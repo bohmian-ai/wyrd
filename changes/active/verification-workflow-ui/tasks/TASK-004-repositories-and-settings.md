@@ -134,3 +134,100 @@ Regenerate changed UI catalog/contracts through their existing generator and run
 inputs, not a Rust/SDK implementation assignment here. Do not add a runner or
 substitute fixtures for unavailable inputs. Integrated change review joins the
 delivered flows and runs the required shipped-surface journey lanes.
+
+## Execution evidence
+
+Integrated source revision: the branch contains `cd204b404`; the consumed server
+operations are `/v1/integrations/github/connect`, `/setup`, `/callback`,
+`/v1/integrations/github` (GET, DELETE), normal Repository Card reads and
+`wyrd declare`. No server, Rust or SDK file is changed.
+
+Commands, run from the repository root:
+
+```bash
+mise run ts:build && mise run ts:build:testing && mise run build:server
+mise run ui:check
+mise run codegen:check
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui build
+mise exec -- scripts/postgres/with-test-postgres.sh -- env WYRD_UI_INTEGRATION=1 WYRD_LOG=warn WYRD_UI_CAPTURE_DIR=<dir> pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.integration.test.ts src/lib/ui-pages.integration.test.ts
+git diff --check
+```
+
+`ui:check` passes (0 type errors, 81 tests, including the task's
+`ui-library.test.ts` and `ui-pages.test.ts` command and `check`);
+`codegen:check` and the build pass; both integration files pass (28 tests).
+
+| Requirement | Proof |
+|---|---|
+| REQ-014: the connection read through the shared contract and both executors | `ui-library.test.ts`: "the GitHub connection read runs as the existing SDK and MCP operations" |
+| REQ-010: index joins Cards and access by repository id; registration, selection, access and readiness words; undeclared rows; connection denied keeps Cards | `ui-library.test.ts`: "the Repositories index joins Repository Cards and GitHub access by repository id" |
+| REQ-011: viewed version apart from selected policy, exact bindings and activation, read-only YAML, TOML labelled a projection, removed access and empty policy | `ui-library.test.ts`: "a Repository Card shows the viewed version apart from the selected policy, its exact bindings and a read-only declaration" |
+| REQ-010: no-Card instructions; unknown, foreign or already-registered ids name nothing | `ui-library.test.ts`: "an accessible repository without a Card shows how to declare one, and an unknown id shows nothing" |
+| REQ-013: host, App, installation and state; suspended or removed access; manage-access link; confirmed disconnect; denied and unconfigured App issue no Card read | `ui-library.test.ts`: "the GitHub integration shows safe connection state and asks before disconnecting" |
+| REQ-010, REQ-011: nav entry, index URL state kept on return, exact version links, activity, Manage connection | `ui-pages.test.ts`: "the Repositories workspace keeps its index state, opens exact versions and leads to the connection" |
+| REQ-013: one connect and one disconnect through the host, pending guard, denied and error state, read-back | `ui-pages.test.ts`: "Settings connects and disconnects GitHub once through the host and reads state back" |
+| REQ-014, AC-006, AC-008, real server: Node and MCP agree; minimal, changed, empty and undeclared repositories; an older version is not selected; ids 1 and 999 not found; no secrets; a viewer is denied the connection, keeps Cards and issues no Card read after denial; another tenant sees nothing; disconnect leaves Cards with access `none` and readiness `inactive` | `ui-library.integration.test.ts`: "Repository Cards join GitHub access by repository id through the Node and MCP hosts" |
+| AC-006, AC-008, AC-009, REQ-010, REQ-011, REQ-013, Chromium against the production BFF: Verify → Repositories → Settings; Wyrd-first connect through the server's setup and callback; every index case; URL state into detail and back; an old version viewed without changing selection; TOML projection; activity → execution → filtered Verify → Verifier definition; no-Card page; foreign and unknown ids; viewer denied on the page and on direct POST and DELETE; modal confirmation (focus, Escape, Cancel sends nothing); one DELETE while pending; Cards and executions kept, executions cancelled; GitHub-first reconnect; no sideways page scroll at 1440 and 390 | `ui-pages.integration.test.ts`: "a tenant connects GitHub from Settings, reads its Repository Cards apart from GitHub access, and disconnects without losing them" |
+
+Not proven:
+
+- AC-006 "access-lost" on a real server is proven only by disconnect. The
+  TypeScript test owner exposes no suspend, removal or installation event, so
+  suspended and removed access are proven with fixtures at unit tier only.
+- AC-009 development journey: `mise run dev:full` is not extended. It starts the
+  server with no `[github]` configuration, so Settings reports the App as not
+  configured and Repositories has no rows there. A developer's own
+  `WYRD_GITHUB_*` variables already reach the dev server.
+- AC-009 individual human acceptance of the mock comparison is not recorded.
+
+TDD: VIOLATED. The connection-read test was written first but its failing run
+was not captured. The four component tests first ran after their components
+existed. The two page tests were written in the same step as the pages. Both
+real-server tests were written after the behaviour.
+
+Corrected mechanics: captures are taken at 1440 and 390 wide (the mock's own
+widths); the integration command adds `WYRD_LOG=warn` and `WYRD_UI_CAPTURE_DIR`;
+the disconnect and connect relay lives at
+`settings/integrations/github/connection` because a `+server.ts` beside a page
+answers a non-HTML GET with 405.
+
+Comparison with the approved mock, against its source (`Repositories.svelte`,
+`RepoDetail.svelte`, `Undeclared.svelte`, `Settings.svelte`, `app.css`) and
+captures of index, detail, no-Card, Settings, the disconnect dialog and the
+disconnected index in light and dark at 1440 and 390. Remaining differences,
+each awaiting a ruling:
+
+1. Index has no "Latest execution" and "Status · verdict" columns.
+2. Activity is the shared RecordTable (Time, Verifier, Card version, Status,
+   Verdict; its Wrap lines, Columns, CSV, Open in Query and paging controls),
+   not the mock's Execution, Pull request, Head, Verifier, Policy table with a
+   "Latest per PR" toggle. Sort, page and query there answer "Open Verify to
+   sort, filter or page these executions." Pull request columns belong to
+   TASK-005.
+3. Activity names the Verifier without `@version` (version on hover).
+4. Card YAML is the whole returned envelope (uid, spec hash, relationships,
+   status), not the mock's short authored YAML.
+5. Detail header has no description line.
+6. Settings shows no Account fact: the connection read returns no account name.
+7. The disconnect dialog gives no count of unfinished executions.
+8. Search applies on Enter.
+9. In-page navigation is drawn as link-styled buttons that emit intents.
+10. Extra access words "No access", "Not selected" and "Unavailable"; a
+    `repository_id` tag where GitHub gives no full name; a Host fact while not
+    connected.
+11. The sidebar shows the host's search box and tenant switcher, which the mock
+    omits.
+12. The mock's phone capture exists in dark only; light at 390 was compared
+    with the desktop light capture.
+
+External dependencies:
+
+- The server callback answers JSON and nothing returns the browser to Settings.
+  The flow completes in the browser only where the UI and `/v1` share an
+  origin; Settings shows the authoritative state on its next load.
+- Reading the connection needs `identity_connections:write`, so a viewer sees
+  the connection as denied while Cards stay readable.
+- The connection read carries no account name and no manage URL; the manage
+  link is `https://{host}/apps/{slug}/installations/new`.
+
+User decisions: none yet.

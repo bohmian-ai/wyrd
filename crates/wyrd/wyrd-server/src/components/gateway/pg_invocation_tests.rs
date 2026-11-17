@@ -6899,8 +6899,9 @@ async fn critical_pressure_pauses_gateway_calls_until_recovery() {
 ///
 /// # Panics
 /// Panics when the Postgres fixture or setup fails, a call fails, or the
-/// answer's bytes are uncounted, counted against the wrong workload, or kept
-/// after the response drops.
+/// answer's bytes are uncounted, counted against the wrong workload, released
+/// before a relayed answer's HTTP body is sent, or kept after the response
+/// drops.
 #[tokio::test]
 async fn buffered_answers_count_against_the_calling_workload() {
     use wyrd_runtime::resources::Workload;
@@ -6943,6 +6944,23 @@ async fn buffered_answers_count_against_the_calling_workload() {
     assert_eq!(workloads.workload_bytes(Workload::Gateway), 0);
     drop(nested);
     assert_eq!(workloads.workload_bytes(Workload::Verification), 0);
+
+    dispatch.push(Step::Return(completed(1, 1)));
+    let relayed = super::routes::chat_completions(
+        State(state.clone()),
+        Ok(caller.clone()),
+        None,
+        HeaderMap::new(),
+        Ok(JsonBody::from(json!({"model": "dep-a/a", "messages": []}))),
+    )
+    .await;
+    assert_eq!(relayed.status(), StatusCode::OK);
+    assert!(
+        workloads.workload_bytes(Workload::Gateway) > 0,
+        "a relayed answer stays charged until its HTTP body is sent"
+    );
+    body_json(relayed).await;
+    assert_eq!(workloads.workload_bytes(Workload::Gateway), 0);
 }
 
 /// A call's request body counts against its own workload while the call

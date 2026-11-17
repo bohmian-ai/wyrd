@@ -519,9 +519,18 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
          `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-testing --test server -P journey --run-ignored=all -E 'test(/verification_runtime::isolated_capacity::/)'"`.
      - TDD: the nested and handed cases were RED first; the HTTP wiring and
        the journey were written after it (VIOLATED for that wiring).
+   - Relayed answers: `relay` keeps a buffered answer's charge inside the
+     HTTP body (`Full` with `map_frame`, which keeps the exact size hint,
+     so `Content-Length` is unchanged). It returns once the body is sent or
+     dropped. Batch answers carry no charge.
+     - `components::gateway::pg_invocation_tests::buffered_answers_count_against_the_calling_workload`
+       now also renders a chat completion through the public handler and
+       asserts the answer stays charged until its HTTP body is read. RED:
+       "a relayed answer stays charged until its HTTP body is sent".
+       GREEN (96 passed, the gateway and middleware lib command above).
+     - Wire unchanged: `mise run test:gateway:native` (17 Rust gateway
+       journeys and 8 Python native-client journeys passed).
    - Open:
-     - A relayed answer's charge returns when it becomes the HTTP body, not
-       when the body is sent.
      - The journey does not yet cover:
        - media or code work;
        - slow streams staying byte-bounded;
@@ -547,7 +556,7 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
          `one_session` name are gone. A sweep for tests of removed
          allocation logic found no test that only asserts removed
          behaviour.
-     Status: FAIL (relayed answers, remaining journey cases).
+     Status: FAIL (remaining journey cases).
 
 7. **Functional closure and performance — REQ-024; AC-018.** Run affected
    functional lanes, then full clean L1 verification, gateway and all three

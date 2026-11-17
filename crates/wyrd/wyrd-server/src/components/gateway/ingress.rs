@@ -512,7 +512,7 @@ pub(crate) async fn anthropic_messages(
         }
     };
     match answer {
-        Ok(answer) => relay(answer.status, answer.body),
+        Ok(answer) => relay(answer.status, answer.body, answer.custody),
         Err(error) => GatewayIngress::AnthropicMessages.error(&error),
     }
 }
@@ -577,7 +577,7 @@ pub(crate) async fn jev_systemone(
         },
     };
     match answer {
-        Ok(answer) => relay(answer.status, answer.body),
+        Ok(answer) => relay(answer.status, answer.body, answer.custody),
         Err(error) => GatewayIngress::OpenAi.error(&error),
     }
 }
@@ -691,7 +691,7 @@ pub(crate) async fn gemini_generate_content(
         },
     };
     match answer {
-        Ok(answer) => relay(answer.status, answer.body),
+        Ok(answer) => relay(answer.status, answer.body, answer.custody),
         Err(error) => GatewayIngress::GeminiGenerateContent.error(&error),
     }
 }

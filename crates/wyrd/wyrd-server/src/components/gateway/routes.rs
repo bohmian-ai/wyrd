@@ -12,6 +12,7 @@ use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
+use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use skald_spec::wire::borrowed::Borrowed;
@@ -20,6 +21,7 @@ use utoipa_axum::routes;
 use vala_bifrost_redux::catalog::{BifrostCatalogError, TableRef};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use wyrd_gateway::{IngressDialect, MediaRequest, OpenAiMediaRoute, RequestJson, ResponseBody};
+use wyrd_runtime::resources::ByteCharge;
 use wyrd_runtime::{Action, Permission, Resource};
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::gateway::openai::{
@@ -1480,27 +1482,39 @@ async fn openai_call(
         Err(WyrdErrorResponse(error)) => Err(error),
     };
     match result {
-        Ok(response) => relay(response.status, response.body),
+        Ok(response) => relay(response.status, response.body, response.custody),
         Err(error) => openai_error(&error),
     }
 }
 
 /// Renders a provider `status` and answer `body`: JSON as JSON, media bytes
 /// with their content type, and events as an incremental server-sent event
-/// stream.
-pub(super) fn relay(status: u16, body: ResponseBody) -> Response {
+/// stream. A buffered answer's memory `custody` rides in the HTTP body, so
+/// it returns once the body is sent or dropped, not when it is rendered.
+pub(super) fn relay(status: u16, body: ResponseBody, custody: Option<ByteCharge>) -> Response {
     let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let charged = |bytes: Bytes| {
+        Body::new(http_body_util::Full::new(bytes).map_frame(move |frame| {
+            let _held = &custody;
+            frame
+        }))
+    };
     match body {
         ResponseBody::Json(raw) => (
             status,
             [(CONTENT_TYPE, "application/json")],
-            raw.into_string(),
+            charged(Bytes::from(raw.into_string())),
         )
             .into_response(),
         ResponseBody::Media(answer) => {
             let content_type = HeaderValue::from_str(&answer.content_type)
                 .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
-            (status, [(CONTENT_TYPE, content_type)], answer.bytes).into_response()
+            (
+                status,
+                [(CONTENT_TYPE, content_type)],
+                charged(answer.bytes),
+            )
+                .into_response()
         }
         ResponseBody::MediaStream {
             content_type,
@@ -1890,7 +1904,7 @@ pub(crate) async fn cancel_batch(
 /// Renders a Batches answer, or its failure as the `OpenAI` error envelope.
 fn batch_response(answer: Result<BatchAnswer, WyrdError>) -> Response {
     match answer {
-        Ok(answer) => relay(answer.status, answer.body),
+        Ok(answer) => relay(answer.status, answer.body, None),
         Err(error) => openai_error(&error),
     }
 }

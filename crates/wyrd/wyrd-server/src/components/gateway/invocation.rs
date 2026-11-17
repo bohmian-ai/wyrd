@@ -178,7 +178,7 @@ pub struct GatewayCallResponse {
     /// The process memory charge of a buffered `body`, attributed to the
     /// call's operation and returned when the response drops; `None` for a
     /// stream, whose frames are bounded by their channel.
-    pub(crate) _custody: Option<ByteCharge>,
+    pub(crate) custody: Option<ByteCharge>,
 }
 
 /// A governed call that ended in an error, with whether a provider may have
@@ -908,7 +908,7 @@ impl<'a> GatewayInvocation<'a> {
                     resolved,
                     deployment,
                     status: 200,
-                    _custody: call.custody(memory, &body),
+                    custody: call.custody(memory, &body),
                     body,
                 })
             }
@@ -921,7 +921,7 @@ impl<'a> GatewayInvocation<'a> {
                     requested: call.requested.clone(),
                     deployment,
                     status: refusal.status,
-                    _custody: call.custody(memory, &body),
+                    custody: call.custody(memory, &body),
                     body,
                 })
             }

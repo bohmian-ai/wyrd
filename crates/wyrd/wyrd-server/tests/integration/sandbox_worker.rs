@@ -1015,6 +1015,69 @@ async fn suspended_sessions_release_runnable_capacity() {
     }
 }
 
+/// A running Python turn holds one CPU lane for its whole duration: with one
+/// effective CPU, no lane is free while a busy turn runs, and the lane
+/// returns once its deadline ends the turn.
+///
+/// # Panics
+/// Panics when the busy turn never runs, runs without its lane, finishes
+/// before its deadline, or keeps the lane after it ends.
+#[tokio::test]
+async fn a_running_turn_holds_its_cpu_lane() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics = recorder.handle();
+    let _recording = metrics::set_default_local_recorder(&recorder);
+    let limits = HostedLimits {
+        monty_min_workers: 0,
+        ..HostedLimits::default()
+    };
+    let process = ProcessResources::new(NonZeroUsize::MIN, 16 << 30, 16 << 30);
+    let sandbox = Sandbox::start(worker(), limits, &process)
+        .await
+        .expect("pool starts");
+    assert_eq!(sandbox.runnable_turns(), 1);
+    let workspace = Arc::new(Workspace::materialize(Vec::new(), limits, None).expect("workspace"));
+    let mounts = workspace.mounts().expect("mounts");
+    let envelopes = Envelopes::default();
+    let busy = sandbox.exec(
+        DataTenantId::new_v7(),
+        "while True:\n    pass".to_owned(),
+        Vec::new(),
+        mounts,
+        Instant::now() + Duration::from_secs(3),
+        Some(&workspace),
+        None,
+        &envelopes,
+    );
+    tokio::pin!(busy);
+    let running = || {
+        sample(
+            &metrics.render(),
+            "wyrd_verification_python_workers{state=\"runnable\"}",
+        ) == 1
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !running() {
+        assert!(Instant::now() < deadline, "the busy turn never ran");
+        tokio::select! {
+            biased;
+            ended = &mut busy => panic!("the busy turn ended early: {ended:?}"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+    }
+    assert_eq!(
+        sandbox.runnable_turns(),
+        0,
+        "the running turn holds the lane"
+    );
+    busy.await.expect_err("the deadline ends the busy turn");
+    assert_eq!(
+        sandbox.runnable_turns(),
+        1,
+        "the ended turn returns the lane"
+    );
+}
+
 /// A worker killed by its time limit or by a cancelled operation keeps its whole charge until its process is gone,
 /// and later operations still run.
 ///

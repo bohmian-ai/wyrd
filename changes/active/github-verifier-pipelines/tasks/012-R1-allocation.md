@@ -486,7 +486,12 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
    and `mise run test:bifrost:journey:oracle`, 67 + 1 passed.
 
    Independent check:
-   - No test holds a CPU lane across a Monty turn (`sandbox.rs` `run_turn`).
+   - Closed: `sandbox_worker::a_running_turn_holds_its_cpu_lane`. With one
+     effective CPU, a busy Python turn leaves 0 lanes free while it runs,
+     and the lane returns when its deadline ends the turn. Mutation:
+     dropping the lease right after `run_turn` acquires it fails with
+     left 1, right 0. Added after the wiring (TDD VIOLATED). GREEN:
+     `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-server --features test-support --test integration -E 'test(=sandbox_worker::a_running_turn_holds_its_cpu_lane)'"`.
    - Repartition and sort are not exercised; the proof is a 4-partition
      aggregate.
    - The parent-commitment sampler in `main.rs` (`mi_process_info`) has no

@@ -101,7 +101,7 @@ repository PostgreSQL → public Bifrost query journey owner in
      PASS. The test reads the newest row through `bifrost.query` and checks
      `sequence = 0`, the Verifier, subject and actor ids, ten null content
      columns and a null `value`. The correlation columns `workload_card_uid`,
-     `subject_card_uid` and `run_id` are not asserted. Inspection answers `cancelled`, and a repeat
+     `subject_card_uid` and `run_id` are asserted null too. Inspection answers `cancelled`, and a repeat
      cancel leaves the history at one row. Status: PASS.
 2. **Runner lifecycle.** Hold executions at running, retrying, deferred-input
    waiting and approval waiting; query each while held, then let work complete
@@ -156,7 +156,9 @@ repository PostgreSQL → public Bifrost query journey owner in
    - Proof: `verification_runtime::running_cancellation_and_revocation_record_cancelled_status`
      (command J). RED: `never listed running: {}, history []`. GREEN: PASS.
      Cancelling held running work records `[running, cancelled]`. After the
-     worker is released the queue stays `cancelled` and no stale row appears.
+     worker is released, a probe completes in the runtime's one slot, so
+     the worker has settled; the queue stays `cancelled` and no stale row
+     appears.
      Revoking the submitter cancels both its running and its pending
      execution, recording `[running, cancelled]` and `[cancelled]`.
    - Admission-time staging:
@@ -167,8 +169,14 @@ repository PostgreSQL → public Bifrost query journey owner in
      status row is `cancelled`. GREEN: PASS. There is no RED, because the
      test was added after the staging. Mutation check: with
      `SubmissionSink`'s staged cancellations emptied, the test fails.
-     PR reservation fencing goes through the same `stage_cancelled` call
-     after the admission commit. No test drives it.
+     PR reservation fencing returns its cancellations from
+     `reserve_pull_request`, and the server stages them through the same
+     `stage_cancelled(fenced)` call as superseded runs, which command G
+     proves. `pg_verifier_executions::pull_request_reservation_of_a_revoked_owner_is_cancelled`
+     (command Q) revokes the Repository owner after its authority was
+     resolved, then reserves: the execution is cancelled `principal_revoked`
+     and the reservation returns it with its stored Verifier and
+     attribution. GREEN: PASS, added after the production code.
    - Admission-time returns are in `pg_verifier_executions` (command Q).
      `revocation_and_admission_order_on_the_principal` asserts the exact
      `CancelledExecution` that the revocation returns and that a submission
@@ -192,14 +200,15 @@ repository PostgreSQL → public Bifrost query journey owner in
        cancelled executions is `cancelled`. It reads them through the
        editor's SDK `bifrost.query`, using Verify's newest-status shape. RED,
        with the production change stashed and an earlier form of the wait:
-       `status rows never landed: {}`. GREEN: PASS. Command Q asserts the
-       returned execution ids only; the Verifier and attribution are not
-       compared.
-   - Not asserted: Bifrost result rows for the released stale worker. The
-     revocation journey checks its status history and queue status after a
-     fixed one-second wait. Rollback of cancel and revocation is safe by
+       `status rows never landed: {}`. GREEN: PASS. Command Q asserts each
+       returned supersede and close cancellation equals the execution's
+       stored id, Verifier and attribution.
+   - Released workers: after the revocation, the journey stops the runtime,
+     whose drain waits for the released worker. Neither fenced execution
+     has a row in `bifrost.verification.results`, while the probe has one,
+     so the query can see results. Rollback of cancel and revocation is safe by
      construction (the `?` comes before staging) and is not tested.
-   - The existing fencing assertions are unchanged: the 40 queue tests
+   - The existing fencing assertions are unchanged: the 41 queue tests
      (command Q) and 23 `wyrd-auth` revocation and issuance tests (command A)
      pass. Status: PASS.
 4. **Existing write and recovery boundaries.** In focused outbox proof, stage
@@ -230,7 +239,7 @@ Commands, run sequentially:
 - J: `mise run build:server`, then
   `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && cargo nextest run --locked -p wyrd-testing --test server -P journey --run-ignored=all -E "test(=verification_runtime::<name>)"'`
 - Q: `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && cargo nextest run --locked -p wyrd-sql --test integration --test-threads=1 -E "test(pg_verifier_executions::)"'`.
-  40 tests pass.
+  41 tests pass.
 - A: the same wrapper around
   `cargo nextest run --locked -p wyrd-auth --test-threads=1 -E "test(revoke) | test(issuance::pg_tests)"`.
   23 tests pass.
@@ -280,7 +289,9 @@ they cover and have no RED, although each is verified GREEN:
   with the signature;
 - the release history assertion;
 - the fallback test, which needs a new test-support seam;
-- the admission-time staging journey.
+- the admission-time staging journey;
+- the PR reservation fence test, the PR identity and null-correlation
+  assertions, and the released-worker result check.
 
 For the PR cancellations the test was written first, but the production
 change was drafted before RED was run. RED was then observed with the
@@ -296,13 +307,14 @@ neither wait on nor fail because of the stage. Revocation reuses its
 existing `UPDATE`, now with `RETURNING`. The task excludes a bench run when
 no hot path is touched.
 
-One indirect effect on queued engine execution: the claim's `running` row
-shares the execution's Scribe outbox lane with its state revisions. The first
-revision can therefore wait for that status write to finish. The change
-adds no new kind of wait; it may lengthen the sanctioned Bifrost append
-acknowledgement by up to one small batch, once per claim. This is not
-measured: `bench:l1:verification` covers only direct verify, which the
-change does not touch, and no L1 experiment runs queued executions.
+Status rows are staged without an acknowledgement, and nothing awaits
+them (`scribe_outbox.rs` `ScribeWrite::Status`). Engine steps change state
+in memory and return without waiting on Scribe (`state.rs` module
+docs). The outbox's lanes, linger and batching are unchanged. An
+execution's status rows and state revisions share a lane, which sends in
+arrival order, so a revision staged while the `running` row is being sent
+goes in the next batch. That ordering touches only the runner's
+background flush, not a hot path.
 
 Risk: the timestamp comes from the pod clock at the transition, as the
 task's "capture at the transition" asks. Newest-row ordering across replicas

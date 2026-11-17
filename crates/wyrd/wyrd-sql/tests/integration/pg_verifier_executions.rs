@@ -4347,6 +4347,26 @@ fn pr_key(repository: &RepositoryId) -> PullRequestKey<'_> {
 ///
 /// # Panics
 /// Panics when the tenant's SYSTEM principal cannot be provisioned.
+/// What a cancellation of `executions` must return: each execution with the
+/// Verifier and attribution its stored row holds, in execution order.
+async fn stored_cancellations(
+    queue: &VerifierExecutionQueue,
+    conn: &mut TenantConn<'_>,
+    executions: &[ExecutionId],
+) -> Vec<CancelledExecution> {
+    let mut expected = Vec::new();
+    for execution in executions {
+        let stored = status(queue, conn, *execution).await;
+        expected.push(CancelledExecution {
+            execution_id: *execution,
+            verifier_card_uid: stored.verifier_card_uid,
+            attribution: stored.attribution,
+        });
+    }
+    expected.sort_by_key(|cancelled| cancelled.execution_id);
+    expected
+}
+
 async fn pr_targets(
     conn: &mut TenantConn<'_>,
     owner: PrincipalId,
@@ -4470,12 +4490,12 @@ async fn pull_request_generations_reserve_activate_and_supersede() {
         .expect("new generation reserves")
         .outcome;
     assert_eq!(b.len(), 2);
+    let mut superseded = superseded;
+    superseded.sort_by_key(|cancelled| cancelled.execution_id);
     assert_eq!(
-        superseded
-            .iter()
-            .map(|cancelled| cancelled.execution_id)
-            .collect::<BTreeSet<_>>(),
-        a.iter().copied().collect::<BTreeSet<_>>()
+        superseded,
+        stored_cancellations(&queue, &mut conn, &a).await,
+        "supersession returns each cancelled execution's Verifier and attribution"
     );
     for execution in &a {
         let state = status(&queue, &mut conn, *execution).await.state;
@@ -4508,6 +4528,50 @@ async fn pull_request_generations_reserve_activate_and_supersede() {
         "an observation older than B is obsolete"
     );
     assert!(history.current.expect("current").reviews(&second));
+}
+
+/// A PR generation reserved for a Repository owner revoked after its
+/// authority was resolved is cancelled by the admission's principal fence,
+/// and the reservation returns each cancelled execution with its Verifier and
+/// attribution.
+///
+/// # Panics
+/// Panics when the reservation fails, its execution stays runnable, or the
+/// returned cancellation differs.
+#[tokio::test]
+async fn pull_request_reservation_of_a_revoked_owner_is_cancelled() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let actor = actor(fixture.data_tenant_id());
+    let queue = VerifierExecutionQueue::default();
+    let mut conn = fixture.tenant_conn().await.expect("tenant connection");
+    let (owner, principal) = declare_service(&mut conn, &actor, "svc").await;
+    record_machine_authentication(&mut conn, principal, &owner)
+        .await
+        .expect("owner activates");
+    let (_, bindings) = repository_with_bindings(&mut conn, &actor, 1).await;
+    let targets = pr_targets(&mut conn, principal, &bindings).await;
+    assert_eq!(revoke(&queue, &mut conn, principal).await, []);
+
+    let repository_id = RepositoryId::new("42").expect("valid repository id");
+    queue
+        .lock_pull_request(&mut conn, pr_key(&repository_id))
+        .await
+        .expect("PR locks");
+    let observed = database_now(&mut conn).await;
+    let Admitted {
+        outcome: (reserved, superseded),
+        cancelled,
+    } = queue
+        .reserve_pull_request(&mut conn, &pins("a"), observed, &targets)
+        .await
+        .expect("generation reserves");
+    assert_eq!((reserved.len(), superseded.len()), (1, 0));
+    assert_revoked(&queue, &mut conn, reserved[0]).await;
+    assert_eq!(
+        cancelled,
+        stored_cancellations(&queue, &mut conn, &reserved).await,
+        "the reservation returns what its fence cancelled"
+    );
 }
 
 /// Closing a PR cancels its unfinished executions with the close code and
@@ -4554,11 +4618,9 @@ async fn pull_request_ends_access_loss_and_refusals_settle_durably() {
         .await
         .expect("PR deactivates");
     assert_eq!(
-        cancelled
-            .iter()
-            .map(|cancelled| cancelled.execution_id)
-            .collect::<Vec<_>>(),
-        vec![executions[0]]
+        cancelled,
+        stored_cancellations(&queue, &mut conn, &executions[..1]).await,
+        "closing returns the cancelled execution's Verifier and attribution"
     );
     let state = status(&queue, &mut conn, executions[0]).await.state;
     assert_eq!(

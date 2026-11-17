@@ -3529,6 +3529,21 @@ impl StatusJourney {
         Ok(rows)
     }
 
+    /// How many published results `bifrost.verification.results` holds for
+    /// `execution`.
+    ///
+    /// # Errors
+    /// Returns the query error.
+    async fn results(&self, execution: ExecutionId) -> Result<usize, ServerJourneyError> {
+        Ok(self
+            .texts(format!(
+                "SELECT CAST(result_id AS VARCHAR) FROM bifrost.verification.results \
+                  WHERE CAST(execution_id AS VARCHAR) = '{execution}'"
+            ))
+            .await?
+            .len())
+    }
+
     /// The recorded status words of `execution`, oldest first.
     ///
     /// # Errors
@@ -3660,8 +3675,8 @@ fn batch_texts(batch: &RecordBatch) -> Result<Vec<Vec<Option<String>>>, ServerJo
 /// With no runner, a Service enqueues one assertion over the public route
 /// and cancels it over the public route. Verify's newest-status query lists
 /// it `cancelled`; its one status row carries `sequence` 0, the execution's
-/// Verifier and stored subject and actor, and no other content; the public
-/// execution view agrees. Cancelling it again answers `cancelled` and records
+/// Verifier and stored subject and actor, and no other content or
+/// correlation; the public execution view agrees. Cancelling it again answers `cancelled` and records
 /// no second row.
 ///
 /// # Errors
@@ -3694,7 +3709,8 @@ async fn pending_cancellation_records_cancelled_status() -> Result<(), ServerJou
             "SELECT sequence, verifier_card_uid, {SUB_PRINCIPAL_ID}, {ACT_PRINCIPAL_ID}, \
                     step_id, item_index, iteration_index, attempt, publication_name, \
                     publication_kind, size_bytes, file_count, sha256, reason, \
-                    value IS NULL \
+                    CAST(workload_card_uid AS VARCHAR), CAST(subject_card_uid AS VARCHAR), \
+                    run_id, value IS NULL \
                FROM bifrost.verification.execution_events \
               WHERE event = 'status' AND execution_id = '{execution}'"
         ))
@@ -3705,7 +3721,7 @@ async fn pending_cancellation_records_cancelled_status() -> Result<(), ServerJou
         Some(subject),
         Some(actor),
     ];
-    expected.extend(std::iter::repeat_n(None, 10));
+    expected.extend(std::iter::repeat_n(None, 13));
     expected.push(Some("true".to_owned()));
     expect_eq("the cancelled status row", &rows, &vec![expected])?;
     if journey.inspected(execution).await? != "cancelled" {
@@ -3822,11 +3838,13 @@ async fn runner_transitions_record_lifecycle_status() -> Result<(), ServerJourne
 /// (REQ-015, AC-010).
 ///
 /// One runtime with one execution slot holds a running execution, which is
-/// cancelled over the public route: it lists `cancelled`, and its released
-/// worker's refused completion records no status. Another is then held
-/// running with a third pending behind it, and an administrator revokes the
-/// submitter through the public principal route: both list `cancelled`,
-/// and the released worker again records nothing.
+/// cancelled over the public route: it lists `cancelled`, and once a probe
+/// execution has completed in the freed slot, its released worker has
+/// recorded no status. Another is then held running with a third pending
+/// behind it, and an administrator revokes the submitter through the public
+/// principal route: both list `cancelled`, and once the runtime has drained,
+/// the released worker again recorded nothing. Neither fenced worker
+/// published a result; the probe published one.
 ///
 /// # Errors
 /// Returns server, route, runtime, query, or fixture errors, or a
@@ -3849,8 +3867,10 @@ async fn running_cancellation_and_revocation_record_cancelled_status()
     }
     journey.await_newest(stopped, "cancelled").await?;
     script.release();
-    // A released engine settles within one renewal tick.
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // The one slot runs the probe only after the released worker settles.
+    script.push_unheld(EngineOutcome::Completed(drift_outcome(None)?));
+    let probe = journey.enqueue().await?;
+    journey.await_newest(probe, "completed").await?;
     if journey.seed.execution(stopped).await?.status != "cancelled" {
         return Err("the cancelled execution committed late work".into());
     }
@@ -3868,7 +3888,9 @@ async fn running_cancellation_and_revocation_record_cancelled_status()
         journey.await_newest(execution, "cancelled").await?;
     }
     script.release();
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Stopping the runtime waits for the released worker to settle.
+    stop.cancel();
+    tokio::time::timeout(WAIT, task).await??;
     if journey.seed.execution(active).await?.status != "cancelled" {
         return Err("the revoked execution committed late work".into());
     }
@@ -3876,8 +3898,15 @@ async fn running_cancellation_and_revocation_record_cancelled_status()
         .assert_history(active, &["running", "cancelled"])
         .await?;
     journey.assert_history(waiting, &["cancelled"]).await?;
-    stop.cancel();
-    tokio::time::timeout(WAIT, task).await??;
+    journey.server.flush_bifrost().await?;
+    if journey.results(probe).await? != 1 {
+        return Err("the completed probe published no result".into());
+    }
+    for execution in [stopped, active] {
+        if journey.results(execution).await? != 0 {
+            return Err(format!("the fenced worker of {execution} published a result").into());
+        }
+    }
     journey.server.shutdown().await?;
     Ok(())
 }

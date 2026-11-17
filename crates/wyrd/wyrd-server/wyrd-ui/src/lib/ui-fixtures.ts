@@ -363,6 +363,8 @@ export function observeAnswer(sql: string): QueryResult | undefined {
     if (sql.startsWith('SELECT status ')) return { ...facet, rows: [['completed', 3], ['cancelled', 1], ['not recorded', 1], ['waiting', 1]] };
     if (sql.startsWith('SELECT verdict ')) return { ...facet, rows: [[null, 2], ['failed', 1], ['inconclusive', 1], ['passed', 1]] };
     if (sql.startsWith('SELECT verifier_card_uid ')) return { ...facet, rows: [[VERIFIER_UIDS.policy, 3], [VERIFIER_UIDS.drift, 2]] };
+    if (sql.startsWith('SELECT repository ')) return { ...facet, rows: [[null, 5], ['9001', 1]] };
+    if (sql.startsWith('SELECT pull_request ')) return { ...facet, rows: [[null, 5], ['42', 1]] };
     if (sql.includes(' AS n FROM')) return facet;
     return sql.includes(' AS verdict, ') ? executionsByVerdict : sql.includes(' AS verifier, ') ? executionsByVerifier : executions;
   }

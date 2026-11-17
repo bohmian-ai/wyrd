@@ -1272,6 +1272,8 @@ const LABELS: Readonly<Record<string, string>> = {
   group_id: 'Session',
   binding_id: 'Binding',
   origin: 'Origin',
+  repository: 'Repository',
+  pull_request: 'Pull request',
   status: 'Status',
   verdict: 'Verdict',
   execution_id: 'Execution',

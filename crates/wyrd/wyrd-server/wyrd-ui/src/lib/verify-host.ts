@@ -10,7 +10,7 @@ import { sortColumns, type ExecutionInput } from 'wyrd-ai-ui/loaders';
 import { step, type HostStep, type ObserveState } from './observe-host';
 
 /** The columns the Verify rail counts. */
-export const VERIFY_FACETS = ['status', 'verdict', 'verifier_card_uid', 'subject_name', 'service_name', 'origin'] as const;
+export const VERIFY_FACETS = ['status', 'verdict', 'verifier_card_uid', 'subject_name', 'service_name', 'origin', 'repository', 'pull_request'] as const;
 /** The shown columns the Verify list may group by. Grouping only arranges rows; it is never a combined judgment. */
 export const VERIFY_GROUPS = ['verifier_card_uid', 'subject_name', 'service_name', 'run_id', 'group_id'] as const;
 

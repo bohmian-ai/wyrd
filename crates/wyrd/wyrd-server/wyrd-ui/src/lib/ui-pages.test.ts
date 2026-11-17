@@ -711,6 +711,9 @@ test('executions list, facets and charts read one population in bounded shared q
   expect(population).toContain("ELSE coalesce(q.status, 'pending') END AS status");
   // A direct execution is never queued: complete once its result is visible, else nothing is recorded.
   expect(population).toContain("WHEN i.origin = 'direct' THEN CASE WHEN r.result_id IS NOT NULL THEN 'completed' ELSE 'not recorded' END");
+  // A pull request execution's repository and number are the pins recorded with its input; no other origin has them.
+  expect(population).toContain("CASE WHEN i.origin = 'pull_request' THEN i.inputs ->> 'repository_id' END AS repository");
+  expect(population).toContain("CASE WHEN i.origin = 'pull_request' THEN i.inputs ->> 'number' END AS pull_request");
   // Only checkpoint rows name the selected result; status and delivery rows carry no state.
   expect(population.match(/event = 'checkpoint'/g)).toHaveLength(2);
   // The selected result is the recorded one, or a direct execution's only one; never the latest row.
@@ -767,6 +770,9 @@ test('the Verify dashboard reads one population and keeps its investigation in t
   const rail = within(page.getByRole('navigation', { name: 'Filter executions' }));
   expect(rail.getByRole('button', { name: /no verdict/ })).toHaveTextContent('2');
   expect(rail.getByRole('button', { name: /latency-drift 1.0.0/ })).toHaveTextContent('2');
+  // Repository and pull request are counted like any other recorded context.
+  expect(rail.getByRole('button', { name: /^42 / })).toHaveTextContent('1');
+  expect(rail.getByRole('button', { name: /^9001 / })).toHaveTextContent('1');
   const table = within(page.getByRole('region', { name: 'executions rows' }));
   expect(table.getAllByRole('row')).toHaveLength(8);
   expect(table.getAllByText('ticket-policy 1.1.0')).toHaveLength(5);
@@ -774,7 +780,7 @@ test('the Verify dashboard reads one population and keeps its investigation in t
   // Bounded shared reads only: every query is one batch read of the executions population, and no row is hydrated.
   expect(new Set(requests.map((request) => request.op))).toEqual(new Set(['bifrost.query', 'cards.list']));
   expect(requests.filter((request) => request.op === 'cards.list')).toEqual([{ op: 'cards.list', kind: 'Verifier', limit: 200 }]);
-  expect(queries()).toHaveLength(9);
+  expect(queries()).toHaveLength(11);
   expect(queries().every((query) => query.sql.includes(') AS executions WHERE recorded_at >= $1::timestamptz AND recorded_at < $2::timestamptz'))).toBe(true);
   expect(new Set(queries().map((query) => JSON.stringify(query.params?.slice(0, 2)))).size).toBe(1);
 
@@ -804,7 +810,7 @@ test('the Verify dashboard reads one population and keeps its investigation in t
   const filtered = await open(search({ where, from: '2026-10-20T10:00:00.000Z', to: '2026-10-20T12:00:00.000Z', group: 'verifier_card_uid' }));
   await waitFor(() => expect(filtered.getByRole('region', { name: 'executions rows' })).toBeInTheDocument());
   expect(filtered.getByLabelText('WHERE: read-only projection of the active filters')).toHaveTextContent(`status = 'completed' AND verdict = 'failed'`);
-  expect(queries()).toHaveLength(9);
+  expect(queries()).toHaveLength(11);
   expect(queries().every((query) => query.sql.includes('status = $') && query.sql.includes('verdict = $') && query.params?.includes('completed') && query.params?.includes('failed'))).toBe(true);
   expect(queries().every((query) => query.params?.[0] === '2026-10-20T10:00:00.000Z' && query.params?.[1] === '2026-10-20T12:00:00.000Z')).toBe(true);
   // Reset zoom returns to the preset; Clear drops the filters; both keep the grouping.
@@ -827,7 +833,7 @@ test('the Verify dashboard reads one population and keeps its investigation in t
   await waitFor(() => expect(denied.container).toHaveTextContent('WYRD_AUTH_403_FORBIDDEN'));
   expect(denied.container).not.toHaveTextContent('No execution matches');
   // The refusals end the load: the one batch of independent reads, and nothing after it.
-  expect(requests).toHaveLength(10);
+  expect(requests).toHaveLength(12);
   denied.unmount();
   // A malformed range or an unknown filter column issues no read.
   for (const bad of ['?from=yesterday&to=today', search({ where: [{ column: 'secret', value: 1 }] })]) {

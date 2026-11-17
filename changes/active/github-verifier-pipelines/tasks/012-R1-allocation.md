@@ -243,21 +243,35 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
        (TDD VIOLATED). GREEN:
        `mise exec -- cargo nextest run --locked -p wyrd-server --features test-support --lib -E 'test(=verification::hosted::worker::tests::delayed_telemetry_coalesces_into_one_current_sample)'`;
        the `sandbox_worker::` selector above: 14 passed.
-     - Samples arriving during a held turn are proved only in the Monty fork.
+     - Samples during a held turn are also proved in-repo:
+       `sandbox_worker::suspended_sessions_release_runnable_capacity` waits
+       for the suspended worker's samples to show its 100 MiB blob while the
+       turn has not ended.
      - Cancelled owners already had a case:
        `failed_workers_settle_before_capacity_returns` cancels a run
        mid-turn, and `settle` asserts on every poll that no worker's charge
        returns while its process exists. Stale owners are covered by
        `stale_worker_telemetry_stops_new_work_without_freeing_usage`.
-     - Raw media buffers charged through their real lifetime: the media test
-       sets `peak = encoded` and uses a fake reader, not a hosted media path.
+     - Closed: `pg_hosted_artifacts::native_media_holds_raw_and_encoded_bytes_only_while_they_live`
+       drives the server's `TenantEvidence::media` over a stored Artifact.
+       A ledger one byte short of raw plus encoded refuses with `Busy` and
+       holds 0. With exactly enough, the returned guard holds only the
+       encoding, and 0 once dropped. Mutation: returning the raw charge
+       before charging the encoding fails the refusal. Added after the
+       behaviour (TDD VIOLATED). GREEN:
+       `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-server --features test-support --test integration -E 'test(=pg_hosted_artifacts::native_media_holds_raw_and_encoded_bytes_only_while_they_live)'"`.
      - The result precharge removal in `runner.rs::conclude` is proved by
        source only.
-     - The `Sandbox::exec` stack-overflow fix has no regression test.
+     - The `Sandbox::exec` stack-overflow fix: the regression is
+       `sandbox_worker::workspace_writes_share_one_budget`, the test that
+       aborted (D1). It runs on the default test thread stack in the
+       `sandbox_worker::` selector (14 passed).
      - `stale_worker_telemetry_stops_new_work_without_freeing_usage` reaches
        staleness on a 500 ms wall clock, not a sample clock.
-   - Commands missing for "vala-verify: 114 passed" and "state and outbox
-     unit tests: 39 passed".
+   - Commands, re-run: `mise exec -- cargo nextest run --locked -p vala-verify`
+     (114 passed) and
+     `mise exec -- cargo nextest run --locked -p wyrd-server --features test-support --lib -E 'test(/^verification::state::tests::/) | test(/^scribe_outbox::tests::/)'`
+     (39 passed).
    - The fork, the 1.1→1.6 upgrade and `libmimalloc-sys`: approved by the
      maintainer and recorded in revision 16's "Maintainer decisions
      (2026-11-16)".

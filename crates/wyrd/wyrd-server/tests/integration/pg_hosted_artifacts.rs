@@ -256,6 +256,56 @@ fn notes() -> SlotName {
     SlotName::new("notes").expect("slot")
 }
 
+/// Reading evidence as native media charges the raw bytes it read and their
+/// encoding together while it encodes, then hands the Agent call only the
+/// encoding's charge, which lasts exactly as long as the call holds it.
+///
+/// # Panics
+/// Panics when memory one byte short of both copies admits the read, a
+/// refusal keeps a charge, the guard is charged other than the encoding, or
+/// the charge outlives the guard.
+#[tokio::test]
+async fn native_media_holds_raw_and_encoded_bytes_only_while_they_live() {
+    let registered = Registered::start().await;
+    let declaration = registered.file("notes.txt");
+    let raw = NOTES.len() as u64;
+    let encoded = (NOTES.len().div_ceil(3) * 4) as u64;
+    let pinned = Arc::new(BTreeMap::from([(notes(), declaration.clone())]));
+    for (capacity, fits) in [(raw + encoded - 1, false), (raw + encoded, true)] {
+        let memory = wyrd_runtime::resources::ByteLedger::new(capacity);
+        let evidence = TenantEvidence::new(
+            registered.server.state().clone(),
+            user(
+                registered.server.data_tenant_id(),
+                [Permission::card_read()],
+            ),
+            HostedLimits::default(),
+            memory.clone(),
+        );
+        evidence
+            .admit(&BTreeMap::new(), &pinned)
+            .await
+            .expect("the notes are admitted");
+        let media = evidence.media(&declaration).await;
+        if !fits {
+            assert!(
+                matches!(media, Err(BlockError::Busy { .. })),
+                "the raw bytes and their encoding are charged together"
+            );
+            assert_eq!(memory.used(), 0, "a refused read holds nothing");
+            continue;
+        }
+        let (_media, guard) = media.expect("both copies fit");
+        assert_eq!(
+            memory.used(),
+            encoded,
+            "the call holds only the encoding once the raw bytes drop"
+        );
+        drop(guard);
+        assert_eq!(memory.used(), 0, "the charge ends with its guard");
+    }
+}
+
 /// One exact Artifact file feeds native media, citations, a workspace, and
 /// Python code, all through the same authorized loader.
 ///

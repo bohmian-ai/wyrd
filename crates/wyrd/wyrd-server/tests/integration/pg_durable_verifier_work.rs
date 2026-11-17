@@ -2552,7 +2552,7 @@ async fn terminal_selection_and_inspection_use_run_state() {
     let current = leased.reclaim().await;
     assert_eq!(
         current.snapshot().terminal.map(Decision::Selected),
-        Some((*selected).clone())
+        Some(selected.clone())
     );
     assert_eq!(
         current
@@ -2846,7 +2846,6 @@ async fn state_format_changes_preserve_existing_custody() {
         ScribeWrite::ExecutionState {
             batch: revision_batch(leased.lease.execution_id, 1),
             checkpoint: Arc::new(Checkpoint::prepared(
-                1,
                 Arc::new(StateRow {
                     execution_id: leased.lease.execution_id,
                     identity: stand_in_identity(&verifier_uid, &card_uid),

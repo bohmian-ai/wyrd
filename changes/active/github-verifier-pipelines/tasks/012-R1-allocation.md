@@ -186,14 +186,33 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
    - Media copies: `bound_media_holds_only_its_guard_through_the_call`
      asserts one read and a peak equal to the encoded length. vala-verify:
      114 passed.
-   - Checkpoint precharge: `verification::state::tests::live_state_stays_charged_through_acknowledged_revisions`.
-     RED: 7276 vs 4064 under the 4× precharge. GREEN; state and outbox unit
-     tests: 39 passed.
-   - Result precharge: `runner.rs::conclude` no longer charges a second
-     copy of the decision before building the result write. Once the write
-     exists, the decision's charge grows by its weight while both live, then
-     fits to the write when the decision drops. This is a source/diff proof
-     only, with no RED, so TDD is VIOLATED for this sub-case. Regressions:
+   - Checkpoint and result precharge, and sizing-only traversal (review
+     finding: `retained`, `Checkpoint::live` and the publication read
+     serialized values solely to charge them, against S:45–47 and
+     T:71–75). The live state, its decision, restoration and publication
+     copies are small graphs left to aggregate pressure; `Held.live`,
+     `retained`, `Charged`, `Checkpoint::live`/`ENTRY_BYTES`, and the
+     runner's `hand_over` are deleted. The flush copies the state under
+     the lock, prepares its row once on the blocking pool, and stages it
+     weighted by `StagedRow::owned_bytes()`; a copy that cannot be
+     prepared breaks the writer. A result write is charged by the outbox
+     from its rows' `owned_bytes`. The remaining `encoded_len` callers in
+     `hosted/workspace.rs` also admit workspace disk quota, so they are
+     not sizing-only.
+     - `verification::state::tests::only_a_staged_revision_is_charged_its_prepared_row`
+       replaces the three live/copy charge tests and the runner's
+       `hand_over` test. RED: "the live state is not charged", left 1446,
+       right 0. GREEN. The first mutation (weight 0) passed because the
+       test derived its expectation from `weight()`; it now uses the
+       prepared row's `owned_bytes()`, and weight 0 fails with left 0,
+       right 2476.
+     - GREEN: server lib 673 passed; server integration
+       `test(/verif|hosted|durable|scribe|outbox/)` 156 passed, with
+       managed Postgres.
+   - Earlier result precharge (superseded by the line above):
+     `runner.rs::conclude` no longer charged a second copy of the
+     decision. This is a source/diff proof only, with no RED, so TDD is
+     VIOLATED for this sub-case. Regressions:
      `pg_verification_runtime::{completion_waits_for_the_durable_result,
      lost_result_ack_replays_the_identical_sealed_batch_and_scribe_deduplicates,
      reclaimed_attempt_after_a_failed_settlement_redelivers_the_selected_result,
@@ -260,12 +279,9 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
        before charging the encoding fails the refusal. Added after the
        behaviour (TDD VIOLATED). GREEN:
        `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-server --features test-support --test integration -E 'test(=pg_hosted_artifacts::native_media_holds_raw_and_encoded_bytes_only_while_they_live)'"`.
-     - Closed: the result handoff in `runner.rs::conclude` is now
-       `hand_over`. `verification::runner::tests::result_write_charge_overlaps_its_decision_then_holds_only_the_write`
-       records the ledger when the decision drops (decision plus write)
-       and asserts the charge then holds exactly the write. Mutations
-       fail it: dropping the decision before charging the write, and
-       skipping the shrink.
+     - Superseded: the `hand_over` result handoff and its test were
+       removed with the decision charge (see "Checkpoint and result
+       precharge" above).
      - Closed: parent custody.
        `sandbox_worker::suspended_sessions_release_runnable_capacity`
        now asserts that during a held turn the ledger holds exactly the

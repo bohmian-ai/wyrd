@@ -50,7 +50,6 @@ use wyrd_spec::verification::execution::{
 use super::evidence::TenantEvidence;
 use super::tools::{host_stop, invocation};
 use super::{HostedLimits, extract_refused};
-use crate::verification::state::Charged;
 use wyrd_spec::verification::state::AcceptedPublication;
 
 /// Process-wide workspace admission over the process memory and scratch
@@ -221,9 +220,8 @@ impl Workspaces {
                     let admitted = if collection.speculation.admits() {
                         evidence.publications(step)
                     } else {
-                        Charged::uncharged(Vec::new())
+                        Vec::new()
                     };
-                    let (admitted, _read) = admitted.into_parts();
                     for publication in admitted {
                         let relative = format!(
                             "content/{}/{}",

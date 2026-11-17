@@ -62,7 +62,7 @@ use crate::components::auth::Caller;
 use crate::components::cards::routes::{authorize_card_ref, get_card_objects_by_ref_for};
 use crate::components::storage::inventory::ObjectInventory;
 use crate::state::AppState;
-use crate::verification::state::{Charged, RunState};
+use crate::verification::state::RunState;
 
 /// Reads one execution's pinned evidence from its tenant's storage.
 pub struct TenantEvidence {
@@ -135,12 +135,11 @@ impl TenantEvidence {
     /// Every publication `step` accepted in the bound execution's state,
     /// grouped by item, iteration, and attempt and in acceptance order within
     /// an attempt, each with its completed File descriptors; none without a
-    /// bound execution. Read from the live state held in memory; the copy
-    /// holds its memory charge until it drops.
-    pub fn publications(&self, step: &TaskId) -> Charged<Vec<AcceptedPublication>> {
+    /// bound execution. Read from the live state held in memory.
+    pub fn publications(&self, step: &TaskId) -> Vec<AcceptedPublication> {
         match &self.execution {
             Some(state) => state.publications(step),
-            None => Charged::uncharged(Vec::new()),
+            None => Vec::new(),
         }
     }
 

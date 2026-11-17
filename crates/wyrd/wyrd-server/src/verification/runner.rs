@@ -46,8 +46,6 @@ use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_verify::blocks::{Checkpoints, Decisions, DriftChecks, EngineError, HostWork};
 use wyrd_runtime::AcceptedAuthority;
-use wyrd_runtime::outbox::OutboxSink;
-use wyrd_runtime::resources::ByteCharge;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{Attribution, PrincipalId};
 use wyrd_spec::card::agent::ExecutionRoute;
@@ -85,14 +83,14 @@ use super::hosted::blocks::{Execution, HostedBlocks};
 use super::inputs::{InputResolver, InputRow};
 use super::leases::{HeldLease, LeaseRenewal};
 use super::results::{ResultPayloadBuilder, ResultRun};
-use super::state::{Charged, Decision, RunState, StateError, StateRow};
+use super::state::{Decision, RunState, StateError, StateRow};
 use super::telemetry::{ExecutionMode, ExecutionTelemetry, Phase};
 use crate::components::auth::Caller;
 use crate::components::gateway::GatewayCallContext;
 use crate::components::github::delivery::GithubDeliveries;
 use crate::components::github::extraction::PullRequestSource;
 use crate::query::scheduled::ScheduledQueryCaller;
-use crate::scribe_outbox::{ScribeOutbox, ScribeSink, ScribeWrite};
+use crate::scribe_outbox::{ScribeOutbox, ScribeWrite};
 use crate::state::AppState;
 
 /// Stable error code when the exact Verifier Card cannot be loaded or is not
@@ -228,9 +226,8 @@ pub struct Custody {
 
 /// The terminal decision one claim offers its execution's state.
 enum Offer {
-    /// The decision the recovered state already accepted, as a copy
-    /// charged for as long as it is kept.
-    Accepted(Charged<Decision>),
+    /// The decision the recovered state already accepted.
+    Accepted(Decision),
     /// A completed outcome, computed from its instant.
     Selected(ExecutedOutcome, DateTime<Utc>),
     /// A failure without an outcome.
@@ -981,10 +978,7 @@ impl VerifierRunner {
             Ok(decisions) => decisions,
             Err(outcome) => return outcome,
         };
-        // The restoration copy stays charged while the engine runs.
-        let (engine, _restored) = state
-            .restore(engine, Arc::clone(state) as Arc<dyn Checkpoints>)
-            .into_parts();
+        let engine = state.restore(engine, Arc::clone(state) as Arc<dyn Checkpoints>);
         let engine = engine
             .with_approvals(decisions)
             .with_host_work(work.clone());
@@ -1629,45 +1623,17 @@ async fn conclude(
     if let Err(transition) = persisted(state, lease, execution_id).await {
         return transition;
     }
-    let (decided, mut charge) = decided.into_parts();
     match decided {
         Decision::Failed(failure) => {
             Transition::Terminate(terminal_status(failure.status), failure.error)
         }
         Decision::Selected(selected) => match result(frozen, &selected, system) {
             Ok((transition, write)) => {
-                let weight = <ScribeSink as OutboxSink>::weight(&write) as u64;
-                hand_over(charge.as_mut(), weight, selected);
-                deliver(tenant, transition, write, charge, lease, outbox).await
+                drop(selected);
+                deliver(tenant, transition, write, lease, outbox).await
             }
             Err(transition) => transition,
         },
-    }
-}
-
-/// Move a decision's `charge` onto the result write built from it: the
-/// write's `weight` is charged while `decision` still lives, so both are
-/// paid for together, then the charge shrinks to exactly the write once
-/// `decision` drops. Nothing is charged ahead of the build.
-fn hand_over<T>(charge: Option<&mut ByteCharge>, weight: u64, decision: T) {
-    match charge {
-        Some(charge) => {
-            charge.grow_infallible(weight);
-            drop(decision);
-            fit(charge, weight);
-        }
-        None => drop(decision),
-    }
-}
-
-/// Grow or shrink `charge` to exactly `bytes`; growth is infallible because
-/// what it pays for already exists.
-fn fit(charge: &mut ByteCharge, bytes: u64) {
-    let held = charge.bytes();
-    if bytes > held {
-        charge.grow_infallible(bytes - held);
-    } else {
-        charge.shrink(held - bytes);
     }
 }
 
@@ -1705,19 +1671,10 @@ async fn persisted(
 /// and the next claim delivers the same selected result again. A lost
 /// `lease` ends the wait; each caller races its own abandoning shutdown
 /// around this one.
-///
-/// `held` is the process memory already charged for `write`, from the
-/// outbox's ledger; it stays charged through the reservation wait and the
-/// outbox takes it over as the staged write's charge.
-///
-/// # Panics
-/// Panics when `held` was charged to another ledger than the outbox's, as
-/// [`wyrd_runtime::outbox::Reservation::stage_charged`] does.
 async fn deliver(
     tenant: DataTenantId,
     transition: Transition,
     mut write: ScribeWrite,
-    held: Option<ByteCharge>,
     lease: &HeldLease,
     outbox: &Arc<ScribeOutbox>,
 ) -> Transition {
@@ -1739,10 +1696,7 @@ async fn deliver(
             }
         }
     };
-    match held {
-        Some(held) => slot.stage_charged(tenant, write, held),
-        None => slot.stage(tenant, write),
-    }
+    slot.stage(tenant, write);
     tokio::select! {
         biased;
         () = lost.cancelled() => Transition::LeaseLost,
@@ -2147,50 +2101,5 @@ impl EngineScript {
             let _ = held.wait_for(|held| !held).await;
         }
         Some(outcome)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use wyrd_runtime::resources::ByteLedger;
-
-    use super::hand_over;
-
-    /// Records the ledger's usage when the decision it stands for drops.
-    struct Decision<'a> {
-        ledger: &'a ByteLedger,
-        seen: &'a std::cell::Cell<u64>,
-    }
-
-    impl Drop for Decision<'_> {
-        fn drop(&mut self) {
-            self.seen.set(self.ledger.used());
-        }
-    }
-
-    /// The result write is charged while its decision still lives, and the
-    /// charge then holds exactly the write.
-    ///
-    /// # Panics
-    /// Panics when the decision drops before the write is charged, or the
-    /// handed-over charge differs from the write's weight.
-    #[test]
-    fn result_write_charge_overlaps_its_decision_then_holds_only_the_write() {
-        let ledger = ByteLedger::new(10_000);
-        let mut charge = ledger.charge_infallible(300);
-        let seen = std::cell::Cell::new(0);
-        hand_over(
-            Some(&mut charge),
-            120,
-            Decision {
-                ledger: &ledger,
-                seen: &seen,
-            },
-        );
-        assert_eq!(seen.get(), 420, "decision and write are charged together");
-        assert_eq!(charge.bytes(), 120, "then only the write");
-        assert_eq!(ledger.used(), 120);
-        drop(charge);
-        assert_eq!(ledger.used(), 0);
     }
 }

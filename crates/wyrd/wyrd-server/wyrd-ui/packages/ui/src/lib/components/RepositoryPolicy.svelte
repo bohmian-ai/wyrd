@@ -9,6 +9,7 @@
   import { fmtAgo, fmtInstant, parseInstant } from '../format.js';
   import { ACCESS_WORDS, READINESS_WORDS, accessWhy, readinessWhy, type RepositoryPolicyProps } from '../repositories.js';
   import ActionNote from './ActionNote.svelte';
+  import Code from './Code.svelte';
   import CopyButton from './CopyButton.svelte';
   import EmptyState from './EmptyState.svelte';
   import RepositorySheet from './RepositorySheet.svelte';
@@ -143,7 +144,7 @@
           {/each}
         </div>
         <div class="tabpanel" role="tabpanel">
-          <pre>{data.declaration}</pre>
+          <Code text={data.declaration} toml={declaration === 'toml'} />
           {#if declaration === 'toml'}<p class="note small">Reconstructed from the Card: a projection of its bindings, not the file that was declared.</p>{/if}
           <p class="note small">Read-only. Change policy by editing the declaration and running wyrd declare.</p>
         </div>

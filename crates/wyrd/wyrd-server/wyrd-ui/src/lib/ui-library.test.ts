@@ -3229,6 +3229,12 @@ test('JSON and YAML blocks are coloured by syntax role without changing their te
   // A version or a timestamp is not a number.
   expect(of(yaml, 'number')).toEqual(['0.25']);
 
+  const toml = '# wyrd.toml, "quoted" 1\n[repository.verified_by]\nverifier = [\n  "./review/pr-review.yaml",\n]\nruns_on = { kind = "pull_request" }\n';
+  const tomlOf = (kind: string) => codeTokens(toml, true).filter((token) => token.kind === kind).map((token) => token.text);
+  expect(codeTokens(toml, true).map((token) => token.text).join('')).toBe(toml);
+  expect(tomlOf('comment')).toEqual(['# wyrd.toml, "quoted" 1']);
+  expect(tomlOf('key')).toEqual(['repository.verified_by', 'verifier', 'runs_on', 'kind']);
+  expect(tomlOf('string')).toEqual(['"./review/pr-review.yaml"', '"pull_request"']);
 });
 
 test('an executions list keeps status and verdict apart, names Verifiers the host read, and opens one exact execution', async () => {

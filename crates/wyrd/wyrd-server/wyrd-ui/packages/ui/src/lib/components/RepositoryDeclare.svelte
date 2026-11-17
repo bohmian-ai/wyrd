@@ -5,6 +5,7 @@
 -->
 <script lang="ts">
   import { ACCESS_WORDS, READINESS_WORDS, type RepositoryDeclareProps } from '../repositories.js';
+  import Code from './Code.svelte';
   import CopyButton from './CopyButton.svelte';
   import EmptyState from './EmptyState.svelte';
   import RepositorySheet from './RepositorySheet.svelte';
@@ -35,7 +36,7 @@
     <section class="section" aria-labelledby="declare-heading">
       <div class="section-head"><h2 class="h" id="declare-heading">Declare it</h2><CopyButton label="Copy wyrd.toml" text={data.toml} /></div>
       <p class="prose">Add this file at the repository root, point verifier at your own Verifier definitions, then run:</p>
-      <pre>{data.toml}</pre>
+      <Code text={data.toml} toml />
       <div class="ident"><code class="mono">{COMMAND}</code><CopyButton label="Copy command" text={COMMAND} /></div>
       <p class="note">The server infers the Repository Card name, provider, host and repository_id, verifies them against this connection, registers the Card and selects that exact version.</p>
     </section>

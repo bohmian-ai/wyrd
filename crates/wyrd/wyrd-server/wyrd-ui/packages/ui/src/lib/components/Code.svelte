@@ -1,5 +1,5 @@
 <!--
-  A block of JSON or YAML, coloured by syntax role with the brand's code
+  A block of JSON, YAML or TOML, coloured by syntax role with the brand's code
   tokens. The code field is dark in both modes. Colour is decoration only:
   the text is unchanged, selectable and copyable. A long block keeps a
   bounded height and scrolls, so machine text never pushes the page's own
@@ -9,15 +9,17 @@
   import { codeTokens } from '../format.js';
 
   interface Props {
-    /** The JSON or YAML text. */
+    /** The JSON or YAML text, or TOML when `toml` is set. */
     text: string;
+    /** Read the text as TOML. */
+    toml?: boolean;
   }
 
-  let { text }: Props = $props();
+  let { text, toml = false }: Props = $props();
 </script>
 
 <!-- svelte-ignore a11y_no_noninteractive_tabindex -- a scrolling block must be reachable by keyboard -->
-<pre class="code" tabindex="0">{#each codeTokens(text) as token, index (index)}{#if token.kind === 'text'}{token.text}{:else}<span data-token={token.kind}>{token.text}</span>{/if}{/each}</pre>
+<pre class="code" tabindex="0">{#each codeTokens(text, toml) as token, index (index)}{#if token.kind === 'text'}{token.text}{:else}<span data-token={token.kind}>{token.text}</span>{/if}{/each}</pre>
 
 <style>
   pre.code {
@@ -47,6 +49,7 @@
   [data-token='literal'] {
     color: var(--code-number);
   }
+  [data-token='comment'],
   [data-token='punct'] {
     color: var(--code-muted);
   }

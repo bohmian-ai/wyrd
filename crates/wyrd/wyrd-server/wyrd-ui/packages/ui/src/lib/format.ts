@@ -123,9 +123,9 @@ export function fmtYaml(value: unknown, indent = ''): string {
   return `${indent}${inline(value)}`;
 }
 
-/** One run of JSON or YAML text and the syntax role it is coloured by. */
+/** One run of JSON, YAML or TOML text and the syntax role it is coloured by. */
 export interface CodeToken {
-  kind: 'key' | 'string' | 'number' | 'literal' | 'punct' | 'text';
+  kind: 'key' | 'string' | 'number' | 'literal' | 'punct' | 'comment' | 'text';
   text: string;
 }
 
@@ -133,14 +133,19 @@ export interface CodeToken {
 const CODE =
   /(?<key>"(?:[^"\\\n]|\\.)*"(?=\s*:)|(?<=^[ \t]*(?:- )*)[A-Za-z_][\w./-]*(?=:(?:\s|$)))|(?<string>"(?:[^"\\\n]|\\.)*"|'[^'\n]*')|(?<number>(?<![\w.@-])-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?(?![\w.@:-]))|(?<literal>\b(?:true|false|null)\b)|(?<punct>[{}[\]]|[:,](?=\s|$)|(?<=^[ \t]*)- )/gm;
 
+// ponytail: the TOML a wyrd.toml uses (comments, tables, keys, basic values); no multi-line strings or dates.
+const TOML =
+  /(?<comment>#.*$)|(?<string>"(?:[^"\\\n]|\\.)*"|'[^'\n]*')|(?<key>[A-Za-z_][\w.-]*(?=\s*=)|(?<=^[ \t]*\[)[\w.-]+(?=\]))|(?<number>(?<![\w.-])-?\d+(?:\.\d+)?(?![\w.-]))|(?<literal>\b(?:true|false)\b)|(?<punct>[{}[\],=])/gm;
+
 /**
- * JSON or YAML text → runs by syntax role, for colouring. The runs joined
- * are exactly the text given: nothing is added, dropped or reordered.
+ * JSON or YAML text, or TOML when `toml` is set → runs by syntax role, for
+ * colouring. The runs joined are exactly the text given: nothing is added,
+ * dropped or reordered.
  */
-export function codeTokens(text: string): CodeToken[] {
+export function codeTokens(text: string, toml = false): CodeToken[] {
   const tokens: CodeToken[] = [];
   let at = 0;
-  for (const match of text.matchAll(CODE)) {
+  for (const match of text.matchAll(toml ? TOML : CODE)) {
     if (match.index > at) tokens.push({ kind: 'text', text: text.slice(at, match.index) });
     const [kind] = Object.entries(match.groups ?? {}).find(([, value]) => value !== undefined) as [CodeToken['kind'], string];
     tokens.push({ kind, text: match[0] });

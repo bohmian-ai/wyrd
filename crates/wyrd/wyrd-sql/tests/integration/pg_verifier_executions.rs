@@ -4345,6 +4345,9 @@ fn pr_key(repository: &RepositoryId) -> PullRequestKey<'_> {
 
 /// What a cancellation of `executions` must return: each execution with the
 /// Verifier and attribution its stored row holds, in execution order.
+///
+/// # Panics
+/// Panics when an execution's status cannot be read or does not exist.
 async fn stored_cancellations(
     queue: &VerifierExecutionQueue,
     conn: &mut TenantConn<'_>,

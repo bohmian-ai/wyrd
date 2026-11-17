@@ -184,6 +184,10 @@ impl Flusher {
     /// The lock is held only while waiting for and taking runs, so the other
     /// tasks flush meanwhile. A panic ends only this task; the runs it held
     /// get no reply and settle alone.
+    ///
+    /// # Panics
+    /// Panics after taking queued runs when a test armed a completion flush
+    /// crash through `CapabilityCrash::crash_next_completion_flush`.
     async fn run(self) {
         let mut batch = Vec::with_capacity(BATCH);
         loop {

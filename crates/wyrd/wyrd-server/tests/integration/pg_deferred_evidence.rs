@@ -19,6 +19,7 @@ use wyrd_loader::{build_declaration_input, load};
 use wyrd_server::state::LimitsConfig;
 use wyrd_server::verification::engines::EngineOutcome;
 use wyrd_server::verification::hosted::HostedLimits;
+use wyrd_server::verification::hosted::sandbox::Sandbox;
 use wyrd_server::verification::runner::EngineScript;
 use wyrd_server::verification::{RuntimeLimits, VerificationRuntime};
 use wyrd_spec::ids::SlotName;
@@ -596,15 +597,16 @@ async fn a_waiting_execution_finishes_after_a_restart() {
 /// the execution does not wait and then pass.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_parked_execution_releases_compute_before_its_park_is_acknowledged() {
+    let hosted = HostedLimits {
+        monty_min_workers: 0,
+        model_calls: 1,
+        ..HostedLimits::default()
+    };
     let deployment = Deployment::launch(|builder| {
         builder
             .with_verification_runtime_for_test()
             .with_verification_runtime_limits_for_test(limits(Duration::from_mins(5)))
-            .with_verification_limits_for_test(HostedLimits {
-                monty_min_workers: 0,
-                model_calls: 1,
-                ..HostedLimits::default()
-            })
+            .with_verification_limits_for_test(hosted)
     })
     .await;
     let measured = ci_gate("1.0.0").replace(
@@ -618,21 +620,31 @@ async fn a_parked_execution_releases_compute_before_its_park_is_acknowledged() {
             "gate-measured",
         )
         .await;
-    // The claim's `running` status row is the execution's first events
-    // write; the state writes share its outbox lane and follow it, so the
-    // second stall, armed while the first holds, takes the state write.
-    let running = deployment
+    // Process memory short of one session envelope, with room left for the
+    // Scribe work that shares it, holds the Python step before it runs. Its
+    // earlier writes, the claim's `running` status row among them, are then
+    // drained, so the one stall takes the execution's state write.
+    assert!(Sandbox::envelope_bytes(&hosted).expect("the envelope fits u64") > 64 << 20);
+    let held = deployment
         .server
-        .stall_next_bifrost_write_into("bifrost.verification.execution_events")
-        .expect("Scribe stalls");
+        .occupy_hosted_memory(64 << 20)
+        .expect("blocks are hosted");
     let parked = deployment.open(7, C1).await;
-    running.wait_entered().await;
+    deployment
+        .server
+        .wait_for_hosted_waiters(1, Duration::from_secs(30))
+        .await
+        .expect("the Python step waits for memory");
+    deployment
+        .server
+        .settle_bifrost_outbox()
+        .await
+        .expect("earlier writes reach Scribe");
     let stall = deployment
         .server
         .stall_next_bifrost_write_into("bifrost.verification.execution_events")
         .expect("Scribe stalls");
-    running.release();
-    running.wait_completed().await;
+    drop(held);
     stall.wait_entered().await;
     assert_eq!(deployment.status(parked).await["status"], "running");
     let blocks = deployment
@@ -683,15 +695,16 @@ async fn a_parked_execution_releases_compute_before_its_park_is_acknowledged() {
 /// does not then pass.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_finished_execution_releases_compute_before_its_terminal_is_acknowledged() {
+    let hosted = HostedLimits {
+        monty_min_workers: 0,
+        model_calls: 1,
+        ..HostedLimits::default()
+    };
     let deployment = Deployment::launch(|builder| {
         builder
             .with_verification_runtime_for_test()
             .with_verification_runtime_limits_for_test(limits(Duration::from_mins(5)))
-            .with_verification_limits_for_test(HostedLimits {
-                monty_min_workers: 0,
-                model_calls: 1,
-                ..HostedLimits::default()
-            })
+            .with_verification_limits_for_test(hosted)
     })
     .await;
     let measured = r#"apiVersion: wyrd/v1
@@ -722,21 +735,31 @@ spec:
             "gate-finished",
         )
         .await;
-    // The claim's `running` status row is the execution's first events
-    // write; the state writes share its outbox lane and follow it, so the
-    // second stall, armed while the first holds, takes the state write.
-    let running = deployment
+    // Process memory short of one session envelope, with room left for the
+    // Scribe work that shares it, holds the Python step before it runs. Its
+    // earlier writes, the claim's `running` status row among them, are then
+    // drained, so the one stall takes the execution's state write.
+    assert!(Sandbox::envelope_bytes(&hosted).expect("the envelope fits u64") > 64 << 20);
+    let held = deployment
         .server
-        .stall_next_bifrost_write_into("bifrost.verification.execution_events")
-        .expect("Scribe stalls");
+        .occupy_hosted_memory(64 << 20)
+        .expect("blocks are hosted");
     let finished = deployment.open(8, C1).await;
-    running.wait_entered().await;
+    deployment
+        .server
+        .wait_for_hosted_waiters(1, Duration::from_secs(30))
+        .await
+        .expect("the Python step waits for memory");
+    deployment
+        .server
+        .settle_bifrost_outbox()
+        .await
+        .expect("earlier writes reach Scribe");
     let stall = deployment
         .server
         .stall_next_bifrost_write_into("bifrost.verification.execution_events")
         .expect("Scribe stalls");
-    running.release();
-    running.wait_completed().await;
+    drop(held);
     stall.wait_entered().await;
     let blocks = deployment
         .server

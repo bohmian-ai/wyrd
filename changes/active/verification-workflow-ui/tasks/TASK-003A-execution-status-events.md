@@ -271,10 +271,12 @@ Diagnosis (the first run of the owner lane in command R):
   had stopped proving their claim.
   - The scripted tests now hold the engine and flush the outbox before
     arming.
-  - The hosted-engine tests stall the `running` row first. They arm a second
-    stall while it holds, then release it. The status row and the revision
-    share the execution's outbox lane, so the second stall takes the
-    revision.
+  - The hosted-engine tests first used two successive stalls, assuming the
+    second would take the revision. Review TASK-003A-2026-11-16-01
+    (FIND-TASK-003A-2) showed that is not ordered: frames in one slice
+    submit concurrently. Remediation TASK-003A-R1 holds the Python step on
+    hosted memory, waits for its waiter, drains the outbox, then arms one
+    stall.
 - `pg_durable_verifier_work`'s `HeldRevisions` drives `RunState` through its
   own outbox with no runner, and is not affected.
 

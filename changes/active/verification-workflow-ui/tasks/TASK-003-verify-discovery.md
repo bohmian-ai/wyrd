@@ -121,10 +121,10 @@ belong to integrated change review; focused UI/host journeys prove this task.
 The Verify page at `/t/{tenant}/verify` lists every execution in the range from
 one `bifrost.query` population (`packages/ui/src/lib/schemas.ts`, `EXECUTIONS`),
 with Status and Verdict as separate columns and filters, two linked charts,
-counted facets, grouping, paging, and a row that opens TASK-002's execution page
-and returns to the same list. Status is the newest TASK-003A status row.
-Repository and pull request number are facets and filters, read from a pull
-request execution's recorded input pins.
+counted facets (Status, Verdict, Verifier, Service, Card, Run, Session),
+grouping, paging, and a row that opens TASK-002's execution page and returns to
+the same list. Status is the newest TASK-003A status row. Each row carries its
+execution, subject Card, selected result, binding and Workload identities.
 
 Commands, run from the repository root:
 
@@ -133,36 +133,50 @@ mise run ui:check
 mise exec -- scripts/postgres/with-test-postgres.sh -- env WYRD_UI_INTEGRATION=1 pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.integration.test.ts src/lib/ui-pages.integration.test.ts
 ```
 
-`ui:check` passes (74 tests). Both integration files passed in full (26 tests)
-at `6ccb565d3`; the two assertions added after it were rerun by their own tests.
+`ui:check` passes (74 tests) and both integration files pass (26 tests) at
+`5ef2a850a`; the keyboard and phone-width steps added after it pass in the
+browser journey at `66c395825`.
 
 | Proof | Test |
 |---|---|
-| One population for rows, facets and charts; the status and selected-result SQL | `ui-pages.test.ts`: "executions list, facets and charts", "the Verify dashboard reads one population and keeps its investigation in the URL" |
-| Real server: a running row matches `get_execution` (Node only); completed and cancelled rows, facets and charts agree on Node and MCP; refusals and another tenant show no rows | `ui-library.integration.test.ts`: "Verify lists executions with and without a recorded result as one authorized population through every host" |
-| Real server: pending, waiting, retrying, timed out and errored rows; pull request facets | `ui-library.integration.test.ts`: "Verify lists pull request executions…", "…waiting for deferred evidence…", "…retrying for a trace that has not landed…", "Verify lists a timed out and an errored execution…" |
-| Browser: filter, group, brush, page, open a row and return; a superseded load never replaces a newer one | `ui-pages.integration.test.ts`: "the Verify dashboard filters, groups, brushes, pages, opens an execution and returns to the same list" |
+| One population for rows, facets and charts; the status and selected-result SQL; the facet list; row identities | `ui-pages.test.ts`: "executions list, facets and charts", "the Verify dashboard reads one population and keeps its investigation in the URL" |
+| Real server: a running row matches `get_execution` (Node only); completed and cancelled rows, their subject identity, facets and charts agree on Node and MCP; refusals and another tenant show no rows | `ui-library.integration.test.ts`: "Verify lists executions with and without a recorded result as one authorized population through every host" |
+| Real server, Node only: pending, waiting, retrying, timed out and errored rows match `get_execution` | `ui-library.integration.test.ts`: "Verify lists pending work admitted for a pull request…", "…waiting for deferred evidence…", "…retrying for a trace that has not landed…", "Verify lists a timed out and an errored execution…" |
+| Browser: filter, group, brush (rows change), page, open a row and return, by mouse and by keyboard, and at phone width; a superseded load never replaces a newer one | `ui-pages.integration.test.ts`: "the Verify dashboard filters, groups, brushes, pages, opens an execution and returns to the same list" |
 
-TDD: the population, status and pull request changes had a failing unit test
-first. The real-server journeys were written after the production query.
+TDD: the population, status, facet-list and row-identity changes had a failing
+unit test first. The real-server journeys were written after the production query.
+
+Comparison with the approved mock (real page captured by the browser journey in
+light and dark at 1280 and 390 wide; mock captured by `selfcheck.mjs --shots`).
+The WHERE box, zoom, range, Live, both charts and legends, the facet rail and
+its order, and the table columns match. Differences:
+
+- Group by is a select on the right; the mock has a row of buttons on the left
+  with the total execution count beside it.
+- The chart headings do not show the total count.
+- The table pages with Newer and Older; the mock shows "Showing 50 of N" with
+  "Show 50 more".
+- The mock's Failed column and Failed requirement facet are absent (see the
+  decision below on requirement filtering; the column was not ruled on).
+- The mock's Repository and Pull request facets and groups are absent; they
+  belong to TASK-005 and were removed from this task.
 
 User decisions, 2026-11-17:
 
 - The list reads the newest status row only; an execution with none is pending.
 - The list filters by failed verdict and by Verifier, never by a specific requirement.
 - The list needs tenant-wide Bifrost read; a Verifier-scoped list is out of scope.
-- Review-set grouping is not part of this task.
+- Repository and pull request context on Verify is TASK-005's.
 
-Not proven, and not built by the decisions above or by choice:
+Not proven:
 
-- The pending, waiting, retrying, timed out and errored journeys and the pull
-  request facets run through the Node executor only, not MCP or the browser.
-- No real-server test holds a second, non-selected result for one execution;
-  the selected-result join is covered by the SQL unit test only.
+- The five status journeys above run through the Node executor only.
+- No real-server test holds a second, non-selected result for one execution,
+  or a completed execution whose result has not yet landed; both are covered
+  at unit or component level only.
 - No unfinished session or drift execution is listed on a real server.
-- Result-visibility lag is shown at component level only.
-- AC-009's mock comparison in both themes and widths, keyboard, focus, touch,
-  long content and error states has not been done.
+- Touch input and long-content states were not exercised.
 
-Status: `BLOCKED`. Open: AC-009, the user's own review of the Verify page
-against the approved mock.
+Status: `BLOCKED`. Open: the mock differences above, and AC-009's human
+acceptance of the page.

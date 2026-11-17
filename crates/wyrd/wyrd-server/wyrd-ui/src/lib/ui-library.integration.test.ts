@@ -4,7 +4,7 @@
  * `@wyrd/testing` over repository Postgres, through the SDK, the MCP endpoint,
  * and the BFF's real browser session. Nothing here mocks the server.
  */
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { copyFileSync, cpSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
@@ -14,7 +14,8 @@ import { render } from '@testing-library/svelte';
 import { expect, vi } from 'vitest';
 import { TraceWaterfall } from 'wyrd-ai-ui';
 import { z } from 'zod';
-import { Bifrost, Cards, Principals, TableConfig, WyrdClient, WyrdState } from 'wyrd-ai';
+import { Bifrost, Cards, GithubConnection, Principals, TableConfig, WyrdClient, WyrdState } from 'wyrd-ai';
+import { signInGithubBrowser } from '@wyrd/testing';
 import {
   CardRefSchema,
   loadArtifactTable,
@@ -1528,6 +1529,67 @@ judged('Verify lists executions with and without a recorded result as one author
   });
   await vi.waitFor(() => expect(dark.document.querySelector('[data-panel="list"]')?.textContent).toMatch(/WYRD_[A-Z0-9_]+/));
   expect(dark.document.querySelector('[data-panel="list"]')?.textContent).not.toContain('No execution matches');
+});
+
+/** A fresh deployment with the GitHub App mock, for a tenant that connects a repository. */
+const reviewed = serverTest({ githubApp: true, perTest: true });
+
+reviewed('Verify lists pull request executions by their recorded repository and number', async ({ server }) => {
+  // The tenant connects installation 101 and declares the review policy of its repository `acme/api` (provider id 1).
+  const github = server.githubApp;
+  github.addInstallation(101, [{ id: 1, fullName: 'acme/api' }]);
+  github.addUser('octo', [101]);
+  github.signIn('octo');
+  github.installTarget(101);
+  const key = server.bootstrapService(['admin'], 'verify_repository_admin');
+  const admin = WyrdClient.connect({ credential: key });
+  const connection = await (await GithubConnection.connect({ client: admin })).begin();
+  expect(signInGithubBrowser(server.baseUrl, server.tenantSlug, key).open(connection.authorization_url).status).toBe(200);
+  const checkout = mkdtempSync(join(tmpdir(), 'wyrd-ui-verify-checkout-'));
+  cpSync(fixture('cards/repository_declaration'), checkout, { recursive: true });
+  mkdirSync(join(checkout, '.git'));
+  writeFileSync(join(checkout, '.git/config'), `[remote "origin"]\n\turl = http://${github.host}/acme/api.git\n`);
+  copyFileSync(join(checkout, 'policies/minimal.toml'), join(checkout, 'wyrd.toml'));
+  await (await Cards.connect({ client: admin })).declareFromPath(join(checkout, 'wyrd.toml'));
+
+  // Pull request 7 opens and is then pushed to, which supersedes its first execution; pull request 8 opens.
+  const deliver = (number: number, action: string) => expect(github.deliverPullRequest(server.baseUrl, 101, 1, number, action)).toBe(202);
+  github.setPullRequest(1, 7, 'b1', 'a1');
+  deliver(7, 'opened');
+  github.setPullRequest(1, 7, 'b1', 'b2');
+  deliver(7, 'synchronize');
+  github.setPullRequest(1, 8, 'b1', 'c1');
+  deliver(8, 'opened');
+
+  const context = { executor: nodeExecutor(admin), range: { from: new Date(Date.now() - 3_600_000).toISOString(), to: new Date(Date.now() + 60_000).toISOString() } };
+  const named = (read: QueryResult) => read.rows.map((row) => Object.fromEntries(read.columns.map((column, at) => [column.name, row[at]])));
+  const list = async (where: { column: string; value: string }[]) => {
+    const loaded = await loadRecordTable({ signal: 'executions', columns: ['recorded_at', 'origin', 'repository', 'pull_request', 'status', 'verdict'], where } as never, context);
+    return loaded.result.state === 'populated' ? named(loaded.result.data.rows) : [];
+  };
+
+  // Both executions of pull request 7 are listed with their recorded repository and number: the superseded one cancelled, its successor pending.
+  let seventh: Record<string, unknown>[] = [];
+  await vi.waitFor(
+    async () => {
+      server.flushBifrost();
+      seventh = await list([{ column: 'pull_request', value: '7' }]);
+      expect(seventh.map((row) => row.status).sort()).toEqual(['cancelled', 'pending']);
+    },
+    { timeout: 30_000, interval: 500 }
+  );
+  for (const row of seventh) expect(row).toMatchObject({ origin: 'pull_request', repository: '1', pull_request: '7', verdict: null });
+
+  // The filters combine, and the pending row is the execution its own exact read describes.
+  const [pending] = await list([{ column: 'pull_request', value: '7' }, { column: 'status', value: 'pending' }]);
+  const [live] = await context.executor.run([{ op: 'verification.get_execution', execution_id: pending.execution_id as string }]);
+  expect(live.ok && [live.value.status, live.value.pull_request?.number, live.value.pull_request?.repository_id, live.value.pull_request?.head.sha]).toEqual(['pending', 7, '1', 'b2']);
+  expect(await list([{ column: 'repository', value: '1' }, { column: 'pull_request', value: '9' }])).toEqual([]);
+
+  // The facets count the same three executions by repository and by pull request.
+  const rail = await loadFacetRail({ signal: 'executions', facets: ['repository', 'pull_request', 'origin'] } as never, context);
+  if (rail.result.state !== 'populated') throw new Error(JSON.stringify(rail.result));
+  expect(rail.result.data.facets.map((facet) => facet.values.rows)).toEqual([[['1', 3]], [['7', 2], ['8', 1]], [['pull_request', 3]]]);
 });
 
 /** The `coding-verifier` statement every request of its `spans-reviewed` check carries. */

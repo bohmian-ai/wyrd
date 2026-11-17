@@ -317,7 +317,7 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
    - `critical_pressure_reclaims_then_cancels_one_victim_per_sample`: reclaim first, one victim per sample, uncancellable ineligible.
    - `paused_admission_starts_after_recovery`.
 
-   RED: all 5 failed on behavior assertions against the stub controller. GREEN: R1. TDD: PASS.
+   RED: all 5 failed on behavior assertions against the stub controller. GREEN: R1. TDD: VIOLATED for the later assertions below.
 
    Independent check: `paused_admission_starts_after_recovery` documented
    that a dropped waiter withdraws its demand but did not assert it. It now

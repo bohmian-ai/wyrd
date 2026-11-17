@@ -1014,7 +1014,8 @@ async fn pending_groups_debounce_and_stop_after_handoff() {
             let outcome = queue
                 .accept_grouped(&mut claimer, &admission)
                 .await
-                .expect("admits");
+                .expect("admits")
+                .outcome;
             assert!(
                 matches!(outcome, EnqueueOutcome::Enqueued(_)),
                 "{outcome:?}"

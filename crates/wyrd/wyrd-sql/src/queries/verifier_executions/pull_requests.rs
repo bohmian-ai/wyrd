@@ -33,7 +33,8 @@ use wyrd_spec::verification::execution::PullRequestActivation;
 use wyrd_spec::verification::{VerificationError, VerificationExecutionStatus};
 
 use super::{
-    EnqueueRefusal, ExecutionAuthority, VerifierExecutionQueue, resolve_binding, stored, timed,
+    Admitted, EnqueueRefusal, ExecutionAuthority, VerifierExecutionQueue, resolve_binding, stored,
+    timed,
 };
 use crate::{OperatorPool, TenantConn};
 
@@ -720,7 +721,8 @@ impl VerifierExecutionQueue {
     /// binding deleted since it was listed reserves nothing. Admissions are
     /// ordered against principal revocation as every other admission is, so
     /// a revoked owner's reservation is cancelled before the commit. Returns the
-    /// generation's executions in target order and the superseded ones.
+    /// generation's executions in target order and the superseded ones, with
+    /// what that fence cancelled.
     ///
     /// # Errors
     /// Returns the database error when a statement fails, or a decode error
@@ -732,7 +734,7 @@ impl VerifierExecutionQueue {
         activation: &PullRequestActivation,
         observed_at: DateTime<Utc>,
         targets: &[PullRequestTarget],
-    ) -> Result<(Vec<ExecutionId>, Vec<ExecutionId>), SqlxError> {
+    ) -> Result<Admitted<(Vec<ExecutionId>, Vec<ExecutionId>)>, SqlxError> {
         timed("pull_request_reserve", async {
             let key = PullRequestKey {
                 host: &activation.host,
@@ -799,12 +801,15 @@ impl VerifierExecutionQueue {
                     reserved.push(execution_id);
                 }
             }
-            self.fence_principals(conn, accepted).await?;
+            let cancelled = self.fence_principals(conn, accepted).await?;
             let superseded_ids = superseded_rows
                 .into_iter()
                 .map(|id| stored(ExecutionId::new(id)))
                 .collect::<Result<_, _>>()?;
-            Ok((reserved, superseded_ids))
+            Ok(Admitted {
+                outcome: (reserved, superseded_ids),
+                cancelled,
+            })
         })
         .await
     }

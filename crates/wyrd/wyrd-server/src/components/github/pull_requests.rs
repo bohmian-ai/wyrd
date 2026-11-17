@@ -47,15 +47,15 @@ use wyrd_spec::verification::VerificationError;
 use wyrd_spec::verification::execution::{PullRequestActivation, PullRequestRef};
 use wyrd_sql::queries::cards::{repository_family_name, selected_repository};
 use wyrd_sql::queries::verifier_executions::{
-    Admission, PullRequestAdmission, PullRequestEnd, PullRequestExecution, PullRequestGeneration,
-    PullRequestKey, PullRequestTarget, VerifierExecutionQueue,
+    Admission, Admitted, PullRequestAdmission, PullRequestEnd, PullRequestExecution,
+    PullRequestGeneration, PullRequestKey, PullRequestTarget, VerifierExecutionQueue,
 };
 
 use super::app::{GithubApp, PullRequestBody, unavailable};
 use super::service::{GithubConnections, InstallationAccess};
 use crate::audit;
 use crate::components::auth::Caller;
-use crate::scribe_outbox::ScribeWrite;
+use crate::scribe_outbox::{ScribeWrite, stage_cancelled};
 use crate::state::registry_db_error;
 use crate::verification::authority::{AuthorityRefusal, BackgroundAuthority};
 use crate::verification::results::{InputRecord, ResultPayloadBuilder, ResultRun};
@@ -286,6 +286,7 @@ impl GithubConnections<'_> {
             delivery_id: delivery_id.to_owned(),
             generation: Uuid::now_v7(),
         };
+        let mut fenced = Vec::new();
         let replay = history
             .current
             .as_ref()
@@ -308,10 +309,14 @@ impl GithubConnections<'_> {
                 );
                 return Ok(Vec::new());
             };
-            let (reserved, superseded) = queue
+            let Admitted {
+                outcome: (reserved, superseded),
+                cancelled,
+            } = queue
                 .reserve_pull_request(&mut conn, &source, observed_at, &targets)
                 .await
                 .map_err(registry_db_error)?;
+            fenced = cancelled;
             tracing::info!(
                 reserved = reserved.len(),
                 superseded = superseded.len(),
@@ -323,7 +328,14 @@ impl GithubConnections<'_> {
             .await
             .map_err(registry_db_error)?
             .current;
+        let occurred_at = chrono::Utc::now();
         conn.commit().await.map_err(registry_db_error)?;
+        stage_cancelled(
+            self.state.bifrost.scribe_outbox(),
+            tenant,
+            fenced,
+            occurred_at,
+        );
         match generation {
             Some(generation) => self.hand_off(tenant, &generation).await,
             None => Ok(Vec::new()),

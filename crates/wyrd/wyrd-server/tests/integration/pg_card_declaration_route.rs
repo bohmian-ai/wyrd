@@ -4861,7 +4861,8 @@ async fn runtime_activity_follows_only_qualifying_exchanges() {
         let tick = queue
             .schedule_due(&mut conn, due, accepted)
             .await
-            .expect("scheduler ticks");
+            .expect("scheduler ticks")
+            .outcome;
         outcomes.push(tick.outcome);
     }
     let (executions, cursor_ahead): (i64, f64) = sqlx::query_as(

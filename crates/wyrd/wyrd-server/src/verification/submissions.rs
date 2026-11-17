@@ -43,13 +43,14 @@ use uuid::Uuid;
 use wyrd_runtime::outbox::{Outbox, OutboxLimits, OutboxSink};
 use wyrd_spec::DataTenantId;
 use wyrd_sql::queries::verifier_executions::{
-    Admission, EnqueueOutcome, SubmissionOutcome, VerifierExecutionQueue,
+    Admission, Admitted, EnqueueOutcome, SubmissionOutcome, VerifierExecutionQueue,
 };
 use wyrd_sql::{SqlError, WyrdPostgres};
 
 use super::cache::{Db, VerifierCardCache};
 use super::scheduler::InFlight;
 pub use crate::scribe_outbox::Acknowledged;
+use crate::scribe_outbox::{ScribeOutbox, stage_cancelled};
 
 /// Wyrd pool connections the queue writer holds at once across every
 /// tenant, and the lanes of each tenant; one busy tenant may use all of them.
@@ -126,22 +127,27 @@ pub struct SubmissionSink {
     /// Notified once per commit that queued at least one new execution; it
     /// stores a single notification while no claim loop waits.
     accepted: Arc<Notify>,
+    /// The process Scribe outbox each committed batch's admission-time
+    /// cancellations are recorded on.
+    scribe: Arc<ScribeOutbox>,
 }
 
 impl SubmissionSink {
-    /// Start the process submission outbox over `postgres`.
+    /// Start the process submission outbox over `postgres`, recording
+    /// admission-time cancellations on `scribe`.
     ///
     /// # Panics
     /// Panics when called outside a Tokio runtime, because the writer task is
     /// spawned immediately.
     #[must_use]
-    pub fn outbox(postgres: WyrdPostgres) -> Arc<SubmissionOutbox> {
+    pub fn outbox(postgres: WyrdPostgres, scribe: Arc<ScribeOutbox>) -> Arc<SubmissionOutbox> {
         Outbox::new(
             Self {
                 postgres,
                 queue: VerifierExecutionQueue::default(),
                 verifier_cards: Arc::default(),
                 accepted: Arc::new(Notify::new()),
+                scribe,
             },
             SUBMISSION_WRITER_CONNECTIONS,
             OutboxLimits {
@@ -292,7 +298,10 @@ impl OutboxSink for SubmissionSink {
                 refusals.insert(pair, refusal);
             }
         }
-        let outcomes = self
+        let Admitted {
+            outcome: outcomes,
+            mut cancelled,
+        } = self
             .queue
             .accept_submissions(&mut conn, &submissions, &refusals)
             .await
@@ -308,14 +317,18 @@ impl OutboxSink for SubmissionSink {
                 }
                 Admission::Submitted(_) | Admission::PullRequest(_) => continue,
             };
-            admitted.push(outcome.map_err(SqlError::Query)?);
+            let outcome = outcome.map_err(SqlError::Query)?;
+            cancelled.extend(outcome.cancelled);
+            admitted.push(outcome.outcome);
         }
         let activated = self
             .queue
             .activate_pull_requests(&mut conn, &pull_requests)
             .await
             .map_err(SqlError::Query)?;
+        let occurred_at = chrono::Utc::now();
         conn.commit().await?;
+        stage_cancelled(&self.scribe, tenant, cancelled, occurred_at);
         if outcomes
             .iter()
             .any(|outcome| matches!(outcome, SubmissionOutcome::Accepted))

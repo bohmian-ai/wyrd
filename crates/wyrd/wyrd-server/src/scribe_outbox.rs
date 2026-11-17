@@ -105,7 +105,9 @@ use wyrd_spec::vala::{
 };
 use wyrd_spec::verification::VerificationExecutionStatus;
 use wyrd_sql::WyrdPostgres;
-use wyrd_sql::queries::verifier_executions::{GroupActivity, VerifierExecutionQueue};
+use wyrd_sql::queries::verifier_executions::{
+    CancelledExecution, GroupActivity, VerifierExecutionQueue,
+};
 use wyrd_tonic::otlp::trace::v1::ResourceSpans;
 use wyrd_tonic::prost::Message as _;
 use wyrd_tonic::tonic::Code;
@@ -2231,6 +2233,31 @@ impl OutboxSink for ScribeSink {
             }
         }
         Ok(())
+    }
+}
+
+/// Stage the `cancelled` status row of every execution in `cancelled`, which
+/// a committed principal revocation or admission fence settled at
+/// `occurred_at`, without waiting.
+///
+/// The caller stages only after its transaction commits.
+pub(crate) fn stage_cancelled(
+    outbox: &ScribeOutbox,
+    tenant: DataTenantId,
+    cancelled: Vec<CancelledExecution>,
+    occurred_at: DateTime<Utc>,
+) {
+    for execution in cancelled {
+        outbox.stage(
+            tenant,
+            ScribeWrite::status(
+                execution.execution_id,
+                &execution.verifier_card_uid,
+                VerificationExecutionStatus::Cancelled,
+                execution.attribution,
+                occurred_at,
+            ),
+        );
     }
 }
 

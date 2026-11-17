@@ -158,6 +158,7 @@ pub fn shell_owners(
 ) -> AppStateInner {
     let verification = Verification::new(
         postgres.wyrd().clone(),
+        Arc::clone(bifrost.scribe_outbox()),
         None,
         OperatorKeys::default(),
         crate::verification::RuntimeLimits::default().execution_timeout,

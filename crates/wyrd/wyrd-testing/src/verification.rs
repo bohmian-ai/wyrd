@@ -695,7 +695,7 @@ impl VerificationFixture {
             )
             .await?;
         conn.commit().await?;
-        match outcomes.as_slice() {
+        match outcomes.outcome.as_slice() {
             [SubmissionOutcome::Accepted] => Ok(submission.execution_id),
             other => Err(VerificationFixtureError::NotEnqueued(format!("{other:?}"))),
         }

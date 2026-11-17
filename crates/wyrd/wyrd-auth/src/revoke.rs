@@ -12,7 +12,7 @@ use wyrd_sql::queries::auth::{
     lock_refresh_family, revoke_refresh_family, service_account_by_id,
     suspend_service_account_principal, suspend_user_principal, user_by_id,
 };
-use wyrd_sql::queries::verifier_executions::VerifierExecutionQueue;
+use wyrd_sql::queries::verifier_executions::{CancelledExecution, VerifierExecutionQueue};
 
 /// Revoke `target_id` in the table the caller's declared `kind` names.
 ///
@@ -33,7 +33,8 @@ use wyrd_sql::queries::verifier_executions::VerifierExecutionQueue;
 /// acting on authority the commit retires. Every admission share-locks its
 /// principals' rows before it commits, so the suspension either waits for an
 /// admission in flight and then cancels its row, or commits first and the
-/// admission cancels its own row.
+/// admission cancels its own row. Returns every execution cancelled, which
+/// the caller records once it commits.
 ///
 /// The kind is a selector, not a hint: principal ids are unique only within
 /// their table, so revoking on the caller's claim rather than on whichever
@@ -52,7 +53,7 @@ pub async fn revoke_principal_in_conn(
     target_id: PrincipalId,
     kind: PrincipalKindTag,
     tenant: DataTenantId,
-) -> Result<(), WyrdError> {
+) -> Result<Vec<CancelledExecution>, WyrdError> {
     let id_uuid = target_id.as_uuid();
 
     if kind == PrincipalKindTag::User {
@@ -98,19 +99,19 @@ pub async fn revoke_principal_in_conn(
     cancel_executions(conn, target_id).await
 }
 
-/// Cancel the revoked principal's unfinished Verifier executions.
+/// Cancel the revoked principal's unfinished Verifier executions, returning
+/// each one cancelled.
 ///
 /// # Errors
 /// Returns [`WyrdError::Internal`] when the cancellation fails.
 async fn cancel_executions(
     conn: &mut TenantConn<'_>,
     target_id: PrincipalId,
-) -> Result<(), WyrdError> {
+) -> Result<Vec<CancelledExecution>, WyrdError> {
     VerifierExecutionQueue::default()
         .cancel_principal(conn, target_id)
         .await
-        .map_err(internal_error)?;
-    Ok(())
+        .map_err(internal_error)
 }
 
 /// Build the single non-enumerating refusal shared by every miss.

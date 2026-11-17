@@ -1371,6 +1371,7 @@ impl AppState {
             };
             let verification = Verification::new(
                 dependencies.postgres.wyrd().clone(),
+                Arc::clone(bifrost.scribe_outbox()),
                 blocks,
                 OperatorKeys::for_role(config.role, &config.verification.operator_keys)?,
                 config.verification.runtime.execution_timeout,

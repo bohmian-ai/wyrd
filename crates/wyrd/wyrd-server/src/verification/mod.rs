@@ -45,6 +45,7 @@ use tokio_util::sync::CancellationToken;
 use wyrd_sql::queries::verifier_executions::VerifierExecutionQueue;
 
 use crate::components::operators::keys::OperatorKeys;
+use crate::scribe_outbox::ScribeOutbox;
 use crate::state::{AppState, EngineWorker};
 
 use self::cache::VerifierCardCache;
@@ -84,9 +85,10 @@ pub struct Verification {
 }
 
 impl Verification {
-    /// Capabilities over `postgres`, hosting `blocks`, sealing Operator
-    /// connections with `operator_keys`, and closing queued executions
-    /// `execution_timeout` after admission.
+    /// Capabilities over `postgres`, recording admission-time cancellations
+    /// on `scribe`, hosting `blocks`, sealing Operator connections with
+    /// `operator_keys`, and closing queued executions `execution_timeout`
+    /// after admission.
     ///
     /// # Panics
     /// Panics when called outside a Tokio runtime, because the submission
@@ -94,6 +96,7 @@ impl Verification {
     #[must_use]
     pub fn new(
         postgres: wyrd_sql::WyrdPostgres,
+        scribe: Arc<ScribeOutbox>,
         blocks: Option<HostedBlocks>,
         operator_keys: OperatorKeys,
         execution_timeout: Duration,
@@ -101,7 +104,7 @@ impl Verification {
         Self {
             health: Arc::default(),
             blocks: blocks.map(Arc::new),
-            submissions: SubmissionSink::outbox(postgres),
+            submissions: SubmissionSink::outbox(postgres, scribe),
             operator_keys: Arc::new(operator_keys),
             execution_timeout,
         }

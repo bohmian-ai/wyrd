@@ -500,7 +500,11 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
          `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-server --features test-support --lib -E 'test(/components::gateway::/) | test(/http::middleware::/)'"`.
      - `http::middleware::body_limit::tests::a_taken_body_charge_outlives_the_response`:
        a taken 40-byte charge stays on the ledger after the response, once,
-       and returns when dropped. Same command.
+       and returns when dropped. An untaken charge stays while a handler
+       that dropped the request's extensions still runs; the middleware
+       keeps its own custody handle until the response returns. RED: left
+       [0], right [20]. GREEN (7 passed):
+       `mise exec -- cargo nextest run --locked -p wyrd-server --features test-support --lib -E 'test(/http::middleware::body_limit::/)'`.
      - Journey `verification_runtime::isolated_capacity::standalone_call_bodies_count_as_gateway_work_while_the_call_runs`:
        - Over raw HTTP, a 64 KiB chat completion held at the provider (the
          existing `HeldUpstream`, now in front of the desk's upstream)

@@ -215,8 +215,14 @@ where
                     }
                     let mut request = Request::from_parts(parts, Body::from(bytes));
                     if let BodyCharge::Memory(charge) = charge {
-                        request.extensions_mut().insert(BodyCustody::new(charge));
-                        return inner.call(request).await.map_err(Into::into);
+                        // The middleware keeps its own handle, so an untaken
+                        // charge stays until the response returns even when
+                        // the handler drops the request's extensions first.
+                        let custody = BodyCustody::new(charge);
+                        request.extensions_mut().insert(custody.clone());
+                        let response = inner.call(request).await.map_err(Into::into);
+                        drop(custody);
+                        return response;
                     }
                     let response = inner.call(request).await.map_err(Into::into);
                     drop(charge);
@@ -572,7 +578,8 @@ mod tests {
 
     /// A handler that takes its body's charge keeps it past the response,
     /// so the body stays counted, once, until the handler's work settles;
-    /// an untaken charge returns with the response.
+    /// an untaken charge stays until the response returns, even when the
+    /// handler drops the request's extensions first.
     ///
     /// # Panics
     ///
@@ -609,6 +616,34 @@ mod tests {
             memory.used(),
             0,
             "dropping the taken charge returns the body"
+        );
+
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&observed);
+        let ledger = memory.clone();
+        let service = ServiceBuilder::new()
+            .layer(wyrd_body_limit(1024, None, None, memory.clone()))
+            .service(service_fn(move |request: Request<Body>| {
+                let (mut parts, body) = request.into_parts();
+                parts.extensions.clear();
+                seen.lock().expect("observations").push(ledger.used());
+                drop(body);
+                async { Ok::<_, Infallible>(Response::new(Body::empty())) }
+            }));
+        let request = Request::builder()
+            .uri("/v1/chat/completions")
+            .body(Body::from(vec![0_u8; 20]))
+            .expect("request");
+        service.oneshot(request).await.expect("response");
+        assert_eq!(
+            *observed.lock().expect("observations"),
+            [20],
+            "an untaken charge stays while the handler runs, without its extensions"
+        );
+        assert_eq!(
+            memory.used(),
+            0,
+            "an untaken charge returns with the response"
         );
     }
 

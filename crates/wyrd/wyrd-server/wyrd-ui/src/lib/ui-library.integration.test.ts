@@ -1377,7 +1377,7 @@ judged('Verify lists executions with and without a recorded result as one author
       expect((await all({ where: [{ column: 'group_id', value: 'ui-verify-conversation' }] }, executor)).map((each) => each.execution_id).sort(), surface).toEqual([session.execution_id, ...turns].sort());
       expect((await all({ where: [{ column: 'verdict', value: null }] }, executor)).map((each) => each.execution_id).sort(), surface).toEqual([stopped]);
       // An incompatible combination is empty, and says so.
-      expect(await page({ where: [{ column: 'status', value: 'running' }, { column: 'verdict', value: 'passed' }] }, executor), surface).toMatchObject({ rows: [], reason: 'No execution matches these filters in this window.' });
+      expect(await page({ where: [{ column: 'status', value: 'cancelled' }, { column: 'verdict', value: 'passed' }] }, executor), surface).toMatchObject({ rows: [], reason: 'No execution matches these filters in this window.' });
       // An earlier range holds nothing.
       expect((await loadRecordTable({ signal: 'executions' }, { executor, range: BEFORE })).result.state, surface).toBe('empty');
       // Bounded shared queries only: no execution's status or details was read to build the list, counts or charts.

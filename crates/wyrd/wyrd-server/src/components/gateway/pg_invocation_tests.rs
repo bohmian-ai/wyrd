@@ -6961,6 +6961,25 @@ async fn buffered_answers_count_against_the_calling_workload() {
     );
     body_json(relayed).await;
     assert_eq!(workloads.workload_bytes(Workload::Gateway), 0);
+
+    dispatch.push(Step::Return(media_completed(PAYLOAD_OBJECT_BYTES)));
+    let media = GatewayInvocation::new(&state)
+        .invoke(&caller, request("dep-a/a", None, Duration::from_secs(10)))
+        .await
+        .expect("the media call completes");
+    let sent = PAYLOAD_OBJECT_BYTES.len() as u64;
+    assert_eq!(workloads.workload_bytes(Workload::Gateway), sent);
+    let relayed = super::routes::relay(media.status, media.body, media.custody);
+    assert_eq!(
+        workloads.workload_bytes(Workload::Gateway),
+        sent,
+        "a relayed media answer stays charged until its HTTP body is sent"
+    );
+    let delivered = axum::body::to_bytes(relayed.into_body(), usize::MAX)
+        .await
+        .expect("the media answer reads");
+    assert_eq!(delivered.as_ref(), PAYLOAD_OBJECT_BYTES);
+    assert_eq!(workloads.workload_bytes(Workload::Gateway), 0);
 }
 
 /// A call's request body counts against its own workload while the call

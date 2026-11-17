@@ -643,9 +643,15 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
      - The connected journey itself has no media or code work,
        cancellation, deadline expiry or drain. Those rest on owner tests,
        by user decision.
-     - It asserts call subjects, not the absence of a double debit for the
-       nested call.
-     - Media relay rests on `test:gateway:native`, which asserts no charge.
+     - Closed: the connected journey now also asserts exactly two call
+       records. The nested call is recorded once, as the Service's, never
+       also as gateway traffic. The lib tests above prove its bytes are
+       never counted as both workloads.
+     - Closed: `buffered_answers_count_against_the_calling_workload` now
+       relays a buffered media answer. It counts exactly its 29 bytes as
+       Gateway work until the HTTP body is read, then 0. Mutation: relaying
+       the media bytes without their charge fails with left 0, right 29.
+       Both were added after the behaviour (TDD VIOLATED).
      - TDD VIOLATED, previously unmarked: the three rewritten deferral
        tests were changed to match the implemented behaviour (user
        decision), and the gateway relay wiring had no test first.
@@ -668,8 +674,7 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
          `one_session` name are gone. A sweep for tests of removed
          allocation logic found no test that only asserts removed
          behaviour.
-     Status: FAIL (no double-debit assertion for the nested call; no charge
-     assertion for media relay).
+     Status: PASS.
 
 7. **Functional closure and performance — REQ-024; AC-018.** Run affected
    functional lanes, then full clean L1 verification, gateway and all three

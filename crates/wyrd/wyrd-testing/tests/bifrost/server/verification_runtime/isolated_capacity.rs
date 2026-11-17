@@ -678,6 +678,11 @@ async fn connected_work_waits_out_pressure_with_its_own_attribution() {
     passed(&settled(&queued).await, "answered");
 
     let subjects = desk.call_subjects().await;
+    assert_eq!(
+        subjects.len(),
+        2,
+        "each call is recorded once, the nested one never also as gateway traffic: {subjects:?}"
+    );
     let root = desk
         .root
         .uid

@@ -664,6 +664,7 @@ impl VerifierRunner {
             return Transition::Terminate(status, error);
         };
         let state = RunState::at(
+            self.state.resources.workloads().clone(),
             Arc::clone(&self.outbox),
             tenant,
             frozen.row(system, identity),

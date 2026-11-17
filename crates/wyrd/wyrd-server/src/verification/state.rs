@@ -58,6 +58,7 @@ use super::results::{ResultPayloadBuilder, ResultRun};
 use crate::scribe_outbox::{ScribeOutbox, ScribeSink, ScribeWrite, revision_batch_id};
 use crate::state::AppState;
 use wyrd_runtime::outbox::Reservation;
+use wyrd_runtime::resources::{Workload, WorkloadManager};
 
 /// The table every revision is a row of, and the logical table of every
 /// revision's batch fence.
@@ -310,6 +311,9 @@ impl Held {
 /// One writer's live state and its background persistence: everything a
 /// revision is written with, shared with the flush that writes it.
 struct Writer {
+    /// The process workloads whose CPU lanes prepare each revision as the
+    /// execution's tenant's verification work.
+    workloads: WorkloadManager,
     /// The outbox every revision is staged on.
     outbox: Arc<ScribeOutbox>,
     /// The execution's tenant.
@@ -353,10 +357,12 @@ impl Writer {
     ///
     /// Each turn first reserves the revision's outbox slot, then copies the
     /// live state, every change so far, under the short lock, prepares the
-    /// copy's row off the lock on the blocking pool, and stages it at once,
-    /// weighing exactly that row. Changes made while a revision is in
-    /// flight coalesce into the one after it, and only one frozen copy
-    /// exists at a time. A copy that cannot be prepared breaks the writer.
+    /// copy's row off the lock on the blocking pool, holding a shared CPU
+    /// lane as the tenant's verification work only while it encodes, and
+    /// stages it at once, weighing exactly that row. Changes made while a
+    /// revision is in flight coalesce into the one after it, and only one
+    /// frozen copy exists at a time. A copy that cannot be prepared breaks
+    /// the writer.
     async fn flush(self: Arc<Self>) {
         loop {
             {
@@ -375,9 +381,19 @@ impl Writer {
                         (held.revision + 1, held.changes, held.state.clone())
                     };
                     let row = Arc::clone(&self.row);
-                    let prepared =
-                        tokio::task::spawn_blocking(move || Checkpoint::new(revision, &state, row))
-                            .await;
+                    // Preparation is mandatory drain: it begins without
+                    // admission, so memory pressure never holds it, and
+                    // takes a CPU lane only while it encodes.
+                    let work =
+                        self.workloads
+                            .begin(Workload::Verification, Some(self.tenant), None);
+                    let workloads = self.workloads.clone();
+                    let prepared = tokio::task::spawn_blocking(move || {
+                        workloads
+                            .lanes()
+                            .run_blocking(work.context(), || Checkpoint::new(revision, &state, row))
+                    })
+                    .await;
                     let accepted = match prepared {
                         Ok(Ok(checkpoint)) => self.write(slot, revision, checkpoint).await,
                         Ok(Err(error)) => {
@@ -561,15 +577,25 @@ impl RunState {
     ) -> Result<Self, StateError> {
         let (revision, state) = Self::accepted(app, tenant, row.execution_id, records).await?;
         Ok(Self::at(
-            outbox, tenant, row, deadline, lost, state, revision,
+            app.resources.workloads().clone(),
+            outbox,
+            tenant,
+            row,
+            deadline,
+            lost,
+            state,
+            revision,
         ))
     }
 
     /// A writer of `state`, accepted at `revision`, which records `row`'s
-    /// identity unless the state already holds one. `lost` is the
-    /// execution's lease-loss token. The live state is a small graph left
-    /// to aggregate pressure; only its staged revisions are charged.
+    /// identity unless the state already holds one and prepares each
+    /// revision on `workloads`' CPU lanes. `lost` is the execution's
+    /// lease-loss token. The live state is a small graph left to aggregate
+    /// pressure; only its staged revisions are charged.
+    #[expect(clippy::too_many_arguments, reason = "one writer input per argument")]
     pub(crate) fn at(
+        workloads: WorkloadManager,
         outbox: Arc<ScribeOutbox>,
         tenant: DataTenantId,
         row: StateRow,
@@ -581,6 +607,7 @@ impl RunState {
         state.identity.get_or_insert_with(|| row.identity.clone());
         Self {
             writer: Arc::new(Writer {
+                workloads,
                 outbox,
                 tenant,
                 row: Arc::new(row),
@@ -1232,6 +1259,29 @@ mod tests {
         revision: i64,
         lost: CancellationToken,
     ) -> RunState {
+        writing_on(&one_lane(), outbox, state, revision, lost)
+    }
+
+    /// Process workloads with one CPU lane.
+    fn one_lane() -> wyrd_runtime::resources::WorkloadManager {
+        wyrd_runtime::resources::ProcessResources::new(
+            std::num::NonZeroUsize::MIN,
+            1 << 30,
+            1 << 30,
+        )
+        .workloads()
+        .clone()
+    }
+
+    /// A writer of `state` at `revision` staging on `outbox` and preparing
+    /// on `workloads`' lanes, whose lease is lost with `lost`.
+    fn writing_on(
+        workloads: &wyrd_runtime::resources::WorkloadManager,
+        outbox: Arc<crate::scribe_outbox::ScribeOutbox>,
+        state: ExecutionState,
+        revision: i64,
+        lost: CancellationToken,
+    ) -> RunState {
         let (verifier, subject) = (uid(), uid());
         let row = StateRow {
             execution_id: ExecutionId::new_v7(),
@@ -1247,6 +1297,7 @@ mod tests {
             ),
         };
         RunState::at(
+            workloads.clone(),
             outbox,
             DataTenantId::new_v7(),
             row,
@@ -1344,6 +1395,54 @@ mod tests {
             approval_id(ExecutionId::new_v7(), &occurrences[0]),
             "another execution never shares an occurrence id"
         );
+    }
+
+    /// Proves checkpoint preparation is CPU work on the shared lanes: while
+    /// every lane is held a dirty execution's revision waits to be prepared,
+    /// and nothing reaches Scribe; once the lane frees, exactly one revision
+    /// is prepared and accepted.
+    ///
+    /// # Panics
+    /// Panics when preparation does not queue for the held lane, a revision
+    /// reaches Scribe while it is held, or the revision is not accepted once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn checkpoint_preparation_waits_for_a_shared_lane() {
+        use wyrd_runtime::resources::Workload;
+        let workloads = one_lane();
+        let gateway = workloads.begin(Workload::Gateway, None, None);
+        let held = workloads.lanes().acquire(gateway.context()).await;
+        let scribe = Arc::new(TableGate::new(ScribeTable::ExecutionEvents));
+        let outbox = ScribeSink::local_outbox(Arc::clone(&scribe) as _, None);
+        let state = writing_on(
+            &workloads,
+            outbox,
+            ExecutionState::fresh(),
+            0,
+            CancellationToken::new(),
+        );
+        state
+            .begin(&Producer::plain(&task("factual-check"), 1))
+            .await
+            .expect("recorded");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while workloads.lanes().waiting() < 1 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "checkpoint preparation never queued for the held lane"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            revisions(&scribe).is_empty(),
+            "nothing is prepared while every lane is held"
+        );
+
+        drop(held);
+        arrived(&scribe).await;
+        scribe.release.add_permits(1);
+        settled(&state).await.expect("the revision is accepted");
+        assert_eq!(revisions(&scribe).len(), 1, "one revision is prepared");
     }
 
     /// Proves an engine transition completes from memory while Scribe holds

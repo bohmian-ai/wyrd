@@ -323,6 +323,7 @@ fn retries_keep_their_actions_spent_time() {
 fn execution(state: &AppState, caller: &Caller, verifier: &CardUid) -> Arc<RunState> {
     let subject = CardUid::from_uuid(uuid::Uuid::now_v7()).expect("uid");
     Arc::new(RunState::at(
+        state.resources.workloads().clone(),
         Arc::clone(state.bifrost.scribe_outbox()),
         test_tenant(),
         StateRow {

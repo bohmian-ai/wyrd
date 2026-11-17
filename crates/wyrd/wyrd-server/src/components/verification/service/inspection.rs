@@ -51,6 +51,7 @@ use super::VerificationControl;
 use crate::audit;
 use crate::components::auth::Caller;
 use crate::components::github::delivery::GithubDeliveries;
+use crate::scribe_outbox::ScribeWrite;
 use crate::state::registry_db_error;
 use crate::verification::approvals::ApprovalDecisions;
 use crate::verification::cache::exact_ref;
@@ -1006,11 +1007,12 @@ impl<'a> VerificationControl<'a> {
     /// Cancel queued `execution_id` and answer its status after the
     /// cancellation fence commits.
     ///
-    /// Unfinished work settles `cancelled` with its terminal delivery due,
-    /// which the runner records in the execution's state; a `pull_request`
-    /// execution's GitHub delivery of the cancellation starts in the
-    /// background once that commits. Settled work keeps its status, result,
-    /// and publications, so a repeat answers the current status.
+    /// Unfinished work settles `cancelled` with its terminal delivery due.
+    /// Once that commits, its `cancelled` status row is staged on the Scribe
+    /// outbox without waiting, and a `pull_request` execution's GitHub
+    /// delivery of the cancellation starts in the background. Settled work
+    /// keeps its status, result, and publications, so a repeat answers the
+    /// current status and stages nothing.
     ///
     /// # Errors
     /// [`WyrdError::VerificationWrongTarget`] on a target that does not run
@@ -1036,7 +1038,20 @@ impl<'a> VerificationControl<'a> {
             .await
             .map_err(registry_db_error)?
             .ok_or_else(|| execution_not_found(execution_id))?;
+        let occurred_at = chrono::Utc::now();
         conn.commit().await.map_err(registry_db_error)?;
+        if cancelled {
+            self.state.bifrost.scribe_outbox().stage(
+                caller.data_tenant_id,
+                ScribeWrite::status(
+                    execution_id,
+                    &status.verifier_card_uid,
+                    VerificationExecutionStatus::Cancelled,
+                    status.attribution,
+                    occurred_at,
+                ),
+            );
+        }
         if cancelled && status.state.pull_request.is_some() {
             GithubDeliveries::spawn(self.state.clone(), caller.data_tenant_id, execution_id);
         }

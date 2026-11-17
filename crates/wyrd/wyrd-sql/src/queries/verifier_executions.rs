@@ -41,7 +41,7 @@ use wyrd_spec::verification::execution::{
 };
 use wyrd_spec::verification::{
     DriftWindow, FrozenTarget, GroupEndSettings, OperatorDispatchState, VerificationBindingStatus,
-    VerificationError, VerificationVerdict, VerifierReadiness,
+    VerificationError, VerificationExecutionStatus, VerificationVerdict, VerifierReadiness,
 };
 
 use crate::queries::verification::{BindingSchedule, InactivityTimeout, binding_activity};
@@ -590,7 +590,8 @@ const TERMINATE_SQL: &str = r"
 ";
 
 /// Return a leased execution to the queue, refunding its attempt; `$3` is the
-/// delay in milliseconds before it is due again.
+/// delay in milliseconds before it is due again. Returns the status it is
+/// returned to.
 const RELEASE_SQL: &str = r"
     UPDATE wyrd.verifier_executions
        SET status = CASE WHEN attempts > 1 THEN 'retrying' ELSE 'pending' END,
@@ -598,6 +599,7 @@ const RELEASE_SQL: &str = r"
            next_attempt_at = statement_timestamp() + ($3::bigint * INTERVAL '1 millisecond'),
            updated_at = statement_timestamp()
      WHERE execution_id = $1 AND lease_token = $2 AND status = 'running'
+    RETURNING status
 ";
 
 /// Cancel one unfinished execution; a settled one is left as it is.
@@ -3134,25 +3136,28 @@ impl VerifierExecutionQueue {
     /// releases with a poll delay so a saturated reader is not reclaimed in a
     /// hot loop. The execution keeps its identity and frozen input, becomes
     /// due `delay` after PostgreSQL's statement time, and does not consume its
-    /// retry budget.
+    /// retry budget. Returns the status it is returned to, `pending` before
+    /// a second attempt and `retrying` after one, or `None` when the lease no
+    /// longer holds it and nothing changed.
     ///
     /// # Errors
-    /// Returns the database error when the update fails.
+    /// Returns the database error when the update fails, or a decode error
+    /// when the stored status is unknown.
     #[tracing::instrument(skip(self, conn), fields(operation = "verification.executions.release", execution_id = %lease.execution_id))]
     pub async fn release(
         &self,
         conn: &mut TenantConn<'_>,
         lease: ExecutionLease,
         delay: Duration,
-    ) -> Result<Settlement, SqlxError> {
+    ) -> Result<Option<VerificationExecutionStatus>, SqlxError> {
         timed("release", async {
-            let result = sqlx::query(RELEASE_SQL)
+            let status: Option<String> = sqlx::query_scalar(RELEASE_SQL)
                 .bind(lease.execution_id.as_uuid())
                 .bind(lease.token.0)
                 .bind(delay.num_milliseconds())
-                .execute(&mut **conn.transaction())
+                .fetch_optional(&mut **conn.transaction())
                 .await?;
-            Ok(settlement(result.rows_affected()))
+            status.map(|status| stored(status.parse())).transpose()
         })
         .await
     }

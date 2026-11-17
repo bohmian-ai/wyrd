@@ -1650,7 +1650,7 @@ async fn reclaimed_lease_fences_the_stale_token() {
             .release(&mut conn, stale.lease, Duration::zero())
             .await
             .expect("stale release answers"),
-        Settlement::StaleLease
+        None
     );
     for _ in 0..2 {
         assert_eq!(
@@ -2116,7 +2116,7 @@ async fn release_requeues_without_consuming_an_attempt() {
             .release(&mut conn, first.lease, Duration::zero())
             .await
             .expect("release answers"),
-        Settlement::Applied
+        Some(VerificationExecutionStatus::Pending)
     );
     let status = queue
         .execution_status(&mut conn, execution)

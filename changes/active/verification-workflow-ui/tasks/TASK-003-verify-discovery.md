@@ -139,7 +139,7 @@ at `6ccb565d3`; the two assertions added after it were rerun by their own tests.
 | Proof | Test |
 |---|---|
 | One population for rows, facets and charts; the status and selected-result SQL | `ui-pages.test.ts`: "executions list, facets and charts", "the Verify dashboard reads one population and keeps its investigation in the URL" |
-| Real server, Node and MCP: running, completed and cancelled rows match `get_execution`; refusals and another tenant show no rows | `ui-library.integration.test.ts`: "Verify lists executions with and without a recorded result as one authorized population through every host" |
+| Real server: a running row matches `get_execution` (Node only); completed and cancelled rows, facets and charts agree on Node and MCP; refusals and another tenant show no rows | `ui-library.integration.test.ts`: "Verify lists executions with and without a recorded result as one authorized population through every host" |
 | Real server: pending, waiting, retrying, timed out and errored rows; pull request facets | `ui-library.integration.test.ts`: "Verify lists pull request executions…", "…waiting for deferred evidence…", "…retrying for a trace that has not landed…", "Verify lists a timed out and an errored execution…" |
 | Browser: filter, group, brush, page, open a row and return; a superseded load never replaces a newer one | `ui-pages.integration.test.ts`: "the Verify dashboard filters, groups, brushes, pages, opens an execution and returns to the same list" |
 
@@ -152,6 +152,17 @@ User decisions, 2026-11-17:
 - The list filters by failed verdict and by Verifier, never by a specific requirement.
 - The list needs tenant-wide Bifrost read; a Verifier-scoped list is out of scope.
 - Review-set grouping is not part of this task.
+
+Not proven, and not built by the decisions above or by choice:
+
+- The pending, waiting, retrying, timed out and errored journeys and the pull
+  request facets run through the Node executor only, not MCP or the browser.
+- No real-server test holds a second, non-selected result for one execution;
+  the selected-result join is covered by the SQL unit test only.
+- No unfinished session or drift execution is listed on a real server.
+- Result-visibility lag is shown at component level only.
+- AC-009's mock comparison in both themes and widths, keyboard, focus, touch,
+  long content and error states has not been done.
 
 Status: `BLOCKED`. Open: AC-009, the user's own review of the Verify page
 against the approved mock.

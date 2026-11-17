@@ -1623,6 +1623,8 @@ reviewed('Verify lists pull request executions by their recorded repository and 
   const [live] = await context.executor.run([{ op: 'verification.get_execution', execution_id: pending.execution_id as string }]);
   expect(live.ok && [live.value.status, live.value.pull_request?.number, live.value.pull_request?.repository_id, live.value.pull_request?.head.sha]).toEqual(['pending', 7, '1', 'b2']);
   expect(await list([{ column: 'repository', value: '1' }, { column: 'pull_request', value: '9' }])).toEqual([]);
+  // Status and verdict combine: unfinished work has no verdict, so pending work that passed matches nothing.
+  expect(await list([{ column: 'status', value: 'pending' }, { column: 'verdict', value: 'passed' }])).toEqual([]);
 
   // The facets count the same three executions by repository and by pull request.
   const rail = await loadFacetRail({ signal: 'executions', facets: ['repository', 'pull_request', 'origin'] }, context);

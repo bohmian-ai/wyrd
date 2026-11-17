@@ -113,22 +113,31 @@ repository PostgreSQL → public Bifrost query journey owner in
      (command J). RED: `never listed completed: {}, history []`. GREEN: PASS.
      The test queries `running`, both parks as `waiting` and `retrying` while
      each is held, and checks that the queue stores no `waiting`. It covers
-     completion, `errored` and `timed_out` terminations, a deferral recording
-     `pending`, and a release of claimed work recording `pending`.
+     completion, `errored` and `timed_out` terminations, and a backpressure
+     deferral recording `[running, pending, running, completed]`.
+   - Release: `pg_verification_runtime::claim_committed_after_cancellation_is_released_unexecuted`
+     (command R) drives the runner's `Transition::Release` and asserts
+     `[running, pending]`. GREEN only: the assertion was added after the
+     release staging.
+   - `retrying` from a release is the same `RELEASE_SQL ... RETURNING status`
+     passthrough. No test releases a run after a retry.
    - Exhaustion: `pg_verification_runtime::retryable_engine_failures_exhaust_to_errored`
      (command R) asserts
      `[running, retrying, running, retrying, running, errored]`.
    - Group commit: `pg_verification_runtime::failed_group_commits_retry_as_groups`
      (command R) asserts `[running, completed]` per run through the batched
      statement.
-   - Fallback: no test can force it, because it needs a dead flusher. Source
-     proof: in `runner.rs`, `settle` stages from the one `(outcome, status)`
-     pair that `apply` returns. The batched path and `settle_alone` both build
-     that pair with `recorded(.., Completed)`.
+   - Fallback: FAIL, open. Only the `Transition::Complete` arm of
+     `settle_alone` is unproved. It runs only when every `Completions` flush
+     task is gone, which `Completions::complete` reports as `None`. No test can
+     force that today without adding a seam that ends the flush tasks. Source
+     proof: `settle` stages from the one `(outcome, status)` pair that
+     `apply` returns, and both paths build it with `recorded(.., Completed)`.
+     Every other `settle_alone` arm is exercised by the tests above.
    - Release and deferral return the stored status from
      `RELEASE_SQL ... RETURNING status`; command Q asserts `Some(Pending)` and
      `None` for a stale lease.
-   - Status: PASS. The fallback is proved by source inspection only.
+   - Status: PASS except the fallback's completion arm (FAIL, above).
 3. **Running cancellation and revocation.** Cancel held running work through
    the public operation; revoke a principal with multiple unfinished executions
    through the public revocation operation. Each affected execution lists as
@@ -147,6 +156,26 @@ repository PostgreSQL → public Bifrost query journey owner in
      `CancelledExecution` that the revocation returns and that a submission
      admission returns. `background_admission_of_a_revoked_owner_is_cancelled`
      does the same for scheduled and group admissions.
+     The grouped assertion compares the execution and attribution but not
+     the Verifier, because the group candidate does not expose it.
+   - PR cancellations: closing, drafting or superseding a PR, a policy that
+     binds nothing, and repository access loss also cancel unfinished work.
+     They sit under the Outcome's "any existing owner" and REQ-015's stale-row
+     rule, though the transition table does not list them.
+     - `DEACTIVATE_SQL`, `SUPERSEDE_SQL` and `CANCEL_REPOSITORIES_SQL` gain
+       `RETURNING` identities. `deactivate_pull_request`,
+       `cancel_pull_request_repositories` and `reserve_pull_request`'s
+       superseded list return `CancelledExecution`.
+     - The PR admission owner and the GitHub connection service (disconnect,
+       uninstall, repository removal, suspension) stage them after commit.
+     - Proof:
+       `pg_github_pull_requests::pull_request_lifecycle_admits_supersedes_and_ends_through_the_webhook`
+       (command G) waits until the newest status of every one of the PR's ten
+       cancelled executions is `cancelled`. It reads them through the
+       editor's SDK `bifrost.query`, using Verify's newest-status shape. RED,
+       with the production change stashed and an earlier form of the wait:
+       `status rows never landed: {}`. GREEN: PASS. Command Q asserts the
+       returned identities.
    - The existing fencing assertions are unchanged: the 40 queue tests
      (command Q) and 23 `wyrd-auth` revocation and issuance tests (command A)
      pass. Status: PASS.
@@ -168,8 +197,9 @@ repository PostgreSQL → public Bifrost query journey owner in
      run still records exactly one `completed`. In the revocation journey,
      released stale workers add no row.
    - Recovery: `verification_runtime::queued_subject_authority_survives_restart`
-     (command J) passes. Status rows carry `event = 'status'`, so the
-     `event = 'checkpoint'` fence reads never select them. Tenant isolation is
+     (command J) passes alongside status rows. Exclusion from checkpoint
+     selection is source proof only: the fence reads filter
+     `event = 'checkpoint'` (`verification/inputs.rs`). Tenant isolation is
      command T. Status: PASS.
 
 Commands, run sequentially:
@@ -184,9 +214,12 @@ Commands, run sequentially:
 - O: `mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=scribe_outbox::tests::status_rows_share_one_frame_and_keep_identity_on_retry)'`
 - R: the same wrapper around
   `cargo nextest run --locked -p wyrd-server --features test-support --test integration --test-threads=1 -E "test(=pg_verification_runtime::<name>)"`.
-  The owner lane `mise run test:bifrost:integration:server`: LANE_RESULT.
+  The owner lane `mise run test:bifrost:integration:server`: 125 of 125 pass on the final code.
+- G: the same wrapper around
+  `cargo nextest run --locked -p wyrd-server --features test-support --test integration --test-threads=1 -E "test(pg_github_pull_requests::)"`.
+  22 tests pass.
 - T: `mise run check:tenant-isolation`, `mise run fmt`, `mise run lints` and
-  `mise exec -- git diff --check`: CHECKS_RESULT.
+  `mise exec -- git diff --check`: all pass.
 
 TDD compliance: VIOLATED for part of the work. Scenarios 1–3 had a journey
 RED before any production code. These proofs were written after the code
@@ -194,7 +227,16 @@ they cover and have no RED, although each is verified GREEN:
 
 - the scenario 4 outbox test;
 - the admission-time `CancelledExecution` assertions;
-- the exhaustion and group-commit history assertions.
+- the exhaustion and group-commit history assertions;
+- the command Q `release` assertions (`Some(Pending)`, `None`), rewritten
+  with the signature;
+- the release history assertion.
+
+For the PR cancellations the test was written first, but the production
+change was drafted before RED was run. RED was then observed with the
+production change stashed. Four existing tests were re-sequenced (see the
+diagnosis above), and their assertions are unchanged. The fallback's
+completion arm has no test.
 
 Hot path: not touched. The change adds nothing to the queued engine
 execution, direct verify, gateway calls, Bifrost query or Bifrost append.
@@ -205,9 +247,9 @@ neither wait on nor fail because of the stage. Revocation reuses its
 existing `UPDATE`, now with `RETURNING`. The task excludes a bench run when
 no hot path is touched.
 
-Risk: PR supersede, deactivation and access-loss cancellations are outside
-the transition table and record no status row. For those executions Verify
-shows the last status that was recorded.
+Risk: the timestamp comes from the pod clock at the transition, as the
+task's "capture at the transition" asks. Newest-row ordering across replicas
+can therefore invert under clock skew, and tie handling is consumer-owned.
 
 ## Verification
 

@@ -235,6 +235,19 @@ impl ByteCharge {
         self.ledger.release(bytes);
     }
 
+    /// An empty charge from the same ledger, attributed to the same
+    /// operation, which later charges grow without naming the operation
+    /// again: a component that retains new buffers for a call holds one and
+    /// charges each buffer as it is materialized.
+    #[must_use]
+    pub fn sibling(&self) -> Self {
+        Self {
+            ledger: self.ledger.clone(),
+            bytes: 0,
+            owner: self.owner.clone(),
+        }
+    }
+
     /// Move `bytes` of this charge into a new one, transferring ownership
     /// without charging the ledger again; `None` when it holds fewer.
     #[must_use]

@@ -22,7 +22,7 @@ use url::Url;
 use wyrd_spec::gateway::{GatewayOperation, ProviderAdapter, ProviderAuth, ProviderDeployment};
 use wyrd_spec::ids::ModelId;
 
-use super::stream::{ChatChunks, Frames, MediaCapture, StreamCapture, relay, relay_media};
+use super::stream::{ChatChunks, Frames, MediaCapture, relay, relay_media};
 use super::{
     Answer, BatchAction, IngressDialect, MediaRequest, NativeBody, Prepared, Unmapped, Wire,
     complete, faithful_embeddings, prepare, refusal,
@@ -531,7 +531,12 @@ fn frames(attempt: &ProviderAttempt<'_>, translated: bool, id: String, model: &s
             .is_some_and(|options| {
                 options.get("include_usage") == Some(&serde_json::Value::Bool(true))
             });
-        Frames::Chat(ChatChunks::new(id, model, include_usage))
+        let choices = attempt
+            .body
+            .member("n")
+            .and_then(|n| n.as_u64())
+            .map_or(1, |n| u32::try_from(n).unwrap_or(u32::MAX));
+        Frames::Chat(ChatChunks::new(id, model, include_usage, choices))
     } else {
         Frames::Native {
             responses: attempt.operation == GatewayOperation::Responses,
@@ -556,17 +561,7 @@ impl Client {
         let translated = matches!(frames, Frames::Chat(_));
         match self.open(attempt.operation, prepared).await {
             Ok(upstream) => AttemptResult::Completed {
-                body: ResponseBody::Events(relay(
-                    upstream,
-                    wire,
-                    frames,
-                    limit,
-                    attempt.deadline,
-                    attempt.cancel.clone(),
-                    attempt
-                        .capture
-                        .then(|| StreamCapture::new(attempt.credential)),
-                )),
+                body: ResponseBody::Events(relay(upstream, wire, frames, limit, attempt)),
                 usage: AttemptUsage::default(),
                 capture: None,
             },
@@ -602,7 +597,11 @@ impl Client {
                     content_type: upstream.content_type().to_owned(),
                     events: {
                         let capture = attempt.capture.then(|| {
-                            MediaCapture::new(attempt.credential, upstream.content_type())
+                            MediaCapture::new(
+                                attempt.credential,
+                                upstream.content_type(),
+                                attempt.memory,
+                            )
                         });
                         relay_media(
                             upstream,
@@ -610,6 +609,7 @@ impl Client {
                             attempt.deadline,
                             attempt.cancel.clone(),
                             capture,
+                            attempt.memory.sibling(),
                         )
                     },
                 },

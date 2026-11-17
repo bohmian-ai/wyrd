@@ -78,7 +78,7 @@ fn reply(request: &Request) -> ResponseTemplate {
     let body: Value = serde_json::from_slice(&request.body).unwrap_or_default();
     if body["stream"] == true {
         return ResponseTemplate::new(200).set_body_raw(
-            GatewayCapture::chat_events("chatcmpl-slow", 2_000),
+            GatewayCapture::chat_events("chatcmpl-slow", SLOW_CHUNKS),
             "text/event-stream",
         );
     }
@@ -846,23 +846,107 @@ async fn standalone_call_bodies_count_as_gateway_work_while_the_call_runs() {
     desk.server.shutdown().await.expect("the server stops");
 }
 
-/// A slow streamed chat completion stays byte-bounded: while the provider
-/// holds the stream open after its first event, the call's gateway work is
-/// exactly its request body, kept past the handler's response, and no relayed
-/// frame is charged. Every frame arrives on release, and the body returns
-/// once the call settles.
+/// Chunks of the provider's streamed answer: several MiB, more than the
+/// socket buffers between the gateway and a stalled reader can absorb, so
+/// the relay's own queue fills.
+const SLOW_CHUNKS: usize = 100_000;
+
+/// A raw HTTP/1.1 streamed chat completion whose client receive buffer is
+/// small, so a reader that stops reading holds the stream open mid-answer.
+struct SlowReader {
+    /// The connection, positioned after the response head.
+    socket: tokio::net::TcpStream,
+}
+
+impl SlowReader {
+    /// Send `body` to the desk's chat completions route and read the
+    /// response head, then stop reading.
+    ///
+    /// # Panics
+    /// Panics when the connection fails or the answer is not a 200 stream.
+    async fn open(desk: &CapacityDesk, body: &[u8]) -> Self {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let socket = tokio::net::TcpSocket::new_v4().expect("a socket");
+        socket
+            .set_recv_buffer_size(4_096)
+            .expect("a small receive buffer");
+        let mut socket = socket
+            .connect(desk.server.bound_addr().expect("the server is bound"))
+            .await
+            .expect("the server accepts");
+        let head = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nhost: wyrd\r\nauthorization: Bearer {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            desk.admin_key,
+            body.len()
+        );
+        socket
+            .write_all(head.as_bytes())
+            .await
+            .expect("the head sends");
+        socket.write_all(body).await.expect("the body sends");
+        let mut read = Vec::new();
+        while !read.ends_with(b"\r\n\r\n") {
+            read.push(socket.read_u8().await.expect("the head reads"));
+        }
+        let head = String::from_utf8(read).expect("an ascii head");
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert!(head.contains("text/event-stream"), "{head}");
+        Self { socket }
+    }
+
+    /// Read the rest of the chunked body and return its decoded bytes.
+    ///
+    /// # Panics
+    /// Panics when the body is not well-formed chunked encoding.
+    async fn finish(mut self) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+
+        let mut raw = Vec::new();
+        self.socket
+            .read_to_end(&mut raw)
+            .await
+            .expect("the body reads");
+        let mut body = Vec::new();
+        let mut rest = raw.as_slice();
+        loop {
+            let line = rest
+                .windows(2)
+                .position(|pair| pair == b"\r\n")
+                .expect("a chunk size line");
+            let size = std::str::from_utf8(&rest[..line])
+                .ok()
+                .and_then(|size| usize::from_str_radix(size, 16).ok())
+                .expect("a hexadecimal chunk size");
+            rest = &rest[line + 2..];
+            if size == 0 {
+                return body;
+            }
+            body.extend_from_slice(&rest[..size]);
+            rest = &rest[size + 2..];
+        }
+    }
+}
+
+/// A slow reader's streamed chat completion stays byte-bounded and charged:
+/// while the reader has stopped mid-answer, the frames the gateway retains
+/// for it are charged to its gateway work, within the relay's bound and far
+/// below the answer; the reader then receives the whole answer. A second
+/// reader that disconnects mid-answer leaves nothing charged once its call
+/// settles.
 ///
 /// # Panics
-/// Panics when setup or the call fails, the stream is malformed, or the
-/// gateway's charged bytes differ from the body while the stream is open or
-/// remain after it ends.
+/// Panics when setup or a call fails, the stream is malformed, or the
+/// gateway's charged bytes are not above the request body while frames wait,
+/// exceed the bound, or remain after the calls end.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the serialized Postgres-backed journey lane"]
-async fn a_slow_stream_holds_only_its_request_body() {
+async fn a_slow_stream_holds_only_bounded_charged_frames() {
     use wyrd_runtime::resources::Workload;
 
     let desk = CapacityDesk::start().await;
     let workloads = desk.server.state().resources.workloads().clone();
+    let gateway = || workloads.workload_bytes(Workload::Gateway);
     let body = serde_json::to_vec(&json!({
         "model": "openai/gpt-4o",
         "stream": true,
@@ -870,46 +954,38 @@ async fn a_slow_stream_holds_only_its_request_body() {
     }))
     .expect("the body serializes");
     let sent = body.len() as u64;
-    desk.provider.hold(&["SLOW-STREAM"]);
-    let mut stream = reqwest::Client::new()
-        .post(format!(
-            "{}/v1/chat/completions",
-            desk.server.base_url().expect("the server is bound")
-        ))
-        .bearer_auth(&desk.admin_key)
-        .header("content-type", "application/json")
-        .body(body)
-        .send()
-        .await
-        .expect("the stream starts");
-    assert_eq!(stream.status().as_u16(), 200);
-    let first = stream
-        .chunk()
-        .await
-        .expect("the stream reads")
-        .expect("a first chunk");
-    assert!(first.starts_with(b"data: "), "an event stream");
-    assert_eq!(
-        workloads.workload_bytes(Workload::Gateway),
-        sent,
-        "an open stream holds its request body and no relayed frame"
-    );
-    desk.provider.release(&["SLOW-STREAM"]);
+    let answer = GatewayCapture::chat_events("chatcmpl-slow", SLOW_CHUNKS);
+    // The relay's queue of 16 frames of at most 64 KiB, plus the frames the
+    // HTTP connection is still writing.
+    let bound = sent + 2 * 1024 * 1024;
 
-    let mut rest = first.len();
-    while let Some(chunk) = stream.chunk().await.expect("the stream reads") {
-        rest += chunk.len();
-    }
-    assert_eq!(
-        rest,
-        GatewayCapture::chat_events("chatcmpl-slow", 2_000).len(),
-        "every frame arrives"
+    let reader = SlowReader::open(&desk, &body).await;
+    super::until("the stalled stream's frames to be charged", || {
+        gateway() > sent
+    })
+    .await
+    .expect("frames wait for the reader");
+    let held = gateway();
+    assert!(held <= bound, "{held} bytes exceed the {bound}-byte bound");
+    assert!(
+        held < answer.len() as u64,
+        "the gateway does not buffer the whole answer"
     );
-    // Shutdown drains the settling call, so the count is final.
+    let relayed = reader.finish().await;
+    assert_eq!(relayed, answer.as_bytes(), "every frame arrives in order");
+    super::until("the finished stream's charges to return", || gateway() == 0)
+        .await
+        .expect("a finished stream keeps nothing");
+
+    let reader = SlowReader::open(&desk, &body).await;
+    super::until("the second stream's frames to be charged", || {
+        gateway() > sent
+    })
+    .await
+    .expect("frames wait for the reader");
+    drop(reader);
+    super::until("the dropped stream's charges to return", || gateway() == 0)
+        .await
+        .expect("a dropped stream keeps nothing");
     desk.server.shutdown().await.expect("the server stops");
-    assert_eq!(
-        workloads.workload_bytes(Workload::Gateway),
-        0,
-        "the body returns once the stream ends"
-    );
 }

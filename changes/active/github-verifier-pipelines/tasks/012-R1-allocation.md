@@ -630,7 +630,7 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
    - Buffered answers: `respond` charges a buffered JSON or media answer's
      exact length, which already exists, and attributes it to the call's
      operation. The charge rides on `GatewayCallResponse` until it drops.
-     Streams stay bounded by their frame channel. Capture payloads are
+     Streams charge each retained frame (see "Slow streams"). Capture payloads are
      charged by the outbox when staged.
      Test: `components::gateway::pg_invocation_tests::buffered_answers_count_against_the_calling_workload`
      proves standalone bytes count as gateway work and nested bytes as
@@ -719,16 +719,52 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
      `held_persistence_bounds_queued_custody_by_claim_permits`,
      `two_replicas_claim_each_queued_run_exactly_once`, with the managed
      Postgres command in "Verification owners and commands".
-   - Slow streams: journey
-     `verification_runtime::isolated_capacity::a_slow_stream_holds_only_its_request_body`.
-     A raw-HTTP streamed chat completion (2,000 chunks) is held open by the
-     provider after its first event. `HeldUpstream` now sends a held event
-     stream's first event at once and the rest on release. While it is
-     open, its Gateway work is exactly its request body, kept past the
-     handler's response, and no relayed frame is charged. On release, all
-     frames arrive, and after a drained shutdown Gateway holds 0. Mutation: unattributing the body fails with left 0.
-     Written after the handoff (TDD VIOLATED). GREEN with the other three
-     capacity journeys (4 passed), using the isolated-capacity command above.
+   - Slow streams (review finding; diagnosis and design by read-only
+     diagnosticians). The old journey held the provider after one event,
+     so it never filled the relay and passed while retained frames were
+     uncharged. Production gap: a stalled reader's queued frames, a whole
+     translated transport chunk, the capture buffer, Google candidate
+     indexes and merged usage members were retained without charge or
+     bound.
+     - Fix: each relayed allocation is charged once, as a sibling of the
+       call's attributed charge (`CallInput.memory`, built at admission),
+       and wrapped in owner-backed `Bytes`. Its `Frame`s are zero-copy
+       slices of at most `FRAME_BYTES` (64 KiB), so the charge returns
+       only when the last slice, possibly inside the HTTP body, drops. A frame memory cannot hold is
+       discarded and ends the stream with `ServiceUnavailable`. Captures
+       charge what they keep and drop on refusal. Google indexes past the
+       requested `n` fail the stream; usage keeps at most `USAGE_MEMBERS`
+       (32) members.
+     - Gateway adapter tests (`mise exec -- cargo nextest run --locked -p wyrd-gateway --lib`, 78 passed):
+       - `adapter::tests::a_stalled_reader_holds_only_charged_bounded_frames`:
+         RED "the relay ended early"; mutations: no charge fails "queued
+         frames are charged: 0", no split fails "the relay ended early".
+       - `adapter::tests::a_frame_memory_cannot_hold_ends_the_stream_with_capacity`:
+         written after the code (TDD VIOLATED); mutation `mandatory` for
+         `charged` fails "the refused frame is discarded".
+       - `adapter::tests::a_gemini_candidate_beyond_the_requested_count_fails_the_stream`:
+         RED relayed "rogue"; mutation ignoring `n` fails "the second
+         requested choice relays".
+       - `adapter::stream::tests::merged_usage_keeps_a_bounded_set_of_members`:
+         RED left 1000, right 32.
+       - `adapter::stream::tests::a_stream_capture_is_charged_until_memory_refuses_it`
+         and `..::a_media_capture_is_charged_until_memory_refuses_it`: RED
+         left 0, right 80 and left 0, right 6.
+     - Journey
+       `verification_runtime::isolated_capacity::a_slow_stream_holds_only_bounded_charged_frames`
+       replaces the old one, and `HeldUpstream`'s first-event split is
+       reverted. A raw HTTP reader with a 4 KiB receive buffer stalls on a
+       100,000-chunk answer the provider sends in full. Gateway bytes rise
+       above the request body, stay within body + 2 MiB and below the
+       answer; the reader then gets every byte in order, and Gateway
+       returns to 0. A second reader disconnects mid-answer and Gateway
+       returns to 0. Written after the fix (TDD VIOLATED); mutation
+       removing the frame charge fails "timed out waiting for the stalled
+       stream's frames to be charged". GREEN in 5.6 s.
+     - Regressions: runtime lib 98, gateway lib 78, server gateway lib 84,
+       isolated-capacity journeys 5, gateway journeys 17 (the 2 Vault
+       journeys need `mise run test:gateway:vault`); clippy clean on the
+       four crates; `check:deps` passes.
    - Remaining cases (user decision: existing owner tests count as the
      evidence):
      - Code work under pressure: the isolated-capacity Python journey

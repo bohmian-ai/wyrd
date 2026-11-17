@@ -5630,7 +5630,7 @@ async fn gateway_terminal_spans_classify_every_call_and_attempt() {
     let mut delivered = Vec::new();
     tokio::time::timeout(Duration::from_secs(1), async {
         while let Some(frame) = events.recv().await {
-            delivered.extend(frame.expect("the stream terminates cleanly"));
+            delivered.extend_from_slice(&frame.expect("the stream terminates cleanly"));
         }
     })
     .await

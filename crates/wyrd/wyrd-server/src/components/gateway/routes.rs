@@ -1542,7 +1542,8 @@ fn events_body(events: wyrd_gateway::EventStream) -> Body {
         events,
         |mut events| async move {
             let frame = events.recv().await?;
-            Some((frame, events))
+            // The body holds each frame, and so its charge, until written.
+            Some((frame.map(bytes::Bytes::from), events))
         },
     ))
 }
@@ -2469,6 +2470,7 @@ mod usage_bound_tests {
                 capture: false,
                 deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(10),
                 cancel: &cancel,
+                memory: &wyrd_runtime::resources::ByteLedger::new(u64::MAX).empty_charge(),
             }))
         });
         assert!(

@@ -10633,6 +10633,7 @@ dependencies = [
  "workspace-hack",
  "wyrd-benchmark",
  "wyrd-crypt",
+ "wyrd-runtime",
  "wyrd-skald-providers",
  "wyrd-skald-spec",
  "wyrd-spec",

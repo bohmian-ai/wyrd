@@ -287,8 +287,8 @@ struct AdmittedCall {
 
 impl AdmittedCall {
     /// Charges `memory` for a buffered `body` the call materialized and
-    /// attributes the charge to the call's operation; a stream is not
-    /// charged. The answer is new memory the call would retain, so a charge
+    /// attributes the charge to the call's operation; a stream's relay
+    /// charges each frame it retains instead. The answer is new memory the call would retain, so a charge
     /// memory cannot hold is refused, and the caller discards the answer.
     ///
     /// # Errors
@@ -1403,6 +1403,9 @@ impl CallTask {
             "operation" => operation_name(self.plan.operation)
         )
         .record(self.received.elapsed().as_secs_f64());
+        // A relayed stream charges the frames it retains to the call.
+        let mut memory = self.state.resources.memory().empty_charge();
+        memory.attribute(&self.call.operation);
         let mut execution = self
             .state
             .gateway
@@ -1419,6 +1422,7 @@ impl CallTask {
                 capture: selects(&self.call.snapshot.capture, GatewayPayloadField::Response),
                 deadline: self.call.deadline,
                 cancel: &self.cancel,
+                memory: &memory,
             })
             .await;
         if !execution.attempts.is_empty() {

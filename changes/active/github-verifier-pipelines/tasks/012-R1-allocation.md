@@ -276,9 +276,14 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
 
    RED: all 5 failed on behavior assertions against the stub controller. GREEN: R1. TDD: PASS.
 
-   Independent check: `paused_admission_starts_after_recovery` documents
-   that a dropped waiter withdraws its demand but does not assert it.
-   Status: FAIL (that assertion).
+   Independent check: `paused_admission_starts_after_recovery` documented
+   that a dropped waiter withdraws its demand but did not assert it. It now
+   asserts that a waiting Verification admission gives Verification a soft
+   target, and that once dropped, the next sample's target is `None`.
+   Added after the behaviour (TDD VIOLATED for that assertion). GREEN:
+   `mise exec -- cargo nextest run --locked -p wyrd-runtime --lib -E 'test(/resources::workload::tests::/)'`
+   (6 passed).
+   Status: PASS.
 
 4. **CPU lanes and tenant service — REQ-019,022; AC-017.** Runtime unit tests
    submit controlled jobs from multiple tenants/workloads. Show C managed lanes,
@@ -305,14 +310,21 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
 
    "No lane while awaiting memory/downstream admission": `WorkloadManager::admit` takes no lane, and `Laned` releases on Pending. Integration proof is due in scenario 5.
 
-   Independent check:
-   - "Local blockage cannot hold other eligible work" has no test; the old
-     `a_non_fitting_head_does_not_block_another_tenant` went with
-     `admission.rs`.
-   - No test shows work waiting in `WorkloadManager::admit` holds no lane.
-     `open_query_stream_holds_no_cpu_lane` covers only a stream between
-     polls.
-   Status: FAIL (those two cases).
+   Independent check, closed:
+   - Local blockage:
+     - `nested_polls_inherit_and_pending_returns_the_lane` already shows
+       laned work awaiting memory holds no lane while the free lane runs
+       other work.
+     - `resources::workload::tests::local_caps_redistribute_and_tenants_share_equally`
+       now keeps a paused heavy tenant's admission waiting while the light
+       tenant's admission starts. This replaces the deleted
+       `a_non_fitting_head_does_not_block_another_tenant`.
+   - Downstream admission: `resources::workload::tests::admission_waits_hold_no_cpu_lane`.
+     Under critical pressure, laned work waiting in `WorkloadManager::admit`
+     leaves the one lane free, and other work runs on it.
+   - Both were written after the behaviour (TDD VIOLATED). GREEN with the
+     workload command in scenario 3 (6 passed).
+   Status: PASS.
 
 5. **Actual execution hooks — REQ-022,024; AC-017.** Bifrost integration tests
    run parallel query/repartition/sort/spill and Forge work through production

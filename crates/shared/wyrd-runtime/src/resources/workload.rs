@@ -827,9 +827,12 @@ mod tests {
     /// A local ceiling smaller than an equal share is redistributed, and
     /// demanding tenants of one workload split its target equally.
     ///
+    /// A tenant held back above its share does not hold back another
+    /// tenant's eligible work.
+    ///
     /// # Panics
-    /// Panics when the capped share is not redistributed or a tenant above
-    /// its share is admitted.
+    /// Panics when the capped share is not redistributed, a tenant above its
+    /// share is admitted, or its waiting admission blocks another tenant.
     #[test]
     fn local_caps_redistribute_and_tenants_share_equally() {
         let (memory, workloads) = manager();
@@ -854,9 +857,11 @@ mod tests {
             !starts_now(&workloads, Workload::Verification, heavy_tenant),
             "212 share, 300 held"
         );
+        let mut paused = pin!(workloads.admit(Workload::Verification, heavy_tenant, None));
+        assert!(poll_once(paused.as_mut()).is_pending());
         assert!(
             starts_now(&workloads, Workload::Verification, light_tenant),
-            "212 share, 60 held"
+            "212 share, 60 held, and the paused heavy tenant does not hold it back"
         );
         assert!(
             starts_now(&workloads, Workload::Gateway, None),
@@ -957,11 +962,42 @@ mod tests {
         drop((held, acknowledged, largest, smaller, gateway));
     }
 
+    /// Laned work waiting for admission holds no CPU lane, so the lane runs
+    /// other work meanwhile.
+    ///
+    /// # Panics
+    /// Panics when the waiting work holds the lane or other work cannot run.
+    #[tokio::test]
+    async fn admission_waits_hold_no_cpu_lane() {
+        let (_memory, workloads) = manager();
+        let worker = workloads.observe_commitment();
+        worker.set(u64::MAX);
+        assert_eq!(workloads.sample(0).state, PressureState::Critical);
+        let lanes = workloads.lanes();
+        let verification = workloads.begin(Workload::Verification, None, None);
+        let mut waiting = pin!(lanes.laned(
+            verification.context(),
+            workloads.admit(Workload::Verification, None, None),
+        ));
+        assert!(poll_once(waiting.as_mut()).is_pending());
+        assert_eq!(lanes.free(), 1, "waiting for admission holds no lane");
+        let gateway = workloads.begin(Workload::Gateway, None, None);
+        let ran = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            lanes.laned(gateway.context(), async { lanes.free() }),
+        )
+        .await
+        .expect("the free lane runs other work");
+        assert_eq!(ran, 0, "the other work holds the one lane");
+        drop((worker, verification, gateway));
+    }
+
     /// A paused admission starts once pressure recovers, and a dropped one
     /// withdraws its demand.
     ///
     /// # Panics
-    /// Panics when a paused admission never starts.
+    /// Panics when a paused admission never starts, or a dropped one still
+    /// counts as demand.
     #[tokio::test]
     async fn paused_admission_starts_after_recovery() {
         let (memory, workloads) = manager();
@@ -970,6 +1006,21 @@ mod tests {
         workloads.sample(0);
         let mut admission = pin!(workloads.admit(Workload::Gateway, None, None));
         assert!(poll_once(admission.as_mut()).is_pending());
+        {
+            let mut waiting = pin!(workloads.admit(Workload::Verification, None, None));
+            assert!(poll_once(waiting.as_mut()).is_pending());
+            workloads.sample(0);
+            assert!(
+                workloads.target(Workload::Verification).is_some(),
+                "a waiting admission is demand"
+            );
+        }
+        workloads.sample(0);
+        assert_eq!(
+            workloads.target(Workload::Verification),
+            None,
+            "a dropped admission withdraws its demand"
+        );
         held.shrink(500);
         workloads.sample(0);
         workloads.sample(0);

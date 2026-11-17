@@ -532,10 +532,12 @@ mod tests {
         use datafusion::prelude::{SessionConfig, SessionContext};
         use wyrd_runtime::resources::{ProcessResources, WorkContext, Workload};
 
+        /// The work contexts one probe observed.
+        type Seen = Arc<Mutex<Vec<Option<WorkContext>>>>;
+
         install_query_span_propagation();
         let process = ProcessResources::new(std::num::NonZeroUsize::MIN, 1 << 30, 1 << 30);
         let operation = process.workloads().begin(Workload::Bifrost, None, None);
-        type Seen = Arc<Mutex<Vec<Option<WorkContext>>>>;
         let probe = |name: &str, seen: &Seen| {
             let recorded = Arc::clone(seen);
             create_udf(

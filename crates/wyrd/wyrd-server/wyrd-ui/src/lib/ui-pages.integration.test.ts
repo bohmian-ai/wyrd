@@ -1654,6 +1654,19 @@ judged('the Verify dashboard filters, groups, brushes, pages, opens an execution
       await expect.poll(() => rows.count()).toBe(50);
     }
 
+    // A brush over the early part of the day, before any execution was accepted, empties the list; Reset zoom brings the rows back.
+    const early = await page.getByRole('region', { name: 'Executions by verdict' }).locator('svg.plot').boundingBox();
+    if (!early) throw new Error('Executions by verdict draws no plot to brush');
+    await page.mouse.move(early.x + early.width * 0.05, early.y + early.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(early.x + early.width * 0.3, early.y + early.height / 2, { steps: 5 });
+    await page.mouse.up();
+    await expect.poll(() => 'from' in query()).toBe(true);
+    await expect.poll(() => rows.count()).toBe(0);
+    await page.getByRole('button', { name: 'Reset zoom' }).click();
+    await expect.poll(() => 'from' in query()).toBe(false);
+    await expect.poll(() => rows.count()).toBe(50);
+
     // A slow load that a newer choice supersedes never replaces it: the newer selection is what stays shown.
     let release = () => {};
     const slow = new Promise<void>((resolve) => (release = resolve));

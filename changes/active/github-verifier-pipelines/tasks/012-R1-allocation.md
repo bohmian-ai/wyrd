@@ -586,6 +586,21 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
      recorded in revision 16's "Maintainer decisions (2026-11-16)".
    - TDD VIOLATED, previously unmarked: the Monty lane wiring in
      `sandbox.rs` and the `main.rs` sampler.
+   - Second check, closed:
+     - Forge on a lane:
+       `forge::managed_rewrite::managed_rewrite_is_refused_under_critical_pressure`
+       now holds every CPU lane after recovery. The fresh rewrite queues
+       for a lane and does not finish, then finishes once the lanes
+       free. Mutation: running the rewrite without `laned` fails with
+       "the rewrite ran while every lane was held".
+     - Real query spill:
+       `oracle::spill::tests::spilling_query_returns_its_lane_during_spill_writes`
+       runs a real DataFusion `ORDER BY` over the charged query runtime
+       under a 2 MiB pool, on one CPU lane. It asserts the sort's
+       `spill_count` > 0, every row returned, and a poll that saw the
+       lane returned after a spill write. Mutation: spill writes without
+       `off_lane` fail it.
+     - Both were written after the behaviour (TDD VIOLATED).
    Status: PASS.
 
 6. **Connected public journey and bounded drain — REQ-019–024; AC-018.** Extend

@@ -3184,7 +3184,7 @@ test('an executions list keeps status and verdict apart, names Verifiers the hos
   const list = render(RecordTable, { input: { signal: 'executions' }, result: { state: 'populated', data: { rows: executions } }, labels: verifierLabels, onaction });
   expect(list.getAllByRole('columnheader').map((heading) => heading.textContent?.trim())).toEqual(['Time ↓', 'Verifier', 'Card name', 'Run', 'Session', 'Service', 'Status', 'Verdict']);
   const cells = (row: number) => [...list.getAllByRole('row')[row].querySelectorAll('td')].map((cell) => cell.textContent?.trim());
-  // Status and verdict are separate facts: a completed failure, then a recorded cancel and an execution with no terminal record, neither with a verdict.
+  // Status and verdict are separate facts: a completed failure, then a recorded cancel and a direct execution with no result, neither with a verdict.
   expect(cells(1).slice(6)).toEqual(['completed', '✕failed']);
   expect(cells(4).slice(6)).toEqual(['!cancelled', 'no verdict']);
   expect(cells(5).slice(6)).toEqual(['not recorded', 'no verdict']);
@@ -3192,12 +3192,14 @@ test('an executions list keeps status and verdict apart, names Verifiers the hos
   expect(cells(2)[4]).toBe('conversation-7');
   // Completed before its result row is visible: the recorded status, and no verdict borrowed from anywhere.
   expect(cells(6).slice(6)).toEqual(['completed', 'no verdict']);
-  expect(list.getByText('not recorded').closest('[title]')).toHaveAttribute('title', 'No terminal state is retained. Open the execution for its current status.');
+  expect(list.getByText('not recorded').closest('[title]')).toHaveAttribute('title', 'No result of this direct execution is retained.');
+  // Unfinished queued work states its recorded lifecycle.
+  expect(cells(7).slice(6)).toEqual(['!waiting', 'no verdict']);
   // The Verifier reads as the name the host supplied and keeps its exact UID; an id without one is shortened, never dropped.
   expect(list.getAllByText('ticket-policy 1.1.0')[0]).toHaveAttribute('title', VERIFIER_UIDS.policy);
   expect(list.getByText('01a1…195f')).toHaveAttribute('title', '01a1e602-c9a9-7d0b-a028-5acc7427195f');
   expect(list.getAllByRole('row')[1].querySelector('time')).toHaveAttribute('datetime', '2026-10-20T11:58:02.412000Z');
-  expect(list.getByText(/^Showing 6 executions/)).toBeInTheDocument();
+  expect(list.getByText(/^Showing 7 executions/)).toBeInTheDocument();
   // A row opens its exact execution, by click or Enter.
   await fireEvent.click(list.getAllByRole('row')[5]);
   await fireEvent.keyDown(list.getAllByRole('row')[1], { key: 'Enter' });

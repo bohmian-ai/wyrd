@@ -1558,9 +1558,9 @@ judged('the Verify dashboard filters, groups, brushes, pages, opens an execution
     await expect.poll(() => rows.count()).toBe(50);
     expect(await where.textContent()).toContain('select facet values to filter');
     for (const title of ['Executions by verdict', 'Executions by Verifier']) expect(await page.getByRole('region', { name: title }).locator('svg.plot').count()).toBe(1);
-    // The Verifier is named from its Card; the running execution claims no status it has not recorded, and no verdict.
+    // The Verifier is named from its Card; the running execution is counted under its recorded status.
     expect(await rail.getByRole('button', { name: /answer-check 1\.0\.0/ }).count()).toBe(1);
-    expect(await rail.getByRole('button', { name: /not recorded/ }).textContent()).toContain('1');
+    expect(await rail.getByRole('button', { name: /running/ }).textContent()).toContain('1');
     await captureExecution(page, 'verify-dashboard');
 
     // Paging keeps the population: the second page holds the rest, and the address holds the cursor.
@@ -1601,8 +1601,8 @@ judged('the Verify dashboard filters, groups, brushes, pages, opens an execution
     await page.waitForURL(list);
     await expect.poll(() => rows.count()).toBe(50);
 
-    // The unfinished execution is found by having no terminal record, and its own page says what it is doing now.
-    await rail.getByRole('button', { name: /not recorded/ }).click();
+    // The unfinished execution is found by its recorded status, and its own page agrees.
+    await rail.getByRole('button', { name: /running/ }).click();
     await expect.poll(() => rows.count()).toBe(1);
     expect(await rows.first().textContent()).toContain('no verdict');
     await rows.first().click();

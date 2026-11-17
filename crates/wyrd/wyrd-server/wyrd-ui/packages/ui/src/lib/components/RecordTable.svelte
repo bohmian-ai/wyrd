@@ -69,8 +69,8 @@
   const TONES: Record<number, Tone> = { 0: 'neutral', 1: 'ok', 2: 'danger' };
   const NOUNS = { traces: ['trace', 'traces'], spans: ['span', 'spans'], logs: ['record', 'records'], metrics: ['point', 'points'], executions: ['execution', 'executions'] } as const;
   /** The tone of each retained execution status and recorded verdict; a status with no terminal record carries none. */
-  const EXECUTION_TONES: Readonly<Record<string, Tone>> = { completed: 'neutral', cancelled: 'warn', timed_out: 'danger', errored: 'danger', passed: 'ok', failed: 'danger', inconclusive: 'warn' };
-  const UNSETTLED = 'No terminal state is retained. Open the execution for its current status.';
+  const EXECUTION_TONES: Readonly<Record<string, Tone>> = { completed: 'neutral', running: 'running', retrying: 'warn', waiting: 'warn', cancelled: 'warn', timed_out: 'danger', errored: 'danger', passed: 'ok', failed: 'danger', inconclusive: 'warn' };
+  const UNSETTLED = 'No result of this direct execution is retained.';
   /** Execution columns that hold a UUID: shown shortened, or as the name the host read for it. A session id is the caller's own text and is shown whole. */
   const isId = (column: string) => signal === 'executions' && column !== 'group_id' && (column.endsWith('_id') || column.endsWith('_uid'));
   const signal = $derived('signal' in input ? input.signal : undefined);

@@ -704,15 +704,19 @@ test('executions list, facets and charts read one population in bounded shared q
   const list = context();
   const table = await loadRecordTable({ signal: 'executions', where }, list.context);
   expect(list.calls).toHaveLength(1);
-  const population = sql(list.calls[0]).slice(sql(list.calls[0]).indexOf(' FROM ('), sql(list.calls[0]).indexOf(' ORDER BY '));
+  const population = sql(list.calls[0]).slice(sql(list.calls[0]).indexOf(' FROM ('), sql(list.calls[0]).lastIndexOf(' ORDER BY '));
   expect(population).toContain('FROM bifrost.verification.execution_inputs i');
-  expect(population).toContain('max(sequence)');
-  // A status is only what is retained: completed, a failure the runner recorded, else not recorded. Nothing reads the queue.
-  expect(population).toContain("WHEN s.failure IS NOT NULL THEN s.failure ELSE 'not recorded' END AS status");
+  // A queued execution's status is its newest retained status row, and pending before any; equal times fall to the event id.
+  expect(population).toContain("last_value(status ORDER BY occurred_at, event_id) AS status FROM bifrost.verification.execution_events WHERE event = 'status'");
+  expect(population).toContain("ELSE coalesce(q.status, 'pending') END AS status");
+  // A direct execution is never queued: complete once its result is visible, else nothing is recorded.
+  expect(population).toContain("WHEN i.origin = 'direct' THEN CASE WHEN r.result_id IS NOT NULL THEN 'completed' ELSE 'not recorded' END");
+  // Only checkpoint rows name the selected result; status and delivery rows carry no state.
+  expect(population.match(/event = 'checkpoint'/g)).toHaveLength(2);
   // The selected result is the recorded one, or a direct execution's only one; never the latest row.
   expect(population).toContain("(i.origin = 'direct' OR r.result_id = s.result_id)");
   // States and results are read from the range start on, never the tenant's whole history.
-  expect(population.match(/(occurred_at|ended_at) >= \$1::timestamptz - INTERVAL '1 hour'/g)).toHaveLength(3);
+  expect(population.match(/(occurred_at|ended_at) >= \$1::timestamptz - INTERVAL '1 hour'/g)).toHaveLength(4);
   expect(population).toContain('WHERE recorded_at >= $1::timestamptz AND recorded_at < $2::timestamptz AND status = $3 AND verdict IS NULL');
   expect(table.executed?.params).toEqual([RANGE.from, RANGE.to, 'completed']);
   expect(sql(list.calls[0])).toMatch(/ORDER BY recorded_at DESC, execution_id ASC LIMIT 51$/);
@@ -764,8 +768,8 @@ test('the Verify dashboard reads one population and keeps its investigation in t
   expect(rail.getByRole('button', { name: /no verdict/ })).toHaveTextContent('2');
   expect(rail.getByRole('button', { name: /latency-drift 1.0.0/ })).toHaveTextContent('2');
   const table = within(page.getByRole('region', { name: 'executions rows' }));
-  expect(table.getAllByRole('row')).toHaveLength(7);
-  expect(table.getAllByText('ticket-policy 1.1.0')).toHaveLength(4);
+  expect(table.getAllByRole('row')).toHaveLength(8);
+  expect(table.getAllByText('ticket-policy 1.1.0')).toHaveLength(5);
   expect(page.getByLabelText('WHERE: read-only projection of the active filters')).toHaveTextContent('select facet values to filter');
   // Bounded shared reads only: every query is one batch read of the executions population, and no row is hydrated.
   expect(new Set(requests.map((request) => request.op))).toEqual(new Set(['bifrost.query', 'cards.list']));

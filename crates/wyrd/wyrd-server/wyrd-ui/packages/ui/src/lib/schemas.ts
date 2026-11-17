@@ -198,13 +198,13 @@ const SPAN_FILTERS = [
 
 /**
  * One row per accepted Verifier execution of every origin, as retained: its
- * input record, the terminal facts of its latest recorded state, and the
- * result that state selected (a direct execution's only one). `status` is
- * `completed`, a `cancelled`, `timed_out` or `errored` the runner recorded,
- * else `not recorded`: no terminal state is retained. That covers work still
- * pending, running, retrying or waiting and also an end only the queue holds,
- * such as a cancel of work no runner had claimed; one execution's own status
- * read tells them apart.
+ * input record, the result its latest checkpoint selected (a direct
+ * execution's only one), and its status. A queued execution's `status` is its
+ * newest retained status row (`running`, `retrying`, `waiting`, `pending`,
+ * `completed`, `cancelled`, `timed_out` or `errored`) and `pending` before
+ * any; a status row lost with its process leaves the older one standing. A
+ * direct execution is never queued: `completed` once its result is visible,
+ * else `not recorded`.
  */
 // Every read of this population binds its range first, so `$1` here is the range start. An execution's
 // states and result are recorded after its input, so the joins read from that start on, with an hour of
@@ -215,12 +215,15 @@ const EXECUTIONS =
   '(SELECT i.execution_id, i.recorded_at, i.verifier_card_uid, i.binding_id, i.group_id, i.origin, i.run_id, ' +
   'i.subject_kind, i.subject_name, i.subject_version, i.subject_card_uid, i.workload_card_uid, i.service_name, i.service_version, i.deployment_environment, ' +
   'r.result_id, r.verdict, r.ended_at, ' +
-  "CASE WHEN s.result_id IS NOT NULL OR (i.origin = 'direct' AND r.result_id IS NOT NULL) THEN 'completed' WHEN s.failure IS NOT NULL THEN s.failure ELSE 'not recorded' END AS status " +
+  "CASE WHEN i.origin = 'direct' THEN CASE WHEN r.result_id IS NOT NULL THEN 'completed' ELSE 'not recorded' END ELSE coalesce(q.status, 'pending') END AS status " +
   'FROM bifrost.verification.execution_inputs i ' +
-  "LEFT JOIN (SELECT e.execution_id, e.value -> 'terminal' ->> 'result_id' AS result_id, e.value -> 'failure' ->> 'status' AS failure " +
+  // Rows of one instant have no recorded order; the event id only makes the choice repeatable.
+  "LEFT JOIN (SELECT execution_id, last_value(status ORDER BY occurred_at, event_id) AS status FROM bifrost.verification.execution_events WHERE event = 'status' " +
+  `AND occurred_at >= ${SINCE} GROUP BY execution_id) q ON q.execution_id = i.execution_id ` +
+  "LEFT JOIN (SELECT e.execution_id, e.value -> 'terminal' ->> 'result_id' AS result_id " +
   'FROM bifrost.verification.execution_events e ' +
-  `JOIN (SELECT execution_id, max(sequence) AS sequence FROM bifrost.verification.execution_events WHERE occurred_at >= ${SINCE} GROUP BY execution_id) l ` +
-  `ON l.execution_id = e.execution_id AND l.sequence = e.sequence WHERE e.occurred_at >= ${SINCE}) s ON s.execution_id = i.execution_id ` +
+  `JOIN (SELECT execution_id, max(sequence) AS sequence FROM bifrost.verification.execution_events WHERE event = 'checkpoint' AND occurred_at >= ${SINCE} GROUP BY execution_id) l ` +
+  `ON l.execution_id = e.execution_id AND l.sequence = e.sequence WHERE e.event = 'checkpoint' AND e.occurred_at >= ${SINCE}) s ON s.execution_id = i.execution_id ` +
   `LEFT JOIN bifrost.verification.results r ON r.execution_id = i.execution_id AND r.ended_at >= ${SINCE} AND (i.origin = 'direct' OR r.result_id = s.result_id)) AS executions`;
 
 /**

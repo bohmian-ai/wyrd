@@ -401,11 +401,20 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
        life fails "an open query stream kept a CPU lane from verification
        work". GREEN in 13.6 s:
        `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && cargo nextest run --locked -p wyrd-testing --test oracle -P journey --run-ignored=all -E 'test(=capacity::open_query_stream_holds_no_cpu_lane)'"`.
+   - Scribe tenant service: request-path ingress jobs run on the lane as
+     their frame's tenant. That covers canonical decode, preprocessing an
+     admitted append, and shredding a slice. Persistence jobs mix tenants
+     and stay unattributed (`None`).
+     - Test: `scribe::execution_lanes::tests::ingress_jobs_run_on_the_shared_cpu_lanes`
+       now asserts the job's `WorkContext.tenant`.
+     - RED: `run` took the tenant but `on_lane` ignored it; "the lane
+       serves the job's tenant" failed with left `None`. GREEN.
+     - Regressions: redux `--lib` 942 passed, `--test integration` 75
+       passed, `mise run test:bifrost:journey:scribe` 45 passed and 1
+       skipped.
    - Open:
      - DataFusion spill writes inside a laned poll still hold the lane
        across local IO.
-     - Scribe lanes are unattributed (`tenant: None`), because persistence
-       jobs mix tenants.
      Status: FAIL.
 
 6. **Connected public journey and bounded drain — REQ-019–024; AC-018.** Extend

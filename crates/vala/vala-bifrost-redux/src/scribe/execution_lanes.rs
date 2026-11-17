@@ -25,7 +25,7 @@ use crate::scribe::wal::{
 };
 use std::str::FromStr;
 use wyrd_spec::auth::{Attribution, PrincipalId};
-use wyrd_spec::ids::CardUid;
+use wyrd_spec::ids::{CardUid, DataTenantId};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::managed_columns::{
@@ -226,6 +226,7 @@ impl ScribeIngressCpuPool {
     /// and propagates any error produced by the free [`decode`] function.
     pub(crate) async fn decode(
         &self,
+        tenant: Option<DataTenantId>,
         payload: IngressPayload,
         inputs: IngressDecodeInputs,
     ) -> Result<RecordBatch, ScribeError> {
@@ -263,7 +264,7 @@ impl ScribeIngressCpuPool {
             active.fetch_add(1, Ordering::AcqRel);
             record_lane_started("ingress");
             let result = catch_unwind(AssertUnwindSafe(|| {
-                on_lane(workloads.as_ref(), || {
+                on_lane(workloads.as_ref(), tenant, || {
                     decode(
                         payload,
                         &DecodeContext {
@@ -308,7 +309,7 @@ impl ScribeIngressCpuPool {
     }
 
     /// Runs one pre-ACK CPU job, such as preprocessing an admitted append, on
-    /// this lane.
+    /// this lane as `tenant`'s work.
     ///
     /// Request-path work stays here rather than on the persistence lane, so a
     /// background staging encode or claim merge never queues ahead of a write.
@@ -320,7 +321,11 @@ impl ScribeIngressCpuPool {
     /// Returns [`ScribeError::IngestBusy`] when the ingress queue is saturated,
     /// the job's own error, or [`ScribeError::Internal`] when the worker panics
     /// or drops its result.
-    pub(crate) async fn run<T, F>(&self, job: F) -> Result<T, ScribeError>
+    pub(crate) async fn run<T, F>(
+        &self,
+        tenant: Option<DataTenantId>,
+        job: F,
+    ) -> Result<T, ScribeError>
     where
         T: Send + 'static,
         F: FnOnce() -> Result<T, ScribeError> + Send + 'static,
@@ -346,7 +351,9 @@ impl ScribeIngressCpuPool {
             let started = std::time::Instant::now();
             active.fetch_add(1, Ordering::AcqRel);
             record_lane_started("ingress");
-            let result = catch_unwind(AssertUnwindSafe(|| on_lane(workloads.as_ref(), job)));
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                on_lane(workloads.as_ref(), tenant, job)
+            }));
             depth.fetch_sub(1, Ordering::AcqRel);
             active.fetch_sub(1, Ordering::AcqRel);
             record_lane_finished("ingress");
@@ -1709,19 +1716,21 @@ pub(crate) enum ScribePersistenceCpuResult {
 /// Returns the stable preprocessing, projection, encoding, replay, or
 /// test-synchronization error produced by the selected operation.
 /// Runs one Scribe CPU job on its Rayon worker, on a shared process CPU lane
-/// as Bifrost work when the pool has joined the lanes.
+/// as `tenant`'s Bifrost work when the pool has joined the lanes.
 ///
 /// The job begins its own non-cancellable operation: Scribe keeps its own
 /// queue bounds and byte admission, and acknowledged durable work must not
-/// be a pressure victim. Persistence jobs mix tenants, so the lane is not
-/// attributed to one.
-// ponytail: unattributed tenant; pass the frame's tenant if Bifrost tenant
-// lane fairness for ingest is needed.
-fn on_lane<T>(workloads: Option<&WorkloadManager>, job: impl FnOnce() -> T) -> T {
+/// be a pressure victim. Request-path jobs pass their frame's tenant;
+/// persistence jobs mix tenants and pass `None`.
+fn on_lane<T>(
+    workloads: Option<&WorkloadManager>,
+    tenant: Option<DataTenantId>,
+    job: impl FnOnce() -> T,
+) -> T {
     let Some(workloads) = workloads else {
         return job();
     };
-    let operation = workloads.begin(Workload::Bifrost, None, None);
+    let operation = workloads.begin(Workload::Bifrost, tenant, None);
     workloads.lanes().run_blocking(operation.context(), job)
 }
 
@@ -1961,7 +1970,7 @@ impl ScribePersistenceCpuPool {
             active.fetch_add(1, Ordering::AcqRel);
             record_lane_started("persistence");
             let result = catch_unwind(AssertUnwindSafe(|| {
-                on_lane(workloads.as_ref(), || {
+                on_lane(workloads.as_ref(), None, || {
                     execute_persistence_operation(operation)
                 })
             }));
@@ -3513,7 +3522,7 @@ mod tests {
     async fn ingress_cpu_runs_bounded_projection_jobs_on_its_lane() {
         let pool = ScribeIngressCpuPool::new_with_capacity(1, 1);
         let worker_name = pool
-            .run(|| {
+            .run(None, || {
                 Ok(std::thread::current()
                     .name()
                     .unwrap_or("unnamed")
@@ -3533,7 +3542,7 @@ mod tests {
     async fn rayon_lane_panic_releases_permit_and_returns_typed_error() {
         let pool = ScribeIngressCpuPool::new_with_capacity(1, 1);
         let error = pool
-            .run(|| -> Result<(), crate::contracts::ScribeError> {
+            .run(None, || -> Result<(), crate::contracts::ScribeError> {
                 panic!("intentional lane panic");
             })
             .await
@@ -3543,7 +3552,7 @@ mod tests {
             crate::contracts::ScribeError::Internal { .. }
         ));
         let result = pool
-            .run(|| Ok::<_, crate::contracts::ScribeError>(()))
+            .run(None, || Ok::<_, crate::contracts::ScribeError>(()))
             .await;
         assert!(result.is_ok(), "panic must release the queue permit");
         let snapshot = pool.snapshot();
@@ -3615,7 +3624,7 @@ mod tests {
     async fn ingress_pool_drain_settles_after_submitted_work() {
         let pool = ScribeIngressCpuPool::new(2);
         for iteration in 0..500 {
-            let job = pool.run(|| Ok::<_, crate::contracts::ScribeError>(()));
+            let job = pool.run(None, || Ok::<_, crate::contracts::ScribeError>(()));
             let (job_result, drain_result) = tokio::join!(
                 job,
                 tokio::time::timeout(std::time::Duration::from_secs(5), pool.drain())
@@ -3710,7 +3719,7 @@ mod tests {
     }
 
     /// An ingress job waits for a shared CPU lane another workload holds and
-    /// then runs as Bifrost work.
+    /// then runs as its tenant's Bifrost work.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ingress_jobs_run_on_the_shared_cpu_lanes() {
         let workloads = one_lane();
@@ -3718,9 +3727,12 @@ mod tests {
         let held = workloads.lanes().acquire(gateway.context()).await;
         let mut pool = ScribeIngressCpuPool::new_with_capacity(1, 1);
         pool.join_lanes(&workloads);
+        let tenant = wyrd_spec::ids::DataTenantId::new(uuid::Uuid::now_v7()).expect("tenant id");
         let job = tokio::spawn(async move {
-            pool.run(|| Ok(wyrd_runtime::resources::WorkContext::current()))
-                .await
+            pool.run(Some(tenant), || {
+                Ok(wyrd_runtime::resources::WorkContext::current())
+            })
+            .await
         });
         let waiter = workloads.clone();
         tokio::task::spawn_blocking(move || await_waiting(&waiter, 1))
@@ -3733,6 +3745,11 @@ mod tests {
             .expect("ingress job completes")
             .expect("the job runs on a lane");
         assert_eq!(context.workload, Workload::Bifrost);
+        assert_eq!(
+            context.tenant,
+            Some(tenant),
+            "the lane serves the job's tenant"
+        );
     }
 
     /// A persistence job waits for a shared CPU lane another workload holds.
@@ -3856,7 +3873,7 @@ mod tests {
         wal_io: &ScribeWalIoPool,
     ) {
         ingress
-            .run(|| Ok::<_, ScribeError>(()))
+            .run(None, || Ok::<_, ScribeError>(()))
             .await
             .expect("ingress job");
         let replayed = ReplayedSealKey {

@@ -790,17 +790,20 @@ impl EvidenceReader for TenantEvidence {
             .await
             .context();
         let lanes = workloads.lanes().clone();
-        // The raw bytes drop on the blocking worker as soon as they encode.
-        let data = tokio::task::spawn_blocking(move || {
-            lanes.run_blocking(context, || {
+        // The worker owns the bytes and their charge together, so a
+        // cancelled call leaves both charged until the worker finishes; the
+        // raw bytes drop there as soon as they encode.
+        let (data, charge) = tokio::task::spawn_blocking(move || {
+            let data = lanes.run_blocking(context, || {
                 base64::engine::general_purpose::STANDARD.encode(bytes)
-            })
+            });
+            charge.shrink(read);
+            (data, charge)
         })
         .await
         .map_err(|error| BlockError::Retryable {
             reason: format!("the evidence media encoding stopped: {error}"),
         })?;
-        charge.shrink(read);
         let media = MediaRef {
             kind,
             source: MediaSource::Base64 {

@@ -2312,10 +2312,12 @@ impl Oracle {
                 let task = admitted.execution_task(config)?;
                 let scan_stats = OracleQueryScanStats::from_plan(root.as_ref());
                 let schema = root.schema();
-                let batches =
-                    execute_stream(root, task).map_err(|error| map_datafusion_error(&error))?;
-                let batches = self.audit_tenant_refusal(context, batches);
-                let batches = laned_batches(lanes, operation, batches);
+                let batches = laned_execution(lanes, operation, || {
+                    let batches =
+                        execute_stream(root, task).map_err(|error| map_datafusion_error(&error))?;
+                    Ok(self.audit_tenant_refusal(context, batches))
+                })
+                .await?;
                 return Ok(CutExecution {
                     schema,
                     batches,
@@ -2350,10 +2352,12 @@ impl Oracle {
         }
         let mut scan_stats = OracleQueryScanStats::from_plan(root.as_ref());
         let schema = root.schema();
-        let batches = execute_stream(Arc::clone(&root), leader.task_ctx())
-            .map_err(|error| map_datafusion_error(&error))?;
-        let batches = self.audit_tenant_refusal(context, batches);
-        let batches = laned_batches(lanes, operation, batches);
+        let batches = laned_execution(lanes, operation, || {
+            let batches = execute_stream(Arc::clone(&root), leader.task_ctx())
+                .map_err(|error| map_datafusion_error(&error))?;
+            Ok(self.audit_tenant_refusal(context, batches))
+        })
+        .await?;
         if let Some(ownership) = admitted.analytical.as_ref() {
             ownership.retain_metric_fold(analytical::AnalyticalGraphMetricFold::new(
                 root,
@@ -4195,6 +4199,23 @@ fn instant_deadline(deadline: DateTime<Utc>) -> Result<Instant, BifrostError> {
         .checked_add(remaining)
         .ok_or(BifrostError::QueryTimeout)
 }
+/// Start a query's execution with `start` on the process CPU `lanes` as
+/// `operation`'s work, then poll its stream as [`laned_batches`] does, so
+/// the entry execution, and any work it spawns, runs laned like every batch.
+///
+/// # Errors
+/// Returns `start`'s error when the query cannot start.
+async fn laned_execution(
+    lanes: wyrd_runtime::resources::CpuLanes,
+    operation: wyrd_runtime::resources::Operation,
+    start: impl FnOnce() -> Result<SendableRecordBatchStream, BifrostError>,
+) -> Result<SendableRecordBatchStream, BifrostError> {
+    let batches = lanes
+        .laned(operation.context(), async move { start() })
+        .await?;
+    Ok(laned_batches(lanes, operation, batches))
+}
+
 /// `batches` with every poll on the process CPU `lanes` as `operation`'s
 /// work, holding no lane between batches; the stream keeps `operation` live
 /// until it drops, so the query counts as Bifrost demand while it runs.
@@ -4259,6 +4280,37 @@ mod tests {
             1,
             "no lane is held after the stream"
         );
+    }
+
+    /// A query's entry execution runs on a lane as the query's work, before
+    /// its first batch is polled, and holds no lane once it has started.
+    ///
+    /// # Panics
+    /// Panics when the query starts unlaned or as other work, or a lane
+    /// stays held after the start.
+    #[tokio::test]
+    async fn laned_execution_starts_the_query_on_a_lane() {
+        use datafusion::arrow::datatypes::Schema;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use wyrd_runtime::resources::{ProcessResources, WorkContext, Workload};
+
+        let process = ProcessResources::new(std::num::NonZeroUsize::MIN, 1 << 30, 1 << 30);
+        let workloads = process.workloads();
+        let operation = workloads.begin(Workload::Bifrost, None, None);
+        let context = operation.context();
+        let lanes = workloads.lanes().clone();
+        let started = laned_execution(lanes.clone(), operation, || {
+            assert_eq!(WorkContext::current(), Some(context), "the query starts laned");
+            assert_eq!(lanes.free(), 0, "the start holds the only lane");
+            let schema = Arc::new(Schema::empty());
+            Ok(Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                futures_util::stream::empty(),
+            )) as SendableRecordBatchStream)
+        })
+        .await;
+        assert!(started.is_ok(), "the query starts");
+        assert_eq!(workloads.lanes().free(), 1, "no lane is held after the start");
     }
 
     /// Interactive audits one local node; Analytical audits its whole frozen

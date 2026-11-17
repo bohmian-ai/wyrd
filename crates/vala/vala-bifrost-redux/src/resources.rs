@@ -908,7 +908,9 @@ impl MemoryHolder {
 #[derive(Debug)]
 struct ResourceState {
     /// This root's one charge on the process memory ledger, always equal to
-    /// [`Self::governed_total`].
+    /// [`Self::governed_total`], attributed to one settled Bifrost operation
+    /// so the process workload manager counts it once as Bifrost usage, and
+    /// as Bifrost demand while it holds bytes.
     process_charge: wyrd_runtime::resources::ByteCharge,
     /// Held bytes attributed to each [`MemoryHolder`].
     held_bytes: [usize; MEMORY_HOLDER_COUNT],
@@ -930,10 +932,19 @@ struct ResourceState {
 }
 
 impl ResourceState {
-    /// An empty ledger whose charges are also promised from `process`.
-    fn charging(process: &wyrd_runtime::resources::ByteLedger) -> Self {
+    /// An empty ledger whose charges are also promised from `process`'s
+    /// memory ledger and attributed there to Bifrost work.
+    fn charging(process: &wyrd_runtime::resources::ProcessResources) -> Self {
+        let mut process_charge = process.memory().empty_charge();
+        // The operation settles at once: the charge keeps its attribution,
+        // so Bifrost demands a share exactly while it holds governed bytes.
+        process_charge.attribute(&process.workloads().begin(
+            wyrd_runtime::resources::Workload::Bifrost,
+            None,
+            None,
+        ));
         Self {
-            process_charge: process.empty_charge(),
+            process_charge,
             held_bytes: [0; MEMORY_HOLDER_COUNT],
             infallible_headroom_bytes: 0,
             oracle_interactive_queries: 0,
@@ -2321,6 +2332,10 @@ impl BifrostResourceGovernor {
                 .map_err(|_| accounting_overflow())?,
             scratch_limit_bytes,
         );
+        process.workloads().set_local_cap(
+            wyrd_runtime::resources::Workload::Bifrost,
+            u64::try_from(managed_memory_bytes).map_err(|_| accounting_overflow())?,
+        );
         let root = Self {
             inner: Arc::new(ResourceGovernorInner {
                 plan: ResourcePlan {
@@ -2362,7 +2377,7 @@ impl BifrostResourceGovernor {
                     },
                 },
                 oracle_class_split: OnceLock::new(),
-                state: Mutex::new(ResourceState::charging(process.memory())),
+                state: Mutex::new(ResourceState::charging(&process)),
                 oracle_capacity_changed: Notify::new(),
                 process,
                 health: BifrostResourceHealth::default(),
@@ -5867,6 +5882,121 @@ mod tests {
             .try_charge_transport(limit)
             .expect("hosted bytes return to Bifrost");
         governor.release_transport(limit).expect("release");
+    }
+
+    /// Whether new `workload` work would start now rather than wait.
+    fn starts_now(
+        workloads: &wyrd_runtime::resources::WorkloadManager,
+        workload: wyrd_runtime::resources::Workload,
+    ) -> bool {
+        use futures_util::FutureExt as _;
+        workloads
+            .admit(workload, None, None)
+            .now_or_never()
+            .is_some()
+    }
+
+    /// Governed Bifrost memory counts once against Bifrost work and keeps it
+    /// demanding until released, with no live operation: with Bifrost holding
+    /// 80% of the budget and gateway work 16%, contention gives each half the
+    /// target, so new Bifrost work pauses while gateway work still starts,
+    /// and once the bytes return Bifrost no longer demands a share.
+    ///
+    /// # Panics
+    /// Panics when governed bytes are charged twice, counted against no
+    /// workload, outlive their release, or above-target Bifrost work starts.
+    #[test]
+    fn governed_bifrost_memory_is_bifrost_demand_until_released() {
+        use wyrd_runtime::resources::{PressureState, Workload};
+        let runtime = BifrostRuntimeResources::from_snapshot(
+            snapshot(256 * MIB),
+            policy(&[BifrostRole::Oracle]),
+        )
+        .expect("plan");
+        let process = runtime.process();
+        let workloads = process.workloads().clone();
+        let limit = process.memory().limit();
+        let bifrost = usize::try_from(limit / 10 * 8).unwrap();
+        runtime
+            .governor
+            .try_charge_transport(bifrost)
+            .expect("Bifrost charges");
+        assert_eq!(process.memory().used(), bifrost as u64, "one root debit");
+        assert_eq!(workloads.workload_bytes(Workload::Bifrost), bifrost as u64);
+        let gateway = workloads.begin(Workload::Gateway, None, None);
+        let mut held = process
+            .memory()
+            .try_charge(limit / 100 * 16)
+            .expect("gateway charges");
+        held.attribute(&gateway);
+
+        assert_eq!(workloads.sample(0).state, PressureState::Contended);
+        let share = (limit - limit / 20) / 2;
+        assert_eq!(workloads.target(Workload::Bifrost), Some(share));
+        assert_eq!(workloads.target(Workload::Gateway), Some(share));
+        assert!(!starts_now(&workloads, Workload::Bifrost), "above target");
+        assert!(starts_now(&workloads, Workload::Gateway), "below target");
+
+        runtime
+            .governor
+            .release_transport(bifrost)
+            .expect("release");
+        assert_eq!(workloads.workload_bytes(Workload::Bifrost), 0);
+        drop(held);
+        let mut held = process
+            .memory()
+            .try_charge(limit / 100 * 96)
+            .expect("gateway charges");
+        held.attribute(&gateway);
+        assert_eq!(workloads.sample(0).state, PressureState::Contended);
+        assert_eq!(
+            workloads.target(Workload::Bifrost),
+            None,
+            "released Bifrost no longer demands"
+        );
+        assert_eq!(
+            workloads.target(Workload::Gateway),
+            Some(limit - limit / 20)
+        );
+    }
+
+    /// An operator-lowered Bifrost cap bounds Bifrost's soft target, and the
+    /// share it cannot spend goes to the other demanding workloads.
+    ///
+    /// # Panics
+    /// Panics when the lowered cap is not Bifrost's target or its unspendable
+    /// share is not redistributed.
+    #[test]
+    fn a_lowered_bifrost_cap_redistributes_its_share() {
+        use wyrd_runtime::resources::{PressureState, Workload};
+        let mut policy = policy(&[BifrostRole::Oracle]);
+        policy.bifrost_memory_limit_bytes = Some(32 * MIB);
+        let runtime =
+            BifrostRuntimeResources::from_snapshot(snapshot(256 * MIB), policy).expect("plan");
+        let process = runtime.process();
+        let workloads = process.workloads().clone();
+        let limit = process.memory().limit();
+        runtime
+            .governor
+            .try_charge_transport(32 * MIB)
+            .expect("Bifrost charges its cap");
+        let gateway = workloads.begin(Workload::Gateway, None, None);
+        let mut held = process
+            .memory()
+            .try_charge(limit - 32 * MIB as u64)
+            .expect("gateway charges the rest");
+        held.attribute(&gateway);
+        assert_eq!(workloads.sample(0).state, PressureState::Critical);
+        let total = limit - limit / 20;
+        assert_eq!(workloads.target(Workload::Bifrost), Some(32 * MIB as u64));
+        assert_eq!(
+            workloads.target(Workload::Gateway),
+            Some(total - 32 * MIB as u64)
+        );
+        runtime
+            .governor
+            .release_transport(32 * MIB)
+            .expect("release");
     }
 
     /// Absolute overrides can tighten but never inflate detected resources.

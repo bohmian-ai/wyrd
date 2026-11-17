@@ -116,119 +116,42 @@ contracts or their generators. Regenerate the UI catalog when schemas change and
 run `mise run codegen:check` where applicable. Full shipped-surface journey lanes
 belong to integrated change review; focused UI/host journeys prove this task.
 
-## Obligations
-
-Recorded before the first edit. Proof owners are the four existing UI test
-files; selectors are recorded under Execution evidence before their first run.
-
-| ID | Promise (required cases) | Contract source | Planned proof |
-|---|---|---|---|
-| REQ-001 | `/t/[tenantKey]/verify` keeps the approved dense layout: WHERE, range, Live, two compact linked charts (by verdict with a neutral no-recorded-verdict bucket; by Verifier), counted facets, grouping and the execution table. Either chart brushes the range of both. Unfinished, terminal and no-result executions are listed. Verifier, subject/Card, Service/Workload, application Run, session, failed-requirement, status and applicable repository/PR context are kept. Charts, facets and rows read one filtered population across pages. Status and Verdict are separate columns and filters; all filters combine and an incompatible combination is empty. Grouping only navigates. | Outcome; Input ¶3–4; spec REQ-001 | Loader unit test on the shared predicate of rows, facets and both charts; page unit test for brush, grouping and filters; host integration on real unfinished, completed, cancelled and no-verdict executions |
-| REQ-002 | A row opens TASK-002's exact page directly. Back restores filters, range, grouping and position. Execution, result, subject, Verifier, binding and application Run stay separate facts. The existing tenant shell and exact Card routing are used; TASK-001's "Results in Verify" opens Verify by the exact Verifier identity. | Input ¶4; spec REQ-002 | Page unit test for URL state; Chromium open-and-return journey |
-| REQ-003 | Rows, counts and charts come from existing `bifrost.query` reads with typed binds and row/byte bounds; no endpoint, field, query service or wire change. Rows carry exact execution, Verifier and subject identity, lifecycle, nullable selected result and verdict and the recorded correlations. The selected result is the recorded `result_id`, never the latest result row. No per-row status or details read. Tenant and Verifier restrictions are those of the query authority; a WHERE is never authorization. An absent source is recorded as an external dependency and stays proposed. | Input ¶1–3; spec REQ-003 | Loader unit test on planned requests (one bounded batch, no `verification.*` read); host integration comparing rows with `verification.get_execution` and with a non-selected result row present |
-| REQ-014 | The dashboard is built from the existing Chart, FacetRail and RecordTable family, loaders, Node and MCP executors, catalog and BFF dispatch; no second loader or table owner. Superseded loads cannot replace a newer selection. A denied prerequisite causes no dependent read. | Input ¶4; spec REQ-014 | Catalog and contract gate (`brand/gen-theme.test.mjs`); the same loaders through Node, MCP, BFF, custom app and built artifact |
-| AC-001 | Create unfinished and completed ordinary, session and drift executions (PR executions where TASK-005 delivers them). Combine status, verdict and general filters, brush both charts, page, group, open a row and return. Counts and rows describe one authorized population; no-result work has no verdict; discovery context survives. | Observable proof ¶1–2 | `ui-library.integration.test.ts` and the Chromium journey in `ui-pages.integration.test.ts` |
-| AC-008 | Foreign tenants, restricted viewers, denied prerequisites and unavailable reads through real Node, MCP, BFF, custom and built-artifact adapters: no foreign rows or counts, no follow-on read after a denial, no denial shown as empty. Result-visibility lag is shown as recorded. | Observable proof ¶1–2 | `ui-library.integration.test.ts` refusal and tenancy cases |
-| AC-009 | `mise run dev:full` produces this task's real inputs where needed; the page and each changed component are compared with the approved mock in both themes, narrow and wide, keyboard, focus and touch, long content and error states, with screenshots and individual human acceptance. | Execution ¶5 | Gallery entries, recorded screenshots; human acceptance is recorded only when given |
-
-### Sources recorded at activation
-
-Read from current source (`crates/vala/vala-bifrost-redux/src/tables/verification/`,
-`crates/wyrd/wyrd-server/src/verification/state.rs`,
-`crates/wyrd/wyrd-server/src/components/verification/service/inspection.rs`,
-`architecture/bifrost-design.md`, `architecture/wyrd-security-posture.md`).
-
-| Need | Existing authorized source | Finding |
-|---|---|---|
-| Population, one row per accepted execution of every origin | `bifrost.verification.execution_inputs` (`execution_id`, `verifier_card_uid`, `binding_id`, `group_id`, `origin`, `recorded_at`) | Supplied. A result row alone never lists unfinished work. |
-| Verifier, subject/Card, Service/Workload, application Run, session, binding | the same row: `verifier_card_uid`, `subject_kind/name/version`, `subject_card_uid`, `service_name`, `service_version`, `deployment_environment`, `workload_card_uid`, `run_id`, `group_id`, `binding_id` | Supplied; each is nullable as recorded. |
-| Selected result identity | latest checkpoint (`event = 'checkpoint'`, `max(sequence)`) of `bifrost.verification.execution_events`: `value.terminal.result_id`; a direct execution writes no event and is complete once its result row is visible | Supplied. Since revision 4 the checkpoint supplies only the selected result; status comes from the row below. |
-| Selected result and verdict | `bifrost.verification.results` joined on the recorded `result_id` (the only row of a direct execution) | Supplied. A completed execution whose result row is not yet visible reads as completed with no recorded verdict. |
-| Counts and charts | aggregates of the same derived rows under the same binds | Supplied by `bifrost.query`. |
-| Queue lifecycle: `pending`, `running`, `retrying`, `waiting`, `completed`, `cancelled`, `timed_out`, `errored` | newest `event = 'status'` row per execution by `occurred_at` in `bifrost.verification.execution_events` (TASK-003A, REQ-015); no row yet means `pending`; equal instants fall to `event_id`, which only makes the choice repeatable | **Supplied at revision 4** (was an external dependency at revision 3). A status row lost with its process leaves the older status standing, as REQ-015 accepts. A direct execution is never queued: `completed` once its result is visible, else `not recorded`. |
-| Exact-Verifier restriction before pagination and counts | `bifrost.query` authorizes by tenant and table object (`bifrost_query:read` on all, schema or table); it has no per-Verifier row rule. `verifier:read` scoped to one Verifier governs only the dedicated execution reads. | **External dependency.** A principal without the table grant is denied the whole read; one with it reads every execution row of its tenant, and opening another Verifier's row is then refused by `verifier:read`. A Verifier-scoped discovery population needs a server-enforced row scope; nothing here emulates it with WHERE. |
-| Repository and pull request | The pins recorded as a `pull_request` execution's `inputs` (`verification/results.rs:412`, `PullRequestActivation`) | **Delivered** as `repository` (provider repository id) and `pull_request` (number): facets and filters, null for every other origin. Correction: this never waited on TASK-005. The repository shows as its provider id, not a name. |
-| Review-set membership | TASK-005 | **Not delivered.** The recorded `generation` is not exposed; no review-set column, facet or group exists. |
-| Failed requirement | The selected result on the execution page | **Kept by opening a row.** User decision, 2026-11-17: the Verify list filters by failed verdict and by Verifier, never by a specific requirement. No failed-requirement column, facet or filter is owed, and no server change is needed. |
-
 ## Execution evidence
 
-Consumed revisions: TASK-001A baseline merge `d118ee49f`; TASK-002 as integrated
-at `b05da5597`. Candidate: `b05da5597..HEAD` on
-`task/wyrd-ui-main-integration/TASK-005`. Paths below are under
-`crates/wyrd/wyrd-server/wyrd-ui/`; `U` is `src/lib/ui-library.test.ts`, `P`
-`src/lib/ui-pages.test.ts`, `UI` `src/lib/ui-library.integration.test.ts`, `PI`
-`src/lib/ui-pages.integration.test.ts`.
+The Verify page at `/t/{tenant}/verify` lists every execution in the range from
+one `bifrost.query` population (`packages/ui/src/lib/schemas.ts`, `EXECUTIONS`),
+with Status and Verdict as separate columns and filters, two linked charts,
+counted facets, grouping, paging, and a row that opens TASK-002's execution page
+and returns to the same list. Status is the newest TASK-003A status row.
+Repository and pull request number are facets and filters, read from a pull
+request execution's recorded input pins.
 
-Focused selectors, recorded before each first run:
+Commands, run from the repository root:
 
-- P `executions list, facets and charts read one population in bounded shared queries`
-- U `an executions list keeps status and verdict apart, names Verifiers the host read, and opens one exact execution`
-- P `the Verify dashboard reads one population and keeps its investigation in the URL`
-- P `an exact Verifier Card page shows its definition, versions and where it runs` (existing; now expects the Results in Verify link)
-- UI `Verify lists executions with and without a recorded result as one authorized population through every host`
-- PI `the Verify dashboard filters, groups, brushes, pages, opens an execution and returns to the same list`
+```bash
+mise run ui:check
+mise exec -- scripts/postgres/with-test-postgres.sh -- env WYRD_UI_INTEGRATION=1 pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.integration.test.ts src/lib/ui-pages.integration.test.ts
+```
 
-Commands (from the repository root unless noted):
+`ui:check` passes (74 tests). Both integration files passed in full (26 tests)
+at `6ccb565d3`; the two assertions added after it were rerun by their own tests.
 
-- C1 `mise exec -- pnpm test src/lib/ui-library.test.ts src/lib/ui-pages.test.ts` in `crates/wyrd/wyrd-server/wyrd-ui`: 43 passed.
-- C2 `mise exec -- scripts/postgres/with-test-postgres.sh -- env WYRD_UI_INTEGRATION=1 pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.integration.test.ts -t "Authorized Observe across hosts|exact Verifier definition|Verify lists executions"`: 3 passed.
-- C3 the same wrapper with `src/lib/ui-pages.integration.test.ts -t "the Verify dashboard filters"`: 1 passed; also `-t "authenticated traces and spans"` and `-t "Verifier Card page draws|observe boards match|execution page keeps its selection"`: passed after their two superseded assertions were updated (below).
-- C4 `mise run ui:check` (check, catalog and contract gate, all unit files): exit 0, 74 tests. `mise run codegen:check`: exit 0. `pnpm build`: exit 0. `git diff --check`: clean.
+| Proof | Test |
+|---|---|
+| One population for rows, facets and charts; the status and selected-result SQL | `ui-pages.test.ts`: "executions list, facets and charts", "the Verify dashboard reads one population and keeps its investigation in the URL" |
+| Real server, Node and MCP: running, completed and cancelled rows match `get_execution`; refusals and another tenant show no rows | `ui-library.integration.test.ts`: "Verify lists executions with and without a recorded result as one authorized population through every host" |
+| Real server: pending, waiting, retrying, timed out and errored rows; pull request facets | `ui-library.integration.test.ts`: "Verify lists pull request executions…", "…waiting for deferred evidence…", "…retrying for a trace that has not landed…", "Verify lists a timed out and an errored execution…" |
+| Browser: filter, group, brush, page, open a row and return; a superseded load never replaces a newer one | `ui-pages.integration.test.ts`: "the Verify dashboard filters, groups, brushes, pages, opens an execution and returns to the same list" |
 
-RED then GREEN, per scenario:
+TDD: the population, status and pull request changes had a failing unit test
+first. The real-server journeys were written after the production query.
 
-- P population loader: RED `TypeError: Cannot read properties of undefined (reading 'table')` (no `executions` signal); GREEN in `855d5a7c9`.
-- U executions list: RED `TypeError: Cannot read properties of undefined (reading '1')` (RecordTable had no executions noun, pills, labels or open intent); GREEN in `396b447fa`.
-- P Verify dashboard: the first run failed on the missing route module, which is a setup failure and not a behavioural RED; GREEN in `c9ba57dc0`. Two expectations were corrected while going green because the test was wrong, not the page: the bound range is `$1::timestamptz`, and a second value of one column adds a clause as in Observe.
+User decisions, 2026-11-17:
 
-### Revision 4: status rows (TASK-003A consumed at `7ef2c34cd`)
+- The list reads the newest status row only; an execution with none is pending.
+- The list filters by failed verdict and by Verifier, never by a specific requirement.
+- The list needs tenant-wide Bifrost read; a Verifier-scoped list is out of scope.
+- Review-set grouping is not part of this task.
 
-Candidate commits `8c48a0597`, `9b41ed6ae`. The population query now takes a queued execution's status from its newest status row and reads checkpoints only for the selected result.
-
-- P `executions list, facets and charts read one population in bounded shared queries` (the test and the query are in one commit, so the RED cannot be verified from history): RED `expected ' FROM (SELECT i.execution_id …' to contain 'last_value(status ORDER BY occurred_at, event_id) …'`; GREEN in `8c48a0597`.
-- U executions list: the `waiting` row and its pill landed together with their assertion; no RED. The `running` and `retrying` tones have no assertion.
-- UI and PI (same selectors as above): edited before their first run against the new query. Their first failures were setup, not behavioural REDs (below); both GREEN in `9b41ed6ae`.
-- Commands: C1 43 passed; C4 `mise run ui:check` exit 0, 74 tests; `mise run codegen:check` exit 0; `git diff --check` clean; the task's full integration command over both files: 21 of 22 passed; the one failure, `development environment lifecycle`, is diagnosis 3, and that test and `local signup and personal settings` pass after its fix.
-
-Diagnoses of the unexpected failures:
-
-1. Symptom: a completed Run execution listed as `pending`. Evidence: `sdks/wyrd-sdk-ts/testing/wyrd_testing.linux-x64-gnu.node` was built at 15:15, before the first status-row commit `43821f9d6` (19:33). Cause: the test server addon predated TASK-003A and staged no status rows. Fix site: none in code; the prerequisite `mise run ts:build:testing` was rerun.
-2. Symptom: the execution held by `holdPublications` listed as `pending` while its own read said `running`. Evidence: `WyrdTestServer::hold_publications` (`crates/wyrd/wyrd-testing/src/server.rs`) claims the queue row through the verification fixture, not the runner. Cause: no production owner made that transition, so no status row exists; a fixture cannot establish this input. Fix site: the two tests. They now submit the hosted `adds-one` Verifier (`fixtures/cards/verification_capacity`) under `occupyHostedMemory`, so a real runner claims it and its step waits for memory. That wait ends at the hosted code timeout (10 s), after which the runner defers and reclaims, so UI reads `running` in one query immediately after `waitForHostedWaiters` and then releases it; PI makes the claim just before opening Verify and completes its `running` step (facet count, filter, open, page status) first, inside that window but still bounded by it. `holdPublications` stays for the cancelled execution: the public cancel route records that row.
-3. Symptom: PI `development environment lifecycle` timed out waiting for `/t/dev` after Sign in, also when run alone. Evidence (independent read-only diagnosis, given only the command, failure and diff): the Username field read `development` after the fill, was set to `""` by Svelte's `set_value` during hydration of `login/+page@.svelte`, and the click then raised `invalid` on it with no POST. Cause: the login page's Username input rendered a one-way `value={…}`, which hydration re-applies over text typed before it; `required` then blocks the submit. Under `vite dev` hydration lands after the `load` event the test waits for. Not caused by this candidate. Fix site: `src/routes/t/[tenantKey]/login/+page@.svelte`, outside this task's write set: `value` became `defaultValue`, which still restores the username after a refused sign-in (PI `local signup and personal settings`). The same one-way `value` was on the signup Username and the four settings identity-provider text inputs; at the user's request both now use `defaultValue` too (these forms post natively and reload, so a default cannot go stale). PI `local signup and personal settings` passes; no test fills the settings identity-provider form.
-
-Independent read-only check of revision 4 (task file and diff only), and what was done:
-
-- The incompatible-combination check filtered `running` after that execution had completed, so it was vacuous: it now filters `cancelled` with `passed`, a status that has a row.
-- A queued execution retained before TASK-003A has a terminal checkpoint and no status row, so it lists as `pending` beside its verdict. Left as is: REQ-015 has discovery read status rows and ignore checkpoints, and no compatibility reading is added. `mise run dev:full` was rerun after the change on a fresh stack: 830 executions, all `completed` (415 direct, 415 submitted, the latter from status rows), 780 passed, 50 failed; screenshots `devfull-verify-{light,dark}-{1280,390}.png` regenerated.
-- The remaining findings are evidence corrections, applied in the rows below.
-
-TDD compliance for revision 4: **VIOLATED**. Only P was written before its code, and its RED is not verifiable from history; U has no RED; `8c48a0597` committed UI and PI edits before they passed (they went green in `9b41ed6ae`).
-
-TDD compliance: **VIOLATED** for the two integration scenarios. UI and PI were written after the loaders and page they exercise, so neither has a RED; an unrecorded exploratory query against a real server also preceded UI and was removed before commit. The unit scenarios were test-first except the route-module case above.
-
-Mechanics deviations:
-
-- WHERE on Verify is the read-only projection of the typed clauses, as the mock draws it; the executions signal refuses `where_sql`, because a free predicate over the derived rows is not one of its checked filter columns.
-- The page reads its URL state from the server load (`data.state`), like the execution page.
-- Verifier names come from one bounded `cards.list` (kind Verifier, 200) on the host; a refused or longer list shows exact UIDs.
-- Existing assertions that Verify was unavailable were replaced by the delivered behaviour: P and PI Verifier Card page (now a Results in Verify link), PI traces journey (Verify is a nav link).
-- Status and Verdict are pinned by the Verify page's own CSS over the shared table (fixed 116 px Verdict column); the shared component is unchanged.
-
-| ID | Status | Proof |
-|---|---|---|
-| REQ-001 | **FAIL (open)** | Delivered and proven: layout, range, two linked charts with a neutral `no verdict` series, counted facets, grouping, separate Status and Verdict, combined and incompatible filters, one population across pages (P population test; P dashboard test; UI totals of three facets, two charts and paged rows equal on Node and MCP; PI). Live is proven only as the `live=1` navigation. Revision 4: Status is the recorded queue lifecycle (P SQL; UI `running`, `cancelled`, `completed` on a real server; U `waiting` pill). all eight queue statuses are now listed from a real server (AC-001 row). Open: a direct `not recorded` is not produced on a real server here; the incompatible combination is proven with terminal rows and with unfinished work (`pending` and `passed` match nothing, pull request journey); failed-requirement context is kept by opening a failed row (user decision, sources table), so no list filter is owed; repository and pull request are facets and filters (AC-001 row) but the repository reads as its provider id and no review-set context exists (TASK-005); WHERE is a read-only projection, not a general predicate; workload, binding and result identity are filters only and cannot be shown as columns. The browser brush now changes the rows: PI brushes a window before any execution was accepted, the list empties, and Reset zoom restores 50 rows. |
-| REQ-002 | PASS | PI: rows open `/verify/executions/{id}` for a completed and a running execution; Back returns to the same URL with the page cursor or filters and a non-zero `window.scrollY`. Range and grouping live in that same URL (P round-trips them into the load); Back with them set was not separately driven in the browser. Results in Verify filters by the exact `verifier_card_uid` (P, PI). U: Verifier, run, session, status and verdict are separate cells and a row opens by its own `execution_id`. |
-| REQ-003 | **FAIL (open)** | Proven: only `bifrost.query` operations build rows, counts and charts (UI op set on Node and MCP; built artifact tool calls; P: nine queries and one `cards.list`); the list and facets carry a `LIMIT`, the charts are bounded by the range and bucket only; typed binds; completed rows equal `verification.get_execution` (UI). The selected-result join on the recorded `result_id` is asserted as SQL text only; no test holds a non-selected result row. No server, SDK or wire file is in the diff. Revision 4: rows carry the recorded lifecycle; the `running` row equals `verification.get_execution` on Node only, the `cancelled` row on Node and MCP (UI). Open: no test holds a non-selected result row; byte bounds are the executor's and are not asserted here; the exact-Verifier row scope is not enforced by the query authority, the external dependency recorded above. |
-| REQ-014 | PASS | Chart, FacetRail and RecordTable with the existing loaders and catalog (C4 gate). UI: list, facets and both charts through Node and MCP; the list and both charts, as plain `Chart` panels whose totals equal the paged rows, through BFF `ui/load` and the custom app; list, facets and the verdict chart through the built artifact answered by the real MCP server. A superseded slow load does not replace the newer selection (PI). The dashboard's reads are one independent batch and a refused batch is followed by no read (P). |
-| AC-001 | **FAIL (open)** | Proven: UI creates failed and passed Run executions, a scheduled drift window, three session turns with their group execution, a runner-claimed execution found by `status = running` with no verdict and then `completed` and `passed` once released, and a cancelled-while-held execution listed as `cancelled`; rows, facets and charts are asserted over the population after the running one completed (the running row itself is asserted alone, on Node, and as a facet count of 1 in PI); PI filters by `running`, opens that execution, returns, then groups, brushes both charts, pages, opens and returns. Unfinished work beyond `running` (Node executor only; correction: the TypeScript test server can hold these, the earlier claim that it cannot was wrong): UI `Verify lists an execution waiting for deferred evidence by its recorded status` lists a pull request execution parked for its `ci` input by `status = waiting` and matches `get_execution` (`waiting: [ci]`); UI `Verify lists an execution retrying for a trace that has not landed by its recorded status` lists a submitted `whole-trace` execution by `status = retrying` and matches `get_execution` (`evidence_unavailable`). Both were written after the production query, so they have no RED. Diagnosis of the first retrying attempt — Symptom: no `retrying` row. Evidence: `get_execution` returned `completed`, `passed`. Cause: `coding-turn` declares a trace input but no check reads it, so an unlanded trace defers nothing. Fix site: the test only; it now submits `whole-trace`, whose check reads the trace. UI `Verify lists a timed out and an errored execution by their recorded status` submits `admission-deadline` (three-second limit) against a model that answers ten seconds late, lists it by `status = timed_out` and matches `get_execution` (`execution_timed_out`); no RED, written after the production query. Diagnosis of its first failure — Symptom: no `timed_out` row. Evidence: `get_execution` read `completed`, the list row `completed`/`failed`, and the status rows `running` then `completed` 0.3 s apart. Cause: the test did not request the `assistant` fixture, so no gateway deployment existed and the section review failed at once instead of waiting on the model. Fix site: the test only. The same test submits `admission-sweep` with a number where its sections must be strings, lists it by `status = errored` and matches `get_execution` (`input_invalid`). A first approach failed (a model answering 500 ends `completed`/`inconclusive`); the trigger was chosen by an independent read-only diagnostician at the user's request, which traced it to the engine's input conformance (`vala-verify/src/blocks/engine.rs:3046`, `runner.rs:1924`). Not built by user decision: an unfinished session or drift execution. Pull request executions: UI `Verify lists pull request executions by their recorded repository and number` admits three through the GitHub mock's signed webhook on a real server, lists pull request 7's `cancelled` (superseded) and `pending` rows by `pull_request = 7`, matches the pending row to `get_execution`, and counts facets `repository` 1 = 3, `pull_request` 7 = 2 and 8 = 1 (Node executor only; RED was the P population and dashboard assertions; the journey itself was written after the production query). |
-| AC-008 | **FAIL (open)** | Proven (UI): another tenant reads empty rows, facets and charts on Node, an empty list on MCP and an empty BFF panel; `verifier:read` alone is denied, not empty, on Node (list, facets, both charts), MCP, BFF and the custom app; an unreachable server is an error on Node, MCP, BFF, the custom app and in the built artifact (there a failing host callback). Added after the revision-4 check (UI, GREEN only): the refused list, facets and charts send three batches and nothing after; the other tenant reads empty facets and charts on MCP, an empty custom-app list and an empty built-artifact list; the built artifact shows the refusal code, not an empty list. Open: a Verifier-scoped viewer cannot be expressed (external dependency); result-visibility lag is proven only at component level (U row `exec_lagging`), not produced on a real server; the other tenant holds no executions of its own. |
-| AC-009 | **FAIL (open)** | Proven: `mise run dev:full` (config directory redirected to a scratch path so the saved credential was kept; batch passed) needed no setup change: after signing in as `development`, `/t/dev/verify` listed its real inputs, 830 completed executions (780 passed, 50 failed) of `follows-policy 1.1.0` and `no-refund-promise 1.1.0` for `support-agent` / `support-desk`, direct and submitted, 50 rows per page, with both charts and all six facets. Gallery cases added for the executions list, grouped list and facets. Screenshots (local, not committed): `devfull-verify-{light,dark}-{1280,390}.png` from that stack and `execution-verify-dashboard-{light,dark}-{1280,390}.png` from PI. Open: the standard stack holds no unfinished, session, drift or `no verdict` execution; no reference-region comparison with the mock, no keyboard, focus, touch, long-content or error-state review, and no individual human acceptance is recorded. |
-
-An independent read-only check of the task file and diff found a session id shortened like a UUID and the instant sort default applied to authored SQL; both are fixed with their assertions, and the rows above were corrected to what the tests assert. Known and left: the population SQL relies on every read binding the range first (all three callers do); the Verifier chart key names its first five series; the unit REDs cannot be verified from history because each test landed in the commit that made it pass.
-
-The user decided on 2026-11-17 to leave this task `BLOCKED` at this point and to add no checkpoint fallback for executions retained before TASK-003A.
-
-User decisions, 2026-11-17: (1) the Verify list needs tenant-wide Bifrost read; a Verifier-scoped list is out of scope for TASK-003 and needs no server change. (2) Of the unbuilt real-server proofs, build `timed_out` and `errored`; an unfinished session or drift execution and a second non-selected result were not selected and are not built. (3) AC-009's human acceptance stays open until the user reviews the page.
-
-Status: `BLOCKED`. Open: REQ-001, REQ-003, AC-001, AC-008, AC-009. Repository and pull request context and real `pending`, `waiting` and `retrying` rows are delivered (commits `91e0de7cb` to `830da965d`). Revision 4 closed the queue-lifecycle part of each; `mise run dev:full` and the independent check were rerun after it (above). The front-matter status stays `proposed`.
+Status: `BLOCKED`. Open: AC-009, the user's own review of the Verify page
+against the approved mock.

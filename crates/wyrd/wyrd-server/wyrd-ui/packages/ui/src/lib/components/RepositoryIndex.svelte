@@ -21,6 +21,13 @@
 </script>
 
 <RepositorySheet>
+  <div class="page-head">
+    <div class="grow">
+      <h1>Repositories</h1>
+      <p class="desc">Repository Cards and the GitHub repositories this tenant can reach. Registration, GitHub access and automatic verification are separate facts.</p>
+    </div>
+    <button type="button" class="btn btn-sm" {disabled} onclick={() => onaction?.({ name: 'connection.open', input: {} })}>GitHub connection</button>
+  </div>
   {#if result.state === 'populated'}
     {@const data = result.data}
     {#if data.connection.state !== 'populated'}

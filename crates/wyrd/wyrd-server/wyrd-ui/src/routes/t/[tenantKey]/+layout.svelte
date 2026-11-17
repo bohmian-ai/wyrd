@@ -22,6 +22,7 @@
   const ICONS = {
     home: 'M3 11l9-7 9 7v9h-6v-6H9v6H3z',
     cards: 'M4 4h16v16H4zM4 9h16',
+    repositories: 'M6 4a2 2 0 1 0 0 4 2 2 0 1 0 0-4M6 16a2 2 0 1 0 0 4 2 2 0 1 0 0-4M6 8v8M10 6h8v12h-8',
     observe: 'M3 12h4l3-7 4 14 3-7h4',
     verify: 'M5 12l5 5L20 7',
     query: 'M4 6c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3zM4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6',
@@ -30,7 +31,8 @@
   const groups = $derived<readonly (readonly Destination[])[]>([
     [
       { label: 'Home', href: base, icon: ICONS.home },
-      { label: 'Cards', href: `${base}/cards`, icon: ICONS.cards }
+      { label: 'Cards', href: `${base}/cards`, icon: ICONS.cards },
+      { label: 'Repositories', href: `${base}/repositories`, icon: ICONS.repositories }
     ],
     [
       { label: 'Observe', href: `${base}/observe`, icon: ICONS.observe },

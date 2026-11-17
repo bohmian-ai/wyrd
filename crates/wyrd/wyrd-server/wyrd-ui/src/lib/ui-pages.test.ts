@@ -859,3 +859,176 @@ test('the Verify dashboard reads one population and keeps its investigation in t
     refused.unmount();
   }
 });
+
+import { readIndex, repositoryHref, writeIndex } from '$lib/repositories-host';
+import { load as loadRepositories } from '../routes/t/[tenantKey]/repositories/+page.server';
+import RepositoriesPage from '../routes/t/[tenantKey]/repositories/+page.svelte';
+import { load as loadRepository } from '../routes/t/[tenantKey]/repositories/[name]/+page.server';
+import RepositoryPage from '../routes/t/[tenantKey]/repositories/[name]/+page.svelte';
+import { load as loadUndeclared } from '../routes/t/[tenantKey]/repositories/github/[repositoryId]/+page.server';
+import UndeclaredPage from '../routes/t/[tenantKey]/repositories/github/[repositoryId]/+page.svelte';
+import { load as loadGithub } from '../routes/t/[tenantKey]/settings/integrations/github/+page.server';
+import GithubPage from '../routes/t/[tenantKey]/settings/integrations/github/+page.svelte';
+import { connectionExecutor } from '$lib/ui-fixtures';
+
+test('the Repositories workspace keeps its index state, opens exact versions and leads to the connection', async () => {
+  const requests: WireRequest[] = [];
+  const tenant = { key: 'acme', name: 'Acme' };
+  const event = (path: string, params: object, executor: Executor) => {
+    host.executor = { run: (batch, signal) => (requests.push(...batch), executor.run(batch, signal)) };
+    requests.length = 0;
+    const url = new URL(`http://ui.test/t/acme/${path}`);
+    return { locals: { browserSession: { client: () => ({}) } }, params: { tenantKey: 'acme', ...params }, url, request: new Request(url) } as never;
+  };
+  const index = async (search = '', executor: Executor = fixtureExecutor) => render(RepositoriesPage, { data: { ...(await loadRepositories(event(`repositories${search}`, {}, executor))), tenant } } as never);
+  const detail = async (rest: string, executor: Executor = fixtureExecutor) =>
+    render(RepositoryPage, { data: { ...(await loadRepository(event(`repositories/${rest}`, { name: decodeURIComponent(rest.split('?')[0]) }, executor))), tenant } } as never);
+  const undeclared = async (rest: string) =>
+    render(UndeclaredPage, { data: { ...(await loadUndeclared(event(`repositories/github/${rest}`, { repositoryId: rest.split('?')[0] }, fixtureExecutor))), tenant } } as never);
+  vi.mocked(goto).mockClear();
+
+  // The index URL round-trips search and Show; an unknown Show is refused before any read.
+  expect(writeIndex({ query: 'pay', show: 'ready' })).toBe('?q=pay&show=ready');
+  expect(readIndex(new URLSearchParams('?q=pay&show=ready'))).toEqual({ query: 'pay', show: 'ready' });
+  expect(writeIndex({})).toBe('');
+  const refused = await index('?show=paused');
+  expect(refused.container).toHaveTextContent('WYRD_SPEC_400_VALIDATION');
+  expect(requests).toEqual([]);
+  refused.unmount();
+
+  // Rows open the exact version and carry the index state, so the way back restores it.
+  const filtered = await index('?q=acme&show=ready');
+  expect(filtered.getByRole('heading', { level: 1, name: 'Repositories' })).toBeInTheDocument();
+  expect(filtered.container).toHaveTextContent('1 of 4 shown');
+  await fireEvent.click(filtered.getByRole('button', { name: 'payments-api' }));
+  expect(goto).toHaveBeenLastCalledWith('/t/acme/repositories/payments-api?version=1.4.0&back=%3Fq%3Dacme%26show%3Dready');
+  await fireEvent.click(within(filtered.getByRole('group', { name: 'Show' })).getByRole('button', { name: 'No Card' }));
+  expect(goto).toHaveBeenLastCalledWith('/t/acme/repositories?q=acme&show=undeclared', { keepFocus: true, noScroll: true });
+  await fireEvent.click(filtered.getByRole('button', { name: 'GitHub connection' }));
+  expect(goto).toHaveBeenLastCalledWith('/t/acme/settings/integrations/github');
+  filtered.unmount();
+  const all = await index();
+  await fireEvent.click(all.getByRole('button', { name: 'acme/web-checkout' }));
+  expect(goto).toHaveBeenLastCalledWith('/t/acme/repositories/github/741660215');
+  all.unmount();
+
+  // The detail: policy and access first, then this Repository's executions from the shared Verify population.
+  expect(repositoryHref('/t/acme', { kind: 'Repository', name: 'a b', version: '1.0.0' }, { declaration: 'toml', back: '?q=x' })).toBe('/t/acme/repositories/a%20b?version=1.0.0&declaration=toml&back=%3Fq%3Dx');
+  const page = await detail('payments-api?version=1.3.0&back=%3Fq%3Dacme%26show%3Dready');
+  expect(page.getByRole('link', { name: 'Repositories' })).toHaveAttribute('href', '/t/acme/repositories?q=acme&show=ready');
+  expect(page.container).toHaveTextContent('not selected · viewing only');
+  const where = [{ column: 'subject_kind', value: 'Repository' }, { column: 'subject_name', value: 'payments-api' }];
+  const activity = requests.filter((request) => request.op === 'bifrost.query') as Extract<WireRequest, { op: 'bifrost.query' }>[];
+  expect(activity).toHaveLength(1);
+  expect(activity[0].sql).toContain('subject_kind = $3 AND subject_name = $4');
+  expect(activity[0].params?.slice(2)).toEqual(['Repository', 'payments-api']);
+  // Activity is one list read: no execution's status or detail is read per row.
+  expect(requests.some((request) => request.op.startsWith('verification.'))).toBe(false);
+  expect(page.getByRole('link', { name: 'View all in Verify' })).toHaveAttribute('href', `/t/acme/verify?${new URLSearchParams({ last: '30d', where: JSON.stringify(where) })}`);
+  await fireEvent.change(page.getByRole('combobox', { name: 'Card version' }), { target: { value: '1.4.0' } });
+  expect(goto).toHaveBeenLastCalledWith('/t/acme/repositories/payments-api?version=1.4.0&back=%3Fq%3Dacme%26show%3Dready', { keepFocus: true, noScroll: true });
+  await fireEvent.click(page.getByRole('tab', { name: 'wyrd.toml' }));
+  expect(goto).toHaveBeenLastCalledWith('/t/acme/repositories/payments-api?version=1.3.0&declaration=toml&back=%3Fq%3Dacme%26show%3Dready', { keepFocus: true, noScroll: true });
+  await fireEvent.click(page.getByRole('button', { name: 'Verifier definition' }));
+  expect(goto).toHaveBeenLastCalledWith('/t/acme/cards/detail?kind=Verifier&name=pr-review&version=1.3.0');
+  await fireEvent.click(page.getByRole('button', { name: 'Manage connection' }));
+  expect(goto).toHaveBeenLastCalledWith('/t/acme/settings/integrations/github');
+  page.unmount();
+
+  // A refused activity read leaves policy and access readable.
+  const noActivity = await detail('payments-api?version=1.4.0', {
+    run: (batch, signal) => (batch[0].op === 'bifrost.query' ? stateExecutors.denied.run(batch, signal) : fixtureExecutor.run(batch, signal))
+  });
+  expect(noActivity.container).toHaveTextContent('✓ selected');
+  expect(noActivity.getByRole('region', { name: 'Verification activity' })).toHaveTextContent('WYRD_AUTH_403_FORBIDDEN');
+  noActivity.unmount();
+
+  // The URL names one exact version; without it, or for an unknown Card, nothing else is read or shown.
+  for (const rest of ['payments-api', 'payments-api?version=latest']) {
+    const invalid = await detail(rest);
+    expect(invalid.container).toHaveTextContent('WYRD_SPEC_400_VALIDATION');
+    expect(requests).toEqual([]);
+    invalid.unmount();
+  }
+  const unknown = await detail('nowhere?version=1.0.0');
+  expect(unknown.container).toHaveTextContent('WYRD_REGISTRY_404_CARD_NOT_FOUND');
+  expect(requests).toEqual([{ op: 'cards.get_by_ref', card_ref: { kind: 'Repository', name: 'nowhere', version: '1.0.0' } }]);
+  expect(unknown.queryByRole('region', { name: 'Verification activity' })).toBeNull();
+  unknown.unmount();
+
+  // A reachable repository with no Card explains how to declare it; a foreign id names nothing.
+  const declare = await undeclared('741660215?back=%3Fshow%3Dundeclared');
+  expect(declare.getByRole('link', { name: 'Repositories' })).toHaveAttribute('href', '/t/acme/repositories?show=undeclared');
+  expect(declare.container).toHaveTextContent('wyrd declare wyrd.toml');
+  declare.unmount();
+  const foreign = await undeclared('999');
+  expect(foreign.container).toHaveTextContent('WYRD_SPEC_404_NOT_FOUND');
+  expect(foreign.container.textContent).not.toMatch(/acme\/\w/);
+});
+
+test('Settings connects and disconnects GitHub once through the host and reads state back', async () => {
+  const tenant = { key: 'acme', name: 'Acme' };
+  const open = async (executor: Executor) => {
+    host.executor = executor;
+    const url = new URL('http://ui.test/t/acme/settings/integrations/github');
+    return render(GithubPage, { data: { ...(await loadGithub({ locals: { browserSession: { client: () => ({}) } }, params: { tenantKey: 'acme' }, url, request: new Request(url) } as never)), tenant } } as never);
+  };
+  const here = '/t/acme/settings/integrations/github';
+  const answers: ((response: Response) => void)[] = [];
+  const fetched = vi.spyOn(globalThis, 'fetch').mockImplementation(() => new Promise<Response>((resolve) => answers.push(resolve)));
+  const opened = vi.spyOn(window, 'open').mockReturnValue(null);
+  vi.mocked(invalidateAll).mockClear();
+
+  // Connect asks the host for the authorization URL once, then leaves for GitHub in the same tab.
+  const start = await open(connectionExecutor({ state: 'not_connected' }));
+  expect(start.getByRole('heading', { level: 1, name: 'GitHub' })).toBeInTheDocument();
+  const connect = () => start.getByRole('button', { name: 'Connect GitHub' });
+  await fireEvent.click(connect());
+  await waitFor(() => expect(connect()).toBeDisabled());
+  await fireEvent.click(connect());
+  expect(fetched.mock.calls).toEqual([[here, { method: 'POST' }]]);
+  answers[0](Response.json({ authorization_url: 'https://github.com/apps/wyrd-verify/installations/new?state=s1' }));
+  await waitFor(() => expect(opened).toHaveBeenCalledWith('https://github.com/apps/wyrd-verify/installations/new?state=s1', '_self'));
+  start.unmount();
+  // A refused connect stays on the page with the server's code.
+  const refusedStart = await open(connectionExecutor({ state: 'not_connected' }));
+  await fireEvent.click(refusedStart.getByRole('button', { name: 'Connect GitHub' }));
+  answers[1](Response.json({ code: 'WYRD_PERMISSION_403_DENIED_RBAC', title: 'Permission denied', status: 403 }, { status: 403 }));
+  await waitFor(() => expect(refusedStart.container).toHaveTextContent('WYRD_PERMISSION_403_DENIED_RBAC'));
+  expect(opened).toHaveBeenCalledTimes(1);
+  refusedStart.unmount();
+
+  // Disconnect is one confirmed host request; the page then reads the connection back.
+  fetched.mockClear();
+  vi.mocked(invalidateAll).mockClear();
+  const connected = await open(fixtureExecutor);
+  const dialog = connected.container.querySelector('dialog') as HTMLDialogElement;
+  dialog.showModal = vi.fn();
+  const confirm = async () => {
+    await fireEvent.click(connected.getByRole('button', { name: 'Disconnect' }));
+    dialog.returnValue = 'confirm';
+    await fireEvent(dialog, new Event('close'));
+  };
+  await confirm();
+  await waitFor(() => expect(connected.getByRole('button', { name: 'Disconnect' })).toBeDisabled());
+  expect(fetched.mock.calls).toEqual([[here, { method: 'DELETE' }]]);
+  expect(invalidateAll).not.toHaveBeenCalled();
+  answers[2](Response.json({ host: 'github.com', app: { id: 4242, slug: 'wyrd-verify' }, state: 'not_connected', repositories: [] }));
+  await waitFor(() => expect(invalidateAll).toHaveBeenCalledTimes(1));
+  await waitFor(() => expect(connected.getByRole('button', { name: 'Disconnect' })).toBeEnabled());
+  // A refusal is shown with its code and the connection stays as the server reports it.
+  await confirm();
+  answers[3](Response.json({ code: 'WYRD_PERMISSION_403_DENIED_RBAC', title: 'Permission denied', status: 403 }, { status: 403 }));
+  await waitFor(() => expect(connected.container).toHaveTextContent('WYRD_PERMISSION_403_DENIED_RBAC'));
+  expect(connected.container).toHaveTextContent('Connected');
+  connected.unmount();
+
+  // Denied, and an App that is not configured, show the problem and no action or Card read.
+  const calls: WireRequest[] = [];
+  const noApp = await open({ run: (batch) => (calls.push(...batch), Promise.resolve(batch.map(() => ({ ok: false, problem: { code: 'WYRD_GITHUB_503_NOT_CONFIGURED', title: 'GitHub App not configured', status: 503 } }))) as never) });
+  expect(noApp.container).toHaveTextContent('WYRD_GITHUB_503_NOT_CONFIGURED');
+  expect(noApp.queryByRole('button')).toBeNull();
+  expect(calls).toEqual([{ op: 'github.get_connection' }]);
+  fetched.mockRestore();
+  opened.mockRestore();
+});

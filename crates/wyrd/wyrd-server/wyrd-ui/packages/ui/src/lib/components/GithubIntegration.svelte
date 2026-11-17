@@ -24,6 +24,12 @@
 </script>
 
 <RepositorySheet>
+  <div class="page-head">
+    <div class="grow">
+      <h1>GitHub</h1>
+      <p class="desc">One GitHub App connection for this tenant. Connecting gives Wyrd access to the repositories you select on GitHub; it does not register Repository Cards or start verification.</p>
+    </div>
+  </div>
   {#if result.state === 'populated' && connection}
     {#if connection.state === 'not_connected'}
       <dl class="facts">

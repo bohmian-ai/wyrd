@@ -4,7 +4,7 @@
  * `@wyrd/testing` over repository Postgres, through the SDK, the MCP endpoint,
  * and the BFF's real browser session. Nothing here mocks the server.
  */
-import { copyFileSync, cpSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
@@ -12,7 +12,7 @@ import { AppBridge, PostMessageTransport } from '@modelcontextprotocol/ext-apps/
 import type { Cookies } from '@sveltejs/kit';
 import { render } from '@testing-library/svelte';
 import { expect, vi } from 'vitest';
-import { TraceWaterfall } from 'wyrd-ai-ui';
+import { TraceWaterfall, type RepositoryRow } from 'wyrd-ai-ui';
 import { z } from 'zod';
 import { Bifrost, Cards, GithubConnection, Principals, TableConfig, WyrdClient, WyrdState } from 'wyrd-ai';
 import { type NativeWyrdTestServer, signInGithubBrowser } from '@wyrd/testing';
@@ -24,9 +24,13 @@ import {
   loadCardInventory,
   loadExecution,
   loadExecutionCharts,
+  loadGithubIntegration,
   loadPromptMessages,
   loadPromptVariables,
   loadRelationshipList,
+  loadRepositoryDeclare,
+  loadRepositoryIndex,
+  loadRepositoryPolicy,
   loadRunsOn,
   loadUsedBy,
   loadVerifierDefinition,
@@ -49,7 +53,7 @@ import { nodeExecutor } from 'wyrd-ai-ui/node';
 import { env } from '$env/dynamic/private';
 import { browserSessions } from '$lib/server/auth/browser-sessions';
 import { AGENT, PROMPT, agent as agentCard, card, inventory, notFound, observeAnswer, prompts, registered, series, summary, timeseries } from '$lib/ui-fixtures';
-import { exportOtlp, nanos, seedSignals } from '$lib/ui-signals.integration';
+import { declarePolicy, exportOtlp, nanos, seedSignals } from '$lib/ui-signals.integration';
 import { POST as loadPanel } from '../routes/t/[tenantKey]/ui/load/+server';
 import { POST as cancelExecution } from '../routes/t/[tenantKey]/verify/executions/[executionId]/cancel/+server';
 import { GET as downloadPublication } from '../routes/t/[tenantKey]/verify/executions/[executionId]/download/+server';
@@ -1539,12 +1543,13 @@ const reviewed = serverTest({ githubApp: true, perTest: true });
 /** The same deployment, which also runs Verifiers. */
 const deferred = serverTest({ githubApp: true, perTest: true, verificationRuntime: true });
 
-/** An admin of the tenant after it connected installation 101 with `acme/api` (provider id 1) and `acme/web` (2). */
-async function connectGithub(server: NativeWyrdTestServer): Promise<WyrdClient> {
+/** An admin of the tenant after it connected installation 101 with `acme/api` (provider id 1), `acme/web` (2) and `more`. */
+async function connectGithub(server: NativeWyrdTestServer, more: { id: number; fullName: string }[] = []): Promise<WyrdClient> {
   const github = server.githubApp;
   github.addInstallation(101, [
     { id: 1, fullName: 'acme/api' },
-    { id: 2, fullName: 'acme/web' }
+    { id: 2, fullName: 'acme/web' },
+    ...more
   ]);
   github.addUser('octo', [101]);
   github.signIn('octo');
@@ -1586,12 +1591,7 @@ reviewed('Verify lists pending work admitted for a pull request by its recorded 
   // The tenant connects installation 101 and declares the review policy of its repository `acme/api` (provider id 1).
   const github = server.githubApp;
   const admin = await connectGithub(server);
-  const checkout = mkdtempSync(join(tmpdir(), 'wyrd-ui-verify-checkout-'));
-  cpSync(fixture('cards/repository_declaration'), checkout, { recursive: true });
-  mkdirSync(join(checkout, '.git'));
-  writeFileSync(join(checkout, '.git/config'), `[remote "origin"]\n\turl = http://${github.host}/acme/api.git\n`);
-  copyFileSync(join(checkout, 'policies/minimal.toml'), join(checkout, 'wyrd.toml'));
-  await (await Cards.connect({ client: admin })).declareFromPath(join(checkout, 'wyrd.toml'));
+  await declarePolicy(await Cards.connect({ client: admin }), github.host, 'acme/api', 'minimal');
 
   // The pull request opens and is then pushed to, which supersedes its first execution. This deployment runs no Verifier, so the second stays pending.
   github.setPullRequest(1, 7, 'b1', 'a1');
@@ -1835,4 +1835,100 @@ traced('a session judgment cites an exact trace: the citation leads to its pinne
   } finally {
     await mcp.close();
   }
+});
+
+reviewed('Repository Cards join GitHub access by repository id through the Node and MCP hosts', async ({ server }) => {
+  // The tenant connects installation 101 (api, web, docs), declares two versions of `api`, an empty policy for `web`, and nothing for `docs`.
+  const github = server.githubApp;
+  const admin = await connectGithub(server, [{ id: 3, fullName: 'acme/docs' }]);
+  const cards = await Cards.connect({ client: admin });
+  await cards.declareFromPath(fixture('cards/verify_in_real_time/answer-check.yaml'));
+  const declare = (fullName: string, policy: string) => declarePolicy(cards, github.host, fullName, policy);
+  const first = await declare('acme/api', 'minimal');
+  const second = await declare('acme/api', 'changed');
+  const web = await declare('acme/web', 'empty');
+  const api = (version: string) => ({ kind: 'Repository', name: 'api', version }) as const;
+  const row = (each: RepositoryRow) => [each.card?.name, each.fullName, each.repositoryId, each.card?.selected, each.card?.versions, each.bindings, each.access, each.readiness];
+  const read = async (executor: Executor) => {
+    const context = { executor };
+    return {
+      index: await loadRepositoryIndex({}, context),
+      inactive: await loadRepositoryIndex({ show: 'inactive', query: 'ACME/' }, context),
+      older: await loadRepositoryPolicy({ cardRef: api(first.version), declaration: 'toml' }, context),
+      selected: await loadRepositoryPolicy({ cardRef: api(second.version) }, context),
+      docs: await loadRepositoryDeclare({ repositoryId: '3' }, context),
+      declared: await loadRepositoryDeclare({ repositoryId: '1' }, context),
+      unknown: await loadRepositoryDeclare({ repositoryId: '999' }, context),
+      github: await loadGithubIntegration({}, context)
+    };
+  };
+
+  const mcp = await mcpOver(server.baseUrl, admin);
+  const node = await read(nodeExecutor(admin));
+  // The MCP host reads the same facts through the existing tools.
+  expect(JSON.parse(JSON.stringify(await read(mcp.executor)))).toEqual(JSON.parse(JSON.stringify(node)));
+  await mcp.close();
+
+  // Registration, access and readiness are separate facts per repository, joined by provider id.
+  const index = node.index.result;
+  expect(index.state === 'populated' && index.data.rows.map(row)).toEqual([
+    ['api', 'acme/api', '1', second.version, 2, 2, 'granted', 'ready'],
+    ['web', 'acme/web', '2', web.version, 1, 0, 'granted', 'none'],
+    [undefined, 'acme/docs', '3', undefined, undefined, 0, 'granted', 'undeclared']
+  ]);
+  expect(node.inactive.result.state === 'populated' && [node.inactive.result.data.rows.map((each) => each.card?.name), node.inactive.result.data.total]).toEqual([['web'], 3]);
+  // Viewing the older version reads it as not selected; the selected policy and its readiness stay the server's.
+  expect(node.older.result.state === 'populated' && node.older.result.data).toMatchObject({
+    selected: false,
+    selectedVersion: second.version,
+    fullName: 'acme/api',
+    installation: 101,
+    access: 'granted',
+    readiness: 'ready',
+    selectedBindings: 2,
+    bindings: [{ name: 'code-review', startsOn: 'runs_on: pull_request', state: 'not selected' }]
+  });
+  expect(node.older.result.state === 'populated' && node.older.result.data.declaration).toContain(`# Projection of Repository/api@${first.version}, not the declared file.`);
+  expect(node.selected.result.state === 'populated' && [node.selected.result.data.selected, node.selected.result.data.bindings.map((each) => [each.name, each.state])]).toEqual([
+    true,
+    [['code-review', 'active'], ['answer-check', 'active']]
+  ]);
+  expect((await cards.get(api(second.version))).status?.repository?.selected).toBe(true);
+  // A reachable repository without a Card can be declared; one with a Card, or an id the connection does not reach, names nothing.
+  expect(node.docs.result.state === 'populated' && node.docs.result.data).toMatchObject({ repositoryId: '3', fullName: 'acme/docs', host: github.host, installation: 101 });
+  for (const each of [node.declared, node.unknown]) expect(each.result).toMatchObject({ state: 'error', problem: { code: 'WYRD_SPEC_404_NOT_FOUND' } });
+  expect(node.github.result.state === 'populated' && [node.github.result.data.connection.state, node.github.result.data.connection.repositories.map((each) => each.full_name)]).toEqual([
+    'active',
+    ['acme/api', 'acme/web', 'acme/docs']
+  ]);
+  for (const secret of github.secrets()) expect(JSON.stringify(node)).not.toContain(secret);
+
+  // A viewer reads Cards but not the connection: the refusal stays the connection's, access is not guessed, and Settings reads no Card.
+  const requests: WireRequest[] = [];
+  const viewer = nodeExecutor(WyrdClient.connect({ credential: server.bootstrapService(['viewer'], 'repositories_viewer') }));
+  const recorded: Executor = { run: (batch, signal) => (requests.push(...batch), viewer.run(batch, signal)) };
+  const viewed = (await loadRepositoryIndex({}, { executor: recorded })).result;
+  expect(viewed.state === 'populated' && [viewed.data.connection.state, viewed.data.rows.map((each) => [each.card?.name, each.access, each.readiness])]).toEqual([
+    'denied',
+    [['api', 'granted', 'ready'], ['web', 'granted', 'none']]
+  ]);
+  requests.length = 0;
+  expect((await loadGithubIntegration({}, { executor: recorded })).result).toMatchObject({ state: 'denied', problem: { code: 'WYRD_PERMISSION_403_DENIED_RBAC' } });
+  expect((await loadRepositoryDeclare({ repositoryId: '3' }, { executor: recorded })).result.state).toBe('denied');
+  expect(requests).toEqual([{ op: 'github.get_connection' }, { op: 'github.get_connection' }]);
+
+  // Another tenant sees none of it by name or id.
+  const foreign = { executor: nodeExecutor(WyrdClient.connect({ credential: server.bootstrapServiceInTenant(server.seedTenant('repositories-b'), ['admin'], 'repositories_b_admin') })) };
+  const theirs = (await loadRepositoryIndex({}, foreign)).result;
+  expect(theirs.state === 'populated' && [theirs.data.total, theirs.data.connection.state === 'populated' && theirs.data.connection.data.state]).toEqual([0, 'not_connected']);
+  expect((await loadRepositoryPolicy({ cardRef: api(second.version) }, foreign)).result).toMatchObject({ state: 'error', problem: { status: 404 } });
+  expect((await loadRepositoryDeclare({ repositoryId: '3' }, foreign)).result).toMatchObject({ state: 'error', problem: { code: 'WYRD_SPEC_404_NOT_FOUND' } });
+
+  // Disconnecting removes access only: the Cards and their selected policy stay, and nothing starts without access.
+  await (await GithubConnection.connect({ client: admin })).disconnect();
+  const after = (await loadRepositoryIndex({}, { executor: nodeExecutor(admin) })).result;
+  expect(after.state === 'populated' && after.data.rows.map(row)).toEqual([
+    ['api', undefined, '1', second.version, 2, 2, 'none', 'inactive'],
+    ['web', undefined, '2', web.version, 1, 0, 'none', 'inactive']
+  ]);
 });

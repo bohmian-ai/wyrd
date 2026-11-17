@@ -986,7 +986,7 @@ test('Settings connects and disconnects GitHub once through the host and reads s
   await fireEvent.click(connect());
   await waitFor(() => expect(connect()).toBeDisabled());
   await fireEvent.click(connect());
-  expect(fetched.mock.calls).toEqual([[here, { method: 'POST' }]]);
+  expect(fetched.mock.calls).toEqual([[`${here}/connection`, { method: 'POST' }]]);
   answers[0](Response.json({ authorization_url: 'https://github.com/apps/wyrd-verify/installations/new?state=s1' }));
   await waitFor(() => expect(opened).toHaveBeenCalledWith('https://github.com/apps/wyrd-verify/installations/new?state=s1', '_self'));
   start.unmount();
@@ -1011,7 +1011,7 @@ test('Settings connects and disconnects GitHub once through the host and reads s
   };
   await confirm();
   await waitFor(() => expect(connected.getByRole('button', { name: 'Disconnect' })).toBeDisabled());
-  expect(fetched.mock.calls).toEqual([[here, { method: 'DELETE' }]]);
+  expect(fetched.mock.calls).toEqual([[`${here}/connection`, { method: 'DELETE' }]]);
   expect(invalidateAll).not.toHaveBeenCalled();
   answers[2](Response.json({ host: 'github.com', app: { id: 4242, slug: 'wyrd-verify' }, state: 'not_connected', repositories: [] }));
   await waitFor(() => expect(invalidateAll).toHaveBeenCalledTimes(1));

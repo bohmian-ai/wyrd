@@ -1,8 +1,28 @@
 /**
  * Real OTLP/HTTP JSON evidence for the Observe journeys: one exported trace,
  * log record and pair of metrics per call, sent through the server's stock
- * ingest endpoints. Test-only; it runs inside the integration lane.
+ * ingest endpoints, and one repository policy declared from a checkout.
+ * Test-only; it runs inside the integration lane.
  */
+import { copyFileSync, cpSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import type { CardRef, Cards } from 'wyrd-ai';
+import { fixture } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/server';
+
+/**
+ * Declare `policies/<policy>.toml` of the repository declaration fixtures as
+ * the `wyrd.toml` of a checkout whose origin is `fullName` on GitHub `host`,
+ * and answer the declared Repository Card.
+ */
+export async function declarePolicy(cards: Cards, host: string, fullName: string, policy: string): Promise<CardRef> {
+  const checkout = mkdtempSync(join(tmpdir(), 'wyrd-ui-checkout-'));
+  cpSync(fixture('cards/repository_declaration'), checkout, { recursive: true });
+  mkdirSync(join(checkout, '.git'));
+  writeFileSync(join(checkout, '.git/config'), `[remote "origin"]\n\turl = http://${host}/${fullName}.git\n`);
+  copyFileSync(join(checkout, `policies/${policy}.toml`), join(checkout, 'wyrd.toml'));
+  return (await cards.declareFromPath(join(checkout, 'wyrd.toml'))).root;
+}
 
 /** An OTLP/HTTP JSON attribute list. */
 const attrs = (values: Record<string, string>) => Object.entries(values).map(([key, value]) => ({ key, value: { stringValue: value } }));

@@ -21,7 +21,7 @@
   async function send(name: 'github.connect' | 'github.disconnect', method: 'POST' | 'DELETE') {
     if (actions[name]?.state === 'pending') return;
     actions[name] = { state: 'pending' };
-    const response = await fetch(here, { method }).catch(() => undefined);
+    const response = await fetch(`${here}/connection`, { method }).catch(() => undefined);
     const body = (await response?.json().catch(() => null)) as { authorization_url?: unknown; code?: unknown } | null;
     // GitHub's own pages finish the connection; the control stays pending while the tab leaves.
     if (response?.ok && name === 'github.connect' && typeof body?.authorization_url === 'string' && /^https?:\/\//.test(body.authorization_url))

@@ -16,7 +16,7 @@ import { declared, fixture, groupExecution, runtimeAccount, scheduledResult, ser
 import { Cards, Principals, WyrdClient, WyrdState } from 'wyrd-ai';
 import { loadExecution } from 'wyrd-ai-ui/loaders';
 import { nodeExecutor } from 'wyrd-ai-ui/node';
-import { exportOtlp, nanos, seedSignals } from '$lib/ui-signals.integration';
+import { declarePolicy, exportOtlp, nanos, seedSignals } from '$lib/ui-signals.integration';
 
 vi.setConfig({ testTimeout: 300_000 });
 
@@ -1891,4 +1891,255 @@ base('development environment lifecycle', { timeout: 2_400_000 }, async () => {
     await child.interrupt();
   }
   for (const port of [8080, 3000, 8000]) expect(await answers(port), `port ${port} after Ctrl-C`).toBe(false);
+});
+
+/** A fresh deployment whose GitHub App is the backend test owner's loopback GitHub. */
+const connected = serverTest({ githubApp: true, perTest: true });
+
+/** Draw a page in both themes at desktop and phone width and, when a capture directory is set, keep a full-page screenshot of each. */
+async function captureRepositories(page: Page, name: string) {
+  for (const width of [1280, 390]) {
+    await page.setViewportSize({ width, height: 800 });
+    for (const mode of ['light', 'dark'] as const) {
+      await page.evaluate((next) => ((document.querySelector('.app-root') as HTMLElement).dataset.mode = next), mode);
+      if (process.env.WYRD_UI_CAPTURE_DIR) await page.screenshot({ path: join(process.env.WYRD_UI_CAPTURE_DIR, `repositories-${name}-${mode}-${width}.png`), fullPage: true });
+    }
+  }
+  await page.setViewportSize({ width: 1280, height: 720 });
+  await page.evaluate(() => ((document.querySelector('.app-root') as HTMLElement).dataset.mode = 'light'));
+}
+
+connected('a tenant connects GitHub from Settings, reads its Repository Cards apart from GitHub access, and disconnects without losing them', async ({ server }) => {
+  // GitHub: installation 101 selects three repositories and the signed-in GitHub user may install it.
+  const github = server.githubApp;
+  github.addInstallation(101, [
+    { id: 1, fullName: 'acme/api' },
+    { id: 2, fullName: 'acme/web' },
+    { id: 3, fullName: 'acme/docs' }
+  ]);
+  github.addUser('octo', [101]);
+  github.signIn('octo');
+  github.installTarget(101);
+  const tenant = server.tenantSlug;
+  const adminKey = server.bootstrapService(['admin'], 'repositories_ui_admin');
+  const admin = WyrdClient.connect({ credential: adminKey });
+  const cards = await Cards.connect({ client: admin });
+  const declare = (fullName: string, policy: string) => declarePolicy(cards, github.host, fullName, policy);
+  buildUi();
+  const bff = await startBff(server.baseUrl);
+  const browser = await chromium.launch();
+  try {
+    const base = `${bff.url}/t/${tenant}`;
+    const page = await signIn(browser, bff.url, tenant, adminKey);
+    const main = page.locator('main');
+    const rows = () =>
+      page
+        .getByRole('region', { name: 'Repositories', exact: true })
+        .locator('tbody tr')
+        .evaluateAll((all) => all.map((row) => [...row.querySelectorAll('td')].map((cell) => cell.querySelector('.link, .st, .mono')?.textContent?.replace(/^[^\w]+/, '').trim())));
+    const noSecrets = async (url: string) => {
+      const html = (await serverHtml(page, url)) + (await page.content());
+      for (const secret of github.secrets()) expect(html).not.toContain(secret);
+    };
+
+    // From Verify, Repositories is its own workspace beside Cards. Nothing is connected or registered yet.
+    await page.goto(`${base}/verify`);
+    await page.getByRole('link', { name: 'Repositories', exact: true }).click();
+    await page.waitForURL(`${base}/repositories`);
+    await expect.poll(() => main.textContent()).toContain('GitHub is not connected.');
+    expect(await rows()).toEqual([[undefined]]);
+    await page.getByRole('button', { name: 'GitHub connection' }).click();
+    await page.waitForURL(`${base}/settings/integrations/github`);
+    await expect.poll(() => main.textContent()).toContain('Not connected');
+
+    // Wyrd-first: Connect leaves for GitHub, which returns to the server's own setup and callback; Settings then reads the connection back.
+    await page.getByRole('button', { name: 'Connect GitHub' }).click();
+    await page.waitForURL(/\/v1\/integrations\/github\/callback/);
+    expect(JSON.parse((await page.locator('body').textContent()) ?? '')).toMatchObject({ state: 'active', installation_id: 101 });
+    await page.goto(`${base}/settings/integrations/github`);
+    await expect.poll(() => main.textContent()).toContain('Connected');
+    const access = page.getByRole('region', { name: 'Repository access', exact: true });
+    // Connecting registered nothing: each reachable repository has no Card.
+    expect(await access.locator('tbody tr').count()).toBe(3);
+    expect(await access.locator('.tag').allTextContents()).toEqual(['no Card', 'no Card', 'no Card']);
+    expect(await page.getByRole('link', { name: /Manage access on GitHub/ }).getAttribute('href')).toBe(`https://${github.host}/apps/wyrd-test-app/installations/new`);
+    await noSecrets(`${base}/settings/integrations/github`);
+    await captureRepositories(page, 'settings-connected');
+
+    // The tenant declares two versions of `api` and an empty policy for `web` through the normal declaration; `docs` stays undeclared.
+    await cards.declareFromPath(fixture('cards/verify_in_real_time/answer-check.yaml'));
+    const first = await declare('acme/api', 'minimal');
+    const second = await declare('acme/api', 'changed');
+    await declare('acme/web', 'empty');
+    // A pull request of `acme/api` admits one execution per selected binding; this deployment runs no Verifier, so both stay pending.
+    github.setPullRequest(1, 7, 'b1', 'a1');
+    expect(github.deliverPullRequest(server.baseUrl, 101, 1, 7, 'opened')).toBe(202);
+
+    // The index states registration, access and readiness per repository.
+    await page.goto(`${base}/repositories`);
+    await expect.poll(rows).toEqual([
+      ['api', second.version, 'Granted', 'Ready'],
+      ['web', expect.any(String), 'Granted', 'Not configured'],
+      ['acme/docs', '', 'Granted', 'Not declared']
+    ]);
+    await noSecrets(`${base}/repositories`);
+    await captureRepositories(page, 'index');
+
+    // Search and Show live in the URL and travel into the detail page and back.
+    await page.getByRole('searchbox', { name: 'Filter repositories' }).fill('acme');
+    await page.getByRole('searchbox', { name: 'Filter repositories' }).press('Enter');
+    await page.waitForURL(`${base}/repositories?q=acme`);
+    await page.getByRole('group', { name: 'Show' }).getByRole('button', { name: 'Ready' }).click();
+    await page.waitForURL(`${base}/repositories?q=acme&show=ready`);
+    await expect.poll(rows).toEqual([['api', second.version, 'Granted', 'Ready']]);
+    await page.getByRole('button', { name: 'api', exact: true }).click();
+    await page.waitForURL(`${base}/repositories/api?version=${second.version}&back=%3Fq%3Dacme%26show%3Dready`);
+    await expect.poll(() => main.textContent()).toContain('✓ selected');
+    await captureRepositories(page, 'detail');
+
+    // Viewing the older version changes the URL only; the selected policy is still the server's.
+    await page.getByRole('combobox', { name: 'Card version' }).selectOption(first.version);
+    await page.waitForURL(new RegExp(`/repositories/api\\?version=${first.version.replaceAll('.', '\\.')}&`));
+    await expect.poll(() => main.textContent()).toContain('not selected · viewing only');
+    expect((await cards.get({ kind: 'Repository', name: 'api', version: second.version })).status?.repository?.selected).toBe(true);
+    await page.getByRole('tab', { name: 'wyrd.toml' }).click();
+    await expect.poll(() => new URL(page.url()).searchParams.get('declaration')).toBe('toml');
+    expect(await page.getByRole('tabpanel').textContent()).toContain(`# Projection of Repository/api@${first.version}, not the declared file.`);
+
+    // Activity is this Repository's executions: the row opens the exact execution, and Verify opens filtered to the same Card.
+    const activity = page.getByRole('region', { name: 'Verification activity', exact: true });
+    await expect
+      .poll(
+        async () => {
+          server.flushBifrost();
+          await page.reload();
+          return activity.locator('tbody tr').count();
+        },
+        { timeout: 30_000, interval: 1_000 }
+      )
+      .toBe(2);
+    for (const text of await activity.locator('tbody tr').allTextContents()) expect(text).toContain('queued');
+    const detailUrl = page.url();
+    await activity.locator('tbody tr').first().click();
+    await page.waitForURL(/\/verify\/executions\/[^/?]+$/);
+    const executionId = decodeURIComponent(new URL(page.url()).pathname.split('/').pop() as string);
+    await expect.poll(() => page.locator('[data-execution-status]').getAttribute('data-execution-status')).toBe('pending');
+    await page.goto(detailUrl);
+    await activity.getByRole('link', { name: 'View all in Verify' }).click();
+    await page.waitForURL(/\/verify\?/);
+    expect(JSON.parse(new URL(page.url()).searchParams.get('where') ?? '[]')).toEqual([{ column: 'subject_kind', value: 'Repository' }, { column: 'subject_name', value: 'api' }]);
+    await expect.poll(() => page.getByRole('region', { name: 'executions rows' }).locator('tbody tr').count()).toBe(2);
+    await page.goto(detailUrl);
+    await page.getByRole('button', { name: 'Verifier definition' }).click();
+    await page.waitForURL(/\/cards\/detail\?kind=Verifier&name=code-review&/);
+    await page.goto(detailUrl);
+
+    // The way back restores the index state the reader left.
+    await page.getByRole('navigation', { name: 'Breadcrumb' }).getByRole('link', { name: 'Repositories' }).click();
+    await page.waitForURL(`${base}/repositories?q=acme&show=ready`);
+    await expect.poll(rows).toEqual([['api', second.version, 'Granted', 'Ready']]);
+
+    // A reachable repository without a Card explains how to declare one; a declared, unknown or malformed id names nothing.
+    await page.getByRole('group', { name: 'Show' }).getByRole('button', { name: 'No Card' }).click();
+    await page.getByRole('button', { name: 'acme/docs' }).click();
+    await page.waitForURL(new RegExp('/repositories/github/3\\?back='));
+    await expect.poll(() => main.textContent()).toContain('wyrd declare wyrd.toml');
+    await captureRepositories(page, 'undeclared');
+    for (const id of ['1', '999']) {
+      const html = await serverHtml(page, `${base}/repositories/github/${id}`);
+      expect(html).toContain('WYRD_SPEC_404_NOT_FOUND');
+      expect(html).not.toContain('acme/');
+    }
+    expect(await serverHtml(page, `${base}/repositories/nowhere?version=1.0.0`)).toMatch(/WYRD_[A-Z]+_404_/);
+
+    // A viewer reads the Cards but not the connection: the refusal is shown as such, with no control and no guessed access.
+    const viewer = await signIn(browser, bff.url, tenant, server.bootstrapService(['viewer'], 'repositories_ui_viewer'));
+    await viewer.goto(`${base}/settings/integrations/github`);
+    await expect.poll(() => viewer.locator('main').textContent()).toContain('WYRD_PERMISSION_403_DENIED_RBAC');
+    expect(await viewer.locator('main').getByRole('button').count()).toBe(0);
+    expect(await viewer.locator('main').textContent()).not.toContain('acme/');
+    await viewer.goto(`${base}/repositories`);
+    await expect.poll(() => viewer.locator('main').textContent()).toContain('GitHub connection unavailable');
+    expect(await viewer.getByRole('button', { name: 'api', exact: true }).count()).toBe(1);
+    expect(await viewer.locator('main').textContent()).not.toContain('acme/docs');
+    // Its direct requests to the host actions are refused by the server and change nothing.
+    for (const method of ['POST', 'DELETE'] as const) {
+      const refused = await viewer.request.fetch(`${base}/settings/integrations/github/connection`, { method, headers: { origin: bff.url } });
+      expect([refused.status(), ((await refused.json()) as { code: string }).code]).toEqual([403, 'WYRD_PERMISSION_403_DENIED_RBAC']);
+    }
+    await viewer.context().close();
+
+    // Manage connection leads from the Repository to Settings. Disconnect asks first in a modal dialog; cancelling sends nothing.
+    await page.goto(detailUrl);
+    await page.getByRole('button', { name: 'Manage connection' }).click();
+    await page.waitForURL(`${base}/settings/integrations/github`);
+    const sent: string[] = [];
+    let release = () => {};
+    await page.route(`${base}/settings/integrations/github/connection`, async (route) => {
+      if (route.request().method() !== 'DELETE') return route.continue();
+      sent.push(route.request().method());
+      await new Promise<void>((resolve) => (release = resolve));
+      await route.continue();
+    });
+    const disconnect = page.getByRole('button', { name: 'Disconnect', exact: true });
+    await disconnect.click();
+    const dialog = page.getByRole('dialog', { name: 'Disconnect GitHub?' });
+    expect(await dialog.evaluate((element) => element.matches(':modal'))).toBe(true);
+    expect(await dialog.textContent()).toContain('Unfinished executions for those repositories are cancelled.');
+    expect(await dialog.textContent()).toContain('Repository Cards and versions are unchanged.');
+    // Keyboard: focus starts on Cancel, and Escape closes without disconnecting.
+    expect(await page.evaluate(() => document.activeElement?.textContent)).toBe('Cancel');
+    await page.keyboard.press('Escape');
+    expect(await dialog.count()).toBe(0);
+    await disconnect.click();
+    await captureRepositories(page, 'disconnect-dialog');
+    await dialog.getByRole('button', { name: 'Cancel' }).click();
+    expect(sent).toEqual([]);
+
+    // Confirmed: one request while pending, then the page reads the connection back as not connected.
+    await disconnect.click();
+    await dialog.getByRole('button', { name: 'Disconnect GitHub' }).click();
+    await expect.poll(() => disconnect.isDisabled()).toBe(true);
+    expect(sent).toEqual(['DELETE']);
+    release();
+    await expect.poll(() => main.textContent()).toContain('Not connected');
+    expect(sent).toEqual(['DELETE']);
+    await page.unroute(`${base}/settings/integrations/github/connection`);
+
+    // The Cards, their selected policy and the recorded execution stay; access is gone, nothing new starts, and the unfinished executions were cancelled.
+    await page.goto(`${base}/repositories`);
+    await expect.poll(rows).toEqual([
+      ['api', second.version, 'No connection', 'Inactive'],
+      ['web', expect.any(String), 'No connection', 'Inactive']
+    ]);
+    await captureRepositories(page, 'index-disconnected');
+    await page.goto(`${base}/verify/executions/${encodeURIComponent(executionId)}`);
+    await expect.poll(() => page.locator('[data-execution-status]').getAttribute('data-execution-status'), { timeout: 30_000 }).toBe('cancelled');
+    await page.goto(detailUrl);
+    await expect.poll(() => main.textContent()).toContain('No connection');
+    await expect
+      .poll(
+        async () => {
+          server.flushBifrost();
+          await page.reload();
+          return (await activity.locator('tbody tr').allTextContents()).map((text) => /cancelled/.test(text));
+        },
+        { timeout: 30_000, interval: 1_000 }
+      )
+      .toEqual([true, true]);
+
+    // GitHub-first: starting from GitHub's own install page returns through the same server callback, and the Cards regain access.
+    await page.goto(`http://${github.host}/apps/wyrd-test-app/installations/new`);
+    await page.waitForURL(/\/v1\/integrations\/github\/callback/);
+    expect(JSON.parse((await page.locator('body').textContent()) ?? '')).toMatchObject({ state: 'active', installation_id: 101 });
+    await page.goto(`${base}/repositories`);
+    await expect.poll(rows).toEqual([
+      ['api', second.version, 'Granted', 'Ready'],
+      ['web', expect.any(String), 'Granted', 'Not configured'],
+      ['acme/docs', '', 'Granted', 'Not declared']
+    ]);
+  } finally {
+    await browser.close();
+    bff.stop();
+  }
 });

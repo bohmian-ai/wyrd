@@ -155,6 +155,20 @@ impl Operation {
         CURRENT.scope(Arc::clone(&self.shared), work).await
     }
 
+    /// The pressure cancellation of the operation whose
+    /// [`Self::scope`] the running task is in, when that operation is
+    /// cancellable; `None` outside any scope.
+    ///
+    /// Work inside the scope that must settle on its own terms, rather than
+    /// being dropped from outside, watches this token and stops itself.
+    #[must_use]
+    pub fn current_cancellation() -> Option<CancellationToken> {
+        CURRENT
+            .try_with(|shared| shared.cancel.clone())
+            .ok()
+            .flatten()
+    }
+
     /// The resource identity of this operation.
     #[must_use]
     pub fn context(&self) -> WorkContext {

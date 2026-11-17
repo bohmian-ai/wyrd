@@ -7218,13 +7218,20 @@ async fn critical_pressure_cancels_the_execution_a_model_call_belongs_to() {
     let execution = tokio::spawn({
         let state = state.clone();
         async move {
+            // The call runs as one block of the execution, as an Agent's does.
             let call = Box::pin(async {
-                GatewayInvocation::new(&state)
-                    .nested(Workload::Verification)
-                    .invoke(&caller, call)
-                    .await
-                    .map(drop)
-                    .map_err(|error| EngineError::Busy(error.to_string()))
+                crate::verification::hosted::blocks::cancellable(Box::pin(async {
+                    GatewayInvocation::new(&state)
+                        .nested(Workload::Verification)
+                        .invoke(&caller, call)
+                        .await
+                        .map(drop)
+                        .map_err(|error| vala_verify::blocks::BlockError::Retryable {
+                            reason: error.to_string(),
+                        })
+                }))
+                .await
+                .map_err(|error| EngineError::Busy(error.to_string()))
             });
             crate::verification::hosted::blocks::as_one_operation(&state, tenant, None, call).await
         }

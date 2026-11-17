@@ -324,23 +324,26 @@ struct ExecutionBinding {
 /// execution starts unconditionally and its nested owners bound their own
 /// admission waits.
 ///
+/// Pressure choosing the execution as its victim cancels it through
+/// [`cancellable`], which refuses the running block, so the engine itself
+/// ends the attempt as a capacity refusal.
+///
 /// # Errors
 /// Returns `run`'s error, or [`EngineError::Busy`] when pressure did not
-/// admit the execution by `admit_by` or chose it as its victim; dropping
-/// `run` stops every nested call with it.
+/// admit the execution by `admit_by`.
 pub async fn as_one_operation<T>(
     state: &AppState,
     tenant: wyrd_spec::ids::DataTenantId,
     admit_by: Option<tokio::time::Instant>,
     run: impl Future<Output = Result<T, vala_verify::blocks::EngineError>>,
 ) -> Result<T, vala_verify::blocks::EngineError> {
-    let victim = tokio_util::sync::CancellationToken::new();
+    let victim = Some(tokio_util::sync::CancellationToken::new());
     let workloads = state.resources.workloads();
     let operation = match admit_by {
-        None => workloads.begin(Workload::Verification, Some(tenant), Some(victim.clone())),
+        None => workloads.begin(Workload::Verification, Some(tenant), victim),
         Some(deadline) => tokio::time::timeout_at(
             deadline,
-            workloads.admit(Workload::Verification, Some(tenant), Some(victim.clone())),
+            workloads.admit(Workload::Verification, Some(tenant), victim),
         )
         .await
         .map_err(|_| {
@@ -349,12 +352,33 @@ pub async fn as_one_operation<T>(
             )
         })?,
     };
+    operation.scope(run).await
+}
+
+/// Run one block of the current execution, refused as
+/// [`BlockError::Busy`] once process pressure cancels the execution.
+///
+/// The refusal comes from inside the engine, so the engine settles the
+/// cancelled attempt as a capacity refusal, releasing its recorded
+/// attempt, rather than having the attempt dropped mid-call and later
+/// recovered as an interrupted one. Outside an [`as_one_operation`], or in
+/// an operation pressure may not cancel, `block` runs unwatched.
+///
+/// # Errors
+/// Returns `block`'s error, or [`BlockError::Busy`] once pressure cancels
+/// the execution.
+pub async fn cancellable<T>(
+    block: impl Future<Output = Result<T, BlockError>>,
+) -> Result<T, BlockError> {
+    let Some(victim) = wyrd_runtime::resources::Operation::current_cancellation() else {
+        return block.await;
+    };
     tokio::select! {
         biased;
-        () = victim.cancelled() => Err(vala_verify::blocks::EngineError::Busy(
-            "process memory pressure cancelled the execution".to_owned(),
-        )),
-        ran = operation.scope(run) => ran,
+        () = victim.cancelled() => Err(BlockError::Busy {
+            reason: "process memory pressure cancelled the execution".to_owned(),
+        }),
+        ran = block => ran,
     }
 }
 
@@ -488,11 +512,23 @@ impl Blocks {
 
 #[async_trait]
 impl ActionExecutor for Blocks {
-    /// Route `call` to the executor of its action kind.
+    /// Route `call` to the executor of its action kind, refused once
+    /// pressure cancels the execution; see [`cancellable`].
+    ///
+    /// # Errors
+    /// Returns the routed executor's [`BlockError`], or
+    /// [`BlockError::Busy`] once pressure cancels the execution.
+    async fn execute(&self, call: BlockCall<'_, Action>) -> Result<ActionOutput, BlockError> {
+        cancellable(self.action(call)).await
+    }
+}
+
+impl Blocks {
+    /// Route action `call` to the executor of its kind.
     ///
     /// # Errors
     /// Returns the routed executor's [`BlockError`].
-    async fn execute(&self, call: BlockCall<'_, Action>) -> Result<ActionOutput, BlockError> {
+    async fn action(&self, call: BlockCall<'_, Action>) -> Result<ActionOutput, BlockError> {
         match call.block {
             Action::Extract {
                 extractor: Some(_), ..
@@ -511,15 +547,20 @@ impl ActionExecutor for Blocks {
 impl CheckExecutor for Blocks {
     /// Route a `code` check to the sandbox and every other executor-run
     /// check (`agent`) to the Agent executor; the engine itself judges
-    /// `assert`, `trace`, and `drift`.
+    /// `assert`, `trace`, and `drift`; refused once pressure cancels the
+    /// execution, see [`cancellable`].
     ///
     /// # Errors
-    /// Returns the routed executor's [`BlockError`].
+    /// Returns the routed executor's [`BlockError`], or
+    /// [`BlockError::Busy`] once pressure cancels the execution.
     async fn execute(&self, call: BlockCall<'_, Check>) -> Result<CheckOutput, BlockError> {
-        match call.block {
-            Check::Code(_) => CheckExecutor::execute(&self.code, call).await,
-            _ => CheckExecutor::execute(self.agent(), call).await,
-        }
+        cancellable(async {
+            match call.block {
+                Check::Code(_) => CheckExecutor::execute(&self.code, call).await,
+                _ => CheckExecutor::execute(self.agent(), call).await,
+            }
+        })
+        .await
     }
 }
 

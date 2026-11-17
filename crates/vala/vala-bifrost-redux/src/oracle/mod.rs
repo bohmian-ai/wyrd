@@ -4300,7 +4300,11 @@ mod tests {
         let context = operation.context();
         let lanes = workloads.lanes().clone();
         let started = laned_execution(lanes.clone(), operation, || {
-            assert_eq!(WorkContext::current(), Some(context), "the query starts laned");
+            assert_eq!(
+                WorkContext::current(),
+                Some(context),
+                "the query starts laned"
+            );
             assert_eq!(lanes.free(), 0, "the start holds the only lane");
             let schema = Arc::new(Schema::empty());
             Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -4310,7 +4314,11 @@ mod tests {
         })
         .await;
         assert!(started.is_ok(), "the query starts");
-        assert_eq!(workloads.lanes().free(), 1, "no lane is held after the start");
+        assert_eq!(
+            workloads.lanes().free(),
+            1,
+            "no lane is held after the start"
+        );
     }
 
     /// Interactive audits one local node; Analytical audits its whole frozen

@@ -711,6 +711,83 @@ async fn connected_work_waits_out_pressure_with_its_own_attribution() {
     desk.server.shutdown().await.expect("the server stops");
 }
 
+/// A verification that critical pressure selects as its victim ends in the
+/// capacity outcome, never a judgment: while a queued Agent run's model call
+/// is held at the provider, pressure stays critical through two samples, so
+/// the run, which owns its nested call's bytes, is cancelled and deferred,
+/// and completes with no failure recorded once pressure recovers. A direct Agent
+/// verification cancelled the same way is refused with the stable
+/// unavailable code.
+///
+/// # Panics
+/// Panics when the process already has a global subscriber, the victim run
+/// is not deferred, does not pass after recovery, or keeps a failure, or the
+/// direct verification is answered otherwise.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn a_pressure_victim_ends_in_capacity_not_a_judgment() {
+    use wyrd_runtime::resources::{PressureState, Workload};
+
+    let logs = LogCapture::install_global().expect("the journey owns the process subscriber");
+    let desk = CapacityDesk::start().await;
+    let workloads = desk.server.state().resources.workloads().clone();
+    let overcommitted = workloads.observe_commitment();
+    let victimize = || {
+        overcommitted.set(u64::MAX);
+        // The first critical sample reclaims; the next selects a victim.
+        assert_eq!(workloads.sample(0).state, PressureState::Critical);
+        assert_eq!(workloads.sample(0).state, PressureState::Critical);
+    };
+    let recover = || {
+        overcommitted.set(0);
+        workloads.sample(0);
+        workloads.sample(0);
+    };
+
+    desk.provider.hold(&[HELD_BODY]);
+    let queued = desk.submit("model-check", HELD_BODY).await;
+    desk.held_arrived.notified().await;
+    assert!(
+        workloads.workload_bytes(Workload::Verification) > 0,
+        "the queued run owns its nested call's bytes"
+    );
+    victimize();
+    // Reading the execution is Bifrost work that pressure also pauses, so
+    // the runner's own deferral event witnesses the cancelled attempt.
+    logged(&logs, &[DEFERRED, &queued.id().to_string()]).await;
+    desk.provider.release(&[HELD_BODY]);
+    recover();
+    passed(&settled(&queued).await, "answered");
+    let state = queued.status().await.expect("the status reads");
+    assert_eq!(state.status, VerificationExecutionStatus::Completed);
+    assert!(
+        state.error.is_none(),
+        "the victim attempt left no failure: {state:?}"
+    );
+
+    desk.provider.hold(&[HELD_BODY]);
+    let (refused, ()) = tokio::join!(desk.verify("model-check", HELD_BODY), async {
+        // The queued retry's arrival may have left a stored notification;
+        // the direct run's own held call is the one that holds bytes.
+        loop {
+            desk.held_arrived.notified().await;
+            if workloads.workload_bytes(Workload::Verification) > 0 {
+                break;
+            }
+        }
+        victimize();
+    });
+    let refused = refused.expect_err("a direct victim is refused");
+    assert_eq!(
+        refused.code(),
+        UNAVAILABLE,
+        "a direct victim gets the capacity code"
+    );
+    desk.provider.release(&[HELD_BODY]);
+    recover();
+    desk.server.shutdown().await.expect("the server stops");
+}
+
 /// A standalone chat completion's request body counts as gateway work for as
 /// long as its call runs, and returns when the call settles.
 ///

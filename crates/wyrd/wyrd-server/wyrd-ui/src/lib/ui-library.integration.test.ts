@@ -1564,7 +1564,7 @@ reviewed('Verify lists pull request executions by their recorded repository and 
   const context = { executor: nodeExecutor(admin), range: { from: new Date(Date.now() - 3_600_000).toISOString(), to: new Date(Date.now() + 60_000).toISOString() } };
   const named = (read: QueryResult) => read.rows.map((row) => Object.fromEntries(read.columns.map((column, at) => [column.name, row[at]])));
   const list = async (where: { column: string; value: string }[]) => {
-    const loaded = await loadRecordTable({ signal: 'executions', columns: ['recorded_at', 'origin', 'repository', 'pull_request', 'status', 'verdict'], where } as never, context);
+    const loaded = await loadRecordTable({ signal: 'executions', columns: ['recorded_at', 'origin', 'repository', 'pull_request', 'status', 'verdict'], where }, context);
     return loaded.result.state === 'populated' ? named(loaded.result.data.rows) : [];
   };
 
@@ -1587,7 +1587,7 @@ reviewed('Verify lists pull request executions by their recorded repository and 
   expect(await list([{ column: 'repository', value: '1' }, { column: 'pull_request', value: '9' }])).toEqual([]);
 
   // The facets count the same three executions by repository and by pull request.
-  const rail = await loadFacetRail({ signal: 'executions', facets: ['repository', 'pull_request', 'origin'] } as never, context);
+  const rail = await loadFacetRail({ signal: 'executions', facets: ['repository', 'pull_request', 'origin'] }, context);
   if (rail.result.state !== 'populated') throw new Error(JSON.stringify(rail.result));
   expect(rail.result.data.facets.map((facet) => facet.values.rows)).toEqual([[['1', 3]], [['7', 2], ['8', 1]], [['pull_request', 3]]]);
 });

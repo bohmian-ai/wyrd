@@ -261,13 +261,22 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
        behaviour (TDD VIOLATED). GREEN:
        `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-server --features test-support --test integration -E 'test(=pg_hosted_artifacts::native_media_holds_raw_and_encoded_bytes_only_while_they_live)'"`.
      - The result precharge removal in `runner.rs::conclude` is proved by
-       source only.
+       source only. Both the old and the new charge are infallible
+       (`charge_infallible` / `grow_infallible`), so no admission or
+       refusal differs. The only difference is a transient peak inside
+       `conclude`, which `ByteLedger` has no high-water mark to expose.
+       A runtime proof would need a new production probe, so this stays a
+       source/diff proof.
      - The `Sandbox::exec` stack-overflow fix: the regression is
        `sandbox_worker::workspace_writes_share_one_budget`, the test that
        aborted (D1). It runs on the default test thread stack in the
        `sandbox_worker::` selector (14 passed).
      - `stale_worker_telemetry_stops_new_work_without_freeing_usage` reaches
-       staleness on a 500 ms wall clock, not a sample clock.
+       staleness on a 500 ms wall clock, not a sample clock. Staleness is
+       defined against the monotonic clock (`STALE_TELEMETRY` versus
+       `Instant` age in `sandbox.rs`), so the test crosses the real
+       threshold; a sample clock would add an injectable clock the
+       contract does not need.
    - Commands, re-run: `mise exec -- cargo nextest run --locked -p vala-verify`
      (114 passed) and
      `mise exec -- cargo nextest run --locked -p wyrd-server --features test-support --lib -E 'test(/^verification::state::tests::/) | test(/^scribe_outbox::tests::/)'`

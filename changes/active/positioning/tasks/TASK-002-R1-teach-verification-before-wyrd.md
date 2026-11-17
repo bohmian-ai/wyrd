@@ -475,3 +475,50 @@ direction; the page goes from the title straight to "What verification is".
 This departs from the docs/AGENTS.md Concept rule ("opens with two sentences
 before any heading"), pending the maintainer's decision on that rule.
 Rerun: `docs:test` 102 passed, build, a11y, linkcheck, `git diff --check` pass.
+
+### Plain-language pass on Foundations
+
+Maintainer direction: write for developers and non-specialists. Research terms
+were replaced by plain explanations, the "two common simplifications"
+paragraph became "methods work together" (payment-after-approval rule), the
+neighboring-practices table became one plain paragraph, the drift case was
+split into two labeled cases, and research detail moved to a plain further-
+reading list in Sources. Every remaining claim keeps its citation; wording was
+checked against the claim ledger's corrected limits.
+
+Two fresh readers read only the built page: a developer without CS theory and
+a non-engineer. Both answered the definition, methods, misleading-score/agent-
+claim and missing-log questions correctly with their own examples. Repaired
+from their reports: the "opposite of verified" riddle, the ML "validation set"
+aside (removed), the compiler assumption, the deadline cliffhanger, the
+customer-records assumption order, "metamorphic relation" (term removed),
+"two models agree", why shared customers leak, drift wording, model confidence,
+the practices table, the AI-tools paragraph, the preprint wording and the
+Sources wall of names. Rerun: humanizer lint clean, `docs:test` 102 passed,
+linkcheck, commands, build, a11y, `git diff --check` pass.
+
+### Plain-language pass on Real-time verification
+
+Same treatment as Foundations: no opener; "What real-time verification is" and
+"Why timing matters" first; plain wording throughout; coverage unchanged.
+Foundations' judge material was also split into "Can an AI judge be trusted?"
+(FAQ link updated). Developer and non-engineer readers answered every
+question correctly with their own examples. Repaired from their reports:
+"whatever runs the checks"/"the caller", measured conditions, "turn work
+away", empty vs failed authorization lookup, the misplaced provider-exposure
+paragraph (now "What an AI model sees"), the three later-check conditions
+(now a list), "inputs slowly changing", the overloaded measured-and-kept
+section (split in two), the returned-vs-saved sentence and "a run" in
+Sources. Rerun: humanizer lint clean, `docs:test` 102 passed, linkcheck,
+build, a11y, `git diff --check` pass.
+
+### Reading-effort audit
+
+Maintainer review found sentences that were correct but had to be decoded.
+Both pages were rewritten so each sentence states one complete idea with no
+gap to fill, no undefined term, and no back-reference. Independent
+sentence-by-sentence audits flagged 56 (Foundations) and 47 (Real-time)
+sentences; all were fixed in third person. A second audit flagged 7 more,
+also fixed. The third result is now "can't tell" on both pages. Rerun:
+humanizer lint clean, `docs:test` 102 passed, linkcheck, build, a11y,
+`git diff --check` pass.

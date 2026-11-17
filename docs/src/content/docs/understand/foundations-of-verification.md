@@ -8,30 +8,36 @@ order: 1
 
 ## What verification is
 
-Verification is checking, with evidence, that something does what it was required to do. Systems engineering defines it the same way: verification shows that a product meets its specified requirements ([NASA, 2024](#sources)). The opposite of verified is not "broken"; it is "unknown". A system that seems to work has not been verified until someone has compared what it did with what it was required to do.
+Verification means checking, with evidence, that something does what it was required to do. Systems engineering uses the same definition: verification shows that a product meets its specified requirements ([NASA, 2024](#sources)).
+
+A system that hasn't been verified isn't necessarily broken. It may work, but nobody knows yet. It is known to work only once someone compares what it did with what it was required to do.
 
 Every verification has three parts:
 
-- A **requirement**: what must be true, stated before anything is judged. "The output is sorted" is a requirement.
+- A **requirement**: a statement of what must be true. "The output is sorted" is a requirement.
 - **Evidence**: a record of what actually happened, such as the input and output of one call.
-- A **check**: a procedure that compares the evidence with the requirement and reports that the requirement is met, that it is violated, or that the evidence cannot decide.
+- A **check**: a procedure that compares the evidence with the requirement. It reports one of three results: the requirement is met, the requirement is violated, or the check can't tell.
 
-The requirement comes first for a reason. A requirement written after seeing a result tends to describe that result. Stating it beforehand turns "this looks fine" into a claim the evidence can contradict.
+The requirement has to be written down before anyone looks at the result. A requirement written afterward tends to describe whatever the system happened to do, so the result can't fail it. A requirement written beforehand is fixed, so the result can fail it.
 
 ## Why verification is important
 
-Verification is how a team knows a system works instead of assuming it does. Without it, confidence rests on how results look, and a broken requirement is found by whoever is harmed by it: a customer who received the wrong refund, an auditor who received a report they were not entitled to see.
+Verification is how a team knows a system works instead of assuming it does. Without verification, the team trusts results because they look right, and problems are found by the people they affect. A customer receives the wrong refund. A confidential report reaches someone who wasn't allowed to see it.
 
-It matters for four reasons:
+Verification matters for four reasons:
 
-- **Failures are cheaper to catch before they act.** A check that runs before a result is used can stop it. The same failure found later can only be explained and cleaned up.
-- **It makes claims inspectable.** "The model is accurate" or "the agent followed the policy" is an opinion until it names the requirement and the evidence. A verified claim can be checked again by a reviewer, an auditor, or a teammate who was not there.
-- **Systems change.** Models are retrained, data shifts, prompts and dependencies are updated. Confidence earned last month says nothing about today unless the requirements are checked again.
-- **Responsibility needs a record.** When something goes wrong, the question is what the system was required to do, what it did, and who knew. Verification leaves that record.
+- **A problem caught early does less damage.** A check that runs before a result is used can stop a wrong result from being used. A wrong result found later has already been used, so the team can only explain the damage and clean it up.
+- **Others can check the claim.** The claim "the model is accurate" is only an opinion until the claim says what "accurate" means and what evidence supports it. Once it does, a reviewer, an auditor, or a teammate can check the claim for themselves.
+- **Systems change.** Models are retrained, data changes, and prompts and libraries are updated. A system that passed its checks last month may not pass them today, so the checks have to run again.
+- **Someone has to be accountable.** When something goes wrong, people ask what the system was supposed to do, what it actually did, and who knew about the problem. Verification keeps a record that answers those questions.
 
-Machine-learning models and AI agents make each reason stronger. Their outputs are fluent by design: a language model is trained to produce likely text, so a plausible answer is weak evidence that it is correct. The same input can produce different outputs, so checking one run says little about the next. And an agent acts as well as answers, by sending a message, changing a record, or making a payment, so a wrong result has effects that cannot be taken back.
+AI models and agents make verification more pressing, for three reasons:
 
-This page develops verification through examples from ordinary software, machine-learning models, and AI agents. None of it needs a particular tool.
+- A language model is trained to produce text that sounds right. So an answer that sounds right is weak evidence that it is right.
+- The same input can produce a different output each time. So checking one run says little about the next.
+- An agent takes actions, such as sending a message, changing a record, or making a payment. So a wrong result can cause harm that can't be undone.
+
+The rest of this page uses examples from ordinary software, AI models, and AI agents. The ideas apply whatever tools a team uses.
 
 ## A result can look right and still be wrong
 
@@ -41,145 +47,188 @@ A sort function receives `[3, 1, 3]` and returns `[1, 3]`.
 | --- | --- | --- |
 | `[3, 1, 3]` | `[1, 3, 3]` | `[1, 3]` |
 
-The observed output is in ascending order, so a glance says the function works. It also lost an item. "Sorted" contains two separate requirements:
+The output is in order, so at a glance the function seems to work. But it lost one of the `3`s. "Sorted" is really two separate requirements:
 
-- **Ordered:** each element is no greater than the element after it.
-- **Preserves items:** the output contains exactly the input's elements, each as many times as it appears in the input.
+- **Ordered:** each item is no larger than the item after it.
+- **Keeps every item:** the output contains the same items as the input, each the same number of times.
 
-The output meets the first requirement and violates the second. Its plausible appearance established neither. Any function that drops or invents values can produce a tidy, ordered list, and a reader who checks only the order would pass this one. Verification starts by naming each requirement on its own, so that each can be checked against something.
+The output meets the first requirement and fails the second. Someone who checks only the order would pass this output, because a function can drop items and still return an ordered list. So verification starts by writing each requirement down separately. Each requirement then gets its own check.
 
 ## What is being checked, and against what
 
-Applied to the sort, the three parts look like this:
+Here are the requirement, the evidence, and the check for each half of "sorted":
 
 | Requirement | Evidence it needs | Check | Result for this call |
 | --- | --- | --- | --- |
-| Ordered | The output | Compare each adjacent pair | Met |
-| Preserves items | The input and the output | Count each value in both | Violated: the input has two `3`s, the output one |
+| Ordered | The output | Compare each item with the next one | Met |
+| Keeps every item | The input and the output | Count each value in both | Violated: the input has two `3`s, the output has one |
 
-The second requirement cannot be checked from the output alone. That is the general pattern: the requirement decides which evidence is relevant, and a precise check over the wrong evidence answers a different question.
+The second requirement can't be checked from the output alone, because the check needs to know what went in. This is true of every requirement: its check needs particular evidence, and without that evidence the check can't decide. A check that reads only the output can confirm the order, but it can't tell whether items were lost, however carefully it is done.
 
-Evidence also has a quality. Here the check reads the actual input and output values. If it read a log line someone wrote to summarize the output, its result could be no better than that log line.
+The evidence must be the actual input and output, not a description of them. Here, the check reads the actual input and output. If it read a log message someone wrote to describe the output, the result could only be as accurate as that message.
 
-Every check rests on assumptions. Counting values assumes that equal values are interchangeable. If the function sorts customer records by age, two records with age 3 differ in their other fields, and preserving items means preserving whole records. A requirement becomes precise once its assumptions are written down.
+A requirement can depend on an assumption. Suppose the function sorts customer records by age, and two customers are both 30. They are two different people, so "keeps every item" means keeping both records. Counting how many records have age 30 isn't enough. A broken function could drop one of the two customers and output the other twice, and the count would still be two. Counting works only when equal values are interchangeable, the way two copies of the number 3 are. So the requirement has to say which kind of item it is about: here, each customer record must appear exactly once.
 
-Not every check reaches a verdict. Suppose only the output `[1, 3]` was recorded. It is ordered, but whether it preserves items cannot be determined, because nothing records the input. A violated requirement and a requirement that the evidence cannot decide are different results. Reporting the second as a pass or as a fail makes a claim the evidence does not support.
+Sometimes a check can't decide whether a requirement is met. Suppose only the output `[1, 3]` was recorded. It is in order, but nobody can tell whether an item was lost, because the input wasn't kept. The result is "can't tell", which is different from "violated". Reporting it as a pass, or as a fail, claims something the evidence doesn't show.
 
-What someone does with a result is a separate step. A team may block a release, fix the function, or record the finding and move on. Verification informs those decisions; it does not have to trigger one. A proof reviewed during design, or an audit of last year's records, may change no immediate action at all.
+Deciding what to do about a result is separate from checking. A team might block a release, fix the function, or note the problem and move on. Verification tells the team what happened, and the team decides what to do.
 
 ## When verification happens
 
-The same requirement, "preserves items", can be checked at different times, and each choice establishes something different.
+The same requirement, "keeps every item", can be checked at three different times:
 
-- **On chosen executions, usually before deployment.** A test calls the function with `[3, 1, 3]`, with an empty list, and with a million random values, then compares counts. It establishes the requirement for those inputs.
-- **On an actual execution, while it runs.** A wrapper counts the input and output of every real call and reacts before the result is used.
-- **On recorded executions, afterward.** A job reads last month's logged inputs and outputs and compares their counts.
+- **Before release, a test checks chosen inputs.** It calls the function with `[3, 1, 3]`, an empty list, and a million random numbers, and compares the counts. If the test passes, the requirement holds for those inputs.
+- **While the system runs, a wrapper checks each real call.** A wrapper is a small piece of code around the function. It compares the counts on every real call before the result is passed on.
+- **Afterward, a job checks recorded calls.** It reads last month's recorded inputs and outputs and compares their counts.
 
-The second and third are **runtime verification**: checking whether an observed execution satisfies or violates a property, rather than establishing the property for every possible execution ([Leucker and Schallhart, 2009](#sources)). Checking an execution as it happens is online monitoring; checking a recorded trace later is offline monitoring, and both are runtime verification. These times are not exclusive categories. A test is an execution observed by a check, and a property tested before deployment can be monitored in production too.
+Checking real runs, as they happen or afterward, is called **runtime verification** ([Leucker and Schallhart, 2009](#sources)). It shows what happened in the runs that were checked, and nothing about the runs that weren't. The three times aren't fully separate. A test is also a run that gets checked, and a requirement tested before release can be checked again in production.
 
-Timing decides what a result can change. The wrapper can stop the shortened list from reaching the next step. The monthly job finds the same violation, but by then it can only start an investigation. When a check must finish before a particular action, its result has a deadline. [Real-time verification](/understand/real-time-verification/) explains what changes under that deadline.
+The time a check runs decides whether its result can prevent a problem or only report it. The wrapper can stop a shortened list before the next step uses it. The monthly job finds the same problem a month later, when all anyone can do is investigate. A check meant to prevent an action must finish before that action happens, so it has a deadline. The page [Real-time verification](/understand/real-time-verification/) explains checking under a deadline.
 
 ## Different methods establish different things
 
-Several disciplines test, check, or prove behavior, and they support different claims. The sort function shows the differences.
+Testing, validation, proof, and runtime verification each answer a different question.
 
-**Testing.** Tests show that the function preserved items for `[3, 1, 3]` and the other inputs chosen. They show nothing about inputs nobody tried: a sort that drops duplicates only in lists longer than 16 elements passes every short test. Testing is one way to gather verification evidence, and its reach is the set of cases chosen.
+**Testing checks the cases someone chose.** Tests can show that the sort kept every item for `[3, 1, 3]` and the other lists tried. They say nothing about lists nobody tried. For example, a sort that drops duplicates only in lists longer than 16 items passes every test that uses short lists.
 
-**Verification and validation.** NASA's systems engineering guidance separates **verification**, which shows a product meets its specified requirements, from **validation**, which shows it fulfills its intended use in its intended environment ([NASA, 2024](#sources)). The sort can be verified against "ordered and preserves items" and still fail validation. If spreadsheet users expect names in their language's alphabetical order and the function orders them by character code, it meets its specification and serves its users badly. Machine learning uses "validation set" for something narrower: held-out data used to tune a model.
+**Validation checks that the requirements are the right ones.** Verification asks whether a product meets its requirements. Validation asks whether the product does the job it is meant for ([NASA, 2024](#sources)). A sort can meet both of its requirements and still be wrong for its users. Suppose users expect names in the alphabetical order of their language. The sort instead orders names by the number the computer stores for each letter. Names that start with an accented letter, such as "Émile", then end up after "Zoe".
 
-**Formal proof.** A proof can show that a sorting algorithm is ordered and preserves items for every input. It holds for what was proved, whether an abstract model of the algorithm or the code itself, under stated assumptions about the environment, compiler, and hardware. Where an assumption fails, the proof says nothing about the running program. Within its assumptions it is stronger than any number of tests; it is not unconditional.
+**A proof covers every input.** A proof can show that a sorting algorithm puts every list in order and keeps every item, for any list, not only the lists tested. But a proof is about the code as written. It assumes that the tools that turn the code into a program, and the computer that runs it, work correctly. If one of those assumptions is false, the proof says nothing about how the program actually runs.
 
-**Runtime checking.** The wrapper judges each actual call. It establishes what this execution did, including when a proof's assumptions are in doubt, and nothing about the next call.
+**Runtime verification covers the runs that actually happen.** A runtime check looks at each real call, so it catches a failure even when one of a proof's assumptions turned out to be false. But it covers only calls that have already happened, not the next one.
 
-Two common simplifications are wrong. Formal methods are not limited to deterministic software: statistical model checking samples executions of a random system and decides whether a property about probabilities holds, with quantified statistical confidence rather than certainty ([Agha and Palmskog, 2018](#sources)). And runtime monitors can check formally specified properties: a monitor for a temporal-logic property judges a finite trace as satisfying it, violating it, or inconclusive when the trace so far cannot settle it ([Bauer, Leucker and Schallhart, 2011](#sources)). Formal verification of agent decision-making also predates language-model agents ([Dennis et al., 2016](#sources)).
+These methods work best together. Take the rule "every payment comes after an approval." Once the rule is written down precisely, it can be checked three ways. A proof can show that the system's design never allows a payment without an approval. Tests can try the cases the team thought of. A check on the live system can catch a run nobody predicted. Each gives a different kind of confidence, and none replaces the others.
 
-Neighboring practices answer related questions:
+Other terms describe related work:
 
-| Practice | Question it answers | What it leaves open |
-| --- | --- | --- |
-| Evaluation | How well does a model or agent perform on a dataset or benchmark? ([Liu et al., 2024](#sources) for agents) | How one particular request went, or how the system performs once its inputs change |
-| Observability | What happened inside a system, from logs, metrics, and traces? | Whether what happened met a requirement; it records without judging |
-| Guardrails | Should this input or output be blocked now? | Usually judges one message, not the process that produced it |
-| Assurance | Is there a justified argument that the system is acceptable for its use? | Anything beyond the evidence the argument assembles |
+- An **evaluation** scores a model or agent on a set of test examples. It says little about how any single real request went.
+- **Observability** records what happened, in logs and traces. It doesn't judge whether what happened was acceptable.
+- A **guardrail** blocks a single unacceptable message, such as a reply that contains a card number. It judges only the message, not whether the steps that produced it were correct.
+- An **assurance case** is a written argument, built from the results of all these methods, that a system is fit for its purpose.
 
-These overlap. An evaluation run on a schedule against stated thresholds is a verification, and a guardrail is a runtime check on narrow evidence. The distinctions say which claim a method supports, not which teams may call their work verification.
+Evaluation, observability, and guardrails become verification when they check a written requirement against evidence. An assurance case collects those results.
 
 ## When there is no single expected answer
 
-The sort has one correct output for each input. Many tasks have none. Here are two summaries of the same incident report:
+Sorting a list has one right answer. Many tasks have more than one. Here are two summaries of the same incident report:
 
 ```text
 A: The outage began at 09:12, affected the EU region, and ended at 09:47 after a configuration rollback.
 B: A configuration change took the EU region down from 09:12 until it was rolled back at 09:47.
 ```
 
-They share little wording and state the same facts. Comparing either one with a stored reference summary would reject the other. Software testing calls this the **test oracle problem**: deciding whether behavior is correct for a given input when no expected output is available. Where no specification, derived oracle, or relation between runs is adequate, the fallback is costly human judgment ([Barr et al., 2015](#sources)).
+Both summaries are correct. They use different words to say the same thing.
 
-Scoped properties make much of it checkable without a reference string:
+Having more than one correct answer breaks the usual way of testing. A normal test stores one correct answer and checks that the output matches it. If the stored answer is summary A, the test fails summary B, even though B is also correct. Testing researchers call this the **test oracle problem**: for many tasks, there is no single correct answer to compare against ([Barr et al., 2015](#sources)).
 
-- **Required facts.** The summary states the start time, end time, and region that appear in the report. A and B both pass; a summary that says 09:21 fails.
-- **Prohibited content.** The summary names no customer. A list of customer names decides it.
-- **Acceptable ranges.** If the summary states a duration, it is within one minute of the report's 35 minutes.
-- **Relations between runs.** Reordering the report's paragraphs without changing its facts must not change the facts the summary states. A **metamorphic relation** states how outputs must relate when inputs change in a known way ([Segura et al., 2016](#sources)). Passing one shows the two outputs are consistent, not that either is correct.
+The way around it is to stop asking "does this match the correct answer?" and ask "does this have the properties every correct summary must have?" Each property can be checked on its own:
 
-The judgment can be deterministic, such as comparing a time string; statistical, such as a failure rate across many outputs; human, such as a reviewer; or model-assisted, where a language model reads the summary and the report and decides whether the facts match. Uncertainty enters from three places, and each calls for a different response:
+- **It includes the key facts.** Any correct summary must give the start time (09:12), the end time (09:47), and the region (EU). A and B both do, so both pass. A summary that says the outage began at 09:21 fails.
+- **It leaves out forbidden content.** For example, a summary must not name a customer. A program can check this by searching the summary for every name on the customer list.
+- **Its numbers are close enough.** The outage lasted 35 minutes. A summary may round the length, so if a summary mentions it, a check can accept anything from 34 to 36 minutes.
+- **It gives the same facts when the input is rearranged.** Reordering the report's paragraphs doesn't change what happened, so the summarizer should still report the same times and region. If the two runs report different facts, the summarizer is unreliable. If they report the same facts, the summarizer is consistent but not necessarily correct, because both runs could make the same mistake ([Segura et al., 2016](#sources)).
 
-| Source of uncertainty | Example | Response |
+Something has to run each check and decide pass or fail. This page calls that the **judge**. A judge can be a program that compares values, a person, or an AI model asked whether the summary matches the report.
+
+Sometimes a check can't reach a clear result. The doubt can come from three places, and each needs a different response:
+
+| Where the doubt comes from | Example | Response |
 | --- | --- | --- |
-| The system | The summarizer writes a different summary each time | Judge each output, and track the failure rate |
-| The evidence | The report the summary came from was not kept | Report that the evidence cannot decide, instead of guessing |
-| The judge | A model judge is unsure whether "09:12" and "just after nine" agree | Report the judgment as undetermined, or ask a person |
+| The system | The summarizer writes a different summary each time it runs | Check every summary, not one, and track how often checks fail |
+| The evidence | The original report wasn't kept, so there is nothing to compare the summary with | Report "can't tell" instead of guessing |
+| The judge | An AI judge can't decide whether "09:12" and "just after nine" mean the same time | Report "can't tell", or ask a person |
 
-A model judge is a check that needs its own verification. In one large study, strong model judges agreed with human preferences about as often as humans agreed with each other, and also showed position bias, verbosity bias, and weak grading of math and reasoning ([Zheng et al., 2023](#sources)). That is agreement with human preference on the questions studied. It is not evidence of factual accuracy, or of compliance with a particular policy. Combining consistency checks with tool-based verification outperformed baseline verifiers on the reasoning benchmarks in [Han, Buntine and Shareghi (2025)](#sources), which also says little about a new domain.
+## Can an AI judge be trusted?
 
-Agreement and repeatability are often mistaken for correctness. Two models, or one model rerun, can agree because they share a blind spot; a repeatable judge is consistent, not necessarily right. A judge's accuracy is known only after measuring it against labeled cases from the domain where it will run: cases that clearly pass, clearly fail, and are ambiguous. The measurement holds until the judge's prompt, its model, or the requirement changes. Calibration, whether a judge's stated confidence matches how often it is right, is a further claim that needs its own measurement ([Ovadia et al., 2019](#sources) measure it for classifiers).
+An AI model used as a judge is a check like any other, and it can be wrong.
+
+One large study compared AI judges with human raters ([Zheng et al., 2023](#sources)). The strongest AI judges agreed with the humans about as often as the humans agreed with each other. But the AI judges often preferred an answer because of the order the answers were shown in, or because it was longer, rather than because it was better. They also graded math and reasoning poorly.
+
+Agreeing with people is also not the same as being right. A judge can match what people prefer and still get a fact wrong or misread a company's policy.
+
+Two common shortcuts don't show that a judge can be trusted:
+
+- **Using a second AI to check the first.** Both models can make the same mistake, so the second one may agree with an error.
+- **Getting the same answer every time.** A judge that always gives the same answer can be wrong every time.
+
+The only way to know whether an AI judge can be trusted is to test it on examples from the real task where the right answer is already known. The examples should include cases that clearly pass, cases that clearly fail, and unclear cases. The test has to be repeated whenever the judge's instructions (its prompt), the model behind it, or the requirement changes.
 
 ## What the output cannot establish
 
-Some requirements are about the output itself, such as a sort's order or a summary's facts, and the output is valid evidence for them. Other requirements are about how the output was produced. The output can look excellent while those are broken. Three cases show which evidence has to be inspected instead.
+Some requirements are about the output itself. Whether a list is sorted can be checked by looking at the list. Other requirements are about how the output was produced. For those, the output can look perfect and still prove nothing. The three examples below show what to look at instead.
 
-**An optimistic evaluation.** A fraud model scores 0.98 AUC on its test set. Transactions from the same customers appear in both training and test data, and one feature was computed after the fraud label was known. That is **leakage**: information that would not be available at prediction time reaches the model during evaluation. A survey of machine-learning-based science compiled reports of leakage in 17 fields, affecting 294 papers ([Kapoor and Narayanan, 2023](#sources)). The score cannot reveal it. Detecting it means inspecting the evaluation: how the split was made, where each feature came from, and when each value became available. Without those records, whether the score is valid remains unknown.
+**Example 1: a test score that's too good.** A fraud-detection model scores very well in testing, but the test was built wrong in two ways:
 
-**Changed conditions.** Six months later, the mix of merchant categories in incoming transactions has shifted. That is a change in the input distribution, which may or may not change the relationship between inputs and fraud; the drift literature calls these virtual and real concept drift ([Gama et al., 2014](#sources)). Comparing a recent window of inputs with a baseline window detects the first. Whether the relationship changed needs outcomes, which often arrive weeks later ([Gama et al., 2014](#sources)). A drift alarm is a reason to investigate. It does not show that any individual prediction is wrong. The model's own confidence is a weak guide here: for the methods studied by [Ovadia et al. (2019)](#sources), uncertainty estimates calibrated on the original distribution degraded under shift.
+- The same customers appear in the data the model learned from and in the data it was tested on. The model can recognize those customers instead of learning what fraud looks like.
+- One of the model's inputs was calculated after each fraud had been discovered. In real use, that information doesn't exist yet when a purchase happens.
 
-**An agent's claim about its own work.** A coding agent finishes and reports:
+Both mistakes give the model information it won't have in real use, so the test score is higher than its real performance. Both are called **leakage**. It is common: one survey found it reported in 294 published studies across 17 fields ([Kapoor and Narayanan, 2023](#sources)).
+
+Leakage can't be seen in the score itself. Finding it means checking how the test was built: how the data was split, where each input came from, and when each value became known.
+
+**Example 2: conditions that changed.** Six months after launch, customers are buying from different kinds of shops. That change can mean one of two things ([Gama et al., 2014](#sources)):
+
+- **Only the inputs changed.** Customers shop differently, but the signs of fraud are the same. Comparing this month's transactions with an earlier month shows this kind of change.
+- **The signs of fraud changed.** Detecting this requires knowing which transactions turned out to be fraud, and that often takes weeks.
+
+An alert that the data has changed, called a **drift alert**, is a reason to look closer. It doesn't prove that any prediction is wrong.
+
+Many models also report a confidence score with each prediction. When the data changes, that score can't be relied on: one study found that confidence scores become less accurate after the data changes ([Ovadia et al., 2019](#sources)).
+
+**Example 3: an agent describing its own work.** A coding agent finishes a task and reports:
 
 ```text
 Ran the test suite: 214 passed. Looked up the customer's account tier before applying the discount.
 ```
 
-The message is evidence that the agent wrote this message. The first claim needs a record of the test run, such as the CI job's exit status and output. The second sentence holds two claims that need different evidence. A tool-call log or trace span showing the account lookup establishes that the call happened. It does not establish what the call returned, or that the discount matched the tier it returned. That needs the call's result, the customer it was made for, and the discount the agent then applied.
+The message proves only that the agent wrote it. It makes three claims, and each needs its own evidence:
 
-The absence of a record establishes less still. Traces can be sampled away, delayed, or dropped, and a step can run in code nobody instrumented. A missing log shows that the step may have been skipped, not that it was. It supports that conclusion only when the capture path is known to record every executed step; otherwise the honest result is that the evidence cannot decide.
+- **The tests passed.** This needs the record of the test run, such as the result and output of the automated test run.
+- **The lookup happened.** This needs a log showing the agent called the lookup tool.
+- **The discount matched the tier.** The log of the call isn't enough. This needs what the lookup returned, which customer it was for, and the discount the agent applied.
 
-In each case the output looked right and was not the evidence that decided the requirement.
+Sometimes there is no record at all. Some systems log only some runs. Records can arrive late or get lost. Some code writes no records at all. So when there is no record of a step, the step may or may not have happened. A missing record proves that a step was skipped only if every step is always recorded. Otherwise, the check can't tell.
+
+In all three examples, the output looked right. The evidence that mattered was somewhere else: in how the test was built, in what happened later, and in the records of what the agent did.
 
 ## A repeatable verification practice
 
-The examples combine into a practice with six parts:
+Taken together, the examples on this page come down to six things. Any system can be verified with them:
 
-1. **One requirement per failure that matters,** scoped to its context, with its assumptions stated: ordered and preserves items; states the report's times; the discount matches the tier the lookup returned.
-2. **Evidence adequate to each requirement.** The output, when the requirement is about the output. Records of the process, such as data splits, feature origins, and tool calls with their results, when it is about the process. Evidence nobody captures yet is the first gap to close.
-3. **The cheapest method that decides each requirement,** with the check itself tested on cases that should pass, fail, and stay undecided before anyone trusts it. This matters most for model judges.
-4. **A response decided in advance** for each result an action depends on: on a violation, on evidence that cannot decide, and when the check itself fails to run. A check that crashed has not passed.
-5. **Provenance.** Each result is recorded with the requirement, the evidence, and the versions of the system and the check it used, so a later reader can tell exactly what was verified.
-6. **Revision as the system changes.** A new model, policy, or data source reruns the labeled cases. A changed requirement gets a new version, and old results stay attached to the version they used.
+1. **A requirement for each failure that matters.** For example: the list keeps every item, the summary gives the report's times, and the discount matches the customer's account tier. Any assumption the requirement depends on is written down with it.
+2. **Evidence that can show whether the requirement is met.** When the requirement is about the output, the output is the evidence. When it is about how the output was produced, the evidence is a record of how it was produced, such as how the data was split, or which tools an agent called and what they returned. If that record doesn't exist yet, creating it comes first.
+3. **The simplest check that works.** Before anyone relies on the check, it is tried on cases where the right result is known: some that should pass, some that should fail, and some where it should report "can't tell". This matters most when the check is an AI judge.
+4. **A plan for each result, decided in advance.** The team decides beforehand what happens when a check fails, when it can't tell, and when the check itself breaks and returns no result. A check that breaks never counts as a pass.
+5. **A record of each check.** The record names the requirement, the evidence, and the versions of the system and the check, so anyone can later see exactly what was verified.
+6. **Updates when the system changes.** When the model, policy, or data source changes, the check is run again on the cases where the right result is known. A changed requirement gets a new version, and old results stay linked to the version they were checked against.
 
-Two difficulties remain once a team has a method. The first is requirements. Requirements describe the world the system acts in, not only the system: requirements engineering separates knowledge of the environment, the requirements, and the specification the machine implements ([Zave and Jackson, 1997](#sources)). Production machine learning adds tests for data, models, infrastructure, and monitoring, because a model's behavior is difficult to specify in advance ([Breck et al., 2017](#sources)).
+Two things are hard to do well: writing the requirements, and building the system that runs the checks.
 
-The second is infrastructure. Evidence has to be captured while the system runs, checks have to finish in time, every result has to name exact versions, and the evidence has to be kept for later investigation. Capture also has to cost little enough that it stays on.
+**Writing good requirements.** A requirement often depends on facts outside the system. "Only send reports to authorized recipients" depends on who is authorized, and people outside the system decide that ([Zave and Jackson, 1997](#sources)). AI models make requirements harder to write, because it is hard to say in advance exactly how a model should behave. Because a model's behavior is hard to pin down, teams that run models in production also write requirements for things they can pin down: the data the model receives and how it is monitored ([Breck et al., 2017](#sources)).
 
-Coding agents and model judges can help with both, by drafting capture code, proposing requirements from a policy document, generating counterexamples, and judging requirements that need context. They do not remove the need for a domain owner who decides what the requirements are, or for checks independent of the system they check. An economic argument holds that human verification capacity becomes the binding constraint as automated output grows, and that using AI to check AI spreads correlated errors ([Catalini, Hui and Wu, 2026](#sources), a preprint). Runtime verification was an established field long before language-model agents ([Leucker and Schallhart, 2009](#sources)); whether agents make it substantially cheaper or more reliable is an open question.
+**Building the system that runs the checks.** It has to capture evidence while the system runs, finish each check before the result is needed, and store each result with the exact versions involved. It also has to be cheap enough to run on every call.
+
+AI tools help with both, but only in part. They can write logging code, suggest requirements from a policy document, find inputs that break a requirement, and act as the judge for requirements that need understanding, such as whether a reply follows a policy. They don't replace a person who owns the requirements. They also don't replace independent checks, because an AI tool can share the blind spots of the AI system it checks. One economics paper argues that using AI to check AI repeats those blind spots instead of catching them ([Catalini, Hui and Wu, 2026](#sources)).
 
 ### Applying the ideas to a new case
 
-A checkout service converts a cart total from US dollars to euros at the current exchange rate. A dashboard shows the average converted total for the day looks normal. What would establish that one conversion was wrong, and what would remain unknown?
+A checkout service converts each cart total from US dollars to euros, using the exchange rate at the moment of purchase. A dashboard shows today's average euro total, and it looks normal. Does that mean every conversion was right?
 
-The requirement applies to each conversion: the euro total equals the dollar total multiplied by the rate in effect at that moment, rounded by the stated rule. Its evidence is that conversion's dollar total, the rate it used, the published rate for that moment, and its euro total. Recomputing the total and finding a mismatch establishes a violation. A normal daily average establishes nothing about one conversion, in the same way a strong test score hid leakage. If the service never recorded when each conversion ran, the rate in effect cannot be identified, and the evidence cannot decide whether that conversion was right.
+No. An average across thousands of purchases can look normal while a few purchases are wrong, because a handful of bad conversions barely moves it.
+
+To catch a bad conversion, each purchase is checked on its own. The euro total must equal the dollar total times the exchange rate at the time of purchase, rounded to the cent. That check needs four records for the purchase: the dollar total, the euro total, the rate the service used, and the official rate at that time. The check multiplies the dollar total by the official rate and compares the answer with the euro total. It also catches a service that used an out-of-date rate, because that rate won't match the official one.
+
+If the service never recorded when each purchase happened, nobody can look up which official rate applied. The check can't say whether that conversion was right or wrong. It can only report "can't tell".
 
 ## Sources
 
-The sources below support the claims cited beside them. For further reading, Leucker and Schallhart (2009) is a short introduction to runtime verification; Barr et al. (2015) and Segura et al. (2016) cover checking without a reference output; Kapoor and Narayanan (2023) and Gama et al. (2014) cover evaluation leakage and drift; Zheng et al. (2023) is the starting point for model judges. Koohestani (2025) is a proof-of-concept workshop paper that learns a probabilistic model of an LLM agent from its runs and model-checks it at runtime; it shows a direction, not an established method.
+The sources below support the claims cited beside them. For going deeper:
+
+- Leucker and Schallhart (2009): a short introduction to checking real runs.
+- Barr et al. (2015) and Segura et al. (2016): checking software when there is no single right answer.
+- Kapoor and Narayanan (2023) and Gama et al. (2014): test scores that mislead, and data that changes.
+- Zheng et al. (2023): how far AI judges can be trusted.
+- More specialized: Agha and Palmskog (2018) and Bauer, Leucker and Schallhart (2011) on proof-style checks for systems with randomness and for live runs; Dennis et al. (2016) on proving autonomous agents' decisions; Koohestani (2025), an early proof of concept for checking LLM agents while they run.
 
 | Source | Type | Supports |
 | --- | --- | --- |
@@ -204,4 +253,4 @@ The sources below support the claims cited beside them. For further reading, Leu
 
 ## Next
 
-[Real-time verification](/understand/real-time-verification/) explains what changes when checks run while a system executes. [Write verifiable requirements](/build-and-verify/declare/write-verifiable-requirements/) and [Establish sufficient evidence](/build-and-verify/observe/establish-sufficient-evidence/) turn this practice into concrete work. To implement it with a tool, [How verification works in Wyrd](/understand/how-verification-works/) shows one implementation.
+[Real-time verification](/understand/real-time-verification/) explains what changes when checks run while a system executes. The guides [Write verifiable requirements](/build-and-verify/declare/write-verifiable-requirements/) and [Establish sufficient evidence](/build-and-verify/observe/establish-sufficient-evidence/) show how to apply this practice. [How verification works in Wyrd](/understand/how-verification-works/) shows one tool that implements it.

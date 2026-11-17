@@ -42,7 +42,7 @@ Assertion, trace, and code checks send nothing to a provider. Keep sensitive evi
 
 ## Can I trust a model judge?
 
-Not without testing it. A model judge can be biased, inconsistent, or wrong, and agreement with another model is not independent evidence. Wyrd requires a judge that passes to cite the evidence it used, and makes the requirement `inconclusive` when it does not; it does not measure a judge's accuracy for you. Run the judge on labeled cases before relying on it, as in [Choose checks and test judges](/build-and-verify/declare/write-verifiable-requirements/#3-choose-checks-and-test-judges). [Foundations of verification](/understand/foundations-of-verification/#when-there-is-no-single-expected-answer) summarizes what research shows about model judges.
+Not without testing it. A model judge can be biased, inconsistent, or wrong, and agreement with another model is not independent evidence. Wyrd requires a judge that passes to cite the evidence it used, and makes the requirement `inconclusive` when it does not; it does not measure a judge's accuracy for you. Run the judge on labeled cases before relying on it, as in [Choose checks and test judges](/build-and-verify/declare/write-verifiable-requirements/#3-choose-checks-and-test-judges). [Can an AI judge be trusted?](/understand/foundations-of-verification/#can-an-ai-judge-be-trusted) summarizes what research shows.
 
 ## What happens to old results when a requirement changes?
 

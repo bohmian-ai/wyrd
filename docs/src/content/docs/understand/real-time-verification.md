@@ -6,86 +6,115 @@ section: Understand
 order: 2
 ---
 
-Real-time verification checks the relevant properties of a system while it executes, soon enough for the result to inform the action or response in progress; it is not hard real-time scheduling, where missing a fixed deadline counts as a system failure, and it implies no particular latency. It matters because the same check that prevents a bad action when it runs first can only explain that action when it runs afterward.
+## What real-time verification is
+
+Real-time verification is checking a system while it runs, early enough that the result can still change what the system does next. A check that runs before an application sends a message can stop a bad message. The same check run tomorrow can only report it.
+
+Here, "real-time" means the result arrives before the system decides what to do next. It doesn't mean instant, and it doesn't promise any particular speed.
+
+## Why timing matters
+
+Most verification happens at one of two times. Tests run before release, and log reviews happen afterward. Both are useful, but neither checks a real input at the moment the system acts on it. Tests miss problems because they can't cover every real input. Log reviews find a problem only after it has done its damage.
+
+AI systems make both weaknesses worse. A model can answer the same request differently each time, so passing a test once says little about how it will answer a real request later. An agent can take actions that can't be undone, such as sending an email or making a payment, so finding the problem in a log afterward is too late. Checking each real action before it happens catches the bad one before it does harm.
 
 ## The same check can arrive too late
 
-An application is about to share a quarterly report with an outside auditor. Two requirements apply: the recipient is authorized to receive the report, and the report contains no bank account number.
+An application is about to share a quarterly report with an outside auditor. Two requirements apply: the auditor must be authorized to receive the report, and the report must not contain a bank account number.
 
-When the checks run before sharing, a violation means the report never leaves. The application can hold it, remove the account number, or ask a person. When the identical checks run an hour after sharing, on the same evidence, they find the same violation, but the report is already with the auditor. The result can still open an incident, contact the recipient, and change the next release. It cannot undo the share.
+Suppose the application checks both requirements before sharing. If either check fails, the report is not sent. The application can hold the report, remove the account number, or ask a person to decide.
 
-Nothing about the evidence or the check differed between the two runs. Only the time the result arrived, relative to the action, changed what it could do. The [Quickstart](/get-started/quickstart/) implements this example as a finance API that verifies each report before releasing it.
+Now suppose the same checks run on the same report an hour after it was shared. They find the same problem, but by then the auditor already has the report. The team that runs the application can still investigate, contact the auditor, and change how the next report is handled. Nobody can unsend the report.
 
-## What can be checked during execution
+The report and the checks were the same both times. The only difference was timing. Before sharing, the result could stop the report. After sharing, it could only report the problem. Wyrd's [Quickstart](/get-started/quickstart/) builds this example: a finance application that checks each report before releasing it.
 
-The sharing decision follows the same sequence as any request or agent step that is verified before it acts:
+## What a check before the action can show
 
-1. **A proposed action.** The application has the report, the recipient, the purpose, and the destination.
-2. **Evidence.** It gathers what the requirements need: the report text, the result of the authorization lookup for this recipient, and the version of the sharing policy that applies.
-3. **Checks.** A pattern check scans the report for account numbers. A comparison reads the authorization result. A judgment compares the purpose with the policy.
-4. **A result** for each requirement, and an overall result.
-5. **The next action.** The application shares the report, holds it, or sends it for review.
+Checking the report before it is shared follows the same steps as checking any request or agent action before it happens:
 
-A check before the action can only use evidence that exists before the action: the proposed content and the preconditions. It can show that the report contains no account number and that the authorization record lists this recipient. It cannot show the effects of the share. An authorization check before sending does not prove that the report was delivered, that only the authorized person opened it, or that the recipient then handled it as the policy requires. Those are claims about a completed action, and they need evidence produced after it, such as a delivery receipt or the destination's access log.
+1. **The application starts with the proposed action.** It has the report, the recipient, the reason for sharing, and the channel the report will be sent through.
+2. **It gathers the evidence the requirements need.** That is the report text, a record of whether this recipient is authorized, and the company's sharing policy. The policy adds a third requirement: the reason for sharing must be one the policy allows.
+3. **It runs one check per requirement.** A text search looks for account numbers. A simple comparison confirms that the authorization record approves this recipient. An AI model reads the policy and decides whether it allows this reason for sharing.
+4. **Each check reports a result.** The overall result passes only if every check passes.
+5. **The application decides what to do next.** It shares the report, holds it, or sends it to a person to review.
 
-Agents make this split routine. Before an agent calls a tool, its proposed arguments can be checked against policy. After the call, its effects can be checked: whether the tool reported success, and whether the system's state now matches what the agent intended.
+A check before the action can only use what exists before the action. It can show that the report has no account number and that the auditor is authorized. It can't show what happened after sending. For example, it can't show that the report arrived, that only the auditor opened the report, or that the auditor followed the policy. Those need evidence that exists only afterward, such as a delivery receipt or an access log.
 
-## A useful result must arrive in time
+Agent actions have the same split. Before an agent uses a tool, the request it is about to make can be checked against policy. Afterward, the outcome can be checked: whether the tool call succeeded and whether it made the change the agent intended.
 
-The application has a deadline: how long it can wait before it must share the report or answer the person who asked. A result that arrives after the deadline cannot inform that decision.
+## A result is only useful if it arrives in time
 
-The time before a result has three parts:
+The application has a deadline: the longest it can wait before it must share the report or reply to whoever requested it. A result that arrives after the deadline can't affect whether the report is shared.
 
-- **Collecting and preparing evidence.** The report may already be in memory. The authorization result may need a lookup, and a PDF may need its text extracted before any check can read it.
-- **Coordination.** Whatever runs the checks has to receive the evidence, find which checks apply, confirm the caller may run them, and schedule the work.
-- **The checks themselves.** Scanning the text for an account number or comparing a field is local computation. Deciding whether a policy written in prose permits this purpose may need a language model, possibly several calls, each subject to the provider's load and the network.
+The time spent waiting for a result has three parts:
 
-The model-assisted judgment usually dominates, and its time varies from one call to the next. Waiting for it synchronously does not bound how long it takes. Only measurement on representative evidence shows whether a check fits the deadline, and the measurement holds only for the load, model, and provider measured.
+- **Gathering evidence.** The report may already be loaded. The authorization record may have to be looked up. If the report is a PDF, its text may have to be extracted before a check can read it.
+- **Setting up the checks.** The checks often run in a separate service. Before that service runs any check, it receives the evidence, works out which checks apply, and confirms that the application may use them.
+- **Running the checks.** A text search or a comparison takes almost no time. Asking an AI model whether the policy allows the sharing can take several calls to an outside service. Each call's time depends on how busy that service is and on the network.
 
-When a result cannot arrive in time, the application needs a fallback chosen on purpose: refuse the action, hold it for review, or act now and verify later where the risk allows. The checking system may also refuse work it cannot take on, or stop a check that runs past a timeout. Neither is a pass. Choosing the fallback is the application's decision, and making it before production is part of the design.
+The AI model usually takes the longest, and its time varies from one call to the next. The application can set a time limit and stop waiting, but then it has no result. A time limit doesn't make the model answer sooner. The only way to know whether the checks fit the deadline is to time them on realistic data. Those timings hold only for the traffic level, AI model, and provider used when they were measured.
 
-## Missing evidence and uncertain judgments
+Before launch, the application's team chooses what happens when the result won't arrive in time. The application can refuse the action, hold it for a person, or go ahead and check afterward if the risk is acceptable. The same plan covers two other cases: the checking service rejects the request because it is overloaded, or it stops a check that runs too long. A rejected or stopped check never counts as a pass.
 
-Three outcomes in the sharing example are often confused:
+## When the answer is "can't tell"
 
-| Situation | What it means | Possible response |
+A check can end in three ways that are often confused. Using the report example:
+
+| Result | What it means | Possible response |
 | --- | --- | --- |
 | A violation | The evidence shows the requirement is not met | Hold the report |
-| Evidence that cannot decide | The check ran, but the evidence it needs is missing, or the judge could not decide | Hold the report, fetch the missing record, or ask a person |
-| A check that did not run | A timeout, a crash, or refused work leaves no judgment at all | The fallback chosen in advance, never a pass |
+| Can't tell | The check ran, but evidence is missing, or the AI model couldn't decide | Hold the report, find the missing record, or ask a person |
+| No result | The check timed out, crashed, or was rejected | Follow the plan chosen before launch: refuse, hold, or check later. Never treat it as a pass |
 
-An authorization lookup that returns nothing belongs in the second or third row, not the first: it does not show that the recipient is unauthorized. A judge that cannot tell whether "external audit" covers this purpose belongs in the second. Systems name these outcomes differently. What matters is that the application can tell them apart, and that none of them silently becomes a pass.
+Suppose the authorization lookup comes back empty. The result is "can't tell". If the lookup times out or fails, the result is "no result". Neither is a violation, because neither shows that the auditor is unauthorized.
 
-A model-assisted judgment also changes who sees the evidence. Sending the report and the policy to an externally hosted model exposes their content to that provider, and relies on the provider's model for that requirement. A deterministic check avoids both. Where a judgment is needed, deciding which evidence the judge may see is part of designing the requirement.
+Now suppose the policy allows sharing for audits, and the AI model can't decide whether this reason for sharing counts as an audit. The result is again "can't tell".
 
-## When a later check is appropriate
+Different systems use different names for these three results. What matters is that the application can tell them apart, and that none of them is ever treated as a pass.
 
-Not every check belongs before the action. Each timing informs a different decision:
+## What an AI model sees
 
-| When the check runs | Decision it can inform | Fits |
+Using an AI model run by another company means sending it the report and the policy. That company sees both. The result also depends on a model that the company controls and can change. A rule-based check, such as a text search, sends nothing to another company and doesn't depend on anyone else's model. When a check needs an AI model, deciding what the model is allowed to see is part of designing the check.
+
+## Not every check has to happen before the action
+
+A check can run before the action, right after it, or on a schedule. Each timing helps with a different decision:
+
+| When the check runs | What it can change | Good for |
 | --- | --- | --- |
-| Inline, before the action | Whether the action happens | Proposed content and preconditions that must be settled first |
-| Queued, after the response | Follow-up: correct, notify, or review | Slow judgments, and evidence such as traces that arrives after the action |
-| Recurring, on a schedule | Investigation, retraining, and the next release | Properties of many executions together, such as drift or a failure rate |
+| Before the action | Whether the action happens | Things that must be settled first, such as who may receive the report |
+| Right after | Follow-up: correct, notify, or review | Slow checks, and evidence that exists only afterward |
+| On a schedule | Investigations, retraining, and the next release | Patterns across many requests, such as a rising failure rate, or real requests that differ more and more from the test data |
 
-A check can move later when its result could not change the current action anyway, when its evidence does not exist yet, or when it is too slow for the deadline and the risk of acting first is acceptable. Only a recurring check sees a property of many executions at once, such as a shift in the input distribution. Live verification and verification during execution are other names for the inline case.
+A check can run later instead of before the action in three cases:
 
-## What must be measured and retained
+- its result couldn't change the action anyway;
+- its evidence doesn't exist until afterward;
+- it is too slow, and acting first is an acceptable risk.
 
-Two measurements decide whether a real-time check is workable. The first is end-to-end time, measured from the application on representative evidence, with the expensive and variable judges running on their real models. The second is each check's accuracy, measured against labeled cases as for any other check.
+Real-time verification is the first row of the table: checking before the action.
 
-Results also need provenance: which version of the requirement, which evidence, and which versions of the system and the check. Without it, nobody can later tell which policy a past decision applied. When a requirement changes, the results of the old version stay attached to it.
+## What has to be measured
 
-A returned result and a durable record are different things. A checking system can return the result first and write its record afterward, which is faster, or write the record first, so that every result the application acted on is kept. Which a given system does, and what it can lose when it fails, depends on the implementation, and is a property to confirm rather than assume.
+Two measurements decide whether real-time checking works for an application:
+
+- **How long the whole check takes**, from the moment the application asks to the moment it gets the result. It has to be measured on realistic data, with the AI model set up exactly as it will be in production.
+- **How often each check is right.** This is measured by running the check on examples whose correct result is already known.
+
+## What has to be kept
+
+Requirements, systems, and checks change over time, so each one has versions. Each result needs a record of the versions that produced it and the evidence it used. Without that record, nobody can later tell which policy a past decision followed. Because of the record, old results stay tied to the old version of a requirement after it changes.
+
+Getting a result back is not the same as having it saved. Some checking systems send the result first and save the record afterward, which is faster. If such a system crashes after sending the result but before saving it, the application has acted on a result that has no record. Other systems save first, so every result the application acted on is kept. It is worth confirming which order a system uses instead of assuming.
 
 ## These ideas in Wyrd
 
-Wyrd is one implementation of these ideas. [How verification works in Wyrd](/understand/how-verification-works/) maps requirements, evidence, checks, results, and provenance onto Wyrd, and follows one inline verification of the report release, including where its time goes and what it retains. The [Quickstart](/get-started/quickstart/) runs that example, and [Act on verdicts in production](/build-and-verify/verify/act-on-verdicts-in-production/) covers deadlines, provider exposure, and cost. Wyrd does not choose an application's requirements or fallbacks.
+Wyrd is one implementation of these ideas. The page [How verification works in Wyrd](/understand/how-verification-works/) follows the report example through Wyrd, including where the time goes and what Wyrd keeps. The [Quickstart](/get-started/quickstart/) runs the example. Wyrd calls a check's result a verdict. The guide [Act on verdicts in production](/build-and-verify/verify/act-on-verdicts-in-production/) covers deadlines, what an AI provider sees, and cost. Wyrd does not choose an application's requirements, or its plan for when a check can't finish.
 
 ## Sources
 
-Runtime verification, as checking an observed execution rather than every execution, and the distinction between online and offline monitoring come from [Leucker and Schallhart (2009)](/understand/foundations-of-verification/#sources). Monitors that judge a finite trace as satisfying, violating, or inconclusive are described by [Bauer, Leucker and Schallhart (2011)](/understand/foundations-of-verification/#sources). Delayed outcomes in drift detection are covered by [Gama et al. (2014)](/understand/foundations-of-verification/#sources). The decision deadline, the three parts of elapsed time, and the inline, queued, and recurring comparison are this page's practical synthesis, not established research terminology.
+[Leucker and Schallhart (2009)](/understand/foundations-of-verification/#sources) introduce runtime verification: checking real runs of a system, as they happen or afterward. [Bauer, Leucker and Schallhart (2011)](/understand/foundations-of-verification/#sources) describe checks that can't give a result until more of the run has happened. [Gama et al. (2014)](/understand/foundations-of-verification/#sources) describe the delay before the true outcome of a decision is known, which is why some checks can run only later. The research doesn't use this page's terms for the deadline, the three parts of the wait, or the three check timings. This page introduces them as a practical summary.
 
 ## Next
 
-[How verification works in Wyrd](/understand/how-verification-works/) applies these ideas to a running system. [Foundations of verification](/understand/foundations-of-verification/) covers the general discipline behind them.
+[How verification works in Wyrd](/understand/how-verification-works/) applies these ideas to a running system. [Foundations of verification](/understand/foundations-of-verification/) covers the general ideas behind them.

@@ -7061,3 +7061,58 @@ async fn call_bodies_count_against_the_calling_workload_while_the_call_runs() {
         "no body bytes outlive the call"
     );
 }
+
+/// Sustained critical pressure cancels a running standalone call it selects:
+/// the call
+/// holding its request body is the largest gateway operation, its
+/// cancellation ends the provider attempt, the caller sees the call refused
+/// as unavailable, and every byte it held returns.
+///
+/// # Panics
+/// Panics when the Postgres fixture or setup fails, pressure does not cancel
+/// the running call, the call completes, or its bytes outlive it.
+#[tokio::test]
+async fn critical_pressure_cancels_a_running_gateway_call() {
+    use wyrd_runtime::resources::{PressureState, Workload};
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let (entered, mut dispatched) = mpsc::unbounded_channel();
+    let held = Arc::new(Held {
+        entered,
+        release: Semaphore::new(0),
+    });
+    let state = replica(&fixture, held.clone()).await;
+    configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
+    let caller = invoker(tenant, 1, [open_access()]);
+    let workloads = state.resources.workloads().clone();
+    let mut call = request("dep-a/a", None, Duration::from_secs(30));
+    call.body = wyrd_gateway::RequestJson::serialize(&json!({"model": "dep-a/a", "messages": []}))
+        .expect("the body serializes");
+    let running = tokio::spawn({
+        let state = state.clone();
+        async move {
+            GatewayInvocation::new(&state)
+                .invoke(&caller, call)
+                .await
+                .map(drop)
+        }
+    });
+    dispatched.recv().await.expect("the call dispatches");
+    assert!(workloads.workload_bytes(Workload::Gateway) > 0);
+
+    let overcommitted = workloads.observe_commitment();
+    overcommitted.set(u64::MAX);
+    assert_eq!(workloads.sample(0).state, PressureState::Critical);
+    // The first critical sample reclaims; the next cancels one victim.
+    workloads.sample(0);
+    let refused = running
+        .await
+        .expect("joins")
+        .expect_err("pressure cancels the running call");
+    assert!(
+        matches!(refused, WyrdError::ServiceUnavailable { .. }),
+        "{refused:?}"
+    );
+    assert_eq!(workloads.workload_bytes(Workload::Gateway), 0);
+    overcommitted.set(0);
+}

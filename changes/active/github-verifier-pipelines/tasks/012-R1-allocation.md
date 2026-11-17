@@ -530,6 +530,23 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
        GREEN (96 passed, the gateway and middleware lib command above).
      - Wire unchanged: `mise run test:gateway:native` (17 Rust gateway
        journeys and 8 Python native-client journeys passed).
+   - Pressure cancellation of a running call:
+     `components::gateway::pg_invocation_tests::critical_pressure_cancels_a_running_gateway_call`.
+     A standalone call held at dispatch carries its body as Gateway bytes.
+     Two critical samples (reclaim, then one victim) cancel it, the caller
+     gets `ServiceUnavailable`, and its bytes return. Written after the
+     body attribution (TDD VIOLATED). Mutation: removing the body's
+     attribution fails "workload_bytes(Gateway) > 0", so the call is never
+     eligible. GREEN with the gateway lib command above.
+   - Deadline expiry under pressure, already proved:
+     `critical_pressure_pauses_gateway_calls_until_recovery` (gateway) and
+     `pg_verification_routes::direct_execution_waits_end_at_the_arrival_deadline`
+     (verification, 504 at the arrival deadline).
+   - Named custody, deadline and replica regressions, per selector (3 passed):
+     `deadline_terminal_waits_for_started_host_work`,
+     `held_persistence_bounds_queued_custody_by_claim_permits`,
+     `two_replicas_claim_each_queued_run_exactly_once`, with the managed
+     Postgres command in "Verification owners and commands".
    - Open:
      - The journey does not yet cover:
        - media or code work;

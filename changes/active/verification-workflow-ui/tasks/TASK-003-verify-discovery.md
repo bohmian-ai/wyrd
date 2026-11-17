@@ -133,9 +133,8 @@ mise run ui:check
 mise exec -- scripts/postgres/with-test-postgres.sh -- env WYRD_UI_INTEGRATION=1 pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.integration.test.ts src/lib/ui-pages.integration.test.ts
 ```
 
-`ui:check` passes (74 tests) and both integration files pass (26 tests) at
-`5ef2a850a`; the keyboard and phone-width steps added after it pass in the
-browser journey at `66c395825`.
+`ui:check` passes (74 tests) and both integration files pass (26 tests) with
+the page drawn as the mock.
 
 | Proof | Test |
 |---|---|
@@ -159,23 +158,28 @@ name with its version on hover; clock time; Status and Verdict pinned while
 the other columns scroll; collapsible group headings with a verdict tally;
 Reset zoom beside the zoomed range.
 
+The table also follows the mock's chrome: no list header, "Showing 50 of N ·
+newest first" with "Show 50 more" (the address holds how many rows are shown,
+up to 500 in one read), a Live/Paused button, and a pressed facet value as
+the only way to remove its filter.
+
 Differences that remain:
 
 - No Failed column: the population holds no failed requirement names, and the
   task forbids hydrating a result per row.
 - No Repository or Pull request facet, group or column: TASK-005.
-- The table keeps the shared list's header (count, Wrap lines, Columns, CSV),
-  Newer and Older paging and Open in Query; the mock has "Showing 50 of N"
-  with "Show 50 more".
-- Range is the shared time picker and Live is a pressed button; the mock has
-  a select and a Live/Paused label.
+- Range is the shared time picker; the mock has a select. Kept by the user's
+  decision for its typed custom range, UTC/local switch and eight presets.
 - `waiting`, `retrying` and `not recorded` are statuses the mock does not
   show; they use ◷, ↻ and ○.
+- The mock's banner for executions held while Live is paused is absent.
+- Past 500 rows the list asks the reader to narrow the range or filters.
 
 User decisions, 2026-11-17:
 
 - The list reads the newest status row only; an execution with none is pending.
 - The list filters by failed verdict and by Verifier, never by a specific requirement.
+- Verify keeps the shared time picker instead of the mock's range select.
 - The list needs tenant-wide Bifrost read; a Verifier-scoped list is out of scope.
 - Repository and pull request context on Verify is TASK-005's.
 

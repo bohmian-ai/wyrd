@@ -811,7 +811,24 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
        run.
      - **Proof:** deferral test 6 of 6 on one Postgres; journeys 4
        passed. Mutation `admit_by: None` fails both journeys.
-   Status: FAIL (drain while pressure stays critical has no proof).
+   - Closed (drain under sustained critical pressure): new
+     `pg_verification_runtime::result_delivery_drains_while_pressure_stays_critical`.
+     - A queued execution computes while the result outbox share is held.
+       Its result waits in the claim's custody: status `running`, no
+       result id, nothing sent to Scribe.
+     - Pressure then turns critical through two samples, the reclaim
+       sample and a victim sample.
+     - Once the share frees, the execution completes on attempt 1 with
+       the result Scribe received, and pressure is asserted still
+       critical.
+     - Mutation limit: an admission wait added at the start of `conclude`
+       did not fail it, because delivery starts before pressure turns
+       critical. The custody assertions instead pin that the stage, the
+       Scribe acknowledgement and the settlement all happen under
+       critical pressure.
+     - Written after the behaviour (TDD VIOLATED). Stable 3 of 3; the
+       `pg_verification_runtime::` lane passed 66.
+   Status: PASS.
 
 7. **Functional closure and performance — REQ-024; AC-018.** Run affected
    functional lanes, then full clean L1 verification, gateway and all three

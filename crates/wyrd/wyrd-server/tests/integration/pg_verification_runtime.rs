@@ -2459,6 +2459,77 @@ async fn exhausted_reconciliation_survives_source_and_capacity_outage() {
     );
 }
 
+/// Result delivery is mandatory drain work: it keeps progressing while
+/// process pressure stays critical.
+///
+/// A queued execution computes its result while the result outbox's share
+/// is held, so the result waits in the claim's custody. Pressure then turns
+/// critical and stays critical through two samples, which select victims;
+/// the waiting delivery is never one. Once the share frees, the execution
+/// completes with the result Scribe received while pressure is still
+/// critical.
+///
+/// # Panics
+/// Panics when the share cannot be held, pressure is not critical, the
+/// execution does not complete on its first attempt under critical pressure,
+/// or Scribe did not receive its result.
+#[tokio::test]
+async fn result_delivery_drains_while_pressure_stays_critical() {
+    use wyrd_runtime::resources::PressureState;
+    let harness = Harness::start().await;
+    let run = harness.submit().await;
+    let script = EngineScript::default();
+    script.push(EngineOutcome::Completed(unscored_report()));
+    let limits = Harness::limits();
+    let composed = harness.runtime(&limits, &script, &CapabilityCrash::default());
+    let outbox = harness
+        .fault
+        .composed_outbox()
+        .expect("the runtime composed its result outbox");
+    let full = outbox
+        .reserve(usize::MAX)
+        .expect_err("no reservation holds every slot");
+    let share = outbox
+        .reserve(full.limit - full.admitted)
+        .expect("the free reservable share is held");
+    let runtime = RunningRuntime::spawn(composed);
+    wait_until("the execution computes", || script.entered() == 1).await;
+
+    let workloads = harness.server.state().resources.workloads().clone();
+    let overcommitted = workloads.observe_commitment();
+    overcommitted.set(u64::MAX);
+    assert_eq!(workloads.sample(0).state, PressureState::Critical);
+    // The first critical sample reclaims; the next selects a victim.
+    assert_eq!(workloads.sample(0).state, PressureState::Critical);
+    let waiting = harness.seed.execution(run).await.expect("execution reads");
+    assert_eq!(
+        (waiting.status.as_str(), waiting.result_id),
+        ("running", None),
+        "the result still waits in the claim's custody"
+    );
+    assert!(sent_to(&harness.fault, RESULTS).await.is_empty());
+    drop(share);
+    let row = harness.wait_execution(run, status("completed")).await;
+    assert_eq!(
+        workloads.pressure().state,
+        PressureState::Critical,
+        "the result drained under critical pressure"
+    );
+    runtime.stop().await;
+    overcommitted.set(0);
+    assert_eq!(row.attempts, 1, "the delivery was never cancelled");
+    let sent: Vec<String> = sent_to(&harness.fault, RESULTS)
+        .await
+        .iter()
+        .map(sent_result_id)
+        .collect();
+    let result = row.result_id.map(|id| id.to_string());
+    assert!(
+        result.as_ref().is_some_and(|id| sent.contains(id)),
+        "the execution completes with a result Scribe received: {result:?} of {sent:?}"
+    );
+}
+
 /// While Scribe cannot accept queued work, finished queued results are held
 /// by the claims that computed them, and those claims bound how much more
 /// is claimed.

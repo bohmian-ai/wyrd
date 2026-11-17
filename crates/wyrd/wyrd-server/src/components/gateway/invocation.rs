@@ -300,7 +300,7 @@ impl AdmittedCall {
         body: &ResponseBody,
     ) -> Result<Option<ByteCharge>, WyrdError> {
         let bytes = match body {
-            ResponseBody::Json(answer) => answer.get().len(),
+            ResponseBody::Json(answer) => answer.capacity(),
             ResponseBody::Media(answer) => answer.bytes.len(),
             ResponseBody::Events(_) | ResponseBody::MediaStream { .. } => return Ok(None),
         };

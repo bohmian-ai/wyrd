@@ -6892,16 +6892,18 @@ async fn critical_pressure_pauses_gateway_calls_until_recovery() {
     assert_eq!(dispatch.seen(), ["dep-a"]);
 }
 
-/// A buffered answer's bytes count against the workload that made the call
-/// while its response is held, and return when it drops: a standalone call's
-/// as gateway work, a nested Agent call's as the initiating verification
-/// work, never both.
+/// A buffered answer's allocation, spare capacity included, counts against
+/// the workload that made the call while it is held, and returns when it
+/// drops: a standalone call's as gateway work, a nested Agent call's as the
+/// initiating verification work, never both. A relayed answer's bytes stay
+/// counted once while the HTTP consumer holds any clone or slice of them,
+/// after the body itself is gone.
 ///
 /// # Panics
 /// Panics when the Postgres fixture or setup fails, a call fails, or the
-/// answer's bytes are uncounted, counted against the wrong workload, released
-/// before a relayed answer's HTTP body is sent, or kept after the response
-/// drops.
+/// answer's bytes are uncounted, counted against the wrong workload, counted
+/// twice, released before the last delivered reference drops, or kept after
+/// it does.
 #[tokio::test]
 async fn buffered_answers_count_against_the_calling_workload() {
     use wyrd_runtime::resources::Workload;
@@ -6913,7 +6915,7 @@ async fn buffered_answers_count_against_the_calling_workload() {
     let caller = invoker(tenant, 1, [open_access()]);
     let workloads = state.resources.workloads().clone();
     let bytes = |response: &super::GatewayCallResponse| match &response.body {
-        ResponseBody::Json(answer) => answer.get().len() as u64,
+        ResponseBody::Json(answer) => answer.capacity() as u64,
         other => panic!("expected a buffered JSON answer: {other:?}"),
     };
 
@@ -6955,11 +6957,24 @@ async fn buffered_answers_count_against_the_calling_workload() {
     )
     .await;
     assert_eq!(relayed.status(), StatusCode::OK);
+    let charged = workloads.workload_bytes(Workload::Gateway);
     assert!(
-        workloads.workload_bytes(Workload::Gateway) > 0,
+        charged > 0,
         "a relayed answer stays charged until its HTTP body is sent"
     );
-    body_json(relayed).await;
+    let delivered = axum::body::to_bytes(relayed.into_body(), usize::MAX)
+        .await
+        .expect("the JSON answer reads");
+    serde_json::from_slice::<Value>(&delivered).expect("the delivered answer is JSON");
+    assert_eq!(
+        workloads.workload_bytes(Workload::Gateway),
+        charged,
+        "delivered bytes stay charged once after their body drops"
+    );
+    let slice = delivered.slice(1..);
+    drop(delivered);
+    assert_eq!(workloads.workload_bytes(Workload::Gateway), charged);
+    drop(slice);
     assert_eq!(workloads.workload_bytes(Workload::Gateway), 0);
 
     dispatch.push(Step::Return(media_completed(PAYLOAD_OBJECT_BYTES)));
@@ -6979,6 +6994,17 @@ async fn buffered_answers_count_against_the_calling_workload() {
         .await
         .expect("the media answer reads");
     assert_eq!(delivered.as_ref(), PAYLOAD_OBJECT_BYTES);
+    assert_eq!(
+        workloads.workload_bytes(Workload::Gateway),
+        sent,
+        "delivered media stays charged once after its body drops"
+    );
+    let clone = delivered.clone();
+    let slice = delivered.slice(..1);
+    drop(delivered);
+    drop(clone);
+    assert_eq!(workloads.workload_bytes(Workload::Gateway), sent);
+    drop(slice);
     assert_eq!(workloads.workload_bytes(Workload::Gateway), 0);
 }
 

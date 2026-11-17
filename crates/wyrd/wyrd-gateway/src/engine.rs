@@ -117,6 +117,13 @@ impl JsonAnswer {
         &self.0
     }
 
+    /// The bytes the text's allocation holds, spare capacity included: what
+    /// retaining the answer actually costs.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.0.capacity()
+    }
+
     /// Moves the JSON text out.
     #[must_use]
     pub fn into_string(self) -> String {

@@ -12,7 +12,6 @@ use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
-use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use skald_spec::wire::borrowed::Borrowed;
@@ -1489,21 +1488,17 @@ async fn openai_call(
 
 /// Renders a provider `status` and answer `body`: JSON as JSON, media bytes
 /// with their content type, and events as an incremental server-sent event
-/// stream. A buffered answer's memory `custody` rides in the HTTP body, so
-/// it returns once the body is sent or dropped, not when it is rendered.
+/// stream. A buffered answer's memory `custody` rides with its allocation,
+/// so it returns once the last reference to the delivered bytes drops,
+/// wherever the HTTP consumer moved, cloned or sliced them, not when the
+/// body is rendered or exhausted.
 pub(super) fn relay(status: u16, body: ResponseBody, custody: Option<ByteCharge>) -> Response {
     let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
-    let charged = |bytes: Bytes| {
-        Body::new(http_body_util::Full::new(bytes).map_frame(move |frame| {
-            let _held = &custody;
-            frame
-        }))
-    };
     match body {
         ResponseBody::Json(raw) => (
             status,
             [(CONTENT_TYPE, "application/json")],
-            charged(Bytes::from(raw.into_string())),
+            Custodied::body(raw.into_string(), custody),
         )
             .into_response(),
         ResponseBody::Media(answer) => {
@@ -1512,7 +1507,7 @@ pub(super) fn relay(status: u16, body: ResponseBody, custody: Option<ByteCharge>
             (
                 status,
                 [(CONTENT_TYPE, content_type)],
-                charged(answer.bytes),
+                Custodied::body(answer.bytes, custody),
             )
                 .into_response()
         }
@@ -1530,6 +1525,33 @@ pub(super) fn relay(status: u16, body: ResponseBody, custody: Option<ByteCharge>
             events_body(events),
         )
             .into_response(),
+    }
+}
+
+/// A buffered answer's allocation together with its memory custody, the
+/// owner behind every [`Bytes`] the HTTP body hands its consumer.
+struct Custodied<T> {
+    /// The answer's allocation, moved in without copying.
+    bytes: T,
+    /// The charge of the allocation, held until its last reference drops.
+    _custody: Option<ByteCharge>,
+}
+
+impl<T: AsRef<[u8]> + Send + 'static> Custodied<T> {
+    /// A full HTTP body over `bytes` whose delivered references keep
+    /// `custody`.
+    fn body(bytes: T, custody: Option<ByteCharge>) -> Body {
+        Body::from(Bytes::from_owner(Self {
+            bytes,
+            _custody: custody,
+        }))
+    }
+}
+
+impl<T: AsRef<[u8]>> AsRef<[u8]> for Custodied<T> {
+    /// The answer's bytes.
+    fn as_ref(&self) -> &[u8] {
+        self.bytes.as_ref()
     }
 }
 

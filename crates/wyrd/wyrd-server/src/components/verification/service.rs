@@ -657,10 +657,14 @@ impl<'a> VerificationControl<'a> {
         let ran = telemetry
             .phase(
                 Phase::Engine,
-                engine.run(
-                    Arc::clone(&target.spec),
-                    std::mem::take(&mut request.inputs),
-                    deadline,
+                crate::verification::hosted::blocks::as_one_operation(
+                    self.state,
+                    caller.data_tenant_id,
+                    engine.run(
+                        Arc::clone(&target.spec),
+                        std::mem::take(&mut request.inputs),
+                        deadline,
+                    ),
                 ),
             )
             .instrument(tracing::debug_span!("verification.engine"))

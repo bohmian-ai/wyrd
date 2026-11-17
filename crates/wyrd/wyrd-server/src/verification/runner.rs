@@ -977,10 +977,13 @@ impl VerifierRunner {
         let engine = engine
             .with_approvals(decisions)
             .with_host_work(work.clone());
-        match engine
-            .run(Arc::clone(spec), evidence, state.deadline())
-            .await
-        {
+        let ran = crate::verification::hosted::blocks::as_one_operation(
+            &self.state,
+            tenant,
+            engine.run(Arc::clone(spec), evidence, state.deadline()),
+        )
+        .await;
+        match ran {
             Ok(outcome) => EngineOutcome::Completed(outcome),
             Err(error) => engine_failure(run, &error),
         }

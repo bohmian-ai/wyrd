@@ -14,6 +14,12 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use wyrd_spec::ids::DataTenantId;
 
+tokio::task_local! {
+    /// The operation the running task's work belongs to, set by
+    /// [`Operation::scope`]; admissions inside it join it.
+    static CURRENT: Arc<OperationShared>;
+}
+
 /// The outer workloads that share one server process, with equal weights.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Workload {
@@ -135,9 +141,20 @@ impl Drop for OperationShared {
 pub struct Operation {
     /// State shared with the manager registry and attributed charges.
     pub(crate) shared: Arc<OperationShared>,
+    /// Whether this handle joined an enclosing operation; dropping a joined
+    /// handle leaves that operation's settlement to its own handle.
+    joined: bool,
 }
 
 impl Operation {
+    /// Runs `work` as part of this operation: every
+    /// [`WorkloadManager::admit`] inside it, on the same manager, joins this
+    /// operation instead of starting another. Its bytes then count here, and
+    /// choosing this operation as a pressure victim cancels it as a whole.
+    pub async fn scope<F: Future>(&self, work: F) -> F::Output {
+        CURRENT.scope(Arc::clone(&self.shared), work).await
+    }
+
     /// The resource identity of this operation.
     #[must_use]
     pub fn context(&self) -> WorkContext {
@@ -293,6 +310,9 @@ impl CommitObservation {
 
 impl Drop for Operation {
     fn drop(&mut self) {
+        if self.joined {
+            return;
+        }
         self.shared.live.store(false, Ordering::Release);
         self.shared.registry.changed.notify_waiters();
     }
@@ -444,7 +464,10 @@ impl WorkloadManager {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(id, Arc::downgrade(&shared));
-        Operation { shared }
+        Operation {
+            shared,
+            joined: false,
+        }
     }
 
     /// Root bytes currently attributed to `workload`'s operations.
@@ -576,13 +599,32 @@ impl WorkloadManager {
     /// materialize. Callers bound the wait with their own deadline; dropping
     /// the future withdraws the demand.
     /// An operation that has to wait logs that once, at debug level.
+    ///
+    /// Inside another operation's [`Operation::scope`] on this manager, the
+    /// admission joins that operation instead: it waits by the enclosing
+    /// operation's workload and tenant, and `workload`, `tenant` and `cancel`
+    /// are ignored, since cancelling the enclosing operation stops this work
+    /// with it.
     pub async fn admit(
         &self,
         workload: Workload,
         tenant: Option<DataTenantId>,
         cancel: Option<CancellationToken>,
     ) -> Operation {
-        let operation = self.begin(workload, tenant, cancel);
+        let enclosing = CURRENT
+            .try_with(Arc::clone)
+            .ok()
+            .filter(|shared| Arc::ptr_eq(&shared.registry, &self.inner.registry));
+        let operation = match enclosing {
+            Some(shared) => Operation {
+                shared,
+                joined: true,
+            },
+            None => self.begin(workload, tenant, cancel),
+        };
+        let WorkContext {
+            workload, tenant, ..
+        } = operation.context();
         let mut waited = false;
         loop {
             let mut changed = std::pin::pin!(self.inner.registry.changed.notified());
@@ -908,6 +950,72 @@ mod tests {
             "confirmed exit releases it"
         );
         drop((held, gateway));
+    }
+
+    /// Work admitted inside an operation's scope joins it: nested calls
+    /// share its identity, their bytes count as its bytes, dropping a joined
+    /// handle leaves it unsettled, and critical pressure cancels the
+    /// enclosing operation as a whole rather than one nested call.
+    ///
+    /// # Panics
+    /// Panics when a nested admission starts its own operation, its bytes
+    /// count elsewhere, a joined handle settles the enclosing operation, or
+    /// the victim is not the enclosing operation.
+    #[tokio::test]
+    async fn nested_admissions_join_the_enclosing_operation() {
+        let (memory, workloads) = manager();
+        let (execution_cancel, nested_cancel, standalone_cancel) = (
+            CancellationToken::new(),
+            CancellationToken::new(),
+            CancellationToken::new(),
+        );
+        let tenant = tenant();
+        let execution = workloads.begin(
+            Workload::Verification,
+            Some(tenant),
+            Some(execution_cancel.clone()),
+        );
+        let standalone = workloads.begin(Workload::Gateway, None, Some(standalone_cancel.clone()));
+        let _standalone_bytes = hold(&memory, &standalone, 250);
+        let nested_bytes = execution
+            .scope(async {
+                let mut held = Vec::new();
+                for _ in 0..2 {
+                    let nested = workloads
+                        .admit(Workload::Gateway, None, Some(nested_cancel.clone()))
+                        .await;
+                    assert_eq!(nested.context(), execution.context());
+                    held.push(hold(&memory, &nested, 200));
+                }
+                held
+            })
+            .await;
+        assert_eq!(
+            execution.bytes(),
+            400,
+            "nested bytes count as the execution's"
+        );
+        assert_eq!(workloads.workload_bytes(Workload::Verification), 400);
+        assert_eq!(workloads.workload_bytes(Workload::Gateway), 250);
+        assert!(
+            starts_now(&workloads, Workload::Gateway, None),
+            "outside the scope, admission starts its own operation"
+        );
+
+        let _commitment = {
+            let observation = workloads.observe_commitment();
+            observation.set(u64::MAX);
+            observation
+        };
+        workloads.sample(0);
+        workloads.sample(0);
+        assert!(
+            execution_cancel.is_cancelled(),
+            "the execution is cancelled as a whole"
+        );
+        assert!(!nested_cancel.is_cancelled() && !standalone_cancel.is_cancelled());
+        drop(nested_bytes);
+        assert_eq!(execution.bytes(), 0);
     }
 
     /// Critical pressure first reclaims, then cancels one cancellable victim

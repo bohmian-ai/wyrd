@@ -734,7 +734,30 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
          `one_session` name are gone. A sweep for tests of removed
          allocation logic found no test that only asserts removed
          behaviour.
-     Status: PASS.
+     - Closed (nested identity, REQ-019): a verification execution is one
+     operation. `WorkloadManager::admit` inside `Operation::scope` joins the
+     enclosing operation. `as_one_operation` runs both the queued and the
+     direct engine as one cancellable Verification operation of the tenant,
+     and a pressure cancellation ends it with the existing `Busy` capacity
+     error. Proofs:
+     - `resources::workload::tests::nested_admissions_join_the_enclosing_operation`:
+       same context, bytes counted as the execution's, the enclosing
+       execution chosen as the victim. Mutation: disabling the join fails
+       on the context.
+     - `components::gateway::pg_invocation_tests::critical_pressure_cancels_the_execution_a_model_call_belongs_to`:
+       a real held gateway call inside an execution counts 0 Gateway bytes,
+       and pressure cancels the execution. Mutation: running the engine
+       outside the scope fails.
+     Written after the code (TDD VIOLATED). Regressions: gateway and
+     verification lib tests 183 passed; sandbox, verification runtime,
+     hosted artifacts, durable work and route integration tests 143 of
+     144; `isolated_capacity` journeys 4 passed.
+   - Open (D4): `pg_hosted_artifacts::busy_queued_execution_is_deferred_until_capacity_frees`
+     fails on HEAD too (2 of 4 runs on one Postgres). **Cause** (Codex
+     diagnostician): under critical pressure, the run's input read waits
+     on Oracle admission until the execution deadline, so the run times
+     out instead of deferring.
+   Status: PASS.
 
 7. **Functional closure and performance — REQ-024; AC-018.** Run affected
    functional lanes, then full clean L1 verification, gateway and all three

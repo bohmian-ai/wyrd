@@ -7135,3 +7135,69 @@ async fn critical_pressure_cancels_a_running_gateway_call() {
     assert_eq!(workloads.workload_bytes(Workload::Gateway), 0);
     overcommitted.set(0);
 }
+
+/// A model call made inside a verification execution joins the execution's
+/// operation: the bytes it holds count as the execution's, and sustained
+/// critical pressure cancels the execution as a whole, which ends the call,
+/// rather than selecting the call on its own.
+///
+/// # Panics
+/// Panics when the Postgres fixture or setup fails, the call's bytes count
+/// as another operation's, pressure selects the call alone, or the call
+/// outlives its execution's cancellation.
+#[tokio::test]
+async fn critical_pressure_cancels_the_execution_a_model_call_belongs_to() {
+    use vala_verify::blocks::EngineError;
+    use wyrd_runtime::resources::{PressureState, Workload};
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let (entered, mut dispatched) = mpsc::unbounded_channel();
+    let held = Arc::new(Held {
+        entered,
+        release: Semaphore::new(0),
+    });
+    let state = replica(&fixture, held.clone()).await;
+    configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
+    let caller = invoker(tenant, 1, [open_access()]);
+    let workloads = state.resources.workloads().clone();
+    let mut call = request("dep-a/a", None, Duration::from_secs(30));
+    call.body = wyrd_gateway::RequestJson::serialize(&json!({"model": "dep-a/a", "messages": []}))
+        .expect("the body serializes");
+    let execution = tokio::spawn({
+        let state = state.clone();
+        async move {
+            let call = Box::pin(async {
+                GatewayInvocation::new(&state)
+                    .nested(Workload::Verification)
+                    .invoke(&caller, call)
+                    .await
+                    .map(drop)
+                    .map_err(|error| EngineError::Busy(error.to_string()))
+            });
+            crate::verification::hosted::blocks::as_one_operation(&state, tenant, call).await
+        }
+    });
+    dispatched.recv().await.expect("the call dispatches");
+    assert!(workloads.workload_bytes(Workload::Verification) > 0);
+    assert_eq!(
+        workloads.workload_bytes(Workload::Gateway),
+        0,
+        "the call's bytes are the execution's, not gateway traffic"
+    );
+
+    let overcommitted = workloads.observe_commitment();
+    overcommitted.set(u64::MAX);
+    assert_eq!(workloads.sample(0).state, PressureState::Critical);
+    // The first critical sample reclaims; the next cancels one victim.
+    workloads.sample(0);
+    let refused = execution
+        .await
+        .expect("joins")
+        .expect_err("pressure cancels the execution");
+    assert!(
+        matches!(&refused, EngineError::Busy(reason) if reason.contains("cancelled the execution")),
+        "the execution, not the call alone, was the victim: {refused:?}"
+    );
+    assert_eq!(workloads.workload_bytes(Workload::Verification), 0);
+    overcommitted.set(0);
+}

@@ -55,7 +55,7 @@ use crate::components::github::service::GithubConnections;
 use crate::state::AppState;
 use crate::verification::state::RunState;
 use crate::verification::telemetry::{Envelopes, ExecutionMode};
-use wyrd_runtime::resources::ProcessResources;
+use wyrd_runtime::resources::{ProcessResources, Workload};
 
 /// Most steps or checks one execution runs at once.
 // ponytail: fixed per-execution fan-out; the sandbox and workspace pools
@@ -310,6 +310,35 @@ struct ExecutionBinding {
     traces: OnceLock<CallerTraces>,
     /// The accepted PR source a `pull_request` extractor reads.
     pull_request: Option<PullRequestSource>,
+}
+
+/// Runs one verification execution's engine `run` as a single Verification
+/// operation of `tenant`, so its Python steps, model calls and other nested
+/// admissions all join it: their bytes count as the execution's, and under
+/// critical pressure the execution is cancelled as a whole.
+///
+/// # Errors
+/// Returns `run`'s error, or [`EngineError::Busy`] when process memory
+/// pressure chose the execution as its victim; dropping `run` stops every
+/// nested call with it.
+pub async fn as_one_operation<T>(
+    state: &AppState,
+    tenant: wyrd_spec::ids::DataTenantId,
+    run: impl Future<Output = Result<T, vala_verify::blocks::EngineError>>,
+) -> Result<T, vala_verify::blocks::EngineError> {
+    let victim = tokio_util::sync::CancellationToken::new();
+    let operation = state.resources.workloads().begin(
+        Workload::Verification,
+        Some(tenant),
+        Some(victim.clone()),
+    );
+    tokio::select! {
+        biased;
+        () = victim.cancelled() => Err(vala_verify::blocks::EngineError::Busy(
+            "process memory pressure cancelled the execution".to_owned(),
+        )),
+        ran = operation.scope(run) => ran,
+    }
 }
 
 impl ExecutionBinding {

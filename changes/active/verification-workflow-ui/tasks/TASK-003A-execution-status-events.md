@@ -220,7 +220,7 @@ Commands, run sequentially:
 - O: `mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=scribe_outbox::tests::status_rows_share_one_frame_and_keep_identity_on_retry)'`
 - R: the same wrapper around
   `cargo nextest run --locked -p wyrd-server --features test-support --test integration --test-threads=1 -E "test(=pg_verification_runtime::<name>)"`.
-  The owner lane `mise run test:bifrost:integration:server`: 125 of 125 pass on the final code.
+  The owner lane `mise run test:bifrost:integration:server`: 126 of 126 pass on the final code, fallback test included.
 - G: the same wrapper around
   `cargo nextest run --locked -p wyrd-server --features test-support --test integration --test-threads=1 -E "test(pg_github_pull_requests::)"`.
   22 tests pass.

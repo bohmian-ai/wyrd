@@ -1634,23 +1634,29 @@ async fn conclude(
         Decision::Failed(failure) => {
             Transition::Terminate(terminal_status(failure.status), failure.error)
         }
-        Decision::Selected(selected) => {
-            match result(frozen, &selected, system) {
-                Ok((transition, write)) => {
-                    let weight = <ScribeSink as OutboxSink>::weight(&write) as u64;
-                    // the built write is charged while the decision still lives
-                    if let Some(charge) = &mut charge {
-                        charge.grow_infallible(weight);
-                    }
-                    drop(selected);
-                    if let Some(charge) = &mut charge {
-                        fit(charge, weight);
-                    }
-                    deliver(tenant, transition, write, charge, lease, outbox).await
-                }
-                Err(transition) => transition,
+        Decision::Selected(selected) => match result(frozen, &selected, system) {
+            Ok((transition, write)) => {
+                let weight = <ScribeSink as OutboxSink>::weight(&write) as u64;
+                hand_over(charge.as_mut(), weight, selected);
+                deliver(tenant, transition, write, charge, lease, outbox).await
             }
+            Err(transition) => transition,
+        },
+    }
+}
+
+/// Move a decision's `charge` onto the result write built from it: the
+/// write's `weight` is charged while `decision` still lives, so both are
+/// paid for together, then the charge shrinks to exactly the write once
+/// `decision` drops. Nothing is charged ahead of the build.
+fn hand_over<T>(charge: Option<&mut ByteCharge>, weight: u64, decision: T) {
+    match charge {
+        Some(charge) => {
+            charge.grow_infallible(weight);
+            drop(decision);
+            fit(charge, weight);
         }
+        None => drop(decision),
     }
 }
 
@@ -2141,5 +2147,50 @@ impl EngineScript {
             let _ = held.wait_for(|held| !held).await;
         }
         Some(outcome)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use wyrd_runtime::resources::ByteLedger;
+
+    use super::hand_over;
+
+    /// Records the ledger's usage when the decision it stands for drops.
+    struct Decision<'a> {
+        ledger: &'a ByteLedger,
+        seen: &'a std::cell::Cell<u64>,
+    }
+
+    impl Drop for Decision<'_> {
+        fn drop(&mut self) {
+            self.seen.set(self.ledger.used());
+        }
+    }
+
+    /// The result write is charged while its decision still lives, and the
+    /// charge then holds exactly the write.
+    ///
+    /// # Panics
+    /// Panics when the decision drops before the write is charged, or the
+    /// handed-over charge differs from the write's weight.
+    #[test]
+    fn result_write_charge_overlaps_its_decision_then_holds_only_the_write() {
+        let ledger = ByteLedger::new(10_000);
+        let mut charge = ledger.charge_infallible(300);
+        let seen = std::cell::Cell::new(0);
+        hand_over(
+            Some(&mut charge),
+            120,
+            Decision {
+                ledger: &ledger,
+                seen: &seen,
+            },
+        );
+        assert_eq!(seen.get(), 420, "decision and write are charged together");
+        assert_eq!(charge.bytes(), 120, "then only the write");
+        assert_eq!(ledger.used(), 120);
+        drop(charge);
+        assert_eq!(ledger.used(), 0);
     }
 }

@@ -260,13 +260,20 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
        before charging the encoding fails the refusal. Added after the
        behaviour (TDD VIOLATED). GREEN:
        `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-server --features test-support --test integration -E 'test(=pg_hosted_artifacts::native_media_holds_raw_and_encoded_bytes_only_while_they_live)'"`.
-     - The result precharge removal in `runner.rs::conclude` is proved by
-       source only. Both the old and the new charge are infallible
-       (`charge_infallible` / `grow_infallible`), so no admission or
-       refusal differs. The only difference is a transient peak inside
-       `conclude`, which `ByteLedger` has no high-water mark to expose.
-       A runtime proof would need a new production probe, so this stays a
-       source/diff proof.
+     - Closed: the result handoff in `runner.rs::conclude` is now
+       `hand_over`. `verification::runner::tests::result_write_charge_overlaps_its_decision_then_holds_only_the_write`
+       records the ledger when the decision drops (decision plus write)
+       and asserts the charge then holds exactly the write. Mutations
+       fail it: dropping the decision before charging the write, and
+       skipping the shrink.
+     - Closed: parent custody.
+       `sandbox_worker::suspended_sessions_release_runnable_capacity`
+       now asserts that during a held turn the ledger holds exactly the
+       worker's report plus the retained code. After the turn it holds
+       only the worker's report. Mutations fail it: charging nothing for
+       retained inputs, and precharging the Monty heap envelope. The
+       `sandbox_worker::` lane passed 14 of 14, three times.
+     - Both were written after the behaviour (TDD VIOLATED).
      - The `Sandbox::exec` stack-overflow fix: the regression is
        `sandbox_worker::workspace_writes_share_one_budget`, the test that
        aborted (D1). It runs on the default test thread stack in the
@@ -291,7 +298,7 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
        `failed_workers_settle_before_capacity_returns`;
      - `bound_media_holds_only_its_guard_through_the_call`;
      - the repaired `busy_queued_execution_is_deferred_until_capacity_frees`.
-   Status: FAIL (the unproved cases above).
+   Status: PASS.
 
 3. **Capacity, sharing and pressure transitions — REQ-020,021; AC-016.** Runtime
    tests use the agreed P/H/M and q=max(L/M,A/P), unequal demand/local caps and

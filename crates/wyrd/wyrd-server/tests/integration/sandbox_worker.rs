@@ -964,9 +964,11 @@ async fn suspended_sessions_release_runnable_capacity() {
     let mounts = workspace.mounts().expect("mounts");
     let writer = workspace.writer().await;
     let envelopes = Envelopes::default();
+    let code = "from pathlib import Path\nblob = 'x' * (100 * 1024 * 1024)\nPath('/work/a.txt').write_text('done')\nlen(blob)";
+    let retained = code.len() as u64;
     let suspended = sandbox.exec(
         DataTenantId::new_v7(),
-        "from pathlib import Path\nblob = 'x' * (100 * 1024 * 1024)\nPath('/work/a.txt').write_text('done')\nlen(blob)".to_owned(),
+        code.to_owned(),
         Vec::new(),
         mounts,
         far(),
@@ -997,7 +999,8 @@ async fn suspended_sessions_release_runnable_capacity() {
     until(
         "the suspended worker reports its blob while its turn is held",
         || {
-            (sandbox.worker_bytes() >= 100 << 20 && memory.used() >= sandbox.worker_bytes())
+            (sandbox.worker_bytes() >= 100 << 20
+                && memory.used() == sandbox.worker_bytes() + retained)
                 .then_some(())
         },
     )
@@ -1008,6 +1011,10 @@ async fn suspended_sessions_release_runnable_capacity() {
     drop(writer);
     let (value, _) = suspended.await.expect("the program finishes");
     assert_eq!(value.py_repr(), "104857600");
+    until("only the worker's own report stays charged", || {
+        (memory.used() == sandbox.worker_bytes()).then_some(())
+    })
+    .await;
     assert_eq!(sandbox.runnable_turns(), 1);
     let rendered = metrics.render();
     for series in SETTLED {

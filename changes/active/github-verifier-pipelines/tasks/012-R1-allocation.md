@@ -981,10 +981,62 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
      (3.1 s), `::two_replicas_claim_each_queued_run_exactly_once` (4.4 s).
    - `mise run fmt:check`, `mise run lints` (exit 0, including workspace
      and shipped-server clippy) and `git diff --check` are clean.
-   - L1 qualification not run: benchmarks are not authorized. Verification,
-     gateway and Bifrost L1 records remain required.
-   Status: OPEN. L1 qualification is pending, and FIND-012-11's
-   cancellation and buffered-decode proof is missing.
+   - L1 at clean `cfa3bee12`: the code is `d96c2ffda` plus the workflow
+     docs commit, with no server change. Run sequentially on the AMD Ryzen 9
+     9950X host (32 CPU / 91 GiB) with `mise run bench:l1:{verification,gateway,bifrost}`.
+     All five records are VALID (exit 0). They sit in this worktree's
+     `benchmarks/history/` and are not yet committed to `benchmark-records`:
+     - `verification/direct-verify/20261117T195143Z-cfa3bee12.json`
+     - `gateway/overhead/20261117T195559Z-cfa3bee12.json`
+     - `bifrost/writes-parquet/20261117T195920Z-cfa3bee12.json`
+     - `bifrost/hot/20261117T200646Z-cfa3bee12.json`
+     - `bifrost/parquet/20261117T201036Z-cfa3bee12.json`
+     Correctness: 0 errors, 0 wrong results, 0 lost or shed captures, and
+     every paced arrival completed.
+   - Comparison. The baseline for each experiment is the newest VALID,
+     clean `benchmark-records` record with the same host, timing, variables
+     and schema. A change is listed when the two runs' repetition ranges
+     are disjoint; no tolerance is invented.
+     - Verification: no compatible baseline. The method now runs the
+       canonical Verifier (two code-running Agent checks) through Rust,
+       Python and TypeScript plus r3000. The newest record
+       (`20261112T030209Z-2ce7caec7`) measured a different check, so its
+       sub-ms latencies cannot be compared. Target missed: Rust c64
+       `overhead_p99_ms` is 1.10 ms against < 0.5.
+     - Gateway against `20261031T131441Z-92b62f9c0`: 57 metrics better and
+       5 worse.
+       - Better: 64 KiB payload c64 rate 4981 → 9540/s, with CPU per
+         request -36% and p99 156.8 → 56.0 ms.
+       - Worse: 64 KiB metadata c1 peak memory 1.53 → 2.17 GB (+42%).
+       - Target newly missed: 1 KiB metadata c64 `overhead_p99_ms` 0.491 →
+         0.527 ms against < 0.5 (repetition ranges overlap).
+       - Still missed, as at baseline: 64 KiB metadata c64 (1.37 ms) and
+         64 KiB payload c64 (56 ms).
+     - Bifrost writes-parquet against `20261031T125731Z-92b62f9c0`: 33
+       better and 6 worse.
+       - Worse: OTLP 1 KiB spans c64 rows/s 130.3k → 125.0k (-4%), OTLP
+         1 KiB c1 WAL-append p99 +10%, and spans c1 peak memory +5%.
+       - Still missed: the `otlp-spans-peak` wire floor, 14.6 against ≥ 30
+         MiB/cpu-s (baseline 15.9).
+     - Bifrost hot against `20261031T130456Z-92b62f9c0`: 25 better and 6
+       worse. The largest is `span-long-tail-memtable-c1`: rate 47.6 →
+       36.0/s (-24%), p99 24.1 → 31.7 ms, queries/cpu-s -28%.
+     - Bifrost parquet against `20261031T130839Z-92b62f9c0`: 4 better and
+       20 worse.
+       - Worse: span-trace c64 rate -7.5% and p99 +12%; span-shredded c1
+         rate -5.8%; span-trace c1 rate -5.3%; point c64 p99 11.7 → 12.2 ms.
+       - Still missed: point c64 against < 5 ms.
+     - The baselines are 17 days and many commits old, so these deltas are
+       not attributed to this remediation. No same-day baseline at
+       `5c9808411` was run.
+   Status: OPEN.
+   - The L1 records are VALID, but AC-018's no-regression criterion is not
+     met. Gateway has a newly missed 1 KiB c64 target and +42% peak memory
+     at 64 KiB c1.
+   - Bifrost hot long-tail memtable and parquet span-trace throughput
+     regressed against history.
+   - Verification has no compatible baseline.
+   - FIND-012-11's cancellation and buffered-decode proof is still missing.
 
 ## Verification owners and commands
 

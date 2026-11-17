@@ -11,7 +11,7 @@
     <label for="invitation-code">Invitation code</label>
     <input id="invitation-code" class="app-input mono" type="password" name="invitationCode" required autocomplete="off" />
     <label for="username">Username</label>
-    <input id="username" class="app-input" name="username" required minlength="3" maxlength="64" autocomplete="username" value={form?.username ?? ''} />
+    <input id="username" class="app-input" name="username" required minlength="3" maxlength="64" autocomplete="username" defaultValue={form?.username ?? ''} />
     <p>3–64 characters: letters, digits, dot, underscore or hyphen, starting with a letter or digit. Stored in lowercase.</p>
     <label for="password">Password</label>
     <PasswordInput id="password" name="password" required autocomplete="new-password" />

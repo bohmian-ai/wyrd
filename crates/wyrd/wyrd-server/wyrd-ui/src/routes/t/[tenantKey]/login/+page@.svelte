@@ -11,7 +11,7 @@
   {#if data.reset}<p role="status">Password set. Sign in with your new password.</p>{/if}
   <form class="fields" method="POST" action="?/password">
     <label for="username">Username</label>
-    <input id="username" class="app-input" name="username" required autocomplete="username" value={form && 'username' in form ? form.username : ''} />
+    <input id="username" class="app-input" name="username" required autocomplete="username" defaultValue={form && 'username' in form ? form.username : ''} />
     <label for="password">Password</label>
     <PasswordInput id="password" name="password" required autocomplete="current-password" />
     <button class="app-control primary wide" type="submit">Sign in</button>

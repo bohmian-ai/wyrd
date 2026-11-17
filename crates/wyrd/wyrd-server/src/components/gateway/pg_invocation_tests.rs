@@ -6982,6 +6982,58 @@ async fn buffered_answers_count_against_the_calling_workload() {
     assert_eq!(workloads.workload_bytes(Workload::Gateway), 0);
 }
 
+/// A buffered answer process memory cannot hold is refused once it is read:
+/// the call fails with the capacity error, the answer is discarded uncharged,
+/// and the next answer that fits is charged as usual.
+///
+/// # Panics
+/// Panics when the Postgres fixture or setup fails, the refused call succeeds
+/// or fails otherwise, its answer stays charged, or a later call that fits
+/// is refused.
+#[tokio::test]
+async fn buffered_answer_memory_cannot_hold_is_refused_and_discarded() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let dispatch = Scripted::shared();
+    let state = replica(&fixture, dispatch.clone())
+        .await
+        .with_owners_for_test(|owners| {
+            owners.resources = wyrd_runtime::resources::ProcessResources::new(
+                std::num::NonZeroUsize::MIN,
+                1 << 20,
+                1 << 20,
+            );
+        });
+    configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
+    let caller = invoker(tenant, 1, [open_access()]);
+    let memory = state.resources.memory().clone();
+
+    let full = memory.charge_infallible(1 << 20);
+    dispatch.push(Step::Return(completed(1, 1)));
+    let refused = GatewayInvocation::new(&state)
+        .invoke(&caller, request("dep-a/a", None, Duration::from_secs(10)))
+        .await;
+    assert!(
+        matches!(refused, Err(WyrdError::ServiceUnavailable { .. })),
+        "an answer memory cannot hold is refused with the capacity error: {refused:?}"
+    );
+    assert_eq!(
+        memory.used(),
+        full.bytes(),
+        "the refused answer holds no charge"
+    );
+    drop(full);
+
+    dispatch.push(Step::Return(completed(1, 1)));
+    let answered = GatewayInvocation::new(&state)
+        .invoke(&caller, request("dep-a/a", None, Duration::from_secs(10)))
+        .await
+        .expect("an answer that fits is kept");
+    assert!(memory.used() > 0, "the kept answer is charged");
+    drop(answered);
+    assert_eq!(memory.used(), 0);
+}
+
 /// A call's request body counts against its own workload while the call
 /// runs: a nested Agent call's serialized body as verification work, and a
 /// standalone call's HTTP body through the charge its ingress clock carries

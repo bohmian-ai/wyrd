@@ -287,17 +287,31 @@ struct AdmittedCall {
 
 impl AdmittedCall {
     /// Charges `memory` for a buffered `body` the call materialized and
-    /// attributes the charge to the call's operation. The bytes exist, so
-    /// the charge cannot be refused; a stream is not charged.
-    fn custody(&self, memory: &ByteLedger, body: &ResponseBody) -> Option<ByteCharge> {
+    /// attributes the charge to the call's operation; a stream is not
+    /// charged. The answer is new memory the call would retain, so a charge
+    /// memory cannot hold is refused, and the caller discards the answer.
+    ///
+    /// # Errors
+    /// Returns `ServiceUnavailable` when process memory cannot hold the
+    /// buffered answer now.
+    fn custody(
+        &self,
+        memory: &ByteLedger,
+        body: &ResponseBody,
+    ) -> Result<Option<ByteCharge>, WyrdError> {
         let bytes = match body {
             ResponseBody::Json(answer) => answer.get().len(),
             ResponseBody::Media(answer) => answer.bytes.len(),
-            ResponseBody::Events(_) | ResponseBody::MediaStream { .. } => return None,
+            ResponseBody::Events(_) | ResponseBody::MediaStream { .. } => return Ok(None),
         };
-        let mut charge = memory.charge_infallible(u64::try_from(bytes).unwrap_or(u64::MAX));
+        let mut charge = memory
+            .try_charge(u64::try_from(bytes).unwrap_or(u64::MAX))
+            .map_err(|_| WyrdError::ServiceUnavailable {
+                message: "process memory cannot hold the gateway answer now".to_owned(),
+                details: json!({ "call_id": self.call_id }),
+            })?;
         charge.attribute(&self.operation);
-        Some(charge)
+        Ok(Some(charge))
     }
 
     /// Borrows the ledger's view of this call.
@@ -881,8 +895,8 @@ impl<'a> GatewayInvocation<'a> {
     ///
     /// # Errors
     /// Returns `GatewayDeadlineExceeded` for a timed-out call,
-    /// `ServiceUnavailable` for a cancelled call or a refusal body that cannot
-    /// be serialized, and `GatewayUpstreamUnavailable` when no attempt
+    /// `ServiceUnavailable` for a cancelled call, a refusal body that cannot
+    /// be serialized, or a buffered answer process memory cannot hold, and `GatewayUpstreamUnavailable` when no attempt
     /// completed.
     fn respond(
         call: &AdmittedCall,
@@ -908,7 +922,7 @@ impl<'a> GatewayInvocation<'a> {
                     resolved,
                     deployment,
                     status: 200,
-                    custody: call.custody(memory, &body),
+                    custody: call.custody(memory, &body)?,
                     body,
                 })
             }
@@ -921,7 +935,7 @@ impl<'a> GatewayInvocation<'a> {
                     requested: call.requested.clone(),
                     deployment,
                     status: refusal.status,
-                    custody: call.custody(memory, &body),
+                    custody: call.custody(memory, &body)?,
                     body,
                 })
             }

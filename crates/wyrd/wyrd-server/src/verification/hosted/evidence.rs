@@ -39,7 +39,7 @@ use vala_verify::blocks::{
     ActionExecutor, ActionOutput, BlockCall, BlockError, CallValue, EngineError, EvidenceReader,
 };
 use wyrd_loader::{EXTRACT_VERSION, Extraction, lines, locates, units};
-use wyrd_runtime::resources::{ByteCharge, ByteLedger};
+use wyrd_runtime::resources::{ByteCharge, ByteLedger, Workload};
 use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::card::verifier::{Action, InputSlot};
 use wyrd_spec::envelope::CardKind;
@@ -759,12 +759,15 @@ impl EvidenceReader for TenantEvidence {
     /// process memory charge for its encoding, which the Agent call holds
     /// while its provider request carries the media. The encoding is charged
     /// before the bytes are encoded, beside the read bytes, whose charge
-    /// returns once they are dropped.
+    /// returns once they are dropped. The encoding is CPU work, so it runs
+    /// on a blocking worker holding a CPU lane as the enclosing operation's
+    /// work, admitted like any new verification work.
     ///
     /// # Errors
     /// Returns [`Self::read`]'s errors, [`BlockError::Terminal`] for a
     /// format with no native media kind, and [`BlockError::Busy`] when
-    /// process memory cannot hold the read bytes and their encoding now.
+    /// process memory cannot hold the read bytes and their encoding now,
+    /// and [`BlockError::Retryable`] when the encoding's worker stops.
     async fn media(
         &self,
         evidence: &InputDeclaration,
@@ -780,9 +783,23 @@ impl EvidenceReader for TenantEvidence {
         charge.try_grow(encoded).map_err(|_| BlockError::Busy {
             reason: "process memory cannot hold the encoded evidence media now".to_owned(),
         })?;
-        let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
         let read = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-        drop(bytes);
+        let workloads = self.state.resources.workloads();
+        let context = workloads
+            .admit(Workload::Verification, Some(self.tenant()), None)
+            .await
+            .context();
+        let lanes = workloads.lanes().clone();
+        // The raw bytes drop on the blocking worker as soon as they encode.
+        let data = tokio::task::spawn_blocking(move || {
+            lanes.run_blocking(context, || {
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            })
+        })
+        .await
+        .map_err(|error| BlockError::Retryable {
+            reason: format!("the evidence media encoding stopped: {error}"),
+        })?;
         charge.shrink(read);
         let media = MediaRef {
             kind,

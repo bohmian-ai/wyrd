@@ -306,6 +306,47 @@ async fn native_media_holds_raw_and_encoded_bytes_only_while_they_live() {
     }
 }
 
+/// Encoding evidence as native media is CPU work: it waits for a CPU lane
+/// while every lane is held, and finishes once one is free.
+///
+/// # Panics
+/// Panics when the encoding finishes while every lane is held, never queues
+/// for a lane, or fails once a lane is free.
+#[tokio::test]
+async fn native_media_encoding_waits_for_a_cpu_lane() {
+    let registered = Registered::start().await;
+    let declaration = registered.file("notes.txt");
+    let pinned = Arc::new(BTreeMap::from([(notes(), declaration.clone())]));
+    let evidence = registered.readable();
+    evidence
+        .admit(&BTreeMap::new(), &pinned)
+        .await
+        .expect("the notes are admitted");
+    let workloads = registered.server.state().resources.workloads().clone();
+    let lanes = workloads.lanes().clone();
+    let other = workloads.begin(wyrd_runtime::resources::Workload::Gateway, None, None);
+    let mut held = Vec::new();
+    while lanes.free() > 0 {
+        held.push(lanes.acquire(other.context()).await);
+    }
+    let media = evidence.media(&declaration);
+    tokio::pin!(media);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while lanes.waiting() == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the media encoding never queued for a CPU lane"
+        );
+        tokio::select! {
+            biased;
+            _ = &mut media => panic!("the media encoded while every lane was held"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+    }
+    drop(held);
+    media.await.expect("the media encodes once a lane is free");
+}
+
 /// One exact Artifact file feeds native media, citations, a workspace, and
 /// Python code, all through the same authorized loader.
 ///

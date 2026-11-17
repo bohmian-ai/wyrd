@@ -893,6 +893,99 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
    alone. Benchmark observations are not test-first RED. TASK-013 retains the
    later full L2 mixed/control and 100-tenant claim fairness work.
 
+   Functional evidence, allocation review 5c9808411 remediation. Successor:
+   `d96c2ffda`; every GREEN below ran at that commit on 2026-11-17.
+   Managed-Postgres runs use
+   `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && <cmd>"`,
+   and journeys use `cargo nextest run --locked -p wyrd-testing --test oracle -P journey --run-ignored=all -E '<selector>'`.
+   - FIND-012-9 (`ab662d5ce`): `mise exec -- cargo clippy --locked -p wyrd-server --bin wyrd-server -- -D warnings`
+     is clean, so the server builds without test-support. Structural fix;
+     no RED applies.
+   - FIND-012-10 (`6e7db5c25`, `56b73dd1a`), scenarios 3/6:
+     - `resources::tests::governed_bifrost_memory_is_bifrost_demand_until_released`
+       and `resources::tests::a_lowered_bifrost_cap_redistributes_its_share`
+       (vala-bifrost-redux lib). Both were RED first: FAIL in 0.105 s and
+       0.106 s.
+     - `scribe::execution_lanes::tests::critical_pressure_refuses_fresh_ingress_but_drains_persistence`
+       (redux lib) was RED first.
+     - `pg_grpc_ingest_smoke::critical_pressure_refuses_public_appends_until_it_recovers`
+       (`-p wyrd-server --features test-support --test integration`, Postgres).
+       It is written after the Gate fix (TDD VIOLATED).
+     - Process deviation: `82281e287` refused at the Scribe ingress
+       without a diagnostician first. `56b73dd1a` moved the refusal to
+       Gate `ensure_open` so that accepted outbox deliveries keep
+       draining.
+   - FIND-012-11, scenarios 4/5 and AC-017:
+     - Checkpoint (`33734decf`):
+       `verification::state::tests::checkpoint_preparation_waits_for_a_shared_lane`
+       (`-p wyrd-server --features test-support --lib`, Postgres). RED first,
+       FAIL in 5.18 s.
+     - Gateway (`09d99d7e0`): `components::gateway::pg_invocation_tests::provider_attempts_run_on_shared_cpu_lanes_and_wait_off_them`
+       and `::relayed_stream_frames_wait_for_a_shared_cpu_lane`, which covers
+       the relay spawned through `Inherited`. Both were RED first.
+       - Diagnosis, relay test flake (diagnostician consulted). **Symptom:**
+         frames arrived while all lanes were meant to be held.
+         **Evidence:** the instrumented run showed `waiting=0 free=1`.
+         **Cause:** the hold loop raced the call's own laned poll for the
+         free lane. **Fix site:** the test now holds the free-lane count
+         captured before the call; production is unchanged.
+     - Remote Scribe fragment (`8edfe3169`): `peer_network::security::peer_context_refusals`
+       step `a_scribe_fragment_waits_for_a_shared_cpu_lane`. RED first:
+       "the Scribe fragment never queued for a held CPU lane" at
+       `security.rs:49`.
+     - Remote Analytical stage (`4148d1947`): `peer_network::analytical::remote_stages_wait_for_a_shared_cpu_lane`.
+       RED first: "no remote stage queued for a held CPU lane" at
+       `analytical.rs:36`. GREEN in 9.2 s, with `peer_context_refusals`
+       GREEN in 8.5 s. A stage with no verified tenant is refused rather
+       than run as no tenant.
+     - FAIL, unproven: no test drives cancellation of laned remote or
+       gateway work to show leases are released, and no test covers
+       substantial buffered decode.
+   - FIND-012-12 (`7d837d8d3`): `adapter::stream::tests::a_finished_stream_capture_stays_charged_while_its_content_lives`,
+     `::a_finished_media_capture_stays_charged_while_its_bytes_live`
+     (wyrd-gateway lib), and `components::gateway::pg_invocation_tests::captured_speech_stays_charged_until_its_capture_settles`.
+     All three were RED first, but the server test was written after the
+     fix (TDD VIOLATED).
+   - FIND-012-13 (`e6528d14a`): `components::gateway::pg_invocation_tests::buffered_answers_count_against_the_calling_workload`
+     and `::critical_pressure_pauses_gateway_calls_until_recovery`, which
+     were updated to keep the debit until the last `Bytes` reference drops.
+   - FIND-012-14 (`d07a054fb`): content inspection of the reconciled
+     owner paragraphs and rustdoc. Runtime proof does not apply.
+   - Diagnosis, `capacity::memory_refusal_preserves_oracle_health_and_next_query`,
+     which failed at `8edfe3169` without the Analytical change:
+     - **Symptom:** the refusal was `WYRD_VALA_504_QUERY_TIMEOUT`, not
+       the typed resource code.
+     - **Evidence:** trace line 1458 "new work waits for process pressure
+       to admit it", then `QueryTimeout` with a 504 after 30070 ms.
+     - **Cause** (two independent read-only Codex diagnosticians):
+       `6e7db5c25` counts the holders' governed bytes as Bifrost. Its
+       64 MiB headroom left the root 97.9% used, above the 95% contention
+       point (`workload.rs:524-553, 674-677`). So Oracle admission
+       (`oracle/mod.rs:2297-2303`) paused the query until its deadline,
+       as `wyrd-design.md` requires.
+     - **Fix site:** the journey's arithmetic (`d96c2ffda`). It now
+       leaves 256 MiB headroom, and the refused query reads 12 rows of
+       100 MB keys to stay within Arrow's 2 GiB string offsets. GREEN in
+       13.8 s.
+     - An intermediate 128 MiB attempt was miscomputed: it was still 95.8%
+       used.
+   - GREEN at `d96c2ffda`, every named test:
+     - Redux lib: 3 passed.
+     - Gateway lib: 2 passed.
+     - Server lib on Postgres: 6 passed.
+     - Server integration on Postgres: 1 passed.
+     - The journeys above passed on the same production code.
+   - Named regressions, each selected and passed:
+     `pg_verification_runtime::deadline_terminal_waits_for_started_host_work`
+     (3.2 s), `::held_persistence_bounds_queued_custody_by_claim_permits`
+     (3.1 s), `::two_replicas_claim_each_queued_run_exactly_once` (4.4 s).
+   - `mise run fmt:check`, `mise run lints` (exit 0, including workspace
+     and shipped-server clippy) and `git diff --check` are clean.
+   - L1 qualification not run: benchmarks are not authorized. Verification,
+     gateway and Bifrost L1 records remain required.
+   Status: OPEN. L1 qualification is pending, and FIND-012-11's
+   cancellation and buffered-decode proof is missing.
+
 ## Verification owners and commands
 
 Unit tests belong beside runtime/controller logic and existing Vala/gateway

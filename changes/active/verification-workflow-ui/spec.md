@@ -1,6 +1,6 @@
 ---
 id: SPEC-verification-workflow-ui
-revision: 3
+revision: 4
 status: approved
 ---
 
@@ -32,8 +32,9 @@ behavior; sample interactions do not add obligations.
 The approach builds shared UI components and adapters over existing Card,
 Bifrost and verification operations, then mounts them in the conventional UI
 and supported hosts. The server continues to own durable behavior. This packet
-adds no server fields, endpoints, query services, storage or execution logic.
-Costs are UI queries, adapters, presentation and real-server visual/journey proof;
+adds no server fields, endpoints, query services, storage or execution logic
+apart from REQ-015's status recording through the existing Scribe outbox.
+Costs are UI queries, adapters, presentation, status-event writes and real-server visual/journey proof;
 the prototype supplies none of that production evidence.
 
 ## Required behavior
@@ -76,7 +77,7 @@ read restrictions must be enforced by existing read/query authority before
 pagination and counts; a browser filter is never authorization. If an existing
 surface cannot supply a required authorized projection, record that precise
 external dependency and leave the affected work proposed rather than changing
-the server, relaxing access or fabricating records. Discovery must not enumerate
+the server beyond REQ-015, relaxing access or fabricating records. Discovery must not enumerate
 every execution in the browser or infer review membership.
 
 ### Inspect one workflow
@@ -212,6 +213,40 @@ unavailable without disabling general verification.
 
 ### Shared delivery and limits
 
+**REQ-015 — Retained queued lifecycle status.** The existing owner of each
+successfully committed queued execution transition stages one row to
+`bifrost.verification.execution_events` through the process Scribe outbox.
+Record claim as `running`, scheduled retry as `retrying`, deferred-input or
+approval park as `waiting`, completion as `completed`, terminal failure as
+`timed_out` or `errored`, and cancellation as `cancelled`. Principal cancellation
+records one row per affected execution, including the existing admission-time
+cancellation path. Initial pending work needs no event; ordinary release/defer
+after a claim records the resulting `pending` or `retrying` status. A rejected
+stale lease, rollback or repeated cancellation without a change records no event.
+
+Each row has `event = 'status'`, `status` exactly as
+`VerificationExecutionStatus` serializes, the affected execution/Verifier
+identities, event UUID and occurrence time. Preserve event identity and time
+through outbox retries. The existing required `sequence` is `0` and has no
+checkpoint meaning. All other nullable columns, including `value`, are null;
+normal managed tenant/subject/actor attribution remains. Discovery reads the
+newest status event per execution ordered by `occurred_at`, ignoring checkpoint
+and GitHub delivery rows. Equal-time selection is consumer-owned, without a
+new causal-order guarantee. Direct executions retain their existing behavior.
+
+Preserve completion's existing `complete_many` group commit and Scribe's
+ordinary shared-frame batching. Extend existing UPDATE results with `RETURNING`
+where needed for event identity/attribution; add no PostgreSQL statement, read
+query or round trip. Staging never waits for or fails the operation because of
+the status write. Checkpoints, revision fencing, queue/lease behavior and
+recovery are unchanged; recovery ignores status events. A row lost with its
+process may leave the list stale. No migration, table, column, endpoint,
+reconciliation or crash-durability guarantee is added. The
+[finalized status-event design](design/verify-status-events.md) records the
+selected implementation flow; TASK-003A supplies the server writes and TASK-003
+owns UI consumption. Failed-requirement IDs and Verifier-scoped viewers are
+outside this server supplement.
+
 **REQ-014 — Shared components and supported hosts.** Extend the existing
 pure-prop component/loader catalog, closed typed read contract, Node/MCP
 executors and host action intents. Conventional pages, gallery, custom
@@ -245,7 +280,8 @@ supply status/details/invocations/publications and authorized actions. The
 [finalized read map](design/contract-alignment-research.md) records inspected
 sources and the [source alignment](design/source-alignment.md) distinguishes
 source presence from integration into this UI checkout. Revision 3 records the
-user's 2026-11-12 agreement to this UI-only approach.
+user's 2026-11-12 agreement to this UI-only approach. Revision 4 adds only
+REQ-015's approved server status-event supplement.
 
 Native Repository, connection, admission, deferred input, approval and delivery
 remain external backend capabilities with their owning authority amendments.
@@ -269,8 +305,8 @@ enumerated above and was synchronized into the original packet on approval
 (2026-11-11): its REQ-018/026/027/029 entries, plan, TASK-007 and TASK-009 point
 here, and its retained Changes obligations are unchanged. Do not execute conflicting original tasks
 or mark the entire original Changes task superseded. Discovery/review-set UI queries and adapters belong to this packet over existing
-read surfaces. Server contract, engine and installation changes remain outside
-this packet; a missing input is an external dependency, not an implementation
+read surfaces. Apart from REQ-015's status recording, server contract, engine and
+installation changes remain outside this packet; a missing input is an external dependency, not an implementation
 assignment here.
 
 The following backend-owned authority amendments are dependencies of the tasks
@@ -294,7 +330,8 @@ its applicable current authority.
 |---|---|
 | 001 — Definition graph | Existing exact Card/Verifier definitions; complete against revision 2. |
 | 002 — Execution inspection | 001 graph; existing status, compact result, explicit details, invocation/publication/file/cancel operations and permitted Bifrost context queries. |
-| 003 — Verify discovery | 002 inspector; existing authorized accepted-execution/result data for bounded queries, counts and filters. Missing read coverage remains an external dependency; no server extension. |
+| 003 — Verify discovery | 002 inspector; 003A's retained queued status events; existing authorized accepted-execution/result data for bounded queries, counts and filters. Other missing read coverage remains an external dependency. |
+| 003A — Queued status events | Existing queue transition owners, completion group commit and process Scribe outbox; implements only REQ-015. |
 | 004 — Repositories/settings | 001/003 plus delivered connection/access and native Repository/selected-policy operations with owning authority. |
 | 005 — PR review sets | 002/003/004 plus actual accepted admission membership/history and confirmed same-commit request semantics. |
 | 006 — Waiting/approval | 002 plus delivered occurrence/wait/decision/readback/continuation operations and owning authority. |
@@ -330,8 +367,15 @@ not merely the existence of a route/component or a successful command.
 | AC-007 PR navigation | Admit multiple Verifiers together, rerequest on the same commit, then update the head. The general PR link follows the current set; explicitly selected history/execution stays exact. Membership and source/policy are server-recorded and no combined verdict appears. | 003,012 |
 | AC-008 Authorization and hosts | Exercise foreign IDs, restricted Verifier scopes, denied prerequisites and unavailable reads through the real supported HTTP/SDK/MCP and browser adapters. No foreign content/counts or follow-on sensitive reads appear; denial/unavailability never becomes empty success. Repeat affected reads/actions in supported host consumers. | 003,005,008–014 |
 | AC-009 Visual and development journey | Produce representative ordinary, session, drift, PR and approval executions through normal public development workflows; navigate Verify, Repositories and Settings in the real browser. Individually compare components/pages with the approved mock in both themes, narrow/wide layouts and keyboard/touch interaction. No inert fixture action or absent prerequisite is accepted as production completion. | 001,004,007,010–014 |
+| AC-010 Retained lifecycle events | Through real public SDK/server operations, cancel pending and running work, revoke a principal with multiple unfinished executions, and hold other work at running/retrying/input-wait/approval-wait before completion or timeout/error. Public Bifrost queries over `event = 'status'` return the expected newest words and specified row fields. Exercise ordinary release/defer returning to pending/retrying. Repeated cancellation, stale settlement and rollback add no event. Focused owner proof preserves grouped completion, shared status-row batching, attribution and retry identity; existing checkpoint recovery and tenant-isolation proof remains passing. | 015 |
 
 ## Approval and revision history
+
+Revision 4 records the user's explicit approval on 2026-11-16 of the status-event
+supplement and its proposed release/defer correction. It authorizes REQ-015 and
+AC-010 only as the exception to the earlier UI-only implementation boundary;
+checkpoints and recovery remain unchanged. TASK-003A implements the server part,
+and TASK-003 consumes its recorded rows.
 
 Revision 3 records the user's explicit agreement on 2026-11-12 to adapt the
 approved UI to existing reads and resource-scaling's compact/details split,
@@ -344,3 +388,4 @@ capability readiness is still checked per task; unavailable data is not invented
 | 1 | draft | Convert the finalized centralized design into one verification UI contract; align the dependency with backend revision 4 and explicitly bound the original UI scope transfer. Clarify the agreed charts, graph presentation, session return and drift-window highlight. |
 | 2 | approved (2026-11-11) | Separate UI specification approval from task-specific backend delivery; record the unconfirmed same-commit review-request input as a direct dependency of TASK-005. |
 | 3 | approved (2026-11-12) | Record the user-agreed UI-only implementation boundary: existing Card/Bifrost/domain reads, compact judgments and explicit details, unchanged task order, no new server APIs/fields/query services or runtime behavior. |
+| 4 | approved (2026-11-16) | Add REQ-015/AC-010: queued lifecycle status rows through the existing Scribe outbox, retaining completion group commit, shared batching and unchanged checkpoints/recovery. Include release/defer status recording; no migration, new endpoint, additional PostgreSQL statement or crash-durability guarantee. |

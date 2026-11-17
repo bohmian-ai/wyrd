@@ -3,12 +3,17 @@ id: TASK-003
 kind: implementation
 status: proposed
 spec: SPEC-verification-workflow-ui
-spec_revision: 3
+spec_revision: 4
 requirements: [REQ-001, REQ-002, REQ-003, REQ-014, AC-001, AC-008, AC-009]
-depends_on: [TASK-002]
+depends_on: [TASK-002, TASK-003A]
 ---
 
 # All-status discovery and the Verify dashboard
+
+Server input: [TASK-003A](TASK-003A-execution-status-events.md) supplies queued
+lifecycle status events through the existing Bifrost table under approved spec
+revision 4. UI consumption stays here; the historical revision-3 execution
+evidence below is preserved and is not proof of this new input's delivery.
 
 ## Outcome
 
@@ -71,11 +76,11 @@ states with the mock. Existing read permissions remain unchanged.
 
 ## Execution and verification
 
-This task is against approved spec revision 3, whose scope transfer is
+This task is against approved spec revision 4, whose scope transfer is
 synchronized. Activation requires only this task's named contract/authority
 and predecessor outputs. Unrelated backend delivery
 or authority amendments do not block it. This packet consumes existing read/action
-capabilities and adds no underlying server changes; a missing required capability
+capabilities, including TASK-003A's status events, and makes no server edits itself; a missing required capability
 remains an explicit external dependency. Record the integrated source revisions
 and actual dependency journeys it consumes; upstream task status is not proof.
 

@@ -2,6 +2,15 @@
 
 Status: finalized
 
+The approved UI design below is preserved. The user reopened only the server
+dependency for TASK-003: [record queued execution statuses](verify-status-events.md).
+The approved supplement adds status rows through the existing Scribe outbox; it leaves
+checkpoints, recovery, tables, endpoints and authorization unchanged. It is the
+sole exception to the earlier UI-only boundary below. Specification revision 4
+records the user's 2026-11-16 approval, including release/defer status recording.
+Earlier revision-3/UI-only statements below describe the preserved original
+scope and are qualified only by this supplement.
+
 The centralized visual design remains approved and `design/mock/` remains the
 sole approved mock. The user finalized the existing-read, UI-only approach on
 2026-11-12 and requested revised tasks. Specification revision 3 records that

@@ -1377,8 +1377,10 @@ pub struct ScribeResources {
 
 impl ScribeResources {
     /// The process workload manager whose CPU lanes Scribe's CPU pools
-    /// run their jobs on.
-    pub(crate) fn workloads(&self) -> &wyrd_runtime::resources::WorkloadManager {
+    /// run their jobs on, and a remote fragment the server executes for a
+    /// verified tenant polls on.
+    #[must_use]
+    pub fn workloads(&self) -> &wyrd_runtime::resources::WorkloadManager {
         self.governor.inner.process.workloads()
     }
 

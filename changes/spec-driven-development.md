@@ -24,6 +24,14 @@ design conversation instead of silently supplying them. If the approved
 contract changes, revise the spec and obtain renewed approval before affected
 work proceeds. Ordinary private coding choices remain implementation-owned.
 
+The approved spec defines each behavioral requirement once. Tasks reference
+those requirements and define scenarios that exercise them; implementation
+adds execution evidence to those scenarios. Review independently checks the
+requirements, scenario coverage, implementation, and evidence. Neither a task,
+a test, an implementation note, nor a review finding creates product authority.
+The maintainer initiates task and change reviews; implementation returns its
+result to the caller without launching a reviewer or an acceptance checker.
+
 Existing approved packets remain authoritative; do not manufacture retroactive
 design artifacts. Bounded direct instructions remain valid under
 [implementation execution](implementation-execution.md#change-contract).
@@ -56,6 +64,11 @@ provenance ledger is required. A useful improvement or conceivable failure
 mode alone does not authorize an obligation. Keep optional proposals outside
 requirements until agreed.
 
+Resolve inferred behavioral promises during specification, before approval.
+Planning and implementation may derive scenarios needed to prove an existing
+promise, but may not infer additional promises from an outcome label. Cite
+the existing requirement or governing authority for a discovered coverage gap.
+
 Planning may decompose approved obligations and identify their necessary work;
 it may not add guarantees, supported cases, interfaces, operational features or
 acceptance obligations. Newly discovered material needs return to design, then
@@ -72,6 +85,18 @@ correctly; report unrelated documentation drift separately.
 Stop elaborating when the agreed outcome, affected owner, material constraints
 and credible verification are clear. Do not fill categories, templates or
 scenario lists with additional scope.
+
+### Ambiguous wording
+
+Consult the approved spec and owning authority first. Resolve reversible
+private coding choices autonomously. If reasonable interpretations change
+observable behavior, required coverage, or a material boundary, report the
+exact wording, competing interpretations, and smallest decision needed to the
+caller; continue unaffected work. Correct unclear task wording through
+`wyrd-plan` when the approved behavior is settled. An unresolved ambiguity in
+approved behavior requires `SPEC_REVISION_REQUIRED` and explicit clarification
+and approval through `wyrd-spec`. Repair wording at its source; do not preserve
+a competing interpretation in an implementation ledger or review finding.
 
 ## Write for maintainer approval
 
@@ -269,6 +294,13 @@ Describe each promise once. Add definitions, alternatives, detailed contracts
 or rationale only when they explain an actual material choice. Record material
 revisions briefly and identify unresolved material decisions in drafts.
 
+For each behavioral requirement, state the relevant starting conditions, actor
+or trigger, and observable result or state transition. Include failure behavior
+and prohibited side effects where they are part of the agreement. Define
+material terms such as completion or visibility; do not substitute an outcome
+label such as "supports retries" for a promise a scenario can falsify.
+Acceptance observations reference requirements rather than redefining them.
+
 Address failure and edge behavior, security, tenancy, durability, performance,
 compatibility, concurrency and persistent formats only where the change affects
 them. Touching an area does not authorize new guarantees for it. Use the
@@ -333,11 +365,19 @@ Use the smallest readable structure and enough of the agreed approach to
 execute without rediscovering the solution. Order behavioral acceptance
 scenarios for test-first implementation, beginning with the smallest observable
 behavior and then adding required variants and failure cases. Each scenario
-states its trigger, expected observation, and the missing behavior that should
-make its test fail before production changes. A scenario is one test-first
-cycle, not a separate task. Leave exact new test names, private mechanics and
-useful refactoring to implementation. Static or already-correct behavior needs
-appropriate proof, not manufactured tests.
+references its approved requirement or governing authority and states:
+
+- starting state and real input, with its source;
+- actor and action or trigger;
+- expected result or state transition, and required absence of side effects;
+- the test owner, tier, and actual consumer path exercised; and
+- the missing behavior that should make the test fail before production changes.
+
+Include these details only as needed to make the scenario unambiguous. A
+scenario is one test-first cycle, not a separate task or new requirement.
+Leave exact new test names, private mechanics and useful refactoring to
+implementation. Static or already-correct behavior needs appropriate proof,
+not manufactured tests.
 
 Maintain one acceptance list through planning and implementation. Implementers
 add proof references and results to its existing entries, preserving required
@@ -345,6 +385,12 @@ cases without repeating the contract in an obligations ledger or a second
 evidence table. Older packets may use their existing proof rows or bullets
 without a rewrite. Record shared proof and commands once and reference them
 from the entries they cover.
+
+The scenario's expected behavior remains fixed while its evidence is added.
+Record the actual assertion location, focused command, observed RED failure,
+GREEN result, and material limitations. If an existing requirement lacks a
+necessary scenario, add the scenario with that requirement reference; do not
+invent a requirement ID or rewrite the promise to match the implementation.
 
 Proof exercises actual inputs and demonstrates the promised outputs. At
 connected boundaries it establishes that the downstream consumer uses the
@@ -359,9 +405,10 @@ aggregates run on the integrated candidate at change review.
 
 Task status moves through `proposed`, `ready`, `in_progress`, `review`, and
 `complete`; use `superseded` when an approved spec revision or replacement task
-invalidates it. Review phases remain read-only. The caller or active execution
-harness records a task-review verdict in the active packet or delivery system
-when that durability is needed.
+invalidates it. Reviews keep the candidate source, requirements, and scenario
+expectations immutable; reviewers may write reports and remediation tasks in
+the review directory. The caller or active execution harness records the
+task-review verdict in the active packet or delivery system when needed.
 
 ## Reuse evidence and task conflicts
 
@@ -425,6 +472,10 @@ violation; preserve it in the implementation handoff and task-review verdict.
 
 ## Review and remediation
 
+The maintainer initiates review, directly or through an explicit instruction to
+an orchestrator. Implementers and reviewers return results to the caller;
+neither automatically launches the next implementation or review phase.
+
 Pre-implementation task readiness and post-implementation task correctness are
 different reviews.
 
@@ -434,28 +485,47 @@ Task readiness reviews one or more proposed tasks and returns `READY`,
 Task review inspects one immutable cumulative task candidate against the
 approved spec, original task, all remediation tasks, and available evidence. It
 returns `PASS`, `FIX_REQUIRED`, `SPEC_REVISION_REQUIRED`, or `BLOCKED`.
+Check assigned spec requirements independently of the task's scenario list,
+then check scenario coverage, implementation correctness, and evidence strength
+separately. Passing planned tests cannot excuse an omitted requirement.
+Keep one primary reviewer and an independent coverage/finding validator for
+the first review, with specialists for affected boundaries. Focus remediation
+review on closure and affected paths; preserve independent validation of any
+new finding. See `wyrd-task-review` for delegation and report details.
 The first review covers the complete base-to-candidate range. Post-remediation
 review checks finding closure, the latest fix diff, and affected paths against
 the original task, retaining the cumulative candidate as context. Carry forward
 source-backed evidence for unchanged behavior unless changed dependencies,
 authority, or new evidence invalidate it; record why any area is reopened.
 
-A blocker requires an explicit obligation or supported-use regression, a
-source-proven failing scenario, and a material consequence, or an explicit
-mandatory repository-gate violation. Reachability alone is insufficient.
+A blocking finding requires an explicit requirement, governing authority, or
+supported-use regression, a concrete scenario, and a material consequence, or
+an explicit mandatory repository-gate violation. Distinguish a source-proven
+implementation defect from an evidence gap: missing proof does not establish
+that the code is wrong, but required behavior without credible proof cannot
+pass. A contract ambiguity requires clarification, not the reviewer's chosen
+semantics. Reachability alone is insufficient.
 Corrections must justify their implementation and maintenance burden against
 deletion, reuse, and smaller alternatives without weakening required safety
 boundaries. After two unsuccessful remediation reviews, assess convergence
 and set the next bounded scope; do not restart the full audit automatically
 or grant an automatic PASS.
 
-Every actionable finding has a stable ID, exact location, mapped spec and task
-obligations, reachable scenario, concrete consequence, required outcome, and
-supporting evidence. A finding is not new product authority.
+Every actionable finding has a stable ID, exact location, mapped requirement
+or authority, starting conditions and trigger, expected behavior, actual
+behavior or missing proof, concrete consequence, and supporting evidence.
+A review matrix records the verdict against existing requirement and scenario
+references; it is not another requirements ledger. Behavioral claims require
+appropriate executable evidence; source inspection may establish structural
+constraints. A finding is not new product authority.
 
 `wyrd-task-review` packages validated `FIX_REQUIRED` findings into the minimum
-cohesive remediation task and routes it directly to `wyrd-implement`. If the required outcome changes the approved behavior or a
-material constraint, route it to `SPEC_REVISION_REQUIRED` instead.
+cohesive remediation task and returns it to the caller for `wyrd-implement`.
+An implementation defect needs a correction at its owner; an evidence gap may
+need only a test or valid execution evidence. If the required outcome changes
+approved behavior or a material constraint, or that behavior is ambiguous,
+return `SPEC_REVISION_REQUIRED` instead. Never prescribe production churn or
+historical RED evidence to repair a TDD execution-order violation.
 
 ## Final change verification
 

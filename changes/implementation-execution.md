@@ -53,6 +53,12 @@ Use the task's existing acceptance entries as the live checklist and evidence
 record until every required outcome and proof is complete. Do not create a
 second obligations ledger or evidence table.
 
+Requirements remain defined in the approved spec. Task scenarios exercise
+them; implementation only adds evidence and source-backed coverage corrections.
+Preserve the expected behavior when recording results. Follow
+[ambiguous wording](spec-driven-development.md#ambiguous-wording) rather than
+guessing, omitting behavior, or introducing another promise.
+
 Do not require the task to predict helpers, private methods, local module
 structure, exact control flow, already-approved dependency APIs, test fixture
 structure, or other reversible choices. The implementation agent owns them.
@@ -104,7 +110,8 @@ Stop before implementation when correctness requires:
 - changing requirements or acceptance outcomes.
 
 Report repository evidence, why no in-scope solution remains, and the exact
-authority required to resume.
+authority required to resume. Return `SPEC_REVISION_REQUIRED` when approved
+behavior needs clarification or correctness requires a new material decision.
 
 ## Execution record
 
@@ -117,7 +124,9 @@ The execution record may append or correct:
 - progress, failures, and evidence.
 
 Update the existing acceptance entries with proof references and results.
-Record shared commands once. Add a short note for a material failure, bounded
+Include actual assertion locations, focused commands, observed RED failures,
+GREEN results, and material limitations. Record shared commands once.
+Add a short note for a material failure, bounded
 correction or deviation: affected criterion, repository evidence, action and
 verification result. Do not narrate routine implementation or repeat the
 contract, file list or test inventory already visible in the task and diff.
@@ -141,9 +150,12 @@ Use this order:
 6. If the failure is outside the diff, diagnose and fix it at its owner. A
    failure you did not cause is still yours; never spend effort proving it
    predates the change.
-7. If a material change or unavailable external authority is required, finish
-   unaffected work and return `BLOCKED`.
-8. Otherwise continue localization and diagnosis.
+7. If approved behavior needs clarification or a material change is required,
+   finish unaffected work and return `SPEC_REVISION_REQUIRED`.
+8. If necessary access or external authority is unavailable, or contradictory
+   task mechanics prevent an in-scope solution under settled approved behavior,
+   finish unaffected work and return `BLOCKED` with the precise impediment.
+9. Otherwise continue localization and diagnosis.
 
 Compiler, test, formatter, Clippy, rustdoc, process, or tool failures are
 diagnostic results. They do not terminate execution by category.
@@ -239,8 +251,9 @@ Lane selection, the `gate` aggregate rule, feature selection, and sequential
 Cargo use are in [`TESTING.md`](../TESTING.md#which-lane-do-i-run).
 
 A red lane blocks completion whoever turned it red. If its fix needs a
-material change, return `BLOCKED` with the diagnosis after every unaffected
-item is complete.
+material change, return `SPEC_REVISION_REQUIRED` with the diagnosis after every
+unaffected item is complete. Use `BLOCKED` only for unavailable access or
+authority, or contradictory task mechanics under settled approved behavior.
 
 ## Final diff audit
 
@@ -265,9 +278,19 @@ verification, a clean diff audit, and recorded bounded corrections.
 
 Implementation is not task completion. The task completes only after an
 independent `$wyrd-task-review` returns `PASS`.
+Return implementation evidence to the caller. Do not spawn reviewers or
+acceptance checkers, invoke task/change review, or automatically hand the
+candidate to a review workflow. The maintainer initiates reviews. External
+read-only diagnosticians may investigate concrete implementation failures;
+they return causes and fix sites, not acceptance verdicts.
 
-`BLOCKED` requires evidence that no in-scope solution remains without a
-material decision or genuinely unavailable authority. Difficulty, elapsed
+`SPEC_REVISION_REQUIRED` means approved behavior needs clarification or
+correctness requires a new material decision. Name the contract or boundary
+affected and the exact decision needed.
+
+`BLOCKED` requires evidence that no in-scope solution remains because necessary
+access or external authority is unavailable, or contradictory task mechanics
+need correction under settled approved behavior. Difficulty, elapsed
 time, partial progress, context compaction, a recoverable command failure,
 missing repository-managed setup, or a convenient handoff point do not qualify.
 

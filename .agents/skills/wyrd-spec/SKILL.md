@@ -42,7 +42,7 @@ the agreed solution needs a new material decision, return the specific question
 to design. Do not independently select a different public surface, ownership
 boundary or implementation approach while converting the design.
 
-## Specify the outcome
+## Declare observable behavior
 
 Write `changes/active/<slug>/spec.md` on the caller's change branch. Keep spec
 ID, revision, and `draft | approved | superseded` status. Default to:
@@ -51,6 +51,14 @@ ID, revision, and `draft | approved | superseded` status. Default to:
 - required behavior, scope and exclusions;
 - applicable constraints and material decisions; and
 - acceptance observations: the situation exercised and expected result.
+
+An outcome explains why the change matters; requirements define how the
+system behaves. For each behavioral promise, state the relevant starting
+conditions, actor or trigger, and observable result or state transition.
+Include agreed failure behavior and prohibited side effects where relevant.
+Define material terms; "supports retries" or "completes successfully" alone
+does not establish a falsifiable requirement. Resolve inferred behavioral
+promises here before approval, never during implementation.
 
 Link the finalized design and relevant supplements. Summarize the agreed
 implementation flow and why it delivers the outcome; keep supporting research
@@ -62,6 +70,12 @@ promise once; acceptance may reference it without repeating it. Link relevant
 authority rather than restating repository policy as new change requirements.
 Add alternatives, detailed contracts, definitions, or decision rationale only
 when they explain an actual material choice. Record material revisions briefly.
+
+This spec is the single definition of the change's behavioral requirements.
+Plans define executable scenarios against its IDs; implementations add evidence;
+reviews assess both coverage and correctness. None may create another contract.
+Apply the shared ambiguous-wording rule: settle materially different readings
+with the user and repair the source wording before seeking approval.
 
 Address failure and edge behavior, security, tenancy, durability, performance,
 compatibility, concurrency and persistent formats only where the change affects

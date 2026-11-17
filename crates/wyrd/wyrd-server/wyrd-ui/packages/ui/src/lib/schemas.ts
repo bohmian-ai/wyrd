@@ -204,9 +204,7 @@ const SPAN_FILTERS = [
  * `completed`, `cancelled`, `timed_out` or `errored`) and `pending` before
  * any; a status row lost with its process leaves the older one standing. A
  * direct execution is never queued: `completed` once its result is visible,
- * else `not recorded`. `repository` and `pull_request` are the provider
- * repository id and pull request number a `pull_request` execution was
- * admitted for, null for every other origin.
+ * else `not recorded`.
  */
 // Every read of this population binds its range first, so `$1` here is the range start. An execution's
 // states and result are recorded after its input, so the joins read from that start on, with an hour of
@@ -217,9 +215,6 @@ const EXECUTIONS =
   '(SELECT i.execution_id, i.recorded_at, i.verifier_card_uid, i.binding_id, i.group_id, i.origin, i.run_id, ' +
   'i.subject_kind, i.subject_name, i.subject_version, i.subject_card_uid, i.workload_card_uid, i.service_name, i.service_version, i.deployment_environment, ' +
   'r.result_id, r.verdict, r.ended_at, ' +
-  // A pull request execution's input record is its frozen source pins; any other origin's holds caller inputs of any name.
-  "CASE WHEN i.origin = 'pull_request' THEN i.inputs ->> 'repository_id' END AS repository, " +
-  "CASE WHEN i.origin = 'pull_request' THEN i.inputs ->> 'number' END AS pull_request, " +
   "CASE WHEN i.origin = 'direct' THEN CASE WHEN r.result_id IS NOT NULL THEN 'completed' ELSE 'not recorded' END ELSE coalesce(q.status, 'pending') END AS status " +
   'FROM bifrost.verification.execution_inputs i ' +
   // Rows of one instant have no recorded order; the event id only makes the choice repeatable.
@@ -279,7 +274,7 @@ export const SIGNALS = {
     columns: ['recorded_at', 'verifier_card_uid', 'subject_name', 'run_id', 'group_id', 'service_name', 'status', 'verdict'],
     filters: [
       'status', 'verdict', 'verifier_card_uid', 'service_name', 'subject_name', 'run_id', 'group_id', 'origin', 'binding_id', 'subject_kind', 'subject_version',
-      'subject_card_uid', 'workload_card_uid', 'service_version', 'deployment_environment', 'execution_id', 'result_id', 'repository', 'pull_request'
+      'subject_card_uid', 'workload_card_uid', 'service_version', 'deployment_environment', 'execution_id', 'result_id'
     ],
     more: ['ended_at']
   }

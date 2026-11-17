@@ -301,7 +301,7 @@ export const KEY_COLUMNS: Record<Signal, readonly string[]> = {
   spans: ['trace_id', 'span_id', 'parent_span_id'],
   logs: ['trace_id', 'span_id', 'observed_time_unix_nano', 'wyrd_request_id', 'severity_number'],
   metrics: [],
-  executions: ['execution_id']
+  executions: ['execution_id', 'subject_kind', 'subject_version', 'subject_card_uid', 'result_id', 'binding_id', 'workload_card_uid']
 };
 
 /** The columns a signal list shows. */
@@ -1272,8 +1272,6 @@ const LABELS: Readonly<Record<string, string>> = {
   group_id: 'Session',
   binding_id: 'Binding',
   origin: 'Origin',
-  repository: 'Repository',
-  pull_request: 'Pull request',
   status: 'Status',
   verdict: 'Verdict',
   execution_id: 'Execution',

@@ -1353,6 +1353,9 @@ judged('Verify lists executions with and without a recorded result as one author
       for (const id of [refused, agreed, drifted, session.execution_id, running]) {
         const [live] = await direct.run([{ op: 'verification.get_execution', execution_id: id }]);
         expect(live.ok && [live.value.status, live.value.result?.outcome.verdict, live.value.result?.verifier.uid], surface).toEqual([row(id).status, row(id).verdict, row(id).verifier_card_uid]);
+        // The row also carries the exact subject Card and the identity of its selected result.
+        expect(live.ok && live.value.result?.subject.uid, surface).toBe(row(id).subject_card_uid);
+        expect(row(id).result_id, surface).toEqual(expect.any(String));
       }
       const [cancelled] = await direct.run([{ op: 'verification.get_execution', execution_id: stopped }]);
       expect(cancelled.ok && cancelled.value.status, surface).toBe('cancelled');
@@ -1566,20 +1569,20 @@ deferred('Verify lists an execution waiting for deferred evidence by its recorde
   await vi.waitFor(
     async () => {
       server.flushBifrost();
-      const loaded = await loadRecordTable({ signal: 'executions', columns: ['execution_id', 'status', 'verdict', 'pull_request'], where: [{ column: 'status', value: 'waiting' }] }, context);
+      const loaded = await loadRecordTable({ signal: 'executions', columns: ['execution_id', 'status', 'verdict'], where: [{ column: 'status', value: 'waiting' }] }, context);
       rows = loaded.result.state === 'populated' ? loaded.result.data.rows.rows : [];
       expect(rows).toHaveLength(1);
     },
     { timeout: 30_000, interval: 500 }
   );
-  const [[id, status, verdict, pullRequest]] = rows;
-  expect([status, verdict, pullRequest]).toEqual(['waiting', null, '7']);
+  const [[id, status, verdict]] = rows;
+  expect([status, verdict]).toEqual(['waiting', null]);
   // The list's status is the one the execution's own exact read reports, with the input it waits for.
   const [live] = await context.executor.run([{ op: 'verification.get_execution', execution_id: id as string }]);
   expect(live.ok && [live.value.status, live.value.waiting]).toEqual(['waiting', ['ci']]);
 });
 
-reviewed('Verify lists pull request executions by their recorded repository and number', async ({ server }) => {
+reviewed('Verify lists pending work admitted for a pull request by its recorded status', async ({ server }) => {
   // The tenant connects installation 101 and declares the review policy of its repository `acme/api` (provider id 1).
   const github = server.githubApp;
   const admin = await connectGithub(server);
@@ -1590,46 +1593,31 @@ reviewed('Verify lists pull request executions by their recorded repository and 
   copyFileSync(join(checkout, 'policies/minimal.toml'), join(checkout, 'wyrd.toml'));
   await (await Cards.connect({ client: admin })).declareFromPath(join(checkout, 'wyrd.toml'));
 
-  // Pull request 7 opens and is then pushed to, which supersedes its first execution; pull request 8 opens.
-  const deliver = (number: number, action: string) => expect(github.deliverPullRequest(server.baseUrl, 101, 1, number, action)).toBe(202);
+  // The pull request opens and is then pushed to, which supersedes its first execution. This deployment runs no Verifier, so the second stays pending.
   github.setPullRequest(1, 7, 'b1', 'a1');
-  deliver(7, 'opened');
+  expect(github.deliverPullRequest(server.baseUrl, 101, 1, 7, 'opened')).toBe(202);
   github.setPullRequest(1, 7, 'b1', 'b2');
-  deliver(7, 'synchronize');
-  github.setPullRequest(1, 8, 'b1', 'c1');
-  deliver(8, 'opened');
+  expect(github.deliverPullRequest(server.baseUrl, 101, 1, 7, 'synchronize')).toBe(202);
 
   const context = { executor: nodeExecutor(admin), range: { from: new Date(Date.now() - 3_600_000).toISOString(), to: new Date(Date.now() + 60_000).toISOString() } };
-  const named = (read: QueryResult) => read.rows.map((row) => Object.fromEntries(read.columns.map((column, at) => [column.name, row[at]])));
   const list = async (where: { column: string; value: string }[]) => {
-    const loaded = await loadRecordTable({ signal: 'executions', columns: ['recorded_at', 'origin', 'repository', 'pull_request', 'status', 'verdict'], where }, context);
-    return loaded.result.state === 'populated' ? named(loaded.result.data.rows) : [];
+    server.flushBifrost();
+    const loaded = await loadRecordTable({ signal: 'executions', columns: ['origin', 'status', 'verdict'], where }, context);
+    if (loaded.result.state !== 'populated') return [];
+    const { columns, rows } = loaded.result.data.rows;
+    return rows.map((row) => Object.fromEntries(columns.map((column, at) => [column.name, row[at]])));
   };
 
-  // Both executions of pull request 7 are listed with their recorded repository and number: the superseded one cancelled, its successor pending.
-  let seventh: Record<string, unknown>[] = [];
-  await vi.waitFor(
-    async () => {
-      server.flushBifrost();
-      seventh = await list([{ column: 'pull_request', value: '7' }]);
-      expect(seventh.map((row) => row.status).sort()).toEqual(['cancelled', 'pending']);
-    },
-    { timeout: 30_000, interval: 500 }
-  );
-  for (const row of seventh) expect(row).toMatchObject({ origin: 'pull_request', repository: '1', pull_request: '7', verdict: null });
+  // The superseded execution is listed as cancelled and its successor as pending, neither with a verdict.
+  await vi.waitFor(async () => expect((await list([])).map((row) => [row.status, row.verdict]).sort()).toEqual([['cancelled', null], ['pending', null]]), { timeout: 30_000, interval: 500 });
 
-  // The filters combine, and the pending row is the execution its own exact read describes.
-  const [pending] = await list([{ column: 'pull_request', value: '7' }, { column: 'status', value: 'pending' }]);
+  // The pending row is the execution its own exact read describes.
+  const [pending] = await list([{ column: 'status', value: 'pending' }]);
+  expect(pending.origin).toBe('pull_request');
   const [live] = await context.executor.run([{ op: 'verification.get_execution', execution_id: pending.execution_id as string }]);
-  expect(live.ok && [live.value.status, live.value.pull_request?.number, live.value.pull_request?.repository_id, live.value.pull_request?.head.sha]).toEqual(['pending', 7, '1', 'b2']);
-  expect(await list([{ column: 'repository', value: '1' }, { column: 'pull_request', value: '9' }])).toEqual([]);
+  expect(live.ok && live.value.status).toBe('pending');
   // Status and verdict combine: unfinished work has no verdict, so pending work that passed matches nothing.
   expect(await list([{ column: 'status', value: 'pending' }, { column: 'verdict', value: 'passed' }])).toEqual([]);
-
-  // The facets count the same three executions by repository and by pull request.
-  const rail = await loadFacetRail({ signal: 'executions', facets: ['repository', 'pull_request', 'origin'] }, context);
-  if (rail.result.state !== 'populated') throw new Error(JSON.stringify(rail.result));
-  expect(rail.result.data.facets.map((facet) => facet.values.rows)).toEqual([[['1', 3]], [['7', 2], ['8', 1]], [['pull_request', 3]]]);
 });
 
 /** The `coding-verifier` statement every request of its `spans-reviewed` check carries. */

@@ -888,6 +888,67 @@ mod tests {
         assert!(poll_once(busy_next.as_mut()).is_pending());
     }
 
+    /// Within one workload, a tenant's running lease counts as service, and
+    /// a tenant returning from idle is rebased to its workload's tenant
+    /// service floor, so neither a long lease nor idle time wins lanes.
+    ///
+    /// # Panics
+    /// Panics when a tenant with a long running lease, or a returning tenant
+    /// on idle credit, wins the next lane.
+    #[tokio::test(start_paused = true)]
+    async fn tenant_service_counts_running_leases_and_rebases_returning_tenants() {
+        let lanes = CpuLanes::new(2);
+        let long = context(Workload::Verification, Some(DataTenantId::new_v7()));
+        let short = context(Workload::Verification, Some(DataTenantId::new_v7()));
+        let other = context(Workload::Verification, Some(DataTenantId::new_v7()));
+        let _long_running = lanes.acquire(long).await;
+        let held = lanes.acquire(other).await;
+        let mut first = pin!(lanes.acquire(short));
+        queue(first.as_mut());
+        tokio::time::advance(Duration::from_secs(2)).await;
+        drop(held);
+        let first = granted(first.as_mut(), "the short tenant has no service yet");
+        let mut next_short = pin!(lanes.acquire(short));
+        queue(next_short.as_mut());
+        let mut next_long = pin!(lanes.acquire(long));
+        queue(next_long.as_mut());
+        tokio::time::advance(Duration::from_secs(3)).await;
+        drop(first);
+        let _next = granted(
+            next_short.as_mut(),
+            "3s served beats the long tenant's 5s still running",
+        );
+        assert!(poll_once(next_long.as_mut()).is_pending());
+
+        let lanes = CpuLanes::new(1);
+        let steady = context(Workload::Verification, Some(DataTenantId::new_v7()));
+        let returning = context(Workload::Verification, Some(DataTenantId::new_v7()));
+        let lease = lanes.acquire(returning).await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        drop(lease);
+        let lease = lanes.acquire(steady).await;
+        tokio::time::advance(Duration::from_secs(30)).await;
+        drop(lease);
+
+        let running = lanes.acquire(steady).await;
+        let mut next_steady = pin!(lanes.acquire(steady));
+        queue(next_steady.as_mut());
+        let mut back = pin!(lanes.acquire(returning));
+        queue(back.as_mut());
+        tokio::time::advance(Duration::from_secs(5)).await;
+        drop(running);
+        let returned = granted(
+            back.as_mut(),
+            "rebased to 30s, the returning tenant is below 35s",
+        );
+        let mut again = pin!(lanes.acquire(returning));
+        queue(again.as_mut());
+        tokio::time::advance(Duration::from_secs(10)).await;
+        drop(returned);
+        let _next_steady = granted(next_steady.as_mut(), "40s rebased beats 35s");
+        assert!(poll_once(again.as_mut()).is_pending());
+    }
+
     /// A nested laned poll inherits its parent's lane and context instead of
     /// deadlocking on a second permit, and work pending on memory holds no
     /// lane, so another workload runs meanwhile.

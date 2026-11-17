@@ -319,6 +319,18 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
    Added after the behaviour (TDD VIOLATED for that assertion). GREEN:
    `mise exec -- cargo nextest run --locked -p wyrd-runtime --lib -E 'test(/resources::workload::tests::/)'`
    (6 passed).
+
+   Second check, closed:
+   - **Recovery boundary:** `borrowing_contention_and_recovery_follow_samples`
+     now recovers at q=0.90 exactly, not 0.89. Mutation `q < RECOVERED`
+     fails it.
+   - **All workloads at or below target:** new
+     `at_target_workloads_yield_the_largest_cancellable_victim`. It
+     selects the largest cancellable operation across workloads and skips
+     a larger uncancellable one. Mutations fail it: dropping the fallback,
+     and treating uncancellable work as eligible.
+   - Both were written after the behaviour (TDD VIOLATED). GREEN with the
+     workload command (8 passed).
    Status: PASS.
 
 4. **CPU lanes and tenant service — REQ-019,022; AC-017.** Runtime unit tests
@@ -360,6 +372,14 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
      leaves the one lane free, and other work runs on it.
    - Both were written after the behaviour (TDD VIOLATED). GREEN with the
      workload command in scenario 3 (6 passed).
+   - Tenant level: new
+     `tenant_service_counts_running_leases_and_rebases_returning_tenants`.
+     Within one workload, a tenant's running lease counts as service, and
+     a returning tenant is rebased to the tenant floor. Mutations fail it:
+     dropping tenant running service, and skipping the tenant rebase.
+     Written after the behaviour (TDD VIOLATED). GREEN:
+     `mise exec -- cargo nextest run --locked -p wyrd-runtime --lib -E 'test(/resources::lanes::tests::/)'`
+     (11 passed).
    Status: PASS.
 
 5. **Actual execution hooks — REQ-022,024; AC-017.** Bifrost integration tests

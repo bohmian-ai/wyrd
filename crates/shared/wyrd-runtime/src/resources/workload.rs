@@ -851,16 +851,16 @@ mod tests {
             "critical stops all new work"
         );
 
-        held.shrink(110);
+        held.shrink(100);
         assert_eq!(
             workloads.sample(0).state,
             PressureState::Contended,
-            "q=0.89 once"
+            "q=0.90 once"
         );
         assert_eq!(
             workloads.sample(0).state,
             PressureState::Normal,
-            "q=0.89 twice"
+            "q=0.90 twice: the boundary is inclusive"
         );
         assert!(starts_now(&workloads, Workload::Gateway, None));
         drop((held, gateway, verification));
@@ -1068,6 +1068,45 @@ mod tests {
         assert!(small.is_cancelled(), "reassessed on the next sample");
         assert!(!other.is_cancelled(), "gateway is below its target");
         drop((held, acknowledged, largest, smaller, gateway));
+    }
+
+    /// With every workload at or below its target, the victim is the largest
+    /// cancellable attributable operation of any workload; a larger
+    /// uncancellable one is never chosen.
+    ///
+    /// # Panics
+    /// Panics when another operation is selected or none is.
+    #[test]
+    fn at_target_workloads_yield_the_largest_cancellable_victim() {
+        let (memory, workloads) = manager();
+        let verification =
+            workloads.begin(Workload::Verification, None, Some(CancellationToken::new()));
+        let gateway = workloads.begin(Workload::Gateway, None, Some(CancellationToken::new()));
+        let durable = workloads.begin(Workload::Bifrost, None, None);
+        let held = [
+            hold(&memory, &verification, 200),
+            hold(&memory, &gateway, 300),
+            hold(&memory, &durable, 400),
+        ];
+        let mut control = Control::default();
+        let mut usage = [0; 3];
+        for (workload, used, target) in [
+            (Workload::Verification, 200, 300),
+            (Workload::Gateway, 300, 300),
+            (Workload::Bifrost, 400, 400),
+        ] {
+            usage[workload.index()] = used;
+            control.targets[workload.index()] = Some(target);
+        }
+
+        let victim = select_victim(&control, usage, &workloads.live_operations())
+            .expect("a cancellable operation is selected");
+        assert!(
+            Arc::ptr_eq(&victim, &gateway.shared),
+            "the largest cancellable operation: {:?}",
+            victim.context
+        );
+        drop((held, verification, gateway, durable));
     }
 
     /// Laned work waiting for admission holds no CPU lane, so the lane runs

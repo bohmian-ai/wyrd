@@ -231,6 +231,32 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
      ledger room left. Raw-ledger occupation stays for the isolated refusal
      tests.
 
+   Independent check (fresh read-only checker, task file plus diff):
+   - Unproved cases:
+     - 100 ms telemetry coalescing (`TELEMETRY_INTERVAL`) has no in-repo
+       test.
+     - Samples arriving during a held turn are proved only in the Monty fork.
+     - Cancelled owners never becoming zero usage has no case.
+     - Raw media buffers charged through their real lifetime: the media test
+       sets `peak = encoded` and uses a fake reader, not a hosted media path.
+     - The result precharge removal in `runner.rs::conclude` is proved by
+       source only.
+     - The `Sandbox::exec` stack-overflow fix has no regression test.
+     - `stale_worker_telemetry_stops_new_work_without_freeing_usage` reaches
+       staleness on a 500 ms wall clock, not a sample clock.
+   - Commands missing for "vala-verify: 114 passed" and "state and outbox
+     unit tests: 39 passed".
+   - The fork, the 1.1→1.6 upgrade and `libmimalloc-sys` rest on the
+     recorded maintainer decision, not on revision 16 text.
+   - TDD VIOLATED, previously unmarked:
+     - `stale_worker_telemetry_stops_new_work_without_freeing_usage`;
+     - the rewritten `sandbox_reuses_processes_with_fresh_tenant_sessions`,
+       `suspended_sessions_release_runnable_capacity` and
+       `failed_workers_settle_before_capacity_returns`;
+     - `bound_media_holds_only_its_guard_through_the_call`;
+     - the repaired `busy_queued_execution_is_deferred_until_capacity_frees`.
+   Status: FAIL (the unproved cases above).
+
 3. **Capacity, sharing and pressure transitions — REQ-020,021; AC-016.** Runtime
    tests use the agreed P/H/M and q=max(L/M,A/P), unequal demand/local caps and
    multiple tenants. One workload borrows idle capacity without charged floors;
@@ -249,6 +275,10 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
    - `paused_admission_starts_after_recovery`.
 
    RED: all 5 failed on behavior assertions against the stub controller. GREEN: R1. TDD: PASS.
+
+   Independent check: `paused_admission_starts_after_recovery` documents
+   that a dropped waiter withdraws its demand but does not assert it.
+   Status: FAIL (that assertion).
 
 4. **CPU lanes and tenant service — REQ-019,022; AC-017.** Runtime unit tests
    submit controlled jobs from multiple tenants/workloads. Show C managed lanes,
@@ -274,6 +304,15 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
    TDD: VIOLATED for the cancellation sub-case. The withdraw logic preceded its test, so that test passed on first run.
 
    "No lane while awaiting memory/downstream admission": `WorkloadManager::admit` takes no lane, and `Laned` releases on Pending. Integration proof is due in scenario 5.
+
+   Independent check:
+   - "Local blockage cannot hold other eligible work" has no test; the old
+     `a_non_fitting_head_does_not_block_another_tenant` went with
+     `admission.rs`.
+   - No test shows work waiting in `WorkloadManager::admit` holds no lane.
+     `open_query_stream_holds_no_cpu_lane` covers only a stream between
+     polls.
+   Status: FAIL (those two cases).
 
 5. **Actual execution hooks — REQ-022,024; AC-017.** Bifrost integration tests
    run parallel query/repartition/sort/spill and Forge work through production
@@ -433,7 +472,22 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
    redux lib under managed Postgres, 943 passed
    (`mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p vala-bifrost-redux --lib"`),
    and `mise run test:bifrost:journey:oracle`, 67 + 1 passed.
-   Status: PASS.
+
+   Independent check:
+   - No test holds a CPU lane across a Monty turn (`sandbox.rs` `run_turn`).
+   - Repartition and sort are not exercised; the proof is a 4-partition
+     aggregate.
+   - The parent-commitment sampler in `main.rs` (`mi_process_info`) has no
+     runtime proof.
+   - The Scribe `off_lane` call sites (`SyncingFile::write`,
+     `MemberStager::encode_runs`) rest on source plus regressions.
+   - The spill choice, release for the rest of the poll, lets more than C
+     polls run at once during spill IO. That is the recorded user decision,
+     not revision 16 text, and it should be weighed against scenario 4's
+     "C managed lanes".
+   - TDD VIOLATED, previously unmarked: the Monty lane wiring in
+     `sandbox.rs` and the `main.rs` sampler.
+   Status: FAIL (the first four items).
 
 6. **Connected public journey and bounded drain — REQ-019–024; AC-018.** Extend
    existing Rust-client/WyrdTestServer/Postgres journey owners with verification
@@ -573,6 +627,16 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
        isolated-capacity and route tests above.
      - Bounded drain: the three named custody regressions above.
      - Cancellation and deadline: the pressure tests above.
+   - Independent check:
+     - The connected journey itself has no media or code work,
+       cancellation, deadline expiry or drain. Those rest on owner tests,
+       by user decision.
+     - It asserts call subjects, not the absence of a double debit for the
+       nested call.
+     - Media relay rests on `test:gateway:native`, which asserts no charge.
+     - TDD VIOLATED, previously unmarked: the three rewritten deferral
+       tests were changed to match the implemented behaviour (user
+       decision), and the gateway relay wiring had no test first.
    - Removing the session precharge broke the premise of three tests,
        that 64 MiB free is short of one Python session. A Codex
        diagnostician found the cause: nothing refused the run, so it never
@@ -592,7 +656,8 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
          `one_session` name are gone. A sweep for tests of removed
          allocation logic found no test that only asserts removed
          behaviour.
-     Status: PASS.
+     Status: FAIL (no double-debit assertion for the nested call; no charge
+     assertion for media relay).
 
 7. **Functional closure and performance — REQ-024; AC-018.** Run affected
    functional lanes, then full clean L1 verification, gateway and all three

@@ -282,7 +282,7 @@ datafusion-distributed = { git = "https://github.com/bohmian-ai/datafusion-distr
 # Parquet read planner, and field-id column resolution) replaces these crates for every consumer, including the
 # iceberg, compaction, and distributed git dependencies.
 [patch.crates-io]
-# Monty 1.6.0 plus two commits: monty-proto's `worker-core` feature builds the
+# Monty 1.6.0 plus Wyrd's fork commits: monty-proto's `worker-core` feature builds the
 # worker without the ty/ruff type checker, and worker hosts report memory in a
 # `MemorySample` event that the pool reads outside turns, including from idle
 # workers. Every Monty crate comes from this rev so the graph holds one copy.

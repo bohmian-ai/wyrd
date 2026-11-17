@@ -14,7 +14,7 @@ import {
 import { nodeExecutor } from 'wyrd-ai-ui/node';
 import { reject } from '$lib/server/auth/session';
 import { appliedRange, readState } from '$lib/observe-host';
-import { verifyInputs } from '$lib/verify-host';
+import { readShown, verifyInputs } from '$lib/verify-host';
 import type { PageServerLoad } from './$types';
 
 /** How many Verifiers the Verifier chart names; the rest share one series, so its key stays on one line. */
@@ -62,14 +62,15 @@ export const load: PageServerLoad = async ({ locals, url, request, depends }) =>
   const session = locals.browserSession ?? reject('unauthenticated');
   const state = readState(url.searchParams);
   const applied = RangeSchema.safeParse(appliedRange(state));
-  if (!applied.success) return { state, range: undefined, verify: { problem: inputProblem('Verify', applied.error.issues[0]) } };
+  if (!applied.success) return { state, shown: readShown(url.searchParams), range: undefined, verify: { problem: inputProblem('Verify', applied.error.issues[0]) } };
   const range = resolveRange(applied.data);
   const context: LoadContext = { executor: nodeExecutor(session.client()), range, signal: request.signal };
-  const inputs = verifyInputs(state);
+  const shown = readShown(url.searchParams);
+  const inputs = verifyInputs(state, shown);
   const rail = validatePanel('FacetRail', inputs.facets);
-  if ('code' in rail) return { state, range, verify: { problem: rail } };
+  if ('code' in rail) return { state, shown, range, verify: { problem: rail } };
   const listed = validatePanel('RecordTable', inputs.list);
-  if ('code' in listed) return { state, range, verify: { problem: listed } };
+  if ('code' in listed) return { state, shown, range, verify: { problem: listed } };
   const checked = rail.input as FacetRailInput;
   const [facets, list, charts, [verifiers]] = await Promise.all([
     loadFacetRail(checked, context),
@@ -80,5 +81,5 @@ export const load: PageServerLoad = async ({ locals, url, request, depends }) =>
   ]);
   const labels = verifiers.ok ? Object.fromEntries(verifiers.value.items.map((card) => [card.card_uid, `${card.name}@${card.version}`])) : {};
   const verifierChart = ranked(charts.verifiers, labels);
-  return { state, range, verify: { facets, list, charts: { verdicts: charts.verdicts, verifiers: verifierChart.chart, verifierSeries: verifierChart.order }, labels } };
+  return { state, shown, range, verify: { facets, list, charts: { verdicts: charts.verdicts, verifiers: verifierChart.chart, verifierSeries: verifierChart.order }, labels } };
 };

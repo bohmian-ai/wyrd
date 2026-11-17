@@ -14,12 +14,22 @@ export const VERIFY_FACETS = ['status', 'verdict', 'verifier_card_uid', 'service
 /** The shown columns the Verify list may group by. Grouping only arranges rows; it is never a combined judgment. */
 export const VERIFY_GROUPS = ['run_id', 'subject_name', 'service_name', 'group_id'] as const;
 
+/** How many executions the Verify list shows first, and how many more each "Show more" adds. */
+export const VERIFY_PAGE = 50;
+/** The most executions one list read returns. */
+export const VERIFY_MOST = 500;
+/** The rows the `shown` search param asks for: a whole number of pages within the list's bounds. */
+export function readShown(params: URLSearchParams): number {
+  const asked = Number(params.get('shown'));
+  return Number.isInteger(asked) ? Math.min(VERIFY_MOST, Math.max(VERIFY_PAGE, asked)) : VERIFY_PAGE;
+}
+
 /**
  * The shared loader inputs of the Verify dashboard, read from the same URL
  * state Observe keeps: the facets and the list filter by the typed WHERE
  * clauses only, so rows, counts and charts describe one population.
  */
-export function verifyInputs(state: ObserveState) {
+export function verifyInputs(state: ObserveState, shown: number = VERIFY_PAGE) {
   const group = VERIFY_GROUPS.find((each) => each === state.group);
   const sort = state.sort && sortColumns('executions').includes(state.sort.column) ? state.sort : undefined;
   return {
@@ -28,9 +38,9 @@ export function verifyInputs(state: ObserveState) {
     list: {
       signal: 'executions',
       where: state.where,
+      limit: shown,
       ...(group ? { groupBy: group } : {}),
       ...(sort ? { sort } : {}),
-      ...(sort || !state.sort ? (state.page ?? {}) : {}),
       ...(state.live ? { live: true } : {})
     }
   };
@@ -48,6 +58,9 @@ export function whereText(state: ObserveState): string {
 export function verifyStep(state: ObserveState, intent: ActionIntent, back: string): HostStep | { readonly open: string } {
   const input = intent.input as Record<string, unknown>;
   if (intent.name === 'record.open') return typeof input.execution_id === 'string' ? { open: input.execution_id } : { unavailable: 'Verify opens executions only' };
+  // A pressed facet value is its filter's off switch: the rail is the only place a filter is added or removed.
+  const applied = state.where.filter((clause) => clause.column !== input.column || clause.value !== input.value || clause.not);
+  if (intent.name === 'facet.filter' && applied.length < state.where.length) return { state: { ...state, where: applied } };
   return step(state, intent, back);
 }
 

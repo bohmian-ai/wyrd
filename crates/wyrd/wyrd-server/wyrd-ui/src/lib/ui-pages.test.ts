@@ -791,10 +791,13 @@ test('the Verify dashboard reads one population and keeps its investigation in t
   // Group by is a row of choices with the current one pressed, beside the total the status facet counts.
   const groups = within(page.getByRole('group', { name: 'Group by' }));
   expect(groups.getAllByRole('button').map((button) => [button.textContent?.trim(), button.getAttribute('aria-pressed')])).toEqual([['none', 'true'], ['run', 'false'], ['Card', 'false'], ['Service', 'false'], ['session', 'false']]);
-  expect(page.getByText('6 executions')).toBeInTheDocument();
+  expect(page.getByText('7 executions')).toBeInTheDocument();
+  // The list says how many of them it shows and has no more to ask for.
+  expect(page.getByText('Showing 7 of 7 · newest first')).toBeInTheDocument();
   await fireEvent.click(groups.getByRole('button', { name: 'session' }));
   expect(goto).toHaveBeenLastCalledWith('/t/acme/verify?group=group_id', expect.anything());
-  await fireEvent.click(page.getByRole('button', { name: 'Live' }));
+  // Live is off until asked for, and says so.
+  await fireEvent.click(page.getByRole('button', { name: 'Paused' }));
   expect(goto).toHaveBeenLastCalledWith('/t/acme/verify?live=1', expect.anything());
   for (const title of ['Executions', 'By Verifier']) {
     const plot = page.getByRole('region', { name: title }).querySelector('svg.plot') as SVGSVGElement;
@@ -823,12 +826,20 @@ test('the Verify dashboard reads one population and keeps its investigation in t
   expect(goto).toHaveBeenLastCalledWith(`/t/acme/verify${search({ where, group: 'service_name' })}`, expect.anything());
   expect(filtered.getByRole('link', { name: 'Clear' })).toHaveAttribute('href', `/t/acme/verify${search({ from: '2026-10-20T10:00:00.000Z', to: '2026-10-20T12:00:00.000Z', group: 'service_name' })}`);
   filtered.unmount();
-  // Another value adds a clause, as in Observe, and the changed list starts at its first page again.
-  const paged = await open(search({ where, after: ['2026-10-20T11:58:02.412000Z', 'exec_failed'] }));
-  await waitFor(() => expect(paged.getByRole('region', { name: 'executions rows' })).toBeInTheDocument());
-  await fireEvent.click(within(paged.getByRole('navigation', { name: 'Filter executions' })).getByRole('button', { name: /cancelled/ }));
+  // The list reads as many rows as the URL asks for. Another value adds a clause and the changed list starts from its first rows; a pressed value removes its own clause.
+  const longer = await open(`${search({ where })}&shown=100`);
+  await waitFor(() => expect(longer.getByRole('region', { name: 'executions rows' })).toBeInTheDocument());
+  expect(queries().filter((query) => / LIMIT 10[01]$/.test(query.sql))).toHaveLength(1);
+  const pressed = within(longer.getByRole('navigation', { name: 'Filter executions' }));
+  await fireEvent.click(pressed.getByRole('button', { name: /cancelled/ }));
   expect(goto).toHaveBeenLastCalledWith(`/t/acme/verify${search({ where: [...where, { column: 'status', value: 'cancelled' }] })}`, expect.anything());
-  paged.unmount();
+  await fireEvent.click(pressed.getByRole('button', { name: /failed/ }));
+  expect(goto).toHaveBeenLastCalledWith(`/t/acme/verify${search({ where: [where[0]] })}`, expect.anything());
+  longer.unmount();
+  // The footer names the order the reader chose, not a fixed one.
+  const sorted = await open('?sort=status:asc');
+  await waitFor(() => expect(sorted.getByText('Showing 7 of 7 · by Status ↑')).toBeInTheDocument());
+  sorted.unmount();
 
   // An incompatible combination is an empty list, said plainly; a refusal is shown as the refusal, never as empty.
   const empty = await open(search({ where: [{ column: 'status', value: 'cancelled' }, { column: 'verdict', value: 'passed' }] }), stateExecutors.empty);

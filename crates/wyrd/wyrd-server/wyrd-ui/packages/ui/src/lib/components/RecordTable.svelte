@@ -56,9 +56,10 @@
     oncolumns,
     controls,
     tools: hostTools,
-    labels = {}
+    labels = {},
+    more
   }: RecordTableProps &
-    ActionProps & { paused?: boolean; oncolumns?: (columns: readonly string[]) => void; controls?: HTMLElement; tools?: Snippet; labels?: Readonly<Record<string, string>> } = $props();
+    ActionProps & { paused?: boolean; oncolumns?: (columns: readonly string[]) => void; controls?: HTMLElement; tools?: Snippet; labels?: Readonly<Record<string, string>>; more?: { total: number; next?: () => void } } = $props();
 
   /** Keep `node` inside `target` while it is mounted. */
   const placeIn = (target: HTMLElement) => (node: HTMLElement) => {
@@ -132,6 +133,8 @@
   const extrasLast = $derived(!visible.includes(extrasBefore));
   let wrap = $state(false);
   const heading = (column: string) => (signal ? columnLabel(column) : column);
+  /** The order the rows are read in, in words. */
+  const ordering = $derived('sort' in input && input.sort ? `by ${heading(input.sort.column)} ${input.sort.desc ? '↓' : '↑'}` : 'newest first');
   const text = (column: string, value: unknown) => cellText(signal ? column : '', value);
 
   const keyOf = (data: QueryResult, row: readonly unknown[]) => {
@@ -280,9 +283,9 @@
     <div class="frame">
       {#if signal && controls}
         <span class="tools" {@attach placeIn(controls)}>{@render hostTools?.()}{@render tools()}</span>
-      {:else if signal}
+      {:else if signal && !more}
         <div class="bar">
-          <span>{counted(rows.rows.length)} · {'sort' in input && input.sort ? `by ${heading(input.sort.column)} ${input.sort.desc ? '↓' : '↑'}` : 'newest first'}</span>
+          <span>{counted(rows.rows.length)} · {ordering}</span>
           <span class="tools">{@render hostTools?.()}{@render tools()}</span>
         </div>
       {/if}
@@ -376,9 +379,14 @@
           </tbody>
         </table>
       </div>
-      {#if page}
+      {#if more}
+        <p class="foot">
+          <span>Showing {fmtCount(rows.rows.length)} of {fmtCount(more.total)} · {ordering}{#if width && width < EXECUTIONS_MIN}{' '}· scroll the table sideways for every column{/if}{#if !more.next && rows.rows.length < more.total}{' '}· narrow the range or filters to read older {noun}{/if}</span>
+          {#if more.next}<button type="button" class="next" onclick={more.next}>Show {Math.min(LIST_LIMIT, more.total - rows.rows.length)} more</button>{/if}
+        </p>
+      {:else if page}
         <nav class="foot pager" aria-label="Pages">
-          <span>Showing {counted(rows.rows.length)}{#if signal === 'spans' && openable}{' '}· a trace id opens that trace{/if}{#if signal === 'executions' && width && width < EXECUTIONS_MIN}{' '}· scroll the table sideways for every column{/if}</span>
+          <span>Showing {counted(rows.rows.length)}{#if signal === 'spans' && openable}{' '}· a trace id opens that trace{/if}</span>
           {#if onaction}
             <span class="pages">
               <button type="button" disabled={!page.newer} onclick={() => page.newer && onaction?.({ name: 'record.page', input: { before: page.newer } })}>‹ Newer</button>
@@ -393,7 +401,7 @@
       {/if}
     </div>
     <ActionNote state={openState} />
-    {#if query}
+    {#if query && !more}
       <span class="query">
         <ActionButton
           variant="link"
@@ -713,6 +721,14 @@
   .ghead .tally {
     margin-left: auto;
     font-size: 11px;
+  }
+  .next {
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--declare);
+    font: inherit;
+    cursor: pointer;
   }
   .toggle {
     width: 18px;

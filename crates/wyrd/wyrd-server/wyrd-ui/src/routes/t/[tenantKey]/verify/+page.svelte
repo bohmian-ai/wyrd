@@ -11,9 +11,8 @@
   import { goto, invalidate } from '$app/navigation';
   import { Chart, EmptyState, FacetRail, RecordTable, type ActionIntent, type ActionState } from 'wyrd-ai-ui';
   import { NO_VERDICT, validateIntent, type ChartProps, type ComponentName } from 'wyrd-ai-ui/loaders';
-  import TimePicker, { type PickedRange, type Zone } from '$lib/TimePicker.svelte';
-  import { PRESETS, appliedRange, moved, writeState, zoomed, type ObserveState } from '$lib/observe-host';
-  import { VERIFY_GROUPS, verifyStep, whereText } from '$lib/verify-host';
+  import { moved, writeState, zoomed, type ObserveState } from '$lib/observe-host';
+  import { VERIFY_GROUPS, VERIFY_MOST, VERIFY_PAGE, verifyStep, whereText } from '$lib/verify-host';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();
@@ -30,9 +29,11 @@
   const where = $derived(whereText(current));
 
   /** The URL of `next`, on its first page when it reads another list. */
-  const href = (next: ObserveState) => {
-    const search = writeState(moved(current, next)).toString();
-    return `${base}/verify${search ? `?${search}` : ''}`;
+  const href = (next: ObserveState, shown = data.shown) => {
+    const search = writeState(moved(current, next));
+    // Another list starts from its first rows; the same list keeps the rows already asked for.
+    if (shown > VERIFY_PAGE && moved(current, next) === next) search.set('shown', String(shown));
+    return `${base}/verify${search.size ? `?${search}` : ''}`;
   };
   const go = (next: ObserveState) => goto(href(next), { keepFocus: true, noScroll: true });
 
@@ -65,6 +66,8 @@
     const [centre, half] = [(from + to) / 2, ((to - from) * factor) / 2];
     void go(zoomed(current, centre - half, centre + half));
   }
+  /** The ranges the picker offers, as the approved design words them. */
+  const RANGES: Readonly<Record<string, string>> = { '1h': 'Last hour', '6h': 'Last 6 hours', '24h': 'Last 24 hours', '7d': 'Last 7 days', '14d': 'Last 14 days' };
   /** The Group by choices as the approved design words them. */
   const GROUP_NAMES = { run_id: 'run', subject_name: 'Card', service_name: 'Service', group_id: 'session' } as const;
   /** The exact Verifier definition a Verifier facet value names, when the host could name it. */
@@ -80,10 +83,8 @@
     const statuses = verify.facets.result.data.facets.find((facet) => facet.column === 'status');
     return statuses?.values.rows.reduce((sum, row) => sum + Number(row[1]), 0);
   });
-  function apply(range: PickedRange, tz: Zone) {
-    void go({ ...current, tz, ...('last' in range ? { last: range.last, from: undefined, to: undefined } : range) });
-  }
-
+  /** The list's footer: how many of the counted executions it shows, and the next rows when one read can hold them. */
+  const more = $derived(total === undefined ? undefined : { total, next: data.shown < Math.min(total, VERIFY_MOST) ? () => void goto(href(current, data.shown + VERIFY_PAGE), { keepFocus: true, noScroll: true }) : undefined });
   /** The Verifier chart's key: each series in its colour; a fourth series only ever counts the rest. */
   const key = (order: readonly string[]) => Object.fromEntries(order.map((name, index) => [name, SERIES[index]]));
   /** How many executions a chart counts, beside its title. */
@@ -112,21 +113,17 @@
       <button type="button" class="icon" aria-label="Zoom out" disabled={!data.range} onclick={() => zoom(2)}>−</button>
       <button type="button" class="icon" aria-label="Zoom in" disabled={!data.range} onclick={() => zoom(0.5)}>+</button>
     </span>
-    <TimePicker range={appliedRange(current)} zone={current.tz} presets={PRESETS} onapply={apply} />
+    <label class="icon range">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="5" width="18" height="16"></rect><path d="M3 10h18M8 3v4M16 3v4"></path></svg>
+      <select aria-label="Time range" value={current.last} onchange={(event) => go({ ...current, last: event.currentTarget.value, from: undefined, to: undefined })}>
+        {#each Object.entries(RANGES) as [last, text] (last)}<option value={last}>{text}</option>{/each}
+        {#if !(current.last in RANGES)}<option value={current.last}>Last {current.last}</option>{/if}
+      </select>
+    </label>
     <button type="button" class="live" aria-pressed={current.live} onclick={() => go({ ...current, live: !current.live })}>
-      <span class="dot" aria-hidden="true"></span>Live
+      <span class="dot" aria-hidden="true"></span>{current.live ? 'Live' : 'Paused'}
     </button>
   </div>
-  {#if current.where.length}
-    <ul class="chips" aria-label="Applied filters">
-      {#each current.where as clause, index (index)}
-        <li>
-          <code>{clause.column} {clause.not ? '≠' : '='} {JSON.stringify(clause.value)}</code>
-          <a aria-label="Remove {clause.column}" href={href({ ...current, where: current.where.filter((_, at) => at !== index) })}>✕</a>
-        </li>
-      {/each}
-    </ul>
-  {/if}
 
   {#if 'problem' in verify}
     <EmptyState state="error" problem={verify.problem} />
@@ -155,7 +152,7 @@
     </div>
     <div class="split">
       <div data-panel="facets"><FacetRail {...verify.facets} labels={verify.labels} link={definition} {actions} onaction={onaction('FacetRail')} /></div>
-      <div data-panel="list"><RecordTable {...verify.list} labels={verify.labels} {actions} onaction={onaction('RecordTable')} /></div>
+      <div data-panel="list"><RecordTable {...verify.list} labels={verify.labels} {more} {actions} onaction={onaction('RecordTable')} /></div>
     </div>
   {/if}
 </div>
@@ -246,26 +243,6 @@
     border-color: var(--ok);
     background: var(--ok);
   }
-  .chips {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-    margin: -8px 0 0;
-    padding: 0;
-    list-style: none;
-  }
-  .chips li {
-    display: flex;
-    gap: 6px;
-    padding: 2px 8px;
-    border: 1px solid var(--border);
-    border-radius: var(--r);
-    font: 12px var(--font-mono);
-  }
-  .chips a {
-    color: var(--muted);
-    text-decoration: none;
-  }
   .panel {
     border: 1px solid var(--border);
     border-radius: var(--r);
@@ -335,6 +312,13 @@
     background: none;
     color: var(--declare);
     font: 12px var(--font-mono);
+    cursor: pointer;
+  }
+  .range select {
+    border: 0;
+    background: transparent;
+    color: inherit;
+    font: inherit;
     cursor: pointer;
   }
   .where a {

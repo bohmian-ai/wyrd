@@ -360,7 +360,7 @@ export const costs = result([col('value', 'Decimal128(38, 12)'), col('currency')
 /** The fixture answering one Observe read, chosen by its fixed SQL shape. */
 export function observeAnswer(sql: string): QueryResult | undefined {
   if (sql.includes(') AS executions')) {
-    if (sql.startsWith('SELECT status ')) return { ...facet, rows: [['completed', 3], ['cancelled', 1], ['not recorded', 1], ['waiting', 1]] };
+    if (sql.startsWith('SELECT status ')) return { ...facet, rows: [['completed', 4], ['cancelled', 1], ['not recorded', 1], ['waiting', 1]] };
     if (sql.startsWith('SELECT verdict ')) return { ...facet, rows: [[null, 2], ['failed', 1], ['inconclusive', 1], ['passed', 1]] };
     if (sql.startsWith('SELECT verifier_card_uid ')) return { ...facet, rows: [[VERIFIER_UIDS.policy, 3], [VERIFIER_UIDS.drift, 2]] };
     if (sql.startsWith('SELECT run_id ')) return { ...facet, rows: [['run_refund', 4], [null, 2]] };

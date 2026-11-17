@@ -1591,12 +1591,14 @@ judged('the Verify dashboard filters, groups, brushes, pages, opens an execution
     await page.waitForURL(list);
     await expect.poll(() => rows.count()).toBe(50);
 
-    // Paging keeps the population: the second page holds the rest, and the address holds the cursor.
-    await page.getByRole('button', { name: /Older/ }).click();
-    await expect.poll(() => 'after' in query()).toBe(true);
-    await expect.poll(() => rows.count()).toBe(7);
+    // Show more keeps the population: the list grows to hold the rest, and the address holds how many it shows.
+    expect(await page.getByText('Showing 50 of 57 · newest first').count()).toBe(1);
+    await page.getByRole('button', { name: 'Show 7 more' }).click();
+    await expect.poll(query).toMatchObject({ shown: '100' });
+    await expect.poll(() => rows.count()).toBe(57);
+    expect(await page.getByRole('button', { name: /Show \d+ more/ }).count()).toBe(0);
 
-    // Open a row and come back: the same page of the same list, at the same scroll position.
+    // Open a row and come back: the same rows of the same list, at the same scroll position.
     await page.setViewportSize({ width: 1280, height: 420 });
     await rows.last().scrollIntoViewIfNeeded();
     const before = { url: page.url(), first: await rows.first().textContent(), scroll: await page.evaluate(() => window.scrollY) };
@@ -1606,15 +1608,15 @@ judged('the Verify dashboard filters, groups, brushes, pages, opens an execution
     await expect.poll(() => page.locator('[data-execution-status]').getAttribute('data-execution-status')).toBe('completed');
     await page.goBack();
     await page.waitForURL(before.url);
-    await expect.poll(() => rows.count()).toBe(7);
+    await expect.poll(() => rows.count()).toBe(57);
     expect(await rows.first().textContent()).toBe(before.first);
     await expect.poll(() => page.evaluate(() => window.scrollY)).toBe(before.scroll);
     await page.setViewportSize({ width: 1280, height: 720 });
 
-    // Status and verdict filters combine; the WHERE box projects them and the list starts at its first page.
+    // Status and verdict filters combine; the WHERE box projects them and the list starts from its first rows.
     await rail.getByRole('button', { name: /failed/ }).click();
     await expect.poll(() => rows.count()).toBe(1);
-    expect(query()).not.toHaveProperty('after');
+    expect(query()).not.toHaveProperty('shown');
     await rail.getByRole('button', { name: /completed/ }).click();
     await expect.poll(async () => (await where.textContent())?.trim()).toBe("verdict = 'failed' AND status = 'completed'");
     expect(await rows.count()).toBe(1);
@@ -1712,7 +1714,7 @@ judged('the Verify dashboard filters, groups, brushes, pages, opens an execution
     // The narrow layout keeps every control and the table reachable.
     await page.setViewportSize({ width: 390, height: 844 });
     await expect.poll(() => rows.count()).toBe(50);
-    expect(await page.getByRole('button', { name: 'Live' }).isVisible()).toBe(true);
+    expect(await page.getByRole('button', { name: 'Paused' }).isVisible()).toBe(true);
     await captureExecution(page, 'verify-dashboard');
     await page.setViewportSize({ width: 1280, height: 720 });
 

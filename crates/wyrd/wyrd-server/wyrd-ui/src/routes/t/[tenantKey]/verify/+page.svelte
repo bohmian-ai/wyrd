@@ -66,6 +66,12 @@
     void go(zoomed(current, centre - half, centre + half));
   }
   const zoomedIn = $derived(current.from !== undefined);
+  /** Executions under the applied filters and range: the status facet counts every one, in fewer values than a facet reads. */
+  const total = $derived.by(() => {
+    if ('problem' in verify || !('data' in verify.facets.result)) return undefined;
+    const statuses = verify.facets.result.data.facets.find((facet) => facet.column === 'status');
+    return statuses?.values.rows.reduce((sum, row) => sum + Number(row[1]), 0);
+  });
   function apply(range: PickedRange, tz: Zone) {
     void go({ ...current, tz, ...('last' in range ? { last: range.last, from: undefined, to: undefined } : range) });
   }
@@ -130,13 +136,13 @@
       </div>
     </section>
     <div class="listbar">
-      <label class="by">
-        Group by
-        <select aria-label="Group by" value={current.group ?? ''} onchange={(event) => go({ ...current, group: event.currentTarget.value || undefined })}>
-          <option value="">none</option>
-          {#each VERIFY_GROUPS as column (column)}<option value={column}>{columnLabel(column)}</option>{/each}
-        </select>
-      </label>
+      <span class="by" role="group" aria-label="Group by">
+        <span>Group by</span>
+        {#each [undefined, ...VERIFY_GROUPS] as column (column ?? '')}
+          <button type="button" class="icon" aria-pressed={current.group === column} onclick={() => go({ ...current, group: column })}>{column ? columnLabel(column) : 'none'}</button>
+        {/each}
+      </span>
+      {#if total !== undefined}<span class="total">{total.toLocaleString('en-US')} executions</span>{/if}
     </div>
     <div class="split">
       <div data-panel="facets"><FacetRail {...verify.facets} labels={verify.labels} {actions} onaction={onaction('FacetRail')} /></div>
@@ -282,7 +288,21 @@
   .by {
     display: inline-flex;
     align-items: center;
+    flex-wrap: wrap;
     gap: 6px;
+    color: var(--muted);
+    font: 12px var(--font-mono);
+  }
+  .by .icon {
+    height: 28px;
+    margin-left: -1px;
+    font: 12px var(--font-mono);
+  }
+  .by .icon[aria-pressed='true'] {
+    border-color: var(--selected-border);
+    background: var(--selected);
+  }
+  .total {
     margin-left: auto;
     color: var(--muted);
     font: 12px var(--font-mono);

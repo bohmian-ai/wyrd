@@ -785,7 +785,11 @@ test('the Verify dashboard reads one population and keeps its investigation in t
   // A facet value, a brush, grouping, Live and paging are navigations: the URL holds the investigation.
   await fireEvent.click(rail.getByRole('button', { name: /failed/ }));
   expect(goto).toHaveBeenLastCalledWith(`/t/acme/verify${search({ where: [{ column: 'verdict', value: 'failed' }] })}`, { keepFocus: true, noScroll: true });
-  await fireEvent.change(page.getByRole('combobox', { name: 'Group by' }), { target: { value: 'group_id' } });
+  // Group by is a row of choices with the current one pressed, beside the total the status facet counts.
+  const groups = within(page.getByRole('group', { name: 'Group by' }));
+  expect(groups.getAllByRole('button').map((button) => [button.textContent?.trim(), button.getAttribute('aria-pressed')])).toEqual([['none', 'true'], ['Verifier', 'false'], ['Card name', 'false'], ['Service', 'false'], ['Run', 'false'], ['Session', 'false']]);
+  expect(page.getByText('6 executions')).toBeInTheDocument();
+  await fireEvent.click(groups.getByRole('button', { name: 'Session' }));
   expect(goto).toHaveBeenLastCalledWith('/t/acme/verify?group=group_id', expect.anything());
   await fireEvent.click(page.getByRole('button', { name: 'Live' }));
   expect(goto).toHaveBeenLastCalledWith('/t/acme/verify?live=1', expect.anything());

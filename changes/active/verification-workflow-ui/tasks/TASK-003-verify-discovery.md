@@ -149,11 +149,10 @@ unit test first. The real-server journeys were written after the production quer
 
 Comparison with the approved mock (real page captured by the browser journey in
 light and dark at 1280 and 390 wide; mock captured by `selfcheck.mjs --shots`).
-The WHERE box, zoom, range, Live, both charts and legends, the facet rail and
-its order, and the table columns match. Differences:
+The WHERE box, zoom, range, Live, both charts and legends, the Group by
+buttons with the total beside them, the facet rail and its order, and the
+table columns match. Differences:
 
-- Group by is a select on the right; the mock has a row of buttons on the left
-  with the total execution count beside it.
 - The chart headings do not show the total count.
 - The table pages with Newer and Older; the mock shows "Showing 50 of N" with
   "Show 50 more".

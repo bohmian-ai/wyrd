@@ -1651,7 +1651,7 @@ judged('the Verify dashboard filters, groups, brushes, pages, opens an execution
     await expect.poll(() => rows.count()).toBe(50);
 
     // Grouping arranges the same rows under their session; it adds no row and no judgment.
-    await page.getByRole('combobox', { name: 'Group by' }).selectOption('group_id');
+    await page.getByRole('group', { name: 'Group by' }).getByRole('button', { name: 'Session' }).click();
     await expect.poll(query).toMatchObject({ group: 'group_id' });
     await expect.poll(() => page.locator('[aria-label="executions rows"] tr.group').count()).toBeGreaterThan(0);
     expect(await rows.count()).toBe(50);
@@ -1700,7 +1700,7 @@ judged('the Verify dashboard filters, groups, brushes, pages, opens an execution
     });
     await rail.getByRole('button', { name: /failed/ }).click();
     await expect.poll(() => waiting).toBe(1);
-    await page.getByRole('combobox', { name: 'Group by' }).selectOption('verifier_card_uid');
+    await page.getByRole('group', { name: 'Group by' }).getByRole('button', { name: 'Verifier' }).click();
     await expect.poll(query).toEqual({ group: 'verifier_card_uid' });
     release();
     await page.unroute(filtered);

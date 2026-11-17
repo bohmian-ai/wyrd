@@ -1673,6 +1673,536 @@
         }
       ]
     },
+    "RepositoryIndex": {
+      "description": "Repository Cards joined to the GitHub repositories the tenant's connection reaches, by provider repository id: registration, GitHub access and automatic verification as separate facts, with search and a Show choice.",
+      "input": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "maxLength": 200
+          },
+          "show": {
+            "type": "string",
+            "enum": [
+              "all",
+              "ready",
+              "inactive",
+              "undeclared"
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "states": [
+        "populated",
+        "denied",
+        "error",
+        "loading"
+      ],
+      "emits": [
+        {
+          "name": "repository.filter",
+          "description": "Replace the search text and Show choice.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string",
+                "maxLength": 200
+              },
+              "show": {
+                "type": "string",
+                "enum": [
+                  "all",
+                  "ready",
+                  "inactive",
+                  "undeclared"
+                ]
+              }
+            },
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        },
+        {
+          "name": "card.open",
+          "description": "Open this exact Card version.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "card_ref": {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "Data",
+                      "Model",
+                      "Artifact",
+                      "Experiment",
+                      "Prompt",
+                      "Agent",
+                      "Mcp",
+                      "Service",
+                      "Audit",
+                      "Verifier",
+                      "Trigger",
+                      "Operator",
+                      "Repository"
+                    ]
+                  },
+                  "name": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "version": {
+                    "type": "string",
+                    "pattern": "^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+                  },
+                  "uid": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "kind",
+                  "name",
+                  "version"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "card_ref"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        },
+        {
+          "name": "repository.declare",
+          "description": "Show how to declare a Repository Card for this reachable GitHub repository.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "repository_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64
+              }
+            },
+            "required": [
+              "repository_id"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        },
+        {
+          "name": "connection.open",
+          "description": "Open the tenant's GitHub connection settings.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        }
+      ]
+    },
+    "RepositoryPolicy": {
+      "description": "One exact Repository Card version: whether it is the selected policy, GitHub access, automatic verification, its exact Verifier bindings and its read-only declaration as Card YAML or a wyrd.toml projection.",
+      "input": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "cardRef": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "Repository"
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "version": {
+                "type": "string",
+                "pattern": "^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+              },
+              "uid": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "kind",
+              "name",
+              "version"
+            ],
+            "additionalProperties": false
+          },
+          "declaration": {
+            "type": "string",
+            "enum": [
+              "yaml",
+              "toml"
+            ]
+          }
+        },
+        "required": [
+          "cardRef"
+        ],
+        "additionalProperties": false
+      },
+      "states": [
+        "populated",
+        "denied",
+        "error",
+        "loading"
+      ],
+      "emits": [
+        {
+          "name": "card.version",
+          "description": "View another exact version of this Repository; selection does not change.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "card_ref": {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "Data",
+                      "Model",
+                      "Artifact",
+                      "Experiment",
+                      "Prompt",
+                      "Agent",
+                      "Mcp",
+                      "Service",
+                      "Audit",
+                      "Verifier",
+                      "Trigger",
+                      "Operator",
+                      "Repository"
+                    ]
+                  },
+                  "name": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "version": {
+                    "type": "string",
+                    "pattern": "^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+                  },
+                  "uid": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "kind",
+                  "name",
+                  "version"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "card_ref"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        },
+        {
+          "name": "card.open",
+          "description": "Open this exact Card version.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "card_ref": {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "Data",
+                      "Model",
+                      "Artifact",
+                      "Experiment",
+                      "Prompt",
+                      "Agent",
+                      "Mcp",
+                      "Service",
+                      "Audit",
+                      "Verifier",
+                      "Trigger",
+                      "Operator",
+                      "Repository"
+                    ]
+                  },
+                  "name": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "version": {
+                    "type": "string",
+                    "pattern": "^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+                  },
+                  "uid": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "kind",
+                  "name",
+                  "version"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "card_ref"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        },
+        {
+          "name": "repository.declaration",
+          "description": "Show the declaration as Card YAML or as a wyrd.toml projection.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "declaration": {
+                "type": "string",
+                "enum": [
+                  "yaml",
+                  "toml"
+                ]
+              }
+            },
+            "required": [
+              "declaration"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        },
+        {
+          "name": "connection.open",
+          "description": "Open the tenant's GitHub connection settings.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        }
+      ]
+    },
+    "RepositoryDeclare": {
+      "description": "One reachable GitHub repository with no Repository Card: its three separate facts and the wyrd.toml and command that declare it.",
+      "input": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "repositoryId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          }
+        },
+        "required": [
+          "repositoryId"
+        ],
+        "additionalProperties": false
+      },
+      "states": [
+        "populated",
+        "denied",
+        "error",
+        "loading"
+      ],
+      "emits": [
+        {
+          "name": "connection.open",
+          "description": "Open the tenant's GitHub connection settings.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        }
+      ]
+    },
+    "GithubIntegration": {
+      "description": "The tenant's one GitHub App connection: state, installation, App and host, the repositories it reaches beside their Repository Cards, connect, manage access on GitHub, and a confirmed disconnect.",
+      "input": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "states": [
+        "populated",
+        "denied",
+        "error",
+        "loading"
+      ],
+      "emits": [
+        {
+          "name": "github.connect",
+          "description": "Start connecting this tenant to GitHub; the host continues on GitHub.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+          },
+          "completion": "host-action"
+        },
+        {
+          "name": "github.disconnect",
+          "description": "Disconnect this tenant from GitHub, after the reader confirmed.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+          },
+          "completion": "host-action"
+        },
+        {
+          "name": "card.open",
+          "description": "Open this exact Card version.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "card_ref": {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "Data",
+                      "Model",
+                      "Artifact",
+                      "Experiment",
+                      "Prompt",
+                      "Agent",
+                      "Mcp",
+                      "Service",
+                      "Audit",
+                      "Verifier",
+                      "Trigger",
+                      "Operator",
+                      "Repository"
+                    ]
+                  },
+                  "name": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "version": {
+                    "type": "string",
+                    "pattern": "^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+                  },
+                  "uid": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "kind",
+                  "name",
+                  "version"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "card_ref"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        },
+        {
+          "name": "repository.declare",
+          "description": "Show how to declare a Repository Card for this reachable GitHub repository.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "repository_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64
+              }
+            },
+            "required": [
+              "repository_id"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        }
+      ]
+    },
     "VerificationExecution": {
       "description": "One exact verification execution: its lifecycle status and verdict, the graph of the Verifier it ran coloured by recorded state, and an inspector for the selected step, requirement, input, session member or retained output. Every part is read and refused on its own.",
       "input": {

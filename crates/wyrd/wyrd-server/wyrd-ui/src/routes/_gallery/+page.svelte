@@ -26,6 +26,7 @@
     AUTHORED_SQL,
     bareSpan,
     card,
+    connectionExecutor,
     day,
     denied,
     DRIFT_VERIFIER,
@@ -37,6 +38,7 @@
     PROMPT,
     RANGE,
     registered,
+    REPOSITORY,
     series,
     SESSION_VERIFIER,
     stateExecutors,
@@ -175,6 +177,55 @@
       regions: [],
       note: 'Reference: the approved verification mock, exact Verifier page, Runs on rail.',
       cases: [{ label: 'a Service binding itself and one component', input: { cardRef: VERIFIER } }, ...states({ cardRef: VERIFIER })]
+    },
+    {
+      component: 'RepositoryIndex',
+      regions: [],
+      note: 'Reference: the approved verification mock, Repositories. Registration, GitHub access and automatic verification are separate columns.',
+      cases: [
+        { label: 'ready, access removed, empty policy and no Card', input: {} },
+        { label: 'Show: not verifying', input: { show: 'inactive' } },
+        { label: 'search with no match', input: { query: 'nothing' } },
+        { label: 'installation access lost', input: {}, executor: connectionExecutor({ state: 'suspended' }) },
+        { label: 'GitHub not connected', input: {}, executor: connectionExecutor({ state: 'not_connected' }) },
+        ...STATES.filter((state) => state !== 'empty').map((state) => ({ label: state, input: {}, state })),
+        { label: 'narrow', input: {}, narrow: true }
+      ]
+    },
+    {
+      component: 'RepositoryPolicy',
+      regions: [],
+      note: 'Reference: the approved verification mock, Repository Card detail. The viewed version is separate from the selected policy.',
+      cases: [
+        { label: 'selected version, access granted', input: { cardRef: REPOSITORY } },
+        { label: 'older version, viewing only · wyrd.toml projection', input: { cardRef: { ...REPOSITORY, version: '1.3.0' }, declaration: 'toml' } },
+        { label: 'access removed on GitHub', input: { cardRef: { ...REPOSITORY, name: 'ledger', version: '1.1.0' } } },
+        { label: 'selected policy binds nothing', input: { cardRef: { ...REPOSITORY, name: 'docs-site', version: '0.3.0' } } },
+        ...STATES.filter((state) => state !== 'empty').map((state) => ({ label: state, input: { cardRef: REPOSITORY }, state })),
+        { label: 'narrow', input: { cardRef: REPOSITORY }, narrow: true }
+      ]
+    },
+    {
+      component: 'RepositoryDeclare',
+      regions: [],
+      note: 'Reference: the approved verification mock, a GitHub repository with no Repository Card.',
+      cases: [
+        { label: 'reachable, not declared', input: { repositoryId: '741660215' } },
+        { label: 'an id the connection does not reach', input: { repositoryId: '999' } },
+        ...STATES.filter((state) => state !== 'empty').map((state) => ({ label: state, input: { repositoryId: '741660215' }, state }))
+      ]
+    },
+    {
+      component: 'GithubIntegration',
+      regions: [],
+      note: 'Reference: the approved verification mock, Settings, GitHub. Disconnect opens a confirmation first.',
+      cases: [
+        { label: 'connected', input: {} },
+        { label: 'not connected', input: {}, executor: connectionExecutor({ state: 'not_connected' }) },
+        { label: 'installation access lost', input: {}, executor: connectionExecutor({ state: 'suspended' }) },
+        ...STATES.filter((state) => state !== 'empty').map((state) => ({ label: state, input: {}, state })),
+        { label: 'narrow', input: {}, narrow: true }
+      ]
     },
     {
       component: 'FacetRail',

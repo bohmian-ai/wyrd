@@ -175,6 +175,7 @@ export const service = {
   relationships: { outbound_refs: [{ ref: AGENT, alias: 'agent' }, { ref: VERIFIER }], inbound_refs: [] },
   status: { phase: 'active' }
 } as unknown as RegisteredCard;
+export const REPOSITORY = { kind: 'Repository', name: 'payments-api', version: '1.4.0' } as const satisfies CardRef;
 /** The tenant's GitHub connection: three reachable repositories, one of them with no Repository Card. */
 export const connection = {
   host: 'github.com',
@@ -543,6 +544,14 @@ export const stateExecutors: Record<'populated' | 'empty' | 'denied' | 'error' |
   loading: { run: () => new Promise(() => {}) }
 };
 
+/** The fixtures behind another GitHub connection state: suspended, not connected, or whatever `view` says. */
+export function connectionExecutor(view: { readonly state: 'suspended' | 'not_connected' }): Executor {
+  const value = { ...connection, repositories: [], ...view, ...(view.state === 'not_connected' ? { installation_id: undefined } : {}) };
+  return {
+    run: (requests) => Promise.all(requests.map(async (request) => (request.op === 'github.get_connection' ? { ok: true, value } : (await fixtureExecutor.run([request]))[0]))) as never
+  };
+}
+
 /** A live executor: each traces list read after the first delivers one more new trace. */
 export function liveExecutor(): Executor {
   let reads = 0;
@@ -584,7 +593,7 @@ export const fixtureExecutor: Executor = {
                 value: {
                   items: Object.values(repositories)
                     .filter((each) => request.name == null || each.metadata.name === request.name)
-                    .map((each) => summary(each.metadata.version, 'active', 'Repository', each.metadata.name)),
+                    .map((each) => summary(each.metadata.version ?? '', 'active', 'Repository', each.metadata.name)),
                   next_cursor: null
                 }
               };

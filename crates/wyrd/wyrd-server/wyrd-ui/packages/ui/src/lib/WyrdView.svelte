@@ -31,6 +31,10 @@
   import UsedBy from './components/UsedBy.svelte';
   import VerifierDefinition from './components/VerifierDefinition.svelte';
   import RunsOn from './components/RunsOn.svelte';
+  import RepositoryIndex from './components/RepositoryIndex.svelte';
+  import RepositoryPolicy from './components/RepositoryPolicy.svelte';
+  import RepositoryDeclare from './components/RepositoryDeclare.svelte';
+  import GithubIntegration from './components/GithubIntegration.svelte';
   import VerificationExecution from './components/VerificationExecution.svelte';
   import VersionDiff from './components/VersionDiff.svelte';
   import Chart from './components/Chart.svelte';
@@ -88,6 +92,10 @@
     VersionDiff,
     VerifierDefinition,
     RunsOn,
+    RepositoryIndex,
+    RepositoryPolicy,
+    RepositoryDeclare,
+    GithubIntegration,
     VerificationExecution,
     StatStrip, FacetRail, RecordTable, TraceWaterfall, RecordDetail };
   /** How often a live panel re-reads. */

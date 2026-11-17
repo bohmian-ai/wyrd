@@ -16,6 +16,10 @@ export { default as UsedBy } from './components/UsedBy.svelte';
 export { default as VersionDiff } from './components/VersionDiff.svelte';
 export { default as VerifierDefinition } from './components/VerifierDefinition.svelte';
 export { default as RunsOn } from './components/RunsOn.svelte';
+export { default as RepositoryIndex } from './components/RepositoryIndex.svelte';
+export { default as RepositoryPolicy } from './components/RepositoryPolicy.svelte';
+export { default as RepositoryDeclare } from './components/RepositoryDeclare.svelte';
+export { default as GithubIntegration } from './components/GithubIntegration.svelte';
 export { default as VerificationExecution } from './components/VerificationExecution.svelte';
 export { default as VerifierGraph } from './components/VerifierGraph.svelte';
 export { default as Panel } from './components/Panel.svelte';
@@ -54,6 +58,11 @@ export type {
   DefinitionRequirement,
   DefinitionStep,
   RunsOnProps,
+  RepositoryIndexProps,
+  RepositoryPolicyProps,
+  RepositoryDeclareProps,
+  GithubIntegrationProps,
+  RepositoryRow,
   DriftContext,
   DriftPoint,
   ExecutionData,

@@ -51,6 +51,16 @@ import {
 import { loadRunsOn, loadVerifierDefinition, type RunsOnProps, type VerifierDefinitionProps } from './verifier.js';
 import { loadExecution, type VerificationExecutionProps } from './execution.js';
 import {
+  loadGithubIntegration,
+  loadRepositoryDeclare,
+  loadRepositoryIndex,
+  loadRepositoryPolicy,
+  type GithubIntegrationProps,
+  type RepositoryDeclareProps,
+  type RepositoryIndexProps,
+  type RepositoryPolicyProps
+} from './repositories.js';
+import {
   components,
   type AbsoluteRange,
   type CardHeaderInput,
@@ -64,6 +74,7 @@ export * from './schemas.js';
 export * from './observe.js';
 export * from './cards.js';
 export * from './verifier.js';
+export * from './repositories.js';
 export * from './execution.js';
 
 /** What every loader receives from its host. */
@@ -103,6 +114,10 @@ export interface ComponentProps {
   VersionDiff: VersionDiffProps;
   VerifierDefinition: VerifierDefinitionProps;
   RunsOn: RunsOnProps;
+  RepositoryIndex: RepositoryIndexProps;
+  RepositoryPolicy: RepositoryPolicyProps;
+  RepositoryDeclare: RepositoryDeclareProps;
+  GithubIntegration: GithubIntegrationProps;
   VerificationExecution: VerificationExecutionProps;
   StatStrip: StatStripProps;
   FacetRail: FacetRailProps;
@@ -254,6 +269,10 @@ const LOADERS: {
   VersionDiff: loadVersionDiff,
   VerifierDefinition: loadVerifierDefinition,
   RunsOn: loadRunsOn,
+  RepositoryIndex: loadRepositoryIndex,
+  RepositoryPolicy: loadRepositoryPolicy,
+  RepositoryDeclare: loadRepositoryDeclare,
+  GithubIntegration: loadGithubIntegration,
   VerificationExecution: loadExecution,
   StatStrip: loadStatStrip,
   FacetRail: loadFacetRail,

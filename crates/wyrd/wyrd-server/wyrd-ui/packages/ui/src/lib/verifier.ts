@@ -243,9 +243,11 @@ export interface RunsOnProps {
 /** The most owner Cards one `RunsOn` reads. */
 const OWNER_READS = 50;
 
-function runsWhen(runsOn: CardTypes.VerificationBinding['runs_on']): string {
+/** When a binding runs, as authored: a Trigger reference, a pull request, a schedule, a group end, or explicit invocation only. */
+export function runsWhen(runsOn: CardTypes.VerificationBinding['runs_on']): string {
   if (runsOn === null || runsOn === undefined) return 'explicit invocation only';
   if (typeof runsOn === 'string') return runsOn;
+  if ('kind' in runsOn && runsOn.kind === 'pull_request') return 'runs_on: pull_request';
   if ('cron' in runsOn) return `schedule ${runsOn.cron}${runsOn.tz ? ` ${runsOn.tz}` : ''}`;
   if ('after' in runsOn) return `group end after ${runsOn.after}`;
   return 'name' in runsOn && 'version' in runsOn ? `Trigger ${runsOn.name}@${runsOn.version}` : 'sibling Trigger';

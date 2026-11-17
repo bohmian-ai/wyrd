@@ -360,6 +360,174 @@
         "States: populated, empty, denied, error, loading. An owner opens through card.open; without a host handler the row is not a control."
       ]
     },
+    "RepositoryIndex": {
+      "status": "built",
+      "catalog": true,
+      "altitude": "quiet",
+      "consumers": [
+        "src/routes/t/[tenantKey]/repositories/+page.svelte",
+        "view documents (WyrdView)"
+      ],
+      "tokens": [
+        "--bg",
+        "--border",
+        "--border-soft",
+        "--danger",
+        "--declare",
+        "--declare-ink",
+        "--declare-soft",
+        "--evidence",
+        "--evidence-ink",
+        "--font-mono",
+        "--font-sans",
+        "--muted",
+        "--ok",
+        "--r",
+        "--selected-border",
+        "--surface",
+        "--surface-hover",
+        "--text",
+        "--warn",
+        "--weight-strong"
+      ],
+      "props": {
+        "input": "RepositoryIndexInput (schemas.ts)",
+        "result": "loader result",
+        "actions?": "per-action state",
+        "onaction?": "(intent) => void"
+      },
+      "rules": [
+        "One row per Repository Card family or reachable GitHub repository without a Card. Registration, GitHub access and automatic verification are separate columns, each a glyph and a word.",
+        "Access comes from the Card's server-derived status; the connection only explains its absence. A refused connection keeps the Cards; a refused Card keeps its row.",
+        "States: populated, denied, error, loading. Search and Show emit repository.filter; rows open through card.open or repository.declare; the connection through connection.open."
+      ]
+    },
+    "RepositoryPolicy": {
+      "status": "built",
+      "catalog": true,
+      "altitude": "quiet",
+      "consumers": [
+        "src/routes/t/[tenantKey]/repositories/[name]/+page.svelte",
+        "view documents (WyrdView)"
+      ],
+      "tokens": [
+        "--bg",
+        "--border",
+        "--border-soft",
+        "--danger",
+        "--declare",
+        "--declare-ink",
+        "--declare-soft",
+        "--evidence",
+        "--evidence-ink",
+        "--font-mono",
+        "--font-sans",
+        "--muted",
+        "--ok",
+        "--r",
+        "--selected-border",
+        "--surface",
+        "--surface-hover",
+        "--text",
+        "--warn",
+        "--weight-strong"
+      ],
+      "props": {
+        "input": "RepositoryPolicyInput (schemas.ts)",
+        "result": "loader result",
+        "actions?": "per-action state",
+        "onaction?": "(intent) => void"
+      },
+      "rules": [
+        "One exact Repository Card version: the viewed version is shown apart from the selected policy, and viewing never selects.",
+        "Bindings name the exact Verifier version and when it starts. The declaration is read-only; the wyrd.toml tab is a labelled projection of the Card.",
+        "No edit, activate, pause or rollback control. States: populated, denied, error, loading. Emits card.version, card.open, repository.declaration, connection.open."
+      ]
+    },
+    "RepositoryDeclare": {
+      "status": "built",
+      "catalog": true,
+      "altitude": "quiet",
+      "consumers": [
+        "src/routes/t/[tenantKey]/repositories/github/[repositoryId]/+page.svelte",
+        "view documents (WyrdView)"
+      ],
+      "tokens": [
+        "--bg",
+        "--border",
+        "--border-soft",
+        "--danger",
+        "--declare",
+        "--declare-ink",
+        "--declare-soft",
+        "--evidence",
+        "--evidence-ink",
+        "--font-mono",
+        "--font-sans",
+        "--muted",
+        "--ok",
+        "--r",
+        "--selected-border",
+        "--surface",
+        "--surface-hover",
+        "--text",
+        "--warn",
+        "--weight-strong"
+      ],
+      "props": {
+        "input": "RepositoryDeclareInput (schemas.ts)",
+        "result": "loader result",
+        "actions?": "per-action state",
+        "onaction?": "(intent) => void"
+      },
+      "rules": [
+        "One reachable GitHub repository with no Repository Card: its three facts, then the wyrd.toml and command that declare it. Nothing here registers anything.",
+        "An id the connection does not reach, or one a Card already names, is not found and names no repository.",
+        "States: populated, denied, error, loading. Emits connection.open."
+      ]
+    },
+    "GithubIntegration": {
+      "status": "built",
+      "catalog": true,
+      "altitude": "quiet",
+      "consumers": [
+        "src/routes/t/[tenantKey]/settings/integrations/github/+page.svelte",
+        "view documents (WyrdView)"
+      ],
+      "tokens": [
+        "--bg",
+        "--border",
+        "--border-soft",
+        "--danger",
+        "--declare",
+        "--declare-ink",
+        "--declare-soft",
+        "--evidence",
+        "--evidence-ink",
+        "--font-mono",
+        "--font-sans",
+        "--muted",
+        "--ok",
+        "--r",
+        "--selected-border",
+        "--surface",
+        "--surface-hover",
+        "--text",
+        "--warn",
+        "--weight-strong"
+      ],
+      "props": {
+        "input": "GithubIntegrationInput (schemas.ts)",
+        "result": "loader result",
+        "actions?": "per-action state",
+        "onaction?": "(intent) => void"
+      },
+      "rules": [
+        "The tenant's one GitHub App connection from the redacted view: state, installation, App and host, and the repositories it reaches beside their Repository Cards.",
+        "Connect and disconnect are host intents; a pending one takes no second press. Disconnect asks first in a native dialog. Managing access is a link to GitHub.",
+        "States: populated, denied, error, loading. A refused or unconfigured connection shows its problem and no action."
+      ]
+    },
     "VerificationExecution": {
       "status": "built",
       "catalog": true,

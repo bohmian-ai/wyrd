@@ -138,6 +138,24 @@ export const PromptInputSchema = z.object({ cardRef: promptRef }).strict();
 /** The input of a Verifier component: one exact Verifier Card. */
 export const VerifierInputSchema = z.object({ cardRef: CardRefSchema.extend({ kind: z.literal('Verifier') }) }).strict();
 
+/** The Show choices of the Repositories index: every row, ready ones, registered ones that start nothing, and repositories with no Card. */
+export const REPOSITORY_SHOWS = ['all', 'ready', 'inactive', 'undeclared'] as const;
+const repositoryFilters = { query: z.string().max(200).optional(), show: z.enum(REPOSITORY_SHOWS).optional() };
+
+/** The input of `RepositoryIndex`: the search text and the Show choice. */
+export const RepositoryIndexInputSchema = z.object(repositoryFilters).strict();
+
+/** The input of `RepositoryPolicy`: one exact Repository Card and which declaration text to show. */
+export const RepositoryPolicyInputSchema = z
+  .object({ cardRef: CardRefSchema.extend({ kind: z.literal('Repository') }), declaration: z.enum(['yaml', 'toml']).optional() })
+  .strict();
+
+/** The input of `RepositoryDeclare`: the provider's stable id of one reachable repository. */
+export const RepositoryDeclareInputSchema = z.object({ repositoryId: z.string().min(1).max(64) }).strict();
+
+/** The input of `GithubIntegration`: the tenant has one connection, so nothing. */
+export const GithubIntegrationInputSchema = z.object({}).strict();
+
 /** One invocation attempt of a step: its fan-out item and repeat iteration, each null when the step has none, and the one-based attempt. */
 export const ProducerSchema = z
   .object({ item_index: z.number().int().min(0).nullish(), iteration_index: z.number().int().min(0).nullish(), attempt: z.number().int().min(1) })
@@ -175,6 +193,16 @@ export const VersionDiffInputSchema = z
 const openCard = {
   description: 'Open this exact Card version.',
   input: z.object({ card_ref: CardRefSchema }).strict(),
+  completion: 'host-navigation'
+} as const;
+
+/** Open the tenant's GitHub connection settings. */
+const openConnection = { description: "Open the tenant's GitHub connection settings.", input: z.object({}).strict(), completion: 'host-navigation' } as const;
+
+/** Show how to declare a reachable repository that has no Card. */
+const declareRepository = {
+  description: 'Show how to declare a Repository Card for this reachable GitHub repository.',
+  input: z.object({ repository_id: z.string().min(1).max(64) }).strict(),
   completion: 'host-navigation'
 } as const;
 
@@ -610,6 +638,48 @@ export const components = {
     states: ['populated', 'empty', 'denied', 'error', 'loading'],
     emits: { 'card.open': openCard }
   },
+  RepositoryIndex: {
+    description:
+      "Repository Cards joined to the GitHub repositories the tenant's connection reaches, by provider repository id: registration, GitHub access and automatic verification as separate facts, with search and a Show choice.",
+    input: RepositoryIndexInputSchema,
+    states: ['populated', 'denied', 'error', 'loading'],
+    emits: {
+      'repository.filter': { description: 'Replace the search text and Show choice.', input: z.object(repositoryFilters).strict(), completion: 'host-navigation' },
+      'card.open': openCard,
+      'repository.declare': declareRepository,
+      'connection.open': openConnection
+    }
+  },
+  RepositoryPolicy: {
+    description:
+      "One exact Repository Card version: whether it is the selected policy, GitHub access, automatic verification, its exact Verifier bindings and its read-only declaration as Card YAML or a wyrd.toml projection.",
+    input: RepositoryPolicyInputSchema,
+    states: ['populated', 'denied', 'error', 'loading'],
+    emits: {
+      'card.version': { description: 'View another exact version of this Repository; selection does not change.', input: z.object({ card_ref: CardRefSchema }).strict(), completion: 'host-navigation' },
+      'card.open': openCard,
+      'repository.declaration': { description: 'Show the declaration as Card YAML or as a wyrd.toml projection.', input: z.object({ declaration: z.enum(['yaml', 'toml']) }).strict(), completion: 'host-navigation' },
+      'connection.open': openConnection
+    }
+  },
+  RepositoryDeclare: {
+    description: 'One reachable GitHub repository with no Repository Card: its three separate facts and the wyrd.toml and command that declare it.',
+    input: RepositoryDeclareInputSchema,
+    states: ['populated', 'denied', 'error', 'loading'],
+    emits: { 'connection.open': openConnection }
+  },
+  GithubIntegration: {
+    description:
+      "The tenant's one GitHub App connection: state, installation, App and host, the repositories it reaches beside their Repository Cards, connect, manage access on GitHub, and a confirmed disconnect.",
+    input: GithubIntegrationInputSchema,
+    states: ['populated', 'denied', 'error', 'loading'],
+    emits: {
+      'github.connect': { description: 'Start connecting this tenant to GitHub; the host continues on GitHub.', input: z.object({}).strict(), completion: 'host-action' },
+      'github.disconnect': { description: 'Disconnect this tenant from GitHub, after the reader confirmed.', input: z.object({}).strict(), completion: 'host-action' },
+      'card.open': openCard,
+      'repository.declare': declareRepository
+    }
+  },
   VerificationExecution: {
     description:
       "One exact verification execution: its lifecycle status and verdict, the graph of the Verifier it ran coloured by recorded state, " +
@@ -728,6 +798,14 @@ export type CardInventoryInput = z.infer<typeof CardInventoryInputSchema>;
 export type CardDetailInput = z.infer<typeof CardDetailInputSchema>;
 /** A validated `CardFacts` input. */
 export type CardFactsInput = z.infer<typeof CardFactsInputSchema>;
+/** A validated `RepositoryIndex` input. */
+export type RepositoryIndexInput = z.infer<typeof RepositoryIndexInputSchema>;
+/** A validated `RepositoryPolicy` input. */
+export type RepositoryPolicyInput = z.infer<typeof RepositoryPolicyInputSchema>;
+/** A validated `RepositoryDeclare` input. */
+export type RepositoryDeclareInput = z.infer<typeof RepositoryDeclareInputSchema>;
+/** A validated `GithubIntegration` input. */
+export type GithubIntegrationInput = z.infer<typeof GithubIntegrationInputSchema>;
 /** A validated `VerificationExecution` input. */
 export type ExecutionInput = z.infer<typeof ExecutionInputSchema>;
 /** A validated `VersionDiff` input. */

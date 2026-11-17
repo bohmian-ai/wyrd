@@ -58,6 +58,10 @@ import {
   UsedBy,
   VersionDiff,
   RunsOn,
+  RepositoryIndex,
+  RepositoryPolicy,
+  RepositoryDeclare,
+  GithubIntegration,
   VerifierDefinition,
   VerifierGraph,
   VerificationExecution,
@@ -99,6 +103,10 @@ import {
   loadVersionDiff,
   definitionGraph,
   loadRunsOn,
+  loadRepositoryIndex,
+  loadRepositoryPolicy,
+  loadRepositoryDeclare,
+  loadGithubIntegration,
   loadVerifierDefinition,
   executionStates,
   loadExecution,
@@ -162,6 +170,7 @@ import {
   observeAnswer,
   RANGE,
   registered,
+  repositories,
   series,
   service,
   SESSION_VERIFIER,
@@ -409,7 +418,7 @@ test('TASK-003: Validated portable rendering', async () => {
   expect(noVersions.container).toHaveTextContent('versions unavailable: Forbidden (WYRD_AUTH_403_FORBIDDEN)');
   expect(noVersions.getByRole('heading', { level: 2 })).toHaveTextContent('ranker');
   noVersions.unmount();
-  for (const result of [{ state: 'loading' }, { state: 'denied', problem: denied }, { state: 'error', problem: { code: 'WYRD_REGISTRY_404_NOT_FOUND', title: 'Not found' } }] as const) {
+  for (const result of [{ state: 'loading' }, { state: 'denied', problem: denied }, { state: 'error', problem: { code: 'WYRD_SPEC_404_NOT_FOUND', title: 'Not found' } }] as const) {
     const view = render(CardHeader, { input: { cardRef: card }, result });
     expect(view.container.querySelector('.state')).toHaveAttribute('data-state', result.state);
     view.unmount();
@@ -803,7 +812,7 @@ test('the GitHub connection read runs as the existing SDK and MCP operations', a
   } finally {
     connect.mockRestore();
   }
-  const app = { callServerTool: vi.fn(async () => ({ content: [], structuredContent: connection })) };
+  const app = { callServerTool: vi.fn(async (_call: unknown) => ({ content: [], structuredContent: connection })) };
   expect(await mcpExecutor(app as never).run(requests)).toEqual([{ ok: true, value: connection }]);
   expect(app.callServerTool.mock.calls[0][0]).toEqual({ name: 'github_connection.get', arguments: {} });
 });
@@ -1319,6 +1328,10 @@ test('TASK-004: Canonical signal interactions', async () => {
     'VersionDiff',
     'VerifierDefinition',
     'RunsOn',
+    'RepositoryIndex',
+    'RepositoryPolicy',
+    'RepositoryDeclare',
+    'GithubIntegration',
     'VerificationExecution',
     'StatStrip',
     'FacetRail',
@@ -3254,4 +3267,310 @@ test('an executions list keeps status and verdict apart, names Verifiers the hos
   expect(chart.container.querySelector('.key i.hollow')?.parentElement).toHaveTextContent('no verdict');
   expect(chart.container.querySelectorAll('rect.segment.hollow').length).toBeGreaterThan(0);
   chart.unmount();
+});
+
+test('the Repositories index joins Repository Cards and GitHub access by repository id', async () => {
+  const reads = fixtureRecording();
+  const index = await loadRepositoryIndex({}, { executor: reads.executor });
+  expect(ops(reads.calls)).toEqual(['github.get_connection', 'cards.list', 'cards.get_by_ref', 'cards.get_by_ref', 'cards.get_by_ref']);
+  if (index.result.state !== 'populated') throw new Error(index.result.state);
+  expect(index.result.data.total).toBe(4);
+  expect(index.result.data.rows).toMatchObject([
+    { card: { name: 'docs-site', versions: 2, selected: '0.3.0' }, fullName: 'acme/docs-site', access: 'granted', readiness: 'none', bindings: 0 },
+    { card: { name: 'ledger', versions: 2, selected: '1.1.0' }, repositoryId: '702551908', access: 'removed', readiness: 'inactive', bindings: 1 },
+    { card: { name: 'payments-api', versions: 2, selected: '1.4.0' }, fullName: 'acme/payments-api', access: 'granted', readiness: 'ready', bindings: 2 },
+    { repositoryId: '741660215', fullName: 'acme/web-checkout', access: 'granted', readiness: 'undeclared' }
+  ]);
+  expect(index.result.data.rows[3].card).toBeUndefined();
+
+  // Search and Show narrow the same bounded join; the total stays the whole of it.
+  const shown = async (input: object) => {
+    const loaded = await loadRepositoryIndex(input, { executor: fixtureExecutor });
+    return loaded.result.state === 'populated' ? loaded.result.data.rows.map((row) => row.card?.name ?? row.fullName) : loaded.result.state;
+  };
+  expect(await shown({ show: 'ready' })).toEqual(['payments-api']);
+  expect(await shown({ show: 'inactive' })).toEqual(['docs-site', 'ledger']);
+  expect(await shown({ show: 'undeclared' })).toEqual(['acme/web-checkout']);
+  expect(await shown({ query: 'ACME/pay' })).toEqual(['payments-api']);
+  expect(await shown({ query: 'ledger', show: 'ready' })).toEqual([]);
+  expect(validatePanel('RepositoryIndex', { show: 'paused' })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+
+  // A lost or absent connection changes access words, never the Cards; nothing without a Card is listed.
+  const withConnection = (view: object) => fixtureRecording((request) => (request.op === 'github.get_connection' ? { ok: true, value: view as never } : undefined)).executor;
+  const lost = await loadRepositoryIndex({}, { executor: withConnection({ ...connection, state: 'suspended', repositories: [] }) });
+  expect(lost.result).toMatchObject({ state: 'populated', data: { total: 3, rows: [{ access: 'granted' }, { access: 'lost', readiness: 'inactive' }, { access: 'granted' }] } });
+  const none = await loadRepositoryIndex({}, { executor: withConnection({ host: 'github.com', app: connection.app, state: 'not_connected', repositories: [] }) });
+  expect(none.result).toMatchObject({ state: 'populated', data: { rows: [{}, { access: 'none', readiness: 'inactive' }, {}] } });
+
+  // Integration permission is separate from Card permission: a refused connection keeps the Cards and guesses no access reason.
+  const noIntegration = await loadRepositoryIndex({}, { executor: fixtureRecording((request) => (request.op === 'github.get_connection' ? { ok: false, problem: denied } : undefined)).executor });
+  expect(noIntegration.result).toMatchObject({
+    state: 'populated',
+    data: { total: 3, connection: { state: 'denied' }, rows: [{ access: 'granted', readiness: 'none' }, { access: 'unreachable', readiness: 'inactive' }, { access: 'granted', readiness: 'ready' }] }
+  });
+  // A refused Card listing is the panel's state and no Card is read after it.
+  const noCards = fixtureRecording((request) => (request.op === 'cards.list' ? { ok: false, problem: denied } : undefined));
+  expect((await loadRepositoryIndex({}, { executor: noCards.executor })).result).toEqual({ state: 'denied', problem: denied });
+  expect(ops(noCards.calls)).toEqual(['github.get_connection', 'cards.list']);
+  // One refused Card read keeps its row; repositories without a Card are then not claimed.
+  const oneRefused = await loadRepositoryIndex({}, { executor: fixtureRecording((request) => (request.op === 'cards.get_by_ref' && request.card_ref.name === 'ledger' ? { ok: false, problem: failure } : undefined)).executor });
+  expect(oneRefused.result).toMatchObject({ state: 'populated', data: { total: 3, partial: expect.stringContaining('could not be read'), rows: [{}, { card: { name: 'ledger' }, problem: failure }, {}] } });
+
+  const onaction = vi.fn();
+  const view = render(RepositoryIndex, { ...index, onaction });
+  const rows = within(view.container).getAllByRole('row');
+  expect(rows).toHaveLength(5);
+  expect(within(rows[0]).getAllByRole('columnheader').map((cell) => cell.textContent)).toEqual(['Repository', 'Card version', 'GitHub access', 'Automatic verification']);
+  expect(rows[1]).toHaveTextContent('Not configured');
+  expect(rows[1]).toHaveTextContent('Selected version 0.3.0 has verifier = [].');
+  expect(rows[2]).toHaveTextContent('Removed');
+  expect(rows[2]).toHaveTextContent('No new executions start without GitHub access. 1 binding stay declared.');
+  expect(rows[3]).toHaveTextContent('Repository Card · acme/payments-api');
+  expect(rows[3]).toHaveTextContent('selected of 2');
+  expect(rows[3]).toHaveTextContent('2 Verifiers run on pull_request.');
+  expect(rows[4]).toHaveTextContent('no Card');
+  expect(rows[4]).toHaveTextContent('Not declared');
+  expect(view.container).toHaveTextContent('4 of 4 shown');
+  expect(view.container).toHaveTextContent('Granting GitHub access never registers a Repository Card or binds Verifiers. Declare a wyrd.toml to register one.');
+  expect(view.container.querySelector('[role="status"]')).toBeNull();
+  await fireEvent.click(within(rows[3]).getByRole('button', { name: 'payments-api' }));
+  await fireEvent.click(within(rows[4]).getByRole('button', { name: 'acme/web-checkout' }));
+  await fireEvent.input(within(view.container).getByRole('searchbox', { name: 'Filter repositories' }), { target: { value: 'pay' } });
+  await fireEvent.submit(within(view.container).getByRole('searchbox').closest('form') as HTMLFormElement);
+  await fireEvent.click(within(within(view.container).getByRole('group', { name: 'Show' })).getByRole('button', { name: 'Not verifying' }));
+  const intents = onaction.mock.calls.map(([intent]) => intent);
+  expect(intents).toEqual([
+    { name: 'card.open', input: { card_ref: { kind: 'Repository', name: 'payments-api', version: '1.4.0' } } },
+    { name: 'repository.declare', input: { repository_id: '741660215' } },
+    { name: 'repository.filter', input: { query: 'pay' } },
+    { name: 'repository.filter', input: { show: 'inactive' } }
+  ]);
+  for (const intent of intents) expect(validateIntent('RepositoryIndex', intent)).toEqual(intent);
+
+  // Without a working connection the banner says so and leads to the connection; a filter with no match says that.
+  const banner = render(RepositoryIndex, { ...lost, onaction });
+  expect(within(banner.container).getByRole('status')).toHaveTextContent('GitHub installation access is lost. Registered Repository Cards stay readable; no new verification starts.');
+  await fireEvent.click(within(banner.container).getByRole('button', { name: 'Connection settings' }));
+  expect(onaction).toHaveBeenLastCalledWith({ name: 'connection.open', input: {} });
+  expect(render(RepositoryIndex, none).container).toHaveTextContent('GitHub is not connected.');
+  expect(render(RepositoryIndex, noIntegration).container).toHaveTextContent(`GitHub connection unavailable: ${denied.title} (${denied.code})`);
+  expect(render(RepositoryIndex, await loadRepositoryIndex({ query: 'zzz' }, { executor: fixtureExecutor })).container).toHaveTextContent('No repositories match this filter.');
+  expect(render(RepositoryIndex, oneRefused).container).toHaveTextContent(`${failure.title} (${failure.code})`);
+  expect(render(RepositoryIndex, { input: {}, result: { state: 'denied', problem: denied } }).container).toHaveTextContent(denied.code);
+  expect(render(RepositoryIndex, { input: {}, result: { state: 'loading' } }).container).toHaveTextContent('Loading repositories');
+});
+
+test('a Repository Card shows the viewed version apart from the selected policy, its exact bindings and a read-only declaration', async () => {
+  const selected = { kind: 'Repository', name: 'payments-api', version: '1.4.0' } as const;
+  const older = { ...selected, version: '1.3.0' } as const;
+  const reads = fixtureRecording();
+  const policy = await loadRepositoryPolicy({ cardRef: selected }, { executor: reads.executor });
+  expect(ops(reads.calls)).toEqual(['cards.get_by_ref', 'cards.list', 'github.get_connection']);
+  expect(policy.result).toMatchObject({
+    state: 'populated',
+    data: {
+      selected: true,
+      access: 'granted',
+      readiness: 'ready',
+      bindings: [
+        { name: 'pr-review', version: '1.3.0', startsOn: 'runs_on: pull_request', state: 'active' },
+        { name: 'dependency-audit', version: '0.4.0', startsOn: 'runs_on: pull_request', state: 'active' }
+      ]
+    }
+  });
+  const onaction = vi.fn();
+  const view = render(RepositoryPolicy, { ...policy, onaction });
+  expect(within(view.container).getByRole('heading', { level: 1 })).toHaveTextContent('payments-api');
+  expect(view.container).toHaveTextContent('✓ selected');
+  expect(view.container).toHaveTextContent('Repository/payments-api@1.4.0');
+  expect(view.container).toHaveTextContent('2 versions · selected 1.4.0');
+  expect(view.container).toHaveTextContent('Installation 41822907 can read acme/payments-api.');
+  expect(view.container.querySelector('[role="status"]')).toBeNull();
+  expect([...within(view.container).getByRole('combobox', { name: 'Card version' }).querySelectorAll('option')].map((option) => option.textContent)).toEqual(['1.4.0 · selected', '1.3.0']);
+  expect(within(view.container).getByRole('link', { name: 'acme/payments-api ↗' })).toHaveAttribute('href', 'https://github.com/acme/payments-api');
+  expect(within(view.container).getAllByRole('columnheader').map((cell) => cell.textContent)).toEqual(['Verifier', 'Exact version', 'Starts on', 'Binding', 'Definition']);
+  // The declaration is the Card as returned, read-only.
+  expect(view.container.querySelector('pre')?.textContent).toBe(fmtYaml(repositories['payments-api@1.4.0']));
+  expect(view.container).toHaveTextContent('Read-only. Change policy by editing the declaration and running wyrd declare.');
+  expect(view.container.querySelector('input, textarea, [contenteditable]')).toBeNull();
+  expect(view.container.textContent).not.toMatch(/Activate|Pause|Roll back/);
+
+  await fireEvent.change(within(view.container).getByRole('combobox', { name: 'Card version' }), { target: { value: '1.3.0' } });
+  await fireEvent.click(within(view.container).getAllByRole('button', { name: 'Verifier definition' })[1]);
+  await fireEvent.click(within(view.container).getByRole('tab', { name: 'wyrd.toml' }));
+  await fireEvent.click(within(view.container).getByRole('button', { name: 'Manage connection' }));
+  const intents = onaction.mock.calls.map(([intent]) => intent);
+  expect(intents).toEqual([
+    { name: 'card.version', input: { card_ref: older } },
+    { name: 'card.open', input: { card_ref: { kind: 'Verifier', name: 'dependency-audit', version: '0.4.0' } } },
+    { name: 'repository.declaration', input: { declaration: 'toml' } },
+    { name: 'connection.open', input: {} }
+  ]);
+  for (const intent of intents) expect(validateIntent('RepositoryPolicy', intent)).toEqual(intent);
+
+  // Viewing an older version reads the selected one for readiness and changes nothing: the page says which is selected.
+  const olderReads = fixtureRecording();
+  const viewed = await loadRepositoryPolicy({ cardRef: older, declaration: 'toml' }, { executor: olderReads.executor });
+  expect(olderReads.calls.map((call) => call.request).filter((request) => request.op === 'cards.get_by_ref')).toEqual([
+    { op: 'cards.get_by_ref', card_ref: older },
+    { op: 'cards.get_by_ref', card_ref: selected }
+  ]);
+  expect(viewed.result).toMatchObject({ state: 'populated', data: { selected: false, selectedVersion: '1.4.0', readiness: 'ready', bindings: [{ name: 'pr-review', state: 'not selected' }] } });
+  const old = render(RepositoryPolicy, { ...viewed, onaction });
+  expect(old.container).toHaveTextContent('not selected · viewing only');
+  expect(within(old.container).getByRole('status')).toHaveTextContent(
+    'You are viewing 1.3.0. Automatic verification uses the selected version 1.4.0; viewing does not change it. To select 1.3.0 again, declare it with wyrd declare.'
+  );
+  await fireEvent.click(within(old.container).getByRole('button', { name: 'View 1.4.0' }));
+  expect(onaction).toHaveBeenLastCalledWith({ name: 'card.version', input: { card_ref: selected } });
+  // The wyrd.toml tab is a labelled projection of the Card, never the file the author wrote.
+  const toml = old.container.querySelector('pre')?.textContent ?? '';
+  expect(toml).toContain('# Projection of Repository/payments-api@1.3.0, not the declared file.');
+  expect(toml).toContain('[repository.verified_by]\nverifier = [\n  { kind = "Verifier", name = "pr-review", version = "1.3.0" },\n]\nruns_on = { kind = "pull_request" }');
+  expect(old.container).toHaveTextContent('Reconstructed from the Card');
+
+  // Access removed on GitHub: the bindings stay declared and inactive.
+  const removed = await loadRepositoryPolicy({ cardRef: { kind: 'Repository', name: 'ledger', version: '1.1.0' } }, { executor: fixtureExecutor });
+  expect(removed.result).toMatchObject({ state: 'populated', data: { access: 'removed', readiness: 'inactive', bindings: [{ state: 'inactive · no access' }] } });
+  const lostView = render(RepositoryPolicy, removed);
+  expect(lostView.container).toHaveTextContent('Removed');
+  expect(lostView.container).toHaveTextContent('Inactive');
+  expect(lostView.container).toHaveTextContent('repository_id 702551908');
+  expect(within(lostView.container).queryByRole('link')).toBeNull();
+  // An empty policy is a valid selected version that starts nothing.
+  const empty = await loadRepositoryPolicy({ cardRef: { kind: 'Repository', name: 'docs-site', version: '0.3.0' } }, { executor: fixtureExecutor });
+  expect(empty.result).toMatchObject({ state: 'populated', data: { selected: true, access: 'granted', readiness: 'none', bindings: [] } });
+  expect(render(RepositoryPolicy, empty).container).toHaveTextContent('Version 0.3.0 declares verifier = []. Pull requests start no automatic verification; GitHub access is unaffected.');
+  // A refused connection read leaves policy readable and guesses no reason.
+  const noIntegration = await loadRepositoryPolicy({ cardRef: { kind: 'Repository', name: 'ledger', version: '1.1.0' } }, { executor: fixtureRecording((request) => (request.op === 'github.get_connection' ? { ok: false, problem: denied } : undefined)).executor });
+  expect(noIntegration.result).toMatchObject({ state: 'populated', data: { access: 'unreachable', bindings: [{ name: 'pr-review' }] } });
+  expect(render(RepositoryPolicy, noIntegration).container).toHaveTextContent('No access');
+
+  // A refused, missing or foreign Card is the panel's state, with no connection read after it.
+  for (const state of ['denied', 'error'] as const) {
+    const refused = await loadRepositoryPolicy({ cardRef: selected }, { executor: stateExecutors[state] });
+    expect(refused.result.state).toBe(state);
+    expect(render(RepositoryPolicy, refused).container.querySelector('table, pre')).toBeNull();
+  }
+  const missing = fixtureRecording();
+  expect((await loadRepositoryPolicy({ cardRef: { ...selected, version: '9.9.9' } }, { executor: missing.executor })).result).toEqual({ state: 'error', problem: notFound });
+  expect(ops(missing.calls)).toEqual(['cards.get_by_ref']);
+  expect(validatePanel('RepositoryPolicy', { cardRef: VERIFIER })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+  expect(render(RepositoryPolicy, { input: { cardRef: selected }, result: { state: 'loading' } }).container).toHaveTextContent('Loading payments-api@1.4.0');
+});
+
+test('an accessible repository without a Card shows how to declare one, and an unknown id shows nothing', async () => {
+  const declare = await loadRepositoryDeclare({ repositoryId: '741660215' }, { executor: fixtureExecutor });
+  expect(declare.result).toMatchObject({ state: 'populated', data: { repositoryId: '741660215', fullName: 'acme/web-checkout', host: 'github.com' } });
+  const onaction = vi.fn();
+  const view = render(RepositoryDeclare, { ...declare, onaction });
+  expect(within(view.container).getByRole('heading', { level: 1 })).toHaveTextContent('acme/web-checkout');
+  expect(view.container).toHaveTextContent('no Repository Card');
+  expect(view.container).toHaveTextContent('github · github.com · repository_id 741660215');
+  expect(view.container).toHaveTextContent('GitHub access is granted, but nothing is registered. Access alone never creates a Card, binds a Verifier or starts verification.');
+  for (const word of ['Not registered', 'Granted', 'Not declared']) expect(view.container).toHaveTextContent(word);
+  expect(view.container.querySelector('pre')?.textContent).toContain('[repository.verified_by]\nverifier = [\n  "./review/pr-review.yaml",\n]\nruns_on = { kind = "pull_request" }');
+  expect(view.container).toHaveTextContent('wyrd declare wyrd.toml');
+  expect(within(view.container).getByRole('link', { name: 'acme/web-checkout ↗' })).toHaveAttribute('href', 'https://github.com/acme/web-checkout');
+
+  // An id the connection does not reach, a foreign one, or one that already has a Card names no repository.
+  for (const repositoryId of ['999', '718204331']) {
+    const unknown = await loadRepositoryDeclare({ repositoryId }, { executor: fixtureExecutor });
+    expect(unknown.result).toMatchObject({ state: 'error', problem: { code: 'WYRD_SPEC_404_NOT_FOUND' } });
+    const shown = render(RepositoryDeclare, unknown);
+    expect(shown.container.querySelector('pre, dl')).toBeNull();
+    expect(shown.container.textContent).not.toMatch(/acme\//);
+  }
+  // A refused connection read is the panel's state and reads no Card after it.
+  const refused = fixtureRecording((request) => (request.op === 'github.get_connection' ? { ok: false, problem: denied } : undefined));
+  expect((await loadRepositoryDeclare({ repositoryId: '741660215' }, { executor: refused.executor })).result).toEqual({ state: 'denied', problem: denied });
+  expect(ops(refused.calls)).toEqual(['github.get_connection']);
+  expect(validatePanel('RepositoryDeclare', { repositoryId: '' })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+});
+
+test('the GitHub integration shows safe connection state and asks before disconnecting', async () => {
+  const reads = fixtureRecording();
+  const github = await loadGithubIntegration({}, { executor: reads.executor });
+  expect(ops(reads.calls).slice(0, 2)).toEqual(['github.get_connection', 'cards.list']);
+  const onaction = vi.fn();
+  const view = render(GithubIntegration, { ...github, onaction });
+  expect(view.container).toHaveTextContent('Connected');
+  for (const fact of ['41822907', 'App wyrd-verify', 'github.com', 'Configured for this deployment']) expect(view.container).toHaveTextContent(fact);
+  expect(within(view.container).getByRole('link', { name: 'Manage access on GitHub ↗' })).toHaveAttribute('href', 'https://github.com/apps/wyrd-verify/installations/new');
+  const table = within(view.container).getByRole('table');
+  expect(within(table).getAllByRole('columnheader').map((cell) => cell.textContent)).toEqual(['GitHub repository', 'repository_id', 'Repository Card (registration is separate)', 'Automatic verification']);
+  const rows = within(table).getAllByRole('row');
+  expect(rows).toHaveLength(4);
+  expect(rows[1]).toHaveTextContent('Repository/payments-api@1.4.0');
+  expect(rows[1]).toHaveTextContent('Ready');
+  expect(rows[2]).toHaveTextContent('Not configured');
+  expect(rows[3]).toHaveTextContent('no Card');
+  await fireEvent.click(within(rows[1]).getByRole('button', { name: 'Repository/payments-api@1.4.0' }));
+  await fireEvent.click(within(rows[3]).getByRole('button', { name: 'How to declare' }));
+  // Disconnect asks first in a native dialog: closing it without confirming sends nothing, confirming sends one intent.
+  // jsdom has no modal dialogs, so this drives the dialog's own close event; Chromium proves the real one.
+  const dialog = view.container.querySelector('dialog') as HTMLDialogElement;
+  const showModal = vi.fn();
+  dialog.showModal = showModal;
+  await fireEvent.click(within(view.container).getByRole('button', { name: 'Disconnect' }));
+  expect(showModal).toHaveBeenCalledOnce();
+  expect(onaction).toHaveBeenCalledTimes(2);
+  expect(dialog).toHaveTextContent('New verification stops for 2 Repository Cards with access (docs-site, payments-api).');
+  expect(dialog).toHaveTextContent('Unfinished executions for those repositories are cancelled.');
+  expect(dialog).toHaveTextContent('Recorded executions, verdicts and evidence stay. Repository Cards and versions are unchanged.');
+  expect([...dialog.querySelectorAll('button')].map((button) => [button.textContent, button.value])).toEqual([['Cancel', 'cancel'], ['Disconnect GitHub', 'confirm']]);
+  expect(dialog.querySelector('form')).toHaveAttribute('method', 'dialog');
+  dialog.returnValue = 'cancel';
+  await fireEvent(dialog, new Event('close'));
+  expect(onaction).toHaveBeenCalledTimes(2);
+  dialog.returnValue = 'confirm';
+  await fireEvent(dialog, new Event('close'));
+  const intents = onaction.mock.calls.map(([intent]) => intent);
+  expect(intents).toEqual([
+    { name: 'card.open', input: { card_ref: { kind: 'Repository', name: 'payments-api', version: '1.4.0' } } },
+    { name: 'repository.declare', input: { repository_id: '741660215' } },
+    { name: 'github.disconnect', input: {} }
+  ]);
+  for (const intent of intents) expect(validateIntent('GithubIntegration', intent)).toEqual(intent);
+  // The props and markup carry the redacted view only.
+  expect(`${JSON.stringify(github)}${view.container.innerHTML}`).not.toMatch(/secret|private_key|token|pem|webhook/i);
+
+  // A pending or refused action is reported by the host and takes no second press.
+  const pending = render(GithubIntegration, { ...github, onaction, actions: { 'github.disconnect': { state: 'pending' } } });
+  expect(within(pending.container).getByRole('button', { name: 'Disconnect' })).toBeDisabled();
+  const refusedAction = render(GithubIntegration, { ...github, onaction, actions: { 'github.disconnect': { state: 'error', problem: denied } } });
+  expect(refusedAction.container).toHaveTextContent(denied.code);
+  expect(within(render(GithubIntegration, github).container).getByRole('button', { name: 'Disconnect' })).toBeDisabled();
+
+  // Not connected: one way in, and no repository table.
+  const withConnection = (view: object) => fixtureRecording((request) => (request.op === 'github.get_connection' ? { ok: true, value: view as never } : undefined)).executor;
+  const none = await loadGithubIntegration({}, { executor: withConnection({ host: 'github.com', app: connection.app, state: 'not_connected', repositories: [] }) });
+  const start = render(GithubIntegration, { ...none, onaction });
+  expect(start.container).toHaveTextContent('Not connected');
+  expect(start.container).toHaveTextContent('GitHub handles App installation, your authorization and which repositories Wyrd may read on github.com.');
+  expect(within(start.container).queryByRole('table')).toBeNull();
+  await fireEvent.click(within(start.container).getByRole('button', { name: 'Connect GitHub' }));
+  expect(onaction).toHaveBeenLastCalledWith({ name: 'github.connect', input: {} });
+  expect(within(render(GithubIntegration, { ...none, onaction, actions: { 'github.connect': { state: 'pending' } } }).container).getByRole('button', { name: 'Connect GitHub' })).toBeDisabled();
+  // Access lost: the state says so and no repository is claimed.
+  const lost = render(GithubIntegration, await loadGithubIntegration({}, { executor: withConnection({ ...connection, state: 'suspended', repositories: [] }) }));
+  expect(lost.container).toHaveTextContent('Access lost');
+  expect(lost.container).toHaveTextContent('No repository access while the installation is suspended or removed. Registered Repository Cards and their history stay readable.');
+
+  // Denied, and an unconfigured App, are the connection's own states; no Card is read after either.
+  const notConfigured = { code: 'WYRD_GITHUB_503_NOT_CONFIGURED', title: 'GitHub App not configured', status: 503 };
+  for (const problem of [denied, notConfigured]) {
+    const refused = fixtureRecording((request) => (request.op === 'github.get_connection' ? { ok: false, problem } : undefined));
+    const loaded = await loadGithubIntegration({}, { executor: refused.executor });
+    expect(ops(refused.calls)).toEqual(['github.get_connection']);
+    const shown = render(GithubIntegration, { ...loaded, onaction });
+    expect(shown.container).toHaveTextContent(problem.code);
+    expect(within(shown.container).queryByRole('button')).toBeNull();
+  }
+  // Refused Cards keep the connection and its repositories; registration is then not claimed either way.
+  const noCards = await loadGithubIntegration({}, { executor: fixtureRecording((request) => (request.op === 'cards.list' ? { ok: false, problem: denied } : undefined)).executor });
+  const cardless = render(GithubIntegration, noCards);
+  expect(within(cardless.container).getAllByRole('row')).toHaveLength(4);
+  expect(cardless.container).toHaveTextContent(`Repository Cards unavailable: ${denied.title} (${denied.code})`);
+  expect(cardless.container.textContent).not.toMatch(/no Card|Not declared/);
 });

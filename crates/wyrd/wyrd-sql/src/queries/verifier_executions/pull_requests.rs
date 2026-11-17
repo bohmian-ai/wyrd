@@ -469,6 +469,10 @@ struct GenerationRow {
     pr_deactivated_at: Option<DateTime<Utc>>,
 }
 
+/// A reserved pull request generation: its executions in target order and
+/// the older executions it superseded.
+pub type Reserved = (Vec<ExecutionId>, Vec<ExecutionId>);
+
 impl VerifierExecutionQueue {
     /// The database time a PR observation is ordered by, read before the
     /// provider's current PR state is: a later observation always reads
@@ -734,7 +738,7 @@ impl VerifierExecutionQueue {
         activation: &PullRequestActivation,
         observed_at: DateTime<Utc>,
         targets: &[PullRequestTarget],
-    ) -> Result<Admitted<(Vec<ExecutionId>, Vec<ExecutionId>)>, SqlxError> {
+    ) -> Result<Admitted<Reserved>, SqlxError> {
         timed("pull_request_reserve", async {
             let key = PullRequestKey {
                 host: &activation.host,

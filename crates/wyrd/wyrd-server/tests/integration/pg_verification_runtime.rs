@@ -2851,6 +2851,9 @@ async fn terminal_failures_use_one_acknowledged_settlement() {
             harness.expire(run).await;
         }
         wait_until("the claim", || script.entered() == entered + claims).await;
+        // Flush the claim's `running` status row, so the hold takes the
+        // failure's state revision.
+        harness.fault.sent().await;
         let hold = harness.fault.hold_next(EVENTS);
         if !timeout {
             script.release();
@@ -4303,16 +4306,21 @@ async fn the_runner_claims_no_more_than_its_execution_slots() {
 async fn a_parked_attempt_keeps_its_claim_until_acknowledged() {
     let harness = Harness::start().await;
     let script = EngineScript::default();
+    script.hold();
     let run = harness.submit().await;
     script.push(EngineOutcome::Parked(
         [SlotName::new("ci").expect("slot name")].into(),
         Vec::new(),
     ));
+    let runtime = harness.spawn(&Harness::limits(), &script);
+    wait_until("the claim", || script.entered() == 1).await;
+    // Flush the claim's `running` status row, so the stall takes the park.
+    harness.fault.sent().await;
     let stall = harness
         .server
         .stall_next_bifrost_write_into("bifrost.verification.execution_events")
         .expect("Scribe stalls");
-    let runtime = harness.spawn(&Harness::limits(), &script);
+    script.release();
     stall.wait_entered().await;
     let pool = harness.assertion.clone();
     let leased = || {

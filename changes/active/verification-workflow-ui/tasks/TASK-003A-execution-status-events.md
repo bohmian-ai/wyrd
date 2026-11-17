@@ -96,6 +96,12 @@ repository PostgreSQL → public Bifrost query journey owner in
    newest row is `cancelled`, with the specified identity/null fields, and domain
    inspection agrees. Repeat cancellation and observe no additional transition
    row. Today this fails because cancellation publishes no status event.
+   - Proof: `verification_runtime::pending_cancellation_records_cancelled_status`
+     (command J). RED: `<id> never listed cancelled: {}, history []`. GREEN:
+     PASS. The test reads the newest row through `bifrost.query` and checks
+     `sequence = 0`, the Verifier, subject and actor ids, ten null content
+     columns and a null `value`. Inspection answers `cancelled`, and a repeat
+     cancel leaves the history at one row. Status: PASS.
 2. **Runner lifecycle.** Hold executions at running, retrying, deferred-input
    waiting and approval waiting; query each while held, then let work complete
    or terminate with timeout/error. Each newest status has the exact serialized
@@ -103,6 +109,26 @@ repository PostgreSQL → public Bifrost query journey owner in
    fallback path in focused owner proof. Release/defer previously claimed work
    without parking and observe the resulting pending/retrying status. Today no
    `event = status` rows exist.
+   - Proof: `verification_runtime::runner_transitions_record_lifecycle_status`
+     (command J). RED: `never listed completed: {}, history []`. GREEN: PASS.
+     The test queries `running`, both parks as `waiting` and `retrying` while
+     each is held, and checks that the queue stores no `waiting`. It covers
+     completion, `errored` and `timed_out` terminations, a deferral recording
+     `pending`, and a release of claimed work recording `pending`.
+   - Exhaustion: `pg_verification_runtime::retryable_engine_failures_exhaust_to_errored`
+     (command R) asserts
+     `[running, retrying, running, retrying, running, errored]`.
+   - Group commit: `pg_verification_runtime::failed_group_commits_retry_as_groups`
+     (command R) asserts `[running, completed]` per run through the batched
+     statement.
+   - Fallback: no test can force it, because it needs a dead flusher. Source
+     proof: in `runner.rs`, `settle` stages from the one `(outcome, status)`
+     pair that `apply` returns. The batched path and `settle_alone` both build
+     that pair with `recorded(.., Completed)`.
+   - Release and deferral return the stored status from
+     `RELEASE_SQL ... RETURNING status`; command Q asserts `Some(Pending)` and
+     `None` for a stale lease.
+   - Status: PASS. The fallback is proved by source inspection only.
 3. **Running cancellation and revocation.** Cancel held running work through
    the public operation; revoke a principal with multiple unfinished executions
    through the public revocation operation. Each affected execution lists as
@@ -110,6 +136,20 @@ repository PostgreSQL → public Bifrost query journey owner in
    completion/status rows. Preserve existing cancellation fencing behavior.
    Include focused proof for admission-time principal cancellation. Today the
    queue cancels correctly but the per-execution Bifrost rows are absent.
+   - Proof: `verification_runtime::running_cancellation_and_revocation_record_cancelled_status`
+     (command J). RED: `never listed running: {}, history []`. GREEN: PASS.
+     Cancelling held running work records `[running, cancelled]`. After the
+     worker is released the queue stays `cancelled` and no stale row appears.
+     Revoking the submitter cancels both its running and its pending
+     execution, recording `[running, cancelled]` and `[cancelled]`.
+   - Admission-time proof is in `pg_verifier_executions` (command Q).
+     `revocation_and_admission_order_on_the_principal` asserts the exact
+     `CancelledExecution` that the revocation returns and that a submission
+     admission returns. `background_admission_of_a_revoked_owner_is_cancelled`
+     does the same for scheduled and group admissions.
+   - The existing fencing assertions are unchanged: the 40 queue tests
+     (command Q) and 23 `wyrd-auth` revocation and issuance tests (command A)
+     pass. Status: PASS.
 4. **Existing write and recovery boundaries.** In focused outbox proof, stage
    several status events and assert they share the ordinary execution-events
    frame, preserve per-row attribution and retain event identity on retry. In
@@ -117,6 +157,57 @@ repository PostgreSQL → public Bifrost query journey owner in
    recovery and tenant-isolation assertions passing; status rows must never be
    selected as checkpoint revisions. These guard the required unchanged paths,
    rather than defining another recovery mechanism.
+   - Proof: `scribe_outbox::tests::status_rows_share_one_frame_and_keep_identity_on_retry`
+     (command O). Status writes for three executions share one
+     execution-events frame. Each row keeps its attribution pair, status,
+     `sequence = 0`, null content and occurrence time. A refused attempt and a
+     redelivery resubmit one batch id with identical bytes and event ids.
+     GREEN: PASS. There is no RED, because the test was written after the
+     `Status` variant.
+   - Rollback: in the group-commit test above the first batch fails, and each
+     run still records exactly one `completed`. In the revocation journey,
+     released stale workers add no row.
+   - Recovery: `verification_runtime::queued_subject_authority_survives_restart`
+     (command J) passes. Status rows carry `event = 'status'`, so the
+     `event = 'checkpoint'` fence reads never select them. Tenant isolation is
+     command T. Status: PASS.
+
+Commands, run sequentially:
+
+- J: `mise run build:server`, then
+  `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && cargo nextest run --locked -p wyrd-testing --test server -P journey --run-ignored=all -E "test(=verification_runtime::<name>)"'`
+- Q: `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && cargo nextest run --locked -p wyrd-sql --test integration --test-threads=1 -E "test(pg_verifier_executions::)"'`.
+  40 tests pass.
+- A: the same wrapper around
+  `cargo nextest run --locked -p wyrd-auth --test-threads=1 -E "test(revoke) | test(issuance::pg_tests)"`.
+  23 tests pass.
+- O: `mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=scribe_outbox::tests::status_rows_share_one_frame_and_keep_identity_on_retry)'`
+- R: the same wrapper around
+  `cargo nextest run --locked -p wyrd-server --features test-support --test integration --test-threads=1 -E "test(=pg_verification_runtime::<name>)"`.
+  The owner lane `mise run test:bifrost:integration:server`: LANE_RESULT.
+- T: `mise run check:tenant-isolation`, `mise run fmt`, `mise run lints` and
+  `mise exec -- git diff --check`: CHECKS_RESULT.
+
+TDD compliance: VIOLATED for part of the work. Scenarios 1–3 had a journey
+RED before any production code. These proofs were written after the code
+they cover and have no RED, although each is verified GREEN:
+
+- the scenario 4 outbox test;
+- the admission-time `CancelledExecution` assertions;
+- the exhaustion and group-commit history assertions.
+
+Hot path: not touched. The change adds nothing to the queued engine
+execution, direct verify, gateway calls, Bifrost query or Bifrost append.
+The runner, the submission writer and PR admission are background writers.
+The cancel and revocation routes add only a non-blocking Scribe stage after
+their existing commit. They add no PostgreSQL statement or write, and they
+neither wait on nor fail because of the stage. Revocation reuses its
+existing `UPDATE`, now with `RETURNING`. The task excludes a bench run when
+no hot path is touched.
+
+Risk: PR supersede, deactivation and access-loss cancellations are outside
+the transition table and record no status row. For those executions Verify
+shows the last status that was recorded.
 
 ## Verification
 

@@ -3645,7 +3645,7 @@ mod tests {
         );
         assert_eq!(text("sequence"), vec![Some("0".to_owned()); 3]);
         assert_eq!(text("reason"), vec![None; 3]);
-        assert!(batch.column_by_name("value").expect("value").null_count() == 3);
+        assert_eq!(batch.column_by_name("value").expect("value").null_count(), 3);
         let micros = batch
             .column_by_name("occurred_at")
             .expect("occurred_at")

@@ -618,11 +618,21 @@ async fn a_parked_execution_releases_compute_before_its_park_is_acknowledged() {
             "gate-measured",
         )
         .await;
-    let stall = deployment
+    // The claim's `running` status row is the execution's first events
+    // write; the state writes share its outbox lane and follow it, so the
+    // second stall, armed while the first holds, takes the state write.
+    let running = deployment
         .server
         .stall_next_bifrost_write_into("bifrost.verification.execution_events")
         .expect("Scribe stalls");
     let parked = deployment.open(7, C1).await;
+    running.wait_entered().await;
+    let stall = deployment
+        .server
+        .stall_next_bifrost_write_into("bifrost.verification.execution_events")
+        .expect("Scribe stalls");
+    running.release();
+    running.wait_completed().await;
     stall.wait_entered().await;
     assert_eq!(deployment.status(parked).await["status"], "running");
     let blocks = deployment
@@ -712,11 +722,21 @@ spec:
             "gate-finished",
         )
         .await;
-    let stall = deployment
+    // The claim's `running` status row is the execution's first events
+    // write; the state writes share its outbox lane and follow it, so the
+    // second stall, armed while the first holds, takes the state write.
+    let running = deployment
         .server
         .stall_next_bifrost_write_into("bifrost.verification.execution_events")
         .expect("Scribe stalls");
     let finished = deployment.open(8, C1).await;
+    running.wait_entered().await;
+    let stall = deployment
+        .server
+        .stall_next_bifrost_write_into("bifrost.verification.execution_events")
+        .expect("Scribe stalls");
+    running.release();
+    running.wait_completed().await;
     stall.wait_entered().await;
     let blocks = deployment
         .server

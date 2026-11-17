@@ -4048,8 +4048,7 @@ async fn acknowledged_admission_preserves_scheduling_state() {
     queue
         .accept_grouped(&mut conn, &updated)
         .await
-        .expect("admission answers")
-        .outcome;
+        .expect("admission answers");
     conn.rollback().await.expect("writer rolls back");
     let mut conn = fixture.tenant_conn().await.expect("writer opens");
     assert_eq!(pending_groups(&mut conn, group_binding).await, 1);

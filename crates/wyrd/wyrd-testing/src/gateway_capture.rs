@@ -29,6 +29,7 @@ use axum::http::HeaderMap;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
+use futures_util::StreamExt;
 use serde::Deserialize;
 use serde::de::{DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{Value, json};
@@ -1028,7 +1029,8 @@ mod tests {
 /// Every request is forwarded to the upstream as it arrives, so the
 /// upstream records it and scripts its answer; that answer is handed back
 /// only once no hold matches the request's body; a hold matches a body
-/// containing every one of its fragments. `wiremock`
+/// containing every one of its fragments. A held event stream sends its
+/// first event at once and the rest on release. `wiremock`
 /// answers on one thread after a fixed delay, so it cannot wait for a test
 /// event; this provider orders a race by the test's own observations rather
 /// than by elapsed time. A forward the upstream refuses answers `502`.
@@ -1149,16 +1151,37 @@ async fn forward(State(holding): State<Holding>, request: axum::extract::Request
         return (axum::http::StatusCode::BAD_GATEWAY, "unreadable answer").into_response();
     };
     let text = String::from_utf8_lossy(&body).into_owned();
-    // The sender lives as long as the serving task, so the wait ends only
-    // when the request is no longer held.
+    let released = move |holds: &Vec<Vec<String>>| {
+        !holds
+            .iter()
+            .any(|hold| hold.iter().all(|fragment| text.contains(fragment.as_str())))
+    };
+    // The sender lives as long as the serving task, so a wait ends only when
+    // the request is no longer held.
     let mut held = holding.held.subscribe();
-    let _released = held
-        .wait_for(|held| {
-            !held
-                .iter()
-                .any(|hold| hold.iter().all(|fragment| text.contains(fragment.as_str())))
-        })
-        .await;
+    let streamed = content_type
+        .as_ref()
+        .is_some_and(|kind| kind.as_bytes().starts_with(b"text/event-stream"));
+    let answer = if streamed && !released(&held.borrow()) {
+        // A held stream sends its first event at once and the rest on
+        // release, so a test can observe a stream that is open mid-flight.
+        let first = answer
+            .windows(2)
+            .position(|pair| pair == b"\n\n")
+            .map_or(answer.len(), |end| end + 2);
+        let (first, rest) = (answer.slice(..first), answer.slice(first..));
+        Body::from_stream(
+            futures_util::stream::iter([Ok::<_, std::convert::Infallible>(first)]).chain(
+                futures_util::stream::once(async move {
+                    let _released = held.wait_for(released).await;
+                    Ok(rest)
+                }),
+            ),
+        )
+    } else {
+        let _released = held.wait_for(released).await;
+        Body::from(answer)
+    };
     let mut response = (status, answer).into_response();
     if let Some(content_type) = content_type {
         response.headers_mut().insert(CONTENT_TYPE, content_type);

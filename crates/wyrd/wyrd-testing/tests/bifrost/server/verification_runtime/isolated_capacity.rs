@@ -38,7 +38,7 @@ use wyrd_client::verify::{Execution, Submission, VerificationExecutionStatus};
 use wyrd_client::{Bifrost, Gateway, WyrdClient};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::verification::execution::{RequirementOutcome, VerificationResult};
-use wyrd_testing::gateway_capture::HeldUpstream;
+use wyrd_testing::gateway_capture::{GatewayCapture, HeldUpstream};
 use wyrd_testing::logs::LogCapture;
 use wyrd_testing::server::{HostedLimits, RuntimeLimits};
 use wyrd_testing::{Bootstrap, WyrdTestServer};
@@ -76,6 +76,12 @@ fn completion(message: Value) -> ResponseTemplate {
 /// finishes; every other Agent finishes at once.
 fn reply(request: &Request) -> ResponseTemplate {
     let body: Value = serde_json::from_slice(&request.body).unwrap_or_default();
+    if body["stream"] == true {
+        return ResponseTemplate::new(200).set_body_raw(
+            GatewayCapture::chat_events("chatcmpl-slow", 2_000),
+            "text/event-stream",
+        );
+    }
     let messages = body["messages"].as_array().cloned().unwrap_or_default();
     let writes = messages
         .iter()
@@ -757,4 +763,72 @@ async fn standalone_call_bodies_count_as_gateway_work_while_the_call_runs() {
         "the body returns when the call settles"
     );
     desk.server.shutdown().await.expect("the server stops");
+}
+
+/// A slow streamed chat completion stays byte-bounded: while the provider
+/// holds the stream open after its first event, the call's gateway work is
+/// exactly its request body, kept past the handler's response, and no relayed
+/// frame is charged. Every frame arrives on release, and the body returns
+/// once the call settles.
+///
+/// # Panics
+/// Panics when setup or the call fails, the stream is malformed, or the
+/// gateway's charged bytes differ from the body while the stream is open or
+/// remain after it ends.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn a_slow_stream_holds_only_its_request_body() {
+    use wyrd_runtime::resources::Workload;
+
+    let desk = CapacityDesk::start().await;
+    let workloads = desk.server.state().resources.workloads().clone();
+    let body = serde_json::to_vec(&json!({
+        "model": "openai/gpt-4o",
+        "stream": true,
+        "messages": [{"role": "user", "content": "SLOW-STREAM"}],
+    }))
+    .expect("the body serializes");
+    let sent = body.len() as u64;
+    desk.provider.hold(&["SLOW-STREAM"]);
+    let mut stream = reqwest::Client::new()
+        .post(format!(
+            "{}/v1/chat/completions",
+            desk.server.base_url().expect("the server is bound")
+        ))
+        .bearer_auth(&desk.admin_key)
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("the stream starts");
+    assert_eq!(stream.status().as_u16(), 200);
+    let first = stream
+        .chunk()
+        .await
+        .expect("the stream reads")
+        .expect("a first chunk");
+    assert!(first.starts_with(b"data: "), "an event stream");
+    assert_eq!(
+        workloads.workload_bytes(Workload::Gateway),
+        sent,
+        "an open stream holds its request body and no relayed frame"
+    );
+    desk.provider.release(&["SLOW-STREAM"]);
+
+    let mut rest = first.len();
+    while let Some(chunk) = stream.chunk().await.expect("the stream reads") {
+        rest += chunk.len();
+    }
+    assert_eq!(
+        rest,
+        GatewayCapture::chat_events("chatcmpl-slow", 2_000).len(),
+        "every frame arrives"
+    );
+    // Shutdown drains the settling call, so the count is final.
+    desk.server.shutdown().await.expect("the server stops");
+    assert_eq!(
+        workloads.workload_bytes(Workload::Gateway),
+        0,
+        "the body returns once the stream ends"
+    );
 }

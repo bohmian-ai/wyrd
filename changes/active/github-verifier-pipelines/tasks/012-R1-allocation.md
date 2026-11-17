@@ -547,14 +547,29 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
      `held_persistence_bounds_queued_custody_by_claim_permits`,
      `two_replicas_claim_each_queued_run_exactly_once`, with the managed
      Postgres command in "Verification owners and commands".
-   - Open:
-     - The journey does not yet cover:
-       - media or code work;
-       - slow streams staying byte-bounded;
-       - cancellation and deadline expiry under pressure;
-       - local quotas refusing at their own boundaries;
-       - bounded drain of persistence and host settlement.
-     - Removing the session precharge broke the premise of three tests,
+   - Slow streams: journey
+     `verification_runtime::isolated_capacity::a_slow_stream_holds_only_its_request_body`.
+     A raw-HTTP streamed chat completion (2,000 chunks) is held open by the
+     provider after its first event. `HeldUpstream` now sends a held event
+     stream's first event at once and the rest on release. While it is
+     open, its Gateway work is exactly its request body, kept past the
+     handler's response, and no relayed frame is charged. On release, all
+     frames arrive, and after a drained shutdown Gateway holds 0. Mutation: unattributing the body fails with left 0.
+     Written after the handoff (TDD VIOLATED). GREEN with the other three
+     capacity journeys (4 passed), using the isolated-capacity command above.
+   - Remaining cases (user decision: existing owner tests count as the
+     evidence):
+     - Code work under pressure: the isolated-capacity Python journey
+       (`direct_verification_runs_while_queued_capacity_is_held`). Media
+       answers take the same buffered-answer charge and relay path as JSON;
+       `mise run test:gateway:native` covers the media operation journeys.
+     - Local quotas and ceilings: the 96 gateway and middleware lib tests,
+       including the ledger, quota and capture-slot refusals, plus the
+       verification execution-slot and direct-ceiling refusals in the
+       isolated-capacity and route tests above.
+     - Bounded drain: the three named custody regressions above.
+     - Cancellation and deadline: the pressure tests above.
+   - Removing the session precharge broke the premise of three tests,
        that 64 MiB free is short of one Python session. A Codex
        diagnostician found the cause: nothing refused the run, so it never
        deferred or timed out. Ledger-full setups starve the Bifrost input
@@ -573,7 +588,7 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
          `one_session` name are gone. A sweep for tests of removed
          allocation logic found no test that only asserts removed
          behaviour.
-     Status: FAIL (remaining journey cases).
+     Status: PASS.
 
 7. **Functional closure and performance — REQ-024; AC-018.** Run affected
    functional lanes, then full clean L1 verification, gateway and all three

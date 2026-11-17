@@ -47,7 +47,7 @@ use crate::credential::ProviderSecret;
 use crate::engine::{
     AttemptUsage, EventStream, Frame, ProviderAttempt, ResponseCapture, StreamEnd,
 };
-use wyrd_runtime::resources::ByteCharge;
+use wyrd_runtime::resources::{ByteCharge, Inherited};
 
 /// Frames buffered between the upstream reader and the caller; once full,
 /// upstream reads wait for the caller.
@@ -567,8 +567,19 @@ pub(crate) fn relay_media(
         capture,
         last_byte: None,
     };
-    tokio::spawn(relay.run(upstream, end_sender, Arc::clone(&terminated)));
+    spawn_inherited(relay.run(upstream, end_sender, Arc::clone(&terminated)));
     EventStream::new(receiver, terminated, end)
+}
+
+/// Spawns a relay so each of its polls, where it decodes, translates and
+/// frames, runs on the spawning call's CPU lanes as that call's work; a poll
+/// that waits on the upstream or the caller returns its lane. Spawned from no
+/// laned work, the relay runs as is.
+fn spawn_inherited(relay: impl Future<Output = ()> + Send + 'static) {
+    match Inherited::current() {
+        Some(call) => tokio::spawn(call.laned(relay)),
+        None => tokio::spawn(relay),
+    };
 }
 
 /// One raw media relay: the caller's chunk channel plus the total answer bound
@@ -713,7 +724,7 @@ pub(crate) fn relay(
         last_byte: None,
         busy: Duration::ZERO,
     };
-    tokio::spawn(relay.run(upstream, end_sender, Arc::clone(&terminated)));
+    spawn_inherited(relay.run(upstream, end_sender, Arc::clone(&terminated)));
     EventStream::new(receiver, terminated, end)
 }
 

@@ -158,6 +158,35 @@ impl ProviderDispatch for Held {
     }
 }
 
+/// Dispatch recording the CPU lane context each attempt runs in, then
+/// waiting until released, as an attempt waits on its provider.
+#[derive(Default)]
+struct LaneProbe {
+    /// The lane context of each dispatched attempt, in dispatch order.
+    contexts: Mutex<Vec<Option<wyrd_runtime::resources::WorkContext>>>,
+    /// Notified when an attempt starts.
+    entered: Notify,
+    /// Releases a waiting attempt.
+    release: Notify,
+}
+
+#[async_trait]
+impl ProviderDispatch for LaneProbe {
+    /// Records the attempt's lane context, waits for release, then completes.
+    ///
+    /// # Panics
+    /// Panics when the contexts lock is poisoned by a panicking holder.
+    async fn dispatch(&self, _attempt: ProviderAttempt<'_>) -> AttemptResult {
+        self.contexts
+            .lock()
+            .expect("contexts")
+            .push(wyrd_runtime::resources::WorkContext::current());
+        self.entered.notify_one();
+        self.release.notified().await;
+        completed(10, 5)
+    }
+}
+
 /// Starts `state`'s gateway background work, as a booted server does, and
 /// waits until its snapshot listener is live, so administrative writes warm
 /// the replica's caches and calls are admitted from them.
@@ -7441,4 +7470,228 @@ async fn critical_pressure_cancels_the_execution_a_model_call_belongs_to() {
     );
     assert_eq!(workloads.workload_bytes(Workload::Verification), 0);
     overcommitted.set(0);
+}
+
+/// A call's provider attempt is CPU work on the shared lanes: while other
+/// work holds every lane the attempt queues and does not run, once a lane
+/// frees it runs as the calling tenant's gateway work, and while it waits on
+/// its provider it holds no lane.
+///
+/// # Panics
+/// Panics when the attempt runs or never queues while every lane is held,
+/// runs under another identity, holds a lane across its provider wait, or
+/// the call does not complete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_attempts_run_on_shared_cpu_lanes_and_wait_off_them() {
+    use wyrd_runtime::resources::Workload;
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let probe = Arc::new(LaneProbe::default());
+    let state = replica(&fixture, probe.clone()).await;
+    configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
+    warm(&state, [tenant]).await;
+    let workloads = state.resources.workloads().clone();
+    let bifrost = workloads.begin(Workload::Bifrost, None, None);
+    let mut held = Vec::new();
+    while workloads.lanes().free() > 0 {
+        held.push(workloads.lanes().acquire(bifrost.context()).await);
+    }
+    let lanes = held.len();
+    let waiting = workloads.lanes().waiting();
+
+    let call = tokio::spawn({
+        let state = state.clone();
+        async move {
+            GatewayInvocation::new(&state)
+                .invoke(
+                    &invoker(tenant, 1, [open_access()]),
+                    request("dep-a/a", None, Duration::from_secs(30)),
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while workloads.lanes().waiting() <= waiting {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the call's CPU work queues for a held lane");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        probe.contexts.lock().expect("contexts").is_empty(),
+        "no attempt runs while every lane is held"
+    );
+
+    held.clear();
+    tokio::time::timeout(Duration::from_secs(10), probe.entered.notified())
+        .await
+        .expect("the attempt runs once a lane frees");
+    let context = probe.contexts.lock().expect("contexts")[0].expect("the attempt runs on a lane");
+    assert_eq!(
+        (context.workload, context.tenant),
+        (Workload::Gateway, Some(tenant)),
+        "the attempt runs as the calling tenant's gateway work"
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while workloads.lanes().free() < lanes {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("a provider wait holds no lane");
+
+    probe.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), call)
+        .await
+        .expect("the call settles")
+        .expect("the call task")
+        .expect("the call completes");
+}
+
+/// Serves one streaming chat answer whose headers go out at once and whose
+/// `frames` follow, then end, only once the first returned [`Notify`]
+/// fires; the second fires once they were written.
+///
+/// # Panics
+///
+/// Panics when the listener cannot bind, accept, read, or write.
+async fn paced_upstream(frames: &'static str) -> (u16, Arc<Notify>, Arc<Notify>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let (send, written) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    let (paced, wrote) = (Arc::clone(&send), Arc::clone(&written));
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let (mut request, mut buffer) = (Vec::new(), [0_u8; 4096]);
+        loop {
+            let read = socket.read(&mut buffer).await.expect("read");
+            request.extend_from_slice(&buffer[..read]);
+            let text = String::from_utf8_lossy(&request);
+            if let Some(end) = text.find("\r\n\r\n") {
+                let length = text[..end]
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|value| value.trim().parse::<usize>().expect("length"))
+                    })
+                    .unwrap_or(0);
+                if request.len() >= end + 4 + length {
+                    break;
+                }
+            }
+        }
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n")
+            .await
+            .expect("write head");
+        paced.notified().await;
+        let body = format!("{:x}\r\n{frames}\r\n0\r\n\r\n", frames.len());
+        socket
+            .write_all(body.as_bytes())
+            .await
+            .expect("write frames");
+        wrote.notify_one();
+        let _ = socket.read(&mut buffer).await;
+    });
+    (port, send, written)
+}
+
+/// A relayed stream's frames are CPU work on the shared lanes: the relay
+/// runs on its own task, yet while other work holds every lane the frames
+/// the upstream sent wait for one, queued as the call's work, and are not
+/// delivered; once a lane frees the stream is delivered through its
+/// terminator.
+///
+/// # Panics
+/// Panics when the stream does not open, a frame is relayed or never queues
+/// while every lane is held, or the stream does not end after release.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relayed_stream_frames_wait_for_a_shared_cpu_lane() {
+    use wyrd_runtime::resources::Workload;
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let dispatch: Arc<dyn ProviderDispatch> = Arc::new(
+        wyrd_gateway::HttpProviderDispatch::new(
+            skald_providers::EndpointPolicy::new(false),
+            wyrd_gateway::BuiltinEndpoints::default(),
+        )
+        .expect("gateway dispatch builds"),
+    );
+    let state = replica(&fixture, dispatch).await;
+    let lanes = state.resources.workloads().lanes().free();
+    configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
+    let (port, send, written) =
+        paced_upstream("data: {\"id\":\"paced-marker\",\"choices\":[]}\n\ndata: [DONE]\n\n").await;
+    GatewayAdministration::new(&state)
+        .put_deployment(
+            &admin(tenant),
+            &ProviderDeploymentName::new("paced").expect("name"),
+            serde_json::from_value(json!({
+                "name": "paced",
+                "adapter": {"openai_compatible": {"base_url": format!("http://127.0.0.1:{port}/v1")}},
+                "auth": "none",
+                "capabilities": ["chat_completions"],
+            }))
+            .expect("deployment decodes"),
+        )
+        .await
+        .expect("deployment stores");
+    let mut request = request("paced/paced", None, Duration::from_secs(30));
+    request.stream = true;
+    let mut body = std::mem::take(&mut request.body).into_tree();
+    body["stream"] = json!(true);
+    request.body = body.into();
+    let response = tokio::time::timeout(
+        Duration::from_secs(10),
+        GatewayInvocation::new(&state).invoke(&invoker(tenant, 1, [open_access()]), request),
+    )
+    .await
+    .expect("the stream opens on its headers")
+    .expect("the stream opens");
+    let ResponseBody::Events(mut events) = response.body else {
+        panic!("event stream expected: {:?}", response.body);
+    };
+
+    let workloads = state.resources.workloads().clone();
+    let bifrost = workloads.begin(Workload::Bifrost, None, None);
+    let mut held = Vec::new();
+    for _ in 0..lanes {
+        held.push(workloads.lanes().acquire(bifrost.context()).await);
+    }
+    send.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), written.notified())
+        .await
+        .expect("the upstream sends its frames");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while workloads.lanes().waiting() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the call's work queues for a held lane");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), events.recv())
+            .await
+            .is_err(),
+        "no frame is relayed while every lane is held"
+    );
+
+    held.clear();
+    let mut delivered = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(frame) = events.recv().await {
+            delivered.extend_from_slice(&frame.expect("the stream terminates cleanly"));
+        }
+    })
+    .await
+    .expect("the stream ends once a lane frees");
+    let delivered = String::from_utf8(delivered).expect("utf-8");
+    assert!(
+        delivered.contains("paced-marker") && delivered.ends_with("data: [DONE]\n\n"),
+        "{delivered}"
+    );
 }

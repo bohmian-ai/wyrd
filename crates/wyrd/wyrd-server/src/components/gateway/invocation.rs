@@ -581,9 +581,16 @@ impl<'a> GatewayInvocation<'a> {
             call_span: tracing::Span::current(),
             cancel: call_cancel,
         };
+        // Each poll of the call's task, where it prepares, translates and
+        // decodes, runs on a shared CPU lane as the call's work; a poll that
+        // waits on the provider, admission or capture returns its lane.
+        let context = task.call.operation.context();
         self.state.gateway.tasks().spawn(
-            task.run(head)
-                .instrument(tracing::info_span!("gateway.execute")),
+            self.state.resources.workloads().lanes().laned(
+                context,
+                task.run(head)
+                    .instrument(tracing::info_span!("gateway.execute")),
+            ),
         );
         let Answer {
             result,

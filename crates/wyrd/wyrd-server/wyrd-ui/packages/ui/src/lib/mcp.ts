@@ -13,6 +13,8 @@ function tool(request: WireRequest): { name: string; arguments: Record<string, u
     case 'cards.get_by_ref':
     case 'cards.get_by_uid':
       return { name: 'cards.get', arguments: rest, value: (content) => content.card };
+    case 'github.get_connection':
+      return { name: 'github_connection.get', arguments: {} };
     case 'verification.get_execution':
     case 'verification.get_execution_details':
     case 'verification.list_invocations':

@@ -175,6 +175,43 @@ export const service = {
   relationships: { outbound_refs: [{ ref: AGENT, alias: 'agent' }, { ref: VERIFIER }], inbound_refs: [] },
   status: { phase: 'active' }
 } as unknown as RegisteredCard;
+/** The tenant's GitHub connection: three reachable repositories, one of them with no Repository Card. */
+export const connection = {
+  host: 'github.com',
+  app: { id: 4242, slug: 'wyrd-verify' },
+  state: 'active',
+  installation_id: 41822907,
+  repositories: [
+    { repository_id: '718204331', full_name: 'acme/payments-api' },
+    { repository_id: '733019442', full_name: 'acme/docs-site' },
+    { repository_id: '741660215', full_name: 'acme/web-checkout' }
+  ],
+  connected_at: '2026-10-01T09:00:00Z',
+  updated_at: '2026-11-09T11:20:00Z'
+} as const;
+const pullRequest = { runs_on: { kind: 'pull_request' } };
+const binds = (name: string, version: string) => ({ verifier: { kind: 'Verifier', name, version }, ...pullRequest });
+/** One Repository Card version; `selected` is the family's selected policy and `fullName` is set only while the connection reaches it. */
+const repositoryCard = (name: string, version: string, selected: string, repositoryId: string, fullName: string | null, verifiedBy: object[]) =>
+  ({
+    apiVersion: 'wyrd/v1',
+    kind: 'Repository',
+    metadata: { name, version, uid: `card_repository_${name}_${version}` },
+    spec: { provider: 'github', host: 'github.com', repository_id: repositoryId, verified_by: verifiedBy },
+    relationships: { inbound_refs: [], outbound_refs: [] },
+    status: { phase: 'active', repository: { selected: version === selected, selected_version: selected, full_name: fullName } }
+  }) as unknown as RegisteredCard;
+/** Repository Cards: ready, access removed on GitHub, and a selected policy that binds nothing. */
+export const repositories: Record<string, RegisteredCard> = Object.fromEntries(
+  [
+    repositoryCard('payments-api', '1.4.0', '1.4.0', '718204331', 'acme/payments-api', [binds('pr-review', '1.3.0'), binds('dependency-audit', '0.4.0')]),
+    repositoryCard('payments-api', '1.3.0', '1.4.0', '718204331', 'acme/payments-api', [binds('pr-review', '1.3.0')]),
+    repositoryCard('ledger', '1.1.0', '1.1.0', '702551908', null, [binds('pr-review', '1.3.0')]),
+    repositoryCard('ledger', '1.0.0', '1.1.0', '702551908', null, [binds('pr-review', '1.2.0')]),
+    repositoryCard('docs-site', '0.3.0', '0.3.0', '733019442', 'acme/docs-site', []),
+    repositoryCard('docs-site', '0.2.0', '0.3.0', '733019442', 'acme/docs-site', [binds('pr-review', '1.2.0')])
+  ].map((each) => [`${each.metadata.name}@${each.metadata.version}`, each])
+);
 /** The files registration recorded for the Model. */
 export const artifacts = {
   artifacts: [
@@ -535,11 +572,22 @@ export const fixtureExecutor: Executor = {
             if (ref.kind === 'Agent') return { ok: true, value: agent };
             if (ref.kind === 'Verifier') return verifiers[`${ref.name}@${ref.version}`] ? { ok: true, value: verifiers[`${ref.name}@${ref.version}`] } : { ok: false, problem: notFound };
             if (ref.kind === 'Service') return { ok: true, value: service };
+            if (ref.kind === 'Repository') return repositories[`${ref.name}@${ref.version}`] ? { ok: true, value: repositories[`${ref.name}@${ref.version}`] } : { ok: false, problem: notFound };
             if (ref.name === NATIVE.name) return { ok: true, value: nativePrompt };
             if (ref.kind === 'Prompt') return prompts[ref.version] ? { ok: true, value: prompts[ref.version] } : { ok: false, problem: notFound };
             return { ok: true, value: registered };
           }
           case 'cards.list':
+            if (request.kind === 'Repository')
+              return {
+                ok: true,
+                value: {
+                  items: Object.values(repositories)
+                    .filter((each) => request.name == null || each.metadata.name === request.name)
+                    .map((each) => summary(each.metadata.version, 'active', 'Repository', each.metadata.name)),
+                  next_cursor: null
+                }
+              };
             if (request.kind === 'Prompt' && request.name === PROMPT.name)
               return { ok: true, value: { items: [summary('1.0.0', 'active', 'Prompt', PROMPT.name), summary('1.1.0', 'active', 'Prompt', PROMPT.name)], next_cursor: null } };
             if (request.kind === 'Verifier' && request.name === VERIFIER.name)
@@ -559,6 +607,8 @@ export const fixtureExecutor: Executor = {
             if (request.name === NATIVE.name) return { ok: true, value: { items: [summary('1.0.0', 'active', 'Prompt', NATIVE.name)], next_cursor: null } };
             if (request.name !== undefined) return { ok: true, value: { items: [summary('1.4.2'), summary('1.4.1', 'deprecated')], next_cursor: null } };
             return { ok: true, value: { items: request.cursor ? inventory.slice(3) : inventory.slice(0, 3), next_cursor: request.cursor ? null : 'page-2' } };
+          case 'github.get_connection':
+            return { ok: true, value: connection };
           case 'cards.list_artifacts':
             return { ok: true, value: artifacts };
           case 'cards.get_by_uid': {

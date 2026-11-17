@@ -10,6 +10,7 @@ import type {
   CardRef,
   CardTypes,
   CardSummary,
+  GithubConnectionView,
   ListCardsRequest,
   ListCardsResponse,
   QueryParam,
@@ -20,7 +21,7 @@ import type {
 
 import problems from './problems.json' with { type: 'json' };
 
-export type { ArtifactInventoryResponse, CardRef, CardSummary, QueryColumn, QueryParam, RegisteredCard } from 'wyrd-ai';
+export type { ArtifactInventoryResponse, CardRef, CardSummary, GithubConnectionView, QueryColumn, QueryParam, RegisteredCard } from 'wyrd-ai';
 
 /** One file registration recorded for a Card version. */
 export type StoredArtifactEntry = ArtifactInventoryResponse['artifacts'][number];
@@ -64,6 +65,8 @@ export type WireRequest =
   | { readonly op: 'bifrost.describe_table'; readonly namespace: string; readonly name: string }
   | { readonly op: 'bifrost.validate_predicate'; readonly namespace: string; readonly name: string; readonly expression: string }
   | { readonly op: 'verification.get_execution'; readonly execution_id: string }
+  /** The tenant's redacted GitHub App connection and the repositories it reaches. */
+  | { readonly op: 'github.get_connection' }
   /** One Card by kind and server-minted UID: the existing `cards/by-uid` read, for an execution that retains only its Verifier's UID. */
   | { readonly op: 'cards.get_by_uid'; readonly kind: CardRef['kind']; readonly card_uid: string }
   | { readonly op: 'verification.get_execution_details'; readonly execution_id: string }
@@ -100,6 +103,7 @@ export interface WireResponses {
   'bifrost.describe_table': TableDescriptionWire;
   'bifrost.validate_predicate': { readonly expression: string };
   'verification.get_execution': VerificationExecutionState;
+  'github.get_connection': GithubConnectionView;
   'cards.get_by_uid': RegisteredCard;
   'verification.get_execution_details': CardTypes.VerificationDetails;
   'verification.list_invocations': CardTypes.InvocationPage;

@@ -2,7 +2,7 @@
  * The Node executor: runs each read through the `wyrd-ai` SDK as the client's
  * principal or forwarded browser session. Server-only; the client holds the credential.
  */
-import { Bifrost, Cards, WyrdError, verify, type WyrdClient } from 'wyrd-ai';
+import { Bifrost, Cards, GithubConnection, WyrdError, verify, type WyrdClient } from 'wyrd-ai';
 import { wyrdProblem, type Executor, type Problem, type WireRequest, type WireResult } from './contract.js';
 
 /** A `/v1` response that refused the read, carrying its problem. */
@@ -46,6 +46,7 @@ async function refusal(response: Response): Promise<Problem> {
 export function nodeExecutor(client: WyrdClient, get: (path: string) => Promise<Response> = (path) => client.httpAuth(`${client.serverUrl}/v1${path}`)): Executor {
   const cards = retained(() => Cards.connect({ client }));
   const bifrost = retained(() => Bifrost.connect({ client }));
+  const github = retained(() => GithubConnection.connect({ client }));
   const execution = (id: string) => verify.Execution.connect(id, { client });
 
   async function read(request: WireRequest, signal?: AbortSignal): Promise<unknown> {
@@ -85,6 +86,8 @@ export function nodeExecutor(client: WyrdClient, get: (path: string) => Promise<
         return { expression: await (await bifrost()).validatePredicate(request.namespace, request.name, request.expression) };
       case 'verification.get_execution':
         return (await execution(request.execution_id)).status();
+      case 'github.get_connection':
+        return (await github()).get();
       case 'cards.get_by_uid': {
         const response = await get(`/cards/by-uid/${request.kind}/${encodeURIComponent(request.card_uid)}`);
         if (!response.ok) throw new Refused(await refusal(response));

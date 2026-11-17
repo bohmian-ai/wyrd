@@ -121,7 +121,7 @@ import { POST as bffLoad } from '../routes/t/[tenantKey]/ui/load/+server';
 import { POST as exampleLoad } from '../../../../../../examples/ui-app/src/routes/view/load/+server';
 import { mcpExecutor } from 'wyrd-ai-ui/mcp';
 import { nodeExecutor } from 'wyrd-ai-ui/node';
-import { Bifrost, WyrdError, verify, type WyrdClient } from 'wyrd-ai';
+import { Bifrost, GithubConnection, WyrdError, verify, type WyrdClient } from 'wyrd-ai';
 import catalog from 'wyrd-ai-ui/catalog.json';
 import { place as placeAll, rowsHeight } from '../../packages/ui/src/lib/layout';
 import { STATE_ROOM, layoutDefinition } from '../../packages/ui/src/lib/verifier-layout';
@@ -133,6 +133,7 @@ import {
   artifacts,
   AUTHORED_SQL,
   authored,
+  connection,
   inventory,
   NATIVE,
   notFound,
@@ -790,6 +791,21 @@ test('execution reads run as the existing SDK, HTTP and MCP operations', async (
     { name: 'verification.list_publications', arguments: { execution_id: 'exec_1' } },
     { name: 'verification.get_publication', arguments: { execution_id: 'exec_1', name: 'tree', ...producer } }
   ]);
+});
+
+test('the GitHub connection read runs as the existing SDK and MCP operations', async () => {
+  const requests = [{ op: 'github.get_connection' }] as const satisfies readonly WireRequest[];
+  const connect = vi.spyOn(GithubConnection, 'connect').mockResolvedValue({ get: async () => connection } as never);
+  try {
+    const client = {} as WyrdClient;
+    expect(await nodeExecutor(client).run(requests)).toEqual([{ ok: true, value: connection }]);
+    expect(connect).toHaveBeenCalledWith({ client });
+  } finally {
+    connect.mockRestore();
+  }
+  const app = { callServerTool: vi.fn(async () => ({ content: [], structuredContent: connection })) };
+  expect(await mcpExecutor(app as never).run(requests)).toEqual([{ ok: true, value: connection }]);
+  expect(app.callServerTool.mock.calls[0][0]).toEqual({ name: 'github_connection.get', arguments: {} });
 });
 
 test('Canonical UI problem projections', async () => {

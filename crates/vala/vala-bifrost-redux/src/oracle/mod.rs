@@ -1352,6 +1352,8 @@ struct AnalyticalCompositionInputs {
     objects: Arc<BifrostIcebergStorage>,
     /// Parquet bytes each distributed scan task reads; `None` keeps upstream's.
     file_scan_bytes_per_task: Option<usize>,
+    /// The process workload manager this node's stage work runs on.
+    workloads: wyrd_runtime::resources::WorkloadManager,
 }
 
 /// Builds one node's Analytical execution handle from its composed owners.
@@ -1373,6 +1375,7 @@ fn compose_analytical_handle(
         peer_tls,
         objects,
         file_scan_bytes_per_task,
+        workloads,
     } = inputs;
     let supervisor = Arc::new(analytical::AnalyticalSupervisor::new());
     let egress = Arc::new(analytical::AnalyticalStageEgress::new(
@@ -1390,6 +1393,7 @@ fn compose_analytical_handle(
             reservations,
             egress,
             objects,
+            workloads,
         });
     Arc::new(analytical::AnalyticalExecutionHandle::new(
         analytical::AnalyticalExecutionOwners {
@@ -1515,6 +1519,7 @@ impl Oracle {
                         peer_transports: config.peer_transports.as_ref().map(Arc::clone),
                         objects: Arc::clone(config.catalog.objects()),
                         file_scan_bytes_per_task: config.config.file_scan_bytes_per_task,
+                        workloads: config.memory.resources.workloads().clone(),
                     })
                 });
         Ok(Self {

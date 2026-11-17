@@ -585,19 +585,30 @@ mod tests {
         for operator in ["RepartitionExec", "SortExec"] {
             assert!(shape.contains(operator), "{operator} in {shape}");
         }
-        let query = async { frame.collect().await.expect("query runs") };
-        process
-            .workloads()
-            .lanes()
-            .laned(operation.context(), query)
-            .await;
+        // Started and polled the way Oracle executes every query, with the
+        // stream collected by an unlaned consumer.
+        let context = operation.context();
+        let task = frame.task_ctx();
+        let batches = super::super::laned_execution(
+            process.workloads().lanes().clone(),
+            operation,
+            || {
+                datafusion::physical_plan::execute_stream(plan, Arc::new(task))
+                    .map_err(|error| super::super::map_datafusion_error(&error))
+            },
+        )
+        .await
+        .expect("the query starts");
+        datafusion::physical_plan::common::collect(batches)
+            .await
+            .expect("query runs");
 
         for (side, seen) in [("before", &before), ("after", &after)] {
             let seen = seen.lock().expect("probe");
             assert!(!seen.is_empty(), "the probe {side} the exchange ran");
             assert!(
                 seen.iter()
-                    .all(|current| *current == Some(operation.context())),
+                    .all(|current| *current == Some(context)),
                 "every partition {side} the exchange ran laned as the query's work: {seen:?}"
             );
         }

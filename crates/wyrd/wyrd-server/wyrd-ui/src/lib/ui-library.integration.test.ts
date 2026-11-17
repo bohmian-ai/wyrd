@@ -1652,6 +1652,38 @@ const traced = assistantTest({
   }
 });
 
+traced('Verify lists an execution retrying for a trace that has not landed by its recorded status', async ({ server, assistant: _ }) => {
+  const cards = await Cards.connect();
+  const policyDesk = await cards.declareFromPath(fixture('cards/verifier_building_blocks/policy-desk.yaml'));
+  const bundle = mkdtempSync(join(tmpdir(), 'wyrd-ui-retrying-'));
+  await cards.pull(policyDesk.root, bundle);
+  const { key } = await runtimeAccount({ kind: 'Service', name: policyDesk.root.name });
+  const desk = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: key }) });
+  await desk.startBifrost();
+  // The check reads a trace nothing has written, so each attempt finds its evidence unavailable and the execution retries.
+  const submitted = await desk.run().observe.submit('whole-trace', { trace: 'ab'.repeat(16) });
+  if (submitted.kind !== 'queued') throw new Error('whole-trace queues an execution');
+  const id = submitted.execution.id;
+
+  const context = { executor: nodeExecutor(WyrdClient.connect()), range: { from: new Date(Date.now() - 3_600_000).toISOString(), to: new Date(Date.now() + 60_000).toISOString() } };
+  await vi.waitFor(
+    async () => {
+      server.flushBifrost();
+      const loaded = await loadRecordTable({ signal: 'executions', columns: ['status', 'verdict'], where: [{ column: 'status', value: 'retrying' }] }, context);
+      if (loaded.result.state !== 'populated') throw new Error(JSON.stringify(loaded.result));
+      const { columns, rows } = loaded.result.data.rows;
+      const listed = rows.map((row) => Object.fromEntries(columns.map((column, at) => [column.name, row[at]])));
+      expect(listed).toMatchObject([{ execution_id: id, status: 'retrying', verdict: null }]);
+      expect(listed).toHaveLength(1);
+    },
+    { timeout: 30_000, interval: 500 }
+  );
+  // The list's status is the one the execution's own exact read reports.
+  const [live] = await context.executor.run([{ op: 'verification.get_execution', execution_id: id }]);
+  expect(live.ok && [live.value.status, live.value.error?.code]).toEqual(['retrying', 'evidence_unavailable']);
+  await desk.shutdown();
+});
+
 traced('a session judgment cites an exact trace: the citation leads to its pinned member and trace, a later span revises nothing, and trace reads keep their own permission', async ({ server, assistant: _ }) => {
   // A coding session of three turns; the first names a retained trace.
   await seedSignals(server, server.apiKey, { trace: SESSION_TRACE, service: 'coding-agent' });

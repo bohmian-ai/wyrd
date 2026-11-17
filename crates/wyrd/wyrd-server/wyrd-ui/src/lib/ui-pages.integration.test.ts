@@ -1629,6 +1629,26 @@ judged('the Verify dashboard filters, groups, brushes, pages, opens an execution
     await page.waitForURL(list);
     await expect.poll(() => rows.count()).toBe(50);
 
+    // The same investigation by keyboard: a facet value filters on Enter, the focused row opens the execution on Enter, and Back returns.
+    await rail.getByRole('button', { name: /failed/ }).focus();
+    await page.keyboard.press('Enter');
+    await expect.poll(async () => (await where.textContent())?.trim()).toBe("verdict = 'failed'");
+    await expect.poll(() => rows.count()).toBe(1);
+    await rows.first().focus();
+    await page.keyboard.press('Enter');
+    await page.waitForURL(`${list}/executions/${refused}`);
+    await page.goBack();
+    await expect.poll(async () => (await where.textContent())?.trim()).toBe("verdict = 'failed'");
+
+    // On a phone-width screen the page does not scroll sideways; the table scrolls inside its own region, and a facet still filters.
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+    await rail.getByRole('button', { name: /completed/ }).click();
+    await expect.poll(async () => (await where.textContent())?.trim()).toBe("verdict = 'failed' AND status = 'completed'");
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await page.getByRole('link', { name: 'Clear' }).click();
+    await page.waitForURL(list);
+    await expect.poll(() => rows.count()).toBe(50);
 
     // Grouping arranges the same rows under their session; it adds no row and no judgment.
     await page.getByRole('combobox', { name: 'Group by' }).selectOption('group_id');

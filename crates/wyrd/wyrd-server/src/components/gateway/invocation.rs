@@ -1160,7 +1160,9 @@ impl<'a> GatewayInvocation<'a> {
     /// attempt's. The outcome and error code start as `execution`'s; a
     /// buffered call whose accounting then fails overrides both with its
     /// settled failure. Request content is resolved later by
-    /// [`Self::capture`], after the caller has its answer.
+    /// [`Self::capture`], after the caller has its answer. `custody` is
+    /// the charge of a streamed response capture's content, which the facts
+    /// carry until the outbox takes it over.
     fn facts(
         call: &AdmittedCall,
         operation: GatewayOperation,
@@ -1168,6 +1170,7 @@ impl<'a> GatewayInvocation<'a> {
         stream: bool,
         execution: &mut CallExecution,
         entries: Option<&[GatewayAccountingEntryV1]>,
+        custody: Option<ByteCharge>,
     ) -> Option<CallFacts> {
         let policy = &call.snapshot.capture;
         if policy.mode == GatewayCaptureMode::Disabled {
@@ -1221,6 +1224,7 @@ impl<'a> GatewayInvocation<'a> {
             request: None,
             response,
             objects,
+            custody,
         })
     }
 
@@ -1259,13 +1263,17 @@ impl<'a> GatewayInvocation<'a> {
         }
         .instrument(tracing::debug_span!("gateway.capture"));
         let result = match tokio::time::timeout_at(call.deadline, work).await {
-            Ok(Ok(capture)) => {
-                match &call.capture_slot {
-                    Some(slot) => slot.stage(capture.tenant(), capture),
-                    None => state
-                        .bifrost
-                        .scribe_outbox()
-                        .stage(capture.tenant(), capture),
+            Ok(Ok(mut capture)) => {
+                let tenant = capture.tenant();
+                match (&call.capture_slot, capture.take_custody()) {
+                    (Some(slot), Some(custody)) => slot.stage_charged(tenant, capture, custody),
+                    (Some(slot), None) => slot.stage(tenant, capture),
+                    // The unreserved outbox charges the record itself; the
+                    // content's charge returns only once it has.
+                    (None, custody) => {
+                        state.bifrost.scribe_outbox().stage(tenant, capture);
+                        drop(custody);
+                    }
                 }
                 Ok(())
             }
@@ -1486,6 +1494,7 @@ impl CallTask {
             self.stream,
             &mut execution,
             entries,
+            None,
         );
         let outcome = match (&accounted, facts.as_mut()) {
             (Ok(_), _) => execution.outcome,
@@ -1568,6 +1577,7 @@ impl CallTask {
             terminal_at: Utc::now(),
             usage: AttemptUsage::default(),
             capture: None,
+            custody: None,
             last_byte: None,
             relay: Duration::ZERO,
         });
@@ -1590,6 +1600,7 @@ impl CallTask {
             }
         }
         record_call(&self.call_span, end.outcome, true);
+        let custody = end.custody;
         let mut accounted = CallExecution {
             outcome: end.outcome,
             response: None,
@@ -1619,6 +1630,7 @@ impl CallTask {
             self.stream,
             &mut accounted,
             entries,
+            custody,
         );
         GatewayInvocation::observe(operation, self.received, end.outcome, &accounted, entries);
         let started = std::time::Instant::now();

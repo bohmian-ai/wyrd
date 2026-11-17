@@ -29,6 +29,7 @@ use vala_bifrost_redux::tables::gateway::{CallsTable, REQUEST_PAYLOAD, RESPONSE_
 use vala_bifrost_redux::tables::signal::correlation_fields;
 use wyrd_gateway::{AttemptRecord, IngressDialect, MediaRequest, UploadContent};
 use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder};
+use wyrd_runtime::resources::ByteCharge;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Attribution;
 use wyrd_spec::gateway::{
@@ -168,6 +169,9 @@ pub(crate) struct CallFacts {
     /// Bytes of every selected binary object already substituted by a typed
     /// reference, awaiting persistence before the referencing row is delivered.
     pub(crate) objects: PayloadObjects,
+    /// The process memory charge of a streamed `response`'s content, kept
+    /// until the capture drops or the outbox takes it over.
+    pub(crate) custody: Option<ByteCharge>,
 }
 
 /// One call's validated analytical record: its row and attempt spans.
@@ -200,6 +204,9 @@ pub struct CallCapture {
     /// Context of the `gateway.call` span the attempt spans are children of,
     /// when the call continued a caller's trace.
     trace: Option<TraceContext>,
+    /// The charge of the captured content this record still carries, handed
+    /// to the outbox with the record once it is staged.
+    custody: Option<ByteCharge>,
 }
 
 impl CallCapture {
@@ -302,6 +309,7 @@ impl CallCapture {
             attribution: facts.attribution,
             subject: facts.subject,
             trace: facts.trace,
+            custody: facts.custody,
         })
     }
 
@@ -597,6 +605,12 @@ impl CallCapture {
             projected.push((ScribeTable::Spans, spans, owners));
         }
         Ok(projected)
+    }
+
+    /// Takes the charge of the content this record carries, for the outbox
+    /// to take over as the record is staged.
+    pub(crate) const fn take_custody(&mut self) -> Option<ByteCharge> {
+        self.custody.take()
     }
 
     /// Tenant the record belongs to.
@@ -1269,6 +1283,7 @@ pub(crate) mod tests {
             })),
             response: Ok(Some(json!({"id": "chatcmpl-1", "token": CANARY}))),
             objects: PayloadObjects::default(),
+            custody: None,
         }
     }
 

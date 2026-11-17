@@ -186,10 +186,12 @@ impl StreamCapture {
         }
     }
 
-    /// Kept events as one JSON array, or `None` when capture was dropped.
-    fn finish(self) -> Option<ResponseCapture> {
+    /// Kept events as one JSON array with the charge that still holds them,
+    /// or `None` when capture was dropped.
+    fn finish(self) -> Option<(ResponseCapture, ByteCharge)> {
+        let charge = self.charge;
         self.events
-            .map(|events| ResponseCapture::Json(Value::Array(events)))
+            .map(|events| (ResponseCapture::Json(Value::Array(events)), charge))
     }
 }
 
@@ -249,9 +251,10 @@ impl MediaCapture {
         }
     }
 
-    /// The kept bytes as a media capture, or `None` when they hold the
-    /// credential or capture was dropped.
-    fn finish(self) -> Option<ResponseCapture> {
+    /// The kept bytes as a media capture with the charge that still holds
+    /// them, or `None` when they hold the credential or capture was dropped.
+    fn finish(self) -> Option<(ResponseCapture, ByteCharge)> {
+        let charge = self.charge;
         ResponseCapture::media(
             MediaAnswer {
                 content_type: self.content_type,
@@ -259,6 +262,7 @@ impl MediaCapture {
             },
             self.secret.as_ref().map(ExposeSecret::expose_secret),
         )
+        .map(|capture| (capture, charge))
     }
 }
 
@@ -600,17 +604,19 @@ impl MediaRelay {
         if outcome == GatewayCallOutcome::Succeeded {
             terminated.store(true, Ordering::Release);
         }
-        let capture = self
+        let (capture, custody) = self
             .capture
             .take()
             .filter(|_| outcome == GatewayCallOutcome::Succeeded)
-            .and_then(MediaCapture::finish);
+            .and_then(MediaCapture::finish)
+            .unzip();
         // A caller that stopped accounting has nothing left to record.
         end.send(StreamEnd {
             outcome,
             terminal_at: Utc::now(),
             usage: AttemptUsage::default(),
             capture,
+            custody,
             last_byte: self.last_byte,
             relay: Duration::ZERO,
         })
@@ -778,12 +784,14 @@ impl Relay {
             }
             Ended::Detached => (GatewayCallOutcome::Cancelled, AttemptUsage::default()),
         };
+        let (capture, custody) = self.capture.take().and_then(StreamCapture::finish).unzip();
         // A caller that stopped accounting has nothing left to record.
         end.send(StreamEnd {
             outcome,
             terminal_at: Utc::now(),
             usage,
-            capture: self.capture.take().and_then(StreamCapture::finish),
+            capture,
+            custody,
             last_byte: self.last_byte,
             relay: self.busy,
         })
@@ -1109,5 +1117,33 @@ mod tests {
         capture.keep(&[0; 6]);
         assert_eq!(ledger.used(), 0, "refused bytes drop the capture");
         assert!(capture.finish().is_none(), "nothing is captured");
+    }
+
+    /// A stream capture that finishes keeps its charge with the finished
+    /// content, returning it only once that content drops.
+    #[test]
+    fn a_finished_stream_capture_stays_charged_while_its_content_lives() {
+        let ledger = ByteLedger::new(100);
+        let mut capture = StreamCapture::new(None, &ledger.empty_charge());
+        capture.push(Some(json!({"n": 1})), 40);
+        let finished = capture.finish();
+        assert!(finished.is_some(), "the events are captured");
+        assert_eq!(ledger.used(), 40, "finished content stays charged");
+        drop(finished);
+        assert_eq!(ledger.used(), 0, "dropping the content returns its charge");
+    }
+
+    /// A media capture that finishes keeps its charge with the finished
+    /// bytes, returning it only once they drop.
+    #[test]
+    fn a_finished_media_capture_stays_charged_while_its_bytes_live() {
+        let ledger = ByteLedger::new(10);
+        let mut capture = MediaCapture::new(None, "audio/mpeg", &ledger.empty_charge());
+        capture.keep(&[0; 6]);
+        let finished = capture.finish();
+        assert!(finished.is_some(), "the bytes are captured");
+        assert_eq!(ledger.used(), 6, "finished bytes stay charged");
+        drop(finished);
+        assert_eq!(ledger.used(), 0, "dropping the bytes returns their charge");
     }
 }

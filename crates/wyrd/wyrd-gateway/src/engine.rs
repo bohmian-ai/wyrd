@@ -299,6 +299,10 @@ pub struct StreamEnd {
     /// the capture ceiling, had no JSON form, or held the credential, or when
     /// a media stream did not end cleanly.
     pub capture: Option<ResponseCapture>,
+    /// The process memory charge still holding `capture`'s content, a
+    /// sibling of the call's; whoever takes `capture` keeps it until that
+    /// content drops or the outbox takes its custody over.
+    pub custody: Option<ByteCharge>,
     /// When the relay received the last upstream body byte; `None` when no
     /// body byte arrived. Transient, for telemetry only.
     pub last_byte: Option<std::time::Instant>,

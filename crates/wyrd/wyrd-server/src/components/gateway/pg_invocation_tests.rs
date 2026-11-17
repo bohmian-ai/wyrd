@@ -4545,6 +4545,162 @@ async fn gateway_selected_speech_persists_one_retrievable_object() {
     );
 }
 
+/// Proves captured generated speech keeps its memory charge from the relay's
+/// clean end until the capture settles: while its object read is parked the
+/// bytes stay counted against gateway work; a capture storage then fails
+/// drops and returns the charge, and an unparked capture stages its row with
+/// the outbox taking the charge over, so process memory returns to its
+/// starting use once delivered, never charged twice or left behind.
+///
+/// # Panics
+///
+/// Panics when a fixture fails, a call fails, the captured bytes go uncounted
+/// while storage holds them, a row's staging differs, or any charge outlives
+/// the drained capture.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn captured_speech_stays_charged_until_its_capture_settles() {
+    use wyrd_runtime::resources::Workload;
+    let spoken = vec![7_u8; 64 * 1024];
+    let other = vec![8_u8; 64 * 1024];
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/audio/speech"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(spoken.clone(), "audio/mpeg"))
+        .mount(&upstream)
+        .await;
+    let (state, scribe) = RecordingScribe::attach(
+        replica_with_fixture_catalog(
+            &fixture,
+            Arc::new(
+                wyrd_gateway::HttpProviderDispatch::new(
+                    skald_providers::EndpointPolicy::new(false),
+                    wyrd_gateway::BuiltinEndpoints::default(),
+                )
+                .expect("gateway dispatch builds"),
+            ),
+        )
+        .await,
+    );
+    configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
+    let admin = admin(tenant);
+    let gateway = GatewayAdministration::new(&state);
+    gateway
+        .put_deployment(
+            &admin,
+            &ProviderDeploymentName::new("speech").expect("name"),
+            serde_json::from_value(json!({
+                "name": "speech",
+                "adapter": {"openai_compatible": {"base_url": format!("{}/v1", upstream.uri())}},
+                "auth": "none",
+                "capabilities": ["audio"],
+            }))
+            .expect("deployment decodes"),
+        )
+        .await
+        .expect("deployment stores");
+    gateway
+        .put_capture(
+            &admin,
+            GatewayCapturePolicyWrite {
+                mode: GatewayCaptureMode::Payload,
+                payload_fields: BTreeSet::from([GatewayPayloadField::Response]),
+            },
+        )
+        .await
+        .expect("payload policy stores");
+    let digest = format!("sha256:{}", hex::encode(Sha256::digest(&spoken)));
+    let wyrd_storage::settings::BackendConfig::Local { root } = state.storage.backend_config()
+    else {
+        panic!("the test replica stores locally");
+    };
+    let fifo = root.join(
+        &object_path(tenant, &digest)
+            .expect("the digest derives a key")
+            .full,
+    );
+    std::fs::create_dir_all(fifo.parent().expect("the key has a parent")).expect("parent creates");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo runs");
+    assert!(made.success(), "the parked object path is a FIFO");
+    let workloads = state.resources.workloads().clone();
+    let memory = state.resources.memory().clone();
+    let speak = || {
+        let state = state.clone();
+        let spoken = spoken.clone();
+        async move {
+            let response = super::routes::audio_speech(
+                State(state),
+                Ok(invoker(tenant, 1, [open_access()])),
+                None,
+                Ok(JsonBody::from(
+                    json!({"model": "speech/speech", "input": "hi", "voice": "alloy"}),
+                )),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let delivered = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("audio reads");
+            assert_eq!(
+                delivered.as_ref(),
+                spoken.as_slice(),
+                "caller bytes are unchanged"
+            );
+        }
+    };
+    drain_gateway(&state).await;
+    let idle = memory.used();
+
+    speak().await;
+    // Opening the FIFO's write end returns once the capture's object read has
+    // opened the read end and is parked on it.
+    let path = fifo.clone();
+    let mut writer = tokio::task::spawn_blocking(move || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("the FIFO opens")
+    })
+    .await
+    .expect("the writer opens");
+    assert!(
+        workloads.workload_bytes(Workload::Gateway) >= spoken.len() as u64,
+        "captured speech stays charged while storage holds it"
+    );
+    std::io::Write::write_all(&mut writer, &other).expect("the FIFO writes");
+    drop(writer);
+    drain_gateway(&state).await;
+    assert_eq!(
+        scribe.attempts(),
+        0,
+        "a capture storage fails stages nothing"
+    );
+    assert_eq!(workloads.workload_bytes(Workload::Gateway), 0);
+    assert_eq!(
+        memory.used(),
+        idle,
+        "the dropped capture returns its charge"
+    );
+
+    std::fs::remove_file(&fifo).expect("the parked path is removed");
+    speak().await;
+    drain_gateway(&state).await;
+    assert!(
+        scribe.published().contains(&digest),
+        "the stored capture stages its row"
+    );
+    assert_eq!(workloads.workload_bytes(Workload::Gateway), 0);
+    assert_eq!(
+        memory.used(),
+        idle,
+        "the delivered row's charge, taken over once, returns"
+    );
+}
+
 /// Proves post-response capture work is bounded by the admitted call's
 /// absolute deadline. With the captured object's storage read parked on a
 /// FIFO, the call still answers, its capture is dropped once as

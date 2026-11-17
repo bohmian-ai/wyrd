@@ -492,8 +492,12 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
      dropping the lease right after `run_turn` acquires it fails with
      left 1, right 0. Added after the wiring (TDD VIOLATED). GREEN:
      `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-server --features test-support --test integration -E 'test(=sandbox_worker::a_running_turn_holds_its_cpu_lane)'"`.
-   - Repartition and sort are not exercised; the proof is a 4-partition
-     aggregate.
+   - Closed: `oracle::telemetry::tests::spawned_query_partitions_run_on_the_spawners_lanes`
+     now asserts its physical plan contains `RepartitionExec` and
+     `SortExec`. Separate probes before the hash exchange and after the
+     final aggregate, which then sorts, both see only the query's laned
+     context. Extended after the behaviour (TDD VIOLATED). GREEN:
+     `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=oracle::telemetry::tests::spawned_query_partitions_run_on_the_spawners_lanes)'`.
    - The parent-commitment sampler in `main.rs` (`mi_process_info`) has no
      runtime proof.
    - The Scribe `off_lane` call sites (`SyncingFile::write`,

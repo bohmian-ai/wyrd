@@ -516,7 +516,8 @@ mod tests {
 
     /// A multi-partition plan run inside laned Bifrost work evaluates its
     /// partitions on tasks `DataFusion` spawns, and each of those runs on the
-    /// process lanes as the same work rather than beside them.
+    /// process lanes as the same work rather than beside them, before and
+    /// after a hash repartition and through a sort.
     ///
     /// # Panics
     /// Panics when the query fails or a spawned partition runs unlaned or as
@@ -534,21 +535,25 @@ mod tests {
         install_query_span_propagation();
         let process = ProcessResources::new(std::num::NonZeroUsize::MIN, 1 << 30, 1 << 30);
         let operation = process.workloads().begin(Workload::Bifrost, None, None);
-        let seen: Arc<Mutex<Vec<Option<WorkContext>>>> = Arc::default();
-        let recorded = Arc::clone(&seen);
-        let probe = create_udf(
-            "lane_probe",
-            vec![DataType::Int64],
-            DataType::Int64,
-            Volatility::Volatile,
-            Arc::new(move |args: &[ColumnarValue]| {
-                recorded.lock().expect("probe").push(WorkContext::current());
-                Ok(args[0].clone())
-            }),
-        );
+        type Seen = Arc<Mutex<Vec<Option<WorkContext>>>>;
+        let probe = |name: &str, seen: &Seen| {
+            let recorded = Arc::clone(seen);
+            create_udf(
+                name,
+                vec![DataType::Int64],
+                DataType::Int64,
+                Volatility::Volatile,
+                Arc::new(move |args: &[ColumnarValue]| {
+                    recorded.lock().expect("probe").push(WorkContext::current());
+                    Ok(args[0].clone())
+                }),
+            )
+        };
+        let (before, after): (Seen, Seen) = (Arc::default(), Arc::default());
         let session =
             SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
-        session.register_udf(probe);
+        session.register_udf(probe("before_exchange", &before));
+        session.register_udf(probe("after_exchange", &after));
         let rows: ArrayRef = Arc::new(Int64Array::from_iter_values(0..4096));
         session
             .register_batch(
@@ -557,28 +562,43 @@ mod tests {
                     .expect("batch"),
             )
             .expect("table");
-        let query = async {
-            session
-                .sql("SELECT lane_probe(n) % 7 AS k, count(*) FROM numbers GROUP BY 1")
-                .await
-                .expect("plan")
-                .collect()
-                .await
-                .expect("query runs")
-        };
+        // The probe runs before the hash exchange and again after the final
+        // aggregate, whose output partitions then sort and merge.
+        let frame = session
+            .sql(
+                "SELECT after_exchange(k) AS k, c FROM \
+                 (SELECT before_exchange(n) % 7 AS k, count(*) AS c FROM numbers GROUP BY 1) \
+                 ORDER BY c, k",
+            )
+            .await
+            .expect("plan");
+        let plan = frame
+            .clone()
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        let shape = datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(true)
+            .to_string();
+        for operator in ["RepartitionExec", "SortExec"] {
+            assert!(shape.contains(operator), "{operator} in {shape}");
+        }
+        let query = async { frame.collect().await.expect("query runs") };
         process
             .workloads()
             .lanes()
             .laned(operation.context(), query)
             .await;
 
-        let seen = seen.lock().expect("probe");
-        assert!(!seen.is_empty(), "the probe ran");
-        assert!(
-            seen.iter()
-                .all(|current| *current == Some(operation.context())),
-            "every partition ran laned as the query's work: {seen:?}"
-        );
+        for (side, seen) in [("before", &before), ("after", &after)] {
+            let seen = seen.lock().expect("probe");
+            assert!(!seen.is_empty(), "the probe {side} the exchange ran");
+            assert!(
+                seen.iter()
+                    .all(|current| *current == Some(operation.context())),
+                "every partition {side} the exchange ran laned as the query's work: {seen:?}"
+            );
+        }
     }
 
     /// `record_peer_attempt` emits the closed peer-attempt counter with both the

@@ -276,15 +276,13 @@ impl CapacityDesk {
         self.blocks().hold_model_calls_for_test()
     }
 
-    /// Hold free process memory down to `leave` bytes, short of one Python
-    /// session, so every Python operation is refused, until the returned
-    /// hold drops. A queued submission needs room left for the Scribe write
-    /// that stages it, since Scribe shares process memory.
+    /// Hold all free process memory, so every Python operation is refused,
+    /// until the returned hold drops.
     ///
     /// # Panics
     /// Panics when the server hosts no blocks.
-    fn hold_python(&self, leave: u64) -> impl Sized {
-        self.blocks().sandbox().occupy_for_test(leave)
+    fn hold_python(&self) -> impl Sized {
+        self.blocks().sandbox().occupy_for_test(0)
     }
 
     /// Hold all free process scratch, so every workspace is refused, until
@@ -426,10 +424,12 @@ async fn settled(execution: &Execution) -> VerificationResult {
 /// model-call permit held, a queued Agent waits for admission while holding
 /// the only queued execution slot, a direct assert-only Verifier completes,
 /// and a second queued run stays pending; both queued runs complete once the
-/// permit is released, and a direct Agent then runs. Python memory and scratch are reserved for neither
-/// mode: an idle server holds no scratch, and with either held at capacity a
-/// queued code or workspace run is deferred and completes on release, while
-/// direct work of that resource is refused with the stable unavailable code.
+/// permit is released, and a direct Agent then runs. Memory and scratch are
+/// reserved for neither mode: an idle server holds no scratch; under
+/// critical memory pressure a queued code run waits in admission and
+/// completes once pressure recovers; with scratch held a queued workspace
+/// run is deferred and completes on release; and direct work finding memory
+/// or scratch full is refused with the stable unavailable code.
 /// Every model call is recorded on the ordinary gateway path against the
 /// verified Service, the deferred attempt's call included. A direct model call waits for the shared permit like a
 /// queued one, and a wait past the direct deadline is cancelled without
@@ -476,10 +476,15 @@ async fn direct_verification_runs_while_queued_capacity_is_held() {
         0,
         "an idle server reserves no scratch for either mode"
     );
-    let held = desk.hold_python(64 << 20);
+    let workloads = desk.server.state().resources.workloads().clone();
+    let pressure = desk.blocks().sandbox().overcommit_for_test();
+    workloads.sample(0);
+    let bifrost_waits = pressure_waits(&logs, "Bifrost");
     let queued_python = desk.submit("python-check", "QUEUED-PYTHON").await;
-    logged(&logs, &[DEFERRED, &queued_python.id().to_string()]).await;
-    drop(held);
+    waited(&logs, "Bifrost", bifrost_waits + 1).await;
+    pressure.set(0);
+    workloads.sample(0);
+    workloads.sample(0);
     passed(&settled(&queued_python).await, "measured");
 
     let held = desk.hold_scratch();
@@ -515,7 +520,7 @@ async fn direct_verification_runs_while_queued_capacity_is_held() {
         .expect_err("direct work needs free process scratch");
     assert_eq!(refused.code(), UNAVAILABLE, "scratch");
     drop(held);
-    let held = desk.hold_python(0);
+    let held = desk.hold_python();
     let refused = desk
         .verify("python-check", "FULL-PYTHON")
         .await

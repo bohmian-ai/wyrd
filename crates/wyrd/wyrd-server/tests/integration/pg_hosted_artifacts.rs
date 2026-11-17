@@ -1429,7 +1429,7 @@ async fn capacity_refusal_is_busy_at_every_hosted_consumer() {
         1,
         "one worker served every step so far"
     );
-    let one_session = sandbox.occupy_for_test(4096);
+    let held = sandbox.occupy_for_test(4096);
     let catching = "try:\n    await call_tool('fs.read', {'path': '/inputs/notes.txt', 'start': 0})\nexcept RuntimeError:\n    pass\n'caught'";
     mock.push_response(answer(
         None,
@@ -1446,7 +1446,7 @@ async fn capacity_refusal_is_busy_at_every_hosted_consumer() {
         "a program beside a refused sibling",
     );
     assert_eq!(mock.remaining(), 0, "no model turn follows the refusal");
-    drop(one_session);
+    drop(held);
     mock.push_response(answer(None, &[("code_run", json!({"source": catching}))]));
     mock.push_response(answer(Some("{}"), &[]));
     let calls = ToolCallsOwner::default();

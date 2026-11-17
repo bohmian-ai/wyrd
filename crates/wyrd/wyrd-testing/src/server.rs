@@ -2966,10 +2966,9 @@ impl WyrdTestServer {
             .ok_or_else(|| WyrdTestServerError::Start("server has no Bifrost Scribe".to_owned()))
     }
 
-    /// Hold direct-lane process memory so at most `leave` bytes stay free, so a hosted
-    /// Python operation whose session envelope does not fit waits, and one
-    /// whose retained request bytes do not fit is refused, until the
-    /// returned hold drops.
+    /// Hold process memory so at most `leave` bytes stay free, so a hosted
+    /// Python operation whose retained request bytes do not fit is refused,
+    /// until the returned hold drops.
     ///
     /// # Panics
     /// Panics when called outside a Tokio runtime.
@@ -2981,8 +2980,8 @@ impl WyrdTestServer {
     }
 
     /// Wait until exactly `count` hosted Python operations wait for process
-    /// admission, such as a verification paused by the pressure
-    /// [`Self::occupy_hosted_memory`] causes, or one that stopped waiting.
+    /// admission, such as a verification paused by critical process
+    /// pressure, or one that stopped waiting.
     ///
     /// # Errors
     /// Returns [`WyrdTestServerError::HostedWaitersNotReached`] with the last

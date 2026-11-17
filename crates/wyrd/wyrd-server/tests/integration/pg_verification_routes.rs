@@ -1824,9 +1824,11 @@ async fn direct_execution_waits_end_at_the_arrival_deadline() {
             .expect("blocks are hosted")
             .sandbox(),
     );
-    // Short of one session envelope, with room left for the Scribe work
-    // that shares process memory.
-    let held = sandbox.occupy_for_test(64 << 20);
+    // Critical pressure keeps the operation waiting in admission; the byte
+    // ledger keeps its room for the run's other work.
+    let workloads = server.state().resources.workloads().clone();
+    let held = sandbox.overcommit_for_test();
+    workloads.sample(0);
 
     let started = std::time::Instant::now();
     let (status, response) = execute(&server, &jwt, body.clone()).await;
@@ -1841,7 +1843,9 @@ async fn direct_execution_waits_end_at_the_arrival_deadline() {
         started.elapsed()
     );
 
-    drop(held);
+    held.set(0);
+    workloads.sample(0);
+    workloads.sample(0);
     let (status, response) = execute(&server, &jwt, body).await;
     assert_eq!(status, StatusCode::OK, "{response}");
     assert_eq!(response["outcome"]["verdict"], "passed", "{response}");

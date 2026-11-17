@@ -677,7 +677,7 @@ fn exists(pid: u32) -> bool {
 }
 
 /// The most an idle worker reports after a reset: a small fraction of the
-/// default 256 MiB session budget, which a session envelope always exceeded.
+/// default 256 MiB session budget.
 const IDLE_WORKER_BYTES: u64 = 64 << 20;
 
 /// Poll `ready` until it yields, failing with `what` after ten seconds.
@@ -827,9 +827,9 @@ async fn settle(sandbox: &Sandbox, charged: usize) {
 /// One healthy worker serves tenant A, then tenant B, then A again. Each
 /// session starts fresh: B sees none of A's globals, mounts, or output, and
 /// a Python error in B still resets the worker for reuse. Between sessions
-/// the idle worker charges the bytes it reports, not a session envelope: after
-/// a session that allocated most of its budget and reset, that is a small
-/// fraction of the budget.
+/// the idle worker charges the bytes it reports: after a session that
+/// allocated most of its budget and reset, that is a small fraction of the
+/// budget.
 ///
 /// # Panics
 /// Panics when the process is not reused, a session sees another's state,

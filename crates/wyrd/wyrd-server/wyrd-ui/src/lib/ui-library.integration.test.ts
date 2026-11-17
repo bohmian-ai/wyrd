@@ -1655,7 +1655,7 @@ const traced = assistantTest({
 /** A deployment whose model answers every call ten seconds late, past a short Verifier limit. */
 const stalled = assistantTest({ perTest: true, judge: () => ({ ...judgeReply('{"done":true}'), delayMs: 10_000 }) });
 
-stalled('Verify lists an execution that passed its Verifier limit by its recorded status', async ({ server, assistant: _ }) => {
+stalled('Verify lists a timed out and an errored execution by their recorded status', async ({ server, assistant: _ }) => {
   // The assistant fixture deploys the model on the gateway, which the desk's section reviewer calls.
   const cards = await Cards.connect();
   const desk = await cards.declareFromPath(fixture('cards/verifier_orchestration/orchestration-desk.yaml'));
@@ -1665,26 +1665,37 @@ stalled('Verify lists an execution that passed its Verifier limit by its recorde
   const orchestration = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: key }) });
   await orchestration.startBifrost();
   // `admission-deadline` allows itself three seconds; its one section review is still waiting on the model when they pass.
-  const submitted = await orchestration.run().observe.submit('admission-deadline', { sections: ['d0'] });
-  if (submitted.kind !== 'queued') throw new Error('admission-deadline queues an execution');
-  const id = submitted.execution.id;
+  const slow = await orchestration.run().observe.submit('admission-deadline', { sections: ['d0'] });
+  // `admission-sweep` declares its sections as strings; the engine refuses a number before any step runs.
+  const invalid = await orchestration.run().observe.submit('admission-sweep', { sections: [0] });
+  if (slow.kind !== 'queued' || invalid.kind !== 'queued') throw new Error('both submissions queue an execution');
 
   const context = { executor: nodeExecutor(WyrdClient.connect()), range: { from: new Date(Date.now() - 3_600_000).toISOString(), to: new Date(Date.now() + 60_000).toISOString() } };
-  await vi.waitFor(
-    async () => {
-      server.flushBifrost();
-      const loaded = await loadRecordTable({ signal: 'executions', columns: ['status', 'verdict'], where: [{ column: 'status', value: 'timed_out' }] }, context);
-      if (loaded.result.state !== 'populated') throw new Error(JSON.stringify(loaded.result));
-      const { columns, rows } = loaded.result.data.rows;
-      const listed = rows.map((row) => Object.fromEntries(columns.map((column, at) => [column.name, row[at]])));
-      expect(listed).toMatchObject([{ execution_id: id, status: 'timed_out', verdict: null }]);
-      expect(listed).toHaveLength(1);
-    },
-    { timeout: 45_000, interval: 500 }
-  );
-  // The list's status is the one the execution's own exact read reports.
-  const [live] = await context.executor.run([{ op: 'verification.get_execution', execution_id: id }]);
-  expect(live.ok && [live.value.status, live.value.error?.code]).toEqual(['timed_out', 'execution_timed_out']);
+  /** The executions the list shows under `status`, by column name. */
+  const listed = async (status: string) => {
+    server.flushBifrost();
+    const loaded = await loadRecordTable({ signal: 'executions', columns: ['status', 'verdict'], where: [{ column: 'status', value: status }] }, context);
+    if (loaded.result.state !== 'populated') return [];
+    const { columns, rows } = loaded.result.data.rows;
+    return rows.map((row) => Object.fromEntries(columns.map((column, at) => [column.name, row[at]])));
+  };
+  const expected = [
+    { execution: slow.execution.id, status: 'timed_out', code: 'execution_timed_out' },
+    { execution: invalid.execution.id, status: 'errored', code: 'input_invalid' }
+  ];
+  for (const { execution, status, code } of expected) {
+    await vi.waitFor(
+      async () => {
+        const rows = await listed(status);
+        expect(rows).toMatchObject([{ execution_id: execution, status, verdict: null }]);
+        expect(rows).toHaveLength(1);
+      },
+      { timeout: 45_000, interval: 500 }
+    );
+    // The list's status is the one the execution's own exact read reports.
+    const [live] = await context.executor.run([{ op: 'verification.get_execution', execution_id: execution }]);
+    expect(live.ok && [live.value.status, live.value.error?.code]).toEqual([status, code]);
+  }
   await orchestration.shutdown();
 });
 

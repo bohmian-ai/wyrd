@@ -1195,26 +1195,50 @@ mod tests {
     use crate::scribe::seal_key::{SealKey, TimePartition};
 
     /// A scratch artifact syncs and resets its backlog once it crosses the
-    /// sync interval, and keeps counting below it.
+    /// sync interval, and keeps counting below it. Inside laned work, writes
+    /// below the interval keep the encoder's CPU lane and the sync returns
+    /// it to other work.
     ///
     /// # Panics
-    /// Panics when the scratch file cannot be written or the backlog is
-    /// not reset at the interval.
+    /// Panics when the scratch file cannot be written, the backlog is not
+    /// reset at the interval, or the lane is held across the sync.
     #[test]
     fn syncing_file_resets_backlog_at_interval() {
+        use std::pin::pin;
+        use std::task::{Context, Poll, Waker};
+
+        use wyrd_runtime::resources::{ProcessResources, Workload};
+
         let scratch = tempfile::tempdir().expect("syncing scratch");
         let file = std::fs::File::create(scratch.path().join("artifact.parquet"))
             .expect("scratch artifact");
         let mut syncing = SyncingFile::new(file);
-        let chunk = vec![0_u8; 1024 * 1024];
-        for _ in 0..7 {
-            syncing.write_all(&chunk).expect("write below interval");
-        }
-        assert_eq!(syncing.unsynced, 7 * 1024 * 1024);
-        syncing.write_all(&chunk).expect("write to interval");
-        assert_eq!(syncing.unsynced, 0);
-        syncing.write_all(&[1]).expect("write past interval");
-        assert_eq!(syncing.unsynced, 1);
+        let resources = ProcessResources::new(std::num::NonZeroUsize::MIN, 1 << 30, 1 << 30);
+        let workloads = resources.workloads();
+        let operation = workloads.begin(Workload::Bifrost, None, None);
+        let lanes = workloads.lanes();
+        let mut poll = pin!(lanes.laned(operation.context(), async {
+            let chunk = vec![0_u8; 1024 * 1024];
+            for _ in 0..7 {
+                syncing.write_all(&chunk).expect("write below interval");
+            }
+            assert_eq!(syncing.unsynced, 7 * 1024 * 1024);
+            let encoding = lanes.free();
+            syncing.write_all(&chunk).expect("write to interval");
+            assert_eq!(syncing.unsynced, 0);
+            let synced = lanes.free();
+            syncing.write_all(&[1]).expect("write past interval");
+            assert_eq!(syncing.unsynced, 1);
+            (encoding, synced)
+        }));
+        let Poll::Ready((encoding, synced)) =
+            poll.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            panic!("the poll completes");
+        };
+        assert_eq!(encoding, 0, "unsynced writes keep the only lane");
+        assert_eq!(synced, 1, "the sync returned the lane");
+        assert_eq!(lanes.free(), 1, "the lane is returned exactly once");
     }
 
     /// Builds one metadata-light stored batch with the requested row count.

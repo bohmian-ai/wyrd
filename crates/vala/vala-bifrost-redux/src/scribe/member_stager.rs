@@ -568,6 +568,55 @@ mod tests {
         }
     }
 
+    /// Encoding a member inside laned persistence work returns the CPU lane
+    /// for the stager's directory and fsync IO instead of holding it across
+    /// the disk waits.
+    ///
+    /// # Panics
+    /// Panics when the member does not encode or the lane is still held
+    /// after the stager's disk IO.
+    #[test]
+    fn staging_disk_io_returns_the_cpu_lane() {
+        use std::pin::pin;
+        use std::task::{Context, Poll, Waker};
+
+        use wyrd_runtime::resources::{ProcessResources, Workload};
+
+        let root = tempfile::tempdir().expect("staged root");
+        let stage = Arc::new(ScribeHotStage::new(root.path().join("stage")));
+        let stager = ScribeMemberStager::new(stage);
+        let tenant = DataTenantId::new_v7();
+        let frozen = frozen_member(tenant, 64);
+        let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone()))
+            .expect("tenant binding");
+        let layout = crate::tables::hourly_test_layout(frozen.schema.as_ref());
+        let resources = ProcessResources::new(std::num::NonZeroUsize::MIN, 1 << 30, 1 << 30);
+        let workloads = resources.workloads();
+        let operation = workloads.begin(Workload::Bifrost, None, None);
+        let lanes = workloads.lanes();
+        let mut poll = pin!(lanes.laned(operation.context(), async {
+            let before = lanes.free();
+            stager
+                .encode_runs(StageMemberRequest {
+                    frozen: &frozen,
+                    binding: &binding,
+                    layout: &layout,
+                    origin: origin(),
+                    memory: crate::resources::ScribeResources::for_test(),
+                })
+                .expect("frozen member encodes into local runs");
+            (before, lanes.free())
+        }));
+        let Poll::Ready((before, after)) =
+            poll.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            panic!("the poll completes");
+        };
+        assert_eq!(before, 0, "the poll runs on the only lane");
+        assert_eq!(after, 1, "the stager's disk IO returned the lane");
+        assert_eq!(lanes.free(), 1, "the lane is returned exactly once");
+    }
+
     /// Re-encoding a member whose record is published is refused: the record
     /// may already have authorized retiring the WAL behind it, so overwriting
     /// the runs it names would remove the only copy of those rows.

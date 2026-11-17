@@ -500,8 +500,18 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
      `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=oracle::telemetry::tests::spawned_query_partitions_run_on_the_spawners_lanes)'`.
    - The parent-commitment sampler in `main.rs` (`mi_process_info`) has no
      runtime proof.
-   - The Scribe `off_lane` call sites (`SyncingFile::write`,
-     `MemberStager::encode_runs`) rest on source plus regressions.
+   - Closed: `scribe::parquet_writer::tests::syncing_file_resets_backlog_at_interval`
+     now runs inside a one-lane laned poll. Writes below the interval keep
+     the lane (free 0), and the interval sync returns it (free 1).
+     Mutation: syncing without `off_lane` fails with left 0, right 1.
+   - Closed: `scribe::member_stager::tests::staging_disk_io_returns_the_cpu_lane`.
+     `encode_runs` inside a one-lane laned poll leaves the lane free after
+     its directory and fsync IO. Mutation: running both stager IO sections
+     without `off_lane` fails with left 0, right 1. Because a poll stays
+     lane-less after its first release, this proves the stager returns its
+     lane for disk work, not each of its two sites separately. Both tests
+     were added after the wiring (TDD VIOLATED). GREEN:
+     `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=scribe::parquet_writer::tests::syncing_file_resets_backlog_at_interval) | test(=scribe::member_stager::tests::staging_disk_io_returns_the_cpu_lane)'`.
    - The spill choice, release for the rest of the poll, lets more than C
      polls run at once during spill IO. That is the recorded user decision,
      not revision 16 text, and it should be weighed against scenario 4's

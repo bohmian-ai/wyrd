@@ -1396,10 +1396,20 @@ judged('Verify lists executions with and without a recorded result as one author
   expect([foreignCharts.verdicts.result.state, foreignCharts.verifiers.result.state]).toEqual(['empty', 'empty']);
   // `verifier:read` alone opens exact executions but grants no discovery read: every panel is denied whole.
   const narrowKey = server.scopedApiKey('ui_verify_narrow', ['verifier:read']);
-  const narrow = { executor: nodeExecutor(WyrdClient.connect({ credential: narrowKey })), range };
+  const narrowNode = nodeExecutor(WyrdClient.connect({ credential: narrowKey }));
+  let narrowBatches = 0;
+  const countingExecutor: Executor = {
+    run(requests, signal) {
+      narrowBatches += 1;
+      return narrowNode.run(requests, signal);
+    }
+  };
+  const narrow = { executor: countingExecutor, range };
   const refusedCharts = await loadExecutionCharts({}, narrow);
   for (const loaded of [await loadRecordTable({ signal: 'executions' }, narrow), await loadFacetRail({ signal: 'executions', facets: ['status'] }, narrow), refusedCharts.verdicts, refusedCharts.verifiers])
     expect(loaded.result).toMatchObject({ state: 'denied', problem: { code: DENIED } });
+  // The list, the facets and the two charts together sent one batch each, and nothing was read after a refusal.
+  expect(narrowBatches).toBe(3);
 
   // BFF and custom app: the same rows for this tenant's session, nothing for another tenant's.
   env.WYRD_SERVER_URL = server.baseUrl;
@@ -1439,6 +1449,9 @@ judged('Verify lists executions with and without a recorded result as one author
   try {
     expect(await loadRecordTable({ signal: 'executions' }, { executor: narrowMcp.executor, range })).toMatchObject(refusal);
     expect((await loadRecordTable({ signal: 'executions' }, { executor: foreignMcp.executor, range })).result.state).toBe('empty');
+    expect((await loadFacetRail({ signal: 'executions', facets: ['status', 'verdict'] }, { executor: foreignMcp.executor, range })).result.state).toBe('empty');
+    const foreignMcpCharts = await loadExecutionCharts({}, { executor: foreignMcp.executor, range });
+    expect([foreignMcpCharts.verdicts.result.state, foreignMcpCharts.verifiers.result.state]).toEqual(['empty', 'empty']);
   } finally {
     await narrowMcp.close();
     await foreignMcp.close();
@@ -1446,8 +1459,11 @@ judged('Verify lists executions with and without a recorded result as one author
   expect(await bff(await signedIn('test-tenant-1', narrowKey))).toMatchObject(refusal);
   vi.stubEnv('WYRD_API_KEY', narrowKey);
   const appDenied = await app();
+  vi.stubEnv('WYRD_API_KEY', foreignKey);
+  const appForeign = await app();
   vi.stubEnv('WYRD_API_KEY', server.apiKey);
   expect(appDenied).toMatchObject(refusal);
+  expect(idsOf(appForeign)).toBe('empty');
 
   // The built HTML draws the list and its facets through host tools/call alone, each answered by the real MCP server.
   const host = new Client({ name: 'wyrd-ui-artifact-host', version: '1.0.0' }, { versionNegotiation: { mode: 'auto' } });
@@ -1475,6 +1491,24 @@ judged('Verify lists executions with and without a recorded result as one author
   } finally {
     await host.close();
   }
+  // The same built HTML behind another principal's host: a refusal is shown as a refusal, another tenant's list as empty.
+  const artifactList = async (credential: string) => {
+    const as = new Client({ name: 'wyrd-ui-artifact-host', version: '1.0.0' }, { versionNegotiation: { mode: 'auto' } });
+    await as.connect(new StreamableHTTPClientTransport(new URL('/mcp', server.baseUrl), { fetch: WyrdClient.connect({ credential }).httpAuth }));
+    try {
+      // The whole tool result is relayed, so a refusal reaches the page as one.
+      const view = await appBridgeView(doc, async (name, args) => (await as.callTool({ name, arguments: args })) as object);
+      const text = () => view.document.querySelector('[data-panel="list"]')?.textContent ?? '';
+      await vi.waitFor(() => expect(text()).toMatch(/WYRD_|No execution matches/));
+      return text();
+    } finally {
+      await as.close();
+    }
+  };
+  const artifactDenied = await artifactList(narrowKey);
+  expect(artifactDenied).toContain(DENIED);
+  expect(artifactDenied).not.toContain('No execution matches');
+  expect(await artifactList(foreignKey)).toContain('No execution matches these filters in this window.');
   // A server that cannot be reached is a problem, never an empty list.
   const DOWN = 'http://127.0.0.1:9';
   const unreachable = { result: { state: 'error', problem: { code: expect.stringMatching(/^WYRD_/) } } };

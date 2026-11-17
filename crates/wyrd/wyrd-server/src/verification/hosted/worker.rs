@@ -160,7 +160,7 @@ fn run(committed: fn() -> u64) -> ExitCode {
     if thread::Builder::new()
         .name("monty-telemetry".to_owned())
         .stack_size(TELEMETRY_STACK_SIZE)
-        .spawn(move || report(committed))
+        .spawn(move || report(committed, io::stdout()))
         .is_err()
     {
         return ExitCode::from(EX_CONFIG);
@@ -228,13 +228,13 @@ fn serve() -> ExitCode {
 /// Native stack of the telemetry thread, which only encodes one small frame.
 const TELEMETRY_STACK_SIZE: usize = 64 * 1024;
 
-/// Report the live and committed bytes every [`TELEMETRY_INTERVAL`] until
-/// stdout closes, which happens only as the process ends.
+/// Report the live and committed bytes to `out` every [`TELEMETRY_INTERVAL`]
+/// until it closes; a worker's stdout closes only as the process ends.
 ///
 /// Each sample reads the counters when it is written, so a write delayed by a
 /// large frame on the interpreter thread coalesces into one current sample
 /// rather than queueing stale ones.
-fn report(committed: fn() -> u64) {
+fn report(committed: fn() -> u64, mut out: impl Write) {
     let mut frame = Vec::with_capacity(TELEMETRY_FRAME_CAPACITY);
     loop {
         thread::sleep(TELEMETRY_INTERVAL);
@@ -248,12 +248,9 @@ fn report(committed: fn() -> u64) {
         if encode_framed_into(&event, &mut frame).is_err() {
             return;
         }
-        let mut stdout = io::stdout().lock();
-        if stdout
-            .write_all(&frame)
-            .and_then(|()| stdout.flush())
-            .is_err()
-        {
+        // `Stdout::write_all` writes the whole frame under one lock, so it
+        // never interleaves with the interpreter thread's frames.
+        if out.write_all(&frame).and_then(|()| out.flush()).is_err() {
             return;
         }
     }
@@ -313,4 +310,100 @@ fn install_panic_hook() {
         );
         default_hook(info);
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicU64;
+    use std::sync::mpsc;
+
+    use super::*;
+
+    /// The committed bytes the telemetry test reports, and how often they
+    /// were read.
+    static COMMITTED: AtomicU64 = AtomicU64::new(1);
+    static READS: AtomicUsize = AtomicUsize::new(0);
+
+    /// The test's committed-bytes reader.
+    fn committed() -> u64 {
+        READS.fetch_add(1, Ordering::SeqCst);
+        COMMITTED.load(Ordering::SeqCst)
+    }
+
+    /// A telemetry sink whose first write waits for the test, standing in
+    /// for a worker stdout delayed behind a large interpreter frame, and
+    /// which closes after its third frame.
+    struct DelayedSink {
+        frames: mpsc::Sender<Vec<u8>>,
+        release: mpsc::Receiver<()>,
+        written: usize,
+    }
+
+    impl Write for DelayedSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.written += 1;
+            if self.written > 2 {
+                return Err(io::ErrorKind::BrokenPipe.into());
+            }
+            self.frames.send(buf.to_vec()).map_err(io::Error::other)?;
+            if self.written == 1 {
+                self.release.recv().map_err(io::Error::other)?;
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The committed bytes one telemetry frame carries.
+    fn sampled(frame: &[u8]) -> u64 {
+        let event: pb::WorkerEvent = FrameReader::new(frame)
+            .read()
+            .expect("a telemetry frame decodes")
+            .expect("one frame");
+        match event.kind {
+            Some(pb::worker_event::Kind::MemorySample(sample)) => sample.committed_bytes,
+            other => panic!("not a memory sample: {other:?}"),
+        }
+    }
+
+    /// A delayed telemetry write coalesces: no samples queue behind it, and
+    /// the next frame reports the bytes current when it is written rather
+    /// than a stale reading; telemetry stops once its output closes.
+    ///
+    /// # Panics
+    /// Panics when a frame carries a stale reading, samples are read
+    /// without being written, or the reporter outlives its closed output.
+    #[test]
+    fn delayed_telemetry_coalesces_into_one_current_sample() {
+        let (frames, received) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let reporter = thread::spawn(move || {
+            report(
+                committed,
+                DelayedSink {
+                    frames,
+                    release: released,
+                    written: 0,
+                },
+            );
+        });
+        let first = received.recv().expect("the first sample is written");
+        assert_eq!(sampled(&first), 1);
+        COMMITTED.store(2, Ordering::SeqCst);
+        release.send(()).expect("the delayed write is released");
+        let next = received.recv().expect("the next sample is written");
+        assert_eq!(sampled(&next), 2, "the next frame reads current bytes");
+        reporter
+            .join()
+            .expect("telemetry stops once its output closes");
+        assert_eq!(
+            READS.load(Ordering::SeqCst),
+            3,
+            "one reading per frame written, none queued behind the delay"
+        );
+        assert!(received.try_recv().is_err(), "no stale frames queued");
+    }
 }

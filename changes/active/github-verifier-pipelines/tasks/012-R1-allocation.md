@@ -233,10 +233,22 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
 
    Independent check (fresh read-only checker, task file plus diff):
    - Unproved cases:
-     - 100 ms telemetry coalescing (`TELEMETRY_INTERVAL`) has no in-repo
-       test.
+     - Closed: `verification::hosted::worker::tests::delayed_telemetry_coalesces_into_one_current_sample`.
+       `report` now takes its writer, and the worker passes stdout, whose
+       `write_all` keeps one lock per frame. A sink delays the first frame
+       while the committed bytes change. The next frame carries the current
+       value, there is one reading per frame and none queue, and the
+       reporter stops once its output closes. Mutation: reading once
+       before the loop fails on the stale value. Added after the reporter
+       (TDD VIOLATED). GREEN:
+       `mise exec -- cargo nextest run --locked -p wyrd-server --features test-support --lib -E 'test(=verification::hosted::worker::tests::delayed_telemetry_coalesces_into_one_current_sample)'`;
+       the `sandbox_worker::` selector above: 14 passed.
      - Samples arriving during a held turn are proved only in the Monty fork.
-     - Cancelled owners never becoming zero usage has no case.
+     - Cancelled owners already had a case:
+       `failed_workers_settle_before_capacity_returns` cancels a run
+       mid-turn, and `settle` asserts on every poll that no worker's charge
+       returns while its process exists. Stale owners are covered by
+       `stale_worker_telemetry_stops_new_work_without_freeing_usage`.
      - Raw media buffers charged through their real lifetime: the media test
        sets `peak = encoded` and uses a fake reader, not a hosted media path.
      - The result precharge removal in `runner.rs::conclude` is proved by

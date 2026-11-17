@@ -498,8 +498,14 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
      final aggregate, which then sorts, both see only the query's laned
      context. Extended after the behaviour (TDD VIOLATED). GREEN:
      `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=oracle::telemetry::tests::spawned_query_partitions_run_on_the_spawners_lanes)'`.
-   - The parent-commitment sampler in `main.rs` (`mi_process_info`) has no
-     runtime proof.
+   - Closed: `main.rs` `tests::committed_bytes_follow_touched_allocations`.
+     Under the server's mimalloc global allocator, `committed_bytes()`
+     while a touched 64 MiB block is held is at least the block. Mutation:
+     reading the page-fault field instead fails with 0. A field that also
+     covers held memory (RSS) would pass; that `commit` is the right field
+     rests on mimalloc's `mi_process_info` signature. Added after the
+     sampler (TDD VIOLATED). GREEN:
+     `mise exec -- cargo nextest run --locked -p wyrd-server --bin wyrd-server -E 'test(=tests::committed_bytes_follow_touched_allocations)'`.
    - Closed: `scribe::parquet_writer::tests::syncing_file_resets_backlog_at_interval`
      now runs inside a one-lane laned poll. Writes below the interval keep
      the lane (free 0), and the interval sync returns it (free 1).
@@ -518,7 +524,8 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
      "C managed lanes".
    - TDD VIOLATED, previously unmarked: the Monty lane wiring in
      `sandbox.rs` and the `main.rs` sampler.
-   Status: FAIL (the first four items).
+   Status: PASS for the runtime proofs. The spill concurrency choice above
+   stays open for the user's call against scenario 4's "C managed lanes".
 
 6. **Connected public journey and bounded drain — REQ-019–024; AC-018.** Extend
    existing Rust-client/WyrdTestServer/Postgres journey owners with verification

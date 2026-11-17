@@ -528,3 +528,25 @@ async fn operator_pool() -> Result<OperatorPool, BootExit> {
         )))
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::committed_bytes;
+
+    /// The pressure sampler reads the allocator's live commitment, which
+    /// always covers a touched block the process still holds.
+    ///
+    /// # Panics
+    /// Panics when the reading is below the held 64 MiB block.
+    #[test]
+    fn committed_bytes_follow_touched_allocations() {
+        const BLOCK: usize = 64 << 20;
+        let block = std::hint::black_box(vec![1_u8; BLOCK]);
+        let committed = committed_bytes();
+        assert!(
+            committed >= BLOCK as u64,
+            "a held, touched {BLOCK}-byte block is committed: {committed}"
+        );
+        drop(block);
+    }
+}

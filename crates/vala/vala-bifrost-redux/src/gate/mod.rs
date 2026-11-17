@@ -356,6 +356,10 @@ pub struct Gate<A: GateAudit + 'static> {
     auth: IngestAuthInterceptor,
     /// Shared admission closure observed by ingest and query alike.
     closed: Arc<AtomicBool>,
+    /// The attached Scribe's ingress lane, which Gate asks to admit each new
+    /// public write as Bifrost work before accepting it; absent with no
+    /// production Scribe.
+    fresh: Option<crate::scribe::execution_lanes::ScribeIngressCpuPool>,
 }
 
 impl<A: GateAudit + 'static> Clone for Gate<A> {
@@ -374,6 +378,7 @@ impl<A: GateAudit + 'static> Clone for Gate<A> {
             limits: self.limits,
             auth: self.auth.clone(),
             closed: Arc::clone(&self.closed),
+            fresh: self.fresh.clone(),
         }
     }
 }
@@ -422,6 +427,7 @@ impl<A: GateAudit + 'static> Gate<A> {
     ) -> Self {
         initialize_gate_metrics();
         Self {
+            fresh: Some(scribe.ingress_cpu_pool()),
             scribe: Some(scribe),
             query: None,
             cards: None,
@@ -448,6 +454,7 @@ impl<A: GateAudit + 'static> Gate<A> {
             limits,
             auth,
             closed: Arc::new(AtomicBool::new(false)),
+            fresh: None,
         }
     }
 
@@ -467,6 +474,7 @@ impl<A: GateAudit + 'static> Gate<A> {
             limits,
             auth,
             closed: Arc::new(AtomicBool::new(false)),
+            fresh: None,
         }
     }
 
@@ -664,18 +672,26 @@ impl<A: GateAudit + 'static> Gate<A> {
         self.closed.load(Ordering::Acquire)
     }
 
-    /// Refuses new ingest once the Gate is closed or Scribe is not ready.
+    /// Refuses new ingest once the Gate is closed, Scribe is not ready, or
+    /// process pressure pauses new Bifrost work.
+    ///
+    /// Only public writes pass here; server outboxes deliver accepted work to
+    /// Scribe directly, so they keep draining under pressure.
     ///
     /// # Errors
     ///
     /// Returns [`IngestError::IngressClosed`] after `close()` and while the
-    /// local Scribe is absent or still recovering.
+    /// local Scribe is absent or still recovering, and
+    /// [`IngestError::IngestBusy`] while pressure pauses new Bifrost work.
     fn ensure_open(&self) -> Result<(), IngestError> {
         if self.is_closed() {
             return Err(IngestError::IngressClosed);
         }
         if !self.scribe.as_ref().is_some_and(|scribe| scribe.is_ready()) {
             return Err(IngestError::IngressClosed);
+        }
+        if let Some(fresh) = &self.fresh {
+            fresh.admit(None).map_err(IngestError::from_scribe)?;
         }
         Ok(())
     }

@@ -1165,9 +1165,9 @@ pub struct Oracle {
     catalog: Arc<BifrostCatalog>,
     /// Tenant SQL handle retained for the Oracle lifecycle boundary.
     vala: ValaPostgres,
-    /// This node's Oracle resource capability, read only by test-tier
-    /// inspection; admission holds its own clone.
-    #[cfg(feature = "test-support")]
+    /// This node's Oracle resource capability: query start admits through
+    /// its process workloads, and test-tier inspection reads its grant;
+    /// admission holds its own clone.
     resources: OracleResources,
     /// Query-scoped live Scribe discovery owner.
     tail_discovery: Option<Arc<dyn TailStreamDiscovery>>,
@@ -1525,7 +1525,6 @@ impl Oracle {
             running_queries,
             catalog: config.catalog,
             vala: config.vala,
-            #[cfg(feature = "test-support")]
             resources: config.memory.resources,
             tail_discovery: config.tail_discovery,
             #[cfg(feature = "test-support")]

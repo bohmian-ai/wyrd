@@ -11,7 +11,8 @@
   import { goto, invalidate } from '$app/navigation';
   import { Chart, EmptyState, FacetRail, RecordTable, type ActionIntent, type ActionState } from 'wyrd-ai-ui';
   import { NO_VERDICT, validateIntent, type ChartProps, type ComponentName } from 'wyrd-ai-ui/loaders';
-  import { moved, writeState, zoomed, type ObserveState } from '$lib/observe-host';
+  import TimePicker, { type PickedRange, type Zone } from '$lib/TimePicker.svelte';
+  import { PRESETS, appliedRange, moved, writeState, zoomed, type ObserveState } from '$lib/observe-host';
   import { VERIFY_GROUPS, VERIFY_MOST, VERIFY_PAGE, verifyStep, whereText } from '$lib/verify-host';
   import type { PageProps } from './$types';
 
@@ -66,8 +67,9 @@
     const [centre, half] = [(from + to) / 2, ((to - from) * factor) / 2];
     void go(zoomed(current, centre - half, centre + half));
   }
-  /** The ranges the picker offers, as the approved design words them. */
-  const RANGES: Readonly<Record<string, string>> = { '1h': 'Last hour', '6h': 'Last 6 hours', '24h': 'Last 24 hours', '7d': 'Last 7 days', '14d': 'Last 14 days' };
+  function apply(range: PickedRange, tz: Zone) {
+    void go({ ...current, tz, ...('last' in range ? { last: range.last, from: undefined, to: undefined } : range) });
+  }
   /** The Group by choices as the approved design words them. */
   const GROUP_NAMES = { run_id: 'run', subject_name: 'Card', service_name: 'Service', group_id: 'session' } as const;
   /** The exact Verifier definition a Verifier facet value names, when the host could name it. */
@@ -113,13 +115,7 @@
       <button type="button" class="icon" aria-label="Zoom out" disabled={!data.range} onclick={() => zoom(2)}>−</button>
       <button type="button" class="icon" aria-label="Zoom in" disabled={!data.range} onclick={() => zoom(0.5)}>+</button>
     </span>
-    <label class="icon range">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="5" width="18" height="16"></rect><path d="M3 10h18M8 3v4M16 3v4"></path></svg>
-      <select aria-label="Time range" value={current.last} onchange={(event) => go({ ...current, last: event.currentTarget.value, from: undefined, to: undefined })}>
-        {#each Object.entries(RANGES) as [last, text] (last)}<option value={last}>{text}</option>{/each}
-        {#if !(current.last in RANGES)}<option value={current.last}>Last {current.last}</option>{/if}
-      </select>
-    </label>
+    <TimePicker range={appliedRange(current)} zone={current.tz} presets={PRESETS} onapply={apply} />
     <button type="button" class="live" aria-pressed={current.live} onclick={() => go({ ...current, live: !current.live })}>
       <span class="dot" aria-hidden="true"></span>{current.live ? 'Live' : 'Paused'}
     </button>
@@ -312,13 +308,6 @@
     background: none;
     color: var(--declare);
     font: 12px var(--font-mono);
-    cursor: pointer;
-  }
-  .range select {
-    border: 0;
-    background: transparent;
-    color: inherit;
-    font: inherit;
     cursor: pointer;
   }
   .where a {

@@ -16,7 +16,8 @@
   table and footer: a 56px plot with no axis text, its time labels beneath,
   and a key when the host names several `colors`; `bars` stacks a
   timeseries' series as bars, coloured by `colors` when the host names a
-  colour per caption. Series take the palette's series order by position
+  colour per caption; a `transparent` colour draws a dashed outline, for a
+  series that is counted without being one of the values. Series take the palette's series order by position
   unless the host names a colour, and every fill is drawn at full strength.
   A host `heading` replaces the chart's own header and splits it into two
   cards: the plot under that heading, then the selectable series summary
@@ -311,7 +312,7 @@
     <h3>{input.title ?? 'Chart'}{#if input.unit && !compact}{' '}<span class="unit">· {input.unit}</span>{/if}</h3>
     {#if headline}<span class="headline" style:color={headline.tone}>{headline.value}</span>{#if headline.detail}<span class="detail">{headline.detail}</span>{/if}{/if}
     {#if compact && Object.keys(colors).length > 1}
-      <span class="key" aria-label="Key">{#each Object.entries(colors) as [label, color] (label)}<span><i class:line={!stacked} style:background={color}></i>{label}</span>{/each}</span>
+      <span class="key" aria-label="Key">{#each Object.entries(colors) as [label, color] (label)}<span><i class:line={!stacked} class:hollow={color === 'transparent'} style:background={color}></i>{label}</span>{/each}</span>
     {/if}
     {/if}
     {#if degraded && data}
@@ -378,7 +379,8 @@
               {@const width = barWidth}
               {#each column.segments as segment (segment.label)}
                 {#if segment.to > segment.from}
-                  <rect class="segment" x={Math.min(sx(column.x), W - PAD.right - width)} y={sy(segment.to)} {width} height={sy(segment.from) - sy(segment.to)} fill={style(segment.index, segment.label).stroke}>
+                  {@const fill = style(segment.index, segment.label).stroke}
+                  <rect class="segment" class:hollow={fill === 'transparent'} x={Math.min(sx(column.x), W - PAD.right - width)} y={sy(segment.to)} {width} height={sy(segment.from) - sy(segment.to)} {fill}>
                     <title>{segment.label}: {fmtNumber(segment.to - segment.from)}{unitLabel}</title>
                   </rect>
                 {/if}
@@ -841,6 +843,14 @@
     width: 8px;
     height: 8px;
     margin-right: 6px;
+  }
+  .key i.hollow {
+    box-sizing: border-box;
+    border: 1px dashed var(--muted);
+  }
+  .segment.hollow {
+    stroke: var(--muted);
+    stroke-dasharray: 2 2;
   }
   .key i.line {
     width: 10px;

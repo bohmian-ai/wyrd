@@ -1081,6 +1081,27 @@ export interface ExecutionChartsProps {
 /** The series of an execution with no recorded verdict: a neutral bucket, never a verdict. */
 export const NO_VERDICT = 'no verdict';
 
+/** How an execution status or recorded verdict reads: its glyph, its words and its tone. Hue is never the only channel. */
+export type ExecutionMark = readonly [glyph: string, label: string, tone: 'text' | 'muted' | 'run' | 'ok' | 'warn' | 'danger'];
+/** Every retained execution status. `pending` is work accepted and not yet started, which a reader knows as queued. */
+export const EXECUTION_STATUS: Readonly<Record<string, ExecutionMark>> = {
+  pending: ['○', 'queued', 'muted'],
+  running: ['●', 'running', 'run'],
+  retrying: ['↻', 'retrying', 'run'],
+  waiting: ['◷', 'waiting', 'warn'],
+  completed: ['■', 'completed', 'text'],
+  errored: ['✕', 'errored', 'danger'],
+  timed_out: ['⧗', 'timed out', 'warn'],
+  cancelled: ['⊘', 'cancelled', 'muted'],
+  'not recorded': ['○', 'not recorded', 'muted']
+};
+/** Every recorded verdict. */
+export const EXECUTION_VERDICT: Readonly<Record<string, ExecutionMark>> = {
+  passed: ['✓', 'passed', 'ok'],
+  failed: ['✕', 'failed', 'danger'],
+  inconclusive: ['?', 'inconclusive', 'muted']
+};
+
 /** Executions per bucket and `series` under the list's own range and WHERE. */
 function executionsBy(series: string, input: { readonly where?: readonly Filter[] }, range: AbsoluteRange): Executed {
   const { table, time } = SIGNALS.executions;
@@ -1096,7 +1117,7 @@ export async function loadExecutionCharts(input: { readonly where?: readonly Fil
   const range = rangeOf(input.range, context);
   if ('code' in range) {
     const result = { state: 'error', problem: range } as const;
-    return { verdicts: { input: chart('Executions by verdict', 'verdict', '-'), result }, verifiers: { input: chart('Executions by Verifier', 'verifier', '-'), result } };
+    return { verdicts: { input: chart('Executions', 'verdict', '-'), result }, verifiers: { input: chart('By Verifier', 'verifier', '-'), result } };
   }
   const plans = [executionsBy(`coalesce(verdict, '${NO_VERDICT}') AS verdict`, input, range), executionsBy('verifier_card_uid AS verifier', input, range)];
   const reads = await context.executor.run(plans.map((plan) => query(plan.sql, plan.params)), context.signal);
@@ -1105,7 +1126,7 @@ export async function loadExecutionCharts(input: { readonly where?: readonly Fil
     const shaped = chart(title, series, plans[index].sql, range);
     return { input: shaped, executed: plans[index], result: read.ok ? shapeChart(shaped, read.value) : failed(read.problem) };
   };
-  return { verdicts: props('Executions by verdict', 'verdict', 0), verifiers: props('Executions by Verifier', 'verifier', 1) };
+  return { verdicts: props('Executions', 'verdict', 0), verifiers: props('By Verifier', 'verifier', 1) };
 }
 
 /** How far a trace's spans may start outside its root's own start and end: clock skew between services, and work that outlives the root. */
@@ -1265,7 +1286,7 @@ const LABELS: Readonly<Record<string, string>> = {
   recorded_at: 'Time',
   ended_at: 'Ended',
   verifier_card_uid: 'Verifier',
-  subject_name: 'Card name',
+  subject_name: 'Card',
   subject_kind: 'Card kind',
   subject_version: 'Card version',
   run_id: 'Run',

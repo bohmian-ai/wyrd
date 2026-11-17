@@ -10,7 +10,7 @@
 <script lang="ts">
   import { goto, invalidate } from '$app/navigation';
   import { Chart, EmptyState, FacetRail, RecordTable, type ActionIntent, type ActionState } from 'wyrd-ai-ui';
-  import { NO_VERDICT, columnLabel, validateIntent, type ChartProps, type ComponentName } from 'wyrd-ai-ui/loaders';
+  import { NO_VERDICT, validateIntent, type ChartProps, type ComponentName } from 'wyrd-ai-ui/loaders';
   import TimePicker, { type PickedRange, type Zone } from '$lib/TimePicker.svelte';
   import { PRESETS, appliedRange, moved, writeState, zoomed, type ObserveState } from '$lib/observe-host';
   import { VERIFY_GROUPS, verifyStep, whereText } from '$lib/verify-host';
@@ -19,10 +19,10 @@
   let { data }: PageProps = $props();
   /** How often Live re-runs the dashboard's load. */
   const LIVE_MS = 10_000;
-  /** A verdict's colour; an execution with no recorded verdict is neutral, never a fourth verdict. */
-  const VERDICTS = { passed: 'var(--ok)', failed: 'var(--danger)', inconclusive: 'var(--warn)', [NO_VERDICT]: 'var(--muted)' } as const;
-  /** The series colours, in the shared chart's order. */
-  const SERIES = ['var(--declare)', 'var(--observe)', 'var(--series-3)', 'var(--series-4)', 'var(--series-5)'] as const;
+  /** A verdict's colour; an execution with no recorded verdict is a dashed outline, never a fourth verdict. */
+  const VERDICTS = { passed: 'var(--declare)', failed: 'var(--danger)', inconclusive: 'var(--muted)', [NO_VERDICT]: 'transparent' } as const;
+  /** The Verifier chart's colours: its three named series in order, then the one that counts the rest. */
+  const SERIES = ['var(--declare)', 'var(--observe)', 'var(--warn)', 'var(--muted)'] as const;
 
   const base = $derived(`/t/${encodeURIComponent(data.tenant.key)}`);
   const current = $derived(data.state);
@@ -65,6 +65,14 @@
     const [centre, half] = [(from + to) / 2, ((to - from) * factor) / 2];
     void go(zoomed(current, centre - half, centre + half));
   }
+  /** The Group by choices as the approved design words them. */
+  const GROUP_NAMES = { run_id: 'run', subject_name: 'Card', service_name: 'Service', group_id: 'session' } as const;
+  /** The exact Verifier definition a Verifier facet value names, when the host could name it. */
+  function definition(column: string, value: unknown) {
+    const [name, version] = (column === 'verifier_card_uid' && !('problem' in verify) && verify.labels[String(value)]?.split('@')) || [];
+    if (!name || !version) return undefined;
+    return { href: `${base}/cards/detail?${new URLSearchParams({ kind: 'Verifier', name, version })}`, label: `Open Verifier ${name}@${version}` };
+  }
   const zoomedIn = $derived(current.from !== undefined);
   /** Executions under the applied filters and range: the status facet counts every one, in fewer values than a facet reads. */
   const total = $derived.by(() => {
@@ -76,12 +84,13 @@
     void go({ ...current, tz, ...('last' in range ? { last: range.last, from: undefined, to: undefined } : range) });
   }
 
-  /** A short key for the Verifier chart: its first series, coloured as the chart draws them. */
-  function key(chart: ChartProps): Record<string, string> {
-    if (chart.result.state !== 'populated') return {};
-    const at = chart.result.data.columns.findIndex((column) => column.name === 'verifier');
-    const names = [...new Set(chart.result.data.rows.map((row) => String(row[at])))].slice(0, SERIES.length);
-    return Object.fromEntries(names.map((name, index) => [name, SERIES[index]]));
+  /** The Verifier chart's key: each series in its colour; a fourth series only ever counts the rest. */
+  const key = (order: readonly string[]) => Object.fromEntries(order.map((name, index) => [name, SERIES[index]]));
+  /** How many executions a chart counts, beside its title. */
+  function counted(chart: ChartProps) {
+    if (chart.result.state !== 'populated') return undefined;
+    const at = chart.result.data.columns.findIndex((column) => column.name === 'executions');
+    return { value: chart.result.data.rows.reduce((sum, row) => sum + Number(row[at]), 0).toLocaleString('en-US') };
   }
 </script>
 
@@ -103,9 +112,6 @@
       <button type="button" class="icon" aria-label="Zoom out" disabled={!data.range} onclick={() => zoom(2)}>−</button>
       <button type="button" class="icon" aria-label="Zoom in" disabled={!data.range} onclick={() => zoom(0.5)}>+</button>
     </span>
-    <button type="button" class="icon" aria-label="Reset zoom" disabled={!zoomedIn} onclick={() => go({ ...current, from: undefined, to: undefined })}>
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7L3 8M3 3v5h5"></path></svg>
-    </button>
     <TimePicker range={appliedRange(current)} zone={current.tz} presets={PRESETS} onapply={apply} />
     <button type="button" class="live" aria-pressed={current.live} onclick={() => go({ ...current, live: !current.live })}>
       <span class="dot" aria-hidden="true"></span>Live
@@ -128,24 +134,27 @@
     <section class="panel overview" aria-label="Timelines" data-panel="charts">
       <header>
         <p class="h">Drag across either chart to zoom both</p>
-        {#if zoomedIn && data.range}<span class="zoomed">{data.range.from.slice(0, 19)}Z → {data.range.to.slice(0, 19)}Z</span>{/if}
+        {#if zoomedIn && data.range}
+          <span class="zoomed">{data.range.from.slice(0, 19)}Z → {data.range.to.slice(0, 19)}Z</span>
+          <button type="button" class="reset" onclick={() => go({ ...current, from: undefined, to: undefined })}>Reset zoom</button>
+        {/if}
       </header>
       <div class="pair">
-        <Chart {...verify.charts.verdicts} compact bars colors={VERDICTS} {actions} onaction={onaction('Chart')} />
-        <Chart {...verify.charts.verifiers} compact bars colors={key(verify.charts.verifiers)} {actions} onaction={onaction('Chart')} />
+        <Chart {...verify.charts.verdicts} compact bars colors={VERDICTS} headline={counted(verify.charts.verdicts)} {actions} onaction={onaction('Chart')} />
+        <Chart {...verify.charts.verifiers} compact bars colors={key(verify.charts.verifierSeries)} headline={counted(verify.charts.verifiers)} {actions} onaction={onaction('Chart')} />
       </div>
     </section>
     <div class="listbar">
       <span class="by" role="group" aria-label="Group by">
         <span>Group by</span>
         {#each [undefined, ...VERIFY_GROUPS] as column (column ?? '')}
-          <button type="button" class="icon" aria-pressed={current.group === column} onclick={() => go({ ...current, group: column })}>{column ? columnLabel(column) : 'none'}</button>
+          <button type="button" class="icon" aria-pressed={current.group === column} onclick={() => go({ ...current, group: column })}>{column ? GROUP_NAMES[column] : 'none'}</button>
         {/each}
       </span>
       {#if total !== undefined}<span class="total">{total.toLocaleString('en-US')} executions</span>{/if}
     </div>
     <div class="split">
-      <div data-panel="facets"><FacetRail {...verify.facets} labels={verify.labels} {actions} onaction={onaction('FacetRail')} /></div>
+      <div data-panel="facets"><FacetRail {...verify.facets} labels={verify.labels} link={definition} {actions} onaction={onaction('FacetRail')} /></div>
       <div data-panel="list"><RecordTable {...verify.list} labels={verify.labels} {actions} onaction={onaction('RecordTable')} /></div>
     </div>
   {/if}
@@ -319,6 +328,14 @@
   .zoomed {
     color: var(--muted);
     font: 12px var(--font-mono);
+  }
+  .reset {
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--declare);
+    font: 12px var(--font-mono);
+    cursor: pointer;
   }
   .where a {
     color: var(--muted);

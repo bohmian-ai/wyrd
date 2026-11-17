@@ -12,7 +12,7 @@ import { step, type HostStep, type ObserveState } from './observe-host';
 /** The columns the Verify rail counts. */
 export const VERIFY_FACETS = ['status', 'verdict', 'verifier_card_uid', 'service_name', 'subject_name', 'run_id', 'group_id'] as const;
 /** The shown columns the Verify list may group by. Grouping only arranges rows; it is never a combined judgment. */
-export const VERIFY_GROUPS = ['verifier_card_uid', 'subject_name', 'service_name', 'run_id', 'group_id'] as const;
+export const VERIFY_GROUPS = ['run_id', 'subject_name', 'service_name', 'group_id'] as const;
 
 /**
  * The shared loader inputs of the Verify dashboard, read from the same URL

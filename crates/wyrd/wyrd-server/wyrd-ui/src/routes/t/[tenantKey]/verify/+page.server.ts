@@ -17,12 +17,35 @@ import { appliedRange, readState } from '$lib/observe-host';
 import { verifyInputs } from '$lib/verify-host';
 import type { PageServerLoad } from './$types';
 
-/** `chart` with each Verifier Card UID of its series read as the name the host listed for it. */
-function named(chart: ChartProps, labels: Readonly<Record<string, string>>): ChartProps {
+/** How many Verifiers the Verifier chart names; the rest share one series, so its key stays on one line. */
+const NAMED_SERIES = 3;
+
+/**
+ * `chart` with its three largest Verifiers as series, largest first, and every
+ * other Verifier counted in one `N more` series. A series reads the Verifier's
+ * name, or its name and version when two of the three share a name; a Verifier
+ * the host could not name reads as its Card UID. `order` is the series order.
+ */
+function ranked(chart: ChartProps, names: Readonly<Record<string, string>>): { readonly chart: ChartProps; readonly order: readonly string[] } {
   const read = chart.result;
-  if (read.state !== 'populated') return chart;
-  const at = read.data.columns.findIndex((column) => column.name === 'verifier');
-  return { ...chart, result: { ...read, data: { ...read.data, rows: read.data.rows.map((row) => row.map((value, index) => (index === at ? (labels[String(value)] ?? value) : value))) } } };
+  if (read.state !== 'populated') return { chart, order: [] };
+  const [at, verifier, n] = ['at', 'verifier', 'executions'].map((name) => read.data.columns.findIndex((column) => column.name === name));
+  const totals = new Map<string, number>();
+  for (const row of read.data.rows) totals.set(String(row[verifier]), (totals.get(String(row[verifier])) ?? 0) + Number(row[n]));
+  const uids = [...totals.keys()].sort((a, b) => totals.get(b)! - totals.get(a)! || a.localeCompare(b));
+  const top = uids.slice(0, NAMED_SERIES).map((uid) => names[uid] ?? uid);
+  const short = top.map((name) => name.split('@')[0]);
+  const series = new Map(uids.slice(0, NAMED_SERIES).map((uid, index) => [uid, short.indexOf(short[index]) === short.lastIndexOf(short[index]) ? short[index] : top[index]]));
+  const rest = uids.length > NAMED_SERIES ? `${uids.length - NAMED_SERIES} more` : undefined;
+  const merged = new Map<string, unknown[]>();
+  for (const row of read.data.rows) {
+    const label = series.get(String(row[verifier])) ?? rest!;
+    const key = `${String(row[at])}\u0000${label}`;
+    const kept = merged.get(key);
+    if (kept) kept[n] = Number(kept[n]) + Number(row[n]);
+    else merged.set(key, row.map((value, index) => (index === verifier ? label : index === n ? Number(value) : value)));
+  }
+  return { chart: { ...chart, result: { ...read, data: { ...read.data, rows: [...merged.values()] } } }, order: [...series.values(), ...(rest ? [rest] : [])] };
 }
 
 /**
@@ -55,6 +78,7 @@ export const load: PageServerLoad = async ({ locals, url, request, depends }) =>
     // ponytail: one page of 200 Verifier versions is named; past that a row shows its exact UID.
     context.executor.run([{ op: 'cards.list', kind: 'Verifier', limit: 200 }], request.signal)
   ]);
-  const labels = verifiers.ok ? Object.fromEntries(verifiers.value.items.map((card) => [card.card_uid, `${card.name} ${card.version}`])) : {};
-  return { state, range, verify: { facets, list, charts: { verdicts: charts.verdicts, verifiers: named(charts.verifiers, labels) }, labels } };
+  const labels = verifiers.ok ? Object.fromEntries(verifiers.value.items.map((card) => [card.card_uid, `${card.name}@${card.version}`])) : {};
+  const verifierChart = ranked(charts.verifiers, labels);
+  return { state, range, verify: { facets, list, charts: { verdicts: charts.verdicts, verifiers: verifierChart.chart, verifierSeries: verifierChart.order }, labels } };
 };

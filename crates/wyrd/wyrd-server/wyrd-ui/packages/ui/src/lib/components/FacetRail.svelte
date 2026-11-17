@@ -5,26 +5,29 @@
   shows its first values and expands to every value read; when the read found
   more than it returns, the count of hidden values says so with "+". A
   severity text value reads in the colour of the highest severity number
-  recorded with it. An execution with no recorded verdict is counted as "no
-  verdict", and a host that passes `labels` names a value it read, such as a
+  recorded with it. An execution facet shows four values first; its failed
+  verdict and its errored and timed out statuses read in the danger colour,
+  and an execution with no recorded verdict is counted as "no recorded
+  verdict". A host `link` puts an exact page beside a value, and a host that passes `labels` names a value it read, such as a
   Verifier Card UID; the filter still carries the value itself.
 -->
 <script lang="ts">
   import type { ActionProps } from '../contract.js';
-  import { FACET_VALUES, NO_VERDICT, STATUS_NAMES, columnLabel, severityLevel, type FacetRailProps } from '../loaders.js';
+  import { EXECUTION_STATUS, FACET_VALUES, STATUS_NAMES, columnLabel, severityLevel, type FacetRailProps } from '../loaders.js';
   import { fmtCount } from '../format.js';
   import { numeric } from '../plot.js';
   import ActionNote from './ActionNote.svelte';
   import EmptyState from './EmptyState.svelte';
 
-  let { input, result, actions = {}, onaction, labels = {} }: FacetRailProps & ActionProps & { labels?: Readonly<Record<string, string>> } = $props();
+  let { input, result, actions = {}, onaction, labels = {}, link }: FacetRailProps & ActionProps & { labels?: Readonly<Record<string, string>>; link?: (column: string, value: unknown) => { href: string; label: string } | undefined } = $props();
 
   const filterState = $derived(actions['facet.filter']);
   const blocked = $derived(!onaction || filterState?.state === 'pending' || filterState?.state === 'unavailable');
   const active = (column: string, value: unknown) =>
     (input.where ?? []).some((filter) => filter.column === column && filter.value === value && !filter.not);
   /** Values a collapsed facet shows. */
-  const FIRST = 5;
+  const FIRST = $derived(input.signal === 'executions' ? 4 : 5);
+  const failing = (column: string, value: unknown) => (column === 'verdict' && value === 'failed') || (column === 'status' && (value === 'errored' || value === 'timed_out'));
   /** Facets the reader expanded. */
   let expanded = $state.raw<ReadonlySet<string>>(new Set());
 </script>
@@ -53,14 +56,15 @@
                 >
                   <span
                     class="value"
-                    class:unset={value === null}
-                    class:error={(column === 'status_code' && value !== null && numeric(value) === 2) || (column === 'severity_text' && severityLevel(number) === 'error')}
+                    class:unset={value === null || (column === 'verdict' && value === 'inconclusive')}
+                    class:error={failing(column, value) || (column === 'status_code' && value !== null && numeric(value) === 2) || (column === 'severity_text' && severityLevel(number) === 'error')}
                     class:warn={column === 'severity_text' && severityLevel(number) === 'warn'}
                      title={labels[String(value)] ? String(value) : undefined}
-                    >{value === null ? (column === 'verdict' ? NO_VERDICT : 'not set') : column === 'status_code' ? (STATUS_NAMES[Number(value)] ?? String(value)) : (labels[String(value)] ?? String(value))}</span
+                    >{value === null ? (column === 'verdict' ? 'no recorded verdict' : 'not set') : column === 'status_code' ? (STATUS_NAMES[Number(value)] ?? String(value)) : column === 'status' && input.signal === 'executions' ? (EXECUTION_STATUS[String(value)]?.[1] ?? String(value)) : (labels[String(value)] ?? String(value))}</span
                   >
                   <span class="count">{fmtCount(numeric(n))}</span>
                 </button>
+                {#if link?.(column, value)}{@const to = link(column, value)!}<a class="def" href={to.href} aria-label={to.label} title={to.label}>↗</a>{/if}
               </li>
             {/each}
           </ul>
@@ -144,6 +148,22 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  li {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    min-width: 0;
+  }
+  li button {
+    flex: 1;
+    min-width: 0;
+  }
+  .def {
+    padding: 0 3px;
+    color: var(--declare);
+    font: 12px var(--font-mono);
+    text-decoration: none;
   }
   .more {
     width: auto;

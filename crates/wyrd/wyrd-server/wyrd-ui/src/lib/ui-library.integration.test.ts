@@ -1487,7 +1487,7 @@ judged('Verify lists executions with and without a recorded result as one author
     const list = () => built.document.querySelector('[data-panel="list"]') as Element;
     await vi.waitFor(() => expect(list().querySelectorAll('tbody tr')).toHaveLength(1));
     expect(list().textContent).toContain('cancelled');
-    expect(list().textContent).toContain('no verdict');
+    expect(list().textContent).toContain('none');
     expect(list().textContent).not.toMatch(/passed|failed/);
     await vi.waitFor(() => expect(built.document.querySelector('[data-panel="facets"]')?.textContent).toContain('completed'));
     await vi.waitFor(() => expect(built.document.querySelector('[data-panel="verdicts"] .legend')?.textContent).toContain('no verdict'));

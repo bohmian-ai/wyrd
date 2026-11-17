@@ -1572,16 +1572,16 @@ judged('the Verify dashboard filters, groups, brushes, pages, opens an execution
     await page.waitForURL(list);
     await expect.poll(() => rows.count()).toBe(50);
     expect(await where.textContent()).toContain('select facet values to filter');
-    for (const title of ['Executions by verdict', 'Executions by Verifier']) expect(await page.getByRole('region', { name: title }).locator('svg.plot').count()).toBe(1);
+    for (const title of ['Executions', 'By Verifier']) expect(await page.getByRole('region', { name: title }).locator('svg.plot').count()).toBe(1);
     // The Verifier is named from its Card; the running execution is counted under its recorded status.
-    expect(await rail.getByRole('button', { name: /answer-check 1\.0\.0/ }).count()).toBe(1);
+    expect(await rail.getByRole('button', { name: /answer-check@1\.0\.0/ }).count()).toBe(1);
     expect(await rail.getByRole('button', { name: /running/ }).textContent()).toContain('1');
     await captureExecution(page, 'verify-dashboard');
 
     // The unfinished execution is found by its recorded status, and its own page agrees.
     await rail.getByRole('button', { name: /running/ }).click();
     await expect.poll(() => rows.count()).toBe(1);
-    expect(await rows.first().textContent()).toContain('no verdict');
+    expect(await rows.first().textContent()).toContain('none');
     await rows.first().click();
     await page.waitForURL(`${list}/executions/${running}`);
     await expect.poll(() => page.locator('[data-execution-status]').getAttribute('data-execution-status')).toBe('running');
@@ -1618,7 +1618,7 @@ judged('the Verify dashboard filters, groups, brushes, pages, opens an execution
     await rail.getByRole('button', { name: /completed/ }).click();
     await expect.poll(async () => (await where.textContent())?.trim()).toBe("verdict = 'failed' AND status = 'completed'");
     expect(await rows.count()).toBe(1);
-    expect(await rows.first().textContent()).toContain('answer-check 1.0.0');
+    expect(await rows.first().textContent()).toContain('answer-check');
     // The failed execution opens as its exact page; Back restores both filters.
     await rows.first().click();
     await page.waitForURL(`${list}/executions/${refused}`);
@@ -1651,13 +1651,13 @@ judged('the Verify dashboard filters, groups, brushes, pages, opens an execution
     await expect.poll(() => rows.count()).toBe(50);
 
     // Grouping arranges the same rows under their session; it adds no row and no judgment.
-    await page.getByRole('group', { name: 'Group by' }).getByRole('button', { name: 'Session' }).click();
+    await page.getByRole('group', { name: 'Group by' }).getByRole('button', { name: 'session' }).click();
     await expect.poll(query).toMatchObject({ group: 'group_id' });
     await expect.poll(() => page.locator('[aria-label="executions rows"] tr.group').count()).toBeGreaterThan(0);
     expect(await rows.count()).toBe(50);
 
     // Either chart brushes the range every panel reads; Reset zoom returns to the preset.
-    for (const title of ['Executions by verdict', 'Executions by Verifier']) {
+    for (const title of ['Executions', 'By Verifier']) {
       const box = await page.getByRole('region', { name: title }).locator('svg.plot').boundingBox();
       if (!box) throw new Error(`${title} draws no plot to brush`);
       await page.mouse.move(box.x + box.width * 0.5, box.y + box.height / 2);
@@ -1675,8 +1675,8 @@ judged('the Verify dashboard filters, groups, brushes, pages, opens an execution
     }
 
     // A brush over the early part of the day, before any execution was accepted, empties the list; Reset zoom brings the rows back.
-    const early = await page.getByRole('region', { name: 'Executions by verdict' }).locator('svg.plot').boundingBox();
-    if (!early) throw new Error('Executions by verdict draws no plot to brush');
+    const early = await page.getByRole('region', { name: 'Executions' }).locator('svg.plot').boundingBox();
+    if (!early) throw new Error('Executions draws no plot to brush');
     await page.mouse.move(early.x + early.width * 0.05, early.y + early.height / 2);
     await page.mouse.down();
     await page.mouse.move(early.x + early.width * 0.3, early.y + early.height / 2, { steps: 5 });
@@ -1700,12 +1700,12 @@ judged('the Verify dashboard filters, groups, brushes, pages, opens an execution
     });
     await rail.getByRole('button', { name: /failed/ }).click();
     await expect.poll(() => waiting).toBe(1);
-    await page.getByRole('group', { name: 'Group by' }).getByRole('button', { name: 'Verifier' }).click();
-    await expect.poll(query).toEqual({ group: 'verifier_card_uid' });
+    await page.getByRole('group', { name: 'Group by' }).getByRole('button', { name: 'Service' }).click();
+    await expect.poll(query).toEqual({ group: 'service_name' });
     release();
     await page.unroute(filtered);
-    await expect.poll(() => page.locator('[aria-label="executions rows"] tr.group').first().textContent()).toContain('Verifier = ');
-    expect(query()).toEqual({ group: 'verifier_card_uid' });
+    await expect.poll(() => page.locator('[aria-label="executions rows"] tr.group').first().textContent()).toMatch(/executions? · /);
+    expect(query()).toEqual({ group: 'service_name' });
     expect(await rows.count()).toBe(50);
     expect(await where.textContent()).toContain('select facet values to filter');
 
@@ -1721,7 +1721,7 @@ judged('the Verify dashboard filters, groups, brushes, pages, opens an execution
     await page.getByRole('link', { name: 'Results in Verify' }).click();
     await expect.poll(async () => (await where.textContent())?.trim()).toBe(`verifier_card_uid = '${assistant.answerCheck.uid}'`);
     await expect.poll(() => rows.count()).toBe(1);
-    expect(await rows.first().textContent()).toContain('answer-check 1.0.0');
+    expect(await rows.first().textContent()).toContain('answer-check');
   } finally {
     await browser.close();
     bff.stop();

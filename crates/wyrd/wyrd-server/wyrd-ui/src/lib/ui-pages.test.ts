@@ -764,16 +764,19 @@ test('the Verify dashboard reads one population and keeps its investigation in t
   // The dashboard: two charts, counted facets and the execution rows, with Verifiers named from one bounded Card list.
   const page = await open('');
   await waitFor(() => expect(page.getByRole('region', { name: 'executions rows' })).toBeInTheDocument());
-  expect(page.getByRole('region', { name: 'Executions by verdict' })).toHaveTextContent('no verdict');
-  expect(page.getByRole('region', { name: 'Executions by Verifier' })).toHaveTextContent('ticket-policy 1.1.0');
+  expect(page.getByRole('region', { name: 'Executions' })).toHaveTextContent('no verdict');
+  // Each chart states its total; the Verifier chart names its largest Verifiers by name.
+  expect(page.getByRole('region', { name: 'By Verifier' })).toHaveTextContent('By Verifier 14 ticket-policylatency-drift');
   const rail = within(page.getByRole('navigation', { name: 'Filter executions' }));
-  expect(rail.getByRole('button', { name: /no verdict/ })).toHaveTextContent('2');
-  expect(rail.getByRole('button', { name: /latency-drift 1.0.0/ })).toHaveTextContent('2');
+  expect(rail.getByRole('button', { name: /no recorded verdict/ })).toHaveTextContent('2');
+  expect(rail.getByRole('button', { name: /latency-drift@1.0.0/ })).toHaveTextContent('2');
   // The rail counts the facets of the approved design, in its order.
-  expect(rail.getAllByRole('heading').map((heading) => heading.textContent?.trim())).toEqual(['Status', 'Verdict', 'Verifier', 'Service', 'Card name', 'Run', 'Session']);
+  expect(rail.getAllByRole('heading').map((heading) => heading.textContent?.trim())).toEqual(['Status', 'Verdict', 'Verifier', 'Service', 'Card', 'Run', 'Session']);
+  // A Verifier value links to its exact definition.
+  expect(rail.getByRole('link', { name: 'Open Verifier latency-drift@1.0.0' })).toHaveAttribute('href', '/t/acme/cards/detail?kind=Verifier&name=latency-drift&version=1.0.0');
   const table = within(page.getByRole('region', { name: 'executions rows' }));
   expect(table.getAllByRole('row')).toHaveLength(8);
-  expect(table.getAllByText('ticket-policy 1.1.0')).toHaveLength(5);
+  expect(table.getAllByText('ticket-policy')).toHaveLength(5);
   expect(page.getByLabelText('WHERE: read-only projection of the active filters')).toHaveTextContent('select facet values to filter');
   // Bounded shared reads only: every query is one batch read of the executions population, and no row is hydrated.
   expect(new Set(requests.map((request) => request.op))).toEqual(new Set(['bifrost.query', 'cards.list']));
@@ -787,13 +790,13 @@ test('the Verify dashboard reads one population and keeps its investigation in t
   expect(goto).toHaveBeenLastCalledWith(`/t/acme/verify${search({ where: [{ column: 'verdict', value: 'failed' }] })}`, { keepFocus: true, noScroll: true });
   // Group by is a row of choices with the current one pressed, beside the total the status facet counts.
   const groups = within(page.getByRole('group', { name: 'Group by' }));
-  expect(groups.getAllByRole('button').map((button) => [button.textContent?.trim(), button.getAttribute('aria-pressed')])).toEqual([['none', 'true'], ['Verifier', 'false'], ['Card name', 'false'], ['Service', 'false'], ['Run', 'false'], ['Session', 'false']]);
+  expect(groups.getAllByRole('button').map((button) => [button.textContent?.trim(), button.getAttribute('aria-pressed')])).toEqual([['none', 'true'], ['run', 'false'], ['Card', 'false'], ['Service', 'false'], ['session', 'false']]);
   expect(page.getByText('6 executions')).toBeInTheDocument();
-  await fireEvent.click(groups.getByRole('button', { name: 'Session' }));
+  await fireEvent.click(groups.getByRole('button', { name: 'session' }));
   expect(goto).toHaveBeenLastCalledWith('/t/acme/verify?group=group_id', expect.anything());
   await fireEvent.click(page.getByRole('button', { name: 'Live' }));
   expect(goto).toHaveBeenLastCalledWith('/t/acme/verify?live=1', expect.anything());
-  for (const title of ['Executions by verdict', 'Executions by Verifier']) {
+  for (const title of ['Executions', 'By Verifier']) {
     const plot = page.getByRole('region', { name: title }).querySelector('svg.plot') as SVGSVGElement;
     plot.getBoundingClientRect = () => ({ left: 0, width: 600, top: 0, height: 56, right: 600, bottom: 56, x: 0, y: 0, toJSON: () => ({}) });
     await fireEvent.pointerDown(plot, { clientX: 100, pointerId: 1 });
@@ -809,7 +812,7 @@ test('the Verify dashboard reads one population and keeps its investigation in t
 
   // Status and verdict combine: the WHERE projection names both, and rows, facets and both charts bind the same clauses.
   const where = [{ column: 'status', value: 'completed' }, { column: 'verdict', value: 'failed' }];
-  const filtered = await open(search({ where, from: '2026-10-20T10:00:00.000Z', to: '2026-10-20T12:00:00.000Z', group: 'verifier_card_uid' }));
+  const filtered = await open(search({ where, from: '2026-10-20T10:00:00.000Z', to: '2026-10-20T12:00:00.000Z', group: 'service_name' }));
   await waitFor(() => expect(filtered.getByRole('region', { name: 'executions rows' })).toBeInTheDocument());
   expect(filtered.getByLabelText('WHERE: read-only projection of the active filters')).toHaveTextContent(`status = 'completed' AND verdict = 'failed'`);
   expect(queries()).toHaveLength(10);
@@ -817,8 +820,8 @@ test('the Verify dashboard reads one population and keeps its investigation in t
   expect(queries().every((query) => query.params?.[0] === '2026-10-20T10:00:00.000Z' && query.params?.[1] === '2026-10-20T12:00:00.000Z')).toBe(true);
   // Reset zoom returns to the preset; Clear drops the filters; both keep the grouping.
   await fireEvent.click(filtered.getByRole('button', { name: 'Reset zoom' }));
-  expect(goto).toHaveBeenLastCalledWith(`/t/acme/verify${search({ where, group: 'verifier_card_uid' })}`, expect.anything());
-  expect(filtered.getByRole('link', { name: 'Clear' })).toHaveAttribute('href', `/t/acme/verify${search({ from: '2026-10-20T10:00:00.000Z', to: '2026-10-20T12:00:00.000Z', group: 'verifier_card_uid' })}`);
+  expect(goto).toHaveBeenLastCalledWith(`/t/acme/verify${search({ where, group: 'service_name' })}`, expect.anything());
+  expect(filtered.getByRole('link', { name: 'Clear' })).toHaveAttribute('href', `/t/acme/verify${search({ from: '2026-10-20T10:00:00.000Z', to: '2026-10-20T12:00:00.000Z', group: 'service_name' })}`);
   filtered.unmount();
   // Another value adds a clause, as in Observe, and the changed list starts at its first page again.
   const paged = await open(search({ where, after: ['2026-10-20T11:58:02.412000Z', 'exec_failed'] }));

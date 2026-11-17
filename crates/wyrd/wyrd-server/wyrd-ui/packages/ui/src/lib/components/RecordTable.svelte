@@ -37,7 +37,7 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
   import type { ActionProps, QueryResult } from '../contract.js';
-  import { KEY_COLUMNS, LIST_LIMIT, NO_VERDICT, STATUS_NAMES, cellText, columnLabel, isInstant, listSort, severityLevel, shortId, shownColumns, signalColumns, sortColumns, type ListSort, type RecordTableProps } from '../loaders.js';
+  import { EXECUTION_STATUS, EXECUTION_VERDICT, KEY_COLUMNS, LIST_LIMIT, STATUS_NAMES, cellText, columnLabel, isInstant, listSort, severityLevel, shortId, shownColumns, signalColumns, sortColumns, type ListSort, type RecordTableProps } from '../loaders.js';
   import { fmtCount } from '../format.js';
   import { columnIndex, numeric } from '../plot.js';
   import ActionButton from './ActionButton.svelte';
@@ -68,8 +68,21 @@
 
   const TONES: Record<number, Tone> = { 0: 'neutral', 1: 'ok', 2: 'danger' };
   const NOUNS = { traces: ['trace', 'traces'], spans: ['span', 'spans'], logs: ['record', 'records'], metrics: ['point', 'points'], executions: ['execution', 'executions'] } as const;
-  /** The tone of each retained execution status and recorded verdict; a status with no terminal record carries none. */
-  const EXECUTION_TONES: Readonly<Record<string, Tone>> = { completed: 'neutral', running: 'running', retrying: 'warn', waiting: 'warn', cancelled: 'warn', timed_out: 'danger', errored: 'danger', passed: 'ok', failed: 'danger', inconclusive: 'warn' };
+  /** An execution's outcome columns stay in view at the right while its identity columns scroll beneath them. */
+  const pinned = (column: string) => (signal === 'executions' && (column === 'status' || column === 'verdict') ? `pin pin-${column}` : undefined);
+  /** When an execution was accepted: the clock time alone within the last day, else the date too. */
+  const recorded = (value: string) => (Date.now() - Date.parse(value) < 86_400_000 ? value.slice(11, 19) : text('recorded_at', value));
+  /** A group of executions in words: how many, then how many of each recorded verdict and how many with none. */
+  function tally(members: readonly (readonly unknown[])[]) {
+    const at = rows ? columnIndex(rows, 'verdict') : -1;
+    const n = (verdict: string | null) => members.filter((row) => row[at] === verdict).length;
+    return [counted(members.length), ...Object.keys(EXECUTION_VERDICT).filter((verdict) => n(verdict)).map((verdict) => `${n(verdict)} ${verdict}`), ...(n(null) ? [`${n(null)} no verdict`] : [])].join(' · ');
+  }
+  /** The executions table's `min-width` in its style: below it the table scrolls sideways and the foot says so. */
+  const EXECUTIONS_MIN = 880;
+  let width = $state(0);
+  /** Groups the reader collapsed, by key. */
+  let collapsed = $state.raw<ReadonlySet<string>>(new Set());
   const UNSETTLED = 'No result of this direct execution is retained.';
   /** Execution columns that hold a UUID: shown shortened, or as the name the host read for it. A session id is the caller's own text and is shown whole. */
   const isId = (column: string) => signal === 'executions' && column !== 'group_id' && (column.endsWith('_id') || column.endsWith('_uid'));
@@ -278,6 +291,7 @@
         class:wrap
         role="region"
         aria-label="{signal ?? 'Query'} rows"
+        bind:clientWidth={width}
         {onscroll}
         onmouseenter={() => (reading = true)}
         onmouseleave={(event) => (reading = event.currentTarget.scrollTop > 0)}
@@ -288,7 +302,7 @@
           <thead>
             <tr>
               {#each visible as column (column)}
-                {#if column === extrasBefore}{@render extraHeads()}{/if}<th scope="col" title={column} aria-sort={order?.column === sortKey(column) ? (order.desc ? 'descending' : 'ascending') : undefined}
+                {#if column === extrasBefore}{@render extraHeads()}{/if}<th scope="col" class={pinned(column)} title={column} aria-sort={order?.column === sortKey(column) ? (order.desc ? 'descending' : 'ascending') : undefined}
                   >{#if sortable(column)}<button type="button" class="sort" onclick={() => sort(column)}
                       >{heading(column)}{#if order?.column === sortKey(column)}<span aria-hidden="true">{order.desc ? ' ↓' : ' ↑'}</span>{/if}</button
                     >{:else}{heading(column)}{/if}</th
@@ -300,9 +314,18 @@
           <tbody>
             {#each groups as { key, caption, members } (key)}
               {#if input.groupBy}
+                {#if signal === 'executions'}
+                  {@const shut = collapsed.has(key)}
+                  <tr class="group"><th scope="rowgroup" colspan={visible.length + extraCount}><span class="ghead">
+                    <button type="button" class="toggle" aria-expanded={!shut} aria-label="{shut ? 'Expand' : 'Collapse'} {caption}" onclick={() => (collapsed = new Set(shut ? [...collapsed].filter((each) => each !== key) : [...collapsed, key]))}>{shut ? '▸' : '▾'}</button>
+                    {#if key === 'null'}<b>Ungrouped</b><span class="null">no {heading(input.groupBy).toLowerCase()}</span>{:else}<b>{caption}</b>{/if}
+                    <span class="null tally">{tally(members)}</span>
+                  </span></th></tr>
+                {:else}
                 <tr class="group"><th scope="rowgroup" colspan={visible.length + extraCount}>{heading(input.groupBy)} = {caption} · {members.length}</th></tr>
+                {/if}
               {/if}
-              {#each members as row, index (index)}
+              {#each collapsed.has(key) ? [] : members as row, index (index)}
                 {@const traceCounts = byTrace.get(String(row[columnIndex(rows, 'trace_id')]))}
                 <tr
                   class:openable
@@ -314,9 +337,19 @@
                 >
                   {#each visible as column (column)}
                     {@const value = row[columnIndex(rows, column)]}
-                    {#if column === extrasBefore}{@render extras(rows, row, traceCounts)}{/if}<td class:name={signal && column === 'name'}>
-                      {#if signal === 'executions' && column === 'verdict' && value === null}
-                        <span class="null">{NO_VERDICT}</span>
+                    {#if column === extrasBefore}{@render extras(rows, row, traceCounts)}{/if}<td class:name={signal && column === 'name'} class={pinned(column)}>
+                      {#if signal === 'executions' && column === 'verdict'}
+                        {@const mark = EXECUTION_VERDICT[String(value)]}
+                        {#if mark}<span class="badge tone-{mark[2]}"><span aria-hidden="true">{mark[0]}</span>{mark[1]}</span>{:else}<span class="null">none</span>{/if}
+                      {:else if signal === 'executions' && column === 'status'}
+                        {@const mark = EXECUTION_STATUS[String(value)] ?? ['', String(value), 'text']}
+                        <span class="st tone-{mark[2]}" title={value === 'not recorded' ? UNSETTLED : undefined}><span aria-hidden="true">{mark[0]}</span>{mark[1]}</span>
+                      {:else if signal === 'executions' && value === null}
+                        <span class="null">—</span>
+                      {:else if signal === 'executions' && column === 'recorded_at'}
+                        <time datetime={String(value)} title={String(value)}>{recorded(String(value))}</time>
+                      {:else if signal === 'executions' && column === 'verifier_card_uid'}
+                        <span class:id={!labels[String(value)]} title={labels[String(value)] ?? String(value)}>{labels[String(value)]?.split('@')[0] ?? shortId(String(value))}</span>
                       {:else if !signal || value === null}
                         <span class:null={value === null} title={typeof value === 'string' && value.length > 40 ? value : undefined}>{text(column, value)}</span>
                       {:else if column === 'duration_nano'}
@@ -327,8 +360,6 @@
                         <span class="level-{severityLevel(row[columnIndex(rows, 'severity_number')])}">{text(column, value)}</span>
                       {:else if column === 'service_name'}
                         <span class="chip" title={String(value)}>{String(value)}</span>
-                      {:else if signal === 'executions' && (column === 'status' || column === 'verdict')}
-                        <span title={value === 'not recorded' ? UNSETTLED : undefined}><StatusPill tone={EXECUTION_TONES[String(value)] ?? 'neutral'} label={String(value).replace('_', ' ')} /></span>
                       {:else if isId(column)}
                         <span class:id={!labels[String(value)]} title={String(value)}>{labels[String(value)] ?? shortId(String(value))}</span>
                       {:else if isInstant(column)}
@@ -347,7 +378,7 @@
       </div>
       {#if page}
         <nav class="foot pager" aria-label="Pages">
-          <span>Showing {counted(rows.rows.length)}{#if signal === 'spans' && openable}{' '}· a trace id opens that trace{/if}</span>
+          <span>Showing {counted(rows.rows.length)}{#if signal === 'spans' && openable}{' '}· a trace id opens that trace{/if}{#if signal === 'executions' && width && width < EXECUTIONS_MIN}{' '}· scroll the table sideways for every column{/if}</span>
           {#if onaction}
             <span class="pages">
               <button type="button" disabled={!page.newer} onclick={() => page.newer && onaction?.({ name: 'record.page', input: { before: page.newer } })}>‹ Newer</button>
@@ -617,6 +648,79 @@
   }
   .null {
     color: var(--muted);
+  }
+  .st,
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font: 12px var(--font-mono);
+    white-space: nowrap;
+  }
+  .badge {
+    padding: 0 6px;
+    border: 2px solid currentColor;
+    border-radius: var(--r);
+    font: 11px/16px var(--font-mono);
+  }
+  .tone-text {
+    color: var(--text);
+  }
+  .tone-muted {
+    color: var(--muted);
+  }
+  .tone-run {
+    color: var(--declare);
+  }
+  .tone-ok {
+    color: var(--ok);
+  }
+  .tone-warn {
+    color: var(--warn);
+  }
+  .tone-danger {
+    color: var(--danger);
+  }
+  [data-signal='executions'] table {
+    min-width: 880px;
+  }
+  .pin {
+    position: sticky;
+    width: 112px;
+    min-width: 112px;
+    box-sizing: border-box;
+    background: var(--surface);
+  }
+  th.pin {
+    z-index: 2;
+  }
+  .pin-status {
+    right: 112px;
+    box-shadow: -1px 0 0 var(--border-soft);
+  }
+  .pin-verdict {
+    right: 0;
+    text-align: right;
+  }
+  tr:hover .pin {
+    background: var(--surface-hover);
+  }
+  .ghead {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .ghead .tally {
+    margin-left: auto;
+    font-size: 11px;
+  }
+  .toggle {
+    width: 18px;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
   }
   .errors,
   .level-error {

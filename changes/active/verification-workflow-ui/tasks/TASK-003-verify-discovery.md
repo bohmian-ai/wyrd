@@ -147,19 +147,30 @@ browser journey at `66c395825`.
 TDD: the population, status, facet-list and row-identity changes had a failing
 unit test first. The real-server journeys were written after the production query.
 
-Comparison with the approved mock (real page captured by the browser journey in
-light and dark at 1280 and 390 wide; mock captured by `selfcheck.mjs --shots`).
-The WHERE box, zoom, range, Live, both charts and legends, the Group by
-buttons with the total beside them, the facet rail and its order, and the
-table columns match. Differences:
+Comparison with the approved mock, against its source (`design/mock/src/Verify.svelte`,
+`Timeline.svelte`, `app.css`) and captures of both pages in light and dark at
+1280 and 390 wide. The production page now follows the mock for: the verdict
+chart colours and the dashed no-verdict series; the Verifier chart's three
+named series and "N more"; each chart's total; Group by buttons (none, run,
+Card, Service, session) with the total; facet wording, four values before
+"more", danger and muted tones, and the link to the exact Verifier
+definition; status as glyph and word; verdict as a badge, or "none"; Verifier
+name with its version on hover; clock time; Status and Verdict pinned while
+the other columns scroll; collapsible group headings with a verdict tally;
+Reset zoom beside the zoomed range.
 
-- The chart headings do not show the total count.
-- The table pages with Newer and Older; the mock shows "Showing 50 of N" with
-  "Show 50 more".
-- The mock's Failed column and Failed requirement facet are absent (see the
-  decision below on requirement filtering; the column was not ruled on).
-- The mock's Repository and Pull request facets and groups are absent; they
-  belong to TASK-005 and were removed from this task.
+Differences that remain:
+
+- No Failed column: the population holds no failed requirement names, and the
+  task forbids hydrating a result per row.
+- No Repository or Pull request facet, group or column: TASK-005.
+- The table keeps the shared list's header (count, Wrap lines, Columns, CSV),
+  Newer and Older paging and Open in Query; the mock has "Showing 50 of N"
+  with "Show 50 more".
+- Range is the shared time picker and Live is a pressed button; the mock has
+  a select and a Live/Paused label.
+- `waiting`, `retrying` and `not recorded` are statuses the mock does not
+  show; they use ◷, ↻ and ○.
 
 User decisions, 2026-11-17:
 
@@ -177,5 +188,5 @@ Not proven:
 - No unfinished session or drift execution is listed on a real server.
 - Touch input and long-content states were not exercised.
 
-Status: `BLOCKED`. Open: the mock differences above, and AC-009's human
-acceptance of the page.
+Status: `BLOCKED`. Open: the remaining mock differences above, and AC-009's
+human acceptance of the page.

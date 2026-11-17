@@ -3182,21 +3182,21 @@ test('JSON and YAML blocks are coloured by syntax role without changing their te
 test('an executions list keeps status and verdict apart, names Verifiers the host read, and opens one exact execution', async () => {
   const onaction = vi.fn();
   const list = render(RecordTable, { input: { signal: 'executions' }, result: { state: 'populated', data: { rows: executions } }, labels: verifierLabels, onaction });
-  expect(list.getAllByRole('columnheader').map((heading) => heading.textContent?.trim())).toEqual(['Time ↓', 'Verifier', 'Card name', 'Run', 'Session', 'Service', 'Status', 'Verdict']);
+  expect(list.getAllByRole('columnheader').map((heading) => heading.textContent?.trim())).toEqual(['Time ↓', 'Verifier', 'Card', 'Run', 'Session', 'Service', 'Status', 'Verdict']);
   const cells = (row: number) => [...list.getAllByRole('row')[row].querySelectorAll('td')].map((cell) => cell.textContent?.trim());
   // Status and verdict are separate facts: a completed failure, then a recorded cancel and a direct execution with no result, neither with a verdict.
-  expect(cells(1).slice(6)).toEqual(['completed', '✕failed']);
-  expect(cells(4).slice(6)).toEqual(['!cancelled', 'no verdict']);
-  expect(cells(5).slice(6)).toEqual(['not recorded', 'no verdict']);
+  expect(cells(1).slice(6)).toEqual(['■completed', '✕failed']);
+  expect(cells(4).slice(6)).toEqual(['⊘cancelled', 'none']);
+  expect(cells(5).slice(6)).toEqual(['○not recorded', 'none']);
   // A session id is the caller's text, shown whole.
   expect(cells(2)[4]).toBe('conversation-7');
   // Completed before its result row is visible: the recorded status, and no verdict borrowed from anywhere.
-  expect(cells(6).slice(6)).toEqual(['completed', 'no verdict']);
+  expect(cells(6).slice(6)).toEqual(['■completed', 'none']);
   expect(list.getByText('not recorded').closest('[title]')).toHaveAttribute('title', 'No result of this direct execution is retained.');
   // Unfinished queued work states its recorded lifecycle.
-  expect(cells(7).slice(6)).toEqual(['!waiting', 'no verdict']);
-  // The Verifier reads as the name the host supplied and keeps its exact UID; an id without one is shortened, never dropped.
-  expect(list.getAllByText('ticket-policy 1.1.0')[0]).toHaveAttribute('title', VERIFIER_UIDS.policy);
+  expect(cells(7).slice(6)).toEqual(['◷waiting', 'none']);
+  // The Verifier reads as the name the host supplied, with its exact version on hover; an id without one is shortened, never dropped.
+  expect(list.getAllByText('ticket-policy')[0]).toHaveAttribute('title', 'ticket-policy@1.1.0');
   expect(list.getByText('01a1…195f')).toHaveAttribute('title', '01a1e602-c9a9-7d0b-a028-5acc7427195f');
   expect(list.getAllByRole('row')[1].querySelector('time')).toHaveAttribute('datetime', '2026-10-20T11:58:02.412000Z');
   expect(list.getByText(/^Showing 7 executions/)).toBeInTheDocument();
@@ -3217,22 +3217,25 @@ test('an executions list keeps status and verdict apart, names Verifiers the hos
     { column: 'verifier_card_uid', values: { ...facet, rows: [[VERIFIER_UIDS.policy, 9], [VERIFIER_UIDS.drift, 3]] } }
   ];
   const rail = render(FacetRail, { input: { signal: 'executions', facets: ['verdict', 'verifier_card_uid'] }, result: { state: 'populated', data: { facets } }, labels: verifierLabels, onaction: filter });
-  await fireEvent.click(rail.getByRole('button', { name: /no verdict\s*2/ }));
-  await fireEvent.click(rail.getByRole('button', { name: /latency-drift 1\.0\.0\s*3/ }));
+  await fireEvent.click(rail.getByRole('button', { name: /no recorded verdict\s*2/ }));
+  await fireEvent.click(rail.getByRole('button', { name: /latency-drift@1\.0\.0\s*3/ }));
   expect(filter.mock.calls.map(([intent]) => intent.input)).toEqual([
     { signal: 'executions', column: 'verdict', value: null },
     { signal: 'executions', column: 'verifier_card_uid', value: VERIFIER_UIDS.drift }
   ]);
   rail.unmount();
 
-  // Both charts draw the read series; no verdict is a series of its own in the neutral colour the host names.
+  // Both charts draw the read series; no verdict is a series of its own, outlined instead of filled.
   const chart = render(Chart, {
-    input: { type: 'timeseries', title: 'Executions by verdict', sql: '-', x: 'at', y: ['executions'], series: 'verdict', range: RANGE },
+    input: { type: 'timeseries', title: 'Executions', sql: '-', x: 'at', y: ['executions'], series: 'verdict', range: RANGE },
     result: { state: 'populated', data: executionsByVerdict },
     compact: true,
     bars: true,
-    colors: { passed: 'var(--ok)', failed: 'var(--danger)', inconclusive: 'var(--warn)', 'no verdict': 'var(--muted)' }
+    colors: { passed: 'var(--declare)', failed: 'var(--danger)', inconclusive: 'var(--muted)', 'no verdict': 'transparent' }
   });
   expect(chart.container.textContent).toContain('no verdict');
+  // A transparent colour is a dashed outline in the key and in the plot, never a filled verdict.
+  expect(chart.container.querySelector('.key i.hollow')?.parentElement).toHaveTextContent('no verdict');
+  expect(chart.container.querySelectorAll('rect.segment.hollow').length).toBeGreaterThan(0);
   chart.unmount();
 });

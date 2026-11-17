@@ -315,7 +315,7 @@ export const LOG = { time_unix_nano: '2026-10-20T11:58:02.410000000+00:00', obse
 
 /** Verifier Card UIDs the execution rows name, and the names a host read for them. */
 export const VERIFIER_UIDS = { policy: '01a1e602-c0e3-7880-ad65-f29c521418cb', drift: '01a1e602-cb7f-7c63-bc0c-f6b307a7147e' } as const;
-export const verifierLabels = { [VERIFIER_UIDS.policy]: 'ticket-policy 1.1.0', [VERIFIER_UIDS.drift]: 'latency-drift 1.0.0' };
+export const verifierLabels = { [VERIFIER_UIDS.policy]: 'ticket-policy@1.1.0', [VERIFIER_UIDS.drift]: 'latency-drift@1.0.0' };
 /** Executions, as the Verify list reads them: shown columns, then execution_id. Completed with each verdict, a recorded cancel, a direct execution with no result, completed before its result row is visible, and one waiting. */
 export const executions = result(
   [col('recorded_at', 'Timestamp(µs, "+00:00")'), col('verifier_card_uid'), col('subject_name'), col('run_id'), col('group_id'), col('service_name'), col('status'), col('verdict'), col('execution_id')],

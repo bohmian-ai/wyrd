@@ -412,10 +412,24 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
      - Regressions: redux `--lib` 942 passed, `--test integration` 75
        passed, `mise run test:bifrost:journey:scribe` 45 passed and 1
        skipped.
-   - Open:
-     - DataFusion spill writes inside a laned poll still hold the lane
-       across local IO.
-     Status: FAIL.
+   - Spill IO off the lane (the user chose "release for the rest of the
+     poll").
+     - A laned poll records its lease where `CpuLanes::off_lane` finds it.
+       In a poll, `off_lane` returns the lane and the rest of that poll
+       runs without one, because waiting for a lane would block the async
+       worker. The next poll queues again.
+     - Blocking jobs keep release-and-requeue. `ChargedSpillWriter`'s
+       write, flush and finish run through `off_lane`.
+     - Ceiling: the rest of a poll after a spill write can run with more
+       than C polls running at once.
+     - Tests:
+       - `resources::lanes::tests::polled_io_returns_the_lane_for_the_rest_of_the_poll`.
+         RED: "the lane is free while the poll does IO", left 0. GREEN;
+         `wyrd-runtime --lib` 94 passed.
+       - `oracle::spill::tests::spill_writes_return_the_query_lane`,
+         written after the implementation. Mutation check: a plain write
+         fails it.
+   Status: PENDING the final lane runs.
 
 6. **Connected public journey and bounded drain — REQ-019–024; AC-018.** Extend
    existing Rust-client/WyrdTestServer/Postgres journey owners with verification
@@ -480,10 +494,26 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
        - cancellation and deadline expiry under pressure;
        - local quotas refusing at their own boundaries;
        - bounded drain of persistence and host settlement.
-     - The same file's
-       `direct_verification_runs_while_queued_capacity_is_held` fails: the
-       queued runner never logs its admission deferral. Under diagnosis.
-     Status: FAIL.
+     - Removing the session precharge broke the premise of three tests,
+       that 64 MiB free is short of one Python session. A Codex
+       diagnostician found the cause: nothing refused the run, so it never
+       deferred or timed out. Ledger-full setups starve the Bifrost input
+       read, and critical pressure now stops that read at Oracle admission.
+       The user chose to assert the real behaviour, that work waits and
+       then completes.
+       - `verification_runtime::isolated_capacity::direct_verification_runs_while_queued_capacity_is_held`:
+         under critical pressure, the queued Python run waits in its
+         Bifrost read and completes after recovery.
+       - `pg_verification_routes::direct_execution_waits_end_at_the_arrival_deadline`:
+         under critical pressure, the direct run times out with 504 at its
+         deadline, then passes.
+       - `verification::pg_tests::execution_waits_and_refusals_follow_hosted_capacity`
+         (MCP): the same, plus a queued run that passes after recovery.
+       - All three pass. Stale "session envelope" comments and the
+         `one_session` name are gone. A sweep for tests of removed
+         allocation logic found no test that only asserts removed
+         behaviour.
+     Status: FAIL (request bodies, relayed answers, remaining journey cases).
 
 7. **Functional closure and performance — REQ-024; AC-018.** Run affected
    functional lanes, then full clean L1 verification, gateway and all three

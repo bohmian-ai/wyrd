@@ -31,9 +31,20 @@ use super::workload::{WorkContext, Workload};
 thread_local! {
     /// The work running on this thread's held lane, and its lanes, if any.
     static RUNNING: RefCell<Option<Inherited>> = const { RefCell::new(None) };
-    /// The lease of the blocking job running on this thread, which
-    /// [`CpuLanes::off_lane`] returns and replaces around blocking IO.
-    static HELD: Cell<Option<RunId>> = const { Cell::new(None) };
+    /// The lease of the laned work running on this thread, which
+    /// [`CpuLanes::off_lane`] returns around blocking IO.
+    static HELD: Cell<Option<Hold>> = const { Cell::new(None) };
+}
+
+/// How the laned work running on a thread holds its lane.
+#[derive(Debug, Clone, Copy)]
+enum Hold {
+    /// A blocking job, which queues for a lane again after off-lane IO.
+    Blocking(RunId),
+    /// One poll of a [`Laned`] future, which runs the rest of the poll
+    /// without a lane after off-lane IO, since waiting for one would block
+    /// an async worker.
+    Polled(RunId),
 }
 
 impl WorkContext {
@@ -242,33 +253,47 @@ impl CpuLanes {
         if RUNNING.with_borrow(Option::is_some) {
             return job();
         }
-        HELD.set(Some(self.wait_blocking(context)));
+        HELD.set(Some(Hold::Blocking(self.wait_blocking(context))));
         let _held = Held(self.clone());
         let _running = Scope::enter(self, context);
         job()
     }
 
-    /// Runs blocking IO `io` off the lane the calling blocking job holds,
-    /// queueing for a lane again once it returns.
+    /// Runs blocking IO `io` off the lane the calling laned work holds.
     ///
-    /// A blocking job that writes or syncs files calls this around the IO,
-    /// so competing CPU work runs on the lane meanwhile. Outside a
-    /// [`Self::run_blocking`] job, `io` runs as is.
+    /// Work that writes or syncs files calls this around the IO, so
+    /// competing CPU work runs on the lane meanwhile. A
+    /// [`Self::run_blocking`] job queues for a lane again once `io` returns.
+    /// A [`Self::laned`] poll cannot wait for one without blocking its async
+    /// worker, so it runs the rest of that poll without a lane and queues
+    /// again on its next poll. Without a held lane, `io` runs as is.
     ///
     /// # Panics
     ///
-    /// Panics only if a held blocking lease is found outside its job's
-    /// scope, which [`Self::run_blocking`] never allows.
+    /// Panics only if a held lease is found outside its work's scope, which
+    /// [`Self::run_blocking`] and [`Self::laned`] never allow.
     pub fn off_lane<T>(io: impl FnOnce() -> T) -> T {
-        let Some(id) = HELD.take() else {
-            return io();
-        };
-        let running = RUNNING
-            .take()
-            .expect("a held blocking lease runs inside its scope");
-        running.lanes.release(id);
-        let _requeue = Requeue(Some(running));
-        io()
+        match HELD.take() {
+            None => io(),
+            Some(Hold::Polled(id)) => {
+                RUNNING.with_borrow(|running| {
+                    running
+                        .as_ref()
+                        .expect("a held polled lease runs inside its scope")
+                        .lanes
+                        .release(id);
+                });
+                io()
+            }
+            Some(Hold::Blocking(id)) => {
+                let running = RUNNING
+                    .take()
+                    .expect("a held blocking lease runs inside its scope");
+                running.lanes.release(id);
+                let _requeue = Requeue(Some(running));
+                io()
+            }
+        }
     }
 
     /// Wraps `future` so each poll runs on a lane for `context`, returning the
@@ -544,12 +569,13 @@ impl LaneState {
     }
 }
 
-/// Returns the blocking job's current lease when the job ends.
+/// Returns the laned work's current lease, unless off-lane IO already
+/// returned it, when a blocking job or one poll ends.
 struct Held(CpuLanes);
 
 impl Drop for Held {
     fn drop(&mut self) {
-        if let Some(id) = HELD.take() {
+        if let Some(Hold::Blocking(id) | Hold::Polled(id)) = HELD.take() {
             self.0.release(id);
         }
     }
@@ -566,7 +592,9 @@ impl Drop for Requeue {
             return;
         };
         if !std::thread::panicking() {
-            HELD.set(Some(running.lanes.wait_blocking(running.context)));
+            HELD.set(Some(Hold::Blocking(
+                running.lanes.wait_blocking(running.context),
+            )));
         }
         RUNNING.set(Some(running));
     }
@@ -693,10 +721,8 @@ impl<F: Future> Future for Laned<F> {
         let Poll::Ready(id) = poll_lane(&this.lanes, this.context, &mut this.waiter, cx) else {
             return Poll::Pending;
         };
-        let _lease = LaneLease {
-            lanes: this.lanes.clone(),
-            id,
-        };
+        HELD.set(Some(Hold::Polled(id)));
+        let _held = Held(this.lanes.clone());
         let _running = Scope::enter(&this.lanes, this.context);
         this.future.as_mut().poll(cx)
     }
@@ -1033,5 +1059,21 @@ mod tests {
             "the job resumes as its own work on a lane"
         );
         assert_eq!(lanes.free(), 1);
+    }
+
+    #[test]
+    fn polled_io_returns_the_lane_for_the_rest_of_the_poll() {
+        let lanes = CpuLanes::new(1);
+        let bifrost = context(Workload::Bifrost, None);
+        let mut io = pin!(lanes.laned(bifrost, async {
+            let free = CpuLanes::off_lane(|| lanes.free());
+            (free, WorkContext::current())
+        }));
+        let Poll::Ready((free_during_io, after_io)) = poll_once(io.as_mut()) else {
+            panic!("the poll completes");
+        };
+        assert_eq!(free_during_io, 1, "the lane is free while the poll does IO");
+        assert_eq!(after_io, Some(bifrost), "the poll keeps its attribution");
+        assert_eq!(lanes.free(), 1, "the lane is returned exactly once");
     }
 }

@@ -266,6 +266,9 @@ impl RuntimeLimits {
 pub struct CapabilityCrash {
     /// One armed flag per capability slot.
     armed: Arc<[AtomicBool; 4]>,
+    /// Armed to panic the runner's next completion flush task that takes
+    /// queued completions, dropping their replies.
+    completion_flush: Arc<AtomicBool>,
 }
 
 #[cfg(feature = "test-support")]
@@ -282,6 +285,21 @@ impl CapabilityCrash {
     pub(crate) fn check(&self, capability: RuntimeCapability) {
         let armed = self.armed[capability.index()].swap(false, Ordering::SeqCst);
         assert!(!armed, "test-injected {} crash", capability.as_str());
+    }
+
+    /// Panic the next completion flush task that takes queued completions,
+    /// so those runs get no reply and settle alone.
+    pub fn crash_next_completion_flush(&self) {
+        self.completion_flush.store(true, Ordering::SeqCst);
+    }
+
+    /// Panic when a completion flush crash is armed, disarming it.
+    ///
+    /// # Panics
+    /// Panics exactly when a test armed a completion flush crash.
+    pub(crate) fn check_completion_flush(&self) {
+        let armed = self.completion_flush.swap(false, Ordering::SeqCst);
+        assert!(!armed, "test-injected completion flush crash");
     }
 }
 

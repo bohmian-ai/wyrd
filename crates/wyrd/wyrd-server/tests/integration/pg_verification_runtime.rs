@@ -2709,6 +2709,60 @@ async fn failed_group_commits_retry_as_groups() {
     }
 }
 
+/// A completion whose group-commit flush task is gone settles alone and
+/// still records its `completed` status.
+///
+/// The test crashes the flush task holding the run's completion, so the run
+/// gets no reply and completes through the runner's single settlement. A
+/// test-only trigger records which statement completed it.
+///
+/// # Panics
+/// Panics when the path recorder cannot be installed, the run does not
+/// complete through the single-run statement, or it records another history.
+#[tokio::test]
+async fn a_completion_without_its_flush_task_settles_alone_and_records_completed() {
+    let harness = Harness::start().await;
+    for statement in [
+        "CREATE TABLE public.completion_paths (execution_id uuid NOT NULL, batched boolean NOT NULL)",
+        "CREATE FUNCTION public.record_completion_path() RETURNS trigger LANGUAGE plpgsql \
+         SECURITY DEFINER AS $$ BEGIN INSERT INTO public.completion_paths VALUES \
+         (NEW.execution_id, current_query() LIKE '%complete_verifier_executions%'); \
+         RETURN NEW; END $$",
+        "CREATE TRIGGER record_completion_path BEFORE UPDATE ON wyrd.verifier_executions \
+         FOR EACH ROW WHEN (NEW.status = 'completed') \
+         EXECUTE FUNCTION public.record_completion_path()",
+    ] {
+        sqlx::query(statement)
+            .execute(&harness.assertion)
+            .await
+            .expect("the path recorder installs");
+    }
+    let script = EngineScript::default();
+    let run = harness.submit().await;
+    script.push(EngineOutcome::Completed(unscored_report()));
+    let crash = CapabilityCrash::default();
+    crash.crash_next_completion_flush();
+    let runtime = RunningRuntime::spawn(harness.runtime(&Harness::limits(), &script, &crash));
+    let row = harness.wait_execution(run, status("completed")).await;
+    assert_eq!(row.attempts, 1, "the fallback settles the same attempt");
+    runtime.stop().await;
+    let paths: Vec<(Uuid, bool)> =
+        sqlx::query_as("SELECT execution_id, batched FROM public.completion_paths")
+            .fetch_all(&harness.assertion)
+            .await
+            .expect("the completion paths read");
+    assert_eq!(
+        paths,
+        [(run.as_uuid(), false)],
+        "the run completed through the single-run statement"
+    );
+    assert_eq!(
+        harness.statuses(run).await,
+        ["running", "completed"],
+        "the single settlement records the completion"
+    );
+}
+
 /// Stage `harness`'s submitted execution's selected result while its
 /// settlement never commits, on its final attempt when `final_attempt`, and
 /// return the execution and its stopping runtime.

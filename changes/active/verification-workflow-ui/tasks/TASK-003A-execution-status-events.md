@@ -127,17 +127,23 @@ repository PostgreSQL → public Bifrost query journey owner in
    - Group commit: `pg_verification_runtime::failed_group_commits_retry_as_groups`
      (command R) asserts `[running, completed]` per run through the batched
      statement.
-   - Fallback: FAIL, open. Only the `Transition::Complete` arm of
-     `settle_alone` is unproved. It runs only when every `Completions` flush
-     task is gone, which `Completions::complete` reports as `None`. No test can
-     force that today without adding a seam that ends the flush tasks. Source
-     proof: `settle` stages from the one `(outcome, status)` pair that
-     `apply` returns, and both paths build it with `recorded(.., Completed)`.
-     Every other `settle_alone` arm is exercised by the tests above.
+   - Fallback: `pg_verification_runtime::a_completion_without_its_flush_task_settles_alone_and_records_completed`
+     (command R). The test arms `CapabilityCrash::crash_next_completion_flush`,
+     so the flush task holding the run's completion panics and drops its
+     reply. The run then completes through `settle_alone`. A test-only
+     trigger, as in the group-commit test, records that the single-run
+     statement completed it, and the test asserts `[running, completed]`.
+     - Seam: one test-support flag on the existing `CapabilityCrash`,
+       checked by `Flusher::run` after it takes runs. It compiles only under
+       `test-support`, which `check:deps` keeps out of the shipped server.
+     - GREEN: PASS. There is no RED, because the fallback staging predates
+       the test.
+     - Mutation check: with the fallback's `Complete` arm changed to record
+       no status, the test fails.
    - Release and deferral return the stored status from
      `RELEASE_SQL ... RETURNING status`; command Q asserts `Some(Pending)` and
      `None` for a stale lease.
-   - Status: PASS except the fallback's completion arm (FAIL, above).
+   - Status: PASS.
 3. **Running cancellation and revocation.** Cancel held running work through
    the public operation; revoke a principal with multiple unfinished executions
    through the public revocation operation. Each affected execution lists as
@@ -230,13 +236,13 @@ they cover and have no RED, although each is verified GREEN:
 - the exhaustion and group-commit history assertions;
 - the command Q `release` assertions (`Some(Pending)`, `None`), rewritten
   with the signature;
-- the release history assertion.
+- the release history assertion;
+- the fallback test, which needs a new test-support seam.
 
 For the PR cancellations the test was written first, but the production
 change was drafted before RED was run. RED was then observed with the
 production change stashed. Four existing tests were re-sequenced (see the
-diagnosis above), and their assertions are unchanged. The fallback's
-completion arm has no test.
+diagnosis above), and their assertions are unchanged.
 
 Hot path: not touched. The change adds nothing to the queued engine
 execution, direct verify, gateway calls, Bifrost query or Bifrost append.

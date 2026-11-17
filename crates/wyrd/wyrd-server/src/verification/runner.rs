@@ -418,6 +418,7 @@ impl VerifierRunner {
     #[cfg(feature = "test-support")]
     #[must_use]
     pub fn with_crash(mut self, crash: CapabilityCrash) -> Self {
+        self.completions.arm_crash(crash.clone());
         self.claims.arm_crash(crash);
         self
     }

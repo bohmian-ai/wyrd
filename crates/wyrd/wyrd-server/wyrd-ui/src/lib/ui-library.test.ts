@@ -2751,9 +2751,8 @@ test('execution loader reads each part once and keeps refusals apart', async () 
   expect(running.calls.map((call) => call.request)).toEqual([
     { op: 'verification.get_execution', execution_id: 'exec_running' },
     { op: 'bifrost.query', sql: 'SELECT verifier_card_uid FROM bifrost.verification.execution_inputs WHERE execution_id = $1 LIMIT 1', params: ['exec_running'], max_rows: 1 },
-    { op: 'verification.list_invocations', execution_id: 'exec_running', limit: 200 },
-    { op: 'verification.list_publications', execution_id: 'exec_running', limit: 200 },
-    { op: 'cards.get_by_uid', kind: 'Verifier', card_uid: 'card_verifier_ticket-policy_1.1.0' }
+    { op: 'cards.get_by_uid', kind: 'Verifier', card_uid: 'card_verifier_ticket-policy_1.1.0' },
+    { op: 'verification.list_invocations', execution_id: 'exec_running', limit: 200 }
   ]);
   expect(live.definition).toMatchObject({ state: 'populated', data: { ref: { ...VERIFIER, uid: 'card_verifier_ticket-policy_1.1.0' }, graph: definitionGraph(specOf('ticket-policy@1.1.0')) } });
   expect(live.details).toEqual({ state: 'empty', reason: 'Details are recorded when the execution completes with a visible result.' });
@@ -2762,7 +2761,29 @@ test('execution loader reads each part once and keeps refusals apart', async () 
   // Settled: the result's exact reference reads the Card; no metadata query; details only when asked for.
   const settled = fixtureRecording();
   const compact = partOf(await loadExecution({ executionId: EXECUTIONS.settled }, { executor: settled.executor }));
-  expect(reads(settled.calls)).toEqual(['verification.get_execution', 'cards.get_by_ref', 'verification.list_invocations', 'verification.list_publications']);
+  // Outputs are read only for the outputs view or a selected step.
+  expect(reads(settled.calls)).toEqual(['verification.get_execution', 'cards.get_by_ref', 'verification.list_invocations']);
+  expect(compact.publications).toBeUndefined();
+
+  // A Verifier without steps reads no progress once its result is recorded.
+  const verifier = verifiers['ticket-policy@1.1.0'];
+  const withoutSteps = { ...verifier, spec: { ...verifier.spec, steps: [] } };
+  const stepless = fixtureRecording((request) => {
+    if (request.op === 'cards.get_by_ref') return { ok: true, value: withoutSteps as never };
+  });
+  const judged = partOf(await loadExecution({ executionId: EXECUTIONS.settled, node: 'none' }, { executor: stepless.executor }));
+  expect(judged.invocations).toBeUndefined();
+  expect(reads(stepless.calls)).toEqual(['verification.get_execution', 'cards.get_by_ref']);
+
+  // An execution that ran directly has no queued record: the server answers 404 for progress and outputs.
+  const notQueued = { code: 'WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND', title: 'Verification execution not found', status: 404 };
+  const ranDirectly = fixtureRecording((request) => {
+    if (request.op === 'verification.list_invocations' || request.op === 'verification.list_publications') return { ok: false, problem: notQueued };
+  });
+  const direct = partOf(await loadExecution({ executionId: EXECUTIONS.settled, node: 'outputs' }, { executor: ranDirectly.executor }));
+  expect(direct.invocations).toBeUndefined();
+  expect(direct.publications).toEqual({ state: 'empty', reason: 'This execution ran directly and retains no outputs.' });
+
   expect(settled.calls[1].request).toEqual({ op: 'cards.get_by_ref', card_ref: VERIFIER });
   expect(compact.details).toBeUndefined();
   const asked = fixtureRecording();
@@ -2781,14 +2802,13 @@ test('execution loader reads each part once and keeps refusals apart', async () 
   const partial = partOf(await loadExecution({ executionId: EXECUTIONS.running }, { executor: noQuery.executor }));
   expect(partial.definition).toEqual({ state: 'denied', problem: denied });
   expect(reads(noQuery.calls)).not.toContain('cards.get_by_uid');
-  expect(partial.invocations.state).toBe('populated');
-  expect(partial.publications.state).toBe('populated');
+  expect(partial.invocations?.state).toBe('populated');
   const unseen = fixtureRecording((request) => (request.op === 'bifrost.query' ? { ok: true, value: { columns: [], rows: [], terminal: terminal(0) } } : undefined));
   expect(partOf(await loadExecution({ executionId: EXECUTIONS.running }, { executor: unseen.executor })).definition).toEqual({ state: 'empty', reason: 'The Verifier this execution runs is not yet visible in retained metadata. Refresh to read it again.' });
   expect(reads(unseen.calls)).not.toContain('cards.get_by_uid');
-  // A refused Card, progress or output read is its own part.
-  const noCard = partOf(await loadExecution({ executionId: EXECUTIONS.settled }, { executor: fixtureRecording((request) => (request.op === 'cards.get_by_ref' || request.op === 'verification.list_publications' ? { ok: false, problem: denied } : undefined)).executor }));
-  expect([noCard.definition.state, noCard.invocations.state, noCard.publications.state]).toEqual(['denied', 'populated', 'denied']);
+  // A refused Card or output read is its own part; with no graph to mark and a result recorded, progress is not read.
+  const noCard = partOf(await loadExecution({ executionId: EXECUTIONS.settled, node: 'outputs' }, { executor: fixtureRecording((request) => (request.op === 'cards.get_by_ref' || request.op === 'verification.list_publications' ? { ok: false, problem: denied } : undefined)).executor }));
+  expect([noCard.definition.state, noCard.invocations?.state, noCard.publications?.state]).toEqual(['denied', undefined, 'denied']);
   const wrongKind = partOf(await loadExecution({ executionId: EXECUTIONS.settled }, { executor: fixtureRecording((request) => (request.op === 'cards.get_by_ref' ? { ok: true, value: agent } : undefined)).executor }));
   expect(wrongKind.definition).toMatchObject({ state: 'error', problem: { code: 'WYRD_SPEC_400_VALIDATION' } });
 
@@ -2937,6 +2957,8 @@ test('execution inspector shows recorded state, judgments and outputs as separat
   await fireEvent.click(node('step:score'));
   expect(sent()).toEqual({ name: 'execution.select', input: { node: 'step:score' } });
   expect(validateIntent('VerificationExecution', sent())).toEqual(sent());
+  // The host reloads with the selection, which reads the outputs.
+  await shown.rerender({ ...(await load({ executionId: EXECUTIONS.settled, node: 'step:score' })), onaction });
   const step = () => within(shown.container).getByRole('region', { name: 'Step score' });
   // Every recorded invocation attempt is listed; the latest is shown until one is chosen.
   const attempts = () => within(step()).getAllByRole('radio');
@@ -2978,8 +3000,9 @@ test('execution inspector shows recorded state, judgments and outputs as separat
   expect(validateIntent('VerificationExecution', sent())).toEqual(sent());
 
   // Every retained output is a peer with its producer; none is the step's or the execution's primary result.
-  await fireEvent.click(within(shown.container).getByRole('button', { name: /All retained outputs \(4\)/ }));
+  await fireEvent.click(within(shown.container).getByRole('button', { name: 'All retained outputs' }));
   expect(sent()).toEqual({ name: 'execution.select', input: { node: 'outputs' } });
+  await shown.rerender({ ...(await load({ executionId: EXECUTIONS.settled, node: 'outputs' })), onaction });
   const all = within(shown.container).getByRole('region', { name: 'Retained outputs' });
   expect(cells(all)).toEqual([['text', 'read-photo', 'attempt 1', 'json', '—'], ['units', 'score', 'attempt 2', 'json', '—'], ['report', 'summarise', 'attempt 1', 'file', '—'], ['tree', 'summarise', 'attempt 1', 'directory', '—']]);
   expect(shown.container.textContent).not.toMatch(/primary|final output|report output/i);
@@ -3083,7 +3106,7 @@ test('a retained text file previews as inert text within the bound, and says whe
   // A single file within the bound is read once, after its manifest, for the exact producer attempt.
   const recording = fixtureRecording();
   const report = await loadExecution(file('report'), { executor: recording.executor });
-  expect(recording.calls.at(-1)?.request).toEqual({ op: 'verification.read_publication_text', execution_id: 'exec_settled', step_id: 'summarise', name: 'report', attempt: 1, max_bytes: 65_536 });
+  expect(recording.calls.map((call) => call.request)).toContainEqual({ op: 'verification.read_publication_text', execution_id: 'exec_settled', step_id: 'summarise', name: 'report', attempt: 1, max_bytes: 65_536 });
   expect(partOf(report).text).toEqual({ state: 'populated', data: { text: '# Report\n<img src=x onerror=alert(1)>', truncated: false } });
   const shown = render(VerificationExecution, report);
   const preview = () => shown.container.querySelector('[data-preview] [data-text]') as HTMLElement;
@@ -3177,7 +3200,7 @@ test('an unavailable read, a refused progress read and context not yet retained 
   expect(partial.container.querySelector('[data-part="Retained outputs"], [data-part="Verifier definition"]')).toBeNull();
   expect(partial.container.querySelector('[data-execution-status]')).not.toBeNull();
   expect(partial.container.querySelector('[data-node]')).not.toBeNull();
-  expect(partial.container).toHaveTextContent(/All retained outputs \(\d+/);
+  expect(partial.container).toHaveTextContent('All retained outputs');
   partial.unmount();
 
   // A Verifier not yet visible in retained metadata is said where the graph would be.

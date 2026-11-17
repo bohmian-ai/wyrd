@@ -64,8 +64,8 @@
 
   const data = $derived(result.state === 'populated' ? result.data : undefined);
   const definition = $derived(data?.definition.state === 'populated' ? data.definition.data : undefined);
-  const items = $derived(data?.invocations.state === 'populated' ? data.invocations.data.items : []);
-  const outputs = $derived(data?.publications.state === 'populated' ? data.publications.data.items : []);
+  const items = $derived(data?.invocations?.state === 'populated' ? data.invocations.data.items : []);
+  const outputs = $derived(data?.publications?.state === 'populated' ? data.publications.data.items : []);
   const states = $derived(data && definition ? executionStates(definition.graph, data.status, items) : undefined);
   const declared = $derived(definition ? definition.graph.requirements.length + definition.graph.steps.reduce((sum, step) => sum + step.requirements.length, 0) : 0);
   const judged = $derived(new Set(data?.status.result?.outcome.requirements.map((each) => each.id)).size);
@@ -245,7 +245,7 @@
   <div class="execution">
     <Panel title="Execution" note={status.execution_id}>
       {#snippet tools()}
-        <button type="button" class="tool" aria-pressed={selection.node === 'outputs'} onclick={() => select({ node: 'outputs' })}>All retained outputs ({outputs.length}{data.publications.state === 'populated' && data.publications.data.next_cursor ? '+' : ''})</button>
+        <button type="button" class="tool" aria-pressed={selection.node === 'outputs'} onclick={() => select({ node: 'outputs' })}>All retained outputs</button>
         <button type="button" class="tool" aria-pressed={!!selection.details} onclick={() => select({ ...selection, details: !selection.details })}>{selection.details ? 'Hide completed details' : 'Load completed details'}</button>
         {#if !settled(status.status)}
           <ActionButton label="Cancel execution" state={act('execution.cancel')} disabled={!onaction} onclick={() => off('execution.cancel') || onaction?.({ name: 'execution.cancel', input: { execution_id: status.execution_id } })} />
@@ -293,8 +293,8 @@
         {@render refused(data.definition, 'Verifier definition')}
       </Panel>
     {/if}
-    {@render refused(data.invocations, 'Recorded progress')}
-    {#if data.invocations.state === 'populated'}
+    {#if data.invocations}{@render refused(data.invocations, 'Recorded progress')}{/if}
+    {#if data.invocations?.state === 'populated'}
       {@const page = data.invocations.data}
       {#if page.history.pending + page.history.failed > 0}
         <p class="hint" data-part="history">{page.history.pending + page.history.failed} history events are not yet retained; recorded progress and outputs below are current.</p>
@@ -307,7 +307,7 @@
         </p>
       {/if}
     {/if}
-    {@render refused(data.publications, 'Retained outputs')}
+    {#if data.publications && data.publications.state !== 'empty'}{@render refused(data.publications, 'Retained outputs')}{/if}
     {#if data.details}{@render refused(data.details, 'Completed details')}{/if}
 
     {#if type === 'outputs'}
@@ -330,10 +330,12 @@
               </tbody>
             </table>
           </div>
-        {:else if data.publications.state === 'populated'}
+        {:else if data.publications?.state === 'populated'}
           <p class="hint">No output is retained for this execution.</p>
+        {:else if data.publications?.state === 'empty'}
+          <p class="hint">{data.publications.reason}</p>
         {/if}
-        {#if data.publications.state === 'populated' && data.publications.data.next_cursor}
+        {#if data.publications?.state === 'populated' && data.publications.data.next_cursor}
           {@const cursor = data.publications.data.next_cursor}
           <button type="button" class="open more" disabled={off('execution.page')} onclick={() => onaction?.({ name: 'execution.page', input: { publications: cursor } })}>Next page of outputs</button>
         {/if}
@@ -370,12 +372,14 @@
                     {/each}
                   </tbody>
                 </table>
-              {:else}
+              {:else if data.publications?.state === 'populated'}
                 <p class="hint">This invocation retained no output.</p>
+              {:else if data.publications?.state === 'empty'}
+                <p class="hint">{data.publications.reason}</p>
               {/if}
             </div>
             {#if loaded?.publication && selection.output}{@render publication(loaded.publication, id)}{/if}
-          {:else if data.invocations.state === 'populated'}
+          {:else if data.invocations?.state === 'populated'}
             <p class="hint">{settled(status.status) ? 'No invocation of this step was recorded.' : 'No invocation of this step is recorded yet.'}</p>
           {/if}
           {#if completed}

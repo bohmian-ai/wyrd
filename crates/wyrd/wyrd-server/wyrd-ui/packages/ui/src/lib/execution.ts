@@ -53,8 +53,10 @@ export interface DriftContext {
 export interface ExecutionData {
   readonly status: VerificationExecutionState;
   readonly definition: Part<ExecutionDefinition>;
-  readonly invocations: Part<CardTypes.InvocationPage>;
-  readonly publications: Part<CardTypes.PublicationPage>;
+  /** Recorded progress, read only when the Verifier has steps or no result is recorded yet. */
+  readonly invocations?: Part<CardTypes.InvocationPage>;
+  /** Retained outputs, read only when the outputs or a step are selected. */
+  readonly publications?: Part<CardTypes.PublicationPage>;
   /** Completed records, read only when asked for. */
   readonly details?: Part<CardTypes.VerificationDetails>;
   /** The selected publication's body or manifest. */
@@ -90,6 +92,9 @@ export const settled = (status: VerificationExecutionState['status']) => TERMINA
 
 const part = <T>(read: WireResult, value: (value: never) => T = (each) => each as T): Part<T> =>
   read.ok ? { state: 'populated', data: value(read.value as never) } : failed(read.problem);
+
+/** The server's answer for an execution that ran directly: it has a result and no queued record, so no progress or outputs. */
+const NOT_QUEUED = 'WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND';
 
 const VERIFIER_UID = 'SELECT verifier_card_uid FROM bifrost.verification.execution_inputs WHERE execution_id = $1 LIMIT 1';
 const INPUTS = 'SELECT to_json(inputs) AS inputs FROM bifrost.verification.execution_inputs WHERE execution_id = $1 LIMIT 1';
@@ -173,9 +178,10 @@ async function readPublication(
 
 /**
  * Load one exact execution. A refused or missing status ends the load with
- * that outcome and no further read. Otherwise the definition, the invocation
- * page and the publication page are read independently, and the selection
- * adds only what it names: completed details when asked for and the
+ * that outcome and no further read. Otherwise the definition is read, the
+ * invocation page only when the Verifier has steps, a step is selected or no
+ * result is recorded yet, and the selection adds only what it names: the publication page for
+ * the outputs or a step, completed details when asked for and the
  * execution has a result, one publication, one source slot's members, the
  * accepted inputs, or one drift requirement's recorded context. The returned
  * input carries the selection actually shown.
@@ -193,10 +199,21 @@ export async function loadExecution(input: ExecutionInput, context: Context): Pr
   const slot = type === 'input' ? state.group?.sources[node] : undefined;
   const drifted = type === 'req' && state.result?.outcome.requirements.some((each) => each.id === node && each.detail?.drift);
 
+  const absent = (read: WireResult) => !read.ok && read.problem.code === NOT_QUEUED;
+  const defined = readDefinition(state, one);
   const [definition, invocations, publications, details, selected, members, inputs, drift] = await Promise.all([
-    readDefinition(state, one),
-    one({ op: 'verification.list_invocations', execution_id: id, limit: EXECUTION_PAGE, ...(input.invocations ? { cursor: input.invocations } : {}) }).then((read) => part<CardTypes.InvocationPage>(read)),
-    one({ op: 'verification.list_publications', execution_id: id, limit: EXECUTION_PAGE, ...(input.publications ? { cursor: input.publications } : {}) }).then((read) => part<CardTypes.PublicationPage>(read)),
+    defined,
+    // Step states come from recorded progress, and so do requirement states until a result is recorded.
+    defined.then(async (definition) => {
+      if (state.result && type !== 'step' && !(definition.state === 'populated' && definition.data.graph.steps.length)) return undefined;
+      const read = await one({ op: 'verification.list_invocations', execution_id: id, limit: EXECUTION_PAGE, ...(input.invocations ? { cursor: input.invocations } : {}) });
+      return absent(read) ? undefined : part<CardTypes.InvocationPage>(read);
+    }),
+    type === 'outputs' || type === 'step'
+      ? one({ op: 'verification.list_publications', execution_id: id, limit: EXECUTION_PAGE, ...(input.publications ? { cursor: input.publications } : {}) }).then(
+          (read): Part<CardTypes.PublicationPage> => (absent(read) ? { state: 'empty', reason: 'This execution ran directly and retains no outputs.' } : part<CardTypes.PublicationPage>(read))
+        )
+      : undefined,
     !input.details
       ? undefined
       : !state.result
@@ -224,7 +241,7 @@ export async function loadExecution(input: ExecutionInput, context: Context): Pr
     input,
     result: {
       state: 'populated',
-      data: { status: state, definition, invocations, publications, ...(details && { details }), ...selected, ...(members && { members }), ...(inputs && { inputs }), ...(drift && { drift }) }
+      data: { status: state, definition, ...(invocations && { invocations }), ...(publications && { publications }), ...(details && { details }), ...selected, ...(members && { members }), ...(inputs && { inputs }), ...(drift && { drift }) }
     }
   };
 }

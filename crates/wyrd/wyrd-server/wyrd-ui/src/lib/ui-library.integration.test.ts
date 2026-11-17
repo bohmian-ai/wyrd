@@ -855,16 +855,16 @@ test('an unfinished execution shows recorded progress and retained outputs throu
     for (const [surface, executor] of [['node', nodeExecutor(client)], ['mcp', mcp.executor]] as const) {
       const context = { executor };
       // Running, with no result: the Verifier it ran is found by its recorded UID, never by name.
-      const open = data(await loadExecution({ executionId, details: true }, context), surface);
+      const open = data(await loadExecution({ executionId, node: 'outputs', details: true }, context), surface);
       expect([open.status.status, open.status.result], surface).toEqual(['running', undefined]);
       expect(open.definition, surface).toMatchObject({ state: 'populated', data: { ref: { kind: 'Verifier', uid: verifier }, graph: { requirements: [{ kind: 'drift' }] } } });
-      expect(open.publications.state === 'populated' && open.publications.data.items.map((item) => [item.producer.step_id, item.name, item.kind]), surface).toEqual([
+      expect(open.publications?.state === 'populated' && open.publications.data.items.map((item) => [item.producer.step_id, item.name, item.kind]), surface).toEqual([
         ['review', 'verdict', 'json'],
         ['review', 'nothing', 'json'],
         ['draft', 'report', 'file'],
         ['draft', 'tree', 'directory']
       ]);
-      expect(open.invocations.state, surface).toBe('populated');
+      expect(open.invocations?.state, surface).toBe('populated');
       // No result yet: completed details are not read and say why.
       expect(open.details, surface).toEqual({ state: 'empty', reason: 'Details are recorded when the execution completes with a visible result.' });
       expect(open.publication, surface).toBeUndefined();
@@ -885,7 +885,7 @@ test('an unfinished execution shows recorded progress and retained outputs throu
       for (const missing of [{ ...tree, producer: { ...attempt, attempt: 2 } }, { ...tree, output: 'absent' }]) {
         const loaded = data(await loadExecution(missing, context), surface);
         expect(loaded.publication, surface).toMatchObject({ state: 'error', problem: { status: 404 } });
-        expect(loaded.publications.state, surface).toBe('populated');
+        expect(loaded.publications?.state, surface).toBe('populated');
       }
       // An execution that does not exist ends the load at its first read.
       expect((await loadExecution({ executionId: '0192f0a0-0000-7000-8000-000000000000' }, context)).result, surface).toMatchObject({
@@ -961,7 +961,7 @@ test('an unfinished execution shows recorded progress and retained outputs throu
   expect(data(settled, 'app').publications).toMatchObject({ state: 'populated', data: { items: [{}, {}, {}, {}] } });
   // Recorded progress stays readable after the cancel, through Node and the custom app alike.
   const afterCancel = data(await loadExecution({ executionId }, { executor: nodeExecutor(client) }), 'node after cancel');
-  expect(afterCancel.invocations.state).toBe('populated');
+  expect(afterCancel.invocations?.state).toBe('populated');
   expect(data(settled, 'app').invocations).toEqual(afterCancel.invocations);
 
   // An execution the app's credential cannot find is the server's refusal, not an empty panel.
@@ -1137,11 +1137,9 @@ judged('a judged execution shows its judgments, accepted inputs, completed detai
         result: { verifier: { name: 'answer-check', uid: assistant.answerCheck.uid }, outcome: { verdict: 'failed', requirements: [{ id: 'says-yes', outcome: 'failed', reason: 'operator Equals returned false', actual: 'no' }] } }
       });
       expect(open.definition, surface).toMatchObject({ state: 'populated', data: { ref: { uid: assistant.answerCheck.uid }, graph: { edges: [{ source: 'input:answer', target: 'req:says-yes' }] } } });
-      expect(open.invocations, surface).toMatchObject({
-        state: 'populated',
-        data: { items: [{ producer: { step_id: 'says-yes', attempt: 1 }, state: 'requirement', outcome: 'failed' }], history: { pending: 0, failed: 0 } }
-      });
-      expect(open.publications, surface).toMatchObject({ state: 'populated', data: { items: [] } });
+      // A Verifier without steps whose result is recorded reads no progress; outputs are read only when opened.
+      expect([open.invocations, open.publications], surface).toEqual([undefined, undefined]);
+      expect(data(await loadExecution({ executionId: refused, node: 'outputs' }, context), surface).publications, surface).toMatchObject({ state: 'populated', data: { items: [] } });
       expect(open.details, surface).toMatchObject({ state: 'populated', data: { execution_id: refused, outcome: { requirements: [{ id: 'says-yes' }] } } });
       // Details are read only when asked for; the accepted input is read for its selected node only.
       const input = data(await loadExecution({ executionId: refused, node: 'input:answer' }, context), surface);
@@ -1228,7 +1226,7 @@ judged('a judged execution shows its judgments, accepted inputs, completed detai
         expect((await loadExecution({ executionId }, { executor: foreign })).result, surface).toMatchObject({ state: 'error', problem: { code: 'WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND' } });
       const partial = data(await loadExecution({ executionId: refused, node: 'input:answer' }, { executor: narrow }), surface);
       expect(partial.status.result?.outcome.verdict, surface).toBe('failed');
-      expect(partial.invocations.state, surface).toBe('populated');
+      expect(partial.invocations, surface).toBeUndefined();
       expect([partial.definition, partial.inputs], surface).toMatchObject([
         { state: 'denied', problem: { code: DENIED } },
         { state: 'denied', problem: { code: DENIED } }

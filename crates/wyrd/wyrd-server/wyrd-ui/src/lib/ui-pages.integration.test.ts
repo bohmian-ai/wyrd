@@ -1173,13 +1173,13 @@ test('an exact execution page keeps its selection through refresh, downloads a r
   await capture('running');
 
   // Every retained output, then one exact intermediate publication of one producer attempt; the URL holds the selection.
-  await page.getByRole('button', { name: /^All retained outputs \(4\)/ }).click();
+  await page.getByRole('button', { name: 'All retained outputs', exact: true }).click();
   await expect.poll(query).toEqual({ node: 'outputs' });
   const outputs = page.getByRole('region', { name: 'Retained outputs', exact: true });
-  expect(await outputs.locator('tbody tr').count()).toBe(4);
+  await expect.poll(() => outputs.locator('tbody tr').count()).toBe(4);
   // The page lists the same recorded identities the shared loader reads: status, and each output with its producer.
   const loaded = await loadExecution({ executionId, node: 'outputs' }, { executor: nodeExecutor(WyrdClient.connect()) });
-  if (loaded.result.state !== 'populated' || loaded.result.data.publications.state !== 'populated') throw new Error('the execution and its outputs load');
+  if (loaded.result.state !== 'populated' || loaded.result.data.publications?.state !== 'populated') throw new Error('the execution and its outputs load');
   expect(await status()).toBe(loaded.result.data.status.status);
   expect(await outputs.locator('tbody tr').evaluateAll((rows) => rows.map((row) => [...row.querySelectorAll('td')].slice(0, 2).map((cell) => cell.textContent?.trim())))).toEqual(
     loaded.result.data.publications.data.items.map((each) => [each.name, each.producer.step_id])
@@ -1229,7 +1229,7 @@ test('an exact execution page keeps its selection through refresh, downloads a r
     await route.fulfill({ response }).catch(() => {});
     delivered();
   });
-  await page.getByRole('button', { name: /^All retained outputs \(4\)/ }).click();
+  await page.getByRole('button', { name: 'All retained outputs', exact: true }).click();
   await expect.poll(() => late).toBe(1);
   const newer = graph.locator('[data-node="req:drift"]');
   await newer.click();

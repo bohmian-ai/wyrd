@@ -166,3 +166,18 @@ authority with this selected behavior during implementation, without using old
 design documents to reinstate rejected speculative accounting. A missing
 observation/execution integration must be reported, not replaced with forbidden
 reservations or an unapproved dependency/runtime redesign.
+
+## Maintainer decisions (2026-11-16)
+
+Approved by the maintainer during TASK-012-R1 implementation:
+
+- **Monty worker telemetry seam.** Monty 1.1.0 cannot report worker memory
+  outside a turn. Wyrd pins Monty 1.6.0 plus Wyrd's fork commits
+  (`bohmian-ai/monty`, branch `wyrd-1.6`, by rev in `[patch.crates-io]`) for a
+  `MemorySample` worker event and dead-idle-worker reaping. `libmimalloc-sys`
+  is a direct server dependency only for `mi_process_info`, the allocator's
+  commitment reading that feeds process pressure and worker telemetry.
+- **Spill IO and lanes.** A laned poll that spills returns its lane for the
+  disk write and finishes that poll without one, queuing again on its next
+  poll. During the rest of that one poll, more than C polls may run; AC-017's
+  "C managed lanes" holds at every poll boundary.

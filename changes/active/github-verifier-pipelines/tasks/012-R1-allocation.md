@@ -258,8 +258,9 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
        staleness on a 500 ms wall clock, not a sample clock.
    - Commands missing for "vala-verify: 114 passed" and "state and outbox
      unit tests: 39 passed".
-   - The fork, the 1.1→1.6 upgrade and `libmimalloc-sys` rest on the
-     recorded maintainer decision, not on revision 16 text.
+   - The fork, the 1.1→1.6 upgrade and `libmimalloc-sys`: approved by the
+     maintainer and recorded in revision 16's "Maintainer decisions
+     (2026-11-16)".
    - TDD VIOLATED, previously unmarked:
      - `stale_worker_telemetry_stops_new_work_without_freeing_usage`;
      - the rewritten `sandbox_reuses_processes_with_fresh_tenant_sessions`,
@@ -531,13 +532,11 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
      were added after the wiring (TDD VIOLATED). GREEN:
      `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=scribe::parquet_writer::tests::syncing_file_resets_backlog_at_interval) | test(=scribe::member_stager::tests::staging_disk_io_returns_the_cpu_lane)'`.
    - The spill choice, release for the rest of the poll, lets more than C
-     polls run at once during spill IO. That is the recorded user decision,
-     not revision 16 text, and it should be weighed against scenario 4's
-     "C managed lanes".
+     polls run at once during spill IO: approved by the maintainer and
+     recorded in revision 16's "Maintainer decisions (2026-11-16)".
    - TDD VIOLATED, previously unmarked: the Monty lane wiring in
      `sandbox.rs` and the `main.rs` sampler.
-   Status: PASS for the runtime proofs. The spill concurrency choice above
-   stays open for the user's call against scenario 4's "C managed lanes".
+   Status: PASS.
 
 6. **Connected public journey and bounded drain — REQ-019–024; AC-018.** Extend
    existing Rust-client/WyrdTestServer/Postgres journey owners with verification

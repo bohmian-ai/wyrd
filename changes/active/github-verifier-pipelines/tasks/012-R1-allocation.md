@@ -757,7 +757,7 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
      diagnostician): under critical pressure, the run's input read waits
      on Oracle admission until the execution deadline, so the run times
      out instead of deferring.
-   Status: PASS.
+   Status: FAIL (D4; drain while pressure stays critical has no proof).
 
 7. **Functional closure and performance — REQ-024; AC-018.** Run affected
    functional lanes, then full clean L1 verification, gateway and all three

@@ -4343,10 +4343,6 @@ fn pr_key(repository: &RepositoryId) -> PullRequestKey<'_> {
     }
 }
 
-/// Every binding admitted under `owner`'s background authority.
-///
-/// # Panics
-/// Panics when the tenant's SYSTEM principal cannot be provisioned.
 /// What a cancellation of `executions` must return: each execution with the
 /// Verifier and attribution its stored row holds, in execution order.
 async fn stored_cancellations(
@@ -4367,6 +4363,10 @@ async fn stored_cancellations(
     expected
 }
 
+/// Every binding admitted under `owner`'s background authority.
+///
+/// # Panics
+/// Panics when the tenant's SYSTEM principal cannot be provisioned.
 async fn pr_targets(
     conn: &mut TenantConn<'_>,
     owner: PrincipalId,

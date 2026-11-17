@@ -317,21 +317,38 @@ struct ExecutionBinding {
 /// admissions all join it: their bytes count as the execution's, and under
 /// critical pressure the execution is cancelled as a whole.
 ///
+/// With `admit_by`, the execution starts only once process pressure admits
+/// new Verification work of `tenant`, waiting no later than `admit_by`; a
+/// queued execution passes the current instant, so it defers at once
+/// rather than reading its inputs into a paused process. Without it the
+/// execution starts unconditionally and its nested owners bound their own
+/// admission waits.
+///
 /// # Errors
-/// Returns `run`'s error, or [`EngineError::Busy`] when process memory
-/// pressure chose the execution as its victim; dropping `run` stops every
-/// nested call with it.
+/// Returns `run`'s error, or [`EngineError::Busy`] when pressure did not
+/// admit the execution by `admit_by` or chose it as its victim; dropping
+/// `run` stops every nested call with it.
 pub async fn as_one_operation<T>(
     state: &AppState,
     tenant: wyrd_spec::ids::DataTenantId,
+    admit_by: Option<tokio::time::Instant>,
     run: impl Future<Output = Result<T, vala_verify::blocks::EngineError>>,
 ) -> Result<T, vala_verify::blocks::EngineError> {
     let victim = tokio_util::sync::CancellationToken::new();
-    let operation = state.resources.workloads().begin(
-        Workload::Verification,
-        Some(tenant),
-        Some(victim.clone()),
-    );
+    let workloads = state.resources.workloads();
+    let operation = match admit_by {
+        None => workloads.begin(Workload::Verification, Some(tenant), Some(victim.clone())),
+        Some(deadline) => tokio::time::timeout_at(
+            deadline,
+            workloads.admit(Workload::Verification, Some(tenant), Some(victim.clone())),
+        )
+        .await
+        .map_err(|_| {
+            vala_verify::blocks::EngineError::Busy(
+                "process memory pressure pauses new executions".to_owned(),
+            )
+        })?,
+    };
     tokio::select! {
         biased;
         () = victim.cancelled() => Err(vala_verify::blocks::EngineError::Busy(

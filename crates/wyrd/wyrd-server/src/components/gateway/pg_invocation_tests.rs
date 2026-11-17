@@ -7174,7 +7174,7 @@ async fn critical_pressure_cancels_the_execution_a_model_call_belongs_to() {
                     .map(drop)
                     .map_err(|error| EngineError::Busy(error.to_string()))
             });
-            crate::verification::hosted::blocks::as_one_operation(&state, tenant, call).await
+            crate::verification::hosted::blocks::as_one_operation(&state, tenant, None, call).await
         }
     });
     dispatched.recv().await.expect("the call dispatches");

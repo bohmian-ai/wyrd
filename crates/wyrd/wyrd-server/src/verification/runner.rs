@@ -762,6 +762,14 @@ impl VerifierRunner {
                 Err(outcome) => outcome,
             }
         };
+        // The whole attempt, input reads included, is one operation that
+        // pressure admits now or defers.
+        let engine = Box::pin(crate::verification::hosted::blocks::as_one_operation(
+            &self.state,
+            tenant,
+            Some(tokio::time::Instant::now()),
+            async { Ok(engine.await) },
+        ));
         let outcome = tokio::time::timeout_at(
             state.deadline(),
             telemetry.phase(
@@ -770,7 +778,10 @@ impl VerifierRunner {
             ),
         )
         .await
-        .unwrap_or_else(|_| timed_out());
+        .map_or_else(
+            |_| timed_out(),
+            |ran| ran.unwrap_or_else(|error| engine_failure(run, &error)),
+        );
         work.settle().await;
         outcome
     }
@@ -977,13 +988,10 @@ impl VerifierRunner {
         let engine = engine
             .with_approvals(decisions)
             .with_host_work(work.clone());
-        let ran = crate::verification::hosted::blocks::as_one_operation(
-            &self.state,
-            tenant,
-            engine.run(Arc::clone(spec), evidence, state.deadline()),
-        )
-        .await;
-        match ran {
+        match engine
+            .run(Arc::clone(spec), evidence, state.deadline())
+            .await
+        {
             Ok(outcome) => EngineOutcome::Completed(outcome),
             Err(error) => engine_failure(run, &error),
         }

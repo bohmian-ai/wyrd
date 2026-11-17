@@ -455,8 +455,8 @@ async fn settled(execution: &Execution) -> VerificationResult {
 /// and a second queued run stays pending; both queued runs complete once the
 /// permit is released, and a direct Agent then runs. Memory and scratch are
 /// reserved for neither mode: an idle server holds no scratch; under
-/// critical memory pressure a queued code run waits in admission and
-/// completes once pressure recovers; with scratch held a queued workspace
+/// critical memory pressure a queued code run is deferred before it reads
+/// its input and completes once pressure recovers; with scratch held a queued workspace
 /// run is deferred and completes on release; and direct work finding memory
 /// or scratch full is refused with the stable unavailable code.
 /// Every model call is recorded on the ordinary gateway path against the
@@ -508,9 +508,8 @@ async fn direct_verification_runs_while_queued_capacity_is_held() {
     let workloads = desk.server.state().resources.workloads().clone();
     let pressure = desk.blocks().sandbox().overcommit_for_test();
     workloads.sample(0);
-    let bifrost_waits = pressure_waits(&logs, "Bifrost");
     let queued_python = desk.submit("python-check", "QUEUED-PYTHON").await;
-    waited(&logs, "Bifrost", bifrost_waits + 1).await;
+    logged(&logs, &[DEFERRED, &queued_python.id().to_string()]).await;
     pressure.set(0);
     workloads.sample(0);
     workloads.sample(0);
@@ -599,9 +598,8 @@ async fn direct_verification_runs_while_queued_capacity_is_held() {
 /// Verification, standalone gateway traffic and Bifrost work on one server
 /// share process pressure: while pressure is critical a standalone chat
 /// completion and a public query each reach admission and wait there, as
-/// gateway and Bifrost work, a queued Agent run waits in its input read, and
-/// once it
-/// recovers all three complete. The Agent's nested model call is recorded
+/// gateway and Bifrost work, a queued Agent run is deferred before it reads
+/// its input, and once it recovers all three complete. The Agent's nested model call is recorded
 /// against the verified Service and the standalone call against no subject,
 /// and no workload keeps bytes once everything settles.
 ///
@@ -654,18 +652,19 @@ async fn connected_work_waits_out_pressure_with_its_own_attribution() {
     });
     waited(&logs, "Gateway", 1).await;
     waited(&logs, "Bifrost", 1).await;
-    let bifrost_waits = pressure_waits(&logs, "Bifrost");
     let queued = desk.submit("model-check", "PRESSURE-MODEL").await;
-    // The queued run reads its submitted input through Bifrost first, and
-    // that read is what pressure stops.
-    waited(&logs, "Bifrost", bifrost_waits + 1).await;
+    // Pressure defers the queued run before it reads its input, so the
+    // read never waits out the execution's deadline.
+    logged(&logs, &[DEFERRED, &queued.id().to_string()]).await;
     assert!(!standalone.is_finished(), "the standalone call waits");
     assert!(!query.is_finished(), "the query waits");
     let status = queued.status().await.expect("the status reads").status;
     assert!(
         matches!(
             status,
-            VerificationExecutionStatus::Pending | VerificationExecutionStatus::Running
+            VerificationExecutionStatus::Pending
+                | VerificationExecutionStatus::Running
+                | VerificationExecutionStatus::Retrying
         ),
         "the queued Agent waits unsettled: {status:?}"
     );

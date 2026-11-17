@@ -752,12 +752,24 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
      verification lib tests 183 passed; sandbox, verification runtime,
      hosted artifacts, durable work and route integration tests 143 of
      144; `isolated_capacity` journeys 4 passed.
-   - Open (D4): `pg_hosted_artifacts::busy_queued_execution_is_deferred_until_capacity_frees`
-     fails on HEAD too (2 of 4 runs on one Postgres). **Cause** (Codex
-     diagnostician): under critical pressure, the run's input read waits
-     on Oracle admission until the execution deadline, so the run times
-     out instead of deferring.
-   Status: FAIL (D4; drain while pressure stays critical has no proof).
+   - Closed (D4): `pg_hosted_artifacts::busy_queued_execution_is_deferred_until_capacity_frees`
+     failed before this change too (2 of 4 runs on one Postgres).
+     - **Symptom:** never deferred; the run timed out at 20 s.
+     - **Cause** (Codex diagnostician): under critical pressure, the
+       run's input read waited on Oracle admission
+       (`oracle/mod.rs:2294`) until the execution deadline, so it timed
+       out instead of deferring.
+     - **Fix** (maintainer-approved): the whole queued attempt, input
+       reads included, is one operation. `as_one_operation(..,
+       Some(now), ..)` admits it now or returns `Busy`, which becomes
+       `Deferred(RUNTIME_BUSY)`, the way Forge refuses rewrites. Direct
+       execution passes `None` and keeps its bounded sandbox wait.
+     - The two `isolated_capacity` journeys asserted the old
+       input-read wait. They now assert the deferral log for the queued
+       run.
+     - **Proof:** deferral test 6 of 6 on one Postgres; journeys 4
+       passed. Mutation `admit_by: None` fails both journeys.
+   Status: FAIL (drain while pressure stays critical has no proof).
 
 7. **Functional closure and performance — REQ-024; AC-018.** Run affected
    functional lanes, then full clean L1 verification, gateway and all three

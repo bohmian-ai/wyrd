@@ -660,6 +660,7 @@ impl<'a> VerificationControl<'a> {
                 crate::verification::hosted::blocks::as_one_operation(
                     self.state,
                     caller.data_tenant_id,
+                    None,
                     engine.run(
                         Arc::clone(&target.spec),
                         std::mem::take(&mut request.inputs),

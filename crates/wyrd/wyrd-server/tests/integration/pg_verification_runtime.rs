@@ -3936,6 +3936,11 @@ async fn claim_committed_after_cancellation_is_released_unexecuted() {
     assert_eq!(expires, None, "the released run holds no live lease");
     assert_eq!(script.entered(), 0, "the released claim never executed");
     assert!(harness.writes().await.is_empty(), "nothing published");
+    assert_eq!(
+        harness.statuses(run).await,
+        ["running", "pending"],
+        "the release records the status it returned the run to"
+    );
 
     sqlx::query("DROP TRIGGER test_hold_claim_commit ON wyrd.verifier_executions")
         .execute(&harness.assertion)

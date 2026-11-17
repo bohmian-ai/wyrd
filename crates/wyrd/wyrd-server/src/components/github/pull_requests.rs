@@ -266,11 +266,18 @@ impl GithubConnections<'_> {
                     .deactivate_pull_request(&mut conn, key, observed_at, end)
                     .await
                     .map_err(registry_db_error)?;
+                let occurred_at = chrono::Utc::now();
                 conn.commit().await.map_err(registry_db_error)?;
                 tracing::info!(
                     ?end,
                     cancelled = cancelled.len(),
                     "pull request deactivated"
+                );
+                stage_cancelled(
+                    self.state.bifrost.scribe_outbox(),
+                    tenant,
+                    cancelled,
+                    occurred_at,
                 );
                 return Ok(Vec::new());
             }
@@ -302,10 +309,17 @@ impl GithubConnections<'_> {
                     )
                     .await
                     .map_err(registry_db_error)?;
+                let occurred_at = chrono::Utc::now();
                 conn.commit().await.map_err(registry_db_error)?;
                 tracing::info!(
                     superseded = superseded.len(),
                     "no selected Repository binds this repository's pull requests"
+                );
+                stage_cancelled(
+                    self.state.bifrost.scribe_outbox(),
+                    tenant,
+                    superseded,
+                    occurred_at,
                 );
                 return Ok(Vec::new());
             };
@@ -316,12 +330,13 @@ impl GithubConnections<'_> {
                 .reserve_pull_request(&mut conn, &source, observed_at, &targets)
                 .await
                 .map_err(registry_db_error)?;
-            fenced = cancelled;
             tracing::info!(
                 reserved = reserved.len(),
                 superseded = superseded.len(),
                 "pull request generation admitted"
             );
+            fenced = superseded;
+            fenced.extend(cancelled);
         }
         let generation = queue
             .lock_pull_request(&mut conn, key)

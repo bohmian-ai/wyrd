@@ -4471,7 +4471,10 @@ async fn pull_request_generations_reserve_activate_and_supersede() {
         .outcome;
     assert_eq!(b.len(), 2);
     assert_eq!(
-        superseded.iter().copied().collect::<BTreeSet<_>>(),
+        superseded
+            .iter()
+            .map(|cancelled| cancelled.execution_id)
+            .collect::<BTreeSet<_>>(),
         a.iter().copied().collect::<BTreeSet<_>>()
     );
     for execution in &a {
@@ -4550,7 +4553,13 @@ async fn pull_request_ends_access_loss_and_refusals_settle_durably() {
         )
         .await
         .expect("PR deactivates");
-    assert_eq!(cancelled, vec![executions[0]]);
+    assert_eq!(
+        cancelled
+            .iter()
+            .map(|cancelled| cancelled.execution_id)
+            .collect::<Vec<_>>(),
+        vec![executions[0]]
+    );
     let state = status(&queue, &mut conn, executions[0]).await.state;
     assert_eq!(
         state.error.map(|error| error.code).as_deref(),
@@ -4583,7 +4592,7 @@ async fn pull_request_ends_access_loss_and_refusals_settle_durably() {
             .cancel_pull_request_repositories(&mut conn, "github.com", Some(&["9".to_owned()]))
             .await
             .expect("other repository cancels"),
-        0,
+        Vec::new(),
         "another repository's loss cancels nothing here"
     );
     queue

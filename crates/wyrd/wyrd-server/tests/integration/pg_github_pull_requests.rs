@@ -6,22 +6,28 @@
 //! Verifiers to its pull requests. The default test server holds the
 //! Verifier runner, so admitted work stays queued until a test claims it.
 
+use arrow::array::{Array as _, StringArray};
+use arrow::datatypes::DataType;
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode, header};
 use chrono::Duration;
 use secrecy::ExposeSecret;
 use serde_json::{Value, json};
 use uuid::Uuid;
+use wyrd_client::Bifrost;
 use wyrd_loader::{build_declaration_input, load};
 use wyrd_server::components::github::service::GithubConnections;
 use wyrd_server::verification::RuntimeLimits;
 use wyrd_spec::ids::VerificationResultId;
+use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::verification::VerificationVerdict;
 use wyrd_sql::queries::verifier_executions::{
     Completion, Settlement, TerminalStatus, VerifierExecutionQueue,
 };
 use wyrd_testing::github::{GithubAppMock, GithubBrowser, PullRequest};
 use wyrd_testing::{Bootstrap, WyrdTestServer, WyrdTestServerBuilder};
+
+use super::pg_hosted_artifacts::client;
 
 /// The connected repository.
 pub(crate) const REPOSITORY: u64 = 4242;
@@ -276,6 +282,66 @@ impl Deployment {
         .expect("executions read");
         conn.commit().await.expect("read commits");
         rows
+    }
+
+    /// Wait until the newest recorded status of every one of `executions`,
+    /// read through the editor's SDK Bifrost query, is `expected`.
+    ///
+    /// # Panics
+    /// Panics when the query fails or any newest status still differs after
+    /// ten seconds.
+    pub(crate) async fn await_newest(&self, executions: &[Uuid], expected: &str) {
+        let ids = executions
+            .iter()
+            .map(|execution| format!("'{execution}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT e.execution_id, e.status FROM bifrost.verification.execution_events e \
+             JOIN (SELECT execution_id, max(occurred_at) AS occurred_at \
+                     FROM bifrost.verification.execution_events \
+                    WHERE event = 'status' GROUP BY execution_id) l \
+               ON e.execution_id = l.execution_id AND e.occurred_at = l.occurred_at \
+            WHERE e.event = 'status' AND e.execution_id IN ({ids})"
+        );
+        let sdk = client(self.base(), &self.jwt);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let mut stream = Bifrost::query_only(&sdk)
+                .query(&BifrostQueryRequest {
+                    params: Vec::new(),
+                    sql: sql.clone(),
+                    deadline_ms: Some(30_000),
+                })
+                .await
+                .expect("status events query");
+            let mut newest = std::collections::BTreeMap::new();
+            while let Some(batch) = stream.next_batch().await.expect("status batch reads") {
+                let text = |column: usize| {
+                    arrow::compute::cast(batch.column(column), &DataType::Utf8)
+                        .expect("column casts to text")
+                };
+                let (ids, statuses) = (text(0), text(1));
+                let ids = ids.as_any().downcast_ref::<StringArray>().expect("text");
+                let statuses = statuses
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("text");
+                for row in 0..batch.num_rows() {
+                    newest.insert(ids.value(row).to_owned(), statuses.value(row).to_owned());
+                }
+            }
+            if executions.iter().all(|execution| {
+                newest.get(&execution.to_string()).map(String::as_str) == Some(expected)
+            }) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "newest statuses never all became {expected}: {newest:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
     /// The frozen Verifier name and version, the admitting Repository
@@ -790,6 +856,10 @@ async fn pull_request_lifecycle_admits_supersedes_and_ends_through_the_webhook()
         ],
         "access loss keeps settled history"
     );
+    // Supersession, draft, close and access loss each record the
+    // cancellation as the execution's current status.
+    let cancelled: Vec<Uuid> = rows.iter().map(|row| row.execution_id).collect();
+    deployment.await_newest(&cancelled, "cancelled").await;
 }
 
 /// Forty-one PRs opened at once each admit exactly one execution per

@@ -33,8 +33,8 @@ use wyrd_spec::verification::execution::PullRequestActivation;
 use wyrd_spec::verification::{VerificationError, VerificationExecutionStatus};
 
 use super::{
-    Admitted, EnqueueRefusal, ExecutionAuthority, VerifierExecutionQueue, resolve_binding, stored,
-    timed,
+    Admitted, CancelledExecution, CancelledRow, EnqueueRefusal, ExecutionAuthority,
+    VerifierExecutionQueue, resolve_binding, stored, timed,
 };
 use crate::{OperatorPool, TenantConn};
 
@@ -113,7 +113,8 @@ const DEACTIVATE_SQL: &str = concat!(
       WHERE ",
     this_pull_request!(),
     " AND (status IN ('pending', 'retrying', 'running') OR pr_deactivated_at IS NULL)
-     RETURNING execution_id, status = 'cancelled' AND error = $4 AS cancelled"
+     RETURNING execution_id, verifier_card_uid, sub_principal_id, act_principal_id,
+               status = 'cancelled' AND error = $4 AS cancelled"
 );
 
 /// Cancel the PR's unfinished executions superseded by a new generation with
@@ -125,7 +126,7 @@ const SUPERSEDE_SQL: &str = concat!(
       WHERE ",
     this_pull_request!(),
     " AND status IN ('pending', 'retrying', 'running')
-     RETURNING execution_id"
+     RETURNING execution_id, verifier_card_uid, sub_principal_id, act_principal_id"
 );
 
 /// Cancel the unfinished PR executions of host `$1` whose repository is one
@@ -147,6 +148,8 @@ const CANCEL_REPOSITORIES_SQL: &str = "
      WHERE origin = 'pull_request' AND pull_request->>'host' = $1
        AND ($2::text[] IS NULL OR pull_request->>'repository_id' = ANY($2))
        AND (status IN ('pending', 'retrying', 'running') OR pr_deactivated_at IS NULL)
+     RETURNING execution_id, verifier_card_uid, sub_principal_id, act_principal_id,
+               status = 'cancelled' AND error = $3 AS cancelled
 ";
 
 /// The `pull_request` bindings a Repository Card version owns, with each
@@ -471,7 +474,29 @@ struct GenerationRow {
 
 /// A reserved pull request generation: its executions in target order and
 /// the older executions it superseded.
-pub type Reserved = (Vec<ExecutionId>, Vec<ExecutionId>);
+pub type Reserved = (Vec<ExecutionId>, Vec<CancelledExecution>);
+
+/// One row a PR-ending update touched: its identities, and whether this
+/// update cancelled it rather than only deactivating its settled history.
+#[derive(sqlx::FromRow)]
+struct EndedRow {
+    /// The touched execution's identities.
+    #[sqlx(flatten)]
+    identities: CancelledRow,
+    /// Whether this update cancelled it.
+    cancelled: Option<bool>,
+}
+
+/// The executions among `rows` that their update cancelled.
+///
+/// # Errors
+/// Returns [`SqlxError::Decode`] when a stored identity is malformed.
+fn cancelled_of(rows: Vec<EndedRow>) -> Result<Vec<CancelledExecution>, SqlxError> {
+    rows.into_iter()
+        .filter(|row| row.cancelled.unwrap_or(false))
+        .map(|row| row.identities.decode())
+        .collect()
+}
 
 impl VerifierExecutionQueue {
     /// The database time a PR observation is ordered by, read before the
@@ -652,7 +677,8 @@ impl VerifierExecutionQueue {
     /// Cancel the locked PR's unfinished executions because of `end`, and
     /// deactivate its generations as of `observed_at`, so none of them is
     /// replayed as current again. Returns the executions this call
-    /// cancelled. History keeps its pins and status.
+    /// cancelled, with the identities their status rows carry. History keeps
+    /// its pins and status.
     ///
     /// # Errors
     /// Returns the database error when the update fails.
@@ -666,9 +692,9 @@ impl VerifierExecutionQueue {
         key: PullRequestKey<'_>,
         observed_at: DateTime<Utc>,
         end: PullRequestEnd,
-    ) -> Result<Vec<ExecutionId>, SqlxError> {
+    ) -> Result<Vec<CancelledExecution>, SqlxError> {
         timed("pull_request_deactivate", async {
-            let rows: Vec<(Uuid, Option<bool>)> = sqlx::query_as(DEACTIVATE_SQL)
+            let rows: Vec<EndedRow> = sqlx::query_as(DEACTIVATE_SQL)
                 .bind(key.host)
                 .bind(key.repository_id.as_str())
                 .bind(key.number()?)
@@ -676,10 +702,7 @@ impl VerifierExecutionQueue {
                 .bind(observed_at)
                 .fetch_all(&mut **conn.transaction())
                 .await?;
-            rows.into_iter()
-                .filter(|(_, cancelled)| cancelled.unwrap_or(false))
-                .map(|(id, _)| stored(ExecutionId::new(id)))
-                .collect()
+            cancelled_of(rows)
         })
         .await
     }
@@ -687,8 +710,9 @@ impl VerifierExecutionQueue {
     /// Cancel every unfinished PR execution of `host` whose repository is in
     /// `repositories`, or of every repository when `None`, because the
     /// tenant's connection no longer reaches it, and deactivate their
-    /// generations. Runs in the access change's own transaction. Returns how
-    /// many rows changed.
+    /// generations. Runs in the access change's own transaction. Returns the
+    /// executions this call cancelled, with the identities their status rows
+    /// carry.
     ///
     /// # Errors
     /// Returns the database error when the update fails.
@@ -701,15 +725,15 @@ impl VerifierExecutionQueue {
         conn: &mut TenantConn<'_>,
         host: &str,
         repositories: Option<&[String]>,
-    ) -> Result<u64, SqlxError> {
+    ) -> Result<Vec<CancelledExecution>, SqlxError> {
         timed("pull_request_access_lost", async {
-            let result = sqlx::query(CANCEL_REPOSITORIES_SQL)
+            let rows: Vec<EndedRow> = sqlx::query_as(CANCEL_REPOSITORIES_SQL)
                 .bind(host)
                 .bind(repositories)
                 .bind(Json(access_lost()))
-                .execute(&mut **conn.transaction())
+                .fetch_all(&mut **conn.transaction())
                 .await?;
-            Ok(result.rows_affected())
+            cancelled_of(rows)
         })
         .await
     }
@@ -745,7 +769,7 @@ impl VerifierExecutionQueue {
                 repository_id: &activation.repository_id,
                 number: activation.number,
             };
-            let superseded_rows: Vec<Uuid> = sqlx::query_scalar(SUPERSEDE_SQL)
+            let superseded_rows: Vec<CancelledRow> = sqlx::query_as(SUPERSEDE_SQL)
                 .bind(key.host)
                 .bind(key.repository_id.as_str())
                 .bind(key.number()?)
@@ -808,7 +832,7 @@ impl VerifierExecutionQueue {
             let cancelled = self.fence_principals(conn, accepted).await?;
             let superseded_ids = superseded_rows
                 .into_iter()
-                .map(|id| stored(ExecutionId::new(id)))
+                .map(CancelledRow::decode)
                 .collect::<Result<_, _>>()?;
             Ok(Admitted {
                 outcome: (reserved, superseded_ids),

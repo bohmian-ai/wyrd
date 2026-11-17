@@ -1825,8 +1825,8 @@ base('development environment lifecycle', { timeout: 2_400_000 }, async () => {
     // One command runs the batch to terminal evidence and reports usable URLs.
     await vi.waitFor(() => expect(output()).toMatch(/batch {8}(passed|FAILED)/), { timeout: 1_500_000, interval: 1_000 });
     expect(output(), log).toContain('batch        passed');
-    // Without a configured GitHub App, pull request review stays off and nothing else changes.
-    await vi.waitFor(() => expect(output(), log).toContain('review       off: this server has no GitHub App'), { timeout: 60_000, interval: 1_000 });
+    // Pull request review registration runs beside the app and batch without holding either up.
+    expect(output()).toContain('review       registers bohmian-ai/wyrd-example-py once GitHub is connected');
     expect(output()).toContain('UI           http://127.0.0.1:3000/t/dev/login (sign in as development / development)');
     expect(output()).not.toContain('/login/api-key');
     for (const port of [8080, 3000, 8000, 1080]) expect(await answers(port), `port ${port}`).toBe(true);

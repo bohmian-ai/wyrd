@@ -688,3 +688,55 @@ async fn dev_harness_registers_the_demo_and_reviews_its_pull_requests() {
     assert_eq!(passed["result"]["outcome"]["verdict"], "passed", "{passed}");
     assert_eq!(check["conclusion"], "success", "{check}");
 }
+
+/// Without a GitHub App, `register` reports review off, exits successfully,
+/// and declares nothing.
+///
+/// # Panics
+/// Panics when `register` fails, prints otherwise, or declares a Card.
+#[tokio::test(flavor = "multi_thread")]
+async fn dev_harness_leaves_review_off_without_a_github_app() {
+    let prepare = Command::new(root().join("scripts/dev/example-app.sh"))
+        .arg("prepare")
+        .output()
+        .expect("prepare runs");
+    assert!(prepare.status.success(), "{prepare:?}");
+    let server = WyrdTestServer::builder()
+        .start_bound()
+        .await
+        .expect("bound test server starts");
+    let principal = server
+        .bootstrap_service("development", &["admin"])
+        .await
+        .expect("the development principal bootstraps");
+    let key = principal
+        .api_key()
+        .expect("a machine principal")
+        .expose_secret()
+        .to_owned();
+    let config = tempfile::tempdir().expect("config home creates");
+    let base = server.base_url().expect("bound");
+    let mut register = Register::start(harness("register", base, &key, config.path()));
+    register.until("review       off: this server has no GitHub App");
+    assert!(register.exit(), "{:#?}", register.seen);
+    let token = server
+        .exchange_api_key(&key.clone().into())
+        .await
+        .expect("the key exchanges");
+    let request = Request::builder()
+        .uri("/v1/cards?kind=Repository")
+        .body(Body::empty())
+        .expect("request builds");
+    let response = server
+        .oneshot_authenticated(&token, request)
+        .await
+        .expect("list responds");
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("body reads"),
+    )
+    .expect("JSON");
+    assert_eq!(page["items"], json!([]), "{page}");
+}

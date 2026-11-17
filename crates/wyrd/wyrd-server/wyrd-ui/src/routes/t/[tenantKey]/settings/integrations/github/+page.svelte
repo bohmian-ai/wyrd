@@ -44,7 +44,7 @@
 </script>
 
 <svelte:head><title>GitHub · Settings · {data.tenant.name} · Wyrd</title></svelte:head>
-<Crumbs items={[{ label: 'Settings', href: `${base}/settings` }, { label: 'Integrations' }, { label: 'GitHub' }]} />
+<Crumbs items={[{ label: data.tenant.key }, { label: 'Settings', href: `${base}/settings` }, { label: 'Integrations' }, { label: 'GitHub' }]} />
 <div class="content">
   {#if 'code' in data.github}
     <EmptyState state="error" problem={data.github} />

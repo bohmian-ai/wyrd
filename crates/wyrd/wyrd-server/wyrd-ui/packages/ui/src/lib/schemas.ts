@@ -666,7 +666,7 @@ export const components = {
     description: 'One reachable GitHub repository with no Repository Card: its three separate facts and the wyrd.toml and command that declare it.',
     input: RepositoryDeclareInputSchema,
     states: ['populated', 'denied', 'error', 'loading'],
-    emits: { 'connection.open': openConnection }
+    emits: {}
   },
   GithubIntegration: {
     description:

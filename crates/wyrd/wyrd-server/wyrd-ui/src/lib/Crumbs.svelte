@@ -6,7 +6,7 @@
 <nav class="bar" aria-label="Breadcrumb">
   {#each items as item, index (index)}
     {#if index > 0}<span aria-hidden="true">/</span>{/if}
-    {#if item.href}<a href={item.href}>{item.label}</a>{:else}<span class="here" aria-current="page">{item.label}</span>{/if}
+    {#if item.href}<a href={item.href}>{item.label}</a>{:else if index === items.length - 1}<span class="here" aria-current="page">{item.label}</span>{:else}<span>{item.label}</span>{/if}
   {/each}
 </nav>
 

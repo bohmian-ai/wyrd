@@ -18,7 +18,7 @@
     gap: 14px;
     min-width: 0;
     color: var(--text);
-    font: 13px var(--font-sans);
+    font: 14px/1.45 var(--font-sans);
   }
   .repo :global(.mono) {
     font-family: var(--font-mono);
@@ -303,7 +303,10 @@
   .repo :global(.outs td) {
     padding: 0;
     border-bottom: 1px solid var(--border-soft);
-    vertical-align: top;
+  }
+  .repo :global(.outs td span.mono),
+  .repo :global(.outs td .st) {
+    white-space: nowrap;
   }
   .repo :global(.outs tbody tr:hover td) {
     background: var(--surface-hover);
@@ -437,6 +440,7 @@
   }
   .repo :global(dialog) {
     width: min(480px, calc(100vw - 32px));
+    margin: auto;
     padding: 0;
     border: 1px solid var(--border);
     border-radius: var(--r);

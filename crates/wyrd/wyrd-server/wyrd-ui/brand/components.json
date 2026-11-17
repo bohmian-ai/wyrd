@@ -476,9 +476,7 @@
       ],
       "props": {
         "input": "RepositoryDeclareInput (schemas.ts)",
-        "result": "loader result",
-        "actions?": "per-action state",
-        "onaction?": "(intent) => void"
+        "result": "loader result"
       },
       "rules": [
         "One reachable GitHub repository with no Repository Card: its three facts, then the wyrd.toml and command that declare it. Nothing here registers anything.",

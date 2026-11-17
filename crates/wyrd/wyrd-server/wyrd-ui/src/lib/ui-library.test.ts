@@ -3462,8 +3462,7 @@ test('a Repository Card shows the viewed version apart from the selected policy,
 test('an accessible repository without a Card shows how to declare one, and an unknown id shows nothing', async () => {
   const declare = await loadRepositoryDeclare({ repositoryId: '741660215' }, { executor: fixtureExecutor });
   expect(declare.result).toMatchObject({ state: 'populated', data: { repositoryId: '741660215', fullName: 'acme/web-checkout', host: 'github.com' } });
-  const onaction = vi.fn();
-  const view = render(RepositoryDeclare, { ...declare, onaction });
+  const view = render(RepositoryDeclare, declare);
   expect(within(view.container).getByRole('heading', { level: 1 })).toHaveTextContent('acme/web-checkout');
   expect(view.container).toHaveTextContent('no Repository Card');
   expect(view.container).toHaveTextContent('github · github.com · repository_id 741660215');

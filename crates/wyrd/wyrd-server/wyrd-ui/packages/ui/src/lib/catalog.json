@@ -2067,19 +2067,7 @@
         "error",
         "loading"
       ],
-      "emits": [
-        {
-          "name": "connection.open",
-          "description": "Open the tenant's GitHub connection settings.",
-          "input": {
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "type": "object",
-            "properties": {},
-            "additionalProperties": false
-          },
-          "completion": "host-navigation"
-        }
-      ]
+      "emits": []
     },
     "GithubIntegration": {
       "description": "The tenant's one GitHub App connection: state, installation, App and host, the repositories it reaches beside their Repository Cards, connect, manage access on GitHub, and a confirmed disconnect.",

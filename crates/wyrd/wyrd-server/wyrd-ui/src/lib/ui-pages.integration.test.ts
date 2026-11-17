@@ -1898,8 +1898,10 @@ const connected = serverTest({ githubApp: true, perTest: true });
 
 /** Draw a page in both themes at desktop and phone width and, when a capture directory is set, keep a full-page screenshot of each. */
 async function captureRepositories(page: Page, name: string) {
-  for (const width of [1280, 390]) {
+  for (const width of [1440, 390]) {
     await page.setViewportSize({ width, height: 800 });
+    // The page never scrolls sideways; wide tables scroll inside their own region.
+    expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth), `${name} at ${width}`).toBeLessThanOrEqual(1);
     for (const mode of ['light', 'dark'] as const) {
       await page.evaluate((next) => ((document.querySelector('.app-root') as HTMLElement).dataset.mode = next), mode);
       if (process.env.WYRD_UI_CAPTURE_DIR) await page.screenshot({ path: join(process.env.WYRD_UI_CAPTURE_DIR, `repositories-${name}-${mode}-${width}.png`), fullPage: true });
@@ -1932,11 +1934,17 @@ connected('a tenant connects GitHub from Settings, reads its Repository Cards ap
     const base = `${bff.url}/t/${tenant}`;
     const page = await signIn(browser, bff.url, tenant, adminKey);
     const main = page.locator('main');
+    /** The index rows as their four named cells: the first word of each. */
     const rows = () =>
       page
         .getByRole('region', { name: 'Repositories', exact: true })
         .locator('tbody tr')
-        .evaluateAll((all) => all.map((row) => [...row.querySelectorAll('td')].map((cell) => cell.querySelector('.link, .st, .mono')?.textContent?.replace(/^[^\w]+/, '').trim())));
+        .evaluateAll((all) =>
+          all.map((row) => {
+            const [repository, version, access, verification] = [...row.querySelectorAll('td')].map((cell) => cell.querySelector('.link, .st, .mono')?.textContent?.replace(/^[^\w]+/, '').trim());
+            return { repository, version, access, verification };
+          })
+        );
     const noSecrets = async (url: string) => {
       const html = (await serverHtml(page, url)) + (await page.content());
       for (const secret of github.secrets()) expect(html).not.toContain(secret);
@@ -1947,7 +1955,7 @@ connected('a tenant connects GitHub from Settings, reads its Repository Cards ap
     await page.getByRole('link', { name: 'Repositories', exact: true }).click();
     await page.waitForURL(`${base}/repositories`);
     await expect.poll(() => main.textContent()).toContain('GitHub is not connected.');
-    expect(await rows()).toEqual([[undefined]]);
+    expect(await main.textContent()).toContain('No Repository Card is registered and the GitHub connection reaches no repository.');
     await page.getByRole('button', { name: 'GitHub connection' }).click();
     await page.waitForURL(`${base}/settings/integrations/github`);
     await expect.poll(() => main.textContent()).toContain('Not connected');
@@ -1978,9 +1986,9 @@ connected('a tenant connects GitHub from Settings, reads its Repository Cards ap
     // The index states registration, access and readiness per repository.
     await page.goto(`${base}/repositories`);
     await expect.poll(rows).toEqual([
-      ['api', second.version, 'Granted', 'Ready'],
-      ['web', expect.any(String), 'Granted', 'Not configured'],
-      ['acme/docs', '', 'Granted', 'Not declared']
+      { repository: 'api', version: second.version, access: 'Granted', verification: 'Ready' },
+      { repository: 'web', version: expect.any(String), access: 'Granted', verification: 'Not configured' },
+      { repository: 'acme/docs', version: '', access: 'Granted', verification: 'Not declared' }
     ]);
     await noSecrets(`${base}/repositories`);
     await captureRepositories(page, 'index');
@@ -1991,7 +1999,7 @@ connected('a tenant connects GitHub from Settings, reads its Repository Cards ap
     await page.waitForURL(`${base}/repositories?q=acme`);
     await page.getByRole('group', { name: 'Show' }).getByRole('button', { name: 'Ready' }).click();
     await page.waitForURL(`${base}/repositories?q=acme&show=ready`);
-    await expect.poll(rows).toEqual([['api', second.version, 'Granted', 'Ready']]);
+    await expect.poll(rows).toEqual([{ repository: 'api', version: second.version, access: 'Granted', verification: 'Ready' }]);
     await page.getByRole('button', { name: 'api', exact: true }).click();
     await page.waitForURL(`${base}/repositories/api?version=${second.version}&back=%3Fq%3Dacme%26show%3Dready`);
     await expect.poll(() => main.textContent()).toContain('✓ selected');
@@ -2037,7 +2045,7 @@ connected('a tenant connects GitHub from Settings, reads its Repository Cards ap
     // The way back restores the index state the reader left.
     await page.getByRole('navigation', { name: 'Breadcrumb' }).getByRole('link', { name: 'Repositories' }).click();
     await page.waitForURL(`${base}/repositories?q=acme&show=ready`);
-    await expect.poll(rows).toEqual([['api', second.version, 'Granted', 'Ready']]);
+    await expect.poll(rows).toEqual([{ repository: 'api', version: second.version, access: 'Granted', verification: 'Ready' }]);
 
     // A reachable repository without a Card explains how to declare one; a declared, unknown or malformed id names nothing.
     await page.getByRole('group', { name: 'Show' }).getByRole('button', { name: 'No Card' }).click();
@@ -2085,6 +2093,9 @@ connected('a tenant connects GitHub from Settings, reads its Repository Cards ap
     await disconnect.click();
     const dialog = page.getByRole('dialog', { name: 'Disconnect GitHub?' });
     expect(await dialog.evaluate((element) => element.matches(':modal'))).toBe(true);
+    // The dialog sits in the middle of the viewport.
+    const box = (await dialog.boundingBox())!;
+    expect(Math.abs(box.x + box.width / 2 - 640)).toBeLessThan(2);
     expect(await dialog.textContent()).toContain('Unfinished executions for those repositories are cancelled.');
     expect(await dialog.textContent()).toContain('Repository Cards and versions are unchanged.');
     // Keyboard: focus starts on Cancel, and Escape closes without disconnecting.
@@ -2109,8 +2120,8 @@ connected('a tenant connects GitHub from Settings, reads its Repository Cards ap
     // The Cards, their selected policy and the recorded execution stay; access is gone, nothing new starts, and the unfinished executions were cancelled.
     await page.goto(`${base}/repositories`);
     await expect.poll(rows).toEqual([
-      ['api', second.version, 'No connection', 'Inactive'],
-      ['web', expect.any(String), 'No connection', 'Inactive']
+      { repository: 'api', version: second.version, access: 'No connection', verification: 'Inactive' },
+      { repository: 'web', version: expect.any(String), access: 'No connection', verification: 'Inactive' }
     ]);
     await captureRepositories(page, 'index-disconnected');
     await page.goto(`${base}/verify/executions/${encodeURIComponent(executionId)}`);
@@ -2134,9 +2145,9 @@ connected('a tenant connects GitHub from Settings, reads its Repository Cards ap
     expect(JSON.parse((await page.locator('body').textContent()) ?? '')).toMatchObject({ state: 'active', installation_id: 101 });
     await page.goto(`${base}/repositories`);
     await expect.poll(rows).toEqual([
-      ['api', second.version, 'Granted', 'Ready'],
-      ['web', expect.any(String), 'Granted', 'Not configured'],
-      ['acme/docs', '', 'Granted', 'Not declared']
+      { repository: 'api', version: second.version, access: 'Granted', verification: 'Ready' },
+      { repository: 'web', version: expect.any(String), access: 'Granted', verification: 'Not configured' },
+      { repository: 'acme/docs', version: '', access: 'Granted', verification: 'Not declared' }
     ]);
   } finally {
     await browser.close();

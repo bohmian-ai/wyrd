@@ -1848,7 +1848,7 @@ reviewed('Repository Cards join GitHub access by repository id through the Node 
   const second = await declare('acme/api', 'changed');
   const web = await declare('acme/web', 'empty');
   const api = (version: string) => ({ kind: 'Repository', name: 'api', version }) as const;
-  const row = (each: RepositoryRow) => [each.card?.name, each.fullName, each.repositoryId, each.card?.selected, each.card?.versions, each.bindings, each.access, each.readiness];
+  const row = ({ card, fullName, repositoryId, bindings, access, readiness }: RepositoryRow) => ({ card: card?.name, selected: card?.selected, versions: card?.versions, fullName, repositoryId, bindings, access, readiness });
   const read = async (executor: Executor) => {
     const context = { executor };
     return {
@@ -1872,9 +1872,9 @@ reviewed('Repository Cards join GitHub access by repository id through the Node 
   // Registration, access and readiness are separate facts per repository, joined by provider id.
   const index = node.index.result;
   expect(index.state === 'populated' && index.data.rows.map(row)).toEqual([
-    ['api', 'acme/api', '1', second.version, 2, 2, 'granted', 'ready'],
-    ['web', 'acme/web', '2', web.version, 1, 0, 'granted', 'none'],
-    [undefined, 'acme/docs', '3', undefined, undefined, 0, 'granted', 'undeclared']
+    { card: 'api', selected: second.version, versions: 2, fullName: 'acme/api', repositoryId: '1', bindings: 2, access: 'granted', readiness: 'ready' },
+    { card: 'web', selected: web.version, versions: 1, fullName: 'acme/web', repositoryId: '2', bindings: 0, access: 'granted', readiness: 'none' },
+    { card: undefined, selected: undefined, versions: undefined, fullName: 'acme/docs', repositoryId: '3', bindings: 0, access: 'granted', readiness: 'undeclared' }
   ]);
   expect(node.inactive.result.state === 'populated' && [node.inactive.result.data.rows.map((each) => each.card?.name), node.inactive.result.data.total]).toEqual([['web'], 3]);
   // Viewing the older version reads it as not selected; the selected policy and its readiness stay the server's.
@@ -1895,7 +1895,7 @@ reviewed('Repository Cards join GitHub access by repository id through the Node 
   ]);
   expect((await cards.get(api(second.version))).status?.repository?.selected).toBe(true);
   // A reachable repository without a Card can be declared; one with a Card, or an id the connection does not reach, names nothing.
-  expect(node.docs.result.state === 'populated' && node.docs.result.data).toMatchObject({ repositoryId: '3', fullName: 'acme/docs', host: github.host, installation: 101 });
+  expect(node.docs.result.state === 'populated' && node.docs.result.data).toMatchObject({ repositoryId: '3', fullName: 'acme/docs', host: github.host });
   for (const each of [node.declared, node.unknown]) expect(each.result).toMatchObject({ state: 'error', problem: { code: 'WYRD_SPEC_404_NOT_FOUND' } });
   expect(node.github.result.state === 'populated' && [node.github.result.data.connection.state, node.github.result.data.connection.repositories.map((each) => each.full_name)]).toEqual([
     'active',
@@ -1908,9 +1908,10 @@ reviewed('Repository Cards join GitHub access by repository id through the Node 
   const viewer = nodeExecutor(WyrdClient.connect({ credential: server.bootstrapService(['viewer'], 'repositories_viewer') }));
   const recorded: Executor = { run: (batch, signal) => (requests.push(...batch), viewer.run(batch, signal)) };
   const viewed = (await loadRepositoryIndex({}, { executor: recorded })).result;
-  expect(viewed.state === 'populated' && [viewed.data.connection.state, viewed.data.rows.map((each) => [each.card?.name, each.access, each.readiness])]).toEqual([
-    'denied',
-    [['api', 'granted', 'ready'], ['web', 'granted', 'none']]
+  expect(viewed.state === 'populated' && viewed.data.connection.state).toBe('denied');
+  expect(viewed.state === 'populated' && viewed.data.rows.map(row)).toMatchObject([
+    { card: 'api', access: 'granted', readiness: 'ready' },
+    { card: 'web', access: 'granted', readiness: 'none' }
   ]);
   requests.length = 0;
   expect((await loadGithubIntegration({}, { executor: recorded })).result).toMatchObject({ state: 'denied', problem: { code: 'WYRD_PERMISSION_403_DENIED_RBAC' } });
@@ -1928,7 +1929,7 @@ reviewed('Repository Cards join GitHub access by repository id through the Node 
   await (await GithubConnection.connect({ client: admin })).disconnect();
   const after = (await loadRepositoryIndex({}, { executor: nodeExecutor(admin) })).result;
   expect(after.state === 'populated' && after.data.rows.map(row)).toEqual([
-    ['api', undefined, '1', second.version, 2, 2, 'none', 'inactive'],
-    ['web', undefined, '2', web.version, 1, 0, 'none', 'inactive']
+    { card: 'api', selected: second.version, versions: 2, fullName: undefined, repositoryId: '1', bindings: 2, access: 'none', readiness: 'inactive' },
+    { card: 'web', selected: web.version, versions: 1, fullName: undefined, repositoryId: '2', bindings: 0, access: 'none', readiness: 'inactive' }
   ]);
 });

@@ -4,13 +4,12 @@
   registers anything.
 -->
 <script lang="ts">
-  import type { ActionProps } from '../contract.js';
-  import { ACCESS_WORDS, READINESS_WORDS, accessWhy, readinessWhy, type RepositoryDeclareProps } from '../repositories.js';
+  import { ACCESS_WORDS, READINESS_WORDS, type RepositoryDeclareProps } from '../repositories.js';
   import CopyButton from './CopyButton.svelte';
   import EmptyState from './EmptyState.svelte';
   import RepositorySheet from './RepositorySheet.svelte';
 
-  let { result, onaction }: RepositoryDeclareProps & ActionProps = $props();
+  let { result }: RepositoryDeclareProps = $props();
 
   const COMMAND = 'wyrd declare wyrd.toml';
   const access = ACCESS_WORDS.granted;
@@ -30,18 +29,8 @@
     </div>
     <dl class="facts">
       <div><dt>Card</dt><dd><span class="st c-muted"><span aria-hidden="true">○</span>Not registered</span></dd></div>
-      <div>
-        <dt>GitHub access</dt>
-        <dd>
-          <span class="st c-{access.tone}"><span aria-hidden="true">{access.glyph}</span>{access.word}</span>
-          <span class="why">{accessWhy('granted', data.fullName, data.installation)}</span>
-          <button type="button" class="link small" disabled={!onaction} onclick={() => onaction?.({ name: 'connection.open', input: {} })}>Manage connection</button>
-        </dd>
-      </div>
-      <div>
-        <dt>Automatic verification</dt>
-        <dd><span class="st c-{readiness.tone}"><span aria-hidden="true">{readiness.glyph}</span>{readiness.word}</span><span class="why">{readinessWhy('undeclared', 0)}</span></dd>
-      </div>
+      <div><dt>GitHub access</dt><dd><span class="st c-{access.tone}"><span aria-hidden="true">{access.glyph}</span>{access.word}</span></dd></div>
+      <div><dt>Automatic verification</dt><dd><span class="st c-{readiness.tone}"><span aria-hidden="true">{readiness.glyph}</span>{readiness.word}</span></dd></div>
     </dl>
     <section class="section" aria-labelledby="declare-heading">
       <div class="section-head"><h2 class="h" id="declare-heading">Declare it</h2><CopyButton label="Copy wyrd.toml" text={data.toml} /></div>

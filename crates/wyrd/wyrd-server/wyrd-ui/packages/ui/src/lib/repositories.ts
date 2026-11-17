@@ -322,7 +322,7 @@ export async function loadRepositoryPolicy(input: RepositoryPolicyInput, context
 /** Props of `RepositoryDeclare`. */
 export interface RepositoryDeclareProps {
   readonly input: RepositoryDeclareInput;
-  readonly result: Loaded<{ readonly repositoryId: string; readonly fullName: string; readonly host: string; readonly installation?: number | null; readonly toml: string }>;
+  readonly result: Loaded<{ readonly repositoryId: string; readonly fullName: string; readonly host: string; readonly toml: string }>;
 }
 
 /**
@@ -345,7 +345,6 @@ export async function loadRepositoryDeclare(input: RepositoryDeclareInput, conte
         repositoryId: input.repositoryId,
         fullName: row.fullName,
         host: connection.data.host,
-        installation: connection.data.installation_id,
         toml: toml(['# wyrd.toml at the repository root. provider, host and repository_id', '# are inferred from origin and verified by the server.'], ['"./review/pr-review.yaml"'])
       }
     }

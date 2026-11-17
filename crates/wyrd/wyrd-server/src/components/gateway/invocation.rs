@@ -230,6 +230,9 @@ pub struct GatewayInvocation<'a> {
     /// The workload the call is admitted as: [`Workload::Gateway`] for a
     /// standalone call, the initiating workload for a nested one.
     workload: Workload,
+    /// The request body's charge [`Self::parsed`] took from the HTTP body
+    /// limit, taken once at admission.
+    body: std::sync::Mutex<Option<ByteCharge>>,
 }
 
 /// Everything admission fixed for one call, owned so execution and accounting
@@ -277,6 +280,9 @@ struct AdmittedCall {
     /// its demand under pressure and the owner of the bytes it retains.
     /// Pressure may cancel the call through `cancel` while it runs.
     operation: Operation,
+    /// The process memory charge of the request `body`, attributed to
+    /// `operation` and returned when the call settles.
+    _body_custody: ByteCharge,
 }
 
 impl AdmittedCall {
@@ -318,6 +324,7 @@ impl<'a> GatewayInvocation<'a> {
             arrival: None,
             bound: None,
             workload: Workload::Gateway,
+            body: std::sync::Mutex::new(None),
         }
     }
 
@@ -348,12 +355,20 @@ impl<'a> GatewayInvocation<'a> {
     /// request `clock` timed, recording its `authenticate` and `parse` phases
     /// for `operation` now that the request is decoded and validated; a
     /// request without a clock keeps phase telemetry only.
+    ///
+    /// The call takes the memory charge of the request body the HTTP body
+    /// limit buffered, which the parsed body shares without a copy.
+    /// Admission attributes it to the call's operation and the call keeps
+    /// it until it settles, so the body counts once, as the call's work,
+    /// however long a stream runs. A call without one, such as a nested
+    /// call's serialized body, is charged its body's kept text at admission.
     #[must_use]
     pub(crate) fn parsed(
         mut self,
         clock: Option<IngressClock>,
         operation: GatewayOperation,
     ) -> Self {
+        self.body = std::sync::Mutex::new(clock.as_ref().and_then(IngressClock::body));
         self.arrival = clock.map(|clock| clock.parsed(operation));
         self
     }
@@ -708,6 +723,21 @@ impl<'a> GatewayInvocation<'a> {
         )
         .await
         .map_err(|_| expired(call_id))?;
+        let handed = self
+            .body
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        // ponytail: a body held only as a decoded tree, never kept as text,
+        // is uncharged; every nested caller serializes its body to text.
+        let mut body_custody = handed.unwrap_or_else(|| {
+            let kept = request.body.text().map_or(0, <[u8]>::len);
+            self.state
+                .resources
+                .memory()
+                .charge_infallible(u64::try_from(kept).unwrap_or(u64::MAX))
+        });
+        body_custody.attribute(&operation);
         let capture_slot = if snapshot.capture.mode == GatewayCaptureMode::Disabled {
             None
         } else if self.bound.is_some() {
@@ -736,6 +766,7 @@ impl<'a> GatewayInvocation<'a> {
             trace,
             capture_slot,
             operation,
+            _body_custody: body_custody,
         };
         // Only a bound caller's deadline can pass before the ledger is charged.
         if self.bound.is_some_and(|bound| bound <= Instant::now()) {

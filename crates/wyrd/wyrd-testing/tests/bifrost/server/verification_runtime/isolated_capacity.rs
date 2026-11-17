@@ -16,6 +16,7 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use secrecy::ExposeSecret;
@@ -37,6 +38,7 @@ use wyrd_client::verify::{Execution, Submission, VerificationExecutionStatus};
 use wyrd_client::{Bifrost, Gateway, WyrdClient};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::verification::execution::{RequirementOutcome, VerificationResult};
+use wyrd_testing::gateway_capture::HeldUpstream;
 use wyrd_testing::logs::LogCapture;
 use wyrd_testing::server::{HostedLimits, RuntimeLimits};
 use wyrd_testing::{Bootstrap, WyrdTestServer};
@@ -97,6 +99,9 @@ fn reply(request: &Request) -> ResponseTemplate {
     completion(json!({ "role": "assistant", "content": r#"{"done":true}"# }))
 }
 
+/// The message content whose provider answers a test holds.
+const HELD_BODY: &str = "HELD-BODY";
+
 /// The plaintext API key of a bootstrapped machine principal.
 ///
 /// # Panics
@@ -121,6 +126,12 @@ struct CapacityDesk {
     admin_key: String,
     /// The scripted model upstream; kept alive for the server.
     _upstream: MockServer,
+    /// The provider the gateway calls, forwarding to the scripted upstream
+    /// and holding answers a test chooses.
+    provider: HeldUpstream,
+    /// Notified each time a request carrying [`HELD_BODY`] reaches the
+    /// scripted upstream.
+    held_arrived: Arc<tokio::sync::Notify>,
     /// The hydrated bundle's directory; kept alive for `state`.
     _bundle: tempfile::TempDir,
     /// The registered `capacity-desk` Service.
@@ -138,11 +149,21 @@ impl CapacityDesk {
     /// Panics when a setup step fails.
     async fn start() -> Self {
         let upstream = MockServer::start().await;
+        let held_arrived = Arc::new(tokio::sync::Notify::new());
+        let arrived = Arc::clone(&held_arrived);
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
-            .respond_with(reply)
+            .respond_with(move |request: &Request| {
+                if String::from_utf8_lossy(&request.body).contains(HELD_BODY) {
+                    arrived.notify_one();
+                }
+                reply(request)
+            })
             .mount(&upstream)
             .await;
+        let provider = HeldUpstream::start(&upstream)
+            .await
+            .expect("the held provider binds");
         let server = Box::pin(
             WyrdTestServer::builder()
                 .with_verification_limits_for_test(HostedLimits {
@@ -159,7 +180,7 @@ impl CapacityDesk {
                 })
                 .with_verification_runtime_for_test()
                 .with_gateway_provider_root_for_test(
-                    upstream.uri().parse().expect("upstream URL parses"),
+                    provider.uri().parse().expect("provider URL parses"),
                 )
                 .start_bound(),
         )
@@ -250,6 +271,8 @@ impl CapacityDesk {
             admin,
             admin_key,
             _upstream: upstream,
+            provider,
+            held_arrived,
             _bundle: bundle,
             root,
             state,
@@ -675,5 +698,63 @@ async fn connected_work_waits_out_pressure_with_its_own_attribution() {
             "{workload:?} keeps no bytes once its work settles"
         );
     }
+    desk.server.shutdown().await.expect("the server stops");
+}
+
+/// A standalone chat completion's request body counts as gateway work for as
+/// long as its call runs, and returns when the call settles.
+///
+/// # Panics
+/// Panics when setup or the call fails, or the body is uncounted, counted as
+/// another workload's, or kept after the call.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn standalone_call_bodies_count_as_gateway_work_while_the_call_runs() {
+    use wyrd_runtime::resources::Workload;
+
+    let desk = CapacityDesk::start().await;
+    let workloads = desk.server.state().resources.workloads().clone();
+    let body = serde_json::to_vec(&json!({
+        "model": "openai/gpt-4o",
+        "messages": [{"role": "user", "content": format!("{HELD_BODY} {}", "x".repeat(64 * 1024))}],
+    }))
+    .expect("the body serializes");
+    let sent = body.len() as u64;
+    desk.provider.hold(&[HELD_BODY]);
+    let call = tokio::spawn({
+        let url = format!(
+            "{}/v1/chat/completions",
+            desk.server.base_url().expect("the server is bound")
+        );
+        let key = desk.admin_key.clone();
+        async move {
+            reqwest::Client::new()
+                .post(url)
+                .bearer_auth(key)
+                .header("content-type", "application/json")
+                .body(body)
+                .send()
+                .await
+                .expect("the call sends")
+                .status()
+                .as_u16()
+        }
+    });
+    desk.held_arrived.notified().await;
+    assert_eq!(
+        workloads.workload_bytes(Workload::Gateway),
+        sent,
+        "the dispatched call holds its body as gateway work"
+    );
+    for workload in [Workload::Verification, Workload::Bifrost] {
+        assert_eq!(workloads.workload_bytes(workload), 0, "{workload:?}");
+    }
+    desk.provider.release(&[HELD_BODY]);
+    assert_eq!(call.await.expect("the call joins"), 200);
+    assert_eq!(
+        workloads.workload_bytes(Workload::Gateway),
+        0,
+        "the body returns when the call settles"
+    );
     desk.server.shutdown().await.expect("the server stops");
 }

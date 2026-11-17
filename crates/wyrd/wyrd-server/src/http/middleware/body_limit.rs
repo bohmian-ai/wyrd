@@ -13,6 +13,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use axum::body::Body;
@@ -212,7 +213,11 @@ where
                         };
                         return Ok(WyrdErrorResponse::from(error).into_response());
                     }
-                    let request = Request::from_parts(parts, Body::from(bytes));
+                    let mut request = Request::from_parts(parts, Body::from(bytes));
+                    if let BodyCharge::Memory(charge) = charge {
+                        request.extensions_mut().insert(BodyCustody::new(charge));
+                        return inner.call(request).await.map_err(Into::into);
+                    }
                     let response = inner.call(request).await.map_err(Into::into);
                     drop(charge);
                     response
@@ -239,6 +244,30 @@ where
                 }
             }
         })
+    }
+}
+
+/// The process memory charge of a buffered request body, offered to its
+/// handler.
+///
+/// A handler whose work outlives its response, such as a streamed gateway
+/// call, takes the charge so the body stays counted, once, until that work
+/// settles; an untaken charge returns with the response.
+#[derive(Clone, Debug)]
+pub(crate) struct BodyCustody(Arc<Mutex<Option<ByteCharge>>>);
+
+impl BodyCustody {
+    /// Offers `charge` to the handler.
+    pub(crate) fn new(charge: ByteCharge) -> Self {
+        Self(Arc::new(Mutex::new(Some(charge))))
+    }
+
+    /// Takes the body's charge; `None` once taken.
+    pub(crate) fn take(&self) -> Option<ByteCharge> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 }
 
@@ -539,6 +568,48 @@ mod tests {
         }
         assert_eq!(observed.lock().expect("observations").len(), 2);
         drop(occupant);
+    }
+
+    /// A handler that takes its body's charge keeps it past the response,
+    /// so the body stays counted, once, until the handler's work settles;
+    /// an untaken charge returns with the response.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the body is charged twice or released early or late.
+    #[tokio::test]
+    async fn a_taken_body_charge_outlives_the_response() {
+        let memory = ByteLedger::new(64);
+        let kept = Arc::new(Mutex::new(None));
+        let keep = Arc::clone(&kept);
+        let service = ServiceBuilder::new()
+            .layer(wyrd_body_limit(1024, None, None, memory.clone()))
+            .service(service_fn(move |request: Request<Body>| {
+                let custody = request
+                    .extensions()
+                    .get::<BodyCustody>()
+                    .expect("the body limit offers the charge");
+                *keep.lock().expect("kept") = custody.take();
+                async { Ok::<_, Infallible>(Response::new(Body::empty())) }
+            }));
+        let request = Request::builder()
+            .uri("/v1/chat/completions")
+            .body(Body::from(vec![0_u8; 40]))
+            .expect("request");
+
+        let response = service.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            memory.used(),
+            40,
+            "the taken charge outlives the response, once"
+        );
+        drop(kept.lock().expect("kept").take());
+        assert_eq!(
+            memory.used(),
+            0,
+            "dropping the taken charge returns the body"
+        );
     }
 
     /// Only the three mounted Scribe HTTP routes receive the selected encoded

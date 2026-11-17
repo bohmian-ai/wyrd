@@ -61,9 +61,11 @@ use super::capture::recording::RecordingScribe;
 use super::ledger::{Accounted, GatewayLedger, LedgerCall};
 use super::pg_administration_tests::{admin, audit_decisions, sealing_keyring, test_state};
 use super::routes::JsonBody;
+use super::telemetry::IngressClock;
 use super::{GatewayAdministration, GatewayCallRequest, GatewayCallResponse, GatewayInvocation};
 use crate::components::auth::Caller;
 use crate::http::error::WyrdErrorResponse;
+use crate::http::middleware::body_limit::BodyCustody;
 use crate::state::AppState;
 
 /// One scripted provider attempt.
@@ -6941,4 +6943,103 @@ async fn buffered_answers_count_against_the_calling_workload() {
     assert_eq!(workloads.workload_bytes(Workload::Gateway), 0);
     drop(nested);
     assert_eq!(workloads.workload_bytes(Workload::Verification), 0);
+}
+
+/// A call's request body counts against its own workload while the call
+/// runs: a nested Agent call's serialized body as verification work, and a
+/// standalone call's HTTP body through the charge its ingress clock carries
+/// from the body limit, counted once, as gateway work. Both return once the call settles.
+///
+/// # Panics
+/// Panics when the Postgres fixture or setup fails, a call fails, or a body
+/// is uncounted, double counted, counted against the wrong workload, or kept
+/// after the call.
+#[tokio::test]
+async fn call_bodies_count_against_the_calling_workload_while_the_call_runs() {
+    use wyrd_runtime::resources::Workload;
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let (entered, mut dispatched) = mpsc::unbounded_channel();
+    let held = Arc::new(Held {
+        entered,
+        release: Semaphore::new(0),
+    });
+    let state = replica(&fixture, held.clone()).await;
+    configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
+    let caller = invoker(tenant, 1, [open_access()]);
+    let workloads = state.resources.workloads().clone();
+    let serialized = || {
+        let mut call = request("dep-a/a", None, Duration::from_secs(10));
+        call.body =
+            wyrd_gateway::RequestJson::serialize(&json!({"model": "dep-a/a", "messages": []}))
+                .expect("the body serializes");
+        call
+    };
+
+    let nested = serialized();
+    let body = nested
+        .body
+        .text()
+        .expect("a serialized body keeps its text")
+        .len() as u64;
+    let running = tokio::spawn({
+        let (state, caller) = (state.clone(), caller.clone());
+        async move {
+            GatewayInvocation::new(&state)
+                .nested(Workload::Verification)
+                .invoke(&caller, nested)
+                .await
+                .map(drop)
+        }
+    });
+    dispatched.recv().await.expect("the nested call dispatches");
+    assert_eq!(
+        workloads.workload_bytes(Workload::Verification),
+        body,
+        "the nested call's body is verification work"
+    );
+    assert_eq!(workloads.workload_bytes(Workload::Gateway), 0);
+    held.release.add_permits(1);
+    running
+        .await
+        .expect("joins")
+        .expect("the nested call completes");
+    assert_eq!(workloads.workload_bytes(Workload::Verification), 0);
+
+    let custody = BodyCustody::new(state.resources.memory().charge_infallible(4096));
+    let clock = IngressClock::authenticated(None, std::time::Instant::now(), Some(custody.clone()));
+    let running = tokio::spawn({
+        let (state, caller) = (state.clone(), caller.clone());
+        async move {
+            GatewayInvocation::new(&state)
+                .parsed(Some(clock), GatewayOperation::ChatCompletions)
+                .invoke(&caller, serialized())
+                .await
+                .map(drop)
+        }
+    });
+    dispatched
+        .recv()
+        .await
+        .expect("the standalone call dispatches");
+    assert!(
+        custody.take().is_none(),
+        "the call took the HTTP body's charge"
+    );
+    assert_eq!(
+        workloads.workload_bytes(Workload::Gateway),
+        4096,
+        "the HTTP body's charge is the call's, counted once"
+    );
+    held.release.add_permits(1);
+    running
+        .await
+        .expect("joins")
+        .expect("the standalone call completes");
+    assert_eq!(workloads.workload_bytes(Workload::Gateway), 0);
+    assert_eq!(
+        state.resources.memory().used(),
+        0,
+        "no body bytes outlive the call"
+    );
 }

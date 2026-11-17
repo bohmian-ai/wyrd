@@ -481,11 +481,41 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
        disconnected behaviour, fails "Gateway work never waited for pressure
        1 times". GREEN in 4.3 s:
        `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-testing --test server -P journey --run-ignored=all -E 'test(=verification_runtime::isolated_capacity::connected_work_waits_out_pressure_with_its_own_attribution)'"`.
+   - Request bodies (user decision: hand the charge to the call).
+     `WyrdBodyLimit` offers a generic body's charge as a `BodyCustody`
+     extension. The gateway ingress layer puts it into `IngressClock`, and
+     `GatewayInvocation::parsed` takes it. Admission attributes it to the
+     call's operation, and `AdmittedCall` keeps it until the call settles.
+     `RequestJson::parse` shares the HTTP bytes, so the body is counted
+     once. A call with no handed charge (a nested Agent call's serialized
+     body) is charged its kept text at admission. An untaken charge still
+     returns with the response.
+     - `components::gateway::pg_invocation_tests::call_bodies_count_against_the_calling_workload_while_the_call_runs`:
+       - Held at dispatch, a nested body counts as Verification work, at its
+         exact length. RED: left 0, right 33.
+       - A standalone call handed a 4096-byte charge through its clock
+         counts exactly 4096 as Gateway work. It takes the charge from the
+         custody, and no bytes outlive the call.
+       - GREEN, with all gateway and middleware lib tests (96 passed):
+         `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-server --features test-support --lib -E 'test(/components::gateway::/) | test(/http::middleware::/)'"`.
+     - `http::middleware::body_limit::tests::a_taken_body_charge_outlives_the_response`:
+       a taken 40-byte charge stays on the ledger after the response, once,
+       and returns when dropped. Same command.
+     - Journey `verification_runtime::isolated_capacity::standalone_call_bodies_count_as_gateway_work_while_the_call_runs`:
+       - Over raw HTTP, a 64 KiB chat completion held at the provider (the
+         existing `HeldUpstream`, now in front of the desk's upstream)
+         counts its exact body length as Gateway work and nothing for
+         other workloads, then 0 after it settles.
+       - Mutation: dropping the clock's custody still passes, because
+         admission then charges the kept text. Only the ledger total would
+         differ, and that total moves with background work (measured
+         51–63 KB against a 65 KB body), so the handoff itself is proved by
+         the two lib tests above.
+       - GREEN, with the other two capacity journeys (3 passed):
+         `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-testing --test server -P journey --run-ignored=all -E 'test(/verification_runtime::isolated_capacity::/)'"`.
+     - TDD: the nested and handed cases were RED first; the HTTP wiring and
+       the journey were written after it (VIOLATED for that wiring).
    - Open:
-     - Request bodies are charged by `WyrdBodyLimit` only while the HTTP
-       handler runs, unattributed. Streaming calls keep the body past the
-       handler, and nested call bodies are uncharged. Awaiting a decision on
-       handing the body charge to the call.
      - A relayed answer's charge returns when it becomes the HTTP body, not
        when the body is sent.
      - The journey does not yet cover:
@@ -513,7 +543,7 @@ never generate synthetic host load or rely on noisy elapsed-time fairness.
          `one_session` name are gone. A sweep for tests of removed
          allocation logic found no test that only asserts removed
          behaviour.
-     Status: FAIL (request bodies, relayed answers, remaining journey cases).
+     Status: FAIL (relayed answers, remaining journey cases).
 
 7. **Functional closure and performance — REQ-024; AC-018.** Run affected
    functional lanes, then full clean L1 verification, gateway and all three

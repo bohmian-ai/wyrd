@@ -21,6 +21,7 @@
 use std::time::{Duration, Instant};
 
 use wyrd_gateway::outcome_name;
+use wyrd_runtime::resources::ByteCharge;
 use wyrd_spec::gateway::{GatewayCallOutcome, GatewayOperation};
 
 use super::capture::operation_name;
@@ -28,6 +29,7 @@ use crate::app::metrics::{
     GATEWAY_DURATION_SECONDS, GATEWAY_OVERHEAD_SECONDS, GATEWAY_PHASE_DURATION_SECONDS,
     GATEWAY_UPSTREAM_SECONDS, GATEWAY_WAIT_SECONDS,
 };
+use crate::http::middleware::body_limit::BodyCustody;
 use crate::http::middleware::metrics::RequestArrival;
 
 /// One request-path phase of a governed call, as its `phase` label names it.
@@ -111,8 +113,9 @@ impl Wait {
     }
 }
 
-/// Request-path timing the gateway ingress middleware hands to its handler.
-#[derive(Debug, Clone, Copy)]
+/// Request-path timing the gateway ingress middleware hands to its handler,
+/// with the request body's memory charge the handler's call takes over.
+#[derive(Debug, Clone)]
 pub(crate) struct IngressClock {
     /// When the request reached the server.
     arrival: Instant,
@@ -120,23 +123,37 @@ pub(crate) struct IngressClock {
     authenticating: Instant,
     /// When authentication finished.
     authenticated: Instant,
+    /// The buffered body's charge, when the body limit charged one.
+    body: Option<BodyCustody>,
 }
 
 impl IngressClock {
     /// The clock of a request authenticated from `authenticating` until now,
     /// arriving at `arrival`, or at `authenticating` when the arrival
-    /// middleware did not run.
-    pub(crate) fn authenticated(arrival: Option<RequestArrival>, authenticating: Instant) -> Self {
+    /// middleware did not run, whose buffered body the body limit charged
+    /// to `body`.
+    pub(crate) fn authenticated(
+        arrival: Option<RequestArrival>,
+        authenticating: Instant,
+        body: Option<BodyCustody>,
+    ) -> Self {
         Self {
             arrival: arrival.map_or(authenticating, RequestArrival::instant),
             authenticating,
             authenticated: Instant::now(),
+            body,
         }
+    }
+
+    /// Takes the request body's memory charge; `None` once taken or when
+    /// the body limit charged none.
+    pub(crate) fn body(&self) -> Option<ByteCharge> {
+        self.body.as_ref().and_then(BodyCustody::take)
     }
 
     /// Records the `authenticate` phase and the `parse` phase, which ends
     /// now, for `operation`, and returns the arrival.
-    pub(crate) fn parsed(self, operation: GatewayOperation) -> Instant {
+    pub(crate) fn parsed(&self, operation: GatewayOperation) -> Instant {
         let telemetry = CallTelemetry::new(operation, false, None);
         telemetry.phase(
             Phase::Authenticate,

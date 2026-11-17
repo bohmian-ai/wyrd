@@ -229,4 +229,6 @@ An independent read-only check of the task file and diff found a session id shor
 
 The user decided on 2026-11-17 to leave this task `BLOCKED` at this point and to add no checkpoint fallback for executions retained before TASK-003A.
 
+User decisions, 2026-11-17: (1) the Verify list needs tenant-wide Bifrost read; a Verifier-scoped list is out of scope for TASK-003 and needs no server change. (2) Of the unbuilt real-server proofs, build `timed_out` and `errored`; an unfinished session or drift execution and a second non-selected result were not selected and are not built. (3) AC-009's human acceptance stays open until the user reviews the page.
+
 Status: `BLOCKED`. Open: REQ-001, REQ-003, AC-001, AC-008, AC-009. Repository and pull request context and real `pending`, `waiting` and `retrying` rows are delivered (commits `91e0de7cb` to `830da965d`). Revision 4 closed the queue-lifecycle part of each; `mise run dev:full` and the independent check were rerun after it (above). The front-matter status stays `proposed`.

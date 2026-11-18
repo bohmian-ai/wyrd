@@ -1737,18 +1737,34 @@ ordinary call; a mismatch is `WYRD_SDK_422_VERIFICATION_DATA_INVALID` naming the
 requirement with the data root's empty `path` (a deeper path could hold a
 returned dictionary key), and never reruns or changes the result.
 
-A citation names an original input slot, or a fixed workspace file's
-`attachment_<n>` slot as the `fs.*` tools report it in `sources`, and a typed
-locator (`page`, `slide`, `lines`, `json_pointer`, or page `region`);
-workspace paths map back to their slots, and `/work` scratch is never a
-source. Before an Agent check runs, a `verdict`-format Prompt's citation
-slots are narrowed on that invocation's copy to the bare slots its bound
-inputs and workspace reach, so the provider request and the Agent's
-validation admit the same slots and a wrong or `inputs.`-prefixed slot is
-repaired; with no reachable source the slots are left open. The Card and
-concurrent invocations are unchanged. The server validates every citation
-against the pinned evidence, and a passed Agent check without a valid
-citation becomes inconclusive.
+A citation names an original input slot, a fixed workspace file's
+`attachment_<n>` slot as the `fs.*` tools report it in `sources`, or the
+engine-owned original source of a retained `pull_request` extraction, with a
+typed locator (`page`, `slide`, `lines`, `json_pointer`, or page `region`). The
+PR source identifies the accepted provider repository and pinned comparison/head
+commits; JSON pointers resolve against that execution's retained extraction.
+Its documented source slot is available to check authors without a caller input,
+cannot collide with caller slots, and cannot be supplied or replaced by callers.
+Workspace paths and derived outputs preserve reachability to their original
+sources; `/work` scratch is never a source. Before an Agent check runs, a
+`verdict`-format Prompt's citation slots are narrowed on that invocation's copy
+to the bare slots its bound inputs and workspace reach, so the provider request
+and the Agent's validation admit the same slots and a wrong or `inputs.`-prefixed
+slot is repaired; with no reachable source the slots are left open. The Card
+and concurrent invocations are unchanged.
+
+The server validates every supplied citation against reachable pinned evidence.
+Invalid output or a supplied citation that does not validate is an explicit
+check validation error, following the existing check-error path; citations are
+not silently discarded. That path may record an inconclusive error result with
+the validation reason, not an accepted and rewritten authored verdict. Existing
+schema and declared-data validation remain unchanged. A valid Agent or code check verdict is preserved,
+including a pass with no citations. The engine never changes an accepted verdict
+to enforce an implicit citation requirement. An authored requirement may demand
+particular evidence. Requirement aggregation and provider/infrastructure error
+handling remain as defined above. A clean PR review may cite the reviewed PR
+source even when it has no findings or inline source anchors. Retained source
+custody, access, and recovery remain with their existing owners.
 
 Verifiers judge one of two evidence modes, fixed at declaration; mixing them
 is refused.

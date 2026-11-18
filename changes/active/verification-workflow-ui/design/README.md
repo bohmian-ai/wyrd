@@ -20,3 +20,9 @@ the rejected consolidation, retained designs and agreed additions. See
 All four original canvas HTML sources and images are preserved in
 [original-canvas](../references/original-canvas/README.md). Mock approval does not
 make their simulated data or illustrative wire fields a backend contract.
+
+The [development repository review supplement](dev-repository-review.md) and
+[TASK-004A](../tasks/TASK-004A-dev-repository-review.md) connect `dev:full` to the
+implemented Repository/settings surfaces through ordinary public APIs.
+Specification revision 5 also assigns TASK-004A the agreed verdict-preservation
+and pinned-PR-citation runtime correction needed by that journey.

@@ -2,14 +2,15 @@
 
 Status: finalized
 
-The approved UI design below is preserved. The user reopened only the server
-dependency for TASK-003: [record queued execution statuses](verify-status-events.md).
-The approved supplement adds status rows through the existing Scribe outbox; it leaves
-checkpoints, recovery, tables, endpoints and authorization unchanged. It is the
-sole exception to the earlier UI-only boundary below. Specification revision 4
-records the user's 2026-11-16 approval, including release/defer status recording.
-Earlier revision-3/UI-only statements below describe the preserved original
-scope and are qualified only by this supplement.
+The approved UI design below is preserved. The server supplements are
+TASK-003A's [retained queued execution statuses](verify-status-events.md) under
+specification revision 4, and TASK-004A's
+[verdict and pinned PR citation correction](dev-repository-review.md#verdict-and-pr-citation-correction)
+under revision 5. The maintainer agreed that valid check verdicts remain
+unchanged, invalid supplied output/citations are explicit validation errors,
+and pinned PR extraction is citable through the review and final check. These
+bounded exceptions qualify the earlier UI-only scope; they add no migration,
+new endpoint or unrelated runtime behavior.
 
 The centralized visual design remains approved and `design/mock/` remains the
 sole approved mock. The user finalized the existing-read, UI-only approach on

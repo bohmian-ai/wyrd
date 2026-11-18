@@ -3,8 +3,8 @@ id: TASK-004A
 kind: implementation
 status: proposed
 spec: SPEC-verification-workflow-ui
-spec_revision: 4
-requirements: [REQ-010, REQ-011, REQ-013, AC-006, AC-009]
+spec_revision: 5
+requirements: [REQ-010, REQ-011, REQ-013, REQ-016, REQ-017, AC-006, AC-009, AC-011]
 depends_on: [TASK-004]
 ---
 
@@ -26,13 +26,14 @@ PRs against it. Shipping bootstrap code and instructions alone does not finish
 this task. Model calls stay mocked; GitHub connection, webhook delivery,
 repository extraction, execution and GitHub writes use the real integration.
 
-This task supplies development inputs and connected proof for revision 4's
+This task implements revision 5's verdict/PR citation correction under
+REQ-016/017 and AC-011, then supplies development inputs and connected proof for
 AC-009 and TASK-004's Repository/connection surfaces. It does not change
 connection semantics: connecting GitHub creates no Card. The dev harness makes
 a separate authenticated declaration after access exists. Preserve REQ-010/011's
 provider identity and selected policy, and REQ-013's connection/registration
 separation. The [development design supplement](../design/dev-repository-review.md)
-records the selected flow and investigated existing owners.
+records the selected flow, approved correction and investigated existing owners.
 
 TASK-004 supplies the implemented Repository/settings views; TASK-003 supplies
 Verify and the existing execution inspector supplies execution reads. Reuse the
@@ -46,8 +47,46 @@ owners. Source presence or queue admission alone is not completion proof.
 | `bohmian-ai/wyrd-example-py` | Add `review/reviewer.yaml`, `review/code-review.yaml`, and root `wyrd.toml`. Wyrd's pinned checkout consumes that upstream commit; ordinary users can also declare the example config. |
 | Wyrd `scripts/dev/example-app.sh` | Advance the base pin and seed the review Verifier after the existing `openai` deployment is created, using the prepared production SDK/CLI environment. |
 | Wyrd `dev:full` harness | Supervise the post-connect API registration alongside the serving stack; use the current dev principal and existing client authentication/declaration handling. |
+| Existing Wyrd/Vala verification owners | Preserve valid check verdicts, explicitly validate supplied citations, and propagate the retained pinned PR source through the actual review/check path. Correct the shipped PR example consumed by the demo. |
 | Wyrd MockServer fixtures | Supply deterministic final code-review reports through the actual gateway route without matching support-desk requests. |
 | Wyrd `CONTRIBUTING.md` | Commit the App, relay and developer journey instructions, including waiting/registered messages and fresh-restart behavior. |
+
+### Correct verdict validation and PR source lineage first
+
+The existing `vala-verify` engine's `Judged::cited` and Agent executor currently
+turn an uncited pass into inconclusive; both paths must satisfy REQ-016. Extend
+the existing check validation/evidence owners, preserving valid returned verdicts
+and rejecting malformed output or invalid supplied citations with an explicit
+validation reason. Remove silent citation filtering as an acceptance mechanism.
+A check error continues through the existing error/aggregation path, including
+its inconclusive error result where applicable; distinguish that explicit
+validation failure from accepting and rewriting a valid verdict. Preserve
+existing declared-data validation and do not weaken evidence validation.
+
+The hosted pull-request extraction already obtains exact accepted source through
+`GithubConnections::extract_pull_request`. Make that retained extraction an
+engine-owned original citable source, reusing the existing source-slot and typed
+locator mechanism and `TenantEvidence` custody/validation. Its identity must
+remain bound to the accepted provider repository and pinned comparison/head
+commits. Carry source reachability through extraction output, review Agent
+inputs/output and workspace, and the final code check, including existing
+retained recovery. Document the engine-owned source slot for check authors;
+ensure callers cannot replace it or collide with it. Source-slot naming and
+private representation are implementation-owned; do not add a second citation
+schema, arbitrary-step-output trust, a new storage owner or an extra external
+read to validate extraction already held for the execution.
+
+Update the shipped `examples/review-a-pull-request/{verifier,reviewer}.yaml` and
+its guide as needed, then derive the demo files below from that corrected example.
+The final requirement binds the reviewed PR evidence as well as the report and
+emits a valid citation to the original PR source, including clean reports with
+no findings. Keep incomplete coverage inconclusive, critical/high findings
+failed and clean complete reports passed. Requirement citations are separate
+from `CodeReviewReport` finding anchors; its closed schema stays unchanged.
+
+Do not implement against the old architecture rule that downgraded uncited
+Agent passes: revision 5's approved authority amendment replaces it. This narrow
+runtime correction is now in scope; unrelated runtime redesign is not.
 
 ### Portable demo files and pinned input
 
@@ -137,13 +176,46 @@ and reconnection after each fresh database start. No secrets are committed.
 
 ## Acceptance scenarios and evidence
 
-These ordered scenarios exercise AC-009 over REQ-010/011/013 and the applicable
-AC-006 connection/declaration path. Add actual assertion locations, exact focused
+The first three scenarios exercise AC-011 under REQ-016/017. The remaining
+scenarios exercise AC-009 over REQ-010/011/013 and the applicable AC-006
+connection/declaration path. Add actual assertion locations, exact focused
 commands, observed RED/GREEN results and limitations beneath each scenario;
 keep expectations unchanged. Existing already-correct behavior uses existing
-proof rather than manufactured RED failures.
+proof rather than manufactured RED failures. The evidence already recorded below
+is retained from revision 4. It does not prove the new REQ-016/017 correction;
+rerun affected assertions against the corrected runtime and authoring files.
 
-1. **Seed the actual example policy.** Start setup against the real dev server
+1. **Preserve valid Agent and code check decisions.** Run each executor path
+   with schema-valid passed, failed and inconclusive results, including passed
+   with an empty citations list and with valid reachable citations. Assert that
+   each accepted requirement keeps the authored outcome and the unchanged
+   `decide` rule aggregates it. Include a direct/public real-server verification
+   path so executor and engine behavior agree. Today uncited passes are rewritten,
+   providing the missing-behavior RED. This tests REQ-016, not a new minimum
+   citation count.
+2. **Reject invalid results explicitly.** Supply malformed output and citations
+   to an unreachable slot, a nonexistent location, and another execution/tenant's
+   source. Assert an explicit validation reason through the existing check-error
+   path, no silently dropped citation and no accepted/relabelled authored verdict.
+   Keep existing provider/infrastructure failure and aggregation behavior. Test
+   the engine/Agent/evidence validation owners and public server boundary; use
+   local providers for repeatability. Current filtering supplies RED where it
+   silently accepts or alters such results. These cases exercise REQ-016/017's
+   original-source validation boundary without accepting arbitrary step output.
+3. **Cite the pinned PR through the shipped example.** Admit a queued PR with
+   the runtime enabled and run the actual shipped example through extraction,
+   review Agent, workspace and final code check. Read its retained requirement
+   citation: it resolves into that execution's pinned PR evidence, including the
+   exact provider repository and comparison/head commits. A complete clean report
+   has no findings yet passes with that valid citation; high findings fail and
+   incomplete coverage stays inconclusive. Exercise the current retained/recovery
+   path and confirm it preserves the same pinned source and citation rather than
+   rebasing onto a later PR head. Forged/colliding caller input cannot replace
+   the source. Today extraction has no original citable slot and the example
+   returns an uncited pass. Use SDK → WyrdTestServer + repository Postgres → SDK
+   journey proof with existing GitHub doubles and gateway fixtures; do not
+   manufacture a caller input to bypass the missing source lineage.
+4. **Seed the actual example policy.** Start setup against the real dev server
    with no GitHub connection. Load package input from the pinned demo checkout,
    create the gateway deployment and declare the review Verifier. Public Card
    reads return the reusable Agent/Verifier with the expected exact references;
@@ -159,7 +231,7 @@ proof rather than manufactured RED failures.
    exact inbound reference to that Agent uid, and no Repository Card. TDD:
    VIOLATED — `setup`'s declaration preceded the journey; no RED recorded.
 
-2. **Register after connection without another command.** Start the actual
+5. **Register after connection without another command.** Start the actual
    bootstrap unconnected; app serving and the startup batch remain usable.
    Establish connection coverage for the canonical demo identity. The harness
    separately declares and selects its Repository with the seeded Verifier;
@@ -186,11 +258,11 @@ proof rather than manufactured RED failures.
    it blocks neither serving nor the batch; the lifecycle journey
    (`development environment lifecycle`, C3) asserts the summary line.
    Limit: stopping a *waiting* `register` with the stack, and a fresh restart
-   waiting again, are proven only by inspection and the live run (scenario 5);
+   waiting again, are proven only by inspection and the live run (now scenario 8);
    no test drives `dev:full` with a GitHub App configured. C3 PASS.
    TDD: VIOLATED — script before journey.
 
-3. **Complete the passing review.** After scenario 2, admit an ordinary PR through
+6. **Complete the passing review.** After scenario 5, admit an ordinary PR through
    the existing webhook path. Run real extraction → Agent → code requirement
    through gateway/MockServer and the enabled hosted runtime. Inspect a terminal
    passed execution, delivered GitHub status, success Check named
@@ -200,7 +272,7 @@ proof rather than manufactured RED failures.
    mock/bound demo policy completes that connected path; a permanently queued
    execution fails this scenario.
 
-   *Evidence (FAIL — SPEC_REVISION_REQUIRED).* Journey `pg_dev_repository_review::dev_harness_registers_the_demo_and_reviews_its_pull_requests`, last block: the
+   *Evidence (FAIL under revision 4; corrective scope approved in revision 5).* Journey `pg_dev_repository_review::dev_harness_registers_the_demo_and_reviews_its_pull_requests`, last block: the
    ordinary PR completes, delivery is `delivered`, one `wyrd/code-review`
    Check carries the scripted summary, one inline-free `COMMENT` review lands,
    and MockServer recorded one final turn with no `tool` message. But the
@@ -213,10 +285,11 @@ proof rather than manufactured RED failures.
    `examples/review-a-pull-request`'s) "otherwise pass" branch therefore
    cannot pass; only its failing branch had a journey
    (`pg_github_delivery::the_review_example_fails_on_a_high_finding_and_comments_its_fix`).
-   Fixing it is runtime/contract behaviour outside this task. The journey
+   This was outside revision 4; REQ-016/017 now assign the correction to this
+   task. This historical failure remains unclosed until rerun. The journey
    asserts the required `passed`/`success` and is red at that line.
 
-4. **Complete the failing review and isolate the matcher.** A PR with the failing
+7. **Complete the failing review and isolate the matcher.** A PR with the failing
    title follows the same real path and finishes failed with delivered failure
    Check, COMMENT review and the scripted high finding in the Check summary,
    without inline anchors. The marker in source context with an ordinary title
@@ -237,7 +310,7 @@ proof rather than manufactured RED failures.
    fixtures are unchanged (priorities 10–40). TDD: matcher fix PASS, initial
    fixtures VIOLATED.
 
-5. **Connect the live demo and prove the complete pipeline.** With the actual
+8. **Connect the live demo and prove the complete pipeline.** With the actual
    developer App installed on `bohmian-ai/wyrd-example-py` and the webhook relay
    running, start `dev:full`, complete the normal browser connection and let the
    harness register/select the Repository. Open actual passing and failing-title
@@ -260,13 +333,27 @@ proof rather than manufactured RED failures.
    upstream. Live run pending maintainer action; not passed.
 
    Commands:
-   - C1: `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-server --test integration -E "test(=pg_dev_repository_review::dev_harness_registers_the_demo_and_reviews_its_pull_requests)"'` — fails only at the scenario 3 verdict assertion.
+   - C1: `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-server --test integration -E "test(=pg_dev_repository_review::dev_harness_registers_the_demo_and_reviews_its_pull_requests)"'` — historical run fails at the passing-review verdict assertion (now scenario 6).
    - C2: same with `-E "test(=pg_dev_repository_review::dev_harness_leaves_review_off_without_a_github_app)"` — PASS.
    - C3: `mise exec -- scripts/postgres/with-test-postgres.sh -- env WYRD_UI_INTEGRATION=1 pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-pages.integration.test.ts -t 'development environment lifecycle'` — PASS (99.8 s; support-desk batch passed alongside).
    - `cargo clippy --locked -p wyrd-server --test integration --all-features -- -D warnings`, `cargo fmt`, `ruff format/check scripts/dev/review_repository.py`, `bash -n` on `example-app.sh` and the `dev:full` body, `git diff --check` — clean.
    - Upstream: `wyrd declare --check review/code-review.yaml` and `wyrd.toml` in the demo checkout — valid.
 
 ## Verification and boundaries
+
+Use the existing pure engine/check/evidence tests for the narrow regression,
+plus real-server verification and queued-PR journeys for the delivered flow.
+An existing regression to revise for the approved semantics is
+`blocks::engine::tests::hosted_check_passes_need_reachable_citations`, run with:
+
+```bash
+mise exec -- cargo nextest run --locked -p vala-verify --lib -E 'test(=blocks::engine::tests::hosted_check_passes_need_reachable_citations)'
+```
+
+Rename it to describe verdict preservation when changing its assertions, and
+record the resulting exact command before RED. The former downgrade expectation
+is intentionally superseded by REQ-016; do not weaken unrelated source validation.
+For new tests record actual focused commands rather than inventing names here.
 
 Use existing real-server GitHub test owners with repository-managed Postgres,
 including the connection, PR admission, extraction and delivery modules in the
@@ -290,12 +377,25 @@ Build prerequisites are the existing `ts:build`, `ts:build:testing`,
 checks appropriate to the actual diff. Shell changes need syntax checks; any
 non-trivial bootstrap logic needs focused behavioral proof. Follow the demo
 repository's own check commands for upstream files. Full journey aggregates
-remain integrated change-review work.
+remain integrated change-review work. Run `mise run fmt`, `mise run lints` and
+relevant dependency/tenant/codegen checks for the actual Rust/contract diff;
+never hand-edit generated artifacts. Python/TypeScript projections use the
+existing citation shape; verify affected language-lifetime/consumer paths at
+their owning tier if their implementation changes.
+
+This correction touches the verification hot path. List every wait on PostgreSQL,
+Scribe, object storage or Vault added or moved, matching each to a sanctioned
+wait; introducing a new unsanctioned wait is outside this spec. A task/change
+review may return PASS only with a full clean `mise run bench:l1:verification`
+run, verdict VALID, compared with the newest record for the same experiment and
+host under `benchmarks/history/`. Smoke, `--steps` and `--allow-dirty` do not count.
+Record benchmark evidence when the runtime correction is verified; no benchmark
+was run while authoring this revision.
 
 No new UI features, callback navigation, Repository status columns, PR review-set
-navigation (TASK-005), migrations, persisted contracts, SDK surfaces or execution
-runtime behavior are assigned here. Preserve existing authentication, tenant
-isolation and GitHub access checks. A runtime or boundary defect requiring
-material changes returns to its owning design/specification; it is not permission
-to expand this development supplement. Private watcher language/layout and
+navigation (TASK-005), migrations, new storage or unrelated SDK/runtime behavior
+are assigned here. Only REQ-016/017's existing-runtime correction is added.
+Preserve existing authentication, tenant isolation and GitHub access checks.
+A defect requiring material changes beyond REQ-016/017 returns to its owning
+design/specification; it is not permission to expand this development supplement. Private watcher language/layout and
 matcher syntax remain implementation-owned.

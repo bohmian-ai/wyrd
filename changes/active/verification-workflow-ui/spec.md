@@ -1,6 +1,6 @@
 ---
 id: SPEC-verification-workflow-ui
-revision: 4
+revision: 5
 status: approved
 ---
 
@@ -33,7 +33,9 @@ The approach builds shared UI components and adapters over existing Card,
 Bifrost and verification operations, then mounts them in the conventional UI
 and supported hosts. The server continues to own durable behavior. This packet
 adds no server fields, endpoints, query services, storage or execution logic
-apart from REQ-015's status recording through the existing Scribe outbox.
+apart from REQ-015's status recording and revision 5's bounded verdict/citation
+correction under REQ-016/017. TASK-004A owns that correction and its development
+journey; all other server exclusions remain unchanged.
 Costs are UI queries, adapters, presentation, status-event writes and real-server visual/journey proof;
 the prototype supplies none of that production evidence.
 
@@ -77,7 +79,7 @@ read restrictions must be enforced by existing read/query authority before
 pagination and counts; a browser filter is never authorization. If an existing
 surface cannot supply a required authorized projection, record that precise
 external dependency and leave the affected work proposed rather than changing
-the server beyond REQ-015, relaxing access or fabricating records. Discovery must not enumerate
+the server beyond REQ-015/016/017, relaxing access or fabricating records. Discovery must not enumerate
 every execution in the browser or infer review membership.
 
 ### Inspect one workflow
@@ -247,6 +249,46 @@ selected implementation flow; TASK-003A supplies the server writes and TASK-003
 owns UI consumption. Failed-requirement IDs and Verifier-scoped viewers are
 outside this server supplement.
 
+**REQ-016 — Preserve valid check verdicts.** When an Agent or code check
+returns a structurally valid verdict, the engine preserves its authored
+`passed`, `failed` or `inconclusive` outcome. An empty citations list alone is
+valid and never causes a pass to be downgraded. The ordinary `decide` rule
+continues to aggregate requirement outcomes; it does not rewrite them to enforce
+an implicit grounding policy. Malformed check output or an invalid supplied
+citation is rejected with an explicit validation reason through the existing
+check-error path, rather than dropping citations or accepting and replacing the
+authored verdict. The existing check-error path may record an inconclusive error
+result with that validation reason; it has not accepted and rewritten the
+check's authored verdict. Existing schema/declared-data validation,
+provider/infrastructure error handling and aggregation are otherwise unchanged. A requirement needing particular evidence remains an
+explicit authored rule; no implicit citation-count rule is added.
+
+**REQ-017 — Cite pinned PR evidence through the review workflow.** A successful
+`pull_request` extraction makes its retained, accepted PR source an original
+citable source using the existing slot/typed-locator citation shape. The source
+identifies the exact provider repository and pinned comparison/head commits;
+a citation into its extraction JSON resolves only within that execution's
+retained evidence. Downstream Agent inputs, derived outputs and workspaces
+preserve reachability to that source. Check authors can identify and cite the
+source without fabricating a caller input; the source slot must be documented
+and usable in the authored example. It cannot collide with or be replaced by
+a caller-controlled slot. Out-of-source, wrong-execution or invalid-locator
+citations fail validation under REQ-016. Existing tenant/access and retained
+source boundaries remain authoritative. Use retained extraction and current
+custody/recovery paths; no new storage owner, PostgreSQL evidence, migration or
+extra hot-path external wait is authorized.
+
+Update the shipped `examples/review-a-pull-request` workflow and the pinned
+`wyrd-example-py` demo to cite this PR evidence in the final requirement, including
+clean reviews with no findings. Preserve their decision rule: incomplete review
+is inconclusive, critical/high findings fail, otherwise pass. A requirement
+citation is separate from finding source anchors: a clean report can have no
+finding locations and still cite the PR reviewed. The closed `CodeReviewReport`
+format and GitHub rendering contracts do not change. The
+[finalized correction design](design/dev-repository-review.md#verdict-and-pr-citation-correction)
+records the agreed flow; TASK-004A supplies runtime correction, authoring and
+connected proof.
+
 **REQ-014 — Shared components and supported hosts.** Extend the existing
 pure-prop component/loader catalog, closed typed read contract, Node/MCP
 executors and host action intents. Conventional pages, gallery, custom
@@ -261,8 +303,10 @@ and internal scrolling/pan/zoom. Fixtures do not close live dependencies.
 No visual workflow editor, new verification kind, finding schema, separate PR
 dashboard, general Cards redesign, activation/pause/rollback editor or broader
 Changes/collaboration product is included. No new server API, response field, query service, authorization behavior,
-runtime, scheduler, registry, graph store, browser execution ledger, event bus
-or PostgreSQL table is authorized by this UI packet. Internal layout algorithms, cursor encoding,
+runtime redesign, scheduler, registry, graph store, browser execution ledger,
+event bus or PostgreSQL table is authorized. REQ-016/017 authorize only the
+existing runtime verdict validation and PR evidence/citation correction; they
+do not authorize unrelated server behavior or a new endpoint. Internal layout algorithms, cursor encoding,
 refresh scheduling and component decomposition remain implementation-owned.
 
 ## Dependencies, authority and scope transfer
@@ -281,7 +325,10 @@ supply status/details/invocations/publications and authorized actions. The
 sources and the [source alignment](design/source-alignment.md) distinguishes
 source presence from integration into this UI checkout. Revision 3 records the
 user's 2026-11-12 agreement to this UI-only approach. Revision 4 adds only
-REQ-015's approved server status-event supplement.
+REQ-015's approved server status-event supplement. Revision 5 records the
+maintainer's agreement to preserve valid verdicts and make pinned PR extraction
+citable, with the shipped example/demo corrected and the original passing PR
+acceptance retained.
 
 Native Repository, connection, admission, deferred input, approval and delivery
 remain external backend capabilities with their owning authority amendments.
@@ -305,8 +352,8 @@ enumerated above and was synchronized into the original packet on approval
 (2026-11-11): its REQ-018/026/027/029 entries, plan, TASK-007 and TASK-009 point
 here, and its retained Changes obligations are unchanged. Do not execute conflicting original tasks
 or mark the entire original Changes task superseded. Discovery/review-set UI queries and adapters belong to this packet over existing
-read surfaces. Apart from REQ-015's status recording, server contract, engine and
-installation changes remain outside this packet; a missing input is an external dependency, not an implementation
+read surfaces. Apart from REQ-015's status recording and REQ-016/017's verdict/PR citation
+correction, server contract, engine and installation changes remain outside this packet; a missing input is an external dependency, not an implementation
 assignment here.
 
 The following backend-owned authority amendments are dependencies of the tasks
@@ -332,6 +379,7 @@ its applicable current authority.
 | 002 — Execution inspection | 001 graph; existing status, compact result, explicit details, invocation/publication/file/cancel operations and permitted Bifrost context queries. |
 | 003 — Verify discovery | 002 inspector; 003A's retained queued status events; existing authorized accepted-execution/result data for bounded queries, counts and filters. Other missing read coverage remains an external dependency. |
 | 003A — Queued status events | Existing queue transition owners, completion group commit and process Scribe outbox; implements only REQ-015. |
+| 004A — Dev repository review and citation correction | Implemented 004 views; existing check/extraction/evidence owners; portable upstream demo files and available pinned commit. Implements REQ-016/017 before completing the passing/failing live PR journey. |
 | 004 — Repositories/settings | 001/003 plus delivered connection/access and native Repository/selected-policy operations with owning authority. |
 | 005 — PR review sets | 002/003/004 plus actual accepted admission membership/history and confirmed same-commit request semantics. |
 | 006 — Waiting/approval | 002 plus delivered occurrence/wait/decision/readback/continuation operations and owning authority. |
@@ -368,8 +416,18 @@ not merely the existence of a route/component or a successful command.
 | AC-008 Authorization and hosts | Exercise foreign IDs, restricted Verifier scopes, denied prerequisites and unavailable reads through the real supported HTTP/SDK/MCP and browser adapters. No foreign content/counts or follow-on sensitive reads appear; denial/unavailability never becomes empty success. Repeat affected reads/actions in supported host consumers. | 003,005,008–014 |
 | AC-009 Visual and development journey | Produce representative ordinary, session, drift, PR and approval executions through normal public development workflows; navigate Verify, Repositories and Settings in the real browser. Individually compare components/pages with the approved mock in both themes, narrow/wide layouts and keyboard/touch interaction. No inert fixture action or absent prerequisite is accepted as production completion. | 001,004,007,010–014 |
 | AC-010 Retained lifecycle events | Through real public SDK/server operations, cancel pending and running work, revoke a principal with multiple unfinished executions, and hold other work at running/retrying/input-wait/approval-wait before completion or timeout/error. Public Bifrost queries over `event = 'status'` return the expected newest words and specified row fields. Exercise ordinary release/defer returning to pending/retrying. Repeated cancellation, stale settlement and rollback add no event. Focused owner proof preserves grouped completion, shared status-row batching, attribution and retry identity; existing checkpoint recovery and tenant-isolation proof remains passing. | 015 |
+| AC-011 Verdict and PR evidence integrity | Exercise Agent/code checks returning valid passed/failed/inconclusive outcomes, including an uncited pass; outcomes remain authored. Malformed output and invalid supplied citations produce explicit validation failures, never silently filtered evidence. Run the shipped PR example and pinned demo through real extraction, review and final code check: a clean review passes with a valid citation to the retained pinned PR source, a high finding fails, and incomplete coverage remains inconclusive. Preserve source reachability through workspace/derived output and existing retained recovery; wrong-execution/tenant/locator citations are rejected. Live demo proof still includes actual GitHub delivery and existing UI visibility under AC-009. | 016,017 |
 
 ## Approval and revision history
+
+Revision 5 records the maintainer's explicit agreement to the verdict/PR citation
+correction and request to revise the spec and tasks. It authorizes REQ-016/017
+and AC-011 within TASK-004A, retaining its clean-PR passed/success expectation.
+The owning Verifier citation paragraph in `architecture/wyrd-design.md` is
+amended with this documentation revision before runtime implementation.
+Revision 4 is preserved in [the prior revision](spec-revisions/revision-4.md).
+This approval does not certify implementation, change other tasks' acceptance,
+or authorize commits or pushes.
 
 Revision 4 records the user's explicit approval on 2026-11-16 of the status-event
 supplement and its proposed release/defer correction. It authorizes REQ-015 and
@@ -389,3 +447,4 @@ capability readiness is still checked per task; unavailable data is not invented
 | 2 | approved (2026-11-11) | Separate UI specification approval from task-specific backend delivery; record the unconfirmed same-commit review-request input as a direct dependency of TASK-005. |
 | 3 | approved (2026-11-12) | Record the user-agreed UI-only implementation boundary: existing Card/Bifrost/domain reads, compact judgments and explicit details, unchanged task order, no new server APIs/fields/query services or runtime behavior. |
 | 4 | approved (2026-11-16) | Add REQ-015/AC-010: queued lifecycle status rows through the existing Scribe outbox, retaining completion group commit, shared batching and unchanged checkpoints/recovery. Include release/defer status recording; no migration, new endpoint, additional PostgreSQL statement or crash-durability guarantee. |
+| 5 | approved (2026-11-17) | Preserve valid Agent/code check verdicts; reject invalid supplied citations explicitly; make retained pinned PR extraction citable and carry provenance through the review/check flow; correct shipped example/demo and retain clean-PR passed/success. TASK-004A owns this bounded runtime and development supplement. |

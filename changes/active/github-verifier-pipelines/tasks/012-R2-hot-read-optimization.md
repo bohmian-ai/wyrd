@@ -188,7 +188,20 @@ behavior keeps its existing proof; no manufactured RED is required for it.
    evidence absent.
    **Tier:** declaration/record tests and opt-in real-server L1.
    **Authority:** REQ-018/024; benchmark Measurement/Verdicts/Records.
-   Evidence: **declaration GREEN; baseline not run.**
+   Evidence: **declaration GREEN; clean full baseline VALID.**
+   - Clean, unprofiled L1 baseline at `56b8d7443` (clean tree, no `--allow-dirty`), all
+     VALID with zero wrong results, about 160 s of the 300 s budget each:
+     `benchmarks/history/bifrost/ui-sql/20261118T215633Z-56b8d7443.json`,
+     `benchmarks/history/bifrost/ui-sql-10x/20261118T220239Z-56b8d7443.json`,
+     `benchmarks/history/bifrost/ui-sql-learned/20261118T220520Z-56b8d7443.json`.
+     Default, requests/s (c1 / c8): memtable 74.9 / 301.8, staged 79.8 / 339.8, published
+     88.5 / 417.9; metrics page p50 at c8: 56 / 37 / 34 ms. At 10×: memtable 48.0 / 195.1,
+     published 71.3 / 307.7. Learned layout is within noise of canonical. Hot memtable reads
+     are the slowest residence, and the gap widens with volume.
+   - Per-page p95 is inconclusive at c1 (about 95 to 112 page samples per 5 s repetition,
+     under the 200 floor) and per-page p99 everywhere; c8 page p95 is conclusive (386 to 533).
+     The step-level `client_p99_ms` is reported from 380 to 2,104 samples per repetition;
+     that existing step reading applies no sample floor.
    - Plan (review revision): default L1 `ui-sql` is six steps, `{memtable,staged,published}-ui-c{1,8}`,
      at the standard 5 s warmup, 3 × 5 s and 300 s budget. Each client cycles traces,
      verification, logs and metrics pages in a fixed order from its own offset, keeping each

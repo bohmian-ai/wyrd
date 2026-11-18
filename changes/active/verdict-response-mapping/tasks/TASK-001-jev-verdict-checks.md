@@ -318,6 +318,32 @@ that proof rather than manufacturing a RED result.
    answer/provenance; retained evidence must outlive the in-process response.
    This is tier-1 result-recording/inspection proof across the SDK boundaries.
 
+   Evidence:
+   - Journey (Rust): `gateway_jev::jev_judgments_are_retained_under_capture_controls`.
+     `desk-policy` is declared as 1.0.0 with `context_capture: full` and as
+     2.0.0 with `hash`. After `Execution::wait`, the `details()` read
+     (HTTP `GET /v1/verification/executions/{id}/details`) returns the
+     exact Verifier version. Each retained requirement's outcome and reason
+     equal the returned ones, and its provenance is
+     `CallProvenance::Agent { agent: desk-judge, route.deployment: jev }`.
+     Its `actual` is the selected native answer (choice with
+     confidence/probabilities, Noul, Score with legend) under `full`, and a
+     64-hex digest only under `hash`. Another tenant's `details()` gets
+     `WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND`.
+   - Command: `scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(=gateway_jev::jev_judgments_are_retained_under_capture_controls)'"`.
+   - TDD deviation: there was no RED. Scenario 1 put the selected answer in
+     the existing `CheckOutput.actual`, which already flows through the
+     existing `capture_actual` and asynchronous recording, so this scenario
+     pins that contract, not new behavior.
+   - Limitations: no MCP tool or CLI command reads verification execution
+     details, so the HTTP details route is the applicable read owner.
+     Whether execution waits for persistence is not measured here; the
+     existing `verify_in_real_time` journeys own that property and this
+     change does not touch it. `redact` shares `capture_actual` with
+     `hash` and is covered by its owner unit test
+     (`assertion::tests`). Python and TS read the same server route, and
+     only the Rust journey pins it.
+
 7. **Retain existing direct-Verdict and gateway behavior** — REQ-005,
    REQ-014; J8. Reuse hosted direct-Verdict journeys to assert outcomes,
    citations, declared data and malformed-output handling when no transform is

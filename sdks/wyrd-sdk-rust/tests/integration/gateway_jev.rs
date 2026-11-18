@@ -24,10 +24,10 @@ use wyrd_ai::operator_connections::SecretBearer;
 use wyrd_ai::state::{DeclareOptions, WyrdState};
 use wyrd_ai::verify::{
     Agent, CardRef, Check, ChoiceQuestion, ChoiceTransform, ComparisonOperator, Component,
-    FieldValue, InputSlot, Inputs, JevPromptOptions, ProbabilityTransform, Prompt, Requirement,
-    ScoreTransform, Service, VerdictTransform, Verifier,
+    Execution, FieldValue, InputSlot, Inputs, JevPromptOptions, ProbabilityTransform, Prompt,
+    Requirement, ScoreTransform, Service, VerdictTransform, Verifier,
 };
-use wyrd_ai::{RequirementOutcome, VerificationVerdict};
+use wyrd_ai::{CallProvenance, RequirementOutcome, VerificationVerdict};
 use wyrd_testing::server::WyrdTestServer;
 
 use crate::support::Deployment;
@@ -607,6 +607,12 @@ fn desk_judge() -> Agent {
 /// whose four requirements read the same answer through a custom Choice map,
 /// Noul expected true and expected false, and `compliance >= 2`.
 fn policy_desk() -> Service {
+    policy_desk_at("1.0.0", "full")
+}
+
+/// [`policy_desk`] at `version`, whose `desk-policy` retains each actual
+/// answer under `context_capture` `capture`.
+fn policy_desk_at(version: &str, capture: &str) -> Service {
     let judge = desk_judge();
     let check = |transform| {
         Check::agent(judge.clone())
@@ -621,7 +627,8 @@ fn policy_desk() -> Service {
             fail_at,
         })
     };
-    let verifier = Verifier::new("desk-policy", "1.0.0")
+    let verifier = Verifier::new("desk-policy", version)
+        .context_capture(capture)
         .inputs([("reply", InputSlot::json(json!({"type": "string"})))])
         .requirements([
             Requirement::new(
@@ -657,7 +664,7 @@ fn policy_desk() -> Service {
                 })),
             ),
         ]);
-    Service::new("policy-desk", "1.0.0")
+    Service::new("policy-desk", version)
         .components([Component::new("desk-judge", judge).verified_by([verifier])])
 }
 
@@ -1064,6 +1071,113 @@ async fn jev_malformed_answers_are_check_errors() {
             before + 4,
             "{marker}: one Jev call per check, none retried"
         );
+    }
+    jev.deployment.shutdown().await;
+}
+
+/// A judged Jev check is retained, not just returned: after recording is
+/// visible, the details read shows each requirement's verdict, reason and
+/// selected native answer with the exact `desk-policy` version and the
+/// `desk-judge` Agent and Jev route that answered. Under `context_capture:
+/// hash` the same judgment keeps its verdict and reason while the raw answer
+/// is retained only as a digest. Another tenant cannot read either.
+///
+/// # Panics
+/// Panics when a judgment differs, the retained answer or provenance is
+/// missing, a hashed answer is retained raw, or another tenant reads it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn jev_judgments_are_retained_under_capture_controls() {
+    let jev = Jev::start().await;
+    let answers = desk_answers("compliant", 0.3, 0.75, 0.02, 2.0);
+    jev.answer_when(
+        "DESK-PASS",
+        json!({"model": "jev-1.13.0", "answers": answers}),
+    )
+    .await;
+    let foreign = jev
+        .deployment
+        .client(&jev.deployment.other_tenant_admin("other-tenant").await);
+
+    for (version, capture) in [("1.0.0", "full"), ("2.0.0", "hash")] {
+        let state = WyrdState::declare_with(
+            &policy_desk_at(version, capture),
+            DeclareOptions {
+                client: Some(jev.deployment.admin()),
+                ..DeclareOptions::default()
+            },
+        )
+        .await
+        .expect("the policy desk declares");
+        let result = state
+            .run_for_card("desk-judge")
+            .expect("the judge's run opens")
+            .observe()
+            .verify(
+                "desk-policy",
+                Inputs::named([("reply", json!("DESK-PASS: the refund follows policy."))]),
+            )
+            .await
+            .expect("the verification executes");
+        assert_eq!(
+            result.outcome.verdict,
+            VerificationVerdict::Passed,
+            "{capture}"
+        );
+
+        let details = jev.deployment.details(result.execution_id).await;
+        assert_eq!(details.verifier.version.to_string(), version, "{capture}");
+        for (id, question) in [
+            ("refund-policy", "refund"),
+            ("helpful", "helpful"),
+            ("resolved", "unresolved"),
+            ("compliant", "compliance"),
+        ] {
+            let returned = requirement(&result, id);
+            let retained = details
+                .outcome
+                .requirements
+                .iter()
+                .find(|requirement| requirement.result.id.as_str() == id)
+                .unwrap_or_else(|| panic!("{id} is retained: {details:#?}"));
+            assert_eq!(
+                (retained.result.outcome, &retained.result.reason),
+                (returned.outcome, &returned.reason),
+                "{capture} {id}"
+            );
+            let actual = retained
+                .result
+                .actual
+                .as_ref()
+                .expect("the answer is retained");
+            if capture == "full" {
+                assert_eq!(actual, &answers[question], "{id}");
+            } else {
+                assert!(
+                    actual.as_str().is_some_and(|digest| digest.len() == 64
+                        && digest.bytes().all(|byte| byte.is_ascii_hexdigit())),
+                    "{id} retains only a digest: {actual}"
+                );
+            }
+            assert!(
+                matches!(
+                    &retained.provenance,
+                    Some(CallProvenance::Agent { agent: Some(agent), route, .. })
+                        if agent.name.as_str() == "desk-judge"
+                            && serde_json::to_value(route).expect("route encodes")["deployment"] == "jev"
+                ),
+                "{id}: {:?}",
+                retained.provenance
+            );
+        }
+
+        let refused = Execution::connect_with(result.execution_id, &foreign)
+            .await
+            .expect("the handle rebuilds from its ID")
+            .details()
+            .await
+            .expect_err("another tenant reads no judgment");
+        assert_eq!(refused.code(), "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND");
     }
     jev.deployment.shutdown().await;
 }

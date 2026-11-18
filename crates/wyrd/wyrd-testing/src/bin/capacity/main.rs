@@ -9,6 +9,9 @@
 //! - `l2 <engine>`: competing open-loop work through capacity, overload, and
 //!   recovery, through `mise run bench:l2:<engine>`.
 //! - `report <record.json>`: regenerates a persisted record's report.
+//! - `profile <cpu-capture.json.gz> [thread-name]`: lists the functions each
+//!   sampled thread group of a CPU capture spends its samples in, from its
+//!   Samply symbol sidecar.
 //! - `results`: writes every recorded run of `benchmarks/history/` into one HTML
 //!   page at `target/benchmarks/results.html`, through
 //!   `mise run bench:results`.
@@ -138,6 +141,19 @@ async fn dispatch(arguments: &[String], root: &Path) -> u8 {
                 }
             }
         }
+        (Some("profile"), _, _) if (3..=4).contains(&arguments.len()) => {
+            let threads = arguments.get(3).map_or("", String::as_str);
+            match levels::cpu_report(Path::new(&arguments[2]), threads) {
+                Ok(report) => {
+                    print!("{report}");
+                    0
+                }
+                Err(message) => {
+                    eprintln!("capacity profile: {message}");
+                    2
+                }
+            }
+        }
         (Some("results"), _, _) if arguments.len() == 2 => {
             let out = root.join(RESULTS);
             match levels::results(root, &out) {
@@ -153,7 +169,7 @@ async fn dispatch(arguments: &[String], root: &Path) -> u8 {
         }
         _ => {
             eprintln!(
-                "capacity: expected `l1 [bifrost [writes-parquet|hot|parquet]|verification|gateway]`, `l2 <bifrost|verification|gateway>`, `report <record.json>`, or `results`, got {:?}",
+                "capacity: expected `l1 [bifrost [writes-parquet|hot|parquet]|verification|gateway]`, `l2 <bifrost|verification|gateway>`, `report <record.json>`, `profile <cpu-capture.json.gz> [thread-name]`, or `results`, got {:?}",
                 &arguments[1.min(arguments.len())..]
             );
             2

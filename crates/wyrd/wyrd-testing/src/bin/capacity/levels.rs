@@ -24,7 +24,7 @@ use wyrd_testing::experiment::{
     Declaration, Engine, HISTORY_DIRECTORY, HostRecord, Invocation, LOCAL_DIRECTORY, Level, Mode,
     Options, Record, SMOKE_DIRECTORY, Source, Validity, Verdict, Workload, run,
 };
-use wyrd_testing::profile::{ProfileMode, SAMPLY};
+use wyrd_testing::profile::{ProfileMode, SAMPLY, SYMBOLS, SymbolizedCapture};
 use wyrd_testing::release_server::{Host, HostLoad};
 
 use crate::flags;
@@ -293,6 +293,7 @@ pub async fn execute(plan: Plan, root: &Path, profile: Option<ProfileMode>) -> u
         profile: profile.map(|mode| Profiling {
             mode,
             program: PathBuf::from(SAMPLY),
+            symbols: root.join(SYMBOLS),
         }),
         interrupt,
     };
@@ -414,6 +415,22 @@ pub fn report(path: &Path) -> Result<String, String> {
         .map(|record| record.render())
         .map_err(|error| error.to_string())
 }
+
+/// Functions each sampled thread group of a CPU capture spends its samples
+/// in, from the capture's Samply sidecar: [`SymbolizedCapture::report`] of
+/// the threads whose name contains `threads`, the top [`PROFILE_TOP`] each.
+///
+/// # Errors
+///
+/// Returns a message when the capture or its sidecar cannot be read.
+pub fn cpu_report(capture: &Path, threads: &str) -> Result<String, String> {
+    SymbolizedCapture::read(capture)
+        .map(|read| read.report(threads, PROFILE_TOP))
+        .map_err(|error| error.to_string())
+}
+
+/// Functions a `profile` report lists per thread group and ordering.
+const PROFILE_TOP: usize = 40;
 
 /// The results page; [`results`] replaces its [`RESULTS_SLOT`] with the
 /// records it shows.

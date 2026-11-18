@@ -1725,6 +1725,9 @@ pub struct Profiling {
     pub mode: ProfileMode,
     /// The CPU profiler program, [`crate::profile::SAMPLY`] outside tests.
     pub program: PathBuf,
+    /// Where sampled executables are kept by build ID, the repository's
+    /// [`crate::profile::SYMBOLS`] outside tests.
+    pub symbols: PathBuf,
 }
 
 /// Where a run keeps raw artifacts and whether it profiles.
@@ -2027,7 +2030,12 @@ where
                 profile.absorb(saved(previous).await);
             }
             let profiler = cpu.map_or_else(Profiler::disabled, |cpu| {
-                Profiler::start(&cpu.program, &targets, &profiles.join(&step.id))
+                Profiler::start(
+                    &cpu.program,
+                    &targets,
+                    &profiles.join(&step.id),
+                    &cpu.symbols,
+                )
             });
             let (repetitions, reasons) = measured.entry(step.id.clone()).or_default();
             let window = Duration::from_secs(declaration.step_timing(step).repetition_seconds);
@@ -3197,6 +3205,17 @@ impl Record {
         for capture in &profile.captures {
             let _ = writeln!(out, "- {} capture: {capture}", role(capture).name());
         }
+        for symbols in &profile.symbols {
+            let kept = symbols.executable.as_ref().map_or_else(
+                || "executable not kept".to_owned(),
+                |kept| format!("build {} kept at {}", kept.build_id, kept.path),
+            );
+            let _ = writeln!(
+                out,
+                "- symbols: {}: {} of {} executable samples unresolved; {kept}",
+                symbols.sidecar, symbols.unresolved, symbols.samples
+            );
+        }
     }
 
     /// Writes `step`'s diagnostic readings to `out`: each declared or read
@@ -3424,7 +3443,8 @@ mod tests {
         Reading, Record, Repetition, Role, Source, Status, Step, Validity, Verdict, Workload, run,
     };
     use crate::capacity::{Population, UNLABELLED};
-    use crate::profile::{ProfileMode, ProfileNote};
+    use crate::profile::fixture::{Sidecar, profiler};
+    use crate::profile::{Archived, ProfileMode, ProfileNote, Symbolized};
     use crate::release_server::Histogram;
     use crate::release_server::HostLoad;
 
@@ -5587,6 +5607,16 @@ Overloaded: do not compare languages here.
             notes: vec!["the server heap profile was not served".to_owned()],
             mode: Some(ProfileMode::Both),
             roles: vec![Role::Server, Role::Driver, Role::Python],
+            symbols: vec![Symbolized {
+                capture: "profiles/op-1/cpu-server-7.json.gz".to_owned(),
+                sidecar: "profiles/op-1/cpu-server-7.json.syms.json".to_owned(),
+                executable: Some(Archived {
+                    build_id: "0f0f".to_owned(),
+                    path: "symbols/0f0f/wyrd-server".to_owned(),
+                }),
+                samples: 200,
+                unresolved: 3,
+            }],
         };
         let console = record.render();
         let path = record.publish(root.path()).expect("publish");
@@ -5646,6 +5676,7 @@ Overloaded: do not compare languages here.
             "- python capture: profiles/verify-typescript-c1/cpu-python-9.json.gz",
             "- driver capture: profiles/op-1/cpu-driver-8.json.gz",
             "- server capture: profiles/op-1/cpu-server-7.json.gz",
+            "- symbols: profiles/op-1/cpu-server-7.json.syms.json: 3 of 200 executable samples unresolved; build 0f0f kept at symbols/0f0f/wyrd-server",
             "neither is aligned to a repetition window",
         ] {
             assert!(console.contains(line), "{line}: {console}");
@@ -5818,7 +5849,7 @@ Overloaded: do not compare languages here.
     #[tokio::test(start_paused = true)]
     async fn profiling_is_optional_diagnostic_evidence() {
         let root = tempfile::tempdir().expect("root");
-        let saving = saving_profiler(root.path());
+        let saving = profiler(root.path(), "saving-profiler", Sidecar::Resolved, 0);
         let silent = root.path().join("silent-profiler");
         std::fs::write(
             &silent,
@@ -5833,6 +5864,7 @@ Overloaded: do not compare languages here.
             profile: program.map(|program| Profiling {
                 mode: ProfileMode::Cpu,
                 program,
+                symbols: root.path().join("symbols"),
             }),
             interrupt: CancellationToken::new(),
         };
@@ -5901,16 +5933,7 @@ Overloaded: do not compare languages here.
     #[tokio::test(start_paused = true)]
     async fn profile_saving_never_delays_drain_or_budget() {
         let root = tempfile::tempdir().expect("root");
-        let slow = root.path().join("slow-profiler");
-        std::fs::write(
-            &slow,
-            "#!/bin/sh\nout=''\nwhile [ $# -gt 0 ]; do [ \"$1\" = --output ] && out=\"$2\"; shift; done\n\
-             trap 'sleep 1; echo profile > \"$out\"; exit 0' INT\nwhile :; do sleep 0.02; done\n",
-        )
-        .expect("script");
-        let mut permissions = std::fs::metadata(&slow).expect("metadata").permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
-        std::fs::set_permissions(&slow, permissions).expect("chmod");
+        let slow = profiler(root.path(), "slow-profiler", Sidecar::Resolved, 1);
         let artifacts = root.path().join("target");
         let capture = artifacts
             .join("profiles")
@@ -5918,6 +5941,7 @@ Overloaded: do not compare languages here.
             .join(format!("cpu-server-{}.json.gz", std::process::id()));
         let run_with = |program: Option<PathBuf>, stall: Duration| {
             let (artifacts, capture) = (artifacts.clone(), capture.clone());
+            let symbols = artifacts.join("symbols");
             async move {
                 let mut workload = Scripted::always(&good());
                 workload.settle = Some(Duration::from_millis(500));
@@ -5928,6 +5952,7 @@ Overloaded: do not compare languages here.
                     profile: program.map(|program| Profiling {
                         mode: ProfileMode::Both,
                         program,
+                        symbols: symbols.clone(),
                     }),
                     interrupt: CancellationToken::new(),
                 };
@@ -5964,26 +5989,6 @@ Overloaded: do not compare languages here.
         }
     }
 
-    /// Writes an executable stand-in profiler under `root` that saves a
-    /// capture to its `--output` when interrupted; returns its path.
-    ///
-    /// # Panics
-    /// Panics when the script cannot be written or made executable under
-    /// `root`.
-    fn saving_profiler(root: &Path) -> PathBuf {
-        let script = root.join("saving-profiler");
-        std::fs::write(
-            &script,
-            "#!/bin/sh\nout=''\nwhile [ $# -gt 0 ]; do [ \"$1\" = --output ] && out=\"$2\"; shift; done\n\
-             trap 'echo profile > \"$out\"; exit 0' INT\nwhile :; do sleep 0.02; done\n",
-        )
-        .expect("script");
-        let mut permissions = std::fs::metadata(&script).expect("metadata").permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
-        std::fs::set_permissions(&script, permissions).expect("chmod");
-        script
-    }
-
     /// Runs the two-step declaration profiled in `mode`, or unprofiled,
     /// writing artifacts under `artifacts`.
     async fn profiled_run(artifacts: &Path, program: &Path, mode: Option<ProfileMode>) -> Record {
@@ -5994,6 +5999,7 @@ Overloaded: do not compare languages here.
             profile: mode.map(|mode| Profiling {
                 mode,
                 program: program.to_path_buf(),
+                symbols: artifacts.join("symbols"),
             }),
             interrupt: CancellationToken::new(),
         };
@@ -6040,12 +6046,14 @@ Overloaded: do not compare languages here.
     #[tokio::test(start_paused = true)]
     async fn profile_modes_start_only_the_requested_collectors() {
         let root = tempfile::tempdir().expect("root");
-        let program = saving_profiler(root.path());
+        let program = profiler(root.path(), "saving-profiler", Sidecar::Resolved, 0);
         let pid = std::process::id();
         let cpu = [
             format!("op-1/cpu-server-{pid}.json.gz"),
+            format!("op-1/cpu-server-{pid}.json.syms.json"),
             format!("op-1/samply-server-{pid}.log"),
             format!("op-64/cpu-server-{pid}.json.gz"),
+            format!("op-64/cpu-server-{pid}.json.syms.json"),
             format!("op-64/samply-server-{pid}.log"),
         ];
         let heap = ["heap-driver-op-1.pb.gz", "heap-driver-op-64.pb.gz"].map(str::to_owned);
@@ -6081,7 +6089,7 @@ Overloaded: do not compare languages here.
     #[tokio::test(start_paused = true)]
     async fn profile_manifests_preserve_executable_and_window_identity() {
         let root = tempfile::tempdir().expect("root");
-        let program = saving_profiler(root.path());
+        let program = profiler(root.path(), "saving-profiler", Sidecar::Resolved, 0);
         let record = profiled_run(root.path(), &program, Some(ProfileMode::Both)).await;
         let read: Record =
             serde_json::from_str(&serde_json::to_string(&record).expect("json")).expect("record");

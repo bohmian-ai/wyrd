@@ -11248,6 +11248,7 @@ dependencies = [
  "datafusion",
  "datafusion-proto",
  "ed25519-dalek",
+ "flate2",
  "futures-util",
  "hdrhistogram",
  "hex",

@@ -166,18 +166,28 @@ pub enum Envelope {
     Runnable,
     /// One in-process governed model call through the Gateway.
     Model,
+    /// One sandbox operation's wait for a Python worker from the pool, from
+    /// asking until it holds a checked-out worker; nested in its sandbox
+    /// envelope.
+    Checkout,
+    /// One sandbox operation's program on its checked-out worker, from the
+    /// first turn sent until the program completes, fails, or stops, worker
+    /// round trips and host calls included; nested in its sandbox envelope.
+    Execute,
 }
 
 impl Envelope {
     /// Every envelope, in emission order.
     #[cfg(feature = "bench")]
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 8] = [
         Self::Workspace,
         Self::Tool,
         Self::Sandbox,
         Self::Capacity,
         Self::Runnable,
         Self::Model,
+        Self::Checkout,
+        Self::Execute,
     ];
 
     /// The benchmark timing boundary of this envelope of a direct
@@ -192,6 +202,8 @@ impl Envelope {
             Self::Capacity => "verification.direct.capacity",
             Self::Runnable => "verification.direct.runnable",
             Self::Model => "verification.direct.model",
+            Self::Checkout => "verification.direct.checkout",
+            Self::Execute => "verification.direct.execute",
         }
     }
 }
@@ -205,7 +217,7 @@ impl Envelope {
 /// it holds nothing and reads no clock. Without `bench` it is a zero-sized
 /// no-op. Only a direct execution's profile reads it.
 #[derive(Debug, Clone, Default)]
-pub struct Envelopes(#[cfg(feature = "bench")] Option<Arc<Mutex<[Vec<Interval>; 6]>>>);
+pub struct Envelopes(#[cfg(feature = "bench")] Option<Arc<Mutex<[Vec<Interval>; 8]>>>);
 
 impl Envelopes {
     /// A record for a `mode` execution: holding intervals only for a direct
@@ -755,6 +767,8 @@ mod tests {
             (Envelope::Capacity, 86, 90),
             (Envelope::Runnable, 91, 93),
             (Envelope::Runnable, 92, 94),
+            (Envelope::Checkout, 90, 91),
+            (Envelope::Execute, 93, 100),
         ] {
             envelopes.record(envelope, at(start, from), at(start, to));
         }
@@ -792,6 +806,8 @@ mod tests {
             within("verification.direct.runnable", 1, 3, 3),
             "overlapping runnable waits count once"
         );
+        assert!(within("verification.direct.checkout", 1, 1, 1));
+        assert!(within("verification.direct.execute", 1, 7, 7));
         assert!(within("verification.direct.engine", 1, 180, 180));
         assert!(
             within("verification.direct.outside", 2, 20, 30),

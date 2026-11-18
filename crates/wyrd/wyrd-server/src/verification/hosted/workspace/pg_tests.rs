@@ -58,7 +58,18 @@ fn workspace_cleans_up_on_drop() {
 
         let workspace = workspaces.open(&files, &evidence).await.expect("opens");
         let dir = workspace.inputs_dir();
-        assert!(dir.join("a.json").is_file());
+        assert_eq!(
+            std::fs::read(dir.join("a.json")).expect("input"),
+            serde_json::to_vec_pretty(&json!({"a": 1})).expect("encodes"),
+            "the JSON input is placed as its pretty encoding"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.with_file_name("staging"))
+                .expect("staging")
+                .count(),
+            0,
+            "a JSON input leaves no staging file"
+        );
         assert!(dir.starts_with(root.path()), "{}", dir.display());
         assert_eq!(process.memory().used(), 0, "staged bytes end once written");
         let written = std::fs::metadata(dir.join("a.json")).expect("input").len();

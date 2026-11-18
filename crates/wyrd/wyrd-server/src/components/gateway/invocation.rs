@@ -568,6 +568,7 @@ impl<'a> GatewayInvocation<'a> {
         let cancel_on_drop = call_cancel.clone().drop_guard();
         let (head, answer) = oneshot::channel();
         let spawned = Instant::now();
+        telemetry.wait(Wait::Admission, spawned.duration_since(received));
         let task = CallTask {
             state: self.state.clone(),
             call,
@@ -744,6 +745,7 @@ impl<'a> GatewayInvocation<'a> {
         )
         .await
         .map_err(|_| expired(call_id))?;
+        telemetry.wait(Wait::Pressure, started.elapsed());
         let handed = self
             .body
             .lock()
@@ -764,7 +766,10 @@ impl<'a> GatewayInvocation<'a> {
         } else if self.bound.is_some() {
             self.state.bifrost.scribe_outbox().reserve(1).ok()
         } else {
-            Some(self.capture_slot(deadline).await?)
+            let waiting = std::time::Instant::now();
+            let slot = self.capture_slot(deadline).await?;
+            telemetry.wait(Wait::CaptureSlot, waiting.elapsed());
+            Some(slot)
         };
 
         let admitted_at = Utc::now();
@@ -1421,6 +1426,7 @@ impl CallTask {
         // A relayed stream charges the frames it retains to the call.
         let mut memory = self.state.resources.memory().empty_charge();
         memory.attribute(&self.call.operation);
+        let executing = Instant::now();
         let mut execution = self
             .state
             .gateway
@@ -1440,6 +1446,7 @@ impl CallTask {
                 memory: &memory,
             })
             .await;
+        self.telemetry.wait(Wait::Execute, executing.elapsed());
         if !execution.attempts.is_empty() {
             self.telemetry
                 .phase(Phase::Credential, execution.timing.credential);
@@ -1484,6 +1491,7 @@ impl CallTask {
         dispatched: bool,
         head: oneshot::Sender<Answer>,
     ) {
+        let settling = std::time::Instant::now();
         let operation = self.plan.operation;
         let upstream = execution.timing.upstream;
         let accounted = Accounted::new(&self.call.ledger(), &self.admission, &execution);
@@ -1525,6 +1533,7 @@ impl CallTask {
             Err(error) => Err(error),
         };
         record_call(&self.call_span, outcome, answer.is_ok());
+        self.telemetry.wait(Wait::Settle, settling.elapsed());
         // A dropped caller no longer awaits the answer.
         head.send(Answer {
             result: answer,
@@ -1560,6 +1569,7 @@ impl CallTask {
         dispatched: bool,
         head: oneshot::Sender<Answer>,
     ) {
+        let settling = std::time::Instant::now();
         let operation = self.plan.operation;
         let resolved = execution.resolved.clone();
         let timing = execution.timing;
@@ -1567,12 +1577,11 @@ impl CallTask {
         let mut attempts = std::mem::take(&mut execution.attempts);
         let attempt_span = std::mem::replace(&mut execution.attempt_span, tracing::Span::none());
         record_first_byte(operation, self.received);
+        let result =
+            GatewayInvocation::respond(&self.call, execution, self.state.resources.memory());
+        self.telemetry.wait(Wait::Settle, settling.elapsed());
         head.send(Answer {
-            result: GatewayInvocation::respond(
-                &self.call,
-                execution,
-                self.state.resources.memory(),
-            ),
+            result,
             dispatched,
             outcome: opened,
             upstream: timing.until_headers(),

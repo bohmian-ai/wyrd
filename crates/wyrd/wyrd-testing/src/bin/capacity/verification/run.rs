@@ -225,13 +225,15 @@ const NOT_VISIBLE: &str = "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND";
 /// judge Verifier's one tool-less Agent reaches it. They nest in the
 /// engine, overlap across concurrent Agents and each other, and are never
 /// summed or subtracted.
-pub(crate) const ENVELOPES: [(&str, &str, bool); 6] = [
+pub(crate) const ENVELOPES: [(&str, &str, bool); 8] = [
     ("server.workspace", "verification.direct.workspace", false),
     ("server.tool", "verification.direct.tool", false),
     ("server.sandbox", "verification.direct.sandbox", false),
     ("server.capacity", "verification.direct.capacity", false),
     ("server.runnable", "verification.direct.runnable", false),
     ("server.model", "verification.direct.model", true),
+    ("server.checkout", "verification.direct.checkout", false),
+    ("server.execute", "verification.direct.execute", false),
 ];
 
 /// Why a step's Verifier reaches no such envelope.

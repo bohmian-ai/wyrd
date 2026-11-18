@@ -63,7 +63,7 @@ use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arrow::array::{ArrayRef, RecordBatch, StringArray};
 use arrow::compute::concat_batches;
@@ -1101,6 +1101,41 @@ impl wyrd_telemetry::TenantSpanSink for ServerSpanSink {
     }
 }
 
+/// One timed stage of a Scribe outbox write; see
+/// [`crate::app::metrics::SCRIBE_OUTBOX_STAGE_SECONDS`].
+#[derive(Debug, Clone, Copy)]
+enum Stage {
+    /// Projecting a write's rows into frames.
+    Frames,
+    /// A chunk's wait for a delivery permit.
+    Permit,
+    /// A chunk's wait for the blocking pool to start its encoding.
+    EncodeQueue,
+    /// A chunk's encoding.
+    Encode,
+    /// One stream's submission until Scribe answers it.
+    Submit,
+}
+
+impl Stage {
+    /// Records the time since `started` as one observation of this stage,
+    /// only while benchmarking; an ordinary server records nothing.
+    fn since(self, started: Instant) {
+        if !wyrd_benchmark::enabled() {
+            return;
+        }
+        let stage = match self {
+            Self::Frames => "frames",
+            Self::Permit => "permit",
+            Self::EncodeQueue => "encode_queue",
+            Self::Encode => "encode",
+            Self::Submit => "submit",
+        };
+        metrics::histogram!(crate::app::metrics::SCRIBE_OUTBOX_STAGE_SECONDS, "stage" => stage)
+            .record(started.elapsed().as_secs_f64());
+    }
+}
+
 /// Groups, encodes, identifies, and submits one tenant's logical writes.
 pub struct ScribeSink {
     /// Submission route selected at boot; `None` reaches no Scribe.
@@ -1911,20 +1946,27 @@ impl ScribeSink {
         chunk: Chunk,
         attempt: usize,
     ) -> (Vec<Submitted>, Vec<usize>) {
+        let waiting = Instant::now();
         let permit = Arc::clone(&self.deliveries)
             .acquire_owned()
             .await
             .expect("the delivery semaphore is never closed");
+        Stage::Permit.since(waiting);
         let in_process = route.in_process();
         let budget = self.frame_budget;
         #[cfg(test)]
         let hold = self.encoding_hold.clone();
+        let queued = Instant::now();
         let encoding = tokio::task::spawn_blocking(move || {
+            Stage::EncodeQueue.since(queued);
             #[cfg(test)]
             if let Some(hold) = hold {
                 hold.park();
             }
-            let encoded = match chunk.encode(tenant, origin, budget, in_process) {
+            let encoding = Instant::now();
+            let encoded = chunk.encode(tenant, origin, budget, in_process);
+            Stage::Encode.since(encoding);
+            let encoded = match encoded {
                 Ok(streams) => Ok(streams),
                 Err(error) => Err((
                     error,
@@ -1951,7 +1993,9 @@ impl ScribeSink {
         };
         let mut submitted = Vec::with_capacity(streams.len());
         for (batch, owners) in streams {
+            let submitting = Instant::now();
             let result = route.submit(&batch, attempt).await;
+            Stage::Submit.since(submitting);
             let retryable = matches!(result, Err(refusal) if refusal != ScribeRefusal::Rejected);
             submitted.push((result, batch, owners));
             if retryable {
@@ -2125,7 +2169,9 @@ impl OutboxSink for ScribeSink {
         };
         let attempt = self.attempts.fetch_add(1, Ordering::Relaxed);
         let mut lost = BTreeSet::new();
+        let projecting = Instant::now();
         let frames = Self::frames(items, self.frame_budget, &mut lost);
+        Stage::Frames.since(projecting);
         let split = frames.partition_point(|frame| frame.table != ScribeTable::Results);
         let (details, summaries) = frames.split_at(split);
         for phase in [(0, details), (split, summaries)] {

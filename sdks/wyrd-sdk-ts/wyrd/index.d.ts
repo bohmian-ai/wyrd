@@ -209,6 +209,18 @@ export declare class NativeAuthored {
    */
   set(field: string, value: NativeValue): void
   /**
+   * Set this Check's `verdict_transform` from `value`: a policy, typed
+   * now so a malformed one is refused where it is written and the stored
+   * form is the canonical one, or `null`, the omitted policy.
+   *
+   * # Errors
+   *
+   * Returns `InvalidArg` when this value is not a Check or `value` is
+   * not JSON. The shared validator's refusal is the result's catalog
+   * error, and nothing is then set.
+   */
+  setVerdictTransform(value: NativeValue): NativeLifecycleResult
+  /**
    * Append `value` to the list `field`; a repeated ID is refused at
    * validation.
    *

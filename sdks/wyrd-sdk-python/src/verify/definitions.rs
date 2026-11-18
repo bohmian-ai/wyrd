@@ -60,12 +60,28 @@ fn json(field: &str, value: &Bound<'_, PyAny>) -> PyResult<Value> {
 /// transform's JSON form or breaks a rule the policy alone decides, such as
 /// `fail_at` at or above `pass_at`.
 fn transform(field: &str, value: &Bound<'_, PyAny>) -> PyResult<VerdictTransform> {
-    let policy: VerdictTransform = serde_json::from_value(json(field, value)?)
-        .map_err(|error| PyErr::from(invalid_argument(field, error)))?;
-    policy
-        .validate(field)
-        .map_err(wyrd_utils::py::WyrdPyError::from)?;
-    Ok(policy)
+    Ok(VerdictTransform::authored(field, json(field, value)?)
+        .map_err(wyrd_utils::py::WyrdPyError::from)?)
+}
+
+/// Refuse `value`, a `wyrd.verify` transform model or its canonical mapping,
+/// as a `verdict_transform` breaking a rule the policy alone decides; the
+/// typed models run this when they are constructed.
+///
+/// # Errors
+/// As [`transform`].
+#[pyfunction]
+fn validate_verdict_transform(value: &Bound<'_, PyAny>) -> PyResult<()> {
+    transform("verdict_transform", value).map(drop)
+}
+
+/// Register [`validate_verdict_transform`] on the root native module, which
+/// the pure-Python transform models import and whose stub declares it.
+///
+/// # Errors
+/// Returns `PyO3` registration errors.
+pub(crate) fn register_verdict_transform(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_function(wrap_pyfunction!(validate_verdict_transform, module)?)
 }
 
 /// `value` as a Python string.

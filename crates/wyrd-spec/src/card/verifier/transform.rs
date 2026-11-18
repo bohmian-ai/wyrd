@@ -57,7 +57,8 @@ impl<F: PromptForm> From<AgentCall<F>> for AgentCheck<F> {
 
 impl<'de, F: PromptForm> Deserialize<'de> for AgentCheck<F> {
     /// Takes `verdict_transform` out, then decodes the rest as an
-    /// [`AgentCall`], as [`super::CodeCheck`] decodes its call.
+    /// [`AgentCall`], as [`super::CodeCheck`] decodes its call. A `null`
+    /// policy is the omitted one, as the optional schema allows.
     ///
     /// # Errors
     /// Returns the deserializer's error for a non-object, a malformed
@@ -66,6 +67,7 @@ impl<'de, F: PromptForm> Deserialize<'de> for AgentCheck<F> {
         let mut object = Map::<String, Value>::deserialize(deserializer)?;
         let verdict_transform = object
             .remove("verdict_transform")
+            .filter(|policy| !policy.is_null())
             .map(serde_json::from_value)
             .transpose()
             .map_err(serde::de::Error::custom)?;
@@ -253,6 +255,21 @@ impl VerdictTransform {
             Self::Probability(_) => QuestionForm::Noul,
             Self::Score(_) => QuestionForm::Score,
         }
+    }
+
+    /// `value` as a policy authored at `path`: decoded, then checked against
+    /// the rules it alone decides. SDKs run this where a policy is written,
+    /// so a refusal carries the same catalog error as registration.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::Validation`] with rule `verdict_transform`: at
+    /// `path` for a value that is not a policy's JSON form, else as
+    /// [`Self::validate`].
+    pub fn authored(path: &str, value: Value) -> Result<Self, WyrdError> {
+        let policy: Self = serde_json::from_value(value)
+            .map_err(|error| refuse("verdict_transform", path, error))?;
+        policy.validate(path)?;
+        Ok(policy)
     }
 
     /// Checks the rules this value alone decides, reporting fields below
@@ -514,5 +531,31 @@ mod tests {
             }
         }
         assert_eq!(holders, ["AgentCheck"]);
+    }
+
+    /// The optional policy's omitted and `null` forms both decode to the
+    /// same direct-Verdict check, as its schema allows; a malformed non-null
+    /// policy is still refused.
+    ///
+    /// # Panics
+    /// Panics when the null form is refused or decodes otherwise, or a
+    /// malformed policy decodes.
+    #[test]
+    fn agent_check_reads_a_null_policy_as_omitted() {
+        let call = serde_json::json!({
+            "agent": {"kind": "Agent", "name": "judge", "version": "1.0.0"}
+        });
+        let mut null = call.clone();
+        null["verdict_transform"] = Value::Null;
+        let omitted: super::AgentCheck =
+            serde_json::from_value(call.clone()).expect("an omitted policy decodes");
+        let explicit: super::AgentCheck =
+            serde_json::from_value(null).expect("a null policy decodes");
+        assert_eq!(explicit, omitted);
+        assert_eq!(explicit.verdict_transform, None);
+
+        let mut malformed = call;
+        malformed["verdict_transform"] = serde_json::json!({"kind": "choice"});
+        assert!(serde_json::from_value::<super::AgentCheck>(malformed).is_err());
     }
 }

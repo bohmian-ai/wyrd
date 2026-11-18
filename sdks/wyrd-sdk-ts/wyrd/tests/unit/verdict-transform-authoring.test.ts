@@ -76,7 +76,27 @@ test.for([
   [{ kind: "choice", question: " " }, "verdict_transform.question"],
   [{ kind: "verdict", question: "helpful" }, "verdict_transform"],
 ] as const)("verdict_transform refuses %j where it is written", ([transform, field]) => {
-  expect(() => check(transform)).toThrow(field);
+  const error = thrown(() => check(transform));
+  expect(error.code).toBe("WYRD_SPEC_400_VALIDATION");
+  expect(error.status).toBe(400);
+  expect(error.details).toEqual({ rule: "verdict_transform", path: field });
+  expect(error.detail).toContain(field);
+  expect(error.remediation).toBeTruthy();
+});
+
+test("a corrected policy is accepted where the refused one was written", () => {
+  expect(
+    thrown(() => check({ kind: "probability", question: "helpful", expected: true, pass_at: 0.2, fail_at: 0.8 })).code,
+  ).toBe("WYRD_SPEC_400_VALIDATION");
+  desk(check({ kind: "probability", question: "helpful", expected: true, pass_at: 0.8, fail_at: 0.2 })).validate();
+});
+
+test("a null verdict_transform is the omitted policy: the check judges directly", () => {
+  const chat = judge(Prompt.openaiChat("gpt-4o", { messages: "Judge {{context}}" }));
+  const direct = (options: verify.AgentCheckOptions): verify.Check =>
+    Check.agent(chat, { inputs: { context: "inputs.reply" }, ...options });
+  desk(direct({}), chat).validate();
+  desk(direct({ verdict_transform: null }), chat).validate();
 });
 
 test.for([

@@ -417,22 +417,6 @@ fn json(field: &str, value: NativeValue) -> Result<Value> {
     value.json(field)
 }
 
-/// `value` as a canonical verdict transform, typed now so a malformed policy
-/// is refused where it is written and the stored form is the canonical one.
-///
-/// # Errors
-/// Returns `InvalidArg` naming `field` when `value` is not a transform's
-/// JSON form or breaks a rule the policy alone decides, such as `fail_at`
-/// at or above `pass_at`.
-fn transform(field: &str, value: NativeValue) -> Result<VerdictTransform> {
-    let policy: VerdictTransform = serde_json::from_value(value.json(field)?)
-        .map_err(|error| invalid(format!("{field}: {error}")))?;
-    policy
-        .validate(field)
-        .map_err(|error| invalid(error.to_string()))?;
-    Ok(policy)
-}
-
 /// `value` as a string.
 ///
 /// # Errors
@@ -731,7 +715,7 @@ fields! {
         map { inputs, bind_input: json, workspace, add_workspace: field }
     }
     Check {
-        one { runtime: json, response_format: json, verdict_transform: transform }
+        one { runtime: json, response_format: json }
         list {}
         map { inputs, bind_input: json, workspace, add_workspace: field }
     }
@@ -1371,6 +1355,32 @@ impl NativeAuthored {
     pub fn set(&mut self, field: String, value: &NativeValue) -> Result<()> {
         self.inner = self.inner.clone().set(&field, value.clone())?;
         Ok(())
+    }
+
+    /// Set this Check's `verdict_transform` from `value`: a policy, typed
+    /// now so a malformed one is refused where it is written and the stored
+    /// form is the canonical one, or `null`, the omitted policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidArg` when this value is not a Check or `value` is
+    /// not JSON. The shared validator's refusal is the result's catalog
+    /// error, and nothing is then set.
+    #[napi]
+    pub fn set_verdict_transform(&mut self, value: &NativeValue) -> Result<NativeLifecycleResult> {
+        let field = "verdict_transform";
+        let Authored::Check(check) = &self.inner else {
+            return Err(unknown(self.inner.name(), field));
+        };
+        let check = match value.clone().json(field)? {
+            Value::Null => check.clone().verdict_transform(Value::Null),
+            policy => match VerdictTransform::authored(field, policy) {
+                Ok(policy) => check.clone().verdict_transform(policy),
+                Err(error) => return NativeLifecycleResult::outcome(Err::<(), _>(error)),
+            },
+        };
+        self.inner = Authored::Check(check);
+        NativeLifecycleResult::outcome(Ok::<_, WyrdError>(()))
     }
 
     /// Append `value` to the list `field`; a repeated ID is refused at

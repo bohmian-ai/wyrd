@@ -3,16 +3,19 @@
 An Agent check whose Prompt asks decision questions reads one answer through
 its ``verdict_transform`` instead of a returned Verdict. Each model carries its
 ``kind`` discriminator; ``Check.agent(..., verdict_transform=...)`` accepts the
-model or its canonical mapping, and the shared Rust contract validates it.
+model or its canonical mapping, and the shared Rust contract validates it: a
+model when it is constructed, a mapping where it is written.
 
 These models need the ``pydantic`` extra; canonical mappings do not.
 """
 
 from __future__ import annotations
 
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from .._wyrd import validate_verdict_transform
 
 Outcome = Literal["passed", "failed", "inconclusive"]
 """A canonical check outcome."""
@@ -28,15 +31,24 @@ ScalarOperator = Literal[
 """A parameterless scalar comparison operator by its wire name."""
 
 
-class ChoiceTransform(BaseModel):
+class _Transform(BaseModel):
+    """A verdict transform, refused by the shared validator when constructed."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="after")
+    def _validated(self) -> Self:
+        validate_verdict_transform(self)
+        return self
+
+
+class ChoiceTransform(_Transform):
     """Judge a Choice question by its selected label.
 
     Without ``outcomes`` the labels must be ``passed``, ``failed``, and
     ``inconclusive``; with it, every declared label maps to an outcome.
     Confidence never changes the outcome.
     """
-
-    model_config = ConfigDict(extra="forbid")
 
     kind: Literal["choice"] = "choice"
     """The discriminator, always ``choice``."""
@@ -46,14 +58,12 @@ class ChoiceTransform(BaseModel):
     """Every declared option label to its outcome."""
 
 
-class ProbabilityTransform(BaseModel):
+class ProbabilityTransform(_Transform):
     """Threshold a yes/no question's probability.
 
     With ``q`` the probability of ``expected``, the check passes when
     ``q >= pass_at``, fails when ``q <= fail_at``, and is inconclusive between.
     """
-
-    model_config = ConfigDict(extra="forbid")
 
     kind: Literal["probability"] = "probability"
     """The discriminator, always ``probability``."""
@@ -67,10 +77,8 @@ class ProbabilityTransform(BaseModel):
     """The inclusive failing bound, below ``pass_at``."""
 
 
-class ScoreTransform(BaseModel):
+class ScoreTransform(_Transform):
     """Compare a Score question's level index, from 0 for the lowest level, with ``expected``."""
-
-    model_config = ConfigDict(extra="forbid")
 
     kind: Literal["score"] = "score"
     """The discriminator, always ``score``."""

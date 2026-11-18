@@ -32,6 +32,17 @@ def timestamp_format(kind: str) -> str | None:
     """
     ...
 
+def validate_verdict_transform(value: object) -> None:
+    """Refuse a verdict transform that breaks a rule the policy alone decides.
+
+    Args:
+        value: a ``wyrd.verify`` transform model or its canonical mapping.
+
+    Raises:
+        WyrdError: ``WYRD_SPEC_400_VALIDATION`` naming the offending field.
+    """
+    ...
+
 class CardRefLike(Protocol):
     """Object that can be represented as a Wyrd card reference.
 

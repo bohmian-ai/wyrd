@@ -59,6 +59,7 @@ fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     wyrd_utils::py::register_wyrd_error_exception(m)?;
     cli::register_entrypoint(m)?;
     bifrost::register_timestamp_format(m)?;
+    verify::definitions::register_verdict_transform(m)?;
 
     wyrd_cards::register(py, m)?;
     state::register_cards(&m.getattr("cards")?.cast_into()?)?;

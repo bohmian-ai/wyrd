@@ -2200,15 +2200,23 @@ export class Check {
   }
 
   /**
-   * Judge with `agent`, which returns the Verdict schema.
+   * Judge with `agent`, which returns the Verdict schema, or a fixed decision
+   * answer that `options.verdict_transform` converts; `null` omits the policy.
    *
    * @param agent - The Agent.
    * @param options - Other fields, each set as its setter sets it.
    * @returns The check.
+   * @throws a `WYRD_SPEC_400_VALIDATION` {@link WyrdError} naming the field of a
+   * policy that breaks a rule it alone decides, such as `fail_at` at or above
+   * `pass_at`.
    */
   static agent(agent: Authorable<Wire.CheckAgent["agent"]>, options: AgentCheckOptions = {}): Check {
+    const { verdict_transform: policy, ...fields } = options;
     const check = adopt(Check.prototype, NativeAuthored.checkAgent(argument("agent", agent)));
-    apply(check, options);
+    apply(check, fields);
+    if (policy !== undefined) {
+      lifecycleValue<null>(authoredOf(check).setVerdictTransform(argument("verdict_transform", policy)));
+    }
     return check;
   }
 

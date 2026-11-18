@@ -127,6 +127,35 @@ def test_verdict_transform_refuses_a_malformed_policy_where_it_is_written(
 
 
 @pytest.mark.parametrize(
+    ("pass_at", "fail_at", "path"),
+    [
+        (0.2, 0.8, "verdict_transform.fail_at"),
+        (1.5, 0.1, "verdict_transform.fail_at"),
+        (float("nan"), 0.1, "verdict_transform"),
+    ],
+)
+def test_a_typed_probability_transform_refuses_invalid_bounds_at_construction(
+    pass_at: float, fail_at: float, path: str
+) -> None:
+    from wyrd.verify import ProbabilityTransform
+
+    with pytest.raises(WyrdError) as refused:
+        ProbabilityTransform(question="helpful", expected=True, pass_at=pass_at, fail_at=fail_at)
+
+    assert refused.value.code == "WYRD_SPEC_400_VALIDATION"
+    assert refused.value.details == {"rule": "verdict_transform", "path": path}
+    assert refused.value.remediation
+
+
+def test_a_corrected_typed_probability_transform_validates() -> None:
+    from wyrd.verify import ProbabilityTransform
+
+    policy = ProbabilityTransform(question="helpful", expected=True, pass_at=0.8, fail_at=0.2)
+
+    desk(verifier(check(policy.model_dump()))).validate()
+
+
+@pytest.mark.parametrize(
     ("transform", "field"),
     [
         ({"kind": "choice", "question": "tone"}, f"{CHECK}.question"),

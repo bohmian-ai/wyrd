@@ -914,6 +914,34 @@ import { load as loadGithub } from '../routes/t/[tenantKey]/settings/integration
 import GithubPage from '../routes/t/[tenantKey]/settings/integrations/github/+page.svelte';
 import { connectionExecutor } from '$lib/ui-fixtures';
 
+test('navigating away cancels the supporting reads a refresh is still streaming', async () => {
+  // Supporting reads hang until their request is cancelled; each records the signal it was given.
+  const signals: AbortSignal[] = [];
+  const supporting = (request: WireRequest) => request.op === 'cards.list' || (request.op === 'bifrost.query' && /GROUPING SETS|grouping\(at\)/.test(request.sql));
+  host.executor = {
+    run: async (batch, signal) => {
+      if (!batch.some(supporting)) return fixtureExecutor.run(batch, signal);
+      if (signal) signals.push(signal);
+      return new Promise((_, reject) => signal?.addEventListener('abort', () => reject(signal.reason)));
+    }
+  };
+  const leave = new AbortController();
+  const event = (path: string) => {
+    const url = new URL(`http://ui.test/t/acme/${path}`);
+    return { locals: { browserSession: { client: () => ({}) } }, url, request: new Request(url, { signal: leave.signal }), depends: () => {}, isDataRequest: true } as never;
+  };
+  type Streamed = { support: Promise<unknown> };
+  const verify = ((await loadVerify(event('verify'))) as unknown as { verify: Streamed }).verify;
+  const observe = ((await loadObserve(event('observe'))) as unknown as { observe: Streamed }).observe;
+  expect(signals.length).toBeGreaterThan(0);
+  expect(signals.some((signal) => signal.aborted)).toBe(false);
+
+  leave.abort();
+  expect(signals.every((signal) => signal.aborted)).toBe(true);
+  await expect(verify.support).rejects.toBeDefined();
+  await expect(observe.support).rejects.toBeDefined();
+});
+
 test('a client refresh returns its list while supporting reads are still pending', async () => {
   // Facets, overview, discovery and Card names wait until released; the list answers at once.
   let release = () => {};

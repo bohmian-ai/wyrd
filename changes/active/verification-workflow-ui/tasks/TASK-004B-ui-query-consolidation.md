@@ -293,7 +293,13 @@ request budgets implement the maintainer-selected optimization.
      `invalidate` (Verify and Observe).
    - Real server: `ui-pages.integration.test.ts` 12/13 GREEN; the Verify journey fails
      before its first page load in hosted-memory setup (see scenario 3).
-   - Not yet exercised: navigate-away cancellation and Back/URL restore under streaming.
+   - Cancellation: "navigating away cancels the supporting reads a refresh is still
+     streaming" (`ui-pages.test.ts`, GREEN on first run; regression, no RED): supporting
+     reads carry the request's signal, so aborting the request aborts every pending one
+     and both streamed `support` promises reject; the list had already returned.
+   - Back/URL restore under streaming: `ui-pages.integration.test.ts` Observe journeys
+     (Open in Query then Back, zoom then Back and reload, Open trace then Back to the same
+     log record) GREEN through the production BFF with client navigations streaming.
 6. **Authorization, terminal failure and supported hosts remain honest.** Exercise
    foreign IDs/tenants, restricted Verifier access, denied tables, unavailable
    dependencies and failed/incomplete query terminals through real Node/MCP/

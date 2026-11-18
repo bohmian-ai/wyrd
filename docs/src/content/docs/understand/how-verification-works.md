@@ -187,7 +187,7 @@ The whole call is bounded by `WYRD_VERIFICATION_TIMEOUT_MS`, 60 seconds by defau
 
 ## What Wyrd retains, and how requirements change
 
-Returning the verdict does not wait for its record, so storage never slows the request. The server queues the result and its pinned inputs in memory and answers. It batches queued records for at most 50 ms, then writes them to Bifrost's write-ahead log; once written they survive a crash, and they become queryable shortly after. A clean shutdown writes everything still queued. Only an abrupt server stop before that write loses a record; the verdict the application received still stands, and the loss is counted.
+Wyrd returns the verdict, then writes its record in the background, so storage does not slow the request. Once committed to Bifrost's write-ahead log, the record is durable; a server stop or write failure before that can lose it. Either way, the verdict the application received stands.
 
 Stored results live in three Bifrost tables, all queryable with SQL: each result's summary in `bifrost.verification.results`, its requirement outcomes and steps in `bifrost.verification.execution_outputs`, and its inputs in `bifrost.verification.execution_inputs`. The result the call returns is compact: the verdict and each requirement's outcome. The checks, provenance, step outputs, and pinned evidence stay in storage for later inspection, as the Quickstart's [stored verdicts](/get-started/quickstart/#4-confirm-the-stored-verdicts) step shows. [Runs and evidence](/understand/runs-observations-and-evidence/) and [Bifrost](/understand/bifrost/) explain retention and query visibility.
 

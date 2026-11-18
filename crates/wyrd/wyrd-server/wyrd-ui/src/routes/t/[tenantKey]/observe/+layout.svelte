@@ -4,8 +4,14 @@
   the server load returned. Every control navigates, so the investigation
   survives reload, Back and a shared link; Live re-runs the same load.
 -->
+<script lang="ts" module>
+  /** Each address's last settled sections, outliving a mount so Back keeps the page's height. */
+  const remembered = new Map<string, unknown>();
+</script>
+
 <script lang="ts">
   import { enhance } from '$app/forms';
+  import { untrack } from 'svelte';
   import { goto, invalidate } from '$app/navigation';
   import { page } from '$app/state';
   import { Chart, Drawer, EmptyState, FacetRail, RecordTable, fmtDuration, fmtNumber, type ActionIntent, type ActionState, type Problem } from 'wyrd-ai-ui';
@@ -32,8 +38,8 @@
   const view = $derived('problem' in observe ? undefined : observe);
   /** Overview, timeline, facets and metric names: in the first HTML, then streamed after the list on each navigation and refresh. */
   type Support = Awaited<NonNullable<typeof view>['support']>;
-  const streamed = new Streamed<Support>();
-  $effect.pre(() => streamed.follow(view?.support));
+  const streamed = new Streamed<Support>(remembered as Map<string, Support>);
+  $effect.pre(() => streamed.follow(view?.support, untrack(() => page.url.href)));
   const support = $derived(!view || view.support instanceof Promise ? streamed.value : view.support);
   const form = $derived(page.form as { draft?: string; problem?: Problem } | null);
 

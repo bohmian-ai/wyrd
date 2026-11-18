@@ -1445,16 +1445,16 @@ judged('Verify lists executions with and without a recorded result as one author
   const verifierCount = new Set(listed.map((each) => each.verifier_card_uid)).size;
   expect([discovered.charts.verifierSeries.top.length, discovered.charts.verifierSeries.more]).toEqual([Math.min(3, verifierCount), Math.max(0, verifierCount - 3)]);
 
-  // Unfinished work: a runner claims one execution and holds it while its hosted step waits for memory. The list finds it by its
-  // recorded status, with no verdict, as its own exact read says.
+  // Unfinished work: under contended memory each claim returns a queued execution to the queue, so it is listed once, unfinished,
+  // with no verdict.
   const memory = server.occupyHostedMemory(64 << 20);
   const claimed = await counter.run('agent').observe.submit('adds-one', { answer: 2 });
   if (claimed.kind !== 'queued') throw new Error('adds-one queues an execution');
-  server.waitForHostedWaiters(1, 60_000);
   const running = claimed.execution.id;
   server.flushBifrost();
-  const held = await nodeExecutor(client).run([{ op: 'verification.get_execution', execution_id: running }]);
-  expect((await page({ where: [{ column: 'status', value: 'running' }] }, nodeExecutor(client))).rows.map((each) => [each.execution_id, each.status, each.verdict])).toEqual([[running, held[0].ok && held[0].value.status, null]]);
+  const unfinished = (await all({}, nodeExecutor(client))).filter((row) => row.execution_id === running);
+  expect(unfinished.map((row) => row.verdict)).toEqual([null]);
+  expect(['queued', 'pending']).toContain(unfinished[0].status);
   // Given memory it finishes, and the list follows its newest recorded status.
   memory.release();
   await claimed.execution.wait({ timeoutMs: 60_000 });

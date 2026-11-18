@@ -7,8 +7,15 @@
   here at the same position. The WHERE box is a read-only projection of the
   applied filters.
 -->
+<script lang="ts" module>
+  /** Each address's last settled sections, outliving a mount so Back keeps the page's height. */
+  const remembered = new Map<string, unknown>();
+</script>
+
 <script lang="ts">
+  import { untrack } from 'svelte';
   import { goto, invalidate } from '$app/navigation';
+  import { page } from '$app/state';
   import { Chart, EmptyState, FacetRail, RecordTable, type ActionIntent, type ActionState } from 'wyrd-ai-ui';
   import { NO_VERDICT, validateIntent, type ChartProps, type ComponentName } from 'wyrd-ai-ui/loaders';
   import TimePicker, { type PickedRange, type Zone } from '$lib/TimePicker.svelte';
@@ -30,8 +37,8 @@
   const verify = $derived(data.verify);
   /** Facets, charts and Verifier names: in the first HTML, then streamed after the list on each navigation and refresh. */
   type Support = Awaited<Extract<typeof data.verify, { support: unknown }>['support']>;
-  const streamed = new Streamed<Support>();
-  $effect.pre(() => streamed.follow('problem' in verify ? undefined : verify.support));
+  const streamed = new Streamed<Support>(remembered as Map<string, Support>);
+  $effect.pre(() => streamed.follow('problem' in verify ? undefined : verify.support, untrack(() => page.url.href)));
   const support = $derived('problem' in verify || verify.support instanceof Promise ? streamed.value : verify.support);
   const labels = $derived(support?.labels ?? {});
   const where = $derived(whereText(current));

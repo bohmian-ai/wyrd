@@ -297,6 +297,15 @@ request budgets implement the maintainer-selected optimization.
      streaming" (`ui-pages.test.ts`, GREEN on first run; regression, no RED): supporting
      reads carry the request's signal, so aborting the request aborts every pending one
      and both streamed `support` promises reject; the list had already returned.
+   - Back scroll under streaming: the Verify journey RED "expected 570 to be 667" (Back
+     restored scroll before the streamed charts and rail rendered, so the page was
+     shorter); GREEN with streaming off, confirming the cause. SvelteKit restores
+     snapshots after scrolling, so a snapshot cannot fix it. Fix: `Streamed` remembers each
+     address's last settled sections (module scope, 10 addresses, address includes the
+     tenant) and a fresh mount shows them until the newest load settles
+     (`streamed.test.ts` "a remounted page shows the last section its address settled";
+     written with the fix, no separate RED). Streamed charts, totals and Card names are
+     polled in the Verify journey.
    - Back/URL restore under streaming: `ui-pages.integration.test.ts` Observe journeys
      (Open in Query then Back, zoom then Back and reload, Open trace then Back to the same
      log record) GREEN through the production BFF with client navigations streaming.
@@ -318,14 +327,26 @@ request budgets implement the maintainer-selected optimization.
      first HTML, malformed range refused before reads, empty range truthful.
    - A support failure keeps the list: streamed sections show their own error
      (`streamed.test.ts`); refused predicates refuse only that refresh's panels.
-   - Both reds are the Verify journeys' hosted-runner step ("1 hosted operations never
-     waited for memory within 60s"). Not caused by this task: the TypeScript SDK's own
-     `tests/integration/verification-capacity.test.ts` fails the same 3 ways after
-     `mise run ts:build:testing`. Since `02efe81fc` hosted operations wait only on
-     process-pressure admission; `occupy_hosted_memory` charges the ledger, which now
-     refuses or admits at once, so nothing waits. Owner: the shared-resource hosting
-     work (github-verifier-pipelines TASK-012), whose harness needs to make
-     `occupy_hosted_memory` raise sampled pressure (or hold `hold_admission_for_test`).
+   - The Verify journeys' hosted-runner setup was red ("1 hosted operations never waited
+     for memory within 60s"), as were the SDK capacity suites. Cause: since `02efe81fc`
+     hosted work waits only when sampled pressure pauses its workload, and the test hold
+     was unattributed, so verification never exceeded its share; a verify racing the
+     100 ms sampler also saw no pressure. Fix at the shared owner
+     (`Sandbox::occupy_for_test`): attribute the hold to the verification workload and
+     sample once on taking it. Rust `verification_capacity::verify_waits_for_hosted_memory_then_passes`
+     RED (timeout) then GREEN 3/3. Queued executions under pressure return to the queue
+     (wyrd-design "A queued execution refused capacity returns to the queue"), so the UI
+     journeys now assert the deferred execution listed unfinished (queued or pending, no
+     verdict) instead of waiting for a hosted waiter, then completed once memory frees.
+   - Still red outside this task: the SDK `submit_defers_under_hosted_memory_then_passes`
+     (expects a hosted waiter for queued work) and `verify_refusals_follow_the_arrival_deadline`
+     (expects an immediate 503 under full memory; full memory now pauses to the 504
+     deadline) in Rust/Python/TypeScript. Both encode pre-`02efe81fc` semantics; owner:
+     github-verifier-pipelines TASK-012.
+   - Full command `WYRD_UI_INTEGRATION=1 pnpm test src/lib/ui-library.integration.test.ts
+     src/lib/ui-pages.integration.test.ts`: 29/29 GREEN. One earlier run failed
+     "development environment lifecycle" at the Cards navigation under host load; it
+     passed alone and in the next full run.
 7. **Verify execution work using existing engine diagnostics.** In the existing
    real-server integration tests, execute original and consolidated bundles on
    the same populated fixture and fixed inputs. Apply [query verification](../design/query-verification.md)

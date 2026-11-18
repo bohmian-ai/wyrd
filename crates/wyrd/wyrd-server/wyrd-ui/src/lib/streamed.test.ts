@@ -6,10 +6,10 @@ test('a streamed section keeps the newest load: older results and failures never
   const section = new Streamed<string>();
   let older = (_: string) => {};
   let fail = (_: Error) => {};
-  section.follow('first');
-  section.follow(new Promise<string>((resolve) => (older = resolve)));
+  section.follow('first', '/t/acme/verify');
+  section.follow(new Promise<string>((resolve) => (older = resolve)), '/t/acme/verify');
   const newest = new Promise<string>((_, reject) => (fail = reject));
-  section.follow(newest);
+  section.follow(newest, '/t/acme/verify');
   // Until the newest settles, the previous value stays; a superseded result is ignored.
   older('stale');
   await Promise.resolve();
@@ -20,4 +20,25 @@ test('a streamed section keeps the newest load: older results and failures never
   await Promise.resolve();
   expect(section.value).toBeUndefined();
   expect(section.problem).toMatchObject({ detail: 'connection reset' });
+});
+
+test('a remounted page shows the last section its address settled until the newest load settles', async () => {
+  const remembered = new Map<string, string>();
+  const first = new Streamed<string>(remembered);
+  first.follow(Promise.resolve('dashboard'), '/t/acme/verify');
+  await Promise.resolve();
+  await Promise.resolve();
+  // Back remounts the page: it shows the remembered section at once, never another address's.
+  let fresh = (_: string) => {};
+  const newest = new Promise<string>((resolve) => (fresh = resolve));
+  const back = new Streamed<string>(remembered);
+  back.follow(newest, '/t/acme/verify');
+  expect(back.value).toBe('dashboard');
+  const elsewhere = new Streamed<string>(remembered);
+  elsewhere.follow(new Promise<string>(() => {}), '/t/other/verify');
+  expect(elsewhere.value).toBeUndefined();
+  fresh('current');
+  await newest;
+  await Promise.resolve();
+  expect(back.value).toBe('current');
 });

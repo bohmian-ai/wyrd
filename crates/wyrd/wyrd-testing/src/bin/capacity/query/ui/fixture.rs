@@ -10,7 +10,8 @@
 //! child-only match selects roots of other services; optional attributes,
 //! correlations and event names stay null on a fixed share of rows.
 
-use std::collections::BTreeMap;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet};
 
 use num_traits::ToPrimitive;
 
@@ -30,6 +31,7 @@ use wyrd_tonic::otlp::trace::v1::status::StatusCode;
 use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span, Status};
 use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
 
+use super::seed::Known;
 use crate::query::telemetry::{attribute, text};
 use crate::query::workload::mix;
 
@@ -488,7 +490,7 @@ impl Journey {
         let mut series = 0;
         for q in 0..self.routes {
             let start = Self::cumulative_start(q, j);
-            let counted = self.started(Some(q), start, Self::export_time(j, 0));
+            let counted = self.counter(q, j);
             let time = Self::export_time(j, series);
             let route = vec![text("route", format!("/r{q:02}"))];
             resources.entry(metric_service(q)).or_default().extend([
@@ -511,12 +513,10 @@ impl Journey {
                     name: METRIC.to_owned(),
                     unit: "ms".to_owned(),
                     data: Some(Data::Histogram(Histogram {
-                        data_points: vec![self.histogram(
-                            route,
-                            q,
-                            start,
-                            Self::export_time(j, series + 1),
-                        )],
+                        data_points: vec![HistogramDataPoint {
+                            attributes: route,
+                            ..self.histogram(q, j)
+                        }],
                         aggregation_temporality: AggregationTemporality::Cumulative as i32,
                     })),
                     ..Metric::default()
@@ -640,8 +640,22 @@ impl Journey {
         EXPORTS * (2 * self.routes + 3)
     }
 
-    /// Route `q`'s cumulative histogram point since `start` at `time`.
-    fn histogram(self, route: Vec<KeyValue>, q: i64, start: i64, time: i64) -> HistogramDataPoint {
+    /// Route `q`'s cumulative counter at export `j`: its requests started
+    /// since the series' cumulative start.
+    #[must_use]
+    pub fn counter(self, q: i64, j: i64) -> i64 {
+        self.started(
+            Some(q),
+            Self::cumulative_start(q, j),
+            Self::export_time(j, 0),
+        )
+    }
+
+    /// Route `q`'s cumulative histogram point at export `j`, without
+    /// attributes; it exports one millisecond after the route's counter.
+    fn histogram(self, q: i64, j: i64) -> HistogramDataPoint {
+        let start = Self::cumulative_start(q, j);
+        let time = Self::export_time(j, 2 * q + 1);
         let mut counts = vec![0_u64; BOUNDS.len() + 1];
         let mut sum = 0.0;
         let mut count = 0;
@@ -651,7 +665,6 @@ impl Journey {
             count += 1;
         }
         HistogramDataPoint {
-            attributes: route,
             start_time_unix_nano: start.cast_unsigned(),
             time_unix_nano: time.cast_unsigned(),
             count,
@@ -659,6 +672,387 @@ impl Journey {
             bucket_counts: counts,
             explicit_bounds: BOUNDS.to_vec(),
             ..HistogramDataPoint::default()
+        }
+    }
+}
+
+/// The catalog's 1-minute bins over the hour.
+const MINUTES: i64 = 60;
+
+/// How many `width`-second bins hold at least one of `times`.
+fn bins(times: impl Iterator<Item = i64>, width: i64) -> usize {
+    times
+        .map(|time| (time - HOUR_START_NANOS).div_euclid(width * 1_000_000_000))
+        .collect::<BTreeSet<_>>()
+        .len()
+}
+
+/// A facet over `counts` as the catalog orders it: `n` descending, then
+/// value ascending with null last, at most 11 rows. Numeric values compare
+/// as text, which is their numeric order at one width.
+fn facet(counts: BTreeMap<Option<String>, i64>) -> Vec<Known> {
+    let mut rows: Vec<_> = counts.into_iter().collect();
+    rows.sort_by(|(a, n), (b, m)| {
+        m.cmp(n)
+            .then_with(|| (a.is_none(), a).cmp(&(b.is_none(), b)))
+    });
+    rows.truncate(11);
+    let (values, counts) = rows
+        .into_iter()
+        .map(|(value, n)| (value, Some(n.to_string())))
+        .unzip();
+    vec![Known::Cells("value", values), Known::Cells("n", counts)]
+}
+
+/// What the catalog counts from cumulative `points` (compared value,
+/// summed value), one per export, of route `q` read from `from`: the
+/// first point counts whole only when its cumulative start is not before
+/// `from`, and each later point counts its increase over the one before,
+/// or whole when its start moved or its compared value fell.
+fn increase(q: i64, from: i64, points: &[(f64, f64)]) -> f64 {
+    let mut total = match points.first() {
+        Some((_, value)) if Journey::cumulative_start(q, 0) >= from => *value,
+        _ => 0.0,
+    };
+    for (j, pair) in (1..).zip(points.windows(2)) {
+        let [(before, earlier), (now, value)] = [pair[0], pair[1]];
+        let kept = Journey::cumulative_start(q, j) == Journey::cumulative_start(q, j - 1);
+        total += if kept && now >= before {
+            value - earlier
+        } else {
+            value
+        };
+    }
+    total
+}
+
+/// The integer gauge's last value in each `width`-second bin of the hour,
+/// summed.
+fn gauge_lasts(width: i64) -> f64 {
+    (1..=3_600 / width)
+        .map(|bin| (GAUGE_BASE + 3 * (bin * width / EXPORT_SECONDS - 1)) as f64)
+        .sum()
+}
+
+impl Journey {
+    /// Spans `(r, k)`, roots only or all, as the trace lists order them:
+    /// start descending, then trace and span id ascending.
+    fn listed(self, roots: bool) -> Vec<(i64, i64)> {
+        let mut rows: Vec<_> = (0..self.requests)
+            .flat_map(|r| (0..if roots { 1 } else { spans(r) }).map(move |k| (r, k)))
+            .map(|(r, k)| {
+                (
+                    Reverse(span_start(self, r, k)),
+                    hex::encode(trace_id(r)),
+                    hex::encode(span_id(r, k)),
+                    (r, k),
+                )
+            })
+            .collect();
+        rows.sort();
+        rows.into_iter().map(|(.., at)| at).collect()
+    }
+
+    /// Spans whose status is an error.
+    fn error_spans(self) -> i64 {
+        (0..self.requests)
+            .map(|r| {
+                (0..spans(r))
+                    .filter(|k| status(r, *k) == StatusCode::Error as i32)
+                    .count()
+            })
+            .sum::<usize>()
+            .to_i64()
+            .unwrap_or(i64::MAX)
+    }
+
+    /// Logs `(r, l)`: each request's completion log, then its error log.
+    fn logs(self) -> impl Iterator<Item = (i64, i64)> {
+        (0..self.requests)
+            .flat_map(|r| std::iter::once((r, 0)).chain(logs_error(r).then_some((r, 1))))
+    }
+
+    /// A trace facet: per `value` of any span, the traces holding it.
+    fn trace_facet(self, value: impl Fn(i64, i64) -> Option<String>) -> Vec<Known> {
+        let mut counts = BTreeMap::new();
+        for r in 0..self.requests {
+            for held in (0..spans(r)).map(|k| value(r, k)).collect::<BTreeSet<_>>() {
+                *counts.entry(held).or_insert(0) += 1;
+            }
+        }
+        facet(counts)
+    }
+
+    /// A log facet: per `value`, the logs holding it.
+    fn log_facet(self, value: impl Fn(i64, i64) -> Option<String>) -> Vec<Known> {
+        let mut counts = BTreeMap::new();
+        for (r, l) in self.logs() {
+            *counts.entry(value(r, l)).or_insert(0) += 1;
+        }
+        facet(counts)
+    }
+
+    /// The counters' increase over the hour read from `from`, per `per`
+    /// seconds, every route summed.
+    fn counter_rate(self, from: i64, per: f64) -> f64 {
+        (0..self.routes)
+            .map(|q| {
+                let points: Vec<_> = (0..EXPORTS)
+                    .map(|j| (self.counter(q, j) as f64, self.counter(q, j) as f64))
+                    .collect();
+                increase(q, from, &points)
+            })
+            .sum::<f64>()
+            / per
+    }
+
+    /// The histograms' counted requests and summed milliseconds over the
+    /// hour, every route summed.
+    fn histogram_total(self) -> (f64, f64) {
+        (0..self.routes).fold((0.0, 0.0), |(count, sum), q| {
+            let points: Vec<_> = (0..EXPORTS).map(|j| self.histogram(q, j)).collect();
+            let counted = |value: fn(&HistogramDataPoint) -> f64| {
+                let pairs: Vec<_> = points
+                    .iter()
+                    .map(|point| (point.count as f64, value(point)))
+                    .collect();
+                increase(q, HOUR_START_NANOS, &pairs)
+            };
+            (
+                count + counted(|point| point.count as f64),
+                sum + counted(|point| point.sum.unwrap_or_default()),
+            )
+        })
+    }
+
+    /// The chart totals: the cumulative counters' rate per `per` seconds
+    /// read from `from`, the delta counter's, and the integer gauge's last
+    /// value per `per`-second bin.
+    fn chart(self, from: i64, per: i64, counters: bool) -> Vec<Known> {
+        let width = per as f64;
+        let mut totals = vec![
+            Known::Total(
+                "value",
+                ("aggregation_temporality", "1"),
+                6.0 * EXPORTS as f64 / width,
+            ),
+            Known::Total("value", ("unit", "By"), gauge_lasts(per)),
+        ];
+        if counters {
+            totals.push(Known::Total(
+                "value",
+                ("aggregation_temporality", "2"),
+                self.counter_rate(from, width),
+            ));
+        }
+        totals
+    }
+
+    /// The newest `n` metric points' names and integer values, newest
+    /// first.
+    fn newest_points(self, n: usize) -> Vec<Known> {
+        let delta = 2 * self.routes;
+        let (names, values): (Vec<_>, Vec<_>) = (0..EXPORTS)
+            .rev()
+            .flat_map(|j| (0..=delta + 2).rev().map(move |k| (j, k)))
+            .take(n)
+            .map(|(j, k)| {
+                let value = match k {
+                    _ if k == delta => Some(6),
+                    _ if k == delta + 1 => Some(GAUGE_BASE + 3 * j),
+                    _ if k < delta && k % 2 == 0 => Some(self.counter(k / 2, j)),
+                    _ => None,
+                };
+                let name = if k == delta + 2 { CPU_METRIC } else { METRIC };
+                (Some(name.to_owned()), value.map(|value| value.to_string()))
+            })
+            .unzip();
+        vec![
+            Known::Cells("metric_name", names),
+            Known::Cells("int_value", values),
+        ]
+    }
+
+    /// What catalog statement `id` must answer over the journey's hour:
+    /// counts, lists and totals computed from the model the journey
+    /// exports; empty for a statement only its recorded answer checks
+    /// (the approximate percentiles). Dependent statements bind the first
+    /// rows of their lists, so their expectations follow the same rows. The
+    /// series table keeps a row per series per export, so the group-keys
+    /// limit of 100 always binds.
+    #[must_use]
+    pub fn known(self, id: &str) -> Vec<Known> {
+        let count = |n: i64| Some(n.to_string());
+        let traces = |rows: &[(i64, i64)]| {
+            rows.iter()
+                .map(|(r, _)| Some(hex::encode(trace_id(*r))))
+                .collect::<Vec<_>>()
+        };
+        let span_bins = || {
+            bins(
+                (0..self.requests).flat_map(|r| (0..spans(r)).map(move |k| span_start(self, r, k))),
+                MINUTES,
+            )
+        };
+        let root_bins = || bins((0..self.requests).map(|r| self.start(r)), MINUTES);
+        let (requests, all, errors, logs) = (
+            self.requests,
+            self.span_rows(),
+            self.error_spans(),
+            self.log_rows(),
+        );
+        let error_logs = logs - requests;
+        let points = self.point_rows();
+        let charted = self.routes + 2 <= 20;
+        let day_from = HOUR_START_NANOS + HOUR_NANOS - 24 * HOUR_NANOS;
+        match id {
+            "trace-spans" => vec![Known::Sum("spans", all as f64), Known::Rows(span_bins())],
+            "trace-errors" => vec![
+                Known::Sum("errors", errors as f64),
+                Known::Rows(span_bins()),
+            ],
+            "trace-duration" | "stat-duration_p95-buckets" => vec![Known::Rows(root_bins())],
+            "trace-durations"
+            | "stat-duration_p95-total"
+            | "span-detail"
+            | "log-detail"
+            | "metrics-labels" => vec![Known::Rows(1)],
+            "trace-totals" => vec![
+                Known::Cells("spans", vec![count(all)]),
+                Known::Cells("traces", vec![count(requests)]),
+                Known::Cells(
+                    "error_traces",
+                    vec![count(
+                        (0..requests)
+                            .filter(|r| r % 17 == 0 || r % 11 == 0)
+                            .count()
+                            .to_i64()
+                            .unwrap_or(i64::MAX),
+                    )],
+                ),
+            ],
+            "trace-facet-service_name" => self.trace_facet(|r, k| Some(service(r, k).to_owned())),
+            "trace-facet-name" => self.trace_facet(|r, k| Some(span_name(r, k))),
+            "trace-facet-status_code" => self.trace_facet(|r, k| Some(status(r, k).to_string())),
+            "trace-facet-http_response_status_code" => {
+                self.trace_facet(|r, k| http_status(r, k).map(|code| code.to_string()))
+            }
+            "trace-facet-gen_ai_operation_name" => {
+                self.trace_facet(|r, k| operation(r, k).map(str::to_owned))
+            }
+            "trace-list" => {
+                vec![Known::Cells("trace_id", traces(&self.listed(true)[..51]))]
+            }
+            "trace-counts" => {
+                let roots = self.listed(true);
+                vec![
+                    Known::Rows(2),
+                    Known::Sum("spans", (spans(roots[0].0) + spans(roots[1].0)) as f64),
+                ]
+            }
+            "trace-page-after" => {
+                vec![Known::Cells(
+                    "trace_id",
+                    traces(&self.listed(true)[50..101]),
+                )]
+            }
+            "trace-page-before" => {
+                let mut before = traces(&self.listed(true)[..49]);
+                before.reverse();
+                vec![Known::Cells("trace_id", before)]
+            }
+            "trace-child-match" => {
+                let matched: Vec<_> = self
+                    .listed(true)
+                    .into_iter()
+                    .filter(|(r, _)| (1..spans(*r)).any(|k| service(*r, k) == CHILD_SERVICE))
+                    .take(51)
+                    .collect();
+                vec![Known::Cells("trace_id", traces(&matched))]
+            }
+            "trace-waterfall" => vec![Known::Rows(
+                usize::try_from(spans(self.listed(true)[0].0)).unwrap_or(0),
+            )],
+            "spans-list" => vec![Known::Cells(
+                "span_id",
+                self.listed(false)[..51]
+                    .iter()
+                    .map(|(r, k)| Some(hex::encode(span_id(*r, *k))))
+                    .collect(),
+            )],
+            "stat-traces-total" => vec![Known::Cells("value", vec![count(requests)])],
+            "stat-traces-buckets" => vec![
+                Known::Sum("value", requests as f64),
+                Known::Rows(root_bins()),
+            ],
+            "stat-spans-total" => vec![Known::Cells("value", vec![count(all)])],
+            "stat-spans-buckets" => vec![Known::Sum("value", all as f64), Known::Rows(span_bins())],
+            "stat-errors-total" => vec![Known::Cells("value", vec![count(errors)])],
+            "stat-errors-buckets" => vec![Known::Sum("value", errors as f64)],
+            "logs-list" => {
+                let mut newest: Vec<_> = self.logs().collect();
+                newest.sort_by_key(|(r, l)| Reverse(log_time(self, *r, *l)));
+                vec![Known::Cells(
+                    "body_text",
+                    newest[..51]
+                        .iter()
+                        .map(|(r, l)| {
+                            Some(format!(
+                                "request {r} {}",
+                                if *l == 1 { "failed" } else { "handled" }
+                            ))
+                        })
+                        .collect(),
+                )]
+            }
+            "logs-timeline" => vec![Known::Sum("records", logs as f64)],
+            "logs-facet-severity_text" => self
+                .log_facet(|r, l| Some((if l == 1 { "ERROR" } else { severity(r).1 }).to_owned())),
+            "logs-facet-service_name" => self.log_facet(|r, _| Some(service(r, 0).to_owned())),
+            "logs-facet-event_name" => {
+                self.log_facet(|r, l| (l == 0).then(|| event_name(r)).flatten().map(str::to_owned))
+            }
+            "logs-facet-exception_type" => {
+                self.log_facet(|r, l| (l == 1).then(|| exception(r).to_owned()))
+            }
+            "stat-logs-total" => vec![Known::Cells("value", vec![count(logs)])],
+            "stat-logs-buckets" => vec![Known::Sum("value", logs as f64)],
+            "stat-log_errors-total" => vec![Known::Cells("value", vec![count(error_logs)])],
+            "stat-log_errors-buckets" => vec![Known::Sum("value", error_logs as f64)],
+            "metrics-facet-service_name" => {
+                let mut counts = BTreeMap::new();
+                for q in 0..self.routes {
+                    *counts.entry(Some(metric_service(q))).or_insert(0) += 2 * EXPORTS;
+                }
+                *counts.entry(Some(metric_service(0))).or_insert(0) += 3 * EXPORTS;
+                facet(counts)
+            }
+            "metrics-facet-subject_card_uid" => vec![
+                Known::Cells("value", vec![None]),
+                Known::Cells("n", vec![count(points)]),
+            ],
+            "metrics-names" => {
+                let cells = |values: [&str; 4]| values.map(|value| Some(value.to_owned())).to_vec();
+                vec![
+                    Known::Cells("metric_name", cells([CPU_METRIC, METRIC, METRIC, METRIC])),
+                    Known::Cells("metric_type", cells(["gauge", "gauge", "histogram", "sum"])),
+                    Known::Cells("unit", cells(["%", "By", "ms", "1"])),
+                ]
+            }
+            "metrics-group-keys" => vec![Known::Rows(100)],
+            "metric-points-list" => self.newest_points(50),
+            "metrics-chart" => self.chart(HOUR_START_NANOS, MINUTES, true),
+            "metrics-24h-chart" => self.chart(day_from, 900, true),
+            "metrics-apart-chart" | "metrics-nested-chart" => {
+                self.chart(HOUR_START_NANOS, MINUTES, charted)
+            }
+            "metrics-histogram" | "metrics-apart-histogram"
+                if id == "metrics-histogram" || self.routes <= 20 =>
+            {
+                let (counted, summed) = self.histogram_total();
+                vec![Known::Sum("count", counted), Known::Sum("sum", summed)]
+            }
+            _ => Vec::new(),
         }
     }
 }

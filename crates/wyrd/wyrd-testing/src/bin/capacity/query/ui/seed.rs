@@ -171,20 +171,29 @@ pub enum Known {
     Rows(usize),
     /// A numeric column summing to this value.
     Sum(&'static str, f64),
-    /// A column holding exactly these cells, in row order.
-    Cells(&'static str, Vec<String>),
+    /// A column holding exactly these cells, nulls as `None`, in row order.
+    Cells(&'static str, Vec<Option<String>>),
+    /// A numeric column summing to this value over the rows whose second
+    /// column holds the given cell; at least one row must.
+    Total(&'static str, (&'static str, &'static str), f64),
 }
 
-/// What statement `id` must answer over driven or journey rows; empty for
-/// a statement no count is known for. Every execution is `completed` or
-/// `pending`: the server records no `status` event, so the `waiting`
+/// What statement `id` must answer over driven or journey rows: the
+/// seeded statements here, the journey's from [`Journey::known`]; empty
+/// for a statement no count is known for. Every execution is `completed`
+/// or `pending`: the server records no `status` event, so the `waiting`
 /// filter answers no row.
 #[must_use]
 pub fn known(id: &str, journey: Journey) -> Vec<Known> {
     let executions = DIRECT + SUBMITTED;
     let half = executions / 2;
     let calls = f64::from(CALLS);
-    let cells = |values: &[&str]| values.iter().map(|value| (*value).to_owned()).collect();
+    let cells = |values: &[&str]| {
+        values
+            .iter()
+            .map(|value| Some((*value).to_owned()))
+            .collect()
+    };
     match id {
         "stat-invocations-total" | "stat-invocations-buckets" => {
             vec![Known::Sum("value", journey.invocations() as f64)]
@@ -201,16 +210,16 @@ pub fn known(id: &str, journey: Journey) -> Vec<Known> {
         "verify-list" => vec![Known::Rows(51)],
         "verify-facet-status" => vec![
             Known::Cells("value", cells(&["completed", "pending"])),
-            Known::Cells("n", vec![DIRECT.to_string(), SUBMITTED.to_string()]),
+            Known::Cells("n", cells(&[&DIRECT.to_string(), &SUBMITTED.to_string()])),
         ],
         "verify-facet-verdict" => vec![
             Known::Cells("value", cells(&["failed", "passed"])),
-            Known::Cells("n", vec![half.to_string(), half.to_string()]),
+            Known::Cells("n", cells(&[&half.to_string(), &half.to_string()])),
         ],
         "verify-chart-verdict" => vec![Known::Sum("executions", f64::from(executions))],
         "verify-filter-verdict" => vec![Known::Rows(usize::try_from(half).unwrap_or(usize::MAX))],
         "verify-filter-status" => vec![Known::Rows(0)],
-        _ => Vec::new(),
+        _ => journey.known(id),
     }
 }
 
@@ -221,25 +230,29 @@ pub fn known(id: &str, journey: Journey) -> Vec<Known> {
 /// Returns the first property the answer misses.
 pub fn check(id: &str, answer: &Answer, journey: Journey) -> Result<(), String> {
     for property in known(id, journey) {
+        let number = |cell: Option<&str>| {
+            cell.and_then(|cell| cell.parse::<f64>().ok())
+                .unwrap_or(f64::NAN)
+        };
+        let near = |total: f64, sum: f64| (total - sum).abs() <= sum.abs() * 1e-9;
         let held = match &property {
             Known::Rows(rows) => answer.rows.len() == *rows,
             Known::Sum(column, sum) => {
-                let total: f64 = answer
-                    .column(column)
-                    .into_iter()
-                    .map(|cell| {
-                        cell.and_then(|cell| cell.parse::<f64>().ok())
-                            .unwrap_or(f64::NAN)
-                    })
-                    .sum();
-                !answer.rows.is_empty() && (total - sum).abs() <= sum.abs() * 1e-9
+                let total: f64 = answer.column(column).into_iter().map(number).sum();
+                !answer.rows.is_empty() && near(total, *sum)
             }
             Known::Cells(column, cells) => {
-                answer.column(column)
-                    == cells
-                        .iter()
-                        .map(|cell| Some(cell.as_str()))
-                        .collect::<Vec<_>>()
+                answer.column(column) == cells.iter().map(Option::as_deref).collect::<Vec<_>>()
+            }
+            Known::Total(column, (by, cell), sum) => {
+                let matching: Vec<f64> = answer
+                    .column(column)
+                    .into_iter()
+                    .zip(answer.column(by))
+                    .filter(|(_, key)| *key == Some(*cell))
+                    .map(|(value, _)| number(value))
+                    .collect();
+                !matching.is_empty() && near(matching.iter().sum(), *sum)
             }
         };
         if !held {
@@ -275,7 +288,7 @@ mod tests {
     }
 
     /// An empty answer fails a statement over driven rows, the expected
-    /// count passes, and a statement nothing names passes as it is.
+    /// count passes, and a statement with no known count passes as it is.
     ///
     /// # Panics
     ///
@@ -316,8 +329,41 @@ mod tests {
             Ok(())
         );
         assert_eq!(
-            check("trace-list", &answer("value", &[]), Journey::DEFAULT),
+            check(
+                "verify-facet-run_id",
+                &answer("value", &[]),
+                Journey::DEFAULT
+            ),
             Ok(())
         );
+    }
+
+    /// Trace, log and metric statements must answer what the journey
+    /// exported: a count off by one, an empty list or an empty chart fails,
+    /// and the model's own count passes.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a wrong journey answer passes or the model's count fails.
+    #[test]
+    fn journey_statements_must_answer_what_was_exported() {
+        let journey = Journey::DEFAULT;
+        let spans = journey.span_rows().to_string();
+        let logs = journey.log_rows().to_string();
+        let fewer = (journey.log_rows() - 1).to_string();
+        assert_eq!(
+            check("stat-spans-total", &answer("value", &[&spans]), journey),
+            Ok(())
+        );
+        assert!(check("stat-spans-total", &answer("value", &["0"]), journey).is_err());
+        assert_eq!(
+            check("stat-logs-total", &answer("value", &[&logs]), journey),
+            Ok(())
+        );
+        assert!(check("stat-logs-total", &answer("value", &[&fewer]), journey).is_err());
+        assert!(check("trace-list", &answer("trace_id", &[]), journey).is_err());
+        assert!(check("logs-list", &answer("body_text", &[]), journey).is_err());
+        assert!(check("metrics-chart", &answer("value", &[]), journey).is_err());
+        assert!(check("metrics-histogram", &answer("count", &[]), journey).is_err());
     }
 }

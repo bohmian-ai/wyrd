@@ -1,6 +1,6 @@
 ---
 id: SPEC-positioning
-revision: 6
+revision: 7
 status: approved
 ---
 
@@ -457,7 +457,7 @@ fixtures or implementation structure.
 | AC-013 | The editorial query map assigns each intent family to canonical substantive content. A reader/agent given representative questions finds the right published page, its prerequisites and executable next step using public site/index surfaces, without repository archaeology. No arbitrary keyword frequency or live search position is required. | REQ-014; INV-004–006 |
 | AC-014 | Substantive external claims have primary-source attribution, demonstrations link to executed evidence, dates/credits are truthful, and the maintainer handoff identifies content/discovery/distribution responsibilities without performing external outreach. | REQ-015; INV-005–006 |
 | AC-015 | Publication evidence identifies the initial set and completion of the full required corpus. The handoff defines baseline and equal-window follow-up metrics, records available baseline data or explicit access gaps, and identifies a responsible maintainer for remaining account-dependent work. | REQ-016; INV-005–006 |
-| AC-016 | In Python, TypeScript and Rust, the agent-workflow program declares its inputs as one model with a `Trace` field, sets up with `configure()` (Rust: `configure` plus `otel::start_telemetry`) and `flush()`, and the real-server journey reproduces complete/skipped/no-trace. Unit evidence shows a marked field or mapping value becomes `{"type": "trace"}` while other fields keep their schemas; default configure installs telemetry, refuses an existing provider and reports missing OpenTelemetry packages (Python, TypeScript); a second configure is frozen; `flush` without a writer succeeds. The scheduled-check `record` programs submit samples, and the support-desk and author-in-code programs write rows, without `start_bifrost`; concurrent first writes land every row. | REQ-017; INV-001, INV-003 |
+| AC-016 | In Python, TypeScript and Rust, the agent-workflow program declares its inputs as one model with a `Trace` field, sets up with `configure()` and `flush()` (Rust: `otel::start_telemetry`, whose `telemetry.shutdown()` stores the spans; a Rust state that writes no Bifrost rows needs neither `configure` nor `flush`), and the real-server journey reproduces complete/skipped/no-trace. Unit evidence shows a marked field or mapping value becomes `{"type": "trace"}` while other fields keep their schemas; default configure installs telemetry, refuses an existing provider and reports missing OpenTelemetry packages (Python, TypeScript); a second configure is frozen; `flush` without a writer succeeds. The scheduled-check `record` programs submit samples, and the support-desk and author-in-code programs write rows, without `start_bifrost`; concurrent first writes land every row. | REQ-017; INV-001, INV-003 |
 
 Automated provider fixtures prove execution mechanics, not live model accuracy.
 Record the install pins, provider/model setup, commands and observed
@@ -480,13 +480,19 @@ release that ships it. Unavailable account metrics are explicit handoff gaps, no
 choices or permission to omit required content.
 
 The maintainer approved revision 3 on 2026-11-12, revision 4 on
-2026-11-13, revision 5 on 2026-11-15 and revision 6 on 2026-11-18. Approval covers the complete positioning and documentation rollout,
+2026-11-13, revision 5 on 2026-11-15, and revisions 6 and 7 on 2026-11-18. Approval covers the complete positioning and documentation rollout,
 bounded ownership transfer, invariants and acceptance evidence. Implementation
-tasks must reference revision 6; the old revision-2 scope must
+tasks must reference revision 7; the old revision-2 scope must
 not be executed as its plan. Spec approval does not approve implementation
 tasks or grant implementation readiness.
 
 ## Revision history
+
+- Revision 7 — Maintainer-approved on 2026-11-18 (TASK-003 review FIND-TASK-003-3): AC-016
+  no longer asks the Rust agent-workflow program for `configure` and `flush`.
+  Rust installs telemetry with `otel::start_telemetry`, and the returned
+  handle's `shutdown()` is what stores the spans; with defaults and no Bifrost
+  writes, `configure` and `flush` would have no effect.
 
 - Revision 6 — Maintainer decision on 2026-11-18: add REQ-017 and AC-016 for
   the SDK lifecycle and trace-slot changes the agent-workflow tutorial needed

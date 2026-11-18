@@ -109,7 +109,10 @@ pub const SLOT_KEYWORD: &str = "x-wyrd-slot";
 /// [`SLOT_KEYWORD`] is `{"type": "trace"}`; its JSON value is the bare ID.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
-pub struct Trace(pub String);
+pub struct Trace(
+    /// The 32-hex trace ID the slot's value carries.
+    pub String,
+);
 
 impl schemars::JsonSchema for Trace {
     /// Inline at each field, so a model's property names the marker directly.

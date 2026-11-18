@@ -85,6 +85,34 @@ test("telemetry setup", async () => {
   expect(globalProvider()).toBe(application);
 });
 
+test("configure reports a missing optional telemetry package", async () => {
+  const missing = "@opentelemetry/exporter-logs-otlp-proto";
+  vi.resetModules();
+  // Fail the import the way Node does when the optional peer is not installed.
+  vi.doMock(missing, () => {
+    throw Object.assign(new Error(`Cannot find package '${missing}'`), { code: "ERR_MODULE_NOT_FOUND" });
+  });
+  try {
+    const fresh = await import("wyrd-ai");
+    const state = fresh.WyrdState.fromPath(BUNDLE, {
+      client: fresh.WyrdClient.connect({ serverUrl: UNREACHABLE, credential: "wyrd_unit_unused" }),
+    });
+
+    // configure rejects with the load failure; Vitest wraps a failing mock factory, keeping it as the cause.
+    await expect(state.configure()).rejects.toMatchObject({
+      cause: { code: "ERR_MODULE_NOT_FOUND", message: expect.stringContaining(missing) },
+    });
+    expect(globalProvider()).not.toBeInstanceOf(BasicTracerProvider);
+    // The context was fixed before the install failed; fixing it again is refused.
+    await expect(state.configure({ telemetry: false })).rejects.toMatchObject({
+      code: "WYRD_SDK_409_STATE_CONFIG_FROZEN",
+    });
+  } finally {
+    vi.doUnmock(missing);
+    vi.resetModules();
+  }
+});
+
 test("configure without telemetry installs no provider", async () => {
   const state = offlineState();
   await state.configure({ deploymentEnvironment: "prod", telemetry: false });

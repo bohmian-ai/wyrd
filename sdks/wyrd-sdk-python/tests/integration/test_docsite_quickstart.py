@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import re
 import runpy
 import shutil
 import sys
@@ -24,7 +25,7 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-from wyrd import WyrdError
+from wyrd import WyrdError, verify
 from wyrd.cards import CardRef, Cards
 from wyrd.client import WyrdClient
 from wyrd.state import WyrdState
@@ -264,22 +265,58 @@ def test_docsite_quickstart_refuses_changed_content_and_broken_references(
 
 
 def test_finance_api_releases_only_passed_reports(
-    reader: Path, server: WyrdTestServer, model: Receiver
+    reader: Path, server: WyrdTestServer, model: Receiver, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The homepage's finance API, beside the Quickstart Service pulled as `.wyrd-bundle`.
+    # The finance API beside the Quickstart Service pulled as `.wyrd-bundle`,
+    # sent the request files the real-time guide's `curl` commands send.
     script, _ = run_quickstart(reader)
     WyrdState.declare(script["service"], bundle_dir=reader / ".wyrd-bundle")
-    shutil.copy(EXAMPLE / "api.py", reader)
+    for name in ("api.py", "permitted.json", "bank-account.json"):
+        shutil.copy(EXAMPLE / name, reader)
+    requests = [
+        json.loads((reader / name).read_text()) for name in ("permitted.json", "bank-account.json")
+    ]
+    uncertain = {**PERMITTED, "report": {"text": "Synthetic report flagged PROVIDER-UNCERTAIN."}}
     example = runpy.run_path(str(reader / "api.py"))
-    bank_account = {**PERMITTED, "report": {"text": "Paid from BANK-ACCOUNT-DEMO-001."}}
     with TestClient(example["api"]) as client:
-        decisions = [
-            client.post("/reports/send", json=release).json()
-            for release in (PERMITTED, bank_account)
-        ]
-        uncertain = client.post(
-            "/reports/send",
-            json={**PERMITTED, "report": {"text": "Synthetic report flagged PROVIDER-UNCERTAIN."}},
-        ).json()
-    assert decisions == [{"decision": "released"}, {"decision": "held for review"}]
-    assert uncertain == {"decision": "held for review"}, "inconclusive holds"
+        responses = [client.post("/reports/send", json=body) for body in (*requests, uncertain)]
+    released, bank_account, inconclusive = [response.json() for response in responses]
+
+    assert [response.status_code for response in responses] == [200, 200, 200]
+    assert released["decision"] == "released"
+    assert bank_account["decision"] == inconclusive["decision"] == "held for review"
+    assert (bank_account["verdict"], bank_account["requirements"]) == (
+        "failed",
+        {"follows-policy": "failed"},
+    )
+    assert (inconclusive["verdict"], inconclusive["requirements"]) == (
+        "inconclusive",
+        {"follows-policy": "inconclusive"},
+    )
+    # Each decision names the execution that judged it, so it was made after
+    # the verdict: only the passed one was released, each in a Run of its own.
+    for response in (released, bank_account, inconclusive):
+        assert details(response["execution_id"])["run_id"] == response["run_id"]
+    assert verify.Execution.connect(released["execution_id"]).wait(60.0).passed
+    assert len({response["run_id"] for response in (released, bank_account, inconclusive)}) == 3
+    printed = "".join(f"{response.text}\n" for response in responses[:2])
+    assert uuids(printed) == uuids((EXAMPLE / "api-output.txt").read_text())
+
+    # A credential that may not run the Verifier: nothing is judged, so the
+    # typed error holds the report.
+    viewer = server.bootstrap_service(["viewer"], name="finance-api-viewer")
+    with monkeypatch.context() as env:
+        env.setenv("WYRD_API_KEY", viewer)
+        example = runpy.run_path(str(reader / "api.py"))
+        with TestClient(example["api"]) as client:
+            refused = client.post("/reports/send", json=requests[0])
+    assert refused.status_code == 503
+    assert refused.json() == {
+        "decision": "held for review",
+        "error": "WYRD_PERMISSION_403_DENIED_RBAC",
+    }
+
+
+def uuids(text: str) -> str:
+    """``text`` with every UUID replaced by one placeholder, so printed IDs compare."""
+    return re.sub(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", "<id>", text)

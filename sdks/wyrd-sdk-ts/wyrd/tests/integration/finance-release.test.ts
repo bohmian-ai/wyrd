@@ -1,14 +1,16 @@
 // The docs Quickstart's TypeScript program, `examples/finance-release`, run
 // as a reader runs it: from a directory holding only the downloaded policy PDF, against a server whose `openai`
 // gateway deployment forwards the policy judge to a local model that reads the policy extraction first.
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
+import { once } from "node:events";
 import { copyFileSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { createInterface } from "node:readline";
 import { promisify } from "node:util";
 
 import { expect, vi } from "vitest";
-import { Cards, WyrdClient, WyrdState } from "wyrd-ai";
+import { Cards, verify, WyrdClient, WyrdState } from "wyrd-ai";
 
 import { sharingPolicyJudge } from "../support/assistant.js";
 import type { ReceivedRequest, Reply } from "../support/http-receiver.js";
@@ -142,4 +144,73 @@ test("judges each finance requirement on its own", async ({ reader }) => {
   }
   await state.shutdown();
   expect(verdicts).toEqual(["failed", "failed", "inconclusive"]);
+});
+
+/** The finance API started in `reader` beside its pulled `.wyrd-bundle`, acting as `key`, and the address it printed. */
+async function serveApi(reader: string, key: string) {
+  const api = spawn(process.execPath, [join(EXAMPLE, "api.ts")], {
+    cwd: reader,
+    env: { ...process.env, PORT: "0", WYRD_API_KEY: key },
+    stdio: ["ignore", "pipe", "inherit"],
+  });
+  const [line] = await once(createInterface({ input: api.stdout }), "line");
+  return { api, url: String(line).replace("listening on ", "") };
+}
+
+/** A finance API response: its decision and, when a verdict decided it, the Run and execution behind it. */
+type Decision = { readonly decision: string; readonly run_id?: string; readonly execution_id?: string };
+
+/** `response` with its run and execution IDs replaced by one placeholder, so a decision compares with the guide's. */
+function decision(response: Decision) {
+  return { ...response, ...("run_id" in response ? { run_id: "<id>", execution_id: "<id>" } : {}) };
+}
+
+test("the finance API releases only passed reports", async ({ reader, server }) => {
+  process.chdir(reader);
+  await run(reader);
+  await (await Cards.connect()).pull(
+    { kind: "Service", name: "finance-release", version: "0.1.0" },
+    join(reader, ".wyrd-bundle"),
+  );
+  const request = (name: string) => JSON.parse(readFileSync(join(EXAMPLE, name), "utf8"));
+  const uncertain = { ...PERMITTED, report: { text: "Synthetic report flagged PROVIDER-UNCERTAIN." } };
+  const send = async (url: string, body: unknown) => {
+    const response = await fetch(`${url}/reports/send`, { method: "POST", body: JSON.stringify(body) });
+    return [response.status, (await response.json()) as Decision] as const;
+  };
+
+  const { api, url } = await serveApi(reader, process.env.WYRD_API_KEY ?? "");
+  const responses = [];
+  for (const body of [request("permitted.json"), request("bank-account.json"), uncertain]) {
+    responses.push(await send(url, body));
+  }
+  api.kill();
+
+  expect(responses.map(([status]) => status)).toEqual([200, 200, 200]);
+  const shown = readFileSync(join(EXAMPLE, "api-output.txt"), "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  expect(responses.slice(0, 2).map(([, body]) => decision(body))).toEqual(shown.map(decision));
+  const [, , [, inconclusive] = [0, { decision: "missing" }]] = responses;
+  expect(decision(inconclusive)).toEqual({
+    decision: "held for review",
+    verdict: "inconclusive",
+    run_id: "<id>",
+    execution_id: "<id>",
+    requirements: { "follows-policy": "inconclusive" },
+  });
+  // Each decision names the execution whose verdict decided it, so it follows the verdict.
+  for (const [, body] of responses) {
+    const result = await (await verify.Execution.connect(body.execution_id ?? "")).wait({ timeoutMs: 60_000 });
+    expect(result.passed, "only a passed verdict releases").toBe(body.decision === "released");
+    expect(result.run_id).toBe(body.run_id);
+  }
+  expect(new Set(responses.map(([, body]) => body.run_id)).size, "each request runs in a Run of its own").toBe(3);
+
+  // A credential that may not run the Verifier: nothing is judged, so the typed error holds the report.
+  const viewer = await serveApi(reader, server.bootstrapService(["viewer"], "finance-api-viewer"));
+  const refused = await send(viewer.url, request("permitted.json"));
+  viewer.api.kill();
+  expect(refused).toEqual([503, { decision: "held for review", error: "WYRD_PERMISSION_403_DENIED_RBAC" }]);
 });

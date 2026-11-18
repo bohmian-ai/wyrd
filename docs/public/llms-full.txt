@@ -3316,6 +3316,358 @@ A drift Verifier refuses `verify`; only the schedule judges it.
 
 [How verification works in Wyrd](/wyrd/understand/how-verification-works/) explains steps, verdicts, and where each check runs. [Write verifiable requirements](/wyrd/build-and-verify/declare/write-verifiable-requirements/) shows how to test a model judge before relying on it.
 
+# Verify during a request
+
+Page: /wyrd/build-and-verify/verify/verify-a-request-in-real-time/
+
+> Call the Quickstart's release check from a web API, send a report only after its verdict passes, and hold every other outcome with the reason.
+
+Put the [Quickstart](/wyrd/get-started/quickstart/)'s release check inside a web API, so each request is verified before the API sends anything.
+
+## Before you start
+
+Finish the Quickstart. Its `finance-release` Service, `release-check` Verifier, and the gateway deployment its judge calls must be declared. Work in the same `quickstart` directory.
+
+## 1. Pull the Service
+
+A deployed application loads the Service it serves from a bundle instead of declaring it. Pull the version the Quickstart declared:
+
+**Python**
+
+```bash
+uv run wyrd pull --kind Service --name finance-release --version 0.1.0 --output-dir .wyrd-bundle
+```
+
+**Rust**
+
+```bash
+wyrd pull --kind Service --name finance-release --version 0.1.0 --output-dir .wyrd-bundle
+```
+
+**TypeScript**
+
+```bash
+pnpm wyrd pull --kind Service --name finance-release --version 0.1.0 --output-dir .wyrd-bundle
+```
+
+## 2. Write the API
+
+The handler verifies the release, waits for the verdict, and only then decides. It sends the report only when the verdict is `passed`; a `failed` or `inconclusive` verdict holds it for review, and so does an error, because nothing was judged:
+
+**Python**
+
+```bash
+uv add fastapi uvicorn
+```
+
+```python title="api.py"
+"""A finance API that verifies each report release before it sends the report.
+
+It serves the Quickstart's ``finance-release`` Service, pulled once at deploy
+time:
+
+    wyrd pull --kind Service --name finance-release --version 0.1.0 \
+      --output-dir .wyrd-bundle
+    uv run uvicorn api:api
+"""
+
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from wyrd import WyrdState
+from wyrd import WyrdError
+from wyrd.verify import VerificationResult
+
+from finance_service import Release
+
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    yield
+    # Drain what the state recorded before the process exits.
+    state.shutdown()
+
+api = FastAPI(lifespan=lifespan)
+
+state = WyrdState.from_path(".wyrd-bundle")
+
+@api.post("/reports/send")
+def send_report(release: Release):
+    with state.run() as run:
+        result = run.observe.verify("release-check", release)
+    if result.passed:
+        return release_report(release, result)
+    return hold_for_review(release, result)
+
+def release_report(release: Release, result: VerificationResult) -> dict:
+    # A real API sends the report to its destination here, only after the verdict.
+    return {"decision": "released", "run_id": result.run_id, "execution_id": result.execution_id}
+
+def hold_for_review(release: Release, result: VerificationResult) -> dict:
+    # Failed and inconclusive verdicts both wait for a person, who sees why.
+    return {
+        "decision": "held for review",
+        "verdict": result.verdict,
+        "run_id": result.run_id,
+        "execution_id": result.execution_id,
+        "requirements": {r["id"]: r["outcome"] for r in result.requirements if r["outcome"] != "passed"},
+    }
+
+@api.exception_handler(WyrdError)
+def hold_on_error(request: Request, error: WyrdError) -> JSONResponse:
+    # No verdict, such as a refused credential or a timeout: nothing was judged, so nothing is sent.
+    return JSONResponse({"decision": "held for review", "error": error.code}, status_code=503)
+
+```
+
+**Rust**
+
+```bash
+cargo add axum
+```
+
+```rust title="src/bin/api.rs"
+//! A finance API that verifies each report release before it sends the report.
+//!
+//! It serves the Quickstart's `finance-release` Service, pulled once at deploy
+//! time with `wyrd pull --kind Service --name finance-release --version 0.1.0
+//! --output-dir .wyrd-bundle`, and listens on `PORT`, by default 8000.
+
+use std::error::Error;
+
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::routing::post;
+use axum::{Json, Router};
+use wyrd_ai::serde_json::{Value, json};
+use wyrd_ai::state::WyrdState;
+use wyrd_ai::{RequirementOutcome, VerificationResult};
+
+/// Verify one release, then release the report only when the verdict passed.
+async fn send_report(
+    State(state): State<WyrdState>,
+    Json(release): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    match state.run().observe().verify("release-check", release).await {
+        Ok(result) if result.is_passed() => (StatusCode::OK, Json(release_report(&result))),
+        Ok(result) => (StatusCode::OK, Json(hold_for_review(&result))),
+        // No verdict, such as a refused credential or a timeout: nothing was
+        // judged, so nothing is sent.
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "decision": "held for review", "error": error.code() })),
+        ),
+    }
+}
+
+/// Send the report; a real API sends it to its destination here, only after
+/// the verdict.
+fn release_report(result: &VerificationResult) -> Value {
+    json!({ "decision": "released", "run_id": result.run_id, "execution_id": result.execution_id })
+}
+
+/// Hold the report for a person, who sees which requirements did not pass.
+/// Failed and inconclusive verdicts both wait.
+fn hold_for_review(result: &VerificationResult) -> Value {
+    let requirements: wyrd_ai::serde_json::Map<String, Value> = result
+        .outcome
+        .requirements
+        .iter()
+        .filter(|requirement| requirement.outcome != RequirementOutcome::Passed)
+        .map(|requirement| {
+            (
+                requirement.id.as_str().to_owned(),
+                json!(requirement.outcome),
+            )
+        })
+        .collect();
+    json!({
+        "decision": "held for review",
+        "verdict": result.outcome.verdict,
+        "run_id": result.run_id,
+        "execution_id": result.execution_id,
+        "requirements": requirements,
+    })
+}
+
+/// Load the pulled bundle and serve `POST /reports/send` until stopped.
+///
+/// # Errors
+/// Returns the bundle's load error or the listener's bind error.
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let state = WyrdState::from_path(".wyrd-bundle")?;
+    let api = Router::new()
+        .route("/reports/send", post(send_report))
+        .with_state(state.clone());
+    let port = std::env::var("PORT").unwrap_or_else(|_| "8000".to_owned());
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await?;
+    println!("listening on http://{}", listener.local_addr()?);
+    axum::serve(listener, api)
+        .with_graceful_shutdown(async {
+            tokio::signal::ctrl_c().await.ok();
+        })
+        .await?;
+    // Drain what the state recorded before the process exits.
+    state.shutdown().await?;
+    Ok(())
+}
+
+```
+
+**TypeScript**
+
+```typescript title="api.ts"
+// A finance API that verifies each report release before it sends the report.
+//
+// It serves the Quickstart's `finance-release` Service, pulled once at deploy time with
+// `wyrd pull --kind Service --name finance-release --version 0.1.0 --output-dir .wyrd-bundle`,
+// and listens on PORT, by default 8000.
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
+import { json } from "node:stream/consumers";
+
+import { type VerificationResult, WyrdError, WyrdState } from "wyrd-ai";
+
+const state = WyrdState.fromPath(".wyrd-bundle");
+
+// Verify one release, then release the report only when the verdict passed.
+async function sendReport(release: unknown): Promise<[number, object]> {
+  try {
+    const result = await state.run().observe.verify("release-check", release as object);
+    return [200, result.passed ? releaseReport(result) : holdForReview(result)];
+  } catch (error) {
+    // No verdict, such as a refused credential or a timeout: nothing was judged, so nothing is sent.
+    if (error instanceof WyrdError) return [503, { decision: "held for review", error: error.code }];
+    throw error;
+  }
+}
+
+// A real API sends the report to its destination here, only after the verdict.
+function releaseReport(result: VerificationResult) {
+  return { decision: "released", run_id: result.run_id, execution_id: result.execution_id };
+}
+
+// Failed and inconclusive verdicts both wait for a person, who sees which requirements did not pass.
+function holdForReview(result: VerificationResult) {
+  const requirements = Object.fromEntries(
+    result.outcome.requirements.filter((r) => r.outcome !== "passed").map((r) => [r.id, r.outcome]),
+  );
+  return {
+    decision: "held for review",
+    verdict: result.outcome.verdict,
+    run_id: result.run_id,
+    execution_id: result.execution_id,
+    requirements,
+  };
+}
+
+const server = createServer(async (request, response) => {
+  if (request.method !== "POST" || request.url !== "/reports/send") {
+    return response.writeHead(404).end();
+  }
+  const [status, body] = await sendReport(await json(request));
+  response.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(body));
+});
+server.listen(Number(process.env.PORT ?? 8000), "127.0.0.1", () => {
+  console.log(`listening on http://127.0.0.1:${(server.address() as AddressInfo).port}`);
+});
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, async () => {
+    server.close();
+    // Drain what the state recorded before the process exits.
+    await state.shutdown();
+    process.exit(0);
+  });
+}
+
+```
+
+Each request opens its own Run. The response carries the Run's `run_id` and the `execution_id` of the verdict that decided it, so every decision can be traced to the judgment behind it.
+
+## 3. Start the API
+
+**Python**
+
+```bash
+uv run uvicorn api:api
+```
+
+**Rust**
+
+```bash
+cargo run --bin api
+```
+
+**TypeScript**
+
+```bash
+node api.ts
+```
+
+The API listens on `http://127.0.0.1:8000`.
+
+## 4. Send two releases
+
+Save a permitted release and one whose report names a bank account:
+
+```json title="permitted.json"
+{
+  "purpose": "external audit",
+  "report": {"text": "Synthetic customer report: quarterly total $120."},
+  "recipient": {"email": "auditor@example.test", "authorized": true},
+  "destination": {"url": "https://auditor.example.test/reports", "restricted": true}
+}
+
+```
+
+```json title="bank-account.json"
+{
+  "purpose": "external audit",
+  "report": {"text": "Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001."},
+  "recipient": {"email": "auditor@example.test", "authorized": true},
+  "destination": {"url": "https://auditor.example.test/reports", "restricted": true}
+}
+
+```
+
+In a second terminal, send each one:
+
+```bash
+curl -s localhost:8000/reports/send -H 'content-type: application/json' -d @permitted.json; echo
+curl -s localhost:8000/reports/send -H 'content-type: application/json' -d @bank-account.json; echo
+```
+
+```text title="output"
+{"decision":"released","run_id":"0193f1c2-5a7e-7c41-9d2a-3b8e4f6a1c90","execution_id":"0193f1c2-5b10-7e2f-8a64-91d0c3e5b7a2"}
+{"decision":"held for review","verdict":"failed","run_id":"0193f1c2-6c3d-7a18-b5e9-2f47d8a0c6e1","execution_id":"0193f1c2-6d02-7b9c-a1f3-58e2b6c4d9f0","requirements":{"follows-policy":"failed"}}
+
+```
+
+Your IDs differ. The permitted report is released. The bank-account report is held, and the response names `follows-policy`, the requirement it failed. An `inconclusive` verdict holds the same way, with `"verdict":"inconclusive"`.
+
+When the call itself fails, such as a credential without `verifier:run`, the API answers `503` with the error code and sends nothing:
+
+```json
+{"decision":"held for review","error":"WYRD_PERMISSION_403_DENIED_RBAC"}
+```
+
+**Checks that can wait:**
+A request waits for every check in the Verifier, including the model judge. When a decision can be made after the response, `submit` the Verifier instead and read the result later, as in [Record a run and observations](/wyrd/build-and-verify/observe/record-a-run-and-observations/#3-verify-the-answer). [Fit checks to the request's deadline](/wyrd/build-and-verify/verify/act-on-verdicts-in-production/#2-fit-checks-to-the-requests-deadline) covers the trade-off.
+
+## If it fails
+
+| You see | Fix |
+| --- | --- |
+| The API exits on startup with a bundle error | Pull the Service into `.wyrd-bundle` in the directory you start the API from |
+| `"error":"WYRD_PERMISSION_403_DENIED_RBAC"` | Use a credential with `verifier:run`, such as the one `wyrd init` saved |
+| Every release is `inconclusive` on `follows-policy` | The judge cannot reach its model. Create the `openai` deployment as in [Quickstart step 1](/wyrd/get-started/quickstart/#1-connect-a-model-provider) |
+
+## Next
+
+[Act on verdicts in production](/wyrd/build-and-verify/verify/act-on-verdicts-in-production/) covers timeouts, provider exposure, and cost for this handler. [ASGI apps](/wyrd/connect/integrate-asgi/) records the request itself as evidence.
+
 # Act on verdicts in production
 
 Page: /wyrd/build-and-verify/verify/act-on-verdicts-in-production/
@@ -3340,8 +3692,8 @@ def send_report(release: Release):
     with state.run() as run:
         result = run.observe.verify("release-check", release)
     if result.passed:
-        return release_report(release)
-    return hold_for_review(release)
+        return release_report(release, result)
+    return hold_for_review(release, result)
 ```
 
 Testing for failure instead, with `if not result.failed`, releases every inconclusive report: the ones whose evidence was missing or whose judge could not decide. Decide each outcome on purpose. With the default `decide: all`:

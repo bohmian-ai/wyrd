@@ -11,10 +11,13 @@ time:
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 # ANCHOR: import
 from wyrd import WyrdState
 # ANCHOR_END: import
+from wyrd import WyrdError
+from wyrd.verify import VerificationResult
 
 from finance_service import Release
 
@@ -37,16 +40,30 @@ def send_report(release: Release):
     with state.run() as run:
         result = run.observe.verify("release-check", release)
     if result.passed:
-        return release_report(release)
-    return hold_for_review(release)
+        return release_report(release, result)
+    return hold_for_review(release, result)
 # ANCHOR_END: handler
 
 
-def release_report(release: Release) -> dict[str, str]:
-    # A real API sends the report to its destination here.
-    return {"decision": "released"}
+# ANCHOR: decisions
+def release_report(release: Release, result: VerificationResult) -> dict:
+    # A real API sends the report to its destination here, only after the verdict.
+    return {"decision": "released", "run_id": result.run_id, "execution_id": result.execution_id}
 
 
-def hold_for_review(release: Release) -> dict[str, str]:
-    # Failed and inconclusive verdicts both wait for a person.
-    return {"decision": "held for review"}
+def hold_for_review(release: Release, result: VerificationResult) -> dict:
+    # Failed and inconclusive verdicts both wait for a person, who sees why.
+    return {
+        "decision": "held for review",
+        "verdict": result.verdict,
+        "run_id": result.run_id,
+        "execution_id": result.execution_id,
+        "requirements": {r["id"]: r["outcome"] for r in result.requirements if r["outcome"] != "passed"},
+    }
+
+
+@api.exception_handler(WyrdError)
+def hold_on_error(request: Request, error: WyrdError) -> JSONResponse:
+    # No verdict, such as a refused credential or a timeout: nothing was judged, so nothing is sent.
+    return JSONResponse({"decision": "held for review", "error": error.code}, status_code=503)
+# ANCHOR_END: decisions

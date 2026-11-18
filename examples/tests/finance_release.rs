@@ -579,3 +579,193 @@ async fn finance_release_policy_versions_remain_attributable() {
         .await
         .expect("test server shuts down");
 }
+
+/// The finance API binary started in the reader's directory beside its
+/// pulled `.wyrd-bundle`, acting as `key`, and the address it printed.
+///
+/// # Panics
+/// Panics when the binary cannot start or prints no address.
+fn serve_api(story: &Story, key: &str) -> (std::process::Child, String) {
+    use std::io::{BufRead, BufReader};
+    let mut api = Command::new(env!("CARGO_BIN_EXE_finance_api"))
+        .current_dir(story.dir.path())
+        .env("WYRD_CONFIG_HOME", story.config.path())
+        .env("WYRD_SERVER_URL", &story.server_url)
+        .env("WYRD_GRPC_URL", &story.grpc_url)
+        .env("WYRD_API_KEY", key)
+        .env("PORT", "0")
+        .env_remove("WYRD_ACCESS_TOKEN")
+        .env_remove("WYRD_WORKLOAD_TOKEN")
+        .env_remove("WYRD_TENANT")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("the finance_api binary starts");
+    let mut line = String::new();
+    BufReader::new(api.stdout.take().expect("stdout is piped"))
+        .read_line(&mut line)
+        .expect("the API prints its address");
+    let url = line
+        .trim()
+        .strip_prefix("listening on ")
+        .expect("the API prints where it listens")
+        .to_owned();
+    (api, url)
+}
+
+/// `response` with its run and execution IDs replaced by one placeholder,
+/// so a decision compares with the one the guide shows.
+fn decision(mut response: Value) -> Value {
+    for id in ["run_id", "execution_id"] {
+        if let Some(value) = response.get_mut(id) {
+            *value = json!("<id>");
+        }
+    }
+    response
+}
+
+/// The finance API releases the permitted report and holds the bank-account
+/// and uncertain ones, each response naming the Run and the execution whose
+/// verdict decided it, so every decision follows its verdict. A credential
+/// that may not run the Verifier gets a typed-error hold.
+///
+/// # Panics
+/// Panics when the server or API cannot start, or a decision differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn finance_api_releases_only_passed_reports() {
+    let story = Story::start().await;
+    story.run().await;
+    let service: CardRef = serde_json::from_value(
+        json!({ "kind": "Service", "name": "finance-release", "version": "0.1.0" }),
+    )
+    .expect("card reference parses");
+    story
+        .cards()
+        .await
+        .pull(
+            CardSelector::exact(service),
+            story.dir.path().join(".wyrd-bundle"),
+            BundleMode::Complete,
+        )
+        .await
+        .expect("the Service pulls");
+    let request = |name: &str| -> Value {
+        serde_json::from_str(
+            &std::fs::read_to_string(Path::new(EXAMPLE_DIR).join(name))
+                .expect("the request file reads"),
+        )
+        .expect("the request file parses")
+    };
+    let mut uncertain = request("permitted.json");
+    uncertain["report"]["text"] = json!("Synthetic report flagged PROVIDER-UNCERTAIN.");
+    let http = reqwest::Client::new();
+    let send = |url: String, body: Value| {
+        let http = http.clone();
+        async move {
+            let response = http
+                .post(format!("{url}/reports/send"))
+                .json(&body)
+                .send()
+                .await
+                .expect("the API answers");
+            let status = response.status().as_u16();
+            (
+                status,
+                response
+                    .json::<Value>()
+                    .await
+                    .expect("the API answers JSON"),
+            )
+        }
+    };
+
+    let (mut api, url) = serve_api(&story, &story.key);
+    let mut responses = Vec::new();
+    for body in [
+        request("permitted.json"),
+        request("bank-account.json"),
+        uncertain,
+    ] {
+        responses.push(send(url.clone(), body).await);
+    }
+    api.kill().expect("the API stops");
+
+    assert!(
+        responses.iter().all(|(status, _)| *status == 200),
+        "{responses:?}"
+    );
+    let shown: Vec<Value> = include_str!("../finance-release/api-output.txt")
+        .lines()
+        .map(|line| decision(serde_json::from_str(line).expect("the guide's output parses")))
+        .collect();
+    assert_eq!(
+        responses[..2]
+            .iter()
+            .map(|(_, body)| decision(body.clone()))
+            .collect::<Vec<_>>(),
+        shown
+    );
+    assert_eq!(
+        decision(responses[2].1.clone()),
+        json!({
+            "decision": "held for review",
+            "verdict": "inconclusive",
+            "run_id": "<id>",
+            "execution_id": "<id>",
+            "requirements": { "follows-policy": "inconclusive" },
+        })
+    );
+    let mut runs = std::collections::HashSet::new();
+    for (_, body) in &responses {
+        let execution = Execution::connect_with(
+            body["execution_id"]
+                .as_str()
+                .expect("an execution ID")
+                .parse()
+                .expect("it parses"),
+            &story.client(),
+        )
+        .await
+        .expect("the execution connects");
+        let result = execution
+            .wait(Duration::from_secs(60))
+            .await
+            .expect("the verdict reads");
+        assert_eq!(
+            result.is_passed(),
+            body["decision"] == "released",
+            "only a passed verdict releases: {body}"
+        );
+        assert_eq!(json!(result.run_id), body["run_id"]);
+        runs.insert(body["run_id"].to_string());
+    }
+    assert_eq!(runs.len(), 3, "each request runs in a Run of its own");
+
+    // A credential that may not run the Verifier: nothing is judged, so the
+    // typed error holds the report.
+    let viewer = story
+        .server
+        .bootstrap_service("finance_api_viewer", &["viewer"])
+        .await
+        .expect("viewer bootstraps");
+    let key = viewer
+        .api_key()
+        .expect("a viewer key")
+        .expose_secret()
+        .to_owned();
+    let (mut api, url) = serve_api(&story, &key);
+    let refused = send(url, request("permitted.json")).await;
+    api.kill().expect("the API stops");
+    assert_eq!(
+        refused,
+        (
+            503,
+            json!({ "decision": "held for review", "error": "WYRD_PERMISSION_403_DENIED_RBAC" })
+        )
+    );
+    story
+        .server
+        .shutdown()
+        .await
+        .expect("test server shuts down");
+}

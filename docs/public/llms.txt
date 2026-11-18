@@ -32,6 +32,7 @@ Set up a local server, run one verification, then choose what to build, in this 
 - [Establish sufficient evidence](/wyrd/build-and-verify/observe/establish-sufficient-evidence/): Give each requirement evidence from its source, with citations, exact versions, and complete inputs, and tell missing evidence apart from a failure.
 - [Write a Verifier](/wyrd/build-and-verify/verify/author-a-verifier/): Write a Verifier, bind it to your Service, call it from your code, and read its verdict, then add a Python check and a model judge.
 - [Recipes](/wyrd/build-and-verify/verify/verifier-recipes/): Copyable Verifiers for common checks, each with its YAML and the Python that calls it - assertions, traces, Python checks, model judges, multi-step, uploaded files, grouped sessions, and drift.
+- [Verify during a request](/wyrd/build-and-verify/verify/verify-a-request-in-real-time/): Call the Quickstart's release check from a web API, send a report only after its verdict passes, and hold every other outcome with the reason.
 - [Act on verdicts in production](/wyrd/build-and-verify/verify/act-on-verdicts-in-production/): Handle passed, failed, inconclusive, errors, and timeouts explicitly, decide what model providers may see, and measure latency and cost for the Verifier you deploy.
 
 ## Connect

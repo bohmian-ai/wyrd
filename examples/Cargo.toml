@@ -39,6 +39,10 @@ name = "finance_release"
 path = "finance-release/finance_release.rs"
 
 [[bin]]
+name = "finance_api"
+path = "finance-release/api.rs"
+
+[[bin]]
 name = "support_agent"
 path = "support-agent/support_agent.rs"
 
@@ -58,7 +62,7 @@ schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
 tracing = { workspace = true }
 wyrd-ai = { path = "../sdks/wyrd-sdk-rust", features = ["otel"] }
 

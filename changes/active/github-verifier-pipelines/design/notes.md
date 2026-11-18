@@ -1,5 +1,18 @@
 # GitHub Verifier pipelines
 
+## UI query and hot-read optimization — proposed supplement
+
+The maintainer requested the [UI query audit and hot-read proposal](ui-hot-read-latency.md),
+then required independent tasks/worktrees. The
+[bounded TASK-012-R2 design](task-012-r2-hot-reads.md) supersedes the joint proposal's
+cross-worktree dependencies: task-004 freezes original UI SQL, records the L1
+baseline, then changes shared hot execution. TASK-004B independently consolidates
+UI queries in `Github/wyrd`; neither consumes the other's implementation or
+qualification. The selected scope is ready for task authoring, while the spec
+scope amendment remains required before implementation. Earlier numerical UI
+SLO recommendations were not agreed and do not govern TASK-012-R2. Prior
+agreements and historical remediation records remain intact.
+
 Status: exploring (direct-cache eligibility refinement; agreed remediation retained)
 
 ## Direct cache eligibility

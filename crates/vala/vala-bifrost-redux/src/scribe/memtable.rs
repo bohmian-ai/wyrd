@@ -2339,12 +2339,19 @@ impl ReadableSource {
                 continue;
             }
             workspace.free();
-            let captured = batch;
+            // Every batch held below derives from the source columns the
+            // projection reads, so only their allocations can be shared; they
+            // are collected once for every charge against this batch.
+            let captured = crate::scribe::memory::allocations(
+                projection
+                    .iter()
+                    .filter_map(|(_, source)| source.map(|column| batch.column(column))),
+            );
             let hold = |held: &[RecordBatch]| {
                 workspace
-                    .try_resize(crate::scribe::memory::unshared_arrow_bytes(
+                    .try_resize(crate::scribe::memory::unshared_beyond(
                         held,
-                        &[captured],
+                        captured.clone(),
                     ))
                     .map_err(refused)
             };
@@ -2402,9 +2409,9 @@ impl ReadableSource {
             // takes over whatever allocations the output kept from it.
             workspace.free();
             query
-                .try_grow(crate::scribe::memory::unshared_arrow_bytes(
+                .try_grow(crate::scribe::memory::unshared_beyond(
                     std::slice::from_ref(&batch),
-                    &[captured],
+                    captured,
                 ))
                 .map_err(refused)?;
             output.push(ReadableBatch {

@@ -58,7 +58,23 @@ pub(crate) fn unshared_arrow_bytes(
     source: &[arrow::record_batch::RecordBatch],
     shared: &[&arrow::record_batch::RecordBatch],
 ) -> usize {
-    let mut charged = allocations(shared);
+    unshared_beyond(
+        source,
+        allocations(shared.iter().flat_map(|batch| batch.columns())),
+    )
+}
+
+/// Returns the distinct allocated bytes `source` keeps alive beyond
+/// `charged`, the allocations [`allocations`] collected from what already
+/// holds them.
+///
+/// A caller that charges several batches against one holder collects the
+/// holder's allocations once and passes each charge its own copy, so the
+/// holder is walked once rather than once per charge.
+pub(crate) fn unshared_beyond(
+    source: &[arrow::record_batch::RecordBatch],
+    mut charged: std::collections::HashSet<(usize, usize)>,
+) -> usize {
     source
         .iter()
         .flat_map(arrow::record_batch::RecordBatch::columns)
@@ -76,7 +92,7 @@ pub(crate) fn unshared_ipc_bytes(
 ) -> usize {
     let start = ipc.as_ptr() as usize;
     let frame = start..start.saturating_add(ipc.len());
-    if allocations(shared)
+    if allocations(shared.iter().flat_map(|batch| batch.columns()))
         .iter()
         .any(|(allocation, _)| frame.contains(allocation))
     {
@@ -86,13 +102,13 @@ pub(crate) fn unshared_ipc_bytes(
     }
 }
 
-/// The distinct allocations `batches` keep alive, keyed as
+/// The distinct allocations `columns` keep alive, keyed as
 /// [`retained_arrow_bytes`] keys them.
-fn allocations(
-    batches: &[&arrow::record_batch::RecordBatch],
+pub(crate) fn allocations<'a>(
+    columns: impl IntoIterator<Item = &'a arrow::array::ArrayRef>,
 ) -> std::collections::HashSet<(usize, usize)> {
     let mut charged = std::collections::HashSet::new();
-    for column in batches.iter().flat_map(|batch| batch.columns()) {
+    for column in columns {
         retained_array_bytes(&column.to_data(), &mut charged);
     }
     charged

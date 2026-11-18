@@ -118,6 +118,20 @@ fn record_lane_finished(lane: &'static str) {
     metrics::gauge!("bifrost_scribe_lane_active", "lane" => lane).decrement(1.0);
 }
 
+/// Records the time since `queued`, when a `lane` job was submitted, as one
+/// [`LANE_WAIT_SECONDS`] observation, only while benchmarking.
+fn record_lane_wait(lane: &'static str, queued: std::time::Instant) {
+    if wyrd_benchmark::enabled() {
+        metrics::histogram!(LANE_WAIT_SECONDS, "lane" => lane)
+            .record(queued.elapsed().as_secs_f64());
+    }
+}
+
+/// Benchmark-only histogram of a lane job's wait from submission until a
+/// worker started it, by `lane`; the job's own run is
+/// `bifrost_scribe_lane_job_seconds`.
+const LANE_WAIT_SECONDS: &str = "bifrost_scribe_lane_wait_seconds";
+
 fn record_lane_job(lane: &'static str, succeeded: bool, elapsed: std::time::Duration) {
     let status = if succeeded { "completed" } else { "failed" };
     metrics::counter!("bifrost_scribe_lane_jobs_total", "lane" => lane, "status" => status)
@@ -139,6 +153,13 @@ fn record_lane_job(lane: &'static str, succeeded: bool, elapsed: std::time::Dura
 fn record_lane_saturation(lane: &'static str) {
     metrics::counter!("bifrost_scribe_lane_saturation_total", "lane" => lane).increment(1);
 }
+
+/// One claimed application queue slot of the ingress lane.
+///
+/// Claimed by [`ScribeIngressCpuPool::try_slot`] and consumed by
+/// [`ScribeIngressCpuPool::spawn`]; dropping an unused slot returns it.
+#[derive(Debug)]
+pub(crate) struct IngressSlot(tokio::sync::OwnedSemaphorePermit);
 
 /// The latency-sensitive native decode lane. Its queue is application-bounded;
 /// Rayon never becomes the source of untracked backpressure.
@@ -295,7 +316,9 @@ impl ScribeIngressCpuPool {
         let failed = Arc::clone(&self.failed);
         let conform = Arc::clone(&self.conform);
         let workloads = self.workloads.clone();
+        let queued = std::time::Instant::now();
         self.pool.spawn_fifo(move || {
+            record_lane_wait("ingress", queued);
             let started = std::time::Instant::now();
             active.fetch_add(1, Ordering::AcqRel);
             record_lane_started("ingress");
@@ -366,13 +389,62 @@ impl ScribeIngressCpuPool {
         T: Send + 'static,
         F: FnOnce() -> Result<T, ScribeError> + Send + 'static,
     {
-        let Ok(permit) = self.permits.clone().try_acquire_owned() else {
+        let slot = self.claim_slot()?;
+        self.spawn(slot, tenant, job).await
+    }
+
+    /// Claims one application queue slot for a job that cannot wait.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::IngestBusy`] when the lane is full, counting the
+    /// refusal as lane saturation.
+    pub(crate) fn claim_slot(&self) -> Result<IngressSlot, ScribeError> {
+        self.try_slot().ok_or_else(|| {
             self.saturation_events.fetch_add(1, Ordering::Relaxed);
             record_lane_saturation("ingress");
-            return Err(ScribeError::IngestBusy {
+            ScribeError::IngestBusy {
                 table: "ingress".to_owned(),
-            });
-        };
+            }
+        })
+    }
+
+    /// Claims one of this lane's application queue slots without waiting.
+    ///
+    /// Returns `None` when the lane is full. Unlike [`Self::run`], a miss is
+    /// not counted as saturation: a caller that can fall back to running the
+    /// job later, such as a group's optional second conversion, has refused
+    /// nothing.
+    pub(crate) fn try_slot(&self) -> Option<IngressSlot> {
+        self.permits
+            .clone()
+            .try_acquire_owned()
+            .ok()
+            .map(IngressSlot)
+    }
+
+    /// Starts `job` on this lane in `slot` as `tenant`'s work and returns its
+    /// completion.
+    ///
+    /// The job and the slot move to the worker at once, so dropping the
+    /// returned future never cancels the job: the job still owns whatever
+    /// memory it carries until it finishes, and the slot frees only then.
+    ///
+    /// # Errors
+    ///
+    /// The returned future yields the job's own error, or
+    /// [`ScribeError::Internal`] when the worker panics or drops its result.
+    pub(crate) fn spawn<T, F>(
+        &self,
+        slot: IngressSlot,
+        tenant: Option<DataTenantId>,
+        job: F,
+    ) -> impl std::future::Future<Output = Result<T, ScribeError>> + Send + 'static
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, ScribeError> + Send + 'static,
+    {
+        let IngressSlot(permit) = slot;
         self.depth.fetch_add(1, Ordering::AcqRel);
         record_lane_enqueued("ingress");
         let (sender, receiver) = oneshot::channel();
@@ -383,7 +455,9 @@ impl ScribeIngressCpuPool {
         let completed = Arc::clone(&self.completed);
         let failed = Arc::clone(&self.failed);
         let workloads = self.workloads.clone();
+        let queued = std::time::Instant::now();
         self.pool.spawn_fifo(move || {
+            record_lane_wait("ingress", queued);
             let started = std::time::Instant::now();
             active.fetch_add(1, Ordering::AcqRel);
             record_lane_started("ingress");
@@ -411,9 +485,11 @@ impl ScribeIngressCpuPool {
             record_lane_job("ingress", result.is_ok(), started.elapsed());
             let _ = sender.send(result);
         });
-        receiver.await.map_err(|_| ScribeError::Internal {
-            detail: "Scribe ingress CPU worker dropped its result".to_owned(),
-        })?
+        async move {
+            receiver.await.map_err(|_| ScribeError::Internal {
+                detail: "Scribe ingress CPU worker dropped its result".to_owned(),
+            })?
+        }
     }
 
     pub(crate) fn snapshot(&self) -> crate::scribe::telemetry::ExecutorSnapshot {
@@ -2286,7 +2362,9 @@ impl ScribeWalIoPool {
         depth.fetch_add(1, Ordering::AcqRel);
         record_lane_enqueued("wal_io");
         let active = Arc::clone(&self.active);
+        let queued = std::time::Instant::now();
         self.pool.spawn_fifo(move || {
+            record_lane_wait("wal_io", queued);
             let started = std::time::Instant::now();
             active.fetch_add(1, Ordering::AcqRel);
             record_lane_started("wal_io");

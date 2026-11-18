@@ -60,15 +60,16 @@ skipped = refund_agent("1042", remembered=ORDERS["1042"])
 state.flush()  # store the spans before they are checked
 
 cases = [
-    ("complete", complete.model_dump()),
-    ("skipped", skipped.model_dump()),
+    ("complete", complete),
+    ("skipped", skipped),
     # The same reply sent without its trace: nothing shows what ran.
-    ("no trace", complete.model_dump(exclude={"trace"})),
+    ("no trace", {"reply": complete.reply}),
 ]
 for label, evidence in cases:
     with state.run() as run:
-        result = run.observe.verify("refund-workflow", **evidence)
-    print(f"{label}: {result.verdict} · {evidence['reply']}")
+        result = run.observe.verify("refund-workflow", evidence)
+    # All three replies are the same text.
+    print(f"{label}: {result.verdict} · {complete.reply}")
     for requirement in result.requirements:
         print(f"  {requirement['id']}: {requirement['outcome']}")
 state.shutdown()

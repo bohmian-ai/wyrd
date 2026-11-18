@@ -37,7 +37,7 @@ The program finds the newest failed `refund-workflow` result in `bifrost.verific
 </LangTab>
 </LangTabs>
 
-A result becomes queryable shortly after its check, not at the moment `verify` returns, so the program looks for up to a minute. A result that is not visible yet is not treated as a pass or a failure.
+`verify` returns its verdict before Wyrd stores the record. Wyrd writes results after the request, off the request's path, so a new result becomes queryable a moment after the call returns. The program therefore retries for up to a minute. A missing row means the record has not been written yet; it says nothing about the verdict. [What Wyrd retains](/understand/how-verification-works/#what-wyrd-retains-and-how-requirements-change) explains the write path.
 
 ## 2. Run it
 

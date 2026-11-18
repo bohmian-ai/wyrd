@@ -50,7 +50,7 @@ They keep their versions. Every result names the exact Verifier and subject vers
 
 ## Where is the evidence kept?
 
-Each result's summary goes to `bifrost.verification.results`, its requirement outcomes and steps to `bifrost.verification.execution_outputs`, and the pinned inputs to `bifrost.verification.execution_inputs`, all queryable with SQL. The server stores them after it answers, so a row appears shortly after the call returns. An abrupt server stop before that write loses the record, though the verdict already returned stands; the loss is counted. [What Wyrd retains](/understand/how-verification-works/#what-wyrd-retains-and-how-requirements-change) explains the boundary.
+Each result's summary goes to `bifrost.verification.results`, its requirement outcomes and steps to `bifrost.verification.execution_outputs`, and the pinned inputs to `bifrost.verification.execution_inputs`, all queryable with SQL. The server stores them after it answers, batching for at most 50 ms before the write, so a row appears shortly after the call returns. Only an abrupt server stop before that write loses the record, though the verdict already returned stands; the loss is counted. [What Wyrd retains](/understand/how-verification-works/#what-wyrd-retains-and-how-requirements-change) explains the boundary.
 
 ## Which languages are supported?
 

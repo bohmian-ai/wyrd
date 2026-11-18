@@ -1743,7 +1743,6 @@ state = WyrdState.declare(service)
 print(f"service: {state.root_ref}")
 print(f"agent:   {state.card_ref('agent')}")
 
-state.start_bifrost()  # the writer; the one declared table is active
 try:
     for answer in ("Your refund request is approved.", "You have a guaranteed refund."):
         # A Run whose view is the Agent, where the Verifier is bound.
@@ -1828,7 +1827,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("service: {}", state.root_ref());
     println!("agent:   {}", state.card_ref("agent")?);
 
-    state.start_bifrost().await?; // the writer; the one declared table is active
     for answer in [
         "Your refund request is approved.",
         "You have a guaranteed refund.",
@@ -1901,7 +1899,6 @@ const id = (ref: CardRef) => `${ref.kind}/${ref.name}@${ref.version}#${ref.uid}`
 console.log(`service: ${id(state.rootRef)}`);
 console.log(`agent:   ${id(state.cardRef("agent"))}`);
 
-await state.startBifrost(); // the writer; the one declared table is active
 try {
   for (const answer of ["Your refund request is approved.", "You have a guaranteed refund."]) {
     // A Run whose view is the Agent, where the Verifier is bound.
@@ -2272,7 +2269,6 @@ The [Verifier reference](/wyrd/reference/verifier-card/) lists every operator an
 | You see | Fix |
 | --- | --- |
 | `WYRD_SDK_404_UNKNOWN_VERIFIER` | Verify on the view the Verifier is bound to: `state.run("agent")` |
-| `WYRD_SDK_400_BIFROST_NOT_STARTED` | Call `start_bifrost` before the first `write` |
 | `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH` | The table exists with different columns: keep its schema, or use a new table name |
 | No rows after a minute | Check that the program reached `shutdown` without an error |
 
@@ -2305,7 +2301,6 @@ from wyrd import WyrdClient, WyrdState
 client = WyrdClient()  # finds the server and credential wyrd init saved
 state = WyrdState.declare("service/support-desk.yaml", client)
 state.configure()      # exports spans, logs, and metrics under this Service and environment
-state.start_bifrost()  # the writer for rows and verdict inputs
 
 # Your model calls go through Wyrd's gateway. http_auth signs each call and
 # ties it to the Run it is made in.
@@ -2316,8 +2311,6 @@ gateway = OpenAI(
 )
 prompt = state.prompt("prompt").prompt  # the Service's declared Prompt
 ```
-
-`start_bifrost` is the first server call, so a wrong URL or credential fails here, at startup.
 
 ## 2. Answer inside a Run
 
@@ -2411,7 +2404,6 @@ Pull the exact Service version at deploy time with `wyrd pull`, load it with `Wy
 
 | You see | Fix |
 | --- | --- |
-| `WYRD_SDK_400_BIFROST_NOT_STARTED` | Call `state.start_bifrost()` at startup, before any `observe` call |
 | `WYRD_SDK_404_UNKNOWN_VERIFIER` | Call the Verifier on the view it is bound to: `run` for the Service, `agent` for the agent |
 | `WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND` | Declare the table under the Service's `spec.tables` |
 | `WYRD_VALA_403_BIFROST_CARD_SCOPE` at `shutdown` | Use a key issued for this Service version |
@@ -3779,15 +3771,16 @@ skipped = refund_agent("1042", remembered=ORDERS["1042"])
 state.flush()  # store the spans before they are checked
 
 cases = [
-    ("complete", complete.model_dump()),
-    ("skipped", skipped.model_dump()),
+    ("complete", complete),
+    ("skipped", skipped),
     # The same reply sent without its trace: nothing shows what ran.
-    ("no trace", complete.model_dump(exclude={"trace"})),
+    ("no trace", {"reply": complete.reply}),
 ]
 for label, evidence in cases:
     with state.run() as run:
-        result = run.observe.verify("refund-workflow", **evidence)
-    print(f"{label}: {result.verdict} · {evidence['reply']}")
+        result = run.observe.verify("refund-workflow", evidence)
+    # All three replies are the same text.
+    print(f"{label}: {result.verdict} · {complete.reply}")
     for requirement in result.requirements:
         print(f"  {requirement['id']}: {requirement['outcome']}")
 state.shutdown()
@@ -3947,7 +3940,7 @@ import { trace } from "@opentelemetry/api";
 import { verify, WyrdState } from "wyrd-ai";
 import { z } from "zod";
 
-const { Check, Requirement, Service, Verifier, traceSlot } = verify;
+const { Check, Requirement, Service, Trace, Verifier } = verify;
 
 // Synthetic order records the agent's lookup tool reads.
 type Order = { delivered: string; refundable: boolean };
@@ -3955,7 +3948,7 @@ const ORDERS: Record<string, Order> = { "1042": { delivered: "2 May", refundable
 
 const RefundReply = z.object({
   reply: z.string(),
-  trace: traceSlot(z.string()), // the trace ID of the work behind the reply
+  trace: Trace(z.string()), // the trace ID of the work behind the reply
 });
 type RefundReply = z.infer<typeof RefundReply>;
 
@@ -4286,7 +4279,7 @@ for (const requirement of details.outcome.requirements) {
 
 ```
 
-A result becomes queryable shortly after its check, not at the moment `verify` returns, so the program looks for up to a minute. A result that is not visible yet is not treated as a pass or a failure.
+`verify` returns its verdict before Wyrd stores the record. Wyrd writes results after the request, off the request's path, so a new result becomes queryable a moment after the call returns. The program therefore retries for up to a minute. A missing row means the record has not been written yet; it says nothing about the verdict. [What Wyrd retains](/wyrd/understand/how-verification-works/#what-wyrd-retains-and-how-requirements-change) explains the write path.
 
 ## 2. Run it
 
@@ -4472,7 +4465,6 @@ from wyrd import WyrdState
 
 # The checkout Service, pulled at deploy time.
 state = WyrdState.from_path(".wyrd-bundle")
-state.start_bifrost()  # samples are sent to Bifrost, where the schedule reads them
 
 # Record five checkout requests that each took the given number of milliseconds.
 latency = float(sys.argv[1])
@@ -4526,7 +4518,6 @@ use wyrd_ai::state::WyrdState;
 async fn main() -> Result<(), Box<dyn Error>> {
     // The checkout Service, pulled at deploy time.
     let state = WyrdState::from_path(".wyrd-bundle")?;
-    state.start_bifrost().await?; // samples are sent to Bifrost, where the schedule reads them
 
     let latency: f64 = std::env::args()
         .nth(1)
@@ -4617,7 +4608,6 @@ import { WyrdState } from "wyrd-ai";
 
 // The checkout Service, pulled at deploy time.
 const state = WyrdState.fromPath(".wyrd-bundle");
-await state.startBifrost(); // samples are sent to Bifrost, where the schedule reads them
 
 const latency = Number(process.argv[2]);
 const run = state.run();
@@ -5149,7 +5139,6 @@ The reply names the request's Run and a `failed` verdict. A second request retur
 | --- | --- |
 | Startup fails with `WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS` | Your app installs its own tracer provider: pass `telemetry=False` and add `wyrd.otel.span_exporter(client)` to that provider |
 | Startup fails with an `ImportError` naming `otel` | Install `wyrd-ai[otel]`, or pass `telemetry=False` |
-| `WYRD_SDK_400_BIFROST_NOT_STARTED` when the app records | The server runs without lifespan: leave Uvicorn's `--lifespan` at `auto` or set it to `on` |
 | `WYRD_SDK_404_UNKNOWN_ALIAS` on every request | `alias` returned a name the bundle does not have |
 
 ## Advanced
@@ -5403,7 +5392,6 @@ self.state = WyrdState.from_path(BUNDLE, self.client)
 # verification carries; name and version come from the bundle. Spans
 # export to Wyrd through the SDK's OTLP exporter.
 self.state.configure(deployment_environment="development")
-self.state.start_bifrost()
 # The Agents SDK's own traces become spans too, under the request's Run.
 set_trace_processors([WyrdAgentsTraceProcessor()])
 ```
@@ -5418,8 +5406,6 @@ state.configure(ConfigureOptions {
     deployment_environment: Some("development".to_owned()),
     ..ConfigureOptions::default()
 })?;
-// Starts the buffered writer the ticket rows go through.
-state.start_bifrost().await?;
 ```
 
 **TypeScript**
@@ -5431,7 +5417,6 @@ const client = WyrdClient.connect();
 const state = WyrdState.fromPath(BUNDLE_DIR, { client });
 // The Service name, version, and environment every span, gateway call, and verification carries; name and version come from the bundle. Spans export to Wyrd.
 await state.configure({ deploymentEnvironment: "development" });
-await state.startBifrost(); // writes tickets to Bifrost
 ```
 
 Loading is offline. From then on, every call sends the runtime key with the release named in the bundle, and the server records both on each row. You never set a release ID yourself.
@@ -6461,7 +6446,7 @@ The whole call is bounded by `WYRD_VERIFICATION_TIMEOUT_MS`, 60 seconds by defau
 
 ## What Wyrd retains, and how requirements change
 
-Returning the verdict does not wait for its record. The server stages the result and its pinned inputs on its in-process outbox and answers; Bifrost then stores them, and they become queryable shortly after. If an abrupt server stop loses the staged copy before it is written, the verdict the application received still stands, but no record of it is retained, and the loss is counted. A returned verdict is therefore not proof that its record is already stored or queryable.
+Returning the verdict does not wait for its record, so storage never slows the request. The server queues the result and its pinned inputs in memory and answers. It batches queued records for at most 50 ms, then writes them to Bifrost's write-ahead log; once written they survive a crash, and they become queryable shortly after. A clean shutdown writes everything still queued. Only an abrupt server stop before that write loses a record; the verdict the application received still stands, and the loss is counted.
 
 Stored results live in three Bifrost tables, all queryable with SQL: each result's summary in `bifrost.verification.results`, its requirement outcomes and steps in `bifrost.verification.execution_outputs`, and its inputs in `bifrost.verification.execution_inputs`. The result the call returns is compact: the verdict and each requirement's outcome. The checks, provenance, step outputs, and pinned evidence stay in storage for later inspection, as the Quickstart's [stored verdicts](/wyrd/get-started/quickstart/#4-confirm-the-stored-verdicts) step shows. [Runs and evidence](/wyrd/understand/runs-observations-and-evidence/) and [Bifrost](/wyrd/understand/bifrost/) explain retention and query visibility.
 
@@ -6800,7 +6785,7 @@ They keep their versions. Every result names the exact Verifier and subject vers
 
 ## Where is the evidence kept?
 
-Each result's summary goes to `bifrost.verification.results`, its requirement outcomes and steps to `bifrost.verification.execution_outputs`, and the pinned inputs to `bifrost.verification.execution_inputs`, all queryable with SQL. The server stores them after it answers, so a row appears shortly after the call returns. An abrupt server stop before that write loses the record, though the verdict already returned stands; the loss is counted. [What Wyrd retains](/wyrd/understand/how-verification-works/#what-wyrd-retains-and-how-requirements-change) explains the boundary.
+Each result's summary goes to `bifrost.verification.results`, its requirement outcomes and steps to `bifrost.verification.execution_outputs`, and the pinned inputs to `bifrost.verification.execution_inputs`, all queryable with SQL. The server stores them after it answers, batching for at most 50 ms before the write, so a row appears shortly after the call returns. Only an abrupt server stop before that write loses the record, though the verdict already returned stands; the loss is counted. [What Wyrd retains](/wyrd/understand/how-verification-works/#what-wyrd-retains-and-how-requirements-change) explains the boundary.
 
 ## Which languages are supported?
 

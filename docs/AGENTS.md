@@ -87,6 +87,9 @@ Copy the named page when writing a new one of the same shape.
   describe. Prose after a block covers only its output and what to do next.
 - Show the output a command prints when it confirms success, in a `text` block
   directly after the command.
+- Pass a model instance (Pydantic model, Zod-parsed object) straight to
+  `verify` or `submit`. Never `model_dump()` or rebuild a dict from it first:
+  the SDK reads the model's fields as the input slots.
 - Use `<LangTabs langs={['python', 'rust', 'typescript']}>` for anything that
   differs by language, in that order.
 - Show a Card declaration one of two ways. Where the page teaches the code

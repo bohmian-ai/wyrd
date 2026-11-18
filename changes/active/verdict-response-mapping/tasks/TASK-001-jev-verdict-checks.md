@@ -183,6 +183,33 @@ that proof rather than manufacturing a RED result.
    the hosted consumer path in each SDK's shipped boundary. Initial RED is
    missing leaf dispatch or wrong interpretation, not unsupported fixture data.
 
+   Evidence:
+   - Journeys, one per SDK, on the same `policy-desk` workflow: a `desk-judge` Jev Agent asks a custom Choice
+     (`compliant`/`violation`/`unknown`), two Nouls and a three-level Score, and `desk-policy` reads one
+     answer through a Choice map, Probability expected true (0.75/0.25), Probability expected false (0.9/0.1)
+     and Score `greater_than_or_equals: 2`.
+     - Rust: `sdks/wyrd-sdk-rust/tests/integration/gateway_jev.rs::jev_policies_judge_choice_probability_and_score`.
+     - Python: `sdks/wyrd-sdk-python/tests/integration/test_gateway_jev.py::test_jev_policies_judge_choice_probability_and_score` (3 parametrized cases).
+     - TypeScript: `sdks/wyrd-sdk-ts/wyrd/tests/integration/gateway-jev.test.ts` "jev policies judge $verdict answers" (3 cases).
+   - Cases: pass (`compliant` at confidence 0.3, Noul 0.75 at the inclusive pass bound, expected-false 0.02,
+     Score 2 at its bound); fail (`violation` at confidence 0.99, Noul 0.25 at the inclusive fail bound,
+     expected-false 0.98, Score 1.8); unknown (`unknown`, both Nouls 0.5 in the band, Score 2). Each case asserts
+     every requirement outcome, the exact reason (answer, policy and, for expected false, the adjusted
+     probability), the selected native answer as `actual`, empty citations, the execution verdict, and the
+     exact native upstream body.
+   - Commands: Rust `... cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(=gateway_jev::jev_policies_judge_choice_probability_and_score)'`;
+     Python `... pytest tests/integration/test_gateway_jev.py -k policies_judge`; TypeScript
+     `... vitest run tests/integration/gateway-jev.test.ts -t 'jev policies'`, each under
+     `scripts/postgres/with-test-postgres.sh` as in scenario 2.
+   - GREEN: Rust `1 passed` (whole `gateway_jev` module: 6 passed); Python `3 passed` (whole file: 8 passed);
+     TypeScript whole file `8 passed`.
+   - TDD deviation: no RED was observed. Leaf dispatch and interpretation for all three policies shipped in
+     scenario 1's commit (`vala-verify blocks::transform`, with its boundary unit tests
+     `choice_maps_labels_and_ignores_confidence`, `probability_thresholds_are_inclusive_for_both_polarities`,
+     `score_compares_level_indices`), so these journeys passed on first run. They pin the hosted path.
+   - Checks: `cargo clippy -p wyrd-ai --all-targets -D warnings`, `py:lints`, `py:typecheck`, `ts:lints`,
+     `ts:typecheck` pass.
+
 4. **Correct invalid authoring before invocation** — REQ-002, REQ-005–008,
    REQ-011, REQ-013; J6. Using public language construction and local graph
    validate, submit invalid fields/types, invalid finite threshold ordering,

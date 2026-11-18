@@ -81,6 +81,39 @@ const TYPED_DESK_QUESTIONS = {
   }),
 };
 
+/** The policy desk's questions: a custom Choice, two Nouls, and a three-level Score. */
+const POLICY_QUESTIONS = {
+  refund: {
+    type: "choice",
+    instructions: "Does the reply follow the refund policy?",
+    criteria: {
+      compliant: "It follows the policy.",
+      violation: "It breaks the policy.",
+      unknown: "It cannot be judged.",
+    },
+  },
+  helpful: { type: "noul", instructions: "Does the reply help the customer?" },
+  unresolved: { type: "noul", instructions: "Does the reply leave the issue unresolved?" },
+  compliance: { type: "score", instructions: "How compliant is the reply?", criteria: ["Low", "Medium", "High"] },
+} as const;
+
+/** Jev's answers to the policy desk questions. */
+function policyAnswers(label: string, confidence: number, helpful: number, unresolved: number, score: number) {
+  return {
+    refund: { type: "choice", choice: label, confidence, probabilities: { [label]: confidence } },
+    helpful: { type: "noul", noul: helpful },
+    unresolved: { type: "noul", noul: unresolved },
+    compliance: { type: "score", score, legend: { "0": "Low", "1": "Medium", "2": "High" } },
+  };
+}
+
+/** State marker → Jev's policy desk answers: every bound, both polarities, and the band between. */
+const POLICY_ANSWERS: Record<string, ReturnType<typeof policyAnswers>> = {
+  "DESK-PASS": policyAnswers("compliant", 0.3, 0.75, 0.02, 2),
+  "DESK-FAIL": policyAnswers("violation", 0.99, 0.25, 0.98, 1.8),
+  "DESK-UNSURE": policyAnswers("unknown", 0.5, 0.5, 0.5, 2),
+};
+
 /** Jev's answer to every refund desk question, selecting `choice` for the refund question. */
 function deskAnswer(choice: string) {
   return {
@@ -135,6 +168,10 @@ function jev(request: ReceivedRequest): Reply {
   const desk = Object.entries(REFUND_CHOICES).find(([marker]) => state.includes(marker));
   if (desk) {
     return { status: 200, body: deskAnswer(desk[1]) };
+  }
+  const policy = Object.entries(POLICY_ANSWERS).find(([marker]) => state.includes(marker));
+  if (policy) {
+    return { status: 200, body: { model: "jev-1.13.0", answers: policy[1] } };
   }
   return { status: 200, body: state.includes("Go away") ? answer(0.12, "rude") : answer(0.93, "polite") };
 }
@@ -359,6 +396,151 @@ test("typed jev choice check becomes the verdict", async ({ provider, deployed: 
       model: "jev-latest",
       state: reply,
       questions: NATIVE_DESK_QUESTIONS,
+    });
+  }
+});
+
+/**
+ * `policy-desk`: one Jev Agent's answer read by four acceptance policies.
+ * `desk-policy` maps the custom `refund` labels, reads `helpful` expected
+ * true and `unresolved` expected false, and requires `compliance >= 2`.
+ */
+function policyDesk(): verify.Service {
+  const judge = new Agent("desk-judge", {
+    version: "1.0.0",
+    prompt: Prompt.jev("jev-latest", { state: STATE, questions: POLICY_QUESTIONS }),
+    execution_route: { kind: "wyrd_gateway", deployment: "jev" },
+    run_config: { max_iterations: 1 },
+  });
+  const refund: verify.ChoiceTransform = {
+    kind: "choice",
+    question: "refund",
+    outcomes: { compliant: "passed", violation: "failed", unknown: "inconclusive" },
+  };
+  const helpful: verify.ProbabilityTransform = {
+    kind: "probability",
+    question: "helpful",
+    expected: true,
+    pass_at: 0.75,
+    fail_at: 0.25,
+  };
+  const resolved: verify.ProbabilityTransform = {
+    kind: "probability",
+    question: "unresolved",
+    expected: false,
+    pass_at: 0.9,
+    fail_at: 0.1,
+  };
+  const compliant: verify.ScoreTransform = {
+    kind: "score",
+    question: "compliance",
+    operator: "greater_than_or_equals",
+    expected: 2,
+  };
+  const verifier = new Verifier("desk-policy", {
+    version: "1.0.0",
+    inputs: { reply: { type: "string" } },
+    requirements: (
+      [
+        ["refund-policy", "The reply follows the refund policy.", refund],
+        ["helpful", "The reply helps the customer.", helpful],
+        ["resolved", "The reply resolves the issue.", resolved],
+        ["compliant", "The reply is at least highly compliant.", compliant],
+      ] as const
+    ).map(
+      ([id, statement, transform]) =>
+        new Requirement(
+          id,
+          statement,
+          Check.agent(judge, { inputs: { context: "inputs.reply" }, verdict_transform: transform }),
+        ),
+    ),
+  });
+  return new Service("policy-desk", { version: "1.0.0" }).addComponent(
+    new Component("desk-judge", judge).verifiedBy([verifier]),
+  );
+}
+
+// Each acceptance policy reads its own question of one Jev answer: a custom
+// Choice map assigns every label its outcome whatever the confidence, Noul
+// bounds are inclusive for both polarities with an inconclusive band
+// between, and a Score comparison passes at its bound and fails below it.
+// The selected native answer is each requirement's actual value.
+test.for([
+  {
+    reply: "DESK-PASS: the refund follows policy.",
+    outcomes: ["passed", "passed", "passed", "passed"],
+    verdict: "passed",
+    reasons: [
+      "Question 'refund' selected 'compliant' (confidence 0.3), which the policy maps to passed.",
+      "Question 'helpful' answered true with probability 0.75; the expected answer true has probability 0.75, at least pass_at 0.75.",
+      `Question 'unresolved' answered true with probability 0.02; the expected answer false has probability ${1 - 0.02}, at least pass_at 0.9.`,
+      "Question 'compliance' scored 2 on levels 0 to 2; greater_than_or_equals 2 holds.",
+    ],
+  },
+  {
+    reply: "DESK-FAIL: you get a refund whatever the policy says.",
+    outcomes: ["failed", "failed", "failed", "failed"],
+    verdict: "failed",
+    reasons: [
+      "Question 'refund' selected 'violation' (confidence 0.99), which the policy maps to failed.",
+      "Question 'helpful' answered true with probability 0.25; the expected answer true has probability 0.25, at most fail_at 0.25.",
+      `Question 'unresolved' answered true with probability 0.98; the expected answer false has probability ${1 - 0.98}, at most fail_at 0.1.`,
+      "Question 'compliance' scored 1.8 on levels 0 to 2; greater_than_or_equals 2 does not hold.",
+    ],
+  },
+  {
+    reply: "DESK-UNSURE: we will see.",
+    outcomes: ["inconclusive", "inconclusive", "inconclusive", "passed"],
+    verdict: "inconclusive",
+    reasons: [
+      "Question 'refund' selected 'unknown' (confidence 0.5), which the policy maps to inconclusive.",
+      "Question 'helpful' answered true with probability 0.5; the expected answer true has probability 0.5, between fail_at 0.25 and pass_at 0.75.",
+      "Question 'unresolved' answered true with probability 0.5; the expected answer false has probability 0.5, between fail_at 0.1 and pass_at 0.9.",
+      "Question 'compliance' scored 2 on levels 0 to 2; greater_than_or_equals 2 holds.",
+    ],
+  },
+])("jev policies judge $verdict answers", async ({ reply, outcomes, verdict, reasons }, { provider, deployed: _ }) => {
+  const state = await WyrdState.declare(policyDesk());
+  const before = provider.received.length;
+
+  const result = await state.run("desk-judge").observe.verify("desk-policy", { reply });
+
+  const answers = POLICY_ANSWERS[reply.split(":")[0] ?? ""];
+  const judged = new Map(result.outcome.requirements.map((each) => [each.id, each]));
+  const read = (
+    [
+      ["refund-policy", "refund"],
+      ["helpful", "helpful"],
+      ["resolved", "unresolved"],
+      ["compliant", "compliance"],
+    ] as const
+  ).map(([id, question]) => {
+    const each = judged.get(id);
+    return {
+      outcome: each?.outcome,
+      reason: each?.reason,
+      actual: each?.actual,
+      citations: each?.citations ?? [],
+      question,
+    };
+  });
+  expect(read).toEqual(
+    read.map(({ question }, index) => ({
+      outcome: outcomes[index],
+      reason: reasons[index],
+      actual: answers?.[question],
+      citations: [],
+      question,
+    })),
+  );
+  expect(result.outcome.verdict).toBe(verdict);
+  const delivered = provider.received.slice(before);
+  expect(delivered.length).toBeGreaterThan(0);
+  for (const each of delivered) {
+    expect({ path: each.path, body: JSON.parse(each.body) }).toEqual({
+      path: "/v1/systemone",
+      body: { model: "jev-latest", state: reply, questions: POLICY_QUESTIONS },
     });
   }
 });

@@ -23,8 +23,9 @@ use wyrd_ai::gateway_admin::{
 use wyrd_ai::operator_connections::SecretBearer;
 use wyrd_ai::state::{DeclareOptions, WyrdState};
 use wyrd_ai::verify::{
-    Agent, Check, ChoiceQuestion, ChoiceTransform, Component, InputSlot, Inputs, JevPromptOptions,
-    Prompt, Requirement, Service, VerdictTransform, Verifier,
+    Agent, Check, ChoiceQuestion, ChoiceTransform, ComparisonOperator, Component, InputSlot,
+    Inputs, JevPromptOptions, ProbabilityTransform, Prompt, Requirement, ScoreTransform, Service,
+    VerdictTransform, Verifier,
 };
 use wyrd_ai::{RequirementOutcome, VerificationVerdict};
 use wyrd_testing::server::WyrdTestServer;
@@ -551,4 +552,225 @@ fn native_refund_question() -> Value {
             "inconclusive": "The reply cannot be judged.",
         },
     })
+}
+
+/// The policy desk's questions: `refund` chooses a custom label,
+/// `helpful` and `unresolved` are yes-or-no, `compliance` grades on three
+/// ordered levels.
+fn desk_questions() -> Value {
+    json!({
+        "refund": {"type": "choice", "instructions": "Does the reply follow the refund policy?",
+                   "criteria": {"compliant": "It follows the policy.", "violation": "It breaks the policy.",
+                                "unknown": "It cannot be judged."}},
+        "helpful": {"type": "noul", "instructions": "Does the reply help the customer?"},
+        "unresolved": {"type": "noul", "instructions": "Does the reply leave the issue unresolved?"},
+        "compliance": {"type": "score", "instructions": "How compliant is the reply?",
+                       "criteria": ["Low", "Medium", "High"]},
+    })
+}
+
+/// Jev's answers to the policy desk: the refund `label` at `confidence`,
+/// `helpful` and `unresolved` probabilities, and the `compliance` score.
+fn desk_answers(label: &str, confidence: f64, helpful: f64, unresolved: f64, score: f64) -> Value {
+    json!({
+        "refund": {"type": "choice", "choice": label, "confidence": confidence,
+                   "probabilities": {label: confidence}},
+        "helpful": {"type": "noul", "noul": helpful},
+        "unresolved": {"type": "noul", "noul": unresolved},
+        "compliance": {"type": "score", "score": score,
+                       "legend": {"0": "Low", "1": "Medium", "2": "High"}},
+    })
+}
+
+/// The `policy-desk` Service: the `desk-judge` Jev Agent asking
+/// [`desk_questions`], verified by `desk-policy`, whose four requirements
+/// read the same answer through a custom Choice map, Noul expected true and
+/// expected false, and `compliance >= 2`.
+///
+/// # Panics
+/// Panics when the Prompt does not build.
+fn policy_desk() -> Service {
+    let questions = serde_json::from_value(desk_questions()).expect("native questions decode");
+    let judge = Agent::new("desk-judge", "1.0.0")
+        .prompt(
+            Prompt::jev(
+                "jev-latest",
+                JevPromptOptions {
+                    state: "${context}".to_owned(),
+                    questions,
+                },
+            )
+            .expect("the Jev prompt builds"),
+        )
+        .execution_route(json!({"kind": "wyrd_gateway", "deployment": "jev"}))
+        .run_config(json!({"max_iterations": 1}));
+    let check = |transform| {
+        Check::agent(judge.clone())
+            .inputs([("context", "inputs.reply")])
+            .verdict_transform(transform)
+    };
+    let probability = |question: &str, expected, pass_at, fail_at| {
+        VerdictTransform::Probability(ProbabilityTransform {
+            question: question.to_owned(),
+            expected,
+            pass_at,
+            fail_at,
+        })
+    };
+    let verifier = Verifier::new("desk-policy", "1.0.0")
+        .inputs([("reply", InputSlot::json(json!({"type": "string"})))])
+        .requirements([
+            Requirement::new(
+                "refund-policy",
+                "The reply follows the refund policy.",
+                check(VerdictTransform::Choice(ChoiceTransform {
+                    question: "refund".to_owned(),
+                    outcomes: Some(
+                        serde_json::from_value(json!({
+                            "compliant": "passed", "violation": "failed", "unknown": "inconclusive",
+                        }))
+                        .expect("outcomes decode"),
+                    ),
+                })),
+            ),
+            Requirement::new(
+                "helpful",
+                "The reply helps the customer.",
+                check(probability("helpful", true, 0.75, 0.25)),
+            ),
+            Requirement::new(
+                "resolved",
+                "The reply resolves the issue.",
+                check(probability("unresolved", false, 0.9, 0.1)),
+            ),
+            Requirement::new(
+                "compliant",
+                "The reply is at least highly compliant.",
+                check(VerdictTransform::Score(ScoreTransform {
+                    question: "compliance".to_owned(),
+                    operator: ComparisonOperator::GreaterThanOrEquals,
+                    expected: 2.0,
+                })),
+            ),
+        ]);
+    Service::new("policy-desk", "1.0.0")
+        .components([Component::new("desk-judge", judge).verified_by([verifier])])
+}
+
+/// Each acceptance policy reads its own question of one Jev answer: a custom
+/// Choice map assigns every label its outcome whatever the confidence, Noul
+/// bounds are inclusive for both expected polarities with an inconclusive
+/// band between, and a Score comparison passes at its bound and fails just
+/// below it. Each reason names the observed answer and the applied policy,
+/// and the selected native answer is the requirement's actual value.
+///
+/// # Panics
+/// Panics when declaration or verification fails, or an outcome, reason,
+/// actual value, verdict, or upstream request differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn jev_policies_judge_choice_probability_and_score() {
+    let jev = Jev::start().await;
+    let cases = [
+        (
+            "DESK-PASS: the refund follows policy.",
+            desk_answers("compliant", 0.3, 0.75, 0.02, 2.0),
+            [RequirementOutcome::Passed; 4],
+            VerificationVerdict::Passed,
+            [
+                "Question 'refund' selected 'compliant' (confidence 0.3), which the policy maps to passed.".to_owned(),
+                "Question 'helpful' answered true with probability 0.75; the expected answer true has probability 0.75, at least pass_at 0.75.".to_owned(),
+                format!("Question 'unresolved' answered true with probability 0.02; the expected answer false has probability {}, at least pass_at 0.9.", 1.0 - 0.02),
+                "Question 'compliance' scored 2 on levels 0 to 2; greater_than_or_equals 2 holds.".to_owned(),
+            ],
+        ),
+        (
+            "DESK-FAIL: you get a refund whatever the policy says.",
+            desk_answers("violation", 0.99, 0.25, 0.98, 1.8),
+            [RequirementOutcome::Failed; 4],
+            VerificationVerdict::Failed,
+            [
+                "Question 'refund' selected 'violation' (confidence 0.99), which the policy maps to failed.".to_owned(),
+                "Question 'helpful' answered true with probability 0.25; the expected answer true has probability 0.25, at most fail_at 0.25.".to_owned(),
+                format!("Question 'unresolved' answered true with probability 0.98; the expected answer false has probability {}, at most fail_at 0.1.", 1.0 - 0.98),
+                "Question 'compliance' scored 1.8 on levels 0 to 2; greater_than_or_equals 2 does not hold.".to_owned(),
+            ],
+        ),
+        (
+            "DESK-UNSURE: we will see.",
+            desk_answers("unknown", 0.5, 0.5, 0.5, 2.0),
+            [
+                RequirementOutcome::Inconclusive,
+                RequirementOutcome::Inconclusive,
+                RequirementOutcome::Inconclusive,
+                RequirementOutcome::Passed,
+            ],
+            VerificationVerdict::Inconclusive,
+            [
+                "Question 'refund' selected 'unknown' (confidence 0.5), which the policy maps to inconclusive.".to_owned(),
+                "Question 'helpful' answered true with probability 0.5; the expected answer true has probability 0.5, between fail_at 0.25 and pass_at 0.75.".to_owned(),
+                "Question 'unresolved' answered true with probability 0.5; the expected answer false has probability 0.5, between fail_at 0.1 and pass_at 0.9.".to_owned(),
+                "Question 'compliance' scored 2 on levels 0 to 2; greater_than_or_equals 2 holds.".to_owned(),
+            ],
+        ),
+    ];
+    for (marker, answers, ..) in &cases {
+        let marker = marker.split(':').next().expect("a marker");
+        jev.answer_when(
+            marker,
+            json!({"model": "jev-1.13.0", "answers": answers,
+                   "usage": {"input_tokens": 60, "output_tokens": 8}}),
+        )
+        .await;
+    }
+    let state = WyrdState::declare_with(
+        &policy_desk(),
+        DeclareOptions {
+            client: Some(jev.deployment.admin()),
+            ..DeclareOptions::default()
+        },
+    )
+    .await
+    .expect("the policy desk declares");
+
+    for (reply, answers, outcomes, verdict, reasons) in cases {
+        let before = jev.received().await.len();
+        let result = state
+            .run_for_card("desk-judge")
+            .expect("the judge's run opens")
+            .observe()
+            .verify("desk-policy", Inputs::named([("reply", json!(reply))]))
+            .await
+            .expect("the verification executes");
+
+        for (((id, question), outcome), reason) in [
+            ("refund-policy", "refund"),
+            ("helpful", "helpful"),
+            ("resolved", "unresolved"),
+            ("compliant", "compliance"),
+        ]
+        .into_iter()
+        .zip(outcomes)
+        .zip(reasons)
+        {
+            let judged = requirement(&result, id);
+            assert_eq!(
+                (judged.outcome, judged.reason.as_str()),
+                (outcome, reason.as_str()),
+                "{reply}: {judged:#?}"
+            );
+            assert_eq!(judged.actual.as_ref(), Some(&answers[question]), "{id}");
+            assert!(judged.citations.is_empty(), "{judged:#?}");
+        }
+        assert_eq!(result.outcome.verdict, verdict, "{reply}");
+        let received = jev.received().await;
+        assert!(received.len() > before, "{reply} reached Jev");
+        for (_, body) in &received[before..] {
+            assert_eq!(
+                body,
+                &json!({"model": "jev-latest", "state": reply, "questions": desk_questions()}),
+            );
+        }
+    }
+    jev.deployment.shutdown().await;
 }

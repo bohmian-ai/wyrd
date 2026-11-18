@@ -32,7 +32,9 @@ from wyrd.verify import (
     ChoiceTransform,
     Component,
     ExecutionRoute,
+    ProbabilityTransform,
     Requirement,
+    ScoreTransform,
     Service,
     VerdictTransform,
     Verifier,
@@ -137,6 +139,56 @@ def desk_answer(choice: str) -> dict[str, Any]:
     }
 
 
+POLICY_QUESTIONS: dict[str, Any] = {
+    "refund": {
+        "type": "choice",
+        "instructions": "Does the reply follow the refund policy?",
+        "criteria": {
+            "compliant": "It follows the policy.",
+            "violation": "It breaks the policy.",
+            "unknown": "It cannot be judged.",
+        },
+    },
+    "helpful": {"type": "noul", "instructions": "Does the reply help the customer?"},
+    "unresolved": {"type": "noul", "instructions": "Does the reply leave the issue unresolved?"},
+    "compliance": {
+        "type": "score",
+        "instructions": "How compliant is the reply?",
+        "criteria": ["Low", "Medium", "High"],
+    },
+}
+"""The policy desk's questions: a custom Choice, two Nouls, and a three-level Score."""
+
+
+def policy_answers(
+    label: str, confidence: float, helpful: float, unresolved: float, score: float
+) -> dict[str, Any]:
+    """Jev's answers to the policy desk questions."""
+    return {
+        "refund": {
+            "type": "choice",
+            "choice": label,
+            "confidence": confidence,
+            "probabilities": {label: confidence},
+        },
+        "helpful": {"type": "noul", "noul": helpful},
+        "unresolved": {"type": "noul", "noul": unresolved},
+        "compliance": {
+            "type": "score",
+            "score": score,
+            "legend": {"0": "Low", "1": "Medium", "2": "High"},
+        },
+    }
+
+
+POLICY_ANSWERS = {
+    "DESK-PASS": policy_answers("compliant", 0.3, 0.75, 0.02, 2.0),
+    "DESK-FAIL": policy_answers("violation", 0.99, 0.25, 0.98, 1.8),
+    "DESK-UNSURE": policy_answers("unknown", 0.5, 0.5, 0.5, 2.0),
+}
+"""State marker → Jev's policy desk answers: every bound, both polarities, and the band between."""
+
+
 def answer(noul: float, tone: str) -> dict[str, Any]:
     """Jev's answer: ``helpful`` with probability ``noul``, tone ``tone``."""
     return {
@@ -175,6 +227,9 @@ class JevUpstream(BaseHTTPRequestHandler):
         for marker, choice in REFUND_CHOICES.items():
             if marker in state:
                 reply = desk_answer(choice)
+        for marker, answers in POLICY_ANSWERS.items():
+            if marker in state:
+                reply = {"model": "jev-1.13.0", "answers": answers}
         for needle, refused in REFUSALS.items():
             if needle in state:
                 status, reply = refused, {"detail": f"key cred {JEV_KEY}"}
@@ -462,3 +517,158 @@ def test_typed_jev_choice_check_becomes_the_verdict(
             "/v1/systemone",
             {"model": "jev-latest", "state": reply, "questions": NATIVE_DESK_QUESTIONS},
         )
+
+
+def policy_desk() -> Service:
+    """``policy-desk``: one Jev Agent's answer read by four acceptance policies.
+
+    ``desk-policy`` maps the custom ``refund`` labels, reads ``helpful`` expected
+    true and ``unresolved`` expected false, and requires ``compliance >= 2``.
+    """
+    judge = Agent(
+        "desk-judge",
+        "1.0.0",
+        prompt=Prompt.jev("jev-latest", state="${context}", questions=POLICY_QUESTIONS),
+        execution_route=ExecutionRoute.wyrd_gateway(deployment="jev"),
+        run_config=AgentRunConfig(max_iterations=1),
+    )
+    policies: list[tuple[str, str, VerdictTransform | Mapping[str, Any]]] = [
+        (
+            "refund-policy",
+            "The reply follows the refund policy.",
+            {
+                "kind": "choice",
+                "question": "refund",
+                "outcomes": {
+                    "compliant": "passed",
+                    "violation": "failed",
+                    "unknown": "inconclusive",
+                },
+            },
+        ),
+        (
+            "helpful",
+            "The reply helps the customer.",
+            ProbabilityTransform(question="helpful", expected=True, pass_at=0.75, fail_at=0.25),
+        ),
+        (
+            "resolved",
+            "The reply resolves the issue.",
+            ProbabilityTransform(question="unresolved", expected=False, pass_at=0.9, fail_at=0.1),
+        ),
+        (
+            "compliant",
+            "The reply is at least highly compliant.",
+            ScoreTransform(question="compliance", operator="greater_than_or_equals", expected=2),
+        ),
+    ]
+    verifier = Verifier(
+        "desk-policy",
+        "1.0.0",
+        inputs={"reply": str},
+        requirements=[
+            Requirement(
+                id,
+                statement,
+                Check.agent(judge, inputs={"context": "inputs.reply"}, verdict_transform=policy),
+            )
+            for id, statement, policy in policies
+        ],
+    )
+    return Service("policy-desk", "1.0.0").add_component(
+        Component("desk-judge", judge).verified_by([verifier])
+    )
+
+
+@pytest.mark.parametrize(
+    ("reply", "outcomes", "verdict", "reasons"),
+    [
+        (
+            "DESK-PASS: the refund follows policy.",
+            ["passed"] * 4,
+            "passed",
+            [
+                "Question 'refund' selected 'compliant' (confidence 0.3),"
+                " which the policy maps to passed.",
+                "Question 'helpful' answered true with probability 0.75;"
+                " the expected answer true has probability 0.75, at least pass_at 0.75.",
+                "Question 'unresolved' answered true with probability 0.02;"
+                f" the expected answer false has probability {1 - 0.02}, at least pass_at 0.9.",
+                "Question 'compliance' scored 2 on levels 0 to 2; greater_than_or_equals 2 holds.",
+            ],
+        ),
+        (
+            "DESK-FAIL: you get a refund whatever the policy says.",
+            ["failed"] * 4,
+            "failed",
+            [
+                "Question 'refund' selected 'violation' (confidence 0.99),"
+                " which the policy maps to failed.",
+                "Question 'helpful' answered true with probability 0.25;"
+                " the expected answer true has probability 0.25, at most fail_at 0.25.",
+                "Question 'unresolved' answered true with probability 0.98;"
+                f" the expected answer false has probability {1 - 0.98}, at most fail_at 0.1.",
+                "Question 'compliance' scored 1.8 on levels 0 to 2;"
+                " greater_than_or_equals 2 does not hold.",
+            ],
+        ),
+        (
+            "DESK-UNSURE: we will see.",
+            ["inconclusive", "inconclusive", "inconclusive", "passed"],
+            "inconclusive",
+            [
+                "Question 'refund' selected 'unknown' (confidence 0.5),"
+                " which the policy maps to inconclusive.",
+                "Question 'helpful' answered true with probability 0.5;"
+                " the expected answer true has probability 0.5, between fail_at 0.25 and pass_at 0.75.",
+                "Question 'unresolved' answered true with probability 0.5;"
+                " the expected answer false has probability 0.5, between fail_at 0.1 and pass_at 0.9.",
+                "Question 'compliance' scored 2 on levels 0 to 2; greater_than_or_equals 2 holds.",
+            ],
+        ),
+    ],
+)
+def test_jev_policies_judge_choice_probability_and_score(
+    jev: tuple[WyrdTestServer, Receiver],
+    reply: str,
+    outcomes: list[str],
+    verdict: str,
+    reasons: list[str],
+) -> None:
+    """Each acceptance policy reads its own question of one Jev answer.
+
+    A custom Choice map assigns every label its outcome whatever the
+    confidence, Noul bounds are inclusive for both polarities with an
+    inconclusive band between, and a Score comparison passes at its bound and
+    fails below it. The selected native answer is each requirement's actual.
+    """
+    server, upstream = jev
+    state = WyrdState.declare(policy_desk(), client_of(server))
+    asked = len(upstream.deliveries)
+
+    result = state.run("desk-judge").observe.verify("desk-policy", reply=reply)
+
+    answers = POLICY_ANSWERS[reply.split(":")[0]]
+    judged = {each["id"]: each for each in result.requirements}
+    for (id, question), outcome, reason in zip(
+        [
+            ("refund-policy", "refund"),
+            ("helpful", "helpful"),
+            ("resolved", "unresolved"),
+            ("compliant", "compliance"),
+        ],
+        outcomes,
+        reasons,
+        strict=True,
+    ):
+        assert (judged[id]["outcome"], judged[id]["reason"]) == (outcome, reason), judged[id]
+        assert judged[id]["actual"] == answers[question], id
+        assert judged[id].get("citations", []) == []
+    assert result.verdict == verdict
+    deliveries = upstream.deliveries[asked:]
+    assert deliveries
+    assert all(
+        (each.path, each.body)
+        == ("/v1/systemone", {"model": "jev-latest", "state": reply, "questions": POLICY_QUESTIONS})
+        for each in deliveries
+    ), deliveries

@@ -247,6 +247,17 @@ that proof rather than manufacturing a RED result.
      `POST /v1/cards` with a probability policy on a Choice question is
      refused with 400 at `...verdict_transform.kind`. Jev receives nothing.
      The corrected definition validates, declares and judges `passed`.
+   - Registration journeys (Python, TypeScript):
+     `test_gateway_jev.py::test_jev_registration_refuses_policies_no_local_graph_can_check`
+     and `gateway-jev.test.ts` "jev registration refuses policies no local
+     graph can check". Each asserts the local refusal names the field, the
+     `CardRef` desk validates locally and `WyrdState.declare` raises
+     `WyrdError` `WYRD_SPEC_400_VALIDATION` naming
+     `requirements[0].check.verdict_transform.question`, Jev receives
+     nothing, and the corrected desk declares and judges `passed`.
+     Commands: `scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && cd sdks/wyrd-sdk-python && uv run python -m pytest -q -p no:cacheprovider tests/integration/test_gateway_jev.py -k registration"`; `scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && cd sdks/wyrd-sdk-ts/wyrd && pnpm exec vitest run tests/integration/gateway-jev.test.ts -t 'jev registration'"`.
+     GREEN: 1 passed each. The behavior shipped earlier in this scenario,
+     so these cross-SDK journeys passed on first run.
    - Commands:
      `cd sdks/wyrd-sdk-python && uv run python -m pytest -q -p no:cacheprovider tests/unit/cards/test_verdict_transform_authoring.py`;
      `cd sdks/wyrd-sdk-ts/wyrd && pnpm exec vitest run tests/unit/verdict-transform-authoring.test.ts`;
@@ -266,9 +277,8 @@ that proof rather than manufacturing a RED result.
    - Limitations: no MCP declaration write tool exists, so the bypass goes
      through HTTP `/v1/cards`. The TS native setter refusals are napi
      `InvalidArg` errors carrying the message, as other setter refusals are,
-     not `WyrdError` instances. The Python and TS correction is revalidated
-     locally; the declared-and-judged correction runs in the Rust journey.
-     Question/criteria limits rely on the scenario-2 Jev builder refusals.
+     not `WyrdError` instances. The raw HTTP bypass is pinned once, in the
+     Rust journey, because it does not go through an SDK. Question/criteria limits rely on the scenario-2 Jev builder refusals.
 
 5. **Malformed native output is an error** — REQ-010, REQ-012, REQ-014; J7.
    Declare a valid Jev leaf check, then script missing selected answer, wrong
@@ -291,6 +301,13 @@ that proof rather than manufacturing a RED result.
      other three pass. The verdict is `inconclusive`, never a pass or a
      provider-authored failure. Jev is called once per check, and nothing is
      retried.
+   - Journeys (Python, TypeScript):
+     `test_gateway_jev.py::test_jev_malformed_answers_are_check_errors`
+     (5 parametrized markers) and `gateway-jev.test.ts` "jev malformed %s
+     answer is a check error" (5 cases) script the same five answers and
+     assert the same outcomes, reasons, verdict and `+4` upstream calls.
+     Commands: `scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && cd sdks/wyrd-sdk-python && uv run python -m pytest -q -p no:cacheprovider tests/integration/test_gateway_jev.py -k malformed"`; `scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && cd sdks/wyrd-sdk-ts/wyrd && pnpm exec vitest run tests/integration/gateway-jev.test.ts -t 'jev malformed'"`. GREEN:
+     5 passed each.
    - Owner: `blocks::transform::tests::unusable_answers_are_check_errors`
      (vala-verify) covers the full input set, including NaN and infinity,
      which JSON cannot carry.
@@ -301,9 +318,9 @@ that proof rather than manufacturing a RED result.
      test expectation, one call versus one per check, and the behavior
      passed. Provider refusal and retry are unchanged and stay covered by
      the existing native gateway tests (`gateway_jev` 401/400/429 cases);
-     this task adds no conversion call that could retry. Python and TS reach
-     the same server check path, and the tier-1 negatives run through Rust
-     only.
+     this task adds no conversion call that could retry. Per this section's
+     rule ("record that proof rather than manufacturing a RED result"), no
+     RED was forced by reverting the scenario-1 validation.
 
 6. **Read the retained judgment under capture controls** — REQ-005, REQ-012,
    REQ-014; J5/J7. Execute a valid hosted leaf check with full capture and read
@@ -330,19 +347,33 @@ that proof rather than manufacturing a RED result.
      confidence/probabilities, Noul, Score with legend) under `full`, and a
      64-hex digest only under `hash`. Another tenant's `details()` gets
      `WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND`.
+   - Journeys (Python, TypeScript):
+     `test_gateway_jev.py::test_jev_judgments_are_retained_under_capture_controls`
+     and `gateway-jev.test.ts` "jev judgments are retained under %s %s
+     capture", both parametrized over 1.0.0/`full` and 2.0.0/`hash`. Each
+     reads `Execution.connect(id).wait(...)` then `details()` and asserts
+     the Verifier version, the retained outcome and reason equal the returned
+     ones, `actual` is the exact selected answer under `full` or a 64-hex
+     digest under `hash`, provenance is
+     `{kind: agent, agent.name: desk-judge, route: {kind: wyrd_gateway, deployment: jev}}`,
+     and a second tenant's `details()` raises
+     `WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND`. Commands: `scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && cd sdks/wyrd-sdk-python && uv run python -m pytest -q -p no:cacheprovider tests/integration/test_gateway_jev.py -k retained"`;
+     `scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && cd sdks/wyrd-sdk-ts/wyrd && pnpm exec vitest run tests/integration/gateway-jev.test.ts -t 'jev judgments are retained'"`. GREEN: 2 passed each (the first
+     Python run failed on a test defect, reading `each["result"]` where the
+     Python details are flat per the `RequirementDetails` stub).
    - Command: `scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(=gateway_jev::jev_judgments_are_retained_under_capture_controls)'"`.
    - TDD deviation: there was no RED. Scenario 1 put the selected answer in
      the existing `CheckOutput.actual`, which already flows through the
      existing `capture_actual` and asynchronous recording, so this scenario
-     pins that contract, not new behavior.
+     pins that contract, not new behavior. Per this section's rule, no RED was
+     forced by removing that capture.
    - Limitations: no MCP tool or CLI command reads verification execution
      details, so the HTTP details route is the applicable read owner.
      Whether execution waits for persistence is not measured here; the
      existing `verify_in_real_time` journeys own that property and this
      change does not touch it. `redact` shares `capture_actual` with
      `hash` and is covered by its owner unit test
-     (`assertion::tests`). Python and TS read the same server route, and
-     only the Rust journey pins it.
+     (`assertion::tests`).
 
 7. **Retain existing direct-Verdict and gateway behavior** — REQ-005,
    REQ-014; J8. Reuse hosted direct-Verdict journeys to assert outcomes,
@@ -380,6 +411,20 @@ that proof rather than manufacturing a RED result.
      and no citations. Documentation is in the gateway-setup README step 6
      and `reference/verifier-card.md` ("Decision answers" plus the two
      rejection rules); `docs:generate` was run and `docs:check` passes.
+   - Example journeys (Python, TypeScript):
+     `test_gateway_jev.py::test_jev_refund_example_judges_as_documented`
+     and `gateway-jev.test.ts` "jev refund example judges %s as documented"
+     declare `examples/gateway-setup/refund-desk.yaml` from its path against
+     a `judge-pool` deployment and assert the exact reason and verdict for
+     the promise (`failed`) and the compliant answer (`passed`). Commands:
+     `scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && cd sdks/wyrd-sdk-python && uv run python -m pytest -q -p no:cacheprovider tests/integration/test_gateway_jev.py -k refund_example"`; `scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && cd sdks/wyrd-sdk-ts/wyrd && pnpm exec vitest run tests/integration/gateway-jev.test.ts -t 'jev refund example'"`. GREEN:
+     2 passed each. The TS run first failed in the full file with "spec hash
+     mismatch": its file-scoped server had already registered the
+     typed-check helper's own `refund-desk@1.0.0`. The helper's Service is
+     now `typed-refund-desk`.
+   - Whole files: Python `test_gateway_jev.py` 18 passed; TS
+     `gateway-jev.test.ts` 18 passed; `py:format`, ruff, ty, `ts:format`,
+     `ts:lints` and `ts:typecheck` clean.
    - RED: the refusals and the existing direct-Verdict behavior passed on the
      first run, as expected. The new example journey first failed on loader
      path escape (`../`), then on a mock marker that also matched the

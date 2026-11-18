@@ -1,7 +1,9 @@
+import { resolve } from "node:path";
+
 import OpenAI from "openai";
 import { expect, vi } from "vitest";
 
-import { Gateway, verify, WyrdClient, WyrdState } from "wyrd-ai";
+import { type CardTypes, Gateway, verify, WyrdClient, WyrdError, WyrdState } from "wyrd-ai";
 import { cli } from "@wyrd/testing";
 
 import type { ReceivedRequest, Reply } from "../support/http-receiver.js";
@@ -23,14 +25,27 @@ const QUESTIONS = {
   },
 };
 
-const { Agent, Check, ChoiceQuestion, Component, NoulQuestion, Prompt, Requirement, ScoreQuestion, Service, Verifier } =
-  verify;
+const {
+  Agent,
+  CardRef,
+  Check,
+  ChoiceQuestion,
+  Component,
+  NoulQuestion,
+  Prompt,
+  Requirement,
+  ScoreQuestion,
+  Service,
+  Verifier,
+} = verify;
 
 /** State marker → the refund question's selected label. */
 const REFUND_CHOICES: Record<string, string> = {
   "CASE-PASS": "passed",
   "CASE-FAIL": "failed",
   "CASE-UNSURE": "inconclusive",
+  "REFUND-PROMISE": "failed",
+  "REFUND-POLICY": "passed",
 };
 
 /** The refund desk's questions as the native Jev questions the typed classes lower to. */
@@ -114,6 +129,41 @@ const POLICY_ANSWERS: Record<string, ReturnType<typeof policyAnswers>> = {
   "DESK-UNSURE": policyAnswers("unknown", 0.5, 0.5, 0.5, 2),
 };
 
+const VALID_ANSWERS = policyAnswers("compliant", 0.3, 0.75, 0.02, 2.0);
+const LEGEND = { "0": "Low", "1": "Medium", "2": "High" };
+
+/** State marker → the requirement a malformed answer breaks, Jev's answers, and the check-error reason. */
+const MALFORMED: Readonly<Record<string, { broken: string; answers: Record<string, unknown>; reason: string }>> = {
+  MISSING: {
+    broken: "refund-policy",
+    answers: Object.fromEntries(Object.entries(VALID_ANSWERS).filter(([key]) => key !== "refund")),
+    reason: "the decision response has no answer to question 'refund'",
+  },
+  "WRONG-FORM": {
+    broken: "refund-policy",
+    answers: { ...VALID_ANSWERS, refund: { type: "noul", noul: 0.9 } },
+    reason: "the answer to question 'refund' is not the choice answer its policy reads",
+  },
+  "UNKNOWN-LABEL": {
+    broken: "refund-policy",
+    answers: {
+      ...VALID_ANSWERS,
+      refund: { type: "choice", choice: "maybe", confidence: 0.9, probabilities: { maybe: 0.9 } },
+    },
+    reason: "the answer to question 'refund' selected an option the question does not declare",
+  },
+  "NOUL-RANGE": {
+    broken: "helpful",
+    answers: { ...VALID_ANSWERS, helpful: { type: "noul", noul: 1.5 } },
+    reason: "the answer to question 'helpful' has a probability outside 0..1",
+  },
+  "SCORE-RANGE": {
+    broken: "compliant",
+    answers: { ...VALID_ANSWERS, compliance: { type: "score", score: 3, legend: LEGEND } },
+    reason: "the answer to question 'compliance' has a score outside its levels 0 to 2",
+  },
+};
+
 /** Jev's answer to every refund desk question, selecting `choice` for the refund question. */
 function deskAnswer(choice: string) {
   return {
@@ -173,6 +223,10 @@ function jev(request: ReceivedRequest): Reply {
   if (policy) {
     return { status: 200, body: { model: "jev-1.13.0", answers: policy[1] } };
   }
+  const malformed = Object.entries(MALFORMED).find(([marker]) => state.includes(marker));
+  if (malformed) {
+    return { status: 200, body: { model: "jev-1.13.0", answers: malformed[1].answers } };
+  }
   return { status: 200, body: state.includes("Go away") ? answer(0.12, "rude") : answer(0.93, "polite") };
 }
 
@@ -213,12 +267,15 @@ const test = serverTest({ provider: jev, verificationRuntime: true }).extend<{ d
         provider: "jev",
         source: { environment: { binding: "test-jev-key" } },
       });
-      await (await Gateway.connect()).putDeployment({
-        name: "jev",
-        adapter: "jev",
-        auth: { bearer: { credential: "jev-key" } },
-        capabilities: ["system_one", "chat_completions"],
-      });
+      const gateway = await Gateway.connect();
+      for (const name of ["jev", "judge-pool"]) {
+        await gateway.putDeployment({
+          name,
+          adapter: "jev",
+          auth: { bearer: { credential: "jev-key" } },
+          capabilities: ["system_one", "chat_completions"],
+        });
+      }
       await use();
     },
     { scope: "file" },
@@ -340,7 +397,7 @@ function refundDesk(prompt: verify.Prompt, transform: verify.VerdictTransform): 
       new Requirement("no-refund-promise", "The reply makes no refund promise the policy does not allow.", check),
     ],
   });
-  return new Service("refund-desk", { version: "1.0.0" }).addComponent(
+  return new Service("typed-refund-desk", { version: "1.0.0" }).addComponent(
     new Component("refund-judge", judge).verifiedBy([verifier]),
   );
 }
@@ -400,18 +457,24 @@ test("typed jev choice check becomes the verdict", async ({ provider, deployed: 
   }
 });
 
-/**
- * `policy-desk`: one Jev Agent's answer read by four acceptance policies.
- * `desk-policy` maps the custom `refund` labels, reads `helpful` expected
- * true and `unresolved` expected false, and requires `compliance >= 2`.
- */
-function policyDesk(): verify.Service {
-  const judge = new Agent("desk-judge", {
+/** `desk-judge`: the Jev Agent asking the policy desk questions. */
+function deskJudge(): verify.Agent {
+  return new Agent("desk-judge", {
     version: "1.0.0",
     prompt: Prompt.jev("jev-latest", { state: STATE, questions: POLICY_QUESTIONS }),
     execution_route: { kind: "wyrd_gateway", deployment: "jev" },
     run_config: { max_iterations: 1 },
   });
+}
+
+/**
+ * `policy-desk`: one Jev Agent's answer read by four acceptance policies.
+ * `desk-policy` maps the custom `refund` labels, reads `helpful` expected
+ * true and `unresolved` expected false, and requires `compliance >= 2`,
+ * retaining each actual answer under `context_capture` `capture`.
+ */
+function policyDesk(version = "1.0.0", capture: CardTypes.ContextCapture = "full"): verify.Service {
+  const judge = deskJudge();
   const refund: verify.ChoiceTransform = {
     kind: "choice",
     question: "refund",
@@ -438,8 +501,9 @@ function policyDesk(): verify.Service {
     expected: 2,
   };
   const verifier = new Verifier("desk-policy", {
-    version: "1.0.0",
+    version,
     inputs: { reply: { type: "string" } },
+    context_capture: capture,
     requirements: (
       [
         ["refund-policy", "The reply follows the refund policy.", refund],
@@ -456,7 +520,7 @@ function policyDesk(): verify.Service {
         ),
     ),
   });
-  return new Service("policy-desk", { version: "1.0.0" }).addComponent(
+  return new Service("policy-desk", { version }).addComponent(
     new Component("desk-judge", judge).verifiedBy([verifier]),
   );
 }
@@ -543,4 +607,158 @@ test.for([
       body: { model: "jev-latest", state: reply, questions: POLICY_QUESTIONS },
     });
   }
+});
+
+/** `registered-desk`: `judge`, an Agent or a registered one's exact reference, verified through `transform`. */
+function registeredDesk(judge: verify.Agent | verify.CardRef, transform: verify.VerdictTransform): verify.Service {
+  const verifier = new Verifier("registered-policy", {
+    version: "1.0.0",
+    inputs: { reply: { type: "string" } },
+    requirements: [
+      new Requirement(
+        "refund-policy",
+        "The reply follows the refund policy.",
+        Check.agent(judge, { inputs: { context: "inputs.reply" }, verdict_transform: transform }),
+      ),
+    ],
+  });
+  return new Service("registered-desk", { version: "1.0.0" }).addComponent(
+    new Component("desk-judge", judge).verifiedBy([verifier]),
+  );
+}
+
+/** The error `action` rejects with. */
+async function rejection(action: () => Promise<unknown> | unknown): Promise<WyrdError> {
+  try {
+    await action();
+  } catch (error) {
+    expect(error).toBeInstanceOf(WyrdError);
+    return error as WyrdError;
+  }
+  throw new Error("nothing was refused");
+}
+
+// Registration decides whether a policy fits a judge no local graph holds: a
+// local graph holding the judge refuses an undeclared question, the same
+// policy on the registered judge's exact reference validates locally and is
+// refused at registration before Jev is called, and the correction judges.
+test("jev registration refuses policies no local graph can check", async ({ provider, deployed: _ }) => {
+  await WyrdState.declare(policyDesk());
+  const asked = provider.received.length;
+  const tone: verify.ChoiceTransform = { kind: "choice", question: "tone" };
+  const field = "requirements[0].check.verdict_transform.question";
+
+  const local = await rejection(() => registeredDesk(deskJudge(), tone).validate());
+  expect(JSON.stringify(local.details)).toContain(field);
+
+  const registered = CardRef.agent("desk-judge", "1.0.0");
+  const wrong = registeredDesk(registered, tone);
+  wrong.validate();
+  const refused = await rejection(() => WyrdState.declare(wrong));
+  expect(refused.code).toBe("WYRD_SPEC_400_VALIDATION");
+  expect(refused.message).toContain(field);
+  expect(provider.received.length).toBe(asked);
+
+  const corrected = registeredDesk(registered, {
+    kind: "choice",
+    question: "refund",
+    outcomes: { compliant: "passed", violation: "failed", unknown: "inconclusive" },
+  });
+  corrected.validate();
+  const state = await WyrdState.declare(corrected);
+  const result = await state
+    .run("desk-judge")
+    .observe.verify("registered-policy", { reply: "DESK-PASS: the refund follows policy." });
+  expect(result.outcome.verdict).toBe("passed");
+});
+
+// A malformed native answer makes only the requirement reading it
+// inconclusive with the reason, with one Jev call per check and no retry.
+test.for(Object.entries(MALFORMED))(
+  "jev malformed %s answer is a check error",
+  async ([marker, { broken, reason }], { provider, deployed: _ }) => {
+    const state = await WyrdState.declare(policyDesk());
+    const before = provider.received.length;
+
+    const result = await state.run("desk-judge").observe.verify("desk-policy", { reply: `${marker}: a reply` });
+
+    for (const each of result.outcome.requirements) {
+      if (each.id === broken) {
+        expect(each.outcome, JSON.stringify(each)).toBe("inconclusive");
+        expect(each.reason).toContain(reason);
+      } else {
+        expect(each.outcome, JSON.stringify(each)).toBe("passed");
+      }
+    }
+    expect(result.outcome.verdict).toBe("inconclusive");
+    expect(provider.received.length).toBe(before + 4);
+  },
+);
+
+// The recorded judgment keeps verdict, reason, the selected answer or only its
+// digest, and the judge's provenance; another tenant reads nothing.
+test.for([
+  ["1.0.0", "full"],
+  ["2.0.0", "hash"],
+] as const)("jev judgments are retained under %s %s capture", async ([version, capture], { server, deployed: _ }) => {
+  const state = await WyrdState.declare(policyDesk(version, capture));
+  const result = await state
+    .run("desk-judge")
+    .observe.verify("desk-policy", { reply: "DESK-PASS: the refund follows policy." });
+  expect(result.outcome.verdict).toBe("passed");
+
+  const execution = await verify.Execution.connect(result.execution_id);
+  await execution.wait({ timeoutMs: 60_000 });
+  const details = await execution.details();
+
+  expect(details.verifier.version).toBe(version);
+  const returned = new Map(result.outcome.requirements.map((each) => [each.id, each]));
+  for (const [id, question] of [
+    ["refund-policy", "refund"],
+    ["helpful", "helpful"],
+    ["resolved", "unresolved"],
+    ["compliant", "compliance"],
+  ] as const) {
+    const kept = details.outcome.requirements.find((each) => each.id === id);
+    expect({ outcome: kept?.outcome, reason: kept?.reason }, id).toEqual({
+      outcome: returned.get(id)?.outcome,
+      reason: returned.get(id)?.reason,
+    });
+    if (capture === "full") {
+      expect(kept?.actual, id).toEqual(VALID_ANSWERS[question]);
+    } else {
+      expect(kept?.actual, id).toMatch(/^[0-9a-f]{64}$/);
+    }
+    expect(kept?.provenance, id).toMatchObject({
+      kind: "agent",
+      agent: { name: "desk-judge" },
+      route: { kind: "wyrd_gateway", deployment: "jev" },
+    });
+  }
+
+  const foreign = WyrdClient.connect({
+    credential: server.bootstrapServiceInTenant(server.seedTenant(`other-${capture}`), ["admin"], `foreign-${capture}`),
+  });
+  const refused = await rejection(async () =>
+    (await verify.Execution.connect(result.execution_id, { client: foreign })).details(),
+  );
+  expect(refused.code).toBe("WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND");
+});
+
+const REFUND_DESK = resolve(import.meta.dirname, "../../../../../examples/gateway-setup/refund-desk.yaml");
+
+// The documented example declares from YAML and Jev's selected canonical
+// label is the verdict.
+test.for([
+  ["REFUND-PROMISE: you are guaranteed a full refund.", "failed"],
+  ["REFUND-POLICY: we refund when the policy allows it.", "passed"],
+] as const)("jev refund example judges %s as documented", async ([answer, verdict], { deployed: _ }) => {
+  const state = await WyrdState.declare(REFUND_DESK);
+
+  const result = await state.run("jev").observe.verify("no-refund-promise", { answer });
+
+  expect(result.outcome.requirements.map(({ reason }) => reason)).toEqual([
+    `Question 'refund_policy' selected '${verdict}' (confidence 0.9).`,
+  ]);
+  expect(result.outcome.verdict).toBe(verdict);
 });

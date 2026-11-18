@@ -13,13 +13,15 @@ import json
 import threading
 from collections.abc import Iterator, Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 
 import httpx
 import openai
 import pytest
 from openai.types.chat import ChatCompletionMessageParam
-from wyrd.cards import CardKind
+from wyrd import WyrdError, verify
+from wyrd.cards import CardKind, CardRef
 from wyrd.gateway_admin import Gateway
 from wyrd.prompt import Prompt
 from wyrd.prompt.decisions import ChoiceQuestion, NoulCriteria, NoulQuestion, ScoreQuestion
@@ -62,7 +64,13 @@ REFUSALS = {
 }
 """State text → the status the upstream refuses it with."""
 
-REFUND_CHOICES = {"CASE-PASS": "passed", "CASE-FAIL": "failed", "CASE-UNSURE": "inconclusive"}
+REFUND_CHOICES = {
+    "CASE-PASS": "passed",
+    "CASE-FAIL": "failed",
+    "CASE-UNSURE": "inconclusive",
+    "REFUND-PROMISE": "failed",
+    "REFUND-POLICY": "passed",
+}
 """State marker → the refund question's selected label."""
 
 NATIVE_DESK_QUESTIONS: dict[str, Any] = {
@@ -188,6 +196,51 @@ POLICY_ANSWERS = {
 }
 """State marker → Jev's policy desk answers: every bound, both polarities, and the band between."""
 
+VALID_ANSWERS = POLICY_ANSWERS["DESK-PASS"]
+MALFORMED = {
+    "MISSING": (
+        "refund-policy",
+        {key: value for key, value in VALID_ANSWERS.items() if key != "refund"},
+        "the decision response has no answer to question 'refund'",
+    ),
+    "WRONG-FORM": (
+        "refund-policy",
+        {**VALID_ANSWERS, "refund": {"type": "noul", "noul": 0.9}},
+        "the answer to question 'refund' is not the choice answer its policy reads",
+    ),
+    "UNKNOWN-LABEL": (
+        "refund-policy",
+        {
+            **VALID_ANSWERS,
+            "refund": {
+                "type": "choice",
+                "choice": "maybe",
+                "confidence": 0.9,
+                "probabilities": {"maybe": 0.9},
+            },
+        },
+        "the answer to question 'refund' selected an option the question does not declare",
+    ),
+    "NOUL-RANGE": (
+        "helpful",
+        {**VALID_ANSWERS, "helpful": {"type": "noul", "noul": 1.5}},
+        "the answer to question 'helpful' has a probability outside 0..1",
+    ),
+    "SCORE-RANGE": (
+        "compliant",
+        {
+            **VALID_ANSWERS,
+            "compliance": {
+                "type": "score",
+                "score": 3,
+                "legend": {"0": "Low", "1": "Medium", "2": "High"},
+            },
+        },
+        "the answer to question 'compliance' has a score outside its levels 0 to 2",
+    ),
+}
+"""State marker → the requirement a malformed answer breaks, Jev's answers, and the check-error reason."""
+
 
 def answer(noul: float, tone: str) -> dict[str, Any]:
     """Jev's answer: ``helpful`` with probability ``noul``, tone ``tone``."""
@@ -230,6 +283,9 @@ class JevUpstream(BaseHTTPRequestHandler):
         for marker, answers in POLICY_ANSWERS.items():
             if marker in state:
                 reply = {"model": "jev-1.13.0", "answers": answers}
+        for marker, (_, answers, _) in MALFORMED.items():
+            if marker in state:
+                reply = {"model": "jev-1.13.0", "answers": answers}
         for needle, refused in REFUSALS.items():
             if needle in state:
                 status, reply = refused, {"detail": f"key cred {JEV_KEY}"}
@@ -270,14 +326,15 @@ def jev() -> Iterator[tuple[WyrdTestServer, Receiver]]:
                     },
                     client=admin,
                 )
-                Gateway(admin).put_deployment(
-                    {
-                        "name": "jev",
-                        "adapter": "jev",
-                        "auth": {"bearer": {"credential": "jev-key"}},
-                        "capabilities": ["system_one", "chat_completions"],
-                    }
-                )
+                for name in ["jev", "judge-pool"]:
+                    Gateway(admin).put_deployment(
+                        {
+                            "name": name,
+                            "adapter": "jev",
+                            "auth": {"bearer": {"credential": "jev-key"}},
+                            "capabilities": ["system_one", "chat_completions"],
+                        }
+                    )
                 yield server, recorded
     finally:
         upstream.shutdown()
@@ -519,19 +576,25 @@ def test_typed_jev_choice_check_becomes_the_verdict(
         )
 
 
-def policy_desk() -> Service:
-    """``policy-desk``: one Jev Agent's answer read by four acceptance policies.
-
-    ``desk-policy`` maps the custom ``refund`` labels, reads ``helpful`` expected
-    true and ``unresolved`` expected false, and requires ``compliance >= 2``.
-    """
-    judge = Agent(
+def desk_judge() -> Agent:
+    """``desk-judge``: the Jev Agent asking the policy desk questions."""
+    return Agent(
         "desk-judge",
         "1.0.0",
         prompt=Prompt.jev("jev-latest", state="${context}", questions=POLICY_QUESTIONS),
         execution_route=ExecutionRoute.wyrd_gateway(deployment="jev"),
         run_config=AgentRunConfig(max_iterations=1),
     )
+
+
+def policy_desk(version: str = "1.0.0", capture: str = "full") -> Service:
+    """``policy-desk``: one Jev Agent's answer read by four acceptance policies.
+
+    ``desk-policy`` maps the custom ``refund`` labels, reads ``helpful`` expected
+    true and ``unresolved`` expected false, and requires ``compliance >= 2``,
+    retaining each actual answer under ``context_capture`` ``capture``.
+    """
+    judge = desk_judge()
     policies: list[tuple[str, str, VerdictTransform | Mapping[str, Any]]] = [
         (
             "refund-policy",
@@ -564,8 +627,9 @@ def policy_desk() -> Service:
     ]
     verifier = Verifier(
         "desk-policy",
-        "1.0.0",
+        version,
         inputs={"reply": str},
+        context_capture=capture,
         requirements=[
             Requirement(
                 id,
@@ -575,7 +639,7 @@ def policy_desk() -> Service:
             for id, statement, policy in policies
         ],
     )
-    return Service("policy-desk", "1.0.0").add_component(
+    return Service("policy-desk", version).add_component(
         Component("desk-judge", judge).verified_by([verifier])
     )
 
@@ -672,3 +736,162 @@ def test_jev_policies_judge_choice_probability_and_score(
         == ("/v1/systemone", {"model": "jev-latest", "state": reply, "questions": POLICY_QUESTIONS})
         for each in deliveries
     ), deliveries
+
+
+def registered_desk(judge: Agent | CardRef, transform: Mapping[str, Any]) -> Service:
+    """``registered-desk``: ``judge``, an Agent or a registered one's exact reference, verified through ``transform``."""
+    verifier = Verifier(
+        "registered-policy",
+        "1.0.0",
+        inputs={"reply": str},
+        requirements=[
+            Requirement(
+                "refund-policy",
+                "The reply follows the refund policy.",
+                Check.agent(judge, inputs={"context": "inputs.reply"}, verdict_transform=transform),
+            )
+        ],
+    )
+    return Service("registered-desk", "1.0.0").add_component(
+        Component("desk-judge", judge).verified_by([verifier])
+    )
+
+
+def test_jev_registration_refuses_policies_no_local_graph_can_check(
+    jev: tuple[WyrdTestServer, Receiver],
+) -> None:
+    """Registration decides whether a policy fits a judge no local graph holds.
+
+    A local graph holding the judge refuses a policy on an undeclared question.
+    Naming the registered judge only by exact reference validates locally,
+    and registration refuses it with the field before Jev is called. The
+    corrected definition declares and judges.
+    """
+    server, upstream = jev
+    WyrdState.declare(policy_desk(), client_of(server))
+    asked = len(upstream.deliveries)
+    tone = {"kind": "choice", "question": "tone"}
+    field = "requirements[0].check.verdict_transform.question"
+
+    with pytest.raises(WyrdError) as local:
+        registered_desk(desk_judge(), tone).validate()
+    assert field in json.dumps(local.value.details), local.value
+
+    registered = CardRef("Agent", "desk-judge", "1.0.0")
+    wrong = registered_desk(registered, tone)
+    wrong.validate()
+    with pytest.raises(WyrdError) as refused:
+        WyrdState.declare(wrong, client_of(server))
+    assert refused.value.code == "WYRD_SPEC_400_VALIDATION", refused.value
+    assert field in refused.value.message, refused.value
+    assert len(upstream.deliveries) == asked
+
+    corrected = registered_desk(
+        registered,
+        {
+            "kind": "choice",
+            "question": "refund",
+            "outcomes": {"compliant": "passed", "violation": "failed", "unknown": "inconclusive"},
+        },
+    )
+    corrected.validate()
+    state = WyrdState.declare(corrected, client_of(server))
+    result = state.run("desk-judge").observe.verify(
+        "registered-policy", reply="DESK-PASS: the refund follows policy."
+    )
+    assert result.verdict == "passed"
+
+
+@pytest.mark.parametrize("marker", list(MALFORMED))
+def test_jev_malformed_answers_are_check_errors(
+    jev: tuple[WyrdTestServer, Receiver], marker: str
+) -> None:
+    """A malformed native answer makes only the requirement reading it inconclusive, with one Jev call per check."""
+    server, upstream = jev
+    state = WyrdState.declare(policy_desk(), client_of(server))
+    broken, _, reason = MALFORMED[marker]
+    asked = len(upstream.deliveries)
+
+    result = state.run("desk-judge").observe.verify("desk-policy", reply=f"{marker}: a reply")
+
+    for each in result.requirements:
+        if each["id"] == broken:
+            assert each["outcome"] == "inconclusive", each
+            assert reason in each["reason"], each
+        else:
+            assert each["outcome"] == "passed", each
+    assert result.verdict == "inconclusive"
+    assert len(upstream.deliveries) == asked + 4
+
+
+@pytest.mark.parametrize(("version", "capture"), [("1.0.0", "full"), ("2.0.0", "hash")])
+def test_jev_judgments_are_retained_under_capture_controls(
+    jev: tuple[WyrdTestServer, Receiver], version: str, capture: str
+) -> None:
+    """The recorded judgment keeps verdict, reason, the selected answer or its digest, and the judge's provenance; another tenant reads nothing."""
+    server, _ = jev
+    state = WyrdState.declare(policy_desk(version, capture), client_of(server))
+    result = state.run("desk-judge").observe.verify(
+        "desk-policy", reply="DESK-PASS: the refund follows policy."
+    )
+    assert result.verdict == "passed"
+
+    execution = verify.Execution.connect(result.execution_id, client_of(server))
+    execution.wait(60.0)
+    details = execution.details()
+
+    assert details["verifier"]["version"] == version
+    returned = {each["id"]: each for each in result.requirements}
+    retained = {each["id"]: each for each in details["outcome"]["requirements"]}
+    for id, question in [
+        ("refund-policy", "refund"),
+        ("helpful", "helpful"),
+        ("resolved", "unresolved"),
+        ("compliant", "compliance"),
+    ]:
+        kept = retained[id]
+        assert (kept["outcome"], kept["reason"]) == (
+            returned[id]["outcome"],
+            returned[id]["reason"],
+        ), id
+        if capture == "full":
+            assert kept["actual"] == VALID_ANSWERS[question], id
+        else:
+            digest = kept["actual"]
+            assert isinstance(digest, str) and len(digest) == 64 and int(digest, 16) >= 0, digest
+        provenance = kept["provenance"]
+        assert provenance["kind"] == "agent", provenance
+        assert provenance["agent"]["name"] == "desk-judge", provenance
+        assert provenance["route"] == {"kind": "wyrd_gateway", "deployment": "jev"}, provenance
+
+    tenant = server.seed_tenant("other-tenant")
+    foreign = server.bootstrap_service_in_tenant(tenant, ["admin"], name=f"foreign-{capture}")
+    with pytest.raises(WyrdError) as refused:
+        verify.Execution.connect(result.execution_id, client_of(server, foreign)).details()
+    assert refused.value.code == "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND"
+
+
+REFUND_DESK = Path(__file__).parents[4] / "examples/gateway-setup/refund-desk.yaml"
+
+
+@pytest.mark.parametrize(
+    ("answer", "verdict"),
+    [
+        ("REFUND-PROMISE: you are guaranteed a full refund.", "failed"),
+        ("REFUND-POLICY: we refund when the policy allows it.", "passed"),
+    ],
+)
+def test_jev_refund_example_judges_as_documented(
+    jev: tuple[WyrdTestServer, Receiver], answer: str, verdict: str
+) -> None:
+    """The documented example declares from YAML and Jev's selected canonical label is the verdict."""
+    server, _ = jev
+    state = WyrdState.declare(REFUND_DESK, client_of(server))
+
+    result = state.run("jev").observe.verify("no-refund-promise", answer=answer)
+
+    [judged] = result.requirements
+    assert judged["reason"] == f"Question 'refund_policy' selected '{verdict}' (confidence 0.9).", (
+        judged
+    )
+    assert result.verdict == verdict

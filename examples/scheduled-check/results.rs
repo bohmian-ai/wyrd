@@ -8,6 +8,8 @@ use wyrd_ai::Bifrost;
 use wyrd_ai::bifrost::{BifrostOptions, QueryParam};
 use wyrd_ai::cards::{CardKind, CardSelector, Cards};
 
+/// The newest three scheduled windows one Verifier judged for one Service,
+/// by their Card uids, with their UTC times as `HH:MM`.
 const RECENT: &str = "SELECT to_char(window_start, '%H:%M') AS opened, \
     to_char(window_end, '%H:%M') AS closed, verdict \
     FROM bifrost.verification.results \

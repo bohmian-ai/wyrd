@@ -10,8 +10,9 @@ time:
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Annotated
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 # ANCHOR: import
 from wyrd import WyrdState
@@ -23,20 +24,27 @@ from finance_service import Release
 
 
 @asynccontextmanager
-async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-    yield
+async def lifespan(_: FastAPI) -> AsyncIterator[dict]:
+    # Each server process loads the Service once, at startup.
+    state = WyrdState.from_path(".wyrd-bundle")
+    yield {"wyrd": state}
     # Drain what the state recorded before the process exits.
     state.shutdown()
 
 
 api = FastAPI(lifespan=lifespan)
 
+
+def wyrd_state(request: Request) -> WyrdState:
+    return request.state.wyrd
+
+
 # ANCHOR: handler
-state = WyrdState.from_path(".wyrd-bundle")
+Wyrd = Annotated[WyrdState, Depends(wyrd_state)]
 
 
 @api.post("/reports/send")
-def send_report(release: Release):
+def send_report(release: Release, state: Wyrd):
     with state.run() as run:
         result = run.observe.verify("release-check", release)
     if result.passed:

@@ -31,7 +31,7 @@
 <figure class="fig" class:halt={!loop.running} bind:this={figure}>
   <p class="sr" id="flow-desc">
     The code panel, labelled Your Finance API, is a Python excerpt of your own service. It imports WyrdState from wyrd,
-    loads the state for the finance-release Service, and defines a send_report handler under the route decorator
+    declares the finance-release Service's state as a dependency, and defines a send_report handler under the route decorator
     api.post for /reports/send. Inside a state.run block the handler makes one synchronous call into Wyrd,
     run.observe.verify, then releases the report if the verdict passed and holds it for review otherwise. During that
     call, Wyrd's real-time verification judges three requirements: an assertion that the recipient is authorized, an

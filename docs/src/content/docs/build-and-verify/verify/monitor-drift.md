@@ -27,18 +27,60 @@ Save three Cards: the `checkout` Service, the `latency-budget` Verifier it is ch
 
 The check fails a window whose mean latency is above 100 ms. Declare the Cards and pull the Service, as a deployment does:
 
+<LangTabs langs={['python', 'rust', 'typescript']}>
+<LangTab lang="python">
+
+```bash
+uv run wyrd declare checkout/checkout.yaml
+uv run wyrd pull --kind Service --name checkout --version 1.0.0 --output-dir .wyrd-bundle
+```
+
+</LangTab>
+<LangTab lang="rust">
+
 ```bash
 wyrd declare checkout/checkout.yaml
 wyrd pull --kind Service --name checkout --version 1.0.0 --output-dir .wyrd-bundle
 ```
 
+</LangTab>
+<LangTab lang="typescript">
+
+```bash
+pnpm wyrd declare checkout/checkout.yaml
+pnpm wyrd pull --kind Service --name checkout --version 1.0.0 --output-dir .wyrd-bundle
+```
+
+</LangTab>
+</LangTabs>
+
 ## 2. Create the Service's account
 
 A schedule runs as the Service's own account, and only while that account has recorded for the Service in the last 24 hours. Create it:
 
+<LangTabs langs={['python', 'rust', 'typescript']}>
+<LangTab lang="python">
+
+```bash
+uv run wyrd principal credential create-principal --name checkout-runtime --role workload --workload-name checkout
+```
+
+</LangTab>
+<LangTab lang="rust">
+
 ```bash
 wyrd principal credential create-principal --name checkout-runtime --role workload --workload-name checkout
 ```
+
+</LangTab>
+<LangTab lang="typescript">
+
+```bash
+pnpm wyrd principal credential create-principal --name checkout-runtime --role workload --workload-name checkout
+```
+
+</LangTab>
+</LangTabs>
 
 Copy the credential it prints into an environment variable for the next step:
 
@@ -66,6 +108,12 @@ export CHECKOUT_KEY=<credential>
 
 </LangTab>
 <LangTab lang="typescript">
+
+`results.ts` parses its rows with Zod. Add it:
+
+```bash
+pnpm add zod
+```
 
 <CodeFromFile file="examples/scheduled-check/record.ts" lang="typescript" title="record.ts" />
 
@@ -154,7 +202,9 @@ Your times differ. Each line is one window:
 Each stored result names the exact Verifier and Service versions it judged.
 
 <Aside type="note" title="Choose a real schedule">
+
 A minute keeps this guide short. A production check usually runs hourly or daily, such as `cron: "0 * * * *"`. `cron` is evaluated in UTC unless the Trigger sets `tz`. A window missed while the server was down is skipped, not judged later.
+
 </Aside>
 
 ## If it fails

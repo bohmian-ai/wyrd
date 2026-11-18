@@ -85,7 +85,7 @@ describe('landing finance figure', () => {
     const lines = [...body.matchAll(/<text x="44" y="\d+"[^>]*>([\s\S]*?)<\/text>/g)].map(([, line]) => text(line));
     expect(lines).toHaveLength(12);
     expect(lines[0]).toBe('from wyrd import WyrdState');
-    expect(lines.slice(5, 7)).toEqual(['@api.post("/reports/send")', 'def send_report(release: Release):']);
+    expect(lines.slice(5, 7)).toEqual(['@api.post("/reports/send")', 'def send_report(release: Release, state: Wyrd):']);
     // The call band sits on the verify line.
     expect(lines[8]).toContain('run.observe.verify(');
     for (const line of lines.filter(Boolean)) expect(api).toContain(line);

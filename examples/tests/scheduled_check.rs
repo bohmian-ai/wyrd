@@ -93,6 +93,9 @@ impl Reader {
 }
 
 /// Seconds since the Unix epoch.
+///
+/// # Panics
+/// Panics when the system clock reads before the Unix epoch.
 fn now() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -102,6 +105,9 @@ fn now() -> f64 {
 
 /// Wait until at least ten seconds remain in the current minute, so the
 /// samples about to be recorded fall in one window, and return the time.
+///
+/// # Panics
+/// Panics when the system clock reads before the Unix epoch.
 async fn clear_of_boundary() -> f64 {
     let second = now() % 60.0;
     if second >= 50.0 {

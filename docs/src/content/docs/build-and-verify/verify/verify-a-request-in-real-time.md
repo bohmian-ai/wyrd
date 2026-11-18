@@ -127,7 +127,9 @@ When the call itself fails, such as a credential without `verifier:run`, the API
 ```
 
 <Aside type="note" title="Checks that can wait">
+
 A request waits for every check in the Verifier, including the model judge. When a decision can be made after the response, `submit` the Verifier instead and read the result later, as in [Record a run and observations](/build-and-verify/observe/record-a-run-and-observations/#3-verify-the-answer). [Fit checks to the request's deadline](/build-and-verify/verify/act-on-verdicts-in-production/#2-fit-checks-to-the-requests-deadline) covers the trade-off.
+
 </Aside>
 
 ## If it fails

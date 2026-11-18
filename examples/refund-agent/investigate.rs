@@ -11,6 +11,7 @@ use wyrd_ai::cards::{CardKind, CardSelector, Cards};
 use wyrd_ai::serde_json::json;
 use wyrd_ai::verify::Execution;
 
+/// The newest failed result judged by one Verifier, by its Card uid.
 const FAILED: &str = "SELECT execution_id FROM bifrost.verification.results \
     WHERE verifier_card_uid = $1 AND verdict = 'failed' ORDER BY ended_at DESC LIMIT 1";
 

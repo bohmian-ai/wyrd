@@ -206,10 +206,13 @@ pub const fn http_status(r: i64, k: i64) -> Option<i64> {
     }
 }
 
-/// The `gen_ai.operation.name` of span `k`: chat and tool spans only.
+/// The `gen_ai.operation.name` of span `k` of request `r`: every fourth
+/// request's root invokes an agent, and chat and tool children name their
+/// operation.
 #[must_use]
-pub const fn operation(k: i64) -> Option<&'static str> {
+pub const fn operation(r: i64, k: i64) -> Option<&'static str> {
     match k {
+        0 if r % 4 == 0 => Some("invoke_agent"),
         1 => Some("chat"),
         2 => Some("execute_tool"),
         _ => None,
@@ -344,7 +347,7 @@ impl Journey {
                 Value::IntValue(code),
             ));
         }
-        if let Some(operation) = operation(k) {
+        if let Some(operation) = operation(r, k) {
             attributes.push(text("gen_ai.operation.name", operation));
         }
         Span {
@@ -769,5 +772,37 @@ mod tests {
             }
             assert_eq!((logs, points), (journey.log_rows(), journey.point_rows()));
         }
+    }
+
+    /// Every fourth request's root is an agent invocation, so the
+    /// invocation statistics count known spans instead of none.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the exported invocations differ from every fourth root.
+    #[test]
+    fn every_fourth_root_invokes_an_agent() {
+        let journey = Journey::DEFAULT;
+        let invocations = (0..journey.span_batches())
+            .flat_map(|b| journey.spans_request(b).resource_spans)
+            .flat_map(|resource| resource.scope_spans)
+            .flat_map(|scope| scope.spans)
+            .filter(|span| {
+                span.attributes.iter().any(|attribute| {
+                    attribute.key == "gen_ai.operation.name"
+                        && attribute
+                            .value
+                            .as_ref()
+                            .and_then(|value| value.value.as_ref())
+                            == Some(
+                                &wyrd_tonic::otlp::common::v1::any_value::Value::StringValue(
+                                    "invoke_agent".to_owned(),
+                                ),
+                            )
+                })
+            })
+            .inspect(|span| assert!(span.parent_span_id.is_empty(), "an invocation is a root"))
+            .count();
+        assert_eq!(invocations, 125);
     }
 }

@@ -1594,3 +1594,27 @@ def test_docsite_agent_workflow_example(refund_reader: WyrdTestServer) -> None:
         "answer-refund",
         "draft-reply",
     ]
+
+
+def test_docsite_investigate_example(refund_reader: WyrdTestServer) -> None:
+    with contextlib.redirect_stdout(io.StringIO()):
+        runpy.run_path("refund_agent.py", run_name="__main__")
+    shutil.copy(REFUND_AGENT / "investigate.py", ".")
+    printed = io.StringIO()
+    with contextlib.redirect_stdout(printed):
+        program = runpy.run_path("investigate.py", run_name="__main__")
+    assert printed.getvalue() == (REFUND_AGENT / "investigate-output.txt").read_text()
+
+    # The execution it found is the skipped run's, and reads refuse an unknown or foreign execution alike.
+    assert program["details"]["outcome"]["evidence"]["reply"]["value"].startswith("Order 1042")
+    with pytest.raises(WyrdError) as unknown:
+        verify.Execution.connect("01a1ec29-0000-7000-8000-000000000000").details()
+    assert unknown.value.code == "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND"
+    foreign = WyrdClient(
+        credential=refund_reader.bootstrap_service_in_tenant(
+            refund_reader.seed_tenant("refund-foreigner"), ["admin"], name="refund-foreigner"
+        )
+    )
+    with pytest.raises(WyrdError) as refused:
+        verify.Execution.connect(program["execution_id"], client=foreign).details()
+    assert refused.value.code == "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND"

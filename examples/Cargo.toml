@@ -47,6 +47,10 @@ name = "refund_agent"
 path = "refund-agent/refund_agent.rs"
 
 [[bin]]
+name = "investigate"
+path = "refund-agent/investigate.rs"
+
+[[bin]]
 name = "support_agent"
 path = "support-agent/support_agent.rs"
 

@@ -123,4 +123,4 @@ The program flushes its spans before it verifies. A trace with no stored span is
 
 ## Next
 
-[Verifier recipes](/build-and-verify/verify/verifier-recipes/#trace) shows more trace checks, such as span position and attributes. [Establish sufficient evidence](/build-and-verify/observe/establish-sufficient-evidence/) covers when missing evidence should hold a decision.
+[Investigate a failed verification](/build-and-verify/verify/run-a-verification-and-inspect-its-evidence/) reads the stored evidence behind the `skipped` failure. [Verifier recipes](/build-and-verify/verify/verifier-recipes/#trace) shows more trace checks, such as span position and attributes. [Establish sufficient evidence](/build-and-verify/observe/establish-sufficient-evidence/) covers when missing evidence should hold a decision.

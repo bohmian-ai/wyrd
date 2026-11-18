@@ -3960,7 +3960,7 @@ function lookUpOrder(orderId: string): Order {
 
 // Answer a refund request; return the reply and the trace ID of the work behind it.
 function refundAgent(orderId: string, remembered?: Order): [string, string] {
-  return tracer.startActiveSpan("answer-refund", (span) => {
+  return tracer.startActiveSpan("answer-refund", (span): [string, string] => {
     // The bug: an order remembered from earlier in the conversation skips the lookup.
     const order = remembered ?? lookUpOrder(orderId);
     const reply = tracer.startActiveSpan("draft-reply", (draft) => {
@@ -4047,7 +4047,271 @@ The program flushes its spans before it verifies. A trace with no stored span is
 
 ## Next
 
-[Verifier recipes](/wyrd/build-and-verify/verify/verifier-recipes/#trace) shows more trace checks, such as span position and attributes. [Establish sufficient evidence](/wyrd/build-and-verify/observe/establish-sufficient-evidence/) covers when missing evidence should hold a decision.
+[Investigate a failed verification](/wyrd/build-and-verify/verify/run-a-verification-and-inspect-its-evidence/) reads the stored evidence behind the `skipped` failure. [Verifier recipes](/wyrd/build-and-verify/verify/verifier-recipes/#trace) shows more trace checks, such as span position and attributes. [Establish sufficient evidence](/wyrd/build-and-verify/observe/establish-sufficient-evidence/) covers when missing evidence should hold a decision.
+
+# Investigate a failed verification
+
+Page: /wyrd/build-and-verify/verify/run-a-verification-and-inspect-its-evidence/
+
+> Find a stored failed result, read which requirement failed, the evidence it judged, and the exact Verifier and subject versions, without rerunning any check.
+
+Start from a stored failure and find out why it failed: which requirement, against what evidence, judged by which versions.
+
+The result `verify` returns is compact: the verdict and each requirement's outcome. Wyrd also keeps the execution's details, which hold each check as written, the value it found, the pinned evidence, and the exact Cards involved. Reading them does not run any check again.
+
+## Before you start
+
+Finish [Verify an agent's workflow](/wyrd/build-and-verify/verify/verify-an-agent-workflow/) in the same directory. Its `skipped` case stored a failed `refund-workflow` result.
+
+## 1. Write the investigation
+
+The program finds the newest failed `refund-workflow` result in `bifrost.verification.results`, then reads its execution's details and prints each requirement that did not pass:
+
+**Python**
+
+```python title="investigate.py"
+import json
+import time
+
+from wyrd.bifrost import Bifrost
+from wyrd.cards import CardRef, Cards
+from wyrd.verify import Execution
+
+FAILED = """
+SELECT execution_id FROM bifrost.verification.results
+WHERE verifier_card_uid = $1 AND verdict = 'failed'
+ORDER BY ended_at DESC LIMIT 1
+"""
+
+# Results are stored shortly after a check: look for up to a minute.
+verifier = Cards().get(CardRef("Verifier", "refund-workflow", "0.1.0"))
+for _ in range(60):
+    rows = Bifrost().sql(FAILED, [verifier.card_ref.uid]).to_arrow().to_pylist()
+    if rows:
+        break
+    time.sleep(1)
+else:
+    raise SystemExit("no failed refund-workflow result yet")
+execution_id = rows[0]["execution_id"]
+
+# One read: the exact versions judged, each check as written, and what it found:
+# here, the names of the spans in the trace, sorted.
+details = Execution.connect(execution_id).details()
+judged, subject = details["verifier"], details["subject"]
+print(f"{judged['name']}@{judged['version']} judged {subject['name']}@{subject['version']}: {details['outcome']['verdict']}")
+for requirement in details["outcome"]["requirements"]:
+    if requirement["outcome"] != "passed":
+        print(f"  {requirement['id']}: {requirement['outcome']} · {requirement['reason']}")
+        print(f"    expected: {json.dumps(requirement['check']['expected'], separators=(',', ':'))}")
+        print(f"    found:    {json.dumps(sorted(requirement['actual']), separators=(',', ':'))}")
+
+```
+
+**Rust**
+
+```rust title="src/bin/investigate.rs"
+//! Find the newest failed `refund-workflow` result and read what its
+//! execution judged.
+
+use std::error::Error;
+use std::time::Duration;
+
+use serde::Deserialize;
+use wyrd_ai::Bifrost;
+use wyrd_ai::bifrost::{BifrostOptions, QueryParam};
+use wyrd_ai::cards::{CardKind, CardSelector, Cards};
+use wyrd_ai::serde_json::json;
+use wyrd_ai::verify::Execution;
+
+const FAILED: &str = "SELECT execution_id FROM bifrost.verification.results \
+    WHERE verifier_card_uid = $1 AND verdict = 'failed' ORDER BY ended_at DESC LIMIT 1";
+
+/// One stored result row.
+#[derive(Deserialize)]
+struct Failed {
+    /// The execution that produced the result.
+    execution_id: String,
+}
+
+/// Print the failed requirements of the newest failed result.
+///
+/// # Errors
+/// Returns the client's configuration or credential error, a refused read,
+/// or `no failed refund-workflow result yet` after a minute without one.
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let bifrost = Bifrost::connect(BifrostOptions::default()).await?;
+
+    // Results are stored shortly after a check: look for up to a minute.
+    let verifier = Cards::connect()
+        .await?
+        .get(CardSelector::named(
+            CardKind::Verifier,
+            "refund-workflow".parse()?,
+        ))
+        .await?;
+    let uid = verifier
+        .metadata
+        .uid
+        .ok_or("the Verifier has no uid")?
+        .to_string();
+    let mut execution_id = None;
+    for _ in 0..60 {
+        let rows: Vec<Failed> = bifrost
+            .sql_as(FAILED, &[QueryParam::String(uid.clone())])
+            .await?;
+        if let Some(row) = rows.into_iter().next() {
+            execution_id = Some(row.execution_id);
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    let execution_id = execution_id.ok_or("no failed refund-workflow result yet")?;
+
+    // One read: the exact versions judged, each check as written, and what it found:
+    // here, the names of the spans in the trace, sorted.
+    let details = json!(
+        Execution::connect(execution_id.parse()?)
+            .await?
+            .details()
+            .await?
+    );
+    let (judged, subject) = (&details["verifier"], &details["subject"]);
+    println!(
+        "{}@{} judged {}@{}: {}",
+        judged["name"].as_str().unwrap_or_default(),
+        judged["version"].as_str().unwrap_or_default(),
+        subject["name"].as_str().unwrap_or_default(),
+        subject["version"].as_str().unwrap_or_default(),
+        details["outcome"]["verdict"].as_str().unwrap_or_default(),
+    );
+    for requirement in details["outcome"]["requirements"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        if requirement["outcome"] != "passed" {
+            println!(
+                "  {}: {} · {}",
+                requirement["id"].as_str().unwrap_or_default(),
+                requirement["outcome"].as_str().unwrap_or_default(),
+                requirement["reason"].as_str().unwrap_or_default(),
+            );
+            println!("    expected: {}", requirement["check"]["expected"]);
+            let mut found: Vec<&str> = requirement["actual"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|name| name.as_str())
+                .collect();
+            found.sort_unstable();
+            println!("    found:    {}", json!(found));
+        }
+    }
+    Ok(())
+}
+
+```
+
+**TypeScript**
+
+The query parses its rows with Zod. Add it:
+
+```bash
+pnpm add zod
+```
+
+```typescript title="investigate.ts"
+import { setTimeout as sleep } from "node:timers/promises";
+
+import { Bifrost, Cards, verify } from "wyrd-ai";
+import { z } from "zod";
+
+const FAILED = `
+SELECT execution_id FROM bifrost.verification.results
+WHERE verifier_card_uid = $1 AND verdict = 'failed'
+ORDER BY ended_at DESC LIMIT 1
+`;
+const bifrost = await Bifrost.connect();
+
+// Results are stored shortly after a check: look for up to a minute.
+const verifier = await (await Cards.connect()).get("Verifier/refund-workflow@0.1.0");
+let rows: { execution_id: string }[] = [];
+for (let attempt = 0; attempt < 60 && rows.length === 0; attempt++) {
+  if (attempt > 0) await sleep(1000);
+  rows = await bifrost.sql(FAILED, [verifier.metadata.uid ?? ""], z.object({ execution_id: z.string() }));
+}
+const [failed] = rows;
+if (failed === undefined) throw new Error("no failed refund-workflow result yet");
+
+// One read: the exact versions judged, each check as written, and what it found:
+// here, the names of the spans in the trace, sorted.
+const details = await (await verify.Execution.connect(failed.execution_id)).details();
+const { verifier: judged, subject } = details;
+console.log(`${judged.name}@${judged.version} judged ${subject.name}@${subject.version}: ${details.outcome.verdict}`);
+for (const requirement of details.outcome.requirements) {
+  if (requirement.outcome !== "passed") {
+    const { check } = requirement;
+    console.log(`  ${requirement.id}: ${requirement.outcome} · ${requirement.reason}`);
+    console.log(`    expected: ${JSON.stringify("expected" in check ? check.expected : null)}`);
+    console.log(`    found:    ${JSON.stringify([...(requirement.actual as string[])].sort())}`);
+  }
+}
+
+```
+
+A result becomes queryable shortly after its check, not at the moment `verify` returns, so the program looks for up to a minute. A result that is not visible yet is not treated as a pass or a failure.
+
+## 2. Run it
+
+**Python**
+
+```bash
+uv run investigate.py
+```
+
+**Rust**
+
+```bash
+cargo run --bin investigate
+```
+
+**TypeScript**
+
+```bash
+node investigate.ts
+```
+
+```text title="output"
+refund-workflow@0.1.0 judged refund-agent@0.1.0: failed
+  looked-up-order: failed · operator IsSuperset returned false
+    expected: ["look-up-order"]
+    found:    ["answer-refund","draft-reply"]
+
+```
+
+## 3. Read the result
+
+Each line answers one question:
+
+- **What judged what.** `refund-workflow@0.1.0` judged `refund-agent@0.1.0`. These are exact versions: a later version of either Card does not change this record.
+- **Which requirement failed.** `looked-up-order`. `reply-names-order` passed, so it is not printed.
+- **What it found.** The check expected `look-up-order` among the trace's span names, and the stored trace held only `answer-refund` and `draft-reply`. The agent never ran its lookup.
+
+The details also hold the pinned evidence under `outcome.evidence`: the reply text and the trace ID the check read. Over MCP, the same read is [`verification.get_execution_details`](/wyrd/reference/mcp-tools/).
+
+A read sees only executions in the caller's own tenant. An unknown execution and one in another tenant both answer `WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND`, so a refused read reveals nothing about other tenants.
+
+## If it fails
+
+| You see | Fix |
+| --- | --- |
+| `no failed refund-workflow result yet` | Run the refund agent from [Verify an agent's workflow](/wyrd/build-and-verify/verify/verify-an-agent-workflow/) first, against the same server |
+| `WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND` | Read with a credential from the tenant that ran the check, such as the one `wyrd init` saved |
+
+## Next
+
+[What Wyrd retains](/wyrd/understand/how-verification-works/#what-wyrd-retains-and-how-requirements-change) explains which tables hold results, inputs, and outputs. [Bifrost](/wyrd/understand/bifrost/) covers querying them with SQL.
 
 # Act on verdicts in production
 

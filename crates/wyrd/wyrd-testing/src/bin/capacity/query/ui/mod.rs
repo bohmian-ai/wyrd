@@ -14,7 +14,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use wyrd_spec::vala::api::QueryParam;
-use wyrd_testing::experiment::{Criterion, Declaration, Metric, Op, Step};
+use wyrd_testing::experiment::{Criterion, Declaration, Metric, Op, Role, Step};
 
 use answer::Order;
 use fixture::Journey;
@@ -34,10 +34,11 @@ pub const PAGES: [&str; 4] = ["traces", "verification", "logs", "metrics"];
 pub const CLIENTS: [u64; 2] = [1, 8];
 
 /// The diagnostic observation of one page's or one statement's client
-/// latency: `page.<page>` or `statement.<id>`.
+/// latency, a driver observation: `driver.page.<page>` or
+/// `driver.statement.<id>`.
 #[must_use]
 pub fn observation(kind: &str, name: &str) -> String {
-    format!("{kind}.{name}")
+    format!("{}.{kind}.{name}", Role::Driver.name())
 }
 
 /// The ui-sql declaration over `base` with the Bifrost read `metrics` and

@@ -614,12 +614,12 @@ mod tests {
             "statement.metrics-histogram",
         ] {
             for stat in ["count", "p95_us"] {
-                let id = format!("diagnostic.{observation}.{stat}");
+                let id = format!("diagnostic.driver.{observation}.{stat}");
                 assert!(declared(id.clone()), "ui-sql declares {id}");
             }
         }
         assert!(
-            !declared("diagnostic.statement.span-detail.count".to_owned()),
+            !declared("diagnostic.driver.statement.span-detail.count".to_owned()),
             "standalone statements are checked for correctness, not timed"
         );
         for criterion in ["no-errors", "exact-answers", "p95-samples"] {

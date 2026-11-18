@@ -422,9 +422,15 @@ fn json(field: &str, value: NativeValue) -> Result<Value> {
 ///
 /// # Errors
 /// Returns `InvalidArg` naming `field` when `value` is not a transform's
-/// JSON form.
+/// JSON form or breaks a rule the policy alone decides, such as `fail_at`
+/// at or above `pass_at`.
 fn transform(field: &str, value: NativeValue) -> Result<VerdictTransform> {
-    serde_json::from_value(value.json(field)?).map_err(|error| invalid(format!("{field}: {error}")))
+    let policy: VerdictTransform = serde_json::from_value(value.json(field)?)
+        .map_err(|error| invalid(format!("{field}: {error}")))?;
+    policy
+        .validate(field)
+        .map_err(|error| invalid(error.to_string()))?;
+    Ok(policy)
 }
 
 /// `value` as a string.

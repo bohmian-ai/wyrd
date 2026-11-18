@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde_json::{Value, json};
-use skald_spec::{Prompt, ResponseFormat, ResponseType};
+use skald_spec::{Prompt, ProviderRequest, ResponseFormat, ResponseType};
 
 use super::extract::ExtractOutput;
 use super::pull_request::{Extractor, PULL_REQUEST_SOURCE};
@@ -16,7 +16,8 @@ use super::reference::{OrderBy, Reference, ReferenceRoot, SourceField};
 use super::schema_path::{admits, fits};
 use super::{
     Action, AgentCall, Check, CheckEvidence, CodeCall, CodeSource, Condition, Decide, DependsOn,
-    DriftCheck, InputSlot, MAX_STEP_RETRIES, Requirement, Step, VerifierSpec, WorkspaceSource,
+    DriftCheck, InputSlot, MAX_STEP_RETRIES, Requirement, Step, VerdictTransform, VerifierSpec,
+    WorkspaceSource,
 };
 use crate::card::agent::{AgentSpec, BuiltinTool};
 use crate::card::drift::DriftSignal;
@@ -107,6 +108,45 @@ impl VerifierSpec {
             ancestors: BTreeMap::new(),
         }
         .run()
+    }
+
+    /// Checks every Agent check's `verdict_transform` against the Prompt
+    /// request `resolve` returns for its Agent, for Agents or Prompts that
+    /// only a declaration graph or the registry can resolve, such as a
+    /// sibling or a registered Agent; [`VerifierSpec::validate`] already
+    /// checks an inline Agent with an inline Prompt. A check whose Agent
+    /// `resolve` cannot answer is skipped.
+    ///
+    /// # Errors
+    /// Returns [`VerdictTransform::validate_for`]'s refusal at the check's
+    /// `verdict_transform` path, such as
+    /// `requirements[0].check.verdict_transform.question`.
+    pub fn validate_transforms_with<'a, F>(&'a self, resolve: F) -> Result<(), WyrdError>
+    where
+        F: Fn(&'a InlineableRef<AgentSpec>) -> Option<&'a ProviderRequest>,
+    {
+        let steps = self.steps.iter().enumerate().flat_map(|(index, step)| {
+            step.requirements
+                .iter()
+                .enumerate()
+                .map(move |(req, requirement)| {
+                    (format!("steps[{index}].requirements[{req}]"), requirement)
+                })
+        });
+        let whole = self
+            .requirements
+            .iter()
+            .enumerate()
+            .map(|(index, requirement)| (format!("requirements[{index}]"), requirement));
+        for (path, requirement) in steps.chain(whole) {
+            if let Check::Agent(check) = &requirement.check
+                && let Some(policy) = &check.verdict_transform
+                && let Some(request) = resolve(&check.call.agent)
+            {
+                policy.validate_for(request, &format!("{path}.check.verdict_transform"))?;
+            }
+        }
+        Ok(())
     }
 
     /// Plans step stages from `depends_on` plus every step reference in each
@@ -608,7 +648,7 @@ where
                     ));
                 }
             }
-            Action::Agent(call) => self.validate_agent(call, position, &action_path)?,
+            Action::Agent(call) => self.validate_agent(call, None, position, &action_path)?,
             Action::Code(call) => self.validate_code(call, position, &action_path)?,
         }
         Ok(())
@@ -659,7 +699,13 @@ where
                 }
                 validate_operator(&trace.operator, &path)
             }
-            Check::Agent(check) => self.validate_agent(&check.call, position, &path),
+            Check::Agent(check) => {
+                let transform = check.verdict_transform.as_ref();
+                if let Some(policy) = transform {
+                    policy.validate(&format!("{path}.verdict_transform"))?;
+                }
+                self.validate_agent(&check.call, transform, position, &path)
+            }
             Check::Code(check) => {
                 self.validate_code(&check.call, position, &path)?;
                 match &check.response_format {
@@ -761,6 +807,7 @@ where
     fn validate_agent(
         &self,
         call: &'a AgentCall,
+        transform: Option<&VerdictTransform>,
         position: Position<'a>,
         path: &str,
     ) -> Result<(), WyrdError> {
@@ -835,7 +882,12 @@ where
                 "publish is available only to step Agents; a check's Agent cannot publish",
             ));
         }
-        if !matches!(position, Position::Step(_)) {
+        if let Some(policy) = transform {
+            policy.validate_for(
+                &resolved.prompt.request,
+                &format!("{path}.verdict_transform"),
+            )?;
+        } else if !matches!(position, Position::Step(_)) {
             let named = resolved.prompt.authored().is_ok_and(|authored| {
                 matches!(authored.response_format, Some(ResponseFormat::Named(_)))
             });

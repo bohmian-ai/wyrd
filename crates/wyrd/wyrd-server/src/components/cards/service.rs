@@ -12,14 +12,14 @@ use uuid::Uuid;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
 use wyrd_semver::{VersionBlock, VersionRange, VersionSpec};
-use wyrd_spec::DataTenantId;
 use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
+use wyrd_spec::card::agent::AgentSpec;
 use wyrd_spec::card::drift::DriftSignal;
 use wyrd_spec::card::repository::infer_card_name;
 use wyrd_spec::card::trigger::TriggerActivation;
 use wyrd_spec::card::verifier::{
-    Action, CheckEvidence, InputSlot, OWNER_OCCURRENCE_KEY, OrderBy, VerificationBinding,
+    Action, Check, CheckEvidence, InputSlot, OWNER_OCCURRENCE_KEY, OrderBy, VerificationBinding,
     VerificationStatus, VerifierSpec,
 };
 use wyrd_spec::envelope::{
@@ -46,6 +46,7 @@ use wyrd_spec::request_id::RequestId;
 use wyrd_spec::storage::{UploadId, UploadInitRequest, UploadPlan};
 use wyrd_spec::vala::api::RegisterTableRequest;
 use wyrd_spec::verification::{GroupEndSettings, GroupSource};
+use wyrd_spec::{DataTenantId, ProviderRequest};
 use wyrd_sql::CardStatus;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::cards::{
@@ -1521,6 +1522,7 @@ impl DeclarationWriter<'_> {
             }
             if let Spec::Verifier(verifier) = &mut spec {
                 verifier.queue_only = queue_only(&mut conn, verifier).await?;
+                validate_registered_transforms(&mut conn, verifier).await?;
             }
             if let Spec::Agent(agent) = &mut spec
                 && let InlineableRef::Inline(prompt) = &agent.prompt
@@ -1980,6 +1982,87 @@ async fn queue_only(conn: &mut TenantConn<'_>, verifier: &VerifierSpec) -> Resul
         }
     }
     Ok(false)
+}
+
+/// Refuse a `verdict_transform` the registered Agent or Prompt it judges
+/// with cannot answer.
+///
+/// Called with `queue_only`, once references are pinned: each referenced
+/// Agent and Prompt is read once by UID inside the declaration transaction,
+/// which already holds siblings persisted earlier in it, so the registry,
+/// not the submitting client, decides every relationship no local graph can
+/// see. An inline Agent with an inline Prompt was checked by
+/// [`VerifierSpec::validate`].
+///
+/// # Errors
+/// Returns `WYRD_SPEC_400_VALIDATION` naming the check's
+/// `verdict_transform` field, `WYRD_INTERNAL` when a reference is unpinned
+/// or names another kind, and the registry error from reading a Card.
+async fn validate_registered_transforms(
+    conn: &mut TenantConn<'_>,
+    verifier: &VerifierSpec,
+) -> Result<(), WyrdError> {
+    /// The request of `agent`'s Prompt: inline, or read into `registered`.
+    fn prompt_of<'a>(
+        agent: &'a AgentSpec,
+        registered: &'a HashMap<CardUid, Spec>,
+    ) -> Option<&'a ProviderRequest> {
+        match &agent.prompt {
+            InlineableRef::Inline(prompt) => Some(&prompt.request),
+            reference => match registered.get(reference.as_card_ref()?.uid.as_ref()?)? {
+                Spec::Prompt(prompt) => Some(&prompt.prompt.request),
+                _ => None,
+            },
+        }
+    }
+    let mut registered: HashMap<CardUid, Spec> = HashMap::new();
+    for requirement in verifier.all_requirements() {
+        let Check::Agent(check) = &requirement.check else {
+            continue;
+        };
+        if check.verdict_transform.is_none() {
+            continue;
+        }
+        let prompt = match &check.call.agent {
+            InlineableRef::Inline(agent) => agent
+                .prompt
+                .as_card_ref()
+                .map(|prompt| pinned_uid(Some(prompt))),
+            reference => {
+                let uid = pinned_uid(reference.as_card_ref())?;
+                if !registered.contains_key(&uid) {
+                    let spec = sql_get_card_by_uid(conn, &uid).await?.spec;
+                    if !matches!(spec, Spec::Agent(_)) {
+                        return Err(WyrdError::internal("an Agent reference names another kind"));
+                    }
+                    registered.insert(uid.clone(), spec);
+                }
+                match registered.get(&uid) {
+                    Some(Spec::Agent(agent)) => agent
+                        .prompt
+                        .as_card_ref()
+                        .map(|prompt| pinned_uid(Some(prompt))),
+                    _ => None,
+                }
+            }
+        };
+        if let Some(uid) = prompt.transpose()?
+            && !registered.contains_key(&uid)
+        {
+            let spec = sql_get_card_by_uid(conn, &uid).await?.spec;
+            if !matches!(spec, Spec::Prompt(_)) {
+                return Err(WyrdError::internal("a Prompt reference names another kind"));
+            }
+            registered.insert(uid, spec);
+        }
+    }
+    verifier.validate_transforms_with(|agent| match agent {
+        InlineableRef::Inline(agent) => prompt_of(agent, &registered),
+        reference => match registered.get(reference.as_card_ref()?.uid.as_ref()?)? {
+            Spec::Agent(agent) => prompt_of(agent, &registered),
+            _ => None,
+        },
+    })
 }
 
 /// Freeze an inline Trigger or Operator body as its canonical spec digest.

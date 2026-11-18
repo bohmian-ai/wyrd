@@ -2,9 +2,12 @@
 
 use std::collections::HashMap;
 
+use wyrd_spec::ProviderRequest;
+use wyrd_spec::card::agent::AgentSpec;
 use wyrd_spec::envelope::Spec;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::graph::spec_binding_errors;
+use wyrd_spec::reference::{InlineableRef, SiblingRef};
 use wyrd_spec::refs::ReferenceSlotVisitor;
 use wyrd_spec::registry::validate_artifact_manifest;
 
@@ -23,9 +26,63 @@ pub fn validate_tree(cards: &mut [AuthoredCard]) -> Vec<Diagnostic> {
         validate_card(card, &mut diagnostics);
         check_resolved_references(card, &mut diagnostics);
     }
+    check_verdict_transforms(cards, &mut diagnostics);
     check_heavy_artifact_constraint(cards, &mut diagnostics);
     check_duplicate_artifact_paths(cards, &mut diagnostics);
     diagnostics
+}
+
+/// Check each Verifier's `verdict_transform` policies against the Prompt
+/// of the sibling Agent it judges with, when that Agent and its Prompt are in
+/// the tree; the server checks the same relationship for registered Agents.
+fn check_verdict_transforms(cards: &[AuthoredCard], diagnostics: &mut Vec<Diagnostic>) {
+    for card in cards {
+        if let Spec::Verifier(spec) = &card.spec
+            && let Err(error) =
+                spec.validate_transforms_with(|agent| sibling_prompt_request(cards, agent))
+        {
+            diagnostics.push(catalog_error(card, &error));
+        }
+    }
+}
+
+/// The Prompt request of the Agent `agent` names: a sibling Agent in
+/// `cards` with an inline or sibling Prompt, or an inline Agent with a
+/// sibling Prompt Card in `cards`. An inline Agent with an inline Prompt
+/// answers `None`: [`VerifierSpec::validate`] already checked it.
+///
+/// [`VerifierSpec::validate`]: wyrd_spec::card::verifier::VerifierSpec::validate
+fn sibling_prompt_request<'a>(
+    cards: &'a [AuthoredCard],
+    agent: &'a InlineableRef<AgentSpec>,
+) -> Option<&'a ProviderRequest> {
+    let agent = match agent {
+        InlineableRef::Inline(agent) if agent.prompt.as_inline().is_some() => return None,
+        InlineableRef::Inline(agent) => agent.as_ref(),
+        reference => match &sibling(cards, reference.target()?)?.spec {
+            Spec::Agent(agent) => agent,
+            _ => return None,
+        },
+    };
+    match &agent.prompt {
+        InlineableRef::Inline(prompt) => Some(&prompt.request),
+        other => match &sibling(cards, other.target()?)?.spec {
+            Spec::Prompt(prompt) => Some(&prompt.prompt.request),
+            _ => None,
+        },
+    }
+}
+
+/// The card in `cards` `target` names, matching its version when pinned.
+fn sibling(cards: &[AuthoredCard], target: SiblingRef) -> Option<&AuthoredCard> {
+    cards.iter().find(|card| {
+        card.kind == target.kind
+            && card.metadata.name == target.name
+            && target
+                .version
+                .as_ref()
+                .is_none_or(|version| card.metadata.resolved_pin() == Some(version))
+    })
 }
 
 /// Reject duplicate `(kind, name, version)` identities and report the

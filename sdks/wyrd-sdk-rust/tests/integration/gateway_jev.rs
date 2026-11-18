@@ -23,9 +23,9 @@ use wyrd_ai::gateway_admin::{
 use wyrd_ai::operator_connections::SecretBearer;
 use wyrd_ai::state::{DeclareOptions, WyrdState};
 use wyrd_ai::verify::{
-    Agent, Check, ChoiceQuestion, ChoiceTransform, ComparisonOperator, Component, InputSlot,
-    Inputs, JevPromptOptions, ProbabilityTransform, Prompt, Requirement, ScoreTransform, Service,
-    VerdictTransform, Verifier,
+    Agent, CardRef, Check, ChoiceQuestion, ChoiceTransform, ComparisonOperator, Component,
+    FieldValue, InputSlot, Inputs, JevPromptOptions, ProbabilityTransform, Prompt, Requirement,
+    ScoreTransform, Service, VerdictTransform, Verifier,
 };
 use wyrd_ai::{RequirementOutcome, VerificationVerdict};
 use wyrd_testing::server::WyrdTestServer;
@@ -589,9 +589,10 @@ fn desk_answers(label: &str, confidence: f64, helpful: f64, unresolved: f64, sco
 ///
 /// # Panics
 /// Panics when the Prompt does not build.
-fn policy_desk() -> Service {
+/// The `desk-judge` Jev Agent asking [`desk_questions`] about `${context}`.
+fn desk_judge() -> Agent {
     let questions = serde_json::from_value(desk_questions()).expect("native questions decode");
-    let judge = Agent::new("desk-judge", "1.0.0")
+    Agent::new("desk-judge", "1.0.0")
         .prompt(
             Prompt::jev(
                 "jev-latest",
@@ -603,7 +604,11 @@ fn policy_desk() -> Service {
             .expect("the Jev prompt builds"),
         )
         .execution_route(json!({"kind": "wyrd_gateway", "deployment": "jev"}))
-        .run_config(json!({"max_iterations": 1}));
+        .run_config(json!({"max_iterations": 1}))
+}
+
+fn policy_desk() -> Service {
+    let judge = desk_judge();
     let check = |transform| {
         Check::agent(judge.clone())
             .inputs([("context", "inputs.reply")])
@@ -772,5 +777,168 @@ async fn jev_policies_judge_choice_probability_and_score() {
             );
         }
     }
+    jev.deployment.shutdown().await;
+}
+
+/// The `registered-desk` Service: `judge`, an Agent or the exact reference
+/// to a registered one, verified by `registered-policy`, which reads its
+/// answer through `transform`.
+fn registered_desk(judge: impl Into<FieldValue> + Clone, transform: VerdictTransform) -> Service {
+    let verifier = Verifier::new("registered-policy", "1.0.0")
+        .inputs([("reply", InputSlot::json(json!({"type": "string"})))])
+        .requirements([Requirement::new(
+            "refund-policy",
+            "The reply follows the refund policy.",
+            Check::agent(judge.clone())
+                .inputs([("context", "inputs.reply")])
+                .verdict_transform(transform),
+        )]);
+    Service::new("registered-desk", "1.0.0")
+        .components([Component::new("desk-judge", judge).verified_by([verifier])])
+}
+
+/// Local validation refuses a policy its in-graph Jev judge cannot answer.
+/// Registration, not the client, decides whether a policy fits a judge no
+/// local graph holds: a registered Jev Agent named only by its exact
+/// reference passes local validation, and the server refuses a policy
+/// selecting a question its Prompt does not declare, naming the field, before
+/// Jev is called. A raw HTTP declaration that skips SDK validation is refused
+/// the same way. The corrected definition declares and judges.
+///
+/// # Panics
+/// Panics when a refused declaration is accepted, a refusal names another
+/// field, Jev is called, or the corrected definition does not judge.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn jev_registration_refuses_policies_no_local_graph_can_check() {
+    let jev = Jev::start().await;
+    jev.answer_when(
+        "DESK-PASS",
+        json!({"model": "jev-1.13.0", "answers": desk_answers("compliant", 0.3, 0.75, 0.02, 2.0)}),
+    )
+    .await;
+    let options = || DeclareOptions {
+        client: Some(jev.deployment.admin()),
+        ..DeclareOptions::default()
+    };
+    WyrdState::declare_with(&policy_desk(), options())
+        .await
+        .expect("the judge registers");
+    let asked = jev.received().await.len();
+
+    let tone = || {
+        VerdictTransform::Choice(ChoiceTransform {
+            question: "tone".to_owned(),
+            outcomes: None,
+        })
+    };
+    let local = registered_desk(desk_judge(), tone())
+        .validate()
+        .expect_err("a local graph holding the judge refuses the policy");
+    assert!(
+        local.problem().details["diagnostics"][0]["message"]
+            .as_str()
+            .is_some_and(
+                |message| message.contains("requirements[0].check.verdict_transform.question")
+            ),
+        "{local:?}"
+    );
+
+    let wrong = registered_desk(CardRef::agent("desk-judge", "1.0.0"), tone());
+    wrong
+        .validate()
+        .expect("no local graph holds the registered judge's Prompt");
+    let refused = WyrdState::declare_with(&wrong, options())
+        .await
+        .expect_err("registration refuses the policy");
+    assert_eq!(refused.code(), "WYRD_SPEC_400_VALIDATION", "{refused}");
+    assert!(
+        refused
+            .to_string()
+            .contains("requirements[0].check.verdict_transform.question"),
+        "{refused}"
+    );
+
+    let token = jev
+        .deployment
+        .admin()
+        .access_token()
+        .await
+        .expect("access token mints");
+    let raw = json!({"submissions": [
+        {"apiVersion": "wyrd/v1", "kind": "Agent",
+         "metadata": {"name": "bypass-judge", "version": "1.0.0"},
+         "spec": {"prompt": {"provider": "jev", "model": "jev-latest", "format": "system_one",
+                             "body": {"state": "${context}", "questions": desk_questions()}},
+                  "execution_route": {"kind": "wyrd_gateway", "deployment": "jev"},
+                  "run_config": {"max_iterations": 1}},
+         "artifacts": []},
+        {"apiVersion": "wyrd/v1", "kind": "Verifier",
+         "metadata": {"name": "bypass-policy", "version": "1.0.0"},
+         "spec": {"inputs": {"reply": {"type": "json", "schema": {"type": "string"}}},
+                  "requirements": [{"id": "judged", "statement": "The reply is judged.",
+                                    "check": {"kind": "agent",
+                                              "agent": {"sibling": {"kind": "Agent", "name": "bypass-judge", "version": "1.0.0"}},
+                                              "inputs": {"context": "inputs.reply"},
+                                              "verdict_transform": {"kind": "probability", "question": "refund",
+                                                                    "expected": true, "pass_at": 0.9, "fail_at": 0.1}}}]},
+         "artifacts": []},
+    ]});
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{}/v1/cards",
+            jev.deployment
+                .server()
+                .base_url()
+                .expect("bound server has a URL")
+        ))
+        .header("x-wyrd-access-token", format!("Bearer {}", token.expose()))
+        .header("idempotency-key", "bypass-policy")
+        .json(&raw)
+        .send()
+        .await
+        .expect("the server answers");
+    let status = response.status().as_u16();
+    let body: Value = response.json().await.expect("the refusal is JSON");
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (400, Some("WYRD_SPEC_400_VALIDATION")),
+        "{body}"
+    );
+    assert!(
+        body.to_string()
+            .contains("requirements[0].check.verdict_transform.kind"),
+        "{body}"
+    );
+    assert_eq!(
+        jev.received().await.len(),
+        asked,
+        "no refused policy reached Jev"
+    );
+
+    let corrected = registered_desk(CardRef::agent("desk-judge", "1.0.0"), VerdictTransform::Choice(ChoiceTransform {
+        question: "refund".to_owned(),
+        outcomes: Some(
+            serde_json::from_value(
+                json!({"compliant": "passed", "violation": "failed", "unknown": "inconclusive"}),
+            )
+            .expect("outcomes decode"),
+        ),
+    }));
+    corrected.validate().expect("the corrected desk validates");
+    let state = WyrdState::declare_with(&corrected, options())
+        .await
+        .expect("the corrected policy registers");
+    let result = state
+        .run_for_card("desk-judge")
+        .expect("the judge's run opens")
+        .observe()
+        .verify(
+            "registered-policy",
+            Inputs::named([("reply", json!("DESK-PASS: the refund follows policy."))]),
+        )
+        .await
+        .expect("the verification executes");
+    assert_eq!(result.outcome.verdict, VerificationVerdict::Passed);
     jev.deployment.shutdown().await;
 }

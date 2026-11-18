@@ -57,10 +57,15 @@ fn json(field: &str, value: &Bound<'_, PyAny>) -> PyResult<Value> {
 ///
 /// # Errors
 /// Raises `WYRD_SPEC_400_VALIDATION` naming `field` when `value` is not a
-/// transform's JSON form.
+/// transform's JSON form or breaks a rule the policy alone decides, such as
+/// `fail_at` at or above `pass_at`.
 fn transform(field: &str, value: &Bound<'_, PyAny>) -> PyResult<VerdictTransform> {
-    serde_json::from_value(json(field, value)?)
-        .map_err(|error| PyErr::from(invalid_argument(field, error)))
+    let policy: VerdictTransform = serde_json::from_value(json(field, value)?)
+        .map_err(|error| PyErr::from(invalid_argument(field, error)))?;
+    policy
+        .validate(field)
+        .map_err(wyrd_utils::py::WyrdPyError::from)?;
+    Ok(policy)
 }
 
 /// `value` as a Python string.

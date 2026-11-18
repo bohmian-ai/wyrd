@@ -227,6 +227,49 @@ that proof rather than manufacturing a RED result.
    SDK authoring tests and tier-1 declaration journeys; shared validator unit
    tests do not substitute for either boundary.
 
+   Evidence:
+   - Public SDK authoring: Python
+     `sdks/wyrd-sdk-python/tests/unit/cards/test_verdict_transform_authoring.py`
+     (construction refuses malformed thresholds, operators, blank questions,
+     wrong value types, unknown kinds and unknown fields, naming the field;
+     `Service.validate()` refuses an unknown question, wrong question kind,
+     incomplete or extra Choice outcomes and a non-Jev Prompt with
+     `requirements[0].check.verdict_transform.*`; the corrected definition
+     revalidates). TypeScript
+     `sdks/wyrd-sdk-ts/wyrd/tests/unit/verdict-transform-authoring.test.ts`
+     covers the same cases.
+   - Registration journey (Rust):
+     `gateway_jev::jev_registration_refuses_policies_no_local_graph_can_check`.
+     A local graph holding the judge refuses `tone`. A desk naming the
+     registered `desk-judge` only by exact `CardRef` validates locally and
+     registration refuses it with `WYRD_SPEC_400_VALIDATION` at
+     `requirements[0].check.verdict_transform.question`. A raw
+     `POST /v1/cards` with a probability policy on a Choice question is
+     refused with 400 at `...verdict_transform.kind`. Jev receives nothing.
+     The corrected definition validates, declares and judges `passed`.
+   - Commands:
+     `cd sdks/wyrd-sdk-python && uv run python -m pytest -q -p no:cacheprovider tests/unit/cards/test_verdict_transform_authoring.py`;
+     `cd sdks/wyrd-sdk-ts/wyrd && pnpm exec vitest run tests/unit/verdict-transform-authoring.test.ts`;
+     `scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(=gateway_jev::jev_registration_refuses_policies_no_local_graph_can_check)'"`.
+   - RED: Python had 12 failed ("DID NOT RAISE"). TypeScript on the previous
+     native build had 12 failed ("nothing was refused"). Rust, with
+     `validate_registered_transforms` disabled, panicked with "registration
+     refuses the policy".
+   - GREEN: Python 15 passed. TypeScript 12 passed. The Rust journey passed.
+     Regressions: the whole `gateway_jev` module (7), Python
+     `test_gateway_jev.py` with the authoring file (23), TS
+     `gateway-jev.test.ts` (8), and `wyrd-spec`/`wyrd-loader` lib (846)
+     all passed. Clippy `-D warnings` for wyrd-spec, wyrd-loader,
+     wyrd-server, wyrd-sdk-ts, wyrd-ai and the Python crate, plus
+     `py:lints`, `py:typecheck`, `ts:lints`, `ts:typecheck` and
+     `ts:napi:check`, all passed.
+   - Limitations: no MCP declaration write tool exists, so the bypass goes
+     through HTTP `/v1/cards`. The TS native setter refusals are napi
+     `InvalidArg` errors carrying the message, as other setter refusals are,
+     not `WyrdError` instances. The Python and TS correction is revalidated
+     locally; the declared-and-judged correction runs in the Rust journey.
+     Question/criteria limits rely on the scenario-2 Jev builder refusals.
+
 5. **Malformed native output is an error** — REQ-010, REQ-012, REQ-014; J7.
    Declare a valid Jev leaf check, then script missing selected answer, wrong
    tag, unknown Choice label, out-of-range Noul/Score and nonfinite numeric

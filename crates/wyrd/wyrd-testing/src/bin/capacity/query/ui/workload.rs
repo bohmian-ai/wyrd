@@ -113,13 +113,11 @@ impl Ui {
                 .stage_scribe()
                 .await
                 .map_err(ExperimentError::workload)?;
-            let held = Residence::read(server)
-                .await
-                .map_err(ExperimentError::workload)?;
-            if staged == 0 || held.memtable_bytes > 0.0 {
+            let rows =
+                self.journey.span_rows() + self.journey.log_rows() + self.journey.point_rows();
+            if staged < rows.cast_unsigned() {
                 return Err(ExperimentError::workload(format!(
-                    "staging moved {staged} rows and left {} memtable bytes",
-                    held.memtable_bytes
+                    "staging moved {staged} of the journey's {rows} rows"
                 )));
             }
         } else if residence == "published" {

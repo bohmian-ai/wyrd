@@ -28,6 +28,7 @@ use serde_json::{Value, json};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardUid, GroupId};
 use wyrd_spec::reference::CardRef;
+use wyrd_spec::trace::TraceContext;
 use wyrd_spec::vala::ids::RunId;
 use wyrd_spec::vala::ids::SessionId;
 use wyrd_spec::verification::execution::VerificationResult;
@@ -411,8 +412,8 @@ impl Observe<'_> {
     /// writer is running, and return `None`, or return what is still to send.
     ///
     /// A foreign runtime calls this on its own thread, inside its producer
-    /// span scope, so each sample recorded here records its `bifrost.enqueue`
-    /// PRODUCER span there.
+    /// span scope, so each sample recorded or staged here records its
+    /// `bifrost.enqueue` PRODUCER span there.
     ///
     /// # Errors
     /// As [`Observe::submit`], before any execution request.
@@ -427,7 +428,8 @@ impl Observe<'_> {
 
     /// Project `inputs` for the Verifier named `verifier`. Record Window
     /// samples now and return `None` when the writer is running; otherwise
-    /// return the samples or Run evidence still to send.
+    /// return the samples, with the PRODUCER span opened for them now, or
+    /// the Run evidence still to send.
     ///
     /// # Errors
     /// As [`Observe::submit`], before any execution request.
@@ -445,7 +447,10 @@ impl Observe<'_> {
                     return Ok(None);
                 }
                 drift::observation(&features, None)?;
-                Evidence::Window(features)
+                Evidence::Window {
+                    features,
+                    producer: trace::producer(DRIFT_OBSERVATIONS_TABLE),
+                }
             }
         };
         Ok(Some(Staged {
@@ -479,9 +484,12 @@ impl Observe<'_> {
     async fn finish(&self, staged: Staged) -> Result<Submission, WyrdError> {
         let state = &self.run.state;
         match staged.evidence {
-            Evidence::Window(features) => {
+            Evidence::Window { features, producer } => {
                 state.bifrost_writer().await?;
-                self.drift_value(&features, None)?;
+                trace::with_producer_span(
+                    move |_| producer.clone(),
+                    || self.drift_value(&features, None),
+                )?;
                 Ok(Submission::Recorded)
             }
             Evidence::Run(evidence) => {
@@ -666,7 +674,17 @@ pub struct Staged {
 #[derive(Debug)]
 enum Evidence {
     /// Window samples, recorded once the writer is running.
-    Window(Value),
+    ///
+    /// `producer` is the `bifrost.enqueue` PRODUCER span opened when the
+    /// samples were staged, on the caller's thread and under its active span;
+    /// the deferred enqueue carries it, so a sample that had to start the
+    /// writer links to the caller's trace like one recorded at once.
+    Window {
+        /// The projected sample features.
+        features: Value,
+        /// The staged PRODUCER span's context, when the caller had a trace.
+        producer: Option<TraceContext>,
+    },
     /// Run evidence, before its files are pinned.
     Run(RunEvidence),
 }

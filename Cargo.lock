@@ -10507,6 +10507,7 @@ version = "0.4.2"
 dependencies = [
  "anyhow",
  "axum",
+ "opentelemetry",
  "reqwest 0.13.4",
  "schemars 1.2.1",
  "secrecy",
@@ -10515,6 +10516,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-opentelemetry",
  "wiremock",
  "workspace-hack",
  "wyrd-ai",

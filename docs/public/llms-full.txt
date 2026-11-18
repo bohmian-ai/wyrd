@@ -3528,14 +3528,14 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { json } from "node:stream/consumers";
 
-import { type VerificationResult, WyrdError, WyrdState } from "wyrd-ai";
+import { type VerificationResult, type VerifierInputs, WyrdError, WyrdState } from "wyrd-ai";
 
 const state = WyrdState.fromPath(".wyrd-bundle");
 
 // Verify one release, then release the report only when the verdict passed.
-async function sendReport(release: unknown): Promise<[number, object]> {
+async function sendReport(release: VerifierInputs): Promise<[number, object]> {
   try {
-    const result = await state.run().observe.verify("release-check", release as object);
+    const result = await state.run().observe.verify("release-check", release);
     return [200, result.passed ? releaseReport(result) : holdForReview(result)];
   } catch (error) {
     // No verdict, such as a refused credential or a timeout: nothing was judged, so nothing is sent.
@@ -3567,7 +3567,7 @@ const server = createServer(async (request, response) => {
   if (request.method !== "POST" || request.url !== "/reports/send") {
     return response.writeHead(404).end();
   }
-  const [status, body] = await sendReport(await json(request));
+  const [status, body] = await sendReport((await json(request)) as VerifierInputs);
   response.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(body));
 });
 server.listen(Number(process.env.PORT ?? 8000), "127.0.0.1", () => {
@@ -3666,7 +3666,388 @@ A request waits for every check in the Verifier, including the model judge. When
 
 ## Next
 
-[Act on verdicts in production](/wyrd/build-and-verify/verify/act-on-verdicts-in-production/) covers timeouts, provider exposure, and cost for this handler. [ASGI apps](/wyrd/connect/integrate-asgi/) records the request itself as evidence.
+[Act on verdicts in production](/wyrd/build-and-verify/verify/act-on-verdicts-in-production/) covers timeouts, provider exposure, and cost for this handler. [ASGI apps](/wyrd/connect/integrate-asgi/) records the request itself as evidence. [Verify an agent's workflow](/wyrd/build-and-verify/verify/verify-an-agent-workflow/) checks the steps behind an answer, not only the answer.
+
+# Verify an agent's workflow
+
+Page: /wyrd/build-and-verify/verify/verify-an-agent-workflow/
+
+> Catch an agent that skipped a required step even though its answer looks right, by checking the trace of the work behind the answer.
+
+Check that a refund agent looked up the order before it answered, not only that its answer looks right.
+
+The agent in this guide has a bug: when it remembers an order from earlier in the conversation, it skips the lookup. Its reply is word for word the same either way, so a check on the reply alone cannot tell the two runs apart. The agent and its order record are synthetic, and no model is called.
+
+## Before you start
+
+Finish [Set up Wyrd](/wyrd/get-started/setup/). Work in its `quickstart` directory with the server running.
+
+## 1. Add tracing
+
+The agent records each step as an OpenTelemetry span, and Wyrd stores the spans as its trace. Add the tracing packages:
+
+**Python**
+
+```bash
+uv add "wyrd-ai[otel]==0.4.2"
+```
+
+**Rust**
+
+```bash
+cargo add wyrd-ai@0.4.2 --features otel
+cargo add opentelemetry@0.31 tracing@0.1 tracing-opentelemetry@0.32
+```
+
+**TypeScript**
+
+```bash
+pnpm add @opentelemetry/api @opentelemetry/context-async-hooks @opentelemetry/core @opentelemetry/resources @opentelemetry/sdk-trace-base @opentelemetry/exporter-trace-otlp-proto @opentelemetry/exporter-logs-otlp-proto @opentelemetry/exporter-metrics-otlp-proto
+```
+
+## 2. Write the agent and its Verifier
+
+The `refund-workflow` Verifier takes the agent's `reply` and the `trace` of the work behind it. It has two requirements:
+
+| Requirement | What it checks |
+| --- | --- |
+| `reply-names-order` | The reply contains `Order 1042` |
+| `looked-up-order` | The trace holds a span named `look-up-order` |
+
+Save the program:
+
+**Python**
+
+```python title="refund_agent.py"
+from opentelemetry import trace
+from wyrd import WyrdState
+from wyrd.verify import Check, ComparisonOperator, InputSlot, Requirement, Service, Verifier
+
+# Synthetic order records the agent's lookup tool reads.
+ORDERS = {"1042": {"delivered": "2 May", "refundable": True}}
+
+refund_workflow = Verifier(
+    "refund-workflow",
+    inputs={"reply": str, "trace": InputSlot.trace()},
+    requirements=[
+        # Judges the answer only: a reply that skipped the lookup passes it too.
+        Requirement(
+            "reply-names-order",
+            "The reply names the customer's order.",
+            Check.assert_("inputs.reply", ComparisonOperator.Contains, "Order 1042"),
+        ),
+        # Judges what ran: the agent's trace must hold a look-up-order span.
+        Requirement(
+            "looked-up-order",
+            "The agent looked up the order before replying.",
+            Check.trace("inputs.trace", "$.spans[*].name", ComparisonOperator.IsSuperset, ["look-up-order"]),
+        ),
+    ],
+)
+
+state = WyrdState.declare(Service("refund-agent", verified_by=[refund_workflow]))
+state.start_telemetry()  # export the agent's spans to Wyrd
+state.start_bifrost()  # so flush can wait until they are stored
+tracer = trace.get_tracer("refund-agent")
+
+def look_up_order(order_id: str) -> dict:
+    with tracer.start_as_current_span("look-up-order", attributes={"order_id": order_id}):
+        return ORDERS[order_id]
+
+def refund_agent(order_id: str, remembered: dict | None = None) -> tuple[str, str]:
+    """Answer a refund request; return the reply and the trace ID of the work behind it."""
+    with tracer.start_as_current_span("answer-refund") as span:
+        # The bug: an order remembered from earlier in the conversation skips the lookup.
+        order = remembered or look_up_order(order_id)
+        with tracer.start_as_current_span("draft-reply"):
+            reply = f"Order {order_id} was delivered on {order['delivered']}, so it qualifies for a refund."
+    return reply, format(span.get_span_context().trace_id, "032x")
+
+complete = refund_agent("1042")
+skipped = refund_agent("1042", remembered=ORDERS["1042"])
+state.flush()  # store the spans before they are checked
+
+cases = [
+    ("complete", {"reply": complete[0], "trace": complete[1]}),
+    ("skipped", {"reply": skipped[0], "trace": skipped[1]}),
+    # The same reply sent without its trace: nothing shows what ran.
+    ("no trace", {"reply": complete[0]}),
+]
+for label, evidence in cases:
+    with state.run() as run:
+        result = run.observe.verify("refund-workflow", **evidence)
+    print(f"{label}: {result.verdict} · {evidence['reply']}")
+    for requirement in result.requirements:
+        print(f"  {requirement['id']}: {requirement['outcome']}")
+state.shutdown()
+
+```
+
+**Rust**
+
+```rust title="src/main.rs"
+//! Declare a refund agent's workflow Verifier in code, answer one refund
+//! request twice, once with the order lookup and once without it, and verify
+//! each reply with the trace of the work behind it.
+
+use std::error::Error;
+
+use opentelemetry::trace::TraceContextExt as _;
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+use wyrd_ai::serde_json::json;
+use wyrd_ai::state::WyrdState;
+use wyrd_ai::verify::{Check, ComparisonOperator, InputSlot, Requirement, Service, Verifier};
+
+/// A synthetic order record the agent's lookup tool reads.
+struct Order {
+    /// The order number.
+    id: &'static str,
+    /// The day the order was delivered.
+    delivered: &'static str,
+}
+
+const ORDER_1042: Order = Order {
+    id: "1042",
+    delivered: "2 May",
+};
+
+/// The workflow check: one requirement on the answer, one on what ran.
+fn refund_workflow() -> Verifier {
+    Verifier::new("refund-workflow", None)
+        .inputs([
+            ("reply", InputSlot::json(json!({ "type": "string" }))),
+            ("trace", InputSlot::trace()),
+        ])
+        .requirements([
+            // Judges the answer only: a reply that skipped the lookup passes it too.
+            Requirement::new(
+                "reply-names-order",
+                "The reply names the customer's order.",
+                Check::assert("inputs.reply", ComparisonOperator::Contains, "Order 1042"),
+            ),
+            // Judges what ran: the agent's trace must hold a look-up-order span.
+            Requirement::new(
+                "looked-up-order",
+                "The agent looked up the order before replying.",
+                Check::trace(
+                    "inputs.trace",
+                    "$.spans[*].name",
+                    ComparisonOperator::IsSuperset,
+                    json!(["look-up-order"]),
+                ),
+            ),
+        ])
+}
+
+/// The agent's lookup tool.
+fn look_up_order(order_id: &str) -> &'static Order {
+    let _span = tracing::info_span!("look-up-order", order_id).entered();
+    &ORDER_1042
+}
+
+/// Answer a refund request; return the reply and the trace ID of the work
+/// behind it.
+fn refund_agent(order_id: &str, remembered: Option<&Order>) -> (String, String) {
+    let span = tracing::info_span!("answer-refund");
+    let reply = span.in_scope(|| {
+        // The bug: an order remembered from earlier in the conversation skips the lookup.
+        let order = remembered.unwrap_or_else(|| look_up_order(order_id));
+        let _draft = tracing::info_span!("draft-reply").entered();
+        format!(
+            "Order {} was delivered on {}, so it qualifies for a refund.",
+            order.id, order.delivered
+        )
+    });
+    let trace = span.context().span().span_context().trace_id().to_string();
+    (reply, trace)
+}
+
+/// Declare the Cards, answer the request with and without the lookup, and
+/// verify each reply, printing every requirement's outcome.
+///
+/// # Errors
+/// Returns the client's configuration or credential error, the declaration's
+/// refusal, a telemetry export failure, a refused check, or a failed shutdown.
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let state =
+        WyrdState::declare(&Service::new("refund-agent", None).verified_by([refund_workflow()]))
+            .await?;
+    // Export the agent's spans to Wyrd.
+    let telemetry = wyrd_ai::otel::start_telemetry(&state)?;
+
+    let complete = refund_agent("1042", None);
+    let skipped = refund_agent("1042", Some(&ORDER_1042));
+    // Store the spans before they are checked.
+    telemetry.shutdown()?;
+
+    let cases = [
+        (
+            "complete",
+            json!({ "reply": complete.0, "trace": complete.1 }),
+        ),
+        ("skipped", json!({ "reply": skipped.0, "trace": skipped.1 })),
+        // The same reply sent without its trace: nothing shows what ran.
+        ("no trace", json!({ "reply": complete.0 })),
+    ];
+    for (label, evidence) in cases {
+        let reply = evidence["reply"].as_str().map(str::to_owned);
+        let result = state
+            .run()
+            .observe()
+            .verify("refund-workflow", evidence)
+            .await?;
+        println!(
+            "{label}: {} · {}",
+            result.outcome.verdict,
+            reply.unwrap_or_default()
+        );
+        for requirement in &result.outcome.requirements {
+            println!(
+                "  {}: {}",
+                requirement.id.as_str(),
+                json!(requirement.outcome).as_str().unwrap_or_default()
+            );
+        }
+    }
+    state.shutdown().await?;
+    Ok(())
+}
+
+```
+
+**TypeScript**
+
+```typescript title="refund_agent.ts"
+import { trace } from "@opentelemetry/api";
+import { verify, WyrdState } from "wyrd-ai";
+
+const { Check, InputSlot, Requirement, Service, Verifier } = verify;
+
+// Synthetic order records the agent's lookup tool reads.
+type Order = { delivered: string; refundable: boolean };
+const ORDERS: Record<string, Order> = { "1042": { delivered: "2 May", refundable: true } };
+
+const refundWorkflow = new Verifier("refund-workflow", {
+  inputs: { reply: InputSlot.json({ type: "string" }), trace: InputSlot.trace() },
+  requirements: [
+    // Judges the answer only: a reply that skipped the lookup passes it too.
+    new Requirement(
+      "reply-names-order",
+      "The reply names the customer's order.",
+      Check.assert("inputs.reply", "contains", "Order 1042"),
+    ),
+    // Judges what ran: the agent's trace must hold a look-up-order span.
+    new Requirement(
+      "looked-up-order",
+      "The agent looked up the order before replying.",
+      Check.trace("inputs.trace", "$.spans[*].name", "is_superset", ["look-up-order"]),
+    ),
+  ],
+});
+
+const state = await WyrdState.declare(new Service("refund-agent", { verified_by: [refundWorkflow] }));
+await state.startTelemetry(); // export the agent's spans to Wyrd
+await state.startBifrost(); // so flush can wait until they are stored
+const tracer = trace.getTracer("refund-agent");
+
+function lookUpOrder(orderId: string): Order {
+  return tracer.startActiveSpan("look-up-order", { attributes: { order_id: orderId } }, (span) => {
+    span.end();
+    return ORDERS[orderId] as Order;
+  });
+}
+
+// Answer a refund request; return the reply and the trace ID of the work behind it.
+function refundAgent(orderId: string, remembered?: Order): [string, string] {
+  return tracer.startActiveSpan("answer-refund", (span) => {
+    // The bug: an order remembered from earlier in the conversation skips the lookup.
+    const order = remembered ?? lookUpOrder(orderId);
+    const reply = tracer.startActiveSpan("draft-reply", (draft) => {
+      draft.end();
+      return `Order ${orderId} was delivered on ${order.delivered}, so it qualifies for a refund.`;
+    });
+    span.end();
+    return [reply, span.spanContext().traceId];
+  });
+}
+
+const complete = refundAgent("1042");
+const skipped = refundAgent("1042", ORDERS["1042"]);
+await state.flush(); // store the spans before they are checked
+
+const cases: [string, Record<string, string>][] = [
+  ["complete", { reply: complete[0], trace: complete[1] }],
+  ["skipped", { reply: skipped[0], trace: skipped[1] }],
+  // The same reply sent without its trace: nothing shows what ran.
+  ["no trace", { reply: complete[0] }],
+];
+for (const [label, evidence] of cases) {
+  const result = await state.run().observe.verify("refund-workflow", evidence);
+  console.log(`${label}: ${result.outcome.verdict} · ${evidence.reply}`);
+  for (const requirement of result.outcome.requirements) {
+    console.log(`  ${requirement.id}: ${requirement.outcome}`);
+  }
+}
+await state.shutdown();
+
+```
+
+The agent answers the same request twice: once with the lookup, once with a remembered order. It returns each reply with its trace ID. The program then verifies three cases: the complete run, the skipped run, and the complete reply sent without its trace.
+
+## 3. Run it
+
+**Python**
+
+```bash
+uv run refund_agent.py
+```
+
+**Rust**
+
+```bash
+cargo run
+```
+
+**TypeScript**
+
+```bash
+node refund_agent.ts
+```
+
+```text title="output"
+complete: passed · Order 1042 was delivered on 2 May, so it qualifies for a refund.
+  reply-names-order: passed
+  looked-up-order: passed
+skipped: failed · Order 1042 was delivered on 2 May, so it qualifies for a refund.
+  reply-names-order: passed
+  looked-up-order: failed
+no trace: inconclusive · Order 1042 was delivered on 2 May, so it qualifies for a refund.
+  reply-names-order: passed
+  looked-up-order: inconclusive
+
+```
+
+All three replies pass `reply-names-order`. Only the trace separates them:
+
+- **complete** passes, because its trace holds the lookup.
+- **skipped** fails `looked-up-order`, because its trace has no `look-up-order` span.
+- **no trace** is `inconclusive`: with no trace there is no evidence about what ran, so Wyrd does not decide. An inconclusive verdict is never a pass.
+
+**Spans must be stored first:**
+The program flushes its spans before it verifies. A trace with no stored span is `inconclusive` under `verify`, so flush, or `submit` the check, which retries while the spans arrive. [Trace evidence](/wyrd/understand/how-verification-works/#trace-evidence) explains both.
+
+## If it fails
+
+| You see | Fix |
+| --- | --- |
+| `complete` and `skipped` are both `inconclusive` on `looked-up-order` | The spans were not stored before the check. Keep the flush before the first `verify` |
+| `WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS` | Your application already installed a tracer provider. Add Wyrd's span exporter to it instead, as in [ASGI apps](/wyrd/connect/integrate-asgi/) |
+| An `ImportError` or missing module naming OpenTelemetry | Add the tracing packages from step 1 |
+
+## Next
+
+[Verifier recipes](/wyrd/build-and-verify/verify/verifier-recipes/#trace) shows more trace checks, such as span position and attributes. [Establish sufficient evidence](/wyrd/build-and-verify/observe/establish-sufficient-evidence/) covers when missing evidence should hold a decision.
 
 # Act on verdicts in production
 

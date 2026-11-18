@@ -43,6 +43,10 @@ name = "finance_api"
 path = "finance-release/api.rs"
 
 [[bin]]
+name = "refund_agent"
+path = "refund-agent/refund_agent.rs"
+
+[[bin]]
 name = "support_agent"
 path = "support-agent/support_agent.rs"
 
@@ -57,6 +61,8 @@ path = "support-desk/rust/main.rs"
 [dependencies]
 anyhow = "1"
 axum = { workspace = true }
+# The refund agent reads its trace ID from the OpenTelemetry context of its tracing span.
+opentelemetry = { workspace = true }
 reqwest = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -64,6 +70,7 @@ serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
 tracing = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 wyrd-ai = { path = "../sdks/wyrd-sdk-rust", features = ["otel"] }
 
 [dev-dependencies]

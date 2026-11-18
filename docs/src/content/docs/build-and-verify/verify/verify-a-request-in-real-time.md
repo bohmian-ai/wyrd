@@ -140,4 +140,4 @@ A request waits for every check in the Verifier, including the model judge. When
 
 ## Next
 
-[Act on verdicts in production](/build-and-verify/verify/act-on-verdicts-in-production/) covers timeouts, provider exposure, and cost for this handler. [ASGI apps](/connect/integrate-asgi/) records the request itself as evidence.
+[Act on verdicts in production](/build-and-verify/verify/act-on-verdicts-in-production/) covers timeouts, provider exposure, and cost for this handler. [ASGI apps](/connect/integrate-asgi/) records the request itself as evidence. [Verify an agent's workflow](/build-and-verify/verify/verify-an-agent-workflow/) checks the steps behind an answer, not only the answer.

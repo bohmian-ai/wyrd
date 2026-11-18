@@ -26,9 +26,13 @@ selected mounts so each journey asserts exactly what the tools returned.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import io
 import json
+import runpy
 import secrets
+import shutil
 import time
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
@@ -1549,3 +1553,44 @@ def test_artifact_workspace_refusals_preserve_authority(
         secret not in json.dumps(each.body) for each in receiver.to("/v1/chat/completions")[asked:]
     ), "no refused path hands the protected line to the model"
     assert tools_called(record)[:2] == ["fs.read", "fs.search"]
+
+
+REFUND_AGENT = FIXTURES.parent / "examples/refund-agent"
+"""The agent workflow guide's example: a refund agent whose remembered-order path skips its lookup."""
+
+
+@pytest.fixture
+def refund_reader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fresh_telemetry_providers: None
+) -> Iterator[WyrdTestServer]:
+    """An empty directory holding only the refund agent program, on a server of its own, as `wyrd init` leaves it."""
+    reader = tmp_path / "refund-agent"
+    reader.mkdir()
+    shutil.copy(REFUND_AGENT / "refund_agent.py", reader)
+    monkeypatch.chdir(reader)
+    monkeypatch.setenv("WYRD_CONFIG_HOME", str(tmp_path / "config"))
+    with WyrdTestServer(verification_runtime=True, mutate_env=False) as server:
+        monkeypatch.setenv("WYRD_SERVER_URL", server.base_url)
+        monkeypatch.setenv("WYRD_GRPC_URL", server.grpc_url)
+        monkeypatch.setenv("WYRD_API_KEY", server.tenant_admin_key())
+        yield server
+
+
+def test_docsite_agent_workflow_example(refund_reader: WyrdTestServer) -> None:
+    printed = io.StringIO()
+    with contextlib.redirect_stdout(printed):
+        program = runpy.run_path("refund_agent.py", run_name="__main__")
+    assert printed.getvalue() == (REFUND_AGENT / "output.txt").read_text()
+
+    # Both replies are the same text; only the traces the program exported differ.
+    complete, skipped = program["complete"], program["skipped"]
+    assert complete[0] == skipped[0]
+    assert [span["name"] for span in timeline(refund_reader, complete[1])] == [
+        "answer-refund",
+        "look-up-order",
+        "draft-reply",
+    ]
+    assert [span["name"] for span in timeline(refund_reader, skipped[1])] == [
+        "answer-refund",
+        "draft-reply",
+    ]

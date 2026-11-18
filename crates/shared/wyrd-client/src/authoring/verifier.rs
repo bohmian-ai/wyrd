@@ -106,7 +106,7 @@ pub const SLOT_KEYWORD: &str = "x-wyrd-slot";
 /// Verifier's [`InputSlot::fields_of`] inputs, where every other field
 /// declares a `json` slot, so one struct both declares the inputs and, once
 /// serialized, supplies them. Its JSON Schema is a string whose
-/// [`SLOT_KEYWORD`] is `{"type": "trace"}`; its JSON value is the bare ID.
+/// `x-wyrd-slot` keyword is `{"type": "trace"}`; its JSON value is the bare ID.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
 pub struct Trace(
@@ -151,7 +151,7 @@ impl InputSlot {
     }
 
     /// A JSON value constrained by the JSON Schema `schema`, or the slot a
-    /// marker names: a schema carrying [`SLOT_KEYWORD`], as a [`Trace`]
+    /// marker names: a schema carrying `x-wyrd-slot`, as a [`Trace`]
     /// field, a Pydantic `wyrd.verify.Trace` field, or a Zod `trace()` field
     /// emits, is that keyword's canonical slot, such as [`InputSlot::trace`].
     pub fn json(schema: impl Into<Value>) -> Self {

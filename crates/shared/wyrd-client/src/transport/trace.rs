@@ -155,7 +155,7 @@ pub fn benchmark_headers() -> Vec<(&'static str, String)> {
         .unwrap_or_default()
 }
 
-/// The benchmark cohort [`with_benchmark_labels`] scoped on this task, which
+/// The benchmark cohort `with_benchmark_labels` scoped on this task, which
 /// classifies this process's own client observations; none outside a scope
 /// or without `test-support`. A benchmark driver classifies its own
 /// observations of calls it sends outside a Wyrd client with it.

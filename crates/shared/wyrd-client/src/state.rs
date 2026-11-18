@@ -789,6 +789,12 @@ impl WyrdState {
     ///
     /// # Errors
     /// As [`WyrdState::start_bifrost_with_config`].
+    ///
+    /// # Cancellation
+    /// Abandoning the future before the writer is published drops the
+    /// unpublished writer and releases the claim, so the next start or first
+    /// write retries startup from scratch; after shutdown the state stays
+    /// closed instead.
     async fn start_gated(
         &self,
         table: Option<TableConfig>,
@@ -1093,6 +1099,11 @@ impl WyrdState {
     /// # Errors
     /// Returns `WYRD_SDK_409_BIFROST_CLOSED` after shutdown and the first
     /// producer or sink failure from the drain.
+    ///
+    /// # Cancellation
+    /// The drain runs on a blocking thread. Abandoning the future stops the
+    /// wait, not the drain: batches already sent may still be acknowledged and
+    /// nothing is rolled back. Call `flush` again to wait for the barrier.
     pub async fn flush(&self) -> Result<(), WyrdError> {
         self.bifrost.flush().await
     }

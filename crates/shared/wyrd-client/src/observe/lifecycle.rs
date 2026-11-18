@@ -139,6 +139,11 @@ impl BifrostLifecycle {
     ///
     /// # Panics
     /// Panics if the phase lock is poisoned.
+    ///
+    /// # Cancellation
+    /// As [`WyrdState::flush`](crate::state::WyrdState::flush): abandoning the future
+    /// leaves the blocking drain running, the phase unchanged, and a retry
+    /// safe.
     pub async fn flush(&self) -> Result<(), WyrdError> {
         let started = match &*self.phase.lock().expect("bifrost phase lock poisoned") {
             Phase::Started(started) => Arc::clone(started),

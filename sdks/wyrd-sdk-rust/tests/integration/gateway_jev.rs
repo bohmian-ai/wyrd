@@ -582,14 +582,10 @@ fn desk_answers(label: &str, confidence: f64, helpful: f64, unresolved: f64, sco
     })
 }
 
-/// The `policy-desk` Service: the `desk-judge` Jev Agent asking
-/// [`desk_questions`], verified by `desk-policy`, whose four requirements
-/// read the same answer through a custom Choice map, Noul expected true and
-/// expected false, and `compliance >= 2`.
+/// The `desk-judge` Jev Agent asking [`desk_questions`] about `${context}`.
 ///
 /// # Panics
 /// Panics when the Prompt does not build.
-/// The `desk-judge` Jev Agent asking [`desk_questions`] about `${context}`.
 fn desk_judge() -> Agent {
     let questions = serde_json::from_value(desk_questions()).expect("native questions decode");
     Agent::new("desk-judge", "1.0.0")
@@ -607,6 +603,9 @@ fn desk_judge() -> Agent {
         .run_config(json!({"max_iterations": 1}))
 }
 
+/// The `policy-desk` Service: the [`desk_judge`] verified by `desk-policy`,
+/// whose four requirements read the same answer through a custom Choice map,
+/// Noul expected true and expected false, and `compliance >= 2`.
 fn policy_desk() -> Service {
     let judge = desk_judge();
     let check = |transform| {
@@ -940,5 +939,131 @@ async fn jev_registration_refuses_policies_no_local_graph_can_check() {
         .await
         .expect("the verification executes");
     assert_eq!(result.outcome.verdict, VerificationVerdict::Passed);
+    jev.deployment.shutdown().await;
+}
+
+/// A malformed native answer is a check error, never a judgment: a missing
+/// selected answer, an answer of another form, an undeclared Choice label and
+/// an out-of-range Noul or Score each make only the requirement reading it
+/// inconclusive with the reason, with one Jev call per check and no retry.
+///
+/// # Panics
+/// Panics when a malformed answer is judged, another requirement changes,
+/// the verdict is not inconclusive, or a malformed answer is retried.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn jev_malformed_answers_are_check_errors() {
+    let jev = Jev::start().await;
+    let valid = desk_answers("compliant", 0.3, 0.75, 0.02, 2.0);
+    let corrupt = |question: &str, answer: Option<Value>| {
+        let mut answers = valid.clone();
+        match answer {
+            Some(answer) => answers[question] = answer,
+            None => {
+                answers
+                    .as_object_mut()
+                    .expect("answers are an object")
+                    .remove(question);
+            }
+        }
+        answers
+    };
+    let cases = [
+        (
+            "MISSING",
+            "refund-policy",
+            corrupt("refund", None),
+            "the decision response has no answer to question 'refund'",
+        ),
+        (
+            "WRONG-FORM",
+            "refund-policy",
+            corrupt("refund", Some(json!({"type": "noul", "noul": 0.9}))),
+            "the answer to question 'refund' is not the choice answer its policy reads",
+        ),
+        (
+            "UNKNOWN-LABEL",
+            "refund-policy",
+            corrupt(
+                "refund",
+                Some(
+                    json!({"type": "choice", "choice": "maybe", "confidence": 0.9,
+                            "probabilities": {"maybe": 0.9}}),
+                ),
+            ),
+            "the answer to question 'refund' selected an option the question does not declare",
+        ),
+        (
+            "NOUL-RANGE",
+            "helpful",
+            corrupt("helpful", Some(json!({"type": "noul", "noul": 1.5}))),
+            "the answer to question 'helpful' has a probability outside 0..1",
+        ),
+        (
+            "SCORE-RANGE",
+            "compliant",
+            corrupt(
+                "compliance",
+                Some(
+                    json!({"type": "score", "score": 3, "legend": {"0": "Low", "1": "Medium", "2": "High"}}),
+                ),
+            ),
+            "the answer to question 'compliance' has a score outside its levels 0 to 2",
+        ),
+    ];
+    for (marker, _, answers, _) in &cases {
+        jev.answer_when(marker, json!({"model": "jev-1.13.0", "answers": answers}))
+            .await;
+    }
+    let state = WyrdState::declare_with(
+        &policy_desk(),
+        DeclareOptions {
+            client: Some(jev.deployment.admin()),
+            ..DeclareOptions::default()
+        },
+    )
+    .await
+    .expect("the policy desk declares");
+
+    for (marker, broken, _, reason) in cases {
+        let before = jev.received().await.len();
+        let result = state
+            .run_for_card("desk-judge")
+            .expect("the judge's run opens")
+            .observe()
+            .verify(
+                "desk-policy",
+                Inputs::named([("reply", json!(format!("{marker}: a reply")))]),
+            )
+            .await
+            .expect("the verification executes");
+        for id in ["refund-policy", "helpful", "resolved", "compliant"] {
+            let judged = requirement(&result, id);
+            if id == broken {
+                assert_eq!(
+                    judged.outcome,
+                    RequirementOutcome::Inconclusive,
+                    "{marker}: {judged:#?}"
+                );
+                assert!(judged.reason.contains(reason), "{marker}: {judged:#?}");
+            } else {
+                assert_eq!(
+                    judged.outcome,
+                    RequirementOutcome::Passed,
+                    "{marker} {id}: {judged:#?}"
+                );
+            }
+        }
+        assert_eq!(
+            result.outcome.verdict,
+            VerificationVerdict::Inconclusive,
+            "{marker}"
+        );
+        assert_eq!(
+            jev.received().await.len(),
+            before + 4,
+            "{marker}: one Jev call per check, none retried"
+        );
+    }
     jev.deployment.shutdown().await;
 }

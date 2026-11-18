@@ -282,6 +282,29 @@ that proof rather than manufacturing a RED result.
    wrong error projection. Tier-1 representative negatives plus typed owner
    tests cover the complete input set.
 
+   Evidence:
+   - Journey (Rust): `gateway_jev::jev_malformed_answers_are_check_errors`.
+     A declared valid policy desk is scripted with a missing `refund`
+     answer, a Noul answer to the Choice question, an undeclared label
+     `maybe`, Noul `1.5` and Score `3` on levels 0–2. Only the reading
+     requirement becomes `inconclusive`, with the transformer's reason; the
+     other three pass. The verdict is `inconclusive`, never a pass or a
+     provider-authored failure. Jev is called once per check, and nothing is
+     retried.
+   - Owner: `blocks::transform::tests::unusable_answers_are_check_errors`
+     (vala-verify) covers the full input set, including NaN and infinity,
+     which JSON cannot carry.
+   - Commands: `scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(=gateway_jev::jev_malformed_answers_are_check_errors)'"`;
+     `mise exec -- cargo nextest run --locked -p vala-verify --lib -E 'test(/blocks::transform::tests::unusable_answers_are_check_errors/)'`.
+   - TDD deviation: there was no RED. The selected-answer validation shipped
+     with the scenario-1 transformer, so the first run found only a wrong
+     test expectation, one call versus one per check, and the behavior
+     passed. Provider refusal and retry are unchanged and stay covered by
+     the existing native gateway tests (`gateway_jev` 401/400/429 cases);
+     this task adds no conversion call that could retry. Python and TS reach
+     the same server check path, and the tier-1 negatives run through Rust
+     only.
+
 6. **Read the retained judgment under capture controls** — REQ-005, REQ-012,
    REQ-014; J5/J7. Execute a valid hosted leaf check with full capture and read
    after existing flush/wait controls establish asynchronous visibility. Assert

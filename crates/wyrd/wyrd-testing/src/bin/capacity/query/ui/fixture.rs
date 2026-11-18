@@ -1043,7 +1043,11 @@ impl Journey {
             }
             "metrics-group-keys" => vec![Known::Distinct(
                 "attributes",
-                usize::try_from(self.routes + 2).unwrap_or(0),
+                (0..self.routes)
+                    .map(|q| format!("/r{q:02}"))
+                    .chain(["/batch".to_owned(), "/gauge".to_owned()])
+                    .map(|route| format!(r#"{{"route":"{route}"}}"#))
+                    .collect(),
             )],
             "metric-points-list" => self.newest_points(50),
             "metrics-chart" => self.chart(HOUR_START_NANOS, MINUTES, true),

@@ -173,8 +173,8 @@ pub enum Known {
     Sum(&'static str, f64),
     /// A column holding exactly these cells, nulls as `None`, in row order.
     Cells(&'static str, Vec<Option<String>>),
-    /// A column holding exactly this many distinct non-null cells.
-    Distinct(&'static str, usize),
+    /// A column whose distinct non-null cells are exactly these.
+    Distinct(&'static str, std::collections::BTreeSet<String>),
     /// A numeric column summing to this value over the rows whose second
     /// column holds the given cell; at least one row must.
     Total(&'static str, (&'static str, &'static str), f64),
@@ -252,8 +252,7 @@ pub fn check(id: &str, answer: &Answer, journey: Journey) -> Result<(), String> 
                     .into_iter()
                     .flatten()
                     .collect::<std::collections::BTreeSet<_>>()
-                    .len()
-                    == *distinct
+                    == distinct.iter().map(String::as_str).collect()
             }
             Known::Total(column, (by, cell), sum) => {
                 let matching: Vec<f64> = answer
@@ -376,5 +375,16 @@ mod tests {
         assert!(check("logs-list", &answer("body_text", &[]), journey).is_err());
         assert!(check("metrics-chart", &answer("value", &[]), journey).is_err());
         assert!(check("metrics-histogram", &answer("count", &[]), journey).is_err());
+        let keys = ["/r00", "/r01", "/r02", "/batch", "/gauge"]
+            .map(|route| format!(r#"{{"route":"{route}"}}"#));
+        let mut wrong = keys.clone();
+        wrong[4] = r#"{"route":"/r03"}"#.to_owned();
+        for (keys, held) in [(&keys, true), (&wrong, false)] {
+            let cells: Vec<&str> = keys.iter().chain(keys.iter()).map(String::as_str).collect();
+            assert_eq!(
+                check("metrics-group-keys", &answer("attributes", &cells), journey).is_ok(),
+                held
+            );
+        }
     }
 }

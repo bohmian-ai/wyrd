@@ -146,12 +146,12 @@ behavior keeps its existing proof; no manufactured RED is required for it.
      list, cursor-page and child-match order by trace, span and log identity; metric names; the
      newest points' integer values; the 1 h, 24 h, per-series and nested charts' counter rate,
      delta and gauge totals; and the histograms' counted requests and summed milliseconds.
-     The approximate percentiles keep only their recorded answer. Group keys assert the distinct
-     series attributes, not a row count: the series table kept 100+ rows in the default arm and
+     The approximate percentiles keep only their recorded answer. Group keys assert the exact set of
+     series attributes (every route, `/batch` and `/gauge`), not a row count: the series table kept 100+ rows in the default arm and
      80 in the learned arm for the same 8 series.
-     Smokes with these checks (VALID): `ui-sql/20261118T214946Z-753cb7b07.json`,
-     `ui-sql-10x/20261118T214844Z-753cb7b07.json`,
-     `ui-sql-learned/20261118T214744Z-753cb7b07.json`.
+     Smokes with these checks (VALID): `ui-sql/20261118T215246Z-eeb58ed9b.json`,
+     `ui-sql-10x/20261118T215346Z-eeb58ed9b.json`,
+     `ui-sql-learned/20261118T215447Z-eeb58ed9b.json`.
    - **Open:** none for the baseline.
 2. **Same data, different residence/layout.** Execute fixed SQL/absolute binds
    before/after explicit stage/publication, then on separately prelearned data.

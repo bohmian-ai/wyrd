@@ -26,6 +26,7 @@ mod isolated;
 mod logs;
 mod run;
 mod telemetry;
+mod ui;
 mod workload;
 
 use std::path::Path;

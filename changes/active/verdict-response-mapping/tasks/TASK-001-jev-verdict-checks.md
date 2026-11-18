@@ -1,7 +1,7 @@
 ---
 id: TASK-001
 kind: implementation
-status: proposed
+status: implemented
 spec: SPEC-verdict-response-mapping
 spec_revision: 1
 requirements: [REQ-001, REQ-002, REQ-003, REQ-005, REQ-006, REQ-007, REQ-008, REQ-010, REQ-011, REQ-012, REQ-013, REQ-014]
@@ -353,6 +353,40 @@ that proof rather than manufacturing a RED result.
    in served declaration/schema and runtime MCP contract checks, plus a
    journey-tested public example. Expected initial state is passing for existing
    behavior; new contract projection assertions initially fail where absent.
+
+   Evidence:
+   - Direct-Verdict and existing behavior: the `gateway_jev`,
+     `verifier_building_blocks` and `authoring` journey modules ran
+     together, 48 passed. They cover direct-Verdict outcomes, citations,
+     data, malformed output and repair, plus the native Jev gateway
+     refusal/retry cases. Python `test_gateway_jev.py` and TS
+     `gateway-jev.test.ts` stay green (scenario 4 run).
+   - Refusals: in `test_verdict_transform_authoring.py`,
+     `test_an_agent_action_takes_no_verdict_transform` (`Action.agent`
+     refuses the keyword) and
+     `test_a_jev_prompt_refuses_a_named_response_format` (a `system_one`
+     Prompt with `response_format: verdict` is refused with "this native
+     format has no structured output"); 17 passed.
+   - Schema contract: `card::verifier::transform::tests::verifier_schema_offers_verdict_transform_only_on_agent_checks`
+     (wyrd-spec) asserts `VerdictTransform`'s variants are exactly
+     choice/probability/score and that `AgentCheck` is the only schema
+     definition carrying `verdict_transform`. `codegen:check` passes with `verdict_transform` in
+     `card-types.ts`. No MCP tool or server route serves Card schemas
+     separately; the runtime-derived schemars schema is the served contract.
+   - Example: `examples/gateway-setup/verifiers/no-refund-promise.yaml` (the
+     design's example) and `examples/gateway-setup/refund-desk.yaml`, run by
+     `gateway_jev::jev_refund_example_judges_as_documented`: the promise
+     fails and the compliant answer passes, each with the documented reason
+     and no citations. Documentation is in the gateway-setup README step 6
+     and `reference/verifier-card.md` ("Decision answers" plus the two
+     rejection rules); `docs:generate` was run and `docs:check` passes.
+   - RED: the refusals and the existing direct-Verdict behavior passed on the
+     first run, as expected. The new example journey first failed on loader
+     path escape (`../`), then on a mock marker that also matched the
+     question text. Both were test/setup defects, fixed by moving the
+     Service file and using unique markers.
+   - Gates: clippy `-D warnings` for wyrd-spec and wyrd-ai, `check:deps`,
+     `py:lints` and `docs:check` all pass.
 
 ## Test owners and focused verification
 

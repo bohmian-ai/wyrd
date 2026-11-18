@@ -4847,7 +4847,7 @@ When to use each kind is in [Steps and checks](/wyrd/understand/how-verification
 | --- | --- | --- |
 | `assert` | `path` or `each`, `operator`, `expected` | Comparing a value; `each` with `[*]` requires every item to pass |
 | `trace` | `on`, `span_selector`, `operator`, `expected` | Comparing values selected from trace spans |
-| `agent` | `agent`, `inputs`, `workspace` | An Agent, with its declared tools and optional workspace as in a step, whose Prompt `response_format` is `verdict` or a closed [verdict](#verdicts-and-citations) schema |
+| `agent` | `agent`, `inputs`, `workspace`, optional `verdict_transform` | An Agent, with its declared tools and optional workspace as in a step, whose Prompt `response_format` is `verdict` or a closed [verdict](#verdicts-and-citations) schema, or whose Jev `system_one` answer a [`verdict_transform`](#decision-answers) reads |
 | `code` | `runtime`, `source`, `entrypoint`, `inputs`, optional `response_format` | A Python function that returns a verdict |
 | `drift` | `on`, `method`, `signal`, `condition`, `profile` | Comparing a window of samples with a baseline |
 
@@ -4930,6 +4930,26 @@ A citation names the original slot, the `attachment_<n>` slot a fixed workspace 
 
 `response_format: verdict` (or `{kind: verdict}`) asks for exactly the verdict above. `{kind: verdict, data: <JSON Schema>}` also requires a `data` object matching that object schema, written in JSON Schema 2020-12 (omit `$schema` or declare 2020-12) and without a root `$id`. An Agent declares it on its Prompt; a `code` check declares it on the check, beside `entrypoint`, and returns `data` in its verdict. Without a `data` schema, a verdict must not carry `data`.
 
+### Decision answers
+
+A Jev `system_one` Prompt answers fixed questions instead of a verdict. An Agent check reads one answer through `verdict_transform`, which only checks take, never steps; the Prompt keeps no `response_format`:
+
+| `kind` | Fields | Reads | Outcome |
+| --- | --- | --- | --- |
+| `choice` | `question`, optional `outcomes` | A `choice` question | The selected label, which must be `passed`, `failed`, or `inconclusive`; `outcomes` instead maps every declared label to one of them |
+| `probability` | `question`, `expected`, `pass_at`, `fail_at` | A `noul` question | With `q` the probability of `expected`: `passed` when `q >= pass_at`, `failed` when `q <= fail_at`, else `inconclusive`; `0 <= fail_at < pass_at <= 1` |
+| `score` | `question`, `operator`, `expected` | A `score` question | `passed` when the score compares true with a scalar [operator](#comparison-operators), else `failed` |
+
+```yaml
+check:
+  kind: agent
+  agent: ./refund-judge.yaml   # a Jev system_one Prompt with a choice question refund_policy
+  inputs: {answer: inputs.answer}
+  verdict_transform: {kind: choice, question: refund_policy}
+```
+
+The reason states the selected answer and the policy, such as `Question 'refund_policy' selected 'failed' (confidence 1).`. The verdict has no citations, and the requirement's `actual` is the selected native answer, retained under `context_capture`. A missing answer, an answer of another form, an undeclared label, or a value outside its range makes the requirement `inconclusive` with the reason. [Gateway setup](https://github.com/bohmian-ai/wyrd/tree/main/examples/gateway-setup) has a runnable example.
+
 An Agent step's Prompt may instead declare `response_format: code_review`, the standard code review report Wyrd renders on a pull request's Check and review; it takes no `data`. See [Review a pull request](/wyrd/build-and-verify/verify/review-a-pull-request/).
 
 The server validates the whole verdict against the declared schema. Data must fit both limits, inclusive:
@@ -4974,6 +4994,8 @@ Common `rule` values in `WYRD_SPEC_400_VALIDATION`:
 | `pass_rate` | `threshold` is not above 0 and at most 1 |
 | `check_response_format` | A `code` check's `response_format` names an unknown format or an invalid `data` schema |
 | `check_agent_schema` | A check Agent's Prompt cannot produce a verdict, or declares `data` without requiring an object |
+| `verdict_transform` | A `verdict_transform` names an unknown or blank question, reads another question form, leaves a `choice` label unmapped, maps an undeclared one, or has invalid thresholds or a non-scalar operator |
+| `verdict_transform_prompt` | A `verdict_transform` judges with an Agent whose Prompt is not a Jev `system_one` Prompt |
 
 # Extraction output
 

@@ -1,0 +1,38 @@
+# A support answer never promises a guaranteed refund, judged by Jev: one
+# Choice question whose labels are the canonical outcomes, read through
+# `verdict_transform`, so the selected label is the verdict.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: no-refund-promise
+  version: 1.0.0
+spec:
+  inputs:
+    answer: {type: json, schema: {type: string}}
+  requirements:
+    - id: no-refund-promise
+      statement: The answer never promises a guaranteed refund
+      check:
+        kind: agent
+        agent:
+          execution_route: {kind: wyrd_gateway, deployment: judge-pool}
+          run_config: {max_iterations: 1}
+          prompt:
+            provider: jev
+            model: jev-judge
+            format: system_one
+            body:
+              state: ${answer}
+              questions:
+                refund_policy:
+                  type: choice
+                  instructions: Does the answer promise a guaranteed refund?
+                  criteria:
+                    passed: The answer does not promise a guaranteed refund
+                    failed: The answer promises a guaranteed refund
+                    inconclusive: There is insufficient information to decide
+        inputs:
+          answer: inputs.answer
+        verdict_transform:
+          kind: choice
+          question: refund_policy

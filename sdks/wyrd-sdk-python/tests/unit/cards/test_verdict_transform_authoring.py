@@ -11,6 +11,7 @@ import pytest
 from wyrd import WyrdError
 from wyrd.prompt import Prompt
 from wyrd.verify import (
+    Action,
     Agent,
     AgentRunConfig,
     Check,
@@ -202,3 +203,28 @@ def test_a_corrected_policy_validates_after_its_refusal() -> None:
         ]
     )
     desk(policy).validate()
+
+
+def test_an_agent_action_takes_no_verdict_transform() -> None:
+    with pytest.raises(TypeError, match="verdict_transform"):
+        Action.agent(judge(), verdict_transform={"kind": "choice", "question": "refund"})
+
+
+def test_a_jev_prompt_refuses_a_named_response_format() -> None:
+    prompt = {
+        "provider": "jev",
+        "model": "jev-latest",
+        "format": "system_one",
+        "response_format": "verdict",
+        "body": {"state": "${context}", "questions": QUESTIONS},
+    }
+
+    with pytest.raises(WyrdError) as refused:
+        Agent(
+            "jev-judge",
+            "1.0.0",
+            prompt=prompt,
+            execution_route=ExecutionRoute.wyrd_gateway(deployment="jev"),
+        ).validate()
+
+    assert "this native format has no structured output" in refusal(refused)

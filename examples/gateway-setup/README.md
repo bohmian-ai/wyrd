@@ -104,6 +104,21 @@ fixtures.
    Every call is retained in `bifrost.gateway.calls` under its `run_id` and the
    Agent's `subject_card_uid`. The Jev deployment returns keyed `answers`.
 
+6. Verify answers with Jev. `verifiers/no-refund-promise.yaml` asks the
+   `judge-pool` deployment one Choice question whose labels are the outcomes,
+   and its `verdict_transform` reads the selected label as the verdict.
+   `refund-desk.yaml` binds it to the Jev Agent:
+
+   ```bash
+   wyrd declare refund-desk.yaml
+   ```
+
+   Verifying `answer: "You are guaranteed a full refund."` fails with the
+   reason `Question 'refund_policy' selected 'failed' (confidence 1).`. The
+   journey
+   `sdks/wyrd-sdk-rust/tests/integration/gateway_jev.rs::jev_refund_example_judges_as_documented`
+   declares and verifies these files.
+
 `wyrd gateway credential revoke <name>` is permanent: every deployment using
 that credential stops serving, and the name cannot be put again. To recover,
 put the key under a new name and point the deployment's `auth.credential` at it.

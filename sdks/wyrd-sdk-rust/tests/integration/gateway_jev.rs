@@ -9,6 +9,7 @@
 //! a bearer token, which is the whole of what such a client sends.
 
 use std::collections::BTreeSet;
+use std::path::Path;
 
 use serde_json::{Value, json};
 use wiremock::matchers::{body_string_contains, method, path};
@@ -81,8 +82,9 @@ struct Jev {
 
 impl Jev {
     /// Start the upstream and the server, write the `jev-key` credential with
-    /// the CLI as the administrator, and deploy `jev/jev-latest` serving
-    /// `system_one` and the `chat_completions` pass-through.
+    /// the CLI as the administrator, and deploy `jev` and the examples'
+    /// `judge-pool`, each serving `system_one` and the `chat_completions`
+    /// pass-through.
     ///
     /// # Panics
     /// Panics when a setup step fails.
@@ -129,24 +131,27 @@ impl Jev {
         )
         .await
         .expect("the CLI writes the credential");
-        Gateway::connect_with(&deployment.admin())
+        let gateway = Gateway::connect_with(&deployment.admin())
             .await
-            .expect("handle connects")
-            .put_deployment(&ProviderDeployment {
-                name: ProviderDeploymentName::new("jev").expect("deployment name"),
-                adapter: ProviderAdapter::Jev,
-                auth: ProviderAuth::Bearer {
-                    credential: ProviderCredentialName::new("jev-key").expect("credential"),
-                },
-                models: None,
-                capabilities: Some(BTreeSet::from([
-                    GatewayOperation::SystemOne,
-                    GatewayOperation::ChatCompletions,
-                ])),
-                access: DeploymentAccess::Open,
-            })
-            .await
-            .expect("deployment puts");
+            .expect("handle connects");
+        for name in ["jev", "judge-pool"] {
+            gateway
+                .put_deployment(&ProviderDeployment {
+                    name: ProviderDeploymentName::new(name).expect("deployment name"),
+                    adapter: ProviderAdapter::Jev,
+                    auth: ProviderAuth::Bearer {
+                        credential: ProviderCredentialName::new("jev-key").expect("credential"),
+                    },
+                    models: None,
+                    capabilities: Some(BTreeSet::from([
+                        GatewayOperation::SystemOne,
+                        GatewayOperation::ChatCompletions,
+                    ])),
+                    access: DeploymentAccess::Open,
+                })
+                .await
+                .expect("deployment puts");
+        }
         Self {
             deployment,
             upstream,
@@ -1178,6 +1183,74 @@ async fn jev_judgments_are_retained_under_capture_controls() {
             .await
             .expect_err("another tenant reads no judgment");
         assert_eq!(refused.code(), "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND");
+    }
+    jev.deployment.shutdown().await;
+}
+
+/// The public `examples/gateway-setup/refund-desk.yaml` runs as written:
+/// `no-refund-promise` asks Jev one canonical Choice question through the
+/// `judge-pool` deployment and reads the selected label as the verdict, so
+/// a reply promising a guaranteed refund fails and a compliant one passes,
+/// each with the documented reason and no citations.
+///
+/// # Panics
+/// Panics when the example does not validate, declare or judge as
+/// documented.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn jev_refund_example_judges_as_documented() {
+    let jev = Jev::start().await;
+    let choice = |label: &str| {
+        json!({"model": "jev-1.13.0", "answers": {"refund_policy": {
+            "type": "choice", "choice": label, "confidence": 1.0,
+            "probabilities": {"passed": f64::from(u8::from(label == "passed")),
+                              "failed": f64::from(u8::from(label == "failed")),
+                              "inconclusive": 0.0}}}})
+    };
+    jev.answer_when("REFUND-PROMISE", choice("failed")).await;
+    jev.answer_when("REFUND-POLICY", choice("passed")).await;
+    let desk =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/gateway-setup/refund-desk.yaml");
+    let state = WyrdState::declare_with(
+        desk.as_path(),
+        DeclareOptions {
+            client: Some(jev.deployment.admin()),
+            ..DeclareOptions::default()
+        },
+    )
+    .await
+    .expect("the example declares");
+
+    for (answer, label, verdict) in [
+        (
+            "REFUND-PROMISE: you are guaranteed a full refund.",
+            "failed",
+            VerificationVerdict::Failed,
+        ),
+        (
+            "REFUND-POLICY: we refund when the policy allows it.",
+            "passed",
+            VerificationVerdict::Passed,
+        ),
+    ] {
+        let result = state
+            .run_for_card("jev")
+            .expect("the judge's run opens")
+            .observe()
+            .verify(
+                "no-refund-promise",
+                Inputs::named([("answer", json!(answer))]),
+            )
+            .await
+            .expect("the verification executes");
+        let judged = requirement(&result, "no-refund-promise");
+        assert_eq!(
+            judged.reason,
+            format!("Question 'refund_policy' selected '{label}' (confidence 1)."),
+            "{answer}"
+        );
+        assert!(judged.citations.is_empty(), "{judged:#?}");
+        assert_eq!(result.outcome.verdict, verdict, "{answer}");
     }
     jev.deployment.shutdown().await;
 }

@@ -458,3 +458,61 @@ pub fn canonical(label: &str) -> Option<VerificationVerdict> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::Value;
+
+    use crate::card::verifier::VerifierSpec;
+
+    /// The `kind` constant of each `oneOf` variant of `definition`.
+    fn variant_kinds(definition: &Value) -> Vec<&str> {
+        definition["oneOf"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|variant| variant.pointer("/properties/kind/const")?.as_str())
+            .collect()
+    }
+
+    /// The Verifier schema that SDK projections and declaration clients read
+    /// defines `VerdictTransform` as exactly the `choice`, `probability`
+    /// and `score` union, and only `AgentCheck` carries `verdict_transform`:
+    /// no action, step or other check does.
+    ///
+    /// # Panics
+    /// Panics when the schema does not encode, the union differs, or another
+    /// definition carries the field.
+    #[test]
+    fn verifier_schema_offers_verdict_transform_only_on_agent_checks() {
+        let schema = serde_json::to_value(crate::schema::schema_for::<VerifierSpec>())
+            .expect("the schema encodes");
+        let defs = schema["$defs"]
+            .as_object()
+            .expect("the schema has definitions");
+
+        assert_eq!(
+            variant_kinds(&defs["VerdictTransform"]),
+            ["choice", "probability", "score"]
+        );
+
+        let mut holders = Vec::new();
+        for (name, definition) in defs {
+            if definition
+                .pointer("/properties/verdict_transform")
+                .is_some()
+            {
+                holders.push(name.clone());
+            }
+            for variant in definition["oneOf"].as_array().into_iter().flatten() {
+                if variant.pointer("/properties/verdict_transform").is_some() {
+                    let kind = variant
+                        .pointer("/properties/kind/const")
+                        .and_then(Value::as_str);
+                    holders.push(format!("{name}.{}", kind.unwrap_or("?")));
+                }
+            }
+        }
+        assert_eq!(holders, ["AgentCheck"]);
+    }
+}

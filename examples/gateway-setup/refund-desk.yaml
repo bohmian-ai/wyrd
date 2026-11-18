@@ -1,0 +1,13 @@
+# The Jev Agent, verified by no-refund-promise on every answer it judges.
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: refund-desk
+  version: 1.0.0
+spec:
+  service_type: agent
+  components:
+    - alias: jev
+      ref: ./agents/jev-agent.yaml
+      verified_by:
+        - verifier: ./verifiers/no-refund-promise.yaml

@@ -432,11 +432,33 @@ invocation on every platform, and saves the captures under the run's
 missing or a capture fails, the record carries a note instead, and the
 verdict is unchanged.
 
+Run a profiled experiment with its normal task, narrowed to the steps in
+question:
+
+```bash
+mise run bench:l1:gateway -- --profile cpu --steps buffered-64kib-capture-metadata.c64
+```
+
+The captures land in the run's `profiles/` directory,
+`target/benchmarks/<engine>/<experiment>/<UTC start>/profiles/`, and the
+printed report lists each one. Read a CPU capture with the harness:
+
+```bash
+target/profiling/release/capacity profile profiles/<step>/cpu-server-<pid>.json.gz              # every thread group
+target/profiling/release/capacity profile profiles/<step>/cpu-server-<pid>.json.gz wyrd-scribe  # threads whose name contains it
+```
+
+For each thread group it prints the samples (about 1 ms of CPU each), then
+the top functions by self and by inclusive samples. Thread names are cut to
+15 characters (`wyrd-scribe-ing`, `tokio-rt-worker`), so filter by a prefix. `samply load` opens the
+same capture as a flame graph.
+
 A heap capture (`heap` or `both`) profiles the server. Once the fixtures are
 loaded, the run asks the `bench` server build to start sampling its heap:
 about one allocation per 512 KiB allocated, recorded with its call stack,
 through the same mimalloc allocator the server always uses. After each
-measured step, the run saves `profiles/heap-<step>.pb.gz`, a symbolized pprof
+measured step, the run saves `profiles/heap-<role>-<step>.pb.gz` for the
+server and the driver, a symbolized pprof
 profile with Go's four heap sample types: `alloc_space` and `alloc_objects`
 count everything the steps so far allocated, freed or not, and `inuse_space`
 and `inuse_objects` what they still hold. Memory allocated before sampling
@@ -447,12 +469,12 @@ frees before it ends is gone from `inuse_space`, but the allocator may keep
 its pages. `alloc_space` shows which code allocated it.
 
 ```bash
-pprof -top profiles/heap-<step>.pb.gz                      # what is held after <step>
-pprof -top -base profiles/heap-<earlier>.pb.gz profiles/heap-<step>.pb.gz  # what <step> still holds beyond <earlier>
-pprof -top -sample_index=alloc_space -base profiles/heap-<earlier>.pb.gz profiles/heap-<step>.pb.gz  # what <step> allocated
+pprof -top profiles/heap-server-<step>.pb.gz                                      # what is held after <step>
+pprof -top -base profiles/heap-server-<earlier>.pb.gz profiles/heap-server-<step>.pb.gz  # what <step> still holds beyond <earlier>
+pprof -top -sample_index=alloc_space -base profiles/heap-server-<earlier>.pb.gz profiles/heap-server-<step>.pb.gz  # what <step> allocated
 ```
 
-`pprof` is Google's profile viewer (`go install github.com/google/pprof@latest`);
+`pprof` is Google's profile viewer, installed locally (`go install github.com/google/pprof@latest`);
 `-http=:8080` opens a flame graph. Each stack starts at the code that asked
 for memory, with the allocator and the standard library's `Vec` and `Box`
 plumbing trimmed. Inlined frames carry short names in the bench build's

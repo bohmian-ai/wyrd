@@ -24,7 +24,7 @@ the owner; never add an alias or a parallel contract.
 change, not whole documents. Generated schemas, source code, tests, and old
 plans never override these documents; implementation that disagrees is drift.
 Directory rules live beside the code: `docs/`, `sdks/wyrd-sdk-python/`,
-`sdks/wyrd-sdk-ts/`, `crates/wyrd/wyrd-sql/`.
+`sdks/wyrd-sdk-ts/`, `crates/wyrd/wyrd-sql/`, `benchmarks/`.
 
 ## Repository map
 

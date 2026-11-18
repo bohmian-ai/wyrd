@@ -379,12 +379,56 @@ export const executionsByVerifier = result(
 
 /** Facet counts: largest first, with a null value. */
 export const facet = result([col('value'), col('n', 'Int64')], [['agent-api', 42], ['search', 7], [null, 3]]);
-/** Facet counts by the column a facet query groups; span names read past the ten shown. */
-function facetFor(sql: string): QueryResult {
-  if (sql.startsWith('SELECT status_code ')) return { ...facet, rows: [[1, 187], [2, 6], [0, 1]] };
-  if (sql.startsWith('SELECT severity_text ')) return { ...facet, rows: [['INFO', 810], ['WARN', 352], ['ERROR', 38]] };
-  if (sql.startsWith('SELECT name ')) return { ...facet, rows: Array.from({ length: 11 }, (_, index) => [`span ${index + 1}`, 200 - index * 9]) };
-  return facet;
+/** Facet `value, n` rows by grouped column; span names read past the ten shown. */
+function facetRows(column: string, executions: boolean): unknown[][] {
+  if (executions) {
+    if (column === 'status') return [['completed', 4], ['cancelled', 1], ['not recorded', 1], ['waiting', 1]];
+    if (column === 'verdict') return [[null, 2], ['failed', 1], ['inconclusive', 1], ['passed', 1]];
+    if (column === 'verifier_card_uid') return [[VERIFIER_UIDS.policy, 3], [VERIFIER_UIDS.drift, 2]];
+    if (column === 'run_id') return [['run_refund', 4], [null, 2]];
+    if (column === 'group_id') return [[null, 5], ['ticket-4821', 1]];
+    return facet.rows.map((row) => [...row]);
+  }
+  if (column === 'status_code') return [[1, 187], [2, 6], [0, 1]];
+  if (column === 'severity_text') return [['INFO', 810], ['WARN', 352], ['ERROR', 38]];
+  if (column === 'name') return Array.from({ length: 11 }, (_, index) => [`span ${index + 1}`, 200 - index * 9]);
+  return facet.rows.map((row) => [...row]);
+}
+
+/** A facet rail's one grouping-set read: per grouped column, its rows tagged with the facet index. */
+function facetsFor(sql: string): QueryResult {
+  const columns = [...(sql.match(/GROUP BY GROUPING SETS \((.*)\)\) AS grouped/)?.[1] ?? '').matchAll(/\((\w+)\)/g)].map((match) => match[1]);
+  const executions = sql.includes(') AS executions');
+  const rows = columns.flatMap((column, index) =>
+    facetRows(column, executions).map(([value, n]) => [index, ...columns.map((_, at) => (at === index ? value : null)), n])
+  );
+  if (!sql.includes('AS verdict_series')) return result([col('facet', 'Int64'), ...columns.map((_, index) => col(`f${index}`)), col('n', 'Int64')], rows);
+  // The Verify discovery read: facets, then executions by verdict and by Verifier, ranked by their totals.
+  const blank = columns.map(() => null);
+  const place = (uid: unknown) => (uid === VERIFIER_UIDS.policy ? 1 : 2);
+  return result(
+    [col('facet', 'Int64'), ...columns.map((_, index) => col(`f${index}`)), col('at', NS), col('verdict'), col('verifier'), col('place', 'UInt64'), col('verifiers', 'UInt64'), col('n', 'Int64')],
+    [
+      ...rows.map(([facet, ...rest]) => [facet, ...rest.slice(0, -1), null, null, null, null, null, rest[rest.length - 1]]),
+      ...executionsByVerdict.rows.map(([at, verdict, n]) => [columns.length, ...blank, at, verdict, null, null, null, n]),
+      ...executionsByVerifier.rows.map(([at, uid, n]) => [columns.length + 1, ...blank, at, null, uid, place(uid), 2, n])
+    ]
+  );
+}
+/** A stat or overview read grouped per bucket and over the range: `buckets` rows, then one range row of 128 per value (cost: per currency). */
+function wholeFor(sql: string): QueryResult {
+  if (sql.includes('(at, currency), (currency)')) {
+    const value = [...sql.matchAll(/ AS (s\d+)/g)][0][1];
+    return result(
+      [col('whole', 'Int32'), col('at', NS), col(value, 'Decimal128(38, 12)'), col('currency')],
+      [...costBuckets.rows.map((row) => [0, ...row]), ...costs.rows.map(([amount, currency]) => [1, null, amount, currency])]
+    );
+  }
+  const names = [...(sql.match(/^SELECT grouping\(at\) AS whole, at, (.*?) FROM \(/)?.[1] ?? '').matchAll(/ AS (\w+)/g)].map((match) => match[1]);
+  return result(
+    [col('whole', 'Int32'), col('at', NS), ...names.map((name) => col(name, 'Int64'))],
+    [...buckets.rows.map(([at, value]) => [0, at, ...names.map(() => value)]), [1, null, ...names.map(() => 128)]]
+  );
 }
 /** One stat total and its buckets. */
 export const total = (value: unknown) => result([col('value', 'Int64')], [[value]]);
@@ -397,12 +441,9 @@ export const costs = result([col('value', 'Decimal128(38, 12)'), col('currency')
 
 /** The fixture answering one Observe read, chosen by its fixed SQL shape. */
 export function observeAnswer(sql: string): QueryResult | undefined {
+  if (sql.startsWith('SELECT grouping(at) AS whole')) return wholeFor(sql);
+  if (sql.includes('GROUPING SETS')) return facetsFor(sql);
   if (sql.includes(') AS executions')) {
-    if (sql.startsWith('SELECT status ')) return { ...facet, rows: [['completed', 4], ['cancelled', 1], ['not recorded', 1], ['waiting', 1]] };
-    if (sql.startsWith('SELECT verdict ')) return { ...facet, rows: [[null, 2], ['failed', 1], ['inconclusive', 1], ['passed', 1]] };
-    if (sql.startsWith('SELECT verifier_card_uid ')) return { ...facet, rows: [[VERIFIER_UIDS.policy, 3], [VERIFIER_UIDS.drift, 2]] };
-    if (sql.startsWith('SELECT run_id ')) return { ...facet, rows: [['run_refund', 4], [null, 2]] };
-    if (sql.startsWith('SELECT group_id ')) return { ...facet, rows: [[null, 5], ['ticket-4821', 1]] };
     if (sql.includes(' AS n FROM')) return facet;
     return sql.includes(' AS verdict, ') ? executionsByVerdict : sql.includes(' AS verifier, ') ? executionsByVerifier : executions;
   }
@@ -415,7 +456,7 @@ export function observeAnswer(sql: string): QueryResult | undefined {
   if (sql.includes("encode(parent_span_id, 'hex')")) return trace;
   if (sql.startsWith('SELECT * FROM bifrost.logs.records')) return logRow;
   if (sql.startsWith('SELECT * FROM bifrost.traces.spans')) return spanRow;
-  if (sql.includes(' AS n FROM')) return facetFor(sql);
+  if (sql.includes(' AS n FROM')) return facet;
   if (sql.includes('AS at,')) return sql.includes(', currency FROM') ? costBuckets : buckets;
   if (sql.includes(', currency FROM')) return costs;
   if (sql.startsWith('SELECT') && sql.includes(' AS value FROM')) return total(128);

@@ -89,7 +89,6 @@ import {
 } from 'wyrd-ai-ui';
 import {
   chartParams,
-  facetQuery,
   histogramWindows,
   inventoryFilter,
   loadArtifactTable,
@@ -111,8 +110,11 @@ import {
   executionStates,
   loadExecution,
   loadChart,
+  loadFacetRail,
   loadRecordDetail,
   loadRecordTable,
+  loadStatStrip,
+  loadTraceOverview,
   loadTraceWaterfall,
   parseNanos,
   shapeChart,
@@ -199,6 +201,83 @@ function recording(answer: (request: WireRequest) => WireResult | Promise<WireRe
   };
   return { executor, calls };
 }
+
+test('a facet rail reads every facet in one ranked grouping-set aggregate', async () => {
+  const column = (name: string, data_type: string) => ({ name, data_type, nullable: true });
+  const read = recording(() => ({
+    ok: true,
+    value: {
+      columns: [column('facet', 'Int64'), column('f0', 'Utf8'), column('f1', 'Int32'), column('n', 'Int64'), column('severity_number', 'Int32')],
+      rows: [
+        [0, 'ERROR', null, 4, 17],
+        [0, null, null, 1, null],
+        [1, null, 9, 5, 9]
+      ],
+      terminal: { outcome: 'success', row_count: 3, warnings: [] }
+    } as never
+  }));
+  const loaded = await loadFacetRail(
+    { signal: 'logs', facets: ['severity_text', 'severity_number'], where: [{ column: 'service_name', value: 'search' }] },
+    { executor: read.executor, range: RANGE }
+  );
+
+  expect(read.calls).toHaveLength(1);
+  expect(read.calls[0].request).toEqual({
+    op: 'bifrost.query',
+    sql:
+      'SELECT facet, f0, f1, n, severity_number FROM (SELECT facet, f0, f1, n, severity_number, row_number() OVER (PARTITION BY facet ORDER BY n DESC, f0, f1) AS rank FROM ' +
+      '(SELECT CASE WHEN grouping(severity_text) = 0 THEN 0 ELSE 1 END AS facet, severity_text AS f0, severity_number AS f1, count(*) AS n, max(severity_number) AS severity_number ' +
+      'FROM bifrost.logs.records WHERE time_unix_nano >= $1::timestamptz AND time_unix_nano < $2::timestamptz AND service_name = $3 ' +
+      'GROUP BY GROUPING SETS ((severity_text), (severity_number))) AS grouped) AS ranked WHERE rank <= 11 ORDER BY facet, rank',
+    params: [RANGE.from, RANGE.to, 'search']
+  });
+  // Each facet keeps its own typed value column, its count, and severity only where it names a level.
+  expect(loaded.result).toMatchObject({
+    state: 'populated',
+    data: {
+      facets: [
+        {
+          column: 'severity_text',
+          values: { columns: [column('value', 'Utf8'), column('n', 'Int64'), column('severity_number', 'Int32')], rows: [['ERROR', 4, 17], [null, 1, null]] }
+        },
+        { column: 'severity_number', values: { columns: [column('value', 'Int32'), column('n', 'Int64')], rows: [[9, 5]] } }
+      ]
+    }
+  });
+});
+
+test('the trace overview reads matching spans and roots once each, bucketed and whole-range', async () => {
+  const column = (name: string, data_type = 'Int64') => ({ name, data_type, nullable: true });
+  const read = recording((request) => {
+    const roots = (request as { sql: string }).sql.includes('parent_span_id IS NULL');
+    return {
+      ok: true,
+      value: roots
+        ? { columns: [column('whole', 'Int32'), column('at', 'Timestamp(ns, "+00:00")'), column('p95', 'Float64'), column('p50', 'Float64')], rows: [[0, 'T1', 9, 4], [1, null, 8, 3]], terminal: { outcome: 'success', row_count: 2, warnings: [] } }
+        : {
+            columns: [column('whole', 'Int32'), column('at', 'Timestamp(ns, "+00:00")'), column('spans'), column('errors'), column('traces'), column('error_traces'), column('span_p95_ms', 'Float64')],
+            rows: [[0, 'T1', 12, 2, 5, 1, 7], [1, null, 12, 2, 5, 1, 7]],
+            terminal: { outcome: 'success', row_count: 2, warnings: [] }
+          }
+    } as never;
+  });
+  const overview = await loadTraceOverview({ where: [{ column: 'service_name', value: 'api' }] }, { executor: read.executor, range: RANGE });
+
+  expect(read.calls).toHaveLength(2);
+  const [spans, roots] = read.calls.map((call) => (call.request as { sql: string }).sql);
+  expect(spans).toContain('GROUP BY GROUPING SETS ((at), ())');
+  expect(roots).toContain('parent_span_id IS NULL');
+  expect(overview.spans.result).toMatchObject({ state: 'populated', data: { rows: [['T1', 12]] } });
+  expect(overview.errors.result).toMatchObject({ state: 'populated', data: { rows: [['T1', 2]] } });
+  expect(overview.duration.result).toMatchObject({ state: 'populated', data: { rows: [['T1', 9, 4]] } });
+  // Range totals come from the whole-range grouping set, never summed from buckets.
+  expect(overview.totals).toMatchObject({
+    state: 'populated',
+    data: { columns: ['spans', 'traces', 'error_traces', 'span_p95_ms', 'p95_ms', 'p50_ms'].map((name) => expect.objectContaining({ name })), rows: [[12, 5, 1, 7, 8, 3]] }
+  });
+  // Each chart keeps its own portable SQL for a Chart panel or Query.
+  expect(overview.spans.input.sql).toMatch(/^SELECT date_bin\(\$3::interval, start_time_unix_nano\) AS at, count\(\*\) AS spans FROM/);
+});
 
 test('TASK-003: Validated portable rendering', async () => {
   // Every catalog component and its declared states are generated, with view-document shape.
@@ -1391,31 +1470,53 @@ test('TASK-004: Canonical signal interactions', async () => {
   await loadTraceWaterfall({ traceId: TRACE, range: RANGE }, { executor: exact.executor, range: RANGE });
   expect(exact.calls[0].request).toMatchObject({ params: [TRACE], max_rows: 10_000 });
   expect((exact.calls[0].request as { sql: string }).sql).not.toContain('$2');
-  // Log detail binds its full key; facets bind the list's WHERE and read one value past the shown ten.
+  // Log detail binds its full key.
   const detail = recording(() => ({ ok: true, value: logRow }));
   await loadRecordDetail({ log: LOG }, { executor: detail.executor });
   expect(detail.calls[0].request).toMatchObject({ params: [LOG.time_unix_nano, LOG.observed_time_unix_nano, LOG.wyrd_request_id] });
-  expect(facetQuery({ signal: 'logs', facets: ['severity_text'], where: [{ column: 'service_name', value: 'search' }] }, 'severity_text', RANGE)).toEqual({
-    sql:
-      'SELECT severity_text AS value, count(*) AS n, max(severity_number) AS severity_number FROM bifrost.logs.records WHERE time_unix_nano >= $1::timestamptz AND time_unix_nano < $2::timestamptz ' +
-      'AND service_name = $3 GROUP BY severity_text ORDER BY n DESC, value LIMIT 11',
-    params: [RANGE.from, RANGE.to, 'search']
-  });
-  // Cost is summed per recorded currency, scoped by a bound Card uid.
-  expect(statQueries('cost', { stats: ['cost'], scope: { column: 'workload_card_uid', uid: 'card_01HX' } }, RANGE, '5 minutes')[0]).toEqual({
-    sql:
-      'SELECT sum(CAST(cost AS DECIMAL(38, 12))) AS value, currency FROM bifrost.gateway.calls WHERE started_at >= $1::timestamptz AND started_at < $2::timestamptz ' +
-      'AND cost IS NOT NULL AND workload_card_uid = $3 GROUP BY currency ORDER BY currency',
-    params: [RANGE.from, RANGE.to, 'card_01HX']
-  });
+  // Cost is summed per recorded currency, scoped by a bound Card uid, per bucket and over the range.
+  expect(statQueries({ stats: ['cost'], scope: { column: 'workload_card_uid', uid: 'card_01HX' } }, RANGE, '5 minutes')).toEqual([
+    {
+      stats: [0],
+      sql:
+        'SELECT grouping(at) AS whole, at, sum(CAST(cost AS DECIMAL(38, 12))) AS s0, currency FROM (SELECT date_bin($3::interval, started_at) AS at, * FROM bifrost.gateway.calls ' +
+        'WHERE started_at >= $1::timestamptz AND started_at < $2::timestamptz AND cost IS NOT NULL AND workload_card_uid = $4) AS scoped ' +
+        'GROUP BY GROUPING SETS ((at, currency), (currency)) ORDER BY whole, at, currency',
+      params: [RANGE.from, RANGE.to, '5 minutes', 'card_01HX']
+    }
+  ]);
 
   // Tokens are summed from gateway usage entries whose unit is tokens.
-  expect(statQueries('tokens', { stats: ['tokens'] }, RANGE, '5 minutes')[0]).toEqual({
-    sql:
-      "SELECT sum(CAST(u['quantity'] AS DECIMAL(38, 12))) AS value FROM (SELECT started_at, workload_card_uid, subject_card_uid, unnest(usage) AS u FROM bifrost.gateway.calls) AS usage " +
-      "WHERE started_at >= $1::timestamptz AND started_at < $2::timestamptz AND u['unit'] = 'tokens'",
-    params: [RANGE.from, RANGE.to]
+  expect(statQueries({ stats: ['tokens'] }, RANGE, '5 minutes')[0].sql).toBe(
+    "SELECT grouping(at) AS whole, at, sum(CAST(u['quantity'] AS DECIMAL(38, 12))) AS s0 FROM (SELECT date_bin($3::interval, started_at) AS at, * FROM " +
+      "(SELECT started_at, workload_card_uid, subject_card_uid, unnest(usage) AS u FROM bifrost.gateway.calls) AS usage WHERE started_at >= $1::timestamptz AND started_at < $2::timestamptz AND u['unit'] = 'tokens') AS scoped " +
+      'GROUP BY GROUPING SETS ((at), ()) ORDER BY whole, at'
+  );
+
+  // Stats over the same rows share one read; a stat's own filter becomes its aggregate's FILTER.
+  const shared = recording((request) => {
+    const sql = (request as { sql: string }).sql;
+    const c = (name: string, data_type = 'Int64') => ({ name, data_type, nullable: true });
+    const at = c('at', 'Timestamp(ns, "+00:00")');
+    const value =
+      sql.includes('parent_span_id IS NULL') ? { columns: [c('whole', 'Int32'), at, c('s0'), c('s3', 'Float64')], rows: [[0, 'T1', 2, 9e6], [1, null, 2, 9e6]] }
+      : sql.includes('currency') ? { columns: [c('whole', 'Int32'), at, c('s5', 'Decimal128(38, 12)'), c('currency', 'Utf8')], rows: [[0, 'T1', '0.4', 'EUR'], [1, null, '0.4', 'EUR']] }
+      : sql.includes('bifrost.gateway.calls') ? { columns: [c('whole', 'Int32'), at, c('s4')], rows: [[1, null, 0]] }
+      : { columns: [c('whole', 'Int32'), at, c('s1'), c('s2')], rows: [[0, 'T1', 7, 1], [1, null, 7, 1]] };
+    return { ok: true, value: { ...value, terminal: { outcome: 'success', row_count: value.rows.length, warnings: [] } } } as never;
   });
+  const loaded = await loadStatStrip({ stats: ['traces', 'spans', 'errors', 'duration_p95', 'calls', 'cost'] }, { executor: shared.executor, range: RANGE });
+  expect(shared.calls).toHaveLength(4);
+  expect((shared.calls[1].request as { sql: string }).sql).toContain('count(*) AS s1, count(*) FILTER (WHERE status_code = 2) AS s2 FROM');
+  if (loaded.result.state !== 'populated') throw new Error(JSON.stringify(loaded.result));
+  expect(loaded.result.data.stats.map(({ stat, total, series }) => [stat, total.columns.map((each) => each.name), total.rows, series.rows])).toEqual([
+    ['traces', ['value'], [[2]], [['T1', 2]]],
+    ['spans', ['value'], [[7]], [['T1', 7]]],
+    ['errors', ['value'], [[1]], [['T1', 1]]],
+    ['duration_p95', ['value'], [[9e6]], [['T1', 9e6]]],
+    ['calls', ['value'], [[0]], []],
+    ['cost', ['value', 'currency'], [['0.4', 'EUR']], [['T1', '0.4', 'EUR']]]
+  ]);
   // Metric structure columns are listable beyond the defaults.
   expect(validatePanel('RecordTable', { signal: 'metrics', columns: ['metric_name', 'bucket_counts', 'explicit_bounds'] })).toMatchObject({ component: 'RecordTable' });
 

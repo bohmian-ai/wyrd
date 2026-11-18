@@ -1,8 +1,10 @@
 import { expect, test } from 'vitest';
 import {
-  loadExecutionCharts,
+  loadExecutionDiscovery,
+  NAMED_VERIFIERS,
   loadFacetRail,
   loadMetric,
+  loadMetricKeys,
   loadMetricNames,
   METRIC_GROUP_KEYS,
   METRIC_NAMES,
@@ -59,13 +61,17 @@ test('observe signal planning and interactions', async () => {
   expect(logs.calls).toHaveLength(2);
 
   // Facets and the strip read the same normalized predicate; trace roots find it on any span of the trace.
+  // Panels of one refresh share its context, so the predicate is validated once for all of them.
   const spans = recording(normalizing('http_response_status_code = 404'));
-  await loadFacetRail({ signal: 'traces', facets: ['name', 'service_name'], where_sql: 'http_response_status_code=404' }, { executor: spans.executor, range: RANGE });
-  await loadStatStrip({ stats: ['traces', 'errors'], where_sql: 'http_response_status_code=404' }, { executor: spans.executor, range: RANGE });
-  const roots = await loadRecordTable({ signal: 'traces', where_sql: 'http_response_status_code=404' }, { executor: spans.executor, range: RANGE });
+  const refresh = { executor: spans.executor, range: RANGE };
+  await Promise.all([
+    loadFacetRail({ signal: 'traces', facets: ['name', 'service_name'], where_sql: 'http_response_status_code=404' }, refresh),
+    loadStatStrip({ stats: ['traces', 'errors'], where_sql: 'http_response_status_code=404' }, refresh)
+  ]);
+  const roots = await loadRecordTable({ signal: 'traces', where_sql: 'http_response_status_code=404' }, refresh);
   const queries = spans.calls.filter((call) => call.op === 'bifrost.query');
-  expect(spans.calls.filter((call) => call.op === 'bifrost.validate_predicate')).toHaveLength(3);
-  expect(queries).toHaveLength(2 + 4 + 1);
+  expect(spans.calls.filter((call) => call.op === 'bifrost.validate_predicate')).toHaveLength(1);
+  expect(queries).toHaveLength(1 + 2 + 1);
   for (const call of queries) expect(call.op === 'bifrost.query' && call.sql).toContain('(http_response_status_code = 404)');
   expect(roots.executed?.sql).toContain('parent_span_id IS NULL AND trace_id IN (SELECT trace_id FROM bifrost.traces.spans WHERE');
 
@@ -77,9 +83,10 @@ test('observe signal planning and interactions', async () => {
   );
   expect(timeline.calls[0]).toMatchObject({ op: 'bifrost.validate_predicate', namespace: 'bifrost.logs', name: 'records' });
   const logReads = timeline.calls.filter((call) => call.op === 'bifrost.query');
-  expect(logReads).toHaveLength(4);
+  // Both stats count the same records, so one read answers them; errors are that read's FILTER.
+  expect(logReads).toHaveLength(1);
   for (const call of logReads) expect(call.op === 'bifrost.query' && call.sql).toMatch(/FROM bifrost\.logs\.records WHERE .*severity_text = \$\d.*\(body_text LIKE '%refund%'\)/);
-  expect(logReads.filter((call) => call.op === 'bifrost.query' && call.sql.includes('severity_number >= 17'))).toHaveLength(2);
+  expect(logReads[0].op === 'bifrost.query' && logReads[0].sql).toContain('count(*) AS s0, count(*) FILTER (WHERE severity_number >= 17) AS s1 FROM');
   expect(validatePanel('StatStrip', { stats: ['logs', 'spans'], where: [{ column: 'severity_text', value: 'ERROR' }] })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
   expect(validatePanel('StatStrip', { stats: ['logs'], where: [{ column: 'name', value: 'x' }] })).toMatchObject({ detail: expect.stringContaining('name is not a logs column') });
 
@@ -334,10 +341,18 @@ test('the metric rail searches names on the server and reads at most one past it
 test('group keys are offered from at most 100 of the metric series index rows', async () => {
   const sets = { columns: ['attributes', 'resource', 'scope'].map((name) => ({ name, data_type: 'Utf8', nullable: true })), rows: [['{"http.route":"/a","code":200}', '{"host.name":"h"}', null], ['{"http.route":"/b"}', 'not json', '[1]']], terminal: EMPTY.terminal };
   const { executor, calls } = recording((request) => ({ ok: true, value: request.op === 'bifrost.query' && request.sql.includes('LIMIT 100') ? sets : EMPTY }) as never);
-  const loaded = await loadMetric({ metric: 'm' }, { executor, range: RANGE });
-  const sample = calls.find((call) => call.op === 'bifrost.query' && call.sql.includes('LIMIT 100'));
+  const sampled = (call: (typeof calls)[number]) => call.op === 'bifrost.query' && call.sql.includes('LIMIT 100');
+  // Drawing a metric never samples its keys; the picker asks for them when the reader opens it.
+  await loadMetric({ metric: 'm' }, { executor, range: RANGE });
+  expect(calls.filter(sampled)).toEqual([]);
+  const offered = await loadMetricKeys({ metric: 'm' }, { executor, range: RANGE });
+  const [sample] = calls.filter(sampled);
+  expect(calls.filter(sampled)).toHaveLength(1);
   expect(sample?.op === 'bifrost.query' && sample.sql).toContain("FROM bifrost.metrics.series WHERE hour_unix_nano >= date_bin(INTERVAL '1 hour', $1::timestamptz) AND hour_unix_nano < $2::timestamptz AND metric_name = $3");
-  expect(loaded.keys).toEqual([...METRIC_GROUP_KEYS, 'attributes.code', 'attributes.http.route', 'resource.host.name']);
+  expect(offered).toEqual({ state: 'populated', data: [...METRIC_GROUP_KEYS, 'attributes.code', 'attributes.http.route', 'resource.host.name'] });
+  // A failed sample offers the promoted columns alone; any key can still be typed.
+  const failing = recording((request) => (request.op === 'bifrost.query' ? { ok: false, problem: { code: 'WYRD_VALA_500_QUERY_FAILED', title: 'Query failed', status: 500 } } : { ok: true, value: EMPTY }) as never);
+  expect(await loadMetricKeys({ metric: 'm' }, { executor: failing.executor, range: RANGE })).toEqual({ state: 'populated', data: METRIC_GROUP_KEYS });
 });
 
 test('histogram percentiles interpolate inside the bucket holding the rank', () => {
@@ -483,7 +498,7 @@ test('every histogram series apart is labelled from the series index, plotted id
 
 import { fireEvent, render, waitFor, within } from '@testing-library/svelte';
 import { vi } from 'vitest';
-import { goto, invalidateAll } from '$app/navigation';
+import { goto, invalidate, invalidateAll } from '$app/navigation';
 import { EXECUTIONS, fixtureExecutor, SERVICE, stateExecutors, VERIFIER, VERIFIER_UIDS, verifiers } from '$lib/ui-fixtures';
 import { readExecution, writeExecution } from '$lib/verify-host';
 import { load as loadExecutionPage } from '../routes/t/[tenantKey]/verify/executions/[executionId]/+page.server';
@@ -492,11 +507,12 @@ import { load as loadCardDetail } from '../routes/t/[tenantKey]/cards/detail/+pa
 import CardDetail from '../routes/t/[tenantKey]/cards/detail/+page.svelte';
 import { load as loadVerify } from '../routes/t/[tenantKey]/verify/+page.server';
 import VerifyPage from '../routes/t/[tenantKey]/verify/+page.svelte';
+import { load as loadObserve } from '../routes/t/[tenantKey]/observe/+layout.server';
 
 // The page's reads run through the fixture executor here; the real BFF path is the integration journey's.
 const host = vi.hoisted(() => ({ executor: undefined as Executor | undefined }));
 vi.mock('wyrd-ai-ui/node', () => ({ nodeExecutor: () => host.executor }));
-vi.mock('$app/navigation', () => ({ goto: vi.fn(async () => {}), invalidateAll: vi.fn(async () => {}) }));
+vi.mock('$app/navigation', () => ({ goto: vi.fn(async () => {}), invalidate: vi.fn(async () => {}), invalidateAll: vi.fn(async () => {}) }));
 
 test('an exact Verifier Card page shows its definition, versions and where it runs', async () => {
   const requests: WireRequest[] = [];
@@ -724,21 +740,48 @@ test('executions list, facets and charts read one population in bounded shared q
   expect(sql(list.calls[0])).toMatch(/^SELECT .*, execution_id, subject_kind, subject_version, subject_card_uid, result_id, binding_id, workload_card_uid FROM /);
   expect(table.result).toMatchObject({ state: 'empty', reason: 'No execution matches these filters in this window.' });
 
-  // Facets and both charts read that same population and WHERE, each as one bounded aggregate.
-  const rail = context();
-  await loadFacetRail({ signal: 'executions', facets: ['status', 'verdict', 'verifier_card_uid'], where }, rail.context);
-  const charts = context();
-  const drawn = await loadExecutionCharts({ where }, charts.context);
-  expect([...rail.calls, ...charts.calls]).toHaveLength(5);
-  for (const request of [...rail.calls, ...charts.calls]) {
-    expect(request.op).toBe('bifrost.query');
-    expect(sql(request)).toContain(population.replace(/\$3/g, sql(request).includes('date_bin($3') ? '$4' : '$3'));
-  }
-  // No verdict is its own neutral series, never a verdict; the other chart keys each Verifier by its UID.
-  expect(sql(charts.calls[0])).toContain("coalesce(verdict, 'no verdict') AS verdict, count(*) AS executions");
-  expect(sql(charts.calls[1])).toContain('verifier_card_uid AS verifier, count(*) AS executions');
-  expect(drawn.verdicts.input).toMatchObject({ type: 'timeseries', x: 'at', y: ['executions'], series: 'verdict', range: RANGE });
-  expect(drawn.verifiers.input).toMatchObject({ series: 'verifier' });
+  // Facets and both charts read that same population and WHERE in one aggregate; Verifiers are ranked by the server.
+  const column = (name: string, data_type = 'Utf8') => ({ name, data_type, nullable: true });
+  const discovered = recording(() => ({
+    ok: true,
+    value: {
+      columns: [column('facet', 'Int64'), column('f0'), column('f1'), column('f2'), column('at', 'Timestamp(ns, "+00:00")'), column('verdict'), column('verifier'), column('place', 'UInt64'), column('verifiers', 'UInt64'), column('n', 'Int64')],
+      rows: [
+        [0, 'completed', null, null, null, null, null, null, null, 4],
+        [1, null, null, null, null, null, null, null, null, 4],
+        [2, null, null, 'v1', null, null, null, null, null, 3],
+        [3, null, null, null, 'T1', 'no verdict', null, null, null, 4],
+        [4, null, null, null, 'T1', null, 'v1', 1, 5, 3],
+        [4, null, null, null, 'T1', null, 'v2', 2, 5, 1],
+        [4, null, null, null, 'T1', null, 'v3', 3, 5, 1],
+        [4, null, null, null, 'T1', null, null, null, 5, 2]
+      ],
+      terminal: { outcome: 'success', row_count: 8, warnings: [] }
+    } as never
+  }));
+  const drawn = await loadExecutionDiscovery({ signal: 'executions', facets: ['status', 'verdict', 'verifier_card_uid'], where }, { executor: discovered.executor, range: RANGE });
+  expect(discovered.calls).toHaveLength(1);
+  const combined = sql(discovered.calls[0]);
+  expect(combined).toContain(population.replace(/\$3/g, '$4'));
+  expect(combined).toContain('GROUP BY GROUPING SETS ((status), (verdict), (verifier_card_uid), (at, verdict_series), (at, verifier))');
+  // No verdict is its own neutral series, never a verdict; the Verifier chart keys each of its three largest Verifiers by UID and counts the rest together.
+  expect(combined).toContain("coalesce(verdict, 'no verdict') AS verdict_series");
+  expect(combined).toContain('dense_rank() OVER (PARTITION BY facet ORDER BY total DESC, verifier) AS place');
+  expect(combined).toContain(`CASE WHEN facet = 4 AND place <= ${NAMED_VERIFIERS} THEN verifier END AS verifier`);
+  expect((discovered.calls[0] as Extract<WireRequest, { op: 'bifrost.query' }>).params).toEqual([RANGE.from, RANGE.to, '15 minutes', 'completed']);
+  expect(drawn.facets.result).toMatchObject({
+    state: 'populated',
+    data: { facets: [{ column: 'status', values: { rows: [['completed', 4]] } }, { column: 'verdict', values: { rows: [[null, 4]] } }, { column: 'verifier_card_uid', values: { rows: [['v1', 3]] } }] }
+  });
+  expect(drawn.charts.verdicts.input).toMatchObject({ type: 'timeseries', x: 'at', y: ['executions'], series: 'verdict', range: RANGE });
+  expect(drawn.charts.verdicts.result).toMatchObject({ state: 'populated', data: { rows: [['T1', 'no verdict', 4]] } });
+  expect(drawn.charts.verifiers.input).toMatchObject({ series: 'verifier' });
+  // Each chart keeps its own portable SQL for a Chart panel or Query; the dashboard records the one read it executed.
+  expect(drawn.charts.verdicts.input.sql).toContain("coalesce(verdict, 'no verdict') AS verdict, count(*) AS executions");
+  expect(drawn.charts.verifiers.input.sql).toContain('verifier_card_uid AS verifier, count(*) AS executions');
+  expect(drawn.charts.verdicts.executed?.sql).toBe(combined);
+  expect(drawn.charts.verifiers.result).toMatchObject({ state: 'populated', data: { rows: [['T1', 'v1', 3], ['T1', 'v2', 1], ['T1', 'v3', 1], ['T1', null, 2]] } });
+  expect(drawn.charts.verifierSeries).toEqual({ top: ['v1', 'v2', 'v3'], more: 2 });
 
   // A page cursor compares the recorded instant as a timestamp; a predicate is refused, because no table validates it.
   expect(listQuery({ signal: 'executions', after: ['2026-10-20T01:00:00Z', 'e1'] }, RANGE).sql).toContain(
@@ -781,7 +824,7 @@ test('the Verify dashboard reads one population and keeps its investigation in t
   // Bounded shared reads only: every query is one batch read of the executions population, and no row is hydrated.
   expect(new Set(requests.map((request) => request.op))).toEqual(new Set(['bifrost.query', 'cards.list']));
   expect(requests.filter((request) => request.op === 'cards.list')).toEqual([{ op: 'cards.list', kind: 'Verifier', limit: 200 }]);
-  expect(queries()).toHaveLength(10);
+  expect(queries()).toHaveLength(2);
   expect(queries().every((query) => query.sql.includes(') AS executions WHERE recorded_at >= $1::timestamptz AND recorded_at < $2::timestamptz'))).toBe(true);
   expect(new Set(queries().map((query) => JSON.stringify(query.params?.slice(0, 2)))).size).toBe(1);
 
@@ -818,7 +861,7 @@ test('the Verify dashboard reads one population and keeps its investigation in t
   const filtered = await open(search({ where, from: '2026-10-20T10:00:00.000Z', to: '2026-10-20T12:00:00.000Z', group: 'service_name' }));
   await waitFor(() => expect(filtered.getByRole('region', { name: 'executions rows' })).toBeInTheDocument());
   expect(filtered.getByLabelText('WHERE: read-only projection of the active filters')).toHaveTextContent(`status = 'completed' AND verdict = 'failed'`);
-  expect(queries()).toHaveLength(10);
+  expect(queries()).toHaveLength(2);
   expect(queries().every((query) => query.sql.includes('status = $') && query.sql.includes('verdict = $') && query.params?.includes('completed') && query.params?.includes('failed'))).toBe(true);
   expect(queries().every((query) => query.params?.[0] === '2026-10-20T10:00:00.000Z' && query.params?.[1] === '2026-10-20T12:00:00.000Z')).toBe(true);
   // Reset zoom returns to the preset; Clear drops the filters; both keep the grouping.
@@ -849,7 +892,7 @@ test('the Verify dashboard reads one population and keeps its investigation in t
   await waitFor(() => expect(denied.container).toHaveTextContent('WYRD_AUTH_403_FORBIDDEN'));
   expect(denied.container).not.toHaveTextContent('No execution matches');
   // The refusals end the load: the one batch of independent reads, and nothing after it.
-  expect(requests).toHaveLength(11);
+  expect(requests).toHaveLength(3);
   denied.unmount();
   // A malformed range or an unknown filter column issues no read.
   for (const bad of ['?from=yesterday&to=today', search({ where: [{ column: 'secret', value: 1 }] })]) {
@@ -870,6 +913,54 @@ import UndeclaredPage from '../routes/t/[tenantKey]/repositories/github/[reposit
 import { load as loadGithub } from '../routes/t/[tenantKey]/settings/integrations/github/+page.server';
 import GithubPage from '../routes/t/[tenantKey]/settings/integrations/github/+page.svelte';
 import { connectionExecutor } from '$lib/ui-fixtures';
+
+test('a client refresh returns its list while supporting reads are still pending', async () => {
+  // Facets, overview, discovery and Card names wait until released; the list answers at once.
+  let release = () => {};
+  const held = new Promise<void>((resolve) => (release = resolve));
+  const supporting = (request: WireRequest) => request.op === 'cards.list' || (request.op === 'bifrost.query' && /GROUPING SETS|grouping\(at\)/.test(request.sql));
+  host.executor = { run: async (batch, signal) => (batch.some(supporting) && (await held), fixtureExecutor.run(batch, signal)) };
+  const event = (path: string, isDataRequest: boolean) => {
+    const url = new URL(`http://ui.test/t/acme/${path}`);
+    return { locals: { browserSession: { client: () => ({}) } }, url, request: new Request(url), depends: () => {}, isDataRequest } as never;
+  };
+  const settled = (promise: Promise<unknown>) => Promise.race([promise.then(() => 'returned'), new Promise((resolve) => setTimeout(() => resolve('waiting'), 50))]);
+  type Streamed = { list: { result: { state: string } }; support: Promise<{ facets: { result: { state: string } } }> };
+
+  const verify = Promise.resolve(loadVerify(event('verify', true)));
+  const observe = Promise.resolve(loadObserve(event('observe', true)));
+  expect([await settled(verify), await settled(observe)]).toEqual(['returned', 'returned']);
+  const lists = [((await verify) as unknown as { verify: Streamed }).verify, ((await observe) as unknown as { observe: Streamed }).observe];
+  expect(lists.map((loaded) => loaded.list.result.state)).toEqual(['populated', 'populated']);
+
+  // The first HTML still waits for every section, so it carries them all.
+  const first = Promise.resolve(loadVerify(event('verify', false)));
+  expect(await settled(first)).toBe('waiting');
+  release();
+  expect(((await first) as unknown as { verify: { support: { facets: { result: { state: string } } } } }).verify.support.facets.result.state).toBe('populated');
+  for (const loaded of lists) expect((await loaded.support).facets.result.state).toBe('populated');
+});
+
+test('Live refreshes the dashboard one load at a time', async () => {
+  host.executor = fixtureExecutor;
+  const url = new URL('http://ui.test/t/acme/verify?live=1');
+  const data = await loadVerify({ locals: { browserSession: { client: () => ({}) } }, url, request: new Request(url), depends: () => {}, isDataRequest: false } as never);
+  // A refresh that has not finished holds back the next tick.
+  let finish = () => {};
+  vi.mocked(invalidate).mockReset().mockImplementation(() => new Promise<void>((resolve) => (finish = resolve)));
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+  try {
+    render(VerifyPage, { data: { ...data, tenant: { key: 'acme', name: 'Acme' } } } as never);
+    await vi.advanceTimersByTimeAsync(35_000);
+    expect(invalidate).toHaveBeenCalledTimes(1);
+    expect(invalidate).toHaveBeenCalledWith('wyrd:verify');
+    finish();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(invalidate).toHaveBeenCalledTimes(2);
+  } finally {
+    vi.useRealTimers();
+  }
+});
 
 test('the Repositories workspace keeps its index state, opens exact versions and leads to the connection', async () => {
   const requests: WireRequest[] = [];

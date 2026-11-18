@@ -12,6 +12,7 @@
   import { MAX_GROUP_KEYS, METRIC_AGGREGATIONS, METRIC_GROUP_KEYS, METRIC_NAMES, SIGNALS, columnLabel, validateIntent, type ComponentName } from 'wyrd-ai-ui/loaders';
   import TimePicker, { type PickedRange, type Zone } from '$lib/TimePicker.svelte';
   import { PRESETS, appliedRange, closed, groupColumns, moved, readState, selectedMetric, step, writeState, zoomed, type HostFilter, type ObserveState } from '$lib/observe-host';
+  import { Streamed } from '$lib/streamed.svelte';
   import type { LayoutProps } from './$types';
 
   let { data, children }: LayoutProps = $props();
@@ -29,6 +30,11 @@
   const current = $derived(readState(page.url.searchParams));
   const observe = $derived(data.observe);
   const view = $derived('problem' in observe ? undefined : observe);
+  /** Overview, timeline, facets and metric names: in the first HTML, then streamed after the list on each navigation and refresh. */
+  type Support = Awaited<NonNullable<typeof view>['support']>;
+  const streamed = new Streamed<Support>();
+  $effect.pre(() => streamed.follow(view?.support));
+  const support = $derived(!view || view.support instanceof Promise ? streamed.value : view.support);
   const form = $derived(page.form as { draft?: string; problem?: Problem } | null);
 
   /** The URL of `next`, on its first page when it reads another list. */
@@ -64,10 +70,14 @@
     };
   }
 
+  // Live waits for each refresh before timing the next, so slow refreshes never pile up.
   $effect(() => {
     if (!current.live) return;
-    const timer = setInterval(() => invalidate('wyrd:observe'), LIVE_MS);
-    return () => clearInterval(timer);
+    let timer: ReturnType<typeof setTimeout>;
+    let stopped = false;
+    const tick = () => (timer = setTimeout(() => void invalidate('wyrd:observe').finally(() => stopped || tick()), LIVE_MS));
+    tick();
+    return () => ((stopped = true), clearTimeout(timer));
   });
 
   /** Zoom the applied range around its centre by `factor`: ½ zooms in, 2 out. */
@@ -102,7 +112,7 @@
   /** The list bar's slot for the trace list's Wrap, Columns and CSV. */
   let listTools = $state<HTMLElement>();
   const totals = $derived.by(() => {
-    const read = view?.overview?.totals;
+    const read = support?.overview?.totals;
     if (read?.state !== 'populated' || !data.range) return undefined;
     const row = read.data.rows[0];
     const at = (name: string) => Number(row[read.data.columns.findIndex((column) => column.name === name)] ?? 0);
@@ -122,8 +132,8 @@
   const metric = $derived(current.signal === 'metrics' ? selectedMetric(current) : undefined);
   let find = $state('');
   /** The names the server found for `find`; absent while the search is blank, so the view's own read shows. */
-  let searched = $state<{ for: string; read: NonNullable<typeof view>['metrics'] }>();
-  const names = $derived(find.trim() && searched?.for === find.trim() ? searched.read : view?.metrics);
+  let searched = $state<{ for: string; read: NonNullable<Support>['metrics'] }>();
+  const names = $derived(find.trim() && searched?.for === find.trim() ? searched.read : support?.metrics);
   const metricRows = $derived.by(() => {
     if (names?.state !== 'populated') return [];
     return names.data.rows.slice(0, METRIC_NAMES).map(([name, type, unit]) => ({ name: String(name), type: String(type ?? ''), unit: unit ? String(unit) : '' }));
@@ -151,7 +161,7 @@
   });
   const metricRow = $derived(metricRows.find((row) => row.name === metric));
   const facetValues = (column: string): readonly unknown[] => {
-    const read = view?.facets.result;
+    const read = support?.facets.result;
     if (read?.state !== 'populated') return [];
     return read.data.facets.find((facet) => facet.column === column)?.values.rows.map(([value]) => value) ?? [];
   };
@@ -162,6 +172,20 @@
   /** The reader's visible series, per metric view and histogram plot; absent shows the Chart's default. */
   let picks = $state<Record<string, ReadonlySet<string>>>({});
   const seriesKey = $derived(view?.series ? JSON.stringify(view.series.input) : '');
+  /** The selected metric's group keys, read once per metric view when the reader first opens the picker. */
+  let offered = $state<{ for: string; keys: readonly string[] }>();
+  const offerKeys = async () => {
+    const at = seriesKey;
+    if (!data.range || !at || offered?.for === at) return;
+    const params = new URLSearchParams(page.url.searchParams);
+    params.set('from', data.range.from);
+    params.set('to', data.range.to);
+    params.set('keys', '');
+    offered = { for: at, keys: METRIC_GROUP_KEYS };
+    const response = await fetch(`${base}/observe/metrics?${params}`).catch(() => undefined);
+    const keys = response?.ok ? await response.json().catch(() => undefined) : undefined;
+    if (Array.isArray(keys) && offered?.for === at) offered = { for: at, keys };
+  };
   /** `n` `noun`s in words: "1 trace", "2 traces". */
   const plural = (n: number, noun: string) => `${fmtNumber(n)} ${noun}${n === 1 ? '' : 's'}`;
 </script>
@@ -234,8 +258,8 @@
   {#if 'problem' in observe}
     <EmptyState state="error" problem={observe.problem} />
   {:else if current.signal === 'traces'}
-    {#if observe.overview}
-      {@const overview = observe.overview}
+    {#if support?.overview}
+      {@const overview = support.overview}
       <section class="panel overview" aria-label="Overview" data-panel="overview">
         <header>
           <p class="h">Drag across any chart to zoom all three</p>
@@ -285,22 +309,22 @@
       <span class="listtools" bind:this={listTools}></span>
     </div>
     <div class="split" class:folded={!filtersOpen}>
-      {#if filtersOpen}<div id="facets" data-panel="facets"><FacetRail {...observe.facets} {actions} onaction={onaction('FacetRail')} /></div>{/if}
+      {#if filtersOpen}<div id="facets" data-panel="facets">{#if support}<FacetRail {...support.facets} {actions} onaction={onaction('FacetRail')} />{:else}<EmptyState state="loading" title="Counting the facets" />{/if}</div>{/if}
       <div data-panel="list">
         {#if observe.list}<RecordTable {...observe.list} {actions} onaction={onaction('RecordTable')} oncolumns={(columns) => go({ ...closed(current), columns })} controls={listTools} />{/if}
       </div>
     </div>
     {@render children()}
   {:else if current.signal === 'logs'}
-    {#if observe.timeline}
-      {@const timeline = observe.timeline}
+    {#if support?.timeline}
+      {@const timeline = support.timeline}
       <section class="panel overview" aria-label="Timeline" data-panel="timeline">
         <Chart {...timeline} input={{ ...timeline.input, title: `${timeline.input.title} · drag to zoom` }} compact bars colors={LEVELS} {actions} onaction={onaction('Chart')} />
       </section>
     {/if}
     <!-- The records work region: fields, records and the selected record side by side, wrapping on a narrow screen. -->
     <div class="work">
-      <div data-panel="facets"><FacetRail {...observe.facets} {actions} onaction={onaction('FacetRail')} /></div>
+      <div data-panel="facets">{#if support}<FacetRail {...support.facets} {actions} onaction={onaction('FacetRail')} />{:else}<EmptyState state="loading" title="Counting the facets" />{/if}</div>
       <div data-panel="list">
         {#if observe.list}<RecordTable {...observe.list} {actions} onaction={onaction('RecordTable')} oncolumns={(columns) => go({ ...closed(current), columns })} tools={grouping} />{/if}
       </div>
@@ -434,9 +458,9 @@
           if (key && !current.by?.includes(key)) go({ ...closed(current), by: [...(current.by ?? []), key] });
         }}
       >
-        <input name="key" list="group-keys" placeholder="attributes.http.route" aria-label="Add a group key" />
+        <input name="key" list="group-keys" placeholder="attributes.http.route" aria-label="Add a group key" onfocus={offerKeys} oninput={offerKeys} />
       </form>
-      <datalist id="group-keys">{#each view?.series?.keys ?? METRIC_GROUP_KEYS as key (key)}<option value={key}></option>{/each}</datalist>
+      <datalist id="group-keys">{#each offered?.for === seriesKey ? offered.keys : METRIC_GROUP_KEYS as key (key)}<option value={key}></option>{/each}</datalist>
     {/if}
   </span>
 {/snippet}

@@ -552,7 +552,9 @@ test('authenticated metrics investigation', async ({ server, ui }) => {
   // Captions name only the cells that differ; the service is the last of them.
   const services = (await legend.locator('th[scope="row"]').allTextContents()).map((caption) => caption.trim().split(' · ').at(-1));
   expect(services.toSorted()).toEqual(['not set', 'ui-agent', 'ui-worker', '∅']);
-  // The key list offers what the metric's series record; an attribute key splits the sum by route.
+  // The key list offers what the metric's series record, read only once the reader opens the picker; an attribute key splits the sum by route.
+  expect(await chart.locator('datalist#group-keys option[value="attributes.route"]').count()).toBe(0);
+  await keys.getByLabel('Add a group key').fill('attr');
   await expect.poll(() => chart.locator('datalist#group-keys option[value="attributes.route"]').count()).toBe(1);
   await keys.getByRole('button', { name: 'Stop grouping by service_name' }).click();
   await expect.poll(() => new URL(page.url()).searchParams.get('by')).toBeNull();

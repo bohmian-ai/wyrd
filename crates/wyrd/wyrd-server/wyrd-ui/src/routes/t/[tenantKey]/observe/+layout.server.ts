@@ -27,9 +27,12 @@ import type { LayoutServerLoad } from './$types';
  * `wyrd:observe`. The open record's params are never read here, so opening
  * one never reloads the list. The facet and list inputs pass their catalog
  * schemas first, which checks every WHERE column against the signal; a
- * malformed range or refused input issues no read.
+ * malformed range or refused input issues no read. The first HTML carries
+ * every section; on a client navigation or refresh, the list and series return
+ * as soon as they are read and the overview, timeline, facets and metric names
+ * stream as `support`.
  */
-export const load: LayoutServerLoad = async ({ locals, url, request, depends }) => {
+export const load: LayoutServerLoad = async ({ locals, url, request, depends, isDataRequest }) => {
   depends('wyrd:observe');
   const session = locals.browserSession ?? reject('unauthenticated');
   const state = closed(readState(listParams(url.searchParams)));
@@ -44,13 +47,15 @@ export const load: LayoutServerLoad = async ({ locals, url, request, depends }) 
   if ('code' in listed) return { range, observe: { problem: listed } };
   const checked = rail.input as FacetRailInput;
   const filter = { where: checked.where, where_sql: checked.where_sql };
-  const [overview, timeline, facets, list, metrics, series] = await Promise.all([
+  const support = Promise.all([
     state.signal === 'traces' ? loadTraceOverview(filter, context) : undefined,
     state.signal === 'logs' ? loadLogTimeline(filter, context) : undefined,
     loadFacetRail(checked, context),
+    state.signal === 'metrics' ? loadMetricNames(filter, context) : undefined
+  ]).then(([overview, timeline, facets, metrics]) => ({ overview, timeline, facets, metrics }));
+  const [list, series] = await Promise.all([
     state.signal !== 'metrics' || state.points ? (loadPanel('RecordTable', listed.input, context) as Promise<RecordTableProps>) : undefined,
-    state.signal === 'metrics' ? loadMetricNames(filter, context) : undefined,
     inputs.series ? loadMetric(inputs.series, context) : undefined
   ]);
-  return { range, observe: { overview, timeline, facets, list, metrics, series } };
+  return { range, observe: { list, series, support: isDataRequest ? support : await support } };
 };

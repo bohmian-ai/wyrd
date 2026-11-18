@@ -23,7 +23,7 @@ import {
   loadCardHeader,
   loadCardInventory,
   loadExecution,
-  loadExecutionCharts,
+  loadExecutionDiscovery,
   loadGithubIntegration,
   loadPromptMessages,
   loadPromptVariables,
@@ -1314,6 +1314,19 @@ judged('Verify lists executions with and without a recorded result as one author
     return loaded.result.data.facets.map((facet) => facet.values);
   };
 
+  // The Verify discovery read runs over the same population: its facets and both charts count every listed execution.
+  const discovered = await loadExecutionDiscovery({ signal: 'executions', facets: ['status', 'verdict', 'verifier_card_uid'] }, { executor: nodeExecutor(client), range });
+  const listed = await all({}, nodeExecutor(client));
+  if (discovered.facets.result.state !== 'populated') throw new Error(JSON.stringify(discovered.facets.result));
+  expect(discovered.facets.result.data.facets.map((facet) => total(facet.values))).toEqual(Array(3).fill(listed.length));
+  expect(discovered.facets.result.data.facets.map((facet) => facet.values.rows)).toEqual((await facets([], nodeExecutor(client))).map((values) => values.rows));
+  for (const chart of [discovered.charts.verdicts, discovered.charts.verifiers]) {
+    if (chart.result.state !== 'populated') throw new Error(JSON.stringify(chart.result));
+    expect(total(chart.result.data)).toBe(listed.length);
+  }
+  const verifierCount = new Set(listed.map((each) => each.verifier_card_uid)).size;
+  expect([discovered.charts.verifierSeries.top.length, discovered.charts.verifierSeries.more]).toEqual([Math.min(3, verifierCount), Math.max(0, verifierCount - 3)]);
+
   // Unfinished work: a runner claims one execution and holds it while its hosted step waits for memory. The list finds it by its
   // recorded status, with no verdict, as its own exact read says.
   const memory = server.occupyHostedMemory(64 << 20);
@@ -1364,7 +1377,7 @@ judged('Verify lists executions with and without a recorded result as one author
 
       // Facets and both charts count the same population the pages hold.
       const [statuses, verdicts, verifiers] = await facets([], executor);
-      const charts = await loadExecutionCharts({}, { executor, range });
+      const { charts } = await loadExecutionDiscovery({ signal: 'executions', facets: ['status', 'verdict', 'verifier_card_uid'] }, { executor, range });
       if (charts.verdicts.result.state !== 'populated' || charts.verifiers.result.state !== 'populated') throw new Error(`${surface}: ${JSON.stringify(charts)}`);
       expect([total(statuses), total(verdicts), total(verifiers), total(charts.verdicts.result.data), total(charts.verifiers.result.data)], surface).toEqual(Array(5).fill(rows.length));
       const count = (read: QueryResult, value: unknown) => Number(read.rows.find((each) => each[0] === value)?.[1] ?? 0);
@@ -1398,7 +1411,7 @@ judged('Verify lists executions with and without a recorded result as one author
   const outsider = { executor: nodeExecutor(WyrdClient.connect({ credential: foreignKey })), range };
   expect((await loadRecordTable({ signal: 'executions' }, outsider)).result.state).toBe('empty');
   expect((await loadFacetRail({ signal: 'executions', facets: ['status', 'verdict'] }, outsider)).result.state).toBe('empty');
-  const foreignCharts = await loadExecutionCharts({}, outsider);
+  const { charts: foreignCharts } = await loadExecutionDiscovery({ signal: 'executions', facets: ['status'] }, outsider);
   expect([foreignCharts.verdicts.result.state, foreignCharts.verifiers.result.state]).toEqual(['empty', 'empty']);
   // `verifier:read` alone opens exact executions but grants no discovery read: every panel is denied whole.
   const narrowKey = server.scopedApiKey('ui_verify_narrow', ['verifier:read']);
@@ -1411,7 +1424,7 @@ judged('Verify lists executions with and without a recorded result as one author
     }
   };
   const narrow = { executor: countingExecutor, range };
-  const refusedCharts = await loadExecutionCharts({}, narrow);
+  const { charts: refusedCharts } = await loadExecutionDiscovery({ signal: 'executions', facets: ['status'] }, narrow);
   for (const loaded of [await loadRecordTable({ signal: 'executions' }, narrow), await loadFacetRail({ signal: 'executions', facets: ['status'] }, narrow), refusedCharts.verdicts, refusedCharts.verifiers])
     expect(loaded.result).toMatchObject({ state: 'denied', problem: { code: DENIED } });
   // The list, the facets and the two charts together sent one batch each, and nothing was read after a refusal.
@@ -1439,7 +1452,7 @@ judged('Verify lists executions with and without a recorded result as one author
   expect(idsOf(answered)).toEqual(failedIds);
 
   // Each chart is a plain Chart panel over the same population: the BFF and the custom app count every execution the pages hold.
-  const charts = await loadExecutionCharts({}, { executor: nodeExecutor(client), range });
+  const { charts } = await loadExecutionDiscovery({ signal: 'executions', facets: ['status'] }, { executor: nodeExecutor(client), range });
   const everything = (await all({}, nodeExecutor(client))).length;
   for (const chart of [charts.verdicts, charts.verifiers]) {
     const chartBody = JSON.stringify({ component: 'Chart', input: chart.input, range });
@@ -1456,7 +1469,7 @@ judged('Verify lists executions with and without a recorded result as one author
     expect(await loadRecordTable({ signal: 'executions' }, { executor: narrowMcp.executor, range })).toMatchObject(refusal);
     expect((await loadRecordTable({ signal: 'executions' }, { executor: foreignMcp.executor, range })).result.state).toBe('empty');
     expect((await loadFacetRail({ signal: 'executions', facets: ['status', 'verdict'] }, { executor: foreignMcp.executor, range })).result.state).toBe('empty');
-    const foreignMcpCharts = await loadExecutionCharts({}, { executor: foreignMcp.executor, range });
+    const { charts: foreignMcpCharts } = await loadExecutionDiscovery({ signal: 'executions', facets: ['status'] }, { executor: foreignMcp.executor, range });
     expect([foreignMcpCharts.verdicts.result.state, foreignMcpCharts.verifiers.result.state]).toEqual(['empty', 'empty']);
   } finally {
     await narrowMcp.close();

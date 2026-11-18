@@ -12,6 +12,7 @@
   import { Chart, EmptyState, FacetRail, RecordTable, type ActionIntent, type ActionState } from 'wyrd-ai-ui';
   import { NO_VERDICT, validateIntent, type ChartProps, type ComponentName } from 'wyrd-ai-ui/loaders';
   import TimePicker, { type PickedRange, type Zone } from '$lib/TimePicker.svelte';
+  import { Streamed } from '$lib/streamed.svelte';
   import { PRESETS, appliedRange, moved, writeState, zoomed, type ObserveState } from '$lib/observe-host';
   import { VERIFY_GROUPS, VERIFY_MOST, VERIFY_PAGE, verifyStep, whereText } from '$lib/verify-host';
   import type { PageProps } from './$types';
@@ -27,6 +28,12 @@
   const base = $derived(`/t/${encodeURIComponent(data.tenant.key)}`);
   const current = $derived(data.state);
   const verify = $derived(data.verify);
+  /** Facets, charts and Verifier names: in the first HTML, then streamed after the list on each navigation and refresh. */
+  type Support = Awaited<Extract<typeof data.verify, { support: unknown }>['support']>;
+  const streamed = new Streamed<Support>();
+  $effect.pre(() => streamed.follow('problem' in verify ? undefined : verify.support));
+  const support = $derived('problem' in verify || verify.support instanceof Promise ? streamed.value : verify.support);
+  const labels = $derived(support?.labels ?? {});
   const where = $derived(whereText(current));
 
   /** The URL of `next`, on its first page when it reads another list. */
@@ -54,10 +61,14 @@
     };
   }
 
+  // Live waits for each refresh before timing the next, so slow refreshes never pile up.
   $effect(() => {
     if (!current.live) return;
-    const timer = setInterval(() => invalidate('wyrd:verify'), LIVE_MS);
-    return () => clearInterval(timer);
+    let timer: ReturnType<typeof setTimeout>;
+    let stopped = false;
+    const tick = () => (timer = setTimeout(() => void invalidate('wyrd:verify').finally(() => stopped || tick()), LIVE_MS));
+    tick();
+    return () => ((stopped = true), clearTimeout(timer));
   });
 
   /** Zoom the applied range around its centre by `factor`: ½ zooms in, 2 out. */
@@ -74,15 +85,15 @@
   const GROUP_NAMES = { run_id: 'run', subject_name: 'Card', service_name: 'Service', group_id: 'session' } as const;
   /** The exact Verifier definition a Verifier facet value names, when the host could name it. */
   function definition(column: string, value: unknown) {
-    const [name, version] = (column === 'verifier_card_uid' && !('problem' in verify) && verify.labels[String(value)]?.split('@')) || [];
+    const [name, version] = (column === 'verifier_card_uid' && labels[String(value)]?.split('@')) || [];
     if (!name || !version) return undefined;
     return { href: `${base}/cards/detail?${new URLSearchParams({ kind: 'Verifier', name, version })}`, label: `Open Verifier ${name}@${version}` };
   }
   const zoomedIn = $derived(current.from !== undefined);
   /** Executions under the applied filters and range: the status facet counts every one, in fewer values than a facet reads. */
   const total = $derived.by(() => {
-    if ('problem' in verify || !('data' in verify.facets.result)) return undefined;
-    const statuses = verify.facets.result.data.facets.find((facet) => facet.column === 'status');
+    if (!support || !('data' in support.facets.result)) return undefined;
+    const statuses = support.facets.result.data.facets.find((facet) => facet.column === 'status');
     return statuses?.values.rows.reduce((sum, row) => sum + Number(row[1]), 0);
   });
   /** The list's footer: how many of the counted executions it shows, and the next rows when one read can hold them. */
@@ -133,8 +144,12 @@
         {/if}
       </header>
       <div class="pair">
-        <Chart {...verify.charts.verdicts} compact bars colors={VERDICTS} headline={counted(verify.charts.verdicts)} {actions} onaction={onaction('Chart')} />
-        <Chart {...verify.charts.verifiers} compact bars colors={key(verify.charts.verifierSeries)} headline={counted(verify.charts.verifiers)} {actions} onaction={onaction('Chart')} />
+        {#if support}
+          <Chart {...support.charts.verdicts} compact bars colors={VERDICTS} headline={counted(support.charts.verdicts)} {actions} onaction={onaction('Chart')} />
+          <Chart {...support.charts.verifiers} compact bars colors={key(support.charts.verifierSeries)} headline={counted(support.charts.verifiers)} {actions} onaction={onaction('Chart')} />
+        {:else}
+          <EmptyState state="loading" title="Reading the timelines" />
+        {/if}
       </div>
     </section>
     <div class="listbar">
@@ -147,8 +162,10 @@
       {#if total !== undefined}<span class="total">{total.toLocaleString('en-US')} executions</span>{/if}
     </div>
     <div class="split">
-      <div data-panel="facets"><FacetRail {...verify.facets} labels={verify.labels} link={definition} {actions} onaction={onaction('FacetRail')} /></div>
-      <div data-panel="list"><RecordTable {...verify.list} labels={verify.labels} {more} {actions} onaction={onaction('RecordTable')} /></div>
+      <div data-panel="facets">
+        {#if support}<FacetRail {...support.facets} {labels} link={definition} {actions} onaction={onaction('FacetRail')} />{:else}<EmptyState state="loading" title="Counting the facets" />{/if}
+      </div>
+      <div data-panel="list"><RecordTable {...verify.list} {labels} {more} {actions} onaction={onaction('RecordTable')} /></div>
     </div>
   {/if}
 </div>

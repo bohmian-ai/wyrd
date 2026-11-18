@@ -194,14 +194,14 @@ behavior keeps its existing proof; no manufactured RED is required for it.
      `benchmarks/history/bifrost/ui-sql/20261118T215633Z-56b8d7443.json`,
      `benchmarks/history/bifrost/ui-sql-10x/20261118T220239Z-56b8d7443.json`,
      `benchmarks/history/bifrost/ui-sql-learned/20261118T220520Z-56b8d7443.json`.
-     Default, requests/s (c1 / c8): memtable 74.9 / 301.8, staged 79.8 / 339.8, published
-     88.5 / 417.9; metrics page p50 at c8: 56 / 37 / 34 ms. At 10×: memtable 48.0 / 195.1,
-     published 71.3 / 307.7. Learned layout is within noise of canonical. Hot memtable reads
-     are the slowest residence, and the gap widens with volume.
-   - Per-page p95 is inconclusive at c1 (about 95 to 112 page samples per 5 s repetition,
-     under the 200 floor) and per-page p99 everywhere; c8 page p95 is conclusive (386 to 533).
-     The step-level `client_p99_ms` is reported from 380 to 2,104 samples per repetition;
-     that existing step reading applies no sample floor.
+     From `capacity report` of the default record, c8 steps: memtable 301.805 requests/s,
+     109.269 queries/cpu-s, server p95 (43.844, 43.876] ms; staged 339.771, 110.851,
+     (29.655, 29.671]; published 417.874, 138.25, (27.197, 27.214]. The report also states
+     `scanned_bytes_per_query` and `scanned_rows_per_query` as "an answered query has no
+     executed-plan scanned bytes/rows" in every step: the scan facts scenario 3 names are
+     absent, which the plan does not judge.
+   - Per-page p95 is reported inconclusive at c1 (95 samples per 5 s repetition in
+     `memtable-ui-c1`, under the 200-sample floor) and per-page p99 everywhere.
    - Plan (review revision): default L1 `ui-sql` is six steps, `{memtable,staged,published}-ui-c{1,8}`,
      at the standard 5 s warmup, 3 × 5 s and 300 s budget. Each client cycles traces,
      verification, logs and metrics pages in a fixed order from its own offset, keeping each

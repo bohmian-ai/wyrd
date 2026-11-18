@@ -956,7 +956,7 @@ async fn jev_registration_refuses_policies_no_local_graph_can_check() {
 
 /// A malformed native answer is a check error, never a judgment: a missing
 /// selected answer, an answer of another form, an undeclared Choice label and
-/// an out-of-range Noul or Score each make only the requirement reading it
+/// an out-of-range Noul, Score or Score confidence each make only the requirement reading it
 /// inconclusive with the reason, with one Jev call per check and no retry.
 ///
 /// # Panics
@@ -1021,6 +1021,16 @@ async fn jev_malformed_answers_are_check_errors() {
                 ),
             ),
             "the answer to question 'compliance' has a score outside its levels 0 to 2",
+        ),
+        (
+            "SCORE-CONFIDENCE",
+            "compliant",
+            corrupt(
+                "compliance",
+                Some(json!({"type": "score", "score": 2, "confidence": 1.5,
+                            "legend": {"0": "Low", "1": "Medium", "2": "High"}})),
+            ),
+            "the answer to question 'compliance' has a confidence or probability outside 0..1",
         ),
     ];
     for (marker, _, answers, _) in &cases {

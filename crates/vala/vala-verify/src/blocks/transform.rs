@@ -53,7 +53,8 @@ impl<'a> VerdictTransformer<'a> {
     /// Returns [`BlockError::Terminal`] for a response of another protocol
     /// than the request, a missing selected answer, an answer of another
     /// form than its question, an undeclared Choice label, a non-finite
-    /// number, a Noul outside `0..1`, or a Score outside `0..N-1`.
+    /// number, a Noul outside `0..1`, a Score outside `0..N-1`, or a
+    /// present confidence or probability outside `0..1`.
     pub fn apply(&self, response: &ProviderResponse) -> Result<(Verdict, Value), BlockError> {
         let (ProviderRequest::JevSystemOne(request), ProviderResponse::JevSystemOne(response)) =
             (self.request, response)
@@ -110,8 +111,25 @@ impl<'a> VerdictTransformer<'a> {
             (
                 VerdictTransform::Score(policy),
                 JevQuestion::Score { criteria, .. },
-                JevAnswer::Score { score, .. },
-            ) => grade(policy, key, *score, criteria.len())?,
+                JevAnswer::Score {
+                    score,
+                    confidence,
+                    probabilities,
+                    ..
+                },
+            ) => {
+                if !confidence.is_none_or(unit)
+                    || !probabilities
+                        .iter()
+                        .flat_map(|p| p.values())
+                        .all(|p| unit(*p))
+                {
+                    return Err(unusable(format!(
+                        "the answer to question '{key}' has a confidence or probability outside 0..1"
+                    )));
+                }
+                grade(policy, key, *score, criteria.len())?
+            }
             _ => {
                 return Err(unusable(format!(
                     "the answer to question '{key}' is not the {} answer its policy reads",
@@ -454,6 +472,63 @@ mod tests {
             ),
             VerificationVerdict::Passed
         );
+    }
+
+    /// A Score answer's optional confidence and probabilities never change its
+    /// comparison when absent or within `0..1`; a present value outside
+    /// `0..1` or non-finite makes the answer a check error.
+    ///
+    /// # Panics
+    /// Panics when valid metadata changes the outcome or invalid metadata
+    /// yields a verdict.
+    #[test]
+    fn score_metadata_must_lie_in_the_unit_interval() {
+        let at_least_two = VerdictTransform::Score(ScoreTransform {
+            question: "compliance".into(),
+            operator: ComparisonOperator::GreaterThanOrEquals,
+            expected: 2.0,
+        });
+        let score = |confidence: Option<f64>, probabilities: Option<BTreeMap<String, f64>>| {
+            let request = request();
+            let response = ProviderResponse::JevSystemOne(JevResponse {
+                model: "jev-1".into(),
+                answers: BTreeMap::from([(
+                    "compliance".into(),
+                    JevAnswer::Score {
+                        score: 2.0,
+                        legend: BTreeMap::from([("2".into(), "high".into())]),
+                        confidence,
+                        probabilities,
+                    },
+                )]),
+                usage: None,
+            });
+            VerdictTransformer::new(&at_least_two, &request).apply(&response)
+        };
+        let levels = |p: f64| Some(BTreeMap::from([("2".to_owned(), p)]));
+        for (confidence, probabilities) in
+            [(None, None), (Some(0.05), None), (Some(1.0), levels(0.0))]
+        {
+            assert_eq!(
+                score(confidence, probabilities).expect("usable").0.outcome,
+                VerificationVerdict::Passed
+            );
+        }
+        for (confidence, probabilities) in [
+            (Some(1.5), None),
+            (Some(-0.1), None),
+            (Some(f64::NAN), None),
+            (None, levels(1.5)),
+            (Some(0.9), levels(f64::INFINITY)),
+        ] {
+            let Err(BlockError::Terminal { reason }) = score(confidence, probabilities) else {
+                panic!("{confidence:?} must be a check error");
+            };
+            assert_eq!(
+                reason,
+                "the answer to question 'compliance' has a confidence or probability outside 0..1"
+            );
+        }
     }
 
     /// Missing answers, wrong tags, undeclared or unmapped labels, and

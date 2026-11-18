@@ -7,6 +7,7 @@
 //! before any window.
 
 pub mod answer;
+pub mod fixture;
 
 use serde::Deserialize;
 use serde_json::Value;

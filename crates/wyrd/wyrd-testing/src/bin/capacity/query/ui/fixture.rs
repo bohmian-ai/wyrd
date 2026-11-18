@@ -12,6 +12,8 @@
 
 use std::collections::BTreeMap;
 
+use num_traits::ToPrimitive;
+
 use wyrd_tonic::otlp::common::v1::any_value::Value;
 use wyrd_tonic::otlp::common::v1::{AnyValue, InstrumentationScope, KeyValue, KeyValueList};
 use wyrd_tonic::otlp::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
@@ -88,13 +90,6 @@ impl Journey {
         routes: 3,
     };
 
-    /// Ten times the default journey: 5,000 requests and ten times the
-    /// metric series.
-    pub const TENFOLD: Self = Self {
-        requests: 5_000,
-        routes: 30,
-    };
-
     /// Start time of request `r`: pairs of requests share one of
     /// `requests / 2` slots spread evenly over the hour.
     #[must_use]
@@ -142,9 +137,9 @@ pub fn span_id(r: i64, k: i64) -> [u8; 8] {
 #[must_use]
 pub fn service(r: i64, k: i64) -> &'static str {
     if k == 0 {
-        ROOT_SERVICES[(r % 3) as usize]
+        pick(&ROOT_SERVICES, r)
     } else {
-        CHILD_SERVICES[((r + k) % 4) as usize]
+        pick(&CHILD_SERVICES, r + k)
     }
 }
 
@@ -152,7 +147,7 @@ pub fn service(r: i64, k: i64) -> &'static str {
 #[must_use]
 pub fn span_name(r: i64, k: i64) -> String {
     match k {
-        0 => format!("GET /api/{}", ROOT_SERVICES[(r % 3) as usize]),
+        0 => format!("GET /api/{}", pick(&ROOT_SERVICES, r)),
         1 => "chat claude-opus-5".to_owned(),
         2 => "execute_tool search".to_owned(),
         _ => "SELECT orders".to_owned(),
@@ -215,7 +210,11 @@ pub const fn operation(k: i64) -> Option<&'static str> {
 /// Severity number and text of request `r`'s completion log.
 #[must_use]
 pub const fn severity(r: i64) -> (i32, &'static str) {
-    if r % 5 == 0 { (13, "WARN") } else { (9, "INFO") }
+    if r % 5 == 0 {
+        (13, "WARN")
+    } else {
+        (9, "INFO")
+    }
 }
 
 /// Whether request `r` also logs an error.
@@ -227,13 +226,21 @@ pub const fn logs_error(r: i64) -> bool {
 /// The exception type of request `r`'s error log.
 #[must_use]
 pub const fn exception(r: i64) -> &'static str {
-    if r % 2 == 0 { "TimeoutError" } else { "ValueError" }
+    if r % 2 == 0 {
+        "TimeoutError"
+    } else {
+        "ValueError"
+    }
 }
 
 /// The `event_name` of request `r`'s completion log, on every third.
 #[must_use]
 pub const fn event_name(r: i64) -> Option<&'static str> {
-    if r % 3 == 0 { Some("request.completed") } else { None }
+    if r % 3 == 0 {
+        Some("request.completed")
+    } else {
+        None
+    }
 }
 
 /// Whether request `r`'s logs carry its trace correlation: all but every
@@ -275,13 +282,19 @@ impl Journey {
         let mut by_service: BTreeMap<&'static str, Vec<Span>> = BTreeMap::new();
         for r in self.batch(b) {
             for k in 0..2 {
-                by_service.entry(service(r, k)).or_default().push(self.span(r, k));
+                by_service
+                    .entry(service(r, k))
+                    .or_default()
+                    .push(self.span(r, k));
             }
         }
         if b > 0 {
             for r in self.batch(b - 1) {
                 for k in 2..spans(r) {
-                    by_service.entry(service(r, k)).or_default().push(self.span(r, k));
+                    by_service
+                        .entry(service(r, k))
+                        .or_default()
+                        .push(self.span(r, k));
                 }
             }
         }
@@ -305,7 +318,7 @@ impl Journey {
     fn span(self, r: i64, k: i64) -> Span {
         let start = span_start(self, r, k);
         let mut attributes = vec![
-            text("route", format!("/api/{}", ROOT_SERVICES[(r % 3) as usize])),
+            text("route", format!("/api/{}", pick(&ROOT_SERVICES, r))),
             attribute(
                 "customer",
                 Value::KvlistValue(KeyValueList {
@@ -317,7 +330,10 @@ impl Journey {
             ),
         ];
         if let Some(code) = http_status(r, k) {
-            attributes.push(attribute("http.response.status_code", Value::IntValue(code)));
+            attributes.push(attribute(
+                "http.response.status_code",
+                Value::IntValue(code),
+            ));
         }
         if let Some(operation) = operation(k) {
             attributes.push(text("gen_ai.operation.name", operation));
@@ -328,7 +344,7 @@ impl Journey {
             parent_span_id: if k == 0 {
                 Vec::new()
             } else {
-                span_id(r, if k <= 2 { 0 } else { 1 }).to_vec()
+                span_id(r, i64::from(k > 2)).to_vec()
             },
             name: span_name(r, k),
             kind: if k == 0 { 2 } else { 3 },
@@ -381,7 +397,7 @@ impl Journey {
     /// Log `l` of request `r`.
     fn log(self, r: i64, l: i64, number: i32, severity: &str, failed: Option<&str>) -> LogRecord {
         let time = log_time(self, r, l);
-        let mut attributes = vec![text("route", format!("/api/{}", ROOT_SERVICES[(r % 3) as usize]))];
+        let mut attributes = vec![text("route", format!("/api/{}", pick(&ROOT_SERVICES, r)))];
         if let Some(exception) = failed {
             attributes.push(text("exception.type", exception));
         }
@@ -420,7 +436,9 @@ impl Journey {
         (0..self.requests)
             .filter(|r| q.is_none_or(|q| self.route(*r) == q))
             .filter(|r| (after + 1..=until).contains(&self.start(*r)))
-            .count() as i64
+            .count()
+            .to_i64()
+            .unwrap_or(i64::MAX)
     }
 
     /// Root durations, milliseconds, of route `q`'s requests started in
@@ -466,7 +484,12 @@ impl Journey {
                     name: METRIC.to_owned(),
                     unit: "1".to_owned(),
                     data: Some(Data::Sum(Sum {
-                        data_points: vec![number(route.clone(), start, time, Number::AsInt(counted))],
+                        data_points: vec![number(
+                            route.clone(),
+                            start,
+                            time,
+                            Number::AsInt(counted),
+                        )],
                         aggregation_temporality: AggregationTemporality::Cumulative as i32,
                         is_monotonic: true,
                     })),
@@ -476,7 +499,12 @@ impl Journey {
                     name: METRIC.to_owned(),
                     unit: "ms".to_owned(),
                     data: Some(Data::Histogram(Histogram {
-                        data_points: vec![self.histogram(route, q, start, Self::export_time(j, series + 1))],
+                        data_points: vec![self.histogram(
+                            route,
+                            q,
+                            start,
+                            Self::export_time(j, series + 1),
+                        )],
                         aggregation_temporality: AggregationTemporality::Cumulative as i32,
                     })),
                     ..Metric::default()
@@ -521,7 +549,12 @@ impl Journey {
                 name: CPU_METRIC.to_owned(),
                 unit: "%".to_owned(),
                 data: Some(Data::Gauge(Gauge {
-                    data_points: vec![number(Vec::new(), 0, cpu_time, Number::AsDouble(j as f64 / 4.0))],
+                    data_points: vec![number(
+                        Vec::new(),
+                        0,
+                        cpu_time,
+                        Number::AsDouble(j as f64 / 4.0),
+                    )],
                 })),
                 ..Metric::default()
             },
@@ -540,6 +573,52 @@ impl Journey {
                 })
                 .collect(),
         }
+    }
+
+    /// OTLP export requests the whole journey sends: every span batch, then
+    /// every log batch, then every metric export.
+    #[must_use]
+    pub fn exports(self) -> i64 {
+        self.span_batches() + self.log_batches() + self.metric_batches()
+    }
+
+    /// Export `index` of [`Self::exports`].
+    #[must_use]
+    pub fn export(self, index: i64) -> Export {
+        let logs = self.span_batches();
+        let metrics = logs + self.log_batches();
+        if index < logs {
+            Export::Spans(self.spans_request(index))
+        } else if index < metrics {
+            Export::Logs(self.logs_request(index - logs))
+        } else {
+            Export::Metrics(self.metrics_request(index - metrics))
+        }
+    }
+
+    /// Spans the journey exports.
+    #[must_use]
+    pub fn span_rows(self) -> i64 {
+        (0..self.requests).map(spans).sum()
+    }
+
+    /// Log records the journey exports: one per request and one per error.
+    #[must_use]
+    pub fn log_rows(self) -> i64 {
+        self.requests
+            + (0..self.requests)
+                .filter(|r| logs_error(*r))
+                .count()
+                .to_i64()
+                .unwrap_or(i64::MAX)
+    }
+
+    /// Metric points the journey exports: per export, a counter and a
+    /// histogram per route plus the delta, the integer gauge and the CPU
+    /// gauge.
+    #[must_use]
+    pub const fn point_rows(self) -> i64 {
+        EXPORTS * (2 * self.routes + 3)
     }
 
     /// Route `q`'s cumulative histogram point since `start` at `time`.
@@ -563,6 +642,21 @@ impl Journey {
             ..HistogramDataPoint::default()
         }
     }
+}
+
+/// One OTLP export request of a journey.
+pub enum Export {
+    /// A trace service export.
+    Spans(ExportTraceServiceRequest),
+    /// A logs service export.
+    Logs(ExportLogsServiceRequest),
+    /// A metrics service export.
+    Metrics(ExportMetricsServiceRequest),
+}
+
+/// Item `n` of `items`, cycling.
+fn pick(items: &[&'static str], n: i64) -> &'static str {
+    items[usize::try_from(n.unsigned_abs()).unwrap_or(0) % items.len()]
 }
 
 /// The service exporting route `q`'s metrics.
@@ -605,6 +699,8 @@ fn scope() -> InstrumentationScope {
 
 #[cfg(test)]
 mod tests {
+    use num_traits::ToPrimitive;
+
     use super::{Journey, spans};
 
     /// Every span exports exactly once across the batches, roots pair up on
@@ -615,7 +711,13 @@ mod tests {
     /// Panics when a span is lost or duplicated, or a time leaves the hour.
     #[test]
     fn exports_cover_every_span_once_inside_the_hour() {
-        for journey in [Journey::DEFAULT, Journey::TENFOLD] {
+        for journey in [
+            Journey::DEFAULT,
+            Journey {
+                requests: 5_000,
+                routes: 30,
+            },
+        ] {
             let exported: usize = (0..journey.span_batches())
                 .map(|b| {
                     journey
@@ -628,10 +730,35 @@ mod tests {
                 })
                 .sum();
             let expected: i64 = (0..journey.requests).map(spans).sum();
-            assert_eq!(exported as i64, expected);
+            assert_eq!(exported.to_i64(), Some(expected));
             assert_eq!(journey.start(0), journey.start(1));
-            assert!(journey.start(journey.requests - 1) < super::HOUR_START_NANOS + super::HOUR_NANOS);
+            assert!(
+                journey.start(journey.requests - 1) < super::HOUR_START_NANOS + super::HOUR_NANOS
+            );
             assert_eq!(journey.started(None, i64::MIN, i64::MAX), journey.requests);
+            let (mut logs, mut points) = (0, 0);
+            for index in 0..journey.exports() {
+                match journey.export(index) {
+                    super::Export::Spans(_) => {}
+                    super::Export::Logs(request) => {
+                        logs += request
+                            .resource_logs
+                            .iter()
+                            .flat_map(|resource| &resource.scope_logs)
+                            .map(|scope| scope.log_records.len().to_i64().unwrap_or(i64::MAX))
+                            .sum::<i64>();
+                    }
+                    super::Export::Metrics(request) => {
+                        points += request
+                            .resource_metrics
+                            .iter()
+                            .flat_map(|resource| &resource.scope_metrics)
+                            .map(|scope| scope.metrics.len().to_i64().unwrap_or(i64::MAX))
+                            .sum::<i64>();
+                    }
+                }
+            }
+            assert_eq!((logs, points), (journey.log_rows(), journey.point_rows()));
         }
     }
 }

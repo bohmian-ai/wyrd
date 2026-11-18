@@ -171,8 +171,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::array::{
-        ArrayRef, Decimal128Array, Int64Array, RecordBatch, StringArray,
-        TimestampNanosecondArray,
+        ArrayRef, Decimal128Array, Int64Array, RecordBatch, StringArray, TimestampNanosecondArray,
     };
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 
@@ -193,9 +192,7 @@ mod tests {
         ]));
         let columns: Vec<ArrayRef> = vec![
             Arc::new(StringArray::from(vec!["0a", id])),
-            Arc::new(
-                TimestampNanosecondArray::from(vec![1, nanos]).with_timezone("UTC"),
-            ),
+            Arc::new(TimestampNanosecondArray::from(vec![1, nanos]).with_timezone("UTC")),
             Arc::new(
                 Decimal128Array::from(vec![5, decimal])
                     .with_precision_and_scale(38, 12)

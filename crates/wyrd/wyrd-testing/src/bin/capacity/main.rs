@@ -570,10 +570,48 @@ mod tests {
             declare(Engine::Bifrost, Level::One, &rest, host, &root)
         };
         assert_eq!(
-            query::Experiment::ALL.map(query::Experiment::name),
-            ["writes-parquet", "hot", "parquet"],
-            "a complete Bifrost L1 suite is three records"
+            query::Experiment::ALL
+                .map(query::Experiment::name)
+                .as_slice(),
+            ["writes-parquet", "hot", "parquet", "ui-sql"],
+            "a complete Bifrost L1 suite is four records"
         );
+        let ui = query::Experiment::parse("ui-sql")
+            .map(|ui| experiment(ui, &[], HOST))
+            .expect("ui-sql is an L1 experiment");
+        assert!(ui.refusals().is_empty(), "{:?}", ui.refusals());
+        for control in ["fixture", "limits", "workload", "corpus"] {
+            assert!(ui.controls.contains_key(control), "ui-sql {control}");
+        }
+        assert_eq!(
+            ui.controls["corpus"]["sha256"].as_str(),
+            Some(query::ui::corpus_digest().as_str()),
+            "a ui-sql record names the exact frozen SQL it ran"
+        );
+        let ui_steps: Vec<&str> = ui.steps.iter().map(|step| step.id.as_str()).collect();
+        for residence in ["memtable", "staged", "published"] {
+            for page in ["traces", "verification", "logs", "metrics"] {
+                for clients in [1, 8] {
+                    let id = format!("{residence}-{page}-page-c{clients}");
+                    assert!(ui_steps.contains(&id.as_str()), "{id} in {ui_steps:?}");
+                }
+            }
+            for query in [
+                "trace-list",
+                "verify-list",
+                "metrics-histogram",
+                "span-detail",
+            ] {
+                let id = format!("{residence}-{query}-c1");
+                assert!(ui_steps.contains(&id.as_str()), "{id} in {ui_steps:?}");
+            }
+        }
+        for criterion in ["no-errors", "exact-answers", "p95-samples"] {
+            assert!(
+                ui.criteria.iter().any(|judged| judged.id == criterion),
+                "ui-sql judges {criterion}"
+            );
+        }
         assert_eq!(
             query::Experiment::parse("writes-hot"),
             None,

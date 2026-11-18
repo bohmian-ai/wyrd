@@ -26,7 +26,7 @@ mod isolated;
 mod logs;
 mod run;
 mod telemetry;
-mod ui;
+pub mod ui;
 mod workload;
 
 use std::path::Path;
@@ -145,7 +145,7 @@ const PARQUET_ENV: [(&str, &str); 1] = [("WYRD_MAX_FILE_RETENTION_TIME", "30")];
 /// so rows stage and publish only when the benchmark control asks. Only the
 /// `hot` reads use them, over a fixture loaded once before any window; a
 /// write workload under them would hold every row it writes in memory.
-const HOT_ENV: [(&str, &str); 3] = [
+pub const HOT_ENV: [(&str, &str); 3] = [
     ("WYRD_MAX_FILE_SIZE_IN_MEMORY", "16384"),
     ("WYRD_MAX_FILE_SIZE_ON_DISK", "16384"),
     ("WYRD_MAX_FILE_RETENTION_TIME", "86400"),
@@ -165,11 +165,14 @@ pub enum Experiment {
     Hot,
     /// Reads after every row is published as Parquet.
     Parquet,
+    /// The original UI SQL over the deterministic journey in each
+    /// residence.
+    UiSql,
 }
 
 impl Experiment {
     /// Every experiment, in the order `l1 bifrost` runs them.
-    pub const ALL: [Self; 3] = [Self::WritesParquet, Self::Hot, Self::Parquet];
+    pub const ALL: [Self; 4] = [Self::WritesParquet, Self::Hot, Self::Parquet, Self::UiSql];
 
     /// The experiment id: its command word and record directory.
     #[must_use]
@@ -178,6 +181,7 @@ impl Experiment {
             Self::WritesParquet => "writes-parquet",
             Self::Hot => "hot",
             Self::Parquet => "parquet",
+            Self::UiSql => "ui-sql",
         }
     }
 
@@ -199,14 +203,14 @@ impl Experiment {
     const fn env(self) -> &'static [(&'static str, &'static str)] {
         match self {
             Self::WritesParquet | Self::Parquet => &PARQUET_ENV,
-            Self::Hot => &HOT_ENV,
+            Self::Hot | Self::UiSql => &HOT_ENV,
         }
     }
 
     /// The read steps: each op, what it asks, and its client counts.
     const fn reads(self) -> &'static [(&'static str, Read, &'static [u64])] {
         match self {
-            Self::WritesParquet => &[],
+            Self::WritesParquet | Self::UiSql => &[],
             Self::Hot => &HOT_READS,
             Self::Parquet => &PARQUET_READS,
         }
@@ -493,6 +497,9 @@ pub fn plan(context: &Context<'_>, base: Declaration) -> std::result::Result<Pla
         fixture.insert("smoke_rows".to_owned(), json!(scale));
     }
     let workload: Box<dyn wyrd_testing::experiment::Workload> = match experiment {
+        Some(Experiment::UiSql) => {
+            Box::new(ui::workload::Ui::new(logs, ui::fixture::Journey::DEFAULT))
+        }
         Some(experiment) => Box::new(isolated::Isolated::new(logs, experiment, scale)),
         None => Box::new(competing::Competing::new(logs, scale)),
     };
@@ -931,38 +938,30 @@ fn l1_declaration(experiment: Experiment, mut base: Declaration) -> Declaration 
     if experiment.writes() {
         base.timing.budget_seconds = WRITES_BUDGET_SECONDS;
     }
-    base.question = String::from(match experiment {
-        Experiment::WritesParquet => {
-            "Under the Parquet Scribe settings, whose windows pay for the staging and publication they cause, what does each native, OTLP spans, and OTLP logs write cost the server per CPU-second and per provisioned vCPU at 1 and 64 closed-loop clients up to its durable acknowledgement, with no error, how much publication ran and what backlog remained, and do the native and OTLP write peaks clear their sanity floors?"
-        }
-        Experiment::Hot => {
-            "With 10M events rows and 1M spans hot in the span Variant layout the server learned, half staged and half in memtables, does a memtable point lookup keep p99 strictly under 5 ms at 64 closed-loop clients with every answer exact, and what does each read cost the server per CPU-second from each source, for a shredded and a long-tail span key?"
-        }
-        Experiment::Parquet => {
-            "With 10M events rows and 1M spans published as Parquet, does a point lookup keep p99 strictly under 5 ms at 64 closed-loop clients with every answer exact, what does each read cost per CPU-second and scan per query, do the span files shred exactly the keys over the threshold, does a span-time window prune, and what does each write path store per retained byte?"
-        }
-    });
+    let limits = limits(experiment.env(), shard_override().as_deref());
+    let (question, fixture, workload) = match experiment {
+        Experiment::WritesParquet => (
+            "Under the Parquet Scribe settings, whose windows pay for the staging and publication they cause, what does each native, OTLP spans, and OTLP logs write cost the server per CPU-second and per provisioned vCPU at 1 and 64 closed-loop clients up to its durable acknowledgement, with no error, how much publication ran and what backlog remained, and do the native and OTLP write peaks clear their sanity floors?",
+            write_fixture(),
+            "closed-loop public-client clients, each sending its next request once the last is acknowledged: native `write_batch` of 16,384 rows; OTLP exports of 512 spans or log records with the client's exchanged bearer",
+        ),
+        Experiment::Hot => (
+            "With 10M events rows and 1M spans hot in the span Variant layout the server learned, half staged and half in memtables, does a memtable point lookup keep p99 strictly under 5 ms at 64 closed-loop clients with every answer exact, and what does each read cost the server per CPU-second from each source, for a shredded and a long-tail span key?",
+            hot_fixture(),
+            "closed-loop public-client clients, each sending its next query once the last answers, every answer checked exactly and bounded to one half: Bifrost SQL events point lookups and 78k-row aggregates; span `attributes ->>` filters on a shredded and a long-tail key, bounded to the half's start times",
+        ),
+        Experiment::Parquet => (
+            "With 10M events rows and 1M spans published as Parquet, does a point lookup keep p99 strictly under 5 ms at 64 closed-loop clients with every answer exact, what does each read cost per CPU-second and scan per query, do the span files shred exactly the keys over the threshold, does a span-time window prune, and what does each write path store per retained byte?",
+            read_fixture("parquet"),
+            "closed-loop public-client clients, each sending its next query once the last answers, every answer checked exactly: Bifrost SQL events point lookups, 100k-row aggregates, and full scans; span `trace_id` lookups and `attributes ->>` filters on a shredded and a long-tail key",
+        ),
+        Experiment::UiSql => return ui::declare(base, isolated_metrics(), limits),
+    };
+    question.clone_into(&mut base.question);
     base.variables.insert("clients".to_owned(), json!(PAIR));
-    base.controls.insert(
-        "fixture".to_owned(),
-        match experiment {
-            Experiment::WritesParquet => write_fixture(),
-            Experiment::Hot => hot_fixture(),
-            Experiment::Parquet => read_fixture("parquet"),
-        },
-    );
-    base.controls.insert(
-        "limits".to_owned(),
-        limits(experiment.env(), shard_override().as_deref()),
-    );
-    base.controls.insert(
-        "workload".to_owned(),
-        json!(match experiment {
-            Experiment::WritesParquet => "closed-loop public-client clients, each sending its next request once the last is acknowledged: native `write_batch` of 16,384 rows; OTLP exports of 512 spans or log records with the client's exchanged bearer",
-            Experiment::Hot => "closed-loop public-client clients, each sending its next query once the last answers, every answer checked exactly and bounded to one half: Bifrost SQL events point lookups and 78k-row aggregates; span `attributes ->>` filters on a shredded and a long-tail key, bounded to the half's start times",
-            Experiment::Parquet => "closed-loop public-client clients, each sending its next query once the last answers, every answer checked exactly: Bifrost SQL events point lookups, 100k-row aggregates, and full scans; span `trace_id` lookups and `attributes ->>` filters on a shredded and a long-tail key",
-        }),
-    );
+    base.controls.insert("fixture".to_owned(), fixture);
+    base.controls.insert("limits".to_owned(), limits);
+    base.controls.insert("workload".to_owned(), json!(workload));
     base.metrics = isolated_metrics();
     if experiment == Experiment::Parquet {
         base.metrics.extend(
@@ -1114,7 +1113,7 @@ fn windowed(experiment: Experiment, id: &str, mut params: Value) -> Step {
                 "native-write-c1" | "otlp-spans-c1" | "otlp-spans-1k-c1" | "native-write-c64"
             )
         }
-        Experiment::Hot => false,
+        Experiment::Hot | Experiment::UiSql => false,
     };
     if long {
         params[WINDOW_SECONDS] = json!(10);

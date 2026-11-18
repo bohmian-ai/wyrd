@@ -160,12 +160,21 @@ pub const fn span_start(journey: Journey, r: i64, k: i64) -> i64 {
     journey.start(r) + k * 10_000
 }
 
-/// Duration of span `k` of request `r`: a root of 1 ms to 2 s, each child a
-/// fraction of it.
+/// Duration of span `k` of request `r`: a root of 50 ms, 500 ms, or 2 s in
+/// a 12:5:3 split, each child half its root.
+///
+/// The few values form wide plateaus around every p50 and p95 rank the
+/// catalog asks, roots alone or with children, so `approx_percentile_cont`
+/// answers the plateau's value however the rows are split across memtables,
+/// staged runs, and Parquet files.
 #[must_use]
 pub const fn duration(r: i64, k: i64) -> i64 {
-    let root = 1_000_000 * (1 + (mix(r.cast_unsigned() ^ 0xd0) % 2_000).cast_signed());
-    root / (k + 1)
+    let root = match mix(r.cast_unsigned() ^ 0xd0) % 20 {
+        0..=11 => 50_000_000,
+        12..=16 => 500_000_000,
+        _ => 2_000_000_000,
+    };
+    if k == 0 { root } else { root / 2 }
 }
 
 /// The OTLP status code of span `k` of request `r`: the root fails every

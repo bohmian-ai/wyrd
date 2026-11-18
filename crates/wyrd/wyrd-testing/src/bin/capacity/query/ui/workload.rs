@@ -26,13 +26,12 @@ use super::fixture::Journey;
 use super::{CASE, Catalog, RESIDENCES, Statement, param};
 use crate::query::isolated::SUCCESS;
 use crate::query::run::{self, Admission, Outcome, Sender, WRONG_RESULT, micros};
-use crate::query::{HOT_ENV, Residence, client, platform, start};
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+use crate::query::{HOT_ENV, client, platform, start, table_files};
 
 /// Concurrent exporters loading the journey.
 const LOADERS: usize = 16;
-
-/// How long the journey may take to publish once asked.
-const SETTLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// One catalog statement with its resolved, frozen binds and its reference
 /// answer.
@@ -97,7 +96,8 @@ impl Ui {
     /// # Errors
     ///
     /// Returns a workload error for a residence earlier than the current
-    /// one, a failed control, rows left behind, or any differing answer.
+    /// one, a failed control, a stage moving fewer rows than the journey
+    /// holds, a publish of no claims, or any differing answer.
     async fn place(&mut self, residence: &'static str) -> Result<(), ExperimentError> {
         let order = |name: &str| RESIDENCES.iter().position(|known| *known == name);
         if order(residence) < order(self.placed) {
@@ -125,9 +125,14 @@ impl Ui {
                 .publish_scribe()
                 .await
                 .map_err(ExperimentError::workload)?;
-            Residence::settle(server, SETTLE_TIMEOUT)
-                .await
-                .map_err(ExperimentError::workload)?;
+            for (table, rows) in self.tables() {
+                let published = published_rows(server, table).map_err(ExperimentError::workload)?;
+                if published != rows {
+                    return Err(ExperimentError::workload(format!(
+                        "publishing left {published} of the journey's {rows} {table} rows in Parquet"
+                    )));
+                }
+            }
         }
         let sent = Instant::now();
         let mut first = None;
@@ -153,6 +158,15 @@ impl Ui {
         Ok(())
     }
 
+    /// Each table the journey writes and the rows it holds there.
+    fn tables(&self) -> [(&'static str, i64); 3] {
+        [
+            ("bifrost.traces.spans", self.journey.span_rows()),
+            ("bifrost.logs.records", self.journey.log_rows()),
+            ("bifrost.metrics.points", self.journey.point_rows()),
+        ]
+    }
+
     /// The statements one step runs: a page's family, or one query.
     fn selected(&self, step: &Step) -> Vec<Bound> {
         let page = step.text("page");
@@ -166,6 +180,25 @@ impl Ui {
             .cloned()
             .collect()
     }
+}
+
+/// The rows in `table`'s published Parquet files under `server`'s store,
+/// from each file's footer.
+///
+/// # Errors
+///
+/// Returns the first file that cannot be opened or whose footer cannot be
+/// read.
+fn published_rows(server: &LocalServer, table: &str) -> Result<i64, String> {
+    table_files(&server.storage_dir(), table)
+        .iter()
+        .try_fold(0, |rows, path| {
+            let file = std::fs::File::open(path)
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+            let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+            Ok(rows + builder.metadata().file_metadata().num_rows())
+        })
 }
 
 /// Sends one statement with `params`, reads it to its terminal, and returns
@@ -368,11 +401,7 @@ impl Workload for Ui {
             )));
         }
         let queries = Arc::new(Bifrost::query_only(&client));
-        for (table, rows) in [
-            ("bifrost.traces.spans", self.journey.span_rows()),
-            ("bifrost.logs.records", self.journey.log_rows()),
-            ("bifrost.metrics.points", self.journey.point_rows()),
-        ] {
+        for (table, rows) in self.tables() {
             let (counted, _) = ask(&queries, &format!("SELECT count(*) AS n FROM {table}"), &[])
                 .await
                 .map_err(ExperimentError::workload)?;

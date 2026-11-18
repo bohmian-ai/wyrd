@@ -94,4 +94,4 @@ A read sees only executions in the caller's own tenant. An unknown execution and
 
 ## Next
 
-[What Wyrd retains](/understand/how-verification-works/#what-wyrd-retains-and-how-requirements-change) explains which tables hold results, inputs, and outputs. [Bifrost](/understand/bifrost/) covers querying them with SQL.
+[What Wyrd retains](/understand/how-verification-works/#what-wyrd-retains-and-how-requirements-change) explains which tables hold results, inputs, and outputs. [Bifrost](/understand/bifrost/) covers querying them with SQL. [Check on a schedule](/build-and-verify/verify/monitor-drift/) has the server run a check with no call from the application.

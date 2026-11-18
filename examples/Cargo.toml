@@ -55,6 +55,14 @@ name = "support_agent"
 path = "support-agent/support_agent.rs"
 
 [[bin]]
+name = "record"
+path = "scheduled-check/record.rs"
+
+[[bin]]
+name = "results"
+path = "scheduled-check/results.rs"
+
+[[bin]]
 name = "author_in_code"
 path = "author-in-code/author.rs"
 

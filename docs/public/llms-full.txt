@@ -4311,7 +4311,369 @@ A read sees only executions in the caller's own tenant. An unknown execution and
 
 ## Next
 
-[What Wyrd retains](/wyrd/understand/how-verification-works/#what-wyrd-retains-and-how-requirements-change) explains which tables hold results, inputs, and outputs. [Bifrost](/wyrd/understand/bifrost/) covers querying them with SQL.
+[What Wyrd retains](/wyrd/understand/how-verification-works/#what-wyrd-retains-and-how-requirements-change) explains which tables hold results, inputs, and outputs. [Bifrost](/wyrd/understand/bifrost/) covers querying them with SQL. [Check on a schedule](/wyrd/build-and-verify/verify/monitor-drift/) has the server run a check with no call from the application.
+
+# Check on a schedule
+
+Page: /wyrd/build-and-verify/verify/monitor-drift/
+
+> Have the Wyrd server judge a Service's recorded samples every minute, then read which windows passed, failed, or had no evidence.
+
+Have the server check a checkout Service's latency on a schedule, with no call from your application.
+
+The application only records samples. A `schedule` Trigger tells the server when to judge them: each run judges the samples recorded since the previous one, called a window.
+
+## Before you start
+
+Finish [Set up Wyrd](/wyrd/get-started/setup/). Work in its `quickstart` directory with the server running.
+
+## 1. Declare the check
+
+Save three Cards: the `checkout` Service, the `latency-budget` Verifier it is checked by, and the `every-minute` Trigger that runs it.
+
+```yaml title="checkout/checkout.yaml"
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: checkout
+  version: 1.0.0
+spec:
+  verified_by:
+    # The server judges latency-budget on every-minute's schedule; no client call runs it.
+    - verifier: ./latency-budget.yaml
+      runs_on: ./every-minute.yaml
+
+```
+
+```yaml title="checkout/latency-budget.yaml"
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: latency-budget
+  version: 1.0.0
+spec:
+  description: Checkout requests average at most 100 ms in each window.
+  inputs:
+    # Each recorded sample is one request's latency, in milliseconds.
+    latency: {type: samples, features: [latency]}
+  requirements:
+    - id: latency-within-budget
+      statement: Mean checkout latency stays at or below 100 ms
+      check:
+        kind: drift
+        on: inputs.latency
+        method: Custom
+        signal: {kind: Metric, name: latency}
+        condition: {kind: Statistical}
+        profile: {kind: Custom, metric_name: latency, baseline_value: 0.0, alert_threshold: 100.0}
+
+```
+
+```yaml title="checkout/every-minute.yaml"
+apiVersion: wyrd/v1
+kind: Trigger
+metadata:
+  name: every-minute
+  version: 1.0.0
+spec:
+  description: At the start of every minute, UTC.
+  kind: schedule
+  cron: "* * * * *"
+
+```
+
+The check fails a window whose mean latency is above 100 ms. Declare the Cards and pull the Service, as a deployment does:
+
+```bash
+wyrd declare checkout/checkout.yaml
+wyrd pull --kind Service --name checkout --version 1.0.0 --output-dir .wyrd-bundle
+```
+
+## 2. Create the Service's account
+
+A schedule runs as the Service's own account, and only while that account has recorded for the Service in the last 24 hours. Create it:
+
+```bash
+wyrd principal credential create-principal --name checkout-runtime --role workload --workload-name checkout
+```
+
+Copy the credential it prints into an environment variable for the next step:
+
+```bash
+export CHECKOUT_KEY=<credential>
+```
+
+## 3. Write the programs
+
+`record` records five checkout requests that each took the number of milliseconds you pass. `results` prints the newest three windows the server judged.
+
+**Python**
+
+```python title="record.py"
+import sys
+
+from wyrd import WyrdState
+
+# The checkout Service, pulled at deploy time.
+state = WyrdState.from_path(".wyrd-bundle")
+state.start_bifrost()  # samples are sent to Bifrost, where the schedule reads them
+
+# Record five checkout requests that each took the given number of milliseconds.
+latency = float(sys.argv[1])
+with state.run() as run:
+    for _ in range(5):
+        run.observe.submit("latency-budget", latency=latency)
+state.shutdown()  # send the samples before the program exits
+print(f"recorded 5 requests at {latency:g} ms")
+
+```
+
+```python title="results.py"
+from wyrd.bifrost import Bifrost
+from wyrd.cards import CardRef, Cards
+
+RECENT = """
+SELECT to_char(window_start, '%H:%M') AS opened, to_char(window_end, '%H:%M') AS closed, verdict
+FROM bifrost.verification.results
+WHERE verifier_card_uid = $1 AND subject_card_uid = $2
+ORDER BY window_start DESC LIMIT 3
+"""
+
+# The scheduler stores one result per judged window: print the newest three, times in UTC.
+cards = Cards()
+verifier = cards.get(CardRef("Verifier", "latency-budget", "1.0.0"))
+service = cards.get(CardRef("Service", "checkout", "1.0.0"))
+rows = Bifrost().sql(RECENT, [verifier.card_ref.uid, service.card_ref.uid]).to_arrow().to_pylist()
+print("latency-budget@1.0.0 on checkout@1.0.0")
+for row in rows:
+    print(f"  {row['opened']}-{row['closed']} {row['verdict']}")
+
+```
+
+**Rust**
+
+```rust title="src/bin/record.rs"
+//! Record five checkout requests that each took the given number of
+//! milliseconds, for the every-minute schedule to judge.
+
+use std::error::Error;
+
+use wyrd_ai::serde_json::json;
+use wyrd_ai::state::WyrdState;
+
+/// Record the samples and send them before exiting.
+///
+/// # Errors
+/// Returns a missing or unparsable latency argument, the bundle's load
+/// error, or the client's Bifrost and submission errors.
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    // The checkout Service, pulled at deploy time.
+    let state = WyrdState::from_path(".wyrd-bundle")?;
+    state.start_bifrost().await?; // samples are sent to Bifrost, where the schedule reads them
+
+    let latency: f64 = std::env::args()
+        .nth(1)
+        .ok_or("pass a latency in ms")?
+        .parse()?;
+    let run = state.run();
+    for _ in 0..5 {
+        run.observe()
+            .submit("latency-budget", json!({ "latency": latency }))
+            .await?;
+    }
+    state.shutdown().await?; // send the samples before the program exits
+    println!("recorded 5 requests at {latency} ms");
+    Ok(())
+}
+
+```
+
+```rust title="src/bin/results.rs"
+//! Print the newest three windows the scheduler judged for `latency-budget`
+//! on `checkout`, times in UTC.
+
+use std::error::Error;
+
+use serde::Deserialize;
+use wyrd_ai::Bifrost;
+use wyrd_ai::bifrost::{BifrostOptions, QueryParam};
+use wyrd_ai::cards::{CardKind, CardSelector, Cards};
+
+const RECENT: &str = "SELECT to_char(window_start, '%H:%M') AS opened, \
+    to_char(window_end, '%H:%M') AS closed, verdict \
+    FROM bifrost.verification.results \
+    WHERE verifier_card_uid = $1 AND subject_card_uid = $2 \
+    ORDER BY window_start DESC LIMIT 3";
+
+/// One judged window.
+#[derive(Deserialize)]
+struct Window {
+    /// When the window opened.
+    opened: String,
+    /// When it closed and was judged.
+    closed: String,
+    /// `passed`, `failed`, or `inconclusive`.
+    verdict: String,
+}
+
+/// Print the newest judged windows.
+///
+/// # Errors
+/// Returns the client's configuration or credential error, a missing Card,
+/// or a refused query.
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let cards = Cards::connect().await?;
+    let mut uids = Vec::new();
+    for (kind, name) in [
+        (CardKind::Verifier, "latency-budget"),
+        (CardKind::Service, "checkout"),
+    ] {
+        let card = cards.get(CardSelector::named(kind, name.parse()?)).await?;
+        let uid = card.metadata.uid.ok_or("the Card has no uid")?;
+        uids.push(QueryParam::String(uid.to_string()));
+    }
+    let bifrost = Bifrost::connect(BifrostOptions::default()).await?;
+    let windows: Vec<Window> = bifrost.sql_as(RECENT, &uids).await?;
+    println!("latency-budget@1.0.0 on checkout@1.0.0");
+    for window in windows {
+        println!("  {}-{} {}", window.opened, window.closed, window.verdict);
+    }
+    Ok(())
+}
+
+```
+
+**TypeScript**
+
+```typescript title="record.ts"
+// Record five checkout requests that each took the given number of milliseconds.
+import { WyrdState } from "wyrd-ai";
+
+// The checkout Service, pulled at deploy time.
+const state = WyrdState.fromPath(".wyrd-bundle");
+await state.startBifrost(); // samples are sent to Bifrost, where the schedule reads them
+
+const latency = Number(process.argv[2]);
+const run = state.run();
+for (let request = 0; request < 5; request++) {
+  await run.observe.submit("latency-budget", { latency });
+}
+await state.shutdown(); // send the samples before the program exits
+console.log(`recorded 5 requests at ${latency} ms`);
+
+```
+
+```typescript title="results.ts"
+// Print the newest three windows the scheduler judged, times in UTC.
+import { Bifrost, Cards } from "wyrd-ai";
+import { z } from "zod";
+
+const RECENT = `
+SELECT to_char(window_start, '%H:%M') AS opened, to_char(window_end, '%H:%M') AS closed, verdict
+FROM bifrost.verification.results
+WHERE verifier_card_uid = $1 AND subject_card_uid = $2
+ORDER BY window_start DESC LIMIT 3
+`;
+const Row = z.object({ opened: z.string(), closed: z.string(), verdict: z.string() });
+
+const cards = await Cards.connect();
+const verifier = await cards.get("Verifier/latency-budget@1.0.0");
+const service = await cards.get("Service/checkout@1.0.0");
+const bifrost = await Bifrost.connect();
+const rows = await bifrost.sql(RECENT, [verifier.metadata.uid ?? "", service.metadata.uid ?? ""], Row);
+console.log("latency-budget@1.0.0 on checkout@1.0.0");
+for (const row of rows) console.log(`  ${row.opened}-${row.closed} ${row.verdict}`);
+
+```
+
+## 4. Record a fast minute and a slow one
+
+Record fast requests as the Service, wait for the next minute to start, then record slow ones:
+
+**Python**
+
+```bash
+WYRD_API_KEY=$CHECKOUT_KEY uv run record.py 80
+# wait for the next minute
+WYRD_API_KEY=$CHECKOUT_KEY uv run record.py 250
+```
+
+**Rust**
+
+```bash
+WYRD_API_KEY=$CHECKOUT_KEY cargo run --bin record 80
+# wait for the next minute
+WYRD_API_KEY=$CHECKOUT_KEY cargo run --bin record 250
+```
+
+**TypeScript**
+
+```bash
+WYRD_API_KEY=$CHECKOUT_KEY node record.ts 80
+# wait for the next minute
+WYRD_API_KEY=$CHECKOUT_KEY node record.ts 250
+```
+
+```text
+recorded 5 requests at 80 ms
+recorded 5 requests at 250 ms
+```
+
+`submit` returns once the samples are recorded. Nothing is judged yet: the server judges each minute when it ends.
+
+## 5. Read the results
+
+Wait two more minutes, so the window after the slow one passes with nothing recorded, then read the results with your own credential:
+
+**Python**
+
+```bash
+uv run results.py
+```
+
+**Rust**
+
+```bash
+cargo run --bin results
+```
+
+**TypeScript**
+
+```bash
+node results.ts
+```
+
+```text title="output"
+latency-budget@1.0.0 on checkout@1.0.0
+  14:03-14:04 inconclusive
+  14:02-14:03 failed
+  14:01-14:02 passed
+
+```
+
+Your times differ. Each line is one window:
+
+- **passed**: the fast requests averaged 80 ms, within the budget.
+- **failed**: the slow requests averaged 250 ms.
+- **inconclusive**: nothing was recorded, so there was no evidence to judge. An inconclusive window is never a pass.
+
+Each stored result names the exact Verifier and Service versions it judged.
+
+**Choose a real schedule:**
+A minute keeps this guide short. A production check usually runs hourly or daily, such as `cron: "0 * * * *"`. `cron` is evaluated in UTC unless the Trigger sets `tz`. A window missed while the server was down is skipped, not judged later.
+
+## If it fails
+
+| You see | Fix |
+| --- | --- |
+| `results` prints no windows | Record with `CHECKOUT_KEY`, the Service's account, not your own credential. The schedule runs only while that account records |
+| The fast window is `inconclusive` | The samples landed in the next minute. Wait for the next window and read again |
+
+## Next
+
+[Investigate a failed verification](/wyrd/build-and-verify/verify/run-a-verification-and-inspect-its-evidence/) reads why a result failed. The [Verifier reference](/wyrd/reference/verifier-card/#checks) lists the other drift methods, which compare samples with a baseline.
 
 # Act on verdicts in production
 
@@ -6488,6 +6850,16 @@ When to use each kind is in [Steps and checks](/wyrd/understand/how-verification
 | `drift` | `on`, `method`, `signal`, `condition`, `profile` | Comparing a window of samples with a baseline |
 
 A `trace` check reads every retained span with the trace ID from `bifrost.traces.spans`, as the executing account, ordered by start time then span ID, up to 10,000 spans. A larger trace, a refused or failed query, a timed-out read, an undecodable span, or an input with no trace makes it `inconclusive`. A trace with no visible span is `inconclusive` under `verify`; in a queued execution, each attempt before the last ends with error code `evidence_unavailable` and status `retrying` (3 attempts, 30 s then 60 s apart), and the last is `inconclusive`. [Trace evidence](/wyrd/understand/how-verification-works/#trace-evidence) explains the behavior.
+
+A `drift` check judges a scheduled window of `samples`. A Verifier with a `samples` slot or a `drift` check has only those, and is bound with a `schedule` Trigger and no `inputs`. `condition` is `Statistical`. A feature drifts when its score exceeds the threshold, and the requirement fails if any feature drifted; a window with no samples in a slot is `inconclusive`.
+
+| `method` | Scores | `profile` |
+| --- | --- | --- |
+| `Psi` | How far each feature's distribution moved from a baseline Data Card named by `signal.baseline_ref` | `binning_strategy` (`EqualWidth` or `Quantile`, 2 to 1000 bins) and `threshold`: `Fixed { value }`, or `ChiSquare { alpha }` / `Normal { alpha }` |
+| `Spc` | Control-chart signals on numeric features against a baseline | `{ sample_size }`, at least 2 |
+| `Custom` | One metric's mean against a fixed limit, with `signal: { kind: Metric, name }` | `{ metric_name, baseline_value, alert_threshold }`, `metric_name` equal to the signal's name. No baseline |
+
+The server fits a `Psi` or `Spc` baseline after declaration. Its state is the Verifier's `status.verification.baseline.state`: `pending`, `building`, `ready`, or `failed` with `baseline.error`. A window judged before `ready` is `inconclusive`.
 
 ## Comparison operators
 

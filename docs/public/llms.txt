@@ -35,6 +35,7 @@ Set up a local server, run one verification, then choose what to build, in this 
 - [Verify during a request](/wyrd/build-and-verify/verify/verify-a-request-in-real-time/): Call the Quickstart's release check from a web API, send a report only after its verdict passes, and hold every other outcome with the reason.
 - [Verify an agent's workflow](/wyrd/build-and-verify/verify/verify-an-agent-workflow/): Catch an agent that skipped a required step even though its answer looks right, by checking the trace of the work behind the answer.
 - [Investigate a failed verification](/wyrd/build-and-verify/verify/run-a-verification-and-inspect-its-evidence/): Find a stored failed result, read which requirement failed, the evidence it judged, and the exact Verifier and subject versions, without rerunning any check.
+- [Check on a schedule](/wyrd/build-and-verify/verify/monitor-drift/): Have the Wyrd server judge a Service's recorded samples every minute, then read which windows passed, failed, or had no evidence.
 - [Act on verdicts in production](/wyrd/build-and-verify/verify/act-on-verdicts-in-production/): Handle passed, failed, inconclusive, errors, and timeouts explicitly, decide what model providers may see, and measure latency and cost for the Verifier you deploy.
 
 ## Connect

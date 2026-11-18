@@ -40,7 +40,6 @@ class Desk:
         # verification carries; name and version come from the bundle. Spans
         # export to Wyrd through the SDK's OTLP exporter.
         self.state.configure(deployment_environment="development")
-        self.state.start_bifrost()
         # The Agents SDK's own traces become spans too, under the request's Run.
         set_trace_processors([WyrdAgentsTraceProcessor()])
         # ANCHOR_END: init

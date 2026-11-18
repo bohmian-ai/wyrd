@@ -306,7 +306,7 @@ impl PyWyrdState {
     /// table's producer keeps draining.
     ///
     /// # Errors
-    /// Raises `WYRD_SDK_400_BIFROST_NOT_STARTED` before startup,
+    /// Raises the error of starting the Bifrost writer when none is running,
     /// `WYRD_SDK_409_BIFROST_CLOSED` after shutdown, and the server's describe
     /// error for an unknown, unauthorized, or unavailable table.
     fn use_table_by_name(&self, py: Python<'_>, table: &str) -> CardPyResult<()> {

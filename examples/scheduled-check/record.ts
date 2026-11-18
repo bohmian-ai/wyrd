@@ -3,7 +3,6 @@ import { WyrdState } from "wyrd-ai";
 
 // The checkout Service, pulled at deploy time.
 const state = WyrdState.fromPath(".wyrd-bundle");
-await state.startBifrost(); // samples are sent to Bifrost, where the schedule reads them
 
 const latency = Number(process.argv[2]);
 const run = state.run();

@@ -780,6 +780,20 @@ impl WyrdState {
         table: Option<TableConfig>,
         queue: QueueConfig,
     ) -> Result<(), WyrdError> {
+        let _gate = self.bifrost.start_gate().await;
+        self.start_gated(table, queue).await
+    }
+
+    /// Claim, connect, and publish the writer; the caller holds the start
+    /// gate.
+    ///
+    /// # Errors
+    /// As [`WyrdState::start_bifrost_with_config`].
+    async fn start_gated(
+        &self,
+        table: Option<TableConfig>,
+        queue: QueueConfig,
+    ) -> Result<(), WyrdError> {
         let claim = self.bifrost.claim()?;
         let client = self.client()?;
         let chosen = table.is_some();
@@ -834,15 +848,16 @@ impl WyrdState {
     /// * `fqn` - The registered table's `<namespace>.<name>`.
     ///
     /// # Errors
-    /// Returns `WYRD_SDK_400_BIFROST_NOT_STARTED` before startup,
-    /// `WYRD_SDK_409_BIFROST_CLOSED` after shutdown, and the server's describe
-    /// error for an unknown, unauthorized, or unavailable table.
+    /// Returns the errors of [`WyrdState::start_bifrost`] when no writer is
+    /// running yet, `WYRD_SDK_409_BIFROST_CLOSED` after shutdown, and the
+    /// server's describe error for an unknown, unauthorized, or unavailable
+    /// table.
     ///
     /// # Cancellation
     /// Abandoning the future during the describe leaves the active table
     /// unchanged.
     pub async fn use_table_by_name(&self, fqn: &str) -> Result<(), WyrdError> {
-        let started = self.started_bifrost()?;
+        let started = self.bifrost_writer().await?;
         Ok(started.bifrost.use_table_by_name(fqn).await?)
     }
 
@@ -1115,6 +1130,39 @@ impl WyrdState {
         let chosen = bifrost.table().is_some();
         self.complete_start(self.bifrost.claim()?, bifrost, chosen)
             .await
+    }
+
+    /// The writer, started with the default configuration if this state
+    /// has none yet.
+    ///
+    /// Writes call this so no caller has to start Bifrost first. A start in
+    /// flight, explicit or from another write, is awaited rather than
+    /// repeated; a failed start is returned and the next write tries again.
+    ///
+    /// # Errors
+    /// Returns `WYRD_SDK_409_BIFROST_CLOSED` after shutdown, and otherwise
+    /// the errors of [`WyrdState::start_bifrost`].
+    ///
+    /// # Cancellation
+    /// As [`WyrdState::start_bifrost`].
+    pub(crate) async fn bifrost_writer(&self) -> Result<Arc<StartedBifrost>, WyrdError> {
+        if let Some(started) = self.bifrost.current()? {
+            return Ok(started);
+        }
+        let _gate = self.bifrost.start_gate().await;
+        if let Some(started) = self.bifrost.current()? {
+            return Ok(started);
+        }
+        self.start_gated(None, QueueConfig::default()).await?;
+        self.bifrost.started()
+    }
+
+    /// The started writer, or `None` before any start.
+    ///
+    /// # Errors
+    /// Returns `WYRD_SDK_409_BIFROST_CLOSED` after shutdown.
+    pub(crate) fn running_bifrost(&self) -> Result<Option<Arc<StartedBifrost>>, WyrdError> {
+        self.bifrost.current()
     }
 
     /// The started writer and its described fixed Drift table.

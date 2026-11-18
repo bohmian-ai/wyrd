@@ -47,6 +47,10 @@ pub struct BifrostLifecycle {
     /// [`Phase::Starting`] claim, releases the lock for its IO, and re-takes it
     /// to publish or release.
     phase: Mutex<Phase>,
+    /// Serializes starts, so a write that starts the writer on first use waits
+    /// for an explicit or concurrent start instead of being refused by it.
+    /// Held across the start's IO, which is why it is an async mutex.
+    start: tokio::sync::Mutex<()>,
 }
 
 impl Default for BifrostLifecycle {
@@ -54,6 +58,7 @@ impl Default for BifrostLifecycle {
     fn default() -> Self {
         Self {
             phase: Mutex::new(Phase::NotStarted),
+            start: tokio::sync::Mutex::new(()),
         }
     }
 }
@@ -69,7 +74,7 @@ impl Debug for BifrostLifecycle {
         };
         f.debug_struct("BifrostLifecycle")
             .field("phase", &phase)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -98,20 +103,40 @@ impl BifrostLifecycle {
         }
     }
 
+    /// Wait for any start in flight and hold off new ones while the guard
+    /// lives.
+    ///
+    /// Both explicit starts and starts on first use take it, so a write that
+    /// finds no writer starts one exactly once per state.
+    pub async fn start_gate(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.start.lock().await
+    }
+
+    /// The started writer, or `None` when none has been started yet.
+    ///
+    /// # Errors
+    /// Returns `WYRD_SDK_409_BIFROST_CLOSED` after shutdown.
+    ///
+    /// # Panics
+    /// Panics if the phase lock is poisoned.
+    pub fn current(&self) -> Result<Option<Arc<StartedBifrost>>, WyrdError> {
+        match &*self.phase.lock().expect("bifrost phase lock poisoned") {
+            Phase::Started(started) => Ok(Some(Arc::clone(started))),
+            Phase::NotStarted | Phase::Starting => Ok(None),
+            Phase::Closed => Err(closed()),
+        }
+    }
+
     /// The started writer, for a synchronous observation.
     ///
     /// # Errors
-    /// Returns `WYRD_SDK_400_BIFROST_NOT_STARTED` before `start_bifrost`
-    /// completes and `WYRD_SDK_409_BIFROST_CLOSED` after shutdown.
+    /// Returns `WYRD_SDK_400_BIFROST_NOT_STARTED` before a writer started
+    /// and `WYRD_SDK_409_BIFROST_CLOSED` after shutdown.
     ///
     /// # Panics
     /// Panics if the phase lock is poisoned.
     pub fn started(&self) -> Result<Arc<StartedBifrost>, WyrdError> {
-        match &*self.phase.lock().expect("bifrost phase lock poisoned") {
-            Phase::Started(started) => Ok(Arc::clone(started)),
-            Phase::NotStarted | Phase::Starting => Err(not_started()),
-            Phase::Closed => Err(closed()),
-        }
+        self.current()?.ok_or_else(not_started)
     }
 
     /// Drain every producer of the started writer, if one was started.

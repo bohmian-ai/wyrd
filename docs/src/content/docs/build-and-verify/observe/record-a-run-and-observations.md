@@ -26,7 +26,6 @@ from wyrd import WyrdClient, WyrdState
 client = WyrdClient()  # finds the server and credential wyrd init saved
 state = WyrdState.declare("service/support-desk.yaml", client)
 state.configure()      # exports spans, logs, and metrics under this Service and environment
-state.start_bifrost()  # the writer for rows and verdict inputs
 
 # Your model calls go through Wyrd's gateway. http_auth signs each call and
 # ties it to the Run it is made in.
@@ -37,8 +36,6 @@ gateway = OpenAI(
 )
 prompt = state.prompt("prompt").prompt  # the Service's declared Prompt
 ```
-
-`start_bifrost` is the first server call, so a wrong URL or credential fails here, at startup.
 
 ## 2. Answer inside a Run
 
@@ -134,7 +131,6 @@ Pull the exact Service version at deploy time with `wyrd pull`, load it with `Wy
 
 | You see | Fix |
 | --- | --- |
-| `WYRD_SDK_400_BIFROST_NOT_STARTED` | Call `state.start_bifrost()` at startup, before any `observe` call |
 | `WYRD_SDK_404_UNKNOWN_VERIFIER` | Call the Verifier on the view it is bound to: `run` for the Service, `agent` for the agent |
 | `WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND` | Declare the table under the Service's `spec.tables` |
 | `WYRD_VALA_403_BIFROST_CARD_SCOPE` at `shutdown` | Use a key issued for this Service version |

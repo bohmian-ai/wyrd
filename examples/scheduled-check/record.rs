@@ -15,7 +15,6 @@ use wyrd_ai::state::WyrdState;
 async fn main() -> Result<(), Box<dyn Error>> {
     // The checkout Service, pulled at deploy time.
     let state = WyrdState::from_path(".wyrd-bundle")?;
-    state.start_bifrost().await?; // samples are sent to Bifrost, where the schedule reads them
 
     let latency: f64 = std::env::args()
         .nth(1)

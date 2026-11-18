@@ -52,7 +52,7 @@ def test_run_exposes_bifrost_write_and_observe_verification(state: WyrdState) ->
     assert callable(run.observe.submit)
     with pytest.raises(wyrd.WyrdError) as raised:
         run.for_card("model").bifrost.write_to("bifrost.datasets.latency", {"latency_ms": 1.0})
-    assert raised.value.code == "WYRD_SDK_400_BIFROST_NOT_STARTED"
+    assert raised.value.code == "WYRD_CLIENT_503_TRANSPORT_DOWN"
 
 
 def test_scoped_views_share_one_invocation_and_keep_their_subjects(state: WyrdState) -> None:
@@ -620,10 +620,10 @@ def test_otel_imports_without_the_agents_sdk() -> None:
 
 
 def _write_reaches_the_ordinary_boundary(run: Run) -> None:
-    """Write one explicit row and assert its ordinary offline error."""
+    """Write one explicit row; offline, starting the writer finds no server."""
     with pytest.raises(wyrd.WyrdError) as raised:
         run.bifrost.write_to("bifrost.datasets.latency", {"latency_ms": 1.0})
-    assert raised.value.code == "WYRD_SDK_400_BIFROST_NOT_STARTED"
+    assert raised.value.code == "WYRD_CLIENT_503_TRANSPORT_DOWN"
 
 
 def _broken(*_args: object, **_kwargs: object) -> None:
@@ -867,6 +867,21 @@ def test_telemetry_setup_names_the_otel_extra_without_the_sdk(client_state: Wyrd
     assert frozen.value.code == "WYRD_SDK_409_STATE_CONFIG_FROZEN"
     client_state._start_telemetry()
     assert isinstance(trace.get_tracer_provider(), TracerProvider)
+
+
+@pytest.mark.usefixtures("unset_global_provider")
+def test_configure_without_telemetry_installs_no_provider(client_state: WyrdState) -> None:
+    """``telemetry=False`` fixes the context and leaves every global provider unset."""
+    from opentelemetry._logs import _internal as logs_internal
+    from opentelemetry.metrics import _internal as metrics_internal
+
+    client_state.configure(deployment_environment="prod", telemetry=False)
+
+    assert client_state.deployment_environment == "prod"
+    assert trace._TRACER_PROVIDER is None
+    assert metrics_internal._METER_PROVIDER is None
+    assert logs_internal._LOGGER_PROVIDER is None
+    client_state.flush()
 
 
 class _FailOnce:

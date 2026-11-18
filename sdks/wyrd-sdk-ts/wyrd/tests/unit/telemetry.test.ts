@@ -85,6 +85,15 @@ test("telemetry setup", async () => {
   expect(globalProvider()).toBe(application);
 });
 
+test("configure without telemetry installs no provider", async () => {
+  const state = offlineState();
+  await state.configure({ deploymentEnvironment: "prod", telemetry: false });
+
+  expect(state.deploymentEnvironment).toBe("prod");
+  expect(globalProvider()).not.toBeInstanceOf(BasicTracerProvider);
+  await state.flush();
+});
+
 test("owned provider correlation", async () => {
   const state = offlineState();
   const exporter = new InMemorySpanExporter();

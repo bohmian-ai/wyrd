@@ -181,7 +181,6 @@ The [Verifier reference](/reference/verifier-card/) lists every operator and fie
 | You see | Fix |
 | --- | --- |
 | `WYRD_SDK_404_UNKNOWN_VERIFIER` | Verify on the view the Verifier is bound to: `state.run("agent")` |
-| `WYRD_SDK_400_BIFROST_NOT_STARTED` | Call `start_bifrost` before the first `write` |
 | `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH` | The table exists with different columns: keep its schema, or use a new table name |
 | No rows after a minute | Check that the program reached `shutdown` without an error |
 

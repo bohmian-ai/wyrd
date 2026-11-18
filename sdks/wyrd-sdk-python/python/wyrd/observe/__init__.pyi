@@ -186,8 +186,8 @@ class Observe:
 
         Raises:
             WyrdError: As ``verify`` for Run evidence; for window samples,
-                ``WYRD_SDK_400_BIFROST_NOT_STARTED``,
-                ``WYRD_SDK_409_BIFROST_CLOSED``, or
+                the error of starting the state's Bifrost writer when this is
+                the first write, ``WYRD_SDK_409_BIFROST_CLOSED``, or
                 ``WYRD_CLIENT_429_QUEUE_FULL``.
         """
         ...
@@ -240,7 +240,8 @@ class RunBifrost:
             WyrdError: ``WYRD_SPEC_400_VALIDATION`` for a row of another
                 shape, a non-``str`` key, or a non-finite float;
                 ``WYRD_SDK_400_INVALID_OBSERVATION`` for a table outside
-                ``bifrost.datasets``; ``WYRD_SDK_400_BIFROST_NOT_STARTED``,
+                ``bifrost.datasets``; the error of starting the state's
+                Bifrost writer when this is the first write;
                 ``WYRD_SDK_409_BIFROST_CLOSED``, or
                 ``WYRD_CLIENT_429_QUEUE_FULL``; and the server's error for a
                 table that is unknown, unauthorized, or unavailable.

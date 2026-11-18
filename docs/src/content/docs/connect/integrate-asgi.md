@@ -174,7 +174,6 @@ The reply names the request's Run and a `failed` verdict. A second request retur
 | --- | --- |
 | Startup fails with `WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS` | Your app installs its own tracer provider: pass `telemetry=False` and add `wyrd.otel.span_exporter(client)` to that provider |
 | Startup fails with an `ImportError` naming `otel` | Install `wyrd-ai[otel]`, or pass `telemetry=False` |
-| `WYRD_SDK_400_BIFROST_NOT_STARTED` when the app records | The server runs without lifespan: leave Uvicorn's `--lifespan` at `auto` or set it to `on` |
 | `WYRD_SDK_404_UNKNOWN_ALIAS` on every request | `alias` returned a name the bundle does not have |
 
 ## Advanced

@@ -226,8 +226,8 @@ class WyrdState:
             table: the registered ``"<namespace>.<name>"`` table.
 
         Raises:
-            WyrdError: ``WYRD_SDK_400_BIFROST_NOT_STARTED`` before
-                ``start_bifrost``, ``WYRD_SDK_409_BIFROST_CLOSED`` after
+            WyrdError: the error of starting the Bifrost writer when none
+                is running, ``WYRD_SDK_409_BIFROST_CLOSED`` after
                 shutdown, and the server's error for a table that is unknown,
                 unauthorized, or unavailable.
         """

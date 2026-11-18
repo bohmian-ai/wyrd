@@ -96,17 +96,17 @@ export async function deploy(client: WyrdClient, bundle: string): Promise<Desk> 
     throw new Error("the `agent` component is not an Agent");
   }
   const { execution_route: executionRoute } = agent.spec;
-  if (executionRoute.kind === "native") {
-    return { receipt, state, client };
+  if (executionRoute.kind !== "native") {
+    const route = `${executionRoute.deployment}/${prompt.spec.model}`;
+    const deployed = await gateway.deployments();
+    if (!deployed.some(({ name }) => name === executionRoute.deployment)) {
+      throw new Error(
+        `the support Agent's model ${route} is not deployed; configure a gateway provider deployment ` +
+          `for ${route} (PUT /v1/admin/gateway/provider-deployments/{name})`,
+      );
+    }
   }
-  const route = `${executionRoute.deployment}/${prompt.spec.model}`;
-  const deployed = await gateway.deployments();
-  if (!deployed.some(({ name }) => name === executionRoute.deployment)) {
-    throw new Error(
-      `the support Agent's model ${route} is not deployed; configure a gateway provider deployment ` +
-        `for ${route} (PUT /v1/admin/gateway/provider-deployments/{name})`,
-    );
-  }
+  await state.configure(); // before first use: fixes the Service context and exports telemetry
   return { receipt, state, client };
 }
 
@@ -172,8 +172,6 @@ export function question(index: number): string {
  */
 export async function serve(desk: Desk): Promise<Served[]> {
   const { state, client } = desk;
-  await state.configure();
-  await state.startBifrost();
   const tracer = trace.getTracer("support-desk");
   const served: Served[] = [];
   for (let index = 0; index < REQUESTS; index++) {

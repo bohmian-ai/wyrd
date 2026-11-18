@@ -136,7 +136,6 @@ if (import.meta.main) {
   const state = WyrdState.fromPath(BUNDLE_DIR, { client });
   // The Service name, version, and environment every span, gateway call, and verification carries; name and version come from the bundle. Spans export to Wyrd.
   await state.configure({ deploymentEnvironment: "development" });
-  await state.startBifrost(); // writes tickets to Bifrost
   // ANCHOR_END: startup
   const server = supportApi({ state, client, gateway: gateway(client) });
   server.listen(Number(process.env.PORT ?? 3000), "127.0.0.1", () => {

@@ -439,27 +439,24 @@ impl Part {
 
     /// The one batch holding `parts`' rows in order, which share one schema.
     ///
-    /// A run of staged rows, with each revision prepared as its row, is
+    /// A run of staged rows, each revision's prepared row among them, is
     /// built straight into one dense batch, each column allocated once; a
     /// lone batch is shared, and several batches are concatenated. Staged-row
     /// and batch destinations never overlap, so a frame never mixes the two.
     ///
     /// # Errors
     ///
-    /// Returns the Arrow error when a revision cannot be prepared, the rows
-    /// cannot be built, the batches cannot be concatenated, or staged rows
+    /// Returns the Arrow error when the rows cannot be built, the batches cannot be concatenated, or staged rows
     /// are mixed with batches.
     fn dense(parts: &[Self]) -> Result<RecordBatch, arrow::error::ArrowError> {
         let staged = parts
             .iter()
             .map(|part| match part {
-                Self::Row(row) => Ok(Some(row)),
-                Self::Checkpoint(checkpoint) => checkpoint.row().map(Some).map_err(|error| {
-                    arrow::error::ArrowError::InvalidArgumentError(error.to_owned())
-                }),
-                Self::Batch(_) => Ok(None),
+                Self::Row(row) => Some(row),
+                Self::Checkpoint(checkpoint) => Some(checkpoint.row()),
+                Self::Batch(_) => None,
             })
-            .collect::<Result<Option<Vec<_>>, _>>()?;
+            .collect::<Option<Vec<_>>>();
         if let Some(rows) = staged {
             return StagedRow::project(&rows);
         }
@@ -2708,11 +2705,10 @@ mod tests {
         let (sender, acked) = tokio::sync::oneshot::channel();
         let write = ScribeWrite::ExecutionState {
             batch: uuid::Uuid::now_v7(),
-            checkpoint: Arc::new(crate::verification::state::Checkpoint::new(
-                1,
-                state,
-                Arc::new(row),
-            )),
+            checkpoint: Arc::new(
+                crate::verification::state::Checkpoint::new(1, &state, Arc::new(row))
+                    .expect("the state prepares"),
+            ),
             attribution: background(),
             acked: Mutex::new(Some(sender)),
         };

@@ -194,7 +194,9 @@ impl WyrdGatewayCaller for ServerWyrdGatewayCaller {
             subject: self.subject.clone().map(GatewayCallAttribution::Resolved),
             prompt_provider: Some(call.provider),
         };
-        let invocation = GatewayInvocation::new(&self.state);
+        // An Agent model call is verification work of its tenant.
+        let invocation = GatewayInvocation::new(&self.state)
+            .nested(wyrd_runtime::resources::Workload::Verification);
         let invocation = match deadline {
             Some(deadline) => invocation.bounded(deadline),
             None => invocation,

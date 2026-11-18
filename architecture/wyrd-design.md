@@ -2351,36 +2351,41 @@ settings; slot limits only lower them. They are per-operation ceilings, not
 reserved capacity.
 
 Hosted capacity follows the process resource plan, not fixed counts.
-`wyrd-runtime` owns the neutral mechanism: one process memory ledger and one
-disposable-scratch ledger for the data-root filesystem, which Bifrost,
-request buffering, and hosted verification all charge, so no byte is
-promised twice. The ledgers carry no policy;
-each capability decides what it charges and how it answers a refusal. The
-server composes them from the Bifrost plan
-([Admission and memory](bifrost-design.md#admission-and-memory)); Vala never
-imports server concepts, and `wyrd-spec` holds none of it. The process pool
-allows one runnable Python turn per effective CPU.
+`wyrd-runtime` owns one workload manager over the process memory ledger and
+the disposable-scratch ledger for the data-root filesystem, which Bifrost,
+gateway request buffering, and hosted verification all charge, so no byte is
+promised twice and an ownership transfer is not another charge. Gateway,
+verification, and Bifrost share the managed budget with equal weights and no
+fixed partitions or charged entitlements: below the admission target work
+borrows unused capacity within its local ceilings; under contention each
+demanding workload, then tenant, gets a soft share and work above its share
+pauses; under persisting critical pressure the manager cancels one cancellable
+operation from the workload furthest above its share, never acknowledged
+durable work or mandatory settlement. The server composes the manager from the
+Bifrost plan ([Admission and memory](bifrost-design.md#admission-and-memory));
+Vala never imports server concepts, and `wyrd-spec` holds none of it. CPU is
+shared the same way: one managed lane per effective CPU admits runnable Python
+turns, substantial gateway encoding and decoding, Scribe CPU jobs, and Oracle
+and Forge execution, least normalized service first. A lane is running work,
+not an operation-lifetime permit: it is released before any IO, memory,
+downstream, or provider wait, and admission is non-preemptive.
 
-A Python operation charges its code and globals to process memory before it
-waits, and is refused at once when even those do not fit. It then waits, FIFO
-within its tenant and round robin across tenants on this replica, for one
-atomic grant of its session's peak envelope: twice the allocator ceiling of
-`WYRD_VERIFICATION_MONTY_MEMORY_MIB` (the worker heap and the parent's copy
-of the largest frame a worker can send), plus the worker's measured resident
-baseline and interpreter stack. A tenant's head that does not fit never
-blocks another tenant's head that does, a refilling tenant cannot pass one
-already waiting, and a grant larger than the whole ledger is refused rather
-than queued. There is no worker, workspace, or waiter count. While an operation waits, idle workers are reaped to return
-their charges. A worker keeps its session's envelope charged after the
-session ends, reset or discarded, because its allocator keeps freed pages;
-the next session on that worker takes the charge over rather than adding to
-it, and the charge returns only once the worker's process is gone.
-`WYRD_VERIFICATION_MONTY_MIN_WORKERS` (default 1) is each pool's prewarming
-target:
-warm workers that fit are charged like any worker and reaped like any idle
-one. A program holds a runnable turn only while Python runs; suspended on a
-host call, a nested tool call, or the `/work` writer, it releases the turn,
-keeps its envelope, and competes for a turn again when it resumes. Workspace
+A Python operation charges what it actually retains, when it is materialized:
+its code and globals, and the frames and media the parent holds. The worker's
+own heap counts through bounded telemetry the worker reports every 100 ms;
+there is no peak envelope, frame-copy multiplier, or reserved session charge,
+and `WYRD_VERIFICATION_MONTY_MEMORY_MIB` stays a per-session allocator
+ceiling, not a reservation. A refused new buffer is discarded and the
+operation is Busy. There is no worker, workspace, or waiter count. A worker
+keeps its last reported usage through idle, reset, and cancelled states,
+because its allocator keeps freed pages, until a newer sample or its
+confirmed exit; a worker whose telemetry is 500 ms stale takes no new work
+until it is visible again. Under critical pressure idle workers are reaped to
+return their usage. `WYRD_VERIFICATION_MONTY_MIN_WORKERS` (default 1) is each
+pool's prewarming target, and warm workers count and are reaped like any idle
+one. A program holds a CPU lane only while Python runs; suspended on a host
+call, a nested tool call, or the `/work` writer, it releases the lane and
+competes for one again when it resumes. Workspace
 inputs charge scratch at their declared size and stream to disk with memory
 charged per chunk, and each `/work` write charges scratch before it lands;
 those charges are refused at once, never waited for.
@@ -2396,7 +2401,7 @@ a `reason` detail; a wait the deadline ends answers
 problem document, and SDKs project it without replaying a direct call. A
 queued execution refused capacity returns to the queue without spending an
 attempt. Cancellation removes a waiter and stops mediated work; a cancelled
-operation's envelope stays charged until its killed worker is gone.
+operation's worker usage stays counted until its killed worker is gone.
 `POST /v1/verification/execute` and `POST /v1/verification/enqueue`, like
 `POST /v1/query`, bypass the protected edge's in-flight limit
 (`WYRD_HTTP_CONCURRENCY_LIMIT`, default 1,024) and pass their bodies

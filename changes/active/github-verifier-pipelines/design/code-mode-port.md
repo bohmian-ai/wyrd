@@ -144,12 +144,41 @@ unchanged from A's tree, except for the amendment notes below. No review
 verdict is added or changed. TASK-001 and TASK-002 keep their recorded review
 history. TASK-003-R2 stays `superseded` and TASK-003-R3 stays open.
 
-### 100-tenant amendment
+### Isolation proof and throughput qualification
 
-Revision 12 and the maintainer directions in TASK-013 and TASK-014 replace
-the sustained ">=200 tenants" of REQ-033, AC-034 and TASK-003-R3 V6 with 100
-tenants. The two-replica proof moves to TASK-014. Notes at those rows record
-this; their older threshold no longer applies.
+Maintainer planning correction, 2026-11-16, under approved pipeline revision 15:
+TASK-013 owns deterministic 100-tenant fairness, completion, drain and return of
+the process memory ledger to its starting charge. Extend the existing held-engine
+Postgres integration scenario with one flooding tenant and 99 quiet tenants,
+one run each: every quiet run is claimed in the first round, behind at most one
+flood run; releasing the engines completes all work and leaves no queued or
+leased rows. Saturation comes from configured limits and held engines.
+
+The existing L2 Verification `competing` experiment already overlaps open-loop
+direct `observe().verify` and queued `observe().submit` on one `combined` server,
+with Scribe evidence writes and capacity → overload → recovery → drain. TASK-013
+adds its missing direct-only control at the same direct rate and schedule, in
+the existing declaration, record and tables. It delivers a full clean unprofiled
+`mise run bench:l2:verification` baseline containing both steps. The existing L1
+`direct-verify` record remains the direct-only baseline. L2 is not moved into L1
+or given a new command, record format, renderer or pass/fail budget.
+
+TASK-014 owns direct-throughput optimization and the retained six-population
+c1/c64 and matched-rate qualification, diagnosis and ledger obligations. It uses
+those L1/L2 baselines and re-runs competing with its control after optimization.
+Memory levelling off over long runs remains an observation from existing L2
+resource windows; fairness, drain and charged-memory return fail deterministically
+in TASK-013's integration test instead of being a sustained benchmark qualification.
+
+This supersedes the earlier 100-tenant sustained and two-process assignments in
+this port record, TASK-012, and the inherited REQ-033 / AC-034 / TASK-003-R3 V6
+amendment notes that refer here. No two-process capacity run is required:
+`pg_verification_runtime::two_replicas_claim_each_queued_run_exactly_once` already
+proves shared-Postgres claiming across two runtimes. It is integration proof,
+not a claim of two OS processes. Admission budgets are per process; a second
+process does not add proof of the single-process capacity invariant. TASK-013
+and TASK-014 carry its exact focused command. Historical verdicts remain intact;
+remaining inherited rows close only against their actual evidence.
 
 ### TASK-003-R3 obligations
 
@@ -159,7 +188,7 @@ this; their older threshold no longer applies.
 | R3-MEM | changed: one process ledger with no queued reservation (revision 13, `35fd76607`); every hosted charge is held only while in use | TASK-012 OBL-7/OBL-9 |
 | R3-CACHE | carried | unverified on the port; TASK-012 lanes |
 | R3-SPILL | carried | unverified on the port; TASK-012 lanes |
-| R3-REPLICA | pending | TASK-014 two-replica record |
+| R3-REPLICA | proof reassigned by the planning correction above; no two-process capacity experiment | Existing shared-Postgres replica-claim integration test, cited by TASK-013/014 |
 | R3-CPU | changed: one runnable-turn bound of the effective CPUs shared by direct and queued work in `combined`; isolation is by `direct` and `worker` pods (revision 13) | TASK-012 OBL-9; TASK-014 |
 | R3-ADMIT | changed: tenant-fair waits kept; revision 13 isolates by deployment target | TASK-012 OBL-9; TASK-014 |
 | R3-WORKER | carried: one sandbox pool per process | TASK-012 OBL-6 |
@@ -168,7 +197,7 @@ this; their older threshold no longer applies.
 | R3-TEL | carried | unverified on the port |
 | R3-BENCH | carried | TASK-012 OBL-10 (harness delivered); TASK-013/014 run it |
 | R3-QUAL | pending; its recorded FAIL stands | TASK-013 baseline, TASK-014 qualification |
-| R3-SUSTAIN | pending, amended to 100 tenants | TASK-014 |
+| R3-SUSTAIN | proof corrected above: deterministic 100-tenant fairness/drain/ledger test; long-run memory remains an L2 observation | TASK-013 integration evidence; TASK-014 post-optimization L2 resource windows |
 | R3-DIAG | pending | TASK-014 artifact analysis |
 | R3-LEDGER | pending | TASK-014 |
 | R3-DOCS | changed: reconciled to revision 12 in `bb78916eb`, then to revisions 13–15 in `456546fbb`, `b2afb89a8`, `b78edf183` and `9755b9c2a` | TASK-012 OBL-2 |
@@ -179,7 +208,7 @@ this; their older threshold no longer applies.
 |---|---|
 | A's spec revision 9 functional and security requirements | carried; amended by pipeline revisions 12–15 for capacity, nested exclusions and tool spend |
 | A's REQ-027/029 idle-capacity borrowing | superseded by revision 13: one shared owner per process, isolation by deployment target |
-| A's REQ-033 and AC-034 | amended to 100 tenants (above); qualification is TASK-014's |
+| A's REQ-033 and AC-034 | proof split corrected above: TASK-013 owns the 100-tenant integration invariant and L2 baseline; TASK-014 retains direct qualification and post-optimization L2 observations; replica claiming uses existing integration proof |
 | A's TASK-001 and TASK-002 | carried with their recorded review history; no verdict changed |
 | A's TASK-003-R2 | superseded, unchanged |
 | A's TASK-003-R3 | open; rows above |

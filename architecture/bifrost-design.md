@@ -1368,9 +1368,12 @@ WAL IO, and Scribe shard counts do not scale with `C` either. Startup logs the r
 configuration, its sources, explicit overrides, and queue limits, and
 `wyrd_process_resource_plan{resource}` publishes effective CPU, memory limit,
 managed memory, and scratch limit. Usage and pressure counters stay live;
-only the configuration is fixed. CPU has no ledger: the operating system
-shares it, Oracle slots and Scribe and Forge worker counts keep their own
-CPU-derived bounds, and only hosted Python turns are bounded by `C`.
+only the configuration is fixed. CPU has no ledger. Oracle slots and Scribe and
+Forge worker counts keep their own CPU-derived bounds, and Scribe CPU jobs,
+Oracle and Forge execution, including spawned parallel work, also take one of
+the process's `C` shared CPU lanes per running poll or job, with gateway and
+hosted verification work ([Agents, tools, and workspaces](wyrd-design.md#agents-tools-and-workspaces)). A lane is never
+held across IO, admission, or persistence waits.
 
 Only fallible cooperative reservation is hard-limited. Growth DataFusion does
 not let fail is still real memory, so it is charged to an explicit process

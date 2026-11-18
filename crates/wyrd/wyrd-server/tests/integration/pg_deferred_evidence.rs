@@ -19,7 +19,6 @@ use wyrd_loader::{build_declaration_input, load};
 use wyrd_server::state::LimitsConfig;
 use wyrd_server::verification::engines::EngineOutcome;
 use wyrd_server::verification::hosted::HostedLimits;
-use wyrd_server::verification::hosted::sandbox::Sandbox;
 use wyrd_server::verification::runner::EngineScript;
 use wyrd_server::verification::{RuntimeLimits, VerificationRuntime};
 use wyrd_spec::ids::SlotName;
@@ -620,21 +619,24 @@ async fn a_parked_execution_releases_compute_before_its_park_is_acknowledged() {
             "gate-measured",
         )
         .await;
-    // Process memory short of one session envelope, with room left for the
-    // Scribe work that shares it, holds the Python step before it runs. Its
-    // earlier writes, the claim's `running` status row among them, are then
-    // drained, so the one stall takes the execution's state write.
-    assert!(Sandbox::envelope_bytes(&hosted).expect("the envelope fits u64") > 64 << 20);
+    // The sandbox's admission gate holds the Python step before it runs,
+    // leaving process pressure and Scribe untouched. Its earlier writes, the
+    // claim's `running` status row among them, are then drained, so the one
+    // stall takes the execution's state write.
     let held = deployment
         .server
-        .occupy_hosted_memory(64 << 20)
-        .expect("blocks are hosted");
+        .state()
+        .verification
+        .blocks()
+        .expect("blocks are hosted")
+        .sandbox()
+        .hold_admission_for_test();
     let parked = deployment.open(7, C1).await;
     deployment
         .server
         .wait_for_hosted_waiters(1, Duration::from_secs(30))
         .await
-        .expect("the Python step waits for memory");
+        .expect("the Python step waits at the admission gate");
     deployment
         .server
         .settle_bifrost_outbox()
@@ -735,21 +737,24 @@ spec:
             "gate-finished",
         )
         .await;
-    // Process memory short of one session envelope, with room left for the
-    // Scribe work that shares it, holds the Python step before it runs. Its
-    // earlier writes, the claim's `running` status row among them, are then
-    // drained, so the one stall takes the execution's state write.
-    assert!(Sandbox::envelope_bytes(&hosted).expect("the envelope fits u64") > 64 << 20);
+    // The sandbox's admission gate holds the Python step before it runs,
+    // leaving process pressure and Scribe untouched. Its earlier writes, the
+    // claim's `running` status row among them, are then drained, so the one
+    // stall takes the execution's state write.
     let held = deployment
         .server
-        .occupy_hosted_memory(64 << 20)
-        .expect("blocks are hosted");
+        .state()
+        .verification
+        .blocks()
+        .expect("blocks are hosted")
+        .sandbox()
+        .hold_admission_for_test();
     let finished = deployment.open(8, C1).await;
     deployment
         .server
         .wait_for_hosted_waiters(1, Duration::from_secs(30))
         .await
-        .expect("the Python step waits for memory");
+        .expect("the Python step waits at the admission gate");
     deployment
         .server
         .settle_bifrost_outbox()

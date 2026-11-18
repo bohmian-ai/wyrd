@@ -1,4 +1,4 @@
 interface:
   display_name: "Wyrd Implement"
-  short_description: "Implement and prove one Wyrd task"
-  default_prompt: "Use $wyrd-implement to make the smallest change satisfying this Wyrd task or remediation task and verify its acceptance criteria."
+  short_description: "Implement Wyrd scenarios and record their evidence"
+  default_prompt: "Use $wyrd-implement to implement this task's approved behavior one scenario at a time, record evidence in place, and return the result without starting review."

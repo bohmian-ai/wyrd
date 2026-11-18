@@ -1,15 +1,19 @@
-//! Process-wide memory and scratch ownership shared by every capability.
+//! Process-wide memory, scratch and CPU ownership shared by every capability.
 //!
-//! One [`ProcessResources`] exists per process. Its [`ByteLedger`]s are the
-//! only promises of process memory and of disposable scratch space: Bifrost,
-//! hosted verification, recording, and request buffering all charge the same
-//! two ledgers, so no capability holds an idle share and no byte is promised
-//! twice. A charge is ownership, not allocation: it is taken before the bytes
-//! exist and returned only once their owner has settled them.
+//! One [`ProcessResources`] exists per process. Its [`ByteLedger`]s record
+//! the process memory and disposable scratch that owners actually retain:
+//! Bifrost, hosted verification, recording, gateway buffering and the outbox
+//! all charge the same two ledgers, so no capability holds an idle share and
+//! no byte is counted twice. Outside Bifrost's declared workspace
+//! reservations, a substantial buffer is charged when it is materialized or
+//! retained, never for predicted future copies; the charge moves with the
+//! buffer and returns only once its owner settles it.
 //!
-//! The ledgers carry no policy. Each capability decides what it charges and
-//! how it reacts to a refusal (spill, wait, or fail cooperatively); CPU is
-//! shared by the operating system scheduler and is not ledgered here.
+//! The [`WorkloadManager`] attributes charges to operations, samples memory
+//! pressure across the parent and its managed workers, pauses new work above
+//! its soft share under contention, and admits major CPU phases to the shared
+//! [`CpuLanes`]. Each capability still decides how it reacts to a refusal
+//! (spill, wait, or fail cooperatively) and keeps its own local limits.
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -17,6 +21,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::Notify;
 use tokio::sync::futures::Notified;
+
+mod lanes;
+mod workload;
+
+pub use lanes::{CpuLanes, Inherited, LaneLease, Laned};
+use workload::OperationShared;
+pub use workload::{
+    CommitObservation, Operation, OperationId, Pressure, PressureState, SAMPLE_INTERVAL,
+    WorkContext, Workload, WorkloadManager,
+};
 
 /// A charge that does not fit the ledger's remaining bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -97,6 +111,7 @@ impl ByteLedger {
         ByteCharge {
             ledger: self.clone(),
             bytes: 0,
+            owner: None,
         }
     }
 
@@ -110,6 +125,7 @@ impl ByteLedger {
         Ok(ByteCharge {
             ledger: self.clone(),
             bytes,
+            owner: None,
         })
     }
 
@@ -122,6 +138,7 @@ impl ByteLedger {
         ByteCharge {
             ledger: self.clone(),
             bytes,
+            owner: None,
         }
     }
 
@@ -169,6 +186,8 @@ pub struct ByteCharge {
     ledger: ByteLedger,
     /// Bytes this charge currently owns; dropped charges return exactly this.
     bytes: u64,
+    /// The operation these bytes are attributed to, when one has custody.
+    owner: Option<Arc<OperationShared>>,
 }
 
 impl ByteCharge {
@@ -191,6 +210,9 @@ impl ByteCharge {
     pub fn try_grow(&mut self, bytes: u64) -> Result<(), LedgerRefusal> {
         self.ledger.try_add(bytes)?;
         self.bytes += bytes;
+        if let Some(owner) = &self.owner {
+            owner.add(bytes);
+        }
         Ok(())
     }
 
@@ -198,13 +220,32 @@ impl ByteCharge {
     pub fn grow_infallible(&mut self, bytes: u64) {
         self.ledger.inner.used.fetch_add(bytes, Ordering::AcqRel);
         self.bytes += bytes;
+        if let Some(owner) = &self.owner {
+            owner.add(bytes);
+        }
     }
 
     /// Return up to `bytes`, never more than this charge holds.
     pub fn shrink(&mut self, bytes: u64) {
         let bytes = bytes.min(self.bytes);
         self.bytes -= bytes;
+        if let Some(owner) = &self.owner {
+            owner.remove(bytes);
+        }
         self.ledger.release(bytes);
+    }
+
+    /// An empty charge from the same ledger, attributed to the same
+    /// operation, which later charges grow without naming the operation
+    /// again: a component that retains new buffers for a call holds one and
+    /// charges each buffer as it is materialized.
+    #[must_use]
+    pub fn sibling(&self) -> Self {
+        Self {
+            ledger: self.ledger.clone(),
+            bytes: 0,
+            owner: self.owner.clone(),
+        }
     }
 
     /// Move `bytes` of this charge into a new one, transferring ownership
@@ -215,7 +256,24 @@ impl ByteCharge {
         Some(Self {
             ledger: self.ledger.clone(),
             bytes,
+            owner: self.owner.clone(),
         })
+    }
+
+    /// Attribute this charge's bytes to `operation`, moving them from any
+    /// previous owner without charging the ledger again.
+    pub fn attribute(&mut self, operation: &Operation) {
+        if let Some(previous) = self.owner.take() {
+            previous.remove(self.bytes);
+        }
+        operation.shared.add(self.bytes);
+        self.owner = Some(Arc::clone(&operation.shared));
+    }
+
+    /// The operation this charge is attributed to, if any.
+    #[must_use]
+    pub fn operation(&self) -> Option<OperationId> {
+        self.owner.as_ref().map(|owner| owner.context.operation)
     }
 
     /// Take over `other`'s bytes without charging the ledger again.
@@ -228,12 +286,22 @@ impl ByteCharge {
             self.ledger.same_ledger(&other.ledger),
             "a charge merges only into its own ledger"
         );
-        self.bytes += std::mem::take(&mut other.bytes);
+        let bytes = std::mem::take(&mut other.bytes);
+        if let Some(owner) = other.owner.take() {
+            owner.remove(bytes);
+        }
+        if let Some(owner) = &self.owner {
+            owner.add(bytes);
+        }
+        self.bytes += bytes;
     }
 }
 
 impl Drop for ByteCharge {
     fn drop(&mut self) {
+        if let Some(owner) = &self.owner {
+            owner.remove(self.bytes);
+        }
         self.ledger.release(self.bytes);
     }
 }
@@ -249,20 +317,38 @@ pub struct ProcessResources {
     memory: ByteLedger,
     /// The one disposable-scratch ledger for the data-root filesystem.
     scratch: ByteLedger,
+    /// The one workload manager sharing memory and CPU among workloads.
+    workloads: WorkloadManager,
 }
 
 impl ProcessResources {
-    /// The plan over already-resolved budgets.
+    /// The plan over already-resolved budgets, with no headroom outside the
+    /// managed memory budget.
     #[must_use]
     pub fn new(effective_cpu: NonZeroUsize, memory_bytes: u64, scratch_bytes: u64) -> Self {
+        Self::with_ceiling(effective_cpu, memory_bytes, memory_bytes, scratch_bytes)
+    }
+
+    /// The plan for a process ceiling of `ceiling_bytes` (`P`, covering the
+    /// parent and its managed workers) of which `memory_bytes` (`M = P - H`)
+    /// is the managed budget; headroom `H` is excluded, never charged.
+    #[must_use]
+    pub fn with_ceiling(
+        effective_cpu: NonZeroUsize,
+        ceiling_bytes: u64,
+        memory_bytes: u64,
+        scratch_bytes: u64,
+    ) -> Self {
+        let memory = ByteLedger::new(memory_bytes);
         Self {
             effective_cpu,
-            memory: ByteLedger::new(memory_bytes),
+            workloads: WorkloadManager::new(memory.clone(), ceiling_bytes, effective_cpu.get()),
+            memory,
             scratch: ByteLedger::new(scratch_bytes),
         }
     }
 
-    /// CPUs the process may run on, the bound on hosted runnable Python turns.
+    /// CPUs the process may run on: the number of managed CPU lanes.
     #[must_use]
     pub const fn effective_cpu(&self) -> NonZeroUsize {
         self.effective_cpu
@@ -278,6 +364,12 @@ impl ProcessResources {
     #[must_use]
     pub const fn scratch(&self) -> &ByteLedger {
         &self.scratch
+    }
+
+    /// The workload manager every capability shares.
+    #[must_use]
+    pub const fn workloads(&self) -> &WorkloadManager {
+        &self.workloads
     }
 }
 
@@ -323,6 +415,61 @@ mod tests {
         assert_eq!(ledger.used(), 105);
         assert_eq!(ledger.available(), 0);
         drop((moved, overshoot));
+        assert_eq!(ledger.used(), 0);
+    }
+
+    /// Custody follows the physical buffer: moving a charge to another
+    /// operation (an outbox, say) changes attribution but never the root,
+    /// and a buffer shared by many readers is one charge until the last
+    /// reference drops.
+    ///
+    /// # Panics
+    /// Panics when attribution double counts, is lost on transfer, or root
+    /// usage changes on a transfer or a refusal.
+    #[test]
+    fn attribution_follows_custody_and_counts_shared_buffers_once() {
+        let process = ProcessResources::new(NonZeroUsize::MIN, 1_000, 0);
+        let ledger = process.memory();
+        let workloads = process.workloads();
+        let verification = workloads.begin(Workload::Verification, None, None);
+        let outbox = workloads.begin(Workload::Bifrost, None, None);
+
+        let mut retained = ledger.try_charge(100).expect("fits");
+        retained.attribute(&verification);
+        assert_eq!(verification.bytes(), 100);
+        assert_eq!(retained.operation(), Some(verification.context().operation));
+
+        let shared = Arc::new(retained);
+        let readers = [
+            Arc::clone(&shared),
+            Arc::clone(&shared),
+            Arc::clone(&shared),
+        ];
+        assert_eq!(ledger.used(), 100, "readers are not copies");
+        assert_eq!(workloads.workload_bytes(Workload::Verification), 100);
+
+        assert!(ledger.try_charge(901).is_err());
+        assert_eq!(verification.bytes(), 100, "a refusal attributes nothing");
+
+        drop(readers);
+        let mut retained = Arc::into_inner(shared).expect("the last reference");
+        let mut published = retained.split(40).expect("holds 40");
+        published.attribute(&outbox);
+        assert_eq!(ledger.used(), 100, "handoff is not a second root charge");
+        assert_eq!(verification.bytes(), 60);
+        assert_eq!(outbox.bytes(), 40);
+
+        retained.grow_infallible(10);
+        retained.shrink(30);
+        assert_eq!(verification.bytes(), 40);
+        published.merge(retained);
+        assert_eq!(outbox.bytes(), 80, "a merge carries custody with it");
+        assert_eq!(verification.bytes(), 0);
+
+        drop(verification);
+        assert_eq!(workloads.workload_bytes(Workload::Bifrost), 80);
+        drop(published);
+        assert_eq!(outbox.bytes(), 0);
         assert_eq!(ledger.used(), 0);
     }
 

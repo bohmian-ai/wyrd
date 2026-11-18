@@ -1210,18 +1210,26 @@ const REFUSAL_QUERY_DEADLINE_MS: i64 = 30_000;
 
 /// Governed bytes the holds deliberately leave free in the root.
 ///
-/// One partition working set: exactly what the plan calls the minimum a query
-/// needs to produce a batch. Holding the whole root instead would refuse the
-/// last holder itself before it could reach its schema frame, and there would
-/// be no occupied root for the refusal below to meet.
-const REFUSAL_HOLDER_HEADROOM_BYTES: usize = 64 * 1024 * 1024;
+/// Four partition working sets. At least the minimum a query needs to produce
+/// a batch, so the last holder still reaches its schema frame; holding the
+/// whole root instead would refuse that holder itself. More than the 5% of
+/// the root at which process pressure pauses new Bifrost work, so the refused
+/// query is admitted and refused at its allocation rather than paused until
+/// its deadline.
+const REFUSAL_HOLDER_HEADROOM_BYTES: usize = 256 * 1024 * 1024;
 
 /// Bytes of filler each row of the refused query's sort key carries.
 ///
 /// Three rows of this width exceed the headroom above, and a sort must reserve
 /// a whole batch before it can spill any of it, so the refusal is a property of
 /// the arithmetic rather than of how `DataFusion` chose to schedule the work.
-const REFUSAL_SORT_KEY_BYTES: usize = 15_000_000;
+/// The refused query reads only [`REFUSAL_WIDE_ROWS_AFTER`]'s rows, so its key
+/// column stays inside Arrow's 2 GiB string offsets.
+const REFUSAL_SORT_KEY_BYTES: usize = 100_000_000;
+
+/// The refused query reads rows above this id: four published rows and every
+/// live row, so it still has a live source.
+const REFUSAL_WIDE_ROWS_AFTER: i64 = REFUSAL_ROWS - 4;
 
 /// Stable error code a query refused for capacity must carry.
 const QUERY_ADMISSION_REJECTED_CODE: &str = "WYRD_VALA_429_QUERY_ADMISSION_REJECTED";
@@ -1344,7 +1352,7 @@ async fn prove_memory_refusal_preserves_health() -> Result<(), JourneyError> {
         &wyrd_client::Bifrost::query_only(&refused),
         &format!(
             "SELECT REPEAT('x', {REFUSAL_SORT_KEY_BYTES}) || CAST(id AS VARCHAR) AS wide_key \
-             FROM bifrost.bifrost.{table} ORDER BY wide_key"
+             FROM bifrost.bifrost.{table} WHERE id > {REFUSAL_WIDE_ROWS_AFTER} ORDER BY wide_key"
         ),
     )
     .await
@@ -2902,4 +2910,181 @@ async fn grpc_query(
         }
     }
     Err("the gRPC stream ended without a terminal frame".to_owned())
+}
+
+/// A public query executes on the process CPU lanes shared with gateway and
+/// verification work: while other work holds every lane the query's batches
+/// wait as Bifrost work, and the query finishes once one lane is released.
+///
+/// # Panics
+///
+/// Panics when the journey breaks; see [`prove_query_waits_for_a_shared_lane`].
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn public_query_waits_for_a_shared_cpu_lane() {
+    prove_query_waits_for_a_shared_lane()
+        .await
+        .expect("a query shares the process CPU lanes");
+}
+
+/// Holds every process lane as gateway work, runs one public query, and
+/// releases a lane.
+///
+/// # Errors
+///
+/// Returns a client or ingest error, and a descriptive error when the query
+/// finishes while every lane is held, never queues for a lane, or does not
+/// finish once one is released.
+async fn prove_query_waits_for_a_shared_lane() -> Result<(), JourneyError> {
+    use wyrd_runtime::resources::Workload;
+
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed()).await?;
+    let server = cluster
+        .server(0)
+        .ok_or("the one-pod cluster runs one server")?;
+    let tenant = cluster.data_tenant_id();
+    let table = unique_table("oracle_shared_lanes");
+    let fqn = format!("bifrost.bifrost.{table}");
+    register_table(server, tenant, &table).await?;
+    let reader = writer(server, "shared-lane-reader").await?;
+    reader
+        .write(&fqn, &journey_schema(), [journey_row(1, "row-1")])
+        .await?;
+    server.flush_bifrost().await?;
+    cluster.refresh_oracle_snapshots().await?;
+
+    let workloads = server.state().resources.workloads().clone();
+    let gateway = workloads.begin(Workload::Gateway, None, None);
+    let mut held = Vec::new();
+    while workloads.lanes().free() > 0 {
+        held.push(workloads.lanes().acquire(gateway.context()).await);
+    }
+    let waiting_before = workloads.lanes().waiting();
+    let mut query = tokio::spawn({
+        let client = reader.client().clone();
+        let sql = format!("SELECT id FROM {fqn}");
+        async move {
+            let mut stream = wyrd_client::Bifrost::query_only(&client)
+                .query(&BifrostQueryRequest {
+                    sql,
+                    deadline_ms: Some(60_000),
+                    params: Vec::new(),
+                })
+                .await?;
+            let mut rows = 0;
+            while let Some(batch) = stream.next_batch().await? {
+                rows += batch.num_rows();
+            }
+            Ok::<_, wyrd_client::bifrost::BifrostClientError>(rows)
+        }
+    });
+    let queued = tokio::time::timeout(Duration::from_secs(30), async {
+        while workloads.lanes().waiting() <= waiting_before {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    if queued.is_err() {
+        return Err("the query never queued for a CPU lane".into());
+    }
+    if tokio::time::timeout(Duration::from_millis(500), &mut query)
+        .await
+        .is_ok()
+    {
+        return Err("the query finished while other work held every CPU lane".into());
+    }
+    held.pop();
+    let rows = tokio::time::timeout(Duration::from_secs(30), query)
+        .await
+        .map_err(|_| "the query did not finish once a CPU lane was released")???;
+    if rows != 1 {
+        return Err(format!("the query returned {rows} rows, not 1").into());
+    }
+    drop(held);
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// A query holds a CPU lane only while a batch is being computed, not for
+/// the life of its stream: with a multi-batch result read only part way,
+/// verification work takes every process lane at once, and the query still
+/// delivers every row after those lanes return.
+///
+/// # Panics
+///
+/// Panics when the journey breaks; see [`prove_open_query_holds_no_lane`].
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn open_query_stream_holds_no_cpu_lane() {
+    prove_open_query_holds_no_lane()
+        .await
+        .expect("an open query stream leaves the lanes to other work");
+}
+
+/// Scans about 50 MiB in 8 MiB batches, more than any transport buffer, so the
+/// server is still producing it, reads one batch of a full scan, takes every
+/// process lane as verification work while the stream stays open, then
+/// returns the lanes and reads the rest.
+async fn prove_open_query_holds_no_lane() -> Result<(), JourneyError> {
+    use wyrd_runtime::resources::Workload;
+
+    const ROWS: i64 = 50_000;
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed()).await?;
+    let server = cluster
+        .server(0)
+        .ok_or("the one-pod cluster runs one server")?;
+    let tenant = cluster.data_tenant_id();
+    let table = unique_table("oracle_open_stream_lanes");
+    let fqn = format!("bifrost.bifrost.{table}");
+    register_table(server, tenant, &table).await?;
+    let reader = writer(server, "open-stream-reader").await?;
+    reader
+        .write(
+            &fqn,
+            &journey_schema(),
+            (0..ROWS).map(|id| journey_row(id, &format!("row-{id}"))),
+        )
+        .await?;
+    server.flush_bifrost().await?;
+    cluster.refresh_oracle_snapshots().await?;
+    let workloads = server.state().resources.workloads().clone();
+    // Every lane of the idle server, before the query can hold one.
+    let lanes = workloads.lanes().free();
+
+    let mut stream = wyrd_client::Bifrost::query_only(reader.client())
+        .query(&BifrostQueryRequest {
+            sql: format!("SELECT id, substr(unused_payload, 1, 1024) AS payload FROM {fqn}"),
+            deadline_ms: Some(60_000),
+            params: Vec::new(),
+        })
+        .await?;
+    let first = stream
+        .next_batch()
+        .await?
+        .ok_or("the query returned no batch")?;
+    let mut rows = first.num_rows();
+    if i64::try_from(rows)? >= ROWS {
+        return Err("the first batch held the whole result".into());
+    }
+
+    let verification = workloads.begin(Workload::Verification, None, None);
+    let held = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut held = Vec::new();
+        for _ in 0..lanes {
+            held.push(workloads.lanes().acquire(verification.context()).await);
+        }
+        held
+    })
+    .await
+    .map_err(|_| "an open query stream kept a CPU lane from verification work")?;
+    drop(held);
+
+    while let Some(batch) = stream.next_batch().await? {
+        rows += batch.num_rows();
+    }
+    if i64::try_from(rows)? != ROWS {
+        return Err(format!("the query returned {rows} rows, not {ROWS}").into());
+    }
+    cluster.shutdown().await?;
+    Ok(())
 }

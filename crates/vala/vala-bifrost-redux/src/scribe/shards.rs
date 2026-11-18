@@ -4447,7 +4447,11 @@ impl ShardOwner {
         root.resize_ingress(held.saturating_add(reserved))?;
         let rows = slice.rows.clone();
         let job = Arc::clone(&layout);
-        let physical = match self.ingress_cpu.run(move || job.shred(&rows)).await {
+        let physical = match self
+            .ingress_cpu
+            .run(Some(append.tenant), move || job.shred(&rows))
+            .await
+        {
             Ok(physical) => physical,
             Err(error) => {
                 if let Err(release) = root.resize_ingress(held) {

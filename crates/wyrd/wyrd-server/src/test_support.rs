@@ -179,6 +179,11 @@ pub fn shell_owners(
             None,
         )
         .expect("the default gateway builds"),
+        resources: wyrd_runtime::resources::ProcessResources::new(
+            std::num::NonZeroUsize::MIN,
+            u64::MAX,
+            u64::MAX,
+        ),
         verification,
         mcp: Mcp::default(),
         github: None,

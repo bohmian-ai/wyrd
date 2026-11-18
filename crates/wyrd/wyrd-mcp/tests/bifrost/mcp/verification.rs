@@ -5643,10 +5643,6 @@ mod pg_tests {
     /// The direct deadline the capacity journey runs under.
     const CAPACITY_TIMEOUT: Duration = Duration::from_secs(2);
 
-    /// Process memory left free while an operation should wait: short of one
-    /// session envelope, with room for the Scribe work that shares the ledger.
-    const SHORT_OF_A_SESSION: u64 = 64 << 20;
-
     /// Bytes of the answer the refused execution sends: half the 1 MiB
     /// `/mcp` body limit, so its buffered body and its retained bytes are
     /// each about this size.
@@ -5760,7 +5756,12 @@ mod pg_tests {
             "{refused}"
         );
 
-        let held = server.occupy_hosted_memory(SHORT_OF_A_SESSION)?;
+        // An overcommitted worker keeps pressure critical, so new work waits
+        // in admission while the byte ledger keeps its room.
+        let workloads = server.state().resources.workloads().clone();
+        let pressure = workloads.observe_commitment();
+        pressure.set(u64::MAX);
+        workloads.sample(0);
         let started = tokio::time::Instant::now();
         let timed_out = server_problem(agent.call_tool(call(EXECUTE, request(2.into()))?).await)?;
         let elapsed = started.elapsed();
@@ -5774,13 +5775,16 @@ mod pg_tests {
         );
         await_waiters(&server, 0).await?;
 
-        // Under the same hold a direct execution waits and a queued one
-        // defers; both pass once the memory frees.
+        // Under the same pressure a direct execution waits in hosted
+        // admission and a queued one waits for its input read; both pass
+        // once pressure recovers.
         let accepted = structured(agent.call_tool(call(ENQUEUE, request(2.into()))?).await?)?;
         let (judged, freed) =
             tokio::join!(agent.call_tool(call(EXECUTE, request(2.into()))?), async {
-                let waited = await_waiters(&server, 2).await;
-                drop(held);
+                let waited = await_waiters(&server, 1).await;
+                pressure.set(0);
+                workloads.sample(0);
+                workloads.sample(0);
                 waited
             });
         freed?;

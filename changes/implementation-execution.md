@@ -49,8 +49,15 @@ instructions remain valid outside that workflow when they are already
 decision-complete and the caller explicitly requests implementation. Do not use
 that exception to bypass an approved spec or unresolved material design.
 
-Keep the checklist live until every actionable requirement and required proof
-is complete.
+Use the task's existing acceptance entries as the live checklist and evidence
+record until every required outcome and proof is complete. Do not create a
+second obligations ledger or evidence table.
+
+Requirements remain defined in the approved spec. Task scenarios exercise
+them; implementation only adds evidence and source-backed coverage corrections.
+Preserve the expected behavior when recording results. Follow
+[ambiguous wording](spec-driven-development.md#ambiguous-wording) rather than
+guessing, omitting behavior, or introducing another promise.
 
 Do not require the task to predict helpers, private methods, local module
 structure, exact control flow, already-approved dependency APIs, test fixture
@@ -103,7 +110,8 @@ Stop before implementation when correctness requires:
 - changing requirements or acceptance outcomes.
 
 Report repository evidence, why no in-scope solution remains, and the exact
-authority required to resume.
+authority required to resume. Return `SPEC_REVISION_REQUIRED` when approved
+behavior needs clarification or correctness requires a new material decision.
 
 ## Execution record
 
@@ -115,15 +123,13 @@ The execution record may append or correct:
 - equivalent verification commands;
 - progress, failures, and evidence.
 
-Record:
-
-```text
-date/attempt
-classification: local | bounded correction
-discovery and repository evidence
-requirement, claim, or command affected
-action and verification result
-```
+Update the existing acceptance entries with proof references and results.
+Include actual assertion locations, focused commands, observed RED failures,
+GREEN results, and material limitations. Record shared commands once.
+Add a short note for a material failure, bounded
+correction or deviation: affected criterion, repository evidence, action and
+verification result. Do not narrate routine implementation or repeat the
+contract, file list or test inventory already visible in the task and diff.
 
 Do not rewrite the objective, requirement or decision IDs, required behavior,
 public or persisted contracts, security semantics, material architecture or
@@ -144,9 +150,12 @@ Use this order:
 6. If the failure is outside the diff, diagnose and fix it at its owner. A
    failure you did not cause is still yours; never spend effort proving it
    predates the change.
-7. If a material change or unavailable external authority is required, finish
-   unaffected work and return `BLOCKED`.
-8. Otherwise continue localization and diagnosis.
+7. If approved behavior needs clarification or a material change is required,
+   finish unaffected work and return `SPEC_REVISION_REQUIRED`.
+8. If necessary access or external authority is unavailable, or contradictory
+   task mechanics prevent an in-scope solution under settled approved behavior,
+   finish unaffected work and return `BLOCKED` with the precise impediment.
+9. Otherwise continue localization and diagnosis.
 
 Compiler, test, formatter, Clippy, rustdoc, process, or tool failures are
 diagnostic results. They do not terminate execution by category.
@@ -242,8 +251,9 @@ Lane selection, the `gate` aggregate rule, feature selection, and sequential
 Cargo use are in [`TESTING.md`](../TESTING.md#which-lane-do-i-run).
 
 A red lane blocks completion whoever turned it red. If its fix needs a
-material change, return `BLOCKED` with the diagnosis after every unaffected
-item is complete.
+material change, return `SPEC_REVISION_REQUIRED` with the diagnosis after every
+unaffected item is complete. Use `BLOCKED` only for unavailable access or
+authority, or contradictory task mechanics under settled approved behavior.
 
 ## Final diff audit
 
@@ -268,56 +278,27 @@ verification, a clean diff audit, and recorded bounded corrections.
 
 Implementation is not task completion. The task completes only after an
 independent `$wyrd-task-review` returns `PASS`.
+Return implementation evidence to the caller. Do not spawn reviewers or
+acceptance checkers, invoke task/change review, or automatically hand the
+candidate to a review workflow. The maintainer initiates reviews. External
+read-only diagnosticians may investigate concrete implementation failures;
+they return causes and fix sites, not acceptance verdicts.
 
-`BLOCKED` requires evidence that no in-scope solution remains without a
-material decision or genuinely unavailable authority. Difficulty, elapsed
+`SPEC_REVISION_REQUIRED` means approved behavior needs clarification or
+correctness requires a new material decision. Name the contract or boundary
+affected and the exact decision needed.
+
+`BLOCKED` requires evidence that no in-scope solution remains because necessary
+access or external authority is unavailable, or contradictory task mechanics
+need correction under settled approved behavior. Difficulty, elapsed
 time, partial progress, context compaction, a recoverable command failure,
 missing repository-managed setup, or a convenient handoff point do not qualify.
 
-Use this report:
+Return the status, task path, implemented outcome, behavioral verification,
+TDD compliance (`PASS`, `VIOLATED`, or `NOT_APPLICABLE`), material risk or blocker,
+and diff or commit reference. Link to the task's acceptance evidence rather
+than reproducing it. Omit empty sections.
 
-```markdown
-## Task Result
-
-Status: IMPLEMENTED | BLOCKED
-
-### Summary
-<Implemented outcome>
-
-### Acceptance Criteria
-
-| Criterion | Implementation evidence | Verification evidence | Result |
-|---|---|---|---|
-| AC1 | <source> | <test or check> | PASS | FAIL | UNVERIFIED |
-
-### Non-goals
-- <non-goal>: EXCLUDED | VIOLATED — <diff evidence>
-
-### Files Changed
-- `path` — <requirement or acceptance criterion>
-
-### Tests Added or Updated
-- <test> — <behavior proved>
-
-### Verification
-Commands executed sequentially:
-1. `command` — PASS | FAIL
-
-Features enabled:
-- `crate`: default | `<exact features>`
-
-### Execution Updates
-- None | <local or bounded correction, evidence, and result>
-
-### Material Deviations
-- None | <approved deviation and impact>
-
-### Blocking Work
-- None | <blocked item and exact authority required>
-
-### Risks and Notes
-- None | <non-blocking evidence>
-
-### Diff or Commit
-- <reference when available>
-```
+A TDD violation remains visible even when all behavioral criteria pass. Follow
+[TDD execution](spec-driven-development.md#tdd-execution) for disclosure and
+remaining work; a later mutation check does not establish test-first execution.

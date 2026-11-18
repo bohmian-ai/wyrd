@@ -7,13 +7,17 @@ description: Implement and verify one bounded Wyrd task or review-produced remed
 
 Implement one task, prove it, and inspect the final diff. Own reversible local
 technical decisions. Do not expand the task into another implementation plan.
+Return the result to the caller. Do not spawn acceptance checkers or reviewers,
+invoke task/change review, or automatically launch a review workflow. The
+maintainer initiates reviews; diagnosticians investigate failures only.
 
 ## Establish the contract
 
 Read the approved spec, the original task, and applicable repository authority.
 For remediation, also read the review verdict and the remediation task under
-`changes/active/<slug>/review/<review-name>/`. Treat the original task plus the
-validated findings as the contract; preserve portions already satisfying it.
+`changes/active/<slug>/review/<review-name>/`. The approved spec and governing
+authority define behavior; the task and validated findings identify work and
+proof gaps within it. Preserve portions already satisfying the contract.
 
 Read `AGENTS.md`, the nested `AGENTS.md` files for every directory the diff touches,
 [spec-driven development](../../../changes/spec-driven-development.md),
@@ -26,10 +30,17 @@ manifests, generated projections, and `mise.toml`.
 
 Use the task's existing acceptance list as the working checklist and evidence
 record. Do not append a separate obligations ledger, invent another ID family,
-or restate the contract. For an older task, annotate its existing proof rows or
+or restate the contract. Preserve scenario expectations while adding evidence.
+For an older task, annotate its existing proof rows or
 bullets in place; no packet rewrite is required. Keep required negative,
 concurrency, tenancy and lifecycle cases visible. Add a missing required case
 only with its contract reference, without expanding approved scope.
+
+Apply the shared ambiguous-wording rule before interpreting unclear behavior.
+Resolve reversible private choices yourself. If the spec and owning authority
+leave materially different behavioral readings, report the exact wording,
+competing interpretations, and smallest decision needed; continue unaffected
+work. Do not guess, omit required behavior, or invent a promise to close the gap.
 
 One test may prove several acceptance observations, and one observation may
 need several forms of evidence. Cite shared proof once and refer to it from
@@ -109,18 +120,18 @@ when the cause involves timing, ordering, or concurrency. Give it only the
 failing command, the trace, and the diff, never your hypothesis. It returns the
 cause, fix site, and affected callers. Record its report beside the diagnosis,
 then apply the Ponytail ladder to the smallest fix at that root cause.
+The diagnostician does not audit acceptance, issue a completion verdict, or
+become a reviewer. Expected missing-behavior RED failures need no diagnostician.
 
 ## Never invent complexity
 
 If there is already a standard and conventional way to do something (a
 published standard such as an RFC, or the established practice of comparable
-widely used projects), do it that way. Do not invent a mechanism, state,
-check, file, setting, option, or error that the standard way does not have.
-If the task text, a review finding, or a remediation asks for one, report it
-to the caller instead of building it. Report it when found, naming the
-obligation ID, and route it as `SPEC_REVISION_REQUIRED` or `BLOCKED`; do not
-continue as though the obligation were settled or met. An obligation the
-standard way cannot satisfy is open, not a known limit.
+widely used projects), reuse it when it satisfies the approved behavior and
+repository authority. Add machinery only for a demonstrated contract gap.
+A different conventional implementation is not itself a defect, and convention
+does not override an explicit Wyrd requirement. Route an actual conflict through
+the shared task/spec correction rules; do not invent another obligation.
 
 ## Delegate by acceptance scenario
 
@@ -138,8 +149,9 @@ final tracked and untracked diff audit. Do not run full user-journey suites or
 broad aggregates for a task or remediation; they run once at change review. Derive corrected commands when task text is stale, without
 substituting weaker proof.
 
-Update the existing acceptance entries in place with concise proof locations,
-RED and GREEN results, and behavioral verification status. Record each exact
+Update the existing acceptance entries in place with actual assertion locations,
+observed RED failures, GREEN results, material limitations, and behavioral
+verification status. Record each exact
 command once; entries may refer to it. Do not append a second evidence table or
 an implementation narrative. Already-correct behavior may use existing proof;
 documentation and structural constraints need appropriate proof, not artificial
@@ -164,21 +176,23 @@ alone is not `PASS`.
 Also confirm that every non-goal remained excluded and no unrelated file was
 changed. Record commands and material limits without narrating implementation.
 
-Before returning `IMPLEMENTED`, spawn a fresh read-only checker with only the
-task file and the diff, never your summary. It answers: which acceptance entries
-lack a contract source; which required outcomes or cases are missing; which
-lack appropriate proof; and whether the recorded TDD compliance is supported.
-Correct the evidence without changing the contract, then resolve or mark `FAIL`
-every unproven required outcome or case.
+Before returning `IMPLEMENTED`, inspect your own diff and reconcile the assigned
+spec requirements, task scenarios, assertions, and recorded execution results.
+Resolve or mark `FAIL` every unproven requirement or case. This self-check does
+not grant independent acceptance and must not spawn a checker or reviewer.
 
-Return `IMPLEMENTED` only when every obligation is `PASS`. Otherwise return
-`BLOCKED` with the open obligation IDs, or `SPEC_REVISION_REQUIRED` when closing
-one needs an expensive-to-reverse decision. A goal, stop hook, or completion
+Return `IMPLEMENTED` only when every assigned requirement and required proof
+passes. An unproven case is work to finish, not itself a blocker. Continue
+in-scope recovery and unaffected work; return `BLOCKED` only when no in-scope
+solution remains without unavailable authority or a task correction, naming
+the open requirement references and exact impediment. Return
+`SPEC_REVISION_REQUIRED` when closing one needs clarification of approved
+behavior or an expensive-to-reverse decision. A goal, stop hook, or completion
 pressure never justifies a `PASS`. Return the status with the task path,
 behavioral verification status, TDD compliance (`PASS`, `VIOLATED`, or
 `NOT_APPLICABLE`), material risk, and diff or commit reference. `IMPLEMENTED`
 reports verified behavior; it does not erase a TDD violation, which must remain
 visible to independent task review. Create a commit only when requested.
-`IMPLEMENTED` routes the immutable cumulative
-candidate to `$wyrd-task-review`; only that independent review can complete the
-task. Implementation does not approve, merge, push, or deploy it.
+Return the candidate reference and evidence to the caller. Only an independent
+`$wyrd-task-review` initiated by the maintainer can complete the task.
+Implementation does not approve, merge, push, or deploy it.

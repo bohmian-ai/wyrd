@@ -19,7 +19,7 @@ use datafusion::execution::memory_pool::MemoryPool;
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::execution::{SpillFile, SpillWriter, TempFileFactory};
 use futures_util::Stream;
-use wyrd_runtime::resources::{ByteCharge, ByteLedger};
+use wyrd_runtime::resources::{ByteCharge, ByteLedger, CpuLanes};
 
 use crate::resources::BifrostResourceError;
 
@@ -246,7 +246,8 @@ impl Drop for ChargedSpillFile {
     }
 }
 
-/// A spill writer that charges the process scratch ledger before each write.
+/// A spill writer that charges the process scratch ledger before each write
+/// and does its disk IO off the query's CPU lane.
 struct ChargedSpillWriter {
     /// The query disk manager's writer, which enforces the per-query cap.
     inner: Box<dyn SpillWriter>,
@@ -266,7 +267,7 @@ impl std::io::Write for ChargedSpillWriter {
                 "spill exceeds the process scratch budget: {refusal}"
             ))
         })?;
-        let written = self.inner.write(buf);
+        let written = CpuLanes::off_lane(|| self.inner.write(buf));
         let kept = written
             .as_ref()
             .map_or(0, |written| u64::try_from(*written).unwrap_or(requested));
@@ -275,13 +276,13 @@ impl std::io::Write for ChargedSpillWriter {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
+        CpuLanes::off_lane(|| self.inner.flush())
     }
 }
 
 impl SpillWriter for ChargedSpillWriter {
     fn finish(&mut self) -> DataFusionResult<()> {
-        self.inner.finish()
+        CpuLanes::off_lane(|| self.inner.finish())
     }
 }
 
@@ -389,6 +390,136 @@ mod tests {
             "an undeleted file keeps its bytes charged"
         );
         drop((first, second));
+    }
+
+    /// A spill write inside a laned query poll returns the poll's CPU lane
+    /// to other work instead of holding it across the disk IO.
+    ///
+    /// # Panics
+    /// Panics when the lane is still held after the write.
+    #[test]
+    fn spill_writes_return_the_query_lane() {
+        use std::pin::pin;
+        use std::task::{Context, Poll, Waker};
+
+        use wyrd_runtime::resources::{ProcessResources, Workload};
+
+        let root = tempfile::tempdir().expect("test spill root must exist");
+        let runtime = OracleSpillRuntime::new(root.path(), ByteLedger::new(1 << 20))
+            .expect("bounded spill owner must be created");
+        let pool = Arc::new(GreedyMemoryPool::new(1_024)) as Arc<dyn MemoryPool>;
+        let (query, _) = build_query_runtime(Some(&runtime), pool, 1 << 20).expect("query runtime");
+        let file = query.disk_manager.create_tmp_file("laned").expect("file");
+        let mut writer = file.open_writer().expect("writer");
+        let resources = ProcessResources::new(std::num::NonZeroUsize::MIN, 1 << 30, 1 << 30);
+        let workloads = resources.workloads();
+        let operation = workloads.begin(Workload::Bifrost, None, None);
+        let lanes = workloads.lanes();
+        let mut poll = pin!(lanes.laned(operation.context(), async {
+            let before = lanes.free();
+            writer.write_all(&[0; 64]).expect("the spill write fits");
+            (before, lanes.free())
+        }));
+        let Poll::Ready((before, after)) =
+            poll.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            panic!("the poll completes");
+        };
+        assert_eq!(before, 0, "the poll runs on the only lane");
+        assert_eq!(after, 1, "the spill write returned the lane");
+        assert_eq!(lanes.free(), 1, "the lane is returned exactly once");
+    }
+
+    /// A real query that spills while it runs on a CPU lane writes its spill
+    /// through the charged files, and each spill write returns the lane for
+    /// the rest of that poll.
+    ///
+    /// # Panics
+    /// Panics when the sort does not spill, returns the wrong rows, or no
+    /// poll observes the lane returned after a spill write.
+    #[tokio::test]
+    async fn spilling_query_returns_its_lane_during_spill_writes() {
+        use std::task::Poll;
+
+        use arrow::array::{Int64Array, RecordBatch};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::datasource::MemTable;
+        use datafusion::execution::memory_pool::GreedyMemoryPool;
+        use datafusion::physical_plan::execute_stream;
+        use datafusion::prelude::{SessionConfig, SessionContext};
+        use futures_util::StreamExt as _;
+        use wyrd_runtime::resources::{ProcessResources, Workload};
+
+        let root = tempfile::tempdir().expect("test spill root must exist");
+        let scratch = ByteLedger::new(1 << 30);
+        let runtime = OracleSpillRuntime::new(root.path(), scratch.clone())
+            .expect("bounded spill owner must be created");
+        let pool = Arc::new(GreedyMemoryPool::new(2 << 20)) as Arc<dyn MemoryPool>;
+        let (query, _disk) = build_query_runtime(Some(&runtime), pool, 1 << 30).expect("runtime");
+        let context = SessionContext::new_with_config_rt(
+            SessionConfig::new()
+                .with_target_partitions(1)
+                .with_batch_size(8_192)
+                .with_sort_spill_reservation_bytes(256 << 10),
+            query,
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let batches = (0..64)
+            .map(|batch| {
+                let values = (0..8_192).map(|row| (batch * 8_192 + row) * 7 % 524_287);
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(Int64Array::from_iter_values(values))],
+                )
+                .expect("batch")
+            })
+            .collect();
+        let table = MemTable::try_new(schema, vec![batches]).expect("table");
+        context
+            .register_table("t", Arc::new(table))
+            .expect("registers");
+        let plan = context
+            .sql("SELECT v FROM t ORDER BY v DESC")
+            .await
+            .expect("plans")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        let mut stream = execute_stream(Arc::clone(&plan), context.task_ctx()).expect("executes");
+
+        let resources = ProcessResources::new(std::num::NonZeroUsize::MIN, 1 << 30, 1 << 30);
+        let workloads = resources.workloads();
+        let operation = workloads.begin(Workload::Bifrost, None, None);
+        let lanes = workloads.lanes();
+        let (mut rows, mut returned) = (0, false);
+        lanes
+            .laned(
+                operation.context(),
+                std::future::poll_fn(|cx| {
+                    loop {
+                        let polled = stream.poll_next_unpin(cx);
+                        // Still inside the laned poll: a spill write in it
+                        // has returned the lane.
+                        returned |= lanes.free() == 1;
+                        match polled {
+                            Poll::Ready(Some(batch)) => {
+                                rows += batch.expect("the sort runs").num_rows();
+                            }
+                            Poll::Ready(None) => return Poll::Ready(()),
+                            Poll::Pending => return Poll::Pending,
+                        }
+                    }
+                }),
+            )
+            .await;
+        let spills = plan
+            .metrics()
+            .and_then(|metrics| metrics.spill_count())
+            .unwrap_or(0);
+        assert!(spills > 0, "the sort spills under a 2 MiB pool");
+        assert_eq!(rows, 64 * 8_192);
+        assert!(returned, "a spill write returned the query's lane");
+        assert_eq!(lanes.free(), 1);
     }
 
     /// A zero query share installs a disk manager that refuses temp files.

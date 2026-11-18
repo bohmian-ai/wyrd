@@ -27,7 +27,7 @@
 //! first keeps it, and the other writer breaks.
 
 use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use chrono::{DateTime, Utc};
 use sha2::{Digest as _, Sha256};
@@ -58,7 +58,7 @@ use super::results::{ResultPayloadBuilder, ResultRun};
 use crate::scribe_outbox::{ScribeOutbox, ScribeSink, ScribeWrite, revision_batch_id};
 use crate::state::AppState;
 use wyrd_runtime::outbox::Reservation;
-use wyrd_runtime::resources::ByteCharge;
+use wyrd_runtime::resources::{Workload, WorkloadManager};
 
 /// The table every revision is a row of, and the logical table of every
 /// revision's batch fence.
@@ -286,18 +286,11 @@ struct Held {
     /// Set once a revision was refused, its acceptance is unknown, or the
     /// writer's lease was lost; this writer records nothing more.
     broken: bool,
-    /// The process memory charge for `state`, or `None` for a writer whose
-    /// outbox charges no ledger. Charged once for a recovered state and
-    /// grown by each retained value as it is recorded, never by recounting
-    /// the state; it lasts as long as `state`, through every revision's
-    /// acknowledgement, and returns when the writer drops.
-    live: Option<ByteCharge>,
 }
 
 impl Held {
-    /// `state`, accepted at `revision` and charged `live`, with nothing
-    /// pending.
-    const fn new(state: ExecutionState, revision: i64, live: Option<ByteCharge>) -> Self {
+    /// `state`, accepted at `revision`, with nothing pending.
+    const fn new(state: ExecutionState, revision: i64) -> Self {
         Self {
             state,
             changes: 0,
@@ -305,79 +298,22 @@ impl Held {
             covered: 0,
             writing: false,
             broken: false,
-            live,
         }
     }
 
-    /// Grow the live charge by `bytes` a change just retained. The growth
-    /// is mandatory, since the change is already made, so it is charged even
-    /// past the limit and later fallible admissions refuse sooner instead.
-    fn retain(&mut self, bytes: u64) {
-        if let Some(live) = &mut self.live {
-            live.grow_infallible(bytes);
-        }
-    }
-
-    /// A charge for one copy of the live state, taken from the live
-    /// charge's ledger before the copy is made; `None` when uncharged.
-    fn charge_copy(&self) -> Option<ByteCharge> {
-        self.live
-            .as_ref()
-            .map(|live| live.ledger().charge_infallible(live.bytes()))
-    }
-}
-
-/// Bytes `value` retains in a live state: its compact JSON length plus
-/// [`Checkpoint::ENTRY_BYTES`] for its in-memory structure.
-fn retained(value: &impl serde::Serialize) -> u64 {
-    super::encoded_len(value, false).saturating_add(Checkpoint::ENTRY_BYTES as u64)
-}
-
-/// A copy read out of a live state with the process memory charge taken
-/// for it before it was made; the charge returns when the copy drops.
-#[derive(Debug)]
-pub struct Charged<T> {
-    /// The copy.
-    value: T,
-    /// Its charge, or `None` when the state is uncharged.
-    charge: Option<ByteCharge>,
-}
-
-impl<T> Charged<T> {
-    /// `value` read from no charged state, holding no charge.
-    pub const fn uncharged(value: T) -> Self {
-        Self {
-            value,
-            charge: None,
-        }
-    }
-
-    /// The copy and its charge, for a caller that moves the copy into an
-    /// owner and keeps the charge beside it.
-    pub fn into_parts(self) -> (T, Option<ByteCharge>) {
-        (self.value, self.charge)
-    }
-}
-
-impl<T> std::ops::Deref for Charged<T> {
-    type Target = T;
-
-    /// The copy.
-    fn deref(&self) -> &T {
-        &self.value
-    }
-}
-
-impl<T: PartialEq> PartialEq for Charged<T> {
-    /// Copies compare by value; their charges do not.
-    fn eq(&self, other: &Self) -> bool {
-        self.value == other.value
+    /// A copy of the terminal decision the state holds, as
+    /// [`Decision::of`] reads it; `None` when nothing is decided.
+    fn decision(&self) -> Option<Decision> {
+        Decision::of(&self.state)
     }
 }
 
 /// One writer's live state and its background persistence: everything a
 /// revision is written with, shared with the flush that writes it.
 struct Writer {
+    /// The process workloads whose CPU lanes prepare each revision as the
+    /// execution's tenant's verification work.
+    workloads: WorkloadManager,
     /// The outbox every revision is staged on.
     outbox: Arc<ScribeOutbox>,
     /// The execution's tenant.
@@ -419,14 +355,14 @@ impl Writer {
     /// Persist every change in background until an accepted revision holds
     /// the latest one or the writer breaks.
     ///
-    /// Each turn first reserves the revision's outbox slot, then freezes the
-    /// live state, every change so far, into the next revision under the
-    /// short lock and stages it at once, so a frozen copy never waits for
-    /// capacity uncharged. The copy is charged the live state's size before
-    /// it is made, and that charge passes to the outbox as part of the
-    /// revision's weight. Changes made while a revision is in flight
-    /// coalesce into the one after it, and only one frozen copy exists at a
-    /// time.
+    /// Each turn first reserves the revision's outbox slot, then copies the
+    /// live state, every change so far, under the short lock, prepares the
+    /// copy's row off the lock on the blocking pool, holding a shared CPU
+    /// lane as the tenant's verification work only while it encodes, and
+    /// stages it at once, weighing exactly that row. Changes made while a
+    /// revision is in flight coalesce into the one after it, and only one
+    /// frozen copy exists at a time. A copy that cannot be prepared breaks
+    /// the writer.
     async fn flush(self: Arc<Self>) {
         loop {
             {
@@ -440,12 +376,32 @@ impl Writer {
             }
             let written = match self.reserve().await {
                 Some(slot) => {
-                    let (revision, covers, frozen, state) = {
+                    let (revision, covers, state) = {
                         let held = self.lock();
-                        let frozen = held.charge_copy();
-                        (held.revision + 1, held.changes, frozen, held.state.clone())
+                        (held.revision + 1, held.changes, held.state.clone())
                     };
-                    let accepted = self.write(slot, revision, state, frozen).await;
+                    let row = Arc::clone(&self.row);
+                    // Preparation is mandatory drain: it begins without
+                    // admission, so memory pressure never holds it, and
+                    // takes a CPU lane only while it encodes.
+                    let work =
+                        self.workloads
+                            .begin(Workload::Verification, Some(self.tenant), None);
+                    let workloads = self.workloads.clone();
+                    let prepared = tokio::task::spawn_blocking(move || {
+                        workloads
+                            .lanes()
+                            .run_blocking(work.context(), || Checkpoint::new(revision, &state, row))
+                    })
+                    .await;
+                    let accepted = match prepared {
+                        Ok(Ok(checkpoint)) => self.write(slot, revision, checkpoint).await,
+                        Ok(Err(error)) => {
+                            tracing::warn!(execution_id = %self.row.execution_id, revision, %error, "an execution state revision cannot be prepared");
+                            false
+                        }
+                        Err(error) => std::panic::resume_unwind(error.into_panic()),
+                    };
                     Some((revision, covers, accepted))
                 }
                 None => None,
@@ -488,33 +444,27 @@ impl Writer {
         }
     }
 
-    /// Stage `state` as `revision` on its reserved `slot` under the
-    /// revision's batch identity and wait for Scribe to accept it, returning
-    /// whether it did.
+    /// Stage the prepared `checkpoint` as `revision` on its reserved `slot`
+    /// under the revision's batch identity and wait for Scribe to accept it,
+    /// returning whether it did.
     ///
-    /// Staging charges the revision's weight to the outbox and the process
-    /// memory ledger until it is written, taking over `frozen`, the charge
-    /// the copy was given before it was made; its lease's loss ends the
-    /// wait. The outbox writer prepares the row, so this does no encoding,
-    /// and nothing here holds the state's lock.
+    /// Staging charges the checkpoint's weight, its prepared row, to the
+    /// outbox and the process memory ledger until it is written; its lease's
+    /// loss ends the wait. Nothing here holds the state's lock.
     async fn write(
         &self,
         slot: Reservation<ScribeSink>,
         revision: i64,
-        state: ExecutionState,
-        frozen: Option<ByteCharge>,
+        checkpoint: Checkpoint,
     ) -> bool {
         let (sender, acked) = oneshot::channel();
         let write = ScribeWrite::ExecutionState {
             batch: revision_batch(self.row.execution_id, revision),
-            checkpoint: Arc::new(Checkpoint::new(revision, state, Arc::clone(&self.row))),
+            checkpoint: Arc::new(checkpoint),
             attribution: self.row.attribution,
             acked: Mutex::new(Some(sender)),
         };
-        match frozen {
-            Some(frozen) => slot.stage_charged(self.tenant, write, frozen),
-            None => slot.stage(self.tenant, write),
-        }
+        slot.stage(self.tenant, write);
         tokio::select! {
             biased;
             () = self.lost.cancelled() => false,
@@ -522,128 +472,28 @@ impl Writer {
         }
     }
 }
-/// One frozen revision staged on the Scribe outbox, whose writer prepares
-/// its row on the outbox's bounded encoding pool, once, so every retry of
-/// the revision submits the same row.
+/// One frozen revision staged on the Scribe outbox, its row prepared once
+/// before staging, so every retry of the revision submits the same row and
+/// the outbox charges exactly that row.
 #[derive(Debug)]
 pub struct Checkpoint {
-    /// The revision this is.
-    revision: i64,
-    /// The complete state it records.
-    state: ExecutionState,
     /// The identities its row records.
     row: Arc<StateRow>,
-    /// The memory it is charged, fixed when it is frozen.
-    weight: usize,
-    /// The prepared row, or why it cannot be prepared.
-    prepared: OnceLock<Result<StagedRow, String>>,
+    /// The prepared `bifrost.verification.execution_events` row.
+    prepared: StagedRow,
 }
 
 impl Checkpoint {
-    /// Bytes each entry of the state is charged beyond its encoded length,
-    /// for its in-memory structure and its prepared row's per-value overhead.
-    const ENTRY_BYTES: usize = 512;
-
-    /// Times its encoded length the state is charged: the frozen state, the
-    /// JSON tree and Variant its preparation builds, and the prepared row
-    /// holding that Variant all hold its values at once.
-    const COPIES: usize = 4;
-
-    /// `state` frozen as `revision` of the execution `row` identifies, not
-    /// prepared yet.
-    #[must_use]
-    pub fn new(revision: i64, state: ExecutionState, row: Arc<StateRow>) -> Self {
-        let weight = Self::charge(&state);
-        Self {
-            revision,
-            state,
-            row,
-            weight,
-            prepared: OnceLock::new(),
-        }
-    }
-
-    /// The memory `state` is charged: [`Self::COPIES`] times its compact
-    /// JSON length, which every settlement, captured value, reason, outcome,
-    /// identity, failure, and publication descriptor adds to, plus
-    /// [`Self::ENTRY_BYTES`] per entry.
-    ///
-    /// The length is counted as the state streams into a sink that keeps no
-    /// byte, so the charge follows every retained value without building the
-    /// row its preparation does later on the outbox's encoding pool.
-    // ponytail: a counting pass over the state per revision; charge per-entry deltas if large states make it costly.
-    fn charge(state: &ExecutionState) -> usize {
-        // A state that does not encode is refused by its preparation; what
-        // was counted before the error still bounds its memory.
-        let counted = usize::try_from(super::encoded_len(state, false)).unwrap_or(usize::MAX);
-        counted
-            .saturating_mul(Self::COPIES)
-            .saturating_add(Self::ENTRY_BYTES.saturating_mul(Self::entries(state)))
-    }
-
-    /// The entries `state` holds that [`Self::ENTRY_BYTES`] is charged for.
-    fn entries(state: &ExecutionState) -> usize {
-        let objects: usize = state.publications.iter().map(|p| p.objects.len()).sum();
-        1 + state.invocations.len() + state.publications.len() + objects
-    }
-
-    /// The memory a live `state` is charged: its compact JSON length plus
-    /// [`Self::ENTRY_BYTES`] per entry, the size [`retained`] grows it by.
-    fn live(state: &ExecutionState) -> u64 {
-        let entries = u64::try_from(Self::entries(state)).unwrap_or(u64::MAX);
-        super::encoded_len(state, false)
-            .saturating_add((Self::ENTRY_BYTES as u64).saturating_mul(entries))
-    }
-
-    /// A revision whose row is already prepared, such as one written in
-    /// another state format.
-    #[cfg(any(test, feature = "test-support"))]
-    #[must_use]
-    pub fn prepared(revision: i64, row: Arc<StateRow>, prepared: StagedRow) -> Self {
-        Self {
-            revision,
-            weight: prepared.owned_bytes(),
-            state: ExecutionState::fresh(),
-            row,
-            prepared: OnceLock::from(Ok(prepared)),
-        }
-    }
-
-    /// The execution whose revision this is.
-    #[must_use]
-    pub fn execution_id(&self) -> ExecutionId {
-        self.row.execution_id
-    }
-
-    /// Memory the outbox charges while the revision waits, fixed when it
-    /// was frozen, so admission, every retry, and release charge the same.
-    #[must_use]
-    pub const fn weight(&self) -> usize {
-        self.weight
-    }
-
-    /// The revision's `bifrost.verification.execution_events` row, prepared
-    /// on first use.
-    ///
-    /// # Errors
-    /// Returns why the state cannot be encoded as its row.
-    pub fn row(&self) -> Result<&StagedRow, &str> {
-        self.prepared
-            .get_or_init(|| self.prepare())
-            .as_ref()
-            .map_err(String::as_str)
-    }
-
-    /// Encodes the state as its revision's row.
+    /// `state` frozen as `revision` of the execution `row` identifies,
+    /// prepared as its row. Run off any lock: this encodes the state.
     ///
     /// # Errors
     /// Returns the encoding error's message when the state does not encode
     /// as JSON, or its checkpoint row does not build, such as when the value
     /// exceeds a Variant bound.
-    fn prepare(&self) -> Result<StagedRow, String> {
-        let value = serde_json::to_value(&self.state).map_err(|error| error.to_string())?;
-        let row = &self.row;
-        ResultPayloadBuilder::new(
+    pub fn new(revision: i64, state: &ExecutionState, row: Arc<StateRow>) -> Result<Self, String> {
+        let value = serde_json::to_value(state).map_err(|error| error.to_string())?;
+        let prepared = ResultPayloadBuilder::new(
             ResultRun {
                 execution_id: row.execution_id,
                 run_id: row.run_id.as_ref(),
@@ -660,9 +510,37 @@ impl Checkpoint {
             Utc::now(),
             Utc::now(),
         )
-        .checkpoint(self.revision, self.state.terminal.is_some(), &value)
+        .checkpoint(revision, state.terminal.is_some(), &value)
         .map(|row| row.row)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+        Ok(Self { row, prepared })
+    }
+
+    /// A revision whose row is already prepared, such as one written in
+    /// another state format.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub const fn prepared(row: Arc<StateRow>, prepared: StagedRow) -> Self {
+        Self { row, prepared }
+    }
+
+    /// The execution whose revision this is.
+    #[must_use]
+    pub fn execution_id(&self) -> ExecutionId {
+        self.row.execution_id
+    }
+
+    /// Memory the outbox charges while the revision waits: its prepared
+    /// row, so admission, every retry, and release charge the same.
+    #[must_use]
+    pub fn weight(&self) -> usize {
+        self.prepared.owned_bytes()
+    }
+
+    /// The revision's prepared `bifrost.verification.execution_events` row.
+    #[must_use]
+    pub const fn row(&self) -> &StagedRow {
+        &self.prepared
     }
 }
 
@@ -699,17 +577,25 @@ impl RunState {
     ) -> Result<Self, StateError> {
         let (revision, state) = Self::accepted(app, tenant, row.execution_id, records).await?;
         Ok(Self::at(
-            outbox, tenant, row, deadline, lost, state, revision,
+            app.resources.workloads().clone(),
+            outbox,
+            tenant,
+            row,
+            deadline,
+            lost,
+            state,
+            revision,
         ))
     }
 
     /// A writer of `state`, accepted at `revision`, which records `row`'s
-    /// identity unless the state already holds one. `lost` is the
-    /// execution's lease-loss token.
-    ///
-    /// The state, already in memory, is charged to the outbox's process
-    /// memory ledger once, infallibly, for as long as the writer holds it.
+    /// identity unless the state already holds one and prepares each
+    /// revision on `workloads`' CPU lanes. `lost` is the execution's
+    /// lease-loss token. The live state is a small graph left to aggregate
+    /// pressure; only its staged revisions are charged.
+    #[expect(clippy::too_many_arguments, reason = "one writer input per argument")]
     pub(crate) fn at(
+        workloads: WorkloadManager,
         outbox: Arc<ScribeOutbox>,
         tenant: DataTenantId,
         row: StateRow,
@@ -719,16 +605,14 @@ impl RunState {
         revision: i64,
     ) -> Self {
         state.identity.get_or_insert_with(|| row.identity.clone());
-        let live = outbox
-            .memory()
-            .map(|memory| memory.charge_infallible(Checkpoint::live(&state)));
         Self {
             writer: Arc::new(Writer {
+                workloads,
                 outbox,
                 tenant,
                 row: Arc::new(row),
                 lost,
-                held: Mutex::new(Held::new(state, revision, live)),
+                held: Mutex::new(Held::new(state, revision)),
                 flushed: Notify::new(),
             }),
             deadline,
@@ -815,10 +699,10 @@ impl RunState {
         self.writer.lock().state.clone()
     }
 
-    /// The terminal decision the live state holds, if any.
+    /// A copy of the terminal decision the live state holds, if any.
     #[must_use]
     pub fn decision(&self) -> Option<Decision> {
-        Decision::of(&self.writer.lock().state)
+        self.writer.lock().decision()
     }
 
     /// The approval occurrences the live state records.
@@ -828,21 +712,13 @@ impl RunState {
     }
 
     /// `engine` restoring this execution from the live state, recording
-    /// into `store`, with the charge for the restoration copy it takes; the
-    /// caller holds the charge while the engine runs.
-    ///
-    /// The copy is charged the live state's size before it is made.
+    /// into `store`.
     pub fn restore(
         &self,
         engine: vala_verify::blocks::VerificationEngine,
         store: Arc<dyn vala_verify::blocks::Checkpoints>,
-    ) -> Charged<vala_verify::blocks::VerificationEngine> {
-        let held = self.writer.lock();
-        let charge = held.charge_copy();
-        Charged {
-            value: engine.with_checkpoints(store, &held.state),
-            charge,
-        }
+    ) -> vala_verify::blocks::VerificationEngine {
+        engine.with_checkpoints(store, &self.writer.lock().state)
     }
 
     /// Wait until an accepted revision holds every change made so far,
@@ -917,35 +793,32 @@ impl RunState {
         })
     }
 
-    /// The decision the state holds, else `decision()` recorded as it. The
-    /// check and the change share one memory lock, so two deciders never
-    /// both decide.
+    /// A copy of the decision the state holds, else of `decision()`
+    /// recorded as it. The check and the change share one memory lock, so
+    /// two deciders never both decide.
     ///
     /// # Errors
     /// As [`Self::select`].
+    ///
+    /// # Panics
+    /// Panics if the state holds no decision right after one was recorded
+    /// under the same lock, which cannot happen.
     fn decide(&self, decision: impl FnOnce() -> Decision) -> Result<Decision, StateError> {
         let mut held = self.writer.lock();
-        if let Some(decided) = Decision::of(&held.state) {
+        if let Some(decided) = held.decision() {
             return Ok(decided);
         }
         if !self.writer.current(&held) {
             return Err(StateError::Stale);
         }
-        let decided = decision();
-        // ponytail: counted under the lock; a terminal record is one bounded
-        // value, so the pass is short.
-        match &decided {
-            Decision::Selected(selected) => {
-                held.retain(retained(selected));
-                held.state.terminal = Some(selected.clone());
-            }
-            Decision::Failed(failure) => {
-                held.retain(retained(failure));
-                held.state.failure = Some(failure.clone());
-            }
+        match decision() {
+            Decision::Selected(selected) => held.state.terminal = Some(selected),
+            Decision::Failed(failure) => held.state.failure = Some(failure),
         }
         self.writer.changed(&mut held);
-        Ok(decided)
+        Ok(held
+            .decision()
+            .expect("the decision was just recorded in the live state"))
     }
 
     /// Record that the execution parks waiting for the deferred inputs
@@ -965,20 +838,14 @@ impl RunState {
         waiting: BTreeSet<SlotName>,
         approvals: Vec<ApprovalOccurrence>,
     ) -> Result<(), StateError> {
-        let grows: Vec<u64> = approvals.iter().map(retained).collect();
-        let waits = retained(&waiting);
         let mut held = self.writer.lock();
         if !self.writer.current(&held) {
             return Err(StateError::Stale);
         }
         let mut changed = held.state.waiting != waiting;
-        if changed {
-            held.retain(waits);
-        }
         held.state.waiting = waiting;
-        for (occurrence, grows) in approvals.into_iter().zip(grows) {
+        for occurrence in approvals {
             if record_approval(&mut held.state, self.writer.row.execution_id, occurrence) {
-                held.retain(grows);
                 changed = true;
             }
         }
@@ -996,14 +863,12 @@ impl RunState {
     /// Returns [`StateError::Stale`] once the writer broke or lost its
     /// lease.
     pub fn accept_evidence(&self, slot: &SlotName, evidence: EvidenceId) -> Result<(), StateError> {
-        let grows = retained(&(slot, evidence));
         let mut held = self.writer.lock();
         if !self.writer.current(&held) {
             return Err(StateError::Stale);
         }
         let waited = held.state.waiting.remove(slot);
         if held.state.evidence.insert(slot.clone(), evidence) != Some(evidence) || waited {
-            held.retain(grows);
             self.writer.changed(&mut held);
         }
         Ok(())
@@ -1034,10 +899,6 @@ impl RunState {
         call: PublicationCall<'_>,
         budget: PublicationBudget,
     ) -> PublicationAcceptance {
-        let grows = retained(&(call.publication, call.call_id, call.objects)).saturating_add(
-            (Checkpoint::ENTRY_BYTES as u64)
-                .saturating_mul(u64::try_from(call.objects.len()).unwrap_or(u64::MAX)),
-        );
         let mut held = self.writer.lock();
         if !self.writer.current(&held) {
             return PublicationAcceptance::StaleLease;
@@ -1066,7 +927,6 @@ impl RunState {
             objects: call.objects.to_vec(),
             retained_bytes: call.retained_bytes,
         });
-        held.retain(grows);
         self.writer.changed(&mut held);
         PublicationAcceptance::Accepted
     }
@@ -1075,31 +935,16 @@ impl RunState {
     /// iteration, and attempt, in acceptance order within an attempt. Each
     /// was accepted before its step settled, so a dependent of the settled
     /// step reads its publications from memory.
-    ///
-    /// The copy is charged to the live state's ledger before it is made and
-    /// holds that charge until it drops.
     #[must_use]
-    pub fn publications(&self, step: &TaskId) -> Charged<Vec<AcceptedPublication>> {
+    pub fn publications(&self, step: &TaskId) -> Vec<AcceptedPublication> {
         let held = self.writer.lock();
-        let selected: Vec<&AcceptedPublication> = held
+        let mut found: Vec<_> = held
             .state
             .publications
             .iter()
             .filter(|accepted| accepted.publication.producer.step_id == *step)
+            .cloned()
             .collect();
-        // ponytail: counted under the lock; the publication budget bounds
-        // the pass.
-        let charge = held.live.as_ref().map(|live| {
-            let entries: u64 = selected
-                .iter()
-                .map(|accepted| 1 + accepted.objects.len() as u64)
-                .sum();
-            live.ledger().charge_infallible(
-                super::encoded_len(&selected, false)
-                    .saturating_add((Checkpoint::ENTRY_BYTES as u64).saturating_mul(entries)),
-            )
-        });
-        let mut found: Vec<_> = selected.into_iter().cloned().collect();
         drop(held);
         found.sort_by_key(|accepted| {
             let producer = &accepted.publication.producer;
@@ -1110,22 +955,17 @@ impl RunState {
                 accepted.sequence,
             )
         });
-        Charged {
-            value: found,
-            charge,
-        }
+        found
     }
 
     /// Apply `change` to the live state as one change; the background flush
-    /// persists it. `change` returns `false` when it changed nothing, and
-    /// otherwise retained `grows` more bytes, which the live charge takes.
+    /// persists it. `change` returns `false` when it changed nothing.
     ///
     /// # Errors
     /// Returns a bounded reason when the writer broke or lost its lease, or
     /// `change`'s own refusal.
     fn change(
         &self,
-        grows: u64,
         change: impl FnOnce(&mut ExecutionState) -> Result<bool, String>,
     ) -> Result<(), String> {
         let mut held = self.writer.lock();
@@ -1133,7 +973,6 @@ impl RunState {
             return Err(StateError::Stale.to_string());
         }
         if change(&mut held.state)? {
-            held.retain(grows);
             self.writer.changed(&mut held);
         }
         Ok(())
@@ -1193,7 +1032,7 @@ impl vala_verify::blocks::Checkpoints for RunState {
     /// # Errors
     /// Returns a bounded reason when the writer broke or lost its lease.
     async fn begin(&self, producer: &Producer) -> Result<(), String> {
-        self.change(retained(producer), |state| {
+        self.change(|state| {
             state.sequence += 1;
             state.invocations.push(InvocationRecord {
                 sequence: state.sequence,
@@ -1219,7 +1058,7 @@ impl vala_verify::blocks::Checkpoints for RunState {
     /// # Errors
     /// Returns a bounded reason when the writer broke or lost its lease.
     async fn forget(&self, producer: &Producer, tool_calls_spent: u32) -> Result<(), String> {
-        self.change(0, |state| {
+        self.change(|state| {
             let retained = state
                 .publications
                 .iter()
@@ -1240,7 +1079,7 @@ impl vala_verify::blocks::Checkpoints for RunState {
     ///
     /// A broken writer records nothing; its next awaited change reports it.
     fn spent(&self, producer: &Producer, tool_calls_spent: u32) {
-        let recorded = self.change(0, |state| {
+        let recorded = self.change(|state| {
             let Some(record) = state.invocations.iter_mut().find(|record| {
                 &record.producer == producer && record.settlement.is_none() && !record.released
             }) else {
@@ -1266,7 +1105,7 @@ impl vala_verify::blocks::Checkpoints for RunState {
         producer: &Producer,
         settled: &InvocationSettlement,
     ) -> Result<(), String> {
-        self.change(retained(settled), |state| {
+        self.change(|state| {
             let record = state
                 .invocations
                 .iter_mut()
@@ -1287,7 +1126,7 @@ impl vala_verify::blocks::Checkpoints for RunState {
     /// already recorded, since a recorded decision is final, or the writer
     /// broke or lost its lease.
     async fn control(&self, control: &ControlRecord) -> Result<(), String> {
-        self.change(retained(control), |state| {
+        self.change(|state| {
             match state
                 .controls
                 .iter()
@@ -1313,9 +1152,7 @@ impl vala_verify::blocks::Checkpoints for RunState {
     /// Returns a bounded reason when the writer broke or lost its lease.
     async fn reached(&self, occurrence: &ApprovalOccurrence) -> Result<(), String> {
         let execution = self.writer.row.execution_id;
-        self.change(retained(occurrence), |state| {
-            Ok(record_approval(state, execution, occurrence.clone()))
-        })
+        self.change(|state| Ok(record_approval(state, execution, occurrence.clone())))
     }
 }
 
@@ -1422,6 +1259,29 @@ mod tests {
         revision: i64,
         lost: CancellationToken,
     ) -> RunState {
+        writing_on(&one_lane(), outbox, state, revision, lost)
+    }
+
+    /// Process workloads with one CPU lane.
+    fn one_lane() -> wyrd_runtime::resources::WorkloadManager {
+        wyrd_runtime::resources::ProcessResources::new(
+            std::num::NonZeroUsize::MIN,
+            1 << 30,
+            1 << 30,
+        )
+        .workloads()
+        .clone()
+    }
+
+    /// A writer of `state` at `revision` staging on `outbox` and preparing
+    /// on `workloads`' lanes, whose lease is lost with `lost`.
+    fn writing_on(
+        workloads: &wyrd_runtime::resources::WorkloadManager,
+        outbox: Arc<crate::scribe_outbox::ScribeOutbox>,
+        state: ExecutionState,
+        revision: i64,
+        lost: CancellationToken,
+    ) -> RunState {
         let (verifier, subject) = (uid(), uid());
         let row = StateRow {
             execution_id: ExecutionId::new_v7(),
@@ -1437,6 +1297,7 @@ mod tests {
             ),
         };
         RunState::at(
+            workloads.clone(),
             outbox,
             DataTenantId::new_v7(),
             row,
@@ -1534,6 +1395,54 @@ mod tests {
             approval_id(ExecutionId::new_v7(), &occurrences[0]),
             "another execution never shares an occurrence id"
         );
+    }
+
+    /// Proves checkpoint preparation is CPU work on the shared lanes: while
+    /// every lane is held a dirty execution's revision waits to be prepared,
+    /// and nothing reaches Scribe; once the lane frees, exactly one revision
+    /// is prepared and accepted.
+    ///
+    /// # Panics
+    /// Panics when preparation does not queue for the held lane, a revision
+    /// reaches Scribe while it is held, or the revision is not accepted once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn checkpoint_preparation_waits_for_a_shared_lane() {
+        use wyrd_runtime::resources::Workload;
+        let workloads = one_lane();
+        let gateway = workloads.begin(Workload::Gateway, None, None);
+        let held = workloads.lanes().acquire(gateway.context()).await;
+        let scribe = Arc::new(TableGate::new(ScribeTable::ExecutionEvents));
+        let outbox = ScribeSink::local_outbox(Arc::clone(&scribe) as _, None);
+        let state = writing_on(
+            &workloads,
+            outbox,
+            ExecutionState::fresh(),
+            0,
+            CancellationToken::new(),
+        );
+        state
+            .begin(&Producer::plain(&task("factual-check"), 1))
+            .await
+            .expect("recorded");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while workloads.lanes().waiting() < 1 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "checkpoint preparation never queued for the held lane"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            revisions(&scribe).is_empty(),
+            "nothing is prepared while every lane is held"
+        );
+
+        drop(held);
+        arrived(&scribe).await;
+        scribe.release.add_permits(1);
+        settled(&state).await.expect("the revision is accepted");
+        assert_eq!(revisions(&scribe).len(), 1, "one revision is prepared");
     }
 
     /// Proves an engine transition completes from memory while Scribe holds
@@ -1871,86 +1780,68 @@ mod tests {
         .unwrap_or_else(|_| panic!("memory holds {} bytes, not {bytes}", memory.used()));
     }
 
-    /// Proves the live state is charged to process memory for as long as
-    /// its writer holds it: a recovered state is charged on arrival, every
-    /// later change grows the charge while an older revision is held, a
-    /// frozen revision is charged on top until Scribe accepts it, and the
-    /// acknowledgement returns only the frozen copy. Siblings cannot be
-    /// promised the live bytes, and dropping the writer returns them once.
+    /// Proves only a staged revision is charged, by the row it was
+    /// prepared as, until Scribe accepts it: the live state, its reads, and
+    /// its terminal decisions are small graphs left to aggregate pressure,
+    /// so no traversal sizes them.
     ///
     /// # Panics
-    /// Panics when the live state goes uncharged at any point, an
-    /// acknowledgement returns live bytes, or the final release differs.
+    /// Panics when the live state, a read, or a decision is charged, or a
+    /// staged revision is charged other than its prepared row.
     #[tokio::test]
-    async fn live_state_stays_charged_through_acknowledged_revisions() {
-        let limit = 1 << 30;
-        let memory = wyrd_runtime::resources::ByteLedger::new(limit);
+    async fn only_a_staged_revision_is_charged_its_prepared_row() {
+        let memory = wyrd_runtime::resources::ByteLedger::new(1 << 30);
         let mut recovered = ExecutionState::fresh();
         recovered.waiting = (0..64)
             .map(|at| wyrd_spec::ids::SlotName::new(format!("slot_{at}")).expect("slot"))
             .collect();
-        let (state, scribe) = charged_at(&memory, recovered.clone(), 1);
-        let mut live = super::Checkpoint::live(&state.snapshot());
-        assert!(live > crate::verification::encoded_len(&recovered, false));
-        assert_eq!(memory.used(), live, "a recovered state is charged");
+        let (state, scribe) = charged_at(&memory, recovered, 1);
+        assert_eq!(memory.used(), 0, "the live state is not charged");
 
-        let first = Producer::plain(&task("factual"), 1);
-        state.begin(&first).await.expect("recorded");
-        live += super::retained(&first);
+        state
+            .begin(&Producer::plain(&task("factual"), 1))
+            .await
+            .expect("recorded");
         arrived(&scribe).await;
-        assert!(
-            memory.used() > live,
-            "the held revision is charged beside the live state"
+        let row = u64::try_from(
+            super::Checkpoint::new(2, &state.snapshot(), Arc::clone(&state.writer.row))
+                .expect("the revision prepares")
+                .row()
+                .owned_bytes(),
+        )
+        .expect("a row size fits");
+        assert!(row > 0, "a prepared row owns its values");
+        assert_eq!(
+            memory.used(),
+            row,
+            "a staged revision weighs its prepared row"
         );
-        let second = Producer::plain(&task("tone"), 1);
-        state.begin(&second).await.expect("recorded");
-        live += super::retained(&second);
-        assert!(memory.used() > live, "later growth is charged while held");
-
-        scribe
-            .release
-            .add_permits(tokio::sync::Semaphore::MAX_PERMITS);
-        settled(&state).await.expect("both changes are accepted");
-        charged(&memory, live).await;
-        assert!(
-            memory.try_charge(limit - live + 1).is_err(),
-            "a sibling cannot be promised the live bytes"
-        );
-
         let read = state.publications(&task("factual"));
         assert!(read.is_empty());
+        assert_eq!(memory.used(), row, "a read is not charged");
         drop(read);
-        drop(state);
-        charged(&memory, 0).await;
-    }
 
-    /// Proves a publication read out of the live state is charged before it
-    /// is copied and holds that charge until the copy drops.
-    ///
-    /// # Panics
-    /// Panics when the copy is uncharged or keeps its charge once dropped.
-    #[tokio::test]
-    async fn publication_reads_hold_their_copy_charge() {
-        let memory = wyrd_runtime::resources::ByteLedger::new(1 << 30);
-        let (state, scribe) = charged_at(&memory, ExecutionState::fresh(), 0);
         scribe
             .release
             .add_permits(tokio::sync::Semaphore::MAX_PERMITS);
-        let value = serde_json::json!("x".repeat(4_096));
-        assert_eq!(
-            publish(&state, ("draft", 1), "c1", "notes", value),
-            PublicationAcceptance::Accepted
-        );
         settled(&state).await.expect("accepted");
-        let live = memory.used();
-
-        let read = state.publications(&task("draft"));
-        assert_eq!(read.len(), 1);
-        assert!(
-            memory.used() > live + 4_096,
-            "the copy is charged beside the live state"
+        charged(&memory, 0).await;
+        let outcome = ExecutedOutcome {
+            verdict: VerificationVerdict::Passed,
+            requirements: Vec::new(),
+            steps: Vec::new(),
+            evidence: BTreeMap::new(),
+        };
+        let selected = state
+            .select(&outcome, chrono::Utc::now())
+            .expect("selected");
+        settled(&state).await.expect("the selection is accepted");
+        charged(&memory, 0).await;
+        assert_eq!(
+            state.decision(),
+            Some(selected),
+            "a later read is the same decision"
         );
-        drop(read);
-        assert_eq!(memory.used(), live, "the copy's charge returns with it");
+        assert_eq!(memory.used(), 0, "a decision is not charged");
     }
 }

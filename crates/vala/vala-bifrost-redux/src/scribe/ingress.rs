@@ -101,6 +101,8 @@ fn take_transport_decode_owner(
 
 /// Move-only context required to form one admitted row source.
 struct AdmittedRowContext {
+    /// The frame's data tenant, whose CPU lane service the decode counts as.
+    tenant: wyrd_spec::DataTenantId,
     /// Source of the trusted subject/actor pair moved into the retained
     /// source.
     attribution: StampedAttribution,
@@ -372,6 +374,7 @@ impl ScribeImpl {
         context: AdmittedRowContext,
     ) -> Result<AdmittedRows, ScribeError> {
         let AdmittedRowContext {
+            tenant,
             attribution,
             workload,
             card_scope,
@@ -406,6 +409,7 @@ impl ScribeImpl {
                 let rows = self
                     .ingress_cpu
                     .decode(
+                        Some(tenant),
                         IngressPayload::Canonical(canonical),
                         crate::scribe::execution_lanes::IngressDecodeInputs {
                             attribution,
@@ -559,7 +563,10 @@ impl ScribeImpl {
     /// Returns [`ScribeError::IngestBusy`] when the ingress queue is saturated
     /// and any preprocessing error from [`prepare_append`].
     async fn preprocess(&self, admitted: AdmittedAppend) -> Result<PreparedAppend, ScribeError> {
-        self.ingress_cpu.run(move || prepare_append(admitted)).await
+        let tenant = admitted.tenant;
+        self.ingress_cpu
+            .run(Some(tenant), move || prepare_append(admitted))
+            .await
     }
 
     /// Prepares one request and dispatches its owned packet to its fixed shard.
@@ -723,6 +730,7 @@ impl ScribeImpl {
             .prepare_admitted_rows(
                 frame.payload,
                 AdmittedRowContext {
+                    tenant,
                     card_scope: frame
                         .attributed_cards
                         .or_else(|| frame.principal.card_scope().map(<[_]>::to_vec)),

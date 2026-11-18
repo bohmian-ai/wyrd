@@ -99,15 +99,17 @@ pub trait PromptCardResolver: Send + Sync {
 #[async_trait]
 pub trait EvidenceReader: Send + Sync {
     /// Read `evidence` as inline provider-native media, with a guard holding
-    /// the host resources the media's bytes take, such as their process
-    /// memory charge. The Agent call keeps the guard until the bound Prompt
-    /// that carries the media is dropped, on completion or cancellation.
+    /// the host resources the returned media's bytes take, such as their
+    /// process memory charge. The Agent call keeps the guard until the bound
+    /// Prompt that carries the media is dropped, on completion or
+    /// cancellation. Copies made later by rendering and provider requests are
+    /// the gateway's own buffers, which it accounts for itself.
     ///
     /// # Errors
     /// Returns [`BlockError::Terminal`] for missing, unauthorized,
     /// mismatched, oversized, or non-native evidence,
-    /// [`BlockError::Busy`] when the host cannot hold the media now, and
-    /// [`BlockError::Retryable`] for a transient storage failure.
+    /// [`BlockError::Busy`] when the host cannot hold the media now, and [`BlockError::Retryable`] for a transient storage
+    /// failure.
     async fn media(
         &self,
         evidence: &InputDeclaration,

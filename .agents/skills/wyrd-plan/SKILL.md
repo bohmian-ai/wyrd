@@ -1,6 +1,6 @@
 ---
 name: wyrd-plan
-description: Use an approved Wyrd spec and finalized design to write cohesive tasks that carry the agreed approach through real inputs, outputs, dependencies, and observable proof without adding scope.
+description: Turn an approved Wyrd spec and finalized design into bounded tasks with observable behavioral scenarios ordered for test-first implementation, without adding requirements.
 ---
 
 # Wyrd Plan
@@ -9,6 +9,9 @@ Translate the approved contract and agreed design into executable work. Carry
 the selected approach into tasks; decompose the flow without enlarging the
 agreement or designing a replacement solution. Leave unsettled reversible
 coding choices to `$wyrd-implement`.
+
+Requirements stay defined once in the approved spec. This plan owns the
+scenarios that exercise them, not a second formulation of the promises.
 
 Do not use this skill for review remediation. Validated implementation findings
 go directly to `$wyrd-implement`; findings that change approved behavior go to
@@ -80,8 +83,11 @@ tasks for capabilities that already exist or fabricate inputs to hide a gap.
 
 Order behavioral acceptance scenarios for test-first implementation. Start with
 the smallest observable behavior, then add the required variants and failure
-cases. For each scenario, state the trigger, expected observation, and what
-missing behavior should make its test fail before production changes. Group
+cases. For each scenario, reference its approved requirement or governing
+authority and state the starting state, real input and source, actor or
+trigger, expected result or state transition, and required absence of side
+effects. Identify the test tier and actual consumer path, and what missing
+behavior should make the test fail before production changes. Group
 equivalent cases without hiding required negative, concurrency, tenancy or
 lifecycle coverage. Each scenario is one test-first cycle, not a separate task.
 Do not prescribe private implementation steps or predict refactoring. For
@@ -89,8 +95,11 @@ static or already-correct behavior, name the appropriate proof without
 manufacturing tests or production changes.
 
 This list is also the implementation evidence record: the implementer adds
-proof references and results in place. Do not create a second obligations
-ledger or repeat the scenarios in a separate verification table.
+actual assertion locations, focused commands, observed RED failures, GREEN
+results, and material limitations in place. The expected behavior stays fixed.
+Do not create a second obligations ledger or repeat the scenarios in a
+separate verification table. An outcome label or test name alone is not a
+scenario; a build or disconnected fixture cannot prove a delivered flow.
 
 Proof must exercise the task's actual inputs and demonstrate its promised
 outputs. At connected boundaries, establish that the downstream consumer uses
@@ -113,6 +122,10 @@ Confirm coverage of approved obligations and the agreed flow without adding
 new ones. Respect exclusions, check each input's source and dependency output,
 and ensure the combined proof connects the delivered flow. Check that the first
 behavioral scenario can drive implementation before later scenarios are added.
+Apply the shared ambiguous-wording rule. Resolve unclear task wording from the
+spec and authority; if materially different behavioral readings remain, return
+the exact wording, interpretations, and smallest decision needed for spec
+clarification. Do not pass an ambiguous behavioral contract to implementation.
 Stop elaborating when the outcome, affected owner, material constraints and credible verification
 are clear. A conceivable failure mode alone does not authorize another requirement.
 

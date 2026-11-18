@@ -599,6 +599,10 @@ impl<S: OutboxSink> Outbox<S> {
     /// `held` is memory the producer already charged for the item; the
     /// outbox takes it over as part of the item's charge rather than
     /// charging those bytes again.
+    ///
+    /// # Panics
+    /// Panics when `held` was charged to another ledger than this charging
+    /// outbox's, as [`ByteCharge::merge`] refuses to combine them.
     fn send_reserved(&self, tenant: DataTenantId, item: S::Item, held: Option<ByteCharge>) {
         let bytes = S::weight(&item);
         let queue = self.queue.read().unwrap_or_else(PoisonError::into_inner);
@@ -763,11 +767,20 @@ impl<S: OutboxSink> Reservation<S> {
     /// reserved slot the outbox takes `held` over as part of the item's
     /// charge, so the item's bytes stay charged once, without a gap or a
     /// second promise; `held` is returned to the ledger otherwise.
+    ///
+    /// # Panics
+    /// Panics when `held` was charged to another ledger than the outbox's
+    /// and the outbox charges process memory, as [`ByteCharge::merge`]
+    /// refuses to combine them.
     pub fn stage_charged(&self, tenant: DataTenantId, item: impl Into<S::Item>, held: ByteCharge) {
         self.stage_held(tenant, item.into(), Some(held));
     }
 
     /// Spends a slot on `item` and its `held` charge, or stages it unreserved.
+    ///
+    /// # Panics
+    /// Panics when a reserved slot is spent on a `held` charge from another
+    /// ledger than the charging outbox's, as [`Outbox::send_reserved`] does.
     fn stage_held(&self, tenant: DataTenantId, item: S::Item, held: Option<ByteCharge>) {
         let spent = self
             .slots

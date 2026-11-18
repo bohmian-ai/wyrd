@@ -1585,6 +1585,218 @@ async fn discarded_speculation_records_after_its_host_work_settles() {
     assert_eq!(step(&outcome, "dropped").output, None);
 }
 
+/// Whether `ledger` recorded a disposition for `step`.
+///
+/// # Panics
+/// Panics when a recording call panicked while holding the ledger lock.
+fn disposed(ledger: &Ledger, step: &str) -> bool {
+    ledger.controls.lock().expect("ledger").iter().any(|control| {
+        matches!(control, ControlRecord::Disposition { step: id, .. } if id.as_str() == step)
+    })
+}
+
+/// A run whose timed-out attempt is already awaiting its started host work
+/// when the execution deadline expires still returns its deadline result
+/// only once that work ends.
+///
+/// # Panics
+/// Panics when the result outruns the held work or is not the deadline.
+#[tokio::test(start_paused = true)]
+async fn execution_deadline_waits_for_an_attempt_already_settling() {
+    let work = Arc::new(HeldWork::default());
+    let spec = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "steps": [{"id": "held", "timeout_seconds": 5,
+                   "action": code_action(json!({"x": "inputs.answer"}))}]
+    }));
+    let script = Arc::new(Script {
+        actions: HashMap::from([("held", Behavior::Settling(Arc::clone(&work)))]),
+        ..Script::default()
+    });
+    let engine = engine(&script, InMemoryTraceSource::new(), 1);
+    let running = run(&engine, &spec, json!({"answer": 1}));
+    tokio::pin!(running);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(120), &mut running)
+            .await
+            .is_err(),
+        "the deadline result waits for the settling attempt's host work"
+    );
+    assert!(!work.settled());
+    work.release.notify_one();
+    let result = running.await;
+    assert!(work.settled(), "the result follows settlement");
+    assert!(
+        matches!(result, Err(EngineError::DeadlineExceeded)),
+        "{result:?}"
+    );
+}
+
+/// A speculative step discarded while its timed-out attempt is awaiting its
+/// started host work records its disposition only once that work ends, and
+/// its output stays withheld.
+///
+/// # Panics
+/// Panics when the disposition outruns the held work or the step's content
+/// is admitted.
+#[tokio::test(start_paused = true)]
+async fn discard_during_settlement_waits_for_its_host_work() {
+    let work = Arc::new(HeldWork::default());
+    let spec = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "steps": [
+            {"id": "compare", "action": code_action(json!({"x": "inputs.answer"}))},
+            {"id": "dropped", "speculative": true, "timeout_seconds": 5,
+             "when": {"path": "steps.compare.output.x", "operator": "equals", "expected": 2},
+             "action": code_action(json!({"y": "inputs.answer"}))}
+        ]
+    }));
+    let script = Arc::new(Script {
+        actions: HashMap::from([
+            ("compare", echo(&[20])),
+            ("dropped", Behavior::Settling(Arc::clone(&work))),
+        ]),
+        ..Script::default()
+    });
+    let ledger = Arc::new(Ledger::default());
+    let engine = engine(&script, InMemoryTraceSource::new(), 4).with_checkpoints(
+        Arc::clone(&ledger) as Arc<dyn Checkpoints>,
+        &ExecutionState::default(),
+    );
+    let running = run(&engine, &spec, json!({"answer": 1}));
+    tokio::pin!(running);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(40), &mut running)
+            .await
+            .is_err(),
+        "the run waits for the discarded step's host work"
+    );
+    assert!(script.calls().contains(&"done:compare".to_owned()));
+    assert!(
+        !disposed(&ledger, "dropped"),
+        "no disposition before settlement"
+    );
+    work.release.notify_one();
+    let outcome = running.await.expect("outcome");
+    assert!(work.settled() && disposed(&ledger, "dropped"));
+    assert_eq!(step(&outcome, "dropped").output, None);
+}
+
+/// The execution deadline expiring while a discarded step's disposition is
+/// awaiting its host work still returns the deadline result only once that
+/// work ends, and records no disposition.
+///
+/// # Panics
+/// Panics when the result outruns the held work, is not the deadline, or a
+/// disposition is recorded.
+#[tokio::test(start_paused = true)]
+async fn execution_deadline_during_a_disposition_waits_for_its_host_work() {
+    let work = Arc::new(HeldWork::default());
+    let spec = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "steps": [
+            {"id": "compare", "action": code_action(json!({"x": "inputs.answer"}))},
+            {"id": "dropped", "speculative": true,
+             "when": {"path": "steps.compare.output.x", "operator": "equals", "expected": 2},
+             "action": code_action(json!({"y": "inputs.answer"}))}
+        ]
+    }));
+    let script = Arc::new(Script {
+        actions: HashMap::from([
+            ("compare", echo(&[10])),
+            ("dropped", Behavior::Settling(Arc::clone(&work))),
+        ]),
+        ..Script::default()
+    });
+    let ledger = Arc::new(Ledger::default());
+    let engine = engine(&script, InMemoryTraceSource::new(), 4).with_checkpoints(
+        Arc::clone(&ledger) as Arc<dyn Checkpoints>,
+        &ExecutionState::default(),
+    );
+    let running = run(&engine, &spec, json!({"answer": 1}));
+    tokio::pin!(running);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(120), &mut running)
+            .await
+            .is_err(),
+        "the deadline result waits for the disposition's host work"
+    );
+    assert!(!work.settled());
+    work.release.notify_one();
+    let result = running.await;
+    assert!(work.settled(), "the result follows settlement");
+    assert!(
+        matches!(result, Err(EngineError::DeadlineExceeded)),
+        "{result:?}"
+    );
+    assert!(
+        !disposed(&ledger, "dropped"),
+        "a cancelled disposition is not recorded"
+    );
+}
+
+/// Concurrent dispositions of discarded steps each wait for all host work
+/// the run's dropped blocks started, so neither is recorded while the other
+/// step's work is still held.
+///
+/// # Panics
+/// Panics when a disposition outruns any held work or a discarded step's
+/// content is admitted.
+#[tokio::test(start_paused = true)]
+async fn concurrent_dispositions_wait_for_all_held_host_work() {
+    let (first, second) = (Arc::new(HeldWork::default()), Arc::new(HeldWork::default()));
+    let speculative = |id: &str, input: &str| {
+        json!({"id": id, "speculative": true,
+               "when": {"path": "steps.compare.output.x", "operator": "equals", "expected": 2},
+               "action": code_action(json!({input: "inputs.answer"}))})
+    };
+    let spec = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "steps": [
+            {"id": "compare", "action": code_action(json!({"x": "inputs.answer"}))},
+            speculative("first", "y"),
+            speculative("second", "z")
+        ]
+    }));
+    let script = Arc::new(Script {
+        actions: HashMap::from([
+            ("compare", echo(&[10])),
+            ("first", Behavior::Settling(Arc::clone(&first))),
+            ("second", Behavior::Settling(Arc::clone(&second))),
+        ]),
+        ..Script::default()
+    });
+    let ledger = Arc::new(Ledger::default());
+    let engine = engine(&script, InMemoryTraceSource::new(), 4).with_checkpoints(
+        Arc::clone(&ledger) as Arc<dyn Checkpoints>,
+        &ExecutionState::default(),
+    );
+    let running = run(&engine, &spec, json!({"answer": 1}));
+    tokio::pin!(running);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(20), &mut running)
+            .await
+            .is_err()
+    );
+    first.release.notify_one();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), &mut running)
+            .await
+            .is_err(),
+        "the run still waits for the second step's work"
+    );
+    assert!(
+        !disposed(&ledger, "first") && !disposed(&ledger, "second"),
+        "no disposition while any discarded step's work is held"
+    );
+    second.release.notify_one();
+    let outcome = running.await.expect("outcome");
+    assert!(first.settled() && second.settled());
+    assert!(disposed(&ledger, "first") && disposed(&ledger, "second"));
+    assert_eq!(step(&outcome, "first").output, None);
+    assert_eq!(step(&outcome, "second").output, None);
+}
+
 /// Agent and code passes need a citation of evidence the call could reach;
 /// unreachable citations are dropped, a citation-less pass is inconclusive,
 /// a check error is inconclusive with its reason, and a failed verdict is

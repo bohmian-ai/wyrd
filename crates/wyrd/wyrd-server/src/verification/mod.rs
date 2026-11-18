@@ -637,7 +637,10 @@ impl VerificationRuntimeBuilder<'_> {
 /// was written before the error, which its encoder then refuses.
 pub(crate) fn encoded_len(value: &impl serde::Serialize, pretty: bool) -> u64 {
     /// A sink counting the bytes written to it.
-    struct Counted(u64);
+    struct Counted(
+        /// Bytes written so far, saturating at `u64::MAX`.
+        u64,
+    );
     impl std::io::Write for Counted {
         /// Count `bytes`, saturating, and keep none of them.
         ///

@@ -61,9 +61,11 @@ use super::capture::recording::RecordingScribe;
 use super::ledger::{Accounted, GatewayLedger, LedgerCall};
 use super::pg_administration_tests::{admin, audit_decisions, sealing_keyring, test_state};
 use super::routes::JsonBody;
+use super::telemetry::IngressClock;
 use super::{GatewayAdministration, GatewayCallRequest, GatewayCallResponse, GatewayInvocation};
 use crate::components::auth::Caller;
 use crate::http::error::WyrdErrorResponse;
+use crate::http::middleware::body_limit::BodyCustody;
 use crate::state::AppState;
 
 /// One scripted provider attempt.
@@ -153,6 +155,35 @@ impl ProviderDispatch for Held {
         self.entered.send(()).expect("test observes dispatch");
         self.release.acquire().await.expect("release open").forget();
         completed(100, 50)
+    }
+}
+
+/// Dispatch recording the CPU lane context each attempt runs in, then
+/// waiting until released, as an attempt waits on its provider.
+#[derive(Default)]
+struct LaneProbe {
+    /// The lane context of each dispatched attempt, in dispatch order.
+    contexts: Mutex<Vec<Option<wyrd_runtime::resources::WorkContext>>>,
+    /// Notified when an attempt starts.
+    entered: Notify,
+    /// Releases a waiting attempt.
+    release: Notify,
+}
+
+#[async_trait]
+impl ProviderDispatch for LaneProbe {
+    /// Records the attempt's lane context, waits for release, then completes.
+    ///
+    /// # Panics
+    /// Panics when the contexts lock is poisoned by a panicking holder.
+    async fn dispatch(&self, _attempt: ProviderAttempt<'_>) -> AttemptResult {
+        self.contexts
+            .lock()
+            .expect("contexts")
+            .push(wyrd_runtime::resources::WorkContext::current());
+        self.entered.notify_one();
+        self.release.notified().await;
+        completed(10, 5)
     }
 }
 
@@ -4543,6 +4574,162 @@ async fn gateway_selected_speech_persists_one_retrievable_object() {
     );
 }
 
+/// Proves captured generated speech keeps its memory charge from the relay's
+/// clean end until the capture settles: while its object read is parked the
+/// bytes stay counted against gateway work; a capture storage then fails
+/// drops and returns the charge, and an unparked capture stages its row with
+/// the outbox taking the charge over, so process memory returns to its
+/// starting use once delivered, never charged twice or left behind.
+///
+/// # Panics
+///
+/// Panics when a fixture fails, a call fails, the captured bytes go uncounted
+/// while storage holds them, a row's staging differs, or any charge outlives
+/// the drained capture.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn captured_speech_stays_charged_until_its_capture_settles() {
+    use wyrd_runtime::resources::Workload;
+    let spoken = vec![7_u8; 64 * 1024];
+    let other = vec![8_u8; 64 * 1024];
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/audio/speech"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(spoken.clone(), "audio/mpeg"))
+        .mount(&upstream)
+        .await;
+    let (state, scribe) = RecordingScribe::attach(
+        replica_with_fixture_catalog(
+            &fixture,
+            Arc::new(
+                wyrd_gateway::HttpProviderDispatch::new(
+                    skald_providers::EndpointPolicy::new(false),
+                    wyrd_gateway::BuiltinEndpoints::default(),
+                )
+                .expect("gateway dispatch builds"),
+            ),
+        )
+        .await,
+    );
+    configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
+    let admin = admin(tenant);
+    let gateway = GatewayAdministration::new(&state);
+    gateway
+        .put_deployment(
+            &admin,
+            &ProviderDeploymentName::new("speech").expect("name"),
+            serde_json::from_value(json!({
+                "name": "speech",
+                "adapter": {"openai_compatible": {"base_url": format!("{}/v1", upstream.uri())}},
+                "auth": "none",
+                "capabilities": ["audio"],
+            }))
+            .expect("deployment decodes"),
+        )
+        .await
+        .expect("deployment stores");
+    gateway
+        .put_capture(
+            &admin,
+            GatewayCapturePolicyWrite {
+                mode: GatewayCaptureMode::Payload,
+                payload_fields: BTreeSet::from([GatewayPayloadField::Response]),
+            },
+        )
+        .await
+        .expect("payload policy stores");
+    let digest = format!("sha256:{}", hex::encode(Sha256::digest(&spoken)));
+    let wyrd_storage::settings::BackendConfig::Local { root } = state.storage.backend_config()
+    else {
+        panic!("the test replica stores locally");
+    };
+    let fifo = root.join(
+        &object_path(tenant, &digest)
+            .expect("the digest derives a key")
+            .full,
+    );
+    std::fs::create_dir_all(fifo.parent().expect("the key has a parent")).expect("parent creates");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo runs");
+    assert!(made.success(), "the parked object path is a FIFO");
+    let workloads = state.resources.workloads().clone();
+    let memory = state.resources.memory().clone();
+    let speak = || {
+        let state = state.clone();
+        let spoken = spoken.clone();
+        async move {
+            let response = super::routes::audio_speech(
+                State(state),
+                Ok(invoker(tenant, 1, [open_access()])),
+                None,
+                Ok(JsonBody::from(
+                    json!({"model": "speech/speech", "input": "hi", "voice": "alloy"}),
+                )),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let delivered = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("audio reads");
+            assert_eq!(
+                delivered.as_ref(),
+                spoken.as_slice(),
+                "caller bytes are unchanged"
+            );
+        }
+    };
+    drain_gateway(&state).await;
+    let idle = memory.used();
+
+    speak().await;
+    // Opening the FIFO's write end returns once the capture's object read has
+    // opened the read end and is parked on it.
+    let path = fifo.clone();
+    let mut writer = tokio::task::spawn_blocking(move || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("the FIFO opens")
+    })
+    .await
+    .expect("the writer opens");
+    assert!(
+        workloads.workload_bytes(Workload::Gateway) >= spoken.len() as u64,
+        "captured speech stays charged while storage holds it"
+    );
+    std::io::Write::write_all(&mut writer, &other).expect("the FIFO writes");
+    drop(writer);
+    drain_gateway(&state).await;
+    assert_eq!(
+        scribe.attempts(),
+        0,
+        "a capture storage fails stages nothing"
+    );
+    assert_eq!(workloads.workload_bytes(Workload::Gateway), 0);
+    assert_eq!(
+        memory.used(),
+        idle,
+        "the dropped capture returns its charge"
+    );
+
+    std::fs::remove_file(&fifo).expect("the parked path is removed");
+    speak().await;
+    drain_gateway(&state).await;
+    assert!(
+        scribe.published().contains(&digest),
+        "the stored capture stages its row"
+    );
+    assert_eq!(workloads.workload_bytes(Workload::Gateway), 0);
+    assert_eq!(
+        memory.used(),
+        idle,
+        "the delivered row's charge, taken over once, returns"
+    );
+}
+
 /// Proves post-response capture work is bounded by the admitted call's
 /// absolute deadline. With the captured object's storage read parked on a
 /// FIFO, the call still answers, its capture is dropped once as
@@ -5628,7 +5815,7 @@ async fn gateway_terminal_spans_classify_every_call_and_attempt() {
     let mut delivered = Vec::new();
     tokio::time::timeout(Duration::from_secs(1), async {
         while let Some(frame) = events.recv().await {
-            delivered.extend(frame.expect("the stream terminates cleanly"));
+            delivered.extend_from_slice(&frame.expect("the stream terminates cleanly"));
         }
     })
     .await
@@ -6835,5 +7022,676 @@ async fn lane_wait_spends_the_agent_call_budget() {
             .count(),
         1,
         "the expired call stays timed out: {outcomes:?}"
+    );
+}
+
+/// Critical process pressure pauses a standalone gateway call before any
+/// quota or capture reservation: it waits as gateway work of its tenant, is
+/// refused at its own deadline without dispatching, and runs once pressure
+/// recovers.
+///
+/// # Panics
+/// Panics when the Postgres fixture or setup fails, the paused call
+/// dispatches or is not refused as expired, or the call does not run after
+/// recovery.
+#[tokio::test]
+async fn critical_pressure_pauses_gateway_calls_until_recovery() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let dispatch = Scripted::shared();
+    let state = replica(&fixture, dispatch.clone()).await;
+    configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
+    let caller = invoker(tenant, 1, [open_access()]);
+    let workloads = state.resources.workloads().clone();
+    let overcommitted = workloads.observe_commitment();
+    overcommitted.set(u64::MAX);
+    assert_eq!(
+        workloads.sample(0).state,
+        wyrd_runtime::resources::PressureState::Critical
+    );
+
+    let refused = GatewayInvocation::new(&state)
+        .invoke(
+            &caller,
+            request("dep-a/a", None, Duration::from_millis(300)),
+        )
+        .await
+        .expect_err("a call cannot start under critical pressure");
+    assert!(
+        matches!(refused, WyrdError::GatewayDeadlineExceeded { .. }),
+        "{refused:?}"
+    );
+    assert!(
+        dispatch.seen().is_empty(),
+        "the paused call never dispatched"
+    );
+
+    overcommitted.set(0);
+    workloads.sample(0);
+    workloads.sample(0);
+    dispatch.push(Step::Return(completed(1, 1)));
+    GatewayInvocation::new(&state)
+        .invoke(&caller, request("dep-a/a", None, Duration::from_secs(10)))
+        .await
+        .expect("the call runs once pressure recovers");
+    assert_eq!(dispatch.seen(), ["dep-a"]);
+}
+
+/// A buffered answer's allocation, spare capacity included, counts against
+/// the workload that made the call while it is held, and returns when it
+/// drops: a standalone call's as gateway work, a nested Agent call's as the
+/// initiating verification work, never both. A relayed answer's bytes stay
+/// counted once while the HTTP consumer holds any clone or slice of them,
+/// after the body itself is gone.
+///
+/// # Panics
+/// Panics when the Postgres fixture or setup fails, a call fails, or the
+/// answer's bytes are uncounted, counted against the wrong workload, counted
+/// twice, released before the last delivered reference drops, or kept after
+/// it does.
+#[tokio::test]
+async fn buffered_answers_count_against_the_calling_workload() {
+    use wyrd_runtime::resources::Workload;
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let dispatch = Scripted::shared();
+    let state = replica(&fixture, dispatch.clone()).await;
+    configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
+    let caller = invoker(tenant, 1, [open_access()]);
+    let workloads = state.resources.workloads().clone();
+    let bytes = |response: &super::GatewayCallResponse| match &response.body {
+        ResponseBody::Json(answer) => answer.capacity() as u64,
+        other => panic!("expected a buffered JSON answer: {other:?}"),
+    };
+
+    dispatch.push(Step::Return(completed(1, 1)));
+    let standalone = GatewayInvocation::new(&state)
+        .invoke(&caller, request("dep-a/a", None, Duration::from_secs(10)))
+        .await
+        .expect("the standalone call completes");
+    assert!(bytes(&standalone) > 0);
+    assert_eq!(
+        workloads.workload_bytes(Workload::Gateway),
+        bytes(&standalone)
+    );
+    assert_eq!(workloads.workload_bytes(Workload::Verification), 0);
+    drop(standalone);
+    assert_eq!(workloads.workload_bytes(Workload::Gateway), 0);
+
+    dispatch.push(Step::Return(completed(1, 1)));
+    let nested = GatewayInvocation::new(&state)
+        .nested(Workload::Verification)
+        .invoke(&caller, request("dep-a/a", None, Duration::from_secs(10)))
+        .await
+        .expect("the nested call completes");
+    assert_eq!(
+        workloads.workload_bytes(Workload::Verification),
+        bytes(&nested)
+    );
+    assert_eq!(workloads.workload_bytes(Workload::Gateway), 0);
+    drop(nested);
+    assert_eq!(workloads.workload_bytes(Workload::Verification), 0);
+
+    dispatch.push(Step::Return(completed(1, 1)));
+    let relayed = super::routes::chat_completions(
+        State(state.clone()),
+        Ok(caller.clone()),
+        None,
+        HeaderMap::new(),
+        Ok(JsonBody::from(json!({"model": "dep-a/a", "messages": []}))),
+    )
+    .await;
+    assert_eq!(relayed.status(), StatusCode::OK);
+    let charged = workloads.workload_bytes(Workload::Gateway);
+    assert!(
+        charged > 0,
+        "a relayed answer stays charged until its HTTP body is sent"
+    );
+    let delivered = axum::body::to_bytes(relayed.into_body(), usize::MAX)
+        .await
+        .expect("the JSON answer reads");
+    serde_json::from_slice::<Value>(&delivered).expect("the delivered answer is JSON");
+    assert_eq!(
+        workloads.workload_bytes(Workload::Gateway),
+        charged,
+        "delivered bytes stay charged once after their body drops"
+    );
+    let slice = delivered.slice(1..);
+    drop(delivered);
+    assert_eq!(workloads.workload_bytes(Workload::Gateway), charged);
+    drop(slice);
+    assert_eq!(workloads.workload_bytes(Workload::Gateway), 0);
+
+    dispatch.push(Step::Return(media_completed(PAYLOAD_OBJECT_BYTES)));
+    let media = GatewayInvocation::new(&state)
+        .invoke(&caller, request("dep-a/a", None, Duration::from_secs(10)))
+        .await
+        .expect("the media call completes");
+    let sent = PAYLOAD_OBJECT_BYTES.len() as u64;
+    assert_eq!(workloads.workload_bytes(Workload::Gateway), sent);
+    let relayed = super::routes::relay(media.status, media.body, media.custody);
+    assert_eq!(
+        workloads.workload_bytes(Workload::Gateway),
+        sent,
+        "a relayed media answer stays charged until its HTTP body is sent"
+    );
+    let delivered = axum::body::to_bytes(relayed.into_body(), usize::MAX)
+        .await
+        .expect("the media answer reads");
+    assert_eq!(delivered.as_ref(), PAYLOAD_OBJECT_BYTES);
+    assert_eq!(
+        workloads.workload_bytes(Workload::Gateway),
+        sent,
+        "delivered media stays charged once after its body drops"
+    );
+    let clone = delivered.clone();
+    let slice = delivered.slice(..1);
+    drop(delivered);
+    drop(clone);
+    assert_eq!(workloads.workload_bytes(Workload::Gateway), sent);
+    drop(slice);
+    assert_eq!(workloads.workload_bytes(Workload::Gateway), 0);
+}
+
+/// A buffered answer process memory cannot hold is refused once it is read:
+/// the call fails with the capacity error, the answer is discarded uncharged,
+/// and the next answer that fits is charged as usual.
+///
+/// # Panics
+/// Panics when the Postgres fixture or setup fails, the refused call succeeds
+/// or fails otherwise, its answer stays charged, or a later call that fits
+/// is refused.
+#[tokio::test]
+async fn buffered_answer_memory_cannot_hold_is_refused_and_discarded() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let dispatch = Scripted::shared();
+    let state = replica(&fixture, dispatch.clone())
+        .await
+        .with_owners_for_test(|owners| {
+            owners.resources = wyrd_runtime::resources::ProcessResources::new(
+                std::num::NonZeroUsize::MIN,
+                1 << 20,
+                1 << 20,
+            );
+        });
+    configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
+    let caller = invoker(tenant, 1, [open_access()]);
+    let memory = state.resources.memory().clone();
+
+    let full = memory.charge_infallible(1 << 20);
+    dispatch.push(Step::Return(completed(1, 1)));
+    let refused = GatewayInvocation::new(&state)
+        .invoke(&caller, request("dep-a/a", None, Duration::from_secs(10)))
+        .await;
+    assert!(
+        matches!(refused, Err(WyrdError::ServiceUnavailable { .. })),
+        "an answer memory cannot hold is refused with the capacity error: {refused:?}"
+    );
+    assert_eq!(
+        memory.used(),
+        full.bytes(),
+        "the refused answer holds no charge"
+    );
+    drop(full);
+
+    dispatch.push(Step::Return(completed(1, 1)));
+    let answered = GatewayInvocation::new(&state)
+        .invoke(&caller, request("dep-a/a", None, Duration::from_secs(10)))
+        .await
+        .expect("an answer that fits is kept");
+    assert!(memory.used() > 0, "the kept answer is charged");
+    drop(answered);
+    assert_eq!(memory.used(), 0);
+}
+
+/// A call's request body counts against its own workload while the call
+/// runs: a nested Agent call's serialized body as verification work, and a
+/// standalone call's HTTP body through the charge its ingress clock carries
+/// from the body limit, counted once, as gateway work. Both return once the call settles.
+///
+/// # Panics
+/// Panics when the Postgres fixture or setup fails, a call fails, or a body
+/// is uncounted, double counted, counted against the wrong workload, or kept
+/// after the call.
+#[tokio::test]
+async fn call_bodies_count_against_the_calling_workload_while_the_call_runs() {
+    use wyrd_runtime::resources::Workload;
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let (entered, mut dispatched) = mpsc::unbounded_channel();
+    let held = Arc::new(Held {
+        entered,
+        release: Semaphore::new(0),
+    });
+    let state = replica(&fixture, held.clone()).await;
+    configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
+    let caller = invoker(tenant, 1, [open_access()]);
+    let workloads = state.resources.workloads().clone();
+    let serialized = || {
+        let mut call = request("dep-a/a", None, Duration::from_secs(10));
+        call.body =
+            wyrd_gateway::RequestJson::serialize(&json!({"model": "dep-a/a", "messages": []}))
+                .expect("the body serializes");
+        call
+    };
+
+    let nested = serialized();
+    let body = nested
+        .body
+        .text()
+        .expect("a serialized body keeps its text")
+        .len() as u64;
+    let running = tokio::spawn({
+        let (state, caller) = (state.clone(), caller.clone());
+        async move {
+            GatewayInvocation::new(&state)
+                .nested(Workload::Verification)
+                .invoke(&caller, nested)
+                .await
+                .map(drop)
+        }
+    });
+    dispatched.recv().await.expect("the nested call dispatches");
+    assert_eq!(
+        workloads.workload_bytes(Workload::Verification),
+        body,
+        "the nested call's body is verification work"
+    );
+    assert_eq!(workloads.workload_bytes(Workload::Gateway), 0);
+    held.release.add_permits(1);
+    running
+        .await
+        .expect("joins")
+        .expect("the nested call completes");
+    assert_eq!(workloads.workload_bytes(Workload::Verification), 0);
+
+    let custody = BodyCustody::new(state.resources.memory().charge_infallible(4096));
+    let clock = IngressClock::authenticated(None, std::time::Instant::now(), Some(custody.clone()));
+    let running = tokio::spawn({
+        let (state, caller) = (state.clone(), caller.clone());
+        async move {
+            GatewayInvocation::new(&state)
+                .parsed(Some(clock), GatewayOperation::ChatCompletions)
+                .invoke(&caller, serialized())
+                .await
+                .map(drop)
+        }
+    });
+    dispatched
+        .recv()
+        .await
+        .expect("the standalone call dispatches");
+    assert!(
+        custody.take().is_none(),
+        "the call took the HTTP body's charge"
+    );
+    assert_eq!(
+        workloads.workload_bytes(Workload::Gateway),
+        4096,
+        "the HTTP body's charge is the call's, counted once"
+    );
+    held.release.add_permits(1);
+    running
+        .await
+        .expect("joins")
+        .expect("the standalone call completes");
+    assert_eq!(workloads.workload_bytes(Workload::Gateway), 0);
+    assert_eq!(
+        state.resources.memory().used(),
+        0,
+        "no body bytes outlive the call"
+    );
+}
+
+/// Sustained critical pressure cancels a running standalone call it selects:
+/// the call
+/// holding its request body is the largest gateway operation, its
+/// cancellation ends the provider attempt, the caller sees the call refused
+/// as unavailable, and every byte it held returns.
+///
+/// # Panics
+/// Panics when the Postgres fixture or setup fails, pressure does not cancel
+/// the running call, the call completes, or its bytes outlive it.
+#[tokio::test]
+async fn critical_pressure_cancels_a_running_gateway_call() {
+    use wyrd_runtime::resources::{PressureState, Workload};
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let (entered, mut dispatched) = mpsc::unbounded_channel();
+    let held = Arc::new(Held {
+        entered,
+        release: Semaphore::new(0),
+    });
+    let state = replica(&fixture, held.clone()).await;
+    configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
+    let caller = invoker(tenant, 1, [open_access()]);
+    let workloads = state.resources.workloads().clone();
+    let mut call = request("dep-a/a", None, Duration::from_secs(30));
+    call.body = wyrd_gateway::RequestJson::serialize(&json!({"model": "dep-a/a", "messages": []}))
+        .expect("the body serializes");
+    let running = tokio::spawn({
+        let state = state.clone();
+        async move {
+            GatewayInvocation::new(&state)
+                .invoke(&caller, call)
+                .await
+                .map(drop)
+        }
+    });
+    dispatched.recv().await.expect("the call dispatches");
+    assert!(workloads.workload_bytes(Workload::Gateway) > 0);
+
+    let overcommitted = workloads.observe_commitment();
+    overcommitted.set(u64::MAX);
+    assert_eq!(workloads.sample(0).state, PressureState::Critical);
+    // The first critical sample reclaims; the next cancels one victim.
+    workloads.sample(0);
+    let refused = running
+        .await
+        .expect("joins")
+        .expect_err("pressure cancels the running call");
+    assert!(
+        matches!(refused, WyrdError::ServiceUnavailable { .. }),
+        "{refused:?}"
+    );
+    assert_eq!(workloads.workload_bytes(Workload::Gateway), 0);
+    overcommitted.set(0);
+}
+
+/// A model call made inside a verification execution joins the execution's
+/// operation: the bytes it holds count as the execution's, and sustained
+/// critical pressure cancels the execution as a whole, which ends the call,
+/// rather than selecting the call on its own.
+///
+/// # Panics
+/// Panics when the Postgres fixture or setup fails, the call's bytes count
+/// as another operation's, pressure selects the call alone, or the call
+/// outlives its execution's cancellation.
+#[tokio::test]
+async fn critical_pressure_cancels_the_execution_a_model_call_belongs_to() {
+    use vala_verify::blocks::EngineError;
+    use wyrd_runtime::resources::{PressureState, Workload};
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let (entered, mut dispatched) = mpsc::unbounded_channel();
+    let held = Arc::new(Held {
+        entered,
+        release: Semaphore::new(0),
+    });
+    let state = replica(&fixture, held.clone()).await;
+    configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
+    let caller = invoker(tenant, 1, [open_access()]);
+    let workloads = state.resources.workloads().clone();
+    let mut call = request("dep-a/a", None, Duration::from_secs(30));
+    call.body = wyrd_gateway::RequestJson::serialize(&json!({"model": "dep-a/a", "messages": []}))
+        .expect("the body serializes");
+    let execution = tokio::spawn({
+        let state = state.clone();
+        async move {
+            // The call runs as one block of the execution, as an Agent's does.
+            let call = Box::pin(async {
+                crate::verification::hosted::blocks::cancellable(Box::pin(async {
+                    GatewayInvocation::new(&state)
+                        .nested(Workload::Verification)
+                        .invoke(&caller, call)
+                        .await
+                        .map(drop)
+                        .map_err(|error| vala_verify::blocks::BlockError::Retryable {
+                            reason: error.to_string(),
+                        })
+                }))
+                .await
+                .map_err(|error| EngineError::Busy(error.to_string()))
+            });
+            crate::verification::hosted::blocks::as_one_operation(&state, tenant, None, call).await
+        }
+    });
+    dispatched.recv().await.expect("the call dispatches");
+    assert!(workloads.workload_bytes(Workload::Verification) > 0);
+    assert_eq!(
+        workloads.workload_bytes(Workload::Gateway),
+        0,
+        "the call's bytes are the execution's, not gateway traffic"
+    );
+
+    let overcommitted = workloads.observe_commitment();
+    overcommitted.set(u64::MAX);
+    assert_eq!(workloads.sample(0).state, PressureState::Critical);
+    // The first critical sample reclaims; the next cancels one victim.
+    workloads.sample(0);
+    let refused = execution
+        .await
+        .expect("joins")
+        .expect_err("pressure cancels the execution");
+    assert!(
+        matches!(&refused, EngineError::Busy(reason) if reason.contains("cancelled the execution")),
+        "the execution, not the call alone, was the victim: {refused:?}"
+    );
+    assert_eq!(workloads.workload_bytes(Workload::Verification), 0);
+    overcommitted.set(0);
+}
+
+/// A call's provider attempt is CPU work on the shared lanes: while other
+/// work holds every lane the attempt queues and does not run, once a lane
+/// frees it runs as the calling tenant's gateway work, and while it waits on
+/// its provider it holds no lane.
+///
+/// # Panics
+/// Panics when the attempt runs or never queues while every lane is held,
+/// runs under another identity, holds a lane across its provider wait, or
+/// the call does not complete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_attempts_run_on_shared_cpu_lanes_and_wait_off_them() {
+    use wyrd_runtime::resources::Workload;
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let probe = Arc::new(LaneProbe::default());
+    let state = replica(&fixture, probe.clone()).await;
+    configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
+    warm(&state, [tenant]).await;
+    let workloads = state.resources.workloads().clone();
+    let bifrost = workloads.begin(Workload::Bifrost, None, None);
+    let mut held = Vec::new();
+    while workloads.lanes().free() > 0 {
+        held.push(workloads.lanes().acquire(bifrost.context()).await);
+    }
+    let lanes = held.len();
+    let waiting = workloads.lanes().waiting();
+
+    let call = tokio::spawn({
+        let state = state.clone();
+        async move {
+            GatewayInvocation::new(&state)
+                .invoke(
+                    &invoker(tenant, 1, [open_access()]),
+                    request("dep-a/a", None, Duration::from_secs(30)),
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while workloads.lanes().waiting() <= waiting {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the call's CPU work queues for a held lane");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        probe.contexts.lock().expect("contexts").is_empty(),
+        "no attempt runs while every lane is held"
+    );
+
+    held.clear();
+    tokio::time::timeout(Duration::from_secs(10), probe.entered.notified())
+        .await
+        .expect("the attempt runs once a lane frees");
+    let context = probe.contexts.lock().expect("contexts")[0].expect("the attempt runs on a lane");
+    assert_eq!(
+        (context.workload, context.tenant),
+        (Workload::Gateway, Some(tenant)),
+        "the attempt runs as the calling tenant's gateway work"
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while workloads.lanes().free() < lanes {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("a provider wait holds no lane");
+
+    probe.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), call)
+        .await
+        .expect("the call settles")
+        .expect("the call task")
+        .expect("the call completes");
+}
+
+/// Serves one streaming chat answer whose headers go out at once and whose
+/// `frames` follow, then end, only once the first returned [`Notify`]
+/// fires; the second fires once they were written.
+///
+/// # Panics
+///
+/// Panics when the listener cannot bind, accept, read, or write.
+async fn paced_upstream(frames: &'static str) -> (u16, Arc<Notify>, Arc<Notify>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let (send, written) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    let (paced, wrote) = (Arc::clone(&send), Arc::clone(&written));
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let (mut request, mut buffer) = (Vec::new(), [0_u8; 4096]);
+        loop {
+            let read = socket.read(&mut buffer).await.expect("read");
+            request.extend_from_slice(&buffer[..read]);
+            let text = String::from_utf8_lossy(&request);
+            if let Some(end) = text.find("\r\n\r\n") {
+                let length = text[..end]
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|value| value.trim().parse::<usize>().expect("length"))
+                    })
+                    .unwrap_or(0);
+                if request.len() >= end + 4 + length {
+                    break;
+                }
+            }
+        }
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n")
+            .await
+            .expect("write head");
+        paced.notified().await;
+        let body = format!("{:x}\r\n{frames}\r\n0\r\n\r\n", frames.len());
+        socket
+            .write_all(body.as_bytes())
+            .await
+            .expect("write frames");
+        wrote.notify_one();
+        let _ = socket.read(&mut buffer).await;
+    });
+    (port, send, written)
+}
+
+/// A relayed stream's frames are CPU work on the shared lanes: the relay
+/// runs on its own task, yet while other work holds every lane the frames
+/// the upstream sent wait for one, queued as the call's work, and are not
+/// delivered; once a lane frees the stream is delivered through its
+/// terminator.
+///
+/// # Panics
+/// Panics when the stream does not open, a frame is relayed or never queues
+/// while every lane is held, or the stream does not end after release.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relayed_stream_frames_wait_for_a_shared_cpu_lane() {
+    use wyrd_runtime::resources::Workload;
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let dispatch: Arc<dyn ProviderDispatch> = Arc::new(
+        wyrd_gateway::HttpProviderDispatch::new(
+            skald_providers::EndpointPolicy::new(false),
+            wyrd_gateway::BuiltinEndpoints::default(),
+        )
+        .expect("gateway dispatch builds"),
+    );
+    let state = replica(&fixture, dispatch).await;
+    let lanes = state.resources.workloads().lanes().free();
+    configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
+    let (port, send, written) =
+        paced_upstream("data: {\"id\":\"paced-marker\",\"choices\":[]}\n\ndata: [DONE]\n\n").await;
+    GatewayAdministration::new(&state)
+        .put_deployment(
+            &admin(tenant),
+            &ProviderDeploymentName::new("paced").expect("name"),
+            serde_json::from_value(json!({
+                "name": "paced",
+                "adapter": {"openai_compatible": {"base_url": format!("http://127.0.0.1:{port}/v1")}},
+                "auth": "none",
+                "capabilities": ["chat_completions"],
+            }))
+            .expect("deployment decodes"),
+        )
+        .await
+        .expect("deployment stores");
+    let mut request = request("paced/paced", None, Duration::from_secs(30));
+    request.stream = true;
+    let mut body = std::mem::take(&mut request.body).into_tree();
+    body["stream"] = json!(true);
+    request.body = body.into();
+    let response = tokio::time::timeout(
+        Duration::from_secs(10),
+        GatewayInvocation::new(&state).invoke(&invoker(tenant, 1, [open_access()]), request),
+    )
+    .await
+    .expect("the stream opens on its headers")
+    .expect("the stream opens");
+    let ResponseBody::Events(mut events) = response.body else {
+        panic!("event stream expected: {:?}", response.body);
+    };
+
+    let workloads = state.resources.workloads().clone();
+    let bifrost = workloads.begin(Workload::Bifrost, None, None);
+    let mut held = Vec::new();
+    for _ in 0..lanes {
+        held.push(workloads.lanes().acquire(bifrost.context()).await);
+    }
+    send.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), written.notified())
+        .await
+        .expect("the upstream sends its frames");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while workloads.lanes().waiting() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the call's work queues for a held lane");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), events.recv())
+            .await
+            .is_err(),
+        "no frame is relayed while every lane is held"
+    );
+
+    held.clear();
+    let mut delivered = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(frame) = events.recv().await {
+            delivered.extend_from_slice(&frame.expect("the stream terminates cleanly"));
+        }
+    })
+    .await
+    .expect("the stream ends once a lane frees");
+    let delivered = String::from_utf8(delivered).expect("utf-8");
+    assert!(
+        delivered.contains("paced-marker") && delivered.ends_with("data: [DONE]\n\n"),
+        "{delivered}"
     );
 }

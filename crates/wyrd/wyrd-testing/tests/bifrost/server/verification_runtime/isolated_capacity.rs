@@ -16,6 +16,7 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use secrecy::ExposeSecret;
@@ -37,6 +38,7 @@ use wyrd_client::verify::{Execution, Submission, VerificationExecutionStatus};
 use wyrd_client::{Bifrost, Gateway, WyrdClient};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::verification::execution::{RequirementOutcome, VerificationResult};
+use wyrd_testing::gateway_capture::{GatewayCapture, HeldUpstream};
 use wyrd_testing::logs::LogCapture;
 use wyrd_testing::server::{HostedLimits, RuntimeLimits};
 use wyrd_testing::{Bootstrap, WyrdTestServer};
@@ -51,6 +53,9 @@ const MODEL_WAIT: &str = "the model call waits for its lane's admission";
 
 /// The stable code of a direct verification past its deadline.
 const TIMED_OUT: &str = "WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT";
+
+/// The event new work logs when process pressure keeps it waiting.
+const PRESSURE_WAIT: &str = "new work waits for process pressure to admit it";
 
 /// The event the runner logs when a queued execution meets a full admission.
 const DEFERRED: &str = "verification execution deferred by admission backpressure";
@@ -71,6 +76,12 @@ fn completion(message: Value) -> ResponseTemplate {
 /// finishes; every other Agent finishes at once.
 fn reply(request: &Request) -> ResponseTemplate {
     let body: Value = serde_json::from_slice(&request.body).unwrap_or_default();
+    if body["stream"] == true {
+        return ResponseTemplate::new(200).set_body_raw(
+            GatewayCapture::chat_events("chatcmpl-slow", SLOW_CHUNKS),
+            "text/event-stream",
+        );
+    }
     let messages = body["messages"].as_array().cloned().unwrap_or_default();
     let writes = messages
         .iter()
@@ -94,6 +105,9 @@ fn reply(request: &Request) -> ResponseTemplate {
     completion(json!({ "role": "assistant", "content": r#"{"done":true}"# }))
 }
 
+/// The message content whose provider answers a test holds.
+const HELD_BODY: &str = "HELD-BODY";
+
 /// The plaintext API key of a bootstrapped machine principal.
 ///
 /// # Panics
@@ -114,8 +128,16 @@ struct CapacityDesk {
     server: WyrdTestServer,
     /// The administrator's client.
     admin: WyrdClient,
+    /// The administrator's API key, for standalone gateway calls.
+    admin_key: String,
     /// The scripted model upstream; kept alive for the server.
     _upstream: MockServer,
+    /// The provider the gateway calls, forwarding to the scripted upstream
+    /// and holding answers a test chooses.
+    provider: HeldUpstream,
+    /// Notified each time a request carrying [`HELD_BODY`] reaches the
+    /// scripted upstream.
+    held_arrived: Arc<tokio::sync::Notify>,
     /// The hydrated bundle's directory; kept alive for `state`.
     _bundle: tempfile::TempDir,
     /// The registered `capacity-desk` Service.
@@ -133,11 +155,21 @@ impl CapacityDesk {
     /// Panics when a setup step fails.
     async fn start() -> Self {
         let upstream = MockServer::start().await;
+        let held_arrived = Arc::new(tokio::sync::Notify::new());
+        let arrived = Arc::clone(&held_arrived);
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
-            .respond_with(reply)
+            .respond_with(move |request: &Request| {
+                if String::from_utf8_lossy(&request.body).contains(HELD_BODY) {
+                    arrived.notify_one();
+                }
+                reply(request)
+            })
             .mount(&upstream)
             .await;
+        let provider = HeldUpstream::start(&upstream)
+            .await
+            .expect("the held provider binds");
         let server = Box::pin(
             WyrdTestServer::builder()
                 .with_verification_limits_for_test(HostedLimits {
@@ -154,22 +186,19 @@ impl CapacityDesk {
                 })
                 .with_verification_runtime_for_test()
                 .with_gateway_provider_root_for_test(
-                    upstream.uri().parse().expect("upstream URL parses"),
+                    provider.uri().parse().expect("provider URL parses"),
                 )
                 .start_bound(),
         )
         .await
         .expect("the server starts");
-        let admin = native_client(
-            &server,
-            &api_key(
-                server
-                    .bootstrap_service("capacity_admin", &["admin"])
-                    .await
-                    .expect("the administrator bootstraps"),
-            ),
-        )
-        .expect("the admin client builds");
+        let admin_key = api_key(
+            server
+                .bootstrap_service("capacity_admin", &["admin"])
+                .await
+                .expect("the administrator bootstraps"),
+        );
+        let admin = native_client(&server, &admin_key).expect("the admin client builds");
         CredentialWriter::new(admin.clone())
             .put_credential(&ProviderCredentialWrite {
                 name: ProviderCredentialName::new("openai-key").expect("credential name"),
@@ -246,7 +275,10 @@ impl CapacityDesk {
         Self {
             server,
             admin,
+            admin_key,
             _upstream: upstream,
+            provider,
+            held_arrived,
             _bundle: bundle,
             root,
             state,
@@ -273,15 +305,13 @@ impl CapacityDesk {
         self.blocks().hold_model_calls_for_test()
     }
 
-    /// Hold free process memory down to `leave` bytes, short of one Python
-    /// session, so every Python operation is refused, until the returned
-    /// hold drops. A queued submission needs room left for the Scribe write
-    /// that stages it, since Scribe shares process memory.
+    /// Hold all free process memory, so every Python operation is refused,
+    /// until the returned hold drops.
     ///
     /// # Panics
     /// Panics when the server hosts no blocks.
-    fn hold_python(&self, leave: u64) -> impl Sized {
-        self.blocks().sandbox().occupy_for_test(leave)
+    fn hold_python(&self) -> impl Sized {
+        self.blocks().sandbox().occupy_for_test(0)
     }
 
     /// Hold all free process scratch, so every workspace is refused, until
@@ -384,6 +414,30 @@ async fn logged(logs: &LogCapture, parts: &[&str]) {
     }
 }
 
+/// How many times `workload` work has logged waiting for pressure.
+fn pressure_waits(logs: &LogCapture, workload: &str) -> usize {
+    let field = format!("workload={workload}");
+    logs.text()
+        .lines()
+        .filter(|line| line.contains(PRESSURE_WAIT) && line.contains(&field))
+        .count()
+}
+
+/// Wait until `workload` work has logged waiting for pressure `count` times.
+///
+/// # Panics
+/// Panics when it has not within a minute.
+async fn waited(logs: &LogCapture, workload: &str, count: usize) {
+    let deadline = Instant::now() + Duration::from_mins(1);
+    while pressure_waits(logs, workload) < count {
+        assert!(
+            Instant::now() < deadline,
+            "{workload} work never waited for pressure {count} times"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// Wait for `execution` to settle and return its result.
 ///
 /// # Panics
@@ -399,10 +453,12 @@ async fn settled(execution: &Execution) -> VerificationResult {
 /// model-call permit held, a queued Agent waits for admission while holding
 /// the only queued execution slot, a direct assert-only Verifier completes,
 /// and a second queued run stays pending; both queued runs complete once the
-/// permit is released, and a direct Agent then runs. Python memory and scratch are reserved for neither
-/// mode: an idle server holds no scratch, and with either held at capacity a
-/// queued code or workspace run is deferred and completes on release, while
-/// direct work of that resource is refused with the stable unavailable code.
+/// permit is released, and a direct Agent then runs. Memory and scratch are
+/// reserved for neither mode: an idle server holds no scratch; under
+/// critical memory pressure a queued code run is deferred before it reads
+/// its input and completes once pressure recovers; with scratch held a queued workspace
+/// run is deferred and completes on release; and direct work finding memory
+/// or scratch full is refused with the stable unavailable code.
 /// Every model call is recorded on the ordinary gateway path against the
 /// verified Service, the deferred attempt's call included. A direct model call waits for the shared permit like a
 /// queued one, and a wait past the direct deadline is cancelled without
@@ -449,10 +505,14 @@ async fn direct_verification_runs_while_queued_capacity_is_held() {
         0,
         "an idle server reserves no scratch for either mode"
     );
-    let held = desk.hold_python(64 << 20);
+    let workloads = desk.server.state().resources.workloads().clone();
+    let pressure = desk.blocks().sandbox().overcommit_for_test();
+    workloads.sample(0);
     let queued_python = desk.submit("python-check", "QUEUED-PYTHON").await;
     logged(&logs, &[DEFERRED, &queued_python.id().to_string()]).await;
-    drop(held);
+    pressure.set(0);
+    workloads.sample(0);
+    workloads.sample(0);
     passed(&settled(&queued_python).await, "measured");
 
     let held = desk.hold_scratch();
@@ -488,7 +548,7 @@ async fn direct_verification_runs_while_queued_capacity_is_held() {
         .expect_err("direct work needs free process scratch");
     assert_eq!(refused.code(), UNAVAILABLE, "scratch");
     drop(held);
-    let held = desk.hold_python(0);
+    let held = desk.hold_python();
     let refused = desk
         .verify("python-check", "FULL-PYTHON")
         .await
@@ -532,5 +592,400 @@ async fn direct_verification_runs_while_queued_capacity_is_held() {
         .expect_err("a full direct execution ceiling refuses");
     assert_eq!(refused.code(), UNAVAILABLE);
     drop(held);
+    desk.server.shutdown().await.expect("the server stops");
+}
+
+/// Verification, standalone gateway traffic and Bifrost work on one server
+/// share process pressure: while pressure is critical a standalone chat
+/// completion and a public query each reach admission and wait there, as
+/// gateway and Bifrost work, a queued Agent run is deferred before it reads
+/// its input, and once it recovers all three complete. The Agent's nested model call is recorded
+/// against the verified Service and the standalone call against no subject,
+/// and no workload keeps bytes once everything settles.
+///
+/// # Panics
+/// Panics when work finishes under critical pressure, does not finish after
+/// recovery, is attributed to the wrong subject, or leaves bytes charged.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn connected_work_waits_out_pressure_with_its_own_attribution() {
+    use wyrd_runtime::resources::{PressureState, Workload};
+
+    let logs = LogCapture::install_global().expect("the journey owns the process subscriber");
+    let desk = CapacityDesk::start().await;
+    let workloads = desk.server.state().resources.workloads().clone();
+    let overcommitted = workloads.observe_commitment();
+    overcommitted.set(u64::MAX);
+    assert_eq!(workloads.sample(0).state, PressureState::Critical);
+
+    let standalone = tokio::spawn({
+        let url = format!(
+            "{}/v1/chat/completions",
+            desk.server.base_url().expect("the server is bound")
+        );
+        let key = desk.admin_key.clone();
+        async move {
+            reqwest::Client::new()
+                .post(url)
+                .bearer_auth(key)
+                .json(&json!({
+                    "model": "openai/gpt-4o",
+                    "messages": [{"role": "user", "content": "STANDALONE"}],
+                }))
+                .send()
+                .await
+                .expect("the standalone call sends")
+                .status()
+                .as_u16()
+        }
+    });
+    let query = tokio::spawn({
+        let admin = desk.admin.clone();
+        async move {
+            Bifrost::connect_with(&admin, BifrostOptions::default())
+                .await
+                .expect("Bifrost connects")
+                .sql_as::<Value>("SELECT count(*) AS calls FROM bifrost.gateway.calls", &[])
+                .await
+                .expect("the query runs")
+        }
+    });
+    waited(&logs, "Gateway", 1).await;
+    waited(&logs, "Bifrost", 1).await;
+    let queued = desk.submit("model-check", "PRESSURE-MODEL").await;
+    // Pressure defers the queued run before it reads its input, so the
+    // read never waits out the execution's deadline.
+    logged(&logs, &[DEFERRED, &queued.id().to_string()]).await;
+    assert!(!standalone.is_finished(), "the standalone call waits");
+    assert!(!query.is_finished(), "the query waits");
+    let status = queued.status().await.expect("the status reads").status;
+    assert!(
+        matches!(
+            status,
+            VerificationExecutionStatus::Pending
+                | VerificationExecutionStatus::Running
+                | VerificationExecutionStatus::Retrying
+        ),
+        "the queued Agent waits unsettled: {status:?}"
+    );
+
+    overcommitted.set(0);
+    workloads.sample(0);
+    workloads.sample(0);
+    assert_eq!(standalone.await.expect("the standalone call"), 200);
+    assert_eq!(query.await.expect("the query").len(), 1);
+    passed(&settled(&queued).await, "answered");
+
+    let subjects = desk.call_subjects().await;
+    assert_eq!(
+        subjects.len(),
+        2,
+        "each call is recorded once, the nested one never also as gateway traffic: {subjects:?}"
+    );
+    let root = desk
+        .root
+        .uid
+        .as_ref()
+        .expect("the declared root carries its UID")
+        .to_string();
+    assert_eq!(
+        subjects
+            .iter()
+            .filter(|subject| subject.as_deref() == Some(root.as_str()))
+            .count(),
+        1,
+        "the nested call is the verified Service's: {subjects:?}"
+    );
+    assert_eq!(
+        subjects.iter().filter(|subject| subject.is_none()).count(),
+        1,
+        "the standalone call has no subject: {subjects:?}"
+    );
+    for workload in Workload::ALL {
+        assert_eq!(
+            workloads.workload_bytes(workload),
+            0,
+            "{workload:?} keeps no bytes once its work settles"
+        );
+    }
+    desk.server.shutdown().await.expect("the server stops");
+}
+
+/// A verification that critical pressure selects as its victim ends in the
+/// capacity outcome, never a judgment: while a queued Agent run's model call
+/// is held at the provider, pressure stays critical through two samples, so
+/// the run, which owns its nested call's bytes, is cancelled and deferred,
+/// and completes with no failure recorded once pressure recovers. A direct Agent
+/// verification cancelled the same way is refused with the stable
+/// unavailable code.
+///
+/// # Panics
+/// Panics when the process already has a global subscriber, the victim run
+/// is not deferred, does not pass after recovery, or keeps a failure, or the
+/// direct verification is answered otherwise.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn a_pressure_victim_ends_in_capacity_not_a_judgment() {
+    use wyrd_runtime::resources::{PressureState, Workload};
+
+    let logs = LogCapture::install_global().expect("the journey owns the process subscriber");
+    let desk = CapacityDesk::start().await;
+    let workloads = desk.server.state().resources.workloads().clone();
+    let overcommitted = workloads.observe_commitment();
+    let victimize = || {
+        overcommitted.set(u64::MAX);
+        // The first critical sample reclaims; the next selects a victim.
+        assert_eq!(workloads.sample(0).state, PressureState::Critical);
+        assert_eq!(workloads.sample(0).state, PressureState::Critical);
+    };
+    let recover = || {
+        overcommitted.set(0);
+        workloads.sample(0);
+        workloads.sample(0);
+    };
+
+    desk.provider.hold(&[HELD_BODY]);
+    let queued = desk.submit("model-check", HELD_BODY).await;
+    desk.held_arrived.notified().await;
+    assert!(
+        workloads.workload_bytes(Workload::Verification) > 0,
+        "the queued run owns its nested call's bytes"
+    );
+    victimize();
+    // Reading the execution is Bifrost work that pressure also pauses, so
+    // the runner's own deferral event witnesses the cancelled attempt.
+    logged(&logs, &[DEFERRED, &queued.id().to_string()]).await;
+    desk.provider.release(&[HELD_BODY]);
+    recover();
+    passed(&settled(&queued).await, "answered");
+    let state = queued.status().await.expect("the status reads");
+    assert_eq!(state.status, VerificationExecutionStatus::Completed);
+    assert!(
+        state.error.is_none(),
+        "the victim attempt left no failure: {state:?}"
+    );
+
+    desk.provider.hold(&[HELD_BODY]);
+    let (refused, ()) = tokio::join!(desk.verify("model-check", HELD_BODY), async {
+        // The queued retry's arrival may have left a stored notification;
+        // the direct run's own held call is the one that holds bytes.
+        loop {
+            desk.held_arrived.notified().await;
+            if workloads.workload_bytes(Workload::Verification) > 0 {
+                break;
+            }
+        }
+        victimize();
+    });
+    let refused = refused.expect_err("a direct victim is refused");
+    assert_eq!(
+        refused.code(),
+        UNAVAILABLE,
+        "a direct victim gets the capacity code"
+    );
+    desk.provider.release(&[HELD_BODY]);
+    recover();
+    desk.server.shutdown().await.expect("the server stops");
+}
+
+/// A standalone chat completion's request body counts as gateway work for as
+/// long as its call runs, and returns when the call settles.
+///
+/// # Panics
+/// Panics when setup or the call fails, or the body is uncounted, counted as
+/// another workload's, or kept after the call.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn standalone_call_bodies_count_as_gateway_work_while_the_call_runs() {
+    use wyrd_runtime::resources::Workload;
+
+    let desk = CapacityDesk::start().await;
+    let workloads = desk.server.state().resources.workloads().clone();
+    let body = serde_json::to_vec(&json!({
+        "model": "openai/gpt-4o",
+        "messages": [{"role": "user", "content": format!("{HELD_BODY} {}", "x".repeat(64 * 1024))}],
+    }))
+    .expect("the body serializes");
+    let sent = body.len() as u64;
+    desk.provider.hold(&[HELD_BODY]);
+    let call = tokio::spawn({
+        let url = format!(
+            "{}/v1/chat/completions",
+            desk.server.base_url().expect("the server is bound")
+        );
+        let key = desk.admin_key.clone();
+        async move {
+            reqwest::Client::new()
+                .post(url)
+                .bearer_auth(key)
+                .header("content-type", "application/json")
+                .body(body)
+                .send()
+                .await
+                .expect("the call sends")
+                .status()
+                .as_u16()
+        }
+    });
+    desk.held_arrived.notified().await;
+    assert_eq!(
+        workloads.workload_bytes(Workload::Gateway),
+        sent,
+        "the dispatched call holds its body as gateway work"
+    );
+    for workload in [Workload::Verification, Workload::Bifrost] {
+        assert_eq!(workloads.workload_bytes(workload), 0, "{workload:?}");
+    }
+    desk.provider.release(&[HELD_BODY]);
+    assert_eq!(call.await.expect("the call joins"), 200);
+    assert_eq!(
+        workloads.workload_bytes(Workload::Gateway),
+        0,
+        "the body returns when the call settles"
+    );
+    desk.server.shutdown().await.expect("the server stops");
+}
+
+/// Chunks of the provider's streamed answer: several MiB, more than the
+/// socket buffers between the gateway and a stalled reader can absorb, so
+/// the relay's own queue fills.
+const SLOW_CHUNKS: usize = 100_000;
+
+/// A raw HTTP/1.1 streamed chat completion whose client receive buffer is
+/// small, so a reader that stops reading holds the stream open mid-answer.
+struct SlowReader {
+    /// The connection, positioned after the response head.
+    socket: tokio::net::TcpStream,
+}
+
+impl SlowReader {
+    /// Send `body` to the desk's chat completions route and read the
+    /// response head, then stop reading.
+    ///
+    /// # Panics
+    /// Panics when the connection fails or the answer is not a 200 stream.
+    async fn open(desk: &CapacityDesk, body: &[u8]) -> Self {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let socket = tokio::net::TcpSocket::new_v4().expect("a socket");
+        socket
+            .set_recv_buffer_size(4_096)
+            .expect("a small receive buffer");
+        let mut socket = socket
+            .connect(desk.server.bound_addr().expect("the server is bound"))
+            .await
+            .expect("the server accepts");
+        let head = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nhost: wyrd\r\nauthorization: Bearer {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            desk.admin_key,
+            body.len()
+        );
+        socket
+            .write_all(head.as_bytes())
+            .await
+            .expect("the head sends");
+        socket.write_all(body).await.expect("the body sends");
+        let mut read = Vec::new();
+        while !read.ends_with(b"\r\n\r\n") {
+            read.push(socket.read_u8().await.expect("the head reads"));
+        }
+        let head = String::from_utf8(read).expect("an ascii head");
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert!(head.contains("text/event-stream"), "{head}");
+        Self { socket }
+    }
+
+    /// Read the rest of the chunked body and return its decoded bytes.
+    ///
+    /// # Panics
+    /// Panics when the body is not well-formed chunked encoding.
+    async fn finish(mut self) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+
+        let mut raw = Vec::new();
+        self.socket
+            .read_to_end(&mut raw)
+            .await
+            .expect("the body reads");
+        let mut body = Vec::new();
+        let mut rest = raw.as_slice();
+        loop {
+            let line = rest
+                .windows(2)
+                .position(|pair| pair == b"\r\n")
+                .expect("a chunk size line");
+            let size = std::str::from_utf8(&rest[..line])
+                .ok()
+                .and_then(|size| usize::from_str_radix(size, 16).ok())
+                .expect("a hexadecimal chunk size");
+            rest = &rest[line + 2..];
+            if size == 0 {
+                return body;
+            }
+            body.extend_from_slice(&rest[..size]);
+            rest = &rest[size + 2..];
+        }
+    }
+}
+
+/// A slow reader's streamed chat completion stays byte-bounded and charged:
+/// while the reader has stopped mid-answer, the frames the gateway retains
+/// for it are charged to its gateway work, within the relay's bound and far
+/// below the answer; the reader then receives the whole answer. A second
+/// reader that disconnects mid-answer leaves nothing charged once its call
+/// settles.
+///
+/// # Panics
+/// Panics when setup or a call fails, the stream is malformed, or the
+/// gateway's charged bytes are not above the request body while frames wait,
+/// exceed the bound, or remain after the calls end.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn a_slow_stream_holds_only_bounded_charged_frames() {
+    use wyrd_runtime::resources::Workload;
+
+    let desk = CapacityDesk::start().await;
+    let workloads = desk.server.state().resources.workloads().clone();
+    let gateway = || workloads.workload_bytes(Workload::Gateway);
+    let body = serde_json::to_vec(&json!({
+        "model": "openai/gpt-4o",
+        "stream": true,
+        "messages": [{"role": "user", "content": "SLOW-STREAM"}],
+    }))
+    .expect("the body serializes");
+    let sent = body.len() as u64;
+    let answer = GatewayCapture::chat_events("chatcmpl-slow", SLOW_CHUNKS);
+    // The relay's queue of 16 frames of at most 64 KiB, plus the frames the
+    // HTTP connection is still writing.
+    let bound = sent + 2 * 1024 * 1024;
+
+    let reader = SlowReader::open(&desk, &body).await;
+    super::until("the stalled stream's frames to be charged", || {
+        gateway() > sent
+    })
+    .await
+    .expect("frames wait for the reader");
+    let held = gateway();
+    assert!(held <= bound, "{held} bytes exceed the {bound}-byte bound");
+    assert!(
+        held < answer.len() as u64,
+        "the gateway does not buffer the whole answer"
+    );
+    let relayed = reader.finish().await;
+    assert_eq!(relayed, answer.as_bytes(), "every frame arrives in order");
+    super::until("the finished stream's charges to return", || gateway() == 0)
+        .await
+        .expect("a finished stream keeps nothing");
+
+    let reader = SlowReader::open(&desk, &body).await;
+    super::until("the second stream's frames to be charged", || {
+        gateway() > sent
+    })
+    .await
+    .expect("frames wait for the reader");
+    drop(reader);
+    super::until("the dropped stream's charges to return", || gateway() == 0)
+        .await
+        .expect("a dropped stream keeps nothing");
     desk.server.shutdown().await.expect("the server stops");
 }

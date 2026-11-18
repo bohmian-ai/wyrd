@@ -27,6 +27,19 @@ result mirror, UI, private enterprise path or source modification is authorized.
 Wyrd owns App keys/signing/callbacks/tenancy; the independent library owns generic
 acquisition/comparison/index/context and remains standalone.
 
+Task 011 targets approved spec revision 9 and adds the single docsite tutorial
+for the existing REQ-016 / AC-011 journey. It consumes task 009's runnable public
+standard-report example, topic docs and connected surface proof. Task 009 retains
+those obligations; 011 owns the step-by-step teaching page and its discovery.
+
+The maintainer agreed [shared workload management](../design/shared-workload-management.md)
+on 2026-11-16 and requested TASK-012-R1-allocation before TASK-013. The matching
+[revision-16 amendment](../spec-revisions/16-shared-workload-management.md) was
+explicitly approved on 2026-11-16; the new task is proposed under that contract,
+with implementation and verification outstanding. It replaces speculative
+verification envelopes/copy estimates, preserves Bifrost's intentional workspace
+reservations, and connects shared pressure and non-preemptive CPU admission.
+
 ## Order and actual dependency outputs
 
 | Task | Deliverable consumed downstream |
@@ -39,9 +52,14 @@ acquisition/comparison/index/context and remains standalone.
 | [006](006-pr-admission-and-supersession.md) | **Historical PASS; acceptance reopened pending 010.** Durable queued ExecutionIds with frozen policy/source/generation and cancellation fences for 005/007/008/009 |
 | [007](007-deferred-evidence-and-resumption.md) | **Complete (maintainer approval).** Durable source-matched evidence, waiting inspection and same-execution park/continuation lifecycle (compute released at park; background ACK before retirement) for 008/009 |
 | [008](008-approval-steps.md) | **Requires 010.** Exact pending approval identities, accepted decisions and continuation/progress for 009 |
-| [009](009-reports-and-github-delivery.md) | **Requires 010.** Optional standard report/helper authoring and recoverable Checks/comments with independent provider retry that never recomputes verification; no new SQL delivery fields |
+| [009](009-reports-and-github-delivery.md) | **Requires 010.** Optional standard report authoring and recoverable Checks/comments with independent provider retry that never recomputes verification; no new SQL delivery fields |
 | [010](010-nonblocking-verification-execution.md) | **Complete.** Approved runtime spec revision 7; shared memory-owned engine, preserved preparation, bounded background terminal retention/lease/group-commit settlement, claim backpressure and resource-scaling proof; keeps Bifrost unchanged and PR/GitHub/Task 004 metadata |
 | [010-R1](010-R1-restore-direct-verification-baseline.md) | **Complete remediation.** Maintainer-agreed direct resource-scaling restoration, destination batching and consumer closure; queued-only resumable state on the same engine; full L1 verification/gateway/Bifrost with no regression. L2 measurement is excluded. |
+| [011](011-code-review-pipeline-tutorial.md) | **Proposed; requires 009.** Single docsite journey from GitHub connection and repository declaration through review authoring, approval, Check/comment and waiting/delivery diagnosis; reuses 009's public standard-report example |
+| [012](012-integrate-code-mode.md) | **Proposed.** Staged port of pinned code mode into B's dynamic pipelines; preserves behavior, applies revision 12's decided nested exclusions and crates.io Monty, carries open obligations and supplies the composed, functionally verified tree for 013 and 014; runs no benchmark |
+| [012-R1](012-R1-allocation.md) | **Proposed; requires 012; approved spec revision 16.** Consumption-based workload manager over gateway/verification/Bifrost and managed workers, preserved Bifrost workspace policy, connected fairness/custody regressions and full clean L1 qualification; required before 013 |
+| [013](013-mixed-verification-benchmark.md) | **Proposed; requires 012 and 012-R1; approved spec revision 16.** Deterministic 100-tenant Postgres fairness/completion/drain/ledger regression; same-rate direct-only control for existing L2 `competing` on one `combined` server, shared tables and full clean L2 baseline for 014; consumes 012-R1's qualified allocation implementation and L1 records |
+| [014](014-direct-verification-throughput.md) | **Proposed; requires 013 (after 012 and 012-R1); approved spec revision 16.** Direct-throughput optimization toward 20,000–30,000 verifications/s and Rust round trips under 2–3 ms; retains c64 overhead target, six-population c1/c64 and matched-rate qualification, scheduler/isolation regressions and inherited diagnosis/ledger rows; compares L1/L2 baselines and re-runs competing/control; consumes 013's 100-tenant test and existing replica-claim proof, without sustained 100-tenant or two-process qualification |
 
 Task 010 targets approved runtime spec revision 7 and must be completed before
 renewed 006 acceptance or 005/007–009 execution. Tasks 005 and 007–009 list 010 in
@@ -60,6 +78,7 @@ invented approval of another spec revision or a runtime PASS.
 Numbering preserves the original nine behavioral pieces, not a linear execution
 order. The original sequence was 001/002, then 003/004, then 006, then 005/007,
 then 008/009; 010 now precedes 005/007–009 and renewed 006 acceptance. Only real prerequisite outputs appear in task metadata. In particular,
+011 follows 009 and consumes its runnable example and topic docs.
 005 waits for 006's accepted PR activation. 006 can prove admission with a normal
 declared queued Verifier; 005 then proves the actual pinned extraction consumer.
 
@@ -88,7 +107,7 @@ listed in task metadata; their strongest crash/authority proof is identified her
 | REQ-012–013; AC-008 | 009: retained successful outputs→zero/one/multiple/invalid report→pinned Check/comment/suggestion independent of authored verdict |
 | REQ-005,014; AC-009 | 009: provider remote success/timeout/batching/restart/new head/access loss→readback/reconciled independent delivery without recomputation |
 | REQ-015; AC-010 | 001 queued saturation→reserved direct execution; 005/007/008 direct queued-only refusal before any step; 006 supplies burst ingress |
-| REQ-016; AC-011 | 002/003/005/006/007/008/009 ship their own typed operations, scopes/errors/inspection/docs and journeys; 009 connects the complete reader journey |
+| REQ-016; AC-011 | 002/003/005/006/007/008/009 ship their own typed operations, scopes/errors/inspection/docs and journeys; 009 owns the runnable standard-report example, topic docs and connected runtime journey; 011 adds the single end-to-end tutorial, discovery links and rendered-page reader proof |
 | INV-001 | 002 association, 003 identity, 006 accepted authority, 007 source/type/tenant evidence matching, 008 exact approval permission and 009 per-write access |
 | INV-002–004 | 003 readiness selection; 006 canonical input ACK→queue commit; 007/008 evidence/decision/pending ACK→continuation recovery; 009 retained progress→independent provider delivery |
 | INV-005 | 005 frozen source/baseline/context and 007/008 same-execution accepted state/budget/deadline recovery |
@@ -179,3 +198,9 @@ boundaries; subsequent [Ponytail calibration](../review/002-github-app-connectio
 reduces retry and historical-evidence work. Its requested clarifications to revision references, packet
 requirements and the substituted-code negative proof are incorporated. This
 checks the authoring handoff; implementation closure remains pending.
+
+Task 011 and its dependency/traceability additions received a bounded independent
+read-only comprehension pass against the current spec, contracts and task packet.
+The reader found no material gap or unsupported scope and confirmed that 009
+retains the runnable example, topic docs and connected runtime proof. This checks
+the tutorial handoff only; the tutorial and its execution proof remain task work.

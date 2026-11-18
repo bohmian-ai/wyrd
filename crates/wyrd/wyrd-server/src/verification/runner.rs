@@ -667,11 +667,8 @@ impl VerifierRunner {
             tracing::warn!(%execution_id, "the execution's identity cannot be read; the failure is not recorded in the execution state");
             return Transition::Terminate(status, error);
         };
-        let offer = match Decision::of(&accepted) {
-            Some(decision) => Offer::Accepted(decision),
-            None => Offer::Failed(status, error),
-        };
         let state = RunState::at(
+            self.state.resources.workloads().clone(),
             Arc::clone(&self.outbox),
             tenant,
             frozen.row(system, identity),
@@ -680,6 +677,10 @@ impl VerifierRunner {
             accepted,
             revision,
         );
+        let offer = match state.decision() {
+            Some(decision) => Offer::Accepted(decision),
+            None => Offer::Failed(status, error),
+        };
         conclude(tenant, frozen, system, &state, offer, lease, &self.outbox).await
     }
 
@@ -763,6 +764,14 @@ impl VerifierRunner {
                 Err(outcome) => outcome,
             }
         };
+        // The whole attempt, input reads included, is one operation that
+        // pressure admits now or defers.
+        let engine = Box::pin(crate::verification::hosted::blocks::as_one_operation(
+            &self.state,
+            tenant,
+            Some(tokio::time::Instant::now()),
+            async { Ok(engine.await) },
+        ));
         let outcome = tokio::time::timeout_at(
             state.deadline(),
             telemetry.phase(
@@ -771,7 +780,10 @@ impl VerifierRunner {
             ),
         )
         .await
-        .unwrap_or_else(|_| timed_out());
+        .map_or_else(
+            |_| timed_out(),
+            |ran| ran.unwrap_or_else(|error| engine_failure(run, &error)),
+        );
         work.settle().await;
         outcome
     }
@@ -971,10 +983,7 @@ impl VerifierRunner {
             Ok(decisions) => decisions,
             Err(outcome) => return outcome,
         };
-        // The restoration copy stays charged while the engine runs.
-        let (engine, _restored) = state
-            .restore(engine, Arc::clone(state) as Arc<dyn Checkpoints>)
-            .into_parts();
+        let engine = state.restore(engine, Arc::clone(state) as Arc<dyn Checkpoints>);
         let engine = engine
             .with_approvals(decisions)
             .with_host_work(work.clone());
@@ -1657,6 +1666,11 @@ impl VerifierRunner {
 /// result write and settles only once Scribe accepts it, through
 /// [`deliver`]. A decision whose persistence fails maps through
 /// [`state_failure`], and a lost lease settles nothing.
+///
+/// The decision is an uncharged copy of the live state's terminal record,
+/// a small object graph covered by aggregate pressure. The selected
+/// decision drops once its result write is built, and that write is charged
+/// only when [`deliver`] stages it, where the outbox takes its custody.
 async fn conclude(
     tenant: DataTenantId,
     frozen: Frozen<'_>,
@@ -1685,7 +1699,10 @@ async fn conclude(
             Transition::Terminate(terminal_status(failure.status), failure.error)
         }
         Decision::Selected(selected) => match result(frozen, &selected, system) {
-            Ok((transition, write)) => deliver(tenant, transition, write, lease, outbox).await,
+            Ok((transition, write)) => {
+                drop(selected);
+                deliver(tenant, transition, write, lease, outbox).await
+            }
             Err(transition) => transition,
         },
     }

@@ -54,6 +54,7 @@ use crate::components::auth::token_extract::{
     verify_access_token, workload_uid_header,
 };
 use crate::http::error::WyrdErrorResponse;
+use crate::http::middleware::body_limit::BodyCustody;
 use crate::http::middleware::metrics::RequestArrival;
 use crate::state::AppState;
 
@@ -166,9 +167,10 @@ impl GatewayIngress {
         match verified {
             Ok(principal) => {
                 let arrival = request.extensions().get::<RequestArrival>().copied();
+                let body = request.extensions().get::<BodyCustody>().cloned();
                 let extensions = request.extensions_mut();
                 extensions.insert(principal);
-                extensions.insert(IngressClock::authenticated(arrival, authenticating));
+                extensions.insert(IngressClock::authenticated(arrival, authenticating, body));
                 next.run(request).await
             }
             Err(error) => self.error(&error),
@@ -510,7 +512,7 @@ pub(crate) async fn anthropic_messages(
         }
     };
     match answer {
-        Ok(answer) => relay(answer.status, answer.body),
+        Ok(answer) => relay(answer.status, answer.body, answer.custody),
         Err(error) => GatewayIngress::AnthropicMessages.error(&error),
     }
 }
@@ -575,7 +577,7 @@ pub(crate) async fn jev_systemone(
         },
     };
     match answer {
-        Ok(answer) => relay(answer.status, answer.body),
+        Ok(answer) => relay(answer.status, answer.body, answer.custody),
         Err(error) => GatewayIngress::OpenAi.error(&error),
     }
 }
@@ -689,7 +691,7 @@ pub(crate) async fn gemini_generate_content(
         },
     };
     match answer {
-        Ok(answer) => relay(answer.status, answer.body),
+        Ok(answer) => relay(answer.status, answer.body, answer.custody),
         Err(error) => GatewayIngress::GeminiGenerateContent.error(&error),
     }
 }

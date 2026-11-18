@@ -1168,10 +1168,12 @@ impl ScribeImpl {
         } = config;
         let seal_max_age = geometry.generation_max_age();
         let ScribeExecutionPools {
-            ingress_cpu,
-            persistence_cpu,
+            mut ingress_cpu,
+            mut persistence_cpu,
             wal_io,
         } = execution_pools;
+        ingress_cpu.join_lanes(memory.workloads());
+        persistence_cpu.join_lanes(memory.workloads());
         let control_postgres = persistence_config
             .as_ref()
             .map(|config| Arc::clone(&config.postgres));

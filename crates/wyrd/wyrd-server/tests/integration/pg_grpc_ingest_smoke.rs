@@ -702,6 +702,41 @@ async fn embedded_ingest_resolves_catalog_and_durably_acknowledges_arrow() {
     server.shutdown().await.expect("server shuts down");
 }
 
+/// While process pressure is critical, a public append is refused with
+/// Scribe's existing busy answer before Scribe accepts any of it, and once
+/// pressure recovers a public append is durably acknowledged again.
+///
+/// # Panics
+/// Panics when pressure is not critical, the pressured append is accepted or
+/// refused with another answer, or the recovered append is not acknowledged.
+#[tokio::test]
+async fn critical_pressure_refuses_public_appends_until_it_recovers() {
+    use wyrd_runtime::resources::PressureState;
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let workloads = server.state().resources.workloads().clone();
+    let overcommitted = workloads.observe_commitment();
+    overcommitted.set(u64::MAX);
+    assert_eq!(workloads.sample(0).state, PressureState::Critical);
+
+    let refused = ingest_logical_batch(&server, "pressured_append", Vec::new())
+        .await
+        .expect_err("a public append is refused under critical pressure");
+    assert_eq!(
+        refused.code(),
+        Code::ResourceExhausted,
+        "the refusal is Scribe's busy answer: {refused:?}"
+    );
+
+    overcommitted.set(0);
+    assert_ne!(workloads.sample(0).state, PressureState::Critical);
+    ingest_logical_batch(&server, "recovered_append", Vec::new())
+        .await
+        .expect("a public append is acknowledged once pressure recovers");
+    server.shutdown().await.expect("server shuts down");
+}
+
 /// The Gate write span is the CONSUMER of a queued batch: it links each valid
 /// producer context the batch carries, in order, and skips a malformed one
 /// without refusing the batch's rows.

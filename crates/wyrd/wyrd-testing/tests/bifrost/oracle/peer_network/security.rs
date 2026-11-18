@@ -73,6 +73,7 @@ async fn prove_peer_context_refusals() -> Result<(), PeerJourneyError> {
     every_bound_identity_must_match(&cluster, &plane).await?;
     worker_discovery_is_always_refused(&cluster, &plane).await?;
     a_foreign_tenant_context_reads_no_scribe_rows(&cluster, &plane).await?;
+    a_scribe_fragment_waits_for_a_shared_cpu_lane(&cluster, &plane).await?;
 
     cluster.shutdown().await?;
     Ok(())
@@ -409,6 +410,83 @@ async fn a_foreign_tenant_context_reads_no_scribe_rows(
     }
     if cluster.scribe_fragments(SCRIBE_POD)? != before {
         return Err("a foreign-tenant fragment executed on the Scribe".into());
+    }
+    Ok(())
+}
+
+/// A verified Scribe fragment is CPU work on the receiving pod's shared
+/// lanes: while other work holds every lane there, the fragment's decode and
+/// execution queue as that tenant's Bifrost work and nothing executes; once
+/// the lanes are released the fragment executes and streams its rows.
+///
+/// # Errors
+///
+/// Returns a message when the fragment executes or finishes while every lane
+/// is held, never queues for one, or does not finish once they are released.
+async fn a_scribe_fragment_waits_for_a_shared_cpu_lane(
+    cluster: &PeerCluster,
+    plane: &ReservationPlane,
+) -> Result<(), PeerJourneyError> {
+    use wyrd_runtime::resources::Workload;
+
+    let fragment = ScribeFragment::live(cluster, plane, "peer_lane_probe").await?;
+    let mut client = OraclePeerServiceClient::new(
+        PeerDial::member(cluster.peer_ca(), cluster.peer_addr(SCRIBE_POD)?)
+            .connect()
+            .await?,
+    );
+    let workloads = cluster
+        .server(SCRIBE_POD)?
+        .state()
+        .resources
+        .workloads()
+        .clone();
+    let lanes = workloads.lanes().free();
+    let gateway = workloads.begin(Workload::Gateway, None, None);
+    let mut held = Vec::new();
+    for _ in 0..lanes {
+        held.push(workloads.lanes().acquire(gateway.context()).await);
+    }
+    let before = cluster.scribe_fragments(SCRIBE_POD)?;
+    let request = fragment.request(cluster.tenant().as_uuid())?;
+    let mut fragment = std::pin::pin!(async move {
+        let mut stream = client.execute_fragment(request).await?.into_inner();
+        let mut frames = 0_usize;
+        while stream.message().await?.is_some() {
+            frames += 1;
+        }
+        Ok::<_, tonic::Status>(frames)
+    });
+    let queued = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            tokio::select! {
+                _ = &mut fragment => return false,
+                () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
+                    if workloads.lanes().waiting() > 0 {
+                        return true;
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    if queued != Ok(true) {
+        return Err("the Scribe fragment never queued for a held CPU lane".into());
+    }
+    if tokio::time::timeout(std::time::Duration::from_millis(500), &mut fragment)
+        .await
+        .is_ok()
+        || cluster.scribe_fragments(SCRIBE_POD)? != before
+    {
+        return Err("the Scribe fragment executed while other work held every CPU lane".into());
+    }
+    held.clear();
+    let frames = tokio::time::timeout(std::time::Duration::from_secs(30), fragment)
+        .await
+        .map_err(|_| "the Scribe fragment did not finish once the CPU lanes were released")?
+        .map_err(|status| format!("the released Scribe fragment failed with {status}"))?;
+    if frames == 0 || cluster.scribe_fragments(SCRIBE_POD)? != before + 1 {
+        return Err("the released Scribe fragment did not execute".into());
     }
     Ok(())
 }

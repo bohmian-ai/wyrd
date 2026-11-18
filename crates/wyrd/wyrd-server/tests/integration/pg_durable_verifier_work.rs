@@ -2846,7 +2846,6 @@ async fn state_format_changes_preserve_existing_custody() {
         ScribeWrite::ExecutionState {
             batch: revision_batch(leased.lease.execution_id, 1),
             checkpoint: Arc::new(Checkpoint::prepared(
-                1,
                 Arc::new(StateRow {
                     execution_id: leased.lease.execution_id,
                     identity: stand_in_identity(&verifier_uid, &card_uid),

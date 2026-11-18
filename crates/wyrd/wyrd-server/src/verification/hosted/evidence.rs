@@ -39,7 +39,7 @@ use vala_verify::blocks::{
     ActionExecutor, ActionOutput, BlockCall, BlockError, CallValue, EngineError, EvidenceReader,
 };
 use wyrd_loader::{EXTRACT_VERSION, Extraction, lines, locates, units};
-use wyrd_runtime::resources::{ByteCharge, ByteLedger};
+use wyrd_runtime::resources::{ByteCharge, ByteLedger, Workload};
 use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::card::verifier::{Action, InputSlot};
 use wyrd_spec::envelope::CardKind;
@@ -62,7 +62,7 @@ use crate::components::auth::Caller;
 use crate::components::cards::routes::{authorize_card_ref, get_card_objects_by_ref_for};
 use crate::components::storage::inventory::ObjectInventory;
 use crate::state::AppState;
-use crate::verification::state::{Charged, RunState};
+use crate::verification::state::RunState;
 
 /// Reads one execution's pinned evidence from its tenant's storage.
 pub struct TenantEvidence {
@@ -135,12 +135,11 @@ impl TenantEvidence {
     /// Every publication `step` accepted in the bound execution's state,
     /// grouped by item, iteration, and attempt and in acceptance order within
     /// an attempt, each with its completed File descriptors; none without a
-    /// bound execution. Read from the live state held in memory; the copy
-    /// holds its memory charge until it drops.
-    pub fn publications(&self, step: &TaskId) -> Charged<Vec<AcceptedPublication>> {
+    /// bound execution. Read from the live state held in memory.
+    pub fn publications(&self, step: &TaskId) -> Vec<AcceptedPublication> {
         match &self.execution {
             Some(state) => state.publications(step),
-            None => Charged::uncharged(Vec::new()),
+            None => Vec::new(),
         }
     }
 
@@ -756,13 +755,18 @@ impl EvidenceReader for TenantEvidence {
     }
 
     /// Read `evidence` as inline provider-native media, returned with the
-    /// process memory charge for the read bytes and their encoding, which
-    /// the Agent call holds while its provider request carries the media.
+    /// process memory charge for its encoding, which the Agent call holds
+    /// while its provider request carries the media. The encoding is charged
+    /// before the bytes are encoded, beside the read bytes, whose charge
+    /// returns once they are dropped. The encoding is CPU work, so it runs
+    /// on a blocking worker holding a CPU lane as the enclosing operation's
+    /// work, admitted like any new verification work.
     ///
     /// # Errors
     /// Returns [`Self::read`]'s errors, [`BlockError::Terminal`] for a
     /// format with no native media kind, and [`BlockError::Busy`] when
-    /// process memory cannot hold the encoding now.
+    /// process memory cannot hold the read bytes and their encoding now,
+    /// and [`BlockError::Retryable`] when the encoding's worker stops.
     async fn media(
         &self,
         evidence: &InputDeclaration,
@@ -778,11 +782,32 @@ impl EvidenceReader for TenantEvidence {
         charge.try_grow(encoded).map_err(|_| BlockError::Busy {
             reason: "process memory cannot hold the encoded evidence media now".to_owned(),
         })?;
+        let read = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        let workloads = self.state.resources.workloads();
+        let context = workloads
+            .admit(Workload::Verification, Some(self.tenant()), None)
+            .await
+            .context();
+        let lanes = workloads.lanes().clone();
+        // The worker owns the bytes and their charge together, so a
+        // cancelled call leaves both charged until the worker finishes; the
+        // raw bytes drop there as soon as they encode.
+        let (data, charge) = tokio::task::spawn_blocking(move || {
+            let data = lanes.run_blocking(context, || {
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            });
+            charge.shrink(read);
+            (data, charge)
+        })
+        .await
+        .map_err(|error| BlockError::Retryable {
+            reason: format!("the evidence media encoding stopped: {error}"),
+        })?;
         let media = MediaRef {
             kind,
             source: MediaSource::Base64 {
                 mime_type: format.mime().to_owned(),
-                data: base64::engine::general_purpose::STANDARD.encode(bytes),
+                data,
             },
         };
         Ok((media, Box::new(charge)))

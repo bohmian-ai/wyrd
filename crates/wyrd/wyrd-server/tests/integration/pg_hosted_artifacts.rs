@@ -256,6 +256,97 @@ fn notes() -> SlotName {
     SlotName::new("notes").expect("slot")
 }
 
+/// Reading evidence as native media charges the raw bytes it read and their
+/// encoding together while it encodes, then hands the Agent call only the
+/// encoding's charge, which lasts exactly as long as the call holds it.
+///
+/// # Panics
+/// Panics when memory one byte short of both copies admits the read, a
+/// refusal keeps a charge, the guard is charged other than the encoding, or
+/// the charge outlives the guard.
+#[tokio::test]
+async fn native_media_holds_raw_and_encoded_bytes_only_while_they_live() {
+    let registered = Registered::start().await;
+    let declaration = registered.file("notes.txt");
+    let raw = NOTES.len() as u64;
+    let encoded = (NOTES.len().div_ceil(3) * 4) as u64;
+    let pinned = Arc::new(BTreeMap::from([(notes(), declaration.clone())]));
+    for (capacity, fits) in [(raw + encoded - 1, false), (raw + encoded, true)] {
+        let memory = wyrd_runtime::resources::ByteLedger::new(capacity);
+        let evidence = TenantEvidence::new(
+            registered.server.state().clone(),
+            user(
+                registered.server.data_tenant_id(),
+                [Permission::card_read()],
+            ),
+            HostedLimits::default(),
+            memory.clone(),
+        );
+        evidence
+            .admit(&BTreeMap::new(), &pinned)
+            .await
+            .expect("the notes are admitted");
+        let media = evidence.media(&declaration).await;
+        if !fits {
+            assert!(
+                matches!(media, Err(BlockError::Busy { .. })),
+                "the raw bytes and their encoding are charged together"
+            );
+            assert_eq!(memory.used(), 0, "a refused read holds nothing");
+            continue;
+        }
+        let (_media, guard) = media.expect("both copies fit");
+        assert_eq!(
+            memory.used(),
+            encoded,
+            "the call holds only the encoding once the raw bytes drop"
+        );
+        drop(guard);
+        assert_eq!(memory.used(), 0, "the charge ends with its guard");
+    }
+}
+
+/// Encoding evidence as native media is CPU work: it waits for a CPU lane
+/// while every lane is held, and finishes once one is free.
+///
+/// # Panics
+/// Panics when the encoding finishes while every lane is held, never queues
+/// for a lane, or fails once a lane is free.
+#[tokio::test]
+async fn native_media_encoding_waits_for_a_cpu_lane() {
+    let registered = Registered::start().await;
+    let declaration = registered.file("notes.txt");
+    let pinned = Arc::new(BTreeMap::from([(notes(), declaration.clone())]));
+    let evidence = registered.readable();
+    evidence
+        .admit(&BTreeMap::new(), &pinned)
+        .await
+        .expect("the notes are admitted");
+    let workloads = registered.server.state().resources.workloads().clone();
+    let lanes = workloads.lanes().clone();
+    let other = workloads.begin(wyrd_runtime::resources::Workload::Gateway, None, None);
+    let mut held = Vec::new();
+    while lanes.free() > 0 {
+        held.push(lanes.acquire(other.context()).await);
+    }
+    let media = evidence.media(&declaration);
+    tokio::pin!(media);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while lanes.waiting() == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the media encoding never queued for a CPU lane"
+        );
+        tokio::select! {
+            biased;
+            _ = &mut media => panic!("the media encoded while every lane was held"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+    }
+    drop(held);
+    media.await.expect("the media encodes once a lane is free");
+}
+
 /// One exact Artifact file feeds native media, citations, a workspace, and
 /// Python code, all through the same authorized loader.
 ///
@@ -1429,7 +1520,7 @@ async fn capacity_refusal_is_busy_at_every_hosted_consumer() {
         1,
         "one worker served every step so far"
     );
-    let one_session = sandbox.occupy_for_test(4096);
+    let held = sandbox.occupy_for_test(4096);
     let catching = "try:\n    await call_tool('fs.read', {'path': '/inputs/notes.txt', 'start': 0})\nexcept RuntimeError:\n    pass\n'caught'";
     mock.push_response(answer(
         None,
@@ -1446,7 +1537,7 @@ async fn capacity_refusal_is_busy_at_every_hosted_consumer() {
         "a program beside a refused sibling",
     );
     assert_eq!(mock.remaining(), 0, "no model turn follows the refusal");
-    drop(one_session);
+    drop(held);
     mock.push_response(answer(None, &[("code_run", json!({"source": catching}))]));
     mock.push_response(answer(Some("{}"), &[]));
     let calls = ToolCallsOwner::default();
@@ -1476,8 +1567,8 @@ async fn capacity_refusal_is_busy_at_every_hosted_consumer() {
 /// A queued execution that process memory cannot admit returns to the
 /// queue with its attempt refunded and runs once memory frees.
 ///
-/// The test occupies process memory short of one session envelope. The
-/// queued execution waits out its code timeout, is refused busy, and is
+/// An overcommitted worker turns process pressure critical. The queued
+/// execution waits out its code timeout, is refused busy, and is
 /// deferred rather than failed, retried, or judged; once the memory frees,
 /// it completes on its first counted attempt with its real verdict.
 ///
@@ -1539,11 +1630,10 @@ async fn busy_queued_execution_is_deferred_until_capacity_frees() {
             .expect("blocks are hosted")
             .sandbox(),
     );
-    // Process memory short of one session envelope, with room left for the
-    // Scribe and Oracle work that shares it, makes the queued operation
-    // wait until its code timeout and then defer.
-    assert!(Sandbox::envelope_bytes(&saturable()).expect("the envelope fits u64") > 64 << 20);
-    let held = sandbox.occupy_for_test(64 << 20);
+    // An overcommitted worker keeps pressure critical, pausing the queued
+    // operation until its code timeout, when it defers; the byte ledger
+    // keeps room for the run's input read and result.
+    let held = sandbox.overcommit_for_test();
     let deferred = seed
         .submit(&adder, &subject, one())
         .await

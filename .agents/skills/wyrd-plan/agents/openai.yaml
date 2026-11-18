@@ -1,4 +1,4 @@
 interface:
   display_name: "Wyrd Plan"
-  short_description: "Carry the agreed Wyrd flow into tasks and proof"
-  default_prompt: "Use $wyrd-plan with the approved spec and finalized design to write cohesive tasks carrying the agreed approach through real inputs, outputs, dependencies, and observable proof."
+  short_description: "Plan observable Wyrd scenarios for test-first work"
+  default_prompt: "Use $wyrd-plan to turn the approved requirements and finalized design into bounded tasks with observable scenarios ordered for RED-GREEN-REFACTOR, without redefining requirements."

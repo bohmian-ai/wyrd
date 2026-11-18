@@ -1,4 +1,4 @@
 interface:
   display_name: "Wyrd Spec"
-  short_description: "Record a finalized Wyrd design as a behavioral contract"
-  default_prompt: "Use $wyrd-spec to turn the finalized design and supplements into a concise behavioral contract for my approval, preserving the agreement without adding requirements."
+  short_description: "Declare Wyrd behavior in one approved contract"
+  default_prompt: "Use $wyrd-spec to declare observable requirements from the finalized design for my approval, resolving material ambiguity without adding scope."

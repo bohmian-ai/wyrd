@@ -2966,10 +2966,9 @@ impl WyrdTestServer {
             .ok_or_else(|| WyrdTestServerError::Start("server has no Bifrost Scribe".to_owned()))
     }
 
-    /// Hold direct-lane process memory so at most `leave` bytes stay free, so a hosted
-    /// Python operation whose session envelope does not fit waits, and one
-    /// whose retained request bytes do not fit is refused, until the
-    /// returned hold drops.
+    /// Hold process memory so at most `leave` bytes stay free, so a hosted
+    /// Python operation whose retained request bytes do not fit is refused,
+    /// until the returned hold drops.
     ///
     /// # Panics
     /// Panics when called outside a Tokio runtime.
@@ -2981,8 +2980,8 @@ impl WyrdTestServer {
     }
 
     /// Wait until exactly `count` hosted Python operations wait for process
-    /// memory, such as a verification parked behind
-    /// [`Self::occupy_hosted_memory`], or one that left the queue.
+    /// admission, such as a verification paused by critical process
+    /// pressure, or one that stopped waiting.
     ///
     /// # Errors
     /// Returns [`WyrdTestServerError::HostedWaitersNotReached`] with the last
@@ -2996,7 +2995,7 @@ impl WyrdTestServer {
         let sandbox = self.hosted_sandbox()?;
         let deadline = Instant::now() + timeout;
         loop {
-            let last = sandbox.waiting().0;
+            let last = sandbox.waiting();
             if last == count {
                 return Ok(());
             }
@@ -3008,7 +3007,7 @@ impl WyrdTestServer {
                     last,
                 });
             }
-            // ponytail: admission publishes no queue-change signal, so this
+            // ponytail: the sandbox publishes no waiter-change signal, so this
             // polls; add one if a test ever needs a tighter wake.
             tokio::time::sleep(HOSTED_WAITERS_POLL_INTERVAL.min(deadline - now)).await;
         }
@@ -5512,6 +5511,9 @@ impl WyrdTestServerBuilder {
         } = Box::pin(AppState::start(
             &config,
             StartInputs {
+                // The test process's allocator is not observed; the ledger
+                // is its only pressure reading.
+                parent_committed: || 0,
                 dependencies: BifrostExternalDependencies {
                     postgres,
                     storage,

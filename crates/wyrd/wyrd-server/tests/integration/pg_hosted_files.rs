@@ -158,8 +158,10 @@ async fn evidence_refuses_tampered_body() {
 }
 
 /// Native media is base64 with the format's MIME type and comes with a
-/// guard holding the process memory its bytes and encoding take until it
-/// drops; non-native formats are refused.
+/// guard holding the process memory of its encoding until it drops; the read
+/// bytes are charged only until they are encoded, and no provider-shaped
+/// copies are promised. Memory short of the read bytes and their encoding
+/// refuses before anything is held, and non-native formats are refused.
 ///
 /// # Panics
 /// Panics when media binding or its charge differs.
@@ -188,11 +190,26 @@ async fn evidence_binds_native_media_only() {
     );
     assert_eq!(
         memory.used(),
-        8 + 12,
-        "the returned guard holds the read bytes and their encoding"
+        12,
+        "the returned guard holds the encoding the media retains, nothing more"
     );
     drop(charge);
     assert_eq!(memory.used(), 0, "dropping the guard returns the charge");
+    let short = wyrd_runtime::resources::ByteLedger::new(8 + 12 - 1);
+    let refusing = TenantEvidence::new(
+        uploads.server.state().clone(),
+        user(uploads.server.data_tenant_id(), []),
+        HostedLimits::default(),
+        short.clone(),
+    );
+    assert!(
+        matches!(
+            refusing.media(&file(pdf, 8, MediaFormat::Pdf)).await,
+            Err(BlockError::Busy { .. })
+        ),
+        "memory short of the read bytes and their encoding refuses before encoding"
+    );
+    assert_eq!(short.used(), 0, "a refusal holds nothing");
     assert!(
         evidence
             .media(&file(csv, 3, MediaFormat::Csv))

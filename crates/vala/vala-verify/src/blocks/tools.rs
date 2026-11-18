@@ -140,13 +140,13 @@ impl Default for ToolCallsOwner {
 }
 
 impl Drop for ToolCallsOwner {
-    /// Hands every settlement not yet awaited to the adopting [`HostWork`].
+    /// Hands every settlement whose host work has not ended, including one
+    /// a dropped [`Self::settle`] was awaiting, to the adopting
+    /// [`HostWork`].
     fn drop(&mut self) {
         if let Some(orphans) = &self.orphans {
             let owed = std::mem::take(&mut *self.calls.inner.settlements());
-            for settlement in owed {
-                orphans.adopt(settlement);
-            }
+            orphans.pending().extend(owed);
         }
     }
 }
@@ -160,12 +160,15 @@ impl Drop for ToolCallsOwner {
 /// records a discarded step's disposition or its own deadline result.
 #[derive(Clone, Default)]
 pub struct HostWork {
-    /// Settlements of dropped invocations not yet awaited.
-    pending: Arc<Mutex<Vec<Settlement>>>,
+    /// Settlements of dropped invocations whose host work has not ended.
+    pending: Arc<Mutex<Vec<Owed>>>,
 }
 
 impl fmt::Debug for HostWork {
     /// The number of settlements owed, never their futures.
+    ///
+    /// # Errors
+    /// Returns the formatter's error when writing to it fails.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("HostWork")
@@ -176,15 +179,15 @@ impl fmt::Debug for HostWork {
 
 impl HostWork {
     /// Locks the owed settlements; a poisoned lock is recovered, because
-    /// every holder only pushes or pops whole settlements under it.
-    fn pending(&self) -> std::sync::MutexGuard<'_, Vec<Settlement>> {
+    /// every holder only adds or removes whole settlements under it.
+    fn pending(&self) -> std::sync::MutexGuard<'_, Vec<Owed>> {
         self.pending.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Leave `settlement`, which resolves once some started host work has
     /// ended, for the next [`Self::settle`].
     pub fn adopt(&self, settlement: impl Future<Output = ()> + Send + 'static) {
-        self.pending().push(Box::pin(settlement));
+        self.pending().push(Owed::new(Box::pin(settlement)));
     }
 
     /// Wait until the host work of every invocation dropped so far, and of
@@ -194,15 +197,64 @@ impl HostWork {
     }
 }
 
-/// Await and remove each settlement in `pending`, including ones added while
-/// waiting, never holding the lock across an await.
-async fn drain(pending: &Mutex<Vec<Settlement>>) {
-    loop {
-        let next = pending.lock().unwrap_or_else(PoisonError::into_inner).pop();
-        match next {
-            Some(settlement) => settlement.await,
-            None => return,
+/// One settlement owed until its host work ends.
+///
+/// It stays in its list while awaited and leaves only once it resolved, so
+/// a waiter that is dropped mid-await leaves it owed, and to whichever
+/// owner the list moves to, rather than taking it away. Its future sits
+/// behind an async lock: one waiter polls it at a time, a waiter dropped
+/// mid-await releases it for the next, and every other waiter waits for
+/// the same end instead of finding the list empty.
+#[derive(Clone)]
+struct Owed(
+    /// The settlement, `None` once it resolved; shared by every list and
+    /// waiter holding this entry.
+    Arc<tokio::sync::Mutex<Option<Settlement>>>,
+);
+
+impl Owed {
+    /// Owes `settlement` until it resolves.
+    fn new(settlement: Settlement) -> Self {
+        Self(Arc::new(tokio::sync::Mutex::new(Some(settlement))))
+    }
+
+    /// Waits until the settlement resolved, polling it unless another
+    /// waiter already is or it already resolved.
+    ///
+    /// # Cancellation
+    /// Dropping the wait leaves the settlement unresolved and owed, for the
+    /// next waiter to continue.
+    async fn settle(&self) {
+        let mut settlement = self.0.lock().await;
+        if let Some(pending) = settlement.as_mut() {
+            pending.await;
+            *settlement = None;
         }
+    }
+}
+
+/// Await each settlement in `pending`, including ones added while waiting,
+/// removing each only once it resolved and never holding the list's lock
+/// across an await.
+///
+/// # Cancellation
+/// Dropping the wait removes nothing still unresolved, so `pending`, and
+/// any owner it is handed to, still owes the work.
+async fn drain(pending: &Mutex<Vec<Owed>>) {
+    loop {
+        let next = pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .last()
+            .cloned();
+        let Some(owed) = next else {
+            return;
+        };
+        owed.settle().await;
+        pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|other| !Arc::ptr_eq(&other.0, &owed.0));
     }
 }
 
@@ -301,8 +353,8 @@ struct CallLog {
     recorder: Mutex<Option<Recorder>>,
     /// Admitted calls in start order, each with whether it finished.
     records: Mutex<Vec<(ToolCallRecord, bool)>>,
-    /// Settlements of attempts' sessions not yet awaited.
-    settlements: Mutex<Vec<Settlement>>,
+    /// Settlements of attempts' sessions whose host work has not ended.
+    settlements: Mutex<Vec<Owed>>,
 }
 
 /// Receives an invocation's spent tool-request count after each request.
@@ -323,9 +375,9 @@ impl fmt::Debug for ToolCalls {
 }
 
 impl CallLog {
-    /// Locks the settlements not yet awaited; a poisoned lock is recovered,
-    /// because every holder only pushes or pops whole settlements under it.
-    fn settlements(&self) -> std::sync::MutexGuard<'_, Vec<Settlement>> {
+    /// Locks the settlements still owed; a poisoned lock is recovered,
+    /// because every holder only adds or removes whole settlements under it.
+    fn settlements(&self) -> std::sync::MutexGuard<'_, Vec<Owed>> {
         self.settlements
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -335,7 +387,7 @@ impl CallLog {
 impl ToolCalls {
     /// Keep `settlement` for the owner's next [`ToolCallsOwner::settle`].
     fn defer(&self, settlement: Settlement) {
-        self.inner.settlements().push(settlement);
+        self.inner.settlements().push(Owed::new(settlement));
     }
 
     /// Spend one request of `limit` and report the new count to the
@@ -1134,7 +1186,84 @@ impl std::io::Write for Capped {
 
 #[cfg(test)]
 mod tests {
-    use super::ToolCallsOwner;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use tokio::sync::Notify;
+
+    use super::{HostWork, ToolCallsOwner};
+
+    /// Host work a test holds until it releases it.
+    fn held(release: &Arc<Notify>, ended: &Arc<AtomicBool>) -> super::Settlement {
+        let (release, ended) = (Arc::clone(release), Arc::clone(ended));
+        Box::pin(async move {
+            release.notified().await;
+            ended.store(true, Ordering::SeqCst);
+        })
+    }
+
+    /// Whether `waiting` is still pending after five seconds, dropping it.
+    async fn pending(waiting: impl Future<Output = ()>) -> bool {
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .is_err()
+    }
+
+    /// A settlement already being awaited stays owed when its waiter is
+    /// dropped: concurrent waiters keep waiting for it, it moves with its
+    /// dropped owner to the run's [`HostWork`], and every waiter there
+    /// finishes only once the work ends.
+    ///
+    /// # Panics
+    /// Panics when any waiter finishes before the held work ends, or the
+    /// work is not owed once its waiter is dropped.
+    #[tokio::test(start_paused = true)]
+    async fn an_awaited_settlement_stays_owed_when_its_waiter_is_dropped() {
+        let (release, ended) = (Arc::new(Notify::new()), Arc::new(AtomicBool::new(false)));
+        let work = HostWork::default();
+        let owner = ToolCallsOwner::default().adopted_by(&work);
+        owner.handle().defer(held(&release, &ended));
+
+        assert!(
+            pending(owner.settle()).await,
+            "the active waiter is dropped"
+        );
+        assert!(pending(owner.settle()).await, "a later waiter still waits");
+        let concurrent = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(5), owner.settle()),
+            tokio::time::timeout(Duration::from_secs(5), owner.settle()),
+        );
+        assert!(
+            concurrent.0.is_err() && concurrent.1.is_err(),
+            "a waiter behind another's poll does not infer completion"
+        );
+        drop(owner);
+        assert!(
+            pending(work.settle()).await,
+            "the dropped owner's work moves"
+        );
+        assert!(pending(work.settle()).await, "and stays owed after a drop");
+
+        let settling = tokio::spawn({
+            let work = work.clone();
+            async move { work.settle().await }
+        });
+        let observer = work.settle();
+        tokio::pin!(observer);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), &mut observer)
+                .await
+                .is_err(),
+            "a second waiter waits for the first's work"
+        );
+        assert!(!ended.load(Ordering::SeqCst));
+        release.notify_one();
+        observer.await;
+        settling.await.expect("settled");
+        assert!(ended.load(Ordering::SeqCst), "settlement follows the work");
+        assert_eq!(format!("{work:?}"), "HostWork { pending: 0 }");
+    }
 
     /// An invocation with nothing spent spends its allowance afresh and one
     /// with a recorded spend resumes from it; every admitted request reports

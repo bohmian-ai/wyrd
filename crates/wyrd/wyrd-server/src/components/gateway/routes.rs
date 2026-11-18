@@ -20,6 +20,7 @@ use utoipa_axum::routes;
 use vala_bifrost_redux::catalog::{BifrostCatalogError, TableRef};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use wyrd_gateway::{IngressDialect, MediaRequest, OpenAiMediaRoute, RequestJson, ResponseBody};
+use wyrd_runtime::resources::ByteCharge;
 use wyrd_runtime::{Action, Permission, Resource};
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::gateway::openai::{
@@ -1480,27 +1481,35 @@ async fn openai_call(
         Err(WyrdErrorResponse(error)) => Err(error),
     };
     match result {
-        Ok(response) => relay(response.status, response.body),
+        Ok(response) => relay(response.status, response.body, response.custody),
         Err(error) => openai_error(&error),
     }
 }
 
 /// Renders a provider `status` and answer `body`: JSON as JSON, media bytes
 /// with their content type, and events as an incremental server-sent event
-/// stream.
-pub(super) fn relay(status: u16, body: ResponseBody) -> Response {
+/// stream. A buffered answer's memory `custody` rides with its allocation,
+/// so it returns once the last reference to the delivered bytes drops,
+/// wherever the HTTP consumer moved, cloned or sliced them, not when the
+/// body is rendered or exhausted.
+pub(super) fn relay(status: u16, body: ResponseBody, custody: Option<ByteCharge>) -> Response {
     let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
     match body {
         ResponseBody::Json(raw) => (
             status,
             [(CONTENT_TYPE, "application/json")],
-            raw.into_string(),
+            Custodied::body(raw.into_string(), custody),
         )
             .into_response(),
         ResponseBody::Media(answer) => {
             let content_type = HeaderValue::from_str(&answer.content_type)
                 .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
-            (status, [(CONTENT_TYPE, content_type)], answer.bytes).into_response()
+            (
+                status,
+                [(CONTENT_TYPE, content_type)],
+                Custodied::body(answer.bytes, custody),
+            )
+                .into_response()
         }
         ResponseBody::MediaStream {
             content_type,
@@ -1519,6 +1528,33 @@ pub(super) fn relay(status: u16, body: ResponseBody) -> Response {
     }
 }
 
+/// A buffered answer's allocation together with its memory custody, the
+/// owner behind every [`Bytes`] the HTTP body hands its consumer.
+struct Custodied<T> {
+    /// The answer's allocation, moved in without copying.
+    bytes: T,
+    /// The charge of the allocation, held until its last reference drops.
+    _custody: Option<ByteCharge>,
+}
+
+impl<T: AsRef<[u8]> + Send + 'static> Custodied<T> {
+    /// A full HTTP body over `bytes` whose delivered references keep
+    /// `custody`.
+    fn body(bytes: T, custody: Option<ByteCharge>) -> Body {
+        Body::from(Bytes::from_owner(Self {
+            bytes,
+            _custody: custody,
+        }))
+    }
+}
+
+impl<T: AsRef<[u8]>> AsRef<[u8]> for Custodied<T> {
+    /// The answer's bytes.
+    fn as_ref(&self) -> &[u8] {
+        self.bytes.as_ref()
+    }
+}
+
 /// Response body relaying `events` as the relay produces them.
 ///
 /// Dropping the body drops the receiver, which aborts the upstream request. An
@@ -1528,7 +1564,8 @@ fn events_body(events: wyrd_gateway::EventStream) -> Body {
         events,
         |mut events| async move {
             let frame = events.recv().await?;
-            Some((frame, events))
+            // The body holds each frame, and so its charge, until written.
+            Some((frame.map(bytes::Bytes::from), events))
         },
     ))
 }
@@ -1890,7 +1927,7 @@ pub(crate) async fn cancel_batch(
 /// Renders a Batches answer, or its failure as the `OpenAI` error envelope.
 fn batch_response(answer: Result<BatchAnswer, WyrdError>) -> Response {
     match answer {
-        Ok(answer) => relay(answer.status, answer.body),
+        Ok(answer) => relay(answer.status, answer.body, None),
         Err(error) => openai_error(&error),
     }
 }
@@ -2455,6 +2492,7 @@ mod usage_bound_tests {
                 capture: false,
                 deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(10),
                 cancel: &cancel,
+                memory: &wyrd_runtime::resources::ByteLedger::new(u64::MAX).empty_charge(),
             }))
         });
         assert!(

@@ -5,7 +5,6 @@ members = [
     "crates/vala/*",
     "crates/skald/*",
     "crates/shared/*",
-    "crates/patches/*",
     "crates/wyrd-spec",
     "examples",
     "sdks/wyrd-sdk-python",
@@ -147,9 +146,9 @@ csv = "1.4"
 lopdf = { version = "0.45", default-features = false }
 quick-xml = "0.41"
 # Sandboxed Verifier Python pool and the hardened worker binary it spawns.
-monty-pool = "1.1"
-monty-proto = "1.1"
-monty-types = "1.1"
+monty-pool = "1.6"
+monty-proto = "1.6"
+monty-types = "1.6"
 tar = { version = "0.4", default-features = false }
 zip = { version = "8.6", default-features = false, features = ["deflate-flate2"] }
 zstd = "0.13"
@@ -165,6 +164,8 @@ hex = { version = "0.4", default-features = false, features = ["alloc"] }
 metrics = { version = "0.24", default-features = false }
 # Global allocator for server binaries only; libraries never set one.
 mimalloc = "0.1.50"
+# mimalloc's own aggregate process statistics, read by server binaries only.
+libmimalloc-sys = "0.1.49"
 metrics-exporter-prometheus = { version = "0.16", default-features = false }
 mini-moka = { version = "0.10", features = ["sync"] }
 proptest = "1"
@@ -281,10 +282,16 @@ datafusion-distributed = { git = "https://github.com/bohmian-ai/datafusion-distr
 # Parquet read planner, and field-id column resolution) replaces these crates for every consumer, including the
 # iceberg, compaction, and distributed git dependencies.
 [patch.crates-io]
-# monty-proto's `worker` feature, which wyrd-server needs to serve as its own
-# Monty worker, hard-depends on the ty/ruff type checker; Wyrd never type checks,
-# so a stand-in with the same API refuses every check and keeps the checker out.
-monty-type-checking = { path = "crates/patches/monty-type-checking" }
+# Monty 1.6.0 plus Wyrd's fork commits: monty-proto's `worker-core` feature builds the
+# worker without the ty/ruff type checker, and worker hosts report memory in a
+# `MemorySample` event that the pool reads outside turns, including from idle
+# workers. Every Monty crate comes from this rev so the graph holds one copy.
+monty = { git = "https://github.com/bohmian-ai/monty", rev = "e54ecafaad8323d88ded7ca2a73ede62d30cf441" }
+monty-fs = { git = "https://github.com/bohmian-ai/monty", rev = "e54ecafaad8323d88ded7ca2a73ede62d30cf441" }
+monty-macros = { git = "https://github.com/bohmian-ai/monty", rev = "e54ecafaad8323d88ded7ca2a73ede62d30cf441" }
+monty-pool = { git = "https://github.com/bohmian-ai/monty", rev = "e54ecafaad8323d88ded7ca2a73ede62d30cf441" }
+monty-proto = { git = "https://github.com/bohmian-ai/monty", rev = "e54ecafaad8323d88ded7ca2a73ede62d30cf441" }
+monty-types = { git = "https://github.com/bohmian-ai/monty", rev = "e54ecafaad8323d88ded7ca2a73ede62d30cf441" }
 datafusion = { git = "https://github.com/bohmian-ai/datafusion", rev = "5f4b1713af4f0394c7c564b6bc6de42e92640186" }
 datafusion-common = { git = "https://github.com/bohmian-ai/datafusion", rev = "5f4b1713af4f0394c7c564b6bc6de42e92640186" }
 datafusion-datasource = { git = "https://github.com/bohmian-ai/datafusion", rev = "5f4b1713af4f0394c7c564b6bc6de42e92640186" }

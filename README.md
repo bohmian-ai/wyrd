@@ -18,8 +18,6 @@
 
 ## The only real-time verification system built for your applications.
 
-**You built the system. How do you know it's behaving correctly?**
-
 Every system has its own requirements, workflows, and definitions of correct behavior. Turning them into repeatable checks usually means stitching together evaluation frameworks, observability tools, custom scripts, and data pipelines.
 
 Wyrd gives you open-source building blocks for your own verification systems. **Declare** requirements. **Observe** real behavior. **Verify** live, during execution, or continuously over time.
@@ -28,19 +26,31 @@ Live verification puts the verdict before the decision. Your application asks Wy
 
 ## Get started
 
-One finance Service and one Verifier: declare what a report release must satisfy, verify four releases, and read the verdicts.
+A support agent answers a customer, and Wyrd verifies the answer before the customer sees it. The Verifier has two requirements: a text check, and an AI judge that reads the refund policy.
 
-### 1. Declare
+You need PostgreSQL 16, Python 3.11, and an OpenAI API key. Install Wyrd and the OpenAI client:
 
-The Service binds one Verifier. The Verifier declares the release it takes and three requirements: two assertions on records your application supplies, and an Agent that reads the company sharing policy PDF and judges the report and its purpose.
+```bash
+uv init support && cd support
+uv add "wyrd-ai==0.4.2" openai
+export OPENAI_API_KEY=sk-...
+```
 
-<!-- example: examples/finance-release/finance_service.py -->
+Start a local server in its own terminal. Enter your database URL and a tenant name, and accept the offer to add OpenAI:
+
+```bash
+uv run wyrd init
+```
+
+Save this as `support_agent.py`:
+
+<!-- example: examples/support-agent/support_agent.py -->
 ```python
+from openai import OpenAI
 from pydantic import BaseModel
+from wyrd import WyrdState
 from wyrd.verify import (
     Agent,
-    AgentRunConfig,
-    Artifact,
     Check,
     ComparisonOperator,
     ExecutionRoute,
@@ -51,180 +61,94 @@ from wyrd.verify import (
     Verifier,
 )
 
-
-# The evidence the application sends for each release.
-class Report(BaseModel):
-    text: str
+POLICY = "Refunds are possible within 30 days of purchase. Never promise a refund."
 
 
-class Recipient(BaseModel):
-    email: str
-    authorized: bool
+# The evidence the application sends for each reply.
+class Reply(BaseModel):
+    question: str
+    answer: str
 
 
-class Destination(BaseModel):
-    url: str
-    restricted: bool
-
-
-class Release(BaseModel):
-    purpose: str
-    report: Report
-    recipient: Recipient
-    destination: Destination
-
-
-# The company sharing policy, uploaded from this directory with its text
-# extracted so the judge can read it.
-policy = Artifact.from_path("company-sharing-policy", "company-sharing-policy.pdf").extract(True)
-
-# `policy-judge`: a model that reads the policy with `fs.read` and returns a
-# verdict on the report. Its model calls go through the `openai` gateway
-# deployment.
+# The judge: a model that reads the reply and decides whether it follows the
+# policy. Wyrd runs it through the `openai` gateway deployment.
 policy_judge = Agent(
     "policy-judge",
     prompt=Prompt.openai_chat(
-        "gpt-4o",
-        messages=(
-            "Read /inputs/company-sharing-policy.pdf.json with fs.read. Decide whether the company sharing "
-            "policy permits sharing this report with this recipient for this purpose, "
-            "citing the report and the policy line you apply. Purpose: {{purpose}} "
-            "Report: {{report}} Recipient: {{recipient}}"
-        ),
+        "gpt-4o-mini",
+        messages=f"Policy: {POLICY} Does this support answer follow the policy? "
+        "Question: {{question}} Answer: {{answer}}",
         response_format=ResponseFormat.verdict(),
     ),
     execution_route=ExecutionRoute.wyrd_gateway(deployment="openai"),
-    tool_names=["fs.read"],
-    run_config=AgentRunConfig(max_iterations=3),
 )
 
-follows_policy = (
-    Check.agent(policy_judge)
-    .inputs({"purpose": "inputs.purpose", "report": "inputs.report", "recipient": "inputs.recipient"})
-    .add_workspace("/inputs/company-sharing-policy.pdf.json", policy.file("extracted/company-sharing-policy.pdf.json"))
-)
-
-release_check = Verifier(
-    "release-check",
-    inputs=Release,
+# The Verifier: two requirements every reply must meet.
+reply_check = Verifier(
+    "reply-check",
+    inputs=Reply,
     requirements=[
         Requirement(
-            "recipient-authorized",
-            "The recipient is authorized to receive the report.",
-            Check.assert_("inputs.recipient.authorized", ComparisonOperator.Equals, True),
+            "no-refund-promise",
+            "The answer never promises a guaranteed refund.",
+            Check.assert_("inputs.answer", ComparisonOperator.NotContains, "guaranteed refund"),
         ),
         Requirement(
             "follows-policy",
-            "The company sharing policy permits this release.",
-            follows_policy,
-        ),
-        Requirement(
-            "destination-restricted",
-            "The destination restricts access to the report.",
-            Check.assert_("inputs.destination.restricted", ComparisonOperator.Equals, True),
+            "The answer follows the refund policy.",
+            Check.agent(policy_judge).inputs(
+                {"question": "inputs.question", "answer": "inputs.answer"}
+            ),
         ),
     ],
 )
 
-service = Service("finance-release", verified_by=[release_check])
-```
-
-<details>
-<summary>The same Verifier in YAML</summary>
-
-<!-- example: examples/finance-release/release-check.yaml -->
-```yaml
-# The release-check Verifier that finance_service.py declares in code. Upload
-# the policy with its extracted text first:
-#   wyrd artifact upload company-sharing-policy.pdf --name company-sharing-policy --version 0.1.0 --extract
-apiVersion: wyrd/v1
-kind: Verifier
-metadata:
-  name: release-check
-spec:
-  inputs:
-    purpose: {type: json}
-    report: {type: json}
-    recipient: {type: json}
-    destination: {type: json}
-  requirements:
-    - id: recipient-authorized
-      statement: The recipient is authorized to receive the report.
-      check: {kind: assert, path: inputs.recipient.authorized, operator: equals, expected: true}
-    - id: follows-policy
-      statement: The company sharing policy permits this release.
-      check:
-        kind: agent
-        agent: ./policy-judge.yaml
-        inputs: {purpose: inputs.purpose, report: inputs.report, recipient: inputs.recipient}
-        workspace:
-          /inputs/company-sharing-policy.pdf.json:
-            artifact:
-              card: {kind: Artifact, name: company-sharing-policy, version: 0.1.0}
-              path: extracted/company-sharing-policy.pdf.json
-    - id: destination-restricted
-      statement: The destination restricts access to the report.
-      check: {kind: assert, path: inputs.destination.restricted, operator: equals, expected: true}
-```
-
-</details>
-
-### 2. Observe
-
-Start a Run and send each release the application is about to make. `verify` waits for the verdict; [`submit`](https://docs.bohmian.ai/wyrd/understand/how-verification-works/#verify-and-submit) queues the check and returns at once.
-
-<!-- example: examples/finance-release/finance_release.py -->
-```python
-from wyrd import WyrdState
-from wyrd.verify import VerificationResult
-
-from finance_service import Destination, Recipient, Release, Report, service
-
-# Upload the policy, declare every Card, and get a ready state.
-state = WyrdState.declare(service)
+# Declare the Cards and get a ready state.
+state = WyrdState.declare(Service("support", verified_by=[reply_check]))
+model = OpenAI()
 
 
-def verify_release(release: Release) -> VerificationResult:
+# Your support agent: any model call.
+def support_agent(question: str) -> str:
+    completion = model.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": f"You are a support agent. {POLICY}"},
+            {"role": "user", "content": question},
+        ],
+    )
+    return completion.choices[0].message.content or ""
+
+
+question = "I bought this 45 days ago. Can I get my money back?"
+# The agent's reply, and a reply that breaks the policy.
+for answer in (support_agent(question), "Yes, you have a guaranteed refund."):
     with state.run() as run:
-        return run.observe.verify("release-check", release)
-
-
-if __name__ == "__main__":
-    recipient = Recipient(email="auditor@example.test", authorized=True)
-    destination = Destination(url="https://auditor.example.test/reports", restricted=True)
-    for purpose, text in (
-        ("external audit", "Synthetic customer report: quarterly total $120."),
-        ("external audit", "Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001."),
-        ("marketing partnership", "Synthetic customer report: quarterly total $120."),
-        ("regulator request", "Synthetic customer report: quarterly total $120."),
-    ):
-        release = Release(purpose=purpose, report=Report(text=text), recipient=recipient, destination=destination)
-        result = verify_release(release)
-        print(f"{purpose} · {text} → {result.verdict}")
-        for requirement in result.requirements:
-            if requirement["outcome"] != "passed":
-                print(f"  {requirement['id']}: {requirement['reason']}")
-    state.shutdown()
+        result = run.observe.verify("reply-check", Reply(question=question, answer=answer))
+    print(f"{result.verdict}: {answer}")
+    for requirement in result.requirements:
+        if requirement["outcome"] != "passed":
+            print(f"  {requirement['id']}: {requirement['reason']}")
+state.shutdown()
 ```
 
-### 3. Verify
+Run it:
 
-Only the first release passes. Each failed release names the requirement that failed and the reason. A failed check is a result, not an exception.
+```bash
+uv run support_agent.py
+```
 
-<!-- example: examples/finance-release/output.txt -->
+<!-- example: examples/support-agent/output.txt -->
 ```text
-external audit · Synthetic customer report: quarterly total $120. → passed
-external audit · Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001. → failed
-  follows-policy: the report names a bank account identifier, which the policy forbids
-marketing partnership · Synthetic customer report: quarterly total $120. → failed
-  follows-policy: the policy does not permit sharing for this purpose
-regulator request · Synthetic customer report: quarterly total $120. → failed
-  follows-policy: the policy does not permit sharing for this purpose
+passed: Refunds are possible within 30 days of purchase, so this order no longer qualifies.
+failed: Yes, you have a guaranteed refund.
+  no-refund-promise: operator NotContains returned false
+  follows-policy: the answer promises a refund the policy does not allow
 ```
 
-The judge's wording varies. `verify` returns before your code acts, so the verdict is part of the request. Assertions add little time; the policy judge adds a model call, up to three tool turns, to that request. If the judge can't decide, the verdict is `inconclusive`, which is never a pass.
+The agent's reply passes. The policy-breaking reply fails both requirements, and each failure gives its reason. The model's wording varies from run to run.
 
-The full example is in [`examples/finance-release`](https://github.com/bohmian-ai/wyrd/tree/main/examples/finance-release) for Python, Rust, and TypeScript. [Run your first verification](https://docs.bohmian.ai/wyrd/get-started/quickstart/) runs it against your own server and model.
+The same example is in [Rust](examples/support-agent/support_agent.rs) and [TypeScript](examples/support-agent/support_agent.ts); [Set up Wyrd](https://docs.bohmian.ai/wyrd/get-started/setup/) has their install commands. The Cards can also be declared as [YAML](https://docs.bohmian.ai/wyrd/understand/how-verification-works/#code-or-yaml), the recommended route in production. [Run your first verification](https://docs.bohmian.ai/wyrd/get-started/quickstart/) goes further: a judge that reads a policy PDF, and a verdict your application acts on.
 
 ## What you can build
 
@@ -258,33 +182,6 @@ The Python, Rust, and TypeScript SDKs, the CLI, MCP, and HTTP all call one serve
 Most AI tools hand you their evaluators, their UI, and their datastore. Your checks end up shaped by what the product supports, and your evidence lives where the product keeps it.
 
 Wyrd gives you the primitives instead, and you build the verification layer your system needs: a code reviewer that reads the diff and your style guide, a payment check that cites your policy document, drift on a classical model, a check across a six-hour agent run.
-
-| You get | So you don't have to |
-| --- | --- |
-| Verification primitives you compose into steps and checks | Fit your rules into one vendor's evaluator types |
-| Checks as versioned YAML in your repo, run in CI, inline, in the background, per session, or on a schedule | Keep one set of evals for CI and another for production |
-| One data plane for telemetry, model calls, your app's rows, and verdicts, as Iceberg tables in your object store, queried with SQL | Join evidence across four tools' stores and APIs |
-| Registration and versioning for the whole service: agents, prompts, models, data, MCP servers | Guess which version produced a result |
-| An LLM gateway and service identity, so every call and verdict names the account and release behind it | Bolt attribution on after the fact |
-| Apache 2.0 and self-hosted, ingesting standard OpenTelemetry (OTLP) from any exporter | Re-instrument your app with a vendor SDK, or send your data to someone else's cloud |
-
-## Install
-
-You need PostgreSQL 16 and one of Python 3.11, Rust 1.95, or Node.js 22.18, on macOS (Apple silicon) or Linux.
-
-```bash
-# Python
-uv add "wyrd-ai==0.4.2"
-
-# Rust
-cargo install wyrd-cli --version 0.4.2 --locked
-cargo add wyrd-ai@0.4.2 tokio serde schemars --features tokio/full,serde/derive
-
-# TypeScript
-pnpm add wyrd-ai@0.4.2
-```
-
-Start a local server with `wyrd init` (`uv run wyrd init` or `pnpm wyrd init`), or let your coding agent do it with `wyrd init guided`. [Set up Wyrd](https://docs.bohmian.ai/wyrd/get-started/setup/) has the details.
 
 ## Already have tools?
 

@@ -269,6 +269,32 @@ def read_sharing_policy(text: str) -> dict:
     }
 
 
+SUPPORT_AGENT = "You are a support agent."
+"""The README support agent's system prompt, which the local model answers with ``SUPPORT_ANSWER``."""
+
+SUPPORT_ANSWER = (
+    "Refunds are possible within 30 days of purchase, so this order no longer qualifies."
+)
+"""The local model's reply as the README support agent."""
+
+SUPPORT_JUDGE = "Does this support answer follow the policy?"
+"""The README support judge's prompt: it fails an answer promising a guaranteed refund and passes every other."""
+
+
+def support_verdict(text: str) -> str:
+    """The README support judge's Verdict for the request ``text``, citing the answer."""
+    broken = "guaranteed refund" in text
+    return json.dumps(
+        {
+            "outcome": "failed" if broken else "passed",
+            "reason": "the answer promises a refund the policy does not allow"
+            if broken
+            else "the answer follows the 30-day policy",
+            "citations": [{"slot": "answer", "locator": {"json_pointer": ""}}],
+        }
+    )
+
+
 FINANCE_POLICY_JUDGE = "Decide whether the company sharing policy permits sharing this report"
 """The finance release example judge's prompt, which the local model answers as the sharing-policy judge."""
 
@@ -389,12 +415,18 @@ def completion(body: dict) -> tuple[int, dict]:
     carries ``POLICY JUDGE``), like the finance release example's judge, reads
     its mount and answers ``sharing_verdict``; the
     modular finance Service's judges answer ``REPORT_SUPPORTED`` and
-    ``AUDIT_PURPOSE``; the file probe plays ``probe_turn``. Every
+    ``AUDIT_PURPOSE``; the file probe plays ``probe_turn``. The README
+    support agent answers ``SUPPORT_ANSWER`` and its judge answers
+    ``support_verdict``. Every
     other judge agrees.
     """
     text = json.dumps(body)
     returned = any(message.get("role") == "tool" for message in body.get("messages", []))
-    if "POLICY JUDGE" in text or FINANCE_POLICY_JUDGE in text:
+    if SUPPORT_AGENT in text:
+        message = {"role": "assistant", "content": SUPPORT_ANSWER}
+    elif SUPPORT_JUDGE in text:
+        message = {"role": "assistant", "content": support_verdict(text)}
+    elif "POLICY JUDGE" in text or FINANCE_POLICY_JUDGE in text:
         message = (
             {
                 "role": "assistant",

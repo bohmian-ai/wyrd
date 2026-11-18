@@ -4,7 +4,7 @@
  * `@wyrd/testing` over repository Postgres, through the SDK, the MCP endpoint,
  * and the BFF's real browser session. Nothing here mocks the server.
  */
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
@@ -46,7 +46,10 @@ import {
   type ChartInput,
   type Executor,
   type QueryResult,
-  type WireRequest
+  type WireRequest,
+  facetsQuery,
+  statQueries,
+  traceOverviewReads
 } from 'wyrd-ai-ui/loaders';
 import { mcpExecutor } from 'wyrd-ai-ui/mcp';
 import { nodeExecutor } from 'wyrd-ai-ui/node';
@@ -453,6 +456,121 @@ test('TASK-004: Authorized Observe across hosts', async ({ server, seeded }) => 
   expect(app.document.querySelector('[data-panel="list"]')?.textContent).toContain('invoke_agent support');
   expect(app.calls.map((call) => call.name)).toEqual(['bifrost.query', 'bifrost.query', 'bifrost.query']);
   expect(app.calls.find((call) => String(call.arguments.sql).includes("trace_id = decode($1, 'hex')"))?.arguments).toMatchObject({ params: [TRACE], max_rows: 10_000 });
+});
+
+/** One analytical read as the UI issues it. */
+type Read = { readonly sql: string; readonly params: readonly unknown[] };
+
+/** The audited original read `id`, test-only reference SQL, rebound to the fixture's range and `bucket`. */
+function originalRead(id: string, bucket: string): Read {
+  const audit = JSON.parse(readFileSync(join(process.cwd(), '../../../../changes/active/verification-workflow-ui/design/query-audit/queries.json'), 'utf8')) as { queries: (Read & { id: string })[] };
+  const found = audit.queries.find((each) => each.id === id);
+  if (!found) throw new Error(`no audited query ${id}`);
+  const rest = found.params.slice(2).map((param, index) => (index === 0 && /^\d+ \w+$/.test(String(param)) ? bucket : param));
+  return { sql: found.sql, params: [RANGE.from, RANGE.to, ...rest] };
+}
+
+/** Run a page's reads together, as the page does, timing the batch from submission to its last terminal. */
+async function readAll(executor: Executor, reads: readonly Read[]): Promise<{ elapsed: number; values: QueryResult[] }> {
+  const started = performance.now();
+  const results = await executor.run(reads.map((read) => ({ op: 'bifrost.query', sql: read.sql, params: [...read.params] }) as WireRequest));
+  const elapsed = performance.now() - started;
+  return {
+    elapsed,
+    values: results.map((result, index) => {
+      if (!result.ok) throw new Error(`${reads[index].sql}: ${JSON.stringify(result.problem)}`);
+      return result.value as QueryResult;
+    })
+  };
+}
+
+/**
+ * The executed work of `reads`, one `EXPLAIN ANALYZE` at a time: scan operators,
+ * the rows they emitted, summed operator `elapsed_compute` and spills. Missing
+ * metrics count nothing; summed compute is not wall time.
+ */
+async function executedWork(executor: Executor, reads: readonly Read[]) {
+  const work = { statements: reads.length, scans: 0, scanned: 0, compute_ms: 0, spills: 0 };
+  const MS: Record<string, number> = { ns: 1e-6, µs: 1e-3, us: 1e-3, ms: 1, s: 1e3 };
+  for (const read of reads) {
+    const { values } = await readAll(executor, [{ sql: `EXPLAIN ANALYZE ${read.sql}`, params: read.params }]);
+    for (const line of values[0].rows.flatMap((row) => String(row[1]).split('\n'))) {
+      const count = (name: string) => Number(line.match(new RegExp(`${name}=([0-9.]+)`))?.[1] ?? 0);
+      const timed = line.match(/elapsed_compute=([0-9.]+)(ns|µs|us|ms|s)/);
+      if (/(DataSource|Scan|Memtable|Parquet)\w*Exec/.test(line)) {
+        work.scans += 1;
+        work.scanned += count('output_rows');
+      }
+      if (timed) work.compute_ms += Number(timed[1]) * MS[timed[2]];
+      work.spills += count('spill_count');
+    }
+  }
+  return { ...work, compute_ms: Math.round(work.compute_ms * 1000) / 1000 };
+}
+
+/** The value and its counts for facet `index` of a grouping-set facet read over `facets` columns. */
+const facetRows = (result: QueryResult, index: number, facets: number, counts = 1) =>
+  result.rows.filter((row) => Number(row[0]) === index).map((row) => [row[1 + index], ...row.slice(1 + facets, 1 + facets + counts)]);
+
+/** Rows as sorted JSON, compared as a multiset. */
+const multiset = (rows: readonly (readonly unknown[])[]) => rows.map((row) => JSON.stringify(row)).sort();
+
+/** The bucket (`whole` 0) or range (`whole` 1) rows of a grouping-set read, keeping `names`. */
+const wholeRows = (result: QueryResult, whole: number, names: readonly string[]) =>
+  result.rows.filter((row) => Number(row[0]) === whole).map((row) => names.map((name) => row[result.columns.findIndex((column) => column.name === name)]));
+
+test('consolidated Observe bundles return the original results; EXPLAIN ANALYZE compares their work', async ({ server, seeded }) => {
+  await seedSignals(server, server.apiKey, { trace: '4bf92f3577b34da6a3ce929d0e0e4736', service: 'ui-agent', subject: seeded.model.uid });
+  server.flushBifrost();
+  const run = nodeExecutor(WyrdClient.connect());
+  const bucket = '15 minutes';
+  const original = (id: string) => originalRead(id, bucket);
+  const report: Record<string, unknown> = {};
+
+  // Traces overview and facets: five plus five reads were one overview pair plus one facet read.
+  const facetColumns = ['service_name', 'name', 'status_code', 'http_response_status_code', 'gen_ai_operation_name'];
+  const traceOriginal = [...['trace-spans', 'trace-errors', 'trace-duration', 'trace-totals', 'trace-durations'].map(original), ...facetColumns.map((column) => original(`trace-facet-${column}`))];
+  const overview = traceOverviewReads({}, RANGE, bucket);
+  const traceNew = [overview.spans, overview.roots, facetsQuery({ signal: 'traces', facets: facetColumns }, RANGE)];
+  const [before, after] = [await readAll(run, traceOriginal), await readAll(run, traceNew)];
+  expect(multiset(wholeRows(after.values[0], 0, ['at', 'spans']))).toEqual(multiset(before.values[0].rows));
+  expect(multiset(wholeRows(after.values[0], 0, ['at', 'errors']))).toEqual(multiset(before.values[1].rows));
+  expect(multiset(wholeRows(after.values[1], 0, ['at', 'p95', 'p50']))).toEqual(multiset(before.values[2].rows));
+  expect([...wholeRows(after.values[0], 1, ['spans', 'traces', 'error_traces', 'span_p95_ms'])[0], ...wholeRows(after.values[1], 1, ['p95', 'p50'])[0]]).toEqual([...before.values[3].rows[0], ...before.values[4].rows[0]]);
+  // Independent fixture facts: three spans of one trace, one of them an error.
+  expect(before.values[3].rows[0].slice(0, 3)).toEqual([3, 1, 1]);
+  facetColumns.forEach((_, index) => {
+    expect(multiset(facetRows(after.values[2], index, facetColumns.length)), facetColumns[index]).toEqual(multiset(before.values[5 + index].rows));
+  });
+  report.traces = { original: { ...(await executedWork(run, traceOriginal)), elapsed_ms: Math.round(before.elapsed) }, consolidated: { ...(await executedWork(run, traceNew)), elapsed_ms: Math.round(after.elapsed) } };
+
+  // Logs facets: four reads were one.
+  const logColumns = ['severity_text', 'service_name', 'event_name', 'exception_type'];
+  const logOriginal = logColumns.map((column) => original(`logs-facet-${column}`));
+  const logNew = [facetsQuery({ signal: 'logs', facets: logColumns }, RANGE)];
+  const [logBefore, logAfter] = [await readAll(run, logOriginal), await readAll(run, logNew)];
+  logColumns.forEach((_, index) => {
+    // Severity also carries its number.
+    expect(multiset(facetRows(logAfter.values[0], index, logColumns.length, index === 0 ? 2 : 1)), logColumns[index]).toEqual(multiset(logBefore.values[index].rows));
+  });
+  report.logs = { original: { ...(await executedWork(run, logOriginal)), elapsed_ms: Math.round(logBefore.elapsed) }, consolidated: { ...(await executedWork(run, logNew)), elapsed_ms: Math.round(logAfter.elapsed) } };
+
+  // The stat strip: a total and a bucket read per stat were one read per population.
+  const stats = ['traces', 'spans', 'errors', 'duration_p95', 'invocations', 'logs', 'log_errors', 'tokens', 'calls', 'cost'] as const;
+  const statOriginal = stats.flatMap((stat) => [original(`stat-${stat}-total`), original(`stat-${stat}-buckets`)]);
+  const statNew = statQueries({ stats: [...stats] }, RANGE, bucket);
+  const [statBefore, statAfter] = [await readAll(run, statOriginal), await readAll(run, statNew)];
+  stats.forEach((stat, index) => {
+    const at = statNew.findIndex((plan) => plan.stats.includes(index));
+    const currency = stat === 'cost' ? ['currency'] : [];
+    expect(multiset(wholeRows(statAfter.values[at], 1, [`s${index}`, ...currency])), `${stat} total`).toEqual(multiset(statBefore.values[index * 2].rows));
+    // A bucket with no row of a filtered stat reads zero in its shared population.
+    const recorded = (row: readonly unknown[]) => row[1] !== 0 && row[1] !== null;
+    expect(multiset(wholeRows(statAfter.values[at], 0, ['at', `s${index}`, ...currency]).filter(recorded)), `${stat} buckets`).toEqual(multiset(statBefore.values[index * 2 + 1].rows.filter(recorded)));
+  });
+  report.statstrip = { original: { ...(await executedWork(run, statOriginal)), elapsed_ms: Math.round(statBefore.elapsed) }, consolidated: { ...(await executedWork(run, statNew)), elapsed_ms: Math.round(statAfter.elapsed) } };
+  // The plan comparison is diagnostic evidence, kept only where the run names a file.
+  if (process.env.WYRD_QUERY_DIAGNOSTICS) writeFileSync(process.env.WYRD_QUERY_DIAGNOSTICS, JSON.stringify(report, null, 2));
 });
 
 test('TASK-004: Metric windows count every recorded value', async ({ server }) => {

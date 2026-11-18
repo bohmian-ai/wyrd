@@ -303,7 +303,23 @@ request budgets implement the maintainer-selected optimization.
    credentials in host-only owners. Existing correct security/terminal tests
    are regressions, not fabricated RED. **Tier:** existing real-server UI and
    browser host owners. **Authority:** verification REQ-003/005/009/014,
-   AC-008; original supported-host/terminal contracts. Evidence: not run.
+   AC-008; original supported-host/terminal contracts. Evidence (regressions, no RED):
+   - `ui-library.integration.test.ts` 14/15 GREEN on the real server, Node and MCP hosts:
+     foreign tenant and foreign trace empty, `cards:read`-only principal denied on every
+     Observe component with no dependent read, restricted Verifier and narrow-key Verify
+     reads, retained-file/download and cancel ownership, terminal states.
+   - `ui-pages.integration.test.ts` 12/13 GREEN through the production BFF: RBAC-denied
+     first HTML, malformed range refused before reads, empty range truthful.
+   - A support failure keeps the list: streamed sections show their own error
+     (`streamed.test.ts`); refused predicates refuse only that refresh's panels.
+   - Both reds are the Verify journeys' hosted-runner step ("1 hosted operations never
+     waited for memory within 60s"). Not caused by this task: the TypeScript SDK's own
+     `tests/integration/verification-capacity.test.ts` fails the same 3 ways after
+     `mise run ts:build:testing`. Since `02efe81fc` hosted operations wait only on
+     process-pressure admission; `occupy_hosted_memory` charges the ledger, which now
+     refuses or admits at once, so nothing waits. Owner: the shared-resource hosting
+     work (github-verifier-pipelines TASK-012), whose harness needs to make
+     `occupy_hosted_memory` raise sampled pressure (or hold `hold_admission_for_test`).
 7. **Verify execution work using existing engine diagnostics.** In the existing
    real-server integration tests, execute original and consolidated bundles on
    the same populated fixture and fixed inputs. Apply [query verification](../design/query-verification.md)
@@ -316,7 +332,28 @@ request budgets implement the maintainer-selected optimization.
    not establish a speedup. Existing BFF browser assertions verify loading and
    navigation. **Tier:** real-server integration diagnostics and browser tests.
    **Authority:** REQ-001/003/014, AC-001/008 and existing UI behavior.
-   Evidence: not run.
+   Evidence: `ui-library.integration.test.ts` "consolidated Observe bundles return the
+   original results; EXPLAIN ANALYZE compares their work" (GREEN), with
+   `WYRD_QUERY_DIAGNOSTICS=<file>`. Original SQL comes from `design/query-audit/queries.json`,
+   rebound to the fixture range and a 15-minute bucket; same server, fixture and binds,
+   no writes between the pair. Results compared as multisets per chart, total, facet and
+   stat, plus independent facts (3 spans, 1 trace, 1 error trace).
+
+   | Bundle | Statements | Scan instances | Scan output rows | Operator compute | Spills | Bundle elapsed |
+   |---|---|---|---|---|---|---|
+   | Traces overview + 5 facets, original | 10 | 10 | 26 | 2.33 ms | 0 | 98 ms |
+   | Traces, consolidated | 3 | 3 | 7 | 2.55 ms | 0 | 36 ms |
+   | Logs 4 facets, original | 4 | 4 | 4 | 0.94 ms | 0 | 39 ms |
+   | Logs facets, consolidated | 1 | 1 | 1 | 0.74 ms | 0 | 36 ms |
+   | StatStrip 10 stats, original | 20 | 20 | 18 | 1.60 ms | 0 | 42 ms |
+   | StatStrip, consolidated | 6 | 6 | 5 | 2.31 ms | 0 | 39 ms |
+
+   Scans fall 10->3, 4->1, 20->6 with no new spill or refusal. Summed operator compute
+   on this three-span fixture is fixed-cost noise (grouping-set expansion adds a little
+   on traces and stats), so no compute or latency gain is claimed; elapsed is one
+   normal-query run each. Limits: Verify discovery and Metrics are not in this pair
+   (Verify's fixture lives in the hosted-blocked test; Metrics reads were removed, not
+   rewritten); Oracle DEBUG profiles and peak memory were not collected.
 
 ## Verification and handoff
 

@@ -1075,6 +1075,255 @@ mod pg_tests {
         Ok(())
     }
 
+    /// A Jev decision Verifier judges through MCP and its judgment reads back
+    /// with the policy that produced it.
+    ///
+    /// The `verification.get_execution_details` descriptor's output schema
+    /// carries the closed `VerdictTransform` union. A Service judged by a
+    /// one-question Jev Agent check executes over `verification.execute`:
+    /// the custom Choice map turns the selected `violation` label into a
+    /// failed requirement with the generated reason, and the details read
+    /// returns the authored `verdict_transform`, the selected native answer
+    /// as the actual value, and the exact `mcp-jev-judge` Agent and `jev` route
+    /// that answered, with the Prompt Card registration made of the Agent's
+    /// inline Jev Prompt. Under `context_capture: hash` the same judgment retains the
+    /// answer only as a digest. Another tenant cannot read either execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns provider, server, bootstrap, gateway administration,
+    /// registration, MCP transport, or tool-call failures, or an error when an
+    /// execution never settles.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the descriptor, a verdict, reason, policy, retained answer,
+    /// provenance, or the foreign refusal differs.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn jev_policy_judgments_read_back_through_mcp() -> Result<(), McpJourneyError> {
+        use wyrd_client::gateway_admin::{
+            DeploymentAccess, GatewayOperation, ProviderAdapter, ProviderAuth,
+            ProviderCredentialName, ProviderCredentialWrite, ProviderCredentialWriteSource,
+            ProviderDeployment, ProviderDeploymentName, ProviderId,
+        };
+        use wyrd_client::gateway_credential::CredentialWriter;
+        use wyrd_client::operator_connections::SecretBearer;
+        use wyrd_client::verify::{
+            Agent, Check, Component, InputSlot, JevPromptOptions, Prompt, Requirement, Service,
+            VerdictTransform, Verifier,
+        };
+
+        let answer = serde_json::json!({"type": "choice", "choice": "violation",
+            "confidence": 0.7, "probabilities": {"compliant": 0.3, "violation": 0.7}});
+        let upstream = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/systemone"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"model": "jev-1.13.0", "answers": {"refund": answer}}),
+            ))
+            .mount(&upstream)
+            .await;
+        let server = Box::pin(
+            WyrdTestServer::builder()
+                .with_verification_runtime_for_test()
+                .with_gateway_provider_root_for_test(upstream.uri().parse()?)
+                .start_bound(),
+        )
+        .await?;
+        let admin = server
+            .bootstrap_service("mcp-jev-admin", &["admin"])
+            .await?;
+        let admin_client = client(&server, api_key(&admin)?)?;
+        let key = ProviderCredentialName::new("jev-key")?;
+        CredentialWriter::new(admin_client.clone())
+            .put_credential(&ProviderCredentialWrite {
+                name: key.clone(),
+                provider: ProviderId::new("jev")?,
+                source: ProviderCredentialWriteSource::ManagedSecret {
+                    secret: SecretBearer::new("jev-operator-key".to_owned()),
+                },
+            })
+            .await?;
+        wyrd_client::Gateway::connect_with(&admin_client)
+            .await?
+            .put_deployment(&ProviderDeployment {
+                name: ProviderDeploymentName::new("jev")?,
+                adapter: ProviderAdapter::Jev,
+                auth: ProviderAuth::Bearer { credential: key },
+                models: None,
+                capabilities: Some([GatewayOperation::SystemOne].into()),
+                access: DeploymentAccess::Open,
+            })
+            .await?;
+        let cards = Cards::connect_with(&admin_client).await?;
+        let policy = serde_json::json!({"kind": "choice", "question": "refund",
+            "outcomes": {"compliant": "passed", "violation": "failed"}});
+        let judge = Agent::new("mcp-jev-judge", "1.0.0")
+            .prompt(Prompt::jev(
+                "jev-latest",
+                JevPromptOptions {
+                    state: "${context}".to_owned(),
+                    questions: serde_json::from_value(serde_json::json!({"refund": {
+                        "type": "choice", "instructions": "Does the reply follow the refund policy?",
+                        "criteria": {"compliant": "It follows the policy.",
+                                     "violation": "It breaks the policy."}}}))?,
+                },
+            )?)
+            .execution_route(serde_json::json!({"kind": "wyrd_gateway", "deployment": "jev"}))
+            .run_config(serde_json::json!({"max_iterations": 1}));
+        let tools = connect(&server, &admin).await?.list_all_tools().await?;
+        let described = tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == GET_EXECUTION_DETAILS)
+            .and_then(|tool| tool.output_schema.as_ref())
+            .ok_or("the details read describes its output")?;
+        let union = &described["$defs"]["VerdictTransform"]["oneOf"];
+        assert_eq!(
+            union.as_array().map(|kinds| kinds
+                .iter()
+                .filter_map(|kind| kind["properties"]["kind"]["const"].as_str())
+                .collect::<Vec<_>>()),
+            Some(vec!["choice", "probability", "score"]),
+            "{union}"
+        );
+        let other_tenant = server.seed_tenant("mcp-jev-other").await?;
+        let foreign = server
+            .bootstrap_service_in_tenant(other_tenant, "mcp-jev-foreign", &["admin"])
+            .await?;
+
+        for (version, capture) in [("1.0.0", "full"), ("2.0.0", "hash")] {
+            let verifier = Verifier::new("mcp-jev-policy", version)
+                .context_capture(capture)
+                .inputs([(
+                    "reply",
+                    InputSlot::json(serde_json::json!({"type": "string"})),
+                )])
+                .requirements([Requirement::new(
+                    "refund-policy",
+                    "The reply follows the refund policy.",
+                    Check::agent(judge.clone())
+                        .inputs([("context", "inputs.reply")])
+                        .verdict_transform(serde_json::from_value::<VerdictTransform>(
+                            policy.clone(),
+                        )?),
+                )]);
+            let declared = cards
+                .declare(&Service::new("mcp-jev-desk", version).components([
+                    Component::new("mcp-jev-judge", judge.clone()).verified_by([verifier]),
+                ]))
+                .await?;
+            let verifier_uid = declared
+                .outcomes
+                .iter()
+                .find(|outcome| outcome.card_ref.kind == CardKind::Verifier)
+                .and_then(|outcome| outcome.card_ref.uid.as_ref())
+                .ok_or("the Verifier registers")?
+                .to_string();
+            let subject = declared.root.clone();
+            let agent = server
+                .credential_registered_service(&subject, &["editor"])
+                .await?;
+            let caller = connect_rooted(&server, &agent).await?;
+            let executed = structured(
+                caller
+                    .call_tool(call(
+                        EXECUTE,
+                        serde_json::json!({
+                            "verifier_card_uid": verifier_uid,
+                            "card_uid": subject.uid.as_ref().ok_or("the Service has a UID")?.to_string(),
+                            "inputs": {"reply": {"kind": "json",
+                                                 "value": "You are guaranteed a full refund."}},
+                        }),
+                    )?)
+                    .await?,
+            )?;
+            assert_eq!(
+                executed["outcome"]["verdict"], "failed",
+                "{capture}: {executed}"
+            );
+            let reason = "Question 'refund' selected 'violation' (confidence 0.7), which the policy maps to failed.";
+            assert_eq!(
+                text(&executed, "/outcome/requirements/0/reason")?,
+                reason,
+                "{capture}"
+            );
+            let execution_id = text(&executed, "/execution_id")?.to_owned();
+            settle(&caller, &execution_id).await?;
+
+            let read = details(&caller, &execution_id).await?;
+            assert_eq!(text(&read, "/verifier/version")?, version, "{read}");
+            let retained = &read["outcome"]["requirements"][0];
+            assert_eq!(retained["outcome"], "failed", "{capture}: {retained}");
+            assert_eq!(retained["reason"], reason, "{capture}: {retained}");
+            assert_eq!(retained["check"]["kind"], "agent", "{retained}");
+            assert_eq!(retained["check"]["verdict_transform"], policy, "{retained}");
+            if capture == "full" {
+                assert_eq!(retained["actual"], answer, "{retained}");
+            } else {
+                assert!(
+                    retained["actual"]
+                        .as_str()
+                        .is_some_and(|digest| digest.len() == 64
+                            && digest.bytes().all(|byte| byte.is_ascii_hexdigit())),
+                    "the hashed answer is retained only as a digest: {retained}"
+                );
+            }
+            let provenance = &retained["provenance"];
+            assert_eq!(provenance["kind"], "agent", "{retained}");
+            assert_eq!(
+                (
+                    &provenance["agent"]["kind"],
+                    &provenance["agent"]["name"],
+                    &provenance["agent"]["version"]
+                ),
+                (
+                    &JsonValue::from("Agent"),
+                    &JsonValue::from("mcp-jev-judge"),
+                    &JsonValue::from("1.0.0")
+                ),
+                "{retained}"
+            );
+            assert_eq!(
+                (&provenance["prompt"]["kind"], &provenance["prompt"]["name"]),
+                (
+                    &JsonValue::from("Prompt"),
+                    &JsonValue::from("mcp-jev-judge-prompt")
+                ),
+                "the Prompt Card registered from the Agent's inline Prompt: {retained}"
+            );
+            assert!(
+                provenance["prompt"]["uid"]
+                    .as_str()
+                    .is_some_and(|uid| !uid.is_empty()),
+                "{retained}"
+            );
+            assert_eq!(
+                provenance["route"],
+                serde_json::json!({"kind": "wyrd_gateway", "deployment": "jev"}),
+                "{retained}"
+            );
+            caller.cancel().await?;
+
+            let foreign_client = connect(&server, &foreign).await?;
+            let refused = refusal(
+                foreign_client
+                    .call_tool(call(
+                        GET_EXECUTION_DETAILS,
+                        serde_json::json!({ "execution_id": execution_id }),
+                    )?)
+                    .await,
+            )?;
+            assert!(
+                refused.contains("WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND"),
+                "another tenant reads no judgment: {refused}"
+            );
+            foreign_client.cancel().await?;
+        }
+        server.shutdown().await?;
+        Ok(())
+    }
+
     /// An agent reads a scheduled drift execution back by its ID: an empty
     /// window settles `inconclusive` through `verification.get_execution`
     /// with its drift report, and `bifrost.query` shows its one `schedule`

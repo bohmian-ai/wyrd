@@ -26,3 +26,11 @@ The [development repository review supplement](dev-repository-review.md) and
 implemented Repository/settings surfaces through ordinary public APIs.
 Specification revision 5 also assigns TASK-004A the agreed verdict-preservation
 and pinned-PR-citation runtime correction needed by that journey.
+
+[UI query consolidation](ui-query-consolidation.md), its
+[original SQL audit](query-audit/README.md) and
+[TASK-004B](../tasks/TASK-004B-ui-query-consolidation.md) cover fewer repeated
+reads and responsive loading across all existing pages and routes after
+TASK-004A completes. [Verification](query-verification.md) uses existing tests
+and engine diagnostics, with
+unchanged analytical meaning, permissions and visual composition.

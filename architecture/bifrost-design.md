@@ -1557,9 +1557,20 @@ reconstructs it in one place before mapping the failure; no failure is
 classified from its human message. Only a failure with no catalog identity
 becomes `WYRD_VALA_500_QUERY_EXECUTION_FAILED`.
 
-A public distributed-plan or execution-path `EXPLAIN` surface is deferred and
-is not part of this delivery. Selected-path evidence reaches callers only
-through the success terminal of the one public query operation. The public
+The existing public query operation accepts `EXPLAIN SELECT` and
+`EXPLAIN ANALYZE SELECT`, including supported CTEs, joins and parameters.
+Plain EXPLAIN returns optimized logical/physical plans without executing the
+underlying data query; ANALYZE returns the executed plan and available operator
+metrics after running the SELECT through its normal selected execution path.
+DataFusion tabular plan output uses the existing Arrow stream and terminal.
+The underlying query's tenant/table/payload authorization, audit, admission,
+resource/output limits, deadline and cancellation remain authoritative for
+both forms. Non-read statements and multiple statements remain invalid.
+Plan output must not disclose credentials or private infrastructure locators;
+no separate topology/debug API is introduced. This bounded addition is owned
+by verification-workflow-ui REQ-018/TASK-004B, explicitly requested on
+2026-11-18. Selected-path evidence also remains available through the success
+terminal of the one public query operation. The public
 query deadline range is `1..=u32::MAX` milliseconds across Rust, HTTP, gRPC,
 Python, TypeScript, and MCP.
 
@@ -2195,8 +2206,7 @@ Bifrost does not provide:
   detached stage runtime;
 - partial successful results, automatic retry of a selected analytical query,
   or silent cross-engine fallback after analytical selection;
-- a public distributed-plan or execution-path `EXPLAIN` surface in this
-  delivery;
+- a separate cluster-topology or private-infrastructure diagnostic API;
 - result caching as a correctness dependency;
 - cross-region query execution or autoscaling semantics;
 - cross-pod Scribe assembly or coordination of one append across ingest pods;

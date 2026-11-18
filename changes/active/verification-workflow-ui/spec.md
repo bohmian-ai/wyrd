@@ -1,6 +1,6 @@
 ---
 id: SPEC-verification-workflow-ui
-revision: 5
+revision: 6
 status: approved
 ---
 
@@ -34,8 +34,10 @@ Bifrost and verification operations, then mounts them in the conventional UI
 and supported hosts. The server continues to own durable behavior. This packet
 adds no server fields, endpoints, query services, storage or execution logic
 apart from REQ-015's status recording and revision 5's bounded verdict/citation
-correction under REQ-016/017. TASK-004A owns that correction and its development
-journey; all other server exclusions remain unchanged.
+correction under REQ-016/017, and revision 6's public EXPLAIN support under
+REQ-018. TASK-004A owns the verdict/citation correction and its development
+journey; TASK-004B owns explanation and UI query consolidation. All other
+server exclusions remain unchanged.
 Costs are UI queries, adapters, presentation, status-event writes and real-server visual/journey proof;
 the prototype supplies none of that production evidence.
 
@@ -300,13 +302,31 @@ component/page state, visual and accessibility evidence from the original UI
 agreement, including light/dark, desktop/mobile, keyboard/focus, long content
 and internal scrolling/pan/zoom. Fixtures do not close live dependencies.
 
+**REQ-018 — Explain authorized Bifrost queries.** TASK-004B adds
+`EXPLAIN SELECT` and `EXPLAIN ANALYZE SELECT` through the existing public query
+operation, including supported CTEs, joins and parameter bindings. Plain
+EXPLAIN returns optimized logical/physical plans without executing the data
+query; ANALYZE executes the underlying SELECT through its normal selected path
+and returns its executed plan with available operator metrics. Both return
+DataFusion's tabular plan output through existing query streams and terminals.
+They preserve underlying table/tenant/payload authorization, read audit,
+admission, resource/output limits, deadlines, cancellation and typed errors.
+Explain does not authorize writes, multiple statements, new query endpoints,
+credential disclosure or private infrastructure diagnostics. Existing shipped
+query clients and the query editor can use the same SQL capability.
+[Verification decisions](design/query-verification.md) define the selected
+integration and evidence collection. Consolidation covers every existing UI
+page/route and uses existing tests, without benchmark runs or `dev:full`.
+
 No visual workflow editor, new verification kind, finding schema, separate PR
 dashboard, general Cards redesign, activation/pause/rollback editor or broader
 Changes/collaboration product is included. No new server API, response field, query service, authorization behavior,
 runtime redesign, scheduler, registry, graph store, browser execution ledger,
 event bus or PostgreSQL table is authorized. REQ-016/017 authorize only the
 existing runtime verdict validation and PR evidence/citation correction; they
-do not authorize unrelated server behavior or a new endpoint. Internal layout algorithms, cursor encoding,
+do not authorize unrelated server behavior or a new endpoint. REQ-018 is the
+additional bounded exception for explanation through the existing query API;
+it does not authorize storage/execution redesign or a separate query service. Internal layout algorithms, cursor encoding,
 refresh scheduling and component decomposition remain implementation-owned.
 
 ## Dependencies, authority and scope transfer
@@ -418,7 +438,19 @@ not merely the existence of a route/component or a successful command.
 | AC-010 Retained lifecycle events | Through real public SDK/server operations, cancel pending and running work, revoke a principal with multiple unfinished executions, and hold other work at running/retrying/input-wait/approval-wait before completion or timeout/error. Public Bifrost queries over `event = 'status'` return the expected newest words and specified row fields. Exercise ordinary release/defer returning to pending/retrying. Repeated cancellation, stale settlement and rollback add no event. Focused owner proof preserves grouped completion, shared status-row batching, attribution and retry identity; existing checkpoint recovery and tenant-isolation proof remains passing. | 015 |
 | AC-011 Verdict and PR evidence integrity | Exercise Agent/code checks returning valid passed/failed/inconclusive outcomes, including an uncited pass; outcomes remain authored. Malformed output and invalid supplied citations produce explicit validation failures, never silently filtered evidence. Run the shipped PR example and pinned demo through real extraction, review and final code check: a clean review passes with a valid citation to the retained pinned PR source, a high finding fails, and incomplete coverage remains inconclusive. Preserve source reachability through workspace/derived output and existing retained recovery; wrong-execution/tenant/locator citations are rejected. Live demo proof still includes actual GitHub delivery and existing UI visibility under AC-009. | 016,017 |
 
+| AC-012 Public query explanation | Through existing SDK/HTTP/MCP query paths and the query editor, explain a bound SELECT and analyze its real execution. Plain EXPLAIN performs no underlying data execution; ANALYZE retains the SELECT's execution selection and governs its work. Both preserve tenant/table/payload checks and complete-stream semantics. Invalid statements, denied access, resource/output exhaustion, deadline and cancellation remain typed failures without successful partial plans. | 018 |
+
 ## Approval and revision history
+
+Revision 6 records the maintainer's explicit 2026-11-18 direction to add public
+EXPLAIN to TASK-004B rather than use a diagnostics workaround. REQ-018/AC-012
+extend the existing query SQL surface; the selected design includes ANALYZE
+for executed-work verification. TASK-004B audits and optimizes all UI routes
+using existing tests without benchmark runs or `dev:full`. Other tasks retain
+their approved scope and evidence. Revision 5 is retained in
+[the prior revision](spec-revisions/revision-5.md). This authorizes planning,
+not a claim of implementation or permission to commit/push.
+
 
 Revision 5 records the maintainer's explicit agreement to the verdict/PR citation
 correction and request to revise the spec and tasks. It authorizes REQ-016/017
@@ -448,3 +480,5 @@ capability readiness is still checked per task; unavailable data is not invented
 | 3 | approved (2026-11-12) | Record the user-agreed UI-only implementation boundary: existing Card/Bifrost/domain reads, compact judgments and explicit details, unchanged task order, no new server APIs/fields/query services or runtime behavior. |
 | 4 | approved (2026-11-16) | Add REQ-015/AC-010: queued lifecycle status rows through the existing Scribe outbox, retaining completion group commit, shared batching and unchanged checkpoints/recovery. Include release/defer status recording; no migration, new endpoint, additional PostgreSQL statement or crash-durability guarantee. |
 | 5 | approved (2026-11-17) | Preserve valid Agent/code check verdicts; reject invalid supplied citations explicitly; make retained pinned PR extraction citable and carry provenance through the review/check flow; correct shipped example/demo and retain clean-PR passed/success. TASK-004A owns this bounded runtime and development supplement. |
+
+| 6 | approved scope (2026-11-18) | Add maintainer-requested public EXPLAIN and selected EXPLAIN ANALYZE in TASK-004B; all-route consolidation verified with existing tests and query plans, without benchmarks or dev:full. |

@@ -2,6 +2,21 @@
 
 Status: finalized
 
+## UI query consolidation — TASK-004B
+
+The maintainer requested [TASK-004B](../tasks/TASK-004B-ui-query-consolidation.md)
+on this branch, to execute after TASK-004A finishes. The
+[query audit and selected implementation](ui-query-consolidation.md) record
+the original SQL, consolidation budgets, independent section loading and
+result equivalence, request budgets and existing engine execution diagnostics.
+Scope covers every existing page and route through shared read owners; there
+is no new domain API and other tasks remain independent. The maintainer then
+explicitly requested EXPLAIN support through the existing query operation;
+revision 6 adds this bounded backend exception before consolidation verification.
+[Verification decisions](query-verification.md) exclude benchmark runs,
+`dev:full`, storage experiments and SLO requalification.
+The plan claims no implementation or measured improvement.
+
 The approved UI design below is preserved. The server supplements are
 TASK-003A's [retained queued execution statuses](verify-status-events.md) under
 specification revision 4, and TASK-004A's

@@ -1,7 +1,7 @@
 ---
 id: TASK-004
 kind: implementation
-status: proposed
+status: implemented
 spec: SPEC-positioning
 spec_revision: 5
 requirements: [REQ-007, REQ-008, REQ-009, REQ-014, REQ-015, REQ-016, INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, AC-006, AC-007, AC-008, AC-013, AC-014, AC-015]
@@ -381,7 +381,7 @@ link and anchor on the 14 pages it visited: none dead.
 
 | Question | Canonical destination reached | Result | Next step |
 |---|---|---|---|
-| What is AI verification; how does it differ from evaluation? | Foundations of verification | Partial: verification fully defined; evaluation contrast is one entry in the related-terms list | Real-time verification, practice guides |
+| What is AI verification; how does it differ from evaluation? | Foundations of verification | Partial, then repaired: the evaluation contrast was one list entry; a `### Verification and evaluation` subsection now answers it, and search for "verification and evaluation" returns the page | Real-time verification, practice guides |
 | Why verify before the response; what adds latency; what happens to evidence after? | Real-time verification | Yes: timing, the three parts of the wait, retained versions and evidence | Quickstart, tutorials (after `9a0d1ee2f`) |
 | How do declared requirements decide a verdict? | How verification works in Wyrd (via `llms.txt`) | Yes: one check per requirement, `decide` | Quickstart, four tutorials |
 | Verify a proposed action in a web API before it executes | Verify during a request | Yes: releases only on `passed` | Act on verdicts, ASGI apps |
@@ -390,13 +390,12 @@ link and anchor on the 14 pages it visited: none dead.
 | Find the failed requirement, evidence and exact versions | Investigate a failed verification | Yes: failed requirement, judged evidence, `refund-workflow@0.1.0` / `refund-agent@0.1.0` | Retention and Bifrost pages |
 | Verify AI output against a policy document | Quickstart | Partial before `bba3e04a5`: on-site search ranked Recipes first; Quickstart now carries the policy wording in its browser title, and What can I build no longer calls it a single assertion | Verify during a request |
 
-Remaining observations, not repaired here: on-site Pagefind searches visible
-text only, so browser titles do not affect its ranking, and comparison queries
-("vs") return nothing; the docs say "requirements", not "contracts". The
-foundation's evaluation contrast and its lack of a direct Quickstart link
-follow TASK-002-R1's tool-independent design; deepen the contrast there if
-day-14 queries show "verification versus evaluation" landings that do not
-convert.
+Deliberately unchanged: Pagefind indexes visible page text only, so browser
+titles do not affect on-site ranking. Feeding it the titles would require
+hidden keyword text, which the spec forbids; external search reads `<title>`
+directly. The docs say "requirements", not "contracts". Foundations links to
+How verification works, not straight to the Quickstart, following TASK-002-R1's
+tool-independent design.
 
 ### Publication order
 

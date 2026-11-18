@@ -109,6 +109,14 @@ Other terms describe related work:
 
 Evaluation, observability, and guardrails become verification when they check a written requirement against evidence. An assurance case collects those results.
 
+### Verification and evaluation
+
+Evaluation and verification answer different questions. An evaluation asks how well a model or agent does on average: it runs a set of examples and reports a score, such as 92% of answers judged correct. That score helps compare two models or two prompt versions. It does not say whether the next real answer is one of the 8% that failed.
+
+Verification asks whether one specific run met a stated requirement, such as "the report goes only to an authorized recipient." It returns a judgment for that run, with the evidence behind it, so the application or a person can decide what to do with that run.
+
+The two meet when an evaluation's score is held to a written requirement, such as "at least 90% on this versioned test set." Checking a new release against that threshold verifies the release; the score alone does not.
+
 ## When there is no single expected answer
 
 Sorting a list has one right answer. Many tasks have more than one. Here are two summaries of the same incident report:

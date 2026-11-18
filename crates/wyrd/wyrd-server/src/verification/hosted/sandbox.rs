@@ -179,6 +179,11 @@ impl Sandbox {
     /// returned hold drops, raising the pressure the process samples and
     /// refusing retained inputs that do not fit in `leave`.
     ///
+    /// The held bytes are verification work, as a memory-heavy run's would
+    /// be, so contended pressure holds new Python operations in their
+    /// admission wait until enough of the hold is released. Pressure is
+    /// sampled once at once, so the next operation already sees the hold.
+    ///
     /// Memory other owners release while the hold lives is absorbed into it
     /// soon after, so the free bytes return to `leave`.
     ///
@@ -188,9 +193,13 @@ impl Sandbox {
     #[must_use]
     pub fn occupy_for_test(&self, leave: u64) -> OccupiedForTest {
         let memory = self.memory.clone();
-        let charge = Arc::new(std::sync::Mutex::new(Some(
-            memory.charge_infallible(memory.available().saturating_sub(leave)),
-        )));
+        let operation = self.workloads.begin(Workload::Verification, None, None);
+        let mut held = memory.charge_infallible(memory.available().saturating_sub(leave));
+        held.attribute(&operation);
+        // Sample now so work arriving before the next periodic sample already
+        // sees the hold; that sample restores the parent's real commitment.
+        self.workloads.sample(0);
+        let charge = Arc::new(std::sync::Mutex::new(Some(held)));
         let held = Arc::clone(&charge);
         let pin = tokio::spawn(async move {
             loop {
@@ -211,7 +220,11 @@ impl Sandbox {
                 changed.await;
             }
         });
-        OccupiedForTest { charge, pin }
+        OccupiedForTest {
+            charge,
+            pin,
+            _operation: operation,
+        }
     }
 
     /// Hold every Python operation inside its admission wait, counted by
@@ -1028,6 +1041,8 @@ pub struct OccupiedForTest {
     charge: Arc<std::sync::Mutex<Option<ByteCharge>>>,
     /// The task absorbing released memory into the charge.
     pin: tokio::task::JoinHandle<()>,
+    /// The verification operation the held bytes are attributed to.
+    _operation: Operation,
 }
 
 #[cfg(feature = "test-support")]

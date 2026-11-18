@@ -2966,9 +2966,11 @@ impl WyrdTestServer {
             .ok_or_else(|| WyrdTestServerError::Start("server has no Bifrost Scribe".to_owned()))
     }
 
-    /// Hold process memory so at most `leave` bytes stay free, so a hosted
-    /// Python operation whose retained request bytes do not fit is refused,
-    /// until the returned hold drops.
+    /// Hold process memory as verification work so at most `leave` bytes stay
+    /// free until the returned hold drops: under the contended pressure that
+    /// leaves, a direct hosted Python operation waits for admission, a queued
+    /// one returns to the queue, and retained request bytes that do not fit
+    /// are refused.
     ///
     /// # Panics
     /// Panics when called outside a Tokio runtime.

@@ -81,13 +81,17 @@ TypeScript behave the same.
 
 ## Decisions and alternatives
 
-- **Dropped: lazy Bifrost start on first write.** Sample observations enqueue
-  synchronously against a table described at startup
-  (`observe/mod.rs` `Observe::drift_value`; `lifecycle.rs` `StartedBifrost`
-  doc: "a synchronous projection-and-enqueue call"). A lazy start would put a
-  gRPC dial and a table describe inside that synchronous Bifrost-append hot
-  path, which needs a blocking runtime and an unsanctioned wait. With item 1,
-  only programs that actually write rows or samples call `start_bifrost()`.
+- **Writes start the writer on first use (user decision, revised).** `verify`
+  and `submit` must never require `start_bifrost()`. The earlier objection
+  applied to synchronous enqueue only. `submit`, `run.bifrost.write`/`write_to`
+  and `use_table_by_name` are already asynchronous (blocking in Python), so
+  the first one starts the writer with default options before recording;
+  once running, samples still enqueue synchronously. A state-wide start gate
+  makes concurrent first writes start it once and makes an explicit
+  `start_bifrost()` in flight awaited, not refused. `start_bifrost()` remains
+  for writer options and fail-fast startup. Offline, the first write reports
+  the connect error (`WYRD_CLIENT_503_TRANSPORT_DOWN`) instead of
+  `WYRD_SDK_400_BIFROST_NOT_STARTED`.
 
 - **OTel stays optional.** `configure()` follows the ASGI middleware's
   existing contract (`docs/.../connect/integrate-asgi.md` If it fails): default

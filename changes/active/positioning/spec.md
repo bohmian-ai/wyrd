@@ -1,6 +1,6 @@
 ---
 id: SPEC-positioning
-revision: 5
+revision: 6
 status: approved
 ---
 
@@ -78,7 +78,7 @@ Current architecture and repository rules own product truth. The completed
 existing authoring, declaration and language projections. Reuse their complete
 workflows, the finance examples, existing tutorial drafts and journey support.
 No runtime, evidence-storage or security change is authorized. The only SDK
-contract changes are the additions INV-001 names.
+contract changes are the additions INV-001 names and the REQ-017 changes.
 
 Approval of revision 3 transfers the following overlapping documentation work
 from `SPEC-docsite-incremental-reset` revision 9 to this change:
@@ -341,6 +341,56 @@ If account access is unavailable, record the gap and responsible maintainer
 rather than fabricate data or block local completion on external metrics.
 Track qualified discovery and successful trials, not stars or traffic alone.
 
+### REQ-017 — Keep the agent-workflow setup to calls a reader needs
+
+The agent-workflow tutorial exposed setup a reader could not explain: a
+separate telemetry call, a writer started only so `flush` would not refuse,
+and a hand-built slot mapping because a model could not declare a trace slot.
+
+Python shown; TypeScript and Rust change the same way.
+
+| Before | After |
+|---|---|
+| `state.start_telemetry()`, `state.start_bifrost()`, then `flush()` | `state.configure()`, then `flush()` |
+| `inputs={"reply": str, "trace": InputSlot.trace()}` | `inputs=RefundReply`, a model whose `trace: Trace` field holds the trace ID |
+
+- **Managed telemetry from `configure`.** Python and TypeScript
+  `state.configure()` fixes the state context (Service, version, environment;
+  a later `configure` refuses with `WYRD_SDK_409_STATE_CONFIG_FROZEN`) and then,
+  by default, installs Wyrd's managed telemetry: global OpenTelemetry
+  providers exporting to Wyrd under that context; `telemetry=False` (`{ telemetry: false }`) opts out, and
+  `start_telemetry` is no longer public. TypeScript `configure` becomes
+  asynchronous, also when telemetry is off. Rust keeps `wyrd_ai::otel::start_telemetry(&state)`, because
+  its client tier must not depend on OpenTelemetry. Missing optional
+  OpenTelemetry packages (Python's `otel` extra, TypeScript's
+  `@opentelemetry/*` peers) fail a default configure with the existing install
+  remedy; an existing
+  provider fails with `WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS`. The ASGI
+  integration's `telemetry` option keeps its approved behavior. The runtime
+  contract is recorded in `SPEC-service-identity-and-telemetry` revision 17.
+- **Drain what was started.** `flush` succeeds when the state never called
+  `start_bifrost` (so no Bifrost writer buffers rows) and still refuses after
+  shutdown.
+- **Writes never require `start_bifrost`.** The first `submit` of window
+  samples, `run.bifrost.write`/`write_to` or `use_table_by_name` starts the
+  state's Bifrost writer with default options; concurrent first writes start
+  it once. `start_bifrost()` stays for writer options and fail-fast startup.
+  `verify` never needed it.
+- **`Trace` slot marker, one name in every SDK.** A field typed
+  `wyrd.verify.Trace` (Python), `verify.Trace(z.string())` (TypeScript) or
+  `wyrd_ai::verify::Trace` (Rust) declares a `trace` slot, as a model field or
+  as a mapping value; every other field stays a `json` slot. Its value is the
+  trace ID string, so one model instance both declares and supplies the
+  inputs. The marker compiles to the canonical `trace` slot: stored Cards and
+  the wire contract are unchanged. Other slot kinds get no marker: `media`
+  values are uploaded files, `samples` are server-filled and `source` is an
+  authoring reference.
+
+These are public SDK changes and break callers of Python `start_telemetry`,
+TypeScript `startTelemetry` and synchronous TypeScript `configure`. The
+maintainer accepted the break; per repository rules no compatibility alias is
+kept.
+
 ## Invariants and non-goals
 
 - **INV-001 — Preserve runtime ownership.** No new runtime, orchestration,
@@ -354,6 +404,8 @@ Track qualified discovery and successful trials, not stars or traffic alone.
   (Python `passed`/`failed`/`inconclusive`, Rust
   `is_passed`/`is_failed`/`is_inconclusive`, TypeScript `VerdictPredicates`).
   Every path that builds a TypeScript result attaches the predicates.
+  Revision 6 approves exactly REQ-017's SDK changes; nothing else in this
+  invariant is relaxed.
 - **INV-002 — Be precise about evidence.** Use synthetic data and clearly
   label supplied recipient/destination facts. No claim of live third-party
   authorization inspection, autonomous transmission, PII redaction or universal
@@ -405,6 +457,7 @@ fixtures or implementation structure.
 | AC-013 | The editorial query map assigns each intent family to canonical substantive content. A reader/agent given representative questions finds the right published page, its prerequisites and executable next step using public site/index surfaces, without repository archaeology. No arbitrary keyword frequency or live search position is required. | REQ-014; INV-004–006 |
 | AC-014 | Substantive external claims have primary-source attribution, demonstrations link to executed evidence, dates/credits are truthful, and the maintainer handoff identifies content/discovery/distribution responsibilities without performing external outreach. | REQ-015; INV-005–006 |
 | AC-015 | Publication evidence identifies the initial set and completion of the full required corpus. The handoff defines baseline and equal-window follow-up metrics, records available baseline data or explicit access gaps, and identifies a responsible maintainer for remaining account-dependent work. | REQ-016; INV-005–006 |
+| AC-016 | In Python, TypeScript and Rust, the agent-workflow program declares its inputs as one model with a `Trace` field, sets up with `configure()` (Rust: `configure` plus `otel::start_telemetry`) and `flush()`, and the real-server journey reproduces complete/skipped/no-trace. Unit evidence shows a marked field or mapping value becomes `{"type": "trace"}` while other fields keep their schemas; default configure installs telemetry, refuses an existing provider and reports missing OpenTelemetry packages (Python, TypeScript); a second configure is frozen; `flush` without a writer succeeds. The scheduled-check `record` programs submit samples, and the support-desk and author-in-code programs write rows, without `start_bifrost`; concurrent first writes land every row. | REQ-017; INV-001, INV-003 |
 
 Automated provider fixtures prove execution mechanics, not live model accuracy.
 Record the install pins, provider/model setup, commands and observed
@@ -426,14 +479,23 @@ The documentation publishes with this change; its install pins name the
 release that ships it. Unavailable account metrics are explicit handoff gaps, not product
 choices or permission to omit required content.
 
-The maintainer approved revision 3 on 2026-11-12 and revision 4 on
-2026-11-13, and revision 5 on 2026-11-15. Approval covers the complete positioning and documentation rollout,
+The maintainer approved revision 3 on 2026-11-12, revision 4 on
+2026-11-13, revision 5 on 2026-11-15 and revision 6 on 2026-11-18. Approval covers the complete positioning and documentation rollout,
 bounded ownership transfer, invariants and acceptance evidence. Implementation
-tasks must reference revision 5; the old revision-2 scope must
+tasks must reference revision 6; the old revision-2 scope must
 not be executed as its plan. Spec approval does not approve implementation
 tasks or grant implementation readiness.
 
 ## Revision history
+
+- Revision 6 — Maintainer decision on 2026-11-18: add REQ-017 and AC-016 for
+  the SDK lifecycle and trace-slot changes the agent-workflow tutorial needed
+  (design: [SDK lifecycle ergonomics](../sdk-lifecycle-ergonomics/design/notes.md)),
+  with identical SDK names, and the maintainer's rule that `verify` and
+  `submit` never require `start_bifrost`. The telemetry runtime contract moves with
+  `SPEC-service-identity-and-telemetry` revision 17. Implemented in
+  `2add347cd..480251a70` before this revision; the revision records the
+  maintainer's earlier approvals.
 
 - Revision 5 — Maintainer decision on 2026-11-15 (TASK-001 review D2): keep
   the typed input models and verdict predicates as approved SDK additions

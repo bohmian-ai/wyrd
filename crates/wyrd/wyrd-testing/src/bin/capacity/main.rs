@@ -589,23 +589,39 @@ mod tests {
             "a ui-sql record names the exact frozen SQL it ran"
         );
         let ui_steps: Vec<&str> = ui.steps.iter().map(|step| step.id.as_str()).collect();
-        for residence in ["memtable", "staged", "published"] {
-            for page in ["traces", "verification", "logs", "metrics"] {
-                for clients in [1, 8] {
-                    let id = format!("{residence}-{page}-page-c{clients}");
-                    assert!(ui_steps.contains(&id.as_str()), "{id} in {ui_steps:?}");
-                }
-            }
-            for query in [
-                "trace-list",
-                "verify-list",
-                "metrics-histogram",
-                "span-detail",
-            ] {
-                let id = format!("{residence}-{query}-c1");
-                assert!(ui_steps.contains(&id.as_str()), "{id} in {ui_steps:?}");
+        assert_eq!(
+            ui_steps,
+            [
+                "memtable-ui-c1",
+                "memtable-ui-c8",
+                "staged-ui-c1",
+                "staged-ui-c8",
+                "published-ui-c1",
+                "published-ui-c8"
+            ],
+            "one combined step per residence and client count"
+        );
+        assert_eq!(
+            ui.timing, timing,
+            "ui-sql keeps the standard L1 windows and budget"
+        );
+        let declared = |id: String| ui.metrics.iter().any(|metric| metric.id == id);
+        for observation in [
+            "page.traces",
+            "page.metrics",
+            "statement.trace-list",
+            "statement.verify-chart-verdict",
+            "statement.metrics-histogram",
+        ] {
+            for stat in ["count", "p95_us"] {
+                let id = format!("diagnostic.{observation}.{stat}");
+                assert!(declared(id.clone()), "ui-sql declares {id}");
             }
         }
+        assert!(
+            !declared("diagnostic.statement.span-detail.count".to_owned()),
+            "standalone statements are checked for correctness, not timed"
+        );
         for criterion in ["no-errors", "exact-answers", "p95-samples"] {
             assert!(
                 ui.criteria.iter().any(|judged| judged.id == criterion),

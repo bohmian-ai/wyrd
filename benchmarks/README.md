@@ -35,10 +35,9 @@ or counter, a mismatched population, zero CPU, a failed record); a busy
 driver does not invalidate a smoke. A full command never runs a smoke first:
 run `--smoke` on the same command, or `bench:smoke` for every default plan's
 smoke. Every L1 experiment takes up to 5 minutes (Verification, Gateway,
-Bifrost `hot` and `parquet`) except Bifrost `writes-parquet`, which takes up
-to 8 (480 s), and Bifrost `ui-sql`, which takes up to about 50 (3,015 s), so
-`bench:l1:bifrost` takes up to 69 minutes (4,095 s) and `bench:l1` up to
-79 in all. An L2 engine takes 20 to 30 minutes.
+Bifrost `hot`, `parquet` and `ui-sql`) except Bifrost `writes-parquet`,
+which takes up to 8 (480 s), so `bench:l1:bifrost` takes up to 23 minutes
+(1,380 s) and `bench:l1` up to 33 in all. An L2 engine takes 20 to 30 minutes.
 
 ## Prerequisites
 

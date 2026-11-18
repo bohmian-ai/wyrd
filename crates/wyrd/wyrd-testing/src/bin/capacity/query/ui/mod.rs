@@ -14,7 +14,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use wyrd_spec::vala::api::QueryParam;
-use wyrd_testing::experiment::{Criterion, Declaration, Metric, Op, Step, WINDOW_SECONDS};
+use wyrd_testing::experiment::{Criterion, Declaration, Metric, Op, Step};
 
 use answer::Order;
 use fixture::Journey;
@@ -25,50 +25,32 @@ pub const CASE: &str = "ui-sql";
 /// Where the rows are, in the order every run moves them.
 pub const RESIDENCES: [&str; 3] = ["memtable", "staged", "published"];
 
-/// The original pages, each its catalog family's statements as one bundle.
+/// The original pages, each its catalog family's statements as one bundle,
+/// in the order every client cycles through them.
 pub const PAGES: [&str; 4] = ["traces", "verification", "logs", "metrics"];
 
-/// Concurrent pages each page bundle runs at.
-pub const PAGE_CLIENTS: [u64; 2] = [1, 8];
+/// Concurrent clients of each residence's step, each cycling through every
+/// page.
+pub const CLIENTS: [u64; 2] = [1, 8];
 
-/// The representative statements measured alone at one client.
-pub const QUERIES: [&str; 15] = [
-    "trace-list",
-    "trace-counts",
-    "verify-list",
-    "logs-list",
-    "metrics-chart",
-    "metrics-histogram",
-    "metrics-24h-chart",
-    "metrics-nested-chart",
-    "trace-child-match",
-    "trace-page-after",
-    "trace-waterfall",
-    "span-detail",
-    "log-detail",
-    "stat-duration_p95-total",
-    "stat-cost-buckets",
-];
-
-/// Seconds of every ui-sql repetition: a one-page bundle answers about a
-/// dozen statements per round, so 10 s keeps every step well above the
-/// p95 sample floor.
-const WINDOW: u64 = 10;
-
-/// Seconds the budget allows beyond the steps' windows: the journey load,
-/// the reference pass, and each residence's placement and recheck.
-const SETUP_SECONDS: u64 = 600;
+/// The diagnostic observation of one page's or one statement's client
+/// latency: `page.<page>` or `statement.<id>`.
+#[must_use]
+pub fn observation(kind: &str, name: &str) -> String {
+    format!("{kind}.{name}")
+}
 
 /// The ui-sql declaration over `base` with the Bifrost read `metrics` and
-/// the server's `limits`: every page at [`PAGE_CLIENTS`] and every
-/// [`QUERIES`] statement at one client, in each residence in order, judged
-/// on errors, exact typed answers and the p95 sample floor.
+/// the server's `limits`: one step per residence and [`CLIENTS`] count, in
+/// residence order, each running every page in the same fixed cycle with
+/// the level's standard windows and budget, judged on errors, exact typed
+/// answers and the pooled p95 sample floor. Each page and each page
+/// statement also reports its own client latency and sample count.
 #[must_use]
 pub fn declare(mut base: Declaration, mut metrics: Vec<Metric>, limits: Value) -> Declaration {
-    "Over the deterministic default journey in the catalog's hour, what do the original UI pages at 1 and 8 concurrent pages and representative standalone UI statements cost the server and client when the rows are in memtables, staged, and published, with every typed answer identical in every residence?".clone_into(&mut base.question);
+    "Over the deterministic default journey in the catalog's hour, what do the original UI pages, cycled in a fixed order by 1 and 8 concurrent clients, cost the server and client per page and per statement when the rows are in memtables, staged, and published, with every typed answer of every catalog statement identical in every residence?".clone_into(&mut base.question);
     let journey = Journey::DEFAULT;
-    base.variables
-        .insert("clients".to_owned(), json!(PAGE_CLIENTS));
+    base.variables.insert("clients".to_owned(), json!(CLIENTS));
     base.controls.insert(
         "fixture".to_owned(),
         json!({
@@ -83,13 +65,14 @@ pub fn declare(mut base: Declaration, mut metrics: Vec<Metric>, limits: Value) -
     base.controls.insert("limits".to_owned(), limits);
     base.controls.insert(
         "workload".to_owned(),
-        json!("closed-loop public-client pages, each sending its next page once the last answers: a page runs its family's independent statements concurrently, then the statements taking their results; every answer checked against its typed reference; rows placed in each residence by the benchmark control outside every window"),
+        json!("closed-loop public clients, each cycling traces, verification, logs and metrics pages from its own offset and sending its next page once the last answers: a page runs its family's independent statements concurrently, then the statements taking their results; every answer checked against its typed reference; rows placed in each residence by the benchmark control outside every window, where every catalog statement, timed or standalone, must answer as in memtables"),
     );
+    let catalog = Catalog::frozen();
     base.controls.insert(
         "corpus".to_owned(),
         json!({
             "sha256": corpus_digest(),
-            "source_revision": Catalog::frozen().map(|catalog| catalog.source_revision).unwrap_or_default(),
+            "source_revision": catalog.as_ref().map(|catalog| catalog.source_revision.clone()).unwrap_or_default(),
         }),
     );
     metrics.push(Metric::raw(
@@ -97,29 +80,33 @@ pub fn declare(mut base: Declaration, mut metrics: Vec<Metric>, limits: Value) -
         "ms",
         "diagnostic: the first statement's time after the rows reached the step's residence, before any warmup",
     ));
-    base.metrics = metrics;
-    let mut steps = Vec::new();
-    for residence in RESIDENCES {
-        for page in PAGES {
-            for clients in PAGE_CLIENTS {
-                steps.push(Step::measured(
-                    &format!("{residence}-{page}-page-c{clients}"),
-                    json!({ "residence": residence, "page": page, "clients": clients, WINDOW_SECONDS: WINDOW }),
-                ));
-            }
-        }
-        for query in QUERIES {
-            steps.push(Step::measured(
-                &format!("{residence}-{query}-c1"),
-                json!({ "residence": residence, "query": query, "clients": 1, WINDOW_SECONDS: WINDOW }),
+    for page in PAGES {
+        metrics.extend(Metric::diagnostic(
+            &observation("page", page),
+            &format!("client: one {page} page from its first statement sent to its last answer checked, late pages included; a percentile under its sample floor is inconclusive"),
+        ));
+    }
+    for statement in catalog.iter().flat_map(|catalog| &catalog.queries) {
+        if PAGES.contains(&statement.family.as_str()) {
+            metrics.extend(Metric::diagnostic(
+                &observation("statement", &statement.id),
+                &format!("client: one `{}` from sent to its terminal, inside its page and overlapping its siblings; a percentile under its sample floor is inconclusive", statement.id),
             ));
         }
     }
-    let ids: Vec<String> = steps.iter().map(|step| step.id.clone()).collect();
-    let timing = base.timing;
-    base.timing.budget_seconds = SETUP_SECONDS
-        + ids.len() as u64 * (timing.warmup_seconds + u64::from(timing.repetitions) * WINDOW);
-    base.steps = steps;
+    base.metrics = metrics;
+    base.steps = RESIDENCES
+        .into_iter()
+        .flat_map(|residence| {
+            CLIENTS.map(|clients| {
+                Step::measured(
+                    &format!("{residence}-ui-c{clients}"),
+                    json!({ "residence": residence, "clients": clients }),
+                )
+            })
+        })
+        .collect();
+    let ids: Vec<String> = base.steps.iter().map(|step| step.id.clone()).collect();
     base.criteria = vec![
         Criterion::every("no-errors", "errors", &ids, Op::Le, 0.0),
         Criterion::every("exact-answers", "wrong_results", &ids, Op::Le, 0.0),

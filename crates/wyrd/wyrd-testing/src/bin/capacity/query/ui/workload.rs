@@ -8,22 +8,24 @@
 //! query is checked against its reference.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use num_traits::ToPrimitive;
 use tokio::task::JoinSet;
+use wyrd_benchmark::Distribution;
 use wyrd_client::Bifrost;
 use wyrd_spec::vala::api::{BifrostQueryRequest, QueryParam, QueryTerminalOutcome};
 use wyrd_testing::capacity::{Expected, Population, Window};
-use wyrd_testing::experiment::{ExperimentError, Phase, Reading, Repetition, Step, Workload};
+use wyrd_testing::experiment::{
+    DIAGNOSTIC, ExperimentError, Phase, Reading, Repetition, Step, Validity, Workload,
+};
 use wyrd_testing::release_server::{LocalServer, PEAK_SAMPLE_INTERVAL_MS};
 
 use super::answer::Answer;
 use super::fixture::Journey;
-use super::{CASE, Catalog, RESIDENCES, Statement, param};
+use super::{CASE, Catalog, PAGES, RESIDENCES, Statement, observation, param};
 use crate::query::isolated::SUCCESS;
 use crate::query::run::{self, Admission, Outcome, Sender, WRONG_RESULT, micros};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -57,6 +59,8 @@ pub struct Ui {
     queries: Option<Arc<Bifrost>>,
     /// Every statement, bound and answered, once prepared.
     bound: Arc<Vec<Bound>>,
+    /// Each of [`PAGES`]' statements, as indices into `bound`.
+    pages: Arc<[Vec<usize>; 4]>,
     /// The residence the rows are in.
     placed: &'static str,
     /// Milliseconds of the first statement after the last placement.
@@ -73,6 +77,7 @@ impl Ui {
             server: None,
             queries: None,
             bound: Arc::new(Vec::new()),
+            pages: Arc::default(),
             placed: RESIDENCES[0],
             first_ms: 0.0,
         }
@@ -168,20 +173,6 @@ impl Ui {
             ("bifrost.metrics.points", self.journey.point_rows()),
         ]
     }
-
-    /// The statements one step runs: a page's family, or one query.
-    fn selected(&self, step: &Step) -> Vec<Bound> {
-        let page = step.text("page");
-        let query = step.text("query");
-        self.bound
-            .iter()
-            .filter(|bound| {
-                page.is_some_and(|page| bound.statement.family == page)
-                    || query.is_some_and(|query| bound.statement.id == query)
-            })
-            .cloned()
-            .collect()
-    }
 }
 
 /// The rows in `table`'s published Parquet files under `server`'s store,
@@ -253,46 +244,57 @@ pub async fn ask(
     Ok((answer, first))
 }
 
-/// Runs `bundle` once as its page does: the independent statements
-/// concurrently, then those taking their results, each checked against its
-/// reference, each in its own task under `admission`'s labels, which a
-/// spawned task does not inherit; counts every statement the server
-/// answered in `answered`.
+/// Runs `page`, indices into `bound`, once as the page does: the
+/// independent statements concurrently, then those taking their results,
+/// each checked against its reference, each in its own task under
+/// `admission`'s labels, which a spawned task does not inherit. Counts every
+/// statement the server answered in `answered` and adds each one's
+/// nanoseconds from sent to terminal to its entry of `statements`.
 ///
 /// # Errors
 ///
 /// Returns the first failure's code, or [`WRONG_RESULT`].
 async fn bundle(
     queries: &Arc<Bifrost>,
-    bundle: &Arc<Vec<Bound>>,
+    bound: &Arc<Vec<Bound>>,
+    page: &[usize],
     answered: &AtomicU64,
     admission: Admission,
+    statements: &mut [Vec<u64>],
 ) -> Result<(), String> {
     for dependent in [false, true] {
         let mut asked = JoinSet::new();
-        for (index, bound) in bundle.iter().enumerate() {
-            if bound.statement.depends_on.is_empty() == dependent {
+        for &index in page {
+            if bound[index].statement.depends_on.is_empty() == dependent {
                 continue;
             }
-            let (queries, bundle) = (Arc::clone(queries), Arc::clone(bundle));
+            let (queries, bound) = (Arc::clone(queries), Arc::clone(bound));
             asked.spawn(async move {
-                let bound = &bundle[index];
-                admission
+                let bound = &bound[index];
+                let sent = Instant::now();
+                let outcome = admission
                     .labelled(ask(&queries, &bound.statement.sql, &bound.params))
                     .await
                     .map(|(answer, _)| {
                         answer
                             .matches(&bound.expected, bound.statement.order())
                             .is_ok()
-                    })
+                    });
+                (index, nanos(sent), outcome)
             });
         }
         let mut failure = None;
         while let Some(joined) = asked.join_next().await {
-            let outcome = joined.unwrap_or_else(|_| Err("panicked".to_owned()));
-            if outcome.is_ok() {
-                answered.fetch_add(1, Ordering::Relaxed);
-            }
+            let outcome = match joined {
+                Ok((index, elapsed, outcome)) => {
+                    if outcome.is_ok() {
+                        answered.fetch_add(1, Ordering::Relaxed);
+                        statements[index].push(elapsed);
+                    }
+                    outcome
+                }
+                Err(_) => Err("panicked".to_owned()),
+            };
             match outcome {
                 Ok(true) => {}
                 Ok(false) => {
@@ -308,6 +310,56 @@ async fn bundle(
         }
     }
     Ok(())
+}
+
+/// Nanoseconds since `sent`.
+fn nanos(sent: Instant) -> u64 {
+    u64::try_from(sent.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Client nanoseconds of one step's pages and statements, every client's
+/// merged.
+#[derive(Debug, Default)]
+struct Latencies {
+    /// Each of [`PAGES`]' complete pages.
+    pages: [Vec<u64>; 4],
+    /// Each bound statement's answers, by its index.
+    statements: Vec<Vec<u64>>,
+}
+
+impl Latencies {
+    /// Adds one client's samples.
+    fn merge(&mut self, other: Self) {
+        for (all, more) in self.pages.iter_mut().zip(other.pages) {
+            all.extend(more);
+        }
+        self.statements
+            .resize_with(other.statements.len(), Vec::new);
+        for (all, more) in self.statements.iter_mut().zip(other.statements) {
+            all.extend(more);
+        }
+    }
+}
+
+/// Sets diagnostic `observation`'s readings from `samples` nanoseconds,
+/// with each percentile whose samples are under `validity`'s floor for it
+/// replaced by an inconclusive reading that names the shortfall.
+fn diagnose(repetition: &mut Repetition, observation: &str, samples: &[u64], validity: &Validity) {
+    repetition.diagnose(observation, Distribution::of_durations(samples), false);
+    let count = samples.len() as u64;
+    for (stat, floor) in [
+        ("p95_us", validity.p95_samples),
+        ("p99_us", validity.p99_samples),
+    ] {
+        if count < floor {
+            repetition.set(
+                &format!("{DIAGNOSTIC}{observation}.{stat}"),
+                Reading::missing(format!(
+                    "inconclusive: {count} samples, under the {floor}-sample floor"
+                )),
+            );
+        }
+    }
 }
 
 /// The resolved binds of `statement`: its catalog binds, with every
@@ -455,6 +507,11 @@ impl Workload for Ui {
                 failed.join(", ")
             )));
         }
+        self.pages = Arc::new(PAGES.map(|page| {
+            (0..bound.len())
+                .filter(|index| bound[*index].statement.family == page)
+                .collect()
+        }));
         self.bound = Arc::new(bound);
         self.queries = Some(queries);
         Ok(())
@@ -473,9 +530,11 @@ impl Workload for Ui {
         self.server.as_ref().map(LocalServer::heap_profile_url)
     }
 
-    /// Runs one closed-loop window of `step`'s page or query in its
-    /// residence, placing the rows there first, outside every window, when
-    /// the residence changes.
+    /// Runs one closed-loop window of `step`'s clients in its residence,
+    /// each cycling through every page from its own offset, placing the
+    /// rows there first, outside every window, when the residence changes;
+    /// reads the pooled server and client latency and each page's and page
+    /// statement's client latency.
     ///
     /// # Errors
     ///
@@ -502,13 +561,6 @@ impl Workload for Ui {
             .ok_or_else(|| {
                 ExperimentError::workload(format!("step {} declares no clients", step.id))
             })?;
-        let selected = Arc::new(self.selected(step));
-        if selected.is_empty() {
-            return Err(ExperimentError::workload(format!(
-                "step {} selects no statement",
-                step.id
-            )));
-        }
         let (server, queries) = self.prepared()?;
         let timings = server.timings().await.map_err(ExperimentError::workload)?;
         let (opened, _) = Window::open(server)
@@ -517,23 +569,49 @@ impl Workload for Ui {
         let stop = Instant::now() + window;
         let admission = Admission::measured(stop, (CASE, phase.label()));
         let answered = Arc::new(AtomicU64::new(0));
+        let latencies = Arc::new(Mutex::new(Latencies::default()));
         let work = async {
             let mut tasks = JoinSet::new();
-            for _ in 0..clients {
-                let (queries, selected, answered) = (
+            for client in 0..clients {
+                let (queries, bound, pages, answered, latencies) = (
                     Arc::clone(&queries),
-                    Arc::clone(&selected),
+                    Arc::clone(&self.bound),
+                    Arc::clone(&self.pages),
                     Arc::clone(&answered),
+                    Arc::clone(&latencies),
                 );
                 tasks.spawn(async move {
                     let mut outcome = Outcome::default();
-                    while admission.open() {
+                    let mut own = Latencies {
+                        statements: vec![Vec::new(); bound.len()],
+                        ..Latencies::default()
+                    };
+                    for page in (client..).map(|turn| turn % PAGES.len()) {
+                        if !admission.open() {
+                            break;
+                        }
                         let sent = Instant::now();
-                        match bundle(&queries, &selected, &answered, admission).await {
-                            Ok(()) => outcome.succeeded(&admission, sent, 0, 0),
+                        match bundle(
+                            &queries,
+                            &bound,
+                            &pages[page],
+                            &answered,
+                            admission,
+                            &mut own.statements,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                own.pages[page].push(nanos(sent));
+                                outcome.succeeded(&admission, sent, 0, 0);
+                            }
                             Err(code) => *outcome.errors.entry(code).or_default() += 1,
                         }
                     }
+                    latencies
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .merge(own);
                     outcome
                 });
             }
@@ -579,10 +657,7 @@ impl Workload for Ui {
         repetition.set("late_requests", Reading::count(outcome.late));
         repetition.set("errors", Reading::count(outcome.error_count()));
         repetition.set("wrong_results", Reading::count(wrong));
-        repetition.set(
-            "queries",
-            Reading::count(pages * selected.len().to_u64().unwrap_or(0)),
-        );
+        repetition.set("queries", Reading::count(answered.load(Ordering::Relaxed)));
         for (id, q) in [
             ("client_p50_ms", 0.5),
             ("client_p95_ms", 0.95),
@@ -591,6 +666,31 @@ impl Workload for Ui {
             repetition.set(id, Reading::percentile(&outcome.latencies_us, q, 1e3));
         }
         repetition.set("first_request_ms", Reading::exact(self.first_ms));
+        let latencies = std::mem::take(
+            &mut *latencies
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let validity = Validity::default();
+        for (page, samples) in PAGES.iter().zip(&latencies.pages) {
+            diagnose(
+                &mut repetition,
+                &observation("page", page),
+                samples,
+                &validity,
+            );
+        }
+        for index in self.pages.iter().flatten() {
+            diagnose(
+                &mut repetition,
+                &observation("statement", &self.bound[*index].statement.id),
+                latencies
+                    .statements
+                    .get(*index)
+                    .map_or(&[][..], Vec::as_slice),
+                &validity,
+            );
+        }
         let [rows, bytes] = population.scanned_per_query(SUCCESS);
         repetition.set("scanned_rows_per_query", rows);
         repetition.set("scanned_bytes_per_query", bytes);
@@ -613,5 +713,40 @@ impl Workload for Ui {
             .await
             .map(|_| ())
             .map_err(ExperimentError::workload)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use wyrd_testing::experiment::{Repetition, Validity};
+
+    /// A page or statement percentile under its sample floor is
+    /// inconclusive, never a number, while its count and median stay.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a short percentile reads as a value.
+    #[test]
+    fn short_percentiles_are_inconclusive() {
+        let validity = Validity::default();
+        let mut repetition = Repetition::default();
+        super::diagnose(&mut repetition, "page.logs", &[1_000_000; 199], &validity);
+        let reading = |stat: &str| repetition.reading(&format!("diagnostic.page.logs.{stat}"));
+        assert_eq!(reading("count").value, Some(199.0));
+        assert!(reading("p50_us").value.is_some());
+        let p95 = reading("p95_us");
+        assert_eq!(p95.value, None);
+        assert_eq!(
+            p95.reason.as_deref(),
+            Some("inconclusive: 199 samples, under the 200-sample floor")
+        );
+        let mut repetition = Repetition::default();
+        super::diagnose(&mut repetition, "page.logs", &[1_000_000; 200], &validity);
+        let reading = |stat: &str| repetition.reading(&format!("diagnostic.page.logs.{stat}"));
+        assert!(reading("p95_us").value.is_some());
+        assert_eq!(
+            reading("p99_us").reason.as_deref(),
+            Some("inconclusive: 200 samples, under the 1000-sample floor")
+        );
     }
 }

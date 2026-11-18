@@ -539,7 +539,7 @@ spec:
 spec:
   provider: ProviderName
   model: string
-  format: chat_completion | responses | messages | generate_content | system_one
+  format: chat_completion | responses | messages | generate_content | system_one | decisions
   body: { ... }                    # that protocol's request body, extension options preserved
   response_format?: verdict | { kind: verdict, data?: JsonSchema } | code_review
 ```
@@ -557,8 +557,8 @@ validation is Wyrd's either way. A `data` schema is JSON Schema
 resource so its local references resolve as they do standalone. The card keeps and hashes the
 authored form, never the expanded provider settings. On a native body the
 named format is lowered into that protocol's structured-output settings; a
-body that also sets its own response settings, or a `system_one` body, is
-refused. Skald owns the
+body that also sets its own response settings, or a `system_one` or `decisions`
+body, is refused. Skald owns the
 compiler but no format names: Wyrd resolves `verdict` and `code_review` when
 it compiles a Prompt, and an unresolved named format cannot render.
 
@@ -577,6 +577,17 @@ custom name is an OpenAI-compatible Chat provider. It never names a gateway
 deployment: the Agent's `execution_route` chooses where the call executes.
 An Agent's inline Prompt takes the same two forms and declares as the
 Agent's own `<agent-name>-prompt` Prompt Card (doctrine 17).
+
+Native decision Prompts use `provider: jev, format: system_one` with shared
+`state` and keyed `questions`, or `provider: google, format: decisions` with
+shared `input` and keyed `questions`. Existing placeholder/media binding renders
+these typed native bodies. Text placeholders preserve strings verbatim and
+serialize other JSON context as JSON text. Jev state remains a string. Google Decisions admits its native text,
+Content and Content-array inputs, including media. These fixed-contract calls
+execute once without streaming or a tool loop; unsupported generation settings
+and incompatible providers are refused before invocation. The gateway's
+`decisions` operation/capability serves `/v1/decisions` and forwards through
+Google's existing auth and transport owners to `/v1beta/decisions`.
 
 ### Agent
 Agent contract: prompt + tools + run config. Tool names resolve through the
@@ -1646,9 +1657,23 @@ aggregation are unchanged.
 |---|---|
 | `assert` | A typed comparison operator over `path`, or every element of an `each` selector |
 | `trace` | Span existence, order, and attributes over a `trace` slot |
-| `agent` | An Agent, with its declared tools and optional `workspace` as in a step, returning the closed Verdict schema `{outcome, reason, citations}` its Prompt declares, plus `data` when that format declares it |
+| `agent` | An Agent returning the closed Verdict schema `{outcome, reason, citations}` its Prompt declares, plus declared `data`; alternatively, an explicit `verdict_transform` converts a supported fixed native decision response to that Verdict. Tools and optional `workspace` remain subject to the selected provider contract |
 | `code` | Sandboxed Python returning the same Verdict schema; an optional `response_format` on the check declares its `data` |
 | `drift` | The existing PSI, SPC, or Custom decision over one `samples` slot, with full statistical detail |
+
+`verdict_transform` belongs only to Agent checks and is part of the versioned
+Verifier. It explicitly selects question keys and declares Choice outcome
+mapping, Noul probability thresholds/polarity, or a scalar Score comparison.
+A flat, nonempty `all` combines unique selected questions from one invocation:
+failure wins, then inconclusive, then pass. Every selected answer is validated;
+an invalid selected answer follows the existing check-error path even when
+another answer fails. Unselected answers do not affect the judgment. Skald owns
+native decoding; Vala applies the policy in memory, without another model call
+or IO. Generated reasons state the observed answer and policy, citations may be
+empty, and confidence never implicitly overrides policy. Selected native
+answers and aggregate question outcomes use the existing captured `actual`
+field, context-capture controls, provenance and asynchronous result recording.
+Omitting the transform preserves the direct-Verdict check contract.
 
 An `approval` step (`action: {kind: approval, message}`) makes its Verifier
 queued-only. Each time the step is reached, including each fanout item and
@@ -3068,15 +3093,20 @@ original Prompt (`openai_chat` in Rust, `Prompt.openai_chat` in Python,
 `Prompt.openaiChat` in TypeScript) at an Agent's `prompt`, and in Python
 `ComparisonOperator`, `ExecutionRoute`, and `AgentRunConfig`; the Prompt's
 `ResponseFormat.verdict(data=...)` extends the canonical Verdict with typed
-`data`. Authoring converts these to the canonical form and adds no validation
-of its own. A setter consumes the value and replaces its whole field, together
+`data`. Authoring converts these to the canonical form and adds no independent
+validation rules. A setter consumes the value and replaces its whole field, together
 with everything that field referenced; an `add_*` method appends one entry in
 place. A Service binds each Component's own Verifiers through
 `Component::verified_by`; Model verification belongs on its Component.
 
-Construction and editing do no domain validation, file reads, or network IO,
-so incomplete values and forward references are allowed. An attempted
-duplicate add is kept, not dropped, and refused when validated. A Card value
+Except for typed decision values, construction and editing do no domain
+validation, file reads, or network IO, so incomplete values and forward references
+are allowed. Typed decision-question and verdict-transform values validate their
+fields and self-contained constraints at construction through their shared owners. The assembled graph's `validate()`
+checks locally resolvable question selection, transform compatibility, Choice
+coverage and duplicate selections; unresolved registered references are validated
+authoritatively at registration. Cross-object checks do not run after each edit.
+An attempted duplicate add is kept, not dropped, and refused when validated. A Card value
 at a reference position contributes a sibling definition, captured by value,
 whose sibling reference carries the Card's version only when it has one; an
 exact `CardRef` stays an external reference. A local Artifact is referenced

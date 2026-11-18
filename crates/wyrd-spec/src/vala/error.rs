@@ -616,7 +616,7 @@ pub enum BifrostError {
         code = "WYRD_VALA_400_QUERY_INVALID_SQL",
         status = 400,
         title = "Invalid or unsupported query SQL",
-        remediation = "Submit a single SELECT statement; DDL/DML and unsupported constructs are rejected."
+        remediation = "Submit a single SELECT statement, or one EXPLAIN [ANALYZE] of it; DDL/DML and unsupported constructs are rejected."
     )]
     QueryInvalidSql {
         /// Human-readable parse/validation detail.

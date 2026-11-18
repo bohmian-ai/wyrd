@@ -5937,7 +5937,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_VALA_400_INGEST_PROTO` | 400 | Invalid ingest request | Fix the ingest request fields and retry with a valid Wyrd ingest payload. |
 | `WYRD_VALA_400_OTLP_REQUEST_MALFORMED` | 400 | OTLP request body malformed | The OTLP request body could not be decoded. Verify the Content-Type matches the encoding (application/x-protobuf or application/json) and that the payload is a valid OTLP ExportRequest. |
 | `WYRD_VALA_400_PAGE_TOKEN_INVALID` | 400 | Page token invalid | Restart the query from page 1 without a page_token. |
-| `WYRD_VALA_400_QUERY_INVALID_SQL` | 400 | Invalid or unsupported query SQL | Submit a single SELECT statement; DDL/DML and unsupported constructs are rejected. |
+| `WYRD_VALA_400_QUERY_INVALID_SQL` | 400 | Invalid or unsupported query SQL | Submit a single SELECT statement, or one EXPLAIN [ANALYZE] of it; DDL/DML and unsupported constructs are rejected. |
 | `WYRD_VALA_400_SCHEMA_PARSE` | 400 | Bifrost schema parse failed | Correct the column type or the row value so it satisfies the table's declared DataTypeSpec; declare a Variant field for open data. |
 | `WYRD_VALA_400_VARIANT_INVALID_JSON` | 400 | Invalid Variant JSON | Supply valid JSON text or a valid arrow.parquet.variant value for the Variant field; use try_parse_json in SQL to map invalid text to null. |
 | `WYRD_VALA_400_VARIANT_NUMERIC_OUT_OF_RANGE` | 400 | Variant numeric value out of range | Send integers within the signed 64-bit or Variant decimal range, or send the number as a string. |

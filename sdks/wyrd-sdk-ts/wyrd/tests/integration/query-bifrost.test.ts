@@ -103,6 +103,34 @@ test("stream yields arrow batches and a terminal", async ({ bifrost }) => {
   expect(stream.terminal).toMatchObject({ outcome: "success", row_count: 3, warnings: [] });
 });
 
+test("explain returns plans and analyze executes the select", async ({ bifrost }) => {
+  const select = `SELECT id FROM ${QUERY_ROWS} WHERE id >= $1 ORDER BY id`;
+  const plans = async (sql: string): Promise<[unknown, unknown][]> => {
+    const stream = await bifrost.stream(sql, [2]);
+    const rows: [unknown, unknown][] = [];
+    for await (const batch of stream) {
+      const kinds = batch.getChild("plan_type")?.toArray() ?? [];
+      const texts = batch.getChild("plan")?.toArray() ?? [];
+      for (const [index, kind] of Array.from(kinds).entries()) {
+        rows.push([kind, texts[index]]);
+      }
+    }
+    expect(stream.terminal).toMatchObject({ outcome: "success" });
+    return rows;
+  };
+
+  const explained = await plans(`EXPLAIN ${select}`);
+  const analyzed = await plans(`EXPLAIN ANALYZE ${select}`);
+
+  expect(explained.map(([kind]) => kind)).toEqual(["logical_plan", "physical_plan"]);
+  expect(explained[0]?.[1]).toContain(QUERY_ROWS);
+  expect(analyzed.map(([kind]) => kind)).toEqual(["Plan with Metrics"]);
+  expect(analyzed[0]?.[1]).toContain("output_rows=2");
+  await expect(bifrost.sql(`EXPLAIN DELETE FROM ${QUERY_ROWS}`)).rejects.toMatchObject({
+    code: "WYRD_VALA_400_QUERY_INVALID_SQL",
+  });
+});
+
 test("caller without bifrost read is refused", async ({ server }) => {
   const denied = await Bifrost.connect({
     client: WyrdClient.connect({ credential: server.scopedApiKey("query_denied", ["cards:read"]) }),

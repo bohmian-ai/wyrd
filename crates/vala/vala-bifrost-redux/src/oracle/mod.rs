@@ -1011,6 +1011,9 @@ struct RetainedPhysicalPlan {
     config: SessionConfig,
     /// The single physical root this query executes.
     root: Arc<dyn ExecutionPlan>,
+    /// Whether the request is `EXPLAIN ANALYZE`: the root is executed and
+    /// returned annotated with its metrics instead of its rows.
+    analyze: bool,
     /// Whether live-stream listing failed for a table before planning.
     live_listing_lost: bool,
 }
@@ -2291,7 +2294,12 @@ impl Oracle {
             running_query,
             profile,
         } = input;
-        let RetainedPhysicalPlan { config, root, .. } = retained;
+        let RetainedPhysicalPlan {
+            config,
+            root,
+            analyze,
+            ..
+        } = retained;
         // Process pressure pauses the query before it executes; it then
         // runs as Bifrost work of its tenant on the shared CPU lanes.
         let workloads = self.resources.workloads();
@@ -2315,10 +2323,10 @@ impl Oracle {
                 admitted.retain_root(&root, profile);
                 let task = admitted.execution_task(config)?;
                 let scan_stats = OracleQueryScanStats::from_plan(root.as_ref());
-                let schema = root.schema();
+                let schema = Explanation::schema(&root, analyze);
                 let batches = laned_execution(lanes, operation, || {
-                    let batches =
-                        execute_stream(root, task).map_err(|error| map_datafusion_error(&error))?;
+                    let batches = Explanation::execute(&root, analyze, task)
+                        .map_err(|error| map_datafusion_error(&error))?;
                     Ok(self.audit_tenant_refusal(context, batches))
                 })
                 .await?;
@@ -2355,9 +2363,9 @@ impl Oracle {
             ownership.publish_participants().await?;
         }
         let mut scan_stats = OracleQueryScanStats::from_plan(root.as_ref());
-        let schema = root.schema();
+        let schema = Explanation::schema(&root, analyze);
         let batches = laned_execution(lanes, operation, || {
-            let batches = execute_stream(Arc::clone(&root), leader.task_ctx())
+            let batches = Explanation::execute(&root, analyze, leader.task_ctx())
                 .map_err(|error| map_datafusion_error(&error))?;
             Ok(self.audit_tenant_refusal(context, batches))
         })
@@ -2977,9 +2985,14 @@ impl Oracle {
             .await?
             .map_err(|error| map_query_planning_error(&error))?;
         physical_planning.done();
+        let explanation = Explanation::of(&planned.statement);
         Ok(Some(RetainedPhysicalPlan {
             config: planning.copied_config(),
-            root,
+            root: match explanation {
+                Some(Explanation::Plan) => Explanation::plan_root(&logical, root.as_ref()),
+                _ => root,
+            },
+            analyze: explanation == Some(Explanation::Analyze),
             live_listing_lost: live.listing_lost,
         }))
     }
@@ -3230,7 +3243,7 @@ impl Oracle {
     ) -> Result<datafusion::logical_expr::LogicalPlan, OracleExecutionError> {
         let plan = session
             .state()
-            .statement_to_plan(statement.clone())
+            .statement_to_plan(explained_select(statement).clone())
             .await
             .map_err(|error| map_sql_planning_error(&error))?;
         let frame = session
@@ -3464,17 +3477,31 @@ fn parse_select(sql: &str) -> Result<(DfStatement, Vec<TableRef>), BifrostError>
         .ok_or_else(|| BifrostError::QueryInvalidSql {
             detail: "exactly one SELECT statement is required".to_owned(),
         })?;
-    if !matches!(&statement, DfStatement::Statement(inner) if matches!(**inner, SqlStatement::Query(_)))
+    if let DfStatement::Explain(explain) = &statement {
+        let options = &explain.options;
+        if options.verbose
+            || options.format.is_some()
+            || options.analyze_level.is_some()
+            || options.analyze_categories.is_some()
+            || options.show_statistics.is_some()
+        {
+            return Err(BifrostError::QueryInvalidSql {
+                detail: "EXPLAIN accepts only the optional ANALYZE keyword".to_owned(),
+            });
+        }
+    }
+    let select = explained_select(&statement);
+    if !matches!(select, DfStatement::Statement(inner) if matches!(**inner, SqlStatement::Query(_)))
     {
         return Err(BifrostError::QueryInvalidSql {
-            detail: "only a single SELECT statement is supported".to_owned(),
+            detail: "only a single SELECT statement, or one EXPLAIN [ANALYZE] of it, is supported"
+                .to_owned(),
         });
     }
-    let (relations, _) = resolve_table_references(&statement, true).map_err(|error| {
-        BifrostError::QueryInvalidSql {
+    let (relations, _) =
+        resolve_table_references(select, true).map_err(|error| BifrostError::QueryInvalidSql {
             detail: format!("table reference error: {error}"),
-        }
-    })?;
+        })?;
     if relations.is_empty() {
         return Err(BifrostError::QueryInvalidSql {
             detail: "query must reference at least one Bifrost table".to_owned(),
@@ -3490,6 +3517,170 @@ fn parse_select(sql: &str) -> Result<(DfStatement, Vec<TableRef>), BifrostError>
         })
         .collect::<Result<_, _>>()
         .map(|tables| (statement, tables))
+}
+
+/// How a validated statement explains its SELECT.
+///
+/// Plain explanation returns the optimized logical plan and the physical root
+/// the SELECT would run, without executing it. Analysis executes that root
+/// through the SELECT's own selected path and returns it with its metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Explanation {
+    /// `EXPLAIN SELECT ...`.
+    Plan,
+    /// `EXPLAIN ANALYZE SELECT ...`.
+    Analyze,
+}
+
+impl Explanation {
+    /// Builds the root a plain explanation executes in place of `root`: one
+    /// row each for the optimized logical plan and the physical root the
+    /// SELECT selected, in `DataFusion`'s `plan_type`/`plan` shape. It reads
+    /// no data.
+    fn plan_root(
+        logical: &datafusion::logical_expr::LogicalPlan,
+        root: &dyn ExecutionPlan,
+    ) -> Arc<dyn ExecutionPlan> {
+        use datafusion::common::display::{PlanType, StringifiedPlan, ToStringifiedPlan as _};
+        let physical = redact_locators(
+            &datafusion::physical_plan::displayable(root)
+                .indent(false)
+                .to_string(),
+        );
+        Arc::new(datafusion::physical_plan::explain::ExplainExec::new(
+            datafusion::logical_expr::LogicalPlan::explain_schema(),
+            vec![
+                logical.to_stringified(PlanType::FinalLogicalPlan),
+                StringifiedPlan::new(PlanType::FinalPhysicalPlan, physical),
+            ],
+            false,
+        ))
+    }
+
+    /// Executes the root that answers the request: `root` itself, or, for
+    /// analysis, `root` run to completion and returned as its plan annotated
+    /// with the operator metrics it recorded, object locators redacted.
+    ///
+    /// Analysis wraps the root only after classification and admission, so the
+    /// analyzed SELECT runs on exactly the class and session it selected.
+    ///
+    /// # Errors
+    ///
+    /// Returns the `DataFusion` error the root fails to start with.
+    fn execute(
+        root: &Arc<dyn ExecutionPlan>,
+        analyze: bool,
+        task: Arc<datafusion::execution::TaskContext>,
+    ) -> datafusion::error::Result<SendableRecordBatchStream> {
+        if !analyze {
+            return execute_stream(Arc::clone(root), task);
+        }
+        let analyzed = execute_stream(
+            Arc::new(
+                datafusion::physical_plan::analyze::AnalyzeExec::builder(
+                    false,
+                    false,
+                    Arc::clone(root),
+                    datafusion::logical_expr::LogicalPlan::explain_schema(),
+                )
+                .build(),
+            ),
+            task,
+        )?;
+        let schema = analyzed.schema();
+        Ok(Box::pin(
+            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                schema,
+                analyzed.map(|batch| batch.and_then(Self::redact_batch)),
+            ),
+        ))
+    }
+
+    /// Returns the output schema of [`Self::execute`] for `root`.
+    fn schema(root: &Arc<dyn ExecutionPlan>, analyze: bool) -> SchemaRef {
+        if analyze {
+            datafusion::logical_expr::LogicalPlan::explain_schema()
+        } else {
+            root.schema()
+        }
+    }
+
+    /// Redacts the `plan` column of one `plan_type`/`plan` batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an internal error when the batch is not that shape.
+    fn redact_batch(
+        batch: datafusion::arrow::record_batch::RecordBatch,
+    ) -> datafusion::error::Result<datafusion::arrow::record_batch::RecordBatch> {
+        use datafusion::arrow::array::{Array as _, ArrayRef, StringArray};
+        let plans = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| datafusion::error::DataFusionError::Internal("plan text".to_owned()))?;
+        let redacted: ArrayRef = Arc::new(
+            (0..plans.len())
+                .map(|row| (!plans.is_null(row)).then(|| redact_locators(plans.value(row))))
+                .collect::<StringArray>(),
+        );
+        Ok(datafusion::arrow::record_batch::RecordBatch::try_new(
+            batch.schema(),
+            vec![Arc::clone(batch.column(0)), redacted],
+        )?)
+    }
+
+    /// Returns the explanation `statement` requests, or `None` for a SELECT.
+    fn of(statement: &DfStatement) -> Option<Self> {
+        match statement {
+            DfStatement::Explain(explain) if explain.options.analyze => Some(Self::Analyze),
+            DfStatement::Explain(_) => Some(Self::Plan),
+            _ => None,
+        }
+    }
+}
+
+/// Replaces every `file_groups={N groups: [...]}` listing in plan text with
+/// `file_groups={N groups}`.
+///
+/// The listing names tenant object keys, which are storage layout rather than
+/// query structure; the group count is what a reader needs. An unterminated
+/// listing drops the rest of the text rather than reveal it.
+fn redact_locators(plan: &str) -> String {
+    const LISTING: &str = "file_groups={";
+    let mut redacted = String::with_capacity(plan.len());
+    let mut rest = plan;
+    while let Some(start) = rest.find(LISTING) {
+        let body = start + LISTING.len();
+        redacted.push_str(&rest[..body]);
+        let tail = &rest[body..];
+        let mut depth = 1_usize;
+        let end = tail.char_indices().find_map(|(index, character)| {
+            match character {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+            (depth == 0).then_some(index)
+        });
+        let Some(end) = end else {
+            redacted.push('}');
+            return redacted;
+        };
+        redacted.push_str(tail[..end].split(':').next().unwrap_or_default().trim());
+        redacted.push('}');
+        rest = &tail[end + 1..];
+    }
+    redacted.push_str(rest);
+    redacted
+}
+
+/// Returns the SELECT a validated statement reads: itself, or the one it explains.
+fn explained_select(statement: &DfStatement) -> &DfStatement {
+    match statement {
+        DfStatement::Explain(explain) => &explain.statement,
+        select => select,
+    }
 }
 
 /// Computes a stable scrubbed digest from whitespace-normalized SQL or plan text.
@@ -5249,6 +5440,73 @@ mod tests {
             };
             assert!(planner.validate_query(&request).is_err());
         }
+    }
+
+    /// One plain or analyzed explanation of one SELECT is accepted with the
+    /// SELECT's own tables, and every other explanation is invalid SQL.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an explained SELECT is refused, its tables differ from the
+    /// SELECT's, or an unsupported explanation is accepted or refused with
+    /// another error.
+    #[test]
+    fn query_floor_accepts_one_explained_select() {
+        let select = "WITH recent AS (SELECT * FROM bifrost.bifrost.spans) \
+                      SELECT * FROM recent JOIN bifrost.bifrost.observations o ON true \
+                      WHERE o.name = $1";
+        let (_, expected) = parse_select(select).expect("SELECT validates");
+        for (sql, mode) in [
+            (format!("EXPLAIN {select}"), Some(Explanation::Plan)),
+            (
+                format!("explain analyze {select}"),
+                Some(Explanation::Analyze),
+            ),
+            (select.to_owned(), None),
+        ] {
+            let (statement, tables) = parse_select(&sql).unwrap_or_else(|error| {
+                panic!("{sql} must validate: {error}");
+            });
+            assert_eq!(tables, expected, "{sql} reads the SELECT's tables");
+            assert_eq!(Explanation::of(&statement), mode, "{sql}");
+        }
+        for sql in [
+            "EXPLAIN VERBOSE SELECT * FROM bifrost.bifrost.spans",
+            "EXPLAIN ANALYZE VERBOSE SELECT * FROM bifrost.bifrost.spans",
+            "EXPLAIN FORMAT TREE SELECT * FROM bifrost.bifrost.spans",
+            "EXPLAIN EXPLAIN SELECT * FROM bifrost.bifrost.spans",
+            "EXPLAIN UPDATE bifrost.bifrost.spans SET name = 'x'",
+            "EXPLAIN DELETE FROM bifrost.bifrost.spans",
+            "EXPLAIN CREATE TABLE bifrost.bifrost.t (n INT)",
+            "EXPLAIN SELECT 1",
+            "EXPLAIN SELECT * FROM bifrost.bifrost.spans; SELECT 1",
+        ] {
+            assert!(
+                matches!(parse_select(sql), Err(BifrostError::QueryInvalidSql { .. })),
+                "{sql} must be invalid SQL"
+            );
+        }
+    }
+
+    /// Plan text keeps each file listing's group count and drops its object keys.
+    #[test]
+    fn explained_plans_redact_object_locators() {
+        let plan = "DataSourceExec: file_groups={2 groups: [[tenants/t/a.parquet], \
+                    [tenants/t/b.parquet:0..10]]}, projection=[id]\n  \
+                    DataSourceExec: file_groups={1 group: [[tenants/t/c.parquet]]}";
+        assert_eq!(
+            redact_locators(plan),
+            "DataSourceExec: file_groups={2 groups}, projection=[id]\n  \
+             DataSourceExec: file_groups={1 group}"
+        );
+        assert_eq!(
+            redact_locators("x file_groups={1 group: [[tenants/t/c"),
+            "x file_groups={}"
+        );
+        assert_eq!(
+            redact_locators("ProjectionExec: expr=[id]"),
+            "ProjectionExec: expr=[id]"
+        );
     }
 
     /// The SQL parser accepts a complete query and extracts its canonical tables.

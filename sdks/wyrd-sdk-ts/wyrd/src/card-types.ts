@@ -443,7 +443,7 @@ export interface BifrostQueryRequest {
    */
   readonly params?: readonly QueryParam[];
   /**
-   * SELECT-only SQL text.
+   * One SELECT statement, or one `EXPLAIN [ANALYZE]` of it.
    */
   readonly sql: string;
 }

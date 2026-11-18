@@ -1882,7 +1882,7 @@ export interface NativeQueryParam {
 
 /** JavaScript query request projected onto the pure Wyrd contract. */
 export interface NativeQueryRequest {
-  /** SELECT-only SQL text. */
+  /** One SELECT statement, or one `EXPLAIN [ANALYZE]` of it. */
   sql: string
   /**
    * Optional query deadline in milliseconds, valid in `1..=u32::MAX`.

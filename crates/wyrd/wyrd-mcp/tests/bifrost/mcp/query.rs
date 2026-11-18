@@ -493,6 +493,88 @@ mod pg_tests {
         Ok(())
     }
 
+    /// An agent explains a bound read before running it, then analyzes it.
+    ///
+    /// Plain `EXPLAIN` answers with the logical and physical plans without
+    /// executing; `EXPLAIN ANALYZE` executes the same SELECT and answers with
+    /// its plan and operator metrics; an explained mutation stays invalid.
+    ///
+    /// # Errors
+    ///
+    /// Returns fixture, transport, tool-call, or shutdown failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a plan kind, plan text, or refusal code differs.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn agent_explains_and_analyzes_a_bound_read() -> Result<(), McpJourneyError> {
+        let server = WyrdTestServer::start_bound().await?;
+        let fixture = seed_query_fixture(&server, "mcp-explain").await?;
+        let table = &fixture.table;
+        let client = ()
+            .serve_with_lifecycle(
+                transport(
+                    &server,
+                    ResolvedCredential::BearerToken(fixture.token.clone().into()),
+                    None,
+                )?,
+                discover(),
+            )
+            .await?;
+        let select = format!("SELECT id FROM {table} WHERE id >= $1 ORDER BY id");
+
+        let explained = structured(
+            client
+                .call_tool(query(
+                    serde_json::json!({"sql": format!("EXPLAIN {select}"), "params": [2]}),
+                ))
+                .await?,
+        )?;
+        let analyzed = structured(
+            client
+                .call_tool(query(
+                    serde_json::json!({"sql": format!("EXPLAIN ANALYZE {select}"), "params": [2]}),
+                ))
+                .await?,
+        )?;
+
+        assert_eq!(explained["columns"][0]["name"], "plan_type", "{explained}");
+        assert_eq!(explained["columns"][1]["name"], "plan", "{explained}");
+        assert_eq!(explained["rows"][0][0], "logical_plan", "{explained}");
+        assert_eq!(explained["rows"][1][0], "physical_plan", "{explained}");
+        assert!(
+            explained["rows"][0][1]
+                .as_str()
+                .unwrap_or_default()
+                .contains(table.as_str()),
+            "{explained}"
+        );
+        assert_eq!(analyzed["rows"][0][0], "Plan with Metrics", "{analyzed}");
+        assert!(
+            analyzed["rows"][0][1]
+                .as_str()
+                .unwrap_or_default()
+                .contains("output_rows="),
+            "{analyzed}"
+        );
+        let refusal = problem(
+            client
+                .call_tool(query(
+                    serde_json::json!({"sql": format!("EXPLAIN DELETE FROM {table}")}),
+                ))
+                .await?,
+        )?;
+        assert_eq!(
+            refusal["code"], "WYRD_VALA_400_QUERY_INVALID_SQL",
+            "{refusal}"
+        );
+
+        client.cancel().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
     /// A settled Oracle query owns none of the resources it borrowed.
     const RELEASED: BifrostQueryResourceSnapshot = BifrostQueryResourceSnapshot {
         admission_slots: 0,

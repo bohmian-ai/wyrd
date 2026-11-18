@@ -20,7 +20,7 @@ use wyrd_runtime::Permission;
 use wyrd_server::config::ServerTarget;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdProblem;
-use wyrd_spec::vala::api::{BifrostQueryRequest, QueryClass};
+use wyrd_spec::vala::api::{BifrostQueryRequest, QueryClass, QueryParam};
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::canonical_signals::{Cell, Row, attributes, batch, spans};
@@ -1042,6 +1042,252 @@ async fn prove_variant_sql_sessions() -> Result<(), JourneyError> {
 
     cluster.shutdown().await?;
     Ok(())
+}
+
+/// `EXPLAIN` and `EXPLAIN ANALYZE` of real SELECTs go through the public
+/// query operation with the SELECT's own selection and authority.
+///
+/// One peer topology serves a one-object Interactive read and a two-object
+/// grouped read that selects the Analytical graph. Plain explanation returns
+/// the logical and physical plans, including the selected distributed root,
+/// without executing anything: no follower leases a graph, and a statement
+/// that fails at execution still explains. Analysis runs on the SELECT's own
+/// class, executes remote stages for the Analytical read, reports operator
+/// metrics, and fails exactly as the SELECT does. A caller without payload
+/// authority, a mutation, and a nested explanation are refused as they are
+/// for the bare SELECT.
+///
+/// # Panics
+///
+/// Panics when an explanation diverges from that contract.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn explain_reports_the_selected_plan_with_select_authority() {
+    prove_explanations().await.expect("EXPLAIN journey");
+}
+
+/// Drives [`explain_reports_the_selected_plan_with_select_authority`].
+///
+/// # Errors
+///
+/// Returns the first claim that broke.
+async fn prove_explanations() -> Result<(), JourneyError> {
+    let cluster = PeerCluster::start_with_slots(&[
+        (ServerTarget::BifrostQuery, Some(2)),
+        (ServerTarget::BifrostQuery, Some(2)),
+        (ServerTarget::BifrostQuery, Some(2)),
+        (ServerTarget::BifrostIngest, None),
+    ])
+    .await?;
+    let suffix = uuid::Uuid::now_v7().simple();
+    let grouped = format!("explain_grouped_{suffix}");
+    cluster.register_table(PEER_SCRIBE, &grouped).await?;
+    cluster.ingest_rows(PEER_SCRIBE, &grouped, 0, 12, 3).await?;
+    cluster.ingest_rows(PEER_SCRIBE, &grouped, 0, 12, 3).await?;
+    let single = format!("explain_single_{suffix}");
+    cluster.register_table(PEER_SCRIBE, &single).await?;
+    cluster.ingest_rows(PEER_SCRIBE, &single, 0, 12, 3).await?;
+    let coordinator = cluster.server(COORDINATOR)?;
+    coordinator
+        .ensure_builtin_table_for_test(cluster.tenant(), "gateway", "calls")
+        .await?;
+    cluster.refresh_snapshots().await?;
+    let api_key = cluster.provision_public_api_key("explain-caller").await?;
+    let client = public_client(coordinator, &api_key)?;
+
+    // Interactive: a bound CTE read explains on the class the SELECT selects.
+    let interactive = format!(
+        "WITH picked AS (SELECT id, filter_key FROM bifrost.bifrost.{single} WHERE filter_key = $1) \
+         SELECT id FROM picked ORDER BY id"
+    );
+    let bound = [QueryParam::String("group_0".to_owned())];
+    let (path, rows) = run_bound(&client, &interactive, &bound).await?;
+    expect_path("Interactive SELECT", path, QueryClass::Interactive)?;
+    if rows.len() != 4 {
+        return Err(format!("the Interactive SELECT returned {rows:?}").into());
+    }
+    let (path, plans) = run_bound(&client, &format!("EXPLAIN {interactive}"), &bound).await?;
+    expect_path("Interactive EXPLAIN", path, QueryClass::Interactive)?;
+    expect_plan_kinds(
+        "Interactive EXPLAIN",
+        &plans,
+        &["logical_plan", "physical_plan"],
+    )?;
+    if !plans[0][1].contains(&single) || !plans[0][1].contains("group_0") {
+        return Err(format!("the logical plan omits the bound read: {}", plans[0][1]).into());
+    }
+    let (path, analyzed) =
+        run_bound(&client, &format!("EXPLAIN ANALYZE {interactive}"), &bound).await?;
+    expect_path("Interactive EXPLAIN ANALYZE", path, QueryClass::Interactive)?;
+    expect_plan_kinds(
+        "Interactive EXPLAIN ANALYZE",
+        &analyzed,
+        &["Plan with Metrics"],
+    )?;
+    if !analyzed[0][1].contains("output_rows=4") {
+        return Err(format!(
+            "the analyzed plan reports no executed rows: {}",
+            analyzed[0][1]
+        )
+        .into());
+    }
+
+    // Analytical: plain explanation shows the distributed root without
+    // executing it; analysis executes it on the graph.
+    let analytical = format!(
+        "SELECT filter_key, COUNT(*) AS matched FROM bifrost.bifrost.{grouped} \
+         GROUP BY 1 ORDER BY 1"
+    );
+    let (path, _) = run_bound(&client, &analytical, &[]).await?;
+    expect_path("Analytical SELECT", path, QueryClass::Analytical)?;
+    let remote_before = RemoteWork::observe(&cluster)?;
+    let (_, plans) = run_bound(&client, &format!("EXPLAIN {analytical}"), &[]).await?;
+    expect_plan_kinds(
+        "Analytical EXPLAIN",
+        &plans,
+        &["logical_plan", "physical_plan"],
+    )?;
+    if !plans[1][1].contains("DistributedExec") {
+        return Err(format!(
+            "the physical plan is not the selected root: {}",
+            plans[1][1]
+        )
+        .into());
+    }
+    for (offset, index) in PEER_FOLLOWERS.into_iter().enumerate() {
+        if cluster.graph_leases(index)?.0 != remote_before.leases[offset] {
+            return Err(format!("plain EXPLAIN leased a graph on follower {index}").into());
+        }
+    }
+    let remote_before = RemoteWork::observe(&cluster)?;
+    let (path, analyzed) =
+        run_bound(&client, &format!("EXPLAIN ANALYZE {analytical}"), &[]).await?;
+    expect_path("Analytical EXPLAIN ANALYZE", path, QueryClass::Analytical)?;
+    remote_before.expect_advanced(&cluster, "Analytical EXPLAIN ANALYZE")?;
+    expect_plan_kinds(
+        "Analytical EXPLAIN ANALYZE",
+        &analyzed,
+        &["Plan with Metrics"],
+    )?;
+    for row in plans.iter().chain(&analyzed) {
+        if row[1].contains("tenants/") || row[1].contains(".parquet") {
+            return Err(format!("{} exposes object locators: {}", row[0], row[1]).into());
+        }
+    }
+
+    // A statement that fails at execution explains, and its analysis fails
+    // exactly as the SELECT does.
+    let failing =
+        format!("SELECT parse_json('{{bad' || filter_key) AS v FROM bifrost.bifrost.{single}");
+    let (_, plans) = run_bound(&client, &format!("EXPLAIN {failing}"), &[]).await?;
+    expect_plan_kinds(
+        "failing EXPLAIN",
+        &plans,
+        &["logical_plan", "physical_plan"],
+    )?;
+    for sql in [failing.clone(), format!("EXPLAIN ANALYZE {failing}")] {
+        expect_refusal(&client, &sql, "WYRD_VALA_500_QUERY_EXECUTION_FAILED").await?;
+    }
+
+    // Unsupported explanations are invalid SQL.
+    for sql in [
+        format!("EXPLAIN VERBOSE {analytical}"),
+        format!("EXPLAIN EXPLAIN {analytical}"),
+        format!("EXPLAIN DELETE FROM bifrost.bifrost.{single}"),
+    ] {
+        expect_refusal(&client, &sql, "WYRD_VALA_400_QUERY_INVALID_SQL").await?;
+    }
+
+    // Payload authority covers the explained SELECT.
+    coordinator
+        .seed_role(
+            "explain_no_payload",
+            &[
+                Permission::bifrost_table_read(),
+                Permission::bifrost_query_read(),
+            ],
+        )
+        .await?;
+    let unprivileged = client_from_bootstrap(
+        coordinator,
+        coordinator
+            .bootstrap_service_in_tenant(
+                cluster.tenant(),
+                "explain-unprivileged",
+                &["explain_no_payload"],
+            )
+            .await?,
+    )?;
+    for sql in [
+        "EXPLAIN SELECT request_payload FROM bifrost.gateway.calls",
+        "EXPLAIN ANALYZE SELECT request_payload FROM bifrost.gateway.calls",
+    ] {
+        expect_refusal(&unprivileged, sql, "WYRD_VALA_403_QUERY_FORBIDDEN").await?;
+    }
+
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// Runs one bound statement through the public query operation and renders
+/// its rows, returning the class its terminal reports.
+///
+/// # Errors
+///
+/// Returns the SDK error unchanged, or a message when no terminal arrives.
+async fn run_bound(
+    client: &WyrdClient,
+    sql: &str,
+    params: &[QueryParam],
+) -> Result<(QueryClass, Vec<Vec<String>>), JourneyError> {
+    let mut stream = wyrd_client::Bifrost::query_only(client)
+        .query(&BifrostQueryRequest {
+            sql: sql.to_owned(),
+            deadline_ms: Some(30_000),
+            params: params.to_vec(),
+        })
+        .await?;
+    let mut rows = Vec::new();
+    while let Some(batch) = stream.next_batch().await? {
+        rows.extend(render_rows(&batch)?);
+    }
+    let terminal = stream
+        .terminal()
+        .ok_or("query produced no terminal frame")?;
+    Ok((terminal.query_class, rows))
+}
+
+/// Requires `rows` to be exactly one plan of each kind in `kinds`, in order.
+///
+/// # Errors
+///
+/// Returns the case and rows when the kinds differ or a plan is empty.
+fn expect_plan_kinds(case: &str, rows: &[Vec<String>], kinds: &[&str]) -> Result<(), JourneyError> {
+    let actual: Vec<&str> = rows.iter().map(|row| row[0].as_str()).collect();
+    if actual != kinds || rows.iter().any(|row| row[1].trim().is_empty()) {
+        return Err(format!("{case}: expected plans {kinds:?}, received {rows:?}").into());
+    }
+    Ok(())
+}
+
+/// Requires `sql` to fail with the public error `code` and no result.
+///
+/// # Errors
+///
+/// Returns a message when the statement succeeds or fails otherwise.
+async fn expect_refusal(client: &WyrdClient, sql: &str, code: &str) -> Result<(), JourneyError> {
+    match run_bound(client, sql, &[]).await {
+        Err(error)
+            if error
+                .downcast_ref::<wyrd_client::bifrost::BifrostClientError>()
+                .map(sdk_code)
+                == Some(code) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(format!("{sql} failed as {error}, not {code}").into()),
+        Ok(rows) => Err(format!("{sql} settled {rows:?}, not {code}").into()),
+    }
 }
 
 /// Proves a failure in a later batch refuses the whole result after the rows

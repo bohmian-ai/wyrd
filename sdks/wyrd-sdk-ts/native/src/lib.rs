@@ -53,7 +53,7 @@ use wyrd_types::TimestampKind;
 /// JavaScript query request projected onto the pure Wyrd contract.
 #[napi(object)]
 pub struct NativeQueryRequest {
-    /// SELECT-only SQL text.
+    /// One SELECT statement, or one `EXPLAIN [ANALYZE]` of it.
     pub sql: String,
     /// Optional query deadline in milliseconds, valid in `1..=u32::MAX`.
     ///

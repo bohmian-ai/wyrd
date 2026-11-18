@@ -30,7 +30,8 @@ use wyrd_spec::reference::{CardRef, InlineableRef};
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::VerificationVerdict;
 use wyrd_spec::verification::execution::{
-    CallProvenance, Citation, InputDeclaration, Locator, Producer, ToolRecipient,
+    CallProvenance, Citation, InputDeclaration, Locator, Producer, RequirementOutcome,
+    ToolRecipient,
 };
 
 /// Build the [`TaskId`] used for a requirement or step in these fixtures.
@@ -538,23 +539,22 @@ impl EvidenceReader for PinnedDeck {
         })
     }
 
-    /// Keep reachable `deck` page citations within its five pages.
+    /// Accept `deck` page citations within its five pages.
     ///
     /// # Errors
-    /// Never fails.
-    async fn cited(
-        &self,
-        reachable: &BTreeSet<SlotName>,
-        citations: Vec<Citation>,
-    ) -> Result<Vec<Citation>, BlockError> {
-        Ok(citations
-            .into_iter()
-            .filter(|citation| {
-                citation.slot.as_str() == "deck"
-                    && reachable.contains(&citation.slot)
-                    && matches!(citation.locator, Locator::Page(1..=5))
-            })
-            .collect())
+    /// Returns [`BlockError::Terminal`] for any other citation.
+    async fn validate(&self, citations: &[&Citation]) -> Result<(), BlockError> {
+        match citations.iter().find(|citation| {
+            citation.slot.as_str() != "deck" || !matches!(citation.locator, Locator::Page(1..=5))
+        }) {
+            Some(citation) => Err(BlockError::Terminal {
+                reason: format!(
+                    "invalid citation: slot {} has no such location",
+                    citation.slot
+                ),
+            }),
+            None => Ok(()),
+        }
     }
 }
 
@@ -572,63 +572,105 @@ fn from_deck(value: Value) -> BTreeMap<String, CallInput> {
     )])
 }
 
-/// A step's cited findings bound into a tool-less check keep their valid
-/// citations; fabricated and unreachable ones are dropped, and a pass left
-/// with none, or with no evidence reader, is inconclusive.
+/// The Agent executor returns its check's Verdict as the Agent authored it,
+/// citations unfiltered. Through the engine every valid verdict keeps its
+/// outcome, an uncited pass included, while a citation the check cannot
+/// reach, which its narrowed format already refuses at the provider, or one
+/// with no location in its pinned evidence, is an explicit inconclusive error
+/// rather than a dropped citation.
 ///
 /// # Panics
-/// Panics when an invalid citation survives or an uncited pass stands.
+/// Panics when a verdict is rewritten, a citation dropped, or an invalid
+/// citation accepted.
 #[tokio::test(flavor = "multi_thread")]
-async fn check_agent_keeps_only_valid_citations() {
-    let findings = json!({
-        "finding": "refunds take 30 days",
-        "citations": [{"slot": "deck", "locator": {"page": 3}}]
-    });
-    let answer = |citations: Value| {
+async fn check_agent_verdicts_are_kept_and_citations_validated() {
+    let answer = |outcome: &str, citations: &Value| {
         openai_text_response(
-            &json!({"outcome": "passed", "reason": "grounded", "citations": citations}).to_string(),
+            &json!({"outcome": outcome, "reason": "judged", "citations": citations}).to_string(),
         )
     };
-    let pinned = executor(vec![
-        openai_text_response(&findings.to_string()),
-        answer(json!([
-            {"slot": "deck", "locator": {"page": 3}},
-            {"slot": "deck", "locator": {"page": 9}},
-            {"slot": "policy", "locator": {"page": 1}}
-        ])),
-        answer(json!([{"slot": "deck", "locator": {"page": 9}}])),
-    ])
-    .with_evidence(Arc::new(PinnedDeck));
-    let judge = agent(verdict_prompt(), &[]);
-
-    let step = step(&pinned, &judge, from_deck(json!("deck text")))
-        .await
-        .expect("the step runs");
-    let output = check(&pinned, &judge, from_deck(step.output.clone()))
-        .await
-        .expect("the check runs");
+    let unreachable = json!([{"slot": "policy", "locator": {"page": 1}}]);
+    let authored =
+        executor(vec![answer("passed", &unreachable)]).with_evidence(Arc::new(PinnedDeck));
+    let output = check(
+        &authored,
+        &agent(verdict_prompt(), &[]),
+        from_deck(json!("x")),
+    )
+    .await
+    .expect("the check runs");
     assert_eq!(output.verdict.outcome, VerificationVerdict::Passed);
     assert_eq!(
         serde_json::to_value(&output.verdict.citations).expect("citations"),
-        step.output["citations"]
+        unreachable
     );
 
-    let fabricated = check(&pinned, &judge, from_deck(step.output))
-        .await
-        .expect("the check runs");
-    assert_eq!(
-        fabricated.verdict.outcome,
-        VerificationVerdict::Inconclusive
-    );
-    assert!(fabricated.verdict.citations.is_empty());
-
-    let unread = executor(vec![answer(
-        json!([{"slot": "deck", "locator": {"page": 3}}]),
-    )]);
-    let output = check(&unread, &judge, from_deck(json!("x")))
-        .await
-        .expect("the check runs");
-    assert_eq!(output.verdict.outcome, VerificationVerdict::Inconclusive);
+    let page = |page: u32| json!([{"slot": "deck", "locator": {"page": page}}]);
+    let cases = [
+        ("passed", json!([]), RequirementOutcome::Passed, "judged"),
+        ("passed", page(3), RequirementOutcome::Passed, "judged"),
+        ("failed", json!([]), RequirementOutcome::Failed, "judged"),
+        (
+            "inconclusive",
+            json!([]),
+            RequirementOutcome::Inconclusive,
+            "judged",
+        ),
+        (
+            "passed",
+            unreachable,
+            RequirementOutcome::Inconclusive,
+            "provider failure SKALD_PROVIDERS_400_BAD_REQUEST",
+        ),
+        (
+            "passed",
+            page(9),
+            RequirementOutcome::Inconclusive,
+            "invalid citation: slot deck has no such location",
+        ),
+    ];
+    for (outcome, citations, expected, reason) in cases {
+        let spec: wyrd_spec::card::verifier::VerifierSpec = serde_json::from_value(json!({
+            "inputs": {"deck": {"type": "json"}, "policy": {"type": "json"}},
+            "requirements": [{"id": "grounded", "statement": "Grounded", "check": {
+                "kind": "agent", "agent": named_judge(json!("verdict")).agent,
+                "inputs": {"response": "inputs.deck"}}}]
+        }))
+        .expect("Verifier");
+        spec.validate().expect("valid Verifier");
+        let executor = Arc::new(executor(vec![answer(outcome, &citations)]));
+        let engine = vala_verify::blocks::VerificationEngine::new(
+            Arc::clone(&executor) as Arc<dyn ActionExecutor>,
+            executor as Arc<dyn CheckExecutor>,
+            Arc::new(vala_verify::InMemoryTraceSource::new()),
+            std::num::NonZeroUsize::new(1).expect("positive"),
+        )
+        .with_evidence(Arc::new(PinnedDeck));
+        let json = |value: Value| InputDeclaration::Json { value };
+        let executed = engine
+            .run(
+                Arc::new(spec),
+                BTreeMap::from([
+                    (
+                        SlotName::new("deck").expect("slot"),
+                        json(json!("deck text")),
+                    ),
+                    (SlotName::new("policy").expect("slot"), json(json!({}))),
+                ]),
+                Instant::now() + Duration::from_secs(60),
+            )
+            .await
+            .expect("the execution settles");
+        let result = &executed.requirements[0].result;
+        assert_eq!(result.outcome, expected, "{outcome} {citations}");
+        assert_eq!(result.reason, reason, "{outcome} {citations}");
+        if expected == RequirementOutcome::Passed {
+            assert_eq!(
+                serde_json::to_value(&result.citations).expect("citations"),
+                citations
+            );
+        }
+    }
 }
 
 /// A benchmark-recorded Agent check times each of its phases once into
@@ -652,7 +694,7 @@ async fn benchmark_check_agent_times_each_phase() {
     .await
     .expect("the check runs");
     let metrics = wyrd_benchmark::snapshot().metrics;
-    for phase in ["resolve", "bind", "run", "verdict", "cite"] {
+    for phase in ["resolve", "bind", "run", "verdict"] {
         let series = metrics
             .iter()
             .find(|metric| metric.matches(AGENT_PHASE_DURATION_SECONDS, &[("phase", phase)]))
@@ -690,8 +732,7 @@ fn named_judge(format: Value) -> AgentCall {
 /// judgments, is kept; missing, wrong, null, or undeclared data, one byte
 /// past either size boundary, 17 containers, and unknown envelope members
 /// are terminal without echoing the answer on a one-iteration budget; the
-/// plain format refuses any data; and a citation-less pass is still
-/// inconclusive.
+/// plain format refuses any data; and a citation-less pass stays passed.
 ///
 /// # Panics
 /// Panics when an invalid answer is accepted, a valid one is refused, or a
@@ -818,7 +859,7 @@ async fn check_agent_validates_custom_data() {
             .expect("uncited pass");
         assert_eq!(
             uncited.verdict.outcome,
-            VerificationVerdict::Inconclusive,
+            VerificationVerdict::Passed,
             "{format}"
         );
     }
@@ -3336,16 +3377,12 @@ impl EvidenceReader for HeldMedia {
         ))
     }
 
-    /// No citations.
+    /// Accept every citation.
     ///
     /// # Errors
     /// Never fails.
-    async fn cited(
-        &self,
-        _reachable: &BTreeSet<SlotName>,
-        _citations: Vec<Citation>,
-    ) -> Result<Vec<Citation>, BlockError> {
-        Ok(Vec::new())
+    async fn validate(&self, _citations: &[&Citation]) -> Result<(), BlockError> {
+        Ok(())
     }
 }
 
@@ -3553,16 +3590,12 @@ impl EvidenceReader for ChargedMedia {
         ))
     }
 
-    /// No citations.
+    /// Accept every citation.
     ///
     /// # Errors
     /// Never fails.
-    async fn cited(
-        &self,
-        _reachable: &BTreeSet<SlotName>,
-        _citations: Vec<Citation>,
-    ) -> Result<Vec<Citation>, BlockError> {
-        Ok(Vec::new())
+    async fn validate(&self, _citations: &[&Citation]) -> Result<(), BlockError> {
+        Ok(())
     }
 }
 

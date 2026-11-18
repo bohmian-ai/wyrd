@@ -235,13 +235,32 @@ impl Deployment {
     /// # Panics
     /// Panics when the declaration is refused.
     async fn declare(&self, cards: &[(&str, &str)], key: &str) {
+        let (status, body) = self.declaring(cards, key, |_| {}).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    /// Submit `cards`, whose `policy.yaml` is the Repository, under
+    /// idempotency `key` with its request body changed by `edit`, as a
+    /// client skipping its own validation would, returning the answer's
+    /// status and JSON body.
+    ///
+    /// # Panics
+    /// Panics when the files do not build a declaration or the answer is
+    /// not JSON.
+    pub(super) async fn declaring(
+        &self,
+        cards: &[(&str, &str)],
+        key: &str,
+        edit: impl FnOnce(&mut Value),
+    ) -> (StatusCode, Value) {
         let dir = tempfile::tempdir().expect("checkout creates");
         for (name, contents) in cards {
             std::fs::write(dir.path().join(name), contents).expect("card file writes");
         }
         let input = build_declaration_input(load(&dir.path().join("policy.yaml")).expect("loads"))
             .expect("declaration input builds");
-        let body = serde_json::to_value(input.to_declare_card_request()).expect("serializes");
+        let mut body = serde_json::to_value(input.to_declare_card_request()).expect("serializes");
+        edit(&mut body);
         let request = Request::builder()
             .method(Method::POST)
             .uri("/v1/cards")
@@ -254,7 +273,14 @@ impl Deployment {
             .oneshot_authenticated(&self.jwt, request)
             .await
             .expect("declaration responds");
-        assert_eq!(response.status(), StatusCode::CREATED);
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1 << 22)
+            .await
+            .expect("body reads");
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
     }
 
     /// Serve `acme/policy` with `main` at commit `c…` (tree `7…`).
@@ -447,7 +473,7 @@ impl Deployment {
     ///
     /// # Panics
     /// Panics when the details are not served or hold no `pr` step.
-    async fn extraction(&self, execution: Uuid) -> Value {
+    pub(super) async fn extraction(&self, execution: Uuid) -> Value {
         let details = self
             .get(&format!("/v1/verification/executions/{execution}/details"))
             .await;

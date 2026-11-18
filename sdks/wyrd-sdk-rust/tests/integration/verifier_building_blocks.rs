@@ -55,7 +55,7 @@ const FOLLOWS: &str = r#"{"outcome":"passed","reason":"within the policy","citat
 const BREAKS: &str = r#"{"outcome":"failed","reason":"contradicts the policy","citations":[{"slot":"answer","locator":{"json_pointer":"/text"}}]}"#;
 
 /// The judge's Verdict for an answer containing `UNCITED`: a pass with no
-/// citation, which must not count as one.
+/// citation, which counts as authored.
 const UNCITED: &str = r#"{"outcome":"passed","reason":"trust me","citations":[]}"#;
 
 /// The judge's Verdict for an answer containing `JUDGE-FOREIGN-CITE`: a pass
@@ -891,25 +891,31 @@ async fn judge_verdict_fails_the_agent_check() {
     desk.deployment.shutdown().await;
 }
 
-/// A judge that passes without citing any evidence cannot pass the
-/// requirement or the review.
+/// A judge that passes without citing evidence passes `follows-policy` as
+/// authored, with no citations and the judge's reason; a pass is never
+/// rewritten for lacking one.
 ///
 /// # Panics
-/// Panics when the review is refused or the uncited pass counts.
+/// Panics when the review is refused or the uncited pass is rewritten.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn uncited_judge_verdict_cannot_pass() {
+async fn uncited_judge_verdict_passes_as_authored() {
     let desk = PolicyDesk::start().await;
 
     let result = desk
         .review(review("UNCITED: refunds follow our policy.", 50, None))
         .await;
 
-    assert_ne!(
-        requirement(&result, "follows-policy").outcome,
-        RequirementOutcome::Passed
+    let judged = requirement(&result, "follows-policy");
+    assert_eq!(
+        (
+            judged.outcome,
+            judged.reason.as_str(),
+            judged.citations.len()
+        ),
+        (RequirementOutcome::Passed, "trust me", 0),
+        "{judged:?}"
     );
-    assert_ne!(result.outcome.verdict, VerificationVerdict::Passed);
     desk.deployment.shutdown().await;
 }
 

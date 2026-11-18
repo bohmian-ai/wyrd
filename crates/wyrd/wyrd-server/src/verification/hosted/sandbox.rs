@@ -15,7 +15,7 @@
 //! cross the boundary as JSON text through the sandbox's `json` module, so
 //! no host object or callback is ever exposed to Python.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -44,7 +44,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use vala_verify::blocks::{
     ActionExecutor, ActionOutput, BlockCall, BlockError, CallInput, CallValue, CheckExecutor,
-    CheckOutput, Delivery, EvidenceReader, ToolBridge, verdict_from,
+    CheckOutput, Delivery, ToolBridge, verdict_from,
 };
 use wyrd_runtime::resources::{
     ByteCharge, ByteLedger, CommitObservation, CpuLanes, Operation, ProcessResources, WorkContext,
@@ -54,7 +54,6 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::card::verifier::{Action, Check, CodeCall, CodeSource};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::SlotName;
 use wyrd_spec::verification::execution::CallProvenance;
 
 use super::HostedLimits;
@@ -1186,12 +1185,12 @@ fn answer(
 pub struct CodeExecutor {
     /// The shared sandbox.
     sandbox: Arc<Sandbox>,
-    /// The execution's evidence, for citation validation.
+    /// The execution's evidence, for Artifact sources and tenancy.
     evidence: Arc<TenantEvidence>,
 }
 
 impl CodeExecutor {
-    /// Code execution over `sandbox` citing `evidence`.
+    /// Code execution over `sandbox` reading `evidence`.
     #[must_use]
     pub const fn new(sandbox: Arc<Sandbox>, evidence: Arc<TenantEvidence>) -> Self {
         Self { sandbox, evidence }
@@ -1281,13 +1280,13 @@ impl ActionExecutor for CodeExecutor {
 
 #[async_trait]
 impl CheckExecutor for CodeExecutor {
-    /// Run a `code` check and return its Verdict, keeping only citations
-    /// into evidence reachable through the call's bindings.
+    /// Run a `code` check and return its Verdict as the code returned it;
+    /// the engine validates its citations.
     ///
     /// # Errors
     /// Returns [`BlockError::Terminal`] for a non-code check or a result
     /// [`verdict_from`] refuses against the check's declared `verdict`
-    /// format, plus [`Self::run`] and citation-read failures.
+    /// format, plus [`Self::run`] failures.
     async fn execute(&self, call: BlockCall<'_, Check>) -> Result<CheckOutput, BlockError> {
         let Check::Code(code) = call.block else {
             return Err(terminal(
@@ -1299,16 +1298,7 @@ impl CheckExecutor for CodeExecutor {
             .map_err(|error| terminal(format!("the code check format is invalid: {error}")))?;
         let (value, provenance) = self.run(&code.call, &call.inputs, call.deadline).await?;
         let schema = SharedSchema::new(Value::Object(schema));
-        let mut verdict = verdict_from(&PreparedSchemas::default(), &schema, value)?;
-        let reachable: BTreeSet<SlotName> = call
-            .inputs
-            .values()
-            .flat_map(|input| input.sources.iter().cloned())
-            .collect();
-        verdict.citations = self
-            .evidence
-            .cited(&reachable, std::mem::take(&mut verdict.citations))
-            .await?;
+        let verdict = verdict_from(&PreparedSchemas::default(), &schema, value)?;
         Ok(CheckOutput {
             verdict,
             actual: None,

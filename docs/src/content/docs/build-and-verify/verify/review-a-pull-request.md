@@ -29,7 +29,7 @@ The report never decides the verdict. Your requirement does:
 
 <CodeFromFile file="examples/review-a-pull-request/verifier.yaml" lang="yaml" title="verifier.yaml" />
 
-The `pr` step extracts the pull request; `review` hands its source to the Agent. `acceptable-review` fails on a `critical` or `high` finding and is `inconclusive` when the review did not cover the whole change, so an empty report from an incomplete review never passes. Change the rule to suit your team.
+The `pr` step extracts the pull request; `review` hands its source to the Agent. `acceptable-review` fails on a `critical` or `high` finding and is `inconclusive` when the review did not cover the whole change, so an empty report from an incomplete review never passes. Its verdict cites the reviewed pull request through `pull_request`, the extraction's own source slot, so a clean review with no findings still names the commits it reviewed. Change the rule to suit your team.
 
 ## 3. Bind it to pull requests
 

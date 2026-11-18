@@ -452,7 +452,7 @@ for citation in judged.get("citations", []):
     print(citation["slot"], citation["locator"])  # attachment_<n> and the cited lines
 ```
 
-A pass without a citation counts as `inconclusive`. Put exact rules, such as an amount limit, in `assert` or `code` requirements of the same Verifier, so they never depend on the model; `decide` combines every requirement's verdict. Your application reads the verdict and decides what to do, such as holding a payment. `verify` waits for the judge; `submit` queues it instead, as [verify and submit](/understand/how-verification-works/#verify-and-submit) explains.
+The judge's verdict counts as returned, with or without citations; a citation that does not locate the handbook makes the requirement `inconclusive`. Put exact rules, such as an amount limit, in `assert` or `code` requirements of the same Verifier, so they never depend on the model; `decide` combines every requirement's verdict. Your application reads the verdict and decides what to do, such as holding a payment. `verify` waits for the judge; `submit` queues it instead, as [verify and submit](/understand/how-verification-works/#verify-and-submit) explains.
 
 ## Grouped session
 

@@ -2010,7 +2010,7 @@ The function must return the requirement's [verdict](/wyrd/reference/verifier-ca
 | `reason` | One sentence shown in the result |
 | `citations` | Where in the evidence the decision rests, as `{slot, locator}` |
 
-Any other shape, or an exception, makes the requirement `inconclusive`, and so does a `passed` outcome without a citation. The same function used as a step instead of a check may return any JSON. The code runs in Wyrd's sandbox with no files, network, or environment.
+Any other shape, an exception, or a citation that does not locate evidence the check reaches makes the requirement `inconclusive`. A valid verdict counts as returned, including a `passed` outcome with no citations. The same function used as a step instead of a check may return any JSON. The code runs in Wyrd's sandbox with no files, network, or environment.
 
 Tickets come from the agent, so bind this Verifier to the agent component rather than the whole Service:
 
@@ -2581,7 +2581,7 @@ for citation in judged.get("citations", []):
     print(citation["slot"], citation["locator"])  # attachment_<n> and the cited lines
 ```
 
-A pass without a citation counts as `inconclusive`. Put exact rules, such as an amount limit, in `assert` or `code` requirements of the same Verifier, so they never depend on the model; `decide` combines every requirement's verdict. Your application reads the verdict and decides what to do, such as holding a payment. `verify` waits for the judge; `submit` queues it instead, as [verify and submit](/wyrd/understand/how-verification-works/#verify-and-submit) explains.
+The judge's verdict counts as returned, with or without citations; a citation that does not locate the handbook makes the requirement `inconclusive`. Put exact rules, such as an amount limit, in `assert` or `code` requirements of the same Verifier, so they never depend on the model; `decide` combines every requirement's verdict. Your application reads the verdict and decides what to do, such as holding a payment. `verify` waits for the judge; `submit` queues it instead, as [verify and submit](/wyrd/understand/how-verification-works/#verify-and-submit) explains.
 
 ## Grouped session
 
@@ -3057,19 +3057,26 @@ spec:
       check:
         kind: code
         entrypoint: judge
-        inputs: {report: steps.review.output}  # the code_review report
+        inputs: {report: steps.review.output, pr: steps.pr.output.pr}  # the code_review report and the pinned pull request
         source:
           inline: |
-            def judge(report):
+            # `pull_request` is the extraction's own source slot: these cite the
+            # reviewed head commit and the commit the review compared from.
+            CITATIONS = [
+                {"slot": "pull_request", "locator": {"json_pointer": "/pr/head/sha"}},
+                {"slot": "pull_request", "locator": {"json_pointer": "/review/comparison_base"}},
+            ]
+
+            def judge(report, pr):
                 if not report["coverage"]["complete"]:
-                    return {"outcome": "inconclusive", "reason": "The review did not cover the whole change.", "citations": []}
+                    return {"outcome": "inconclusive", "reason": "The review did not cover the whole change.", "citations": CITATIONS}
                 if any(f["severity"] in ("critical", "high") for f in report["findings"]):
-                    return {"outcome": "failed", "reason": "The review found critical or high issues.", "citations": []}
-                return {"outcome": "passed", "reason": "The review is complete with no critical or high issues.", "citations": []}
+                    return {"outcome": "failed", "reason": "The review found critical or high issues.", "citations": CITATIONS}
+                return {"outcome": "passed", "reason": "The review is complete with no critical or high issues.", "citations": CITATIONS}
 
 ```
 
-The `pr` step extracts the pull request; `review` hands its source to the Agent. `acceptable-review` fails on a `critical` or `high` finding and is `inconclusive` when the review did not cover the whole change, so an empty report from an incomplete review never passes. Change the rule to suit your team.
+The `pr` step extracts the pull request; `review` hands its source to the Agent. `acceptable-review` fails on a `critical` or `high` finding and is `inconclusive` when the review did not cover the whole change, so an empty report from an incomplete review never passes. Its verdict cites the reviewed pull request through `pull_request`, the extraction's own source slot, so a clean review with no findings still names the commits it reviewed. Change the rule to suit your team.
 
 ## 3. Bind it to pull requests
 
@@ -4917,7 +4924,7 @@ An `agent` or `code` check returns a verdict:
 | `{json_pointer: "/path"}` | JSON inputs and DOCX or XLSX extraction output |
 | `{region: {page, x, y, width, height}}` | A rectangle on a page, in page coordinates |
 
-A citation names the original slot, or the `attachment_<n>` slot a fixed workspace file reports in `sources`, never an extract step or `/work` file. With `response_format: verdict`, an Agent check's model may cite only the bare slots its inputs and workspace reach, such as `answer`, never `inputs.answer`. An invalid citation is dropped, and a `passed` verdict left without one is recorded as `inconclusive`. For JSON pointers into extracted files, see [Extraction output](/wyrd/reference/extraction-output/#citations).
+A citation names the original slot, the `attachment_<n>` slot a fixed workspace file reports in `sources`, or `pull_request`, never an extract step or `/work` file. `pull_request` is the original source of a successful `extract` with `extractor: pull_request`: every value derived from that step's output reaches it, and its `json_pointer` locators resolve against that execution's extraction, such as `{"slot": "pull_request", "locator": {"json_pointer": "/pr/head/sha"}}`. A Verifier using that extractor cannot declare an input named `pull_request`. With `response_format: verdict`, an Agent check's model may cite only the bare slots its inputs and workspace reach, such as `answer`, never `inputs.answer`. A valid verdict keeps its outcome, including a `passed` verdict with no citations. A citation of a slot the check does not reach, or of a location its evidence does not have, makes the requirement `inconclusive` with a reason starting `invalid citation:`; the verdict is not kept. For JSON pointers into extracted files, see [Extraction output](/wyrd/reference/extraction-output/#citations).
 
 ### Custom data
 
@@ -4960,6 +4967,7 @@ Common `rule` values in `WYRD_SPEC_400_VALIDATION`:
 | `graph` | `depends_on` forms a cycle |
 | `media_as_text` | A `media` slot is bound to an Agent text placeholder |
 | `extract_source` | An `extract` step names both or neither of `from` and `extractor`, or `from` is not a whole `media` slot |
+| `source_slot` | A Verifier with an `extract` step using `extractor: pull_request` declares an input named `pull_request` |
 | `extract_format` | An `extract` step reads a slot with a format it cannot extract |
 | `operator` | An operator's parameters are invalid, such as a bad regex |
 | `step_budget` | `timeout_seconds` is 0 or `retries` is above 5 |

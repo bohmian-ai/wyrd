@@ -193,6 +193,30 @@ rerun affected assertions against the corrected runtime and authoring files.
    path so executor and engine behavior agree. Today uncited passes are rewritten,
    providing the missing-behavior RED. This tests REQ-016, not a new minimum
    citation count.
+
+   *Evidence (PASS).* Engine `blocks::engine::tests::hosted_check_verdicts_are_kept_as_authored`
+   (`crates/vala/vala-verify/src/blocks/engine/tests.rs:1808`, renamed from
+   `hosted_check_passes_need_reachable_citations`, command C4): cited and
+   uncited passes stay `passed` (uncited keeps reason `scripted`), `failed`
+   and `inconclusive` stay as authored, and unchanged `decide` gives `failed`
+   for the mix and `passed` for cited+uncited. RED observed before the engine
+   change: `uncited` came back `inconclusive`. Agent executor
+   `check_agent_verdicts_are_kept_and_citations_validated`
+   (`crates/vala/vala-verify/tests/integration/blocks_agent.rs:586`, C5)
+   runs passed-uncited, passed-cited, failed and inconclusive through the
+   executor and the engine; each is kept, and `check_agent_validates_custom_data`
+   now expects its uncited pass to pass. Code check: the hosted `CodeExecutor`
+   no longer filters (`sandbox.rs`); the clean example report in scenario 3
+   passes. Public real server, all three SDKs (C6–C8):
+   `uncited_judge_verdict_passes_as_authored` (Rust
+   `sdks/wyrd-sdk-rust/tests/integration/verifier_building_blocks.rs:902`,
+   Python `test_verifier_building_blocks.py:598`, TypeScript
+   `verifier-building-blocks.test.ts:585`) asserts `follows-policy` is
+   `passed` with reason `trust me` and no citations. These replace the former
+   `uncited_judge_verdict_cannot_pass` journeys, whose expectation REQ-016
+   supersedes (`architecture/wyrd-design.md:1762`). TDD: engine PASS (RED
+   recorded); Agent executor and SDK journeys VIOLATED (updated after the
+   production change, no RED recorded).
 2. **Reject invalid results explicitly.** Supply malformed output and citations
    to an unreachable slot, a nonexistent location, and another execution/tenant's
    source. Assert an explicit validation reason through the existing check-error
@@ -202,6 +226,29 @@ rerun affected assertions against the corrected runtime and authoring files.
    local providers for repeatability. Current filtering supplies RED where it
    silently accepts or alters such results. These cases exercise REQ-016/017's
    original-source validation boundary without accepting arbitrary step output.
+
+   *Evidence (PASS).* Validation has one owner, engine `judge` (`engine.rs`,
+   `validate`), after the check returns: an unreachable slot, a
+   `pull_request` pointer that does not resolve, or a location the
+   `EvidenceReader` cannot find returns `BlockError::Terminal` with reason
+   `invalid citation: …`, which the existing check-error path records as
+   `inconclusive`. Nothing is dropped. Engine (C4): `elsewhere` →
+   `inconclusive` "invalid citation: slot policy is not evidence this check
+   reaches"; malformed `errored` → `inconclusive` "invalid verdict". Agent
+   (C5): a cite of an unreachable slot is refused by the narrowed verdict
+   format ("provider failure SKALD_PROVIDERS_400_BAD_REQUEST"); deck page 9
+   → "invalid citation: slot deck has no such location". Tenant evidence
+   (C9): `pg_hosted_files::citations_must_locate_pinned_evidence`: every
+   invalid citation, beside a valid one, fails with `invalid citation: slot
+   <slot>`; a slot outside this execution's pins (so another execution's or
+   tenant's source) fails "is not pinned evidence of this execution".
+   `pg_hosted_artifacts::recovered_authority_bounds_every_agent_tool` (C9)
+   asserts the Agent check returns the fabricated line as authored and
+   `TenantEvidence::validate` refuses it by name. Public server (C6–C8):
+   `invalid_judge_verdicts_are_inconclusive` and
+   `code_check_fails_with_citations_and_is_inconclusive_otherwise` pass
+   unchanged in all three SDKs. TDD: VIOLATED for C5/C9 (assertions updated
+   after the change); the SDK journeys are prior proof.
 3. **Cite the pinned PR through the shipped example.** Admit a queued PR with
    the runtime enabled and run the actual shipped example through extraction,
    review Agent, workspace and final code check. Read its retained requirement
@@ -215,6 +262,36 @@ rerun affected assertions against the corrected runtime and authoring files.
    returns an uncited pass. Use SDK → WyrdTestServer + repository Postgres → SDK
    journey proof with existing GitHub doubles and gateway fixtures; do not
    manufacture a caller input to bypass the missing source lineage.
+
+   *Evidence (PASS).* `PULL_REQUEST_SOURCE` (`pull_request`) is documented in
+   `crates/wyrd-spec/src/card/verifier/pull_request.rs`. The engine adds it to
+   the sources of a settled pull-request extract step, so it flows through
+   step bindings, Agent inputs/output and workspace to the final check;
+   checkpointed settlements keep it. Pointers resolve in memory against the
+   execution's retained extraction (`Bindings.pull_request`). Journeys in
+   `crates/wyrd/wyrd-server/tests/integration/pg_github_delivery.rs` (C10):
+   `the_review_example_cites_the_pinned_pull_request_it_passes` (:918) runs
+   the shipped `examples/review-a-pull-request` from a queued PR: a clean
+   complete report passes with Check `success`, an incomplete one is
+   `inconclusive`/`action_required`; both cite `/pr/head/sha` and
+   `/review/comparison_base`, which resolve to the pinned head and comparison
+   commits. `the_review_example_fails_on_a_high_finding_and_comments_its_fix`
+   (:963) fails with the same citations.
+   `a_resumed_check_cites_the_pull_request_it_pinned` (:1014) holds the
+   execution at an approval, moves the PR head on GitHub, then resumes: the
+   pinned and uncited checks pass, the extraction head stays the first
+   commit, a forged pointer is `inconclusive` "invalid citation: slot
+   pull_request has no location /pr/forged", and a foreign slot gives
+   "…attachment_0 is not evidence this check reaches". A declaration adding
+   input `pull_request` beside the extractor is refused 400
+   `WYRD_SPEC_400_VALIDATION`, rule `source_slot` (also
+   `validate.rs::pull_request_extraction_output_binds_without_a_client_schema`,
+   C11, RED observed: the input was accepted). Docs:
+   `reference/verifier-card.md` (slot, collision rule, `source_slot` row),
+   `review-a-pull-request.md`, `author-a-verifier.md`,
+   `verifier-recipes.md`; `llms-full.txt` regenerated with `docs:generate`.
+   No storage, migration or PostgreSQL evidence added. TDD: wyrd-spec
+   collision PASS; journeys VIOLATED (written after the engine change).
 4. **Seed the actual example policy.** Start setup against the real dev server
    with no GitHub connection. Load package input from the pinned demo checkout,
    create the gateway deployment and declare the review Verifier. Public Card
@@ -272,7 +349,14 @@ rerun affected assertions against the corrected runtime and authoring files.
    mock/bound demo policy completes that connected path; a permanently queued
    execution fails this scenario.
 
-   *Evidence (FAIL under revision 4; corrective scope approved in revision 5).* Journey `pg_dev_repository_review::dev_harness_registers_the_demo_and_reviews_its_pull_requests`, last block: the
+   *Evidence (PASS under revision 5).* C1 passes against demo pin `90fb879`
+   (derived from the corrected example, pushed to `dev-workload`): the
+   ordinary PR completes `passed`, delivery `delivered`, Check
+   `wyrd/code-review` `success` with one `COMMENT` review, and MockServer
+   recorded one final turn with no `tool` message (69.5 s). Historical
+   record follows.
+
+   *Historical evidence (FAIL under revision 4).* Journey `pg_dev_repository_review::dev_harness_registers_the_demo_and_reviews_its_pull_requests`, last block: the
    ordinary PR completes, delivery is `delivered`, one `wyrd/code-review`
    Check carries the scripted summary, one inline-free `COMMENT` review lands,
    and MockServer recorded one final turn with no `tool` message. But the
@@ -333,8 +417,17 @@ rerun affected assertions against the corrected runtime and authoring files.
    upstream. Live run pending maintainer action; not passed.
 
    Commands:
-   - C1: `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-server --test integration -E "test(=pg_dev_repository_review::dev_harness_registers_the_demo_and_reviews_its_pull_requests)"'` — historical run fails at the passing-review verdict assertion (now scenario 6).
+   - C1: `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-server --test integration -E "test(=pg_dev_repository_review::dev_harness_registers_the_demo_and_reviews_its_pull_requests)"'` — PASS at pin `90fb879` (revision 4 failed at the passing-review verdict).
    - C2: same with `-E "test(=pg_dev_repository_review::dev_harness_leaves_review_off_without_a_github_app)"` — PASS.
+   - C4: `mise exec -- cargo nextest run --locked -p vala-verify --lib -E 'test(=blocks::engine::tests::hosted_check_verdicts_are_kept_as_authored)'` — RED (uncited `inconclusive`), then PASS; whole `vala-verify` 114/114.
+   - C5: `mise exec -- cargo nextest run --locked -p vala-verify --test integration -E 'test(=blocks_agent::check_agent_verdicts_are_kept_and_citations_validated) | test(=blocks_agent::check_agent_validates_custom_data)'` — PASS.
+   - C6: `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run build:server && cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E "test(/^verifier_building_blocks::/)"'` — 31/31 PASS.
+   - C7: same wrapper, `mise run py:setup`, then in `sdks/wyrd-sdk-python` `uv run python -m pytest -q -m "integration and not local_dev" tests/integration/test_verifier_building_blocks.py` — 39 passed.
+   - C8: same wrapper, `mise run ts:build && mise run ts:build:testing`, then in `sdks/wyrd-sdk-ts/wyrd` `pnpm exec vitest run tests/integration/verifier-building-blocks.test.ts` — 34 passed.
+   - C9: `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-server --test integration --all-features -E "test(=pg_hosted_artifacts::recovered_authority_bounds_every_agent_tool) | test(=pg_hosted_files::citations_must_locate_pinned_evidence)"'` — PASS. The broader `wyrd-server` lib plus `pg_hosted|pg_github|pg_durable|pg_deferred|pg_verif|pg_direct|verification` run had 892 tests: 891 passed. The one failure, `recovered_authority_bounds_every_agent_tool`, still asserted the removed filter; it now asserts the authored output plus explicit validation and passes.
+   - C10: same wrapper with `-E "test(=pg_github_delivery::the_review_example_cites_the_pinned_pull_request_it_passes) | test(=pg_github_delivery::the_review_example_fails_on_a_high_finding_and_comments_its_fix) | test(=pg_github_delivery::a_resumed_check_cites_the_pull_request_it_pinned)"` — PASS.
+   - C11: `mise exec -- cargo nextest run --locked -p wyrd-spec --lib -E 'test(=card::verifier::validate::tests::pull_request_extraction_output_binds_without_a_client_schema)'` — RED (colliding input accepted), then PASS.
+   - C1+C2 together (one nextest invocation): C1 PASS; C2 FAIL at `pg_dev_repository_review.rs:703`, `fatal: Unable to create '…/target/dev/wyrd-example-py/.git/index.lock': File exists`. Diagnosis — Symptom: C2 fails in 0.165 s only when it runs beside C1. Evidence: both tests run `example-app.sh prepare` first (`:462`, `:699`) and both sit in the `pg-servers` nextest group (16 threads). Cause: two concurrent `prepare` runs share the fixed checkout `target/dev/wyrd-example-py`; `checkout()` git index writes collide, and `wheel()` (`rm -rf vendor`, `uv sync`) races too. Fix site (diagnostician recommendation, not applied, awaiting maintainer approval): a one-thread nextest test group for `test(/^pg_dev_repository_review::/)` in `.config/nextest.toml`, placed before the `pg-servers` override (C1 also binds MockServer's fixed port 1080). `dev:full` runs the steps one after another and is unaffected. A lock inside the script would need `flock`, which macOS lacks. Each test passes alone.
    - C3: `mise exec -- scripts/postgres/with-test-postgres.sh -- env WYRD_UI_INTEGRATION=1 pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-pages.integration.test.ts -t 'development environment lifecycle'` — PASS (99.8 s; support-desk batch passed alongside).
    - `cargo clippy --locked -p wyrd-server --test integration --all-features -- -D warnings`, `cargo fmt`, `ruff format/check scripts/dev/review_repository.py`, `bash -n` on `example-app.sh` and the `dev:full` body, `git diff --check` — clean.
    - Upstream: `wyrd declare --check review/code-review.yaml` and `wyrd.toml` in the demo checkout — valid.

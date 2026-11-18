@@ -376,13 +376,10 @@ async fn artifact_evidence_and_code_reach_every_consumer() {
         slot: notes(),
         locator: Locator::Lines { start: 1, end: 2 },
     };
-    assert_eq!(
-        evidence
-            .cited(&BTreeSet::from([notes()]), vec![cited.clone()])
-            .await
-            .expect("citations check"),
-        vec![cited]
-    );
+    evidence
+        .validate(&[&cited])
+        .await
+        .expect("the citation names a location in the pinned file");
 
     let workspace = workspaces(HostedLimits::default())
         .open(
@@ -756,13 +753,10 @@ async fn evidence_metadata_is_resolved_once() {
         slot: doc.clone(),
         locator: Locator::Lines { start: 1, end: 1 },
     };
-    assert_eq!(
-        evidence
-            .cited(&BTreeSet::from([doc.clone()]), vec![cited.clone()])
-            .await
-            .expect("citations check"),
-        vec![cited]
-    );
+    evidence
+        .validate(&[&cited])
+        .await
+        .expect("the citation names a location in the pinned file");
     let mounted = |value: InputDeclaration, slot: &SlotName| CallInput {
         value: CallValue::Evidence(value),
         sources: BTreeSet::from([slot.clone()]),
@@ -954,8 +948,8 @@ fn document(value: Value) -> BTreeMap<String, CallInput> {
 /// query, code, and file calls run and are recorded, yet Oracle refuses the
 /// other table and a join reaching it: tool grants never widen data scope.
 /// The located line the file tool returned becomes the step's citation, and
-/// a tool-less check judged by the real evidence reader keeps it and drops a
-/// fabricated one. A call to a tool the Agent did not declare fails the step.
+/// a tool-less check returns it beside a fabricated one as authored, and the
+/// real evidence reader validates the first and refuses the second by name. A call to a tool the Agent did not declare fails the step.
 ///
 /// # Panics
 /// Panics when a scope widens, a call goes unrecorded, an invalid citation
@@ -1089,7 +1083,7 @@ async fn recovered_authority_bounds_every_agent_tool() {
         Arc::new(NoRegistry),
     )
     .with_toolset(Arc::new(tools))
-    .with_evidence(evidence);
+    .with_evidence(Arc::clone(&evidence) as Arc<dyn EvidenceReader>);
 
     let declared = reviewer(&["bifrost.query", "code.run", "fs.read"]);
     let id = TaskId::new("review").expect("task id");
@@ -1205,10 +1199,26 @@ async fn recovered_authority_bounds_every_agent_tool() {
     checked.settle().await;
     let verdict = verdict.expect("the check runs").verdict;
     assert_eq!(verdict.outcome, VerificationVerdict::Passed);
+    let fabricated = json!({"slot": "notes", "locator": {"lines": {"start": 9, "end": 9}}});
     assert_eq!(
         serde_json::to_value(&verdict.citations).expect("citations"),
-        json!([cited])
+        json!([cited, fabricated]),
+        "the executor returns the verdict as authored"
     );
+    evidence
+        .validate(&[&verdict.citations[0]])
+        .await
+        .expect("the located line validates");
+    match evidence
+        .validate(&verdict.citations.iter().collect::<Vec<_>>())
+        .await
+    {
+        Err(BlockError::Terminal { reason }) => assert_eq!(
+            reason,
+            r#"invalid citation: slot notes has no location {"lines":{"start":9,"end":9}}"#
+        ),
+        other => panic!("the fabricated line was accepted: {other:?}"),
+    }
 
     let refused = step(Action::Agent(declared), &ToolCallsOwner::default())
         .await

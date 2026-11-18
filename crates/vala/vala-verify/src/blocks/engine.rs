@@ -34,6 +34,7 @@ use thiserror::Error;
 use tokio::sync::Semaphore;
 use tokio::time::{Instant, timeout_at};
 
+use wyrd_spec::card::verifier::pull_request::{Extractor, PULL_REQUEST_SOURCE};
 use wyrd_spec::card::verifier::{
     Action, AgentCall, ArtifactSelection, Check, Condition, Decide, DependsOn, InputSlot,
     Requirement, Step, TraceCheck, VerifierSpec, WorkspaceSource,
@@ -45,8 +46,9 @@ use wyrd_spec::verification::VerificationVerdict;
 use wyrd_spec::verification::execution::ApprovalReceipt;
 use wyrd_spec::verification::execution::{
     CallProvenance, Citation, ExecutedOutcome, ExecutedRequirement, InputDeclaration,
-    InvocationSettlement, Producer, ProducerInvocation, RequirementDetail, RequirementDetails,
-    RequirementOutcome, RequirementResult, Speculation, StepResult, StepStatus, ToolCallRecord,
+    InvocationSettlement, Locator, Producer, ProducerInvocation, RequirementDetail,
+    RequirementDetails, RequirementOutcome, RequirementResult, Speculation, StepResult, StepStatus,
+    ToolCallRecord,
 };
 use wyrd_spec::verification::state::{ApprovalOccurrence, ControlRecord, ExecutionState};
 use wyrd_spec::verification::{ComparisonOperator, ContextCapture};
@@ -1641,7 +1643,11 @@ impl VerificationEngine {
                         }
                         let attempted = self.attempt(step, &bindings, deadline, instance).await?;
                         let attempts = attempted.attempts;
-                        let own = attempted.settle(step, bindings.sources(), instance);
+                        let mut reached = bindings.sources();
+                        if extracts_pull_request(step) {
+                            reached.insert(pull_request_source());
+                        }
+                        let own = attempted.settle(step, reached, instance);
                         // Only a checkpointed run records the settlement, so only
                         // it copies the output into one.
                         if attempts > 0 && self.checkpoints.is_some() {
@@ -1806,7 +1812,10 @@ impl VerificationEngine {
             return Prepared::Settled((**result).clone());
         }
         let inputs = match requirement_bindings(spec, scope, &self.attached, key) {
-            Ok(inputs) => inputs,
+            Ok(inputs) => Bindings {
+                pull_request: pull_request_extraction(spec, scope),
+                ..inputs
+            },
             Err(gap) => {
                 return Prepared::Settled(Judged::missing(gap).report(spec, key, instance));
             }
@@ -1968,6 +1977,55 @@ impl VerificationEngine {
         }
     }
 
+    /// Validate every citation an Agent or code check supplied: its slot is
+    /// an original source the check reaches; a citation of the
+    /// [`PULL_REQUEST_SOURCE`] slot is a JSON pointer naming a location in
+    /// this execution's retained `pull_request` extraction; any other names a
+    /// location in its pinned evidence, through the host's reader when one
+    /// is installed. Nothing is dropped and the verdict is never changed.
+    ///
+    /// # Errors
+    /// Returns [`BlockError::Terminal`] naming the first invalid citation,
+    /// and the reader's failure to validate the rest.
+    async fn validate(
+        &self,
+        citations: &[Citation],
+        sources: &BTreeSet<SlotName>,
+        pull_request: Option<&Value>,
+    ) -> Result<(), BlockError> {
+        let invalid = |detail: String| BlockError::Terminal {
+            reason: format!("invalid citation: {detail}"),
+        };
+        let mut pinned = Vec::with_capacity(citations.len());
+        for citation in citations {
+            if !sources.contains(&citation.slot) {
+                return Err(invalid(format!(
+                    "slot {} is not evidence this check reaches",
+                    citation.slot
+                )));
+            }
+            match pull_request.filter(|_| citation.slot.as_str() == PULL_REQUEST_SOURCE) {
+                Some(extraction) => {
+                    let Locator::JsonPointer(pointer) = &citation.locator else {
+                        return Err(invalid(format!(
+                            "slot {PULL_REQUEST_SOURCE} is located only by json_pointer"
+                        )));
+                    };
+                    if extraction.pointer(pointer).is_none() {
+                        return Err(invalid(format!(
+                            "slot {PULL_REQUEST_SOURCE} has no location {pointer}"
+                        )));
+                    }
+                }
+                None => pinned.push(citation),
+            }
+        }
+        match &self.evidence {
+            Some(reader) if !pinned.is_empty() => reader.validate(&pinned).await,
+            _ => Ok(()),
+        }
+    }
+
     /// Run the attempt `producer` of one requirement's check over its
     /// resolved bindings.
     ///
@@ -2008,7 +2066,11 @@ impl VerificationEngine {
         producer: &Producer,
     ) -> Result<Judged, EngineError> {
         let sources = bindings.sources();
-        let Bindings { inputs, workspace } = bindings;
+        let Bindings {
+            inputs,
+            workspace,
+            pull_request,
+        } = bindings;
         let timer = BlockTimer::start(&self.clock, "check", check_kind(&requirement.check));
         let (judged, ok) = match &requirement.check {
             Check::Assert {
@@ -2062,10 +2124,16 @@ impl VerificationEngine {
                     iteration_index: producer.iteration_index,
                     tool_calls: tool_calls.handle(),
                 };
-                let result = self.checks.execute(call).await;
+                let result = match self.checks.execute(call).await {
+                    Ok(output) => self
+                        .validate(&output.verdict.citations, &sources, pull_request.as_deref())
+                        .await
+                        .map(|()| output),
+                    Err(error) => Err(error),
+                };
                 tool_calls.settle().await;
                 let (judged, ok) = match result {
-                    Ok(output) => (Judged::cited(output, &sources, capture), true),
+                    Ok(output) => (Judged::checked(output, capture), true),
                     Err(BlockError::Busy { reason }) => {
                         timer.finish(false);
                         self.forget(producer, tool_calls.spent()).await?;
@@ -2174,6 +2242,9 @@ struct Bindings {
     inputs: BTreeMap<String, CallInput>,
     /// Workspace files by authored path.
     workspace: BTreeMap<String, CallInput>,
+    /// A check's retained `pull_request` extraction, which citations of the
+    /// [`PULL_REQUEST_SOURCE`] slot resolve against; `None` for an action.
+    pull_request: Option<Arc<Value>>,
 }
 
 impl Bindings {
@@ -2225,7 +2296,11 @@ fn bindings(scope: &Scope<'_>, attached: &Attached, step: &Step) -> Result<Bindi
     {
         return Err(Missing::failed(format!("`{from}` supplied no evidence")));
     }
-    Ok(Bindings { inputs, workspace })
+    Ok(Bindings {
+        inputs,
+        workspace,
+        pull_request: None,
+    })
 }
 
 /// Evaluate a step's `when` or `until` (`clause`) against `scope`. An
@@ -2416,7 +2491,11 @@ fn check_bindings(
                 mount(scope, attached, &call.workspace, current),
             );
             return match (inputs, workspace) {
-                (Ok(inputs), Ok(workspace)) => Ok(Bindings { inputs, workspace }),
+                (Ok(inputs), Ok(workspace)) => Ok(Bindings {
+                    inputs,
+                    workspace,
+                    pull_request: None,
+                }),
                 (inputs, workspace) => Err(Missing::strongest(
                     [inputs.err(), workspace.err()].into_iter().flatten(),
                 )
@@ -2429,6 +2508,7 @@ fn check_bindings(
     Ok(Bindings {
         inputs,
         workspace: BTreeMap::new(),
+        pull_request: None,
     })
 }
 
@@ -2922,31 +3002,6 @@ impl Judged {
             tool_calls: Vec::new(),
         })
     }
-
-    /// An Agent or code judgment: citations outside the call's original
-    /// `sources` are dropped, and a pass left without a citation is
-    /// inconclusive.
-    ///
-    /// # Errors
-    /// Returns the capture failure of an actual value that cannot be hashed.
-    fn cited(
-        output: CheckOutput,
-        sources: &BTreeSet<SlotName>,
-        capture: ContextCapture,
-    ) -> Result<Self, ExecError> {
-        let mut judged = Self::checked(output, capture)?;
-        judged
-            .citations
-            .retain(|citation| sources.contains(&citation.slot));
-        if judged.outcome == RequirementOutcome::Passed && judged.citations.is_empty() {
-            judged.outcome = RequirementOutcome::Inconclusive;
-            judged.reason = format!(
-                "passed without a citation of reachable original evidence: {}",
-                judged.reason
-            );
-        }
-        Ok(judged)
-    }
 }
 
 /// The requirement at `key`: a step's requirement, or a whole-Verifier one.
@@ -2972,6 +3027,36 @@ fn json(input: &CallInput) -> Cow<'_, Value> {
         }
         CallValue::Publication { .. } | CallValue::Publications { .. } => Cow::Owned(Value::Null),
     }
+}
+
+/// The engine-owned original-source slot of a successful `pull_request`
+/// extraction.
+fn pull_request_source() -> SlotName {
+    SlotName::new(PULL_REQUEST_SOURCE).expect("the pull request source is a valid slot name")
+}
+
+/// Whether `step` extracts the pinned pull request.
+const fn extracts_pull_request(step: &Step) -> bool {
+    matches!(
+        step.action,
+        Action::Extract {
+            extractor: Some(Extractor::PullRequest),
+            ..
+        }
+    )
+}
+
+/// The retained output of the run's settled `pull_request` extraction, which
+/// `spec`'s checks may cite through [`PULL_REQUEST_SOURCE`]; every extraction
+/// of one execution reads the same pinned source.
+fn pull_request_extraction(spec: &VerifierSpec, scope: &Scope<'_>) -> Option<Arc<Value>> {
+    spec.steps
+        .iter()
+        .filter(|step| extracts_pull_request(step))
+        .find_map(|step| match scope.step(&step.id) {
+            Some(Settled::Succeeded { output, .. }) => Some(Arc::clone(output)),
+            _ => None,
+        })
 }
 
 /// The bounded cause a block error carries.

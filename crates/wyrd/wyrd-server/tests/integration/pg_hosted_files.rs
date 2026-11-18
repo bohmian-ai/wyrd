@@ -286,14 +286,15 @@ async fn extract_action_returns_locked_shape() {
         .expect("test server shuts down");
 }
 
-/// Only reachable, pinned slots with existing locations stay cited: PDF
-/// pages and regions, text lines, JSON pointers into inline JSON, and
-/// canonical DOCX pointers.
+/// Citations of pinned slots validate only at existing locations: PDF pages
+/// and regions, text lines, JSON pointers into inline JSON, and canonical
+/// DOCX pointers. Any other location, or an unpinned slot, is refused by name
+/// rather than dropped.
 ///
 /// # Panics
-/// Panics when a fabricated or unreachable citation survives.
+/// Panics when a valid citation is refused or an invalid one accepted.
 #[tokio::test(flavor = "current_thread")]
-async fn citations_must_locate_reachable_evidence() {
+async fn citations_must_locate_pinned_evidence() {
     let uploads = Uploads::start().await;
     let mut slots = BTreeMap::new();
     for (slot, bytes, format) in [
@@ -339,7 +340,7 @@ async fn citations_must_locate_reachable_evidence() {
         slot: SlotName::new(slot).expect("slot"),
         locator,
     };
-    let valid = vec![
+    let valid = [
         cite("deck", Locator::Page(1)),
         cite(
             "deck",
@@ -356,7 +357,7 @@ async fn citations_must_locate_reachable_evidence() {
         cite("facts", Locator::JsonPointer("/rows/0".to_owned())),
         cite("memo", Locator::JsonPointer("/blocks/0/text".to_owned())),
     ];
-    let invalid = vec![
+    let invalid = [
         cite("deck", Locator::Page(2)),
         cite("deck", Locator::Slide(1)),
         cite("notes", Locator::Lines { start: 3, end: 4 }),
@@ -366,22 +367,19 @@ async fn citations_must_locate_reachable_evidence() {
         cite("memo", Locator::JsonPointer("/format".to_owned())),
         cite("ghost", Locator::Page(1)),
     ];
-    let reachable: BTreeSet<SlotName> = ["deck", "memo", "notes", "facts", "ghost"]
-        .into_iter()
-        .map(|slot| SlotName::new(slot).expect("slot"))
-        .collect();
-    let mut all = valid.clone();
-    all.extend(invalid);
-    assert_eq!(evidence.cited(&reachable, all).await.expect("cited"), valid);
-
-    let only_notes = BTreeSet::from([SlotName::new("notes").expect("slot")]);
-    assert!(
-        evidence
-            .cited(&only_notes, vec![cite("deck", Locator::Page(1))])
-            .await
-            .expect("cited")
-            .is_empty()
-    );
+    evidence
+        .validate(&valid.iter().collect::<Vec<_>>())
+        .await
+        .expect("every valid citation names a pinned location");
+    for citation in &invalid {
+        match evidence.validate(&[&valid[0], citation]).await {
+            Err(BlockError::Terminal { reason }) => assert!(
+                reason.starts_with(&format!("invalid citation: slot {}", citation.slot)),
+                "{citation:?}: {reason}"
+            ),
+            other => panic!("{citation:?} was not refused: {other:?}"),
+        }
+    }
     uploads
         .server
         .shutdown()

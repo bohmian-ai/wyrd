@@ -1797,19 +1797,19 @@ async fn concurrent_dispositions_wait_for_all_held_host_work() {
     assert_eq!(step(&outcome, "second").output, None);
 }
 
-/// Agent and code passes need a citation of evidence the call could reach;
-/// unreachable citations are dropped, a citation-less pass is inconclusive,
-/// a check error is inconclusive with its reason, and a failed verdict is
-/// kept as data.
+/// Agent and code verdicts keep their authored outcome, a pass with no
+/// citation included, and `decide` aggregates them unchanged; a citation of a
+/// source the check cannot reach is an explicit validation error, never
+/// dropped, and a check error stays inconclusive with its reason.
 ///
 /// # Panics
-/// Panics when a citation outcome differs.
+/// Panics when an outcome, citation, or reason differs.
 #[tokio::test(start_paused = true)]
-async fn hosted_check_passes_need_reachable_citations() {
+async fn hosted_check_verdicts_are_kept_as_authored() {
     let check = |id: &str| json!({"id": id, "statement": id, "check": code_check(json!({"answer": "inputs.answer", "claim": "requirement.statement"}))});
     let spec = verifier(json!({
         "inputs": {"answer": {"type": "json"}, "policy": {"type": "json"}},
-        "requirements": [check("cited"), check("uncited"), check("elsewhere"), check("errored"), check("rejected")]
+        "requirements": [check("cited"), check("uncited"), check("unsure"), check("elsewhere"), check("errored"), check("rejected")]
     }));
     let answer = json!([{"slot": "answer", "locator": {"json_pointer": "/text"}}]);
     let policy = json!([{"slot": "policy", "locator": {"page": 1}}]);
@@ -1822,6 +1822,10 @@ async fn hosted_check_passes_need_reachable_citations() {
             (
                 "uncited",
                 Ok(verdict(VerificationVerdict::Passed, json!([]))),
+            ),
+            (
+                "unsure",
+                Ok(verdict(VerificationVerdict::Inconclusive, json!([]))),
             ),
             (
                 "elsewhere",
@@ -1840,8 +1844,9 @@ async fn hosted_check_passes_need_reachable_citations() {
         ]),
         ..Script::default()
     });
+    let hosted = engine(&script, InMemoryTraceSource::new(), 4);
     let outcome = run(
-        &engine(&script, InMemoryTraceSource::new(), 4),
+        &hosted,
         &spec,
         json!({"answer": {"text": "hi"}, "policy": {}}),
     )
@@ -1851,15 +1856,31 @@ async fn hosted_check_passes_need_reachable_citations() {
         outcomes(&outcome),
         BTreeMap::from([
             ("cited", RequirementOutcome::Passed),
-            ("uncited", RequirementOutcome::Inconclusive),
+            ("uncited", RequirementOutcome::Passed),
+            ("unsure", RequirementOutcome::Inconclusive),
             ("elsewhere", RequirementOutcome::Inconclusive),
             ("errored", RequirementOutcome::Inconclusive),
             ("rejected", RequirementOutcome::Failed),
         ])
     );
     assert_eq!(requirement(&outcome, "cited").citations.len(), 1);
-    assert!(requirement(&outcome, "elsewhere").citations.is_empty());
+    assert_eq!(requirement(&outcome, "uncited").reason, "scripted");
+    assert_eq!(requirement(&outcome, "unsure").reason, "scripted");
+    assert_eq!(
+        requirement(&outcome, "elsewhere").reason,
+        "invalid citation: slot policy is not evidence this check reaches"
+    );
     assert_eq!(requirement(&outcome, "errored").reason, "invalid verdict");
+    assert_eq!(outcome.verdict, VerificationVerdict::Failed);
+
+    let passes = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "requirements": [check("cited"), check("uncited")]
+    }));
+    let outcome = run(&hosted, &passes, json!({"answer": {"text": "hi"}}))
+        .await
+        .expect("outcome");
+    assert_eq!(outcome.verdict, VerificationVerdict::Passed);
 }
 
 /// A one-column numeric sample batch.
@@ -2698,19 +2719,12 @@ impl EvidenceReader for Kit {
         })
     }
 
-    /// Keep every reachable citation.
+    /// Accept every citation.
     ///
     /// # Errors
     /// Never fails.
-    async fn cited(
-        &self,
-        reachable: &BTreeSet<SlotName>,
-        citations: Vec<Citation>,
-    ) -> Result<Vec<Citation>, BlockError> {
-        Ok(citations
-            .into_iter()
-            .filter(|citation| reachable.contains(&citation.slot))
-            .collect())
+    async fn validate(&self, _citations: &[&Citation]) -> Result<(), BlockError> {
+        Ok(())
     }
 
     /// Select the kit's files.

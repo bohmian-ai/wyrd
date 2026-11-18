@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use skald_spec::{Prompt, ResponseFormat, ResponseType};
 
 use super::extract::ExtractOutput;
-use super::pull_request::Extractor;
+use super::pull_request::{Extractor, PULL_REQUEST_SOURCE};
 use super::reference::{OrderBy, Reference, ReferenceRoot, SourceField};
 use super::schema_path::{admits, fits};
 use super::{
@@ -309,11 +309,32 @@ where
     ///
     /// # Errors
     /// Returns the first refusal any rule produces, in authoring order: slots,
-    /// evidence mode, pass rate, step shapes, planning, then requirements.
+    /// the pull-request source slot, evidence mode, pass rate, step shapes, planning, then requirements.
     fn run(mut self) -> Result<(), WyrdError> {
         let spec = self.spec;
         for (slot, input) in &spec.inputs {
             validate_slot(slot, input)?;
+        }
+        let extracts_pull_request = spec.steps.iter().any(|step| {
+            matches!(
+                step.action,
+                Action::Extract {
+                    extractor: Some(Extractor::PullRequest),
+                    ..
+                }
+            )
+        });
+        if extracts_pull_request
+            && spec
+                .inputs
+                .keys()
+                .any(|slot| slot.as_str() == PULL_REQUEST_SOURCE)
+        {
+            return Err(invalid(
+                "source_slot",
+                &format!("inputs.{PULL_REQUEST_SOURCE}"),
+                "`pull_request` is the pull-request extraction's own source slot; rename this input",
+            ));
         }
         if let Some(order) = &spec.order_by {
             validate_order(spec, order)?;
@@ -1960,10 +1981,12 @@ mod tests {
     /// A pull-request extraction step takes no media slot, and later steps
     /// bind its output by field or whole. Its shape is server-owned, so
     /// validation knows no output schema and leaves paths into it, as into
-    /// code output, to resolve at execution.
+    /// code output, to resolve at execution. Its source slot is the
+    /// engine's own, so no input may take its name.
     ///
     /// # Panics
-    /// Panics when either Verifier is refused.
+    /// Panics when either Verifier is refused or a colliding input is
+    /// accepted.
     #[test]
     fn pull_request_extraction_output_binds_without_a_client_schema() {
         let body = json!({
@@ -1987,12 +2010,21 @@ mod tests {
             .validate()
             .expect("a pull-request extraction Verifier validates");
         parse(&with(
-            body,
+            body.clone(),
             "/steps/1/action/inputs/changes",
             json!("steps.extract-pr.output.diff"),
         ))
         .validate()
         .expect("a path into the output is not checked before execution");
+        assert_eq!(
+            refusal(&with(
+                body,
+                "/inputs",
+                json!({"pull_request": {"type": "json"}}),
+            )),
+            ("source_slot".to_owned(), "inputs.pull_request".to_owned()),
+            "a caller slot cannot replace the extraction's own source"
+        );
     }
 
     /// Agent calls follow their Prompt placeholders and position rules; a

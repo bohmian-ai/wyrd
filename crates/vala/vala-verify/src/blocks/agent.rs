@@ -30,7 +30,6 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::SlotName;
 use wyrd_spec::reference::{CardRef, InlineableRef};
 use wyrd_spec::verification::TaskId;
-use wyrd_spec::verification::VerificationVerdict;
 use wyrd_spec::verification::execution::{
     CallProvenance, Citation, InputDeclaration, Producer, Verdict,
 };
@@ -115,17 +114,15 @@ pub trait EvidenceReader: Send + Sync {
         evidence: &InputDeclaration,
     ) -> Result<(MediaRef, Box<dyn Any + Send + Sync>), BlockError>;
 
-    /// The subset of `citations` whose slot is in `reachable` and whose
-    /// locator names a location in that slot's pinned original evidence.
+    /// Check that each of `citations`, whose slots the engine has already
+    /// found reachable, names a location in that slot's pinned original
+    /// evidence.
     ///
     /// # Errors
-    /// Returns [`BlockError::Retryable`] when evidence cannot be read now;
-    /// evidence that can never be read leaves its citations invalid.
-    async fn cited(
-        &self,
-        reachable: &BTreeSet<SlotName>,
-        citations: Vec<Citation>,
-    ) -> Result<Vec<Citation>, BlockError>;
+    /// Returns [`BlockError::Terminal`] naming the first citation of a slot
+    /// that is not pinned, cannot ever be read, or has no such location, and
+    /// [`BlockError::Retryable`] when evidence cannot be read now.
+    async fn validate(&self, citations: &[&Citation]) -> Result<(), BlockError>;
 
     /// The inventory paths of exact Artifact `card` that `path` selects:
     /// that file, every file beneath that directory on `/` boundaries, or
@@ -558,10 +555,8 @@ impl ActionExecutor for AgentExecutor {
 
 #[async_trait]
 impl CheckExecutor for AgentExecutor {
-    /// Run an Agent check and return its Verdict.
-    ///
-    /// Only citations into original evidence reachable through the call's
-    /// bindings survive; a pass left without one becomes inconclusive.
+    /// Run an Agent check and return its Verdict as the Agent authored it;
+    /// the engine validates its citations.
     ///
     /// # Errors
     /// Returns [`BlockError::Terminal`] for a non-Agent check, a step-position
@@ -590,20 +585,8 @@ impl CheckExecutor for AgentExecutor {
             ));
         };
         let started = phase_start();
-        let mut verdict = verdict_from(&self.schemas, schema, Value::Object(answer))?;
-        let started = phase_end("verdict", started);
-        let citations = std::mem::take(&mut verdict.citations);
-        if let Some(reader) = &self.evidence {
-            verdict.citations = reader.cited(&reachable, citations).await?;
-        }
-        phase_end("cite", started);
-        if verdict.outcome == VerificationVerdict::Passed && verdict.citations.is_empty() {
-            verdict.outcome = VerificationVerdict::Inconclusive;
-            verdict.reason = format!(
-                "no valid original-evidence citation supports this pass: {}",
-                verdict.reason
-            );
-        }
+        let verdict = verdict_from(&self.schemas, schema, Value::Object(answer))?;
+        phase_end("verdict", started);
         Ok(CheckOutput {
             verdict,
             actual: None,

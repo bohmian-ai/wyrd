@@ -70,7 +70,7 @@ const FOLLOWS =
 const BREAKS =
   '{"outcome":"failed","reason":"contradicts the policy","citations":[{"slot":"answer","locator":{"json_pointer":"/text"}}]}';
 
-/** The judge's Verdict for an answer containing `UNCITED`: a pass with no citation, which must not count as one. */
+/** The judge's Verdict for an answer containing `UNCITED`: a pass with no citation, which counts as authored. */
 const UNCITED = '{"outcome":"passed","reason":"trust me","citations":[]}';
 
 /** The judge's Verdict for an answer containing `JUDGE-FOREIGN-CITE`: a pass citing a JSON pointer the answer does not have. */
@@ -582,11 +582,11 @@ test("judge verdict fails the agent check", async ({ desk }) => {
   expect(result.outcome.verdict).toBe("failed");
 });
 
-test("uncited judge verdict cannot pass", async ({ desk }) => {
+test("uncited judge verdict passes as authored", async ({ desk }) => {
   const result = await reviewNow(desk, review("UNCITED: refunds follow our policy.", 50));
 
-  expect(requirement(result, "follows-policy").outcome).not.toBe("passed");
-  expect(result.outcome.verdict).not.toBe("passed");
+  const judged = requirement(result, "follows-policy");
+  expect([judged.outcome, judged.reason, judged.citations ?? []]).toEqual(["passed", "trust me", []]);
 });
 
 test("raising code check cannot pass", async ({ desk }) => {

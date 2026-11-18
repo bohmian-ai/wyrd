@@ -17,7 +17,7 @@ Enforcement lives in your code because the right response depends on the action:
 
 ## When should I use verify, submit, or a schedule?
 
-Use `verify` when the application must decide before it responds or acts. Use `submit` when the decision can wait, the check is too slow for the request, or the evidence lands after the call. Use a schedule to judge a time window of recorded samples, as with drift. [verify and submit](/understand/how-verification-works/#verify-and-submit) compares the three. `verify` and `submit` run the same Verifier; schedules judge drift Verifiers, which refuse `verify`.
+Use `verify` when the application must decide before it responds or acts. Use `submit` when the decision can wait, the check is too slow for the request, or the evidence lands after the call. Use a schedule to judge a time window of recorded samples, as with drift. [verify and submit](/understand/how-verification-works/#verify-and-submit) compares the three; [Verify during a request](/build-and-verify/verify/verify-a-request-in-real-time/) and [Check on a schedule](/build-and-verify/verify/monitor-drift/) run the first and the last. `verify` and `submit` run the same Verifier; schedules judge drift Verifiers, which refuse `verify`.
 
 ## What happens when evidence is missing?
 

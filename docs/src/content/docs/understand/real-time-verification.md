@@ -110,7 +110,7 @@ Getting a result back is not the same as having it saved. Some checking systems 
 
 ## These ideas in Wyrd
 
-Wyrd is one implementation of these ideas. The page [How verification works in Wyrd](/understand/how-verification-works/) follows the report example through Wyrd, including where the time goes and what Wyrd keeps. The [Quickstart](/get-started/quickstart/) runs the example. Wyrd calls a check's result a verdict. The guide [Act on verdicts in production](/build-and-verify/verify/act-on-verdicts-in-production/) covers deadlines, what an AI provider sees, and cost. Wyrd does not choose an application's requirements, or its plan for when a check can't finish.
+Wyrd is one implementation of these ideas. The page [How verification works in Wyrd](/understand/how-verification-works/) follows the report example through Wyrd, including where the time goes and what Wyrd keeps. The [Quickstart](/get-started/quickstart/) runs the example, and [Verify during a request](/build-and-verify/verify/verify-a-request-in-real-time/) checks each report inside a web API before releasing it. [Check on a schedule](/build-and-verify/verify/monitor-drift/) runs the recurring row of the table above. Wyrd calls a check's result a verdict. The guide [Act on verdicts in production](/build-and-verify/verify/act-on-verdicts-in-production/) covers deadlines, what an AI provider sees, and cost. Wyrd does not choose an application's requirements, or its plan for when a check can't finish.
 
 ## Sources
 

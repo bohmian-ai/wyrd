@@ -1064,7 +1064,7 @@ The judge's wording varies. `release-check@0.1.0` still mounts the original poli
 
 ## Next
 
-[How verification works in Wyrd](/wyrd/understand/how-verification-works/) explains what happens inside the call, and [Write verifiable requirements](/wyrd/build-and-verify/declare/write-verifiable-requirements/) turns your own goals into requirements like these three. [ASGI apps](/wyrd/connect/integrate-asgi/) puts the same call inside a FastAPI or Starlette request. [What can I build?](/wyrd/get-started/what-can-i-build/) matches your problem to a larger workflow. The [Verifier reference](/wyrd/reference/verifier-card/) lists every field you can declare.
+[How verification works in Wyrd](/wyrd/understand/how-verification-works/) explains what happens inside the call, and [Write verifiable requirements](/wyrd/build-and-verify/declare/write-verifiable-requirements/) turns your own goals into requirements like these three. [Verify during a request](/wyrd/build-and-verify/verify/verify-a-request-in-real-time/) puts the same call inside a web API that sends a report only after it passes, and [ASGI apps](/wyrd/connect/integrate-asgi/) records each FastAPI or Starlette request as evidence. [What can I build?](/wyrd/get-started/what-can-i-build/) matches your problem to a larger workflow. The [Verifier reference](/wyrd/reference/verifier-card/) lists every field you can declare.
 
 # What can I build?
 
@@ -2488,7 +2488,7 @@ Conclude that a step was skipped only when the capture path records every execut
 
 ## Next
 
-[Act on verdicts in production](/wyrd/build-and-verify/verify/act-on-verdicts-in-production/) covers what your application does with each outcome.
+[Verify an agent's workflow](/wyrd/build-and-verify/verify/verify-an-agent-workflow/) requires a positive record of each step from a trace. [Act on verdicts in production](/wyrd/build-and-verify/verify/act-on-verdicts-in-production/) covers what your application does with each outcome.
 
 # Write a Verifier
 
@@ -4818,7 +4818,7 @@ Each `agent` check costs at least one model call per verification, and more when
 
 ## Next
 
-[Technical questions](/wyrd/understand/technical-questions/) answers common adoption questions, and the [Verifier Card reference](/wyrd/reference/verifier-card/) lists every field.
+[Verify during a request](/wyrd/build-and-verify/verify/verify-a-request-in-real-time/) builds this handler and runs each outcome, and [Investigate a failed verification](/wyrd/build-and-verify/verify/run-a-verification-and-inspect-its-evidence/) follows a stored failure back to the requirement, evidence, and versions behind it. [Technical questions](/wyrd/understand/technical-questions/) answers common adoption questions, and the [Verifier Card reference](/wyrd/reference/verifier-card/) lists every field.
 
 # LLM gateway
 
@@ -6216,7 +6216,7 @@ Getting a result back is not the same as having it saved. Some checking systems 
 
 ## These ideas in Wyrd
 
-Wyrd is one implementation of these ideas. The page [How verification works in Wyrd](/wyrd/understand/how-verification-works/) follows the report example through Wyrd, including where the time goes and what Wyrd keeps. The [Quickstart](/wyrd/get-started/quickstart/) runs the example. Wyrd calls a check's result a verdict. The guide [Act on verdicts in production](/wyrd/build-and-verify/verify/act-on-verdicts-in-production/) covers deadlines, what an AI provider sees, and cost. Wyrd does not choose an application's requirements, or its plan for when a check can't finish.
+Wyrd is one implementation of these ideas. The page [How verification works in Wyrd](/wyrd/understand/how-verification-works/) follows the report example through Wyrd, including where the time goes and what Wyrd keeps. The [Quickstart](/wyrd/get-started/quickstart/) runs the example, and [Verify during a request](/wyrd/build-and-verify/verify/verify-a-request-in-real-time/) checks each report inside a web API before releasing it. [Check on a schedule](/wyrd/build-and-verify/verify/monitor-drift/) runs the recurring row of the table above. Wyrd calls a check's result a verdict. The guide [Act on verdicts in production](/wyrd/build-and-verify/verify/act-on-verdicts-in-production/) covers deadlines, what an AI provider sees, and cost. Wyrd does not choose an application's requirements, or its plan for when a check can't finish.
 
 ## Sources
 
@@ -6454,7 +6454,7 @@ Every stored result names the exact Verifier and subject versions it judged, inc
 
 ## Next
 
-The [Quickstart](/wyrd/get-started/quickstart/) runs the finance example. [Write verifiable requirements](/wyrd/build-and-verify/declare/write-verifiable-requirements/), [Establish sufficient evidence](/wyrd/build-and-verify/observe/establish-sufficient-evidence/), and [Act on verdicts in production](/wyrd/build-and-verify/verify/act-on-verdicts-in-production/) apply this to your own system, and the [Verifier Card reference](/wyrd/reference/verifier-card/) lists every field.
+The [Quickstart](/wyrd/get-started/quickstart/) runs the finance example, and [Verify during a request](/wyrd/build-and-verify/verify/verify-a-request-in-real-time/), [Verify an agent's workflow](/wyrd/build-and-verify/verify/verify-an-agent-workflow/), [Check on a schedule](/wyrd/build-and-verify/verify/monitor-drift/), and [Investigate a failed verification](/wyrd/build-and-verify/verify/run-a-verification-and-inspect-its-evidence/) run each path on this page. [Write verifiable requirements](/wyrd/build-and-verify/declare/write-verifiable-requirements/), [Establish sufficient evidence](/wyrd/build-and-verify/observe/establish-sufficient-evidence/), and [Act on verdicts in production](/wyrd/build-and-verify/verify/act-on-verdicts-in-production/) apply this to your own system, and the [Verifier Card reference](/wyrd/reference/verifier-card/) lists every field.
 
 # Runs and evidence
 
@@ -6751,7 +6751,7 @@ Enforcement lives in your code because the right response depends on the action:
 
 ## When should I use verify, submit, or a schedule?
 
-Use `verify` when the application must decide before it responds or acts. Use `submit` when the decision can wait, the check is too slow for the request, or the evidence lands after the call. Use a schedule to judge a time window of recorded samples, as with drift. [verify and submit](/wyrd/understand/how-verification-works/#verify-and-submit) compares the three. `verify` and `submit` run the same Verifier; schedules judge drift Verifiers, which refuse `verify`.
+Use `verify` when the application must decide before it responds or acts. Use `submit` when the decision can wait, the check is too slow for the request, or the evidence lands after the call. Use a schedule to judge a time window of recorded samples, as with drift. [verify and submit](/wyrd/understand/how-verification-works/#verify-and-submit) compares the three; [Verify during a request](/wyrd/build-and-verify/verify/verify-a-request-in-real-time/) and [Check on a schedule](/wyrd/build-and-verify/verify/monitor-drift/) run the first and the last. `verify` and `submit` run the same Verifier; schedules judge drift Verifiers, which refuse `verify`.
 
 ## What happens when evidence is missing?
 

@@ -79,4 +79,4 @@ Each `agent` check costs at least one model call per verification, and more when
 
 ## Next
 
-[Technical questions](/understand/technical-questions/) answers common adoption questions, and the [Verifier Card reference](/reference/verifier-card/) lists every field.
+[Verify during a request](/build-and-verify/verify/verify-a-request-in-real-time/) builds this handler and runs each outcome, and [Investigate a failed verification](/build-and-verify/verify/run-a-verification-and-inspect-its-evidence/) follows a stored failure back to the requirement, evidence, and versions behind it. [Technical questions](/understand/technical-questions/) answers common adoption questions, and the [Verifier Card reference](/reference/verifier-card/) lists every field.

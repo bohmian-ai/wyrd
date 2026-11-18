@@ -77,4 +77,4 @@ Conclude that a step was skipped only when the capture path records every execut
 
 ## Next
 
-[Act on verdicts in production](/build-and-verify/verify/act-on-verdicts-in-production/) covers what your application does with each outcome.
+[Verify an agent's workflow](/build-and-verify/verify/verify-an-agent-workflow/) requires a positive record of each step from a trace. [Act on verdicts in production](/build-and-verify/verify/act-on-verdicts-in-production/) covers what your application does with each outcome.

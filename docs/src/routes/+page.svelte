@@ -13,8 +13,8 @@
 
   let { data } = $props();
 
-  // Landing: the painted cover and value statement, the finance verification
-  // figure, the Declare → Observe → Verify strip, the Quickstart, the platform
+  // Landing: the painted cover and value statement, the report-release
+  // verification figure, the Declare → Observe → Verify strip, the Quickstart, the platform
   // summary, the workflow strip, then one door per published section.
   // Every internal action resolves through published content, so a section or
   // a start page appears here only once its page exists.
@@ -52,8 +52,6 @@
     <p class="eyebrow">Wyrd · Open-source real-time verification for your applications · v{__WYRD_VERSION__}</p>
     <h1><span class="d">Declare.</span><br /><span class="o">Observe.</span><br />Verify.</h1>
     <p class="tagline">The only real-time verification system built for your applications.</p>
-    <p class="lede">You built the system. How do you know it's behaving correctly?</p>
-    <p class="lede">Live verification puts the verdict before the decision.</p>
     <div class="cta">
       {#if start}
         {#if quickstart}<a class="button primary" href={`${base}${quickstart.path}`}>Verify in real time →</a>{/if}
@@ -68,8 +66,8 @@
 
 <section class="flow dark-field" aria-labelledby="flow-h">
   <div class="wrap">
-    <h2 id="flow-h">Verification in the flow.</h2>
-    <p class="sub">Your finance API calls Wyrd to verify each report before releasing it. Wyrd returns the verdict; your API decides.</p>
+    <h2 id="flow-h">Verify before your application acts.</h2>
+    <p class="sub">Your application verifies what it is about to do against your requirements, gets a verdict for each one, and decides what happens next.</p>
     <FinanceFlow code={data.flow} />
   </div>
 </section>
@@ -77,11 +75,11 @@
 <div class="wrap">
   <section class="layers" aria-labelledby="layers-h">
     <p class="eyebrow">Core platform</p>
-    <h2 id="layers-h">One loop, three steps.</h2>
+    <h2 id="layers-h">How Wyrd works.</h2>
     <ol class="strip">
-      <li><span class="n">01</span><b>Declare</b><p>Describe the system in YAML, and bind the Verifiers that check them.</p></li>
-      <li><span class="n">02</span><b class="o">Observe</b><p>Record what the system does using Wyrd's purpose-built high-throughput data plane.</p></li>
-      <li><span class="n">03</span><b>Verify</b><p>Verify behavior in real time or in the background using Wyrd's verification engine.</p></li>
+      <li><span class="n">01</span><b>Declare</b><p>Write your application's requirements in YAML or using language SDKs and bind the Verifiers that judge them.</p></li>
+      <li><span class="n">02</span><b class="o">Observe</b><p>Record what your application does as it runs: its inputs, outputs, and actions.</p></li>
+      <li><span class="n">03</span><b>Verify</b><p>Verify that behavior against each requirement, before your application acts or in the background, and get a verdict with its reason.</p></li>
     </ol>
   </section>
 
@@ -89,8 +87,8 @@
     <section class="qs" aria-labelledby="qs-h">
       <div>
         <p class="eyebrow">Get started</p>
-        <h2 id="qs-h">From intent to evidence.</h2>
-        <p class="sub">One finance Service and one Verifier: declare what a report release must satisfy, verify four releases, and read the verdicts.</p>
+        <h2 id="qs-h">Build your own verification.</h2>
+        <p class="sub">Declare your requirements, observe real behavior, and verify it before your application acts.</p>
       </div>
       <nav class="links" aria-label="Get started">
         {#each startPages as item (item.path)}
@@ -101,7 +99,7 @@
       <div class="loop">
         <Tabs>
           <Tab label="01 Declare">
-            <p class="step">The Service binds one Verifier. The Verifier declares the release it takes and three requirements: two assertions on records your application supplies, and an Agent that reads the company sharing policy PDF and judges the report and its purpose.</p>
+            <p class="step">The Verifier declares the release it takes and three requirements: two assertions on records your application supplies, and an Agent that judges the report against the company sharing policy. Code and YAML declare the same Verifier; YAML is recommended in production.</p>
             <LangTabs langs={['python', 'rust', 'typescript', 'yaml']}>
               {#each data.declare as o (o.lang)}
                 <LangTab lang={o.lang}><CodeBlock lang={o.lang} title={o.title} html={o.html} /></LangTab>
@@ -109,7 +107,7 @@
             </LangTabs>
           </Tab>
           <Tab label="02 Observe">
-            <p class="step">Start a Run and send each release the application is about to make. <code>verify</code> waits for the verdict; <code>submit</code> queues the check and returns at once.</p>
+            <p class="step">Start a Run and send each release the application is about to make. <code>verify</code> waits for the verdict.</p>
             <LangTabs langs={['python', 'rust', 'typescript']}>
               {#each data.observe as o (o.lang)}
                 <LangTab lang={o.lang}><CodeBlock lang={o.lang} title={o.title} html={o.html} /></LangTab>
@@ -117,7 +115,7 @@
             </LangTabs>
           </Tab>
           <Tab label="03 Verify">
-            <p class="step">Only the first release passes. Each failed release names the requirement that failed and the reason. A failed check is a result, not an exception.</p>
+            <p class="step">Only the first release passes. Each failed release names the requirement that failed and the reason. A failed verification is a result, not an exception.</p>
             <CodeBlock lang="text" {...data.verify} />
           </Tab>
         </Tabs>
@@ -137,7 +135,7 @@
 
   <section class="workflows" aria-labelledby="workflows-h">
     <h2 id="workflows-h">One verification engine. Build your workflow.</h2>
-    <p class="sub">The same engine checks one request, an agent run, a review pipeline, or a whole session.</p>
+    <p class="sub">The same engine verifies one request, an agent run, a review pipeline, or a whole session.</p>
     <WorkflowStrip />
   </section>
 
@@ -164,6 +162,8 @@
 
   .cover {
     position: relative;
+    display: flex;
+    align-items: center;
     min-height: 720px;
     overflow: hidden;
   }
@@ -202,16 +202,6 @@
     font-weight: 500;
     line-height: 1.15;
     letter-spacing: -0.02em;
-  }
-  .lede {
-    max-width: 40ch;
-    margin: 0;
-    color: var(--muted);
-    font-size: 18px;
-    line-height: 1.45;
-  }
-  .lede + .lede {
-    margin-top: 8px;
   }
   .cta {
     display: flex;

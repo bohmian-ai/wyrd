@@ -108,6 +108,30 @@ The program uploads the policy with its extracted text and declares the Service,
 
 The judge's wording varies. The failed releases pass both assertions and fail `follows-policy`: the judge read the policy, found the bank account, and found that the policy permits sharing only for external audits.
 
+<Aside type="note" title="Declare the same Cards from YAML">
+
+In production, Cards usually live in YAML files instead of code; [Code or YAML](/understand/how-verification-works/#code-or-yaml) explains why. These three files declare the same Service, Verifier, and judge Agent. Upload the policy with `wyrd artifact upload company-sharing-policy.pdf --name company-sharing-policy --version 0.1.0 --extract`, then pass the Service file to `WyrdState.declare` instead of the Service built in code.
+
+<Tabs>
+<Tab label="finance-release.yaml">
+
+<CodeFromFile file="examples/finance-release/finance-release.yaml" lang="yaml" title="finance-release.yaml" />
+
+</Tab>
+<Tab label="release-check.yaml">
+
+<CodeFromFile file="examples/finance-release/release-check.yaml" lang="yaml" title="release-check.yaml" />
+
+</Tab>
+<Tab label="policy-judge.yaml">
+
+<CodeFromFile file="examples/finance-release/policy-judge.yaml" lang="yaml" title="policy-judge.yaml" />
+
+</Tab>
+</Tabs>
+
+</Aside>
+
 `verify` returns before your code acts, so the verdict is part of the request. Assertions add little time; the policy judge adds up to three model calls to that request. If the judge can't decide, the verdict is `inconclusive`, which is never a pass. [`submit`](/understand/how-verification-works/#verify-and-submit) queues the same check when the request can't wait.
 
 Run the program again. Nothing changed, so it declares nothing new.

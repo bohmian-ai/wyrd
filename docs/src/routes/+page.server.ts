@@ -1,9 +1,10 @@
 import { highlight, sliceRegion, stripAnchors, tokenLines } from '$lib/mdsvex/highlight.js';
 
-// The landing page shows the Quickstart's finance release example, which the
-// SDK journeys run: its declarations, programs, output, and API come from
-// examples/finance-release. Vite inlines them at build time, so the built
-// server reads no files.
+// The landing page shows slices of the Quickstart's report-release example,
+// which the SDK journeys run: the finance API, the Verifier in each language
+// and in YAML, the verify call, and its output. The full program lives only on
+// the Quickstart. Vite inlines the sources at build time, so the built server
+// reads no files.
 const sources: Record<string, string> = import.meta.glob('../../../examples/finance-release/*.{py,rs,ts,txt,yaml}', {
   query: '?raw',
   import: 'default',
@@ -11,7 +12,7 @@ const sources: Record<string, string> = import.meta.glob('../../../examples/fina
 });
 
 const finance = (file: string) => sources[`../../../examples/finance-release/${file}`];
-const region = (file: string, name: string) => sliceRegion(finance(file), name, `examples/finance-release/${file}`);
+const region = (file: string, name: string) => stripAnchors(sliceRegion(finance(file), name, `examples/finance-release/${file}`));
 
 const LANGS = [
   { lang: 'python', ext: 'py', declare: 'finance_service.py', observe: 'finance_release.py' },
@@ -25,10 +26,10 @@ export function load() {
   return {
     flow: tokenLines(api, 'python'),
     declare: [
-      ...LANGS.map((l) => ({ lang: l.lang, title: l.declare, html: highlight(stripAnchors(finance(`finance_service.${l.ext}`)), l.lang) })),
-      { lang: 'yaml' as const, title: 'release-check.yaml', html: highlight(finance('release-check.yaml'), 'yaml') }
+      ...LANGS.map((l) => ({ lang: l.lang, title: l.declare, html: highlight(region(`finance_service.${l.ext}`, 'verifier'), l.lang) })),
+      { lang: 'yaml' as const, title: 'release-check.yaml', html: highlight(region('release-check.yaml', 'verifier'), 'yaml') }
     ],
-    observe: LANGS.map((l) => ({ lang: l.lang, title: l.observe, html: highlight(stripAnchors(finance(`finance_release.${l.ext}`)), l.lang) })),
+    observe: LANGS.map((l) => ({ lang: l.lang, title: l.observe, html: highlight(region(`finance_release.${l.ext}`, 'verify'), l.lang) })),
     verify: { title: 'output', html: highlight(finance('output.txt'), 'text') }
   };
 }

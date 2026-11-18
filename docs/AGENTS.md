@@ -89,6 +89,11 @@ Copy the named page when writing a new one of the same shape.
   directly after the command.
 - Use `<LangTabs langs={['python', 'rust', 'typescript']}>` for anything that
   differs by language, in that order.
+- Show a Card declaration one of two ways. Where the page teaches the code
+  route, use code tabs and offer the same Cards as YAML. Everywhere else, show
+  YAML, the recommended production route, and link to Author in code. Show a
+  long example in full only on the page that runs it; other pages show the
+  region that makes their point.
 - Pin versions in install commands to the documented release.
 - Public pages use the reader's tools (`uv add`, `cargo add`, `pnpm add`,
   `wyrd ...`), never repository tasks; `scripts/check_commands.py` enforces it.

@@ -81,6 +81,7 @@ fn release_check(policy: &Artifact) -> Result<Verifier, Box<dyn Error>> {
         policy.file("extracted/company-sharing-policy.pdf.json"),
     );
 
+    // ANCHOR: verifier
     Ok(Verifier::new("release-check", None)
         .inputs(InputSlot::fields_of::<Release>())
         .requirements([
@@ -108,6 +109,7 @@ fn release_check(policy: &Artifact) -> Result<Verifier, Box<dyn Error>> {
                 ),
             ),
         ]))
+    // ANCHOR_END: verifier
 }
 
 /// `policy-judge`: a model that reads the policy with `fs.read` and returns

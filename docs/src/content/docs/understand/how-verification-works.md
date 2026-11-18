@@ -27,11 +27,7 @@ A **Card** is Wyrd's versioned record of a component, such as a Service or an Ag
 
 ## One verification, end to end
 
-The example is the report release from [Real-time verification](/understand/real-time-verification/#the-same-check-can-arrive-too-late), built as a finance API. Before it sends a report to an outside party, the API verifies the release:
-
-<CodeFromFile file="examples/finance-release/api.py" lang="python" title="api.py" region="handler" />
-
-The request moves through six stages:
+The example is the report release from [Real-time verification](/understand/real-time-verification/#the-same-check-can-arrive-too-late), built as a finance API. Before it sends a report to an outside party, the API verifies the release. The request moves through six stages, and [Act on verdicts in production](/build-and-verify/verify/act-on-verdicts-in-production/#1-release-only-what-passed) shows the handler's code:
 
 1. **Request.** `POST /reports/send` arrives with the report, its purpose, the recipient, and the destination.
 2. **Requirements and evidence.** The `release-check` Verifier declares what must be true and which evidence it reads. The request body is the evidence; the sharing policy is a file the Verifier version names.
@@ -95,6 +91,15 @@ Files are mounted unchanged and unparsed. `fs.read` and `fs.search` serve raw te
 ### Bindings
 
 A binding attaches a Verifier to what it checks, under `verified_by`. It can sit on a Service, on one of its components (an Agent, Model, Data, Prompt, or any other Card the Service uses), or on a standalone Agent. A binding can also name a Trigger in `runs_on`, so the server runs it on a schedule, and Operators in `on_failure`.
+
+## Code or YAML
+
+A Verifier, and every other Card, can be declared in two ways. Both produce the same Cards, and the server can't tell them apart.
+
+- **In code.** The Python, Rust, and TypeScript SDKs build Cards with the same field names as the YAML. This is the quickest way to start: one program declares the Cards and verifies with them. The [Quickstart](/get-started/quickstart/) and [Author in code](/build-and-verify/declare/author-in-code/) use this route.
+- **In YAML files.** Each Card is a file that lives in the repository beside the application. This is the recommended route in production. Any language can declare the same files, a change to a requirement is reviewed in a pull request like any other change, and CI declares the files with `wyrd declare` before the application deploys. The [Build and verify](/build-and-verify/declare/define-a-service/) guides and [Deploy a Service from CI](/operate/deploy-a-service-from-ci/) use this route.
+
+A team can start in code and move to YAML later, because both routes declare the same Cards.
 
 ## Calls, verdicts, and failures
 

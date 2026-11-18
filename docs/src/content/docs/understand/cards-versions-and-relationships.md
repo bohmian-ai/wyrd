@@ -10,20 +10,9 @@ A Card is a versioned declaration of one AI system component, or of one Verifier
 
 ## The shape of a Card
 
-These are the two Cards from the [setup check](/get-started/setup/#3-check-it-end-to-end):
-
-<Tabs>
-<Tab label="support-reply.yaml">
+This is the Service Card from the [setup check](/get-started/setup/#3-check-it-end-to-end):
 
 <CodeFromFile file="examples/setup-check/support-reply.yaml" lang="yaml" title="support-reply.yaml" />
-
-</Tab>
-<Tab label="no-refund-promise.yaml">
-
-<CodeFromFile file="examples/setup-check/no-refund-promise.yaml" lang="yaml" title="no-refund-promise.yaml" />
-
-</Tab>
-</Tabs>
 
 An author writes `apiVersion`, `kind`, `metadata`, and `spec`. The server adds `relationships` and `status`.
 

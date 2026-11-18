@@ -79,7 +79,6 @@ describe('landing finance figure', () => {
   it('homepage shows embedded finance verification', () => {
     const { body } = render(Landing, { props: { data: landingData() } });
     expect(body).toContain('The only real-time verification system built for your applications.');
-    expect(body).toMatch(/You built the system\. How do you know it(&#39;|')s behaving correctly\?/);
     expect(body.indexOf('id="flow-h"')).toBeLessThan(body.indexOf('id="layers-h"'));
     expect(body.indexOf('id="workflows-h"')).toBeGreaterThan(body.indexOf('id="platform-h"'));
     // Every displayed code line is a line of the journey-tested API, numbered 1 to 12.

@@ -28,131 +28,41 @@ Live verification puts the verdict before the decision. Your application asks Wy
 
 ## An example
 
-An application shares synthetic customer reports with outside auditors. Before it sends one, it checks three requirements in one Verifier. A model reads the company sharing policy PDF and judges the report and its purpose; the other two are assertions on records the application supplies:
+An application shares customer reports with outside auditors. Before it sends a report, it checks three requirements, declared together as one Verifier. Two of them compare a value in the records the application sends. In the third, an AI model reads the company's sharing policy PDF and decides whether the policy allows this report to be shared for this purpose:
 
-```python title="finance_service.py"
-from pydantic import BaseModel
-from wyrd.verify import (
-    Agent,
-    AgentRunConfig,
-    Artifact,
-    Check,
-    ComparisonOperator,
-    ExecutionRoute,
-    Prompt,
-    Requirement,
-    ResponseFormat,
-    Service,
-    Verifier,
-)
-
-# The evidence the application sends for each release.
-class Report(BaseModel):
-    text: str
-
-class Recipient(BaseModel):
-    email: str
-    authorized: bool
-
-class Destination(BaseModel):
-    url: str
-    restricted: bool
-
-class Release(BaseModel):
-    purpose: str
-    report: Report
-    recipient: Recipient
-    destination: Destination
-
-# The company sharing policy, uploaded from this directory with its text
-# extracted so the judge can read it.
-policy = Artifact.from_path("company-sharing-policy", "company-sharing-policy.pdf").extract(True)
-
-# `policy-judge`: a model that reads the policy with `fs.read` and returns a
-# verdict on the report. Its model calls go through the `openai` gateway
-# deployment.
-policy_judge = Agent(
-    "policy-judge",
-    prompt=Prompt.openai_chat(
-        "gpt-4o",
-        messages=(
-            "Read /inputs/company-sharing-policy.pdf.json with fs.read. Decide whether the company sharing "
-            "policy permits sharing this report with this recipient for this purpose, "
-            "citing the report and the policy line you apply. Purpose: {{purpose}} "
-            "Report: {{report}} Recipient: {{recipient}}"
-        ),
-        response_format=ResponseFormat.verdict(),
-    ),
-    execution_route=ExecutionRoute.wyrd_gateway(deployment="openai"),
-    tool_names=["fs.read"],
-    run_config=AgentRunConfig(max_iterations=3),
-)
-
-follows_policy = (
-    Check.agent(policy_judge)
-    .inputs({"purpose": "inputs.purpose", "report": "inputs.report", "recipient": "inputs.recipient"})
-    .add_workspace("/inputs/company-sharing-policy.pdf.json", policy.file("extracted/company-sharing-policy.pdf.json"))
-)
-
-release_check = Verifier(
-    "release-check",
-    inputs=Release,
-    requirements=[
-        Requirement(
-            "recipient-authorized",
-            "The recipient is authorized to receive the report.",
-            Check.assert_("inputs.recipient.authorized", ComparisonOperator.Equals, True),
-        ),
-        Requirement(
-            "follows-policy",
-            "The company sharing policy permits this release.",
-            follows_policy,
-        ),
-        Requirement(
-            "destination-restricted",
-            "The destination restricts access to the report.",
-            Check.assert_("inputs.destination.restricted", ComparisonOperator.Equals, True),
-        ),
-    ],
-)
-
-service = Service("finance-release", verified_by=[release_check])
-
+```yaml title="release-check.yaml"
+requirements:
+  - id: recipient-authorized
+    statement: The recipient is authorized to receive the report.
+    check: {kind: assert, path: inputs.recipient.authorized, operator: equals, expected: true}
+  - id: follows-policy
+    statement: The company sharing policy permits this release.
+    check:
+      kind: agent
+      agent: ./policy-judge.yaml
+      inputs: {purpose: inputs.purpose, report: inputs.report, recipient: inputs.recipient}
+      workspace:
+        /inputs/company-sharing-policy.pdf.json:
+          artifact:
+            card: {kind: Artifact, name: company-sharing-policy, version: 0.1.0}
+            path: extracted/company-sharing-policy.pdf.json
+  - id: destination-restricted
+    statement: The destination restricts access to the report.
+    check: {kind: assert, path: inputs.destination.restricted, operator: equals, expected: true}
 ```
 
-The application verifies each release with one call and releases it only on `passed`:
+The application checks each report with one call:
 
 ```python title="finance_release.py"
-from wyrd import WyrdState
-from wyrd.verify import VerificationResult
-
-from finance_service import Destination, Recipient, Release, Report, service
-
 # Upload the policy, declare every Card, and get a ready state.
 state = WyrdState.declare(service)
 
 def verify_release(release: Release) -> VerificationResult:
     with state.run() as run:
         return run.observe.verify("release-check", release)
-
-if __name__ == "__main__":
-    recipient = Recipient(email="auditor@example.test", authorized=True)
-    destination = Destination(url="https://auditor.example.test/reports", restricted=True)
-    for purpose, text in (
-        ("external audit", "Synthetic customer report: quarterly total $120."),
-        ("external audit", "Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001."),
-        ("marketing partnership", "Synthetic customer report: quarterly total $120."),
-        ("regulator request", "Synthetic customer report: quarterly total $120."),
-    ):
-        release = Release(purpose=purpose, report=Report(text=text), recipient=recipient, destination=destination)
-        result = verify_release(release)
-        print(f"{purpose} · {text} → {result.verdict}")
-        for requirement in result.requirements:
-            if requirement["outcome"] != "passed":
-                print(f"  {requirement['id']}: {requirement['reason']}")
-    state.shutdown()
-
 ```
+
+Four reports get these verdicts:
 
 ```text title="output"
 external audit · Synthetic customer report: quarterly total $120. → passed
@@ -165,7 +75,7 @@ regulator request · Synthetic customer report: quarterly total $120. → failed
 
 ```
 
-The judge's wording varies. The policy forbids bank account identifiers and permits sharing only for external audits. [Run your first verification](/wyrd/get-started/quickstart/) runs the full program in Python, Rust, or TypeScript. A Verifier can also run Python, judge a whole session, or compare samples with a baseline on a schedule; [What can I build?](/wyrd/get-started/what-can-i-build/) matches each to a problem.
+The judge's wording varies. The policy forbids bank account identifiers and permits sharing only for external audits. [Run your first verification](/wyrd/get-started/quickstart/) declares the Verifier and runs the full program in Python, Rust, or TypeScript. A Verifier can also run Python, judge a whole session, or compare samples with a baseline on a schedule; [What can I build?](/wyrd/get-started/what-can-i-build/) matches each to a problem.
 
 ## How Wyrd fits your stack
 
@@ -340,7 +250,7 @@ spec:
 **support-reply.yaml**
 
 ```yaml title="support-reply.yaml"
-# The subject: your support agent's Service, verified by no-refund-promise.
+# The subject: your support app's Service, verified by no-refund-promise.
 apiVersion: wyrd/v1
 kind: Service
 metadata:
@@ -1007,6 +917,88 @@ regulator request · Synthetic customer report: quarterly total $120. → failed
 
 The judge's wording varies. The failed releases pass both assertions and fail `follows-policy`: the judge read the policy, found the bank account, and found that the policy permits sharing only for external audits.
 
+**Declare the same Cards from YAML:**
+
+In production, Cards usually live in YAML files instead of code; [Code or YAML](/wyrd/understand/how-verification-works/#code-or-yaml) explains why. These three files declare the same Service, Verifier, and judge Agent. Upload the policy with `wyrd artifact upload company-sharing-policy.pdf --name company-sharing-policy --version 0.1.0 --extract`, then pass the Service file to `WyrdState.declare` instead of the Service built in code.
+
+**finance-release.yaml**
+
+```yaml title="finance-release.yaml"
+# The finance-release Service, verified by release-check.
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: finance-release
+spec:
+  verified_by:
+    - verifier: ./release-check.yaml
+
+```
+
+**release-check.yaml**
+
+```yaml title="release-check.yaml"
+# The release-check Verifier that finance_service.py declares in code. Upload
+# the policy with its extracted text first:
+#   wyrd artifact upload company-sharing-policy.pdf --name company-sharing-policy --version 0.1.0 --extract
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: release-check
+spec:
+  inputs:
+    purpose: {type: json}
+    report: {type: json}
+    recipient: {type: json}
+    destination: {type: json}
+  requirements:
+    - id: recipient-authorized
+      statement: The recipient is authorized to receive the report.
+      check: {kind: assert, path: inputs.recipient.authorized, operator: equals, expected: true}
+    - id: follows-policy
+      statement: The company sharing policy permits this release.
+      check:
+        kind: agent
+        agent: ./policy-judge.yaml
+        inputs: {purpose: inputs.purpose, report: inputs.report, recipient: inputs.recipient}
+        workspace:
+          /inputs/company-sharing-policy.pdf.json:
+            artifact:
+              card: {kind: Artifact, name: company-sharing-policy, version: 0.1.0}
+              path: extracted/company-sharing-policy.pdf.json
+    - id: destination-restricted
+      statement: The destination restricts access to the report.
+      check: {kind: assert, path: inputs.destination.restricted, operator: equals, expected: true}
+
+```
+
+**policy-judge.yaml**
+
+```yaml title="policy-judge.yaml"
+# A model that reads the policy with fs.read and returns a verdict on the
+# report. Its model calls go through the `openai` gateway deployment.
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: policy-judge
+spec:
+  execution_route: {kind: wyrd_gateway, deployment: openai}
+  tool_names: [fs.read]
+  run_config: {max_iterations: 3}
+  prompt:
+    provider: openai
+    model: gpt-4o
+    messages:
+      - role: user
+        content: >-
+          Read /inputs/company-sharing-policy.pdf.json with fs.read. Decide whether the
+          company sharing policy permits sharing this report with this recipient for this
+          purpose, citing the report and the policy line you apply. Purpose: {{purpose}}
+          Report: {{report}} Recipient: {{recipient}}
+    response_format: verdict
+
+```
+
 `verify` returns before your code acts, so the verdict is part of the request. Assertions add little time; the policy judge adds up to three model calls to that request. If the judge can't decide, the verdict is `inconclusive`, which is never a pass. [`submit`](/wyrd/understand/how-verification-works/#verify-and-submit) queues the same check when the request can't wait.
 
 Run the program again. Nothing changed, so it declares nothing new.
@@ -1211,7 +1203,7 @@ Page: /wyrd/build-and-verify/declare/write-verifiable-requirements/
 
 > Turn a vague goal such as "the agent should be reliable" into scoped requirements with named evidence, a suitable check, tested model judges, and versioned changes.
 
-Turn a goal like "the agent should be reliable" into requirements a check can decide, then keep them trustworthy as they change. The examples use the `release-check` Verifier from the [Quickstart](/wyrd/get-started/quickstart/).
+Turn a goal like "the agent should be reliable" into requirements a check can decide, then keep them trustworthy as they change. The examples use the `release-check` Verifier from the [Quickstart](/wyrd/get-started/quickstart/), in its YAML form; the Quickstart also declares it in code.
 
 Each practice names the failure it prevents and where it stops helping. [Foundations of verification](/wyrd/understand/foundations-of-verification/) explains the reasoning behind them.
 
@@ -1230,24 +1222,24 @@ Write one statement per failure you care about, naming the context it applies to
 Each statement on the right fails in one way, and a person reading a failed result knows what broke. `release-check` declares these three, each with its own `id` and verdict:
 
 ```yaml title="release-check.yaml"
-  requirements:
-    - id: recipient-authorized
-      statement: The recipient is authorized to receive the report.
-      check: {kind: assert, path: inputs.recipient.authorized, operator: equals, expected: true}
-    - id: follows-policy
-      statement: The company sharing policy permits this release.
-      check:
-        kind: agent
-        agent: ./policy-judge.yaml
-        inputs: {purpose: inputs.purpose, report: inputs.report, recipient: inputs.recipient}
-        workspace:
-          /inputs/company-sharing-policy.pdf.json:
-            artifact:
-              card: {kind: Artifact, name: company-sharing-policy, version: 0.1.0}
-              path: extracted/company-sharing-policy.pdf.json
-    - id: destination-restricted
-      statement: The destination restricts access to the report.
-      check: {kind: assert, path: inputs.destination.restricted, operator: equals, expected: true}
+requirements:
+  - id: recipient-authorized
+    statement: The recipient is authorized to receive the report.
+    check: {kind: assert, path: inputs.recipient.authorized, operator: equals, expected: true}
+  - id: follows-policy
+    statement: The company sharing policy permits this release.
+    check:
+      kind: agent
+      agent: ./policy-judge.yaml
+      inputs: {purpose: inputs.purpose, report: inputs.report, recipient: inputs.recipient}
+      workspace:
+        /inputs/company-sharing-policy.pdf.json:
+          artifact:
+            card: {kind: Artifact, name: company-sharing-policy, version: 0.1.0}
+            path: extracted/company-sharing-policy.pdf.json
+  - id: destination-restricted
+    statement: The destination restricts access to the report.
+    check: {kind: assert, path: inputs.destination.restricted, operator: equals, expected: true}
 ```
 
 In the Quickstart the policy judge also catches a named bank account, because the policy forbids it; a separate `code` check would make that its own requirement, with its own verdict.
@@ -1510,7 +1502,7 @@ Page: /wyrd/build-and-verify/declare/bind-a-verifier/
 
 Attach each Verifier to what it checks, and choose who runs it: your code, or a schedule.
 
-This page uses the `support-desk` Service from [Services](/wyrd/build-and-verify/declare/define-a-service/). The Verifiers it binds are written in [Write a Verifier](/wyrd/build-and-verify/verify/author-a-verifier/).
+This page uses the `support-desk` Service from [Services](/wyrd/build-and-verify/declare/define-a-service/). The Verifiers it binds are written in [Write a Verifier](/wyrd/build-and-verify/verify/author-a-verifier/). To bind Verifiers in Python, Rust, or TypeScript instead of YAML, see [Author in code](/wyrd/build-and-verify/declare/author-in-code/).
 
 ## 1. Bind Verifiers your code calls
 
@@ -1674,7 +1666,7 @@ Page: /wyrd/build-and-verify/declare/author-in-code/
 
 > Build a Service, its Agent and Prompt, and a Verifier in Python, Rust, or TypeScript, declare them without versions, verify two answers, and read back the rows each Run wrote.
 
-Build your Cards in code instead of YAML files. One program defines a Service, the Agent it runs, and a Verifier bound to that Agent, declares them, verifies a passing and a failing answer, and records each answer in the Service's table.
+Build your Cards in code instead of YAML files. Code is the quickest way to start; in production, Cards usually live in YAML files, as [Code or YAML](/wyrd/understand/how-verification-works/#code-or-yaml) explains. One program defines a Service, the Agent it runs, and a Verifier bound to that Agent, declares them, verifies a passing and a failing answer, and records each answer in the Service's table.
 
 You need the server and the `quickstart` directory from [Set up Wyrd](/wyrd/get-started/setup/). Run everything below there.
 
@@ -2751,7 +2743,7 @@ Page: /wyrd/build-and-verify/verify/verifier-recipes/
 
 > Copyable Verifiers for common checks, each with its YAML and the Python that calls it - assertions, traces, Python checks, model judges, multi-step, uploaded files, grouped sessions, and drift.
 
-Pick the check you need, bind its Verifier under `verified_by` to what it checks (a Service, one of its Agents, Models, or Data, or a standalone Agent), and call it from your code. Each recipe's Python declares `support-reply.yaml`, a Service that binds the recipe's Verifier, as in the [setup check](/wyrd/get-started/setup/#3-check-it-end-to-end).
+Pick the check you need, bind its Verifier under `verified_by` to what it checks (a Service, one of its Agents, Models, or Data, or a standalone Agent), and call it from your code. Each recipe's Python declares `support-reply.yaml`, a Service that binds the recipe's Verifier, as in the [setup check](/wyrd/get-started/setup/#3-check-it-end-to-end). To declare a recipe in Python, Rust, or TypeScript instead of YAML, see [Author in code](/wyrd/build-and-verify/declare/author-in-code/).
 
 | To check | Use | Kind |
 | --- | --- | --- |
@@ -4854,21 +4846,7 @@ A **Card** is Wyrd's versioned record of a component, such as a Service or an Ag
 
 ## One verification, end to end
 
-The example is the report release from [Real-time verification](/wyrd/understand/real-time-verification/#the-same-check-can-arrive-too-late), built as a finance API. Before it sends a report to an outside party, the API verifies the release:
-
-```python title="api.py"
-state = WyrdState.from_path(".wyrd-bundle")
-
-@api.post("/reports/send")
-def send_report(release: Release):
-    with state.run() as run:
-        result = run.observe.verify("release-check", release)
-    if result.passed:
-        return release_report(release)
-    return hold_for_review(release)
-```
-
-The request moves through six stages:
+The example is the report release from [Real-time verification](/wyrd/understand/real-time-verification/#the-same-check-can-arrive-too-late), built as a finance API. Before it sends a report to an outside party, the API verifies the release. The request moves through six stages, and [Act on verdicts in production](/wyrd/build-and-verify/verify/act-on-verdicts-in-production/#1-release-only-what-passed) shows the handler's code:
 
 1. **Request.** `POST /reports/send` arrives with the report, its purpose, the recipient, and the destination.
 2. **Requirements and evidence.** The `release-check` Verifier declares what must be true and which evidence it reads. The request body is the evidence; the sharing policy is a file the Verifier version names.
@@ -4965,6 +4943,15 @@ Files are mounted unchanged and unparsed. `fs.read` and `fs.search` serve raw te
 ### Bindings
 
 A binding attaches a Verifier to what it checks, under `verified_by`. It can sit on a Service, on one of its components (an Agent, Model, Data, Prompt, or any other Card the Service uses), or on a standalone Agent. A binding can also name a Trigger in `runs_on`, so the server runs it on a schedule, and Operators in `on_failure`.
+
+## Code or YAML
+
+A Verifier, and every other Card, can be declared in two ways. Both produce the same Cards, and the server can't tell them apart.
+
+- **In code.** The Python, Rust, and TypeScript SDKs build Cards with the same field names as the YAML. This is the quickest way to start: one program declares the Cards and verifies with them. The [Quickstart](/wyrd/get-started/quickstart/) and [Author in code](/wyrd/build-and-verify/declare/author-in-code/) use this route.
+- **In YAML files.** Each Card is a file that lives in the repository beside the application. This is the recommended route in production. Any language can declare the same files, a change to a requirement is reviewed in a pull request like any other change, and CI declares the files with `wyrd declare` before the application deploys. The [Build and verify](/wyrd/build-and-verify/declare/define-a-service/) guides and [Deploy a Service from CI](/wyrd/operate/deploy-a-service-from-ci/) use this route.
+
+A team can start in code and move to YAML later, because both routes declare the same Cards.
 
 ## Calls, verdicts, and failures
 
@@ -5148,12 +5135,10 @@ A Card is a versioned declaration of one AI system component, or of one Verifier
 
 ## The shape of a Card
 
-These are the two Cards from the [setup check](/wyrd/get-started/setup/#3-check-it-end-to-end):
-
-**support-reply.yaml**
+This is the Service Card from the [setup check](/wyrd/get-started/setup/#3-check-it-end-to-end):
 
 ```yaml title="support-reply.yaml"
-# The subject: your support agent's Service, verified by no-refund-promise.
+# The subject: your support app's Service, verified by no-refund-promise.
 apiVersion: wyrd/v1
 kind: Service
 metadata:
@@ -5162,29 +5147,6 @@ metadata:
 spec:
   verified_by:
     - verifier: ./no-refund-promise.yaml
-
-```
-
-**no-refund-promise.yaml**
-
-```yaml title="no-refund-promise.yaml"
-# The Verifier: a support answer never promises a guaranteed refund.
-apiVersion: wyrd/v1
-kind: Verifier
-metadata:
-  name: no-refund-promise
-  version: 1.0.0
-spec:
-  inputs:
-    answer: { type: json }
-  requirements:
-    - id: no-refund-promise
-      statement: The answer never promises a guaranteed refund
-      check:
-        kind: assert
-        path: inputs.answer
-        operator: not_contains
-        expected: guaranteed refund
 
 ```
 

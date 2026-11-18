@@ -7,7 +7,7 @@ topic: Declare
 order: 0
 ---
 
-Turn a goal like "the agent should be reliable" into requirements a check can decide, then keep them trustworthy as they change. The examples use the `release-check` Verifier from the [Quickstart](/get-started/quickstart/).
+Turn a goal like "the agent should be reliable" into requirements a check can decide, then keep them trustworthy as they change. The examples use the `release-check` Verifier from the [Quickstart](/get-started/quickstart/), in its YAML form; the Quickstart also declares it in code.
 
 Each practice names the failure it prevents and where it stops helping. [Foundations of verification](/understand/foundations-of-verification/) explains the reasoning behind them.
 
@@ -25,7 +25,7 @@ Write one statement per failure you care about, naming the context it applies to
 
 Each statement on the right fails in one way, and a person reading a failed result knows what broke. `release-check` declares these three, each with its own `id` and verdict:
 
-<CodeFromFile file="examples/finance-release/release-check.yaml" lang="yaml" title="release-check.yaml" range="14-31" />
+<CodeFromFile file="examples/finance-release/release-check.yaml" lang="yaml" title="release-check.yaml" region="requirements" />
 
 In the Quickstart the policy judge also catches a named bank account, because the policy forbids it; a separate `code` check would make that its own requirement, with its own verdict.
 

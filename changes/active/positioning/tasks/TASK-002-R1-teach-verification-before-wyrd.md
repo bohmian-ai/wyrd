@@ -522,3 +522,27 @@ sentences; all were fixed in third person. A second audit flagged 7 more,
 also fixed. The third result is now "can't tell" on both pages. Rerun:
 humanizer lint clean, `docs:test` 102 passed, linkcheck, build, a11y,
 `git diff --check` pass.
+
+### Code example de-duplication
+
+The full report-release program now appears only on Run your first
+verification. The landing page keeps the tested API handler figure and drops
+its Declare/Observe/Verify code tabs; What Wyrd does shows the verify loop and
+output, not the 97-line declaration; How verification works links to the
+handler in Act on verdicts in production instead of repeating it; Cards and
+versions shows one setup Card. The dead `.lede + .lede` selector was removed.
+Rerun: `docs:test` 102 passed, svelte-check 0 warnings, linkcheck, build,
+a11y, anchors, `git diff --check` pass.
+
+### Code and YAML declaration consistency
+
+One rule now governs declarations (docs/AGENTS.md Examples): code tabs plus
+the same Cards as YAML where the page teaches the code route, YAML with a
+link to Author in code elsewhere. How verification works gains "Code or
+YAML" (same Cards; code to start; YAML recommended in production). The
+landing page restores Declare/Observe/Verify as short tested regions
+(`verifier`, `verify`) of the finance-release files in each language plus
+YAML; the Quickstart offers the YAML files in a note; the YAML guides link to
+Author in code and back. Rerun: `docs:test` 102 passed, svelte-check 0
+warnings, linkcheck, commands, build, a11y, `git diff --check`, and
+`cargo check` on the examples pass.

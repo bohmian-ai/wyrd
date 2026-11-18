@@ -7,7 +7,7 @@ topic: Declare
 order: 3
 ---
 
-Build your Cards in code instead of YAML files. One program defines a Service, the Agent it runs, and a Verifier bound to that Agent, declares them, verifies a passing and a failing answer, and records each answer in the Service's table.
+Build your Cards in code instead of YAML files. Code is the quickest way to start; in production, Cards usually live in YAML files, as [Code or YAML](/understand/how-verification-works/#code-or-yaml) explains. One program defines a Service, the Agent it runs, and a Verifier bound to that Agent, declares them, verifies a passing and a failing answer, and records each answer in the Service's table.
 
 You need the server and the `quickstart` directory from [Set up Wyrd](/get-started/setup/). Run everything below there.
 

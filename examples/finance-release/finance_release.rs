@@ -11,6 +11,7 @@ use wyrd_ai::{RequirementOutcome, VerificationResult};
 
 use finance_service::{Destination, Recipient, Release, Report};
 
+// ANCHOR: verify
 /// Verify one release against `release-check` in a new Run.
 ///
 /// # Errors
@@ -22,6 +23,7 @@ async fn verify_release(
     let input = serde_json::to_value(release)?;
     Ok(state.run().observe().verify("release-check", input).await?)
 }
+// ANCHOR_END: verify
 
 /// Declare the finance release, then verify four releases and print each
 /// verdict with the reason for every requirement that did not pass.

@@ -16,17 +16,19 @@ Live verification puts the verdict before the decision. Your application asks Wy
 
 ## An example
 
-An application shares synthetic customer reports with outside auditors. Before it sends one, it checks three requirements in one Verifier. A model reads the company sharing policy PDF and judges the report and its purpose; the other two are assertions on records the application supplies:
+An application shares customer reports with outside auditors. Before it sends a report, it checks three requirements, declared together as one Verifier. Two of them compare a value in the records the application sends. In the third, an AI model reads the company's sharing policy PDF and decides whether the policy allows this report to be shared for this purpose:
 
-<CodeFromFile file="examples/finance-release/finance_service.py" lang="python" title="finance_service.py" />
+<CodeFromFile file="examples/finance-release/release-check.yaml" lang="yaml" title="release-check.yaml" region="requirements" />
 
-The application verifies each release with one call and releases it only on `passed`:
+The application checks each report with one call:
 
-<CodeFromFile file="examples/finance-release/finance_release.py" lang="python" title="finance_release.py" />
+<CodeFromFile file="examples/finance-release/finance_release.py" lang="python" title="finance_release.py" region="verify" />
+
+Four reports get these verdicts:
 
 <CodeFromFile file="examples/finance-release/output.txt" lang="text" title="output" />
 
-The judge's wording varies. The policy forbids bank account identifiers and permits sharing only for external audits. [Run your first verification](/get-started/quickstart/) runs the full program in Python, Rust, or TypeScript. A Verifier can also run Python, judge a whole session, or compare samples with a baseline on a schedule; [What can I build?](/get-started/what-can-i-build/) matches each to a problem.
+The judge's wording varies. The policy forbids bank account identifiers and permits sharing only for external audits. [Run your first verification](/get-started/quickstart/) declares the Verifier and runs the full program in Python, Rust, or TypeScript. A Verifier can also run Python, judge a whole session, or compare samples with a baseline on a schedule; [What can I build?](/get-started/what-can-i-build/) matches each to a problem.
 
 ## How Wyrd fits your stack
 

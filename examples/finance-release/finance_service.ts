@@ -37,6 +37,7 @@ const followsPolicy = Check.agent(policyJudge)
   .inputs({ purpose: "inputs.purpose", report: "inputs.report", recipient: "inputs.recipient" })
   .addWorkspace("/inputs/company-sharing-policy.pdf.json", policy.file("extracted/company-sharing-policy.pdf.json"));
 
+// ANCHOR: verifier
 const releaseCheck = new Verifier("release-check", {
   inputs: Release,
   requirements: [
@@ -53,6 +54,7 @@ const releaseCheck = new Verifier("release-check", {
     ),
   ],
 });
+// ANCHOR_END: verifier
 
 export const service = new Service("finance-release", { verified_by: [releaseCheck] });
 

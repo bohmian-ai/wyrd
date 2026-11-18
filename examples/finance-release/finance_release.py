@@ -3,6 +3,7 @@ from wyrd.verify import VerificationResult
 
 from finance_service import Destination, Recipient, Release, Report, service
 
+# ANCHOR: verify
 # Upload the policy, declare every Card, and get a ready state.
 state = WyrdState.declare(service)
 
@@ -10,6 +11,7 @@ state = WyrdState.declare(service)
 def verify_release(release: Release) -> VerificationResult:
     with state.run() as run:
         return run.observe.verify("release-check", release)
+# ANCHOR_END: verify
 
 
 if __name__ == "__main__":

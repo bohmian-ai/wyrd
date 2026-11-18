@@ -7,7 +7,7 @@ topic: Verify
 order: 1
 ---
 
-Pick the check you need, bind its Verifier under `verified_by` to what it checks (a Service, one of its Agents, Models, or Data, or a standalone Agent), and call it from your code. Each recipe's Python declares `support-reply.yaml`, a Service that binds the recipe's Verifier, as in the [setup check](/get-started/setup/#3-check-it-end-to-end).
+Pick the check you need, bind its Verifier under `verified_by` to what it checks (a Service, one of its Agents, Models, or Data, or a standalone Agent), and call it from your code. Each recipe's Python declares `support-reply.yaml`, a Service that binds the recipe's Verifier, as in the [setup check](/get-started/setup/#3-check-it-end-to-end). To declare a recipe in Python, Rust, or TypeScript instead of YAML, see [Author in code](/build-and-verify/declare/author-in-code/).
 
 | To check | Use | Kind |
 | --- | --- | --- |

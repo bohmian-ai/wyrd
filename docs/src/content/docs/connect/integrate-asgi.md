@@ -1,5 +1,6 @@
 ---
 title: ASGI apps
+browserTitle: Verify requests in FastAPI and other ASGI apps | Wyrd
 description: Add WyrdMiddleware to a FastAPI, Starlette, Django, or Litestar app to start Wyrd with the app, verify inside one Run per request, and drain queued evidence at shutdown.
 pillar: wyrd
 section: Connect

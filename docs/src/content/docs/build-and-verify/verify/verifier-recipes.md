@@ -1,5 +1,6 @@
 ---
 title: Recipes
+browserTitle: Verifier recipes for common AI checks | Wyrd
 description: Copyable Verifiers for common checks, each with its YAML and the Python that calls it - assertions, traces, Python checks, model judges, multi-step, uploaded files, grouped sessions, and drift.
 pillar: wyrd
 section: Build and verify

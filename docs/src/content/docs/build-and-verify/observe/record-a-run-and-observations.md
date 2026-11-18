@@ -1,5 +1,6 @@
 ---
 title: Runs and observations
+browserTitle: Record runs and observations of an AI service | Wyrd
 description: Wrap each request in a Run, call your model through the gateway, record what happened, verify it, and read the whole Run back.
 pillar: wyrd
 section: Build and verify

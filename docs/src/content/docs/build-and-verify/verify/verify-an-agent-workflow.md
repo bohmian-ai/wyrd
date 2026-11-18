@@ -1,5 +1,6 @@
 ---
 title: Verify an agent's workflow
+browserTitle: Verify an AI agent completed every step | Wyrd
 description: Catch an agent that skipped a required step even though its answer looks right, by checking the trace of the work behind the answer.
 pillar: wyrd
 section: Build and verify

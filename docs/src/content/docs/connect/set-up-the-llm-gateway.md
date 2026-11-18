@@ -1,5 +1,6 @@
 ---
 title: LLM gateway
+browserTitle: Set up the LLM gateway | Wyrd
 description: Store a provider key on your Wyrd server, create a deployment for it, and call the model through Wyrd with your Wyrd credential.
 pillar: wyrd
 section: Connect

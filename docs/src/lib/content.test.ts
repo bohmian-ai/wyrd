@@ -230,7 +230,7 @@ describe('page metadata', () => {
       'understand/real-time-verification': ['Real-Time Verification for AI Applications | Wyrd', 'Real-time verification'],
       'understand/technical-questions': ['Real-Time Verification: Technical Questions', 'Technical questions'],
       'understand/foundations-of-verification': ['Foundations of AI Verification | Wyrd', 'Foundations of verification'],
-      'build-and-verify/verify/verify-an-agent-workflow': ["Verify an agent's workflow | Wyrd", "Verify an agent's workflow"]
+      'build-and-verify/verify/verify-an-agent-workflow': ['Verify an AI agent completed every step | Wyrd', "Verify an agent's workflow"]
     };
     for (const [slug, [browser, h1]] of Object.entries(pages)) {
       const { head: html, body, entry } = head(slug);

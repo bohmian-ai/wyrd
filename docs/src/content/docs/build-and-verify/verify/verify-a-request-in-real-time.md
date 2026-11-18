@@ -1,5 +1,6 @@
 ---
 title: Verify during a request
+browserTitle: Verify an AI action before your application executes it | Wyrd
 description: Call the Quickstart's release check from a web API, send a report only after its verdict passes, and hold every other outcome with the reason.
 pillar: wyrd
 section: Build and verify

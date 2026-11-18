@@ -1,5 +1,6 @@
 ---
 title: Run your first verification
+browserTitle: "Quickstart: verify AI output against a policy document | Wyrd"
 description: Verify a finance report against three requirements, including a model that reads a sharing policy PDF, in one call, and release it only when the verdict passes. Python, Rust, or TypeScript.
 pillar: wyrd
 section: Get started

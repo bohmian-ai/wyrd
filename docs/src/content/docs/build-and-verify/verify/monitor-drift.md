@@ -1,6 +1,6 @@
 ---
 title: Check on a schedule
-browserTitle: Verify AI behavior continuously on a schedule | Wyrd
+browserTitle: Continuous verification on a schedule | Wyrd
 description: Have the Wyrd server judge a Service's recorded samples every minute, then read which windows passed, failed, or had no evidence.
 pillar: wyrd
 section: Build and verify

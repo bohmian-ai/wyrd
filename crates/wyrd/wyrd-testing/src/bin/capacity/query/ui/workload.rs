@@ -222,7 +222,9 @@ pub async fn ask(
 
 /// Runs `bundle` once as its page does: the independent statements
 /// concurrently, then those taking their results, each checked against its
-/// reference; counts every statement the server answered in `answered`.
+/// reference, each in its own task under `admission`'s labels, which a
+/// spawned task does not inherit; counts every statement the server
+/// answered in `answered`.
 ///
 /// # Errors
 ///
@@ -231,6 +233,7 @@ async fn bundle(
     queries: &Arc<Bifrost>,
     bundle: &Arc<Vec<Bound>>,
     answered: &AtomicU64,
+    admission: Admission,
 ) -> Result<(), String> {
     for dependent in [false, true] {
         let mut asked = JoinSet::new();
@@ -241,7 +244,8 @@ async fn bundle(
             let (queries, bundle) = (Arc::clone(queries), Arc::clone(bundle));
             asked.spawn(async move {
                 let bound = &bundle[index];
-                ask(&queries, &bound.statement.sql, &bound.params)
+                admission
+                    .labelled(ask(&queries, &bound.statement.sql, &bound.params))
                     .await
                     .map(|(answer, _)| answer.matches(&bound.expected, &[]).is_ok())
             });
@@ -492,10 +496,7 @@ impl Workload for Ui {
                     let mut outcome = Outcome::default();
                     while admission.open() {
                         let sent = Instant::now();
-                        match admission
-                            .labelled(bundle(&queries, &selected, &answered))
-                            .await
-                        {
+                        match bundle(&queries, &selected, &answered, admission).await {
                             Ok(()) => outcome.succeeded(&admission, sent, 0, 0),
                             Err(code) => *outcome.errors.entry(code).or_default() += 1,
                         }

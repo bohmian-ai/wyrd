@@ -54,15 +54,15 @@ Set up a local server, run one verification, then choose what to build, in this 
 
 ## Understand
 
-- [Foundations of verification](/wyrd/understand/foundations-of-verification/): What verification establishes, how testing, validation, formal proof, and runtime checking differ, how to check outputs with no single right answer, and what an ML score or an agent's claim cannot show.
-- [Real-time verification](/wyrd/understand/real-time-verification/): Real-time verification for AI applications - checking a system while it runs, in time to inform the current action, with deadlines, evidence and check time, uncertain results, and when a queued or recurring check fits better.
-- [How verification works in Wyrd](/wyrd/understand/how-verification-works/): How Wyrd implements verification - Verifiers, bindings, and evidence; one inline verification of a finance report release; verify, submit, and drift schedules; where the time goes; and what Wyrd retains.
+- [Foundations of verification](/wyrd/understand/foundations-of-verification/): What AI verification establishes, how it differs from evaluation, testing, and formal proof, and how to check outputs that have no single right answer.
+- [Real-time verification](/wyrd/understand/real-time-verification/): Real-time verification for AI applications: checking an action before it happens, deadlines, evidence and check time, uncertain results, and when to check later.
+- [How verification works in Wyrd](/wyrd/understand/how-verification-works/): How Wyrd verifies an action against declared requirements: Verifiers, bindings, evidence, verify, submit, and schedules, where the time goes, and what is kept.
 - [Runs and evidence](/wyrd/understand/runs-observations-and-evidence/): How Wyrd records what a declared service actually does, and ties each observation to the version that ran.
 - [Cards and versions](/wyrd/understand/cards-versions-and-relationships/): A Service declaration is a set of versioned Cards, each one a declared component of an AI system.
 - [Bifrost](/wyrd/understand/bifrost/): Wyrd's analytical warehouse, the two ways to write to it, and when a written row becomes queryable.
 - [Identity and access](/wyrd/understand/identity-and-authorization/): Every call to Wyrd is made as an account whose roles decide what it may do; a running Service also names its exact release, from its bundle.
 - [Architecture](/wyrd/understand/architecture/): What a team deployment of Wyrd runs, what it connects to, and why each part is separate.
-- [Technical questions](/wyrd/understand/technical-questions/): Real-time verification technical questions - who enforces a verdict, verify versus submit and schedules, missing evidence, timeouts, model providers and sensitive data, versions, languages, and self-hosting.
+- [Technical questions](/wyrd/understand/technical-questions/): Direct answers on real-time verification: who enforces a verdict, missing evidence, timeouts, model providers, sensitive data, versions, and self-hosting.
 
 ## Reference
 

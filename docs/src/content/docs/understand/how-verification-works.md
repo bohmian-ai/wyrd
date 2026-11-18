@@ -1,6 +1,6 @@
 ---
 title: How verification works in Wyrd
-description: How Wyrd implements verification - Verifiers, bindings, and evidence; one inline verification of a finance report release; verify, submit, and drift schedules; where the time goes; and what Wyrd retains.
+description: "How Wyrd verifies an action against declared requirements: Verifiers, bindings, evidence, verify, submit, and schedules, where the time goes, and what is kept."
 pillar: wyrd
 section: Understand
 order: 3

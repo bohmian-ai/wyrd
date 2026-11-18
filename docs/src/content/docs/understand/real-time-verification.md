@@ -1,7 +1,7 @@
 ---
 title: Real-time verification
 browserTitle: Real-Time Verification for AI Applications | Wyrd
-description: Real-time verification for AI applications - checking a system while it runs, in time to inform the current action, with deadlines, evidence and check time, uncertain results, and when a queued or recurring check fits better.
+description: "Real-time verification for AI applications: checking an action before it happens, deadlines, evidence and check time, uncertain results, and when to check later."
 pillar: wyrd
 section: Understand
 order: 2

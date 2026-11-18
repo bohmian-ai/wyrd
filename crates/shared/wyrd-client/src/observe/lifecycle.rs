@@ -127,18 +127,6 @@ impl BifrostLifecycle {
         }
     }
 
-    /// The started writer, for a synchronous observation.
-    ///
-    /// # Errors
-    /// Returns `WYRD_SDK_400_BIFROST_NOT_STARTED` before a writer started
-    /// and `WYRD_SDK_409_BIFROST_CLOSED` after shutdown.
-    ///
-    /// # Panics
-    /// Panics if the phase lock is poisoned.
-    pub fn started(&self) -> Result<Arc<StartedBifrost>, WyrdError> {
-        self.current()?.ok_or_else(not_started)
-    }
-
     /// Drain every producer of the started writer, if one was started.
     ///
     /// Nothing is pending before a writer exists, so a never-started state, or
@@ -265,14 +253,6 @@ impl Drop for StartClaim<'_> {
 fn already_started() -> WyrdError {
     WyrdError::SdkBifrostAlreadyStarted {
         message: "this WyrdState already started Bifrost".to_owned(),
-        details: serde_json::Value::Null,
-    }
-}
-
-/// The refusal for an observation before `start_bifrost` completed.
-fn not_started() -> WyrdError {
-    WyrdError::SdkBifrostNotStarted {
-        message: "call start_bifrost before observing".to_owned(),
         details: serde_json::Value::Null,
     }
 }

@@ -7727,7 +7727,6 @@ This page is generated from the error definitions in the Wyrd source.
 
 | Code | Status | Title | Fix |
 | --- | ---: | --- | --- |
-| `WYRD_SDK_400_BIFROST_NOT_STARTED` | 400 | WyrdState Bifrost writer is not started | Call start_bifrost on the state before opening a run and emitting observations. |
 | `WYRD_SDK_400_CARD_KIND_MISMATCH` | 400 | WyrdState Card kind mismatch | Use an alias for a Card of the expected kind. |
 | `WYRD_SDK_400_INVALID_OBSERVATION` | 400 | Invalid observation input | Emit a flat object of boolean, integer, finite float, or string values, with valid feature names and media bindings. |
 | `WYRD_SDK_400_INVALID_STATE_BUNDLE` | 400 | Invalid WyrdState bundle | Pull the intended root Card again with wyrd pull --output-dir &lt;dir&gt;, then load that complete directory. |

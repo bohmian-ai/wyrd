@@ -323,7 +323,7 @@ async fn startup_describes_the_fixed_table_once() {
     );
 }
 
-/// A missing fixed table fails startup, so no run can emit.
+/// A missing fixed table fails startup and leaves no writer.
 #[tokio::test]
 async fn missing_fixed_table_fails_startup() {
     let mut bodies = fixed_table_bodies();
@@ -335,12 +335,13 @@ async fn missing_fixed_table_fails_startup() {
         .await
         .expect_err("an absent fixed table must fail startup");
     assert_eq!(error.status(), 404);
-    let refusal = state
-        .run()
-        .observe()
-        .drift_value(&json!({ "age": 42 }), None)
-        .expect_err("a failed startup leaves no writer");
-    assert_eq!(refusal.code(), "WYRD_SDK_400_BIFROST_NOT_STARTED");
+    assert!(
+        state
+            .running_bifrost()
+            .expect("a failed startup leaves the state open")
+            .is_none(),
+        "a failed startup leaves no writer"
+    );
 }
 
 /// A fixed table whose authored fields differ from the projection in any
@@ -488,7 +489,7 @@ async fn shutdown_during_start_stays_closed() {
         .expect_err("the losing start cannot publish its writer");
     assert_eq!(lost.code(), "WYRD_SDK_409_BIFROST_CLOSED");
     assert_eq!(
-        lifecycle.started().err().map(|error| error.code()),
+        lifecycle.current().err().map(|error| error.code()),
         Some("WYRD_SDK_409_BIFROST_CLOSED")
     );
     assert_eq!(
@@ -1582,7 +1583,7 @@ async fn concurrent_first_writes_describe_each_table_once() {
     assert!(results.iter().all(Result::is_ok), "{results:?}");
     assert_eq!(server.calls("bifrost.datasets.first"), 1);
     assert_eq!(server.calls("bifrost.datasets.second"), 1);
-    let started = state.started_bifrost().expect("started");
+    let started = state.running_bifrost().expect("open").expect("started");
     assert_eq!(
         started.bifrost.producer_count(),
         2,
@@ -1727,13 +1728,13 @@ async fn several_declared_tables_need_an_explicit_active_table() {
             .write(&row)
             .await
             .expect("writes the active table");
-        let started = state.started_bifrost().expect("started");
+        let started = state.running_bifrost().expect("open").expect("started");
         assert_eq!(
             started.bifrost.active_writer_table().expect("active").fqn(),
             table
         );
     }
-    let started = state.started_bifrost().expect("started");
+    let started = state.running_bifrost().expect("open").expect("started");
     assert_eq!(
         started.bifrost.producer_count(),
         2,

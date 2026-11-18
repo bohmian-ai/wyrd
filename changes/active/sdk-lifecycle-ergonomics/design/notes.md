@@ -91,7 +91,8 @@ TypeScript behave the same.
   `start_bifrost()` in flight awaited, not refused. `start_bifrost()` remains
   for writer options and fail-fast startup. Offline, the first write reports
   the connect error (`WYRD_CLIENT_503_TRANSPORT_DOWN`) instead of
-  `WYRD_SDK_400_BIFROST_NOT_STARTED`.
+  `WYRD_SDK_400_BIFROST_NOT_STARTED`, which no public call can raise and is
+  deleted from the catalog.
 
 - **OTel stays optional.** `configure()` follows the ASGI middleware's
   existing contract (`docs/.../connect/integrate-asgi.md` If it fails): default

@@ -1508,20 +1508,6 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// An observation was attempted before `start_bifrost` connected a writer.
-    #[error("[WYRD_SDK_400_BIFROST_NOT_STARTED] {message}")]
-    #[wyrd_error(
-        code = "WYRD_SDK_400_BIFROST_NOT_STARTED",
-        status = 400,
-        title = "WyrdState Bifrost writer is not started",
-        remediation = "Call start_bifrost on the state before opening a run and emitting observations."
-    )]
-    SdkBifrostNotStarted {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
     /// An observation was attempted after the state's writer was shut down.
     ///
     /// Graceful shutdown is the durability barrier: once it succeeds the state
@@ -3969,7 +3955,6 @@ impl WyrdError {
             | Self::SdkStateConfigFrozen { message, details }
             | Self::SdkTelemetryFlushTimeout { message, details }
             | Self::SdkTelemetryFlushFailed { message, details }
-            | Self::SdkBifrostNotStarted { message, details }
             | Self::SdkBifrostClosed { message, details }
             | Self::SdkInvalidObservation { message, details }
             | Self::SdkCardKindMismatch { message, details }

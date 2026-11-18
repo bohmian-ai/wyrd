@@ -1154,7 +1154,10 @@ impl WyrdState {
             return Ok(started);
         }
         self.start_gated(None, QueueConfig::default()).await?;
-        self.bifrost.started()
+        Ok(self
+            .bifrost
+            .current()?
+            .expect("a completed start published its writer"))
     }
 
     /// The started writer, or `None` before any start.
@@ -1165,15 +1168,6 @@ impl WyrdState {
         self.bifrost.current()
     }
 
-    /// The started writer and its described fixed Drift table.
-    ///
-    /// # Errors
-    /// Returns `WYRD_SDK_400_BIFROST_NOT_STARTED` before startup and
-    /// `WYRD_SDK_409_BIFROST_CLOSED` after shutdown.
-    pub(crate) fn started_bifrost(&self) -> Result<Arc<StartedBifrost>, WyrdError> {
-        self.bifrost.started()
-    }
-
     /// Point-in-time bounded-ownership accounting for this state's one writer.
     ///
     /// Test-harness only: a capacity benchmark samples `owned_bytes` while
@@ -1181,12 +1175,14 @@ impl WyrdState {
     /// cannot see because it owns a different writer. Reads atomics; no IO.
     ///
     /// # Errors
-    /// Returns `WYRD_SDK_400_BIFROST_NOT_STARTED` before startup and
-    /// `WYRD_SDK_409_BIFROST_CLOSED` after shutdown.
+    /// Returns `WYRD_SDK_409_BIFROST_CLOSED` after shutdown; `None` means no
+    /// writer has started.
     #[cfg(feature = "test-support")]
     #[cfg(feature = "internal")]
-    pub fn bifrost_metrics(&self) -> Result<crate::bifrost::BifrostMetrics, WyrdError> {
-        Ok(self.started_bifrost()?.bifrost.metrics())
+    pub fn bifrost_metrics(&self) -> Result<Option<crate::bifrost::BifrostMetrics>, WyrdError> {
+        Ok(self
+            .running_bifrost()?
+            .map(|started| started.bifrost.metrics()))
     }
 
     /// Return the exact root Card reference.

@@ -215,24 +215,29 @@ pub struct Observe<'a> {
 }
 
 impl Observe<'_> {
-    /// Project and enqueue one Drift observation.
+    /// Project and enqueue one Drift observation on the running writer.
     ///
     /// Input validation runs before the lifecycle lookup so a malformed feature
-    /// map reports what is wrong with it rather than reporting that Bifrost has
-    /// not started.
+    /// map reports what is wrong with it rather than a lifecycle refusal.
     ///
     /// # Errors
     /// Returns `WYRD_SDK_400_INVALID_OBSERVATION` for a malformed feature
-    /// map, `WYRD_SDK_400_BIFROST_NOT_STARTED` before startup,
-    /// `WYRD_SDK_409_BIFROST_CLOSED` after shutdown, and
+    /// map, `WYRD_SDK_409_BIFROST_CLOSED` after shutdown, and
     /// `WYRD_CLIENT_429_QUEUE_FULL` when the producer is saturated.
+    ///
+    /// # Panics
+    /// Panics when no writer has started; every caller starts it first.
     fn drift_value(
         &self,
         features: &Value,
         session_id: Option<SessionId>,
     ) -> Result<(), WyrdError> {
         let record = drift::observation(features, session_id)?;
-        let started = self.run.state.started_bifrost()?;
+        let started = self
+            .run
+            .state
+            .running_bifrost()?
+            .expect("callers start the writer before recording samples");
         started.bifrost.insert_observation(
             &started.drift,
             drift::rows(&record)?,

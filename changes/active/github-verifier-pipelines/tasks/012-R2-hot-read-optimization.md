@@ -112,7 +112,36 @@ behavior keeps its existing proof; no manufactured RED is required for it.
    **RED:** missing scenario/integer-only checker cannot deliver these results.
    **Tier:** checker unit plus real-server integration/journey.
    **Authority:** REQ-018/024; Bifrost Query/Variant SQL/Public surface.
-   Evidence: not run.
+   Evidence: **PARTIAL.**
+   - Checker units: `query::ui::answer::tests::{typed_answers_compare_ids_timestamps_decimals_and_nulls,
+     ties_compare_as_multisets_within_their_keys,variants_compare_by_value_not_layout}` and
+     `query::ui::tests::{frozen_catalog_holds_the_original_statements,tied_statements_declare_the_order_their_sql_leaves}`
+     (`mise exec -- cargo nextest run --locked -p wyrd-testing --bin capacity -E 'test(/query::ui::/)'`; GREEN).
+     Their RED runs predate this record and are not reconstructed.
+   - Real server: `Workload::prepare` in `capacity/query/ui/workload.rs` answers all 69
+     statements in catalog order and fails on any failed terminal; every timed answer is
+     compared with its typed reference (`exact-answers` criterion).
+   - Known counts, `capacity/query/ui/seed.rs::{known,check}`, unit
+     `query::ui::seed::tests::driven_statements_must_count_what_was_driven`. Prepare seeds
+     100 metadata-captured gateway calls to the local mock provider (canned usage of 11 + 4
+     tokens; a fake local price so `cost` is filled) and 60 direct plus 40 submitted
+     assertion verifications, every odd one failing. It binds those statements to the seeding
+     window and requires calls 100, tokens 1,500, cost 0.0054 USD, 51 listed executions,
+     60 completed / 40 pending, 50 passed / 50 failed and 50 failed-filter rows.
+     `query::ui::fixture::tests::every_fourth_root_invokes_an_agent`: RED `left: 0, right: 125`,
+     then GREEN; `stat-invocations-*` must count `Journey::invocations` (125; 1,250 at 10×).
+   - RED (`mise run bench:l1:bifrost:ui -- --smoke --allow-dirty` before seeding): prepare
+     failed naming every verify-* and stat-{calls,tokens,cost}-* statement (for example
+     `verify-list answers 0 rows`, `stat-calls-total answers [["0"]]`).
+     GREEN: `target/benchmarks/smoke/bifrost/ui-sql/20261118T202920Z-e24285ae5.json`, VALID.
+   - Negative case: `verify-filter-status` (bind `waiting`) must answer no row. The server
+     writes only `checkpoint` execution events, so the catalog's `event = 'status'` subquery
+     never matches and every submitted execution reads `pending`. This is a finding about the
+     frozen SQL, recorded rather than rewritten (query rewriting is out of scope).
+   - **Open before the baseline:** trace, log and metric statements are checked only against
+     their self-recorded reference, not against counts derived from the journey. A wrong
+     example binding that still returns rows would pass, and scalar/histogram series are not
+     asserted with expected values.
 2. **Same data, different residence/layout.** Execute fixed SQL/absolute binds
    before/after explicit stage/publication, then on separately prelearned data.
    Assert actual residence, identical logical rows and no duplicate identities;
@@ -120,7 +149,18 @@ behavior keeps its existing proof; no manufactured RED is required for it.
    No timed interval includes ingest/placement drift. **RED:** current hot setup
    prelearns and lacks this paired experiment. **Tier:** placement integration
    and public query journey. **Authority:** REQ-018/024; immutable source and
-   nested-field query rules. Evidence: not run.
+   nested-field query rules. Evidence: **PARTIAL.**
+   - `Ui::place` moves rows only through the bench Scribe stage/publish control, outside
+     every window. It requires staging to move at least the journey's rows and publication to
+     leave each table's exact row count in Parquet footers. Every catalog statement, standalone
+     ones included, must answer in staged and published exactly as in memtables before the
+     step's first window; smoke records above and below are VALID in all three residences.
+   - Learned arm: `ui-sql-learned` publishes a 10,000-span `hot` sample (2026-01-01, its own
+     trace ids) and requires a learned `bifrost.traces` Variant layout through the shared
+     `learn_span_layout` (the `hot` prelearn now uses it too) before the default journey
+     loads. Smoke: `target/benchmarks/smoke/bifrost/ui-sql-learned/20261118T204803Z-7b988f68b.json`, VALID.
+   - **Open:** no assertion yet of no duplicate identities, mixed sources, publication
+     overlap, schema null-fill or extensions.
 3. **Qualified original baseline.** Run the original page schedules at one/eight
    pages and default/10× volume, with representative standalone/layout cases.
    Record primary/full-result times, per-query latency, correct pages/s, first
@@ -137,7 +177,28 @@ behavior keeps its existing proof; no manufactured RED is required for it.
    evidence absent.
    **Tier:** declaration/record tests and opt-in real-server L1.
    **Authority:** REQ-018/024; benchmark Measurement/Verdicts/Records.
-   Evidence: not run; baseline checkpoint not reached.
+   Evidence: **declaration GREEN; baseline not run.**
+   - Plan (review revision): default L1 `ui-sql` is six steps, `{memtable,staged,published}-ui-c{1,8}`,
+     at the standard 5 s warmup, 3 × 5 s and 300 s budget. Each client cycles traces,
+     verification, logs and metrics pages in a fixed order from its own offset, keeping each
+     page's dependencies and concurrency. Each page and page statement reports client latency
+     and sample count as `diagnostic.driver.{page,statement}.*`; a percentile under its floor
+     (200 for p95, 1,000 for p99) is recorded as inconclusive
+     (`query::ui::workload::tests::short_percentiles_are_inconclusive`). Standalone
+     statements are correctness-only.
+   - The 10× and learned-layout comparisons are separate opt-in experiments,
+     `ui-sql-10x` (`bench:l1:bifrost:ui:10x`) and `ui-sql-learned`
+     (`bench:l1:bifrost:ui:learned`), outside `bench:l1:bifrost` and `bench:l1`.
+   - `tests::level_one_declares_complete_engine_coverage`: RED against the old 69-step
+     matrix, then GREEN; RED again on `ui-sql-10x is an extended L1 experiment`, then GREEN.
+     Command: `mise exec -- cargo nextest run --locked -p wyrd-testing --bin capacity -E 'test(=tests::level_one_declares_complete_engine_coverage)'`.
+   - Smokes (VALID, `--allow-dirty`, diagnostic only): `ui-sql/20261118T205029Z-7b988f68b.json`,
+     `ui-sql-10x/20261118T204416Z-7b988f68b.json`, `hot/20261118T204917Z-7b988f68b.json`.
+     A smoke took about 57 s, 24 s of it windows, so setup, seeding and placement took about
+     33 s; full L1 should need about 155 s of 300 s. That is an estimate, not a measurement.
+   - **TDD process violation:** the `diagnose` sample-floor helper in
+     `capacity/query/ui/workload.rs` was written before `short_percentiles_are_inconclusive`.
+   - Commits: `be1dda235`, `2cb79aeec`, `e24285ae5`, `7b988f68b`, `dfea1d71c`.
 4. **Work follows demand.** Open a captured multi-batch canonical/learned source
    without pulling: row expressions/reconstruction have not run. Pull through
    its actual DataFusion source and observe bounded work/results. Where the

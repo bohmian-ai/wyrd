@@ -309,7 +309,7 @@
       <span class="listtools" bind:this={listTools}></span>
     </div>
     <div class="split" class:folded={!filtersOpen}>
-      {#if filtersOpen}<div id="facets" data-panel="facets">{#if support}<FacetRail {...support.facets} {actions} onaction={onaction('FacetRail')} />{:else}<EmptyState state="loading" title="Counting the facets" />{/if}</div>{/if}
+      {#if filtersOpen}<div id="facets" data-panel="facets">{#if support}<FacetRail {...support.facets} {actions} onaction={onaction('FacetRail')} />{:else}<EmptyState state={streamed.problem ? 'error' : 'loading'} problem={streamed.problem} title={streamed.problem ? undefined : 'Counting the facets'} />{/if}</div>{/if}
       <div data-panel="list">
         {#if observe.list}<RecordTable {...observe.list} {actions} onaction={onaction('RecordTable')} oncolumns={(columns) => go({ ...closed(current), columns })} controls={listTools} />{/if}
       </div>
@@ -324,7 +324,7 @@
     {/if}
     <!-- The records work region: fields, records and the selected record side by side, wrapping on a narrow screen. -->
     <div class="work">
-      <div data-panel="facets">{#if support}<FacetRail {...support.facets} {actions} onaction={onaction('FacetRail')} />{:else}<EmptyState state="loading" title="Counting the facets" />{/if}</div>
+      <div data-panel="facets">{#if support}<FacetRail {...support.facets} {actions} onaction={onaction('FacetRail')} />{:else}<EmptyState state={streamed.problem ? 'error' : 'loading'} problem={streamed.problem} title={streamed.problem ? undefined : 'Counting the facets'} />{/if}</div>
       <div data-panel="list">
         {#if observe.list}<RecordTable {...observe.list} {actions} onaction={onaction('RecordTable')} oncolumns={(columns) => go({ ...closed(current), columns })} tools={grouping} />{/if}
       </div>

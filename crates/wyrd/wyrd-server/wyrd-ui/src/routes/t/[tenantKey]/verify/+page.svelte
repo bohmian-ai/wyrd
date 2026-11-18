@@ -148,7 +148,7 @@
           <Chart {...support.charts.verdicts} compact bars colors={VERDICTS} headline={counted(support.charts.verdicts)} {actions} onaction={onaction('Chart')} />
           <Chart {...support.charts.verifiers} compact bars colors={key(support.charts.verifierSeries)} headline={counted(support.charts.verifiers)} {actions} onaction={onaction('Chart')} />
         {:else}
-          <EmptyState state="loading" title="Reading the timelines" />
+          <EmptyState state={streamed.problem ? 'error' : 'loading'} problem={streamed.problem} title={streamed.problem ? undefined : 'Reading the timelines'} />
         {/if}
       </div>
     </section>
@@ -163,7 +163,7 @@
     </div>
     <div class="split">
       <div data-panel="facets">
-        {#if support}<FacetRail {...support.facets} {labels} link={definition} {actions} onaction={onaction('FacetRail')} />{:else}<EmptyState state="loading" title="Counting the facets" />{/if}
+        {#if support}<FacetRail {...support.facets} {labels} link={definition} {actions} onaction={onaction('FacetRail')} />{:else}<EmptyState state={streamed.problem ? 'error' : 'loading'} problem={streamed.problem} title={streamed.problem ? undefined : 'Counting the facets'} />{/if}
       </div>
       <div data-panel="list"><RecordTable {...verify.list} {labels} {more} {actions} onaction={onaction('RecordTable')} /></div>
     </div>

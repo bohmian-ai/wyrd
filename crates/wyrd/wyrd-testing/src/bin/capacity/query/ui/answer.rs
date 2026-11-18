@@ -9,6 +9,8 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
 use arrow::util::display::{ArrayFormatter, FormatOptions};
+use wyrd_queue::variant::variant_cell_to_json;
+use wyrd_types::variant::is_variant;
 
 /// One result column: its name, exact Arrow type and field metadata, which
 /// carries a Variant's extension identity.
@@ -53,7 +55,9 @@ pub struct Answer {
 }
 
 impl Answer {
-    /// The answer `batches` of `schema` hold, in stream order.
+    /// The answer `batches` of `schema` hold, in stream order, with each
+    /// Variant column shown as its JSON value, so one object compares equal
+    /// however its fields are laid out.
     ///
     /// # Errors
     ///
@@ -77,16 +81,22 @@ impl Answer {
                 .map(|column| ArrayFormatter::try_new(column.as_ref(), &options))
                 .collect::<Result<Vec<_>, _>>()?;
             for row in 0..batch.num_rows() {
-                rows.push(
-                    batch
-                        .columns()
-                        .iter()
-                        .zip(&formatters)
-                        .map(|(column, formatter)| {
-                            (!column.is_null(row)).then(|| formatter.value(row).to_string())
-                        })
-                        .collect(),
-                );
+                let mut cells = Vec::with_capacity(batch.num_columns());
+                for ((column, formatter), field) in
+                    batch.columns().iter().zip(&formatters).zip(schema.fields())
+                {
+                    cells.push(if column.is_null(row) {
+                        None
+                    } else if is_variant(field) {
+                        let json = variant_cell_to_json(column.as_ref(), row).map_err(|error| {
+                            ArrowError::InvalidArgumentError(format!("{}: {error:?}", field.name()))
+                        })?;
+                        Some(json.to_string())
+                    } else {
+                        Some(formatter.value(row).to_string())
+                    });
+                }
+                rows.push(cells);
             }
         }
         Ok(Self { columns, rows })
@@ -188,11 +198,12 @@ impl Answer {
                 .unwrap_or(expected.rows.len());
             let cut = matches!(order, Order::Cut { limit, .. } if limit == expected.rows.len());
             if !(cut && end == expected.rows.len()) {
-                let mut actual = self.rows[start..end].to_vec();
-                let mut wanted = expected.rows[start..end].to_vec();
-                actual.sort();
-                wanted.sort();
-                self.same_rows(&actual, &wanted, start)?;
+                let mut actual: Vec<&Vec<Option<String>>> = self.rows[start..end].iter().collect();
+                let mut wanted: Vec<&Vec<Option<String>>> =
+                    expected.rows[start..end].iter().collect();
+                actual.sort_unstable();
+                wanted.sort_unstable();
+                self.same_rows(actual, wanted, start)?;
             }
             start = end;
         }
@@ -205,13 +216,13 @@ impl Answer {
     /// # Errors
     ///
     /// Returns the first differing cell.
-    fn same_rows(
+    fn same_rows<'r>(
         &self,
-        actual: &[Vec<Option<String>>],
-        wanted: &[Vec<Option<String>>],
+        actual: impl IntoIterator<Item = &'r Vec<Option<String>>>,
+        wanted: impl IntoIterator<Item = &'r Vec<Option<String>>>,
         first: usize,
     ) -> Result<(), String> {
-        for (index, (row, want)) in actual.iter().zip(wanted).enumerate() {
+        for (index, (row, want)) in actual.into_iter().zip(wanted).enumerate() {
             if let Some(((cell, want), column)) = row
                 .iter()
                 .zip(want)
@@ -394,5 +405,30 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    /// The one-row answer of an `attributes` Variant column holding `json`.
+    fn attributes(json: &str) -> Answer {
+        let text: ArrayRef = Arc::new(StringArray::from(vec![json]));
+        let variant = parquet_variant_compute::json_to_variant(&text).expect("variant");
+        let schema = Arc::new(Schema::new(vec![variant.field("attributes")]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![ArrayRef::from(variant)])
+            .expect("batch");
+        Answer::from_batches(&schema, &[batch]).expect("answer")
+    }
+
+    /// One Variant object written with its fields in two physical orders
+    /// is one answer, while a different value is not.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the checker compares Variant bytes rather than values.
+    #[test]
+    fn variants_compare_by_value_not_layout() {
+        let expected = attributes(r#"{"route":"/api/cart","status":200}"#);
+        let reordered = attributes(r#"{"status":200,"route":"/api/cart"}"#);
+        assert_eq!(reordered.matches(&expected, Order::Total), Ok(()));
+        let wrong = attributes(r#"{"route":"/api/cart","status":404}"#);
+        assert!(wrong.matches(&expected, Order::Total).is_err());
     }
 }

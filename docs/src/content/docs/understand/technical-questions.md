@@ -1,5 +1,6 @@
 ---
 title: Technical questions
+browserTitle: "Real-Time Verification: Technical Questions"
 description: Real-time verification technical questions - who enforces a verdict, verify versus submit and schedules, missing evidence, timeouts, model providers and sensitive data, versions, languages, and self-hosting.
 pillar: wyrd
 section: Understand

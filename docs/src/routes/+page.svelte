@@ -10,6 +10,7 @@
   import Tab from '$lib/components/Tab.svelte';
   import FinanceFlow from '$lib/components/FinanceFlow.svelte';
   import WorkflowStrip from '$lib/components/WorkflowStrip.svelte';
+  import PageHead from '$lib/components/PageHead.svelte';
 
   let { data } = $props();
 
@@ -38,13 +39,12 @@
     .find((item) => item.path === '/understand/how-verification-works/');
 </script>
 
-<svelte:head>
-  <title>Wyrd docs</title>
-  <meta
-    name="description"
-    content="The only real-time verification system built for your applications. Your application asks Wyrd whether an action meets your requirements, and acts on the verdict."
-  />
-</svelte:head>
+<PageHead
+  title="Wyrd | Real-Time Verification for AI Applications"
+  description="Open-source real-time verification for AI applications: check a proposed action against declared requirements, get an evidence-backed verdict in time to act, and keep the evidence."
+  path="/"
+  type="website"
+/>
 
 <section class="cover dark-field" aria-label="Wyrd">
   <CoverScene />

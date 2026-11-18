@@ -6,7 +6,7 @@ name: publish-docs
 # the repository's Pages settings. `paths.base = '/wyrd'` in
 # docs/svelte.config.js prefixes every asset and link, so the build is uploaded
 # inside a wyrd/ folder. The llms.txt origin constant
-# (docs/scripts/generate_llms_txt.py) must name the same domain.
+# (docs/scripts/generate_llms_txt.py) and docs/site.js must name the same domain.
 
 on:
   push:

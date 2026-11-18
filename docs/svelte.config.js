@@ -6,14 +6,14 @@ import rehypeSlug from 'rehype-slug';
 import rehypeAutolinkHeadings from 'rehype-autolink-headings';
 import { fileURLToPath } from 'url';
 import path from 'path';
+import { BASE } from './site.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// Single source of truth for the GitHub Pages project subpath. Used both for
-// SvelteKit's `paths.base` and the rehype link rewriter below, so markdown
-// content can author clean root-absolute links (`/cards/data/`) and have them
-// resolve correctly under `/wyrd/` at build time.
-const BASE = '/wyrd';
+// BASE (site.js) is the GitHub Pages project subpath. It sets SvelteKit's
+// `paths.base` and drives the rehype link rewriter below, so markdown content
+// can author clean root-absolute links (`/cards/data/`) and have them resolve
+// correctly under `/wyrd/` at build time.
 
 // Rewrite markdown-authored absolute links/images so they survive the Pages
 // subpath. SvelteKit only resolves `<a>` in component markup, not links emitted

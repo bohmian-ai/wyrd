@@ -28,9 +28,9 @@ CONTENT_DIR = DOCS_ROOT / "src" / "content" / "docs"
 PUBLIC_DIR = DOCS_ROOT / "public"
 
 # Production origin for the docs site: GitHub Pages serves it on the
-# docs.bohmian.ai custom domain under BASE. BASE must always match
-# svelte.config.js `paths.base`; every emitted link is BASE-relative so a local
-# build under the same base serves it.
+# docs.bohmian.ai custom domain under BASE. Both must always match docs/site.js;
+# every emitted link is BASE-relative so a local build under the same base
+# serves it.
 ORIGIN = "https://docs.bohmian.ai"
 BASE = "/wyrd"
 SITE = f"{ORIGIN}{BASE}"

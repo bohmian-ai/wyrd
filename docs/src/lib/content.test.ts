@@ -1,11 +1,15 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { render } from 'svelte/server';
-import { toSlug, validateFrontmatter, type DocMetadata } from './content.js';
+import { allSlugs, getEntry, toSlug, validateFrontmatter, type DocMetadata } from './content.js';
 import DocPage from '../routes/[...slug]/+page.svelte';
+import Landing from '../routes/+page.svelte';
+import { load as landingData } from '../routes/+page.server';
 import { lastCommitDate, remarkUpdated } from './updated.js';
+
+vi.mock('$app/paths', () => ({ base: '/wyrd' }));
 
 describe('toSlug', () => {
   it('maps index.md to the directory root (empty string for top-level)', () => {
@@ -196,5 +200,71 @@ describe('page rendering', () => {
 
   it('shows no date for a page without commit history', () => {
     expect(show({ title: 'X', pillar: 'wyrd', section: 'Reference' })).not.toContain('Last updated');
+  });
+});
+
+describe('page metadata', () => {
+  const SITE = 'https://docs.bohmian.ai/wyrd';
+  const head = (slug: string) => {
+    const entry = getEntry(slug)!;
+    const { head, body } = render(DocPage, { props: { data: { slug, metadata: entry.metadata, archetype: 'article' } } });
+    return { head, body, entry };
+  };
+  const meta = (html: string, key: string) =>
+    html.match(new RegExp(`<meta (?:name|property)="${key}" content="([^"]*)"`))?.[1];
+  const canonical = (html: string) => html.match(/<link rel="canonical" href="([^"]*)"/)?.[1];
+  const title = (html: string) => html.match(/<title>([^<]*)<\/title>/)?.[1];
+
+  it('positioning pages expose canonical metadata', () => {
+    const home = render(Landing, { props: { data: landingData() } }).head;
+    expect(title(home)).toBe('Wyrd | Real-Time Verification for AI Applications');
+    expect(canonical(home)).toBe(`${SITE}/`);
+    expect(meta(home, 'og:url')).toBe(`${SITE}/`);
+    expect(meta(home, 'og:type')).toBe('website');
+    expect(meta(home, 'og:title')).toBe(title(home));
+    expect(meta(home, 'description')).toBeTruthy();
+    expect(meta(home, 'og:description')).toBe(meta(home, 'description'));
+    expect(meta(home, 'description')).not.toBe(getEntry('get-started/introduction')!.metadata.description);
+
+    const pages = {
+      'understand/real-time-verification': ['Real-Time Verification for AI Applications | Wyrd', 'Real-time verification'],
+      'understand/technical-questions': ['Real-Time Verification: Technical Questions', 'Technical questions'],
+      'understand/foundations-of-verification': ['Foundations of AI Verification | Wyrd', 'Foundations of verification'],
+      'build-and-verify/verify/verify-an-agent-workflow': ["Verify an agent's workflow | Wyrd", "Verify an agent's workflow"]
+    };
+    for (const [slug, [browser, h1]] of Object.entries(pages)) {
+      const { head: html, body, entry } = head(slug);
+      // The reader-facing heading stays the frontmatter title; the browser title is its own contract.
+      expect(title(html), slug).toBe(browser);
+      expect(body).toMatch(new RegExp(`<h1[^>]*>${h1}</h1>`));
+      expect(canonical(html), slug).toBe(`${SITE}/${slug}/`);
+      expect(meta(html, 'og:url')).toBe(`${SITE}/${slug}/`);
+      expect(meta(html, 'og:type')).toBe('article');
+      expect(meta(html, 'og:site_name')).toBe('Wyrd');
+      expect(meta(html, 'og:title')).toBe(title(html));
+      expect(meta(html, 'description')).toBe(entry.metadata.description);
+      expect(meta(html, 'og:description')).toBe(entry.metadata.description);
+      expect(meta(html, 'twitter:card')).toBe('summary');
+      expect(html).not.toMatch(/localhost|127\.0\.0\.1|docs\.test/);
+    }
+  });
+
+  it('gives every page its own browser title and description', () => {
+    const home = render(Landing, { props: { data: landingData() } }).head;
+    const heads = [home, ...allSlugs().map((slug) => head(slug).head)];
+    for (const key of ['title', 'description'] as const) {
+      const values = heads.map((html) => (key === 'title' ? title(html) : meta(html, 'description')));
+      expect(values.filter((value) => !value)).toEqual([]);
+      expect(values.filter((value, i) => values.indexOf(value) !== i)).toEqual([]);
+    }
+  });
+
+  it('dates an article only from its commit history', () => {
+    const at = (updated?: string) =>
+      render(DocPage, {
+        props: { data: { slug: 'x', metadata: { title: 'X', pillar: 'wyrd', section: 'Reference', updated }, archetype: 'article' } }
+      }).head;
+    expect(meta(at('2026-09-30'), 'article:modified_time')).toBe('2026-09-30');
+    expect(at()).not.toContain('article:modified_time');
   });
 });

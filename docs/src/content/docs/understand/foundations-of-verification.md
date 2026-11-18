@@ -1,5 +1,6 @@
 ---
 title: Foundations of verification
+browserTitle: Foundations of AI Verification | Wyrd
 description: What verification establishes, how testing, validation, formal proof, and runtime checking differ, how to check outputs with no single right answer, and what an ML score or an agent's claim cannot show.
 pillar: wyrd
 section: Understand

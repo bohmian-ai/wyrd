@@ -628,6 +628,42 @@ mod tests {
                 "ui-sql judges {criterion}"
             );
         }
+        for (name, requests, layout) in [
+            ("ui-sql-10x", 5_000, "canonical"),
+            ("ui-sql-learned", 500, "learned"),
+        ] {
+            let extended = query::Experiment::parse(name).map_or_else(
+                || panic!("{name} is an extended L1 experiment"),
+                |extended| experiment(extended, &[], HOST),
+            );
+            assert!(
+                !query::Experiment::ALL
+                    .map(query::Experiment::name)
+                    .contains(&name),
+                "{name} runs only when selected"
+            );
+            assert!(extended.refusals().is_empty(), "{:?}", extended.refusals());
+            assert_eq!(extended.experiment, name);
+            assert_eq!(
+                extended.controls["fixture"]["journey"]["requests"],
+                requests
+            );
+            assert_eq!(extended.controls["fixture"]["layout"], layout);
+            assert_eq!(
+                extended
+                    .steps
+                    .iter()
+                    .map(|step| step.id.as_str())
+                    .collect::<Vec<_>>(),
+                ui_steps,
+                "{name} measures the same steps as ui-sql"
+            );
+            assert_eq!(
+                extended.timing, timing,
+                "{name} keeps the L1 windows and budget"
+            );
+        }
+        assert_eq!(ui.controls["fixture"]["layout"], "canonical");
         assert_eq!(
             query::Experiment::parse("writes-hot"),
             None,

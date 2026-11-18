@@ -23,6 +23,7 @@ use wyrd_testing::experiment::{
 };
 use wyrd_testing::release_server::{LocalServer, PEAK_SAMPLE_INTERVAL_MS};
 
+use super::Arm;
 use super::answer::Answer;
 use super::fixture::Journey;
 use super::{CASE, Catalog, PAGES, RESIDENCES, Statement, observation, param, seed};
@@ -30,10 +31,16 @@ use crate::query::isolated::SUCCESS;
 use crate::query::run::{self, Admission, Outcome, Sender, WRONG_RESULT, micros};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-use crate::query::{HOT_ENV, client, platform, start, table_files};
+use crate::query::telemetry::Telemetry;
+use crate::query::{
+    HOT_ENV, WRITE_FIXTURE_ROWS, client, learn_span_layout, platform, start, table_files,
+};
 
 /// How long seeded calls and verifications may take to become visible.
 const VISIBLE_WAIT: Duration = Duration::from_secs(60);
+
+/// Spans of the sample that teaches the learned arm's span layout.
+const LEARNING_SPANS: i64 = 10_000;
 
 /// Concurrent exporters loading the journey.
 const LOADERS: usize = 16;
@@ -56,6 +63,8 @@ pub struct Ui {
     logs: PathBuf,
     /// The journey loaded.
     journey: Journey,
+    /// Whether the server learns a span layout before the journey loads.
+    learned: bool,
     /// The running server, once prepared.
     server: Option<LocalServer>,
     /// The public query handle, once prepared.
@@ -74,12 +83,14 @@ pub struct Ui {
 }
 
 impl Ui {
-    /// An unprepared workload of `journey` keeping its server log under
+    /// An unprepared workload of `arm` keeping its server log under
     /// `logs`.
-    pub fn new(logs: PathBuf, journey: Journey) -> Self {
+    pub fn new(logs: PathBuf, arm: Arm) -> Self {
+        let journey = arm.journey;
         Self {
             logs,
             journey,
+            learned: arm.learned,
             server: None,
             queries: None,
             bound: Arc::new(Vec::new()),
@@ -237,6 +248,48 @@ impl Ui {
             )));
         }
         Ok(window)
+    }
+
+    /// Loads [`LEARNING_SPANS`] spans of the `hot` sample, dated far
+    /// outside the journey's hour and with their own trace ids, through
+    /// `otlp` and publishes them so the server learns its span layout
+    /// before the journey loads; the span count then includes them.
+    ///
+    /// # Errors
+    ///
+    /// Returns a workload error for a short or failed load, or a publish
+    /// that taught no layout.
+    async fn learn(&mut self, otlp: &run::Otlp) -> Result<(), ExperimentError> {
+        let server = self
+            .server
+            .as_ref()
+            .ok_or_else(|| ExperimentError::workload("the server is not started"))?;
+        let sample = Sender::Spans(
+            otlp.clone(),
+            Telemetry {
+                spans: WRITE_FIXTURE_ROWS,
+                wide: false,
+            },
+        );
+        let loaded = sample
+            .closed_loop(
+                &Arc::new(AtomicI64::new(WRITE_FIXTURE_ROWS)),
+                WRITE_FIXTURE_ROWS + LEARNING_SPANS,
+                LOADERS,
+                Admission::default(),
+            )
+            .await;
+        if loaded.error_count() > 0 || loaded.rows != LEARNING_SPANS.cast_unsigned() {
+            return Err(ExperimentError::workload(format!(
+                "the layout sample loaded {} of {LEARNING_SPANS} spans with errors {:?}",
+                loaded.rows, loaded.errors
+            )));
+        }
+        learn_span_layout(server)
+            .await
+            .map_err(ExperimentError::workload)?;
+        self.spans += LEARNING_SPANS;
+        Ok(())
     }
 
     /// Each table the journey writes and the rows it holds there.
@@ -524,6 +577,9 @@ impl Workload for Ui {
         let otlp = run::Otlp::connect(&client)
             .await
             .map_err(ExperimentError::workload)?;
+        if self.learned {
+            self.learn(&otlp).await?;
+        }
         let exports = self.journey.exports();
         let loaded = Sender::Ui(otlp, self.journey)
             .closed_loop(
@@ -577,7 +633,7 @@ impl Workload for Ui {
                 first = ?expected.rows.first(),
                 "ui-sql reference"
             );
-            if let Err(problem) = seed::check(&statement.id, &expected) {
+            if let Err(problem) = seed::check(&statement.id, &expected, self.journey) {
                 failed.push(problem);
             }
             bound.push(Bound {

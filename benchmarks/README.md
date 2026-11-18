@@ -39,6 +39,14 @@ Bifrost `hot`, `parquet` and `ui-sql`) except Bifrost `writes-parquet`,
 which takes up to 8 (480 s), so `bench:l1:bifrost` takes up to 23 minutes
 (1,380 s) and `bench:l1` up to 33 in all. An L2 engine takes 20 to 30 minutes.
 
+Two extended Bifrost experiments run only when selected, never inside
+`bench:l1:bifrost` or `bench:l1`, each up to 5 minutes with its own record:
+`bench:l1:bifrost:ui:10x` (`ui-sql-10x`) runs `ui-sql` over ten times the
+journey's requests, and `bench:l1:bifrost:ui:learned` (`ui-sql-learned`) runs
+it after a published span sample taught the server a span Variant layout.
+They are the volume and layout comparisons for `ui-sql`, not part of a
+complete L1 suite.
+
 ## Prerequisites
 
 The commands run on macOS arm64, Linux x86_64, and Linux arm64, with the same

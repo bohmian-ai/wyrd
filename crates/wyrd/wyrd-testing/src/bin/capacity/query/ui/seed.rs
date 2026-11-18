@@ -17,6 +17,7 @@ use wyrd_testing::gateway_capture::{GatewayCapture, PacedUpstream, Pacing};
 use wyrd_testing::release_server::SetupTenant;
 
 use super::answer::Answer;
+use super::fixture::Journey;
 use crate::gateway::workload::{Caller, CapturePolicy, Shape, Tenant as GatewayTenant, call, http};
 use crate::verification::workload::{
     ASSERT_VERIFIER, Tenant as VerificationTenant, context, failing,
@@ -40,9 +41,6 @@ pub const DIRECT: u32 = 60;
 
 /// Submitted verifications driven; each completes in the background.
 pub const SUBMITTED: u32 = 40;
-
-/// Agent-invocation roots the journey exports: every fourth of its 500.
-pub const INVOCATIONS: u32 = 125;
 
 /// Drives [`CALLS`] priced gateway calls and [`DIRECT`] direct and
 /// [`SUBMITTED`] submitted assertion verifications, every odd one
@@ -182,14 +180,14 @@ pub enum Known {
 /// `pending`: the server records no `status` event, so the `waiting`
 /// filter answers no row.
 #[must_use]
-pub fn known(id: &str) -> Vec<Known> {
+pub fn known(id: &str, journey: Journey) -> Vec<Known> {
     let executions = DIRECT + SUBMITTED;
     let half = executions / 2;
     let calls = f64::from(CALLS);
     let cells = |values: &[&str]| values.iter().map(|value| (*value).to_owned()).collect();
     match id {
         "stat-invocations-total" | "stat-invocations-buckets" => {
-            vec![Known::Sum("value", f64::from(INVOCATIONS))]
+            vec![Known::Sum("value", journey.invocations() as f64)]
         }
         "stat-calls-total" | "stat-calls-buckets" => vec![Known::Sum("value", calls)],
         "stat-tokens-total" | "stat-tokens-buckets" => {
@@ -221,8 +219,8 @@ pub fn known(id: &str) -> Vec<Known> {
 /// # Errors
 ///
 /// Returns the first property the answer misses.
-pub fn check(id: &str, answer: &Answer) -> Result<(), String> {
-    for property in known(id) {
+pub fn check(id: &str, answer: &Answer, journey: Journey) -> Result<(), String> {
+    for property in known(id, journey) {
         let held = match &property {
             Known::Rows(rows) => answer.rows.len() == *rows,
             Known::Sum(column, sum) => {
@@ -258,6 +256,7 @@ pub fn check(id: &str, answer: &Answer) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::super::answer::{Answer, Column};
+    use super::super::fixture::Journey;
     use super::check;
 
     /// A one-column answer of `cells`.
@@ -283,14 +282,42 @@ mod tests {
     /// Panics when an empty or wrong answer passes, or a right one fails.
     #[test]
     fn driven_statements_must_count_what_was_driven() {
-        assert!(check("stat-calls-total", &answer("value", &[])).is_err());
-        assert!(check("stat-calls-total", &answer("value", &["99"])).is_err());
+        assert!(check("stat-calls-total", &answer("value", &[]), Journey::DEFAULT).is_err());
+        assert!(
+            check(
+                "stat-calls-total",
+                &answer("value", &["99"]),
+                Journey::DEFAULT
+            )
+            .is_err()
+        );
         assert_eq!(
-            check("stat-calls-total", &answer("value", &["100"])),
+            check(
+                "stat-calls-total",
+                &answer("value", &["100"]),
+                Journey::DEFAULT
+            ),
             Ok(())
         );
-        assert!(check("verify-filter-status", &answer("value", &["1"])).is_err());
-        assert_eq!(check("verify-filter-status", &answer("value", &[])), Ok(()));
-        assert_eq!(check("trace-list", &answer("value", &[])), Ok(()));
+        assert!(
+            check(
+                "verify-filter-status",
+                &answer("value", &["1"]),
+                Journey::DEFAULT
+            )
+            .is_err()
+        );
+        assert_eq!(
+            check(
+                "verify-filter-status",
+                &answer("value", &[]),
+                Journey::DEFAULT
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            check("trace-list", &answer("value", &[]), Journey::DEFAULT),
+            Ok(())
+        );
     }
 }

@@ -168,11 +168,20 @@ pub enum Experiment {
     /// The original UI SQL over the deterministic journey in each
     /// residence.
     UiSql,
+    /// [`Self::UiSql`] over ten times the journey's requests.
+    UiSql10x,
+    /// [`Self::UiSql`] after a published span sample taught the server a
+    /// span Variant layout.
+    UiSqlLearned,
 }
 
 impl Experiment {
     /// Every experiment, in the order `l1 bifrost` runs them.
     pub const ALL: [Self; 4] = [Self::WritesParquet, Self::Hot, Self::Parquet, Self::UiSql];
+
+    /// The extended experiments, run only when selected by name: never part
+    /// of `l1 bifrost` or `l1`.
+    pub const EXTENDED: [Self; 2] = [Self::UiSql10x, Self::UiSqlLearned];
 
     /// The experiment id: its command word and record directory.
     #[must_use]
@@ -182,6 +191,8 @@ impl Experiment {
             Self::Hot => "hot",
             Self::Parquet => "parquet",
             Self::UiSql => "ui-sql",
+            Self::UiSql10x => "ui-sql-10x",
+            Self::UiSqlLearned => "ui-sql-learned",
         }
     }
 
@@ -190,7 +201,20 @@ impl Experiment {
     pub fn parse(name: &str) -> Option<Self> {
         Self::ALL
             .into_iter()
+            .chain(Self::EXTENDED)
             .find(|experiment| experiment.name() == name)
+    }
+
+    /// The ui-sql arm the experiment runs, or `None` for the other
+    /// experiments.
+    #[must_use]
+    pub const fn ui_arm(self) -> Option<ui::Arm> {
+        match self {
+            Self::UiSql => Some(ui::Arm::DEFAULT),
+            Self::UiSql10x => Some(ui::Arm::TEN_X),
+            Self::UiSqlLearned => Some(ui::Arm::LEARNED),
+            Self::WritesParquet | Self::Hot | Self::Parquet => None,
+        }
     }
 
     /// Whether the experiment measures writes rather than reads.
@@ -203,14 +227,14 @@ impl Experiment {
     const fn env(self) -> &'static [(&'static str, &'static str)] {
         match self {
             Self::WritesParquet | Self::Parquet => &PARQUET_ENV,
-            Self::Hot | Self::UiSql => &HOT_ENV,
+            Self::Hot | Self::UiSql | Self::UiSql10x | Self::UiSqlLearned => &HOT_ENV,
         }
     }
 
     /// The read steps: each op, what it asks, and its client counts.
     const fn reads(self) -> &'static [(&'static str, Read, &'static [u64])] {
         match self {
-            Self::WritesParquet | Self::UiSql => &[],
+            Self::WritesParquet | Self::UiSql | Self::UiSql10x | Self::UiSqlLearned => &[],
             Self::Hot => &HOT_READS,
             Self::Parquet => &PARQUET_READS,
         }
@@ -450,8 +474,9 @@ pub fn experiment(arguments: &[String]) -> std::result::Result<Experiment, Strin
         .and_then(|name| Experiment::parse(name))
         .ok_or_else(|| {
             format!(
-                "l1 bifrost takes one experiment of {:?} before its flags",
-                Experiment::ALL.map(Experiment::name)
+                "l1 bifrost takes one experiment of {:?} or {:?} before its flags",
+                Experiment::ALL.map(Experiment::name),
+                Experiment::EXTENDED.map(Experiment::name)
             )
         })
 }
@@ -496,13 +521,12 @@ pub fn plan(context: &Context<'_>, base: Declaration) -> std::result::Result<Pla
     {
         fixture.insert("smoke_rows".to_owned(), json!(scale));
     }
-    let workload: Box<dyn wyrd_testing::experiment::Workload> = match experiment {
-        Some(Experiment::UiSql) => {
-            Box::new(ui::workload::Ui::new(logs, ui::fixture::Journey::DEFAULT))
-        }
-        Some(experiment) => Box::new(isolated::Isolated::new(logs, experiment, scale)),
-        None => Box::new(competing::Competing::new(logs, scale)),
-    };
+    let workload: Box<dyn wyrd_testing::experiment::Workload> =
+        match (experiment, experiment.and_then(Experiment::ui_arm)) {
+            (_, Some(arm)) => Box::new(ui::workload::Ui::new(logs, arm)),
+            (Some(experiment), None) => Box::new(isolated::Isolated::new(logs, experiment, scale)),
+            (None, None) => Box::new(competing::Competing::new(logs, scale)),
+        };
     Ok(Plan {
         declaration,
         workload,
@@ -955,7 +979,10 @@ fn l1_declaration(experiment: Experiment, mut base: Declaration) -> Declaration 
             read_fixture("parquet"),
             "closed-loop public-client clients, each sending its next query once the last answers, every answer checked exactly: Bifrost SQL events point lookups, 100k-row aggregates, and full scans; span `trace_id` lookups and `attributes ->>` filters on a shredded and a long-tail key",
         ),
-        Experiment::UiSql => return ui::declare(base, isolated_metrics(), limits),
+        Experiment::UiSql | Experiment::UiSql10x | Experiment::UiSqlLearned => {
+            let arm = experiment.ui_arm().unwrap_or(ui::Arm::DEFAULT);
+            return ui::declare(base, isolated_metrics(), limits, arm);
+        }
     };
     question.clone_into(&mut base.question);
     base.variables.insert("clients".to_owned(), json!(PAIR));
@@ -1113,7 +1140,9 @@ fn windowed(experiment: Experiment, id: &str, mut params: Value) -> Step {
                 "native-write-c1" | "otlp-spans-c1" | "otlp-spans-1k-c1" | "native-write-c64"
             )
         }
-        Experiment::Hot | Experiment::UiSql => false,
+        Experiment::Hot | Experiment::UiSql | Experiment::UiSql10x | Experiment::UiSqlLearned => {
+            false
+        }
     };
     if long {
         params[WINDOW_SECONDS] = json!(10);
@@ -1521,6 +1550,32 @@ fn client(server: &LocalServer) -> Result<WyrdClient> {
         credential: Some(server.api_key().clone()),
         ..ClientConfig::from_global_with_overrides(&GlobalConfig::default(), Some(SERVER_URL), None)
     })?)
+}
+
+/// Scribe's gauge of cached learned Variant layouts, by namespace.
+const LAYOUTS_LEARNED: &str = "bifrost_scribe_variant_layouts_learned";
+
+/// Publishes everything `server`'s Scribe holds through the benchmark
+/// control and requires the publish to have taught it a `bifrost.traces`
+/// Variant layout, so later span rows are written in that learned layout.
+///
+/// # Errors
+///
+/// Returns a failed platform sign-in or publish, an empty publish, or no
+/// learned layout.
+pub async fn learn_span_layout(server: &LocalServer) -> Result<()> {
+    let claims = platform(server).await?.publish_scribe().await?;
+    let learned = server
+        .metrics()
+        .await?
+        .sum(LAYOUTS_LEARNED, &["namespace=\"bifrost.traces\""]);
+    if claims == 0 || learned < 1.0 {
+        return Err(format!(
+            "publishing the span sample published {claims} claims and taught {learned} bifrost.traces Variant layouts"
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// The platform session on `server` of the platform root credential its

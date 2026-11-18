@@ -608,6 +608,13 @@ impl Journey {
         }
     }
 
+    /// Agent-invocation roots the journey exports: one per fourth request
+    /// ([`operation`]).
+    #[must_use]
+    pub const fn invocations(self) -> i64 {
+        (self.requests + 3) / 4
+    }
+
     /// Spans the journey exports.
     #[must_use]
     pub fn span_rows(self) -> i64 {

@@ -42,21 +42,72 @@ pub fn observation(kind: &str, name: &str) -> String {
     format!("{}.{kind}.{name}", Role::Driver.name())
 }
 
-/// The ui-sql declaration over `base` with the Bifrost read `metrics` and
-/// the server's `limits`: one step per residence and [`CLIENTS`] count, in
+/// One ui-sql arm: the journey it loads and whether the server first
+/// learns a span Variant layout from a separate published sample.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Arm {
+    /// The journey every residence holds.
+    pub journey: Journey,
+    /// Whether a published span sample teaches the server a
+    /// `bifrost.traces` Variant layout before the journey loads.
+    pub learned: bool,
+}
+
+impl Arm {
+    /// Default L1: the default journey in the canonical layout.
+    pub const DEFAULT: Self = Self {
+        journey: Journey::DEFAULT,
+        learned: false,
+    };
+
+    /// The extended volume arm: ten times the default journey's requests.
+    pub const TEN_X: Self = Self {
+        journey: Journey {
+            requests: 5_000,
+            routes: 30,
+        },
+        learned: false,
+    };
+
+    /// The extended layout arm: the default journey after a learned layout.
+    pub const LEARNED: Self = Self {
+        journey: Journey::DEFAULT,
+        learned: true,
+    };
+
+    /// The layout control the record names: `learned` or `canonical`.
+    #[must_use]
+    pub const fn layout(self) -> &'static str {
+        if self.learned { "learned" } else { "canonical" }
+    }
+}
+
+/// The ui-sql declaration of `arm` over `base` with the Bifrost read
+/// `metrics` and the server's `limits`, naming the arm's journey and
+/// layout among its fixture controls: one step per residence and [`CLIENTS`] count, in
 /// residence order, each running every page in the same fixed cycle with
 /// the level's standard windows and budget, judged on errors, exact typed
 /// answers and the pooled p95 sample floor. Each page and each page
 /// statement also reports its own client latency and sample count.
 #[must_use]
-pub fn declare(mut base: Declaration, mut metrics: Vec<Metric>, limits: Value) -> Declaration {
-    "Over the deterministic default journey in the catalog's hour, what do the original UI pages, cycled in a fixed order by 1 and 8 concurrent clients, cost the server and client per page and per statement when the rows are in memtables, staged, and published, with every typed answer of every catalog statement identical in every residence?".clone_into(&mut base.question);
-    let journey = Journey::DEFAULT;
+pub fn declare(
+    mut base: Declaration,
+    mut metrics: Vec<Metric>,
+    limits: Value,
+    arm: Arm,
+) -> Declaration {
+    let journey = arm.journey;
+    base.question = format!(
+        "Over the deterministic {}-request journey in the catalog's hour, in the {} span layout, what do the original UI pages, cycled in a fixed order by 1 and 8 concurrent clients, cost the server and client per page and per statement when the rows are in memtables, staged, and published, with every typed answer of every catalog statement identical in every residence?",
+        journey.requests,
+        arm.layout()
+    );
     base.variables.insert("clients".to_owned(), json!(CLIENTS));
     base.controls.insert(
         "fixture".to_owned(),
         json!({
             "journey": journey,
+            "layout": arm.layout(),
             "exports": journey.exports(),
             "spans": journey.span_rows(),
             "logs": journey.log_rows(),

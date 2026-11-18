@@ -19,7 +19,13 @@ any process can rebuild from its ID and wait on::
     result = wyrd.verify.Execution.connect(execution.id).wait(60)
 
 Window samples return ``Recorded``: the Verifier's schedule judges them later.
+
+``ChoiceTransform``, ``ProbabilityTransform``, ``ScoreTransform``, and their
+``VerdictTransform`` union are Pydantic models, imported on first use, so
+this module loads without the ``pydantic`` extra.
 """
+
+from typing import Any
 
 from .._wyrd.cards.prompt import Prompt, ResponseFormat
 from .._wyrd.verify import (
@@ -67,6 +73,7 @@ __all__ = [
     "Binding",
     "CardRef",
     "Check",
+    "ChoiceTransform",
     "CodeSource",
     "ComparisonOperator",
     "Component",
@@ -80,14 +87,35 @@ __all__ = [
     "Mcp",
     "Model",
     "Operator",
+    "ProbabilityTransform",
     "Prompt",
     "Recorded",
     "Requirement",
     "ResponseFormat",
+    "ScoreTransform",
     "Service",
     "Step",
     "Table",
     "Trigger",
+    "VerdictTransform",
     "VerificationResult",
     "Verifier",
 ]
+
+_TRANSFORMS = frozenset(
+    {"ChoiceTransform", "ProbabilityTransform", "ScoreTransform", "VerdictTransform"}
+)
+
+
+def __getattr__(name: str) -> Any:
+    """Import a Pydantic transform model on first use.
+
+    Raises:
+        ImportError: The ``pydantic`` extra is not installed.
+        AttributeError: ``name`` is no member of this module.
+    """
+    if name in _TRANSFORMS:
+        from . import _transforms
+
+        return getattr(_transforms, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

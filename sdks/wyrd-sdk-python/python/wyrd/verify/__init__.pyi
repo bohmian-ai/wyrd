@@ -54,6 +54,7 @@ from .. import cards
 from ..cards import CardKind, JsonScalar, JsonValue
 from ..client import WyrdClient
 from ..prompt import Prompt, ResponseFormat
+from ._transforms import ChoiceTransform, ProbabilityTransform, ScoreTransform, VerdictTransform
 
 # Wire views of the fixed records ``VerificationResult`` and
 # ``Execution.status`` return as dictionaries. They mirror the shared Rust
@@ -3251,6 +3252,7 @@ class CheckFields(TypedDict, total=False):
     workspace: Mapping[str, FieldInput]
     runtime: JsonInput
     response_format: JsonInput
+    verdict_transform: VerdictTransform | Mapping[str, JsonInput]
 
 class ArtifactFile:
     """A fixed file or directory prefix of one exact Artifact version.
@@ -3686,7 +3688,8 @@ class Check:
 
     @staticmethod
     def agent(agent: FieldInput, **fields: Unpack[CheckFields]) -> Check:
-        """Judge with ``agent``, which returns the Verdict schema.
+        """Judge with ``agent``, which returns the Verdict schema, or whose decision
+        answer ``verdict_transform`` reads into the verdict.
 
         Args:
             agent: An ``Agent``, an exact ``CardRef``, a YAML path, or an inline Agent mapping.
@@ -3767,6 +3770,19 @@ class Check:
 
         Args:
             value: The new ``response_format``.
+        """
+        ...
+
+    def verdict_transform(self, value: VerdictTransform | Mapping[str, JsonInput]) -> Self:
+        """Set ``verdict_transform``, the policy reading an Agent check's decision answer
+        into its verdict, replacing its earlier value; returns this value.
+
+        Args:
+            value: A transform model, or its canonical mapping such as
+                ``{"kind": "choice", "question": "refund_policy"}``.
+
+        Raises:
+            WyrdError: ``WYRD_SPEC_400_VALIDATION`` when ``value`` is no transform.
         """
         ...
 
@@ -4038,6 +4054,7 @@ __all__ = [
     "Binding",
     "CardRef",
     "Check",
+    "ChoiceTransform",
     "CodeSource",
     "ComparisonOperator",
     "Component",
@@ -4051,14 +4068,17 @@ __all__ = [
     "Mcp",
     "Model",
     "Operator",
+    "ProbabilityTransform",
     "Prompt",
     "Recorded",
     "Requirement",
     "ResponseFormat",
+    "ScoreTransform",
     "Service",
     "Step",
     "Table",
     "Trigger",
+    "VerdictTransform",
     "VerificationResult",
     "Verifier",
 ]

@@ -1,6 +1,8 @@
 """Public modules export what they list, and the package root re-exports them."""
 
 import importlib
+import subprocess
+import sys
 
 import pytest
 import wyrd
@@ -19,6 +21,7 @@ PUBLIC_MODULES = [
     "wyrd.operators",
     "wyrd.auth",
     "wyrd.prompt",
+    "wyrd.prompt.decisions",
     "wyrd.state",
     "wyrd.testing",
     "wyrd.testing.cli",
@@ -71,3 +74,40 @@ def test_verify_exports_definitions_and_the_original_prompt() -> None:
     with pytest.raises(ModuleNotFoundError):
         importlib.import_module("wyrd.authoring")
     assert not hasattr(importlib.import_module("wyrd._wyrd"), "authoring")
+
+
+DICTIONARY_ONLY_DECISIONS = """
+import sys
+
+sys.modules["pydantic"] = None
+from wyrd.prompt import Prompt
+from wyrd.verify import Action, Agent, Check
+
+prompt = Prompt.jev(
+    "jev-latest",
+    state="${context}",
+    questions={"helpful": {"type": "noul", "instructions": "Does the reply help?"}},
+)
+judge = Agent("judge", "1.0.0", prompt=prompt)
+Action.agent(judge)
+Check.agent(
+    judge,
+    verdict_transform={
+        "kind": "probability", "question": "helpful", "expected": True,
+        "pass_at": 0.9, "fail_at": 0.1,
+    },
+)
+try:
+    from wyrd.verify import ProbabilityTransform
+except ImportError:
+    print("models need pydantic")
+"""
+"""Jev authoring from dictionaries alone, in an interpreter where Pydantic cannot import."""
+
+
+def test_decision_authoring_from_dictionaries_needs_no_pydantic() -> None:
+    ran = subprocess.run(
+        [sys.executable, "-c", DICTIONARY_ONLY_DECISIONS], capture_output=True, text=True
+    )
+
+    assert (ran.returncode, ran.stdout, ran.stderr) == (0, "models need pydantic\n", "")

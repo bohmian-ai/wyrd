@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -19,8 +19,24 @@ import httpx
 import openai
 import pytest
 from openai.types.chat import ChatCompletionMessageParam
+from wyrd.cards import CardKind
 from wyrd.gateway_admin import Gateway
+from wyrd.prompt import Prompt
+from wyrd.prompt.decisions import ChoiceQuestion, NoulCriteria, NoulQuestion, ScoreQuestion
+from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer, cli
+from wyrd.verify import (
+    Agent,
+    AgentRunConfig,
+    Check,
+    ChoiceTransform,
+    Component,
+    ExecutionRoute,
+    Requirement,
+    Service,
+    VerdictTransform,
+    Verifier,
+)
 
 from .support import Delivery, Receiver, client_of
 
@@ -43,6 +59,82 @@ REFUSALS = {
     "bad-key": 401,
 }
 """State text → the status the upstream refuses it with."""
+
+REFUND_CHOICES = {"CASE-PASS": "passed", "CASE-FAIL": "failed", "CASE-UNSURE": "inconclusive"}
+"""State marker → the refund question's selected label."""
+
+NATIVE_DESK_QUESTIONS: dict[str, Any] = {
+    "refund_policy": {
+        "type": "choice",
+        "instructions": "Does the reply promise a refund the policy does not allow?",
+        "criteria": {
+            "passed": "The reply makes no refund promise.",
+            "failed": "The reply promises a refund.",
+            "inconclusive": "The reply cannot be judged.",
+        },
+    },
+    "helpful": {
+        "type": "noul",
+        "instructions": "Does the reply help the customer?",
+        "criteria": {"true": "It answers the question.", "false": "It does not."},
+    },
+    "polite": {"type": "noul", "instructions": "Is the reply polite?"},
+    "urgency": {
+        "type": "score",
+        "instructions": "How urgently does the reply need follow-up?",
+        "criteria": ["Routine", "Soon", "Immediate"],
+    },
+}
+"""The refund desk's questions as the native Jev questions the typed models lower to."""
+
+TYPED_DESK_QUESTIONS = {
+    "refund_policy": ChoiceQuestion(
+        instructions="Does the reply promise a refund the policy does not allow?",
+        criteria={
+            "passed": "The reply makes no refund promise.",
+            "failed": "The reply promises a refund.",
+            "inconclusive": "The reply cannot be judged.",
+        },
+    ),
+    "helpful": NoulQuestion(
+        instructions="Does the reply help the customer?",
+        criteria=NoulCriteria(
+            true_description="It answers the question.", false_description="It does not."
+        ),
+    ),
+    "polite": NoulQuestion(instructions="Is the reply polite?"),
+    "urgency": ScoreQuestion(
+        instructions="How urgently does the reply need follow-up?",
+        criteria=["Routine", "Soon", "Immediate"],
+    ),
+}
+"""The same questions authored with the public Pydantic question models."""
+
+
+def desk_answer(choice: str) -> dict[str, Any]:
+    """Jev's answer to every refund desk question, selecting ``choice`` for the refund question."""
+    return {
+        "model": "jev-1.13.0",
+        "answers": {
+            "refund_policy": {
+                "type": "choice",
+                "choice": choice,
+                "confidence": 0.9,
+                "probabilities": {
+                    label: 0.9 if label == choice else 0.05
+                    for label in ("passed", "failed", "inconclusive")
+                },
+            },
+            "helpful": {"type": "noul", "noul": 0.8},
+            "polite": {"type": "noul", "noul": 0.7},
+            "urgency": {
+                "type": "score",
+                "score": 1.0,
+                "legend": {"0": "Routine", "1": "Soon", "2": "Immediate"},
+            },
+        },
+        "usage": {"input_tokens": 50, "output_tokens": 5},
+    }
 
 
 def answer(noul: float, tone: str) -> dict[str, Any]:
@@ -80,6 +172,9 @@ class JevUpstream(BaseHTTPRequestHandler):
         status, reply = 200, answer(0.93, "polite")
         if "Go away" in state:
             reply = answer(0.12, "rude")
+        for marker, choice in REFUND_CHOICES.items():
+            if marker in state:
+                reply = desk_answer(choice)
         for needle, refused in REFUSALS.items():
             if needle in state:
                 status, reply = refused, {"detail": f"key cred {JEV_KEY}"}
@@ -108,7 +203,9 @@ def jev() -> Iterator[tuple[WyrdTestServer, Receiver]]:
     try:
         with pytest.MonkeyPatch.context() as env:
             env.setenv("WYRD_TEST_GATEWAY_PROVIDER_KEY", JEV_KEY)
-            with WyrdTestServer(provider_base_url=recorded.url, mutate_env=False) as server:
+            with WyrdTestServer(
+                provider_base_url=recorded.url, verification_runtime=True, mutate_env=False
+            ) as server:
                 admin = client_of(server)
                 cli.put_provider_credential(
                     {
@@ -265,3 +362,103 @@ def test_jev_refusals_relay_like_other_providers(jev: tuple[WyrdTestServer, Rece
         client.chat.completions.create(model="jev/jev-latest", messages=chat("rate-limited"))
     assert throttled.value.code is None
     assert JEV_KEY not in throttled.value.response.text
+
+
+def refund_desk(prompt: Prompt, transform: VerdictTransform | Mapping[str, Any]) -> Service:
+    """``refund-desk``: the ``refund-judge`` Jev Agent asking ``prompt``, verified by its Choice answer.
+
+    ``refund-promise`` binds the ``reply`` slot to the Prompt's ``${context}`` and reads
+    the judge's answer through ``transform``.
+    """
+    judge = Agent(
+        "refund-judge",
+        "1.0.0",
+        prompt=prompt,
+        execution_route=ExecutionRoute.wyrd_gateway(deployment="jev"),
+        run_config=AgentRunConfig(max_iterations=1),
+    )
+    check = Check.agent(judge, inputs={"context": "inputs.reply"}, verdict_transform=transform)
+    verifier = Verifier(
+        "refund-promise",
+        "1.0.0",
+        inputs={"reply": str},
+        requirements=[
+            Requirement(
+                "no-refund-promise",
+                "The reply makes no refund promise the policy does not allow.",
+                check,
+            )
+        ],
+    )
+    return Service("refund-desk", "1.0.0").add_component(
+        Component("refund-judge", judge).verified_by([verifier])
+    )
+
+
+def test_typed_jev_choice_check_becomes_the_verdict(
+    jev: tuple[WyrdTestServer, Receiver],
+) -> None:
+    """Typed, native, and mixed Jev questions author one Prompt whose Choice answer is the verdict.
+
+    The Pydantic question and transform models need no ``model_dump``: the
+    declared graph stores the native Jev request and canonical transform, so
+    redeclaring the native-dictionary form changes nothing. Each reply reaches
+    Jev once as the bound state, and the selected label becomes the verdict.
+    """
+    server, upstream = jev
+    client = client_of(server)
+    typed, native, mixed = (
+        Prompt.jev("jev-latest", state="${context}", questions=questions)
+        for questions in (
+            TYPED_DESK_QUESTIONS,
+            NATIVE_DESK_QUESTIONS,
+            {
+                **NATIVE_DESK_QUESTIONS,
+                **{k: TYPED_DESK_QUESTIONS[k] for k in ("helpful", "urgency")},
+            },
+        )
+    )
+    assert typed.model_dump() == native.model_dump() == mixed.model_dump()
+    assert typed.model_dump()["body"] == {
+        "state": "${context}",
+        "questions": NATIVE_DESK_QUESTIONS,
+    }
+
+    state = WyrdState.declare(refund_desk(typed, ChoiceTransform(question="refund_policy")), client)
+    again = WyrdState.declare(
+        refund_desk(native, {"kind": "choice", "question": "refund_policy"}), client
+    )
+    assert [again.card_ref(alias) for alias in again.aliases] == [
+        state.card_ref(alias) for alias in state.aliases
+    ]
+    envelopes = [state.card(alias) for alias in state.aliases]
+    [verifier] = [each for each in envelopes if each.card_ref.kind == CardKind.Verifier]
+    [requirement] = verifier.spec["requirements"]
+    assert requirement["check"]["verdict_transform"] == {
+        "kind": "choice",
+        "question": "refund_policy",
+    }
+    prompts = [each.spec for each in envelopes if each.card_ref.kind == CardKind.Prompt]
+    assert prompts, [each.card_ref for each in envelopes]
+    assert all(spec == typed.model_dump() for spec in prompts), prompts
+
+    for reply, outcome in [
+        ('CASE-PASS: "Thanks" for asking.\nRefunds follow the policy.', "passed"),
+        ("CASE-FAIL: you will get a full refund today.", "failed"),
+        ("CASE-UNSURE: maybe.", "inconclusive"),
+    ]:
+        asked = len(upstream.deliveries)
+        result = state.run("refund-judge").observe.verify("refund-promise", reply=reply)
+
+        [judged] = result.requirements
+        assert (judged["outcome"], judged["reason"]) == (
+            outcome,
+            f"Question 'refund_policy' selected '{outcome}' (confidence 0.9).",
+        ), judged
+        assert judged.get("citations", []) == []
+        assert result.verdict == outcome
+        (delivery,) = upstream.deliveries[asked:]
+        assert (delivery.path, delivery.body) == (
+            "/v1/systemone",
+            {"model": "jev-latest", "state": reply, "questions": NATIVE_DESK_QUESTIONS},
+        )

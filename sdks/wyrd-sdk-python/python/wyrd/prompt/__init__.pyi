@@ -1812,6 +1812,37 @@ class Prompt:
         """
         ...
 
+    @staticmethod
+    def jev(
+        model: str,
+        *,
+        state: str,
+        questions: Mapping[str, Any],
+    ) -> Prompt:
+        """Build a TypeSafe Jev ``system_one`` decision prompt.
+
+        Each question is a ``wyrd.prompt.decisions`` model, lowered to its
+        native Jev question (Noul criteria become ``{"true", "false"}``), or
+        a native Jev question mapping kept as authored; one map may mix both.
+        An Agent check reads the answers through its ``verdict_transform``.
+
+        Args:
+            model: the Jev model, such as ``jev-latest``; must not be blank.
+            state: the text the questions are about, usually a ``${name}``
+                placeholder bound per call.
+            questions: question key to question; each answer returns under
+                its key.
+
+        Returns:
+            the new prompt.
+
+        Raises:
+            WyrdError: ``WYRD_SPEC_400_VALIDATION`` naming ``questions.<key>``
+                for a question in neither form, or the builder's error for a
+                blank model or a broken Jev bound, such as no questions.
+        """
+        ...
+
     def system(self, text: str) -> Prompt:
         """Return a copy with a system instruction.
 

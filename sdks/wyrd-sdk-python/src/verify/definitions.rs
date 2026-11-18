@@ -30,7 +30,8 @@ use wyrd_client::cards::Declarable;
 use wyrd_client::verify::{
     Action, Agent, AgentRunConfigSpec, Artifact, ArtifactFile, Audit, Binding, CardDefinition,
     CardRef, Check, CodeSource, ComparisonOperator, Component, Data, Experiment, FieldValue,
-    InputSlot, Mcp, Model, Operator, Requirement, Service, Step, Table, Trigger, Verifier,
+    InputSlot, Mcp, Model, Operator, Requirement, Service, Step, Table, Trigger, VerdictTransform,
+    Verifier,
 };
 use wyrd_spec::ExecutionRoute;
 use wyrd_spec::envelope::CardKind;
@@ -48,6 +49,18 @@ type Convert<T> = fn(&str, &Bound<'_, PyAny>) -> PyResult<T>;
 /// represent `value`.
 fn json(field: &str, value: &Bound<'_, PyAny>) -> PyResult<Value> {
     Ok(json_value(value.py(), field, value)?)
+}
+
+/// `value` as a canonical verdict transform: a `wyrd.verify` transform model
+/// or its canonical mapping, typed now so a malformed policy is refused where
+/// it is written and the stored form is the canonical one.
+///
+/// # Errors
+/// Raises `WYRD_SPEC_400_VALIDATION` naming `field` when `value` is not a
+/// transform's JSON form.
+fn transform(field: &str, value: &Bound<'_, PyAny>) -> PyResult<VerdictTransform> {
+    serde_json::from_value(json(field, value)?)
+        .map_err(|error| PyErr::from(invalid_argument(field, error)))
 }
 
 /// `value` as a Python string.
@@ -1133,7 +1146,7 @@ definition_class! {
 definition_class! {
     /// A verdict-producing requirement check.
     PyCheck(Check) = "Check" {
-        one { runtime: json, response_format: json }
+        one { runtime: json, response_format: json, verdict_transform: transform }
         list {}
         map { inputs, bind_input: json, workspace, add_workspace: field }
     }

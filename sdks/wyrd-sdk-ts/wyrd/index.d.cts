@@ -28,6 +28,16 @@ export declare class NativeAuthored {
    */
   static prompt(provider: string, model: string, options: any): NativeAuthored | NativeWyrdError
   /**
+   * The original native TypeSafe Jev `system_one` Prompt for `model`
+   * asking `questions` about `state`, built by the shared Prompt builder:
+   * each question named in `typed` is a typed decision question lowered
+   * to its native Jev form, every other one a native Jev question kept as
+   * authored. Returns the builder's stable refusal as the error value,
+   * such as `WYRD_PROMPT_400_EMPTY_MODEL` or `WYRD_PROMPT_400_INVALID`
+   * for a malformed question or a broken Jev bound.
+   */
+  static promptJev(model: string, state: string, questions: any, typed: Array<string>): NativeAuthored | NativeWyrdError
+  /**
    * The component `alias` for `reference`: a Card, an exact `CardRef`,
    * or a reference path.
    *

@@ -2315,6 +2315,99 @@ export type ResponseFormat =
   | { readonly type: "verdict"; readonly data?: Readonly<Record<string, Wire.JsonValue>> }
   | { readonly type: "code_review" };
 
+/** A {@link NoulQuestion}'s descriptions of each polarity. */
+export type NoulCriteria = {
+  /** What a true answer means. */
+  readonly true_description: string;
+  /** What a false answer means. */
+  readonly false_description: string;
+};
+
+/** A typed Jev yes-or-no question, answered with the probability it is true. */
+export class NoulQuestion {
+  /** The question type. */
+  readonly type = "noul";
+  /** What Jev is asked. */
+  readonly instructions: string;
+  /** The optional description of each polarity; absent, not `undefined`, when omitted. */
+  declare readonly criteria?: NoulCriteria;
+
+  /**
+   * A Noul question.
+   *
+   * @param options - The instructions and optional polarity descriptions.
+   */
+  constructor(options: { readonly instructions: string; readonly criteria?: NoulCriteria }) {
+    this.instructions = options.instructions;
+    if (options.criteria !== undefined) {
+      this.criteria = options.criteria;
+    }
+  }
+}
+
+/** A typed Jev question answered by selecting one labelled choice. */
+export class ChoiceQuestion {
+  /** The question type. */
+  readonly type = "choice";
+  /** What Jev is asked. */
+  readonly instructions: string;
+  /** Each choice label and its description. */
+  readonly criteria: Readonly<Record<string, string>>;
+
+  /**
+   * A Choice question.
+   *
+   * @param options - The instructions and the choices by label.
+   */
+  constructor(options: { readonly instructions: string; readonly criteria: Readonly<Record<string, string>> }) {
+    this.instructions = options.instructions;
+    this.criteria = options.criteria;
+  }
+}
+
+/** A typed Jev question answered with a score over ordered levels. */
+export class ScoreQuestion {
+  /** The question type. */
+  readonly type = "score";
+  /** What Jev is asked. */
+  readonly instructions: string;
+  /** The levels, lowest first. */
+  readonly criteria: readonly string[];
+
+  /**
+   * A Score question.
+   *
+   * @param options - The instructions and the levels, lowest first.
+   */
+  constructor(options: { readonly instructions: string; readonly criteria: readonly string[] }) {
+    this.instructions = options.instructions;
+    this.criteria = options.criteria;
+  }
+}
+
+/** A typed Jev decision question, lowered to its native form by {@link Prompt.jev}. */
+export type DecisionQuestion = NoulQuestion | ChoiceQuestion | ScoreQuestion;
+
+/** A native Jev question exactly as Jev's `system_one` request carries it. */
+export type JevQuestion = Readonly<Record<string, Wire.JsonValue>>;
+
+/** {@link Prompt.jev} options. */
+export type JevPromptOptions = {
+  /** The state template, such as `${context}`. */
+  readonly state: string;
+  /** Each question by name: a typed {@link DecisionQuestion} or a native {@link JevQuestion}. */
+  readonly questions: Readonly<Record<string, DecisionQuestion | JevQuestion>>;
+};
+
+/** How an Agent check reads a Jev answer as its verdict. */
+export type VerdictTransform = Wire.VerdictTransform;
+/** A Choice answer's selected label mapped to an outcome. */
+export type ChoiceTransform = Wire.VerdictTransformChoice;
+/** A Noul answer's probability read against inclusive pass and fail bounds. */
+export type ProbabilityTransform = Wire.VerdictTransformProbability;
+/** A Score answer compared with an expected value. */
+export type ScoreTransform = Wire.VerdictTransformScore;
+
 /** The options every {@link Prompt} factory takes, by the native builder's names. */
 export type PromptOptions = {
   /** System text: the system message, or OpenAI Responses `instructions`. */
@@ -2450,6 +2543,35 @@ export class Prompt {
    */
   static vertex(model: string, options: PromptOptions = {}): Prompt {
     return Prompt.build("vertex", model, options);
+  }
+
+  /**
+   * The native TypeSafe Jev `system_one` Prompt for `model` asking
+   * `options.questions` about `options.state`. A {@link NoulQuestion},
+   * {@link ChoiceQuestion}, or {@link ScoreQuestion} is lowered to its native
+   * Jev question; a plain object is a native Jev question kept as written,
+   * never translated, so Noul criteria stay `{ true, false }` there.
+   *
+   * @param model - The literal Jev model name, such as `jev-latest`.
+   * @param options - The state template and the questions by name.
+   * @returns The Prompt.
+   * @throws `WyrdError` from the native builder, such as
+   * `WYRD_PROMPT_400_EMPTY_MODEL`, or `WYRD_PROMPT_400_INVALID` for a
+   * malformed question.
+   */
+  static jev(model: string, options: JevPromptOptions): Prompt {
+    const typed: string[] = [];
+    const questions = Object.fromEntries(
+      Object.entries(options.questions).map(([name, question]) => {
+        const decision =
+          question instanceof NoulQuestion || question instanceof ChoiceQuestion || question instanceof ScoreQuestion;
+        if (decision) {
+          typed.push(name);
+        }
+        return [name, decision ? { ...question } : question];
+      }),
+    );
+    return builtPrompt(NativeAuthored.promptJev(model, options.state, snapshot("questions", questions), typed));
   }
 
   /**

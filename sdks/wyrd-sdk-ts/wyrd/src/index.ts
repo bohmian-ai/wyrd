@@ -2487,6 +2487,7 @@ export namespace verify {
   export import Binding = definitions.Binding;
   export import CardRef = definitions.CardRef;
   export import Check = definitions.Check;
+  export import ChoiceQuestion = definitions.ChoiceQuestion;
   export import CodeSource = definitions.CodeSource;
   export import Component = definitions.Component;
   export import Data = definitions.Data;
@@ -2494,9 +2495,11 @@ export namespace verify {
   export import InputSlot = definitions.InputSlot;
   export import Mcp = definitions.Mcp;
   export import Model = definitions.Model;
+  export import NoulQuestion = definitions.NoulQuestion;
   export import Operator = definitions.Operator;
   export import Prompt = definitions.Prompt;
   export import Requirement = definitions.Requirement;
+  export import ScoreQuestion = definitions.ScoreQuestion;
   export import Service = definitions.Service;
   export import Step = definitions.Step;
   export import Table = definitions.Table;
@@ -2529,6 +2532,14 @@ export namespace verify {
   export type PromptOptions = definitions.PromptOptions;
   export type PromptContent = definitions.PromptContent;
   export type MediaRef = definitions.MediaRef;
+  export type NoulCriteria = definitions.NoulCriteria;
+  export type DecisionQuestion = definitions.DecisionQuestion;
+  export type JevQuestion = definitions.JevQuestion;
+  export type JevPromptOptions = definitions.JevPromptOptions;
+  export type VerdictTransform = definitions.VerdictTransform;
+  export type ChoiceTransform = definitions.ChoiceTransform;
+  export type ProbabilityTransform = definitions.ProbabilityTransform;
+  export type ScoreTransform = definitions.ScoreTransform;
 
   /** How a {@link File} declares its format and display name. */
   export interface FileOptions {

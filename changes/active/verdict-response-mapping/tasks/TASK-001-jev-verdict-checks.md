@@ -138,6 +138,39 @@ that proof rather than manufacturing a RED result.
    public exports/coercion/constructors or lost canonical fields. Tier-1 SDK
    journeys are supported by owner construction and language-boundary tests.
 
+   Evidence:
+   - Python journey: `sdks/wyrd-sdk-python/tests/integration/test_gateway_jev.py::test_typed_jev_choice_check_becomes_the_verdict`.
+     Typed (`wyrd.prompt.decisions`), native and mixed questions give equal `model_dump()` with body
+     `{state, questions}` in the exact native form (Noul criteria lowered to `{true, false}`, omitted Noul
+     criteria stay absent, Choice labels and Score order unchanged). The typed `ChoiceTransform` model and
+     a native dict declare the same Card refs; the stored Verifier check holds the canonical
+     `{"kind": "choice", "question": "refund_policy"}`; every stored Prompt spec equals the authored one.
+     Each of the three replies gives the expected requirement and execution verdict, exact reason, empty
+     citations, and one upstream `/v1/systemone` call with the exact native body.
+   - Python command: `scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && cd sdks/wyrd-sdk-python && uv run python -m pytest -q -p no:cacheprovider tests/integration/test_gateway_jev.py -k becomes_the_verdict"`
+     (after `uv run maturin develop --features testing`).
+   - Python RED: `ModuleNotFoundError: No module named 'wyrd.prompt.decisions'`. GREEN: `1 passed, 4 deselected`.
+   - Python boundary: `tests/unit/test_public_exports.py::test_decision_authoring_from_dictionaries_needs_no_pydantic`
+     builds `Prompt.jev`, an ordinary `Action.agent` and a dict `verdict_transform` with Pydantic blocked,
+     and the transform models refuse with `ImportError`. Unit exports: 33 passed. `py:format`, `py:lints`
+     (ruff and stub check) and `py:typecheck` (ty) pass.
+   - TypeScript journey: `sdks/wyrd-sdk-ts/wyrd/tests/integration/gateway-jev.test.ts` "typed jev choice check
+     becomes the verdict". Same workflow with `new verify.ChoiceQuestion/NoulQuestion/ScoreQuestion`, native
+     literals and a mix; the `verify.ChoiceTransform` literal is type-checked by `ts:typecheck`. Redeclaring
+     native and mixed forms gives the same Card refs; read-back asserts the stored transform and Prompt body.
+   - TypeScript command: `scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && cd sdks/wyrd-sdk-ts/wyrd && pnpm exec vitest run tests/integration/gateway-jev.test.ts -t 'typed jev choice'"`
+     (after `mise run ts:build && mise run ts:build:testing`).
+   - TypeScript RED: `TypeError: ChoiceQuestion is not a constructor`. Second failure (diagnosed): an omitted
+     `NoulQuestion.criteria` was an own `undefined` property under define semantics and the JSON snapshot refused
+     it; the field is now `declare`d. GREEN: `1 passed | 4 skipped`; the whole file: 5 passed.
+   - TypeScript checks: `ts:format`, `ts:lints`, `ts:typecheck`, `codegen:check` pass; `ts:napi:check` passes
+     with the regenerated `index.d.ts` committed. `cargo clippy -p wyrd-sdk-ts --all-targets -D warnings` clean.
+   - Typed versus native is decided by language type (Python `model_dump_json`, TypeScript `instanceof`);
+     a raw object is never translated. Lowering stays in Rust (`DecisionQuestion` → `JevQuestion`).
+   - Allocation: one JSON conversion per question and per transform, at authoring time only.
+   - Limitation: reconstruction from a saved bundle (`WyrdState.fromPath`) is not exercised here; redeclaration
+     and read-back are.
+
 3. **Acceptance policy controls the answer** — REQ-006–008, REQ-010,
    REQ-012–013; J3/J5. Extend the hosted Jev workflow with custom Choice
    labels, Noul for both expected polarities, and Score on three ordered levels.

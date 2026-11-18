@@ -1,7 +1,7 @@
 import OpenAI from "openai";
 import { expect, vi } from "vitest";
 
-import { Gateway, WyrdClient } from "wyrd-ai";
+import { Gateway, verify, WyrdClient, WyrdState } from "wyrd-ai";
 import { cli } from "@wyrd/testing";
 
 import type { ReceivedRequest, Reply } from "../support/http-receiver.js";
@@ -22,6 +22,85 @@ const QUESTIONS = {
     criteria: { polite: "courteous", rude: "curt" },
   },
 };
+
+const { Agent, Check, ChoiceQuestion, Component, NoulQuestion, Prompt, Requirement, ScoreQuestion, Service, Verifier } =
+  verify;
+
+/** State marker → the refund question's selected label. */
+const REFUND_CHOICES: Record<string, string> = {
+  "CASE-PASS": "passed",
+  "CASE-FAIL": "failed",
+  "CASE-UNSURE": "inconclusive",
+};
+
+/** The refund desk's questions as the native Jev questions the typed classes lower to. */
+const NATIVE_DESK_QUESTIONS = {
+  refund_policy: {
+    type: "choice",
+    instructions: "Does the reply promise a refund the policy does not allow?",
+    criteria: {
+      passed: "The reply makes no refund promise.",
+      failed: "The reply promises a refund.",
+      inconclusive: "The reply cannot be judged.",
+    },
+  },
+  helpful: {
+    type: "noul",
+    instructions: "Does the reply help the customer?",
+    criteria: { true: "It answers the question.", false: "It does not." },
+  },
+  polite: { type: "noul", instructions: "Is the reply polite?" },
+  urgency: {
+    type: "score",
+    instructions: "How urgently does the reply need follow-up?",
+    criteria: ["Routine", "Soon", "Immediate"],
+  },
+} as const;
+
+/** The Prompt's state template: the bound `context` input. */
+const STATE = `\${context}`;
+
+/** The same questions authored with the public question classes. */
+const TYPED_DESK_QUESTIONS = {
+  refund_policy: new ChoiceQuestion({
+    instructions: "Does the reply promise a refund the policy does not allow?",
+    criteria: {
+      passed: "The reply makes no refund promise.",
+      failed: "The reply promises a refund.",
+      inconclusive: "The reply cannot be judged.",
+    },
+  }),
+  helpful: new NoulQuestion({
+    instructions: "Does the reply help the customer?",
+    criteria: { true_description: "It answers the question.", false_description: "It does not." },
+  }),
+  polite: new NoulQuestion({ instructions: "Is the reply polite?" }),
+  urgency: new ScoreQuestion({
+    instructions: "How urgently does the reply need follow-up?",
+    criteria: ["Routine", "Soon", "Immediate"],
+  }),
+};
+
+/** Jev's answer to every refund desk question, selecting `choice` for the refund question. */
+function deskAnswer(choice: string) {
+  return {
+    model: "jev-1.13.0",
+    answers: {
+      refund_policy: {
+        type: "choice",
+        choice,
+        confidence: 0.9,
+        probabilities: Object.fromEntries(
+          ["passed", "failed", "inconclusive"].map((label) => [label, label === choice ? 0.9 : 0.05]),
+        ),
+      },
+      helpful: { type: "noul", noul: 0.8 },
+      polite: { type: "noul", noul: 0.7 },
+      urgency: { type: "score", score: 1, legend: { "0": "Routine", "1": "Soon", "2": "Immediate" } },
+    },
+    usage: { input_tokens: 50, output_tokens: 5 },
+  };
+}
 
 /** State text → the status the upstream refuses it with. */
 const REFUSALS: Record<string, number> = {
@@ -52,6 +131,10 @@ function jev(request: ReceivedRequest): Reply {
   const refused = Object.entries(REFUSALS).find(([needle]) => state.includes(needle));
   if (refused) {
     return { status: refused[1], body: { detail: `key cred ${JEV_KEY}` } };
+  }
+  const desk = Object.entries(REFUND_CHOICES).find(([marker]) => state.includes(marker));
+  if (desk) {
+    return { status: 200, body: deskAnswer(desk[1]) };
   }
   return { status: 200, body: state.includes("Go away") ? answer(0.12, "rude") : answer(0.93, "polite") };
 }
@@ -85,7 +168,7 @@ function chat(state: string): OpenAI.Chat.ChatCompletionMessageParam[] {
 }
 
 /** A server with one Jev deployment serving `system_one` and the `chat_completions` pass-through. */
-const test = serverTest({ provider: jev }).extend<{ deployed: void }>({
+const test = serverTest({ provider: jev, verificationRuntime: true }).extend<{ deployed: void }>({
   deployed: [
     async ({ server: _ }, use) => {
       await cli.putProviderCredential({
@@ -198,4 +281,84 @@ test("jev refusals relay like other providers", async ({ provider, deployed: _ }
   const throttled = await chatRefusal(openai, "rate-limited");
   expect({ status: throttled?.status, code: throttled?.code ?? null }).toEqual({ status: 429, code: null });
   expect(JSON.stringify(throttled?.error)).not.toContain(JEV_KEY);
+});
+
+/**
+ * `refund-desk`: the `refund-judge` Jev Agent asking `prompt`, verified by
+ * `refund-promise`, which binds the `reply` slot to `${context}` and reads the
+ * judge's answer through `transform`.
+ */
+function refundDesk(prompt: verify.Prompt, transform: verify.VerdictTransform): verify.Service {
+  const judge = new Agent("refund-judge", {
+    version: "1.0.0",
+    prompt,
+    execution_route: { kind: "wyrd_gateway", deployment: "jev" },
+    run_config: { max_iterations: 1 },
+  });
+  const check = Check.agent(judge, { inputs: { context: "inputs.reply" }, verdict_transform: transform });
+  const verifier = new Verifier("refund-promise", {
+    version: "1.0.0",
+    inputs: { reply: { type: "string" } },
+    requirements: [
+      new Requirement("no-refund-promise", "The reply makes no refund promise the policy does not allow.", check),
+    ],
+  });
+  return new Service("refund-desk", { version: "1.0.0" }).addComponent(
+    new Component("refund-judge", judge).verifiedBy([verifier]),
+  );
+}
+
+// Typed classes, native literals, and a mix of both author one Prompt whose
+// Choice answer is the verdict. The declared graph stores the native Jev
+// request and the canonical transform, so redeclaring the native form
+// changes nothing; each reply reaches Jev once as the bound state.
+test("typed jev choice check becomes the verdict", async ({ provider, deployed: _ }) => {
+  const [typed, native, mixed] = [
+    TYPED_DESK_QUESTIONS,
+    NATIVE_DESK_QUESTIONS,
+    { ...NATIVE_DESK_QUESTIONS, helpful: TYPED_DESK_QUESTIONS.helpful, urgency: TYPED_DESK_QUESTIONS.urgency },
+  ].map((questions) => Prompt.jev("jev-latest", { state: STATE, questions }));
+  const transform: verify.ChoiceTransform = { kind: "choice", question: "refund_policy" };
+
+  const state = await WyrdState.declare(refundDesk(typed, transform));
+  const again = await WyrdState.declare(refundDesk(native, transform));
+  expect(again.aliases.map((alias) => again.cardRef(alias))).toEqual(
+    state.aliases.map((alias) => state.cardRef(alias)),
+  );
+  const mixedAgain = await WyrdState.declare(refundDesk(mixed, transform));
+  expect(mixedAgain.cardRef("refund-judge")).toEqual(state.cardRef("refund-judge"));
+  const cards = state.aliases.map((alias) => state.card(alias));
+  const [verifier] = cards.filter((card) => card.kind === "Verifier");
+  expect(verifier?.spec).toMatchObject({ requirements: [{ check: { verdict_transform: transform } }] });
+  const prompts = cards.filter((card) => card.kind === "Prompt").map((card) => card.spec);
+  expect(prompts.length).toBeGreaterThan(0);
+  for (const spec of prompts) {
+    expect(spec).toMatchObject({ body: { state: STATE, questions: NATIVE_DESK_QUESTIONS } });
+  }
+
+  for (const [reply, outcome] of [
+    ['CASE-PASS: "Thanks" for asking.\nRefunds follow the policy.', "passed"],
+    ["CASE-FAIL: you will get a full refund today.", "failed"],
+    ["CASE-UNSURE: maybe.", "inconclusive"],
+  ] as const) {
+    const before = provider.received.length;
+    const result = await state.run("refund-judge").observe.verify("refund-promise", { reply });
+
+    const [judged, ...others] = result.outcome.requirements;
+    expect(others).toEqual([]);
+    expect({ outcome: judged?.outcome, reason: judged?.reason, citations: judged?.citations ?? [] }).toEqual({
+      outcome,
+      reason: `Question 'refund_policy' selected '${outcome}' (confidence 0.9).`,
+      citations: [],
+    });
+    expect(result.outcome.verdict).toBe(outcome);
+    const [upstream, ...rest] = provider.received.slice(before);
+    expect(rest).toEqual([]);
+    expect(upstream?.path).toBe("/v1/systemone");
+    expect(JSON.parse(upstream?.body ?? "")).toEqual({
+      model: "jev-latest",
+      state: reply,
+      questions: NATIVE_DESK_QUESTIONS,
+    });
+  }
 });

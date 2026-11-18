@@ -19,10 +19,11 @@ use napi_derive::napi;
 use serde_json::Value;
 use wyrd_client::verify::{
     Action, Agent, AnthropicOptions, Artifact, ArtifactFile, Audit, Binding, CardDefinition,
-    CardRef, Check, CodeSource, Component, Data, Experiment, FieldValue, GeminiOptions, InputSlot,
-    Mcp, Model, OpenAiChatOptions, OpenAiResponsesOptions, Operator, Prompt, PromptBuilderError,
-    Requirement, ResponseFormat, Service, Step, Table, Trigger, Verifier, anthropic, gemini,
-    openai_chat, openai_responses, vertex,
+    CardRef, Check, CodeSource, Component, Data, DecisionQuestion, Experiment, FieldValue,
+    GeminiOptions, InputSlot, JevPromptOptions, JevQuestion, Mcp, Model, OpenAiChatOptions,
+    OpenAiResponsesOptions, Operator, Prompt, PromptBuilderError, Requirement, ResponseFormat,
+    Service, Step, Table, Trigger, VerdictTransform, Verifier, anthropic, gemini, jev, openai_chat,
+    openai_responses, vertex,
 };
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
@@ -416,6 +417,16 @@ fn json(field: &str, value: NativeValue) -> Result<Value> {
     value.json(field)
 }
 
+/// `value` as a canonical verdict transform, typed now so a malformed policy
+/// is refused where it is written and the stored form is the canonical one.
+///
+/// # Errors
+/// Returns `InvalidArg` naming `field` when `value` is not a transform's
+/// JSON form.
+fn transform(field: &str, value: NativeValue) -> Result<VerdictTransform> {
+    serde_json::from_value(value.json(field)?).map_err(|error| invalid(format!("{field}: {error}")))
+}
+
 /// `value` as a string.
 ///
 /// # Errors
@@ -714,7 +725,7 @@ fields! {
         map { inputs, bind_input: json, workspace, add_workspace: field }
     }
     Check {
-        one { runtime: json, response_format: json }
+        one { runtime: json, response_format: json, verdict_transform: transform }
         list {}
         map { inputs, bind_input: json, workspace, add_workspace: field }
     }
@@ -887,6 +898,36 @@ fn build_prompt(
     }
 }
 
+/// The native Jev Prompt for `model` from the shared builder, lowering each
+/// question named in `typed` from its typed form and keeping every other one
+/// as the native Jev question it is.
+///
+/// # Errors
+///
+/// Returns [`PromptBuilderError::Validation`] naming `questions.<key>` for a
+/// question that is not its declared form, and the builder's own refusal.
+fn build_jev(
+    model: String,
+    state: String,
+    questions: Value,
+    typed: &[String],
+) -> std::result::Result<Prompt, PromptBuilderError> {
+    let questions: std::collections::BTreeMap<String, Value> = authored("questions", questions)?;
+    let questions = questions
+        .into_iter()
+        .map(|(name, question)| {
+            let field = format!("questions.{name}");
+            let native = if typed.contains(&name) {
+                authored::<DecisionQuestion>(&field, question)?.into()
+            } else {
+                authored::<JevQuestion>(&field, question)?
+            };
+            Ok((name, native))
+        })
+        .collect::<std::result::Result<_, PromptBuilderError>>()?;
+    jev(model, JevPromptOptions { state, questions })
+}
+
 /// The variable bindings `vars` names, in order, as the shared Prompt
 /// binds them.
 ///
@@ -1016,6 +1057,23 @@ impl NativeAuthored {
         options: Value,
     ) -> Either<NativeAuthored, NativeWyrdError> {
         prompt_result(build_prompt(&provider, model, options))
+    }
+
+    /// The original native TypeSafe Jev `system_one` Prompt for `model`
+    /// asking `questions` about `state`, built by the shared Prompt builder:
+    /// each question named in `typed` is a typed decision question lowered
+    /// to its native Jev form, every other one a native Jev question kept as
+    /// authored. Returns the builder's stable refusal as the error value,
+    /// such as `WYRD_PROMPT_400_EMPTY_MODEL` or `WYRD_PROMPT_400_INVALID`
+    /// for a malformed question or a broken Jev bound.
+    #[napi]
+    pub fn prompt_jev(
+        model: String,
+        state: String,
+        questions: Value,
+        typed: Vec<String>,
+    ) -> Either<NativeAuthored, NativeWyrdError> {
+        prompt_result(build_jev(model, state, questions, &typed))
     }
 
     /// The component `alias` for `reference`: a Card, an exact `CardRef`,

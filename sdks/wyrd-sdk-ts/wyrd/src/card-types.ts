@@ -831,7 +831,8 @@ export interface CatboostMeta {
 export type Check = CheckAssert | CheckTrace | CheckAgent | CheckCode | CheckDrift;
 
 /**
- * An Agent, with any tools it declares, returning the Verdict schema.
+ * An Agent, with any tools it declares, returning the Verdict schema
+ * or a fixed decision answer its `verdict_transform` converts.
  */
 export interface CheckAgent {
   /**
@@ -843,6 +844,11 @@ export interface CheckAgent {
    */
   readonly inputs?: Readonly<Record<string, Reference>>;
   readonly kind: "agent";
+  /**
+   * The policy converting the Agent's native decision answer into the
+   * Verdict; omitted, the Prompt must produce the Verdict itself.
+   */
+  readonly verdict_transform?: VerdictTransform | null;
   /**
    * Files under `/inputs/...` for the Agent's tools, keyed by mount
    * destination, in step and check position alike.
@@ -7980,6 +7986,71 @@ export interface UpdateOperatorConnectionRequestSlack {
    * Replacement workspace ID.
    */
   readonly workspace_id?: string | null;
+}
+
+/**
+ * The closed set of policies converting one native decision answer into a
+ * Verdict.
+ */
+export type VerdictTransform = VerdictTransformChoice | VerdictTransformProbability | VerdictTransformScore;
+
+/**
+ * Map the selected Choice label to an outcome.
+ */
+export interface VerdictTransformChoice {
+  readonly kind: "choice";
+  /**
+   * Every declared option label to its outcome.
+   */
+  readonly outcomes?: Readonly<Record<string, VerificationVerdict>> | null;
+  /**
+   * The Choice question key.
+   */
+  readonly question: string;
+}
+
+/**
+ * Threshold a Noul probability.
+ */
+export interface VerdictTransformProbability {
+  /**
+   * The answer that passes.
+   */
+  readonly expected: boolean;
+  /**
+   * The greatest polarity-adjusted probability that fails.
+   */
+  readonly fail_at: number;
+  readonly kind: "probability";
+  /**
+   * The least polarity-adjusted probability that passes.
+   */
+  readonly pass_at: number;
+  /**
+   * The Noul question key.
+   */
+  readonly question: string;
+}
+
+/**
+ * Compare a Score on its authored level scale.
+ */
+export interface VerdictTransformScore {
+  /**
+   * The level index compared against.
+   */
+  readonly expected: number;
+  readonly kind: "score";
+  /**
+   * The scalar numeric comparison: `equals`, `not_equals`,
+   * `greater_than`, `greater_than_or_equals`, `less_than`,
+   * `less_than_or_equals`, or `approximately_equals`.
+   */
+  readonly operator: ComparisonOperator;
+  /**
+   * The Score question key.
+   */
+  readonly question: string;
 }
 
 /**

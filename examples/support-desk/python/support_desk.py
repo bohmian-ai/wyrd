@@ -155,8 +155,8 @@ def serve(desk: Desk) -> list[Served]:
     waiting for it. Telemetry and tickets are flushed on return.
     """
     state = desk.state
+    state.configure()
     state.start_bifrost()
-    state.start_telemetry()
     tracer = trace.get_tracer("support-desk")
     served = []
     for index in range(REQUESTS):

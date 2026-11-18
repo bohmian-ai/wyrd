@@ -1,15 +1,22 @@
 import { trace } from "@opentelemetry/api";
 import { verify, WyrdState } from "wyrd-ai";
+import { z } from "zod";
 
-const { Check, InputSlot, Requirement, Service, Verifier } = verify;
+const { Check, Requirement, Service, Trace, Verifier } = verify;
 
 // Synthetic order records the agent's lookup tool reads.
 type Order = { delivered: string; refundable: boolean };
 const ORDERS: Record<string, Order> = { "1042": { delivered: "2 May", refundable: true } };
 
 // ANCHOR: verifier
+const RefundReply = z.object({
+  reply: z.string(),
+  trace: Trace(z.string()), // the trace ID of the work behind the reply
+});
+type RefundReply = z.infer<typeof RefundReply>;
+
 const refundWorkflow = new Verifier("refund-workflow", {
-  inputs: { reply: InputSlot.json({ type: "string" }), trace: InputSlot.trace() },
+  inputs: RefundReply,
   requirements: [
     // Judges the answer only: a reply that skipped the lookup passes it too.
     new Requirement(
@@ -28,8 +35,7 @@ const refundWorkflow = new Verifier("refund-workflow", {
 // ANCHOR_END: verifier
 
 const state = await WyrdState.declare(new Service("refund-agent", { verified_by: [refundWorkflow] }));
-await state.startTelemetry(); // export the agent's spans to Wyrd
-await state.startBifrost(); // so flush can wait until they are stored
+await state.configure(); // export the agent's spans to Wyrd
 const tracer = trace.getTracer("refund-agent");
 
 // ANCHOR: agent
@@ -40,9 +46,9 @@ function lookUpOrder(orderId: string): Order {
   });
 }
 
-// Answer a refund request; return the reply and the trace ID of the work behind it.
-function refundAgent(orderId: string, remembered?: Order): [string, string] {
-  return tracer.startActiveSpan("answer-refund", (span): [string, string] => {
+// Answer a refund request; return the reply with the trace of the work behind it.
+function refundAgent(orderId: string, remembered?: Order): RefundReply {
+  return tracer.startActiveSpan("answer-refund", (span): RefundReply => {
     // The bug: an order remembered from earlier in the conversation skips the lookup.
     const order = remembered ?? lookUpOrder(orderId);
     const reply = tracer.startActiveSpan("draft-reply", (draft) => {
@@ -50,7 +56,7 @@ function refundAgent(orderId: string, remembered?: Order): [string, string] {
       return `Order ${orderId} was delivered on ${order.delivered}, so it qualifies for a refund.`;
     });
     span.end();
-    return [reply, span.spanContext().traceId];
+    return { reply, trace: span.spanContext().traceId };
   });
 }
 // ANCHOR_END: agent
@@ -60,11 +66,11 @@ const complete = refundAgent("1042");
 const skipped = refundAgent("1042", ORDERS["1042"]);
 await state.flush(); // store the spans before they are checked
 
-const cases: [string, Record<string, string>][] = [
-  ["complete", { reply: complete[0], trace: complete[1] }],
-  ["skipped", { reply: skipped[0], trace: skipped[1] }],
+const cases: [string, Partial<RefundReply>][] = [
+  ["complete", complete],
+  ["skipped", skipped],
   // The same reply sent without its trace: nothing shows what ran.
-  ["no trace", { reply: complete[0] }],
+  ["no trace", { reply: complete.reply }],
 ];
 for (const [label, evidence] of cases) {
   const result = await state.run().observe.verify("refund-workflow", evidence);

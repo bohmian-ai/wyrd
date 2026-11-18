@@ -172,8 +172,8 @@ export function question(index: number): string {
  */
 export async function serve(desk: Desk): Promise<Served[]> {
   const { state, client } = desk;
+  await state.configure();
   await state.startBifrost();
-  await state.startTelemetry();
   const tracer = trace.getTracer("support-desk");
   const served: Served[] = [];
   for (let index = 0; index < REQUESTS; index++) {

@@ -115,7 +115,6 @@ def run_the_agent(state: WyrdState, server: WyrdTestServer) -> tuple[str, str, s
     Returns the Run id and the execution ids of the direct and submitted
     verifications.
     """
-    state.start_telemetry()
     state.start_bifrost()
     llm = openai.OpenAI(
         base_url=f"{server.base_url}/v1",

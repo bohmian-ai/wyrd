@@ -1,14 +1,20 @@
 from opentelemetry import trace
+from pydantic import BaseModel
 from wyrd import WyrdState
-from wyrd.verify import Check, ComparisonOperator, InputSlot, Requirement, Service, Verifier
+from wyrd.verify import Check, ComparisonOperator, Requirement, Service, Trace, Verifier
 
 # Synthetic order records the agent's lookup tool reads.
 ORDERS = {"1042": {"delivered": "2 May", "refundable": True}}
 
 # ANCHOR: verifier
+class RefundReply(BaseModel):
+    reply: str
+    trace: Trace  # the trace ID of the work behind the reply
+
+
 refund_workflow = Verifier(
     "refund-workflow",
-    inputs={"reply": str, "trace": InputSlot.trace()},
+    inputs=RefundReply,
     requirements=[
         # Judges the answer only: a reply that skipped the lookup passes it too.
         Requirement(
@@ -27,8 +33,7 @@ refund_workflow = Verifier(
 # ANCHOR_END: verifier
 
 state = WyrdState.declare(Service("refund-agent", verified_by=[refund_workflow]))
-state.start_telemetry()  # export the agent's spans to Wyrd
-state.start_bifrost()  # so flush can wait until they are stored
+state.configure()  # export the agent's spans to Wyrd
 tracer = trace.get_tracer("refund-agent")
 
 
@@ -38,14 +43,14 @@ def look_up_order(order_id: str) -> dict:
         return ORDERS[order_id]
 
 
-def refund_agent(order_id: str, remembered: dict | None = None) -> tuple[str, str]:
-    """Answer a refund request; return the reply and the trace ID of the work behind it."""
+def refund_agent(order_id: str, remembered: dict | None = None) -> RefundReply:
+    """Answer a refund request; return the reply with the trace of the work behind it."""
     with tracer.start_as_current_span("answer-refund") as span:
         # The bug: an order remembered from earlier in the conversation skips the lookup.
         order = remembered or look_up_order(order_id)
         with tracer.start_as_current_span("draft-reply"):
             reply = f"Order {order_id} was delivered on {order['delivered']}, so it qualifies for a refund."
-    return reply, format(span.get_span_context().trace_id, "032x")
+    return RefundReply(reply=reply, trace=format(span.get_span_context().trace_id, "032x"))
 # ANCHOR_END: agent
 
 
@@ -55,10 +60,10 @@ skipped = refund_agent("1042", remembered=ORDERS["1042"])
 state.flush()  # store the spans before they are checked
 
 cases = [
-    ("complete", {"reply": complete[0], "trace": complete[1]}),
-    ("skipped", {"reply": skipped[0], "trace": skipped[1]}),
+    ("complete", complete.model_dump()),
+    ("skipped", skipped.model_dump()),
     # The same reply sent without its trace: nothing shows what ran.
-    ("no trace", {"reply": complete[0]}),
+    ("no trace", complete.model_dump(exclude={"trace"})),
 ]
 for label, evidence in cases:
     with state.run() as run:

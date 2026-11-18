@@ -35,7 +35,7 @@ export interface Worked {
 /**
  * Run the whole local workflow as `client`: declare and pull the
  * assistant, invoke the Gateway, observe and verify a Run, export a span
- * through `state.startTelemetry`, and
+ * through the telemetry `state.configure` installs, and
  * read the evidence back. No key is issued and nothing is flushed.
  */
 export async function work(client: WyrdClient): Promise<Worked> {
@@ -47,6 +47,7 @@ export async function work(client: WyrdClient): Promise<Worked> {
   const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-local-"));
   await cards.pull(receipt.root, bundle);
   const state = WyrdState.fromPath(bundle, { client });
+  await state.configure();
   await state.startBifrost();
 
   expect(await invoke(client)).toBe("hi");
@@ -57,8 +58,6 @@ export async function work(client: WyrdClient): Promise<Worked> {
   expect(result.outcome.verdict).toBe("passed");
   expect(result.verifier.name).toBe("answer-check");
 
-  await state.startTelemetry();
-  await state.startTelemetry();
   exportSpan(run.forCard("agent"));
   // Shutdown flushes the exported span.
   await state.shutdown();

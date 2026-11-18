@@ -17,13 +17,13 @@ Finish [Set up Wyrd](/get-started/setup/). Work in its `quickstart` directory wi
 
 ## 1. Add tracing
 
-The agent records each step as an OpenTelemetry span, and Wyrd stores the spans as its trace. Add the tracing packages:
+The agent records each step as an OpenTelemetry span, and Wyrd stores the spans as its trace. Add the tracing packages, and Pydantic or Zod for the Verifier's inputs:
 
 <LangTabs langs={['python', 'rust', 'typescript']}>
 <LangTab lang="python">
 
 ```bash
-uv add "wyrd-ai[otel]==0.4.2"
+uv add "wyrd-ai[otel,pydantic]==0.4.2"
 ```
 
 </LangTab>
@@ -38,7 +38,7 @@ cargo add opentelemetry@0.31 tracing@0.1 tracing-opentelemetry@0.32
 <LangTab lang="typescript">
 
 ```bash
-pnpm add @opentelemetry/api @opentelemetry/context-async-hooks @opentelemetry/core @opentelemetry/resources @opentelemetry/sdk-trace-base @opentelemetry/exporter-trace-otlp-proto @opentelemetry/exporter-logs-otlp-proto @opentelemetry/exporter-metrics-otlp-proto
+pnpm add zod @opentelemetry/api @opentelemetry/context-async-hooks @opentelemetry/core @opentelemetry/resources @opentelemetry/sdk-trace-base @opentelemetry/exporter-trace-otlp-proto @opentelemetry/exporter-logs-otlp-proto @opentelemetry/exporter-metrics-otlp-proto
 ```
 
 </LangTab>
@@ -46,7 +46,7 @@ pnpm add @opentelemetry/api @opentelemetry/context-async-hooks @opentelemetry/co
 
 ## 2. Write the agent and its Verifier
 
-The `refund-workflow` Verifier takes the agent's `reply` and the `trace` of the work behind it. It has two requirements:
+The `refund-workflow` Verifier takes the agent's `reply` and the `trace` of the work behind it, declared as one model whose `trace` field holds the trace ID. It has two requirements:
 
 | Requirement | What it checks |
 | --- | --- |
@@ -110,7 +110,9 @@ All three replies pass `reply-names-order`. Only the trace separates them:
 - **no trace** is `inconclusive`: with no trace there is no evidence about what ran, so Wyrd does not decide. An inconclusive verdict is never a pass.
 
 <Aside type="note" title="Spans must be stored first">
+
 The program flushes its spans before it verifies. A trace with no stored span is `inconclusive` under `verify`, so flush, or `submit` the check, which retries while the spans arrive. [Trace evidence](/understand/how-verification-works/#trace-evidence) explains both.
+
 </Aside>
 
 ## If it fails

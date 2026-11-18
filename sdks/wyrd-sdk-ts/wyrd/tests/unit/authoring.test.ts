@@ -642,6 +642,28 @@ test("a Zod schema is a json input slot of the JSON Schema it emits", () => {
   expect(() => verifier.plan()).not.toThrow();
 });
 
+test("a Trace property declares a trace slot and its value is the trace ID", () => {
+  const RefundReply = z.object({ reply: z.string(), trace: verify.Trace(z.string()) });
+  const verifier = new Verifier("refund-workflow", {
+    version: "1.0.0",
+    inputs: RefundReply,
+    requirements: [
+      new Requirement(
+        "looked-up-order",
+        "The agent looked up the order.",
+        Check.trace("inputs.trace", "$.spans[*].name", "is_superset", ["look-up-order"]),
+      ),
+    ],
+  });
+
+  const inputs = (verifier.spec() as { inputs: Record<string, unknown> }).inputs;
+  expect(inputs).toEqual({ reply: { type: "json", schema: { type: "string" } }, trace: { type: "trace" } });
+  const mapped = new Verifier("refund-workflow", { version: "1.0.0", inputs: { trace: verify.Trace(z.string()) } });
+  expect((mapped.spec() as { inputs: Record<string, unknown> }).inputs).toEqual({ trace: { type: "trace" } });
+  expect(RefundReply.parse({ reply: "Order 1042", trace: "0af7651916cd43dd" }).trace).toBe("0af7651916cd43dd");
+  expect(() => verifier.plan()).not.toThrow();
+});
+
 test("a Zod object as the whole inputs declares one slot per property", () => {
   const Release = z.object({ report: z.object({ text: z.string() }), authorized: z.boolean() });
   const verifier = new Verifier("release-check", {

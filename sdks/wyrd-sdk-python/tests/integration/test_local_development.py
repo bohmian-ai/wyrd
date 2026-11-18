@@ -2,7 +2,7 @@
 
 They declare and pull an assistant, invoke a model through the Gateway with
 the stock OpenAI client, observe and verify a Run, export its spans through
-``state.start_telemetry``, and query the evidence back. No key is issued and
+``state.configure``, and query the evidence back. No key is issued and
 nothing is flushed on the server's behalf. ``work`` is that whole workflow for
 one client, so the signed-in story proves the same steps for a saved login.
 """
@@ -97,6 +97,7 @@ def work(client: WyrdClient, bundle_home: Path) -> Worked:
     declare(cards, "cards/verify_in_real_time/latency-model.yaml")
     declare(cards, "cards/verify_in_real_time/assistant.yaml")
     state = hydrated(pull(cards, "assistant", bundle_home), client)
+    state.configure()
     state.start_bifrost()
 
     assert invoke(client) == "hi"
@@ -106,8 +107,6 @@ def work(client: WyrdClient, bundle_home: Path) -> Worked:
     result = run.for_card("agent").observe.verify("answer-check", "yes")
     assert (result.verdict, result.verifier.name) == ("passed", "answer-check")
 
-    state.start_telemetry()
-    state.start_telemetry()
     export(run.for_card("agent"))
     # Shutdown flushes the exported span.
     state.shutdown()
@@ -199,7 +198,7 @@ def test_start_telemetry_refuses_the_applications_own_provider(
     trace.set_tracer_provider(own)
 
     with pytest.raises(WyrdError) as refused:
-        state.start_telemetry()
+        state.configure()
 
     assert refused.value.code == "WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS"
     assert trace.get_tracer_provider() is own

@@ -668,8 +668,8 @@ def test_grouped_coding_uses_declared_sources(
     coding = principal("coding")
     principals.grant_role(coding, "py_live_reader")
     state = WyrdState.from_path(bundle, WyrdClient(credential=service_key("coding")))
+    state.configure()
     state.start_bifrost()
-    state.start_telemetry()
     tracer = trace.get_tracer("journey.coding")
     session = tracer.start_span("coding-session")
     with trace.use_span(session), tracer.start_as_current_span("edit-file"):

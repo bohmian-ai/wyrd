@@ -160,6 +160,24 @@ function emitted(source: JsonSchemaSource): Wire.JsonValue {
   return JSON.parse(JSON.stringify(source.toJSONSchema())) as Wire.JsonValue;
 }
 
+/** Mirrors wyrd-client's `SLOT_KEYWORD`: the canonical slot a marked field declares. */
+const SLOT_KEYWORD = "x-wyrd-slot";
+
+/**
+ * Mark a string schema, such as Zod's `z.string()`, as a `trace` slot.
+ *
+ * A property of a Zod object a Verifier takes as its `inputs`, or a mapping
+ * value, marked this way declares a `trace` slot; every other property
+ * declares a `json` slot. Its value is the trace ID string, so one object
+ * both declares a Verifier's inputs and, once parsed, supplies them.
+ *
+ * @param schema - The string schema to mark; its `meta` adds the marker.
+ * @returns The marked schema.
+ */
+export function Trace<S extends { meta(metadata: Record<string, unknown>): S }>(schema: S): S {
+  return schema.meta({ [SLOT_KEYWORD]: { type: "trace" } });
+}
+
 /**
  * A Verifier's `inputs`: the slots by name, or one `json` slot per property
  * of the object schema a {@link JsonSchemaSource} such as a Zod object emits,

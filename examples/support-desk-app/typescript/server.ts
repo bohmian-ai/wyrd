@@ -134,10 +134,9 @@ if (import.meta.main) {
   const client = WyrdClient.connect();
   // The declared Service, pulled by `pnpm run deploy`.
   const state = WyrdState.fromPath(BUNDLE_DIR, { client });
-  // The Service name, version, and environment every span, gateway call, and verification carries. Name and version come from the bundle.
-  state.configure({ deploymentEnvironment: "development" });
+  // The Service name, version, and environment every span, gateway call, and verification carries; name and version come from the bundle. Spans export to Wyrd.
+  await state.configure({ deploymentEnvironment: "development" });
   await state.startBifrost(); // writes tickets to Bifrost
-  await state.startTelemetry(); // exports spans to Wyrd
   // ANCHOR_END: startup
   const server = supportApi({ state, client, gateway: gateway(client) });
   server.listen(Number(process.env.PORT ?? 3000), "127.0.0.1", () => {
@@ -146,7 +145,7 @@ if (import.meta.main) {
   });
 
   // ANCHOR: shutdown
-  // Flush every span and row before exiting: shutdown flushes the provider startTelemetry installed, then drains the writer.
+  // Flush every span and row before exiting: shutdown flushes the provider configure installed, then drains the writer.
   for (const signal of ["SIGINT", "SIGTERM"]) {
     process.on(signal, async () => {
       server.close();

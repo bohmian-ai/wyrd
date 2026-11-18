@@ -94,6 +94,40 @@ impl From<Verifier> for FieldValue {
     }
 }
 
+/// The JSON Schema keyword a slot marker such as [`Trace`] sets. Its value is
+/// the canonical slot the model field declares in place of a `json` slot, such
+/// as `{"type": "trace"}`. [`InputSlot::json`] reads it, so it never reaches a
+/// stored Card.
+pub const SLOT_KEYWORD: &str = "x-wyrd-slot";
+
+/// A trace slot's value: the trace ID string of the work a Verifier judges.
+///
+/// A struct field of this type declares a `trace` slot when the struct is a
+/// Verifier's [`InputSlot::fields_of`] inputs, where every other field
+/// declares a `json` slot, so one struct both declares the inputs and, once
+/// serialized, supplies them. Its JSON Schema is a string whose
+/// [`SLOT_KEYWORD`] is `{"type": "trace"}`; its JSON value is the bare ID.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct Trace(pub String);
+
+impl schemars::JsonSchema for Trace {
+    /// Inline at each field, so a model's property names the marker directly.
+    fn inline_schema() -> bool {
+        true
+    }
+
+    /// The marker's name.
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Trace".into()
+    }
+
+    /// A string schema marked as a trace slot.
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({ "type": "string", SLOT_KEYWORD: { "type": "trace" } })
+    }
+}
+
 /// One named evidence slot of a Verifier.
 ///
 /// Evidence a caller omits stays missing, never `null`: the checks that need
@@ -113,10 +147,22 @@ impl InputSlot {
         }
     }
 
-    /// A JSON value constrained by the JSON Schema `schema`.
+    /// A JSON value constrained by the JSON Schema `schema`, or the slot a
+    /// marker names: a schema carrying [`SLOT_KEYWORD`], as a [`Trace`]
+    /// field, a Pydantic `wyrd.verify.Trace` field, or a Zod `trace()` field
+    /// emits, is that keyword's canonical slot, such as [`InputSlot::trace`].
     pub fn json(schema: impl Into<Value>) -> Self {
+        let mut schema = schema.into();
+        if let Some(slot) = schema
+            .as_object_mut()
+            .and_then(|object| object.remove(SLOT_KEYWORD))
+        {
+            return Self {
+                body: Body::authored(slot),
+            };
+        }
         let mut slot = Self::typed("json");
-        slot.body.set("schema", FieldValue::from(schema.into()));
+        slot.body.set("schema", FieldValue::from(schema));
         slot
     }
 

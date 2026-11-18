@@ -3126,6 +3126,20 @@ class Requirement:
         """
         ...
 
+class Trace(str):
+    """A trace slot's value: the trace ID of the work a Verifier judges.
+
+    A Pydantic model field, or a Verifier ``inputs`` mapping value, of this
+    type declares a ``trace`` slot; every other field declares a ``json``
+    slot. A model field validates as a plain ``str`` and serializes as the
+    bare ID, so one model both declares a Verifier's inputs and supplies them.
+    """
+
+    @classmethod
+    def model_json_schema(cls) -> dict[str, Any]:
+        """The marked string schema a mapping value ``Trace`` stands for."""
+        ...
+
 class InputSlot:
     """One named evidence slot of a Verifier.
 
@@ -3674,6 +3688,7 @@ __all__ = [
     "Service",
     "Step",
     "Table",
+    "Trace",
     "Trigger",
     "VerificationResult",
     "Verifier",

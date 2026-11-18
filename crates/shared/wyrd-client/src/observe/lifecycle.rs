@@ -114,6 +114,27 @@ impl BifrostLifecycle {
         }
     }
 
+    /// Drain every producer of the started writer, if one was started.
+    ///
+    /// Nothing is pending before a writer exists, so a never-started state, or
+    /// one whose start is still in flight, flushes at once; telemetry-only
+    /// callers flush without starting Bifrost.
+    ///
+    /// # Errors
+    /// Returns `WYRD_SDK_409_BIFROST_CLOSED` after shutdown and the first
+    /// producer or sink failure from the drain.
+    ///
+    /// # Panics
+    /// Panics if the phase lock is poisoned.
+    pub async fn flush(&self) -> Result<(), WyrdError> {
+        let started = match &*self.phase.lock().expect("bifrost phase lock poisoned") {
+            Phase::Started(started) => Arc::clone(started),
+            Phase::NotStarted | Phase::Starting => return Ok(()),
+            Phase::Closed => return Err(closed()),
+        };
+        Ok(started.bifrost.flush().await?)
+    }
+
     /// Drain every producer of the started writer and close this state.
     ///
     /// Every success is terminal. A never-started state, or one whose start is

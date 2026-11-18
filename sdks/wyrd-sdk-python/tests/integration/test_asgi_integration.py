@@ -299,7 +299,7 @@ def test_asgi_lifespan(
 
     # The missing otel extra keeps its install remedy.
     reset_telemetry_providers(monkeypatch)
-    [failed] = cycle(app(Faulty(fresh(), ImportError(_EXPORTER_EXTRA), "start_telemetry"), []))
+    [failed] = cycle(app(Faulty(fresh(), ImportError(_EXPORTER_EXTRA), "_start_telemetry"), []))
     assert failed["message"] == _EXPORTER_EXTRA
 
 

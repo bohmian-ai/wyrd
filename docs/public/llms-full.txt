@@ -2304,8 +2304,8 @@ from wyrd import WyrdClient, WyrdState
 
 client = WyrdClient()  # finds the server and credential wyrd init saved
 state = WyrdState.declare("service/support-desk.yaml", client)
-state.start_bifrost()    # the writer for rows and verdict inputs
-state.start_telemetry()  # exports spans, logs, and metrics under this Service and environment
+state.configure()      # exports spans, logs, and metrics under this Service and environment
+state.start_bifrost()  # the writer for rows and verdict inputs
 
 # Your model calls go through Wyrd's gateway. http_auth signs each call and
 # ties it to the Run it is made in.
@@ -2832,7 +2832,7 @@ from opentelemetry import trace
 from wyrd import WyrdState
 
 state = WyrdState.declare("support-reply.yaml")
-state.start_telemetry()  # export OpenTelemetry spans, logs, and metrics to Wyrd
+state.configure()  # export OpenTelemetry spans, logs, and metrics to Wyrd
 tracer = trace.get_tracer("support")
 
 # Your code's real work, traced as it runs.
@@ -3373,8 +3373,9 @@ time:
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Annotated
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 from wyrd import WyrdState
 from wyrd import WyrdError
@@ -3383,17 +3384,22 @@ from wyrd.verify import VerificationResult
 from finance_service import Release
 
 @asynccontextmanager
-async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-    yield
+async def lifespan(_: FastAPI) -> AsyncIterator[dict]:
+    # Each server process loads the Service once, at startup.
+    state = WyrdState.from_path(".wyrd-bundle")
+    yield {"wyrd": state}
     # Drain what the state recorded before the process exits.
     state.shutdown()
 
 api = FastAPI(lifespan=lifespan)
 
-state = WyrdState.from_path(".wyrd-bundle")
+def wyrd_state(request: Request) -> WyrdState:
+    return request.state.wyrd
+
+Wyrd = Annotated[WyrdState, Depends(wyrd_state)]
 
 @api.post("/reports/send")
-def send_report(release: Release):
+def send_report(release: Release, state: Wyrd):
     with state.run() as run:
         result = run.observe.verify("release-check", release)
     if result.passed:
@@ -3654,6 +3660,7 @@ When the call itself fails, such as a credential without `verifier:run`, the API
 ```
 
 **Checks that can wait:**
+
 A request waits for every check in the Verifier, including the model judge. When a decision can be made after the response, `submit` the Verifier instead and read the result later, as in [Record a run and observations](/wyrd/build-and-verify/observe/record-a-run-and-observations/#3-verify-the-answer). [Fit checks to the request's deadline](/wyrd/build-and-verify/verify/act-on-verdicts-in-production/#2-fit-checks-to-the-requests-deadline) covers the trade-off.
 
 ## If it fails
@@ -3684,12 +3691,12 @@ Finish [Set up Wyrd](/wyrd/get-started/setup/). Work in its `quickstart` directo
 
 ## 1. Add tracing
 
-The agent records each step as an OpenTelemetry span, and Wyrd stores the spans as its trace. Add the tracing packages:
+The agent records each step as an OpenTelemetry span, and Wyrd stores the spans as its trace. Add the tracing packages, and Pydantic or Zod for the Verifier's inputs:
 
 **Python**
 
 ```bash
-uv add "wyrd-ai[otel]==0.4.2"
+uv add "wyrd-ai[otel,pydantic]==0.4.2"
 ```
 
 **Rust**
@@ -3702,12 +3709,12 @@ cargo add opentelemetry@0.31 tracing@0.1 tracing-opentelemetry@0.32
 **TypeScript**
 
 ```bash
-pnpm add @opentelemetry/api @opentelemetry/context-async-hooks @opentelemetry/core @opentelemetry/resources @opentelemetry/sdk-trace-base @opentelemetry/exporter-trace-otlp-proto @opentelemetry/exporter-logs-otlp-proto @opentelemetry/exporter-metrics-otlp-proto
+pnpm add zod @opentelemetry/api @opentelemetry/context-async-hooks @opentelemetry/core @opentelemetry/resources @opentelemetry/sdk-trace-base @opentelemetry/exporter-trace-otlp-proto @opentelemetry/exporter-logs-otlp-proto @opentelemetry/exporter-metrics-otlp-proto
 ```
 
 ## 2. Write the agent and its Verifier
 
-The `refund-workflow` Verifier takes the agent's `reply` and the `trace` of the work behind it. It has two requirements:
+The `refund-workflow` Verifier takes the agent's `reply` and the `trace` of the work behind it, declared as one model whose `trace` field holds the trace ID. It has two requirements:
 
 | Requirement | What it checks |
 | --- | --- |
@@ -3720,15 +3727,20 @@ Save the program:
 
 ```python title="refund_agent.py"
 from opentelemetry import trace
+from pydantic import BaseModel
 from wyrd import WyrdState
-from wyrd.verify import Check, ComparisonOperator, InputSlot, Requirement, Service, Verifier
+from wyrd.verify import Check, ComparisonOperator, Requirement, Service, Trace, Verifier
 
 # Synthetic order records the agent's lookup tool reads.
 ORDERS = {"1042": {"delivered": "2 May", "refundable": True}}
 
+class RefundReply(BaseModel):
+    reply: str
+    trace: Trace  # the trace ID of the work behind the reply
+
 refund_workflow = Verifier(
     "refund-workflow",
-    inputs={"reply": str, "trace": InputSlot.trace()},
+    inputs=RefundReply,
     requirements=[
         # Judges the answer only: a reply that skipped the lookup passes it too.
         Requirement(
@@ -3746,32 +3758,31 @@ refund_workflow = Verifier(
 )
 
 state = WyrdState.declare(Service("refund-agent", verified_by=[refund_workflow]))
-state.start_telemetry()  # export the agent's spans to Wyrd
-state.start_bifrost()  # so flush can wait until they are stored
+state.configure()  # export the agent's spans to Wyrd
 tracer = trace.get_tracer("refund-agent")
 
 def look_up_order(order_id: str) -> dict:
     with tracer.start_as_current_span("look-up-order", attributes={"order_id": order_id}):
         return ORDERS[order_id]
 
-def refund_agent(order_id: str, remembered: dict | None = None) -> tuple[str, str]:
-    """Answer a refund request; return the reply and the trace ID of the work behind it."""
+def refund_agent(order_id: str, remembered: dict | None = None) -> RefundReply:
+    """Answer a refund request; return the reply with the trace of the work behind it."""
     with tracer.start_as_current_span("answer-refund") as span:
         # The bug: an order remembered from earlier in the conversation skips the lookup.
         order = remembered or look_up_order(order_id)
         with tracer.start_as_current_span("draft-reply"):
             reply = f"Order {order_id} was delivered on {order['delivered']}, so it qualifies for a refund."
-    return reply, format(span.get_span_context().trace_id, "032x")
+    return RefundReply(reply=reply, trace=format(span.get_span_context().trace_id, "032x"))
 
 complete = refund_agent("1042")
 skipped = refund_agent("1042", remembered=ORDERS["1042"])
 state.flush()  # store the spans before they are checked
 
 cases = [
-    ("complete", {"reply": complete[0], "trace": complete[1]}),
-    ("skipped", {"reply": skipped[0], "trace": skipped[1]}),
+    ("complete", complete.model_dump()),
+    ("skipped", skipped.model_dump()),
     # The same reply sent without its trace: nothing shows what ran.
-    ("no trace", {"reply": complete[0]}),
+    ("no trace", complete.model_dump(exclude={"trace"})),
 ]
 for label, evidence in cases:
     with state.run() as run:
@@ -3793,10 +3804,14 @@ state.shutdown()
 use std::error::Error;
 
 use opentelemetry::trace::TraceContextExt as _;
+use schemars::JsonSchema;
+use serde::Serialize;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
-use wyrd_ai::serde_json::json;
+use wyrd_ai::serde_json::{json, to_value};
 use wyrd_ai::state::WyrdState;
-use wyrd_ai::verify::{Check, ComparisonOperator, InputSlot, Requirement, Service, Verifier};
+use wyrd_ai::verify::{
+    Check, ComparisonOperator, InputSlot, Requirement, Service, Trace, Verifier,
+};
 
 /// A synthetic order record the agent's lookup tool reads.
 struct Order {
@@ -3806,18 +3821,27 @@ struct Order {
     delivered: &'static str,
 }
 
+/// The synthetic order both runs answer about: the lookup tool returns it,
+/// and the skipped run uses it as the remembered copy.
 const ORDER_1042: Order = Order {
     id: "1042",
     delivered: "2 May",
 };
 
+/// The agent's reply and the trace of the work behind it: the Verifier's
+/// inputs, and the evidence each case supplies.
+#[derive(Serialize, JsonSchema)]
+struct RefundReply {
+    /// The reply the customer reads.
+    reply: String,
+    /// The trace ID of the work behind the reply.
+    trace: Trace,
+}
+
 /// The workflow check: one requirement on the answer, one on what ran.
 fn refund_workflow() -> Verifier {
     Verifier::new("refund-workflow", None)
-        .inputs([
-            ("reply", InputSlot::json(json!({ "type": "string" }))),
-            ("trace", InputSlot::trace()),
-        ])
+        .inputs(InputSlot::fields_of::<RefundReply>())
         .requirements([
             // Judges the answer only: a reply that skipped the lookup passes it too.
             Requirement::new(
@@ -3845,9 +3869,9 @@ fn look_up_order(order_id: &str) -> &'static Order {
     &ORDER_1042
 }
 
-/// Answer a refund request; return the reply and the trace ID of the work
+/// Answer a refund request; return the reply with the trace of the work
 /// behind it.
-fn refund_agent(order_id: &str, remembered: Option<&Order>) -> (String, String) {
+fn refund_agent(order_id: &str, remembered: Option<&Order>) -> RefundReply {
     let span = tracing::info_span!("answer-refund");
     let reply = span.in_scope(|| {
         // The bug: an order remembered from earlier in the conversation skips the lookup.
@@ -3859,7 +3883,10 @@ fn refund_agent(order_id: &str, remembered: Option<&Order>) -> (String, String) 
         )
     });
     let trace = span.context().span().span_context().trace_id().to_string();
-    (reply, trace)
+    RefundReply {
+        reply,
+        trace: Trace(trace),
+    }
 }
 
 /// Declare the Cards, answer the request with and without the lookup, and
@@ -3882,13 +3909,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     telemetry.shutdown()?;
 
     let cases = [
-        (
-            "complete",
-            json!({ "reply": complete.0, "trace": complete.1 }),
-        ),
-        ("skipped", json!({ "reply": skipped.0, "trace": skipped.1 })),
+        ("complete", to_value(&complete)?),
+        ("skipped", to_value(&skipped)?),
         // The same reply sent without its trace: nothing shows what ran.
-        ("no trace", json!({ "reply": complete.0 })),
+        ("no trace", json!({ "reply": complete.reply })),
     ];
     for (label, evidence) in cases {
         let reply = evidence["reply"].as_str().map(str::to_owned);
@@ -3921,15 +3945,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
 ```typescript title="refund_agent.ts"
 import { trace } from "@opentelemetry/api";
 import { verify, WyrdState } from "wyrd-ai";
+import { z } from "zod";
 
-const { Check, InputSlot, Requirement, Service, Verifier } = verify;
+const { Check, Requirement, Service, Verifier, traceSlot } = verify;
 
 // Synthetic order records the agent's lookup tool reads.
 type Order = { delivered: string; refundable: boolean };
 const ORDERS: Record<string, Order> = { "1042": { delivered: "2 May", refundable: true } };
 
+const RefundReply = z.object({
+  reply: z.string(),
+  trace: traceSlot(z.string()), // the trace ID of the work behind the reply
+});
+type RefundReply = z.infer<typeof RefundReply>;
+
 const refundWorkflow = new Verifier("refund-workflow", {
-  inputs: { reply: InputSlot.json({ type: "string" }), trace: InputSlot.trace() },
+  inputs: RefundReply,
   requirements: [
     // Judges the answer only: a reply that skipped the lookup passes it too.
     new Requirement(
@@ -3947,8 +3978,7 @@ const refundWorkflow = new Verifier("refund-workflow", {
 });
 
 const state = await WyrdState.declare(new Service("refund-agent", { verified_by: [refundWorkflow] }));
-await state.startTelemetry(); // export the agent's spans to Wyrd
-await state.startBifrost(); // so flush can wait until they are stored
+await state.configure(); // export the agent's spans to Wyrd
 const tracer = trace.getTracer("refund-agent");
 
 function lookUpOrder(orderId: string): Order {
@@ -3958,9 +3988,9 @@ function lookUpOrder(orderId: string): Order {
   });
 }
 
-// Answer a refund request; return the reply and the trace ID of the work behind it.
-function refundAgent(orderId: string, remembered?: Order): [string, string] {
-  return tracer.startActiveSpan("answer-refund", (span): [string, string] => {
+// Answer a refund request; return the reply with the trace of the work behind it.
+function refundAgent(orderId: string, remembered?: Order): RefundReply {
+  return tracer.startActiveSpan("answer-refund", (span): RefundReply => {
     // The bug: an order remembered from earlier in the conversation skips the lookup.
     const order = remembered ?? lookUpOrder(orderId);
     const reply = tracer.startActiveSpan("draft-reply", (draft) => {
@@ -3968,7 +3998,7 @@ function refundAgent(orderId: string, remembered?: Order): [string, string] {
       return `Order ${orderId} was delivered on ${order.delivered}, so it qualifies for a refund.`;
     });
     span.end();
-    return [reply, span.spanContext().traceId];
+    return { reply, trace: span.spanContext().traceId };
   });
 }
 
@@ -3976,11 +4006,11 @@ const complete = refundAgent("1042");
 const skipped = refundAgent("1042", ORDERS["1042"]);
 await state.flush(); // store the spans before they are checked
 
-const cases: [string, Record<string, string>][] = [
-  ["complete", { reply: complete[0], trace: complete[1] }],
-  ["skipped", { reply: skipped[0], trace: skipped[1] }],
+const cases: [string, Partial<RefundReply>][] = [
+  ["complete", complete],
+  ["skipped", skipped],
   // The same reply sent without its trace: nothing shows what ran.
-  ["no trace", { reply: complete[0] }],
+  ["no trace", { reply: complete.reply }],
 ];
 for (const [label, evidence] of cases) {
   const result = await state.run().observe.verify("refund-workflow", evidence);
@@ -4035,6 +4065,7 @@ All three replies pass `reply-names-order`. Only the trace separates them:
 - **no trace** is `inconclusive`: with no trace there is no evidence about what ran, so Wyrd does not decide. An inconclusive verdict is never a pass.
 
 **Spans must be stored first:**
+
 The program flushes its spans before it verifies. A trace with no stored span is `inconclusive` under `verify`, so flush, or `submit` the check, which retries while the spans arrive. [Trace evidence](/wyrd/understand/how-verification-works/#trace-evidence) explains both.
 
 ## If it fails
@@ -4123,6 +4154,7 @@ use wyrd_ai::cards::{CardKind, CardSelector, Cards};
 use wyrd_ai::serde_json::json;
 use wyrd_ai::verify::Execution;
 
+/// The newest failed result judged by one Verifier, by its Card uid.
 const FAILED: &str = "SELECT execution_id FROM bifrost.verification.results \
     WHERE verifier_card_uid = $1 AND verdict = 'failed' ORDER BY ended_at DESC LIMIT 1";
 
@@ -4214,12 +4246,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
 ```
 
 **TypeScript**
-
-The query parses its rows with Zod. Add it:
-
-```bash
-pnpm add zod
-```
 
 ```typescript title="investigate.ts"
 import { setTimeout as sleep } from "node:timers/promises";
@@ -4384,17 +4410,47 @@ spec:
 
 The check fails a window whose mean latency is above 100 ms. Declare the Cards and pull the Service, as a deployment does:
 
+**Python**
+
+```bash
+uv run wyrd declare checkout/checkout.yaml
+uv run wyrd pull --kind Service --name checkout --version 1.0.0 --output-dir .wyrd-bundle
+```
+
+**Rust**
+
 ```bash
 wyrd declare checkout/checkout.yaml
 wyrd pull --kind Service --name checkout --version 1.0.0 --output-dir .wyrd-bundle
+```
+
+**TypeScript**
+
+```bash
+pnpm wyrd declare checkout/checkout.yaml
+pnpm wyrd pull --kind Service --name checkout --version 1.0.0 --output-dir .wyrd-bundle
 ```
 
 ## 2. Create the Service's account
 
 A schedule runs as the Service's own account, and only while that account has recorded for the Service in the last 24 hours. Create it:
 
+**Python**
+
+```bash
+uv run wyrd principal credential create-principal --name checkout-runtime --role workload --workload-name checkout
+```
+
+**Rust**
+
 ```bash
 wyrd principal credential create-principal --name checkout-runtime --role workload --workload-name checkout
+```
+
+**TypeScript**
+
+```bash
+pnpm wyrd principal credential create-principal --name checkout-runtime --role workload --workload-name checkout
 ```
 
 Copy the credential it prints into an environment variable for the next step:
@@ -4500,6 +4556,8 @@ use wyrd_ai::Bifrost;
 use wyrd_ai::bifrost::{BifrostOptions, QueryParam};
 use wyrd_ai::cards::{CardKind, CardSelector, Cards};
 
+/// The newest three scheduled windows one Verifier judged for one Service,
+/// by their Card uids, with their UTC times as `HH:MM`.
 const RECENT: &str = "SELECT to_char(window_start, '%H:%M') AS opened, \
     to_char(window_end, '%H:%M') AS closed, verdict \
     FROM bifrost.verification.results \
@@ -4546,6 +4604,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
 ```
 
 **TypeScript**
+
+`results.ts` parses its rows with Zod. Add it:
+
+```bash
+pnpm add zod
+```
 
 ```typescript title="record.ts"
 // Record five checkout requests that each took the given number of milliseconds.
@@ -4662,6 +4726,7 @@ Your times differ. Each line is one window:
 Each stored result names the exact Verifier and Service versions it judged.
 
 **Choose a real schedule:**
+
 A minute keeps this guide short. A production check usually runs hourly or daily, such as `cron: "0 * * * *"`. `cron` is evaluated in UTC unless the Trigger sets `tz`. A window missed while the server was down is skipped, not judged later.
 
 ## If it fails
@@ -4692,10 +4757,10 @@ Each practice names the failure it prevents and where it stops helping.
 The finance handler releases a report only when the verdict is `passed`:
 
 ```python title="api.py"
-state = WyrdState.from_path(".wyrd-bundle")
+Wyrd = Annotated[WyrdState, Depends(wyrd_state)]
 
 @api.post("/reports/send")
-def send_report(release: Release):
+def send_report(release: Release, state: Wyrd):
     with state.run() as run:
         result = run.observe.verify("release-check", release)
     if result.passed:
@@ -5131,7 +5196,7 @@ A graceful stop (`SIGTERM`) drains every worker. A worker killed with `SIGKILL`,
 | --- | --- |
 | `app` | The ASGI app to wrap; `add_middleware` passes it. |
 | `state` | A loaded `WyrdState`. The middleware never declares or registers anything. |
-| `telemetry` | Whether startup calls `state.start_telemetry()`. Default `True`. |
+| `telemetry` | Whether startup installs the telemetry `state.configure()` installs. Default `True`. |
 | `alias` | Function from the ASGI scope to the component alias each Run observes. Default: the Service. |
 
 `RUN_SCOPE_KEY` is `"wyrd.run"`, the scope key that holds the request's Run. Other ASGI connection types pass through unchanged.
@@ -5335,12 +5400,11 @@ Give the container the runtime key as `WYRD_API_KEY`, and `WYRD_SERVER_URL`. The
 self.client = client or WyrdClient()
 self.state = WyrdState.from_path(BUNDLE, self.client)
 # The Service name, version, and environment every span, gateway call, and
-# verification carries. Name and version come from the bundle.
+# verification carries; name and version come from the bundle. Spans
+# export to Wyrd through the SDK's OTLP exporter.
 self.state.configure(deployment_environment="development")
 self.state.start_bifrost()
-# Spans export to Wyrd through the SDK's OTLP exporter; the Agents SDK's
-# own traces become spans too, under the request's Run.
-self.state.start_telemetry()
+# The Agents SDK's own traces become spans too, under the request's Run.
 set_trace_processors([WyrdAgentsTraceProcessor()])
 ```
 
@@ -5365,10 +5429,9 @@ state.start_bifrost().await?;
 const client = WyrdClient.connect();
 // The declared Service, pulled by `pnpm run deploy`.
 const state = WyrdState.fromPath(BUNDLE_DIR, { client });
-// The Service name, version, and environment every span, gateway call, and verification carries. Name and version come from the bundle.
-state.configure({ deploymentEnvironment: "development" });
+// The Service name, version, and environment every span, gateway call, and verification carries; name and version come from the bundle. Spans export to Wyrd.
+await state.configure({ deploymentEnvironment: "development" });
 await state.startBifrost(); // writes tickets to Bifrost
-await state.startTelemetry(); // exports spans to Wyrd
 ```
 
 Loading is offline. From then on, every call sends the runtime key with the release named in the bundle, and the server records both on each row. You never set a release ID yourself.
@@ -7690,7 +7753,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_SDK_409_BIFROST_ALREADY_STARTED` | 409 | WyrdState Bifrost writer is already started | Reuse the state's existing writer, or shut it down and create a new WyrdState to start again. |
 | `WYRD_SDK_409_BIFROST_CLOSED` | 409 | WyrdState Bifrost writer is closed | Create a new WyrdState and start its Bifrost writer; a shut-down state stays closed to writes. |
 | `WYRD_SDK_409_STATE_CONFIG_FROZEN` | 409 | WyrdState configuration is already fixed | Call configure once, before startup and before opening a Run, or construct another WyrdState for a different configuration. |
-| `WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS` | 409 | An OpenTelemetry provider is already installed | Add each state's Wyrd span, log, and metric exporters to the application's own providers instead of calling start_telemetry. |
+| `WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS` | 409 | An OpenTelemetry provider is already installed | Turn off Wyrd's managed telemetry setup and add each state's Wyrd span, log, and metric exporters to the application's own providers. |
 | `WYRD_SDK_422_VERIFICATION_DATA_INVALID` | 422 | Verification data does not match the requested type | Match the requested type to the check's declared data schema, use a union or decoder for mixed shapes, or read the result without a type. |
 | `WYRD_SDK_503_TELEMETRY_FLUSH_FAILED` | 503 | Telemetry flush failed | Check the OpenTelemetry exporter's logs and the state's credentials, then retry flush or shutdown. |
 | `WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT` | 504 | Telemetry flush timed out | Check that the Wyrd server's OTLP endpoint is reachable, raise the OpenTelemetry SDK export timeout if spans are large, and retry flush or shutdown. |

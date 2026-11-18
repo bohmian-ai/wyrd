@@ -1072,14 +1072,14 @@ impl WyrdState {
     /// Drain every producer of this state's writer without closing it.
     ///
     /// The explicit durability barrier a test or a finite job uses; ordinary
-    /// callers drain once at [`WyrdState::shutdown`].
+    /// callers drain once at [`WyrdState::shutdown`]. A state that never
+    /// started Bifrost has nothing to drain and succeeds.
     ///
     /// # Errors
-    /// Returns `WYRD_SDK_400_BIFROST_NOT_STARTED` before startup,
-    /// `WYRD_SDK_409_BIFROST_CLOSED` after shutdown, and the first producer or
-    /// sink failure from the drain.
+    /// Returns `WYRD_SDK_409_BIFROST_CLOSED` after shutdown and the first
+    /// producer or sink failure from the drain.
     pub async fn flush(&self) -> Result<(), WyrdError> {
-        Ok(self.bifrost.started()?.bifrost.flush().await?)
+        self.bifrost.flush().await
     }
 
     /// Drain every producer of this state's writer and close it to writes.
@@ -2380,7 +2380,7 @@ struct AliasRecord {
 /// How a state's runtime-managed OpenTelemetry tracer provider failed to flush.
 ///
 /// Python and TypeScript state flush and shutdown first flush the provider
-/// their `start_telemetry` installed, then always attempt the native Bifrost
+/// their managed telemetry setup installed, then always attempt the native Bifrost
 /// drain. This value carries the provider stage's outcome across that drain so
 /// both runtimes report the same catalog error: OTEL is primary and the
 /// drain's stable code, when it also failed, is secondary detail. `cause` is a

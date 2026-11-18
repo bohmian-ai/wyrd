@@ -2038,3 +2038,53 @@ fn fields_of_declares_one_slot_per_field() {
     assert_eq!(report["properties"]["text"]["type"], json!("string"));
     verifier.plan().expect("field slots validate");
 }
+
+/// A [`Trace`] field declares a `trace` slot beside the struct's `json`
+/// slots, carries no schema into the stored Card, and serializes as the bare
+/// trace ID; a mapping value schema with the marker is the same slot.
+///
+/// # Panics
+/// Panics when the marked field is not a bare trace slot, a plain field
+/// loses its schema, or the serialized value is not the ID.
+#[test]
+fn trace_field_declares_a_trace_slot() {
+    /// A reply and the trace of the work behind it.
+    #[derive(serde::Serialize, schemars::JsonSchema)]
+    struct RefundReply {
+        /// The agent's reply.
+        reply: String,
+        /// The trace behind the reply.
+        trace: super::Trace,
+    }
+
+    let verifier = Verifier::new("refund-workflow", "1.0.0")
+        .inputs(InputSlot::fields_of::<RefundReply>())
+        .requirements([Requirement::new(
+            "looked-up-order",
+            "The agent looked up the order.",
+            Check::trace(
+                "inputs.trace",
+                "$.spans[*].name",
+                "is_superset",
+                json!(["look-up-order"]),
+            ),
+        )]);
+
+    let inputs = verifier.spec()["inputs"].clone();
+    assert_eq!(inputs["trace"], json!({ "type": "trace" }));
+    assert_eq!(inputs["reply"]["schema"]["type"], json!("string"));
+    let mapped = Verifier::new("refund-workflow", "1.0.0").inputs([(
+        "trace",
+        InputSlot::json(
+            json!({ "type": "string", super::verifier::SLOT_KEYWORD: { "type": "trace" } }),
+        ),
+    )]);
+    assert_eq!(mapped.spec()["inputs"]["trace"], json!({ "type": "trace" }));
+    let value = serde_json::to_value(RefundReply {
+        reply: "Order 1042".into(),
+        trace: super::Trace("0af7651916cd43dd8448eb211c80319c".into()),
+    })
+    .expect("reply is JSON");
+    assert_eq!(value["trace"], json!("0af7651916cd43dd8448eb211c80319c"));
+    verifier.plan().expect("the slots validate");
+}

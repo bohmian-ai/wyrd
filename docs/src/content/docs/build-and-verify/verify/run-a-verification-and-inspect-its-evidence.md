@@ -32,12 +32,6 @@ The program finds the newest failed `refund-workflow` result in `bifrost.verific
 </LangTab>
 <LangTab lang="typescript">
 
-The query parses its rows with Zod. Add it:
-
-```bash
-pnpm add zod
-```
-
 <CodeFromFile file="examples/refund-agent/investigate.ts" lang="typescript" title="investigate.ts" />
 
 </LangTab>

@@ -2392,6 +2392,7 @@ export namespace verify {
   export import Service = definitions.Service;
   export import Step = definitions.Step;
   export import Table = definitions.Table;
+  export import Trace = definitions.Trace;
   export import Trigger = definitions.Trigger;
   export import Verifier = definitions.Verifier;
   export type Authorable<T> = definitions.Authorable<T>;
@@ -2789,7 +2790,7 @@ export class Run {
 
   /**
    * Run `fn` inside this view's scope: spans started in it, across awaits,
-   * carry this run and Card once {@link WyrdState.startTelemetry} installed
+   * carry this run and Card once {@link WyrdState.configure} installed
    * telemetry, and requests through the state's {@link WyrdState.httpAuth}
    * carry this run and Card. Without `@opentelemetry/api` spans are untouched.
    *
@@ -3077,7 +3078,7 @@ function suppliedAttributes(supplied: Record<string, unknown>): Record<string, s
   return attributes;
 }
 
-/** The explicit fields {@link WyrdState.configure} fixes; omitted ones default. */
+/** The explicit fields {@link WyrdState.configure} fixes, and whether it installs telemetry; omitted ones default. */
 export type ConfigureOptions = {
   /** The loaded Service's name; must match it. */
   readonly serviceName?: string;
@@ -3085,6 +3086,8 @@ export type ConfigureOptions = {
   readonly serviceVersion?: string;
   /** The deployment environment correlation tag copied onto rows; it never selects or refuses execution. */
   readonly deploymentEnvironment?: string;
+  /** Whether to install Wyrd's managed tracer provider; default `true`. */
+  readonly telemetry?: boolean;
 };
 
 /**
@@ -3096,11 +3099,11 @@ export type ConfigureOptions = {
  */
 export class WyrdState {
   readonly #native: NativeWyrdState;
-  /** The tracer provider {@link WyrdState.startTelemetry} installed. */
+  /** The tracer provider {@link WyrdState.configure} installed. */
   #telemetry: { forceFlush(): Promise<void> } | undefined;
 
   /**
-   * Flush completed spans from the provider {@link WyrdState.startTelemetry}
+   * Flush completed spans from the provider {@link WyrdState.configure}
    * installed, within its configured `forceFlushTimeoutMillis`. Resolves to
    * the payload-free failure, or `undefined` when there is no managed provider
    * or it flushed; never rejects.
@@ -3347,37 +3350,11 @@ export class WyrdState {
     lifecycleValue<null>(await this.#native.useTableByName(table));
   }
 
-  /**
-   * Install the global OpenTelemetry tracer provider exporting spans to this
-   * state's server as the state's client.
-   *
-   * Spans export through the stock OTLP/HTTP exporter `spanExporter` builds, which
-   * asks the client for a fresh access token on every export; spans started
-   * inside {@link Run.scope} carry that run and Card. Node's `AsyncLocalStorage`
-   * context manager is registered unless the application registered one. A
-   * second call is idempotent, and {@link WyrdState.shutdown} flushes only
-   * this provider. The provider's resource names the root Service's name and
-   * version and the configured `deployment.environment.name`, so every span
-   * carries the state's environment. Needs the optional `@opentelemetry/api`,
-   * `@opentelemetry/context-async-hooks`, `@opentelemetry/resources`,
-   * `@opentelemetry/sdk-trace-base`, and `@opentelemetry/exporter-trace-otlp-proto`
-   * peers.
-   *
-   * @throws a {@link WyrdError}: `WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS` when
-   * a global tracer provider is already registered (add `spanExporter` to it
-   * instead), or the credential error when the state's client cannot resolve.
-   */
-  async startTelemetry(): Promise<void> {
-    if (this.#telemetry !== undefined) {
-      return;
-    }
+  /** Install the managed tracer provider {@link WyrdState.configure} documents. */
+  async #startTelemetry(): Promise<void> {
     const native = this.#native.client();
     const client = WyrdClient.fromNative(nativeHandle(native.client, native.error));
     const { startTelemetry } = await import("./otel.js");
-    // An overlapping call on this state may have installed during the await.
-    if (this.#telemetry !== undefined) {
-      return;
-    }
     const provider = startTelemetry(client, this.rootRef, this.deploymentEnvironment);
     if (provider === undefined) {
       throw projectedError(telemetryProviderExists());
@@ -3402,21 +3379,39 @@ export class WyrdState {
 
   /**
    * Fix this state's Service release and deployment environment before its
-   * first use. Local, with no network IO.
+   * first use, then, unless `telemetry` is `false`, install the global
+   * OpenTelemetry tracer provider exporting spans to Wyrd.
    *
    * Omitted `serviceName` and `serviceVersion` default to the loaded Service;
    * an omitted `deploymentEnvironment` defaults to a non-empty
    * `WYRD_DEPLOYMENT_ENVIRONMENT`, else stays `undefined`. Without a call, the
-   * first Run, client, Bifrost, telemetry, or shutdown use applies the same
-   * defaults. Another loaded state keeps its own configuration.
+   * first Run, client, Bifrost, or shutdown use applies the same defaults and
+   * installs no telemetry. Another loaded state keeps its own configuration.
    *
-   * @param options - The explicit name, version, and environment.
+   * The provider's resource names the root Service's name and version and the
+   * configured `deployment.environment.name`. Spans export through the stock
+   * OTLP/HTTP exporter `spanExporter` builds, which asks the client for a
+   * fresh access token on every export; spans started inside
+   * {@link Run.scope} carry that run and Card. Node's `AsyncLocalStorage`
+   * context manager is registered unless the application registered one, and
+   * {@link WyrdState.shutdown} flushes only this provider. Telemetry needs the
+   * optional `@opentelemetry/api`, `@opentelemetry/context-async-hooks`,
+   * `@opentelemetry/resources`, `@opentelemetry/sdk-trace-base`, and
+   * `@opentelemetry/exporter-trace-otlp-proto` peers. The configuration is
+   * fixed before the provider installs, so a failed install is fixed in code,
+   * not by configuring again.
+   *
+   * @param options - The explicit name, version, and environment, and
+   * `telemetry: false` when the application owns its tracer provider (add
+   * `spanExporter` to it instead).
    * @throws {@link WyrdError} `WYRD_SDK_409_STATE_CONFIG_FROZEN` once
-   * configuration is fixed, even after shutdown, or
+   * configuration is fixed, even after shutdown;
    * `WYRD_CLIENT_400_CONFIG_INVALID` for an empty field or a mismatched name
-   * or version.
+   * or version; `WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS` when a global tracer
+   * provider is already registered; or the credential error when the state's
+   * client cannot resolve.
    */
-  configure(options: ConfigureOptions = {}): void {
+  async configure(options: ConfigureOptions = {}): Promise<void> {
     lifecycleValue<null>(
       this.#native.configure({
         serviceName: options.serviceName,
@@ -3424,6 +3419,9 @@ export class WyrdState {
         deploymentEnvironment: options.deploymentEnvironment,
       }),
     );
+    if (options.telemetry ?? true) {
+      await this.#startTelemetry();
+    }
   }
 
   /** The configured deployment environment correlation tag, or `undefined`; reading it fixes defaults. */
@@ -3495,7 +3493,7 @@ export class WyrdState {
   }
 
   /**
-   * Export completed spans from the provider {@link WyrdState.startTelemetry}
+   * Export completed spans from the provider {@link WyrdState.configure}
    * installed, then drain every producer of this state's writer without
    * closing it.
    *
@@ -3506,7 +3504,8 @@ export class WyrdState {
    * @throws a {@link WyrdError}: `WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT` or
    * `WYRD_SDK_503_TELEMETRY_FLUSH_FAILED` when the managed provider did not
    * flush, with any drain failure's code as `details.native_code`; otherwise
-   * before startup, after shutdown, or for the first producer or sink failure.
+   * after shutdown, or for the first producer or sink failure. A state that
+   * never started Bifrost has no writer to drain.
    */
   async flush(): Promise<void> {
     const telemetry = await this.#flushTelemetry();
@@ -3521,7 +3520,7 @@ export class WyrdState {
    * resolves can lose pending rows. After an ambiguous failure, retry
    * `shutdown()` on the same state rather than replacing the writer; a
    * successfully closed state stays closed. A tracer provider
-   * {@link WyrdState.startTelemetry} installed is flushed first but stays
+   * {@link WyrdState.configure} installed is flushed first but stays
    * installed and usable; the drain is attempted even when that flush fails.
    *
    * @throws a {@link WyrdError}: `WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT` or

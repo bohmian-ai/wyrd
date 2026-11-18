@@ -1786,3 +1786,26 @@ fn a_state_created_with_a_client_keeps_it_for_every_server_call() {
         url
     );
 }
+
+/// A flush drains only a writer that exists: before a start, and while one
+/// is in flight, there is nothing pending, so a telemetry-only caller
+/// flushes without starting Bifrost; after shutdown the state stays closed.
+#[tokio::test]
+async fn flush_drains_only_a_started_writer() {
+    let lifecycle = BifrostLifecycle::default();
+    lifecycle
+        .flush()
+        .await
+        .expect("nothing to drain before start");
+    let claim = lifecycle.claim().expect("first claim");
+    lifecycle
+        .flush()
+        .await
+        .expect("nothing to drain during start");
+    drop(claim);
+    lifecycle.shutdown().await.expect("shutdown closes");
+    assert_eq!(
+        lifecycle.flush().await.err().map(|error| error.code()),
+        Some("WYRD_SDK_409_BIFROST_CLOSED")
+    );
+}

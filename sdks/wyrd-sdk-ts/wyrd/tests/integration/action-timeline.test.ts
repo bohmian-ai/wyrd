@@ -23,7 +23,7 @@ let telemetry: Promise<unknown> | undefined;
 
 /** Install `state`'s telemetry unless an earlier test in this file already did. */
 function startTelemetry(state: WyrdState): Promise<unknown> {
-  telemetry ??= state.startTelemetry();
+  telemetry ??= state.configure();
   return telemetry;
 }
 

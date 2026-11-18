@@ -222,7 +222,7 @@ A graceful stop (`SIGTERM`) drains every worker. A worker killed with `SIGKILL`,
 | --- | --- |
 | `app` | The ASGI app to wrap; `add_middleware` passes it. |
 | `state` | A loaded `WyrdState`. The middleware never declares or registers anything. |
-| `telemetry` | Whether startup calls `state.start_telemetry()`. Default `True`. |
+| `telemetry` | Whether startup installs the telemetry `state.configure()` installs. Default `True`. |
 | `alias` | Function from the ASGI scope to the component alias each Run observes. Default: the Service. |
 
 `RUN_SCOPE_KEY` is `"wyrd.run"`, the scope key that holds the request's Run. Other ASGI connection types pass through unchanged.

@@ -83,11 +83,9 @@ def test_write_refuses_a_table_outside_bifrost_datasets(state: WyrdState) -> Non
     assert raised.value.code == "WYRD_SDK_400_INVALID_OBSERVATION"
 
 
-def test_flush_requires_a_started_writer(state: WyrdState) -> None:
-    """An explicit drain of a state that never started Bifrost is an error."""
-    with pytest.raises(wyrd.WyrdError) as raised:
-        state.flush()
-    assert raised.value.code == "WYRD_SDK_400_BIFROST_NOT_STARTED"
+def test_flush_without_a_writer_drains_nothing(state: WyrdState) -> None:
+    """A state that never started Bifrost has nothing to drain."""
+    state.flush()
 
 
 def test_shutdown_without_startup_succeeds(state: WyrdState) -> None:
@@ -790,11 +788,12 @@ def test_telemetry_setup(
     interfaces: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """One managed provider per application: repeats are idempotent, others are refused intact."""
+    """One managed provider per application: reinstalls are idempotent, others are refused intact."""
     if case == "repeat":
-        client_state.start_telemetry()
+        client_state.configure()
         installed = trace.get_tracer_provider()
-        client_state.start_telemetry()
+        # The ASGI middleware reinstalls after an application's own configure.
+        client_state._start_telemetry()
         assert trace.get_tracer_provider() is installed
         assert isinstance(installed, TracerProvider)
         return
@@ -818,7 +817,7 @@ def test_telemetry_setup(
 
         def start() -> None:
             try:
-                client_state.start_telemetry()
+                client_state._start_telemetry()
             except BaseException as failure:
                 failures.append(failure)
 
@@ -832,7 +831,7 @@ def test_telemetry_setup(
         assert isinstance(trace.get_tracer_provider(), TracerProvider)
         return
     if case == "other_state":
-        _second_state(complete_bundle, interfaces).start_telemetry()
+        _second_state(complete_bundle, interfaces).configure()
     elif case == "application":
         trace.set_tracer_provider(TracerProvider())
     elif case == "application_meter":
@@ -848,7 +847,7 @@ def test_telemetry_setup(
         monkeypatch.setattr(TracerProvider, "shutdown", lambda provider: released.append(provider))
     existing = trace.get_tracer_provider()
     with pytest.raises(wyrd.WyrdError) as refused:
-        client_state.start_telemetry()
+        client_state.configure()
     assert refused.value.code == "WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS"
     assert trace.get_tracer_provider() is existing
     if case == "lost_race":
@@ -861,9 +860,12 @@ def test_telemetry_setup_names_the_otel_extra_without_the_sdk(client_state: Wyrd
     with pytest.MonkeyPatch.context() as patch:
         patch.setitem(sys.modules, "opentelemetry.sdk.trace", None)
         with pytest.raises(ImportError, match=r"wyrd-ai\[otel\]"):
-            client_state.start_telemetry()
-    # The failure is not remembered: once the SDK imports, setup succeeds.
-    client_state.start_telemetry()
+            client_state.configure()
+    # The configuration stays fixed; the install failure is not remembered.
+    with pytest.raises(wyrd.WyrdError) as frozen:
+        client_state.configure()
+    assert frozen.value.code == "WYRD_SDK_409_STATE_CONFIG_FROZEN"
+    client_state._start_telemetry()
     assert isinstance(trace.get_tracer_provider(), TracerProvider)
 
 
@@ -935,21 +937,11 @@ def test_owned_provider_correlation(state: WyrdState) -> None:
             False,
             "flush",
             "WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT",
-            "WYRD_SDK_400_BIFROST_NOT_STARTED",
+            None,
         ),
-        (
-            TimeoutError,
-            "flush",
-            "WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT",
-            "WYRD_SDK_400_BIFROST_NOT_STARTED",
-        ),
-        (
-            RuntimeError,
-            "flush",
-            "WYRD_SDK_503_TELEMETRY_FLUSH_FAILED",
-            "WYRD_SDK_400_BIFROST_NOT_STARTED",
-        ),
-        (True, "flush", "WYRD_SDK_400_BIFROST_NOT_STARTED", None),
+        (TimeoutError, "flush", "WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT", None),
+        (RuntimeError, "flush", "WYRD_SDK_503_TELEMETRY_FLUSH_FAILED", None),
+        (True, "flush", None, None),
         (False, "shutdown", "WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT", None),
         (RuntimeError, "shutdown", "WYRD_SDK_503_TELEMETRY_FLUSH_FAILED", None),
         (True, "shutdown", None, None),
@@ -974,11 +966,11 @@ def test_managed_telemetry_lifecycle(
 ) -> None:
     """The managed provider flushes first; every failure is reported and the drain still runs.
 
-    Bifrost is never started here, so a flush's native drain reports
-    ``BIFROST_NOT_STARTED`` and a shutdown's drain succeeds: either result in
-    the error proves the drain was attempted after the provider failed.
+    Bifrost is never started here, so both native drains succeed with nothing
+    to drain: a ``None`` native code in the error proves the drain was
+    attempted after the provider failed.
     """
-    client_state.start_telemetry()
+    client_state.configure()
     provider = trace.get_tracer_provider()
     assert isinstance(provider, TracerProvider)
     flushes: list[str] = []
@@ -1045,12 +1037,7 @@ def _stale_flush(
             tracer.start_span(f"late-{method}").end()
             watcher = threading.Thread(target=release_when_waiting, daemon=True)
             watcher.start()
-            if method == "flush":
-                with pytest.raises(wyrd.WyrdError) as failed:
-                    state.flush()
-                assert failed.value.code == "WYRD_SDK_400_BIFROST_NOT_STARTED"
-            else:
-                state.shutdown()
+            getattr(state, method)()
             exported = {span.name for span in exporter.get_finished_spans()}
             assert f"late-{method}" in exported
         finally:
@@ -1059,7 +1046,7 @@ def _stale_flush(
 
 
 def _ignore_errors(call: Any) -> None:
-    """Run ``call``, discarding the Wyrd error a Bifrost-less flush raises."""
+    """Run ``call``, discarding the Wyrd error a held telemetry flush raises."""
     try:
         call()
     except wyrd.WyrdError:
@@ -1091,7 +1078,7 @@ def test_managed_telemetry_flush_deadline(
     # Frees the held export if the flush ignores its bound, so a regression fails, not hangs.
     fallback = threading.Timer(5, exporter.release.set)
     fallback.start()
-    client_state.start_telemetry()
+    client_state.configure()
     provider = trace.get_tracer_provider()
     assert isinstance(provider, TracerProvider)
     tracer = provider.get_tracer("framework")
@@ -1105,7 +1092,7 @@ def test_managed_telemetry_flush_deadline(
             client_state.flush()
         assert time.monotonic() - started < 2
         assert failed.value.code == "WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT"
-        assert failed.value.details["native_code"] == "WYRD_SDK_400_BIFROST_NOT_STARTED"
+        assert failed.value.details["native_code"] is None
         assert exporter.entered.is_set()
         assert not exporter.release.is_set()
         with run:

@@ -233,28 +233,8 @@ class WyrdState:
         """
         ...
 
-    def start_telemetry(self) -> None:
-        """Install the global tracer, meter, and logger providers exporting as this state's client.
-
-        The three share one Resource: ``service.name`` and ``service.version``
-        from the loaded Service and, when configured,
-        ``deployment.environment.name``, so every span, log record, and metric
-        point lands under this state's Service and environment. Starting
-        fixes the state's configuration. Each signal exports through the
-        stock OTLP/HTTP exporter, which asks the client for a fresh access
-        token on every export; spans started inside ``with state.run(...)``
-        carry that Run and Card. A second call is idempotent, and ``flush``
-        and ``shutdown`` flush only the providers installed here. Needs the
-        ``otel`` extra.
-
-        Raises:
-            WyrdError: ``WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS`` when the
-                application already installed its own tracer, meter, or logger
-                provider; add ``wyrd.otel.span_exporter``,
-                ``log_exporter``, and ``metric_exporter`` to its providers
-                instead.
-            ImportError: naming the ``otel`` extra when it is not installed.
-        """
+    def _start_telemetry(self) -> None:
+        """Install the managed providers ``configure`` installs; idempotent. Internal to Wyrd integrations."""
         ...
 
     def configure(
@@ -263,25 +243,48 @@ class WyrdState:
         service_name: str | None = None,
         service_version: str | None = None,
         deployment_environment: str | None = None,
+        telemetry: bool = True,
     ) -> None:
-        """Fix this state's Service release and deployment environment before first use.
+        """Fix this state's Service release and environment, then install Wyrd's telemetry.
 
-        Local, with no network IO. Omitted name and version default to the
-        loaded Service; an omitted environment defaults to a non-empty
-        ``WYRD_DEPLOYMENT_ENVIRONMENT``, else stays ``None``. Without a call,
-        the first Run, client, Bifrost, telemetry, or shutdown use applies the
-        same defaults. Another loaded state keeps its own configuration.
+        Omitted name and version default to the loaded Service; an omitted
+        environment defaults to a non-empty ``WYRD_DEPLOYMENT_ENVIRONMENT``,
+        else stays ``None``. Without a call, the first Run, client, Bifrost, or
+        shutdown use applies the same defaults and installs no telemetry.
+        Another loaded state keeps its own configuration.
+
+        With ``telemetry`` (the default), it then installs the global tracer,
+        meter, and logger providers, exporting as this state's client. They
+        share one Resource: ``service.name``, ``service.version`` and, when
+        configured, ``deployment.environment.name``, so every span, log
+        record, and metric point lands under this state's Service and
+        environment. Each signal exports through the stock OTLP/HTTP
+        exporter, which asks the client for a fresh access token on every
+        export; spans started inside ``with state.run(...)`` carry that Run
+        and Card. ``flush`` and ``shutdown`` flush only these providers.
+        Telemetry needs the ``otel`` extra. The configuration is fixed before
+        the providers install, so a failed install is fixed in code, not by
+        calling ``configure`` again.
 
         Args:
             service_name: the loaded Service's name; must match it.
             service_version: the loaded Service's exact version; must match it.
             deployment_environment: the deployment environment correlation tag
                 copied onto rows; it never selects or refuses execution.
+            telemetry: whether to install Wyrd's managed providers. Pass
+                ``False`` when the application owns its providers; add
+                ``wyrd.otel.span_exporter``, ``log_exporter``, and
+                ``metric_exporter`` to them instead.
 
         Raises:
             WyrdError: ``WYRD_SDK_409_STATE_CONFIG_FROZEN`` once configuration
                 is fixed, even after shutdown; ``WYRD_CLIENT_400_CONFIG_INVALID``
-                for an empty field or a mismatched name or version.
+                for an empty field or a mismatched name or version;
+                ``WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS`` when the
+                application already installed its own tracer, meter, or
+                logger provider.
+            ImportError: naming the ``otel`` extra when telemetry is on and it
+                is not installed.
         """
         ...
 
@@ -339,15 +342,16 @@ class WyrdState:
         """Drain every producer of this state's writer without closing it.
 
         The explicit durability barrier for a test or a finite job. A tracer
-        provider ``start_telemetry`` installed is force-flushed first; the
-        writer drains even when that flush fails.
+        provider ``configure`` installed is force-flushed first; the
+        writer drains even when that flush fails. A state that never started
+        Bifrost has no writer to drain, so a telemetry-only program flushes
+        without ``start_bifrost``.
 
         Raises:
             WyrdError: ``WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT`` or
                 ``WYRD_SDK_503_TELEMETRY_FLUSH_FAILED`` when the telemetry
                 flush timed out or failed (``details["native_code"]`` names any
                 writer failure too); otherwise
-                ``WYRD_SDK_400_BIFROST_NOT_STARTED`` before startup,
                 ``WYRD_SDK_409_BIFROST_CLOSED`` after shutdown, or the first
                 producer or sink failure.
         """
@@ -362,7 +366,7 @@ class WyrdState:
         ambiguous failure, retry ``shutdown()`` on the same state rather than
         replacing the writer. A successfully shut-down state stays closed;
         create a new ``WyrdState`` to start again. A tracer provider
-        ``start_telemetry`` installed is force-flushed first, and the writer
+        ``configure`` installed is force-flushed first, and the writer
         drains even when that flush fails. An application-owned provider is
         never flushed here; shut it down yourself.
 

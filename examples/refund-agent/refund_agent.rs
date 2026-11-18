@@ -5,10 +5,14 @@
 use std::error::Error;
 
 use opentelemetry::trace::TraceContextExt as _;
+use schemars::JsonSchema;
+use serde::Serialize;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
-use wyrd_ai::serde_json::json;
+use wyrd_ai::serde_json::{json, to_value};
 use wyrd_ai::state::WyrdState;
-use wyrd_ai::verify::{Check, ComparisonOperator, InputSlot, Requirement, Service, Verifier};
+use wyrd_ai::verify::{
+    Check, ComparisonOperator, InputSlot, Requirement, Service, Trace, Verifier,
+};
 
 /// A synthetic order record the agent's lookup tool reads.
 struct Order {
@@ -18,19 +22,28 @@ struct Order {
     delivered: &'static str,
 }
 
+/// The synthetic order both runs answer about: the lookup tool returns it,
+/// and the skipped run uses it as the remembered copy.
 const ORDER_1042: Order = Order {
     id: "1042",
     delivered: "2 May",
 };
 
 // ANCHOR: verifier
+/// The agent's reply and the trace of the work behind it: the Verifier's
+/// inputs, and the evidence each case supplies.
+#[derive(Serialize, JsonSchema)]
+struct RefundReply {
+    /// The reply the customer reads.
+    reply: String,
+    /// The trace ID of the work behind the reply.
+    trace: Trace,
+}
+
 /// The workflow check: one requirement on the answer, one on what ran.
 fn refund_workflow() -> Verifier {
     Verifier::new("refund-workflow", None)
-        .inputs([
-            ("reply", InputSlot::json(json!({ "type": "string" }))),
-            ("trace", InputSlot::trace()),
-        ])
+        .inputs(InputSlot::fields_of::<RefundReply>())
         .requirements([
             // Judges the answer only: a reply that skipped the lookup passes it too.
             Requirement::new(
@@ -60,9 +73,9 @@ fn look_up_order(order_id: &str) -> &'static Order {
     &ORDER_1042
 }
 
-/// Answer a refund request; return the reply and the trace ID of the work
+/// Answer a refund request; return the reply with the trace of the work
 /// behind it.
-fn refund_agent(order_id: &str, remembered: Option<&Order>) -> (String, String) {
+fn refund_agent(order_id: &str, remembered: Option<&Order>) -> RefundReply {
     let span = tracing::info_span!("answer-refund");
     let reply = span.in_scope(|| {
         // The bug: an order remembered from earlier in the conversation skips the lookup.
@@ -74,7 +87,10 @@ fn refund_agent(order_id: &str, remembered: Option<&Order>) -> (String, String) 
         )
     });
     let trace = span.context().span().span_context().trace_id().to_string();
-    (reply, trace)
+    RefundReply {
+        reply,
+        trace: Trace(trace),
+    }
 }
 // ANCHOR_END: agent
 
@@ -99,13 +115,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     telemetry.shutdown()?;
 
     let cases = [
-        (
-            "complete",
-            json!({ "reply": complete.0, "trace": complete.1 }),
-        ),
-        ("skipped", json!({ "reply": skipped.0, "trace": skipped.1 })),
+        ("complete", to_value(&complete)?),
+        ("skipped", to_value(&skipped)?),
         // The same reply sent without its trace: nothing shows what ran.
-        ("no trace", json!({ "reply": complete.0 })),
+        ("no trace", json!({ "reply": complete.reply })),
     ];
     for (label, evidence) in cases {
         let reply = evidence["reply"].as_str().map(str::to_owned);

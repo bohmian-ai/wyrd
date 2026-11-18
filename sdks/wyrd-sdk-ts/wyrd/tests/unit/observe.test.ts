@@ -233,6 +233,7 @@ describe("internal native run wrapper", () => {
       "Service",
       "Step",
       "Table",
+      "Trace",
       "Trigger",
       "Verifier",
     ]);

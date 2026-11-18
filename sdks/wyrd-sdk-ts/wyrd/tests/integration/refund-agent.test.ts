@@ -1,5 +1,5 @@
 // The agent workflow guide's TypeScript program, `examples/refund-agent`, run as a reader runs it: from an empty
-// directory against a real server. The program exports its spans through `startTelemetry`, so the trace check reads
+// directory against a real server. The program exports its spans through the telemetry `configure` installs, so the trace check reads
 // the traces it recorded: the complete reply passes, the reply that skipped its lookup fails, and the reply sent
 // without a trace is inconclusive. The investigation then finds the stored failure and prints its failed requirement and
 // the trace it read, and an unknown execution's details are not found.

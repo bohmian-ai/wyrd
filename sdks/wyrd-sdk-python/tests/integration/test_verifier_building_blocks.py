@@ -153,9 +153,15 @@ def policy_desk_key(policy_desk_bundle: Path) -> str:
 
 
 @pytest.fixture
-def desk(policy_desk_bundle: Path, policy_desk_key: str) -> Iterator[WyrdState]:
-    """The hydrated ``policy-desk`` Service acting as its own key, Bifrost started."""
+def desk(
+    request: pytest.FixtureRequest, policy_desk_bundle: Path, policy_desk_key: str
+) -> Iterator[WyrdState]:
+    """The hydrated ``policy-desk`` Service acting as its own key, Bifrost started.
+
+    Telemetry is installed only for a test that asks for fresh providers.
+    """
     state = WyrdState.from_path(policy_desk_bundle, WyrdClient(credential=policy_desk_key))
+    state.configure(telemetry="fresh_telemetry_providers" in request.fixturenames)
     state.start_bifrost()
     yield state
     state.shutdown()
@@ -214,7 +220,6 @@ def record_trace(
     Stored spans order by start time, so ``outer`` is the trace document's
     ``spans[0]`` and ``inner`` its ``spans[1]``.
     """
-    desk.start_telemetry()
     tracer = trace.get_tracer("journey.policy")
     with tracer.start_as_current_span(outer, attributes={"policy_id": policy_id}) as span:
         with tracer.start_as_current_span(inner):
@@ -230,7 +235,6 @@ def record_whole_trace(desk: WyrdState, server: WyrdTestServer, trace_id: str | 
 
     Given ``trace_id``, both spans join that trace.
     """
-    desk.start_telemetry()
     writer = TracerProvider()
     writer.add_span_processor(SimpleSpanProcessor(span_exporter(client_of(server))))
     parent = None
@@ -1584,13 +1588,13 @@ def test_docsite_agent_workflow_example(refund_reader: WyrdTestServer) -> None:
 
     # Both replies are the same text; only the traces the program exported differ.
     complete, skipped = program["complete"], program["skipped"]
-    assert complete[0] == skipped[0]
-    assert [span["name"] for span in timeline(refund_reader, complete[1])] == [
+    assert complete.reply == skipped.reply
+    assert [span["name"] for span in timeline(refund_reader, complete.trace)] == [
         "answer-refund",
         "look-up-order",
         "draft-reply",
     ]
-    assert [span["name"] for span in timeline(refund_reader, skipped[1])] == [
+    assert [span["name"] for span in timeline(refund_reader, skipped.trace)] == [
         "answer-refund",
         "draft-reply",
     ]

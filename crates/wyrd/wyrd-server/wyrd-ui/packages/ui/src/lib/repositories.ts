@@ -131,7 +131,7 @@ async function readConnection(context: Context): Promise<Read<GithubConnectionVi
  * Card keeps its row.
  */
 // ponytail: reads at most 500 versions and 50 families, two Card reads each; past that the rows say they are partial. A server-side join replaces this if tenants outgrow it.
-async function joinRepositories(connection: Read<GithubConnectionView>, context: Context): Promise<Read<RepositoryJoin>> {
+async function joinRepositories(pending: Read<GithubConnectionView> | Promise<Read<GithubConnectionView>>, context: Context): Promise<Read<RepositoryJoin>> {
   const listed: CardSummary[] = [];
   let cursor: string | null = null;
   for (let page = 0; page < LIST_PAGES; page += 1) {
@@ -156,6 +156,7 @@ async function joinRepositories(connection: Read<GithubConnectionView>, context:
     return selected && selected !== newest[index] ? [{ index, ref: ref(names[index], selected) }] : [];
   });
   const second = await read(wanted.map((each) => each.ref));
+  const connection = await pending;
   const rows = names.map((name, index): RepositoryRow => {
     const opens = wanted.find((each) => each.index === index);
     const answer = opens ? second[wanted.indexOf(opens)] : first[index];
@@ -206,14 +207,17 @@ export interface RepositoryIndexProps {
 
 /** Load the Repositories index: the bounded join, narrowed by the search text and the Show choice. */
 export async function loadRepositoryIndex(input: RepositoryIndexInput, context: Context): Promise<RepositoryIndexProps> {
-  const connection = await readConnection(context);
+  // The Card listing does not depend on the connection, so both start at once.
+  const connection = readConnection(context);
+  // A refused listing returns before the connection is awaited; its abort must not go unhandled.
+  connection.catch(() => undefined);
   const join = await joinRepositories(connection, context);
   if (join.state !== 'populated') return { input, result: join };
   const term = input.query?.trim().toLowerCase();
   const shows = (row: RepositoryRow) =>
     input.show === undefined || input.show === 'all' || (input.show === 'inactive' ? ['inactive', 'none', 'unselected'].includes(row.readiness ?? '') : row.readiness === input.show);
   const rows = join.data.rows.filter((row) => shows(row) && (!term || `${row.card?.name ?? ''} ${row.fullName ?? ''}`.toLowerCase().includes(term)));
-  return { input, result: { state: 'populated', data: { rows, total: join.data.rows.length, ...(join.data.partial ? { partial: join.data.partial } : {}), connection } } };
+  return { input, result: { state: 'populated', data: { rows, total: join.data.rows.length, ...(join.data.partial ? { partial: join.data.partial } : {}), connection: await connection } } };
 }
 
 /** One declared binding of the viewed version. */

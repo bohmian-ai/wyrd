@@ -27,16 +27,19 @@ const keysPath = (principalId: string, cursor: string | null) =>
 
 /**
  * The calling User's profile and one page of their own key metadata, both
- * derived by the server from the session; the target principal is never
+ * for the principal the server-resolved session names; the target principal is never
  * taken from the page. No key secret is ever part of this page load.
  */
 export const load: PageServerLoad = async (event) => {
   if (!event.locals.browserSession) return { profile: null, keys: null, problem: problem('upstream') };
   try {
     const session = signedIn(event);
-    const profile = (await (await call(session, 'GET', '/principals/me')).json()) as CurrentUserProfile;
-    const cursor = event.url.searchParams.get('after');
-    const keys = (await (await call(session, 'GET', keysPath(profile.principal_id, cursor))).json()) as CredentialList;
+    // The session already names its principal, so the key page does not wait for the profile.
+    const read = async <T>(path: string) => (await (await call(session, 'GET', path)).json()) as T;
+    const [profile, keys] = await Promise.all([
+      read<CurrentUserProfile>('/principals/me'),
+      read<CredentialList>(keysPath(session.principalId, event.url.searchParams.get('after')))
+    ]);
     return { profile, keys, problem: null };
   } catch (cause) {
     if (!isHttpError(cause)) throw cause;

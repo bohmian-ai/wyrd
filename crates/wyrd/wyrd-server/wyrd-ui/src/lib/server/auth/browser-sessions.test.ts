@@ -2,6 +2,7 @@
 import { afterEach, expect, test, vi } from 'vitest';
 import type { Cookies } from '@sveltejs/kit';
 import { BrowserSessions } from './browser-sessions';
+import { load as loadTenantLayout } from '../../../routes/t/[tenantKey]/+layout.server';
 
 vi.mock('$env/dynamic/private', () => ({
   env: { WYRD_SERVER_URL: 'http://127.0.0.1:8080' }
@@ -233,4 +234,35 @@ test('metadata requires current live enumeration', async () => {
   });
   expect(sibling.values.has('wyrd_session_acme')).toBe(false);
   expect(sibling.values.get('wyrd_session_beta')).toBe('b.2');
+});
+
+test('the tenant layout enumerates sessions without depending on the URL, so client navigation does not repeat it', async () => {
+  const browser = jar({ wyrd_session_acme: 'a.1' });
+  server(() => Response.json({ sessions: [view] }));
+  const browserSession = (await new BrowserSessions().read('acme', url, browser.cookies))!;
+  const requests = server(() => Response.json({ sessions: [view] }));
+  // SvelteKit reruns a load on navigation when it reads the URL outside `untrack`.
+  let untracked = false;
+  const tracked: string[] = [];
+  const watched = new Proxy(url, {
+    get: (target, key) => {
+      if (!untracked) tracked.push(String(key));
+      const value = Reflect.get(target, key);
+      return typeof value === 'function' ? value.bind(target) : value;
+    }
+  });
+  const untrack = <T>(fn: () => T): T => {
+    untracked = true;
+    try {
+      return fn();
+    } finally {
+      untracked = false;
+    }
+  };
+
+  const data = await loadTenantLayout({ locals: { session: null, browserSession, tenant: browserSession.context() }, cookies: browser.cookies, url: watched, untrack } as never);
+
+  expect(data).toMatchObject({ tenant: { key: 'acme', name: 'Acme' }, session: { tenants: [{ key: 'acme', name: 'Acme' }] } });
+  expect(requests).toHaveLength(1);
+  expect(tracked).toEqual([]);
 });

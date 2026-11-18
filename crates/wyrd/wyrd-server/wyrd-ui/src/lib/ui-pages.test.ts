@@ -499,7 +499,7 @@ test('every histogram series apart is labelled from the series index, plotted id
 import { fireEvent, render, waitFor, within } from '@testing-library/svelte';
 import { vi } from 'vitest';
 import { goto, invalidate, invalidateAll } from '$app/navigation';
-import { EXECUTIONS, fixtureExecutor, SERVICE, stateExecutors, VERIFIER, VERIFIER_UIDS, verifiers } from '$lib/ui-fixtures';
+import { EXECUTIONS, fixtureExecutor, PROMPT, SERVICE, stateExecutors, VERIFIER, VERIFIER_UIDS, verifiers } from '$lib/ui-fixtures';
 import { readExecution, writeExecution } from '$lib/verify-host';
 import { load as loadExecutionPage } from '../routes/t/[tenantKey]/verify/executions/[executionId]/+page.server';
 import ExecutionPage from '../routes/t/[tenantKey]/verify/executions/[executionId]/+page.svelte';
@@ -513,6 +513,24 @@ import { load as loadObserve } from '../routes/t/[tenantKey]/observe/+layout.ser
 const host = vi.hoisted(() => ({ executor: undefined as Executor | undefined }));
 vi.mock('wyrd-ai-ui/node', () => ({ nodeExecutor: () => host.executor }));
 vi.mock('$app/navigation', () => ({ goto: vi.fn(async () => {}), invalidate: vi.fn(async () => {}), invalidateAll: vi.fn(async () => {}) }));
+
+test('a Card page reads its Card once and lists its versions once, whichever panels its tab shows', async () => {
+  const requests: WireRequest[] = [];
+  host.executor = { run: (batch, signal) => (requests.push(...batch), fixtureExecutor.run(batch, signal)) };
+  const open = async (ref: { kind: string; name: string; version: string }) => {
+    requests.length = 0;
+    const url = new URL(`http://ui.test/t/acme/cards/detail?${new URLSearchParams(ref)}`);
+    await loadCardDetail({ locals: { browserSession: { client: () => ({}) } }, url, request: new Request(url) } as never);
+    const own = (request: WireRequest) => 'card_ref' in request && request.card_ref.name === ref.name && request.card_ref.version === ref.version;
+    return {
+      cardReads: requests.filter((request) => request.op === 'cards.get_by_ref' && own(request)).length,
+      versionListings: requests.filter((request) => request.op === 'cards.list' && request.name === ref.name).length
+    };
+  };
+  for (const ref of [SERVICE, PROMPT, { kind: 'Verifier', name: 'ticket-policy', version: '1.1.0' }]) {
+    expect(await open(ref), `${ref.kind} ${ref.name}@${ref.version}`).toEqual({ cardReads: 1, versionListings: 1 });
+  }
+});
 
 test('an exact Verifier Card page shows its definition, versions and where it runs', async () => {
   const requests: WireRequest[] = [];
@@ -905,6 +923,8 @@ test('the Verify dashboard reads one population and keeps its investigation in t
 
 import { readIndex, repositoryHref, writeIndex } from '$lib/repositories-host';
 import { load as loadRepositories } from '../routes/t/[tenantKey]/repositories/+page.server';
+import { load as loadAccount } from '../routes/t/[tenantKey]/settings/account/+page.server';
+import type { RepositoryIndexProps } from 'wyrd-ai-ui/loaders';
 import RepositoriesPage from '../routes/t/[tenantKey]/repositories/+page.svelte';
 import { load as loadRepository } from '../routes/t/[tenantKey]/repositories/[name]/+page.server';
 import RepositoryPage from '../routes/t/[tenantKey]/repositories/[name]/+page.svelte';
@@ -988,6 +1008,24 @@ test('Live refreshes the dashboard one load at a time', async () => {
   } finally {
     vi.useRealTimers();
   }
+});
+
+test('the Repositories index lists its Cards without waiting for the GitHub connection', async () => {
+  let connected = false;
+  const listedBefore: boolean[] = [];
+  host.executor = {
+    run: async (batch, signal) => {
+      if (batch.some((request) => request.op === 'cards.list')) listedBefore.push(!connected);
+      const answers = await fixtureExecutor.run(batch, signal);
+      if (batch.some((request) => request.op === 'github.get_connection')) await new Promise((settle) => setTimeout(settle, 10)).then(() => (connected = true));
+      return answers;
+    }
+  };
+  const url = new URL('http://ui.test/t/acme/repositories');
+  const data = (await loadRepositories({ locals: { browserSession: { client: () => ({}) } }, params: { tenantKey: 'acme' }, url, request: new Request(url) } as never)) as { index: RepositoryIndexProps };
+
+  expect(data.index.result.state).toBe('populated');
+  expect(listedBefore[0]).toBe(true);
 });
 
 test('the Repositories workspace keeps its index state, opens exact versions and leads to the connection', async () => {
@@ -1083,6 +1121,26 @@ test('the Repositories workspace keeps its index state, opens exact versions and
   const foreign = await undeclared('999');
   expect(foreign.container).toHaveTextContent('WYRD_SPEC_404_NOT_FOUND');
   expect(foreign.container.textContent).not.toMatch(/acme\/\w/);
+});
+
+test('account settings reads the profile and the own key page at once, for the session principal', async () => {
+  const requested: string[] = [];
+  let profiled = false;
+  const browserSession = {
+    principalId: 'p-1',
+    api: async (_method: string, path: string) => {
+      requested.push(`${path} (profile answered: ${profiled})`);
+      if (path !== '/principals/me') return Response.json({ items: [], next_cursor: null });
+      await new Promise((settle) => setTimeout(settle, 10));
+      profiled = true;
+      return Response.json({ principal_id: 'p-1' });
+    }
+  };
+  const url = new URL('http://ui.test/t/acme/settings/account?after=k-9');
+  const data = await loadAccount({ locals: { browserSession }, url } as never);
+
+  expect(data).toMatchObject({ profile: { principal_id: 'p-1' }, keys: { items: [] }, problem: null });
+  expect(requested).toEqual(['/principals/me (profile answered: false)', '/principals/p-1/credentials?limit=50&cursor=k-9 (profile answered: false)']);
 });
 
 test('Settings connects and disconnects GitHub once through the host and reads state back', async () => {

@@ -29,6 +29,7 @@ import {
   type TraceWaterfallProps
 } from './observe.js';
 import {
+  readCard,
   listVersions,
   loadArtifactTable,
   loadCardFacts,
@@ -240,9 +241,9 @@ export async function loadChart(input: ChartInput, context: LoadContext): Promis
  * with its own versions state.
  */
 export async function loadCardHeader(input: CardHeaderInput, context: LoadContext): Promise<CardHeaderProps> {
-  const [read] = await context.executor.run([{ op: 'cards.get_by_ref', card_ref: input.cardRef }], context.signal);
-  if (!read.ok) return { input, result: failed(read.problem) };
-  const card = read.value;
+  const read = await readCard(input.cardRef, context);
+  if (read.state !== 'populated') return { input, result: read };
+  const card = read.data;
   const versions = await listVersions(card, context);
   return { input, result: { state: 'populated', data: { card, versions } } };
 }

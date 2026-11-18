@@ -6,6 +6,7 @@
  */
 import type { CardTypes } from 'wyrd-ai';
 import { failed, wyrdProblem, type CardRef, type Executor, type Loaded } from './contract.js';
+import { readCard } from './cards.js';
 
 type VerifierSpec = CardTypes.VerifierSpec;
 type Requirement = CardTypes.Requirement;
@@ -205,11 +206,11 @@ type Read<T> = Extract<Loaded<T>, { state: 'populated' | 'denied' | 'error' }>;
 
 /** Read one exact Card and refuse any kind but Verifier. */
 async function readVerifier(ref: CardRef, context: Context) {
-  const [read] = await context.executor.run([{ op: 'cards.get_by_ref', card_ref: ref }], context.signal);
-  if (!read.ok) return failed(read.problem);
-  if (read.value.kind !== 'Verifier')
-    return { state: 'error' as const, problem: wyrdProblem('validation', `${ref.name}@${ref.version} is a ${read.value.kind} Card, not a Verifier`) };
-  return { state: 'populated' as const, data: read.value };
+  const read = await readCard(ref, context);
+  if (read.state !== 'populated') return read;
+  if (read.data.kind !== 'Verifier')
+    return { state: 'error' as const, problem: wyrdProblem('validation', `${ref.name}@${ref.version} is a ${read.data.kind} Card, not a Verifier`) };
+  return read;
 }
 
 /** Load an exact Verifier's authored definition and declared graph. */

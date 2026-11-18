@@ -54,7 +54,24 @@ const VERSION_PAGE = 100;
 const VERSION_PAGES = 5;
 
 /** Every listed version sharing `card`'s resolved kind and name, prereleases included, newest first. */
-export async function listVersions(card: RegisteredCard, context: Context): Promise<Read<CardVersions>> {
+export function listVersions(card: RegisteredCard, context: Context): Promise<Read<CardVersions>> {
+  return shared(context, `versions\n${card.kind}\n${card.metadata.name}`, () => readVersions(card, context));
+}
+
+/** Panels of one load share its context, so they share each Card read and version listing; the memo dies with the context. */
+function shared<T>(context: Context, key: string, read: () => Promise<T>): Promise<T> {
+  const memo = SHARED.get(context) ?? new Map<string, Promise<unknown>>();
+  SHARED.set(context, memo);
+  const once = (memo.get(key) as Promise<T> | undefined) ?? read();
+  memo.set(key, once);
+  return once;
+}
+
+/** Each load context's Card reads and version listings, by request. */
+const SHARED = new WeakMap<Context, Map<string, Promise<unknown>>>();
+
+/** Page through every exact version sharing `card`'s kind and name; see {@link listVersions}. */
+async function readVersions(card: RegisteredCard, context: Context): Promise<Read<CardVersions>> {
   const items: CardSummary[] = [];
   let cursor: string | null = null;
   for (let page = 0; page < VERSION_PAGES; page += 1) {
@@ -139,10 +156,12 @@ export async function loadCardInventory(input: CardInventoryInput, context: Cont
 /** A settled read: its value, or the refusal or failure that replaced it. */
 type Read<T> = Extract<Loaded<T>, { state: 'populated' | 'denied' | 'error' }>;
 
-/** Read one exact Card. */
-async function readCard(ref: CardRef, context: Context): Promise<Read<RegisteredCard>> {
-  const [read] = await context.executor.run([{ op: 'cards.get_by_ref', card_ref: ref }], context.signal);
-  return read.ok ? { state: 'populated', data: read.value } : failed(read.problem);
+/** Read one exact Card, once per load context. */
+export function readCard(ref: CardRef, context: Context): Promise<Read<RegisteredCard>> {
+  return shared(context, `card\n${ref.kind}\n${ref.name}\n${ref.version}\n${ref.uid ?? ''}`, async () => {
+    const [read] = await context.executor.run([{ op: 'cards.get_by_ref', card_ref: ref }], context.signal);
+    return read.ok ? { state: 'populated' as const, data: read.value } : failed(read.problem);
+  });
 }
 
 /** Props of `CardFacts`. */

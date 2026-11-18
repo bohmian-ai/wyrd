@@ -146,12 +146,14 @@ impl Ui {
                     ))
                 })?;
             first.get_or_insert_with(|| sent.elapsed().as_secs_f64() * 1e3);
-            answer.matches(&bound.expected, &[]).map_err(|difference| {
-                ExperimentError::workload(format!(
-                    "{} in {residence} differs from memtable: {difference}",
-                    bound.statement.id
-                ))
-            })?;
+            answer
+                .matches(&bound.expected, bound.statement.order())
+                .map_err(|difference| {
+                    ExperimentError::workload(format!(
+                        "{} in {residence} differs from memtable: {difference}",
+                        bound.statement.id
+                    ))
+                })?;
         }
         self.first_ms = first.unwrap_or_default();
         self.placed = residence;
@@ -278,7 +280,11 @@ async fn bundle(
                 admission
                     .labelled(ask(&queries, &bound.statement.sql, &bound.params))
                     .await
-                    .map(|(answer, _)| answer.matches(&bound.expected, &[]).is_ok())
+                    .map(|(answer, _)| {
+                        answer
+                            .matches(&bound.expected, bound.statement.order())
+                            .is_ok()
+                    })
             });
         }
         let mut failure = None;

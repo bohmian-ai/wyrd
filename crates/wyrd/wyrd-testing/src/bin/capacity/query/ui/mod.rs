@@ -16,6 +16,7 @@ use sha2::{Digest as _, Sha256};
 use wyrd_spec::vala::api::QueryParam;
 use wyrd_testing::experiment::{Criterion, Declaration, Metric, Op, Step, WINDOW_SECONDS};
 
+use answer::Order;
 use fixture::Journey;
 
 /// The benchmark case every ui-sql query declares to the server.
@@ -157,6 +158,48 @@ pub struct Statement {
     pub params: Vec<Value>,
 }
 
+impl Statement {
+    /// How much row order this statement's SQL decides: [`Order::Total`]
+    /// unless it is in [`TIED`].
+    #[must_use]
+    pub fn order(&self) -> Order<'static> {
+        TIED.iter()
+            .find(|(id, _)| *id == self.id)
+            .map_or(Order::Total, |(_, order)| *order)
+    }
+}
+
+/// The statements whose final `ORDER BY` leaves rows tied, and the keys it
+/// does order: per-bucket charts with several rows a bucket, grouped
+/// statements with no order, and limits that may cut a tie.
+const TIED: [(&str, Order<'static>); 13] = [
+    ("trace-counts", Order::Keys(&[])),
+    ("verify-chart-verdict", Order::Keys(&["at"])),
+    ("verify-chart-verifier", Order::Keys(&["at"])),
+    ("logs-timeline", Order::Keys(&["at"])),
+    ("metrics-chart", Order::Keys(&["at"])),
+    ("metrics-histogram", Order::Keys(&["at"])),
+    (
+        "metrics-group-keys",
+        Order::Cut {
+            keys: &[],
+            limit: 100,
+        },
+    ),
+    ("metrics-apart-chart", Order::Keys(&["at"])),
+    ("metrics-apart-histogram", Order::Keys(&["at"])),
+    ("metrics-24h-chart", Order::Keys(&["at"])),
+    ("metrics-nested-chart", Order::Keys(&["at"])),
+    (
+        "metric-points-list",
+        Order::Cut {
+            keys: &["time_unix_nano"],
+            limit: 50,
+        },
+    ),
+    ("stat-cost-buckets", Order::Keys(&["at"])),
+];
+
 impl Catalog {
     /// The parsed [`CATALOG`].
     ///
@@ -197,7 +240,7 @@ pub fn param(value: &Value) -> Result<QueryParam, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Catalog, corpus_digest, param};
+    use super::{Catalog, Order, corpus_digest, param};
 
     /// The frozen catalog parses whole: 69 statements in six families, from
     /// the pinned revision, with numeric binds kept integral.
@@ -244,5 +287,63 @@ mod tests {
             Some(vec!["trace-list".to_owned()])
         );
         assert_eq!(corpus_digest().len(), 64);
+    }
+
+    /// Each tied statement's SQL ends ordering exactly its declared keys,
+    /// under its declared limit, and the lists and buckets stay total.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a declared order disagrees with the frozen SQL.
+    #[test]
+    fn tied_statements_declare_the_order_their_sql_leaves() {
+        let catalog = Catalog::frozen().expect("catalog");
+        let order = |id: &str| {
+            catalog
+                .queries
+                .iter()
+                .find(|statement| statement.id == id)
+                .expect("statement")
+                .order()
+        };
+        assert_eq!(order("logs-timeline"), Order::Keys(&["at"]));
+        assert_eq!(
+            order("metric-points-list"),
+            Order::Cut {
+                keys: &["time_unix_nano"],
+                limit: 50
+            }
+        );
+        assert_eq!(order("trace-list"), Order::Total);
+        assert_eq!(order("stat-logs-buckets"), Order::Total);
+        for statement in &catalog.queries {
+            let (keys, limit) = match statement.order() {
+                Order::Total => continue,
+                Order::Keys(keys) => (keys, None),
+                Order::Cut { keys, limit } => (keys, Some(limit)),
+            };
+            let ending = [
+                (!keys.is_empty()).then(|| format!("ORDER BY {}", keys.join(", "))),
+                limit.map(|limit| format!("LIMIT {limit}")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" ");
+            let tail = statement
+                .sql
+                .rsplit(')')
+                .next()
+                .unwrap_or_default()
+                .replace(" DESC", "")
+                .replace(" ASC", "");
+            assert!(tail.ends_with(&ending), "{}: {tail}", statement.id);
+            assert_eq!(
+                keys.is_empty(),
+                !tail.contains("ORDER BY"),
+                "{}",
+                statement.id
+            );
+        }
     }
 }

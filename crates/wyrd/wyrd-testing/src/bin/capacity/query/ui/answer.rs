@@ -22,6 +22,26 @@ pub struct Column {
     pub metadata: BTreeMap<String, String>,
 }
 
+/// How much of an answer's row order its statement's SQL decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Order<'a> {
+    /// The `ORDER BY` decides every row's position.
+    Total,
+    /// Only the sequence of these key columns is decided: rows sharing
+    /// every key may come in any order, and with no keys the whole answer
+    /// is unordered.
+    Keys(&'a [&'a str]),
+    /// As [`Order::Keys`] under a `LIMIT` of `limit` rows: an answer
+    /// that reaches it may have cut its last run of equal keys, so that run
+    /// may hold any of the rows sharing its keys.
+    Cut {
+        /// The key columns.
+        keys: &'a [&'a str],
+        /// The statement's `LIMIT`.
+        limit: usize,
+    },
+}
+
 /// A whole query answer in row order: its columns and each cell's typed
 /// value as Arrow displays it, `None` for null.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,14 +110,14 @@ impl Answer {
     }
 
     /// Checks this answer against `expected`: the same columns and types,
-    /// the same row count, and every cell equal except in `approximate`
-    /// columns, whose numeric values must lie within their relative
-    /// tolerance of the expected value, with nulls matching exactly.
+    /// the same row count, and every cell equal, in the row order `order`
+    /// says the statement decides: rows sharing their keys compare as a
+    /// multiset, and a cut last run compares only its keys.
     ///
     /// # Errors
     ///
     /// Returns the first difference, named by column and row.
-    pub fn matches(&self, expected: &Self, approximate: &[(&str, f64)]) -> Result<(), String> {
+    pub fn matches(&self, expected: &Self, order: Order<'_>) -> Result<(), String> {
         fn shape(answer: &Answer) -> Vec<(&str, &str)> {
             answer
                 .columns
@@ -127,37 +147,82 @@ impl Answer {
                 expected.rows.len()
             ));
         }
-        for (index, (row, wanted)) in self.rows.iter().zip(&expected.rows).enumerate() {
-            if row.len() != self.columns.len() || wanted.len() != self.columns.len() {
-                return Err(format!(
-                    "row {index} holds {} cells, expected {} of {} columns",
-                    row.len(),
-                    wanted.len(),
-                    self.columns.len()
-                ));
+        let width = self.columns.len();
+        if let Some(row) = self
+            .rows
+            .iter()
+            .chain(&expected.rows)
+            .find(|row| row.len() != width)
+        {
+            return Err(format!(
+                "a row holds {} cells, expected {width} columns",
+                row.len()
+            ));
+        }
+        let keys = match order {
+            Order::Total => return self.same_rows(&self.rows, &expected.rows, 0),
+            Order::Keys(keys) | Order::Cut { keys, .. } => keys
+                .iter()
+                .map(|key| {
+                    self.position(key)
+                        .ok_or_else(|| format!("no key column `{key}`"))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        let key =
+            |row: &[Option<String>]| keys.iter().map(|at| row[*at].clone()).collect::<Vec<_>>();
+        if let Some(index) = (0..self.rows.len())
+            .find(|index| key(&self.rows[*index]) != key(&expected.rows[*index]))
+        {
+            return Err(format!(
+                "row {index} keys {:?}, expected {:?}",
+                key(&self.rows[index]),
+                key(&expected.rows[index])
+            ));
+        }
+        let mut start = 0;
+        while start < expected.rows.len() {
+            let run = key(&expected.rows[start]);
+            let end = (start..expected.rows.len())
+                .find(|index| key(&expected.rows[*index]) != run)
+                .unwrap_or(expected.rows.len());
+            let cut = matches!(order, Order::Cut { limit, .. } if limit == expected.rows.len());
+            if !(cut && end == expected.rows.len()) {
+                let mut actual = self.rows[start..end].to_vec();
+                let mut wanted = expected.rows[start..end].to_vec();
+                actual.sort();
+                wanted.sort();
+                self.same_rows(&actual, &wanted, start)?;
             }
-            for ((cell, want), column) in row.iter().zip(wanted).zip(&self.columns) {
-                let tolerance = approximate
-                    .iter()
-                    .find(|(name, _)| *name == column.name)
-                    .map(|(_, tolerance)| *tolerance);
-                let equal = match (cell, want, tolerance) {
-                    (Some(cell), Some(want), Some(tolerance)) => {
-                        match (cell.parse::<f64>(), want.parse::<f64>()) {
-                            (Ok(cell), Ok(want)) => {
-                                (cell - want).abs() <= tolerance * want.abs().max(f64::MIN_POSITIVE)
-                            }
-                            _ => false,
-                        }
-                    }
-                    _ => cell == want,
-                };
-                if !equal {
-                    return Err(format!(
-                        "row {index} column `{}`: {cell:?}, expected {want:?}",
-                        column.name
-                    ));
-                }
+            start = end;
+        }
+        Ok(())
+    }
+
+    /// Checks `actual` against `wanted` row by row and cell by cell,
+    /// naming a difference by its row offset from `first` and its column.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first differing cell.
+    fn same_rows(
+        &self,
+        actual: &[Vec<Option<String>>],
+        wanted: &[Vec<Option<String>>],
+        first: usize,
+    ) -> Result<(), String> {
+        for (index, (row, want)) in actual.iter().zip(wanted).enumerate() {
+            if let Some(((cell, want), column)) = row
+                .iter()
+                .zip(want)
+                .zip(&self.columns)
+                .find(|((cell, want), _)| cell != want)
+            {
+                return Err(format!(
+                    "row {} column `{}`: {cell:?}, expected {want:?}",
+                    first + index,
+                    column.name
+                ));
             }
         }
         Ok(())
@@ -175,7 +240,7 @@ mod tests {
     };
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 
-    use super::Answer;
+    use super::{Answer, Column, Order};
 
     /// A two-row answer of a string ID, a UTC timestamp, a decimal, and a
     /// nullable count, with `row` deciding the second row's values.
@@ -205,8 +270,7 @@ mod tests {
     }
 
     /// Identical typed answers match; a different string, timestamp,
-    /// decimal, null, type, or row count each fail, and an approximate
-    /// column passes only within its tolerance.
+    /// decimal, null, type, or row count each fail.
     ///
     /// # Panics
     ///
@@ -214,7 +278,10 @@ mod tests {
     #[test]
     fn typed_answers_compare_ids_timestamps_decimals_and_nulls() {
         let expected = answer("0b", 2, 7, None);
-        assert_eq!(answer("0b", 2, 7, None).matches(&expected, &[]), Ok(()));
+        assert_eq!(
+            answer("0b", 2, 7, None).matches(&expected, Order::Total),
+            Ok(())
+        );
         assert_eq!(
             expected.column("cost"),
             vec![Some("0.000000000005"), Some("0.000000000007")]
@@ -225,21 +292,107 @@ mod tests {
             answer("0b", 2, 8, None),
             answer("0b", 2, 7, Some(0)),
         ] {
-            assert!(wrong.matches(&expected, &[]).is_err(), "{wrong:?}");
+            assert!(wrong.matches(&expected, Order::Total).is_err(), "{wrong:?}");
         }
         let mut retyped = expected.clone();
         retyped.columns[3].data_type = DataType::Int32.to_string();
-        assert!(retyped.matches(&expected, &[]).is_err());
+        assert!(retyped.matches(&expected, Order::Total).is_err());
         let mut short = expected.clone();
         short.rows.pop();
-        assert!(short.matches(&expected, &[]).is_err());
+        assert!(short.matches(&expected, Order::Total).is_err());
         let mut narrow = expected.clone();
         narrow.rows[1].pop();
-        assert!(narrow.matches(&expected, &[]).is_err());
-        assert!(expected.matches(&narrow, &[]).is_err());
-        let mut near = expected.clone();
-        near.rows[0][3] = Some("1.04".to_owned());
-        assert!(near.matches(&expected, &[("n", 0.05)]).is_ok());
-        assert!(near.matches(&expected, &[("n", 0.01)]).is_err());
+        assert!(narrow.matches(&expected, Order::Total).is_err());
+        assert!(expected.matches(&narrow, Order::Total).is_err());
+    }
+
+    /// An answer of `at`, `level` and `n` columns holding `rows`.
+    fn timeline(rows: &[(&str, &str, &str)]) -> Answer {
+        Answer {
+            columns: ["at", "level", "n"]
+                .map(|name| Column {
+                    name: name.to_owned(),
+                    data_type: "Utf8".to_owned(),
+                    metadata: std::collections::BTreeMap::new(),
+                })
+                .to_vec(),
+            rows: rows
+                .iter()
+                .map(|(at, level, n)| {
+                    vec![
+                        Some((*at).to_owned()),
+                        Some((*level).to_owned()),
+                        Some((*n).to_owned()),
+                    ]
+                })
+                .collect(),
+        }
+    }
+
+    /// Rows sharing their keys may come in any order, but keys keep their
+    /// sequence and every row's cells must still match; with no keys the
+    /// whole answer is a multiset; a last run cut at the limit need only keep
+    /// its keys, while one short of the limit is whole.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the checker accepts a wrong answer or refuses a right one.
+    #[test]
+    fn ties_compare_as_multisets_within_their_keys() {
+        let expected = timeline(&[("1", "info", "4"), ("1", "error", "2"), ("2", "info", "3")]);
+        let swapped = timeline(&[("1", "error", "2"), ("1", "info", "4"), ("2", "info", "3")]);
+        assert!(swapped.matches(&expected, Order::Total).is_err());
+        assert_eq!(swapped.matches(&expected, Order::Keys(&["at"])), Ok(()));
+        let crossed = timeline(&[("2", "info", "3"), ("1", "error", "2"), ("1", "info", "4")]);
+        assert!(crossed.matches(&expected, Order::Keys(&["at"])).is_err());
+        assert_eq!(crossed.matches(&expected, Order::Keys(&[])), Ok(()));
+        let miscounted = timeline(&[("1", "error", "2"), ("1", "info", "5"), ("2", "info", "3")]);
+        assert!(miscounted.matches(&expected, Order::Keys(&["at"])).is_err());
+        assert!(miscounted.matches(&expected, Order::Keys(&[])).is_err());
+        let cut = timeline(&[("1", "info", "4"), ("1", "error", "2"), ("2", "warn", "9")]);
+        assert_eq!(
+            cut.matches(
+                &expected,
+                Order::Cut {
+                    keys: &["at"],
+                    limit: 3
+                }
+            ),
+            Ok(())
+        );
+        assert!(cut.matches(&expected, Order::Keys(&["at"])).is_err());
+        assert!(
+            cut.matches(
+                &expected,
+                Order::Cut {
+                    keys: &["at"],
+                    limit: 4
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            miscounted
+                .matches(
+                    &expected,
+                    Order::Cut {
+                        keys: &["at"],
+                        limit: 3
+                    }
+                )
+                .is_err()
+        );
+        let rekeyed = timeline(&[("1", "info", "4"), ("1", "error", "2"), ("3", "info", "3")]);
+        assert!(
+            rekeyed
+                .matches(
+                    &expected,
+                    Order::Cut {
+                        keys: &["at"],
+                        limit: 3
+                    }
+                )
+                .is_err()
+        );
     }
 }

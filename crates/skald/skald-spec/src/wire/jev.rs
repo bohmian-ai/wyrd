@@ -115,7 +115,8 @@ pub enum JevAnswer {
     },
     /// Answer to a `score` question.
     Score {
-        /// Expected level on the scale, normalized from 0 to 1.
+        /// Expected level index on the question's scale, from 0 to N-1 for
+        /// its N levels; possibly fractional, never normalized.
         score: f64,
         /// Level index, as a decimal string, to its description.
         legend: BTreeMap<String, String>,

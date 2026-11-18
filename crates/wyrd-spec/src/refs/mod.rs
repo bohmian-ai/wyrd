@@ -368,7 +368,7 @@ where
     for (i, requirement) in requirements.iter_mut().enumerate() {
         let prefix = format!("{prefix}[{i}].check");
         match &mut requirement.check {
-            Check::Agent(call) => visit_agent_call(call, &prefix, f),
+            Check::Agent(check) => visit_agent_call(&mut check.call, &prefix, f),
             Check::Code(check) => visit_code_call(&mut check.call, &prefix, f),
             Check::Drift(drift) => drift.spec.visit_at(&prefix, f),
             Check::Assert { .. } | Check::Trace(_) => {}
@@ -738,11 +738,14 @@ mod completeness_tests {
             requirements: vec![Requirement {
                 id: TaskId::new("judge").expect("fixture requirement id is valid"),
                 statement: "The answer is grounded.".to_owned(),
-                check: Check::Agent(AgentCall {
-                    agent: InlineableRef::Inline(Box::new(agent())),
-                    inputs: BTreeMap::new(),
-                    workspace: BTreeMap::new(),
-                }),
+                check: Check::Agent(
+                    AgentCall {
+                        agent: InlineableRef::Inline(Box::new(agent())),
+                        inputs: BTreeMap::new(),
+                        workspace: BTreeMap::new(),
+                    }
+                    .into(),
+                ),
             }],
             decide: Decide::All,
             context_capture: None,

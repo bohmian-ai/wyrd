@@ -367,7 +367,7 @@ async fn check(
     inputs: BTreeMap<String, CallInput>,
 ) -> Result<vala_verify::blocks::CheckOutput, BlockError> {
     let id = tid("grounded");
-    let block = Check::Agent(call.clone());
+    let block = Check::Agent(call.clone().into());
     let calls = ToolCallsOwner::default();
     let output = CheckExecutor::execute(
         executor,
@@ -1126,7 +1126,7 @@ async fn check_agent_reads_its_workspace_through_declared_tools() {
     .with_toolset(Arc::new(FixedToolset))
     .with_evidence(Arc::new(PinnedDeck));
     let id = tid("grounded");
-    let block = Check::Agent(agent(verdict_prompt(), &["fs.read"]));
+    let block = Check::Agent(agent(verdict_prompt(), &["fs.read"]).into());
     let calls = ToolCallsOwner::default();
     let output = CheckExecutor::execute(
         &executor,
@@ -1509,7 +1509,7 @@ async fn agent_records_survive_failed_steps_and_inconclusive_checks() {
     if let InlineableRef::Inline(spec) = &mut judge.agent {
         spec.tool_names = vec!["fs.read".to_owned()];
     }
-    let check = bound(Check::Agent(iterations(judge, 2)));
+    let check = bound(Check::Agent(iterations(judge, 2).into()));
     let outcome = run_engine(
         executor,
         json!({
@@ -3116,7 +3116,7 @@ async fn agent_check_settles_before_result() {
             executor,
             json!({
                 "inputs": {"document": {"type": "json"}},
-                "requirements": [{"id": "grounded", "statement": "Grounded", "check": bound(Check::Agent(judge))}]
+                "requirements": [{"id": "grounded", "statement": "Grounded", "check": bound(Check::Agent(judge.into()))}]
             }),
         ));
         tokio::select! {

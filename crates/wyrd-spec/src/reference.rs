@@ -1179,11 +1179,14 @@ mod tests {
             requirements: vec![Requirement {
                 id: TaskId::new("judge").expect("fixture requirement id is valid"),
                 statement: "The answer is grounded.".to_owned(),
-                check: Check::Agent(AgentCall {
-                    agent,
-                    inputs: BTreeMap::new(),
-                    workspace: BTreeMap::new(),
-                }),
+                check: Check::Agent(
+                    AgentCall {
+                        agent,
+                        inputs: BTreeMap::new(),
+                        workspace: BTreeMap::new(),
+                    }
+                    .into(),
+                ),
             }],
             decide: Decide::All,
             context_capture: None,

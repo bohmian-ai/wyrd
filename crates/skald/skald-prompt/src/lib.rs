@@ -29,8 +29,9 @@ pub mod response_format;
 pub mod settings;
 
 pub use builder::{
-    AnthropicOptions, GeminiOptions, OpenAiChatOptions, OpenAiResponsesOptions, VertexOptions,
-    anthropic, gemini, openai_chat, openai_responses, vertex,
+    AnthropicOptions, ChoiceQuestion, DecisionQuestion, GeminiOptions, JevPromptOptions,
+    NoulCriteria, NoulQuestion, OpenAiChatOptions, OpenAiResponsesOptions, ScoreQuestion,
+    VertexOptions, anthropic, gemini, jev, openai_chat, openai_responses, vertex,
 };
 pub use error::{PromptBuilderError, PromptBuilderResult};
 pub use media::{MAX_MEDIA_FILE_BYTES, PyMediaRef, document_path, image_path};

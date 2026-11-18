@@ -97,6 +97,32 @@ that proof rather than manufacturing a RED result.
    the absent authoring/transform path or existing non-Verdict refusal, not a
    disconnected decoder assertion. This is a tier-1 Rust SDK journey.
 
+   Evidence:
+   - Journey: `sdks/wyrd-sdk-rust/tests/integration/gateway_jev.rs::jev_choice_check_becomes_the_verdict`.
+     It covers `Prompt::jev`, `ChoiceQuestion`, `Check::agent(..).verdict_transform(VerdictTransform::Choice(..))`,
+     the `jev` deployment and the wiremock `/v1/systemone` mock. It asserts passed, failed and
+     inconclusive requirement and execution verdicts, the exact reason, empty citations, one upstream
+     call per verification, and the exact upstream body (literal quoted/newline state, lowered question,
+     `jev-latest` model).
+   - Command: `scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(=gateway_jev::jev_choice_check_becomes_the_verdict)'"`
+     (after `mise run build:server`).
+   - RED 1 (missing authoring path): compile errors `unresolved imports wyrd_ai::verify::{ChoiceQuestion,
+     ChoiceTransform, JevPromptOptions, VerdictTransform}` and `no method named verdict_transform`.
+   - RED 2 (existing non-Verdict refusal): requirement `Inconclusive` with reason
+     "the check Agent returned no structured Verdict". Declaration accepted the sibling Agent because
+     validation resolves only inline Agents; scenario 4 owns that gap.
+   - GREEN: `1 test run: 1 passed`.
+   - Owner tests: `skald-prompt builder::builder_tests::{jev_typed_questions_lower_to_native_questions,
+     jev_prompt_refuses_documented_bounds}` and `vala-verify blocks::transform::tests::*` (4) pass.
+     Run with `mise exec -- cargo nextest run --locked -p <crate> --lib -E 'test(/.../)'`.
+     Non-Postgres suites of wyrd-spec, vala-verify, skald-prompt, skald-spec and wyrd-client: 1366 passed.
+     Clippy `-D warnings` is clean on the touched crates.
+   - Reused seam tests pass. The task's first selector names a stale module; the test lives at
+     `prompt::prompt_render::jev_state_renders_quotes_and_newlines_verbatim`.
+   - Allocation: Vala shares the run's existing `Arc<ProviderResponse>` and serializes only the one
+     selected answer for `actual`. `Prompt::jev` validates Jev bounds once at construction through the
+     gateway's borrowed view. That costs one `to_value` of the authored request, at authoring time only.
+
 2. **Public typed authoring survives declaration** — REQ-001–002, REQ-005,
    REQ-013; J1/J8. Repeat the connected Choice workflow through public Python
    and TypeScript imports, with direct Pydantic models and actual TypeScript

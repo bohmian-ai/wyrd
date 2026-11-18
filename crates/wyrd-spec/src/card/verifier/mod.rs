@@ -36,11 +36,15 @@ pub mod extract;
 pub mod pull_request;
 pub mod reference;
 mod schema_path;
+pub mod transform;
 mod validate;
 
 pub use reference::{
     OrderBy, PathSegment, Reference, ReferenceError, ReferenceRoot, SourceField, SourceReference,
     SourceText, VerdictField,
+};
+pub use transform::{
+    AgentCheck, ChoiceTransform, ProbabilityTransform, ScoreTransform, VerdictTransform,
 };
 pub use validate::ResolvedAgent;
 
@@ -128,8 +132,8 @@ impl VerifierSpec {
             calls: &mut Vec<(String, &'a AgentCall)>,
         ) {
             for (i, requirement) in requirements.iter().enumerate() {
-                if let Check::Agent(call) = &requirement.check {
-                    calls.push((format!("{prefix}[{i}].check"), call));
+                if let Check::Agent(check) = &requirement.check {
+                    calls.push((format!("{prefix}[{i}].check"), &check.call));
                 }
             }
         }
@@ -841,9 +845,10 @@ pub enum Check<F: PromptForm = Compiled> {
     },
     /// Trace assertion over a trace slot.
     Trace(TraceCheck),
-    /// An Agent, with any tools it declares, returning the Verdict schema.
-    #[cfg_attr(feature = "server", schema(value_type = AgentCall))]
-    Agent(AgentCall<F>),
+    /// An Agent, with any tools it declares, returning the Verdict schema
+    /// or a fixed decision answer its `verdict_transform` converts.
+    #[cfg_attr(feature = "server", schema(value_type = AgentCheck))]
+    Agent(AgentCheck<F>),
     /// Sandboxed code returning the Verdict schema.
     Code(CodeCheck),
     /// Statistical drift over a samples slot.

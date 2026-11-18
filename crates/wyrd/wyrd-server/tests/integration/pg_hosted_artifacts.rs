@@ -1178,7 +1178,7 @@ async fn recovered_authority_bounds_every_agent_tool() {
         "the caught denial is the safe problem with no rows, and the repair succeeds"
     );
 
-    let check = Check::Agent(reviewer(&[]));
+    let check = Check::Agent(reviewer(&[]).into());
     let checked = ToolCallsOwner::default();
     let verdict = CheckExecutor::execute(
         executor,

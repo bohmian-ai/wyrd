@@ -36,8 +36,8 @@ use tokio::time::{Instant, timeout_at};
 
 use wyrd_spec::card::verifier::pull_request::{Extractor, PULL_REQUEST_SOURCE};
 use wyrd_spec::card::verifier::{
-    Action, AgentCall, ArtifactSelection, Check, Condition, Decide, DependsOn, InputSlot,
-    Requirement, Step, TraceCheck, VerifierSpec, WorkspaceSource,
+    Action, AgentCall, AgentCheck, ArtifactSelection, Check, Condition, Decide, DependsOn,
+    InputSlot, Requirement, Step, TraceCheck, VerifierSpec, WorkspaceSource,
 };
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::SlotName;
@@ -2485,7 +2485,7 @@ fn check_bindings(
             scope.resolve_all(path.iter().chain(each).map(|path| ("value", path)), current)
         }
         Check::Trace(trace) => scope.resolve_all([("on", &trace.on)], current),
-        Check::Agent(call) => {
+        Check::Agent(AgentCheck { call, .. }) => {
             let (inputs, workspace) = (
                 scope.resolve_all(&call.inputs, current),
                 mount(scope, attached, &call.workspace, current),
@@ -2572,7 +2572,7 @@ fn fixed_selections(spec: &VerifierSpec) -> impl Iterator<Item = &ArtifactSelect
         }
     }
     for requirement in requirements {
-        if let Check::Agent(call) = &requirement.check {
+        if let Check::Agent(AgentCheck { call, .. }) = &requirement.check {
             calls.push(call);
         }
     }

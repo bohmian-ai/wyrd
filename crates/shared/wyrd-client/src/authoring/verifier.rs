@@ -390,7 +390,8 @@ impl Check {
         )
     }
 
-    /// Judge with `agent`, which returns the Verdict schema.
+    /// Judge with `agent`, which returns the Verdict schema, or a fixed
+    /// decision answer that [`Check::verdict_transform`] converts.
     pub fn agent(agent: impl Into<FieldValue>) -> Self {
         Self::of("agent", [("agent", agent.into())])
     }
@@ -423,6 +424,7 @@ fields!(Check [body] {
     map workspace, add_workspace: FieldValue = "workspace";
     one runtime: Value = "runtime";
     one response_format: Value = "response_format";
+    one verdict_transform: FieldValue = "verdict_transform";
 });
 
 impl From<Check> for FieldValue {

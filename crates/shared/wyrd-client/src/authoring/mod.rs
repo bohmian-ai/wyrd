@@ -244,6 +244,7 @@ canonical_values!(
     wyrd_spec::ExecutionRoute,
     wyrd_spec::AgentRunConfigSpec,
     wyrd_spec::verification::ComparisonOperator,
+    wyrd_spec::card::verifier::VerdictTransform,
 );
 
 impl From<skald_prompt::Prompt> for FieldValue {

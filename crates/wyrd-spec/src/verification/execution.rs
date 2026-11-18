@@ -2198,7 +2198,9 @@ mod tests {
             let details: VerificationDetails =
                 serde_json::from_value(record.clone()).expect("details decode as recorded");
             assert_eq!(serde_json::to_value(&details).expect("serialize"), record);
-            let Check::Agent(call) = &details.outcome.requirements[0].check else {
+            let Check::Agent(crate::card::verifier::AgentCheck { call, .. }) =
+                &details.outcome.requirements[0].check
+            else {
                 panic!("an Agent check stays an Agent check");
             };
             assert_eq!(

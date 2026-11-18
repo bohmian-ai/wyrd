@@ -64,11 +64,19 @@ pub use crate::authoring::{
     LocalArtifact, Mcp, Model, Operator, Requirement, Service, Step, Table, Trigger, Verifier,
 };
 pub use skald_prompt::{
-    AnthropicOptions, GeminiOptions, OpenAiChatOptions, OpenAiResponsesOptions, Prompt,
-    PromptBuilderError, ResponseFormat, ResponseFormatKind, VertexOptions, anthropic, gemini,
-    openai_chat, openai_responses, vertex,
+    AnthropicOptions, ChoiceQuestion, DecisionQuestion, GeminiOptions, JevPromptOptions,
+    NoulCriteria, NoulQuestion, OpenAiChatOptions, OpenAiResponsesOptions, Prompt,
+    PromptBuilderError, ResponseFormat, ResponseFormatKind, ScoreQuestion, VertexOptions,
+    anthropic, gemini, jev, openai_chat, openai_responses, vertex,
 };
+/// The native Jev questions a [`JevPromptOptions`] map holds.
+pub use skald_spec::wire::jev::{JevNoulCriteria, JevQuestion};
 pub use wyrd_spec::AgentRunConfigSpec;
+/// The policies converting a fixed decision answer into an Agent check's
+/// Verdict.
+pub use wyrd_spec::card::verifier::{
+    ChoiceTransform, ProbabilityTransform, ScoreTransform, VerdictTransform,
+};
 pub use wyrd_spec::verification::ComparisonOperator;
 
 /// Time an execute response may take to arrive after the server's

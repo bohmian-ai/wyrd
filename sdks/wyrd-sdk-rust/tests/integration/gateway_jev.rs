@@ -21,9 +21,16 @@ use wyrd_ai::gateway_admin::{
     ProviderDeploymentName, ProviderId,
 };
 use wyrd_ai::operator_connections::SecretBearer;
+use wyrd_ai::state::{DeclareOptions, WyrdState};
+use wyrd_ai::verify::{
+    Agent, Check, ChoiceQuestion, ChoiceTransform, Component, InputSlot, Inputs, JevPromptOptions,
+    Prompt, Requirement, Service, VerdictTransform, Verifier,
+};
+use wyrd_ai::{RequirementOutcome, VerificationVerdict};
 use wyrd_testing::server::WyrdTestServer;
 
 use crate::support::Deployment;
+use crate::verifier_building_blocks::requirement;
 
 /// The Jev key the operator submits; only the upstream may see it.
 const JEV_KEY: &str = "jev-operator-key";
@@ -102,9 +109,11 @@ impl Jev {
             .mount(&upstream)
             .await;
         let deployment = Deployment::start_with(
-            WyrdTestServer::builder().with_gateway_provider_root_for_test(
-                upstream.uri().parse().expect("upstream URL parses"),
-            ),
+            WyrdTestServer::builder()
+                .with_verification_runtime_for_test()
+                .with_gateway_provider_root_for_test(
+                    upstream.uri().parse().expect("upstream URL parses"),
+                ),
         )
         .await;
         cli::put_provider_credential(
@@ -170,6 +179,18 @@ impl Jev {
             .expect("the Gateway answers");
         let status = response.status().as_u16();
         (status, response.json().await.expect("the reply is JSON"))
+    }
+
+    /// Answer `systemone` requests whose state contains `marker` with `body`,
+    /// ahead of the default answer.
+    async fn answer_when(&self, marker: &str, body: Value) {
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .and(body_string_contains(marker))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .with_priority(1)
+            .mount(&self.upstream)
+            .await;
     }
 
     /// Every request body the upstream received at `/v1/systemone`, with
@@ -359,4 +380,175 @@ async fn jev_refusals_relay_like_other_providers() {
     assert_eq!(reply["error"]["code"], Value::Null, "no Wyrd code: {reply}");
     assert!(!reply.to_string().contains(JEV_KEY), "{reply}");
     jev.deployment.shutdown().await;
+}
+
+/// The Choice question the refund judge asks, with the canonical outcome
+/// labels as its options.
+fn refund_question() -> ChoiceQuestion {
+    ChoiceQuestion {
+        instructions: "Does the reply promise a refund the policy does not allow?".to_owned(),
+        criteria: [
+            ("passed", "The reply makes no refund promise."),
+            ("failed", "The reply promises a refund."),
+            ("inconclusive", "The reply cannot be judged."),
+        ]
+        .into_iter()
+        .map(|(label, description)| (label.to_owned(), description.to_owned()))
+        .collect(),
+    }
+}
+
+/// Jev's answer to the refund question: `choice` with confidence 0.9.
+fn refund_answer(choice: &str) -> Value {
+    let probabilities: serde_json::Map<String, Value> = ["passed", "failed", "inconclusive"]
+        .into_iter()
+        .map(|label| {
+            (
+                label.to_owned(),
+                json!(if label == choice { 0.9 } else { 0.05 }),
+            )
+        })
+        .collect();
+    json!({
+        "model": "jev-1.13.0",
+        "answers": {"refund_policy": {
+            "type": "choice", "choice": choice, "confidence": 0.9,
+            "probabilities": probabilities,
+        }},
+        "usage": {"input_tokens": 50, "output_tokens": 5},
+    })
+}
+
+/// The `refund-judge` Agent: a Jev `system_one` Prompt asking the refund
+/// question about the bound `${context}`, routed to the `jev` deployment.
+///
+/// # Panics
+/// Panics when the Prompt does not build.
+fn refund_judge() -> Agent {
+    let prompt = Prompt::jev(
+        "jev-latest",
+        JevPromptOptions {
+            state: "${context}".to_owned(),
+            questions: [("refund_policy".to_owned(), refund_question().into())].into(),
+        },
+    )
+    .expect("the Jev prompt builds");
+    Agent::new("refund-judge", "1.0.0")
+        .prompt(prompt)
+        .execution_route(json!({"kind": "wyrd_gateway", "deployment": "jev"}))
+        .run_config(json!({"max_iterations": 1}))
+}
+
+/// `refund-promise`: one requirement judged by `judge`'s Choice answer,
+/// read through `transform`, over the `reply` slot.
+fn refund_verifier(judge: &Agent, transform: VerdictTransform) -> Verifier {
+    Verifier::new("refund-promise", "1.0.0")
+        .inputs([("reply", InputSlot::json(json!({"type": "string"})))])
+        .requirements([Requirement::new(
+            "no-refund-promise",
+            "The reply makes no refund promise the policy does not allow.",
+            Check::agent(judge.clone())
+                .inputs([("context", "inputs.reply")])
+                .verdict_transform(transform),
+        )])
+}
+
+/// A Jev Choice check authored with the public Rust Prompt and transform
+/// types judges each support reply in one upstream call: the selected
+/// `passed`, `failed`, or `inconclusive` label becomes the requirement and
+/// execution verdict, with a reason naming the answer, no citations, and no
+/// response schema or caller parser.
+///
+/// # Panics
+/// Panics when declaration or verification fails, a verdict, reason, or
+/// citation differs, or the upstream request is not the bound Jev request.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn jev_choice_check_becomes_the_verdict() {
+    let jev = Jev::start().await;
+    for (marker, choice) in [
+        ("CASE-PASS", "passed"),
+        ("CASE-FAIL", "failed"),
+        ("CASE-UNSURE", "inconclusive"),
+    ] {
+        jev.answer_when(marker, refund_answer(choice)).await;
+    }
+    let judge = refund_judge();
+    let transform = VerdictTransform::Choice(ChoiceTransform {
+        question: "refund_policy".to_owned(),
+        outcomes: None,
+    });
+    let service = Service::new("refund-desk", "1.0.0").components([Component::new(
+        "refund-judge",
+        judge.clone(),
+    )
+    .verified_by([refund_verifier(&judge, transform)])]);
+    let state = WyrdState::declare_with(
+        &service,
+        DeclareOptions {
+            client: Some(jev.deployment.admin()),
+            ..DeclareOptions::default()
+        },
+    )
+    .await
+    .expect("the Jev check declares");
+
+    for (reply, outcome, verdict) in [
+        (
+            "CASE-PASS: \"Thanks\" for asking.\nRefunds follow the policy.",
+            RequirementOutcome::Passed,
+            VerificationVerdict::Passed,
+        ),
+        (
+            "CASE-FAIL: you will get a full refund today.",
+            RequirementOutcome::Failed,
+            VerificationVerdict::Failed,
+        ),
+        (
+            "CASE-UNSURE: maybe.",
+            RequirementOutcome::Inconclusive,
+            VerificationVerdict::Inconclusive,
+        ),
+    ] {
+        let before = jev.received().await.len();
+        let result = state
+            .run_for_card("refund-judge")
+            .expect("the judge's run opens")
+            .observe()
+            .verify("refund-promise", Inputs::named([("reply", json!(reply))]))
+            .await
+            .expect("the verification executes");
+
+        let judged = requirement(&result, "no-refund-promise");
+        let choice = format!("{outcome:?}").to_lowercase();
+        assert_eq!(judged.outcome, outcome, "{reply}: {judged:#?}");
+        assert_eq!(
+            judged.reason,
+            format!("Question 'refund_policy' selected '{choice}' (confidence 0.9)."),
+        );
+        assert!(judged.citations.is_empty(), "{judged:#?}");
+        assert_eq!(result.outcome.verdict, verdict);
+        let received = jev.received().await;
+        assert_eq!(received.len(), before + 1, "one Jev call per verification");
+        assert_eq!(
+            received[before].1,
+            json!({"model": "jev-latest", "state": reply, "questions": {
+                "refund_policy": native_refund_question(),
+            }}),
+        );
+    }
+    jev.deployment.shutdown().await;
+}
+
+/// The refund question as the native Jev question it lowers to.
+fn native_refund_question() -> Value {
+    json!({
+        "type": "choice",
+        "instructions": "Does the reply promise a refund the policy does not allow?",
+        "criteria": {
+            "passed": "The reply makes no refund promise.",
+            "failed": "The reply promises a refund.",
+            "inconclusive": "The reply cannot be judged.",
+        },
+    })
 }

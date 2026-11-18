@@ -6,6 +6,7 @@ use skald_spec::wire::anthropic_messages::{
 use skald_spec::wire::google_generate::{
     GoogleContent, GoogleGenerateContentRequest, GoogleGenerateSettings, GoogleGenerationConfig,
 };
+use skald_spec::wire::jev::{JevNoulCriteria, JevQuestion, JevRequest, JevRequestView};
 use skald_spec::wire::openai_chat::{
     OpenAiChatRequest, OpenAiChatSettings, OpenAiMessageContent, OpenAiResponseFormat,
 };
@@ -15,8 +16,12 @@ use skald_spec::wire::openai_responses::{
 };
 use skald_spec::{ProviderName, ProviderRequest};
 
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+
 use crate::coerce::{checked_model, schema_object};
-use crate::error::PromptBuilderResult;
+use crate::error::{PromptBuilderError, PromptBuilderResult};
 use crate::messages::{anthropic_text_block, google_text_part};
 use crate::prompt::Prompt;
 use crate::response_format::{ResponseFormat, ResponseFormatKind};
@@ -487,6 +492,159 @@ fn google_settings(
         settings.generation_config = Some(config);
     }
     Ok(settings)
+}
+
+/// A yes/no decision question, answered with the probability that it
+/// holds.
+///
+/// A typed authoring helper shared by decision providers: each provider's
+/// constructor lowers it to that provider's native question, so the stored
+/// Prompt keeps only the native form.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NoulQuestion {
+    /// What to decide about the state.
+    pub instructions: String,
+    /// Optional descriptions of the true and false outcomes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub criteria: Option<NoulCriteria>,
+}
+
+/// Descriptions of a [`NoulQuestion`]'s two outcomes.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NoulCriteria {
+    /// When the answer is true.
+    pub true_description: String,
+    /// When the answer is false.
+    pub false_description: String,
+}
+
+/// A question choosing exactly one of named options.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChoiceQuestion {
+    /// What to choose about the state.
+    pub instructions: String,
+    /// Option name to its description; the names are the answer labels.
+    pub criteria: BTreeMap<String, String>,
+}
+
+/// A question grading on an ordered scale whose levels are indexed from
+/// zero, lowest first.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScoreQuestion {
+    /// What to grade about the state.
+    pub instructions: String,
+    /// Level descriptions, lowest first.
+    pub criteria: Vec<String>,
+}
+
+/// Any typed decision question, tagged by `type` as `noul`, `choice`, or
+/// `score`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DecisionQuestion {
+    /// A yes/no question.
+    Noul(NoulQuestion),
+    /// A choice among named options.
+    Choice(ChoiceQuestion),
+    /// A grade on an ordered scale.
+    Score(ScoreQuestion),
+}
+
+impl From<NoulQuestion> for JevQuestion {
+    /// Lowers the outcome descriptions to Jev's `{"true", "false"}` criteria.
+    fn from(question: NoulQuestion) -> Self {
+        Self::Noul {
+            instructions: question.instructions,
+            criteria: question.criteria.map(|criteria| JevNoulCriteria {
+                when_true: criteria.true_description,
+                when_false: criteria.false_description,
+            }),
+        }
+    }
+}
+
+impl From<ChoiceQuestion> for JevQuestion {
+    /// Keeps every option name and description unchanged.
+    fn from(question: ChoiceQuestion) -> Self {
+        Self::Choice {
+            instructions: question.instructions,
+            criteria: question.criteria,
+        }
+    }
+}
+
+impl From<ScoreQuestion> for JevQuestion {
+    /// Keeps the level order unchanged.
+    fn from(question: ScoreQuestion) -> Self {
+        Self::Score {
+            instructions: question.instructions,
+            criteria: question.criteria,
+        }
+    }
+}
+
+impl From<DecisionQuestion> for JevQuestion {
+    /// Lowers whichever question `question` holds.
+    fn from(question: DecisionQuestion) -> Self {
+        match question {
+            DecisionQuestion::Noul(question) => question.into(),
+            DecisionQuestion::Choice(question) => question.into(),
+            DecisionQuestion::Score(question) => question.into(),
+        }
+    }
+}
+
+/// TypeSafe Jev `system_one` constructor options.
+#[derive(Debug, Clone, Default)]
+pub struct JevPromptOptions {
+    /// The text the questions are about, usually a `${name}` placeholder
+    /// bound per call.
+    pub state: String,
+    /// Native Jev questions keyed by the name their answer returns under;
+    /// typed questions convert with `.into()`.
+    pub questions: BTreeMap<String, JevQuestion>,
+}
+
+/// Builds a native TypeSafe Jev `system_one` prompt: one fixed decision
+/// request whose answers a Verifier check's `verdict_transform` reads.
+///
+/// # Errors
+///
+/// Returns [`PromptBuilderError::EmptyModel`](crate::error::PromptBuilderError::EmptyModel) for a blank model,
+/// [`PromptBuilderError::Validation`](crate::error::PromptBuilderError::Validation) naming the member that breaks a documented Jev
+/// bound, such as no questions or too many Choice options, and
+/// [`PromptBuilderError::Skald`](crate::error::PromptBuilderError::Skald) when native Prompt construction rejects the request.
+pub fn jev(model: impl Into<String>, options: JevPromptOptions) -> PromptBuilderResult<Prompt> {
+    let model = checked_model(model)?;
+    let request = JevRequest {
+        model: model.clone(),
+        state: options.state,
+        questions: options.questions,
+    };
+    // Construction-time only: the bounds live on the borrowed view the
+    // gateway decodes, so check that same view of the built body.
+    let body = serde_json::to_value(&request)
+        .map_err(|error| PromptBuilderError::Validation(error.to_string()))?;
+    JevRequestView::deserialize(&body)
+        .map_err(|error| PromptBuilderError::Validation(error.to_string()))?
+        .validate()
+        .map_err(|error| PromptBuilderError::Validation(error.to_string()))?;
+    finalize_prompt(ProviderRequest::JevSystemOne(request), model, None)
+}
+
+impl Prompt {
+    /// Builds a native TypeSafe Jev `system_one` prompt; see [`jev`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`jev`]'s errors.
+    pub fn jev(model: impl Into<String>, options: JevPromptOptions) -> PromptBuilderResult<Self> {
+        jev(model, options)
+    }
 }
 
 #[cfg(test)]
@@ -960,6 +1118,156 @@ mod builder_tests {
         assert!(matches!(
             google_file_data_part("application/pdf", "gs://bucket/file.pdf"),
             GooglePart::FileData { .. }
+        ));
+    }
+
+    /// Typed questions lower to exactly the native Jev questions an
+    /// equivalent native map declares: Noul descriptions become
+    /// `{"true", "false"}`, omitted criteria stay omitted, Choice labels and
+    /// Score order are unchanged, and the state is kept verbatim.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the typed and native Prompts differ or do not build.
+    #[test]
+    fn jev_typed_questions_lower_to_native_questions() {
+        use std::collections::BTreeMap;
+
+        use skald_spec::wire::jev::{JevNoulCriteria, JevQuestion};
+
+        use crate::Prompt;
+        use crate::builder::{
+            ChoiceQuestion, DecisionQuestion, JevPromptOptions, NoulCriteria, NoulQuestion,
+            ScoreQuestion,
+        };
+
+        let typed: BTreeMap<String, JevQuestion> = [
+            (
+                "billing".to_owned(),
+                NoulQuestion {
+                    instructions: "About billing?".into(),
+                    criteria: Some(NoulCriteria {
+                        true_description: "A charge.".into(),
+                        false_description: "Anything else.".into(),
+                    }),
+                }
+                .into(),
+            ),
+            (
+                "plain".to_owned(),
+                DecisionQuestion::Noul(NoulQuestion {
+                    instructions: "Polite?".into(),
+                    criteria: None,
+                })
+                .into(),
+            ),
+            (
+                "team".to_owned(),
+                ChoiceQuestion {
+                    instructions: "Which team?".into(),
+                    criteria: BTreeMap::from([
+                        ("zeta".into(), "Last.".into()),
+                        ("alpha".into(), "First.".into()),
+                    ]),
+                }
+                .into(),
+            ),
+            (
+                "urgency".to_owned(),
+                ScoreQuestion {
+                    instructions: "How urgent?".into(),
+                    criteria: vec!["Routine".into(), "Soon".into(), "Now".into()],
+                }
+                .into(),
+            ),
+        ]
+        .into();
+        let native: BTreeMap<String, JevQuestion> = serde_json::from_value(json!({
+            "billing": {"type": "noul", "instructions": "About billing?",
+                        "criteria": {"true": "A charge.", "false": "Anything else."}},
+            "plain": {"type": "noul", "instructions": "Polite?"},
+            "team": {"type": "choice", "instructions": "Which team?",
+                     "criteria": {"zeta": "Last.", "alpha": "First."}},
+            "urgency": {"type": "score", "instructions": "How urgent?",
+                        "criteria": ["Routine", "Soon", "Now"]},
+        }))
+        .expect("native questions decode");
+        assert_eq!(
+            typed["billing"],
+            JevQuestion::Noul {
+                instructions: "About billing?".into(),
+                criteria: Some(JevNoulCriteria {
+                    when_true: "A charge.".into(),
+                    when_false: "Anything else.".into(),
+                }),
+            }
+        );
+        let build = |questions| {
+            Prompt::jev(
+                "jev-latest",
+                JevPromptOptions {
+                    state: "He said \"hi\".\n${context}".into(),
+                    questions,
+                },
+            )
+            .expect("the Jev prompt builds")
+        };
+        let (typed, native) = (build(typed), build(native));
+        assert_eq!(typed.native(), native.native());
+        let ProviderRequest::JevSystemOne(request) = &typed.native().request else {
+            panic!("a Jev system_one request");
+        };
+        assert_eq!(request.state, "He said \"hi\".\n${context}");
+        assert_eq!(request.model, "jev-latest");
+    }
+
+    /// A Jev prompt breaking a documented bound is refused at construction,
+    /// naming the offending member.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an invalid prompt builds or the refusal names another
+    /// member.
+    #[test]
+    fn jev_prompt_refuses_documented_bounds() {
+        use std::collections::BTreeMap;
+
+        use crate::builder::{ChoiceQuestion, JevPromptOptions, ScoreQuestion};
+        use crate::{Prompt, PromptBuilderError};
+
+        let refused =
+            |questions: BTreeMap<String, skald_spec::wire::jev::JevQuestion>| match Prompt::jev(
+                "jev-latest",
+                JevPromptOptions {
+                    state: "${context}".into(),
+                    questions,
+                },
+            ) {
+                Err(PromptBuilderError::Validation(reason)) => reason,
+                other => panic!("expected a validation refusal, got {other:?}"),
+            };
+        assert!(refused(BTreeMap::new()).starts_with("questions"));
+        let one_level = ScoreQuestion {
+            instructions: "Grade".into(),
+            criteria: vec!["Only".into()],
+        };
+        assert!(
+            refused([("grade".to_owned(), one_level.into())].into())
+                .starts_with("questions.grade.criteria")
+        );
+        let too_many = ChoiceQuestion {
+            instructions: "Pick".into(),
+            criteria: (0..300)
+                .map(|i| (format!("o{i}"), "x".to_owned()))
+                .collect(),
+        };
+        assert!(
+            refused([("pick".to_owned(), too_many.into())].into())
+                .starts_with("questions.pick.criteria")
+        );
+        assert!(matches!(
+            Prompt::jev(" ", JevPromptOptions::default()),
+            Err(PromptBuilderError::EmptyModel)
         ));
     }
 }

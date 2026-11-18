@@ -254,11 +254,14 @@ impl Requirement {
         let references: Vec<&Reference> = match &self.check {
             Check::Assert { path, each, .. } => path.iter().chain(each).collect(),
             Check::Trace(trace) => vec![&trace.on],
-            Check::Agent(call) => call
+            Check::Agent(check) => check
+                .call
                 .inputs
                 .values()
                 .chain(
-                    call.workspace
+                    check
+                        .call
+                        .workspace
                         .values()
                         .filter_map(WorkspaceSource::reference),
                 )
@@ -656,7 +659,7 @@ where
                 }
                 validate_operator(&trace.operator, &path)
             }
-            Check::Agent(call) => self.validate_agent(call, position, &path),
+            Check::Agent(check) => self.validate_agent(&check.call, position, &path),
             Check::Code(check) => {
                 self.validate_code(&check.call, position, &path)?;
                 match &check.response_format {
@@ -2505,7 +2508,10 @@ mod tests {
                 *format,
                 "the authored format is kept"
             );
-            let crate::card::verifier::Check::Agent(call) = &spec.requirements[2].check else {
+            let crate::card::verifier::Check::Agent(crate::card::verifier::AgentCheck {
+                call, ..
+            }) = &spec.requirements[2].check
+            else {
                 panic!("agent check");
             };
             let prompt = call

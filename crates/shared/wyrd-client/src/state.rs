@@ -2822,23 +2822,26 @@ pub(crate) mod tests {
             use wyrd_spec::verification::TaskId;
 
             let verifier_ref = test_ref(CardKind::Verifier, "judge", 4);
-            let check = Check::Agent(AgentCall {
-                agent: InlineableRef::Inline(Box::new(AgentSpec {
-                    prompt: if sibling {
-                        InlineableRef::Sibling {
-                            sibling: (&prompt_ref).into(),
-                        }
-                    } else {
-                        InlineableRef::Ref(prompt_ref)
-                    },
-                    execution_route: wyrd_spec::ExecutionRoute::Native {},
-                    tool_names: Vec::new(),
-                    run_config: AgentRunConfigSpec::default(),
-                    verified_by: Vec::new(),
-                })),
-                inputs: BTreeMap::new(),
-                workspace: BTreeMap::new(),
-            });
+            let check = Check::Agent(
+                AgentCall {
+                    agent: InlineableRef::Inline(Box::new(AgentSpec {
+                        prompt: if sibling {
+                            InlineableRef::Sibling {
+                                sibling: (&prompt_ref).into(),
+                            }
+                        } else {
+                            InlineableRef::Ref(prompt_ref)
+                        },
+                        execution_route: wyrd_spec::ExecutionRoute::Native {},
+                        tool_names: Vec::new(),
+                        run_config: AgentRunConfigSpec::default(),
+                        verified_by: Vec::new(),
+                    })),
+                    inputs: BTreeMap::new(),
+                    workspace: BTreeMap::new(),
+                }
+                .into(),
+            );
             let verifier = VerifierSpec {
                 requirements: vec![Requirement {
                     id: TaskId::new("judge").expect("fixture requirement id is valid"),

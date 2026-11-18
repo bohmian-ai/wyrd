@@ -23,7 +23,7 @@ use skald_agent::{
 use skald_prompt::Prompt;
 use skald_providers::ProviderError;
 use skald_runtime::{ProviderRegistry, SkaldRuntimeError};
-use skald_spec::{MediaRef, PreparedSchemas, ResponseType};
+use skald_spec::{MediaRef, PreparedSchemas, ProviderResponse, ResponseType};
 use wyrd_spec::card::agent::{AgentSpec, BuiltinTool, ExecutionRoute};
 use wyrd_spec::card::verifier::{Action, AgentCall, Check, InputSlot};
 use wyrd_spec::error::WyrdError;
@@ -37,7 +37,7 @@ use wyrd_spec::verification::execution::{
 use super::tools::{AgentToolset, ToolSession};
 use super::{
     ActionExecutor, ActionOutput, BlockCall, BlockError, CallInput, CallValue, CheckExecutor,
-    CheckOutput, EngineError, Position, verdict_from,
+    CheckOutput, EngineError, Position, VerdictTransformer, verdict_from,
 };
 
 /// Histogram of one Agent call's phases, seconds, labelled `phase`:
@@ -516,6 +516,7 @@ impl AgentExecutor {
             structured: run.structured_output,
             text: run.output,
             prompt,
+            final_response: run.final_response,
             _media_guards: media_guards,
             provenance: CallProvenance::Agent {
                 agent: resolved.agent_ref,
@@ -555,13 +556,16 @@ impl ActionExecutor for AgentExecutor {
 
 #[async_trait]
 impl CheckExecutor for AgentExecutor {
-    /// Run an Agent check and return its Verdict as the Agent authored it;
-    /// the engine validates its citations.
+    /// Run an Agent check and return its Verdict: as the Agent authored it,
+    /// or, for a check declaring a `verdict_transform`, converted from the
+    /// run's typed decision response with the selected answer as the actual
+    /// value. The engine validates citations either way.
     ///
     /// # Errors
     /// Returns [`BlockError::Terminal`] for a non-Agent check, a step-position
-    /// call, or an answer [`verdict_from`] refuses against the Prompt's
-    /// declared format, plus [`Self::invoke`] failures.
+    /// call, an answer [`verdict_from`] refuses against the Prompt's
+    /// declared format, or one [`VerdictTransformer::apply`] refuses, plus
+    /// [`Self::invoke`] failures.
     async fn execute(&self, call: BlockCall<'_, Check>) -> Result<CheckOutput, BlockError> {
         let Check::Agent(agent) = call.block else {
             return Err(terminal("the Agent executor runs only Agent checks"));
@@ -575,7 +579,26 @@ impl CheckExecutor for AgentExecutor {
             .chain(call.workspace.values())
             .flat_map(|input| input.sources.iter().cloned())
             .collect();
-        let invoked = self.invoke(&call, agent, &Role::Check(&reachable)).await?;
+        let invoked = self
+            .invoke(&call, &agent.call, &Role::Check(&reachable))
+            .await?;
+        if let Some(policy) = &agent.verdict_transform {
+            let response = invoked
+                .final_response
+                .as_deref()
+                .ok_or_else(|| terminal("the check Agent returned no decision response"))?;
+            let started = phase_start();
+            let (verdict, actual) =
+                VerdictTransformer::new(policy, &invoked.prompt.native().request)
+                    .apply(response)?;
+            phase_end("verdict", started);
+            return Ok(CheckOutput {
+                verdict,
+                actual: Some(actual),
+                detail: None,
+                provenance: Some(invoked.provenance),
+            });
+        }
         let answer = invoked
             .structured
             .ok_or_else(|| terminal("the check Agent returned no structured Verdict"))?;
@@ -625,6 +648,8 @@ struct Invoked {
     text: String,
     /// The bound Prompt that ran.
     prompt: Arc<Prompt>,
+    /// The typed native response the run ended with, shared with the run.
+    final_response: Option<Arc<ProviderResponse>>,
     /// Guards of the media `prompt` carries, released with it.
     _media_guards: Vec<Box<dyn Any + Send + Sync>>,
     /// Agent, Prompt, and effective route.

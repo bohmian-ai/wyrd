@@ -16,6 +16,7 @@
 
 pub(crate) mod agent;
 mod tools;
+mod transform;
 
 pub use agent::{
     AGENT_PHASE_DURATION_SECONDS, AgentCardResolver, AgentExecutor, EvidenceReader,
@@ -25,6 +26,7 @@ pub use tools::{
     AgentToolset, CodeTool, Delivery, HostWork, ToolBridge, ToolCalls, ToolCallsOwner, ToolLimits,
     ToolSession, hold_permit, provider_tool_name, tool_error,
 };
+pub use transform::VerdictTransformer;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;

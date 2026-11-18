@@ -877,9 +877,11 @@ impl Journey {
     /// counts, lists and totals computed from the model the journey
     /// exports; empty for a statement only its recorded answer checks
     /// (the approximate percentiles). Dependent statements bind the first
-    /// rows of their lists, so their expectations follow the same rows. The
-    /// series table keeps a row per series per export, so the group-keys
-    /// limit of 100 always binds.
+    /// rows of their lists, so their expectations follow the same rows. How
+    /// many rows the series table keeps per series depends on how the
+    /// server stored it, so group keys must name every route's attributes,
+    /// `/batch` and `/gauge` (a route's counter and histogram share them)
+    /// without a row count.
     #[must_use]
     pub fn known(self, id: &str) -> Vec<Known> {
         let count = |n: i64| Some(n.to_string());
@@ -1039,7 +1041,10 @@ impl Journey {
                     Known::Cells("unit", cells(["%", "By", "ms", "1"])),
                 ]
             }
-            "metrics-group-keys" => vec![Known::Rows(100)],
+            "metrics-group-keys" => vec![Known::Distinct(
+                "attributes",
+                usize::try_from(self.routes + 2).unwrap_or(0),
+            )],
             "metric-points-list" => self.newest_points(50),
             "metrics-chart" => self.chart(HOUR_START_NANOS, MINUTES, true),
             "metrics-24h-chart" => self.chart(day_from, 900, true),

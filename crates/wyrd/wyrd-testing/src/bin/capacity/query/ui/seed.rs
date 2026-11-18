@@ -173,6 +173,8 @@ pub enum Known {
     Sum(&'static str, f64),
     /// A column holding exactly these cells, nulls as `None`, in row order.
     Cells(&'static str, Vec<Option<String>>),
+    /// A column holding exactly this many distinct non-null cells.
+    Distinct(&'static str, usize),
     /// A numeric column summing to this value over the rows whose second
     /// column holds the given cell; at least one row must.
     Total(&'static str, (&'static str, &'static str), f64),
@@ -243,6 +245,15 @@ pub fn check(id: &str, answer: &Answer, journey: Journey) -> Result<(), String> 
             }
             Known::Cells(column, cells) => {
                 answer.column(column) == cells.iter().map(Option::as_deref).collect::<Vec<_>>()
+            }
+            Known::Distinct(column, distinct) => {
+                answer
+                    .column(column)
+                    .into_iter()
+                    .flatten()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    == *distinct
             }
             Known::Total(column, (by, cell), sum) => {
                 let matching: Vec<f64> = answer

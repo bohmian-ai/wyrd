@@ -138,10 +138,21 @@ behavior keeps its existing proof; no manufactured RED is required for it.
      writes only `checkpoint` execution events, so the catalog's `event = 'status'` subquery
      never matches and every submitted execution reads `pending`. This is a finding about the
      frozen SQL, recorded rather than rewritten (query rewriting is out of scope).
-   - **Open before the baseline:** trace, log and metric statements are checked only against
-     their self-recorded reference, not against counts derived from the journey. A wrong
-     example binding that still returns rows would pass, and scalar/histogram series are not
-     asserted with expected values.
+   - Journey statements, `Journey::known` in `capacity/query/ui/fixture.rs`, unit
+     `query::ui::seed::tests::journey_statements_must_answer_what_was_exported`: RED
+     `seed.rs:341 assertion failed: check("stat-spans-total", &answer("value", &["0"]), journey).is_err()`,
+     then GREEN. Every trace, log and metric statement over the hour must answer what the
+     model exported: span, error, trace and log counts and minute bins; facet values and counts;
+     list, cursor-page and child-match order by trace, span and log identity; metric names; the
+     newest points' integer values; the 1 h, 24 h, per-series and nested charts' counter rate,
+     delta and gauge totals; and the histograms' counted requests and summed milliseconds.
+     The approximate percentiles keep only their recorded answer. Group keys assert the distinct
+     series attributes, not a row count: the series table kept 100+ rows in the default arm and
+     80 in the learned arm for the same 8 series.
+     Smokes with these checks (VALID): `ui-sql/20261118T214946Z-753cb7b07.json`,
+     `ui-sql-10x/20261118T214844Z-753cb7b07.json`,
+     `ui-sql-learned/20261118T214744Z-753cb7b07.json`.
+   - **Open:** none for the baseline.
 2. **Same data, different residence/layout.** Execute fixed SQL/absolute binds
    before/after explicit stage/publication, then on separately prelearned data.
    Assert actual residence, identical logical rows and no duplicate identities;

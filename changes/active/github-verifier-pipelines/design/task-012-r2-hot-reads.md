@@ -1,7 +1,6 @@
 # TASK-012-R2 design: benchmark and fix hot reads
 
-Status: finalized for task authoring. Specification scope amendment required
-before implementation.
+Status: finalized. Scope approved as spec revision 17 on 2026-11-18.
 
 ## Start here: the actual queries
 
@@ -137,6 +136,5 @@ report evidence/options before redesigning it. Commits remain maintainer-owned.
 
 Revision 16 REQ-018/019/022–024 supplies inherited no-regression, CPU and custody
 constraints. Bifrost architecture already requires bounded captured pull-driven
-streams. REQ-024 currently limits additional Bifrost changes to resource-manager
-integration; the selected optimization needs an approved specification scope
-amendment before implementation. This design does not claim that approval.
+streams. Revision 17, approved on 2026-11-18, extends REQ-024 beyond resource-manager
+integration for the selected optimization.

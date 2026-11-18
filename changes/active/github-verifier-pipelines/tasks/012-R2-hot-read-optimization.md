@@ -1,10 +1,9 @@
 ---
 id: TASK-012-R2
 status: proposed
-approved_spec_revision: 16
+approved_spec_revision: 17
 depends_on: [TASK-012-R1]
 obligations: [REQ-018, REQ-019, REQ-022, REQ-023, REQ-024]
-implementation_prerequisite: approved specification amendment extending Bifrost optimization scope
 ---
 
 # Benchmark UI SQL, then optimize shared hot reads
@@ -36,8 +35,8 @@ The maintainer selected this scope and baseline-first order on 2026-11-18.
 TASK-012-R1 supplies the integrated memory/CPU owners and compatibility records.
 Its maintainer-completed status is not reopened.
 
-**Before implementation:** approve the scope amendment extending revision 16's
-REQ-024 beyond resource-manager integration. Inherited memory, CPU, durability
+**Scope:** [revision 17](../spec-revisions/17-hot-read-optimization.md), approved
+on 2026-11-18, extends REQ-024 beyond resource-manager integration. Inherited memory, CPU, durability
 and no-regression constraints remain. This proposed task is not spec approval;
 no new absolute UI latency target or hot/Parquet ratio is agreed.
 

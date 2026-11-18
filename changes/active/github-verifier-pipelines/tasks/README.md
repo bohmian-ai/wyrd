@@ -58,7 +58,7 @@ reservations, and connects shared pressure and non-preemptive CPU admission.
 | [011](011-code-review-pipeline-tutorial.md) | **Proposed; requires 009.** Single docsite journey from GitHub connection and repository declaration through review authoring, approval, Check/comment and waiting/delivery diagnosis; reuses 009's public standard-report example |
 | [012](012-integrate-code-mode.md) | **Proposed.** Staged port of pinned code mode into B's dynamic pipelines; preserves behavior, applies revision 12's decided nested exclusions and crates.io Monty, carries open obligations and supplies the composed, functionally verified tree for 013 and 014; runs no benchmark |
 | [012-R1](012-R1-allocation.md) | **Complete (maintainer approval); requires 012; approved spec revision 16.** AC-018 qualification gaps recorded open in scenario 7. Consumption-based workload manager over gateway/verification/Bifrost and managed workers, preserved Bifrost workspace policy, connected fairness/custody regressions and full clean L1 qualification; required before 013 |
-| [012-R2](012-R2-hot-read-optimization.md) | **Proposed; requires 012-R1's existing integrated owners and a specification scope amendment before implementation.** Freeze original UI SQL from a local immutable revision; add L1 `ui-sql` and record its clean baseline before optimizing shared hot execution. UI query rewriting and frontend changes are outside scope. Historical settlement-remediation TASK-012-R2 records remain unchanged. |
+| [012-R2](012-R2-hot-read-optimization.md) | **Proposed; requires 012-R1's existing integrated owners; approved spec revision 17.** Freeze original UI SQL from a local immutable revision; add L1 `ui-sql` and record its clean baseline before optimizing shared hot execution. UI query rewriting and frontend changes are outside scope. Historical settlement-remediation TASK-012-R2 records remain unchanged. |
 | [013](013-mixed-verification-benchmark.md) | **Proposed; requires 012 and 012-R1; approved spec revision 16.** Deterministic 100-tenant Postgres fairness/completion/drain/ledger regression; same-rate direct-only control for existing L2 `competing` on one `combined` server, shared tables and full clean L2 baseline for 014; consumes 012-R1's qualified allocation implementation and L1 records |
 | [014](014-direct-verification-throughput.md) | **Proposed; requires 013 (after 012 and 012-R1); approved spec revision 16.** Direct-throughput optimization toward 20,000–30,000 verifications/s and Rust round trips under 2–3 ms; retains c64 overhead target, six-population c1/c64 and matched-rate qualification, scheduler/isolation regressions and inherited diagnosis/ledger rows; compares L1/L2 baselines and re-runs competing/control; consumes 013's 100-tenant test and existing replica-claim proof, without sustained 100-tenant or two-process qualification |
 
@@ -93,9 +93,8 @@ this planning work.
 ## Supplemental performance investigations
 
 [TASK-012-R2](012-R2-hot-read-optimization.md) is a separate implementation
-proposal, not another profile-only investigation below. Its approved base is
-revision 16, but REQ-024's integration-only scope needs an explicit approved
-extension before implementation. It records the maintainer-selected independent
+proposal, not another profile-only investigation below. Approved spec revision
+17 extends REQ-024's integration-only scope for it. It records the maintainer-selected independent
 engine/benchmark scope and baseline-first checkpoint; it does not claim that
 amendment is already approved or reorder 013/014.
 

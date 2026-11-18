@@ -25,12 +25,15 @@ use wyrd_testing::release_server::{LocalServer, PEAK_SAMPLE_INTERVAL_MS};
 
 use super::answer::Answer;
 use super::fixture::Journey;
-use super::{CASE, Catalog, PAGES, RESIDENCES, Statement, observation, param};
+use super::{CASE, Catalog, PAGES, RESIDENCES, Statement, observation, param, seed};
 use crate::query::isolated::SUCCESS;
 use crate::query::run::{self, Admission, Outcome, Sender, WRONG_RESULT, micros};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use crate::query::{HOT_ENV, client, platform, start, table_files};
+
+/// How long seeded calls and verifications may take to become visible.
+const VISIBLE_WAIT: Duration = Duration::from_secs(60);
 
 /// Concurrent exporters loading the journey.
 const LOADERS: usize = 16;
@@ -65,6 +68,9 @@ pub struct Ui {
     placed: &'static str,
     /// Milliseconds of the first statement after the last placement.
     first_ms: f64,
+    /// Spans held once seeding's gateway and verification spans joined the
+    /// journey's.
+    spans: i64,
 }
 
 impl Ui {
@@ -80,6 +86,7 @@ impl Ui {
             pages: Arc::default(),
             placed: RESIDENCES[0],
             first_ms: 0.0,
+            spans: journey.span_rows(),
         }
     }
 
@@ -165,10 +172,77 @@ impl Ui {
         Ok(())
     }
 
+    /// Seeds the gateway calls and verifications ([`seed::seed`]), waits
+    /// until every one is visible to `queries`, then counts the spans the
+    /// journey and seeding hold together, returning the seeded window.
+    ///
+    /// # Errors
+    ///
+    /// Returns a workload error for a seeding failure, rows not all visible
+    /// within [`VISIBLE_WAIT`], or fewer spans than the journey and one
+    /// attempt per call.
+    async fn seed(
+        &mut self,
+        client: &wyrd_client::WyrdClient,
+        queries: &Arc<Bifrost>,
+    ) -> Result<[QueryParam; 2], ExperimentError> {
+        let server = self
+            .server
+            .as_ref()
+            .ok_or_else(|| ExperimentError::workload("the server is not started"))?;
+        let [setup] = server.tenants() else {
+            return Err(ExperimentError::workload("setup provisioned one tenant"));
+        };
+        let window = seed::seed(setup, client, &self.logs)
+            .await
+            .map_err(ExperimentError::workload)?;
+        let count = async |table: &str| {
+            let (answer, _) = ask(queries, &format!("SELECT count(*) AS n FROM {table}"), &[])
+                .await
+                .map_err(ExperimentError::workload)?;
+            Ok::<_, ExperimentError>(
+                answer
+                    .column("n")
+                    .first()
+                    .copied()
+                    .flatten()
+                    .and_then(|n| n.parse::<i64>().ok())
+                    .unwrap_or_default(),
+            )
+        };
+        let deadline = Instant::now() + VISIBLE_WAIT;
+        loop {
+            let calls = count("bifrost.gateway.calls").await?;
+            let results = count("bifrost.verification.results").await?;
+            if calls == i64::from(seed::CALLS)
+                && results == i64::from(seed::DIRECT + seed::SUBMITTED)
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(ExperimentError::workload(format!(
+                    "after {VISIBLE_WAIT:?} {calls} of {} calls and {results} of {} results are visible",
+                    seed::CALLS,
+                    seed::DIRECT + seed::SUBMITTED
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        self.spans = count("bifrost.traces.spans").await?;
+        let floor = self.journey.span_rows() + i64::from(seed::CALLS);
+        if self.spans < floor {
+            return Err(ExperimentError::workload(format!(
+                "{} spans after seeding, under the journey's and one per call {floor}",
+                self.spans
+            )));
+        }
+        Ok(window)
+    }
+
     /// Each table the journey writes and the rows it holds there.
     fn tables(&self) -> [(&'static str, i64); 3] {
         [
-            ("bifrost.traces.spans", self.journey.span_rows()),
+            ("bifrost.traces.spans", self.spans),
             ("bifrost.logs.records", self.journey.log_rows()),
             ("bifrost.metrics.points", self.journey.point_rows()),
         ]
@@ -369,12 +443,19 @@ fn diagnose(repetition: &mut Repetition, observation: &str, samples: &[u64], val
 ///
 /// Returns a message for an unrepresentable bind or a missing dependency
 /// answer.
-fn resolve(statement: &Statement, bound: &[Bound]) -> Result<Vec<QueryParam>, String> {
+fn resolve(
+    statement: &Statement,
+    bound: &[Bound],
+    window: &[QueryParam; 2],
+) -> Result<Vec<QueryParam>, String> {
     let mut params = statement
         .params
         .iter()
         .map(param)
         .collect::<Result<Vec<_>, _>>()?;
+    if seed::seeded(&statement.id) {
+        params[..2].clone_from_slice(window);
+    }
     let answer = |id: &str| {
         bound
             .iter()
@@ -475,11 +556,12 @@ impl Workload for Ui {
                 )));
             }
         }
+        let window = self.seed(&client, &queries).await?;
         let catalog = Catalog::frozen().map_err(ExperimentError::workload)?;
         let mut bound: Vec<Bound> = Vec::new();
         let mut failed = Vec::new();
         for statement in catalog.queries {
-            let params = resolve(&statement, &bound).map_err(ExperimentError::workload)?;
+            let params = resolve(&statement, &bound, &window).map_err(ExperimentError::workload)?;
             let expected = match ask(&queries, &statement.sql, &params).await {
                 Ok((answer, _)) => answer,
                 Err(code) => {
@@ -495,6 +577,9 @@ impl Workload for Ui {
                 first = ?expected.rows.first(),
                 "ui-sql reference"
             );
+            if let Err(problem) = seed::check(&statement.id, &expected) {
+                failed.push(problem);
+            }
             bound.push(Bound {
                 statement,
                 params,
@@ -503,7 +588,7 @@ impl Workload for Ui {
         }
         if !failed.is_empty() {
             return Err(ExperimentError::workload(format!(
-                "every catalog statement must answer; failed: {}",
+                "every catalog statement must answer what the fixture holds; failed: {}",
                 failed.join(", ")
             )));
         }

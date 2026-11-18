@@ -8,6 +8,7 @@
 
 pub mod answer;
 pub mod fixture;
+pub mod seed;
 pub mod workload;
 
 use serde::Deserialize;

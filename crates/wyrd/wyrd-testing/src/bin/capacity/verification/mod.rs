@@ -36,7 +36,7 @@ mod driver;
 pub(crate) mod run;
 
 use driver::Language;
-mod workload;
+pub(crate) mod workload;
 
 use std::time::Duration;
 

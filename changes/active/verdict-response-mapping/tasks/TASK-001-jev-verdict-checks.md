@@ -367,8 +367,12 @@ that proof rather than manufacturing a RED result.
      existing `capture_actual` and asynchronous recording, so this scenario
      pins that contract, not new behavior. Per this section's rule, no RED was
      forced by removing that capture.
-   - Limitations: no MCP tool or CLI command reads verification execution
-     details, so the HTTP details route is the applicable read owner.
+   - MCP: the original claim that no MCP tool reads execution details was
+     false; `verification.get_execution_details` serves them. Proof:
+     `verification::pg_tests::jev_policy_judgments_read_back_through_mcp`
+     (`crates/wyrd/wyrd-mcp/tests/bifrost/mcp/verification.rs`), recorded under
+     Remediation evidence (R1-7).
+   - Limitations: no CLI command reads verification execution details.
      Whether execution waits for persistence is not measured here; the
      existing `verify_in_real_time` journeys own that property and this
      change does not touch it. `redact` shares `capture_actual` with

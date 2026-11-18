@@ -187,6 +187,8 @@ const config = {
     // generator scripts write there. SvelteKit's default is static/.
     files: { assets: 'public' },
     prerender: {
+      // Crawl from the landing as usual; the sitemap has no inbound link.
+      entries: ['*', '/sitemap.xml'],
       // A link to a missing or draft page is a dead link for readers.
       handleHttpError: 'fail',
       // The content catch-all prerenders one entry per published page, so it is

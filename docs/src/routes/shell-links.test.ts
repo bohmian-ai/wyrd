@@ -201,6 +201,19 @@ describe('publication closure', () => {
       expect(body).not.toMatch(/Withdrawn page|Held operation|\/operate\/|get-started\/withdrawn/);
     }
 
+    // The sitemap lists the same published set on the production site, and
+    // each built page names its own production URL as canonical.
+    const site = 'https://docs.bohmian.ai/wyrd';
+    const sitemap = readFileSync(path.join(build, 'sitemap.xml'), 'utf8');
+    expect([...sitemap.matchAll(/<loc>([^<]+)<\/loc>/g)].map((m) => m[1])).toEqual([
+      `${site}/`,
+      `${site}/get-started/introduction/`,
+      `${site}/understand/kept/`
+    ]);
+    expect(readFileSync(path.join(build, 'understand/kept/index.html'), 'utf8')).toContain(
+      `<link rel="canonical" href="${site}/understand/kept/"`
+    );
+
     expect(pagefindSearch(build, 'quokkafern')).toEqual(['/wyrd/get-started/introduction/']);
     expect(pagefindSearch(build, 'zebracorn')).toEqual([]);
   }, 180_000);

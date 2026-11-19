@@ -1,6 +1,6 @@
 ---
 title: Failures
-description: Page someone when a submitted or scheduled Verifier fails, with an Operator Card, an operator connection, and on_failure, then check that the page was delivered.
+description: Page someone when a scheduled Verifier fails, with an Operator Card, an operator connection, and on_failure, then check that the page was delivered.
 pillar: wyrd
 section: Build and verify
 topic: Verify
@@ -8,11 +8,13 @@ order: 5
 draft: true
 ---
 
-An Operator is what Wyrd does when a Verifier fails: post to a webhook, page PagerDuty, or message Slack. You attach it to a binding with `on_failure`, and the server runs it once per failed execution. This page wires a daily latency check to an on-call webhook.
+An Operator is what Wyrd does when a Verifier fails: post to a webhook, page PagerDuty, or message Slack. You attach it to a binding with `on_failure`, and the server runs it once per failed execution the binding creates. This page pages an on-call webhook when a minute of checkout requests is too slow.
 
-Operators run only for background work. A `failed` verdict from `submit` or a schedule runs them; `verify`, `passed`, `inconclusive`, and execution errors never do.
+The server runs Operators only for executions it starts itself, such as a schedule's. A `failed` verdict from `verify` or `submit` never runs them, and neither do `passed`, `inconclusive`, or execution errors.
 
-## 1. Create the connection
+Start from a server you set up with `wyrd init`, and an empty directory holding the files below.
+
+## 1. Store the webhook's connection
 
 Secrets never go in a Card. A tenant administrator stores the webhook's origin and token once, as an operator connection:
 
@@ -22,36 +24,36 @@ wyrd operator-connection create --body-file - <<JSON
 JSON
 ```
 
-The command prints the connection with its secret redacted. `wyrd operator-connection list` shows every connection in the tenant.
+The command prints the connection with its token redacted. The server encrypts the token before storing it, with the key `wyrd init` keeps.
 
 ## 2. Write the Operator and bind it
 
-The Operator names the connection and a path on its origin. The Service attaches it to the binding with `on_failure`:
+The Operator names the connection and a path on its origin. The Service binds `latency-budget` to an every-minute schedule and pages on-call when a minute fails:
 
 <Tabs>
-<Tab label="latency-watch.yaml">
+<Tab label="checkout-alerts.yaml">
 
-<CodeFromFile file="fixtures/cards/scheduled_drift_alerts_operator/latency-watch.yaml" lang="yaml" title="latency-watch.yaml" />
-
-</Tab>
-<Tab label="alert-on-call.yaml">
-
-<CodeFromFile file="fixtures/cards/scheduled_drift_alerts_operator/alert-on-call.yaml" lang="yaml" title="alert-on-call.yaml" />
+<CodeFromFile file="examples/respond-to-a-failed-verification/checkout-alerts.yaml" lang="yaml" title="checkout-alerts.yaml" />
 
 </Tab>
-<Tab label="latency-shift.yaml">
+<Tab label="page-on-call.yaml">
 
-<CodeFromFile file="fixtures/cards/scheduled_drift_alerts_operator/latency-shift.yaml" lang="yaml" title="latency-shift.yaml" />
+<CodeFromFile file="examples/respond-to-a-failed-verification/page-on-call.yaml" lang="yaml" title="page-on-call.yaml" />
 
 </Tab>
-<Tab label="daily.yaml">
+<Tab label="latency-budget.yaml">
 
-<CodeFromFile file="fixtures/cards/scheduled_drift_alerts_operator/daily.yaml" lang="yaml" title="daily.yaml" />
+<CodeFromFile file="examples/respond-to-a-failed-verification/latency-budget.yaml" lang="yaml" title="latency-budget.yaml" />
+
+</Tab>
+<Tab label="every-minute.yaml">
+
+<CodeFromFile file="examples/respond-to-a-failed-verification/every-minute.yaml" lang="yaml" title="every-minute.yaml" />
 
 </Tab>
 </Tabs>
 
-When `latency-shift` fails, the server posts the `body` to `https://hooks.example.com/hooks/latency-shift` with `Authorization: Bearer <token>`. The `{{...}}` placeholders are filled from the failed execution:
+When a minute fails, the server posts the `body` to `https://hooks.example.com/hooks/checkout-latency` with `Authorization: Bearer <token>`. The `{{...}}` placeholders are filled from the failed execution:
 
 | Placeholder | Value |
 | --- | --- |
@@ -61,66 +63,75 @@ When `latency-shift` fails, the server posts the `body` to `https://hooks.exampl
 | `verdict`, `completed_at`, `summary` | What happened and when |
 | `drift.drifted_features`, `drift.total_features` | For drift checks, how many features drifted |
 
-The Operator's `auth.scheme` must match the connection's, and `url` is a path on the connection's origin, or a full URL with that same origin. Declare the Service as usual with `wyrd declare latency-watch.yaml`; declaration refuses an Operator whose connection is missing, disabled, or does not match. Declaring a binding with `on_failure` needs the `operators:invoke` scope.
+The Operator's `auth.scheme` must match the connection's, and `url` is a path on the connection's origin, or a full URL with that same origin. Declaration refuses an Operator whose connection is missing, disabled, or does not match, and declaring a binding with `on_failure` needs the `operators:invoke` scope.
 
 Slack and PagerDuty use `kind: notify` with a `channel` of `{kind: slack, connection, channel_id, text}` or `{kind: pager_duty, connection, ...}`, against a `slack` or `pager_duty` connection.
 
-## 3. Check it was delivered
+## 3. Declare the Service and create its account
 
-Each Operator run is a dispatch on the execution. Find the latest execution of the binding:
+Declare and pull the Service, then create the account its schedule runs as:
 
-```sql
-SELECT execution_id, verdict, ended_at
-FROM bifrost.verification.results
-WHERE binding_id = $1
-ORDER BY ended_at DESC
-LIMIT 1
+```bash
+wyrd declare checkout-alerts.yaml
+wyrd pull --kind Service --name checkout-alerts --version 1.0.0 --output-dir .wyrd-bundle
+wyrd principal credential create-principal --name checkout-runtime --role workload --workload-name checkout-alerts
+export CHECKOUT_KEY=<credential>
 ```
 
-The binding ID is in the Service's Card status, under `status.verification.binding_ids`. Then read the dispatches:
+## 4. Record a slow minute
+
+Save `record` from [Monitor drift](/build-and-verify/verify/monitor-drift/#3-write-the-programs) in the same directory, and `dispatches`, which waits for the failed minute and prints how each Operator run was delivered:
 
 <LangTabs langs={['python', 'rust', 'typescript']}>
 <LangTab lang="python">
 
-```python
-from wyrd import verify
+<CodeFromFile file="examples/respond-to-a-failed-verification/dispatches.py" lang="python" title="dispatches.py" />
 
-for dispatch in verify.Execution.connect(execution_id).status()["dispatches"]:
-    print(dispatch["status"], dispatch.get("error"))
+```bash
+WYRD_API_KEY=$CHECKOUT_KEY uv run record.py 250
+uv run dispatches.py
 ```
 
 </LangTab>
 <LangTab lang="rust">
 
-```rust
-use wyrd_ai::verify::Execution;
+<CodeFromFile file="examples/respond-to-a-failed-verification/dispatches.rs" lang="rust" title="src/bin/dispatches.rs" />
 
-let state = Execution::connect(execution_id.parse()?).await?.status().await?;
-for dispatch in &state.dispatches {
-    println!("{:?} {:?}", dispatch.status, dispatch.error);
-}
+```bash
+WYRD_API_KEY=$CHECKOUT_KEY cargo run --bin record 250
+cargo run --bin dispatches
 ```
 
 </LangTab>
 <LangTab lang="typescript">
 
-```typescript
-import { verify } from "wyrd-ai";
+<CodeFromFile file="examples/respond-to-a-failed-verification/dispatches.ts" lang="typescript" title="dispatches.ts" />
 
-const { dispatches } = await (await verify.Execution.connect(executionId)).status();
-for (const dispatch of dispatches) console.log(dispatch.status, dispatch.error);
+```bash
+WYRD_API_KEY=$CHECKOUT_KEY node record.ts 250
+node dispatches.ts
 ```
 
 </LangTab>
 </LangTabs>
 
-A dispatch is `pending`, `running`, `retrying`, `delivered`, or `failed`. Each one is delivered and retried on its own, and a delivery failure never changes the verdict.
+Within about a minute, `dispatches` prints:
 
-## What can go wrong
+```text
+verdict: failed
+dispatch: delivered
+```
 
-| Symptom or code | Cause | Fix |
-| --- | --- | --- |
-| `WYRD_SPEC_400_OPERATOR_CONNECTION_UNAVAILABLE` at declaration | No active connection has that name, or its auth scheme or origin differs from the Operator's | Create the connection first, and match `auth.scheme` and the origin |
-| The check failed but `dispatches` is empty | The verdict came from `verify`, or it was `inconclusive` | Only a `failed` verdict from `submit` or a schedule runs Operators |
-| A dispatch is `failed` | The webhook refused the request or was unreachable after retries | Read the dispatch's `error`, fix the receiver, and check the connection's token |
-| Nothing ran at all | The binding is inactive or its baseline is not ready | [Check the account](/build-and-verify/verify/monitor-drift/#2-create-the-services-account) and the [baseline](/reference/verifier-card/#checks) |
+and your webhook receives the Operator's body. A dispatch is `pending`, `running`, `retrying`, `delivered`, or `failed`. Each one is delivered and retried on its own, and a delivery failure never changes the verdict. After a restart of `wyrd init`, the same connection keeps delivering.
+
+## If it fails
+
+| You see | Fix |
+| --- | --- |
+| `WYRD_SPEC_400_OPERATOR_CONNECTION_UNAVAILABLE` at declaration | Create the connection first, and match the Operator's `auth.scheme` and origin |
+| `no failed window was judged` | Record with `$CHECKOUT_KEY` at least 10 seconds before the minute ends, then run `dispatches` again |
+| `dispatch: failed` | The webhook refused the request or was unreachable after retries; fix the receiver and check the connection's token |
+
+## Next
+
+[Act on verdicts in production](/build-and-verify/verify/act-on-verdicts-in-production/) covers the other ways to react to a verdict.

@@ -35,6 +35,10 @@ name = "setup_check"
 path = "setup-check/check.rs"
 
 [[bin]]
+name = "failed_verification_dispatches"
+path = "respond-to-a-failed-verification/dispatches.rs"
+
+[[bin]]
 name = "finance_release"
 path = "finance-release/finance_release.rs"
 

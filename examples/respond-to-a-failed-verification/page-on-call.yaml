@@ -1,0 +1,17 @@
+# The Operator: post the failure to a path on the on-call-hooks connection's origin.
+apiVersion: wyrd/v1
+kind: Operator
+metadata:
+  name: page-on-call
+  version: 1.0.0
+spec:
+  kind: http
+  method: post
+  url: /hooks/checkout-latency
+  auth:
+    scheme: bearer
+    connection: on-call-hooks
+  body:
+    execution_id: "{{execution_id}}"
+    verdict: "{{verdict}}"
+    summary: "{{summary}}"

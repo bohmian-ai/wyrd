@@ -218,8 +218,8 @@ This page is generated from the error definitions in the Wyrd source.
 | --- | ---: | --- | --- |
 | `WYRD_OPERATOR_400_INVALID_CONNECTION` | 400 | Invalid Operator connection | Send the provider-tagged shape matching the connection's provider with a non-empty secret and a normalized https origin. |
 | `WYRD_OPERATOR_404_CONNECTION_NOT_FOUND` | 404 | Operator connection not found | List GET /v1/operator-connections in the same tenant and retry with one of those connection IDs. |
-| `WYRD_OPERATOR_409_CONNECTION_CONFLICT` | 409 | Operator connection name conflict | Choose another name, or PATCH the existing connection to rotate its secret. |
-| `WYRD_OPERATOR_503_KEY_UNAVAILABLE` | 503 | Operator connection key unavailable | Restore the configured Operator key provider so it can supply the active key, then retry. |
+| `WYRD_OPERATOR_409_CONNECTION_CONFLICT` | 409 | Operator connection conflict | For a create, choose another name or PATCH the existing connection to rotate its secret; for a concurrent update, read the connection again and retry. |
+| `WYRD_OPERATOR_503_KEY_UNAVAILABLE` | 503 | Operator connection key unavailable | Configure [kms] (WYRD_KMS_*) and restore its wrapping backend so it can serve the active and retained keys, then retry. |
 
 ## WYRD_ORIGIN
 

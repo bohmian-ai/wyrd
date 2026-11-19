@@ -1323,6 +1323,138 @@ def test_guided_manual_setup(language: str, tmp_path: Path) -> None:
         assert {"passed", "failed"} in runs.values(), runs
 
 
+HOOK_TOKEN = "on-call-hook-token"
+"""The bearer token the reader stores on the on-call-hooks connection."""
+
+HOOK_PATH = "/hooks/checkout-latency"
+"""The path on the connection's origin that ``page-on-call.yaml`` posts to."""
+
+
+def record_slow_requests(reader: Path, env: dict[str, str], runtime_key: str) -> None:
+    """Record five slow requests with the Service's own key, clear of a minute boundary."""
+    # A window is one minute: keep the samples clear of the boundary they would straddle.
+    if time.time() % 60 >= 50:
+        time.sleep(61 - time.time() % 60)
+    recorded = subprocess.run(
+        [sys.executable, "record.py", "250"],
+        cwd=reader,
+        env={**env, "WYRD_API_KEY": runtime_key},
+        capture_output=True,
+        text=True,
+    )
+    assert recorded.returncode == 0, recorded.stdout + recorded.stderr
+    assert recorded.stdout == "recorded 5 requests at 250 ms\n"
+
+
+DISPATCHES_RUNNERS = {
+    "python": [sys.executable, "dispatches.py"],
+    # The Rust program reads no local file; it builds with the repository's toolchain.
+    "rust": [
+        *("mise", "-C", str(Path(__file__).resolve().parents[4]), "exec", "--"),
+        *("cargo", "run", "--locked", "-q", "-p", "wyrd-rust-examples"),
+        *("--bin", "failed_verification_dispatches"),
+    ],
+    # Node resolves wyrd-ai and zod from the examples package beside the file.
+    "typescript": [
+        "node",
+        str(
+            Path(__file__).resolve().parents[4]
+            / "examples/respond-to-a-failed-verification/dispatches.ts"
+        ),
+    ],
+}
+"""Language → the command a reader runs for the Failures guide's ``dispatches`` program."""
+
+
+def read_dispatches(language: str, reader: Path, env: dict[str, str]) -> list[str]:
+    """Run the guide's ``dispatches`` program as the administrator and return what it printed."""
+    ran = subprocess.run(
+        DISPATCHES_RUNNERS[language], cwd=reader, env=env, capture_output=True, text=True
+    )
+    assert ran.returncode == 0, ran.stdout + ran.stderr
+    assert HOOK_TOKEN not in ran.stdout + ran.stderr
+    return ran.stdout.splitlines()
+
+
+@pytest.mark.local_dev
+@pytest.mark.parametrize("language", DISPATCHES_RUNNERS)
+def test_failed_verification_pages_on_call_across_restart(
+    language: str, tmp_path: Path, receiver: Receiver
+) -> None:
+    """The Failures guide pages its on-call hook from ``wyrd init``, before and after a restart.
+
+    The reader stores the hook's origin and token once with ``wyrd
+    operator-connection create`` and no key setting, declares and pulls the
+    guide's Service, and creates its runtime account. Slow requests recorded
+    with that account fail the every-minute window, and ``dispatches.py``
+    prints the ``failed`` verdict and a ``delivered`` dispatch; the hook
+    receives the Operator's body with the stored token. After ``wyrd init``
+    restarts with the saved setup, the same stored connection pages again.
+    """
+    root = Path(__file__).resolve().parents[4]
+    cli_path = str(root / "target/debug/wyrd")
+    reader = tmp_path / "project"
+    shutil.copytree(root / "examples/respond-to-a-failed-verification", reader)
+    shutil.copy(root / "examples/scheduled-check/record.py", reader)
+    connection = json.dumps(
+        {
+            "provider": "http",
+            "name": "on-call-hooks",
+            "origin": receiver.url,
+            "auth": {"scheme": "bearer", "token": HOOK_TOKEN},
+        }
+    )
+    earlier = len(receiver.to(HOOK_PATH))
+    printed = ["verdict: failed", "dispatch: delivered"]
+
+    with local_deployment() as (home, env):
+        caller = {**env, "WYRD_SERVER_URL": f"http://{env['WYRD_SERVER_BIND']}"}
+
+        def wyrd(*args: str, stdin: str | None = None) -> str:
+            ran = subprocess.run(
+                [cli_path, *args],
+                input=stdin,
+                cwd=reader,
+                env=caller,
+                capture_output=True,
+                text=True,
+            )
+            assert ran.returncode == 0, ran.stdout + ran.stderr
+            assert HOOK_TOKEN not in ran.stdout + ran.stderr
+            return ran.stdout
+
+        # First run: store the connection, declare and pull the Service, page once.
+        with installed_local_cli(cli_path, home, env, ""):
+            wyrd("operator-connection", "create", "--body-file", "-", stdin=connection)
+            wyrd("declare", "checkout-alerts.yaml")
+            wyrd(
+                *("pull", "--kind", "Service", "--name", "checkout-alerts"),
+                *("--version", "1.0.0", "--output-dir", ".wyrd-bundle"),
+            )
+            issued = wyrd(
+                *("principal", "credential", "create-principal", "--name", "checkout-runtime"),
+                *("--role", "workload", "--workload-name", "checkout-alerts"),
+            )
+            runtime_key = next(
+                line.split()[1] for line in issued.splitlines() if line.startswith("credential:")
+            )
+            record_slow_requests(reader, env, runtime_key)
+            assert read_dispatches(language, reader, env) == printed
+        first_pages = receiver.to(HOOK_PATH)[earlier:]
+        assert len(first_pages) == 1, first_pages
+        assert first_pages[0].headers["authorization"] == f"Bearer {HOOK_TOKEN}"
+        assert first_pages[0].body["verdict"] == "failed", first_pages[0].body
+
+        # Restart: the saved setup opens the same stored connection.
+        with installed_local_cli(cli_path, home, env, ""):
+            record_slow_requests(reader, env, runtime_key)
+            assert read_dispatches(language, reader, env) == printed
+        restart_pages = receiver.to(HOOK_PATH)[earlier + 1 :]
+        assert len(restart_pages) == 1, restart_pages
+        assert restart_pages[0].headers["authorization"] == f"Bearer {HOOK_TOKEN}"
+        assert restart_pages[0].body["verdict"] == "failed", restart_pages[0].body
+
+
 EXAMPLE_REPOS = ("wyrd-example-py", "wyrd-example-ts", "wyrd-example-rs")
 """Standalone example repositories, checked out beside Wyrd or under ``WYRD_EXAMPLES_DIR``."""
 

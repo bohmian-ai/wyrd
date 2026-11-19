@@ -4590,7 +4590,6 @@ async fn gateway_selected_speech_persists_one_retrievable_object() {
 async fn captured_speech_stays_charged_until_its_capture_settles() {
     use wyrd_runtime::resources::Workload;
     let spoken = vec![7_u8; 64 * 1024];
-    let other = vec![8_u8; 64 * 1024];
     let fixture = PgFixture::start().await.expect("fixture starts");
     let tenant = fixture.data_tenant_id();
     let upstream = MockServer::start().await;
@@ -4685,23 +4684,25 @@ async fn captured_speech_stays_charged_until_its_capture_settles() {
     let idle = memory.used();
 
     speak().await;
-    // Opening the FIFO's write end returns once the capture's object read has
-    // opened the read end and is parked on it.
-    let path = fifo.clone();
-    let mut writer = tokio::task::spawn_blocking(move || {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(path)
-            .expect("the FIFO opens")
-    })
-    .await
-    .expect("the writer opens");
+    // The capture's object read blocks opening the FIFO until a writer opens
+    // it, so the capture cannot settle and its charge must still be held.
     assert!(
         workloads.workload_bytes(Workload::Gateway) >= spoken.len() as u64,
         "captured speech stays charged while storage holds it"
     );
-    std::io::Write::write_all(&mut writer, &other).expect("the FIFO writes");
-    drop(writer);
+    // Opening the write end returns once the read has opened the FIFO; the
+    // read then finds no stored bytes and the capture fails its storage.
+    let path = fifo.clone();
+    tokio::task::spawn_blocking(move || {
+        drop(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .expect("the FIFO opens"),
+        );
+    })
+    .await
+    .expect("the writer opens");
     drain_gateway(&state).await;
     assert_eq!(
         scribe.attempts(),

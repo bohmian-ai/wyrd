@@ -10664,6 +10664,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "wyrd-kms"
+version = "0.4.2"
+dependencies = [
+ "base64 0.22.1",
+ "secrecy",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "workspace-hack",
+ "wyrd-crypt",
+ "wyrd-spec",
+ "wyrd-utils",
+ "wyrd-vault",
+ "zeroize",
+]
+
+[[package]]
 name = "wyrd-loader"
 version = "0.4.2"
 dependencies = [

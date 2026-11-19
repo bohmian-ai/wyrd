@@ -65,6 +65,7 @@ wyrd-benchmark = { path = "crates/shared/wyrd-benchmark", version = "0.4.2" }
 wyrd-bench = { path = "crates/shared/wyrd-bench", version = "0.4.2" }
 wyrd-sql = { path = "crates/wyrd/wyrd-sql" }
 wyrd-gateway = { path = "crates/wyrd/wyrd-gateway", version = "0.4.2" }
+wyrd-kms = { path = "crates/wyrd/wyrd-kms" }
 wyrd-storage = { path = "crates/wyrd/wyrd-storage" }
 wyrd-server = { path = "crates/wyrd/wyrd-server" }
 wyrd-testing = { path = "crates/wyrd/wyrd-testing" }

@@ -2950,3 +2950,94 @@ async fn retained_reads_resolve_current_and_history_membership() {
         .expect("foreign count reads");
     assert_eq!(counted, [json!({ "members": 0 })]);
 }
+
+/// A review set whose handoff was lost to a restart, then superseded by a
+/// newer request before it was retried, is still retained with its complete
+/// membership when its key is retried, while the newer set stays current.
+///
+/// # Panics
+/// Panics when the interrupted request is acknowledged, the retry does not
+/// replay its generation, or its members are not retained.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lost_review_set_superseded_before_its_retry_is_still_retained() {
+    let Deployment { mock, server, jwt } = Deployment::start().await;
+    mock.set_pull_request(REPOSITORY, 61, PullRequest::open(REPOSITORY, "b1", "l1"));
+    server.flush_bifrost().await.expect("setup settles");
+    let held = server
+        .stall_next_bifrost_write_into("bifrost.verification.execution_inputs")
+        .expect("Scribe stalls");
+    let lost = {
+        let url = format!(
+            "{}v1/integrations/github/pull-requests/reviews",
+            server
+                .base_url()
+                .expect("bound")
+                .trim_end_matches('/')
+                .to_owned()
+                + "/"
+        );
+        let body = GithubPullRequestReviewRequest {
+            host: mock.host(),
+            repository_id: RepositoryId::new(REPOSITORY.to_string()).expect("valid id"),
+            number: 61,
+        };
+        tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(url)
+                .header("X-Wyrd-Access-Token", format!("Bearer {jwt}"))
+                .header("Idempotency-Key", "lost-61-a")
+                .json(&body)
+                .send()
+                .await
+                .map(|response| response.status())
+        })
+    };
+    held.wait_entered().await;
+    let restarted =
+        Box::pin(server.restart_bound(WyrdTestServer::builder().with_github_app_for_test(&mock)))
+            .await
+            .expect("server restarts");
+    held.release();
+    let answered = lost.await.expect("joins");
+    assert!(
+        !matches!(answered, Ok(status) if status.is_success()),
+        "an interrupted request is not accepted: {answered:?}"
+    );
+    let Bootstrap::User { jwt, .. } = restarted
+        .bootstrap_user("pull-request-retrier", &["editor"])
+        .await
+        .expect("retrier bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let deployment = Deployment {
+        mock,
+        server: restarted,
+        jwt,
+    };
+    let lost_rows = deployment.rows(61).await;
+    assert_eq!(
+        lost_rows.len(),
+        2,
+        "the lost set was reserved: {lost_rows:?}"
+    );
+
+    let github = deployment.github(&deployment.jwt).await;
+    let newer = github
+        .review_pull_request(&deployment.review(61), "newer-61-b")
+        .await
+        .expect("the newer review is accepted");
+    let retried = github
+        .review_pull_request(&deployment.review(61), "lost-61-a")
+        .await
+        .expect("the lost key replays");
+    assert_eq!(accepted(&retried), ids(&lost_rows));
+    let retained = deployment.retained_as(&deployment.jwt, 61, 4).await;
+    let lost_generation = json!(retried.generation.to_string());
+    assert_eq!(of(&retained, &lost_generation).len(), 2, "{retained:?}");
+    assert_eq!(
+        current(&retained),
+        Some((json!(newer.generation.to_string()), true)),
+        "the retried older set does not become current"
+    );
+}

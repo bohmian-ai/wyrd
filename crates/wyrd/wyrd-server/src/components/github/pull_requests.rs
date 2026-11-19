@@ -47,6 +47,7 @@ use wyrd_spec::github_connection::{
 };
 use wyrd_spec::ids::{CardName, CardUid, ExecutionId, IdempotencyKey, RepositoryId};
 use wyrd_spec::verification::VerificationError;
+use wyrd_spec::verification::VerificationExecutionStatus;
 use wyrd_spec::verification::execution::{PullRequestActivation, PullRequestRef};
 use wyrd_sql::queries::cards::{repository_family_name, selected_repository};
 use wyrd_sql::queries::verifier_executions::{
@@ -686,9 +687,15 @@ impl GithubConnections<'_> {
         ))
     }
 
-    /// Stage the input record of every still-reserved or refused execution
-    /// of `generation` and wait until the queue writer activated or, for a
-    /// refusal, durably retained each.
+    /// Stage the input record of every still-reserved, refused or cancelled
+    /// execution of `generation` and wait until the queue writer activated
+    /// or durably retained each.
+    ///
+    /// A cancelled member may have been superseded before its handoff was
+    /// retained, so a replay of its generation, such as a retried review
+    /// request key, retains it then; its activation is a no-op. An active
+    /// member was activated only after its record was retained, so it is
+    /// not staged again.
     ///
     /// Each record is built from the generation's stored pins and
     /// observation time only, so a replay stages byte-identical rows under
@@ -708,7 +715,11 @@ impl GithubConnections<'_> {
         let reserved: Vec<&PullRequestExecution> = generation
             .executions
             .iter()
-            .filter(|execution| execution.reserved || execution.refused)
+            .filter(|execution| {
+                execution.reserved
+                    || execution.refused
+                    || execution.status == VerificationExecutionStatus::Cancelled
+            })
             .collect();
         let executions: Vec<ExecutionId> = generation
             .executions

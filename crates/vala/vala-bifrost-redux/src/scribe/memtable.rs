@@ -324,7 +324,8 @@ impl Memtable {
         meta: ScribeAppendMeta,
         batch: RecordBatch,
     ) -> Result<(), ScribeError> {
-        self.insert_with_layout(seal_key, meta, batch, None)
+        let statistics = batch_statistics(&batch);
+        self.insert_with_layout(seal_key, meta, batch, statistics, None)
     }
 
     /// Inserts an append whose rows are already in `layout`, or canonical when `None`.
@@ -334,6 +335,8 @@ impl Memtable {
     /// physical rows. Every later append to that generation must carry the
     /// same layout; the shard chose it from [`Self::generation_layout`] before
     /// converting, so a difference is an ownership bug and is refused.
+    /// `statistics` are `batch`'s [`batch_statistics`]; the shard computes
+    /// them on its ingest lane so its serial owner only attaches them here.
     ///
     /// # Errors
     /// Returns [`ScribeError::Internal`] if the bucket lock is poisoned or the
@@ -343,11 +346,9 @@ impl Memtable {
         seal_key: &SealKey,
         meta: ScribeAppendMeta,
         batch: RecordBatch,
+        statistics: Arc<Statistics>,
         layout: Option<Arc<crate::scribe::layout_cache::LearnedLayout>>,
     ) -> Result<(), ScribeError> {
-        // Bounds scan every row, so they are computed before the lock every
-        // writer of this shard shares.
-        let statistics = batch_statistics(&batch);
         let mut buckets = self.writable.write().map_err(|e| ScribeError::Internal {
             detail: format!("memtable bucket lock poisoned: {e}"),
         })?;
@@ -1485,7 +1486,7 @@ impl MemtableBucket {
     /// Retains one append batch with its metadata and exact column bounds.
     ///
     /// `statistics` are the batch's [`batch_statistics`], computed once by the
-    /// caller outside the memtable lock, so a live read prunes the batch
+    /// caller before the memtable lock, so a live read prunes the batch
     /// without scanning its rows. The tail seals into a shared run once it
     /// holds [`APPEND_RUN_LEN`] appends (see [`Self::seal_tail`]).
     fn append(&mut self, meta: ScribeAppendMeta, batch: RecordBatch, statistics: Arc<Statistics>) {
@@ -3570,12 +3571,14 @@ pub(crate) mod tests {
                 learned_key.table_version,
             )
             .expect("the sample shreds `attrs`");
+        let shredded = layout.shred(&rows).expect("shredded rows");
         let memtable = Memtable::new();
         memtable
             .insert_with_layout(
                 &learned_key,
                 make_test_meta(1),
-                layout.shred(&rows).expect("shredded rows"),
+                shredded.clone(),
+                batch_statistics(&shredded),
                 Some(layout),
             )
             .expect("learned insert");

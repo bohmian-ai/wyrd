@@ -3166,6 +3166,8 @@ struct DurableSlice {
     request_id: uuid::Uuid,
     /// Arrow rows awaiting memtable insertion.
     rows: Option<arrow::record_batch::RecordBatch>,
+    /// Exact bounds of `rows`, computed off the owner on the ingest lane.
+    statistics: Arc<datafusion::common::Statistics>,
     /// Active-memory bytes reserved for this slice.
     memtable_bytes: usize,
     /// Variant layout of `rows`, pinned by the generation they enter; `None` is canonical.
@@ -3262,13 +3264,20 @@ struct PlannedConversion {
     job: Box<dyn FnOnce() -> Result<RecordBatch, ScribeError> + Send>,
 }
 
-/// A started conversion's completion: the converted rows and the lease the
-/// worker owns until the job finishes, holding the conversion's reservation
-/// and the original rows' charge.
+/// A started conversion's completion: the converted rows, their exact bounds
+/// and the lease the worker owns until the job finishes, holding the
+/// conversion's reservation and the original rows' charge.
 type ConversionResult = std::pin::Pin<
     Box<
         dyn std::future::Future<
-                Output = Result<(RecordBatch, crate::resources::ScribeMemoryLease), ScribeError>,
+                Output = Result<
+                    (
+                        RecordBatch,
+                        Arc<datafusion::common::Statistics>,
+                        crate::resources::ScribeMemoryLease,
+                    ),
+                    ScribeError,
+                >,
             > + Send,
     >,
 >;
@@ -3287,6 +3296,10 @@ struct RunningConversion {
     result: ConversionResult,
 }
 
+/// One finished conversion: the converted rows, their exact bounds and their
+/// retained bytes.
+type ConvertedRows = (RecordBatch, Arc<datafusion::common::Statistics>, usize);
+
 /// How starting one planned conversion ended.
 enum ConversionStart {
     /// The conversion runs on the lane.
@@ -3299,8 +3312,8 @@ enum ConversionStart {
 }
 
 /// Runs one group's planned Variant conversions, at most
-/// [`CONVERSION_WINDOW`] at once, and returns the converted rows and their
-/// retained bytes in plan order.
+/// [`CONVERSION_WINDOW`] at once, and returns the converted rows, their exact
+/// bounds (computed on the lane) and their retained bytes in plan order.
 ///
 /// Before a conversion starts, its append's root grows by the conversion's
 /// upper bound, and that growth plus the original rows' charge is split into
@@ -3322,7 +3335,7 @@ async fn run_conversions(
     lane: &ScribeIngressCpuPool,
     prepared: &mut [PreparedAppend],
     planned: Vec<PlannedConversion>,
-) -> Result<Vec<(RecordBatch, usize)>, ScribeError> {
+) -> Result<Vec<ConvertedRows>, ScribeError> {
     let mut converted = Vec::with_capacity(planned.len());
     let mut running = VecDeque::with_capacity(CONVERSION_WINDOW);
     let mut failure = None;
@@ -3416,7 +3429,10 @@ fn start_conversion(
         let started = Instant::now();
         let converted = job();
         record_group_stage("convert_job", started.elapsed());
-        converted.map(|rows| (rows, reservation))
+        converted.map(|rows| {
+            let statistics = crate::scribe::memtable::batch_statistics(&rows);
+            (rows, statistics, reservation)
+        })
     });
     ConversionStart::Started(RunningConversion {
         index,
@@ -3434,7 +3450,7 @@ fn start_conversion(
 async fn finish_oldest(
     prepared: &mut [PreparedAppend],
     running: &mut VecDeque<RunningConversion>,
-    converted: &mut Vec<(RecordBatch, usize)>,
+    converted: &mut Vec<ConvertedRows>,
     failure: &mut Option<(usize, ScribeError)>,
 ) {
     let Some(conversion) = running.pop_front() else {
@@ -3443,7 +3459,7 @@ async fn finish_oldest(
     let index = conversion.index;
     let settled = match conversion.result.await {
         Ok(_) if failure.is_some() => return,
-        Ok((rows, reservation)) => settle_conversion(
+        Ok((rows, statistics, reservation)) => settle_conversion(
             prepared,
             conversion.append,
             conversion.reserve,
@@ -3451,7 +3467,7 @@ async fn finish_oldest(
             &rows,
             reservation,
         )
-        .map(|retained| (rows, retained)),
+        .map(|retained| (rows, statistics, retained)),
         Err(error) => Err(error),
     };
     match settled {
@@ -4655,9 +4671,12 @@ impl ShardOwner {
         let converting = conversion.elapsed();
         match converted {
             Ok(converted) => {
-                for (index, (rows, retained)) in planned_slices.into_iter().zip(converted) {
+                for (index, (rows, statistics, retained)) in
+                    planned_slices.into_iter().zip(converted)
+                {
                     let (_, slice, _) = &mut bound[index];
                     slice.rows = rows;
+                    slice.statistics = statistics;
                     slice.memtable_bytes = retained;
                 }
             }
@@ -4892,6 +4911,7 @@ impl ShardOwner {
             seal_key,
             request_id,
             rows,
+            statistics,
             wal_append,
             memtable_bytes,
             ..
@@ -4902,6 +4922,7 @@ impl ShardOwner {
                 seal_key,
                 request_id,
                 rows: Some(rows),
+                statistics,
                 memtable_bytes,
                 layout: None,
                 active_reserved: true,
@@ -4939,6 +4960,7 @@ impl ShardOwner {
             seal_key,
             request_id,
             rows,
+            statistics,
             wal_append,
             memtable_bytes,
             ..
@@ -4951,6 +4973,7 @@ impl ShardOwner {
                 seal_key,
                 request_id,
                 rows: retain_rows.then_some(rows),
+                statistics,
                 memtable_bytes,
                 layout: None,
                 active_reserved: retain_rows,
@@ -5112,6 +5135,7 @@ impl ShardOwner {
                     seal_key: slice.seal_key.canonical_key(),
                 },
                 rows,
+                Arc::clone(&slice.statistics),
                 slice.layout.take(),
             )
             .map_err(|error| {
@@ -7567,6 +7591,7 @@ mod tests {
                 vec![DurableSlice {
                     seal_key: key.clone(),
                     request_id: uuid::Uuid::now_v7(),
+                    statistics: crate::scribe::memtable::batch_statistics(&next_batch),
                     rows: Some(next_batch),
                     memtable_bytes: rotation_bytes,
                     layout: None,
@@ -8274,10 +8299,10 @@ mod tests {
     }
 
     /// The tags of converted batches, in the order they were returned.
-    fn conversion_tags(converted: &[(RecordBatch, usize)]) -> Vec<i64> {
+    fn conversion_tags(converted: &[ConvertedRows]) -> Vec<i64> {
         converted
             .iter()
-            .map(|(rows, _)| {
+            .map(|(rows, _, _)| {
                 rows.column(0)
                     .as_any()
                     .downcast_ref::<Int64Array>()

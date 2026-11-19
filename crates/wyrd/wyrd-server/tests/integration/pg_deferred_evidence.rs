@@ -631,21 +631,29 @@ async fn a_parked_execution_releases_compute_before_its_park_is_acknowledged() {
         .verification
         .blocks()
         .expect("blocks are hosted");
-    assert_eq!(
-        blocks.resources().scratch().used(),
-        0,
-        "the workspace's scratch is released while the park is unacknowledged"
-    );
     let sandbox = blocks.sandbox();
+    // The stalled write is the step's first revision, staged while Python
+    // still runs; the park queues behind it, so it stays unacknowledged.
+    // With no warm worker, an idle one proves the step ran and came back.
+    let released = || {
+        !sandbox.idle_worker_pids().is_empty()
+            && blocks.resources().scratch().used() == 0
+            && BTreeSet::from_iter(sandbox.charged_worker_pids())
+                == BTreeSet::from_iter(sandbox.idle_worker_pids())
+            && blocks.hold_model_calls_for_test().num_permits() == 1
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !released() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "compute is still held while the park is unacknowledged"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     assert_eq!(
-        BTreeSet::from_iter(sandbox.charged_worker_pids()),
-        BTreeSet::from_iter(sandbox.idle_worker_pids()),
-        "no Python worker is checked out while the park is unacknowledged"
-    );
-    assert_eq!(
-        blocks.hold_model_calls_for_test().num_permits(),
-        1,
-        "the model call is released while the park is unacknowledged"
+        deployment.status(parked).await["status"],
+        "running",
+        "the execution does not wait before its park is acknowledged"
     );
 
     stall.release();

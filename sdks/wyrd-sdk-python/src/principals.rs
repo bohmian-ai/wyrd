@@ -174,41 +174,6 @@ impl Principals {
         to_python(py, &profile)
     }
 
-    /// Reseal a human connection's unchanged client secret under a fresh
-    /// data key.
-    ///
-    /// # Errors
-    /// Raises `WyrdError` when the id is malformed, the caller lacks
-    /// identity-connection write, the connection is unknown, retired, or
-    /// changed, or the key service is unavailable.
-    fn renew_human_connection_encryption(
-        &self,
-        py: Python<'_>,
-        connection_id: &str,
-    ) -> WyrdPyResult<Py<PyAny>> {
-        let id = decode("connection_id", Value::from(connection_id))?;
-        let renewed =
-            crate::trace::block_on(py, self.handle(py)?.renew_human_connection_encryption(id))?;
-        to_python(py, &renewed)
-    }
-
-    /// Reseal a trusted issuer's unchanged client secret under a fresh data
-    /// key.
-    ///
-    /// # Errors
-    /// Raises `WyrdError` when the caller lacks `service_accounts:write`, the
-    /// issuer is unknown, holds no secret, or changed, or the key service is
-    /// unavailable.
-    fn renew_trusted_issuer_encryption(
-        &self,
-        py: Python<'_>,
-        issuer: &str,
-    ) -> WyrdPyResult<Py<PyAny>> {
-        let renewed =
-            crate::trace::block_on(py, self.handle(py)?.renew_trusted_issuer_encryption(issuer))?;
-        to_python(py, &renewed)
-    }
-
     /// Revoke one credential of a principal.
     ///
     /// # Errors

@@ -7,9 +7,9 @@ use uuid::Uuid;
 use wyrd_spec::auth::{
     CreateServicePrincipalRequest, CreateServicePrincipalResponse, CreateUserInvitationRequest,
     CreateUserRequest, CreatedUser, CredentialListQuery, CredentialListResponse,
-    CurrentUserProfile, HumanConnectionView, IssuedCredential, IssuedUserInvitation, PrincipalId,
-    PrincipalPage, PrincipalQuery, PrincipalRoles, PrincipalSummary, RevokePrincipalRequest,
-    RoleAssignmentChange, TrustedIssuerView, WorkloadRestriction,
+    CurrentUserProfile, IssuedCredential, IssuedUserInvitation, PrincipalId, PrincipalPage,
+    PrincipalQuery, PrincipalRoles, PrincipalSummary, RevokePrincipalRequest, RoleAssignmentChange,
+    WorkloadRestriction,
 };
 use wyrd_spec::error::WyrdError;
 
@@ -292,55 +292,6 @@ impl Principals {
                 Method::POST,
                 &format!("/v1/principals/{principal_id}/revoke"),
                 Some(request),
-            )
-            .await
-    }
-
-    /// Reseal a tenant human connection's unchanged client secret under a
-    /// fresh data key. Its revision, sign-in, and sessions are unchanged.
-    ///
-    /// # Arguments
-    /// * `connection_id` - The live connection whose secret to renew.
-    ///
-    /// # Errors
-    /// Returns a Wyrd error when the caller lacks identity-connection write,
-    /// the connection is unknown or retired, holds no secret, changed during
-    /// the renewal, or the key service is unavailable.
-    pub async fn renew_human_connection_encryption(
-        &self,
-        connection_id: Uuid,
-    ) -> Result<HumanConnectionView, WyrdError> {
-        self.client
-            .http
-            .request_json::<(), _>(
-                Method::POST,
-                &format!("/v1/identity/oidc/connections/{connection_id}/renew-encryption"),
-                None,
-            )
-            .await
-    }
-
-    /// Reseal a trusted issuer's unchanged client secret under a fresh data
-    /// key. The issuer and its workload bindings are unchanged.
-    ///
-    /// # Arguments
-    /// * `issuer` - The trusted issuer URL.
-    ///
-    /// # Errors
-    /// Returns a Wyrd error when the caller lacks `service_accounts:write`, the
-    /// issuer is unknown, holds no secret, changed during the renewal, or the
-    /// key service is unavailable.
-    pub async fn renew_trusted_issuer_encryption(
-        &self,
-        issuer: &str,
-    ) -> Result<TrustedIssuerView, WyrdError> {
-        let issuer = urlencoding::encode(issuer);
-        self.client
-            .http
-            .request_json::<(), _>(
-                Method::POST,
-                &format!("/v1/admin/trusted-issuers/renew-encryption?issuer={issuer}"),
-                None,
             )
             .await
     }

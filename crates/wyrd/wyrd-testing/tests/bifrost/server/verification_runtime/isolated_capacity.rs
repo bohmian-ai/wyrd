@@ -601,7 +601,9 @@ async fn direct_verification_runs_while_queued_capacity_is_held() {
 /// gateway and Bifrost work, a queued Agent run is deferred before it reads
 /// its input, and once it recovers all three complete. The Agent's nested model call is recorded
 /// against the verified Service and the standalone call against no subject,
-/// and no workload keeps bytes once everything settles.
+/// and no request workload keeps bytes once everything settles. Bifrost's
+/// governed memory, the rows its memtable retains until a flush, counts as
+/// Bifrost work by design, so Bifrost is not expected to return to zero.
 ///
 /// # Panics
 /// Panics when work finishes under critical pressure, does not finish after
@@ -701,7 +703,7 @@ async fn connected_work_waits_out_pressure_with_its_own_attribution() {
         1,
         "the standalone call has no subject: {subjects:?}"
     );
-    for workload in Workload::ALL {
+    for workload in [Workload::Gateway, Workload::Verification] {
         assert_eq!(
             workloads.workload_bytes(workload),
             0,
@@ -789,7 +791,10 @@ async fn a_pressure_victim_ends_in_capacity_not_a_judgment() {
 }
 
 /// A standalone chat completion's request body counts as gateway work for as
-/// long as its call runs, and returns when the call settles.
+/// long as its call runs, and returns when the call settles. A charge has one
+/// owner, so gateway holding exactly the body proves no other workload holds
+/// it; Bifrost's own governed memory, the rows setup left in its memtable, is
+/// Bifrost work by design and not part of this call.
 ///
 /// # Panics
 /// Panics when setup or the call fails, or the body is uncounted, counted as
@@ -833,9 +838,11 @@ async fn standalone_call_bodies_count_as_gateway_work_while_the_call_runs() {
         sent,
         "the dispatched call holds its body as gateway work"
     );
-    for workload in [Workload::Verification, Workload::Bifrost] {
-        assert_eq!(workloads.workload_bytes(workload), 0, "{workload:?}");
-    }
+    assert_eq!(
+        workloads.workload_bytes(Workload::Verification),
+        0,
+        "the call holds no verification bytes"
+    );
     desk.provider.release(&[HELD_BODY]);
     assert_eq!(call.await.expect("the call joins"), 200);
     assert_eq!(

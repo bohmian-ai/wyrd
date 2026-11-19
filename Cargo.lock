@@ -10958,7 +10958,6 @@ dependencies = [
  "wyrd-queue",
  "wyrd-runtime",
  "wyrd-semver",
- "wyrd-server",
  "wyrd-skald-agent",
  "wyrd-skald-prompt",
  "wyrd-skald-providers",

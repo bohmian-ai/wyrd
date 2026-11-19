@@ -1150,6 +1150,11 @@ mod pg_tests {
     }
 
     async fn test_state(fixture: &PgFixture) -> AppState {
+        test_state_with(fixture, kms()).await
+    }
+
+    /// [`test_state`] sealing through `kms` instead of the seeded facade.
+    async fn test_state_with(fixture: &PgFixture, kms: Arc<wyrd_kms::WyrdKms>) -> AppState {
         let postgres = Arc::new(crate::postgres::ServerPostgres::from_parts(
             fixture.wyrd_postgres().clone(),
             fixture.vala_postgres().clone(),
@@ -1160,7 +1165,7 @@ mod pg_tests {
         let signer = LocalSigner::new(storage_root).expect("local signer creates");
         crate::state::AppState::from_owners_for_test(crate::state::AppStateInner {
             auth: crate::components::auth::ServerAuth {
-                kms: Some(kms()),
+                kms: Some(kms),
                 ..crate::components::auth::ServerAuth::default()
             },
             ..crate::test_support::test_owners(
@@ -1577,6 +1582,92 @@ mod pg_tests {
             decision_rows(&state, &scribe, "admin.trusted_issuer.renew_encryption").await,
             vec![("allowed".to_owned(), 3), ("denied".to_owned(), 1)]
         );
+    }
+
+    /// A trusted issuer's renewal through a remote key service fails closed on
+    /// an outage with the stored envelope unchanged, and a renewal racing the
+    /// issuer's deletion loses with a conflict: the deletion stands and no row
+    /// is restored.
+    ///
+    /// # Panics
+    /// Panics when the outage writes, the race does not conflict, or the
+    /// deleted issuer reappears.
+    #[tokio::test]
+    async fn issuer_renewal_survives_outage_and_loses_to_deletion() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let transit =
+            wyrd_testing::kms::TransitFixture::start_delayed(Duration::from_millis(300)).await;
+        let state = test_state_with(
+            &fixture,
+            Arc::new(
+                wyrd_kms::WyrdKms::new(&transit.config("issuer", &[]), false)
+                    .expect("transit facade"),
+            ),
+        )
+        .await;
+        let (_server, issuer) = discovery_server().await;
+        let _created = create_trusted_issuer(
+            State(state.clone()),
+            writer(tenant),
+            Json(create_issuer_request(issuer.clone(), Some(SECRET))),
+        )
+        .await
+        .expect("create succeeds");
+        let stored = || async {
+            let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+            let row = trusted_issuer_by_url(&mut conn, issuer.as_str())
+                .await
+                .expect("query succeeds");
+            conn.commit().await.expect("commit");
+            row.and_then(|row| row.client_secret_enc)
+        };
+        let before = stored().await.expect("secret is stored");
+        let query = || {
+            Query(IssuerQuery {
+                issuer: issuer.as_str().to_owned(),
+            })
+        };
+
+        transit.set_available(false);
+        let outage = renew_trusted_issuer_encryption(State(state.clone()), writer(tenant), query())
+            .await
+            .expect_err("a key outage refuses");
+        transit.set_available(true);
+        assert_eq!(outage.0.code(), "WYRD_SERVER_503_SERVICE_UNAVAILABLE");
+        assert_eq!(
+            stored().await,
+            Some(before),
+            "a refused renewal writes nothing"
+        );
+
+        let encrypts = transit.requests("encrypt").await;
+        let renewal =
+            renew_trusted_issuer_encryption(State(state.clone()), writer(tenant), query());
+        let delete = async {
+            while transit.requests("encrypt").await <= encrypts {
+                tokio::task::yield_now().await;
+            }
+            delete_trusted_issuer_route(
+                State(state.clone()),
+                writer(tenant),
+                Query(DeleteIssuerQuery {
+                    issuer: issuer.as_str().to_owned(),
+                    cascade: false,
+                }),
+            )
+            .await
+        };
+        let (lost, deleted) = tokio::join!(renewal, delete);
+        assert_eq!(deleted.expect("delete succeeds"), StatusCode::NO_CONTENT);
+        assert_eq!(
+            lost.expect_err("the renewal loses to the deletion")
+                .0
+                .code(),
+            "WYRD_AUTH_409_ADMIN_CONFLICT"
+        );
+        assert_eq!(stored().await, None, "the deletion stands");
+        settle_audit(&state).await;
     }
 
     /// Every physical identifier an administrative conflict must never

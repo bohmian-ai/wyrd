@@ -1965,14 +1965,18 @@ async fn platform_sign_in_opens_its_client_secret_through_vault_transit_across_r
 /// Renewing the platform connection's encryption reseals its unchanged client
 /// secret under a fresh data key: one more Transit encrypt, a redacted view,
 /// and the next sign-in authenticates with the same secret, with no
-/// reconfiguration. A removed connection has nothing to renew, and removal
+/// reconfiguration, through the route and the client handle. A key outage
+/// refuses with nothing resealed; a removal racing a renewal wins and the
+/// renewal conflicts; a removed connection has nothing to renew, and removal
 /// is never undone by a renewal.
 ///
 /// # Panics
 /// Panics when any step deviates from the contract above.
 #[tokio::test]
 async fn renewing_platform_connection_encryption_keeps_its_sign_in() {
-    let transit = wyrd_testing::kms::TransitFixture::start().await;
+    let transit =
+        wyrd_testing::kms::TransitFixture::start_delayed(std::time::Duration::from_millis(300))
+            .await;
     let srv = Box::pin(
         WyrdTestServer::builder()
             .with_kms_for_test(transit.config("platform", &[]))
@@ -2065,16 +2069,47 @@ async fn renewing_platform_connection_encryption_keeps_its_sign_in() {
     assert_eq!(transit.requests("encrypt").await, 3, "resealed again");
     confidential_platform_sign_in(&srv, &provider).await;
 
-    let resp = srv
-        .oneshot(platform_request(
+    // A key outage refuses the renewal and changes nothing.
+    transit.set_available(false);
+    let resp = renew().await.expect("renew route responds");
+    transit.set_available(true);
+    assert_eq!(
+        resp.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "an outage refuses"
+    );
+    assert_eq!(
+        transit.requests("encrypt").await,
+        3,
+        "the outage resealed nothing"
+    );
+    confidential_platform_sign_in(&srv, &provider).await;
+
+    // A removal landing while the renewal reseals wins; the renewal conflicts.
+    let encrypts = transit.requests("encrypt").await;
+    let remove = async {
+        while transit.requests("encrypt").await <= encrypts {
+            tokio::task::yield_now().await;
+        }
+        srv.oneshot(platform_request(
             Method::DELETE,
             "/platform/oidc/connection",
             &session,
             None,
         ))
         .await
-        .expect("remove route responds");
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT, "connection removes");
+    };
+    let (lost, removed) = tokio::join!(renew(), remove);
+    assert_eq!(
+        removed.expect("remove route responds").status(),
+        StatusCode::NO_CONTENT,
+        "connection removes"
+    );
+    assert_eq!(
+        lost.expect("renew route responds").status(),
+        StatusCode::CONFLICT,
+        "the renewal loses to the removal"
+    );
     let resp = renew().await.expect("renew route responds");
     assert_eq!(
         resp.status(),

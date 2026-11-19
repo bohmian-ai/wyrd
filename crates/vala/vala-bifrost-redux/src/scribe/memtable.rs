@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, FieldRef, Schema, SchemaRef};
 use datafusion::common::stats::Precision;
-use datafusion::common::{ColumnStatistics, ScalarValue, Statistics};
+use datafusion::common::{ColumnStatistics, Statistics};
 use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
 use datafusion::logical_expr::Accumulator as _;
 use wyrd_spec::DataTenantId;
@@ -3309,7 +3309,8 @@ pub(crate) fn batch_statistics(batch: &RecordBatch) -> Arc<Statistics> {
                 | DataType::Utf8View
                 | DataType::FixedSizeBinary(_)
         );
-        if !column.data_type().is_primitive() && !identity {
+        let bounded = column.data_type().is_primitive() || (identity && short_values(column));
+        if !bounded {
             continue;
         }
         let values = std::slice::from_ref(column);
@@ -3317,10 +3318,7 @@ pub(crate) fn batch_statistics(batch: &RecordBatch) -> Arc<Statistics> {
             .and_then(|mut min| min.update_batch(values).and_then(|()| min.evaluate()));
         let max = MaxAccumulator::try_new(column.data_type())
             .and_then(|mut max| max.update_batch(values).and_then(|()| max.evaluate()));
-        if let (Ok(min), Ok(max)) = (min, max)
-            && retained_bound(&min)
-            && retained_bound(&max)
-        {
+        if let (Ok(min), Ok(max)) = (min, max) {
             bounds.min_value = Precision::Exact(min);
             bounds.max_value = Precision::Exact(max);
         }
@@ -3334,14 +3332,25 @@ pub(crate) fn batch_statistics(batch: &RecordBatch) -> Arc<Statistics> {
 /// the statistics of every batch it bounds.
 const IDENTITY_BOUND_BYTES: usize = 64;
 
-/// Reports whether `bound` is short enough to retain: any non-identity value,
-/// or an identity value of at most [`IDENTITY_BOUND_BYTES`].
-fn retained_bound(bound: &ScalarValue) -> bool {
-    match bound {
-        ScalarValue::Utf8(Some(value))
-        | ScalarValue::LargeUtf8(Some(value))
-        | ScalarValue::Utf8View(Some(value)) => value.len() <= IDENTITY_BOUND_BYTES,
-        ScalarValue::FixedSizeBinary(_, Some(value)) => value.len() <= IDENTITY_BOUND_BYTES,
+/// Reports whether every slot of an identity `column` is at most
+/// [`IDENTITY_BOUND_BYTES`], read from its offsets or views alone.
+///
+/// Bounds run on the shard's serial owner, so a column holding any longer
+/// value (free text) is skipped before its values are compared; its bounds
+/// stay unknown even when its min and max would be short, which only prunes
+/// less.
+fn short_values(column: &dyn arrow::array::Array) -> bool {
+    use arrow::array::AsArray as _;
+    let fits = |len: usize| len <= IDENTITY_BOUND_BYTES;
+    match column.data_type() {
+        DataType::Utf8 => column.as_string::<i32>().offsets().lengths().all(fits),
+        DataType::LargeUtf8 => column.as_string::<i64>().offsets().lengths().all(fits),
+        DataType::Utf8View => column
+            .as_string_view()
+            .views()
+            .iter()
+            .all(|view| usize::try_from(*view & u128::from(u32::MAX)).is_ok_and(fits)),
+        DataType::FixedSizeBinary(width) => usize::try_from(*width).is_ok_and(fits),
         _ => true,
     }
 }
@@ -4336,8 +4345,9 @@ pub(crate) mod tests {
             Field::new("name", DataType::Utf8, false),
             Field::new("body", DataType::Utf8, false),
             Field::new("tags", DataType::Binary, false),
+            Field::new("trace", DataType::Utf8View, false),
         ]));
-        let long = "x".repeat(IDENTITY_BOUND_BYTES + 1);
+        let long = "m".repeat(IDENTITY_BOUND_BYTES + 1);
         let batch = RecordBatch::try_new(
             schema,
             vec![
@@ -4346,17 +4356,18 @@ pub(crate) mod tests {
                 Arc::new(arrow::array::StringArray::from(vec![
                     "a",
                     long.as_str(),
-                    "b",
+                    "z",
                 ])),
                 Arc::new(arrow::array::BinaryArray::from(vec![&b"a"[..], b"b", b"c"])),
+                Arc::new(arrow::array::StringViewArray::from(vec!["t2", "t1", "t3"])),
             ],
         )
         .expect("bounds fixture batch");
 
         let statistics = batch_statistics(&batch);
 
-        let [id, name, body, tags] = statistics.column_statistics.as_slice() else {
-            panic!("four columns");
+        let [id, name, body, tags, trace] = statistics.column_statistics.as_slice() else {
+            panic!("five columns");
         };
         assert_eq!(statistics.num_rows, Precision::Exact(3));
         assert_eq!(id.min_value, Precision::Exact(ScalarValue::Int64(Some(3))));
@@ -4369,8 +4380,20 @@ pub(crate) mod tests {
             name.max_value,
             Precision::Exact(ScalarValue::Utf8(Some("c".to_owned())))
         );
-        assert_eq!(body.max_value, Precision::Absent, "too long to retain");
-        assert_eq!(body.min_value, Precision::Absent);
+        assert_eq!(
+            body.min_value,
+            Precision::Absent,
+            "a column holding any over-long value is not bounded, even between short bounds"
+        );
+        assert_eq!(body.max_value, Precision::Absent);
+        assert_eq!(
+            trace.min_value,
+            Precision::Exact(ScalarValue::Utf8View(Some("t1".to_owned())))
+        );
+        assert_eq!(
+            trace.max_value,
+            Precision::Exact(ScalarValue::Utf8View(Some("t3".to_owned())))
+        );
         assert_eq!(
             tags.min_value,
             Precision::Absent,

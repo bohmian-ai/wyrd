@@ -989,6 +989,50 @@ test('a client navigation reads only its list, and support reads the population 
   expect(first.verify.support.facets.result.state).toBe('populated');
 });
 
+test('each Observe request validates its custom predicate once before reading, and a refused one reads nothing', async () => {
+  const requests: WireRequest[] = [];
+  let refusal: WireResult | undefined;
+  host.executor = {
+    run: (batch, signal) => {
+      requests.push(...batch);
+      if (!batch.some((request) => request.op === 'bifrost.validate_predicate')) return fixtureExecutor.run(batch, signal);
+      return Promise.resolve(batch.map(() => refusal ?? { ok: true, value: { expression: 'duration_ms > 5' } })) as never;
+    }
+  };
+  const custom = `signal=traces&where_sql=${encodeURIComponent('duration_ms>5')}${WINDOW}`;
+  const ops = () => requests.map((request) => request.op);
+  const refresh = async () => {
+    requests.length = 0;
+    const data = (await loadObserve(asSession(`observe?${custom}`, { isDataRequest: true }))) as unknown as { observe: { list: { result: { state: string } } } };
+    const list = { state: data.observe.list.result.state, ops: ops() };
+    requests.length = 0;
+    const response = await getObserveSupport(asSession(`observe/support?${custom}`));
+    return { list, support: { status: response.status, body: await response.json(), ops: ops() } };
+  };
+
+  // A client refresh is two host requests; each validates the predicate once, first, then reads under it.
+  const valid = await refresh();
+  expect(valid.list.state).not.toBe('error');
+  expect(valid.list.ops[0]).toBe('bifrost.validate_predicate');
+  expect(valid.list.ops.filter((op) => op === 'bifrost.validate_predicate')).toHaveLength(1);
+  expect(valid.support.status).toBe(200);
+  expect(valid.support.ops[0]).toBe('bifrost.validate_predicate');
+  expect(valid.support.ops.filter((op) => op === 'bifrost.validate_predicate')).toHaveLength(1);
+  expect(valid.support.ops.length).toBeGreaterThan(1);
+
+  // A refused or denied predicate stops both requests at the validation, with no dependent read.
+  for (const [code, status, state] of [
+    ['WYRD_VALA_400_QUERY_INVALID_SQL', 400, 'error'],
+    ['WYRD_VALA_403_QUERY_FORBIDDEN', 403, 'denied']
+  ] as const) {
+    refusal = { ok: false, problem: { code, title: code, status } };
+    const refused = await refresh();
+    expect(refused.list).toEqual({ state, ops: ['bifrost.validate_predicate'] });
+    expect(refused.support.ops).toEqual(['bifrost.validate_predicate']);
+    expect(refused.support.body.facets.result).toMatchObject({ state, problem: { code } });
+  }
+});
+
 test('a support read stops its upstream reads when the browser closes the connection, and leaves the connection as it found it', async () => {
   const signals: AbortSignal[] = [];
   host.executor = {

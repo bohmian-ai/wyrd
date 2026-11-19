@@ -1483,18 +1483,48 @@ impl MemtableBucket {
     ///
     /// The bounds are computed here, once per batch, so a live read prunes
     /// the batch without scanning its rows. The tail seals into a shared run
-    /// once it holds [`APPEND_RUN_LEN`] appends.
+    /// once it holds [`APPEND_RUN_LEN`] appends (see [`Self::seal_tail`]).
     fn append(&mut self, meta: ScribeAppendMeta, batch: RecordBatch) {
         self.row_count += batch.num_rows();
         self.bytes_accumulated += estimate_batch_bytes(&batch);
         self.tail.statistics.push(batch_statistics(&batch));
         self.tail.batches.push(batch);
+        #[cfg(test)]
         self.tail.wal_lsns.push(meta.wal_lsn_max);
         self.metas.push(meta);
         if self.tail.batches.len() == APPEND_RUN_LEN {
-            self.runs.push(self.tail.seal());
+            self.seal_tail();
         }
         self.last_insert_at = Instant::now();
+    }
+
+    /// Seals the tail into a coalesced run, then folds that run into the
+    /// previous run's last batch while [`AppendRun::absorb`] allows it.
+    ///
+    /// Folding works like a binary counter, so a stream of small appends
+    /// keeps a logarithmic number of growing batches, each row is copied a
+    /// logarithmic number of times, and a batch stops growing at
+    /// [`COALESCE_ROWS`] or [`COALESCE_BYTES`].
+    ///
+    /// Batches are replaced only while no live read holds this bucket's
+    /// `charge`, which every capture and every batch projected from one
+    /// holds. The replaced buffers are then freed at once, and the bucket's
+    /// charge, sized from the original appends, still covers the tighter
+    /// coalesced copy. While a read is in flight the tail seals uncopied,
+    /// and a later seal folds into it.
+    fn seal_tail(&mut self) {
+        let exclusive = Arc::strong_count(&self.charge) == 1;
+        let mut run = self.tail.seal(exclusive);
+        while let Some(merged) = self
+            .runs
+            .last()
+            .filter(|_| exclusive)
+            .and_then(|older| older.absorb(&run))
+        {
+            self.runs.pop();
+            run = merged;
+        }
+        self.runs.push(run);
     }
 
     /// Classify whether this bucket should seal, and why, at `now`.
@@ -1532,11 +1562,13 @@ impl MemtableBucket {
     /// hot-source registry. Producing both from one value is what keeps a
     /// published member's ordinal equal to its registered one.
     ///
-    /// The generation's batches and bounds are concatenated from the sealed
-    /// runs and the tail once here, so the generation is shared by reference
-    /// from then on.
+    /// The tail seals like any other (see [`Self::seal_tail`]), and the
+    /// generation's batches and bounds are listed from the sealed runs once
+    /// here, so the generation is shared by reference from then on.
     fn freeze(mut self, seal_id: u64, shard_id: usize) -> FrozenMemtable {
-        self.runs.push(self.tail.seal());
+        if !self.tail.batches.is_empty() {
+            self.seal_tail();
+        }
         let batches = self
             .runs
             .iter()
@@ -1671,12 +1703,11 @@ impl ImmutableEntry {
 
     /// Tracks `frozen` as a generation awaiting its durable commit.
     ///
-    /// # Panics
-    ///
-    /// Panics when `frozen` does not carry one append meta per batch (see
-    /// [`AppendRun::new`]).
+    /// A test build names each batch by its append's WAL position when the
+    /// batches are the appends, and by the generation's last position when
+    /// appends were coalesced.
     fn pending(frozen: FrozenMemtable) -> Self {
-        Self {
+        let entry = Self {
             seal_id: frozen.seal_id,
             wal_lsn_min: frozen
                 .metas
@@ -1690,14 +1721,27 @@ impl ImmutableEntry {
                 .map(|meta| meta.wal_lsn_max)
                 .max()
                 .unwrap_or_else(|| crate::scribe::wal::WalLsn::new(0)),
-            run: AppendRun::new(
-                Arc::clone(&frozen.batches),
-                Arc::clone(&frozen.statistics),
-                frozen.metas.iter().map(|meta| meta.wal_lsn_max).collect(),
-            ),
+            run: AppendRun::new(Arc::clone(&frozen.batches), Arc::clone(&frozen.statistics)),
             frozen,
             state: ImmutableState::PendingCommit,
-        }
+        };
+        #[cfg(test)]
+        let entry = {
+            let mut entry = entry;
+            let lsns = if entry.frozen.metas.len() == entry.frozen.batches.len() {
+                entry
+                    .frozen
+                    .metas
+                    .iter()
+                    .map(|meta| meta.wal_lsn_max)
+                    .collect()
+            } else {
+                vec![entry.wal_lsn_max; entry.frozen.batches.len()]
+            };
+            entry.run = entry.run.with_wal_lsns(lsns.into());
+            entry
+        };
+        entry
     }
 
     /// Captures this immutable generation's batches for projection outside
@@ -2118,55 +2162,226 @@ pub(crate) struct LiveReadOwners {
 /// Most appends a writable bucket's tail holds before it seals into a shared
 /// [`AppendRun`].
 ///
-/// A live capture shares every sealed run and copies only the tail, so this
-/// bounds the per-capture copy while keeping a bucket's run count small.
-const APPEND_RUN_LEN: usize = 64;
+/// A live capture shares every sealed run and copies only the tail, and a
+/// live read evaluates each tail append as its own batch, so a short tail
+/// keeps both small; sealing coalesces the appends (see
+/// [`MemtableBucket::seal_tail`]).
+const APPEND_RUN_LEN: usize = 8;
+
+/// Most rows a coalesced memtable batch holds: DataFusion's default execution
+/// batch size, so a live read hands operators full batches.
+const COALESCE_ROWS: usize = 8192;
+
+/// Most column bytes a coalesced memtable batch holds, bounding the copy one
+/// seal makes under the memtable write lock.
+const COALESCE_BYTES: usize = 4 << 20;
+
+/// Returns the rows and column bytes `statistics` records for its batch, or
+/// `None` when either is unknown, as for a hand-built test batch.
+fn recorded_size(statistics: &Statistics) -> Option<(usize, usize)> {
+    let rows = *statistics.num_rows.get_value()?;
+    let bytes = statistics
+        .column_statistics
+        .iter()
+        .try_fold(0_usize, |total, column| {
+            Some(total.saturating_add(*column.byte_size.get_value()?))
+        })?;
+    Some((rows, bytes))
+}
+
+/// Reports whether batches of sizes `left` and `right` coalesce within
+/// [`COALESCE_ROWS`] and [`COALESCE_BYTES`].
+fn coalesces(left: (usize, usize), right: (usize, usize)) -> bool {
+    left.0.saturating_add(right.0) <= COALESCE_ROWS
+        && left.1.saturating_add(right.1) <= COALESCE_BYTES
+}
+
+/// Concatenates consecutive same-schema `batches` into one, with bounds
+/// merged from their exact `statistics` and byte sizes measured from the
+/// result.
+///
+/// Returns `None` when Arrow refuses the concatenation or the bounds do not
+/// merge; the caller then keeps the batches as they are.
+fn coalesce(
+    batches: &[&RecordBatch],
+    statistics: &[&Statistics],
+) -> Option<(RecordBatch, Arc<Statistics>)> {
+    let schema = batches.first()?.schema();
+    let batch = arrow::compute::concat_batches(&schema, batches.iter().copied()).ok()?;
+    let mut merged = Statistics::try_merge_iter(statistics.iter().copied(), &schema).ok()?;
+    for (column, bounds) in batch
+        .columns()
+        .iter()
+        .zip(merged.column_statistics.iter_mut())
+    {
+        bounds.byte_size = column
+            .to_data()
+            .get_slice_memory_size()
+            .map_or(Precision::Absent, Precision::Exact);
+    }
+    Some((batch, Arc::new(merged)))
+}
 
 /// Consecutive appends shared by reference between the bucket or generation
 /// that retains them and every live capture of them.
 ///
-/// Cloning a run clones three handles, never a batch, so a capture taken
+/// Cloning a run clones a few handles, never a batch, so a capture taken
 /// under the memtable read locks costs a few pointer copies per run.
 #[derive(Debug, Clone)]
 struct AppendRun {
-    /// The appended batches, in append order.
+    /// The retained batches, in append order; a sealed run's small appends
+    /// are coalesced.
     batches: Arc<[RecordBatch]>,
     /// Exact bounds of each batch, index-aligned with `batches`; a batch
     /// without an entry reads with unknown bounds.
     statistics: Arc<[Arc<Statistics>]>,
-    /// Maximum WAL LSN of each append, index-aligned with `batches`, kept
-    /// only so tests can name each batch a read returns.
+    /// Maximum WAL LSN of each batch's appends, index-aligned with
+    /// `batches`, kept only so tests can name each batch a read returns.
     #[cfg(test)]
     wal_lsns: Arc<[crate::scribe::wal::WalLsn]>,
 }
 
 impl AppendRun {
-    /// Builds a run over index-aligned appends.
+    /// Builds a run over `batches` and their bounds.
     ///
     /// `statistics` may be shorter than `batches`, as in a hand-built test
     /// generation; those batches read with unknown bounds.
-    ///
-    /// # Panics
-    ///
-    /// Panics when `wal_lsns` does not carry exactly one WAL position per
-    /// batch. A live read pairs batches with positions run by run, so a
-    /// mismatch would misalign every later run's bounds and pruning.
-    fn new(
-        batches: Arc<[RecordBatch]>,
-        statistics: Arc<[Arc<Statistics>]>,
-        wal_lsns: Arc<[crate::scribe::wal::WalLsn]>,
-    ) -> Self {
-        assert_eq!(
-            batches.len(),
-            wal_lsns.len(),
-            "an append run carries exactly one WAL position per batch"
-        );
+    fn new(batches: Arc<[RecordBatch]>, statistics: Arc<[Arc<Statistics>]>) -> Self {
         Self {
             batches,
             statistics,
             #[cfg(test)]
-            wal_lsns,
+            wal_lsns: Arc::default(),
         }
+    }
+
+    /// Names each batch by the WAL position a test reads it back as.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `wal_lsns` does not carry exactly one WAL position per
+    /// batch, which would misname every later batch.
+    #[cfg(test)]
+    fn with_wal_lsns(mut self, wal_lsns: Arc<[crate::scribe::wal::WalLsn]>) -> Self {
+        assert_eq!(
+            self.batches.len(),
+            wal_lsns.len(),
+            "an append run carries exactly one WAL position per batch"
+        );
+        self.wal_lsns = wal_lsns;
+        self
+    }
+
+    /// Seals index-aligned appends into a run. When the caller holds them
+    /// `exclusive`ly, each stretch of consecutive appends that [`coalesces`]
+    /// is concatenated into one batch; an append too large to join its
+    /// neighbours, or of unknown size, is kept uncopied, as every append is
+    /// otherwise.
+    fn sealed(
+        batches: Vec<RecordBatch>,
+        statistics: Vec<Arc<Statistics>>,
+        #[cfg(test)] wal_lsns: Vec<crate::scribe::wal::WalLsn>,
+        exclusive: bool,
+    ) -> Self {
+        let mut kept = Vec::with_capacity(batches.len());
+        let mut bounds = Vec::with_capacity(batches.len());
+        #[cfg(test)]
+        let mut lsns = Vec::with_capacity(batches.len());
+        let mut flush = |range: std::ops::Range<usize>| {
+            let merged = (range.len() > 1)
+                .then(|| {
+                    coalesce(
+                        &batches[range.clone()].iter().collect::<Vec<_>>(),
+                        &statistics[range.clone()]
+                            .iter()
+                            .map(AsRef::as_ref)
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .flatten();
+            if let Some((batch, merged)) = merged {
+                kept.push(batch);
+                bounds.push(merged);
+                #[cfg(test)]
+                lsns.push(wal_lsns[range.end - 1]);
+            } else {
+                kept.extend(batches[range.clone()].iter().cloned());
+                bounds.extend(statistics[range.clone()].iter().cloned());
+                #[cfg(test)]
+                lsns.extend_from_slice(&wal_lsns[range]);
+            }
+        };
+        let mut start = 0;
+        let mut size = None;
+        for index in 0..batches.len() {
+            let next = statistics.get(index).and_then(|item| recorded_size(item));
+            match (size, next) {
+                (Some(group), Some(item)) if exclusive && coalesces(group, item) => {
+                    size = Some((group.0 + item.0, group.1 + item.1));
+                }
+                _ => {
+                    if index > start {
+                        flush(start..index);
+                    }
+                    start = index;
+                    size = next;
+                }
+            }
+        }
+        if start < batches.len() {
+            flush(start..batches.len());
+        }
+        let run = Self::new(kept.into(), bounds.into());
+        #[cfg(test)]
+        let run = run.with_wal_lsns(lsns.into());
+        run
+    }
+
+    /// Folds `newer`, a run sealed after this one, into this run's last
+    /// batch, or returns `None` to keep them apart.
+    ///
+    /// They fold only when `newer` is one batch, the two coalesce, and this
+    /// run's last batch holds at most twice `newer`'s rows. The size ratio
+    /// is what makes sealing a binary counter: a batch is recopied only once
+    /// enough rows arrive behind it to roughly double it. Only the last
+    /// batch is copied; every earlier batch of this run is shared.
+    fn absorb(&self, newer: &Self) -> Option<Self> {
+        let [newest] = &*newer.batches else {
+            return None;
+        };
+        let last = self.batches.len().checked_sub(1)?;
+        let older_bounds = self.statistics.get(last)?;
+        let newer_bounds = newer.statistics.first()?;
+        let older = recorded_size(older_bounds)?;
+        let added = recorded_size(newer_bounds)?;
+        if older.0 > added.0.saturating_mul(2) || !coalesces(older, added) {
+            return None;
+        }
+        let (batch, merged) = coalesce(
+            &[&self.batches[last], newest],
+            &[older_bounds, newer_bounds],
+        )?;
+        let run = Self::new(
+            self.batches[..last]
+                .iter()
+                .cloned()
+                .chain(std::iter::once(batch))
+                .collect(),
+            self.statistics[..last]
+                .iter()
+                .cloned()
+                .chain(std::iter::once(merged))
+                .collect(),
+        );
+        #[cfg(test)]
+        let run = run.with_wal_lsns(
+            self.wal_lsns[..last]
+                .iter()
+                .chain(newer.wal_lsns.iter())
+                .copied()
+                .collect(),
+        );
+        Some(run)
     }
 }
 
@@ -2177,7 +2392,9 @@ struct AppendTail {
     batches: Vec<RecordBatch>,
     /// Exact bounds of each batch, index-aligned with `batches`.
     statistics: Vec<Arc<Statistics>>,
-    /// Maximum WAL LSN of each append, index-aligned with `batches`.
+    /// Maximum WAL LSN of each append, index-aligned with `batches`, kept
+    /// only so tests can name each batch a read returns.
+    #[cfg(test)]
     wal_lsns: Vec<crate::scribe::wal::WalLsn>,
 }
 
@@ -2185,20 +2402,30 @@ impl AppendTail {
     /// Copies the tail into a run a capture holds while the bucket keeps
     /// appending.
     fn run(&self) -> AppendRun {
-        AppendRun::new(
+        let run = AppendRun::new(
             self.batches.as_slice().into(),
             self.statistics.as_slice().into(),
-            self.wal_lsns.as_slice().into(),
-        )
+        );
+        #[cfg(test)]
+        let run = run.with_wal_lsns(self.wal_lsns.as_slice().into());
+        run
     }
 
-    /// Moves the tail into a sealed run, leaving it empty.
-    fn seal(&mut self) -> AppendRun {
-        AppendRun::new(
-            std::mem::take(&mut self.batches).into(),
-            std::mem::take(&mut self.statistics).into(),
-            std::mem::take(&mut self.wal_lsns).into(),
-        )
+    /// Moves the tail into a sealed run, coalesced when the bucket holds it
+    /// `exclusive`ly (see [`AppendRun::sealed`]), leaving it empty.
+    fn seal(&mut self, exclusive: bool) -> AppendRun {
+        let batches = std::mem::take(&mut self.batches);
+        let statistics = std::mem::take(&mut self.statistics);
+        #[cfg(test)]
+        let run = AppendRun::sealed(
+            batches,
+            statistics,
+            std::mem::take(&mut self.wal_lsns),
+            exclusive,
+        );
+        #[cfg(not(test))]
+        let run = AppendRun::sealed(batches, statistics, exclusive);
+        run
     }
 }
 
@@ -3628,41 +3855,38 @@ pub(crate) mod tests {
 
     /// A capture shares a bucket's sealed runs and a generation's batches by
     /// reference and copies only the bucket's unsealed tail; every read and
-    /// freeze keeps each append's rows paired with its WAL position, in order.
+    /// freeze keeps every append's rows, in order.
     ///
-    /// Each append's single `id` row equals its LSN, so a reordered or
-    /// misaligned batch is caught. The bucket is captured at exactly one full
-    /// run (no tail), then again after more appends span two sealed runs and
-    /// a tail; the earlier capture keeps its rows. Pruning keeps exactly the
-    /// batches whose bounds match across a run boundary, and freezing shares
-    /// one concatenated generation with all its bounds.
+    /// Each append is one `id` row numbered in append order. The bucket is
+    /// captured at exactly one full, coalesced run (no tail), then again
+    /// after a second run, sealed uncopied while the first capture holds the
+    /// bucket, and a tail of two appends; the earlier capture keeps its rows.
+    /// Pruning by the coalesced batch's merged bounds keeps it whole or skips
+    /// it, and freezing shares one generation with all its bounds.
     ///
     /// # Panics
     ///
     /// Panics when a capture copies a sealed run or a frozen generation, or a
-    /// read, prune, or freeze loses, reorders, or misaligns an append.
+    /// read, prune, or freeze loses or reorders a row.
     #[test]
     fn captures_share_sealed_runs_and_frozen_generations() {
-        use arrow::array::Array as _;
-
         let memtable = Memtable::new();
         let key = make_test_seal_key();
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let insert = |lsns: std::ops::RangeInclusive<u64>| {
-            for lsn in lsns {
-                let value = i64::try_from(lsn).expect("lsn value");
+        let insert = |ids: std::ops::RangeInclusive<i64>| {
+            for id in ids {
                 let batch = RecordBatch::try_new(
                     Arc::clone(&schema),
-                    vec![Arc::new(Int64Array::from(vec![value]))],
+                    vec![Arc::new(Int64Array::from(vec![id]))],
                 )
-                .expect("valued batch");
+                .expect("id batch");
                 memtable
-                    .insert(&key, make_test_meta(lsn), batch)
+                    .insert(&key, make_test_meta(id.unsigned_abs()), batch)
                     .expect("active insert");
             }
         };
         let partitions = key.partition.time()..=key.partition.time();
-        let lsns = |capture: &LiveCapture, pruning| -> Vec<u64> {
+        let ids = |capture: &LiveCapture, pruning| -> Vec<i64> {
             capture
                 .read(
                     &partitions,
@@ -3675,21 +3899,15 @@ pub(crate) mod tests {
                 .evaluated()
                 .expect("batches evaluate")
                 .iter()
-                .map(|readable| {
-                    let lsn = readable.wal_lsn_max.as_u64();
-                    let ids = readable
+                .flat_map(|readable| {
+                    readable
                         .batch
                         .column(0)
                         .as_any()
                         .downcast_ref::<Int64Array>()
-                        .expect("id column");
-                    assert_eq!(ids.len(), 1);
-                    assert_eq!(
-                        u64::try_from(ids.value(0)).ok(),
-                        Some(lsn),
-                        "rows follow their LSN"
-                    );
-                    lsn
+                        .expect("id column")
+                        .values()
+                        .to_vec()
                 })
                 .collect()
         };
@@ -3705,74 +3923,195 @@ pub(crate) mod tests {
             for (captured, owned) in capture.memory[0].runs.iter().zip(&bucket.runs) {
                 assert!(Arc::ptr_eq(&captured.batches, &owned.batches));
                 assert!(Arc::ptr_eq(&captured.statistics, &owned.statistics));
-                assert!(Arc::ptr_eq(&captured.wal_lsns, &owned.wal_lsns));
             }
         };
-        let full = u64::try_from(APPEND_RUN_LEN).expect("run length");
+        let between = |low: i64, high: i64| {
+            let bound = |operator, value: i64| {
+                Arc::new(datafusion::physical_expr::expressions::BinaryExpr::new(
+                    datafusion::physical_expr::expressions::col("id", &schema).expect("id column"),
+                    operator,
+                    datafusion::physical_expr::expressions::lit(value),
+                ))
+            };
+            crate::scan_sizing::BatchPruning::try_new(
+                &schema,
+                Arc::new(datafusion::physical_expr::expressions::BinaryExpr::new(
+                    bound(datafusion::logical_expr::Operator::GtEq, low),
+                    datafusion::logical_expr::Operator::And,
+                    bound(datafusion::logical_expr::Operator::LtEq, high),
+                )),
+            )
+            .expect("pruning plans")
+        };
+        let full = i64::try_from(APPEND_RUN_LEN).expect("run length");
         let total = 2 * full + 2;
+        let around_the_fold = between(full - 2, full + 3);
+        let tail_append = between(total - 1, total - 1);
 
         insert(1..=full);
         let exact = take();
         assert_eq!(exact.memory[0].runs.len(), 1, "a full run leaves no tail");
         shares_sealed(&exact, 1);
-        assert_eq!(lsns(&exact, None), (1..=full).collect::<Vec<_>>());
+        assert_eq!(ids(&exact, None), (1..=full).collect::<Vec<_>>());
 
         insert(full + 1..=total);
         let active = take();
         assert_eq!(
             active.memory[0].runs.len(),
             3,
-            "two sealed runs and the tail"
+            "the first run, the run sealed while it was held, and the tail"
         );
         shares_sealed(&active, 2);
-        assert_eq!(active.memory[0].runs[2].batches.len(), 2);
-        assert_eq!(lsns(&active, None), (1..=total).collect::<Vec<_>>());
+        assert_eq!(active.memory[0].runs[0].batches.len(), 1, "coalesced");
         assert_eq!(
-            lsns(&exact, None),
+            active.memory[0].runs[1].batches.len(),
+            APPEND_RUN_LEN,
+            "a run sealed while a capture holds the bucket stays uncopied"
+        );
+        assert_eq!(active.memory[0].runs[2].batches.len(), 2);
+        assert_eq!(ids(&active, None), (1..=total).collect::<Vec<_>>());
+        assert_eq!(
+            ids(&exact, None),
             (1..=full).collect::<Vec<_>>(),
             "an earlier capture keeps its rows"
         );
-
-        let bound = |operator, value: u64| {
-            Arc::new(datafusion::physical_expr::expressions::BinaryExpr::new(
-                datafusion::physical_expr::expressions::col("id", &schema).expect("id column"),
-                operator,
-                datafusion::physical_expr::expressions::lit(
-                    i64::try_from(value).expect("bound value"),
-                ),
-            ))
-        };
-        let pruning = crate::scan_sizing::BatchPruning::try_new(
-            &schema,
-            Arc::new(datafusion::physical_expr::expressions::BinaryExpr::new(
-                bound(datafusion::logical_expr::Operator::GtEq, full - 2),
-                datafusion::logical_expr::Operator::And,
-                bound(datafusion::logical_expr::Operator::LtEq, full + 3),
-            )),
-        )
-        .expect("pruning plans");
         assert_eq!(
-            lsns(&active, Some(&pruning)),
-            (full - 2..=full + 3).collect::<Vec<_>>(),
-            "pruning keeps exactly the matching batches across the run boundary"
+            ids(&active, Some(&around_the_fold)),
+            (1..=full + 3).collect::<Vec<_>>(),
+            "the coalesced batch may match, so it is kept whole; later appends \
+             are pruned one by one"
+        );
+        assert_eq!(
+            ids(&active, Some(&tail_append)),
+            vec![total - 1],
+            "the coalesced batch's merged bounds rule it out"
         );
 
         let frozen = memtable.freeze(&key).expect("freeze");
-        let appended = usize::try_from(total).expect("append count");
-        assert_eq!(frozen.batches.len(), appended);
-        assert_eq!(frozen.statistics.len(), appended);
+        let batches = 1 + APPEND_RUN_LEN + 2;
+        assert_eq!(
+            frozen.batches.len(),
+            batches,
+            "held, so the tail seals uncopied"
+        );
+        assert_eq!(frozen.statistics.len(), batches);
         let captured = take();
         assert!(Arc::ptr_eq(
             &captured.memory[0].runs[0].batches,
             &frozen.batches
         ));
-        assert_eq!(lsns(&captured, None), (1..=total).collect::<Vec<_>>());
+        assert_eq!(ids(&captured, None), (1..=total).collect::<Vec<_>>());
+        assert_eq!(ids(&captured, Some(&tail_append)), vec![total - 1]);
+        assert_eq!(ids(&active, None), (1..=total).collect::<Vec<_>>());
+        assert_eq!(ids(&exact, None), (1..=full).collect::<Vec<_>>());
+    }
+
+    /// Small appends coalesce as their bucket seals, unless a live read
+    /// holds the bucket.
+    ///
+    /// 64 one-row appends read back as one batch in append order. While a
+    /// capture is held the next run seals uncopied, so its rows still read
+    /// from the buffers the capture shares; once it drops, the next run folds
+    /// into the uncopied run's last batch. An append over [`COALESCE_ROWS`]
+    /// keeps its own uncopied batch, and the small appends after it coalesce.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a read loses or reorders a row, small appends are not
+    /// coalesced, or a held bucket's batches are replaced.
+    #[test]
+    fn small_appends_coalesce_unless_a_read_holds_the_bucket() {
+        let memtable = Memtable::new();
+        let key = make_test_seal_key();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let append = |ids: std::ops::Range<i64>| {
+            let lsn = ids.start.unsigned_abs();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from_iter_values(ids))],
+            )
+            .expect("id batch");
+            memtable
+                .insert(&key, make_test_meta(lsn), batch)
+                .expect("active insert");
+        };
+        let partitions = key.partition.time()..=key.partition.time();
+        let read = |capture: &LiveCapture| -> Vec<Vec<i64>> {
+            capture
+                .read(&partitions, schema.fields(), None, None, &unbounded_pool())
+                .expect("capture read")
+                .evaluated()
+                .expect("batches evaluate")
+                .iter()
+                .map(|readable| {
+                    readable
+                        .batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("id column")
+                        .values()
+                        .to_vec()
+                })
+                .collect()
+        };
+        let take = || {
+            LiveCapture::take([&memtable], key.tenant, &key.table, None)
+                .expect("locks")
+                .expect("no registry to wait on")
+        };
+        let ones = |ids: std::ops::Range<i64>| ids.map(|id| vec![id]).collect::<Vec<_>>();
+
+        for id in 1..=64 {
+            append(id..id + 1);
+        }
+        assert_eq!(read(&take()), vec![(1..=64).collect::<Vec<_>>()]);
+
+        let held = take();
+        for id in 65..=72 {
+            append(id..id + 1);
+        }
+        let mut expected = vec![(1..=64).collect::<Vec<_>>()];
+        expected.extend(ones(65..73));
+        assert_eq!(read(&take()), expected, "a held bucket seals uncopied");
+        assert_eq!(read(&held), vec![(1..=64).collect::<Vec<_>>()]);
+        drop(held);
+
+        for id in 73..=80 {
+            append(id..id + 1);
+        }
+        let mut expected = vec![(1..=64).collect::<Vec<_>>()];
+        expected.extend(ones(65..72));
+        expected.push((72..=80).collect());
         assert_eq!(
-            lsns(&captured, Some(&pruning)),
-            (full - 2..=full + 3).collect::<Vec<_>>()
+            read(&take()),
+            expected,
+            "the next run folds into the last batch"
         );
-        assert_eq!(lsns(&active, None), (1..=total).collect::<Vec<_>>());
-        assert_eq!(lsns(&exact, None), (1..=full).collect::<Vec<_>>());
+
+        let large = i64::try_from(COALESCE_ROWS).expect("row cap") + 1;
+        append(100..100 + large);
+        let large_batch = {
+            let writable = memtable.writable.read().expect("writable lock");
+            writable[&key].tail.batches[0].clone()
+        };
+        for id in 0..63 {
+            append(1_000 + id..1_001 + id);
+        }
+        let batches = read(&take());
+        let [.., large_read, after] = batches.as_slice() else {
+            panic!("the large append and the appends after it");
+        };
+        assert_eq!(*large_read, (100..100 + large).collect::<Vec<_>>());
+        assert_eq!(*after, (1_000..1_063).collect::<Vec<_>>());
+        let writable = memtable.writable.read().expect("writable lock");
+        let kept = &writable[&key].runs.last().expect("sealed run").batches;
+        assert!(
+            kept.iter()
+                .any(|batch| batch.column(0).to_data().buffers()[0].as_ptr()
+                    == large_batch.column(0).to_data().buffers()[0].as_ptr()),
+            "the large append is not copied"
+        );
     }
 
     /// A capture read that projects every written column, in order and
@@ -4396,9 +4735,12 @@ pub(crate) mod tests {
                 .collect::<std::collections::BTreeSet<_>>()
         };
 
+        // Each frozen generation's appends coalesce into one batch, named by
+        // its last append: 30 for the enclosing generation, 20 for the
+        // enclosed one; 31 is still active.
         assert_eq!(
             cut(&memtable),
-            [1_u64, 12, 20, 30, 31].into_iter().collect(),
+            [20_u64, 30, 31].into_iter().collect(),
             "nothing durable serves these rows yet, so every one of them is live"
         );
 
@@ -4408,7 +4750,7 @@ pub(crate) mod tests {
 
         assert_eq!(
             cut(&memtable),
-            [12_u64, 20, 31].into_iter().collect(),
+            [20_u64, 31].into_iter().collect(),
             "the enclosed generation owns its own rows and the enclosing member's \
              bounds are not evidence about them"
         );
@@ -5103,8 +5445,8 @@ pub(crate) mod tests {
         let frozen = memtable.freeze(&seal_key).expect("freeze");
 
         assert_eq!(frozen.row_count(), 300, "3 batches × 100 rows retained");
-        assert_eq!(frozen.batches.len(), 3);
-        assert_eq!(frozen.metas.len(), 3);
+        assert_eq!(frozen.batches.len(), 1, "the small appends coalesce");
+        assert_eq!(frozen.metas.len(), 3, "every append keeps its meta");
         assert_eq!(frozen.seal_key, seal_key);
 
         // Insert after freeze should go to a new bucket

@@ -145,3 +145,45 @@ a sealed host attestation or a cross-request memo, each a new trust
 mechanism that the task excludes. No code change. This ruling replaces the
 "exactly one applicable validation" pass criterion for the client refresh;
 the standalone, refused-predicate and list-only rows still need proof.
+
+### Closure
+
+Tested commit `b5f8a322a` (R2 commits `450ab04fe`, `f968142b0`, `14ae3b9fe`,
+`33fd49980`, `b5f8a322a` over baseline `41f2419c8`); no relevant uncommitted
+state.
+
+| Row | Status | Proof |
+|---|---|---|
+| FIND-4: startup | PASS | `supportGate` gained `hold('head')`, which keeps the server's response head back. Observe journey (`Observe reads support once per population…`): with the list rendered, Zoom in twice, then leave for Verify; every held grouped SQL request `ended` `abandoned` before any head (3 + 3). The existing post-header hold, its abandonment and the no-late-overwrite assertions are unchanged and pass. Owner fix: TS SDK `Bifrost.stream(..., { signal })` with native `NativeAbort`, which drops the pending Rust future and so the HTTP request; `node.ts` passes its signal. Lower tier: `sdks/wyrd-sdk-ts/wyrd/tests/unit/abort-pending.test.ts` holds `/v1/query` on a silent loopback server and observes its socket close on abort. |
+| FIND-4: Card names | PASS | Verify dashboard journey: with Verify's real `cards.list` (`GET /v1/cards`) and discovery SQL both held before headers, filter `failed` then `completed`, then leave for Observe; each pair `ended` `abandoned` (`['cards','sql']` × 2). Later steps keep label fallback and the bounded 200-Verifier lookup. SDK: `Cards.list(request, { signal })`, same unit test; an already-aborted signal sends nothing. |
+| FIND-7 | PASS under ruling | Ruling above. `ui-pages.test.ts` `each Observe request validates its custom predicate once before reading…`: with valid nonblank `where_sql`, the client list request and the support request each issue exactly one `bifrost.validate_predicate`, first; an invalid (`400`) or denied (`403`) predicate stops both with only the validation call. Standalone loaders keep their own validation (`observe signal planning and interactions`). The list-only no-support-refresh test (`a client navigation reads only its list…`) is unchanged and passes. |
+| Explicit loading | PASS | `Streamed.pending` is true while the newest read is for a population other than the one shown, or Back is showing a remembered value; it is false for a Live reread of the shown population (`streamed.test.ts`, 2 new tests). `src/lib/Updating.svelte` dims retained facets and charts, sets `aria-busy`, and overlays a `role=status` "Updating" label without changing height. The list bar counts (Observe) and total (Verify) are marked too, and Verify's list neither counts nor pages against the old total. Observe's overview and timeline show loading or error EmptyStates until their first support. Browser assertions: Updating on facets and overview/charts while held, list usable, cleared after release, initial "Reading the overview", per-chart errors with no counts on failure, nothing busy during a held Live reread, and Back height and scroll unchanged. |
+| Visual acceptance | Evidence prepared; rulings pending | See captures below. |
+
+**RED observed:** browser `expected [0,0] to deeply equal [1,1]` (no Updating marker) on both boards; Observe startup outcome `['open','open','open']` and Verify `['open','open']` before the SDK signal; counts `aria-busy` `null`; Verify `Show N more` count `1`; `pending` `undefined`, then `true` for a Live reread. SDK mutation: with abort forwarding disabled, both abort tests time out.
+
+**Removed proof:** the `Bifrost.running()` "server no longer runs it" check was vacuous, because held queries were already absent from `running()` while held. Only the closed upstream request is claimed, not server-side work release.
+
+**Commands** (Cargo serialized):
+
+```bash
+mise exec -- scripts/postgres/with-test-postgres.sh -- env WYRD_UI_INTEGRATION=1 WYRD_UI_CAPTURE_DIR=<captures> pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-pages.integration.test.ts -t 'Observe reads support once per population|the Verify dashboard filters|authenticated traces and spans|authenticated logs investigation|authenticated metrics investigation|observe boards match approved canvas'   # 6 passed
+pnpm --dir crates/wyrd/wyrd-server/wyrd-ui exec vitest run src/lib/streamed.test.ts src/lib/ui-pages.test.ts   # 25 passed
+mise run ui:check                                   # 0 errors; 95 tests
+mise exec -- cargo fmt -p wyrd-sdk-ts; mise exec -- cargo clippy --locked -p wyrd-sdk-ts --all-targets -- -D warnings   # clean
+mise run ts:napi:check; mise run ts:format:check; mise run ts:lints; mise run ts:typecheck   # pass
+mise run ts:test:unit                               # 91 passed
+git diff --check                                    # clean
+```
+
+**Hot path:** none touched. The change is UI host, TS SDK and native binding client-side cancellation; no server, Oracle, Scribe or PostgreSQL wait is added or moved.
+
+**Captures:** `captures/` beside this file (untracked, 1440×900, full page,
+`lifecycle-{observe,verify}-{loading,updating,settled,support-error,back}-{light,dark}.png`,
+20 files), written via `WYRD_UI_CAPTURE_DIR` on the command line. Rulings
+requested, none given yet:
+1. The Updating treatment: 50% dim plus an overlaid dashed "● Updating" label in the house EmptyState vocabulary. On the facet rail the label overlaps the "Click a value to add it to WHERE" hint.
+2. Initial overview and timeline loading as a dashed EmptyState inside the panel.
+3. The dark full-page background still ends at the 900 px viewport (`lifecycle-*-dark.png`); existing styling, not changed here.
+
+**TDD:** the original and R1 violations stand as recorded, including R1's malformed-JSON test-after-fix. R2: the FIND-4 SDK unit test was written after the native/TS signal. Its strength is shown by mutation, but test-first was not followed (the browser RED came first). The FIND-7 host test is characterization of already-correct behavior. Loading, counts and Live-pending were test-first.

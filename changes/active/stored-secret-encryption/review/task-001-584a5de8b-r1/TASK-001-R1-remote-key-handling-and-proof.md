@@ -7,7 +7,7 @@ spec_revision: 1
 requirements: [REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, REQ-008]
 depends_on: [TASK-001]
 parent_task: TASK-001
-remediates: [FIND-TASK-001-1, FIND-TASK-001-2, FIND-TASK-001-3]
+remediates: [FIND-TASK-001-1, FIND-TASK-001-2]
 ---
 
 # Complete remote key handling and acceptance proof
@@ -15,8 +15,7 @@ remediates: [FIND-TASK-001-1, FIND-TASK-001-2, FIND-TASK-001-3]
 ## Outcome and reviewed subject
 
 Make the existing remote KMS capability preserve its secret-buffer invariant,
-accept the advertised federated GCP workload ADC configuration, and carry the
-required performance proof for its shared Gateway Vault consumer. Successful
+accept the advertised federated GCP workload ADC configuration. Successful
 closure lets the next task consume the common facade without changing its
 envelope, authority context or deployment key trust.
 
@@ -49,12 +48,8 @@ No new public authentication option or live production cloud account is
 needed. Narrowing the approved contract requires specification authority and
 is not an implementation fix under this task.
 
-**FIND-TASK-001-3 — mandatory Gateway qualification.** The shared Vault KV
-extraction executes on Gateway ExternalSecret requests. Supply the full clean
-canonical Gateway benchmark and comparison, and correct the original task's
-no-hot-path assertion. This is an evidence correction; it requires no
-production rewrite. Preserve the user's uncommitted files when obtaining a
-clean checkout. Reuse existing benchmark history/readers/report format.
+The maintainer withdrew FIND-TASK-001-3 and its benchmark requirement on
+2026-11-19. No benchmark is assigned by this remediation task.
 
 ## Ordered closure scenarios
 
@@ -136,72 +131,21 @@ clean checkout. Reuse existing benchmark history/readers/report format.
    the existing injected-credential tests for KMS wire assertions. Do not
    substitute a direct injected provider for the constructor being fixed.
 
-   **Evidence (commit `9fd0858b4`). PASS.** Owner: `GcpKms::new`
-   (`crates/wyrd/wyrd-kms/src/gcp.rs`). It now builds Google's
-   `google-cloud-auth` 1.19 application default credentials
-   (`Builder::default().build_access_token_credentials()`), adapted to the
-   existing `GcpCredentialProvider` by the private `Adc` provider.
-   - The gap: the locked `object_store` 0.14.2 ADC enum has no
-     `external_account` variant.
-   - Why this crate: `google-cloud-auth` is Google's reference ADC
-     implementation. It covers `service_account`, `authorized_user`,
-     `external_account` (file, url, executable and aws sources) and
-     impersonation, and its token cache refreshes before expiry.
-   - It uses the workspace's `reqwest` 0.13 with default features off, and
-     Rustls comes from `wyrd_tls`. It adds `google-cloud-gax`, `-rpc` and
-     `-wkt`; `check:deps` and `check:workspace-hack` pass.
-   - The cache refresh task needs a Tokio runtime, so the constructor
-     refuses with a `backend` config error when none is current.
-   - The CryptoKey selection, the facade, the injected-credential tests and
-     the `Rotating` wire assertions are unchanged.
+   **WITHDRAWN.** The reviewer withdrew FIND-TASK-001-2 from this task as
+   scope expansion: no Wyrd authority requires Workload Identity Federation.
+   Commit `9fd0858b4` (`google-cloud-auth` and its three Google crates) is
+   reverted. `GcpKms::new` is back on the existing `object_store` credential
+   chain (service-account key, gcloud user credential, metadata server), and
+   the federation test and its reference-page wording are removed.
+## Preserved external-wait audit
 
-   Test: `remote_tests::gcp_federated_adc_builds_through_the_ambient_constructor_and_refreshes`.
-   - Setup: `GOOGLE_APPLICATION_CREDENTIALS` names an `external_account`
-     file with a file subject-token source and a local STS `token_url`.
-   - Seal and open carry `Bearer fed-0`. After that token's one-second
-     lifetime, the next seal carries `Bearer fed-1`.
-   - A refused exchange (STS 400 for `revoked-jwt`) returns
-     `Unavailable { GcpKms, Credential }` from both `renew` and `seal`, so
-     no replacement envelope is produced. The error text has no subject
-     token, provider text or URL.
-   - RED, against the 584a5de8b constructor: `builds from federated ADC:
-     Config { setting: "backend", reason: "could not load GCP workload
-     credentials" }`.
-   - GREEN, in about 10 s: `mise exec -- cargo nextest run --locked -p
-     wyrd-kms --lib -E
-     'test(=remote_tests::gcp_federated_adc_builds_through_the_ambient_constructor_and_refreshes)'`.
-     The test's only wait is 1.1 s for the token to expire. The rest is
-     the library's fixed 10 s short-refresh interval, during which the
-     request waits for the new token.
-   - Limits: no live GCP or STS. A permanent (4xx) exchange failure stops
-     that credential's refresh task, so the backend reports `Credential`
-     until restart; this is `google-cloud-auth` behavior. Credential
-     acquisition is not bounded by the 10 s call timeout.
-3. **Shared consumer qualification** — FIND-TASK-001-3, existing benchmark
-   acceptance. Inventory every added/moved PostgreSQL, Scribe, object-store
-   and Vault wait for the remediated candidate. Run a full clean
-   `mise run bench:l1:gateway` with VALID verdict and compare with the newest
-   same-experiment/same-host record under `benchmarks/history/`. Use the
-   canonical report and comparison readers and benchmark AGENTS reporting
-   sections. Smoke, steps, profiled or dirty runs cannot close this scenario.
-
-   **Evidence. NOT CLOSED: the benchmark was not run, at the maintainer's
-   direction.**
-   - Wait inventory for candidate `9fd0858b4`, on the Gateway ExternalSecret
-     path `GatewayEngine::attempt` → `CredentialResolver::resolve` →
-     `VaultBackend::fetch` → `VaultKv2::read_field` → `Endpoint::send`:
-     - Vault: the same one KV HTTP request and the same response-chunk
-       awaits. The body now builds in `SecretBytes`, which copies when it
-       grows, and is then parsed to `Value`.
-     - PostgreSQL, Scribe, object storage: none added or moved.
-     - The KMS provider calls and the GCP `google-cloud-auth` token cache
-       have no production caller yet.
-   - The original task's no-hot-path claim is corrected in place.
-   - A full clean `mise run bench:l1:gateway` was started in a clean
-     worktree at `9fd0858b4` and stopped during its release build, when
-     the maintainer said not to benchmark. No record and no comparison with
-     `gateway/overhead/20261031T131441Z-92b62f9c0.json` exist, so
-     FIND-TASK-001-3 stays open.
+The recorded audit traces Gateway ExternalSecret
+through `GatewayEngine::attempt` → `CredentialResolver::resolve` →
+`VaultBackend::fetch` → `VaultKv2::read_field` → `Endpoint::send`. It retains
+one Vault KV request and its response-chunk waits; no PostgreSQL, Scribe or
+object-storage wait is added or moved. New KMS providers have no production
+consumer yet. The maintainer stopped the attempted benchmark during its
+release build; no benchmark result is claimed or required for closure.
 
 ## Verification and preserved scope
 
@@ -215,7 +159,6 @@ journey with the existing repository Postgres/Vault lifecycle wrapper
 (`test:gateway:vault:inner` as recorded in the original task).
 Run affected format/lint/dependency checks and `docs:check` if documentation
 changes; `codegen:check` applies only if an actual generated contract changes.
-The mandatory full benchmark is separate from these functional lanes.
 
 Preserve independent DEKs, two-layer owner binding, active/retained reference
 allowlisting, file/memory behavior, renewal versus rewrap semantics, provider

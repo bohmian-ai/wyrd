@@ -753,7 +753,9 @@ mod tests {
             .and(path("/v1/transit/wyrd/encrypt/wyrd-secrets"))
             .and(header("x-vault-token", TOKEN))
             .and(header("x-vault-namespace", "ns1"))
-            .and(body_json(json!({"plaintext": "ZGVr", "associated_data": "YWFk"})))
+            .and(body_json(
+                json!({"plaintext": "ZGVr", "associated_data": "YWFk"}),
+            ))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(json!({"data": {"ciphertext": "vault:v1:opaque"}})),
@@ -762,7 +764,9 @@ mod tests {
             .await;
         Mock::given(method("POST"))
             .and(path("/v1/transit/wyrd/decrypt/wyrd-secrets"))
-            .and(body_json(json!({"ciphertext": "vault:v1:opaque", "associated_data": "YWFk"})))
+            .and(body_json(
+                json!({"ciphertext": "vault:v1:opaque", "associated_data": "YWFk"}),
+            ))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(json!({"data": {"plaintext": "ZGVr"}})),
             )

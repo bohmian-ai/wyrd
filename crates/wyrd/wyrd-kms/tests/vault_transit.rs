@@ -86,7 +86,10 @@ impl DevVault {
             if health.is_ok_and(|response| response.status().is_success()) {
                 break;
             }
-            assert!(Instant::now() < deadline, "dev Vault did not become healthy");
+            assert!(
+                Instant::now() < deadline,
+                "dev Vault did not become healthy"
+            );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         vault
@@ -105,7 +108,11 @@ impl DevVault {
             .send()
             .await
             .expect("Vault answers");
-        assert!(response.status().is_success(), "{route}: {}", response.status());
+        assert!(
+            response.status().is_success(),
+            "{route}: {}",
+            response.status()
+        );
     }
 
     /// A facade over this server's Transit mount with `token`.
@@ -130,9 +137,14 @@ impl DevVault {
 #[ignore = "requires a `vault` binary; run by test:kms:vault"]
 async fn transit_wraps_rotates_and_refuses_through_the_facade() {
     let vault = DevVault::start().await;
-    vault.admin("sys/mounts/transit", json!({"type": "transit"})).await;
     vault
-        .admin(&format!("transit/keys/{KEY}"), json!({"type": "aes256-gcm96"}))
+        .admin("sys/mounts/transit", json!({"type": "transit"}))
+        .await;
+    vault
+        .admin(
+            &format!("transit/keys/{KEY}"),
+            json!({"type": "aes256-gcm96"}),
+        )
         .await;
     let kms = vault.kms(ROOT_TOKEN);
     let ctx = SecretContext {
@@ -143,7 +155,10 @@ async fn transit_wraps_rotates_and_refuses_through_the_facade() {
         version: Some(1),
     };
     let sealed = kms.seal(&ctx, b"xoxb-token").await.expect("seals");
-    assert_eq!(kms.open(&ctx, &sealed).await.expect("opens").as_slice(), b"xoxb-token");
+    assert_eq!(
+        kms.open(&ctx, &sealed).await.expect("opens").as_slice(),
+        b"xoxb-token"
+    );
     let refused = Err(KmsError::Unavailable {
         backend: KmsBackendKind::VaultTransit,
         failure: ProviderFailure::Refused,
@@ -154,17 +169,29 @@ async fn transit_wraps_rotates_and_refuses_through_the_facade() {
     };
     assert_eq!(kms.open(&other, &sealed).await.map(|_| ()), refused);
 
-    vault.admin(&format!("transit/keys/{KEY}/rotate"), json!({})).await;
+    vault
+        .admin(&format!("transit/keys/{KEY}/rotate"), json!({}))
+        .await;
     assert_eq!(
-        kms.open(&ctx, &sealed).await.expect("old version opens").as_slice(),
+        kms.open(&ctx, &sealed)
+            .await
+            .expect("old version opens")
+            .as_slice(),
         b"xoxb-token"
     );
     let rewrapped = kms.rewrap(&ctx, &sealed).await.expect("rewraps onto v2");
     assert_ne!(rewrapped, sealed);
-    assert_eq!(kms.open(&ctx, &rewrapped).await.expect("opens").as_slice(), b"xoxb-token");
+    assert_eq!(
+        kms.open(&ctx, &rewrapped).await.expect("opens").as_slice(),
+        b"xoxb-token"
+    );
 
     assert_eq!(
-        vault.kms("hvs.not-a-token").open(&ctx, &sealed).await.map(|_| ()),
+        vault
+            .kms("hvs.not-a-token")
+            .open(&ctx, &sealed)
+            .await
+            .map(|_| ()),
         refused
     );
 }

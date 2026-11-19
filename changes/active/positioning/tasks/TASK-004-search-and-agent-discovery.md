@@ -340,6 +340,8 @@ links), `cfb9faa9d` (snippet-length descriptions), `bba3e04a5` (retrieval repair
 | `mise run docs:build` | pass; Pagefind indexed 42 pages |
 | `mise run docs:a11y` | 42 pages, AA contrast light and dark |
 | `git diff --check` | clean |
+| `mise run docs:check` (at `e0f71fbfc`) | pass: generated-docs drift guard clean, 13 files / 106 tests, commands, links, build, a11y 42 pages |
+| `mise run check:examples` | pass |
 
 **Design judgments.** `site.js` holds `ORIGIN` and `BASE` because
 `vite.config.ts` importing `svelte.config.js` made svelte-check type-check the
@@ -407,7 +409,7 @@ tool-independent design.
 3. Then the remaining proven corpus: Verify during a request, Check on a
    schedule, Investigate a failed verification, and the three practice guides.
 
-The whole change is complete only after integrated change review runs the full
+No example, SDK or crate file changed in this task (`git diff --stat 908a16946..HEAD -- examples sdks crates` is empty), so no SDK or example journey is affected. The whole change is complete only after integrated change review runs the full
 `mise run docs:check` and SDK/example suites; the initial set does not grant
 completion. `publish-docs.yml` deploys every published page on merge to
 `main`, so staging the order above means merging in that order; drafts stay

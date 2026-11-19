@@ -302,4 +302,27 @@ class OperatorConnections:
         """
         ...
 
+    def renew_encryption(self, connection_id: str) -> OperatorConnectionView:
+        """Reseal one connection's unchanged secret under a fresh data key.
+
+        The connection keeps its ID, status, and secret version; a disabled
+        connection stays disabled. This does not replace or revoke the
+        credential at its provider: replace a leaked or expired secret with
+        ``update`` and revoke the old value at its issuer.
+
+        Args:
+            connection_id: the UUIDv7 ``connection_id`` from a view.
+
+        Raises:
+            WyrdError: ``WYRD_SPEC_400_VALIDATION`` when ``connection_id`` is
+                not a UUIDv7, ``WYRD_PERMISSION_403_DENIED_RBAC`` without
+                ``operators:write``, ``WYRD_OPERATOR_404_CONNECTION_NOT_FOUND``
+                for an unknown connection, ``WYRD_OPERATOR_409_CONNECTION_CONFLICT``
+                when a concurrent write changed it first, and
+                ``WYRD_OPERATOR_503_KEY_UNAVAILABLE`` when the stored secret
+                cannot be opened or resealed.
+
+        """
+        ...
+
 __all__ = ["OperatorConnections"]

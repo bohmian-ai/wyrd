@@ -63,6 +63,17 @@ impl ManagedSecretBinding<'_> {
             .map_err(|_| KmsError::Authentication)
     }
 
+    /// Renews `sealed`'s encryption for this binding: the same provider key
+    /// resealed under a fresh DEK and nonce wrapped by the active key.
+    ///
+    /// # Errors
+    /// Returns the facade's [`KmsError`] when `sealed` does not open for this
+    /// binding or the reseal fails; no envelope is returned then.
+    pub async fn renew(&self, kms: &WyrdKms, sealed: &[u8]) -> Result<Vec<u8>, KmsError> {
+        let authority = [self.provider.as_str()];
+        kms.renew(&self.context(&authority), sealed).await
+    }
+
     /// The envelope context: tenant scope, Gateway purpose, the credential
     /// name as owner, and `authority` (the provider).
     fn context<'a>(&'a self, authority: &'a [&'a str]) -> SecretContext<'a> {

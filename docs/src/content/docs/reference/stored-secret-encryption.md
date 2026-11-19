@@ -113,6 +113,31 @@ active_key = "arn:aws:kms:us-east-1:111122223333:key/2222bbbb-2222-2222-2222-222
 retained_keys = ["arn:aws:kms:us-east-1:111122223333:key/1111aaaa-1111-1111-1111-111111111111"]
 ```
 
+## Renew, replace, or revoke a stored secret
+
+Each resource that stores a secret offers three separate actions under its existing name or id and permission:
+
+- **Renew encryption** reseals the unchanged secret under a fresh data key wrapped by the active key. The resource, its view, and the secret the provider accepts do not change, so clients need no reconfiguration. A human connection keeps its revision and its sessions.
+- **Replace** stores a new secret supplied by the administrator. Wyrd never mints one.
+- **Revoke** stops Wyrd using the secret. It does not revoke the credential at its provider; do that at the provider, then replace or revoke it in Wyrd.
+
+| Resource | Renew encryption | Replace | Revoke |
+| --- | --- | --- | --- |
+| Operator connection | `POST /v1/operator-connections/{connection_id}/renew-encryption`, `wyrd operator-connection renew-encryption`, SDK `renew_encryption`, MCP `operator_connections.renew_encryption` | Update with a new credential | Disable |
+| Gateway managed secret | `POST /v1/admin/gateway/provider-credentials/{name}/renew-encryption`, `wyrd gateway credential renew-encryption`, MCP `gateway.renew_provider_credential_encryption` | Put the credential again | Revoke |
+| Human OIDC connection | `POST /v1/identity/oidc/connections/{id}/renew-encryption` | Stage, test, and activate a candidate | Delete the connection |
+| Trusted issuer | `POST /v1/admin/trusted-issuers/renew-encryption?issuer=`, `wyrd auth trusted-issuer renew-encryption` | Delete and add the issuer again | Delete the issuer |
+| Platform OIDC connection | `POST /platform/oidc/connection/renew-encryption` | `PUT /platform/oidc/connection` | `DELETE /platform/oidc/connection` |
+
+A renewal reads the secret, reseals it outside any database transaction, and stores the result only if the resource still holds the secret it read. A renewal that races a replacement, revocation, or deletion loses with a `409` and the other change stands; a renewal never restores a revoked or deleted resource.
+
+| Condition | Result |
+| --- | --- |
+| No such resource in the caller's tenant | `404` |
+| The resource is revoked, disabled, or holds no stored secret | `409` |
+| The resource changed between the read and the store | `409`; nothing is written |
+| The backend is unavailable | `503`; the stored secret is unchanged |
+
 ## Startup refusals
 
 Startup fails and names the first offending setting; the message never contains a key, token, path, or URL.

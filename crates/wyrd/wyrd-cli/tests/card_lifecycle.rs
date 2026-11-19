@@ -2935,9 +2935,10 @@ mod pg_tests {
     /// Each provider is created from a body file, rotated from a body file
     /// without changing its identity, and read back redacted; `list` returns
     /// exactly the three; the HTTP connection is disabled and re-enabled with
-    /// a status patch. A writer is refused creation, and another tenant's
-    /// administrator gets the stable not-found refusal on read, rotate, and
-    /// disable. No secret ever appears in argv, stdout, or stderr.
+    /// a status patch, and its encryption is renewed while disabled without
+    /// re-enabling it. A writer is refused creation, and another tenant's
+    /// administrator gets the stable not-found refusal on read, rotate,
+    /// disable, and renewal. No secret ever appears in argv, stdout, or stderr.
     ///
     /// # Panics
     /// Panics when the server fails to start or stop, a bootstrap fails, a
@@ -3059,6 +3060,15 @@ mod pg_tests {
             &connection_cli(verb("disable", &["--connection-id", &http]), &admin).await,
         );
         assert_eq!(disabled["status"], "disabled", "{disabled}");
+        let renewed = connection_json(
+            "renew-encryption",
+            &connection_cli(verb("renew-encryption", &["--connection-id", &http]), &admin).await,
+        );
+        assert_eq!(
+            (&renewed["connection_id"], &renewed["status"]),
+            (&json!(http), &json!("disabled")),
+            "renewal keeps the identity and does not re-enable: {renewed}"
+        );
         let enable_path = write_fixture(
             bodies.path(),
             "http-enable.yaml",
@@ -3123,6 +3133,7 @@ mod pg_tests {
                 &["--connection-id", &ids[0], "--body-file", slack_rotate],
             ),
             verb("disable", &["--connection-id", &http]),
+            verb("renew-encryption", &["--connection-id", &http]),
         ] {
             let refused = connection_cli(arguments.clone(), &foreign).await;
             assert!(!refused.status.success(), "{arguments:?}");

@@ -43,6 +43,7 @@ pub fn identity_router() -> OpenApiRouter<AppState> {
         .routes(routes!(activate_candidate))
         .routes(routes!(deactivate_active))
         .routes(routes!(remove_connection))
+        .routes(routes!(renew_connection_encryption))
 }
 
 /// The deployment's connection owner, built once at boot.
@@ -403,6 +404,63 @@ async fn remove_connection(
         .remove(caller.data_tenant_id, id, &decision)
         .await
         .map(|()| StatusCode::NO_CONTENT)
+        .map_err(WyrdErrorResponse::from)
+}
+
+/// `POST /v1/identity/oidc/connections/{id}/renew-encryption` — reseal one
+/// Active or Candidate connection's unchanged client secret under a fresh
+/// data key.
+///
+/// The connection keeps its id, revision, and test stamp, so login and its
+/// sessions continue with no reconfiguration. Replacing the secret itself is
+/// a new candidate that is tested and activated.
+///
+/// # Errors
+/// Returns `403` without `identity_connections:write`, `404` when this tenant
+/// has no Active or Candidate connection with `id`, `409` when it holds no
+/// client secret or changed during the renewal, and `503` when `[kms]` or the
+/// store is unavailable.
+#[utoipa::path(
+    post,
+    path = "/identity/oidc/connections/{id}/renew-encryption",
+    params(("id" = Uuid, Path, description = "Connection id")),
+    responses(
+        (status = 200, description = "The secret was resealed; it is never returned",
+         body = HumanConnectionView),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
+        (status = 403, description = "Caller lacks identity_connections:write \
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 404, description = "No Active or Candidate connection with this id in the \
+          caller tenant (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem),
+        (status = 409, description = "The connection holds no client secret or changed during \
+          the renewal (WYRD_AUTH_409_CONNECTION_CONFLICT)", body = WyrdProblem),
+        (status = 500, description = "An unexpected server failure (WYRD_SPEC_500_INTERNAL)",
+         body = WyrdProblem),
+        (status = 503, description = "Stored-secret encryption or the store is unavailable \
+          (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)",
+         body = WyrdProblem)
+    ),
+    tag = "Identity"
+)]
+#[tracing::instrument(skip_all, fields(operation = "identity.oidc.connection.renew_encryption"))]
+async fn renew_connection_encryption(
+    State(state): State<AppState>,
+    RequestOrigin(origin): RequestOrigin,
+    caller: Caller,
+    Path(id): Path<Uuid>,
+) -> Result<Json<HumanConnectionView>, WyrdErrorResponse> {
+    let decision = decide(&state, &caller, "identity.oidc.connection.renew_encryption")?;
+    let owner = connections(&state)?;
+    let staged = match owner.stage_renewal(caller.data_tenant_id, id).await {
+        Ok(staged) => staged,
+        Err(refusal) => return refuse_after_decision(&state, &caller, decision, refusal),
+    };
+    owner
+        .renew_encryption(caller.data_tenant_id, staged, &decision, &origin)
+        .await
+        .map(Json)
         .map_err(WyrdErrorResponse::from)
 }
 
@@ -785,6 +843,221 @@ mod pg_tests {
         assert_eq!(
             decisions(&state, &scribe, "identity.oidc.candidate.put").await,
             vec![("allowed".to_owned(), 3), ("denied".to_owned(), 1)]
+        );
+    }
+
+    /// Renewing a connection's stored client secret reseals the unchanged
+    /// secret under a fresh data key and keeps the connection's id,
+    /// revision, test stamp, and Active binding, so login keeps working with
+    /// no reconfiguration. A renewal racing a deactivation loses with a
+    /// conflict and never re-enables the connection; a retired connection,
+    /// another tenant's caller, and an unauthorized caller are refused, and a
+    /// key outage changes nothing.
+    ///
+    /// # Panics
+    /// Panics when a renewal outcome, stored row, opened secret, or recorded
+    /// decision differs from the above.
+    #[tokio::test]
+    async fn renewing_a_connection_secret_keeps_its_revision_and_login() {
+        use secrecy::ExposeSecret as _;
+        use wyrd_auth_oidc::ClientAuth;
+        use wyrd_sql::queries::auth::{promote_tested_human_candidate, stamp_human_candidate_tested};
+        const SECRET: &str = "human-client-secret-unchanged";
+
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let provider = passing_provider().await;
+        let transit = wyrd_testing::kms::TransitFixture::start_delayed(
+            std::time::Duration::from_millis(300),
+        )
+        .await;
+        let kms = Arc::new(
+            wyrd_kms::WyrdKms::new(&transit.config("human", &[]), false).expect("transit facade"),
+        );
+        let scribe = Arc::new(RecordingScribe::default());
+        let allow = || {
+            Arc::new(AllowFirst {
+                allowed: AtomicUsize::new(usize::MAX),
+                evaluations: AtomicUsize::new(0),
+            })
+        };
+        let with_transit = |state: AppState| {
+            let audit = Arc::clone(state.bifrost.scribe_outbox());
+            state.with_owners_for_test(|owners| {
+                owners.auth.human_connections = Some(HumanConnections::new(
+                    fixture.wyrd_postgres().clone(),
+                    Some(Arc::clone(&kms)),
+                    ScreenedHttp::allowing_internal(),
+                    audit,
+                ));
+            })
+        };
+        let state = with_transit(test_state(&fixture, allow(), &scribe).await);
+        let owner = connections(&state).expect("owner configured");
+        let body = serde_json::json!({
+            "issuer": provider.uri(),
+            "client_id": "wyrd-human",
+            "client_auth": "SecretBasic",
+            "client_secret": SECRET,
+            "claim_mapping": { "subject": "sub" },
+        });
+        let input = ConnectionInput::from_slice(&serde_json::to_vec(&body).expect("body"))
+            .expect("candidate input is valid");
+        let staged = owner.stage(tenant, input).await.expect("candidate stages");
+        let decision = audit::audit_event(
+            &caller(tenant),
+            "identity.oidc.candidate.put",
+            RESOURCE,
+            &Permission::identity_connections_write().to_string(),
+            wyrd_spec::vala::api::AuditOutcome::Allowed,
+        );
+        let candidate = owner
+            .put_candidate(tenant, staged, &decision, &origin())
+            .await
+            .expect("candidate is staged");
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        stamp_human_candidate_tested(
+            &mut conn,
+            candidate.id,
+            1,
+            &format!("{}/jwks", provider.uri()),
+            std::time::Duration::from_secs(600),
+        )
+        .await
+        .expect("stamp")
+        .expect("candidate stamped");
+        promote_tested_human_candidate(&mut conn, 1)
+            .await
+            .expect("promote")
+            .expect("candidate promoted");
+        conn.commit().await.expect("commit");
+        let active_row = || async {
+            let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+            let row = human_connection_in_state(&mut conn, "Active")
+                .await
+                .expect("active reads");
+            conn.commit().await.expect("commit");
+            row
+        };
+        let before = active_row().await.expect("active exists");
+
+        let Json(renewed) = renew_connection_encryption(
+            State(state.clone()),
+            RequestOrigin(origin()),
+            caller(tenant),
+            Path(candidate.id),
+        )
+        .await
+        .expect("renewal");
+        assert_eq!(
+            (renewed.id, renewed.revision, renewed.state, renewed.tested_revision),
+            (candidate.id, 1, wyrd_spec::auth::HumanConnectionState::Active, Some(1)),
+            "renewal keeps the connection's identity, revision, and stamp"
+        );
+        let after = active_row().await.expect("still active");
+        assert_eq!(after.revision, before.revision);
+        assert_ne!(
+            after.client_secret_enc, before.client_secret_enc,
+            "the secret is resealed under a fresh data key"
+        );
+        let active = owner
+            .active_connection(tenant)
+            .await
+            .expect("active opens")
+            .expect("active exists");
+        assert_eq!(active.binding.connection_revision, before.revision);
+        let ClientAuth::SecretBasic(opened) = &active.trusted.client_auth else {
+            panic!("the connection still authenticates with its secret");
+        };
+        assert_eq!(opened.expose_secret(), SECRET, "login uses the unchanged secret");
+
+        let foreign = fixture
+            .seed_additional_tenant("human-renewal-foreign")
+            .await
+            .expect("second tenant seeds");
+        let refused = renew_connection_encryption(
+            State(state.clone()),
+            RequestOrigin(origin()),
+            caller(foreign),
+            Path(candidate.id),
+        )
+        .await
+        .expect_err("another tenant cannot see the connection");
+        assert_eq!(refused.0.code(), "WYRD_SPEC_404_NOT_FOUND");
+
+        transit.set_available(false);
+        let outage = renew_connection_encryption(
+            State(state.clone()),
+            RequestOrigin(origin()),
+            caller(tenant),
+            Path(candidate.id),
+        )
+        .await
+        .expect_err("a key outage refuses");
+        transit.set_available(true);
+        assert_eq!(outage.0.code(), "WYRD_SERVER_503_SERVICE_UNAVAILABLE");
+        assert_eq!(
+            active_row().await.expect("active").client_secret_enc,
+            after.client_secret_enc,
+            "a refused renewal writes nothing"
+        );
+
+        let encrypts = transit.requests("encrypt").await;
+        let renewal = renew_connection_encryption(
+            State(state.clone()),
+            RequestOrigin(origin()),
+            caller(tenant),
+            Path(candidate.id),
+        );
+        let deactivate = async {
+            while transit.requests("encrypt").await <= encrypts {
+                tokio::task::yield_now().await;
+            }
+            deactivate_active(State(state.clone()), caller(tenant)).await
+        };
+        let (lost, retired) = tokio::join!(renewal, deactivate);
+        assert_eq!(retired.expect("deactivation"), StatusCode::NO_CONTENT);
+        assert_eq!(
+            lost.expect_err("the renewal loses to the deactivation").0.code(),
+            "WYRD_AUTH_409_CONNECTION_CONFLICT"
+        );
+        assert!(
+            owner.active_connection(tenant).await.expect("reads").is_none(),
+            "renewal never re-enables a retired connection"
+        );
+        let retired = renew_connection_encryption(
+            State(state.clone()),
+            RequestOrigin(origin()),
+            caller(tenant),
+            Path(candidate.id),
+        )
+        .await
+        .expect_err("a retired connection holds nothing to renew");
+        assert_eq!(retired.0.code(), "WYRD_SPEC_404_NOT_FOUND");
+
+        let denied = with_transit(
+            test_state(
+                &fixture,
+                Arc::new(AllowFirst {
+                    allowed: AtomicUsize::new(0),
+                    evaluations: AtomicUsize::new(0),
+                }),
+                &scribe,
+            )
+            .await,
+        );
+        let refused = renew_connection_encryption(
+            State(denied.clone()),
+            RequestOrigin(origin()),
+            caller(tenant),
+            Path(candidate.id),
+        )
+        .await
+        .expect_err("an unauthorized caller is refused");
+        assert_eq!(refused.0.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
+        assert_eq!(
+            decisions(&denied, &scribe, "identity.oidc.connection.renew_encryption").await,
+            vec![("allowed".to_owned(), 5), ("denied".to_owned(), 1)]
         );
     }
 }

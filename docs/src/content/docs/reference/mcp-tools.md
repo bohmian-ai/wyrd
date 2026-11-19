@@ -95,6 +95,7 @@ A token already minted from a revoked credential lapses within five minutes.
 | `operator_connections.create` | `operators:write` | `{request: CreateOperatorConnectionRequest}` → OperatorConnectionView | Create a Slack, PagerDuty, or HTTP connection |
 | `operator_connections.update` | `operators:write` | `{connection_id, request}` → OperatorConnectionView | Patch a connection; provider and name are fixed |
 | `operator_connections.disable` | `operators:write` | `{connection_id}` → OperatorConnectionView | Disable a connection |
+| `operator_connections.renew_encryption` | `operators:write` | `{connection_id}` → OperatorConnectionView | Reseal the unchanged credential under a fresh data key |
 
 ## GitHub connection
 
@@ -128,6 +129,7 @@ Gateway tools address resources by exact `name` and never call a model.
 | `gateway.put_governance_policy` | `gateway:write` | GovernancePolicy → governance policy | Replace the governance policy |
 | `gateway.put_capture_policy` | `gateway:write` | CapturePolicyWrite → versioned capture policy | Replace the capture policy |
 | `gateway.revoke_provider_credential` | `gateway:write` | `{name}` → credential view | Revoke permanently |
+| `gateway.renew_provider_credential_encryption` | `gateway:write` | `{name}` → credential view | Reseal an active managed secret under a fresh data key |
 | `gateway.delete_provider_credential` | `gateway:delete` | `{name}` → `{}` | Delete an unreferenced credential; absent succeeds |
 | `gateway.delete_provider_deployment` | `gateway:delete` | `{name}` → `{}` | Delete a deployment; absent succeeds |
 | `gateway.delete_fallback_policy` | `gateway:write` | `{}` → `{}` | Restore the default |

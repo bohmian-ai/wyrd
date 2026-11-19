@@ -474,7 +474,8 @@ impl WyrdMcpHandler {
             | operators::GET
             | operators::CREATE
             | operators::UPDATE
-            | operators::DISABLE) => {
+            | operators::DISABLE
+            | operators::RENEW_ENCRYPTION) => {
                 let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
                 // Authorized and audited by the operation, like revocation.
                 self.mcp_operator_connections(name, caller, request.arguments)

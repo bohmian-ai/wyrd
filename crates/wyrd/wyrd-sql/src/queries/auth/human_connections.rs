@@ -123,6 +123,19 @@ const IS_ACTIVE_SQL: &str = r"
            AND state = 'Active' AND removed_at IS NULL)
 ";
 
+/// Swaps one live Active or Candidate connection's sealed client secret for
+/// its encryption renewal while the row still holds the envelope that was
+/// opened; revision, state, and test stamp are unchanged.
+const RENEW_SECRET_SQL: &str = r"
+    UPDATE wyrd.auth_human_connections
+       SET client_secret_enc = $3, updated_at = statement_timestamp()
+     WHERE connection_id = $1 AND client_secret_enc = $2
+       AND state IN ('Active', 'Candidate') AND removed_at IS NULL
+    RETURNING connection_id, data_tenant_id, revision, state, issuer_url, client_id,
+           client_auth, client_secret_enc, claim_mapping, group_role_map, jwks_ttl_secs,
+           jwks_uri, tested_revision, tested_until, removed_at, created_at, updated_at
+";
+
 /// Tombstones one live connection and wipes its secret.
 const REMOVE_SQL: &str = r"
     UPDATE wyrd.auth_human_connections
@@ -384,6 +397,31 @@ pub async fn remove_human_connection(
         .execute(&mut **conn.transaction())
         .await
         .map(|result| result.rows_affected() == 1)
+        .map_err(SqlError::from)
+}
+
+/// Replace live connection `connection_id`'s sealed client secret with
+/// `renewed`, its encryption renewal, only while it still holds `observed`
+/// and is Active or Candidate.
+///
+/// Returns `None` when a deactivation, removal, replacement, or another
+/// renewal committed first; the caller reports a conflict and the winner
+/// stands.
+///
+/// # Errors
+/// Returns [`SqlError`] when the update fails.
+pub async fn renew_human_connection_secret(
+    conn: &mut TenantConn<'_>,
+    connection_id: Uuid,
+    observed: &[u8],
+    renewed: &[u8],
+) -> Result<Option<HumanConnectionRow>, SqlError> {
+    sqlx::query_as::<_, HumanConnectionRow>(RENEW_SECRET_SQL)
+        .bind(connection_id)
+        .bind(observed)
+        .bind(renewed)
+        .fetch_optional(&mut **conn.transaction())
+        .await
         .map_err(SqlError::from)
 }
 

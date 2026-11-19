@@ -52,6 +52,7 @@ use wyrd_sql::queries::auth::{
     human_candidate_test_is_current, human_connection_in_state, insert_human_candidate,
     insert_login_state, list_service_account_roles, list_user_roles, live_human_connections,
     lock_human_connection_slot, promote_tested_human_candidate, remove_human_connection,
+    renew_human_connection_secret,
     replace_human_candidate, service_account_by_id, stamp_human_candidate_tested, user_by_id,
 };
 use wyrd_sql::row_types::auth::{HumanConnectionBinding, HumanConnectionRow};
@@ -122,6 +123,18 @@ pub struct StagedCandidate {
     connection_id: Uuid,
     /// The sealed row write, its JWKS TTL filled in under the slot lock.
     write: HumanConnectionWrite,
+}
+
+/// A connection secret resealed by [`HumanConnections::stage_renewal`], ready
+/// for [`HumanConnections::renew_encryption`].
+#[derive(Debug)]
+pub struct StagedRenewal {
+    /// The connection whose secret was renewed.
+    connection_id: Uuid,
+    /// The envelope read and opened; the swap lands only while it is stored.
+    observed: Vec<u8>,
+    /// The same secret resealed under a fresh data key.
+    renewed: Vec<u8>,
 }
 
 /// The candidate revision a test sign-in is begun for.
@@ -347,6 +360,95 @@ impl HumanConnections {
             None => insert_human_candidate(&mut conn, connection_id, &write)
                 .await
                 .map_err(store_error)?,
+        };
+        conn.commit().await.map_err(store_error)?;
+        view(row, &callback)
+    }
+
+    /// Read live connection `connection_id`'s sealed client secret in one
+    /// short transaction, then, holding none, renew its encryption: the same
+    /// secret resealed under a fresh data key bound to the same tenant,
+    /// issuer, client id, method, and connection id.
+    ///
+    /// Callers run this after authorizing and before
+    /// [`Self::renew_encryption`], as [`Self::stage`] precedes
+    /// [`Self::put_candidate`].
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::NotFound`] when this tenant has no Active or
+    /// Candidate connection with `connection_id`,
+    /// [`WyrdError::ConnectionConflict`] when it holds no client secret,
+    /// [`WyrdError::ServiceUnavailable`] when `[kms]` is missing or the
+    /// secret cannot be opened or resealed, and the store errors of
+    /// [`Self::list`].
+    pub async fn stage_renewal(
+        &self,
+        tenant: DataTenantId,
+        connection_id: Uuid,
+    ) -> Result<StagedRenewal, WyrdError> {
+        let mut conn = self.begin(tenant).await?;
+        let row = live_human_connections(&mut conn)
+            .await
+            .map_err(store_error)?
+            .into_iter()
+            .find(|row| {
+                row.connection_id == connection_id
+                    && row.state != HumanConnectionState::Inactive.as_str()
+            })
+            .ok_or_else(|| not_found("no active or candidate human connection has this id"))?;
+        conn.commit().await.map_err(store_error)?;
+        let observed = row
+            .client_secret_enc
+            .ok_or_else(|| conflict("the connection holds no client secret"))?;
+        let owner_id = connection_id.to_string();
+        let renewed = ClientSecretOwner {
+            scope: SecretScope::Tenant(tenant),
+            purpose: SecretPurpose::AuthHumanConnection,
+            issuer_url: &row.issuer_url,
+            client_id: &row.client_id,
+            connection_id: Some(&owner_id),
+        }
+        .renew_secret(&row.client_auth, &observed, self.kms.as_deref())
+        .await
+        .map_err(|_: IssuerSealError| WyrdError::ServiceUnavailable {
+            message: "provider client secret protection is unavailable".to_owned(),
+            details: json!({ "reason": "kms_unavailable" }),
+        })?;
+        Ok(StagedRenewal {
+            connection_id,
+            observed,
+            renewed,
+        })
+    }
+
+    /// Store a renewal staged by [`Self::stage_renewal`]. The connection
+    /// keeps its id, revision, state, and test stamp, so login and every
+    /// session bound to it continue unchanged.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::ConnectionConflict`] when the connection was
+    /// deactivated, removed, replaced, or renewed after it was read, and the
+    /// audit/store errors of [`Self::list`].
+    pub async fn renew_encryption(
+        &self,
+        tenant: DataTenantId,
+        staged: StagedRenewal,
+        decision: &AuditEvent,
+        origin: &Url,
+    ) -> Result<HumanConnectionView, WyrdError> {
+        let callback = provider_callback(origin)?;
+        let mut conn = self.begin_locked(tenant, decision).await?;
+        let Some(row) = renew_human_connection_secret(
+            &mut conn,
+            staged.connection_id,
+            &staged.observed,
+            &staged.renewed,
+        )
+        .await
+        .map_err(store_error)?
+        else {
+            return commit_refusal(conn, conflict("the connection changed during the renewal"))
+                .await;
         };
         conn.commit().await.map_err(store_error)?;
         view(row, &callback)

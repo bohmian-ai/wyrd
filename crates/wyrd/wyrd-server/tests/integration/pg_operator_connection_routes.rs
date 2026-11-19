@@ -245,6 +245,143 @@ async fn rotation_racing_a_disable_conflicts_and_keeps_the_disable() {
     assert_eq!(read["status"], "disabled", "the disable is kept");
 }
 
+/// Encryption renewal never undoes or bypasses the connection's authority: a
+/// renewal racing a disable conflicts and the disable's row is kept, renewing
+/// a disabled connection leaves it disabled, a reader is refused and audited,
+/// another tenant sees not-found, and a key outage leaves the row unchanged.
+/// A replacement secret still lands when the stored envelope cannot open.
+///
+/// # Panics
+/// Panics when any response, decision, or stored row differs.
+#[tokio::test]
+async fn renewal_keeps_revocation_and_refuses_without_authority() {
+    let transit = TransitFixture::start_delayed(std::time::Duration::from_millis(300)).await;
+    let server = WyrdTestServer::builder()
+        .with_kms_for_test(transit.config("ops", &[]))
+        .start_in_process()
+        .await
+        .expect("test server starts");
+    let tenant = server.data_tenant_id();
+    let (_, jwt) = user(&server, "oc-renew-admin", &["admin"]).await;
+    let (status, view) = call(
+        &server,
+        &jwt,
+        Method::POST,
+        "/v1/operator-connections",
+        Some(&creates()[0]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{view}");
+    let id = view["connection_id"].as_str().expect("id").to_owned();
+    let uri = format!("/v1/operator-connections/{id}");
+    let renew = format!("{uri}/renew-encryption");
+
+    let renewal = call(&server, &jwt, Method::POST, &renew, None);
+    let disable = async {
+        while transit.requests("encrypt").await < 2 {
+            tokio::task::yield_now().await;
+        }
+        call(&server, &jwt, Method::DELETE, &uri, None).await
+    };
+    let ((renewed, problem), (disabled, _)) = tokio::join!(renewal, disable);
+    assert_eq!(disabled, StatusCode::OK);
+    assert_eq!(
+        (renewed, problem["code"].as_str()),
+        (
+            StatusCode::CONFLICT,
+            Some("WYRD_OPERATOR_409_CONNECTION_CONFLICT")
+        ),
+        "the renewal lost to the disable"
+    );
+    let (_, disabled_envelope, version) = stored_row(&server, tenant, &id).await;
+
+    let (status, view) = call(&server, &jwt, Method::POST, &renew, None).await;
+    assert_eq!(
+        (status, view["status"].as_str()),
+        (StatusCode::OK, Some("disabled")),
+        "renewal does not re-enable: {view}"
+    );
+    let (_, renewed_envelope, renewed_version) = stored_row(&server, tenant, &id).await;
+    assert_ne!(renewed_envelope, disabled_envelope, "the envelope is resealed");
+    assert_eq!(renewed_version, version, "the secret version is unchanged");
+
+    custom_role(
+        &server,
+        "operators_reader",
+        json!([{ "resource": "operators", "action": "read", "scope": "all" }]),
+    )
+    .await;
+    let (reader_id, reader) = user(&server, "oc-renew-reader", &["operators_reader"]).await;
+    let (status, problem) = call(&server, &reader, Method::POST, &renew, None).await;
+    assert_eq!(
+        (status, problem["code"].as_str()),
+        (
+            StatusCode::FORBIDDEN,
+            Some("WYRD_PERMISSION_403_DENIED_RBAC")
+        )
+    );
+    assert_eq!(
+        decisions(&server, reader_id, "operator_connection.renew_encryption").await,
+        vec![("operators:write".to_owned(), "denied".to_owned())]
+    );
+    let other = server.seed_tenant("oc-renew-other").await.expect("tenant seeds");
+    let foreign = server
+        .bootstrap_service_in_tenant(other, "oc-renew-foreign", &["admin"])
+        .await
+        .expect("foreign admin bootstraps");
+    let foreign = server
+        .exchange_api_key(foreign.api_key().expect("api key"))
+        .await
+        .expect("api key exchanges");
+    let (status, problem) = call(&server, &foreign, Method::POST, &renew, None).await;
+    assert_eq!(
+        (status, problem["code"].as_str()),
+        (
+            StatusCode::NOT_FOUND,
+            Some("WYRD_OPERATOR_404_CONNECTION_NOT_FOUND")
+        )
+    );
+
+    transit.set_available(false);
+    let (status, problem) = call(&server, &jwt, Method::POST, &renew, None).await;
+    transit.set_available(true);
+    assert_eq!(
+        (status, problem["code"].as_str()),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Some("WYRD_OPERATOR_503_KEY_UNAVAILABLE")
+        )
+    );
+    let (_, after_outage, _) = stored_row(&server, tenant, &id).await;
+    assert_eq!(after_outage, renewed_envelope, "a failed renewal writes nothing");
+
+    let mut conn = server
+        .tenant_conn_for(tenant)
+        .await
+        .expect("tenant connection opens");
+    sqlx::query(
+        "UPDATE wyrd.operator_connections SET secret_ciphertext = '\\x00'::bytea \
+         WHERE connection_id = $1::uuid",
+    )
+    .bind(&id)
+    .execute(&mut **conn.transaction())
+    .await
+    .expect("envelope corrupts");
+    conn.commit().await.expect("corruption commits");
+    let (status, _) = call(&server, &jwt, Method::POST, &renew, None).await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "an envelope that cannot open cannot be renewed"
+    );
+    let replace = json!({ "provider": "slack", "bot_token": SECRETS[3] });
+    let (status, view) = call(&server, &jwt, Method::PATCH, &uri, Some(&replace)).await;
+    assert_eq!(status, StatusCode::OK, "replacement never opens the old value: {view}");
+    let (_, replaced, replaced_version) = stored_row(&server, tenant, &id).await;
+    assert!(replaced.starts_with(b"WKMS"), "a complete envelope is stored");
+    assert_eq!(replaced_version, version + 1, "replacement is the next secret version");
+}
+
 /// A tenant administrator creates, lists, reads, updates, rotates, disables,
 /// and re-enables connections of every provider; only redacted metadata is
 /// returned, only ciphertext is stored, no route or query reveals a stored

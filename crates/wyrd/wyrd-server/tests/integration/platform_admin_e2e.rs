@@ -1962,6 +1962,110 @@ async fn platform_sign_in_opens_its_client_secret_through_vault_transit_across_r
     srv.shutdown().await.expect("server shuts down");
 }
 
+/// Renewing the platform connection's encryption reseals its unchanged client
+/// secret under a fresh data key: one more Transit encrypt, a redacted view,
+/// and the next sign-in authenticates with the same secret, with no
+/// reconfiguration. A removed connection has nothing to renew, and removal
+/// is never undone by a renewal.
+///
+/// # Panics
+/// Panics when any step deviates from the contract above.
+#[tokio::test]
+async fn renewing_platform_connection_encryption_keeps_its_sign_in() {
+    let transit = wyrd_testing::kms::TransitFixture::start().await;
+    let srv = Box::pin(
+        WyrdTestServer::builder()
+            .with_kms_for_test(transit.config("platform", &[]))
+            .start_bound(),
+    )
+    .await
+    .expect("server starts");
+    let root = initialize_platform_root(&srv)
+        .await
+        .expect("deployment initializes");
+    let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
+    let provider = wiremock::MockServer::start().await;
+    mount_platform_provider(
+        &provider,
+        platform_key_set("mock-1"),
+        wiremock::ResponseTemplate::new(500),
+    )
+    .await;
+    let resp = srv
+        .oneshot(platform_request(
+            Method::PUT,
+            "/platform/oidc/connection",
+            &session,
+            Some(json!({
+                "issuer_url": provider.uri(),
+                "client_id": PLATFORM_CLIENT,
+                "client_auth": { "method": "secret_post", "secret": PLATFORM_CLIENT_SECRET },
+            })),
+        ))
+        .await
+        .expect("configure route responds");
+    assert_eq!(resp.status(), StatusCode::OK, "connection configures");
+    let configured = body_json(resp).await;
+    let resp = srv
+        .oneshot(platform_request(
+            Method::POST,
+            "/platform/admins",
+            &session,
+            Some(json!({ "name": "ops-lead", "match_claim": "ops@example.com" })),
+        ))
+        .await
+        .expect("register route responds");
+    assert_eq!(resp.status(), StatusCode::OK, "administrator registers");
+
+    let renew = || {
+        srv.oneshot(platform_request(
+            Method::POST,
+            "/platform/oidc/connection/renew-encryption",
+            &session,
+            None,
+        ))
+    };
+    let resp = renew().await.expect("renew route responds");
+    let status = resp.status();
+    let renewed = body_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "renewal succeeds: {renewed}");
+    assert_eq!(renewed, configured, "the connection is unchanged and redacted");
+    assert_eq!(
+        transit.requests("encrypt").await,
+        2,
+        "the unchanged secret is resealed once under a fresh data key"
+    );
+    confidential_platform_sign_in(&srv, &provider).await;
+
+    let resp = srv
+        .oneshot(platform_request(
+            Method::DELETE,
+            "/platform/oidc/connection",
+            &session,
+            None,
+        ))
+        .await
+        .expect("remove route responds");
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT, "connection removes");
+    let resp = renew().await.expect("renew route responds");
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "a removed connection has nothing to renew"
+    );
+    let resp = srv
+        .oneshot(platform_request(
+            Method::GET,
+            "/platform/oidc/connection",
+            &session,
+            None,
+        ))
+        .await
+        .expect("read route responds");
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "removal stands");
+    srv.shutdown().await.expect("server shuts down");
+}
+
 /// An operator configures federated sign-in, registers an administrator, and
 /// can take it all away again without losing the deployment.
 ///

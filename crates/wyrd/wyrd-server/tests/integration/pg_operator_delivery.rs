@@ -1036,6 +1036,116 @@ async fn racing_rotations_keep_the_first_commit_and_deliver_it() {
     assert_eq!(tokens, vec![format!("Bearer {ROTATED_TOKEN}")]);
 }
 
+/// The backend-wrapped DEK and payload nonce of a stored envelope, split by
+/// the documented common format.
+///
+/// # Panics
+/// Panics when `envelope` is shorter than its own length fields.
+fn wrapped_dek_and_nonce(envelope: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let ref_len = usize::from(u16::from_be_bytes([envelope[6], envelope[7]]));
+    let at = 8 + ref_len;
+    let wrapped_len = u32::from_be_bytes(envelope[at..at + 4].try_into().expect("length field"));
+    let wrapped_end = at + 4 + usize::try_from(wrapped_len).expect("length fits");
+    (
+        envelope[at + 4..wrapped_end].to_vec(),
+        envelope[wrapped_end..wrapped_end + 12].to_vec(),
+    )
+}
+
+/// Renewing a connection's encryption reseals the same credential under a
+/// fresh DEK and nonce on the same identity and secret version, and the next
+/// delivery sends the unchanged token with no client or Card change.
+///
+/// # Panics
+/// Panics when the renewal response, stored envelope, or delivered token
+/// differs.
+#[tokio::test]
+async fn renewed_encryption_keeps_the_credential_and_delivers_it() {
+    let transit = TransitFixture::start().await;
+    let delivery = Delivery::start_on(Some(transit.config("ops", &[]))).await;
+    Mock::given(method("POST"))
+        .and(path("/slack"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
+        .mount(&delivery.mock)
+        .await;
+    let posted = delivery.operator("posted", slack("C0123456789")).await;
+    let (_, list) = delivery
+        .call(Method::GET, "/v1/operator-connections", None)
+        .await;
+    let before = list
+        .as_array()
+        .expect("connection list")
+        .iter()
+        .find(|view| view["provider"] == "slack")
+        .expect("slack connection")
+        .clone();
+    let slack_id = before["connection_id"].as_str().expect("id").to_owned();
+    let stored = |id: String| {
+        let pool = delivery.assertion.clone();
+        async move {
+            sqlx::query_as::<_, (Vec<u8>, i32)>(
+                "SELECT secret_ciphertext, secret_version FROM wyrd.operator_connections \
+                 WHERE connection_id = $1::uuid",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("row reads")
+        }
+    };
+    let (old_envelope, old_version) = stored(slack_id.clone()).await;
+
+    let (status, renewed) = delivery
+        .call(
+            Method::POST,
+            &format!("/v1/operator-connections/{slack_id}/renew-encryption"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{renewed}");
+    assert_eq!(
+        (&renewed["connection_id"], &renewed["status"], &renewed["name"]),
+        (&before["connection_id"], &before["status"], &before["name"]),
+        "renewal keeps the connection identity and status"
+    );
+    assert!(
+        !renewed.to_string().contains(SLACK_TOKEN),
+        "the response is redacted"
+    );
+    let (new_envelope, new_version) = stored(slack_id.clone()).await;
+    assert_eq!(new_version, old_version, "the secret version is unchanged");
+    let (old_dek, old_nonce) = wrapped_dek_and_nonce(&old_envelope);
+    let (new_dek, new_nonce) = wrapped_dek_and_nonce(&new_envelope);
+    assert_ne!(new_dek, old_dek, "renewal wraps a fresh DEK");
+    assert_ne!(new_nonce, old_nonce, "renewal encrypts under a fresh nonce");
+
+    delivery.fail_binding("owner", &[&posted]).await;
+    let running = delivery.spawn(
+        delivery.server.state(),
+        &Delivery::limits(),
+        &failing_script(1),
+        &CapabilityCrash::default(),
+    );
+    let run = delivery.new_run(&[]).await;
+    delivery
+        .wait_dispatches(run, 1, |row| row.status == "delivered")
+        .await;
+    running.stop().await;
+    let tokens: Vec<String> = delivery
+        .requests("/slack")
+        .await
+        .iter()
+        .filter_map(|post| {
+            post.headers
+                .get("authorization")?
+                .to_str()
+                .ok()
+                .map(str::to_owned)
+        })
+        .collect();
+    assert_eq!(tokens, vec![format!("Bearer {SLACK_TOKEN}")]);
+}
+
 /// A slow endpoint times out each attempt, retries after 30 seconds and then
 /// two minutes, and fails once the three-attempt budget is spent, without
 /// rerunning the Verifier; a crashed worker restarts, shutdown releases an

@@ -19,7 +19,9 @@ use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
 use uuid::Uuid;
-use wyrd_auth::pg_resolvers::{IssuerSealError, client_auth_label, seal_platform_client_secret};
+use wyrd_auth::pg_resolvers::{
+    IssuerSealError, client_auth_label, renew_platform_client_secret, seal_platform_client_secret,
+};
 use wyrd_auth::platform_authz::{
     PLATFORM_ADMINS_RESOURCE, PLATFORM_CONNECTION_RESOURCE, PlatformAuthorization,
     PlatformAuthzError, platform_principal_resource,
@@ -38,7 +40,7 @@ use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::request_id::RequestId;
 use wyrd_sql::queries::platform::identity::{
     delete_platform_oidc_connection, insert_platform_identity_tx, platform_oidc_connection,
-    upsert_platform_oidc_connection,
+    swap_platform_sealed_secret_tx, upsert_platform_oidc_connection,
 };
 use wyrd_sql::queries::platform::principals::{
     StatusChange, insert_platform_principal_tx, list_platform_principals,
@@ -79,6 +81,7 @@ pub fn platform_identity_router() -> OpenApiRouter<AppState> {
             configure_connection,
             remove_connection
         ))
+        .routes(routes!(renew_connection_encryption))
         .routes(routes!(register_admin, list_platform_admins))
         .routes(routes!(set_admin_status))
 }
@@ -369,6 +372,111 @@ async fn read_connection(
         })?;
 
     // The sealed secret is read from the row and deliberately not projected.
+    Ok(Json(PlatformOidcConnectionView {
+        issuer_url: row.issuer_url,
+        jwks_uri: row.jwks_uri,
+        client_id: row.client_id,
+        client_auth: row.client_auth,
+        jwks_ttl_secs: row.jwks_ttl_secs,
+    }))
+}
+
+/// Reseal the platform connection's unchanged client secret under a fresh
+/// data key.
+///
+/// The secret the provider accepts is unchanged, so sign-in keeps working
+/// with no reconfiguration. The envelope is read and renewed before the
+/// operation's transaction opens, and swapped only if the row still holds the
+/// bytes that were read: a renewal never restores a removed connection or
+/// overwrites a reconfigured one.
+///
+/// # Errors
+/// Returns a `404` when no connection is configured, a `409` when it holds no
+/// client secret or changed during the renewal, a `503` when the key service
+/// is unavailable, and a stable Wyrd error when the caller is unauthorized or
+/// the write fails.
+#[utoipa::path(
+    post,
+    path = "/platform/oidc/connection/renew-encryption",
+    responses(
+        (status = 200, description = "Secret resealed; the connection is unchanged",
+         body = PlatformOidcConnectionView),
+        (status = 401, description = "No valid platform credential \
+          (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
+        (status = 403, description = "The grant does not cover platform identity writes \
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 404, description = "No platform OIDC connection is configured \
+          (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem),
+        (status = 409, description = "The connection holds no client secret, or was removed or \
+          reconfigured during the renewal (WYRD_SPEC_409_CONFLICT)", body = WyrdProblem),
+        (status = 503, description = "The key service is unavailable \
+          (WYRD_SERVER_503_SERVICE_UNAVAILABLE)", body = WyrdProblem),
+    ),
+    tag = "Platform"
+)]
+#[tracing::instrument(level = "info", skip(state, caller), fields(operation = "platform.oidc_connection.renew_encryption"))]
+async fn renew_connection_encryption(
+    State(state): State<AppState>,
+    caller: PlatformCaller,
+) -> Result<Json<PlatformOidcConnectionView>, WyrdErrorResponse> {
+    let pool = operator(&state)?;
+    // The handle must outlive the transaction it lends out.
+    let authz =
+        PlatformAuthorization::new(pool.clone(), Arc::clone(state.bifrost.scribe_outbox()) as _);
+    let required = Permission::platform_identity_write();
+    // Renewal waits on the key service, so the decision is made first and the
+    // operation's transaction opens only after it.
+    authz
+        .decide(
+            &caller.context,
+            &required,
+            caller.request_id.as_str(),
+            PLATFORM_CONNECTION_RESOURCE,
+        )
+        .map_err(|error| platform_authz_error(&error, &required))?;
+
+    let row = platform_oidc_connection(&pool)
+        .await
+        .map_err(store_error)?
+        .ok_or_else(|| {
+            WyrdErrorResponse::from(WyrdError::NotFound {
+                message: "no platform OIDC connection is configured".to_owned(),
+                details: serde_json::json!({}),
+            })
+        })?;
+    let conflict = |message: &str| {
+        WyrdErrorResponse::from(WyrdError::Conflict {
+            message: message.to_owned(),
+            details: serde_json::json!({}),
+        })
+    };
+    let observed = row
+        .client_secret_enc
+        .as_deref()
+        .ok_or_else(|| conflict("the platform connection holds no client secret"))?;
+    let renewed = renew_platform_client_secret(&row, observed, state.auth.kms.as_deref())
+        .await
+        .map_err(|error| {
+            tracing::error!(cause = %error, "platform client secret could not be renewed");
+            WyrdErrorResponse::from(WyrdError::ServiceUnavailable {
+                message: "platform client secret protection is unavailable".to_owned(),
+                details: serde_json::json!({ "reason": "kms_unavailable" }),
+            })
+        })?;
+
+    let mut decision = authz
+        .begin()
+        .await
+        .map_err(|error| platform_authz_error(&error, &required))?;
+    let swapped = swap_platform_sealed_secret_tx(&mut decision, observed, &renewed)
+        .await
+        .map_err(store_error)?;
+    commit_decision(decision).await?;
+    if !swapped {
+        return Err(conflict(
+            "the platform connection changed during the encryption renewal",
+        ));
+    }
     Ok(Json(PlatformOidcConnectionView {
         issuer_url: row.issuer_url,
         jwks_uri: row.jwks_uri,

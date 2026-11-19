@@ -167,6 +167,34 @@ impl OperatorConnections {
             .await
     }
 
+    /// Renew one connection's encryption: the server reseals its unchanged
+    /// secret under a fresh data key and keeps its identity, status, and
+    /// secret version. A disabled connection stays disabled.
+    ///
+    /// This does not replace or revoke the credential at its provider; use
+    /// [`Self::update`] with a new secret for a leaked or expired one.
+    ///
+    /// # Arguments
+    /// * `connection_id` - The connection whose secret is resealed.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the caller lacks `operators:write`, the
+    /// connection is unknown, a concurrent write changed it first, the stored
+    /// secret cannot be opened or resealed, or the request fails.
+    pub async fn renew_encryption(
+        &self,
+        connection_id: &OperatorConnectionId,
+    ) -> Result<OperatorConnectionView, WyrdError> {
+        self.client
+            .http
+            .request_json::<(), _>(
+                Method::POST,
+                &format!("{}/renew-encryption", Self::path(connection_id)),
+                None,
+            )
+            .await
+    }
+
     /// The item route for `connection_id`.
     fn path(connection_id: &OperatorConnectionId) -> String {
         format!("/v1/operator-connections/{connection_id}")

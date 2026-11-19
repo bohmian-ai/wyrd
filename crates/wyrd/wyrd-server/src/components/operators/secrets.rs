@@ -141,6 +141,31 @@ impl OperatorSecrets {
             .map_err(|error| unavailable(&error))
     }
 
+    /// Renew the encryption of `stored`'s current secret: open it and reseal
+    /// the same value under a fresh DEK and nonce on the same secret version.
+    ///
+    /// Callers run this with no transaction open and fence the swap on the
+    /// row they read.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::OperatorKeyUnavailable`] with a constant detail
+    /// when no `[kms]` is configured or the envelope cannot open or reseal.
+    pub async fn renew(
+        &self,
+        tenant: DataTenantId,
+        stored: &StoredConnection,
+    ) -> Result<SealedSecret, WyrdError> {
+        let kms = self
+            .kms
+            .as_deref()
+            .ok_or_else(|| unavailable(&UNCONFIGURED))?;
+        let identity = SecretIdentity::of(tenant, &stored.view, stored.secret_version);
+        kms.renew(&identity.context(), &stored.sealed.envelope)
+            .await
+            .map(|envelope| SealedSecret { envelope })
+            .map_err(|error| unavailable(&error))
+    }
+
     /// Open the current secret of `stored` for one delivery attempt.
     ///
     /// # Errors

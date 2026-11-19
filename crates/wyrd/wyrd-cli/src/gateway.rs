@@ -76,6 +76,8 @@ pub enum CredentialVerb {
     List,
     /// Terminally revoke a credential.
     Revoke(CredentialNameArg),
+    /// Reseal a managed credential's unchanged key under a fresh data key.
+    RenewEncryption(CredentialNameArg),
     /// Delete an unreferenced credential; absent names succeed.
     Delete(CredentialNameArg),
 }
@@ -168,6 +170,11 @@ impl GatewayCommand {
                 CredentialVerb::Revoke(arg) => {
                     print(&revoke_credential_with(client, &arg.name).await?)
                 }
+                CredentialVerb::RenewEncryption(arg) => print(
+                    &CredentialWriter::new(client)
+                        .renew_credential_encryption(&arg.name)
+                        .await?,
+                ),
                 CredentialVerb::Delete(arg) => Ok(delete_credential_with(client, &arg.name).await?),
             },
             GatewayResource::Deployment(verb) => match verb {

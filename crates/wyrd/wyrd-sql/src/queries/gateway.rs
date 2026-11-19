@@ -72,6 +72,25 @@ const REVOKE_CREDENTIAL_SQL: &str = r"
     RETURNING name, provider, source, state, created_at, updated_at, rotated_at, revoked_at
 ";
 
+/// Reads one credential's provider, state, and sealed managed secret.
+const CREDENTIAL_SECRET_SQL: &str = r"
+    SELECT provider, state, secret_ciphertext
+      FROM wyrd.gateway_provider_credentials
+     WHERE name = $1
+";
+
+/// Swaps an active credential's sealed managed secret for its renewal only
+/// while the row still holds the envelope the renewal opened.
+const RENEW_CREDENTIAL_SQL: &str = r"
+    UPDATE wyrd.gateway_provider_credentials
+       SET secret_ciphertext = $3,
+           updated_at = now()
+     WHERE name = $1
+       AND state = 'active'
+       AND secret_ciphertext = $2
+    RETURNING name, provider, source, state, created_at, updated_at, rotated_at, revoked_at
+";
+
 /// Deletes one credential; a referencing deployment fails the composite foreign
 /// key with `23503`.
 const DELETE_CREDENTIAL_SQL: &str = r"
@@ -318,6 +337,44 @@ pub async fn revoke_gateway_credential(
 ) -> Result<Option<GatewayCredentialRow>, Error> {
     sqlx::query_as::<_, GatewayCredentialRow>(REVOKE_CREDENTIAL_SQL)
         .bind(name)
+        .fetch_optional(&mut **conn.transaction())
+        .await
+}
+
+/// Reads `(provider, state, secret_ciphertext)` of one credential, the
+/// inputs an encryption renewal opens; `None` when no credential has the name.
+///
+/// # Errors
+/// Returns a SQLx error when Postgres rejects the query.
+pub async fn gateway_credential_secret(
+    conn: &mut TenantConn<'_>,
+    name: &str,
+) -> Result<Option<(String, String, Option<Vec<u8>>)>, Error> {
+    sqlx::query_as(CREDENTIAL_SECRET_SQL)
+        .bind(name)
+        .fetch_optional(&mut **conn.transaction())
+        .await
+}
+
+/// Replaces an active credential's sealed managed secret with `renewed`, its
+/// encryption renewal, only while the row still holds `observed`.
+///
+/// Returns `None` when a replacement, revocation, or another renewal
+/// committed first, so the caller reports a conflict and the winner stands.
+/// `rotated_at` is unchanged: the provider key is the same.
+///
+/// # Errors
+/// Returns a SQLx error when Postgres rejects the update.
+pub async fn renew_gateway_credential(
+    conn: &mut TenantConn<'_>,
+    name: &str,
+    observed: &[u8],
+    renewed: &[u8],
+) -> Result<Option<GatewayCredentialRow>, Error> {
+    sqlx::query_as::<_, GatewayCredentialRow>(RENEW_CREDENTIAL_SQL)
+        .bind(name)
+        .bind(observed)
+        .bind(renewed)
         .fetch_optional(&mut **conn.transaction())
         .await
 }

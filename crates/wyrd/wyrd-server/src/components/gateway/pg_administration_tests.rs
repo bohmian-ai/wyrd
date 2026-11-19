@@ -563,6 +563,164 @@ async fn gateway_managed_secrets_persist_sealed_and_bound_envelopes() {
     settle_audit(&state).await;
 }
 
+/// Renewing a managed secret's encryption reseals the same provider key under
+/// a fresh DEK on the same credential, and the next snapshot prepares the
+/// unchanged key. A renewal racing a revoke or a replacement loses with the
+/// resource conflict and leaves the winner's row; a revoked credential, a
+/// credential with no managed secret, and a key outage refuse without a write.
+///
+/// # Panics
+///
+/// Panics when an administration call, stored envelope, or prepared key
+/// differs.
+#[tokio::test]
+async fn gateway_managed_secret_renewal_keeps_the_key_and_loses_races() {
+    const SUBMITTED: &str = "sk-live-renewed-submission";
+    const REPLACED: &str = "sk-live-replacement-wins";
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let transit =
+        wyrd_testing::kms::TransitFixture::start_delayed(std::time::Duration::from_millis(300))
+            .await;
+    let kms = Arc::new(WyrdKms::new(&transit.config("gw", &[]), false).expect("transit facade"));
+    let state = with_kms(test_state(&fixture).await, &fixture, &kms);
+    let admin = admin(tenant);
+    let gateway = GatewayAdministration::new(&state);
+    let managed = |name: &str, secret: &str| {
+        credential(
+            name,
+            "openai",
+            json!({"managed_secret": {"secret": secret}}),
+        )
+    };
+    let name = credential_name("managed");
+    gateway
+        .put_credential(&admin, &name, managed("managed", SUBMITTED))
+        .await
+        .expect("managed submission stores");
+    let (_, before) = stored_credential(&fixture, tenant, "managed").await;
+
+    let renewed = gateway
+        .renew_credential_encryption(&admin, &name)
+        .await
+        .expect("renewal");
+    assert_eq!(
+        (renewed.name.as_str(), renewed.state),
+        ("managed", ProviderCredentialState::Active)
+    );
+    assert!(renewed.rotated_at.is_none(), "renewal is not a credential rotation");
+    let (row, after) = stored_credential(&fixture, tenant, "managed").await;
+    assert!(!row.contains(SUBMITTED), "the row never holds plaintext");
+    assert_ne!(after, before, "the envelope is resealed under a fresh DEK");
+    let (snapshot, _) = super::service::load_snapshot(
+        fixture.wyrd_postgres(),
+        &gateway_config(tenant),
+        tenant,
+        Some(&kms),
+    )
+    .await
+    .expect("a fresh load opens the stored envelope");
+    assert_eq!(prepared(&snapshot, "managed").as_deref(), Some(SUBMITTED));
+
+    let encrypts = transit.requests("encrypt").await;
+    let renewal = gateway.renew_credential_encryption(&admin, &name);
+    let replacement = async {
+        while transit.requests("encrypt").await <= encrypts {
+            tokio::task::yield_now().await;
+        }
+        gateway
+            .put_credential(&admin, &name, managed("managed", REPLACED))
+            .await
+    };
+    let (lost, won) = tokio::join!(renewal, replacement);
+    won.expect("the replacement commits first");
+    assert!(
+        matches!(lost, Err(WyrdError::GatewayResourceConflict { .. })),
+        "the renewal loses to the replacement: {lost:?}"
+    );
+    let (snapshot, _) = super::service::load_snapshot(
+        fixture.wyrd_postgres(),
+        &gateway_config(tenant),
+        tenant,
+        Some(&kms),
+    )
+    .await
+    .expect("a fresh load opens the stored envelope");
+    assert_eq!(prepared(&snapshot, "managed").as_deref(), Some(REPLACED));
+
+    let encrypts = transit.requests("encrypt").await;
+    let renewal = gateway.renew_credential_encryption(&admin, &name);
+    let revoke = async {
+        while transit.requests("encrypt").await <= encrypts {
+            tokio::task::yield_now().await;
+        }
+        gateway.revoke_credential(&admin, &name).await
+    };
+    let (lost, revoked) = tokio::join!(renewal, revoke);
+    assert_eq!(
+        revoked.expect("revoke").state,
+        ProviderCredentialState::Revoked
+    );
+    assert!(
+        matches!(lost, Err(WyrdError::GatewayResourceConflict { .. })),
+        "the renewal loses to the revoke: {lost:?}"
+    );
+    let (_, revoked_envelope) = stored_credential(&fixture, tenant, "managed").await;
+    assert!(matches!(
+        gateway.renew_credential_encryption(&admin, &name).await,
+        Err(WyrdError::GatewayResourceConflict { .. })
+    ));
+    assert_eq!(
+        gateway.credential(&admin, &name).await.expect("read").state,
+        ProviderCredentialState::Revoked,
+        "renewal never re-enables a revoked credential"
+    );
+    assert_eq!(
+        stored_credential(&fixture, tenant, "managed").await.1,
+        revoked_envelope
+    );
+
+    let environment = credential_name("openai-env");
+    gateway
+        .put_credential(
+            &admin,
+            &environment,
+            credential(
+                "openai-env",
+                "openai",
+                json!({"environment": {"binding": "openai-env"}}),
+            ),
+        )
+        .await
+        .expect("environment credential stores");
+    assert!(matches!(
+        gateway.renew_credential_encryption(&admin, &environment).await,
+        Err(WyrdError::GatewayResourceConflict { .. })
+    ));
+    assert!(matches!(
+        gateway
+            .renew_credential_encryption(&admin, &credential_name("missing"))
+            .await,
+        Err(WyrdError::GatewayResourceNotFound { .. })
+    ));
+
+    let outage = credential_name("outage");
+    gateway
+        .put_credential(&admin, &outage, managed("outage", SUBMITTED))
+        .await
+        .expect("managed submission stores");
+    let (_, sealed) = stored_credential(&fixture, tenant, "outage").await;
+    transit.set_available(false);
+    let refused = gateway.renew_credential_encryption(&admin, &outage).await;
+    transit.set_available(true);
+    assert!(
+        matches!(refused, Err(WyrdError::ServiceUnavailable { .. })),
+        "{refused:?}"
+    );
+    assert_eq!(stored_credential(&fixture, tenant, "outage").await.1, sealed);
+    settle_audit(&state).await;
+}
+
 /// Returns the details of an invalid-configuration rejection.
 ///
 /// # Panics

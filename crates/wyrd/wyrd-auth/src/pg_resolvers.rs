@@ -498,6 +498,30 @@ impl ClientSecretOwner<'_> {
             })
     }
 
+    /// Renew the encryption of `envelope`, sealed for the stored
+    /// client-authentication `method`: the same secret resealed under a fresh
+    /// data key and nonce wrapped by the active key.
+    ///
+    /// # Errors
+    /// Returns [`IssuerSealError::KmsMissing`] when `kms` is `None`, and
+    /// [`IssuerSealError::Encrypt`] when the envelope does not open under
+    /// this owner or the reseal fails.
+    pub(crate) async fn renew_secret(
+        &self,
+        method: &str,
+        envelope: &[u8],
+        kms: Option<&WyrdKms>,
+    ) -> Result<Vec<u8>, IssuerSealError> {
+        let kms = kms.ok_or(IssuerSealError::KmsMissing)?;
+        let authority = self.authority(method);
+        kms.renew(&self.context(&authority), envelope)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, purpose = self.purpose.as_str(), "client secret could not be renewed");
+                IssuerSealError::Encrypt
+            })
+    }
+
     /// Rebuild a stored client-authentication method, opening its secret.
     ///
     /// Shared by the workload issuer, platform connection, and tenant human
@@ -765,6 +789,30 @@ pub async fn seal_platform_client_secret(
     .await
 }
 
+/// Renew the platform connection's client-secret encryption: the same secret
+/// resealed under a fresh data key for the same issuer, client id, and
+/// method. Callers run this before opening the transaction that swaps it in.
+///
+/// # Errors
+/// Returns [`IssuerSealError::KmsMissing`] without a facade and
+/// [`IssuerSealError::Encrypt`] when the envelope does not open for this
+/// connection or the reseal fails.
+pub async fn renew_platform_client_secret(
+    row: &PlatformOidcConnectionRow,
+    envelope: &[u8],
+    kms: Option<&WyrdKms>,
+) -> Result<Vec<u8>, IssuerSealError> {
+    ClientSecretOwner {
+        scope: SecretScope::Platform,
+        purpose: SecretPurpose::PlatformOidc,
+        issuer_url: &row.issuer_url,
+        client_id: &row.client_id,
+        connection_id: None,
+    }
+    .renew_secret(&row.client_auth, envelope, kms)
+    .await
+}
+
 /// Name the stored discriminant for a client authentication method.
 #[must_use]
 pub fn client_auth_label(auth: &ClientAuth) -> &'static str {
@@ -813,6 +861,32 @@ pub async fn issuer_write_from_trusted(
         jwks_ttl_secs: i64::try_from(issuer.jwks_ttl.as_secs()).unwrap_or(i64::MAX),
         client_secret_enc,
     })
+}
+
+/// Renew a stored trusted issuer's client-secret encryption: the same secret
+/// resealed under a fresh data key, bound to the same tenant, issuer URL,
+/// client id, and method. Callers run this outside any transaction, since a
+/// remote backend waits on its key service, then swap on the observed bytes.
+///
+/// # Errors
+/// Returns [`IssuerSealError::KmsMissing`] without a facade and
+/// [`IssuerSealError::Encrypt`] when the envelope does not open for this
+/// issuer or the reseal fails.
+pub async fn renew_trusted_issuer_secret(
+    tenant: DataTenantId,
+    row: &TrustedIssuerRow,
+    envelope: &[u8],
+    kms: Option<&WyrdKms>,
+) -> Result<Vec<u8>, IssuerSealError> {
+    ClientSecretOwner {
+        scope: SecretScope::Tenant(tenant),
+        purpose: SecretPurpose::AuthTrustedIssuer,
+        issuer_url: &row.issuer_url,
+        client_id: &row.client_id,
+        connection_id: None,
+    }
+    .renew_secret(&row.client_auth, envelope, kms)
+    .await
 }
 
 /// Encode a [`WorkloadBinding`] into a [`WorkloadBindingWrite`] for boot seeding.

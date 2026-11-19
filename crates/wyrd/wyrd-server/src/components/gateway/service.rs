@@ -29,10 +29,10 @@ use wyrd_spec::gateway::{
 use wyrd_spec::ids::{ProviderCredentialName, ProviderDeploymentName, ProviderId};
 use wyrd_sql::queries::gateway::{
     GatewayCredentialWrite, GatewayDeploymentWrite, GatewayPricingWrite, delete_gateway_credential,
-    delete_gateway_deployment, gateway_credential, gateway_credential_for_share,
+    delete_gateway_deployment, gateway_credential, gateway_credential_for_share, gateway_credential_secret,
     gateway_credentials, gateway_deployment, gateway_deployments, gateway_policies,
     gateway_pricing, gateway_snapshot, lock_gateway_policies, revoke_gateway_credential,
-    update_gateway_policies, upsert_gateway_credential, upsert_gateway_deployment,
+    renew_gateway_credential, update_gateway_policies, upsert_gateway_credential, upsert_gateway_deployment,
     upsert_gateway_pricing,
 };
 use wyrd_sql::row_types::gateway::{GatewayCredentialRow, GatewayPricingRow};
@@ -206,6 +206,96 @@ impl<'a> GatewayAdministration<'a> {
             },
         )
         .await
+    }
+
+    /// Renews an active managed secret's encryption: the same provider key is
+    /// resealed under a fresh DEK and nonce, and the credential keeps its
+    /// name, source, and `rotated_at`.
+    ///
+    /// The stored envelope is read and resealed before any write transaction
+    /// opens; the swap commits only while the row still holds the envelope
+    /// that was opened, so a replacement, revocation, or renewal that commits
+    /// first wins and this call changes nothing.
+    ///
+    /// # Errors
+    /// Returns a permission error without `gateway:write`,
+    /// `GatewayResourceNotFound` when the name is absent,
+    /// `GatewayResourceConflict` when the credential is revoked, holds no
+    /// managed secret, or changed during the renewal, and
+    /// `ServiceUnavailable` when the deployment has no `[kms]`, the envelope
+    /// cannot be opened or resealed, or storage fails.
+    pub async fn renew_credential_encryption(
+        &self,
+        caller: &Caller,
+        name: &ProviderCredentialName,
+    ) -> Result<ProviderCredentialView, WyrdError> {
+        let resource = format!("gateway_provider_credential:{name}");
+        self.audited_prepared(
+            caller,
+            &Permission::gateway_write(),
+            "gateway.provider_credential.renew_encryption",
+            &resource,
+            self.prepare_renewal(caller.data_tenant_id, name),
+            |mut conn, (observed, renewed)| async move {
+                let row = renew_gateway_credential(&mut conn, name.as_str(), &observed, &renewed)
+                    .await
+                    .map_err(unavailable)?
+                    .ok_or_else(|| {
+                        conflict("credential changed during encryption renewal", name.as_str())
+                    })?;
+                let view = credential_view(row)?;
+                conn.commit().await.map_err(unavailable)?;
+                Ok(view)
+            },
+        )
+        .await
+    }
+
+    /// Reads `name`'s sealed managed secret and renews its encryption,
+    /// returning `(observed, renewed)` envelopes; the read commits before the
+    /// key service is called.
+    ///
+    /// # Errors
+    /// Returns the not-found, conflict, and unavailable errors of
+    /// [`Self::renew_credential_encryption`].
+    async fn prepare_renewal(
+        &self,
+        tenant: DataTenantId,
+        name: &ProviderCredentialName,
+    ) -> Result<(Vec<u8>, Vec<u8>), WyrdError> {
+        let mut conn = self.postgres.tenant_conn(tenant).await.map_err(unavailable)?;
+        let (provider, state, sealed) = gateway_credential_secret(&mut conn, name.as_str())
+            .await
+            .map_err(unavailable)?
+            .ok_or_else(|| not_found("credential", name.as_str()))?;
+        conn.commit().await.map_err(unavailable)?;
+        if state != "active" {
+            return Err(conflict("credential is revoked", name.as_str()));
+        }
+        let Some(sealed) = sealed else {
+            return Err(conflict("credential holds no managed secret", name.as_str()));
+        };
+        let protection = || WyrdError::ServiceUnavailable {
+            message: "gateway credential protection is unavailable".to_owned(),
+            details: json!({ "resource": "credential" }),
+        };
+        let kms = self.kms.ok_or_else(|| {
+            tracing::warn!("gateway encryption renewal refused: no [kms] is configured");
+            protection()
+        })?;
+        let provider = ProviderId::new(&provider).map_err(unavailable)?;
+        let renewed = ManagedSecretBinding {
+            tenant,
+            name,
+            provider: &provider,
+        }
+        .renew(kms, &sealed)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "gateway managed secret could not be renewed");
+            protection()
+        })?;
+        Ok((sealed, renewed))
     }
 
     /// Deletes an unreferenced credential; deleting an absent name succeeds.

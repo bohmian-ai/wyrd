@@ -1,7 +1,7 @@
 //! Operator connection management over MCP.
 //!
 //! Typed projections of the same [`OperatorConnectionControl`] operations
-//! HTTP serves. Reads are advertised to every caller; the three writes appear
+//! HTTP serves. Reads are advertised to every caller; the four writes appear
 //! only to a caller holding `operators:write`, and the operation authorizes
 //! and audits that permission again when a write is named directly. Write
 //! arguments are decoded by the HTTP body decoder, which reports only a
@@ -39,6 +39,9 @@ pub(super) const UPDATE: &str = "operator_connections.update";
 
 /// Wire name of connection disable.
 pub(super) const DISABLE: &str = "operator_connections.disable";
+
+/// Wire name of connection encryption renewal.
+pub(super) const RENEW_ENCRYPTION: &str = "operator_connections.renew_encryption";
 
 /// Arguments of the listing: none.
 #[derive(Debug, serde::Deserialize, JsonSchema)]
@@ -132,6 +135,15 @@ pub(super) fn write_descriptors() -> Vec<Tool> {
              operator_connections.update. Requires operators:write.",
             false,
         ),
+        tool::<IdArgs, OperatorConnectionView>(
+            RENEW_ENCRYPTION,
+            "Renew an Operator connection's encryption",
+            "Reseal one connection's unchanged secret under a fresh data key; its ID, status, \
+             and secret version are kept and a disabled connection stays disabled. This does \
+             not replace or revoke the credential at its provider: replace a leaked or expired \
+             secret with operator_connections.update. Requires operators:write.",
+            false,
+        ),
     ]
 }
 
@@ -157,7 +169,7 @@ fn decode_secret_args<T: DeserializeOwned>(
 impl WyrdMcpHandler {
     /// Dispatch one Operator connection tool by wire name.
     ///
-    /// `name` is one of this module's five wire names; the caller routes only
+    /// `name` is one of this module's six wire names; the caller routes only
     /// those here, so the final arm is [`DISABLE`].
     ///
     /// # Errors
@@ -192,6 +204,10 @@ impl WyrdMcpHandler {
                         .update(&caller, args.connection_id, args.request)
                         .await?,
                 )
+            }
+            RENEW_ENCRYPTION => {
+                let args: IdArgs = parse_args(arguments, RENEW_ENCRYPTION)?;
+                structured(&control.renew_encryption(&caller, args.connection_id).await?)
             }
             _ => {
                 let args: IdArgs = parse_args(arguments, DISABLE)?;

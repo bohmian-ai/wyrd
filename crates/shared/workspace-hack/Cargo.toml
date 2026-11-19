@@ -34,7 +34,7 @@ bit-vec = { version = "0.8" }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 bohmian-code-review-pipeline = { git = "https://github.com/bohmian-ai/bohmian-code-review", rev = "9046d1035538df8dfb661f826b102316ee6d0b4e", default-features = false, features = ["testing"] }
 byteorder = { version = "1" }
-bytes = { version = "1", features = ["serde"] }
+bytes = { version = "1" }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 clap_builder = { version = "4", default-features = false, features = ["color", "env", "help", "std", "suggestions", "usage"] }
@@ -42,7 +42,6 @@ console = { version = "0.16", default-features = false, features = ["ansi-parsin
 crossbeam-epoch = { version = "0.9" }
 crossbeam-utils = { version = "0.8" }
 crypto-common = { version = "0.1", default-features = false, features = ["getrandom", "std"] }
-deranged = { version = "0.5", features = ["serde"] }
 digest-93f6ce9d446188ac = { package = "digest", version = "0.10", features = ["mac", "oid", "std"] }
 digest-a6292c17cd707f01 = { package = "digest", version = "0.11", features = ["alloc", "mac", "oid"] }
 either = { version = "1", features = ["serde", "use_std"] }
@@ -73,7 +72,6 @@ hyper-util = { version = "0.1", features = ["client-legacy", "server-auto", "ser
 icu_properties = { version = "2" }
 idna = { version = "1" }
 indexmap = { version = "2", features = ["serde"] }
-jiff = { version = "0.2", default-features = false, features = ["serde", "std", "tzdb-bundle-always"] }
 lazy_static = { version = "1", default-features = false, features = ["spin_no_std"] }
 lexical-parse-float = { version = "1", features = ["format"] }
 lexical-parse-integer = { version = "1", default-features = false, features = ["format", "std"] }
@@ -117,7 +115,6 @@ semver = { version = "1", features = ["serde"] }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", features = ["alloc", "rc"] }
 serde_json = { version = "1", features = ["alloc", "float_roundtrip", "preserve_order", "raw_value"] }
-serde_with = { version = "3", features = ["base64"] }
 sha2-93f6ce9d446188ac = { package = "sha2", version = "0.10", features = ["oid"] }
 sha2-a6292c17cd707f01 = { package = "sha2", version = "0.11" }
 signature = { version = "2", default-features = false, features = ["digest", "rand_core", "std"] }
@@ -133,7 +130,7 @@ subtle = { version = "2" }
 sync_wrapper = { version = "1", default-features = false, features = ["futures"] }
 temp-env = { version = "0.3", features = ["async_closure"] }
 thiserror = { version = "2" }
-time = { version = "0.3", features = ["formatting", "macros", "parsing", "serde"] }
+time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-stream = { version = "0.1", features = ["fs", "net", "sync"] }
 tokio-util = { version = "0.7", features = ["codec", "io", "rt"] }
@@ -169,7 +166,7 @@ bit-vec = { version = "0.8" }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 bohmian-code-review-pipeline = { git = "https://github.com/bohmian-ai/bohmian-code-review", rev = "9046d1035538df8dfb661f826b102316ee6d0b4e", default-features = false, features = ["testing"] }
 byteorder = { version = "1" }
-bytes = { version = "1", features = ["serde"] }
+bytes = { version = "1" }
 cc = { version = "1", default-features = false, features = ["parallel"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
@@ -178,7 +175,6 @@ console = { version = "0.16", default-features = false, features = ["ansi-parsin
 crossbeam-epoch = { version = "0.9" }
 crossbeam-utils = { version = "0.8" }
 crypto-common = { version = "0.1", default-features = false, features = ["getrandom", "std"] }
-deranged = { version = "0.5", features = ["serde"] }
 digest-93f6ce9d446188ac = { package = "digest", version = "0.10", features = ["mac", "oid", "std"] }
 digest-a6292c17cd707f01 = { package = "digest", version = "0.11", features = ["alloc", "mac", "oid"] }
 either = { version = "1", features = ["serde", "use_std"] }
@@ -209,7 +205,6 @@ hyper-util = { version = "0.1", features = ["client-legacy", "server-auto", "ser
 icu_properties = { version = "2" }
 idna = { version = "1" }
 indexmap = { version = "2", features = ["serde"] }
-jiff = { version = "0.2", default-features = false, features = ["serde", "std", "tzdb-bundle-always"] }
 lazy_static = { version = "1", default-features = false, features = ["spin_no_std"] }
 lexical-parse-float = { version = "1", features = ["format"] }
 lexical-parse-integer = { version = "1", default-features = false, features = ["format", "std"] }
@@ -254,7 +249,6 @@ semver = { version = "1", features = ["serde"] }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", features = ["alloc", "rc"] }
 serde_json = { version = "1", features = ["alloc", "float_roundtrip", "preserve_order", "raw_value"] }
-serde_with = { version = "3", features = ["base64"] }
 sha2-93f6ce9d446188ac = { package = "sha2", version = "0.10", features = ["oid"] }
 sha2-a6292c17cd707f01 = { package = "sha2", version = "0.11" }
 signature = { version = "2", default-features = false, features = ["digest", "rand_core", "std"] }
@@ -272,8 +266,7 @@ syn-f595c2ba2a3f28df = { package = "syn", version = "2", features = ["extra-trai
 sync_wrapper = { version = "1", default-features = false, features = ["futures"] }
 temp-env = { version = "0.3", features = ["async_closure"] }
 thiserror = { version = "2" }
-time = { version = "0.3", features = ["formatting", "macros", "parsing", "serde"] }
-time-macros = { version = "0.2", default-features = false, features = ["formatting", "parsing", "serde"] }
+time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-stream = { version = "0.1", features = ["fs", "net", "sync"] }
 tokio-util = { version = "0.7", features = ["codec", "io", "rt"] }

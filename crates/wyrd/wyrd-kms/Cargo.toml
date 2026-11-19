@@ -10,14 +10,10 @@ publish = false
 description = "WyrdKms: the one stored-secret envelope facade over file, memory, GCP KMS, AWS KMS, and Vault Transit wrapping backends."
 
 [dependencies]
-async-trait = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
-# GCP application default credentials, including Workload Identity Federation.
-google-cloud-auth = { workspace = true }
 http = { workspace = true }
-# Only for the AWS workload credential chain, SigV4 signing, and the
-# credential provider shape both remote backends share.
+# Only for the GCP and AWS workload credential chains and SigV4 signing.
 object_store = { workspace = true, features = ["aws", "gcp"] }
 reqwest = { workspace = true }
 secrecy = { workspace = true }
@@ -34,6 +30,7 @@ wyrd-vault = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 temp-env = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

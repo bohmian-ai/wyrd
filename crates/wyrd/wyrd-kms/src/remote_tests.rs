@@ -651,3 +651,142 @@ async fn remote_plaintext_answers_needing_a_copy_are_refused() {
         Err(transport(KmsBackendKind::VaultTransit))
     );
 }
+
+/// Google credential variables that could otherwise hide which identity
+/// `GcpKms::new` selected.
+const AMBIENT_GOOGLE: [&str; 5] = [
+    "SERVICE_ACCOUNT",
+    "GOOGLE_SERVICE_ACCOUNT",
+    "GOOGLE_SERVICE_ACCOUNT_PATH",
+    "GOOGLE_SERVICE_ACCOUNT_KEY",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+];
+
+/// Build the production GCP facade over `server` with exactly `inputs` set
+/// among Wyrd's Google credential variables and every other ambient source
+/// cleared, seal and reopen through it, and return the identity each KMS
+/// request was signed as.
+async fn gcp_identities(server: &MockServer, inputs: &[(&str, &str)]) -> Vec<Option<String>> {
+    let home = tempfile::tempdir().expect("empty home");
+    let mut vars: Vec<(&str, Option<&str>)> = AMBIENT_GOOGLE
+        .iter()
+        .chain(&[
+            "GOOGLE_ACCOUNT_JSON_BASE64",
+            "GOOGLE_APPLICATION_CREDENTIALS_JSON",
+        ])
+        .filter(|name| inputs.iter().all(|(set, _)| set != *name))
+        .map(|name| (*name, None))
+        .collect();
+    vars.extend(inputs.iter().map(|(name, value)| (*name, Some(*value))));
+    vars.push(("HOME", home.path().to_str()));
+    let config = crate::KmsConfig {
+        backend: Some(KmsBackendKind::GcpKms),
+        active_key: Some(GCP_OLD.to_owned()),
+        endpoint: Some(server.uri()),
+        ..crate::KmsConfig::default()
+    };
+    let kms = temp_env::with_vars(vars, || WyrdKms::new(&config, false)).expect("builds");
+    let ctx = context(DataTenantId::new_v7());
+    let sealed = kms.seal(&ctx, b"sk-live").await.expect("seals");
+    assert_eq!(
+        kms.open(&ctx, &sealed).await.expect("opens").as_slice(),
+        b"sk-live"
+    );
+    let seen = requests(server).await;
+    server.reset().await;
+    Mock::given(method("POST"))
+        .respond_with(FakeKms(GCP))
+        .mount(server)
+        .await;
+    seen.iter()
+        .map(|request| {
+            request
+                .headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .and_then(wyrd_dev_fixtures::google::bearer_issuer)
+        })
+        .collect()
+}
+
+/// Each of Wyrd's two inline Google credential variables, set alone, is the
+/// identity the production GCP facade signs its KMS calls with.
+#[tokio::test]
+async fn gcp_kms_signs_with_either_inline_google_credential() {
+    let server = fake(GCP).await;
+    let encoded = STANDARD.encode(wyrd_dev_fixtures::google::service_account_json(
+        "encoded@wyrd.test",
+    ));
+    let raw = wyrd_dev_fixtures::google::service_account_json("raw@wyrd.test");
+
+    let from_encoded = gcp_identities(&server, &[("GOOGLE_ACCOUNT_JSON_BASE64", &encoded)]).await;
+    let from_raw = gcp_identities(&server, &[("GOOGLE_APPLICATION_CREDENTIALS_JSON", &raw)]).await;
+
+    let encoded_identity = Some("encoded@wyrd.test".to_owned());
+    let raw_identity = Some("raw@wyrd.test".to_owned());
+    assert_eq!(from_encoded, [encoded_identity.clone(), encoded_identity]);
+    assert_eq!(from_raw, [raw_identity.clone(), raw_identity]);
+}
+
+/// With both inline variables set the base64 one wins, and with neither the
+/// credentials file named by `GOOGLE_APPLICATION_CREDENTIALS` is used.
+#[tokio::test]
+async fn gcp_kms_keeps_google_credential_precedence() {
+    let server = fake(GCP).await;
+    let encoded = STANDARD.encode(wyrd_dev_fixtures::google::service_account_json(
+        "encoded@wyrd.test",
+    ));
+    let raw = wyrd_dev_fixtures::google::service_account_json("raw@wyrd.test");
+    let file = tempfile::NamedTempFile::new().expect("credentials file");
+    std::fs::write(
+        file.path(),
+        wyrd_dev_fixtures::google::service_account_json("file@wyrd.test"),
+    )
+    .expect("writes");
+    let path = file.path().to_str().expect("utf-8 path");
+
+    let both = gcp_identities(
+        &server,
+        &[
+            ("GOOGLE_ACCOUNT_JSON_BASE64", &encoded),
+            ("GOOGLE_APPLICATION_CREDENTIALS_JSON", &raw),
+        ],
+    )
+    .await;
+    let neither = gcp_identities(&server, &[("GOOGLE_APPLICATION_CREDENTIALS", path)]).await;
+
+    let encoded_identity = Some("encoded@wyrd.test".to_owned());
+    let file_identity = Some("file@wyrd.test".to_owned());
+    assert_eq!(both, [encoded_identity.clone(), encoded_identity]);
+    assert_eq!(neither, [file_identity.clone(), file_identity]);
+}
+
+/// An inline credential the provider cannot use fails facade construction
+/// with a fixed reason that echoes none of the credential.
+#[test]
+fn gcp_kms_redacts_an_unusable_inline_google_credential() {
+    let unusable = r#"{"type":"service_account","client_email":"x@wyrd.test","private_key_id":"k","private_key":"canary-not-a-key"}"#;
+    let config = crate::KmsConfig {
+        backend: Some(KmsBackendKind::GcpKms),
+        active_key: Some(GCP_OLD.to_owned()),
+        ..crate::KmsConfig::default()
+    };
+
+    let error = temp_env::with_vars(
+        [
+            ("GOOGLE_ACCOUNT_JSON_BASE64", None),
+            ("GOOGLE_APPLICATION_CREDENTIALS_JSON", Some(unusable)),
+        ],
+        || WyrdKms::new(&config, false).map(|_| ()),
+    )
+    .expect_err("an unusable key is refused");
+
+    assert_eq!(
+        error,
+        KmsError::Config {
+            setting: "backend",
+            reason: "could not load GCP workload credentials",
+        }
+    );
+    assert!(!format!("{error} {error:?}").contains("canary"));
+}

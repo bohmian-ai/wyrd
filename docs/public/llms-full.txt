@@ -8285,7 +8285,7 @@ Each stored value records the key that wrapped it. Opening a value whose key is 
 | --- | --- | --- | --- |
 | `file` | A file in `key_dir` named after the key, mode `0600`, holding 32 random bytes as base64 | File ownership | AES-256-GCM associated data |
 | `memory` | 32 random bytes generated at startup and lost on exit; values stored under it cannot be opened after a restart | None | AES-256-GCM associated data |
-| `gcp_kms` | A symmetric `ENCRYPT_DECRYPT` CryptoKey; Cloud KMS selects the primary version to encrypt and the needed version to decrypt | Application default credentials: `GOOGLE_APPLICATION_CREDENTIALS`, the gcloud default, or the metadata server | `additionalAuthenticatedData` |
+| `gcp_kms` | A symmetric `ENCRYPT_DECRYPT` CryptoKey; Cloud KMS selects the primary version to encrypt and the needed version to decrypt | The Google identity GCS storage uses: `GOOGLE_ACCOUNT_JSON_BASE64` (base64 service-account JSON), else `GOOGLE_APPLICATION_CREDENTIALS_JSON` (service-account JSON), else application default credentials: `GOOGLE_APPLICATION_CREDENTIALS`, the gcloud default, or the metadata server | `additionalAuthenticatedData` |
 | `aws_kms` | A symmetric key; AWS selects its key material on decrypt | The standard AWS credential chain: environment, web identity, container, or instance metadata | Encryption context `wyrd-context` |
 | `vault_transit` | A Transit key of an AEAD type such as `aes256-gcm96`; Transit keeps old versions for decrypt | The Vault token | `associated_data` |
 
@@ -8337,7 +8337,9 @@ gcloud kms keys add-iam-policy-binding wyrd-secrets --keyring=wyrd --location=us
   --member=serviceAccount:<server-service-account> --role=roles/cloudkms.cryptoKeyEncrypterDecrypter
 ```
 
-Set `active_key` to `projects/<project>/locations/us-central1/keyRings/wyrd/cryptoKeys/wyrd-secrets`. Run the server as that service account, or point `GOOGLE_APPLICATION_CREDENTIALS` at its key file.
+Set `active_key` to `projects/<project>/locations/us-central1/keyRings/wyrd/cryptoKeys/wyrd-secrets`. Run the server as that service account, point `GOOGLE_APPLICATION_CREDENTIALS` at its key file, or set its key JSON in `GOOGLE_ACCOUNT_JSON_BASE64` (base64-encoded) or `GOOGLE_APPLICATION_CREDENTIALS_JSON`.
+
+GCS storage and Cloud KMS read the same variables, so a server that already reaches its bucket through one of them uses that service account for Cloud KMS too. Grant it the key role above; storage permissions do not include Cloud KMS. When both inline variables are set, `GOOGLE_ACCOUNT_JSON_BASE64` wins, and a value in it that is not valid base64 of UTF-8 selects no inline key rather than falling back to `GOOGLE_APPLICATION_CREDENTIALS_JSON`.
 
 ### `aws_kms`
 

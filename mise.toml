@@ -255,7 +255,7 @@ run = "cargo nextest run --locked -p wyrd-kms --test integration --run-ignored=a
 
 [tasks."test:kms:gcp:cloud"]
 hide = true
-description = "Run the WyrdKms check against real Google Cloud KMS (merge-to-main only; requires WYRD_KMS_BACKEND=gcp_kms, WYRD_KMS_ACTIVE_KEY, and GOOGLE_APPLICATION_CREDENTIALS or another application default credential)"
+description = "Run the WyrdKms check against real Google Cloud KMS (merge-to-main only; requires WYRD_KMS_BACKEND=gcp_kms, WYRD_KMS_ACTIVE_KEY, and GOOGLE_ACCOUNT_JSON_BASE64, GOOGLE_APPLICATION_CREDENTIALS_JSON, GOOGLE_APPLICATION_CREDENTIALS, or another application default credential)"
 run = "cargo nextest run --locked -p wyrd-kms --test integration --run-ignored=all -E 'test(/^integration_gcp::/)'"
 
 [tasks."test:kms:aws:cloud"]

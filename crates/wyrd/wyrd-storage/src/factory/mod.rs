@@ -80,24 +80,6 @@ pub fn client_options(backend: &BackendConfig) -> ClientOptions {
         .with_allow_http(endpoint.is_some_and(|endpoint| endpoint.starts_with("http://")))
 }
 
-/// Returns the service-account JSON from Wyrd's GCS credential variables.
-///
-/// `GOOGLE_ACCOUNT_JSON_BASE64` is decoded, else
-/// `GOOGLE_APPLICATION_CREDENTIALS_JSON` is returned as is. `None` leaves
-/// `object_store`'s default chain (a credentials file path or ambient
-/// identity) in charge.
-#[cfg(feature = "cloud")]
-pub(crate) fn service_account_json() -> Option<String> {
-    use base64::Engine as _;
-    if let Ok(encoded) = std::env::var("GOOGLE_ACCOUNT_JSON_BASE64") {
-        return base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .ok()
-            .and_then(|json| String::from_utf8(json).ok());
-    }
-    std::env::var("GOOGLE_APPLICATION_CREDENTIALS_JSON").ok()
-}
-
 /// Build the active backend signer in a cloud-enabled build.
 ///
 /// A cloud signer owns the backend's one `object_store` client, built with no
@@ -213,29 +195,106 @@ mod tests {
         }
     }
 
-    /// Wyrd's GCS credential variables yield the service-account JSON:
-    /// the base64 variable decoded, else the JSON variable verbatim.
-    #[test]
-    fn service_account_json_reads_wyrd_gcs_variables() {
+    /// Google credential variables that could otherwise hide which identity
+    /// the GCS signer selected.
+    #[cfg(feature = "emulator")]
+    const AMBIENT_GOOGLE: [&str; 7] = [
+        "SERVICE_ACCOUNT",
+        "GOOGLE_SERVICE_ACCOUNT",
+        "GOOGLE_SERVICE_ACCOUNT_PATH",
+        "GOOGLE_SERVICE_ACCOUNT_KEY",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_ACCOUNT_JSON_BASE64",
+        "GOOGLE_APPLICATION_CREDENTIALS_JSON",
+    ];
+
+    /// Build the production GCS signer against a local endpoint with exactly
+    /// `inputs` set among the Google credential variables, and return the
+    /// identity its boot probe was signed as.
+    #[cfg(feature = "emulator")]
+    async fn gcs_identity(inputs: &[(&str, &str)]) -> Option<String> {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "<ListBucketResult><Name>wyrd-test</Name><Prefix></Prefix><KeyCount>0</KeyCount>\
+                 <MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated></ListBucketResult>",
+                "application/xml",
+            ))
+            .mount(&server)
+            .await;
+        let home = tempfile::tempdir().expect("empty home");
+        let mut vars: Vec<(&str, Option<&str>)> = AMBIENT_GOOGLE
+            .iter()
+            .filter(|name| inputs.iter().all(|(set, _)| set != *name))
+            .map(|name| (*name, None))
+            .collect();
+        vars.extend(inputs.iter().map(|(name, value)| (*name, Some(*value))));
+        vars.push(("HOME", home.path().to_str()));
+        let backend = BackendConfig::Gcs(crate::settings::GcsConfig {
+            bucket: "wyrd-test".to_owned(),
+            endpoint_url: Some(server.uri()),
+        });
+        temp_env::async_with_vars(vars, build_signer(&backend))
+            .await
+            .expect("builds and probes");
+        let seen = server.received_requests().await.expect("recording");
+        seen.first()
+            .and_then(|request| request.headers.get("authorization"))
+            .and_then(|value| value.to_str().ok())
+            .and_then(wyrd_dev_fixtures::google::bearer_issuer)
+    }
+
+    /// Each inline Google credential variable, set alone, is the identity the
+    /// GCS signer uses, and with both set the base64 one wins. A local
+    /// endpoint without an inline key is deliberately unsigned, so the
+    /// credentials-file chain is not observable here.
+    #[cfg(feature = "emulator")]
+    #[tokio::test]
+    async fn gcs_signer_selects_the_configured_google_identity() {
         use base64::Engine as _;
-        let raw = r#"{"type":"service_account"}"#;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(raw);
-        let from_b64 = temp_env::with_vars(
-            [
-                ("GOOGLE_ACCOUNT_JSON_BASE64", Some(encoded.as_str())),
-                ("GOOGLE_APPLICATION_CREDENTIALS_JSON", None),
-            ],
-            service_account_json,
-        );
-        let from_json = temp_env::with_vars(
+        use wyrd_dev_fixtures::google::service_account_json;
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(service_account_json("encoded@wyrd.test"));
+        let raw = service_account_json("raw@wyrd.test");
+        let from_encoded = gcs_identity(&[("GOOGLE_ACCOUNT_JSON_BASE64", &encoded)]).await;
+        let from_raw = gcs_identity(&[("GOOGLE_APPLICATION_CREDENTIALS_JSON", &raw)]).await;
+        let both = gcs_identity(&[
+            ("GOOGLE_ACCOUNT_JSON_BASE64", &encoded),
+            ("GOOGLE_APPLICATION_CREDENTIALS_JSON", &raw),
+        ])
+        .await;
+
+        assert_eq!(from_encoded.as_deref(), Some("encoded@wyrd.test"));
+        assert_eq!(from_raw.as_deref(), Some("raw@wyrd.test"));
+        assert_eq!(both.as_deref(), Some("encoded@wyrd.test"));
+    }
+
+    /// An inline credential the provider cannot use fails signer
+    /// construction without echoing the credential.
+    #[cfg(feature = "emulator")]
+    #[tokio::test]
+    async fn gcs_signer_redacts_an_unusable_inline_google_credential() {
+        let unusable = r#"{"type":"service_account","client_email":"x@wyrd.test","private_key_id":"k","private_key":"canary-not-a-key"}"#;
+        let backend = BackendConfig::Gcs(crate::settings::GcsConfig {
+            bucket: "wyrd-test".to_owned(),
+            endpoint_url: None,
+        });
+
+        let error = temp_env::async_with_vars(
             [
                 ("GOOGLE_ACCOUNT_JSON_BASE64", None),
-                ("GOOGLE_APPLICATION_CREDENTIALS_JSON", Some(raw)),
+                ("GOOGLE_APPLICATION_CREDENTIALS_JSON", Some(unusable)),
             ],
-            service_account_json,
-        );
+            build_signer(&backend),
+        )
+        .await
+        .map(|_| ())
+        .expect_err("an unusable key is refused");
 
-        assert_eq!(from_b64.as_deref(), Some(raw));
-        assert_eq!(from_json.as_deref(), Some(raw));
+        assert!(
+            !format!("{error} {error:?}").contains("canary"),
+            "{error:?}"
+        );
     }
 }

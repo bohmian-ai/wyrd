@@ -4,9 +4,10 @@
 //! primary version; Decrypt lets KMS select the version the ciphertext needs,
 //! so native rotation needs no Wyrd change. The canonical wrap context is
 //! sent as `additionalAuthenticatedData`. The access token comes from the
-//! standard GCP credential chain (service account file, application default
-//! credentials, or the metadata server), refreshed by `object_store`'s
-//! provider before it expires.
+//! same identity Google Cloud Storage selects: Wyrd's inline service-account
+//! variables when set, else the standard GCP credential chain (service
+//! account file, application default credentials, or the metadata server),
+//! refreshed by `object_store`'s provider before it expires.
 
 use std::time::Duration;
 
@@ -39,19 +40,21 @@ pub(crate) struct GcpKms {
 }
 
 impl GcpKms {
-    /// Build over the ambient GCP credential chain.
+    /// Build over the service account Wyrd's inline Google variables name,
+    /// else the ambient GCP credential chain.
     ///
     /// # Errors
     /// Returns [`KmsError::Config`] when the credential chain or client
     /// cannot be built.
     pub(crate) fn new(endpoint: Option<&Url>) -> Result<Self, KmsError> {
-        let store = GoogleCloudStorageBuilder::from_env()
-            .with_bucket_name("wyrd-kms")
-            .build()
-            .map_err(|_| KmsError::Config {
-                setting: "backend",
-                reason: "could not load GCP workload credentials",
-            })?;
+        let mut builder = GoogleCloudStorageBuilder::from_env().with_bucket_name("wyrd-kms");
+        if let Some(key) = wyrd_utils::secret::google_service_account_json() {
+            builder = builder.with_service_account_key(key);
+        }
+        let store = builder.build().map_err(|_| KmsError::Config {
+            setting: "backend",
+            reason: "could not load GCP workload credentials",
+        })?;
         Self::with_credentials(
             endpoint.map_or(DEFAULT_ENDPOINT, Url::as_str),
             store.credentials().clone(),

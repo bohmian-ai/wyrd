@@ -11,7 +11,6 @@ authors = { workspace = true }
 default = []
 pg = [
     "dep:secrecy",
-    "dep:serde_json",
     "dep:sqlx",
     "dep:thiserror",
     "dep:tokio",
@@ -23,8 +22,10 @@ pg = [
 ]
 
 [dependencies]
+aws-lc-rs = { workspace = true }
+base64 = { workspace = true }
+serde_json = { workspace = true }
 secrecy = { workspace = true, optional = true }
-serde_json = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
 thiserror = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = ["macros", "rt-multi-thread"] }

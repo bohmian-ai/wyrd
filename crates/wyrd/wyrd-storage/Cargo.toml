@@ -39,12 +39,14 @@ bytes = { workspace = true }
 object_store = { workspace = true }
 futures-util = { workspace = true }
 wyrd-tls = { workspace = true }
+wyrd-utils = { workspace = true }
 
 [dev-dependencies]
 workspace-hack.workspace = true
 temp-env = { workspace = true, features = ["async_closure"] }
 wyrd-dev-fixtures = { path = "../../shared/wyrd-dev-fixtures", version = "0.4.2", features = ["pg"] }
 wyrd-testing = { path = "../wyrd-testing", version = "0.4.2" }
+wiremock = { workspace = true }
 
 [lints]
 workspace = true

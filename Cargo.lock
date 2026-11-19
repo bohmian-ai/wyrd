@@ -10067,6 +10067,8 @@ dependencies = [
  "arrow-ipc",
  "arrow-schema",
  "async-compression",
+ "aws-lc-rs",
+ "aws-lc-sys",
  "axum",
  "axum-core",
  "base64 0.22.1",
@@ -10584,6 +10586,8 @@ dependencies = [
 name = "wyrd-dev-fixtures"
 version = "0.4.2"
 dependencies = [
+ "aws-lc-rs",
+ "base64 0.22.1",
  "secrecy",
  "serde_json",
  "sqlx",
@@ -10682,6 +10686,7 @@ dependencies = [
  "wiremock",
  "workspace-hack",
  "wyrd-crypt",
+ "wyrd-dev-fixtures",
  "wyrd-spec",
  "wyrd-tls",
  "wyrd-utils",
@@ -11234,12 +11239,14 @@ dependencies = [
  "url",
  "uuid",
  "vala-sql",
+ "wiremock",
  "workspace-hack",
  "wyrd-dev-fixtures",
  "wyrd-spec",
  "wyrd-sql",
  "wyrd-testing",
  "wyrd-tls",
+ "wyrd-utils",
 ]
 
 [[package]]
@@ -11402,6 +11409,7 @@ dependencies = [
 name = "wyrd-utils"
 version = "0.4.2"
 dependencies = [
+ "base64 0.22.1",
  "flate2",
  "pyo3",
  "secrecy",
@@ -11409,6 +11417,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "temp-env",
  "thiserror 2.0.21",
  "walkdir",
  "workspace-hack",

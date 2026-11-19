@@ -29,6 +29,9 @@ const REQUEST_BYTES: usize = 256 << 10;
 /// How long a test waits for a queued execution or a waiter to appear.
 const WAIT: Duration = Duration::from_secs(60);
 
+/// How long a queued execution is watched staying unfinished under held memory.
+const DEFERRED: Duration = Duration::from_secs(5);
+
 /// The capacity desk deployment: a server hosting Python Verifiers under a
 /// short direct deadline, with the `capacity-desk` Service registered and
 /// hydrated as its own key.
@@ -229,7 +232,17 @@ async fn submit_defers_under_hosted_memory_then_passes() {
     else {
         panic!("Run evidence queues an execution");
     };
-    desk.await_waiters(1).await;
+    // A claim refused capacity returns the execution to the queue, so while
+    // memory is held it neither completes nor fails.
+    let deferred = execution
+        .wait(DEFERRED)
+        .await
+        .expect_err("the execution defers while memory is held");
+    assert_eq!(
+        deferred.code(),
+        "WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT",
+        "{deferred}"
+    );
     drop(held);
     let result = execution
         .wait(WAIT)

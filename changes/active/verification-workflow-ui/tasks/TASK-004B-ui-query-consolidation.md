@@ -411,11 +411,21 @@ request budgets implement the maintainer-selected optimization.
 
    Lanes for the EXPLAIN backend (this branch, full runs): `test:bifrost:journey:oracle`
    69/69, `test:bifrost:journey:typescript` 210 passed, `test:bifrost:journey:python`
-   225 passed, `test:bifrost:journey:mcp` 49/50. The MCP failure is
-   `verification::pg_tests::execution_waits_and_refusals_follow_hosted_capacity`: with the
-   hold counted as verification work (scenario 6), a request under `occupy_hosted_memory`
-   now waits to the 504 deadline instead of being refused at once with 503. Open: one
-   control serves both the refusal and the wait journeys; needs a maintainer decision.
+   225 passed, `test:bifrost:journey:mcp` 50/50 after the hosted charge-order fix below
+   (first run 49/50: `verification::pg_tests::execution_waits_and_refusals_follow_hosted_capacity`
+   RED, a request whose inputs could not fit waited to the 504 deadline instead of 503).
+   Hosted charge order (maintainer override, 2026-11-19, no L1 bench): `Sandbox::execute`
+   now charges the retained code and globals before the admission and telemetry waits
+   (wyrd-design "charges what it actually retains, when it is materialized"; "Busy before
+   that deadline answers 503"), attributing the charge once admitted. GREEN: the MCP test
+   above; SDK `verification_capacity` Rust 3/3, TypeScript 3/3, Python 3/3. The SDK
+   `submit_defers_under_hosted_memory_then_passes` waited for a hosted waiter, which queued
+   work never becomes (a refused claim returns it to the queue); it now asserts a 5 s
+   wait times out (`WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT`, neither completed nor failed)
+   while memory is held, then passes. `sandbox_worker::sandbox_pauses_under_process_pressure`
+   held all memory, so its inputs now refuse at once; it leaves 1 MiB for the inputs and
+   still asserts the pressure wait. wyrd-server hosted lib 37/37, hosted integration 53/53;
+   UI integration 29/29; fmt, lints, ts:lints, py:lints clean.
 
 ## Verification and handoff
 

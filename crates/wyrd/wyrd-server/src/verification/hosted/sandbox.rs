@@ -381,9 +381,9 @@ impl Sandbox {
     /// only paths the code can reach; every other OS call, host function, or
     /// undefined name is refused inside the sandbox.
     ///
-    /// The operation is admitted as `tenant`'s verification work, waiting while
-    /// process pressure pauses it, then charges the code and globals it
-    /// retains. No new session starts while any worker's telemetry is stale.
+    /// The operation first charges the code and globals it retains, so inputs
+    /// that cannot fit are refused at once, then is admitted as `tenant`'s
+    /// verification work, waiting while process pressure pauses it. No new session starts while any worker's telemetry is stale.
     /// The worker's observed bytes are attributed to the operation while it
     /// holds the worker. Python holds one CPU lane only while a turn runs; a
     /// program suspended on host calls or a `/work` writer holds none. Under
@@ -465,6 +465,15 @@ impl Sandbox {
         let retained = u64::try_from(retained).unwrap_or(u64::MAX);
         let victim = CancellationToken::new();
         let waited = Instant::now();
+        // The inputs are materialized now: ones that cannot fit are Busy at
+        // once, never a wait the deadline ends.
+        let mut held = self.memory.try_charge(retained).map_err(|_| {
+            refused(
+                "memory",
+                waited,
+                "process memory cannot hold the Python operation now",
+            )
+        })?;
         let operation = envelopes
             .time(Envelope::Capacity, async {
                 self.waiting.fetch_add(1, Ordering::Relaxed);
@@ -499,13 +508,6 @@ impl Sandbox {
             .await?;
         metrics::histogram!(VERIFICATION_HOSTED_WAIT_SECONDS, "outcome" => "granted")
             .record(waited.elapsed().as_secs_f64());
-        let mut held = self.memory.try_charge(retained).map_err(|_| {
-            refused(
-                "memory",
-                waited,
-                "process memory cannot hold the Python operation now",
-            )
-        })?;
         held.attribute(&operation);
         let context = operation.context();
         let _active = (

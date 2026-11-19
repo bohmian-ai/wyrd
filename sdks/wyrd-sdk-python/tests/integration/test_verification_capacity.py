@@ -37,6 +37,9 @@ REQUEST_BYTES = 256 << 10
 WAIT_SECONDS = 60.0
 """How long a test waits for a queued execution or a waiter to appear."""
 
+DEFERRED_SECONDS = 5.0
+"""How long a queued execution is watched staying unfinished under held memory."""
+
 
 @contextmanager
 def capacity_desk(tmp_path: Path) -> Generator[tuple[WyrdTestServer, WyrdState]]:
@@ -75,8 +78,11 @@ def test_submit_defers_under_hosted_memory_then_passes(tmp_path: Path) -> None:
     with capacity_desk(tmp_path) as (server, state):
         with server.occupy_hosted_memory(SHORT_OF_A_SESSION):
             accepted = state.run("agent").observe.submit("adds-one", 2)
-            await_waiters(server, 1)
-        assert isinstance(accepted, verify.Execution)
+            assert isinstance(accepted, verify.Execution)
+            # A claim refused capacity returns the execution to the queue: it neither completes nor fails.
+            with pytest.raises(WyrdError) as deferred:
+                accepted.wait(DEFERRED_SECONDS)
+            assert deferred.value.code == "WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT"
         assert accepted.wait(WAIT_SECONDS).verdict == "passed"
 
 

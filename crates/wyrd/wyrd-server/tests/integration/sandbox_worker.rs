@@ -567,12 +567,12 @@ async fn sandbox_contains_runaway_code() {
     );
 }
 
-/// Critical process pressure pauses new operations: one whose deadline
-/// passes is busy, the process-capacity refusal the engine defers rather
+/// Process pressure pauses new operations whose inputs fit: with memory
+/// held as verification work, one whose deadline passes is busy, the process-capacity refusal the engine defers rather
 /// than retries or judges, and once pressure recovers the next one runs.
 ///
 /// # Panics
-/// Panics when an operation starts under critical pressure, its refusal is
+/// Panics when an operation starts under that pressure, its refusal is
 /// not busy, or work does not resume after recovery.
 #[tokio::test]
 async fn sandbox_pauses_under_process_pressure() {
@@ -586,9 +586,11 @@ async fn sandbox_pauses_under_process_pressure() {
     let sandbox = Sandbox::start(worker(), limits, &process)
         .await
         .expect("pool starts");
-    let occupied = sandbox.occupy_for_test(0);
-    until("the full ledger turns pressure critical", || {
-        (workloads.pressure().state == PressureState::Critical).then_some(())
+    // Room for the operation's inputs, so it waits on pressure instead of
+    // being refused memory at once.
+    let occupied = sandbox.occupy_for_test(1 << 20);
+    until("the held ledger contends", || {
+        (workloads.pressure().state != PressureState::Normal).then_some(())
     })
     .await;
     let soon = Instant::now() + Duration::from_millis(300);

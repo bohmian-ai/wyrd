@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 use wyrd_kms::{KmsBackendKind, KmsConfig, WyrdKms};
 use wyrd_spec::ids::DataTenantId;
+use wyrd_testing::kms::TransitFixture;
 use wyrd_testing::logs::LogCapture;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
@@ -175,6 +176,68 @@ fn creates() -> [Value; 3] {
         json!({ "provider": "http", "name": "ops-hooks", "origin": "https://Hooks.Example.com:443",
                 "auth": { "scheme": "header", "name": "X-Api-Key", "value": SECRETS[2] } }),
     ]
+}
+
+/// A secret rotation whose remote encryption is still in flight when the
+/// connection is disabled is fenced out by the disable and prepared again
+/// over the row the disable left: the disable is kept, so the rotation never
+/// re-enables the connection, and the rotated secret commits once, as the
+/// next secret version, sealed again for that row.
+///
+/// # Panics
+/// Panics when either response, the stored row, or the read view differs.
+#[tokio::test]
+async fn rotation_racing_a_disable_keeps_the_disable() {
+    let transit = TransitFixture::start_delayed(std::time::Duration::from_millis(500)).await;
+    let server = WyrdTestServer::builder()
+        .with_kms_for_test(transit.config("ops", &[]))
+        .start_in_process()
+        .await
+        .expect("test server starts");
+    let tenant = server.data_tenant_id();
+    let (_, jwt) = user(&server, "oc-race-admin", &["admin"]).await;
+    let (status, view) = call(
+        &server,
+        &jwt,
+        Method::POST,
+        "/v1/operator-connections",
+        Some(&creates()[0]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{view}");
+    let id = view["connection_id"].as_str().expect("id").to_owned();
+    let uri = format!("/v1/operator-connections/{id}");
+    let (_, before, before_version) = stored_row(&server, tenant, &id).await;
+
+    let rotate = json!({ "provider": "slack", "bot_token": SECRETS[3] });
+    let rotation = call(&server, &jwt, Method::PATCH, &uri, Some(&rotate));
+    let disable = async {
+        while transit.requests("encrypt").await < 2 {
+            tokio::task::yield_now().await;
+        }
+        call(&server, &jwt, Method::DELETE, &uri, None).await
+    };
+    let ((rotated, rotated_view), (disabled, disabled_view)) = tokio::join!(rotation, disable);
+
+    assert_eq!(
+        (disabled, disabled_view["status"].as_str()),
+        (StatusCode::OK, Some("disabled"))
+    );
+    assert_eq!(
+        (rotated, rotated_view["status"].as_str()),
+        (StatusCode::OK, Some("disabled")),
+        "the rotation commits over the disabled row without re-enabling it"
+    );
+    assert_eq!(
+        transit.requests("encrypt").await,
+        3,
+        "the fenced-out rotation sealed again for the row the disable left"
+    );
+    let (_, after, after_version) = stored_row(&server, tenant, &id).await;
+    assert_eq!(after_version, before_version + 1, "one rotation committed");
+    assert_ne!(after, before, "the rotated envelope replaced the original");
+    let (_, read) = call(&server, &jwt, Method::GET, &uri, None).await;
+    assert_eq!(read["status"], "disabled", "the disable is kept");
 }
 
 /// A tenant administrator creates, lists, reads, updates, rotates, disables,

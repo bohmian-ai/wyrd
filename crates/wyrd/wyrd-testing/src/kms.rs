@@ -6,6 +6,8 @@
 //! fixture served to prove its stored secrets were sealed and opened through
 //! the remote backend rather than another local path.
 
+use std::time::Duration;
+
 use base64::Engine as _;
 use serde_json::{Value, json};
 use wiremock::matchers::method;
@@ -28,9 +30,16 @@ pub struct TransitFixture {
 impl TransitFixture {
     /// Start a fixture on a loopback port.
     pub async fn start() -> Self {
+        Self::start_delayed(Duration::ZERO).await
+    }
+
+    /// Start a fixture that answers every request after `delay`, so a
+    /// journey can commit a competing write while an encryption is still in
+    /// flight. A request is counted by [`Self::requests`] on arrival.
+    pub async fn start_delayed(delay: Duration) -> Self {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .respond_with(Transit)
+            .respond_with(Transit { delay })
             .mount(&server)
             .await;
         Self { server }
@@ -83,10 +92,20 @@ pub fn transit_config(endpoint: &str, active: &str, retained: &[&str]) -> KmsCon
 }
 
 /// The Transit protocol responder behind [`TransitFixture`].
-struct Transit;
+struct Transit {
+    /// How long every answer is held back.
+    delay: Duration,
+}
 
 impl Respond for Transit {
     fn respond(&self, request: &Request) -> ResponseTemplate {
+        Self::answer(request).set_delay(self.delay)
+    }
+}
+
+impl Transit {
+    /// The undelayed answer to `request`.
+    fn answer(request: &Request) -> ResponseTemplate {
         let engine = base64::engine::general_purpose::STANDARD;
         let Ok(body) = serde_json::from_slice::<Value>(&request.body) else {
             return ResponseTemplate::new(400).set_body_json(json!({"errors": ["invalid json"]}));

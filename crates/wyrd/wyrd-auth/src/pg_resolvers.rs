@@ -1041,6 +1041,68 @@ mod pg_tests {
         assert!(matches!(other, IssuerDecodeError::Decrypt));
     }
 
+    /// Through the resolver the jwt-bearer exchange uses, a trusted issuer
+    /// whose stored envelope was copied from another tenant's issuer for the
+    /// same URL fails closed instead of serving that tenant's secret, while
+    /// the source tenant still resolves its own.
+    ///
+    /// # Panics
+    /// Panics when seeding or the copy fails, the copied row resolves, or the
+    /// source tenant's issuer stops resolving with its secret.
+    #[tokio::test]
+    async fn resolver_refuses_an_envelope_copied_from_another_tenant() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let first = fixture.data_tenant_id();
+        let second = DataTenantId::new_v7();
+        fixture
+            .seed_additional_tenant_with_uuid(second, "issuer-copied")
+            .await
+            .expect("second tenant seeds");
+        let key = kms();
+        for (tenant, secret) in [(first, "first-secret"), (second, "second-secret")] {
+            let mut issuer = sample_issuer(tenant);
+            issuer.client_auth = ClientAuth::SecretPost(SecretString::from(secret.to_owned()));
+            let write = issuer_write_from_trusted(&issuer, Some(&key))
+                .await
+                .expect("encode succeeds");
+            let mut conn = fixture
+                .tenant_conn_for(tenant)
+                .await
+                .expect("tenant conn opens");
+            upsert_trusted_issuer(&mut conn, &write)
+                .await
+                .expect("issuer upsert");
+            conn.commit().await.expect("seed commits");
+        }
+        let superuser = fixture.superuser_pool().expect("superuser pool opens");
+        sqlx::query(
+            "UPDATE wyrd.auth_trusted_issuers SET client_secret_enc = \
+               (SELECT client_secret_enc FROM wyrd.auth_trusted_issuers WHERE data_tenant_id = $1) \
+             WHERE data_tenant_id = $2",
+        )
+        .bind(second.as_uuid())
+        .bind(first.as_uuid())
+        .execute(&superuser)
+        .await
+        .expect("envelope copies");
+
+        let resolver = PgIssuerResolver::new(fixture.wyrd_postgres().clone(), Some(key));
+        let url = IssuerUrl::new(ISSUER_URL).expect("issuer url is valid");
+        assert!(
+            resolver.trusted_issuer(&first, &url).await.is_err(),
+            "the copied envelope does not open for the first tenant"
+        );
+        let own = resolver
+            .trusted_issuer(&second, &url)
+            .await
+            .expect("the source tenant resolves")
+            .expect("its issuer is found");
+        match &own.client_auth {
+            ClientAuth::SecretPost(secret) => assert_eq!(secret.expose_secret(), "second-secret"),
+            other => panic!("expected SecretPost, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn resolver_reads_and_decrypts_seeded_issuer() {
         let fixture = PgFixture::start().await.expect("fixture starts");

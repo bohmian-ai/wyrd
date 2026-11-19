@@ -1442,6 +1442,166 @@ async fn foreign_or_missing_connection_fails_at_delivery() {
     );
 }
 
+/// A stored envelope opens only for the connection and tenant it was sealed
+/// for. With the same tenant's other connection's envelope, another tenant's
+/// envelope for the same connection name, or an altered envelope in place,
+/// each dispatch fails `credential_invalid` without a provider call, so no
+/// copied secret reaches a provider, while the untouched connection beside
+/// them still delivers with its own key.
+///
+/// # Panics
+/// Panics when an envelope cannot be replaced, a dispatch settles otherwise,
+/// or a provider receives anything but the intact connection's key.
+#[tokio::test]
+async fn copied_or_altered_envelopes_fail_closed_at_delivery() {
+    let delivery = Delivery::boot().await;
+    let origin = delivery.mock.uri();
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&delivery.mock)
+        .await;
+    let connection = |name: &str, key: &str| {
+        json!({ "provider": "http", "name": name, "origin": origin,
+                "auth": { "scheme": "header", "name": "X-Api-Key", "value": key } })
+    };
+    delivery
+        .connect(&[
+            connection("hooks-cross-tenant", "cross-tenant-key"),
+            connection("hooks-cross-owner", "cross-owner-key"),
+            connection("hooks-altered", "altered-key"),
+            connection("hooks-intact", "intact-key"),
+        ])
+        .await;
+    let other = delivery
+        .server
+        .seed_tenant("operator-copied")
+        .await
+        .expect("tenant seeds");
+    let foreign_admin = delivery
+        .server
+        .bootstrap_service_in_tenant(other, "operator-copied-admin", &["admin"])
+        .await
+        .expect("foreign admin bootstraps");
+    let foreign_jwt = delivery
+        .server
+        .exchange_api_key(foreign_admin.api_key().expect("api key"))
+        .await
+        .expect("api key exchanges");
+    let (status, view) = delivery
+        .call_as(
+            &foreign_jwt,
+            Method::POST,
+            "/v1/operator-connections",
+            Some(&connection("hooks-cross-tenant", "foreign-tenant-key")),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{view}");
+
+    let copy = |target: &str, source_tenant: DataTenantId, source: &str| {
+        sqlx::query(
+            "UPDATE wyrd.operator_connections SET secret_ciphertext = \
+               (SELECT secret_ciphertext FROM wyrd.operator_connections \
+                 WHERE data_tenant_id = $1 AND name = $2) \
+             WHERE data_tenant_id = $3 AND name = $4",
+        )
+        .bind(source_tenant.as_uuid())
+        .bind(source.to_owned())
+        .bind(delivery.seed.tenant().as_uuid())
+        .bind(target.to_owned())
+        .execute(&delivery.assertion)
+    };
+    copy("hooks-cross-tenant", other, "hooks-cross-tenant")
+        .await
+        .expect("cross-tenant envelope copies");
+    copy("hooks-cross-owner", delivery.seed.tenant(), "hooks-intact")
+        .await
+        .expect("cross-owner envelope copies");
+    sqlx::query(
+        "UPDATE wyrd.operator_connections \
+            SET secret_ciphertext = overlay(secret_ciphertext PLACING \
+                  decode(lpad(to_hex(get_byte(secret_ciphertext, length(secret_ciphertext) - 1) # 1), 2, '0'), 'hex') \
+                  FROM length(secret_ciphertext)) \
+          WHERE data_tenant_id = $1 AND name = 'hooks-altered'",
+    )
+    .bind(delivery.seed.tenant().as_uuid())
+    .execute(&delivery.assertion)
+    .await
+    .expect("envelope alters in place");
+
+    let hook_on = |connection: &str| {
+        json!({ "kind": "http", "method": "post", "url": format!("{origin}/hook/{connection}"),
+                "auth": { "scheme": "header", "name": "x-api-key", "connection": connection },
+                "body": { "verdict": "{{verdict}}" } })
+    };
+    let mut operators = Vec::new();
+    for name in [
+        "hooks-cross-tenant",
+        "hooks-cross-owner",
+        "hooks-altered",
+        "hooks-intact",
+    ] {
+        operators.push(
+            delivery
+                .seed
+                .operator(name, &hook_on(name))
+                .await
+                .expect("operator seeds"),
+        );
+    }
+    delivery
+        .fail_binding("owner", &operators.iter().collect::<Vec<_>>())
+        .await;
+    let running = delivery.spawn(
+        delivery.server.state(),
+        &Delivery::limits(),
+        &failing_script(1),
+        &CapabilityCrash::default(),
+    );
+    let run = delivery.new_run(&[]).await;
+    let rows = delivery
+        .wait_dispatches(run, 4, |row| {
+            row.status != "pending" && row.status != "running"
+        })
+        .await;
+    running.stop().await;
+    let settled: Vec<(&str, Option<&str>)> = operators
+        .iter()
+        .map(|uid| {
+            let row = &rows[&uid.as_uuid()];
+            (row.status.as_str(), row.error_code.as_deref())
+        })
+        .collect();
+    assert_eq!(
+        settled,
+        [
+            ("failed", Some("credential_invalid")),
+            ("failed", Some("credential_invalid")),
+            ("failed", Some("credential_invalid")),
+            ("delivered", None),
+        ]
+    );
+    let keys: Vec<(String, String)> = delivery
+        .mock
+        .received_requests()
+        .await
+        .expect("recorded")
+        .iter()
+        .map(|request| {
+            let key = request
+                .headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            (request.url.path().to_owned(), key.to_owned())
+        })
+        .collect();
+    assert_eq!(
+        keys,
+        [("/hook/hooks-intact".to_owned(), "intact-key".to_owned())],
+        "only the intact connection reaches its provider, with its own key"
+    );
+}
+
 /// A Slack template referencing `drift.*` fields renders the frozen counts of
 /// the failed Drift run, agreeing with its server-written `summary`.
 ///

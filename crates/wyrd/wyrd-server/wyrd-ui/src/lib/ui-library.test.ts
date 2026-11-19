@@ -1507,7 +1507,7 @@ test('TASK-004: Canonical signal interactions', async () => {
   });
   const loaded = await loadStatStrip({ stats: ['traces', 'spans', 'errors', 'duration_p95', 'calls', 'cost'] }, { executor: shared.executor, range: RANGE });
   expect(shared.calls).toHaveLength(4);
-  expect((shared.calls[1].request as { sql: string }).sql).toContain('count(*) AS s1, count(*) FILTER (WHERE status_code = 2) AS s2 FROM');
+  expect((shared.calls[1].request as { sql: string }).sql).toContain('count(*) AS s1, count(*) FILTER (WHERE status_code = 2) AS s2, count(*) FILTER (WHERE status_code = 2) AS m2 FROM');
   if (loaded.result.state !== 'populated') throw new Error(JSON.stringify(loaded.result));
   expect(loaded.result.data.stats.map(({ stat, total, series }) => [stat, total.columns.map((each) => each.name), total.rows, series.rows])).toEqual([
     ['traces', ['value'], [[2]], [['T1', 2]]],

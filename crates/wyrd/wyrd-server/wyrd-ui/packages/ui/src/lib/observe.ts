@@ -224,7 +224,9 @@ const STAT_SOURCES: Record<Stat, { table: string; time: string; value: string; f
  * column, root restriction and currency grouping. Each read scans once and
  * groups per bucket and over the whole range by grouping sets; `whole` is 1
  * on range rows. Stat `i` of the input reads column `s<i>`; a filter its
- * population does not share becomes that aggregate's `FILTER`.
+ * population does not share becomes that aggregate's `FILTER`, and `m<i>`
+ * counts the rows it matched, so a bucket only the population recorded is
+ * not one of that stat's buckets.
  */
 export function statQueries(input: StatStripInput, range: AbsoluteRange, bucket: string, predicate?: string): (Executed & { readonly stats: readonly number[] })[] {
   const populations = new Map<string, number[]>();
@@ -243,7 +245,12 @@ export function statQueries(input: StatStripInput, range: AbsoluteRange, bucket:
     if (input.scope) binds.clauses.push(`${input.scope.column} = ${binds.bind(input.scope.uid)}`);
     if (source.table === SIGNALS.spans.table || source.table === SIGNALS.logs.table) binds.where(input.where).predicate(predicate);
     if (source.roots) binds.roots(source.table);
-    const values = stats.map((index, at) => `${sources[at].value}${sources[at].filter && !shared ? ` FILTER (WHERE ${sources[at].filter})` : ''} AS s${index}`).join(', ');
+    const values = stats
+      .map((index, at) => {
+        const filter = sources[at].filter && !shared ? ` FILTER (WHERE ${sources[at].filter})` : '';
+        return `${sources[at].value}${filter} AS s${index}${filter ? `, count(*)${filter} AS m${index}` : ''}`;
+      })
+      .join(', ');
     const [currency, sets] = source.byCurrency ? [', currency', '(at, currency), (currency)'] : ['', '(at), ()'];
     return {
       stats,
@@ -265,7 +272,10 @@ export async function loadStatStrip(input: StatStripInput, context: LoadContext)
   if (failure) return { input, result: failure };
   const reads = new Map(plans.flatMap((plan, at) => plan.stats.map((index) => [index, (results[at] as { value: QueryResult }).value] as const)));
   const stats = input.stats.map((stat, index) => {
-    const read = reads.get(index) as QueryResult;
+    const all = reads.get(index) as QueryResult;
+    // A filtered stat's buckets are those where its filter matched a row, as its own WHERE would group them.
+    const matched = all.columns.findIndex((column) => column.name === `m${index}`);
+    const read = matched < 0 ? all : { ...all, rows: all.rows.filter((row) => Number(row[0]) === 1 || Number(row[matched]) > 0) };
     const value = [`s${index}`, 'value'] as const;
     const currency = STAT_SOURCES[stat].byCurrency ? ['currency'] : [];
     return { stat, total: wholeRows(read, 1, [value, ...currency]), series: wholeRows(read, 0, ['at', value, ...currency]) };

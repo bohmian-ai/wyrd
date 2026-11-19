@@ -110,6 +110,70 @@ export async function seedSignals(server: { baseUrl: string; flushBifrost(): voi
   server.flushBifrost();
 }
 
+/** Thirteen numbered values; index `n` reads `${prefix}-0n`. */
+const numbered = (prefix: string, n: number) => `${prefix}-${String(n).padStart(2, '0')}`;
+
+/**
+ * Two hours after {@link seedSignals}' evidence, in another stat bucket: one
+ * OK root span per trace of fourteen, and fourteen INFO log records, so the
+ * error stats record nothing in that bucket. Every facet but the severity and
+ * status counts more than eleven values: `svc-00` twice and `svc-01`…`svc-12`
+ * once each tie by value; the fourteenth span and log carry no HTTP status,
+ * exception type or event name. Exported as `apiKey`, then published.
+ */
+export async function seedPopulated(server: { baseUrl: string; flushBifrost(): void }, apiKey: string) {
+  const each = Array.from({ length: 14 }, (_, n) => n);
+  const service = (n: number) => numbered('svc', n % 13);
+  const resource = (n: number) => ({ attributes: attrs({ 'service.name': service(n) }) });
+  const scope = { name: 'wyrd-ui-journey' };
+  const start = (n: number) => nanos(`2026-10-19T05:00:${String(n).padStart(2, '0')}Z`);
+  const spans = each.map((n) => ({
+    resource: resource(n),
+    scopeSpans: [
+      {
+        scope,
+        spans: [
+          {
+            traceId: `${'c'.repeat(30)}${String(n).padStart(2, '0')}`,
+            spanId: `${'d'.repeat(14)}${String(n).padStart(2, '0')}`,
+            name: numbered('op', n),
+            kind: 1,
+            startTimeUnixNano: start(n),
+            endTimeUnixNano: String(BigInt(start(n)) + 10_000_000n),
+            status: { code: 1 },
+            attributes: [
+              ...(n < 13 ? [{ key: 'http.response.status_code', value: { intValue: String(200 + n) } }] : []),
+              ...(n < 12 ? attrs({ 'gen_ai.operation.name': numbered('gen', n) }) : [])
+            ]
+          }
+        ]
+      }
+    ]
+  }));
+  const logs = each.map((n) => ({
+    resource: resource(n),
+    scopeLogs: [
+      {
+        scope,
+        logRecords: [
+          {
+            timeUnixNano: start(n),
+            observedTimeUnixNano: start(n),
+            severityNumber: 9,
+            severityText: 'INFO',
+            ...(n < 13 ? { eventName: numbered('event', n) } : {}),
+            body: { stringValue: `step ${n}` },
+            attributes: n < 13 ? attrs({ 'exception.type': numbered('Err', n) }) : []
+          }
+        ]
+      }
+    ]
+  }));
+  await exportOtlp(server, apiKey, '/v1/traces', { resourceSpans: spans });
+  await exportOtlp(server, apiKey, '/v1/logs', { resourceLogs: logs });
+  server.flushBifrost();
+}
+
 /** POST one OTLP/HTTP JSON export as `apiKey`; anything but 200 throws with the server's answer. */
 export async function exportOtlp(server: { baseUrl: string }, apiKey: string, path: string, body: unknown, headers: Record<string, string> = {}) {
   const response = await fetch(new URL(path, server.baseUrl), {

@@ -12,7 +12,7 @@ import { AppBridge, PostMessageTransport } from '@modelcontextprotocol/ext-apps/
 import type { Cookies } from '@sveltejs/kit';
 import { render } from '@testing-library/svelte';
 import { expect, vi } from 'vitest';
-import { TraceWaterfall, type RepositoryRow } from 'wyrd-ai-ui';
+import { StatStrip, TraceWaterfall, type RepositoryRow } from 'wyrd-ai-ui';
 import { z } from 'zod';
 import { Bifrost, Cards, GithubConnection, Principals, TableConfig, WyrdClient, WyrdState } from 'wyrd-ai';
 import { type NativeWyrdTestServer, signInGithubBrowser } from '@wyrd/testing';
@@ -47,6 +47,7 @@ import {
   type Executor,
   type QueryResult,
   type WireRequest,
+  bucketFor,
   executionDiscoveryQuery,
   facetsQuery,
   statQueries,
@@ -57,7 +58,7 @@ import { nodeExecutor } from 'wyrd-ai-ui/node';
 import { env } from '$env/dynamic/private';
 import { browserSessions } from '$lib/server/auth/browser-sessions';
 import { AGENT, PROMPT, agent as agentCard, card, inventory, notFound, observeAnswer, prompts, registered, series, summary, timeseries } from '$lib/ui-fixtures';
-import { declarePolicy, exportOtlp, nanos, seedSignals } from '$lib/ui-signals.integration';
+import { declarePolicy, exportOtlp, nanos, seedPopulated, seedSignals } from '$lib/ui-signals.integration';
 import { POST as loadPanel } from '../routes/t/[tenantKey]/ui/load/+server';
 import { POST as cancelExecution } from '../routes/t/[tenantKey]/verify/executions/[executionId]/cancel/+server';
 import { GET as downloadPublication } from '../routes/t/[tenantKey]/verify/executions/[executionId]/download/+server';
@@ -528,10 +529,11 @@ const multiset = (rows: readonly (readonly unknown[])[]) => rows.map((row) => JS
 const wholeRows = (result: QueryResult, whole: number, names: readonly string[]) =>
   result.rows.filter((row) => Number(row[0]) === whole).map((row) => names.map((name) => row[result.columns.findIndex((column) => column.name === name)]));
 
-test('consolidated Observe bundles return the original results; EXPLAIN ANALYZE compares their work', async ({ server, seeded }) => {
-  await seedSignals(server, server.apiKey, { trace: '4bf92f3577b34da6a3ce929d0e0e4736', service: 'ui-agent', subject: seeded.model.uid });
-  server.flushBifrost();
-  const run = nodeExecutor(WyrdClient.connect());
+test('consolidated Observe bundles return the original results; EXPLAIN ANALYZE compares their work', async ({ server }) => {
+  const key = server.bootstrapServiceInTenant(server.seedTenant('ui-consolidated'), ['admin'], 'ui-consolidated-admin');
+  await seedSignals(server, key, { trace: '4bf92f3577b34da6a3ce929d0e0e4736', service: 'ui-agent' });
+  await seedPopulated(server, key);
+  const run = nodeExecutor(WyrdClient.connect({ credential: key }));
   const bucket = '15 minutes';
   const original = (id: string) => originalRead(id, bucket);
   const report: Record<string, unknown> = {};
@@ -546,11 +548,18 @@ test('consolidated Observe bundles return the original results; EXPLAIN ANALYZE 
   expect(multiset(wholeRows(after.values[0], 0, ['at', 'errors']))).toEqual(multiset(before.values[1].rows));
   expect(multiset(wholeRows(after.values[1], 0, ['at', 'p95', 'p50']))).toEqual(multiset(before.values[2].rows));
   expect([...wholeRows(after.values[0], 1, ['spans', 'traces', 'error_traces', 'span_p95_ms'])[0], ...wholeRows(after.values[1], 1, ['p95', 'p50'])[0]]).toEqual([...before.values[3].rows[0], ...before.values[4].rows[0]]);
-  // Independent fixture facts: three spans of one trace, one of them an error.
-  expect(before.values[3].rows[0].slice(0, 3)).toEqual([3, 1, 1]);
+  // Independent fixture facts: seventeen spans of fifteen traces, one span an error.
+  expect(before.values[3].rows[0].slice(0, 3)).toEqual([17, 15, 1]);
   facetColumns.forEach((_, index) => {
     expect(multiset(facetRows(after.values[2], index, facetColumns.length)), facetColumns[index]).toEqual(multiset(before.values[5 + index].rows));
   });
+  // Each facet keeps its own first ten values plus the eleventh, by trace count then value; an empty value ranks by its count.
+  const ten = (prefix: string, from = 0) => Array.from({ length: 10 }, (_, n) => [`${prefix}-${String(n + from).padStart(2, '0')}`, 1]);
+  const [services, names, , statuses, operations] = facetColumns.map((_, index) => facetRows(after.values[2], index, facetColumns.length));
+  expect(services).toEqual([['svc-00', 2], ...ten('svc', 1)]);
+  expect(names).toEqual([['chat ranker', 1], ['execute_tool search', 1], ['invoke_agent support', 1], ...ten('op').slice(0, 8)]);
+  expect(statuses).toEqual([[null, 2], ...Array.from({ length: 10 }, (_, n) => [200 + n, 1])]);
+  expect(operations).toEqual([[null, 3], ...ten('gen')]);
   report.traces = { original: { ...(await executedWork(run, traceOriginal)), elapsed_ms: Math.round(before.elapsed) }, consolidated: { ...(await executedWork(run, traceNew)), elapsed_ms: Math.round(after.elapsed) } };
 
   // Logs facets: four reads were one.
@@ -562,6 +571,11 @@ test('consolidated Observe bundles return the original results; EXPLAIN ANALYZE 
     // Severity also carries its number.
     expect(multiset(facetRows(logAfter.values[0], index, logColumns.length, index === 0 ? 2 : 1)), logColumns[index]).toEqual(multiset(logBefore.values[index].rows));
   });
+  const [severities, logServices, events, exceptions] = logColumns.map((_, index) => facetRows(logAfter.values[0], index, logColumns.length, index === 0 ? 2 : 1));
+  expect(severities).toEqual([['INFO', 14, 9], ['ERROR', 1, 17]]);
+  expect(logServices).toEqual([['svc-00', 2], ...ten('svc', 1)]);
+  expect(events).toEqual([[null, 2], ...ten('event')]);
+  expect(exceptions).toEqual([[null, 2], ...ten('Err')]);
   report.logs = { original: { ...(await executedWork(run, logOriginal)), elapsed_ms: Math.round(logBefore.elapsed) }, consolidated: { ...(await executedWork(run, logNew)), elapsed_ms: Math.round(logAfter.elapsed) } };
 
   // The stat strip: a total and a bucket read per stat were one read per population.
@@ -573,10 +587,19 @@ test('consolidated Observe bundles return the original results; EXPLAIN ANALYZE 
     const at = statNew.findIndex((plan) => plan.stats.includes(index));
     const currency = stat === 'cost' ? ['currency'] : [];
     expect(multiset(wholeRows(statAfter.values[at], 1, [`s${index}`, ...currency])), `${stat} total`).toEqual(multiset(statBefore.values[index * 2].rows));
-    // A bucket with no row of a filtered stat reads zero in its shared population.
-    const recorded = (row: readonly unknown[]) => row[1] !== 0 && row[1] !== null;
-    expect(multiset(wholeRows(statAfter.values[at], 0, ['at', `s${index}`, ...currency]).filter(recorded)), `${stat} buckets`).toEqual(multiset(statBefore.values[index * 2 + 1].rows.filter(recorded)));
   });
+  // Every stat's loaded series is its original bucket read: the error stats record one bucket, the counts two.
+  const loaded = await loadStatStrip({ stats: [...stats] }, { executor: run, range: RANGE });
+  expect(loaded.result.state, JSON.stringify(loaded.result)).toBe('populated');
+  const strip = loaded.result.state === 'populated' ? loaded.result.data.stats : [];
+  const loadedOriginal = await readAll(run, stats.map((stat) => originalRead(`stat-${stat}-buckets`, bucketFor(RANGE))));
+  stats.forEach((stat, index) => expect(strip[index].series.rows, `${stat} buckets`).toEqual(loadedOriginal.values[index].rows));
+  expect(strip.map(({ series }) => series.rows.length)).toEqual([2, 2, 1, 2, 1, 2, 1, 0, 0, 0]);
+  // One recorded error bucket draws no trend line; the counts over both buckets draw one.
+  const view = render(StatStrip, loaded);
+  for (const [label, line] of [['Error spans', false], ['Error logs', false], ['Agent invocations', false], ['Spans', true], ['Log records', true]] as const)
+    expect(view.getByRole('img', { name: `${label} per bucket` }).querySelector('polyline') !== null, label).toBe(line);
+  view.unmount();
   report.statstrip = { original: { ...(await executedWork(run, statOriginal)), elapsed_ms: Math.round(statBefore.elapsed) }, consolidated: { ...(await executedWork(run, statNew)), elapsed_ms: Math.round(statAfter.elapsed) } };
   // The plan comparison is diagnostic evidence, kept only where the run names a file.
   recordDiagnostics(report);

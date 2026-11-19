@@ -393,6 +393,16 @@ diagnostics says they are unavailable. Gateway L1 records each phase of
 `server_elapsed`, `provider_excluded`, and `residual`, and the Scribe
 `outbox_write.scribe` batch writes, each over its own window population.
 
+After the diagnostics, `capacity report` lists each measured repetition's
+server window: every timing series by boundary, outcome, case, and phase;
+every scan series; and every counter that moved, gauge, and histogram with an
+observation, read from the window's two snapshots the run keeps under
+`timings/<step>/repetition-N.json` in its raw evidence directory. Counts,
+nearest-rank bucket bounds, and mean bounds are of that window alone.
+Oracle's `oracle_query_profile_*_total{event}` counters break a query's time
+into planning and operator stages, such as `Oracle.physical_planning`,
+`LiveScribeExec.fragment_open_time`, and `DataSourceExec.time_elapsed_opening`.
+
 When reporting a run, paste this report, fresh or regenerated with
 `capacity report <record>`, and append interpretation below it. Do not
 replace it with hand-built tables or extract results from raw snapshots.

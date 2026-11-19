@@ -1207,6 +1207,18 @@ impl Reading {
         }
     }
 
+    /// The bounds of a histogram `distribution`'s mean, each value divided
+    /// by `per`; missing without an observation.
+    #[must_use]
+    pub fn mean(distribution: &wyrd_benchmark::Distribution, per: f64) -> Self {
+        let samples = distribution.len();
+        if samples == 0 {
+            return Self::missing("no observation");
+        }
+        let (low, high) = distribution.total_bounds();
+        Self::bounded(low as f64, high as f64, per * samples as f64).with_samples(samples)
+    }
+
     /// Nearest-rank percentile `q` of a histogram `distribution`, each value
     /// divided by `per`, as the [`Self::bounded`] interval of its bucket,
     /// with the sample count and rank; missing without samples.
@@ -1312,6 +1324,20 @@ impl Reading {
         };
         cell.trim_end().to_owned()
     }
+}
+
+/// One distribution's count, nearest-rank p50, p95 and p99, and mean, each
+/// value divided by `per` and read in `unit`.
+fn distribution_cells(distribution: &wyrd_benchmark::Distribution, per: f64, unit: &str) -> String {
+    let quantile = |q| Reading::quantile(distribution, q, per).cell(unit);
+    format!(
+        "n {}, p50 {}, p95 {}, p99 {}, mean {}",
+        distribution.len(),
+        quantile(0.5),
+        quantile(0.95),
+        quantile(0.99),
+        Reading::mean(distribution, per).cell(unit)
+    )
 }
 
 /// A number with at most three decimals and no trailing zeros.
@@ -1491,16 +1517,7 @@ impl Repetition {
         for (stat, q) in [("p50_us", 0.5), ("p95_us", 0.95), ("p99_us", 0.99)] {
             self.set(&id(stat), Reading::quantile(&distribution, q, per));
         }
-        let (low, high) = distribution.total_bounds();
-        self.set(
-            &id("mean_us"),
-            if samples == 0 {
-                Reading::missing("no observation")
-            } else {
-                Reading::bounded(low as f64, high as f64, per * samples as f64)
-                    .with_samples(samples)
-            },
-        );
+        self.set(&id("mean_us"), Reading::mean(&distribution, per));
     }
 
     /// Sets every [`DIAGNOSTIC_STATS`] reading of `observation` missing as
@@ -2833,6 +2850,43 @@ impl Record {
     /// Returns a read failure, [`ExperimentError::Unsupported`] for another
     /// schema version, or [`ExperimentError::Malformed`].
     pub fn read(path: &Path) -> Result<Self, ExperimentError> {
+        Self::read_record(path)
+    }
+
+    /// Reads a record, then each measured repetition's server snapshots
+    /// the run kept beside it (`timings/<step>/repetition-N.json` under
+    /// its artifacts directory), so [`Self::render`] lists every server
+    /// series.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`Self::read`] failure.
+    pub fn read_with_timings(path: &Path) -> Result<Self, ExperimentError> {
+        let mut record = Self::read_record(path)?;
+        let Some(directory) = record.artifacts.directory.clone() else {
+            return Ok(record);
+        };
+        let timings = Path::new(&directory).join("timings");
+        for step in &mut record.steps {
+            for (index, repetition) in step.repetitions.iter_mut().enumerate() {
+                let Ok(index) = u8::try_from(index) else {
+                    continue;
+                };
+                let kept = timings
+                    .join(&step.id)
+                    .join(format!("{}.json", Phase::Repetition(index).label()));
+                if let Ok(bytes) = std::fs::read(kept)
+                    && let Ok(evidence) = serde_json::from_slice(&bytes)
+                {
+                    repetition.timings = evidence;
+                }
+            }
+        }
+        Ok(record)
+    }
+
+    /// Reads one record file.
+    fn read_record(path: &Path) -> Result<Self, ExperimentError> {
         let text = std::fs::read_to_string(path).map_err(|source| ExperimentError::Persist {
             path: path.to_path_buf(),
             source,
@@ -3021,6 +3075,7 @@ impl Record {
                 }
             }
             self.render_diagnostics(&mut out, step);
+            Self::render_server(&mut out, step);
         }
         if !self.reasons.is_empty() {
             out.push_str("\n## Reasons\n\n");
@@ -3285,6 +3340,98 @@ impl Record {
             out.push_str(
                 "    - driver: — unavailable: this record holds no driver observation for this step\n",
             );
+        }
+    }
+
+    /// Writes every server series each repetition's kept snapshots hold:
+    /// each timing series, scan series, counter that moved, gauge, and
+    /// histogram with an observation in the window, rebuilt from the
+    /// record's snapshots alone. A window whose snapshots do not difference
+    /// says why.
+    fn render_server(out: &mut String, step: &StepRecord) {
+        use wyrd_benchmark::{HistogramUnit, IntervalValue};
+        for (index, repetition) in step.repetitions.iter().enumerate() {
+            for evidence in repetition
+                .timings
+                .iter()
+                .filter(|evidence| evidence.role == Role::Server)
+            {
+                let _ = writeln!(
+                    out,
+                    "  - repetition {} server {} window (nearest-rank bucket bounds):",
+                    index + 1,
+                    evidence.window
+                );
+                let interval = match evidence.after.since(&evidence.before) {
+                    Ok(interval) => interval,
+                    Err(reason) => {
+                        let _ = writeln!(out, "    - — unreadable: {reason}");
+                        continue;
+                    }
+                };
+                for series in &interval.series {
+                    let _ = writeln!(
+                        out,
+                        "    - timing {} {} case {} phase {}: {}",
+                        series.boundary,
+                        series.outcome,
+                        series.case,
+                        series.phase,
+                        distribution_cells(&series.elapsed, 1e3, "µs")
+                    );
+                }
+                for scan in &interval.scans {
+                    let _ = writeln!(
+                        out,
+                        "    - scan {} case {} phase {}: rows {}; bytes {}",
+                        scan.outcome,
+                        scan.case,
+                        scan.phase,
+                        distribution_cells(&scan.rows, 1.0, "rows"),
+                        distribution_cells(&scan.bytes, 1.0, "B")
+                    );
+                }
+                for metric in &interval.metrics {
+                    let name = if metric.labels.is_empty() {
+                        metric.name.clone()
+                    } else {
+                        let labels: Vec<String> = metric
+                            .labels
+                            .iter()
+                            .map(|(label, value)| format!("{label}={value}"))
+                            .collect();
+                        format!("{}{{{}}}", metric.name, labels.join(","))
+                    };
+                    let _ = match &metric.value {
+                        IntervalValue::Counter(0) => Ok(()),
+                        IntervalValue::Counter(increase) => {
+                            writeln!(out, "    - counter {name}: +{increase}")
+                        }
+                        IntervalValue::Gauge { value, peak } => writeln!(
+                            out,
+                            "    - gauge {name}: {} peak {}",
+                            number(*value),
+                            number(*peak)
+                        ),
+                        IntervalValue::Histogram { distribution, .. }
+                            if distribution.is_empty() =>
+                        {
+                            Ok(())
+                        }
+                        IntervalValue::Histogram { unit, distribution } => {
+                            let (per, label) = match unit {
+                                HistogramUnit::Nanoseconds => (1e3, "µs"),
+                                HistogramUnit::Billionths => (unit.per_unit() as f64, ""),
+                            };
+                            writeln!(
+                                out,
+                                "    - histogram {name}: {}",
+                                distribution_cells(distribution, per, label)
+                            )
+                        }
+                    };
+                }
+            }
         }
     }
 

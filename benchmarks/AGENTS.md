@@ -27,6 +27,11 @@ whoever runs it.
 
 - ALWAYS report a run by pasting its `capacity report <record.json>` output,
   then add interpretation below it. Compare runs with `mise run bench:results`.
+- `capacity report` shows every series the server records for each step. A
+  value the run keeps but the report omits is a reader defect: extend the
+  reader.
+- Explain a result from the report's per-statement diagnostics and server
+  series first. Profile only when they cannot name the cost.
 - Memory growth: start with the record's opening and peak resident memory,
   then `--pace`, which adds resident and governed memory by owner after each
   repetition drains. Use heap captures only when those readings cannot

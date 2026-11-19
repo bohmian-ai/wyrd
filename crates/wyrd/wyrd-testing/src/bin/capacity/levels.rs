@@ -411,7 +411,7 @@ pub fn spawn(root: &Path, command: &[&str], forwarded: &[String]) -> u8 {
 /// Returns a message when the record is unreadable, malformed, or of an
 /// unsupported schema version.
 pub fn report(path: &Path) -> Result<String, String> {
-    Record::read(path)
+    Record::read_with_timings(path)
         .map(|record| record.render())
         .map_err(|error| error.to_string())
 }

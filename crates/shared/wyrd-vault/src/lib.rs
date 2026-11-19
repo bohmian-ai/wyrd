@@ -28,8 +28,10 @@ use reqwest::header::HeaderValue;
 use reqwest::redirect::Policy;
 use reqwest::{Certificate, Client, RequestBuilder, StatusCode};
 use secrecy::{ExposeSecret, SecretString};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use url::{Host, Url};
+use wyrd_crypt::SecretBytes;
 use zeroize::Zeroizing;
 
 /// Total time one Vault read may take.
@@ -149,10 +151,11 @@ impl VaultKv2 {
         field: &str,
     ) -> Result<SecretString, VaultError> {
         let url = self.endpoint.url(&["data"], path.split('/'))?;
-        let envelope = self
+        let body = self
             .endpoint
             .send(self.endpoint.client.get(url), token)
             .await?;
+        let envelope: Value = serde_json::from_slice(&body).map_err(|_| VaultError::Unavailable)?;
         let metadata = &envelope["data"]["metadata"];
         let deleted = metadata["deletion_time"]
             .as_str()
@@ -227,14 +230,24 @@ impl VaultTransit {
         associated_data: &[u8],
     ) -> Result<String, VaultError> {
         let url = self.endpoint.url(&["encrypt", key], std::iter::empty())?;
-        let body = json!({
-            "plaintext": STANDARD.encode(plaintext),
-            "associated_data": STANDARD.encode(associated_data),
-        });
-        let answer = self
+        let encoded = Zeroizing::new(STANDARD.encode(plaintext));
+        let mut body = SecretBytes::default();
+        serde_json::to_writer(
+            &mut body,
+            &EncryptRequest {
+                plaintext: &encoded,
+                associated_data: &STANDARD.encode(associated_data),
+            },
+        )
+        .map_err(|_| VaultError::Unavailable)?;
+        let request = self
             .endpoint
-            .send(self.endpoint.client.post(url).json(&body), token)
-            .await?;
+            .client
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(bytes::Bytes::from_owner(body));
+        let answer = self.endpoint.send(request, token).await?;
+        let answer: Value = serde_json::from_slice(&answer).map_err(|_| VaultError::Unavailable)?;
         answer["data"]["ciphertext"]
             .as_str()
             .map(str::to_owned)
@@ -259,7 +272,7 @@ impl VaultTransit {
         key: &str,
         ciphertext: &str,
         associated_data: &[u8],
-    ) -> Result<Zeroizing<Vec<u8>>, VaultError> {
+    ) -> Result<SecretBytes, VaultError> {
         let url = self.endpoint.url(&["decrypt", key], std::iter::empty())?;
         let body = json!({
             "ciphertext": ciphertext,
@@ -269,14 +282,42 @@ impl VaultTransit {
             .endpoint
             .send(self.endpoint.client.post(url).json(&body), token)
             .await?;
-        let encoded = answer["data"]["plaintext"]
-            .as_str()
-            .ok_or(VaultError::Unavailable)?;
+        let answer: DecryptAnswer<'_> =
+            serde_json::from_slice(&answer).map_err(|_| VaultError::Unavailable)?;
         STANDARD
-            .decode(encoded)
-            .map(Zeroizing::new)
+            .decode(answer.data.plaintext)
+            .map(|plaintext| SecretBytes::from(Zeroizing::new(plaintext)))
             .map_err(|_| VaultError::Unavailable)
     }
+}
+
+/// A Transit encrypt body borrowing its base64 plaintext, so serializing it
+/// into [`SecretBytes`] makes no unprotected copy of the key.
+#[derive(Serialize)]
+struct EncryptRequest<'a> {
+    /// Base64 plaintext.
+    plaintext: &'a str,
+    /// Base64 associated data.
+    associated_data: &'a str,
+}
+
+/// A Transit decrypt answer read in place from the protected response body.
+///
+/// The plaintext borrows the body, so an answer that would need unescaping
+/// into a fresh string fails to parse and is refused instead; Vault's base64
+/// output never contains an escape.
+#[derive(Deserialize)]
+struct DecryptAnswer<'a> {
+    /// The `data` object.
+    #[serde(borrow)]
+    data: DecryptData<'a>,
+}
+
+/// The `data` object of a Transit decrypt answer.
+#[derive(Deserialize)]
+struct DecryptData<'a> {
+    /// Base64 plaintext, borrowed from the protected body.
+    plaintext: &'a str,
 }
 
 /// One Vault mount behind the screened, bounded HTTP client.
@@ -356,7 +397,8 @@ impl Endpoint {
     }
 
     /// Sends `request` with the trimmed, sensitive token and the namespace,
-    /// and returns the bounded JSON answer of a `200`.
+    /// and returns the bounded body of a `200`, kept in [`SecretBytes`]
+    /// because a KV value or a Transit decrypt answer is secret.
     ///
     /// # Errors
     ///
@@ -368,7 +410,7 @@ impl Endpoint {
         &self,
         request: RequestBuilder,
         token: &SecretString,
-    ) -> Result<Value, VaultError> {
+    ) -> Result<SecretBytes, VaultError> {
         let mut token =
             HeaderValue::from_str(token.expose_secret().trim()).map_err(|_| VaultError::Refused)?;
         token.set_sensitive(true);
@@ -385,7 +427,7 @@ impl Endpoint {
             }
             _ => return Err(VaultError::Unavailable),
         }
-        let mut body = Zeroizing::new(Vec::new());
+        let mut body = SecretBytes::default();
         while let Some(chunk) = response
             .chunk()
             .await
@@ -396,7 +438,7 @@ impl Endpoint {
             }
             body.extend_from_slice(&chunk);
         }
-        serde_json::from_slice(&body).map_err(|_| VaultError::Unavailable)
+        Ok(body)
     }
 }
 
@@ -781,7 +823,7 @@ mod tests {
             .decrypt(&token(), "wyrd-secrets", &wrapped, b"aad")
             .await
             .expect("decrypts");
-        assert_eq!(plaintext.as_slice(), b"dek");
+        assert_eq!(&plaintext[..], b"dek");
 
         for (status, expected) in [
             (400, VaultError::Refused),

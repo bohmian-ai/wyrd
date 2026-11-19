@@ -61,6 +61,73 @@ impl Drop for SecretKey {
     }
 }
 
+/// Owned secret bytes — a plaintext key, or a request or answer body that
+/// carries one — with redacted debug output, zeroized on drop.
+///
+/// Growth never reallocates in place: appending past the capacity moves the
+/// bytes into a larger buffer and zeroizes the old one, so no unprotected
+/// copy is left behind. Writing JSON into it with `serde_json::to_writer`
+/// therefore keeps the whole serialized body protected.
+#[derive(Default)]
+pub struct SecretBytes(Zeroizing<Vec<u8>>);
+
+impl SecretBytes {
+    /// An empty buffer that holds `capacity` bytes before it grows.
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self(Zeroizing::new(Vec::with_capacity(capacity)))
+    }
+
+    /// Append `bytes`, moving into a buffer of at least twice the capacity
+    /// when they do not fit.
+    pub fn extend_from_slice(&mut self, bytes: &[u8]) {
+        let needed = self.0.len() + bytes.len();
+        if needed > self.0.capacity() {
+            let mut grown = Zeroizing::new(Vec::with_capacity(needed.max(self.0.capacity() * 2)));
+            grown.extend_from_slice(&self.0);
+            self.0 = grown;
+        }
+        self.0.extend_from_slice(bytes);
+    }
+}
+
+impl From<Zeroizing<Vec<u8>>> for SecretBytes {
+    fn from(bytes: Zeroizing<Vec<u8>>) -> Self {
+        Self(bytes)
+    }
+}
+
+impl std::ops::Deref for SecretBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl AsRef<[u8]> for SecretBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::io::Write for SecretBytes {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for SecretBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretBytes([REDACTED])")
+    }
+}
+
 /// Encrypted payload with nonce.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncryptedPayload {
@@ -508,9 +575,30 @@ pub enum CryptError {
 #[cfg(test)]
 mod tests {
     use super::{
-        SealingKeyId, SealingKeyring, SecretKey, decrypt, derive_key, encrypt, hmac_sha256, open,
-        rewrap, seal, verify_hmac_sha256,
+        SealingKeyId, SealingKeyring, SecretBytes, SecretKey, decrypt, derive_key, encrypt,
+        hmac_sha256, open, rewrap, seal, verify_hmac_sha256,
     };
+
+    /// Secret bytes keep their content across growth, which moves them into
+    /// a fresh larger buffer instead of reallocating in place, accept JSON
+    /// through `Write`, and never print their content.
+    ///
+    /// # Panics
+    /// Panics when content, growth, or redaction differs.
+    #[test]
+    fn secret_bytes_grow_by_moving_and_redact_debug() {
+        let mut bytes = SecretBytes::with_capacity(4);
+        bytes.extend_from_slice(b"abcd");
+        let before = bytes.as_ptr();
+        bytes.extend_from_slice(b"e");
+        assert_eq!(&bytes[..], b"abcde");
+        assert_ne!(bytes.as_ptr(), before, "grown into a new buffer");
+
+        let mut json = SecretBytes::default();
+        std::io::Write::write_all(&mut json, br#"{"plaintext":"c2stbGl2ZQ=="}"#).expect("writes");
+        assert_eq!(&json[..], br#"{"plaintext":"c2stbGl2ZQ=="}"#);
+        assert_eq!(format!("{json:?}"), "SecretBytes([REDACTED])");
+    }
 
     /// HMAC-SHA256 matches the RFC 4231 vectors for a short key (case 2) and
     /// a key longer than one block (case 6), and verification refuses a

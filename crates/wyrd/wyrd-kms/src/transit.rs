@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use secrecy::SecretString;
 use url::Url;
+use wyrd_crypt::SecretBytes;
 use wyrd_vault::{VaultError, VaultTransit};
 use zeroize::Zeroizing;
 
@@ -95,7 +96,7 @@ impl TransitKms {
         key: &str,
         wrapped: &[u8],
         aad: &[u8],
-    ) -> Result<Zeroizing<Vec<u8>>, KmsError> {
+    ) -> Result<SecretBytes, KmsError> {
         let ciphertext = std::str::from_utf8(wrapped).map_err(|_| KmsError::UnknownFormat)?;
         self.transit
             .decrypt(&self.token().await?, key, ciphertext, aad)

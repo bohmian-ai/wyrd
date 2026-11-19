@@ -14,8 +14,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use object_store::gcp::{GcpCredentialProvider, GoogleCloudStorageBuilder};
 use reqwest::{Client, StatusCode};
-use serde_json::json;
+use serde::Serialize;
 use url::Url;
+use wyrd_crypt::SecretBytes;
 use zeroize::Zeroizing;
 
 use crate::remote::{self, unavailable};
@@ -85,18 +86,14 @@ impl GcpKms {
         dek: &[u8],
         aad: &[u8],
     ) -> Result<Vec<u8>, KmsError> {
-        let answer = self
-            .call(
-                key,
-                "encrypt",
-                &json!({
-                    "plaintext": STANDARD.encode(dek),
-                    "additionalAuthenticatedData": STANDARD.encode(aad),
-                }),
-                false,
-            )
-            .await?;
-        remote::base64_field(KIND, &answer, "ciphertext").map(|wrapped| wrapped.to_vec())
+        let plaintext = Zeroizing::new(STANDARD.encode(dek));
+        let body = remote::secret_json(&Request {
+            plaintext: Some(&plaintext),
+            ciphertext: None,
+            additional_authenticated_data: &STANDARD.encode(aad),
+        })?;
+        let answer = self.call(key, "encrypt", body, false).await?;
+        remote::base64_field(KIND, &answer, "ciphertext")
     }
 
     /// Decrypt `wrapped` under CryptoKey `key`, requiring `aad`.
@@ -109,23 +106,18 @@ impl GcpKms {
         key: &str,
         wrapped: &[u8],
         aad: &[u8],
-    ) -> Result<Zeroizing<Vec<u8>>, KmsError> {
-        let answer = self
-            .call(
-                key,
-                "decrypt",
-                &json!({
-                    "ciphertext": STANDARD.encode(wrapped),
-                    "additionalAuthenticatedData": STANDARD.encode(aad),
-                }),
-                true,
-            )
-            .await?;
-        remote::base64_field(KIND, &answer, "plaintext")
+    ) -> Result<SecretBytes, KmsError> {
+        let body = remote::secret_json(&Request {
+            plaintext: None,
+            ciphertext: Some(&STANDARD.encode(wrapped)),
+            additional_authenticated_data: &STANDARD.encode(aad),
+        })?;
+        let answer = self.call(key, "decrypt", body, true).await?;
+        remote::plaintext(KIND, &answer)
     }
 
     /// POST `body` to `{endpoint}/v1/{key}:{method}` with a fresh bearer
-    /// token and map the status.
+    /// token, map the status, and return the protected answer body.
     ///
     /// # Errors
     /// Returns [`KmsError::Authentication`] for a 400 on decrypt and
@@ -134,9 +126,9 @@ impl GcpKms {
         &self,
         key: &str,
         method: &str,
-        body: &serde_json::Value,
+        body: SecretBytes,
         decrypting: bool,
-    ) -> Result<serde_json::Value, KmsError> {
+    ) -> Result<SecretBytes, KmsError> {
         let token = self
             .credentials
             .get_credential()
@@ -146,7 +138,8 @@ impl GcpKms {
             .client
             .post(format!("{}/v1/{key}:{method}", self.endpoint))
             .bearer_auth(&token.bearer)
-            .json(body);
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(bytes::Bytes::from_owner(body));
         let (status, answer) = remote::send(KIND, request).await?;
         match status {
             StatusCode::OK => Ok(answer),
@@ -158,4 +151,19 @@ impl GcpKms {
             _ => Err(unavailable(KIND, ProviderFailure::Transport)),
         }
     }
+}
+
+/// A Cloud KMS encrypt or decrypt body borrowing its base64 fields, so
+/// serializing it makes no unprotected copy of the key.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Request<'a> {
+    /// Base64 plaintext DEK, on encrypt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plaintext: Option<&'a str>,
+    /// Base64 wrapped DEK, on decrypt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ciphertext: Option<&'a str>,
+    /// Base64 canonical wrap context.
+    additional_authenticated_data: &'a str,
 }

@@ -22,6 +22,7 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 use wyrd_spec::DataTenantId;
 
 use crate::aws::AwsKms;
+use crate::config::{VaultSettings, VaultToken};
 use crate::gcp::GcpKms;
 use crate::transit::TransitKms;
 use crate::{
@@ -207,6 +208,41 @@ fn aws(server: &MockServer, active: &str, retained: &[&str]) -> WyrdKms {
             AwsKms::with_credentials(Some(&server.uri()), aws_keys(), TIMEOUT).expect("builds"),
         ),
     )
+}
+
+/// Transit fixture: `vault:v1:` ciphertext sealing `{context,
+/// plaintext}`; a decrypt under another context answers 400.
+struct Transit;
+impl Respond for Transit {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: Value = serde_json::from_slice(&request.body).expect("json");
+        if request.url.path().contains("/encrypt/") {
+            let blob = json!({"context": body["associated_data"], "plaintext": body["plaintext"]});
+            let ciphertext = format!("vault:v1:{}", STANDARD.encode(blob.to_string()));
+            return ResponseTemplate::new(200)
+                .set_body_json(json!({"data": {"ciphertext": ciphertext}}));
+        }
+        let blob: Value = body["ciphertext"]
+            .as_str()
+            .and_then(|text| text.strip_prefix("vault:v1:"))
+            .and_then(|encoded| STANDARD.decode(encoded).ok())
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        if blob["context"] != body["associated_data"] {
+            return ResponseTemplate::new(400)
+                .set_body_json(json!({"errors": ["cipher: message authentication failed"]}));
+        }
+        ResponseTemplate::new(200).set_body_json(json!({"data": {"plaintext": blob["plaintext"]}}))
+    }
+}
+/// A Transit fixture server.
+async fn transit_fake() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(Transit)
+        .mount(&server)
+        .await;
+    server
 }
 
 /// Requests the fixture received.
@@ -414,39 +450,7 @@ async fn provider_failures_refuse_redacted_and_disallowed_keys_send_nothing() {
 /// substituted context is refused.
 #[tokio::test]
 async fn transit_wraps_through_the_configured_key_and_rereads_its_token() {
-    use crate::config::{VaultSettings, VaultToken};
-    /// Transit fixture: `vault:v1:` ciphertext sealing `{context,
-    /// plaintext}`; a decrypt under another context answers 400.
-    struct Transit;
-    impl Respond for Transit {
-        fn respond(&self, request: &Request) -> ResponseTemplate {
-            let body: Value = serde_json::from_slice(&request.body).expect("json");
-            if request.url.path().contains("/encrypt/") {
-                let blob =
-                    json!({"context": body["associated_data"], "plaintext": body["plaintext"]});
-                let ciphertext = format!("vault:v1:{}", STANDARD.encode(blob.to_string()));
-                return ResponseTemplate::new(200)
-                    .set_body_json(json!({"data": {"ciphertext": ciphertext}}));
-            }
-            let blob: Value = body["ciphertext"]
-                .as_str()
-                .and_then(|text| text.strip_prefix("vault:v1:"))
-                .and_then(|encoded| STANDARD.decode(encoded).ok())
-                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-                .unwrap_or_default();
-            if blob["context"] != body["associated_data"] {
-                return ResponseTemplate::new(400)
-                    .set_body_json(json!({"errors": ["cipher: message authentication failed"]}));
-            }
-            ResponseTemplate::new(200)
-                .set_body_json(json!({"data": {"plaintext": blob["plaintext"]}}))
-        }
-    }
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(Transit)
-        .mount(&server)
-        .await;
+    let server = transit_fake().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let token_file = dir.path().join("token");
     let write_token = |token: &str| {
@@ -547,5 +551,103 @@ async fn renew_and_rewrap_return_nothing_when_the_provider_fails() {
             .iter()
             .any(|request| request.url.path() == format!("/v1/{GCP_NEW}:encrypt")),
         "rewrap wraps through the active CryptoKey"
+    );
+}
+
+/// A Transit backend over `server` with an inline token.
+fn transit(server: &MockServer) -> TransitKms {
+    TransitKms::new(
+        url::Url::parse(&server.uri()).expect("url"),
+        VaultSettings {
+            mount: "transit".to_owned(),
+            namespace: None,
+            token: VaultToken::Inline("hvs.inline".to_owned().into()),
+        },
+    )
+    .expect("builds")
+}
+
+/// Every remote backend hands back an unwrapped DEK whose `Debug` reveals
+/// none of its bytes.
+#[tokio::test]
+async fn remote_unwrapped_deks_have_redacted_debug() {
+    let dek = [0xAB_u8; 32];
+    let aad = b"context";
+    let gcp_server = fake(GCP).await;
+    let aws_server = fake(AWS).await;
+    let transit_server = transit_fake().await;
+    let gcp = GcpKms::with_credentials(&gcp_server.uri(), gcp_tokens(), TIMEOUT).expect("builds");
+    let aws =
+        AwsKms::with_credentials(Some(&aws_server.uri()), aws_keys(), TIMEOUT).expect("builds");
+    let transit = transit(&transit_server);
+
+    let unwrapped = [
+        gcp.unwrap(
+            GCP_OLD,
+            &gcp.wrap(GCP_OLD, &dek, aad).await.expect("wraps"),
+            aad,
+        )
+        .await
+        .expect("unwraps"),
+        aws.unwrap(
+            AWS_OLD,
+            &aws.wrap(AWS_OLD, &dek, aad).await.expect("wraps"),
+            aad,
+        )
+        .await
+        .expect("unwraps"),
+        transit
+            .unwrap(
+                "k",
+                &transit.wrap("k", &dek, aad).await.expect("wraps"),
+                aad,
+            )
+            .await
+            .expect("unwraps"),
+    ];
+    for bytes in &unwrapped {
+        assert_eq!(&bytes[..], dek.as_slice());
+        let debug = format!("{bytes:?}");
+        assert!(!debug.contains("171"), "{debug}");
+        assert!(debug.contains("REDACTED"), "{debug}");
+    }
+}
+
+/// A decrypt answer is read in place from the protected response body: a
+/// plaintext that would need unescaping into a fresh, unprotected string is
+/// refused as a transport failure instead.
+#[tokio::test]
+async fn remote_plaintext_answers_needing_a_copy_are_refused() {
+    let escaped = r"\/".repeat(42) + "8=";
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            format!(
+                r#"{{"plaintext":"{escaped}","Plaintext":"{escaped}","data":{{"plaintext":"{escaped}"}}}}"#
+            ),
+            "application/json",
+        ))
+        .mount(&server)
+        .await;
+    let gcp = GcpKms::with_credentials(&server.uri(), gcp_tokens(), TIMEOUT).expect("builds");
+    let aws = AwsKms::with_credentials(Some(&server.uri()), aws_keys(), TIMEOUT).expect("builds");
+    let transport = |backend| KmsError::Unavailable {
+        backend,
+        failure: ProviderFailure::Transport,
+    };
+    assert_eq!(
+        gcp.unwrap(GCP_OLD, b"blob", b"aad").await.map(|_| ()),
+        Err(transport(KmsBackendKind::GcpKms))
+    );
+    assert_eq!(
+        aws.unwrap(AWS_OLD, b"blob", b"aad").await.map(|_| ()),
+        Err(transport(KmsBackendKind::AwsKms))
+    );
+    assert_eq!(
+        transit(&server)
+            .unwrap("k", b"vault:v1:blob", b"aad")
+            .await
+            .map(|_| ()),
+        Err(transport(KmsBackendKind::VaultTransit))
     );
 }

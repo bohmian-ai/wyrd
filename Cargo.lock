@@ -10172,7 +10172,6 @@ dependencies = [
  "semver",
  "serde",
  "serde_core",
- "serde_derive",
  "serde_json",
  "sha2 0.10.9",
  "sha2 0.11.0",
@@ -10669,6 +10668,7 @@ version = "0.4.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
+ "bytes",
  "http",
  "object_store",
  "reqwest 0.13.4",
@@ -11421,14 +11421,17 @@ name = "wyrd-vault"
 version = "0.4.2"
 dependencies = [
  "base64 0.22.1",
+ "bytes",
  "reqwest 0.13.4",
  "secrecy",
+ "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "url",
  "wiremock",
  "workspace-hack",
+ "wyrd-crypt",
  "wyrd-tls",
  "zeroize",
 ]

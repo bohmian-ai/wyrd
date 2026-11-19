@@ -34,7 +34,7 @@ mod transit;
 
 use std::fmt;
 
-use wyrd_crypt::{EncryptedPayload, SecretKey};
+use wyrd_crypt::{EncryptedPayload, SecretBytes, SecretKey};
 use wyrd_spec::DataTenantId;
 use zeroize::Zeroizing;
 
@@ -240,9 +240,9 @@ impl Backend {
         key_ref: &str,
         wrapped: &[u8],
         aad: &[u8],
-    ) -> Result<Zeroizing<Vec<u8>>, KmsError> {
+    ) -> Result<SecretBytes, KmsError> {
         match self {
-            Self::Local(keys) => keys.unwrap(key_ref, wrapped, aad),
+            Self::Local(keys) => keys.unwrap(key_ref, wrapped, aad).map(SecretBytes::from),
             Self::Gcp(kms) => kms.unwrap(key_ref, wrapped, aad).await,
             Self::Aws(kms) => kms.unwrap(key_ref, wrapped, aad).await,
             Self::Transit(kms) => kms.unwrap(key_ref, wrapped, aad).await,
@@ -469,10 +469,7 @@ impl WyrdKms {
                 &context.canonical(WRAP_DOMAIN),
             )
             .await?;
-        let dek: [u8; 32] = bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| KmsError::InvalidDek)?;
+        let dek: [u8; 32] = bytes[..].try_into().map_err(|_| KmsError::InvalidDek)?;
         Ok(SecretKey::from_bytes(dek))
     }
 
@@ -577,7 +574,7 @@ mod tests {
             .await
             .expect("dek");
         assert_eq!(dek_a.len(), 32);
-        assert_ne!(dek_a, dek_b, "independent DEKs");
+        assert_ne!(dek_a[..], dek_b[..], "independent DEKs");
         assert!(!first.windows(10).any(|w| w == b"xoxb-token"));
     }
 
@@ -852,8 +849,8 @@ mod tests {
                 .backend
                 .unwrap("k2", after.wrapped_dek, &aad)
                 .await
-                .expect("dek"),
-            old_dek,
+                .expect("dek")[..],
+            old_dek[..],
             "renewal uses a fresh DEK"
         );
         assert_eq!(
@@ -877,8 +874,8 @@ mod tests {
                 .backend
                 .unwrap("k2", moved.wrapped_dek, &aad)
                 .await
-                .expect("dek"),
-            old_dek,
+                .expect("dek")[..],
+            old_dek[..],
             "rewrap keeps the DEK"
         );
         assert_eq!(rotating.is_current(&rewrapped), Ok(true));

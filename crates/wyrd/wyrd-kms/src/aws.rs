@@ -15,8 +15,9 @@ use base64::engine::general_purpose::STANDARD;
 use object_store::aws::{AmazonS3Builder, AwsAuthorizer, AwsCredentialProvider};
 use object_store::client::HttpRequestBody;
 use reqwest::{Client, StatusCode};
-use serde_json::{Value, json};
+use serde::Serialize;
 use url::Url;
+use wyrd_crypt::SecretBytes;
 use zeroize::Zeroizing;
 
 use crate::config::aws_region;
@@ -25,9 +26,6 @@ use crate::{KmsBackendKind, KmsError, ProviderFailure};
 
 /// This backend's kind.
 const KIND: KmsBackendKind = KmsBackendKind::AwsKms;
-
-/// Encryption-context key carrying the canonical wrap context.
-const CONTEXT_KEY: &str = "wyrd-context";
 
 /// A reusable authenticated AWS KMS client.
 pub(crate) struct AwsKms {
@@ -88,18 +86,17 @@ impl AwsKms {
         dek: &[u8],
         aad: &[u8],
     ) -> Result<Vec<u8>, KmsError> {
-        let answer = self
-            .call(
-                key,
-                "TrentService.Encrypt",
-                &json!({
-                    "KeyId": key,
-                    "Plaintext": STANDARD.encode(dek),
-                    "EncryptionContext": {CONTEXT_KEY: STANDARD.encode(aad)},
-                }),
-            )
-            .await?;
-        remote::base64_field(KIND, &answer, "CiphertextBlob").map(|wrapped| wrapped.to_vec())
+        let plaintext = Zeroizing::new(STANDARD.encode(dek));
+        let body = remote::secret_json(&Request {
+            key_id: key,
+            plaintext: Some(&plaintext),
+            ciphertext_blob: None,
+            encryption_context: Context {
+                wyrd_context: &STANDARD.encode(aad),
+            },
+        })?;
+        let answer = self.call(key, "TrentService.Encrypt", body).await?;
+        remote::base64_field(KIND, &answer, "CiphertextBlob")
     }
 
     /// Decrypt `wrapped` under key ARN `key`, requiring `aad`.
@@ -112,27 +109,33 @@ impl AwsKms {
         key: &str,
         wrapped: &[u8],
         aad: &[u8],
-    ) -> Result<Zeroizing<Vec<u8>>, KmsError> {
-        let answer = self
-            .call(
-                key,
-                "TrentService.Decrypt",
-                &json!({
-                    "KeyId": key,
-                    "CiphertextBlob": STANDARD.encode(wrapped),
-                    "EncryptionContext": {CONTEXT_KEY: STANDARD.encode(aad)},
-                }),
-            )
-            .await?;
-        remote::base64_field(KIND, &answer, "Plaintext")
+    ) -> Result<SecretBytes, KmsError> {
+        let body = remote::secret_json(&Request {
+            key_id: key,
+            plaintext: None,
+            ciphertext_blob: Some(&STANDARD.encode(wrapped)),
+            encryption_context: Context {
+                wyrd_context: &STANDARD.encode(aad),
+            },
+        })?;
+        let answer = self.call(key, "TrentService.Decrypt", body).await?;
+        remote::plaintext(KIND, &answer)
     }
 
-    /// Sign and POST one KMS JSON action for `key` and map its answer.
+    /// Sign and POST one KMS JSON action for `key`, map its answer, and
+    /// return the protected answer body.
+    ///
+    /// The signer and the request share one protected body.
     ///
     /// # Errors
     /// Returns [`KmsError::Authentication`] for `InvalidCiphertextException`
     /// or `IncorrectKeyException`, and [`KmsError::Unavailable`] otherwise.
-    async fn call(&self, key: &str, target: &str, body: &Value) -> Result<Value, KmsError> {
+    async fn call(
+        &self,
+        key: &str,
+        target: &str,
+        body: SecretBytes,
+    ) -> Result<SecretBytes, KmsError> {
         let (partition, region) = aws_region(key).ok_or(KmsError::KeyNotAllowed)?;
         let url = self.endpoint.clone().unwrap_or_else(|| {
             let suffix = if partition == "aws-cn" {
@@ -147,7 +150,7 @@ impl AwsKms {
             .get_credential()
             .await
             .map_err(|_| unavailable(KIND, ProviderFailure::Credential))?;
-        let bytes = serde_json::to_vec(body).map_err(|_| KmsError::Encrypt)?;
+        let bytes = bytes::Bytes::from_owner(body);
         let mut signed = http::Request::builder()
             .method("POST")
             .uri(format!("{url}/"))
@@ -167,6 +170,7 @@ impl AwsKms {
         if status == StatusCode::OK {
             return Ok(answer);
         }
+        let answer = remote::json(KIND, &answer)?;
         let kind = answer["__type"].as_str().unwrap_or_default();
         if kind.ends_with("InvalidCiphertextException") || kind.ends_with("IncorrectKeyException") {
             return Err(KmsError::Authentication);
@@ -180,4 +184,30 @@ impl AwsKms {
             },
         ))
     }
+}
+
+/// A KMS Encrypt or Decrypt body borrowing its base64 fields, so
+/// serializing it makes no unprotected copy of the key.
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct Request<'a> {
+    /// The configured key ARN.
+    key_id: &'a str,
+    /// Base64 plaintext DEK, on Encrypt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plaintext: Option<&'a str>,
+    /// Base64 wrapped DEK, on Decrypt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ciphertext_blob: Option<&'a str>,
+    /// The encryption context.
+    encryption_context: Context<'a>,
+}
+
+/// The encryption context: the base64 canonical wrap context under
+/// `wyrd-context`.
+#[derive(Serialize)]
+struct Context<'a> {
+    /// Base64 canonical wrap context.
+    #[serde(rename = "wyrd-context")]
+    wyrd_context: &'a str,
 }

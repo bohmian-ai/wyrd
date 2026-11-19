@@ -11,12 +11,15 @@ description = "Bounded, screened, and pinned HashiCorp Vault client: the KV v2 r
 
 [dependencies]
 base64 = { workspace = true }
+bytes = { workspace = true }
 reqwest = { workspace = true }
 secrecy = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["net", "time"] }
 url = { workspace = true }
+wyrd-crypt = { workspace = true }
 wyrd-tls = { workspace = true }
 zeroize = { workspace = true }
 

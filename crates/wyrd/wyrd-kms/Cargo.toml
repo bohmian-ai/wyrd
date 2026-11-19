@@ -11,6 +11,7 @@ description = "WyrdKms: the one stored-secret envelope facade over file, memory,
 
 [dependencies]
 base64 = { workspace = true }
+bytes = { workspace = true }
 http = { workspace = true }
 # Only for the GCP and AWS workload credential chains and SigV4 signing.
 object_store = { workspace = true, features = ["aws", "gcp"] }

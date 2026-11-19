@@ -902,6 +902,7 @@ mod pg_tests {
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let row = insert_human_candidate(
             &mut conn,
+            uuid::Uuid::now_v7(),
             &HumanConnectionWrite {
                 issuer_url: EXTERNAL_ISSUER.to_owned(),
                 client_id: EXTERNAL_AUDIENCE.to_owned(),

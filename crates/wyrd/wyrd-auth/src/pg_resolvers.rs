@@ -435,7 +435,10 @@ fn principal_kind_from_str(value: &str) -> Result<IssuerTokenPolicy, IssuerDecod
 ///
 /// Built from verified authority and the row's trusted columns, never from
 /// the envelope: the tenant (or the platform), the owning table's purpose,
-/// the issuer URL, the client id, and the client-authentication method.
+/// the issuer URL, the client id, the client-authentication method, and, for
+/// a tenant human connection, the connection id. A tenant's Active and
+/// Candidate connections can share issuer, client, and method, so only the
+/// connection id keeps one's secret from opening as the other's.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ClientSecretOwner<'a> {
     /// Owning tenant, or the platform.
@@ -446,6 +449,9 @@ pub(crate) struct ClientSecretOwner<'a> {
     pub(crate) issuer_url: &'a str,
     /// OAuth client id.
     pub(crate) client_id: &'a str,
+    /// The owning human connection's id; `None` for an issuer or platform
+    /// connection, which its issuer URL already identifies.
+    pub(crate) connection_id: Option<&'a str>,
 }
 
 impl ClientSecretOwner<'_> {
@@ -483,7 +489,7 @@ impl ClientSecretOwner<'_> {
         kms: Option<&WyrdKms>,
     ) -> Result<Vec<u8>, IssuerSealError> {
         let kms = kms.ok_or(IssuerSealError::KmsMissing)?;
-        let authority = [self.client_id, method];
+        let authority = self.authority(method);
         kms.seal(&self.context(&authority), secret)
             .await
             .map_err(|error| {
@@ -510,7 +516,7 @@ impl ClientSecretOwner<'_> {
         let secret = || async {
             let bytes = secret_enc.ok_or(IssuerDecodeError::MissingSecret)?;
             let kms = kms.ok_or(IssuerDecodeError::KmsMissing)?;
-            let authority = [self.client_id, discriminant];
+            let authority = self.authority(discriminant);
             let plaintext = kms
                 .open(&self.context(&authority), bytes)
                 .await
@@ -531,7 +537,16 @@ impl ClientSecretOwner<'_> {
         }
     }
 
-    /// The envelope context over `authority`: the client id and method.
+    /// The envelope authority for `method`: the client id, the method, and
+    /// the connection id when there is one.
+    fn authority<'b>(&'b self, method: &'b str) -> Vec<&'b str> {
+        [self.client_id, method]
+            .into_iter()
+            .chain(self.connection_id)
+            .collect()
+    }
+
+    /// The envelope context over `authority`, from [`Self::authority`].
     fn context<'a>(&'a self, authority: &'a [&'a str]) -> SecretContext<'a> {
         SecretContext {
             scope: self.scope,
@@ -567,6 +582,7 @@ async fn trusted_issuer_from_row(
         purpose: SecretPurpose::AuthTrustedIssuer,
         issuer_url: &row.issuer_url,
         client_id: &row.client_id,
+        connection_id: None,
     }
     .client_auth(&row.client_auth, row.client_secret_enc.as_deref(), kms)
     .await?;
@@ -626,11 +642,13 @@ pub(crate) async fn human_connection_trusted_issuer(
         .ok_or_else(|| IssuerDecodeError::JwksUri("the connection has no jwks uri".to_owned()))?;
     let jwks_uri =
         Url::parse(jwks_uri).map_err(|error| IssuerDecodeError::JwksUri(error.to_string()))?;
+    let connection_id = row.connection_id.to_string();
     let client_auth = ClientSecretOwner {
         scope: SecretScope::Tenant(tenant),
         purpose: SecretPurpose::AuthHumanConnection,
         issuer_url: issuer.as_str(),
         client_id: &row.client_id,
+        connection_id: Some(&connection_id),
     }
     .client_auth(&row.client_auth, row.client_secret_enc.as_deref(), kms)
     .await?;
@@ -680,6 +698,7 @@ pub async fn platform_connection_from_row(
         purpose: SecretPurpose::PlatformOidc,
         issuer_url: &row.issuer_url,
         client_id: &row.client_id,
+        connection_id: None,
     }
     .client_auth(&row.client_auth, row.client_secret_enc.as_deref(), kms)
     .await
@@ -740,6 +759,7 @@ pub async fn seal_platform_client_secret(
         purpose: SecretPurpose::PlatformOidc,
         issuer_url,
         client_id,
+        connection_id: None,
     }
     .seal(client_auth, kms)
     .await
@@ -775,6 +795,7 @@ pub async fn issuer_write_from_trusted(
         purpose: SecretPurpose::AuthTrustedIssuer,
         issuer_url: issuer.issuer.as_str(),
         client_id: &issuer.client_id,
+        connection_id: None,
     }
     .seal(&issuer.client_auth, kms)
     .await?;

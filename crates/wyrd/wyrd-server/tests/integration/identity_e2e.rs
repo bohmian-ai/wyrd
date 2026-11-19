@@ -4794,6 +4794,114 @@ async fn candidate_tested(srv: &WyrdTestServer, admin: &TenantAdmin) -> bool {
     !listed["candidate"]["tested_until"].is_null()
 }
 
+/// A client secret is bound to its own connection: when the Active
+/// connection's valid secret is copied onto a Candidate that names the same
+/// issuer, client, and method, the Candidate's test sign-in is refused before
+/// the secret reaches the provider and the Candidate stays untested. The
+/// Active connection still signs alice in with its own secret, and the
+/// Candidate tests once it is staged again with its own secret.
+///
+/// # Panics
+/// Panics when the copied secret is used, or an intact connection does not
+/// authenticate.
+#[tokio::test]
+#[ignore = "requires the Keycloak and Dex identity lane"]
+async fn tenant_connection_refuses_a_secret_copied_between_connections() {
+    let srv = WyrdTestServerBuilder::default()
+        .start_in_process()
+        .await
+        .expect("test server starts");
+    let tenant = srv.data_tenant_id();
+    let admin = tenant_admin(&srv, tenant, "copied-secret-admin").await;
+    activate_keycloak_connection(
+        &srv,
+        &admin,
+        CONFIDENTIAL_HUMAN_CLIENT,
+        "SecretPost",
+        Some(CONFIDENTIAL_HUMAN_SECRET),
+    )
+    .await;
+    let (status, staged) = call_json(
+        &srv,
+        &admin.token,
+        Method::PUT,
+        CANDIDATE,
+        Some(connection_input(
+            CONFIDENTIAL_HUMAN_CLIENT,
+            "SecretPost",
+            Some("not-the-secret"),
+            None,
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "candidate stages: {staged}");
+    let revision = staged["revision"].as_u64().expect("candidate revision");
+    let pool = srv
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    let copied = sqlx::query(
+        "UPDATE wyrd.auth_human_connections AS candidate \
+            SET client_secret_enc = active.client_secret_enc \
+           FROM wyrd.auth_human_connections AS active \
+          WHERE candidate.data_tenant_id = $1 AND candidate.state = 'Candidate' \
+            AND active.data_tenant_id = $1 AND active.state = 'Active'",
+    )
+    .bind(tenant.as_uuid())
+    .execute(&pool)
+    .await
+    .expect("the active secret copies onto the candidate");
+    assert_eq!(copied.rows_affected(), 1);
+
+    let (status, begun) = begin_test(&srv, &admin.token, revision).await;
+    assert_eq!(status, StatusCode::OK, "the test begins: {begun}");
+    let reply = finish_test_sign_in(&srv, &begun).await;
+    assert_refused(
+        reply.status,
+        &reply.problem(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "WYRD_AUTH_503_VERIFY_UNAVAILABLE",
+    );
+    assert!(
+        !candidate_tested(&srv, &admin).await,
+        "a copied secret leaves the candidate untested"
+    );
+
+    let keycloak = OidcIssuerFixture::connect(&keycloak_issuer()).await;
+    let session = human_login(
+        &srv,
+        &keycloak,
+        CONFIDENTIAL_HUMAN_CLIENT,
+        "alice",
+        "alice-password",
+    )
+    .await;
+    assert_v1_delegated_write_ok(
+        &srv,
+        session["access_token"].as_str().expect("access token"),
+        "copied-secret-active",
+    )
+    .await;
+    let (status, staged) = call_json(
+        &srv,
+        &admin.token,
+        Method::PUT,
+        CANDIDATE,
+        Some(connection_input(
+            CONFIDENTIAL_HUMAN_CLIENT,
+            "SecretPost",
+            Some(CONFIDENTIAL_HUMAN_SECRET),
+            Some(revision),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "candidate restages: {staged}");
+    let revision = staged["revision"].as_u64().expect("candidate revision");
+    let (status, begun) = begin_test(&srv, &admin.token, revision).await;
+    assert_eq!(status, StatusCode::OK, "the test begins: {begun}");
+    assert_test_completion(&finish_test_sign_in(&srv, &begun).await);
+}
+
 /// A candidate is tested by one real provider sign-in through the common
 /// callback, with login state's protections and nothing issued:
 ///   1. tenant A's genuine provider return presented under tenant B's test

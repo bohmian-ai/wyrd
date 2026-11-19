@@ -75,6 +75,28 @@ names to copy. Historical scenarios 2/3 TDD violations stay recorded.
    maintenance reconstruction with the same owner identity. Owners: wyrd-auth
    resolver tests and wyrd-server identity integration; the consumer proof is the
    required journey tier, not only an isolated AAD unit.
+   - Evidence: `ClientSecretOwner` gains `connection_id`. A human connection's envelope
+     authority is now `[client_id, method, connection_id]`, built at three points: in
+     `stage`, which seals to the observed candidate's id or a fresh UUIDv7; in
+     `human_connection_trusted_issuer`, which opens with `row.connection_id`; and in
+     maintenance `SealedSecretTable::HumanConnections` (`ARRAY[client_id, client_auth,
+     connection_id::text]`). `insert_human_candidate` takes that id.
+     `put_candidate` conflicts unless the locked candidate is still the one `stage` read.
+     Remote sealing stays outside transactions. No schema change.
+     `identity_e2e::tenant_connection_refuses_a_secret_copied_between_connections` copies
+     the Active row's valid secret onto a same-issuer/client/method Candidate. Its test
+     sign-in is refused with 503 `WYRD_AUTH_503_VERIFY_UNAVAILABLE` and the Candidate
+     stays untested. The Active connection still signs alice in, and a re-staged
+     Candidate tests. RED, before the fix: `left: 200, right: 503`, because the copied
+     secret completed the test sign-in. GREEN: the identity lane wrapper ran `cargo
+     nextest run --locked -p wyrd-server --test integration --run-ignored=all
+     --test-threads=1 -E
+     'test(/^identity_e2e::(tenant_connection_|tenant_human_login|tenant_callback)/)'`,
+     8/8 passed. `tenant_connection_rotation_journey` covers maintenance rewrap of the
+     corrected authority, then sign-in. `-p wyrd-auth --lib --all-features -E
+     'test(/pg_tests::/)'` passed 106/106, including the cross-tenant copy refusal.
+     `-p wyrd-server --lib --features test-support -E 'test(/auth::callback::/)'`
+     passed 19/19. TDD PASS.
 2. **Completed Operator work survives pass limits — finding 2.** Through the
    production facade/local remote-service fixture and real repository Postgres,
    use individually successful delayed rows with a small tenant budget. Observe

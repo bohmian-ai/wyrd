@@ -219,17 +219,21 @@ pub async fn human_connection_in_state(
         .map_err(SqlError::from)
 }
 
-/// Insert a new candidate at the next tenant revision.
+/// Insert a new candidate as `connection_id` at the next tenant revision.
+///
+/// The caller chooses the id because the candidate's client secret is sealed
+/// to it before this transaction opens.
 ///
 /// # Errors
 /// Returns [`SqlError`] when the insert fails, including a unique violation
 /// when a candidate already exists.
 pub async fn insert_human_candidate(
     conn: &mut TenantConn<'_>,
+    connection_id: Uuid,
     write: &HumanConnectionWrite,
 ) -> Result<HumanConnectionRow, SqlError> {
     sqlx::query_as::<_, HumanConnectionRow>(INSERT_CANDIDATE_SQL)
-        .bind(Uuid::now_v7())
+        .bind(connection_id)
         .bind(conn.data_tenant_id().as_uuid())
         .bind(&write.issuer_url)
         .bind(&write.client_id)
@@ -465,7 +469,8 @@ impl SealedSecretTable {
         match self {
             Self::HumanConnections => {
                 "SELECT data_tenant_id, connection_id::text AS row_key, issuer_url AS owner,
-                        ARRAY[client_id, client_auth] AS authority, client_secret_enc
+                        ARRAY[client_id, client_auth, connection_id::text] AS authority,
+                        client_secret_enc
                    FROM wyrd.auth_human_connections WHERE client_secret_enc IS NOT NULL"
             }
             Self::TrustedIssuers => {

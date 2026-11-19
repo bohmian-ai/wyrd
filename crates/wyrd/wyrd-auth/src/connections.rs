@@ -114,6 +114,12 @@ impl Debug for HumanConnections {
 pub struct StagedCandidate {
     /// The candidate revision the caller expects to replace; `None` creates.
     expected_revision: Option<u64>,
+    /// The candidate id read while staging, `None` when there was none; the
+    /// write lands only while the locked candidate is still this one.
+    observed: Option<Uuid>,
+    /// The id the secret is sealed to: the observed candidate's, else a
+    /// fresh one the insert uses.
+    connection_id: Uuid,
     /// The sealed row write, its JWKS TTL filled in under the slot lock.
     write: HumanConnectionWrite,
 }
@@ -211,26 +217,37 @@ impl HumanConnections {
         Ok(response)
     }
 
-    /// Prepare `tenant`'s candidate write with no database IO: seal the
-    /// secret into the common envelope bound to the tenant, issuer, client
-    /// id, and method.
+    /// Prepare `tenant`'s candidate write: read which candidate it replaces
+    /// in one short transaction, then, holding none, seal the secret into the
+    /// common envelope bound to the tenant, issuer, client id, method, and
+    /// that candidate's id (or a fresh id for a new candidate).
     ///
     /// `input` must come from [`ConnectionInput::from_slice`], which is the one
     /// place its cross-field rules are checked; the durable table re-asserts
-    /// the Public-has-no-secret invariant. Callers run this before
-    /// authorizing and before any transaction opens, so every refusal it can
-    /// produce is a deployment or input fact rather than an unaudited
-    /// decision, and a key-service wait holds no lock.
+    /// the Public-has-no-secret invariant. Callers run this after authorizing
+    /// and before [`Self::put_candidate`] opens its write transaction, so a
+    /// refusal here follows a staged decision and a key-service wait holds no
+    /// lock.
     ///
     /// # Errors
     /// Returns [`WyrdError::Validation`] when a secret must be sealed without
-    /// `[kms]`, [`WyrdError::ServiceUnavailable`] when sealing fails, and
+    /// `[kms]`, [`WyrdError::ServiceUnavailable`] when sealing fails,
+    /// [`WyrdError::AuthVerifyUnavailable`] when the store fails, and
     /// [`WyrdError::Internal`] when JSON encoding fails.
     pub async fn stage(
         &self,
         tenant: DataTenantId,
         input: ConnectionInput,
     ) -> Result<StagedCandidate, WyrdError> {
+        let mut conn = self.begin(tenant).await?;
+        let observed =
+            human_connection_in_state(&mut conn, HumanConnectionState::Candidate.as_str())
+                .await
+                .map_err(store_error)?
+                .map(|row| row.connection_id);
+        conn.commit().await.map_err(store_error)?;
+        let connection_id = observed.unwrap_or_else(Uuid::now_v7);
+        let owner_id = connection_id.to_string();
         let client_secret_enc = match &input.client_secret {
             Some(secret) => {
                 let kms = self.require_kms()?;
@@ -239,6 +256,7 @@ impl HumanConnections {
                     purpose: SecretPurpose::AuthHumanConnection,
                     issuer_url: input.issuer.as_str(),
                     client_id: &input.client_id,
+                    connection_id: Some(&owner_id),
                 };
                 Some(
                     owner
@@ -258,6 +276,8 @@ impl HumanConnections {
         };
         Ok(StagedCandidate {
             expected_revision: input.expected_revision,
+            observed,
+            connection_id,
             write: HumanConnectionWrite {
                 issuer_url: input.issuer.as_str().to_owned(),
                 client_auth: input.client_auth.as_str().to_owned(),
@@ -277,8 +297,9 @@ impl HumanConnections {
     ///
     /// # Errors
     /// Returns [`WyrdError::ConnectionConflict`] when `expected_revision` does
-    /// not match the current candidate (or is supplied when none exists), and
-    /// the audit/store errors of [`Self::list`].
+    /// not match the current candidate (or is supplied when none exists) or
+    /// the candidate is no longer the one [`Self::stage`] read, and the
+    /// audit/store errors of [`Self::list`].
     pub async fn put_candidate(
         &self,
         tenant: DataTenantId,
@@ -289,6 +310,8 @@ impl HumanConnections {
         let callback = provider_callback(origin)?;
         let StagedCandidate {
             expected_revision,
+            observed,
+            connection_id,
             mut write,
         } = staged;
         let mut conn = self.begin_locked(tenant, decision).await?;
@@ -296,11 +319,12 @@ impl HumanConnections {
             human_connection_in_state(&mut conn, HumanConnectionState::Candidate.as_str())
                 .await
                 .map_err(store_error)?;
-        let revision_matches = match (&candidate, expected_revision) {
-            (Some(row), Some(expected)) => u64::try_from(row.revision).ok() == Some(expected),
-            (None, None) => true,
-            _ => false,
-        };
+        let revision_matches = candidate.as_ref().map(|row| row.connection_id) == observed
+            && match (&candidate, expected_revision) {
+                (Some(row), Some(expected)) => u64::try_from(row.revision).ok() == Some(expected),
+                (None, None) => true,
+                _ => false,
+            };
         if !revision_matches {
             return commit_refusal(
                 conn,
@@ -320,7 +344,7 @@ impl HumanConnections {
                 .await
                 .map_err(store_error)?
                 .ok_or_else(|| internal("locked candidate vanished during replace"))?,
-            None => insert_human_candidate(&mut conn, &write)
+            None => insert_human_candidate(&mut conn, connection_id, &write)
                 .await
                 .map_err(store_error)?,
         };

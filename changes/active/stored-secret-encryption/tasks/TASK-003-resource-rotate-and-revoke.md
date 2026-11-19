@@ -51,9 +51,7 @@ resealing unchanged plaintext. Do not make auth replacement bypass validation or
 promise session preservation that its lifecycle does not provide.
 
 Project the owner actions through typed `wyrd-spec` contracts/errors, server
-HTTP/OpenAPI, `wyrd-client`, CLI, Rust/Python/TypeScript SDKs and scoped MCP
-writes. Carry each changed projection's exports, Python authored stubs, native
-bindings and generated TypeScript declarations with it. No UI or public raw
+HTTP/OpenAPI and the CLI. SDKs and MCP do not expose them. No UI or public raw
 encrypt/decrypt endpoint. No wrapping-key administration in tenant actions.
 
 Use the common facade outside DB locks, commit against current authority/secret
@@ -81,7 +79,7 @@ in these entries; test variant owners/surfaces under the same scenarios.
    session effects; extend the existing flow only to use the common facade and
    expose the approved action. Do not replace its authentication machinery.
    Provider failure/invalid input leaves committed state intact.
-   Server/SDK journeys plus OIDC/provider fixtures assert the consuming effect;
+   Server journeys plus OIDC/provider fixtures assert the consuming effect;
    RED is absent action/mode or replacement incorrectly depending on old decrypt.
 3. **Revoke without resurrection** — REQ-007–009.
    Given an in-use resource, revoke it and exercise subsequent consuming use
@@ -93,16 +91,15 @@ in these entries; test variant owners/surfaces under the same scenarios.
    cancellation. Existing correct disable/revoke behavior needs regression proof;
    RED for new behavior is a missing projection or unsafe encryption action.
 4. **Preserve permissions, commit safety, and redaction** — REQ-008–009.
-   Attempt the actions as a wrong tenant, unprivileged principal, and MCP caller
-   lacking write scope. Inject provider refusal/timeout and a competing resource
+   Attempt the actions as a wrong tenant and an unprivileged principal. Inject provider refusal/timeout and a competing resource
    update between read and commit. Observe permission refusal or conflict, no
    partial/losing write, and no keys/plaintext in responses, logs, errors or audit.
    Exercise actual owner services and existing snapshot invalidation; do not
    replace permission or persistence behavior with facade mocks. RED is a newly
    missing boundary/atomicity case; reuse existing proven cases.
-5. **Operate through every public projection** — REQ-006–008, REQ-012.
-   Drive the previous operations through public Rust, Python, TypeScript, CLI,
-   HTTP and scoped MCP callers against the real server/Postgres. Verify typed
+5. **Operate through HTTP and the CLI** — REQ-006–008, REQ-012.
+   Drive the previous operations through HTTP and CLI callers against the real
+   server/Postgres. Verify typed
    requests/modes, stable resource references, errors, and actual downstream
    use/refusal. Document upstream credential revocation separately from Wyrd
    revoke and encryption renewal. RED is missing consumer exposure or divergent
@@ -115,18 +112,17 @@ in these entries; test variant owners/surfaces under the same scenarios.
      - Trusted issuer: `WYRD_AUTH_404_ADMIN_NOT_FOUND`.
    - Unprivileged caller:
      - Operator, human, and trusted issuer: 403 with a denied audit row. Decision rows are `[("allowed",5),("denied",1)]` for human connections and `[("allowed",3),("denied",1)]` for trusted issuers.
-     - MCP without write scope: Gateway reader denied with 403 in `wyrd-mcp/tests/bifrost/mcp/gateway.rs::agent_administers_redacted_gateway_configuration`; Operator scoped tool in `mcp/operators.rs`.
    - Provider outage:
      - Gateway, Operator, and human: Transit `set_available(false)` returns 503 with the envelope unchanged.
-     - Trusted issuer and platform: the same 503 path is not exercised; this is a limit.
+     - Trusted issuer: `admin::routes::pg_tests::issuer_renewal_survives_outage_and_loses_to_deletion`. Platform: `platform_admin_e2e::renewing_platform_connection_encryption_keeps_its_sign_in`. Both return 503 with the envelope unchanged and sign-in still working.
    - Competing update between read and commit:
      - Gateway and human: deterministic races using the Transit delay and the encrypt-count barrier.
      - Operator: a disable racing a rotation.
-     - Platform and trusted issuer: the same byte compare-and-swap (`swap_platform_sealed_secret_tx`, `RENEW_TRUSTED_ISSUER_SECRET_SQL`), not race-tested; this is a limit.
+     - Platform and trusted issuer: a deletion racing the renewal (same two tests, Transit delay and encrypt-count barrier) wins; the renewal returns 409 and the resource stays deleted.
    - Redaction:
-     - Every response is the existing redacted view, and the tests assert no plaintext in responses or CLI output (Gateway CLI secret-leak loop, MCP ROTATED check).
+     - Every response is the existing redacted view, and the tests assert no plaintext in responses or CLI output (Gateway CLI secret-leak loop).
      - Errors carry no secret or key text.
-   - RED: Gateway MCP denial was behavioral ("unknown Wyrd MCP tool"); the others are part of the RED runs above.
+   - RED: part of the RED runs above; the trusted-issuer and platform outage and race cases were added after their production code and passed on first run.
 
    **Evidence (revocation without resurrection).**
    - Each renewal compares and swaps on the exact observed envelope plus the live state, so it cannot undo a revoke.
@@ -150,60 +146,48 @@ in these entries; test variant owners/surfaces under the same scenarios.
    - Gateway: `wyrd-server/src/components/gateway/pg_administration_tests.rs::gateway_managed_secret_renewal_keeps_the_key_and_loses_races` (Transit delayed 300 ms) asserts the same name, state, and `rotated_at`, a changed envelope with no plaintext at rest, and that a fresh `load_snapshot` prepares the submitted key. `PG` + `cargo nextest run --locked -p wyrd-server --features test-support --lib -E 'test(/gateway::pg_administration_tests::/)'`. RED: compile-only (E0599, missing `renew_credential_encryption`). GREEN.
    - Human connection: `wyrd-server/src/components/admin/identity.rs::pg_tests::renewing_a_connection_secret_keeps_its_revision_and_login` asserts the same id, revision 1, Active, and `tested_revision`, a changed envelope, and that `active_connection` opens the same `SecretBasic` secret at the same revision (login and sessions untouched). Selector `test(/components::admin::identity::pg_tests::/)` with `--lib`. RED: compile-only (E0425). GREEN.
    - Trusted issuer: `wyrd-server/src/components/admin/routes.rs::pg_tests::renewing_issuer_encryption_keeps_the_secret_and_respects_deletion` asserts an unchanged view, a changed envelope, and that `PgIssuerResolver` opens the same `SecretPost` secret. Selector `test(/components::admin::routes::pg_tests::/)` with `--lib`. RED: compile-only (E0425/E0422). GREEN: 36/36 in that lib run.
-   - Platform: `wyrd-server/tests/integration/platform_admin_e2e.rs::renewing_platform_connection_encryption_keeps_its_sign_in` (Vault Transit fixture) asserts an unchanged redacted view, exactly one more Transit encrypt per renewal (HTTP route, then `wyrd_client::Platform::renew_oidc_encryption`), and a real confidential sign-in afterwards whose token exchange carries the unchanged secret. `--test integration -E 'test(=platform_admin_e2e::renewing_platform_connection_encryption_keeps_its_sign_in)'`. RED: 401 `WYRD_AUTH_401_UNAUTHENTICATED` (route missing) for HTTP (behavioral), then E0599 for the client method. GREEN; `platform_admin_e2e::` 42/42.
+   - Platform: `wyrd-server/tests/integration/platform_admin_e2e.rs::renewing_platform_connection_encryption_keeps_its_sign_in` (Vault Transit fixture) asserts an unchanged redacted view, exactly one more Transit encrypt for the renewal, and a real confidential sign-in afterwards whose token exchange carries the unchanged secret. `--test integration -E 'test(=platform_admin_e2e::renewing_platform_connection_encryption_keeps_its_sign_in)'`. RED: 401 `WYRD_AUTH_401_UNAUTHENTICATED` (route missing) for HTTP (behavioral). GREEN; `platform_admin_e2e::` 42/42.
 
-   **Evidence (projections).** Each owner is projected through the public surfaces it already has. Gateway credential mutation is CLI/MCP/HTTP-only by design (`wyrd-client/src/gateway_credential.rs` module doc). Human connections are HTTP-only today. Trusted issuers are HTTP plus CLI. The platform connection is HTTP plus the Rust client handle.
-   - Operator:
-     - Rust SDK: `wyrd-ai` `operator_connections::` 4/4.
-     - Python: `sdks/wyrd-sdk-python/tests/integration/test_operator_connections.py`, 4 passed. `renew_encryption` and its `.pyi` are authored.
-     - TypeScript: `operator-connections.test.ts`, 4 passed. `renewEncryption`; `index.d.ts` regenerated by `mise run ts:build`.
-     - CLI: `card_lifecycle::pg_tests::cli_manages_redacted_operator_connections`.
-     - MCP: `operator_connections.renew_encryption`, with the discovery and connectivity catalogs at 52 tools.
-   - Gateway:
-     - CLI: `gateway_server_journey::gateway_commands_manage_redacted_tenant_configuration`.
-     - MCP and HTTP: `agent_administers_redacted_gateway_configuration`. Its MCP RED was behavioral: "unknown Wyrd MCP tool" and catalog 51 vs 52.
-   - Trusted issuer CLI: `wyrd-cli/tests/secret_sources.rs::trusted_issuer_renew_encryption_sends_no_secret`. RED: "unrecognized subcommand 'renew-encryption'" (behavioral). GREEN: `secret_sources::` 5/5.
-   - Platform client: in the platform test above.
-   - MCP command: `PG` + `cargo nextest run --locked -p wyrd-mcp --test mcp --run-ignored all -E 'test(/^gateway::/) | test(/^discovery::/) | test(/^connectivity::/) | test(/^operators::/)'`, 8/8.
+   **Evidence (projections).** Renewal ships through HTTP and the CLI only. The Operator handle's `renew_encryption` is gated on wyrd-client's `internal` feature, which the CLI enables and `wyrd-ai` never does (`check:deps`); Gateway mutation stays on the non-SDK `CredentialWriter`.
+   - HTTP: every owner test above.
+   - CLI:
+     - Operator: `card_lifecycle::pg_tests::cli_manages_redacted_operator_connections`.
+     - Gateway: `gateway_server_journey::gateway_commands_manage_redacted_tenant_configuration`.
+     - Trusted issuer: `wyrd-cli/tests/secret_sources.rs::trusted_issuer_renew_encryption_sends_no_secret`. RED: "unrecognized subcommand 'renew-encryption'" (behavioral). GREEN: `secret_sources::` 5/5.
+     - Human and platform connections have no CLI surface; they renew over HTTP.
    - CLI command: `mise exec -- cargo build --locked -p wyrd-cli -p wyrd-server --bins`, then `PG` + `cargo nextest run --locked -p wyrd-cli --test cli -E '<selector>'`.
-   - Docs: `docs/src/content/docs/reference/stored-secret-encryption.md` § "Renew, replace, or revoke a stored secret" separates encryption renewal, replacement, Wyrd revoke, and upstream revocation. `reference/mcp-tools.md` has both new tool rows.
-   - Limit (ambiguous wording): "Rust/Python/TypeScript SDKs" for every owner conflicts with the approved no-SDK Gateway mutation boundary and with auth owners that have no SDK surface. The smallest decision needed is whether the auth owners and the platform connection need new SDK projections (a new public surface) or whether their existing surfaces suffice.
+   - Docs: `docs/src/content/docs/reference/stored-secret-encryption.md` § "Renew, replace, or revoke a stored secret" separates encryption renewal, replacement, Wyrd revoke, and upstream revocation.
 
 ## Verification and handoff
 
-**Final regression (after fmt):** server lib 36/36; integration (Operator routes and delivery, identity rotation and restart, platform) 13/13; MCP 8/8; CLI 7/7.
+**Final regression (after fmt):** server lib 36/36; admin routes 18/18; integration (Operator routes and delivery, identity rotation and restart, platform) 13/13; CLI 7/7; unchanged MCP 8/8 and Rust SDK 10/10 after the projections were removed.
 
-**Checks run:** `mise run fmt`, `mise run lints`, `mise run codegen:check`, `mise run check:deps`, `mise run check:tenant-isolation`, `py:format:check`, `py:lints`, `py:typecheck`, `ts:format:check`, `ts:lints`, `ts:typecheck`, `ts:napi:check`, `docs:generate`, `docs:check`, and `git diff --check`; all exit 0. No hot-path code changed. Renewal runs only on admin request paths, and its one remote wait is the KMS renew, which runs outside any transaction. No migration was added.
+**Checks run:** `mise run fmt`, `mise run lints`, `mise run codegen:check`, `mise run check:deps`, `mise run check:tenant-isolation`, `py:lints`, `py:typecheck`, `ts:typecheck`, `ts:napi:check` (SDK surfaces unchanged), `docs:generate`, `docs:check`, and `git diff --check`; all exit 0. No hot-path code changed. Renewal runs only on admin request paths, and its one remote wait is the KMS renew, which runs outside any transaction. No migration was added.
 
 **TDD compliance: VIOLATED.**
 - Production code came before its executed RED for:
-  - the Operator MCP tool;
   - the Gateway CLI verb (its first RED run used the wrong selector);
-  - Python and TypeScript `renew_encryption`, whose RED was not executed.
+  - the trusted-issuer and platform outage and race tests.
 - Gateway owner, human connection, and trusted issuer RED were compile-only.
 - Each case has a GREEN behavioral test.
 
 
 Reuse `wyrd-server` integration and `wyrd-auth` PG tests for owner state/races;
-Rust SDK integration, Python integration, TypeScript integration, CLI and MCP
-journey targets for projections. Existing module/file owners include Operator
+CLI journey targets for projections. Existing module/file owners include Operator
 connections, Gateway administration, identity, and platform journeys. Discover
 the actual new test selectors and record focused setup-aware commands before
 RED. Available environment-owning runners are `mise run test:operators:integration`,
 `mise run test:wyrdstate:journey`, `mise run test:gateway:journey`,
 `mise run test:identity:journey`, and `mise run test:platform:journey`.
-Full language gates (`verify:rust-sdk`, `verify:python-sdk`,
-`verify:typescript-sdk`) and combined journey runs belong to integrated review;
-use their actual package/feature/setup recipes for focused task execution.
+Combined journey runs belong to integrated review.
 
 Run affected owner/projection tests, `mise run codegen:check`,
 `mise run check:deps`, `mise run check:tenant-isolation`, Rust format/lints,
-Python format/lints/typecheck, TypeScript format/lints/typecheck and native
-declaration checks for the changed surfaces, and `mise run docs:check`.
+and `mise run docs:check`.
 If runtime hot-path code changes, enumerate added/moved external waits and
 their authority. Benchmarks are not assigned by this task and require an
 explicit maintainer request for the current change.
 
-Output: tested, documented resource actions on every required surface. Task 4
+Output: tested, documented resource actions over HTTP and the CLI. Task 4
 is independent after Task 2; selected-secret actions do not depend on a new
 deployment maintenance framework or provider key-admin privileges.

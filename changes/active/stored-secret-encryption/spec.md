@@ -161,8 +161,8 @@ Validation, encryption, provider, or commit failure leaves prior committed state
 intact. Responses, errors, logs, and audit expose redacted metadata, never keys
 or secret plaintext. Transient key/plaintext buffers use the shared redaction
 and zeroization facilities. No generic plaintext-decryption or database-selector
-API is introduced. Rotate/Revoke ship through HTTP, CLI, Rust/Python/TypeScript
-SDKs, and scoped MCP writes using the resource's existing permission boundary.
+API is introduced. Rotate/Revoke ship through HTTP and the CLI using the
+resource's existing permission boundary; SDKs and MCP do not expose them.
 UI buttons are deferred.
 
 **REQ-009 — Retain runtime lifecycle.** Committed actions use existing owner

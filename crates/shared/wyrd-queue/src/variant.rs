@@ -312,11 +312,26 @@ impl EncodedVariant {
     /// depth limit.
     pub fn from_builder(builder: VariantBuilder) -> Result<Self, VariantViolation> {
         let (metadata, value) = builder.finish();
+        Self::check_built(&metadata, &value)?;
+        Ok(Self { metadata, value })
+    }
+
+    /// Check bytes a Variant builder in this process wrote against the
+    /// Bifrost limits, without copying them.
+    ///
+    /// The builder is the encoding authority, so only the size limit and the
+    /// explicit-stack scan run; upstream's recursive validation is reserved
+    /// for raw input ([`Self::validate_bytes`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VariantViolation::TooLarge`] past the size limit, and the
+    /// scan's violation, such as [`VariantViolation::TooDeep`], otherwise.
+    fn check_built(metadata: &[u8], value: &[u8]) -> Result<(), VariantViolation> {
         Self::within_size_limit(metadata.len() + value.len())?;
         let parsed =
-            VariantMetadata::try_new(&metadata).map_err(|_| invalid(&JsonPointer::default()))?;
-        scan_encoded(parsed, &value).finish()?;
-        Ok(Self { metadata, value })
+            VariantMetadata::try_new(metadata).map_err(|_| invalid(&JsonPointer::default()))?;
+        scan_encoded(parsed, value).finish()
     }
 
     /// Check already-encoded Variant bytes after full validation, keeping no
@@ -740,6 +755,109 @@ impl VariantColumnBuilder {
             ],
             nulls,
         ))
+    }
+}
+
+/// One Variant column whose values are built in place, row by row.
+///
+/// Where [`VariantColumnBuilder`] copies values already encoded elsewhere,
+/// this encodes each value straight into the column's buffers and checks it
+/// there, under exactly the rules of [`EncodedVariant::from_builder`], so no
+/// value is staged in its own allocation. A caller that must reject a group
+/// of rows together takes a [`Self::checkpoint`] before the group and
+/// [`Self::rollback`]s to it, which leaves the column as if the group had
+/// never been appended. [`Self::finish`] yields the canonical storage struct
+/// with `Binary` children, byte for byte what [`VariantColumnBuilder`]
+/// produces for the same values.
+#[derive(Debug)]
+pub struct VariantColumnEncoder {
+    /// The column under construction.
+    rows: parquet_variant_compute::VariantArrayBuilder,
+}
+
+impl Default for VariantColumnEncoder {
+    /// An empty column with no reserved rows.
+    fn default() -> Self {
+        Self::with_capacity(0)
+    }
+}
+
+impl VariantColumnEncoder {
+    /// Start an empty column sized for `rows` values.
+    #[must_use]
+    pub fn with_capacity(rows: usize) -> Self {
+        Self {
+            rows: parquet_variant_compute::VariantArrayBuilder::new(rows),
+        }
+    }
+
+    /// Encode one row with `build` and check it under the Bifrost limits.
+    ///
+    /// `build` must append exactly one value to the builder it is given. On
+    /// success returns the row's encoded `metadata` and `value` bytes; a
+    /// refused row is removed again, so the column is unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns the violation [`EncodedVariant::from_builder`] would return for
+    /// the same value.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `build` appends no value, which is a caller defect.
+    pub fn append(
+        &mut self,
+        build: impl FnOnce(&mut parquet_variant_compute::VariantArrayBuilder),
+    ) -> Result<usize, VariantViolation> {
+        let before = self.rows.checkpoint();
+        build(&mut self.rows);
+        assert_ne!(
+            self.rows.checkpoint(),
+            before,
+            "a row build appends a value"
+        );
+        let (metadata, value) = self
+            .rows
+            .last_value_bytes()
+            .expect("a built row is a present value");
+        let encoded = metadata.len() + value.len();
+        match EncodedVariant::check_built(metadata, value) {
+            Ok(()) => Ok(encoded),
+            Err(violation) => {
+                self.rows.rollback(before);
+                Err(violation)
+            }
+        }
+    }
+
+    /// The column state after its last complete row, for [`Self::rollback`].
+    #[must_use]
+    pub fn checkpoint(&self) -> parquet_variant_compute::VariantArrayCheckpoint {
+        self.rows.checkpoint()
+    }
+
+    /// Discard every row appended since `checkpoint`, which must come from
+    /// this column.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `checkpoint` is ahead of the column.
+    pub fn rollback(&mut self, checkpoint: parquet_variant_compute::VariantArrayCheckpoint) {
+        self.rows.rollback(checkpoint);
+    }
+
+    /// Finish the canonical storage struct column.
+    ///
+    /// # Errors
+    ///
+    /// Returns the Arrow error when either child exceeds `i32` offsets.
+    pub fn finish(self) -> Result<ArrayRef, ArrowError> {
+        let (_, children, nulls) = self.rows.build_binary()?.into_inner().into_parts();
+        Ok(Arc::new(StructArray::try_new(
+            variant_storage_fields(),
+            children,
+            nulls,
+        )?))
     }
 }
 
@@ -2501,5 +2619,80 @@ mod tests {
         writer.finish().expect("finishes");
         let rows: Value = serde_json::from_slice(&writer.into_inner()).expect("json");
         assert_eq!(rows, json!([{"r": null}]));
+    }
+
+    /// Encode `{"z": .., "a": .., "z": ..}` the way an attribute writer does:
+    /// keys are inserted last first, so `z` gets dictionary id 0.
+    fn attribute_object(builder: &mut impl VariantBuilderExt, tag: i64) {
+        let mut object = builder.new_object();
+        object.insert("z", tag);
+        object.insert("a", "text");
+        let mut nested = object.new_list("items");
+        nested.append_value(1.5_f64);
+        nested.append_value(i64::MIN);
+        nested.finish();
+        object.finish();
+    }
+
+    /// Nest one integer `depth` lists deep.
+    fn nested_lists(builder: &mut impl VariantBuilderExt, depth: u32) {
+        if depth == 0 {
+            builder.append_value(1_i64);
+            return;
+        }
+        let mut list = builder.new_list();
+        nested_lists(&mut list, depth - 1);
+        list.finish();
+    }
+
+    /// Values encoded in place build the column [`VariantColumnBuilder`]
+    /// builds from the same values encoded one by one, byte for byte; a
+    /// refused row and a rolled-back group leave nothing behind, and a
+    /// refusal carries the violation [`EncodedVariant::from_builder`] gives.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the two columns differ, a refused or rolled-back row
+    /// survives, or the refusal differs from the per-value one.
+    #[test]
+    fn in_place_encoding_matches_staged_values_and_rolls_back() {
+        let staged = |tag| {
+            let mut builder = VariantBuilder::new();
+            attribute_object(&mut builder, tag);
+            EncodedVariant::from_builder(builder).expect("encodes")
+        };
+        let expected = [staged(1), staged(3)]
+            .iter()
+            .map(Some)
+            .collect::<VariantColumnBuilder>()
+            .finish();
+
+        let mut encoder = VariantColumnEncoder::with_capacity(2);
+        let bytes = encoder
+            .append(|row| attribute_object(row, 1))
+            .expect("first row");
+        assert_eq!(bytes, staged(1).encoded_bytes());
+
+        let group = encoder.checkpoint();
+        encoder
+            .append(|row| attribute_object(row, 2))
+            .expect("grouped row");
+        let refused = encoder
+            .append(|row| nested_lists(row, VARIANT_MAX_DEPTH + 1))
+            .expect_err("past the depth limit");
+        let mut deep = VariantBuilder::new();
+        nested_lists(&mut deep, VARIANT_MAX_DEPTH + 1);
+        assert_eq!(
+            Some(refused),
+            EncodedVariant::from_builder(deep).err(),
+            "the in-place refusal is the per-value one"
+        );
+        encoder.rollback(group);
+
+        encoder
+            .append(|row| attribute_object(row, 3))
+            .expect("last row");
+        let column = encoder.finish().expect("finishes");
+        assert_eq!(column.to_data(), expected.to_data());
     }
 }

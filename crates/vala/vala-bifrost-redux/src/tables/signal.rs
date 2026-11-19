@@ -25,10 +25,11 @@ use parquet_variant::{
     VariantBuilderExt,
 };
 use std::borrow::Cow;
-use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
-use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder, VariantViolation, narrow_integer};
+use wyrd_queue::variant::{
+    EncodedVariant, VariantColumnBuilder, VariantColumnEncoder, VariantViolation, narrow_integer,
+};
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::ids::{RunId, SpanId, TraceId};
@@ -103,8 +104,30 @@ pub fn attributes_variant(
     attributes: &[KeyValue],
 ) -> Result<EncodedVariant, VariantFailure> {
     let mut builder = VariantBuilder::new();
-    append_object(&mut builder, attributes);
+    append_object(&mut builder, attributes, &mut Vec::new());
     finish_variant(field, builder)
+}
+
+/// Encode one `OTLP` attribute collection as the next row of `column`.
+///
+/// The object is written straight into the column and checked there under
+/// the rules [`attributes_variant`] applies, so it is never staged in its own
+/// buffers. `scratch` is the request's duplicate-key stack, which it leaves
+/// as it found it. Returns the row's encoded bytes.
+///
+/// # Errors
+///
+/// Returns the same [`VariantFailure`] [`attributes_variant`] returns for
+/// `field`; the column is then unchanged.
+pub fn append_attributes(
+    column: &mut VariantColumnEncoder,
+    field: &'static str,
+    attributes: &[KeyValue],
+    scratch: &mut Vec<usize>,
+) -> Result<usize, VariantFailure> {
+    column
+        .append(|row| append_object(row, attributes, scratch))
+        .map_err(|violation| VariantFailure { field, violation })
 }
 
 /// Project one `OTLP` value into a Variant of the same type.
@@ -123,7 +146,7 @@ pub fn any_value_variant(
     value: &AnyValue,
 ) -> Result<EncodedVariant, VariantFailure> {
     let mut builder = VariantBuilder::new();
-    append_any_value(&mut builder, value.value.as_ref());
+    append_any_value(&mut builder, value.value.as_ref(), &mut Vec::new());
     finish_variant(field, builder)
 }
 
@@ -146,7 +169,14 @@ fn finish_variant(
 }
 
 /// Append one `OTLP` value at any Variant builder position.
-fn append_any_value(builder: &mut impl VariantBuilderExt, value: Option<&Value>) {
+///
+/// `scratch` is the duplicate-key stack every nested object of one value
+/// shares; see [`push_final_entries`].
+fn append_any_value(
+    builder: &mut impl VariantBuilderExt,
+    value: Option<&Value>,
+    scratch: &mut Vec<usize>,
+) {
     match value {
         None => builder.append_value(Variant::Null),
         Some(Value::StringValue(text)) => builder.append_value(text.as_str()),
@@ -156,44 +186,99 @@ fn append_any_value(builder: &mut impl VariantBuilderExt, value: Option<&Value>)
         Some(Value::BytesValue(bytes)) => builder.append_value(Variant::Binary(bytes)),
         Some(Value::ArrayValue(array)) => {
             let mut list = builder.new_list();
-            append_items(&mut list, &array.values);
+            append_items(&mut list, &array.values, scratch);
             list.finish();
         }
-        Some(Value::KvlistValue(list)) => append_object(builder, &list.values),
+        Some(Value::KvlistValue(list)) => append_object(builder, &list.values, scratch),
     }
 }
 
 /// Append every `OTLP` array item to an open Variant list.
-fn append_items<S: BuilderSpecificState>(list: &mut ListBuilder<'_, S>, items: &[AnyValue]) {
+fn append_items<S: BuilderSpecificState>(
+    list: &mut ListBuilder<'_, S>,
+    items: &[AnyValue],
+    scratch: &mut Vec<usize>,
+) {
     for item in items {
-        append_any_value(list, item.value.as_ref());
+        append_any_value(list, item.value.as_ref(), scratch);
     }
+}
+
+/// Push the positions of `entries` that survive duplicate-key resolution onto
+/// `scratch`, returning where they start.
+///
+/// The final occurrence of each key wins, and the survivors are left in
+/// descending original position, the order [`append_object`] has always
+/// written them in, so the Variant dictionary assigns the same field ids.
+/// Positions are sorted by key and then position instead of hashed, so
+/// attacker-chosen keys cost `O(n log n)` comparisons and no allocation
+/// beyond the stack's growth. A nested object pushes its own frame above its
+/// parent's and truncates back to it, so one stack serves a whole value.
+fn push_final_entries(entries: &[KeyValue], scratch: &mut Vec<usize>) -> usize {
+    let start = scratch.len();
+    scratch.extend(0..entries.len());
+    let frame = &mut scratch[start..];
+    frame.sort_unstable_by(|left, right| {
+        entries[*left]
+            .key
+            .cmp(&entries[*right].key)
+            .then(left.cmp(right))
+    });
+    let mut kept = 0;
+    for position in 0..frame.len() {
+        let last_of_key = frame
+            .get(position + 1)
+            .is_none_or(|next| entries[*next].key != entries[frame[position]].key);
+        if last_of_key {
+            frame[kept] = frame[position];
+            kept += 1;
+        }
+    }
+    frame[..kept].sort_unstable_by(|left, right| right.cmp(left));
+    scratch.truncate(start + kept);
+    start
+}
+
+/// Count the distinct keys in one `OTLP` attribute collection.
+///
+/// OTLP carries a logical map as repeated entries, so a duplicated key is one
+/// key for cardinality purposes and resolves to its final value on read.
+#[must_use]
+pub fn distinct_keys(entries: &[KeyValue]) -> usize {
+    let mut scratch = Vec::new();
+    push_final_entries(entries, &mut scratch);
+    scratch.len()
 }
 
 /// Append one `OTLP` key-value collection as a Variant object.
 ///
-/// Entries are visited from the last to the first and a key already written
-/// is skipped, so the final occurrence of a repeated key is the one stored.
+/// Only the final occurrence of a repeated key is stored, and survivors are
+/// written from the last to the first, as [`push_final_entries`] orders them.
 /// Variant objects order their keys by name, so visiting order changes
 /// nothing else. A present key whose value is unset is stored as a Variant
 /// null, which stays distinct from an absent key.
-fn append_object(builder: &mut impl VariantBuilderExt, entries: &[KeyValue]) {
+fn append_object(
+    builder: &mut impl VariantBuilderExt,
+    entries: &[KeyValue],
+    scratch: &mut Vec<usize>,
+) {
+    let start = push_final_entries(entries, scratch);
+    let end = scratch.len();
     let mut object = builder.new_object();
-    let mut written: HashSet<&str> = HashSet::with_capacity(entries.len());
-    for entry in entries.iter().rev() {
-        if !written.insert(entry.key.as_str()) {
-            continue;
-        }
+    for position in start..end {
+        let entry = &entries[scratch[position]];
         match entry.value.as_ref().and_then(|value| value.value.as_ref()) {
             // A field builder would treat null as an absent key.
             None => object.insert(&entry.key, Variant::Null),
             Some(value) => append_any_value(
                 &mut ObjectFieldBuilder::new(&entry.key, &mut object),
                 Some(value),
+                scratch,
             ),
         }
     }
     object.finish();
+    scratch.truncate(start);
 }
 
 /// Build one Variant column from encoded values; `None` is a null row.
@@ -224,47 +309,43 @@ pub fn variant_column<'a>(
 
 /// Build one `resource_entity_refs` list column from flattened references.
 ///
-/// `lengths` holds one entry per row, as for [`list_column`]; every reference
-/// keeps its type, both ordered key lists, and its schema URL.
+/// `refs` yields every row's references in row order and `lengths` holds one
+/// entry per row, as for [`list_column`]; every reference keeps its type, both
+/// ordered key lists, and its schema URL. The references are borrowed, so a
+/// resource repeated on many rows is copied only into the column.
 ///
 /// # Errors
 ///
 /// Returns [`TableError::Internal`] when the assembled column does not match
 /// [`ENTITY_REF_ELEMENT`], which would mean the ledger and this builder drift.
-pub fn entity_refs_column(
-    refs: &[EntityRef],
+pub fn entity_refs_column<'a>(
+    refs: impl Iterator<Item = &'a EntityRef> + Clone,
     lengths: &[Option<usize>],
 ) -> Result<ArrayRef, TableError> {
+    let refs: Vec<&EntityRef> = refs.collect();
+    let text = |select: fn(&EntityRef) -> &str| {
+        utf8_opt_column_from(refs.iter().map(|entity| Some(select(entity))))
+    };
     let key_element = ENTITY_REF_KEY_ELEMENT.to_arrow();
     let keys = |select: fn(&EntityRef) -> &[String]| {
-        let values: Vec<String> = refs
-            .iter()
-            .flat_map(|entity| select(entity).to_vec())
-            .collect();
         let lengths: Vec<Option<usize>> = refs
             .iter()
             .map(|entity| Some(select(entity).len()))
             .collect();
-        list_column(&key_element, utf8_column(&values), &lengths).map_err(internal)
+        let names: Vec<&str> = refs
+            .iter()
+            .flat_map(|entity| select(entity).iter().map(String::as_str))
+            .collect();
+        list_column(&key_element, utf8_column(&names), &lengths).map_err(internal)
     };
     let element = ENTITY_REF_ELEMENT.to_arrow();
     let entities = struct_column(
         &nested_fields(&element)?,
         vec![
-            utf8_column(
-                &refs
-                    .iter()
-                    .map(|entity| entity.r#type.clone())
-                    .collect::<Vec<_>>(),
-            ),
+            text(|entity| &entity.r#type),
             keys(|entity| &entity.id_keys)?,
             keys(|entity| &entity.description_keys)?,
-            utf8_column(
-                &refs
-                    .iter()
-                    .map(|entity| entity.schema_url.clone())
-                    .collect::<Vec<_>>(),
-            ),
+            text(|entity| &entity.schema_url),
         ],
         None,
     )
@@ -316,23 +397,24 @@ pub fn promoted_int(attributes: &[KeyValue], key: &str) -> Option<i64> {
 /// them from their own attributes. Each value is null when its source is
 /// absent or is not a string.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct ExceptionPromotions {
+pub struct ExceptionPromotions<'a> {
     /// `exception.type`.
-    pub exception_type: Option<String>,
+    pub exception_type: Option<&'a str>,
     /// `exception.message`.
-    pub message: Option<String>,
+    pub message: Option<&'a str>,
     /// `exception.stacktrace`.
-    pub stacktrace: Option<String>,
+    pub stacktrace: Option<&'a str>,
 }
 
-impl ExceptionPromotions {
-    /// Read the three exception conventions from one attribute set.
+impl<'a> ExceptionPromotions<'a> {
+    /// Read the three exception conventions from one attribute set, borrowing
+    /// their text from it.
     #[must_use]
-    pub fn from_attributes(attributes: &[KeyValue]) -> Self {
+    pub fn from_attributes(attributes: &'a [KeyValue]) -> Self {
         Self {
-            exception_type: promoted_string(attributes, "exception.type"),
-            message: promoted_string(attributes, "exception.message"),
-            stacktrace: promoted_string(attributes, "exception.stacktrace"),
+            exception_type: last_string_attribute(attributes, "exception.type"),
+            message: last_string_attribute(attributes, "exception.message"),
+            stacktrace: last_string_attribute(attributes, "exception.stacktrace"),
         }
     }
 
@@ -345,10 +427,10 @@ impl ExceptionPromotions {
     /// Returns the promoted text bytes these values add to one row.
     #[must_use]
     pub fn bytes(&self) -> usize {
-        [&self.exception_type, &self.message, &self.stacktrace]
+        [self.exception_type, self.message, self.stacktrace]
             .into_iter()
             .flatten()
-            .map(String::len)
+            .map(str::len)
             .sum()
     }
 }
@@ -533,6 +615,29 @@ impl ResourcePromotionColumns {
             .push(resource.telemetry_sdk_language.clone());
         self.telemetry_sdk_version
             .push(resource.telemetry_sdk_version.clone());
+    }
+
+    /// Build the nine columns in ledger order directly from each row's
+    /// promotions, borrowing them rather than staging per-row copies.
+    #[must_use]
+    pub fn from_rows<'a>(
+        rows: impl ExactSizeIterator<Item = &'a ResourcePromotions> + Clone,
+    ) -> [ArrayRef; 9] {
+        let text = |pick: fn(&ResourcePromotions) -> Option<&str>| {
+            utf8_opt_column_from(rows.clone().map(pick))
+        };
+        let subject = || arrow::array::new_null_array(&DataType::Utf8, rows.len());
+        [
+            text(|row| row.service_namespace.as_deref()),
+            text(|row| row.service_instance_id.as_deref()),
+            i64_opt_column(rows.clone().map(|row| row.process_pid).collect()),
+            text(|row| row.telemetry_sdk_name.as_deref()),
+            text(|row| row.telemetry_sdk_language.as_deref()),
+            text(|row| row.telemetry_sdk_version.as_deref()),
+            subject(),
+            subject(),
+            subject(),
+        ]
     }
 
     /// Build the nine columns in ledger order: the six promotions, then the
@@ -803,24 +908,26 @@ pub fn without_correlation_columns(batch: &RecordBatch) -> Result<RecordBatch, T
     .map_err(|error| TableError::Internal(format!("ledger projection: {error}")))
 }
 
-/// Build a non-nullable UTF-8 column.
+/// Build a non-nullable UTF-8 column from owned or borrowed text.
 #[must_use]
-pub fn utf8_column(values: &[String]) -> ArrayRef {
-    utf8_opt_column_from(values.iter().map(|value| Some(value.as_str())))
+pub fn utf8_column(values: &[impl AsRef<str>]) -> ArrayRef {
+    utf8_opt_column_from(values.iter().map(|value| Some(value.as_ref())))
 }
 
-/// Build a nullable UTF-8 column.
+/// Build a nullable UTF-8 column from owned or borrowed text.
 #[must_use]
-pub fn utf8_opt_column(values: &[Option<String>]) -> ArrayRef {
-    utf8_opt_column_from(values.iter().map(Option::as_deref))
+pub fn utf8_opt_column(values: &[Option<impl AsRef<str>>]) -> ArrayRef {
+    utf8_opt_column_from(values.iter().map(|value| value.as_ref().map(AsRef::as_ref)))
 }
 
 /// Build a UTF-8 column whose offsets and bytes are allocated once.
 ///
 /// The values are walked once to total their bytes, then appended into a
 /// builder of that exact capacity; a column without nulls carries no validity
-/// buffer, as Arrow's own constructors produce.
-fn utf8_opt_column_from<'a>(
+/// buffer, as Arrow's own constructors produce. Projections that repeat one
+/// envelope's text per row pass a borrowing iterator, so the text is copied
+/// only into the column.
+pub fn utf8_opt_column_from<'a>(
     values: impl ExactSizeIterator<Item = Option<&'a str>> + Clone,
 ) -> ArrayRef {
     let bytes = values
@@ -839,9 +946,12 @@ fn utf8_opt_column_from<'a>(
 /// # Errors
 ///
 /// Returns a stable reason when a value does not match the declared width.
-pub fn fixed_binary_column(width: i32, values: &[Vec<u8>]) -> Result<ArrayRef, &'static str> {
+pub fn fixed_binary_column(
+    width: i32,
+    values: &[impl AsRef<[u8]>],
+) -> Result<ArrayRef, &'static str> {
     FixedSizeBinaryArray::try_from_sparse_iter_with_size(
-        values.iter().map(|value| Some(value.as_slice())),
+        values.iter().map(|value| Some(value.as_ref())),
         width,
     )
     .map(|array| Arc::new(array) as ArrayRef)
@@ -855,10 +965,10 @@ pub fn fixed_binary_column(width: i32, values: &[Vec<u8>]) -> Result<ArrayRef, &
 /// Returns a stable reason when a present value does not match `width`.
 pub fn fixed_binary_opt_column(
     width: i32,
-    values: &[Option<Vec<u8>>],
+    values: &[Option<impl AsRef<[u8]>>],
 ) -> Result<ArrayRef, &'static str> {
     FixedSizeBinaryArray::try_from_sparse_iter_with_size(
-        values.iter().map(|value| value.as_ref().map(Vec::as_slice)),
+        values.iter().map(|value| value.as_ref().map(AsRef::as_ref)),
         width,
     )
     .map(|array| Arc::new(array) as ArrayRef)

@@ -54,27 +54,23 @@ pub(crate) fn refuse_forged_log_derivations(batch: &RecordBatch) -> Result<(), B
             })
     };
     let (attributes, body) = (column("attributes")?, column("body")?);
-    let mut exception = Vec::with_capacity(batch.num_rows());
+    let mut stored = Vec::with_capacity(batch.num_rows());
     let mut body_text = Vec::with_capacity(batch.num_rows());
     for row in 0..batch.num_rows() {
-        exception.push(ExceptionPromotions::from_attributes(&stored_attributes(
-            attributes.as_ref(),
-            row,
-        )?));
+        stored.push(stored_attributes(attributes.as_ref(), row)?);
         body_text.push(stored_text(body.as_ref(), row)?);
     }
-    let text = |pick: fn(&ExceptionPromotions) -> &Option<String>| {
-        utf8_opt_column(
-            &exception
-                .iter()
-                .map(|row| pick(row).clone())
-                .collect::<Vec<_>>(),
-        )
+    let exception: Vec<ExceptionPromotions<'_>> = stored
+        .iter()
+        .map(|attributes| ExceptionPromotions::from_attributes(attributes))
+        .collect();
+    let text = |pick: for<'r> fn(&ExceptionPromotions<'r>) -> Option<&'r str>| {
+        utf8_opt_column(&exception.iter().map(pick).collect::<Vec<_>>())
     };
     [
-        ("exception_type", text(|row| &row.exception_type)),
-        ("exception_message", text(|row| &row.message)),
-        ("exception_stacktrace", text(|row| &row.stacktrace)),
+        ("exception_type", text(|row| row.exception_type)),
+        ("exception_message", text(|row| row.message)),
+        ("exception_stacktrace", text(|row| row.stacktrace)),
         ("body_text", utf8_opt_column(&body_text)),
         (
             "is_exception",
@@ -355,9 +351,12 @@ impl LogColumns {
             .push(resource.promotions.deployment_environment.clone());
         self.resource_promotions.push(&resource.promotions);
         self.is_exception.push(exception.any());
-        self.exception_type.push(exception.exception_type);
-        self.exception_message.push(exception.message);
-        self.exception_stacktrace.push(exception.stacktrace);
+        self.exception_type
+            .push(exception.exception_type.map(str::to_owned));
+        self.exception_message
+            .push(exception.message.map(str::to_owned));
+        self.exception_stacktrace
+            .push(exception.stacktrace.map(str::to_owned));
         self.body_text.push(body_text);
 
         self.card_uid.push(correlation.card_uid);
@@ -393,7 +392,7 @@ impl LogColumns {
             variant_column(self.resource_attributes.iter().map(Some)),
             u32_as_i64_column(self.resource_dropped_attributes_count),
             utf8_column(&self.resource_schema_url),
-            entity_refs_column(&self.entity_refs, &self.entity_ref_lengths)?,
+            entity_refs_column(self.entity_refs.iter(), &self.entity_ref_lengths)?,
             bool_column(self.scope_present),
             utf8_column(&self.scope_name),
             utf8_column(&self.scope_version),

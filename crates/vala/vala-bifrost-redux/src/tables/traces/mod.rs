@@ -767,4 +767,161 @@ mod tests {
             Some("a promoted gen_ai attribute has the wrong type")
         );
     }
+
+    /// A request of several resource and scope groups, absent envelopes,
+    /// rejected siblings, childless spans, and repeated top-level and nested
+    /// attribute keys projects to exactly the pinned canonical bytes.
+    ///
+    /// The pin is the batch's buffer-level logical identity, the digest Gate
+    /// derives its batch id from, so any change to a value, an offset, a
+    /// validity bitmap, or a null slot's bytes changes it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the outcome counts, the first rejection reason, or any
+    /// canonical buffer byte differs from the pinned projection.
+    #[test]
+    fn multi_group_projection_matches_its_pinned_canonical_bytes() {
+        let mut request = maximal_resource_spans(maximal_span_attributes());
+        let template = request[0].scope_spans[0].spans[0].clone();
+        let bare = Span {
+            span_id: vec![9; 8],
+            parent_span_id: Vec::new(),
+            trace_state: String::new(),
+            name: "bare".to_owned(),
+            attributes: vec![
+                attribute("k", Value::StringValue("v".to_owned())),
+                attribute(
+                    "nested",
+                    Value::KvlistValue(KeyValueList {
+                        values: vec![
+                            attribute("b", Value::IntValue(1)),
+                            attribute("a", Value::IntValue(2)),
+                            attribute("b", Value::IntValue(3)),
+                        ],
+                    }),
+                ),
+                attribute("", Value::BoolValue(false)),
+                attribute("k", Value::StringValue("final".to_owned())),
+            ],
+            events: Vec::new(),
+            links: Vec::new(),
+            status: None,
+            ..template.clone()
+        };
+        let unnamed = Span {
+            name: String::new(),
+            ..template.clone()
+        };
+        request[0].scope_spans[0]
+            .spans
+            .extend([unnamed, bare.clone()]);
+        request[0].scope_spans.push(ScopeSpans {
+            scope: None,
+            schema_url: String::new(),
+            spans: vec![bare.clone()],
+        });
+        request.push(ResourceSpans {
+            resource: None,
+            schema_url: "https://schemas/resource/2".to_owned(),
+            scope_spans: vec![ScopeSpans {
+                scope: Some(InstrumentationScope {
+                    name: "other".to_owned(),
+                    version: String::new(),
+                    attributes: Vec::new(),
+                    dropped_attributes_count: 0,
+                }),
+                schema_url: "https://schemas/scope/2".to_owned(),
+                spans: vec![template, bare],
+            }],
+        });
+
+        let (batch, outcome) =
+            project_resource_spans(&request, None, usize::MAX).expect("request projects");
+
+        assert_eq!((outcome.accepted_spans, outcome.rejected_spans), (5, 1));
+        assert_eq!(
+            outcome.rejection_message.as_deref(),
+            Some("span name is empty or exceeds the accepted length")
+        );
+        let (digest, bytes) =
+            crate::scribe::preprocess::logical_data_identity(&batch).expect("identity");
+        let hex = crate::scribe::preprocess::hex_digest(&digest);
+        assert_eq!(
+            (hex.as_str(), bytes),
+            (
+                "d23a93b53e6bc545628331400cb7396dff5d03bdc66e4cc8275fc5364cff6876",
+                5407
+            )
+        );
+    }
+
+    /// A span refused by its last link's Variant, after its own, its events',
+    /// and its earlier links' attributes already encoded, leaves exactly the
+    /// batch a request without it projects: no attribute, event, or link row
+    /// of it survives, and the spans around it are unchanged.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the refused span leaves any row behind or is not refused
+    /// with the catalogued depth code.
+    #[test]
+    fn a_span_refused_by_its_last_link_variant_leaves_no_rows_behind() {
+        use wyrd_spec::vala::api::VARIANT_MAX_DEPTH;
+        use wyrd_tonic::otlp::common::v1::ArrayValue;
+        use wyrd_tonic::otlp::trace::v1::span::Link;
+
+        let mut deep = AnyValue {
+            value: Some(Value::IntValue(1)),
+        };
+        for _ in 0..VARIANT_MAX_DEPTH {
+            deep = AnyValue {
+                value: Some(Value::ArrayValue(ArrayValue { values: vec![deep] })),
+            };
+        }
+        let mut without = maximal_resource_spans(maximal_span_attributes());
+        let template = without[0].scope_spans[0].spans[0].clone();
+        assert!(
+            !template.events.is_empty() && !template.links.is_empty(),
+            "the refused span encodes events and links before its failing link"
+        );
+        let after = Span {
+            span_id: vec![7; 8],
+            ..template.clone()
+        };
+        let mut refused = Span {
+            span_id: vec![8; 8],
+            ..template.clone()
+        };
+        refused.links.push(Link {
+            attributes: vec![KeyValue {
+                key: "deep".to_owned(),
+                value: Some(deep),
+            }],
+            ..template.links[0].clone()
+        });
+        without[0].scope_spans[0].spans = vec![template.clone(), after.clone()];
+        let mut with = without.clone();
+        with[0].scope_spans[0].spans = vec![template, refused, after];
+
+        let (expected, _) =
+            project_resource_spans(&without, None, usize::MAX).expect("request projects");
+        let (batch, outcome) =
+            project_resource_spans(&with, None, usize::MAX).expect("request projects");
+
+        assert_eq!((outcome.accepted_spans, outcome.rejected_spans), (2, 1));
+        assert!(
+            outcome
+                .rejection_message
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("WYRD_VALA_400_VARIANT_TOO_DEEP")),
+            "{:?}",
+            outcome.rejection_message
+        );
+        assert_eq!(batch, expected);
+        assert_eq!(
+            crate::scribe::preprocess::logical_data_identity(&batch).expect("identity"),
+            crate::scribe::preprocess::logical_data_identity(&expected).expect("identity"),
+        );
+    }
 }

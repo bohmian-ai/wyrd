@@ -883,7 +883,7 @@ fn notify_completion(
 ///
 /// Only diagnostics use this: the durable identity always compares raw bytes.
 #[must_use]
-fn hex_digest(digest: &[u8; 32]) -> String {
+pub(crate) fn hex_digest(digest: &[u8; 32]) -> String {
     use std::fmt::Write as _;
     digest
         .iter()

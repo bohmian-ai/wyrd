@@ -41,7 +41,7 @@ pub const MEMORY_CATEGORY_COUNT: usize = 8;
 /// that own their buffers are unaffected, so a projected or OTLP batch measures
 /// exactly what Arrow reports for it.
 pub(crate) fn retained_arrow_bytes(batch: &arrow::record_batch::RecordBatch) -> usize {
-    let mut charged = std::collections::HashSet::new();
+    let mut charged = Allocations::new();
     batch.columns().iter().fold(0_usize, |total, column| {
         total.saturating_add(retained_array_bytes(&column.to_data(), &mut charged))
     })
@@ -73,7 +73,7 @@ pub(crate) fn unshared_arrow_bytes(
 /// holder is walked once rather than once per charge.
 pub(crate) fn unshared_beyond(
     source: &[arrow::record_batch::RecordBatch],
-    mut charged: std::collections::HashSet<(usize, usize)>,
+    mut charged: Allocations,
 ) -> usize {
     source
         .iter()
@@ -106,27 +106,33 @@ pub(crate) fn unshared_ipc_bytes(
 /// [`retained_arrow_bytes`] keys them.
 pub(crate) fn allocations<'a>(
     columns: impl IntoIterator<Item = &'a arrow::array::ArrayRef>,
-) -> std::collections::HashSet<(usize, usize)> {
-    let mut charged = std::collections::HashSet::new();
+) -> Allocations {
+    let mut charged = Allocations::new();
     for column in columns {
         retained_array_bytes(&column.to_data(), &mut charged);
     }
     charged
 }
 
+/// Distinct allocations, each keyed by its start address and capacity, kept
+/// sorted so a lookup is a binary search.
+///
+/// A batch keeps tens of allocations alive, so a sorted vector finds and
+/// inserts them faster than hashing each key, and is one allocation.
+pub(crate) type Allocations = Vec<(usize, usize)>;
+
 /// Charges one array's own allocations, then its children's, once each.
 ///
-/// `charged` carries the allocations already counted for this batch. The key is
-/// the allocation start and its capacity, so two views into one buffer collapse
-/// to one charge while two equally sized distinct buffers stay separate.
-fn retained_array_bytes(
-    data: &arrow::array::ArrayData,
-    charged: &mut std::collections::HashSet<(usize, usize)>,
-) -> usize {
+/// `charged` carries the allocations already counted for this batch, sorted.
+/// The key is the allocation start and its capacity, so two views into one
+/// buffer collapse to one charge while two equally sized distinct buffers stay
+/// separate.
+fn retained_array_bytes(data: &arrow::array::ArrayData, charged: &mut Allocations) -> usize {
     let mut total = size_of::<arrow::array::ArrayData>();
     let mut charge = |buffer: &arrow::buffer::Buffer, total: &mut usize| {
         let allocation = (buffer.data_ptr().as_ptr() as usize, buffer.capacity());
-        if charged.insert(allocation) {
+        if let Err(at) = charged.binary_search(&allocation) {
+            charged.insert(at, allocation);
             *total = total.saturating_add(buffer.capacity());
         }
     };

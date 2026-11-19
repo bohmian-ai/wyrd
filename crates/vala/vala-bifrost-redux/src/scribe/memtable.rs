@@ -2369,7 +2369,7 @@ impl ReadableSource {
         let Some(((run, at), _)) = selected.peek() else {
             return Ok(());
         };
-        let first = physical_projection(&self.runs[*run].batches[*at], &schema, &projection);
+        let first = physical_projection(&self.runs[*run].batches[*at], &schema, &projection, None);
         let requirements = requirements
             .map(|requirements| {
                 requirements
@@ -2379,6 +2379,7 @@ impl ReadableSource {
             .transpose()?;
         let mut source = PreparedSource {
             source: self.clone(),
+            physical: Arc::clone(first.schema_ref()),
             schema,
             projection,
             requirements,
@@ -2830,6 +2831,9 @@ struct PreparedSource {
     schema: SchemaRef,
     /// Each required field and the source column it reads, if any.
     projection: Vec<(FieldRef, Option<usize>)>,
+    /// The first kept batch's physical projection schema, reused for every
+    /// batch that stores its projected columns in the same fields.
+    physical: SchemaRef,
     /// The read's requirements and their adaptation to the source's layout.
     requirements: Option<(ReadRequirements, AdaptedRequirements)>,
     /// The pruning predicate adapted to a learned Variant layout, filtering
@@ -2944,7 +2948,8 @@ impl PreparedSource {
                 ))
                 .map_err(refused)
         };
-        let mut physical = physical_projection(batch, &self.schema, &self.projection);
+        let mut physical =
+            physical_projection(batch, &self.schema, &self.projection, Some(&self.physical));
         let batch = if let Some((requirements, adapted)) = &self.requirements {
             let Some((batch, evaluated)) = adapted.evaluate(
                 requirements,
@@ -3088,6 +3093,10 @@ fn count_examined(
 /// of `schema`, with a projected field the batch predates filled with nulls:
 /// the stored layout a capture filters before reconstructing it in `schema`.
 ///
+/// `cached` is a schema an earlier batch's projection built; it is reused,
+/// rather than rebuilt, when `batch` stores every projected column in a field
+/// of the same type, nullability, and metadata.
+///
 /// # Panics
 ///
 /// Never in practice: every column comes from `batch` or is built at its row
@@ -3096,29 +3105,49 @@ fn physical_projection(
     batch: &RecordBatch,
     schema: &SchemaRef,
     projection: &[(FieldRef, Option<usize>)],
+    cached: Option<&SchemaRef>,
 ) -> RecordBatch {
-    let (fields, columns): (Vec<_>, Vec<_>) = projection
+    let stored = batch.schema_ref();
+    let columns = projection
         .iter()
-        .zip(schema.fields())
-        .map(|((field, source), named)| match source {
-            Some(column) => (
-                Arc::new(
-                    batch
-                        .schema_ref()
-                        .field(*column)
-                        .clone()
-                        .with_name(named.name()),
-                ),
-                Arc::clone(batch.column(*column)),
-            ),
-            None => (
-                Arc::clone(named),
-                arrow::array::new_null_array(field.data_type(), batch.num_rows()),
-            ),
+        .map(|(field, source)| match source {
+            Some(column) => Arc::clone(batch.column(*column)),
+            None => arrow::array::new_null_array(field.data_type(), batch.num_rows()),
         })
-        .unzip();
+        .collect();
+    let physical = cached
+        .filter(|cached| {
+            projection
+                .iter()
+                .zip(cached.fields())
+                .all(|((_, source), field)| {
+                    source.is_none_or(|column| {
+                        let stored = stored.field(column);
+                        stored.data_type() == field.data_type()
+                            && stored.is_nullable() == field.is_nullable()
+                            && stored.metadata() == field.metadata()
+                    })
+                })
+        })
+        .map_or_else(
+            || {
+                Arc::new(Schema::new(
+                    projection
+                        .iter()
+                        .zip(schema.fields())
+                        .map(|((_, source), named)| match source {
+                            Some(column) => {
+                                Arc::new(stored.field(*column).clone().with_name(named.name()))
+                            }
+                            None => Arc::clone(named),
+                        })
+                        .collect::<Vec<_>>(),
+                ))
+            },
+            Arc::clone,
+        );
     RecordBatch::try_new_with_options(
-        Arc::new(Schema::new(fields)),
+        physical,
         columns,
         &arrow::array::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
     )
@@ -3676,6 +3705,41 @@ pub(crate) mod tests {
 
         assert_eq!(lsns(Some(&pruning)), vec![2]);
         assert_eq!(lsns(None), vec![1, 2]);
+    }
+
+    /// A batch storing its projected columns as the first batch did reuses
+    /// that batch's physical schema; one storing a column in another type
+    /// gets a schema of its own.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the schema is rebuilt for a matching batch or reused for
+    /// a differing one.
+    #[test]
+    fn physical_projection_reuses_a_matching_schema_only() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let projection = vec![(Arc::clone(schema.fields().first().expect("field")), Some(0))];
+        let batch = |data_type: DataType| {
+            let column =
+                arrow::compute::cast(&Int64Array::from(vec![1_i64]), &data_type).expect("casts");
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("stored", data_type, true)])),
+                vec![column],
+            )
+            .expect("batch")
+        };
+        let first = physical_projection(&batch(DataType::Int64), &schema, &projection, None);
+        let cached = first.schema();
+
+        let same =
+            physical_projection(&batch(DataType::Int64), &schema, &projection, Some(&cached));
+        let other =
+            physical_projection(&batch(DataType::Utf8), &schema, &projection, Some(&cached));
+
+        assert!(Arc::ptr_eq(&same.schema(), &cached));
+        assert!(!Arc::ptr_eq(&other.schema(), &cached));
+        assert_eq!(other.schema().field(0).name(), "id");
+        assert_eq!(other.schema().field(0).data_type(), &DataType::Utf8);
     }
 
     /// Identity bounds are each column's byte-ordered extremes, skipping

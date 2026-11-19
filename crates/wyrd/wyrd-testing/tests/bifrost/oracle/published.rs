@@ -301,7 +301,8 @@ async fn prove_cancelled_read_terminates() -> Result<(), JourneyError> {
 /// query timeout keeps cancellation the cause of the terminal.
 const CANCELLED_READ_DRAIN: Duration = Duration::from_secs(15);
 
-/// A read stalled during physical planning ends at the query deadline.
+/// A read stalled during physical planning ends at the query deadline, for a
+/// SELECT and for its explanations; a cancelled analysis fails and cleans up.
 ///
 /// Physical planning reads storage: for every Iceberg-published file it keeps,
 /// the Oracle provider fetches the Parquet footer into the node's metadata
@@ -320,18 +321,24 @@ async fn planning_read_stall_ends_at_query_deadline() {
         .expect("a stalled planning read ends at the query deadline");
 }
 
-/// Stalls the first planning footer read and requires a `QueryTimeout`.
+/// Stalls the first planning footer read and requires a `QueryTimeout`, for
+/// the SELECT and both of its explanations, then cancels a running analysis.
 ///
-/// One row is written, promoted to Iceberg, and pinned, so the query plans one
-/// published file whose footer is not yet cached. The stall is held until the
-/// query has ended, so only the deadline can end it; an outer bound turns a
-/// hang into a failure instead of a stuck lane.
+/// Each statement reads its own table, written, promoted to Iceberg and
+/// pinned, so each plans one published file whose footer is not yet cached:
+/// plain `EXPLAIN` plans physically too, and `EXPLAIN ANALYZE` plans before it
+/// executes. The stall is held until the query has ended, so only the deadline
+/// can end it; an outer bound turns a hang into a failure instead of a stuck
+/// lane. A last analysis, its footer already cached, is held at its data read
+/// after admission, found through the public running list and cancelled
+/// through the public operation: it must fail rather than return a plan, and release every query
+/// resource.
 ///
 /// # Errors
 ///
 /// Returns a client, ingest, Forge, or lifecycle error, and a descriptive error
-/// when the stall is not reached, the query hangs, settles, or fails with any
-/// problem other than `QueryTimeout`.
+/// when the stall is not reached, a query hangs, settles, or fails with any
+/// problem other than the expected one.
 async fn prove_planning_read_stall_times_out() -> Result<(), JourneyError> {
     let cluster = WyrdTestCluster::start_spec_with_forge_completion_observer(
         BifrostClusterSpec::one_mixed().with_metadata_cache_mode(ScribeCacheMode::Enabled),
@@ -341,50 +348,125 @@ async fn prove_planning_read_stall_times_out() -> Result<(), JourneyError> {
         .server(0)
         .ok_or("the one-pod cluster runs one server")?;
     let tenant = cluster.data_tenant_id();
-    let table = unique_table("oracle_planning_stall");
+    let reader = writer(server, "planning-stall-reader").await?;
+    for explain in ["", "EXPLAIN ", "EXPLAIN ANALYZE "] {
+        let table = unique_table("oracle_planning_stall");
+        let fqn = format!("bifrost.bifrost.{table}");
+        register_table(server, tenant, &table).await?;
+        reader
+            .write(&fqn, &journey_schema(), [journey_row(1, "row-1")])
+            .await?;
+        server.flush_bifrost().await?;
+        compact_sealed_batch(&cluster, tenant, &table, 1).await?;
+        cluster.refresh_oracle_snapshots().await?;
+
+        let stall = server.object_reads_for_test().arm_stall();
+        let sql = format!("{explain}SELECT id FROM {fqn}");
+        let query = tokio::spawn({
+            let client = reader.client().clone();
+            let sql = sql.clone();
+            async move {
+                let mut stream = wyrd_client::Bifrost::query_only(&client)
+                    .query(&BifrostQueryRequest {
+                        sql,
+                        deadline_ms: Some(PLANNING_STALL_DEADLINE_MS),
+                        params: Vec::new(),
+                    })
+                    .await?;
+                while stream.next_batch().await?.is_some() {}
+                Ok::<_, wyrd_client::bifrost::BifrostClientError>(())
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(30), stall.wait_until_reached())
+            .await
+            .map_err(|_| format!("{sql} never reached the planning read"))?;
+        let outcome = tokio::time::timeout(Duration::from_secs(60), query)
+            .await
+            .map_err(|_| {
+                format!("{sql} stalled in planning must end at its deadline, not hang")
+            })??;
+        let code = match &outcome {
+            Err(error) => sdk_code(error),
+            Ok(()) => return Err(format!("{sql} stalled in planning settled").into()),
+        };
+        if code != "WYRD_VALA_504_QUERY_TIMEOUT" {
+            return Err(format!("{sql} stalled in planning failed as {code}: {outcome:?}").into());
+        }
+        stall.release();
+    }
+
+    // A cancelled analysis ends as a failure and releases what it held.
+    let table = unique_table("oracle_cancelled_analysis");
     let fqn = format!("bifrost.bifrost.{table}");
     register_table(server, tenant, &table).await?;
-    let reader = writer(server, "planning-stall-reader").await?;
     reader
         .write(&fqn, &journey_schema(), [journey_row(1, "row-1")])
         .await?;
     server.flush_bifrost().await?;
     compact_sealed_batch(&cluster, tenant, &table, 1).await?;
     cluster.refresh_oracle_snapshots().await?;
-
-    let stall = server.object_reads_for_test().arm_stall();
-    let query = tokio::spawn({
+    // A first read caches the file's footer, so the held read below is the
+    // analysis's data read after admission, where it is listed as running.
+    run_bound(reader.client(), &format!("SELECT id FROM {fqn}"), &[]).await?;
+    let barrier = server.object_reads_for_test().arm_stall();
+    let analysis = tokio::spawn({
         let client = reader.client().clone();
-        let sql = format!("SELECT id FROM {fqn}");
+        let sql = format!("EXPLAIN ANALYZE SELECT id FROM {fqn}");
         async move {
             let mut stream = wyrd_client::Bifrost::query_only(&client)
                 .query(&BifrostQueryRequest {
                     sql,
-                    deadline_ms: Some(PLANNING_STALL_DEADLINE_MS),
+                    deadline_ms: Some(30_000),
                     params: Vec::new(),
                 })
                 .await?;
-            while stream.next_batch().await?.is_some() {}
-            Ok::<_, wyrd_client::bifrost::BifrostClientError>(())
+            let mut plans = 0_usize;
+            while let Some(batch) = stream.next_batch().await? {
+                plans += batch.num_rows();
+            }
+            Ok::<_, wyrd_client::bifrost::BifrostClientError>(plans)
         }
     });
-    tokio::time::timeout(Duration::from_secs(30), stall.wait_until_reached())
+    tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_reached())
         .await
-        .map_err(|_| "the query never reached the planning read")?;
-    let outcome = tokio::time::timeout(Duration::from_secs(60), query)
-        .await
-        .map_err(|_| "a query stalled in planning must end at its deadline, not hang")??;
-    let code = match &outcome {
-        Err(error) => sdk_code(error),
-        Ok(()) => return Err("a query stalled in planning settled".into()),
+        .map_err(|_| "the analysis never reached its scan")?;
+    // An analysis sends nothing until it has executed, so its id comes from
+    // the public list of running queries.
+    let query = wyrd_client::Bifrost::query_only(reader.client());
+    let running = query.running().await?;
+    let [held] = running.as_slice() else {
+        return Err(format!("expected only the held analysis running, saw {running:?}").into());
     };
-    if code != "WYRD_VALA_504_QUERY_TIMEOUT" {
-        return Err(format!("a query stalled in planning failed as {code}: {outcome:?}").into());
+    let request_id = held.request_id.clone();
+    query.cancel(&request_id).await?;
+    barrier.release();
+    let ended = tokio::time::timeout(Duration::from_secs(30), analysis)
+        .await
+        .map_err(|_| "a cancelled analysis must end, not hang")??;
+    match ended {
+        Err(error) if sdk_code(&error) == CANCELLED_QUERY_CODE => {}
+        Err(error) => return Err(format!("the cancelled analysis failed as {error}").into()),
+        Ok(plans) => {
+            return Err(format!("the cancelled analysis returned {plans} plan rows").into());
+        }
     }
-    stall.release();
+    // Settlement removes it from the running list and returns its admission
+    // grant and governed memory.
+    wait_inspection(server, |inspection| {
+        inspection.active_queries == 0 && inspection.reserved_memory_bytes == 0
+    })
+    .await?;
+    let running = query.running().await?;
+    if !running.is_empty() {
+        return Err(format!("the cancelled analysis is still running: {running:?}").into());
+    }
     cluster.shutdown().await?;
     Ok(())
 }
+
+/// Stable error code of a stream cancelled through the public operation: the
+/// stream settles a failure terminal, never a cancellation-specific code.
+const CANCELLED_QUERY_CODE: &str = "WYRD_VALA_500_QUERY_EXECUTION_FAILED";
 
 /// Deadline of the query whose planning read is stalled, well inside the
 /// journey's outer bound.
@@ -1225,9 +1307,114 @@ async fn prove_explanations() -> Result<(), JourneyError> {
         expect_refusal(&unprivileged, sql, "WYRD_VALA_403_QUERY_FORBIDDEN").await?;
     }
 
+    // Table authority covers the explained SELECT: a caller granted only the
+    // gateway schema is refused before any plan of another schema's table.
+    coordinator
+        .seed_role(
+            "explain_gateway_only",
+            &[Permission {
+                resource: wyrd_runtime::Resource::BifrostQuery,
+                action: wyrd_runtime::Action::Read,
+                scope: wyrd_runtime::PermissionScope::Bifrost(
+                    wyrd_runtime::BifrostPermissionScope::Schema(
+                        wyrd_runtime::BifrostSchemaScope {
+                            catalog: "bifrost".to_owned(),
+                            schema: "gateway".to_owned(),
+                        },
+                    ),
+                ),
+            }],
+        )
+        .await?;
+    let tableless = client_from_bootstrap(
+        coordinator,
+        coordinator
+            .bootstrap_service_in_tenant(
+                cluster.tenant(),
+                "explain-tableless",
+                &["explain_gateway_only"],
+            )
+            .await?,
+    )?;
+    // Another tenant naming this tenant's table finds none, and no plan of it.
+    let foreign = public_client(
+        coordinator,
+        &cluster
+            .provision_foreign_public_api_key(&format!("explain-foreign-{suffix}"))
+            .await?,
+    )?;
+    for (caller, case, code) in [
+        (&tableless, "denied table", DENIED_TABLE_CODE),
+        (&foreign, "foreign tenant", FOREIGN_TABLE_CODE),
+    ] {
+        for sql in [
+            format!("EXPLAIN {interactive}"),
+            format!("EXPLAIN ANALYZE {interactive}"),
+        ] {
+            match run_bound(caller, &sql, &bound).await {
+                Err(error) => {
+                    let text = error.to_string();
+                    let refused = error
+                        .downcast_ref::<wyrd_client::bifrost::BifrostClientError>()
+                        .map(sdk_code);
+                    if refused != Some(code)
+                        || text.contains("TableScan")
+                        || text.contains("DataSourceExec")
+                    {
+                        return Err(
+                            format!("{case}: {sql} failed as {text}, not a bare {code}").into()
+                        );
+                    }
+                }
+                Ok(plans) => return Err(format!("{case}: {sql} disclosed {plans:?}").into()),
+            }
+        }
+    }
+
+    // An analysis that scans another tenant's file fails as the SELECT does,
+    // with no plan, and every Oracle returns to its pre-query ownership.
+    let mixed = format!("explain_mixed_{suffix}");
+    cluster.register_table(PEER_SCRIBE, &mixed).await?;
+    cluster.ingest_rows(PEER_SCRIBE, &mixed, 0, 12, 3).await?;
+    cluster
+        .seed_foreign_hot_row(
+            PEER_SCRIBE,
+            &mixed,
+            &format!("explain-mixed-foreign-{suffix}"),
+        )
+        .await?;
+    cluster.refresh_snapshots().await?;
+    let baseline = cluster
+        .indices_of(ServerTarget::BifrostQuery)
+        .into_iter()
+        .map(|index| Ok((index, cluster.ownership_snapshot(index)?)))
+        .collect::<Result<Vec<_>, JourneyError>>()?;
+    let sql = format!("EXPLAIN ANALYZE SELECT id FROM bifrost.bifrost.{mixed}");
+    let error = match run_bound(&client, &sql, &[]).await {
+        Err(error) => error,
+        Ok(plans) => return Err(format!("{sql} returned {plans:?}").into()),
+    };
+    let problem = error
+        .downcast_ref::<wyrd_client::bifrost::BifrostClientError>()
+        .map(|error| wyrd_spec::error::WyrdError::from(error).problem());
+    if problem
+        != Some(wyrd_spec::error::WyrdError::from(BifrostError::QueryTenantInvariant).problem())
+    {
+        return Err(format!("{sql} failed as {error}").into());
+    }
+    for (index, before) in baseline {
+        await_baseline(&cluster, index, before).await?;
+    }
+
     cluster.shutdown().await?;
     Ok(())
 }
+
+/// Stable error code of a query naming a table its caller may not read.
+const DENIED_TABLE_CODE: &str = "WYRD_VALA_403_QUERY_FORBIDDEN";
+
+/// Stable error code of a query naming a table its caller's tenant lacks.
+const FOREIGN_TABLE_CODE: &str = "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND";
 
 /// Runs one bound statement through the public query operation and renders
 /// its rows, returning the class its terminal reports.

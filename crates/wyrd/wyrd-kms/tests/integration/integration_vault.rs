@@ -1,4 +1,5 @@
-//! `WyrdKms` over a real `vault server -dev` Transit engine.
+//! `WyrdKms` over a real `vault server -dev` Transit engine, run by
+//! `test:kms:vault`.
 //!
 //! The adapter's request shapes are pinned by unit tests against a local
 //! protocol fixture; what only a real server proves is that Transit accepts

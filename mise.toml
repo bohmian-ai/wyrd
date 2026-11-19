@@ -251,7 +251,17 @@ run = "cargo nextest run --locked -p wyrd-testing --test gateway -P journey --ru
 [tasks."test:kms:vault"]
 tools = { vault = "2.1.1" }
 description = "Run the WyrdKms Vault Transit check against a real dev Vault"
-run = "cargo nextest run --locked -p wyrd-kms --test vault_transit --run-ignored=all"
+run = "cargo nextest run --locked -p wyrd-kms --test integration --run-ignored=all -E 'test(/^integration_vault::/)'"
+
+[tasks."test:kms:gcp:cloud"]
+hide = true
+description = "Run the WyrdKms check against real Google Cloud KMS (merge-to-main only; requires WYRD_KMS_BACKEND=gcp_kms, WYRD_KMS_ACTIVE_KEY, and GOOGLE_APPLICATION_CREDENTIALS or another application default credential)"
+run = "cargo nextest run --locked -p wyrd-kms --test integration --run-ignored=all -E 'test(/^integration_gcp::/)'"
+
+[tasks."test:kms:aws:cloud"]
+hide = true
+description = "Run the WyrdKms check against real AWS KMS (merge-to-main only; requires WYRD_KMS_BACKEND=aws_kms, WYRD_KMS_ACTIVE_KEY as a key ARN, and AWS credentials in the standard chain)"
+run = "cargo nextest run --locked -p wyrd-kms --test integration --run-ignored=all -E 'test(/^integration_aws::/)'"
 
 [tasks."test:gateway:journey:surfaces:inner"]
 hide = true

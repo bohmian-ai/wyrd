@@ -395,6 +395,58 @@ impl WyrdKms {
         .map_err(|_| KmsError::Authentication)
     }
 
+    /// Renew encryption: open `envelope` and reseal the same value under a
+    /// fresh DEK and nonce wrapped by the active key.
+    ///
+    /// Use this when a DEK may be exposed; the returned envelope shares no
+    /// key material with the old one.
+    ///
+    /// # Errors
+    /// Returns any [`WyrdKms::open`] or [`WyrdKms::seal`] error; no envelope
+    /// is returned unless both succeeded.
+    pub async fn renew(
+        &self,
+        context: &SecretContext<'_>,
+        envelope: &[u8],
+    ) -> Result<Vec<u8>, KmsError> {
+        let plaintext = self.open(context, envelope).await?;
+        self.seal(context, &plaintext).await
+    }
+
+    /// Rewrap: move `envelope`'s DEK to the active key, keeping the DEK,
+    /// payload nonce, and ciphertext unchanged. The value is never decrypted.
+    ///
+    /// # Errors
+    /// Returns [`KmsError::UnknownFormat`], [`KmsError::KeyNotAllowed`],
+    /// [`KmsError::InvalidDek`], or the backend's [`KmsError`]; no envelope
+    /// is returned unless unwrap and wrap both succeeded.
+    pub async fn rewrap(
+        &self,
+        context: &SecretContext<'_>,
+        envelope: &[u8],
+    ) -> Result<Vec<u8>, KmsError> {
+        let old = Envelope::decode(envelope)?;
+        let dek = self.unwrap_dek(context, &old).await?;
+        let wrapped_dek = self
+            .backend
+            .wrap(&self.active, &dek, &context.canonical(WRAP_DOMAIN))
+            .await?;
+        Envelope {
+            key_ref: &self.active,
+            wrapped_dek: &wrapped_dek,
+            ..old
+        }
+        .encode()
+    }
+
+    /// Whether `envelope` already names the active wrapping key.
+    ///
+    /// # Errors
+    /// Returns [`KmsError::UnknownFormat`] for bytes that are not an envelope.
+    pub fn is_current(&self, envelope: &[u8]) -> Result<bool, KmsError> {
+        Ok(Envelope::decode(envelope)?.key_ref == self.active)
+    }
+
     /// Unwrap `envelope`'s DEK after checking its reference is configured.
     ///
     /// # Errors
@@ -758,6 +810,96 @@ mod tests {
                 .expect("retained opens")
                 .as_slice(),
             b"client-secret"
+        );
+    }
+
+    /// Renewal reseals the same value under a fresh DEK and nonce and the
+    /// active key; rewrap keeps the DEK, nonce, and ciphertext and only moves
+    /// the wrapping to the active key, so the result opens without the old
+    /// key retained.
+    #[tokio::test]
+    async fn renew_uses_a_fresh_dek_and_rewrap_keeps_it_under_the_active_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        key_file(dir.path(), "k1", 1);
+        key_file(dir.path(), "k2", 2);
+        let ctx = context(DataTenantId::new_v7());
+        let old = file(dir.path(), "k1", &[])
+            .expect("builds")
+            .seal(&ctx, b"client-secret")
+            .await
+            .expect("seals");
+        let rotating = file(dir.path(), "k2", &["k1"]).expect("builds");
+        let retired = file(dir.path(), "k2", &[]).expect("builds");
+        assert_eq!(rotating.is_current(&old), Ok(false));
+        assert_eq!(
+            rotating.is_current(b"garbage"),
+            Err(KmsError::UnknownFormat)
+        );
+        let aad = ctx.canonical(WRAP_DOMAIN);
+        let before = Envelope::decode(&old).expect("decodes");
+        let old_dek = rotating
+            .backend
+            .unwrap("k1", before.wrapped_dek, &aad)
+            .await
+            .expect("dek");
+
+        let renewed = rotating.renew(&ctx, &old).await.expect("renews");
+        let after = Envelope::decode(&renewed).expect("decodes");
+        assert_eq!(after.key_ref, "k2");
+        assert_ne!(after.nonce, before.nonce);
+        assert_ne!(
+            rotating
+                .backend
+                .unwrap("k2", after.wrapped_dek, &aad)
+                .await
+                .expect("dek"),
+            old_dek,
+            "renewal uses a fresh DEK"
+        );
+        assert_eq!(
+            retired
+                .open(&ctx, &renewed)
+                .await
+                .expect("opens")
+                .as_slice(),
+            b"client-secret"
+        );
+
+        let rewrapped = rotating.rewrap(&ctx, &old).await.expect("rewraps");
+        let moved = Envelope::decode(&rewrapped).expect("decodes");
+        assert_eq!(moved.key_ref, "k2");
+        assert_eq!(
+            (moved.nonce, moved.ciphertext),
+            (before.nonce, before.ciphertext)
+        );
+        assert_eq!(
+            rotating
+                .backend
+                .unwrap("k2", moved.wrapped_dek, &aad)
+                .await
+                .expect("dek"),
+            old_dek,
+            "rewrap keeps the DEK"
+        );
+        assert_eq!(rotating.is_current(&rewrapped), Ok(true));
+        assert_eq!(
+            retired
+                .open(&ctx, &rewrapped)
+                .await
+                .expect("opens")
+                .as_slice(),
+            b"client-secret"
+        );
+        assert_eq!(
+            retired.open(&ctx, &old).await.map(|_| ()),
+            Err(KmsError::KeyNotAllowed)
+        );
+        assert_eq!(
+            rotating
+                .rewrap(&context(DataTenantId::new_v7()), &old)
+                .await,
+            Err(KmsError::Authentication),
+            "rewrap still authenticates the owner"
         );
     }
 }

@@ -507,3 +507,45 @@ async fn transit_wraps_through_the_configured_key_and_rereads_its_token() {
         })
     );
 }
+
+/// A provider failure during renewal or rewrap returns no replacement
+/// envelope; the old one stays readable once the provider recovers.
+#[tokio::test]
+async fn renew_and_rewrap_return_nothing_when_the_provider_fails() {
+    let ctx = context(DataTenantId::new_v7());
+    let server = fake(GCP).await;
+    let old = gcp(&server, GCP_OLD, &[])
+        .seal(&ctx, b"sk-live")
+        .await
+        .expect("seals");
+    let rotating = gcp(&server, GCP_NEW, &[GCP_OLD]);
+    server.reset().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let unavailable = Err(KmsError::Unavailable {
+        backend: KmsBackendKind::GcpKms,
+        failure: ProviderFailure::Transport,
+    });
+    assert_eq!(rotating.renew(&ctx, &old).await, unavailable);
+    assert_eq!(rotating.rewrap(&ctx, &old).await, unavailable);
+    server.reset().await;
+    Mock::given(method("POST"))
+        .respond_with(FakeKms(GCP))
+        .mount(&server)
+        .await;
+    assert_eq!(
+        rotating.open(&ctx, &old).await.expect("opens").as_slice(),
+        b"sk-live"
+    );
+    let rewrapped = rotating.rewrap(&ctx, &old).await.expect("rewraps");
+    assert_eq!(rotating.is_current(&rewrapped), Ok(true));
+    assert!(
+        requests(&server)
+            .await
+            .iter()
+            .any(|request| request.url.path() == format!("/v1/{GCP_NEW}:encrypt")),
+        "rewrap wraps through the active CryptoKey"
+    );
+}

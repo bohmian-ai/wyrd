@@ -60,6 +60,35 @@ review-set list/history read or same-commit request exists. Record that external
 before activation; if absent, retain the dependency instead of implementing it
 here. These constraints preserve exact membership and authorization.
 
+**Delivered by TASK-005A** (commits `f4ce139ce` through `64fb741fe`; spec revision 7):
+
+- **Request.** `POST /v1/integrations/github/pull-requests/reviews` takes
+  `{host, repository_id, number}` and a required `Idempotency-Key`. It
+  answers 202 with `{generation, executions}`. The same operation is
+  `review_pull_request`/`reviewPullRequest` on `GithubConnection` in the
+  Rust, Python and TypeScript SDKs, and the MCP tool
+  `github_connection.review_pull_request`.
+- **Authorization.** It requires `cards:read`, then `verifier:read` and
+  `verifier:run` on every selected Verifier. A distinct key admits and
+  supersedes; a retried key returns the same generation and members, even
+  after the head moves.
+- **Refusals.** An ineligible PR answers
+  `WYRD_GITHUB_409_PULL_REQUEST_NOT_REVIEWABLE` with `details.reason`.
+  Provider and authority outages answer typed 503s.
+- **Membership.** `pull_request` pins now carry `members` (every member,
+  refused ones included) and `request_key` or `delivery_id`. Each member's
+  pins are retained in `bifrost.verification.execution_inputs` with origin
+  `pull_request`.
+- **Reading sets.** `recorded_at` is the generation's PostgreSQL observation
+  time. The current set is the latest `recorded_at`. A set is complete only
+  when every listed member has a record. No implicit time range applies, so
+  history is selected by an explicit `recorded_at` bound.
+- **Read authorization.** Reads need `bifrost_query:read` covering that
+  table. Other callers get no rows or counts.
+- **Journeys.** `pg_github_pull_requests::` (26 tests), the MCP
+  `github::pg_tests::` journeys, Rust SDK `repository_declaration::`, and the
+  focused Python and TypeScript review journeys all pass.
+
 Extend the existing typed shared loader/host contract and use the approved PR
 context in the [composition](../design/consolidation.md) and [mock](../design/mock/README.md).
 The general tenant-scoped PR link follows the latest admitted set across head

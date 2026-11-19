@@ -17,13 +17,14 @@ pub use handle::Principals;
 // The wire contract this handle speaks, re-exported so an SDK user reaches one
 // module for the capability and its types rather than depending on `wyrd-spec`
 // directly.
+pub use uuid::Uuid;
 pub use wyrd_spec::auth::{
     AccountAuthentication, CreateServicePrincipalRequest, CreateServicePrincipalResponse,
     CreateUserInvitationRequest, CreateUserRequest, CreatedUser, CredentialListQuery,
-    CredentialListResponse, CredentialMetadata, CurrentUserProfile, IssuedCredential,
-    IssuedUserInvitation, PrincipalId, PrincipalKindTag, PrincipalPage, PrincipalQuery,
-    PrincipalRoles, PrincipalStatus, PrincipalSummary, RevokePrincipalRequest, RoleAssignment,
-    RoleAssignmentChange, RoleSource, SecretBearer, WorkloadFamily, WorkloadKind,
-    WorkloadRestriction,
+    CredentialListResponse, CredentialMetadata, CurrentUserProfile, HumanConnectionView,
+    IssuedCredential, IssuedUserInvitation, PrincipalId, PrincipalKindTag, PrincipalPage,
+    PrincipalQuery, PrincipalRoles, PrincipalStatus, PrincipalSummary, RevokePrincipalRequest,
+    RoleAssignment, RoleAssignmentChange, RoleSource, SecretBearer, TrustedIssuerView,
+    WorkloadFamily, WorkloadKind, WorkloadRestriction,
 };
 pub use wyrd_spec::error::WyrdError;

@@ -104,6 +104,27 @@ def test_only_a_tenant_admin_assigns_roles(server: WyrdTestServer) -> None:
     assert revoked.value.code == DENIED
 
 
+def test_identity_secret_renewal_reaches_each_owner(server: WyrdTestServer) -> None:
+    _, key = issue(server)
+    admin = Principals(client_of(server))
+    workload = Principals(client_of(server, key))
+    unknown_connection = "01a1f59d-8e3f-72c3-8fc3-d5b1cf0330e8"
+
+    with pytest.raises(WyrdError) as issuer:
+        admin.renew_trusted_issuer_encryption("https://unknown.example.com")
+    with pytest.raises(WyrdError) as connection:
+        admin.renew_human_connection_encryption(unknown_connection)
+    with pytest.raises(WyrdError) as denied_issuer:
+        workload.renew_trusted_issuer_encryption("https://unknown.example.com")
+    with pytest.raises(WyrdError) as denied_connection:
+        workload.renew_human_connection_encryption(unknown_connection)
+
+    assert issuer.value.code == "WYRD_AUTH_404_ADMIN_NOT_FOUND"
+    assert connection.value.code == "WYRD_SPEC_404_NOT_FOUND"
+    assert denied_issuer.value.code == DENIED
+    assert denied_connection.value.code == DENIED
+
+
 def test_direct_and_idp_user_assignments_coexist(server: WyrdTestServer) -> None:
     user = server.bootstrap_user(["viewer"], "pr-person")
     principals = Principals(client_of(server))

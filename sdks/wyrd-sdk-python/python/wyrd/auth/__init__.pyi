@@ -135,6 +135,46 @@ class RevokePrincipalRequest(TypedDict):
     principal_kind: PrincipalKind
     reason: str
 
+class ClaimMapping(TypedDict):
+    """Which ID-token claims supply the subject, email, and groups."""
+
+    subject: str
+    email: NotRequired[str | None]
+    groups: NotRequired[str | None]
+
+class TrustedIssuerView(TypedDict):
+    """A trusted workload issuer, without its client secret."""
+
+    issuer: str
+    jwks_uri: str
+    expected_audience: str
+    client_id: str
+    client_auth: str
+    principal_kind: str
+    jwks_ttl_secs: int
+    claim_mapping: ClaimMapping
+    group_role_map: dict[str, list[str]]
+    default_roles: list[str]
+
+class HumanConnectionView(TypedDict):
+    """A tenant human sign-in connection, without its client secret."""
+
+    id: str
+    tenant_id: str
+    revision: int
+    state: Literal["Candidate", "Active", "Inactive"]
+    issuer: str
+    client_id: str
+    client_auth: Literal["SecretBasic", "SecretPost", "Public"]
+    claim_mapping: ClaimMapping
+    group_role_map: dict[str, list[str]]
+    jwks_ttl_secs: int
+    tested_revision: int | None
+    tested_until: str | None
+    created_at: str
+    updated_at: str
+    callback_url: str | None
+
 class Principals:
     """Tenant principal handle: Service principals, their credentials,
     principal discovery, and direct Role assignment.
@@ -249,6 +289,42 @@ class Principals:
         Raises:
             WyrdError: ``WYRD_PERMISSION_403_DENIED_RBAC`` when the caller is
                 not a User.
+
+        """
+        ...
+
+    def renew_human_connection_encryption(self, connection_id: str) -> HumanConnectionView:
+        """Reseal a human connection's unchanged client secret under a fresh data key.
+
+        The connection's revision, sign-in, and sessions are unchanged.
+
+        Args:
+            connection_id: the live connection whose secret to renew.
+
+        Raises:
+            WyrdError: ``WYRD_PERMISSION_403_DENIED_RBAC`` without
+                ``identity_connections:write``, ``WYRD_SPEC_404_NOT_FOUND`` for an
+                unknown or retired connection, a ``409`` when it holds no secret
+                or changed during the renewal, or a ``503`` when the key service
+                is unavailable.
+
+        """
+        ...
+
+    def renew_trusted_issuer_encryption(self, issuer: str) -> TrustedIssuerView:
+        """Reseal a trusted issuer's unchanged client secret under a fresh data key.
+
+        The issuer and its workload bindings are unchanged.
+
+        Args:
+            issuer: the trusted issuer URL.
+
+        Raises:
+            WyrdError: ``WYRD_PERMISSION_403_DENIED_RBAC`` without
+                ``service_accounts:write``, ``WYRD_AUTH_404_ADMIN_NOT_FOUND`` for an
+                unknown issuer, ``WYRD_AUTH_409_ADMIN_CONFLICT`` when it holds no
+                secret or changed during the renewal, or a ``503`` when the key
+                service is unavailable.
 
         """
         ...

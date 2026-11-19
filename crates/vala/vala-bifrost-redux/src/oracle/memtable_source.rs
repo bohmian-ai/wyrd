@@ -235,6 +235,52 @@ impl MemtableSource {
     }
 }
 
+/// Returns a pull of `pull`'s batches coalesced into batches of
+/// `batch_size` rows, the buffer held under `reservation`.
+///
+/// A batch of at least half `batch_size` rows passes through uncopied, as
+/// `DataFusion`'s own coalescing does. The rows still buffered when `pull`
+/// ends are emitted last. An error from `pull`, the coalescer, or the
+/// reservation is yielded once, after which the pull ends.
+fn coalesced(
+    mut pull: impl FnMut() -> Option<DataFusionResult<RecordBatch>>,
+    schema: SchemaRef,
+    batch_size: usize,
+    reservation: datafusion::execution::memory_pool::MemoryReservation,
+) -> impl FnMut() -> Option<DataFusionResult<RecordBatch>> {
+    let mut coalescer = arrow::compute::BatchCoalescer::new(schema, batch_size)
+        .with_biggest_coalesce_batch_size(Some(batch_size / 2));
+    let mut ended = false;
+    move || {
+        loop {
+            if let Some(rows) = coalescer.next_completed_batch() {
+                reservation.resize(coalescer.size());
+                return Some(Ok(rows));
+            }
+            if ended {
+                return None;
+            }
+            let pushed = match pull() {
+                Some(Ok(rows)) => coalescer
+                    .push_batch(rows)
+                    .map_err(Into::into)
+                    .and_then(|()| reservation.try_resize(coalescer.size())),
+                Some(Err(error)) => Err(error),
+                None => {
+                    ended = true;
+                    coalescer.finish_buffered_batch().map_err(Into::into)
+                }
+            };
+            if let Err(error) = pushed {
+                ended = true;
+                coalescer = arrow::compute::BatchCoalescer::new(coalescer.schema(), batch_size);
+                reservation.free();
+                return Some(Err(error));
+            }
+        }
+    }
+}
+
 /// A memtable source's recorded bounds, merged.
 #[derive(Debug, Clone)]
 struct Merged {
@@ -285,23 +331,30 @@ impl Merged {
 
 impl DataSource for MemtableSource {
     /// Streams one partition's kept batches in order, evaluating each only
-    /// when the stream is asked for the next batch: the batch is evaluated
-    /// from the capture, filtered by the filters this source took over unless
-    /// its bounds prove it fully matching, dropped when left empty, projected,
+    /// when the stream needs more rows: the batch is evaluated from the
+    /// capture, filtered by the filters this source took over unless its
+    /// bounds prove it fully matching, dropped when left empty, projected,
     /// and cut at the partition's limit, after which no later batch is
-    /// evaluated. A batch that fails ends the stream with that error. The
-    /// stream holds the source's accounting owners until it
-    /// drops, since a stream can outlive its plan.
+    /// evaluated.
+    ///
+    /// Appends are small, so the surviving rows are coalesced into batches of
+    /// the session's batch size before they leave the source; a batch already
+    /// half that size passes through uncopied, and the rows buffered when the
+    /// partition or its limit ends are emitted as they are. The buffer is
+    /// reserved from the task's memory pool. A batch that fails ends the
+    /// stream with that error, dropping the buffered rows. The stream holds
+    /// the source's accounting owners until it drops, since a stream can
+    /// outlive its plan.
     ///
     /// # Errors
     ///
     /// Returns an internal `DataFusion` error for an out-of-range partition;
-    /// the stream yields an evaluation, filter, or projection error in place
-    /// of that batch.
+    /// the stream yields an evaluation, filter, projection, coalescing, or
+    /// memory refusal error in place of the batch it was building.
     fn open(
         &self,
         partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let batches = self.partitions.get(partition).cloned().ok_or_else(|| {
             DataFusionError::Internal(format!("memtable partition {partition} is out of range"))
@@ -315,7 +368,7 @@ impl DataSource for MemtableSource {
         let projection = self.projection.clone();
         let mut remaining = self.fetch;
         let charges = Arc::clone(&self.charges);
-        let next = move || -> Option<DataFusionResult<RecordBatch>> {
+        let pull = move || -> Option<DataFusionResult<RecordBatch>> {
             let _charges = &charges;
             loop {
                 if remaining == Some(0) {
@@ -355,6 +408,15 @@ impl DataSource for MemtableSource {
                 return Some(Ok(rows));
             }
         };
+        let next = coalesced(
+            pull,
+            Arc::clone(&self.projected_schema),
+            context.session_config().batch_size(),
+            datafusion::execution::memory_pool::MemoryConsumer::new(format!(
+                "MemtableSource[{partition}]"
+            ))
+            .register(context.memory_pool()),
+        );
         Ok(Box::pin(datafusion::physical_plan::coop::cooperative(
             RecordBatchStreamAdapter::new(
                 Arc::clone(&self.projected_schema),
@@ -933,10 +995,67 @@ mod tests {
         assert_eq!(total.column_statistics[0].max_value, Precision::Absent);
     }
 
+    /// Small kept batches leave the source coalesced: three one- and
+    /// two-row batches stream as one batch of all their rows, in order, and
+    /// a limit cuts the coalesced rows without evaluating past it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the batches stream uncoalesced, out of order, or past the
+    /// limit.
+    #[tokio::test]
+    async fn small_batches_stream_coalesced_up_to_the_limit() {
+        use datafusion::physical_plan::common::collect;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let source = |fetch| {
+            let mut source = evaluated_source(
+                vec![bounded(&[1, 2]), bounded(&[3]), bounded(&[4, 5])],
+                Arc::default(),
+                crate::scan_sizing::OraclePartitioning::new(
+                    1,
+                    crate::scan_sizing::ORACLE_PARTITION_SCAN_BYTES,
+                ),
+                1,
+                Arc::clone(&schema),
+            )
+            .expect("memtable source");
+            source.fetch = fetch;
+            source
+        };
+        let read = |source: MemtableSource| async move {
+            collect(
+                source
+                    .open(0, Arc::new(datafusion::execution::TaskContext::default()))
+                    .expect("the partition opens"),
+            )
+            .await
+            .expect("the partition reads")
+        };
+        let ids = |batch: &RecordBatch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("ids")
+                .values()
+                .to_vec()
+        };
+
+        let all = read(source(None)).await;
+        assert_eq!(all.len(), 1, "the small batches coalesce into one");
+        assert_eq!(ids(&all[0]), vec![1, 2, 3, 4, 5]);
+        let limited = read(source(Some(3))).await;
+        assert_eq!(limited.len(), 1);
+        assert_eq!(ids(&limited[0]), vec![1, 2, 3], "the limit cuts the rows");
+    }
+
     /// A batch that fails to evaluate ends its partition's stream: the
     /// batches before it stream, the failure is yielded once, no later batch
     /// is evaluated, and the capture's accounting owners stay held while the
-    /// stream reads and are released once it and its source drop.
+    /// stream reads and are released once it and its source drop. The
+    /// session's batch size is the first batch's two rows, so that batch
+    /// streams before the failing one is evaluated.
     ///
     /// # Panics
     ///
@@ -972,8 +1091,10 @@ mod tests {
             Arc::clone(&schema),
         )
         .expect("memtable source");
+        let two_rows = datafusion::execution::TaskContext::default()
+            .with_session_config(datafusion::prelude::SessionConfig::new().with_batch_size(2));
         let mut stream = source
-            .open(0, Arc::new(datafusion::execution::TaskContext::default()))
+            .open(0, Arc::new(two_rows))
             .expect("the partition opens");
 
         let first = stream

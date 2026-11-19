@@ -453,9 +453,11 @@ impl LiveTailBatches {
 /// hooks.
 ///
 /// The returned stream counts as one open live producer until it drops,
-/// counts every batch it yields, and holds an armed [`ScribeLiveProductionPause`] before every batch after the
-/// first, so a journey can observe Oracle holding an earlier batch while the
-/// Scribe has not yet produced the next. Compiled only with `test-support`.
+/// counts every batch it yields, and, once a batch is yielded, holds an armed
+/// [`ScribeLiveProductionPause`] before polling for the next, so a journey can
+/// observe Oracle holding an earlier batch while the Scribe has not yet
+/// produced another, even when the fragment has only one. Compiled only with
+/// `test-support`.
 #[cfg(feature = "test-support")]
 #[must_use]
 pub(crate) fn observe_live_production_for_test(
@@ -466,14 +468,10 @@ pub(crate) fn observe_live_production_for_test(
     let observed = async_stream::stream! {
         let _open = open;
         let mut stream = stream;
-        let mut produced = false;
         while let Some(batch) = futures_util::StreamExt::next(&mut stream).await {
-            if produced {
-                scribe_live_production_pause_for_test().hold().await;
-            }
-            produced = true;
             LIVE_BATCHES_PRODUCED.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             yield batch;
+            scribe_live_production_pause_for_test().hold().await;
         }
     };
     Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, observed))

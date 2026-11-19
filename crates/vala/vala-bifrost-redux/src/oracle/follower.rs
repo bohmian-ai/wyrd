@@ -3108,8 +3108,10 @@ pub(crate) mod tests {
 
     /// Opening a multi-batch memtable capture evaluates none of its rows:
     /// resolving the follower's leaf retains the captured batches, and each
-    /// one is evaluated only when the source's stream is asked for it, so a
+    /// one is evaluated only when the source's stream needs its rows, so a
     /// consumer that stops after the first batch never evaluates the rest.
+    /// The session's batch size is the first batch's two rows, so one pull
+    /// fills its output batch from that batch alone.
     ///
     /// # Panics
     /// Panics when resolution or the first pull fails, or when opening or a
@@ -3190,8 +3192,10 @@ pub(crate) mod tests {
             .plan;
         assert_eq!(live_scan_for_test().0, before.0, "opening examines no row");
 
+        let two_rows = TaskContext::default()
+            .with_session_config(datafusion::prelude::SessionConfig::new().with_batch_size(2));
         let mut rows = plan
-            .execute(0, Arc::new(TaskContext::default()))
+            .execute(0, Arc::new(two_rows))
             .expect("the memtable partition opens");
         let first = rows
             .next()

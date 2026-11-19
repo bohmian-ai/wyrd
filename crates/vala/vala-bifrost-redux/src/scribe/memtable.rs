@@ -13,9 +13,9 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use arrow::array::RecordBatch;
-use arrow::datatypes::{FieldRef, Schema, SchemaRef};
+use arrow::datatypes::{DataType, FieldRef, Schema, SchemaRef};
 use datafusion::common::stats::Precision;
-use datafusion::common::{ColumnStatistics, Statistics};
+use datafusion::common::{ColumnStatistics, ScalarValue, Statistics};
 use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
 use datafusion::logical_expr::Accumulator as _;
 use wyrd_spec::DataTenantId;
@@ -1489,6 +1489,7 @@ impl MemtableBucket {
         self.bytes_accumulated += estimate_batch_bytes(&batch);
         self.tail.statistics.push(batch_statistics(&batch));
         self.tail.batches.push(batch);
+        #[cfg(test)]
         self.tail.wal_lsns.push(meta.wal_lsn_max);
         self.metas.push(meta);
         if self.tail.batches.len() == APPEND_RUN_LEN {
@@ -1673,8 +1674,8 @@ impl ImmutableEntry {
     ///
     /// # Panics
     ///
-    /// Panics when `frozen` does not carry one append meta per batch (see
-    /// [`AppendRun::new`]).
+    /// In test builds, panics when `frozen` does not carry one append meta
+    /// per batch, since tests name each batch by its meta's WAL position.
     fn pending(frozen: FrozenMemtable) -> Self {
         Self {
             seal_id: frozen.seal_id,
@@ -1690,11 +1691,14 @@ impl ImmutableEntry {
                 .map(|meta| meta.wal_lsn_max)
                 .max()
                 .unwrap_or_else(|| crate::scribe::wal::WalLsn::new(0)),
-            run: AppendRun::new(
-                Arc::clone(&frozen.batches),
-                Arc::clone(&frozen.statistics),
-                frozen.metas.iter().map(|meta| meta.wal_lsn_max).collect(),
-            ),
+            run: {
+                let run =
+                    AppendRun::new(Arc::clone(&frozen.batches), Arc::clone(&frozen.statistics));
+                #[cfg(test)]
+                let run =
+                    run.with_wal_lsns(frozen.metas.iter().map(|meta| meta.wal_lsn_max).collect());
+                run
+            },
             frozen,
             state: ImmutableState::PendingCommit,
         }
@@ -2145,28 +2149,29 @@ impl AppendRun {
     ///
     /// `statistics` may be shorter than `batches`, as in a hand-built test
     /// generation; those batches read with unknown bounds.
-    ///
-    /// # Panics
-    ///
-    /// Panics when `wal_lsns` does not carry exactly one WAL position per
-    /// batch. A live read pairs batches with positions run by run, so a
-    /// mismatch would misalign every later run's bounds and pruning.
-    fn new(
-        batches: Arc<[RecordBatch]>,
-        statistics: Arc<[Arc<Statistics>]>,
-        wal_lsns: Arc<[crate::scribe::wal::WalLsn]>,
-    ) -> Self {
-        assert_eq!(
-            batches.len(),
-            wal_lsns.len(),
-            "an append run carries exactly one WAL position per batch"
-        );
+    fn new(batches: Arc<[RecordBatch]>, statistics: Arc<[Arc<Statistics>]>) -> Self {
         Self {
             batches,
             statistics,
             #[cfg(test)]
-            wal_lsns,
+            wal_lsns: Arc::from([]),
         }
+    }
+
+    /// Returns this run naming each batch by its append's maximum WAL LSN.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `wal_lsns` does not carry exactly one WAL position per
+    /// batch, which would make a test name the wrong batch.
+    #[cfg(test)]
+    fn with_wal_lsns(self, wal_lsns: Arc<[crate::scribe::wal::WalLsn]>) -> Self {
+        assert_eq!(
+            self.batches.len(),
+            wal_lsns.len(),
+            "an append run carries exactly one WAL position per batch"
+        );
+        Self { wal_lsns, ..self }
     }
 }
 
@@ -2177,7 +2182,9 @@ struct AppendTail {
     batches: Vec<RecordBatch>,
     /// Exact bounds of each batch, index-aligned with `batches`.
     statistics: Vec<Arc<Statistics>>,
-    /// Maximum WAL LSN of each append, index-aligned with `batches`.
+    /// Maximum WAL LSN of each append, index-aligned with `batches`, kept
+    /// only so tests can name each batch a read returns.
+    #[cfg(test)]
     wal_lsns: Vec<crate::scribe::wal::WalLsn>,
 }
 
@@ -2185,20 +2192,24 @@ impl AppendTail {
     /// Copies the tail into a run a capture holds while the bucket keeps
     /// appending.
     fn run(&self) -> AppendRun {
-        AppendRun::new(
+        let run = AppendRun::new(
             self.batches.as_slice().into(),
             self.statistics.as_slice().into(),
-            self.wal_lsns.as_slice().into(),
-        )
+        );
+        #[cfg(test)]
+        let run = run.with_wal_lsns(self.wal_lsns.as_slice().into());
+        run
     }
 
     /// Moves the tail into a sealed run, leaving it empty.
     fn seal(&mut self) -> AppendRun {
-        AppendRun::new(
+        let run = AppendRun::new(
             std::mem::take(&mut self.batches).into(),
             std::mem::take(&mut self.statistics).into(),
-            std::mem::take(&mut self.wal_lsns).into(),
-        )
+        );
+        #[cfg(test)]
+        let run = run.with_wal_lsns(std::mem::take(&mut self.wal_lsns).into());
+        run
     }
 }
 
@@ -2316,7 +2327,7 @@ impl ReadableSource {
                 .iter()
                 .enumerate()
                 .all(|(at, column)| *column == Some(at));
-        let statistics: Vec<Arc<Statistics>> = self
+        let mut statistics: Vec<Arc<Statistics>> = self
             .runs
             .iter()
             .flat_map(|run| (0..run.batches.len()).map(|index| run.statistics.get(index)))
@@ -2337,7 +2348,14 @@ impl ReadableSource {
                 None => Arc::new(Statistics::new_unknown(&schema)),
             })
             .collect();
-        let keep = pruning.map(|pruning| pruning.keep(&statistics, statistics.len()));
+        let keep = pruning.map(|pruning| {
+            let keep = pruning.keep(&statistics, statistics.len());
+            if self.bound_identities(pruning, &schema, &kept, &keep, &mut statistics) {
+                pruning.keep(&statistics, statistics.len())
+            } else {
+                keep
+            }
+        });
         let mut selected = self
             .runs
             .iter()
@@ -2389,6 +2407,76 @@ impl ReadableSource {
             });
         }
         Ok(())
+    }
+
+    /// Adds the bounds of the identity columns `pruning` reads to every
+    /// batch's `statistics` that `keep` still keeps, returning whether any
+    /// bound was added.
+    ///
+    /// Recorded bounds cover only primitive columns, so a UTF8 or
+    /// fixed-size binary identity is bounded here, per query, and only when
+    /// the predicate reads it: appends pay nothing, and a query without an
+    /// identity predicate scans no identity values. A column is bounded only
+    /// when it is read uncast (`kept`) and stored in the type `schema` reads;
+    /// [`identity_bounds`] leaves a column holding an over-long value
+    /// unknown. `statistics` index-align with the captured batches and
+    /// `schema`'s columns.
+    fn bound_identities(
+        &self,
+        pruning: &crate::scan_sizing::BatchPruning,
+        schema: &SchemaRef,
+        kept: &[Option<usize>],
+        keep: &[bool],
+        statistics: &mut [Arc<Statistics>],
+    ) -> bool {
+        let columns: Vec<(usize, usize)> =
+            datafusion::physical_expr::utils::collect_columns(pruning.predicate().orig_expr())
+                .iter()
+                .map(datafusion::physical_expr::expressions::Column::index)
+                .filter_map(|at| {
+                    let field = schema.fields().get(at)?;
+                    matches!(
+                        field.data_type(),
+                        DataType::Utf8
+                            | DataType::LargeUtf8
+                            | DataType::Utf8View
+                            | DataType::FixedSizeBinary(_)
+                    )
+                    .then_some((at, (*kept.get(at)?)?))
+                })
+                .collect();
+        if columns.is_empty() || keep.len() != statistics.len() {
+            return false;
+        }
+        let mut bounded = false;
+        let batches = self.runs.iter().flat_map(|run| run.batches.iter());
+        for ((batch, bounds), _) in batches
+            .zip(statistics.iter_mut())
+            .zip(keep)
+            .filter(|(_, keep)| **keep)
+        {
+            let mut added: Option<Statistics> = None;
+            for &(at, source) in &columns {
+                let Some(column) = batch.columns().get(source) else {
+                    continue;
+                };
+                if column.data_type() != schema.field(at).data_type() {
+                    continue;
+                }
+                if let Some((min, max)) = identity_bounds(column.as_ref()) {
+                    let column = &mut added
+                        .get_or_insert_with(|| Statistics::clone(bounds))
+                        .column_statistics[at];
+                    column.min_value = Precision::Exact(min);
+                    column.max_value = Precision::Exact(max);
+                }
+            }
+            if let Some(added) = added {
+                *bounds = Arc::new(added);
+                bounded = true;
+            }
+        }
+        bounded
     }
 
     /// Returns column `column` of `physical`, a [`physical_projection`] of
@@ -3084,6 +3172,67 @@ pub(crate) fn batch_statistics(batch: &RecordBatch) -> Arc<Statistics> {
     Arc::new(statistics)
 }
 
+/// Longest identity value, in bytes, a query-time bound holds.
+///
+/// Trace, span, and parent ids are at most 32 hex characters; a column holding
+/// a longer value is free text, whose bounds would cost a long comparison per
+/// row and rarely prune.
+const IDENTITY_BOUND_BYTES: usize = 64;
+
+/// Returns a UTF8 or fixed-size binary `column`'s minimum and maximum in one
+/// pass, or `None` when it holds no non-null value, holds a value longer than
+/// [`IDENTITY_BOUND_BYTES`], or has another type.
+///
+/// Values compare as bytes, which is `DataFusion`'s string and binary order.
+fn identity_bounds(column: &dyn arrow::array::Array) -> Option<(ScalarValue, ScalarValue)> {
+    use arrow::array::AsArray as _;
+    fn extrema<'a, T: AsRef<[u8]> + Ord + ?Sized + 'a>(
+        values: impl IntoIterator<Item = Option<&'a T>>,
+    ) -> Option<(&'a T, &'a T)> {
+        let mut bounds: Option<(&T, &T)> = None;
+        for value in values.into_iter().flatten() {
+            if value.as_ref().len() > IDENTITY_BOUND_BYTES {
+                return None;
+            }
+            bounds = Some(bounds.map_or((value, value), |(min, max)| {
+                (min.min(value), max.max(value))
+            }));
+        }
+        bounds
+    }
+    let text = |(min, max): (&str, &str)| (min.to_owned(), max.to_owned());
+    match column.data_type() {
+        DataType::Utf8 => extrema(column.as_string::<i32>())
+            .map(text)
+            .map(|(min, max)| (ScalarValue::Utf8(Some(min)), ScalarValue::Utf8(Some(max)))),
+        DataType::LargeUtf8 => extrema(column.as_string::<i64>())
+            .map(text)
+            .map(|(min, max)| {
+                (
+                    ScalarValue::LargeUtf8(Some(min)),
+                    ScalarValue::LargeUtf8(Some(max)),
+                )
+            }),
+        DataType::Utf8View => extrema(column.as_string_view())
+            .map(text)
+            .map(|(min, max)| {
+                (
+                    ScalarValue::Utf8View(Some(min)),
+                    ScalarValue::Utf8View(Some(max)),
+                )
+            }),
+        DataType::FixedSizeBinary(width) => {
+            extrema(column.as_fixed_size_binary()).map(|(min, max)| {
+                (
+                    ScalarValue::FixedSizeBinary(*width, Some(min.to_vec())),
+                    ScalarValue::FixedSizeBinary(*width, Some(max.to_vec())),
+                )
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Resolves each required field to its column in one captured schema.
 ///
 /// A required field carrying a `PARQUET:field_id` matches the column with the
@@ -3527,6 +3676,53 @@ pub(crate) mod tests {
 
         assert_eq!(lsns(Some(&pruning)), vec![2]);
         assert_eq!(lsns(None), vec![1, 2]);
+    }
+
+    /// Identity bounds are each column's byte-ordered extremes, skipping
+    /// nulls, and unknown for a column holding no value or an over-long one.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a bound differs from the expected extreme or is known
+    /// where it must be unknown.
+    #[test]
+    fn identity_bounds_skip_nulls_and_refuse_over_long_values() {
+        let text = arrow::array::StringArray::from(vec![Some("t2"), None, Some("t1"), Some("t3")]);
+        assert_eq!(
+            identity_bounds(&text),
+            Some((ScalarValue::from("t1"), ScalarValue::from("t3")))
+        );
+        let view = arrow::array::StringViewArray::from(vec!["b", "a"]);
+        assert_eq!(
+            identity_bounds(&view),
+            Some((
+                ScalarValue::Utf8View(Some("a".to_owned())),
+                ScalarValue::Utf8View(Some("b".to_owned()))
+            ))
+        );
+        let ids =
+            arrow::array::FixedSizeBinaryArray::try_from_iter([[2_u8; 8], [1; 8]].into_iter())
+                .expect("ids");
+        assert_eq!(
+            identity_bounds(&ids),
+            Some((
+                ScalarValue::FixedSizeBinary(8, Some(vec![1; 8])),
+                ScalarValue::FixedSizeBinary(8, Some(vec![2; 8]))
+            ))
+        );
+        let long = "m".repeat(IDENTITY_BOUND_BYTES + 1);
+        let body = arrow::array::StringArray::from(vec!["a", long.as_str(), "z"]);
+        assert_eq!(
+            identity_bounds(&body),
+            None,
+            "an over-long value leaves the column unknown"
+        );
+        let empty = arrow::array::StringArray::from(vec![None::<&str>]);
+        assert_eq!(
+            identity_bounds(&empty),
+            None,
+            "an all-null column has no extremes"
+        );
     }
 
     /// Catalog identity, time and child-match predicates prune memory

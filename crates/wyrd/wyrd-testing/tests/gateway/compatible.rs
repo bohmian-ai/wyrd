@@ -1073,6 +1073,118 @@ async fn cold_call_waits_retryably_while_a_managed_secret_is_prepared() {
     assert_upstream_keys(&journey, &[PROVIDER_KEY]).await;
 }
 
+/// Proves a managed secret whose preparation failed on a key-service outage
+/// stays retryable and recovers in the same process.
+///
+/// While Transit answers 500, a reload installs the tenant's snapshot with
+/// the managed secret unprepared. Each call on that credential is then
+/// refused with the retryable `WYRD_SERVER_503_SERVICE_UNAVAILABLE` and
+/// reaches no upstream, while a deployment that needs no credential still
+/// answers. Once the same Transit endpoint answers again, the background
+/// reload prepares the secret with no resource edit or restart, and the call
+/// is served with the submitted key.
+///
+/// # Panics
+///
+/// Panics when a status, refusal code, or upstream expectation fails.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn failed_managed_secret_preparation_stays_retryable_and_recovers() {
+    let transit = TransitFixture::start().await;
+    let journey = Journey::start_on(Some(transit.config("gateway", &[]))).await;
+    for route in ["/v1/chat/completions", "/first/v1/chat/completions"] {
+        Mock::given(method("POST"))
+            .and(path(route))
+            .respond_with(ResponseTemplate::new(200).set_body_json(GatewayCapture::completion()))
+            .mount(&journey.upstream)
+            .await;
+    }
+    journey
+        .deploy("openai", "authorization", &["chat_completions"])
+        .await;
+    invoke(&journey).await;
+
+    transit.set_available(false);
+    let failed = transit.requests("decrypt").await;
+    journey
+        .put(
+            "provider-deployments/acme-first",
+            json!({"name": "acme-first", "auth": "none", "capabilities": ["chat_completions"],
+                   "adapter": {"openai_compatible": {
+                       "base_url": format!("{}/first/v1", journey.upstream.uri())}}}),
+        )
+        .await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while transit.requests("decrypt").await == failed {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the reload never asked Transit to open the secret"
+        );
+        tokio::task::yield_now().await;
+    }
+    let caller = [("authorization", format!("Bearer {}", journey.caller))];
+    let refusal = loop {
+        let answer = journey
+            .post_once("/v1/chat/completions", &caller, &chat(false, "hi"))
+            .await;
+        if answer.status().as_u16() != 200 {
+            break answer;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the unprepared snapshot was never installed"
+        );
+        tokio::task::yield_now().await;
+    };
+    for refused in [
+        refusal,
+        journey
+            .post_once("/v1/chat/completions", &caller, &chat(false, "hi"))
+            .await,
+    ] {
+        assert_eq!(refused.status().as_u16(), 503, "the outage is retryable");
+        let body: Value = refused.json().await.expect("problem body");
+        assert_eq!(
+            body["error"]["code"], "WYRD_SERVER_503_SERVICE_UNAVAILABLE",
+            "{body}"
+        );
+    }
+    assert_upstream_keys(&journey, &[PROVIDER_KEY]).await;
+    let unrelated = journey
+        .post(
+            "/v1/chat/completions",
+            &caller,
+            &json!({"model": "acme-first/m", "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await;
+    assert_eq!(
+        unrelated.status().as_u16(),
+        200,
+        "a deployment needing no managed secret still answers"
+    );
+
+    transit.set_available(true);
+    invoke(&journey).await;
+    let dispatched: Vec<String> = journey
+        .upstream_calls()
+        .await
+        .iter()
+        .filter(|call| call.url.path() == "/v1/chat/completions")
+        .map(|call| {
+            call.headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(
+        dispatched,
+        vec![format!("Bearer {PROVIDER_KEY}"); 2],
+        "the recovered secret is the submitted key"
+    );
+}
+
 /// Managed-secret credential document for `name` holding `secret`.
 fn managed(name: &str, secret: &str) -> Value {
     json!({

@@ -111,6 +111,26 @@ names to copy. Historical scenarios 2/3 TDD violations stay recorded.
    endpoint in the same server process and observe background recovery without
    resource edits/restart. Retain warm zero-extra-key-request assertions and existing
    snapshot lifecycle proof; an unfinished stall alone cannot close this finding.
+   - Evidence: `GatewayCredentialSource::ManagedSecret` gains `pending`, set from the
+     load's `KmsError::Unavailable`. The resolver maps it to `CredentialError::Pending`,
+     and the engine to `FailureClass::CredentialPending`. That class is not billable,
+     does not count toward the breaker, and continues to fallback.
+     `CallExecution.credential_pending` holds when no attempt was billable;
+     `respond` maps it to the existing `ServiceUnavailable` and never to
+     `GatewayUpstreamUnavailable`. There is no new cache, TTL or invocation-time KMS/PG
+     wait: resolution still reads only the admitted snapshot. `TransitFixture` gains
+     `set_available`. `compatible::failed_managed_secret_preparation_stays_retryable_and_recovers`
+     puts Transit into 500s and triggers a reload with an unrelated deployment write. Two
+     calls return 503 `WYRD_SERVER_503_SERVICE_UNAVAILABLE`, with no upstream dispatch;
+     no-credential `acme-first` answers 200. Once the same endpoint is back, the call is
+     served with the submitted key, with no edit or restart. RED, before the fix:
+     `left: 502, right: 503`. GREEN: `WYRD_TEST_GATEWAY_PROVIDER_KEY=sk-native-upstream`
+     with `with-test-postgres.sh`, `db:migrate:all:inner` and `cargo nextest run --locked
+     -p wyrd-testing --test gateway -P journey --run-ignored=all -E
+     'test(/^compatible::(failed_managed|cold_call|managed_secret)/) | test(/^resilience::/)'`
+     passed 12/12, including the warm zero-Transit-request journey. `-p wyrd-gateway --lib`
+     passed 78/78. `-p wyrd-server --lib --features test-support -E
+     'test(/components::gateway::/)'` passed 87/87. TDD PASS.
 4. **Lost replacement fence returns conflict — finding 4.** With delayed remote
    sealing, let disable commit first. Assert exact existing conflict code, unchanged
    winning status/envelope/version and no losing replacement write. Then let another

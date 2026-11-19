@@ -45,7 +45,7 @@ use skald_providers::MediaAnswer;
 use skald_providers::exchange::{self, Exchange, Waits};
 
 use crate::adapter::{BatchAction, IngressDialect, MediaRequest};
-use crate::credential::{CredentialResolver, ProviderSecret};
+use crate::credential::{CredentialError, CredentialResolver, ProviderSecret};
 use crate::health::DeploymentHealth;
 use crate::request::RequestJson;
 use crate::routing::{CallPlan, PlannedCandidate};
@@ -392,6 +392,11 @@ pub enum FailureClass {
     Rejected,
     /// Response content already reached the caller.
     AfterOutput,
+    /// The provider never received the request because the deployment's
+    /// managed secret awaits background preparation after a key-service
+    /// outage. It is not the deployment's fault, so it does not count
+    /// toward the deployment's breaker.
+    CredentialPending,
 }
 
 impl FailureClass {
@@ -403,6 +408,7 @@ impl FailureClass {
             Self::Upstream => "upstream",
             Self::Rejected => "rejected",
             Self::AfterOutput => "after_output",
+            Self::CredentialPending => "credential_pending",
         }
     }
 }
@@ -553,6 +559,10 @@ pub struct CallExecution {
     /// Monotonic credential, adapter, and provider-wait time of every
     /// attempt, for telemetry only.
     pub timing: ExecutionTiming,
+    /// Whether the call failed with no attempt reaching a provider and at
+    /// least one deployment's managed secret awaiting preparation, so the
+    /// caller should retry rather than treat the upstream as unavailable.
+    pub credential_pending: bool,
 }
 
 /// Transient monotonic timing of one call's execution, read by telemetry and
@@ -741,6 +751,7 @@ impl GatewayEngine {
     async fn walk(&self, input: &CallInput<'_>, timing: &mut ExecutionTiming) -> CallExecution {
         let mut attempts: Vec<AttemptRecord> = Vec::new();
         let mut refusal = None;
+        let mut pending = false;
         let retry_safe = matches!(
             input.plan.operation,
             GatewayOperation::ChatCompletions
@@ -827,9 +838,13 @@ impl GatewayEngine {
                 }
             };
             record_failure(&span, class);
+            pending |= class == FailureClass::CredentialPending;
             attempts.push(record(
                 GatewayCallOutcome::Failed,
-                class != FailureClass::BeforeDispatch,
+                !matches!(
+                    class,
+                    FailureClass::BeforeDispatch | FailureClass::CredentialPending
+                ),
                 usage,
             ));
             match self.after_failure(input.tenant, deployment, class, retry_safe) {
@@ -837,14 +852,20 @@ impl GatewayEngine {
                 Next::Stop(outcome) => return finish(outcome, attempts, None, refusal, None),
             }
         }
-        finish(GatewayCallOutcome::Failed, attempts, None, refusal, None)
+        let credential_pending = pending && attempts.iter().all(|attempt| !attempt.billable);
+        CallExecution {
+            credential_pending,
+            ..finish(GatewayCallOutcome::Failed, attempts, None, refusal, None)
+        }
     }
 
     /// Resolves the credential and dispatches one attempt.
     ///
     /// `dispatched` flips just before the provider call so cancellation can
     /// tell a billable in-flight attempt from credential work. A credential
-    /// failure is reported as a before-dispatch failure with unknown usage.
+    /// failure is reported as a before-dispatch failure with unknown usage,
+    /// or as [`FailureClass::CredentialPending`] for a managed secret still
+    /// awaiting preparation.
     /// [`Self::execute`] runs it inside the attempt's `gateway.attempt` span
     /// carrying the ordinal, deployment, and `gen_ai` provider and
     /// request-model attributes. Credential and dispatch time fold into
@@ -875,7 +896,11 @@ impl GatewayEngine {
                     "gateway credential resolution failed; deployment unavailable"
                 );
                 return AttemptResult::Failed {
-                    class: FailureClass::BeforeDispatch,
+                    class: if error == CredentialError::Pending {
+                        FailureClass::CredentialPending
+                    } else {
+                        FailureClass::BeforeDispatch
+                    },
                     usage: AttemptUsage::default(),
                 };
             }
@@ -921,6 +946,7 @@ impl GatewayEngine {
                 self.health.record_failure(tenant, &deployment.name);
                 Next::Continue
             }
+            FailureClass::CredentialPending => Next::Continue,
             FailureClass::Upstream => {
                 self.health.record_failure(tenant, &deployment.name);
                 if retry_safe {
@@ -958,6 +984,7 @@ fn finish(
         capture,
         attempt_span: attempt_span.unwrap_or_else(tracing::Span::none),
         timing: ExecutionTiming::default(),
+        credential_pending: false,
     }
 }
 

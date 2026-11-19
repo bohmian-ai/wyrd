@@ -1065,7 +1065,10 @@ async fn credential_snapshot(
                     }
                 }
             }
-            GatewayCredentialSource::ManagedSecret { secret }
+            GatewayCredentialSource::ManagedSecret {
+                secret,
+                pending: retry,
+            }
         }
     };
     (

@@ -1731,6 +1731,7 @@ async fn gateway_token_limits_hold_exposure_in_the_admission_window() {
         capture: None,
         attempt_span: tracing::Span::none(),
         timing: ExecutionTiming::default(),
+        credential_pending: false,
     };
     let mut accounted =
         Accounted::new(&call, &admission, &execution).expect("late accounting prices");
@@ -1868,6 +1869,7 @@ async fn gateway_targeted_token_limits_settle_covered_attempts_only() {
                 capture: None,
                 attempt_span: tracing::Span::none(),
                 timing: ExecutionTiming::default(),
+                credential_pending: false,
             },
         )
         .expect("accounting prices");

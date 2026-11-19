@@ -412,7 +412,7 @@ fn prepared(snapshot: &GatewayTenantSnapshot, credential: &str) -> Option<String
     let credential = snapshot
         .credential(&credential_name(credential))
         .expect("admitted");
-    let GatewayCredentialSource::ManagedSecret { secret } = &credential.source else {
+    let GatewayCredentialSource::ManagedSecret { secret, .. } = &credential.source else {
         panic!("managed source");
     };
     secret

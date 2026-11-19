@@ -58,6 +58,10 @@ pub enum CredentialError {
     /// The source exists but produced no usable value.
     #[error("provider credential source is unavailable")]
     Unavailable,
+    /// The managed secret could not be prepared because the key service was
+    /// unavailable; a background reload is retrying it.
+    #[error("provider credential is awaiting preparation")]
+    Pending,
 }
 
 /// Resolves deployment credentials from operator bindings, Vault backends,
@@ -85,8 +89,9 @@ impl CredentialResolver {
     /// Environment bindings read the operator's environment variable or
     /// restrictive mounted file; Vault sources read the latest version afresh;
     /// a managed secret is the value the snapshot loader opened for `tenant`,
-    /// read from memory with no key-service or Postgres wait. Surrounding
-    /// whitespace is trimmed and an empty value fails closed.
+    /// read from memory with no key-service or Postgres wait, and one whose
+    /// preparation hit a key-service outage is [`CredentialError::Pending`].
+    /// Surrounding whitespace is trimmed and an empty value fails closed.
     ///
     /// # Errors
     ///
@@ -135,8 +140,12 @@ impl CredentialResolver {
                     .fetch(reference)
                     .await?
             }
-            GatewayCredentialSource::ManagedSecret { secret } => {
-                secret.clone().ok_or(CredentialError::Unavailable)?
+            GatewayCredentialSource::ManagedSecret { secret, pending } => {
+                secret.clone().ok_or(if *pending {
+                    CredentialError::Pending
+                } else {
+                    CredentialError::Unavailable
+                })?
             }
         };
         let trimmed = raw.expose_secret().trim();

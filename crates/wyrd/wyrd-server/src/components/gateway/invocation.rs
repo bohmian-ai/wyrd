@@ -908,8 +908,10 @@ impl<'a> GatewayInvocation<'a> {
     /// # Errors
     /// Returns `GatewayDeadlineExceeded` for a timed-out call,
     /// `ServiceUnavailable` for a cancelled call, a refusal body that cannot
-    /// be serialized, or a buffered answer process memory cannot hold, and `GatewayUpstreamUnavailable` when no attempt
-    /// completed.
+    /// be serialized, or a buffered answer process memory cannot hold,
+    /// `ServiceUnavailable` when no attempt reached a provider because a
+    /// managed secret awaits preparation after a key-service outage, and
+    /// `GatewayUpstreamUnavailable` when no attempt otherwise completed.
     fn respond(
         call: &AdmittedCall,
         execution: CallExecution,
@@ -959,6 +961,12 @@ impl<'a> GatewayInvocation<'a> {
                 message: "the gateway call was cancelled".to_owned(),
                 details: json!({ "call_id": call_id }),
             }),
+            (GatewayCallOutcome::Failed, ..) if execution.credential_pending => {
+                Err(WyrdError::ServiceUnavailable {
+                    message: "gateway managed secret preparation is unavailable".to_owned(),
+                    details: json!({ "call_id": call_id, "resource": "credential" }),
+                })
+            }
             _ => Err(WyrdError::GatewayUpstreamUnavailable {
                 message: "no provider attempt completed the gateway call".to_owned(),
                 details: json!({ "call_id": call_id }),
@@ -1626,6 +1634,7 @@ impl CallTask {
             capture: end.capture,
             attempt_span,
             timing,
+            credential_pending: false,
         };
         let mut priced = Accounted::new(&self.call.ledger(), &self.admission, &accounted);
         match &mut priced {

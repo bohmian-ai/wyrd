@@ -56,7 +56,7 @@ impl GatewayTenantSnapshot {
         self.credentials.iter().any(|credential| {
             matches!(
                 credential.source,
-                GatewayCredentialSource::ManagedSecret { secret: None }
+                GatewayCredentialSource::ManagedSecret { secret: None, .. }
             )
         })
     }
@@ -147,8 +147,12 @@ pub enum GatewayCredentialSource {
     /// snapshot was loaded, so an attempt reads memory only.
     ManagedSecret {
         /// The opened provider key, or `None` when this load could not open
-        /// the envelope; resolution then fails as unavailable until a later
-        /// load prepares it.
+        /// the envelope; resolution then fails until a later load prepares
+        /// it.
         secret: Option<SecretString>,
+        /// Whether the envelope went unopened because the key service was
+        /// unavailable, so a background reload is retrying it and a call is
+        /// refused retryably rather than as an unusable credential.
+        pending: bool,
     },
 }

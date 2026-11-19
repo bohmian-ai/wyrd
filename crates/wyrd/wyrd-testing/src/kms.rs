@@ -6,6 +6,8 @@
 //! fixture served to prove its stored secrets were sealed and opened through
 //! the remote backend rather than another local path.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -25,6 +27,8 @@ const TRANSIT_TOKEN: &str = "fixture-vault-token";
 pub struct TransitFixture {
     /// Mock HTTP server answering `/v1/<mount>/encrypt|decrypt/<key>`.
     server: MockServer,
+    /// Whether requests are answered; see [`Self::set_available`].
+    available: Arc<AtomicBool>,
 }
 
 impl TransitFixture {
@@ -38,11 +42,22 @@ impl TransitFixture {
     /// flight. A request is counted by [`Self::requests`] on arrival.
     pub async fn start_delayed(delay: Duration) -> Self {
         let server = MockServer::start().await;
+        let available = Arc::new(AtomicBool::new(true));
         Mock::given(method("POST"))
-            .respond_with(Transit { delay })
+            .respond_with(Transit {
+                delay,
+                available: Arc::clone(&available),
+            })
             .mount(&server)
             .await;
-        Self { server }
+        Self { server, available }
+    }
+
+    /// Take the fixture down or bring it back at the same address: while
+    /// unavailable, every request answers HTTP 500, as a failing Transit
+    /// does, and is still counted by [`Self::requests`].
+    pub fn set_available(&self, available: bool) {
+        self.available.store(available, Ordering::SeqCst);
     }
 
     /// Base URL of the fixture.
@@ -95,11 +110,18 @@ pub fn transit_config(endpoint: &str, active: &str, retained: &[&str]) -> KmsCon
 struct Transit {
     /// How long every answer is held back.
     delay: Duration,
+    /// Shared with [`TransitFixture::set_available`].
+    available: Arc<AtomicBool>,
 }
 
 impl Respond for Transit {
     fn respond(&self, request: &Request) -> ResponseTemplate {
-        Self::answer(request).set_delay(self.delay)
+        let answer = if self.available.load(Ordering::SeqCst) {
+            Self::answer(request)
+        } else {
+            ResponseTemplate::new(500).set_body_json(json!({"errors": ["transit unavailable"]}))
+        };
+        answer.set_delay(self.delay)
     }
 }
 

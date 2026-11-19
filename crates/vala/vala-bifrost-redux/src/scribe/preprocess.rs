@@ -436,9 +436,6 @@ pub(crate) struct PreparedSlice {
     /// Request correlation the terminal COMMIT record persists.
     pub request_id: Uuid,
     pub rows: RecordBatch,
-    /// Exact bounds of `rows`, computed here on the ingest lane so the
-    /// shard's serial owner only attaches them at memtable insertion.
-    pub statistics: Arc<datafusion::common::Statistics>,
     pub wal_append: PreparedWalAppend,
     pub memtable_bytes: usize,
 }
@@ -797,7 +794,6 @@ fn prepare_slice(
     let seal_key = SealKey::new(context.tenant, context.table.clone(), partition)
         .with_table_version(context.table_version);
     let memtable_bytes = crate::scribe::memory::retained_arrow_bytes(&rows);
-    let statistics = crate::scribe::memtable::batch_statistics(&rows);
     let data_payload = encode_ipc(&rows, memtable_bytes)?;
     let identity_span = tracing::debug_span!(
         "scribe_logical_batch_identity",
@@ -825,7 +821,6 @@ fn prepare_slice(
         seal_key,
         request_id: context.request_id,
         rows,
-        statistics,
         wal_append,
         memtable_bytes,
     })

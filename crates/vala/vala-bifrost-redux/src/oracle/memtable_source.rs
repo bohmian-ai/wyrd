@@ -1,12 +1,17 @@
-//! The Scribe follower's memtable leaf: an in-memory source that drops every
-//! batch a query's predicate rules out before any of its rows is compared.
+//! The Scribe follower's memtable leaf: a source over captured memory
+//! batches that drops every batch a query's predicate rules out before any of
+//! its rows is compared, and evaluates each kept batch only when its stream
+//! is asked for the next one.
 //!
-//! `DataFusion`'s `MemorySourceConfig` accepts no filter, so a point lookup
-//! over the memtable evaluates its predicate on every row. Scribe records each
-//! append batch's exact column bounds when the batch arrives; this source
-//! prunes by them through [`BatchPruning`], the same pruning the Scribe
-//! listing sizes the query with, as a Parquet scan prunes row groups by their
-//! footer statistics.
+//! `DataFusion`'s `MemorySourceConfig` holds batches already evaluated and
+//! accepts no filter, so a point lookup over the memtable evaluates its
+//! predicate on every row and every batch is filtered, projected, and
+//! reconstructed before the query reads one. Scribe records each append
+//! batch's exact column bounds when the batch arrives; this source prunes by
+//! them through [`BatchPruning`], the same pruning the Scribe listing sizes
+//! the query with, as a Parquet scan prunes row groups by their footer
+//! statistics, and pulls each batch it keeps from the Scribe capture on
+//! demand.
 //!
 //! The source also takes over the query's static filters. A batch the bounds
 //! prove matches on every row streams without evaluating them; only the
@@ -20,9 +25,8 @@ use arrow::record_batch::RecordBatch;
 use datafusion::common::Statistics;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::config::ConfigOptions;
-use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::source::DataSource;
-use datafusion::error::Result as DataFusionResult;
+use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::projection::ProjectionExprs;
 use datafusion::physical_expr::utils::conjunction;
@@ -34,14 +38,50 @@ use datafusion::physical_plan::{DisplayFormatType, Partitioning, SendableRecordB
 
 use crate::scan_sizing::{BatchPruning, ScanScope, ScanSizer};
 
-/// An in-memory source over memtable batches that prunes them by their bounds.
+/// The rows of one memtable batch: a captured batch evaluated when pulled.
+#[derive(Debug, Clone)]
+pub(super) enum MemtableRows {
+    /// A Scribe capture's batch, filtered, projected, and reconstructed only
+    /// when the source's stream asks for it.
+    Captured(crate::scribe::memtable::LiveBatch),
+    /// Rows already evaluated, as a unit fixture supplies them.
+    #[cfg(test)]
+    Evaluated(RecordBatch),
+}
+
+impl MemtableRows {
+    /// Evaluates the rows in `schema`, the source's columns, or `None` when
+    /// the capture's own filter keeps none of them.
+    ///
+    /// # Errors
+    ///
+    /// Returns the Scribe evaluation error, or the `DataFusion` error raised
+    /// when the evaluated rows do not project to `schema`.
+    fn evaluate(&self, schema: &SchemaRef) -> DataFusionResult<Option<RecordBatch>> {
+        match self {
+            Self::Captured(batch) => batch
+                .evaluate()
+                .map_err(|error| DataFusionError::External(Box::new(error)))?
+                .map(|rows| super::exec::project_batch(&rows, Arc::clone(schema)))
+                .transpose(),
+            #[cfg(test)]
+            Self::Evaluated(batch) => Ok(Some(batch.clone())),
+        }
+    }
+}
+
+/// A source over memtable batches that prunes them by their bounds and
+/// evaluates each kept batch only when its stream pulls it.
 ///
-/// Reads exactly as the wrapped `MemorySourceConfig` does until
+/// It reads every batch, in order, partition by partition, until
 /// `DataFusion`'s `FilterPushdown` offers it the query's predicate. It then
 /// keeps only the batches the predicate cannot exclude, takes over every
 /// static filter, and evaluates them itself on the kept batches the bounds
 /// cannot prove fully matching. Dynamic and volatile filters stay with the
-/// operator above, which still evaluates them on every surviving row.
+/// operator above, which still evaluates them on every surviving row. A
+/// limit or column projection pushed into it applies to each evaluated batch,
+/// so a stream that reaches its limit, or is dropped, evaluates no later
+/// batch.
 ///
 /// The batches share the Scribe capture's Arrow buffers, so the source, every
 /// clone or pushed-down rewrite of it, and every stream it opens hold the
@@ -49,10 +89,19 @@ use crate::scan_sizing::{BatchPruning, ScanScope, ScanSizer};
 /// return their charge to the Scribe root while any of them still reads.
 #[derive(Debug, Clone)]
 pub(super) struct MemtableSource {
-    /// The batches, already dealt to partitions, that this source reads.
-    inner: MemorySourceConfig,
-    /// Exact bounds of each batch in `inner`, partition by partition, column
-    /// for column with the source schema.
+    /// The batches, dealt to partitions, that this source reads.
+    partitions: Vec<Vec<MemtableRows>>,
+    /// The batches' columns, before any pushed-down projection.
+    schema: SchemaRef,
+    /// Indices into `schema` of the columns a pushed-down projection keeps,
+    /// or `None` for every column.
+    projection: Option<Vec<usize>>,
+    /// `schema` after `projection`: the columns this source emits.
+    projected_schema: SchemaRef,
+    /// Most rows each partition emits, or `None` for every row.
+    fetch: Option<usize>,
+    /// Bounds of each batch in `partitions`, partition by partition, column
+    /// for column with `schema`.
     statistics: Vec<Vec<Arc<Statistics>>>,
     /// `statistics` merged once per partition, then across partitions, so
     /// the planner's repeated statistics requests read Scribe's recorded
@@ -67,29 +116,28 @@ pub(super) struct MemtableSource {
     /// The static filters this source took over, as one conjunction, or
     /// `None` while every filter stays with the operator above.
     filter: Option<Arc<dyn PhysicalExpr>>,
-    /// Per batch of `inner`, partition by partition, whether its bounds
-    /// prove `filter` holds on every row, so the batch streams unfiltered.
+    /// Per batch of `partitions`, whether its bounds prove `filter` holds on
+    /// every row, so the batch streams unfiltered.
     matched: Vec<Vec<bool>>,
 }
 
 impl MemtableSource {
     /// Builds the source over `batches` and their bounds, dealt round-robin
     /// over the partitions their bytes earn under `partitioning`, at least
-    /// one and at most `cap`.
+    /// one and at most `cap`. No batch is evaluated here.
     ///
-    /// The batches are already projected to the query's columns, so they are
-    /// sized by [`ScanSizer`] with every column covered. `charges` are the
-    /// accounting owners of the batches' buffers, held for the source's life.
-    /// The batches' bounds are merged into [`Merged`] here, once. The source
+    /// Each batch evaluates to `schema`'s columns, so they are sized by
+    /// [`ScanSizer`] with every column covered. `charges` are the accounting
+    /// owners of the batches' buffers, held for the source's life. The
+    /// batches' bounds are merged into [`Merged`] here, once. The source
     /// holds no filter until filter pushdown offers it one.
     ///
     /// # Errors
     ///
-    /// Returns the `DataFusion` error raised when a batch does not match
-    /// `schema`, or when bounds do not merge because their column counts
-    /// differ.
+    /// Returns the `DataFusion` error raised when bounds do not merge because
+    /// their column counts differ.
     pub(super) fn try_new(
-        batches: Vec<(RecordBatch, Arc<Statistics>)>,
+        batches: Vec<(MemtableRows, Arc<Statistics>)>,
         charges: Arc<crate::scribe::memtable::LiveReadOwners>,
         partitioning: crate::scan_sizing::OraclePartitioning,
         cap: usize,
@@ -104,10 +152,14 @@ impl MemtableSource {
             partition.push(batch);
             statistics.push(bounds);
         }
-        let (batches, statistics): (Vec<Vec<_>>, Vec<Vec<_>>) = dealt.into_iter().unzip();
+        let (partitions, statistics): (Vec<Vec<_>>, Vec<Vec<_>>) = dealt.into_iter().unzip();
         let merged = Merged::try_new(&statistics, &schema)?;
         Ok(Self {
-            inner: MemorySourceConfig::try_new(&batches, schema, None)?,
+            partitions,
+            projected_schema: Arc::clone(&schema),
+            schema,
+            projection: None,
+            fetch: None,
             matched: statistics
                 .iter()
                 .map(|bounds| vec![false; bounds.len()])
@@ -118,27 +170,6 @@ impl MemtableSource {
             charges,
             filter: None,
         })
-    }
-
-    /// Rewraps a fetch- or projection-rewritten copy of `inner`, keeping this
-    /// source's accounting owners, or `None` when `rewritten` is not an
-    /// in-memory source.
-    ///
-    /// Only a source holding no filter is rewritten, and the rewritten source
-    /// no longer prunes (see [`Self::pruned`]).
-    fn rewrapped(&self, rewritten: &Arc<dyn DataSource>) -> Option<Self> {
-        let rewritten: &dyn std::any::Any = rewritten.as_ref();
-        rewritten
-            .downcast_ref::<MemorySourceConfig>()
-            .map(|inner| Self {
-                inner: inner.clone(),
-                statistics: self.statistics.clone(),
-                merged: self.merged.clone(),
-                partitioning: self.partitioning,
-                charges: Arc::clone(&self.charges),
-                filter: None,
-                matched: self.matched.clone(),
-            })
     }
 
     /// Returns this source pruned by `predicate` and, when `absorbed` names
@@ -155,7 +186,7 @@ impl MemtableSource {
     /// covers. A source carrying a fetch or projection is never pruned, since
     /// rebuilding would drop it. Each kept batch is then marked fully matching when
     /// [`BatchPruning::fully_matching`] proves the held filter true on all
-    /// of its rows.
+    /// of its rows. No batch is evaluated.
     ///
     /// # Errors
     ///
@@ -166,14 +197,13 @@ impl MemtableSource {
         predicate: Arc<dyn PhysicalExpr>,
         absorbed: Vec<Arc<dyn PhysicalExpr>>,
     ) -> DataFusionResult<Option<Self>> {
-        if self.inner.fetch().is_some() || self.inner.projection().is_some() {
+        if self.fetch.is_some() || self.projection.is_some() {
             return Ok(None);
         }
-        let schema = self.inner.original_schema();
         let mut excluded = false;
         let mut kept = Vec::new();
-        let pruning = BatchPruning::try_new(&schema, predicate);
-        for (batches, statistics) in self.inner.partitions().iter().zip(&self.statistics) {
+        let pruning = BatchPruning::try_new(&self.schema, predicate);
+        for (batches, statistics) in self.partitions.iter().zip(&self.statistics) {
             let keep = pruning.as_ref().map_or_else(
                 || vec![true; batches.len()],
                 |pruning| pruning.keep(statistics, batches.len()),
@@ -196,54 +226,12 @@ impl MemtableSource {
             Arc::clone(&self.charges),
             self.partitioning,
             self.statistics.len(),
-            schema,
+            Arc::clone(&self.schema),
         )?;
         let filter = conjunction(self.filter.iter().cloned().chain(absorbed));
-        source.matched = BatchPruning::fully_matching(
-            &source.inner.original_schema(),
-            &filter,
-            &source.statistics,
-        );
+        source.matched = BatchPruning::fully_matching(&source.schema, &filter, &source.statistics);
         source.filter = Some(filter);
         Ok(Some(source))
-    }
-
-    /// Streams `partition`'s kept batches, filtering by `filter` each one its
-    /// bounds do not prove fully matching and dropping batches left empty.
-    ///
-    /// # Errors
-    ///
-    /// Returns an internal `DataFusion` error for an out-of-range partition.
-    fn filtered(
-        &self,
-        partition: usize,
-        filter: &Arc<dyn PhysicalExpr>,
-    ) -> DataFusionResult<SendableRecordBatchStream> {
-        let batches = self.inner.partitions().get(partition).ok_or_else(|| {
-            datafusion::error::DataFusionError::Internal(format!(
-                "memtable partition {partition} is out of range"
-            ))
-        })?;
-        let matched = self.matched.get(partition).cloned().unwrap_or_default();
-        let filter = Arc::clone(filter);
-        let batches = batches
-            .clone()
-            .into_iter()
-            .zip(matched.into_iter().chain(std::iter::repeat(false)))
-            .map(move |(batch, matched)| {
-                if matched {
-                    Ok(batch)
-                } else {
-                    datafusion::physical_plan::filter::batch_filter(&batch, &filter)
-                }
-            })
-            .filter(|batch| batch.as_ref().map_or(true, |batch| batch.num_rows() > 0));
-        Ok(Box::pin(datafusion::physical_plan::coop::cooperative(
-            RecordBatchStreamAdapter::new(
-                self.inner.original_schema(),
-                futures_util::stream::iter(batches),
-            ),
-        )))
     }
 }
 
@@ -296,120 +284,187 @@ impl Merged {
 }
 
 impl DataSource for MemtableSource {
-    /// Streams one partition's kept batches, filtering each one its bounds
-    /// do not prove fully matching by the filters this source took over, and
-    /// holding the source's accounting owners until the stream drops, since a
-    /// stream can outlive its plan.
+    /// Streams one partition's kept batches in order, evaluating each only
+    /// when the stream is asked for the next batch: the batch is evaluated
+    /// from the capture, filtered by the filters this source took over unless
+    /// its bounds prove it fully matching, dropped when left empty, projected,
+    /// and cut at the partition's limit, after which no later batch is
+    /// evaluated. The stream holds the source's accounting owners until it
+    /// drops, since a stream can outlive its plan.
     ///
     /// # Errors
     ///
-    /// Returns the wrapped source's error for an out-of-range partition.
+    /// Returns an internal `DataFusion` error for an out-of-range partition;
+    /// the stream yields an evaluation, filter, or projection error in place
+    /// of that batch.
     fn open(
         &self,
         partition: usize,
-        context: Arc<TaskContext>,
+        _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        let stream = match &self.filter {
-            None => self.inner.open(partition, context)?,
-            Some(filter) => self.filtered(partition, filter)?,
-        };
-        let schema = stream.schema();
+        let batches = self.partitions.get(partition).cloned().ok_or_else(|| {
+            DataFusionError::Internal(format!("memtable partition {partition} is out of range"))
+        })?;
+        let matched = self.matched.get(partition).cloned().unwrap_or_default();
+        let mut batches = batches
+            .into_iter()
+            .zip(matched.into_iter().chain(std::iter::repeat(false)));
+        let schema = Arc::clone(&self.schema);
+        let filter = self.filter.clone();
+        let projection = self.projection.clone();
+        let mut remaining = self.fetch;
         let charges = Arc::clone(&self.charges);
-        let held = futures_util::StreamExt::map(stream, move |batch| {
+        let next = move || -> Option<DataFusionResult<RecordBatch>> {
             let _charges = &charges;
-            batch
-        });
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, held)))
+            loop {
+                if remaining == Some(0) {
+                    return None;
+                }
+                let (rows, matched) = batches.next()?;
+                let pulled = rows.evaluate(&schema).and_then(|rows| {
+                    rows.map(|rows| match &filter {
+                        Some(filter) if !matched => {
+                            datafusion::physical_plan::filter::batch_filter(&rows, filter)
+                        }
+                        _ => Ok(rows),
+                    })
+                    .transpose()
+                });
+                let mut rows = match pulled {
+                    Ok(Some(rows)) if rows.num_rows() > 0 => rows,
+                    Ok(_) => continue,
+                    Err(error) => return Some(Err(error)),
+                };
+                if let Some(projection) = &projection {
+                    rows = match rows.project(projection) {
+                        Ok(rows) => rows,
+                        Err(error) => return Some(Err(error.into())),
+                    };
+                }
+                if let Some(remaining) = remaining.as_mut() {
+                    rows = rows.slice(0, rows.num_rows().min(*remaining));
+                    *remaining -= rows.num_rows();
+                }
+                return Some(Ok(rows));
+            }
+        };
+        Ok(Box::pin(datafusion::physical_plan::coop::cooperative(
+            RecordBatchStreamAdapter::new(
+                Arc::clone(&self.projected_schema),
+                futures_util::stream::iter(std::iter::from_fn(next)),
+            ),
+        )))
     }
 
-    /// Displays as the wrapped in-memory source, with any filter it took over.
+    /// Displays as an in-memory source, with any limit and filter it holds.
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        self.inner.fmt_as(t, f)?;
+        let sizes: Vec<_> = self.partitions.iter().map(Vec::len).collect();
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(f, "partitions={}, partition_sizes={sizes:?}", sizes.len())?;
+                if let Some(fetch) = self.fetch {
+                    write!(f, ", fetch={fetch}")?;
+                }
+            }
+            DisplayFormatType::TreeRender => {
+                writeln!(f, "format=memory")?;
+                write!(f, "batches={}", sizes.iter().sum::<usize>())?;
+            }
+        }
         match &self.filter {
             Some(filter) => write!(f, ", predicate={filter}"),
             None => Ok(()),
         }
     }
 
-    /// Reports the wrapped source's partitioning.
+    /// Reports one partition per dealt batch list.
     fn output_partitioning(&self) -> Partitioning {
-        self.inner.output_partitioning()
+        Partitioning::UnknownPartitioning(self.partitions.len())
     }
 
-    /// Reports the wrapped source's equivalences.
+    /// Reports no ordering or equivalence over the emitted columns.
     fn eq_properties(&self) -> EquivalenceProperties {
-        self.inner.eq_properties()
+        EquivalenceProperties::new(Arc::clone(&self.projected_schema))
     }
 
     /// Reports the merged recorded bounds of one partition, or of all of
-    /// them, inexact once this source filters, because they count rows before
-    /// the filter.
-    ///
-    /// A source rewritten with a limit or projection, whose output the
-    /// recorded bounds no longer describe, and an out-of-range partition
-    /// report the wrapped source's statistics instead.
+    /// them, projected like the emitted columns and cut by the limit; inexact
+    /// once this source filters, because they count rows before the filter.
+    /// An out-of-range partition reports unknown statistics.
     ///
     /// # Errors
     ///
-    /// Returns the wrapped source's error for an out-of-range partition.
+    /// Returns the `DataFusion` error raised when the limit cannot apply to
+    /// the bounds.
     fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
-        let recorded = if self.inner.fetch().is_some() || self.inner.projection().is_some() {
-            None
-        } else {
-            match partition {
-                None => Some(Arc::clone(&self.merged.total)),
-                Some(partition) => self.merged.partitions.get(partition).cloned(),
-            }
+        let recorded = match partition {
+            None => Some(Arc::clone(&self.merged.total)),
+            Some(partition) => self.merged.partitions.get(partition).cloned(),
         };
-        let statistics = match recorded {
-            Some(statistics) => statistics,
-            None => self.inner.partition_statistics(partition)?,
+        let Some(recorded) = recorded else {
+            return Ok(Arc::new(Statistics::new_unknown(&self.projected_schema)));
         };
-        Ok(if self.filter.is_some() {
-            Arc::new(Arc::unwrap_or_clone(statistics).to_inexact())
+        if self.projection.is_none() && self.fetch.is_none() && self.filter.is_none() {
+            return Ok(recorded);
+        }
+        let mut statistics = Arc::unwrap_or_clone(recorded).project(self.projection.as_ref());
+        if self.filter.is_some() {
+            statistics = statistics.to_inexact();
+        }
+        let partitions = if partition.is_some() {
+            1
         } else {
-            statistics
-        })
+            self.partitions.len()
+        };
+        Ok(Arc::new(statistics.with_fetch(self.fetch, 0, partitions)?))
     }
 
-    /// Applies a limit through the wrapped source, keeping the accounting
-    /// owners, while this source holds no filter; the limited source no
-    /// longer prunes. A filtering source refuses, because the wrapped one
-    /// would drop the filter.
+    /// Applies a limit to every partition while this source holds no filter;
+    /// the limited source no longer prunes. A filtering source refuses, so
+    /// the limit stays above the filter it takes over.
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn DataSource>> {
         if self.filter.is_some() {
             return None;
         }
-        let limited = self.inner.with_fetch(limit)?;
-        self.rewrapped(&limited)
-            .map(|source| Arc::new(source) as Arc<dyn DataSource>)
+        Some(Arc::new(Self {
+            fetch: limit,
+            ..self.clone()
+        }))
     }
 
-    /// Reports the wrapped source's limit.
+    /// Reports the limit this source applies to each partition.
     fn fetch(&self) -> Option<usize> {
-        self.inner.fetch()
+        self.fetch
     }
 
-    /// Absorbs a projection through the wrapped source, keeping the
-    /// accounting owners, while this source holds no filter; the projected
-    /// source no longer prunes. A filtering source refuses, because the
-    /// wrapped one would drop the filter.
+    /// Absorbs a projection of bare, unaliased columns while this source
+    /// holds no filter; the projected source no longer prunes. A filtering
+    /// source, or any other projection, is refused.
     ///
     /// # Errors
     ///
-    /// Returns the wrapped source's projection error.
+    /// Returns the `DataFusion` error raised when the projected schema
+    /// cannot be built.
     fn try_swapping_with_projection(
         &self,
         projection: &ProjectionExprs,
     ) -> DataFusionResult<Option<Arc<dyn DataSource>>> {
-        if self.filter.is_some() {
+        use datafusion::physical_plan::projection::{
+            all_alias_free_columns, new_projections_for_columns,
+        };
+        let exprs: Vec<_> = projection.iter().cloned().collect();
+        if self.filter.is_some() || !all_alias_free_columns(&exprs) {
             return Ok(None);
         }
-        Ok(self
-            .inner
-            .try_swapping_with_projection(projection)?
-            .and_then(|projected| self.rewrapped(&projected))
-            .map(|source| Arc::new(source) as Arc<dyn DataSource>))
+        let every: Vec<usize> = (0..self.schema.fields().len()).collect();
+        let columns =
+            new_projections_for_columns(&exprs, self.projection.as_deref().unwrap_or(&every));
+        let projected_schema = datafusion::common::project_schema(&self.schema, Some(&columns))?;
+        Ok(Some(Arc::new(Self {
+            projection: Some(columns),
+            projected_schema,
+            ..self.clone()
+        })))
     }
 
     /// Prunes the batches `filters` exclude and takes over every static
@@ -453,7 +508,7 @@ impl DataSource for MemtableSource {
         })
     }
 
-    /// Visits the wrapped source's expressions and any filter it took over.
+    /// Visits the filter this source took over, if any.
     ///
     /// # Errors
     ///
@@ -462,12 +517,10 @@ impl DataSource for MemtableSource {
         &self,
         f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
     ) -> DataFusionResult<TreeNodeRecursion> {
-        if let Some(filter) = &self.filter
-            && f(filter)? == TreeNodeRecursion::Stop
-        {
-            return Ok(TreeNodeRecursion::Stop);
+        match &self.filter {
+            Some(filter) => f(filter),
+            None => Ok(TreeNodeRecursion::Continue),
         }
-        self.inner.apply_expressions(f)
     }
 }
 
@@ -489,7 +542,28 @@ mod tests {
     use datafusion::physical_plan::filter::FilterExec;
     use datafusion::physical_plan::{ExecutionPlan, collect};
 
-    use super::MemtableSource;
+    use super::{MemtableRows, MemtableSource};
+
+    /// Builds the source over already evaluated `batches`, as
+    /// [`MemtableSource::try_new`] does over captured ones.
+    fn evaluated_source(
+        batches: Vec<(RecordBatch, Arc<Statistics>)>,
+        charges: Arc<crate::scribe::memtable::LiveReadOwners>,
+        partitioning: crate::scan_sizing::OraclePartitioning,
+        cap: usize,
+        schema: arrow::datatypes::SchemaRef,
+    ) -> datafusion::error::Result<MemtableSource> {
+        MemtableSource::try_new(
+            batches
+                .into_iter()
+                .map(|(batch, bounds)| (MemtableRows::Evaluated(batch), bounds))
+                .collect(),
+            charges,
+            partitioning,
+            cap,
+            schema,
+        )
+    }
 
     /// Runs filter pushdown over `plan` and returns the rewritten plan with
     /// the memtable source it now reads, which must have replaced the filter.
@@ -538,7 +612,7 @@ mod tests {
     #[tokio::test]
     async fn point_lookup_prunes_batches_outside_their_bounds() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let source = MemtableSource::try_new(
+        let source = evaluated_source(
             vec![
                 bounded(&[0, 1, 2]),
                 bounded(&[10, 11, 12]),
@@ -564,12 +638,7 @@ mod tests {
         );
 
         let (plan, source) = pushed_down(plan);
-        let kept = source
-            .inner
-            .partitions()
-            .iter()
-            .map(Vec::len)
-            .collect::<Vec<_>>();
+        let kept = source.partitions.iter().map(Vec::len).collect::<Vec<_>>();
         let rows = collect(
             plan,
             Arc::new(datafusion::execution::TaskContext::default()),
@@ -609,7 +678,7 @@ mod tests {
                 ..ColumnStatistics::new_unknown()
             }],
         };
-        let source = MemtableSource::try_new(
+        let source = evaluated_source(
             vec![
                 bounded(&[0, 1, 2]),
                 bounded(&[10, 11, 12]),
@@ -742,7 +811,7 @@ mod tests {
                 .get_value()
                 .expect("recorded byte size") as u64
         };
-        let source = MemtableSource::try_new(
+        let source = evaluated_source(
             batches,
             Arc::default(),
             crate::scan_sizing::OraclePartitioning::new(
@@ -770,12 +839,7 @@ mod tests {
         .expect("execute the pruned scan");
 
         assert_eq!(
-            source
-                .inner
-                .partitions()
-                .iter()
-                .map(Vec::len)
-                .collect::<Vec<_>>(),
+            source.partitions.iter().map(Vec::len).collect::<Vec<_>>(),
             vec![3],
             "only the exact batch below the range is excluded"
         );
@@ -819,7 +883,7 @@ mod tests {
         // A recorded bound wider than the rows: only Scribe's bound reports it.
         Arc::make_mut(&mut recorded).column_statistics[0].min_value =
             Precision::Exact(ScalarValue::Int64(Some(-7)));
-        let source = MemtableSource::try_new(
+        let source = evaluated_source(
             vec![(first_batch, recorded), bounded(&[-3, 2])],
             Arc::default(),
             partitioning,
@@ -854,9 +918,8 @@ mod tests {
         let cast = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
         let (batch, bounds) = bounded(&[1, 2]);
         let batch = super::super::exec::project_batch(&batch, Arc::clone(&cast)).expect("cast");
-        let source =
-            MemtableSource::try_new(vec![(batch, bounds)], Arc::default(), partitioning, 1, cast)
-                .expect("cast source");
+        let source = evaluated_source(vec![(batch, bounds)], Arc::default(), partitioning, 1, cast)
+            .expect("cast source");
         let total = source.partition_statistics(None).expect("total");
 
         assert_eq!(total.column_statistics[0].min_value, Precision::Absent);

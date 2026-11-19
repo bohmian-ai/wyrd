@@ -8239,7 +8239,7 @@ mod tests {
             )
             .expect("capture reads");
         let mut values = Vec::new();
-        for readable in read.batches {
+        for readable in read.evaluated().expect("batches evaluate") {
             let attrs = readable.batch.column_by_name("attrs").expect("attrs");
             assert_eq!(
                 attrs.data_type(),
@@ -10185,7 +10185,14 @@ mod tests {
             "a non-final holder keeps the charge"
         );
         assert_eq!(read.batches.len(), 1);
-        assert_eq!(read.batches[0].batch.num_rows(), 1);
+        assert_eq!(
+            read.batches[0]
+                .evaluate()
+                .expect("the batch evaluates")
+                .expect("its row is kept")
+                .num_rows(),
+            1
+        );
         drop(read);
         assert_eq!(
             budget.memory_snapshot().scribe_total_bytes,

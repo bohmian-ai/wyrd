@@ -892,7 +892,9 @@ async fn live_rows(
     let (rows, _charges, runs, _lease) =
         service.open_capture(&request).expect(context).into_parts();
     assert!(runs.is_empty(), "{context}: the fixture staged no run");
-    rows.into_iter().map(|batch| batch.rows).collect()
+    rows.into_iter()
+        .filter_map(|batch| batch.evaluate().expect(context))
+        .collect()
 }
 
 /// Assert a distinct tenant cannot observe the retained hot batch.

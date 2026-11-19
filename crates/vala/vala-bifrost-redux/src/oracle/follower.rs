@@ -482,14 +482,15 @@ impl<T> ScribeTailResolver<T> {
 impl<T> ScribeTailResolver<T> {
     /// Builds the Scribe follower's leaf over one opened live read.
     ///
-    /// Memtable rows arrive already filtered and evaluated to `output_schema`,
-    /// the schema [`signed_requirements`] derives: the requirements' outputs
-    /// when `requirements` is present, else the signed closure. They are dealt
-    /// round-robin across the partitions their bytes earn, at most the
-    /// session's target partitions (see
+    /// Memtable batches arrive retained, not evaluated: each is filtered and
+    /// evaluated to `output_schema`, the schema [`signed_requirements`]
+    /// derives (the requirements' outputs when `requirements` is present,
+    /// else the signed closure), only when its partition's stream pulls it.
+    /// They are dealt round-robin across the partitions their bytes earn, at
+    /// most the session's target partitions (see
     /// [`crate::scan_sizing::OraclePartitioning::scan_partitions`]), of one
-    /// in-memory source. Each batch carries the statistics the live read
-    /// projected onto its outputs, inexact once its filter dropped a row, so
+    /// memtable source. Each batch carries the statistics the live read
+    /// projected onto its outputs, inexact when its filter may drop a row, so
     /// the query's pushed predicate drops batches it cannot match, and the
     /// kept batches are dealt again over the partitions their own bytes earn.
     /// The staged runs are read by [`staged_scan`] at `required_schema`, the
@@ -503,8 +504,8 @@ impl<T> ScribeTailResolver<T> {
     /// `output_schema`.
     ///
     /// # Errors
-    /// Returns [`FollowerResolutionError::Fault`] when a memtable batch does
-    /// not project to the closure, a staged run's size cannot be read or its
+    /// Returns [`FollowerResolutionError::Fault`] when a staged run's size
+    /// cannot be read or its
     /// path is not UTF-8, or a plan node cannot be built.
     async fn live_leaf(
         &self,
@@ -519,20 +520,22 @@ impl<T> ScribeTailResolver<T> {
         let (rows, charges, runs, lease) = read.into_parts();
         let mut leaves: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(2);
         if !rows.is_empty() || runs.is_empty() {
-            let projected = rows
-                .iter()
-                .map(|batch| {
-                    Ok((
-                        super::exec::project_batch(&batch.rows, Arc::clone(output_schema))
-                            .map_err(|_| fault("Scribe memtable rows do not match the closure"))?,
-                        Arc::clone(&batch.statistics),
-                    ))
-                })
-                .collect::<Result<Vec<_>, FollowerResolutionError>>()?;
-            // Dealt over the partitions the projected bytes earn; pushdown
+            // Retained, not evaluated: each batch is filtered, projected,
+            // and cast to the closure only when its partition's stream pulls
+            // it. Dealt over the partitions the recorded bytes earn; pushdown
             // re-deals whatever the query's predicate keeps.
+            let retained = rows
+                .into_iter()
+                .map(|batch| {
+                    let statistics = Arc::clone(batch.statistics());
+                    (
+                        super::memtable_source::MemtableRows::Captured(batch),
+                        statistics,
+                    )
+                })
+                .collect();
             let source = super::memtable_source::MemtableSource::try_new(
-                projected,
+                retained,
                 Arc::new(charges),
                 self.partitioning,
                 session.config().target_partitions(),
@@ -1294,7 +1297,6 @@ pub fn authenticated_preflight(
 pub(crate) mod tests {
     //! Authenticated preflight and role-local provider behavior proofs.
 
-    use crate::scribe::tail_rpc::HotBatch;
     use crate::scribe::tail_rpc::tests::StagedGenerationFixture;
     use crate::scribe::wal::WalLsn;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1412,7 +1414,7 @@ pub(crate) mod tests {
         /// Captured requests, expected to contain exactly one member.
         requests: Arc<std::sync::Mutex<Vec<FetchLiveTailRequest>>>,
         /// Active and unretired immutable cohorts returned by the snapshot seam.
-        batches: Vec<HotBatch>,
+        batches: Vec<crate::scribe::memtable::LiveBatch>,
     }
 
     #[async_trait]
@@ -3102,6 +3104,113 @@ pub(crate) mod tests {
         let mut values = first_int64_values(&rows);
         values.sort_unstable();
         assert_eq!(values, vec![1, 2, 3, 10], "every row is read exactly once");
+    }
+
+    /// Opening a multi-batch memtable capture evaluates none of its rows:
+    /// resolving the follower's leaf retains the captured batches, and each
+    /// one is evaluated only when the source's stream is asked for it, so a
+    /// consumer that stops after the first batch never evaluates the rest.
+    ///
+    /// # Panics
+    /// Panics when resolution or the first pull fails, or when opening or a
+    /// pull examines rows the consumer did not request.
+    #[tokio::test]
+    async fn opening_a_memtable_capture_evaluates_no_row_until_pulled() {
+        use crate::scribe::memtable::live_scan_for_test;
+        use futures_util::StreamExt as _;
+
+        let session = SessionContext::new_with_config(
+            crate::resources::OracleSessionShape::new(1).session_config(),
+        )
+        .state();
+        let tenant_id = DataTenantId::new_v7();
+        let schema = closure_fixture_schema();
+        let day = crate::test_support::day_partition(2026, 8, 19);
+        let (key, memtable) = closure_fixture_memtable(tenant_id, day, &schema);
+        for (lsn, duration) in [(8, 113_i64), (9, 127_i64)] {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from(vec!["later"])),
+                    Arc::new(Int64Array::from(vec![duration])),
+                    Arc::new(StringArray::from(vec!["STATUS_CODE_OK"])),
+                ],
+            )
+            .expect("later batch");
+            let meta = ScribeAppendMeta {
+                batch_id: *uuid::Uuid::now_v7().as_bytes(),
+                schema_fingerprint: [0; 32],
+                data_digest: [0; 32],
+                data_len: 0,
+                payload_digest: [0; 32],
+                payload_len: 0,
+                slice_index: 0,
+                slice_count: 1,
+                rows_accepted: 1,
+                wal_lsn_min: WalLsn::new(lsn),
+                wal_lsn_max: WalLsn::new(lsn),
+                seal_key: key.to_string(),
+            };
+            memtable
+                .insert(&key, meta, batch)
+                .expect("later batch inserts");
+        }
+        let stream = StreamIdentity::new(
+            crate::scribe::stream_identity::NodeId::new(uuid::Uuid::now_v7()),
+            WriterEpoch::new(2),
+        );
+        let resolver = ScribeTailResolver::with_schema(
+            Arc::new(FetchLiveTailService::new(stream, memtable)),
+            Arc::clone(&schema),
+        );
+        let binding = closure_fixture_binding(tenant_id);
+        let assignment = reading_capture(
+            &resolver.tail,
+            closure_assignment(
+                local_scribe_scan_id(&binding, stream),
+                binding,
+                schema.as_ref(),
+                signed_closure(),
+                super::super::assignment_schema_fingerprint(schema.as_ref()),
+            ),
+        )
+        .await;
+
+        let before = live_scan_for_test();
+        let plan = resolver
+            .resolve(
+                ClusterRole::Scribe,
+                test_query_id(),
+                &assignment,
+                &RemoteScanPayload::default(),
+                &session,
+            )
+            .await
+            .expect("the three-batch cut resolves")
+            .plan;
+        assert_eq!(live_scan_for_test().0, before.0, "opening examines no row");
+
+        let mut rows = plan
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("the memtable partition opens");
+        let first = rows
+            .next()
+            .await
+            .expect("a first batch")
+            .expect("the first batch evaluates");
+        assert_eq!(first_int64_values(&[first]), vec![41, 97]);
+        assert_eq!(
+            live_scan_for_test().0 - before.0,
+            2,
+            "the first pull examines only the first batch"
+        );
+        drop(rows);
+        drop(plan);
+        assert_eq!(
+            live_scan_for_test().0 - before.0,
+            2,
+            "dropping the stream evaluates no later batch"
+        );
     }
 
     /// Every authenticated request-component contradiction fails before resolution.

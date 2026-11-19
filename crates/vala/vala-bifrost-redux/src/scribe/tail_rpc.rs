@@ -388,33 +388,20 @@ pub struct FetchLiveTailRequest {
     pub(crate) memory: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
 }
 
-/// One shallow, structural hot snapshot returned by a shard owner.
-#[derive(Debug, Clone)]
-pub struct HotBatch {
-    /// Exact partition day owning the batch.
-    pub partition_day: TimePartition,
-    /// Immutable generation holding the rows, or `None` while they are still
-    /// in a writable bucket.
-    pub generation: Option<crate::scribe::hot_source::GenerationOrdinal>,
-    /// Arrow rows projected to the request's required columns.
-    pub rows: arrow::record_batch::RecordBatch,
-    /// Exact bounds of `rows`, column for column, computed when the rows
-    /// were appended; the follower prunes the batch with them.
-    pub statistics: std::sync::Arc<datafusion::common::Statistics>,
-}
-
 /// One partition range read from a retained Scribe live capture.
 ///
-/// Opening filters and projects the capture's memory batches and names its
-/// staged runs in range; nothing is decoded or copied here. The Scribe
+/// Opening retains the capture's memory batches the read's pruning keeps and
+/// names its staged runs in range; no row is evaluated, decoded, or copied
+/// here. Each memory batch is evaluated only when the follower's source pulls
+/// it. The Scribe
 /// follower turns it into one `DataFusion` plan: the memory rows become an
 /// in-memory source, the runs are read by Oracle's hot-Parquet scan, and the
 /// shared lease moves into that scan so a run stays readable even if
 /// publication retires its authority meanwhile.
 #[derive(Debug)]
 pub struct LiveTailBatches {
-    /// Memory batches in capture order, not yet filtered.
-    memtable: Vec<HotBatch>,
+    /// Memory batches in capture order, not yet evaluated.
+    memtable: Vec<crate::scribe::memtable::LiveBatch>,
     /// Accounting owners of `memtable`'s Arrow buffers: charges shared with
     /// the retained capture, so retirement cannot uncharge them while this
     /// read holds them, and the query's reservation of what it allocated.
@@ -428,7 +415,7 @@ pub struct LiveTailBatches {
 /// The parts of one [`LiveTailBatches`]: memory batches, their accounting
 /// owners, staged run paths, and the lease keeping those runs on disk.
 pub(crate) type LiveTailParts = (
-    Vec<HotBatch>,
+    Vec<crate::scribe::memtable::LiveBatch>,
     crate::scribe::memtable::LiveReadOwners,
     Vec<PathBuf>,
     Option<Arc<StagedSourceLease>>,
@@ -438,8 +425,9 @@ impl LiveTailBatches {
     /// Wraps an already captured memtable snapshot with no staged members.
     ///
     /// Used by resolver fixtures that supply their own cohort.
+    #[cfg(test)]
     #[must_use]
-    pub fn from_snapshot(memtable: Vec<HotBatch>) -> Self {
+    pub(crate) fn from_snapshot(memtable: Vec<crate::scribe::memtable::LiveBatch>) -> Self {
         Self {
             memtable,
             charges: crate::scribe::memtable::LiveReadOwners::default(),
@@ -976,16 +964,7 @@ impl FetchLiveTailService {
             &request.memory,
         )?;
         Ok(LiveTailBatches {
-            memtable: read
-                .batches
-                .into_iter()
-                .map(|readable| HotBatch {
-                    partition_day: readable.partition_day,
-                    generation: readable.generation,
-                    rows: readable.batch,
-                    statistics: readable.statistics,
-                })
-                .collect(),
+            memtable: read.batches,
             charges: read.owners,
             runs: read.runs,
             staged: read.lease,
@@ -1275,7 +1254,13 @@ pub(crate) mod tests {
         let (rows, _charges, runs, _lease) = read.into_parts();
         let mut values = rows
             .iter()
-            .flat_map(|batch| first_column_values(&batch.rows))
+            .flat_map(|batch| {
+                batch
+                    .evaluate()
+                    .expect("the batch evaluates")
+                    .map(|rows| first_column_values(&rows))
+                    .unwrap_or_default()
+            })
             .collect::<Vec<_>>();
         for run in runs {
             let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(

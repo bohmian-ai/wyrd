@@ -71,19 +71,24 @@ wyrd-server migrate
 
 ## 3. Start the server and check readiness
 
-The server needs two keys of its own. Create them once, store them in your secret manager, and mount the same two files on every replica:
+The server needs two keys of its own. Create them once, store them in your secret manager, and mount the same files on every replica:
 
 ```bash
 openssl genpkey -algorithm ed25519 -out signing.pem
-openssl rand -base64 32 | tr -d '\n' > sealing.key
-chmod 0600 signing.pem sealing.key
+mkdir kms
+openssl rand -base64 32 | tr -d '\n' > kms/v1
+chmod 0600 signing.pem kms/v1
 ```
 
 The server reads only regular files that the user running it owns and nobody else can read, so mount them with that owner and mode `0600`.
 
 The signing key signs the access tokens Wyrd issues. Every request carries one, and a replica accepts it only if this key signed it. With one shared key, a token issued by any replica works on all of them and still works after a restart. With `APP_ENV=production` and no signing key, the server refuses to start.
 
-The sealing key encrypts the secrets Wyrd stores in PostgreSQL, such as LLM provider keys stored as `managed_secret` and identity provider client secrets, so a copy of the database does not expose them. Back it up separately from the database. If it is lost, those secrets cannot be decrypted, and the server refuses to start while any are stored.
+The `kms/v1` key encrypts the secrets Wyrd stores in PostgreSQL, such as LLM provider keys stored as `managed_secret`, identity provider client secrets, and Operator connection credentials, so a copy of the database does not expose them. Back it up separately from the database. If it is lost, those secrets cannot be decrypted, and the server refuses to start while any are stored.
+
+<Aside type="note" title="Use a cloud KMS or Vault instead">
+To keep this key in Google Cloud KMS, AWS KMS, or Vault Transit, set the `WYRD_KMS_*` variables in [Stored-secret encryption](/reference/stored-secret-encryption/) instead of the three below.
+</Aside>
 
 Set these variables, then start `wyrd-server` with the same `WYRD_DATABASE_URL`:
 
@@ -91,7 +96,9 @@ Set these variables, then start `wyrd-server` with the same `WYRD_DATABASE_URL`:
 | --- | --- | --- |
 | `WYRD_STORAGE_URL` | `s3://bucket`, `gs://bucket`, or `az://account/container`; bucket only, no path. S3 reads its region from `AWS_REGION` | Data goes to a local directory that only this process sees |
 | `WYRD_SIGNING_KEY_FILE` | Path to `signing.pem` | Startup fails when `APP_ENV=production`; otherwise each process makes a temporary key, and tokens stop working after a restart and on other replicas |
-| `WYRD_SEALING_KEY_FILE` | Path to `sealing.key` | Storing a `managed_secret` fails with `gateway credential protection is unavailable` |
+| `WYRD_KMS_BACKEND` | `file` | Storing a secret fails, such as a `managed_secret` with `gateway credential protection is unavailable` |
+| `WYRD_KMS_KEY_DIR` | Path to the `kms` directory | Startup fails when `WYRD_KMS_BACKEND=file` |
+| `WYRD_KMS_ACTIVE_KEY` | `v1`, the key's file name | Startup fails when `WYRD_KMS_BACKEND` is set |
 | `WYRD_OTLP_ENDPOINT` | Your OpenTelemetry collector's OTLP/gRPC URL, such as `http://collector:4317` | The server exports no traces to you; tenants' own timelines still work |
 | `WYRD_OTLP_SAMPLE_RATIO` | The share of traces exported to your collector, from `0` to `1` | `0.01`: 1% of traces |
 | `WYRD_TRACE_FILTER` | Which spans reach your collector, such as `info,wyrd_server=debug` | `info` |

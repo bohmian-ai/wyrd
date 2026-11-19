@@ -4,7 +4,6 @@ description: The [kms] server settings that select the wrapping backend and keys
 pillar: wyrd
 section: Reference
 order: 6
-draft: true
 ---
 
 `wyrd-server` encrypts every recoverable secret it stores with a fresh 256-bit data key, and wraps that key with the deployment wrapping key that `[kms]` selects. Settings are read once at startup from the `[kms]` table of the [server TOML file](/reference/verification-runtime-limits/#server-toml-file). Environment variables override them, and a change takes effect after a restart.
@@ -54,6 +53,54 @@ The workload needs these provider permissions on every active and retained key:
 | `gcp_kms` | `cloudkms.cryptoKeyVersions.useToEncrypt` and `cloudkms.cryptoKeyVersions.useToDecrypt` (role `roles/cloudkms.cryptoKeyEncrypterDecrypter`) |
 | `aws_kms` | `kms:Encrypt` and `kms:Decrypt` |
 | `vault_transit` | `update` on `<mount>/encrypt/<key>` and `<mount>/decrypt/<key>` |
+
+## Provider setup
+
+Wyrd neither creates nor deletes wrapping keys. Provision each key before the server starts, and grant the server's workload only the permissions above.
+
+### `file`
+
+```bash
+mkdir kms
+openssl rand -base64 32 | tr -d '\n' > kms/v1
+chmod 0600 kms/v1
+```
+
+Set `key_dir` to the `kms` directory and `active_key` to `v1`. The user running the server must own the file.
+
+### `vault_transit`
+
+```bash
+vault secrets enable transit
+vault write -f transit/keys/wyrd-secrets type=aes256-gcm96
+vault policy write wyrd-kms - <<'HCL'
+path "transit/encrypt/wyrd-secrets" { capabilities = ["update"] }
+path "transit/decrypt/wyrd-secrets" { capabilities = ["update"] }
+HCL
+vault token create -policy=wyrd-kms -field=token > vault-token
+chmod 0600 vault-token
+```
+
+Set `endpoint` to the Vault address, `active_key` to `wyrd-secrets`, and `vault_token_file` to the token file. A Vault Agent may renew or replace the token in that file. Rotate with `vault write -f transit/keys/wyrd-secrets/rotate`; existing values stay readable and `active_key` does not change.
+
+### `gcp_kms`
+
+```bash
+gcloud kms keyrings create wyrd --location=us-central1
+gcloud kms keys create wyrd-secrets --keyring=wyrd --location=us-central1 --purpose=encryption
+gcloud kms keys add-iam-policy-binding wyrd-secrets --keyring=wyrd --location=us-central1 \
+  --member=serviceAccount:<server-service-account> --role=roles/cloudkms.cryptoKeyEncrypterDecrypter
+```
+
+Set `active_key` to `projects/<project>/locations/us-central1/keyRings/wyrd/cryptoKeys/wyrd-secrets`. Run the server as that service account, or point `GOOGLE_APPLICATION_CREDENTIALS` at its key file.
+
+### `aws_kms`
+
+```bash
+aws kms create-key --key-spec SYMMETRIC_DEFAULT --key-usage ENCRYPT_DECRYPT --query KeyMetadata.Arn --output text
+```
+
+Allow `kms:Encrypt` and `kms:Decrypt` on the printed ARN to the server's IAM role, through the key policy or an IAM policy, and set `active_key` to that ARN.
 
 ## Example
 

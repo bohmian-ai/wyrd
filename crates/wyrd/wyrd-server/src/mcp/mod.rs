@@ -233,6 +233,7 @@ impl ServerHandler for WyrdMcpHandler {
             .chain(verification::approve_descriptors())
             .chain(operators::write_descriptors())
             .chain(github::write_descriptors())
+            .chain(github::review_descriptors())
             .chain(gateway::descriptors())
             .chain(self.probe_descriptors())
             .find(|tool| tool.name == name)
@@ -262,6 +263,7 @@ impl ServerHandler for WyrdMcpHandler {
             }
             if verification::may_run_verifiers(&caller) {
                 catalog.extend(verification::write_descriptors());
+                catalog.extend(github::review_descriptors());
             }
             if verification::may_approve(&caller) {
                 catalog.extend(verification::approve_descriptors());
@@ -481,7 +483,7 @@ impl WyrdMcpHandler {
                     .await
                     .map_err(wyrd_error_to_mcp)
             }
-            name @ (github::GET | github::CONNECT | github::DISCONNECT) => {
+            name @ (github::GET | github::CONNECT | github::DISCONNECT | github::REVIEW) => {
                 let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
                 // Authorized and audited by the operation.
                 self.mcp_github(name, caller, request.arguments)
@@ -592,6 +594,7 @@ mod tests {
             .chain(verification::approve_descriptors())
             .chain(operators::write_descriptors())
             .chain(github::write_descriptors())
+            .chain(github::review_descriptors())
             .chain(gateway::descriptors())
             .collect();
         assert!(catalog.iter().any(|tool| tool.name == operators::CREATE));

@@ -291,6 +291,14 @@ impl Deployment {
     /// Panics when the query fails or any newest status still differs after
     /// ten seconds.
     pub(crate) async fn await_newest(&self, executions: &[Uuid], expected: &str) {
+        self.await_newest_as(&self.jwt, executions, expected).await;
+    }
+
+    /// [`Self::await_newest`], read as `jwt`.
+    ///
+    /// # Panics
+    /// Panics as [`Self::await_newest`] does.
+    pub(crate) async fn await_newest_as(&self, jwt: &str, executions: &[Uuid], expected: &str) {
         let ids = executions
             .iter()
             .map(|execution| format!("'{execution}'"))
@@ -304,7 +312,7 @@ impl Deployment {
                ON e.execution_id = l.execution_id AND e.occurred_at = l.occurred_at \
             WHERE e.event = 'status' AND e.execution_id IN ({ids})"
         );
-        let sdk = client(self.base(), &self.jwt);
+        let sdk = client(self.base(), jwt);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             let mut stream = Bifrost::query_only(&sdk)
@@ -591,8 +599,9 @@ async fn pull_request_lifecycle_admits_supersedes_and_ends_through_the_webhook()
             "head_repository_id": "4242",
             "delivery_id": opened,
             "generation": served["pull_request"]["generation"],
+            "members": [a[0].execution_id.to_string(), a[1].execution_id.to_string()],
         }),
-        "the execution is pinned to GitHub's current source"
+        "the execution is pinned to GitHub's current source and its generation's members"
     );
     let text = served.to_string();
     for secret in mock.secrets() {
@@ -2092,4 +2101,204 @@ async fn pull_request_inspection_requires_repository_read() {
     let (code, body) = read_as(&deployment, &both, &status).await;
     assert_eq!(code, StatusCode::OK, "{body}");
     assert_eq!(body["status"], "completed");
+}
+
+/// One PR execution's retained input record, as an authorized SDK Bifrost
+/// query returns it.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(crate) struct Retained {
+    /// The execution.
+    pub(crate) execution_id: Uuid,
+    /// The Repository Card version whose binding admitted it.
+    pub(crate) workload_card_uid: Option<String>,
+    /// Its frozen PR pins.
+    pub(crate) inputs: Value,
+}
+
+impl Deployment {
+    /// Every retained `pull_request` input record of PR `number`, read as
+    /// `jwt` through the SDK's Bifrost query once at least `count` are
+    /// visible.
+    ///
+    /// # Panics
+    /// Panics when the query fails or fewer than `count` are visible after
+    /// ten seconds.
+    pub(crate) async fn retained_as(&self, jwt: &str, number: u64, count: usize) -> Vec<Retained> {
+        let sdk = client(self.base(), jwt);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let rows: Vec<Retained> = Bifrost::query_only(&sdk)
+                .sql_as(
+                    "SELECT execution_id, workload_card_uid, inputs \
+                       FROM bifrost.verification.execution_inputs \
+                      WHERE origin = 'pull_request' ORDER BY execution_id",
+                    &[],
+                )
+                .await
+                .expect("retained inputs query");
+            let rows: Vec<Retained> = rows
+                .into_iter()
+                .filter(|row| row.inputs["number"] == json!(number))
+                .collect();
+            if rows.len() >= count {
+                return rows;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "only {} of {count} members retained: {rows:?}",
+                rows.len()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// The card UID of Repository `policy` at `version`.
+    ///
+    /// # Panics
+    /// Panics when the read fails.
+    pub(crate) async fn policy_uid(&self, version: &str) -> String {
+        let mut conn = self.conn().await;
+        let uid: Uuid = sqlx::query_scalar(
+            "SELECT card_uid FROM wyrd.cards
+              WHERE kind = 'Repository' AND name = 'policy' AND version = $1",
+        )
+        .bind(version)
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("policy reads");
+        conn.commit().await.expect("read commits");
+        uid.to_string()
+    }
+}
+
+/// Assert `retained` holds exactly `rows`' executions, each naming the same
+/// generation, the selected `policy`, and the complete member list in
+/// binding order.
+///
+/// # Panics
+/// Panics when a member is missing, duplicated or names other membership.
+fn assert_complete(retained: &[Retained], rows: &[Row], policy: &str) {
+    let members: Vec<Value> = rows
+        .iter()
+        .map(|row| json!(row.execution_id.to_string()))
+        .collect();
+    let mut ids: Vec<Uuid> = retained.iter().map(|row| row.execution_id).collect();
+    ids.sort_unstable();
+    let mut expected: Vec<Uuid> = rows.iter().map(|row| row.execution_id).collect();
+    expected.sort_unstable();
+    assert_eq!(ids, expected, "every member is retained once");
+    let generation = &retained[0].inputs["generation"];
+    for row in retained {
+        assert_eq!(&row.inputs["generation"], generation, "{row:?}");
+        assert_eq!(row.inputs["members"], json!(members), "{row:?}");
+        assert_eq!(row.workload_card_uid.as_deref(), Some(policy), "{row:?}");
+    }
+}
+
+/// Every member of an admitted generation is retained with its generation,
+/// selected policy and complete membership, refused members included: a
+/// mixed generation keeps its runnable and its refused member, and an
+/// all-refused generation keeps both refusals. Refused members record their
+/// `errored` status and never become runnable.
+///
+/// # Panics
+/// Panics when a member is not retained, membership is incomplete, a refusal
+/// has no recorded status, or a refused member is claimable.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_admitted_member_is_retained_with_its_status() {
+    let deployment = Deployment::start().await;
+    let Bootstrap::User { jwt: reader, .. } = deployment
+        .server
+        .bootstrap_user("pull-request-reader", &["editor"])
+        .await
+        .expect("reader bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let policy = deployment.policy_uid("1.0.0").await;
+    let pool = deployment
+        .server
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    sqlx::query(
+        "UPDATE wyrd.cards SET status = 'deleted' WHERE kind = 'Verifier' AND name = 'z-review'",
+    )
+    .execute(&pool)
+    .await
+    .expect("z-review is deleted");
+    deployment
+        .mock
+        .set_pull_request(REPOSITORY, 21, PullRequest::open(REPOSITORY, "b1", "m1"));
+
+    assert_eq!(deployment.send(21, "opened").await.0, StatusCode::ACCEPTED);
+    let mixed = deployment.rows(21).await;
+    let mut statuses: Vec<&str> = mixed.iter().map(|row| row.status.as_str()).collect();
+    statuses.sort_unstable();
+    assert_eq!(statuses, ["errored", "pending"], "{mixed:?}");
+    assert_complete(
+        &deployment.retained_as(&reader, 21, 2).await,
+        &mixed,
+        &policy,
+    );
+    let refused: Vec<Uuid> = mixed
+        .iter()
+        .filter(|row| row.status == "errored")
+        .map(|row| row.execution_id)
+        .collect();
+    deployment
+        .await_newest_as(&reader, &refused, "errored")
+        .await;
+    let claimed = deployment.claim(10).await;
+    assert_eq!(
+        claimed
+            .iter()
+            .map(|claim| claim.lease.execution_id.as_uuid())
+            .collect::<Vec<_>>(),
+        mixed
+            .iter()
+            .filter(|row| row.status == "pending")
+            .map(|row| row.execution_id)
+            .collect::<Vec<_>>(),
+        "only the runnable member is claimable"
+    );
+
+    sqlx::query(
+        "UPDATE wyrd.auth_users SET status = 'suspended'
+          WHERE id = (SELECT o.sub_principal_id FROM wyrd.cards c
+                        JOIN wyrd.card_declaration_operations o
+                          ON o.operation_id = c.selection_occurrence
+                       WHERE c.kind = 'Repository' AND c.name = 'policy')",
+    )
+    .execute(&pool)
+    .await
+    .expect("the editor is suspended");
+    deployment
+        .mock
+        .set_pull_request(REPOSITORY, 22, PullRequest::open(REPOSITORY, "b1", "r1"));
+    assert_eq!(deployment.send(22, "opened").await.0, StatusCode::ACCEPTED);
+    let refusals = deployment.rows(22).await;
+    assert!(
+        refusals.iter().all(|row| row.status == "errored"),
+        "{refusals:?}"
+    );
+    assert_complete(
+        &deployment.retained_as(&reader, 22, 2).await,
+        &refusals,
+        &policy,
+    );
+    deployment
+        .await_newest_as(
+            &reader,
+            &refusals
+                .iter()
+                .map(|row| row.execution_id)
+                .collect::<Vec<_>>(),
+            "errored",
+        )
+        .await;
+    assert!(
+        deployment.claim(10).await.is_empty(),
+        "a refusal is never runnable"
+    );
 }

@@ -535,13 +535,19 @@ pub struct PullRequestRef {
 
 /// The pull request source one queued execution was admitted for.
 ///
-/// Every execution of one admission shares its `generation`. A newer
-/// source of the same pull request supersedes the generation: its unfinished
-/// executions are cancelled with code `pull_request_superseded`. A close or
-/// draft conversion cancels them with `pull_request_closed` or
+/// Every execution of one admission shares its `generation` and lists the
+/// generation's complete `members`, so a reader that sees fewer members'
+/// records than `members` names knows the set is not yet fully visible. A
+/// newer source of the same pull request supersedes the generation: its
+/// unfinished executions are cancelled with code `pull_request_superseded`.
+/// A close or draft conversion cancels them with `pull_request_closed` or
 /// `pull_request_draft`, and losing the repository through removal,
 /// suspension or disconnect with `repository_access_lost`. Settled history
 /// keeps these pins.
+///
+/// A provider delivery admits a generation under its `delivery_id`; an
+/// explicit fresh-review request admits one under its `request_key`
+/// instead.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
@@ -561,10 +567,21 @@ pub struct PullRequestActivation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_repository_id: Option<RepositoryId>,
     /// Provider delivery that admitted the source, for matching the
-    /// provider's delivery log.
-    pub delivery_id: String,
+    /// provider's delivery log; absent for an explicit review request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_id: Option<String>,
+    /// Idempotency key of the explicit fresh-review request that admitted
+    /// the source; absent for a provider delivery. A retry of the same key
+    /// for the same pull request returns this generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_key: Option<String>,
     /// The admission every execution of this source shares.
     pub generation: uuid::Uuid,
+    /// Every execution of the generation, refused members included, in
+    /// binding order; empty only on a generation recorded before
+    /// membership was retained.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<ExecutionId>,
 }
 
 /// The attributable decision of one Verifier execution.

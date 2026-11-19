@@ -2575,6 +2575,20 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: Value,
     },
+    /// A fresh review was requested for a pull request that cannot be reviewed now.
+    #[error("[WYRD_GITHUB_409_PULL_REQUEST_NOT_REVIEWABLE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_GITHUB_409_PULL_REQUEST_NOT_REVIEWABLE",
+        status = 409,
+        title = "Pull request not reviewable",
+        remediation = "Request a review only for an open, ready pull request of a repository whose selected Repository declares pull_request bindings; details.reason is not_found, closed, draft or no_bindings, and no work was accepted."
+    )]
+    GithubPullRequestNotReviewable {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
     /// A binding's effective Trigger activation cannot run its Verifier.
     #[error("[WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH] {message}")]
     #[wyrd_error(
@@ -4324,6 +4338,7 @@ impl WyrdError {
             | Self::GithubRepositoryInaccessible { message, details }
             | Self::GithubWebhookRefused { message, details }
             | Self::GithubRequestInvalid { message, details }
+            | Self::GithubPullRequestNotReviewable { message, details }
             | Self::SpecTriggerActivationMismatch { message, details }
             | Self::SpecInvalidServiceComponentKind { message, details }
             | Self::SpecUnboundVerifierPeer { message, details }

@@ -1,5 +1,6 @@
 //! Tenant GitHub connection: connect, read and disconnect the deployment's
-//! configured GitHub App.
+//! configured GitHub App, and request a fresh review of a connected pull
+//! request.
 //!
 //! The shared implementation every first-class SDK, the CLI, and MCP project.
 //! It owns no durable state: the server verifies, associates, authorizes and
@@ -19,7 +20,8 @@ use crate::client::WyrdClient;
 pub use wyrd_spec::error::WyrdError;
 pub use wyrd_spec::github_connection::{
     GithubAppIdentity, GithubConnectRequest, GithubConnectResponse, GithubConnectionState,
-    GithubConnectionView, GithubRepositoryAccess,
+    GithubConnectionView, GithubPullRequestReviewRequest, GithubPullRequestReviewResponse,
+    GithubRepositoryAccess,
 };
 
 /// The connection route.
@@ -113,6 +115,38 @@ impl GithubConnection {
         self.client
             .http
             .request_json::<(), _>(Method::DELETE, PATH, None)
+            .await
+    }
+
+    /// Request a fresh review of one connected pull request by its selected
+    /// Repository's whole `pull_request` binding set, under `key`.
+    ///
+    /// `key` names the request: a retry with the same key for the same pull
+    /// request, after a lost response or a restart, returns the same
+    /// generation and members; a distinct key admits a new generation even
+    /// at an unchanged head. The key is sent verbatim as `Idempotency-Key` on
+    /// every transport attempt.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the caller lacks `cards:read`, or
+    /// `verifier:read` or `verifier:run` on a selected Verifier; when the pull
+    /// request is missing, closed, draft or bound by no Verifier
+    /// (`WYRD_GITHUB_409_PULL_REQUEST_NOT_REVIEWABLE`); when the repository is
+    /// not connected; when GitHub or the accountable authority is unavailable
+    /// (retryable under the same key); or when the request fails.
+    pub async fn review_pull_request(
+        &self,
+        request: &GithubPullRequestReviewRequest,
+        key: &str,
+    ) -> Result<GithubPullRequestReviewResponse, WyrdError> {
+        self.client
+            .http
+            .submit_with_idempotency_key(
+                Method::POST,
+                &format!("{PATH}/pull-requests/reviews"),
+                request,
+                key,
+            )
             .await
     }
 }

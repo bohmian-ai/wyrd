@@ -58,7 +58,10 @@ use wyrd_spec::gateway::{
     GatewayFallbackPolicy, GatewayGovernancePolicy, ProviderCredentialView,
     ProviderCredentialWrite, ProviderDeployment,
 };
-use wyrd_spec::github_connection::{GithubConnectResponse, GithubConnectionView};
+use wyrd_spec::github_connection::{
+    GithubConnectResponse, GithubConnectionView, GithubPullRequestReviewRequest,
+    GithubPullRequestReviewResponse,
+};
 use wyrd_spec::operator_connection::{
     CreateOperatorConnectionRequest, OperatorConnectionView, UpdateOperatorConnectionRequest,
 };
@@ -336,6 +339,8 @@ fn contracts() -> Value {
         OperatorConnectionView,
         GithubConnectResponse,
         GithubConnectionView,
+        GithubPullRequestReviewRequest,
+        GithubPullRequestReviewResponse,
         SpanRecord,
     )
     .into_iter()

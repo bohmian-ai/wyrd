@@ -4329,8 +4329,10 @@ fn pins(head: &str) -> PullRequestActivation {
             sha: head.repeat(40),
         },
         head_repository_id: Some(RepositoryId::new("42").expect("valid repository id")),
-        delivery_id: Uuid::now_v7().to_string(),
+        delivery_id: Some(Uuid::now_v7().to_string()),
+        request_key: None,
         generation: Uuid::now_v7(),
+        members: Vec::new(),
     }
 }
 

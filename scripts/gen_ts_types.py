@@ -95,6 +95,8 @@ WIRE_ROOTS = [
     "OperatorConnectionView",
     "GithubConnectResponse",
     "GithubConnectionView",
+    "GithubPullRequestReviewRequest",
+    "GithubPullRequestReviewResponse",
     "UpdateOperatorConnectionRequest",
     "ExecutionPlan",
     "VerificationDetails",

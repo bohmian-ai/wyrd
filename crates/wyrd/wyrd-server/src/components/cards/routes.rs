@@ -877,19 +877,24 @@ fn parse_card_uid(value: &str) -> Result<CardUid, WyrdErrorResponse> {
     })
 }
 
-/// Extract and validate the required declaration idempotency key.
+/// Extract and validate a required idempotency key.
 ///
-/// Declaration requires a caller-supplied key because the server cannot infer
-/// whether two otherwise identical requests are a retry or an intentional new
-/// operation. The service combines this key with the principal and canonical
-/// request hash to provide exactly-once declaration semantics.
-fn extract_required_idempotency_key(
+/// Declaration, and every other request whose identical retries and
+/// intentional repeats the server cannot tell apart, such as a fresh pull
+/// request review, requires a caller-supplied key. The declaration service
+/// combines it with the principal and canonical request hash to provide
+/// exactly-once declaration semantics.
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_400_IDEMPOTENCY_KEY_REQUIRED`-family errors for a
+/// missing, non-UTF-8 or invalid key.
+pub(crate) fn extract_required_idempotency_key(
     headers: &HeaderMap,
 ) -> Result<IdempotencyKey, WyrdErrorResponse> {
     let value = headers
         .get(header::HeaderName::from_static(IDEMPOTENCY_KEY_HEADER))
         .ok_or_else(|| WyrdError::RegistryIdempotencyKeyRequired {
-            message: "Idempotency-Key header is required for card lifecycle requests".to_owned(),
+            message: "Idempotency-Key header is required for this request".to_owned(),
             details: serde_json::json!({ "header": IDEMPOTENCY_KEY_HEADER }),
         })?;
     let value = value

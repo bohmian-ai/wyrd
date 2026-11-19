@@ -5,7 +5,9 @@
 //! ([`VerifierExecutionQueue::lock_pull_request`]) against the PR's current
 //! generation: an observation older than the latest one is obsolete, a
 //! closed or draft PR deactivates it ([`VerifierExecutionQueue::deactivate_pull_request`]),
-//! an unchanged source replays it, and a new source reserves a new
+//! an unchanged source replays it, an explicit review request's key replays
+//! the generation it admitted ([`VerifierExecutionQueue::requested_pull_request`]),
+//! and a new source or a new request key reserves a new
 //! generation ([`VerifierExecutionQueue::reserve_pull_request`]) that cancels
 //! every older unfinished execution of the PR in the same transaction, or,
 //! when the selected policy binds nothing, deactivates the older ones as
@@ -63,18 +65,42 @@ const LATEST_SQL: &str = concat!(
     this_pull_request!()
 );
 
+/// The columns [`GenerationRow`] reads.
+macro_rules! generation_columns {
+    () => {
+        "SELECT execution_id, binding_id, status, next_attempt_at = 'infinity' AS reserved,
+                authority IS NULL AS refused, verifier_card_uid, card_uid, owner_card_uid,
+                sub_principal_id, act_principal_id, pull_request, pr_observed_at,
+                pr_deactivated_at
+           FROM wyrd.verifier_executions
+          WHERE "
+    };
+}
+
 /// Every execution of the PR's newest generation, in binding order.
 const CURRENT_SQL: &str = concat!(
-    "SELECT execution_id, binding_id, status, next_attempt_at = 'infinity' AS reserved,
-            verifier_card_uid, card_uid, owner_card_uid, sub_principal_id, act_principal_id,
-            pull_request, pr_observed_at, pr_deactivated_at
-       FROM wyrd.verifier_executions
-      WHERE ",
+    generation_columns!(),
     this_pull_request!(),
     " AND pr_observed_at = (SELECT max(pr_observed_at) FROM wyrd.verifier_executions WHERE ",
     this_pull_request!(),
     ") ORDER BY binding_id"
 );
+
+/// Every execution of the PR's generation admitted by explicit review
+/// request key `$4`, in binding order.
+const REQUESTED_SQL: &str = concat!(
+    generation_columns!(),
+    this_pull_request!(),
+    " AND pull_request->>'request_key' = $4 ORDER BY binding_id"
+);
+
+/// Record the complete member list `$1`, in binding order, in every member's
+/// pins.
+const MEMBERS_SQL: &str = "
+    UPDATE wyrd.verifier_executions
+       SET pull_request = jsonb_set(pull_request, '{members}', to_jsonb($1::uuid[]))
+     WHERE execution_id = ANY($1)
+";
 
 /// Every tenant holding an execution of a PR generation not deactivated.
 const PULL_REQUEST_TENANTS_SQL: &str =
@@ -368,6 +394,9 @@ pub struct PullRequestExecution {
     pub status: VerificationExecutionStatus,
     /// Whether it still awaits its handoff: reserved and never activated.
     pub reserved: bool,
+    /// Whether admission refused it: a terminal `errored` execution
+    /// without accepted authority, which never becomes runnable.
+    pub refused: bool,
     /// Exact Verifier.
     pub verifier_card_uid: CardUid,
     /// Exact subject.
@@ -454,6 +483,8 @@ struct GenerationRow {
     status: String,
     /// Whether the row is still due at `infinity`.
     reserved: Option<bool>,
+    /// Whether the row has no accepted authority.
+    refused: Option<bool>,
     /// Verifier.
     verifier_card_uid: Uuid,
     /// Subject.
@@ -496,6 +527,39 @@ fn cancelled_of(rows: Vec<EndedRow>) -> Result<Vec<CancelledExecution>, SqlxErro
         .filter(|row| row.cancelled.unwrap_or(false))
         .map(|row| row.identities.decode())
         .collect()
+}
+
+/// The one generation `rows` hold, in their order; `None` when empty.
+///
+/// # Errors
+/// Returns [`SqlxError::Decode`] when a stored identity or status is
+/// malformed.
+fn generation_of(rows: Vec<GenerationRow>) -> Result<Option<PullRequestGeneration>, SqlxError> {
+    let mut current: Option<PullRequestGeneration> = None;
+    for row in rows {
+        let execution = PullRequestExecution {
+            execution_id: stored(ExecutionId::new(row.execution_id))?,
+            binding_id: stored(BindingId::new(row.binding_id))?,
+            status: stored(row.status.parse())?,
+            reserved: row.reserved.unwrap_or(false),
+            refused: row.refused.unwrap_or(false),
+            verifier_card_uid: stored(CardUid::from_uuid(row.verifier_card_uid))?,
+            card_uid: stored(CardUid::from_uuid(row.card_uid))?,
+            owner_card_uid: stored(CardUid::from_uuid(row.owner_card_uid))?,
+            attribution: Attribution::new(
+                PrincipalId::new(row.sub_principal_id),
+                PrincipalId::new(row.act_principal_id),
+            ),
+        };
+        let generation = current.get_or_insert_with(|| PullRequestGeneration {
+            activation: row.pull_request.0,
+            observed_at: row.pr_observed_at,
+            deactivated: row.pr_deactivated_at.is_some(),
+            executions: Vec::new(),
+        });
+        generation.executions.push(execution);
+    }
+    Ok(current)
 }
 
 impl VerifierExecutionQueue {
@@ -554,30 +618,44 @@ impl VerifierExecutionQueue {
                 .bind(number)
                 .fetch_all(&mut **conn.transaction())
                 .await?;
-            let mut current: Option<PullRequestGeneration> = None;
-            for row in rows {
-                let execution = PullRequestExecution {
-                    execution_id: stored(ExecutionId::new(row.execution_id))?,
-                    binding_id: stored(BindingId::new(row.binding_id))?,
-                    status: stored(row.status.parse())?,
-                    reserved: row.reserved.unwrap_or(false),
-                    verifier_card_uid: stored(CardUid::from_uuid(row.verifier_card_uid))?,
-                    card_uid: stored(CardUid::from_uuid(row.card_uid))?,
-                    owner_card_uid: stored(CardUid::from_uuid(row.owner_card_uid))?,
-                    attribution: Attribution::new(
-                        PrincipalId::new(row.sub_principal_id),
-                        PrincipalId::new(row.act_principal_id),
-                    ),
-                };
-                let generation = current.get_or_insert_with(|| PullRequestGeneration {
-                    activation: row.pull_request.0,
-                    observed_at: row.pr_observed_at,
-                    deactivated: row.pr_deactivated_at.is_some(),
-                    executions: Vec::new(),
-                });
-                generation.executions.push(execution);
-            }
-            Ok(PullRequestHistory { latest_at, current })
+            Ok(PullRequestHistory {
+                latest_at,
+                current: generation_of(rows)?,
+            })
+        })
+        .await
+    }
+
+    /// The locked PR's generation an explicit review request under
+    /// `request_key` admitted, current or not; `None` when that key admitted
+    /// none for this PR.
+    ///
+    /// The caller holds [`Self::lock_pull_request`]'s lock, so a concurrent
+    /// retry of the same key waits and then finds the generation the first
+    /// one admitted.
+    ///
+    /// # Errors
+    /// Returns the database error when the read fails, or a decode error
+    /// when a stored identity, status or pin is malformed.
+    #[tracing::instrument(
+        skip(self, conn, request_key),
+        fields(operation = "verification.pull_request.requested")
+    )]
+    pub async fn requested_pull_request(
+        &self,
+        conn: &mut TenantConn<'_>,
+        key: PullRequestKey<'_>,
+        request_key: &str,
+    ) -> Result<Option<PullRequestGeneration>, SqlxError> {
+        timed("pull_request_requested", async {
+            let rows: Vec<GenerationRow> = sqlx::query_as(REQUESTED_SQL)
+                .bind(key.host)
+                .bind(key.repository_id.as_str())
+                .bind(key.number()?)
+                .bind(request_key)
+                .fetch_all(&mut **conn.transaction())
+                .await?;
+            generation_of(rows)
         })
         .await
     }
@@ -740,7 +818,8 @@ impl VerifierExecutionQueue {
 
     /// Reserve a new generation of the locked PR for `activation` observed
     /// at `observed_at`: cancel every older unfinished execution of the PR
-    /// as superseded, then freeze one execution per target.
+    /// as superseded, then freeze one execution per target and record the
+    /// generation's complete member list in every member's pins.
     ///
     /// A runnable target freezes its binding's exact Verifier version,
     /// subject, Trigger and Operators with its accepted authority, reserved
@@ -829,6 +908,11 @@ impl VerifierExecutionQueue {
                     reserved.push(execution_id);
                 }
             }
+            let members: Vec<Uuid> = reserved.iter().map(ExecutionId::as_uuid).collect();
+            sqlx::query(MEMBERS_SQL)
+                .bind(&members)
+                .execute(&mut **conn.transaction())
+                .await?;
             let cancelled = self.fence_principals(conn, accepted).await?;
             let superseded_ids = superseded_rows
                 .into_iter()

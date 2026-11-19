@@ -835,6 +835,16 @@ impl Workload for Ui {
         let [rows, bytes] = population.scanned_per_query(SUCCESS);
         repetition.set("scanned_rows_per_query", rows);
         repetition.set("scanned_bytes_per_query", bytes);
+        let queries = answered.load(Ordering::Relaxed);
+        for (id, counter) in [
+            ("memtable_rows_per_query", LIVE_ROWS_EXAMINED),
+            ("memtable_bytes_per_query", LIVE_BYTES_EXAMINED),
+        ] {
+            repetition.set(
+                id,
+                examined_per_query(population.counter(counter, &[]), queries),
+            );
+        }
         Ok(repetition)
     }
 
@@ -854,6 +864,25 @@ impl Workload for Ui {
             .await
             .map(|_| ())
             .map_err(ExperimentError::workload)
+    }
+}
+
+/// Scribe's benchmark count of the captured memtable rows its live reads
+/// examined, before any row filter.
+pub const LIVE_ROWS_EXAMINED: &str = "bifrost_scribe_live_rows_examined_total";
+
+/// Scribe's benchmark count of the decoded Arrow bytes of the columns its
+/// live reads examined in those rows.
+pub const LIVE_BYTES_EXAMINED: &str = "bifrost_scribe_live_bytes_examined_total";
+
+/// The mean of one window's `examined` counter movement over its `queries`
+/// answered queries, missing when the server never registered the counter or
+/// no query was answered: absence is not a zero scan.
+fn examined_per_query(examined: Option<u64>, queries: u64) -> Reading {
+    match examined {
+        _ if queries == 0 => Reading::missing("no query was answered"),
+        None => Reading::missing("the server registered no live memtable scan counter"),
+        Some(examined) => Reading::exact(examined as f64 / queries as f64).with_samples(queries),
     }
 }
 
@@ -889,5 +918,23 @@ mod tests {
             reading("p99_us").reason.as_deref(),
             Some("inconclusive: 200 samples, under the 1000-sample floor")
         );
+    }
+
+    /// A window's examined memtable rows or bytes read per answered query,
+    /// and missing, never zero, when the server never registered the counter
+    /// or no query was answered.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a reading is not the counter's mean per query or an
+    /// absent counter or query reads as a number.
+    #[test]
+    fn memtable_scans_read_per_answered_query() {
+        let reading = super::examined_per_query(Some(30), 4);
+        assert_eq!(reading.value, Some(7.5));
+        assert_eq!(reading.samples, Some(4));
+        assert_eq!(super::examined_per_query(Some(0), 4).value, Some(0.0));
+        assert_eq!(super::examined_per_query(None, 4).value, None);
+        assert_eq!(super::examined_per_query(Some(30), 0).value, None);
     }
 }

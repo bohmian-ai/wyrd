@@ -69,6 +69,43 @@ pub(crate) const GROUP_CLOSE_TOTAL: &str = "bifrost_scribe_group_close_total";
 /// instead of starting.
 pub(crate) const CONVERSION_DEFERRED_TOTAL: &str = "bifrost_scribe_conversion_deferred_total";
 
+/// Benchmark-only count of the rows of captured memtable batches live reads
+/// examined: each batch its bounds did not prune, counted once when the read
+/// evaluates it, before any row filter, so it measures the input a read
+/// worked through rather than the rows it returned. A memory batch reads no
+/// storage, so these rows are never Oracle's physical `rows_scanned`.
+pub(crate) const LIVE_ROWS_EXAMINED_TOTAL: &str = "bifrost_scribe_live_rows_examined_total";
+
+/// Benchmark-only count of the decoded Arrow bytes of the columns live reads
+/// examined in the batches [`LIVE_ROWS_EXAMINED_TOTAL`] counts: each read
+/// column's recorded byte size, the in-memory bytes the read worked through.
+/// It is never Oracle's physical `bytes_scanned`, which counts Parquet bytes
+/// read from storage.
+pub(crate) const LIVE_BYTES_EXAMINED_TOTAL: &str = "bifrost_scribe_live_bytes_examined_total";
+
+/// Rows and bytes counted by [`record_live_scan`], mirrored for tests.
+#[cfg(feature = "test-support")]
+pub(crate) static LIVE_SCAN: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Counts one examined captured batch's `rows` and decoded `bytes` into
+/// [`LIVE_ROWS_EXAMINED_TOTAL`] and [`LIVE_BYTES_EXAMINED_TOTAL`], only while
+/// benchmarking.
+pub(crate) fn record_live_scan(rows: u64, bytes: u64) {
+    #[cfg(feature = "test-support")]
+    {
+        let [counted_rows, counted_bytes] = &LIVE_SCAN;
+        counted_rows.fetch_add(rows, std::sync::atomic::Ordering::AcqRel);
+        counted_bytes.fetch_add(bytes, std::sync::atomic::Ordering::AcqRel);
+    }
+    if wyrd_benchmark::enabled() {
+        metrics::counter!(LIVE_ROWS_EXAMINED_TOTAL).increment(rows);
+        metrics::counter!(LIVE_BYTES_EXAMINED_TOTAL).increment(bytes);
+    }
+}
+
 /// Records `elapsed` as one observation of group `stage` of
 /// [`GROUP_STAGE_SECONDS`], only while benchmarking.
 pub(crate) fn record_group_stage(stage: &'static str, elapsed: Duration) {

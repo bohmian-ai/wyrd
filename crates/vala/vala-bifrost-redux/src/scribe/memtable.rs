@@ -2328,16 +2328,23 @@ impl ReadableSource {
             detail: format!("live-tail query memory refused: {error}"),
         };
         let workspace = query.new_empty();
-        for (index, ((batch, wal_lsn_max), mut statistics)) in self
+        for (index, ((batch, wal_lsn_max, recorded), mut statistics)) in self
             .runs
             .iter()
-            .flat_map(|run| run.batches.iter().zip(run.wal_lsns.iter().copied()))
+            .flat_map(|run| {
+                run.batches
+                    .iter()
+                    .zip(run.wal_lsns.iter().copied())
+                    .enumerate()
+                    .map(|(at, (batch, lsn))| (batch, lsn, run.statistics.get(at)))
+            })
             .zip(statistics)
             .enumerate()
         {
             if keep.as_ref().is_some_and(|keep| !keep[index]) {
                 continue;
             }
+            count_examined(batch, recorded.map(AsRef::as_ref), &projection);
             workspace.free();
             // Every batch held below derives from the source columns the
             // projection reads, so only their allocations can be shared; they
@@ -2521,6 +2528,19 @@ static VARIANT_RECONSTRUCTIONS: std::sync::atomic::AtomicUsize =
 #[must_use]
 pub fn variant_reconstructions_for_test() -> usize {
     VARIANT_RECONSTRUCTIONS.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Returns the rows and decoded bytes of the captured batches live reads in
+/// this process examined, as [`crate::scribe::profile::record_live_scan`]
+/// counts them.
+#[cfg(feature = "test-support")]
+#[must_use]
+pub fn live_scan_for_test() -> (u64, u64) {
+    let [rows, bytes] = &crate::scribe::profile::LIVE_SCAN;
+    (
+        rows.load(std::sync::atomic::Ordering::Acquire),
+        bytes.load(std::sync::atomic::Ordering::Acquire),
+    )
 }
 
 /// The ordered outputs and exact filter one live read evaluates in place of
@@ -2748,6 +2768,35 @@ impl AdaptedRequirements {
         .map_err(arrow_internal)?;
         Ok(Some((batch, Arc::new(statistics))))
     }
+}
+
+/// Counts `batch`, one captured batch a live read is about to evaluate, as
+/// examined (see [`crate::scribe::profile::record_live_scan`]): all its rows,
+/// before any row filter, and the byte size `recorded` holds for each column
+/// `projection` reads, measured from the batch only when none was recorded.
+/// A required field the batch predates reads no stored column and adds no
+/// bytes. Outside a benchmark or test-support build nothing is counted, so
+/// an ordinary read does no accounting.
+fn count_examined(
+    batch: &RecordBatch,
+    recorded: Option<&Statistics>,
+    projection: &[(FieldRef, Option<usize>)],
+) {
+    if !(wyrd_benchmark::enabled() || cfg!(feature = "test-support")) {
+        return;
+    }
+    let bytes = projection
+        .iter()
+        .filter_map(|(_, source)| *source)
+        .map(|column| {
+            recorded
+                .and_then(|bounds| bounds.column_statistics.get(column))
+                .and_then(|bounds| bounds.byte_size.get_value().copied())
+                .or_else(|| batch.column(column).to_data().get_slice_memory_size().ok())
+                .unwrap_or(0) as u64
+        })
+        .fold(0_u64, u64::saturating_add);
+    crate::scribe::profile::record_live_scan(batch.num_rows() as u64, bytes);
 }
 
 /// Returns `batch`'s columns `projection` reads, unconverted, under the names
@@ -3279,6 +3328,70 @@ pub(crate) mod tests {
 
         assert_eq!(lsns(Some(&pruning)), vec![2]);
         assert_eq!(lsns(None), vec![1, 2]);
+    }
+
+    /// A live read counts the rows and decoded bytes of exactly the captured
+    /// batches it examines: a batch its bounds prune adds nothing, and a kept
+    /// batch adds its rows before any row filter and the recorded Arrow bytes
+    /// of the columns it reads.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the capture cannot be read or the counted rows or bytes
+    /// differ from the examined batches'.
+    #[test]
+    fn capture_read_counts_the_rows_and_bytes_it_examines() {
+        let memtable = Memtable::new();
+        let key = make_test_seal_key();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("unread", DataType::Int64, false),
+        ]));
+        let batch = |ids: Vec<i64>| {
+            let unread = Int64Array::from(vec![0_i64; ids.len()]);
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(ids)), Arc::new(unread)],
+            )
+            .expect("fixture batch")
+        };
+        memtable
+            .insert(&key, make_test_meta(1), batch(vec![1, 2]))
+            .expect("first insert");
+        memtable
+            .insert(&key, make_test_meta(2), batch(vec![50]))
+            .expect("second insert");
+        let required = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let pruning = crate::scan_sizing::BatchPruning::try_new(
+            &required,
+            Arc::new(datafusion::physical_expr::expressions::BinaryExpr::new(
+                datafusion::physical_expr::expressions::col("id", &required).expect("id column"),
+                datafusion::logical_expr::Operator::Eq,
+                datafusion::physical_expr::expressions::lit(50_i64),
+            )),
+        )
+        .expect("pruning plans");
+        let capture = LiveCapture::take([&memtable], key.tenant, &key.table, None)
+            .expect("locks")
+            .expect("no registry to wait on");
+        let partitions = key.partition.time()..=key.partition.time();
+        let examined = |pruning| {
+            let before = live_scan_for_test();
+            capture
+                .read(
+                    &partitions,
+                    required.fields(),
+                    pruning,
+                    None,
+                    &unbounded_pool(),
+                )
+                .expect("capture read");
+            let after = live_scan_for_test();
+            (after.0 - before.0, after.1 - before.1)
+        };
+
+        assert_eq!(examined(Some(&pruning)), (1, 8), "only the kept batch");
+        assert_eq!(examined(None), (3, 24), "every batch, `id` alone");
     }
 
     /// A capture shares a bucket's sealed runs and a generation's batches by

@@ -102,7 +102,14 @@ configuration declares server limits.
   latency cell the server and client p50/p95/p99.
 - **Bytes have declared sources.** Writes report rows, retained Arrow MiB
   (uncompressed), and encoded OTLP wire MiB. Queries report the mean scanned
-  rows and bytes of each query's own executed plan, from the same snapshots. The L1
+  rows and bytes of each query's own executed plan, from the same snapshots.
+  Those are physical Parquet facts; a memtable batch is never one. `ui-sql`
+  also reports `memtable_rows_per_query` and `memtable_bytes_per_query`: the
+  captured memtable rows Scribe live reads examined after batch pruning and
+  before any row filter, and the recorded decoded Arrow bytes of the columns
+  they read, from the window's `bifrost_scribe_live_rows_examined_total` and
+  `bifrost_scribe_live_bytes_examined_total` movement per answered query;
+  missing, never zero, without the counter or an answered query. The L1
   storage ratio is published Parquet bytes over retained Arrow bytes of one
   settled sample per path, excluding WAL, staging, and catalog bytes.
 - The `timing` control records the method, precision, range, series bounds,

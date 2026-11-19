@@ -112,7 +112,7 @@ behavior keeps its existing proof; no manufactured RED is required for it.
    **RED:** missing scenario/integer-only checker cannot deliver these results.
    **Tier:** checker unit plus real-server integration/journey.
    **Authority:** REQ-018/024; Bifrost Query/Variant SQL/Public surface.
-   Evidence: **checker units GREEN; real-server evidence not run.**
+   Evidence: **checker units GREEN; real-server smokes VALID with 0 wrong answers.**
    - Units (`mise exec -- cargo nextest run --locked -p wyrd-testing --bin capacity -E 'test(/query::ui::/)'`, GREEN):
      `answer::tests::{typed_answers_compare_ids_timestamps_decimals_and_nulls,ties_compare_as_multisets_within_their_keys,variants_compare_by_value_not_layout}`,
      `tests::{frozen_catalog_holds_the_original_statements,tied_statements_declare_the_order_their_sql_leaves}`,
@@ -122,10 +122,14 @@ behavior keeps its existing proof; no manufactured RED is required for it.
      `seed.rs:341 assertion failed: check("stat-spans-total", &answer("value", &["0"]), journey).is_err()`).
      They prove the checker and the known counts (`seed::known`, `Journey::known`), not that
      the server answers them.
-   - Real-server runs cited here before were withdrawn on 2026-11-18: they were started
-     from a retry loop around the `mise run bench:*` tasks and read with `jq`, contrary to
-     `benchmarks/AGENTS.md`; their records were deleted, and real-server evidence awaits
-     compliant runs.
+   - Smokes, each run once at `6fc40b230`: `mise run bench:l1:bifrost:ui --smoke`
+     (`target/benchmarks/smoke/bifrost/ui-sql/20261119T005053Z-6fc40b230.json`),
+     `mise run bench:l1:bifrost:ui:10x --smoke` (`…/ui-sql-10x/20261119T010050Z-6fc40b230.json`),
+     `mise run bench:l1:bifrost:ui:learned --smoke` (`…/ui-sql-learned/20261119T010156Z-6fc40b230.json`).
+     `capacity report` of each: `verdict: VALID (exit 0)`, and for all six steps
+     `exact-answers: wrong_results ≤ 0 queries every rep | 0 queries spread 0`. Earlier
+     runs were withdrawn on 2026-11-18 (started from a retry loop and read with `jq`,
+     contrary to `benchmarks/AGENTS.md`) and their records deleted.
 2. **Same data, different residence/layout.** Execute fixed SQL/absolute binds
    before/after explicit stage/publication, then on separately prelearned data.
    Assert actual residence, identical logical rows and no duplicate identities;
@@ -155,18 +159,46 @@ behavior keeps its existing proof; no manufactured RED is required for it.
    evidence absent.
    **Tier:** declaration/record tests and opt-in real-server L1.
    **Authority:** REQ-018/024; benchmark Measurement/Verdicts/Records.
-   Evidence: **declaration GREEN; baseline checkpoint not reached.**
+   Evidence: **declaration GREEN; clean full baseline VALID.**
    - `tests::level_one_declares_complete_engine_coverage` (RED against the old 69-step
      matrix and on `ui-sql-10x is an extended L1 experiment`, then GREEN):
      `mise exec -- cargo nextest run --locked -p wyrd-testing --bin capacity -E 'test(=tests::level_one_declares_complete_engine_coverage)'`.
      `workload::tests::short_percentiles_are_inconclusive` GREEN.
    - **TDD process violation:** the `diagnose` sample-floor helper was written before
      `short_percentiles_are_inconclusive`.
-   - A full baseline and a profile were run, but they are withdrawn and do not satisfy this
-     checkpoint. Real-server runs cited here before were withdrawn on 2026-11-18: they were started
-     from a retry loop around the `mise run bench:*` tasks and read with `jq`, contrary to
-     `benchmarks/AGENTS.md`; their records were deleted, and real-server evidence awaits
-     compliant runs.
+   - `mise run bench:l1:bifrost:ui`, run once at `6fc40b230` on a clean tree: `benchmarks/history/bifrost/ui-sql/20261119T010259Z-6fc40b230.json`,
+     `verdict: VALID (exit 0)`, 0 wrong answers in every step. From `capacity report`:
+     ```
+     | memtable-ui-c1 | clients=1 residence="memtable" | 77.16 requests/s; 20.579 queries/s/vCPU; 156.948 queries/cpu-s; 6.372 ms/query | (3.15, 3.152] / (22.348, 22.364] / (24.658, 24.674] (client 9.767 / 26.784 / 28.704) | 0 total (median 0) |
+     | memtable-ui-c8 | clients=8 residence="memtable" | 336.279 requests/s; 89.652 queries/s/vCPU; 112.681 queries/cpu-s; 8.875 ms/query | (4.506, 4.51] / (41.714, 41.746] / (55.443, 55.476] (client 16.324 / 61.49 / 80.901) | 0 total (median 0) |
+     | staged-ui-c1 | clients=1 residence="staged" | 83.098 requests/s; 22.126 queries/s/vCPU; 157.061 queries/cpu-s; 6.367 ms/query | (3.34, 3.342] / (15.729, 15.737] / (18.448, 18.465] (client 10.64 / 20.68 / 23.058) | 0 total (median 0) |
+     | staged-ui-c8 | clients=8 residence="staged" | 350.88 requests/s; 93.568 queries/s/vCPU; 111.683 queries/cpu-s; 8.954 ms/query | (5.853, 5.857] / (29.18, 29.196] / (35.258, 35.291] (client 21.964 / 39.454 / 44.016) | 0 total (median 0) |
+     | published-ui-c1 | clients=1 residence="published" | 91.861 requests/s; 24.453 queries/s/vCPU; 189.615 queries/cpu-s; 5.274 ms/query | (2.847, 2.849] / (15.688, 15.696] / (18.498, 18.514] (client 9.145 / 20.033 / 21.324) | 0 total (median 0) |
+     | published-ui-c8 | clients=8 residence="published" | 423.238 requests/s; 112.906 queries/s/vCPU; 138.973 queries/cpu-s; 7.196 ms/query | (4.567, 4.571] / (26.411, 26.427] / (32.342, 32.358] (client 17.244 / 36.134 / 39.779) | 0 total (median 0) |
+     ```
+   - `mise run bench:l1:bifrost:ui:10x`, run once at `6fc40b230` on a clean tree: `benchmarks/history/bifrost/ui-sql-10x/20261119T010539Z-6fc40b230.json`,
+     `verdict: VALID (exit 0)`, 0 wrong answers in every step. From `capacity report`:
+     ```
+     | memtable-ui-c1 | clients=1 residence="memtable" | 48.416 requests/s; 12.935 queries/s/vCPU; 104.352 queries/cpu-s; 9.583 ms/query | (6.734, 6.738] / (31.949, 31.965] / (36.012, 36.045] (client 15.996 / 38.877 / 40.527) | 0 total (median 0) |
+     | memtable-ui-c8 | clients=8 residence="memtable" | 198.195 requests/s; 53.045 queries/s/vCPU; 72.932 queries/cpu-s; 13.711 ms/query | (11.739, 11.747] / (57.672, 57.704] / (91.423, 91.488] (client 27.117 / 99.115 / 120.894) | 0 total (median 0) |
+     | staged-ui-c1 | clients=1 residence="staged" | 65.842 requests/s; 17.564 queries/s/vCPU; 133.553 queries/cpu-s; 7.488 ms/query | (4.764, 4.768] / (23.74, 23.757] / (27.181, 27.197] (client 13.266 / 29.556 / 31.147) | 0 total (median 0) |
+     | staged-ui-c8 | clients=8 residence="staged" | 256.076 requests/s; 68.373 queries/s/vCPU; 85.407 queries/cpu-s; 11.709 ms/query | (9.535, 9.544] / (42.762, 42.795] / (55.149, 55.181] (client 28.905 / 60.145 / 65.45) | 0 total (median 0) |
+     | published-ui-c1 | clients=1 residence="published" | 72.218 requests/s; 19.257 queries/s/vCPU; 158.866 queries/cpu-s; 6.295 ms/query | (3.942, 3.944] / (23.446, 23.462] / (26.968, 26.984] (client 11.273 / 28.921 / 30.725) | 0 total (median 0) |
+     | published-ui-c8 | clients=8 residence="published" | 311.867 requests/s; 83.295 queries/s/vCPU; 104.416 queries/cpu-s; 9.577 ms/query | (6.844, 6.849] / (42.303, 42.336] / (51.872, 51.905] (client 20.672 / 55.492 / 59.801) | 0 total (median 0) |
+     ```
+   - `mise run bench:l1:bifrost:ui:learned`, run once at `6fc40b230` on a clean tree: `benchmarks/history/bifrost/ui-sql-learned/20261119T010926Z-6fc40b230.json`,
+     `verdict: VALID (exit 0)`, 0 wrong answers in every step. From `capacity report`:
+     ```
+     | memtable-ui-c1 | clients=1 residence="memtable" | 75.999 requests/s; 20.24 queries/s/vCPU; 150.971 queries/cpu-s; 6.624 ms/query | (3.467, 3.469] / (22.774, 22.79] / (24.838, 24.855] (client 9.656 / 26.974 / 29.87) | 0 total (median 0) |
+     | memtable-ui-c8 | clients=8 residence="memtable" | 320.676 requests/s; 85.545 queries/s/vCPU; 107.028 queries/cpu-s; 9.343 ms/query | (5.239, 5.243] / (43.319, 43.352] / (57.508, 57.541] (client 17.058 / 63.132 / 87.731) | 0 total (median 0) |
+     | staged-ui-c1 | clients=1 residence="staged" | 82.313 requests/s; 21.917 queries/s/vCPU; 150.722 queries/cpu-s; 6.635 ms/query | (3.752, 3.754] / (15.884, 15.892] / (18.645, 18.661] (client 10.729 / 21.07 / 22.561) | 0 total (median 0) |
+     | staged-ui-c8 | clients=8 residence="staged" | 342.713 requests/s; 91.439 queries/s/vCPU; 108.289 queries/cpu-s; 9.235 ms/query | (6.828, 6.832] / (29.737, 29.753] / (35.586, 35.619] (client 22.649 / 40.445 / 45.241) | 0 total (median 0) |
+     | published-ui-c1 | clients=1 residence="published" | 91.639 requests/s; 24.41 queries/s/vCPU; 189.282 queries/cpu-s; 5.283 ms/query | (2.865, 2.867] / (15.72, 15.729] / (18.53, 18.547] (client 9.223 / 20.519 / 21.625) | 0 total (median 0) |
+     | published-ui-c8 | clients=8 residence="published" | 420.278 requests/s; 112.012 queries/s/vCPU; 136.823 queries/cpu-s; 7.309 ms/query | (4.612, 4.616] / (27.181, 27.197] / (33.194, 33.21] (client 17.159 / 36.641 / 40.279) | 0 total (median 0) |
+     ```
+   - Each report states `scanned_bytes_per_query` and `scanned_rows_per_query` as "an answered
+     query has no executed-plan scanned bytes/rows": the scan facts are absent.
+   - Earlier baseline records were withdrawn on 2026-11-18 (retry loop, `jq`) and deleted.
 4. **Work follows demand.** Open a captured multi-batch canonical/learned source
    without pulling: row expressions/reconstruction have not run. Pull through
    its actual DataFusion source and observe bounded work/results. Where the

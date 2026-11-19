@@ -2099,15 +2099,16 @@ async fn grouped_verification_contract_is_served() {
     server.shutdown().await.expect("server shuts down");
 }
 
-/// Operator connection management publishes exactly its five typed
-/// operations: the provider-tagged create and update bodies, the redacted
-/// view, and a UUID `connection_id` path parameter.
+/// Operator connection management publishes exactly its six typed
+/// operations: the provider-tagged create and update bodies, the bodyless
+/// encryption renewal, the redacted view, and a UUID `connection_id` path
+/// parameter.
 ///
 /// # Panics
 /// Panics when the server fails to start or stop, or when an operation,
 /// schema reference, or path parameter differs.
 #[tokio::test]
-async fn operator_connection_contract_publishes_five_typed_operations() {
+async fn operator_connection_contract_publishes_six_typed_operations() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -2125,6 +2126,7 @@ async fn operator_connection_contract_publishes_five_typed_operations() {
         })
         .collect();
     let item = "/v1/operator-connections/{connection_id}";
+    let renew = "/v1/operator-connections/{connection_id}/renew-encryption";
     assert_eq!(
         operations,
         BTreeSet::from([
@@ -2133,6 +2135,7 @@ async fn operator_connection_contract_publishes_five_typed_operations() {
             (item, "delete"),
             (item, "get"),
             (item, "patch"),
+            (renew, "post"),
         ])
     );
     let body_ref = |path: &str, method: &str| {
@@ -2151,9 +2154,26 @@ async fn operator_connection_contract_publishes_five_typed_operations() {
             ["schema"]["$ref"],
         "#/components/schemas/OperatorConnectionView"
     );
-    for method in ["get", "patch", "delete"] {
-        let schema = path_parameter_schema(&document, item, method, "connection_id");
-        assert_eq!(schema["format"], "uuid", "{method} connection_id: {schema}");
+    assert!(
+        paths[renew]["post"]["requestBody"].is_null(),
+        "renewal takes no body: {}",
+        paths[renew]["post"]
+    );
+    assert_eq!(
+        paths[renew]["post"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/OperatorConnectionView"
+    );
+    for (path, method) in [
+        (item, "get"),
+        (item, "patch"),
+        (item, "delete"),
+        (renew, "post"),
+    ] {
+        let schema = path_parameter_schema(&document, path, method, "connection_id");
+        assert_eq!(
+            schema["format"], "uuid",
+            "{method} {path} connection_id: {schema}"
+        );
     }
 
     server.shutdown().await.expect("server shuts down");

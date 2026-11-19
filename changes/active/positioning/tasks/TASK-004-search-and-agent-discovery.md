@@ -328,7 +328,7 @@ links), `cfb9faa9d` (snippet-length descriptions), `bba3e04a5` (retrieval repair
 | REQ-007–008 / AC-006–007 | Six sections, routes, brand and landing unchanged; Task 3 dispositions (four published tutorials, Operators draft) agree across nav, sitemap, `llms.txt`, search. The request, workflow, schedule and investigation tutorials had no inbound content links (request tutorial: none); bounded `## Next`/in-context links added from Quickstart, Real-time verification, How verification works, Establish sufficient evidence, Act on verdicts, FAQ | `docs:linkcheck`, shell-links and index tests | PASS |
 | REQ-014 / AC-013 | Query map below; descriptions of the four positioning pages cut from 202–225 to 151–161 characters, leading with their query wording; 13 terse nav-label pages gain task-naming browser titles | Retrieval walkthrough below | PASS |
 | REQ-015 / AC-014 | Dates come only from commit history (page footer, `article:modified_time`, sitemap `lastmod`); no author, reviewer or image invented | Content tests above | PASS |
-| REQ-016 / AC-015 | Measurement procedure and baselines below | GitHub traffic read; Search Console access gap recorded | BLOCKED on owner names |
+| REQ-016 / AC-015 | Measurement procedure and baselines below | GitHub traffic read; Search Console access gap recorded; owners named by the maintainer | PASS |
 
 ### Commands
 
@@ -437,14 +437,14 @@ trials, not stars or raw traffic.
 
 ### Ownership
 
-The repository names no owner (no CODEOWNERS or maintainer file), so these
-are unassigned until the maintainer names them:
+The repository names no owner (no CODEOWNERS or maintainer file). The
+maintainer named the owner when asked on 2026-11-18:
 
 | Responsibility | Includes | Owner |
 |---|---|---|
-| Content maintenance | Query map above, tutorial accuracy, day-14/30 content follow-up | Unassigned |
-| Discovery checks | Search Console property and sitemap submission, the reviews above, `robots.txt` | Unassigned |
-| Distribution and feedback | Sharing specific pages, recording trial attempts and questions | Unassigned |
+| Content maintenance | Query map above, tutorial accuracy, day-14/30 content follow-up | Thorrester |
+| Discovery checks | Search Console property and sitemap submission, the reviews above, `robots.txt` | Thorrester |
+| Distribution and feedback | Sharing specific pages, recording trial attempts and questions | Thorrester |
 
 Distribution guidance for whoever owns it: share a specific page with the
 reader's problem — the skipped-step tutorial for agent builders, the request

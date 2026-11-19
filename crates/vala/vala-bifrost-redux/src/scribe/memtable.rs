@@ -345,6 +345,9 @@ impl Memtable {
         batch: RecordBatch,
         layout: Option<Arc<crate::scribe::layout_cache::LearnedLayout>>,
     ) -> Result<(), ScribeError> {
+        // Bounds scan every row, so they are computed before the lock every
+        // writer of this shard shares.
+        let statistics = batch_statistics(&batch);
         let mut buckets = self.writable.write().map_err(|e| ScribeError::Internal {
             detail: format!("memtable bucket lock poisoned: {e}"),
         })?;
@@ -366,7 +369,7 @@ impl Memtable {
             });
         }
 
-        bucket.append(meta, batch);
+        bucket.append(meta, batch, statistics);
         Ok(())
     }
 
@@ -1481,13 +1484,14 @@ impl MemtableBucket {
 
     /// Retains one append batch with its metadata and exact column bounds.
     ///
-    /// The bounds are computed here, once per batch, so a live read prunes
-    /// the batch without scanning its rows. The tail seals into a shared run
-    /// once it holds [`APPEND_RUN_LEN`] appends (see [`Self::seal_tail`]).
-    fn append(&mut self, meta: ScribeAppendMeta, batch: RecordBatch) {
+    /// `statistics` are the batch's [`batch_statistics`], computed once by the
+    /// caller outside the memtable lock, so a live read prunes the batch
+    /// without scanning its rows. The tail seals into a shared run once it
+    /// holds [`APPEND_RUN_LEN`] appends (see [`Self::seal_tail`]).
+    fn append(&mut self, meta: ScribeAppendMeta, batch: RecordBatch, statistics: Arc<Statistics>) {
         self.row_count += batch.num_rows();
         self.bytes_accumulated += estimate_batch_bytes(&batch);
-        self.tail.statistics.push(batch_statistics(&batch));
+        self.tail.statistics.push(statistics);
         self.tail.batches.push(batch);
         #[cfg(test)]
         self.tail.wal_lsns.push(meta.wal_lsn_max);

@@ -6,6 +6,7 @@
  */
 import { execFileSync, spawn } from 'node:child_process';
 import { closeSync, mkdtempSync, openSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { createServer as createHttpServer, request as httpRequest } from 'node:http';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -49,6 +50,70 @@ async function startBff(serverUrl: string): Promise<{ url: string; stop: () => v
     child.once('exit', (code) => reject(new Error(`the BFF exited with ${code} before listening`)));
   });
   return { url, stop: () => child.kill() };
+}
+
+/** One supporting query answer the gate holds back: its SQL, and how its answer ended. */
+interface HeldAnswer {
+  readonly sql: string;
+  /** `abandoned` when the BFF closed the answer before its end, as it does when it stops the read; `failed` when the gate broke it off. */
+  readonly ended: Promise<'finished' | 'abandoned' | 'failed'>;
+  /** Send the rest of the answer. */
+  release(): void;
+  /** Break the answer off, as a failed upstream read does. */
+  fail(): void;
+}
+
+/**
+ * A loopback HTTP hop between the BFF and the server that, while holding,
+ * passes each supporting query's response head on and keeps back its body:
+ * the BFF's read is running, and it either closes the answer (it stopped the
+ * read) or reads it to the end once released (it kept reading). Supporting
+ * queries are the grouped reads (facets, overview, timeline, discovery); every
+ * other request passes untouched.
+ */
+async function supportGate(target: string) {
+  const held: HeldAnswer[] = [];
+  const supporting: string[] = [];
+  let holding = false;
+  const server = createHttpServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk: Buffer) => chunks.push(chunk));
+    req.on('end', () => {
+      const body = Buffer.concat(chunks);
+      const sql = req.method === 'POST' && req.url === '/v1/query' ? String((JSON.parse(body.toString()) as { sql?: string }).sql ?? '') : '';
+      const grouped = /GROUPING SETS|grouping\(at\)/.test(sql);
+      if (grouped) supporting.push(sql);
+      let open = () => {};
+      let broken = false;
+      const gate = grouped && holding ? new Promise<void>((resolve) => (open = resolve)) : undefined;
+      if (gate) {
+        const ended = new Promise<'finished' | 'abandoned' | 'failed'>((resolve) => res.once('close', () => resolve(broken ? 'failed' : res.writableFinished ? 'finished' : 'abandoned')));
+        held.push({ sql, ended, release: open, fail: () => ((broken = true), open()) });
+      }
+      const upstream = httpRequest(new URL(req.url ?? '/', target), { method: req.method, headers: req.headers }, async (answer) => {
+        res.writeHead(answer.statusCode ?? 502, answer.headers);
+        res.flushHeaders();
+        await gate;
+        if (res.destroyed) return answer.destroy();
+        if (broken) return res.destroy();
+        answer.pipe(res);
+      });
+      // The BFF closing its answer closes the server's request too.
+      res.once('close', () => upstream.destroy());
+      upstream.on('error', () => res.destroy());
+      upstream.end(body);
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address() as { port: number };
+  return {
+    url: `http://127.0.0.1:${port}`,
+    held,
+    /** How many supporting queries reached the gate so far. */
+    supporting: () => supporting.length,
+    hold: (on: boolean) => void (holding = on),
+    stop: () => server.close()
+  };
 }
 
 /** One browser signed in to `tenant` with `apiKey` through the API-key page. */
@@ -806,6 +871,220 @@ const strongPassword = () => `correct horse ${crypto.randomUUID()}`;
 /** The profile `key` resolves to, read through the SDK straight from the server. */
 const meWith = async (serverUrl: string, key: string) =>
   (await Principals.connect({ client: WyrdClient.connect({ serverUrl, credential: key }) })).me();
+
+/** The fixed viewport of the lifecycle journeys' screenshots. */
+const LIFECYCLE_VIEWPORT = { width: 1440, height: 900 };
+
+/** Full-page screenshots of `page` in light and dark at its current viewport, as `lifecycle-<name>-<mode>.png`, when `WYRD_UI_CAPTURE_DIR` is set. */
+async function captureLifecycle(page: Page, name: string) {
+  const shots = process.env.WYRD_UI_CAPTURE_DIR;
+  for (const mode of ['light', 'dark'] as const) {
+    await page.evaluate((next) => ((document.querySelector('.app-root') as HTMLElement).dataset.mode = next), mode);
+    if (shots) await page.screenshot({ path: join(shots, `lifecycle-${name}-${mode}.png`), fullPage: true });
+  }
+  await page.evaluate(() => delete (document.querySelector('.app-root') as HTMLElement).dataset.mode);
+}
+
+/**
+ * Live on `board` (`observe` or `verify`) at `search`, in a new page of
+ * `page`'s session on a fake clock. Its support is held through two more tick
+ * opportunities, then failed, then held and released: each refresh starts
+ * only after the previous one's support settled. Pausing, and leaving after
+ * resuming, stop the ticks.
+ */
+async function liveWaitsForSupport(browser: Browser, page: Page, gate: Awaited<ReturnType<typeof supportGate>>, at: string, board: 'observe' | 'verify') {
+  const context = await browser.newContext({ storageState: await page.context().storageState(), viewport: LIFECYCLE_VIEWPORT });
+  const live = await context.newPage();
+  try {
+    await live.clock.install();
+    const refreshes: string[] = [];
+    live.on('request', (request) => new URL(request.url()).pathname.endsWith(`/${board}/__data.json`) && refreshes.push(request.url()));
+    const facets = live.locator(board === 'observe' ? '[data-panel="facets"]' : '[aria-label="Filter executions"]');
+    await live.goto(at);
+    await expect.poll(() => facets.getByRole('button').count(), { timeout: 30_000 }).toBeGreaterThan(0);
+    // The page's own timers run only as the clock does: wait while it advances in steps far shorter than a tick.
+    const running = <T,>(read: () => T | Promise<T>) => expect.poll(async () => (await live.clock.runFor(50), read()));
+    gate.held.length = 0;
+    gate.hold(true);
+    // The first tick refreshes the list, then holds on its support across two more tick opportunities.
+    await live.clock.runFor(10_000);
+    await running(() => gate.held.length).toBeGreaterThan(0);
+    const first = gate.held.length;
+    await live.clock.runFor(25_000);
+    expect([refreshes.length, gate.held.length]).toEqual([1, first]);
+    // A failed support read releases the next refresh, and is shown as failed.
+    for (const answer of gate.held) answer.fail();
+    await running(() => live.locator('[data-state="error"]').count()).toBeGreaterThan(0);
+    await live.clock.runFor(10_000);
+    await running(() => gate.held.length).toBe(2 * first);
+    expect(refreshes).toHaveLength(2);
+    // So does a successful one.
+    gate.hold(false);
+    for (const answer of gate.held.slice(first)) answer.release();
+    await running(() => live.locator('[data-state="error"]').count()).toBe(0);
+    await live.clock.runFor(10_000);
+    await running(() => refreshes.length).toBe(3);
+    // Pausing stops the ticks; the pause itself is the one more list read.
+    await live.locator('button.live').click();
+    await expect.poll(() => new URL(live.url()).searchParams.get('live')).toBeNull();
+    const paused = refreshes.length;
+    await live.clock.runFor(60_000);
+    expect(refreshes.length).toBe(paused);
+    // Nothing was stopped: the held refreshes' support ended as the gate ended it.
+    expect(await Promise.all(gate.held.map((answer) => answer.ended))).toEqual([...Array(first).fill('failed'), ...Array(first).fill('finished')]);
+    // Resumed, then left: no tick of the page that went.
+    await live.locator('button.live').click();
+    await expect.poll(() => new URL(live.url()).searchParams.get('live')).toBe('1');
+    await live.getByRole('navigation', { name: 'Destinations' }).getByRole('link', { name: board === 'observe' ? 'Verify' : 'Observe' }).click();
+    await live.waitForURL((url) => !url.pathname.endsWith(`/${board}`));
+    const left = refreshes.length;
+    await live.clock.runFor(60_000);
+    expect(refreshes.length).toBe(left);
+    return { refreshes: refreshes.length, held: gate.held.length };
+  } finally {
+    await context.close();
+  }
+}
+
+test('Observe reads support once per population, stops it when superseded or left, and Live waits for it', async ({ server, ui }) => {
+  const slug = 'ui-lifecycle';
+  const tenant = server.seedTenant(slug);
+  const key = server.bootstrapServiceInTenant(tenant, ['admin'], 'ui-lifecycle-admin');
+  await seedSignals(server, key, { trace: TRACE, service: 'ui-agent' });
+  // Fifty-two more root spans, so the traces list has an older page.
+  const steps = Array.from({ length: 52 }, (_, n) => String(n).padStart(2, '0'));
+  await exportOtlp(server, key, '/v1/traces', {
+    resourceSpans: [
+      {
+        resource: { attributes: [{ key: 'service.name', value: { stringValue: 'ui-worker' } }] },
+        scopeSpans: [
+          {
+            scope: { name: 'wyrd-ui-lifecycle' },
+            spans: steps.map((n) => ({
+              traceId: `${'e'.repeat(30)}${n}`,
+              spanId: `${'f'.repeat(14)}${n}`,
+              name: `step-${n}`,
+              kind: 1,
+              startTimeUnixNano: nanos(`2026-10-19T06:${n}:00Z`),
+              endTimeUnixNano: nanos(`2026-10-19T06:${n}:00Z`, 5_000_000n),
+              status: { code: 1 }
+            }))
+          }
+        ]
+      }
+    ]
+  });
+  server.flushBifrost();
+  const gate = await supportGate(ui.serverUrl);
+  const bff = await startBff(gate.url);
+  try {
+    const page = await signIn(ui.browser, bff.url, slug, key);
+    await page.setViewportSize(LIFECYCLE_VIEWPORT);
+    const reads: string[] = [];
+    page.on('request', (request) => new URL(request.url()).pathname.endsWith('/support') && reads.push(new URL(request.url()).pathname));
+    const query = () => Object.fromEntries(new URL(page.url()).searchParams);
+    const list = page.locator('[data-panel="list"]');
+    const rows = list.locator('tbody tr');
+    const facets = page.locator('[data-panel="facets"]');
+    const overview = page.locator('[data-panel="overview"]');
+    const observe = `${bff.url}/t/${slug}/observe?from=${RANGE.from}&to=${RANGE.to}`;
+    const ended = (answers: readonly HeldAnswer[]) => Promise.all(answers.map((answer) => answer.ended));
+
+    // The first HTML carries every section, read beside the list.
+    await page.goto(observe);
+    await expect.poll(() => facets.textContent(), { timeout: 30_000 }).toContain('ui-worker');
+    expect([await rows.count(), reads]).toEqual([50, []]);
+    const population = gate.supporting();
+    expect(population).toBeGreaterThan(0);
+    const counts = await facets.textContent();
+
+    // Paging, sorting and shown columns read only the list: no support read, and the facets and overview stay as they were.
+    await list.getByRole('navigation', { name: 'Pages' }).getByRole('button', { name: /Older/ }).click();
+    await expect.poll(query).toHaveProperty('after');
+    await expect.poll(() => rows.count()).toBe(3);
+    await list.locator('th button.sort').first().click();
+    await expect.poll(query).toHaveProperty('sort');
+    await page.locator('.listbar summary', { hasText: 'Columns' }).click();
+    await page.locator('.listbar label input:checked').last().uncheck();
+    await expect.poll(query).toHaveProperty('columns');
+    await expect.poll(() => rows.count()).toBe(50);
+    expect([reads, gate.supporting(), await facets.textContent(), await overview.getByRole('region').count()]).toEqual([[], population, counts, 3]);
+
+    // A range change is another population: its list is shown at once and its support is read once, after the list.
+    gate.hold(true);
+    await page.getByRole('button', { name: 'Zoom in' }).click();
+    await expect.poll(() => gate.held.length).toBe(population);
+    await expect.poll(() => rows.count()).toBeGreaterThan(0);
+    expect(reads).toHaveLength(1);
+    // A newer range supersedes it: its upstream queries are closed unread, and the newer ones are read.
+    await page.getByRole('button', { name: 'Zoom in' }).click();
+    await expect.poll(() => gate.held.length).toBe(2 * population);
+    expect(await ended(gate.held.slice(0, population))).toEqual(Array(population).fill('abandoned'));
+    expect(reads).toHaveLength(2);
+    const zoomed = page.url();
+    // Leaving while it is read closes its upstream queries too.
+    await page.getByRole('navigation', { name: 'Destinations' }).getByRole('link', { name: 'Verify' }).click();
+    await page.waitForURL(`${bff.url}/t/${slug}/verify`);
+    expect(await ended(gate.held.slice(population, 2 * population))).toEqual(Array(population).fill('abandoned'));
+
+    // Back to that range: nothing settled for it, so its list is shown with its support explicitly loading, until it settles.
+    await page.goBack();
+    await page.waitForURL(zoomed);
+    await expect.poll(() => gate.held.length).toBeGreaterThanOrEqual(3 * population);
+    await expect.poll(() => rows.count()).toBeGreaterThan(0);
+    await expect.poll(() => facets.locator('[data-state="loading"]', { hasText: 'Counting the facets' }).count()).toBe(1);
+    await captureLifecycle(page, 'observe-loading');
+    gate.hold(false);
+    for (const answer of gate.held) answer.release();
+    await expect.poll(() => facets.getByRole('button').count()).toBeGreaterThan(0);
+    expect([await facets.textContent(), await overview.getByRole('region').count()]).not.toEqual([counts, 0]);
+    await captureLifecycle(page, 'observe-settled');
+
+    // A failed support read says so beside the list it did not remove, and shows no counts at all rather than zeros.
+    gate.held.length = 0;
+    gate.hold(true);
+    await page.getByRole('button', { name: 'Zoom out' }).click();
+    await expect.poll(() => gate.held.length).toBe(population);
+    for (const answer of gate.held) answer.fail();
+    gate.hold(false);
+    await expect.poll(() => facets.locator('[data-state="error"]').count()).toBe(1);
+    expect([await rows.count() > 0, await facets.getByRole('button').count()]).toEqual([true, 0]);
+    await captureLifecycle(page, 'observe-support-error');
+
+    // Live waits for its support before its next refresh, and stops when paused or left.
+    await liveWaitsForSupport(ui.browser, page, gate, `${observe}&live=1`, 'observe');
+
+    // Back restores the filter, range, open span and scroll position, at the page's height, while support is read again.
+    await page.goto(observe);
+    await expect.poll(() => facets.getByRole('button').count(), { timeout: 30_000 }).toBeGreaterThan(0);
+    await facets.getByRole('button', { name: /ui-worker/ }).click();
+    await expect.poll(query).toHaveProperty('where');
+    await expect.poll(() => rows.count()).toBe(50);
+    await page.setViewportSize({ width: LIFECYCLE_VIEWPORT.width, height: 600 });
+    await rows.last().scrollIntoViewIfNeeded();
+    const left = { url: page.url(), scroll: await page.evaluate(() => window.scrollY), height: await page.evaluate(() => document.documentElement.scrollHeight) };
+    expect(left.scroll).toBeGreaterThan(0);
+    await page.getByRole('navigation', { name: 'Destinations' }).getByRole('link', { name: 'Verify' }).click();
+    await page.waitForURL(/\/verify/);
+    await expect.poll(() => page.locator('[data-state="loading"]').count()).toBe(0);
+    gate.held.length = 0;
+    gate.hold(true);
+    await page.goBack();
+    await page.waitForURL(left.url);
+    await expect.poll(() => gate.held.length).toBe(population);
+    await expect.poll(() => page.evaluate(() => window.scrollY)).toBe(left.scroll);
+    expect(await page.evaluate(() => document.documentElement.scrollHeight)).toBeGreaterThanOrEqual(left.height);
+    expect(await facets.getByRole('button', { name: /ui-worker/ }).count()).toBe(1);
+    await captureLifecycle(page, 'observe-back');
+    gate.hold(false);
+    for (const answer of gate.held) answer.release();
+  } finally {
+    gate.hold(false);
+    for (const answer of gate.held) answer.release();
+    bff.stop();
+    gate.stop();
+  }
+});
 
 test('local signup and personal settings', async ({ server, ui }) => {
   const tenantKey = 'ui-local';

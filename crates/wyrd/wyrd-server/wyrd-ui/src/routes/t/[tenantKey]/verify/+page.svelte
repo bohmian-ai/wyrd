@@ -91,8 +91,10 @@
   }
 
   // Live waits for each refresh, its list and then its support, before timing the next, so slow refreshes never pile up.
+  // Live alone, not the state object each refresh replaces: a refresh must not restart the timer it is timing.
+  const live = $derived(current.live);
   $effect(() => {
-    if (!current.live) return;
+    if (!live) return;
     let timer: ReturnType<typeof setTimeout>;
     let stopped = false;
     const refresh = async () => {

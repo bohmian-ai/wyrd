@@ -10,12 +10,13 @@
 
 use serde_json::{Value, json};
 use wiremock::matchers::{body_string_contains, method, path};
-use wiremock::{Mock, ResponseTemplate};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use secrecy::{ExposeSecret, SecretString};
 use wyrd_spec::ids::DataTenantId;
 use wyrd_testing::Bootstrap;
 use wyrd_testing::gateway_capture::GatewayCapture;
+use wyrd_testing::kms::{TransitFixture, transit_config};
 
 use crate::harness::{
     ANTHROPIC_EVENTS, INVOKER_ROLE, Journey, PROVIDER_KEY, anthropic_code, api_key,
@@ -913,6 +914,163 @@ async fn managed_secret_rotation_survives_server_restart() {
         &[PROVIDER_KEY, PROVIDER_KEY, ROTATED_KEY, ROTATED_KEY],
     )
     .await;
+}
+
+/// Proves a managed provider secret sealed under a remote wrapping backend is
+/// opened only while the Gateway prepares its snapshot, never on a warm call.
+///
+/// The administrator's submission seals through Vault Transit and the
+/// background reloads its writes queue open it. Once they settle, warm calls
+/// make no Transit request. A rotation is prepared again the same way. After
+/// a restart, the cold first call is refused retryably until the background
+/// reload has opened the committed envelope through Transit, and warm calls
+/// again make no Transit request. The upstream receives exactly the
+/// submitted, then the rotated, key.
+///
+/// # Panics
+///
+/// Panics when a status, Transit request count, or upstream credential
+/// expectation fails.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn managed_secret_opens_through_vault_transit_only_while_preparing() {
+    let transit = TransitFixture::start().await;
+    let journey = Journey::start_on(Some(transit.config("gateway", &[]))).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(GatewayCapture::completion()))
+        .mount(&journey.upstream)
+        .await;
+
+    // The credential and deployment writes each notify once.
+    let before = journey.invalidations();
+    journey
+        .deploy("openai", "authorization", &["chat_completions"])
+        .await;
+    journey.settled(before + 2).await;
+    assert_eq!(
+        transit.requests("encrypt").await,
+        1,
+        "the submission seals once"
+    );
+    let prepared = transit.requests("decrypt").await;
+    assert!(
+        prepared >= 1,
+        "preparation opened the envelope through Transit"
+    );
+    invoke(&journey).await;
+    invoke(&journey).await;
+    assert_eq!(
+        transit.requests("decrypt").await,
+        prepared,
+        "warm calls make no Transit request"
+    );
+
+    let before = journey.invalidations();
+    journey
+        .put(
+            "provider-credentials/openai-key",
+            managed("openai-key", ROTATED_KEY),
+        )
+        .await;
+    journey.settled(before + 1).await;
+    let rotated = transit.requests("decrypt").await;
+    assert!(rotated > prepared, "the rotation is prepared again");
+    invoke(&journey).await;
+    invoke(&journey).await;
+    assert_eq!(
+        transit.requests("decrypt").await,
+        rotated,
+        "warm calls after the rotation make no Transit request"
+    );
+
+    let journey = journey.restart().await;
+    invoke(&journey).await;
+    journey.settled(journey.invalidations()).await;
+    let restarted = transit.requests("decrypt").await;
+    assert!(
+        restarted > rotated,
+        "the restarted process opened the committed envelope through Transit"
+    );
+    invoke(&journey).await;
+    assert_eq!(
+        transit.requests("decrypt").await,
+        restarted,
+        "warm calls after the restart make no Transit request"
+    );
+    assert_upstream_keys(
+        &journey,
+        &[
+            PROVIDER_KEY,
+            PROVIDER_KEY,
+            ROTATED_KEY,
+            ROTATED_KEY,
+            ROTATED_KEY,
+            ROTATED_KEY,
+        ],
+    )
+    .await;
+}
+
+/// Proves a cold call waits retryably, rather than failing, while a managed
+/// secret under a remote wrapping backend is still being prepared.
+///
+/// After a restart whose Transit endpoint stalls, the background reload
+/// cannot open the committed envelope, so each call is refused with the
+/// retryable `WYRD_SERVER_503_SERVICE_UNAVAILABLE` and nothing reaches the
+/// upstream. Once the process runs against a responsive Transit again, the
+/// call is served with the submitted key.
+///
+/// # Panics
+///
+/// Panics when a status, refusal code, or upstream credential expectation
+/// fails.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn cold_call_waits_retryably_while_a_managed_secret_is_prepared() {
+    let transit = TransitFixture::start().await;
+    let journey = Journey::start_on(Some(transit.config("gateway", &[]))).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(GatewayCapture::completion()))
+        .mount(&journey.upstream)
+        .await;
+    journey
+        .deploy("openai", "authorization", &["chat_completions"])
+        .await;
+
+    let stalled = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_mins(1)))
+        .mount(&stalled)
+        .await;
+    let journey = journey
+        .restart_on(transit_config(&stalled.uri(), "gateway", &[]))
+        .await;
+    for attempt in ["first", "repeated"] {
+        let refused = journey
+            .post_once(
+                "/v1/chat/completions",
+                &[("authorization", format!("Bearer {}", journey.caller))],
+                &chat(false, "hi"),
+            )
+            .await;
+        assert_eq!(
+            refused.status().as_u16(),
+            503,
+            "the {attempt} cold call is retryable"
+        );
+        let body: Value = refused.json().await.expect("problem body");
+        assert_eq!(
+            body["error"]["code"], "WYRD_SERVER_503_SERVICE_UNAVAILABLE",
+            "{body}"
+        );
+    }
+    assert_upstream_keys(&journey, &[]).await;
+
+    let journey = journey.restart_on(transit.config("gateway", &[])).await;
+    invoke(&journey).await;
+    assert_upstream_keys(&journey, &[PROVIDER_KEY]).await;
 }
 
 /// Managed-secret credential document for `name` holding `secret`.

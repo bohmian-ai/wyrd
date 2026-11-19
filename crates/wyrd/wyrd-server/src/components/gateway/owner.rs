@@ -112,6 +112,22 @@ impl Gateway {
         &self.snapshots
     }
 
+    /// Whether the snapshot cache has no reload queued or running; see
+    /// [`GatewaySnapshots::settled`].
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn snapshots_settled(&self) -> bool {
+        self.snapshots.settled()
+    }
+
+    /// Invalidation notifications the snapshot cache has received; see
+    /// [`GatewaySnapshots::invalidations`].
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn snapshot_invalidations(&self) -> u64 {
+        self.snapshots.invalidations()
+    }
+
     /// The process quota usage.
     pub(crate) const fn usage(&self) -> &Arc<GatewayUsage> {
         &self.usage
@@ -150,6 +166,7 @@ impl Gateway {
                         for tenant in snapshots.reloads().await {
                             failed |= snapshots.reload(&postgres, &config, tenant).await.is_err();
                         }
+                        snapshots.drained();
                         if failed {
                             tokio::time::sleep(RELOAD_RETRY).await;
                         }

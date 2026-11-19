@@ -138,6 +138,9 @@ struct Entries {
     live: bool,
     /// Tenants waiting for a background reload, at most [`CACHE_TENANTS`].
     reloads: HashSet<DataTenantId>,
+    /// Whether the reload worker holds tenants it took from `reloads` and
+    /// has not yet finished reloading.
+    draining: bool,
 }
 
 impl Default for Entries {
@@ -148,6 +151,7 @@ impl Default for Entries {
             generation: 0,
             live: false,
             reloads: HashSet::new(),
+            draining: false,
         }
     }
 }
@@ -231,13 +235,15 @@ impl GatewaySnapshots {
     ///
     /// The caller waits on this load, so it opens managed secrets only with
     /// a local facade, which waits on no external service. With a remote
-    /// one it leaves them unprepared, so those credentials resolve as
-    /// unavailable, and queues the background reload that prepares them;
-    /// every other credential serves at once.
+    /// one, a tenant holding a managed secret is not served from this load:
+    /// it queues the background reload that prepares the secret and fails
+    /// retryably until that reload installs. A tenant without one serves at
+    /// once.
     ///
     /// # Errors
     /// Returns the load's error, such as `ServiceUnavailable` when storage
-    /// fails.
+    /// fails, and `ServiceUnavailable` while a remote facade's managed
+    /// secrets await their background preparation.
     pub(crate) async fn load_through(
         &self,
         postgres: &wyrd_sql::WyrdPostgres,
@@ -249,17 +255,19 @@ impl GatewaySnapshots {
         }
         let kms = self.kms.as_deref();
         let local = kms.filter(|kms| kms.backend().is_local());
-        let snapshot = self
-            .share(tenant, async {
-                load_snapshot(postgres, config, tenant, local)
-                    .await
-                    .map(|(snapshot, _)| snapshot)
-            })
-            .await?;
-        if kms.is_some() && local.is_none() && snapshot.unprepared() {
-            self.requeue(tenant);
-        }
-        Ok(snapshot)
+        let remote = kms.is_some() && local.is_none();
+        self.share(tenant, async {
+            let (snapshot, _) = load_snapshot(postgres, config, tenant, local).await?;
+            if remote && snapshot.unprepared() {
+                self.requeue(tenant);
+                return Err(WyrdError::ServiceUnavailable {
+                    message: "gateway managed secret preparation is pending".to_owned(),
+                    details: serde_json::json!({ "resource": "credential" }),
+                });
+            }
+            Ok(snapshot)
+        })
+        .await
     }
 
     /// Runs `load` as `tenant`'s one miss load unless a load for it is
@@ -292,15 +300,38 @@ impl GatewaySnapshots {
         loaded
     }
 
-    /// Takes every tenant waiting for a reload, waiting until one is queued.
+    /// Takes every tenant waiting for a reload, waiting until one is queued,
+    /// and marks the worker draining until [`Self::drained`].
     pub(crate) async fn reloads(&self) -> Vec<DataTenantId> {
         loop {
-            let queued: Vec<DataTenantId> = self.entries().reloads.drain().collect();
+            let queued: Vec<DataTenantId> = {
+                let mut entries = self.entries();
+                entries.draining |= !entries.reloads.is_empty();
+                entries.reloads.drain().collect()
+            };
             if !queued.is_empty() {
                 return queued;
             }
             self.wake.notified().await;
         }
+    }
+
+    /// Records that the reload worker finished every tenant the last
+    /// [`Self::reloads`] took, whether or not each reload succeeded.
+    pub(crate) fn drained(&self) {
+        self.entries().draining = false;
+    }
+
+    /// Whether no reload is queued or running on the worker, so every
+    /// notification that arrived has been loaded and, with a remote facade,
+    /// prepared or installed unprepared. A journey waits on this instead of
+    /// sleeping before it counts the wrapping-service requests that warm
+    /// calls make.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn settled(&self) -> bool {
+        let entries = self.entries();
+        entries.reloads.is_empty() && !entries.draining
     }
 
     /// Loads `tenant`'s snapshot from `postgres` with `config`'s bindings,

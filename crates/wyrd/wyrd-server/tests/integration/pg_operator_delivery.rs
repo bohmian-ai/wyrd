@@ -21,7 +21,7 @@ use url::Url;
 use uuid::Uuid;
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, Request as MockRequest, ResponseTemplate};
-use wyrd_kms::{KmsBackendKind, KmsConfig, WyrdKms};
+use wyrd_kms::{KmsConfig, WyrdKms};
 use wyrd_server::components::operators::secrets::OperatorSecrets;
 use wyrd_server::state::AppState;
 use wyrd_server::verification::engines::EngineOutcome;
@@ -40,6 +40,7 @@ use wyrd_spec::verification::execution::{
 use wyrd_spec::verification::{
     DriftReport, DriftVerdict, FeatureDriftReport, FrozenTarget, VerificationVerdict,
 };
+use wyrd_testing::kms::{TransitFixture, transit_config};
 use wyrd_testing::logs::LogCapture;
 use wyrd_testing::verification::VerificationFixture;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
@@ -1097,8 +1098,8 @@ async fn slow_endpoint_exhausts_the_budget_and_shutdown_releases() {
 /// Panics when either dispatch settles differently or a provider is called.
 #[tokio::test]
 async fn revoked_connection_fails_closed_and_key_outage_retries() {
-    let transit = transit_fake().await;
-    let delivery = Delivery::start_on(Some(transit_kms(&transit.uri(), "ops", &[]))).await;
+    let transit = TransitFixture::start().await;
+    let delivery = Delivery::start_on(Some(transit_config(&transit.uri(), "ops", &[]))).await;
     let origin = delivery.mock.uri();
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(204))
@@ -1131,7 +1132,7 @@ async fn revoked_connection_fails_closed_and_key_outage_retries() {
     delivery.fail_binding("owner", &[&revoked, &hooked]).await;
 
     let outage = OperatorSecrets::new(Some(Arc::new(
-        WyrdKms::new(&transit_kms(&unreachable_endpoint(), "ops", &[]), false)
+        WyrdKms::new(&transit_config(&unreachable_endpoint(), "ops", &[]), false)
             .expect("transit facade builds"),
     )));
     let running = delivery.spawn_replica(
@@ -1891,19 +1892,6 @@ fn rotated_file_kms(server: &WyrdTestServer) -> Arc<WyrdKms> {
     Arc::new(WyrdKms::new(&config, false).expect("rotated file facade builds"))
 }
 
-/// A `vault_transit` `[kms]` at `endpoint` with `active` and `retained`
-/// Transit key names and an inline token.
-fn transit_kms(endpoint: &str, active: &str, retained: &[&str]) -> KmsConfig {
-    KmsConfig {
-        backend: Some(KmsBackendKind::VaultTransit),
-        active_key: Some(active.to_owned()),
-        retained_keys: retained.iter().map(|key| (*key).to_owned()).collect(),
-        endpoint: Some(endpoint.to_owned()),
-        vault_token: Some(secrecy::SecretString::from("rewrap-vault-token")),
-        ..KmsConfig::default()
-    }
-}
-
 /// A loopback URL nothing listens on.
 ///
 /// # Panics
@@ -1913,46 +1901,6 @@ fn unreachable_endpoint() -> String {
     let endpoint = format!("http://{}", closed.local_addr().expect("addr"));
     drop(closed);
     endpoint
-}
-
-/// Local Vault Transit protocol fixture: an encrypt answers `vault:v1:`
-/// ciphertext sealing `{context, plaintext}`, and a decrypt under another
-/// context answers 400, the way Transit authenticates associated data.
-struct Transit;
-
-impl wiremock::Respond for Transit {
-    fn respond(&self, request: &MockRequest) -> ResponseTemplate {
-        use base64::Engine as _;
-        let engine = base64::engine::general_purpose::STANDARD;
-        let body: Value = serde_json::from_slice(&request.body).expect("json");
-        if request.url.path().contains("/encrypt/") {
-            let blob = json!({"context": body["associated_data"], "plaintext": body["plaintext"]});
-            let ciphertext = format!("vault:v1:{}", engine.encode(blob.to_string()));
-            return ResponseTemplate::new(200)
-                .set_body_json(json!({"data": {"ciphertext": ciphertext}}));
-        }
-        let blob: Value = body["ciphertext"]
-            .as_str()
-            .and_then(|text| text.strip_prefix("vault:v1:"))
-            .and_then(|encoded| engine.decode(encoded).ok())
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default();
-        if blob["context"] != body["associated_data"] {
-            return ResponseTemplate::new(400)
-                .set_body_json(json!({"errors": ["cipher: message authentication failed"]}));
-        }
-        ResponseTemplate::new(200).set_body_json(json!({"data": {"plaintext": blob["plaintext"]}}))
-    }
-}
-
-/// Start a [`Transit`] fixture.
-async fn transit_fake() -> MockServer {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(Transit)
-        .mount(&server)
-        .await;
-    server
 }
 
 /// Rewrap runs beside delivery, never ahead of it: while a stalled wrapping
@@ -1966,14 +1914,14 @@ async fn transit_fake() -> MockServer {
 /// shutdown, or the answered pass leaves a row on the retained key.
 #[tokio::test]
 async fn slow_rewrap_never_holds_back_another_tenants_delivery() {
-    let transit = transit_fake().await;
-    let delivery = Delivery::start_on(Some(transit_kms(&transit.uri(), "old", &[]))).await;
+    let transit = TransitFixture::start().await;
+    let delivery = Delivery::start_on(Some(transit_config(&transit.uri(), "old", &[]))).await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(204))
         .mount(&delivery.mock)
         .await;
     let stale_tenant = delivery.seed.tenant();
-    let old = WyrdKms::new(&transit_kms(&transit.uri(), "old", &[]), false).expect("old facade");
+    let old = WyrdKms::new(&transit_config(&transit.uri(), "old", &[]), false).expect("old facade");
     assert_eq!(
         current(&delivery.assertion, stale_tenant, &old).await,
         vec![true; 3]
@@ -1987,7 +1935,8 @@ async fn slow_rewrap_never_holds_back_another_tenants_delivery() {
         .mount(&stalled)
         .await;
     let replica = OperatorSecrets::new(Some(Arc::new(
-        WyrdKms::new(&transit_kms(&stalled.uri(), "new", &["old"]), false).expect("stalled facade"),
+        WyrdKms::new(&transit_config(&stalled.uri(), "new", &["old"]), false)
+            .expect("stalled facade"),
     )));
     let limits = RuntimeLimits {
         rewrap_interval: Duration::from_millis(50),
@@ -2041,7 +1990,7 @@ async fn slow_rewrap_never_holds_back_another_tenants_delivery() {
     );
 
     let answered = Arc::new(
-        WyrdKms::new(&transit_kms(&transit.uri(), "new", &["old"]), false)
+        WyrdKms::new(&transit_config(&transit.uri(), "new", &["old"]), false)
             .expect("answered facade"),
     );
     let running = delivery.spawn_replica(

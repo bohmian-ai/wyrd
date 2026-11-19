@@ -1831,6 +1831,137 @@ async fn federated_platform_sign_in_runs_through_the_served_callback() {
     srv.shutdown().await.expect("server shuts down");
 }
 
+/// Client secret of the confidential platform connection the Transit journey
+/// configures.
+const PLATFORM_CLIENT_SECRET: &str = "platform-client-secret";
+
+/// Complete one federated platform sign-in on `srv` against `provider`,
+/// asserting the token endpoint received [`PLATFORM_CLIENT_SECRET`] in the
+/// code exchange's body.
+///
+/// # Panics
+/// Panics when the sign-in is refused or the exchange carried another secret.
+async fn confidential_platform_sign_in(srv: &WyrdTestServer, provider: &wiremock::MockServer) {
+    let issuer = provider.uri();
+    let (state, nonce) = begin_platform_login(srv).await;
+    mount_platform_provider(
+        provider,
+        platform_key_set("mock-1"),
+        platform_token_reply(&issuer, &nonce, PLATFORM_CLIENT, "mock-1"),
+    )
+    .await;
+    let (status, body) = platform_callback(srv, &state, Some(&issuer)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the confidential sign-in completes: {body}"
+    );
+    let exchanges: Vec<String> = provider
+        .received_requests()
+        .await
+        .expect("requests are recorded")
+        .iter()
+        .filter(|request| request.url.path() == "/token")
+        .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+        .collect();
+    assert_eq!(exchanges.len(), 1, "one code exchange: {exchanges:?}");
+    assert!(
+        exchanges[0].contains(&format!("client_secret={PLATFORM_CLIENT_SECRET}")),
+        "the exchange authenticates with the opened secret: {}",
+        exchanges[0]
+    );
+}
+
+/// A confidential platform OIDC connection's client secret is sealed through
+/// the deployment's remote wrapping backend and opened through it for the
+/// code exchange, before and after a restart:
+///   1. configuring the connection seals the secret with one Transit
+///      encrypt, and the view never returns it;
+///   2. a sign-in authenticates to the provider's token endpoint with the
+///      opened secret, which took a Transit decrypt;
+///   3. the restarted process opens the committed envelope through Transit
+///      again and the next sign-in authenticates the same way.
+///
+/// # Panics
+/// Panics when any step deviates from the contract above.
+#[tokio::test]
+async fn platform_sign_in_opens_its_client_secret_through_vault_transit_across_restart() {
+    let transit = wyrd_testing::kms::TransitFixture::start().await;
+    let srv = Box::pin(
+        WyrdTestServer::builder()
+            .with_kms_for_test(transit.config("platform", &[]))
+            .start_bound(),
+    )
+    .await
+    .expect("server starts");
+    let root = initialize_platform_root(&srv)
+        .await
+        .expect("deployment initializes");
+    let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
+    let provider = wiremock::MockServer::start().await;
+    mount_platform_provider(
+        &provider,
+        platform_key_set("mock-1"),
+        wiremock::ResponseTemplate::new(500),
+    )
+    .await;
+
+    // 1. Configuring seals through Transit; the view is redacted.
+    let resp = srv
+        .oneshot(platform_request(
+            Method::PUT,
+            "/platform/oidc/connection",
+            &session,
+            Some(json!({
+                "issuer_url": provider.uri(),
+                "client_id": PLATFORM_CLIENT,
+                "client_auth": { "method": "secret_post", "secret": PLATFORM_CLIENT_SECRET },
+            })),
+        ))
+        .await
+        .expect("configure route responds");
+    let status = resp.status();
+    let view = body_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "connection configures: {view}");
+    assert!(
+        !view.to_string().contains(PLATFORM_CLIENT_SECRET),
+        "the view never returns the secret: {view}"
+    );
+    assert_eq!(
+        transit.requests("encrypt").await,
+        1,
+        "the secret seals once"
+    );
+    let resp = srv
+        .oneshot(platform_request(
+            Method::POST,
+            "/platform/admins",
+            &session,
+            Some(json!({ "name": "ops-lead", "match_claim": "ops@example.com" })),
+        ))
+        .await
+        .expect("register route responds");
+    assert_eq!(resp.status(), StatusCode::OK, "administrator registers");
+
+    // 2. The code exchange uses the secret Transit opened.
+    confidential_platform_sign_in(&srv, &provider).await;
+    let opened = transit.requests("decrypt").await;
+    assert!(opened >= 1, "the sign-in opened the secret through Transit");
+
+    // 3. The restarted process opens the committed envelope again.
+    let srv = Box::pin(srv.restart_bound(WyrdTestServer::builder()))
+        .await
+        .expect("server restarts");
+    confidential_platform_sign_in(&srv, &provider).await;
+    assert!(
+        transit.requests("decrypt").await > opened,
+        "the restarted process opened the secret through Transit"
+    );
+    assert_eq!(transit.requests("encrypt").await, 1, "nothing was resealed");
+
+    srv.shutdown().await.expect("server shuts down");
+}
+
 /// An operator configures federated sign-in, registers an administrator, and
 /// can take it all away again without losing the deployment.
 ///

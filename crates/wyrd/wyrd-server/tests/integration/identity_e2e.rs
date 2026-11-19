@@ -5371,6 +5371,141 @@ async fn federated_cloud_journey_cli_authored_keycloak() {
     srv.shutdown().await.expect("server shuts down cleanly");
 }
 
+/// Tenant human-login and workload-issuer client secrets are sealed through
+/// the deployment's remote wrapping backend and opened through it by their
+/// real consumers, before and after a restart:
+///   1. a confidential Keycloak connection staged, tested, and activated
+///      through the served API seals its secret through Transit, and its test
+///      sign-in's code exchange already needs the opened secret;
+///   2. a person then signs in through that connection;
+///   3. a `SecretPost` trusted issuer authored through the CLI seals its
+///      secret through Transit, and a jwt-bearer exchange against it, which
+///      decodes the issuer and so opens the secret, returns `200`;
+///   4. the restarted process opens both committed envelopes through Transit
+///      again: the person signs in and the workload exchanges once more.
+///
+/// # Panics
+/// Panics when any step deviates from the contract above.
+#[tokio::test]
+#[ignore = "requires the Keycloak and Dex identity lane"]
+async fn auth_client_secrets_open_through_vault_transit_across_restart() {
+    let transit = wyrd_testing::kms::TransitFixture::start().await;
+    let srv = WyrdTestServerBuilder::default()
+        .with_kms_for_test(transit.config("identity", &[]))
+        .start_bound()
+        .await
+        .expect("bound server starts");
+    let server_url: Url = srv
+        .base_url()
+        .expect("bound server exposes a base URL")
+        .parse()
+        .expect("base URL parses");
+    let keycloak = OidcIssuerFixture::connect(&keycloak_issuer()).await;
+
+    // 1–2. Tenant human login through a confidential connection.
+    let admin = tenant_admin(&srv, srv.data_tenant_id(), "transit-admin").await;
+    activate_keycloak_connection(
+        &srv,
+        &admin,
+        CONFIDENTIAL_HUMAN_CLIENT,
+        "SecretPost",
+        Some(CONFIDENTIAL_HUMAN_SECRET),
+    )
+    .await;
+    human_login(
+        &srv,
+        &keycloak,
+        CONFIDENTIAL_HUMAN_CLIENT,
+        "alice",
+        "alice-password",
+    )
+    .await;
+    let human_sealed = transit.requests("encrypt").await;
+    assert!(
+        human_sealed >= 1,
+        "the connection secret sealed through Transit"
+    );
+
+    // 3. Workload exchange against a CLI-authored confidential issuer.
+    let assertion = keycloak
+        .workload_token("wyrd-workload", "wyrd-workload-secret", "wyrd-workload")
+        .await;
+    let subject = jwt_claims(&assertion)["sub"]
+        .as_str()
+        .expect("workload token carries a subject")
+        .to_owned();
+    let card_ref = binding_card_ref(CardKind::Service, "transit-workload");
+    let principal = srv
+        .seed_card_principal(&card_ref, &["editor"])
+        .await
+        .expect("workload principal seeds");
+    assert_cli_succeeded(
+        &wyrd_cli(
+            trusted_issuer_add_args(&server_url, "SecretPost", "Workload"),
+            &[
+                ("WYRD_ACCESS_TOKEN", admin.token.clone()),
+                (
+                    "WYRD_ISSUER_CLIENT_SECRET",
+                    "transit-issuer-secret".to_owned(),
+                ),
+            ],
+        )
+        .await,
+        "CLI trusted-issuer add succeeds",
+    );
+    assert_cli_succeeded(
+        &wyrd_cli(
+            workload_binding_add_args(&server_url, &subject, principal, card_ref.uid.as_ref()),
+            &[("WYRD_ACCESS_TOKEN", admin.token.clone())],
+        )
+        .await,
+        "CLI workload-binding add succeeds",
+    );
+    assert!(
+        transit.requests("encrypt").await > human_sealed,
+        "the issuer secret sealed through Transit"
+    );
+    assert_eq!(
+        post_jwt_bearer(&srv, &assertion).await.status(),
+        StatusCode::OK,
+        "the workload exchanges against the confidential issuer"
+    );
+    let opened = transit.requests("decrypt").await;
+    assert!(
+        opened >= 2,
+        "both consumers opened their secret through Transit"
+    );
+
+    // 4. The restarted process opens both envelopes through Transit again.
+    let srv = Box::pin(srv.restart_bound(WyrdTestServerBuilder::default()))
+        .await
+        .expect("server restarts");
+    human_login(
+        &srv,
+        &keycloak,
+        CONFIDENTIAL_HUMAN_CLIENT,
+        "alice",
+        "alice-password",
+    )
+    .await;
+    let human_reopened = transit.requests("decrypt").await;
+    assert!(
+        human_reopened > opened,
+        "the restarted sign-in opened its secret"
+    );
+    assert_eq!(
+        post_jwt_bearer(&srv, &assertion).await.status(),
+        StatusCode::OK,
+        "the workload exchanges after the restart"
+    );
+    assert!(
+        transit.requests("decrypt").await > human_reopened,
+        "the restarted exchange opened the issuer secret"
+    );
+
+    srv.shutdown().await.expect("server shuts down cleanly");
+}
+
 /// Assert the production `wyrd-client` workload-credential lifecycle end-to-end
 /// against the live bound server: one cached exchange, reuse while fresh, and a
 /// fresh re-exchange on `force_refresh` — the exact path a workload's transport

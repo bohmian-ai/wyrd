@@ -2408,7 +2408,7 @@ pub enum WyrdError {
         details: Value,
     },
     /// The tenant already has an Operator connection of this provider and
-    /// name, or an update kept losing to concurrent writes.
+    /// name, or an update lost to a concurrent write.
     #[error("[WYRD_OPERATOR_409_CONNECTION_CONFLICT] {message}")]
     #[wyrd_error(
         code = "WYRD_OPERATOR_409_CONNECTION_CONFLICT",

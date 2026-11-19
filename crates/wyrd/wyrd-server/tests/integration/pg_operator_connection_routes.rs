@@ -179,15 +179,14 @@ fn creates() -> [Value; 3] {
 }
 
 /// A secret rotation whose remote encryption is still in flight when the
-/// connection is disabled is fenced out by the disable and prepared again
-/// over the row the disable left: the disable is kept, so the rotation never
-/// re-enables the connection, and the rotated secret commits once, as the
-/// next secret version, sealed again for that row.
+/// connection is disabled loses to the disable: the rotation returns the
+/// connection conflict, and the row keeps the disable's status, envelope, and
+/// secret version, with no second seal for the row the disable left.
 ///
 /// # Panics
 /// Panics when either response, the stored row, or the read view differs.
 #[tokio::test]
-async fn rotation_racing_a_disable_keeps_the_disable() {
+async fn rotation_racing_a_disable_conflicts_and_keeps_the_disable() {
     let transit = TransitFixture::start_delayed(std::time::Duration::from_millis(500)).await;
     let server = WyrdTestServer::builder()
         .with_kms_for_test(transit.config("ops", &[]))
@@ -217,25 +216,31 @@ async fn rotation_racing_a_disable_keeps_the_disable() {
         }
         call(&server, &jwt, Method::DELETE, &uri, None).await
     };
-    let ((rotated, rotated_view), (disabled, disabled_view)) = tokio::join!(rotation, disable);
+    let ((rotated, problem), (disabled, disabled_view)) = tokio::join!(rotation, disable);
 
     assert_eq!(
         (disabled, disabled_view["status"].as_str()),
         (StatusCode::OK, Some("disabled"))
     );
     assert_eq!(
-        (rotated, rotated_view["status"].as_str()),
-        (StatusCode::OK, Some("disabled")),
-        "the rotation commits over the disabled row without re-enabling it"
+        (rotated, problem["code"].as_str()),
+        (
+            StatusCode::CONFLICT,
+            Some("WYRD_OPERATOR_409_CONNECTION_CONFLICT")
+        ),
+        "the rotation lost to the disable"
     );
     assert_eq!(
         transit.requests("encrypt").await,
-        3,
-        "the fenced-out rotation sealed again for the row the disable left"
+        2,
+        "the losing rotation is not sealed again"
     );
     let (_, after, after_version) = stored_row(&server, tenant, &id).await;
-    assert_eq!(after_version, before_version + 1, "one rotation committed");
-    assert_ne!(after, before, "the rotated envelope replaced the original");
+    assert_eq!(
+        (after, after_version),
+        (before, before_version),
+        "the disable left the stored secret unchanged"
+    );
     let (_, read) = call(&server, &jwt, Method::GET, &uri, None).await;
     assert_eq!(read["status"], "disabled", "the disable is kept");
 }

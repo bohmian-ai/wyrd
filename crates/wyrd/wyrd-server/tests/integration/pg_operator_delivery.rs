@@ -955,6 +955,87 @@ async fn next_attempt_on_another_replica_uses_the_rotated_credential() {
     );
 }
 
+/// Two rotations of one credential race through a slow key service: the
+/// rotation that commits first wins, the other returns the connection
+/// conflict without overwriting it, and the next delivery sends the winner's
+/// token.
+///
+/// # Panics
+/// Panics when both or neither rotation commits, the loser's response is not
+/// the conflict, or the delivery sends another token.
+#[tokio::test]
+async fn racing_rotations_keep_the_first_commit_and_deliver_it() {
+    let transit = TransitFixture::start_delayed(Duration::from_millis(500)).await;
+    let delivery = Delivery::start_on(Some(transit.config("ops", &[]))).await;
+    Mock::given(method("POST"))
+        .and(path("/slack"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
+        .mount(&delivery.mock)
+        .await;
+    let posted = delivery.operator("posted", slack("C0123456789")).await;
+    let (_, list) = delivery
+        .call(Method::GET, "/v1/operator-connections", None)
+        .await;
+    let slack_id = list
+        .as_array()
+        .or_else(|| list["connections"].as_array())
+        .expect("connection list")
+        .iter()
+        .find(|view| view["provider"] == "slack")
+        .and_then(|view| view["connection_id"].as_str())
+        .expect("slack connection")
+        .to_owned();
+    let uri = format!("/v1/operator-connections/{slack_id}");
+    let sealed_before = transit.requests("encrypt").await;
+
+    let first = json!({ "provider": "slack", "bot_token": ROTATED_TOKEN });
+    let second = json!({ "provider": "slack", "bot_token": "xoxb-losing-slack-token" });
+    let first_rotation = delivery.call(Method::PATCH, &uri, Some(&first));
+    let second_rotation = async {
+        while transit.requests("encrypt").await <= sealed_before {
+            tokio::task::yield_now().await;
+        }
+        delivery.call(Method::PATCH, &uri, Some(&second)).await
+    };
+    let ((first_status, _), (second_status, problem)) =
+        tokio::join!(first_rotation, second_rotation);
+    assert_eq!(first_status, StatusCode::OK, "the first commit wins");
+    assert_eq!(
+        (second_status, problem["code"].as_str()),
+        (
+            StatusCode::CONFLICT,
+            Some("WYRD_OPERATOR_409_CONNECTION_CONFLICT")
+        ),
+        "the losing rotation conflicts"
+    );
+
+    delivery.fail_binding("owner", &[&posted]).await;
+    let running = delivery.spawn(
+        delivery.server.state(),
+        &Delivery::limits(),
+        &failing_script(1),
+        &CapabilityCrash::default(),
+    );
+    let run = delivery.new_run(&[]).await;
+    delivery
+        .wait_dispatches(run, 1, |row| row.status == "delivered")
+        .await;
+    running.stop().await;
+    let tokens: Vec<String> = delivery
+        .requests("/slack")
+        .await
+        .iter()
+        .filter_map(|post| {
+            post.headers
+                .get("authorization")?
+                .to_str()
+                .ok()
+                .map(str::to_owned)
+        })
+        .collect();
+    assert_eq!(tokens, vec![format!("Bearer {ROTATED_TOKEN}")]);
+}
+
 /// A slow endpoint times out each attempt, retries after 30 seconds and then
 /// two minutes, and fails once the three-attempt budget is spent, without
 /// rerunning the Verifier; a crashed worker restarts, shutdown releases an

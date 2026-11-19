@@ -36,9 +36,6 @@ const UPDATE: &str = "operator_connection.update";
 /// Audit operation of a connection disable.
 const DISABLE: &str = "operator_connection.disable";
 
-/// How many times a change is prepared again after a concurrent write wins.
-const CHANGE_ATTEMPTS: usize = 3;
-
 /// The not-found refusal for `connection_id`.
 fn not_found(connection_id: OperatorConnectionId) -> WyrdError {
     WyrdError::OperatorConnectionNotFound {
@@ -242,11 +239,12 @@ impl<'a> OperatorConnectionControl<'a> {
     /// The row is read in its own transaction, a replacement secret is sealed
     /// with no transaction open, and the write is fenced on the authority,
     /// status, secret version, and envelope read, so a key-service wait holds
-    /// no row lock. A concurrent change wins the fence; this change is then
-    /// prepared again over the row it left, at most [`CHANGE_ATTEMPTS`] times.
+    /// no row lock. A concurrent change that commits first wins the fence, and
+    /// this change is refused rather than applied over the winner.
     ///
     /// # Errors
-    /// Returns the refusals named on [`Self::update`].
+    /// Returns [`WyrdError::OperatorConnectionConflict`] when a concurrent
+    /// change committed first, and the refusals named on [`Self::update`].
     async fn change(
         &self,
         caller: &Caller,
@@ -260,56 +258,53 @@ impl<'a> OperatorConnectionControl<'a> {
             &format!("operator_connection:{connection_id}"),
         )?;
         let tenant = caller.data_tenant_id;
-        for _ in 0..CHANGE_ATTEMPTS {
-            let mut conn = self.state.registry_tenant_conn(tenant).await?;
-            let current = get_connection(&mut conn, connection_id)
-                .await
-                .map_err(registry_db_error)?;
-            conn.commit().await.map_err(registry_db_error)?;
-            let current = current.ok_or_else(|| not_found(connection_id))?;
-            let update = match &change {
-                Change::Disable => wyrd_spec::operator_connection::ConnectionUpdate {
-                    config: current.view.config.clone(),
-                    secret: None,
-                    status: Some(OperatorConnectionStatus::Disabled),
-                },
-                Change::Update(request) => request.clone().apply(current.view.config.clone())?,
-            };
-            let secret_version = current.secret_version + 1;
-            let sealed = match &update.secret {
-                Some(secret) => Some(
-                    self.secrets()
-                        .seal(
-                            &SecretIdentity::of(tenant, &current.view, secret_version),
-                            &plaintext(secret)?,
-                        )
-                        .await?,
-                ),
-                None => None,
-            };
-            let mut conn = self.state.registry_tenant_conn(tenant).await?;
-            let stored = update_connection(
-                &mut conn,
-                &current,
-                &ConnectionChange {
-                    config: &update.config,
-                    status: update.status.unwrap_or(current.view.status),
-                    secret: sealed.as_ref().map(|sealed| (sealed, secret_version)),
-                    principal: caller.principal.id,
-                },
-            )
+        let mut conn = self.state.registry_tenant_conn(tenant).await?;
+        let current = get_connection(&mut conn, connection_id)
             .await
             .map_err(registry_db_error)?;
-            conn.commit().await.map_err(registry_db_error)?;
-            if let Some(stored) = stored {
-                return Ok(stored.view);
-            }
-        }
-        Err(WyrdError::OperatorConnectionConflict {
-            message: "the Operator connection kept changing concurrently; read it again and retry"
-                .to_owned(),
-            details: serde_json::json!({ "connection_id": connection_id }),
-        })
+        conn.commit().await.map_err(registry_db_error)?;
+        let current = current.ok_or_else(|| not_found(connection_id))?;
+        let update = match &change {
+            Change::Disable => wyrd_spec::operator_connection::ConnectionUpdate {
+                config: current.view.config.clone(),
+                secret: None,
+                status: Some(OperatorConnectionStatus::Disabled),
+            },
+            Change::Update(request) => request.clone().apply(current.view.config.clone())?,
+        };
+        let secret_version = current.secret_version + 1;
+        let sealed = match &update.secret {
+            Some(secret) => Some(
+                self.secrets()
+                    .seal(
+                        &SecretIdentity::of(tenant, &current.view, secret_version),
+                        &plaintext(secret)?,
+                    )
+                    .await?,
+            ),
+            None => None,
+        };
+        let mut conn = self.state.registry_tenant_conn(tenant).await?;
+        let stored = update_connection(
+            &mut conn,
+            &current,
+            &ConnectionChange {
+                config: &update.config,
+                status: update.status.unwrap_or(current.view.status),
+                secret: sealed.as_ref().map(|sealed| (sealed, secret_version)),
+                principal: caller.principal.id,
+            },
+        )
+        .await
+        .map_err(registry_db_error)?;
+        conn.commit().await.map_err(registry_db_error)?;
+        stored
+            .map(|stored| stored.view)
+            .ok_or_else(|| WyrdError::OperatorConnectionConflict {
+                message: "the Operator connection changed concurrently; read it again and retry"
+                    .to_owned(),
+                details: serde_json::json!({ "connection_id": connection_id }),
+            })
     }
 
     /// Evaluate `operators:write` and stage the decision on the process audit

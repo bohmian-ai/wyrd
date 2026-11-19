@@ -159,12 +159,10 @@ Record focused commands and actual RED/GREEN/assertion evidence in these entries
      `pg_resolvers::pg_tests::resolver_refuses_an_envelope_copied_from_another_tenant`
      shows the jwt-bearer resolver refuses a cross-tenant copy while the source tenant
      still resolves its own secret.
-     `pg_operator_connection_routes::rotation_racing_a_disable_keeps_the_disable` delays
-     Transit 500 ms and lands the disable mid-encrypt. The disable stays, the rotation is
-     fenced out, sealed again (3 encrypts) and commits once (`secret_version + 1`), and
-     the connection is never re-enabled. This test's first draft expected a 409; the
-     documented `change` re-prepare loop (`service.rs` `CHANGE_ATTEMPTS`) is the
-     contract, so that was an assertion error, not a product defect.
+     The race evidence first recorded here asserted a retry-to-success loop. That
+     contradicted REQ-008 and was corrected in TASK-002-R1 (FIND-TASK-002-4). The R1
+     evidence for that correction is in
+     `review/task-002-c8cbfeeb0/TASK-002-R1-secret-owner-binding-and-runtime-safety.md`.
      Existing proof, cited: `pg_invocation_tests.rs:900` (Gateway cross-tenant copy),
      `wyrd-sql` `updates_rotate_in_place_and_are_fenced_on_the_observed_row`,
      `gateway_concurrent_replacements_are_last_committed_and_family_independent`,

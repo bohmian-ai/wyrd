@@ -22,9 +22,15 @@
 
 #![deny(missing_docs)]
 
+mod aws;
 mod config;
 mod envelope;
+mod gcp;
 mod local;
+mod remote;
+#[cfg(test)]
+mod remote_tests;
+mod transit;
 
 use std::fmt;
 
@@ -34,8 +40,11 @@ use zeroize::Zeroizing;
 
 pub use config::{KmsBackendKind, KmsConfig};
 
+use crate::aws::AwsKms;
 use crate::envelope::Envelope;
+use crate::gcp::GcpKms;
 use crate::local::LocalKeys;
+use crate::transit::TransitKms;
 
 /// Domain tag of the payload layer's associated data.
 const PAYLOAD_DOMAIN: &str = "wyrd.kms.payload.v1";
@@ -113,7 +122,9 @@ impl SecretContext<'_> {
             SecretScope::Platform => ("platform", String::new()),
         };
         let authority_len = self.authority.len().to_string();
-        let version = self.version.map_or_else(|| "-".to_owned(), |v| v.to_string());
+        let version = self
+            .version
+            .map_or_else(|| "-".to_owned(), |v| v.to_string());
         let mut parts: Vec<&str> = vec![
             scope,
             &tenant,
@@ -198,6 +209,12 @@ pub enum KmsError {
 enum Backend {
     /// File or explicit memory keys held in process memory.
     Local(LocalKeys),
+    /// GCP Cloud KMS.
+    Gcp(GcpKms),
+    /// AWS KMS.
+    Aws(AwsKms),
+    /// Vault Transit.
+    Transit(TransitKms),
 }
 
 impl Backend {
@@ -208,6 +225,9 @@ impl Backend {
     async fn wrap(&self, key_ref: &str, dek: &SecretKey, aad: &[u8]) -> Result<Vec<u8>, KmsError> {
         match self {
             Self::Local(keys) => keys.wrap(key_ref, dek, aad),
+            Self::Gcp(kms) => kms.wrap(key_ref, dek.expose(), aad).await,
+            Self::Aws(kms) => kms.wrap(key_ref, dek.expose(), aad).await,
+            Self::Transit(kms) => kms.wrap(key_ref, dek.expose(), aad).await,
         }
     }
 
@@ -223,6 +243,9 @@ impl Backend {
     ) -> Result<Zeroizing<Vec<u8>>, KmsError> {
         match self {
             Self::Local(keys) => keys.unwrap(key_ref, wrapped, aad),
+            Self::Gcp(kms) => kms.unwrap(key_ref, wrapped, aad).await,
+            Self::Aws(kms) => kms.unwrap(key_ref, wrapped, aad).await,
+            Self::Transit(kms) => kms.unwrap(key_ref, wrapped, aad).await,
         }
     }
 }
@@ -277,11 +300,23 @@ impl WyrdKms {
                 })?,
                 std::iter::once(&settings.active).chain(&settings.retained),
             )?),
-            KmsBackendKind::GcpKms | KmsBackendKind::AwsKms | KmsBackendKind::VaultTransit => {
-                return Err(KmsError::Config {
-                    setting: "backend",
-                    reason: "is not available in this build",
-                });
+            KmsBackendKind::GcpKms => Backend::Gcp(GcpKms::new(settings.endpoint.as_ref())?),
+            KmsBackendKind::AwsKms => {
+                let (_, region) = config::aws_region(&settings.active).ok_or(KmsError::Config {
+                    setting: "active_key",
+                    reason: "is not a valid key reference for the backend",
+                })?;
+                Backend::Aws(AwsKms::new(region, settings.endpoint.as_ref())?)
+            }
+            KmsBackendKind::VaultTransit => {
+                let (Some(address), Some(vault)) = (settings.endpoint.clone(), settings.vault)
+                else {
+                    return Err(KmsError::Config {
+                        setting: "endpoint",
+                        reason: "is required for the vault_transit backend",
+                    });
+                };
+                Backend::Transit(TransitKms::new(address, vault)?)
             }
         };
         Ok(Self {
@@ -290,6 +325,22 @@ impl WyrdKms {
             retained: settings.retained,
             backend,
         })
+    }
+
+    /// A facade over an already-built `backend`, for adapter tests.
+    #[cfg(test)]
+    fn with_backend(
+        kind: KmsBackendKind,
+        active: &str,
+        retained: &[&str],
+        backend: Backend,
+    ) -> Self {
+        Self {
+            kind,
+            active: active.to_owned(),
+            retained: retained.iter().map(|key| (*key).to_owned()).collect(),
+            backend,
+        }
     }
 
     /// Seal `plaintext` as the secret `context` identifies under a fresh DEK
@@ -304,9 +355,8 @@ impl WyrdKms {
         plaintext: &[u8],
     ) -> Result<Vec<u8>, KmsError> {
         let dek = SecretKey::generate();
-        let payload =
-            wyrd_crypt::encrypt_aad(&dek, plaintext, &context.canonical(PAYLOAD_DOMAIN))
-                .map_err(|_| KmsError::Encrypt)?;
+        let payload = wyrd_crypt::encrypt_aad(&dek, plaintext, &context.canonical(PAYLOAD_DOMAIN))
+            .map_err(|_| KmsError::Encrypt)?;
         let wrapped_dek = self
             .backend
             .wrap(&self.active, &dek, &context.canonical(WRAP_DOMAIN))
@@ -464,8 +514,16 @@ mod tests {
         assert_ne!(a.nonce, b.nonce, "fresh payload nonce");
         assert_ne!(a.ciphertext, b.ciphertext);
         let aad = ctx.canonical(WRAP_DOMAIN);
-        let dek_a = kms.backend.unwrap("dev", a.wrapped_dek, &aad).await.expect("dek");
-        let dek_b = kms.backend.unwrap("dev", b.wrapped_dek, &aad).await.expect("dek");
+        let dek_a = kms
+            .backend
+            .unwrap("dev", a.wrapped_dek, &aad)
+            .await
+            .expect("dek");
+        let dek_b = kms
+            .backend
+            .unwrap("dev", b.wrapped_dek, &aad)
+            .await
+            .expect("dek");
         assert_eq!(dek_a.len(), 32);
         assert_ne!(dek_a, dek_b, "independent DEKs");
         assert!(!first.windows(10).any(|w| w == b"xoxb-token"));
@@ -485,7 +543,11 @@ mod tests {
             .expect("seals");
         let restarted = file(dir.path(), "k1", &[]).expect("file facade rebuilds");
         assert_eq!(
-            restarted.open(&ctx, &sealed).await.expect("opens").as_slice(),
+            restarted
+                .open(&ctx, &sealed)
+                .await
+                .expect("opens")
+                .as_slice(),
             b"client-secret"
         );
     }
@@ -590,7 +652,10 @@ mod tests {
             );
         }
         assert_eq!(
-            other.open(&ctx, &sealed[..sealed.len() - 17]).await.map(|_| ()),
+            other
+                .open(&ctx, &sealed[..sealed.len() - 17])
+                .await
+                .map(|_| ()),
             Err(KmsError::UnknownFormat)
         );
 
@@ -638,7 +703,10 @@ mod tests {
         );
         key_file(dir.path(), "k1", 1);
         for (name, contents) in [
-            ("short", base64::engine::general_purpose::STANDARD.encode([1; 16])),
+            (
+                "short",
+                base64::engine::general_purpose::STANDARD.encode([1; 16]),
+            ),
             ("text", "not base64!".to_owned()),
         ] {
             std::fs::write(dir.path().join(name), contents).expect("writes");
@@ -651,7 +719,11 @@ mod tests {
                 )
                 .expect("owner-only");
             }
-            assert_eq!(refusal(file(dir.path(), "k1", &[name])), "key_dir", "{name}");
+            assert_eq!(
+                refusal(file(dir.path(), "k1", &[name])),
+                "key_dir",
+                "{name}"
+            );
         }
         #[cfg(unix)]
         {
@@ -680,7 +752,11 @@ mod tests {
         );
         let retaining = file(dir.path(), "k2", &["k1"]).expect("builds");
         assert_eq!(
-            retaining.open(&ctx, &old).await.expect("retained opens").as_slice(),
+            retaining
+                .open(&ctx, &old)
+                .await
+                .expect("retained opens")
+                .as_slice(),
             b"client-secret"
         );
     }

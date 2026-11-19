@@ -41,18 +41,19 @@ impl LocalKeys {
     ) -> Result<Self, KmsError> {
         let mut keys = HashMap::new();
         for name in names {
-            let text = Zeroizing::new(wyrd_utils::secret::read_secret_file(&dir.join(name)).map_err(
-                |_| KmsError::Config {
-                    setting: "key_dir",
-                    reason: "names a key file that is missing, unreadable, or not owner-only",
-                },
-            )?);
-            let bytes = Zeroizing::new(STANDARD.decode(text.trim()).map_err(|_| {
-                KmsError::Config {
+            let text = Zeroizing::new(
+                wyrd_utils::secret::read_secret_file(&dir.join(name)).map_err(|_| {
+                    KmsError::Config {
+                        setting: "key_dir",
+                        reason: "names a key file that is missing, unreadable, or not owner-only",
+                    }
+                })?,
+            );
+            let bytes =
+                Zeroizing::new(STANDARD.decode(text.trim()).map_err(|_| KmsError::Config {
                     setting: "key_dir",
                     reason: "names a key file that is not base64",
-                }
-            })?);
+                })?);
             let key: [u8; 32] = bytes.as_slice().try_into().map_err(|_| KmsError::Config {
                 setting: "key_dir",
                 reason: "names a key file that is not a 32-byte key",

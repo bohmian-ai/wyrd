@@ -72,7 +72,9 @@ impl<'a> Envelope<'a> {
     /// algorithm, a truncated field, a non-UTF-8 reference, or a ciphertext
     /// shorter than its tag.
     pub(crate) fn decode(bytes: &'a [u8]) -> Result<Self, KmsError> {
-        let rest = bytes.strip_prefix(MAGIC.as_slice()).ok_or(KmsError::UnknownFormat)?;
+        let rest = bytes
+            .strip_prefix(MAGIC.as_slice())
+            .ok_or(KmsError::UnknownFormat)?;
         let (&[format, algorithm], rest) = split(rest, 2)? else {
             return Err(KmsError::UnknownFormat);
         };

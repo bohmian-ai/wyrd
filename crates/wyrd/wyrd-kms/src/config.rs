@@ -225,7 +225,10 @@ impl KmsConfig {
             .clone()
             .ok_or(invalid("active_key", "is required"))?;
         if !valid_reference(kind, &active) {
-            return Err(invalid("active_key", "is not a valid key reference for the backend"));
+            return Err(invalid(
+                "active_key",
+                "is not a valid key reference for the backend",
+            ));
         }
         for (index, retained) in self.retained_keys.iter().enumerate() {
             if !valid_reference(kind, retained) {
@@ -254,7 +257,11 @@ impl KmsConfig {
         }
         let vault = kind == KmsBackendKind::VaultTransit;
         for (present, applies, setting) in [
-            (self.key_dir.is_some(), kind == KmsBackendKind::File, "key_dir"),
+            (
+                self.key_dir.is_some(),
+                kind == KmsBackendKind::File,
+                "key_dir",
+            ),
             (
                 self.endpoint.is_some(),
                 matches!(
@@ -282,7 +289,10 @@ impl KmsConfig {
             .transpose()?;
         let vault = if vault {
             if endpoint.is_none() {
-                return Err(invalid("endpoint", "is required for the vault_transit backend"));
+                return Err(invalid(
+                    "endpoint",
+                    "is required for the vault_transit backend",
+                ));
             }
             let token = match (&self.vault_token_file, &self.vault_token) {
                 (Some(path), None) => VaultToken::File(path.clone()),
@@ -386,7 +396,9 @@ pub(crate) fn aws_region(arn: &str) -> Option<(&str, &str)> {
         && account.len() == 12
         && account.bytes().all(|byte| byte.is_ascii_digit())
         && !id.is_empty()
-        && id.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-');
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-');
     ok.then_some((partition, region))
 }
 
@@ -635,7 +647,13 @@ mod tests {
         let debug = format!("{vault:?}");
         let error = vault.resolve(true).err().expect("refused").to_string();
         for text in [debug, error] {
-            for canary in ["secret-host", "canary-token", "canary-path", "canary-retained", "canary-active"] {
+            for canary in [
+                "secret-host",
+                "canary-token",
+                "canary-path",
+                "canary-retained",
+                "canary-active",
+            ] {
                 assert!(!text.contains(canary), "{text}");
             }
         }

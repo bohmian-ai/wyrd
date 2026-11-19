@@ -83,12 +83,13 @@ pub(crate) const LIVE_ROWS_EXAMINED_TOTAL: &str = "bifrost_scribe_live_rows_exam
 /// read from storage.
 pub(crate) const LIVE_BYTES_EXAMINED_TOTAL: &str = "bifrost_scribe_live_bytes_examined_total";
 
-/// Rows and bytes counted by [`record_live_scan`], mirrored for tests.
 #[cfg(feature = "test-support")]
-pub(crate) static LIVE_SCAN: [std::sync::atomic::AtomicU64; 2] = [
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-];
+thread_local! {
+    /// Rows and bytes [`record_live_scan`] counted on this thread, mirrored
+    /// for tests: per thread, so one test's reads never count another's.
+    pub(crate) static LIVE_SCAN: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
 
 /// Counts one examined captured batch's `rows` and decoded `bytes` into
 /// [`LIVE_ROWS_EXAMINED_TOTAL`] and [`LIVE_BYTES_EXAMINED_TOTAL`], only while
@@ -96,9 +97,10 @@ pub(crate) static LIVE_SCAN: [std::sync::atomic::AtomicU64; 2] = [
 pub(crate) fn record_live_scan(rows: u64, bytes: u64) {
     #[cfg(feature = "test-support")]
     {
-        let [counted_rows, counted_bytes] = &LIVE_SCAN;
-        counted_rows.fetch_add(rows, std::sync::atomic::Ordering::AcqRel);
-        counted_bytes.fetch_add(bytes, std::sync::atomic::Ordering::AcqRel);
+        LIVE_SCAN.with(|counted| {
+            let (counted_rows, counted_bytes) = counted.get();
+            counted.set((counted_rows + rows, counted_bytes + bytes));
+        });
     }
     if wyrd_benchmark::enabled() {
         metrics::counter!(LIVE_ROWS_EXAMINED_TOTAL).increment(rows);

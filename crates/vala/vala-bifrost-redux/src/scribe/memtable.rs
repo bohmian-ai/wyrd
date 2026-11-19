@@ -2530,17 +2530,13 @@ pub fn variant_reconstructions_for_test() -> usize {
     VARIANT_RECONSTRUCTIONS.load(std::sync::atomic::Ordering::Acquire)
 }
 
-/// Returns the rows and decoded bytes of the captured batches live reads in
-/// this process examined, as [`crate::scribe::profile::record_live_scan`]
+/// Returns the rows and decoded bytes of the captured batches live reads on
+/// this thread examined, as [`crate::scribe::profile::record_live_scan`]
 /// counts them.
 #[cfg(feature = "test-support")]
 #[must_use]
 pub fn live_scan_for_test() -> (u64, u64) {
-    let [rows, bytes] = &crate::scribe::profile::LIVE_SCAN;
-    (
-        rows.load(std::sync::atomic::Ordering::Acquire),
-        bytes.load(std::sync::atomic::Ordering::Acquire),
-    )
+    crate::scribe::profile::LIVE_SCAN.with(std::cell::Cell::get)
 }
 
 /// The ordered outputs and exact filter one live read evaluates in place of

@@ -13,9 +13,9 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use arrow::array::RecordBatch;
-use arrow::datatypes::{FieldRef, Schema, SchemaRef};
+use arrow::datatypes::{DataType, FieldRef, Schema, SchemaRef};
 use datafusion::common::stats::Precision;
-use datafusion::common::{ColumnStatistics, Statistics};
+use datafusion::common::{ColumnStatistics, ScalarValue, Statistics};
 use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
 use datafusion::logical_expr::Accumulator as _;
 use wyrd_spec::DataTenantId;
@@ -3038,7 +3038,7 @@ fn physical_projection(
 }
 
 /// Computes one append batch's exact row count, every column's byte size,
-/// and primitive-column bounds.
+/// and primitive and identity-column bounds.
 ///
 /// This is the one producer of memtable batch statistics, at append and at
 /// replay; projection and the follower carry them unchanged.
@@ -3051,11 +3051,14 @@ fn physical_projection(
 /// numbers. A size Arrow cannot compute stays unknown, which sizing counts
 /// as a fallback.
 ///
-/// Only primitive columns (integers, floats, decimals, dates, times,
-/// timestamps) get a minimum and maximum: they cost one vectorized pass at
-/// insert, which a live read then saves on every query that can rule the
-/// batch out. Other columns, and a primitive column whose bound cannot be
-/// computed, stay unknown, which never prunes.
+/// Primitive columns (integers, floats, decimals, dates, times, timestamps)
+/// and identity columns (UTF8 strings and fixed-width binary) get a minimum
+/// and maximum: they cost one vectorized pass at insert, which a live read
+/// then saves on every query that can rule the batch out. An identity bound
+/// longer than [`IDENTITY_BOUND_BYTES`] is not retained, so a batch keeps at
+/// most two short values per column. Other columns, and a column whose bound
+/// cannot be computed or is too long to retain, stay unknown, which never
+/// prunes.
 pub(crate) fn batch_statistics(batch: &RecordBatch) -> Arc<Statistics> {
     let mut statistics = Statistics::new_unknown(batch.schema_ref());
     statistics.num_rows = Precision::Exact(batch.num_rows());
@@ -3068,7 +3071,14 @@ pub(crate) fn batch_statistics(batch: &RecordBatch) -> Arc<Statistics> {
         if let Ok(bytes) = column.to_data().get_slice_memory_size() {
             bounds.byte_size = Precision::Exact(bytes);
         }
-        if !column.data_type().is_primitive() {
+        let identity = matches!(
+            column.data_type(),
+            DataType::Utf8
+                | DataType::LargeUtf8
+                | DataType::Utf8View
+                | DataType::FixedSizeBinary(_)
+        );
+        if !column.data_type().is_primitive() && !identity {
             continue;
         }
         let values = std::slice::from_ref(column);
@@ -3076,12 +3086,33 @@ pub(crate) fn batch_statistics(batch: &RecordBatch) -> Arc<Statistics> {
             .and_then(|mut min| min.update_batch(values).and_then(|()| min.evaluate()));
         let max = MaxAccumulator::try_new(column.data_type())
             .and_then(|mut max| max.update_batch(values).and_then(|()| max.evaluate()));
-        if let (Ok(min), Ok(max)) = (min, max) {
+        if let (Ok(min), Ok(max)) = (min, max)
+            && retained_bound(&min)
+            && retained_bound(&max)
+        {
             bounds.min_value = Precision::Exact(min);
             bounds.max_value = Precision::Exact(max);
         }
     }
     Arc::new(statistics)
+}
+
+/// Longest UTF8 or fixed-width binary bound, in bytes, an append batch's
+/// statistics retain: every catalog identity (UUIDs, trace and span ids) fits,
+/// while a long free-text value is left unknown instead of being copied into
+/// the statistics of every batch it bounds.
+const IDENTITY_BOUND_BYTES: usize = 64;
+
+/// Reports whether `bound` is short enough to retain: any non-identity value,
+/// or an identity value of at most [`IDENTITY_BOUND_BYTES`].
+fn retained_bound(bound: &ScalarValue) -> bool {
+    match bound {
+        ScalarValue::Utf8(Some(value))
+        | ScalarValue::LargeUtf8(Some(value))
+        | ScalarValue::Utf8View(Some(value)) => value.len() <= IDENTITY_BOUND_BYTES,
+        ScalarValue::FixedSizeBinary(_, Some(value)) => value.len() <= IDENTITY_BOUND_BYTES,
+        _ => true,
+    }
 }
 
 /// Resolves each required field to its column in one captured schema.
@@ -3792,42 +3823,64 @@ pub(crate) mod tests {
         assert_eq!(narrow.column_statistics.len(), 1);
     }
 
-    /// An append batch's bounds are exact for a primitive column and unknown
-    /// for any other, so a string predicate never prunes on a guess.
+    /// An append batch's bounds are exact for primitive and identity (UTF8,
+    /// fixed-width binary) columns, unknown for an identity value too long to
+    /// retain, and unknown for any other column, so no predicate prunes on a
+    /// guess.
     ///
     /// # Panics
     ///
     /// Panics when a bound or the row count differs from the batch.
     #[test]
-    fn batch_statistics_bound_primitive_columns_only() {
+    fn batch_statistics_bound_primitive_and_identity_columns() {
+        use datafusion::common::ScalarValue;
+
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
-            Field::new("payload", DataType::Utf8, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("body", DataType::Utf8, false),
+            Field::new("tags", DataType::Binary, false),
         ]));
+        let long = "x".repeat(IDENTITY_BOUND_BYTES + 1);
         let batch = RecordBatch::try_new(
             schema,
             vec![
                 Arc::new(Int64Array::from(vec![7, 3, 9])),
-                Arc::new(arrow::array::StringArray::from(vec!["a", "b", "c"])),
+                Arc::new(arrow::array::StringArray::from(vec!["b", "a", "c"])),
+                Arc::new(arrow::array::StringArray::from(vec![
+                    "a",
+                    long.as_str(),
+                    "b",
+                ])),
+                Arc::new(arrow::array::BinaryArray::from(vec![&b"a"[..], b"b", b"c"])),
             ],
         )
         .expect("bounds fixture batch");
 
         let statistics = batch_statistics(&batch);
 
-        let id = &statistics.column_statistics[0];
-        let payload = &statistics.column_statistics[1];
+        let [id, name, body, tags] = statistics.column_statistics.as_slice() else {
+            panic!("four columns");
+        };
         assert_eq!(statistics.num_rows, Precision::Exact(3));
+        assert_eq!(id.min_value, Precision::Exact(ScalarValue::Int64(Some(3))));
+        assert_eq!(id.max_value, Precision::Exact(ScalarValue::Int64(Some(9))));
         assert_eq!(
-            id.min_value,
-            Precision::Exact(datafusion::common::ScalarValue::Int64(Some(3)))
+            name.min_value,
+            Precision::Exact(ScalarValue::Utf8(Some("a".to_owned())))
         );
         assert_eq!(
-            id.max_value,
-            Precision::Exact(datafusion::common::ScalarValue::Int64(Some(9)))
+            name.max_value,
+            Precision::Exact(ScalarValue::Utf8(Some("c".to_owned())))
         );
-        assert_eq!(payload.min_value, Precision::Absent);
-        assert_eq!(payload.null_count, Precision::Exact(0));
+        assert_eq!(body.max_value, Precision::Absent, "too long to retain");
+        assert_eq!(body.min_value, Precision::Absent);
+        assert_eq!(
+            tags.min_value,
+            Precision::Absent,
+            "variable binary is not bounded"
+        );
+        assert_eq!(name.null_count, Precision::Exact(0));
     }
 
     /// Buffers a live read computes for its query are reserved from the

@@ -57,3 +57,31 @@ test('a read whose successful answer is not JSON fails the section instead of cl
   expect(section.value).toBeUndefined();
   expect(section.problem).toMatchObject({ code: 'WYRD_SPEC_502_UPSTREAM_FAILURE' });
 });
+
+test('a section is pending from a newer load until that load settles, whatever it still shows', async () => {
+  const section = new Streamed<string>();
+  section.follow('first', '/t/acme/verify');
+  expect(section.pending).toBe(false);
+  let settle = (_: string) => {};
+  const newer = new Promise<string>((resolve) => (settle = resolve));
+  section.follow(newer, '/t/acme/verify');
+  // The old value is still shown, and marked as waiting for its successor.
+  expect([section.value, section.pending]).toEqual(['first', true]);
+  settle('second');
+  await newer;
+  await Promise.resolve();
+  expect([section.value, section.pending]).toEqual(['second', false]);
+  // A failure settles it too.
+  let fail = (_: Error) => {};
+  const failing = new Promise<string>((_, reject) => (fail = reject));
+  section.follow(failing, '/t/acme/verify');
+  expect(section.pending).toBe(true);
+  fail(new Error('reset'));
+  await failing.catch(() => {});
+  await Promise.resolve();
+  expect([section.pending, section.problem?.detail]).toEqual([false, 'reset']);
+  // A value given as it is never waits.
+  section.follow(newer, '/t/acme/verify');
+  section.follow('third', '/t/acme/verify');
+  expect(section.pending).toBe(false);
+});

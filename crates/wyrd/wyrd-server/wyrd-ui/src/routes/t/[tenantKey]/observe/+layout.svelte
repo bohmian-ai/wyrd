@@ -19,6 +19,7 @@
   import TimePicker, { type PickedRange, type Zone } from '$lib/TimePicker.svelte';
   import { PRESETS, appliedRange, closed, groupColumns, moved, population, readState, selectedMetric, step, writeState, zoomed, type HostFilter, type ObserveState } from '$lib/observe-host';
   import { Streamed } from '$lib/streamed.svelte';
+  import Updating from '$lib/Updating.svelte';
   import type { LayoutProps } from './$types';
 
   let { data, children }: LayoutProps = $props();
@@ -301,6 +302,7 @@
             <button type="button" class="badge" onclick={reset} aria-label="Reset zoom">Zoomed {data.range.from.slice(11, 19)} – {data.range.to.slice(11, 19)} ✕</button>
           {/if}
         </header>
+        <Updating pending={streamed.pending}>
         <div class="trio">
           <Chart
             {...overview.spans}
@@ -323,6 +325,11 @@
           />
           <Chart {...overview.duration} compact colors={DURATIONS} headline={totals ? { value: `p95 ${fmtDuration(totals.p95)}` } : undefined} {actions} onaction={onaction('Chart')} />
         </div>
+        </Updating>
+      </section>
+    {:else if !support}
+      <section class="panel overview" aria-label="Overview" data-panel="overview">
+        <EmptyState state={streamed.problem ? 'error' : 'loading'} problem={streamed.problem} title={streamed.problem ? undefined : 'Reading the overview'} />
       </section>
     {/if}
     <div class="listbar">
@@ -343,7 +350,7 @@
       <span class="listtools" bind:this={listTools}></span>
     </div>
     <div class="split" class:folded={!filtersOpen}>
-      {#if filtersOpen}<div id="facets" data-panel="facets">{#if support}<FacetRail {...support.facets} {actions} onaction={onaction('FacetRail')} />{:else}<EmptyState state={streamed.problem ? 'error' : 'loading'} problem={streamed.problem} title={streamed.problem ? undefined : 'Counting the facets'} />{/if}</div>{/if}
+      {#if filtersOpen}<div id="facets" data-panel="facets">{#if support}<Updating pending={streamed.pending}><FacetRail {...support.facets} {actions} onaction={onaction('FacetRail')} /></Updating>{:else}<EmptyState state={streamed.problem ? 'error' : 'loading'} problem={streamed.problem} title={streamed.problem ? undefined : 'Counting the facets'} />{/if}</div>{/if}
       <div data-panel="list">
         {#if observe.list}<RecordTable {...observe.list} {actions} onaction={onaction('RecordTable')} oncolumns={(columns) => go({ ...closed(current), columns })} controls={listTools} />{/if}
       </div>
@@ -353,12 +360,18 @@
     {#if support?.timeline}
       {@const timeline = support.timeline}
       <section class="panel overview" aria-label="Timeline" data-panel="timeline">
-        <Chart {...timeline} input={{ ...timeline.input, title: `${timeline.input.title} · drag to zoom` }} compact bars colors={LEVELS} {actions} onaction={onaction('Chart')} />
+        <Updating pending={streamed.pending}>
+          <Chart {...timeline} input={{ ...timeline.input, title: `${timeline.input.title} · drag to zoom` }} compact bars colors={LEVELS} {actions} onaction={onaction('Chart')} />
+        </Updating>
+      </section>
+    {:else if !support}
+      <section class="panel overview" aria-label="Timeline" data-panel="timeline">
+        <EmptyState state={streamed.problem ? 'error' : 'loading'} problem={streamed.problem} title={streamed.problem ? undefined : 'Reading the timeline'} />
       </section>
     {/if}
     <!-- The records work region: fields, records and the selected record side by side, wrapping on a narrow screen. -->
     <div class="work">
-      <div data-panel="facets">{#if support}<FacetRail {...support.facets} {actions} onaction={onaction('FacetRail')} />{:else}<EmptyState state={streamed.problem ? 'error' : 'loading'} problem={streamed.problem} title={streamed.problem ? undefined : 'Counting the facets'} />{/if}</div>
+      <div data-panel="facets">{#if support}<Updating pending={streamed.pending}><FacetRail {...support.facets} {actions} onaction={onaction('FacetRail')} /></Updating>{:else}<EmptyState state={streamed.problem ? 'error' : 'loading'} problem={streamed.problem} title={streamed.problem ? undefined : 'Counting the facets'} />{/if}</div>
       <div data-panel="list">
         {#if observe.list}<RecordTable {...observe.list} {actions} onaction={onaction('RecordTable')} oncolumns={(columns) => go({ ...closed(current), columns })} tools={grouping} />{/if}
       </div>

@@ -20,6 +20,7 @@
   import { NO_VERDICT, validateIntent, type ChartProps, type ComponentName } from 'wyrd-ai-ui/loaders';
   import TimePicker, { type PickedRange, type Zone } from '$lib/TimePicker.svelte';
   import { Streamed } from '$lib/streamed.svelte';
+  import Updating from '$lib/Updating.svelte';
   import { PRESETS, appliedRange, moved, population, writeState, zoomed, type ObserveState } from '$lib/observe-host';
   import { VERIFY_GROUPS, VERIFY_MOST, VERIFY_PAGE, verifyStep, whereText } from '$lib/verify-host';
   import type { PageProps } from './$types';
@@ -178,14 +179,18 @@
           <button type="button" class="reset" onclick={() => go({ ...current, from: undefined, to: undefined })}>Reset zoom</button>
         {/if}
       </header>
-      <div class="pair">
-        {#if support}
-          <Chart {...support.charts.verdicts} compact bars colors={VERDICTS} headline={counted(support.charts.verdicts)} {actions} onaction={onaction('Chart')} />
-          <Chart {...support.charts.verifiers} compact bars colors={key(support.charts.verifierSeries)} headline={counted(support.charts.verifiers)} {actions} onaction={onaction('Chart')} />
-        {:else}
+      {#if support}
+        <Updating pending={streamed.pending}>
+          <div class="pair">
+            <Chart {...support.charts.verdicts} compact bars colors={VERDICTS} headline={counted(support.charts.verdicts)} {actions} onaction={onaction('Chart')} />
+            <Chart {...support.charts.verifiers} compact bars colors={key(support.charts.verifierSeries)} headline={counted(support.charts.verifiers)} {actions} onaction={onaction('Chart')} />
+          </div>
+        </Updating>
+      {:else}
+        <div class="pair">
           <EmptyState state={streamed.problem ? 'error' : 'loading'} problem={streamed.problem} title={streamed.problem ? undefined : 'Reading the timelines'} />
-        {/if}
-      </div>
+        </div>
+      {/if}
     </section>
     <div class="listbar">
       <span class="by" role="group" aria-label="Group by">
@@ -198,7 +203,7 @@
     </div>
     <div class="split">
       <div data-panel="facets">
-        {#if support}<FacetRail {...support.facets} {labels} link={definition} {actions} onaction={onaction('FacetRail')} />{:else}<EmptyState state={streamed.problem ? 'error' : 'loading'} problem={streamed.problem} title={streamed.problem ? undefined : 'Counting the facets'} />{/if}
+        {#if support}<Updating pending={streamed.pending}><FacetRail {...support.facets} {labels} link={definition} {actions} onaction={onaction('FacetRail')} /></Updating>{:else}<EmptyState state={streamed.problem ? 'error' : 'loading'} problem={streamed.problem} title={streamed.problem ? undefined : 'Counting the facets'} />{/if}
       </div>
       <div data-panel="list"><RecordTable {...verify.list} {labels} {more} {actions} onaction={onaction('RecordTable')} /></div>
     </div>

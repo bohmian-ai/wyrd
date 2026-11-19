@@ -1044,6 +1044,11 @@ test('Observe reads support once per population, stops it when superseded or lef
     await expect.poll(() => gate.held.length).toBe(population);
     await expect.poll(() => rows.count()).toBeGreaterThan(0);
     expect(reads).toHaveLength(1);
+    // Meanwhile the old facets and overview stay, each marked as updating, and the list stays usable.
+    const pending = (section: typeof facets) => section.locator('[aria-busy="true"]', { has: page.getByRole('status', { name: 'Updating' }) });
+    await expect.poll(() => Promise.all([pending(facets).count(), pending(overview).count()])).toEqual([1, 1]);
+    await expect.poll(() => list.locator('th button.sort').first().isEnabled()).toBe(true);
+    await captureLifecycle(page, 'observe-updating');
     // A newer range supersedes it: its upstream queries are closed unread, and the newer ones are read.
     await page.getByRole('button', { name: 'Zoom in' }).click();
     await expect.poll(() => gate.held.length).toBe(2 * population);
@@ -1061,10 +1066,12 @@ test('Observe reads support once per population, stops it when superseded or lef
     await expect.poll(() => gate.held.length).toBeGreaterThanOrEqual(3 * population);
     await expect.poll(() => rows.count()).toBeGreaterThan(0);
     await expect.poll(() => facets.locator('[data-state="loading"]', { hasText: 'Counting the facets' }).count()).toBe(1);
+    await expect.poll(() => overview.locator('[data-state="loading"]', { hasText: 'Reading the overview' }).count()).toBe(1);
     await captureLifecycle(page, 'observe-loading');
     gate.hold(false);
     for (const answer of gate.held) answer.release();
     await expect.poll(() => facets.getByRole('button').count()).toBeGreaterThan(0);
+    await expect.poll(() => page.locator('[aria-busy="true"]').count()).toBe(0);
     expect([await facets.textContent(), await overview.getByRole('region').count()]).not.toEqual([counts, 0]);
     await captureLifecycle(page, 'observe-settled');
 
@@ -1076,7 +1083,9 @@ test('Observe reads support once per population, stops it when superseded or lef
     for (const answer of gate.held) answer.fail();
     gate.hold(false);
     await expect.poll(() => facets.locator('[data-state="error"]').count()).toBe(1);
-    expect([await rows.count() > 0, await facets.getByRole('button').count()]).toEqual([true, 0]);
+    // Each overview chart says its read failed, with no count in its place.
+    expect([await rows.count() > 0, await facets.getByRole('button').count(), await overview.locator('[data-state="error"]').count()]).toEqual([true, 0, 3]);
+    expect(await overview.textContent()).not.toMatch(/\d+ traces?|% of traces|p95 \d/);
     await captureLifecycle(page, 'observe-support-error');
 
     // Support still waiting for the server's answer is stopped too: superseded, then left, each request is closed before any head.
@@ -2075,6 +2084,11 @@ judged('the Verify dashboard filters, groups, brushes, pages, opens an execution
     // Verify support is one discovery query per population.
     const population = gate.held.length;
     expect([population, reads.length]).toEqual([1, 1]);
+    // Meanwhile the old facets and charts stay, each marked as updating, and the list stays usable.
+    const updating = (panel: string) => page.locator(`[data-panel="${panel}"] [aria-busy="true"]`, { has: page.getByRole('status', { name: 'Updating' }) });
+    await expect.poll(() => Promise.all([updating('facets').count(), updating('charts').count()])).toEqual([1, 1]);
+    await expect.poll(() => rows.first().isVisible()).toBe(true);
+    await captureLifecycle(page, 'verify-updating');
     // A newer filter supersedes it: its upstream queries are closed unread.
     await rail.getByRole('button', { name: /completed/ }).click();
     await expect.poll(() => gate.held.length).toBe(2 * population);
@@ -2094,6 +2108,7 @@ judged('the Verify dashboard filters, groups, brushes, pages, opens an execution
     for (const answer of gate.held) answer.release();
     await expect.poll(async () => (await where.textContent())?.trim()).toBe("verdict = 'failed' AND status = 'completed'");
     await expect.poll(() => rail.getByRole('button', { name: /failed/ }).count()).toBe(1);
+    await expect.poll(() => page.locator('[aria-busy="true"]').count()).toBe(0);
     await captureLifecycle(page, 'verify-settled');
 
     // A failed support read says so beside the list it did not remove, and shows no counts at all rather than zeros.

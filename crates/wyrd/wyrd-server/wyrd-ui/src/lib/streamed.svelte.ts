@@ -23,6 +23,7 @@ const REMEMBERED = 10;
  */
 export class Streamed<T> {
   #settled = $state<{ value: T } | { problem: Problem }>();
+  #pending = $state(false);
   #latest = 0;
   #reading?: AbortController;
   readonly #remembered: Map<string, T>;
@@ -37,6 +38,11 @@ export class Streamed<T> {
     return this.#settled && 'value' in this.#settled ? this.#settled.value : undefined;
   }
 
+  /** Whether the newest load is still reading; what the section shows meanwhile belongs to an older one. */
+  get pending(): boolean {
+    return this.#pending;
+  }
+
   /** Why the newest load failed, or `undefined`. */
   get problem(): Problem | undefined {
     return this.#settled && 'problem' in this.#settled ? this.#settled.problem : undefined;
@@ -45,6 +51,7 @@ export class Streamed<T> {
   /** Follow the section of the newest load at `address`; call it whenever the load's data changes. */
   follow(next: T | Promise<T> | undefined, address: string): void {
     const at = ++this.#latest;
+    this.#pending = next instanceof Promise;
     if (!(next instanceof Promise)) {
       this.#settled = next === undefined ? undefined : { value: next };
       if (next !== undefined) this.#remember(address, next);
@@ -56,12 +63,14 @@ export class Streamed<T> {
     next.then(
       (value) => {
         if (at !== this.#latest) return;
+        this.#pending = false;
         this.#settled = { value };
         this.#remember(address, value);
       },
       // A superseded load's failure is not this page's; the newest one's is shown.
       (error: unknown) => {
         if (at !== this.#latest) return;
+        this.#pending = false;
         const refused = typeof error === 'object' && error !== null && 'code' in error && 'title' in error;
         this.#settled = { problem: refused ? (error as Problem) : wyrdProblem('upstream', error instanceof Error ? error.message : 'The section could not be read.') };
       }

@@ -14,7 +14,7 @@ import { render } from '@testing-library/svelte';
 import { expect, vi } from 'vitest';
 import { StatStrip, TraceWaterfall, type RepositoryRow } from 'wyrd-ai-ui';
 import { z } from 'zod';
-import { Bifrost, Cards, GithubConnection, Principals, TableConfig, WyrdClient, WyrdState } from 'wyrd-ai';
+import { Bifrost, Cards, Gateway, GithubConnection, Principals, TableConfig, WyrdClient, WyrdState } from 'wyrd-ai';
 import { type NativeWyrdTestServer, signInGithubBrowser } from '@wyrd/testing';
 import {
   CardRefSchema,
@@ -63,6 +63,7 @@ import { POST as loadPanel } from '../routes/t/[tenantKey]/ui/load/+server';
 import { POST as cancelExecution } from '../routes/t/[tenantKey]/verify/executions/[executionId]/cancel/+server';
 import { GET as downloadPublication } from '../routes/t/[tenantKey]/verify/executions/[executionId]/download/+server';
 import { AGREES, assistantTest, judgeReply, toolCall, toolTurn } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/assistant';
+import { configureGateway } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/local-development';
 import { declared, fixture, groupExecution, runtimeAccount, scheduledResult, serverTest, type DeclaredRef } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/server';
 import { load as loadExamplePage } from '../../../../../../examples/ui-app/src/routes/+page.server';
 import { POST as loadExamplePanel } from '../../../../../../examples/ui-app/src/routes/view/load/+server';
@@ -603,6 +604,71 @@ test('consolidated Observe bundles return the original results; EXPLAIN ANALYZE 
   report.statstrip = { original: { ...(await executedWork(run, statOriginal)), elapsed_ms: Math.round(statBefore.elapsed) }, consolidated: { ...(await executedWork(run, statNew)), elapsed_ms: Math.round(statAfter.elapsed) } };
   // The plan comparison is diagnostic evidence, kept only where the run names a file.
   recordDiagnostics(report);
+});
+
+/** A gateway whose upstream reports five input and three output tokens, except for `gpt-4o-nano`, which reports no usage. */
+const metered = serverTest({
+  perTest: true,
+  provider: ({ body }) => {
+    const reply = judgeReply('ok');
+    if (!body.includes('gpt-4o-nano')) return reply;
+    const { usage: _, ...unmetered } = reply.body as Record<string, unknown>;
+    return { ...reply, body: unmetered };
+  }
+});
+
+metered('gateway usage stats count tokens apart from calls and never add currencies', async ({ server }) => {
+  const client = WyrdClient.connect();
+  await configureGateway(client);
+  const gateway = await Gateway.connect({ client });
+  await gateway.putCapturePolicy({ mode: 'metadata', payload_fields: [] });
+  const priced = (model: string, currency: string, input: string, output: string) => ({
+    model: { deployment: 'openai', model },
+    version: `${model}-v1`,
+    currency,
+    effective_at: '2020-01-01T00:00:00Z',
+    active: true,
+    rates: [
+      { dimension: 'input_tokens', unit: '1m_tokens', price: input },
+      { dimension: 'output_tokens', unit: '1m_tokens', price: output }
+    ]
+  });
+  const call = async (model: string) => {
+    const answered = await client.httpAuth(`${server.baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: `openai/${model}`, messages: [{ role: 'user', content: 'hi' }] })
+    });
+    expect(answered.status, await answered.clone().text()).toBe(200);
+  };
+  // Active pricing has one currency at a time: one EUR call, then, repriced in USD, two USD calls and one unpriced call reporting no tokens.
+  const govern = (pricing: ReturnType<typeof priced>[]) => gateway.putGovernancePolicy({ limits: [], budgets: [], unknown_cost: 'allow_unpriced', pricing });
+  await govern([priced('gpt-4o-mini', 'EUR', '1', '4')]);
+  await call('gpt-4o-mini');
+  await govern([priced('gpt-4o', 'USD', '2', '8')]);
+  for (const model of ['gpt-4o', 'gpt-4o', 'gpt-4o-nano']) await call(model);
+  server.flushBifrost();
+  const hour = 3_600_000;
+  const now = Math.floor(Date.now() / hour) * hour;
+  const range = { from: new Date(now - hour).toISOString(), to: new Date(now + 2 * hour).toISOString() };
+  const run = nodeExecutor(client);
+  const stats = ['tokens', 'calls', 'cost'] as const;
+  const loaded = await loadStatStrip({ stats: [...stats] }, { executor: run, range });
+  expect(loaded.result.state, JSON.stringify(loaded.result)).toBe('populated');
+  const strip = loaded.result.state === 'populated' ? loaded.result.data.stats : [];
+  // Independent facts: eight tokens for each of three metered calls; four calls; 2·5 + 8·3 per million USD twice, 1·5 + 4·3 per million EUR once.
+  expect(strip.map(({ total }) => total.rows.map((row) => row.map(String)))).toEqual([[['24']], [['4']], [['0.000017', 'EUR'], ['0.000068', 'USD']]]);
+  // Totals and buckets equal the original per-stat reads.
+  const original = await readAll(run, stats.flatMap((stat) => [originalRead(`stat-${stat}-total`, bucketFor(range), range), originalRead(`stat-${stat}-buckets`, bucketFor(range), range)]));
+  stats.forEach((stat, index) => {
+    expect(multiset(strip[index].total.rows), `${stat} total`).toEqual(multiset(original.values[index * 2].rows));
+    // The original orders buckets by time alone, so currencies within one bucket compare as a multiset.
+    expect(multiset(strip[index].series.rows), `${stat} buckets`).toEqual(multiset(original.values[index * 2 + 1].rows));
+  });
+  // The strip shows each currency's own amount, never their sum.
+  const view = render(StatStrip, loaded);
+  expect([...view.container.querySelectorAll('.value')].map((each) => each.textContent)).toEqual(['24', '4', '0.000017 EUR', '0.000068 USD']);
+  view.unmount();
 });
 
 test('TASK-004: Metric windows count every recorded value', async ({ server }) => {

@@ -47,7 +47,7 @@ use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use std::sync::Arc;
 use vala_bifrost_redux::contracts::DecodedOtlp;
-use vala_bifrost_redux::gate::{AuthContext, IngestError};
+use vala_bifrost_redux::gate::{AuthContext, IngestError, IngestOutcome};
 use wyrd_tonic::otlp::logs_service::{ExportLogsServiceRequest, ExportLogsServiceResponse};
 use wyrd_tonic::otlp::metrics_service::{
     ExportMetricsServiceRequest, ExportMetricsServiceResponse,
@@ -57,7 +57,7 @@ use wyrd_tonic::prost::Message;
 
 use crate::components::auth::Caller;
 use crate::http::error::WyrdErrorResponse;
-use crate::otlp_decode::{decode_trace_protobuf, preflight_trace_protobuf};
+use crate::otlp_decode::{decode_trace, preflight_trace_protobuf};
 use crate::otlp_json::{preflight_logs_json, preflight_metrics_json, preflight_trace_json};
 use crate::otlp_logs_decode::{decode_logs_protobuf, preflight_logs_protobuf};
 use crate::otlp_logs_json::decode_logs_json;
@@ -250,17 +250,28 @@ async fn export_traces(
     let auth = caller_auth_context(&caller);
 
     let bifrost = Arc::clone(&state.bifrost);
+    let gate = bifrost.gate();
     let (owner, request) = match encoding {
         OtlpEncoding::Protobuf => {
-            let plan = preflight_trace_protobuf(&body, bifrost.gate().otlp_wire_limits())
+            let (plan, counts) = preflight_trace_protobuf(&body, gate.otlp_wire_limits())
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
-            let owner = bifrost
-                .gate()
+            let owner = gate
                 .reserve_otlp_decode(plan.reservation_bytes())
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
-            let request = decode_trace_protobuf(&body)
+            let prepared = decode_trace(&body, counts)
+                .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?
+                .prepare(gate, &auth)
+                .await
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
-            (owner, request)
+            let wire_bytes = body.len();
+            // The batch owns its data; release the wire before Scribe adopts
+            // the decode owner.
+            drop(body);
+            let outcome = gate
+                .dispatch_traces(&auth, prepared, wire_bytes, owner)
+                .await
+                .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
+            return Ok(trace_response(encoding, &outcome));
         }
         OtlpEncoding::Json => {
             let plan = preflight_trace_json(&body, bifrost.gate().otlp_wire_limits())
@@ -279,19 +290,22 @@ async fn export_traces(
             (owner, request)
         }
     };
-    let outcome = bifrost
-        .gate()
+    let outcome = gate
         .ingest_decoded_resource_spans(&auth, DecodedOtlp::new(request, body.len(), owner))
         .await
         .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
+    Ok(trace_response(encoding, &outcome))
+}
 
+/// Records one trace export's counts on the request span and encodes its
+/// partial-success response.
+fn trace_response(encoding: OtlpEncoding, outcome: &IngestOutcome) -> Response {
     tracing::Span::current().record("accepted_spans", outcome.accepted_spans);
     tracing::Span::current().record("rejected_spans", outcome.rejected_spans);
-
     let response = ExportTraceServiceResponse {
         partial_success: outcome.partial_success(),
     };
-    Ok(encode_response(encoding, &response))
+    encode_response(encoding, &response)
 }
 
 /// `POST /v1/metrics` — decode an OTLP metrics export and write it through the

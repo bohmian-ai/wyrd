@@ -17,24 +17,25 @@ use std::borrow::Cow;
 use std::sync::{Arc, LazyLock};
 use wyrd_queue::variant::VariantColumnEncoder;
 use wyrd_spec::vala::BifrostError;
-use wyrd_tonic::otlp::common::v1::KeyValue;
-use wyrd_tonic::otlp::common::v1::any_value::Value;
+use wyrd_tonic::otlp::common::v1::InstrumentationScope;
+use wyrd_tonic::otlp::resource::v1::Resource;
 use wyrd_tonic::otlp::trace::v1::span::Event;
-use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span};
+use wyrd_tonic::otlp::trace::v1::{ResourceSpans, Span};
 
+use super::input::{EventInput, LinkInput, SpanInput, TraceInput};
 use super::spans::{SPAN_EVENT_ELEMENT, SPAN_FIELDS, SPAN_LINK_ELEMENT};
 use crate::otlp_contract::IngestOutcome;
 use crate::tables::TableError;
 use crate::tables::fields::canonical_arrow_fields;
 use crate::tables::signal::{
-    ExceptionPromotions, OutputBudget, RecordCorrelation, ResourceEnvelope,
-    ResourcePromotionColumns, ScopeEnvelope, VariantFailure, append_attributes, bool_column,
-    checked_i64, distinct_keys, entity_refs_column, fixed_binary_column, fixed_binary_opt_column,
-    fixed_row_bytes, i32_column, i32_opt_column, i64_column, i64_opt_column, internal,
-    last_attribute, last_string_attribute, list_column, nested_fields, otlp_instant_column,
-    projected_signal_schema, promoted_int, refuse_forged, span_id_bytes, stored_attributes,
-    struct_column, trace_id_bytes, u32_as_i64_column, utf8_column, utf8_opt_column,
-    utf8_opt_column_from, variant_column,
+    Attributes, ExceptionPromotions, OutputBudget, RecordCorrelation, ResourceEnvelope,
+    ResourcePromotionColumns, ScopeEnvelope, ValueRef, VariantFailure, append_attributes,
+    bool_column, checked_i64, distinct_keys, entity_refs_column, fixed_binary_column,
+    fixed_binary_opt_column, fixed_row_bytes, i32_column, i32_opt_column, i64_column,
+    i64_opt_column, internal, last_attribute, last_string_attribute, list_column, nested_fields,
+    otlp_instant_column, projected_signal_schema, promoted_int, refuse_forged, span_id_bytes,
+    stored_attributes, struct_column, trace_id_bytes, u32_as_i64_column, utf8_column,
+    utf8_opt_column, utf8_opt_column_from, variant_column,
 };
 use wyrd_spec::ids::CardUid;
 
@@ -98,6 +99,27 @@ pub fn project_resource_spans(
     card_scope: Option<&[CardUid]>,
     output_limit_bytes: usize,
 ) -> Result<(RecordBatch, IngestOutcome), TableError> {
+    project_trace_input(
+        &TraceInput::from_generated(resource_spans),
+        card_scope,
+        output_limit_bytes,
+    )
+}
+
+/// Project one flattened trace export into one canonical span batch.
+///
+/// This is the projection [`project_resource_spans`] describes, read from a
+/// [`TraceInput`]; both entry points produce identical batches and outcomes
+/// for the same export.
+///
+/// # Errors
+///
+/// Returns the errors [`project_resource_spans`] returns.
+pub fn project_trace_input(
+    input: &TraceInput<'_>,
+    card_scope: Option<&[CardUid]>,
+    output_limit_bytes: usize,
+) -> Result<(RecordBatch, IngestOutcome), TableError> {
     let mut columns = SpanColumns::default();
     // Envelopes are retained once per group and referenced by each accepted
     // row, so `(index, repeated bytes)` is all a span needs to carry.
@@ -108,15 +130,15 @@ pub fn project_resource_spans(
 
     let mut ordinal: u64 = 0;
 
-    for resource in resource_spans {
-        let envelope = ResourceEnvelope::project(resource.resource.as_ref(), &resource.schema_url)
+    for resource in &input.resources {
+        let envelope = ResourceEnvelope::project(resource.resource.as_deref(), resource.schema_url)
             .map(|envelope| columns.retain_resource(envelope));
-        let resource_defect = validate_resource(resource);
-        for scope in &resource.scope_spans {
-            let scope_envelope = ScopeEnvelope::project(scope.scope.as_ref(), &scope.schema_url)
+        let resource_defect = validate_resource(resource.resource.as_deref());
+        for scope in &input.scopes[resource.scopes.clone()] {
+            let scope_envelope = ScopeEnvelope::project(scope.scope.as_deref(), scope.schema_url)
                 .map(|envelope| columns.retain_scope(envelope));
-            let scope_defect = resource_defect.or_else(|| validate_scope(scope));
-            for span in &scope.spans {
+            let scope_defect = resource_defect.or_else(|| validate_scope(scope.scope.as_deref()));
+            for span in &input.spans[scope.spans.clone()] {
                 let row = ordinal;
                 ordinal = ordinal.saturating_add(1);
                 let outcome = match (scope_defect, &envelope, &scope_envelope) {
@@ -126,6 +148,7 @@ pub fn project_resource_spans(
                     }
                     (None, Ok(resource), Ok(scope)) => columns
                         .push(
+                            input,
                             span,
                             Context {
                                 resource: resource.0,
@@ -212,18 +235,15 @@ impl Default for SpanOutputWidths {
 /// Returns the stable rejection reason, or `None` when the resource is
 /// acceptable. A defect here rejects every span beneath it rather than being
 /// silently repaired.
-fn validate_resource(resource: &ResourceSpans) -> Option<&'static str> {
-    let attributes = resource
-        .resource
-        .as_ref()
-        .map_or(&[][..], |value| value.attributes.as_slice());
+fn validate_resource(resource: Option<&Resource>) -> Option<&'static str> {
+    let attributes = resource.map_or(&[][..], |value| value.attributes.as_slice());
     (distinct_keys(attributes) > MAX_RESOURCE_ATTRIBUTE_KEYS)
         .then_some("resource declares too many distinct attribute keys")
 }
 
 /// Validate the scope-level facts every descendant span inherits.
-fn validate_scope(scope: &ScopeSpans) -> Option<&'static str> {
-    let scope = scope.scope.as_ref()?;
+fn validate_scope(scope: Option<&InstrumentationScope>) -> Option<&'static str> {
+    let scope = scope?;
     if scope.name.len() > MAX_NAME_BYTES {
         return Some("scope name exceeds the accepted length");
     }
@@ -360,17 +380,21 @@ impl<'a> SpanColumns<'a> {
     /// scope bytes.
     fn push(
         &mut self,
-        span: &'a Span,
+        input: &'a TraceInput<'a>,
+        span: &'a SpanInput<'a>,
         context: Context,
         card_scope: Option<&[CardUid]>,
         row: u64,
     ) -> Result<usize, Cow<'static, str>> {
-        let trace_id = trace_id_bytes(&span.trace_id)?;
-        let span_id = span_id_bytes(&span.span_id)?;
+        let attributes = input.attributes(span.attributes);
+        let events = input.events(span);
+        let links = input.links(span);
+        let trace_id = trace_id_bytes(span.trace_id)?;
+        let span_id = span_id_bytes(span.span_id)?;
         let parent = if span.parent_span_id.is_empty() {
             None
         } else {
-            Some(span_id_bytes(&span.parent_span_id)?)
+            Some(span_id_bytes(span.parent_span_id)?)
         };
         if span.name.is_empty() || span.name.len() > MAX_NAME_BYTES {
             return Err("span name is empty or exceeds the accepted length".into());
@@ -378,7 +402,7 @@ impl<'a> SpanColumns<'a> {
         if span.trace_state.len() > MAX_TRACE_STATE_BYTES {
             return Err("span trace_state exceeds the accepted length".into());
         }
-        if distinct_keys(&span.attributes) > MAX_SPAN_ATTRIBUTE_KEYS {
+        if distinct_keys(attributes) > MAX_SPAN_ATTRIBUTE_KEYS {
             return Err("span declares too many distinct attribute keys".into());
         }
         let start = checked_i64(span.start_time_unix_nano)?;
@@ -388,24 +412,25 @@ impl<'a> SpanColumns<'a> {
             .filter(|duration| *duration >= 0)
             .ok_or("span ends before it starts")?;
 
-        let promotions = GenAiPromotions::extract(&span.attributes)?;
-        let correlation = RecordCorrelation::extract(&span.attributes, card_scope)?;
-        Self::validate_events(span)?;
-        Self::validate_links(span)?;
+        let promotions = GenAiPromotions::extract(attributes)?;
+        let correlation = RecordCorrelation::extract(attributes, card_scope)?;
+        Self::validate_events(input, span)?;
+        Self::validate_links(input, links)?;
         let variant_bytes = self
-            .append_variants(span)
+            .append_variants(input, attributes, events, links)
             .map_err(|failure| failure.reason(row))?;
-        let http = HttpPromotions::extract(&span.attributes);
-        let exception = Self::exception_promotions(span);
+        let http = HttpPromotions::extract(attributes);
+        let exception = Self::exception_promotions(
+            events
+                .iter()
+                .map(|event| (event.name, input.attributes(event.attributes))),
+        );
         let payload_bytes = variant_bytes
-            + self.push_events(span)
-            + self.push_links(span)
+            + self.push_events(events)
+            + self.push_links(links)
             + span.trace_state.len()
             + span.name.len()
-            + span
-                .status
-                .as_ref()
-                .map_or(0, |status| status.message.len())
+            + span.status.map_or(0, |status| status.message.len())
             + http.bytes()
             + exception.bytes()
             + promotions
@@ -420,18 +445,17 @@ impl<'a> SpanColumns<'a> {
         self.trace_id.push(trace_id);
         self.span_id.push(span_id);
         self.parent_span_id.push(parent);
-        self.trace_state.push(&span.trace_state);
+        self.trace_state.push(span.trace_state);
         self.flags.push(span.flags);
-        self.name.push(&span.name);
+        self.name.push(span.name);
         self.kind.push(span.kind);
         self.start_time_unix_nano.push(start);
         self.end_time_unix_nano.push(end);
         self.duration_nano.push(duration);
         self.status_present.push(span.status.is_some());
-        self.status_code
-            .push(span.status.as_ref().map(|status| status.code));
+        self.status_code.push(span.status.map(|status| status.code));
         self.status_message
-            .push(span.status.as_ref().map(|status| status.message.as_str()));
+            .push(span.status.map(|status| status.message));
         self.dropped_attributes_count
             .push(span.dropped_attributes_count);
         self.event_lengths.push(Some(span.events.len()));
@@ -457,7 +481,7 @@ impl<'a> SpanColumns<'a> {
         self.exception_message.push(exception.message);
         self.exception_stacktrace.push(exception.stacktrace);
         self.is_exception.push(
-            span.events
+            events
                 .iter()
                 .any(|event| event.name == EXCEPTION_EVENT_NAME),
         );
@@ -478,12 +502,12 @@ impl<'a> SpanColumns<'a> {
     /// Returns the stable rejection reason for an empty or over-long event
     /// name, an attribute cardinality breach, or an event outside its span's
     /// time window.
-    fn validate_events(span: &Span) -> Result<(), &'static str> {
-        for event in &span.events {
+    fn validate_events(input: &TraceInput<'_>, span: &SpanInput<'_>) -> Result<(), &'static str> {
+        for event in input.events(span) {
             if event.name.is_empty() || event.name.len() > MAX_NAME_BYTES {
                 return Err("span event name is empty or exceeds the accepted length");
             }
-            if distinct_keys(&event.attributes) > MAX_CHILD_ATTRIBUTE_KEYS {
+            if distinct_keys(input.attributes(event.attributes)) > MAX_CHILD_ATTRIBUTE_KEYS {
                 return Err("span event declares too many distinct attribute keys");
             }
             if event.time_unix_nano < span.start_time_unix_nano
@@ -501,28 +525,30 @@ impl<'a> SpanColumns<'a> {
     ///
     /// Returns the stable rejection reason for an invalid linked identifier, an
     /// over-long `trace_state`, or an attribute cardinality breach.
-    fn validate_links(span: &Span) -> Result<(), &'static str> {
-        for link in &span.links {
-            trace_id_bytes(&link.trace_id)?;
-            span_id_bytes(&link.span_id)?;
+    fn validate_links(input: &TraceInput<'_>, links: &[LinkInput<'_>]) -> Result<(), &'static str> {
+        for link in links {
+            trace_id_bytes(link.trace_id)?;
+            span_id_bytes(link.span_id)?;
             if link.trace_state.len() > MAX_TRACE_STATE_BYTES {
                 return Err("span link trace_state exceeds the accepted length");
             }
-            if distinct_keys(&link.attributes) > MAX_CHILD_ATTRIBUTE_KEYS {
+            if distinct_keys(input.attributes(link.attributes)) > MAX_CHILD_ATTRIBUTE_KEYS {
                 return Err("span link declares too many distinct attribute keys");
             }
         }
         Ok(())
     }
 
-    /// Read the `exception.*` conventions from the span's last event named
-    /// `exception`; every value is null when no such event exists.
-    fn exception_promotions(span: &Span) -> ExceptionPromotions<'_> {
-        span.events
-            .iter()
+    /// Read the `exception.*` conventions from the last of a span's `(name,
+    /// attributes)` events named `exception`; every value is null when no such
+    /// event exists.
+    fn exception_promotions<'e>(
+        events: impl DoubleEndedIterator<Item = (&'e str, Attributes<'e>)>,
+    ) -> ExceptionPromotions<'e> {
+        events
             .rev()
-            .find(|event| event.name == EXCEPTION_EVENT_NAME)
-            .map(|event| ExceptionPromotions::from_attributes(&event.attributes))
+            .find(|(name, _)| *name == EXCEPTION_EVENT_NAME)
+            .map(|(_, attributes)| ExceptionPromotions::from_attributes(attributes))
             .unwrap_or_default()
     }
 
@@ -537,43 +563,44 @@ impl<'a> SpanColumns<'a> {
     /// # Errors
     ///
     /// Returns the [`VariantFailure`] of the first set that cannot be stored.
-    fn append_variants(&mut self, span: &Span) -> Result<usize, VariantFailure> {
-        let attributes = self.attributes.checkpoint();
-        let events = self.event_attributes.checkpoint();
-        let links = self.link_attributes.checkpoint();
+    fn append_variants(
+        &mut self,
+        input: &TraceInput<'_>,
+        attributes: Attributes<'_>,
+        events: &[EventInput<'_>],
+        links: &[LinkInput<'_>],
+    ) -> Result<usize, VariantFailure> {
+        let span_mark = self.attributes.checkpoint();
+        let event_mark = self.event_attributes.checkpoint();
+        let link_mark = self.link_attributes.checkpoint();
         let scratch = &mut self.variant_scratch;
-        let encoded = append_attributes(
-            &mut self.attributes,
-            "attributes",
-            &span.attributes,
-            scratch,
-        )
-        .and_then(|bytes| {
-            span.events.iter().try_fold(bytes, |bytes, event| {
-                append_attributes(
-                    &mut self.event_attributes,
-                    "events",
-                    &event.attributes,
-                    scratch,
-                )
-                .map(|event| bytes + event)
+        let encoded = append_attributes(&mut self.attributes, "attributes", attributes, scratch)
+            .and_then(|bytes| {
+                events.iter().try_fold(bytes, |bytes, event| {
+                    append_attributes(
+                        &mut self.event_attributes,
+                        "events",
+                        input.attributes(event.attributes),
+                        scratch,
+                    )
+                    .map(|event| bytes + event)
+                })
             })
-        })
-        .and_then(|bytes| {
-            span.links.iter().try_fold(bytes, |bytes, link| {
-                append_attributes(
-                    &mut self.link_attributes,
-                    "links",
-                    &link.attributes,
-                    scratch,
-                )
-                .map(|link| bytes + link)
-            })
-        });
+            .and_then(|bytes| {
+                links.iter().try_fold(bytes, |bytes, link| {
+                    append_attributes(
+                        &mut self.link_attributes,
+                        "links",
+                        input.attributes(link.attributes),
+                        scratch,
+                    )
+                    .map(|link| bytes + link)
+                })
+            });
         if encoded.is_err() {
-            self.attributes.rollback(attributes);
-            self.event_attributes.rollback(events);
-            self.link_attributes.rollback(links);
+            self.attributes.rollback(span_mark);
+            self.event_attributes.rollback(event_mark);
+            self.link_attributes.rollback(link_mark);
         }
         encoded
     }
@@ -587,15 +614,15 @@ impl<'a> SpanColumns<'a> {
     ///
     /// Panics only if a validated event time exceeds `i64`, which validation
     /// against the span's checked end time rules out.
-    fn push_events(&mut self, span: &'a Span) -> usize {
+    fn push_events(&mut self, events: &[EventInput<'a>]) -> usize {
         let mut payload_bytes = 0;
-        for event in &span.events {
+        for event in events {
             self.event_time.push(
                 checked_i64(event.time_unix_nano)
                     .expect("a validated event time never exceeds its span's checked end"),
             );
             payload_bytes += event.name.len();
-            self.event_name.push(&event.name);
+            self.event_name.push(event.name);
             self.event_dropped.push(event.dropped_attributes_count);
         }
         payload_bytes
@@ -606,13 +633,13 @@ impl<'a> SpanColumns<'a> {
     /// The links' attribute sets are already in their Variant column.
     /// Returns the links' `trace_state` payload bytes;
     /// fixed-width identifiers are charged with the link's fixed width.
-    fn push_links(&mut self, span: &'a Span) -> usize {
+    fn push_links(&mut self, links: &[LinkInput<'a>]) -> usize {
         let mut payload_bytes = 0;
-        for link in &span.links {
-            self.link_trace_id.push(&link.trace_id);
-            self.link_span_id.push(&link.span_id);
+        for link in links {
+            self.link_trace_id.push(link.trace_id);
+            self.link_span_id.push(link.span_id);
             payload_bytes += link.trace_state.len();
-            self.link_trace_state.push(&link.trace_state);
+            self.link_trace_state.push(link.trace_state);
             self.link_flags.push(link.flags);
             self.link_dropped.push(link.dropped_attributes_count);
         }
@@ -826,11 +853,13 @@ pub(crate) fn refuse_forged_span_derivations(batch: &RecordBatch) -> Result<(), 
     let mut is_exception = Vec::with_capacity(rows);
     for (row, span) in spans.iter().enumerate() {
         gen_ai.push(
-            GenAiPromotions::extract(&span.attributes)
+            GenAiPromotions::extract((&span.attributes).into())
                 .map_err(|reason| refused(format!("span row {row}: {reason}")))?,
         );
-        http.push(HttpPromotions::extract(&span.attributes));
-        exception.push(SpanColumns::exception_promotions(span));
+        http.push(HttpPromotions::extract((&span.attributes).into()));
+        exception.push(SpanColumns::exception_promotions(span.events.iter().map(
+            |event| (event.name.as_str(), Attributes::from(&event.attributes)),
+        )));
         is_exception.push(
             span.events
                 .iter()
@@ -923,13 +952,13 @@ impl<'a> GenAiPromotions<'a> {
     ///
     /// Returns the stable rejection reason when a pinned source attribute is
     /// present but is not the exact protocol type the convention defines.
-    fn extract(attributes: &'a [KeyValue]) -> Result<Self, &'static str> {
+    fn extract(attributes: Attributes<'a>) -> Result<Self, &'static str> {
         let mut promotions = Self::default();
         for (slot, key) in promotions.strings.iter_mut().zip(GEN_AI_STRING_PROMOTIONS) {
             *slot = match last_attribute(attributes, key) {
                 None => None,
-                Some(entry) => match entry.value.as_ref().and_then(|value| value.value.as_ref()) {
-                    Some(Value::StringValue(text)) => Some(text.as_str()),
+                Some(entry) => match entry.value {
+                    ValueRef::String(text) => Some(text),
                     _ => return Err("a promoted gen_ai attribute has the wrong type"),
                 },
             };
@@ -937,8 +966,8 @@ impl<'a> GenAiPromotions<'a> {
         for (slot, key) in promotions.ints.iter_mut().zip(GEN_AI_INT_PROMOTIONS) {
             *slot = match last_attribute(attributes, key) {
                 None => None,
-                Some(entry) => match entry.value.as_ref().and_then(|value| value.value.as_ref()) {
-                    Some(Value::IntValue(number)) => Some(*number),
+                Some(entry) => match entry.value {
+                    ValueRef::Int(number) => Some(number),
                     _ => return Err("a promoted gen_ai attribute has the wrong type"),
                 },
             };
@@ -969,7 +998,7 @@ struct HttpPromotions<'a> {
 
 impl<'a> HttpPromotions<'a> {
     /// Read the HTTP conventions from one span's attributes, borrowing them.
-    fn extract(attributes: &'a [KeyValue]) -> Self {
+    fn extract(attributes: Attributes<'a>) -> Self {
         Self {
             request_method: last_string_attribute(attributes, "http.request.method"),
             route: last_string_attribute(attributes, "http.route"),

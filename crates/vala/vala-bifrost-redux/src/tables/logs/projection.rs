@@ -62,7 +62,7 @@ pub(crate) fn refuse_forged_log_derivations(batch: &RecordBatch) -> Result<(), B
     }
     let exception: Vec<ExceptionPromotions<'_>> = stored
         .iter()
-        .map(|attributes| ExceptionPromotions::from_attributes(attributes))
+        .map(ExceptionPromotions::from_attributes)
         .collect();
     let text = |pick: for<'r> fn(&ExceptionPromotions<'r>) -> Option<&'r str>| {
         utf8_opt_column(&exception.iter().map(pick).collect::<Vec<_>>())

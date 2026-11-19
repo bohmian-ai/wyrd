@@ -1,9 +1,13 @@
 //! Canonical trace-signal table definitions and their table-owned projection.
 
+pub mod input;
 pub mod projection;
 pub mod spans;
 
-pub use projection::{SpanOutputWidths, canonical_span_schema, project_resource_spans};
+pub use input::TraceInput;
+pub use projection::{
+    SpanOutputWidths, canonical_span_schema, project_resource_spans, project_trace_input,
+};
 pub use spans::SpansTable;
 
 #[cfg(test)]

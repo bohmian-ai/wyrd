@@ -41,6 +41,7 @@ use crate::namespaces::BifrostNamespace;
 use crate::oracle::{AuthorizedQueryContext, OracleQueryStream, QueryStreamLifecycle};
 pub use crate::otlp_contract::{IngestOutcome, LogsOutcome, MetricsOutcome};
 use crate::scribe::preprocess::logical_data_identity;
+use crate::tables::traces::TraceInput;
 use crate::tables::{
     ApprovalsTable, CallsTable, DomainTable, EvidenceTable, ExecutionEventsTable,
     ExecutionInputsTable, ExecutionOutputsTable, ObjectsTable, ResultsTable, SeriesTable,
@@ -52,6 +53,20 @@ use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::vala::api::{AuditDetail, AuditEvent, AuditOutcome, BifrostQueryRequest};
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::vala::ids::{SpanId, TableVersion, TraceId};
+
+/// One trace export authorized, attributed, and projected, owning its batch.
+///
+/// Returned by [`Gate::prepare_trace_input`] and consumed by
+/// [`Gate::dispatch_traces`].
+#[derive(Debug)]
+pub struct PreparedTraces {
+    /// The accepted spans' canonical batch.
+    batch: RecordBatch,
+    /// The partial-success outcome.
+    outcome: IngestOutcome,
+    /// The Cards the export is attributed to.
+    attributed: Option<Vec<wyrd_spec::ids::CardUid>>,
+}
 
 /// Maps a canonical OTLP projection failure to its ingest refusal.
 ///
@@ -864,31 +879,97 @@ impl<A: GateAudit + 'static> Gate<A> {
         auth: &AuthContext,
         decoded: DecodedOtlp<ExportTraceServiceRequest>,
     ) -> Result<IngestOutcome, IngestError> {
+        let prepared = self
+            .prepare_trace_input(
+                auth,
+                &TraceInput::from_generated(&decoded.request.resource_spans),
+            )
+            .await?;
+        // The generated request is no longer read; free its backing before
+        // Scribe adopts the decode owner and charges the projected Arrow.
+        drop(decoded.request);
+        self.dispatch_prepared_traces(auth, prepared, decoded.wire_bytes, decoded.owner)
+            .await
+    }
+
+    /// Authorize, attribute, and project one flattened trace export.
+    ///
+    /// This is the first half of trace ingest for a decoder whose input
+    /// borrows its transport buffer: the returned batch owns its data, so the
+    /// caller releases the input and buffer before
+    /// [`Self::dispatch_traces`] hands the batch to Scribe. Card attribution
+    /// reads every span, including spans projection then rejects.
+    ///
+    /// # Errors
+    ///
+    /// Returns authorization, attribution, or projection errors.
+    #[tracing::instrument(skip_all, fields(tenant = %auth.tenant, request_id = %auth.request_id))]
+    pub async fn prepare_trace_input(
+        &self,
+        auth: &AuthContext,
+        input: &TraceInput<'_>,
+    ) -> Result<PreparedTraces, IngestError> {
         self.ensure_open()?;
         self.authorize_record_write(auth, &TableRef::new(BifrostNamespace::Traces, "spans"))
             .await?;
         let attributed = self
-            .attributed_cards(auth, || attribution::span_card_uids(&decoded.request))
+            .attributed_cards(auth, || attribution::span_card_uids(input))
             .await?;
-        let (batch, outcome) = crate::tables::traces::project_resource_spans(
-            &decoded.request.resource_spans,
+        let (batch, outcome) = crate::tables::traces::project_trace_input(
+            input,
             attributed.as_deref(),
             self.limits.expanded_bytes(),
         )
         .map_err(|error| projection_error("trace", &error))?;
-        // The generated request is no longer read; free its backing before
-        // Scribe adopts the decode owner and charges the projected Arrow.
-        drop(decoded.request);
+        Ok(PreparedTraces {
+            batch,
+            outcome,
+            attributed,
+        })
+    }
+
+    /// Hand one prepared trace export and its decode owner to Scribe.
+    ///
+    /// `wire_bytes` is the export's encoded size. Returns the partial-success
+    /// outcome projection produced.
+    ///
+    /// # Errors
+    ///
+    /// Returns request-limit or Scribe errors.
+    #[tracing::instrument(skip_all, fields(tenant = %auth.tenant, request_id = %auth.request_id))]
+    pub async fn dispatch_traces(
+        &self,
+        auth: &AuthContext,
+        prepared: PreparedTraces,
+        wire_bytes: usize,
+        owner: OtlpDecodeOwner,
+    ) -> Result<IngestOutcome, IngestError> {
+        self.dispatch_prepared_traces(auth, prepared, wire_bytes, Some(owner))
+            .await
+    }
+
+    /// Dispatch a prepared trace export with its optional decode owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns request-limit or Scribe errors.
+    async fn dispatch_prepared_traces(
+        &self,
+        auth: &AuthContext,
+        prepared: PreparedTraces,
+        wire_bytes: usize,
+        owner: Option<OtlpDecodeOwner>,
+    ) -> Result<IngestOutcome, IngestError> {
         self.dispatch_canonical(
             auth,
             TableRef::new(BifrostNamespace::Traces, "spans"),
-            decoded.wire_bytes,
-            batch,
-            decoded.owner,
-            attributed,
+            wire_bytes,
+            prepared.batch,
+            owner,
+            prepared.attributed,
         )
         .await?;
-        Ok(outcome)
+        Ok(prepared.outcome)
     }
 
     /// Routes one adapter-decoded metrics export and its move-only owner.

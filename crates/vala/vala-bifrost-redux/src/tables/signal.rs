@@ -61,6 +61,244 @@ pub static ENTITY_REF_ELEMENT: F = F::sensitive(
     false,
 );
 
+/// Positions `start..end` of one list in an [`AttributePool`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PoolRange {
+    /// First position.
+    pub start: usize,
+    /// One past the last position.
+    pub end: usize,
+}
+
+/// One `OTLP` value stored in an [`AttributePool`], borrowing its text and
+/// bytes from the request.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PooledValue<'a> {
+    /// An absent or unset value.
+    Empty,
+    /// A string value.
+    String(&'a str),
+    /// A boolean value.
+    Bool(bool),
+    /// A signed integer value.
+    Int(i64),
+    /// A double value.
+    Double(f64),
+    /// A bytes value.
+    Bytes(&'a [u8]),
+    /// An array whose items are [`AttributePool::values`] in this range.
+    Array(PoolRange),
+    /// A key/value list whose entries are [`AttributePool::entries`] in this
+    /// range.
+    Kvlist(PoolRange),
+}
+
+/// One `OTLP` key/value entry stored in an [`AttributePool`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PooledEntry<'a> {
+    /// The entry key.
+    pub key: &'a str,
+    /// The entry value.
+    pub value: PooledValue<'a>,
+}
+
+/// Every attribute entry and array item of one borrowed `OTLP` request,
+/// flattened into two vectors.
+///
+/// A decoder that borrows its request appends here instead of building the
+/// generated message tree, so a whole request's attributes take two
+/// allocations. Each list occupies a contiguous [`PoolRange`]; nested lists
+/// are referenced by range.
+#[derive(Debug, Default)]
+pub struct AttributePool<'a> {
+    /// Key/value entries of every attribute list and key/value list.
+    pub entries: Vec<PooledEntry<'a>>,
+    /// Items of every array value.
+    pub values: Vec<PooledValue<'a>>,
+}
+
+impl AttributePool<'_> {
+    /// The pooled attribute list at `range`.
+    #[must_use]
+    pub fn attributes(&self, range: PoolRange) -> Attributes<'_> {
+        Attributes::Pooled(self, range)
+    }
+}
+
+/// One `OTLP` attribute collection, borrowed from either a generated message
+/// or an [`AttributePool`].
+///
+/// Every attribute rule in this module reads collections through this handle,
+/// so a decoded request and a borrowed one are projected by one
+/// implementation.
+#[derive(Debug, Clone, Copy)]
+pub enum Attributes<'a> {
+    /// Entries of a generated message.
+    Generated(&'a [KeyValue]),
+    /// Entries of a borrowed request's pool.
+    Pooled(&'a AttributePool<'a>, PoolRange),
+}
+
+/// One attribute entry read through [`Attributes`].
+#[derive(Debug, Clone, Copy)]
+pub struct Attribute<'a> {
+    /// The entry key.
+    pub key: &'a str,
+    /// The entry value; [`ValueRef::Empty`] when absent or unset.
+    pub value: ValueRef<'a>,
+}
+
+/// One `OTLP` value read through [`Attributes`] or [`Values`].
+#[derive(Debug, Clone, Copy)]
+pub enum ValueRef<'a> {
+    /// An absent or unset value.
+    Empty,
+    /// A string value.
+    String(&'a str),
+    /// A boolean value.
+    Bool(bool),
+    /// A signed integer value.
+    Int(i64),
+    /// A double value.
+    Double(f64),
+    /// A bytes value.
+    Bytes(&'a [u8]),
+    /// An array value.
+    Array(Values<'a>),
+    /// A key/value list value.
+    Kvlist(Attributes<'a>),
+}
+
+/// The items of one `OTLP` array value.
+#[derive(Debug, Clone, Copy)]
+pub enum Values<'a> {
+    /// Items of a generated message.
+    Generated(&'a [AnyValue]),
+    /// Items of a borrowed request's pool.
+    Pooled(&'a AttributePool<'a>, PoolRange),
+}
+
+impl<'a> Attributes<'a> {
+    /// The number of entries, duplicates included.
+    #[must_use]
+    pub fn len(self) -> usize {
+        match self {
+            Self::Generated(entries) => entries.len(),
+            Self::Pooled(_, range) => range.end - range.start,
+        }
+    }
+
+    /// Whether the collection has no entries.
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
+    /// The entry at `index`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `index` is not below [`Self::len`].
+    #[must_use]
+    pub fn get(self, index: usize) -> Attribute<'a> {
+        match self {
+            Self::Generated(entries) => {
+                let entry = &entries[index];
+                Attribute {
+                    key: &entry.key,
+                    value: entry.value.as_ref().map_or(ValueRef::Empty, ValueRef::of),
+                }
+            }
+            Self::Pooled(pool, range) => {
+                let entry = &pool.entries[range.start..range.end][index];
+                Attribute {
+                    key: entry.key,
+                    value: ValueRef::pooled(pool, entry.value),
+                }
+            }
+        }
+    }
+
+    /// The entries in request order.
+    pub fn iter(self) -> impl DoubleEndedIterator<Item = Attribute<'a>> + ExactSizeIterator {
+        (0..self.len()).map(move |index| self.get(index))
+    }
+}
+
+impl<'a> From<&'a [KeyValue]> for Attributes<'a> {
+    fn from(entries: &'a [KeyValue]) -> Self {
+        Self::Generated(entries)
+    }
+}
+
+impl<'a> From<&'a Vec<KeyValue>> for Attributes<'a> {
+    fn from(entries: &'a Vec<KeyValue>) -> Self {
+        Self::Generated(entries)
+    }
+}
+
+impl<'a, const N: usize> From<&'a [KeyValue; N]> for Attributes<'a> {
+    fn from(entries: &'a [KeyValue; N]) -> Self {
+        Self::Generated(entries)
+    }
+}
+
+impl<'a> Values<'a> {
+    /// The number of items.
+    #[must_use]
+    pub fn len(self) -> usize {
+        match self {
+            Self::Generated(items) => items.len(),
+            Self::Pooled(_, range) => range.end - range.start,
+        }
+    }
+
+    /// Whether the array has no items.
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
+    /// The items in request order.
+    pub fn iter(self) -> impl Iterator<Item = ValueRef<'a>> {
+        (0..self.len()).map(move |index| match self {
+            Self::Generated(items) => ValueRef::of(&items[index]),
+            Self::Pooled(pool, range) => ValueRef::pooled(pool, pool.values[range.start + index]),
+        })
+    }
+}
+
+impl<'a> ValueRef<'a> {
+    /// Read one generated value.
+    #[must_use]
+    pub fn of(value: &'a AnyValue) -> Self {
+        match &value.value {
+            None => Self::Empty,
+            Some(Value::StringValue(text)) => Self::String(text),
+            Some(Value::BoolValue(flag)) => Self::Bool(*flag),
+            Some(Value::IntValue(number)) => Self::Int(*number),
+            Some(Value::DoubleValue(number)) => Self::Double(*number),
+            Some(Value::BytesValue(bytes)) => Self::Bytes(bytes),
+            Some(Value::ArrayValue(array)) => Self::Array(Values::Generated(&array.values)),
+            Some(Value::KvlistValue(list)) => Self::Kvlist(Attributes::Generated(&list.values)),
+        }
+    }
+
+    /// Read one pooled value of `pool`.
+    fn pooled(pool: &'a AttributePool<'a>, value: PooledValue<'a>) -> Self {
+        match value {
+            PooledValue::Empty => Self::Empty,
+            PooledValue::String(text) => Self::String(text),
+            PooledValue::Bool(flag) => Self::Bool(flag),
+            PooledValue::Int(number) => Self::Int(number),
+            PooledValue::Double(number) => Self::Double(number),
+            PooledValue::Bytes(bytes) => Self::Bytes(bytes),
+            PooledValue::Array(range) => Self::Array(Values::Pooled(pool, range)),
+            PooledValue::Kvlist(range) => Self::Kvlist(Attributes::Pooled(pool, range)),
+        }
+    }
+}
+
 /// One `OTLP` value or attribute collection that cannot be stored as Variant.
 ///
 /// The failure keeps the logical field it was projected for; the rejected
@@ -99,12 +337,12 @@ impl VariantFailure {
 ///
 /// Returns a [`VariantFailure`] for `field` when the encoded object exceeds
 /// the Variant size limit or nests past the depth limit.
-pub fn attributes_variant(
+pub fn attributes_variant<'a>(
     field: &'static str,
-    attributes: &[KeyValue],
+    attributes: impl Into<Attributes<'a>>,
 ) -> Result<EncodedVariant, VariantFailure> {
     let mut builder = VariantBuilder::new();
-    append_object(&mut builder, attributes, &mut Vec::new());
+    append_object(&mut builder, attributes.into(), &mut Vec::new());
     finish_variant(field, builder)
 }
 
@@ -122,7 +360,7 @@ pub fn attributes_variant(
 pub fn append_attributes(
     column: &mut VariantColumnEncoder,
     field: &'static str,
-    attributes: &[KeyValue],
+    attributes: Attributes<'_>,
     scratch: &mut Vec<usize>,
 ) -> Result<usize, VariantFailure> {
     column
@@ -146,7 +384,7 @@ pub fn any_value_variant(
     value: &AnyValue,
 ) -> Result<EncodedVariant, VariantFailure> {
     let mut builder = VariantBuilder::new();
-    append_any_value(&mut builder, value.value.as_ref(), &mut Vec::new());
+    append_any_value(&mut builder, ValueRef::of(value), &mut Vec::new());
     finish_variant(field, builder)
 }
 
@@ -174,33 +412,33 @@ fn finish_variant(
 /// shares; see [`push_final_entries`].
 fn append_any_value(
     builder: &mut impl VariantBuilderExt,
-    value: Option<&Value>,
+    value: ValueRef<'_>,
     scratch: &mut Vec<usize>,
 ) {
     match value {
-        None => builder.append_value(Variant::Null),
-        Some(Value::StringValue(text)) => builder.append_value(text.as_str()),
-        Some(Value::BoolValue(flag)) => builder.append_value(*flag),
-        Some(Value::IntValue(number)) => builder.append_value(narrow_integer(*number)),
-        Some(Value::DoubleValue(number)) => builder.append_value(*number),
-        Some(Value::BytesValue(bytes)) => builder.append_value(Variant::Binary(bytes)),
-        Some(Value::ArrayValue(array)) => {
+        ValueRef::Empty => builder.append_value(Variant::Null),
+        ValueRef::String(text) => builder.append_value(text),
+        ValueRef::Bool(flag) => builder.append_value(flag),
+        ValueRef::Int(number) => builder.append_value(narrow_integer(number)),
+        ValueRef::Double(number) => builder.append_value(number),
+        ValueRef::Bytes(bytes) => builder.append_value(Variant::Binary(bytes)),
+        ValueRef::Array(items) => {
             let mut list = builder.new_list();
-            append_items(&mut list, &array.values, scratch);
+            append_items(&mut list, items, scratch);
             list.finish();
         }
-        Some(Value::KvlistValue(list)) => append_object(builder, &list.values, scratch),
+        ValueRef::Kvlist(entries) => append_object(builder, entries, scratch),
     }
 }
 
 /// Append every `OTLP` array item to an open Variant list.
 fn append_items<S: BuilderSpecificState>(
     list: &mut ListBuilder<'_, S>,
-    items: &[AnyValue],
+    items: Values<'_>,
     scratch: &mut Vec<usize>,
 ) {
-    for item in items {
-        append_any_value(list, item.value.as_ref(), scratch);
+    for item in items.iter() {
+        append_any_value(list, item, scratch);
     }
 }
 
@@ -214,21 +452,17 @@ fn append_items<S: BuilderSpecificState>(
 /// attacker-chosen keys cost `O(n log n)` comparisons and no allocation
 /// beyond the stack's growth. A nested object pushes its own frame above its
 /// parent's and truncates back to it, so one stack serves a whole value.
-fn push_final_entries(entries: &[KeyValue], scratch: &mut Vec<usize>) -> usize {
+fn push_final_entries(entries: Attributes<'_>, scratch: &mut Vec<usize>) -> usize {
+    let key = |position: usize| entries.get(position).key;
     let start = scratch.len();
     scratch.extend(0..entries.len());
     let frame = &mut scratch[start..];
-    frame.sort_unstable_by(|left, right| {
-        entries[*left]
-            .key
-            .cmp(&entries[*right].key)
-            .then(left.cmp(right))
-    });
+    frame.sort_unstable_by(|left, right| key(*left).cmp(key(*right)).then(left.cmp(right)));
     let mut kept = 0;
     for position in 0..frame.len() {
         let last_of_key = frame
             .get(position + 1)
-            .is_none_or(|next| entries[*next].key != entries[frame[position]].key);
+            .is_none_or(|next| key(*next) != key(frame[position]));
         if last_of_key {
             frame[kept] = frame[position];
             kept += 1;
@@ -244,9 +478,9 @@ fn push_final_entries(entries: &[KeyValue], scratch: &mut Vec<usize>) -> usize {
 /// OTLP carries a logical map as repeated entries, so a duplicated key is one
 /// key for cardinality purposes and resolves to its final value on read.
 #[must_use]
-pub fn distinct_keys(entries: &[KeyValue]) -> usize {
+pub fn distinct_keys<'a>(entries: impl Into<Attributes<'a>>) -> usize {
     let mut scratch = Vec::new();
-    push_final_entries(entries, &mut scratch);
+    push_final_entries(entries.into(), &mut scratch);
     scratch.len()
 }
 
@@ -259,20 +493,20 @@ pub fn distinct_keys(entries: &[KeyValue]) -> usize {
 /// null, which stays distinct from an absent key.
 fn append_object(
     builder: &mut impl VariantBuilderExt,
-    entries: &[KeyValue],
+    entries: Attributes<'_>,
     scratch: &mut Vec<usize>,
 ) {
     let start = push_final_entries(entries, scratch);
     let end = scratch.len();
     let mut object = builder.new_object();
     for position in start..end {
-        let entry = &entries[scratch[position]];
-        match entry.value.as_ref().and_then(|value| value.value.as_ref()) {
+        let entry = entries.get(scratch[position]);
+        match entry.value {
             // A field builder would treat null as an absent key.
-            None => object.insert(&entry.key, Variant::Null),
-            Some(value) => append_any_value(
-                &mut ObjectFieldBuilder::new(&entry.key, &mut object),
-                Some(value),
+            ValueRef::Empty => object.insert(entry.key, Variant::Null),
+            value => append_any_value(
+                &mut ObjectFieldBuilder::new(entry.key, &mut object),
+                value,
                 scratch,
             ),
         }
@@ -373,20 +607,16 @@ fn entity_ref_bytes(entity: &EntityRef) -> usize {
 /// Promoted semantic-convention columns are null when their source is absent
 /// or carries another protocol type, so this never rejects a record.
 #[must_use]
-pub fn promoted_string(attributes: &[KeyValue], key: &str) -> Option<String> {
+pub fn promoted_string<'a>(attributes: impl Into<Attributes<'a>>, key: &str) -> Option<String> {
     last_string_attribute(attributes, key).map(str::to_owned)
 }
 
 /// Read the final occurrence of `key` as a signed integer; any other value is
 /// `None`.
 #[must_use]
-pub fn promoted_int(attributes: &[KeyValue], key: &str) -> Option<i64> {
-    match last_attribute(attributes, key)?
-        .value
-        .as_ref()
-        .and_then(|value| value.value.as_ref())
-    {
-        Some(Value::IntValue(number)) => Some(*number),
+pub fn promoted_int<'a>(attributes: impl Into<Attributes<'a>>, key: &str) -> Option<i64> {
+    match last_attribute(attributes, key)?.value {
+        ValueRef::Int(number) => Some(number),
         _ => None,
     }
 }
@@ -410,7 +640,8 @@ impl<'a> ExceptionPromotions<'a> {
     /// Read the three exception conventions from one attribute set, borrowing
     /// their text from it.
     #[must_use]
-    pub fn from_attributes(attributes: &'a [KeyValue]) -> Self {
+    pub fn from_attributes(attributes: impl Into<Attributes<'a>>) -> Self {
+        let attributes = attributes.into();
         Self {
             exception_type: last_string_attribute(attributes, "exception.type"),
             message: last_string_attribute(attributes, "exception.message"),
@@ -561,7 +792,8 @@ pub struct ResourcePromotions {
 impl ResourcePromotions {
     /// Read every promoted convention from one resource attribute set.
     #[must_use]
-    pub fn extract(attributes: &[KeyValue]) -> Self {
+    pub fn extract<'a>(attributes: impl Into<Attributes<'a>>) -> Self {
+        let attributes = attributes.into();
         Self {
             service_name: promoted_string(attributes, "service.name"),
             service_version: promoted_string(attributes, "service.version"),
@@ -723,21 +955,27 @@ impl ScopeEnvelope {
 /// `None` for a present non-string value is deliberate: the caller decides
 /// whether that is a null promotion or a record rejection.
 #[must_use]
-pub fn last_string_attribute<'a>(attributes: &'a [KeyValue], key: &str) -> Option<&'a str> {
-    last_attribute(attributes, key).and_then(|entry| {
-        match entry.value.as_ref().and_then(|value| value.value.as_ref()) {
-            Some(wyrd_tonic::otlp::common::v1::any_value::Value::StringValue(text)) => {
-                Some(text.as_str())
-            }
-            _ => None,
-        }
-    })
+pub fn last_string_attribute<'a>(
+    attributes: impl Into<Attributes<'a>>,
+    key: &str,
+) -> Option<&'a str> {
+    match last_attribute(attributes, key)?.value {
+        ValueRef::String(text) => Some(text),
+        _ => None,
+    }
 }
 
 /// Find the last attribute entry carried by `key`.
 #[must_use]
-pub fn last_attribute<'a>(attributes: &'a [KeyValue], key: &str) -> Option<&'a KeyValue> {
-    attributes.iter().rev().find(|entry| entry.key == key)
+pub fn last_attribute<'a>(
+    attributes: impl Into<Attributes<'a>>,
+    key: &str,
+) -> Option<Attribute<'a>> {
+    attributes
+        .into()
+        .iter()
+        .rev()
+        .find(|entry| entry.key == key)
 }
 
 /// Record-level `OTLP` attribute carrying optional Card correlation.
@@ -793,10 +1031,11 @@ impl RecordCorrelation {
     /// not carry that UID, or when the final `wyrd.run_id`
     /// occurrence is not a string. [`RunId`] adopts any string, so a run
     /// identifier has no further grammar to fail.
-    pub fn extract(
-        attributes: &[KeyValue],
+    pub fn extract<'a>(
+        attributes: impl Into<Attributes<'a>>,
         card_scope: Option<&[CardUid]>,
     ) -> Result<Self, &'static str> {
+        let attributes = attributes.into();
         let card_uid = correlation_text(attributes, CARD_UID_ATTRIBUTE, CARD_UID_REJECTION)?
             .map(|text| {
                 let uid = CardUid::from_str(text).map_err(|_| CARD_UID_REJECTION)?;
@@ -822,7 +1061,7 @@ impl RecordCorrelation {
 /// before projection; a wrongly typed occurrence yields nothing here and is
 /// rejected by [`RecordCorrelation::extract`] on its own record.
 #[must_use]
-pub fn card_uid_text(attributes: &[KeyValue]) -> Option<&str> {
+pub fn card_uid_text<'a>(attributes: impl Into<Attributes<'a>>) -> Option<&'a str> {
     correlation_text(attributes, CARD_UID_ATTRIBUTE, CARD_UID_REJECTION)
         .ok()
         .flatten()
@@ -835,14 +1074,14 @@ pub fn card_uid_text(attributes: &[KeyValue]) -> Option<&str> {
 /// Returns `wrong_type` when the final occurrence carries any protocol value
 /// other than a string.
 fn correlation_text<'a>(
-    attributes: &'a [KeyValue],
+    attributes: impl Into<Attributes<'a>>,
     key: &str,
     wrong_type: &'static str,
 ) -> Result<Option<&'a str>, &'static str> {
     match last_attribute(attributes, key) {
         None => Ok(None),
-        Some(entry) => match entry.value.as_ref().and_then(|value| value.value.as_ref()) {
-            Some(Value::StringValue(text)) => Ok(Some(text.as_str())),
+        Some(entry) => match entry.value {
+            ValueRef::String(text) => Ok(Some(text)),
             _ => Err(wrong_type),
         },
     }
@@ -1478,7 +1717,7 @@ pub(crate) mod correlation_fixture {
             .expect("the batch has an attributes column");
         for (row, source) in sources.iter().enumerate() {
             let expected =
-                attributes_variant("attributes", source).expect("fixture attributes project");
+                attributes_variant("attributes", *source).expect("fixture attributes project");
             let expected = variant_bytes_to_json(expected.metadata(), expected.value())
                 .expect("fixture attributes decode");
             assert_eq!(
@@ -1558,6 +1797,36 @@ mod tests {
     use wyrd_queue::variant::variant_bytes_to_json;
     use wyrd_spec::vala::api::VARIANT_MAX_DEPTH;
     use wyrd_tonic::otlp::common::v1::{ArrayValue, KeyValueList};
+
+    /// A pooled list cannot expose an entry from the following list.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the index reaches the list length, even with more pooled entries.
+    #[test]
+    #[should_panic(expected = "index out of bounds")]
+    fn pooled_attributes_get_panics_at_list_boundary() {
+        let pool = AttributePool {
+            entries: vec![
+                PooledEntry {
+                    key: "before",
+                    value: PooledValue::Empty,
+                },
+                PooledEntry {
+                    key: "inside",
+                    value: PooledValue::Empty,
+                },
+                PooledEntry {
+                    key: "after",
+                    value: PooledValue::Empty,
+                },
+            ],
+            values: vec![],
+        };
+        let attributes = pool.attributes(PoolRange { start: 1, end: 2 });
+        assert_eq!(attributes.get(0).key, "inside");
+        let _ = attributes.get(1);
+    }
 
     /// Build one attribute entry with the supplied protocol value.
     fn attribute(key: &str, value: Value) -> KeyValue {

@@ -25,11 +25,11 @@ use wyrd_tonic::otlp::common::v1::KeyValue;
 use wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest;
 use wyrd_tonic::otlp::metrics::v1::{Metric, metric};
 use wyrd_tonic::otlp::metrics_service::ExportMetricsServiceRequest;
-use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
 
 use super::auth::AuthContext;
 use super::error::IngestError;
 use crate::tables::signal::card_uid_text;
+use crate::tables::traces::TraceInput;
 use crate::tables::{CardDescriptor, FrameDimensions};
 
 /// Most distinct Cards one frame may attribute to through registry
@@ -385,14 +385,12 @@ fn native_uids(ipc: &[u8], column: &str) -> Vec<CardUid> {
 
 /// Collects the distinct `wyrd.card_uid` values of a trace export's spans.
 #[must_use]
-pub fn span_card_uids(request: &ExportTraceServiceRequest) -> Vec<CardUid> {
+pub fn span_card_uids(input: &TraceInput<'_>) -> Vec<CardUid> {
     parse_distinct(
-        request
-            .resource_spans
+        input
+            .spans
             .iter()
-            .flat_map(|resource| &resource.scope_spans)
-            .flat_map(|scope| &scope.spans)
-            .filter_map(|span| card_uid_text(&span.attributes)),
+            .filter_map(|span| card_uid_text(input.attributes(span.attributes))),
     )
 }
 

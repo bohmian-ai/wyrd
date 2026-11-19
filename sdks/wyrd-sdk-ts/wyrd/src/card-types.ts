@@ -972,25 +972,6 @@ export interface Citation {
 }
 
 /**
- * Serde mirror of the domain claim mapping, whose claim paths are not directly
- * (de)serializable.
- */
-export interface ClaimMappingPayload {
-  /**
-   * Optional claim path that yields the principal email.
-   */
-  readonly email?: string | null;
-  /**
-   * Optional claim path that yields the principal groups.
-   */
-  readonly groups?: string | null;
-  /**
-   * Claim path that yields the principal subject.
-   */
-  readonly subject: string;
-}
-
-/**
  * A code execution runtime.
  */
 export type CodeRuntime = "python";
@@ -3375,87 +3356,6 @@ export interface HuggingfaceMeta2 {
    * Optional pinned revision.
    */
   readonly revision?: string | null;
-}
-
-/**
- * How Wyrd authenticates to the provider token endpoint for human login.
- */
-export type HumanClientAuth = "SecretBasic" | "SecretPost" | "Public";
-
-/**
- * Lifecycle state of one tenant human connection.
- */
-export type HumanConnectionState = "Candidate" | "Active" | "Inactive";
-
-/**
- * Redacted projection of one tenant human connection.
- *
- * Never carries a client secret, its ciphertext, or sealing-key identifiers.
- */
-export interface HumanConnectionView {
-  /**
-   * Exact redirect URI to register at the provider, derived from the
-   * deployment's configured public origin. `None` only when the deployment
-   * has no public origin configured, in which case staging and testing are
-   * refused.
-   */
-  readonly callback_url?: string | null;
-  /**
-   * Verified claim mapping (`subject`, optional `email` and `groups`).
-   */
-  readonly claim_mapping: ClaimMappingPayload;
-  /**
-   * Client-authentication method; the secret itself is never returned.
-   */
-  readonly client_auth: HumanClientAuth;
-  /**
-   * Wyrd's client id at the provider, also the ID-token audience.
-   */
-  readonly client_id: string;
-  /**
-   * Creation instant.
-   */
-  readonly created_at: string;
-  /**
-   * Provider group to tenant role names.
-   */
-  readonly group_role_map: Readonly<Record<string, readonly string[]>>;
-  /**
-   * Stable connection id; kept as a tombstone after removal.
-   */
-  readonly id: string;
-  /**
-   * Provider issuer URL, pinned as the ID-token `iss`.
-   */
-  readonly issuer: string;
-  /**
-   * JWKS key-cache lifetime in seconds.
-   */
-  readonly jwks_ttl_secs: number;
-  /**
-   * Tenant-monotonic configuration revision.
-   */
-  readonly revision: number;
-  /**
-   * Lifecycle state.
-   */
-  readonly state: HumanConnectionState;
-  /**
-   * Owning tenant.
-   */
-  readonly tenant_id: DataTenantId;
-  /**
-   * Revision the last successful test proved, when one is current.
-   */
-  readonly tested_revision?: number | null;
-  /**
-   * Instant after which activation requires a fresh test.
-   */
-  readonly tested_until?: string | null;
-  /**
-   * Last mutation instant.
-   */
-  readonly updated_at: string;
 }
 
 /**
@@ -7916,52 +7816,6 @@ export interface TriggerSpecSchedule {
    * Optional IANA timezone; absent means UTC.
    */
   readonly tz?: string | null;
-}
-
-/**
- * Redacted issuer projection. Never carries the client secret.
- */
-export interface TrustedIssuerView {
-  /**
-   * Claim-to-principal mapping.
-   */
-  readonly claim_mapping: ClaimMappingPayload;
-  /**
-   * Client-auth method, rendered as a string.
-   */
-  readonly client_auth: string;
-  /**
-   * Client id Wyrd presents to the issuer.
-   */
-  readonly client_id: string;
-  /**
-   * Roles granted to every principal from this issuer.
-   */
-  readonly default_roles: readonly string[];
-  /**
-   * Expected audience for tokens from this issuer.
-   */
-  readonly expected_audience: string;
-  /**
-   * Mapping from issuer group to Wyrd roles.
-   */
-  readonly group_role_map: Readonly<Record<string, readonly string[]>>;
-  /**
-   * Normalized issuer URL.
-   */
-  readonly issuer: string;
-  /**
-   * JWKS key-cache TTL in seconds.
-   */
-  readonly jwks_ttl_secs: number;
-  /**
-   * Resolved JWKS URI.
-   */
-  readonly jwks_uri: string;
-  /**
-   * Principal kind, rendered as a string.
-   */
-  readonly principal_kind: string;
 }
 
 /**

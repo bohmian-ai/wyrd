@@ -40,8 +40,6 @@ import type {
   CredentialListResponse as CredentialList,
   CredentialMetadata,
   CurrentUserProfile,
-  HumanConnectionView,
-  TrustedIssuerView,
   DataTypeSpec,
   FallbackRule,
   FallbackScope,
@@ -211,8 +209,6 @@ export type {
   CredentialList,
   CredentialMetadata,
   CurrentUserProfile,
-  HumanConnectionView,
-  TrustedIssuerView,
   DataTypeSpec,
   FallbackRule,
   FallbackScope,
@@ -2264,30 +2260,6 @@ export class Principals {
    */
   async me(): Promise<CurrentUserProfile> {
     return lifecycleValue(await this.#native.me());
-  }
-
-  /**
-   * Reseal a human connection's unchanged client secret under a fresh data key;
-   * its revision, sign-in and sessions are unchanged.
-   *
-   * @param connectionId - The live connection whose secret to renew.
-   * @returns The connection's redacted view.
-   * @throws {@link WyrdError} when the connection is unknown, retired, holds no secret or changed during the renewal, the key service is unavailable, or a transport or authorization failure.
-   */
-  async renewHumanConnectionEncryption(connectionId: string): Promise<HumanConnectionView> {
-    return lifecycleValue(await this.#native.renewHumanConnectionEncryption(connectionId));
-  }
-
-  /**
-   * Reseal a trusted issuer's unchanged client secret under a fresh data key;
-   * requires `service_accounts:write`.
-   *
-   * @param issuer - The trusted issuer URL.
-   * @returns The issuer's redacted view.
-   * @throws {@link WyrdError} when the issuer is unknown, holds no secret or changed during the renewal, the key service is unavailable, or a transport or authorization failure.
-   */
-  async renewTrustedIssuerEncryption(issuer: string): Promise<TrustedIssuerView> {
-    return lifecycleValue(await this.#native.renewTrustedIssuerEncryption(issuer));
   }
 
   /**

@@ -73,23 +73,6 @@ test("only a tenant admin assigns roles", async ({ bundle: _ }) => {
   await expect(own.revokeRole(principal, "workload")).rejects.toMatchObject(DENIED);
 });
 
-test("identity secret renewal reaches each owner", async ({ bundle: _ }) => {
-  const { key } = await issue("renewing-workload");
-  const admin = await Principals.connect();
-  const workload = await Principals.connect({ client: WyrdClient.connect({ credential: key }) });
-  const unknownIssuer = "https://unknown.example.com";
-  const unknownConnection = "01a1f59d-8e3f-72c3-8fc3-d5b1cf0330e8";
-
-  await expect(admin.renewTrustedIssuerEncryption(unknownIssuer)).rejects.toMatchObject({
-    code: "WYRD_AUTH_404_ADMIN_NOT_FOUND",
-  });
-  await expect(admin.renewHumanConnectionEncryption(unknownConnection)).rejects.toMatchObject({
-    code: "WYRD_SPEC_404_NOT_FOUND",
-  });
-  await expect(workload.renewTrustedIssuerEncryption(unknownIssuer)).rejects.toMatchObject(DENIED);
-  await expect(workload.renewHumanConnectionEncryption(unknownConnection)).rejects.toMatchObject(DENIED);
-});
-
 test("direct and idp user assignments coexist", async ({ server }) => {
   const user = server.bootstrapUser(["viewer"], "pr-person");
   const principals = await Principals.connect();

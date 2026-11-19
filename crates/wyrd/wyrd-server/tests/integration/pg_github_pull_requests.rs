@@ -18,7 +18,11 @@ use wyrd_client::Bifrost;
 use wyrd_loader::{build_declaration_input, load};
 use wyrd_server::components::github::service::GithubConnections;
 use wyrd_server::verification::RuntimeLimits;
-use wyrd_spec::ids::VerificationResultId;
+use wyrd_spec::error::WyrdError;
+use wyrd_spec::github_connection::{
+    GithubPullRequestReviewRequest, GithubPullRequestReviewResponse,
+};
+use wyrd_spec::ids::{RepositoryId, VerificationResultId};
 use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::verification::VerificationVerdict;
 use wyrd_sql::queries::verifier_executions::{
@@ -2300,5 +2304,368 @@ async fn every_admitted_member_is_retained_with_its_status() {
     assert!(
         deployment.claim(10).await.is_empty(),
         "a refusal is never runnable"
+    );
+}
+
+impl Deployment {
+    /// The SDK's GitHub connection handle acting as `jwt`.
+    ///
+    /// # Panics
+    /// Panics when the handle cannot connect.
+    pub(crate) async fn github(&self, jwt: &str) -> wyrd_client::GithubConnection {
+        wyrd_client::GithubConnection::connect_with(&client(self.base(), jwt))
+            .await
+            .expect("GitHub handle connects")
+    }
+
+    /// Send one review request for PR `number` under `key` as the editor,
+    /// without the SDK's transport retry, and return its status and body.
+    ///
+    /// # Panics
+    /// Panics when the request cannot be sent.
+    pub(crate) async fn review_once(&self, number: u64, key: &str) -> (StatusCode, Value) {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/integrations/github/pull-requests/reviews")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("Idempotency-Key", key)
+            .body(Body::from(
+                serde_json::to_vec(&self.review(number)).expect("serializes"),
+            ))
+            .expect("request builds");
+        let response = self
+            .server
+            .oneshot_authenticated(&self.jwt, request)
+            .await
+            .expect("review responds");
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("body reads");
+        (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+    }
+
+    /// The review request for PR `number` of the connected repository.
+    pub(crate) fn review(&self, number: u64) -> GithubPullRequestReviewRequest {
+        GithubPullRequestReviewRequest {
+            host: self.mock.host(),
+            repository_id: RepositoryId::new(REPOSITORY.to_string()).expect("valid id"),
+            number,
+        }
+    }
+}
+
+/// The execution ids of `rows`.
+fn ids(rows: &[Row]) -> Vec<Uuid> {
+    rows.iter().map(|row| row.execution_id).collect()
+}
+
+/// The execution ids a review response accepted.
+fn accepted(response: &GithubPullRequestReviewResponse) -> Vec<Uuid> {
+    response
+        .executions
+        .iter()
+        .map(wyrd_spec::ids::ExecutionId::as_uuid)
+        .collect()
+}
+
+/// An explicit review request admits a new generation at an unchanged head
+/// under each distinct key and supersedes the older one; a sequential,
+/// concurrent or post-restart retry of a key returns its generation and
+/// members unchanged; a policy change applies only to later requests;
+/// ordinary redelivery still replays the current generation; and a retry of
+/// an older key after the head advanced returns its superseded generation
+/// without admitting or reactivating work.
+///
+/// # Panics
+/// Panics when a request admits other members than expected, a retry
+/// changes membership, or superseded work becomes runnable again.
+#[tokio::test(flavor = "multi_thread")]
+async fn explicit_review_requests_admit_new_generations_and_replay_by_key() {
+    let deployment = Deployment::start().await;
+    deployment
+        .mock
+        .set_pull_request(REPOSITORY, 31, PullRequest::open(REPOSITORY, "b1", "s1"));
+    assert_eq!(deployment.send(31, "opened").await.0, StatusCode::ACCEPTED);
+    let delivered = ids(&deployment.rows(31).await);
+    let github = deployment.github(&deployment.jwt).await;
+    let request = deployment.review(31);
+
+    let first = github
+        .review_pull_request(&request, "review-31-a")
+        .await
+        .expect("a fresh review is accepted");
+    assert_eq!(first.executions.len(), 2, "{first:?}");
+    let rows = deployment.rows(31).await;
+    assert_eq!(rows.len(), 4, "a new generation at the same head: {rows:?}");
+    assert_eq!(
+        ids(&rows[2..]),
+        accepted(&first),
+        "members in binding order"
+    );
+    assert!(
+        rows[..2].iter().all(|row| row.status == "cancelled"
+            && row.code.as_deref() == Some("pull_request_superseded")),
+        "the delivered generation is superseded: {rows:?}"
+    );
+    assert!(
+        rows[2..]
+            .iter()
+            .all(|row| row.status == "pending" && !row.reserved && row.head == "s1"),
+        "{rows:?}"
+    );
+    assert_eq!(ids(&rows[..2]), delivered);
+
+    assert_eq!(
+        github
+            .review_pull_request(&request, "review-31-a")
+            .await
+            .expect("a retry is accepted"),
+        first,
+        "a retry returns the same generation and members"
+    );
+    let (left, right) = tokio::join!(
+        github.review_pull_request(&request, "review-31-b"),
+        github.review_pull_request(&request, "review-31-b"),
+    );
+    let second = left.expect("a concurrent request is accepted");
+    assert_eq!(
+        right.expect("its concurrent retry"),
+        second,
+        "concurrent retries share one generation"
+    );
+    assert_ne!(second.generation, first.generation);
+    assert_eq!(deployment.rows(31).await.len(), 6, "one generation per key");
+
+    assert_eq!(deployment.send(31, "edited").await.0, StatusCode::ACCEPTED);
+    let (status, _) = deployment.send(31, "reopened").await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(
+        deployment.rows(31).await.len(),
+        6,
+        "an ordinary redelivery replays the current generation"
+    );
+
+    deployment
+        .declare(POLICY_V2, "pull-request-policy-v2")
+        .await;
+    let narrowed = github
+        .review_pull_request(&request, "review-31-c")
+        .await
+        .expect("a request under the new policy is accepted");
+    assert_eq!(
+        narrowed.executions.len(),
+        1,
+        "the newly selected policy binds one Verifier"
+    );
+
+    deployment
+        .mock
+        .edit_pull_request(REPOSITORY, 31, |pr| pr.head_sha = "s2".to_owned());
+    assert_eq!(
+        deployment.send(31, "synchronize").await.0,
+        StatusCode::ACCEPTED
+    );
+    let advanced = deployment.rows(31).await;
+    assert_eq!(advanced.len(), 8, "{advanced:?}");
+    assert_eq!(advanced[7].head, "s2");
+    assert_eq!(
+        advanced[6].status, "cancelled",
+        "the head advance supersedes it"
+    );
+
+    assert_eq!(
+        github
+            .review_pull_request(&request, "review-31-a")
+            .await
+            .expect("an old retry is answered"),
+        first,
+        "an old retry returns its own generation"
+    );
+    let after = deployment.rows(31).await;
+    assert_eq!(
+        after, advanced,
+        "an old retry admits and reactivates nothing"
+    );
+
+    let Deployment { mock, server, jwt } = deployment;
+    let restarted =
+        Box::pin(server.restart_bound(WyrdTestServer::builder().with_github_app_for_test(&mock)))
+            .await
+            .expect("server restarts");
+    let deployment = Deployment {
+        mock,
+        server: restarted,
+        jwt,
+    };
+    let github = deployment.github(&deployment.jwt).await;
+    assert_eq!(
+        github
+            .review_pull_request(&request, "review-31-c")
+            .await
+            .expect("a retry after restart is answered"),
+        narrowed,
+        "a retry after a restart returns the same generation"
+    );
+    assert_eq!(deployment.rows(31).await, after);
+}
+
+/// A review request accepts no work when the caller may not run a selected
+/// Verifier, names another host, or names a pull request that is missing,
+/// closed, draft or bound by no Verifier; a provider or accountable
+/// authority failure is a typed retryable error whose retry under the same
+/// key is then accepted.
+///
+/// # Panics
+/// Panics when a refused request admits work or answers another code.
+#[tokio::test(flavor = "multi_thread")]
+async fn refused_review_requests_accept_nothing() {
+    let deployment = Deployment::start().await;
+    let code = |error: WyrdError| error.code().to_owned();
+    let Bootstrap::User { jwt: viewer, .. } = deployment
+        .server
+        .bootstrap_user("pull-request-viewer", &["viewer"])
+        .await
+        .expect("viewer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    deployment
+        .mock
+        .set_pull_request(REPOSITORY, 41, PullRequest::open(REPOSITORY, "b1", "d1"));
+    let denied = deployment
+        .github(&viewer)
+        .await
+        .review_pull_request(&deployment.review(41), "denied-41")
+        .await
+        .expect_err("a viewer may not request a review");
+    assert_eq!(code(denied), "WYRD_PERMISSION_403_DENIED_RBAC");
+    assert!(deployment.rows(41).await.is_empty());
+
+    let github = deployment.github(&deployment.jwt).await;
+    let mut other = deployment.review(41);
+    other.host = "github.example".to_owned();
+    assert_eq!(
+        code(
+            github
+                .review_pull_request(&other, "host-key-41")
+                .await
+                .expect_err("another host")
+        ),
+        "WYRD_GITHUB_400_INVALID_REQUEST"
+    );
+
+    deployment.mock.set_pull_request(
+        REPOSITORY,
+        42,
+        PullRequest {
+            open: false,
+            ..PullRequest::open(REPOSITORY, "b1", "c1")
+        },
+    );
+    deployment.mock.set_pull_request(
+        REPOSITORY,
+        43,
+        PullRequest {
+            draft: true,
+            ..PullRequest::open(REPOSITORY, "b1", "c1")
+        },
+    );
+    for (number, reason) in [(42, "closed"), (43, "draft"), (44, "not_found")] {
+        let refused = github
+            .review_pull_request(&deployment.review(number), "ineligible")
+            .await
+            .expect_err("an ineligible pull request is not reviewable");
+        assert_eq!(
+            refused.code(),
+            "WYRD_GITHUB_409_PULL_REQUEST_NOT_REVIEWABLE",
+            "{refused}"
+        );
+        assert_eq!(
+            refused.as_problem_json()["details"]["reason"],
+            json!(reason),
+            "{refused}"
+        );
+        assert!(deployment.rows(number).await.is_empty());
+    }
+
+    deployment
+        .mock
+        .fail_next_pull_request_read(StatusCode::BAD_GATEWAY);
+    let (status, unavailable) = deployment.review_once(41, "retry-41").await;
+    assert_eq!(
+        (status, &unavailable["code"]),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!("WYRD_GITHUB_503_PROVIDER_UNAVAILABLE")
+        ),
+        "{unavailable}"
+    );
+    assert!(deployment.rows(41).await.is_empty());
+    let retried = github
+        .review_pull_request(&deployment.review(41), "retry-41")
+        .await
+        .expect("the retry under the same key is accepted");
+    assert_eq!(accepted(&retried), ids(&deployment.rows(41).await));
+
+    let pool = deployment
+        .server
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    // The schema keeps every SYSTEM principal active; this fixture database
+    // lifts that check so the accountable authority has no SYSTEM actor.
+    let system = |sql: &'static str| sqlx::raw_sql(sql).execute(&pool);
+    deployment
+        .mock
+        .set_pull_request(REPOSITORY, 45, PullRequest::open(REPOSITORY, "b1", "u1"));
+    system(
+        "ALTER TABLE wyrd.auth_service_accounts
+             DROP CONSTRAINT auth_service_accounts_system_active_check;
+         UPDATE wyrd.auth_service_accounts SET status = 'suspended'
+          WHERE principal_kind = 'system';",
+    )
+    .await
+    .expect("SYSTEM is suspended");
+    let (status, undecided) = deployment.review_once(45, "authority-45").await;
+    assert_eq!(
+        (status, &undecided["code"]),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!("WYRD_SERVER_503_SERVICE_UNAVAILABLE")
+        ),
+        "{undecided}"
+    );
+    assert!(deployment.rows(45).await.is_empty());
+    system(
+        "UPDATE wyrd.auth_service_accounts SET status = 'active'
+          WHERE principal_kind = 'system';
+         ALTER TABLE wyrd.auth_service_accounts
+           ADD CONSTRAINT auth_service_accounts_system_active_check
+           CHECK (principal_kind <> 'system' OR status = 'active');",
+    )
+    .await
+    .expect("SYSTEM is restored");
+    let decided = github
+        .review_pull_request(&deployment.review(45), "authority-45")
+        .await
+        .expect("the retry under the same key is accepted");
+    assert_eq!(accepted(&decided), ids(&deployment.rows(45).await));
+
+    deployment
+        .declare(POLICY_EMPTY, "pull-request-policy-empty")
+        .await;
+    let unbound = github
+        .review_pull_request(&deployment.review(41), "unbound-41")
+        .await
+        .expect_err("a policy binding nothing reviews nothing");
+    assert_eq!(
+        unbound.as_problem_json()["details"]["reason"],
+        json!("no_bindings")
+    );
+    assert_eq!(
+        accepted(&retried),
+        ids(&deployment.rows(41).await),
+        "no state changed"
     );
 }

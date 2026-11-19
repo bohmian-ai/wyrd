@@ -23,6 +23,7 @@ pub use wyrd_spec::github_connection::{
     GithubConnectionView, GithubPullRequestReviewRequest, GithubPullRequestReviewResponse,
     GithubRepositoryAccess,
 };
+pub use wyrd_spec::ids::RepositoryId;
 
 /// The connection route.
 const PATH: &str = "/v1/integrations/github";

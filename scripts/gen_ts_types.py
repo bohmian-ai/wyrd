@@ -69,6 +69,7 @@ WIRE_ROOTS = [
     "CredentialListQuery",
     "CredentialListResponse",
     "CurrentUserProfile",
+    "HumanConnectionView",
     "IssuedCredential",
     "PrincipalPage",
     "PrincipalQuery",
@@ -76,6 +77,7 @@ WIRE_ROOTS = [
     "RevokePrincipalRequest",
     "RoleAssignmentChange",
     "TokenAudience",
+    "TrustedIssuerView",
     # Gateway.
     "GatewayCapturePolicy",
     "GatewayCapturePolicyWrite",

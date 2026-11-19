@@ -190,6 +190,54 @@ impl NativePrincipals {
         })
     }
 
+    /// Reseals a human connection's unchanged client secret under a fresh
+    /// data key.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the view cannot be serialized; a
+    /// malformed id or server refusal is returned in the result.
+    #[napi]
+    pub fn renew_human_connection_encryption<'env>(
+        &self,
+        env: &'env Env,
+        connection_id: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let principals = self.principals.clone();
+        crate::trace::spawn(env, async move {
+            let id = decode(
+                "connection_id",
+                &serde_json::Value::String(connection_id).to_string(),
+            );
+            let result = match id {
+                Ok(id) => principals.renew_human_connection_encryption(id).await,
+                Err(error) => Err(error),
+            };
+            NativeLifecycleResult::outcome(result)
+        })
+    }
+
+    /// Reseals a trusted issuer's unchanged client secret under a fresh data
+    /// key.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the view cannot be serialized; a server
+    /// refusal is returned in the result.
+    #[napi]
+    pub fn renew_trusted_issuer_encryption<'env>(
+        &self,
+        env: &'env Env,
+        issuer: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let principals = self.principals.clone();
+        crate::trace::spawn(env, async move {
+            NativeLifecycleResult::outcome(
+                principals.renew_trusted_issuer_encryption(&issuer).await,
+            )
+        })
+    }
+
     /// Revokes one credential of a principal.
     ///
     /// # Errors

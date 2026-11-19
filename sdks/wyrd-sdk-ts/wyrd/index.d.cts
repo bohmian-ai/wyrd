@@ -1122,6 +1122,26 @@ export declare class NativePrincipals {
    */
   me(): Promise<NativeLifecycleResult>
   /**
+   * Reseals a human connection's unchanged client secret under a fresh
+   * data key.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the view cannot be serialized; a
+   * malformed id or server refusal is returned in the result.
+   */
+  renewHumanConnectionEncryption(connectionId: string): Promise<NativeLifecycleResult>
+  /**
+   * Reseals a trusted issuer's unchanged client secret under a fresh data
+   * key.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the view cannot be serialized; a server
+   * refusal is returned in the result.
+   */
+  renewTrustedIssuerEncryption(issuer: string): Promise<NativeLifecycleResult>
+  /**
    * Revokes one credential of a principal.
    *
    * # Errors

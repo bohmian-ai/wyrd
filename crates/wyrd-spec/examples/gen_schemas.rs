@@ -15,9 +15,9 @@ use serde_json::{Map, Value, json, to_string_pretty};
 use wyrd_spec::auth::{
     AbsoluteUrl, CallbackQuery, CreateServicePrincipalRequest, CreateServicePrincipalResponse,
     CredentialListQuery, CredentialListResponse, CurrentUserProfile, GatewayAccess,
-    IssuedCredential, IssuerUrl, LoginInitResponse, PrincipalKindTag, PrincipalPage,
-    PrincipalQuery, PrincipalRoles, RevokePrincipalRequest, RoleAssignmentChange, TokenAudience,
-    TokenRequest, TokenResponse,
+    HumanConnectionView, IssuedCredential, IssuerUrl, LoginInitResponse, PrincipalKindTag,
+    PrincipalPage, PrincipalQuery, PrincipalRoles, RevokePrincipalRequest, RoleAssignmentChange,
+    TokenAudience, TokenRequest, TokenResponse, TrustedIssuerView,
 };
 use wyrd_spec::card::agent::AgentSpec;
 use wyrd_spec::card::artifact::{ArtifactSpec, FrameworkAdapterRef};
@@ -266,6 +266,8 @@ fn contracts() -> Value {
         CredentialListResponse,
         CredentialListQuery,
         CurrentUserProfile,
+        HumanConnectionView,
+        TrustedIssuerView,
         PrincipalRoles,
         RoleAssignmentChange,
         PrincipalPage,

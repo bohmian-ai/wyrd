@@ -55,14 +55,15 @@ export function nodeExecutor(client: WyrdClient, get: (path: string) => Promise<
         return (await cards()).get(request.card_ref);
       case 'cards.list': {
         const { op: _, ...query } = request;
-        return (await cards()).list(query);
+        return (await cards()).list(query, { signal });
       }
       case 'cards.list_artifacts':
         return (await cards()).listArtifacts(request.card_ref);
       case 'bifrost.query': {
-        const stream = await (await bifrost()).stream(request.sql, request.params ?? [], { deadlineMs: request.deadline_ms });
+        // Cancelled while the query starts, the SDK closes its request and throws.
+        const stream = await (await bifrost()).stream(request.sql, request.params ?? [], { deadlineMs: request.deadline_ms, signal });
         const abort = () => void stream.return();
-        // Cancelled while the stream started: close it before reading anything.
+        // Cancelled as the stream arrived: close it before reading anything.
         if (signal?.aborted) abort();
         signal?.throwIfAborted();
         signal?.addEventListener('abort', abort, { once: true });

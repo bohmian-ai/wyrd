@@ -52,8 +52,10 @@ async function startBff(serverUrl: string): Promise<{ url: string; stop: () => v
   return { url, stop: () => child.kill() };
 }
 
-/** One supporting query answer the gate holds back: its SQL, and how its answer ended. */
+/** One supporting answer the gate holds back: what it reads, and how its answer ended. */
 interface HeldAnswer {
+  /** `sql` for a grouped query, `cards` for a Card list. */
+  readonly kind: 'sql' | 'cards';
   readonly sql: string;
   /** `abandoned` when the BFF closed the answer before its end, as it does when it stops the read; `failed` when the gate broke it off. */
   readonly ended: Promise<'finished' | 'abandoned' | 'failed'>;
@@ -63,18 +65,23 @@ interface HeldAnswer {
   fail(): void;
 }
 
+/** How `answer` has ended so far, `open` while the BFF still waits for it. */
+const outcome = (answer: HeldAnswer) => Promise.race([answer.ended, Promise.resolve('open' as const)]);
+
 /**
  * A loopback HTTP hop between the BFF and the server that, while holding,
- * passes each supporting query's response head on and keeps back its body:
- * the BFF's read is running, and it either closes the answer (it stopped the
- * read) or reads it to the end once released (it kept reading). Supporting
- * queries are the grouped reads (facets, overview, timeline, discovery); every
- * other request passes untouched.
+ * keeps back part of each supporting answer: after the head (`body`, the
+ * BFF's read is streaming) or before it (`head`, the BFF's request is still
+ * waiting for the server). The BFF then either closes the answer (it stopped
+ * the read) or reads it to the end once released (it kept reading).
+ * Supporting answers are the grouped queries (facets, overview, timeline,
+ * discovery) and, held at the head, the Card list; every other request
+ * passes untouched.
  */
 async function supportGate(target: string) {
   const held: HeldAnswer[] = [];
   const supporting: string[] = [];
-  let holding = false;
+  let holding: false | 'head' | 'body' = false;
   const server = createHttpServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on('data', (chunk: Buffer) => chunks.push(chunk));
@@ -83,12 +90,15 @@ async function supportGate(target: string) {
       const sql = req.method === 'POST' && req.url === '/v1/query' ? String((JSON.parse(body.toString()) as { sql?: string }).sql ?? '') : '';
       const grouped = /GROUPING SETS|grouping\(at\)/.test(sql);
       if (grouped) supporting.push(sql);
+      const kind = grouped ? 'sql' : req.method === 'GET' && /^\/v1\/cards(\?|$)/.test(req.url ?? '') ? 'cards' : undefined;
+      const stage = kind === 'sql' || (kind === 'cards' && holding === 'head') ? holding : false;
       let open = () => {};
       let broken = false;
-      const gate = grouped && holding ? new Promise<void>((resolve) => (open = resolve)) : undefined;
-      if (gate) {
+      const gate = stage ? new Promise<void>((resolve) => (open = resolve)) : undefined;
+      if (gate && kind) {
         const ended = new Promise<'finished' | 'abandoned' | 'failed'>((resolve) => res.once('close', () => resolve(broken ? 'failed' : res.writableFinished ? 'finished' : 'abandoned')));
         held.push({
+          kind,
           sql,
           ended,
           release: open,
@@ -99,9 +109,12 @@ async function supportGate(target: string) {
         });
       }
       const upstream = httpRequest(new URL(req.url ?? '/', target), { method: req.method, headers: req.headers }, async (answer) => {
-        res.writeHead(answer.statusCode ?? 502, answer.headers);
-        res.flushHeaders();
-        await gate;
+        if (stage === 'head') await gate;
+        if (!res.destroyed && !broken) {
+          res.writeHead(answer.statusCode ?? 502, answer.headers);
+          res.flushHeaders();
+        }
+        if (stage === 'body') await gate;
         if (res.destroyed) return answer.destroy();
         if (broken) return res.destroy();
         answer.pipe(res);
@@ -119,7 +132,8 @@ async function supportGate(target: string) {
     held,
     /** How many supporting queries reached the gate so far. */
     supporting: () => supporting.length,
-    hold: (on: boolean) => void (holding = on),
+    /** Hold supporting answers after their head (`true`), before it (`'head'`), or not at all. */
+    hold: (on: boolean | 'head') => void (holding = on === true ? 'body' : on),
     stop: () => server.close()
   };
 }
@@ -1064,6 +1078,21 @@ test('Observe reads support once per population, stops it when superseded or lef
     await expect.poll(() => facets.locator('[data-state="error"]').count()).toBe(1);
     expect([await rows.count() > 0, await facets.getByRole('button').count()]).toEqual([true, 0]);
     await captureLifecycle(page, 'observe-support-error');
+
+    // Support still waiting for the server's answer is stopped too: superseded, then left, each request is closed before any head.
+    gate.held.length = 0;
+    gate.hold('head');
+    await page.getByRole('button', { name: 'Zoom in' }).click();
+    await expect.poll(() => gate.held.length).toBe(population);
+    await expect.poll(() => rows.count()).toBeGreaterThan(0);
+    await page.getByRole('button', { name: 'Zoom in' }).click();
+    await expect.poll(() => gate.held.length).toBe(2 * population);
+    await expect.poll(() => Promise.all(gate.held.slice(0, population).map(outcome))).toEqual(Array(population).fill('abandoned'));
+    await page.getByRole('navigation', { name: 'Destinations' }).getByRole('link', { name: 'Verify' }).click();
+    await page.waitForURL(`${bff.url}/t/${slug}/verify`);
+    await expect.poll(() => Promise.all(gate.held.slice(population, 2 * population).map(outcome))).toEqual(Array(population).fill('abandoned'));
+    gate.hold(false);
+    for (const answer of gate.held) answer.release();
 
     // Live waits for its support before its next refresh, and stops when paused or left.
     await liveWaitsForSupport(ui.browser, page, gate, `${observe}&live=1`, 'observe');
@@ -2078,6 +2107,25 @@ judged('the Verify dashboard filters, groups, brushes, pages, opens an execution
     await expect.poll(() => page.locator('[data-state="error"]').count()).toBeGreaterThan(0);
     expect([await rows.count(), await rail.getByRole('button').count()]).toEqual([50, 0]);
     await captureLifecycle(page, 'verify-support-error');
+
+    // Support still waiting for the server's answer is stopped too, the Card-name list included: superseded, then left, each request is closed before any head.
+    const kinds = (answers: readonly HeldAnswer[]) => answers.map((answer) => answer.kind).sort();
+    await page.goto(list);
+    await expect.poll(() => rail.getByRole('button', { name: /failed/ }).count(), { timeout: 30_000 }).toBe(1);
+    gate.held.length = 0;
+    gate.hold('head');
+    await rail.getByRole('button', { name: /failed/ }).click();
+    await expect.poll(() => kinds(gate.held)).toEqual(['cards', 'sql']);
+    await expect.poll(() => rows.count()).toBe(1);
+    await rail.getByRole('button', { name: /completed/ }).click();
+    await expect.poll(() => gate.held.length).toBe(4);
+    expect(kinds(gate.held.slice(2))).toEqual(['cards', 'sql']);
+    await expect.poll(() => Promise.all(gate.held.slice(0, 2).map(outcome))).toEqual(['abandoned', 'abandoned']);
+    await page.getByRole('navigation', { name: 'Destinations' }).getByRole('link', { name: 'Observe' }).click();
+    await page.waitForURL(/\/observe/);
+    await expect.poll(() => Promise.all(gate.held.slice(2, 4).map(outcome))).toEqual(['abandoned', 'abandoned']);
+    gate.hold(false);
+    for (const answer of gate.held) answer.release();
 
     // Live waits for its support before its next refresh, and stops when paused or left.
     await liveWaitsForSupport(browser, page, gate, `${list}?live=1`, 'verify');

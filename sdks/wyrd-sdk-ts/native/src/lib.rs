@@ -313,6 +313,66 @@ pub struct NativeTableConfigResult {
     pub error: Option<NativeWyrdError>,
 }
 
+/// The native side of a JavaScript `AbortSignal`: the SDK aborts it when the
+/// caller's signal aborts, and each native call given it stops waiting.
+///
+/// A call stopped this way drops its pending Rust future, which drops its
+/// in-flight HTTP request, so the server sees the request closed instead of
+/// running work nobody will read.
+#[napi]
+pub struct NativeAbort {
+    aborted: tokio::sync::watch::Sender<bool>,
+}
+
+#[napi]
+impl NativeAbort {
+    /// A signal not yet aborted.
+    #[napi(constructor)]
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            aborted: tokio::sync::watch::channel(false).0,
+        }
+    }
+
+    /// Abort every call given this signal; aborting again does nothing more.
+    #[napi]
+    pub fn abort(&self) {
+        self.aborted.send_replace(true);
+    }
+}
+
+impl Default for NativeAbort {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NativeAbort {
+    /// What a call watches: `abort`'s state, or nothing when the caller gave none.
+    pub(crate) fn watch(abort: Option<&NativeAbort>) -> AbortWatch {
+        AbortWatch(abort.map(|abort| abort.aborted.subscribe()))
+    }
+}
+
+/// The receiving end of one [`NativeAbort`], moved into a native call's future.
+pub(crate) struct AbortWatch(Option<tokio::sync::watch::Receiver<bool>>);
+
+impl AbortWatch {
+    /// Run `work` to completion, or drop it and answer `None` once aborted.
+    pub(crate) async fn or_run<T>(self, work: impl std::future::Future<Output = T>) -> Option<T> {
+        let Some(mut aborted) = self.0 else {
+            return Some(work.await);
+        };
+        tokio::select! {
+            biased;
+            // A dropped sender never aborts; only an explicit abort stops the work.
+            Ok(_) = aborted.wait_for(|aborted| *aborted) => None,
+            done = work => Some(done),
+        }
+    }
+}
+
 /// Structured result of starting a native terminal-safe query.
 #[napi]
 pub struct NativeQueryStart {
@@ -973,6 +1033,9 @@ impl NativeBifrost {
     /// returned in [`NativeQueryStart`] so JavaScript never has to parse an
     /// exception message to recover the public Wyrd error contract.
     ///
+    /// Aborting `abort` before the response arrives drops the pending request,
+    /// so the server sees it closed, and resolves `null`.
+    ///
     /// # Errors
     ///
     /// Returns a napi error only when napi cannot project the structured
@@ -982,9 +1045,11 @@ impl NativeBifrost {
         &self,
         env: &'env Env,
         request: NativeQueryRequest,
-    ) -> napi::Result<PromiseRaw<'env, NativeQueryStart>> {
+        abort: Option<&NativeAbort>,
+    ) -> napi::Result<PromiseRaw<'env, Option<NativeQueryStart>>> {
         let client = self.client.clone();
-        crate::trace::spawn(env, async move {
+        let aborted = NativeAbort::watch(abort);
+        let start = async move {
             let params = request
                 .params
                 .unwrap_or_default()
@@ -994,21 +1059,22 @@ impl NativeBifrost {
                 .collect::<StdResult<Vec<_>, _>>();
             let params = match params {
                 Ok(params) => params,
-                Err(error) => return Ok(NativeQueryStart::failure(&error)),
+                Err(error) => return NativeQueryStart::failure(&error),
             };
             let request = BifrostQueryRequest {
                 params,
                 sql: request.sql,
                 deadline_ms: match request.deadline_ms.map(parse_deadline_ms).transpose() {
                     Ok(deadline_ms) => deadline_ms,
-                    Err(error) => return Ok(NativeQueryStart::failure(&error)),
+                    Err(error) => return NativeQueryStart::failure(&error),
                 },
             };
-            Ok(match client.query(&request).await {
+            match client.query(&request).await {
                 Ok(stream) => NativeQueryStart::success(stream),
                 Err(error) => NativeQueryStart::failure(&error),
-            })
-        })
+            }
+        };
+        crate::trace::spawn(env, async move { Ok(aborted.or_run(start).await) })
     }
 
     /// Lists active queries for the authenticated tenant.

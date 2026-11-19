@@ -128,6 +128,7 @@ import type {
 } from "./card-types.js";
 
 import type {
+  NativeAbort,
   NativeBifrostQueryStream,
   NativeLifecycleResult,
   NativeQueryStep,
@@ -476,6 +477,32 @@ function nativeHandle<T>(value: T | null | undefined, error: NativeErrorMetadata
     );
   }
   return value;
+}
+
+/**
+ * Run one native call `signal` may stop. Aborted while the call is pending,
+ * the native side drops its request, so the server sees it closed, and this
+ * throws the signal's reason. An answer that arrived first is returned; the
+ * caller owns closing it.
+ */
+async function abortable<T>(
+  signal: AbortSignal | undefined,
+  call: (abort?: NativeAbort) => Promise<T | null | undefined>,
+): Promise<T> {
+  signal?.throwIfAborted();
+  const abort = signal && new nativeBinding.NativeAbort();
+  const stop = () => abort?.abort();
+  signal?.addEventListener("abort", stop, { once: true });
+  try {
+    const answer = await call(abort);
+    // Native answers nothing only for a call its abort stopped.
+    if (answer === null || answer === undefined) {
+      throw signal?.reason;
+    }
+    return answer;
+  } finally {
+    signal?.removeEventListener("abort", stop);
+  }
 }
 
 function runningQuery(wire: RunningQuerySummary): RunningQuery {
@@ -1392,33 +1419,41 @@ export class Bifrost {
    * @param query - One SELECT statement.
    * @param params - Values bound to `$1..$n`, in order.
    * @param options - `deadlineMs`, the query deadline from 1 to 4294967295
-   * milliseconds; omitted, the server's default deadline applies.
+   * milliseconds; omitted, the server's default deadline applies. `signal`
+   * stops a query still starting by closing its request. Once the stream is
+   * returned, close it with `return()`.
    * @returns The running stream.
    * @throws {@link WyrdError} for an invalid request, a refused or
    * unauthorized query, or a transport failure when the query starts; later
-   * failures throw during iteration.
+   * failures throw during iteration. The signal's reason once it aborts
+   * before the stream starts.
    */
   async stream(
     query: string,
     params?: readonly QueryParam[],
-    options: { readonly deadlineMs?: number } = {},
+    options: { readonly deadlineMs?: number; readonly signal?: AbortSignal } = {},
   ): Promise<BifrostQueryStream> {
-    const start = await this.#native.query({
-      sql: query,
-      deadlineMs: options.deadlineMs,
-      params: params?.map((value) => {
-        switch (typeof value) {
-          case "boolean":
-            return { kind: "boolean", bool: value };
-          case "number":
-            return { kind: "number", number: value };
-          case "string":
-            return { kind: "string", string: value };
-          default:
-            return { kind: value === null ? "null" : typeof value };
-        }
-      }),
-    });
+    const start = await abortable(options.signal, (abort) =>
+      this.#native.query(
+        {
+          sql: query,
+          deadlineMs: options.deadlineMs,
+          params: params?.map((value) => {
+            switch (typeof value) {
+              case "boolean":
+                return { kind: "boolean", bool: value };
+              case "number":
+                return { kind: "number", number: value };
+              case "string":
+                return { kind: "string", string: value };
+              default:
+                return { kind: value === null ? "null" : typeof value };
+            }
+          }),
+        },
+        abort,
+      ),
+    );
     const error = projectedError(start);
     if (error !== undefined) {
       throw error;
@@ -1921,12 +1956,19 @@ export class Cards {
    * List metadata-only Card summaries.
    *
    * @param request - Optional filters, page size, and cursor.
+   * @param options - `signal` stops the list while its page is still
+   * pending by closing its request.
    * @returns One page of summaries and the next page's cursor.
    * @throws {@link WyrdError} for a malformed filter or a transport or
-   * authorization failure.
+   * authorization failure; the signal's reason once it aborts first.
    */
-  async list(request: ListCardsRequest = {}): Promise<ListCardsResponse> {
-    return lifecycleValue<ListCardsResponse>(await this.#native.list(JSON.stringify(request)));
+  async list(
+    request: ListCardsRequest = {},
+    options: { readonly signal?: AbortSignal } = {},
+  ): Promise<ListCardsResponse> {
+    return lifecycleValue<ListCardsResponse>(
+      await abortable(options.signal, (abort) => this.#native.list(JSON.stringify(request), abort)),
+    );
   }
 
   /**

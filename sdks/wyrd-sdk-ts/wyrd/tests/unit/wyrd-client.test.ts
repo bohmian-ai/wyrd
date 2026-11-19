@@ -86,14 +86,14 @@ test("state httpAuth carries its own service, run, and environment", async () =>
   });
   context.setGlobalContextManager(new StorageContextManager());
   try {
-    const configured = async (environment: string): Promise<WyrdState> => {
+    const configured = (environment: string): WyrdState => {
       const state = WyrdState.fromPath(BUNDLE, {
         client: WyrdClient.connect({ serverUrl: "http://127.0.0.1:9", credential: "access-token-1" }),
       });
-      await state.configure({ deploymentEnvironment: environment, telemetry: false });
+      state.configure({ deploymentEnvironment: environment });
       return state;
     };
-    const [prod, staging] = [await configured("prod"), await configured("staging")];
+    const [prod, staging] = [configured("prod"), configured("staging")];
     const service = prod.rootRef.uid ?? "";
     const agent = prod.cardRef("agent_triage").uid ?? "";
     const [prodFetch, stagingFetch] = [prod.httpAuth, staging.httpAuth];

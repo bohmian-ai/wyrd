@@ -1,6 +1,5 @@
 <script lang="ts">
   import { getEntry } from '$lib/content';
-  import PageHead from '$lib/components/PageHead.svelte';
   import type { PageData } from './$types';
 
   let { data }: { data: PageData } = $props();
@@ -21,13 +20,12 @@
   );
 </script>
 
-<PageHead
-  title={data.metadata.browserTitle ?? `${data.metadata.title} | Wyrd`}
-  description={data.metadata.description}
-  path={data.slug ? `/${data.slug}/` : '/'}
-  type="article"
-  updated={data.metadata.updated}
-/>
+<svelte:head>
+  <title>{data.metadata.title} — Wyrd docs</title>
+  {#if data.metadata.description}
+    <meta name="description" content={data.metadata.description} />
+  {/if}
+</svelte:head>
 
 <!-- Archetype (article | hub | reference) is a styling/indexing hook only. -->
 <article class="prose" data-archetype={data.archetype} data-pagefind-body>

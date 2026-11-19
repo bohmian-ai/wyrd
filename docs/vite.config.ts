@@ -2,7 +2,6 @@ import tailwindcss from '@tailwindcss/vite';
 import { sveltekit } from '@sveltejs/kit/vite';
 import { defineConfig } from 'vitest/config';
 import { readFileSync } from 'node:fs';
-import { BASE, ORIGIN } from './site.js';
 
 // The released Wyrd version, read from `[workspace.package]` in the root
 // Cargo.toml that every crate and SDK version follows, so the header never
@@ -16,7 +15,7 @@ function wyrdVersion(): string {
 
 export default defineConfig({
   plugins: [tailwindcss(), sveltekit()],
-  define: { __WYRD_VERSION__: JSON.stringify(wyrdVersion()), __WYRD_SITE__: JSON.stringify(`${ORIGIN}${BASE}`) },
+  define: { __WYRD_VERSION__: JSON.stringify(wyrdVersion()) },
   test: {
     include: ['src/**/*.test.ts']
   }

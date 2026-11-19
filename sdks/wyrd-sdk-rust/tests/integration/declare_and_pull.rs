@@ -153,7 +153,7 @@ async fn service_graph_declares_and_pulls() {
 }
 
 /// The docsite Quickstart's Service file, which references its Verifier file.
-const QUICKSTART: &str = "../examples/setup-check/support-reply.yaml";
+const QUICKSTART: &str = "../examples/quickstart/support-reply.yaml";
 
 /// Declare `path` as `client` with the state kept private.
 ///

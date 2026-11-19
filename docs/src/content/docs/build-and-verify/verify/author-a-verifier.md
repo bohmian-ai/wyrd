@@ -17,7 +17,7 @@ A Verifier names the evidence it takes and what must be true of it. This one fai
 
 <CodeFromFile file="examples/support-desk-app/service/no-refund-promise.yaml" lang="yaml" title="service/no-refund-promise.yaml" />
 
-An assertion runs no model, so the same evidence always gets the same verdict. Every field is listed in the [Verifier Card reference](/reference/verifier-card/).
+An assertion runs no model, so its verdict is deterministic and returns in milliseconds. Every field is listed in the [Verifier Card reference](/reference/verifier-card/).
 
 ## 2. Bind it and check it
 
@@ -120,7 +120,7 @@ Some rules need judgment. `follows-policy` asks a model whether a refund decisio
 
 The judge calls its model through your server's [LLM gateway](/connect/set-up-the-llm-gateway/), on the deployment named in `execution_route`. Its Prompt sets `response_format: verdict`, so the model answers with an outcome, a reason, and citations. Declaring a Verifier whose check Agent has no verdict format fails. Bind `follows-policy` beside `ticket-complete` on the agent.
 
-A model call adds its response time to the request, so when the decision can wait, submit the letter and collect the verdict later:
+A model call takes seconds, so submit the letter and collect the verdict later instead of waiting in the request:
 
 ```python
 from wyrd import verify
@@ -142,4 +142,4 @@ print(result.verdict)  # passed
 
 ## Next
 
-Copy a check for your own case from [Recipes](/build-and-verify/verify/verifier-recipes/). Before you rely on a model judge, test it as in [Write verifiable requirements](/build-and-verify/declare/write-verifiable-requirements/#3-choose-checks-and-test-judges).
+Copy a check for your own case from [Recipes](/build-and-verify/verify/verifier-recipes/).

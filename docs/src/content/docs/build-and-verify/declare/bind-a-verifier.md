@@ -1,6 +1,5 @@
 ---
 title: Bindings
-browserTitle: Bind a Verifier to a Service | Wyrd
 description: Attach a Verifier to a Service or one of its components with verified_by, and choose whether your code or a schedule runs it.
 pillar: wyrd
 section: Build and verify
@@ -10,7 +9,7 @@ order: 2
 
 Attach each Verifier to what it checks, and choose who runs it: your code, or a schedule.
 
-This page uses the `support-desk` Service from [Services](/build-and-verify/declare/define-a-service/). The Verifiers it binds are written in [Write a Verifier](/build-and-verify/verify/author-a-verifier/). To bind Verifiers in Python, Rust, or TypeScript instead of YAML, see [Author in code](/build-and-verify/declare/author-in-code/).
+This page uses the `support-desk` Service from [Services](/build-and-verify/declare/define-a-service/). The Verifiers it binds are written in [Write a Verifier](/build-and-verify/verify/author-a-verifier/).
 
 ## 1. Bind Verifiers your code calls
 

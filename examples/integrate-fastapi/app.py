@@ -1,6 +1,6 @@
 """A FastAPI app that verifies each support answer it receives under its own Run.
 
-It serves the setup check's ``support-reply`` Service, pulled once at deploy time:
+It serves the Quickstart's ``support-reply`` Service, pulled once at deploy time:
 
     wyrd pull --kind Service --name support-reply --version 1.0.0 \
       --output-dir .wyrd-bundle

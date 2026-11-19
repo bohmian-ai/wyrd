@@ -1,6 +1,5 @@
 ---
 title: Troubleshooting
-browserTitle: Troubleshoot a Wyrd deployment | Wyrd
 description: Find the cause of a Wyrd server that refuses to migrate or start, from the message it prints.
 pillar: wyrd
 section: Operate

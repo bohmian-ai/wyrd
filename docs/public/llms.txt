@@ -1,13 +1,13 @@
 # Wyrd
 
-> Wyrd is the only real-time verification system built for your applications. Before an application acts, it asks Wyrd whether the action meets the requirements you declare; Wyrd returns a verdict for each, with a reason and the exact versions it judged, and the application decides. Open source: Declare. Observe. Verify.
+> Wyrd is open-source AI assurance and verification infrastructure. Verify AI systems before and after release, with verdicts you can trace, reproduce, and audit.
 
 ## Start here
 
 Set up a local server, run one verification, then choose what to build, in this order. A connected Wyrd MCP server teaches the same route through `wyrd.guide {"topic":"start"}`.
 
-- [Set up Wyrd](/wyrd/get-started/setup/): install Wyrd, start a local server you keep running, and check it with a verification that needs no model.
-- [Run your first verification](/wyrd/get-started/quickstart/): verify each proposed finance report release against three requirements, one judged by a model reading a policy PDF, and release only a passed one, from Python, Rust, or TypeScript.
+- [Set up Wyrd](/wyrd/get-started/setup/): install Wyrd and start a local server you keep running.
+- [Run your first verification](/wyrd/get-started/quickstart/): declare a Verifier in YAML and verify a passing and a failing support answer from Python, Rust, or TypeScript.
 - [What can I build?](/wyrd/get-started/what-can-i-build/): example workflows built from the primitives, not a complete list: policy documents, agent evaluation, long-running workflows, runtime checks, observability, or drift.
 
 ## Home
@@ -16,27 +16,20 @@ Set up a local server, run one verification, then choose what to build, in this 
 
 ## Get started
 
-- [What Wyrd does](/wyrd/get-started/introduction/): The only real-time verification system built for your applications. Your application asks Wyrd whether an action meets your requirements, and acts on the verdict.
-- [Set up Wyrd](/wyrd/get-started/setup/): Install the Wyrd 0.4.2 CLI and SDK for Python, Rust, or TypeScript, start a local server with your coding agent or by hand, and check it with a verification that needs no model.
-- [Run your first verification](/wyrd/get-started/quickstart/): Verify a finance report against three requirements, including a model that reads a sharing policy PDF, in one call, and release it only when the verdict passes. Python, Rust, or TypeScript.
+- [What Wyrd does](/wyrd/get-started/introduction/): Wyrd verifies what your AI system does against the requirements you declare, and records which versions produced each result.
+- [Set up Wyrd](/wyrd/get-started/setup/): Install the Wyrd 0.4.1 CLI and SDK for Python, Rust, or TypeScript, then let your coding agent start a local server and run a first verification, or do it by hand.
+- [Run your first verification](/wyrd/get-started/quickstart/): Declare a Verifier and the Service it checks in two YAML files, then verify a passing and a failing support answer from one Python, Rust, or TypeScript program.
 - [What can I build?](/wyrd/get-started/what-can-i-build/): Example verification workflows built from Wyrd's primitives - policy documents, agent evaluation, long-running workflows, runtime checks, observability, and drift.
 - [Use with your coding agent](/wyrd/get-started/use-with-your-coding-agent/): Give your coding agent the Wyrd docs through llms.txt and Wyrd's tools through MCP with wyrd mcp install.
 
 ## Build and verify
 
-- [Write verifiable requirements](/wyrd/build-and-verify/declare/write-verifiable-requirements/): Turn a vague goal such as "the agent should be reliable" into scoped requirements with named evidence, a suitable check, tested model judges, and versioned changes.
 - [Services](/wyrd/build-and-verify/declare/define-a-service/): Declare a Service from YAML files, with its components and a table for the rows it records, then read back the exact versions the server stored.
 - [Bindings](/wyrd/build-and-verify/declare/bind-a-verifier/): Attach a Verifier to a Service or one of its components with verified_by, and choose whether your code or a schedule runs it.
 - [Author in code](/wyrd/build-and-verify/declare/author-in-code/): Build a Service, its Agent and Prompt, and a Verifier in Python, Rust, or TypeScript, declare them without versions, verify two answers, and read back the rows each Run wrote.
 - [Runs and observations](/wyrd/build-and-verify/observe/record-a-run-and-observations/): Wrap each request in a Run, call your model through the gateway, record what happened, verify it, and read the whole Run back.
-- [Establish sufficient evidence](/wyrd/build-and-verify/observe/establish-sufficient-evidence/): Give each requirement evidence from its source, with citations, exact versions, and complete inputs, and tell missing evidence apart from a failure.
 - [Write a Verifier](/wyrd/build-and-verify/verify/author-a-verifier/): Write a Verifier, bind it to your Service, call it from your code, and read its verdict, then add a Python check and a model judge.
 - [Recipes](/wyrd/build-and-verify/verify/verifier-recipes/): Copyable Verifiers for common checks, each with its YAML and the Python that calls it - assertions, traces, Python checks, model judges, multi-step, uploaded files, grouped sessions, and drift.
-- [Verify during a request](/wyrd/build-and-verify/verify/verify-a-request-in-real-time/): Call the Quickstart's release check from a web API, send a report only after its verdict passes, and hold every other outcome with the reason.
-- [Verify an agent's workflow](/wyrd/build-and-verify/verify/verify-an-agent-workflow/): Catch an agent that skipped a required step even though its answer looks right, by checking the trace of the work behind the answer.
-- [Investigate a failed verification](/wyrd/build-and-verify/verify/run-a-verification-and-inspect-its-evidence/): Find a stored failed result, read which requirement failed, the evidence it judged, and the exact Verifier and subject versions, without rerunning any check.
-- [Check on a schedule](/wyrd/build-and-verify/verify/monitor-drift/): Have the Wyrd server judge a Service's recorded samples every minute, then read which windows passed, failed, or had no evidence.
-- [Act on verdicts in production](/wyrd/build-and-verify/verify/act-on-verdicts-in-production/): Handle passed, failed, inconclusive, errors, and timeouts explicitly, decide what model providers may see, and measure latency and cost for the Verifier you deploy.
 
 ## Connect
 
@@ -54,15 +47,12 @@ Set up a local server, run one verification, then choose what to build, in this 
 
 ## Understand
 
-- [Foundations of verification](/wyrd/understand/foundations-of-verification/): What AI verification establishes, how it differs from evaluation, testing, and formal proof, and how to check outputs that have no single right answer.
-- [Real-time verification](/wyrd/understand/real-time-verification/): Real-time verification for AI applications: checking an action before it happens, deadlines, evidence and check time, uncertain results, and when to check later.
-- [How verification works in Wyrd](/wyrd/understand/how-verification-works/): How Wyrd verifies an action against declared requirements: Verifiers, bindings, evidence, verify, submit, and schedules, where the time goes, and what is kept.
+- [Architecture](/wyrd/understand/architecture/): What a team deployment of Wyrd runs, what it connects to, and why each part is separate.
+- [How verification works](/wyrd/understand/how-verification-works/): Inputs, steps, requirements, and decide; Agent workspaces; verify versus submit; executions, verdicts, results, and Operators.
 - [Runs and evidence](/wyrd/understand/runs-observations-and-evidence/): How Wyrd records what a declared service actually does, and ties each observation to the version that ran.
 - [Cards and versions](/wyrd/understand/cards-versions-and-relationships/): A Service declaration is a set of versioned Cards, each one a declared component of an AI system.
 - [Bifrost](/wyrd/understand/bifrost/): Wyrd's analytical warehouse, the two ways to write to it, and when a written row becomes queryable.
 - [Identity and access](/wyrd/understand/identity-and-authorization/): Every call to Wyrd is made as an account whose roles decide what it may do; a running Service also names its exact release, from its bundle.
-- [Architecture](/wyrd/understand/architecture/): What a team deployment of Wyrd runs, what it connects to, and why each part is separate.
-- [Technical questions](/wyrd/understand/technical-questions/): Direct answers on real-time verification: who enforces a verdict, missing evidence, timeouts, model providers, sensitive data, versions, and self-hosting.
 
 ## Reference
 

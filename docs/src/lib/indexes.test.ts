@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { allSlugs, getEntry } from './content.js';
 import { buildNav } from './derived-nav.js';
 
@@ -52,7 +52,7 @@ describe('machine-readable indexes follow published pages', () => {
     const pages = [...full.matchAll(/^Page: \/wyrd(\/[^\s]*)$/gm)].map((m) => m[1]);
     expect(pages).toEqual(sidebar.flatMap((group) => group.items.map((item) => item.path)));
     expect(full).toContain('state = WyrdState.declare("support-reply.yaml")');
-    expect(full).toContain('```yaml title="support-reply.yaml"\n# The subject: your support app\'s Service, verified by no-refund-promise.\napiVersion: wyrd/v1\nkind: Service');
+    expect(full).toContain('```yaml title="support-reply.yaml"\n# The subject: your support agent\'s Service, verified by no-refund-promise.\napiVersion: wyrd/v1\nkind: Service');
     expect(full).not.toMatch(/<\/?(CodeFromFile|LangTabs?|Tabs?|Aside)\b|ANCHOR(_END)?:/);
   });
 });
@@ -137,49 +137,5 @@ describe('publication closure', () => {
       'guide/leaks.md:5: link to unpublished page `/guide/held/`',
       'guide/leaks.md:5: link to unpublished page `/wyrd/guide/held-too/`'
     ]);
-  });
-});
-
-describe('sitemap', () => {
-  it('positioning discovery excludes drafts and lists published pages', async () => {
-    // Load the content map and sitemap as a production build does: no drafts.
-    vi.stubEnv('DEV', false);
-    vi.resetModules();
-    const { GET } = await import('../routes/sitemap.xml/+server');
-    const content = await import('./content.js');
-    vi.unstubAllEnvs();
-
-    const response = await GET({} as never);
-    expect(response.headers.get('content-type')).toContain('application/xml');
-    const xml = await response.text();
-    const SITE = 'https://docs.bohmian.ai/wyrd';
-    const locs = [...xml.matchAll(/<loc>([^<]+)<\/loc>/g)].map((m) => m[1]);
-
-    // Exactly the production routes, each once, as absolute URLs on the production site.
-    const published = ['/', ...content.allSlugs().filter(Boolean).map((slug) => `/${slug}/`)];
-    expect(locs).toEqual(published.map((p) => `${SITE}${p}`));
-    expect(new Set(locs).size).toBe(locs.length);
-    for (const draft of ['build-and-verify/observe/write-and-query-custom-data-with-bifrost', 'connect/call-wyrd-from-a-stock-client'])
-      expect(locs).not.toContain(`${SITE}/${draft}/`);
-    for (const page of [
-      '/',
-      '/get-started/quickstart/',
-      '/understand/foundations-of-verification/',
-      '/understand/real-time-verification/',
-      '/understand/how-verification-works/',
-      '/understand/technical-questions/',
-      '/build-and-verify/verify/verify-an-agent-workflow/'
-    ])
-      expect(locs).toContain(`${SITE}${page}`);
-
-    // The compact agent index advertises the same published pages.
-    const advertised = indexPaths(read('llms.txt')).filter((p) => !publicFile(p));
-    expect(advertised.filter((p) => !locs.includes(`${SITE}${p}`))).toEqual([]);
-
-    // A page's lastmod is its commit date, never an invented one.
-    const dated = content.allSlugs().filter((slug) => slug && content.getEntry(slug)!.metadata.updated);
-    expect(dated.length).toBeGreaterThan(0);
-    for (const slug of dated)
-      expect(xml).toContain(`<loc>${SITE}/${slug}/</loc><lastmod>${content.getEntry(slug)!.metadata.updated}</lastmod>`);
   });
 });

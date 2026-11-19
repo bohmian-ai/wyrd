@@ -41,7 +41,6 @@ from wyrd.verify import (
     Service,
     Step,
     Table,
-    Trace,
     Trigger,
     Verifier,
 )
@@ -260,21 +259,6 @@ def test_pydantic_models_supply_input_schemas() -> None:
     assert "text" in inputs["report"]["schema"]["required"]
     assert "notes" not in inputs["report"]["schema"]["required"], "omission follows the model"
     assert {"type": "null"} in inputs["report"]["schema"]["properties"]["notes"]["anyOf"]
-
-
-class RefundReply(BaseModel):
-    reply: str
-    trace: Trace
-
-
-def test_trace_fields_declare_trace_slots() -> None:
-    modelled = Verifier("refund-workflow", "1.0.0", inputs=RefundReply).spec()["inputs"]
-    assert modelled["trace"] == {"type": "trace"}
-    assert modelled["reply"] == {"type": "json", "schema": {"title": "Reply", "type": "string"}}
-    mapped = Verifier("refund-workflow", "1.0.0", inputs={"trace": Trace}).spec()["inputs"]
-    assert mapped["trace"] == {"type": "trace"}
-    supplied = RefundReply(reply="Order 1042", trace=Trace("0af7651916cd43dd"))
-    assert supplied.model_dump() == {"reply": "Order 1042", "trace": "0af7651916cd43dd"}
 
 
 class Reply(BaseModel):

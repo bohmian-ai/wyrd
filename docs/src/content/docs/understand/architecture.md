@@ -3,7 +3,7 @@ title: Architecture
 description: What a team deployment of Wyrd runs, what it connects to, and why each part is separate.
 pillar: wyrd
 section: Understand
-order: 8
+order: 1
 ---
 
 A Wyrd deployment is one server binary, run as one pod or as several pods with different roles, behind one endpoint you own. It stores everything durable in Postgres and object storage, so pods can be replaced, scaled, or split by role without moving data.
@@ -32,4 +32,4 @@ The server calls model providers with keys you configure, for model-judged check
 
 ## Next
 
-[How verification works in Wyrd](/understand/how-verification-works/) follows one check through the server. [Bifrost](/understand/bifrost/) covers the data plane.
+[How verification works](/understand/how-verification-works/) follows one check through the server. [Bifrost](/understand/bifrost/) covers the data plane.

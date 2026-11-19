@@ -68,17 +68,17 @@ write a machine-specific path into a project file.
        - verifier: ./no-refund-promise.yaml
    ```
 
-   Write the program for the chosen language from the "Check it end to end"
-   step of the "Set up Wyrd" page of the Wyrd documentation for this release
-   (`get-started/setup/` in `llms-full.txt`): `check.py` for Python,
-   `src/main.rs` for Rust, or `check.ts` for TypeScript. It
+   Write the program for the chosen language from the "Run your first
+   verification" page of the Wyrd documentation for this release
+   (`get-started/quickstart/` in `llms-full.txt`): `quickstart.py` for
+   Python, `src/main.rs` for Rust, or `quickstart.ts` for TypeScript. It
    declares the Service with `WyrdState.declare("support-reply.yaml")`, opens
    one Run, and verifies two answers with
    `run.observe.verify("no-refund-promise", ...)`. It needs no model or
    provider key.
 
 5. Run it from the directory holding both YAML files, with the project's own
-   tool: `uv run check.py`, `cargo run`, or `node check.ts`. It
+   tool: `uv run quickstart.py`, `cargo run`, or `node quickstart.ts`. It
    prints one `passed` and one `failed` verdict, each naming its subject as
    `Service/support-reply@1.0.0#<uid>`. A `failed` verdict is a
    result, not an error.
@@ -89,7 +89,7 @@ write a machine-specific path into a project file.
    `bifrost.query` with this SQL, replacing `<uid>`:
 
    ```sql
-   SELECT result_id, execution_id, run_id, subject_card_uid, verifier_card_uid, verdict FROM bifrost.verification.results WHERE subject_card_uid = '<uid>' ORDER BY ended_at DESC LIMIT 20
+   SELECT result_id, run_id, subject_card_uid, verdict FROM bifrost.verification.results WHERE subject_card_uid = '<uid>' ORDER BY ended_at DESC LIMIT 20
    ```
 
    Rows become queryable shortly after the server publishes them; repeat the

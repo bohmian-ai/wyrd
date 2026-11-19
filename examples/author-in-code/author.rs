@@ -66,6 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("service: {}", state.root_ref());
     println!("agent:   {}", state.card_ref("agent")?);
 
+    state.start_bifrost().await?; // the writer; the one declared table is active
     for answer in [
         "Your refund request is approved.",
         "You have a guaranteed refund.",

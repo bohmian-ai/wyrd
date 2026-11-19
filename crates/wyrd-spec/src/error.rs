@@ -1433,7 +1433,7 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// Wyrd's managed telemetry setup found a process-global tracer, meter, or logger
+    /// `start_telemetry` found a process-global tracer, meter, or logger
     /// provider Wyrd did not install for this state: the application's own,
     /// or one bound to another state's configured Service.
     ///
@@ -1445,7 +1445,7 @@ pub enum WyrdError {
         code = "WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS",
         status = 409,
         title = "An OpenTelemetry provider is already installed",
-        remediation = "Turn off Wyrd's managed telemetry setup and add each state's Wyrd span, log, and metric exporters to the application's own providers."
+        remediation = "Add each state's Wyrd span, log, and metric exporters to the application's own providers instead of calling start_telemetry."
     )]
     SdkTelemetryProviderExists {
         /// Human-readable error message.
@@ -1503,6 +1503,20 @@ pub enum WyrdError {
         remediation = "Check the OpenTelemetry exporter's logs and the state's credentials, then retry flush or shutdown."
     )]
     SdkTelemetryFlushFailed {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// An observation was attempted before `start_bifrost` connected a writer.
+    #[error("[WYRD_SDK_400_BIFROST_NOT_STARTED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SDK_400_BIFROST_NOT_STARTED",
+        status = 400,
+        title = "WyrdState Bifrost writer is not started",
+        remediation = "Call start_bifrost on the state before opening a run and emitting observations."
+    )]
+    SdkBifrostNotStarted {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
@@ -3955,6 +3969,7 @@ impl WyrdError {
             | Self::SdkStateConfigFrozen { message, details }
             | Self::SdkTelemetryFlushTimeout { message, details }
             | Self::SdkTelemetryFlushFailed { message, details }
+            | Self::SdkBifrostNotStarted { message, details }
             | Self::SdkBifrostClosed { message, details }
             | Self::SdkInvalidObservation { message, details }
             | Self::SdkCardKindMismatch { message, details }

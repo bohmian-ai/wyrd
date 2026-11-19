@@ -39,25 +39,3 @@ onboarding rows; TASK-003 completes the rest.
 | `api/openapi.md` | Retain | Accurate entry to the served contract | `router.rs` serves `GET /openapi.json` from the mounted registrations | Published |
 
 Pending REQ-008 (TASK-006): the editor role still grants `policy:lock`; retained pages no longer enumerate Card kinds or permissions.
-
-## Handoff to SPEC-positioning
-
-Approval of SPEC-positioning transfers these pages and surfaces
-from this packet. Rows above stay as the record of this packet's earlier work;
-SPEC-positioning owns the next change to each.
-
-| Surface | New owner | State after positioning TASK-001 |
-| --- | --- | --- |
-| `README.md`, homepage (`docs/src/routes/+page.*`), package introductions | positioning TASK-001 | Lead with the real-time verification claim and the finance release example |
-| `get-started/introduction.md` | positioning TASK-001 | Rewritten around the finance release example |
-| `get-started/setup.md` | positioning TASK-001 | Ends with the model-free setup check (`examples/setup-check`) |
-| `get-started/quickstart.md` | positioning TASK-001 | Replaced by `examples/finance-release`; published |
-| Verification education and FAQ pages | positioning TASK-002 | Published: `understand/foundations-of-verification`, `understand/real-time-verification`, `understand/technical-questions`, and practice guides `declare/write-verifiable-requirements`, `observe/establish-sufficient-evidence`, `verify/act-on-verdicts-in-production`; `how-verification-works`, `author-a-verifier`, `verifier-recipes` retained with links and claim repairs. Dispositions in positioning TASK-002 |
-| Tutorial drafts this packet listed | positioning TASK-003 | Published, Python, Rust and TypeScript: `verify/verify-a-request-in-real-time` (request decision), new `verify/verify-an-agent-workflow` (skipped action), `verify/monitor-drift` rewritten as "Check on a schedule" (drift-method and baseline material moved to `reference/verifier-card#checks`), `verify/run-a-verification-and-inspect-its-evidence` rewritten as "Investigate a failed verification". `verify/respond-to-a-failed-verification` stays a draft owned here, its broken link repaired. Dispositions in positioning TASK-003 |
-| Shared metadata, semantic rendering, sitemap | positioning TASK-004 | Not started |
-
-This packet keeps everything else: the remaining Build and verify, Connect,
-Operate, Understand and Reference rows, publication evidence, draft exclusion,
-accessibility, brand, diagram and guide-writing obligations. The transfer
-adopts none of this packet's proposed Card-kind, SDK-runtime or migration
-changes.

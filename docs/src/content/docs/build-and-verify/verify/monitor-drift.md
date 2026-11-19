@@ -1,220 +1,278 @@
 ---
-title: Check on a schedule
-browserTitle: Continuous verification on a schedule | Wyrd
-description: Have the Wyrd server judge a Service's recorded samples every minute, then read which windows passed, failed, or had no evidence.
+title: Drift
+description: Compare the inputs your service sees with a healthy baseline on a schedule, and get paged when they shift.
 pillar: wyrd
 section: Build and verify
 topic: Verify
 order: 4
+draft: true
 ---
 
-Have the server check a checkout Service's latency on a schedule, with no call from your application.
+A drift Verifier compares what a component sees in production with a baseline you declare once. Your service records samples with `submit`; a `schedule` Trigger judges each window and runs your Operators when a feature shifts. Drift is never judged in real time. This guide checks a churn model's inputs against last quarter's healthy data every hour.
 
-The application only records samples. A `schedule` Trigger tells the server when to judge them: each run judges the samples recorded since the previous one, called a window.
+## Prerequisites
 
-## Before you start
+- A declared Model Card, here `churn-classifier@1.4.2` ([declare one from code](/understand/cards-versions-and-relationships/#declare-cards-from-code)), and `editor` to declare Cards.
+- A running service that loads its bundle, as in [Record a run and observations](/build-and-verify/observe/record-a-run-and-observations/).
+- A sample of healthy inputs, with the same column names your service will record.
 
-Finish [Set up Wyrd](/get-started/setup/). Work in its `quickstart` directory with the server running.
+## 1. Declare the baseline
 
-## 1. Declare the check
+The baseline is a Data Card. From Python, declare a DataFrame of healthy inputs:
 
-Save three Cards: the `checkout` Service, the `latency-budget` Verifier it is checked by, and the `every-minute` Trigger that runs it.
+```python
+import pandas as pd
+from wyrd.cards import Cards
+from wyrd.data import DataCard, PandasInterface
 
-<CodeFromFile file="examples/scheduled-check/checkout/checkout.yaml" lang="yaml" title="checkout/checkout.yaml" />
+healthy = pd.read_parquet("churn_inputs_2026q2.parquet")[["tenure_months", "monthly_spend"]]
+baseline = DataCard(
+    PandasInterface(data=healthy),
+    space="default",
+    name="churn-baseline",
+    version="1.0.0",
+)
+Cards().data.declare(baseline)
+```
 
-<CodeFromFile file="examples/scheduled-check/checkout/latency-budget.yaml" lang="yaml" title="checkout/latency-budget.yaml" />
+Registration uploads the data and records its schema and statistics. Keep the columns to the features you will score: every feature the Verifier names must be a column here.
 
-<CodeFromFile file="examples/scheduled-check/checkout/every-minute.yaml" lang="yaml" title="checkout/every-minute.yaml" />
+## 2. Write the Verifier
 
-The check fails a window whose mean latency is above 100 ms. Declare the Cards and pull the Service, as a deployment does:
+A drift Verifier has one `samples` slot naming the measurements it judges, and a `drift` check on that slot:
+
+```yaml title="service/churn-input-drift.yaml"
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  space: default
+  name: churn-input-drift
+  version: 1.0.0
+spec:
+  description: Churn model inputs stay distributed like the healthy baseline.
+  inputs:
+    current: { type: samples, features: [tenure_months, monthly_spend] }
+  requirements:
+    - id: churn-inputs-stable
+      statement: No churn model input drifted from the healthy baseline
+      check:
+        kind: drift
+        on: inputs.current
+        method: Psi
+        signal:
+          kind: Distribution
+          baseline_ref: { kind: Data, name: churn-baseline, version: 1.0.0, space: default }
+          features: [tenure_months, monthly_spend]
+        condition: { kind: Statistical }
+        profile:
+          kind: Psi
+          binning_strategy: { kind: Quantile, n_bins: 10 }
+          threshold: { kind: Fixed, value: 0.25 }
+```
+
+Pick the method by what you are watching:
+
+| `method` | Scores | `profile` |
+| --- | --- | --- |
+| `Psi` | How far each feature's distribution has moved from the baseline. The usual choice for model inputs | `binning_strategy` (`EqualWidth` or `Quantile`, 2 to 1000 bins) and `threshold`: `Fixed { value }`, or `ChiSquare { alpha }` / `Normal { alpha }` to derive one statistically |
+| `Spc` | Control-chart signals on numeric features, for a value that should stay stable over time | `{ sample_size }`, at least 2 |
+| `Custom` | One metric you compute against a fixed number | `{ metric_name, baseline_value, alert_threshold }`, with `signal: { kind: Metric, name }` and `metric_name` equal to that name. Needs no baseline Data Card |
+
+`condition` must be `Statistical`. A feature is drifted when its score exceeds the threshold, and the requirement fails if any feature drifted. For PSI, 0.1 is a small shift and 0.25 a large one; start at 0.25 and tighten once you know how noisy your inputs are.
+
+Declaration refuses a Verifier that mixes `samples` slots or `drift` checks with any other slot or check type: a window Verifier and a per-run Verifier are judged on different evidence.
+
+## 3. Bind it to a schedule and declare
+
+List the model as a component of a Service and bind the Verifier to it. The schedule reads each `samples` slot's own `features` and judges every drift requirement in the Verifier:
+
+```yaml title="service/churn-service.yaml"
+apiVersion: wyrd/v1
+kind: Service
+metadata: {name: churn-service, version: 1.0.0, space: default}
+spec:
+  service_type: model
+  components:
+    - alias: churn_model
+      ref: {kind: Model, name: churn-classifier, version: 1.4.2}
+      verified_by:
+        - verifier: ./churn-input-drift.yaml
+          runs_on: {kind: schedule, cron: "0 * * * *"}
+```
+
+Every `samples` slot is required; a requirement whose slot recorded nothing in the window is `inconclusive`. To page someone when it fails, see [Respond to a failed verification](/build-and-verify/verify/respond-to-a-failed-verification/).
+
+```bash
+wyrd declare service/churn-service.yaml
+```
+
+`schedule` is the only Trigger that runs a Verifier on its own. `cron` is evaluated in UTC unless you set `tz`, such as `tz: America/Chicago`. Each due time judges the samples recorded since the previous one, so the hourly schedule above judges `[00:00, 01:00)` at 01:00.
+
+## 4. Wait for the baseline to fit
+
+After declaration the server fits the baseline in the background. A PSI or SPC Verifier cannot score anything until that finishes. Check its state:
 
 <LangTabs langs={['python', 'rust', 'typescript']}>
 <LangTab lang="python">
 
-```bash
-uv run wyrd declare checkout/checkout.yaml
-uv run wyrd pull --kind Service --name checkout --version 1.0.0 --output-dir .wyrd-bundle
+```python
+from wyrd.cards import CardRef, Cards
+
+verifier = Cards().get(CardRef(kind="Verifier", name="churn-input-drift", version="1.0.0", space="default"))
+print(verifier.status.verification.baseline.state)  # pending, building, ready, or failed
 ```
 
 </LangTab>
 <LangTab lang="rust">
 
-```bash
-wyrd declare checkout/checkout.yaml
-wyrd pull --kind Service --name checkout --version 1.0.0 --output-dir .wyrd-bundle
+```rust
+use wyrd_ai::cards::{CardKind, CardSelector, Cards};
+
+let selector = CardSelector::named(CardKind::Verifier, "default".parse()?, "churn-input-drift".parse()?)
+    .with_version("1.0.0".parse()?);
+let verifier = Cards::connect().await?.get(selector).await?;
+let baseline = verifier.status.and_then(|status| status.verification).and_then(|v| v.baseline);
+println!("{:?}", baseline.map(|b| b.state)); // Pending, Building, Ready, or Failed
 ```
 
 </LangTab>
 <LangTab lang="typescript">
 
-```bash
-pnpm wyrd declare checkout/checkout.yaml
-pnpm wyrd pull --kind Service --name checkout --version 1.0.0 --output-dir .wyrd-bundle
+```typescript
+import { Cards } from "wyrd-ai";
+
+const verifier = await (await Cards.connect()).get({
+  kind: "Verifier",
+  name: "churn-input-drift",
+  version: "1.0.0",
+  space: "default",
+});
+console.log(verifier.status?.verification?.baseline?.state); // pending, building, ready, or failed
 ```
 
 </LangTab>
 </LangTabs>
 
-## 2. Create the Service's account
+`failed` comes with `baseline.error` explaining why, usually a feature missing from the baseline or a text column under `Spc`, which only charts numbers. Fix the Card and declare a new version. A window judged before the baseline is `ready` is `inconclusive` and runs no Operator.
 
-A schedule runs as the Service's own account, and only while that account has recorded for the Service in the last 24 hours. Create it:
+## 5. Record samples
+
+Submit one row of feature values per prediction, on the component the binding sits under:
 
 <LangTabs langs={['python', 'rust', 'typescript']}>
 <LangTab lang="python">
 
-```bash
-uv run wyrd principal credential create-principal --name checkout-runtime --role workload --workload-name checkout
+```python
+with state.run("churn_model") as run:
+    features = {"tenure_months": customer.tenure_months, "monthly_spend": customer.monthly_spend}
+    prediction = churn_classifier.predict(features)  # your model code
+    run.observe.submit("churn-input-drift", current=features)
 ```
 
 </LangTab>
 <LangTab lang="rust">
 
-```bash
-wyrd principal credential create-principal --name checkout-runtime --role workload --workload-name checkout
+```rust
+use wyrd_ai::verify::{Input, Inputs, Submission};
+
+let run = state.run_for_card("churn_model")?;
+let features = json!({ "tenure_months": customer.tenure_months, "monthly_spend": customer.monthly_spend });
+let prediction = churn_classifier.predict(&features); // your model code
+let submission = run
+    .observe()
+    .submit("churn-input-drift", Inputs::named([("current", Input::from(features))]))
+    .await?;
+assert!(matches!(submission, Submission::Recorded));
 ```
 
 </LangTab>
 <LangTab lang="typescript">
 
-```bash
-pnpm wyrd principal credential create-principal --name checkout-runtime --role workload --workload-name checkout
+```typescript
+const run = state.run("churn_model");
+const features = { tenure_months: customer.tenureMonths, monthly_spend: customer.monthlySpend };
+const prediction = churnClassifier.predict(features); // your model code
+await run.observe.submit("churn-input-drift", { current: features });
 ```
 
 </LangTab>
 </LangTabs>
 
-Copy the credential it prints into an environment variable for the next step:
+Values must be flat: strings, booleans, finite floats, or integers. `submit` writes the row through the same buffered observation path as other telemetry and returns `Recorded`, not an execution: there is nothing to wait on, because the schedule judges the window later. `verify` on this Verifier is refused with `WYRD_VERIFICATION_422_INPUT_UNSUPPORTED` before anything is sent.
 
-```bash
-export CHECKOUT_KEY=<credential>
-```
+A scheduled binding runs only while its Service is live. The server treats the binding as active when the Service's credential has authenticated in the last 24 hours, so a schedule on a Service that is not deployed does nothing. Missed windows, such as during a server outage, are skipped, not backfilled. Each window runs as the binding owner's authority.
 
-## 3. Write the programs
+## 6. Read the result
 
-`record` records five checkout requests that each took the number of milliseconds you pass. `results` prints the newest three windows the server judged.
+Each judged window writes one row to `bifrost.verification.results`, tied to the binding and the window:
 
 <LangTabs langs={['python', 'rust', 'typescript']}>
 <LangTab lang="python">
 
-<CodeFromFile file="examples/scheduled-check/record.py" lang="python" title="record.py" />
+```python
+from wyrd.bifrost import Bifrost
 
-<CodeFromFile file="examples/scheduled-check/results.py" lang="python" title="results.py" />
-
-</LangTab>
-<LangTab lang="rust">
-
-<CodeFromFile file="examples/scheduled-check/record.rs" lang="rust" title="src/bin/record.rs" />
-
-<CodeFromFile file="examples/scheduled-check/results.rs" lang="rust" title="src/bin/results.rs" />
-
-</LangTab>
-<LangTab lang="typescript">
-
-`results.ts` parses its rows with Zod. Add it:
-
-```bash
-pnpm add zod
-```
-
-<CodeFromFile file="examples/scheduled-check/record.ts" lang="typescript" title="record.ts" />
-
-<CodeFromFile file="examples/scheduled-check/results.ts" lang="typescript" title="results.ts" />
-
-</LangTab>
-</LangTabs>
-
-## 4. Record a fast minute and a slow one
-
-Record fast requests as the Service, wait for the next minute to start, then record slow ones:
-
-<LangTabs langs={['python', 'rust', 'typescript']}>
-<LangTab lang="python">
-
-```bash
-WYRD_API_KEY=$CHECKOUT_KEY uv run record.py 80
-# wait for the next minute
-WYRD_API_KEY=$CHECKOUT_KEY uv run record.py 250
+rows = Bifrost().sql(
+    """
+    SELECT window_start, window_end, verdict, verifier_version
+    FROM bifrost.verification.results
+    WHERE binding_id = $1
+    ORDER BY window_start DESC
+    LIMIT 20
+    """,
+    [binding_id],
+)
+print(rows.to_pandas())
 ```
 
 </LangTab>
 <LangTab lang="rust">
 
-```bash
-WYRD_API_KEY=$CHECKOUT_KEY cargo run --bin record 80
-# wait for the next minute
-WYRD_API_KEY=$CHECKOUT_KEY cargo run --bin record 250
+```rust
+use wyrd_ai::{Bifrost, bifrost::{BifrostOptions, QueryParam}};
+
+let rows = Bifrost::connect(BifrostOptions::default())
+    .await?
+    .sql(
+        "SELECT window_start, window_end, verdict, verifier_version \
+         FROM bifrost.verification.results \
+         WHERE binding_id = $1 \
+         ORDER BY window_start DESC \
+         LIMIT 20",
+        &[QueryParam::String(binding_id.to_string())],
+    )
+    .await?;
 ```
 
 </LangTab>
 <LangTab lang="typescript">
 
-```bash
-WYRD_API_KEY=$CHECKOUT_KEY node record.ts 80
-# wait for the next minute
-WYRD_API_KEY=$CHECKOUT_KEY node record.ts 250
+```typescript
+import { Bifrost } from "wyrd-ai";
+
+const bifrost = await Bifrost.connect();
+const rows = await bifrost.sql(
+  `SELECT window_start, window_end, verdict, verifier_version
+     FROM bifrost.verification.results
+    WHERE binding_id = $1
+    ORDER BY window_start DESC
+    LIMIT 20`,
+  [bindingId],
+);
 ```
 
 </LangTab>
 </LangTabs>
 
-```text
-recorded 5 requests at 80 ms
-recorded 5 requests at 250 ms
-```
+`binding_id` is in the Service's Card status (`status.verification.binding_ids`). A scheduled window has no `run_id`, because no application run produced it; filter on `binding_id` or `subject_card_uid` instead. The `churn-inputs-stable` requirement's `detail` holds every feature's score, threshold, sample counts, and drift flag, with the window and baseline it used.
 
-`submit` returns once the samples are recorded. Nothing is judged yet: the server judges each minute when it ends.
+## What can go wrong
 
-## 5. Read the results
-
-Wait two more minutes, so the window after the slow one passes with nothing recorded, then read the results with your own credential:
-
-<LangTabs langs={['python', 'rust', 'typescript']}>
-<LangTab lang="python">
-
-```bash
-uv run results.py
-```
-
-</LangTab>
-<LangTab lang="rust">
-
-```bash
-cargo run --bin results
-```
-
-</LangTab>
-<LangTab lang="typescript">
-
-```bash
-node results.ts
-```
-
-</LangTab>
-</LangTabs>
-
-<CodeFromFile file="examples/scheduled-check/results-output.txt" lang="text" title="output" />
-
-Your times differ. Each line is one window:
-
-- **passed**: the fast requests averaged 80 ms, within the budget.
-- **failed**: the slow requests averaged 250 ms.
-- **inconclusive**: nothing was recorded, so there was no evidence to judge. An inconclusive window is never a pass.
-
-Each stored result names the exact Verifier and Service versions it judged.
-
-<Aside type="note" title="Choose a real schedule">
-
-A minute keeps this guide short. A production check usually runs hourly or daily, such as `cron: "0 * * * *"`. `cron` is evaluated in UTC unless the Trigger sets `tz`. A window missed while the server was down is skipped, not judged later.
-
-</Aside>
-
-## If it fails
-
-| You see | Fix |
-| --- | --- |
-| `results` prints no windows | Record with `CHECKOUT_KEY`, the Service's account, not your own credential. The schedule runs only while that account records |
-| The fast window is `inconclusive` | The samples landed in the next minute. Wait for the next window and read again |
-
-## Next
-
-[Investigate a failed verification](/build-and-verify/verify/run-a-verification-and-inspect-its-evidence/) reads why a result failed. The [Verifier reference](/reference/verifier-card/#checks) lists the other drift methods, which compare samples with a baseline.
+| Symptom or code | Cause | Fix |
+| --- | --- | --- |
+| Declaration refuses the Verifier | It mixes `samples` or `drift` with other slot or check types | Split it into a window Verifier and a per-run Verifier |
+| Declaration refuses the binding | A window Verifier without a `schedule` Trigger, or a binding with `inputs` | Bind with `runs_on: { kind: schedule, ... }` and no `inputs` |
+| `WYRD_VERIFICATION_422_INPUT_UNSUPPORTED` | `verify` on a window Verifier | Use `submit` |
+| Baseline stuck in `failed` | A scored feature is missing from the baseline, or is text under `Spc` | Read `baseline.error`, fix the Verifier or baseline, and declare a new version |
+| No results on schedule | The Service has not authenticated in 24 hours, or no samples landed in the window | Deploy the Service; submit on the bound component's alias |
+| Every window `inconclusive` | The baseline was not ready, or the window had too few samples to score | Wait for `ready`; read the requirement `reason` |

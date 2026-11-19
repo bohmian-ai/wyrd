@@ -16,48 +16,27 @@ deployment, identity, authorization, credentials, networking, and team access.
 
 ## Product Purpose
 
-Wyrd is the only real-time verification system built for your applications. It
-answers the developer's question: "You built the system. How do you know it's
-behaving correctly?" Before an application acts, it asks Wyrd whether the
-action meets the requirements its developers declared; Wyrd returns a verdict
-for each requirement, and the application decides. Wyrd is open-source
-building blocks for that verification: Declare. Observe. Verify.
+Wyrd is open-source AI assurance and verification infrastructure. Declare an AI
+system, observe its behavior, and verify it behaves as intended.
 
-The developer documentation succeeds when a user can understand Wyrd, run the
-finance release Quickstart, and learn to build their own verification without
-reconstructing the path from architecture documents, source code, or
-disconnected reference pages.
-
-The learning path starts with Foundations of verification, a cited,
-tool-independent explanation of requirements, evidence, and judgments, then
-Real-time verification, the equally tool-independent explanation of checking a
-system while it runs, then How verification works in Wyrd, which applies both
-to Wyrd, and the practice guides in Build and verify. Educational pages cite primary sources beside their claims and
-state each claim's limits; they promise no latency, accuracy, or enforcement
-Wyrd has not measured or does not perform.
+The developer documentation succeeds when a user can understand Wyrd and
+complete a real local or self-hosted workflow without reconstructing the path
+from architecture documents, source code, or disconnected reference pages.
 
 ## Positioning
-
-Public entry points (README, homepage, Introduction) open with the exact
-headline and question above, then show working proof before infrastructure:
-an application verifying a report release against three requirements, one of
-them a model judging a policy PDF, and releasing only on a passed verdict.
-Gateway, Bifrost, and deployment detail follow that proof.
 
 Wyrd verifies that an AI system behaves as declared, whether it is an
 individual LLM, a deployed agent service, or a traditional HTTP service, before
 and after deployment. Every verdict records what was checked, which standard
-applied, and the exact versions that ran. The application owns the decision a
-verdict informs; Wyrd never sends or blocks anything itself. Wyrd does not
-become the user's application runtime, training loop, workflow engine, or
-arbitrary code-execution framework.
+applied, and the exact versions that ran. Wyrd does not become the user's
+application runtime, training loop, workflow engine, or arbitrary
+code-execution framework.
 
 ## Operating Context
 
 The documentation supports these durable user workflows:
 
 - Understand what Wyrd is and where it fits in an AI system.
-- Verify an application action in real time and act on the verdict.
 - Run the Wyrd server for local development.
 - Deploy and configure Wyrd for a self-hosted enterprise team.
 - Provision, update, rotate, and revoke credentials and permissions.

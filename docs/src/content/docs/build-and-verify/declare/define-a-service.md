@@ -1,6 +1,5 @@
 ---
 title: Services
-browserTitle: Declare an AI service and its components | Wyrd
 description: Declare a Service from YAML files, with its components and a table for the rows it records, then read back the exact versions the server stored.
 pillar: wyrd
 section: Build and verify

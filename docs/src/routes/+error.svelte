@@ -11,8 +11,7 @@
 </script>
 
 <svelte:head>
-  <title>{page.status} | Wyrd</title>
-  <meta name="robots" content="noindex" />
+  <title>{page.status} — Wyrd docs</title>
 </svelte:head>
 
 <!-- adapter-static emits this as 404.html via fallback: '404.html'. -->

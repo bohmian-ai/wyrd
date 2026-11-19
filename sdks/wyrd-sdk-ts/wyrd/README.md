@@ -1,10 +1,8 @@
 # wyrd-ai
 
-TypeScript SDK for [Wyrd](https://github.com/bohmian-ai/wyrd), the real-time
-verification system built for your applications. Before your application acts,
-it asks Wyrd whether the action meets your requirements, and acts on the
-verdict. [Run your first verification](https://docs.bohmian.ai/wyrd/get-started/quickstart/)
-shows it end to end.
+TypeScript SDK for [Wyrd](https://github.com/bohmian-ai/wyrd), open-source
+verification and assurance for AI systems. Record what your agents do, verify
+it against the Verifiers you registered, and query the evidence.
 
 ```bash
 pnpm add wyrd-ai

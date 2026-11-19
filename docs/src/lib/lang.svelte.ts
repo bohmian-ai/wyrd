@@ -1,11 +1,11 @@
 import { browser } from '$app/environment';
 
-// The multi-language device: one shared choice (Python, Rust, TypeScript, or YAML) that every
+// The multi-language device: one shared choice (Python, Rust, or TypeScript) that every
 // LangTabs block on every page follows. Rune-based reactive module so any
 // component that reads `lang.value` re-renders when the choice changes;
 // persisted to localStorage under `wyrd:lang`.
 
-export type Lang = 'python' | 'rust' | 'typescript' | 'yaml';
+export type Lang = 'python' | 'rust' | 'typescript';
 
 const KEY = 'wyrd:lang';
 
@@ -50,6 +50,5 @@ export const lang = {
 export const LANGS: { id: Lang; label: string }[] = [
   { id: 'python', label: 'Python' },
   { id: 'rust', label: 'Rust' },
-  { id: 'typescript', label: 'TypeScript' },
-  { id: 'yaml', label: 'YAML' }
+  { id: 'typescript', label: 'TypeScript' }
 ];

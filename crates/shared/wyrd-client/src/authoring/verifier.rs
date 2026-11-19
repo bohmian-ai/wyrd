@@ -94,43 +94,6 @@ impl From<Verifier> for FieldValue {
     }
 }
 
-/// The JSON Schema keyword a slot marker such as [`Trace`] sets. Its value is
-/// the canonical slot the model field declares in place of a `json` slot, such
-/// as `{"type": "trace"}`. [`InputSlot::json`] reads it, so it never reaches a
-/// stored Card.
-pub const SLOT_KEYWORD: &str = "x-wyrd-slot";
-
-/// A trace slot's value: the trace ID string of the work a Verifier judges.
-///
-/// A struct field of this type declares a `trace` slot when the struct is a
-/// Verifier's [`InputSlot::fields_of`] inputs, where every other field
-/// declares a `json` slot, so one struct both declares the inputs and, once
-/// serialized, supplies them. Its JSON Schema is a string whose
-/// `x-wyrd-slot` keyword is `{"type": "trace"}`; its JSON value is the bare ID.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(transparent)]
-pub struct Trace(
-    /// The 32-hex trace ID the slot's value carries.
-    pub String,
-);
-
-impl schemars::JsonSchema for Trace {
-    /// Inline at each field, so a model's property names the marker directly.
-    fn inline_schema() -> bool {
-        true
-    }
-
-    /// The marker's name.
-    fn schema_name() -> std::borrow::Cow<'static, str> {
-        "Trace".into()
-    }
-
-    /// A string schema marked as a trace slot.
-    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        schemars::json_schema!({ "type": "string", SLOT_KEYWORD: { "type": "trace" } })
-    }
-}
-
 /// One named evidence slot of a Verifier.
 ///
 /// Evidence a caller omits stays missing, never `null`: the checks that need
@@ -150,70 +113,11 @@ impl InputSlot {
         }
     }
 
-    /// A JSON value constrained by the JSON Schema `schema`, or the slot a
-    /// marker names: a schema carrying `x-wyrd-slot`, as a [`Trace`]
-    /// field, a Pydantic `wyrd.verify.Trace` field, or a Zod `trace()` field
-    /// emits, is that keyword's canonical slot, such as [`InputSlot::trace`].
+    /// A JSON value constrained by the JSON Schema `schema`.
     pub fn json(schema: impl Into<Value>) -> Self {
-        let mut schema = schema.into();
-        if let Some(slot) = schema
-            .as_object_mut()
-            .and_then(|object| object.remove(SLOT_KEYWORD))
-        {
-            return Self {
-                body: Body::authored(slot),
-            };
-        }
         let mut slot = Self::typed("json");
-        slot.body.set("schema", FieldValue::from(schema));
+        slot.body.set("schema", FieldValue::from(schema.into()));
         slot
-    }
-
-    /// A JSON value constrained by the JSON Schema of `T`, such as a struct
-    /// deriving `schemars::JsonSchema`: the Rust twin of a Pydantic model or
-    /// Zod schema passed as a slot.
-    #[must_use]
-    pub fn model<T: schemars::JsonSchema>() -> Self {
-        Self::json(schemars::schema_for!(T))
-    }
-
-    /// One slot per field of `T`, such as a struct deriving
-    /// `schemars::JsonSchema`, as [`InputSlot::fields`] reads its schema: the
-    /// Rust twin of passing a Pydantic model or Zod object as a Verifier's
-    /// whole `inputs`. A value of `T` passed to `verify` then fills every slot
-    /// at once. A `T` without fields, such as an enum, declares no slots.
-    #[must_use]
-    pub fn fields_of<T: schemars::JsonSchema>() -> Vec<(String, Self)> {
-        Self::fields(&Value::from(schemars::schema_for!(T))).unwrap_or_default()
-    }
-
-    /// One slot per property of the object JSON Schema `schema`, named by
-    /// the property and constrained by its schema; `None` when `schema`
-    /// declares no `properties`. A property that references one of the
-    /// schema's `$defs` becomes that definition, carrying the definitions it
-    /// reaches, so nested types and references still resolve. A recursive
-    /// type's schema is a root `$ref` to its own definition, whose properties
-    /// are the slots.
-    #[must_use]
-    pub fn fields(schema: &Value) -> Option<Vec<(String, Self)>> {
-        let empty = serde_json::Map::new();
-        let defs = schema
-            .get("$defs")
-            .and_then(Value::as_object)
-            .unwrap_or(&empty);
-        let root = schema
-            .get("$ref")
-            .and_then(Value::as_str)
-            .and_then(local_def)
-            .and_then(|name| defs.get(name))
-            .unwrap_or(schema);
-        let properties = root.get("properties").and_then(Value::as_object)?;
-        Some(
-            properties
-                .iter()
-                .map(|(name, property)| (name.clone(), Self::from(standalone(property, defs))))
-                .collect(),
-        )
     }
 
     /// A slot of `type` listing `items` under `field`.
@@ -261,64 +165,6 @@ impl InputSlot {
         body.fields
             .insert("source".to_owned(), Value::from(text.into()));
         Self { body }
-    }
-}
-
-/// `property` as a schema of its own: a lone local `$ref` replaced by the
-/// definition it names, with the other keys kept, and `$defs` holding every
-/// definition the result still references.
-fn standalone(property: &Value, defs: &serde_json::Map<String, Value>) -> Value {
-    let mut schema = property.clone();
-    if let Value::Object(object) = &mut schema
-        && let Some(target) = object
-            .get("$ref")
-            .and_then(Value::as_str)
-            .and_then(local_def)
-        && let Some(Value::Object(definition)) = defs.get(target)
-    {
-        object.remove("$ref");
-        for (key, value) in definition {
-            object.entry(key.clone()).or_insert_with(|| value.clone());
-        }
-    }
-    let mut reached = serde_json::Map::new();
-    let mut pending = vec![schema.clone()];
-    while let Some(value) = pending.pop() {
-        for name in local_refs(&value) {
-            if let Some(definition) = defs.get(name.as_str())
-                && !reached.contains_key(&name)
-            {
-                reached.insert(name, definition.clone());
-                pending.push(definition.clone());
-            }
-        }
-    }
-    if let (Value::Object(object), false) = (&mut schema, reached.is_empty()) {
-        object.insert("$defs".to_owned(), Value::Object(reached));
-    }
-    schema
-}
-
-/// The `$defs` name a local `#/$defs/<name>` reference points at.
-fn local_def(reference: &str) -> Option<&str> {
-    reference.strip_prefix("#/$defs/")
-}
-
-/// Every `$defs` name `value` references locally, at any depth.
-fn local_refs(value: &Value) -> Vec<String> {
-    match value {
-        Value::Object(object) => object
-            .iter()
-            .flat_map(|(key, value)| match (key.as_str(), value) {
-                ("$ref", Value::String(reference)) => local_def(reference)
-                    .map(str::to_owned)
-                    .into_iter()
-                    .collect(),
-                _ => local_refs(value),
-            })
-            .collect(),
-        Value::Array(items) => items.iter().flat_map(local_refs).collect(),
-        _ => Vec::new(),
     }
 }
 

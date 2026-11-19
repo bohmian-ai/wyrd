@@ -572,30 +572,6 @@ impl VerificationExecutionState {
     }
 }
 
-/// Verdict predicates, read from [`VerificationOutcome::verdict`]: exactly
-/// one of them holds for any result, and none can fail.
-impl<T> VerificationResult<T> {
-    /// Whether the verdict is `passed`: the only verdict that releases what
-    /// was verified. Same as comparing [`VerificationOutcome::verdict`].
-    #[must_use]
-    pub const fn is_passed(&self) -> bool {
-        matches!(self.outcome.verdict, VerificationVerdict::Passed)
-    }
-
-    /// Whether the verdict is `failed`: an expectation was violated.
-    #[must_use]
-    pub const fn is_failed(&self) -> bool {
-        matches!(self.outcome.verdict, VerificationVerdict::Failed)
-    }
-
-    /// Whether the verdict is `inconclusive`: no judgment could be made,
-    /// which is never a pass.
-    #[must_use]
-    pub const fn is_inconclusive(&self) -> bool {
-        matches!(self.outcome.verdict, VerificationVerdict::Inconclusive)
-    }
-}
-
 impl VerificationResult {
     /// This result with every present requirement `data` decoded as `T`.
     ///
@@ -1021,37 +997,6 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-
-    /// Exactly one verdict predicate holds for each verdict.
-    ///
-    /// # Panics
-    /// Panics when a result does not decode or a predicate disagrees with
-    /// its verdict.
-    #[test]
-    fn verdict_predicates_match_the_verdict() {
-        for (verdict, expected) in [
-            ("passed", [true, false, false]),
-            ("failed", [false, true, false]),
-            ("inconclusive", [false, false, true]),
-        ] {
-            let result: VerificationResult = serde_json::from_value(json!({
-                "execution_id": ExecutionId::new_v7(),
-                "verifier": {"kind": "Verifier", "name": "judge", "version": "1.0.0"},
-                "subject": {"kind": "Agent", "name": "drafter", "version": "1.0.0"},
-                "outcome": {"verdict": verdict, "requirements": []}
-            }))
-            .expect("result decodes");
-            assert_eq!(
-                [
-                    result.is_passed(),
-                    result.is_failed(),
-                    result.is_inconclusive()
-                ],
-                expected,
-                "{verdict}"
-            );
-        }
-    }
 
     /// Every input kind and route override round-trips, and malformed
     /// declarations are refused.

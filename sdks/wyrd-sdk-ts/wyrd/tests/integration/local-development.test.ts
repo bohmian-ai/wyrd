@@ -29,7 +29,7 @@ test("admin key completes the local workflow", async ({ server }) => {
   trace.disable();
   const own = new BasicTracerProvider();
   trace.setGlobalTracerProvider(own);
-  await expect(WyrdState.fromPath(worked.bundle, { client }).configure()).rejects.toMatchObject({
+  await expect(WyrdState.fromPath(worked.bundle, { client }).startTelemetry()).rejects.toMatchObject({
     code: "WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS",
   });
 });

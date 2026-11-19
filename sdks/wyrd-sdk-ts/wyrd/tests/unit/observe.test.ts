@@ -8,23 +8,13 @@ type NativeRun = Parameters<typeof Observe.fromNative>[0];
 /** One call the fake native run recorded, as the arguments it received. */
 type Call = readonly unknown[];
 
-/** A passed result, as native answers a verify. */
-const PASSED = {
-  valueJson: JSON.stringify({
-    execution_id: "0190f5e8-7c1a-7000-8000-000000000001",
-    verifier: { kind: "Verifier", name: "judge", version: "1.0.0" },
-    subject: { kind: "Agent", name: "drafter", version: "1.0.0" },
-    outcome: { verdict: "passed", requirements: [] },
-  }),
-};
-
 /**
  * A fake native run that records its arguments and answers fixed envelopes.
  *
  * These tests cover the wrapper's input projection, refusals, and result
  * projection. The real-server journeys cover execution.
  */
-function fakeRun(result: Record<string, unknown> = PASSED, submission: Record<string, unknown> = {}) {
+function fakeRun(result: Record<string, unknown> = { valueJson: "null" }, submission: Record<string, unknown> = {}) {
   const calls: Call[] = [];
   const answer =
     (value: unknown) =>
@@ -68,30 +58,6 @@ describe("internal native run wrapper", () => {
       code: "WYRD_SDK_404_UNKNOWN_VERIFIER",
       status: 404,
     });
-  });
-
-  test.each([
-    ["passed", [true, false, false]],
-    ["failed", [false, true, false]],
-    ["inconclusive", [false, false, true]],
-  ] as const)("a %s result sets its verdict predicates once, outside its JSON", async (verdict, expected) => {
-    const wire = {
-      execution_id: "0190f5e8-7c1a-7000-8000-000000000001",
-      verifier: { kind: "Verifier", name: "judge", version: "1.0.0" },
-      subject: { kind: "Agent", name: "drafter", version: "1.0.0" },
-      outcome: { verdict, requirements: [] },
-    };
-    const { observe } = fakeRun({ valueJson: JSON.stringify(wire) });
-
-    const results = [
-      await observe.verify("judge", { answer: "yes" }),
-      await observe.verifyTyped("judge", { answer: "yes" }, { parse: (value: unknown) => value }),
-    ];
-
-    for (const result of results) {
-      expect([result.passed, result.failed, result.inconclusive]).toEqual(expected);
-      expect(JSON.parse(JSON.stringify(result)), "the wire shape is unchanged").toEqual(wire);
-    }
   });
 
   test.each([
@@ -233,7 +199,6 @@ describe("internal native run wrapper", () => {
       "Service",
       "Step",
       "Table",
-      "Trace",
       "Trigger",
       "Verifier",
     ]);

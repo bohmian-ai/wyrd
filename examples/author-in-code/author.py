@@ -61,6 +61,7 @@ state = WyrdState.declare(service)
 print(f"service: {state.root_ref}")
 print(f"agent:   {state.card_ref('agent')}")
 
+state.start_bifrost()  # the writer; the one declared table is active
 try:
     for answer in ("Your refund request is approved.", "You have a guaranteed refund."):
         # A Run whose view is the Agent, where the Verifier is bound.

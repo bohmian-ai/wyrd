@@ -1,6 +1,5 @@
 ---
 title: LLM gateway
-browserTitle: Set up the LLM gateway | Wyrd
 description: Store a provider key on your Wyrd server, create a deployment for it, and call the model through Wyrd with your Wyrd credential.
 pillar: wyrd
 section: Connect
@@ -52,7 +51,7 @@ Calls made before this step are never recorded.
 ## 4. Make a request
 
 ```bash
-uv add "wyrd-ai[gateway]==0.4.2" openai
+uv add "wyrd-ai[gateway]==0.4.1" openai
 ```
 
 ```python title="call.py"

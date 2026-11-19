@@ -1,34 +1,12 @@
 ---
 title: What Wyrd does
-description: The only real-time verification system built for your applications. Your application asks Wyrd whether an action meets your requirements, and acts on the verdict.
+description: Wyrd verifies what your AI system does against the requirements you declare, and records which versions produced each result.
 pillar: wyrd
 section: Get started
 order: 1
 ---
 
-**You built the system. How do you know it's behaving correctly?**
-
-Every system has its own requirements, workflows, and definitions of correct behavior. Turning them into repeatable checks usually means stitching together evaluation frameworks, observability tools, custom scripts, and data pipelines.
-
-Wyrd gives you open-source building blocks for your own verification systems. **Declare** requirements. **Observe** real behavior. **Verify** live, during execution, or continuously over time.
-
-Live verification puts the verdict before the decision. Your application asks Wyrd whether what it is about to do meets your requirements, gets an evidence-backed verdict for each one, and decides what happens next. The same verdicts are available from queued and continuous checks.
-
-## An example
-
-An application shares customer reports with outside auditors. Before it sends a report, it checks three requirements, declared together as one Verifier. Two of them compare a value in the records the application sends. In the third, an AI model reads the company's sharing policy PDF and decides whether the policy allows this report to be shared for this purpose:
-
-<CodeFromFile file="examples/finance-release/release-check.yaml" lang="yaml" title="release-check.yaml" region="requirements" />
-
-The application checks each report with one call:
-
-<CodeFromFile file="examples/finance-release/finance_release.py" lang="python" title="finance_release.py" region="verify" />
-
-Four reports get these verdicts:
-
-<CodeFromFile file="examples/finance-release/output.txt" lang="text" title="output" />
-
-The judge's wording varies. The policy forbids bank account identifiers and permits sharing only for external audits. [Run your first verification](/get-started/quickstart/) declares the Verifier and runs the full program in Python, Rust, or TypeScript. A Verifier can also run Python, judge a whole session, or compare samples with a baseline on a schedule; [What can I build?](/get-started/what-can-i-build/) matches each to a problem.
+Wyrd is open-source infrastructure for building your own verification system for AI/ML in production. You ship a support agent, a payment workflow, a model behind an API, or a coding agent that runs for hours. You compose Wyrd's primitives into checks on its outputs, tool calls, and complete workflows against the rules you set, such as "never promise a refund" or "follow the payment policy document", before you release a change and while it serves real traffic. When a rule fails, Wyrd tells you which rule, why, and which version of your system broke it.
 
 ## How Wyrd fits your stack
 
@@ -39,6 +17,54 @@ The judge's wording varies. The policy forbids bank account identifiers and perm
 3. **Verify.** Your app sends a result to a Verifier and gets a verdict for each requirement, with a reason. Wyrd keeps every verdict with the exact versions it judged.
 
 Your coding agent reads the same declarations, verdicts, and evidence over MCP. The Python, Rust, and TypeScript SDKs, the CLI, MCP, and HTTP all call one server, so a verdict reads the same from each. [Architecture](/understand/architecture/) shows what a team deployment runs.
+
+## An example
+
+A support agent must never promise a guaranteed refund. The Service describes the agent and binds a Verifier, which states that requirement as an assertion:
+
+<Tabs>
+<Tab label="support-reply.yaml">
+
+<CodeFromFile file="examples/quickstart/support-reply.yaml" lang="yaml" title="support-reply.yaml" />
+
+</Tab>
+<Tab label="no-refund-promise.yaml">
+
+<CodeFromFile file="examples/quickstart/no-refund-promise.yaml" lang="yaml" title="no-refund-promise.yaml" />
+
+</Tab>
+</Tabs>
+
+This program declares both and verifies two answers:
+
+<LangTabs langs={['python', 'rust', 'typescript']}>
+<LangTab lang="python">
+
+<CodeFromFile file="examples/quickstart/quickstart.py" lang="python" title="quickstart.py" />
+
+</LangTab>
+<LangTab lang="rust">
+
+<CodeFromFile file="examples/quickstart/quickstart.rs" lang="rust" title="src/main.rs" />
+
+</LangTab>
+<LangTab lang="typescript">
+
+<CodeFromFile file="examples/quickstart/quickstart.ts" lang="typescript" title="quickstart.ts" />
+
+</LangTab>
+</LangTabs>
+
+```text
+passed: the comparison held
+  subject:  Service/support-reply@1.0.0#<uid>
+  verifier: default/Verifier/no-refund-promise@1.0.0#<uid>
+failed: operator NotContains returned false
+  subject:  Service/support-reply@1.0.0#<uid>
+  verifier: default/Verifier/no-refund-promise@1.0.0#<uid>
+```
+
+In CI, `wyrd declare support-reply.yaml` declares the same files from the command line. This assertion is the simplest check. A Verifier can also run Python, judge with an Agent that reads your uploaded policy files and cites them, judge a whole session, or compare samples with a baseline on a schedule; [What can I build?](/get-started/what-can-i-build/) matches each to a problem.
 
 ## Already have tools?
 
@@ -53,12 +79,11 @@ Keep them. Add Wyrd where they stop.
 | LiteLLM, Portkey | Model routing, inline guardrails | Tying every call to an account, a release, and a verdict |
 | Datadog, Grafana, Honeycomb | Infrastructure monitoring and alerts | Pass/fail verdicts on the same OpenTelemetry data |
 | Credo AI, watsonx.governance | AI inventory, policy programs | Proof from production for each control |
-| Guardrails AI, NeMo Guardrails | Predefined input/output filters | Your own requirements, judged with your evidence and files, returned to your code to decide |
 
 ## Where Wyrd stops
 
-Wyrd verifies your system; your code runs it. Your app owns its code, models, and data, runs and deploys them, and decides what to do with a verdict. Wyrd is not an application runtime, model host, training framework, or general-purpose code executor. Wyrd returns verdicts; it never blocks, retries, or reroutes your application. Your code decides.
+Wyrd verifies your system; your code runs it. Your app owns its code, models, and data, runs and deploys them, and decides what to do with a verdict. Wyrd is not an application runtime, model host, training framework, or general-purpose code executor.
 
 ## Next
 
-[Set up Wyrd](/get-started/setup/) starts a local server. [Run your first verification](/get-started/quickstart/) then runs this example against it. [Foundations of verification](/understand/foundations-of-verification/) explains requirements, evidence, and judgments without Wyrd, [Real-time verification](/understand/real-time-verification/) explains checking a system while it runs, and [How verification works in Wyrd](/understand/how-verification-works/) shows how Wyrd places a verdict before your application acts.
+[Set up Wyrd](/get-started/setup/) starts a local server. [Run your first verification](/get-started/quickstart/) then declares a Verifier and verifies one passing and one failing reply. [What can I build?](/get-started/what-can-i-build/) shows the larger workflows.

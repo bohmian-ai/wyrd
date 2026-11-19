@@ -8,10 +8,10 @@ const page = (slug: string) =>
 // llms-full.txt carries what a reader of the rendered page sees, as plain
 // Markdown: the embedded source itself, not the tag that names it.
 describe('pageText', () => {
-  it('renders setup with its embedded source bodies and no component markup', () => {
-    const text = pageText(page('get-started/setup'));
+  it('renders the quickstart with its embedded source bodies and no component markup', () => {
+    const text = pageText(page('get-started/quickstart'));
     expect(text).not.toMatch(/^---$/m);
-    expect(text).toContain('```python title="check.py"\nfrom wyrd import WyrdState');
+    expect(text).toContain('```python title="quickstart.py"\nfrom wyrd import WyrdState');
     expect(text).toContain('state = WyrdState.declare("support-reply.yaml")');
     expect(text).toContain('let state = WyrdState::declare("support-reply.yaml").await?;');
     expect(text).toContain('const state = await WyrdState.declare("support-reply.yaml");');
@@ -61,7 +61,7 @@ describe('pageText', () => {
   });
 
   it('embeds a selected range and fails on an invalid embed', () => {
-    const text = pageText('<CodeFromFile file="examples/setup-check/support-reply.yaml" lang="yaml" range="3-3" />');
+    const text = pageText('<CodeFromFile file="examples/quickstart/support-reply.yaml" lang="yaml" range="3-3" />');
     expect(text).toBe('```yaml title="support-reply.yaml"\nkind: Service\n```');
     expect(() => pageText('<CodeFromFile file="examples/missing.yaml" lang="yaml" />')).toThrow(/file not found/);
   });

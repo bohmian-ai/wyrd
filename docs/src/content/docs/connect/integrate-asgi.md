@@ -1,6 +1,5 @@
 ---
 title: ASGI apps
-browserTitle: Verify requests in FastAPI and other ASGI apps | Wyrd
 description: Add WyrdMiddleware to a FastAPI, Starlette, Django, or Litestar app to start Wyrd with the app, verify inside one Run per request, and drain queued evidence at shutdown.
 pillar: wyrd
 section: Connect
@@ -17,12 +16,12 @@ Add `WyrdMiddleware` to any ASGI app, such as FastAPI, Starlette, Django, or Lit
 ## Before you start
 
 - The server from [Set up Wyrd](/get-started/setup/), running.
-- The `support-reply` Service from the [setup check](/get-started/setup/#3-check-it-end-to-end), declared.
+- The `support-reply` Service from [Run your first verification](/get-started/quickstart/), declared.
 
 ## Install
 
 ```bash
-uv add "wyrd-ai[otel]==0.4.2" uvicorn
+uv add "wyrd-ai[otel]==0.4.1" uvicorn
 ```
 
 Add your framework too, such as `uv add fastapi`. Then pull the Service into the app's directory, at build or deploy time rather than when the app starts:
@@ -175,6 +174,7 @@ The reply names the request's Run and a `failed` verdict. A second request retur
 | --- | --- |
 | Startup fails with `WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS` | Your app installs its own tracer provider: pass `telemetry=False` and add `wyrd.otel.span_exporter(client)` to that provider |
 | Startup fails with an `ImportError` naming `otel` | Install `wyrd-ai[otel]`, or pass `telemetry=False` |
+| `WYRD_SDK_400_BIFROST_NOT_STARTED` when the app records | The server runs without lifespan: leave Uvicorn's `--lifespan` at `auto` or set it to `on` |
 | `WYRD_SDK_404_UNKNOWN_ALIAS` on every request | `alias` returned a name the bundle does not have |
 
 ## Advanced
@@ -222,7 +222,7 @@ A graceful stop (`SIGTERM`) drains every worker. A worker killed with `SIGKILL`,
 | --- | --- |
 | `app` | The ASGI app to wrap; `add_middleware` passes it. |
 | `state` | A loaded `WyrdState`. The middleware never declares or registers anything. |
-| `telemetry` | Whether startup installs the telemetry `state.configure()` installs. Default `True`. |
+| `telemetry` | Whether startup calls `state.start_telemetry()`. Default `True`. |
 | `alias` | Function from the ASGI scope to the component alias each Run observes. Default: the Service. |
 
 `RUN_SCOPE_KEY` is `"wyrd.run"`, the scope key that holds the request's Run. Other ASGI connection types pass through unchanged.

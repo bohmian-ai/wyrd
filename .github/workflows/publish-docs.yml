@@ -6,7 +6,7 @@ name: publish-docs
 # the repository's Pages settings. `paths.base = '/wyrd'` in
 # docs/svelte.config.js prefixes every asset and link, so the build is uploaded
 # inside a wyrd/ folder. The llms.txt origin constant
-# (docs/scripts/generate_llms_txt.py) and docs/site.js must name the same domain.
+# (docs/scripts/generate_llms_txt.py) must name the same domain.
 
 on:
   push:
@@ -79,15 +79,13 @@ jobs:
       # The custom domain serves the artifact root, so the build goes under
       # wyrd/ to match paths.base. Pages only serves a 404 page from the root,
       # so the fallback shell is copied there, and the bare domain redirects to
-      # the docs. Crawlers read robots.txt only at the domain root, so it is
-      # written there: every page may be crawled, and it names the sitemap.
+      # the docs.
       - name: Stage Pages artifact under /wyrd
         run: |
           mkdir -p _site
           cp -R docs/build _site/wyrd
           cp _site/wyrd/404.html _site/404.html
-          printf '<!doctype html><meta charset="utf-8"><title>Wyrd docs</title><meta http-equiv="refresh" content="0; url=/wyrd/"><link rel="canonical" href="https://docs.bohmian.ai/wyrd/"><a href="/wyrd/">Wyrd docs</a>\n' > _site/index.html
-          printf 'User-agent: *\nAllow: /\n\nSitemap: https://docs.bohmian.ai/wyrd/sitemap.xml\n' > _site/robots.txt
+          printf '<!doctype html><meta charset="utf-8"><title>Wyrd docs</title><meta http-equiv="refresh" content="0; url=/wyrd/"><link rel="canonical" href="/wyrd/"><a href="/wyrd/">Wyrd docs</a>\n' > _site/index.html
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v5

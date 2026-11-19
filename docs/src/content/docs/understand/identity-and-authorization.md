@@ -3,7 +3,7 @@ title: Identity and access
 description: Every call to Wyrd is made as an account whose roles decide what it may do; a running Service also names its exact release, from its bundle.
 pillar: wyrd
 section: Understand
-order: 7
+order: 6
 ---
 
 Every call to the Wyrd server is made as an account, and the account's roles decide what it may do. A running Service adds one fact the key cannot carry: which exact release it is, which comes from its bundle.

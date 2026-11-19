@@ -118,7 +118,7 @@ def test_configured_service_context_reaches_both_verification_subjects(
     verdicts: set[str] = set()
     for environment in ("prod", "staging"):
         state = WyrdState.from_path(bundle, WyrdClient(credential=key))
-        state.configure(deployment_environment=environment, telemetry=False)
+        state.configure(deployment_environment=environment)
         run = state.run()
         agent = run.for_card("agent")
 

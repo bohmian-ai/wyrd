@@ -138,7 +138,6 @@ def deploy(client: WyrdClient, bundle: Path) -> Desk:
             f"the support Agent's model {route} is not deployed; configure a gateway "
             f"provider deployment for {route} (PUT /v1/admin/gateway/provider-deployments/{{name}})"
         )
-    state.configure()  # before first use: fixes the Service context and exports telemetry
     return Desk(receipt, state, gateway_client(client))
 
 
@@ -156,6 +155,8 @@ def serve(desk: Desk) -> list[Served]:
     waiting for it. Telemetry and tickets are flushed on return.
     """
     state = desk.state
+    state.start_bifrost()
+    state.start_telemetry()
     tracer = trace.get_tracer("support-desk")
     served = []
     for index in range(REQUESTS):

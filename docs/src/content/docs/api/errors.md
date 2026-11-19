@@ -311,6 +311,7 @@ This page is generated from the error definitions in the Wyrd source.
 
 | Code | Status | Title | Fix |
 | --- | ---: | --- | --- |
+| `WYRD_SDK_400_BIFROST_NOT_STARTED` | 400 | WyrdState Bifrost writer is not started | Call start_bifrost on the state before opening a run and emitting observations. |
 | `WYRD_SDK_400_CARD_KIND_MISMATCH` | 400 | WyrdState Card kind mismatch | Use an alias for a Card of the expected kind. |
 | `WYRD_SDK_400_INVALID_OBSERVATION` | 400 | Invalid observation input | Emit a flat object of boolean, integer, finite float, or string values, with valid feature names and media bindings. |
 | `WYRD_SDK_400_INVALID_STATE_BUNDLE` | 400 | Invalid WyrdState bundle | Pull the intended root Card again with wyrd pull --output-dir &lt;dir&gt;, then load that complete directory. |
@@ -321,7 +322,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_SDK_409_BIFROST_ALREADY_STARTED` | 409 | WyrdState Bifrost writer is already started | Reuse the state's existing writer, or shut it down and create a new WyrdState to start again. |
 | `WYRD_SDK_409_BIFROST_CLOSED` | 409 | WyrdState Bifrost writer is closed | Create a new WyrdState and start its Bifrost writer; a shut-down state stays closed to writes. |
 | `WYRD_SDK_409_STATE_CONFIG_FROZEN` | 409 | WyrdState configuration is already fixed | Call configure once, before startup and before opening a Run, or construct another WyrdState for a different configuration. |
-| `WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS` | 409 | An OpenTelemetry provider is already installed | Turn off Wyrd's managed telemetry setup and add each state's Wyrd span, log, and metric exporters to the application's own providers. |
+| `WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS` | 409 | An OpenTelemetry provider is already installed | Add each state's Wyrd span, log, and metric exporters to the application's own providers instead of calling start_telemetry. |
 | `WYRD_SDK_422_VERIFICATION_DATA_INVALID` | 422 | Verification data does not match the requested type | Match the requested type to the check's declared data schema, use a union or decoder for mixed shapes, or read the result without a type. |
 | `WYRD_SDK_503_TELEMETRY_FLUSH_FAILED` | 503 | Telemetry flush failed | Check the OpenTelemetry exporter's logs and the state's credentials, then retry flush or shutdown. |
 | `WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT` | 504 | Telemetry flush timed out | Check that the Wyrd server's OTLP endpoint is reachable, raise the OpenTelemetry SDK export timeout if spans are large, and retry flush or shutdown. |

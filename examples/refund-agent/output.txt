@@ -1,9 +1,0 @@
-complete: passed · Order 1042 was delivered on 2 May, so it qualifies for a refund.
-  reply-names-order: passed
-  looked-up-order: passed
-skipped: failed · Order 1042 was delivered on 2 May, so it qualifies for a refund.
-  reply-names-order: passed
-  looked-up-order: failed
-no trace: inconclusive · Order 1042 was delivered on 2 May, so it qualifies for a refund.
-  reply-names-order: passed
-  looked-up-order: inconclusive

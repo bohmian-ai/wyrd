@@ -1,4 +1,4 @@
-//! The Set up Wyrd check in Rust: declare a Service and the Verifier it
+//! The docsite Quickstart in Rust: declare a Service and the Verifier it
 //! references, then judge a passing and a failing answer.
 
 use wyrd_ai::WyrdError;

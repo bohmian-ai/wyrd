@@ -209,7 +209,7 @@ async fn sample(state: WyrdState, stop: CancellationToken) -> Vec<(f64, usize)> 
         tokio::select! {
             () = stop.cancelled() => return samples,
             _ = tick.tick() => {
-                if let Ok(Some(metrics)) = state.bifrost_metrics() {
+                if let Ok(metrics) = state.bifrost_metrics() {
                     samples.push((first.elapsed().as_secs_f64(), metrics.owned_bytes));
                 }
             }

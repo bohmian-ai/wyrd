@@ -780,26 +780,6 @@ impl WyrdState {
         table: Option<TableConfig>,
         queue: QueueConfig,
     ) -> Result<(), WyrdError> {
-        let _gate = self.bifrost.start_gate().await;
-        self.start_gated(table, queue).await
-    }
-
-    /// Claim, connect, and publish the writer; the caller holds the start
-    /// gate.
-    ///
-    /// # Errors
-    /// As [`WyrdState::start_bifrost_with_config`].
-    ///
-    /// # Cancellation
-    /// Abandoning the future before the writer is published drops the
-    /// unpublished writer and releases the claim, so the next start or first
-    /// write retries startup from scratch; after shutdown the state stays
-    /// closed instead.
-    async fn start_gated(
-        &self,
-        table: Option<TableConfig>,
-        queue: QueueConfig,
-    ) -> Result<(), WyrdError> {
         let claim = self.bifrost.claim()?;
         let client = self.client()?;
         let chosen = table.is_some();
@@ -854,16 +834,15 @@ impl WyrdState {
     /// * `fqn` - The registered table's `<namespace>.<name>`.
     ///
     /// # Errors
-    /// Returns the errors of [`WyrdState::start_bifrost`] when no writer is
-    /// running yet, `WYRD_SDK_409_BIFROST_CLOSED` after shutdown, and the
-    /// server's describe error for an unknown, unauthorized, or unavailable
-    /// table.
+    /// Returns `WYRD_SDK_400_BIFROST_NOT_STARTED` before startup,
+    /// `WYRD_SDK_409_BIFROST_CLOSED` after shutdown, and the server's describe
+    /// error for an unknown, unauthorized, or unavailable table.
     ///
     /// # Cancellation
     /// Abandoning the future during the describe leaves the active table
     /// unchanged.
     pub async fn use_table_by_name(&self, fqn: &str) -> Result<(), WyrdError> {
-        let started = self.bifrost_writer().await?;
+        let started = self.started_bifrost()?;
         Ok(started.bifrost.use_table_by_name(fqn).await?)
     }
 
@@ -1093,19 +1072,14 @@ impl WyrdState {
     /// Drain every producer of this state's writer without closing it.
     ///
     /// The explicit durability barrier a test or a finite job uses; ordinary
-    /// callers drain once at [`WyrdState::shutdown`]. A state that never
-    /// started Bifrost has nothing to drain and succeeds.
+    /// callers drain once at [`WyrdState::shutdown`].
     ///
     /// # Errors
-    /// Returns `WYRD_SDK_409_BIFROST_CLOSED` after shutdown and the first
-    /// producer or sink failure from the drain.
-    ///
-    /// # Cancellation
-    /// The drain runs on a blocking thread. Abandoning the future stops the
-    /// wait, not the drain: batches already sent may still be acknowledged and
-    /// nothing is rolled back. Call `flush` again to wait for the barrier.
+    /// Returns `WYRD_SDK_400_BIFROST_NOT_STARTED` before startup,
+    /// `WYRD_SDK_409_BIFROST_CLOSED` after shutdown, and the first producer or
+    /// sink failure from the drain.
     pub async fn flush(&self) -> Result<(), WyrdError> {
-        self.bifrost.flush().await
+        Ok(self.bifrost.started()?.bifrost.flush().await?)
     }
 
     /// Drain every producer of this state's writer and close it to writes.
@@ -1143,40 +1117,13 @@ impl WyrdState {
             .await
     }
 
-    /// The writer, started with the default configuration if this state
-    /// has none yet.
-    ///
-    /// Writes call this so no caller has to start Bifrost first. A start in
-    /// flight, explicit or from another write, is awaited rather than
-    /// repeated; a failed start is returned and the next write tries again.
+    /// The started writer and its described fixed Drift table.
     ///
     /// # Errors
-    /// Returns `WYRD_SDK_409_BIFROST_CLOSED` after shutdown, and otherwise
-    /// the errors of [`WyrdState::start_bifrost`].
-    ///
-    /// # Cancellation
-    /// As [`WyrdState::start_bifrost`].
-    pub(crate) async fn bifrost_writer(&self) -> Result<Arc<StartedBifrost>, WyrdError> {
-        if let Some(started) = self.bifrost.current()? {
-            return Ok(started);
-        }
-        let _gate = self.bifrost.start_gate().await;
-        if let Some(started) = self.bifrost.current()? {
-            return Ok(started);
-        }
-        self.start_gated(None, QueueConfig::default()).await?;
-        Ok(self
-            .bifrost
-            .current()?
-            .expect("a completed start published its writer"))
-    }
-
-    /// The started writer, or `None` before any start.
-    ///
-    /// # Errors
-    /// Returns `WYRD_SDK_409_BIFROST_CLOSED` after shutdown.
-    pub(crate) fn running_bifrost(&self) -> Result<Option<Arc<StartedBifrost>>, WyrdError> {
-        self.bifrost.current()
+    /// Returns `WYRD_SDK_400_BIFROST_NOT_STARTED` before startup and
+    /// `WYRD_SDK_409_BIFROST_CLOSED` after shutdown.
+    pub(crate) fn started_bifrost(&self) -> Result<Arc<StartedBifrost>, WyrdError> {
+        self.bifrost.started()
     }
 
     /// Point-in-time bounded-ownership accounting for this state's one writer.
@@ -1186,14 +1133,12 @@ impl WyrdState {
     /// cannot see because it owns a different writer. Reads atomics; no IO.
     ///
     /// # Errors
-    /// Returns `WYRD_SDK_409_BIFROST_CLOSED` after shutdown; `None` means no
-    /// writer has started.
+    /// Returns `WYRD_SDK_400_BIFROST_NOT_STARTED` before startup and
+    /// `WYRD_SDK_409_BIFROST_CLOSED` after shutdown.
     #[cfg(feature = "test-support")]
     #[cfg(feature = "internal")]
-    pub fn bifrost_metrics(&self) -> Result<Option<crate::bifrost::BifrostMetrics>, WyrdError> {
-        Ok(self
-            .running_bifrost()?
-            .map(|started| started.bifrost.metrics()))
+    pub fn bifrost_metrics(&self) -> Result<crate::bifrost::BifrostMetrics, WyrdError> {
+        Ok(self.started_bifrost()?.bifrost.metrics())
     }
 
     /// Return the exact root Card reference.
@@ -2435,7 +2380,7 @@ struct AliasRecord {
 /// How a state's runtime-managed OpenTelemetry tracer provider failed to flush.
 ///
 /// Python and TypeScript state flush and shutdown first flush the provider
-/// their managed telemetry setup installed, then always attempt the native Bifrost
+/// their `start_telemetry` installed, then always attempt the native Bifrost
 /// drain. This value carries the provider stage's outcome across that drain so
 /// both runtimes report the same catalog error: OTEL is primary and the
 /// drain's stable code, when it also failed, is secondary detail. `cause` is a

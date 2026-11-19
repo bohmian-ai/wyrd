@@ -345,12 +345,12 @@ test("state httpAuth supplies service and agent context", async ({ server, provi
   const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-http-auth-"));
   await cards.pull(root, bundle);
   const issued = await runtimeAccount({ kind: "Service", name: "configured-service" });
-  const configured = async (environment: string): Promise<WyrdState> => {
+  const configured = (environment: string): WyrdState => {
     const state = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: issued.key }) });
-    await state.configure({ deploymentEnvironment: environment, telemetry: false });
+    state.configure({ deploymentEnvironment: environment });
     return state;
   };
-  const [prod, staging] = [await configured("prod"), await configured("staging")];
+  const [prod, staging] = [configured("prod"), configured("staging")];
   const [service, agent] = [prod.rootRef.uid, prod.cardRef("agent").uid];
   const openaiOf = (state: WyrdState): OpenAI =>
     new OpenAI({

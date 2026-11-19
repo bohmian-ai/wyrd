@@ -238,6 +238,7 @@ pub async fn answer(state: &WyrdState, run: &Run, question: &str) -> Result<Stri
 /// or check recorded for it. Nothing replays the remaining requests.
 pub async fn serve(desk: &Desk) -> Result<Vec<Served>, Error> {
     let state = &desk.state;
+    state.start_bifrost().await?;
     let telemetry = start_telemetry(state)?;
     let mut served = Vec::with_capacity(REQUESTS);
     for index in 0..REQUESTS {

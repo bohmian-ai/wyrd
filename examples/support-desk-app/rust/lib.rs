@@ -97,6 +97,8 @@ impl SupportDesk {
             deployment_environment: Some("development".to_owned()),
             ..ConfigureOptions::default()
         })?;
+        // Starts the buffered writer the ticket rows go through.
+        state.start_bifrost().await?;
         // ANCHOR_END: init
         Ok(Self { state })
     }

@@ -507,7 +507,7 @@ pub fn open_wyrd_state(path: String) -> NativeWyrdState {
     }
 }
 
-/// The catalog refusal `WyrdState.configure` throws when a global tracer
+/// The catalog refusal `WyrdState.startTelemetry` throws when a global tracer
 /// provider is already registered, so its title and remediation come from the
 /// one Rust catalog.
 #[napi]
@@ -519,7 +519,7 @@ pub fn telemetry_provider_exists() -> NativeWyrdError {
 }
 
 /// The catalog error `WyrdState.flush` and `WyrdState.shutdown` throw when the
-/// tracer provider `configure` installed did not flush, built by the
+/// tracer provider `startTelemetry` installed did not flush, built by the
 /// shared [`TelemetryFlushFailure`] so Python and TypeScript report the same
 /// code and details. `cause` is payload-free; `native_code` is the stable code
 /// of a native drain that also failed.
@@ -1053,9 +1053,8 @@ impl NativeRun {
     }
 
     /// Submits slot values: Window samples are recorded now on the
-    /// JavaScript thread when the state's writer is running, and otherwise
-    /// after the first sample starts it; either way each sample's
-    /// `bifrost.enqueue` PRODUCER span is opened now, in Node's tracer. Run evidence is
+    /// JavaScript thread, so each queued sample write records its
+    /// `bifrost.enqueue` PRODUCER span in Node's tracer; Run evidence is
     /// queued for one execution carrying the caller's optional `group_id`.
     ///
     /// # Errors
@@ -1078,7 +1077,9 @@ impl NativeRun {
         crate::trace::spawn(env, async move {
             let result = match staged {
                 Ok(None) => Ok(Submission::Recorded),
-                Ok(Some(staged)) => Box::pin(run.observe().enqueue_staged(staged)).await,
+                Ok(Some(staged)) => Box::pin(run.observe().enqueue_staged(staged))
+                    .await
+                    .map(Submission::Queued),
                 Err(error) => Err(error),
             };
             Ok(NativeSubmission::outcome(result))

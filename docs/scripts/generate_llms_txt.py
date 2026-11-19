@@ -28,9 +28,9 @@ CONTENT_DIR = DOCS_ROOT / "src" / "content" / "docs"
 PUBLIC_DIR = DOCS_ROOT / "public"
 
 # Production origin for the docs site: GitHub Pages serves it on the
-# docs.bohmian.ai custom domain under BASE. Both must always match docs/site.js;
-# every emitted link is BASE-relative so a local build under the same base
-# serves it.
+# docs.bohmian.ai custom domain under BASE. BASE must always match
+# svelte.config.js `paths.base`; every emitted link is BASE-relative so a local
+# build under the same base serves it.
 ORIGIN = "https://docs.bohmian.ai"
 BASE = "/wyrd"
 SITE = f"{ORIGIN}{BASE}"
@@ -38,17 +38,15 @@ SITE = f"{ORIGIN}{BASE}"
 # The onboarding route, in reading order: the canonical start for agents. Only
 # the steps the sidebar publishes are listed, so a withdrawn step drops out.
 START = [
-    ("get-started/setup", "install Wyrd, start a local server you keep running, and check it with a verification that needs no model"),
-    ("get-started/quickstart", "verify each proposed finance report release against three requirements, one judged by a model reading a policy PDF, and release only a passed one, from Python, Rust, or TypeScript"),
+    ("get-started/setup", "install Wyrd and start a local server you keep running"),
+    ("get-started/quickstart", "declare a Verifier in YAML and verify a passing and a failing support answer from Python, Rust, or TypeScript"),
     ("get-started/what-can-i-build", "example workflows built from the primitives, not a complete list: policy documents, agent evaluation, long-running workflows, runtime checks, observability, or drift"),
 ]
 
 SUMMARY = (
-    "Wyrd is the only real-time verification system built for your applications. "
-    "Before an application acts, it asks Wyrd whether the action meets the "
-    "requirements you declare; Wyrd returns a verdict for each, with a reason and "
-    "the exact versions it judged, and the application decides. Open source: "
-    "Declare. Observe. Verify."
+    "Wyrd is open-source AI assurance and verification infrastructure. Verify AI "
+    "systems before and after release, with verdicts you can trace, reproduce, "
+    "and audit."
 )
 
 # Mirrors SECTIONS and TOPICS in docs/src/lib/content.ts: the sidebar order.

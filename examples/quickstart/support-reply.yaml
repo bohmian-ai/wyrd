@@ -1,4 +1,4 @@
-# The subject: your support app's Service, verified by no-refund-promise.
+# The subject: your support agent's Service, verified by no-refund-promise.
 apiVersion: wyrd/v1
 kind: Service
 metadata:

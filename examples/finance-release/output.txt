@@ -1,7 +1,0 @@
-external audit · Synthetic customer report: quarterly total $120. → passed
-external audit · Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001. → failed
-  follows-policy: the report names a bank account identifier, which the policy forbids
-marketing partnership · Synthetic customer report: quarterly total $120. → failed
-  follows-policy: the policy does not permit sharing for this purpose
-regulator request · Synthetic customer report: quarterly total $120. → failed
-  follows-policy: the policy does not permit sharing for this purpose

@@ -77,7 +77,7 @@ pub struct PyWyrdState {
     /// Loaded Data holders by exact `CardRef`.
     data: BTreeMap<String, Py<DataCard>>,
     /// The `wyrd.otel._ManagedTelemetry` handle over the providers
-    /// `configure` installed, flushed by `flush` and `shutdown`.
+    /// `start_telemetry` installed, flushed by `flush` and `shutdown`.
     telemetry: OnceLock<Py<PyAny>>,
     /// Serializes `start_telemetry`'s check, install, and publication, so a
     /// concurrent call on this state waits for the first instead of losing
@@ -224,7 +224,6 @@ impl PyWyrdState {
     /// already installed its own tracer, meter, or logger provider, `ImportError` naming the
     /// `otel` extra when it is not installed, and the credential error when
     /// the state's client cannot resolve.
-    #[pyo3(name = "_start_telemetry")]
     fn start_telemetry(&self, py: Python<'_>) -> PyResult<()> {
         if self.telemetry.get().is_some() {
             return Ok(());
@@ -306,7 +305,7 @@ impl PyWyrdState {
     /// table's producer keeps draining.
     ///
     /// # Errors
-    /// Raises the error of starting the Bifrost writer when none is running,
+    /// Raises `WYRD_SDK_400_BIFROST_NOT_STARTED` before startup,
     /// `WYRD_SDK_409_BIFROST_CLOSED` after shutdown, and the server's describe
     /// error for an unknown, unauthorized, or unavailable table.
     fn use_table_by_name(&self, py: Python<'_>, table: &str) -> CardPyResult<()> {
@@ -314,42 +313,28 @@ impl PyWyrdState {
     }
 
     /// Fix this state's Service release and deployment environment before
-    /// its first use, then, unless `telemetry` is false, install the managed
-    /// OpenTelemetry providers exporting to Wyrd.
-    ///
-    /// Fixing the configuration is local; installing telemetry builds the
-    /// stock exporters, which make no request until the first export. The
-    /// configuration is fixed before the providers install, because their
-    /// Resource names the configured environment, so a failed install is
-    /// fixed in code rather than retried with another `configure`.
+    /// its first use; local, with no network IO.
     ///
     /// # Errors
     ///
     /// Raises `WYRD_SDK_409_STATE_CONFIG_FROZEN` once configuration is fixed
-    /// by an earlier configure or first use, even after shutdown,
+    /// by an earlier configure or first use, even after shutdown, and
     /// `WYRD_CLIENT_400_CONFIG_INVALID` for an empty field or a name or
-    /// version that does not match the loaded Service, and, when installing
-    /// telemetry, the errors of [`Self::start_telemetry`].
-    #[pyo3(signature = (*, service_name=None, service_version=None, deployment_environment=None, telemetry=true))]
+    /// version that does not match the loaded Service.
+    #[pyo3(signature = (*, service_name=None, service_version=None, deployment_environment=None))]
     fn configure(
         &self,
-        py: Python<'_>,
         service_name: Option<String>,
         service_version: Option<String>,
         deployment_environment: Option<String>,
-        telemetry: bool,
-    ) -> PyResult<()> {
+    ) -> CardPyResult<()> {
         self.inner
             .configure(ConfigureOptions {
                 service_name,
                 service_version,
                 deployment_environment,
             })
-            .map_err(WyrdPyError::from)?;
-        if telemetry {
-            self.start_telemetry(py)?;
-        }
-        Ok(())
+            .map_err(WyrdPyError::from)
     }
 
     /// The configured deployment environment correlation tag, or `None` when
@@ -405,7 +390,7 @@ impl PyWyrdState {
     }
 
     /// Export completed spans, logs, and metrics from the providers
-    /// `configure` installed, then drain every producer of this state's
+    /// `start_telemetry` installed, then drain every producer of this state's
     /// writer without closing it.
     ///
     /// The provider flush runs first, waiting at most the OpenTelemetry SDK's
@@ -418,9 +403,9 @@ impl PyWyrdState {
     /// Raises `WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT` or
     /// `WYRD_SDK_503_TELEMETRY_FLUSH_FAILED` when the managed provider did not
     /// flush, with any drain failure's code as `details.native_code`; otherwise
-    /// `WYRD_SDK_409_BIFROST_CLOSED` after shutdown and the first producer or
-    /// sink failure from the drain. A state that never started Bifrost has no
-    /// writer to drain.
+    /// `WYRD_SDK_400_BIFROST_NOT_STARTED` before startup,
+    /// `WYRD_SDK_409_BIFROST_CLOSED` after shutdown, and the first producer or
+    /// sink failure from the drain.
     fn flush(&self, py: Python<'_>) -> CardPyResult<()> {
         let telemetry = self.flush_telemetry(py);
         let native = crate::trace::block_on(py, self.inner.flush());
@@ -433,7 +418,7 @@ impl PyWyrdState {
     /// observation: queue admission is not a durable acknowledgement, so an
     /// abrupt exit before this returns can lose pending rows. After an ambiguous
     /// failure, retry `shutdown()` on the same state rather than replacing the
-    /// writer. The providers `configure` installed are flushed first
+    /// writer. The providers `start_telemetry` installed are flushed first
     /// but stay installed and usable; an application's own provider is never
     /// touched. The drain is attempted even when the provider flush fails.
     ///
@@ -656,7 +641,7 @@ impl PyWyrdState {
         })
     }
 
-    /// Flush completed telemetry from the providers `configure` installed.
+    /// Flush completed telemetry from the providers `start_telemetry` installed.
     ///
     /// Calls the managed handle's `force_flush`, which waits at most the SDK's
     /// default flush bound even when the stock processor ignores it. A

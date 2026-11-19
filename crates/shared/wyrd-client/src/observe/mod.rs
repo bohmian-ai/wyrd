@@ -28,7 +28,6 @@ use serde_json::{Value, json};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardUid, GroupId};
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::trace::TraceContext;
 use wyrd_spec::vala::ids::RunId;
 use wyrd_spec::vala::ids::SessionId;
 use wyrd_spec::verification::execution::VerificationResult;
@@ -36,7 +35,7 @@ use wyrd_spec::verification::execution::VerificationResult;
 use crate::bifrost::{BifrostClientError, Correlation, WriterTable};
 use crate::state::{BoundVerifier, WyrdState};
 use crate::transport::trace;
-use crate::verify::{Inputs, Projected, RunEvidence, Submission, Target};
+use crate::verify::{Execution, Inputs, Projected, RunEvidence, Submission, Target};
 
 pub use lifecycle::DRIFT_OBSERVATIONS_TABLE;
 
@@ -216,29 +215,24 @@ pub struct Observe<'a> {
 }
 
 impl Observe<'_> {
-    /// Project and enqueue one Drift observation on the running writer.
+    /// Project and enqueue one Drift observation.
     ///
     /// Input validation runs before the lifecycle lookup so a malformed feature
-    /// map reports what is wrong with it rather than a lifecycle refusal.
+    /// map reports what is wrong with it rather than reporting that Bifrost has
+    /// not started.
     ///
     /// # Errors
     /// Returns `WYRD_SDK_400_INVALID_OBSERVATION` for a malformed feature
-    /// map, `WYRD_SDK_409_BIFROST_CLOSED` after shutdown, and
+    /// map, `WYRD_SDK_400_BIFROST_NOT_STARTED` before startup,
+    /// `WYRD_SDK_409_BIFROST_CLOSED` after shutdown, and
     /// `WYRD_CLIENT_429_QUEUE_FULL` when the producer is saturated.
-    ///
-    /// # Panics
-    /// Panics when no writer has started; every caller starts it first.
     fn drift_value(
         &self,
         features: &Value,
         session_id: Option<SessionId>,
     ) -> Result<(), WyrdError> {
         let record = drift::observation(features, session_id)?;
-        let started = self
-            .run
-            .state
-            .running_bifrost()?
-            .expect("callers start the writer before recording samples");
+        let started = self.run.state.started_bifrost()?;
         started.bifrost.insert_observation(
             &started.drift,
             drift::rows(&record)?,
@@ -373,12 +367,11 @@ impl Observe<'_> {
     /// subject without waiting for a judgment.
     ///
     /// Run evidence is staged for one queued execution and returns its
-    /// [`Execution`](crate::verify::Execution); a `202` confirms staging, not queue
+    /// [`Execution`]; a `202` confirms staging, not queue
     /// acceptance, so a replay conflict or a loss before acceptance surfaces
     /// through the handle. Window samples are recorded through this state's
     /// Bifrost Drift observation path and return [`Submission::Recorded`]:
-    /// the Verifier's schedule judges the window later. The first sample
-    /// starts the state's writer when nothing started it.
+    /// the Verifier's schedule judges the window later.
     ///
     /// # Arguments
     /// * `verifier` - The `metadata.name` of a Verifier bound to this view's subject.
@@ -390,7 +383,7 @@ impl Observe<'_> {
     /// the wrong kind, an unreadable file, or a file format its slot does not
     /// accept, and `WYRD_VERIFICATION_413_INPUT_TOO_LARGE` for a file above
     /// its slot's `max_bytes`, all before any execution request; for Window
-    /// samples, the errors of starting the writer and of an observation;
+    /// samples, the Bifrost lifecycle and queue errors of an observation;
     /// otherwise the client resolution error and the server's refusal.
     ///
     /// # Cancellation
@@ -403,16 +396,16 @@ impl Observe<'_> {
     ) -> Result<Submission, WyrdError> {
         match self.record_or_stage(verifier, inputs)? {
             None => Ok(Submission::Recorded),
-            Some(staged) => self.finish(staged).await,
+            Some(staged) => Ok(Submission::Queued(self.enqueue_run(staged).await?)),
         }
     }
 
     /// The synchronous half of [`Observe::submit`]: project `inputs` for the
-    /// Verifier named `verifier`, record Window samples now when this state's
-    /// writer is running, and return `None`, or return what is still to send.
+    /// Verifier named `verifier`, record Window samples now, and return
+    /// `None`, or return the Run evidence still to enqueue.
     ///
     /// A foreign runtime calls this on its own thread, inside its producer
-    /// span scope, so each sample recorded or staged here records its
+    /// span scope, so each recorded sample's queued write records its
     /// `bifrost.enqueue` PRODUCER span there.
     ///
     /// # Errors
@@ -422,14 +415,12 @@ impl Observe<'_> {
         &self,
         verifier: &str,
         inputs: impl Into<Inputs>,
-    ) -> Result<Option<Staged>, WyrdError> {
+    ) -> Result<Option<StagedRun>, WyrdError> {
         self.record_or_stage(verifier, inputs)
     }
 
-    /// Project `inputs` for the Verifier named `verifier`. Record Window
-    /// samples now and return `None` when the writer is running; otherwise
-    /// return the samples, with the PRODUCER span opened for them now, or
-    /// the Run evidence still to send.
+    /// Project `inputs` for the Verifier named `verifier`: record Window
+    /// samples and return `None`, or return the Run evidence to enqueue.
     ///
     /// # Errors
     /// As [`Observe::submit`], before any execution request.
@@ -437,70 +428,46 @@ impl Observe<'_> {
         &self,
         verifier: &str,
         inputs: impl Into<Inputs>,
-    ) -> Result<Option<Staged>, WyrdError> {
+    ) -> Result<Option<StagedRun>, WyrdError> {
         let bound = self.run.state.bound_verifier(&self.run.subject, verifier)?;
-        let evidence = match self.target(bound).project(inputs.into())? {
-            Projected::Run(evidence) => Evidence::Run(evidence),
+        match self.target(bound).project(inputs.into())? {
+            Projected::Run(evidence) => Ok(Some(StagedRun {
+                verifier: verifier.to_owned(),
+                group_id: self.group_id.clone(),
+                evidence,
+            })),
             Projected::Window(features) => {
-                if self.run.state.running_bifrost()?.is_some() {
-                    self.drift_value(&features, None)?;
-                    return Ok(None);
-                }
-                drift::observation(&features, None)?;
-                Evidence::Window {
-                    features,
-                    producer: trace::producer(DRIFT_OBSERVATIONS_TABLE),
-                }
+                self.drift_value(&features, None)?;
+                Ok(None)
             }
-        };
-        Ok(Some(Staged {
-            verifier: verifier.to_owned(),
-            group_id: self.group_id.clone(),
-            evidence,
-        }))
+        }
     }
 
-    /// The asynchronous half of [`Observe::submit`]: start this state's
-    /// writer and record staged samples, or pin staged Run evidence's files
-    /// and queue one execution.
+    /// The asynchronous half of [`Observe::submit`]: pin `staged`'s files
+    /// and stage it for one queued execution.
     ///
     /// # Errors
-    /// As [`Observe::submit`].
+    /// As [`Observe::submit`] for Run evidence.
     ///
     /// # Cancellation
     /// As [`Observe::submit`].
     #[cfg(feature = "internal")]
-    pub async fn enqueue_staged(&self, staged: Staged) -> Result<Submission, WyrdError> {
-        self.finish(staged).await
+    pub async fn enqueue_staged(&self, staged: StagedRun) -> Result<Execution, WyrdError> {
+        self.enqueue_run(staged).await
     }
 
-    /// Send what [`Observe::record_or_stage`] could not finish synchronously.
+    /// Pin `staged`'s files and stage it for one queued execution.
     ///
     /// # Errors
-    /// As [`Observe::submit`].
+    /// As [`Observe::submit`] for Run evidence.
     ///
     /// # Cancellation
     /// As [`Observe::submit`].
-    async fn finish(&self, staged: Staged) -> Result<Submission, WyrdError> {
+    async fn enqueue_run(&self, staged: StagedRun) -> Result<Execution, WyrdError> {
         let state = &self.run.state;
-        match staged.evidence {
-            Evidence::Window { features, producer } => {
-                state.bifrost_writer().await?;
-                trace::with_producer_span(
-                    move |_| producer.clone(),
-                    || self.drift_value(&features, None),
-                )?;
-                Ok(Submission::Recorded)
-            }
-            Evidence::Run(evidence) => {
-                let bound = state.bound_verifier(&self.run.subject, &staged.verifier)?;
-                let mut target = self.target(bound);
-                target.group_id = staged.group_id;
-                Ok(Submission::Queued(
-                    target.enqueue(state.client()?, evidence).await?,
-                ))
-            }
-        }
+        let mut target = self.target(state.bound_verifier(&self.run.subject, &staged.verifier)?);
+        target.group_id = staged.group_id;
+        target.enqueue(state.client()?, staged.evidence).await
     }
 
     /// The execution target of `bound` for this view's Run, taking its UIDs.
@@ -573,7 +540,7 @@ impl RunBifrost<'_> {
     /// `bifrost.datasets`, which is where reserved and system-managed tables are
     /// refused before admission; the server's not-found, authorization, or
     /// availability error for an unknown, unauthorized, or unavailable table;
-    /// the errors of starting the writer when this is the first write,
+    /// `WYRD_SDK_400_BIFROST_NOT_STARTED` before startup,
     /// `WYRD_SDK_409_BIFROST_CLOSED` after shutdown, and
     /// `WYRD_CLIENT_429_QUEUE_FULL` when the producer is saturated.
     ///
@@ -625,7 +592,7 @@ impl RunBifrost<'_> {
         if let Some(table) = table {
             require_dataset(table)?;
         }
-        let started = self.run.state.bifrost_writer().await?;
+        let started = self.run.state.started_bifrost()?;
         let destination = if let Some(table) = table {
             started.bifrost.resolve_writer_table(table).await?
         } else {
@@ -659,34 +626,15 @@ fn require_dataset(table: &str) -> Result<(), WyrdError> {
     Ok(())
 }
 
-/// What a submission projected and still has to send.
+/// Run evidence a submission projected and still has to enqueue.
 #[derive(Debug)]
-pub struct Staged {
+pub struct StagedRun {
     /// The bound Verifier's `metadata.name`, resolved again on enqueue.
     verifier: String,
     /// The caller group captured when the evidence was staged.
     group_id: Option<GroupId>,
-    /// The projected samples or Run evidence.
-    evidence: Evidence,
-}
-
-/// The two kinds of evidence a submission sends.
-#[derive(Debug)]
-enum Evidence {
-    /// Window samples, recorded once the writer is running.
-    ///
-    /// `producer` is the `bifrost.enqueue` PRODUCER span opened when the
-    /// samples were staged, on the caller's thread and under its active span;
-    /// the deferred enqueue carries it, so a sample that had to start the
-    /// writer links to the caller's trace like one recorded at once.
-    Window {
-        /// The projected sample features.
-        features: Value,
-        /// The staged PRODUCER span's context, when the caller had a trace.
-        producer: Option<TraceContext>,
-    },
-    /// Run evidence, before its files are pinned.
-    Run(RunEvidence),
+    /// The projected evidence, before its files are pinned.
+    evidence: RunEvidence,
 }
 
 /// Serialize the bytes of one projected row.

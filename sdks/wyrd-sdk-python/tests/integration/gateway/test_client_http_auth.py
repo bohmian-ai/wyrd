@@ -253,7 +253,7 @@ def test_state_http_auth_supplies_service_and_agent_context(
 
     def configured(environment: str) -> WyrdState:
         state = WyrdState.from_path(bundle, client_of(server, key))
-        state.configure(deployment_environment=environment, telemetry=False)
+        state.configure(deployment_environment=environment)
         return state
 
     prod, staging = configured("prod"), configured("staging")
@@ -328,7 +328,7 @@ def test_configured_gateway_calls_have_canonical_dimensions(
     bundle = pull(cards, "configured-service", tmp_path)
     key = service_key("configured-service", client=client_of(server))
     state = WyrdState.from_path(bundle, client_of(server, key))
-    state.configure(deployment_environment="prod", telemetry=False)
+    state.configure(deployment_environment="prod")
     service, agent = state.root_ref.uid, state.card_ref("agent").uid
     assert service is not None and agent is not None
     bound = openai.OpenAI(

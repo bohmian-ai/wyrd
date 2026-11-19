@@ -1,6 +1,6 @@
 """A Service's action is one trace, read back through ``Bifrost.trace_timeline``.
 
-The ``assistant`` Service, instrumented with ``configure``, records
+The ``assistant`` Service, instrumented with ``start_telemetry``, records
 spans, writes a Run observation and a table row, calls a model through the
 Gateway, and verifies its answer with an Agent judge, all in one span.
 The timeline read returns that work as one connected, time-ordered tree.
@@ -60,8 +60,8 @@ def test_service_action_timeline_is_one_connected_tree(
     Bifrost(TableConfig(Action, ACTIONS)).register()
     state = hydrated(assistant_bundle, WyrdClient(credential=assistant_key))
     service = WyrdClient(credential=assistant_key, workload_uid=str(state.root_ref.uid))
-    state.configure()
     state.start_bifrost()
+    state.start_telemetry()
     writer = Bifrost(client=service)
     tracer = trace.get_tracer(SERVICE_SCOPE)
 

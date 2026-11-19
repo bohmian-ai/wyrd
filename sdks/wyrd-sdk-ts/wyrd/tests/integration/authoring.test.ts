@@ -31,7 +31,7 @@ import {
   WyrdState,
 } from "wyrd-ai";
 
-import { sharingPolicyJudge } from "../support/assistant.js";
+import { judgeReply, toolCall, toolTurn } from "../support/assistant.js";
 import type { ReceivedRequest, Reply } from "../support/http-receiver.js";
 import { configureGateway } from "../support/local-development.js";
 import { details, fixture, serverTest } from "../support/server.js";
@@ -126,9 +126,46 @@ function changed(slot: "recipient" | "destination", change: Release): Release {
   return { ...release, [slot]: { ...(release[slot] as Release), ...change } };
 }
 
+/** The policy judge's first turn: read its mounted policy. */
+const READ_POLICY = [toolCall("call-policy", "fs.read", { path: "/inputs/policy.json" })];
+
+/** The policy judge's Verdict once `body` carries its `fs.read` result; no Verdict when the read has no `external-audit` line. */
+function sharingVerdict(body: string): string {
+  const messages = (JSON.parse(body) as { messages: { role: string; content: string | null }[] }).messages;
+  const release = JSON.stringify(messages.filter(({ role }) => role === "user").map(({ content }) => content));
+  let output: { sources?: string[]; units?: { text: string; locator: unknown }[] };
+  try {
+    output = JSON.parse(messages.find(({ role }) => role === "tool")?.content ?? "") as typeof output;
+  } catch {
+    return "the policy did not read";
+  }
+  const line = (output.units ?? []).find(({ text }) => text.includes("external-audit"));
+  if (line === undefined) {
+    return "the policy did not read";
+  }
+  const citations = [
+    { slot: "report", locator: { json_pointer: "/text" } },
+    { slot: output.sources?.[0], locator: line.locator },
+  ];
+  if (release.includes("PROVIDER-UNCERTAIN")) {
+    return JSON.stringify({
+      outcome: "inconclusive",
+      reason: "the policy does not settle this release",
+      citations: [],
+    });
+  }
+  if (release.includes("BANK-ACCOUNT-DEMO-001")) {
+    return JSON.stringify({ outcome: "failed", reason: "the report names a bank account identifier", citations });
+  }
+  return JSON.stringify({ outcome: "passed", reason: "an external audit may receive this report", citations });
+}
+
 /** The local model upstream: the policy judge, and nothing else. */
 function upstream(request: ReceivedRequest): Reply {
-  return request.body.includes("POLICY JUDGE") ? sharingPolicyJudge(request) : { status: 404 };
+  if (!request.body.includes("POLICY JUDGE")) {
+    return { status: 404 };
+  }
+  return /"role"\s*:\s*"tool"/.test(request.body) ? judgeReply(sharingVerdict(request.body)) : toolTurn(READ_POLICY);
 }
 
 /** A policy-judge Agent `name` at `version`, as the story's Agent files declare it. */

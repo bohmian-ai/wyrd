@@ -371,7 +371,6 @@ async fn sustained_hundred_feature_drift_lands_exactly_once_with_flat_client_byt
             .state
             .bifrost_metrics()
             .expect("a started state reports its queue")
-            .expect("the writer started")
             .owned_bytes
     };
 

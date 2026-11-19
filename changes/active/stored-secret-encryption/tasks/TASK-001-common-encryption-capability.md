@@ -226,8 +226,12 @@ passes, 898 of 898.
  Reference:
 `docs/src/content/docs/reference/stored-secret-encryption.md`, `draft: true`
 until Task 2 makes the server read `[kms]`. Authority updated before
-replacement behavior (commit `a859dab1d`). No runtime consumer, hot path,
-SQL, or migration changed.
+replacement behavior (commit `a859dab1d`). No runtime consumer is
+switched and no SQL or migration changed. Correction (TASK-001-R1): the
+shared Vault read the Gateway ExternalSecret path awaits
+(`VaultKv2::read_field` → `Endpoint::send`) did change, so a Gateway hot
+path is touched; its wait inventory and benchmark qualification are recorded
+in the TASK-001-R1 remediation.
 
 Output: one tested shared capability/configuration and updated authority for
 Task 2, with no requirement for SQL, migrations, cloud key provisioning per

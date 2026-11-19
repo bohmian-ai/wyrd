@@ -24,6 +24,8 @@ const REMEMBERED = 10;
 export class Streamed<T> {
   #settled = $state<{ value: T } | { problem: Problem }>();
   #pending = $state(false);
+  /** The address whose own read settled the shown value; a remembered value has none. */
+  #current?: string;
   #latest = 0;
   #reading?: AbortController;
   readonly #remembered: Map<string, T>;
@@ -38,7 +40,11 @@ export class Streamed<T> {
     return this.#settled && 'value' in this.#settled ? this.#settled.value : undefined;
   }
 
-  /** Whether the newest load is still reading; what the section shows meanwhile belongs to an older one. */
+  /**
+   * Whether what the section shows belongs to another population, or to an
+   * earlier visit, than the newest load that is still reading. A reread of
+   * the population it shows (Live) is not pending.
+   */
   get pending(): boolean {
     return this.#pending;
   }
@@ -51,9 +57,10 @@ export class Streamed<T> {
   /** Follow the section of the newest load at `address`; call it whenever the load's data changes. */
   follow(next: T | Promise<T> | undefined, address: string): void {
     const at = ++this.#latest;
-    this.#pending = next instanceof Promise;
+    this.#pending = next instanceof Promise && address !== this.#current;
     if (!(next instanceof Promise)) {
       this.#settled = next === undefined ? undefined : { value: next };
+      this.#current = next === undefined ? undefined : address;
       if (next !== undefined) this.#remember(address, next);
       return;
     }
@@ -65,12 +72,14 @@ export class Streamed<T> {
         if (at !== this.#latest) return;
         this.#pending = false;
         this.#settled = { value };
+        this.#current = address;
         this.#remember(address, value);
       },
       // A superseded load's failure is not this page's; the newest one's is shown.
       (error: unknown) => {
         if (at !== this.#latest) return;
         this.#pending = false;
+        this.#current = undefined;
         const refused = typeof error === 'object' && error !== null && 'code' in error && 'title' in error;
         this.#settled = { problem: refused ? (error as Problem) : wyrdProblem('upstream', error instanceof Error ? error.message : 'The section could not be read.') };
       }

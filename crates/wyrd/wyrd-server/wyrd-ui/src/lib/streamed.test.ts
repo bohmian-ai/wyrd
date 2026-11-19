@@ -58,13 +58,13 @@ test('a read whose successful answer is not JSON fails the section instead of cl
   expect(section.problem).toMatchObject({ code: 'WYRD_SPEC_502_UPSTREAM_FAILURE' });
 });
 
-test('a section is pending from a newer load until that load settles, whatever it still shows', async () => {
+test('a section is pending from a newer population\'s load until that load settles, whatever it still shows', async () => {
   const section = new Streamed<string>();
   section.follow('first', '/t/acme/verify');
   expect(section.pending).toBe(false);
   let settle = (_: string) => {};
   const newer = new Promise<string>((resolve) => (settle = resolve));
-  section.follow(newer, '/t/acme/verify');
+  section.follow(newer, '/t/acme/verify?status=failed');
   // The old value is still shown, and marked as waiting for its successor.
   expect([section.value, section.pending]).toEqual(['first', true]);
   settle('second');
@@ -74,14 +74,27 @@ test('a section is pending from a newer load until that load settles, whatever i
   // A failure settles it too.
   let fail = (_: Error) => {};
   const failing = new Promise<string>((_, reject) => (fail = reject));
-  section.follow(failing, '/t/acme/verify');
+  section.follow(failing, '/t/acme/verify?status=queued');
   expect(section.pending).toBe(true);
   fail(new Error('reset'));
   await failing.catch(() => {});
   await Promise.resolve();
   expect([section.pending, section.problem?.detail]).toEqual([false, 'reset']);
   // A value given as it is never waits.
-  section.follow(newer, '/t/acme/verify');
-  section.follow('third', '/t/acme/verify');
+  section.follow(newer, '/t/acme/verify?status=passed');
+  section.follow('third', '/t/acme/verify?status=passed');
   expect(section.pending).toBe(false);
+});
+
+test('a refresh of the population a section shows is not pending; Back to a remembered one is', async () => {
+  const remembered = new Map<string, string>();
+  const section = new Streamed<string>(remembered);
+  section.follow('counted', '/t/acme/verify?status=failed');
+  // Live rereads the population it shows: the section is current until the reread settles.
+  section.follow(new Promise<string>(() => {}), '/t/acme/verify?status=failed');
+  expect(section.pending).toBe(false);
+  // Back remounts with the remembered value of an earlier read, which the newest read replaces.
+  const back = new Streamed<string>(remembered);
+  back.follow(new Promise<string>(() => {}), '/t/acme/verify?status=failed');
+  expect([back.value, back.pending]).toEqual(['counted', true]);
 });

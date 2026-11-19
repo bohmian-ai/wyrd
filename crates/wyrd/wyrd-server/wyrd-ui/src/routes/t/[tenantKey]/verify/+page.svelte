@@ -133,7 +133,8 @@
     return statuses?.values.rows.reduce((sum, row) => sum + Number(row[1]), 0);
   });
   /** The list's footer: how many of the counted executions it shows, and the next rows when one read can hold them. */
-  const more = $derived(total === undefined ? undefined : { total, next: data.shown < Math.min(total, VERIFY_MOST) ? () => void goto(href(current, data.shown + VERIFY_PAGE), { keepFocus: true, noScroll: true }) : undefined });
+  // The total is the population's support; while a newer population's is read, the list neither counts nor pages against the old one.
+  const more = $derived(total === undefined || streamed.pending ? undefined : { total, next: data.shown < Math.min(total, VERIFY_MOST) ? () => void goto(href(current, data.shown + VERIFY_PAGE), { keepFocus: true, noScroll: true }) : undefined });
   /** The Verifier chart's key: each series in its colour; a fourth series only ever counts the rest. */
   const key = (order: readonly string[]) => Object.fromEntries(order.map((name, index) => [name, SERIES[index]]));
   /** How many executions a chart counts, beside its title. */
@@ -199,7 +200,7 @@
           <button type="button" class="icon" aria-pressed={current.group === column} onclick={() => go({ ...current, group: column })}>{column ? GROUP_NAMES[column] : 'none'}</button>
         {/each}
       </span>
-      {#if total !== undefined}<span class="total">{total.toLocaleString('en-US')} executions</span>{/if}
+      {#if total !== undefined}<span class="total" aria-busy={streamed.pending ? 'true' : undefined}>{total.toLocaleString('en-US')} executions</span>{/if}
     </div>
     <div class="split">
       <div data-panel="facets">
@@ -211,6 +212,10 @@
 </div>
 
 <style>
+  /* The previous population's total while its successor is read. */
+  .total[aria-busy='true'] {
+    opacity: 0.5;
+  }
   .top {
     display: flex;
     flex-wrap: wrap;

@@ -938,6 +938,8 @@ async function liveWaitsForSupport(browser: Browser, page: Page, gate: Awaited<R
     const first = gate.held.length;
     await live.clock.runFor(25_000);
     expect([refreshes.length, gate.held.length]).toEqual([1, first]);
+    // A reread of the population the board shows marks nothing as updating, so Live never flickers.
+    expect(await live.locator('[aria-busy="true"]').count()).toBe(0);
     // A failed support read releases the next refresh, and is shown as failed.
     for (const answer of gate.held) answer.fail();
     await running(() => live.locator('[data-state="error"]').count()).toBeGreaterThan(0);
@@ -1047,6 +1049,8 @@ test('Observe reads support once per population, stops it when superseded or lef
     // Meanwhile the old facets and overview stay, each marked as updating, and the list stays usable.
     const pending = (section: typeof facets) => section.locator('[aria-busy="true"]', { has: page.getByRole('status', { name: 'Updating' }) });
     await expect.poll(() => Promise.all([pending(facets).count(), pending(overview).count()])).toEqual([1, 1]);
+    // The list bar's counts are the old population's too, so they are marked as well.
+    expect(await page.locator('.listbar .counts').getAttribute('aria-busy')).toBe('true');
     await expect.poll(() => list.locator('th button.sort').first().isEnabled()).toBe(true);
     await captureLifecycle(page, 'observe-updating');
     // A newer range supersedes it: its upstream queries are closed unread, and the newer ones are read.
@@ -2087,6 +2091,9 @@ judged('the Verify dashboard filters, groups, brushes, pages, opens an execution
     // Meanwhile the old facets and charts stay, each marked as updating, and the list stays usable.
     const updating = (panel: string) => page.locator(`[data-panel="${panel}"] [aria-busy="true"]`, { has: page.getByRole('status', { name: 'Updating' }) });
     await expect.poll(() => Promise.all([updating('facets').count(), updating('charts').count()])).toEqual([1, 1]);
+    expect(await page.locator('.listbar .total').getAttribute('aria-busy')).toBe('true');
+    // The list never pages or counts against the old total.
+    expect([await page.getByRole('button', { name: /Show \d+ more/ }).count(), await page.locator('[data-panel="list"]').textContent()]).toEqual([0, expect.not.stringMatching(/Showing 1 of \d/)]);
     await expect.poll(() => rows.first().isVisible()).toBe(true);
     await captureLifecycle(page, 'verify-updating');
     // A newer filter supersedes it: its upstream queries are closed unread.

@@ -342,9 +342,9 @@
         Filters{current.where.length ? ` · ${current.where.length}` : ''}
       </button>
       {#if totals && current.mode === 'spans'}
-        <span class="counts">{plural(totals.spans, 'span')} match · p95 {fmtDuration(totals.spanP95)}</span>
+        <span class="counts" aria-busy={streamed.pending ? 'true' : undefined}>{plural(totals.spans, 'span')} match · p95 {fmtDuration(totals.spanP95)}</span>
       {:else if totals}
-        <span class="counts">{plural(totals.traces, 'trace')} · <span class:bad={totals.errorShare > 0}>{fmtNumber(totals.errorShare)}% error</span> · p95 {fmtDuration(totals.p95)}</span>
+        <span class="counts" aria-busy={streamed.pending ? 'true' : undefined}>{plural(totals.traces, 'trace')} · <span class:bad={totals.errorShare > 0}>{fmtNumber(totals.errorShare)}% error</span> · p95 {fmtDuration(totals.p95)}</span>
       {/if}
       {@render grouping()}
       <span class="listtools" bind:this={listTools}></span>
@@ -523,6 +523,10 @@
 {/snippet}
 
 <style>
+  /* Counts of the previous population while its successor is read. */
+  .counts[aria-busy='true'] {
+    opacity: 0.5;
+  }
   .top {
     display: flex;
     flex-wrap: wrap;

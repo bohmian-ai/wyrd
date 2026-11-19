@@ -2251,6 +2251,89 @@ async fn slow_rewrap_never_holds_back_another_tenants_delivery() {
     running.stop().await;
 }
 
+/// Rewrap keeps the work it finishes: with every key-service answer held back
+/// so the tenant's stale rows together outlast one pass's tenant budget, each
+/// pass commits the rows it rewrapped before the budget ran out, and repeated
+/// passes move every row onto the active key. A rotation and a disable racing
+/// the first pass win their rows: the rotated token is the one that opens and
+/// the disabled connection stays disabled.
+///
+/// # Panics
+/// Panics when a pass commits nothing, the passes do not converge, or a
+/// racing write is lost.
+#[tokio::test]
+async fn rewrap_commits_progress_across_tenant_budgets() {
+    let transit = TransitFixture::start_delayed(Duration::from_millis(200)).await;
+    let delivery = Delivery::start_on(Some(transit.config("old", &[]))).await;
+    let tenant = delivery.seed.tenant();
+    let state = delivery.server.state();
+    let operator = state.postgres.operator_pool().expect("operator pool");
+    let kms =
+        Arc::new(WyrdKms::new(&transit.config("new", &["old"]), false).expect("rotated facade"));
+    let keys = OperatorSecrets::new(Some(Arc::clone(&kms)));
+    let budget = Duration::from_millis(600);
+    let (_, list) = delivery
+        .call(Method::GET, "/v1/operator-connections", None)
+        .await;
+    let id_of = |provider: &str| {
+        list.as_array()
+            .or_else(|| list["connections"].as_array())
+            .expect("connection list")
+            .iter()
+            .find(|view| view["provider"] == provider)
+            .and_then(|view| view["connection_id"].as_str())
+            .expect("connection")
+            .to_owned()
+    };
+    let (slack_id, pager_id) = (id_of("slack"), id_of("pager_duty"));
+
+    let slack_uri = format!("/v1/operator-connections/{slack_id}");
+    let pager_uri = format!("/v1/operator-connections/{pager_id}");
+    let rotate = json!({ "provider": "slack", "bot_token": ROTATED_TOKEN });
+    let (moved, (rotated, _), (disabled, _)) = tokio::join!(
+        keys.rewrap_pass(state.postgres.wyrd(), &operator, WAIT, budget),
+        delivery.call(Method::PATCH, &slack_uri, Some(&rotate)),
+        delivery.call(Method::DELETE, &pager_uri, None),
+    );
+    assert_eq!((rotated, disabled), (StatusCode::OK, StatusCode::OK));
+    let moved = moved.expect("the pass runs");
+    assert!(
+        (1..3).contains(&moved),
+        "one pass commits the rows it finished within its budget: {moved}"
+    );
+    let mut passes = 1;
+    while current(&delivery.assertion, tenant, &kms).await != vec![true; 3] {
+        assert!(passes < 10, "rewrap never converged");
+        keys.rewrap_pass(state.postgres.wyrd(), &operator, WAIT, budget)
+            .await
+            .expect("the pass runs");
+        passes += 1;
+    }
+
+    let mut conn = state
+        .postgres
+        .wyrd()
+        .tenant_conn(tenant)
+        .await
+        .expect("conn");
+    let slack = wyrd_sql::queries::operator_connections::get_connection(
+        &mut conn,
+        slack_id.parse().expect("connection id"),
+    )
+    .await
+    .expect("connection reads")
+    .expect("connection exists");
+    conn.commit().await.expect("read commits");
+    let opened = keys
+        .open(tenant, &slack)
+        .await
+        .expect("rotated token opens");
+    let opened: Value = serde_json::from_slice(&opened).expect("stored secret is JSON");
+    assert_eq!(opened["value"], ROTATED_TOKEN, "the rotation's token opens");
+    let (_, pager) = delivery.call(Method::GET, &pager_uri, None).await;
+    assert_eq!(pager["status"], "disabled", "the disable is kept");
+}
+
 /// A cross-tenant rewrap discovery stalled behind a lock on the connection
 /// table returns within the pass budget without touching a row, and the next
 /// pass after the stall clears rewraps every stale row.

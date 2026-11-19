@@ -160,11 +160,12 @@ impl OperatorSecrets {
     ///
     /// The whole pass, including the cross-tenant discovery read, runs under
     /// `pass_budget`, and each tenant under `tenant_budget` capped by what
-    /// remains; an overrun drops the in-flight future, which rolls back any
-    /// tenant transaction in progress. A tenant whose rewrap fails or runs
-    /// out of budget is logged and skipped so it cannot stall the others;
-    /// the next pass retries it. Without `[kms]` the pass does nothing.
-    /// Returns the rows moved.
+    /// remains; an overrun drops the in-flight future, which rolls back the
+    /// row swap in progress while every row already swapped stays committed.
+    /// A tenant whose rewrap fails or runs out of budget is logged and
+    /// skipped so it cannot stall the others; the next pass continues it. Without `[kms]` the pass does nothing.
+    /// Returns the rows moved, including those of a tenant cut off by its
+    /// budget.
     ///
     /// # Errors
     /// Returns the database error when the cross-tenant discovery read fails.
@@ -194,11 +195,11 @@ impl OperatorSecrets {
             }
             match tokio::time::timeout(
                 tenant_budget.min(remaining),
-                rewrap_tenant(kms, postgres, tenant),
+                rewrap_tenant(kms, postgres, tenant, &mut moved),
             )
             .await
             {
-                Ok(Ok(count)) => moved += count,
+                Ok(Ok(())) => {}
                 Ok(Err(error)) => {
                     tracing::warn!(%tenant, %error, "operator key rewrap skipped a tenant this pass");
                 }
@@ -215,10 +216,14 @@ impl OperatorSecrets {
 
 /// Rewrap `tenant`'s envelopes that do not name the active key.
 ///
-/// Reads the rows in one short transaction, rewraps each with no transaction
-/// open, then swaps them in one more, each fenced on the secret version and
-/// envelope it read so a concurrent rotation or replica wins. A row that does
-/// not rewrap is logged and left for the next pass.
+/// Reads the rows in one short transaction, then rewraps each with no
+/// transaction open and swaps it in its own short transaction, fenced on the
+/// secret version and envelope it read so a concurrent rotation or replica
+/// wins. Each swap commits before the next row's key-service calls, so a
+/// pass cut off by its budget keeps the rows it finished and the next pass
+/// continues from the rows still stale. A row that does not rewrap is logged
+/// and left for the next pass. Every committed swap is counted in `moved`
+/// as it commits, so the count survives a pass cut off by its budget.
 ///
 /// # Errors
 /// Returns [`SqlError`] when a read or swap fails.
@@ -226,41 +231,36 @@ async fn rewrap_tenant(
     kms: &WyrdKms,
     postgres: &WyrdPostgres,
     tenant: DataTenantId,
-) -> Result<usize, SqlError> {
+    moved: &mut usize,
+) -> Result<(), SqlError> {
     let mut conn = postgres.tenant_conn(tenant).await?;
     let rows = list_connections(&mut conn).await.map_err(SqlError::from)?;
     conn.commit().await?;
-    let mut rewrapped = Vec::new();
     for row in rows {
         if kms.is_current(&row.sealed.envelope).unwrap_or(false) {
             continue;
         }
         let identity = SecretIdentity::of(tenant, &row.view, row.secret_version);
-        match kms.rewrap(&identity.context(), &row.sealed.envelope).await {
-            Ok(envelope) => rewrapped.push((row, envelope)),
-            Err(error) => tracing::warn!(
-                %tenant,
-                connection_id = %row.view.connection_id,
-                %error,
-                "operator credential could not be rewrapped"
-            ),
-        }
-    }
-    if rewrapped.is_empty() {
-        return Ok(0);
-    }
-    let mut conn = postgres.tenant_conn(tenant).await?;
-    let mut moved = 0;
-    for (row, envelope) in &rewrapped {
-        if rewrap_connection(&mut conn, row, envelope)
+        let envelope = match kms.rewrap(&identity.context(), &row.sealed.envelope).await {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                tracing::warn!(
+                    %tenant,
+                    connection_id = %row.view.connection_id,
+                    %error,
+                    "operator credential could not be rewrapped"
+                );
+                continue;
+            }
+        };
+        let mut conn = postgres.tenant_conn(tenant).await?;
+        let swapped = rewrap_connection(&mut conn, &row, &envelope)
             .await
-            .map_err(SqlError::from)?
-        {
-            moved += 1;
-        }
+            .map_err(SqlError::from)?;
+        conn.commit().await?;
+        *moved += usize::from(swapped);
     }
-    conn.commit().await?;
-    Ok(moved)
+    Ok(())
 }
 
 /// Log that a rewrap pass ran out of budget and left the rest to the next.

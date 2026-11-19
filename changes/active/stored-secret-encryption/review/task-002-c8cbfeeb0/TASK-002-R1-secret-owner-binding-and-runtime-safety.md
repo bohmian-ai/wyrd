@@ -104,6 +104,23 @@ names to copy. Historical scenarios 2/3 TDD violations stay recorded.
    verify existing exact-envelope fences preserve them. Assert cancellation and
    other-tenant delivery remain independent. Use existing Operator integration
    fixtures/time controls; no synthetic host load or benchmark.
+   - Evidence: `secrets.rs` `rewrap_tenant` now runs the remote rewrap of one row with
+     no transaction open, then commits that row's fenced `rewrap_connection` swap in its
+     own short transaction before starting the next row. `moved` is counted through
+     `&mut`, so a tenant cut off by its budget still reports the rows it committed. The
+     existing SQL exact-envelope/version swap is reused; there is no job table or
+     scheduler.
+     `pg_operator_delivery::rewrap_commits_progress_across_tenant_budgets` holds every
+     Transit answer for 200 ms with a 600 ms tenant budget and 3 stale rows. Pass 1,
+     raced by a Slack rotation and a PagerDuty disable, commits 1–2 rows, and repeated
+     passes converge on `[true; 3]`. The rotated token opens through `OperatorSecrets::open`
+     and the disable is kept. RED, before the fix: `one pass commits the rows it finished
+     within its budget: 0`. GREEN: the operator integration selector from scenario 4
+     plus `-E 'test(/^pg_operator_delivery::(rewrap|slow_rewrap|stalled_rewrap|next_attempt)/)'`
+     passed 4/4. `slow_rewrap_never_holds_back_another_tenants_delivery` still proves the
+     other tenant's delivery, the cancelled shutdown and the rollback of a stalled pass;
+     the full Operator suite passed 19/19 apart from this test, which passed on rerun after
+     its plaintext assertion was corrected. TDD PASS.
 3. **Completed Gateway preparation failure stays 503 and recovers — finding 3.**
    Real Gateway/server/Postgres journey: complete a retryable remote unwrap failure
    and install its snapshot, then invoke repeatedly. Assert exact existing 503 code,

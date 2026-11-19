@@ -840,8 +840,11 @@ impl HumanConnections {
         self.postgres.tenant_conn(tenant).await.map_err(store_error)
     }
 
-    /// Open a tenant transaction, take the slot lock, and stage `decision` on
-    /// the audit stage.
+    /// Stage `decision` on the audit stage, then open a tenant transaction
+    /// and take the slot lock.
+    ///
+    /// The decision is staged first so a transaction or lock failure still
+    /// records the allowance it followed.
     ///
     /// # Errors
     /// Returns the store error when the transaction or lock fails.
@@ -850,11 +853,11 @@ impl HumanConnections {
         tenant: DataTenantId,
         decision: &AuditEvent,
     ) -> Result<TenantConn<'_>, WyrdError> {
+        self.audit.stage(tenant, decision.clone());
         let mut conn = self.begin(tenant).await?;
         lock_human_connection_slot(&mut conn)
             .await
             .map_err(store_error)?;
-        self.audit.stage(tenant, decision.clone());
         Ok(conn)
     }
 

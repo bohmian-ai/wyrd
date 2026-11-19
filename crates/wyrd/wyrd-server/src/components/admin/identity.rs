@@ -1059,6 +1059,75 @@ mod pg_tests {
         .expect_err("a retired connection holds nothing to renew");
         assert_eq!(retired.0.code(), "WYRD_SPEC_404_NOT_FOUND");
 
+        let restaged = owner
+            .stage(
+                tenant,
+                ConnectionInput::from_slice(&serde_json::to_vec(&body).expect("body"))
+                    .expect("candidate input is valid"),
+            )
+            .await
+            .expect("second candidate stages");
+        let second = owner
+            .put_candidate(tenant, restaged, &decision, &origin())
+            .await
+            .expect("second candidate is staged");
+        let candidate_secret = || async {
+            let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+            let row = human_connection_in_state(&mut conn, "Candidate")
+                .await
+                .expect("candidate reads")
+                .expect("candidate exists");
+            conn.commit().await.expect("commit");
+            row.client_secret_enc
+        };
+        let sealed = candidate_secret().await;
+        let (cut_pool, _) = fixture
+            .fresh_runtime_handles()
+            .await
+            .expect("separate pools connect");
+        let cut_off = test_state(&fixture, allow(), &scribe).await;
+        let audit = Arc::clone(cut_off.bifrost.scribe_outbox());
+        let cut_off = cut_off.with_owners_for_test(|owners| {
+            owners.auth.human_connections = Some(HumanConnections::new(
+                cut_pool.clone(),
+                Some(Arc::clone(&kms)),
+                ScreenedHttp::allowing_internal(),
+                audit,
+            ));
+        });
+        let encrypts = transit.requests("encrypt").await;
+        let renewal = renew_connection_encryption(
+            State(cut_off.clone()),
+            RequestOrigin(origin()),
+            caller(tenant),
+            Path(second.id),
+        );
+        let cut = async {
+            while transit.requests("encrypt").await <= encrypts {
+                tokio::task::yield_now().await;
+            }
+            cut_pool.app_pool().close().await;
+        };
+        let (failed, ()) = tokio::join!(renewal, cut);
+        assert_eq!(
+            failed
+                .expect_err("a store failure after the reseal refuses")
+                .0
+                .code(),
+            "WYRD_AUTH_503_VERIFY_UNAVAILABLE"
+        );
+        assert_eq!(
+            candidate_secret().await,
+            sealed,
+            "a renewal that cannot store writes nothing"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        assert_eq!(
+            cut_off.bifrost.scribe_outbox().settle(deadline).await,
+            0,
+            "audit settles"
+        );
+
         let denied = with_transit(
             test_state(
                 &fixture,
@@ -1086,7 +1155,9 @@ mod pg_tests {
                 "identity.oidc.connection.renew_encryption"
             )
             .await,
-            vec![("allowed".to_owned(), 5), ("denied".to_owned(), 1)]
+            vec![("allowed".to_owned(), 6), ("denied".to_owned(), 1)],
+            "each authorized renewal stages one allowance, even when its store fails \
+             after the reseal"
         );
     }
 }

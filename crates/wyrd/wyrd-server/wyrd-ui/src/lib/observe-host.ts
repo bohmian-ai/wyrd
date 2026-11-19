@@ -231,6 +231,16 @@ export function closed(state: ObserveState): ObserveState {
   return { ...state, trace: undefined, span: undefined, log: undefined };
 }
 
+/**
+ * The population the supporting reads count: the signal and mode, the range
+ * and the filters. The list's own choices (columns, order, page, grouping,
+ * metric series and points), Live and the open record are cleared, so paging
+ * or sorting names the same population and never reads its support again.
+ */
+export function population(state: ObserveState): ObserveState {
+  return { ...closed(state), tz: 'utc', group: undefined, live: false, columns: undefined, sort: undefined, page: undefined, agg: undefined, by: undefined, apart: undefined, points: false };
+}
+
 /** The state over another absolute range, keeping the preset a reset returns to. */
 export function zoomed(state: ObserveState, from: number, to: number): ObserveState {
   return { ...closed(state), from: new Date(from).toISOString(), to: new Date(to).toISOString() };

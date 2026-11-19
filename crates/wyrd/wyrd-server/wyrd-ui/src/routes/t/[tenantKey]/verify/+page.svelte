@@ -13,14 +13,14 @@
 </script>
 
 <script lang="ts">
-  import { untrack } from 'svelte';
+  import { onDestroy, untrack } from 'svelte';
   import { goto, invalidate } from '$app/navigation';
   import { page } from '$app/state';
   import { Chart, EmptyState, FacetRail, RecordTable, type ActionIntent, type ActionState } from 'wyrd-ai-ui';
   import { NO_VERDICT, validateIntent, type ChartProps, type ComponentName } from 'wyrd-ai-ui/loaders';
   import TimePicker, { type PickedRange, type Zone } from '$lib/TimePicker.svelte';
   import { Streamed } from '$lib/streamed.svelte';
-  import { PRESETS, appliedRange, moved, writeState, zoomed, type ObserveState } from '$lib/observe-host';
+  import { PRESETS, appliedRange, moved, population, writeState, zoomed, type ObserveState } from '$lib/observe-host';
   import { VERIFY_GROUPS, VERIFY_MOST, VERIFY_PAGE, verifyStep, whereText } from '$lib/verify-host';
   import type { PageProps } from './$types';
 
@@ -35,11 +35,33 @@
   const base = $derived(`/t/${encodeURIComponent(data.tenant.key)}`);
   const current = $derived(data.state);
   const verify = $derived(data.verify);
-  /** Facets, charts and Verifier names: in the first HTML, then streamed after the list on each navigation and refresh. */
-  type Support = Awaited<Extract<typeof data.verify, { support: unknown }>['support']>;
+  /** Facets, charts and Verifier names: in the first HTML, then read from `verify/support` when their population changes and on each Live refresh. */
+  type Support = NonNullable<Extract<typeof data.verify, { support: unknown }>['support']>;
   const streamed = new Streamed<Support>(remembered as Map<string, Support>);
-  $effect.pre(() => streamed.follow('problem' in verify ? undefined : verify.support, untrack(() => page.url.href)));
-  const support = $derived('problem' in verify || verify.support instanceof Promise ? streamed.value : verify.support);
+  // The first HTML renders its own support: effects never run on the server. A remount with none shows its address's remembered support.
+  untrack(() => 'problem' in data.verify || (data.verify.support && streamed.follow(data.verify.support, remembering())));
+  onDestroy(() => streamed.stop());
+  /** The population support counts; paging, sorting and grouping keep it. */
+  const populationKey = $derived('problem' in verify ? undefined : writeState(population(current)).toString());
+  /** Where support is remembered: its population, which list choices share, so Back to any of them keeps the page's height. */
+  function remembering() {
+    return `${base}/verify?${writeState(population(data.state))}`;
+  }
+  /** Read support for the current population under the range the list was read in. */
+  const readSupport = () => {
+    if (!data.range || 'problem' in data.verify) return Promise.resolve();
+    const search = writeState({ ...population(data.state), from: data.range.from, to: data.range.to });
+    return streamed.read(`${base}/verify/support?${search}`, remembering());
+  };
+  $effect.pre(() => {
+    void populationKey;
+    untrack(() => {
+      if ('problem' in verify) return streamed.follow(undefined, remembering());
+      if (verify.support) return streamed.follow(verify.support, remembering());
+      void readSupport();
+    });
+  });
+  const support = $derived(streamed.value);
   const labels = $derived(support?.labels ?? {});
   const where = $derived(whereText(current));
 
@@ -68,12 +90,16 @@
     };
   }
 
-  // Live waits for each refresh before timing the next, so slow refreshes never pile up.
+  // Live waits for each refresh, its list and then its support, before timing the next, so slow refreshes never pile up.
   $effect(() => {
     if (!current.live) return;
     let timer: ReturnType<typeof setTimeout>;
     let stopped = false;
-    const tick = () => (timer = setTimeout(() => void invalidate('wyrd:verify').finally(() => stopped || tick()), LIVE_MS));
+    const refresh = async () => {
+      await invalidate('wyrd:verify');
+      if (!stopped) await readSupport();
+    };
+    const tick = () => (timer = setTimeout(() => void refresh().finally(() => stopped || tick()), LIVE_MS));
     tick();
     return () => ((stopped = true), clearTimeout(timer));
   });

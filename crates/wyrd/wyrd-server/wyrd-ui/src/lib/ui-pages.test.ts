@@ -86,7 +86,7 @@ test('observe signal planning and interactions', async () => {
   // Both stats count the same records, so one read answers them; errors are that read's FILTER.
   expect(logReads).toHaveLength(1);
   for (const call of logReads) expect(call.op === 'bifrost.query' && call.sql).toMatch(/FROM bifrost\.logs\.records WHERE .*severity_text = \$\d.*\(body_text LIKE '%refund%'\)/);
-  expect(logReads[0].op === 'bifrost.query' && logReads[0].sql).toContain('count(*) AS s0, count(*) FILTER (WHERE severity_number >= 17) AS s1 FROM');
+  expect(logReads[0].op === 'bifrost.query' && logReads[0].sql).toContain('count(*) AS s0, count(*) FILTER (WHERE severity_number >= 17) AS s1, count(*) FILTER (WHERE severity_number >= 17) AS m1 FROM');
   expect(validatePanel('StatStrip', { stats: ['logs', 'spans'], where: [{ column: 'severity_text', value: 'ERROR' }] })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
   expect(validatePanel('StatStrip', { stats: ['logs'], where: [{ column: 'name', value: 'x' }] })).toMatchObject({ detail: expect.stringContaining('name is not a logs column') });
 
@@ -933,11 +933,64 @@ import UndeclaredPage from '../routes/t/[tenantKey]/repositories/github/[reposit
 import { load as loadGithub } from '../routes/t/[tenantKey]/settings/integrations/github/+page.server';
 import GithubPage from '../routes/t/[tenantKey]/settings/integrations/github/+page.svelte';
 import { connectionExecutor } from '$lib/ui-fixtures';
+import { EventEmitter } from 'node:events';
+import { GET as getObserveSupport } from '../routes/t/[tenantKey]/observe/support/+server';
+import { GET as getVerifySupport } from '../routes/t/[tenantKey]/verify/support/+server';
 
-test('navigating away cancels the supporting reads a refresh is still streaming', async () => {
-  // Supporting reads hang until their request is cancelled; each records the signal it was given.
+/** The supporting reads of Observe and Verify: facets, overview, timeline, discovery charts and Card names. */
+const supporting = (request: WireRequest) => request.op === 'cards.list' || (request.op === 'bifrost.query' && /GROUPING SETS|grouping\(at\)/.test(request.sql));
+/** One request as this tenant's browser session, over `socket` when one is given. */
+const asSession = (path: string, more: Record<string, unknown> = {}) => {
+  const url = new URL(`http://ui.test/t/acme/${path}`);
+  return { locals: { browserSession: { client: () => ({}) } }, url, request: new Request(url), depends: () => {}, ...more } as never;
+};
+/** A fixed window, so two reads of one population bind the same bounds. */
+const WINDOW = '&from=2026-10-20T00%3A00%3A00.000Z&to=2026-10-21T00%3A00%3A00.000Z';
+
+test('a client navigation reads only its list, and support reads the population whatever the list shows', async () => {
+  const requests: WireRequest[] = [];
+  host.executor = { run: (batch, signal) => (requests.push(...batch), fixtureExecutor.run(batch, signal)) };
+  // Paging, sorting, grouping and shown columns rerun the list and no supporting read.
+  for (const [load, path, section] of [
+    [loadVerify, `verify?sort=status:asc&shown=100&group=run_id${WINDOW}`, 'verify'],
+    [loadObserve, `observe?sort=name:asc&group=name${WINDOW}`, 'observe']
+  ] as const) {
+    requests.length = 0;
+    const data = (await (load as (event: never) => Promise<unknown>)(asSession(path, { isDataRequest: true }))) as Record<string, { list: { result: { state: string } }; support?: unknown }>;
+    expect(data[section].list.result.state).not.toBe('error');
+    expect(data[section].support).toBeUndefined();
+    expect(requests.filter(supporting)).toEqual([]);
+    expect(requests.length).toBeGreaterThan(0);
+  }
+
+  // The support routes read the population only: list choices change nothing they read or answer.
+  const read = async (handler: (event: never) => Promise<Response>, path: string) => {
+    requests.length = 0;
+    const response = await handler(asSession(path));
+    return { status: response.status, body: await response.json(), requests: [...requests] };
+  };
+  for (const [handler, path, list] of [
+    [getVerifySupport, 'verify/support?', `&sort=status:asc&shown=100&group=run_id&live=1`],
+    [getObserveSupport, 'observe/support?', `&sort=name:asc&columns=${encodeURIComponent('["name"]')}&group=name&live=1&trace=${'a'.repeat(32)}`]
+  ] as const) {
+    const whole = await read(handler, `${path}${WINDOW.slice(1)}`);
+    expect(whole.status).toBe(200);
+    expect(whole.body.facets.result.state).toBe('populated');
+    expect(whole.requests.some(supporting)).toBe(true);
+    expect(whole.requests.some((request) => request.op === 'bifrost.query' && !supporting(request))).toBe(false);
+    expect(await read(handler, `${path}${WINDOW.slice(1)}${list}`)).toEqual(whole);
+    // A refused population is answered with its stable problem and reads nothing.
+    const refused = await read(handler, `${path}where=${encodeURIComponent(JSON.stringify([{ column: 'secret', value: 1 }]))}${WINDOW}`);
+    expect(refused).toMatchObject({ status: 400, body: { code: 'WYRD_SPEC_400_VALIDATION' }, requests: [] });
+  }
+
+  // The first HTML still carries every section.
+  const first = (await loadVerify(asSession('verify', { isDataRequest: false }))) as unknown as { verify: { support: { facets: { result: { state: string } } } } };
+  expect(first.verify.support.facets.result.state).toBe('populated');
+});
+
+test('a support read stops its upstream reads when the browser closes the connection, and leaves the connection as it found it', async () => {
   const signals: AbortSignal[] = [];
-  const supporting = (request: WireRequest) => request.op === 'cards.list' || (request.op === 'bifrost.query' && /GROUPING SETS|grouping\(at\)/.test(request.sql));
   host.executor = {
     run: async (batch, signal) => {
       if (!batch.some(supporting)) return fixtureExecutor.run(batch, signal);
@@ -945,68 +998,72 @@ test('navigating away cancels the supporting reads a refresh is still streaming'
       return new Promise((_, reject) => signal?.addEventListener('abort', () => reject(signal.reason)));
     }
   };
-  const leave = new AbortController();
-  const event = (path: string) => {
-    const url = new URL(`http://ui.test/t/acme/${path}`);
-    return { locals: { browserSession: { client: () => ({}) } }, url, request: new Request(url, { signal: leave.signal }), depends: () => {}, isDataRequest: true } as never;
-  };
-  type Streamed = { support: Promise<unknown> };
-  const verify = ((await loadVerify(event('verify'))) as unknown as { verify: Streamed }).verify;
-  const observe = ((await loadObserve(event('observe'))) as unknown as { observe: Streamed }).observe;
-  expect(signals.length).toBeGreaterThan(0);
-  expect(signals.some((signal) => signal.aborted)).toBe(false);
-
-  leave.abort();
-  expect(signals.every((signal) => signal.aborted)).toBe(true);
-  await expect(verify.support).rejects.toBeDefined();
-  await expect(observe.support).rejects.toBeDefined();
-});
-
-test('a client refresh returns its list while supporting reads are still pending', async () => {
-  // Facets, overview, discovery and Card names wait until released; the list answers at once.
-  let release = () => {};
-  const held = new Promise<void>((resolve) => (release = resolve));
-  const supporting = (request: WireRequest) => request.op === 'cards.list' || (request.op === 'bifrost.query' && /GROUPING SETS|grouping\(at\)/.test(request.sql));
-  host.executor = { run: async (batch, signal) => (batch.some(supporting) && (await held), fixtureExecutor.run(batch, signal)) };
-  const event = (path: string, isDataRequest: boolean) => {
-    const url = new URL(`http://ui.test/t/acme/${path}`);
-    return { locals: { browserSession: { client: () => ({}) } }, url, request: new Request(url), depends: () => {}, isDataRequest } as never;
-  };
-  const settled = (promise: Promise<unknown>) => Promise.race([promise.then(() => 'returned'), new Promise((resolve) => setTimeout(() => resolve('waiting'), 50))]);
-  type Streamed = { list: { result: { state: string } }; support: Promise<{ facets: { result: { state: string } } }> };
-
-  const verify = Promise.resolve(loadVerify(event('verify', true)));
-  const observe = Promise.resolve(loadObserve(event('observe', true)));
-  expect([await settled(verify), await settled(observe)]).toEqual(['returned', 'returned']);
-  const lists = [((await verify) as unknown as { verify: Streamed }).verify, ((await observe) as unknown as { observe: Streamed }).observe];
-  expect(lists.map((loaded) => loaded.list.result.state)).toEqual(['populated', 'populated']);
-
-  // The first HTML still waits for every section, so it carries them all.
-  const first = Promise.resolve(loadVerify(event('verify', false)));
-  expect(await settled(first)).toBe('waiting');
-  release();
-  expect(((await first) as unknown as { verify: { support: { facets: { result: { state: string } } } } }).verify.support.facets.result.state).toBe('populated');
-  for (const loaded of lists) expect((await loaded.support).facets.result.state).toBe('populated');
-});
-
-test('Live refreshes the dashboard one load at a time', async () => {
+  for (const [handler, path] of [
+    [getVerifySupport, 'verify/support'],
+    [getObserveSupport, 'observe/support']
+  ] as const) {
+    signals.length = 0;
+    const socket = new EventEmitter();
+    const read = handler(asSession(path, { platform: { req: { socket } } }));
+    await vi.waitFor(() => expect(signals.length).toBeGreaterThan(0));
+    expect(signals.some((signal) => signal.aborted)).toBe(false);
+    socket.emit('close');
+    expect(signals.every((signal) => signal.aborted)).toBe(true);
+    await expect(read).rejects.toBeDefined();
+    expect(socket.listenerCount('close')).toBe(0);
+  }
+  // A completed read stops listening, so a kept-alive connection gathers no listeners.
   host.executor = fixtureExecutor;
-  const url = new URL('http://ui.test/t/acme/verify?live=1');
-  const data = await loadVerify({ locals: { browserSession: { client: () => ({}) } }, url, request: new Request(url), depends: () => {}, isDataRequest: false } as never);
-  // A refresh that has not finished holds back the next tick.
-  let finish = () => {};
-  vi.mocked(invalidate).mockReset().mockImplementation(() => new Promise<void>((resolve) => (finish = resolve)));
+  const socket = new EventEmitter();
+  expect((await getVerifySupport(asSession('verify/support', { platform: { req: { socket } } }))).status).toBe(200);
+  expect(socket.listenerCount('close')).toBe(0);
+});
+
+test('Live starts no refresh until the last refresh has read its support, and stops when the page goes', async () => {
+  host.executor = fixtureExecutor;
+  const data = await loadVerify(asSession('verify?live=1', { isDataRequest: false }));
+  const body = JSON.stringify((data as unknown as { verify: { support: unknown } }).verify.support);
+  const answers: ((response: Response) => void)[] = [];
+  const fetched = vi.spyOn(globalThis, 'fetch').mockImplementation(() => new Promise<Response>((resolve) => answers.push(resolve)));
+  vi.mocked(invalidate).mockReset().mockResolvedValue(undefined);
   vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
   try {
-    render(VerifyPage, { data: { ...data, tenant: { key: 'acme', name: 'Acme' } } } as never);
+    const page = render(VerifyPage, { data: { ...data, tenant: { key: 'acme', name: 'Acme' } } } as never);
+    // The list refreshed at once; its support is still being read across three more tick opportunities.
     await vi.advanceTimersByTimeAsync(35_000);
     expect(invalidate).toHaveBeenCalledTimes(1);
     expect(invalidate).toHaveBeenCalledWith('wyrd:verify');
-    finish();
+    expect(fetched).toHaveBeenCalledTimes(1);
+    const [href, init] = fetched.mock.calls[0] as [string, RequestInit];
+    expect(href).toMatch(/^\/t\/acme\/verify\/support\?/);
+    expect(new URL(href, 'http://ui.test').searchParams.get('live')).toBeNull();
+    expect(init.signal?.aborted).toBe(false);
+
+    // A failed support read settles the refresh: the list stays, the failure is said, and the next tick runs.
+    answers[0](new Response(JSON.stringify(wyrdProblem('upstream', 'connection reset')), { status: 502, headers: { 'content-type': 'application/problem+json' } }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(page.getByRole('region', { name: 'executions rows' })).toBeInTheDocument();
+    expect(page.container).toHaveTextContent('connection reset');
     await vi.advanceTimersByTimeAsync(10_000);
     expect(invalidate).toHaveBeenCalledTimes(2);
+    expect(fetched).toHaveBeenCalledTimes(2);
+
+    // A successful one does too, and shows what it read.
+    answers[1](new Response(body, { status: 200, headers: { 'content-type': 'application/json' } }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(page.container).not.toHaveTextContent('connection reset');
+    expect(page.getByRole('region', { name: 'By Verifier' })).toBeInTheDocument();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(invalidate).toHaveBeenCalledTimes(3);
+
+    // Leaving cancels the read in flight, and no tick follows.
+    page.unmount();
+    expect((fetched.mock.calls[2][1] as RequestInit).signal?.aborted).toBe(true);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(invalidate).toHaveBeenCalledTimes(3);
   } finally {
     vi.useRealTimers();
+    fetched.mockRestore();
   }
 });
 

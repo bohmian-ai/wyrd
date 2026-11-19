@@ -11,13 +11,13 @@
 
 <script lang="ts">
   import { enhance } from '$app/forms';
-  import { untrack } from 'svelte';
+  import { onDestroy, untrack } from 'svelte';
   import { goto, invalidate } from '$app/navigation';
   import { page } from '$app/state';
   import { Chart, Drawer, EmptyState, FacetRail, RecordTable, fmtDuration, fmtNumber, type ActionIntent, type ActionState, type Problem } from 'wyrd-ai-ui';
   import { MAX_GROUP_KEYS, METRIC_AGGREGATIONS, METRIC_GROUP_KEYS, METRIC_NAMES, SIGNALS, columnLabel, validateIntent, type ComponentName } from 'wyrd-ai-ui/loaders';
   import TimePicker, { type PickedRange, type Zone } from '$lib/TimePicker.svelte';
-  import { PRESETS, appliedRange, closed, groupColumns, moved, readState, selectedMetric, step, writeState, zoomed, type HostFilter, type ObserveState } from '$lib/observe-host';
+  import { PRESETS, appliedRange, closed, groupColumns, moved, population, readState, selectedMetric, step, writeState, zoomed, type HostFilter, type ObserveState } from '$lib/observe-host';
   import { Streamed } from '$lib/streamed.svelte';
   import type { LayoutProps } from './$types';
 
@@ -36,11 +36,33 @@
   const current = $derived(readState(page.url.searchParams));
   const observe = $derived(data.observe);
   const view = $derived('problem' in observe ? undefined : observe);
-  /** Overview, timeline, facets and metric names: in the first HTML, then streamed after the list on each navigation and refresh. */
-  type Support = Awaited<NonNullable<typeof view>['support']>;
+  /** Overview, timeline, facets and metric names: in the first HTML, then read from `observe/support` when their population changes and on each Live refresh. */
+  type Support = NonNullable<NonNullable<typeof view>['support']>;
   const streamed = new Streamed<Support>(remembered as Map<string, Support>);
-  $effect.pre(() => streamed.follow(view?.support, untrack(() => page.url.href)));
-  const support = $derived(!view || view.support instanceof Promise ? streamed.value : view.support);
+  // The first HTML renders its own support: effects never run on the server. A remount with none shows its address's remembered support.
+  untrack(() => 'problem' in data.observe || (data.observe.support && streamed.follow(data.observe.support, remembering())));
+  onDestroy(() => streamed.stop());
+  /** The population support counts; paging, sorting, columns, grouping and the open record keep it. */
+  const populationKey = $derived(view ? writeState(population(current)).toString() : undefined);
+  /** Where support is remembered: its population, which list choices share, so Back to any of them keeps the page's height. */
+  function remembering() {
+    return `${base}/observe?${writeState(population(readState(page.url.searchParams)))}`;
+  }
+  /** Read support for the current population under the range the list was read in. */
+  const readSupport = () => {
+    if (!data.range || 'problem' in data.observe) return Promise.resolve();
+    const search = writeState({ ...population(readState(page.url.searchParams)), from: data.range.from, to: data.range.to });
+    return streamed.read(`${base}/observe/support?${search}`, remembering());
+  };
+  $effect.pre(() => {
+    void populationKey;
+    untrack(() => {
+      if (!view) return streamed.follow(undefined, remembering());
+      if (view.support) return streamed.follow(view.support, remembering());
+      void readSupport();
+    });
+  });
+  const support = $derived(streamed.value);
   const form = $derived(page.form as { draft?: string; problem?: Problem } | null);
 
   /** The URL of `next`, on its first page when it reads another list. */
@@ -76,12 +98,16 @@
     };
   }
 
-  // Live waits for each refresh before timing the next, so slow refreshes never pile up.
+  // Live waits for each refresh, its list and then its support, before timing the next, so slow refreshes never pile up.
   $effect(() => {
     if (!current.live) return;
     let timer: ReturnType<typeof setTimeout>;
     let stopped = false;
-    const tick = () => (timer = setTimeout(() => void invalidate('wyrd:observe').finally(() => stopped || tick()), LIVE_MS));
+    const refresh = async () => {
+      await invalidate('wyrd:observe');
+      if (!stopped) await readSupport();
+    };
+    const tick = () => (timer = setTimeout(() => void refresh().finally(() => stopped || tick()), LIVE_MS));
     tick();
     return () => ((stopped = true), clearTimeout(timer));
   });

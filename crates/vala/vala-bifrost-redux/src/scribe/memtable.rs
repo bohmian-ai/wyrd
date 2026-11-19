@@ -2904,52 +2904,95 @@ impl PreparedSource {
     /// [`AdaptedRequirements::evaluate`]). A predicate that does not evaluate
     /// filters nothing here; the query's own filter still runs.
     ///
+    /// The batches at `ats` of `run` evaluate together: their physical
+    /// projections are concatenated into one batch first, so each step below
+    /// runs once for all of them. Every one of them stores its columns in
+    /// [`Self::physical`]'s layout (see [`LiveBatch::joins`]).
+    ///
     /// The output grows the query's reservation by the allocations it does
-    /// not share with its captured batch. While the batch is filtered or
-    /// reconstructed, a workspace reservation beside it holds the batches it
-    /// copies; it is released before the output is reserved, so an
-    /// allocation the output keeps from it is charged once.
+    /// not share with its captured batches. While the batches are joined,
+    /// filtered, or reconstructed, workspace reservations beside them hold
+    /// the batches evaluation copies; they are released before the output is
+    /// reserved, so an allocation the output keeps from them is charged once.
     ///
     /// # Errors
     ///
-    /// Returns an internal error when Variant reconstruction, Arrow cast,
-    /// requirement evaluation, or batch assembly fails, or the query's pool
-    /// refuses the workspace or the output.
+    /// Returns an internal error when concatenation, Variant reconstruction,
+    /// Arrow cast, requirement evaluation, or batch assembly fails, or the
+    /// query's pool refuses a workspace or the output.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `ats` is empty or names a batch `run` does not hold.
     fn evaluate(
         &self,
         run: usize,
-        at: usize,
+        ats: &[usize],
         mut statistics: Arc<Statistics>,
     ) -> Result<Option<(RecordBatch, Arc<Statistics>)>, ScribeError> {
         let source = &self.source;
-        let batch = &source.runs[run].batches[at];
-        count_examined(
-            batch,
-            source.runs[run].statistics.get(at).map(AsRef::as_ref),
-            &self.projection,
-        );
+        let appends = &source.runs[run];
+        for &at in ats {
+            count_examined(
+                &appends.batches[at],
+                appends.statistics.get(at).map(AsRef::as_ref),
+                &self.projection,
+            );
+        }
+        let batch = &appends.batches[ats[0]];
         let refused = |error: datafusion::error::DataFusionError| ScribeError::Internal {
             detail: format!("live-tail query memory refused: {error}"),
         };
+        // Every batch the output keeps derives from the source columns the
+        // projection reads, so only their allocations can be shared with it;
+        // they are collected once for every charge against these batches.
+        let captured = crate::scribe::memory::allocations(ats.iter().flat_map(|&at| {
+            self.projection.iter().filter_map(move |(_, source)| {
+                source.map(|column| appends.batches[at].column(column))
+            })
+        }));
+        let projected = |at: usize| {
+            physical_projection(
+                &appends.batches[at],
+                &self.schema,
+                &self.projection,
+                Some(&self.physical),
+            )
+        };
+        let joined = self.query.new_empty();
+        let (mut physical, held) = if let [at] = ats {
+            (projected(*at), captured.clone())
+        } else {
+            let parts: Vec<RecordBatch> = ats.iter().map(|&at| projected(at)).collect();
+            let physical =
+                arrow::compute::concat_batches(&self.physical, &parts).map_err(|error| {
+                    ScribeError::Internal {
+                        detail: format!("live-tail batch concatenation failed: {error}"),
+                    }
+                })?;
+            joined
+                .try_resize(crate::scribe::memory::unshared_beyond(
+                    std::slice::from_ref(&physical),
+                    captured.clone(),
+                ))
+                .map_err(refused)?;
+            // `joined` charges the concatenation, so a batch held below
+            // shares its allocations as it shares the captured ones.
+            let mut held = captured.clone();
+            held.extend(crate::scribe::memory::allocations(physical.columns()));
+            held.sort_unstable();
+            held.dedup();
+            (physical, held)
+        };
         let workspace = self.query.new_empty();
-        // Every batch held below derives from the source columns the
-        // projection reads, so only their allocations can be shared; they
-        // are collected once for every charge against this batch.
-        let captured = crate::scribe::memory::allocations(
-            self.projection
-                .iter()
-                .filter_map(|(_, source)| source.map(|column| batch.column(column))),
-        );
-        let hold = |held: &[RecordBatch]| {
+        let hold = |batches: &[RecordBatch]| {
             workspace
                 .try_resize(crate::scribe::memory::unshared_beyond(
-                    held,
-                    captured.clone(),
+                    batches,
+                    held.clone(),
                 ))
                 .map_err(refused)
         };
-        let mut physical =
-            physical_projection(batch, &self.schema, &self.projection, Some(&self.physical));
         let batch = if let Some((requirements, adapted)) = &self.requirements {
             let Some((batch, evaluated)) = adapted.evaluate(
                 requirements,
@@ -2984,9 +3027,10 @@ impl PreparedSource {
             }
             source.logical_batch(&self.schema, &self.projection, &physical)?
         };
-        // The workspace is gone once the output exists, so the query takes
-        // over whatever allocations the output kept from it.
+        // The workspaces are gone once the output exists, so the query takes
+        // over whatever allocations the output kept from them.
         drop(workspace);
+        drop(joined);
         self.query
             .try_grow(crate::scribe::memory::unshared_beyond(
                 std::slice::from_ref(&batch),
@@ -3024,6 +3068,55 @@ impl LiveBatch {
         &self.statistics
     }
 
+    /// Returns the rows the captured batch holds before evaluation.
+    pub(crate) fn rows(&self) -> usize {
+        self.source.source.runs[self.run].batches[self.at].num_rows()
+    }
+
+    /// Whether [`Self::evaluate_joined`] can evaluate `other` together with
+    /// this batch: both are batches of one prepared read and append run, and
+    /// both store the read's columns in its physical layout, so their
+    /// physical projections concatenate.
+    pub(crate) fn joins(&self, other: &Self) -> bool {
+        let stores_like = |batch: &Self| {
+            stores_like(
+                &self.source.source.runs[batch.run].batches[batch.at],
+                &self.source.projection,
+                &self.source.physical,
+            )
+        };
+        Arc::ptr_eq(&self.source, &other.source)
+            && self.run == other.run
+            && stores_like(self)
+            && stores_like(other)
+    }
+
+    /// Evaluates `batches`, each joining the first (see [`Self::joins`]), as
+    /// one: their rows, in order, filtered, projected, and reconstructed in
+    /// one pass, or `None` when no row is kept or `batches` is empty. A lone
+    /// batch evaluates in whatever layout it stores.
+    ///
+    /// # Errors
+    ///
+    /// Returns an internal error when one of several batches does not join
+    /// the first, or
+    /// [`Self::evaluate`]'s error.
+    pub(crate) fn evaluate_joined(batches: &[Self]) -> Result<Option<RecordBatch>, ScribeError> {
+        let Some(first) = batches.first() else {
+            return Ok(None);
+        };
+        if batches.len() > 1 && !batches.iter().all(|batch| first.joins(batch)) {
+            return Err(ScribeError::Internal {
+                detail: "live-tail batches evaluated together do not join".to_owned(),
+            });
+        }
+        let ats: Vec<usize> = batches.iter().map(|batch| batch.at).collect();
+        Ok(first
+            .source
+            .evaluate(first.run, &ats, Arc::clone(&first.bounds))?
+            .map(|(batch, _)| batch))
+    }
+
     /// Filters, projects, and reconstructs the batch now, returning its rows
     /// in the read's output columns, or `None` when no row is kept.
     ///
@@ -3031,10 +3124,11 @@ impl LiveBatch {
     ///
     /// Returns an internal error when evaluation fails or the query's pool
     /// refuses what it allocates (see [`PreparedSource::evaluate`]).
+    #[cfg(test)]
     pub(crate) fn evaluate(&self) -> Result<Option<RecordBatch>, ScribeError> {
         Ok(self
             .source
-            .evaluate(self.run, self.at, Arc::clone(&self.bounds))?
+            .evaluate(self.run, &[self.at], Arc::clone(&self.bounds))?
             .map(|(batch, _)| batch))
     }
 
@@ -3049,7 +3143,7 @@ impl LiveBatch {
         let source = &self.source.source;
         Ok(self
             .source
-            .evaluate(self.run, self.at, Arc::clone(&self.bounds))?
+            .evaluate(self.run, &[self.at], Arc::clone(&self.bounds))?
             .map(|(batch, statistics)| ReadableBatch {
                 partition_day: source.seal_key.partition.time(),
                 wal_lsn_max: source.runs[self.run].wal_lsns[self.at],
@@ -3116,19 +3210,7 @@ fn physical_projection(
         })
         .collect();
     let physical = cached
-        .filter(|cached| {
-            projection
-                .iter()
-                .zip(cached.fields())
-                .all(|((_, source), field)| {
-                    source.is_none_or(|column| {
-                        let stored = stored.field(column);
-                        stored.data_type() == field.data_type()
-                            && stored.is_nullable() == field.is_nullable()
-                            && stored.metadata() == field.metadata()
-                    })
-                })
-        })
+        .filter(|cached| stores_like(batch, projection, cached))
         .map_or_else(
             || {
                 Arc::new(Schema::new(
@@ -3152,6 +3234,28 @@ fn physical_projection(
         &arrow::array::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
     )
     .expect("columns taken from one batch share its row count and their own fields")
+}
+
+/// Whether `batch` stores every column `projection` reads in a field of the
+/// type, nullability, and metadata of `physical`'s field for it, so its
+/// [`physical_projection`] is in `physical`'s layout.
+fn stores_like(
+    batch: &RecordBatch,
+    projection: &[(FieldRef, Option<usize>)],
+    physical: &Schema,
+) -> bool {
+    let stored = batch.schema_ref();
+    projection
+        .iter()
+        .zip(physical.fields())
+        .all(|((_, source), field)| {
+            source.is_none_or(|column| {
+                let stored = stored.field(column);
+                stored.data_type() == field.data_type()
+                    && stored.is_nullable() == field.is_nullable()
+                    && stored.metadata() == field.metadata()
+            })
+        })
 }
 
 /// Computes one append batch's exact row count, every column's byte size,
@@ -3740,6 +3844,76 @@ pub(crate) mod tests {
         assert!(!Arc::ptr_eq(&other.schema(), &cached));
         assert_eq!(other.schema().field(0).name(), "id");
         assert_eq!(other.schema().field(0).data_type(), &DataType::Utf8);
+    }
+
+    /// Appends of one source and run join, and evaluate together as one
+    /// batch holding every row in the order given, examining each row once;
+    /// an append of another generation joins none of them, evaluates alone,
+    /// and is refused in a group with them.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the joins differ, the joined rows differ from the appends'
+    /// rows, a row is examined other than once, the lone batch does not
+    /// evaluate, or the mixed group evaluates.
+    #[test]
+    fn appends_of_one_run_evaluate_joined_as_one_batch() {
+        use arrow::array::AsArray as _;
+
+        let memtable = Memtable::new();
+        let key = make_test_seal_key();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let insert = |lsn: u64, ids: Vec<i64>| {
+            let batch =
+                RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int64Array::from(ids))])
+                    .expect("batch");
+            memtable
+                .insert(&key, make_test_meta(lsn), batch)
+                .expect("insert");
+        };
+        insert(1, vec![0]);
+        memtable.freeze(&key).expect("older generation");
+        insert(2, vec![1, 2]);
+        insert(3, vec![3]);
+        insert(4, vec![4, 5]);
+        let capture = LiveCapture::take([&memtable], key.tenant, &key.table, None)
+            .expect("locks")
+            .expect("no registry to wait on");
+        let partitions = key.partition.time()..=key.partition.time();
+        let read = capture
+            .read(&partitions, schema.fields(), None, None, &unbounded_pool())
+            .expect("capture read");
+        let lsn = |batch: &LiveBatch| {
+            batch
+                .readable()
+                .expect("evaluates")
+                .expect("rows")
+                .wal_lsn_max
+                .as_u64()
+        };
+        let (older, current): (Vec<&LiveBatch>, Vec<&LiveBatch>) =
+            read.batches.iter().partition(|batch| lsn(batch) == 1);
+        let current: Vec<LiveBatch> = current.into_iter().cloned().collect();
+
+        assert!(current.iter().all(|batch| current[0].joins(batch)));
+        assert!(!current.iter().any(|batch| older[0].joins(batch)));
+        let before = live_scan_for_test().0;
+        let joined = LiveBatch::evaluate_joined(&current)
+            .expect("evaluates")
+            .expect("rows");
+        assert_eq!(live_scan_for_test().0 - before, 5);
+        assert_eq!(
+            joined
+                .column(0)
+                .as_primitive::<arrow::datatypes::Int64Type>()
+                .values(),
+            &[1, 2, 3, 4, 5]
+        );
+        let alone = LiveBatch::evaluate_joined(&[older[0].clone()])
+            .expect("a lone batch evaluates")
+            .expect("rows");
+        assert_eq!(alone.num_rows(), 1);
+        assert!(LiveBatch::evaluate_joined(&[current[0].clone(), older[0].clone()]).is_err());
     }
 
     /// Identity bounds are each column's byte-ordered extremes, skipping

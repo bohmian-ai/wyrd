@@ -50,20 +50,36 @@ pub(super) enum MemtableRows {
 }
 
 impl MemtableRows {
-    /// Evaluates the rows in `schema`, the source's columns, or `None` when
-    /// the capture's own filter keeps none of them.
+    /// Evaluates `group` as one batch in `schema`, or `None` when the
+    /// captures' own filter keeps none of its rows: one fixture's rows, or
+    /// captured batches that join (see
+    /// [`crate::scribe::memtable::LiveBatch::joins`]).
     ///
     /// # Errors
     ///
     /// Returns the Scribe evaluation error, or the `DataFusion` error raised
     /// when the evaluated rows do not project to `schema`.
-    fn evaluate(&self, schema: &SchemaRef) -> DataFusionResult<Option<RecordBatch>> {
-        let rows = match self {
-            Self::Captured(batch) => batch
-                .evaluate()
-                .map_err(|error| DataFusionError::External(Box::new(error)))?,
+    fn evaluate_joined(
+        group: &[Self],
+        schema: &SchemaRef,
+    ) -> DataFusionResult<Option<RecordBatch>> {
+        let rows = match group {
+            [] => None,
             #[cfg(test)]
-            Self::Evaluated(batch) => Some(batch.clone()),
+            [Self::Evaluated(batch)] => Some(batch.clone()),
+            group => crate::scribe::memtable::LiveBatch::evaluate_joined(
+                &group
+                    .iter()
+                    .map(|rows| match rows {
+                        Self::Captured(batch) => Ok(batch.clone()),
+                        #[cfg(test)]
+                        Self::Evaluated(_) => Err(DataFusionError::Internal(
+                            "fixture rows do not join".to_owned(),
+                        )),
+                    })
+                    .collect::<DataFusionResult<Vec<_>>>()?,
+            )
+            .map_err(|error| DataFusionError::External(Box::new(error)))?,
         };
         rows.map(|rows| super::exec::project_batch(&rows, Arc::clone(schema)))
             .transpose()
@@ -331,14 +347,16 @@ impl Merged {
 
 impl DataSource for MemtableSource {
     /// Streams one partition's kept batches in order, evaluating each only
-    /// when the stream needs more rows: the batch is evaluated from the
-    /// capture, filtered by the filters this source took over unless its
+    /// when the stream needs more rows. Consecutive captured batches that
+    /// join (see [`crate::scribe::memtable::LiveBatch::joins`]), share their
+    /// matching, and together hold at most the session's batch size evaluate
+    /// as one: the group is evaluated from the capture, filtered by the filters this source took over unless its
     /// bounds prove it fully matching, dropped when left empty, projected,
     /// and cut at the partition's limit, after which no later batch is
     /// evaluated.
     ///
-    /// Appends are small, so the surviving rows are coalesced into batches of
-    /// the session's batch size before they leave the source; a batch already
+    /// A filter can leave groups small, so the surviving rows are coalesced
+    /// into batches of the session's batch size before they leave the source; a batch already
     /// half that size passes through uncopied, and the rows buffered when the
     /// partition or its limit ends are emitted as they are. The buffer is
     /// reserved from the task's memory pool. A batch that fails ends the
@@ -362,7 +380,9 @@ impl DataSource for MemtableSource {
         let matched = self.matched.get(partition).cloned().unwrap_or_default();
         let mut batches = batches
             .into_iter()
-            .zip(matched.into_iter().chain(std::iter::repeat(false)));
+            .zip(matched.into_iter().chain(std::iter::repeat(false)))
+            .peekable();
+        let batch_size = context.session_config().batch_size();
         let schema = Arc::clone(&self.schema);
         let filter = self.filter.clone();
         let projection = self.projection.clone();
@@ -375,7 +395,28 @@ impl DataSource for MemtableSource {
                     return None;
                 }
                 let (rows, matched) = batches.next()?;
-                let pulled = rows.evaluate(&schema).and_then(|rows| {
+                // Captured batches that join, with the same matching, evaluate
+                // as one, up to the session's batch size, so each evaluation
+                // step runs once per group rather than once per append.
+                let mut group = Vec::new();
+                match &rows {
+                    MemtableRows::Captured(first) => {
+                        let mut held = first.rows();
+                        while let Some((MemtableRows::Captured(next), next_matched)) =
+                            batches.peek()
+                            && *next_matched == matched
+                            && held + next.rows() <= batch_size
+                            && first.joins(next)
+                        {
+                            held += next.rows();
+                            group.extend(batches.next().map(|(rows, _)| rows));
+                        }
+                    }
+                    #[cfg(test)]
+                    MemtableRows::Evaluated(_) => {}
+                }
+                group.insert(0, rows);
+                let pulled = MemtableRows::evaluate_joined(&group, &schema).and_then(|rows| {
                     rows.map(|rows| match &filter {
                         Some(filter) if !matched => {
                             datafusion::physical_plan::filter::batch_filter(&rows, filter)

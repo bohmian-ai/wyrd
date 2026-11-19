@@ -182,6 +182,8 @@ Record actual assertion locations, focused commands and RED/GREEN results here.
      (`crates/wyrd/wyrd-server/tests/integration/pg_github_pull_requests.rs:2962`): a set whose handoff is lost to a restart and superseded by
      a newer key is fully retained when its key is retried, and the newer set
      stays current.
+   - **Authorization: FAIL — SPEC_REVISION_REQUIRED.** The tests prove only
+     the tenant boundary and table-level refusals. Existing Bifrost reads are not enough: `bifrost.verification.execution_inputs` is gated only by table-level `bifrost_query:read`. The Oracle object check (`crates/wyrd/wyrd-server/src/query/service.rs:213`) gates the table, and the only payload gate covers gateway-call columns (`service.rs:370`). So a caller with table query permission but no `verifier:read` on a member's Verifier, or no `cards:read`, can read that member's pins and count members. REQ-020 and `architecture/bifrost-design.md` require tenant, Card, exact Verifier and sensitive-payload checks before membership or counts are disclosed. Closing this needs Verifier- and Card-scoped authorization on the retained read, either as an Oracle row policy or as a domain read of a whole set. This task excludes a dedicated history API, and per-member detail reads cannot stand in for it.
    - Command: C1, now 26 tests passing, plus `pg_github_delivery::` (38 in
      total).
    - RED (lost set): `only 3 of 4 members retained`. `hand_off` skipped
@@ -213,7 +215,9 @@ Record actual assertion locations, focused commands and RED/GREEN results here.
         (`crates/wyrd/wyrd-server/src/components/auth/token_extract.rs:46`),
         so it got 401 before admission. *Fix site:* the test header.
         Diagnosed by a read-only Codex diagnostician.
-   - Status: PASS.
+   - Status: retention, completeness, latest, history and tenant isolation
+     PASS. Exact Verifier and Card authorization of the retained read FAIL
+     (SPEC_REVISION_REQUIRED).
 
 ## Verification and handoff
 

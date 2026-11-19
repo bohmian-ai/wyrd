@@ -83,8 +83,8 @@ here. These constraints preserve exact membership and authorization.
   time. The current set is the latest `recorded_at`. A set is complete only
   when every listed member has a record. No implicit time range applies, so
   history is selected by an explicit `recorded_at` bound.
-- **Read authorization.** Reads need `bifrost_query:read` covering that
-  table. Other callers get no rows or counts.
+- **Read authorization: not delivered.** Existing Bifrost reads are not enough: `bifrost.verification.execution_inputs` is gated only by table-level `bifrost_query:read`. The Oracle object check (`crates/wyrd/wyrd-server/src/query/service.rs:213`) gates the table, and the only payload gate covers gateway-call columns (`service.rs:370`). So a caller with table query permission but no `verifier:read` on a member's Verifier, or no `cards:read`, can read that member's pins and count members. REQ-020 and `architecture/bifrost-design.md` require tenant, Card, exact Verifier and sensitive-payload checks before membership or counts are disclosed. Closing this needs Verifier- and Card-scoped authorization on the retained read, either as an Oracle row policy or as a domain read of a whole set. This task excludes a dedicated history API, and per-member detail reads cannot stand in for it. TASK-005 stays blocked on this
+  until a spec revision decides the read path.
 - **Journeys.** `pg_github_pull_requests::` (26 tests), the MCP
   `github::pg_tests::` journeys, Rust SDK `repository_declaration::`, and the
   focused Python and TypeScript review journeys all pass.

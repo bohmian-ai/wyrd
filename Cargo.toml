@@ -253,6 +253,8 @@ datafusion = "=55.1.0"
 # Wyrd's one object store for artifact and Bifrost storage; the same release
 # DataFusion 55 uses.
 object_store = { version = "0.14.2", default-features = false, features = ["fs"] }
+# GCP application default credentials, including Workload Identity Federation.
+google-cloud-auth = { version = "1.19", default-features = false }
 datafusion-proto = "=55.1.0"
 datafusion-datasource = "=55.1.0"
 parquet = "60.0"

@@ -41,7 +41,7 @@ Each stored value records the key that wrapped it. Opening a value whose key is 
 | --- | --- | --- | --- |
 | `file` | A file in `key_dir` named after the key, mode `0600`, holding 32 random bytes as base64 | File ownership | AES-256-GCM associated data |
 | `memory` | 32 random bytes generated at startup and lost on exit; values stored under it cannot be opened after a restart | None | AES-256-GCM associated data |
-| `gcp_kms` | A symmetric `ENCRYPT_DECRYPT` CryptoKey; Cloud KMS selects the primary version to encrypt and the needed version to decrypt | Application default credentials: `GOOGLE_APPLICATION_CREDENTIALS`, the gcloud default, or the metadata server | `additionalAuthenticatedData` |
+| `gcp_kms` | A symmetric `ENCRYPT_DECRYPT` CryptoKey; Cloud KMS selects the primary version to encrypt and the needed version to decrypt | Application default credentials: the file `GOOGLE_APPLICATION_CREDENTIALS` names (a service account key or a Workload Identity Federation configuration), the gcloud default, or the metadata server | `additionalAuthenticatedData` |
 | `aws_kms` | A symmetric key; AWS selects its key material on decrypt | The standard AWS credential chain: environment, web identity, container, or instance metadata | Encryption context `wyrd-context` |
 | `vault_transit` | A Transit key of an AEAD type such as `aes256-gcm96`; Transit keeps old versions for decrypt | The Vault token | `associated_data` |
 

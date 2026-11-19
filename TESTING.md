@@ -160,6 +160,7 @@ mise run test:wyrd | test:skald | test:vala | test:shared   # family lanes
 mise run test:sql                        # SQL-backed integration
 mise run test:tonic                      # wyrd-tonic at its required feature union
 mise run test:storage:matrix             # object-store emulators
+mise run test:kms:vault                  # WyrdKms over a real dev Vault Transit
 mise run py:test:unit                    # Python
 mise run ts:test:unit                    # TypeScript
 mise run test:rust                       # full Rust aggregate

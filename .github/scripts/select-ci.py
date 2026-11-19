@@ -98,6 +98,8 @@ LANGUAGE_PACKAGES = {
 BIFROST_JOURNEY = {"vala-bifrost-redux", "wyrd-client", "wyrd-testing", "wyrd-mcp"}
 # Packages whose ignored gateway journeys test:gateway:gate runs.
 GATEWAY_JOURNEY = {"wyrd-testing", "wyrd-cli", "wyrd-mcp", "wyrd-ai"}
+# Packages whose real-Vault Transit check test:kms:vault runs.
+KMS_VAULT = {"wyrd-kms", "wyrd-vault"}
 STORAGE_PACKAGES = {"wyrd-storage", "wyrd-server", "wyrd-sql"}
 # The identity journeys drive the server, the CLI, and every SDK's saved login.
 IDENTITY_PACKAGES = {
@@ -398,6 +400,8 @@ def select(paths, root):
         sel.lane("test:bifrost:gate", f"Bifrost journeys exercise {hits[0]}")
     if hits := sorted(affected.keys() & GATEWAY_JOURNEY):
         sel.lane("test:gateway:gate", f"gateway journeys exercise {hits[0]}")
+    if hits := sorted(affected.keys() & KMS_VAULT):
+        sel.lane("test:kms:vault", f"the Vault Transit check exercises {hits[0]}")
     if hits := sorted(affected.keys() & RUST_SDK_JOURNEY):
         sel.lane("test:rust-sdk:journey", f"story journeys exercise {hits[0]}")
     if hits := sorted(affected.keys() & EXAMPLE_PACKAGES):

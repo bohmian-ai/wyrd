@@ -121,6 +121,9 @@ check_selection "server change selects identity and storage journeys" \
 check_selection "gateway engine selects the gateway journeys" \
   "full_gate=false changed_packages=wyrd-gateway rust_packages~wyrd-server rust_packages~wyrd-testing ci_lanes~test:wyrd ci_lanes~test:gateway:gate" \
   "crates/wyrd/wyrd-gateway/src/lib.rs"
+check_selection "KMS crate selects the Vault Transit check" \
+  "full_gate=false changed_packages=wyrd-kms ci_lanes~test:wyrd ci_lanes~test:kms:vault" \
+  "crates/wyrd/wyrd-kms/src/lib.rs"
 check_selection "auth crate selects the identity journey" \
   "full_gate=false identity=true" \
   "crates/shared/wyrd-auth-oidc/src/lib.rs"

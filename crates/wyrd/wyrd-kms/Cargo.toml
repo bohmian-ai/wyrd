@@ -14,6 +14,7 @@ base64 = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+url = { workspace = true }
 wyrd-crypt = { workspace = true }
 wyrd-spec = { workspace = true }
 wyrd-utils = { workspace = true }
@@ -21,6 +22,7 @@ wyrd-vault = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+temp-env = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 workspace-hack.workspace = true

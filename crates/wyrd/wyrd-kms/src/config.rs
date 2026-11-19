@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use secrecy::SecretString;
 use serde::Deserialize;
+use url::Url;
 
 use crate::KmsError;
 
@@ -177,30 +178,216 @@ pub(crate) struct Settings {
     pub(crate) retained: Vec<String>,
     /// `file` key directory.
     pub(crate) key_dir: Option<PathBuf>,
+    /// Remote endpoint override, or the Vault address.
+    pub(crate) endpoint: Option<Url>,
+    /// `vault_transit` settings.
+    pub(crate) vault: Option<VaultSettings>,
+}
+
+/// Validated `vault_transit` settings.
+pub(crate) struct VaultSettings {
+    /// Transit mount.
+    pub(crate) mount: String,
+    /// Enterprise namespace.
+    pub(crate) namespace: Option<String>,
+    /// Where the token comes from.
+    pub(crate) token: VaultToken,
+}
+
+/// The one configured Vault token source.
+pub(crate) enum VaultToken {
+    /// Owner-only file re-read per request.
+    File(PathBuf),
+    /// Inline environment token.
+    Inline(SecretString),
+}
+
+/// A refusal of `setting` for `reason`.
+const fn invalid(setting: &'static str, reason: &'static str) -> KmsError {
+    KmsError::Config { setting, reason }
 }
 
 impl KmsConfig {
     /// Validate this configuration for a `production` or development server.
     ///
     /// # Errors
-    /// Returns [`KmsError::Config`] naming the first offending setting.
+    /// Returns [`KmsError::Config`] naming the first offending setting: a
+    /// missing backend or active key, a reference malformed for the backend,
+    /// an active key repeated as retained or a duplicate retained key, a
+    /// setting that does not apply to the backend, a missing `key_dir` or
+    /// Vault endpoint, anything but exactly one Vault token source, a
+    /// non-`http(s)` endpoint, and in `production` the memory backend or a
+    /// plaintext endpoint.
     pub(crate) fn resolve(&self, production: bool) -> Result<Settings, KmsError> {
-        let _ = production;
-        let kind = self.backend.ok_or(KmsError::Config {
-            setting: "backend",
-            reason: "is required",
-        })?;
-        let active = self.active_key.clone().ok_or(KmsError::Config {
-            setting: "active_key",
-            reason: "is required",
-        })?;
+        let kind = self.backend.ok_or(invalid("backend", "is required"))?;
+        let active = self
+            .active_key
+            .clone()
+            .ok_or(invalid("active_key", "is required"))?;
+        if !valid_reference(kind, &active) {
+            return Err(invalid("active_key", "is not a valid key reference for the backend"));
+        }
+        for (index, retained) in self.retained_keys.iter().enumerate() {
+            if !valid_reference(kind, retained) {
+                return Err(invalid(
+                    "retained_keys",
+                    "holds an invalid key reference for the backend",
+                ));
+            }
+            if *retained == active || self.retained_keys[..index].contains(retained) {
+                return Err(invalid(
+                    "retained_keys",
+                    "repeats the active key or another retained key",
+                ));
+            }
+        }
+        if kind == KmsBackendKind::Memory {
+            if production {
+                return Err(invalid("backend", "memory is refused in production"));
+            }
+            if !self.retained_keys.is_empty() {
+                return Err(invalid(
+                    "retained_keys",
+                    "do not apply to the ephemeral memory backend",
+                ));
+            }
+        }
+        let vault = kind == KmsBackendKind::VaultTransit;
+        for (present, applies, setting) in [
+            (self.key_dir.is_some(), kind == KmsBackendKind::File, "key_dir"),
+            (
+                self.endpoint.is_some(),
+                matches!(
+                    kind,
+                    KmsBackendKind::GcpKms | KmsBackendKind::AwsKms | KmsBackendKind::VaultTransit
+                ),
+                "endpoint",
+            ),
+            (self.vault_mount.is_some(), vault, "vault_mount"),
+            (self.vault_namespace.is_some(), vault, "vault_namespace"),
+            (self.vault_token_file.is_some(), vault, "vault_token_file"),
+            (self.vault_token.is_some(), vault, "vault_token"),
+        ] {
+            if present && !applies {
+                return Err(invalid(setting, "does not apply to the selected backend"));
+            }
+        }
+        if kind == KmsBackendKind::File && self.key_dir.is_none() {
+            return Err(invalid("key_dir", "is required for the file backend"));
+        }
+        let endpoint = self
+            .endpoint
+            .as_deref()
+            .map(|endpoint| parse_endpoint(endpoint, production))
+            .transpose()?;
+        let vault = if vault {
+            if endpoint.is_none() {
+                return Err(invalid("endpoint", "is required for the vault_transit backend"));
+            }
+            let token = match (&self.vault_token_file, &self.vault_token) {
+                (Some(path), None) => VaultToken::File(path.clone()),
+                (None, Some(token)) => VaultToken::Inline(token.clone()),
+                _ => {
+                    return Err(invalid(
+                        "vault_token",
+                        "requires exactly one of vault_token_file and WYRD_KMS_VAULT_TOKEN",
+                    ));
+                }
+            };
+            Some(VaultSettings {
+                mount: self
+                    .vault_mount
+                    .clone()
+                    .unwrap_or_else(|| "transit".to_owned()),
+                namespace: self.vault_namespace.clone(),
+                token,
+            })
+        } else {
+            None
+        };
         Ok(Settings {
             kind,
             active,
             retained: self.retained_keys.clone(),
             key_dir: self.key_dir.clone(),
+            endpoint,
+            vault,
         })
     }
+}
+
+/// Parse an `http(s)` endpoint; `production` requires `https`.
+///
+/// # Errors
+/// Returns [`KmsError::Config`] on `endpoint`.
+fn parse_endpoint(endpoint: &str, production: bool) -> Result<Url, KmsError> {
+    let url = Url::parse(endpoint).map_err(|_| invalid("endpoint", "is not a URL"))?;
+    match url.scheme() {
+        "https" => Ok(url),
+        "http" if !production => Ok(url),
+        "http" => Err(invalid("endpoint", "must use https in production")),
+        _ => Err(invalid("endpoint", "must be an http(s) URL")),
+    }
+}
+
+/// Whether `reference` is well formed for `kind`.
+///
+/// Local and Transit references are key names of at most 128 ASCII letters,
+/// digits, `_`, `-`, or `.`, not starting with `.`, so a file reference can
+/// never leave `key_dir`. GCP references are CryptoKey resource names without
+/// a version; AWS references are key ARNs, never aliases.
+fn valid_reference(kind: KmsBackendKind, reference: &str) -> bool {
+    match kind {
+        KmsBackendKind::File | KmsBackendKind::Memory | KmsBackendKind::VaultTransit => {
+            key_name(reference)
+        }
+        KmsBackendKind::GcpKms => {
+            let parts: Vec<&str> = reference.split('/').collect();
+            parts.len() == 8
+                && ["projects", "locations", "keyRings", "cryptoKeys"]
+                    .iter()
+                    .zip(parts.chunks(2))
+                    .all(|(label, pair)| pair[0] == *label && key_name(pair[1]))
+        }
+        KmsBackendKind::AwsKms => aws_region(reference).is_some(),
+    }
+}
+
+/// Whether `name` is a safe key name.
+fn key_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && !name.starts_with('.')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+/// The partition and region of an AWS KMS key ARN
+/// `arn:<partition>:kms:<region>:<12-digit account>:key/<id>`, or `None`.
+pub(crate) fn aws_region(arn: &str) -> Option<(&str, &str)> {
+    let mut parts = arn.splitn(6, ':');
+    let (Some("arn"), Some(partition), Some("kms"), Some(region), Some(account), Some(resource)) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) else {
+        return None;
+    };
+    let id = resource.strip_prefix("key/")?;
+    let ok = matches!(partition, "aws" | "aws-cn" | "aws-us-gov")
+        && !region.is_empty()
+        && region
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && account.len() == 12
+        && account.bytes().all(|byte| byte.is_ascii_digit())
+        && !id.is_empty()
+        && id.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-');
+    ok.then_some((partition, region))
 }
 
 /// Read `key`, treating unset as absent and an empty or non-UTF-8 value as a
@@ -220,5 +407,278 @@ fn env(key: &str, setting: &'static str) -> Result<Option<String>, KmsError> {
             setting,
             reason: "is not valid UTF-8",
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Validation, redaction, and environment projection of `[kms]`.
+
+    use super::*;
+
+    /// A configuration selecting `backend` with active key `active`.
+    fn config(backend: KmsBackendKind, active: &str) -> KmsConfig {
+        KmsConfig {
+            backend: Some(backend),
+            active_key: Some(active.to_owned()),
+            ..KmsConfig::default()
+        }
+    }
+
+    /// The setting a refused configuration names.
+    fn refused(config: &KmsConfig, production: bool) -> &'static str {
+        match config.resolve(production) {
+            Err(KmsError::Config { setting, .. }) => setting,
+            Err(other) => panic!("unexpected error {other:?}"),
+            Ok(_) => panic!("configuration was accepted"),
+        }
+    }
+
+    /// Valid selections of every backend resolve.
+    #[test]
+    fn valid_selections_resolve() {
+        let file = KmsConfig {
+            key_dir: Some(PathBuf::from("/keys")),
+            retained_keys: vec!["k0".to_owned()],
+            ..config(KmsBackendKind::File, "k1")
+        };
+        let gcp = config(
+            KmsBackendKind::GcpKms,
+            "projects/p/locations/global/keyRings/r/cryptoKeys/wyrd-secrets",
+        );
+        let aws = config(
+            KmsBackendKind::AwsKms,
+            "arn:aws:kms:us-east-1:111122223333:key/1234abcd-12ab-34cd-56ef-1234567890ab",
+        );
+        let vault = KmsConfig {
+            endpoint: Some("https://vault.internal:8200".to_owned()),
+            vault_token_file: Some(PathBuf::from("/run/vault-token")),
+            ..config(KmsBackendKind::VaultTransit, "wyrd-secrets")
+        };
+        for (valid, production) in [
+            (&file, true),
+            (&config(KmsBackendKind::Memory, "dev"), false),
+            (&gcp, true),
+            (&aws, true),
+            (&vault, true),
+        ] {
+            assert!(valid.resolve(production).is_ok(), "{valid:?}");
+        }
+    }
+
+    /// Missing, malformed, incoherent, and production-unsafe settings refuse
+    /// and name the setting.
+    #[test]
+    fn malformed_missing_or_incoherent_settings_refuse() {
+        let memory = config(KmsBackendKind::Memory, "dev");
+        let file = KmsConfig {
+            key_dir: Some(PathBuf::from("/keys")),
+            ..config(KmsBackendKind::File, "k1")
+        };
+        let vault = KmsConfig {
+            endpoint: Some("https://vault.internal:8200".to_owned()),
+            vault_token: Some(SecretString::from("hvs.x")),
+            ..config(KmsBackendKind::VaultTransit, "wyrd-secrets")
+        };
+        let cases: Vec<(KmsConfig, bool, &str)> = vec![
+            (KmsConfig::default(), false, "backend"),
+            (
+                KmsConfig {
+                    active_key: None,
+                    ..memory.clone()
+                },
+                false,
+                "active_key",
+            ),
+            (memory.clone(), true, "backend"),
+            (
+                KmsConfig {
+                    retained_keys: vec!["old".to_owned()],
+                    ..memory.clone()
+                },
+                false,
+                "retained_keys",
+            ),
+            (
+                KmsConfig {
+                    key_dir: Some(PathBuf::from("/keys")),
+                    ..memory.clone()
+                },
+                false,
+                "key_dir",
+            ),
+            (
+                KmsConfig {
+                    key_dir: None,
+                    ..file.clone()
+                },
+                false,
+                "key_dir",
+            ),
+            (config(KmsBackendKind::File, "../k1"), false, "active_key"),
+            (
+                KmsConfig {
+                    retained_keys: vec!["k1".to_owned()],
+                    ..file.clone()
+                },
+                false,
+                "retained_keys",
+            ),
+            (
+                KmsConfig {
+                    retained_keys: vec!["k0".to_owned(), "k0".to_owned()],
+                    ..file.clone()
+                },
+                false,
+                "retained_keys",
+            ),
+            (
+                KmsConfig {
+                    endpoint: Some("https://kms".to_owned()),
+                    ..file.clone()
+                },
+                false,
+                "endpoint",
+            ),
+            (
+                KmsConfig {
+                    vault_mount: Some("transit".to_owned()),
+                    ..file.clone()
+                },
+                false,
+                "vault_mount",
+            ),
+            (
+                config(
+                    KmsBackendKind::GcpKms,
+                    "projects/p/locations/global/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1",
+                ),
+                false,
+                "active_key",
+            ),
+            (
+                config(
+                    KmsBackendKind::AwsKms,
+                    "arn:aws:kms:us-east-1:111122223333:alias/wyrd",
+                ),
+                false,
+                "active_key",
+            ),
+            (
+                KmsConfig {
+                    endpoint: Some("http://localhost:4566".to_owned()),
+                    ..config(
+                        KmsBackendKind::AwsKms,
+                        "arn:aws:kms:us-east-1:111122223333:key/abc",
+                    )
+                },
+                true,
+                "endpoint",
+            ),
+            (
+                KmsConfig {
+                    endpoint: None,
+                    ..vault.clone()
+                },
+                false,
+                "endpoint",
+            ),
+            (
+                KmsConfig {
+                    endpoint: Some("not a url".to_owned()),
+                    ..vault.clone()
+                },
+                false,
+                "endpoint",
+            ),
+            (
+                KmsConfig {
+                    endpoint: Some("http://vault.internal:8200".to_owned()),
+                    ..vault.clone()
+                },
+                true,
+                "endpoint",
+            ),
+            (
+                KmsConfig {
+                    vault_token: None,
+                    ..vault.clone()
+                },
+                false,
+                "vault_token",
+            ),
+            (
+                KmsConfig {
+                    vault_token_file: Some(PathBuf::from("/run/token")),
+                    ..vault.clone()
+                },
+                false,
+                "vault_token",
+            ),
+        ];
+        for (case, production, setting) in &cases {
+            assert_eq!(refused(case, *production), *setting, "{case:?}");
+        }
+    }
+
+    /// Debug output and every diagnostic omit references, paths,
+    /// endpoints, and tokens.
+    #[test]
+    fn debug_and_diagnostics_are_redacted() {
+        let vault = KmsConfig {
+            endpoint: Some("http://vault.secret-host:8200".to_owned()),
+            vault_token: Some(SecretString::from("hvs.canary-token")),
+            vault_token_file: Some(PathBuf::from("/run/canary-path")),
+            retained_keys: vec!["canary-retained".to_owned()],
+            ..config(KmsBackendKind::VaultTransit, "canary-active")
+        };
+        let debug = format!("{vault:?}");
+        let error = vault.resolve(true).err().expect("refused").to_string();
+        for text in [debug, error] {
+            for canary in ["secret-host", "canary-token", "canary-path", "canary-retained", "canary-active"] {
+                assert!(!text.contains(canary), "{text}");
+            }
+        }
+    }
+
+    /// `WYRD_KMS_*` variables project onto their settings; an unknown
+    /// backend or an empty variable refuses.
+    #[test]
+    fn environment_projects_onto_settings() {
+        temp_env::with_vars(
+            [
+                ("WYRD_KMS_BACKEND", Some("vault_transit")),
+                ("WYRD_KMS_ACTIVE_KEY", Some("wyrd-secrets")),
+                ("WYRD_KMS_RETAINED_KEYS", Some("old-a, old-b")),
+                ("WYRD_KMS_ENDPOINT", Some("https://vault.internal:8200")),
+                ("WYRD_KMS_VAULT_MOUNT", Some("transit/wyrd")),
+                ("WYRD_KMS_VAULT_NAMESPACE", Some("ns1")),
+                ("WYRD_KMS_VAULT_TOKEN", Some("hvs.x")),
+            ],
+            || {
+                let mut projected = KmsConfig::default();
+                projected.apply_env().expect("projects");
+                assert_eq!(projected.backend, Some(KmsBackendKind::VaultTransit));
+                assert_eq!(projected.active_key.as_deref(), Some("wyrd-secrets"));
+                assert_eq!(projected.retained_keys, ["old-a", "old-b"]);
+                assert_eq!(projected.vault_mount.as_deref(), Some("transit/wyrd"));
+                assert!(projected.vault_token.is_some());
+                assert!(projected.resolve(true).is_ok());
+            },
+        );
+        for (key, value, setting) in [
+            ("WYRD_KMS_BACKEND", "sealing", "backend"),
+            ("WYRD_KMS_ACTIVE_KEY", " ", "active_key"),
+        ] {
+            temp_env::with_var(key, Some(value), || {
+                assert!(
+                    matches!(
+                        KmsConfig::default().apply_env(),
+                        Err(KmsError::Config { setting: named, .. }) if named == setting
+                    ),
+                    "{key}"
+                );
+            });
+        }
     }
 }

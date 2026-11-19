@@ -489,4 +489,199 @@ mod tests {
             b"client-secret"
         );
     }
+
+    /// Opening under any substituted scope, purpose, owner, authority, or
+    /// version, or after tampering with the payload or wrapped DEK, refuses
+    /// as an authentication failure.
+    #[tokio::test]
+    async fn substituted_context_or_tampered_envelope_refuses() {
+        let kms = memory();
+        let tenant = DataTenantId::new_v7();
+        let ctx = context(tenant);
+        let sealed = kms.seal(&ctx, b"xoxb-token").await.expect("seals");
+        let substituted = [
+            SecretContext {
+                scope: SecretScope::Tenant(DataTenantId::new_v7()),
+                ..ctx
+            },
+            SecretContext {
+                scope: SecretScope::Platform,
+                ..ctx
+            },
+            SecretContext {
+                purpose: SecretPurpose::GatewayProviderCredential,
+                ..ctx
+            },
+            SecretContext {
+                owner: "conn-2",
+                ..ctx
+            },
+            SecretContext {
+                authority: &["pagerduty", "ops"],
+                ..ctx
+            },
+            SecretContext {
+                authority: &["slack", "ops", "1"],
+                version: None,
+                ..ctx
+            },
+            SecretContext {
+                version: Some(2),
+                ..ctx
+            },
+            SecretContext {
+                version: None,
+                ..ctx
+            },
+        ];
+        for other in &substituted {
+            assert_eq!(
+                kms.open(other, &sealed).await.map(|_| ()),
+                Err(KmsError::Authentication),
+                "{other:?}"
+            );
+        }
+        let envelope = Envelope::decode(&sealed).expect("decodes");
+        let wrapped_at = sealed.len() - envelope.ciphertext.len() - 12 - envelope.wrapped_dek.len();
+        for at in [sealed.len() - 1, wrapped_at] {
+            let mut tampered = sealed.clone();
+            tampered[at] ^= 1;
+            assert_eq!(
+                kms.open(&ctx, &tampered).await.map(|_| ()),
+                Err(KmsError::Authentication),
+                "byte {at}"
+            );
+        }
+    }
+
+    /// An envelope naming a key the deployment does not configure, an
+    /// unknown magic, format, or algorithm, a truncated envelope, and an
+    /// unwrapped DEK of the wrong length all refuse without trying another
+    /// key.
+    #[tokio::test]
+    async fn disallowed_key_unknown_format_and_bad_dek_refuse() {
+        let ctx = context(DataTenantId::new_v7());
+        let sealed = memory().seal(&ctx, b"xoxb-token").await.expect("seals");
+        assert_eq!(
+            memory().open(&ctx, &sealed).await.map(|_| ()),
+            Err(KmsError::Authentication),
+            "another process's memory key does not open it"
+        );
+        let other = WyrdKms::new(
+            &KmsConfig {
+                backend: Some(KmsBackendKind::Memory),
+                active_key: Some("other".to_owned()),
+                ..KmsConfig::default()
+            },
+            false,
+        )
+        .expect("builds");
+        assert_eq!(
+            other.open(&ctx, &sealed).await.map(|_| ()),
+            Err(KmsError::KeyNotAllowed)
+        );
+        for at in [0, 4, 5] {
+            let mut unknown = sealed.clone();
+            unknown[at] ^= 0x40;
+            assert_eq!(
+                other.open(&ctx, &unknown).await.map(|_| ()),
+                Err(KmsError::UnknownFormat),
+                "byte {at}"
+            );
+        }
+        assert_eq!(
+            other.open(&ctx, &sealed[..sealed.len() - 17]).await.map(|_| ()),
+            Err(KmsError::UnknownFormat)
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        key_file(dir.path(), "k1", 7);
+        let kms = file(dir.path(), "k1", &[]).expect("builds");
+        let short = wyrd_crypt::encrypt_aad(
+            &SecretKey::from_bytes([7; 32]),
+            &[0; 16],
+            &ctx.canonical(WRAP_DOMAIN),
+        )
+        .expect("wraps");
+        let mut wrapped = short.nonce.to_vec();
+        wrapped.extend_from_slice(&short.ciphertext);
+        let bad = Envelope {
+            key_ref: "k1",
+            wrapped_dek: &wrapped,
+            nonce: [0; 12],
+            ciphertext: &[0; 16],
+        }
+        .encode()
+        .expect("encodes");
+        assert_eq!(
+            kms.open(&ctx, &bad).await.map(|_| ()),
+            Err(KmsError::InvalidDek)
+        );
+    }
+
+    /// The file constructor refuses a missing, loose, non-base64, or
+    /// wrong-length key file without generating a substitute, and a key
+    /// file present in the directory but not configured opens nothing.
+    #[tokio::test]
+    async fn file_constructor_refuses_bad_keys_and_holds_only_configured_ones() {
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let refusal = |result: Result<WyrdKms, KmsError>| match result {
+            Err(KmsError::Config { setting, .. }) => setting,
+            other => panic!("expected a configuration refusal, got {other:?}"),
+        };
+        assert_eq!(refusal(file(dir.path(), "k1", &[])), "key_dir");
+        assert_eq!(
+            std::fs::read_dir(dir.path()).expect("lists").count(),
+            0,
+            "no fallback key is generated"
+        );
+        key_file(dir.path(), "k1", 1);
+        for (name, contents) in [
+            ("short", base64::engine::general_purpose::STANDARD.encode([1; 16])),
+            ("text", "not base64!".to_owned()),
+        ] {
+            std::fs::write(dir.path().join(name), contents).expect("writes");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(
+                    dir.path().join(name),
+                    std::fs::Permissions::from_mode(0o600),
+                )
+                .expect("owner-only");
+            }
+            assert_eq!(refusal(file(dir.path(), "k1", &[name])), "key_dir", "{name}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            key_file(dir.path(), "loose", 2);
+            std::fs::set_permissions(
+                dir.path().join("loose"),
+                std::fs::Permissions::from_mode(0o644),
+            )
+            .expect("loosens");
+            assert_eq!(refusal(file(dir.path(), "loose", &[])), "key_dir");
+        }
+
+        key_file(dir.path(), "k2", 2);
+        let ctx = context(DataTenantId::new_v7());
+        let old = file(dir.path(), "k1", &[])
+            .expect("builds")
+            .seal(&ctx, b"client-secret")
+            .await
+            .expect("seals");
+        let rotated = file(dir.path(), "k2", &[]).expect("builds");
+        assert_eq!(
+            rotated.open(&ctx, &old).await.map(|_| ()),
+            Err(KmsError::KeyNotAllowed),
+            "an unconfigured key file grants nothing"
+        );
+        let retaining = file(dir.path(), "k2", &["k1"]).expect("builds");
+        assert_eq!(
+            retaining.open(&ctx, &old).await.expect("retained opens").as_slice(),
+            b"client-secret"
+        );
+    }
 }

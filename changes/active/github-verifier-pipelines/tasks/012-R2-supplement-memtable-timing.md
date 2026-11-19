@@ -207,8 +207,20 @@ experiments after this change, preserving comparable evidence between variants.
   (±150 MiB, no direction). Per-batch retained bytes are not measured.
 - Open: the c64 OTLP write regression (~17% spans) is a write-performance
   regression and keeps the parent incomplete until its cause is found or the
-  maintainer accepts it. CPU profiles of `otlp-spans-c64` at `d310d770c` and
-  `57ec43e29` are the next diagnostic.
+  maintainer accepts it.
+- Diagnosis: `--profile cpu --steps otlp-spans-c64` at `d310d770c` and
+  `57ec43e29` (diagnostic). Shard owner `wyrd-scribe-coo` samples
+  3,895 → 9,821; 76% under `insert_committed_group` → memtable insert, 54%
+  in an unresolved libc symbol beside `min_string`/`min_fixed_size_binary`
+  (whole-value string comparison). Ingest/persist threads unchanged.
+- Fix 2: `6566e05c7` skips bounds for a column holding any value over
+  `IDENTITY_BOUND_BYTES`, read from offsets/views before comparing; such a
+  column's bounds stay unknown even between short min/max (prunes less,
+  never wrongly). Proof: `batch_statistics_bound_primitive_and_identity_columns`
+  (long middle value → Absent; Utf8View exact). TDD: `VIOLATED` (code before
+  assertion). Writes at `6566e05c7` (VALID, load 1.72): `otlp-spans-c64`
+  534 req/s, logs c64 476, native c64 183. Partial recovery; spans remain
+  ~14% below `d310d770c`. Cause of the remainder unproven.
 
 ### 6. Decide any remaining batching work from evidence
 

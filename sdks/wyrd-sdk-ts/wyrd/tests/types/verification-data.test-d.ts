@@ -31,3 +31,14 @@ expectTypeOf(
 // The authored format is the wire's expanded response format.
 expectTypeOf(verdictFormat(Judge)).toExtend<CardTypes.NamedResponseFormat>();
 expectTypeOf(verdictFormat()).toExtend<CardTypes.ResponseFormat>();
+
+// Typed details keep a check's tool calls; each record names its recipient,
+// and a historical requirement without calls still reads.
+expectTypeOf(execution.detailsTyped(Judge))
+  .resolves.toHaveProperty("outcome")
+  .toHaveProperty("requirements")
+  .items.toHaveProperty("tool_calls")
+  .toEqualTypeOf<readonly CardTypes.ToolCallRecord[] | undefined>();
+expectTypeOf<CardTypes.StepResult["tool_calls"]>().toEqualTypeOf<readonly CardTypes.ToolCallRecord[] | undefined>();
+expectTypeOf<CardTypes.ToolCallRecord["recipient"]>().toEqualTypeOf<"model" | "code">();
+expectTypeOf<Omit<CardTypes.RequirementDetails, "tool_calls">>().toExtend<CardTypes.RequirementDetails>();

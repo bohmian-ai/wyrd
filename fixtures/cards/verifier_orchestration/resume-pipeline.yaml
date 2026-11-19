@@ -1,0 +1,57 @@
+# Array work, a speculative extra review, and a refinement that waits for
+# both, so a crash mid-refinement leaves frozen items, a recorded decision,
+# and settled iterations for the recovered execution to resume from; the
+# refinement's retry lets an interrupted iteration run once more.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: resume-pipeline
+  version: 1.0.0
+spec:
+  description: Logical control state a reclaimed execution resumes from.
+  inputs:
+    doc:
+      type: json
+      schema:
+        type: object
+        properties: {marker: {type: string}, sections: {type: array, items: {type: string}}}
+        required: [marker, sections]
+  steps:
+    - id: map
+      foreach: {items: inputs.doc.sections, max_items: 4}
+      action:
+        kind: agent
+        agent: ./section-reviewer.yaml
+        inputs: {section: item, index: item_index}
+    - id: bootstrap
+      action:
+        kind: agent
+        agent: ./bootstrapper.yaml
+        inputs: {question: inputs.doc.marker}
+    - id: compare
+      action:
+        kind: agent
+        agent: ./comparer.yaml
+        inputs: {question: inputs.doc.marker}
+    - id: extra
+      depends_on: {any_succeeded: [bootstrap]}
+      speculative: true
+      when: {path: steps.compare.output.agree, operator: equals, expected: false}
+      action:
+        kind: agent
+        agent: ./extra-reviewer.yaml
+        inputs: {question: inputs.doc.marker}
+    - id: refine
+      depends_on: [map, extra]
+      retries: 1
+      repeat:
+        max_iterations: 3
+        until: {path: iteration.output.score, operator: greater_than_or_equals, expected: 2}
+      action:
+        kind: agent
+        agent: ./refiner.yaml
+        inputs: {question: inputs.doc.marker, index: iteration.index, previous: iteration.previous}
+  requirements:
+    - id: refined
+      statement: The refinement reached its score
+      check: {kind: assert, path: steps.refine.output.score, operator: greater_than_or_equals, expected: 2}

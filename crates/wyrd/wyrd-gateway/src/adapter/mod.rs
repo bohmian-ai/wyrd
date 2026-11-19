@@ -20,23 +20,30 @@ mod jev;
 mod media;
 mod stream;
 
+use std::borrow::Cow;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use serde::Serialize;
-use serde::de::DeserializeOwned;
+use serde::de::{
+    self, DeserializeOwned, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor,
+};
 use serde_json::value::{RawValue, to_raw_value};
 use serde_json::{Map, Value, json};
+use skald_providers::RequestBody;
 use skald_spec::ProviderResponse;
 use skald_spec::wire::anthropic_messages::{AnthropicMessagesRequest, AnthropicUsage};
+use skald_spec::wire::borrowed::IgnoredObject;
 use skald_spec::wire::google_generate::{GoogleGenerateContentRequest, GoogleUsageMetadata};
 use skald_spec::wire::jev::{JevRequest, JevUsage};
 use skald_spec::wire::openai_chat::{
-    OpenAiChatMessage, OpenAiChatRequest, OpenAiChatResponse, OpenAiImageUrl, OpenAiMessageContent,
-    OpenAiStop, OpenAiStreamOptions, OpenAiToolCall, OpenAiUsage,
+    OpenAiChatMessage, OpenAiChatMessageView, OpenAiChatRequest, OpenAiChatRequestView,
+    OpenAiChatResponse, OpenAiChatToolChoiceView, OpenAiContentPart, OpenAiContentPartView,
+    OpenAiImageUrlView, OpenAiMessageContent, OpenAiMessageContentView, OpenAiStop,
+    OpenAiStreamOptionsView, OpenAiToolCall, OpenAiToolCallView, OpenAiToolView, OpenAiUsage,
 };
 use skald_spec::wire::openai_embeddings::{
-    OpenAiEmbeddingUsage, OpenAiEmbeddingsInput, OpenAiEmbeddingsRequest,
+    OpenAiEmbeddingUsage, OpenAiEmbeddingsInputView, OpenAiEmbeddingsRequestView,
 };
 use skald_spec::wire::openai_responses::OpenAiResponsesUsage;
 use wyrd_spec::gateway::native::{
@@ -49,7 +56,8 @@ use wyrd_spec::gateway::{
 use wyrd_spec::ids::ModelId;
 
 use crate::credential::ProviderSecret;
-use crate::engine::AttemptUsage;
+use crate::engine::{AttemptUsage, JsonAnswer};
+use crate::request::RequestJson;
 
 pub use batch::{BATCH_ENDPOINTS, BatchAction, BatchInput};
 pub use http::{BuiltinEndpoints, HttpProviderDispatch};
@@ -116,11 +124,14 @@ impl Wire {
 }
 
 /// Request ready for one deployment.
+///
+/// A native request borrows the caller's body, so planning and dispatch never
+/// copy it; translated requests own their typed target bodies.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum Prepared {
+pub(crate) enum Prepared<'a> {
     /// A body already in the deployment's dialect, sent unchanged except for
     /// its model; the answer returns unchanged.
-    Native(Value),
+    Native(NativeBody<'a>),
     /// Chat Completions translated to Anthropic Messages; the answer
     /// translates back. Boxed so the variant does not inflate every `Native`.
     Anthropic(Box<AnthropicMessagesRequest>),
@@ -133,10 +144,79 @@ pub(crate) enum Prepared {
     Jev(Box<JevRequest>),
 }
 
-/// Builds the upstream request of `body` for `model` on `deployment`.
+/// A caller's native JSON object with the deployment's model applied on the wire.
 ///
-/// Pure and deterministic, so planning can use it to drop deployments that
-/// cannot represent a request before admission and dispatch repeats it.
+/// The override is applied as the body serializes, never by copying it: a
+/// present `model` member keeps its position with the new value, and an
+/// absent one follows the caller's members. Every other member serializes
+/// exactly as submitted.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct NativeBody<'a> {
+    /// The caller's object body, shared by every attempt of the call.
+    body: &'a RequestJson,
+    /// The deployment's native model, when the dialect carries it in the body.
+    model: Option<&'a str>,
+}
+
+impl NativeBody<'_> {
+    /// Serializes the body with its model applied as compact JSON bytes,
+    /// through [`RequestJson::to_json`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the serialization error of a member serde cannot write.
+    pub(crate) fn to_json(self) -> serde_json::Result<Vec<u8>> {
+        self.body.to_json(self.model)
+    }
+}
+
+impl<'a> From<NativeBody<'a>> for RequestBody<'a> {
+    /// The decoded body as the provider encoders take it, its model still
+    /// unapplied.
+    fn from(body: NativeBody<'a>) -> Self {
+        match body.body.tree() {
+            Value::Object(members) => Self::Object {
+                members,
+                model: body.model,
+            },
+            other => Self::Json(other),
+        }
+    }
+}
+
+impl Serialize for NativeBody<'_> {
+    /// Serializes through [`RequestBody`], the encoders' one member order.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        RequestBody::from(*self).serialize(serializer)
+    }
+}
+
+/// The upstream form [`check`] selects for a representable request, carrying
+/// only borrowed input, so selecting it builds no provider payload.
+#[derive(Debug)]
+pub(crate) enum Target<'a> {
+    /// The caller's body, already in the deployment's dialect.
+    Native(NativeBody<'a>),
+    /// A native Jev `systemone` body for a Jev deployment.
+    Jev,
+    /// The Jev request carried by a Chat Completions body, decoded from the
+    /// last user message's text.
+    JevChat(jev::ChatQuestions),
+    /// A Chat Completions body for an Anthropic deployment.
+    Anthropic,
+    /// A Chat Completions body for a Gemini or Vertex deployment.
+    Google,
+}
+
+/// Checks that `deployment` can represent `body` for `model` and selects its
+/// upstream form without building it.
+///
+/// Planning runs it for every candidate before admission, and [`prepare`]
+/// runs it again for the dispatched attempt, so both apply one set of rules.
+/// Translated bodies are checked through their borrowed projections: no
+/// request text is copied and no target payload is built. Only the text of a
+/// Jev pass-through's last user message is decoded, as the request it
+/// carries.
 ///
 /// # Errors
 ///
@@ -148,15 +228,15 @@ pub(crate) enum Prepared {
 /// only to `OpenAI`-protocol adapters, as do Batches lifecycle bodies. Jev
 /// `systemone` bodies reach only Jev deployments; a Chat Completions body
 /// reaches Jev only as the typed Jev request in its last user message.
-pub(crate) fn prepare(
+pub(crate) fn check<'a>(
     ingress: IngressDialect,
     operation: GatewayOperation,
     stream: bool,
-    body: &Value,
+    body: &'a RequestJson,
     deployment: &ProviderDeployment,
-    model: &ModelId,
+    model: &'a ModelId,
     media: Option<&MediaRequest>,
-) -> Result<Prepared, UnsupportedRequest> {
+) -> Result<Target<'a>, UnsupportedRequest> {
     let model = model.as_str();
     media::validate(operation, media, body)?;
     let chat = operation == GatewayOperation::ChatCompletions;
@@ -170,7 +250,11 @@ pub(crate) fn prepare(
     if matches!(
         ingress,
         IngressDialect::OpenAi | IngressDialect::AnthropicMessages
-    ) && body.get("stream").and_then(Value::as_bool).unwrap_or(false) != stream
+    ) && body
+        .member("stream")
+        .and_then(|member| member.as_bool())
+        .unwrap_or(false)
+        != stream
     {
         return Err(UnsupportedRequest::new(
             "stream",
@@ -185,35 +269,36 @@ pub(crate) fn prepare(
             GatewayOperation::ChatCompletions
             | GatewayOperation::Responses
             | GatewayOperation::Images
-            | GatewayOperation::Audio => Ok(Prepared::Native(native(body, Some(model))?)),
+            | GatewayOperation::Audio => Ok(Target::Native(native(body, Some(model))?)),
             GatewayOperation::Embeddings => {
                 embeddings(body)?;
-                Ok(Prepared::Native(native(body, Some(model))?))
+                Ok(Target::Native(native(body, Some(model))?))
             }
             // A batch body carries no model; its input file names the model.
-            GatewayOperation::Batches => Ok(Prepared::Native(native(body, None)?)),
+            GatewayOperation::Batches => Ok(Target::Native(native(body, None)?)),
             GatewayOperation::SystemOne => {
                 Err(unsupported_operation(operation, &deployment.adapter))
             }
         },
         (IngressDialect::Jev, ProviderAdapter::Jev) if operation == GatewayOperation::SystemOne => {
-            Ok(Prepared::Jev(Box::new(jev::request(body, model)?)))
+            jev::check(body, model)?;
+            Ok(Target::Jev)
         }
         (IngressDialect::OpenAi, ProviderAdapter::Jev) if chat => {
-            Ok(Prepared::Jev(Box::new(jev::chat_request(body, model)?)))
+            Ok(Target::JevChat(jev::chat_questions(&chat_view(body)?)?))
         }
-        (IngressDialect::OpenAi, ProviderAdapter::Anthropic) if chat => Ok(Prepared::Anthropic(
-            Box::new(anthropic::request(chat_request(body)?, model)?),
-        )),
+        (IngressDialect::OpenAi, ProviderAdapter::Anthropic) if chat => {
+            anthropic::check(&chat_view(body)?)?;
+            Ok(Target::Anthropic)
+        }
         (IngressDialect::OpenAi, ProviderAdapter::Gemini | ProviderAdapter::Vertex { .. })
             if chat =>
         {
-            Ok(Prepared::Google(Box::new(google::request(chat_request(
-                body,
-            )?)?)))
+            google::check(&chat_view(body)?)?;
+            Ok(Target::Google)
         }
         (IngressDialect::AnthropicMessages, ProviderAdapter::Anthropic) if chat => {
-            Ok(Prepared::Native(native(body, Some(model))?))
+            Ok(Target::Native(native(body, Some(model))?))
         }
         (
             IngressDialect::GeminiGenerateContent,
@@ -222,7 +307,7 @@ pub(crate) fn prepare(
         | (IngressDialect::VertexGenerateContent, ProviderAdapter::Vertex { .. })
             if chat =>
         {
-            Ok(Prepared::Native(native(body, None)?))
+            Ok(Target::Native(native(body, None)?))
         }
         (IngressDialect::OpenAi, _) => Err(unsupported_operation(operation, &deployment.adapter)),
         (dialect, adapter) => Err(UnsupportedRequest::new(
@@ -235,41 +320,103 @@ pub(crate) fn prepare(
     }
 }
 
+/// Builds the upstream request of `body` for `model` on `deployment`, for
+/// the attempt being dispatched.
+///
+/// Pure and deterministic: [`check`] selects the form and applies every
+/// representability rule, then only that form is built, and nothing is kept
+/// once the attempt ends. A native request only borrows `body`, so it is
+/// never copied.
+///
+/// # Errors
+///
+/// Returns what [`check`] returns, or names `body` when a checked body does
+/// not decode as its owned request.
+pub(crate) fn prepare<'a>(
+    ingress: IngressDialect,
+    operation: GatewayOperation,
+    stream: bool,
+    body: &'a RequestJson,
+    deployment: &ProviderDeployment,
+    model: &'a ModelId,
+    media: Option<&MediaRequest>,
+) -> Result<Prepared<'a>, UnsupportedRequest> {
+    Ok(
+        match check(ingress, operation, stream, body, deployment, model, media)? {
+            Target::Native(native) => Prepared::Native(native),
+            Target::Jev => Prepared::Jev(Box::new(jev::request(body, model.as_str())?)),
+            Target::JevChat(questions) => {
+                Prepared::Jev(Box::new(jev::chat_request(questions, model.as_str())))
+            }
+            Target::Anthropic => Prepared::Anthropic(Box::new(anthropic::request(
+                chat_request(body)?,
+                model.as_str(),
+            ))),
+            Target::Google => Prepared::Google(Box::new(google::request(chat_request(body)?))),
+        },
+    )
+}
+
+/// A successful provider answer as the adapter receives it.
+#[derive(Debug)]
+pub(crate) enum Answer {
+    /// Answer text of a native passthrough, not yet validated as JSON.
+    Native(String),
+    /// Answer of a translated request, decoded by its Skald client.
+    Typed(Box<ProviderResponse>),
+}
+
+/// Why a successful provider answer does not complete the attempt.
+#[derive(Debug)]
+pub(crate) enum Unmapped {
+    /// Native answer text that is not JSON at all, which may succeed at
+    /// another deployment.
+    Undecodable(serde_json::Error),
+    /// An answer the ingress dialect cannot represent, with the usage that
+    /// could be read.
+    Unrepresentable(AttemptUsage),
+}
+
 /// Maps a successful provider answer to the ingress dialect and extracts its
 /// usage.
 ///
-/// A raw answer is a native passthrough whose bytes return unchanged; a parsed
-/// copy only yields its usage, read as `wire`. Typed Anthropic and Google
-/// answers translate to a chat completion, serialized once and named `id`
-/// when the provider supplies no usable identifier. A typed Jev answer
+/// Native answer text is validated in the same single pass that reads its
+/// usage, read as `wire`, and its bytes return unchanged. When `capture`
+/// selects it, that pass is its whole decode, returned for the capture
+/// projection; otherwise only its usage member is decoded, under the same
+/// rules. Every other answer returns no decoded copy. Typed Anthropic and
+/// Google answers translate to a chat completion, serialized once and named
+/// `id` when the provider supplies no usable identifier. A typed Jev answer
 /// returns as Jev's own response with its usage, or, when `translated` (the
 /// Chat Completions pass-through), as a chat completion whose content is
 /// that answer's JSON.
 ///
 /// # Errors
 ///
-/// Returns the usage that could be read when a translated answer carries
-/// content, a finish state, or a shape the ingress dialect cannot represent,
-/// or when the answer is of a kind no prepared request produces.
+/// Returns [`Unmapped::Undecodable`] for native text that is not one JSON
+/// value. Returns [`Unmapped::Unrepresentable`] with the usage that could be
+/// read for native JSON a value decode rejects, such as an out-of-range
+/// number or excess nesting, when a translated answer carries content, a
+/// finish state, or a shape the ingress dialect cannot represent, or when the
+/// answer is of a kind no prepared request produces.
 pub(crate) fn complete(
-    response: ProviderResponse,
+    response: Answer,
     wire: Wire,
     translated: bool,
+    capture: bool,
     id: &str,
     model: &str,
-) -> Result<(Box<RawValue>, AttemptUsage), AttemptUsage> {
+) -> Result<(JsonAnswer, AttemptUsage, Option<Value>), Unmapped> {
     let chat_completion = |usage: AttemptUsage, chat: Option<OpenAiChatResponse>| {
         chat.and_then(|chat| to_raw_value(&chat).ok())
-            .map(|chat| (chat, usage.clone()))
-            .ok_or(usage)
+            .map(|chat| (chat.into(), usage.clone(), None))
+            .ok_or(Unmapped::Unrepresentable(usage))
+    };
+    let response = match response {
+        Answer::Native(text) => return native_answer(text, wire, capture),
+        Answer::Typed(response) => *response,
     };
     match response {
-        ProviderResponse::RawV1(raw) => {
-            let body: Value =
-                serde_json::from_str(raw.get()).map_err(|_| AttemptUsage::default())?;
-            let usage = usage(wire, &body);
-            Ok((raw, usage))
-        }
         ProviderResponse::AnthropicMessage(native) => {
             let usage = usage(
                 Wire::Anthropic,
@@ -293,10 +440,45 @@ pub(crate) fn complete(
                 return chat_completion(usage, jev::chat_response(&answer, id));
             }
             to_raw_value(&answer)
-                .map(|body| (body, usage.clone()))
-                .map_err(|_| usage)
+                .map(|body| (body.into(), usage.clone(), None))
+                .map_err(|_| Unmapped::Unrepresentable(usage))
         }
-        _ => Err(AttemptUsage::default()),
+        _ => Err(Unmapped::Unrepresentable(AttemptUsage::default())),
+    }
+}
+
+/// Validates native answer `text` once while reading its `wire` usage: as a
+/// whole [`Value`] when `capture` selects it, otherwise through
+/// [`usage_member`].
+///
+/// A value decode accepts only text a [`RawValue`] accepts, so a decoded
+/// answer is checked JSON. Only a rejected answer is scanned again, to tell
+/// text that is not JSON from JSON a value decode refuses.
+///
+/// # Errors
+///
+/// Returns [`Unmapped::Undecodable`] when `text` is not one JSON value, and
+/// [`Unmapped::Unrepresentable`] with no usage for JSON a value decode
+/// rejects.
+fn native_answer(
+    text: String,
+    wire: Wire,
+    capture: bool,
+) -> Result<(JsonAnswer, AttemptUsage, Option<Value>), Unmapped> {
+    let read = if capture {
+        serde_json::from_str::<Value>(&text).map(|body| (usage(wire, &body), Some(body)))
+    } else {
+        usage_member(wire, &text).map(|member| {
+            let usage = member.map_or_else(AttemptUsage::default, |member| counted(wire, &member));
+            (usage, None)
+        })
+    };
+    match read {
+        Ok((usage, decoded)) => Ok((JsonAnswer::validated(text), usage, decoded)),
+        Err(_) => match serde_json::from_str::<&RawValue>(&text) {
+            Err(error) => Err(Unmapped::Undecodable(error)),
+            Ok(_) => Err(Unmapped::Unrepresentable(AttemptUsage::default())),
+        },
     }
 }
 
@@ -355,22 +537,35 @@ pub(crate) fn refusal(
 
 /// Removes every exact occurrence of `secret` from the decoded strings and
 /// object keys of `value`.
-pub(crate) fn without_secret(value: Value, secret: &str) -> Value {
+///
+/// The value is edited in place: only a string or an object's keys holding
+/// `secret` are rebuilt, so secret-free content keeps its allocations.
+pub(crate) fn without_secret(mut value: Value, secret: &str) -> Value {
+    remove_secret(&mut value, secret);
+    value
+}
+
+/// Removes `secret` from `value` in place, as [`without_secret`] does.
+fn remove_secret(value: &mut Value, secret: &str) {
     match value {
-        Value::String(text) => Value::String(text.replace(secret, "")),
-        Value::Array(items) => Value::Array(
-            items
-                .into_iter()
-                .map(|item| without_secret(item, secret))
-                .collect(),
-        ),
-        Value::Object(object) => Value::Object(
-            object
-                .into_iter()
-                .map(|(key, item)| (key.replace(secret, ""), without_secret(item, secret)))
-                .collect(),
-        ),
-        other => other,
+        Value::String(text) if text.contains(secret) => *text = text.replace(secret, ""),
+        Value::Array(items) => {
+            for item in items {
+                remove_secret(item, secret);
+            }
+        }
+        Value::Object(object) => {
+            if object.keys().any(|key| key.contains(secret)) {
+                *object = std::mem::take(object)
+                    .into_iter()
+                    .map(|(key, item)| (key.replace(secret, ""), item))
+                    .collect();
+            }
+            for item in object.values_mut() {
+                remove_secret(item, secret);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -404,6 +599,11 @@ fn encodes_secret(text: &str, secret: &str) -> bool {
         .strip_prefix("data:")
         .and_then(|rest| rest.split_once(";base64,"))
         .map_or(text, |(_, encoded)| encoded);
+    // Base64 decodes at most three bytes per four characters, so text too
+    // short to hold the secret is judged without decoding it.
+    if encoded.len().saturating_mul(3) < secret.len().saturating_mul(4) {
+        return false;
+    }
     base64::engine::general_purpose::STANDARD
         .decode(encoded)
         .is_ok_and(|bytes| {
@@ -527,21 +727,20 @@ fn unsupported_operation(
     )
 }
 
-/// Copies a native body, rewriting `model` when the dialect carries it in the
+/// Borrows a native body, applying `model` when the dialect carries it in the
 /// body.
 ///
 /// # Errors
 ///
 /// Returns [`UnsupportedRequest`] for a non-object body.
-fn native(body: &Value, model: Option<&str>) -> Result<Value, UnsupportedRequest> {
-    let Value::Object(object) = body else {
+fn native<'a>(
+    body: &'a RequestJson,
+    model: Option<&'a str>,
+) -> Result<NativeBody<'a>, UnsupportedRequest> {
+    if !body.is_object() {
         return Err(UnsupportedRequest::new("body", "must be a JSON object"));
-    };
-    let mut object = object.clone();
-    if let Some(model) = model {
-        object.insert("model".to_owned(), Value::String(model.to_owned()));
     }
-    Ok(Value::Object(object))
+    Ok(NativeBody { body, model })
 }
 
 /// Largest number of inputs one embeddings request may carry: the `OpenAI`
@@ -551,8 +750,9 @@ const MAX_EMBEDDING_INPUTS: usize = 2048;
 
 /// Validates an `OpenAI` embeddings body before it passes through unchanged.
 ///
-/// The body decodes through the typed Skald request, so input is a string, a
-/// token array, or a batch of either; a batch keeps its order because the body
+/// The body decodes through the borrowed projection of the typed Skald
+/// request, so input is a string, a token array, or a batch of either, and no
+/// input text is copied; a batch keeps its order because the body
 /// is forwarded as submitted and the provider answers per index.
 ///
 /// # Errors
@@ -561,9 +761,10 @@ const MAX_EMBEDDING_INPUTS: usize = 2048;
 /// request, `input` when it is empty, carries an empty item, or exceeds
 /// [`MAX_EMBEDDING_INPUTS`], `dimensions` when it is zero, and
 /// `encoding_format` for a format other than `float` or `base64`.
-fn embeddings(body: &Value) -> Result<(), UnsupportedRequest> {
-    let request: OpenAiEmbeddingsRequest =
-        serde_json::from_value(body.clone()).map_err(|error| {
+fn embeddings(body: &RequestJson) -> Result<(), UnsupportedRequest> {
+    let request = body
+        .view::<OpenAiEmbeddingsRequestView>()
+        .map_err(|error| {
             UnsupportedRequest::new(
                 "body",
                 format!("is not a valid embeddings request: {error}"),
@@ -587,7 +788,6 @@ fn embeddings(body: &Value) -> Result<(), UnsupportedRequest> {
     }
     if request
         .encoding_format
-        .as_deref()
         .is_some_and(|format| !matches!(format, "float" | "base64"))
     {
         return Err(UnsupportedRequest::new(
@@ -599,18 +799,21 @@ fn embeddings(body: &Value) -> Result<(), UnsupportedRequest> {
 }
 
 /// Counts the items of an embeddings `input` and reports whether any is empty.
-fn inputs(input: &OpenAiEmbeddingsInput) -> (usize, bool) {
+fn inputs(input: &OpenAiEmbeddingsInputView<'_>) -> (usize, bool) {
     match input {
-        OpenAiEmbeddingsInput::One(text) => (1, text.is_empty()),
-        OpenAiEmbeddingsInput::Tokens(tokens) => (1, tokens.is_empty()),
-        OpenAiEmbeddingsInput::Many(items) => (items.len(), items.iter().any(String::is_empty)),
-        OpenAiEmbeddingsInput::TokenBatches(items) => {
+        OpenAiEmbeddingsInputView::One(text) => (1, text.is_empty()),
+        OpenAiEmbeddingsInputView::Tokens(tokens) => (1, tokens.is_empty()),
+        OpenAiEmbeddingsInputView::Many(items) => {
+            (items.len(), items.iter().any(|item| item.is_empty()))
+        }
+        OpenAiEmbeddingsInputView::TokenBatches(items) => {
             (items.len(), items.iter().any(Vec::is_empty))
         }
     }
 }
 
-/// True when a successful embeddings `answer` honors its `request`.
+/// True when a successful embeddings `answer` honors its `request`, read
+/// through the request's borrowed projection.
 ///
 /// The answer must carry one item per input in input order (`data[i].index ==
 /// i`). Every vector must use the requested representation: an array of
@@ -620,10 +823,10 @@ fn inputs(input: &OpenAiEmbeddingsInput) -> (usize, bool) {
 /// every vector must have exactly that many values. A provider silently
 /// ignoring any of these would weaken the request, so the attempt fails
 /// instead of returning the answer.
-pub(crate) fn faithful_embeddings(request: &Value, answer: &RawValue) -> bool {
+pub(crate) fn faithful_embeddings(request: &RequestJson, answer: &str) -> bool {
     let (Ok(request), Ok(answer)) = (
-        serde_json::from_value::<OpenAiEmbeddingsRequest>(request.clone()),
-        serde_json::from_str::<Value>(answer.get()),
+        request.view::<OpenAiEmbeddingsRequestView>(),
+        serde_json::from_str::<Value>(answer),
     ) else {
         return false;
     };
@@ -631,7 +834,7 @@ pub(crate) fn faithful_embeddings(request: &Value, answer: &RawValue) -> bool {
     let Some(data) = answer.get("data").and_then(Value::as_array) else {
         return false;
     };
-    let base64 = request.encoding_format.as_deref() == Some("base64");
+    let base64 = request.encoding_format == Some("base64");
     data.len() == count
         && data.iter().enumerate().all(|(position, item)| {
             let ordered = item
@@ -674,7 +877,7 @@ fn base64_floats(encoded: &str) -> Option<usize> {
 fn streamable(
     adapter: &str,
     stream: Option<bool>,
-    options: Option<&OpenAiStreamOptions>,
+    options: Option<&OpenAiStreamOptionsView<'_>>,
     tools: bool,
 ) -> Result<(), UnsupportedRequest> {
     let streaming = stream == Some(true);
@@ -690,18 +893,32 @@ fn streamable(
     )
 }
 
-/// Decodes an `OpenAI` Chat Completions body into its typed Skald form.
+/// Decodes an `OpenAI` Chat Completions body through its borrowed
+/// projection, for checks that copy no request text.
 ///
 /// # Errors
 ///
 /// Returns [`UnsupportedRequest`] naming the decode failure.
-fn chat_request(body: &Value) -> Result<OpenAiChatRequest, UnsupportedRequest> {
-    serde_json::from_value(body.clone()).map_err(|error| {
-        UnsupportedRequest::new(
-            "body",
-            format!("is not a valid chat completion request: {error}"),
-        )
-    })
+fn chat_view(body: &RequestJson) -> Result<OpenAiChatRequestView<'_>, UnsupportedRequest> {
+    body.view().map_err(not_chat)
+}
+
+/// Decodes a checked `OpenAI` Chat Completions body into its typed Skald
+/// form, for the target being built.
+///
+/// # Errors
+///
+/// Returns [`UnsupportedRequest`] naming the decode failure.
+fn chat_request(body: &RequestJson) -> Result<OpenAiChatRequest, UnsupportedRequest> {
+    body.view().map_err(not_chat)
+}
+
+/// The rejection of a body that is not a chat completion request.
+fn not_chat(error: serde_json::Error) -> UnsupportedRequest {
+    UnsupportedRequest::new(
+        "body",
+        format!("is not a valid chat completion request: {error}"),
+    )
 }
 
 /// Rejects every present member of `checks`, named by field.
@@ -724,44 +941,50 @@ fn reject_present(adapter: &str, checks: &[(&str, bool)]) -> Result<(), Unsuppor
 /// # Errors
 ///
 /// Returns [`UnsupportedRequest`] naming the first key of `extra`.
-fn reject_extra(adapter: &str, extra: &Map<String, Value>) -> Result<(), UnsupportedRequest> {
-    reject_present(
-        adapter,
-        &extra
-            .keys()
-            .map(|key| (key.as_str(), true))
-            .collect::<Vec<_>>(),
-    )
+fn reject_extra(adapter: &str, extra: &IgnoredObject<'_>) -> Result<(), UnsupportedRequest> {
+    match &extra.first_key {
+        Some(key) => reject_present(adapter, &[(key, true)]),
+        None => Ok(()),
+    }
 }
 
-/// Splits the leading system and developer messages from the conversation.
-///
-/// Returns their joined text, or `None`, and the index of the first
-/// conversational message.
+/// Whether `role` is that of a system or developer message.
+fn is_system(role: &str) -> bool {
+    matches!(role, "system" | "developer")
+}
+
+/// Checks the leading system and developer messages and returns the index of
+/// the first conversational message.
 ///
 /// # Errors
 ///
 /// Returns [`UnsupportedRequest`] for a later system message, whose position
 /// no target can represent, or non-text system content.
-fn system_prefix(
-    messages: &[OpenAiChatMessage],
-) -> Result<(Option<String>, usize), UnsupportedRequest> {
-    let is_system =
-        |message: &OpenAiChatMessage| matches!(message.role.as_str(), "system" | "developer");
-    let offset = messages.iter().take_while(|m| is_system(m)).count();
-    if let Some(index) = messages.iter().skip(offset).position(is_system) {
+fn system_prefix(messages: &[OpenAiChatMessageView<'_>]) -> Result<usize, UnsupportedRequest> {
+    let offset = messages.iter().take_while(|m| is_system(m.role)).count();
+    if let Some(index) = messages.iter().skip(offset).position(|m| is_system(m.role)) {
         return Err(UnsupportedRequest::new(
             format!("messages[{}].role", index + offset),
             "system messages must precede the conversation for this adapter",
         ));
     }
-    let mut texts = Vec::with_capacity(offset);
     for (index, message) in messages[..offset].iter().enumerate() {
         let field = format!("messages[{index}]");
         plain_message(message, &field)?;
-        texts.push(text_content(message.content.as_ref(), &field)?.unwrap_or_default());
+        text_only(message.content.as_ref(), &field)?;
     }
-    Ok(((!texts.is_empty()).then(|| texts.join("\n\n")), offset))
+    Ok(offset)
+}
+
+/// Joined text of the leading system and developer messages of checked
+/// `messages`, or `None`, and the index of the first conversational message.
+fn system_text(messages: &[OpenAiChatMessage]) -> (Option<String>, usize) {
+    let offset = messages.iter().take_while(|m| is_system(&m.role)).count();
+    let texts: Vec<String> = messages[..offset]
+        .iter()
+        .map(|message| text_content(message.content.as_ref()).unwrap_or_default())
+        .collect();
+    ((!texts.is_empty()).then(|| texts.join("\n\n")), offset)
 }
 
 /// Rejects message members no translated target represents.
@@ -771,7 +994,10 @@ fn system_prefix(
 /// Returns [`UnsupportedRequest`] for `name`, `refusal`, `audio`,
 /// annotations, `tool_calls` outside assistant messages, or `tool_call_id`
 /// outside tool messages.
-fn plain_message(message: &OpenAiChatMessage, field: &str) -> Result<(), UnsupportedRequest> {
+fn plain_message(
+    message: &OpenAiChatMessageView<'_>,
+    field: &str,
+) -> Result<(), UnsupportedRequest> {
     let checks = [
         ("name", message.name.is_some()),
         ("refusal", message.refusal.is_some()),
@@ -795,25 +1021,24 @@ fn plain_message(message: &OpenAiChatMessage, field: &str) -> Result<(), Unsuppo
     }
 }
 
-/// Text of text-only content, or `None` when absent or empty.
+/// Checks that content is text only and returns whether its text is
+/// non-empty, as [`text_content`] then yields it.
 ///
 /// # Errors
 ///
 /// Returns [`UnsupportedRequest`] when a content part is not text.
-fn text_content(
-    content: Option<&OpenAiMessageContent>,
+fn text_only(
+    content: Option<&OpenAiMessageContentView<'_>>,
     field: &str,
-) -> Result<Option<String>, UnsupportedRequest> {
-    let text = match content {
-        None => String::new(),
-        Some(OpenAiMessageContent::Text(text)) => text.clone(),
-        Some(OpenAiMessageContent::Parts(parts)) => {
-            let mut text = String::new();
+) -> Result<bool, UnsupportedRequest> {
+    match content {
+        None => Ok(false),
+        Some(OpenAiMessageContentView::Text(text)) => Ok(!text.is_empty()),
+        Some(OpenAiMessageContentView::Parts(parts)) => {
+            let mut text = false;
             for (index, part) in parts.iter().enumerate() {
                 match part {
-                    skald_spec::wire::openai_chat::OpenAiContentPart::Text { text: part } => {
-                        text.push_str(part);
-                    }
+                    OpenAiContentPartView::Text { text: part } => text |= !part.is_empty(),
                     _ => {
                         return Err(UnsupportedRequest::new(
                             format!("{field}.content[{index}]"),
@@ -822,51 +1047,107 @@ fn text_content(
                     }
                 }
             }
-            text
+            Ok(text)
         }
-    };
-    Ok((!text.is_empty()).then_some(text))
+    }
 }
 
-/// Splits a base64 `data:` image URL into media type and payload.
+/// Text of checked text-only content, or `None` when absent or empty.
+fn text_content(content: Option<&OpenAiMessageContent>) -> Option<String> {
+    let text = match content {
+        None => String::new(),
+        Some(OpenAiMessageContent::Text(text)) => text.clone(),
+        Some(OpenAiMessageContent::Parts(parts)) => parts
+            .iter()
+            .filter_map(|part| match part {
+                OpenAiContentPart::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect(),
+    };
+    (!text.is_empty()).then_some(text)
+}
+
+/// Checks an image's detail hint and returns whether its URL is a base64
+/// `data:` URL, which [`data_url`] splits.
 ///
 /// # Errors
 ///
 /// Returns [`UnsupportedRequest`] for a non-`auto` detail hint.
-fn image(
-    image: &OpenAiImageUrl,
-    field: &str,
-) -> Result<Option<(String, String)>, UnsupportedRequest> {
-    if image
-        .detail
-        .as_deref()
-        .is_some_and(|detail| detail != "auto")
-    {
+fn image(image: &OpenAiImageUrlView<'_>, field: &str) -> Result<bool, UnsupportedRequest> {
+    if image.detail.is_some_and(|detail| detail != "auto") {
         return Err(UnsupportedRequest::new(
             format!("{field}.image_url.detail"),
             "image detail is not supported by a translated adapter",
         ));
     }
-    Ok(image
-        .url
-        .strip_prefix("data:")
-        .and_then(|rest| rest.split_once(";base64,"))
-        .map(|(media, data)| (media.to_owned(), data.to_owned())))
+    Ok(data_url(image.url).is_some())
 }
 
-/// Decodes tool-call arguments, which must be a JSON object.
+/// Splits a base64 `data:` image URL into media type and payload.
+fn data_url(url: &str) -> Option<(&str, &str)> {
+    url.strip_prefix("data:")?.split_once(";base64,")
+}
+
+/// Checks a tool call: a function whose arguments are a JSON object, checked
+/// as raw JSON without building it.
 ///
 /// # Errors
 ///
 /// Returns [`UnsupportedRequest`] for a non-function call or arguments that
 /// are not a JSON object.
-fn arguments(call: &OpenAiToolCall, field: &str) -> Result<Value, UnsupportedRequest> {
-    match serde_json::from_str::<Value>(&call.function.arguments) {
-        Ok(value @ Value::Object(_)) if call.kind == "function" => Ok(value),
+fn arguments(call: &OpenAiToolCallView<'_>, field: &str) -> Result<(), UnsupportedRequest> {
+    match serde_json::from_str::<&RawValue>(call.function.arguments) {
+        Ok(raw) if call.kind == "function" && raw.get().starts_with('{') => Ok(()),
         _ => Err(UnsupportedRequest::new(
             format!("{field}.tool_calls"),
             "tool calls must be functions whose arguments are a JSON object",
         )),
+    }
+}
+
+/// Decoded arguments of a checked tool call; [`arguments`] admitted only a
+/// JSON object, so the empty-object fallback is never taken.
+fn arguments_value(call: &OpenAiToolCall) -> Value {
+    serde_json::from_str(&call.function.arguments).unwrap_or_else(|_| json!({}))
+}
+
+/// Checks that every tool is a non-strict function.
+///
+/// # Errors
+///
+/// Returns [`UnsupportedRequest`] naming the first other tool.
+fn function_tools(adapter: &str, tools: &[OpenAiToolView<'_>]) -> Result<(), UnsupportedRequest> {
+    match tools.iter().position(|tool| {
+        !matches!(tool, OpenAiToolView::Function { function } if function.strict != Some(true))
+    }) {
+        Some(index) => Err(UnsupportedRequest::new(
+            format!("tools[{index}]"),
+            format!("only non-strict function tools are supported by the {adapter} adapter"),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Checks that a tool choice is a mode or a named function.
+///
+/// # Errors
+///
+/// Returns [`UnsupportedRequest`] for allowed-tools and custom-tool choices.
+fn tool_choice(
+    adapter: &str,
+    choice: Option<&OpenAiChatToolChoiceView<'_>>,
+) -> Result<(), UnsupportedRequest> {
+    match choice {
+        Some(OpenAiChatToolChoiceView::Allowed(_) | OpenAiChatToolChoiceView::Custom(_)) => {
+            Err(UnsupportedRequest::new(
+                "tool_choice",
+                format!(
+                    "allowed-tools and custom-tool choices are not supported by the {adapter} adapter"
+                ),
+            ))
+        }
+        _ => Ok(()),
     }
 }
 
@@ -903,15 +1184,114 @@ fn now() -> u64 {
 /// object, one no typed usage decodes, or counts whose sum overflows leave
 /// usage unknown.
 fn usage(wire: Wire, body: &Value) -> AttemptUsage {
-    let object = match wire {
-        Wire::OpenAi | Wire::Anthropic | Wire::Jev => body.get("usage"),
-        Wire::Google => body
-            .get("usage_metadata")
-            .or_else(|| body.get("usageMetadata")),
-    };
-    let Some(object) = object else {
-        return AttemptUsage::default();
-    };
+    usage_names(wire)
+        .iter()
+        .find_map(|name| body.get(name))
+        .map_or_else(AttemptUsage::default, |object| counted(wire, object))
+}
+
+/// The top-level members a `wire` answer may carry its usage object in, in
+/// precedence order.
+const fn usage_names(wire: Wire) -> &'static [&'static str] {
+    match wire {
+        Wire::OpenAi | Wire::Anthropic | Wire::Jev => &["usage"],
+        Wire::Google => &["usage_metadata", "usageMetadata"],
+    }
+}
+
+/// Reads the usage member of a `wire` answer `body` without decoding the
+/// rest.
+///
+/// `body` is read as `serde_json::from_str::<Value>` reads it, with the same
+/// syntax, number, and nesting checks, top-level arrays and scalars included,
+/// and the last of duplicate members kept, so the member is the one [`usage`]
+/// finds in the whole decode. Only that member is decoded; every other value
+/// is checked and dropped, so a metadata-only answer never owns its content.
+///
+/// # Errors
+///
+/// Returns the JSON error when `body` is not one JSON value or exceeds the
+/// nesting limit.
+fn usage_member(wire: Wire, body: &str) -> serde_json::Result<Option<Value>> {
+    let mut deserializer = serde_json::Deserializer::from_str(body);
+    let member = UsageMember(usage_names(wire)).deserialize(&mut deserializer)?;
+    deserializer.end()?;
+    Ok(member)
+}
+
+/// Decodes the first of `names`, at most two, that a JSON object holds, and
+/// checks every other value without keeping it.
+///
+/// Every value is read through `deserialize_any`, so `serde_json` applies the
+/// same nesting limit a [`Value`] decode does. With no names it only checks
+/// a value, which is how nested values are read.
+struct UsageMember(&'static [&'static str]);
+
+impl<'de> DeserializeSeed<'de> for UsageMember {
+    type Value = Option<Value>;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for UsageMember {
+    type Value = Option<Value>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_bool<E: de::Error>(self, _: bool) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_i64<E: de::Error>(self, _: i64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_u64<E: de::Error>(self, _: u64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_f64<E: de::Error>(self, _: f64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_str<E: de::Error>(self, _: &str) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        while seq.next_element_seed(Self(&[]))?.is_some() {}
+        Ok(None)
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut found: [Option<Value>; 2] = [None, None];
+        while let Some(Name(name)) = map.next_key()? {
+            match self.0.iter().position(|wanted| *wanted == name) {
+                Some(slot) => found[slot] = Some(map.next_value()?),
+                None => {
+                    map.next_value_seed(Self(&[]))?;
+                }
+            }
+        }
+        Ok(found.into_iter().flatten().next())
+    }
+}
+
+/// An object member name, borrowed from the answer unless it holds escapes.
+#[derive(serde::Deserialize)]
+#[serde(transparent)]
+struct Name<'a>(#[serde(borrow)] Cow<'a, str>);
+
+/// Reads token usage of `wire` from its usage `object`.
+fn counted(wire: Wire, object: &Value) -> AttemptUsage {
     let counts = match wire {
         Wire::OpenAi => typed::<OpenAiUsage>(object)
             .map(|(usage, json)| (usage.prompt_tokens, Some(usage.completion_tokens), json))

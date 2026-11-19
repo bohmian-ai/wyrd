@@ -8,6 +8,7 @@ description: Independently audit an immutable integrated Wyrd change against its
 Determine whether the immutable integrated repository satisfies the approved
 specification exactly. Review remains read-only; completion is a separate
 automatic handoff.
+The maintainer initiates this review; implementation does not launch it.
 
 ## Establish the subject
 
@@ -54,17 +55,23 @@ integrated target. Re-review an affected task when conflict resolution or other
 integration changes prevent ancestry or exact-patch equivalence from proving
 that its approved candidate is unchanged.
 
-Classify material concerns only as `MISSING`, `INCORRECT`, `DRIFT`, `VIOLATION`,
-or `REGRESSION`. Do not report optional improvements, preferences, unrelated
-debt, or speculative hardening. Each finding names the violated obligation,
-exact location, evidence, consequence, required outcome, and closure proof.
+Use the shared review contract: distinguish implementation defects (`MISSING`,
+`INCORRECT`, `DRIFT`, `VIOLATION`, `REGRESSION`) from `EVIDENCE_GAP` and contract
+ambiguity. Check scenario coverage against the spec, independently of passing
+task tests. The matrix references existing requirements; it creates none.
+Behavior needs executable proof, while structural constraints may use source
+inspection. Follow the shared ambiguous-wording rule instead of choosing new
+semantics. Omit optional improvements, preferences, unrelated debt, and
+speculative hardening. Each finding names its requirement or authority,
+starting conditions and trigger, expected and actual behavior or missing proof,
+exact location, evidence, consequence, and closure scenario.
 
 Reject unearned complexity. Where a standard and conventional way exists (a
 published standard such as an RFC, or the established practice of comparable
-widely used projects), the integrated change must use it. Classify any
-mechanism, state, check, file, setting, option, or error beyond that standard
-as `DRIFT` unless approved authority explicitly requires it. Never require one
-in a finding or remediation; a correction follows the standard way too.
+widely used projects), prefer it when it satisfies approved Wyrd behavior.
+Classify duplicate ownership or machinery serving no approved outcome as
+`DRIFT`, identifying the deletion or existing mechanism that preserves the
+contract. A different conventional implementation alone is not a defect.
 
 ## Verdict and routing
 
@@ -72,7 +79,9 @@ Return `PASS`, `FIX_REQUIRED`, `SPEC_REVISION_REQUIRED`, or `BLOCKED`.
 
 - `FIX_REQUIRED`: write a self-contained remediation task under a new
   `changes/active/<slug>/review/<review-name>/` directory using the same compact
-  contract as `$wyrd-task-review`, then route it directly to `$wyrd-implement`.
+  contract as `$wyrd-task-review`, then return it to the caller for
+  `$wyrd-implement`. An evidence gap may require only a test or valid execution
+  evidence; do not demand production changes without a code defect.
 - `SPEC_REVISION_REQUIRED`: route to `$wyrd-spec` for explicit human approval.
 - `BLOCKED`: report the exact missing subject, authority, review, or evidence.
 - `PASS`: immediately load and execute `$wyrd-complete` with the reviewed

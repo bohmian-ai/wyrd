@@ -84,6 +84,15 @@ impl ResponseFormat {
         }
     }
 
+    /// Builds the standard code review report format, `code_review`: a fixed
+    /// schema of summary and findings that GitHub delivery renders. It takes
+    /// no custom `data`.
+    pub fn code_review() -> Self {
+        Self {
+            kind: ResponseFormatKind::Named(NamedResponseFormat::Name("code_review".to_owned())),
+        }
+    }
+
     /// Returns the response-format kind.
     pub const fn kind(&self) -> &ResponseFormatKind {
         &self.kind
@@ -98,7 +107,7 @@ impl ResponseFormat {
             | ResponseFormatKind::Named(_) => ResponseType::Text,
             ResponseFormatKind::JsonSchema { name, schema } => ResponseType::JsonSchema {
                 name: name.clone(),
-                schema: schema.clone(),
+                schema: schema.clone().into(),
             },
         }
     }
@@ -164,10 +173,12 @@ impl ResponseFormat {
             ResponseFormatKind::JsonSchema { name, .. } => {
                 format!("ResponseFormat.json_schema(name={name:?})")
             }
-            ResponseFormatKind::Named(NamedResponseFormat::Expanded { data: Some(_), .. }) => {
-                "ResponseFormat.verdict(data=...)".to_owned()
+            ResponseFormatKind::Named(
+                named @ NamedResponseFormat::Expanded { data: Some(_), .. },
+            ) => {
+                format!("ResponseFormat.{}(data=...)", named.name())
             }
-            ResponseFormatKind::Named(_) => "ResponseFormat.verdict()".to_owned(),
+            ResponseFormatKind::Named(named) => format!("ResponseFormat.{}()", named.name()),
         }
     }
 

@@ -1,0 +1,49 @@
+# Approved design example; requires the proposed PR extraction contract.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: code-review
+  version: 0.1.0
+spec:
+  steps:
+    - id: extract-pr
+      action:
+        kind: extract
+        extractor: pull_request
+
+    - id: review
+      action:
+        kind: agent
+        agent: ./reviewer.yaml
+        inputs:
+          pr: steps.extract-pr.output.pr
+          changes: steps.extract-pr.output.changes
+          context: steps.extract-pr.output.context
+        workspace:
+          /inputs/pr.json: steps.extract-pr.output
+
+  requirements:
+    - id: acceptable-review
+      statement: Review is complete with no critical or high findings.
+      check:
+        kind: code
+        runtime: python
+        inputs:
+          report: steps.review.output
+        source:
+          inline: |
+            def judge(report):
+                if not report["coverage"]["complete"]:
+                    outcome = "inconclusive"
+                    reason = "The review did not cover its required scope."
+                elif any(f["severity"] in ["critical", "high"]
+                         for f in report["findings"]):
+                    outcome = "failed"
+                    reason = "The review found critical or high issues."
+                else:
+                    outcome = "passed"
+                    reason = "The review completed without critical or high issues."
+                return {"outcome": outcome, "reason": reason, "citations": []}
+        entrypoint: judge
+
+  decide: all

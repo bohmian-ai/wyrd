@@ -72,8 +72,21 @@ impl AnthropicClient {
     /// headers are invalid, and [`ProviderError::Connect`],
     /// [`ProviderError::Timeout`], or [`ProviderError::Upstream`] when the
     /// exchange fails.
-    pub async fn send_raw(&self, body: &RawValue) -> ProviderResult<Box<RawValue>> {
-        raw::send_raw(
+    pub async fn send_raw(&self, body: Vec<u8>) -> ProviderResult<Box<RawValue>> {
+        let answer = self.send_raw_text(body).await?;
+        raw::answer_json("anthropic", answer)
+    }
+
+    /// Posts a caller-built body exactly as [`Self::send_raw`] does and
+    /// returns the successful answer as text without validating it as JSON,
+    /// for a caller that validates it in its own single pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::send_raw`] other than the answer's JSON
+    /// [`ProviderError::Decode`].
+    pub async fn send_raw_text(&self, body: Vec<u8>) -> ProviderResult<String> {
+        raw::send_raw_text(
             &self.transport,
             "anthropic",
             &self.messages_url(),
@@ -94,7 +107,7 @@ impl AnthropicClient {
     ///
     /// Returns the errors of [`super::open_stream`], or
     /// [`ProviderError::Decode`] when the auth headers are invalid.
-    pub async fn stream_raw(&self, body: &RawValue) -> ProviderResult<super::ProviderByteStream> {
+    pub async fn stream_raw(&self, body: Vec<u8>) -> ProviderResult<super::ProviderByteStream> {
         super::open_stream(
             &self.transport,
             "anthropic",
@@ -106,7 +119,16 @@ impl AnthropicClient {
     }
 
     /// Sends a native Anthropic request.
-    pub async fn send_native(&self, request: ProviderRequest) -> ProviderResult<ProviderResponse> {
+    ///
+    /// # Errors
+    /// Returns [`ProviderError::VariantMismatch`] for a request this client
+    /// does not serve, [`ProviderError::Auth`] when its credentials cannot be
+    /// presented, [`ProviderError::Status`] for a non-success answer,
+    /// [`ProviderError::Connect`], [`ProviderError::Upstream`], or
+    /// [`ProviderError::Timeout`] when the exchange fails, and
+    /// [`ProviderError::Decode`] when the body cannot be encoded or the answer
+    /// decoded.
+    pub async fn send_native(&self, request: &ProviderRequest) -> ProviderResult<ProviderResponse> {
         match request {
             ProviderRequest::AnthropicMessage(request) => {
                 let url = self.messages_url();
@@ -122,7 +144,7 @@ impl AnthropicClient {
                 Ok(ProviderResponse::AnthropicMessage(response))
             }
             ProviderRequest::RawV1 { body, .. } => {
-                let body = serde_json::value::to_raw_value(&body)
+                let body = serde_json::to_vec(&body)
                     .map_err(|error| ProviderError::decode("anthropic", error))?;
                 let url = format!("{}/raw", self.auth.base_url());
                 let response = raw::send_raw(
@@ -130,7 +152,7 @@ impl AnthropicClient {
                     "anthropic",
                     &url,
                     self.auth.headers()?,
-                    &body,
+                    body,
                     &self.retry,
                 )
                 .await?;
@@ -138,7 +160,7 @@ impl AnthropicClient {
             }
             other => Err(ProviderError::variant_mismatch(
                 "anthropic",
-                super::request_variant_label(&other),
+                super::request_variant_label(other),
             )),
         }
     }
@@ -146,17 +168,17 @@ impl AnthropicClient {
 
 #[async_trait]
 impl ProviderClient for AnthropicClient {
-    async fn send(&self, request: ProviderRequest) -> ProviderResult<ProviderResponse> {
+    async fn send(&self, request: &ProviderRequest) -> ProviderResult<ProviderResponse> {
         self.send_native(request).await
     }
 
-    async fn stream(&self, request: ProviderRequest) -> ProviderResult<ProviderStream> {
+    async fn stream(&self, request: &ProviderRequest) -> ProviderResult<ProviderStream> {
         match request {
             ProviderRequest::AnthropicMessage(request) => {
                 let url = self.messages_url();
                 let body = serde_json::to_vec(&request)
                     .map_err(|error| ProviderError::decode("anthropic", error))?;
-                let text = super::send_bytes_with_retry(
+                let answer = super::send_bytes_with_retry(
                     &self.transport,
                     "anthropic",
                     reqwest::Method::POST,
@@ -166,12 +188,13 @@ impl ProviderClient for AnthropicClient {
                     &self.retry,
                 )
                 .await?;
-                let events = decode_sse_events("anthropic", text.as_bytes())?;
+                let events =
+                    decode_sse_events("anthropic", String::from_utf8_lossy(&answer).as_bytes())?;
                 Ok(ProviderStream::Anthropic(events))
             }
             other => Err(ProviderError::variant_mismatch(
                 "anthropic",
-                super::request_variant_label(&other),
+                super::request_variant_label(other),
             )),
         }
     }
@@ -199,7 +222,7 @@ mod anthropic_messages {
         let request: AnthropicMessagesRequest =
             serde_json::from_str(&request_body).expect("fixture parses");
         let response = common::anthropic_client(&server.uri())
-            .send(ProviderRequest::AnthropicMessage(request))
+            .send(&ProviderRequest::AnthropicMessage(request))
             .await
             .expect("request succeeds");
 
@@ -222,7 +245,7 @@ mod anthropic_messages {
         let request: AnthropicMessagesRequest =
             serde_json::from_str(&request_body).expect("fixture parses");
         common::anthropic_client(&server.uri())
-            .send(ProviderRequest::AnthropicMessage(request))
+            .send(&ProviderRequest::AnthropicMessage(request))
             .await
             .expect("request succeeds");
         common::assert_received_body(&server, &request_body).await;

@@ -828,7 +828,7 @@ pub enum WyrdError {
         code = "WYRD_AUTH_403_WORKLOAD_CONTEXT_REQUIRED",
         status = 403,
         title = "Workload context required",
-        remediation = "This account is restricted to one workload family, so Card-attributed emission and verification need the exact release root. Exchange the key with `workload_uid`, send `x-wyrd-workload-uid`, or use the WyrdState loaded for that release. Generic authorized calls do not need a root."
+        remediation = "This account is restricted to one workload family, so Card-attributed emission needs the exact release root. Exchange the key with `workload_uid`, send `x-wyrd-workload-uid`, or use the WyrdState loaded for that release. Generic authorized calls do not need a root."
     )]
     WorkloadContextRequired {
         /// Human-readable error message.
@@ -1413,6 +1413,23 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// A waited verification execution was cancelled, so it has no result.
+    ///
+    /// Its stored status keeps the server's `cancelled` code; only a wait
+    /// reports the cancellation as this error.
+    #[error("[WYRD_SDK_409_VERIFICATION_CANCELLED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SDK_409_VERIFICATION_CANCELLED",
+        status = 409,
+        title = "Verification execution was cancelled",
+        remediation = "Read the execution's accepted evidence, or submit the verification again; a cancelled execution never resumes."
+    )]
+    SdkVerificationCancelled {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload: the `execution_id` and its `status`.
+        details: serde_json::Value,
+    },
     /// A second `start_bifrost` was attempted on a state that already owns a
     /// connected writer.
     ///
@@ -1714,6 +1731,49 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// A Repository declaration could not select its version: the family's
+    /// selected version changed after this declaration began.
+    #[error("[WYRD_REGISTRY_409_REPOSITORY_SELECTION_CONFLICT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REGISTRY_409_REPOSITORY_SELECTION_CONFLICT",
+        status = 409,
+        title = "Repository selection changed during declaration",
+        remediation = "Another declaration selected details.selected first; its Cards stay registered. Read the Repository Card, then declare again to select your policy over it."
+    )]
+    RegistryRepositorySelectionConflict {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A Repository's name and provider identity disagree with an established Repository family.
+    #[error("[WYRD_REGISTRY_409_REPOSITORY_IDENTITY_CONFLICT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REGISTRY_409_REPOSITORY_IDENTITY_CONFLICT",
+        status = 409,
+        title = "Repository identity conflict",
+        remediation = "A provider repository keeps one Repository Card family: omit the [repository.metadata] name override, or set it to details.established_name; a name already used by another repository needs a different override."
+    )]
+    RegistryRepositoryIdentityConflict {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A Repository declaration names no provider repository.
+    #[error("[WYRD_REGISTRY_400_REPOSITORY_IDENTITY_MISSING] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REGISTRY_400_REPOSITORY_IDENTITY_MISSING",
+        status = 400,
+        title = "Repository identity missing",
+        remediation = "Declare from a checkout whose origin remote is the connected repository, pass --repository <git-remote-url>, or set [repository.spec] repository_id."
+    )]
+    RegistryRepositoryIdentityMissing {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// Transient Postgres or RLS misconfiguration; retry with backoff.
     #[error("[WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE] {message}")]
     #[wyrd_error(
@@ -2009,6 +2069,21 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: Value,
     },
+    /// The execution is visible, but it has no publication with this name
+    /// for the selected producer step, item, iteration, and attempt.
+    #[error("[WYRD_VERIFICATION_404_PUBLICATION_NOT_FOUND] {message}")]
+    #[wyrd_error(
+        code = "WYRD_VERIFICATION_404_PUBLICATION_NOT_FOUND",
+        status = 404,
+        title = "Verification publication not found",
+        remediation = "List GET /v1/verification/executions/{execution_id}/publications and select a listed name with its exact producer attempt, item_index, and iteration_index."
+    )]
+    VerificationPublicationNotFound {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
     /// A manual run's target cannot run the requested input.
     #[error("[WYRD_VERIFICATION_400_INVALID_TARGET] {message}")]
     #[wyrd_error(
@@ -2165,6 +2240,65 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: Value,
     },
+    /// No Verifier subscribes to the published deferred input for the
+    /// repository; nothing was retained.
+    #[error("[WYRD_VERIFICATION_409_EVIDENCE_UNMATCHED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_VERIFICATION_409_EVIDENCE_UNMATCHED",
+        status = 409,
+        title = "Verification evidence unmatched",
+        remediation = "Check the input name and repository: publish only an input a Verifier bound to the connected repository declares with deferred: true. Nothing was retained, so publish again once a binding subscribes."
+    )]
+    VerificationEvidenceUnmatched {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
+    /// Different evidence was already accepted for the same repository,
+    /// commit, and input.
+    #[error("[WYRD_VERIFICATION_409_EVIDENCE_CONFLICT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_VERIFICATION_409_EVIDENCE_CONFLICT",
+        status = 409,
+        title = "Verification evidence conflict",
+        remediation = "Accepted evidence is never replaced: republish the original content to replay its receipt, or publish the new content for a new commit."
+    )]
+    VerificationEvidenceConflict {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
+    /// The execution records no approval occurrence with this id.
+    #[error("[WYRD_VERIFICATION_404_APPROVAL_NOT_FOUND] {message}")]
+    #[wyrd_error(
+        code = "WYRD_VERIFICATION_404_APPROVAL_NOT_FOUND",
+        status = 404,
+        title = "Verification approval not found",
+        remediation = "Read the execution and decide an approval_id listed in its approvals."
+    )]
+    VerificationApprovalNotFound {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
+    /// The approval occurrence is no longer pending: another decision was
+    /// accepted, or its execution ended, expired, or was superseded.
+    #[error("[WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING] {message}")]
+    #[wyrd_error(
+        code = "WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING",
+        status = 409,
+        title = "Verification approval not pending",
+        remediation = "An accepted decision is final and an ended execution takes none: read the execution for the occurrence's status, and decide a pending occurrence of a current execution instead."
+    )]
+    VerificationApprovalNotPending {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload naming the occurrence's status.
+        details: Value,
+    },
     /// An agent check's provider failed after the check's own retry budget.
     #[error("[WYRD_VERIFICATION_502_DEPENDENCY_FAILED] {message}")]
     #[wyrd_error(
@@ -2177,6 +2311,21 @@ pub enum WyrdError {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
+        details: Value,
+    },
+    /// An Agent step or check requested a tool after spending its whole
+    /// invocation allowance of direct and Python-originated tool requests.
+    #[error("[WYRD_VERIFICATION_422_TOOL_BUDGET_EXCEEDED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_VERIFICATION_422_TOOL_BUDGET_EXCEEDED",
+        status = 422,
+        title = "Verification tool budget exceeded",
+        remediation = "Make fewer tool calls per Agent step or check, for example by reducing evidence inside one code.run program, or raise WYRD_VERIFICATION_AGENT_TOOL_MAX_CALLS on the server."
+    )]
+    VerificationToolBudgetExceeded {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload naming the limit.
         details: Value,
     },
     /// A direct execution exceeded its 60-second deadline.
@@ -2208,6 +2357,26 @@ pub enum WyrdError {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
+        details: Value,
+    },
+    /// This server's deployment target does not run the requested Verifier
+    /// work.
+    ///
+    /// Refused before authorization, admission, or any write, so nothing of
+    /// the refused call exists and the identical call may be sent to a server
+    /// whose target runs it.
+    #[error("[WYRD_VERIFICATION_421_WRONG_TARGET] {message}")]
+    #[wyrd_error(
+        code = "WYRD_VERIFICATION_421_WRONG_TARGET",
+        status = 421,
+        title = "Verification sent to the wrong target",
+        remediation = "Nothing of the refused call was recorded: send synchronous verify to a `direct` or `combined` server and queued work (enqueue, webhooks, deferred evidence, approvals, cancellation) to a `worker` or `combined` server; `details.target` names this server's target."
+    )]
+    VerificationWrongTarget {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload naming this server's target and the
+        /// refused work.
         details: Value,
     },
     /// An Operator template, URL origin, or header violates the Operator contract.
@@ -2294,13 +2463,125 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: Value,
     },
+    /// This deployment has no GitHub App configured, so only the GitHub integration is unavailable.
+    #[error("[WYRD_GITHUB_503_NOT_CONFIGURED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_GITHUB_503_NOT_CONFIGURED",
+        status = 503,
+        title = "GitHub integration not configured",
+        remediation = "Ask the deployment operator to configure the GitHub App (WYRD_GITHUB_* settings) and restart the server; every other Wyrd operation is unaffected."
+    )]
+    GithubNotConfigured {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
+    /// GitHub could not be reached or returned an unusable answer.
+    #[error("[WYRD_GITHUB_503_PROVIDER_UNAVAILABLE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_GITHUB_503_PROVIDER_UNAVAILABLE",
+        status = 503,
+        title = "GitHub unavailable",
+        remediation = "Retry after the GitHub API recovers; when it persists, check the configured API URL, App credentials and network policy."
+    )]
+    GithubUnavailable {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
+    /// The tenant has no connected GitHub installation.
+    #[error("[WYRD_GITHUB_404_NOT_CONNECTED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_GITHUB_404_NOT_CONNECTED",
+        status = 404,
+        title = "GitHub not connected",
+        remediation = "Connect the tenant with POST /v1/integrations/github/connect and complete the GitHub installation and authorization in a signed-in browser."
+    )]
+    GithubNotConnected {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
+    /// A GitHub setup or callback did not complete a verified connection transaction.
+    #[error("[WYRD_GITHUB_403_CONNECTION_REFUSED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_GITHUB_403_CONNECTION_REFUSED",
+        status = 403,
+        title = "GitHub connection refused",
+        remediation = "Begin a new connection with POST /v1/integrations/github/connect and finish it in a browser signed in to Wyrd as the same principal, authorizing a GitHub account that can access the installation; details.reason names the refused check."
+    )]
+    GithubConnectionRefused {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
+    /// The verified association would break one-installation-per-tenant or one-tenant-per-installation, or the connection changed while it was in progress.
+    #[error("[WYRD_GITHUB_409_CONNECTION_CONFLICT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_GITHUB_409_CONNECTION_CONFLICT",
+        status = 409,
+        title = "GitHub connection conflict",
+        remediation = "An installation belongs to at most one tenant and a tenant to one installation: disconnect the existing association first, or begin a new connection when details.reason is connection_changed."
+    )]
+    GithubConnectionConflict {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
+    /// The repository is not both selected by the tenant and currently accessible to its installation.
+    #[error("[WYRD_GITHUB_403_REPOSITORY_INACCESSIBLE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_GITHUB_403_REPOSITORY_INACCESSIBLE",
+        status = 403,
+        title = "GitHub repository not accessible",
+        remediation = "Select the repository in the tenant's GitHub installation and reconnect, or restore the installation; Wyrd uses a repository only while the installation can reach it and the tenant selected it."
+    )]
+    GithubRepositoryInaccessible {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
+    /// A GitHub webhook delivery carried no valid X-Hub-Signature-256.
+    #[error("[WYRD_GITHUB_401_WEBHOOK_REFUSED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_GITHUB_401_WEBHOOK_REFUSED",
+        status = 401,
+        title = "GitHub webhook refused",
+        remediation = "Configure the GitHub App's webhook secret to equal the deployment's WYRD_GITHUB_WEBHOOK_SECRET."
+    )]
+    GithubWebhookRefused {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
+    /// A GitHub integration request, setup redirect, callback or webhook payload is malformed.
+    #[error("[WYRD_GITHUB_400_INVALID_REQUEST] {message}")]
+    #[wyrd_error(
+        code = "WYRD_GITHUB_400_INVALID_REQUEST",
+        status = 400,
+        title = "Invalid GitHub request",
+        remediation = "Send the documented query parameters or JSON body; details.field names the rejected part."
+    )]
+    GithubRequestInvalid {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
     /// A binding's effective Trigger activation cannot run its Verifier.
     #[error("[WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH] {message}")]
     #[wyrd_error(
         code = "WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH",
         status = 400,
         title = "Trigger activation does not match Verifier",
-        remediation = "Attach a schedule Trigger only to a Verifier whose samples slots declare the recorded features it judges; attach a group_end Trigger only to a Verifier with source inputs, reacting through on_verdict_change; supply other evidence through verify or submit."
+        remediation = "Attach a schedule Trigger only to a Verifier whose samples slots declare the recorded features it judges; attach a group_end Trigger only to a Verifier with source inputs, reacting through on_verdict_change; use the pull_request Trigger exactly on Repository bindings; supply other evidence through verify or submit."
     )]
     SpecTriggerActivationMismatch {
         /// Human-readable error message.
@@ -3963,6 +4244,7 @@ impl WyrdError {
             | Self::SdkUnknownAlias { message, details }
             | Self::SdkUnknownVerifier { message, details }
             | Self::SdkVerificationWaitTimedOut { message, details }
+            | Self::SdkVerificationCancelled { message, details }
             | Self::SdkVerificationDataInvalid { message, details }
             | Self::SdkBifrostAlreadyStarted { message, details }
             | Self::SdkTelemetryProviderExists { message, details }
@@ -3983,6 +4265,9 @@ impl WyrdError {
             | Self::RegistryUnresolvedDependency { message, details }
             | Self::RegistryVersionConflict { message, details }
             | Self::RegistrySpecDrift { message, details }
+            | Self::RegistryRepositorySelectionConflict { message, details }
+            | Self::RegistryRepositoryIdentityConflict { message, details }
+            | Self::RegistryRepositoryIdentityMissing { message, details }
             | Self::RegistryUnavailable { message, details }
             | Self::RegistryDependencyCycle { message, details }
             | Self::RegistryUnresolvedInlineReference { message, details }
@@ -4004,6 +4289,7 @@ impl WyrdError {
             | Self::SpecDuplicateBindingOperator { message, details }
             | Self::VerificationBindingNotFound { message, details }
             | Self::VerificationExecutionNotFound { message, details }
+            | Self::VerificationPublicationNotFound { message, details }
             | Self::VerificationInvalidTarget { message, details }
             | Self::VerificationInvalidWindow { message, details }
             | Self::VerificationNotReady { message, details }
@@ -4015,15 +4301,29 @@ impl WyrdError {
             | Self::VerificationSnapshotIncomplete { message, details }
             | Self::VerificationInputIncompatible { message, details }
             | Self::VerificationInputUnsupported { message, details }
+            | Self::VerificationEvidenceUnmatched { message, details }
+            | Self::VerificationEvidenceConflict { message, details }
+            | Self::VerificationApprovalNotFound { message, details }
+            | Self::VerificationApprovalNotPending { message, details }
             | Self::VerificationDependencyFailed { message, details }
+            | Self::VerificationToolBudgetExceeded { message, details }
             | Self::VerificationExecutionTimedOut { message, details }
             | Self::VerificationStagingFull { message, details }
+            | Self::VerificationWrongTarget { message, details }
             | Self::SpecInvalidOperator { message, details }
             | Self::SpecOperatorConnectionUnavailable { message, details }
             | Self::OperatorConnectionNotFound { message, details }
             | Self::OperatorConnectionConflict { message, details }
             | Self::OperatorConnectionInvalid { message, details }
             | Self::OperatorKeyUnavailable { message, details }
+            | Self::GithubNotConfigured { message, details }
+            | Self::GithubUnavailable { message, details }
+            | Self::GithubNotConnected { message, details }
+            | Self::GithubConnectionRefused { message, details }
+            | Self::GithubConnectionConflict { message, details }
+            | Self::GithubRepositoryInaccessible { message, details }
+            | Self::GithubWebhookRefused { message, details }
+            | Self::GithubRequestInvalid { message, details }
             | Self::SpecTriggerActivationMismatch { message, details }
             | Self::SpecInvalidServiceComponentKind { message, details }
             | Self::SpecUnboundVerifierPeer { message, details }

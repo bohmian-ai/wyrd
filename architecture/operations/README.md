@@ -51,13 +51,22 @@ for it.
 
 The closed target mapping is:
 
-| `WYRD_TARGET` | Public serving | Bifrost readiness entries |
-|---|---:|---|
-| `all` | yes | Scribe, Oracle, Forge coordinator, Forge worker |
-| `server` | yes | Scribe, Oracle, Forge coordinator |
-| `oracle` | yes | Oracle |
-| `scribe` | yes | Scribe |
-| `forge-worker` | no | Forge worker |
+| `WYRD_TARGET` | Public serving | Bifrost readiness entries | Direct verification | Queued verification |
+|---|---:|---|---:|---:|
+| `combined` (default) | yes | Scribe, Oracle, Forge coordinator, Forge worker | yes | yes |
+| `direct` | yes | Scribe, Oracle | yes | no |
+| `worker` | yes | Scribe, Oracle | no | yes |
+| `bifrost-ingest` | yes | Scribe | no | no |
+| `bifrost-query` | yes | Oracle | no | no |
+| `bifrost-maintenance` | no | Forge coordinator, Forge worker | no | no |
+
+Every target except `combined` requires peer mode (`WYRD_PEER_ADDRESS` and
+`WYRD_PEER_TLS_DIR`). A `bifrost-maintenance` pod opens only its peer
+listener, which carries the Forge leader route. A verification call sent to a
+target that does not run that work is refused before authorization or any
+write with `WYRD_VERIFICATION_421_WRONG_TARGET`; route direct work to
+`combined` or `direct` pods and queued work, including GitHub webhooks, to
+`combined` or `worker` pods.
 
 Every Bifrost-managed local path derives from `WYRD_BIFROST_DATA_DIR`
 (default `.wyrd/bifrost`). The root is the Scribe WAL base and holds the stable

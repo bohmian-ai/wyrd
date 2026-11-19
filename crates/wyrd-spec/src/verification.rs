@@ -13,6 +13,8 @@ pub mod execution;
 pub mod ids;
 pub mod operator;
 pub mod plan;
+pub mod report;
+pub mod state;
 
 use std::collections::BTreeMap;
 
@@ -24,7 +26,7 @@ use crate::card::trigger::TriggerDuration;
 use crate::card::verifier::{OrderBy, SourceText};
 use crate::ids::{BindingId, CardUid, ExecutionId, FeatureName, OperatorDispatchId, SlotName};
 
-pub use ids::{JsonPath, TaskId};
+pub use ids::{JsonPath, PublicationName, TaskId};
 pub use operator::{ComparisonOperator, DivergenceMetric, JsonValueType};
 pub use plan::{DagError, ExecutionPlan, Stage, plan_stages};
 
@@ -126,6 +128,10 @@ pub enum VerificationExecutionStatus {
     Running,
     /// A retryable failure is waiting for its next attempt.
     Retrying,
+    /// Parked: every runnable step settled and the rest wait for published
+    /// deferred inputs. Nonterminal; reported by inspection only, never
+    /// stored as a queue status.
+    Waiting,
     /// Executed and produced an acknowledged result.
     Completed,
     /// Stopped before producing a result.

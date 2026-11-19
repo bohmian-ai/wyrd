@@ -48,6 +48,7 @@ name = "gateway"
 path = "tests/gateway/main.rs"
 
 [dependencies]
+wyrd-benchmark = { workspace = true, features = ["bench"] }
 # A normal edge, unlike every other member's dev-only one: the Python
 # `testing` extension and the TypeScript testing addon reach the hack only
 # through this harness, so their builds reuse the Rust test builds' third-party
@@ -62,6 +63,7 @@ bytes = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 ed25519-dalek = { workspace = true, features = ["pkcs8"] }
+flate2 = { workspace = true }
 num-traits = { workspace = true }
 rcgen = { workspace = true }
 futures-util = { workspace = true }
@@ -69,6 +71,7 @@ hdrhistogram = { workspace = true }
 hex = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 iceberg = { workspace = true }
+jsonwebtoken = { workspace = true }
 http = { workspace = true }
 http-body = { workspace = true }
 http-body-util = "0.1"
@@ -87,7 +90,7 @@ tempfile = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "test-util", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "test-util", "time"] }
 tokio-stream = "0.1"
 tokio-util = { workspace = true }
 tower = { workspace = true, features = ["util"] }
@@ -95,6 +98,7 @@ wyrd-tonic = { workspace = true, features = ["server", "client"] }
 uuid = { workspace = true, features = ["v4", "v7"] }
 vala-bifrost-redux = { workspace = true, features = ["bench-support", "test-support"] }
 vala-sql = { workspace = true }
+vala-verify = { workspace = true }
 wyrd-auth = { workspace = true }
 wyrd-auth-issue = { workspace = true }
 wyrd-auth-oidc = { workspace = true }

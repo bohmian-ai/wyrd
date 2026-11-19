@@ -3155,6 +3155,7 @@ impl PreparedPythonCard {
                     artifacts: manifest.entries,
                 }],
                 artifact_sources: manifest.sources,
+                repository: None,
             },
             tempdir: saved.tempdir,
         })
@@ -3646,6 +3647,7 @@ fn kind_from_card_kind(kind: &CardKind) -> Kind {
         CardKind::Trigger => Kind::Trigger,
         CardKind::Operator => Kind::Operator,
         CardKind::Source => Kind::Source,
+        CardKind::Repository => Kind::Repository,
         CardKind::External => Kind::External,
     }
 }

@@ -12,7 +12,7 @@
 //! structure only.
 
 use std::collections::BTreeMap;
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Seek, SeekFrom};
 
 use calamine::{Data, Reader as _, Xlsx};
 use quick_xml::events::Event;
@@ -409,7 +409,7 @@ impl<'a> Extraction<'a> {
     /// Returns [`ExtractError`] for a container failing
     /// [`zip_guard`], an unreadable workbook, or the text limit.
     fn xlsx(&mut self, bytes: &[u8]) -> Result<ExtractOutput, ExtractError> {
-        zip_guard(bytes, self.limits)?;
+        zip_guard(Cursor::new(bytes), self.limits)?;
         let mut workbook =
             Xlsx::new(Cursor::new(bytes)).map_err(|error| refused(MediaFormat::Xlsx, &error))?;
         let mut sheets = Vec::new();
@@ -481,14 +481,18 @@ type CellParts<'w> = (Option<&'w Data>, Option<&'w String>);
 /// Refuse an archive above the entry, decompressed-byte, or ratio limit.
 ///
 /// Every entry is streamed through a reader capped at the remaining budget,
-/// so a header that understates an entry's size cannot exceed it.
+/// so a header that understates an entry's size cannot exceed it. The
+/// archive is read from `source`, in memory or a file alike, so a staged
+/// archive is guarded without loading it.
 ///
 /// # Errors
 /// Returns [`ExtractError`] for an unreadable archive or one over a
 /// limit.
-pub fn zip_guard(bytes: &[u8], limits: &ExtractLimits) -> Result<(), ExtractError> {
-    let mut archive =
-        ZipArchive::new(Cursor::new(bytes)).map_err(|error| refused(MediaFormat::Zip, &error))?;
+pub fn zip_guard(mut source: impl Read + Seek, limits: &ExtractLimits) -> Result<(), ExtractError> {
+    let compressed = source
+        .seek(SeekFrom::End(0))
+        .map_err(|error| refused(MediaFormat::Zip, &error))?;
+    let mut archive = ZipArchive::new(source).map_err(|error| refused(MediaFormat::Zip, &error))?;
     if archive.len() > limits.archive_max_entries {
         return Err(terminal(format!(
             "the archive has {} entries, above the {}-entry limit",
@@ -496,7 +500,6 @@ pub fn zip_guard(bytes: &[u8], limits: &ExtractLimits) -> Result<(), ExtractErro
             limits.archive_max_entries
         )));
     }
-    let compressed = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     let budget = limits
         .archive_max_bytes
         .min(compressed.saturating_mul(limits.archive_max_ratio));
@@ -656,7 +659,8 @@ impl<'a> Parts<'a> {
         format: MediaFormat,
         limits: &ExtractLimits,
     ) -> Result<Self, ExtractError> {
-        zip_guard(bytes, limits).map_err(|error| terminal(format!("{format}: {error}")))?;
+        zip_guard(Cursor::new(bytes), limits)
+            .map_err(|error| terminal(format!("{format}: {error}")))?;
         let archive =
             ZipArchive::new(Cursor::new(bytes)).map_err(|error| refused(format, &error))?;
         Ok(Self { archive, format })

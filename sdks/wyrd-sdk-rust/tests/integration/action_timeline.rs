@@ -141,7 +141,8 @@ fn holds_in_order(names: &[&str], steps: &[fn(&str) -> bool]) -> bool {
 /// with an LLM judge reads back as one connected, time-ordered tree
 /// rooted at the action's span, as [`act_and_read`] asserts. The operator's
 /// export holds every server span of the action's trace with the same ids,
-/// and the consumers too.
+/// under the same parent or under operator-only `debug` spans whose nearest
+/// timeline ancestor is that parent, and the consumers too.
 ///
 /// # Panics
 /// Panics when a step fails or the timeline or operator export differs.
@@ -157,13 +158,26 @@ async fn service_action_timeline_is_one_connected_tree() {
         .iter()
         .filter(|span| span.scope.name != SERVICE_SCOPE && span.scope.name != GATEWAY_SCOPE)
     {
-        let parent = span.parent_span_id.map(|parent| parent.to_hex());
-        assert!(
-            exported.iter().any(|copy| copy.trace_id == trace
-                && copy.span_id == span.span_id.to_hex()
-                && Some(&copy.parent_span_id) == parent.as_ref()
-                && copy.name == span.name),
-            "the operator holds {} with the same ids",
+        let copy = exported
+            .iter()
+            .find(|copy| {
+                copy.trace_id == trace
+                    && copy.span_id == span.span_id.to_hex()
+                    && copy.name == span.name
+            })
+            .unwrap_or_else(|| panic!("the operator holds {} with the same ids", span.name));
+        let held = |id: &str| timeline.iter().any(|kept| kept.span_id.to_hex() == id);
+        let mut parent = copy.parent_span_id.as_str();
+        while !held(parent) {
+            match exported.iter().find(|ancestor| ancestor.span_id == parent) {
+                Some(ancestor) => parent = ancestor.parent_span_id.as_str(),
+                None => break,
+            }
+        }
+        assert_eq!(
+            span.parent_span_id.map(|parent| parent.to_hex()).as_deref(),
+            Some(parent),
+            "{} names its nearest operator ancestor on the timeline",
             span.name
         );
     }

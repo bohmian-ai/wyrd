@@ -239,7 +239,8 @@ pub(crate) mod prompt_support {
                     "properties": { "answer": { "type": "string" } }
                 })
                 .as_object()
-                .cloned(),
+                .cloned()
+                .map(Into::into),
                 strict: Some(true),
             },
         }

@@ -488,6 +488,7 @@ impl VerificationScheduler {
                         Box::new(Queued {
                             admission: Admission::Scheduled(admission),
                             claim: Some(claim),
+                            reply: None,
                         }),
                         row,
                     ))),
@@ -645,6 +646,7 @@ impl VerificationScheduler {
                             Box::new(Queued {
                                 admission: Admission::Grouped(admission),
                                 claim: Some(claim),
+                                reply: None,
                             }),
                             row,
                         )))

@@ -1,4 +1,4 @@
 interface:
   display_name: "Wyrd Plan"
-  short_description: "Create small tasks from an approved spec"
-  default_prompt: "Use $wyrd-plan to turn this approved Wyrd spec into the minimum set of outcome-complete implementation tasks."
+  short_description: "Plan observable Wyrd scenarios for test-first work"
+  default_prompt: "Use $wyrd-plan to turn the approved requirements and finalized design into bounded tasks with observable scenarios ordered for RED-GREEN-REFACTOR, without redefining requirements."

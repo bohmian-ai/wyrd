@@ -6,6 +6,12 @@ conflicts with these documents is drift to correct; implementation state,
 delivery sequencing, and decision history belong outside normative
 architecture.
 
+Wyrd's default recording pattern is
+[asynchronous and eventually consistent](wyrd-design.md#recording-and-eventual-consistency):
+execution stages records and continues; background writers batch and persist
+them. Operations that wait for durability have explicit boundaries in their
+owning contracts.
+
 ## Authority map
 
 | Document | Owns |

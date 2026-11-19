@@ -15,7 +15,7 @@ use wyrd_storage::BackendConfig;
 #[cfg(feature = "cloud")]
 use wyrd_storage::CloudStore;
 
-use crate::resources::{BifrostResourceError, MetadataReservation, OracleMetadataResources};
+use crate::resources::{BifrostResourceError, OracleMetadataResources};
 use crate::storage::footer_cache::FooterCache;
 pub(crate) use crate::storage::range_cache::RangeCache;
 
@@ -46,16 +46,10 @@ pub struct BifrostStorage {
     /// scan on this node; absent on a node that serves no Oracle or has a zero
     /// budget.
     metadata_cache: Option<Arc<FileMetadataCache>>,
-    /// The whole cache budget, charged once to the Oracle memory root and held
-    /// for the owner's life, so footers are never an ungoverned second pool.
-    metadata_charge: Option<MetadataReservation>,
     /// The node-wide cache of Parquet byte ranges Oracle scans read from
     /// warehouse objects; absent on a node that serves no Oracle or has a zero
     /// budget.
     data_cache: Option<Arc<RangeCache>>,
-    /// The whole `data_cache_bytes` budget, charged and held as
-    /// `metadata_charge` is.
-    data_charge: Option<MetadataReservation>,
 }
 
 impl BifrostStorage {
@@ -83,9 +77,7 @@ impl BifrostStorage {
             backend: backend.clone(),
             policy,
             metadata_cache: None,
-            metadata_charge: None,
             data_cache: None,
-            data_charge: None,
         })
     }
 
@@ -141,16 +133,15 @@ impl BifrostStorage {
     /// Gives this owner its node-wide Parquet footer cache, a [`FooterCache`],
     /// and its byte-range cache, a [`RangeCache`].
     ///
-    /// Called once at composition on an Oracle-serving node. Each cache's
-    /// whole byte limit, `metadata_cache_bytes` and `data_cache_bytes`, is
-    /// charged to the Oracle memory root up front and held for the owner's
-    /// life, because neither cache reports a per-entry charge. A zero budget
-    /// leaves the owner without that cache and charges nothing for it.
+    /// Called once at composition on an Oracle-serving node.
+    /// `metadata_cache_bytes` and `data_cache_bytes` are ceilings, not
+    /// reservations: each cached entry is charged to the Oracle memory root
+    /// at its retained size while anyone holds it, so empty caches withhold
+    /// nothing. A zero budget leaves the owner without that cache.
     ///
     /// # Errors
-    /// Returns the [`BifrostResourceError`] of a refused root charge, or
-    /// [`BifrostResourceError::Unavailable`] when a budget does not fit this
-    /// platform's `usize`.
+    /// Returns [`BifrostResourceError::Unavailable`] when a budget does not
+    /// fit this platform's `usize`.
     pub fn with_oracle_caches(
         mut self,
         resources: &OracleMetadataResources,
@@ -163,12 +154,10 @@ impl BifrostStorage {
         let footers = budget(self.policy.metadata_cache_bytes())?;
         let ranges = budget(self.policy.data_cache_bytes())?;
         if footers > 0 {
-            self.metadata_charge = Some(resources.try_reserve_metadata(footers)?);
-            self.metadata_cache = Some(Arc::new(FooterCache::new(footers)));
+            self.metadata_cache = Some(Arc::new(FooterCache::new(footers, resources.clone())));
         }
         if ranges > 0 {
-            self.data_charge = Some(resources.try_reserve_metadata(ranges)?);
-            self.data_cache = Some(Arc::new(RangeCache::new(ranges)));
+            self.data_cache = Some(Arc::new(RangeCache::new(ranges, resources.clone())));
         }
         Ok(self)
     }
@@ -221,7 +210,7 @@ impl BifrostStorage {
     ///
     /// Composed the way production composes: a local store, the default
     /// policy resolved for the fixture's Oracle-serving decision, and, on an
-    /// Oracle-serving fixture, the footer and byte-range caches charged to a
+    /// Oracle-serving fixture, the footer and byte-range caches charging a
     /// 1 GiB test Oracle composition.
     ///
     /// # Panics

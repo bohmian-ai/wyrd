@@ -1,7 +1,7 @@
 //! HTTP response mapping for Wyrd errors.
 
 use axum::body::Body;
-use axum::extract::rejection::{JsonRejection, PathRejection};
+use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::http::{StatusCode, header::CONTENT_TYPE};
 use axum::response::{IntoResponse, Response};
 use std::fmt::Display;
@@ -93,6 +93,18 @@ pub fn path_rejection(rejection: &PathRejection) -> WyrdErrorResponse {
     })
 }
 
+/// Refuse a query string the route's typed extractor could not decode.
+///
+/// The query counterpart of [`path_rejection`], answering with the canonical
+/// `WYRD_SPEC_400_VALIDATION` problem instead of Axum's plain-text body.
+#[must_use]
+pub fn query_rejection(rejection: &QueryRejection) -> WyrdErrorResponse {
+    WyrdErrorResponse(WyrdError::Validation {
+        message: format!("query is invalid: {}", rejection.body_text()),
+        details: serde_json::json!({ "location": "query" }),
+    })
+}
+
 /// Refuse a JSON body the route's typed extractor could not decode.
 ///
 /// The body counterpart of [`path_rejection`]: a handler taking
@@ -107,11 +119,13 @@ pub fn body_rejection(rejection: &JsonRejection) -> WyrdErrorResponse {
     })
 }
 
-/// Whether `error` is a transient refusal retryable after one second.
+/// Whether `error` is a transient refusal retryable after one second; a
+/// generic 503 is transient by definition (RFC 9110 §15.6.4).
 fn retryable_now(error: &WyrdError) -> bool {
     matches!(
         error,
         WyrdError::AuthVerifyUnavailable { .. }
+            | WyrdError::ServiceUnavailable { .. }
             | WyrdError::VerificationStagingFull { .. }
             | WyrdError::Vala {
                 error: wyrd_spec::vala::error::BifrostError::QueryAdmissionRejected
@@ -427,8 +441,9 @@ mod error_mapper_tests {
         assert_eq!(problem["details"]["data"]["status"], 503);
     }
 
-    /// Proves every retryable pressure error — auth verify, ingest busy,
-    /// verification staging, and query admission — carries `Retry-After: 1`,
+    /// Proves every retryable pressure error — auth verify, a generic 503
+    /// such as a process capacity refusal, ingest busy, verification
+    /// staging, and query admission — carries `Retry-After: 1`,
     /// while non-retryable Bifrost failures carry none.
     ///
     /// # Panics
@@ -443,6 +458,18 @@ mod error_mapper_tests {
         .into_response();
         assert_eq!(
             retryable
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        let unavailable = WyrdErrorResponse::from(WyrdError::ServiceUnavailable {
+            message: "the verification runtime has no capacity for this Verifier now".to_owned(),
+            details: serde_json::json!({ "reason": "process memory" }),
+        })
+        .into_response();
+        assert_eq!(
+            unavailable
                 .headers()
                 .get(axum::http::header::RETRY_AFTER)
                 .and_then(|value| value.to_str().ok()),

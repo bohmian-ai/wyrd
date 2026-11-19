@@ -42,8 +42,9 @@ use crate::oracle::{AuthorizedQueryContext, OracleQueryStream, QueryStreamLifecy
 pub use crate::otlp_contract::{IngestOutcome, LogsOutcome, MetricsOutcome};
 use crate::scribe::preprocess::logical_data_identity;
 use crate::tables::{
-    CallsTable, DomainTable, ExecutionInputsTable, ExecutionOutputsTable, ObjectsTable,
-    ResultsTable, SeriesTable, TableError,
+    ApprovalsTable, CallsTable, DomainTable, EvidenceTable, ExecutionEventsTable,
+    ExecutionInputsTable, ExecutionOutputsTable, ObjectsTable, ResultsTable, SeriesTable,
+    TableError,
 };
 use wyrd_runtime::principal::CardAttribution;
 use wyrd_spec::auth::Attribution;
@@ -69,22 +70,24 @@ fn projection_error(signal: &str, error: &TableError) -> IngestError {
     }
 }
 /// Record the bounded-cardinality Gate request families used by D24, and
-/// a write's server time through [`wyrd_telemetry::record_timing`] at
+/// a write's server time through [`wyrd_benchmark::record_timing`] at
 /// boundary `bifrost.gate.write` under the current span's benchmark
-/// classification; no benchmark reads a query's Gate time, so it records
+/// classification, in place of its duration histogram, so a benchmark
+/// counts it once; no benchmark reads a query's Gate time, so it records
 /// none.
 fn record_gate_request(operation: &'static str, outcome: &'static str, elapsed: Duration) {
-    if operation == "write" {
-        wyrd_telemetry::record_timing(
+    metrics::counter!("bifrost_gate_requests_total", "operation" => operation, "outcome" => outcome)
+        .increment(1);
+    if operation == "write" && wyrd_benchmark::enabled() {
+        wyrd_benchmark::record_timing(
             &tracing::Span::current(),
             "bifrost.gate.write",
             outcome,
             elapsed,
             None,
         );
+        return;
     }
-    metrics::counter!("bifrost_gate_requests_total", "operation" => operation, "outcome" => outcome)
-        .increment(1);
     metrics::histogram!(
         "bifrost_gate_request_duration_seconds",
         "operation" => operation,
@@ -353,6 +356,10 @@ pub struct Gate<A: GateAudit + 'static> {
     auth: IngestAuthInterceptor,
     /// Shared admission closure observed by ingest and query alike.
     closed: Arc<AtomicBool>,
+    /// The attached Scribe's ingress lane, which Gate asks to admit each new
+    /// public write as Bifrost work before accepting it; absent with no
+    /// production Scribe.
+    fresh: Option<crate::scribe::execution_lanes::ScribeIngressCpuPool>,
 }
 
 impl<A: GateAudit + 'static> Clone for Gate<A> {
@@ -371,6 +378,7 @@ impl<A: GateAudit + 'static> Clone for Gate<A> {
             limits: self.limits,
             auth: self.auth.clone(),
             closed: Arc::clone(&self.closed),
+            fresh: self.fresh.clone(),
         }
     }
 }
@@ -419,6 +427,7 @@ impl<A: GateAudit + 'static> Gate<A> {
     ) -> Self {
         initialize_gate_metrics();
         Self {
+            fresh: Some(scribe.ingress_cpu_pool()),
             scribe: Some(scribe),
             query: None,
             cards: None,
@@ -445,6 +454,7 @@ impl<A: GateAudit + 'static> Gate<A> {
             limits,
             auth,
             closed: Arc::new(AtomicBool::new(false)),
+            fresh: None,
         }
     }
 
@@ -464,6 +474,7 @@ impl<A: GateAudit + 'static> Gate<A> {
             limits,
             auth,
             closed: Arc::new(AtomicBool::new(false)),
+            fresh: None,
         }
     }
 
@@ -661,18 +672,26 @@ impl<A: GateAudit + 'static> Gate<A> {
         self.closed.load(Ordering::Acquire)
     }
 
-    /// Refuses new ingest once the Gate is closed or Scribe is not ready.
+    /// Refuses new ingest once the Gate is closed, Scribe is not ready, or
+    /// process pressure pauses new Bifrost work.
+    ///
+    /// Only public writes pass here; server outboxes deliver accepted work to
+    /// Scribe directly, so they keep draining under pressure.
     ///
     /// # Errors
     ///
     /// Returns [`IngestError::IngressClosed`] after `close()` and while the
-    /// local Scribe is absent or still recovering.
+    /// local Scribe is absent or still recovering, and
+    /// [`IngestError::IngestBusy`] while pressure pauses new Bifrost work.
     fn ensure_open(&self) -> Result<(), IngestError> {
         if self.is_closed() {
             return Err(IngestError::IngressClosed);
         }
         if !self.scribe.as_ref().is_some_and(|scribe| scribe.is_ready()) {
             return Err(IngestError::IngressClosed);
+        }
+        if let Some(fresh) = &self.fresh {
+            fresh.admit(None).map_err(IngestError::from_scribe)?;
         }
         Ok(())
     }
@@ -1132,8 +1151,8 @@ impl<A: GateAudit + 'static> Gate<A> {
     }
 }
 
-/// Whether `table` is one of the verification result or input tables only the
-/// server's internal writer writes.
+/// Whether `table` is one of the verification result, input, or event tables
+/// only the server's internal writer writes.
 ///
 /// The set is closed and owned by the table definitions themselves, so a
 /// renamed result table cannot silently fall out of the reservation.
@@ -1145,6 +1164,9 @@ fn is_verification_result_table(table: &TableRef) -> bool {
             ExecutionOutputsTable::NAMESPACE,
             ExecutionOutputsTable::NAME,
         ),
+        (ExecutionEventsTable::NAMESPACE, ExecutionEventsTable::NAME),
+        (EvidenceTable::NAMESPACE, EvidenceTable::NAME),
+        (ApprovalsTable::NAMESPACE, ApprovalsTable::NAME),
     ]
     .into_iter()
     .any(|(namespace, name)| {
@@ -2770,6 +2792,9 @@ mod tests {
             "bifrost.verification.results",
             "bifrost.verification.execution_inputs",
             "bifrost.verification.execution_outputs",
+            "bifrost.verification.execution_events",
+            "bifrost.verification.evidence",
+            "bifrost.verification.approvals",
             "bifrost.metrics.series",
         ] {
             for (label, auth) in &principals {
@@ -2974,15 +2999,16 @@ mod tests {
 
     /// A native write's `bifrost.gate.write` observation runs until Scribe
     /// admitted it durably, so a 30 ms append is inside it; a write refused
-    /// before Scribe is its own `failed` observation.
+    /// before Scribe is its own `failed` observation; the request counter
+    /// counts both and no duration histogram counts either again.
     ///
     /// # Panics
     /// Panics when an outcome, count, or elapsed bound is wrong.
     #[tokio::test]
     async fn histogram_write_boundary_includes_durable_append() {
-        use wyrd_telemetry::timing;
+        use wyrd_benchmark as timing;
 
-        timing::enable();
+        timing::install().expect("the benchmark recorder installs");
         let before = timing::snapshot();
         let gate = Gate::<RecordingAudit>::with_test_scribe(
             Arc::new(SlowScribe),
@@ -3033,6 +3059,20 @@ mod tests {
             "through the durable append: {lowest} ns"
         );
         assert_eq!(series("failed").count, 1);
+        assert!(
+            interval
+                .histogram(
+                    "bifrost_gate_request_duration_seconds",
+                    &[("operation", "write")]
+                )
+                .is_err(),
+            "the duration histogram would count each timed write twice"
+        );
+        assert_eq!(
+            interval.counter("bifrost_gate_requests_total", &[("operation", "write")]),
+            Some(2),
+            "the request counter still counts both writes"
+        );
     }
 
     /// Query request lifecycles emit one exact terminal and drain active work.

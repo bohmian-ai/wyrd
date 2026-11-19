@@ -12,9 +12,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::{TimeDelta, Utc};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
+use tokio::sync::Semaphore;
 use url::Url;
+use vala_bifrost_redux::resources::ScribeWorkerOverrides;
 use vala_bifrost_redux::scribe::geometry::{ScribeGeometry, ScribeGeometryError};
 use wyrd_auth_oidc::{AddressPolicy, ScreenedHttp};
 use wyrd_crypt::SealingKeyring;
@@ -28,6 +31,7 @@ use wyrd_telemetry::TelemetryConfig;
 use wyrd_utils::secret::read_secret_file;
 
 use crate::boot::data_root::DEFAULT_BIFROST_DATA_DIR;
+use crate::verification::RuntimeLimits;
 use crate::verification::hosted::HostedLimits;
 
 /// Errors raised during configuration loading or validation.
@@ -179,38 +183,151 @@ impl ServeMode {
     }
 }
 
-/// Internal process composition for the Forge maintenance topology.
+/// Closed process target selected by `WYRD_TARGET`.
+///
+/// One binary runs every deployment shape. `Combined` is the all-in-one
+/// default; the other targets split Verifier work and Bifrost owners across
+/// separately provisioned pods so direct verification never shares capacity
+/// with queued work. Every split target runs only in explicit peer mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 #[clap(rename_all = "kebab-case")]
-pub enum BifrostTarget {
-    /// Serve APIs, schedule Forge work, and run the embedded worker.
+pub enum ServerTarget {
+    /// Serve every route, run direct and queued verification, and run Scribe,
+    /// Oracle, and both Forge roles in-process.
     #[default]
-    All,
-    /// Serve APIs and schedule Forge work without executing tasks.
-    Server,
-    /// Serve only Oracle query, lifecycle, and persisted follower capabilities.
-    Oracle,
+    Combined,
+    /// Execute only synchronous `verify`, with Scribe and Oracle in-process.
+    Direct,
+    /// Admit and execute only queued verification, with Scribe and Oracle
+    /// in-process.
+    Worker,
     /// Serve only Scribe ingest, tail, and live follower capabilities.
-    Scribe,
-    /// Run Forge workers without opening public API listeners.
-    ForgeWorker,
+    BifrostIngest,
+    /// Serve only Oracle query, lifecycle, and persisted follower capabilities.
+    BifrostQuery,
+    /// Run the Forge coordinator and worker without public API listeners.
+    BifrostMaintenance,
 }
 
-impl BifrostTarget {
-    /// Returns whether this role owns public API listeners.
+impl ServerTarget {
+    /// The `WYRD_TARGET` spelling of every target, in declaration order.
+    pub const NAMES: [&'static str; 6] = [
+        "combined",
+        "direct",
+        "worker",
+        "bifrost-ingest",
+        "bifrost-query",
+        "bifrost-maintenance",
+    ];
+
+    /// Parses one `WYRD_TARGET` value.
+    ///
+    /// Returns `None` for any value outside [`Self::NAMES`]; the removed
+    /// targets have no aliases.
     #[must_use]
-    pub(crate) fn serves_api(self) -> bool {
-        matches!(self, Self::All | Self::Server | Self::Oracle | Self::Scribe)
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "combined" => Some(Self::Combined),
+            "direct" => Some(Self::Direct),
+            "worker" => Some(Self::Worker),
+            "bifrost-ingest" => Some(Self::BifrostIngest),
+            "bifrost-query" => Some(Self::BifrostQuery),
+            "bifrost-maintenance" => Some(Self::BifrostMaintenance),
+            _ => None,
+        }
     }
 
-    /// Returns whether this target owns only part of the Scribe/Oracle pair.
+    /// Returns whether this target owns public API listeners.
+    #[must_use]
+    pub(crate) fn serves_api(self) -> bool {
+        !matches!(self, Self::BifrostMaintenance)
+    }
+
+    /// Returns whether this target executes synchronous `verify`.
+    #[must_use]
+    pub fn runs_direct(self) -> bool {
+        matches!(self, Self::Combined | Self::Direct)
+    }
+
+    /// Returns whether this target admits and executes queued verification:
+    /// enqueue, GitHub webhooks, deferred inputs, approvals, queued-only
+    /// controls, and execution claims.
+    #[must_use]
+    pub fn runs_queued(self) -> bool {
+        matches!(self, Self::Combined | Self::Worker)
+    }
+
+    /// Returns whether this target serves any Verifier work.
+    #[must_use]
+    pub fn serves_verifiers(self) -> bool {
+        self.runs_direct() || self.runs_queued()
+    }
+
+    /// The `WYRD_TARGET` spelling of this target.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        Self::NAMES[self as usize]
+    }
+
+    /// Refuses synchronous `verify` on a target that does not run it.
     ///
-    /// A split target cannot reach its counterpart in-process, so it runs only
-    /// in explicit peer mode.
+    /// Callers check this before authorization, admission, or any write, so a
+    /// refused call leaves nothing behind.
+    ///
+    /// # Errors
+    /// Returns [`wyrd_spec::error::WyrdError::VerificationWrongTarget`] unless
+    /// [`Self::runs_direct`].
+    pub(crate) fn require_direct(self, operation: &str) -> Result<(), wyrd_spec::error::WyrdError> {
+        self.require(self.runs_direct(), "direct", operation)
+    }
+
+    /// Refuses queued Verifier work on a target that does not run it.
+    ///
+    /// Callers check this before authorization, admission, or any write, so a
+    /// refused call leaves nothing behind.
+    ///
+    /// # Errors
+    /// Returns [`wyrd_spec::error::WyrdError::VerificationWrongTarget`] unless
+    /// [`Self::runs_queued`].
+    pub(crate) fn require_queued(self, operation: &str) -> Result<(), wyrd_spec::error::WyrdError> {
+        self.require(self.runs_queued(), "queued", operation)
+    }
+
+    /// Builds the shared wrong-target refusal for `work`.
+    ///
+    /// # Errors
+    /// Returns [`wyrd_spec::error::WyrdError::VerificationWrongTarget`],
+    /// naming this target, `work` and `operation`, when `runs` is false.
+    fn require(
+        self,
+        runs: bool,
+        work: &str,
+        operation: &str,
+    ) -> Result<(), wyrd_spec::error::WyrdError> {
+        if runs {
+            return Ok(());
+        }
+        Err(wyrd_spec::error::WyrdError::VerificationWrongTarget {
+            message: format!(
+                "{operation} is {work} Verifier work, which this server's '{}' target does not run",
+                self.name()
+            ),
+            details: serde_json::json!({
+                "target": self.name(),
+                "work": work,
+                "operation": operation,
+            }),
+        })
+    }
+
+    /// Returns whether this target is one part of a split deployment.
+    ///
+    /// A split target cannot reach the owners it does not run in-process, so
+    /// it runs only in explicit peer mode.
     #[must_use]
     pub fn requires_peer(self) -> bool {
-        matches!(self, Self::Oracle | Self::Scribe)
+        !matches!(self, Self::Combined)
     }
 }
 
@@ -310,15 +427,18 @@ pub struct ServeConfig {
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScribeRuntimeConfig {
-    /// Tokio coordination worker count.
-    #[serde(default = "default_scribe_coordination_threads")]
-    pub coordination_threads: usize,
-    /// Ingress CPU worker count.
-    #[serde(default = "default_scribe_ingress_cpu_threads")]
-    pub ingress_cpu_threads: usize,
-    /// Persistence CPU worker count for Parquet preparation and bounded replay work.
-    #[serde(default = "default_scribe_persistence_cpu_threads")]
-    pub persistence_cpu_threads: usize,
+    /// Tokio coordination worker count; unset derives it from effective CPU
+    /// through
+    /// [`vala_bifrost_redux::resources::ScribeWorkers::resolve`].
+    #[serde(default)]
+    pub coordination_threads: Option<usize>,
+    /// Ingress CPU worker count; unset derives it from effective CPU.
+    #[serde(default)]
+    pub ingress_cpu_threads: Option<usize>,
+    /// Persistence CPU worker count for Parquet preparation and bounded replay
+    /// work; unset derives it from effective CPU.
+    #[serde(default)]
+    pub persistence_cpu_threads: Option<usize>,
     /// WAL IO worker count. Boot runs at least one worker per shard; see
     /// [`Self::wal_io_workers`].
     #[serde(default = "default_scribe_wal_io_threads")]
@@ -411,9 +531,9 @@ pub struct BifrostRoles {
 impl BifrostRoles {
     /// Constructs the exact effective roles for one public process target.
     #[must_use]
-    pub fn for_target(target: BifrostTarget) -> Self {
+    pub fn for_target(target: ServerTarget) -> Self {
         let selected = match target {
-            BifrostTarget::All => [
+            ServerTarget::Combined => [
                 BifrostRuntimeRole::Scribe,
                 BifrostRuntimeRole::ForgeCoordinator,
                 BifrostRuntimeRole::ForgeWorker,
@@ -421,16 +541,19 @@ impl BifrostRoles {
             ]
             .into_iter()
             .collect(),
-            BifrostTarget::Server => [
-                BifrostRuntimeRole::Scribe,
+            ServerTarget::Direct | ServerTarget::Worker => {
+                [BifrostRuntimeRole::Scribe, BifrostRuntimeRole::Oracle]
+                    .into_iter()
+                    .collect()
+            }
+            ServerTarget::BifrostQuery => [BifrostRuntimeRole::Oracle].into_iter().collect(),
+            ServerTarget::BifrostIngest => [BifrostRuntimeRole::Scribe].into_iter().collect(),
+            ServerTarget::BifrostMaintenance => [
                 BifrostRuntimeRole::ForgeCoordinator,
-                BifrostRuntimeRole::Oracle,
+                BifrostRuntimeRole::ForgeWorker,
             ]
             .into_iter()
             .collect(),
-            BifrostTarget::Oracle => [BifrostRuntimeRole::Oracle].into_iter().collect(),
-            BifrostTarget::Scribe => [BifrostRuntimeRole::Scribe].into_iter().collect(),
-            BifrostTarget::ForgeWorker => [BifrostRuntimeRole::ForgeWorker].into_iter().collect(),
         };
         Self { selected }
     }
@@ -1128,6 +1251,36 @@ pub struct BifrostRuntimeConfig {
 }
 
 impl BifrostRuntimeConfig {
+    /// Projects the resource and Scribe worker settings onto the checked
+    /// resource policy.
+    ///
+    /// This is the only translation from server configuration to Bifrost
+    /// resource planning, so boot and tests resolve the same shared cap and
+    /// worker counts from the same fields. Validation happens where the policy
+    /// meets an observation, never here.
+    #[must_use]
+    pub fn resource_policy(
+        &self,
+        roles: std::collections::BTreeSet<vala_bifrost_redux::resources::BifrostRole>,
+        scratch_root: Option<PathBuf>,
+        volume_roots: Option<vala_bifrost_redux::resources::BifrostVolumeRoots>,
+    ) -> vala_bifrost_redux::resources::BifrostResourcePolicy {
+        let resources = &self.resources;
+        vala_bifrost_redux::resources::BifrostResourcePolicy {
+            roles,
+            process_memory_limit_bytes: resources.process_memory_limit_bytes,
+            server_memory_min_bytes: resources.server_memory_min_bytes,
+            bifrost_memory_limit_bytes: resources.memory_limit_bytes,
+            scratch_limit_bytes: resources.scratch_limit_bytes,
+            effective_cpu: resources.effective_cpu,
+            scribe_workers: self.scribe.worker_overrides(),
+            oracle_query_slot_limit: resources.oracle_query_slot_limit,
+            oracle_partition_scan_bytes: resources.oracle_partition_scan_bytes,
+            scratch_root,
+            volume_roots,
+        }
+    }
+
     /// Resolved local Bifrost data root: the environment override, else `.wyrd/bifrost`.
     #[must_use]
     pub fn data_dir(&self) -> &Path {
@@ -1143,9 +1296,7 @@ impl BifrostRuntimeConfig {
 /// Oracle, and Forge in-process and opens no private socket. Peer mode is
 /// enabled by supplying both `address` and `tls_dir`, even for the first of
 /// several replicas; each replica publishes its own address through the
-/// existing fenced `vala.cluster_nodes` membership. A dedicated `forge-worker`
-/// opens no listener, so it takes `tls_dir` alone: its credentials only dial
-/// the elected Forge leader's peer route.
+/// existing fenced `vala.cluster_nodes` membership.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BifrostPeerConfig {
@@ -1215,35 +1366,17 @@ impl BifrostPeerConfig {
         }))
     }
 
-    /// Validates the explicit peer-mode inputs for a process that does, or
-    /// does not, serve a peer listener.
+    /// Validates the explicit peer-mode inputs.
     ///
-    /// A listening target needs both `address` and `tls_dir` or neither. A
-    /// dial-only target (`listens == false`, the dedicated Forge worker) may
-    /// name `tls_dir` alone and never an `address`, because it publishes no
-    /// endpoint for anyone to dial.
+    /// Every target that runs in peer mode opens the private listener, so peer
+    /// mode takes both `address` and `tls_dir` or neither.
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError::Invalid`] when a listening target supplies only
-    /// one of `address` and `tls_dir`, a dial-only target supplies an
-    /// `address`, `tls_dir` is empty, or `address` is not a bare `host:port`.
-    fn validate(&self, listens: bool) -> Result<(), ConfigError> {
-        if !listens {
-            if self.address.is_some() {
-                return Err(ConfigError::Invalid {
-                    message: "the forge-worker target serves no peer listener; \
-                              unset WYRD_PEER_ADDRESS and keep only WYRD_PEER_TLS_DIR"
-                        .to_owned(),
-                });
-            }
-            return match &self.tls_dir {
-                Some(tls_dir) if tls_dir.as_os_str().is_empty() => Err(ConfigError::Invalid {
-                    message: "WYRD_PEER_TLS_DIR must name a directory".to_owned(),
-                }),
-                _ => Ok(()),
-            };
-        }
+    /// Returns [`ConfigError::Invalid`] when only one of `address` and
+    /// `tls_dir` is supplied, `tls_dir` is empty, or `address` is not a bare
+    /// `host:port`.
+    fn validate(&self) -> Result<(), ConfigError> {
         let (address, tls_dir) = match (&self.address, &self.tls_dir) {
             (None, None) => return Ok(()),
             (Some(address), Some(tls_dir)) => (address, tls_dir),
@@ -1367,6 +1500,16 @@ impl BifrostStorageIoConfig {
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BifrostResourceConfig {
+    /// Optional ceiling on this process's memory, below detected host memory.
+    ///
+    /// Every capability's memory comes from one process ledger: this value
+    /// less [`Self::server_memory_min_bytes`]. Processes sharing a host or a
+    /// container allocation must each set a non-overlapping ceiling, because
+    /// host memory cannot assign them disjoint budgets. A value may only
+    /// lower the detected host memory.
+    /// `WYRD_BIFROST_PROCESS_MEMORY_LIMIT_BYTES` overrides it.
+    #[serde(default)]
+    pub process_memory_limit_bytes: Option<usize>,
     /// Optional lower cap on the one shared Bifrost memory budget.
     ///
     /// Unset, the cap is the detected process memory limit less
@@ -1384,7 +1527,7 @@ pub struct BifrostResourceConfig {
     /// Optional disposable scratch cap; filesystem availability may be tighter.
     #[serde(default)]
     pub scratch_limit_bytes: Option<u64>,
-    /// Optional effective CPU cap; process/cgroup affinity may be tighter.
+    /// Optional effective CPU cap; available parallelism may be tighter.
     #[serde(default)]
     pub effective_cpu: Option<usize>,
     /// Optional Oracle query slot-unit concurrency limit for this node.
@@ -1402,66 +1545,6 @@ pub struct BifrostResourceConfig {
     /// `WYRD_BIFROST_ORACLE_PARTITION_SCAN_BYTES` overrides it.
     #[serde(default)]
     pub oracle_partition_scan_bytes: Option<u64>,
-}
-
-impl BifrostResourceConfig {
-    /// Projects these operator settings onto the checked resource policy.
-    ///
-    /// This is the only translation from server configuration to Bifrost
-    /// resource planning, so boot and tests resolve the same shared cap from
-    /// the same fields. Validation happens where the policy meets an
-    /// observation, never here.
-    #[must_use]
-    pub fn policy(
-        &self,
-        roles: std::collections::BTreeSet<vala_bifrost_redux::resources::BifrostRole>,
-        scratch_root: Option<PathBuf>,
-        volume_roots: Option<vala_bifrost_redux::resources::BifrostVolumeRoots>,
-    ) -> vala_bifrost_redux::resources::BifrostResourcePolicy {
-        vala_bifrost_redux::resources::BifrostResourcePolicy {
-            roles,
-            server_memory_min_bytes: self.server_memory_min_bytes,
-            bifrost_memory_limit_bytes: self.memory_limit_bytes,
-            scratch_limit_bytes: self.scratch_limit_bytes,
-            effective_cpu: self.effective_cpu,
-            oracle_query_slot_limit: self.oracle_query_slot_limit,
-            oracle_partition_scan_bytes: self.oracle_partition_scan_bytes,
-            scratch_root,
-            volume_roots,
-        }
-    }
-}
-
-/// Derives the dedicated Scribe coordination-runtime worker count.
-///
-/// The coordination runtime hosts one long-lived task per Scribe shard lane
-/// plus the reconciliation and persistence loops. Those shard owners are not
-/// pure channel-awaiters: each performs synchronous Arrow memtable insertion
-/// inline and awaits a Postgres `COMMIT`, so a thread count well below the
-/// lane count serializes independent lanes.
-///
-/// The derivation therefore starts from detected parallelism — matching the
-/// sibling ingress and persistence derivations, including their `map_or(4, ..)`
-/// fallback for platforms that cannot report it — floored at two so a
-/// single-core box still gets a second thread to make progress on while one
-/// lane blocks in `COMMIT`.
-fn default_scribe_coordination_threads() -> usize {
-    std::thread::available_parallelism()
-        .map_or(4, std::num::NonZeroUsize::get)
-        .max(2)
-}
-
-fn default_scribe_ingress_cpu_threads() -> usize {
-    let available = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
-    (available.saturating_sub(2).max(2) / 3).max(1)
-}
-
-fn default_scribe_persistence_cpu_threads() -> usize {
-    let available = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
-    let budget = available.saturating_sub(2).max(2);
-    budget
-        .saturating_sub(default_scribe_ingress_cpu_threads())
-        .max(1)
 }
 
 fn default_scribe_wal_io_threads() -> usize {
@@ -1519,9 +1602,9 @@ fn default_ingest_wal_workspace_bytes() -> usize {
 impl Default for ScribeRuntimeConfig {
     fn default() -> Self {
         Self {
-            coordination_threads: default_scribe_coordination_threads(),
-            ingress_cpu_threads: default_scribe_ingress_cpu_threads(),
-            persistence_cpu_threads: default_scribe_persistence_cpu_threads(),
+            coordination_threads: None,
+            ingress_cpu_threads: None,
+            persistence_cpu_threads: None,
             wal_io_threads: default_scribe_wal_io_threads(),
             ingest_request_bytes: default_ingest_request_bytes(),
             outbox_capacity: default_outbox_capacity(),
@@ -1549,6 +1632,17 @@ impl ScribeRuntimeConfig {
         self.wal_io_threads.max(self.shard_count)
     }
 
+    /// The worker counts set explicitly, which the resource plan applies over
+    /// its CPU-derived defaults.
+    #[must_use]
+    pub const fn worker_overrides(&self) -> ScribeWorkerOverrides {
+        ScribeWorkerOverrides {
+            coordination_threads: self.coordination_threads,
+            ingress_cpu_threads: self.ingress_cpu_threads,
+            persistence_cpu_threads: self.persistence_cpu_threads,
+        }
+    }
+
     /// Validate that every configured bound can provide bounded operation.
     ///
     /// # Errors
@@ -1563,9 +1657,12 @@ impl ScribeRuntimeConfig {
             ("coordination_threads", self.coordination_threads),
             ("ingress_cpu_threads", self.ingress_cpu_threads),
             ("persistence_cpu_threads", self.persistence_cpu_threads),
-            ("wal_io_threads", self.wal_io_threads),
+            ("wal_io_threads", Some(self.wal_io_threads)),
         ];
-        if let Some((name, _value)) = thread_values.into_iter().find(|(_, value)| *value == 0) {
+        if let Some((name, _value)) = thread_values
+            .into_iter()
+            .find(|(_, value)| *value == Some(0))
+        {
             return Err(format!("scribe.{name} must be at least 1"));
         }
         let rotation_values = [
@@ -1709,10 +1806,11 @@ pub struct MetricsConfig {
     /// stays on loopback rather than inheriting the (possibly public) HTTP IP.
     #[serde(default)]
     pub bind: Option<SocketAddr>,
-    /// Whether the metrics listener also serves the read-only benchmark
-    /// timing snapshot, `GET /benchmark/timings`, and the process records
-    /// benchmark timing histograms. Defaults to false; only a
-    /// benchmark-owned server enables it, and it requires a loopback bind.
+    /// Whether this process installs the benchmark recorder instead of the
+    /// Prometheus recorder: its metrics listener then serves the read-only
+    /// benchmark snapshot, `GET /benchmark/snapshot`, and no `/metrics`
+    /// exposition. Defaults to false; only a benchmark-owned server enables
+    /// it, and it requires a loopback bind and a `bench` build.
     #[serde(default)]
     pub benchmark_snapshot: bool,
 }
@@ -1745,9 +1843,32 @@ pub struct VerificationConfig {
     /// credentials come from.
     #[serde(default)]
     pub operator_keys: OperatorKeysConfig,
-    /// The Deployment limits, read only from `WYRD_VERIFICATION_*` at startup.
+    /// `verify` calls one process runs at once; unset keeps the default.
+    /// `WYRD_VERIFICATION_DIRECT_EXECUTIONS` overrides it.
+    #[serde(default)]
+    pub direct_executions: Option<usize>,
+    /// Queued executions one process runs at once; unset keeps the default.
+    /// `WYRD_VERIFICATION_QUEUED_EXECUTIONS` overrides it.
+    #[serde(default)]
+    pub queued_executions: Option<usize>,
+    /// Ceiling of one queued execution from its first claim, in
+    /// milliseconds; unset keeps the default.
+    /// `WYRD_VERIFICATION_EXECUTION_TIMEOUT_MS` overrides it.
+    #[serde(default)]
+    pub execution_timeout_ms: Option<u64>,
+    /// Gateway model calls every `verify` call and queued execution of one
+    /// process make at once; unset keeps the default.
+    /// `WYRD_VERIFICATION_MODEL_CALLS` overrides it.
+    #[serde(default)]
+    pub model_calls: Option<usize>,
+    /// The resolved Deployment limits: defaults, then the file capacities
+    /// above, then `WYRD_VERIFICATION_*`, validated at startup.
     #[serde(skip)]
     pub limits: HostedLimits,
+    /// The resolved runtime bounds; only the queued execution slots and the
+    /// queued execution deadline are configurable, resolved as `limits` is.
+    #[serde(skip)]
+    pub runtime: RuntimeLimits,
 }
 
 /// Serde default for [`VerificationConfig::enabled`].
@@ -1761,57 +1882,79 @@ impl Default for VerificationConfig {
         Self {
             enabled: default_verification_enabled(),
             operator_keys: OperatorKeysConfig::default(),
+            direct_executions: None,
+            queued_executions: None,
+            execution_timeout_ms: None,
+            model_calls: None,
             limits: HostedLimits::default(),
+            runtime: RuntimeLimits::default(),
         }
     }
 }
 
 impl VerificationConfig {
-    /// Apply every `WYRD_VERIFICATION_*` Deployment limit and the Monty
-    /// worker path, then refuse inconsistent limits.
+    /// Resolve [`Self::limits`] and [`Self::runtime`]: the approved defaults,
+    /// then each execution capacity and the queued
+    /// deadline from its `WYRD_VERIFICATION_*` variable when set, else from
+    /// the file; then every other `WYRD_VERIFICATION_*` Deployment limit;
+    /// then refuse inconsistent merged limits, whatever their source.
     ///
-    /// Each limit is a positive integer; `_MIB`/`_KIB` are binary units and
-    /// `_MS` milliseconds. Unset variables keep the approved defaults.
+    /// Each value is checked only once it wins, so a valid variable repairs
+    /// a stale file value. Each limit is a positive integer; `_MIB`/`_KIB`
+    /// are binary units and `_ms`/`_MS` milliseconds. Admission counts must
+    /// fit a semaphore, and the queued deadline must be a timestamp from now. Unset values keep
+    /// the approved defaults.
     ///
     /// # Errors
-    /// Returns [`ConfigError::BadEnvVar`] naming a variable that is empty,
-    /// not a positive integer, or overflows its unit, and
-    /// [`ConfigError::Invalid`] naming the variables of an inconsistent pair.
-    fn apply_limits_env(&mut self) -> Result<(), ConfigError> {
+    /// Returns [`ConfigError::Invalid`] naming a winning file value that is
+    /// zero, overflows its unit, or exceeds its runtime representation,
+    /// [`ConfigError::BadEnvVar`] naming a variable that is empty, not a
+    /// positive integer, overflows its unit, or exceeds its runtime
+    /// representation, and [`ConfigError::Invalid`] naming the variables of
+    /// an inconsistent pair.
+    pub fn resolve_limits(&mut self) -> Result<(), ConfigError> {
         /// One kibibyte.
         const KIB: u64 = 1024;
         /// One mebibyte.
         const MIB: u64 = 1024 * KIB;
         let limits = &mut self.limits;
+        set_count(
+            "verification.model_calls",
+            self.model_calls,
+            "WYRD_VERIFICATION_MODEL_CALLS",
+            Semaphore::MAX_PERMITS,
+            &mut limits.model_calls,
+        )?;
+        set_count(
+            "verification.direct_executions",
+            self.direct_executions,
+            "WYRD_VERIFICATION_DIRECT_EXECUTIONS",
+            Semaphore::MAX_PERMITS,
+            &mut limits.direct_executions,
+        )?;
+        set_count(
+            "verification.queued_executions",
+            self.queued_executions,
+            "WYRD_VERIFICATION_QUEUED_EXECUTIONS",
+            Semaphore::MAX_PERMITS,
+            &mut self.runtime.execution_slots,
+        )?;
+        if let Some(timeout) = Selected::of(
+            "verification.execution_timeout_ms",
+            self.execution_timeout_ms,
+            "WYRD_VERIFICATION_EXECUTION_TIMEOUT_MS",
+        )? {
+            self.runtime.execution_timeout = timeout.deadline()?;
+        }
         set_scaled(
             "WYRD_VERIFICATION_MONTY_MIN_WORKERS",
             1,
             &mut limits.monty_min_workers,
         )?;
         set_scaled(
-            "WYRD_VERIFICATION_MONTY_MAX_WORKERS",
-            1,
-            &mut limits.monty_max_workers,
-        )?;
-        set_scaled(
-            "WYRD_VERIFICATION_MONTY_MAX_WAITERS",
-            1,
-            &mut limits.monty_max_waiters,
-        )?;
-        set_scaled(
             "WYRD_VERIFICATION_MONTY_MEMORY_MIB",
             MIB,
             &mut limits.monty_memory_bytes,
-        )?;
-        set_scaled(
-            "WYRD_VERIFICATION_MONTY_PROCESS_MEMORY_MIB",
-            MIB,
-            &mut limits.monty_process_memory_bytes,
-        )?;
-        set_scaled(
-            "WYRD_VERIFICATION_MONTY_POOL_MEMORY_MIB",
-            MIB,
-            &mut limits.monty_pool_memory_bytes,
         )?;
         set_millis(
             "WYRD_VERIFICATION_CODE_TIMEOUT_MS",
@@ -1830,6 +1973,11 @@ impl VerificationConfig {
             "WYRD_VERIFICATION_FILES_MAX_MIB",
             MIB,
             &mut limits.files_max_bytes,
+        )?;
+        set_scaled(
+            "WYRD_VERIFICATION_PUBLICATIONS_MAX",
+            1,
+            &mut limits.publications_max,
         )?;
         set_scaled(
             "WYRD_VERIFICATION_ARCHIVE_MAX_MIB",
@@ -1872,31 +2020,17 @@ impl VerificationConfig {
             &mut limits.tool_result_max_bytes,
         )?;
         set_scaled(
-            "WYRD_VERIFICATION_MAX_WORKSPACES",
+            "WYRD_VERIFICATION_TOOL_ARGUMENT_MAX_KIB",
+            KIB,
+            &mut limits.tool_argument_max_bytes,
+        )?;
+        set_scaled(
+            "WYRD_VERIFICATION_AGENT_TOOL_MAX_CALLS",
             1,
-            &mut limits.max_workspaces,
+            &mut limits.agent_tool_max_calls,
         )?;
         set_millis("WYRD_VERIFICATION_TIMEOUT_MS", &mut limits.verify_timeout)?;
         let inconsistent = [
-            (
-                limits.monty_min_workers > limits.monty_max_workers,
-                "WYRD_VERIFICATION_MONTY_MIN_WORKERS exceeds WYRD_VERIFICATION_MONTY_MAX_WORKERS",
-            ),
-            (
-                limits.monty_memory_bytes >= limits.monty_process_memory_bytes,
-                "WYRD_VERIFICATION_MONTY_MEMORY_MIB must be below \
-                 WYRD_VERIFICATION_MONTY_PROCESS_MEMORY_MIB",
-            ),
-            (
-                limits.monty_pool_memory_bytes < limits.monty_process_memory_bytes,
-                "WYRD_VERIFICATION_MONTY_POOL_MEMORY_MIB is below \
-                 WYRD_VERIFICATION_MONTY_PROCESS_MEMORY_MIB",
-            ),
-            (
-                limits.live_workers().is_none(),
-                "WYRD_VERIFICATION_MONTY_PROCESS_MEMORY_MIB cannot hold \
-                 WYRD_VERIFICATION_MONTY_MEMORY_MIB plus Monty's allocator headroom",
-            ),
             (
                 limits.file_max_bytes > limits.files_max_bytes,
                 "WYRD_VERIFICATION_FILE_MAX_MIB exceeds WYRD_VERIFICATION_FILES_MAX_MIB",
@@ -1913,6 +2047,108 @@ impl VerificationConfig {
         }
         Ok(())
     }
+}
+
+/// One verification setting's winning raw value, before unit conversion:
+/// its environment variable when set, else its server TOML file value, so a
+/// valid override repairs a stale file value and a refusal names the input
+/// that won.
+struct Selected<'a> {
+    /// The environment variable or TOML key the value came from.
+    name: &'a str,
+    /// Whether `name` is an environment variable.
+    env: bool,
+    /// The positive value.
+    value: u64,
+}
+
+impl<'a> Selected<'a> {
+    /// Select the positive integer in `key` over the file's `value` for
+    /// `file_key`; `None` when neither is set.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::BadEnvVar`] when `key` is set but empty or not
+    /// a positive integer, and [`ConfigError::Invalid`] naming `file_key`
+    /// when the file's value wins and is zero.
+    fn of(
+        file_key: &'a str,
+        value: Option<u64>,
+        key: &'a str,
+    ) -> Result<Option<Self>, ConfigError> {
+        if let Some(value) = env_positive(key)? {
+            return Ok(Some(Self {
+                name: key,
+                env: true,
+                value,
+            }));
+        }
+        match value {
+            Some(0) => Err(ConfigError::Invalid {
+                message: format!("{file_key} must be positive"),
+            }),
+            value => Ok(value.map(|value| Self {
+                name: file_key,
+                env: false,
+                value,
+            })),
+        }
+    }
+
+    /// The refusal of this value as its source's error, `reason` saying why.
+    fn refuse(&self, reason: &str) -> ConfigError {
+        let value = self.value;
+        if self.env {
+            ConfigError::BadEnvVar {
+                key: self.name.to_owned(),
+                message: format!("{value} {reason}"),
+            }
+        } else {
+            ConfigError::Invalid {
+                message: format!("{} {value} {reason}", self.name),
+            }
+        }
+    }
+
+    /// This millisecond count as a queued execution deadline. The runner
+    /// binds it as signed milliseconds, PostgreSQL adds it to the statement
+    /// time as an interval, and the queue reads that timestamp back as a
+    /// `DateTime<Utc>`; a timestamp from now that fits `DateTime<Utc>` also
+    /// fits the interval's signed microseconds.
+    ///
+    /// # Errors
+    /// Returns this value's refusal when it exceeds signed milliseconds or
+    /// ends past the latest `DateTime<Utc>` from now.
+    fn deadline(&self) -> Result<Duration, ConfigError> {
+        let timeout = Duration::from_millis(self.value);
+        TimeDelta::from_std(timeout)
+            .ok()
+            .and_then(|delta| Utc::now().checked_add_signed(delta))
+            .map(|_| timeout)
+            .ok_or_else(|| self.refuse("cannot be represented as a queued execution deadline"))
+    }
+}
+
+/// Overwrite `target` with the winning count of `key` or the file's `value`
+/// for `file_key`, refusing one above `max`.
+///
+/// # Errors
+/// Returns every error of [`Selected::of`], and the winner's refusal when it
+/// exceeds `max`.
+fn set_count(
+    file_key: &str,
+    value: Option<usize>,
+    key: &str,
+    max: usize,
+    target: &mut usize,
+) -> Result<(), ConfigError> {
+    let value = value.map(|count| u64::try_from(count).unwrap_or(u64::MAX));
+    if let Some(selected) = Selected::of(file_key, value, key)? {
+        *target = usize::try_from(selected.value)
+            .ok()
+            .filter(|count| *count <= max)
+            .ok_or_else(|| selected.refuse(&format!("exceeds the runtime's limit of {max}")))?;
+    }
+    Ok(())
 }
 
 /// Overwrite `target` with the positive integer in `key` times `unit`.
@@ -2214,6 +2450,351 @@ impl OperatorKeysConfig {
     }
 }
 
+/// The deployment's GitHub App (`[github]`, `WYRD_GITHUB_*`).
+///
+/// Optional: when every field is unset the GitHub integration is unavailable
+/// and every other surface runs unchanged. Once any field is set the section
+/// must be complete and valid or startup fails. The App's private key,
+/// webhook secret and OAuth client secret come only from the environment or
+/// a mounted file (`WYRD_GITHUB_APP_PRIVATE_KEY_FILE` /
+/// `WYRD_GITHUB_APP_PRIVATE_KEY_PEM`, `WYRD_GITHUB_WEBHOOK_SECRET_FILE` /
+/// `WYRD_GITHUB_WEBHOOK_SECRET`, `WYRD_GITHUB_OAUTH_CLIENT_SECRET_FILE` /
+/// `WYRD_GITHUB_OAUTH_CLIENT_SECRET`), never TOML.
+#[derive(Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GithubConfig {
+    /// GitHub App id (`WYRD_GITHUB_APP_ID`).
+    #[serde(default)]
+    pub app_id: Option<u64>,
+    /// GitHub App slug (`WYRD_GITHUB_APP_SLUG`).
+    #[serde(default)]
+    pub slug: Option<String>,
+    /// GitHub web origin (`WYRD_GITHUB_WEB_ORIGIN`); `https://github.com`
+    /// when unset, and only that in production. Development and tests name a
+    /// local GitHub protocol mock.
+    #[serde(default)]
+    pub web_origin: Option<String>,
+    /// GitHub REST API origin (`WYRD_GITHUB_API_ORIGIN`);
+    /// `https://api.github.com` when unset, and only that in production.
+    #[serde(default)]
+    pub api_origin: Option<String>,
+    /// This deployment's public base URL (`WYRD_GITHUB_PUBLIC_URL`). The App
+    /// is registered with `<public_url>/v1/integrations/github/setup`,
+    /// `/callback` and `/webhook`.
+    #[serde(default)]
+    pub public_url: Option<String>,
+    /// The App's OAuth client id (`WYRD_GITHUB_OAUTH_CLIENT_ID`).
+    #[serde(default)]
+    pub oauth_client_id: Option<String>,
+    /// App private key PEM; environment or file only.
+    #[serde(skip)]
+    pub private_key: Option<SecretString>,
+    /// Webhook secret; environment or file only.
+    #[serde(skip)]
+    pub webhook_secret: Option<SecretString>,
+    /// OAuth client secret; environment or file only.
+    #[serde(skip)]
+    pub oauth_client_secret: Option<SecretString>,
+}
+
+impl Debug for GithubConfig {
+    /// Redacting debug: prints the nonsecret identity and whether each secret
+    /// is present, never a secret.
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GithubConfig")
+            .field("app_id", &self.app_id)
+            .field("slug", &self.slug)
+            .field("web_origin", &self.web_origin)
+            .field("api_origin", &self.api_origin)
+            .field("public_url", &self.public_url)
+            .field("oauth_client_id", &self.oauth_client_id)
+            .field("private_key", &self.private_key.is_some())
+            .field("webhook_secret", &self.webhook_secret.is_some())
+            .field("oauth_client_secret", &self.oauth_client_secret.is_some())
+            .finish()
+    }
+}
+
+/// A complete, validated GitHub App configuration.
+#[derive(Clone)]
+pub struct GithubAppSettings {
+    /// GitHub App id.
+    pub app_id: u64,
+    /// GitHub App slug.
+    pub slug: String,
+    /// GitHub web origin, without a trailing slash.
+    pub web_origin: Url,
+    /// GitHub REST API base, without a trailing slash.
+    pub api_origin: Url,
+    /// This deployment's public base URL, without a trailing slash.
+    pub public_url: Url,
+    /// OAuth client id.
+    pub oauth_client_id: String,
+    /// OAuth client secret.
+    pub oauth_client_secret: SecretString,
+    /// The App JWT's RS256 signing key, proven to sign at validation.
+    pub signing_key: jsonwebtoken::EncodingKey,
+    /// Webhook HMAC secret.
+    pub webhook_secret: SecretString,
+}
+
+impl Debug for GithubAppSettings {
+    /// Redacting debug: prints the App identity and origins, never a secret.
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GithubAppSettings")
+            .field("app_id", &self.app_id)
+            .field("slug", &self.slug)
+            .field("web_origin", &self.web_origin.as_str())
+            .field("api_origin", &self.api_origin.as_str())
+            .field("public_url", &self.public_url.as_str())
+            .finish_non_exhaustive()
+    }
+}
+
+impl GithubAppSettings {
+    /// The configured GitHub host: the web origin's host, with its port when
+    /// not the scheme default. Installation association is scoped to it.
+    #[must_use]
+    pub fn host(&self) -> String {
+        let host = self.web_origin.host_str().unwrap_or_default();
+        match self.web_origin.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host.to_owned(),
+        }
+    }
+}
+
+impl GithubConfig {
+    /// Whether any field is set, which makes the section required to be
+    /// complete.
+    fn is_present(&self) -> bool {
+        self.app_id.is_some()
+            || self.slug.is_some()
+            || self.web_origin.is_some()
+            || self.api_origin.is_some()
+            || self.public_url.is_some()
+            || self.oauth_client_id.is_some()
+            || self.private_key.is_some()
+            || self.webhook_secret.is_some()
+            || self.oauth_client_secret.is_some()
+    }
+
+    /// Validate the section into the App it configures; `None` when the
+    /// section is entirely unset.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::Invalid`] naming the first missing or invalid
+    /// field: a zero App id, a slug that is not lowercase letters, digits and
+    /// hyphens, an origin that is not a bare `http(s)` origin (`https` only
+    /// in production), a production origin other than GitHub.com's
+    /// (`https://github.com`, `https://api.github.com`), a public URL with a
+    /// query or fragment, an empty client id or secret, or a private key that
+    /// cannot sign an RS256 App JWT.
+    pub fn resolve(&self, production: bool) -> Result<Option<GithubAppSettings>, ConfigError> {
+        if !self.is_present() {
+            return Ok(None);
+        }
+        let invalid = |message: &str| ConfigError::Invalid {
+            message: format!("github: {message}"),
+        };
+        let required = |name: &str| invalid(&format!("{name} is required once [github] is set"));
+        let url = |name: &str, value: &str, bare: bool| {
+            let parsed = Url::parse(value).map_err(|_| invalid(&format!("{name} is not a URL")))?;
+            let scheme_ok =
+                parsed.scheme() == "https" || (!production && parsed.scheme() == "http");
+            if !scheme_ok || parsed.host_str().is_none() {
+                return Err(invalid(&format!(
+                    "{name} must be an https URL (http only outside production)"
+                )));
+            }
+            if parsed.query().is_some()
+                || parsed.fragment().is_some()
+                || !parsed.username().is_empty()
+                || parsed.password().is_some()
+                || (bare && parsed.path() != "/")
+            {
+                return Err(invalid(&format!(
+                    "{name} must not carry credentials, a query or a fragment{}",
+                    if bare { ", or a path" } else { "" }
+                )));
+            }
+            let trimmed = parsed.as_str().trim_end_matches('/').to_owned();
+            Url::parse(&trimmed).map_err(|_| invalid(&format!("{name} is not a URL")))
+        };
+        let app_id = self
+            .app_id
+            .filter(|id| *id > 0)
+            .ok_or_else(|| required("app_id (WYRD_GITHUB_APP_ID, positive)"))?;
+        let slug = self
+            .slug
+            .clone()
+            .ok_or_else(|| required("slug (WYRD_GITHUB_APP_SLUG)"))?;
+        if slug.is_empty()
+            || !slug
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            return Err(invalid(
+                "slug must be lowercase letters, digits and hyphens",
+            ));
+        }
+        let web_origin = url(
+            "web_origin",
+            self.web_origin.as_deref().unwrap_or("https://github.com"),
+            true,
+        )?;
+        let api_origin = url(
+            "api_origin",
+            self.api_origin
+                .as_deref()
+                .unwrap_or("https://api.github.com"),
+            false,
+        )?;
+        if production
+            && (web_origin.as_str() != "https://github.com/"
+                || api_origin.as_str() != "https://api.github.com/")
+        {
+            return Err(invalid(
+                "web_origin and api_origin must be GitHub.com's \
+                 (https://github.com, https://api.github.com) in production",
+            ));
+        }
+        let public_url = url(
+            "public_url",
+            self.public_url
+                .as_deref()
+                .ok_or_else(|| required("public_url (WYRD_GITHUB_PUBLIC_URL)"))?,
+            false,
+        )?;
+        let oauth_client_id = self
+            .oauth_client_id
+            .clone()
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| required("oauth_client_id (WYRD_GITHUB_OAUTH_CLIENT_ID)"))?;
+        let secret = |value: &Option<SecretString>, name: &str| {
+            value
+                .clone()
+                .filter(|secret| !secret.expose_secret().trim().is_empty())
+                .ok_or_else(|| required(name))
+        };
+        let oauth_client_secret = secret(
+            &self.oauth_client_secret,
+            "the OAuth client secret (WYRD_GITHUB_OAUTH_CLIENT_SECRET_FILE)",
+        )?;
+        let webhook_secret = secret(
+            &self.webhook_secret,
+            "the webhook secret (WYRD_GITHUB_WEBHOOK_SECRET_FILE)",
+        )?;
+        let private_key = secret(
+            &self.private_key,
+            "the App private key (WYRD_GITHUB_APP_PRIVATE_KEY_FILE)",
+        )?;
+        let key_invalid = || {
+            invalid(
+                "the App private key (WYRD_GITHUB_APP_PRIVATE_KEY_FILE) is not an RSA \
+                 private key that signs RS256",
+            )
+        };
+        let signing_key =
+            jsonwebtoken::EncodingKey::from_rsa_pem(private_key.expose_secret().as_bytes())
+                .map_err(|_| key_invalid())?;
+        jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256),
+            &serde_json::json!({}),
+            &signing_key,
+        )
+        .map_err(|_| key_invalid())?;
+        Ok(Some(GithubAppSettings {
+            app_id,
+            slug,
+            web_origin,
+            api_origin,
+            public_url,
+            oauth_client_id,
+            oauth_client_secret,
+            signing_key,
+            webhook_secret,
+        }))
+    }
+
+    /// Apply `WYRD_GITHUB_*` environment overrides and secrets.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::BadEnvVar`] or [`ConfigError::EmptyEnvVar`] for
+    /// a malformed override, [`ConfigError::ConflictingEnvVars`] when a
+    /// secret is given both inline and as a file, and
+    /// [`ConfigError::Invalid`] when a secret file is refused.
+    fn apply_env(&mut self) -> Result<(), ConfigError> {
+        if let Some(val) = env_opt("WYRD_GITHUB_APP_ID")? {
+            self.app_id =
+                Some(
+                    val.parse()
+                        .map_err(|e: std::num::ParseIntError| ConfigError::BadEnvVar {
+                            key: "WYRD_GITHUB_APP_ID".to_owned(),
+                            message: e.to_string(),
+                        })?,
+                );
+        }
+        for (key, field) in [
+            ("WYRD_GITHUB_APP_SLUG", &mut self.slug),
+            ("WYRD_GITHUB_WEB_ORIGIN", &mut self.web_origin),
+            ("WYRD_GITHUB_API_ORIGIN", &mut self.api_origin),
+            ("WYRD_GITHUB_PUBLIC_URL", &mut self.public_url),
+            ("WYRD_GITHUB_OAUTH_CLIENT_ID", &mut self.oauth_client_id),
+        ] {
+            if let Some(val) = env_opt(key)? {
+                *field = Some(val);
+            }
+        }
+        for (file, inline, field) in [
+            (
+                "WYRD_GITHUB_APP_PRIVATE_KEY_FILE",
+                "WYRD_GITHUB_APP_PRIVATE_KEY_PEM",
+                &mut self.private_key,
+            ),
+            (
+                "WYRD_GITHUB_WEBHOOK_SECRET_FILE",
+                "WYRD_GITHUB_WEBHOOK_SECRET",
+                &mut self.webhook_secret,
+            ),
+            (
+                "WYRD_GITHUB_OAUTH_CLIENT_SECRET_FILE",
+                "WYRD_GITHUB_OAUTH_CLIENT_SECRET",
+                &mut self.oauth_client_secret,
+            ),
+        ] {
+            if let Some(secret) = load_env_secret(file, inline)? {
+                *field = Some(secret);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Load one secret from the file named by `file_key` or, failing that, the
+/// inline `inline_key`; surrounding whitespace is trimmed.
+///
+/// # Errors
+/// Returns [`ConfigError::ConflictingEnvVars`] when both are set and
+/// [`ConfigError::Invalid`] naming the path, never its content, when
+/// [`read_secret_file`] refuses the file.
+fn load_env_secret(file_key: &str, inline_key: &str) -> Result<Option<SecretString>, ConfigError> {
+    match (env_opt(file_key)?, env_opt(inline_key)?) {
+        (Some(_), Some(_)) => Err(ConfigError::ConflictingEnvVars {
+            keys: vec![file_key.to_owned(), inline_key.to_owned()],
+        }),
+        (Some(path), None) => {
+            let text =
+                read_secret_file(Path::new(&path)).map_err(|reason| ConfigError::Invalid {
+                    message: format!("{file_key} file at {path} {reason}"),
+                })?;
+            Ok(Some(SecretString::from(text.trim().to_owned())))
+        }
+        (None, Some(inline)) => Ok(Some(SecretString::from(inline.trim().to_owned()))),
+        (None, None) => Ok(None),
+    }
+}
+
 impl MetricsConfig {
     /// Resolve the concrete metrics bind. When `bind` is unset, use
     /// **loopback** (`127.0.0.1`) on `http_bind`'s port + 1 — NOT `http_bind`'s
@@ -2255,7 +2836,7 @@ pub struct WyrdServerConfig {
     pub deployment_profile: DeploymentProfile,
     /// Closed process target derived from `WYRD_TARGET`.
     #[serde(default)]
-    pub role: BifrostTarget,
+    pub role: ServerTarget,
     /// HTTP server bind configuration.
     #[serde(default)]
     pub http: HttpConfig,
@@ -2280,7 +2861,7 @@ pub struct WyrdServerConfig {
     /// Role-aware Bifrost runtime configuration.
     #[serde(default)]
     pub bifrost: BifrostRuntimeConfig,
-    /// Forge worker capacity for `all` and `forge-worker` roles.
+    /// Forge worker capacity for the `combined` and `bifrost-maintenance` targets.
     #[serde(default)]
     pub forge: ForgeRuntimeConfig,
     /// Prometheus metrics server configuration.
@@ -2304,6 +2885,9 @@ pub struct WyrdServerConfig {
     /// Operator-owned gateway credential sources.
     #[serde(default)]
     pub gateway: GatewayConfig,
+    /// The deployment's optional GitHub App.
+    #[serde(default)]
+    pub github: GithubConfig,
 }
 
 impl WyrdServerConfig {
@@ -2986,22 +3570,20 @@ impl WyrdServerConfig {
             self.bifrost.data_dir = Some(PathBuf::from(value));
         }
         if let Some(value) = env_opt("WYRD_TARGET")? {
-            self.role = match value.as_str() {
-                "all" => BifrostTarget::All,
-                "server" => BifrostTarget::Server,
-                "oracle" => BifrostTarget::Oracle,
-                "scribe" => BifrostTarget::Scribe,
-                "forge-worker" => BifrostTarget::ForgeWorker,
-                _ => {
-                    return Err(ConfigError::BadEnvVar {
-                        key: "WYRD_TARGET".to_owned(),
-                        message: format!(
-                            "expected 'all', 'server', 'oracle', 'scribe', or 'forge-worker', got {value:?}"
-                        ),
-                    });
-                }
-            };
+            self.role = ServerTarget::parse(&value).ok_or_else(|| ConfigError::BadEnvVar {
+                key: "WYRD_TARGET".to_owned(),
+                message: format!(
+                    "expected one of {}, got {value:?}",
+                    ServerTarget::NAMES
+                        .map(|name| format!("'{name}'"))
+                        .join(", ")
+                ),
+            })?;
         }
+        self.bifrost.resources.process_memory_limit_bytes = parse_optional_env(
+            "WYRD_BIFROST_PROCESS_MEMORY_LIMIT_BYTES",
+            self.bifrost.resources.process_memory_limit_bytes,
+        )?;
         self.bifrost.resources.memory_limit_bytes = parse_optional_env(
             "WYRD_BIFROST_MEMORY_LIMIT_BYTES",
             self.bifrost.resources.memory_limit_bytes,
@@ -3270,7 +3852,10 @@ impl WyrdServerConfig {
 
         // verification.operator_keys (WYRD_OPERATOR_KEK_*)
         self.verification.operator_keys.apply_env()?;
-        self.verification.apply_limits_env()?;
+        self.verification.resolve_limits()?;
+
+        // github (WYRD_GITHUB_*)
+        self.github.apply_env()?;
 
         // readiness.tick_ms
         if let Some(val) = env_opt("WYRD_READINESS_TICK_MS")? {
@@ -3322,6 +3907,8 @@ impl WyrdServerConfig {
     fn validate(&self) -> Result<(), ConfigError> {
         self.gateway
             .validate(self.deployment_profile.is_production())?;
+        self.github
+            .resolve(self.deployment_profile.is_production())?;
         let serves_api = self.role.serves_api();
         if serves_api {
             self.verification.operator_keys.validate(
@@ -3382,14 +3969,12 @@ impl WyrdServerConfig {
             self.validate_oracle_calibration()?;
         }
 
-        // Peer mode is explicit and all-or-nothing for a listening target. A
-        // split Scribe or Oracle target cannot reach its counterpart
-        // in-process and needs it; a Forge worker never opens the socket and
-        // takes only the credentials it dials the Forge leader with.
-        self.bifrost.peer.validate(serves_api)?;
+        // Peer mode is explicit and all-or-nothing. A split target cannot
+        // reach the owners it does not run in-process, so it needs peer mode.
+        self.bifrost.peer.validate()?;
         if self.role.requires_peer() && !self.bifrost.peer.is_enabled() {
             return Err(ConfigError::Invalid {
-                message: "split oracle and scribe targets require peer mode \
+                message: "every WYRD_TARGET except 'combined' requires peer mode \
                           (WYRD_PEER_ADDRESS and WYRD_PEER_TLS_DIR)"
                     .to_owned(),
             });
@@ -3430,8 +4015,16 @@ impl WyrdServerConfig {
             }
         }
 
-        // 1c. The benchmark snapshot is served only on an enabled loopback
-        // metrics listener: it is an unauthenticated local readout.
+        // 1c. The benchmark snapshot exists only in a `bench` build and is
+        // served only on an enabled loopback metrics listener: it is an
+        // unauthenticated local readout.
+        if self.metrics.benchmark_snapshot && !cfg!(feature = "bench") {
+            return Err(ConfigError::Invalid {
+                message: "metrics.benchmark_snapshot requires a wyrd-server built with the \
+                          `bench` feature"
+                    .to_owned(),
+            });
+        }
         if self.metrics.benchmark_snapshot
             && (!self.metrics.enabled || self.metrics.is_public_bind(self.http.bind))
         {
@@ -3908,9 +4501,11 @@ mod tests {
     use std::os::unix::fs::PermissionsExt as _;
     use std::sync::Mutex;
 
+    use chrono::{DateTime, Utc};
+
     use super::*;
     use vala_bifrost_redux::resources::{
-        ORACLE_PARTITION_WORKING_MEMORY_BYTES, ResourcePlan, oracle_worker_slots,
+        ORACLE_PARTITION_WORKING_MEMORY_BYTES, ResourcePlan, ScribeWorkers, oracle_worker_slots,
     };
 
     /// Serialize env-var tests so concurrent test threads cannot interfere.
@@ -3937,39 +4532,110 @@ mod tests {
     #[test]
     fn default_config_validates() {
         let cfg = WyrdServerConfig::default();
-        assert_eq!(cfg.role, BifrostTarget::All);
+        assert_eq!(cfg.role, ServerTarget::Combined);
         assert_eq!(cfg.bifrost_roles().len(), 4);
         cfg.validate()
             .expect("default all-in-one config validates without a calibration profile");
     }
 
-    /// Proves the closed public role derives the internal Bifrost topology.
+    /// Proves each closed target parses from its one spelling and derives its
+    /// Bifrost owners and Verifier work; removed targets have no alias.
+    ///
+    /// # Panics
+    /// Panics when a closed target fails to parse, derives the wrong owners or
+    /// work, or a removed target name still parses.
     #[test]
-    fn public_roles_derive_internal_bifrost_roles() {
+    fn targets_derive_bifrost_owners_and_verifier_work() {
+        use BifrostRuntimeRole::{ForgeCoordinator, ForgeWorker, Oracle, Scribe};
         let cases = [
-            (BifrostTarget::All, 4, true),
-            (BifrostTarget::Server, 3, true),
-            (BifrostTarget::Oracle, 1, true),
-            (BifrostTarget::Scribe, 1, true),
-            (BifrostTarget::ForgeWorker, 1, false),
+            (
+                "combined",
+                vec![Scribe, ForgeCoordinator, ForgeWorker, Oracle],
+                true,
+                true,
+            ),
+            ("direct", vec![Scribe, Oracle], true, false),
+            ("worker", vec![Scribe, Oracle], false, true),
+            ("bifrost-ingest", vec![Scribe], false, false),
+            ("bifrost-query", vec![Oracle], false, false),
+            (
+                "bifrost-maintenance",
+                vec![ForgeCoordinator, ForgeWorker],
+                false,
+                false,
+            ),
         ];
-        for (target, count, serves_gate) in cases {
+        assert_eq!(cases.len(), ServerTarget::NAMES.len());
+        for (name, owners, direct, queued) in cases {
+            let target = ServerTarget::parse(name).expect("a closed target parses");
+            assert_eq!(target.name(), name);
             let roles = BifrostRoles::for_target(target);
-            assert_eq!(roles.len(), count, "{target:?}");
-            assert_eq!(roles.serves_gate(), serves_gate, "{target:?}");
+            assert_eq!(roles.len(), owners.len(), "{name}");
+            assert!(owners.iter().all(|role| roles.contains(role)), "{name}");
+            assert_eq!(target.runs_direct(), direct, "{name}");
+            assert_eq!(target.runs_queued(), queued, "{name}");
+            assert_eq!(target.requires_peer(), name != "combined", "{name}");
+            assert_eq!(target.serves_api(), name != "bifrost-maintenance", "{name}");
+        }
+        for removed in ["all", "server", "oracle", "scribe", "forge-worker"] {
+            assert_eq!(ServerTarget::parse(removed), None, "{removed} has no alias");
         }
     }
 
-    /// Proves a dedicated Forge worker ignores malformed settings for services
-    /// it does not own while retaining its local concurrency guard.
+    /// Proves each target refuses the Verifier work it does not run with the
+    /// one stable wrong-target error naming the target.
+    ///
+    /// # Panics
+    /// Panics when a target refuses work it runs, accepts work it does not
+    /// run, or refuses with another error, status or target name.
     #[test]
-    fn forge_worker_validation_ignores_api_only_settings() {
+    fn targets_refuse_verifier_work_they_do_not_run() {
+        let code = |result: Result<(), wyrd_spec::error::WyrdError>| {
+            result.err().map(|error| error.code())
+        };
+        for target in [ServerTarget::Combined, ServerTarget::Direct] {
+            assert_eq!(code(target.require_direct("verification.execute")), None);
+        }
+        for target in [ServerTarget::Combined, ServerTarget::Worker] {
+            assert_eq!(code(target.require_queued("verification.enqueue")), None);
+        }
+        let refused = ServerTarget::Direct
+            .require_queued("verification.enqueue")
+            .expect_err("direct refuses queued work");
+        assert_eq!(refused.status(), 421);
+        let wyrd_spec::error::WyrdError::VerificationWrongTarget { details, .. } = refused else {
+            panic!("direct refuses with the wrong-target error");
+        };
+        assert_eq!(details["target"], "direct", "the refusal names this target");
+        for target in [
+            ServerTarget::Worker,
+            ServerTarget::BifrostIngest,
+            ServerTarget::BifrostQuery,
+            ServerTarget::BifrostMaintenance,
+        ] {
+            assert_eq!(
+                code(target.require_direct("verification.execute")),
+                Some("WYRD_VERIFICATION_421_WRONG_TARGET"),
+                "{target:?}"
+            );
+        }
+    }
+
+    /// Proves the Forge maintenance target ignores malformed settings for
+    /// services it does not own while retaining its local concurrency guard.
+    #[test]
+    fn maintenance_validation_ignores_api_only_settings() {
         let mut config = WyrdServerConfig {
             deployment_profile: DeploymentProfile::Production,
-            role: BifrostTarget::ForgeWorker,
+            role: ServerTarget::BifrostMaintenance,
             ..WyrdServerConfig::default()
         };
-        config.bifrost.scribe.coordination_threads = 0;
+        config.bifrost.peer = BifrostPeerConfig {
+            address: Some("maintenance-0.peers.svc:50052".to_owned()),
+            tls_dir: Some(PathBuf::from("/etc/wyrd/peer")),
+            ..BifrostPeerConfig::default()
+        };
+        config.bifrost.scribe.coordination_threads = Some(0);
         config.bifrost.oracle.admission_waiters = 0;
         config.bifrost.oracle.calibration_profile = PathBuf::from("/\0malformed");
         config.http.bind = config.grpc.bind;
@@ -3983,19 +4649,19 @@ mod tests {
 
         config
             .validate()
-            .expect("ForgeWorker should validate only owned Forge and metrics settings");
+            .expect("bifrost-maintenance validates only owned Forge, peer, and metrics settings");
     }
 
     /// Proves API-owning roles reject the same malformed service settings.
     #[test]
     fn api_roles_reject_forge_worker_only_validation_bypass() {
-        for role in [BifrostTarget::All, BifrostTarget::Server] {
+        for role in [ServerTarget::Combined, ServerTarget::Direct] {
             let mut config = WyrdServerConfig {
                 deployment_profile: DeploymentProfile::Production,
                 role,
                 ..WyrdServerConfig::default()
             };
-            config.bifrost.scribe.coordination_threads = 0;
+            config.bifrost.scribe.coordination_threads = Some(0);
             config.grpc.reflection_enabled = true;
             config.limits.body_bytes = 0;
             config.limits.timeout_ms = 0;
@@ -4017,7 +4683,7 @@ mod tests {
     #[test]
     fn production_peer_target_needs_no_public_grpc_certificate() {
         let directory = tempfile::tempdir().expect("key temp directory");
-        for role in [BifrostTarget::All, BifrostTarget::Oracle] {
+        for role in [ServerTarget::Combined, ServerTarget::BifrostQuery] {
             let mut config = WyrdServerConfig {
                 deployment_profile: DeploymentProfile::Production,
                 role,
@@ -4108,7 +4774,7 @@ maintenance_interval_secs = 45
                     memory_source: ResourceSource::Injected,
                     cpu_source: ResourceSource::Injected,
                 },
-                config.bifrost.resources.policy(
+                config.bifrost.resource_policy(
                     [BifrostRole::Scribe, BifrostRole::Oracle, BifrostRole::Forge]
                         .into_iter()
                         .collect(),
@@ -4287,9 +4953,211 @@ maintenance_interval_secs = 45
         }
     }
 
+    /// The server TOML file sets the process model-call capacity, the
+    /// direct and queued execution slots, and the queued deadline; values it
+    /// leaves out keep their defaults, and an environment variable overrides
+    /// its file value alone, repairing a file value that is zero, overflows
+    /// its unit, or is no representable deadline; an invalid variable refuses
+    /// even over a valid file value. A winning zero, overflowing, or
+    /// unrepresentable file value is refused naming its key: a count above
+    /// the semaphore maximum, which itself applies, or a deadline past the
+    /// latest `DateTime<Utc>` from now, while one just inside applies. A
+    /// negative count, a removed per-lane model-call key, and a removed
+    /// queued share key do not parse.
+    ///
+    /// # Panics
+    /// Panics when a file value is not resolved, the environment does not
+    /// win, or a bad file or environment value is accepted or refused under
+    /// another name.
+    #[test]
+    fn verification_capacity_file_values_resolve_under_env() {
+        /// Every capacity setting the file carries.
+        const FILE: &str = "
+            [verification]
+            direct_executions = 7
+            queued_executions = 9
+            execution_timeout_ms = 7200000
+            model_calls = 11
+        ";
+        let _guard = ENV_LOCK.lock().expect("environment test lock");
+        let file = |contents: &str| {
+            toml::from_str::<WyrdServerConfig>(contents).map(|config| config.verification)
+        };
+        let mut config = file(FILE).expect("the file parses");
+        config.resolve_limits().expect("file values apply");
+        assert_eq!(
+            (
+                config.limits.direct_executions,
+                config.runtime.execution_slots,
+                config.runtime.execution_timeout,
+            ),
+            (7, 9, Duration::from_hours(2))
+        );
+        assert_eq!(config.limits.model_calls, 11);
+        assert_eq!(
+            (config.limits.verify_timeout, config.runtime.lease),
+            (
+                HostedLimits::default().verify_timeout,
+                RuntimeLimits::default().lease
+            ),
+            "settings the file cannot carry keep their defaults"
+        );
+        temp_env::with_vars(
+            [
+                ("WYRD_VERIFICATION_DIRECT_EXECUTIONS", Some("2")),
+                ("WYRD_VERIFICATION_MODEL_CALLS", Some("23")),
+            ],
+            || {
+                let mut config = file(FILE).expect("the file parses");
+                config.resolve_limits().expect("overrides apply");
+                assert_eq!(
+                    (
+                        config.limits.direct_executions,
+                        config.limits.model_calls,
+                        config.runtime.execution_slots,
+                    ),
+                    (2, 23, 9),
+                    "the environment wins over the file, value by value"
+                );
+            },
+        );
+        // A valid environment value repairs a stale file value that is zero,
+        // out of range, or is no representable deadline.
+        let stale = "
+            [verification]
+            queued_executions = 0
+            execution_timeout_ms = 9223372036854775807
+        ";
+        temp_env::with_vars(
+            [
+                ("WYRD_VERIFICATION_QUEUED_EXECUTIONS", Some("9")),
+                ("WYRD_VERIFICATION_EXECUTION_TIMEOUT_MS", Some("7200000")),
+            ],
+            || {
+                let mut config = file(stale).expect("the file parses");
+                config
+                    .resolve_limits()
+                    .expect("the environment wins over invalid file values");
+                assert_eq!(
+                    (
+                        config.runtime.execution_slots,
+                        config.runtime.execution_timeout,
+                    ),
+                    (9, Duration::from_hours(2))
+                );
+            },
+        );
+        for (key, value, contents) in [
+            (
+                "WYRD_VERIFICATION_QUEUED_EXECUTIONS",
+                "0",
+                "[verification]\nqueued_executions = 9",
+            ),
+            (
+                "WYRD_VERIFICATION_EXECUTION_TIMEOUT_MS",
+                "18446744073709551615",
+                "[verification]\nexecution_timeout_ms = 7200000",
+            ),
+        ] {
+            temp_env::with_vars([(key, Some(value))], || {
+                let error = file(contents)
+                    .expect("the file parses")
+                    .resolve_limits()
+                    .expect_err("an invalid environment winner refuses");
+                assert!(error.to_string().contains(key), "{key}: {error}");
+            });
+        }
+        for (contents, named) in [
+            (
+                "[verification]\nqueued_executions = 0",
+                "verification.queued_executions",
+            ),
+            (
+                "[verification]\nexecution_timeout_ms = 0",
+                "verification.execution_timeout_ms",
+            ),
+            (
+                "[verification]\nmodel_calls = 0",
+                "verification.model_calls",
+            ),
+        ] {
+            let error = file(contents)
+                .expect("the file parses")
+                .resolve_limits()
+                .expect_err("a bad file value refuses");
+            assert!(error.to_string().contains(named), "{contents}: {error}");
+        }
+        // Every admission count must fit a semaphore, and a deadline must be a
+        // timestamp from now: signed milliseconds bound as an interval of
+        // signed microseconds and read back as a `DateTime<Utc>`.
+        let permits = tokio::sync::Semaphore::MAX_PERMITS;
+        let mut config = file(&format!("[verification]\ndirect_executions = {permits}"))
+            .expect("the file parses");
+        config
+            .resolve_limits()
+            .expect("the most permits a semaphore holds apply");
+        assert_eq!(config.limits.direct_executions, permits);
+        let hour = 3_600_000;
+        let room = (DateTime::<Utc>::MAX_UTC - Utc::now()).num_milliseconds();
+        let mut config = file(&format!(
+            "[verification]\nexecution_timeout_ms = {}",
+            room - hour
+        ))
+        .expect("the file parses");
+        config
+            .resolve_limits()
+            .expect("a deadline inside the timestamp range applies");
+        assert_eq!(
+            config.runtime.execution_timeout,
+            Duration::from_millis(u64::try_from(room - hour).expect("positive"))
+        );
+        for (contents, named) in [
+            (
+                "[verification]\ndirect_executions = 9223372036854775807".to_owned(),
+                "verification.direct_executions",
+            ),
+            (
+                format!("[verification]\nqueued_executions = {}", permits + 1),
+                "verification.queued_executions",
+            ),
+            (
+                format!("[verification]\nmodel_calls = {}", permits + 1),
+                "verification.model_calls",
+            ),
+            (
+                "[verification]\nexecution_timeout_ms = 9223372036854775807".to_owned(),
+                "verification.execution_timeout_ms",
+            ),
+            (
+                format!("[verification]\nexecution_timeout_ms = {}", room + hour),
+                "verification.execution_timeout_ms",
+            ),
+        ] {
+            let error = file(&contents)
+                .expect("the file parses")
+                .resolve_limits()
+                .expect_err("an unrepresentable file value refuses");
+            assert!(error.to_string().contains(named), "{contents}: {error}");
+        }
+        assert!(
+            file("[verification]\nmodel_calls = -1").is_err(),
+            "a negative count does not parse"
+        );
+        assert!(
+            file("[verification.queued]\nmodel_calls = 2").is_err(),
+            "the per-lane model-call counts are gone"
+        );
+        assert!(
+            file("[verification]\nqueued_memory_percent = 25").is_err(),
+            "the queued share percentages are gone"
+        );
+    }
+
     /// Unset Deployment limits keep the approved defaults; set ones apply
-    /// in their binary units; malformed, zero, overflowing, and inconsistent
-    /// values refuse startup naming the variable.
+    /// in their binary units; malformed, zero, overflowing, inconsistent, and
+    /// unrepresentable values refuse startup naming the variable: a count
+    /// above the semaphore maximum and a queued deadline beyond signed milliseconds or the timestamp
+    /// range.
     ///
     /// # Panics
     /// Panics when a limit is misparsed or a bad value is accepted.
@@ -4297,57 +5165,93 @@ maintenance_interval_secs = 45
     fn verification_limits_env_applies_and_refuses() {
         let _guard = ENV_LOCK.lock().expect("environment test lock");
         let mut config = VerificationConfig::default();
-        config.apply_limits_env().expect("defaults apply");
+        config.resolve_limits().expect("defaults apply");
         assert_eq!(config.limits, HostedLimits::default());
+        assert_eq!(config.runtime, RuntimeLimits::default());
+        assert_eq!(config.limits.agent_tool_max_calls, 128);
+        assert_eq!(config.limits.tool_argument_max_bytes, 64 * 1024);
+        assert_eq!(config.limits.tool_result_max_bytes, 64 * 1024);
         temp_env::with_vars(
             [
                 ("WYRD_VERIFICATION_FILE_MAX_MIB", Some("5")),
                 ("WYRD_VERIFICATION_TOOL_RESULT_MAX_KIB", Some("8")),
                 ("WYRD_VERIFICATION_TIMEOUT_MS", Some("1500")),
+                ("WYRD_VERIFICATION_DIRECT_EXECUTIONS", Some("3")),
+                ("WYRD_VERIFICATION_MODEL_CALLS", Some("9")),
+                ("WYRD_VERIFICATION_QUEUED_EXECUTIONS", Some("11")),
+                ("WYRD_VERIFICATION_EXECUTION_TIMEOUT_MS", Some("7200000")),
+                ("WYRD_VERIFICATION_AGENT_TOOL_MAX_CALLS", Some("3")),
+                ("WYRD_VERIFICATION_TOOL_ARGUMENT_MAX_KIB", Some("2")),
             ],
             || {
                 let mut config = VerificationConfig::default();
-                config.apply_limits_env().expect("overrides apply");
+                config.resolve_limits().expect("overrides apply");
                 assert_eq!(config.limits.file_max_bytes, 5 * 1024 * 1024);
                 assert_eq!(config.limits.tool_result_max_bytes, 8 * 1024);
                 assert_eq!(config.limits.verify_timeout, Duration::from_millis(1500));
+                assert_eq!(config.limits.direct_executions, 3);
+                assert_eq!(config.limits.model_calls, 9);
+                assert_eq!(config.runtime.execution_slots, 11);
+                assert_eq!(config.runtime.execution_timeout, Duration::from_hours(2));
+                assert_eq!(
+                    config.runtime.lease,
+                    RuntimeLimits::default().lease,
+                    "only the queued slots and deadline are configurable"
+                );
+                assert_eq!(config.limits.agent_tool_max_calls, 3);
+                assert_eq!(config.limits.tool_argument_max_bytes, 2 * 1024);
             },
         );
         for (key, value) in [
-            ("WYRD_VERIFICATION_MAX_WORKSPACES", "0"),
+            ("WYRD_VERIFICATION_MODEL_CALLS", "-2"),
+            ("WYRD_VERIFICATION_QUEUED_EXECUTIONS", "many"),
+            ("WYRD_VERIFICATION_EXECUTION_TIMEOUT_MS", "0"),
             ("WYRD_VERIFICATION_CODE_TIMEOUT_MS", "ten"),
             ("WYRD_VERIFICATION_SCRATCH_MAX_MIB", "-1"),
             ("WYRD_VERIFICATION_FILES_MAX_MIB", "18446744073709551615"),
+            (
+                "WYRD_VERIFICATION_EXECUTION_TIMEOUT_MS",
+                "18446744073709551615",
+            ),
+            (
+                "WYRD_VERIFICATION_EXECUTION_TIMEOUT_MS",
+                "9223372036854775807",
+            ),
+            ("WYRD_VERIFICATION_AGENT_TOOL_MAX_CALLS", ""),
+            ("WYRD_VERIFICATION_AGENT_TOOL_MAX_CALLS", "0"),
+            ("WYRD_VERIFICATION_AGENT_TOOL_MAX_CALLS", "-1"),
+            ("WYRD_VERIFICATION_AGENT_TOOL_MAX_CALLS", "many"),
+            ("WYRD_VERIFICATION_AGENT_TOOL_MAX_CALLS", "4294967296"),
+            ("WYRD_VERIFICATION_TOOL_ARGUMENT_MAX_KIB", ""),
+            ("WYRD_VERIFICATION_TOOL_ARGUMENT_MAX_KIB", "0"),
+            ("WYRD_VERIFICATION_TOOL_ARGUMENT_MAX_KIB", "-64"),
+            ("WYRD_VERIFICATION_TOOL_ARGUMENT_MAX_KIB", "64k"),
+            (
+                "WYRD_VERIFICATION_TOOL_ARGUMENT_MAX_KIB",
+                "18446744073709551615",
+            ),
         ] {
             temp_env::with_vars([(key, Some(value))], || {
                 let error = VerificationConfig::default()
-                    .apply_limits_env()
+                    .resolve_limits()
                     .expect_err("bad value refuses");
                 assert!(error.to_string().contains(key), "{key}: {error}");
             });
         }
+        let over = (tokio::sync::Semaphore::MAX_PERMITS + 1).to_string();
+        for key in [
+            "WYRD_VERIFICATION_DIRECT_EXECUTIONS",
+            "WYRD_VERIFICATION_QUEUED_EXECUTIONS",
+            "WYRD_VERIFICATION_MODEL_CALLS",
+        ] {
+            temp_env::with_vars([(key, Some(over.as_str()))], || {
+                let error = VerificationConfig::default()
+                    .resolve_limits()
+                    .expect_err("a count no semaphore holds refuses");
+                assert!(error.to_string().contains(key), "{key}: {error}");
+            });
+        }
         for (vars, named) in [
-            (
-                [
-                    ("WYRD_VERIFICATION_MONTY_MIN_WORKERS", "9"),
-                    ("WYRD_VERIFICATION_MONTY_MAX_WORKERS", "8"),
-                ],
-                "WYRD_VERIFICATION_MONTY_MIN_WORKERS",
-            ),
-            (
-                [
-                    ("WYRD_VERIFICATION_MONTY_MEMORY_MIB", "384"),
-                    ("WYRD_VERIFICATION_MONTY_PROCESS_MEMORY_MIB", "384"),
-                ],
-                "WYRD_VERIFICATION_MONTY_MEMORY_MIB",
-            ),
-            (
-                [
-                    ("WYRD_VERIFICATION_MONTY_POOL_MEMORY_MIB", "100"),
-                    ("WYRD_VERIFICATION_MONTY_PROCESS_MEMORY_MIB", "384"),
-                ],
-                "WYRD_VERIFICATION_MONTY_POOL_MEMORY_MIB",
-            ),
             (
                 [
                     ("WYRD_VERIFICATION_FILE_MAX_MIB", "200"),
@@ -4365,7 +5269,7 @@ maintenance_interval_secs = 45
         ] {
             temp_env::with_vars(vars.map(|(key, value)| (key, Some(value))), || {
                 let error = VerificationConfig::default()
-                    .apply_limits_env()
+                    .resolve_limits()
                     .expect_err("inconsistent limits refuse");
                 assert!(error.to_string().contains(named), "{named}: {error}");
             });
@@ -4710,20 +5614,25 @@ minimum_slots = 2
         );
     }
 
-    /// An oversized Operator key version is ignored by a dedicated Forge
-    /// worker, which owns no Operator keys, and refused before boot for an
-    /// API-bearing role.
+    /// An oversized Operator key version is ignored by the Forge maintenance
+    /// target, which owns no Operator keys, and refused before boot for an
+    /// API-bearing target.
     #[test]
     fn oversized_operator_key_version_follows_role_ownership() {
         for (role, accepted) in [
-            (BifrostTarget::ForgeWorker, true),
-            (BifrostTarget::Server, false),
+            (ServerTarget::BifrostMaintenance, true),
+            (ServerTarget::Direct, false),
         ] {
             let mut config = WyrdServerConfig {
                 role,
                 ..WyrdServerConfig::default()
             };
             config.bifrost.oracle.allow_unapproved_profile = true;
+            config.bifrost.peer = BifrostPeerConfig {
+                address: Some("pod-0.peers.svc:50052".to_owned()),
+                tls_dir: Some(PathBuf::from("/etc/wyrd/peer")),
+                ..BifrostPeerConfig::default()
+            };
             config.verification.operator_keys.active_version =
                 NonZeroU32::new(2_147_483_648).expect("positive");
             match config.validate() {
@@ -4799,8 +5708,9 @@ minimum_slots = 2
     ///
     /// The default target needs no peer input. A split target without peer
     /// mode, half of the peer inputs, a URI-shaped or portless address, a
-    /// loopback gRPC bind on the wildcard peer port, and a Forge worker with
-    /// peer inputs are each refused before boot.
+    /// loopback gRPC bind on the wildcard peer port, and peer credentials
+    /// without an address are each refused before boot. Every split target,
+    /// including the Forge maintenance target, needs peer mode.
     #[test]
     fn peer_mode_is_explicit_and_validated() {
         let peer = |address: &str| BifrostPeerConfig {
@@ -4813,7 +5723,7 @@ minimum_slots = 2
             .validate()
             .expect("the default target needs no peer mode");
 
-        config.role = BifrostTarget::Oracle;
+        config.role = ServerTarget::BifrostQuery;
         assert!(config.validate().is_err(), "a split target needs peer mode");
         config.bifrost.peer = peer("oracle-0.peers.svc:50052");
         config.validate().expect("a complete split peer validates");
@@ -4850,60 +5760,26 @@ minimum_slots = 2
         );
         config.grpc.bind = WyrdServerConfig::default().grpc.bind;
 
-        config.role = BifrostTarget::ForgeWorker;
-        config.bifrost.peer = peer("worker-0.peers.svc:50052");
-        assert!(
-            config.validate().is_err(),
-            "a Forge worker opens no peer socket"
-        );
-    }
-
-    /// A dedicated Forge worker takes peer credentials without an address and
-    /// reads them to dial the leader; a listening target may not.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a dial-only worker is refused or reads no bundle, or when a
-    /// listening target accepts credentials without an address.
-    #[test]
-    fn forge_worker_takes_dial_only_peer_credentials() {
-        let dir = tempfile::tempdir().expect("peer TLS directory");
-        for (name, contents) in [("ca.crt", "ca"), ("tls.crt", "leaf"), ("tls.key", "key")] {
-            std::fs::write(dir.path().join(name), contents).expect("peer TLS file");
+        for role in [
+            ServerTarget::Direct,
+            ServerTarget::Worker,
+            ServerTarget::BifrostIngest,
+            ServerTarget::BifrostMaintenance,
+        ] {
+            config.role = role;
+            config.bifrost.peer = BifrostPeerConfig::default();
+            assert!(config.validate().is_err(), "{role:?} needs peer mode");
+            config.bifrost.peer = BifrostPeerConfig {
+                tls_dir: Some(PathBuf::from("/etc/wyrd/peer")),
+                ..BifrostPeerConfig::default()
+            };
+            assert!(
+                config.validate().is_err(),
+                "{role:?} needs an address with its credentials"
+            );
+            config.bifrost.peer = peer("pod-0.peers.svc:50052");
+            config.validate().expect("a complete split peer validates");
         }
-        let dial_only = BifrostPeerConfig {
-            tls_dir: Some(dir.path().to_path_buf()),
-            ..BifrostPeerConfig::default()
-        };
-        let mut config = WyrdServerConfig {
-            role: BifrostTarget::ForgeWorker,
-            ..WyrdServerConfig::default()
-        };
-        config.bifrost.peer = dial_only.clone();
-        config
-            .validate()
-            .expect("a Forge worker dials the leader with credentials alone");
-        assert_eq!(config.bifrost.peer.advertised_uri(), None);
-        let bundle = config
-            .bifrost
-            .peer
-            .read_bundle()
-            .expect("the dial-only bundle reads")
-            .expect("dial-only credentials are peer mode");
-        assert_eq!(bundle.certificate_chain, b"leaf");
-
-        config.bifrost.peer.tls_dir = Some(PathBuf::new());
-        assert!(
-            config.validate().is_err(),
-            "an empty dial-only directory is refused"
-        );
-
-        config.role = BifrostTarget::Server;
-        config.bifrost.peer = dial_only;
-        assert!(
-            config.validate().is_err(),
-            "a listening target needs an address with its credentials"
-        );
     }
 
     /// Proves the canonical peer environment names land on the validated fields.
@@ -4977,10 +5853,10 @@ minimum_slots = 2
     #[test]
     fn scribe_runtime_defaults_match_configured_ingest_contract() {
         let cfg = ScribeRuntimeConfig::default();
-        assert!(
-            cfg.coordination_threads >= 2,
-            "coordination threads {} must keep the two-thread floor",
-            cfg.coordination_threads
+        assert_eq!(
+            cfg.worker_overrides(),
+            ScribeWorkerOverrides::default(),
+            "omitted worker counts derive from the resource plan"
         );
         assert_eq!(
             cfg.ingest_request_bytes,
@@ -5049,6 +5925,74 @@ minimum_slots = 2
         assert!(error.contains("seal_key_early_seal_bytes"), "{error}");
     }
 
+    /// Omitted Scribe worker counts derive from the plan's capped effective
+    /// CPU while explicit ones, even one equal to the derived default, keep
+    /// their value, and invalid explicit counts keep their errors.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an omitted count ignores the CPU cap, an explicit count is
+    /// replaced, or an invalid count is accepted.
+    #[test]
+    fn scribe_worker_resolution_preserves_explicit_settings() {
+        use vala_bifrost_redux::resources::{
+            BifrostRole, BifrostRuntimeResources, ResourceSource, SystemResourceSnapshot,
+        };
+        const GIB: usize = 1024 * 1024 * 1024;
+        let _guard = ENV_LOCK.lock().expect("environment test lock");
+        let resolve = |toml: &str| {
+            let config = from_toml_str_with_dev_oracle_opt_in(toml).expect("config parses");
+            config.bifrost.scribe.validate().expect("valid workers");
+            BifrostRuntimeResources::from_snapshot(
+                SystemResourceSnapshot {
+                    memory_limit_bytes: 8 * GIB,
+                    effective_cpu: 32,
+                    scratch_capacity_bytes: 64 * GIB as u64,
+                    scratch_available_bytes: 64 * GIB as u64,
+                    memory_source: ResourceSource::Injected,
+                    cpu_source: ResourceSource::Injected,
+                },
+                config.bifrost.resource_policy(
+                    [BifrostRole::Scribe].into_iter().collect(),
+                    None,
+                    None,
+                ),
+            )
+            .expect("plan resolves")
+            .plan()
+        };
+        let workers =
+            |coordination_threads, ingress_cpu_threads, persistence_cpu_threads| ScribeWorkers {
+                coordination_threads,
+                ingress_cpu_threads,
+                persistence_cpu_threads,
+            };
+        let cap = "[bifrost.resources]\neffective_cpu = 8\n";
+        // C = 8: coordination max(8, 2), budget 6, ingress 2, persistence 4.
+        let omitted = resolve(cap);
+        assert_eq!(omitted.effective_cpu, 8);
+        assert_eq!(omitted.scribe_workers, workers(8, 2, 4));
+        // Uncapped, the same omission follows the observed 32 CPUs.
+        assert_eq!(resolve("").scribe_workers, workers(32, 10, 20));
+        // Explicit ingress leaves the persistence default's formula alone.
+        let partial = resolve(&format!("{cap}[bifrost.scribe]\ningress_cpu_threads = 5\n"));
+        assert_eq!(partial.scribe_workers, workers(8, 5, 4));
+        // Explicit values equal to the derived defaults are still explicit and
+        // survive a different CPU.
+        let explicit = "[bifrost.scribe]\ncoordination_threads = 8\ningress_cpu_threads = 2\n\
+                        persistence_cpu_threads = 4\n";
+        assert_eq!(resolve(explicit).scribe_workers, workers(8, 2, 4));
+        let config =
+            from_toml_str_with_dev_oracle_opt_in("[bifrost.scribe]\npersistence_cpu_threads = 0\n")
+                .expect("a zero count parses");
+        let error = config
+            .bifrost
+            .scribe
+            .validate()
+            .expect_err("a zero explicit count is refused");
+        assert!(error.contains("persistence_cpu_threads"), "{error}");
+    }
+
     /// Boot runs one WAL IO worker per shard when the configured count is lower.
     #[test]
     fn wal_io_workers_cover_every_shard() {
@@ -5080,9 +6024,9 @@ minimum_slots = 2
                 assert!(error.contains(stringify!($field)), "{error}");
             }};
         }
-        assert_rejected!(coordination_threads, 0);
-        assert_rejected!(ingress_cpu_threads, 0);
-        assert_rejected!(persistence_cpu_threads, 0);
+        assert_rejected!(coordination_threads, Some(0));
+        assert_rejected!(ingress_cpu_threads, Some(0));
+        assert_rejected!(persistence_cpu_threads, Some(0));
         assert_rejected!(wal_io_threads, 0);
         assert_rejected!(shard_count, 0);
         assert_rejected!(max_file_size_on_disk, 0);
@@ -5973,6 +6917,7 @@ minimum_slots = 2
             oracle_enabled: true,
             forge_enabled: false,
             scratch_limit_bytes: 0,
+            scribe_workers: ScribeWorkers::resolve(effective_cpu, ScribeWorkerOverrides::default()),
         };
         // Memory is generous, so CPU is what bounds concurrency; the ratio is
         // two units per effective core.
@@ -6415,6 +7360,434 @@ provider = "anthropic"
                     }
                 },
             );
+        }
+    }
+
+    /// A complete GitHub App section as the environment supplies it, with
+    /// the private key from a mounted file.
+    fn github_env(key_file: &Path) -> Vec<(&'static str, Option<String>)> {
+        vec![
+            ("WYRD_GITHUB_APP_ID", Some("4242".to_owned())),
+            ("WYRD_GITHUB_APP_SLUG", Some("wyrd-app".to_owned())),
+            (
+                "WYRD_GITHUB_WEB_ORIGIN",
+                Some("http://127.0.0.1:8443/".to_owned()),
+            ),
+            (
+                "WYRD_GITHUB_API_ORIGIN",
+                Some("http://127.0.0.1:8443/api/v3".to_owned()),
+            ),
+            (
+                "WYRD_GITHUB_PUBLIC_URL",
+                Some("https://wyrd.example.com/".to_owned()),
+            ),
+            ("WYRD_GITHUB_OAUTH_CLIENT_ID", Some("Iv1.client".to_owned())),
+            (
+                "WYRD_GITHUB_APP_PRIVATE_KEY_FILE",
+                Some(key_file.display().to_string()),
+            ),
+            (
+                "WYRD_GITHUB_WEBHOOK_SECRET",
+                Some("webhook-secret-value".to_owned()),
+            ),
+            (
+                "WYRD_GITHUB_OAUTH_CLIENT_SECRET",
+                Some("oauth-secret-value".to_owned()),
+            ),
+        ]
+    }
+
+    /// Fail unless `settings` signs an RS256 App JWT that the test App's
+    /// public key verifies.
+    ///
+    /// # Panics
+    /// Panics when signing fails or the signature does not verify.
+    fn assert_signs_app_jwts(settings: &GithubAppSettings) {
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256),
+            &serde_json::json!({ "iss": "4242" }),
+            &settings.signing_key,
+        )
+        .expect("the validated key signs");
+        let key = jsonwebtoken::DecodingKey::from_rsa_pem(
+            wyrd_testing::github::APP_PUBLIC_KEY_PEM.as_bytes(),
+        )
+        .expect("the public half decodes");
+        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+        validation.set_required_spec_claims::<&str>(&[]);
+        validation.validate_exp = false;
+        jsonwebtoken::decode::<serde_json::Value>(&token, &key, &validation)
+            .expect("the public half verifies the App JWT");
+    }
+
+    /// An owner-only file holding the test App key.
+    ///
+    /// # Panics
+    /// Panics when the key cannot be written or restricted.
+    fn github_key_file(dir: &Path) -> PathBuf {
+        let path = dir.join("app.pem");
+        std::fs::write(&path, wyrd_testing::github::APP_PRIVATE_KEY_PEM).expect("key writes");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("key is owner-only");
+        path
+    }
+
+    /// Proves every GitHub App field parses from the environment and a
+    /// mounted key file, a local development mock's host keeps its port, the
+    /// key signs App JWTs the public half verifies, and neither Debug form
+    /// prints a secret.
+    ///
+    /// # Panics
+    /// Panics when a field differs or a secret is printed.
+    #[test]
+    fn github_app_config_parses_from_env_and_files_and_redacts() {
+        let _guard = ENV_LOCK.lock().expect("environment test lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_file = github_key_file(dir.path());
+        temp_env::with_vars(github_env(&key_file), || {
+            let mut config = WyrdServerConfig::default();
+            config
+                .apply_env_overrides()
+                .expect("the GitHub overrides apply");
+            let settings = config
+                .github
+                .resolve(false)
+                .expect("the section validates outside production")
+                .expect("the section is present");
+            assert_eq!(settings.app_id, 4242);
+            assert_eq!(settings.slug, "wyrd-app");
+            assert_eq!(settings.host(), "127.0.0.1:8443");
+            assert_eq!(settings.api_origin.as_str(), "http://127.0.0.1:8443/api/v3");
+            assert_eq!(settings.public_url.as_str(), "https://wyrd.example.com/");
+            assert_eq!(settings.oauth_client_id, "Iv1.client");
+            assert_signs_app_jwts(&settings);
+            assert_eq!(
+                settings.webhook_secret.expose_secret(),
+                "webhook-secret-value"
+            );
+            assert_eq!(
+                settings.oauth_client_secret.expose_secret(),
+                "oauth-secret-value"
+            );
+            for printed in [format!("{:?}", config.github), format!("{settings:?}")] {
+                for secret in ["webhook-secret-value", "oauth-secret-value", "PRIVATE KEY"] {
+                    assert!(!printed.contains(secret), "{printed}");
+                }
+            }
+        });
+    }
+
+    /// Proves the "Connect GitHub" guide's embedded server settings,
+    /// `examples/connect-github/server.sh`, run as published, placeholders
+    /// included, and, with each `<...>` filled in and its secret files
+    /// mounted, configure a production server for GitHub.com.
+    ///
+    /// # Panics
+    /// Panics when the guide does not embed the script, `bash` cannot run
+    /// it, or the exported settings do not resolve to GitHub.com in
+    /// production.
+    #[test]
+    fn github_guide_settings_configure_a_production_server() {
+        const GUIDE: &str =
+            include_str!("../../../../docs/src/content/docs/operate/connect-github.md");
+        let block = include_str!("../../../../examples/connect-github/server.sh");
+        assert!(
+            GUIDE.contains(
+                r#"<CodeFromFile file="examples/connect-github/server.sh" lang="bash" />"#
+            )
+        );
+        let _guard = ENV_LOCK.lock().expect("environment test lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (name, value) in [
+            ("github-app.pem", wyrd_testing::github::APP_PRIVATE_KEY_PEM),
+            ("github-client-secret", "oauth-secret-value"),
+            ("github-webhook-secret", "webhook-secret-value"),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, value).expect("secret writes");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("secret is owner-only");
+        }
+        let published = std::process::Command::new("bash")
+            .args(["-euo", "pipefail", "-c", block])
+            .env_clear()
+            .output()
+            .expect("bash runs the settings");
+        assert!(published.status.success(), "{published:?}");
+        let block = block
+            .replace("<App ID>", "4242")
+            .replace("<slug>", "wyrd-app")
+            .replace("<Client ID>", "Iv1.client")
+            .replace("/run/secrets", &dir.path().display().to_string());
+        let printed = std::process::Command::new("bash")
+            .args(["-euo", "pipefail", "-c", &format!("{block}\nenv")])
+            .env_clear()
+            .output()
+            .expect("bash runs the filled-in settings");
+        assert!(printed.status.success(), "{printed:?}");
+        let exported: Vec<(String, Option<String>)> = String::from_utf8(printed.stdout)
+            .expect("the environment prints as UTF-8")
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .filter(|(name, _)| name.starts_with("WYRD_GITHUB_"))
+            .map(|(name, value)| (name.to_owned(), Some(value.to_owned())))
+            .collect();
+        let unset = github_env(Path::new("unused"))
+            .into_iter()
+            .map(|(name, _)| (name.to_owned(), None));
+        let vars: Vec<(String, Option<String>)> = unset.chain(exported).collect();
+        temp_env::with_vars(vars, || {
+            let mut config = WyrdServerConfig::default();
+            config
+                .apply_env_overrides()
+                .expect("the guide's settings apply");
+            let settings = config
+                .github
+                .resolve(true)
+                .expect("the guide's settings validate in production")
+                .expect("the guide configures the App");
+            assert_eq!(settings.app_id, 4242);
+            assert_eq!(settings.slug, "wyrd-app");
+            assert_eq!(settings.host(), "github.com");
+            assert_eq!(settings.web_origin.as_str(), "https://github.com/");
+            assert_eq!(settings.api_origin.as_str(), "https://api.github.com/");
+            assert_eq!(settings.public_url.as_str(), "https://wyrd.example.com/");
+            assert_eq!(settings.oauth_client_id, "Iv1.client");
+            assert_signs_app_jwts(&settings);
+            assert_eq!(
+                settings.webhook_secret.expose_secret(),
+                "webhook-secret-value"
+            );
+            assert_eq!(
+                settings.oauth_client_secret.expose_secret(),
+                "oauth-secret-value"
+            );
+        });
+    }
+
+    /// Proves an unset section configures no App, the default host is
+    /// `github.com`, production accepts only GitHub.com's origins, and a
+    /// partial or invalid section, including a public key in place of the
+    /// App's private key, refuses startup naming the field without quoting
+    /// key material.
+    ///
+    /// # Panics
+    /// Panics when an unset section configures an App, an invalid one
+    /// validates, or a refusal quotes key material.
+    #[test]
+    fn github_app_config_is_optional_but_complete_once_present() {
+        let _guard = ENV_LOCK.lock().expect("environment test lock");
+        assert!(
+            WyrdServerConfig::default()
+                .github
+                .resolve(true)
+                .expect("an unset section is valid")
+                .is_none()
+        );
+        let complete = GithubConfig {
+            app_id: Some(1),
+            slug: Some("app".to_owned()),
+            public_url: Some("https://wyrd.example.com".to_owned()),
+            oauth_client_id: Some("Iv1.client".to_owned()),
+            private_key: Some(SecretString::from(
+                wyrd_testing::github::APP_PRIVATE_KEY_PEM,
+            )),
+            webhook_secret: Some(SecretString::from("webhook")),
+            oauth_client_secret: Some(SecretString::from("oauth")),
+            ..GithubConfig::default()
+        };
+        let settings = complete
+            .resolve(true)
+            .expect("a complete section validates")
+            .expect("present");
+        assert_eq!(settings.host(), "github.com");
+        assert_eq!(settings.api_origin.as_str(), "https://api.github.com/");
+        assert_signs_app_jwts(&settings);
+
+        let cases: [(&str, GithubConfig); 10] = [
+            (
+                "public_url",
+                GithubConfig {
+                    public_url: None,
+                    ..complete.clone()
+                },
+            ),
+            (
+                "app_id",
+                GithubConfig {
+                    app_id: Some(0),
+                    ..complete.clone()
+                },
+            ),
+            (
+                "slug",
+                GithubConfig {
+                    slug: Some("Not A Slug".to_owned()),
+                    ..complete.clone()
+                },
+            ),
+            (
+                "web_origin",
+                GithubConfig {
+                    web_origin: Some("https://github.com/path".to_owned()),
+                    ..complete.clone()
+                },
+            ),
+            (
+                "api_origin",
+                GithubConfig {
+                    api_origin: Some("http://api.github.com".to_owned()),
+                    ..complete.clone()
+                },
+            ),
+            (
+                "webhook secret",
+                GithubConfig {
+                    webhook_secret: Some(SecretString::from("  ")),
+                    ..complete.clone()
+                },
+            ),
+            (
+                "private key",
+                GithubConfig {
+                    private_key: Some(SecretString::from("not a pem")),
+                    ..complete.clone()
+                },
+            ),
+            (
+                "WYRD_GITHUB_APP_PRIVATE_KEY_FILE",
+                GithubConfig {
+                    private_key: Some(SecretString::from(wyrd_testing::github::APP_PUBLIC_KEY_PEM)),
+                    ..complete.clone()
+                },
+            ),
+            (
+                "web_origin",
+                GithubConfig {
+                    web_origin: Some("https://github.example.com".to_owned()),
+                    ..complete.clone()
+                },
+            ),
+            (
+                "api_origin",
+                GithubConfig {
+                    api_origin: Some("https://github.example.com/api/v3".to_owned()),
+                    ..complete.clone()
+                },
+            ),
+        ];
+        let key_body = wyrd_testing::github::APP_PUBLIC_KEY_PEM
+            .lines()
+            .nth(1)
+            .expect("the PEM has a body");
+        for (field, config) in cases {
+            match config.resolve(true) {
+                Err(ConfigError::Invalid { message }) => {
+                    assert!(message.contains(field), "{field}: {message}");
+                    assert!(
+                        !message.contains("-----BEGIN") && !message.contains(key_body),
+                        "{field} refusal quotes key material: {message}"
+                    );
+                }
+                other => panic!("{field}: expected a typed refusal, got {other:?}"),
+            }
+        }
+        match (GithubConfig {
+            slug: Some("only-a-slug".to_owned()),
+            ..GithubConfig::default()
+        })
+        .resolve(false)
+        {
+            Err(ConfigError::Invalid { message }) => {
+                assert!(message.contains("app_id"), "{message}");
+            }
+            other => panic!("a partial section must refuse startup, got {other:?}"),
+        }
+    }
+
+    /// Proves the nonsecret App fields parse from server TOML while every
+    /// secret comes from its `_FILE` source.
+    ///
+    /// # Panics
+    /// Panics when a field differs.
+    #[test]
+    fn github_app_config_reads_toml_fields_and_secret_files() {
+        let _guard = ENV_LOCK.lock().expect("environment test lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_file = github_key_file(dir.path());
+        let secret_file = |name: &str, value: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, value).expect("secret writes");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("secret is owner-only");
+            path.display().to_string()
+        };
+        let webhook = secret_file("webhook", "webhook-from-file");
+        let oauth = secret_file("oauth", "oauth-from-file");
+        let mut config = from_toml_str_with_dev_oracle_opt_in(
+            "[github]\napp_id = 7\nslug = \"toml-app\"\n\
+             public_url = \"https://wyrd.example.com\"\n\
+             oauth_client_id = \"Iv1.toml\"\n\
+             web_origin = \"http://127.0.0.1:8443\"\n\
+             api_origin = \"http://127.0.0.1:8443/api/v3\"\n",
+        )
+        .expect("the section parses");
+        let unset = github_env(&key_file)
+            .into_iter()
+            .map(|(name, _)| (name, None::<String>));
+        let files = [
+            (
+                "WYRD_GITHUB_APP_PRIVATE_KEY_FILE",
+                Some(key_file.display().to_string()),
+            ),
+            ("WYRD_GITHUB_WEBHOOK_SECRET_FILE", Some(webhook)),
+            ("WYRD_GITHUB_OAUTH_CLIENT_SECRET_FILE", Some(oauth)),
+        ];
+        let vars: Vec<_> = unset
+            .filter(|(name, _)| !files.iter().any(|(file, _)| file == name))
+            .chain(files.clone())
+            .collect();
+        temp_env::with_vars(vars, || {
+            config
+                .apply_env_overrides()
+                .expect("the secret files apply");
+        });
+        let settings = config
+            .github
+            .resolve(false)
+            .expect("the section validates")
+            .expect("present");
+        assert_eq!(
+            (
+                settings.app_id,
+                settings.slug.as_str(),
+                settings.oauth_client_id.as_str()
+            ),
+            (7, "toml-app", "Iv1.toml")
+        );
+        assert_eq!(settings.public_url.as_str(), "https://wyrd.example.com/");
+        assert_eq!(settings.host(), "127.0.0.1:8443");
+        assert_eq!(settings.api_origin.as_str(), "http://127.0.0.1:8443/api/v3");
+        assert_signs_app_jwts(&settings);
+        assert_eq!(settings.webhook_secret.expose_secret(), "webhook-from-file");
+        assert_eq!(
+            settings.oauth_client_secret.expose_secret(),
+            "oauth-from-file"
+        );
+    }
+
+    /// Proves the TOML section carries no secret: a secret key there is an
+    /// unknown field.
+    ///
+    /// # Panics
+    /// Panics when a secret parses from TOML.
+    #[test]
+    fn github_secrets_never_come_from_toml() {
+        for field in ["private_key", "webhook_secret", "oauth_client_secret"] {
+            let parsed = from_toml_str_with_dev_oracle_opt_in(&format!(
+                "[github]\napp_id = 1\n{field} = \"value\"\n"
+            ));
+            assert!(parsed.is_err(), "{field} parsed from TOML");
         }
     }
 }

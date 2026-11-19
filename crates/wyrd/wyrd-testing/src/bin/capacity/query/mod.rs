@@ -7,7 +7,7 @@
 //! Rust client exactly as the guide's `WYRD_SERVER_URL` and `WYRD_API_KEY`
 //! configure it. Every query is checked against its exact answer and every
 //! write resolves at its durable acknowledgement. Evidence comes from client
-//! timings, `/metrics`, and the OS's readings of the server process.
+//! timings, the benchmark snapshot, and the OS's readings of the server process.
 //!
 //! - **L1** ([`isolated`]), three experiments at 1 and 64 closed-loop
 //!   clients ([`Experiment`]): `writes-parquet` sweeps native Arrow, OTLP
@@ -26,6 +26,7 @@ mod isolated;
 mod logs;
 mod run;
 mod telemetry;
+pub mod ui;
 mod workload;
 
 use std::path::Path;
@@ -144,7 +145,7 @@ const PARQUET_ENV: [(&str, &str); 1] = [("WYRD_MAX_FILE_RETENTION_TIME", "30")];
 /// so rows stage and publish only when the benchmark control asks. Only the
 /// `hot` reads use them, over a fixture loaded once before any window; a
 /// write workload under them would hold every row it writes in memory.
-const HOT_ENV: [(&str, &str); 3] = [
+pub const HOT_ENV: [(&str, &str); 3] = [
     ("WYRD_MAX_FILE_SIZE_IN_MEMORY", "16384"),
     ("WYRD_MAX_FILE_SIZE_ON_DISK", "16384"),
     ("WYRD_MAX_FILE_RETENTION_TIME", "86400"),
@@ -164,11 +165,23 @@ pub enum Experiment {
     Hot,
     /// Reads after every row is published as Parquet.
     Parquet,
+    /// The original UI SQL over the deterministic journey in each
+    /// residence.
+    UiSql,
+    /// [`Self::UiSql`] over ten times the journey's requests.
+    UiSql10x,
+    /// [`Self::UiSql`] after a published span sample taught the server a
+    /// span Variant layout.
+    UiSqlLearned,
 }
 
 impl Experiment {
     /// Every experiment, in the order `l1 bifrost` runs them.
-    pub const ALL: [Self; 3] = [Self::WritesParquet, Self::Hot, Self::Parquet];
+    pub const ALL: [Self; 4] = [Self::WritesParquet, Self::Hot, Self::Parquet, Self::UiSql];
+
+    /// The extended experiments, run only when selected by name: never part
+    /// of `l1 bifrost` or `l1`.
+    pub const EXTENDED: [Self; 2] = [Self::UiSql10x, Self::UiSqlLearned];
 
     /// The experiment id: its command word and record directory.
     #[must_use]
@@ -177,6 +190,9 @@ impl Experiment {
             Self::WritesParquet => "writes-parquet",
             Self::Hot => "hot",
             Self::Parquet => "parquet",
+            Self::UiSql => "ui-sql",
+            Self::UiSql10x => "ui-sql-10x",
+            Self::UiSqlLearned => "ui-sql-learned",
         }
     }
 
@@ -185,7 +201,20 @@ impl Experiment {
     pub fn parse(name: &str) -> Option<Self> {
         Self::ALL
             .into_iter()
+            .chain(Self::EXTENDED)
             .find(|experiment| experiment.name() == name)
+    }
+
+    /// The ui-sql arm the experiment runs, or `None` for the other
+    /// experiments.
+    #[must_use]
+    pub const fn ui_arm(self) -> Option<ui::Arm> {
+        match self {
+            Self::UiSql => Some(ui::Arm::DEFAULT),
+            Self::UiSql10x => Some(ui::Arm::TEN_X),
+            Self::UiSqlLearned => Some(ui::Arm::LEARNED),
+            Self::WritesParquet | Self::Hot | Self::Parquet => None,
+        }
     }
 
     /// Whether the experiment measures writes rather than reads.
@@ -198,14 +227,14 @@ impl Experiment {
     const fn env(self) -> &'static [(&'static str, &'static str)] {
         match self {
             Self::WritesParquet | Self::Parquet => &PARQUET_ENV,
-            Self::Hot => &HOT_ENV,
+            Self::Hot | Self::UiSql | Self::UiSql10x | Self::UiSqlLearned => &HOT_ENV,
         }
     }
 
     /// The read steps: each op, what it asks, and its client counts.
     const fn reads(self) -> &'static [(&'static str, Read, &'static [u64])] {
         match self {
-            Self::WritesParquet => &[],
+            Self::WritesParquet | Self::UiSql | Self::UiSql10x | Self::UiSqlLearned => &[],
             Self::Hot => &HOT_READS,
             Self::Parquet => &PARQUET_READS,
         }
@@ -445,8 +474,9 @@ pub fn experiment(arguments: &[String]) -> std::result::Result<Experiment, Strin
         .and_then(|name| Experiment::parse(name))
         .ok_or_else(|| {
             format!(
-                "l1 bifrost takes one experiment of {:?} before its flags",
-                Experiment::ALL.map(Experiment::name)
+                "l1 bifrost takes one experiment of {:?} or {:?} before its flags",
+                Experiment::ALL.map(Experiment::name),
+                Experiment::EXTENDED.map(Experiment::name)
             )
         })
 }
@@ -491,10 +521,12 @@ pub fn plan(context: &Context<'_>, base: Declaration) -> std::result::Result<Pla
     {
         fixture.insert("smoke_rows".to_owned(), json!(scale));
     }
-    let workload: Box<dyn wyrd_testing::experiment::Workload> = match experiment {
-        Some(experiment) => Box::new(isolated::Isolated::new(logs, experiment, scale)),
-        None => Box::new(competing::Competing::new(logs, scale)),
-    };
+    let workload: Box<dyn wyrd_testing::experiment::Workload> =
+        match (experiment, experiment.and_then(Experiment::ui_arm)) {
+            (_, Some(arm)) => Box::new(ui::workload::Ui::new(logs, arm)),
+            (Some(experiment), None) => Box::new(isolated::Isolated::new(logs, experiment, scale)),
+            (None, None) => Box::new(competing::Competing::new(logs, scale)),
+        };
     Ok(Plan {
         declaration,
         workload,
@@ -930,38 +962,33 @@ fn l1_declaration(experiment: Experiment, mut base: Declaration) -> Declaration 
     if experiment.writes() {
         base.timing.budget_seconds = WRITES_BUDGET_SECONDS;
     }
-    base.question = String::from(match experiment {
-        Experiment::WritesParquet => {
-            "Under the Parquet Scribe settings, whose windows pay for the staging and publication they cause, what does each native, OTLP spans, and OTLP logs write cost the server per CPU-second and per provisioned vCPU at 1 and 64 closed-loop clients up to its durable acknowledgement, with no error, how much publication ran and what backlog remained, and do the native and OTLP write peaks clear their sanity floors?"
+    let limits = limits(experiment.env(), shard_override().as_deref());
+    let (question, fixture, workload) = match experiment {
+        Experiment::WritesParquet => (
+            "Under the Parquet Scribe settings, whose windows pay for the staging and publication they cause, what does each native, OTLP spans, and OTLP logs write cost the server per CPU-second and per provisioned vCPU at 1 and 64 closed-loop clients up to its durable acknowledgement, with no error, how much publication ran and what backlog remained, and do the native and OTLP write peaks clear their sanity floors?",
+            write_fixture(),
+            "closed-loop public-client clients, each sending its next request once the last is acknowledged: native `write_batch` of 16,384 rows; OTLP exports of 512 spans or log records with the client's exchanged bearer",
+        ),
+        Experiment::Hot => (
+            "With 10M events rows and 1M spans hot in the span Variant layout the server learned, half staged and half in memtables, does a memtable point lookup keep p99 strictly under 5 ms at 64 closed-loop clients with every answer exact, and what does each read cost the server per CPU-second from each source, for a shredded and a long-tail span key?",
+            hot_fixture(),
+            "closed-loop public-client clients, each sending its next query once the last answers, every answer checked exactly and bounded to one half: Bifrost SQL events point lookups and 78k-row aggregates; span `attributes ->>` filters on a shredded and a long-tail key, bounded to the half's start times",
+        ),
+        Experiment::Parquet => (
+            "With 10M events rows and 1M spans published as Parquet, does a point lookup keep p99 strictly under 5 ms at 64 closed-loop clients with every answer exact, what does each read cost per CPU-second and scan per query, do the span files shred exactly the keys over the threshold, does a span-time window prune, and what does each write path store per retained byte?",
+            read_fixture("parquet"),
+            "closed-loop public-client clients, each sending its next query once the last answers, every answer checked exactly: Bifrost SQL events point lookups, 100k-row aggregates, and full scans; span `trace_id` lookups and `attributes ->>` filters on a shredded and a long-tail key",
+        ),
+        Experiment::UiSql | Experiment::UiSql10x | Experiment::UiSqlLearned => {
+            let arm = experiment.ui_arm().unwrap_or(ui::Arm::DEFAULT);
+            return ui::declare(base, isolated_metrics(), limits, arm);
         }
-        Experiment::Hot => {
-            "With 10M events rows and 1M spans hot in the span Variant layout the server learned, half staged and half in memtables, does a memtable point lookup keep p99 strictly under 5 ms at 64 closed-loop clients with every answer exact, and what does each read cost the server per CPU-second from each source, for a shredded and a long-tail span key?"
-        }
-        Experiment::Parquet => {
-            "With 10M events rows and 1M spans published as Parquet, does a point lookup keep p99 strictly under 5 ms at 64 closed-loop clients with every answer exact, what does each read cost per CPU-second and scan per query, do the span files shred exactly the keys over the threshold, does a span-time window prune, and what does each write path store per retained byte?"
-        }
-    });
+    };
+    question.clone_into(&mut base.question);
     base.variables.insert("clients".to_owned(), json!(PAIR));
-    base.controls.insert(
-        "fixture".to_owned(),
-        match experiment {
-            Experiment::WritesParquet => write_fixture(),
-            Experiment::Hot => hot_fixture(),
-            Experiment::Parquet => read_fixture("parquet"),
-        },
-    );
-    base.controls.insert(
-        "limits".to_owned(),
-        limits(experiment.env(), shard_override().as_deref()),
-    );
-    base.controls.insert(
-        "workload".to_owned(),
-        json!(match experiment {
-            Experiment::WritesParquet => "closed-loop public-client clients, each sending its next request once the last is acknowledged: native `write_batch` of 16,384 rows; OTLP exports of 512 spans or log records with the client's exchanged bearer",
-            Experiment::Hot => "closed-loop public-client clients, each sending its next query once the last answers, every answer checked exactly and bounded to one half: Bifrost SQL events point lookups and 78k-row aggregates; span `attributes ->>` filters on a shredded and a long-tail key, bounded to the half's start times",
-            Experiment::Parquet => "closed-loop public-client clients, each sending its next query once the last answers, every answer checked exactly: Bifrost SQL events point lookups, 100k-row aggregates, and full scans; span `trace_id` lookups and `attributes ->>` filters on a shredded and a long-tail key",
-        }),
-    );
+    base.controls.insert("fixture".to_owned(), fixture);
+    base.controls.insert("limits".to_owned(), limits);
+    base.controls.insert("workload".to_owned(), json!(workload));
     base.metrics = isolated_metrics();
     if experiment == Experiment::Parquet {
         base.metrics.extend(
@@ -1113,7 +1140,9 @@ fn windowed(experiment: Experiment, id: &str, mut params: Value) -> Step {
                 "native-write-c1" | "otlp-spans-c1" | "otlp-spans-1k-c1" | "native-write-c64"
             )
         }
-        Experiment::Hot => false,
+        Experiment::Hot | Experiment::UiSql | Experiment::UiSql10x | Experiment::UiSqlLearned => {
+            false
+        }
     };
     if long {
         params[WINDOW_SECONDS] = json!(10);
@@ -1523,6 +1552,32 @@ fn client(server: &LocalServer) -> Result<WyrdClient> {
     })?)
 }
 
+/// Scribe's gauge of cached learned Variant layouts, by namespace.
+const LAYOUTS_LEARNED: &str = "bifrost_scribe_variant_layouts_learned";
+
+/// Publishes everything `server`'s Scribe holds through the benchmark
+/// control and requires the publish to have taught it a `bifrost.traces`
+/// Variant layout, so later span rows are written in that learned layout.
+///
+/// # Errors
+///
+/// Returns a failed platform sign-in or publish, an empty publish, or no
+/// learned layout.
+pub async fn learn_span_layout(server: &LocalServer) -> Result<()> {
+    let claims = platform(server).await?.publish_scribe().await?;
+    let learned = server
+        .metrics()
+        .await?
+        .sum(LAYOUTS_LEARNED, &["namespace=\"bifrost.traces\""]);
+    if claims == 0 || learned < 1.0 {
+        return Err(format!(
+            "publishing the span sample published {claims} claims and taught {learned} bifrost.traces Variant layouts"
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// The platform session on `server` of the platform root credential its
 /// first `setup` disclosed: the only identity the benchmark control admits.
 ///
@@ -1596,7 +1651,7 @@ async fn lanes(client: &WyrdClient, ops: &[WriteOp]) -> Result<Vec<Lane>> {
     Ok(lanes)
 }
 
-/// Where Scribe holds rows, from one `/metrics` scrape and the store.
+/// Where Scribe holds rows, from one benchmark snapshot and the store.
 #[derive(Debug)]
 struct Residence {
     /// Arrow bytes in active and immutable memtables.
@@ -1807,7 +1862,7 @@ mod tests {
             .chain(&HOT_READS)
             .map(|(_, read, _)| read.case());
         for case in WriteOp::ALL.map(WriteOp::name).into_iter().chain(reads) {
-            assert!(wyrd_telemetry::timing::CASES.contains(&case), "{case}");
+            assert!(wyrd_benchmark::CASES.contains(&case), "{case}");
         }
     }
 

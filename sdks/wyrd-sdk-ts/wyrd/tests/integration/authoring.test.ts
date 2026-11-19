@@ -34,7 +34,7 @@ import {
 import { judgeReply, toolCall, toolTurn } from "../support/assistant.js";
 import type { ReceivedRequest, Reply } from "../support/http-receiver.js";
 import { configureGateway } from "../support/local-development.js";
-import { fixture, serverTest } from "../support/server.js";
+import { details, fixture, serverTest } from "../support/server.js";
 
 const {
   Action,
@@ -450,10 +450,11 @@ test("multi_component_service_verifies_each_subject", async ({ cards, provider }
     ] as const) {
       expect(result.subject).toEqual(state.cardRef(alias));
       expect(result.verifier.name).toBe(verifier);
-      expect(new Set(result.outcome.steps.map(({ id }) => id))).toEqual(new Set(steps));
+      const executed = (await details(result.execution_id)).outcome.steps;
+      expect(new Set(executed.map(({ id }) => id))).toEqual(new Set(steps));
       expect(
-        result.outcome.steps.every(({ status }) => status === "succeeded"),
-        JSON.stringify(result.outcome.steps),
+        executed.every(({ status }) => status === "succeeded"),
+        JSON.stringify(executed),
       ).toBe(true);
     }
     expect(releases(report, access), JSON.stringify([report.outcome, access.outcome])).toBe(true);
@@ -542,10 +543,11 @@ test("multi_component_service_verifies_each_subject", async ({ cards, provider }
       [changed("destination", { public_sharing: true }), false, "failed"],
     ] as const) {
       const access = judged((await verifyBoth(summarized, request))[1]);
-      const ran = access.outcome.steps.map(({ id }) => id);
+      const executed = (await details(access.execution_id)).outcome.steps;
+      const ran = executed.map(({ id }) => id);
       expect(new Set(ran)).toEqual(new Set(["recipient", "destination", "summary"]));
       expect(ran.at(-1), "the summary runs after both prerequisites").toBe("summary");
-      const summary = access.outcome.steps.find(({ id }) => id === "summary");
+      const summary = executed.find(({ id }) => id === "summary");
       expect(summary?.status).toBe("succeeded");
       expect(summary?.output, "the summary consumes both prerequisite outputs").toEqual({
         releasable,

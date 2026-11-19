@@ -17,20 +17,27 @@
 //! with their frozen identities through
 //! [`VerifierExecutionQueue::accept_scheduled`] and
 //! [`VerifierExecutionQueue::accept_grouped`], which move the expected
-//! cursor or consume the selected pending activity in the same transaction.
+//! cursor or consume the selected pending activity in the same transaction;
+//! pull-request executions, reserved before their inputs were staged, are
+//! made due through [`VerifierExecutionQueue::activate_pull_requests`].
 //! Replay, idempotency conflicts, and refusals are decided there, so a
 //! repeated batch accepts nothing twice. The writer grants no authority: each
 //! execution runs under the authority accepted or frozen with it. Losses
 //! are counted in `outbox_events_lost_total{outbox="verifier_submissions"}`.
 //! A commit that queued a new execution notifies [`SubmissionSink::accepted`],
 //! which wakes this process's idle Verifier runner instead of leaving the
-//! execution to its poll interval.
+//! execution to its poll interval. A caller's submission carries an
+//! [`AdmissionReply`] answered with its outcome only after that commit, so
+//! acknowledgement follows recoverable admission; a submission lost before
+//! it commits drops its reply unanswered.
 
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 
-use tokio::sync::Notify;
+use std::sync::Mutex;
+
+use tokio::sync::{Notify, oneshot};
 
 use uuid::Uuid;
 use wyrd_runtime::outbox::{Outbox, OutboxLimits, OutboxSink};
@@ -68,6 +75,42 @@ pub struct Queued {
     /// The producer's claim on the candidate's due occurrence or group;
     /// `None` for a submission.
     pub claim: Option<Arc<InFlight>>,
+    /// Where a caller's submission, or the pull-request delivery awaiting
+    /// its reserved execution, learns its committed outcome; `None` for a
+    /// scheduled or group candidate, which no caller awaits.
+    pub reply: Option<AdmissionReply>,
+}
+
+/// The one-shot answer to a caller awaiting its submission's durable
+/// admission.
+///
+/// Clones share one sender, so the Scribe write holding the staged input and
+/// the acknowledged queue item answer the same caller. The caller sees the
+/// committed [`SubmissionOutcome`], or a closed channel once every holder of
+/// an unwritten submission is dropped, which is exactly when it was lost.
+#[derive(Debug, Clone)]
+pub struct AdmissionReply(Arc<Mutex<Option<oneshot::Sender<SubmissionOutcome>>>>);
+
+impl AdmissionReply {
+    /// A reply and the receiver its caller awaits.
+    #[must_use]
+    pub fn channel() -> (Self, oneshot::Receiver<SubmissionOutcome>) {
+        let (sender, receiver) = oneshot::channel();
+        (Self(Arc::new(Mutex::new(Some(sender)))), receiver)
+    }
+
+    /// Answer the caller with its committed outcome; a later answer, or one
+    /// to a caller that stopped waiting, is ignored.
+    fn send(&self, outcome: SubmissionOutcome) {
+        let sender = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(sender) = sender {
+            let _gone = sender.send(outcome);
+        }
+    }
 }
 
 /// Queue destination of the outbox: one tenant's submissions, one
@@ -176,7 +219,9 @@ impl OutboxSink for SubmissionSink {
     /// Submissions are accepted after their targets resolve; scheduled and
     /// group candidates are admitted in binding order, the one lock order
     /// every writer uses, with their frozen identities, moving the expected
-    /// cursor or consuming the selected pending activity. A refused or
+    /// cursor or consuming the selected pending activity; reserved
+    /// pull-request executions are activated, and each awaiting delivery is
+    /// answered accepted after the commit, a replay included. A refused or
     /// conflicting item is logged; a refused or conflicting submission
     /// settled `errored` in the same transaction, so its status says why.
     /// When any execution was newly admitted, [`SubmissionSink::accepted`] is
@@ -200,15 +245,25 @@ impl OutboxSink for SubmissionSink {
         items: &[Acknowledged],
     ) -> Result<(), SqlError> {
         let mut submissions = Vec::new();
+        let mut replies = Vec::new();
         let mut candidates = Vec::new();
+        let mut pull_requests = Vec::new();
+        let mut pull_request_replies = Vec::new();
         for item in items {
             match &item.queued().admission {
-                Admission::Submitted(submission) => submissions.push(submission.clone()),
+                Admission::Submitted(submission) => {
+                    submissions.push(submission.clone());
+                    replies.push(item.queued().reply.as_ref());
+                }
                 candidate @ Admission::Scheduled(admission) => {
                     candidates.push((admission.binding_id, candidate));
                 }
                 candidate @ Admission::Grouped(admission) => {
                     candidates.push((admission.binding_id, candidate));
+                }
+                Admission::PullRequest(admission) => {
+                    pull_requests.push(admission.execution_id);
+                    pull_request_replies.push(item.queued().reply.as_ref());
                 }
             }
         }
@@ -251,10 +306,15 @@ impl OutboxSink for SubmissionSink {
                 Admission::Grouped(admission) => {
                     self.queue.accept_grouped(&mut conn, admission).await
                 }
-                Admission::Submitted(_) => continue,
+                Admission::Submitted(_) | Admission::PullRequest(_) => continue,
             };
             admitted.push(outcome.map_err(SqlError::Query)?);
         }
+        let activated = self
+            .queue
+            .activate_pull_requests(&mut conn, &pull_requests)
+            .await
+            .map_err(SqlError::Query)?;
         conn.commit().await?;
         if outcomes
             .iter()
@@ -262,11 +322,12 @@ impl OutboxSink for SubmissionSink {
             || admitted
                 .iter()
                 .any(|outcome| matches!(outcome, EnqueueOutcome::Enqueued(_)))
+            || !activated.is_empty()
         {
             self.accepted.notify_one();
         }
-        for (submission, outcome) in submissions.iter().zip(outcomes) {
-            match outcome {
+        for ((submission, reply), outcome) in submissions.iter().zip(replies).zip(outcomes) {
+            match &outcome {
                 SubmissionOutcome::Accepted | SubmissionOutcome::Replayed(_) => {}
                 SubmissionOutcome::Conflict { original } => tracing::info!(
                     %tenant,
@@ -281,6 +342,12 @@ impl OutboxSink for SubmissionSink {
                     "submission refused"
                 ),
             }
+            if let Some(reply) = reply {
+                reply.send(outcome);
+            }
+        }
+        for reply in pull_request_replies.into_iter().flatten() {
+            reply.send(SubmissionOutcome::Accepted);
         }
         for ((_, candidate), outcome) in candidates.iter().zip(admitted) {
             if let EnqueueOutcome::Refused(refusal) = outcome {

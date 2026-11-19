@@ -30,6 +30,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use vala_sql::ValaPostgres;
 use wyrd_runtime::audit::AuditStage;
+use wyrd_runtime::resources::Workload;
 use wyrd_runtime::{DelegationStep, Permission, PermissionScope, Principal};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
@@ -566,8 +567,9 @@ impl QueryTelemetryGuard {
 
     /// Emits the final query and stream outcome exactly once, with the
     /// executed plan's scan rows and bytes on the query span when known,
-    /// and records them into the benchmark scan histograms under the
-    /// request's classification.
+    /// and, for a successful query, records them into the benchmark scan
+    /// histograms under the request's classification: only answered
+    /// queries' scans are read, so other outcomes open no scan series.
     fn finish(&mut self, outcome: &'static str) {
         if self.finalization == QueryTelemetryFinalization::Closed {
             return;
@@ -576,12 +578,14 @@ impl QueryTelemetryGuard {
         self.finish_source_span(outcome);
         self.span.record("outcome", outcome);
         self.scan_stats.finalize();
-        wyrd_telemetry::timing::record_scan(
-            &self.span,
-            outcome,
-            self.scan_stats.physical_rows_scanned,
-            self.scan_stats.physical_bytes_scanned,
-        );
+        if outcome == "success" {
+            wyrd_benchmark::record_scan(
+                &self.span,
+                outcome,
+                self.scan_stats.physical_rows_scanned,
+                self.scan_stats.physical_bytes_scanned,
+            );
+        }
         metrics::counter!(
             "oracle_query_files_scanned_total",
             "class" => query_class_label(self.query_class)
@@ -1161,9 +1165,9 @@ pub struct Oracle {
     catalog: Arc<BifrostCatalog>,
     /// Tenant SQL handle retained for the Oracle lifecycle boundary.
     vala: ValaPostgres,
-    /// This node's Oracle resource capability, read only by test-tier
-    /// inspection; admission holds its own clone.
-    #[cfg(feature = "test-support")]
+    /// This node's Oracle resource capability: query start admits through
+    /// its process workloads, and test-tier inspection reads its grant;
+    /// admission holds its own clone.
     resources: OracleResources,
     /// Query-scoped live Scribe discovery owner.
     tail_discovery: Option<Arc<dyn TailStreamDiscovery>>,
@@ -1348,6 +1352,8 @@ struct AnalyticalCompositionInputs {
     objects: Arc<BifrostIcebergStorage>,
     /// Parquet bytes each distributed scan task reads; `None` keeps upstream's.
     file_scan_bytes_per_task: Option<usize>,
+    /// The process workload manager this node's stage work runs on.
+    workloads: wyrd_runtime::resources::WorkloadManager,
 }
 
 /// Builds one node's Analytical execution handle from its composed owners.
@@ -1369,6 +1375,7 @@ fn compose_analytical_handle(
         peer_tls,
         objects,
         file_scan_bytes_per_task,
+        workloads,
     } = inputs;
     let supervisor = Arc::new(analytical::AnalyticalSupervisor::new());
     let egress = Arc::new(analytical::AnalyticalStageEgress::new(
@@ -1386,6 +1393,7 @@ fn compose_analytical_handle(
             reservations,
             egress,
             objects,
+            workloads,
         });
     Arc::new(analytical::AnalyticalExecutionHandle::new(
         analytical::AnalyticalExecutionOwners {
@@ -1511,6 +1519,7 @@ impl Oracle {
                         peer_transports: config.peer_transports.as_ref().map(Arc::clone),
                         objects: Arc::clone(config.catalog.objects()),
                         file_scan_bytes_per_task: config.config.file_scan_bytes_per_task,
+                        workloads: config.memory.resources.workloads().clone(),
                     })
                 });
         Ok(Self {
@@ -1521,7 +1530,6 @@ impl Oracle {
             running_queries,
             catalog: config.catalog,
             vala: config.vala,
-            #[cfg(feature = "test-support")]
             resources: config.memory.resources,
             tail_discovery: config.tail_discovery,
             #[cfg(feature = "test-support")]
@@ -2262,7 +2270,9 @@ impl Oracle {
     ///
     /// # Errors
     ///
-    /// Returns [`BifrostError::OracleRoleUnavailable`] when an Analytical root
+    /// Returns [`BifrostError::QueryTimeout`] when process pressure keeps the
+    /// query paused past its deadline,
+    /// [`BifrostError::OracleRoleUnavailable`] when an Analytical root
     /// has no handle or attempt identity, and otherwise the stable admission,
     /// supervisor, reservation, runtime, or `DataFusion` execution error; every
     /// one of them is terminal.
@@ -2282,6 +2292,16 @@ impl Oracle {
             profile,
         } = input;
         let RetainedPhysicalPlan { config, root, .. } = retained;
+        // Process pressure pauses the query before it executes; it then
+        // runs as Bifrost work of its tenant on the shared CPU lanes.
+        let workloads = self.resources.workloads();
+        let operation = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            workloads.admit(Workload::Bifrost, Some(context.data_tenant_id), None),
+        )
+        .await
+        .map_err(|_| BifrostError::QueryTimeout)?;
+        let lanes = workloads.lanes().clone();
         let (handle, attempt) = match query_class {
             // Only a node that composed the handle plans a distributed root, so
             // an Analytical class without one is a broken invariant, never a
@@ -2296,9 +2316,12 @@ impl Oracle {
                 let task = admitted.execution_task(config)?;
                 let scan_stats = OracleQueryScanStats::from_plan(root.as_ref());
                 let schema = root.schema();
-                let batches =
-                    execute_stream(root, task).map_err(|error| map_datafusion_error(&error))?;
-                let batches = self.audit_tenant_refusal(context, batches);
+                let batches = laned_execution(lanes, operation, || {
+                    let batches =
+                        execute_stream(root, task).map_err(|error| map_datafusion_error(&error))?;
+                    Ok(self.audit_tenant_refusal(context, batches))
+                })
+                .await?;
                 return Ok(CutExecution {
                     schema,
                     batches,
@@ -2333,9 +2356,12 @@ impl Oracle {
         }
         let mut scan_stats = OracleQueryScanStats::from_plan(root.as_ref());
         let schema = root.schema();
-        let batches = execute_stream(Arc::clone(&root), leader.task_ctx())
-            .map_err(|error| map_datafusion_error(&error))?;
-        let batches = self.audit_tenant_refusal(context, batches);
+        let batches = laned_execution(lanes, operation, || {
+            let batches = execute_stream(Arc::clone(&root), leader.task_ctx())
+                .map_err(|error| map_datafusion_error(&error))?;
+            Ok(self.audit_tenant_refusal(context, batches))
+        })
+        .await?;
         if let Some(ownership) = admitted.analytical.as_ref() {
             ownership.retain_metric_fold(analytical::AnalyticalGraphMetricFold::new(
                 root,
@@ -4177,11 +4203,127 @@ fn instant_deadline(deadline: DateTime<Utc>) -> Result<Instant, BifrostError> {
         .checked_add(remaining)
         .ok_or(BifrostError::QueryTimeout)
 }
+/// Start a query's execution with `start` on the process CPU `lanes` as
+/// `operation`'s work, then poll its stream as [`laned_batches`] does, so
+/// the entry execution, and any work it spawns, runs laned like every batch.
+///
+/// # Errors
+/// Returns `start`'s error when the query cannot start.
+async fn laned_execution(
+    lanes: wyrd_runtime::resources::CpuLanes,
+    operation: wyrd_runtime::resources::Operation,
+    start: impl FnOnce() -> Result<SendableRecordBatchStream, BifrostError>,
+) -> Result<SendableRecordBatchStream, BifrostError> {
+    let batches = lanes
+        .laned(operation.context(), async move { start() })
+        .await?;
+    Ok(laned_batches(lanes, operation, batches))
+}
+
+/// `batches` with every poll on the process CPU `lanes` as `operation`'s
+/// work, holding no lane between batches; the stream keeps `operation` live
+/// until it drops, so the query counts as Bifrost demand while it runs.
+fn laned_batches(
+    lanes: wyrd_runtime::resources::CpuLanes,
+    operation: wyrd_runtime::resources::Operation,
+    batches: SendableRecordBatchStream,
+) -> SendableRecordBatchStream {
+    let schema = batches.schema();
+    let context = operation.context();
+    let stream =
+        futures_util::stream::unfold((batches, operation), move |(mut batches, operation)| {
+            let lanes = lanes.clone();
+            async move {
+                let next = lanes.laned(context, batches.next()).await?;
+                Some((next, (batches, operation)))
+            }
+        });
+    Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream))
+}
+
 #[cfg(test)]
 mod tests {
     use super::participant_cut::tests::lease;
     use super::*;
     use wyrd_runtime::{BifrostPermissionScope, BifrostTableScope};
+
+    /// Every batch of a laned query stream is produced on a lane as the
+    /// query's work, and the stream keeps the query's operation live.
+    ///
+    /// # Panics
+    /// Panics when a batch is produced unlaned or as other work, or a lane
+    /// stays held after the stream ends.
+    #[tokio::test]
+    async fn laned_batches_poll_each_batch_on_a_lane() {
+        use datafusion::arrow::array::{ArrayRef, Int64Array};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::arrow::record_batch::RecordBatch;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use wyrd_runtime::resources::{ProcessResources, WorkContext, Workload};
+
+        let process = ProcessResources::new(std::num::NonZeroUsize::MIN, 1 << 30, 1 << 30);
+        let workloads = process.workloads();
+        let operation = workloads.begin(Workload::Bifrost, None, None);
+        let context = operation.context();
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let batch_schema = Arc::clone(&schema);
+        let produced = futures_util::stream::iter(0..3).map(move |n| {
+            assert_eq!(WorkContext::current(), Some(context), "batch {n} ran laned");
+            let column: ArrayRef = Arc::new(Int64Array::from(vec![n]));
+            Ok(RecordBatch::try_new(Arc::clone(&batch_schema), vec![column]).expect("batch"))
+        });
+        let batches = laned_batches(
+            workloads.lanes().clone(),
+            operation,
+            Box::pin(RecordBatchStreamAdapter::new(schema, produced)),
+        );
+        let collected: Vec<_> = batches.collect().await;
+        assert_eq!(collected.len(), 3);
+        assert_eq!(
+            workloads.lanes().free(),
+            1,
+            "no lane is held after the stream"
+        );
+    }
+
+    /// A query's entry execution runs on a lane as the query's work, before
+    /// its first batch is polled, and holds no lane once it has started.
+    ///
+    /// # Panics
+    /// Panics when the query starts unlaned or as other work, or a lane
+    /// stays held after the start.
+    #[tokio::test]
+    async fn laned_execution_starts_the_query_on_a_lane() {
+        use datafusion::arrow::datatypes::Schema;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use wyrd_runtime::resources::{ProcessResources, WorkContext, Workload};
+
+        let process = ProcessResources::new(std::num::NonZeroUsize::MIN, 1 << 30, 1 << 30);
+        let workloads = process.workloads();
+        let operation = workloads.begin(Workload::Bifrost, None, None);
+        let context = operation.context();
+        let lanes = workloads.lanes().clone();
+        let started = laned_execution(lanes.clone(), operation, || {
+            assert_eq!(
+                WorkContext::current(),
+                Some(context),
+                "the query starts laned"
+            );
+            assert_eq!(lanes.free(), 0, "the start holds the only lane");
+            let schema = Arc::new(Schema::empty());
+            Ok(Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                futures_util::stream::empty(),
+            )) as SendableRecordBatchStream)
+        })
+        .await;
+        assert!(started.is_ok(), "the query starts");
+        assert_eq!(
+            workloads.lanes().free(),
+            1,
+            "no lane is held after the start"
+        );
+    }
 
     /// Interactive audits one local node; Analytical audits its whole frozen
     /// cut as distributed, and an unrepresentable cut fails closed.
@@ -5150,6 +5292,26 @@ mod tests {
             terminal.error,
             Some(Box::new(WyrdError::from(error).problem()))
         );
+    }
+
+    /// A benchmark server records scan facts for an answered query only, so
+    /// a failed one opens no scan series.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the recorder does not install or a failed query records
+    /// a scan.
+    #[test]
+    fn benchmark_scans_record_answered_queries_only() {
+        wyrd_benchmark::install().expect("the only recorder");
+        for outcome in ["failed", "success"] {
+            let mut query = OracleTelemetry::start_query(QueryClass::Analytical);
+            query.start_stream();
+            query.finish(outcome);
+        }
+        let scans = wyrd_benchmark::snapshot().scans;
+        assert_eq!(scans.len(), 1, "{scans:?}");
+        assert_eq!((scans[0].outcome.as_str(), scans[0].count), ("success", 1));
     }
 
     /// The standard recorder observes the canonical failed stream labels.

@@ -4,7 +4,7 @@
 //! conversational text. A request carries the native model, the `state` text
 //! to judge, and keyed `noul`, `choice`, or `score` questions; the answer
 //! carries the resolved model, one typed [`JevAnswer`] per question key, and
-//! token usage. [`JevRequest::validate`] enforces the documented question
+//! token usage. [`JevRequestView::validate`] enforces the documented question
 //! bounds before any provider IO.
 
 use std::collections::BTreeMap;
@@ -20,59 +20,65 @@ pub const JEV_MIN_SCORE_LEVELS: usize = 2;
 /// Most levels one `score` question may define.
 pub const JEV_MAX_SCORE_LEVELS: usize = 10;
 
-/// `POST /v1/systemone` request body.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields)]
-pub struct JevRequest {
-    /// Native Jev model, such as `jev-latest`.
-    pub model: String,
-    /// Text the questions are about, such as an agent reply.
-    pub state: String,
-    /// Questions keyed by the name their answer returns under.
-    pub questions: BTreeMap<String, JevQuestion>,
+crate::wire_contract! {
+    /// `POST /v1/systemone` request body.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+    #[serde(deny_unknown_fields)]
+    pub struct JevRequest as JevRequestView {
+        /// Native Jev model, such as `jev-latest`.
+        pub model: String,
+        /// Text the questions are about, such as an agent reply.
+        pub state: String,
+        /// Questions keyed by the name their answer returns under.
+        pub questions: BTreeMap<String, JevQuestion>,
+    }
 }
 
-/// One keyed Jev question, tagged by its answer form.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum JevQuestion {
-    /// Yes/no question answered with a probability that it holds.
-    Noul {
-        /// What to decide about the state.
-        instructions: String,
-        /// Optional descriptions of the true and false outcomes.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        criteria: Option<JevNoulCriteria>,
-    },
-    /// Pick exactly one of the keyed options.
-    Choice {
-        /// What to choose about the state.
-        instructions: String,
-        /// Option name to its description.
-        criteria: BTreeMap<String, String>,
-    },
-    /// Grade on an ordered scale whose levels are indexed from zero.
-    Score {
-        /// What to grade about the state.
-        instructions: String,
-        /// Level descriptions, lowest first.
-        criteria: Vec<String>,
-    },
+crate::wire_contract! {
+    /// One keyed Jev question, tagged by its answer form.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+    #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+    pub enum JevQuestion as JevQuestionView {
+        /// Yes/no question answered with a probability that it holds.
+        Noul {
+            /// What to decide about the state.
+            instructions: String,
+            /// Optional descriptions of the true and false outcomes.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            criteria: Option<JevNoulCriteria>,
+        },
+        /// Pick exactly one of the keyed options.
+        Choice {
+            /// What to choose about the state.
+            instructions: String,
+            /// Option name to its description.
+            criteria: BTreeMap<String, String>,
+        },
+        /// Grade on an ordered scale whose levels are indexed from zero.
+        Score {
+            /// What to grade about the state.
+            instructions: String,
+            /// Level descriptions, lowest first.
+            criteria: Vec<String>,
+        },
+    }
 }
 
-/// Outcome descriptions of a `noul` question.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields)]
-pub struct JevNoulCriteria {
-    /// When the answer is true.
-    #[serde(rename = "true")]
-    pub when_true: String,
-    /// When the answer is false.
-    #[serde(rename = "false")]
-    pub when_false: String,
+crate::wire_contract! {
+    /// Outcome descriptions of a `noul` question.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+    #[serde(deny_unknown_fields)]
+    pub struct JevNoulCriteria as JevNoulCriteriaView {
+        /// When the answer is true.
+        #[serde(rename = "true")]
+        pub when_true: String,
+        /// When the answer is false.
+        #[serde(rename = "false")]
+        pub when_false: String,
+    }
 }
 
 /// `POST /v1/systemone` answer.
@@ -165,8 +171,9 @@ impl JevRequestError {
     }
 }
 
-impl JevRequest {
-    /// Checks the documented Jev bounds that decoding cannot express.
+impl JevRequestView<'_> {
+    /// Checks the documented Jev bounds that decoding cannot express, on the
+    /// borrowed projection so checking copies no request text.
     ///
     /// The model must be non-empty; at least one question must be present, every key and
     /// instruction non-empty, a `choice` must offer 1 to
@@ -196,7 +203,7 @@ impl JevRequest {
     }
 }
 
-impl JevQuestion {
+impl JevQuestionView<'_> {
     /// Checks this question's bounds, naming members below `field`.
     ///
     /// # Errors
@@ -224,7 +231,7 @@ impl JevQuestion {
                         format!("{field}.criteria"),
                         "must offer 1 to 255 options",
                     ))
-                } else if criteria.keys().any(String::is_empty) {
+                } else if criteria.keys().any(|name| name.is_empty()) {
                     Err(JevRequestError::new(
                         format!("{field}.criteria"),
                         "option names must be non-empty",
@@ -254,9 +261,11 @@ mod tests {
 
     /// Decodes and validates a request body.
     fn checked(body: Value) -> Result<JevRequest, String> {
-        let request: JevRequest = serde_json::from_value(body).map_err(|e| e.to_string())?;
-        request.validate().map_err(|e| e.to_string())?;
-        Ok(request)
+        JevRequestView::deserialize(&body)
+            .map_err(|e| e.to_string())?
+            .validate()
+            .map_err(|e| e.to_string())?;
+        serde_json::from_value(body).map_err(|e| e.to_string())
     }
 
     /// Every documented question form decodes, validates, and re-encodes to

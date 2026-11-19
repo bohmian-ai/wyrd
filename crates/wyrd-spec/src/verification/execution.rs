@@ -7,9 +7,14 @@
 //! `GET /v1/verification/executions/{execution_id}` reports
 //! [`VerificationExecutionState`]. Execution status stays separate from the
 //! verdict: a failed requirement is a normal result, never a transport error.
+//! Every result read returns the compact [`VerificationResult`];
+//! `GET /v1/verification/executions/{execution_id}/details` alone returns
+//! the descriptive [`VerificationDetails`].
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::LazyLock;
 
+use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -20,16 +25,18 @@ use super::{
     DriftReport, DriftWindow, GroupSnapshot, OperatorDispatchState, VerificationError,
     VerificationExecutionStatus, VerificationVerdict,
 };
+use crate::auth::PrincipalId;
 use crate::auth::Sha256Hex;
-use crate::card::agent::{BuiltinTool, ExecutionRoute};
+use crate::card::agent::{Authored, BuiltinTool, Compiled, ExecutionRoute, PromptForm};
 use crate::card::verifier::{Check, CodeRuntime};
 use crate::error::WyrdError;
-use crate::ids::{CardUid, ExecutionId, GroupId, SlotName};
+use crate::ids::{ApprovalId, CardUid, EvidenceId, ExecutionId, GroupId, RepositoryId, SlotName};
+use crate::origin::CommitSha;
 use crate::reference::CardRef;
 use crate::storage::ids::UploadId;
 use crate::storage::upload::UploadPlan;
 use crate::vala::ids::{RunId, TraceId};
-use crate::verification::TaskId;
+use crate::verification::{PublicationName, TaskId};
 
 /// `POST /v1/verification/execute` and `POST /v1/verification/enqueue`
 /// request body: the exact Verifier and subject plus one declaration per
@@ -135,6 +142,200 @@ pub struct EvidencePlanResponse {
     pub uploads: Vec<EvidenceUpload>,
 }
 
+/// The connected provider repository a deferred publication is about.
+///
+/// The stable identity a Repository Card names, not a Card reference: the
+/// provider web host and the provider's repository id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceRepository {
+    /// Provider web host, such as `github.com`.
+    pub host: String,
+    /// Stable provider id of the repository.
+    pub repository_id: RepositoryId,
+}
+
+/// The source tags a deferred publication matches on: only the commit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceTags {
+    /// The exact full 40-character commit the evidence was produced from.
+    pub commit: CommitSha,
+}
+
+/// `POST /v1/verification/evidence/publish` request body.
+///
+/// Supplies `value` for every Verifier subscribed to the deferred `input`
+/// of `repository` at `tags.commit`. A File must already be a completed
+/// upload from `POST /v1/verification/evidence`. The server resolves the
+/// `owner/name` slug among the tenant's connected repositories and answers
+/// with the stable identity it matched.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct PublishEvidenceRequest {
+    /// The connected repository the evidence is about, as `owner/name`.
+    pub repository: String,
+    /// The source the evidence was produced from.
+    pub tags: EvidenceTags,
+    /// The deferred input slot name the evidence supplies.
+    #[cfg_attr(feature = "server", schema(value_type = String))]
+    pub input: SlotName,
+    /// The evidence: inline JSON, a completed File, or an Artifact file.
+    pub value: InputDeclaration,
+}
+
+/// Whether a publication was newly accepted or an earlier acceptance
+/// replayed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceStatus {
+    /// At least one subscriber accepted the evidence for the first time.
+    Accepted,
+    /// Every subscriber had already accepted this exact evidence.
+    Replayed,
+}
+
+/// `POST /v1/verification/evidence/publish` response: the durable receipt.
+///
+/// Returned only once every matched subscriber's acceptance is durable; it
+/// does not mean any execution ran.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct PublishEvidenceResponse {
+    /// The evidence identity; the same for the same source and content.
+    #[cfg_attr(feature = "server", schema(value_type = String))]
+    pub evidence_id: EvidenceId,
+    /// The connected repository the slug resolved to.
+    pub repository: EvidenceRepository,
+    /// The matched source tags.
+    pub tags: EvidenceTags,
+    /// The deferred input supplied.
+    #[cfg_attr(feature = "server", schema(value_type = String))]
+    pub input: SlotName,
+    /// Whether this call accepted the evidence or replayed an earlier
+    /// acceptance.
+    pub status: EvidenceStatus,
+    /// How many subscribed Verifier versions hold the evidence.
+    pub matched_subscriptions: u32,
+    /// When the evidence was first accepted.
+    pub recorded_at: DateTime<Utc>,
+}
+
+/// A person's decision on one pending approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalDecision {
+    /// Continue as approved.
+    Approved,
+    /// Continue as rejected; the Verifier decides what a rejection means.
+    Rejected,
+}
+
+/// Where one approval occurrence stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalStatus {
+    /// Waiting for a decision before the execution expires.
+    Pending,
+    /// Approved by `actor_id`.
+    Approved,
+    /// Rejected by `actor_id`.
+    Rejected,
+    /// The execution ended before anyone decided; no actor.
+    Expired,
+}
+
+impl From<ApprovalDecision> for ApprovalStatus {
+    /// The status an accepted `decision` gives its occurrence.
+    fn from(decision: ApprovalDecision) -> Self {
+        match decision {
+            ApprovalDecision::Approved => Self::Approved,
+            ApprovalDecision::Rejected => Self::Rejected,
+        }
+    }
+}
+
+/// `POST /v1/verification/executions/{execution_id}/approvals/{approval_id}`
+/// request body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct DecideApprovalRequest {
+    /// `approved` or `rejected`.
+    pub decision: ApprovalDecision,
+    /// Why, recorded with the decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// The decision receipt of one approval occurrence, and an approval step's
+/// output.
+///
+/// Returned only once the decision is durably accepted. `actor_id` and
+/// `decided_at` are absent while pending and for an expired occurrence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalReceipt {
+    /// The occurrence decided.
+    #[cfg_attr(feature = "server", schema(value_type = String))]
+    pub approval_id: ApprovalId,
+    /// `approved` or `rejected` once decided.
+    pub status: ApprovalStatus,
+    /// The principal who decided.
+    #[serde(default)]
+    #[cfg_attr(feature = "server", schema(value_type = Option<String>))]
+    pub actor_id: Option<PrincipalId>,
+    /// When the decision was accepted.
+    #[serde(default)]
+    pub decided_at: Option<DateTime<Utc>>,
+    /// The decider's stated reason.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// One approval occurrence of an execution, as inspection reports it.
+///
+/// It expires with the execution itself; there is no per-approval deadline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalOccurrenceState {
+    /// The identity a decision names.
+    #[cfg_attr(feature = "server", schema(value_type = String))]
+    pub approval_id: ApprovalId,
+    /// The approval step.
+    #[cfg_attr(feature = "server", schema(value_type = String))]
+    pub step_id: TaskId,
+    /// Zero-based fanout item, for a fanout step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item: Option<u32>,
+    /// Zero-based repeat iteration, for a repeating step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iteration: Option<u32>,
+    /// What the approver is asked.
+    pub message: String,
+    /// Where the occurrence stands.
+    pub status: ApprovalStatus,
+    /// The principal who decided, once decided.
+    #[serde(default)]
+    #[cfg_attr(feature = "server", schema(value_type = Option<String>))]
+    pub actor_id: Option<PrincipalId>,
+    /// When the decision was accepted, once decided.
+    #[serde(default)]
+    pub decided_at: Option<DateTime<Utc>>,
+    /// The decider's stated reason.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
 /// How to upload one missing file through the shared storage lifecycle.
 ///
 /// Transfer the bytes by `plan`, then finish with
@@ -154,7 +355,8 @@ pub struct EvidenceUpload {
 }
 
 /// `202 Accepted` body of `POST /v1/verification/enqueue`. It confirms
-/// staging only; replay or conflict is decided when the queue accepts it.
+/// durable admission; a replay under the same key names the original
+/// execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct EnqueueVerificationResponse {
@@ -199,10 +401,177 @@ pub struct VerificationExecutionState<T = Map<String, Value>> {
     /// The source snapshot a group execution judges.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<GroupSnapshot>,
+    /// The pull request source a `pull_request` binding execution was
+    /// admitted for, frozen at admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<PullRequestActivation>,
+    /// The deferred inputs a `waiting` execution is parked for; empty
+    /// otherwise.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    #[cfg_attr(feature = "server", schema(value_type = Vec<String>))]
+    pub waiting: BTreeSet<SlotName>,
+    /// Every approval occurrence the execution reached, pending or
+    /// decided, in step order; empty when it reached none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approvals: Vec<ApprovalOccurrenceState>,
+    /// How far GitHub delivery of a `pull_request` execution's current
+    /// state got; absent for every other origin. Delivery never changes the
+    /// verdict, and its failure never fails the execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_delivery: Option<GithubDelivery>,
 }
 
-/// The attributable result of one Verifier execution.
+/// The GitHub delivery of one `pull_request` execution's current state: its
+/// one Check and its one `COMMENT` review.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct GithubDelivery {
+    /// The outcome recorded for the execution's current state.
+    pub status: GithubDeliveryStatus,
+    /// Why a `skipped` or `failed` delivery did not finish, or why a
+    /// `delivered` Check shows no report; absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<GithubDeliveryReason>,
+    /// Report findings whose anchors the retained source does not hold.
+    /// Each is listed in the Check summary instead of inline, never moved
+    /// to another line.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub problems: Vec<AnchorProblem>,
+}
+
+/// One outcome of GitHub delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum GithubDeliveryStatus {
+    /// Nothing is recorded for the current state yet: delivery has not run
+    /// or is still running. Waiting and unfinished executions stay here
+    /// until their state is delivered.
+    Pending,
+    /// The Check, and the review when there is one, are on GitHub.
+    Delivered,
+    /// Not delivered because a newer source superseded the execution or
+    /// the repository's access was removed; nothing is written again.
+    Skipped,
+    /// GitHub refused a write, or stayed unavailable through every retry.
+    Failed,
+}
+
+/// Why GitHub delivery was skipped or failed, or why a delivered Check
+/// shows no report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum GithubDeliveryReason {
+    /// A newer source of the pull request, or its close, superseded the
+    /// execution.
+    Superseded,
+    /// The App lost access to the repository.
+    AccessRemoved,
+    /// GitHub refused a Check or review write; retrying cannot help.
+    GithubRefused,
+    /// GitHub stayed unavailable or rate limited through every retry.
+    GithubUnavailable,
+    /// More than one accepted output is a `code_review` report, so none is
+    /// shown; the Check summary names them.
+    ReportAmbiguous,
+    /// The one `code_review` report is malformed or unsupported, so it is
+    /// not shown; the Check summary names the problem.
+    ReportInvalid,
+}
+
+/// A report finding anchor the retained source does not hold.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct AnchorProblem {
+    /// The finding's report ID.
+    pub finding: String,
+    /// Why the anchor was refused.
+    pub reason: AnchorProblemReason,
+}
+
+/// Why a finding anchor was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AnchorProblemReason {
+    /// The anchor names another commit than the reviewed one.
+    AnchorCommitMismatch,
+    /// The reviewed change holds no file at the anchor's path.
+    AnchorPathUnknown,
+    /// The file's source was not retained, so no line can be checked.
+    AnchorSourceUnavailable,
+    /// The anchor's lines lie beyond the file.
+    AnchorOutOfRange,
+}
+
+impl AnchorProblemReason {
+    /// The reason's wire code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AnchorCommitMismatch => "anchor_commit_mismatch",
+            Self::AnchorPathUnknown => "anchor_path_unknown",
+            Self::AnchorSourceUnavailable => "anchor_source_unavailable",
+            Self::AnchorOutOfRange => "anchor_out_of_range",
+        }
+    }
+}
+
+/// One side of a pull request as an admission pinned it: the branch name
+/// then and the exact commit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct PullRequestRef {
+    /// Branch name when the source was admitted.
+    #[serde(rename = "ref")]
+    pub ref_name: String,
+    /// Exact commit SHA the execution reviews.
+    pub sha: String,
+}
+
+/// The pull request source one queued execution was admitted for.
 ///
+/// Every execution of one admission shares its `generation`. A newer
+/// source of the same pull request supersedes the generation: its unfinished
+/// executions are cancelled with code `pull_request_superseded`. A close or
+/// draft conversion cancels them with `pull_request_closed` or
+/// `pull_request_draft`, and losing the repository through removal,
+/// suspension or disconnect with `repository_access_lost`. Settled history
+/// keeps these pins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct PullRequestActivation {
+    /// Provider web host, such as `github.com`.
+    pub host: String,
+    /// Stable provider id of the base repository.
+    pub repository_id: RepositoryId,
+    /// Pull request number in the base repository.
+    pub number: u64,
+    /// Base branch and commit.
+    pub base: PullRequestRef,
+    /// Head branch and commit.
+    pub head: PullRequestRef,
+    /// Stable provider id of the head repository; differs from
+    /// `repository_id` for a fork and is absent once the fork is deleted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_repository_id: Option<RepositoryId>,
+    /// Provider delivery that admitted the source, for matching the
+    /// provider's delivery log.
+    pub delivery_id: String,
+    /// The admission every execution of this source shares.
+    pub generation: uuid::Uuid,
+}
+
+/// The attributable decision of one Verifier execution.
+///
+/// The compact default every execution, status, and wait read returns: the
+/// verdict and each requirement's judgment, without the check configuration,
+/// provenance, steps, or evidence that [`VerificationDetails`] describes.
 /// `T` is the type of each requirement's custom `data`: JSON objects on the
 /// wire, or a caller's type after a typed SDK read.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -223,12 +592,12 @@ pub struct VerificationResult<T = Map<String, Value>> {
     /// absent when the invocation carried none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deployment_environment: Option<String>,
-    /// Verdict, breakdown, and evidence.
+    /// Verdict and requirement judgments.
     #[cfg_attr(feature = "server", schema(value_type = VerificationOutcome))]
     pub outcome: VerificationOutcome<T>,
 }
 
-/// Overall verdict with its requirement and step breakdown.
+/// Overall verdict with its requirement judgments.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[schemars(rename = "VerificationOutcome")]
@@ -239,10 +608,6 @@ pub struct VerificationOutcome<T = Map<String, Value>> {
     /// Every requirement, step requirements included.
     #[cfg_attr(feature = "server", schema(value_type = Vec<RequirementResult>))]
     pub requirements: Vec<RequirementResult<T>>,
-    /// Every step in plan order.
-    pub steps: Vec<StepResult>,
-    /// The pinned original evidence, by slot.
-    pub evidence: BTreeMap<SlotName, InputDeclaration>,
 }
 
 /// The judgment of one requirement.
@@ -256,6 +621,14 @@ pub struct RequirementResult<T = Map<String, Value>> {
     /// Owning step of a step requirement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step: Option<TaskId>,
+    /// Zero-based fanout item of the owning step's invocation this instance
+    /// judged; absent without fanout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_index: Option<u32>,
+    /// Zero-based repeat iteration of the owning step's invocation this
+    /// instance judged; absent without repeat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iteration_index: Option<u32>,
     /// The requirement statement.
     pub statement: String,
     /// The outcome.
@@ -265,7 +638,8 @@ pub struct RequirementResult<T = Map<String, Value>> {
     /// The compared actual value, when capture permits it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actual: Option<Value>,
-    /// Validated original-evidence citations.
+    /// Validated original-evidence citations: the original slot and locator,
+    /// never a promise that the input body is echoed or fetchable.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub citations: Vec<Citation>,
     /// Custom data an Agent or code check returned under its declared
@@ -281,12 +655,99 @@ pub struct RequirementResult<T = Map<String, Value>> {
     /// Check-specific detail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<RequirementDetail>,
+}
+
+/// `GET /v1/verification/executions/{execution_id}/details` response: what
+/// one execution ran and how it judged.
+///
+/// The same identity and judgments as its [`VerificationResult`], plus each
+/// requirement's exact authored check and provenance, every step, and the
+/// pinned evidence declarations. `T` is the custom-data type, as in
+/// [`VerificationResult`]. `F` is the inline Agent Prompt form: a read
+/// keeps the [`Authored`] form and never compiles, renders, or executes a
+/// Prompt; an engine records the [`Compiled`] form it ran.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(bound(
+    serialize = "T: Serialize",
+    deserialize = "T: serde::de::DeserializeOwned"
+))]
+#[schemars(rename = "VerificationDetails", bound = "T: JsonSchema, F: PromptForm")]
+#[cfg_attr(feature = "server", schema(bound = ""))]
+pub struct VerificationDetails<T = Map<String, Value>, F: PromptForm = Authored> {
+    /// Server-issued execution identity.
+    pub execution_id: ExecutionId,
+    /// The caller's application Run, when there is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<RunId>,
+    /// The exact Verifier executed.
+    pub verifier: CardRef,
+    /// The exact subject judged.
+    pub subject: CardRef,
+    /// The deployment environment tag the execution was invoked with, or
+    /// absent when the invocation carried none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_environment: Option<String>,
+    /// Verdict, requirement and step breakdown, and evidence.
+    #[cfg_attr(feature = "server", schema(value_type = OutcomeDetails))]
+    pub outcome: OutcomeDetails<T, F>,
+}
+
+/// Overall verdict with its full requirement and step breakdown and the
+/// pinned evidence.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(bound(
+    serialize = "T: Serialize",
+    deserialize = "T: serde::de::DeserializeOwned"
+))]
+#[schemars(rename = "OutcomeDetails", bound = "T: JsonSchema, F: PromptForm")]
+#[cfg_attr(feature = "server", schema(bound = ""))]
+pub struct OutcomeDetails<T = Map<String, Value>, F: PromptForm = Authored> {
+    /// The `decide` rule applied to every applicable requirement.
+    pub verdict: VerificationVerdict,
+    /// Every requirement, step requirements included.
+    #[cfg_attr(feature = "server", schema(value_type = Vec<RequirementDetails>))]
+    pub requirements: Vec<RequirementDetails<T, F>>,
+    /// Every step in plan order.
+    pub steps: Vec<StepResult>,
+    /// The pinned original evidence, by slot.
+    pub evidence: BTreeMap<SlotName, InputDeclaration>,
+}
+
+/// The judgment of one requirement with the exact check that produced it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(bound(
+    serialize = "T: Serialize",
+    deserialize = "T: serde::de::DeserializeOwned"
+))]
+#[schemars(rename = "RequirementDetails", bound = "T: JsonSchema, F: PromptForm")]
+#[cfg_attr(feature = "server", schema(bound = ""))]
+pub struct RequirementDetails<T = Map<String, Value>, F: PromptForm = Authored> {
+    /// The judgment, exactly as the compact result carries it.
+    #[serde(flatten)]
+    #[cfg_attr(feature = "server", schema(value_type = RequirementResult))]
+    pub result: RequirementResult<T>,
     /// The exact check configuration that ran.
-    pub check: Check,
+    #[schemars(with = "Check")]
+    #[cfg_attr(feature = "server", schema(value_type = Check))]
+    pub check: Check<F>,
     /// What executed the check, for Agent, code, and drift checks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<CallProvenance>,
+    /// Tools an Agent check called, direct and nested, in start order;
+    /// empty for every other check and for historical results.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCallRecord>,
 }
+
+/// The full outcome an engine produces and records: details holding each
+/// check in the compiled form it ran.
+pub type ExecutedOutcome = OutcomeDetails<Map<String, Value>, Compiled>;
+
+/// One requirement of an [`ExecutedOutcome`].
+pub type ExecutedRequirement = RequirementDetails<Map<String, Value>, Compiled>;
 
 /// One requirement's outcome. Only `not_applicable` leaves the `decide`
 /// denominator.
@@ -391,12 +852,404 @@ pub enum StepStatus {
     Skipped,
 }
 
-/// One tool call an Agent action made.
+/// The committed settlement of one queued block invocation attempt.
 ///
-/// Records what the model received, never the raw tool output: the digest
-/// and size describe the bounded output actually returned. A call that
-/// returned no output, such as one that failed, has no digest and zero
-/// returned bytes rather than a digest of nothing.
+/// A queued execution checkpoints each action and requirement it runs as
+/// soon as the block settles, before the block's dependents run, so a
+/// reclaimed execution restores the settlement instead of running the block
+/// again. Skipped steps and requirements settled by a missing value perform
+/// no IO and are never checkpointed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum InvocationSettlement {
+    /// A step action succeeded or failed after its attempts.
+    Action {
+        /// The reported step result, its output uncaptured.
+        result: Box<StepResult>,
+        /// Original slots the action read.
+        sources: BTreeSet<SlotName>,
+    },
+    /// A requirement's check was judged.
+    Requirement {
+        /// The reported requirement with the exact check that judged it.
+        result: Box<ExecutedRequirement>,
+    },
+}
+
+/// The content kind one execution publication retains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationKind {
+    /// One regular file.
+    File,
+    /// One directory tree.
+    Directory,
+    /// One bounded JSON value, `null` included.
+    Json,
+}
+
+/// The producer invocation attempt that accepted a publication.
+///
+/// This is the host-assigned logical invocation identity: the step, its
+/// zero-based fanout item and repeat iteration when those constructs exist,
+/// and its one-based attempt. Authors never supply it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct Producer {
+    /// The producing step.
+    pub step_id: TaskId,
+    /// Zero-based fanout item; `None` without fanout.
+    pub item_index: Option<u32>,
+    /// Zero-based repeat iteration; `None` without repeat.
+    pub iteration_index: Option<u32>,
+    /// One-based attempt.
+    pub attempt: u32,
+}
+
+impl Producer {
+    /// The one-based `attempt` of `step`, which neither fans out nor
+    /// repeats.
+    #[must_use]
+    pub fn plain(step: &TaskId, attempt: u32) -> Self {
+        Self {
+            step_id: step.clone(),
+            item_index: None,
+            iteration_index: None,
+            attempt,
+        }
+    }
+}
+
+/// One regular file a file or directory publication retains.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct PublicationFile {
+    /// Path relative to the publication root; a file publication's one entry
+    /// is its basename.
+    pub path: String,
+    /// SHA-256 of the file's bytes, the verification File that holds them.
+    pub sha256: Sha256Hex,
+    /// File size in bytes.
+    pub size_bytes: u64,
+}
+
+/// The immutable manifest of a file or directory publication.
+///
+/// Every byte it names was completed as a verification File before the
+/// manifest committed, so a manifest never names partial content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct PublicationManifest {
+    /// Every regular file, sorted by path.
+    pub files: Vec<PublicationFile>,
+    /// Every directory below a directory publication's root, empty ones
+    /// included, sorted; empty for a file.
+    pub directories: Vec<String>,
+}
+
+/// The content one publication retains: a manifest of completed Files for
+/// a file or directory, or a bounded JSON value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PublicationContent {
+    /// One regular file; its manifest holds exactly one entry.
+    File {
+        /// The retained file.
+        manifest: PublicationManifest,
+    },
+    /// One directory tree.
+    Directory {
+        /// The retained tree.
+        manifest: PublicationManifest,
+    },
+    /// One JSON value, `null` included.
+    Json {
+        /// The retained value.
+        value: Value,
+    },
+}
+
+impl PublicationContent {
+    /// The kind of content retained.
+    #[must_use]
+    pub const fn kind(&self) -> PublicationKind {
+        match self {
+            Self::File { .. } => PublicationKind::File,
+            Self::Directory { .. } => PublicationKind::Directory,
+            Self::Json { .. } => PublicationKind::Json,
+        }
+    }
+}
+
+/// One accepted, immutable execution publication.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct Publication {
+    /// The logical name, unique within its producer attempt.
+    pub name: PublicationName,
+    /// The invocation attempt that accepted it.
+    pub producer: Producer,
+    /// The retained content.
+    #[serde(flatten)]
+    pub content: PublicationContent,
+}
+
+/// The `manifest.json` of a mounted `steps.<id>.publications` collection.
+///
+/// It reports the producer step's terminal status, every invocation attempt
+/// with its status, and every admitted publication with the path its content
+/// is mounted at beneath the collection root, so a consumer reads failed or
+/// skipped producers honestly instead of inferring them from absent files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct PublicationCollection {
+    /// The producer step's terminal status.
+    pub status: StepStatus,
+    /// Why the step failed or was skipped; `null` when it succeeded.
+    pub reason: Option<String>,
+    /// The step's speculative disposition.
+    pub speculation: Speculation,
+    /// Every invocation attempt, ordered by item, iteration, then attempt;
+    /// empty when the step never ran.
+    pub invocations: Vec<ProducerInvocation>,
+    /// Every admitted publication, grouped like `invocations` and in
+    /// acceptance order within an attempt.
+    pub entries: Vec<CollectionEntry>,
+}
+
+/// A step's speculative disposition, as a collection manifest reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum Speculation {
+    /// The step is not speculative.
+    None,
+    /// The step ran before its condition resolved; its contribution is
+    /// withheld until the condition settles.
+    Pending,
+    /// The condition held; the contribution is admitted.
+    Admitted,
+    /// The condition was false; unfinished work was cancelled and the
+    /// contribution is excluded from ordinary consumers.
+    Discarded,
+    /// The condition could not be evaluated; nothing is admitted.
+    Blocked,
+}
+
+impl Speculation {
+    /// Whether ordinary consumers may read the step's contribution.
+    #[must_use]
+    pub const fn admits(self) -> bool {
+        matches!(self, Self::None | Self::Admitted)
+    }
+}
+
+/// One invocation attempt of a collection's producer step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ProducerInvocation {
+    /// Zero-based fanout item; `null` without fanout.
+    pub item_index: Option<u32>,
+    /// Zero-based repeat iteration; `null` without repeat.
+    pub iteration_index: Option<u32>,
+    /// One-based attempt.
+    pub attempt: u32,
+    /// How the attempt ended: a retried attempt failed.
+    pub status: StepStatus,
+    /// Why the attempt failed; `null` when it succeeded.
+    pub reason: Option<String>,
+}
+
+/// One admitted publication of a mounted collection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct CollectionEntry {
+    /// The logical name.
+    pub name: PublicationName,
+    /// Whether it mounts as a file, a directory, or a JSON file.
+    pub kind: PublicationKind,
+    /// The mounted file, JSON file, or directory root, relative to the
+    /// collection root and always beneath `content/`. Its segments are
+    /// opaque: read them here rather than constructing them.
+    pub path: String,
+    /// Zero-based fanout item of the producer; `null` without fanout.
+    pub item_index: Option<u32>,
+    /// Zero-based repeat iteration of the producer; `null` without repeat.
+    pub iteration_index: Option<u32>,
+    /// One-based producer attempt.
+    pub attempt: u32,
+}
+
+/// Page size an execution listing uses when `limit` is omitted.
+pub const EXECUTION_PAGE_DEFAULT: u32 = 50;
+
+/// Most entries one execution listing page returns.
+pub const EXECUTION_PAGE_MAX: u32 = 200;
+
+/// Query of the paginated execution listings,
+/// `GET /v1/verification/executions/{execution_id}/invocations` and
+/// `/publications`.
+///
+/// The first page fixes the listing's cut: every page of one listing,
+/// followed through `next_cursor`, reads exactly the entries committed
+/// before the first page was read, in commit order, with no gap or
+/// duplicate. Entries committed later appear when a new listing is started.
+/// A cursor binds its tenant, execution, and listing and confers no
+/// authority, which every page re-checks.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::IntoParams, utoipa::ToSchema))]
+#[cfg_attr(feature = "server", into_params(parameter_in = Query))]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionPageQuery {
+    /// Page size, 1–200; 50 when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 200))]
+    pub limit: Option<u32>,
+    /// Opaque continuation from the previous page's `next_cursor`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = 2048))]
+    pub cursor: Option<String>,
+}
+
+/// How one invocation attempt stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum InvocationProgress {
+    /// Dispatched and not settled: still running, or abandoned when its
+    /// execution is terminal.
+    Started,
+    /// A step action settled.
+    Action {
+        /// How the action ended.
+        status: StepStatus,
+    },
+    /// A requirement was judged.
+    Requirement {
+        /// The judgment.
+        outcome: RequirementOutcome,
+    },
+}
+
+/// One checkpointed invocation attempt of a queued execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ExecutionInvocation {
+    /// The step or requirement, item, iteration, and attempt.
+    pub producer: Producer,
+    /// Whether the attempt is running or how it settled.
+    #[serde(flatten)]
+    pub progress: InvocationProgress,
+    /// Why a settled attempt failed, was skipped, or was judged as it was;
+    /// `null` otherwise.
+    pub reason: Option<String>,
+    /// The attempt's speculative disposition.
+    pub speculation: Speculation,
+}
+
+/// How far one execution's history has been projected into
+/// `bifrost.verification.execution_events`.
+///
+/// Projection lag delays history only: invocation progress and publications
+/// read from the execution's records whatever this reports.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct HistoryProjection {
+    /// Events Scribe acknowledged.
+    pub acknowledged: u64,
+    /// Events not yet submitted.
+    pub pending: u64,
+    /// Events submitted without an acknowledgement, to be resubmitted under
+    /// the same batch identity.
+    pub failed: u64,
+}
+
+/// `GET /v1/verification/executions/{execution_id}/invocations` response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct InvocationPage {
+    /// The execution.
+    pub execution_id: ExecutionId,
+    /// Its current lifecycle status.
+    pub status: VerificationExecutionStatus,
+    /// The page's invocation attempts, in commit order.
+    pub items: Vec<ExecutionInvocation>,
+    /// Continuation of this listing; `null` on its last page.
+    pub next_cursor: Option<String>,
+    /// The execution's history projection position.
+    pub history: HistoryProjection,
+}
+
+/// One accepted publication as a listing names it, without its content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct PublicationSummary {
+    /// The logical name, unique within its producer attempt.
+    pub name: PublicationName,
+    /// The content kind retained.
+    pub kind: PublicationKind,
+    /// The invocation attempt that accepted it.
+    pub producer: Producer,
+    /// Its producer's speculative disposition.
+    pub speculation: Speculation,
+}
+
+/// `GET /v1/verification/executions/{execution_id}/publications` response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct PublicationPage {
+    /// The execution.
+    pub execution_id: ExecutionId,
+    /// The page's publications, in acceptance order.
+    pub items: Vec<PublicationSummary>,
+    /// Continuation of this listing; `null` on its last page.
+    pub next_cursor: Option<String>,
+}
+
+/// Producer selection of one publication read or download, the query of
+/// `GET` and `POST /v1/verification/executions/{execution_id}/publications/{step_id}/{name}[/download]`.
+///
+/// It names the exact producer attempt a listing reports, never the latest
+/// attempt.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::IntoParams, utoipa::ToSchema))]
+#[cfg_attr(feature = "server", into_params(parameter_in = Query))]
+#[serde(deny_unknown_fields)]
+pub struct PublicationSelector {
+    /// One-based producer attempt.
+    #[schemars(range(min = 1))]
+    pub attempt: u32,
+    /// Zero-based fanout item; omitted without fanout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_index: Option<u32>,
+    /// Zero-based repeat iteration; omitted without repeat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iteration_index: Option<u32>,
+    /// For a directory download, the regular file's path relative to the
+    /// publication root, as its manifest lists it; omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+/// `POST /v1/verification/executions/{execution_id}/cancel` response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct CancelExecutionResponse {
+    /// The execution.
+    pub execution_id: ExecutionId,
+    /// Its status after the cancellation fence: `cancelled` for work that
+    /// was unfinished, otherwise the terminal status it already had.
+    pub status: VerificationExecutionStatus,
+}
+
+/// One tool call an Agent step or check made, directly or from its Python.
+///
+/// Records what its recipient received, never the raw tool output: the
+/// digest and size describe the bounded output actually delivered. A call
+/// that delivered no output, such as one that failed or was cancelled, has
+/// no digest and zero returned bytes rather than a digest of nothing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct ToolCallRecord {
@@ -404,16 +1257,35 @@ pub struct ToolCallRecord {
     pub tool: BuiltinTool,
     /// Call arguments.
     pub arguments: Value,
-    /// SHA-256 of the bounded output returned to the model; absent when the
-    /// call returned none.
+    /// Where the output went, or would have gone: the model for a direct
+    /// call, Python for a call `code.run` made. Absent on historical
+    /// records, which were all direct.
+    #[serde(default)]
+    pub recipient: ToolRecipient,
+    /// SHA-256 of the bounded output delivered to the recipient; absent
+    /// when the call delivered none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "server", schema(value_type = Option<String>))]
     pub output_sha256: Option<Sha256Hex>,
-    /// Bytes of output returned to the model; zero when it returned none.
+    /// Bytes of output delivered to the recipient; zero when it delivered
+    /// none.
     pub returned_bytes: u64,
-    /// Error the tool returned, when it failed.
+    /// Error the tool returned, when it failed or was cancelled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// Who receives a tool call's output.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ToolRecipient {
+    /// The model requested the call and receives its output.
+    #[default]
+    Model,
+    /// Python inside `code.run` awaited the call and receives its output;
+    /// the model sees only what that program returns.
+    Code,
 }
 
 /// Most bytes of compact UTF-8 JSON one Verdict's custom `data` may take.
@@ -471,6 +1343,10 @@ impl VerificationExecutionState {
             group_id,
             owner_card_uid,
             group,
+            pull_request,
+            waiting,
+            approvals,
+            github_delivery,
         } = self;
         Ok(VerificationExecutionState {
             execution_id,
@@ -481,6 +1357,10 @@ impl VerificationExecutionState {
             group_id,
             owner_card_uid,
             group,
+            pull_request,
+            waiting,
+            approvals,
+            github_delivery,
         })
     }
 }
@@ -507,11 +1387,6 @@ impl VerificationResult {
             deployment_environment,
             outcome,
         } = self;
-        let requirements = outcome
-            .requirements
-            .into_iter()
-            .map(RequirementResult::decode_data)
-            .collect::<Result<_, _>>()?;
         Ok(VerificationResult {
             execution_id,
             run_id,
@@ -520,11 +1395,88 @@ impl VerificationResult {
             deployment_environment,
             outcome: VerificationOutcome {
                 verdict: outcome.verdict,
-                requirements,
+                requirements: outcome
+                    .requirements
+                    .into_iter()
+                    .map(RequirementResult::decode_data)
+                    .collect::<Result<_, _>>()?,
+            },
+        })
+    }
+}
+
+impl VerificationDetails {
+    /// These details with every present requirement `data` decoded as `T`,
+    /// with the [`VerificationResult::decode_data`] semantics.
+    ///
+    /// # Errors
+    /// Returns the [`VerificationResult::decode_data`] error.
+    pub fn decode_data<T: DeserializeOwned>(self) -> Result<VerificationDetails<T>, WyrdError> {
+        let Self {
+            execution_id,
+            run_id,
+            verifier,
+            subject,
+            deployment_environment,
+            outcome,
+        } = self;
+        Ok(VerificationDetails {
+            execution_id,
+            run_id,
+            verifier,
+            subject,
+            deployment_environment,
+            outcome: OutcomeDetails {
+                verdict: outcome.verdict,
+                requirements: outcome
+                    .requirements
+                    .into_iter()
+                    .map(|requirement| {
+                        Ok(RequirementDetails {
+                            result: requirement.result.decode_data()?,
+                            check: requirement.check,
+                            provenance: requirement.provenance,
+                            tool_calls: requirement.tool_calls,
+                        })
+                    })
+                    .collect::<Result<_, WyrdError>>()?,
                 steps: outcome.steps,
                 evidence: outcome.evidence,
             },
         })
+    }
+}
+
+impl<T, F: PromptForm> OutcomeDetails<T, F> {
+    /// The compact decision of this outcome: its verdict and each
+    /// requirement's judgment, without checks, provenance, steps, or
+    /// evidence.
+    #[must_use]
+    pub fn compact(self) -> VerificationOutcome<T> {
+        VerificationOutcome {
+            verdict: self.verdict,
+            requirements: self
+                .requirements
+                .into_iter()
+                .map(|requirement| requirement.result)
+                .collect(),
+        }
+    }
+}
+
+impl<T, F: PromptForm> VerificationDetails<T, F> {
+    /// The compact [`VerificationResult`] of these details: the same
+    /// identity and judgments.
+    #[must_use]
+    pub fn compact(self) -> VerificationResult<T> {
+        VerificationResult {
+            execution_id: self.execution_id,
+            run_id: self.run_id,
+            verifier: self.verifier,
+            subject: self.subject,
+            deployment_environment: self.deployment_environment,
+            outcome: self.outcome.compact(),
+        }
     }
 }
 
@@ -550,6 +1502,8 @@ impl RequirementResult {
         Ok(RequirementResult {
             id: self.id,
             step: self.step,
+            item_index: self.item_index,
+            iteration_index: self.iteration_index,
             statement: self.statement,
             outcome: self.outcome,
             reason: self.reason,
@@ -557,11 +1511,37 @@ impl RequirementResult {
             citations: self.citations,
             data,
             detail: self.detail,
-            check: self.check,
-            provenance: self.provenance,
         })
     }
 }
+
+/// The generated closed Verdict schema without `data`, the plain `verdict`
+/// format every expanded one extends. Generated once: it depends only on the
+/// Verdict type, and every compiled Prompt and decoded inline Agent check
+/// resolves it.
+///
+/// # Panics
+///
+/// Panics on first use if the generated schema is not an object declaring
+/// `properties`, an invariant of the derived schema.
+static PLAIN_VERDICT: LazyLock<Map<String, Value>> = LazyLock::new(|| {
+    let Ok(mut generated) = serde_json::to_value(crate::schema::schema_for::<Verdict>()) else {
+        unreachable!("a generated root schema serializes to a JSON object");
+    };
+    portable(&mut generated);
+    let Value::Object(mut schema) = generated else {
+        unreachable!("a generated root schema serializes to a JSON object");
+    };
+    if let Some(required) = schema.get_mut("required").and_then(Value::as_array_mut) {
+        required.retain(|name| name != "data");
+    }
+    schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .expect("the generated Verdict schema declares properties")
+        .remove("data");
+    schema
+});
 
 impl Verdict {
     /// Resolves a `verdict` response format to the schema its responses
@@ -602,25 +1582,7 @@ impl Verdict {
                 ),
             ));
         }
-        let Ok(mut generated) = serde_json::to_value(crate::schema::schema_for::<Self>()) else {
-            unreachable!("a generated root schema serializes to a JSON object");
-        };
-        portable(&mut generated);
-        let Value::Object(mut schema) = generated else {
-            unreachable!("a generated root schema serializes to a JSON object");
-        };
-        let required = |schema: &mut Map<String, Value>| {
-            schema
-                .get_mut("required")
-                .and_then(Value::as_array_mut)
-                .map(|required| required.retain(|name| name != "data"))
-        };
-        required(&mut schema);
-        let properties = schema
-            .get_mut("properties")
-            .and_then(Value::as_object_mut)
-            .expect("the generated Verdict schema declares properties");
-        properties.remove("data");
+        let mut schema = PLAIN_VERDICT.clone();
         let Some(data) = format.data() else {
             return Ok(schema);
         };
@@ -725,7 +1687,7 @@ impl Verdict {
 /// Keys of `properties` and `$defs` are names, never keywords. It runs on
 /// the generated envelope only, before any authored `data` schema is
 /// embedded.
-fn portable(schema: &mut Value) {
+pub(crate) fn portable(schema: &mut Value) {
     let Value::Object(node) = schema else {
         return;
     };
@@ -867,13 +1829,16 @@ mod tests {
         }
     }
 
-    /// A result with every locator kind, drift detail, provenance, tool calls
-    /// with and without returned output, and a skipped step keeps its
-    /// documented wire form; records without a returned size, naming a
-    /// non-built-in tool, or with a non-canonical digest are refused.
+    /// Details with every locator kind, drift detail, provenance, step and
+    /// check tool calls with and without returned output for both
+    /// recipients, and a skipped step keep their documented wire form; a
+    /// historical record without a recipient reads as model-directed and a
+    /// historical requirement as calling no tools; records without a
+    /// returned size, naming a non-built-in tool or an unknown recipient, or
+    /// with a non-canonical digest are refused.
     ///
     /// # Panics
-    /// Panics when the documented result does not round-trip.
+    /// Panics when the documented details do not round-trip.
     #[test]
     fn verification_result_round_trips_documented_outcome() {
         let result = json!({
@@ -893,7 +1858,12 @@ mod tests {
                         {"slot": "contract", "locator": {"region": {"page": 7, "x": 0.5, "y": 1.0, "width": 2.0, "height": 0.25}}}
                     ],
                     "check": {"kind": "assert", "path": "inputs.contract", "operator": "is_not_null"},
-                    "provenance": {"kind": "agent", "route": {"kind": "wyrd_gateway", "deployment": "eu-west"}}
+                    "provenance": {"kind": "agent", "route": {"kind": "wyrd_gateway", "deployment": "eu-west"}},
+                    "tool_calls": [
+                        {"tool": "code.run", "arguments": {"source": "1"}, "recipient": "model", "output_sha256": "d".repeat(64), "returned_bytes": 9},
+                        {"tool": "fs.read", "arguments": {"path": "/inputs/a.txt"}, "recipient": "code", "output_sha256": "e".repeat(64), "returned_bytes": 40},
+                        {"tool": "bifrost.query", "arguments": {"sql": "SELECT 1"}, "recipient": "code", "returned_bytes": 0, "error": "WYRD_PERMISSION_403_DENIED_RBAC: denied"}
+                    ]
                 }, {
                     "id": "stable", "statement": "Inputs are stable",
                     "outcome": "not_applicable", "reason": "step skipped",
@@ -905,16 +1875,71 @@ mod tests {
                     "id": "structure", "status": "skipped", "attempts": 0, "duration_ms": 0,
                     "reason": "when was false",
                     "tool_calls": [
-                        {"tool": "fs.read", "arguments": {"path": "/inputs/a.pdf"}, "output_sha256": "c".repeat(64), "returned_bytes": 512},
-                        {"tool": "fs.search", "arguments": {"query": "cap"}, "returned_bytes": 0, "error": "workspace read timed out"}
+                        {"tool": "fs.read", "arguments": {"path": "/inputs/a.pdf"}, "recipient": "model", "output_sha256": "c".repeat(64), "returned_bytes": 512},
+                        {"tool": "fs.search", "arguments": {"query": "cap"}, "recipient": "model", "returned_bytes": 0, "error": "workspace read timed out"}
                     ]
                 }],
                 "evidence": {"contract": {"kind": "file", "sha256": "b".repeat(64), "size_bytes": 4, "format": "pdf"}}
             }
         });
-        let parsed: VerificationResult =
-            serde_json::from_value(result.clone()).expect("documented result");
+        let parsed: VerificationDetails =
+            serde_json::from_value(result.clone()).expect("documented details");
         assert_eq!(serde_json::to_value(&parsed).expect("serialize"), result);
+        let recipients: Vec<ToolRecipient> = parsed.outcome.requirements[0]
+            .tool_calls
+            .iter()
+            .map(|call| call.recipient)
+            .collect();
+        assert_eq!(
+            recipients,
+            [
+                ToolRecipient::Model,
+                ToolRecipient::Code,
+                ToolRecipient::Code
+            ],
+            "new records keep their recipients"
+        );
+        assert!(
+            parsed.outcome.requirements[1].tool_calls.is_empty(),
+            "a requirement without calls carries none"
+        );
+        let typed = parsed
+            .clone()
+            .decode_data::<Map<String, Value>>()
+            .expect("typed");
+        assert_eq!(
+            typed.outcome.requirements[0].tool_calls, parsed.outcome.requirements[0].tool_calls,
+            "custom-data decoding keeps check tool calls"
+        );
+        let mut historical = result.clone();
+        for call in historical["outcome"]["steps"][0]["tool_calls"]
+            .as_array_mut()
+            .expect("calls")
+        {
+            call.as_object_mut().expect("record").remove("recipient");
+        }
+        historical["outcome"]["requirements"][0]
+            .as_object_mut()
+            .expect("requirement")
+            .remove("tool_calls");
+        let historical: VerificationDetails =
+            serde_json::from_value(historical).expect("historical details");
+        assert!(
+            historical.outcome.steps[0]
+                .tool_calls
+                .iter()
+                .all(|call| call.recipient == ToolRecipient::Model),
+            "a historical record without a recipient was model-directed"
+        );
+        assert!(
+            historical.outcome.requirements[0].tool_calls.is_empty(),
+            "a historical requirement has no tool calls"
+        );
+        assert_eq!(
+            serde_json::to_value(&historical.outcome.steps[0].tool_calls[0]).expect("record")["recipient"],
+            "model",
+            "a newly emitted record names its recipient"
+        );
         assert!(
             serde_json::from_value::<Verdict>(
                 json!({"outcome": "passed", "reason": "ok", "citations": [], "score": 1})
@@ -925,6 +1950,7 @@ mod tests {
             json!({"tool": "fs.read", "arguments": {}}),
             json!({"tool": "http.fetch", "arguments": {}, "returned_bytes": 0}),
             json!({"tool": "fs.read", "arguments": {}, "output_sha256": "C".repeat(64), "returned_bytes": 1}),
+            json!({"tool": "fs.read", "arguments": {}, "recipient": "python", "returned_bytes": 0}),
         ] {
             assert!(
                 serde_json::from_value::<ToolCallRecord>(record.clone()).is_err(),
@@ -999,6 +2025,207 @@ mod tests {
         let problem = serde_json::to_string(&error.problem()).expect("problem");
         assert!(!problem.contains("customer-secret"), "{problem}");
         assert!(!error.to_string().contains("customer-secret"), "{error}");
+    }
+
+    /// The full stored record of an execution judging every outcome kind:
+    /// failed custom data, drift detail, citations, an inline Agent check
+    /// whose named `response_format` only a compiler resolves, steps, and
+    /// evidence.
+    fn recorded(prompt: &Value) -> Value {
+        json!({
+            "execution_id": "0195a4b8-3c1d-7e00-8000-000000000001",
+            "run_id": "run-1",
+            "verifier": {"kind": "Verifier", "name": "judge", "version": "1.0.0"},
+            "subject": {"kind": "Agent", "name": "drafter", "version": "1.0.0"},
+            "deployment_environment": "prod",
+            "outcome": {
+                "verdict": "failed",
+                "requirements": [{
+                    "id": "grounded", "statement": "Cites the policy", "outcome": "failed",
+                    "reason": "no citation", "actual": {"score": 0.25},
+                    "citations": [{"slot": "policy", "locator": {"page": 2}}],
+                    "data": {"score": 0.25},
+                    "check": {"kind": "agent", "agent": {
+                        "prompt": prompt,
+                        "execution_route": {"kind": "wyrd_gateway", "deployment": "judge"}
+                    }, "inputs": {"answer": "inputs.answer"}},
+                    "provenance": {"kind": "agent", "route": {"kind": "wyrd_gateway", "deployment": "judge"}}
+                }, {
+                    "id": "present", "statement": "Has an answer", "outcome": "passed",
+                    "reason": "present",
+                    "check": {"kind": "assert", "path": "inputs.answer", "operator": "is_not_null"}
+                }, {
+                    "id": "named", "statement": "Judged by the registered Agent",
+                    "outcome": "inconclusive", "reason": "provider refused",
+                    "check": {"kind": "agent", "agent": {"kind": "Agent", "name": "judge", "version": "1.0.0"}}
+                }, {
+                    "id": "stable", "step": "structure", "statement": "Inputs are stable",
+                    "outcome": "not_applicable", "reason": "step skipped",
+                    "detail": {"drift": {"method": "Psi", "features": {}, "verdict": "NoDrift"}},
+                    "check": {"kind": "assert", "path": "inputs.answer", "operator": "is_not_null"}
+                }],
+                "steps": [{"id": "structure", "status": "skipped", "attempts": 0, "duration_ms": 0, "reason": "when was false"}],
+                "evidence": {"answer": {"kind": "json", "value": {"text": "yes"}}}
+            }
+        })
+    }
+
+    /// The portable inline Prompt [`recorded`] judges with, declaring custom
+    /// data through the named `verdict` format.
+    fn portable_prompt() -> Value {
+        json!({
+            "provider": "openai", "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "{{answer}}"}],
+            "response_format": {"kind": "verdict", "data": {
+                "type": "object", "properties": {"score": {"type": "number"}},
+                "required": ["score"], "additionalProperties": false
+            }}
+        })
+    }
+
+    /// The compact result keeps identity and every judgment field, custom
+    /// data and drift detail included, for each outcome kind, and omits the
+    /// check, provenance, steps, and evidence as absent keys rather than
+    /// nulls. Projecting stored details and decoding the stored record
+    /// directly agree; typed data decodes failed requirements and refuses a
+    /// mismatch without changing the decision. The published schema
+    /// declares no configuration field.
+    ///
+    /// # Panics
+    /// Panics when a retained field is lost, an omitted field is present, or
+    /// the projections disagree.
+    #[test]
+    fn compact_results_preserve_judgments_without_configuration() {
+        /// The caller's model of the judge's custom data.
+        #[derive(Debug, PartialEq, Deserialize)]
+        struct Judge {
+            /// The judge's score.
+            score: f64,
+        }
+
+        let record = recorded(&portable_prompt());
+        let mut expected = record.clone();
+        let outcome = expected["outcome"].as_object_mut().expect("outcome");
+        outcome.remove("steps");
+        outcome.remove("evidence");
+        for requirement in outcome["requirements"]
+            .as_array_mut()
+            .expect("requirements")
+        {
+            let fields = requirement.as_object_mut().expect("requirement");
+            fields.remove("check");
+            fields.remove("provenance");
+        }
+        let projected = serde_json::from_value::<VerificationDetails>(record.clone())
+            .expect("details")
+            .compact();
+        assert_eq!(
+            serde_json::to_value(&projected).expect("serialize"),
+            expected
+        );
+        let direct: VerificationResult =
+            serde_json::from_value(record).expect("a compact read of the full record");
+        assert_eq!(direct, projected, "both projections agree");
+        let outcomes: Vec<_> = projected
+            .outcome
+            .requirements
+            .iter()
+            .map(|requirement| requirement.outcome)
+            .collect();
+        assert_eq!(
+            outcomes,
+            [
+                RequirementOutcome::Failed,
+                RequirementOutcome::Passed,
+                RequirementOutcome::Inconclusive,
+                RequirementOutcome::NotApplicable,
+            ]
+        );
+
+        let typed = projected.clone().decode_data::<Judge>().expect("typed");
+        assert_eq!(
+            typed.outcome.requirements[0].data,
+            Some(Judge { score: 0.25 })
+        );
+        assert_eq!(typed.outcome.verdict, projected.outcome.verdict);
+        assert!(projected.decode_data::<BTreeMap<String, String>>().is_err());
+
+        let schema = serde_json::to_value(crate::schema::schema_for::<VerificationResult>())
+            .expect("schema");
+        let definitions = &schema["$defs"];
+        let names = |definition: &str| -> BTreeSet<String> {
+            definitions[definition]["properties"]
+                .as_object()
+                .expect(definition)
+                .keys()
+                .cloned()
+                .collect()
+        };
+        assert_eq!(
+            names("VerificationOutcome"),
+            BTreeSet::from(["verdict".to_owned(), "requirements".to_owned()])
+        );
+        assert!(names("RequirementResult").is_disjoint(&BTreeSet::from([
+            "check".to_owned(),
+            "provenance".to_owned()
+        ])));
+    }
+
+    /// Details keep each inline Agent's authored Prompt, portable and
+    /// native, and a registered Agent reference exactly as recorded, and
+    /// agree with the compact result. Decoding never compiles: a Prompt
+    /// naming a format no compiler resolves still describes what was
+    /// recorded, while the executable form refuses it. Structural integrity
+    /// is still checked.
+    ///
+    /// # Panics
+    /// Panics when the details change a recorded field, compile a Prompt, or
+    /// admit a malformed record.
+    #[test]
+    fn execution_details_preserve_authored_checks_without_compilation() {
+        let native = json!({
+            "provider": "anthropic", "model": "claude", "format": "messages",
+            "body": {"max_tokens": 64, "messages": [{"role": "user", "content": [{"type": "text", "text": "{{answer}}"}]}]},
+            "response_format": "verdict"
+        });
+        let unresolvable = {
+            let mut prompt = portable_prompt();
+            prompt["response_format"] = json!("not-a-format");
+            prompt
+        };
+        for prompt in [portable_prompt(), native, unresolvable.clone()] {
+            let record = recorded(&prompt);
+            let details: VerificationDetails =
+                serde_json::from_value(record.clone()).expect("details decode as recorded");
+            assert_eq!(serde_json::to_value(&details).expect("serialize"), record);
+            let Check::Agent(call) = &details.outcome.requirements[0].check else {
+                panic!("an Agent check stays an Agent check");
+            };
+            assert_eq!(
+                call.agent
+                    .as_inline()
+                    .map(|agent| agent.prompt.as_inline().is_some()),
+                Some(true),
+                "the inline Agent keeps its inline authored Prompt"
+            );
+            assert_eq!(
+                details.outcome.requirements[2].check,
+                serde_json::from_value(record["outcome"]["requirements"][2]["check"].clone())
+                    .expect("registered Agent reference")
+            );
+            let compact: VerificationResult = serde_json::from_value(record).expect("compact");
+            assert_eq!(details.compact(), compact, "identity and judgments agree");
+        }
+        assert!(
+            serde_json::from_value::<
+                VerificationDetails<Map<String, Value>, crate::card::agent::Compiled>,
+            >(recorded(&unresolvable))
+            .is_err(),
+            "the executable form compiles, and refuses the unresolvable format"
+        );
+        let mut malformed = recorded(&portable_prompt());
+        malformed["outcome"]["requirements"][1]["check"]["extra"] = json!(true);
+        assert!(serde_json::from_value::<VerificationDetails>(malformed).is_err());
     }
 
     /// Custom Verdict data obeys the inclusive size and depth bounds: exact

@@ -1,5 +1,5 @@
 use wyrd_client::WyrdClient;
-use wyrd_server::config::BifrostTarget;
+use wyrd_server::config::ServerTarget;
 use wyrd_spec::vala::api::BifrostQueryRequest;
 
 use super::support::PeerJourneyError;
@@ -17,6 +17,105 @@ const FOLLOWERS: [usize; 2] = [1, 2];
 
 /// Index of the pod that publishes the data every Oracle reads.
 const SCRIBE: usize = 3;
+
+/// A remote Analytical stage is CPU work on its follower's shared lanes:
+/// while other work holds every lane on both followers, the stage's
+/// execution and the tasks it spawns queue there as Bifrost work and the
+/// statement does not finish; once the lanes are released it returns every
+/// group.
+///
+/// # Panics
+///
+/// Panics when the stage runs while every follower lane is held, never
+/// queues for one, or the statement does not finish after release.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn remote_stages_wait_for_a_shared_cpu_lane() {
+    Box::pin(prove_remote_stages_wait_for_a_shared_lane())
+        .await
+        .expect("remote stage lane journey");
+}
+
+/// Holds every lane on both followers, runs one grouped statement from the
+/// leader, and releases the lanes.
+///
+/// # Errors
+///
+/// Returns the first claim that broke.
+async fn prove_remote_stages_wait_for_a_shared_lane() -> Result<(), PeerJourneyError> {
+    use wyrd_runtime::resources::Workload;
+
+    let cluster = PeerCluster::start(&[
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostIngest,
+    ])
+    .await?;
+    let table = format!("stage_lanes_{}", uuid::Uuid::now_v7().simple());
+    cluster.register_table(SCRIBE, &table).await?;
+    cluster.ingest_rows(SCRIBE, &table, 0, 12, 3).await?;
+    cluster.ingest_rows(SCRIBE, &table, 0, 12, 3).await?;
+    for index in [LEADER, FOLLOWERS[0], FOLLOWERS[1], SCRIBE] {
+        cluster.refresh_snapshot(index).await?;
+    }
+
+    let mut followers = Vec::new();
+    let mut held = Vec::new();
+    for index in FOLLOWERS {
+        let workloads = cluster.server(index)?.state().resources.workloads().clone();
+        let gateway = workloads.begin(Workload::Gateway, None, None);
+        for _ in 0..workloads.lanes().free() {
+            held.push(workloads.lanes().acquire(gateway.context()).await);
+        }
+        followers.push((workloads, gateway));
+    }
+    let waiting = || {
+        followers
+            .iter()
+            .map(|(workloads, _)| workloads.lanes().waiting())
+            .sum::<usize>()
+    };
+    let sql = format!(
+        "SELECT filter_key, COUNT(*) AS matched FROM bifrost.bifrost.{table} \
+         GROUP BY filter_key ORDER BY filter_key"
+    );
+    let rows = {
+        let mut statement = std::pin::pin!(cluster.execute_sql(LEADER, &sql));
+        let queued = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                tokio::select! {
+                    _ = &mut statement => return false,
+                    () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
+                        if waiting() > 0 {
+                            return true;
+                        }
+                    }
+                }
+            }
+        })
+        .await;
+        if queued != Ok(true) {
+            return Err("no remote stage queued for a held CPU lane".into());
+        }
+        if tokio::time::timeout(std::time::Duration::from_millis(500), &mut statement)
+            .await
+            .is_ok()
+        {
+            return Err("the statement finished while other work held every follower lane".into());
+        }
+        held.clear();
+        tokio::time::timeout(std::time::Duration::from_secs(60), statement)
+            .await
+            .map_err(|_| "the statement did not finish once the follower lanes were released")??
+    };
+    if rows != 3 {
+        return Err(format!("the released statement returned {rows} rows, not 3").into());
+    }
+    drop(followers);
+    cluster.shutdown().await?;
+    Ok(())
+}
 
 /// A distributed graph owns exactly one leased reservation on each follower.
 ///
@@ -44,10 +143,10 @@ async fn graph_lease_owns_exact_resources_for_complete_graph() {
 /// Returns the first scenario failure, which names the claim that broke.
 async fn prove_graph_lease_owns_exact_resources() -> Result<(), PeerJourneyError> {
     let cluster = PeerCluster::start(&[
-        BifrostTarget::Oracle,
-        BifrostTarget::Oracle,
-        BifrostTarget::Oracle,
-        BifrostTarget::Scribe,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostIngest,
     ])
     .await?;
 
@@ -166,10 +265,10 @@ enum TerminalCause {
 /// Returns the first claim that broke.
 async fn prove_terminal_ordering(cause: TerminalCause) -> Result<(), PeerJourneyError> {
     let mut cluster = PeerCluster::start(&[
-        BifrostTarget::Oracle,
-        BifrostTarget::Oracle,
-        BifrostTarget::Oracle,
-        BifrostTarget::Scribe,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostIngest,
     ])
     .await?;
 
@@ -329,10 +428,10 @@ async fn baseline_executes_join_group_sort_and_interchangeable_topology() {
 /// Returns the first claim that broke.
 async fn prove_physical_analytical_baseline() -> Result<(), PeerJourneyError> {
     let mut cluster = PeerCluster::start(&[
-        BifrostTarget::Oracle,
-        BifrostTarget::Oracle,
-        BifrostTarget::Oracle,
-        BifrostTarget::Scribe,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostIngest,
     ])
     .await?;
 
@@ -609,10 +708,10 @@ async fn stage_graph_executes_representative_query_styles() {
 /// Returns the first claim that broke, naming the style.
 async fn prove_representative_query_styles() -> Result<(), PeerJourneyError> {
     let mut cluster = PeerCluster::start(&[
-        BifrostTarget::Oracle,
-        BifrostTarget::Oracle,
-        BifrostTarget::Oracle,
-        BifrostTarget::Scribe,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostIngest,
     ])
     .await?;
 
@@ -1205,10 +1304,10 @@ async fn remote_live_scribe_drop_releases_query() {
 /// Returns the first ending whose release or terminal broke the contract.
 async fn prove_remote_live_scribe_release() -> Result<(), PeerJourneyError> {
     let mut cluster = PeerCluster::start(&[
-        BifrostTarget::Oracle,
-        BifrostTarget::Oracle,
-        BifrostTarget::Oracle,
-        BifrostTarget::Scribe,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostIngest,
     ])
     .await?;
     let api_key = cluster
@@ -1479,10 +1578,10 @@ async fn remote_live_window_blocked_scribe_stops_cleanly() {
 async fn prove_window_blocked_scribe_stop() -> Result<(), PeerJourneyError> {
     let case = "window-blocked Scribe stopped";
     let mut cluster = PeerCluster::start(&[
-        BifrostTarget::Oracle,
-        BifrostTarget::Oracle,
-        BifrostTarget::Oracle,
-        BifrostTarget::Scribe,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostIngest,
     ])
     .await?;
     let api_key = cluster.provision_public_api_key("window-reader").await?;
@@ -1717,10 +1816,10 @@ async fn two_leaders_retry_preaccept_capacity() {
 /// Returns the first claim that broke.
 async fn prove_two_leaders_retry_preaccept_capacity() -> Result<(), PeerJourneyError> {
     let mut cluster = PeerCluster::start_with_slots(&[
-        (BifrostTarget::Oracle, Some(RETRY_LEADER_SLOTS)),
-        (BifrostTarget::Oracle, Some(RETRY_LEADER_SLOTS)),
-        (BifrostTarget::Scribe, None),
-        (BifrostTarget::Oracle, Some(RETRY_RECEIVER_SLOTS)),
+        (ServerTarget::BifrostQuery, Some(RETRY_LEADER_SLOTS)),
+        (ServerTarget::BifrostQuery, Some(RETRY_LEADER_SLOTS)),
+        (ServerTarget::BifrostIngest, None),
+        (ServerTarget::BifrostQuery, Some(RETRY_RECEIVER_SLOTS)),
     ])
     .await?;
     let receiver = cluster.node_id(RETRY_RECEIVER).as_uuid();

@@ -1,0 +1,35 @@
+# Judges the final summary against the document, citing its title.
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: doc-judge
+  version: 1.0.0
+spec:
+  execution_route: {kind: wyrd_gateway, deployment: openai}
+  run_config: {max_iterations: 2}
+  prompt:
+    provider: openai
+    model: gpt-4o
+    messages:
+      - role: user
+        content: "JUDGE-DOC: {{summary}}"
+    response_format:
+      type: object
+      properties:
+        outcome: {type: string, enum: [passed, failed, inconclusive]}
+        reason: {type: string}
+        citations:
+          type: array
+          items:
+            type: object
+            properties:
+              slot: {type: string}
+              locator:
+                type: object
+                properties: {json_pointer: {type: string}}
+                required: [json_pointer]
+                additionalProperties: false
+            required: [slot, locator]
+            additionalProperties: false
+      required: [outcome, reason, citations]
+      additionalProperties: false

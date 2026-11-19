@@ -1,0 +1,26 @@
+# Refused at declaration: a requirement check's Agent selects publish, which
+# only a step Agent may declare.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: check-publishes
+  version: 1.0.0
+spec:
+  inputs:
+    question: {type: json, schema: {type: string}}
+  requirements:
+    - id: judged
+      statement: The question is answered
+      check:
+        kind: agent
+        agent:
+          execution_route: {kind: wyrd_gateway, deployment: openai}
+          tool_names: [publish]
+          prompt:
+            provider: openai
+            model: gpt-4o
+            messages:
+              - role: user
+                content: "NEVER CALLED: {{question}}"
+            response_format: verdict
+        inputs: {question: inputs.question}

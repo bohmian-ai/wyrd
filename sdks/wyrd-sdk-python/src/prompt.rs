@@ -1,5 +1,5 @@
 //! `wyrd.prompt` registration: the shared Skald Prompt classes, plus the
-//! Verdict factory this SDK adds to their `ResponseFormat`.
+//! Verdict and code review factories this SDK adds to their `ResponseFormat`.
 
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
@@ -26,8 +26,15 @@ fn verdict(data: Option<&Bound<'_, PyAny>>) -> WyrdPyResult<ResponseFormat> {
     Ok(ResponseFormat::verdict(Some(schema)))
 }
 
-/// Register the shared Prompt classes on `module` and add `verdict` to its
-/// `ResponseFormat` as a static method, so `ResponseFormat.verdict` and the
+/// The standard code review report format, `code_review`, whose fixed
+/// schema GitHub delivery renders.
+#[pyfunction]
+fn code_review() -> ResponseFormat {
+    ResponseFormat::code_review()
+}
+
+/// Register the shared Prompt classes on `module` and add `verdict` and
+/// `code_review` to its `ResponseFormat` as static methods, so they and the
 /// class's other constructors share one class identity.
 ///
 /// # Errors
@@ -35,11 +42,14 @@ fn verdict(data: Option<&Bound<'_, PyAny>>) -> WyrdPyResult<ResponseFormat> {
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     skald_prompt::register_prompt(module)?;
     let py = module.py();
-    let factory = py
-        .import("builtins")?
-        .getattr("staticmethod")?
-        .call1((wrap_pyfunction!(verdict, module)?,))?;
-    module
-        .getattr("ResponseFormat")?
-        .setattr("verdict", factory)
+    let staticmethod = py.import("builtins")?.getattr("staticmethod")?;
+    let format = module.getattr("ResponseFormat")?;
+    format.setattr(
+        "verdict",
+        staticmethod.call1((wrap_pyfunction!(verdict, module)?,))?,
+    )?;
+    format.setattr(
+        "code_review",
+        staticmethod.call1((wrap_pyfunction!(code_review, module)?,))?,
+    )
 }

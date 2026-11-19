@@ -660,6 +660,74 @@ async fn finish_upload(
     })
 }
 
+/// A File the server itself produced, stored by [`put_file`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredFile {
+    /// The identity naming the File's evidence location, which its
+    /// inventory fact records.
+    pub upload_id: UploadId,
+    /// The stored object's verified descriptor.
+    pub stored: StoredObjectRef,
+}
+
+/// Store `bytes`, a File the server itself produced whose digest is
+/// `sha256`, at a fresh tenant evidence location, and verify it as a
+/// completed upload is verified.
+///
+/// The server already holds the bytes, so no upload session exists: the
+/// size limit, tenant evidence path, backend write, and head verification
+/// of [`file_upload_init`] and [`reconcile_upload`] run without their
+/// session SQL. Recording the File in the object inventory is the caller's.
+///
+/// # Errors
+/// Returns the size-limit refusal, the backend write or head failure, and
+/// the size or encryption refusal of a stored object that does not verify.
+#[instrument(skip(storage, caller, bytes), fields(tenant = %caller.data_tenant_id, %sha256, len = bytes.len()))]
+pub async fn put_file(
+    storage: &StorageHandle,
+    caller: &StorageCaller,
+    sha256: &wyrd_spec::auth::Sha256Hex,
+    bytes: Vec<u8>,
+) -> Result<StoredFile, WyrdError> {
+    let expected = bytes.len() as u64;
+    plan_upload(
+        expected,
+        storage.backend(),
+        storage.multipart_threshold_bytes(),
+    )
+    .map_err(|_| {
+        map_storage_error(StorageError::ArtifactTooLarge {
+            actual: expected,
+            limit: MAX_OBJECT_SIZE_BYTES,
+        })
+    })?;
+    let upload_id = UploadId::new();
+    let validated = tenant_path::evidence(caller.data_tenant_id, sha256, &upload_id);
+    storage
+        .put_object(&validated, bytes)
+        .await
+        .map_err(map_storage_error)?;
+    let head = storage
+        .signer()
+        .head_for_verification(&validated)
+        .await
+        .map_err(map_storage_error)?;
+    if let Some((error, _)) = head_refusal(storage, expected, &head) {
+        return Err(map_storage_error(error));
+    }
+    Ok(StoredFile {
+        upload_id,
+        stored: StoredObjectRef {
+            storage_path: validated.full,
+            size_bytes: head.size_bytes,
+            sha256: base64::engine::general_purpose::STANDARD.encode(sha256.as_bytes()),
+            content_type: head.content_type,
+            sse_marker: head.sse_marker,
+            created_at: chrono::Utc::now(),
+        },
+    })
+}
+
 /// Abort an in-flight upload; an already terminal upload answers
 /// `aborted: false`.
 ///
@@ -818,26 +886,44 @@ pub async fn download_init(
     stored: StoredArtifactEntry,
 ) -> Result<DownloadInitResponse, WyrdError> {
     let validated = validated_download_path(caller, &body)?;
-    let request_ttl_secs = compute_download_ttl(&body, storage.presign_ttl_secs());
-    let get_url = download_url(storage, &validated, request_ttl_secs).await?;
+    let size_bytes = u64::try_from(stored.size_bytes).map_err(|_| {
+        internal_error(
+            "stored artifact size is negative",
+            serde_json::json!({
+                "storage_path": validated.full,
+                "size_bytes": stored.size_bytes,
+            }),
+        )
+    })?;
+    let ttl_secs = compute_download_ttl(&body, storage.presign_ttl_secs());
+    download_plan(storage, &validated, ttl_secs, size_bytes, stored.sha256).await
+}
+
+/// Plan a download of one validated, completed object of `size_bytes` whose
+/// base64 SHA-256 is `sha256`, presigned for `ttl_secs` on a cloud backend.
+///
+/// Every download plan is built here, whichever owner authorized and
+/// resolved the object.
+///
+/// # Errors
+/// Returns the mapped storage error when the backend cannot presign the GET.
+pub async fn download_plan(
+    storage: &StorageHandle,
+    validated: &ValidatedPath,
+    ttl_secs: u32,
+    size_bytes: u64,
+    sha256: String,
+) -> Result<DownloadInitResponse, WyrdError> {
+    let get_url = download_url(storage, validated, ttl_secs).await?;
     let ttl_secs = if storage.backend() == StorageBackendKind::Local {
         0
     } else {
-        request_ttl_secs
+        ttl_secs
     };
-
     Ok(DownloadInitResponse {
         plan: DownloadPlan { get_url, ttl_secs },
-        size_bytes: u64::try_from(stored.size_bytes).map_err(|_| {
-            internal_error(
-                "stored artifact size is negative",
-                serde_json::json!({
-                    "storage_path": validated.full,
-                    "size_bytes": stored.size_bytes,
-                }),
-            )
-        })?,
-        sha256: stored.sha256,
+        size_bytes,
+        sha256,
     })
 }
 
@@ -858,6 +944,20 @@ pub async fn download_local_blob(
     path: String,
 ) -> Result<(BoxStream<'static, Result<Bytes, StorageError>>, u64), WyrdError> {
     let validated = tenant_path::validate(&path, data_tenant_id).map_err(map_tenant_path)?;
+    download_local_object(storage, &validated).await
+}
+
+/// Open an already validated local-mode object for streaming through an
+/// authenticated server route, as [`download_local_blob`] does once it has
+/// validated its caller's path.
+///
+/// # Errors
+/// Returns an internal error on a non-local backend, and the mapped storage
+/// error when the object is absent or cannot be opened.
+pub async fn download_local_object(
+    storage: &StorageHandle,
+    validated: &ValidatedPath,
+) -> Result<(BoxStream<'static, Result<Bytes, StorageError>>, u64), WyrdError> {
     if storage.backend() != StorageBackendKind::Local {
         return Err(internal_error(
             "local download route mounted for non-local backend",
@@ -865,7 +965,7 @@ pub async fn download_local_blob(
         ));
     }
     storage
-        .get_object_stream(&validated)
+        .get_object_stream(validated)
         .await
         .map_err(map_storage_error)
 }
@@ -1528,48 +1628,47 @@ async fn verify_object_head(
             serde_json::json!({ "upload_id": upload_uuid, "expected_size_bytes": row.expected_size_bytes }),
         )
     })?;
+    let Some((error, reason)) = head_refusal(state.storage, expected, head) else {
+        return Ok(());
+    };
+    let error = map_storage_error(error);
+    let error_code = error.code().to_owned();
+    let status_code = i32::from(error.status());
+    mark_failed(
+        state,
+        caller,
+        upload_uuid,
+        validated,
+        row.backend,
+        FailureContext {
+            reason,
+            status_code,
+            error_code: Some(&error_code),
+        },
+    )
+    .await?;
+    Err(error)
+}
+
+/// The refusal a stored object's `head` earns, with the failure reason an
+/// upload session records for it: a size other than `expected`, or no
+/// encryption marker when `storage` requires one.
+fn head_refusal(
+    storage: &StorageHandle,
+    expected: u64,
+    head: &HeadInfo,
+) -> Option<(StorageError, &'static str)> {
     if head.size_bytes != expected {
-        let error = map_storage_error(StorageError::SizeMismatch {
-            expected,
-            actual: head.size_bytes,
-        });
-        let error_code = error.code().to_owned();
-        let status_code = i32::from(error.status());
-        mark_failed(
-            state,
-            caller,
-            upload_uuid,
-            validated,
-            row.backend,
-            FailureContext {
-                reason: "size_mismatch",
-                status_code,
-                error_code: Some(&error_code),
+        return Some((
+            StorageError::SizeMismatch {
+                expected,
+                actual: head.size_bytes,
             },
-        )
-        .await?;
-        return Err(error);
+            "size_mismatch",
+        ));
     }
-    if state.storage.require_encryption() && head.sse_marker.is_none() {
-        let error = map_storage_error(StorageError::EncryptionMissing);
-        let error_code = error.code().to_owned();
-        let status_code = i32::from(error.status());
-        mark_failed(
-            state,
-            caller,
-            upload_uuid,
-            validated,
-            row.backend,
-            FailureContext {
-                reason: "encryption_missing",
-                status_code,
-                error_code: Some(&error_code),
-            },
-        )
-        .await?;
-        return Err(error);
-    }
-    Ok(())
+    (storage.require_encryption() && head.sse_marker.is_none())
+        .then_some((StorageError::EncryptionMissing, "encryption_missing"))
 }
 
 async fn mark_failed(

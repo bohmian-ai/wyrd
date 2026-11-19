@@ -18,6 +18,7 @@ use crate::parquet::variant_residual::{VariantWriter, variant_residual_share};
 use std::path::Path;
 use std::sync::Arc;
 
+use futures_util::FutureExt as _;
 use iceberg::Catalog;
 use iceberg::table::Table;
 use iceberg_compaction_core::compaction::CompactionPlan;
@@ -27,6 +28,7 @@ use iceberg_compaction_core::managed::{
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+use wyrd_runtime::resources::Workload;
 
 use crate::catalog::TenantTableBinding;
 use crate::forge::error::ForgeError;
@@ -249,8 +251,9 @@ impl ForgeManagedRewrite {
     ///
     /// # Errors
     ///
-    /// Returns [`ForgeError::Shutdown`] when the attempt was cancelled before
-    /// the core finished, [`ForgeError::Catalog`] for a core execution failure,
+    /// Returns [`ForgeError::Capacity`] when process pressure refuses the
+    /// rewrite before it starts, [`ForgeError::Shutdown`] when the attempt
+    /// was cancelled before the core finished, [`ForgeError::Catalog`] for a core execution failure,
     /// and [`ForgeError::Invariant`] when the core produced an object this
     /// attempt cannot attribute to itself or a handoff that contradicts itself.
     /// Any of those raised after an object may exist arrives wrapped in
@@ -311,7 +314,25 @@ impl ForgeManagedRewrite {
             &mut equality_deletes,
         );
         let output_view = forge_output_view(table, &policy.data_location)?;
-        let result = match compaction.rewrite(planned.plan, &output_view).await {
+        // Process pressure refuses a new rewrite before it executes, as
+        // retryable capacity like Forge's other local admission: the
+        // durable task retries later rather than holding a worker slot.
+        // An admitted rewrite runs as Bifrost work of its tenant on the
+        // shared CPU lanes, which the partitions DataFusion spawns inherit.
+        let workloads = self.core.resources.workloads();
+        let Some(operation) = workloads
+            .admit(Workload::Bifrost, Some(self.binding.tenant), None)
+            .now_or_never()
+        else {
+            return Err(self.attach_possible_outputs(ForgeError::Capacity {
+                detail: "process memory pressure pauses new Forge rewrites".to_owned(),
+            }));
+        };
+        let rewrite = workloads.lanes().laned(
+            operation.context(),
+            compaction.rewrite(planned.plan, &output_view),
+        );
+        let result = match rewrite.await {
             Ok(result) => result,
             Err(error) => return Err(self.classify_core_failure(&error)),
         };
@@ -488,15 +509,19 @@ async fn record_variant_residual_shares(table: &Table, outputs: &[iceberg::spec:
 /// The pool is a fresh view of the one shared Bifrost governor, so every
 /// reservation the rewrite grows is charged to the same cap Scribe, Oracle,
 /// and transport charge, and every byte returns when the attempt's context and
-/// reservations drop. The shared cap is the only memory bound, and
-/// `forge-spill` keeps `DataFusion`'s
-/// own temp-directory limit. A fresh view per attempt means a failed attempt
-/// releases everything before its retry builds the next one.
+/// reservations drop. The shared cap is the only memory bound. Spill files
+/// go through the attempt's own charged factory under `forge-spill`: its
+/// disk manager keeps `DataFusion`'s default temp-directory limit as the
+/// per-attempt cap, and every written byte is charged to the process scratch
+/// ledger shared with Oracle spill and verification workspaces before it is
+/// written, so a full ledger fails the spill rather than the disk. A fresh
+/// view per attempt means a failed attempt releases everything, its spill
+/// charge included, before its retry builds the next one.
 ///
 /// # Errors
 ///
 /// Returns [`ForgeError::Invariant`] when the spill root is not an existing
-/// directory or the core cannot build the runtime.
+/// directory or the core cannot build the runtime or its spill disk manager.
 fn governed_context_for(
     attempt_id: Uuid,
     cancel: &CancellationToken,
@@ -504,9 +529,20 @@ fn governed_context_for(
     resources: &crate::resources::ForgeResources,
     spill_root: &Path,
 ) -> Result<Arc<ManagedExecutionContext>, ForgeError> {
-    let spill = SpillLease::new(spill_root).map_err(|error| ForgeError::Invariant {
-        detail: format!("Forge spill root is unusable: {error}"),
+    // The factory keeps its disk manager alive for the attempt.
+    let (factory, _) = crate::oracle::spill::charged_spill_factory(
+        spill_root,
+        datafusion::execution::disk_manager::DEFAULT_MAX_TEMP_DIRECTORY_SIZE,
+        resources.scratch(),
+    )
+    .map_err(|error| ForgeError::Invariant {
+        detail: format!("Forge spill disk manager is unusable: {error}"),
     })?;
+    let spill = SpillLease::new(spill_root)
+        .map_err(|error| ForgeError::Invariant {
+            detail: format!("Forge spill root is unusable: {error}"),
+        })?
+        .with_temp_file_factory(factory);
     ManagedExecutionContext::builder()
         .with_attempt_id(AttemptId::from_uuid(attempt_id))
         .with_cancellation(cancel.clone())
@@ -627,16 +663,19 @@ mod tests {
             .disk_manager
             .create_tmp_file("forge-rewrite-spill")
             .expect("the disk manager creates a spill file");
-        let spill_dirs = runtime.disk_manager.temp_dir_paths();
-        assert!(
-            !spill_dirs.is_empty() && spill_dirs.iter().all(|dir| dir.starts_with(spill.path())),
-            "spills land beneath the leased forge-spill root, saw {spill_dirs:?}"
-        );
         assert!(
             spill_file
                 .path()
                 .is_some_and(|path| path.starts_with(spill.path())),
             "a spill file lands beneath the leased forge-spill root"
+        );
+        let mut writer = spill_file.open_writer().expect("a spill writer");
+        std::io::Write::write_all(&mut writer, &[0; 4096]).expect("the spill write fits");
+        drop(writer);
+        assert_eq!(
+            forge.scratch().used(),
+            4096,
+            "spill bytes charge the process scratch ledger"
         );
         let reservation = MemoryConsumer::new("forge-rewrite").register(&runtime.memory_pool);
         reservation
@@ -663,6 +702,11 @@ mod tests {
         drop(spill_file);
         drop(runtime);
         drop(context);
+        assert_eq!(
+            forge.scratch().used(),
+            0,
+            "a deleted spill returns its bytes"
+        );
         let released = roles.snapshot().expect("released snapshot");
         assert_eq!(released.forge_memory_used_bytes, 0);
         assert_eq!(released.governed_memory_used_bytes, 8 * MIB);

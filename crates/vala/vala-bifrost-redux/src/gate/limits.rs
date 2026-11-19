@@ -161,6 +161,15 @@ impl BifrostTransportAdmission {
         self.governor.transport_used_bytes()
     }
 
+    /// Returns the process memory ledger the shared Bifrost cap draws from.
+    ///
+    /// Edge owners that buffer bodies outside Bifrost transport charge this
+    /// ledger directly, so every buffered request byte lands in one budget.
+    #[must_use]
+    pub fn process_memory(&self) -> &wyrd_runtime::resources::ByteLedger {
+        self.governor.process_memory()
+    }
+
     /// Returns the shared Bifrost cap transport competes for.
     #[must_use]
     pub fn limit_bytes(&self) -> usize {

@@ -79,7 +79,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_AUTH_403_PRINCIPAL_ORPHANED` | 403 | The backing Service or Agent card has been soft-deleted | Re-declare the card or use a different principal to obtain a token. |
 | `WYRD_AUTH_403_RECENT_LOGIN_REQUIRED` | 403 | Recent sign-in required | Sign in again with your password or SSO, then create the key within five minutes; an API key or recovery session cannot create one. |
 | `WYRD_AUTH_403_UNREPRESENTABLE_DELEGATION` | 403 | Delegated permissions cannot be represented | The subject's and actor's shared permissions cannot be represented by token scopes, so the exchange issued no token. Exchange with grants whose exact shared authority fits the supported scopes, such as both parties holding the same explicit gateway deployment or model grant. |
-| `WYRD_AUTH_403_WORKLOAD_CONTEXT_REQUIRED` | 403 | Workload context required | This account is restricted to one workload family, so Card-attributed emission and verification need the exact release root. Exchange the key with `workload_uid`, send `x-wyrd-workload-uid`, or use the WyrdState loaded for that release. Generic authorized calls do not need a root. |
+| `WYRD_AUTH_403_WORKLOAD_CONTEXT_REQUIRED` | 403 | Workload context required | This account is restricted to one workload family, so Card-attributed emission needs the exact release root. Exchange the key with `workload_uid`, send `x-wyrd-workload-uid`, or use the WyrdState loaded for that release. Generic authorized calls do not need a root. |
 | `WYRD_AUTH_404_ADMIN_NOT_FOUND` | 404 | Admin resource not found in tenant | Confirm the issuer URL (and subject for bindings) and that the resource exists in the current tenant. |
 | `WYRD_AUTH_404_PRINCIPAL_NOT_FOUND` | 404 | Requested principal not found in tenant | The principal named by the `subject_token` or `actor_token` no longer exists in the current tenant. Re-authenticate both parties and retry the exchange. |
 | `WYRD_AUTH_409_ADMIN_CONFLICT` | 409 | Admin resource already exists or is still referenced | A trusted issuer or workload binding with this key already exists, or the issuer still has live bindings. Use a distinct key, or delete the bindings first (or with --cascade). |
@@ -173,6 +173,19 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_GATEWAY_429_LIMIT_EXCEEDED` | 429 | Gateway limit exceeded | Retry after `details.retry_after_seconds`, reduce concurrency, or ask a tenant administrator to raise the limit. |
 | `WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE` | 502 | Gateway upstream unavailable | Retry with backoff. If failures persist, a tenant administrator should check the deployment's provider, credential, and fallback configuration. |
 | `WYRD_GATEWAY_504_DEADLINE_EXCEEDED` | 504 | Gateway deadline exceeded | Retry with a longer deadline or a smaller request. |
+
+## WYRD_GITHUB
+
+| Code | Status | Title | Fix |
+| --- | ---: | --- | --- |
+| `WYRD_GITHUB_400_INVALID_REQUEST` | 400 | Invalid GitHub request | Send the documented query parameters or JSON body; details.field names the rejected part. |
+| `WYRD_GITHUB_401_WEBHOOK_REFUSED` | 401 | GitHub webhook refused | Configure the GitHub App's webhook secret to equal the deployment's WYRD_GITHUB_WEBHOOK_SECRET. |
+| `WYRD_GITHUB_403_CONNECTION_REFUSED` | 403 | GitHub connection refused | Begin a new connection with POST /v1/integrations/github/connect and finish it in a browser signed in to Wyrd as the same principal, authorizing a GitHub account that can access the installation; details.reason names the refused check. |
+| `WYRD_GITHUB_403_REPOSITORY_INACCESSIBLE` | 403 | GitHub repository not accessible | Select the repository in the tenant's GitHub installation and reconnect, or restore the installation; Wyrd uses a repository only while the installation can reach it and the tenant selected it. |
+| `WYRD_GITHUB_404_NOT_CONNECTED` | 404 | GitHub not connected | Connect the tenant with POST /v1/integrations/github/connect and complete the GitHub installation and authorization in a signed-in browser. |
+| `WYRD_GITHUB_409_CONNECTION_CONFLICT` | 409 | GitHub connection conflict | An installation belongs to at most one tenant and a tenant to one installation: disconnect the existing association first, or begin a new connection when details.reason is connection_changed. |
+| `WYRD_GITHUB_503_NOT_CONFIGURED` | 503 | GitHub integration not configured | Ask the deployment operator to configure the GitHub App (WYRD_GITHUB_* settings) and restart the server; every other Wyrd operation is unaffected. |
+| `WYRD_GITHUB_503_PROVIDER_UNAVAILABLE` | 503 | GitHub unavailable | Retry after the GitHub API recovers; when it persists, check the configured API URL, App credentials and network policy. |
 
 ## WYRD_LOADER
 
@@ -285,6 +298,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_REGISTRY_400_INVALID_VERSION_BLOCK` | 400 | The version block is invalid for this operation | Check the error message for the specific constraint: Service and Agent cards require an exact semver pin; version components must fit i64; a scoped bump must stay within the authored range. |
 | `WYRD_REGISTRY_400_LIST_LIMIT_OUT_OF_RANGE` | 400 | List `limit` is zero or exceeds the per-tenant cap | Pass a `limit` in `1..=LIST_LIMIT_MAX` (currently 200). |
 | `WYRD_REGISTRY_400_MANIFEST_HASH_MISMATCH` | 400 | Artifact manifest hash mismatch | Recompute the JCS manifest hash and retry. |
+| `WYRD_REGISTRY_400_REPOSITORY_IDENTITY_MISSING` | 400 | Repository identity missing | Declare from a checkout whose origin remote is the connected repository, pass --repository &lt;git-remote-url&gt;, or set [repository.spec] repository_id. |
 | `WYRD_REGISTRY_400_REQUIREMENT_NOT_RESOLVABLE_HERE` | 400 | `card_ref.version` is a Requirement; this endpoint accepts a Pin | Resolve the Requirement to a Pin via the future `resolve_card_ref` endpoint, or pass a Pin directly. |
 | `WYRD_REGISTRY_400_SPEC_TOO_LARGE` | 400 | Card spec exceeds MAX_SPEC_BYTES (256 KiB) | Reduce the spec size or split into multiple cards. If artifacts are inlined, move them to an Artifact card with object_store backing. |
 | `WYRD_REGISTRY_400_UNRESOLVED_INLINE_REFERENCE` | 400 | Unresolved inline CardRef | Resolve nested inline file references in the loader before submitting the card. |
@@ -293,6 +307,8 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_REGISTRY_400_VERSION_REQUIRED` | 400 | `metadata.version` is present but empty | Provide a valid semver string (e.g. `"1.0.0"`) or omit `metadata.version` entirely to let the server auto-assign the next version. |
 | `WYRD_REGISTRY_404_CARD_NOT_FOUND` | 404 | No card matches the supplied identity | Check (kind, name, version) or the `card_uid` is correct and the card is declared in the current tenant. |
 | `WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT` | 409 | Idempotency key conflict | Use the original request with this key or choose a new key for different content. |
+| `WYRD_REGISTRY_409_REPOSITORY_IDENTITY_CONFLICT` | 409 | Repository identity conflict | A provider repository keeps one Repository Card family: omit the [repository.metadata] name override, or set it to details.established_name; a name already used by another repository needs a different override. |
+| `WYRD_REGISTRY_409_REPOSITORY_SELECTION_CONFLICT` | 409 | Repository selection changed during declaration | Another declaration selected details.selected first; its Cards stay registered. Read the Repository Card, then declare again to select your policy over it. |
 | `WYRD_REGISTRY_409_SPEC_DRIFT` | 409 | Re-declare with the same identity but a different spec_hash; same-version cards are immutable | Bump `metadata.version` to publish a new spec, or revert your spec to match the declared version. |
 | `WYRD_REGISTRY_410_OPERATION_EXPIRED` | 410 | Declaration operation expired | Start a new declaration with a new idempotency key. |
 | `WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY` | 422 | Card reference could not be resolved | Register the referenced card in the current tenant before submitting this card. |
@@ -323,6 +339,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_SDK_409_BIFROST_CLOSED` | 409 | WyrdState Bifrost writer is closed | Create a new WyrdState and start its Bifrost writer; a shut-down state stays closed to writes. |
 | `WYRD_SDK_409_STATE_CONFIG_FROZEN` | 409 | WyrdState configuration is already fixed | Call configure once, before startup and before opening a Run, or construct another WyrdState for a different configuration. |
 | `WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS` | 409 | An OpenTelemetry provider is already installed | Add each state's Wyrd span, log, and metric exporters to the application's own providers instead of calling start_telemetry. |
+| `WYRD_SDK_409_VERIFICATION_CANCELLED` | 409 | Verification execution was cancelled | Read the execution's accepted evidence, or submit the verification again; a cancelled execution never resumes. |
 | `WYRD_SDK_422_VERIFICATION_DATA_INVALID` | 422 | Verification data does not match the requested type | Match the requested type to the check's declared data schema, use a union or decoder for mixed shapes, or read the result without a type. |
 | `WYRD_SDK_503_TELEMETRY_FLUSH_FAILED` | 503 | Telemetry flush failed | Check the OpenTelemetry exporter's logs and the state's credentials, then retry flush or shutdown. |
 | `WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT` | 504 | Telemetry flush timed out | Check that the Wyrd server's OTLP endpoint is reachable, raise the OpenTelemetry SDK export timeout if spans are large, and retry flush or shutdown. |
@@ -361,7 +378,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_SPEC_400_INVALID_SERVICE_COMPONENT_KIND` | 400 | Invalid Service component kind | Move Verifier, Trigger, Operator, Audit, and Source cards out of Service.components; attach a Verifier with verified_by. |
 | `WYRD_SPEC_400_INVALID_VERIFIER_REF_KIND` | 400 | Invalid Verifier reference kind | Set verified_by[..].verifier to a Verifier CardRef. |
 | `WYRD_SPEC_400_OPERATOR_CONNECTION_UNAVAILABLE` | 400 | Operator connection unavailable | Create or re-enable an active connection of the Operator's provider with this name in the tenant, whose HTTP origin and auth scheme match the Operator. |
-| `WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH` | 400 | Trigger activation does not match Verifier | Attach a schedule Trigger only to a Verifier whose samples slots declare the recorded features it judges; attach a group_end Trigger only to a Verifier with source inputs, reacting through on_verdict_change; supply other evidence through verify or submit. |
+| `WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH` | 400 | Trigger activation does not match Verifier | Attach a schedule Trigger only to a Verifier whose samples slots declare the recorded features it judges; attach a group_end Trigger only to a Verifier with source inputs, reacting through on_verdict_change; use the pull_request Trigger exactly on Repository bindings; supply other evidence through verify or submit. |
 | `WYRD_SPEC_400_UNBOUND_VERIFIER_PEER` | 400 | Unbound Verifier peer | Add the Verifier CardRef to the Service, a Service component, or a submitted Agent verified_by list, or declare the shared Verifier separately. |
 | `WYRD_SPEC_400_VALIDATION` | 400 | Validation failed | Check the submitted Wyrd request fields against the published schema and retry. |
 | `WYRD_SPEC_404_NOT_FOUND` | 404 | Resource not found | Check that the referenced Wyrd resource exists. |
@@ -468,6 +485,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND` | 404 | Bifrost table not found | Create the table via the catalog API before writing or querying. |
 | `WYRD_VALA_404_RUNNING_QUERY_NOT_FOUND` | 404 | Running query not found | Verify the request identity or list currently running queries for the authenticated tenant. |
 | `WYRD_VALA_404_TRACE_NOT_FOUND` | 404 | Trace not found | Confirm the trace_id and that it falls within the queried time window. |
+| `WYRD_VALA_409_BIFROST_BATCH_CONFLICT` | 409 | Batch id already committed with different rows | Another batch already committed this batch_id with different rows. Read the table to learn what was accepted; send new rows under a new batch_id. |
 | `WYRD_VALA_409_BIFROST_COMMIT_CONFLICT` | 409 | Concurrent OLAP commit conflict | Retry the write; another writer committed to the same table concurrently. |
 | `WYRD_VALA_409_BIFROST_COMPACTION_TARGET_MISMATCH` | 409 | Bifrost compaction target mismatch | Retry with the table's registered compaction target, omit it, or register a different table. |
 | `WYRD_VALA_409_BIFROST_COMPACTION_TYPE_MISMATCH` | 409 | Bifrost compaction type mismatch | Retry with the table's registered compaction type, omit it, or register a different table. |
@@ -522,16 +540,23 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_VERIFICATION_400_INPUT_INVALID` | 400 | Invalid verification input | Send `{ verifier_card_uid, card_uid, inputs }` where inputs maps each declared Verifier slot to a json, file, artifact, or trace value; run_id and execution_route_overrides are optional. |
 | `WYRD_VERIFICATION_400_INVALID_TARGET` | 400 | Invalid verification run target | Target an existing binding, or an active Verifier Card UID plus an active subject Card UID in this tenant, whose implementation accepts the requested input. |
 | `WYRD_VERIFICATION_400_INVALID_WINDOW` | 400 | Invalid Drift window | Send a UTC half-open drift_window with start before end spanning at most 31 days. |
+| `WYRD_VERIFICATION_404_APPROVAL_NOT_FOUND` | 404 | Verification approval not found | Read the execution and decide an approval_id listed in its approvals. |
 | `WYRD_VERIFICATION_404_BINDING_NOT_FOUND` | 404 | Verification binding not found | Read the owner Card's card.status.verification.binding_ids and retry with one of those binding IDs. |
 | `WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND` | 404 | Verification execution not found | Use the execution_id returned by POST /v1/verification/enqueue in the same tenant; a just-accepted execution may take a moment to become visible. |
+| `WYRD_VERIFICATION_404_PUBLICATION_NOT_FOUND` | 404 | Verification publication not found | List GET /v1/verification/executions/`{execution_id}`/publications and select a listed name with its exact producer attempt, item_index, and iteration_index. |
 | `WYRD_VERIFICATION_404_TARGET_NOT_FOUND` | 404 | Verification target not found | Use an active Verifier Card UID and an active subject Card UID declared in the caller's tenant. |
+| `WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING` | 409 | Verification approval not pending | An accepted decision is final and an ended execution takes none: read the execution for the occurrence's status, and decide a pending occurrence of a current execution instead. |
 | `WYRD_VERIFICATION_409_BASELINE_LEGACY` | 409 | Verification baseline legacy | Register a new Verifier version so its baseline is refitted under the current format. |
 | `WYRD_VERIFICATION_409_BASELINE_NOT_READY` | 409 | Verification baseline not ready | Poll the Verifier Card's card.status.verification.baseline until it is ready, then retry. |
+| `WYRD_VERIFICATION_409_EVIDENCE_CONFLICT` | 409 | Verification evidence conflict | Accepted evidence is never replaced: republish the original content to replay its receipt, or publish the new content for a new commit. |
+| `WYRD_VERIFICATION_409_EVIDENCE_UNMATCHED` | 409 | Verification evidence unmatched | Check the input name and repository: publish only an input a Verifier bound to the connected repository declares with deferred: true. Nothing was retained, so publish again once a binding subscribes. |
 | `WYRD_VERIFICATION_409_SNAPSHOT_INCOMPLETE` | 409 | Verification snapshot incomplete | Check Bifrost publication for the named source executions, then submit a new turn to the group. |
 | `WYRD_VERIFICATION_409_VERIFIER_NOT_READY` | 409 | Verifier not ready | Poll the Verifier Card's card.status.verification.baseline until it is ready, then retry. |
 | `WYRD_VERIFICATION_413_INPUT_TOO_LARGE` | 413 | Verification input too large | Keep the request body and each evidence file within the Deployment's verification limits, or upload large files through verification.evidence and pass them by digest. |
+| `WYRD_VERIFICATION_421_WRONG_TARGET` | 421 | Verification sent to the wrong target | Nothing of the refused call was recorded: send synchronous verify to a `direct` or `combined` server and queued work (enqueue, webhooks, deferred evidence, approvals, cancellation) to a `worker` or `combined` server; `details.target` names this server's target. |
 | `WYRD_VERIFICATION_422_INPUT_INCOMPATIBLE` | 422 | Verification input incompatible | Supply every feature the Verifier scores, with the value type its baseline or profile expects. |
 | `WYRD_VERIFICATION_422_INPUT_UNSUPPORTED` | 422 | Verification input unsupported | Execute and enqueue run request-scoped Verifiers; a Verifier that judges a scheduled window runs only on its binding schedule. |
+| `WYRD_VERIFICATION_422_TOOL_BUDGET_EXCEEDED` | 422 | Verification tool budget exceeded | Make fewer tool calls per Agent step or check, for example by reducing evidence inside one code.run program, or raise WYRD_VERIFICATION_AGENT_TOOL_MAX_CALLS on the server. |
 | `WYRD_VERIFICATION_429_STAGING_FULL` | 429 | Verification staging is full | Nothing of the refused call was staged: retry the identical call after `details.retry_after_seconds`, or lower the request rate. |
 | `WYRD_VERIFICATION_502_DEPENDENCY_FAILED` | 502 | Verification dependency failed | The agent check's provider failed after its own retries; retry the request deliberately once the provider recovers. |
 | `WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT` | 504 | Verification execution timed out | Reduce the supplied input or the Verifier's judge work so one execution completes within 60 seconds. |

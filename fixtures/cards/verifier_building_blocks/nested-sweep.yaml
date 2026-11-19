@@ -1,0 +1,64 @@
+# Nested tool calls inside array and repeated work: each item of `batch` and
+# each round of `rounds` runs one code.run program that lists its workspace
+# and reads the file it found, the read consuming the listing's answer.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: nested-sweep
+  version: 1.0.0
+spec:
+  description: Every note in the batch and the lead note are read through nested tool calls.
+  inputs:
+    batch: {type: json, schema: {type: array, items: {type: string}}}
+    lead: {type: json, schema: {type: string}}
+  steps:
+    - id: per-note
+      foreach: {items: inputs.batch, max_items: 2}
+      action:
+        kind: agent
+        agent:
+          execution_route: {kind: wyrd_gateway, deployment: openai}
+          tool_names: [fs.list, fs.read, code.run]
+          run_config: {max_iterations: 2}
+          prompt:
+            provider: openai
+            model: gpt-4o
+            messages:
+              - role: user
+                content: "NESTED-ITEM: {{index}}. Read the note."
+            response_format:
+              type: object
+              properties: {read: {type: boolean}}
+              required: [read]
+              additionalProperties: false
+        inputs: {index: item_index}
+        workspace:
+          /inputs/note.json: item
+    - id: rounds
+      repeat:
+        max_iterations: 2
+        until: {path: iteration.output.read, operator: equals, expected: true}
+      action:
+        kind: agent
+        agent:
+          execution_route: {kind: wyrd_gateway, deployment: openai}
+          tool_names: [fs.list, fs.read, code.run]
+          run_config: {max_iterations: 2}
+          prompt:
+            provider: openai
+            model: gpt-4o
+            messages:
+              - role: user
+                content: "NESTED-ROUND: {{round}}. Read the lead note."
+            response_format:
+              type: object
+              properties: {read: {type: boolean}}
+              required: [read]
+              additionalProperties: false
+        inputs: {round: iteration.index}
+        workspace:
+          /inputs/note.json: inputs.lead
+  requirements:
+    - id: lead-read
+      statement: The lead note was read
+      check: {kind: assert, path: steps.rounds.output.read, operator: equals, expected: true}

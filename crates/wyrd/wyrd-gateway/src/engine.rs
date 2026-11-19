@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use serde_json::value::RawValue;
@@ -31,6 +32,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
+use wyrd_runtime::resources::{ByteCharge, LedgerRefusal};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::gateway::{
@@ -40,11 +42,12 @@ use wyrd_spec::gateway::{
 use wyrd_spec::ids::{ModelId, ProviderDeploymentName};
 
 use skald_providers::MediaAnswer;
-use skald_providers::exchange::{self, Exchange};
+use skald_providers::exchange::{self, Exchange, Waits};
 
 use crate::adapter::{BatchAction, IngressDialect, MediaRequest};
 use crate::credential::{CredentialResolver, ProviderSecret};
 use crate::health::DeploymentHealth;
+use crate::request::RequestJson;
 use crate::routing::{CallPlan, PlannedCandidate};
 use crate::snapshot::GatewayTenantSnapshot;
 
@@ -66,7 +69,7 @@ pub struct ProviderAttempt<'a> {
     /// Resolved credential, when the deployment authenticates.
     pub credential: Option<&'a ProviderSecret>,
     /// Operation request body.
-    pub body: &'a Value,
+    pub body: &'a RequestJson,
     /// Route and uploaded files of an Images or Audio call.
     pub media: Option<&'a MediaRequest>,
     /// Lifecycle action of a Batches call.
@@ -81,6 +84,57 @@ pub struct ProviderAttempt<'a> {
     /// Caller cancellation or server drain; a relayed stream observes it
     /// after the answer reaches the caller.
     pub cancel: &'a CancellationToken,
+    /// An empty process memory charge attributed to the call's operation;
+    /// a relayed stream charges each frame it retains as a sibling of it.
+    pub memory: &'a ByteCharge,
+}
+
+/// One complete JSON value, held as its exact text without surrounding
+/// whitespace.
+///
+/// It is either a [`RawValue`] or answer text the adapter validated in the
+/// same pass that read its usage, so every holder carries checked JSON and
+/// relays its text unchanged. It keeps the reader's allocation, spare
+/// capacity included, rather than shrinking the answer into a copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsonAnswer(String);
+
+impl JsonAnswer {
+    /// Takes answer `text` that a full JSON decode of the adapter accepted,
+    /// trimming the surrounding whitespace a [`RawValue`] would not keep.
+    pub(crate) fn validated(text: String) -> Self {
+        let value = text.trim_matches([' ', '\t', '\n', '\r']);
+        if value.len() == text.len() {
+            Self(text)
+        } else {
+            Self(value.into())
+        }
+    }
+
+    /// The JSON text.
+    #[must_use]
+    pub fn get(&self) -> &str {
+        &self.0
+    }
+
+    /// The bytes the text's allocation holds, spare capacity included: what
+    /// retaining the answer actually costs.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.0.capacity()
+    }
+
+    /// Moves the JSON text out.
+    #[must_use]
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl From<Box<RawValue>> for JsonAnswer {
+    fn from(raw: Box<RawValue>) -> Self {
+        Self(Box::<str>::from(raw).into_string())
+    }
 }
 
 /// Successful answer of an attempt, carried to the caller without
@@ -89,7 +143,7 @@ pub struct ProviderAttempt<'a> {
 pub enum ResponseBody {
     /// Complete JSON answer: the provider's bytes for native passthrough, or
     /// the single serialization of a translated body.
-    Json(Box<RawValue>),
+    Json(JsonAnswer),
     /// Server-sent event frames relayed as they arrive.
     Events(EventStream),
     /// Non-JSON media answer, such as a text transcript, bounded by the
@@ -118,6 +172,84 @@ impl ResponseBody {
     }
 }
 
+/// One relayed stream frame: a slice of a charged allocation.
+///
+/// The allocation's process memory charge lives with the allocation, so it
+/// returns only when the last frame sliced from it drops, wherever its
+/// consumer moves it: a queued frame, one the response body is writing, and
+/// one the caller still holds all count.
+#[derive(Debug)]
+pub struct Frame(Bytes);
+
+/// An allocation together with the charge of its capacity, the owner behind
+/// every [`Frame`] sliced from it.
+struct Charged {
+    /// The allocation's bytes.
+    bytes: Vec<u8>,
+    /// The charge of `bytes`' capacity, a sibling of the call's.
+    _charge: ByteCharge,
+}
+
+impl AsRef<[u8]> for Charged {
+    /// The allocation's bytes.
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl Frame {
+    /// Charges `bytes`' allocation once as a sibling of the call's `memory`
+    /// and yields it as frames of at most `piece` bytes, sharing the
+    /// allocation without copying; empty `bytes` yields nothing.
+    ///
+    /// # Errors
+    /// Returns [`LedgerRefusal`] when process memory cannot hold the
+    /// allocation; the caller discards it before any frame exists.
+    pub(crate) fn split(
+        bytes: Vec<u8>,
+        piece: usize,
+        memory: &ByteCharge,
+    ) -> Result<impl Iterator<Item = Self>, LedgerRefusal> {
+        let mut charge = memory.sibling();
+        charge.try_grow(u64::try_from(bytes.capacity()).unwrap_or(u64::MAX))?;
+        let shared = Bytes::from_owner(Charged {
+            bytes,
+            _charge: charge,
+        });
+        let len = shared.len();
+        Ok((0..len)
+            .step_by(piece.max(1))
+            .map(move |start| Self(shared.slice(start..len.min(start + piece.max(1))))))
+    }
+
+    /// Charges a small terminal frame the stream must still deliver, even
+    /// past the limit.
+    pub(crate) fn mandatory(bytes: Vec<u8>, memory: &ByteCharge) -> Self {
+        let mut charge = memory.sibling();
+        charge.grow_infallible(u64::try_from(bytes.capacity()).unwrap_or(u64::MAX));
+        Self(Bytes::from_owner(Charged {
+            bytes,
+            _charge: charge,
+        }))
+    }
+}
+
+impl std::ops::Deref for Frame {
+    type Target = [u8];
+
+    /// The frame's bytes.
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl From<Frame> for Bytes {
+    /// The frame's bytes, still holding its allocation's charge.
+    fn from(frame: Frame) -> Self {
+        frame.0
+    }
+}
+
 /// Incremental answer relayed from one upstream stream.
 ///
 /// The frame channel is bounded, so a slow caller stops upstream reads, and
@@ -128,7 +260,7 @@ impl ResponseBody {
 #[derive(Debug)]
 pub struct EventStream {
     /// Server-sent event bytes in delivery order; closes when the relay ends.
-    pub(crate) frames: mpsc::Receiver<Vec<u8>>,
+    pub(crate) frames: mpsc::Receiver<Frame>,
     /// Set by the relay, before it closes `frames`, once the stream ended
     /// explicitly with success or a delivered terminal error.
     terminated: Arc<AtomicBool>,
@@ -167,6 +299,10 @@ pub struct StreamEnd {
     /// the capture ceiling, had no JSON form, or held the credential, or when
     /// a media stream did not end cleanly.
     pub capture: Option<ResponseCapture>,
+    /// The process memory charge still holding `capture`'s content, a
+    /// sibling of the call's; whoever takes `capture` keeps it until that
+    /// content drops or the outbox takes its custody over.
+    pub custody: Option<ByteCharge>,
     /// When the relay received the last upstream body byte; `None` when no
     /// body byte arrived. Transient, for telemetry only.
     pub last_byte: Option<std::time::Instant>,
@@ -185,7 +321,7 @@ pub struct StreamAborted;
 impl EventStream {
     /// Wraps a relay's `frames`, its `terminated` flag, and its `end`.
     pub(crate) fn new(
-        frames: mpsc::Receiver<Vec<u8>>,
+        frames: mpsc::Receiver<Frame>,
         terminated: Arc<AtomicBool>,
         end: oneshot::Receiver<StreamEnd>,
     ) -> Self {
@@ -213,7 +349,7 @@ impl EventStream {
     ///
     /// Each frame's handoff instant is kept, so the stream's drop reports
     /// when the consumer took the final one.
-    pub async fn recv(&mut self) -> Option<Result<Vec<u8>, StreamAborted>> {
+    pub async fn recv(&mut self) -> Option<Result<Frame, StreamAborted>> {
         if let Some(frame) = self.frames.recv().await {
             self.handed = Some(std::time::Instant::now());
             return Some(Ok(frame));
@@ -436,6 +572,11 @@ pub struct ExecutionTiming {
     /// Send to fully-read body, or to failure, of every ended exchange: the
     /// union of each attempt's retries, summed across sequential attempts.
     pub upstream: Duration,
+    /// The part of [`Self::upstream`] some ended exchange spent waiting for
+    /// its headers, or for its failure when none arrived; the rest is body
+    /// receipt ([`Self::body`]). It includes local pool, connect, and
+    /// runtime work, so it is not remote compute alone.
+    pub headers: Duration,
     /// Send and header instants of the opened stream's exchange, whose body
     /// the relay reads; `None` for a buffered call.
     pub open: Option<(std::time::Instant, std::time::Instant)>,
@@ -450,23 +591,18 @@ impl ExecutionTiming {
     /// headers. Dispatch time outside that union is adapter work. Attempts
     /// run one after another, so summing them keeps the call's union.
     fn attempt(&mut self, dispatch: Duration, exchanges: &[Exchange]) {
-        let mut ended = Vec::new();
-        let mut waited = Vec::new();
-        for exchange in exchanges {
-            match (exchange.ended, exchange.headers) {
-                (Some(end), _) => {
-                    ended.push((exchange.sent, end));
-                    waited.push((exchange.sent, end));
-                }
-                (None, Some(headers)) => {
-                    self.open = Some((exchange.sent, headers));
-                    waited.push((exchange.sent, headers));
-                }
-                (None, None) => {}
-            }
-        }
-        self.upstream += union(&mut ended);
-        self.translate += dispatch.saturating_sub(union(&mut waited));
+        let waits = Waits::of(exchanges);
+        self.upstream += waits.ended;
+        self.headers += waits.headers;
+        self.open = waits.open.or(self.open);
+        self.translate += dispatch.saturating_sub(waits.waited);
+    }
+
+    /// The part of [`Self::upstream`] spent receiving bodies while no ended
+    /// exchange waited for headers.
+    #[must_use]
+    pub fn body(&self) -> Duration {
+        self.upstream.saturating_sub(self.headers)
     }
 
     /// Provider wait until the call's answer head: every ended exchange plus
@@ -491,25 +627,6 @@ impl ExecutionTiming {
     }
 }
 
-/// Total length of the union of `intervals`, each `(start, end)`; an empty
-/// or inverted interval adds nothing.
-fn union(intervals: &mut [(std::time::Instant, std::time::Instant)]) -> Duration {
-    intervals.sort_unstable();
-    let mut total = Duration::ZERO;
-    let mut covered: Option<(std::time::Instant, std::time::Instant)> = None;
-    for &(start, end) in intervals.iter().filter(|(start, end)| end > start) {
-        covered = match covered {
-            Some((from, to)) if start <= to => Some((from, to.max(end))),
-            Some((from, to)) => {
-                total += to - from;
-                Some((start, end))
-            }
-            None => Some((start, end)),
-        };
-    }
-    total + covered.map_or(Duration::ZERO, |(from, to)| to - from)
-}
-
 /// Inputs of one admitted call.
 #[derive(Debug, Clone, Copy)]
 pub struct CallInput<'a> {
@@ -520,7 +637,7 @@ pub struct CallInput<'a> {
     /// Admitted candidates.
     pub plan: &'a CallPlan,
     /// Operation request body.
-    pub body: &'a Value,
+    pub body: &'a RequestJson,
     /// Dialect of `body`.
     pub ingress: IngressDialect,
     /// Route and uploaded files of an Images or Audio call.
@@ -535,6 +652,9 @@ pub struct CallInput<'a> {
     pub deadline: Instant,
     /// Caller cancellation or server drain.
     pub cancel: &'a CancellationToken,
+    /// An empty process memory charge attributed to the call's operation;
+    /// a relayed stream charges each frame it retains as a sibling of it.
+    pub memory: &'a ByteCharge,
 }
 
 /// Dependency-owning gateway execution component.
@@ -597,9 +717,17 @@ impl GatewayEngine {
     ///
     /// Attempts run inside one [`exchange::scope`], so the returned
     /// [`ExecutionTiming`] separates credential, adapter, and provider time.
+    /// In a benchmark process every provider exchange forwards the closed
+    /// classification of the request that admitted the call, so a local
+    /// provider keeps a late call in its cohort; it carries no authority.
     pub async fn execute(&self, input: CallInput<'_>) -> CallExecution {
         let mut timing = ExecutionTiming::default();
-        let mut execution = exchange::scope(self.walk(&input, &mut timing)).await;
+        let forwarded = if wyrd_benchmark::enabled() {
+            wyrd_benchmark::Cohort::of_span(&tracing::Span::current()).headers()
+        } else {
+            reqwest::header::HeaderMap::new()
+        };
+        let mut execution = exchange::scope(forwarded, self.walk(&input, &mut timing)).await;
         execution.timing = timing;
         execution
     }
@@ -772,6 +900,7 @@ impl GatewayEngine {
                 capture: input.capture,
                 deadline: input.deadline,
                 cancel: input.cancel,
+                memory: input.memory,
             })
             .await;
         timing.attempt(dispatching.elapsed(), &exchange::take());
@@ -973,7 +1102,9 @@ mod tests {
     fn completed() -> AttemptResult {
         AttemptResult::Completed {
             body: ResponseBody::Json(
-                RawValue::from_string(r#"{"ok":true}"#.to_owned()).expect("json"),
+                RawValue::from_string(r#"{"ok":true}"#.to_owned())
+                    .expect("json")
+                    .into(),
             ),
             usage: AttemptUsage {
                 provider_usage_json: Some(r#"{"total_tokens":3}"#.to_owned()),
@@ -1096,7 +1227,7 @@ mod tests {
                 tenant: DataTenantId::SYSTEM_OWNER,
                 snapshot: snap,
                 plan: &plan,
-                body: &json!({}),
+                body: &RequestJson::from(json!({})),
                 ingress: IngressDialect::OpenAi,
                 batch: None,
                 media: None,
@@ -1104,6 +1235,7 @@ mod tests {
                 capture: false,
                 deadline: Instant::now() + deadline,
                 cancel,
+                memory: &wyrd_runtime::resources::ByteLedger::new(u64::MAX).empty_charge(),
             })
             .await
     }
@@ -1372,7 +1504,8 @@ mod tests {
     /// Provider wait is subtracted exchange by exchange: a prior attempt's
     /// whole exchange and an opened stream's send-to-headers, while dispatch
     /// time outside every exchange stays adapter work, and the stream's end
-    /// adds its send-to-last-byte. Overlapping retries are waited once.
+    /// adds its send-to-last-byte. Overlapping retries are waited once, and
+    /// ended exchanges split into header wait and body receipt.
     ///
     /// # Panics
     ///
@@ -1399,6 +1532,11 @@ mod tests {
             }],
         );
         assert_eq!(timing.upstream, Duration::from_millis(30));
+        assert_eq!(
+            (timing.headers, timing.body()),
+            (Duration::from_millis(20), Duration::from_millis(10)),
+            "an opened stream's headers are not an ended exchange's"
+        );
         assert_eq!(timing.translate, Duration::from_millis(10 + 20));
         assert_eq!(timing.until_headers(), Duration::from_millis(30 + 100));
         assert_eq!(
@@ -1441,6 +1579,10 @@ mod tests {
         assert_eq!(
             (retried.upstream, retried.translate),
             (Duration::from_millis(40), Duration::from_millis(10))
+        );
+        assert_eq!(
+            (retried.headers, retried.body()),
+            (Duration::from_millis(15), Duration::from_millis(25))
         );
     }
 }

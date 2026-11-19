@@ -5,32 +5,46 @@ use std::time::Instant;
 
 use futures_util::future::BoxFuture;
 use tracing::{Instrument as _, Span};
+use wyrd_runtime::resources::Inherited;
 use wyrd_spec::vala::api::QueryClass;
 
-/// Carries the spawning task's span into every task `DataFusion` spawns.
+/// Carries the spawning task's span and CPU lanes into every task
+/// `DataFusion` spawns.
 ///
 /// `DataFusion` runs partitions, repartitioning, and coalescing on its own
 /// spawned tasks, which start with no span. Without this, work a query plan
 /// does on those tasks, such as a remote peer fragment, would be a separate
-/// trace root rather than child work of the query that caused it.
+/// trace root rather than child work of the query that caused it. Work
+/// spawned from laned execution also runs on the process CPU lanes as the
+/// same work, so a plan's parallel partitions share CPU with every other
+/// workload instead of running beside the lane its root holds.
 struct QuerySpanJoinSetTracer;
 
 impl datafusion::common::runtime::JoinSetTracer for QuerySpanJoinSetTracer {
-    /// Instruments a spawned future with the span current at spawn time.
+    /// Instruments a spawned future with the span current at spawn time,
+    /// and runs it on the spawner's lanes when the spawner is laned.
     fn trace_future(
         &self,
         future: BoxFuture<'static, Box<dyn Any + Send>>,
     ) -> BoxFuture<'static, Box<dyn Any + Send>> {
-        Box::pin(future.instrument(Span::current()))
+        let future = future.instrument(Span::current());
+        match Inherited::current() {
+            Some(inherited) => Box::pin(inherited.laned(future)),
+            None => Box::pin(future),
+        }
     }
 
-    /// Runs a spawned blocking closure inside the span current at spawn time.
+    /// Runs a spawned blocking closure inside the span current at spawn time,
+    /// on a lane of the spawner's when the spawner is laned.
     fn trace_block(
         &self,
         block: Box<dyn FnOnce() -> Box<dyn Any + Send> + Send>,
     ) -> Box<dyn FnOnce() -> Box<dyn Any + Send> + Send> {
         let span = Span::current();
-        Box::new(move || span.in_scope(block))
+        match Inherited::current() {
+            Some(inherited) => Box::new(move || inherited.run_blocking(|| span.in_scope(block))),
+            None => Box::new(move || span.in_scope(block)),
+        }
     }
 }
 
@@ -499,6 +513,102 @@ pub fn record_exchange_transfer(batches: u64, bytes: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A multi-partition plan run inside laned Bifrost work evaluates its
+    /// partitions on tasks `DataFusion` spawns, and each of those runs on the
+    /// process lanes as the same work rather than beside them, before and
+    /// after a hash repartition and through a sort.
+    ///
+    /// # Panics
+    /// Panics when the query fails or a spawned partition runs unlaned or as
+    /// other work.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn spawned_query_partitions_run_on_the_spawners_lanes() {
+        use std::sync::{Arc, Mutex};
+
+        use datafusion::arrow::array::{ArrayRef, Int64Array};
+        use datafusion::arrow::datatypes::DataType;
+        use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
+        use datafusion::prelude::{SessionConfig, SessionContext};
+        use wyrd_runtime::resources::{ProcessResources, WorkContext, Workload};
+
+        /// The work contexts one probe observed.
+        type Seen = Arc<Mutex<Vec<Option<WorkContext>>>>;
+
+        install_query_span_propagation();
+        let process = ProcessResources::new(std::num::NonZeroUsize::MIN, 1 << 30, 1 << 30);
+        let operation = process.workloads().begin(Workload::Bifrost, None, None);
+        let probe = |name: &str, seen: &Seen| {
+            let recorded = Arc::clone(seen);
+            create_udf(
+                name,
+                vec![DataType::Int64],
+                DataType::Int64,
+                Volatility::Volatile,
+                Arc::new(move |args: &[ColumnarValue]| {
+                    recorded.lock().expect("probe").push(WorkContext::current());
+                    Ok(args[0].clone())
+                }),
+            )
+        };
+        let (before, after): (Seen, Seen) = (Arc::default(), Arc::default());
+        let session =
+            SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
+        session.register_udf(probe("before_exchange", &before));
+        session.register_udf(probe("after_exchange", &after));
+        let rows: ArrayRef = Arc::new(Int64Array::from_iter_values(0..4096));
+        session
+            .register_batch(
+                "numbers",
+                datafusion::arrow::record_batch::RecordBatch::try_from_iter([("n", rows)])
+                    .expect("batch"),
+            )
+            .expect("table");
+        // The probe runs before the hash exchange and again after the final
+        // aggregate, whose output partitions then sort and merge.
+        let frame = session
+            .sql(
+                "SELECT after_exchange(k) AS k, c FROM \
+                 (SELECT before_exchange(n) % 7 AS k, count(*) AS c FROM numbers GROUP BY 1) \
+                 ORDER BY c, k",
+            )
+            .await
+            .expect("plan");
+        let plan = frame
+            .clone()
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        let shape = datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(true)
+            .to_string();
+        for operator in ["RepartitionExec", "SortExec"] {
+            assert!(shape.contains(operator), "{operator} in {shape}");
+        }
+        // Started and polled the way Oracle executes every query, with the
+        // stream collected by an unlaned consumer.
+        let context = operation.context();
+        let task = frame.task_ctx();
+        let batches =
+            super::super::laned_execution(process.workloads().lanes().clone(), operation, || {
+                datafusion::physical_plan::execute_stream(plan, Arc::new(task))
+                    .map_err(|error| super::super::map_datafusion_error(&error))
+            })
+            .await
+            .expect("the query starts");
+        datafusion::physical_plan::common::collect(batches)
+            .await
+            .expect("query runs");
+
+        for (side, seen) in [("before", &before), ("after", &after)] {
+            let seen = seen.lock().expect("probe");
+            assert!(!seen.is_empty(), "the probe {side} the exchange ran");
+            assert!(
+                seen.iter().all(|current| *current == Some(context)),
+                "every partition {side} the exchange ran laned as the query's work: {seen:?}"
+            );
+        }
+    }
 
     /// `record_peer_attempt` emits the closed peer-attempt counter with both the
     /// outcome and error-class labels.

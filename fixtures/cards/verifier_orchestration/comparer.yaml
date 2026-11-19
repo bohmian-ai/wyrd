@@ -1,0 +1,20 @@
+# Compares the first reviews; agree is null when it cannot compare.
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: comparer
+  version: 1.0.0
+spec:
+  execution_route: {kind: wyrd_gateway, deployment: openai}
+  tool_names: []
+  run_config: {max_iterations: 8}
+  prompt:
+    provider: openai
+    model: gpt-4o
+    messages:
+      - role: user
+        content: "COMPARE: {{question}}"
+    response_format:
+      type: object
+      properties: {agree: {type: [boolean, "null"]}}
+      additionalProperties: false

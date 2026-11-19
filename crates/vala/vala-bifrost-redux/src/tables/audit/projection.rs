@@ -50,8 +50,9 @@ pub enum AuditProjectionError {
 /// directly as a Variant when staged, the outcome and subject kind their
 /// stable snake-case tags, and the decision instant is the `created_at` time
 /// column, so a retained row partitions by when the boundary decided rather
-/// than when it was written. The Scribe outbox builds a slice's staged rows
-/// into one batch with [`StagedRow::project`].
+/// than when it was written. The decision's own text moves into its cells,
+/// so the row copies none of it. The Scribe outbox builds a slice's staged
+/// rows into one batch with [`StagedRow::project`].
 ///
 /// # Errors
 ///
@@ -59,7 +60,7 @@ pub enum AuditProjectionError {
 /// Variant limit, and [`AuditProjectionError::Arrow`] when the cells do not
 /// fill the audit schema.
 pub fn stage_audit_event(
-    event: &AuditEvent,
+    event: AuditEvent,
     decided_at: DateTime<Utc>,
 ) -> Result<StagedRow, AuditProjectionError> {
     let detail = event
@@ -75,12 +76,12 @@ pub fn stage_audit_event(
         AuditOutcome::Denied => "denied",
     };
     let mut cells = vec![
-        Cell::text(event.trace_id.as_deref()),
-        Cell::text(Some(event.operation.as_str())),
-        Cell::text(Some(event.resource.as_str())),
+        Cell::text(event.trace_id),
+        Cell::text(Some(event.operation)),
+        Cell::text(Some(event.resource)),
         Cell::text(event.card_ref.as_ref().map(ToString::to_string)),
         Cell::text(Some(event.sub_principal_kind.as_str())),
-        Cell::text(Some(event.permission.as_str())),
+        Cell::text(Some(event.permission)),
         Cell::text(Some(outcome)),
         Cell::Variant(detail),
         Cell::text(event.credential_id.map(|id| id.to_string())),
@@ -90,7 +91,7 @@ pub fn stage_audit_event(
     cells.extend([
         Cell::text(Some(event.sub_principal_id.to_string())),
         Cell::text(Some(event.act_principal_id.to_string())),
-        Cell::text(Some(event.request_id.as_str())),
+        Cell::text(Some(event.request_id.into_inner())),
     ]);
     Ok(StagedRow::new(Arc::clone(&AUDIT_SCHEMA), cells)?)
 }
@@ -114,7 +115,7 @@ mod tests {
     ///
     /// Panics when the decision cannot be staged or built.
     fn project(event: &AuditEvent, decided_at: DateTime<Utc>) -> RecordBatch {
-        let row = stage_audit_event(event, decided_at).expect("valid projection");
+        let row = stage_audit_event(event.clone(), decided_at).expect("valid projection");
         StagedRow::project(&[row]).expect("one row builds")
     }
 
@@ -186,6 +187,102 @@ mod tests {
             .downcast_ref::<TimestampMicrosecondArray>()
             .expect("created_at column");
         assert_eq!(row.schema().field(9).name(), CREATED_AT);
+        assert_eq!(time.value(0), decided_at.timestamp_micros());
+    }
+
+    /// An owned decision moves its text into the staged row instead of copying
+    /// it: the operation, resource, permission, trace, and request cells hold
+    /// the decision's own buffers, while every cell keeps its canonical value,
+    /// the credential, delegation detail, and carried pair, and the decision
+    /// time.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a cell copies the decision's text or differs from the
+    /// decision.
+    #[test]
+    fn owned_decision_preserves_canonical_row_and_attribution() {
+        let credential = Uuid::now_v7();
+        let attribution = Attribution {
+            sub_principal_id: PrincipalId::new(Uuid::now_v7()),
+            act_principal_id: PrincipalId::new(Uuid::now_v7()),
+        };
+        let mut event = AuditEvent::new(
+            RequestId::parse(&Uuid::now_v7().to_string()).expect("a v7 request id"),
+            Some("4bf92f3577b34da6a3ce929d0e0e4736".to_owned()),
+            "cards.update".to_owned(),
+            "card:model/fraud/1.0.0".to_owned(),
+            None,
+            attribution,
+            PrincipalKindTag::User,
+            "cards:write".to_owned(),
+            AuditOutcome::Allowed,
+        );
+        event.credential_id = Some(credential);
+        event.detail = Some(wyrd_spec::vala::AuditDetail::OracleAdmissionRecovery {
+            expired_lease_count: 1,
+            active_lease_count: 2,
+            interactive_slots: 3,
+            analytical_slots: 4,
+            total_slots: 7,
+        });
+        let decided_at = Utc
+            .timestamp_micros(1_700_000_000_000_011)
+            .single()
+            .expect("valid test timestamp");
+        let expected = event.clone();
+        let buffers = [
+            (
+                "trace_id",
+                event.trace_id.as_deref().expect("trace").as_ptr(),
+            ),
+            ("operation", event.operation.as_ptr()),
+            ("resource", event.resource.as_ptr()),
+            ("permission", event.permission.as_ptr()),
+            (WYRD_REQUEST_ID, event.request_id.as_str().as_ptr()),
+        ];
+
+        let row = stage_audit_event(event, decided_at).expect("valid projection");
+
+        for (name, buffer) in buffers {
+            assert_eq!(
+                row.text(name).expect("text cell").as_ptr(),
+                buffer,
+                "{name} moves the decision's own text"
+            );
+        }
+        let batch = StagedRow::project(&[&row]).expect("one row builds");
+        let text = |name: &str| row.text(name).map(str::to_owned);
+        assert_eq!(text("trace_id"), expected.trace_id);
+        assert_eq!(text("operation"), Some(expected.operation));
+        assert_eq!(text("resource"), Some(expected.resource));
+        assert_eq!(text("permission"), Some(expected.permission));
+        assert_eq!(text("sub_principal_kind").as_deref(), Some("user"));
+        assert_eq!(text("outcome").as_deref(), Some("allowed"));
+        assert_eq!(text(CREDENTIAL_ID), Some(credential.to_string()));
+        assert_eq!(
+            text(SUB_PRINCIPAL_ID),
+            Some(attribution.sub_principal_id.to_string())
+        );
+        assert_eq!(
+            text(ACT_PRINCIPAL_ID),
+            Some(attribution.act_principal_id.to_string())
+        );
+        assert_eq!(
+            text(WYRD_REQUEST_ID).as_deref(),
+            Some(expected.request_id.as_str())
+        );
+        let canonical =
+            wyrd_spec::vala::audit_detail_canonical_json(expected.detail.as_ref().expect("detail"));
+        assert_eq!(
+            variant_cell_to_json(batch.column(7).as_ref(), 0).expect("decodes"),
+            serde_json::from_str::<serde_json::Value>(&canonical).expect("canonical JSON")
+        );
+        let time = batch
+            .column(9)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("created_at column");
         assert_eq!(time.value(0), decided_at.timestamp_micros());
     }
 

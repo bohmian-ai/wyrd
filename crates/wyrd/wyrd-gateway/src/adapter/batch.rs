@@ -8,8 +8,9 @@
 use std::collections::BTreeSet;
 use std::fmt::{self, Debug, Formatter};
 
+use serde::Serialize;
 use serde_json::Value;
-use skald_providers::{OpenAiBatchRoute, UploadContent, UploadFile};
+use skald_providers::{OpenAiBatchRoute, RequestBody, UploadContent, UploadFile};
 use wyrd_spec::gateway::{GatewayContractError, ModelRef};
 
 /// Endpoints a batch line may target.
@@ -118,15 +119,51 @@ impl BatchInput {
 
     /// Serializes the lines as JSONL with every body's model set to the
     /// deployment's `native` model identifier.
+    ///
+    /// Each line is written straight into a file buffer reserved from the
+    /// lines' length hints with its body's model applied as it serializes, so
+    /// no line is copied or encoded twice.
     fn native(&self, native: &str) -> Vec<u8> {
-        let mut bytes = Vec::new();
+        let hint = self
+            .lines
+            .iter()
+            .map(|line| RequestBody::from(line).len_hint() + native.len() + 1)
+            .sum();
+        let mut bytes = Vec::with_capacity(hint);
         for line in &self.lines {
-            let mut line = line.clone();
-            line["body"]["model"] = Value::String(native.to_owned());
-            bytes.extend_from_slice(line.to_string().as_bytes());
+            serde_json::to_writer(&mut bytes, &NativeLine { line, native })
+                .expect("a parsed JSON line serializes");
             bytes.push(b'\n');
         }
         bytes
+    }
+}
+
+/// One parsed batch line serialized with its body's model set to `native`.
+struct NativeLine<'a> {
+    /// The line as parsed: an object whose `body` is an object.
+    line: &'a Value,
+    /// The deployment's native model identifier.
+    native: &'a str,
+}
+
+impl Serialize for NativeLine<'_> {
+    /// Serializes every member as parsed except `body`, which serializes
+    /// through [`RequestBody`] with the native model applied.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let Value::Object(members) = self.line else {
+            return self.line.serialize(serializer);
+        };
+        serializer.collect_map(members.iter().map(|(name, value)| {
+            let value = match value {
+                Value::Object(body) if name == "body" => RequestBody::Object {
+                    members: body,
+                    model: Some(self.native),
+                },
+                value => RequestBody::Json(value),
+            };
+            (name, value)
+        }))
     }
 }
 

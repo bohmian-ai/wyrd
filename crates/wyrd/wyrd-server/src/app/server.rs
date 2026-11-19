@@ -13,7 +13,7 @@ use wyrd_tonic::tonic::transport::server::Router as TonicRouter;
 use wyrd_tonic::tonic_health::server::HealthReporter;
 
 use crate::app::BootExit;
-use crate::app::metrics::{install_recorder, metrics_router, serve_metrics};
+use crate::app::metrics::{MetricsBackend, metrics_router, serve_metrics};
 use crate::app::serve::serve;
 use crate::app::supervise::{
     TaskExit, TaskId, classify_first_exit_with_shutdown, drain_with_shutdown_hooks, fallible_task,
@@ -24,7 +24,7 @@ use crate::boot::{
 };
 use crate::components::cards::reconciler;
 use crate::components::health::readiness_loop;
-use crate::config::{BifrostTarget, ServeMode, WyrdServerConfig};
+use crate::config::{BifrostRoles, BifrostRuntimeRole, ServeMode, WyrdServerConfig};
 use crate::grpc::{
     GrpcRouterConfig, build_app_grpc, build_peer_grpc, drive_health_status, publish_initial_health,
     serve_grpc_with_listener, serve_peer_grpc_with_listener,
@@ -92,7 +92,10 @@ pub struct WyrdServer {
     /// Private Bifrost peer router, present only for a peer-bearing target.
     peer_router: Option<TonicRouter>,
     reporter: HealthReporter,
-    metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
+    /// The process metrics backend installed before boot, handed to the
+    /// bound server; `None` installs the configured backend when the
+    /// metrics listener starts.
+    metrics: Option<MetricsBackend>,
     extra_workers: Vec<(&'static str, BoxWorker)>,
     #[cfg(feature = "test-support")]
     shutdown_probe: Option<ShutdownTestProbe>,
@@ -105,9 +108,10 @@ impl WyrdServer {
     /// readiness loop drives and the mounted health service come from the
     /// same `health_reporter()` call.
     ///
-    /// Does **not** install the Prometheus recorder — that is a process-global
-    /// side effect and is deferred to [`serve`], which installs it exactly once
-    /// and only when `config.metrics.enabled`. This keeps `new` free of global
+    /// Does **not** install the metrics backend — that is a process-global
+    /// side effect and is deferred to [`serve`], which installs the one
+    /// [`MetricsBackend`] the configuration selects exactly once and only when
+    /// `config.metrics.enabled`. This keeps `new` free of global
     /// side effects, so constructing (or double-constructing) a `WyrdServer`
     /// never touches the global recorder.
     ///
@@ -115,14 +119,18 @@ impl WyrdServer {
     /// Returns [`ServerBootError`] on gRPC router assembly (e.g. missing token
     /// verifier).
     pub fn new(config: WyrdServerConfig, state: AppState) -> Result<Self, ServerBootError> {
-        Self::new_with_metrics_handle(config, state, None)
+        Self::new_with_metrics(config, state, None)
     }
 
-    /// Assemble a server when the process recorder was installed before boot.
-    pub fn new_with_metrics_handle(
+    /// Assemble a server when the process metrics backend was installed
+    /// before boot.
+    ///
+    /// # Errors
+    /// Returns [`ServerBootError`] on gRPC router assembly.
+    pub fn new_with_metrics(
         config: WyrdServerConfig,
         state: AppState,
-        metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
+        metrics: Option<MetricsBackend>,
     ) -> Result<Self, ServerBootError> {
         let (reporter, health_service) = wyrd_tonic::tonic_health::server::health_reporter();
 
@@ -154,7 +162,7 @@ impl WyrdServer {
             grpc_router,
             peer_router,
             reporter,
-            metrics_handle,
+            metrics,
             extra_workers: Vec::new(),
             #[cfg(feature = "test-support")]
             shutdown_probe: None,
@@ -280,7 +288,9 @@ impl WyrdServer {
     /// until the returned future and its owned server state are dropped.
     pub async fn bind(self, mode: ServeMode) -> Result<BoundServer, BootExit> {
         wyrd_tls::install_crypto_provider().map_err(|error| BootExit::Other(Box::new(error)))?;
-        let (http_listener, http_addr) = if mode.serves_http() {
+        // The Forge maintenance target opens no public listener.
+        let serves_api = self.config.role.serves_api();
+        let (http_listener, http_addr) = if serves_api && mode.serves_http() {
             let bind = self.config.http.bind;
             let listener = TcpListener::bind(bind).await.map_err(|e| {
                 BootExit::Other(format!("HTTP listener failed to bind {bind}: {e}").into())
@@ -292,7 +302,7 @@ impl WyrdServer {
         } else {
             (None, None)
         };
-        let (grpc_listener, grpc_addr) = if mode.serves_grpc() {
+        let (grpc_listener, grpc_addr) = if serves_api && mode.serves_grpc() {
             let bind = self.config.grpc.bind;
             let listener = TcpListener::bind(bind).await.map_err(|e| {
                 BootExit::Other(format!("gRPC listener failed to bind {bind}: {e}").into())
@@ -353,7 +363,7 @@ impl WyrdServer {
             peer_listener,
             peer_addr,
             reporter: self.reporter,
-            metrics_handle: self.metrics_handle,
+            metrics: self.metrics,
             extra_workers: self.extra_workers,
             #[cfg(feature = "test-support")]
             shutdown_probe: self.shutdown_probe,
@@ -385,7 +395,10 @@ pub struct BoundServer {
     /// Exact address the private peer listener holds.
     peer_addr: Option<SocketAddr>,
     reporter: HealthReporter,
-    metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
+    /// The process metrics backend installed before boot, taken once by the
+    /// metrics listener; `None` installs the configured backend there, and
+    /// with no metrics listener no backend is installed.
+    metrics: Option<MetricsBackend>,
     extra_workers: Vec<(&'static str, BoxWorker)>,
     http_listener: Option<TcpListener>,
     grpc_listener: Option<TcpListener>,
@@ -631,11 +644,9 @@ impl BoundServer {
             .map_err(|e| BootExit::Other(Box::new(e)))?;
             set.spawn(scheduler);
         }
-        // `All` owns one bounded Forge worker in addition to the scheduler;
-        // `Server` intentionally schedules maintenance without executing it.
-        // The dedicated `ForgeWorker` process is composed by
-        // `run_forge_worker_process` and never reaches this serving owner.
-        if self.config.role == BifrostTarget::All {
+        // `combined` and `bifrost-maintenance` own one bounded Forge worker in
+        // addition to the scheduler; no other target runs Forge.
+        if BifrostRoles::for_target(self.config.role).contains(&BifrostRuntimeRole::ForgeWorker) {
             let state = self.state.clone();
             let worker = restarting_worker(
                 "forge_worker",
@@ -647,7 +658,32 @@ impl BoundServer {
             set.spawn(worker);
         }
 
-        if let Some(operator) = self.state.postgres.operator_pool() {
+        // GitHub delivery recovery is queued work.
+        if self.state.github.is_some() && self.config.role.runs_queued() {
+            set.spawn(worker_task(
+                TaskId::Worker("github_report_recovery"),
+                crate::components::github::delivery::GithubDeliveries::recover(
+                    self.state.clone(),
+                    shutdown.clone(),
+                ),
+            ));
+            let state = self.state.clone();
+            let shutdown = shutdown.clone();
+            set.spawn(worker_task(
+                TaskId::Worker("github_delivery_recovery"),
+                async move {
+                    crate::components::github::service::GithubConnections::new(&state)
+                        .run_delivery_recovery(shutdown)
+                        .await;
+                },
+            ));
+        }
+        if let Some(operator) = self
+            .state
+            .postgres
+            .operator_pool()
+            .filter(|_| self.config.role.serves_api())
+        {
             set.spawn(worker_task(
                 TaskId::Worker("card_reconciler"),
                 reconciler::run(self.state.clone(), operator, shutdown.clone()),
@@ -720,11 +756,12 @@ impl BoundServer {
             }));
         }
         if let Some(listener) = self.metrics_listener.take() {
-            let handle = match self.metrics_handle.take() {
-                Some(handle) => handle,
-                None => install_recorder().map_err(|e| BootExit::Other(Box::new(e)))?,
+            let backend = match self.metrics.take() {
+                Some(backend) => backend,
+                None => MetricsBackend::install(self.config.metrics.benchmark_snapshot)
+                    .map_err(|e| BootExit::Other(Box::new(e)))?,
             };
-            let router = metrics_router(handle, self.config.metrics.benchmark_snapshot);
+            let router = metrics_router(backend);
             set.spawn(fallible_task(
                 TaskId::Metrics,
                 serve_metrics(router, listener, shutdown.clone()),
@@ -785,7 +822,11 @@ impl BoundServer {
         // work returns immediately even when the supervised drain consumed
         // the whole budget; work still running at the deadline is a lifecycle
         // failure rather than a clean drain.
-        let gateway_drained = self.state.gateway.drain(deadline).await;
+        let gateway_drained = self
+            .state
+            .gateway
+            .drain(self.state.postgres.wyrd(), deadline)
+            .await;
         let mcp_drained = self.state.mcp.drain(deadline).await;
         let hosted_closed = self.state.verification.close_hosted(deadline).await;
         let terminal = match terminal {
@@ -992,12 +1033,12 @@ mod pg_tests {
             config.http.bind = "127.0.0.1:0".parse().expect("static bind is valid");
             config.metrics.enabled = false;
             config.shutdown.drain_ms = 1_000;
-            // The unit shell composes no Forge, and the default `All` target
-            // refuses to run without a retained Forge worker before shutdown
-            // is ever reached. `Server` is the serving target that schedules
-            // maintenance without executing it; it reaches the identical
-            // readiness, transport, Oracle, and Scribe shutdown phases.
-            config.role = BifrostTarget::Server;
+            // The unit shell composes no Forge, and the default `combined`
+            // target refuses to run without a retained Forge worker before
+            // shutdown is ever reached. `direct` runs no Forge role and reaches
+            // the identical readiness, transport, Oracle, and Scribe shutdown
+            // phases.
+            config.role = crate::config::ServerTarget::Direct;
             let probe = ShutdownTestProbe::new(stall);
             let server = WyrdServer::new(config, test_state_with_auth())
                 .expect("test server builds")

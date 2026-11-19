@@ -1,0 +1,1048 @@
+{
+  "source_revision": "4dd767d8f4eb5c20bdffea587e3ba2be1d38eb36",
+  "source_sha256": {
+    "crates/wyrd/wyrd-server/wyrd-ui/packages/ui/src/lib/observe.ts": "8f20ede837b201f29c36c308e86a3dfceb17798fce3c6fe46a20a3eaecfafb2e",
+    "crates/wyrd/wyrd-server/wyrd-ui/packages/ui/src/lib/schemas.ts": "a2ddb2a9c8bf54cf60e2a7b908aa7395507e21f960762c03969a9421c78c7811",
+    "crates/wyrd/wyrd-server/wyrd-ui/packages/ui/src/lib/loaders.ts": "1ce61d105ae9397868c0f6870ee42aa78d675f2a0eba35f7ac689c7f96f9bb5f",
+    "crates/wyrd/wyrd-server/wyrd-ui/packages/ui/src/lib/plot.ts": "339bcd3118aa166c6501bae1a6bd4ce34e868f7e7bdbf0330bb97350475241f7"
+  },
+  "range": {
+    "from": "2026-11-18T12:00:00.000Z",
+    "to": "2026-11-18T13:00:00.000Z"
+  },
+  "notice": "Design extraction, not executed SQL. Example binds must match the benchmark fixture. Dependent counts and labels bind actual preceding results at runtime.",
+  "queries": [
+    {
+      "id": "trace-spans",
+      "family": "traces",
+      "builder": "traceOverviewQueries",
+      "input": {},
+      "depends_on": [],
+      "sql": "SELECT date_bin($3::interval, start_time_unix_nano) AS at, count(*) AS spans FROM bifrost.traces.spans WHERE start_time_unix_nano >= $1::timestamptz AND start_time_unix_nano < $2::timestamptz GROUP BY date_bin($3::interval, start_time_unix_nano) ORDER BY at",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z",
+        "1 minute"
+      ]
+    },
+    {
+      "id": "trace-errors",
+      "family": "traces",
+      "builder": "traceOverviewQueries",
+      "input": {},
+      "depends_on": [],
+      "sql": "SELECT date_bin($3::interval, start_time_unix_nano) AS at, count(*) FILTER (WHERE status_code = 2) AS errors FROM bifrost.traces.spans WHERE start_time_unix_nano >= $1::timestamptz AND start_time_unix_nano < $2::timestamptz GROUP BY date_bin($3::interval, start_time_unix_nano) ORDER BY at",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z",
+        "1 minute"
+      ]
+    },
+    {
+      "id": "trace-duration",
+      "family": "traces",
+      "builder": "traceOverviewQueries",
+      "input": {},
+      "depends_on": [],
+      "sql": "SELECT date_bin($3::interval, start_time_unix_nano) AS at, approx_percentile_cont(duration_nano, 0.95) / 1e6 AS p95, approx_percentile_cont(duration_nano, 0.5) / 1e6 AS p50 FROM bifrost.traces.spans WHERE start_time_unix_nano >= $1::timestamptz AND start_time_unix_nano < $2::timestamptz AND parent_span_id IS NULL GROUP BY date_bin($3::interval, start_time_unix_nano) ORDER BY at",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z",
+        "1 minute"
+      ]
+    },
+    {
+      "id": "trace-totals",
+      "family": "traces",
+      "builder": "traceOverviewQueries",
+      "input": {},
+      "depends_on": [],
+      "sql": "SELECT count(*) AS spans, count(DISTINCT trace_id) AS traces, count(DISTINCT trace_id) FILTER (WHERE status_code = 2) AS error_traces, approx_percentile_cont(duration_nano, 0.95) / 1e6 AS span_p95_ms FROM bifrost.traces.spans WHERE start_time_unix_nano >= $1::timestamptz AND start_time_unix_nano < $2::timestamptz",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z"
+      ]
+    },
+    {
+      "id": "trace-durations",
+      "family": "traces",
+      "builder": "traceOverviewQueries",
+      "input": {},
+      "depends_on": [],
+      "sql": "SELECT approx_percentile_cont(duration_nano, 0.95) / 1e6 AS p95_ms, approx_percentile_cont(duration_nano, 0.5) / 1e6 AS p50_ms FROM bifrost.traces.spans WHERE start_time_unix_nano >= $1::timestamptz AND start_time_unix_nano < $2::timestamptz AND parent_span_id IS NULL",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z"
+      ]
+    },
+    {
+      "id": "trace-facet-service_name",
+      "family": "traces",
+      "builder": "facetQuery",
+      "input": {
+        "column": "service_name"
+      },
+      "depends_on": [],
+      "sql": "SELECT service_name AS value, count(DISTINCT trace_id) AS n FROM bifrost.traces.spans WHERE start_time_unix_nano >= $1::timestamptz AND start_time_unix_nano < $2::timestamptz GROUP BY service_name ORDER BY n DESC, value LIMIT 11",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z"
+      ]
+    },
+    {
+      "id": "trace-facet-name",
+      "family": "traces",
+      "builder": "facetQuery",
+      "input": {
+        "column": "name"
+      },
+      "depends_on": [],
+      "sql": "SELECT name AS value, count(DISTINCT trace_id) AS n FROM bifrost.traces.spans WHERE start_time_unix_nano >= $1::timestamptz AND start_time_unix_nano < $2::timestamptz GROUP BY name ORDER BY n DESC, value LIMIT 11",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z"
+      ]
+    },
+    {
+      "id": "trace-facet-status_code",
+      "family": "traces",
+      "builder": "facetQuery",
+      "input": {
+        "column": "status_code"
+      },
+      "depends_on": [],
+      "sql": "SELECT status_code AS value, count(DISTINCT trace_id) AS n FROM bifrost.traces.spans WHERE start_time_unix_nano >= $1::timestamptz AND start_time_unix_nano < $2::timestamptz GROUP BY status_code ORDER BY n DESC, value LIMIT 11",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z"
+      ]
+    },
+    {
+      "id": "trace-facet-http_response_status_code",
+      "family": "traces",
+      "builder": "facetQuery",
+      "input": {
+        "column": "http_response_status_code"
+      },
+      "depends_on": [],
+      "sql": "SELECT http_response_status_code AS value, count(DISTINCT trace_id) AS n FROM bifrost.traces.spans WHERE start_time_unix_nano >= $1::timestamptz AND start_time_unix_nano < $2::timestamptz GROUP BY http_response_status_code ORDER BY n DESC, value LIMIT 11",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z"
+      ]
+    },
+    {
+      "id": "trace-facet-gen_ai_operation_name",
+      "family": "traces",
+      "builder": "facetQuery",
+      "input": {
+        "column": "gen_ai_operation_name"
+      },
+      "depends_on": [],
+      "sql": "SELECT gen_ai_operation_name AS value, count(DISTINCT trace_id) AS n FROM bifrost.traces.spans WHERE start_time_unix_nano >= $1::timestamptz AND start_time_unix_nano < $2::timestamptz GROUP BY gen_ai_operation_name ORDER BY n DESC, value LIMIT 11",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z"
+      ]
+    },
+    {
+      "id": "trace-list",
+      "family": "traces",
+      "builder": "listQuery",
+      "input": {},
+      "depends_on": [],
+      "sql": "SELECT start_time_unix_nano, name, service_name, duration_nano, status_code, encode(trace_id, 'hex') AS trace_id, encode(span_id, 'hex') AS span_id FROM bifrost.traces.spans WHERE start_time_unix_nano >= $1::timestamptz AND start_time_unix_nano < $2::timestamptz AND parent_span_id IS NULL ORDER BY start_time_unix_nano DESC, encode(trace_id, 'hex') ASC, encode(span_id, 'hex') ASC LIMIT 51",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z"
+      ]
+    },
+    {
+      "id": "trace-counts",
+      "family": "traces",
+      "builder": "countsQuery",
+      "input": {
+        "trace_ids": [
+          "00000000000000000000000000000001",
+          "00000000000000000000000000000002"
+        ],
+        "roots": {
+          "from": 1795003200000,
+          "to": 1795006800000
+        }
+      },
+      "depends_on": [
+        "trace-list"
+      ],
+      "sql": "SELECT encode(trace_id, 'hex') AS trace_id, count(*) AS spans, count(*) FILTER (WHERE status_code = 2) AS errors FROM bifrost.traces.spans WHERE start_time_unix_nano >= $1::timestamptz AND start_time_unix_nano < $2::timestamptz AND trace_id IN (decode($3, 'hex'), decode($4, 'hex')) GROUP BY trace_id",
+      "params": [
+        "2026-11-18T11:00:00.000Z",
+        "2026-11-18T14:00:00.000Z",
+        "00000000000000000000000000000001",
+        "00000000000000000000000000000002"
+      ]
+    },
+    {
+      "id": "verify-list",
+      "family": "verification",
+      "builder": "listQuery",
+      "input": {},
+      "depends_on": [],
+      "sql": "SELECT recorded_at, verifier_card_uid, subject_name, run_id, group_id, service_name, status, verdict, execution_id, subject_kind, subject_version, subject_card_uid, result_id, binding_id, workload_card_uid FROM (SELECT i.execution_id, i.recorded_at, i.verifier_card_uid, i.binding_id, i.group_id, i.origin, i.run_id, i.subject_kind, i.subject_name, i.subject_version, i.subject_card_uid, i.workload_card_uid, i.service_name, i.service_version, i.deployment_environment, r.result_id, r.verdict, r.ended_at, CASE WHEN i.origin = 'direct' THEN CASE WHEN r.result_id IS NOT NULL THEN 'completed' ELSE 'not recorded' END ELSE coalesce(q.status, 'pending') END AS status FROM bifrost.verification.execution_inputs i LEFT JOIN (SELECT execution_id, last_value(status ORDER BY occurred_at, event_id) AS status FROM bifrost.verification.execution_events WHERE event = 'status' AND occurred_at >= $1::timestamptz - INTERVAL '1 hour' GROUP BY execution_id) q ON q.execution_id = i.execution_id LEFT JOIN (SELECT e.execution_id, e.value -> 'terminal' ->> 'result_id' AS result_id FROM bifrost.verification.execution_events e JOIN (SELECT execution_id, max(sequence) AS sequence FROM bifrost.verification.execution_events WHERE event = 'checkpoint' AND occurred_at >= $1::timestamptz - INTERVAL '1 hour' GROUP BY execution_id) l ON l.execution_id = e.execution_id AND l.sequence = e.sequence WHERE e.event = 'checkpoint' AND e.occurred_at >= $1::timestamptz - INTERVAL '1 hour') s ON s.execution_id = i.execution_id LEFT JOIN bifrost.verification.results r ON r.execution_id = i.execution_id AND r.ended_at >= $1::timestamptz - INTERVAL '1 hour' AND (i.origin = 'direct' OR r.result_id = s.result_id)) AS executions WHERE recorded_at >= $1::timestamptz AND recorded_at < $2::timestamptz ORDER BY recorded_at DESC, execution_id ASC LIMIT 51",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z"
+      ]
+    },
+    {
+      "id": "verify-facet-status",
+      "family": "verification",
+      "builder": "facetQuery",
+      "input": {
+        "column": "status"
+      },
+      "depends_on": [],
+      "sql": "SELECT status AS value, count(*) AS n FROM (SELECT i.execution_id, i.recorded_at, i.verifier_card_uid, i.binding_id, i.group_id, i.origin, i.run_id, i.subject_kind, i.subject_name, i.subject_version, i.subject_card_uid, i.workload_card_uid, i.service_name, i.service_version, i.deployment_environment, r.result_id, r.verdict, r.ended_at, CASE WHEN i.origin = 'direct' THEN CASE WHEN r.result_id IS NOT NULL THEN 'completed' ELSE 'not recorded' END ELSE coalesce(q.status, 'pending') END AS status FROM bifrost.verification.execution_inputs i LEFT JOIN (SELECT execution_id, last_value(status ORDER BY occurred_at, event_id) AS status FROM bifrost.verification.execution_events WHERE event = 'status' AND occurred_at >= $1::timestamptz - INTERVAL '1 hour' GROUP BY execution_id) q ON q.execution_id = i.execution_id LEFT JOIN (SELECT e.execution_id, e.value -> 'terminal' ->> 'result_id' AS result_id FROM bifrost.verification.execution_events e JOIN (SELECT execution_id, max(sequence) AS sequence FROM bifrost.verification.execution_events WHERE event = 'checkpoint' AND occurred_at >= $1::timestamptz - INTERVAL '1 hour' GROUP BY execution_id) l ON l.execution_id = e.execution_id AND l.sequence = e.sequence WHERE e.event = 'checkpoint' AND e.occurred_at >= $1::timestamptz - INTERVAL '1 hour') s ON s.execution_id = i.execution_id LEFT JOIN bifrost.verification.results r ON r.execution_id = i.execution_id AND r.ended_at >= $1::timestamptz - INTERVAL '1 hour' AND (i.origin = 'direct' OR r.result_id = s.result_id)) AS executions WHERE recorded_at >= $1::timestamptz AND recorded_at < $2::timestamptz GROUP BY status ORDER BY n DESC, value LIMIT 11",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z"
+      ]
+    },
+    {
+      "id": "verify-facet-verdict",
+      "family": "verification",
+      "builder": "facetQuery",
+      "input": {
+        "column": "verdict"
+      },
+      "depends_on": [],
+      "sql": "SELECT verdict AS value, count(*) AS n FROM (SELECT i.execution_id, i.recorded_at, i.verifier_card_uid, i.binding_id, i.group_id, i.origin, i.run_id, i.subject_kind, i.subject_name, i.subject_version, i.subject_card_uid, i.workload_card_uid, i.service_name, i.service_version, i.deployment_environment, r.result_id, r.verdict, r.ended_at, CASE WHEN i.origin = 'direct' THEN CASE WHEN r.result_id IS NOT NULL THEN 'completed' ELSE 'not recorded' END ELSE coalesce(q.status, 'pending') END AS status FROM bifrost.verification.execution_inputs i LEFT JOIN (SELECT execution_id, last_value(status ORDER BY occurred_at, event_id) AS status FROM bifrost.verification.execution_events WHERE event = 'status' AND occurred_at >= $1::timestamptz - INTERVAL '1 hour' GROUP BY execution_id) q ON q.execution_id = i.execution_id LEFT JOIN (SELECT e.execution_id, e.value -> 'terminal' ->> 'result_id' AS result_id FROM bifrost.verification.execution_events e JOIN (SELECT execution_id, max(sequence) AS sequence FROM bifrost.verification.execution_events WHERE event = 'checkpoint' AND occurred_at >= $1::timestamptz - INTERVAL '1 hour' GROUP BY execution_id) l ON l.execution_id = e.execution_id AND l.sequence = e.sequence WHERE e.event = 'checkpoint' AND e.occurred_at >= $1::timestamptz - INTERVAL '1 hour') s ON s.execution_id = i.execution_id LEFT JOIN bifrost.verification.results r ON r.execution_id = i.execution_id AND r.ended_at >= $1::timestamptz - INTERVAL '1 hour' AND (i.origin = 'direct' OR r.result_id = s.result_id)) AS executions WHERE recorded_at >= $1::timestamptz AND recorded_at < $2::timestamptz GROUP BY verdict ORDER BY n DESC, value LIMIT 11",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z"
+      ]
+    },
+    {
+      "id": "verify-facet-verifier_card_uid",
+      "family": "verification",
+      "builder": "facetQuery",
+      "input": {
+        "column": "verifier_card_uid"
+      },
+      "depends_on": [],
+      "sql": "SELECT verifier_card_uid AS value, count(*) AS n FROM (SELECT i.execution_id, i.recorded_at, i.verifier_card_uid, i.binding_id, i.group_id, i.origin, i.run_id, i.subject_kind, i.subject_name, i.subject_version, i.subject_card_uid, i.workload_card_uid, i.service_name, i.service_version, i.deployment_environment, r.result_id, r.verdict, r.ended_at, CASE WHEN i.origin = 'direct' THEN CASE WHEN r.result_id IS NOT NULL THEN 'completed' ELSE 'not recorded' END ELSE coalesce(q.status, 'pending') END AS status FROM bifrost.verification.execution_inputs i LEFT JOIN (SELECT execution_id, last_value(status ORDER BY occurred_at, event_id) AS status FROM bifrost.verification.execution_events WHERE event = 'status' AND occurred_at >= $1::timestamptz - INTERVAL '1 hour' GROUP BY execution_id) q ON q.execution_id = i.execution_id LEFT JOIN (SELECT e.execution_id, e.value -> 'terminal' ->> 'result_id' AS result_id FROM bifrost.verification.execution_events e JOIN (SELECT execution_id, max(sequence) AS sequence FROM bifrost.verification.execution_events WHERE event = 'checkpoint' AND occurred_at >= $1::timestamptz - INTERVAL '1 hour' GROUP BY execution_id) l ON l.execution_id = e.execution_id AND l.sequence = e.sequence WHERE e.event = 'checkpoint' AND e.occurred_at >= $1::timestamptz - INTERVAL '1 hour') s ON s.execution_id = i.execution_id LEFT JOIN bifrost.verification.results r ON r.execution_id = i.execution_id AND r.ended_at >= $1::timestamptz - INTERVAL '1 hour' AND (i.origin = 'direct' OR r.result_id = s.result_id)) AS executions WHERE recorded_at >= $1::timestamptz AND recorded_at < $2::timestamptz GROUP BY verifier_card_uid ORDER BY n DESC, value LIMIT 11",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z"
+      ]
+    },
+    {
+      "id": "verify-facet-service_name",
+      "family": "verification",
+      "builder": "facetQuery",
+      "input": {
+        "column": "service_name"
+      },
+      "depends_on": [],
+      "sql": "SELECT service_name AS value, count(*) AS n FROM (SELECT i.execution_id, i.recorded_at, i.verifier_card_uid, i.binding_id, i.group_id, i.origin, i.run_id, i.subject_kind, i.subject_name, i.subject_version, i.subject_card_uid, i.workload_card_uid, i.service_name, i.service_version, i.deployment_environment, r.result_id, r.verdict, r.ended_at, CASE WHEN i.origin = 'direct' THEN CASE WHEN r.result_id IS NOT NULL THEN 'completed' ELSE 'not recorded' END ELSE coalesce(q.status, 'pending') END AS status FROM bifrost.verification.execution_inputs i LEFT JOIN (SELECT execution_id, last_value(status ORDER BY occurred_at, event_id) AS status FROM bifrost.verification.execution_events WHERE event = 'status' AND occurred_at >= $1::timestamptz - INTERVAL '1 hour' GROUP BY execution_id) q ON q.execution_id = i.execution_id LEFT JOIN (SELECT e.execution_id, e.value -> 'terminal' ->> 'result_id' AS result_id FROM bifrost.verification.execution_events e JOIN (SELECT execution_id, max(sequence) AS sequence FROM bifrost.verification.execution_events WHERE event = 'checkpoint' AND occurred_at >= $1::timestamptz - INTERVAL '1 hour' GROUP BY execution_id) l ON l.execution_id = e.execution_id AND l.sequence = e.sequence WHERE e.event = 'checkpoint' AND e.occurred_at >= $1::timestamptz - INTERVAL '1 hour') s ON s.execution_id = i.execution_id LEFT JOIN bifrost.verification.results r ON r.execution_id = i.execution_id AND r.ended_at >= $1::timestamptz - INTERVAL '1 hour' AND (i.origin = 'direct' OR r.result_id = s.result_id)) AS executions WHERE recorded_at >= $1::timestamptz AND recorded_at < $2::timestamptz GROUP BY service_name ORDER BY n DESC, value LIMIT 11",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z"
+      ]
+    },
+    {
+      "id": "verify-facet-subject_name",
+      "family": "verification",
+      "builder": "facetQuery",
+      "input": {
+        "column": "subject_name"
+      },
+      "depends_on": [],
+      "sql": "SELECT subject_name AS value, count(*) AS n FROM (SELECT i.execution_id, i.recorded_at, i.verifier_card_uid, i.binding_id, i.group_id, i.origin, i.run_id, i.subject_kind, i.subject_name, i.subject_version, i.subject_card_uid, i.workload_card_uid, i.service_name, i.service_version, i.deployment_environment, r.result_id, r.verdict, r.ended_at, CASE WHEN i.origin = 'direct' THEN CASE WHEN r.result_id IS NOT NULL THEN 'completed' ELSE 'not recorded' END ELSE coalesce(q.status, 'pending') END AS status FROM bifrost.verification.execution_inputs i LEFT JOIN (SELECT execution_id, last_value(status ORDER BY occurred_at, event_id) AS status FROM bifrost.verification.execution_events WHERE event = 'status' AND occurred_at >= $1::timestamptz - INTERVAL '1 hour' GROUP BY execution_id) q ON q.execution_id = i.execution_id LEFT JOIN (SELECT e.execution_id, e.value -> 'terminal' ->> 'result_id' AS result_id FROM bifrost.verification.execution_events e JOIN (SELECT execution_id, max(sequence) AS sequence FROM bifrost.verification.execution_events WHERE event = 'checkpoint' AND occurred_at >= $1::timestamptz - INTERVAL '1 hour' GROUP BY execution_id) l ON l.execution_id = e.execution_id AND l.sequence = e.sequence WHERE e.event = 'checkpoint' AND e.occurred_at >= $1::timestamptz - INTERVAL '1 hour') s ON s.execution_id = i.execution_id LEFT JOIN bifrost.verification.results r ON r.execution_id = i.execution_id AND r.ended_at >= $1::timestamptz - INTERVAL '1 hour' AND (i.origin = 'direct' OR r.result_id = s.result_id)) AS executions WHERE recorded_at >= $1::timestamptz AND recorded_at < $2::timestamptz GROUP BY subject_name ORDER BY n DESC, value LIMIT 11",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z"
+      ]
+    },
+    {
+      "id": "verify-facet-run_id",
+      "family": "verification",
+      "builder": "facetQuery",
+      "input": {
+        "column": "run_id"
+      },
+      "depends_on": [],
+      "sql": "SELECT run_id AS value, count(*) AS n FROM (SELECT i.execution_id, i.recorded_at, i.verifier_card_uid, i.binding_id, i.group_id, i.origin, i.run_id, i.subject_kind, i.subject_name, i.subject_version, i.subject_card_uid, i.workload_card_uid, i.service_name, i.service_version, i.deployment_environment, r.result_id, r.verdict, r.ended_at, CASE WHEN i.origin = 'direct' THEN CASE WHEN r.result_id IS NOT NULL THEN 'completed' ELSE 'not recorded' END ELSE coalesce(q.status, 'pending') END AS status FROM bifrost.verification.execution_inputs i LEFT JOIN (SELECT execution_id, last_value(status ORDER BY occurred_at, event_id) AS status FROM bifrost.verification.execution_events WHERE event = 'status' AND occurred_at >= $1::timestamptz - INTERVAL '1 hour' GROUP BY execution_id) q ON q.execution_id = i.execution_id LEFT JOIN (SELECT e.execution_id, e.value -> 'terminal' ->> 'result_id' AS result_id FROM bifrost.verification.execution_events e JOIN (SELECT execution_id, max(sequence) AS sequence FROM bifrost.verification.execution_events WHERE event = 'checkpoint' AND occurred_at >= $1::timestamptz - INTERVAL '1 hour' GROUP BY execution_id) l ON l.execution_id = e.execution_id AND l.sequence = e.sequence WHERE e.event = 'checkpoint' AND e.occurred_at >= $1::timestamptz - INTERVAL '1 hour') s ON s.execution_id = i.execution_id LEFT JOIN bifrost.verification.results r ON r.execution_id = i.execution_id AND r.ended_at >= $1::timestamptz - INTERVAL '1 hour' AND (i.origin = 'direct' OR r.result_id = s.result_id)) AS executions WHERE recorded_at >= $1::timestamptz AND recorded_at < $2::timestamptz GROUP BY run_id ORDER BY n DESC, value LIMIT 11",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z"
+      ]
+    },
+    {
+      "id": "verify-facet-group_id",
+      "family": "verification",
+      "builder": "facetQuery",
+      "input": {
+        "column": "group_id"
+      },
+      "depends_on": [],
+      "sql": "SELECT group_id AS value, count(*) AS n FROM (SELECT i.execution_id, i.recorded_at, i.verifier_card_uid, i.binding_id, i.group_id, i.origin, i.run_id, i.subject_kind, i.subject_name, i.subject_version, i.subject_card_uid, i.workload_card_uid, i.service_name, i.service_version, i.deployment_environment, r.result_id, r.verdict, r.ended_at, CASE WHEN i.origin = 'direct' THEN CASE WHEN r.result_id IS NOT NULL THEN 'completed' ELSE 'not recorded' END ELSE coalesce(q.status, 'pending') END AS status FROM bifrost.verification.execution_inputs i LEFT JOIN (SELECT execution_id, last_value(status ORDER BY occurred_at, event_id) AS status FROM bifrost.verification.execution_events WHERE event = 'status' AND occurred_at >= $1::timestamptz - INTERVAL '1 hour' GROUP BY execution_id) q ON q.execution_id = i.execution_id LEFT JOIN (SELECT e.execution_id, e.value -> 'terminal' ->> 'result_id' AS result_id FROM bifrost.verification.execution_events e JOIN (SELECT execution_id, max(sequence) AS sequence FROM bifrost.verification.execution_events WHERE event = 'checkpoint' AND occurred_at >= $1::timestamptz - INTERVAL '1 hour' GROUP BY execution_id) l ON l.execution_id = e.execution_id AND l.sequence = e.sequence WHERE e.event = 'checkpoint' AND e.occurred_at >= $1::timestamptz - INTERVAL '1 hour') s ON s.execution_id = i.execution_id LEFT JOIN bifrost.verification.results r ON r.execution_id = i.execution_id AND r.ended_at >= $1::timestamptz - INTERVAL '1 hour' AND (i.origin = 'direct' OR r.result_id = s.result_id)) AS executions WHERE recorded_at >= $1::timestamptz AND recorded_at < $2::timestamptz GROUP BY group_id ORDER BY n DESC, value LIMIT 11",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z"
+      ]
+    },
+    {
+      "id": "verify-chart-verdict",
+      "family": "verification",
+      "builder": "executionsBy",
+      "input": {},
+      "depends_on": [],
+      "sql": "SELECT date_bin($3::interval, recorded_at) AS at, coalesce(verdict, 'no verdict') AS verdict, count(*) AS executions FROM (SELECT i.execution_id, i.recorded_at, i.verifier_card_uid, i.binding_id, i.group_id, i.origin, i.run_id, i.subject_kind, i.subject_name, i.subject_version, i.subject_card_uid, i.workload_card_uid, i.service_name, i.service_version, i.deployment_environment, r.result_id, r.verdict, r.ended_at, CASE WHEN i.origin = 'direct' THEN CASE WHEN r.result_id IS NOT NULL THEN 'completed' ELSE 'not recorded' END ELSE coalesce(q.status, 'pending') END AS status FROM bifrost.verification.execution_inputs i LEFT JOIN (SELECT execution_id, last_value(status ORDER BY occurred_at, event_id) AS status FROM bifrost.verification.execution_events WHERE event = 'status' AND occurred_at >= $1::timestamptz - INTERVAL '1 hour' GROUP BY execution_id) q ON q.execution_id = i.execution_id LEFT JOIN (SELECT e.execution_id, e.value -> 'terminal' ->> 'result_id' AS result_id FROM bifrost.verification.execution_events e JOIN (SELECT execution_id, max(sequence) AS sequence FROM bifrost.verification.execution_events WHERE event = 'checkpoint' AND occurred_at >= $1::timestamptz - INTERVAL '1 hour' GROUP BY execution_id) l ON l.execution_id = e.execution_id AND l.sequence = e.sequence WHERE e.event = 'checkpoint' AND e.occurred_at >= $1::timestamptz - INTERVAL '1 hour') s ON s.execution_id = i.execution_id LEFT JOIN bifrost.verification.results r ON r.execution_id = i.execution_id AND r.ended_at >= $1::timestamptz - INTERVAL '1 hour' AND (i.origin = 'direct' OR r.result_id = s.result_id)) AS executions WHERE recorded_at >= $1::timestamptz AND recorded_at < $2::timestamptz GROUP BY 1, 2 ORDER BY at",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z",
+        "1 minute"
+      ]
+    },
+    {
+      "id": "verify-chart-verifier",
+      "family": "verification",
+      "builder": "executionsBy",
+      "input": {},
+      "depends_on": [],
+      "sql": "SELECT date_bin($3::interval, recorded_at) AS at, verifier_card_uid AS verifier, count(*) AS executions FROM (SELECT i.execution_id, i.recorded_at, i.verifier_card_uid, i.binding_id, i.group_id, i.origin, i.run_id, i.subject_kind, i.subject_name, i.subject_version, i.subject_card_uid, i.workload_card_uid, i.service_name, i.service_version, i.deployment_environment, r.result_id, r.verdict, r.ended_at, CASE WHEN i.origin = 'direct' THEN CASE WHEN r.result_id IS NOT NULL THEN 'completed' ELSE 'not recorded' END ELSE coalesce(q.status, 'pending') END AS status FROM bifrost.verification.execution_inputs i LEFT JOIN (SELECT execution_id, last_value(status ORDER BY occurred_at, event_id) AS status FROM bifrost.verification.execution_events WHERE event = 'status' AND occurred_at >= $1::timestamptz - INTERVAL '1 hour' GROUP BY execution_id) q ON q.execution_id = i.execution_id LEFT JOIN (SELECT e.execution_id, e.value -> 'terminal' ->> 'result_id' AS result_id FROM bifrost.verification.execution_events e JOIN (SELECT execution_id, max(sequence) AS sequence FROM bifrost.verification.execution_events WHERE event = 'checkpoint' AND occurred_at >= $1::timestamptz - INTERVAL '1 hour' GROUP BY execution_id) l ON l.execution_id = e.execution_id AND l.sequence = e.sequence WHERE e.event = 'checkpoint' AND e.occurred_at >= $1::timestamptz - INTERVAL '1 hour') s ON s.execution_id = i.execution_id LEFT JOIN bifrost.verification.results r ON r.execution_id = i.execution_id AND r.ended_at >= $1::timestamptz - INTERVAL '1 hour' AND (i.origin = 'direct' OR r.result_id = s.result_id)) AS executions WHERE recorded_at >= $1::timestamptz AND recorded_at < $2::timestamptz GROUP BY 1, 2 ORDER BY at",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z",
+        "1 minute"
+      ]
+    },
+    {
+      "id": "logs-list",
+      "family": "logs",
+      "builder": "listQuery",
+      "input": {},
+      "depends_on": [],
+      "sql": "SELECT time_unix_nano, severity_text, service_name, body_text, exception_type, encode(trace_id, 'hex') AS trace_id, encode(span_id, 'hex') AS span_id, observed_time_unix_nano, wyrd_request_id, severity_number FROM bifrost.logs.records WHERE time_unix_nano >= $1::timestamptz AND time_unix_nano < $2::timestamptz ORDER BY time_unix_nano DESC, observed_time_unix_nano ASC, wyrd_request_id ASC LIMIT 51",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z"
+      ]
+    },
+    {
+      "id": "logs-timeline",
+      "family": "logs",
+      "builder": "logTimelineQuery",
+      "input": {},
+      "depends_on": [],
+      "sql": "SELECT date_bin($3::interval, time_unix_nano) AS at, CASE WHEN severity_number >= 17 THEN 'error' WHEN severity_number >= 13 THEN 'warn' WHEN severity_number >= 9 THEN 'info' WHEN severity_number >= 1 THEN 'debug' ELSE 'unset' END AS level, count(*) AS records FROM bifrost.logs.records WHERE time_unix_nano >= $1::timestamptz AND time_unix_nano < $2::timestamptz GROUP BY date_bin($3::interval, time_unix_nano), CASE WHEN severity_number >= 17 THEN 'error' WHEN severity_number >= 13 THEN 'warn' WHEN severity_number >= 9 THEN 'info' WHEN severity_number >= 1 THEN 'debug' ELSE 'unset' END ORDER BY at",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z",
+        "1 minute"
+      ]
+    },
+    {
+      "id": "logs-facet-severity_text",
+      "family": "logs",
+      "builder": "facetQuery",
+      "input": {
+        "column": "severity_text"
+      },
+      "depends_on": [],
+      "sql": "SELECT severity_text AS value, count(*) AS n, max(severity_number) AS severity_number FROM bifrost.logs.records WHERE time_unix_nano >= $1::timestamptz AND time_unix_nano < $2::timestamptz GROUP BY severity_text ORDER BY n DESC, value LIMIT 11",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z"
+      ]
+    },
+    {
+      "id": "logs-facet-service_name",
+      "family": "logs",
+      "builder": "facetQuery",
+      "input": {
+        "column": "service_name"
+      },
+      "depends_on": [],
+      "sql": "SELECT service_name AS value, count(*) AS n FROM bifrost.logs.records WHERE time_unix_nano >= $1::timestamptz AND time_unix_nano < $2::timestamptz GROUP BY service_name ORDER BY n DESC, value LIMIT 11",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z"
+      ]
+    },
+    {
+      "id": "logs-facet-event_name",
+      "family": "logs",
+      "builder": "facetQuery",
+      "input": {
+        "column": "event_name"
+      },
+      "depends_on": [],
+      "sql": "SELECT event_name AS value, count(*) AS n FROM bifrost.logs.records WHERE time_unix_nano >= $1::timestamptz AND time_unix_nano < $2::timestamptz GROUP BY event_name ORDER BY n DESC, value LIMIT 11",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z"
+      ]
+    },
+    {
+      "id": "logs-facet-exception_type",
+      "family": "logs",
+      "builder": "facetQuery",
+      "input": {
+        "column": "exception_type"
+      },
+      "depends_on": [],
+      "sql": "SELECT exception_type AS value, count(*) AS n FROM bifrost.logs.records WHERE time_unix_nano >= $1::timestamptz AND time_unix_nano < $2::timestamptz GROUP BY exception_type ORDER BY n DESC, value LIMIT 11",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z"
+      ]
+    },
+    {
+      "id": "metrics-facet-service_name",
+      "family": "metrics",
+      "builder": "facetQuery",
+      "input": {
+        "column": "service_name"
+      },
+      "depends_on": [],
+      "sql": "SELECT service_name AS value, count(*) AS n FROM bifrost.metrics.points WHERE time_unix_nano >= $1::timestamptz AND time_unix_nano < $2::timestamptz GROUP BY service_name ORDER BY n DESC, value LIMIT 11",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z"
+      ]
+    },
+    {
+      "id": "metrics-facet-subject_card_uid",
+      "family": "metrics",
+      "builder": "facetQuery",
+      "input": {
+        "column": "subject_card_uid"
+      },
+      "depends_on": [],
+      "sql": "SELECT subject_card_uid AS value, count(*) AS n FROM bifrost.metrics.points WHERE time_unix_nano >= $1::timestamptz AND time_unix_nano < $2::timestamptz GROUP BY subject_card_uid ORDER BY n DESC, value LIMIT 11",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z"
+      ]
+    },
+    {
+      "id": "metrics-names",
+      "family": "metrics",
+      "builder": "metricNamesQuery",
+      "input": {},
+      "depends_on": [],
+      "sql": "SELECT metric_name, metric_type, unit FROM bifrost.metrics.series WHERE hour_unix_nano >= date_bin(INTERVAL '1 hour', $1::timestamptz) AND hour_unix_nano < $2::timestamptz GROUP BY metric_name, metric_type, unit ORDER BY metric_name, metric_type, unit LIMIT 51",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z"
+      ]
+    },
+    {
+      "id": "metrics-chart",
+      "family": "metrics",
+      "builder": "metricQueries",
+      "input": {
+        "metric": "m.requests"
+      },
+      "depends_on": [],
+      "sql": "WITH pts AS (SELECT date_bin($4::interval, time_unix_nano) AS w, time_unix_nano AS t, start_time_unix_nano AS s, series_id, metric_type, unit, aggregation_temporality, is_monotonic, CAST(int_value AS DECIMAL(38, 0)) AS i, COALESCE(CAST(int_value AS DOUBLE), double_value) AS x FROM bifrost.metrics.points WHERE time_unix_nano >= $1::timestamptz AND time_unix_nano < $2::timestamptz AND metric_name = $3 AND metric_type IN ('gauge', 'sum')), steps AS (SELECT *, lag(t) OVER series IS NULL AS head, lag(s) OVER series AS sp, lag(x) OVER series AS xp, lag(i) OVER series AS ip FROM pts WINDOW series AS (PARTITION BY series_id ORDER BY t)), ends AS (SELECT w, series_id, metric_type, unit, aggregation_temporality, is_monotonic, sum(x) AS xt, last_value(x ORDER BY t) AS x1, sum(CASE WHEN head THEN CASE WHEN s < $1::timestamptz THEN 0 ELSE x END WHEN s = sp AND x >= xp THEN x - xp ELSE x END) AS xd, sum(i) AS it, last_value(i ORDER BY t) AS i1, sum(CASE WHEN head THEN CASE WHEN s < $1::timestamptz THEN 0 ELSE i END WHEN s = sp AND i >= ip THEN i - ip ELSE i END) AS id, bool_and(i IS NOT NULL AND (head OR ip IS NOT NULL)) AS exact FROM steps GROUP BY w, series_id, metric_type, unit, aggregation_temporality, is_monotonic), per AS (SELECT w, encode(series_id, 'hex') AS series, metric_type, unit, aggregation_temporality, is_monotonic, CASE WHEN aggregation_temporality = 1 THEN xt WHEN metric_type = 'sum' AND is_monotonic THEN xd ELSE x1 END AS v, CASE WHEN exact THEN CASE WHEN aggregation_temporality = 1 THEN it WHEN metric_type = 'sum' AND is_monotonic THEN id ELSE i1 END END AS vi FROM ends), grouped AS (SELECT w, metric_type, unit, aggregation_temporality, is_monotonic, CAST(CASE WHEN count(vi) = count(*) THEN CASE WHEN metric_type = 'sum' THEN sum(vi) ELSE avg(vi) END END AS DECIMAL(38, 4)) AS gi, CASE WHEN metric_type = 'sum' THEN sum(v) ELSE avg(v) END AS gv FROM per GROUP BY w, metric_type, unit, aggregation_temporality, is_monotonic), valued AS (SELECT w, metric_type, unit, aggregation_temporality, is_monotonic, COALESCE(CAST(gi AS DOUBLE), gv) / CASE WHEN metric_type = 'sum' AND (is_monotonic OR aggregation_temporality = 1) THEN $5 ELSE 1 END AS value, CASE WHEN NOT (metric_type = 'sum' AND (is_monotonic OR aggregation_temporality = 1)) THEN gi END AS exact FROM grouped), measured AS (SELECT *, CASE WHEN metric_type = 'sum' AND (is_monotonic OR aggregation_temporality = 1) THEN sum(value) OVER (PARTITION BY metric_type, unit, aggregation_temporality, is_monotonic) ELSE avg(value) OVER (PARTITION BY metric_type, unit, aggregation_temporality, is_monotonic) END AS measure FROM valued), ranked AS (SELECT *, dense_rank() OVER (ORDER BY measure DESC NULLS LAST, metric_type, unit, aggregation_temporality, is_monotonic) AS rank FROM measured), plotted AS (SELECT *, COALESCE(CAST(exact AS VARCHAR), CAST(value AS VARCHAR)) AS text, COALESCE(exact, CASE WHEN abs(value) < 1e19 THEN CAST(value AS DECIMAL(38, 0)) END) AS tie FROM (SELECT *, max(rank) OVER () AS groups FROM ranked) WHERE rank <= 20) SELECT w AS at, metric_type, unit, aggregation_temporality, is_monotonic, value, groups, last_value(text) OVER (PARTITION BY metric_type, unit, aggregation_temporality, is_monotonic ORDER BY w ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS latest, first_value(text) OVER (PARTITION BY metric_type, unit, aggregation_temporality, is_monotonic ORDER BY value DESC NULLS LAST, tie DESC NULLS LAST) AS max, CASE WHEN count(exact) OVER (PARTITION BY metric_type, unit, aggregation_temporality, is_monotonic) = count(*) OVER (PARTITION BY metric_type, unit, aggregation_temporality, is_monotonic) THEN CAST(avg(exact) OVER (PARTITION BY metric_type, unit, aggregation_temporality, is_monotonic) AS VARCHAR) ELSE CAST(avg(value) OVER (PARTITION BY metric_type, unit, aggregation_temporality, is_monotonic) AS VARCHAR) END AS mean FROM plotted ORDER BY at",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z",
+        "m.requests",
+        "1 minute",
+        60
+      ]
+    },
+    {
+      "id": "metrics-histogram",
+      "family": "metrics",
+      "builder": "histogramQuery",
+      "input": {
+        "metric": "m.requests"
+      },
+      "depends_on": [],
+      "sql": "WITH pts AS (SELECT date_bin($4::interval, time_unix_nano) AS w, time_unix_nano AS t, start_time_unix_nano AS started, metric_type, unit, aggregation_temporality, is_monotonic, explicit_bounds AS bounds, series_id, CAST(histogram_count AS BIGINT) AS n, histogram_sum AS v, CAST(bucket_counts AS BIGINT[]) AS b FROM bifrost.metrics.points WHERE time_unix_nano >= $1::timestamptz AND time_unix_nano < $2::timestamptz AND metric_name = $3 AND metric_type = 'histogram'), steps AS (SELECT *, lag(t) OVER series IS NULL AS head, lag(started) OVER series AS sp, lag(n) OVER series AS np, lag(v) OVER series AS vp, lag(b) OVER series AS bp FROM pts WHERE aggregation_temporality = 2 WINDOW series AS (PARTITION BY series_id ORDER BY t)), counted AS (SELECT w, metric_type, unit, aggregation_temporality, is_monotonic, bounds, unnest(generate_series(1, CAST(cardinality(b) AS BIGINT))) AS i, unnest(b) AS c, CASE WHEN head THEN CASE WHEN started < $1::timestamptz THEN b END WHEN sp = started AND n >= np THEN bp END AS bb, n - CASE WHEN head THEN CASE WHEN started < $1::timestamptz THEN n ELSE 0 END WHEN sp = started AND n >= np THEN np ELSE 0 END AS dn, v - CASE WHEN head THEN CASE WHEN started < $1::timestamptz THEN v ELSE 0 END WHEN sp = started AND n >= np THEN vp ELSE 0 END AS dv FROM steps UNION ALL SELECT w, metric_type, unit, aggregation_temporality, is_monotonic, bounds, unnest(generate_series(1, CAST(cardinality(b) AS BIGINT))) AS i, unnest(b) AS c, NULL AS bb, n AS dn, v AS dv FROM pts WHERE aggregation_temporality <> 2), buckets AS (SELECT w, metric_type, unit, aggregation_temporality, is_monotonic, bounds, i, sum(CAST(c AS BIGINT) - COALESCE(CAST(array_element(bb, i) AS BIGINT), 0)) AS c, sum(CASE WHEN i = 1 THEN dn END) AS dn, sum(CASE WHEN i = 1 THEN dv END) AS dv, count(CASE WHEN i = 1 THEN dn END) AS kn, count(CASE WHEN i = 1 THEN dv END) AS kv FROM counted GROUP BY w, metric_type, unit, aggregation_temporality, is_monotonic, bounds, i), windows AS (SELECT w, metric_type, unit, aggregation_temporality, is_monotonic, bounds, sum(dn) AS count, CASE WHEN sum(kv) = sum(kn) THEN sum(dv) END AS sum, array_agg(CAST(c AS VARCHAR) ORDER BY i) AS buckets FROM buckets GROUP BY w, metric_type, unit, aggregation_temporality, is_monotonic, bounds), ranked AS (SELECT *, dense_rank() OVER (ORDER BY measure DESC, metric_type, unit, aggregation_temporality, is_monotonic, bounds) AS rank FROM (SELECT *, sum(count) OVER (PARTITION BY metric_type, unit, aggregation_temporality, is_monotonic, bounds) AS measure FROM windows WHERE count > 0)) SELECT w AS at, metric_type, unit, aggregation_temporality, is_monotonic, bounds, count, sum, buckets, groups FROM (SELECT *, max(rank) OVER () AS groups FROM ranked) WHERE rank <= 20 ORDER BY at",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z",
+        "m.requests",
+        "1 minute"
+      ]
+    },
+    {
+      "id": "metrics-group-keys",
+      "family": "metrics",
+      "builder": "groupKeysQuery",
+      "input": {
+        "metric": "m.requests"
+      },
+      "depends_on": [],
+      "sql": "SELECT to_json(attributes) AS attributes, to_json(resource_attributes) AS resource, to_json(scope_attributes) AS scope FROM bifrost.metrics.series WHERE hour_unix_nano >= date_bin(INTERVAL '1 hour', $1::timestamptz) AND hour_unix_nano < $2::timestamptz AND metric_name = $3 LIMIT 100",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z",
+        "m.requests"
+      ]
+    },
+    {
+      "id": "metrics-apart-chart",
+      "family": "variants",
+      "builder": "metricQueries",
+      "input": {
+        "metric": "m.requests",
+        "apart": true
+      },
+      "depends_on": [],
+      "sql": "WITH pts AS (SELECT date_bin($4::interval, time_unix_nano) AS w, time_unix_nano AS t, start_time_unix_nano AS s, series_id, metric_type, unit, aggregation_temporality, is_monotonic, CAST(int_value AS DECIMAL(38, 0)) AS i, COALESCE(CAST(int_value AS DOUBLE), double_value) AS x FROM bifrost.metrics.points WHERE time_unix_nano >= $1::timestamptz AND time_unix_nano < $2::timestamptz AND metric_name = $3 AND metric_type IN ('gauge', 'sum')), steps AS (SELECT *, lag(t) OVER series IS NULL AS head, lag(s) OVER series AS sp, lag(x) OVER series AS xp, lag(i) OVER series AS ip FROM pts WINDOW series AS (PARTITION BY series_id ORDER BY t)), ends AS (SELECT w, series_id, metric_type, unit, aggregation_temporality, is_monotonic, sum(x) AS xt, last_value(x ORDER BY t) AS x1, sum(CASE WHEN head THEN CASE WHEN s < $1::timestamptz THEN 0 ELSE x END WHEN s = sp AND x >= xp THEN x - xp ELSE x END) AS xd, sum(i) AS it, last_value(i ORDER BY t) AS i1, sum(CASE WHEN head THEN CASE WHEN s < $1::timestamptz THEN 0 ELSE i END WHEN s = sp AND i >= ip THEN i - ip ELSE i END) AS id, bool_and(i IS NOT NULL AND (head OR ip IS NOT NULL)) AS exact FROM steps GROUP BY w, series_id, metric_type, unit, aggregation_temporality, is_monotonic), per AS (SELECT w, encode(series_id, 'hex') AS series, metric_type, unit, aggregation_temporality, is_monotonic, CASE WHEN aggregation_temporality = 1 THEN xt WHEN metric_type = 'sum' AND is_monotonic THEN xd ELSE x1 END AS v, CASE WHEN exact THEN CASE WHEN aggregation_temporality = 1 THEN it WHEN metric_type = 'sum' AND is_monotonic THEN id ELSE i1 END END AS vi FROM ends), grouped AS (SELECT w, metric_type, unit, aggregation_temporality, is_monotonic, series, CAST(CASE WHEN count(vi) = count(*) THEN CASE WHEN metric_type = 'sum' THEN sum(vi) ELSE avg(vi) END END AS DECIMAL(38, 4)) AS gi, CASE WHEN metric_type = 'sum' THEN sum(v) ELSE avg(v) END AS gv FROM per GROUP BY w, metric_type, unit, aggregation_temporality, is_monotonic, series), valued AS (SELECT w, metric_type, unit, aggregation_temporality, is_monotonic, series, COALESCE(CAST(gi AS DOUBLE), gv) / CASE WHEN metric_type = 'sum' AND (is_monotonic OR aggregation_temporality = 1) THEN $5 ELSE 1 END AS value, CASE WHEN NOT (metric_type = 'sum' AND (is_monotonic OR aggregation_temporality = 1)) THEN gi END AS exact FROM grouped), measured AS (SELECT *, CASE WHEN metric_type = 'sum' AND (is_monotonic OR aggregation_temporality = 1) THEN sum(value) OVER (PARTITION BY metric_type, unit, aggregation_temporality, is_monotonic, series) ELSE avg(value) OVER (PARTITION BY metric_type, unit, aggregation_temporality, is_monotonic, series) END AS measure FROM valued), ranked AS (SELECT *, dense_rank() OVER (ORDER BY measure DESC NULLS LAST, metric_type, unit, aggregation_temporality, is_monotonic, series) AS rank FROM measured), plotted AS (SELECT *, COALESCE(CAST(exact AS VARCHAR), CAST(value AS VARCHAR)) AS text, COALESCE(exact, CASE WHEN abs(value) < 1e19 THEN CAST(value AS DECIMAL(38, 0)) END) AS tie FROM (SELECT *, max(rank) OVER () AS groups FROM ranked) WHERE rank <= 20) SELECT w AS at, metric_type, unit, aggregation_temporality, is_monotonic, series, value, groups, last_value(text) OVER (PARTITION BY metric_type, unit, aggregation_temporality, is_monotonic, series ORDER BY w ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS latest, first_value(text) OVER (PARTITION BY metric_type, unit, aggregation_temporality, is_monotonic, series ORDER BY value DESC NULLS LAST, tie DESC NULLS LAST) AS max, CASE WHEN count(exact) OVER (PARTITION BY metric_type, unit, aggregation_temporality, is_monotonic, series) = count(*) OVER (PARTITION BY metric_type, unit, aggregation_temporality, is_monotonic, series) THEN CAST(avg(exact) OVER (PARTITION BY metric_type, unit, aggregation_temporality, is_monotonic, series) AS VARCHAR) ELSE CAST(avg(value) OVER (PARTITION BY metric_type, unit, aggregation_temporality, is_monotonic, series) AS VARCHAR) END AS mean FROM plotted ORDER BY at",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z",
+        "m.requests",
+        "1 minute",
+        60
+      ]
+    },
+    {
+      "id": "metrics-apart-histogram",
+      "family": "variants",
+      "builder": "histogramQuery",
+      "input": {
+        "metric": "m.requests",
+        "apart": true
+      },
+      "depends_on": [],
+      "sql": "WITH pts AS (SELECT date_bin($4::interval, time_unix_nano) AS w, time_unix_nano AS t, start_time_unix_nano AS started, metric_type, unit, aggregation_temporality, is_monotonic, encode(series_id, 'hex') AS series, explicit_bounds AS bounds, series_id, CAST(histogram_count AS BIGINT) AS n, histogram_sum AS v, CAST(bucket_counts AS BIGINT[]) AS b FROM bifrost.metrics.points WHERE time_unix_nano >= $1::timestamptz AND time_unix_nano < $2::timestamptz AND metric_name = $3 AND metric_type = 'histogram'), steps AS (SELECT *, lag(t) OVER series IS NULL AS head, lag(started) OVER series AS sp, lag(n) OVER series AS np, lag(v) OVER series AS vp, lag(b) OVER series AS bp FROM pts WHERE aggregation_temporality = 2 WINDOW series AS (PARTITION BY series_id ORDER BY t)), counted AS (SELECT w, metric_type, unit, aggregation_temporality, is_monotonic, series, bounds, unnest(generate_series(1, CAST(cardinality(b) AS BIGINT))) AS i, unnest(b) AS c, CASE WHEN head THEN CASE WHEN started < $1::timestamptz THEN b END WHEN sp = started AND n >= np THEN bp END AS bb, n - CASE WHEN head THEN CASE WHEN started < $1::timestamptz THEN n ELSE 0 END WHEN sp = started AND n >= np THEN np ELSE 0 END AS dn, v - CASE WHEN head THEN CASE WHEN started < $1::timestamptz THEN v ELSE 0 END WHEN sp = started AND n >= np THEN vp ELSE 0 END AS dv FROM steps UNION ALL SELECT w, metric_type, unit, aggregation_temporality, is_monotonic, series, bounds, unnest(generate_series(1, CAST(cardinality(b) AS BIGINT))) AS i, unnest(b) AS c, NULL AS bb, n AS dn, v AS dv FROM pts WHERE aggregation_temporality <> 2), buckets AS (SELECT w, metric_type, unit, aggregation_temporality, is_monotonic, series, bounds, i, sum(CAST(c AS BIGINT) - COALESCE(CAST(array_element(bb, i) AS BIGINT), 0)) AS c, sum(CASE WHEN i = 1 THEN dn END) AS dn, sum(CASE WHEN i = 1 THEN dv END) AS dv, count(CASE WHEN i = 1 THEN dn END) AS kn, count(CASE WHEN i = 1 THEN dv END) AS kv FROM counted GROUP BY w, metric_type, unit, aggregation_temporality, is_monotonic, series, bounds, i), windows AS (SELECT w, metric_type, unit, aggregation_temporality, is_monotonic, series, bounds, sum(dn) AS count, CASE WHEN sum(kv) = sum(kn) THEN sum(dv) END AS sum, array_agg(CAST(c AS VARCHAR) ORDER BY i) AS buckets FROM buckets GROUP BY w, metric_type, unit, aggregation_temporality, is_monotonic, series, bounds), ranked AS (SELECT *, dense_rank() OVER (ORDER BY measure DESC, metric_type, unit, aggregation_temporality, is_monotonic, series, bounds) AS rank FROM (SELECT *, sum(count) OVER (PARTITION BY metric_type, unit, aggregation_temporality, is_monotonic, series, bounds) AS measure FROM windows WHERE count > 0)) SELECT w AS at, metric_type, unit, aggregation_temporality, is_monotonic, series, bounds, count, sum, buckets, groups FROM (SELECT *, max(rank) OVER () AS groups FROM ranked) WHERE rank <= 20 ORDER BY at",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z",
+        "m.requests",
+        "1 minute"
+      ]
+    },
+    {
+      "id": "metrics-labels",
+      "family": "variants",
+      "builder": "seriesLabelsQuery",
+      "input": {
+        "metric": "m.requests",
+        "apart": true,
+        "series": [
+          "00000000000000000000000000000001"
+        ]
+      },
+      "depends_on": [
+        "metrics-apart-chart",
+        "metrics-apart-histogram"
+      ],
+      "sql": "SELECT encode(series_id, 'hex') AS series, to_json(resource_attributes) AS resource, scope_name, scope_version, to_json(scope_attributes) AS scope, to_json(attributes) AS attributes FROM (SELECT *, row_number() OVER (PARTITION BY series_id ORDER BY hour_unix_nano DESC) AS newest FROM bifrost.metrics.series WHERE hour_unix_nano >= date_bin(INTERVAL '1 hour', $1::timestamptz) AND hour_unix_nano < $2::timestamptz AND metric_name = $3 AND series_id IN (decode($4, 'hex'))) WHERE newest = 1",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z",
+        "m.requests",
+        "00000000000000000000000000000001"
+      ]
+    },
+    {
+      "id": "metrics-24h-chart",
+      "family": "variants",
+      "builder": "metricQueries",
+      "input": {
+        "metric": "m.requests",
+        "range": {
+          "from": "2026-11-17T13:00:00.000Z",
+          "to": "2026-11-18T13:00:00.000Z"
+        }
+      },
+      "depends_on": [],
+      "sql": "WITH pts AS (SELECT date_bin($4::interval, time_unix_nano) AS w, time_unix_nano AS t, start_time_unix_nano AS s, series_id, metric_type, unit, aggregation_temporality, is_monotonic, CAST(int_value AS DECIMAL(38, 0)) AS i, COALESCE(CAST(int_value AS DOUBLE), double_value) AS x FROM bifrost.metrics.points WHERE time_unix_nano >= $1::timestamptz AND time_unix_nano < $2::timestamptz AND metric_name = $3 AND metric_type IN ('gauge', 'sum')), steps AS (SELECT *, lag(t) OVER series IS NULL AS head, lag(s) OVER series AS sp, lag(x) OVER series AS xp, lag(i) OVER series AS ip FROM pts WINDOW series AS (PARTITION BY series_id ORDER BY t)), ends AS (SELECT w, series_id, metric_type, unit, aggregation_temporality, is_monotonic, sum(x) AS xt, last_value(x ORDER BY t) AS x1, sum(CASE WHEN head THEN CASE WHEN s < $1::timestamptz THEN 0 ELSE x END WHEN s = sp AND x >= xp THEN x - xp ELSE x END) AS xd, sum(i) AS it, last_value(i ORDER BY t) AS i1, sum(CASE WHEN head THEN CASE WHEN s < $1::timestamptz THEN 0 ELSE i END WHEN s = sp AND i >= ip THEN i - ip ELSE i END) AS id, bool_and(i IS NOT NULL AND (head OR ip IS NOT NULL)) AS exact FROM steps GROUP BY w, series_id, metric_type, unit, aggregation_temporality, is_monotonic), per AS (SELECT w, encode(series_id, 'hex') AS series, metric_type, unit, aggregation_temporality, is_monotonic, CASE WHEN aggregation_temporality = 1 THEN xt WHEN metric_type = 'sum' AND is_monotonic THEN xd ELSE x1 END AS v, CASE WHEN exact THEN CASE WHEN aggregation_temporality = 1 THEN it WHEN metric_type = 'sum' AND is_monotonic THEN id ELSE i1 END END AS vi FROM ends), grouped AS (SELECT w, metric_type, unit, aggregation_temporality, is_monotonic, CAST(CASE WHEN count(vi) = count(*) THEN CASE WHEN metric_type = 'sum' THEN sum(vi) ELSE avg(vi) END END AS DECIMAL(38, 4)) AS gi, CASE WHEN metric_type = 'sum' THEN sum(v) ELSE avg(v) END AS gv FROM per GROUP BY w, metric_type, unit, aggregation_temporality, is_monotonic), valued AS (SELECT w, metric_type, unit, aggregation_temporality, is_monotonic, COALESCE(CAST(gi AS DOUBLE), gv) / CASE WHEN metric_type = 'sum' AND (is_monotonic OR aggregation_temporality = 1) THEN $5 ELSE 1 END AS value, CASE WHEN NOT (metric_type = 'sum' AND (is_monotonic OR aggregation_temporality = 1)) THEN gi END AS exact FROM grouped), measured AS (SELECT *, CASE WHEN metric_type = 'sum' AND (is_monotonic OR aggregation_temporality = 1) THEN sum(value) OVER (PARTITION BY metric_type, unit, aggregation_temporality, is_monotonic) ELSE avg(value) OVER (PARTITION BY metric_type, unit, aggregation_temporality, is_monotonic) END AS measure FROM valued), ranked AS (SELECT *, dense_rank() OVER (ORDER BY measure DESC NULLS LAST, metric_type, unit, aggregation_temporality, is_monotonic) AS rank FROM measured), plotted AS (SELECT *, COALESCE(CAST(exact AS VARCHAR), CAST(value AS VARCHAR)) AS text, COALESCE(exact, CASE WHEN abs(value) < 1e19 THEN CAST(value AS DECIMAL(38, 0)) END) AS tie FROM (SELECT *, max(rank) OVER () AS groups FROM ranked) WHERE rank <= 20) SELECT w AS at, metric_type, unit, aggregation_temporality, is_monotonic, value, groups, last_value(text) OVER (PARTITION BY metric_type, unit, aggregation_temporality, is_monotonic ORDER BY w ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS latest, first_value(text) OVER (PARTITION BY metric_type, unit, aggregation_temporality, is_monotonic ORDER BY value DESC NULLS LAST, tie DESC NULLS LAST) AS max, CASE WHEN count(exact) OVER (PARTITION BY metric_type, unit, aggregation_temporality, is_monotonic) = count(*) OVER (PARTITION BY metric_type, unit, aggregation_temporality, is_monotonic) THEN CAST(avg(exact) OVER (PARTITION BY metric_type, unit, aggregation_temporality, is_monotonic) AS VARCHAR) ELSE CAST(avg(value) OVER (PARTITION BY metric_type, unit, aggregation_temporality, is_monotonic) AS VARCHAR) END AS mean FROM plotted ORDER BY at",
+      "params": [
+        "2026-11-17T13:00:00.000Z",
+        "2026-11-18T13:00:00.000Z",
+        "m.requests",
+        "15 minutes",
+        900
+      ]
+    },
+    {
+      "id": "metrics-nested-chart",
+      "family": "variants",
+      "builder": "metricQueries",
+      "input": {
+        "metric": "m.requests",
+        "by": [
+          "attributes.route"
+        ]
+      },
+      "depends_on": [],
+      "sql": "WITH pts AS (SELECT date_bin($5::interval, time_unix_nano) AS w, time_unix_nano AS t, start_time_unix_nano AS s, series_id, metric_type, unit, aggregation_temporality, is_monotonic, variant_get_text(attributes, $4) AS g1, CAST(int_value AS DECIMAL(38, 0)) AS i, COALESCE(CAST(int_value AS DOUBLE), double_value) AS x FROM bifrost.metrics.points WHERE time_unix_nano >= $1::timestamptz AND time_unix_nano < $2::timestamptz AND metric_name = $3 AND metric_type IN ('gauge', 'sum')), steps AS (SELECT *, lag(t) OVER series IS NULL AS head, lag(s) OVER series AS sp, lag(x) OVER series AS xp, lag(i) OVER series AS ip FROM pts WINDOW series AS (PARTITION BY series_id ORDER BY t)), ends AS (SELECT w, series_id, metric_type, unit, aggregation_temporality, is_monotonic, g1, sum(x) AS xt, last_value(x ORDER BY t) AS x1, sum(CASE WHEN head THEN CASE WHEN s < $1::timestamptz THEN 0 ELSE x END WHEN s = sp AND x >= xp THEN x - xp ELSE x END) AS xd, sum(i) AS it, last_value(i ORDER BY t) AS i1, sum(CASE WHEN head THEN CASE WHEN s < $1::timestamptz THEN 0 ELSE i END WHEN s = sp AND i >= ip THEN i - ip ELSE i END) AS id, bool_and(i IS NOT NULL AND (head OR ip IS NOT NULL)) AS exact FROM steps GROUP BY w, series_id, metric_type, unit, aggregation_temporality, is_monotonic, g1), per AS (SELECT w, encode(series_id, 'hex') AS series, metric_type, unit, aggregation_temporality, is_monotonic, g1, CASE WHEN aggregation_temporality = 1 THEN xt WHEN metric_type = 'sum' AND is_monotonic THEN xd ELSE x1 END AS v, CASE WHEN exact THEN CASE WHEN aggregation_temporality = 1 THEN it WHEN metric_type = 'sum' AND is_monotonic THEN id ELSE i1 END END AS vi FROM ends), grouped AS (SELECT w, metric_type, unit, aggregation_temporality, is_monotonic, g1, CAST(CASE WHEN count(vi) = count(*) THEN CASE WHEN metric_type = 'sum' THEN sum(vi) ELSE avg(vi) END END AS DECIMAL(38, 4)) AS gi, CASE WHEN metric_type = 'sum' THEN sum(v) ELSE avg(v) END AS gv FROM per GROUP BY w, metric_type, unit, aggregation_temporality, is_monotonic, g1), valued AS (SELECT w, metric_type, unit, aggregation_temporality, is_monotonic, g1, COALESCE(CAST(gi AS DOUBLE), gv) / CASE WHEN metric_type = 'sum' AND (is_monotonic OR aggregation_temporality = 1) THEN $6 ELSE 1 END AS value, CASE WHEN NOT (metric_type = 'sum' AND (is_monotonic OR aggregation_temporality = 1)) THEN gi END AS exact FROM grouped), measured AS (SELECT *, CASE WHEN metric_type = 'sum' AND (is_monotonic OR aggregation_temporality = 1) THEN sum(value) OVER (PARTITION BY metric_type, unit, aggregation_temporality, is_monotonic, g1) ELSE avg(value) OVER (PARTITION BY metric_type, unit, aggregation_temporality, is_monotonic, g1) END AS measure FROM valued), ranked AS (SELECT *, dense_rank() OVER (ORDER BY measure DESC NULLS LAST, metric_type, unit, aggregation_temporality, is_monotonic, g1) AS rank FROM measured), plotted AS (SELECT *, COALESCE(CAST(exact AS VARCHAR), CAST(value AS VARCHAR)) AS text, COALESCE(exact, CASE WHEN abs(value) < 1e19 THEN CAST(value AS DECIMAL(38, 0)) END) AS tie FROM (SELECT *, max(rank) OVER () AS groups FROM ranked) WHERE rank <= 20) SELECT w AS at, metric_type, unit, aggregation_temporality, is_monotonic, g1, value, groups, last_value(text) OVER (PARTITION BY metric_type, unit, aggregation_temporality, is_monotonic, g1 ORDER BY w ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS latest, first_value(text) OVER (PARTITION BY metric_type, unit, aggregation_temporality, is_monotonic, g1 ORDER BY value DESC NULLS LAST, tie DESC NULLS LAST) AS max, CASE WHEN count(exact) OVER (PARTITION BY metric_type, unit, aggregation_temporality, is_monotonic, g1) = count(*) OVER (PARTITION BY metric_type, unit, aggregation_temporality, is_monotonic, g1) THEN CAST(avg(exact) OVER (PARTITION BY metric_type, unit, aggregation_temporality, is_monotonic, g1) AS VARCHAR) ELSE CAST(avg(value) OVER (PARTITION BY metric_type, unit, aggregation_temporality, is_monotonic, g1) AS VARCHAR) END AS mean FROM plotted ORDER BY at",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z",
+        "m.requests",
+        "route",
+        "1 minute",
+        60
+      ]
+    },
+    {
+      "id": "trace-child-match",
+      "family": "variants",
+      "builder": "listQuery",
+      "input": {
+        "signal": "traces",
+        "where": [
+          {
+            "column": "service_name",
+            "value": "child-service"
+          }
+        ]
+      },
+      "depends_on": [],
+      "sql": "SELECT start_time_unix_nano, name, service_name, duration_nano, status_code, encode(trace_id, 'hex') AS trace_id, encode(span_id, 'hex') AS span_id FROM bifrost.traces.spans WHERE start_time_unix_nano >= $1::timestamptz AND start_time_unix_nano < $2::timestamptz AND parent_span_id IS NULL AND trace_id IN (SELECT trace_id FROM bifrost.traces.spans WHERE start_time_unix_nano >= $1::timestamptz AND start_time_unix_nano < $2::timestamptz AND service_name = $3) ORDER BY start_time_unix_nano DESC, encode(trace_id, 'hex') ASC, encode(span_id, 'hex') ASC LIMIT 51",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z",
+        "child-service"
+      ]
+    },
+    {
+      "id": "verify-filter-status",
+      "family": "variants",
+      "builder": "listQuery",
+      "input": {
+        "signal": "executions",
+        "where": [
+          {
+            "column": "status",
+            "value": "waiting"
+          }
+        ]
+      },
+      "depends_on": [],
+      "sql": "SELECT recorded_at, verifier_card_uid, subject_name, run_id, group_id, service_name, status, verdict, execution_id, subject_kind, subject_version, subject_card_uid, result_id, binding_id, workload_card_uid FROM (SELECT i.execution_id, i.recorded_at, i.verifier_card_uid, i.binding_id, i.group_id, i.origin, i.run_id, i.subject_kind, i.subject_name, i.subject_version, i.subject_card_uid, i.workload_card_uid, i.service_name, i.service_version, i.deployment_environment, r.result_id, r.verdict, r.ended_at, CASE WHEN i.origin = 'direct' THEN CASE WHEN r.result_id IS NOT NULL THEN 'completed' ELSE 'not recorded' END ELSE coalesce(q.status, 'pending') END AS status FROM bifrost.verification.execution_inputs i LEFT JOIN (SELECT execution_id, last_value(status ORDER BY occurred_at, event_id) AS status FROM bifrost.verification.execution_events WHERE event = 'status' AND occurred_at >= $1::timestamptz - INTERVAL '1 hour' GROUP BY execution_id) q ON q.execution_id = i.execution_id LEFT JOIN (SELECT e.execution_id, e.value -> 'terminal' ->> 'result_id' AS result_id FROM bifrost.verification.execution_events e JOIN (SELECT execution_id, max(sequence) AS sequence FROM bifrost.verification.execution_events WHERE event = 'checkpoint' AND occurred_at >= $1::timestamptz - INTERVAL '1 hour' GROUP BY execution_id) l ON l.execution_id = e.execution_id AND l.sequence = e.sequence WHERE e.event = 'checkpoint' AND e.occurred_at >= $1::timestamptz - INTERVAL '1 hour') s ON s.execution_id = i.execution_id LEFT JOIN bifrost.verification.results r ON r.execution_id = i.execution_id AND r.ended_at >= $1::timestamptz - INTERVAL '1 hour' AND (i.origin = 'direct' OR r.result_id = s.result_id)) AS executions WHERE recorded_at >= $1::timestamptz AND recorded_at < $2::timestamptz AND status = $3 ORDER BY recorded_at DESC, execution_id ASC LIMIT 51",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z",
+        "waiting"
+      ]
+    },
+    {
+      "id": "verify-filter-verdict",
+      "family": "variants",
+      "builder": "listQuery",
+      "input": {
+        "signal": "executions",
+        "where": [
+          {
+            "column": "verdict",
+            "value": "failed"
+          }
+        ]
+      },
+      "depends_on": [],
+      "sql": "SELECT recorded_at, verifier_card_uid, subject_name, run_id, group_id, service_name, status, verdict, execution_id, subject_kind, subject_version, subject_card_uid, result_id, binding_id, workload_card_uid FROM (SELECT i.execution_id, i.recorded_at, i.verifier_card_uid, i.binding_id, i.group_id, i.origin, i.run_id, i.subject_kind, i.subject_name, i.subject_version, i.subject_card_uid, i.workload_card_uid, i.service_name, i.service_version, i.deployment_environment, r.result_id, r.verdict, r.ended_at, CASE WHEN i.origin = 'direct' THEN CASE WHEN r.result_id IS NOT NULL THEN 'completed' ELSE 'not recorded' END ELSE coalesce(q.status, 'pending') END AS status FROM bifrost.verification.execution_inputs i LEFT JOIN (SELECT execution_id, last_value(status ORDER BY occurred_at, event_id) AS status FROM bifrost.verification.execution_events WHERE event = 'status' AND occurred_at >= $1::timestamptz - INTERVAL '1 hour' GROUP BY execution_id) q ON q.execution_id = i.execution_id LEFT JOIN (SELECT e.execution_id, e.value -> 'terminal' ->> 'result_id' AS result_id FROM bifrost.verification.execution_events e JOIN (SELECT execution_id, max(sequence) AS sequence FROM bifrost.verification.execution_events WHERE event = 'checkpoint' AND occurred_at >= $1::timestamptz - INTERVAL '1 hour' GROUP BY execution_id) l ON l.execution_id = e.execution_id AND l.sequence = e.sequence WHERE e.event = 'checkpoint' AND e.occurred_at >= $1::timestamptz - INTERVAL '1 hour') s ON s.execution_id = i.execution_id LEFT JOIN bifrost.verification.results r ON r.execution_id = i.execution_id AND r.ended_at >= $1::timestamptz - INTERVAL '1 hour' AND (i.origin = 'direct' OR r.result_id = s.result_id)) AS executions WHERE recorded_at >= $1::timestamptz AND recorded_at < $2::timestamptz AND verdict = $3 ORDER BY recorded_at DESC, execution_id ASC LIMIT 51",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z",
+        "failed"
+      ]
+    },
+    {
+      "id": "trace-page-after",
+      "family": "variants",
+      "builder": "listQuery",
+      "input": {
+        "after": [
+          "2026-11-18T12:30:00.000000000Z",
+          "00000000000000000000000000000001",
+          "0000000000000001"
+        ]
+      },
+      "depends_on": [],
+      "sql": "SELECT start_time_unix_nano, name, service_name, duration_nano, status_code, encode(trace_id, 'hex') AS trace_id, encode(span_id, 'hex') AS span_id FROM bifrost.traces.spans WHERE start_time_unix_nano >= $1::timestamptz AND start_time_unix_nano < $2::timestamptz AND parent_span_id IS NULL AND (start_time_unix_nano < $3::timestamptz OR (start_time_unix_nano = $3::timestamptz AND (encode(trace_id, 'hex') > $4 OR (encode(trace_id, 'hex') = $4 AND (encode(span_id, 'hex') > $5))))) ORDER BY start_time_unix_nano DESC, encode(trace_id, 'hex') ASC, encode(span_id, 'hex') ASC LIMIT 51",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z",
+        "2026-11-18T12:30:00.000000000Z",
+        "00000000000000000000000000000001",
+        "0000000000000001"
+      ]
+    },
+    {
+      "id": "trace-page-before",
+      "family": "variants",
+      "builder": "listQuery",
+      "input": {
+        "before": [
+          "2026-11-18T12:30:00.000000000Z",
+          "00000000000000000000000000000001",
+          "0000000000000001"
+        ]
+      },
+      "depends_on": [],
+      "sql": "SELECT start_time_unix_nano, name, service_name, duration_nano, status_code, encode(trace_id, 'hex') AS trace_id, encode(span_id, 'hex') AS span_id FROM bifrost.traces.spans WHERE start_time_unix_nano >= $1::timestamptz AND start_time_unix_nano < $2::timestamptz AND parent_span_id IS NULL AND (start_time_unix_nano > $3::timestamptz OR (start_time_unix_nano = $3::timestamptz AND (encode(trace_id, 'hex') < $4 OR (encode(trace_id, 'hex') = $4 AND (encode(span_id, 'hex') < $5))))) ORDER BY start_time_unix_nano ASC, encode(trace_id, 'hex') DESC, encode(span_id, 'hex') DESC LIMIT 51",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z",
+        "2026-11-18T12:30:00.000000000Z",
+        "00000000000000000000000000000001",
+        "0000000000000001"
+      ]
+    },
+    {
+      "id": "trace-waterfall",
+      "family": "variants",
+      "builder": "waterfallQuery",
+      "input": {
+        "trace_id": "00000000000000000000000000000001"
+      },
+      "depends_on": [],
+      "sql": "SELECT encode(span_id, 'hex') AS span_id, encode(parent_span_id, 'hex') AS parent_span_id, name, service_name, start_time_unix_nano, duration_nano, status_code FROM bifrost.traces.spans WHERE trace_id = decode($1, 'hex') ORDER BY start_time_unix_nano, span_id",
+      "params": [
+        "00000000000000000000000000000001"
+      ]
+    },
+    {
+      "id": "span-detail",
+      "family": "variants",
+      "builder": "detailQuery",
+      "input": {},
+      "depends_on": [],
+      "sql": "SELECT * FROM bifrost.traces.spans WHERE trace_id = decode($1, 'hex') AND span_id = decode($2, 'hex')",
+      "params": [
+        "00000000000000000000000000000001",
+        "0000000000000001"
+      ]
+    },
+    {
+      "id": "log-detail",
+      "family": "variants",
+      "builder": "detailQuery",
+      "input": {},
+      "depends_on": [],
+      "sql": "SELECT * FROM bifrost.logs.records WHERE time_unix_nano = $1::timestamptz AND observed_time_unix_nano = $2::timestamptz AND wyrd_request_id = $3",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T12:00:00.000Z",
+        "019a9660-0000-7000-8000-000000000001"
+      ]
+    },
+    {
+      "id": "spans-list",
+      "family": "variants",
+      "builder": "listQuery",
+      "input": {},
+      "depends_on": [],
+      "sql": "SELECT start_time_unix_nano, name, service_name, duration_nano, status_code, encode(trace_id, 'hex') AS trace_id, encode(span_id, 'hex') AS span_id, encode(parent_span_id, 'hex') AS parent_span_id FROM bifrost.traces.spans WHERE start_time_unix_nano >= $1::timestamptz AND start_time_unix_nano < $2::timestamptz ORDER BY start_time_unix_nano DESC, encode(trace_id, 'hex') ASC, encode(span_id, 'hex') ASC LIMIT 51",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z"
+      ]
+    },
+    {
+      "id": "metric-points-list",
+      "family": "variants",
+      "builder": "listQuery",
+      "input": {},
+      "depends_on": [],
+      "sql": "SELECT time_unix_nano, metric_name, metric_type, unit, CAST(int_value AS VARCHAR) AS int_value, double_value FROM bifrost.metrics.points WHERE time_unix_nano >= $1::timestamptz AND time_unix_nano < $2::timestamptz ORDER BY time_unix_nano DESC LIMIT 50",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z"
+      ]
+    },
+    {
+      "id": "stat-traces-total",
+      "family": "statstrip",
+      "builder": "statQueries",
+      "input": {
+        "stat": "traces"
+      },
+      "depends_on": [],
+      "sql": "SELECT count(*) AS value FROM bifrost.traces.spans WHERE start_time_unix_nano >= $1::timestamptz AND start_time_unix_nano < $2::timestamptz AND parent_span_id IS NULL",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z"
+      ]
+    },
+    {
+      "id": "stat-traces-buckets",
+      "family": "statstrip",
+      "builder": "statQueries",
+      "input": {
+        "stat": "traces"
+      },
+      "depends_on": [],
+      "sql": "SELECT date_bin($3::interval, start_time_unix_nano) AS at, count(*) AS value FROM bifrost.traces.spans WHERE start_time_unix_nano >= $1::timestamptz AND start_time_unix_nano < $2::timestamptz AND parent_span_id IS NULL GROUP BY date_bin($3::interval, start_time_unix_nano) ORDER BY at",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z",
+        "1 minute"
+      ]
+    },
+    {
+      "id": "stat-spans-total",
+      "family": "statstrip",
+      "builder": "statQueries",
+      "input": {
+        "stat": "spans"
+      },
+      "depends_on": [],
+      "sql": "SELECT count(*) AS value FROM bifrost.traces.spans WHERE start_time_unix_nano >= $1::timestamptz AND start_time_unix_nano < $2::timestamptz",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z"
+      ]
+    },
+    {
+      "id": "stat-spans-buckets",
+      "family": "statstrip",
+      "builder": "statQueries",
+      "input": {
+        "stat": "spans"
+      },
+      "depends_on": [],
+      "sql": "SELECT date_bin($3::interval, start_time_unix_nano) AS at, count(*) AS value FROM bifrost.traces.spans WHERE start_time_unix_nano >= $1::timestamptz AND start_time_unix_nano < $2::timestamptz GROUP BY date_bin($3::interval, start_time_unix_nano) ORDER BY at",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z",
+        "1 minute"
+      ]
+    },
+    {
+      "id": "stat-errors-total",
+      "family": "statstrip",
+      "builder": "statQueries",
+      "input": {
+        "stat": "errors"
+      },
+      "depends_on": [],
+      "sql": "SELECT count(*) AS value FROM bifrost.traces.spans WHERE start_time_unix_nano >= $1::timestamptz AND start_time_unix_nano < $2::timestamptz AND status_code = 2",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z"
+      ]
+    },
+    {
+      "id": "stat-errors-buckets",
+      "family": "statstrip",
+      "builder": "statQueries",
+      "input": {
+        "stat": "errors"
+      },
+      "depends_on": [],
+      "sql": "SELECT date_bin($3::interval, start_time_unix_nano) AS at, count(*) AS value FROM bifrost.traces.spans WHERE start_time_unix_nano >= $1::timestamptz AND start_time_unix_nano < $2::timestamptz AND status_code = 2 GROUP BY date_bin($3::interval, start_time_unix_nano) ORDER BY at",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z",
+        "1 minute"
+      ]
+    },
+    {
+      "id": "stat-duration_p95-total",
+      "family": "statstrip",
+      "builder": "statQueries",
+      "input": {
+        "stat": "duration_p95"
+      },
+      "depends_on": [],
+      "sql": "SELECT approx_percentile_cont(duration_nano, 0.95) AS value FROM bifrost.traces.spans WHERE start_time_unix_nano >= $1::timestamptz AND start_time_unix_nano < $2::timestamptz AND parent_span_id IS NULL",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z"
+      ]
+    },
+    {
+      "id": "stat-duration_p95-buckets",
+      "family": "statstrip",
+      "builder": "statQueries",
+      "input": {
+        "stat": "duration_p95"
+      },
+      "depends_on": [],
+      "sql": "SELECT date_bin($3::interval, start_time_unix_nano) AS at, approx_percentile_cont(duration_nano, 0.95) AS value FROM bifrost.traces.spans WHERE start_time_unix_nano >= $1::timestamptz AND start_time_unix_nano < $2::timestamptz AND parent_span_id IS NULL GROUP BY date_bin($3::interval, start_time_unix_nano) ORDER BY at",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z",
+        "1 minute"
+      ]
+    },
+    {
+      "id": "stat-invocations-total",
+      "family": "statstrip",
+      "builder": "statQueries",
+      "input": {
+        "stat": "invocations"
+      },
+      "depends_on": [],
+      "sql": "SELECT count(*) AS value FROM bifrost.traces.spans WHERE start_time_unix_nano >= $1::timestamptz AND start_time_unix_nano < $2::timestamptz AND gen_ai_operation_name = 'invoke_agent'",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z"
+      ]
+    },
+    {
+      "id": "stat-invocations-buckets",
+      "family": "statstrip",
+      "builder": "statQueries",
+      "input": {
+        "stat": "invocations"
+      },
+      "depends_on": [],
+      "sql": "SELECT date_bin($3::interval, start_time_unix_nano) AS at, count(*) AS value FROM bifrost.traces.spans WHERE start_time_unix_nano >= $1::timestamptz AND start_time_unix_nano < $2::timestamptz AND gen_ai_operation_name = 'invoke_agent' GROUP BY date_bin($3::interval, start_time_unix_nano) ORDER BY at",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z",
+        "1 minute"
+      ]
+    },
+    {
+      "id": "stat-logs-total",
+      "family": "statstrip",
+      "builder": "statQueries",
+      "input": {
+        "stat": "logs"
+      },
+      "depends_on": [],
+      "sql": "SELECT count(*) AS value FROM bifrost.logs.records WHERE time_unix_nano >= $1::timestamptz AND time_unix_nano < $2::timestamptz",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z"
+      ]
+    },
+    {
+      "id": "stat-logs-buckets",
+      "family": "statstrip",
+      "builder": "statQueries",
+      "input": {
+        "stat": "logs"
+      },
+      "depends_on": [],
+      "sql": "SELECT date_bin($3::interval, time_unix_nano) AS at, count(*) AS value FROM bifrost.logs.records WHERE time_unix_nano >= $1::timestamptz AND time_unix_nano < $2::timestamptz GROUP BY date_bin($3::interval, time_unix_nano) ORDER BY at",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z",
+        "1 minute"
+      ]
+    },
+    {
+      "id": "stat-log_errors-total",
+      "family": "statstrip",
+      "builder": "statQueries",
+      "input": {
+        "stat": "log_errors"
+      },
+      "depends_on": [],
+      "sql": "SELECT count(*) AS value FROM bifrost.logs.records WHERE time_unix_nano >= $1::timestamptz AND time_unix_nano < $2::timestamptz AND severity_number >= 17",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z"
+      ]
+    },
+    {
+      "id": "stat-log_errors-buckets",
+      "family": "statstrip",
+      "builder": "statQueries",
+      "input": {
+        "stat": "log_errors"
+      },
+      "depends_on": [],
+      "sql": "SELECT date_bin($3::interval, time_unix_nano) AS at, count(*) AS value FROM bifrost.logs.records WHERE time_unix_nano >= $1::timestamptz AND time_unix_nano < $2::timestamptz AND severity_number >= 17 GROUP BY date_bin($3::interval, time_unix_nano) ORDER BY at",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z",
+        "1 minute"
+      ]
+    },
+    {
+      "id": "stat-tokens-total",
+      "family": "statstrip",
+      "builder": "statQueries",
+      "input": {
+        "stat": "tokens"
+      },
+      "depends_on": [],
+      "sql": "SELECT sum(CAST(u['quantity'] AS DECIMAL(38, 12))) AS value FROM (SELECT started_at, workload_card_uid, subject_card_uid, unnest(usage) AS u FROM bifrost.gateway.calls) AS usage WHERE started_at >= $1::timestamptz AND started_at < $2::timestamptz AND u['unit'] = 'tokens'",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z"
+      ]
+    },
+    {
+      "id": "stat-tokens-buckets",
+      "family": "statstrip",
+      "builder": "statQueries",
+      "input": {
+        "stat": "tokens"
+      },
+      "depends_on": [],
+      "sql": "SELECT date_bin($3::interval, started_at) AS at, sum(CAST(u['quantity'] AS DECIMAL(38, 12))) AS value FROM (SELECT started_at, workload_card_uid, subject_card_uid, unnest(usage) AS u FROM bifrost.gateway.calls) AS usage WHERE started_at >= $1::timestamptz AND started_at < $2::timestamptz AND u['unit'] = 'tokens' GROUP BY date_bin($3::interval, started_at) ORDER BY at",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z",
+        "1 minute"
+      ]
+    },
+    {
+      "id": "stat-calls-total",
+      "family": "statstrip",
+      "builder": "statQueries",
+      "input": {
+        "stat": "calls"
+      },
+      "depends_on": [],
+      "sql": "SELECT count(*) AS value FROM bifrost.gateway.calls WHERE started_at >= $1::timestamptz AND started_at < $2::timestamptz",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z"
+      ]
+    },
+    {
+      "id": "stat-calls-buckets",
+      "family": "statstrip",
+      "builder": "statQueries",
+      "input": {
+        "stat": "calls"
+      },
+      "depends_on": [],
+      "sql": "SELECT date_bin($3::interval, started_at) AS at, count(*) AS value FROM bifrost.gateway.calls WHERE started_at >= $1::timestamptz AND started_at < $2::timestamptz GROUP BY date_bin($3::interval, started_at) ORDER BY at",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z",
+        "1 minute"
+      ]
+    },
+    {
+      "id": "stat-cost-total",
+      "family": "statstrip",
+      "builder": "statQueries",
+      "input": {
+        "stat": "cost"
+      },
+      "depends_on": [],
+      "sql": "SELECT sum(CAST(cost AS DECIMAL(38, 12))) AS value, currency FROM bifrost.gateway.calls WHERE started_at >= $1::timestamptz AND started_at < $2::timestamptz AND cost IS NOT NULL GROUP BY currency ORDER BY currency",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z"
+      ]
+    },
+    {
+      "id": "stat-cost-buckets",
+      "family": "statstrip",
+      "builder": "statQueries",
+      "input": {
+        "stat": "cost"
+      },
+      "depends_on": [],
+      "sql": "SELECT date_bin($3::interval, started_at) AS at, sum(CAST(cost AS DECIMAL(38, 12))) AS value, currency FROM bifrost.gateway.calls WHERE started_at >= $1::timestamptz AND started_at < $2::timestamptz AND cost IS NOT NULL GROUP BY date_bin($3::interval, started_at), currency ORDER BY at",
+      "params": [
+        "2026-11-18T12:00:00.000Z",
+        "2026-11-18T13:00:00.000Z",
+        "1 minute"
+      ]
+    }
+  ]
+}

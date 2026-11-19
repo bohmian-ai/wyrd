@@ -17,6 +17,11 @@ import {
 import type {
   AlterTableRequest as AlterTableRequestWire,
   ArtifactInventoryResponse,
+  ApprovalDecision,
+  ApprovalId,
+  ApprovalOccurrenceState,
+  ApprovalReceipt,
+  ApprovalStatus,
   ArtifactSpec,
   BifrostTableDescription as TableDescriptionWire,
   BifrostTableEntry as TableEntry,
@@ -51,6 +56,14 @@ import type {
   GatewayPolicySubject,
   GatewayPolicyTarget,
   GatewayPriceRate,
+  EvidenceRepository,
+  EvidenceStatus,
+  EvidenceTags,
+  GithubAppIdentity,
+  GithubConnectResponse,
+  GithubConnectionState,
+  GithubConnectionView,
+  GithubRepositoryAccess,
   HttpAuthScheme,
   HttpConnectionAuth,
   IssuedCredential,
@@ -96,11 +109,22 @@ import type {
   TokenAudience,
   UpdateOperatorConnectionRequest,
   NamedResponseFormatVariant2 as VerdictResponseFormat,
+  OutcomeDetails as WireOutcomeDetails,
+  RequirementDetails as WireRequirementDetails,
   RequirementResult as WireRequirementResult,
+  VerificationDetails as WireVerificationDetails,
   VerificationExecutionState as WireVerificationExecutionState,
   VerificationOutcome as WireVerificationOutcome,
   VerificationResult as WireVerificationResult,
   WorkloadRestriction,
+  CancelExecutionResponse,
+  DownloadInitResponse,
+  ExecutionPageQuery,
+  InvocationPage,
+  Publication,
+  PublicationPage,
+  PublicationSelector,
+  PublishEvidenceResponse,
 } from "./card-types.js";
 
 import type {
@@ -130,6 +154,8 @@ const {
 type NativeBifrost = import("../index.cjs").NativeBifrost;
 type NativeCards = import("../index.cjs").NativeCards;
 type NativeOperatorConnections = import("../index.cjs").NativeOperatorConnections;
+type NativeEvidence = import("../index.cjs").NativeEvidence;
+type NativeGithubConnection = import("../index.cjs").NativeGithubConnection;
 type NativePrincipals = import("../index.cjs").NativePrincipals;
 type NativeGateway = import("../index.cjs").NativeGateway;
 type NativeWyrdClient = import("../index.cjs").NativeWyrdClient;
@@ -164,6 +190,11 @@ export interface CancelRunningQueryResult {
 export type { WyrdErrorCode } from "./error-codes.js";
 /** Wire contracts generated from the `wyrd-spec` Rust types, under their SDK names. */
 export type {
+  ApprovalDecision,
+  ApprovalId,
+  ApprovalOccurrenceState,
+  ApprovalReceipt,
+  ApprovalStatus,
   ArtifactInventoryResponse,
   CardDeclarationOutcome,
   CardSummary,
@@ -194,6 +225,14 @@ export type {
   GatewayPolicySubject,
   GatewayPolicyTarget,
   GatewayPriceRate,
+  EvidenceRepository,
+  EvidenceStatus,
+  EvidenceTags,
+  GithubAppIdentity,
+  GithubConnectResponse,
+  GithubConnectionState,
+  GithubConnectionView,
+  GithubRepositoryAccess,
   HttpAuthScheme,
   HttpConnectionAuth,
   IssuedCredential,
@@ -225,6 +264,14 @@ export type {
   RoleSource,
   SortKey,
   TableEntry,
+  CancelExecutionResponse,
+  DownloadInitResponse,
+  ExecutionPageQuery,
+  InvocationPage,
+  Publication,
+  PublicationPage,
+  PublicationSelector,
+  PublishEvidenceResponse,
   TokenAudience,
   UpdateOperatorConnectionRequest,
 };
@@ -238,9 +285,15 @@ export type {
   DataSpec,
   DriftBaselineState,
   DriftBaselineStatus,
+  ExecutionInvocation,
   ExecutionRoute,
   ExperimentSpec,
+  HistoryProjection,
   McpSpec,
+  Producer,
+  PublicationKind,
+  PublicationManifest,
+  PublicationSummary,
   Metadata as CardMetadata,
   ModelSpec,
   OperatorSpec,
@@ -255,11 +308,14 @@ export type {
   RegisteredModelCard,
   RegisteredOperatorCard,
   RegisteredPromptCard,
+  RegisteredRepositoryCard,
   RegisteredServiceCard,
   RegisteredTriggerCard,
   RegisteredUntypedCard,
   RegisteredVerifierCard,
   Relationships as CardRelationships,
+  RepositorySpec,
+  RepositoryStatus,
   ServiceSpec,
   SpanRecord,
   Status as CardStatus,
@@ -281,7 +337,7 @@ export type VerdictData = NonNullable<WireRequirementResult["data"]>;
 /** The judgment of one requirement, its custom `data` typed `T`. */
 export type RequirementResult<T = VerdictData> = Omit<WireRequirementResult, "data"> & { readonly data?: T };
 
-/** Overall verdict with its requirement and step breakdown, custom `data` typed `T`. */
+/** Overall verdict with each requirement's judgment, custom `data` typed `T`. */
 export type VerificationOutcome<T = VerdictData> = Omit<WireVerificationOutcome, "requirements"> & {
   readonly requirements: readonly RequirementResult<T>[];
 };
@@ -289,6 +345,19 @@ export type VerificationOutcome<T = VerdictData> = Omit<WireVerificationOutcome,
 /** The attributable result of one Verifier execution, custom `data` typed `T`. */
 export type VerificationResult<T = VerdictData> = Omit<WireVerificationResult, "outcome"> & {
   readonly outcome: VerificationOutcome<T>;
+};
+
+/** One requirement's judgment with its authored check and provenance, custom `data` typed `T`. */
+export type RequirementDetails<T = VerdictData> = Omit<WireRequirementDetails, "data"> & { readonly data?: T };
+
+/** The verdict with everything the execution ran, custom `data` typed `T`. */
+export type OutcomeDetails<T = VerdictData> = Omit<WireOutcomeDetails, "requirements"> & {
+  readonly requirements: readonly RequirementDetails<T>[];
+};
+
+/** What one completed Verifier execution ran, custom `data` typed `T`. */
+export type VerificationDetails<T = VerdictData> = Omit<WireVerificationDetails, "outcome"> & {
+  readonly outcome: OutcomeDetails<T>;
 };
 
 /** A verification execution's status, its result's custom `data` typed `T`. */
@@ -306,7 +375,7 @@ export interface VerdictDataParser<T> {
 }
 
 /**
- * Decode every present requirement `data` of `result` with `parser`.
+ * Decode every present `data` of `requirements` with `parser`.
  *
  * Absent data stays absent; failed requirements decode too. Whatever the
  * parser throws, the first mismatch raises `WYRD_SDK_422_VERIFICATION_DATA_INVALID`
@@ -314,8 +383,11 @@ export interface VerdictDataParser<T> {
  * data root's empty `path`, never the data, the thrown value, or a deeper
  * path, which may hold a returned dictionary key.
  */
-function typedResult<T>(result: VerificationResult, parser: VerdictDataParser<T>): VerificationResult<T> {
-  const requirements = result.outcome.requirements.map((requirement): RequirementResult<T> => {
+function typedRequirements<R extends { readonly id: string; readonly data?: VerdictData | null }, T>(
+  requirements: readonly R[],
+  parser: VerdictDataParser<T>,
+): (Omit<R, "data"> & { readonly data?: T })[] {
+  return requirements.map((requirement) => {
     const { data, ...rest } = requirement;
     if (data === undefined) {
       return rest;
@@ -333,7 +405,14 @@ function typedResult<T>(result: VerificationResult, parser: VerdictDataParser<T>
       );
     }
   });
-  return { ...result, outcome: { ...result.outcome, requirements } };
+}
+
+/** {@link typedRequirements} over `result`'s requirements. */
+function typedResult<T>(result: VerificationResult, parser: VerdictDataParser<T>): VerificationResult<T> {
+  return {
+    ...result,
+    outcome: { ...result.outcome, requirements: typedRequirements(result.outcome.requirements, parser) },
+  };
 }
 
 /**
@@ -1824,9 +1903,10 @@ export class Cards {
    *
    * The envelope is discriminated by `kind`: `spec` and `status` are typed for
    * Data, Model, Artifact, Experiment, Prompt, Agent, Mcp, Service, Audit,
-   * Verifier, Trigger, and Operator Cards,
-   * including a Drift Verifier's `status.verification.baseline` state. Other
-   * kinds return {@link RegisteredUntypedCard}, whose `spec` is a plain record.
+   * Verifier, Trigger, Operator, and Repository Cards, including a Drift
+   * Verifier's `status.verification.baseline` state and a Repository's
+   * `status.repository` selection. Other kinds return
+   * {@link RegisteredUntypedCard}, whose `spec` is a plain record.
    *
    * @param ref - A Card reference, or its `Kind/name@version[#uid]` text.
    * @returns The declared envelope.
@@ -1989,6 +2069,75 @@ export class OperatorConnections {
    */
   async disable(connectionId: string): Promise<OperatorConnectionView> {
     return lifecycleValue<OperatorConnectionView>(await this.#native.disable(connectionId));
+  }
+}
+
+/**
+ * Tenant GitHub connection client over the shared Rust handle.
+ *
+ * Connects, reads, and disconnects the deployment's configured GitHub App.
+ * The server verifies, associates, authorizes, and audits; every response is
+ * the redacted {@link GithubConnectionView} or the transaction receipt, and
+ * failures throw a structured {@link WyrdError}.
+ */
+export class GithubConnection {
+  readonly #native: NativeGithubConnection;
+
+  private constructor(native: NativeGithubConnection) {
+    this.#native = native;
+  }
+
+  /**
+   * Connect a GitHub connection client, completing any credential exchange
+   * the client requires before resolving. A presented-as-is bearer or fresh
+   * cached token is reused without a request, so a later call may still be
+   * refused.
+   *
+   * @param options - `client` to call the server as; omitted, the ambient
+   * client is resolved.
+   * @returns The connection client.
+   * @throws {@link WyrdError} when the ambient client cannot be resolved or a
+   * required credential exchange is refused or unreachable.
+   */
+  static async connect(options: ClientOptions = {}): Promise<GithubConnection> {
+    const connection = await wyrdClientNative(clientOf(options)).githubConnection();
+    return new GithubConnection(nativeHandle(connection.handle, connection.error));
+  }
+
+  /**
+   * Begin a connection transaction; requires `identity_connections:write`.
+   * Open `authorization_url` in a browser signed in to Wyrd as the same
+   * principal to complete it.
+   *
+   * @returns GitHub's install URL and the instant the transaction expires.
+   * @throws {@link WyrdError} `WYRD_GITHUB_503_NOT_CONFIGURED` when the
+   * deployment has no GitHub App, or a transport or authorization failure.
+   */
+  async begin(): Promise<GithubConnectResponse> {
+    return lifecycleValue<GithubConnectResponse>(await this.#native.begin());
+  }
+
+  /**
+   * Read the tenant's connection; requires `identity_connections:write`.
+   *
+   * @returns The redacted connection view, `not_connected` when none.
+   * @throws {@link WyrdError} `WYRD_GITHUB_503_NOT_CONFIGURED` when the
+   * deployment has no GitHub App, or a transport or authorization failure.
+   */
+  async get(): Promise<GithubConnectionView> {
+    return lifecycleValue<GithubConnectionView>(await this.#native.get());
+  }
+
+  /**
+   * Release the tenant's installation; requires `identity_connections:write`.
+   *
+   * @returns The released, `not_connected` view.
+   * @throws {@link WyrdError} `WYRD_GITHUB_404_NOT_CONNECTED` when no
+   * installation is associated, `WYRD_GITHUB_503_NOT_CONFIGURED` when the
+   * deployment has no GitHub App, or a transport or authorization failure.
+   */
+  async disconnect(): Promise<GithubConnectionView> {
+    return lifecycleValue<GithubConnectionView>(await this.#native.disconnect());
   }
 }
 
@@ -2426,6 +2575,61 @@ export namespace verify {
   }
 
   /**
+   * Publishes evidence for a Verifier input declared `deferred: true`.
+   *
+   * Every Verifier bound to the repository, or already executing for the
+   * commit, that declares the input receives the evidence, and its waiting
+   * executions resume; publishing never starts an execution.
+   */
+  export class Evidence {
+    readonly #native: NativeEvidence;
+
+    private constructor(native: NativeEvidence) {
+      this.#native = native;
+    }
+
+    /**
+     * Connect a publisher, completing any credential exchange the client requires.
+     *
+     * @param options - `client` to publish as; omitted, the ambient client is resolved.
+     * @throws {@link WyrdError} when the client cannot be resolved or its
+     * credential exchange is refused.
+     */
+    static async connect(options: ClientOptions = {}): Promise<Evidence> {
+      const connection = await wyrdClientNative(clientOf(options)).evidence();
+      return new Evidence(nativeHandle(connection.handle, connection.error));
+    }
+
+    /**
+     * Publish `value` as the deferred input `name` and return the durable receipt.
+     *
+     * @param name - The deferred input name.
+     * @param value - JSON for a `json` input; a {@link File} (uploaded unless
+     * the tenant already holds it) or {@link ArtifactRef} for a `media` input.
+     * @param source - `repository` as `owner/name`, else `WYRD_REPOSITORY`,
+     * else the working directory's Git `origin`; `commit`, the full SHA the
+     * evidence is about, else `WYRD_COMMIT`, else the checkout's `HEAD`.
+     * @returns `accepted` on first acceptance, `replayed` when every
+     * subscriber already held the same evidence.
+     * @throws {@link WyrdError} `WYRD_VERIFICATION_400_INPUT_INVALID` when no
+     * source names the repository or commit, or the value does not fit;
+     * `WYRD_GITHUB_403_REPOSITORY_INACCESSIBLE` for a repository the tenant has
+     * not connected; `WYRD_VERIFICATION_409_EVIDENCE_UNMATCHED` when no Verifier
+     * subscribes; `WYRD_VERIFICATION_409_EVIDENCE_CONFLICT` when different
+     * evidence was already accepted.
+     */
+    async publish(
+      name: string,
+      value: VerifierInput,
+      source: { readonly repository?: string; readonly commit?: string } = {},
+    ): Promise<PublishEvidenceResponse> {
+      return lifecycleValue(
+        await this.#native.publish(name, nativeInput(name, value), source.repository, source.commit),
+      );
+    }
+  }
+
+  /**
    * One queued Verifier execution, addressed by its server-issued ID.
    *
    * Any process can rebuild it with {@link Execution.connect}; the
@@ -2475,8 +2679,9 @@ export namespace verify {
      * Poll with capped backoff until a result, the execution's own error, or
      * `timeoutMs`. A result is never invented from a status.
      *
-     * @throws {@link WyrdError} the settled execution's error (including an
-     * asynchronous idempotency conflict), `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT`,
+     * @throws {@link WyrdError} the settled execution's error,
+     * `WYRD_SDK_409_VERIFICATION_CANCELLED` for a cancelled execution,
+     * `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT`,
      * or a non-transient read failure.
      */
     async wait(options: { readonly timeoutMs: number }): Promise<VerificationResult> {
@@ -2510,6 +2715,113 @@ export namespace verify {
       parser: VerdictDataParser<T>,
     ): Promise<VerificationResult<T>> {
       return typedResult(await this.wait(options), parser);
+    }
+
+    /**
+     * Read one stable page of the execution's invocation attempts, with its
+     * status and history projection position.
+     *
+     * @param page - `limit` (1–200, default 50) and the previous page's `cursor`.
+     * @throws {@link WyrdError} validation for a bad limit or cursor, not-found
+     * for an execution not visible to the caller, and `verifier:read` denial.
+     */
+    async invocations(page: ExecutionPageQuery = {}): Promise<InvocationPage> {
+      return lifecycleValue(await this.#native.invocations(JSON.stringify(page)));
+    }
+
+    /**
+     * Read one stable page of the execution's accepted publications, without content.
+     *
+     * @param page - As for {@link Execution.invocations}.
+     * @throws {@link WyrdError} the errors of {@link Execution.invocations}.
+     */
+    async publications(page: ExecutionPageQuery = {}): Promise<PublicationPage> {
+      return lifecycleValue(await this.#native.publications(JSON.stringify(page)));
+    }
+
+    /**
+     * Read publication `name` of `stepId`'s exact producer attempt: a JSON
+     * value, or a file or directory manifest.
+     *
+     * @throws {@link WyrdError} validation for a zero attempt or a `path`,
+     * `WYRD_VERIFICATION_404_PUBLICATION_NOT_FOUND` when that attempt published
+     * no such name, and the errors of {@link Execution.invocations}.
+     */
+    async publication(stepId: string, name: string, selector: PublicationSelector): Promise<Publication> {
+      return lifecycleValue(await this.#native.publication(stepId, name, JSON.stringify(selector)));
+    }
+
+    /**
+     * Plan the download of a file publication, or of the directory publication
+     * file `selector.path` names.
+     *
+     * @throws {@link WyrdError} validation for a JSON publication, a path on a
+     * file, or a missing or unlisted directory path, and the errors of
+     * {@link Execution.publication}.
+     */
+    async download(stepId: string, name: string, selector: PublicationSelector): Promise<DownloadInitResponse> {
+      return lifecycleValue(await this.#native.download(stepId, name, JSON.stringify(selector)));
+    }
+
+    /**
+     * Cancel the execution durably; a terminal execution keeps its status, so
+     * a repeated cancel answers the same.
+     *
+     * @throws {@link WyrdError} not-found for an execution not visible to the
+     * caller, and `verifier:run` denial.
+     */
+    async cancel(): Promise<CancelExecutionResponse> {
+      return lifecycleValue(await this.#native.cancel());
+    }
+
+    /**
+     * Approve or reject a pending approval occurrence, one of
+     * {@link Execution.status}'s `approvals`, and return its receipt once the
+     * decision is durable; the same execution then continues. The same
+     * decision and reason again return the same receipt.
+     *
+     * @param approvalId - The pending occurrence's `approval_id`.
+     * @param decision - `approved` or `rejected`.
+     * @param reason - Why, recorded with the decision.
+     * @returns The receipt: `approval_id`, `status`, `actor_id`, `decided_at`, `reason`.
+     * @throws {@link WyrdError} `WYRD_PERMISSION_403_DENIED_RBAC` without
+     * `verifier:approve` on the execution's Verifier;
+     * `WYRD_VERIFICATION_404_APPROVAL_NOT_FOUND` for an occurrence the
+     * execution never reached; `WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING` once
+     * another decision was accepted or the execution ended or expired.
+     */
+    async decide(approvalId: ApprovalId, decision: ApprovalDecision, reason?: string): Promise<ApprovalReceipt> {
+      return lifecycleValue(await this.#native.decide(approvalId, decision, reason));
+    }
+
+    /**
+     * Read what the completed execution ran: each requirement's authored
+     * check and provenance, every step, and the pinned evidence, beside the
+     * same judgments as its result. One read, never polled; no Prompt is
+     * compiled to decode it.
+     *
+     * @throws {@link WyrdError} `WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND` when
+     * no complete details are visible to the caller, `verifier:read` denial,
+     * and the transport failure.
+     */
+    async details(): Promise<VerificationDetails> {
+      return lifecycleValue(await this.#native.details());
+    }
+
+    /**
+     * {@link Execution.details}, with each present custom `data` parsed by
+     * `parser`.
+     *
+     * @param parser - Parses each present `data`, such as a Zod schema.
+     * @throws {@link WyrdError} the errors of {@link Execution.details}, then
+     * `WYRD_SDK_422_VERIFICATION_DATA_INVALID` when present data does not parse.
+     */
+    async detailsTyped<T>(parser: VerdictDataParser<T>): Promise<VerificationDetails<T>> {
+      const details = await this.details();
+      return {
+        ...details,
+        outcome: { ...details.outcome, requirements: typedRequirements(details.outcome.requirements, parser) },
+      };
     }
   }
 }
@@ -2629,7 +2941,7 @@ export class Observe {
   /**
    * Submit slot values: Window samples are recorded for the Verifier's
    * schedule, and Run evidence is queued for one execution. Acceptance confirms
-   * staging only; read the outcome through the execution's `wait`.
+   * durable admission; read the outcome through the execution's `wait`.
    *
    * @param verifier - The bound Verifier's name.
    * @param inputs - As {@link Observe.verify}.

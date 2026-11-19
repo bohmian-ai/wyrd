@@ -28,7 +28,9 @@ use wyrd_ai::operator_connections::{
 };
 use wyrd_ai::transport::{GrpcConfig, HttpConfig};
 use wyrd_ai::verify::Execution;
-use wyrd_ai::{Bifrost, ExecutionId, SpanRecord, TraceId, VerificationResult, WyrdClient};
+use wyrd_ai::{
+    Bifrost, ExecutionId, SpanRecord, TraceId, VerificationDetails, VerificationResult, WyrdClient,
+};
 use wyrd_spec::ids::BindingId;
 use wyrd_spec::verification::VerificationExecutionStatus;
 use wyrd_spec::verification::execution::VerificationExecutionState;
@@ -424,6 +426,26 @@ impl Deployment {
         }
     }
 
+    /// The details of execution `id`, read as the administrator once its
+    /// result is visible: what it ran, with its steps and pinned evidence.
+    ///
+    /// # Panics
+    /// Panics when the handle cannot connect, no result is visible within a
+    /// minute, or the details do not read.
+    pub async fn details(&self, id: ExecutionId) -> VerificationDetails {
+        let execution = Execution::connect_with(id, &self.admin())
+            .await
+            .expect("the execution handle connects");
+        execution
+            .wait(Duration::from_secs(60))
+            .await
+            .expect("the result becomes visible");
+        execution
+            .details()
+            .await
+            .expect("the execution details read")
+    }
+
     /// Start a local Operator hook and create the HTTP connection
     /// `connection` pointing at it with bearer `token`, so a registered
     /// Operator naming that connection delivers to the hook.
@@ -471,6 +493,24 @@ impl Deployment {
             server,
             admin_key: self.admin_key,
             admin_root: self.admin_root,
+        }
+    }
+
+    /// Boot `builder` as a second bound replica over the same Postgres and
+    /// artifact storage while this server keeps running, as another pod
+    /// does. The administrator key is shared; clients of the replica are
+    /// built from the returned deployment.
+    ///
+    /// # Panics
+    /// Panics when the replica does not start.
+    pub async fn replica(&self, builder: WyrdTestServerBuilder) -> Self {
+        let server = Box::pin(self.server.start_bound_replica(builder))
+            .await
+            .expect("test server replica starts");
+        Self {
+            server,
+            admin_key: self.admin_key.clone(),
+            admin_root: self.admin_root.clone(),
         }
     }
 

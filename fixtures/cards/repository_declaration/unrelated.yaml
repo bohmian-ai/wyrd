@@ -1,0 +1,13 @@
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: unrelated-check
+  version: 1.0.0
+spec:
+  description: Lives beside wyrd.toml but no Repository selects it.
+  inputs:
+    answer: {type: json}
+  requirements:
+    - id: says-no
+      statement: The answer is "no"
+      check: {kind: assert, path: inputs.answer, operator: equals, expected: "no"}

@@ -44,11 +44,24 @@ use wyrd_spec::gateway::{GATEWAY_JSON_MAX_BYTES, GatewayCallOutcome};
 
 use super::{Wire, anthropic, google, openai_error_body, usage};
 use crate::credential::ProviderSecret;
-use crate::engine::{AttemptUsage, EventStream, ResponseCapture, StreamEnd};
+use crate::engine::{
+    AttemptUsage, EventStream, Frame, ProviderAttempt, ResponseCapture, StreamEnd,
+};
+use wyrd_runtime::resources::{ByteCharge, Inherited};
 
 /// Frames buffered between the upstream reader and the caller; once full,
 /// upstream reads wait for the caller.
 pub(crate) const FRAME_BUFFER: usize = 16;
+
+/// Largest frame the relay retains; a longer upstream chunk is relayed as
+/// several frames, so the frames a slow caller leaves queued hold at most
+/// [`FRAME_BUFFER`] times this many bytes.
+pub(crate) const FRAME_BYTES: usize = 64 * 1024;
+
+/// Most usage members one stream remembers; typed usage reads only a few,
+/// so further new members a provider sends are ignored while those kept
+/// still update.
+const USAGE_MEMBERS: usize = 32;
 
 /// The terminal frame of a successful Chat Completions stream.
 pub(crate) const DONE_FRAME: &[u8] = b"data: [DONE]\n\n";
@@ -79,6 +92,8 @@ enum Stop {
     Timeout,
     /// The caller cancelled or the server is draining.
     Cancelled,
+    /// Process memory could not hold the next frame.
+    Memory,
 }
 
 impl Stop {
@@ -88,13 +103,14 @@ impl Stop {
             Self::Upstream => "the provider stream ended before completing",
             Self::Timeout => "the gateway call exceeded its deadline",
             Self::Cancelled => "the gateway stream was cancelled",
+            Self::Memory => "process memory cannot hold the gateway stream now",
         }
     }
 
     /// Terminal call outcome of this stop.
     const fn outcome(self) -> GatewayCallOutcome {
         match self {
-            Self::Upstream => GatewayCallOutcome::Failed,
+            Self::Upstream | Self::Memory => GatewayCallOutcome::Failed,
             Self::Timeout => GatewayCallOutcome::TimedOut,
             Self::Cancelled => GatewayCallOutcome::Cancelled,
         }
@@ -107,7 +123,7 @@ impl Stop {
         match self {
             Self::Upstream => WyrdError::GatewayUpstreamUnavailable { message, details },
             Self::Timeout => WyrdError::GatewayDeadlineExceeded { message, details },
-            Self::Cancelled => WyrdError::ServiceUnavailable { message, details },
+            Self::Cancelled | Self::Memory => WyrdError::ServiceUnavailable { message, details },
         }
     }
 }
@@ -124,11 +140,15 @@ pub(crate) struct StreamCapture {
     events: Option<Vec<Value>>,
     /// Relayed event bytes counted so far.
     bytes: usize,
+    /// Process memory charged for the kept events, by their relayed size; a
+    /// sibling of the call's charge, returned when the capture drops.
+    charge: ByteCharge,
 }
 
 impl StreamCapture {
-    /// Starts an empty capture scrubbing `credential`.
-    pub(crate) fn new(credential: Option<&ProviderSecret>) -> Self {
+    /// Starts an empty capture scrubbing `credential`, charging what it
+    /// keeps as a sibling of the call's `memory`.
+    pub(crate) fn new(credential: Option<&ProviderSecret>, memory: &ByteCharge) -> Self {
         Self {
             secret: credential
                 .map(ProviderSecret::expose)
@@ -136,31 +156,42 @@ impl StreamCapture {
                 .map(|secret| SecretString::from(secret.to_owned())),
             events: Some(Vec::new()),
             bytes: 0,
+            charge: memory.sibling(),
         }
     }
 
-    /// Keeps `event`, relayed as `bytes` bytes, without the credential; an
-    /// event with no JSON form, one past the ceiling, or one holding the
-    /// credential as base64 drops the capture and frees what was kept.
+    /// Keeps `event`, relayed as `bytes` bytes, without the credential,
+    /// charging those bytes; an event with no JSON form, one past the
+    /// ceiling, one holding the credential as base64, or one process memory
+    /// cannot hold drops the capture and frees what was kept.
     fn push(&mut self, event: Option<Value>, bytes: usize) {
         self.bytes = self.bytes.saturating_add(bytes);
         let Some(events) = &mut self.events else {
             return;
         };
         let secret = self.secret.as_ref().map(ExposeSecret::expose_secret);
-        match event
+        if let Some(ResponseCapture::Json(event)) = event
             .filter(|_| self.bytes <= GATEWAY_JSON_MAX_BYTES)
+            .filter(|_| {
+                self.charge
+                    .try_grow(u64::try_from(bytes).unwrap_or(u64::MAX))
+                    .is_ok()
+            })
             .and_then(|event| ResponseCapture::json(event, secret))
         {
-            Some(ResponseCapture::Json(event)) => events.push(event),
-            _ => self.events = None,
+            events.push(event);
+        } else {
+            self.events = None;
+            self.charge.shrink(self.charge.bytes());
         }
     }
 
-    /// Kept events as one JSON array, or `None` when capture was dropped.
-    fn finish(self) -> Option<ResponseCapture> {
+    /// Kept events as one JSON array with the charge that still holds them,
+    /// or `None` when capture was dropped.
+    fn finish(self) -> Option<(ResponseCapture, ByteCharge)> {
+        let charge = self.charge;
         self.events
-            .map(|events| ResponseCapture::Json(Value::Array(events)))
+            .map(|events| (ResponseCapture::Json(Value::Array(events)), charge))
     }
 }
 
@@ -177,31 +208,61 @@ pub(crate) struct MediaCapture {
     secret: Option<SecretString>,
     /// Content type the upstream answer declared.
     content_type: String,
-    /// Delivered bytes in order.
-    bytes: Vec<u8>,
+    /// Delivered bytes in order; `None` once process memory could not hold
+    /// them, which drops capture.
+    bytes: Option<Vec<u8>>,
+    /// Process memory charged for `bytes`; a sibling of the call's charge,
+    /// returned when the capture drops.
+    charge: ByteCharge,
 }
 
 impl MediaCapture {
     /// Starts an empty capture of `content_type` bytes judged against
-    /// `credential`.
-    pub(crate) fn new(credential: Option<&ProviderSecret>, content_type: &str) -> Self {
+    /// `credential`, charging what it keeps as a sibling of the call's
+    /// `memory`.
+    pub(crate) fn new(
+        credential: Option<&ProviderSecret>,
+        content_type: &str,
+        memory: &ByteCharge,
+    ) -> Self {
         Self {
             secret: credential.map(|secret| SecretString::from(secret.expose().to_owned())),
             content_type: content_type.to_owned(),
-            bytes: Vec::new(),
+            bytes: Some(Vec::new()),
+            charge: memory.sibling(),
         }
     }
 
-    /// The kept bytes as a media capture, or `None` when they hold the
-    /// credential.
-    fn finish(self) -> Option<ResponseCapture> {
+    /// Keeps delivered `bytes`, charging them; bytes process memory cannot
+    /// hold drop the capture and free what was kept.
+    fn keep(&mut self, bytes: &[u8]) {
+        let Some(kept) = &mut self.bytes else {
+            return;
+        };
+        if self
+            .charge
+            .try_grow(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+            .is_ok()
+        {
+            kept.extend_from_slice(bytes);
+        } else {
+            self.bytes = None;
+            self.charge.shrink(self.charge.bytes());
+        }
+    }
+
+    /// The kept bytes as a media capture with the charge that still holds
+    /// them, or `None` when they hold the credential or capture was dropped.
+    fn finish(self) -> Option<(ResponseCapture, ByteCharge)> {
+        let charge = self.charge;
         ResponseCapture::media(
             MediaAnswer {
                 content_type: self.content_type,
-                bytes: self.bytes,
+                bytes: self.bytes?.into(),
             },
             self.secret.as_ref().map(ExposeSecret::expose_secret),
         )
+        .map(|capture| (capture, charge))
     }
 }
 
@@ -309,18 +370,24 @@ pub(crate) struct ChatChunks {
     created: u64,
     /// Whether the caller asked for a final usage chunk.
     include_usage: bool,
-    /// Choice indexes whose first chunk already carried the assistant role.
+    /// Choices the caller asked for, `n`; a provider choice index at or
+    /// beyond it is a protocol failure.
+    choices: u32,
+    /// Choice indexes whose first chunk already carried the assistant role,
+    /// at most `choices` of them.
     started: Vec<u32>,
 }
 
 impl ChatChunks {
-    /// Starts a chunk stream named `id` for `model`.
-    pub(crate) fn new(id: String, model: &str, include_usage: bool) -> Self {
+    /// Starts a chunk stream named `id` for `model` relaying `choices`
+    /// choices, at least one.
+    pub(crate) fn new(id: String, model: &str, include_usage: bool, choices: u32) -> Self {
         Self {
             id,
             model: model.to_owned(),
             created: super::now(),
             include_usage,
+            choices: choices.max(1),
             started: Vec::new(),
         }
     }
@@ -432,6 +499,9 @@ impl ChatChunks {
             let index = candidate
                 .index
                 .unwrap_or_else(|| u32::try_from(position).unwrap_or(u32::MAX));
+            if index >= self.choices {
+                return None;
+            }
             let mut content = String::new();
             for part in candidate.content.parts {
                 match part {
@@ -483,6 +553,7 @@ pub(crate) fn relay_media(
     deadline: Instant,
     cancel: CancellationToken,
     capture: Option<MediaCapture>,
+    memory: ByteCharge,
 ) -> EventStream {
     let (sender, receiver) = mpsc::channel(FRAME_BUFFER);
     let (end_sender, end) = oneshot::channel();
@@ -492,11 +563,23 @@ pub(crate) fn relay_media(
         deadline,
         cancel,
         sender,
+        memory,
         capture,
         last_byte: None,
     };
-    tokio::spawn(relay.run(upstream, end_sender, Arc::clone(&terminated)));
+    spawn_inherited(relay.run(upstream, end_sender, Arc::clone(&terminated)));
     EventStream::new(receiver, terminated, end)
+}
+
+/// Spawns a relay so each of its polls, where it decodes, translates and
+/// frames, runs on the spawning call's CPU lanes as that call's work; a poll
+/// that waits on the upstream or the caller returns its lane. Spawned from no
+/// laned work, the relay runs as is.
+fn spawn_inherited(relay: impl Future<Output = ()> + Send + 'static) {
+    match Inherited::current() {
+        Some(call) => tokio::spawn(call.laned(relay)),
+        None => tokio::spawn(relay),
+    };
 }
 
 /// One raw media relay: the caller's chunk channel plus the total answer bound
@@ -509,7 +592,9 @@ struct MediaRelay {
     /// Call cancellation, which stops the relay.
     cancel: CancellationToken,
     /// Bounded channel to the caller's stream.
-    sender: mpsc::Sender<Vec<u8>>,
+    sender: mpsc::Sender<Frame>,
+    /// The call's empty memory charge; each frame is charged as a sibling.
+    memory: ByteCharge,
     /// Selected response bytes kept for capture; `None` keeps nothing.
     capture: Option<MediaCapture>,
     /// When the last upstream body chunk arrived.
@@ -530,17 +615,19 @@ impl MediaRelay {
         if outcome == GatewayCallOutcome::Succeeded {
             terminated.store(true, Ordering::Release);
         }
-        let capture = self
+        let (capture, custody) = self
             .capture
             .take()
             .filter(|_| outcome == GatewayCallOutcome::Succeeded)
-            .and_then(MediaCapture::finish);
+            .and_then(MediaCapture::finish)
+            .unzip();
         // A caller that stopped accounting has nothing left to record.
         end.send(StreamEnd {
             outcome,
             terminal_at: Utc::now(),
             usage: AttemptUsage::default(),
             capture,
+            custody,
             last_byte: self.last_byte,
             relay: Duration::ZERO,
         })
@@ -574,16 +661,23 @@ impl MediaRelay {
                 return GatewayCallOutcome::Failed;
             }
             if let Some(capture) = &mut self.capture {
-                capture.bytes.extend_from_slice(&bytes);
+                capture.keep(&bytes);
             }
-            let sent = tokio::select! {
-                biased;
-                () = self.cancel.cancelled() => return GatewayCallOutcome::Cancelled,
-                () = tokio::time::sleep_until(self.deadline) => return GatewayCallOutcome::TimedOut,
-                sent = self.sender.send(bytes) => sent,
+            // Raw media has no in-band error: a refused chunk fails the
+            // stream, which the caller aborts.
+            let Ok(frames) = Frame::split(bytes, FRAME_BYTES, &self.memory) else {
+                return GatewayCallOutcome::Failed;
             };
-            if sent.is_err() {
-                return GatewayCallOutcome::Cancelled;
+            for frame in frames {
+                let sent = tokio::select! {
+                    biased;
+                    () = self.cancel.cancelled() => return GatewayCallOutcome::Cancelled,
+                    () = tokio::time::sleep_until(self.deadline) => return GatewayCallOutcome::TimedOut,
+                    sent = self.sender.send(frame) => sent,
+                };
+                if sent.is_err() {
+                    return GatewayCallOutcome::Cancelled;
+                }
             }
         }
     }
@@ -599,16 +693,22 @@ impl MediaRelay {
 /// waiting at most [`TERMINAL_GRACE`] for the caller to accept it, and marks
 /// the stream terminated once delivered; otherwise the stream stays
 /// unterminated so the caller aborts. Every end sends one [`StreamEnd`],
-/// carrying `capture`'s content when response capture was selected.
+/// carrying the relayed content when `attempt` selected response capture.
+/// Deadline, cancellation, credential, and the memory charged for retained
+/// frames and capture all come from `attempt`.
 pub(crate) fn relay(
     upstream: ProviderByteStream,
     wire: Wire,
     frames: Frames,
     limit: usize,
-    deadline: Instant,
-    cancel: CancellationToken,
-    capture: Option<StreamCapture>,
+    attempt: &ProviderAttempt<'_>,
 ) -> EventStream {
+    let deadline = attempt.deadline;
+    let cancel = attempt.cancel.clone();
+    let capture = attempt
+        .capture
+        .then(|| StreamCapture::new(attempt.credential, attempt.memory));
+    let memory = attempt.memory.sibling();
     let (sender, receiver) = mpsc::channel(FRAME_BUFFER);
     let (end_sender, end) = oneshot::channel();
     let terminated = Arc::new(AtomicBool::new(false));
@@ -619,11 +719,12 @@ pub(crate) fn relay(
         deadline,
         cancel,
         sender,
+        memory,
         capture,
         last_byte: None,
         busy: Duration::ZERO,
     };
-    tokio::spawn(relay.run(upstream, end_sender, Arc::clone(&terminated)));
+    spawn_inherited(relay.run(upstream, end_sender, Arc::clone(&terminated)));
     EventStream::new(receiver, terminated, end)
 }
 
@@ -645,7 +746,9 @@ struct Relay {
     /// Call cancellation, which stops the relay.
     cancel: CancellationToken,
     /// Bounded channel to the caller's stream.
-    sender: mpsc::Sender<Vec<u8>>,
+    sender: mpsc::Sender<Frame>,
+    /// The call's empty memory charge; each frame is charged as a sibling.
+    memory: ByteCharge,
     /// Selected response content kept for capture; `None` keeps nothing.
     capture: Option<StreamCapture>,
     /// When the last upstream body chunk arrived.
@@ -680,8 +783,11 @@ impl Relay {
                 if let Some(frame) = boundary
                     .then(|| error_frame(self.wire, &self.frames, stop))
                     .flatten()
-                    && let Ok(Ok(())) =
-                        tokio::time::timeout(TERMINAL_GRACE, self.sender.send(frame)).await
+                    && let Ok(Ok(())) = tokio::time::timeout(
+                        TERMINAL_GRACE,
+                        self.sender.send(Frame::mandatory(frame, &self.memory)),
+                    )
+                    .await
                 {
                     terminated.store(true, Ordering::Release);
                 }
@@ -689,33 +795,46 @@ impl Relay {
             }
             Ended::Detached => (GatewayCallOutcome::Cancelled, AttemptUsage::default()),
         };
+        let (capture, custody) = self.capture.take().and_then(StreamCapture::finish).unzip();
         // A caller that stopped accounting has nothing left to record.
         end.send(StreamEnd {
             outcome,
             terminal_at: Utc::now(),
             usage,
-            capture: self.capture.take().and_then(StreamCapture::finish),
+            capture,
+            custody,
             last_byte: self.last_byte,
             relay: self.busy,
         })
         .ok();
     }
 
-    /// Sends `frame` unless the caller is gone, the deadline passes, or
-    /// cancellation fires first.
+    /// Charges `frame` and sends it as pieces of at most [`FRAME_BYTES`]
+    /// unless process memory cannot hold it, which discards it, the caller
+    /// is gone, the deadline passes, or cancellation fires.
     ///
     /// # Errors
     ///
-    /// Returns the [`Ended`] state the interruption implies; a caller that
-    /// cannot accept frames is always at an event boundary, since frames are
-    /// whole.
+    /// Returns the [`Ended`] state the interruption implies. It is at an
+    /// event boundary only when no piece of `frame` was sent yet.
     async fn deliver(&self, frame: Vec<u8>) -> Result<(), Ended> {
-        tokio::select! {
-            biased;
-            () = self.cancel.cancelled() => Err(Ended::Failed { stop: Stop::Cancelled, boundary: true }),
-            () = tokio::time::sleep_until(self.deadline) => Err(Ended::Failed { stop: Stop::Timeout, boundary: true }),
-            sent = self.sender.send(frame) => sent.map_err(|_| Ended::Detached),
+        let Ok(pieces) = Frame::split(frame, FRAME_BYTES, &self.memory) else {
+            return Err(Ended::Failed {
+                stop: Stop::Memory,
+                boundary: true,
+            });
+        };
+        for (sent, piece) in pieces.enumerate() {
+            let boundary = sent == 0;
+            let stop = |stop| Ended::Failed { stop, boundary };
+            tokio::select! {
+                biased;
+                () = self.cancel.cancelled() => return Err(stop(Stop::Cancelled)),
+                () = tokio::time::sleep_until(self.deadline) => return Err(stop(Stop::Timeout)),
+                sent = self.sender.send(piece) => sent.map_err(|_| Ended::Detached)?,
+            }
         }
+        Ok(())
     }
 
     /// Moves upstream events to the caller until the upstream ends.
@@ -799,7 +918,10 @@ impl Relay {
             for frame in out {
                 if let Err(ended) = self.deliver(frame).await {
                     return match ended {
-                        Ended::Failed { stop, .. } => failed(stop, &decoder, &self.frames),
+                        Ended::Failed {
+                            stop,
+                            boundary: true,
+                        } => failed(stop, &decoder, &self.frames),
                         other => other,
                     };
                 }
@@ -920,7 +1042,7 @@ impl Relay {
 /// Overlays the usage object `event` carries onto `merged`: `OpenAI` `usage`
 /// or a Responses event's `response.usage`, Anthropic `message.usage` then
 /// each later `usage`, Google `usageMetadata`, or Jev `usage`, though Jev
-/// never streams.
+/// never streams. At most [`USAGE_MEMBERS`] members are remembered.
 fn merge_usage(wire: Wire, event: &Value, merged: &mut Map<String, Value>) {
     let found = match wire {
         Wire::Jev => event.get("usage"),
@@ -935,7 +1057,11 @@ fn merge_usage(wire: Wire, event: &Value, merged: &mut Map<String, Value>) {
             .or_else(|| event.get("usage_metadata")),
     };
     if let Some(Value::Object(object)) = found {
-        merged.extend(object.clone());
+        for (member, value) in object {
+            if merged.len() < USAGE_MEMBERS || merged.contains_key(member) {
+                merged.insert(member.clone(), value.clone());
+            }
+        }
     }
 }
 
@@ -945,4 +1071,90 @@ fn frame(chunk: &OpenAiChatStreamChunk) -> Option<Vec<u8>> {
     serde_json::to_writer(&mut bytes, chunk).ok()?;
     bytes.extend_from_slice(b"\n\n");
     Some(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Map, json};
+
+    use wyrd_runtime::resources::ByteLedger;
+
+    use super::{MediaCapture, StreamCapture, USAGE_MEMBERS, Wire, merge_usage};
+
+    /// A provider sending a new usage member in every event cannot grow what
+    /// the relay remembers past [`USAGE_MEMBERS`], and a remembered member
+    /// still takes its latest value.
+    #[test]
+    fn merged_usage_keeps_a_bounded_set_of_members() {
+        let mut merged = Map::new();
+        for member in 0..1_000 {
+            merge_usage(
+                Wire::OpenAi,
+                &json!({"usage": {format!("member_{member}"): member}}),
+                &mut merged,
+            );
+        }
+        merge_usage(
+            Wire::OpenAi,
+            &json!({"usage": {"member_0": "latest"}}),
+            &mut merged,
+        );
+        assert_eq!(merged.len(), USAGE_MEMBERS);
+        assert_eq!(merged["member_0"], "latest", "a kept member still updates");
+    }
+
+    /// A stream capture is charged for what it keeps; an event process
+    /// memory cannot also hold drops the capture and returns its charge.
+    #[test]
+    fn a_stream_capture_is_charged_until_memory_refuses_it() {
+        let ledger = ByteLedger::new(100);
+        let mut capture = StreamCapture::new(None, &ledger.empty_charge());
+        capture.push(Some(json!({"n": 1})), 40);
+        capture.push(Some(json!({"n": 2})), 40);
+        assert_eq!(ledger.used(), 80, "kept events are charged");
+        capture.push(Some(json!({"n": 3})), 40);
+        assert_eq!(ledger.used(), 0, "a refused event drops the capture");
+        assert!(capture.finish().is_none(), "nothing is captured");
+    }
+
+    /// A media capture is charged for the bytes it keeps; bytes process
+    /// memory cannot also hold drop the capture and return its charge.
+    #[test]
+    fn a_media_capture_is_charged_until_memory_refuses_it() {
+        let ledger = ByteLedger::new(10);
+        let mut capture = MediaCapture::new(None, "audio/mpeg", &ledger.empty_charge());
+        capture.keep(&[0; 6]);
+        assert_eq!(ledger.used(), 6, "kept bytes are charged");
+        capture.keep(&[0; 6]);
+        assert_eq!(ledger.used(), 0, "refused bytes drop the capture");
+        assert!(capture.finish().is_none(), "nothing is captured");
+    }
+
+    /// A stream capture that finishes keeps its charge with the finished
+    /// content, returning it only once that content drops.
+    #[test]
+    fn a_finished_stream_capture_stays_charged_while_its_content_lives() {
+        let ledger = ByteLedger::new(100);
+        let mut capture = StreamCapture::new(None, &ledger.empty_charge());
+        capture.push(Some(json!({"n": 1})), 40);
+        let finished = capture.finish();
+        assert!(finished.is_some(), "the events are captured");
+        assert_eq!(ledger.used(), 40, "finished content stays charged");
+        drop(finished);
+        assert_eq!(ledger.used(), 0, "dropping the content returns its charge");
+    }
+
+    /// A media capture that finishes keeps its charge with the finished
+    /// bytes, returning it only once they drop.
+    #[test]
+    fn a_finished_media_capture_stays_charged_while_its_bytes_live() {
+        let ledger = ByteLedger::new(10);
+        let mut capture = MediaCapture::new(None, "audio/mpeg", &ledger.empty_charge());
+        capture.keep(&[0; 6]);
+        let finished = capture.finish();
+        assert!(finished.is_some(), "the bytes are captured");
+        assert_eq!(ledger.used(), 6, "finished bytes stay charged");
+        drop(finished);
+        assert_eq!(ledger.used(), 0, "dropping the bytes returns their charge");
+    }
 }

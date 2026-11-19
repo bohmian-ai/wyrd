@@ -752,8 +752,8 @@ struct PromptOptions {
 }
 
 /// One response format, by its `type`: plain text, a JSON object, a named
-/// JSON Schema, or the canonical Verdict with an optional custom `data`
-/// schema.
+/// JSON Schema, the canonical Verdict with an optional custom `data`
+/// schema, or the standard code review report.
 #[derive(Debug, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum PromptFormat {
@@ -774,6 +774,8 @@ enum PromptFormat {
         #[serde(default)]
         data: Option<serde_json::Map<String, Value>>,
     },
+    /// The standard code review report, whose schema is fixed.
+    CodeReview,
 }
 
 impl PromptFormat {
@@ -789,6 +791,7 @@ impl PromptFormat {
             Self::JsonObject => Ok(ResponseFormat::json_object()),
             Self::JsonSchema { name, schema } => ResponseFormat::json_schema(name, schema),
             Self::Verdict { data } => Ok(ResponseFormat::verdict(data)),
+            Self::CodeReview => Ok(ResponseFormat::code_review()),
         }
     }
 }

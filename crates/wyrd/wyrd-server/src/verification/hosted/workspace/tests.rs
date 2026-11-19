@@ -1,7 +1,7 @@
 //! Workspaces stay inside their directory, inside their limits, serve the
 //! actual lines of their files, and extract only on request.
 
-use std::io::Write as _;
+use std::io::Cursor;
 
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -224,12 +224,22 @@ fn workspace_reads_lines_and_extracts_on_request() {
         invalid("extraction_refused")
     );
     assert!(!workspace.work_dir().join("bad.json").exists());
+    let mut entries: Vec<_> = std::fs::read_dir(&workspace.root)
+        .expect("root")
+        .map(|entry| entry.expect("entry").file_name())
+        .collect();
+    entries.sort();
     assert_eq!(
-        std::fs::read_dir(workspace.root.path())
-            .expect("root")
-            .count(),
-        2,
+        entries,
+        ["inputs", "staging", "work"],
         "a refused extraction leaves no temporary file"
+    );
+    assert_eq!(
+        std::fs::read_dir(workspace.root.join("staging"))
+            .expect("staging")
+            .count(),
+        0,
+        "every staged input was placed"
     );
 }
 
@@ -644,5 +654,469 @@ fn workspace_refuses_bad_paths_and_limits() {
     assert_eq!(
         refusal(workspace.extract("/inputs/img.png", "/work/img.json")),
         invalid("extractable_document")
+    );
+}
+
+/// `fs.write` creates and replaces regular `/work` files with their parents
+/// and reads back exactly; it refuses `/inputs`, traversal, a file or link
+/// as a parent or target, and content over the `/work` budget, which counts
+/// a replaced file once, leaving every refused location untouched.
+///
+/// # Panics
+/// Panics when a write differs or a refused write changes the workspace.
+#[test]
+fn workspace_writes_private_scratch() {
+    let limits = HostedLimits {
+        work_write_max_bytes: 16,
+        ..HostedLimits::default()
+    };
+    let workspace = Workspace::materialize(
+        vec![staged(
+            "/inputs/a.txt",
+            b"input".to_vec(),
+            MediaFormat::Text,
+        )],
+        limits,
+        None,
+    )
+    .expect("workspace");
+    assert_eq!(
+        workspace
+            .write("/work/notes/day 1/é.md", "draft")
+            .expect("written"),
+        json!({"path": "/work/notes/day 1/é.md", "bytes": 5})
+    );
+    assert_eq!(
+        workspace
+            .write("/work/notes/day 1/é.md", "final text!!")
+            .expect("replaced"),
+        json!({"path": "/work/notes/day 1/é.md", "bytes": 12})
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.work_dir().join("notes/day 1/é.md")).expect("read"),
+        "final text!!"
+    );
+    assert_eq!(
+        refusal(workspace.write("/work/other.md", "12345")),
+        invalid("work_budget"),
+        "twelve held plus five passes sixteen"
+    );
+    workspace
+        .write("/work/notes/day 1/é.md", "sixteen bytes!!!")
+        .expect("a replacement counts the replaced file once");
+    for path in [
+        "/inputs/a.txt",
+        "/inputs/new.txt",
+        "/work/../inputs/a.txt",
+        "/work//x.md",
+        "/work/./x.md",
+        "/etc/x.md",
+        "/work",
+    ] {
+        assert_eq!(
+            refusal(workspace.write(path, "x")),
+            invalid("write_path"),
+            "{path}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(workspace.inputs_dir().join("a.txt")).expect("input"),
+        "input"
+    );
+    std::fs::write(workspace.work_dir().join("flat"), b"").expect("file");
+    assert_eq!(
+        refusal(workspace.write("/work/flat/child.md", "x")),
+        invalid("write_parent")
+    );
+    let outside = tempfile::tempdir().expect("outside");
+    std::os::unix::fs::symlink(outside.path(), workspace.work_dir().join("escape")).expect("link");
+    assert_eq!(
+        refusal(workspace.write("/work/escape/deeper/x.md", "x")),
+        invalid("write_parent")
+    );
+    std::os::unix::fs::symlink(
+        outside.path().join("target.md"),
+        workspace.work_dir().join("linked.md"),
+    )
+    .expect("link");
+    assert_eq!(
+        refusal(workspace.write("/work/linked.md", "x")),
+        invalid("regular_file")
+    );
+    assert_eq!(
+        refusal(workspace.write("/work/notes", "x")),
+        invalid("regular_file")
+    );
+    assert_eq!(
+        std::fs::read_dir(outside.path()).expect("outside").count(),
+        0,
+        "no write followed a link out of /work"
+    );
+    let big = HostedLimits {
+        work_write_max_bytes: 4,
+        ..HostedLimits::default()
+    };
+    let small = Workspace::materialize(Vec::new(), big, None).expect("workspace");
+    assert_eq!(
+        refusal(small.write("/work/new/deep/x.md", "hello")),
+        invalid("work_budget")
+    );
+    assert!(
+        !small.work_dir().join("new").exists(),
+        "a refused write creates no parent"
+    );
+}
+
+/// A snapshot whose caller is cancelled keeps the `/work` writer turn until
+/// its blocking read ends, so no writer changes the tree mid-read.
+///
+/// # Panics
+/// Panics when the runtime cannot build, the file cannot be written, or the
+/// turn is released before the read ends.
+#[test]
+fn cancelled_snapshot_keeps_writer_exclusion() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let workspace = Arc::new(
+            Workspace::materialize(Vec::new(), HostedLimits::default(), None).expect("workspace"),
+        );
+        std::fs::write(workspace.work_dir().join("notes.md"), b"x").expect("write");
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let blocker = tokio::task::spawn_blocking(move || held.recv());
+        let work = tokio_util::task::TaskTracker::new();
+        let mut freeze = Box::pin(workspace.freeze("/work/notes.md", &work));
+        let polled =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(freeze.as_mut().poll(cx))).await;
+        assert!(polled.is_pending(), "the read waits for the blocking pool");
+        drop(freeze);
+        assert!(
+            workspace.writer.try_lock().is_err(),
+            "the queued read still owns the turn"
+        );
+        release.send(()).expect("release");
+        blocker.await.expect("blocker").expect("released");
+        let _turn = workspace.writer().await;
+    });
+}
+
+/// Whether `result` is a host stop carrying a busy refusal naming `what`,
+/// which the Agent session turns into a busy block rather than a tool
+/// result the model sees.
+fn busy_stop(result: &Result<Value, ToolError>, what: &str) -> bool {
+    matches!(
+        result,
+        Err(ToolError::Invocation { cause: Some(cause), .. })
+            if matches!(
+                cause.downcast_ref::<BlockError>(),
+                Some(BlockError::Busy { reason }) if reason.contains(what)
+            )
+    )
+}
+
+/// `fs.extract` charges process memory for the document it reads and the
+/// output it builds while it runs, and process scratch for its output; a
+/// charge either ledger cannot grant, including memory for the encoded
+/// output of a document that fits, stops the call busy before it writes,
+/// and every charge but the written output's scratch returns when it ends.
+///
+/// # Panics
+/// Panics when a refused extraction is not a busy stop, writes its output,
+/// or leaves a charge, or the extraction that fits leaves memory charged.
+#[test]
+fn extraction_charges_process_memory_and_scratch() {
+    let text = "alpha\nbeta\n".repeat(64).into_bytes();
+    let size = text.len() as u64;
+    let open = |memory: u64, scratch: u64| {
+        let scratch = ByteLedger::new(scratch);
+        let mut workspace = Workspace::materialize(
+            vec![staged("/inputs/a.txt", text.clone(), MediaFormat::Text)],
+            HostedLimits::default(),
+            ScratchRoot {
+                dir: std::env::temp_dir(),
+                ledger: scratch.clone(),
+            },
+        )
+        .expect("materializes");
+        let memory = ByteLedger::new(memory);
+        workspace.memory = Some(memory.clone());
+        (workspace, memory, scratch)
+    };
+
+    let (workspace, memory, _) = open(size - 1, 1 << 20);
+    let refused = workspace.extract("/inputs/a.txt", "/work/a.json");
+    assert!(busy_stop(&refused, "memory"), "{refused:?}");
+    assert_eq!(memory.used(), 0);
+
+    let (workspace, memory, _) = open(size + 1, 1 << 20);
+    let refused = workspace.extract("/inputs/a.txt", "/work/a.json");
+    assert!(
+        busy_stop(&refused, "memory"),
+        "memory that holds the document but not its encoded output: {refused:?}"
+    );
+    assert_eq!(memory.used(), 0);
+    assert!(!workspace.work_dir().join("a.json").exists());
+
+    let (workspace, memory, scratch) = open(1 << 20, size + 1);
+    let refused = workspace.extract("/inputs/a.txt", "/work/a.json");
+    assert!(busy_stop(&refused, "scratch"), "{refused:?}");
+    assert_eq!(memory.used(), 0);
+    assert_eq!(scratch.used(), size, "only the inputs stay charged");
+    assert!(!workspace.work_dir().join("a.json").exists());
+
+    let (workspace, memory, scratch) = open(1 << 20, 1 << 20);
+    workspace
+        .extract("/inputs/a.txt", "/work/a.json")
+        .expect("extracts");
+    assert_eq!(memory.used(), 0, "the read and output charges end");
+    let written = std::fs::metadata(workspace.work_dir().join("a.json"))
+        .expect("output")
+        .len();
+    assert_eq!(scratch.used(), size + written);
+}
+
+/// A charged workspace's scratch charge is its inputs plus what `/work`
+/// holds plus the one write being admitted, never its unused room. A write
+/// the shared process scratch ledger cannot hold beside another workspace
+/// is refused as scratch, a write past the `/work` limit as the limit, and
+/// the next admission returns bytes a removed file freed.
+///
+/// # Panics
+/// Panics when a charge counts unused room or ignores the ledger.
+#[test]
+fn admitted_writes_charge_process_scratch() {
+    let ledger = ByteLedger::new(1_000);
+    let limits = HostedLimits {
+        work_write_max_bytes: 500,
+        ..HostedLimits::default()
+    };
+    let open = || {
+        Workspace::materialize(
+            vec![staged("/inputs/a.txt", vec![b'x'; 100], MediaFormat::Text)],
+            limits,
+            ScratchRoot {
+                dir: std::env::temp_dir(),
+                ledger: ledger.clone(),
+            },
+        )
+        .expect("materializes")
+    };
+
+    let first = open();
+    assert_eq!(ledger.used(), 100, "inputs are charged as written");
+    assert_eq!(first.work_room(), 500);
+    assert_eq!(ledger.used(), 100, "unused room is not charged");
+    assert_eq!(first.admit_write(600), Err(WriteRefusal::Limit));
+    assert_eq!(ledger.used(), 100);
+    first.admit_write(200).expect("admits");
+    assert_eq!(ledger.used(), 300, "the admitted write is charged");
+    std::fs::write(first.work_dir().join("w.txt"), [b'y'; 200]).expect("work file");
+
+    let second = open();
+    second.admit_write(500).expect("admits");
+    assert_eq!(ledger.used(), 900);
+    std::fs::write(second.work_dir().join("w.txt"), [b'y'; 500]).expect("work file");
+    first.admit_write(100).expect("admits");
+    assert_eq!(ledger.used(), 1_000);
+    assert_eq!(
+        second.admit_write(1),
+        Err(WriteRefusal::Limit),
+        "/work is full"
+    );
+    std::fs::remove_file(second.work_dir().join("w.txt")).expect("removes");
+    second.admit_write(0).expect("admits");
+    assert_eq!(ledger.used(), 500, "a removed file returns its charge");
+
+    let third = open();
+    assert_eq!(
+        third.admit_write(450),
+        Err(WriteRefusal::Scratch),
+        "process scratch is shared"
+    );
+    assert_eq!(ledger.used(), 600, "a refused write leaves no charge");
+
+    drop(first);
+    assert_eq!(ledger.used(), 200, "a dropped workspace returns its charge");
+}
+
+/// `fs.write` charges process scratch for what it adds to `/work`: a write
+/// the shared ledger cannot hold stops the call busy and writes nothing,
+/// and a replacement is charged only for the bytes it grows by once it
+/// lands. While it lands, its temporary copy sits beside the file it
+/// replaces, so that copy is charged too: a replacement whose final size
+/// fits but whose copy does not stops busy and keeps the original.
+///
+/// # Panics
+/// Panics when a write passes a full ledger, a replacement's copy goes
+/// uncharged or its final bytes are charged twice, or a refused write
+/// changes `/work`.
+#[test]
+fn writes_charge_process_scratch() {
+    let ledger = ByteLedger::new(450);
+    let workspace = Workspace::materialize(
+        vec![staged("/inputs/a.txt", vec![b'x'; 100], MediaFormat::Text)],
+        HostedLimits::default(),
+        ScratchRoot {
+            dir: std::env::temp_dir(),
+            ledger: ledger.clone(),
+        },
+    )
+    .expect("materializes");
+    let written = workspace.work_dir().join("w.txt");
+
+    workspace
+        .write("/work/w.txt", &"y".repeat(150))
+        .expect("writes");
+    assert_eq!(ledger.used(), 250, "the written bytes are charged");
+    workspace
+        .write("/work/w.txt", &"y".repeat(200))
+        .expect("a replacement whose copy fits writes");
+    assert_eq!(ledger.used(), 300, "a replaced file is charged once");
+
+    let refused = workspace.write("/work/w.txt", &"z".repeat(200));
+    assert!(busy_stop(&refused, "scratch"), "{refused:?}");
+    assert_eq!(
+        std::fs::read_to_string(&written).expect("original"),
+        "y".repeat(200),
+        "a replacement whose copy does not fit keeps the original"
+    );
+    assert_eq!(ledger.used(), 300, "a refused replacement adds no charge");
+
+    let refused = workspace.write("/work/more.txt", &"z".repeat(151));
+    assert!(busy_stop(&refused, "scratch"), "{refused:?}");
+    assert!(!workspace.work_dir().join("more.txt").exists());
+    assert_eq!(ledger.used(), 300, "a refused write adds no charge");
+}
+
+/// A workspace whose directory cannot be removed keeps its whole scratch
+/// charge, so a sibling is never promised bytes still on disk; one that is
+/// removed returns its charge once.
+///
+/// # Panics
+/// Panics when a surviving directory returns its charge, or a removed one
+/// keeps it.
+#[test]
+fn surviving_workspace_keeps_its_scratch_charge() {
+    let ledger = ByteLedger::new(1_000);
+    let open = || {
+        Workspace::materialize(
+            vec![staged("/inputs/a.txt", vec![b'x'; 100], MediaFormat::Text)],
+            HostedLimits::default(),
+            ScratchRoot {
+                dir: std::env::temp_dir(),
+                ledger: ledger.clone(),
+            },
+        )
+        .expect("materializes")
+    };
+
+    let removed = open();
+    assert_eq!(ledger.used(), 100);
+    drop(removed);
+    assert_eq!(ledger.used(), 0, "a removed workspace returns its charge");
+
+    let surviving = open();
+    let locked = surviving.work_dir().join("locked");
+    std::fs::create_dir(&locked).expect("a code-made directory");
+    std::fs::write(locked.join("kept.txt"), b"k").expect("a code-made file");
+    let unlocked = std::fs::metadata(&locked).expect("locked").permissions();
+    let mut readonly = unlocked.clone();
+    readonly.set_readonly(true);
+    std::fs::set_permissions(&locked, readonly).expect("locks the directory");
+    let root = surviving.root.clone();
+    drop(surviving);
+    assert!(
+        locked.join("kept.txt").exists(),
+        "the file survived removal"
+    );
+    assert_eq!(ledger.used(), 100, "surviving bytes stay charged");
+    assert!(
+        ledger.try_charge(901).is_err(),
+        "a sibling cannot be promised the surviving bytes"
+    );
+
+    std::fs::set_permissions(&locked, unlocked).expect("unlocks the directory");
+    std::fs::remove_dir_all(root).expect("removes the test directory");
+}
+
+/// A cleanup dropped before it runs, as when a runtime shuts down, keeps
+/// its workspace's charge, since nothing confirmed the bytes are gone; a
+/// released one returns it.
+///
+/// # Panics
+/// Panics when an unrun cleanup returns its charge or a released one keeps
+/// it.
+#[test]
+fn abandoned_cleanup_keeps_its_scratch_charge() {
+    let ledger = ByteLedger::new(1_000);
+    let released = Custody {
+        charge: Some(ledger.try_charge(10).expect("fits")),
+        root: PathBuf::from("released"),
+    };
+    released.release();
+    assert_eq!(ledger.used(), 0, "a confirmed cleanup returns its charge");
+    let abandoned = Custody {
+        charge: Some(ledger.try_charge(10).expect("fits")),
+        root: PathBuf::from("abandoned"),
+    };
+    drop(abandoned);
+    assert_eq!(ledger.used(), 10, "an unconfirmed cleanup keeps its charge");
+}
+
+/// An archive unpacks from its staged file, so while it unpacks scratch
+/// holds the compressed archive and its entries together: a ledger that
+/// fits less than both refuses it busy and keeps nothing, and once it is
+/// unpacked the staged archive is removed and only its entries stay
+/// charged.
+///
+/// # Panics
+/// Panics when the refusal is not busy or leaves a charge, or the unpacked
+/// workspace keeps the staged archive or its charge.
+#[test]
+fn archives_unpack_beside_their_staged_file() {
+    let (alpha, beta) = ("alpha\n".repeat(200), "beta\n".repeat(200));
+    let archive = zipped(&[("a.txt", &alpha), ("b.txt", &beta)]);
+    let expanded = (alpha.len() + beta.len()) as u64;
+    let compressed = archive.len() as u64;
+    let open = |room: u64| {
+        let ledger = ByteLedger::new(room);
+        let opened = Workspace::materialize(
+            vec![staged(
+                "/inputs/docs.zip",
+                archive.clone(),
+                MediaFormat::Zip,
+            )],
+            HostedLimits::default(),
+            ScratchRoot {
+                dir: std::env::temp_dir(),
+                ledger: ledger.clone(),
+            },
+        );
+        (opened, ledger)
+    };
+
+    let (refused, ledger) = open(compressed + expanded - 1);
+    assert!(matches!(refused, Err(BlockError::Busy { .. })));
+    assert_eq!(ledger.used(), 0, "a refused unpack keeps no charge");
+
+    let (unpacked, ledger) = open(compressed + expanded);
+    let workspace = unpacked.expect("unpacks");
+    assert_eq!(
+        ledger.used(),
+        expanded,
+        "the staged archive's charge returns"
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.inputs_dir().join("docs.zip/a.txt")).expect("entry"),
+        alpha
+    );
+    assert_eq!(
+        std::fs::read_dir(workspace.root.join("staging"))
+            .expect("staging")
+            .count(),
+        0,
+        "the staged archive is removed"
     );
 }

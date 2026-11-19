@@ -20,8 +20,9 @@ export interface Reply {
 
 /**
  * A local HTTP endpoint standing in for a provider, a judge, or an Operator
- * hook. It answers each request with `reply` and records it, and
- * {@link Receiver.requests} waits on arrival events rather than polling.
+ * hook. It answers each request with `reply`, once a promised reply settles,
+ * and records it, and {@link Receiver.requests} waits on arrival events
+ * rather than polling.
  */
 export class Receiver {
   readonly received: ReceivedRequest[] = [];
@@ -32,7 +33,9 @@ export class Receiver {
   ) {}
 
   /** Listen on a loopback port, answering every request with `reply`. */
-  static async start(reply: (request: ReceivedRequest) => Reply = () => ({ status: 204 })): Promise<Receiver> {
+  static async start(
+    reply: (request: ReceivedRequest) => Reply | Promise<Reply> = () => ({ status: 204 }),
+  ): Promise<Receiver> {
     let receiver: Receiver | undefined;
     const server = createServer((request, response) => {
       const chunks: Buffer[] = [];
@@ -44,14 +47,15 @@ export class Receiver {
           headers: request.headers,
           body: Buffer.concat(chunks).toString(),
         };
-        const { status, body, contentType, delayMs } = reply(served);
-        const text = body === undefined || typeof body === "string" ? body : JSON.stringify(body);
-        setTimeout(() => {
-          response.writeHead(status, { "content-type": contentType ?? "application/json" });
-          response.end(text);
-          receiver?.received.push(served);
-          server.emit("served");
-        }, delayMs ?? 0);
+        void Promise.resolve(reply(served)).then(({ status, body, contentType, delayMs }) => {
+          const text = body === undefined || typeof body === "string" ? body : JSON.stringify(body);
+          setTimeout(() => {
+            response.writeHead(status, { "content-type": contentType ?? "application/json" });
+            response.end(text);
+            receiver?.received.push(served);
+            server.emit("served");
+          }, delayMs ?? 0);
+        });
       });
     });
     // Node closes idle keep-alive connections after 5s, while the gateway's

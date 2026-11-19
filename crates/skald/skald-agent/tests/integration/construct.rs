@@ -146,6 +146,28 @@ fn agent_try_from_ref_card_succeeds_with_test_resolver() {
     assert_eq!(agent.cascade_children(), vec![card_ref]);
 }
 
+/// A named Prompt reference survives assigning a different runtime Prompt.
+///
+/// # Panics
+/// Panics when the Prompt does not register or resolve, or the exported
+/// reference stops naming the Card.
+#[test]
+fn agent_named_prompt_reference_survives_runtime_assignment() {
+    let _guard = registry_lock();
+    clear_prompt_card_registry();
+    let card_ref = prompt_card_ref("named-prompt");
+    register_prompt_card(&card_ref, Prompt::from_native(prompt())).expect("prompt registers");
+
+    let mut agent = Agent::try_from_ref(
+        InlineableRef::Ref(card_ref.clone()),
+        default_prompt_resolver(),
+    )
+    .expect("registered prompt resolves");
+    agent.prompt = Arc::new(Prompt::from_native(prompt()));
+
+    assert_eq!(agent.prompt_ref(), &InlineableRef::Ref(card_ref));
+}
+
 /// An exact sibling Prompt resolves through the local registry like the
 /// external reference it names.
 ///

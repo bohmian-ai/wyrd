@@ -27,12 +27,12 @@ use tokio::time::Instant;
 use tokio_util::task::AbortOnDropHandle;
 use vala_bifrost_redux::catalog::{BifrostCatalog, TableRef, TenantTableBinding};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
+use wyrd_benchmark::Distribution;
 use wyrd_client::transport::trace::with_benchmark_labels;
 use wyrd_spec::DataTenantId;
 use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
-use wyrd_telemetry::timing::Distribution;
 use wyrd_testing::capacity::{
-    Expected, NANOS_PER_MS, Percentiles, Population, QUERY_BOUNDARY, Selection, Window,
+    Expected, NANOS_PER_MS, Percentiles, Population, QUERY_BOUNDARY, Window,
 };
 use wyrd_testing::experiment::{
     Arrivals, ExperimentError, Phase, Reading, Repetition, Step, Workload,
@@ -335,7 +335,7 @@ impl Competing {
                 ))
             })?;
         let timings = server.timings().await.map_err(ExperimentError::workload)?;
-        let (opened, before) = Window::open(server, Selection::RESOURCES)
+        let (opened, before) = Window::open(server)
             .await
             .map_err(ExperimentError::workload)?;
         let start = Instant::now();
@@ -406,6 +406,7 @@ impl Competing {
             processes: vec!["wyrd-server".to_owned()],
             server_cpu_seconds: usage.server_cpu_seconds,
             peak_memory_bytes: usage.peak_memory_bytes,
+            opening_memory_bytes: usage.opening_memory_bytes,
             memory_interval_ms: PEAK_SAMPLE_INTERVAL_MS,
             driver_cpu_seconds: usage.driver_cpu_seconds,
             ..Repetition::default()
@@ -1079,6 +1080,10 @@ impl Workload for Competing {
             .collect()
     }
 
+    fn heap_profile_url(&self) -> Option<String> {
+        self.server.as_ref().map(LocalServer::heap_profile_url)
+    }
+
     /// Runs the whole capacity → overload → recovery sequence; a warmup
     /// runs the same work.
     async fn measure(
@@ -1114,7 +1119,7 @@ mod tests {
 
     use tokio::time::Instant;
 
-    use wyrd_telemetry::timing::{Distribution, IntervalScan, IntervalSeries};
+    use wyrd_benchmark::{Distribution, IntervalScan, IntervalSeries};
     use wyrd_testing::capacity::NANOS_PER_MS;
     use wyrd_testing::capacity::Population;
     use wyrd_testing::experiment::{Reading, Repetition};

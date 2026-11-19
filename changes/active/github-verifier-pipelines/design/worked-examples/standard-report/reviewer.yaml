@@ -1,0 +1,32 @@
+# Approved design example; code_review is a proposed named response format.
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: code-reviewer
+  version: 0.1.0
+spec:
+  prompt:
+    provider: openai
+    model: gpt-4o
+    system: |
+      Review the active changes using the supplied source context.
+      Return supported findings with severity, confidence, explanation,
+      source locations and remediation when available.
+      Disclose incomplete coverage. Do not invent findings or fixes.
+    messages:
+      - role: user
+        content: |
+          Pull request:
+          ${pr}
+
+          Active changes:
+          ${changes}
+
+          Supporting source context:
+          ${context}
+    response_format: code_review
+  execution_route:
+    kind: wyrd_gateway
+    deployment: openai
+  tool_names:
+    - fs.read

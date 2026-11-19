@@ -1,12 +1,14 @@
 //! Test-only faults injected between the result writer and Scribe.
 //!
 //! [`PublicationFault`] wraps the pod's real Scribe in a decorator the
-//! runtime's result outbox writes through, so a runtime test can lose the
-//! acknowledgement of one table's batch, settle the outbox, and observe every
-//! batch it submitted.
+//! runtime's result outbox writes through, so a runtime test can lose or hold
+//! the acknowledgement of one table's batch, settle the outbox, and observe
+//! every batch it submitted.
 
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+use tokio_util::sync::CancellationToken;
 
 use vala_bifrost_redux::catalog::{TableRef, TableUid};
 use vala_bifrost_redux::contracts::{FrameAdmission, Scribe, ScribeError, ScribeIngressFrame};
@@ -18,12 +20,18 @@ use crate::scribe_outbox::{ScribeOutbox, ScribeSink, payload_ipc};
 /// One-shot faults on result writes, plus a record of every submitted batch.
 ///
 /// `lose_ack_next` lets Scribe durably accept one table's batch and then
-/// reports it busy, so the outbox must resend the identical batch. The fault
-/// fires once.
+/// reports it busy, so the outbox must resend the identical batch;
+/// `reject_next` refuses one table's next batch terminally without
+/// forwarding it; `hold_next` keeps one table's next batch from Scribe until
+/// released. Each fault fires once.
 #[derive(Clone, Default)]
 pub struct PublicationFault {
     /// One-shot lost acknowledgement after this table's durable batch.
     lose_ack_on: Arc<Mutex<Option<String>>>,
+    /// One-shot terminal refusal of this table's next batch.
+    reject_on: Arc<Mutex<Option<String>>>,
+    /// One-shot hold before this table's next batch reaches Scribe.
+    hold_on: Arc<Mutex<Option<(String, Hold)>>>,
     /// Every batch submitted, in submission order.
     sent: Arc<Mutex<Vec<SentBatch>>>,
     /// The result outbox the runtime writes through, once composed.
@@ -51,6 +59,26 @@ impl PublicationFault {
         *self.lose_ack_on.lock().expect("fault lock") = Some(table.to_owned());
     }
 
+    /// Refuse the next batch for `table` terminally, as Scribe refuses a
+    /// batch it cannot admit, without forwarding it.
+    ///
+    /// # Panics
+    /// Panics when the fault lock is poisoned.
+    pub fn reject_next(&self, table: &str) {
+        *self.reject_on.lock().expect("fault lock") = Some(table.to_owned());
+    }
+
+    /// Hold the next batch for `table` before it reaches Scribe until the
+    /// returned [`Hold`] is released.
+    ///
+    /// # Panics
+    /// Panics when the fault lock is poisoned.
+    pub fn hold_next(&self, table: &str) -> Hold {
+        let hold = Hold::default();
+        *self.hold_on.lock().expect("fault lock") = Some((table.to_owned(), hold.clone()));
+        hold
+    }
+
     /// Every batch submitted once everything staged so far is written, in
     /// submission order.
     ///
@@ -70,6 +98,14 @@ impl PublicationFault {
         self.sent.lock().expect("fault lock").clone()
     }
 
+    /// The result outbox a composed runtime writes through, once one is
+    /// composed, so a test can hold its capacity while the server's own
+    /// outbox stays free.
+    #[must_use]
+    pub fn composed_outbox(&self) -> Option<Arc<ScribeOutbox>> {
+        self.outbox.get().cloned()
+    }
+
     /// The result outbox writing through these faults to `inner` and
     /// recording grouped activity through `groups`, created on first use and
     /// shared by every later caller.
@@ -83,6 +119,28 @@ impl PublicationFault {
             let _shared = wyrd_runtime::runtime().enter();
             ScribeSink::local_outbox(Arc::new(FaultScribe { inner, fault }), Some(groups))
         }))
+    }
+}
+
+/// One held batch: [`arrived`](Self::arrived) once it reaches the fault,
+/// forwarded to Scribe once [`release`](Self::release)d.
+#[derive(Clone, Default)]
+pub struct Hold {
+    /// Cancelled once the held batch reaches the fault.
+    arrived: CancellationToken,
+    /// Cancelled to forward the held batch.
+    released: CancellationToken,
+}
+
+impl Hold {
+    /// Wait until the held batch reaches the fault.
+    pub async fn arrived(&self) {
+        self.arrived.cancelled().await;
+    }
+
+    /// Forward the held batch to Scribe.
+    pub fn release(&self) {
+        self.released.cancel();
     }
 }
 
@@ -101,10 +159,12 @@ impl Scribe for FaultScribe {
         self.inner.is_ready()
     }
 
-    /// Record and forward `frame`, losing its acknowledgement when armed.
+    /// Record and forward `frame`, rejecting it, holding it, or losing its
+    /// acknowledgement when armed.
     ///
     /// # Errors
-    /// Returns `IngestBusy` for an armed lost acknowledgement, and otherwise
+    /// Returns `FingerprintMismatch` for an armed rejection, `IngestBusy` for
+    /// an armed lost acknowledgement, and otherwise
     /// the real Scribe's outcome.
     ///
     /// # Panics
@@ -116,6 +176,23 @@ impl Scribe for FaultScribe {
             batch_id: frame.batch_id,
             bytes: payload_ipc(&frame.payload).to_vec(),
         });
+        if take_if(&self.fault.reject_on, &table) {
+            return Err(ScribeError::FingerprintMismatch { table });
+        }
+        let held = {
+            let mut armed = self.fault.hold_on.lock().expect("fault lock");
+            match armed.take() {
+                Some((held, hold)) if held == table => Some(hold),
+                other => {
+                    *armed = other;
+                    None
+                }
+            }
+        };
+        if let Some(hold) = held {
+            hold.arrived.cancel();
+            hold.released.cancelled().await;
+        }
         let admission = self.inner.ingest_frame(frame).await?;
         if take_if(&self.fault.lose_ack_on, &table) {
             return Err(ScribeError::IngestBusy { table });

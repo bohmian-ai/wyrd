@@ -3,11 +3,12 @@
 //! `WYRD_BIFROST_DATA_DIR` names a single directory. The root itself is the
 //! Scribe WAL base, and therefore also holds the stable node identity written
 //! beside the WAL. Every other managed local path is a fixed child of it:
-//! Scribe staged members, Scribe output scratch, Oracle spill, and Forge
-//! spill.
+//! Scribe staged members, Scribe output scratch, Oracle spill, Forge spill,
+//! and hosted verification workspaces.
 //!
 //! Preparation creates every managed path, takes an exclusive advisory lock on
-//! the root, clears Forge spill left by a previous owner, and write-probes each
+//! the root, clears Forge spill and verification workspaces left by a previous
+//! owner, and write-probes each
 //! managed directory before any role is constructed, so a second process
 //! mounting the same root, or an unwritable child, fails boot instead of
 //! surfacing after work was acknowledged.
@@ -64,6 +65,9 @@ pub struct BifrostDataRoot {
     oracle_spill: PathBuf,
     /// Forge rewrite spill directory; emptied at every boot under the lock.
     forge_spill: PathBuf,
+    /// Hosted verification workspace directory; emptied at every boot under
+    /// the lock.
+    verification_scratch: PathBuf,
     /// Open lock file; the advisory lock lives exactly as long as this handle.
     _lock: File,
 }
@@ -105,12 +109,14 @@ impl BifrostDataRoot {
         };
         let oracle_spill = root.join("oracle-spill");
         let forge_spill = root.join("forge-spill");
+        let verification_scratch = root.join("verification-scratch");
         for path in [
             &roots.wal,
             &roots.scribe_stage,
             &roots.scribe_output_scratch,
             &oracle_spill,
             &forge_spill,
+            &verification_scratch,
         ] {
             std::fs::create_dir_all(path).map_err(|source| BifrostDataRootError::Unusable {
                 path: path.clone(),
@@ -139,16 +145,19 @@ impl BifrostDataRoot {
                 });
             }
         }
-        clear_directory(&forge_spill).map_err(|source| BifrostDataRootError::Unusable {
-            path: forge_spill.clone(),
-            source,
-        })?;
+        for disposable in [&forge_spill, &verification_scratch] {
+            clear_directory(disposable).map_err(|source| BifrostDataRootError::Unusable {
+                path: disposable.clone(),
+                source,
+            })?;
+        }
         for dir in [
             &roots.wal,
             &roots.scribe_stage,
             &roots.scribe_output_scratch,
             &oracle_spill,
             &forge_spill,
+            &verification_scratch,
         ] {
             let probe = dir.join(PROBE_FILE_NAME);
             probe_write(&probe).map_err(|source| BifrostDataRootError::Unusable {
@@ -160,6 +169,7 @@ impl BifrostDataRoot {
             roots,
             oracle_spill,
             forge_spill,
+            verification_scratch,
             _lock: lock,
         })
     }
@@ -180,6 +190,14 @@ impl BifrostDataRoot {
     #[must_use]
     pub fn forge_spill(&self) -> &Path {
         &self.forge_spill
+    }
+
+    /// Hosted verification workspace directory, empty when preparation
+    /// returned. It shares the data root's filesystem, whose scratch ledger
+    /// the process plan measured.
+    #[must_use]
+    pub fn verification_scratch(&self) -> &Path {
+        &self.verification_scratch
     }
 
     /// Managed paths in the shape the Bifrost resource detector registers.
@@ -243,12 +261,17 @@ mod tests {
         assert_eq!(prepared.wal(), root);
         assert_eq!(prepared.oracle_spill(), root.join("oracle-spill"));
         assert_eq!(prepared.forge_spill(), root.join("forge-spill"));
+        assert_eq!(
+            prepared.verification_scratch(),
+            root.join("verification-scratch")
+        );
         for path in [
             &roots.wal,
             &roots.scribe_stage,
             &roots.scribe_output_scratch,
             prepared.oracle_spill(),
             prepared.forge_spill(),
+            prepared.verification_scratch(),
         ] {
             assert!(
                 path.starts_with(&root) && path.is_dir(),
@@ -277,26 +300,29 @@ mod tests {
             &roots.scribe_output_scratch,
             prepared.oracle_spill(),
             prepared.forge_spill(),
+            prepared.verification_scratch(),
         ] {
             assert!(path.is_absolute(), "{}", path.display());
         }
     }
 
-    /// Stale Forge spill is cleared under the root lock while every other
-    /// managed child keeps its contents.
+    /// Stale Forge spill and verification workspaces are cleared under the
+    /// root lock while every other managed child keeps its contents.
     ///
     /// # Panics
     ///
     /// Panics when preparation fails, stale spill survives, or a WAL,
     /// staged, or Oracle spill entry is removed.
     #[test]
-    fn prepare_clears_stale_forge_spill() {
+    fn prepare_clears_stale_disposable_scratch() {
         let base = tempfile::tempdir().expect("root fixture");
         let root = base.path();
         let stale_dir = root.join("forge-spill").join("datafusion-stale");
         std::fs::create_dir_all(&stale_dir).expect("stale spill directory");
         std::fs::write(stale_dir.join("run.arrow"), b"spill").expect("stale spill file");
         std::fs::write(root.join("forge-spill").join("loose"), b"spill").expect("loose spill");
+        let workspace = root.join("verification-scratch").join(".tmpStale");
+        std::fs::create_dir_all(workspace.join("work")).expect("stale workspace");
         let wal = root.join("retained.wal");
         std::fs::write(&wal, b"wal").expect("retained WAL");
         std::fs::create_dir_all(root.join("oracle-spill")).expect("oracle spill");
@@ -311,8 +337,15 @@ mod tests {
             0,
             "stale Forge spill is cleared"
         );
+        assert_eq!(
+            std::fs::read_dir(prepared.verification_scratch())
+                .expect("verification scratch readable")
+                .count(),
+            0,
+            "stale workspaces are cleared"
+        );
         assert!(wal.exists(), "WAL contents are never cleared");
-        assert!(oracle.exists(), "only Forge spill is cleared");
+        assert!(oracle.exists(), "only disposable scratch is cleared");
     }
 
     /// A root that cannot be a directory fails with a typed error.

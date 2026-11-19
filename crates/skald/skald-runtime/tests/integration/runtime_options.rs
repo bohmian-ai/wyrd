@@ -15,7 +15,7 @@ async fn request_options_round_trip_through_mock_dispatch() {
     let runtime = runtime_with(&mock);
 
     runtime
-        .send(request)
+        .send(&request)
         .await
         .expect("options request dispatches");
 }

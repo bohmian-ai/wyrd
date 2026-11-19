@@ -16,9 +16,10 @@ from wyrd.auth import Principals
 from wyrd.bifrost import AsyncBifrost, Bifrost, TableConfig
 from wyrd.cards import Cards
 from wyrd.gateway_admin import Gateway
+from wyrd.github import GithubConnection
 from wyrd.operators import OperatorConnections
 
-HANDLES = [Bifrost, AsyncBifrost, Cards, Gateway, Principals, OperatorConnections]
+HANDLES = [Bifrost, AsyncBifrost, Cards, Gateway, Principals, OperatorConnections, GithubConnection]
 
 FIRST_USE: list[tuple[type, Callable[[Any], object]]] = [
     (Bifrost, lambda handle: handle.list_tables()),
@@ -26,6 +27,7 @@ FIRST_USE: list[tuple[type, Callable[[Any], object]]] = [
     (Gateway, lambda handle: handle.credentials()),
     (Principals, lambda handle: handle.list()),
     (OperatorConnections, lambda handle: handle.list()),
+    (GithubConnection, lambda handle: handle.get()),
 ]
 
 

@@ -24,6 +24,10 @@ pub const PEAK_SAMPLE_INTERVAL_MS: u64 = 10;
 /// [`PEAK_SAMPLE_INTERVAL_MS`] as a duration.
 const PEAK_SAMPLE_INTERVAL: Duration = Duration::from_millis(PEAK_SAMPLE_INTERVAL_MS);
 
+/// Every this many [`PEAK_SAMPLE_INTERVAL`] ticks, a children sampler lists
+/// every process to find new children (100 ms).
+const CHILD_DISCOVERY_TICKS: u64 = 10;
+
 /// The first CPU's brand string, or `unknown`.
 pub(crate) fn cpu_model() -> String {
     let system =
@@ -73,6 +77,35 @@ pub(crate) fn process_cpu_usec(pid: u32) -> Option<u64> {
     system
         .process(pid)
         .map(|process| process.accumulated_cpu_time().saturating_mul(1_000))
+}
+
+/// The live child processes of `parent` in `system`'s last refresh, never
+/// its threads, which `sysinfo` also lists.
+fn children(system: &System, parent: Pid) -> impl Iterator<Item = &sysinfo::Process> {
+    system
+        .processes()
+        .values()
+        .filter(move |process| process.parent() == Some(parent) && process.thread_kind().is_none())
+}
+
+/// Microseconds of user plus system CPU the live children of process
+/// `parent`, such as its Python workers, have used, or `None` once `parent`
+/// is gone. A child that already exited is not here: its parent reports it
+/// once reaped.
+pub(crate) fn children_cpu_usec(parent: u32) -> Option<u64> {
+    let parent = Pid::from_u32(parent);
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing().with_cpu(),
+    );
+    system.process(parent)?;
+    Some(
+        children(&system, parent)
+            .map(|child| child.accumulated_cpu_time().saturating_mul(1_000))
+            .sum(),
+    )
 }
 
 /// Seconds of user plus system CPU this process has used, or `None` when
@@ -156,44 +189,98 @@ impl HostLoad {
     }
 }
 
-/// A background thread recording the highest resident memory one process
-/// reaches from [`PeakSampler::start`] until [`PeakSampler::finish`].
+/// The resident memory one process held over a window, bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryReadings {
+    /// The first reading, taken as the window opened.
+    pub opening: u64,
+    /// The largest reading.
+    pub peak: u64,
+}
+
+/// A background thread recording the resident memory of one process, or the
+/// summed memory of its live children ([`PeakSampler::children`]), as it
+/// starts and the highest it reaches until [`PeakSampler::finish`].
 ///
 /// The OS keeps no portable resettable peak, so the window's peak is the
 /// largest of readings taken every [`PEAK_SAMPLE_INTERVAL`].
 pub struct PeakSampler {
     /// Set to end the sampling loop.
     stop: Arc<AtomicBool>,
-    /// The sampling thread, returning the peak it saw; taken by `finish`.
-    thread: Option<JoinHandle<u64>>,
+    /// The sampling thread, returning what it read; taken by `finish`.
+    thread: Option<JoinHandle<Option<MemoryReadings>>>,
 }
 
 impl PeakSampler {
     /// Starts sampling process `pid`'s resident memory on a new thread.
     ///
     /// The thread reads until stopped or the process exits, keeping the
-    /// largest reading.
-    pub(crate) fn start(pid: u32) -> Self {
+    /// first and the largest reading.
+    #[must_use]
+    pub fn start(pid: u32) -> Self {
+        let pid = Pid::from_u32(pid);
+        Self::sample(move |system, _| {
+            refresh_process(system, pid, ProcessRefreshKind::nothing().with_memory())
+                .then(|| system.process(pid).map(sysinfo::Process::memory))
+        })
+    }
+
+    /// Starts sampling the summed resident memory of process `parent`'s live
+    /// children, such as its Python workers, on a new thread, until stopped
+    /// or `parent` exits. A window in which no child was ever resident
+    /// finishes unsampled, never zero.
+    #[must_use]
+    pub fn children(parent: u32) -> Self {
+        let parent = Pid::from_u32(parent);
+        let memory = ProcessRefreshKind::nothing().with_memory();
+        Self::sample(move |system, tick| {
+            // ponytail: listing every process each tick costs the driver
+            // milliseconds, so new children are found every
+            // CHILD_DISCOVERY_TICKS and only known ones are re-read between;
+            // a child living shorter than that can be missed.
+            if tick % CHILD_DISCOVERY_TICKS == 0 {
+                system.refresh_processes_specifics(ProcessesToUpdate::All, true, memory);
+            } else {
+                let mut known: Vec<Pid> = children(system, parent)
+                    .map(sysinfo::Process::pid)
+                    .collect();
+                known.push(parent);
+                system.refresh_processes_specifics(ProcessesToUpdate::Some(&known), true, memory);
+            }
+            system.process(parent)?;
+            Some(Some(
+                children(system, parent).map(sysinfo::Process::memory).sum(),
+            ))
+        })
+    }
+
+    /// Calls `read` with the sampling thread's `System` and the tick number
+    /// every [`PEAK_SAMPLE_INTERVAL`] until stopped or `read` reports its
+    /// process gone (`None`), keeping the first and the largest reading.
+    fn sample(
+        mut read: impl FnMut(&mut System, u64) -> Option<Option<u64>> + Send + 'static,
+    ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = Arc::clone(&stop);
         let thread = std::thread::spawn(move || {
-            let pid = Pid::from_u32(pid);
             let mut system = System::new();
-            let mut peak = 0;
-            while refresh_process(
-                &mut system,
-                pid,
-                ProcessRefreshKind::nothing().with_memory(),
-            ) {
-                peak = system
-                    .process(pid)
-                    .map_or(peak, |process| peak.max(process.memory()));
+            let mut readings: Option<MemoryReadings> = None;
+            let mut tick = 0;
+            while let Some(reading) = read(&mut system, tick) {
+                if let Some(memory) = reading {
+                    let seen = readings.get_or_insert(MemoryReadings {
+                        opening: memory,
+                        peak: memory,
+                    });
+                    seen.peak = seen.peak.max(memory);
+                }
                 if stopped.load(Ordering::Relaxed) {
                     break;
                 }
+                tick += 1;
                 std::thread::sleep(PEAK_SAMPLE_INTERVAL);
             }
-            peak
+            readings
         });
         Self {
             stop,
@@ -201,18 +288,23 @@ impl PeakSampler {
         }
     }
 
-    /// Stops sampling and returns the peak resident memory seen, in bytes.
+    /// Stops sampling and returns the opening and peak resident memory.
     ///
     /// # Errors
     ///
     /// Returns an error when the sampling thread panicked or never read the
     /// process.
-    pub(crate) fn finish(mut self) -> io::Result<u64> {
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: `finish` consumes the sampler, so its thread is
+    /// still there to take.
+    pub fn finish(mut self) -> io::Result<MemoryReadings> {
         self.stop.store(true, Ordering::Relaxed);
         let thread = self.thread.take().expect("a sampler is finished once");
         match thread.join() {
-            Ok(0) => Err(io::Error::other("the process was never sampled")),
-            Ok(peak) => Ok(peak),
+            Ok(Some(readings)) if readings.peak > 0 => Ok(readings),
+            Ok(_) => Err(io::Error::other("the process was never sampled")),
             Err(_) => Err(io::Error::other("the memory sampler panicked")),
         }
     }
@@ -247,6 +339,44 @@ mod tests {
             None,
             "a missing process reads nothing"
         );
-        assert!(sampler.finish().expect("sampled peak") > 0);
+        let memory = sampler.finish().expect("sampled memory");
+        assert!(
+            0 < memory.opening && memory.opening <= memory.peak,
+            "{memory:?}"
+        );
+    }
+
+    /// The children readers see a live child process and never this
+    /// process's own threads: with no child, worker CPU reads zero and worker
+    /// memory finishes unsampled; a missing parent reads nothing.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a reading is wrong or the child cannot be started.
+    #[test]
+    fn reads_live_children_but_not_threads() {
+        let pid = std::process::id();
+        let threads = std::thread::spawn(move || super::children_cpu_usec(pid));
+        assert_eq!(
+            threads.join().expect("reader"),
+            Some(0),
+            "threads are not children"
+        );
+        assert!(
+            super::PeakSampler::children(pid).finish().is_err(),
+            "no child is never zero memory"
+        );
+        assert_eq!(super::children_cpu_usec(u32::MAX), None);
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("a child process");
+        let sampler = super::PeakSampler::children(pid);
+        assert!(super::children_cpu_usec(pid).is_some());
+        let memory = sampler.finish();
+        child.kill().expect("the child stops");
+        child.wait().expect("the child is reaped");
+        assert!(memory.expect("sampled child memory").peak > 0);
     }
 }

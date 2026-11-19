@@ -763,6 +763,45 @@ impl TenantTokenIssuer {
         })
     }
 
+    /// Resolve the fresh authority of `principal_id`, a User or Service
+    /// account accountable for a declaration, for background work it owns
+    /// without a selected root.
+    ///
+    /// The principal is resolved as a User and, when no active User has that
+    /// id, as a Service account, with tenant admission, active status and
+    /// current roles, permissions and restriction, exactly as
+    /// [`Self::scheduled`] resolves its account. Nothing is presented,
+    /// signed, or recorded.
+    ///
+    /// # Errors
+    /// [`IssuanceError::PrincipalInactive`] when neither an active User nor
+    /// an active Service account has the id, and every other
+    /// [`Self::scheduled`] error.
+    #[tracing::instrument(level = "debug", skip(self, conn), fields(principal_id = %principal_id), err)]
+    pub async fn accountable(
+        &self,
+        conn: &mut TenantConn<'_>,
+        principal_id: Uuid,
+    ) -> Result<VerifiedToken, IssuanceError> {
+        let principal = match self.resolve(conn, principal_id, true).await {
+            Err(IssuanceError::PrincipalInactive) => {
+                self.resolve(conn, principal_id, false).await?
+            }
+            resolved => resolved?,
+        };
+        let context = ResolvedContext::resolve(conn, None, principal.restriction.as_ref()).await?;
+        self.verified(AccessGrant {
+            principal: principal.principal,
+            roles: principal.roles,
+            permissions: principal.permissions,
+            card_access: context.access,
+            workload_uid: None,
+            credential_id: None,
+            act: None,
+            audience: TokenAudience::Wyrd,
+        })
+    }
+
     /// Shape `access` into the [`VerifiedToken`] its signed token would yield.
     ///
     /// # Errors

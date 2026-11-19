@@ -126,9 +126,9 @@ To use a file already declared as an Artifact, pass an `ArtifactRef` instead: `w
 | `run_id` | Your run |
 | `verifier`, `subject` | The exact Verifier and Card versions |
 | `outcome.verdict` | `passed`, `failed`, or `inconclusive`. Python also exposes it as `result.verdict` |
-| `outcome.requirements` | One entry per requirement: `id`, `step`, `statement`, `outcome`, `reason`, `actual`, `citations`, `detail`, and the check's provenance |
-| `outcome.steps` | One entry per step: `id`, `status`, `output`, `attempts`, `duration_ms`, `reason`, `tool_calls` |
-| `outcome.evidence` | The pinned input declarations, by slot, with file digests |
+| `outcome.requirements` | One entry per requirement: `id`, `step`, `statement`, `outcome`, `reason`, `actual`, `citations`, custom `data`, and `detail` |
+
+The result is the decision only. To see what ran, including each check, its provenance, the steps, and the pinned inputs, read the execution's details; see [Read the evidence](/build-and-verify/verify/run-a-verification-and-inspect-its-evidence/#3-read-the-evidence).
 
 <LangTabs langs={['python', 'rust', 'typescript']}>
 <LangTab lang="python">

@@ -19,6 +19,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["time", "sync", "fs", "io-util", "net"] }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }
+bytes = { workspace = true }
 reqwest = { workspace = true }
 tracing = { workspace = true }
 secrecy = { workspace = true }
@@ -32,6 +33,7 @@ wyrd-tls = { workspace = true }
 
 [dev-dependencies]
 workspace-hack.workspace = true
+http = { workspace = true }
 rcgen = { workspace = true }
 rustls = { workspace = true }
 tempfile = { workspace = true }

@@ -7,29 +7,44 @@
 //! one Service per application, and each application loads its pulled Service
 //! bundle under that Service's own Card-bound key, so every call is the
 //! public Rust client's `observe().verify` or `observe().submit` exactly as
-//! production makes it. Evidence comes from client timings, `/metrics`, and
+//! production makes it. Evidence comes from client timings, the benchmark snapshot, and
 //! the OS's readings of the server process.
 //!
-//! - **L1, `direct-verify`:** closed-loop direct `verify` at 1 and 64
-//!   clients. The server's verification overhead (arrival until the result is
-//!   staged, less the Verifier's own blocks) p99 must be strictly under
-//!   0.5 ms at 64 clients, read from the server histogram's bucket, so an
-//!   unresolved tail cannot pass. Every repetition must answer with no
-//!   refusal and the expected verdict.
+//! - **L1, `direct-verify`:** direct `verify` of the canonical Verifier (one
+//!   Assert and two Agent checks, each Agent running one `code.run` between
+//!   two model exchanges with a local provider) through the Rust, Python and
+//!   TypeScript SDKs: closed loop at 1 and 64 clients, and paced at
+//!   [`PACED_RATE`] verifications/s from [`PACED_CLIENTS`] clients, the one
+//!   load every SDK presents the server equally. The server's verification
+//!   overhead (arrival until the result is staged, less the Verifier's own
+//!   blocks) p99 must be strictly under 0.5 ms at 64 closed-loop Rust
+//!   clients, read from the server histogram's bucket, so an unresolved tail
+//!   cannot pass. Every repetition must answer with no
+//!   refusal and the expected verdict, and reconcile every acknowledged
+//!   call's provider exchanges and code output. Diagnostic `direct-verify-model-c1`
+//!   and `-c64`, declared only when `--steps` names one, verify a judge
+//!   Verifier whose one Agent check calls a local Gateway deployment backed
+//!   by a local provider; they share the correctness criteria and are never
+//!   judged by the overhead objective.
 //! - **L2, `competing`:** one stateful step whose every repetition runs open
 //!   loop capacity → overload → recovery ([`Schedule`]) with direct `verify`
 //!   and background `submit` together; every verification stages its result
 //!   through Scribe into Bifrost, so evidence writes and the queued backlog
 //!   progress in the same window.
 
-mod run;
-mod workload;
+mod driver;
+pub(crate) mod run;
+
+use driver::Language;
+pub(crate) mod workload;
 
 use std::time::Duration;
 
 use serde_json::{Value, json};
+use wyrd_server::config::VerificationConfig;
+use wyrd_testing::capacity::Population;
 use wyrd_testing::experiment::{
-    Criterion, Declaration, Derive, Direction, Engine, Level, Metric, Op, Reading, Step,
+    Criterion, Declaration, Derive, Direction, Engine, Level, Metric, Op, Reading, Role, Step,
 };
 
 use crate::levels::{Context, Plan};
@@ -40,6 +55,31 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>
 /// Closed-loop client counts of the L1 sweep, one step each.
 pub const CLIENTS: [u64; 2] = [1, 64];
 
+/// Diagnostic Rust closed-loop client counts between [`CLIENTS`], declared
+/// only when `--steps` names one, so a run can read throughput and CPU per
+/// verification against server concurrency as load rises.
+pub const SWEEP_CLIENTS: [u64; 3] = [4, 16, 32];
+
+/// The prefix of the Rust closed-loop step ids, one per client count.
+const RUST_STEP: &str = "direct-verify-c";
+
+/// The arrival rate, verifications per second, every language's paced
+/// diagnostic step offers through [`PACED_CLIENTS`] clients, so the server
+/// sees the same load whichever SDK calls it; below every population's
+/// closed-loop capacity on the reference host.
+pub const PACED_RATE: u64 = 3_000;
+
+/// The clients a paced step spreads [`PACED_RATE`] across, each calling at
+/// its own fixed slots.
+pub const PACED_CLIENTS: u64 = 64;
+
+/// The prefix of the diagnostic model step ids, one per [`CLIENTS`] count.
+pub const MODEL_STEP: &str = "direct-verify-model-c";
+
+/// The version of the L1 canonical workload each record carries, so an
+/// Assert-only record is never read as a comparable canonical baseline.
+pub const CANONICAL_VERSION: &str = "canonical-1";
+
 /// The client count the strict overhead objective applies at.
 pub const OBJECTIVE_CLIENTS: u64 = 64;
 
@@ -49,14 +89,21 @@ pub const OVERHEAD_LIMIT_MS: f64 = 0.5;
 /// Each direct execution phase the server times beside
 /// `verification.direct`, as the metric id segment it fills and its
 /// benchmark timing boundary. `outside` is the execution's time outside
-/// every phase: HTTP decode, middleware, and waits between phases.
-pub const PHASE_TIMINGS: [(&str, &str); 6] = [
+/// every phase, and `outside_before`, `outside_between` and `outside_after`
+/// split it into the time before the first phase (arrival, middleware,
+/// decode), the gaps between phases, and the time after the last phase
+/// (result construction and teardown).
+pub const PHASE_TIMINGS: [(&str, &str); 10] = [
     ("admit", "verification.direct.admit"),
     ("load", "verification.direct.load"),
+    ("setup", "verification.direct.setup"),
     ("prepare", "verification.direct.prepare"),
     ("engine", "verification.direct.engine"),
     ("stage", "verification.direct.stage"),
     ("outside", "verification.direct.outside"),
+    ("outside_before", "verification.direct.outside.before"),
+    ("outside_between", "verification.direct.outside.between"),
+    ("outside_after", "verification.direct.outside.after"),
 ];
 
 /// The overhead thresholds each L1 repetition counts executions over, as
@@ -199,11 +246,13 @@ impl Schedule {
 
 /// Plans the Verification experiment at the context's level: refuses unknown
 /// flags, declares it, and prepares the workload, which starts the server
-/// only once the run admits it.
+/// only once the run admits it and profiles its language drivers under
+/// `--profile`.
 ///
 /// # Errors
 ///
-/// Returns a message for an unknown flag or an invalid rate.
+/// Returns a message for an unknown flag, an invalid rate, or a malformed
+/// `--profile`.
 pub fn plan(context: &Context<'_>, base: Declaration) -> std::result::Result<Plan, String> {
     let valued: &[&str] = match context.level {
         Level::One => &[],
@@ -212,9 +261,18 @@ pub fn plan(context: &Context<'_>, base: Declaration) -> std::result::Result<Pla
     context.known(valued, &[])?;
     let declaration = declare(context.level, context.arguments, base)?;
     let logs = context.output(Engine::Verification, &declaration.experiment);
+    let model = declaration
+        .steps
+        .iter()
+        .any(|step| step.id.starts_with(MODEL_STEP));
     Ok(Plan {
         declaration,
-        workload: Box::new(run::Bench::new(context.level, logs)),
+        workload: Box::new(run::Bench::new(
+            context.level,
+            logs,
+            model,
+            crate::levels::profile(context.arguments)?,
+        )),
     })
 }
 
@@ -230,16 +288,29 @@ pub fn declare(
     base: Declaration,
 ) -> std::result::Result<Declaration, String> {
     let mut declaration = match level {
-        Level::One => direct(base),
+        Level::One => direct(base, models(arguments)?, &sweeps(arguments)?),
         Level::Two => competing(base, arguments)?,
     };
-    declaration.controls.insert(
-        "fixture".to_owned(),
-        json!("one tenant: an assertion Verifier of four `equals` checks over one 2 KiB `context` slot, a Model, and one Service per application with its own Card-bound family runtime key; every odd arrival answers check `d` wrong, so both verdicts stay in every window"),
-    );
+    let fixture = match level {
+        Level::One => format!("one tenant: canonical Verifier `{}` of one Assert and two Agent checks over one 2 KiB `context` slot, all three eligible at once; each Agent, routed through local Gateway deployment `{}` with `code.run` granted by tenant Role `bench_code`, makes one model exchange that asks for one `code.run` of a fixed program reading `/inputs/context.json`, then a second whose cited Verdict carries that output as data, so a verification is four governed provider exchanges and two `code.run` operations; the loopback provider answers each conversation from its own messages and keeps a bounded per-arrival ledger the driver reconciles; a Model and one Service per application with its own Card-bound family runtime key; every odd arrival answers the Assert wrong, so both verdicts stay in every window; L2 keeps the Assert-only Verifier", workload::CANONICAL_VERIFIER, workload::JUDGE_DEPLOYMENT),
+        Level::Two => "one tenant: an assertion Verifier of four `equals` checks over one 2 KiB `context` slot, a Model, and one Service per application with its own Card-bound family runtime key; every odd arrival answers check `d` wrong, so both verdicts stay in every window".to_owned(),
+    };
+    declaration
+        .controls
+        .insert("fixture".to_owned(), json!(fixture));
+    let mut server = VerificationConfig::default();
+    server
+        .resolve_limits()
+        .map_err(|error| format!("reading the server's verification limits: {error}"))?;
+    let limits = server.limits;
     declaration.controls.insert(
         "limits".to_owned(),
-        json!("server defaults on the whole host; no resource quota"),
+        json!(format!(
+            "server defaults on the whole host; no resource quota; verification: {} prewarmed Python workers, {} MiB Python budget per operation, {} ms per code operation; Python sessions wait fairly per tenant for shared process memory and reuse reset workers; workspaces charge shared process memory and scratch; an Agent check holds one workspace for its invocation, and a refused workspace or operation is a counted refusal, never a pool resize",
+            limits.monty_min_workers,
+            limits.monty_memory_bytes / (1024 * 1024),
+            limits.code_timeout.as_millis(),
+        )),
     );
     Ok(declaration)
 }
@@ -298,18 +369,41 @@ fn work_metrics() -> Vec<Metric> {
                 scale: 1e6,
             },
         ),
+        Metric::raw(
+            "worker_cpu_seconds",
+            "s",
+            "user plus system CPU seconds of the server's Python worker children inside the measured window, including workers started or exited in it; apart from server CPU, which stays the server process's own, and from client and provider CPU",
+        ),
+        Metric::raw(
+            "worker_peak_memory_bytes",
+            "bytes",
+            "sampled peak of the server's Python worker children's summed resident memory from the window's open until its calls drained; apart from server memory",
+        ),
+        Metric::raw(
+            "worker_spawns",
+            "workers",
+            "Python worker processes the server started inside the measured window",
+        ),
+        Metric::raw(
+            "worker_resets",
+            "workers",
+            "Python worker sessions reset for reuse inside the measured window",
+        ),
+        Metric::raw(
+            "worker_reaps",
+            "workers",
+            "exited Python worker processes the server reaped inside the measured window",
+        ),
     ]
 }
 
-/// The server percentiles of direct `verify` at `scope`, and the diagnostic
-/// client round-trip percentiles beside them.
-fn latency_metrics(scope: &str) -> Vec<Metric> {
+/// The server percentiles of direct `verify` at `scope`, and the client
+/// percentiles, of the boundary `client` describes, beside them.
+fn latency_metrics(scope: &str, client: &str) -> Vec<Metric> {
     let server = format!(
         "server: a direct execution's start until its result is ready (`verification.direct`, outcome `completed`), {scope}; nearest-rank bucket bounds of the server's timing histograms"
     );
-    let client = format!(
-        "diagnostic only: public-client `verify` call until its judged result, {scope}; never judged"
-    );
+    let client = format!("{client}, {scope}");
     ["p50_ms", "p95_ms", "p99_ms"]
         .into_iter()
         .map(|id| Metric::raw(id, "ms", &server))
@@ -321,34 +415,177 @@ fn latency_metrics(scope: &str) -> Vec<Metric> {
         .collect()
 }
 
-/// The L1 declaration: closed-loop direct `verify` at each of [`CLIENTS`].
-fn direct(mut base: Declaration) -> Declaration {
-    let steps: Vec<String> = CLIENTS
+/// Whether `--steps` names a [`MODEL_STEP`], so L1 declares the model steps.
+///
+/// # Errors
+///
+/// Returns the `--steps` value refusal.
+fn models(arguments: &[String]) -> std::result::Result<bool, String> {
+    Ok(
+        crate::flags::value(arguments, "--steps")?.is_some_and(|steps| {
+            steps
+                .split(',')
+                .any(|step| step.trim().starts_with(MODEL_STEP))
+        }),
+    )
+}
+
+/// The [`SWEEP_CLIENTS`] counts `--steps` names as Rust closed-loop steps.
+///
+/// # Errors
+///
+/// Returns the `--steps` value refusal.
+fn sweeps(arguments: &[String]) -> std::result::Result<Vec<u64>, String> {
+    let named = crate::flags::value(arguments, "--steps")?.unwrap_or_default();
+    Ok(SWEEP_CLIENTS
+        .into_iter()
+        .filter(|clients| {
+            named
+                .split(',')
+                .any(|step| step.trim() == format!("{RUST_STEP}{clients}"))
+        })
+        .collect())
+}
+
+/// The L1 declaration: closed-loop direct `verify` at each of [`CLIENTS`],
+/// with `model` the diagnostic model steps at the same counts, and the Rust
+/// diagnostic closed-loop steps at each of `sweep` in client order.
+fn direct(mut base: Declaration, model: bool, sweep: &[u64]) -> Declaration {
+    let populations: Vec<(Language, u64, Option<u64>, String)> = Language::ALL
         .iter()
-        .map(|clients| format!("direct-verify-c{clients}"))
+        .flat_map(|language| {
+            let prefix = match language {
+                Language::Rust => String::from("direct-verify"),
+                other => format!("direct-verify-{}", other.name()),
+            };
+            let mut closed = CLIENTS.to_vec();
+            if *language == Language::Rust {
+                closed.extend_from_slice(sweep);
+                closed.sort_unstable();
+            }
+            closed
+                .into_iter()
+                .map(move |clients| (clients, None))
+                .chain([(PACED_CLIENTS, Some(PACED_RATE))])
+                .map(move |(clients, rate)| {
+                    let id = match rate {
+                        None => format!("{prefix}-c{clients}"),
+                        Some(rate) => format!("{prefix}-r{rate}"),
+                    };
+                    (*language, clients, rate, id)
+                })
+        })
         .collect();
+    let steps: Vec<String> = populations.iter().map(|(_, _, _, id)| id.clone()).collect();
     base.experiment = String::from("direct-verify");
     base.question = String::from(
         "Does direct `observe().verify` keep the server's verification overhead p99 strictly under 0.5 ms at 64 closed-loop clients, answering every call with the expected verdict, and what does each verification cost the server per CPU-second at 1 and 64 clients?",
     );
     base.variables.insert("clients".to_owned(), json!(CLIENTS));
+    base.variables.insert(
+        "languages".to_owned(),
+        json!(Language::ALL.map(Language::name)),
+    );
+    base.controls.insert(
+        "processes".to_owned(),
+        json!("rust: the clients are bounded async tasks in this controller, which also hosts the local provider on its own runtime; python: one child process calling the `wyrd` package's synchronous `observe.verify` from prestarted threads, one per client; typescript: one child Node process awaiting the `wyrd-ai` package's `observe.verify` in bounded Promise loops, one per client. Each child loads every application's pulled bundle and starts its workers before its first window, and times every call with its own language clock; client CPU and memory are the client process's, and only the Rust client's include the controller and provider"),
+    );
     base.controls.insert(
         "workload".to_owned(),
-        json!("closed-loop public-client `observe().verify` (direct mode), one application per client, each sending its next call once the last answers"),
+        json!("closed-loop public-client `observe().verify` (direct mode) of the canonical Verifier, one application per client, each sending its next call once the last answers; the client time starts immediately before `verify` and stops when its decoded result returns, with Run and context preparation before it; a second client sample continues until the returned result's compact fields are materialized, and result checks and details reads come after both"),
     );
-    base.steps = CLIENTS
+    base.controls
+        .insert("workload_version".to_owned(), json!(CANONICAL_VERSION));
+    base.controls.insert(
+        "paced".to_owned(),
+        json!(format!("diagnostic `-r{PACED_RATE}` steps offer {PACED_RATE} verifications/s from {PACED_CLIENTS} clients in every language: client i's k-th call is due at (i / {PACED_CLIENTS} + k) x {PACED_CLIENTS} / {PACED_RATE} s after the window opens and waits for it, so every SDK presents the server the same arrival rate; a call starts late when its client is still busy, and calls never sent by the window end are missed. Closed-loop `-c` steps hold the client count, not the server load: a client that spends longer in its own SDK keeps fewer executions on the server, so their server readings compare only within a language")),
+    );
+    base.controls.insert(
+        "compare".to_owned(),
+        json!({
+            "by": "language",
+            "metrics": [
+                "rate",
+                "server_concurrency",
+                "overhead_p99_ms",
+                "p50_ms",
+                "p99_ms",
+                "client_p50_ms",
+                "client_p99_ms",
+            ],
+            "notes": {
+                "clients=1": "One client, one call at a time: the cost of a call with no load. Compare languages here.",
+                "clients=64": "64 clients calling back to back: the server is past saturation, and each language keeps a different number of executions on it (server_concurrency). This shows how the server degrades under overload. Do not compare languages here.",
+                format!("clients={PACED_CLIENTS} rate={PACED_RATE}"): format!("{PACED_RATE} verifications/s from every language: the same server load. Compare languages here: server overhead should match, and client latency less server latency is the SDK and transport cost."),
+            },
+        }),
+    );
+    base.steps = populations
         .iter()
-        .zip(&steps)
-        .map(|(clients, id)| Step::measured(id, json!({ "clients": clients, "op": "verify" })))
+        .map(|(language, clients, rate, id)| {
+            let mut params = json!({ "clients": clients, "op": "verify", "check": "canonical", "language": language.name() });
+            if let Some(rate) = rate {
+                params["rate"] = json!(rate);
+            }
+            Step::measured(id, params)
+        })
         .collect();
+    let mut correct = steps.clone();
+    if model {
+        for clients in CLIENTS {
+            let id = format!("{MODEL_STEP}{clients}");
+            base.steps.push(Step::measured(
+                &id,
+                json!({ "clients": clients, "op": "verify", "check": "model" }),
+            ));
+            correct.push(id);
+        }
+        base.controls.insert(
+            "model".to_owned(),
+            json!(format!("diagnostic model steps: `{}` has one Agent check routed through local Gateway deployment `{}` for one iteration; the deployment calls a loopback plaintext HTTP/1.1 OpenAI-compatible provider in the driver process that answers every call at once with a passing Verdict citing slot `{}` and fixed usage (11 prompt, 4 completion tokens); unexercised: TLS, provider authentication, retries, fallbacks, streaming, tool calls, and remote provider latency, none of which is measured or zero", workload::JUDGE_VERIFIER, workload::JUDGE_DEPLOYMENT, workload::JUDGE_SLOT)),
+        );
+    }
     base.metrics = work_metrics();
-    base.metrics
-        .extend(latency_metrics("every acknowledged call"));
+    base.metrics.extend(latency_metrics(
+        "every acknowledged call",
+        "client: end-to-end client–server–client call-return latency, from immediately before the public `verify` until its decoded result returns, with all elapsed work in between (SDK serialization, transport, server, provider, sandbox, pool and host waits, decoding) and never reduced by any phase; a total with no target",
+    ));
+    base.metrics.extend(
+        ["client_ready_p50_ms", "client_ready_p95_ms", "client_ready_p99_ms"].map(|id| {
+            Metric::raw(
+                id,
+                "ms",
+                "client: end-to-end result-ready latency, from the same start until the verdict and every requirement's outcome, citations, and data are materialized from the returned view, so deferred conversion is included and judgment is not; a total with no target, every acknowledged call",
+            )
+        }),
+    );
+    base.metrics.extend(run::MATERIALIZE_STATS.map(|(id, _)| {
+        Metric::raw(
+            id,
+            "ms",
+            "client diagnostic: per acknowledged call, its result-ready sample less its own call-return sample on the same language clock, the deferred verdict and requirement conversion after `verify` returned; computed per call before the percentile, never from the totals' percentiles",
+        )
+    }));
     base.metrics.extend([
+        Metric::raw(
+            "client_cpu_seconds",
+            "s",
+            "client: user plus system CPU seconds of the process making the step's calls over the measured window; for Rust it is this controller, including the local provider",
+        ),
+        Metric::raw(
+            "client_peak_memory_bytes",
+            "bytes",
+            "client: sampled peak resident memory of the process making the step's calls from the window's open until its calls drained",
+        ),
         Metric::raw(
             "wrong",
             "verifications",
-            "direct results whose verdict was not the expected one",
+            "direct results whose verdict, requirement outcomes, citations, or Agent data were not the expected ones",
+        ),
+        Metric::raw(
+            "unreconciled",
+            "problems",
+            "canonical steps: acknowledged calls without exactly one `code.run` turn and one own-output final turn per Agent in the provider ledger, mismatched final turns, conversations nobody acknowledged in an error-free window, a ledger overflow, and sampled executions whose details do not record one clean model-recipient `code.run` per Agent check; inapplicable elsewhere",
         ),
         Metric::raw(
             "lost_writes",
@@ -364,6 +601,46 @@ fn direct(mut base: Declaration) -> Declaration {
             "overhead_mean_ms",
             "ms",
             "server: exact mean of the per-execution residuals",
+        ),
+        Metric::raw(
+            "server_concurrency",
+            "executions",
+            "server: the time-averaged count of direct executions in progress over the window, the completed executions' summed `verification.direct` elapsed time over the window's seconds (Little's law; executions draining after the window add their whole time); the load the server actually carried, which a closed-loop step's client count does not fix",
+        ),
+        Metric::raw(
+            "arrivals_late",
+            "arrivals",
+            "client, paced steps: calls that started more than 5 ms behind their due slot, measured immediately before the public `verify`; diagnostic, the send-lateness p99 judges",
+        ),
+        Metric::raw(
+            "arrivals_late_first_ms",
+            "ms",
+            "client, paced steps: the due time, after the window opened, of the first call that started more than 5 ms late; missing when none did",
+        ),
+        Metric::raw(
+            "arrivals_late_last_ms",
+            "ms",
+            "client, paced steps: the due time, after the window opened, of the last call that started more than 5 ms late; missing when none did",
+        ),
+        Metric::raw(
+            "arrivals_wake_p99_us",
+            "µs",
+            "client, paced steps: p99 of how late each caller woke after its due slot, before preparing its call; start lateness well above it is the caller's own preparation",
+        ),
+        Metric::raw(
+            "driver_gc_collections",
+            "collections",
+            "client, Python steps: garbage collections the driver's interpreter ran during the window (`gc.callbacks`); missing for a driver that reports none",
+        ),
+        Metric::raw(
+            "driver_gc_max_ms",
+            "ms",
+            "client, Python steps: the longest garbage collection the driver's interpreter ran during the window",
+        ),
+        Metric::raw(
+            "arrivals_late_in_gc",
+            "arrivals",
+            "client, paced Python steps: late calls whose wait, from due slot to start, overlapped a garbage collection; equal to `arrivals_late` when collections explain every late start",
         ),
         Metric::raw(
             "overhead_max_ms",
@@ -407,6 +684,36 @@ fn direct(mut base: Declaration) -> Declaration {
             ));
         }
     }
+    for language in driver::Language::ALL {
+        base.metrics.extend(Population::root_metrics(
+            language.role(),
+            run::client_roots(language),
+        ));
+    }
+    base.metrics.extend(Population::response_byte_metrics(
+        Role::Driver,
+        run::HTTP_ROOT,
+    ));
+    base.metrics
+        .extend(Population::root_metrics(Role::Driver, &run::FIXTURE_ROOTS));
+    for phase in run::GATEWAY_PHASES {
+        base.metrics.extend(Metric::diagnostic(
+            &format!("gateway.phase.{phase}"),
+            &format!("server: `wyrd_gateway_phase_duration_seconds{{phase={phase}}}` of an Agent's in-process model calls, measured window; nested in the Verifier block and never summed"),
+        ));
+    }
+    for wait in crate::gateway::run::WAITS {
+        base.metrics.extend(Metric::diagnostic(
+            &format!("gateway.wait.{wait}"),
+            &format!("server: `wyrd_gateway_wait_seconds{{wait={wait}}}` of an Agent's in-process model calls, measured window; overlaps the phases and is never summed"),
+        ));
+    }
+    for (observation, boundary, _) in run::ENVELOPES {
+        base.metrics.extend(Metric::diagnostic(
+            observation,
+            &format!("server: per completed direct execution, the union of its `{boundary}` intervals, measured window; inclusive (a tool call holds its sandbox operation, a model call its Gateway phases and provider waits), nested in the engine and the Verifier blocks, overlapping across concurrent Agents, and never summed or subtracted; fewer samples than completed executions leaves attribution unfinished"),
+        ));
+    }
     let objective = format!("direct-verify-c{OBJECTIVE_CLIENTS}");
     base.criteria = vec![
         Criterion::limit(
@@ -417,9 +724,10 @@ fn direct(mut base: Declaration) -> Declaration {
             OVERHEAD_LIMIT_MS,
         )
         .percentile(99),
-        Criterion::every("no-errors", "errors", &steps, Op::Le, 0.0),
-        Criterion::every("correct-verdicts", "wrong", &steps, Op::Le, 0.0),
-        Criterion::every("no-lost-evidence", "lost_writes", &steps, Op::Le, 0.0),
+        Criterion::every("no-errors", "errors", &correct, Op::Le, 0.0),
+        Criterion::every("correct-verdicts", "wrong", &correct, Op::Le, 0.0),
+        Criterion::every("no-lost-evidence", "lost_writes", &correct, Op::Le, 0.0),
+        Criterion::every("reconciled", "unreconciled", &steps, Op::Le, 0.0),
     ];
     base
 }
@@ -469,6 +777,7 @@ fn competing(
     base.metrics = work_metrics();
     base.metrics.extend(latency_metrics(
         "executions that ended in the capacity phase",
+        "diagnostic only: public-client `verify` call until its judged result; never judged",
     ));
     base.metrics.extend([
         Metric::raw(
@@ -630,6 +939,20 @@ mod tests {
 
     use super::{COMPETING, OVERHEAD_LIMIT_MS, STAGES, Schedule, declare};
 
+    /// The default L1 populations: Rust, Python, and TypeScript at 1 and
+    /// 64 clients.
+    const STEPS: [&str; 9] = [
+        "direct-verify-c1",
+        "direct-verify-c64",
+        "direct-verify-r3000",
+        "direct-verify-python-c1",
+        "direct-verify-python-c64",
+        "direct-verify-python-r3000",
+        "direct-verify-typescript-c1",
+        "direct-verify-typescript-c64",
+        "direct-verify-typescript-r3000",
+    ];
+
     /// A clean base declaration at `level` with no release binary.
     pub(super) fn base(level: Level) -> Declaration {
         Declaration {
@@ -687,7 +1010,127 @@ mod tests {
             .iter()
             .map(|step| step.id.as_str())
             .collect();
-        assert_eq!(steps, ["direct-verify-c1", "direct-verify-c64"]);
+        assert_eq!(steps, STEPS);
+        let expected = [
+            ("rust", 1, None),
+            ("rust", 64, None),
+            ("rust", 64, Some(3_000)),
+            ("python", 1, None),
+            ("python", 64, None),
+            ("python", 64, Some(3_000)),
+            ("typescript", 1, None),
+            ("typescript", 64, None),
+            ("typescript", 64, Some(3_000)),
+        ];
+        for (step, (language, clients, rate)) in declaration.steps.iter().zip(expected) {
+            assert_eq!(step.text("op"), Some("verify"), "{}", step.id);
+            assert_eq!(step.text("check"), Some("canonical"), "{}", step.id);
+            assert_eq!(step.text("language"), Some(language), "{}", step.id);
+            assert_eq!(step.number("clients"), Some(clients), "{}", step.id);
+            assert_eq!(step.number("rate"), rate, "{}", step.id);
+        }
+        let processes = declaration.controls["processes"]
+            .as_str()
+            .expect("the process model is recorded");
+        for named in [
+            "prestarted threads",
+            "bounded Promise",
+            "include the controller and provider",
+        ] {
+            assert!(processes.contains(named), "{named}: {processes}");
+        }
+        for id in ["client_cpu_seconds", "client_peak_memory_bytes"] {
+            assert!(
+                declaration.metrics.iter().any(|metric| metric.id == id),
+                "{id} is declared"
+            );
+        }
+        assert_eq!(
+            declaration.controls["workload_version"],
+            super::CANONICAL_VERSION
+        );
+        let fixture = declaration.controls["fixture"]
+            .as_str()
+            .expect("the fixture is recorded");
+        for named in [
+            super::workload::CANONICAL_VERIFIER,
+            "one Assert and two Agent checks",
+            "four governed provider exchanges and two `code.run` operations",
+            "L2",
+        ] {
+            assert!(fixture.contains(named), "{named}: {fixture}");
+        }
+        let limits = declaration.controls["limits"]
+            .as_str()
+            .expect("the limits are recorded");
+        for named in [
+            "workspaces",
+            "Python workers",
+            "wait fairly per tenant for shared process memory",
+            "never a pool resize",
+        ] {
+            assert!(limits.contains(named), "{named}: {limits}");
+        }
+        assert!(
+            !limits.contains("waiters"),
+            "no fixed waiter count: {limits}"
+        );
+        for id in [
+            "client_p50_ms",
+            "client_p95_ms",
+            "client_p99_ms",
+            "client_ready_p50_ms",
+            "client_ready_p95_ms",
+            "client_ready_p99_ms",
+        ] {
+            let metric = declaration
+                .metric(id)
+                .unwrap_or_else(|| panic!("total client field {id} is declared"));
+            assert!(
+                metric.boundary.starts_with("client: end-to-end"),
+                "{id} is a total: {}",
+                metric.boundary
+            );
+        }
+        assert!(
+            declaration
+                .metrics
+                .iter()
+                .all(|metric| !metric.id.contains("adjusted")),
+            "no client metric subtracts work"
+        );
+        assert!(
+            declaration
+                .criteria
+                .iter()
+                .all(|criterion| !criterion.metric.starts_with("client")),
+            "no client target is judged"
+        );
+        for (observation, _, _) in super::run::ENVELOPES {
+            assert!(
+                declaration
+                    .metrics
+                    .iter()
+                    .any(|metric| metric.id.contains(&format!("{observation}."))),
+                "{observation} attributes engine time"
+            );
+        }
+        let reconciled = declaration
+            .criteria
+            .iter()
+            .find(|criterion| criterion.id == "reconciled")
+            .expect("per-request reconciliation is judged");
+        assert_eq!(reconciled.steps, steps);
+        assert!(declaration.metric("unreconciled").is_some());
+        for diagnostic in ["driver.fixture.upstream.", "gateway.phase.route."] {
+            assert!(
+                declaration
+                    .metrics
+                    .iter()
+                    .any(|metric| metric.id.contains(diagnostic)),
+                "{diagnostic} is declared: every canonical exchange is a governed model call"
+            );
+        }
         let overhead = declaration
             .criteria
             .iter()
@@ -705,7 +1148,7 @@ mod tests {
                 .iter()
                 .find(|c| c.id == id)
                 .expect("declared");
-            assert_eq!(criterion.steps.len(), super::CLIENTS.len());
+            assert_eq!(criterion.steps, STEPS, "{id} covers every language");
             assert!(matches!(
                 criterion.rule,
                 Rule {
@@ -726,6 +1169,129 @@ mod tests {
             assert!(declaration.metric(id).is_some(), "{id} is declared");
         }
         assert_eq!(declaration.refusals(), Vec::new());
+    }
+
+    /// A named sweep count adds one Rust closed-loop step in client order
+    /// and leaves the default declaration and other languages unchanged.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a sweep step is missing, misordered, or not a Rust
+    /// closed-loop step.
+    #[test]
+    fn sweep_steps_are_rust_only_and_declared_when_named() {
+        let selected = line(&["--steps", "direct-verify-c16,direct-verify-c4"]);
+        let declaration =
+            declare(Level::One, &selected, base(Level::One)).expect("L1 declares sweep steps");
+        let ids: Vec<&str> = declaration
+            .steps
+            .iter()
+            .map(|step| step.id.as_str())
+            .collect();
+        assert_eq!(
+            &ids[..5],
+            [
+                "direct-verify-c1",
+                "direct-verify-c4",
+                "direct-verify-c16",
+                "direct-verify-c64",
+                "direct-verify-r3000"
+            ]
+        );
+        assert_eq!(&ids[5..], &STEPS[3..]);
+        let c16 = &declaration.steps[2];
+        assert_eq!(c16.number("clients"), Some(16));
+        assert_eq!(c16.text("language"), Some("rust"));
+        assert_eq!(c16.number("rate"), None);
+    }
+
+    /// The model steps exist only when `--steps` names one: the default L1
+    /// declaration is unchanged, and a model run adds both counts with the
+    /// `model` check over the same SDK `verify` flow, records the local
+    /// fixture and what it leaves unexercised, owes the provider's answers
+    /// as driver diagnostics, keeps the overhead objective on the assertion
+    /// step alone, and refuses an undeclared model step.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a model step leaks into the default run or is judged by
+    /// the overhead objective.
+    #[test]
+    fn model_steps_declare_the_existing_sdk_flow_and_local_fixture() {
+        let default =
+            declare(Level::One, &line(&[]), base(Level::One)).expect("L1 declares by default");
+        let selected = line(&["--steps", "direct-verify-c1,direct-verify-model-c64"]);
+        let mut model =
+            declare(Level::One, &selected, base(Level::One)).expect("L1 declares model steps");
+        let ids = |declaration: &Declaration| -> Vec<String> {
+            declaration
+                .steps
+                .iter()
+                .map(|step| step.id.clone())
+                .collect()
+        };
+        assert_eq!(ids(&default), STEPS);
+        assert!(!default.controls.contains_key("model"));
+        assert_eq!(
+            ids(&model),
+            [
+                &STEPS[..],
+                &["direct-verify-model-c1", "direct-verify-model-c64"]
+            ]
+            .concat()
+        );
+        for step in &model.steps[STEPS.len()..] {
+            assert_eq!(step.text("check"), Some("model"));
+            assert_eq!(step.text("op"), Some("verify"));
+        }
+        let fixture = model.controls["model"]
+            .as_str()
+            .expect("the fixture is recorded");
+        for named in [
+            super::workload::JUDGE_DEPLOYMENT,
+            "loopback plaintext HTTP/1.1",
+            "unexercised: TLS",
+        ] {
+            assert!(fixture.contains(named), "{named}: {fixture}");
+        }
+        assert!(
+            model
+                .metrics
+                .iter()
+                .any(|metric| metric.id.contains("driver.fixture.upstream")),
+            "the provider's answers are driver diagnostics"
+        );
+        let criterion = |id: &str| {
+            model
+                .criteria
+                .iter()
+                .find(|criterion| criterion.id == id)
+                .expect("declared")
+                .steps
+                .clone()
+        };
+        assert_eq!(criterion("overhead-p99"), ["direct-verify-c64"]);
+        for id in ["no-errors", "correct-verdicts", "no-lost-evidence"] {
+            assert_eq!(
+                criterion(id).len(),
+                STEPS.len() + 2,
+                "{id} covers the model steps"
+            );
+        }
+        assert_eq!(model.refusals(), Vec::new());
+        crate::levels::select(&mut model, &selected).expect("declared steps select");
+        assert_eq!(
+            model.selection.as_deref(),
+            Some(
+                &[
+                    "direct-verify-c1".to_owned(),
+                    "direct-verify-model-c64".to_owned()
+                ][..]
+            )
+        );
+        let unknown = line(&["--steps", "direct-verify-model-c2"]);
+        let mut refused = declare(Level::One, &unknown, base(Level::One)).expect("declares");
+        assert!(crate::levels::select(&mut refused, &unknown).is_err());
     }
 
     /// L2 declares one stateful step with every phase's metrics, judges

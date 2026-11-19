@@ -1,0 +1,6 @@
+[repository.metadata]
+version = "0.1.0"
+
+[repository.verified_by]
+verifier = ["./code-review.yaml"]
+runs_on = { kind = "pull_request" }

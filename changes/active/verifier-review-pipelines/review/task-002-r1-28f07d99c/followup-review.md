@@ -1,0 +1,34 @@
+# Focused follow-up: O5.2 accepted publish reply loss
+
+Subject: prior candidate `75c9bfa9e07163099eac40d5a556c4447c6a519d` to candidate `28f07d99cee44669cd4a8209d1f096ee19c5dfd4`; HEAD independently matches the candidate. Source and authority were unchanged. This review read neither competing current report nor any other current discovery conclusion. The conflict supplied by the orchestrator is the question, not evidence.
+
+**Source trace: RESOLVED. O5.2 remains unproved by the named case.** The first publish reply reaches its invoking Agent before the later consumer fails Busy. The direct replay demonstrates idempotency after delivered success. It does not demonstrate a lost first publish reply. This is a bounded required-proof gap, not a demonstrated production replay defect.
+
+## Required observation
+
+The original TASK-002 scenario table, `tasks/TASK-002-agent-tooling.md:61,65`, explicitly names lost reply/original-call replay and lost tool reply. The prior validated finding, `review/task-002-75c9bfa9e/findings-validation.md:70–78`, distinguishes two successful duplicate calls from reply loss and requires an invocation/publication seam that loses a reply after acceptance, then replays the original call/attempt without another acceptance/upload. The remediation task repeats that correction at `:71–78` and O5.2 at `:155`. Thus this is an explicit acceptance observation, not an inferred request for additional resilience machinery.
+
+## Actual producer-to-consumer trace
+
+| Point | Source and observation |
+| --- | --- |
+| First publish begins | `pg_durable_verifier_work.rs:1727–1739` supplies the drafter's first model answer with `fs_write` and `publish`. Its publish is `call_1`, as the test itself states at `:1806–1809`. |
+| Acceptance precedes reply | `hosted/publications.rs:305–324` awaits `RunState::accept_publication` and returns the accepted content kind. `hosted/tools.rs:342–374` awaits that operation and constructs the normal `{name,kind}` reply. |
+| Reply reaches invoking Agent | `vala-verify/src/blocks/tools.rs:272–274` forwards the original call ID and result through `RecordedTool`. `skald-agent/src/loop_runtime.rs:632–701` awaits `invoke_call`, applies result callbacks, journals the result, optionally appends the successful session turn, and returns a `ConversationTurn::ToolResult`; `:704–718` collects and pushes it into the conversation. There is no loss gate or replacement in the server test's ordinary `agent_engine` composition (`pg_durable_verifier_work.rs:1435–1480`). |
+| Drafter observes continuation and settles | The next queued model answer is successful final `{}` (`:1740`), followed by the consumer's `code_run` (`:1741`). The engine is awaited until `Err(EngineError::Busy)` (`:1743–1749`), and all three model answers have been consumed (`:1750`). On reclaim the test explicitly asserts a settled draft attempt 1 and no spent consumer attempt (`:1752–1758`). Therefore the interruption occurs after the drafter's publish result has been processed and its final model turn has completed. |
+| Later replay | After reclaim, the test manually calls `Publications::path` with original producer attempt 1, `call_1`, name `report`, and original path (`:1788–1813`). Empty scratch plus inaccessible object storage, successful File kind, and unchanged revision (`:1803–1825`) establish reuse of the durable receipt without a new acceptance/upload. |
+| Recovered successor | The remaining assertions (`:1827–1900`) establish settled-producer preservation and exact accepted bytes reaching the consumer. They do not change the earlier reply-delivery sequence. |
+
+The normal first `{name,kind}` reply is lost to nobody in this trace. It is delivered to the drafter Agent's tool-result processing and conversation before that Agent settles. The later engine result is a Busy error from the consumer, not an accepted publish receipt lost before delivery. The test retaining no Rust variable for the initial tool reply does not discard it at the invoking consumer boundary: the Agent loop already consumed it. Reclaim discards/replaces execution-local state after this observed success; it cannot retroactively make that successful tool exchange uncertain. The rustdoc claim at `pg_durable_verifier_work.rs:1693–1697` that the original publish reply “was lost” has no corresponding source action/assertion.
+
+## Source-local proposal
+
+**FOLLOWUP-O5.2 — MISSING required lost-reply observation.** Location: `crates/wyrd/wyrd-server/tests/integration/pg_durable_verifier_work.rs:1740–1758,1803–1825`. Violated obligation: remediation O5.2 and original TASK-002's named lost tool reply/original-call replay case.
+
+Consequence and materiality: the named green case cannot distinguish an uncertain accepted first call from a fully successful first call followed by deliberate duplicate submission, the same distinction required by FIND-TASK-002-5. The durable replay implementation is supported by the source and current replay assertions; this finding claims missing required failure-path proof only. No production failure is established.
+
+Smallest credible correction: keep this recovered-consumer case and its useful assertions. At the existing server invocation/publication seam, perform one first publish whose reply is deliberately discarded/withheld before the modeled invoking consumer receives success; independently observe durable acceptance, then replay the same producer/call/name/arguments and verify the original receipt with no new acceptance/upload. The existing RunState snapshot/reclaim, Publications, empty-workspace, revision, and storage controls suffice as the owners to reuse. A separate small owner-level case is sufficient; this need not interrupt the full Agent loop or prove automatic Agent reissuance. Explicitly identify the response recipient and loss boundary in that case so a later execution Busy result cannot substitute for lost tool delivery. Retain the current exact-byte/recovery and no-settled-drafter-replay assertions, and correct the unsupported rustdoc claim in this case.
+
+An intentional drop of the first publication result at that lower seam, with acceptance established through durable state rather than delivery to the caller, can model the required uncertainty. A network fault harness, public resume API, production transport change, new general test framework, and another SDK fault matrix are unnecessary. Merely changing a label/comment or throwing away the completed engine outcome is insufficient because the publish result has already reached the original Agent.
+
+Verification: static source tracing only; no builds, tests, generators, load, source edits, or subagents. The orchestrator supplied a green execution of the named server case; that confirms these assertions run, not the absent loss observation. Scope outside O5.2 was not re-reviewed. Risk is limited to an explicit proof gap; no new runtime defect is asserted.

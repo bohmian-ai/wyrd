@@ -11,8 +11,12 @@
 //! frames [`PacedUpstream`] writes one at a time. `wiremock` returns one
 //! whole body after one delay, so it cannot pace a stream; [`PacedUpstream`]
 //! is the bounded local provider that does, recording when it sent each
-//! frame.
+//! frame. Nor can it wait for a test event, so [`HeldUpstream`] forwards to
+//! a scripted upstream and holds chosen answers until the test releases
+//! them. [`pick`] reads only the request and answer members a fixture
+//! judges or routes by, under a decoded value's rules.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -21,13 +25,17 @@ use std::time::{Duration, Instant};
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
+use serde::Deserialize;
+use serde::de::{DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{Value, json};
 use url::Url;
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+use wyrd_benchmark::{Cohort, Observation};
 use wyrd_runtime::Permission;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::GatewayAccess;
@@ -79,6 +87,23 @@ impl GatewayCapture {
     pub fn sized_completion(content_bytes: usize) -> Value {
         let mut completion = Self::completion();
         completion["choices"][0]["message"]["content"] = json!(Self::prose(content_bytes));
+        completion
+    }
+
+    /// A buffered Chat Completions answer whose message content is a passing
+    /// Verdict citing the whole of slot `slot`, with the fixed usage of
+    /// [`Self::completion`], for an Agent check that answers in the plain
+    /// `verdict` format.
+    pub fn verdict_completion(slot: &str) -> Value {
+        let mut completion = Self::completion();
+        completion["choices"][0]["message"]["content"] = json!(
+            json!({
+                "outcome": "passed",
+                "reason": "the fixture judges every answer acceptable",
+                "citations": [{"slot": slot, "locator": {"json_pointer": ""}}],
+            })
+            .to_string()
+        );
         completion
     }
 
@@ -399,6 +424,10 @@ pub struct Pacing {
 /// Monotonic send times [`PacedUpstream`] recorded, by call marker.
 type Sends = Arc<Mutex<HashMap<String, Vec<Instant>>>>;
 
+/// The buffered answer [`PacedUpstream::replying`] builds from one request
+/// body, or `None` to refuse it.
+pub type Reply = Arc<dyn Fn(&[u8]) -> Option<Bytes> + Send + Sync>;
+
 /// What every [`PacedUpstream`] connection shares.
 #[derive(Clone)]
 struct Paced {
@@ -407,6 +436,8 @@ struct Paced {
     /// The buffered answer's body, identical on every call, so it is built
     /// once.
     buffered: Bytes,
+    /// Builds each buffered answer from its request instead, when set.
+    reply: Option<Reply>,
     /// Frame send times of calls not yet taken.
     sends: Sends,
     /// Calls whose send times may be held at once; a later call is answered
@@ -420,13 +451,19 @@ struct Paced {
 /// It serves `POST /v1/chat/completions` under any path prefix. The call's
 /// marker is its first message's content, which the caller makes unique. A
 /// buffered call waits [`Pacing::buffered_delay`] and answers a sized
-/// completion; a `stream: true` call waits [`Pacing::stream_delay`], then
+/// completion, or what its [`Reply`] builds from the request; a `stream: true` call waits [`Pacing::stream_delay`], then
 /// writes [`GatewayCapture::chat_event_frames`] with the marker as its id,
 /// [`Pacing::chunk_interval`] apart. Just before handing each data event (or
 /// the buffered body) to the connection it records [`Instant::now`] under
 /// the marker; a handed frame is not proof of receipt. Nothing else is
 /// recorded, and at most `bound` calls' times are held until
 /// [`Self::take`] removes them. Dropping it stops serving.
+///
+/// In a benchmark process each answer is one [`FIXTURE_ROOT`] observation,
+/// classified by the benchmark metadata the Gateway forwarded, from the
+/// request's arrival to its answer's headers, with the paced delay excluded
+/// and its `parse` and `answer` components; a stream's paced body is not
+/// part of it.
 pub struct PacedUpstream {
     /// The bound address.
     address: SocketAddr,
@@ -443,6 +480,46 @@ impl PacedUpstream {
     /// # Errors
     /// Returns the bind failure.
     pub async fn start(pacing: Pacing, bound: usize) -> std::io::Result<Self> {
+        let completion = GatewayCapture::sized_completion(pacing.buffered_bytes);
+        Self::answering(pacing, bound, &completion).await
+    }
+
+    /// [`Self::start`], answering every buffered call with `completion`
+    /// instead of a sized one; [`Pacing::buffered_bytes`] is unused.
+    ///
+    /// # Errors
+    /// Returns the bind failure.
+    pub async fn answering(
+        pacing: Pacing,
+        bound: usize,
+        completion: &Value,
+    ) -> std::io::Result<Self> {
+        Self::serve(pacing, bound, Bytes::from(completion.to_string()), None).await
+    }
+
+    /// [`Self::start`], answering every buffered call with what `reply`
+    /// builds from its request body, so a scripted conversation answers each
+    /// turn from that request's own messages; a request `reply` refuses is
+    /// answered `400`. [`Pacing::buffered_bytes`] is unused.
+    ///
+    /// # Errors
+    /// Returns the bind failure.
+    pub async fn replying(pacing: Pacing, bound: usize, reply: Reply) -> std::io::Result<Self> {
+        Self::serve(pacing, bound, Bytes::new(), Some(reply)).await
+    }
+
+    /// Binds a loopback port and serves `pacing` with the buffered answer
+    /// `buffered`, or what `reply` builds, holding at most `bound` calls'
+    /// send times.
+    ///
+    /// # Errors
+    /// Returns the bind failure.
+    async fn serve(
+        pacing: Pacing,
+        bound: usize,
+        buffered: Bytes,
+        reply: Option<Reply>,
+    ) -> std::io::Result<Self> {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
         let address = listener.local_addr()?;
         let sends: Sends = Arc::default();
@@ -450,9 +527,8 @@ impl PacedUpstream {
             .route("/{*path}", post(answer))
             .with_state(Paced {
                 pacing,
-                buffered: Bytes::from(
-                    GatewayCapture::sized_completion(pacing.buffered_bytes).to_string(),
-                ),
+                buffered,
+                reply,
                 sends: Arc::clone(&sends),
                 bound,
             });
@@ -527,23 +603,61 @@ async fn pause(delay: Duration) {
     }
 }
 
+/// Path of a chat request's marker: its first message's content.
+const MARKER: &[Step] = &[Step::Key("messages"), Step::Index(0), Step::Key("content")];
+
+/// Path of a chat request's `stream` member.
+const STREAM: &[Step] = &[Step::Key("stream")];
+
+/// The benchmark root of one [`PacedUpstream`] answer, apart from the
+/// driver's own client work although both run in the driver process.
+pub const FIXTURE_ROOT: &str = "fixture.upstream";
+
+/// Waits `delay` like [`pause`], excluding the wait from `observation`.
+async fn paused(delay: Duration, observation: &mut Observation) {
+    let started = observation.now();
+    pause(delay).await;
+    if let Some(started) = started {
+        observation.exclude(started.elapsed());
+    }
+}
+
 /// Answers one chat completion as [`PacedUpstream`] documents; a body that
 /// is not a JSON chat request is refused with `400`.
-async fn answer(State(paced): State<Paced>, body: Bytes) -> Response {
-    let Ok(request) = serde_json::from_slice::<Value>(&body) else {
+async fn answer(State(paced): State<Paced>, headers: HeaderMap, body: Bytes) -> Response {
+    let mut observation = Observation::start(FIXTURE_ROOT, || Cohort::of_headers(&headers));
+    let started = observation.now();
+    let picked = pick(&body, [MARKER, STREAM]);
+    observation.since("parse", started);
+    let Ok([marker, stream]) = picked else {
+        observation.finish(wyrd_benchmark::ERROR);
         return (axum::http::StatusCode::BAD_REQUEST, "not json").into_response();
     };
-    let marker = request["messages"][0]["content"]
-        .as_str()
-        .unwrap_or_default()
-        .to_owned();
+    let marker = match marker {
+        Some(Leaf::Str(marker)) => marker,
+        _ => Cow::Borrowed(""),
+    };
     let pacing = paced.pacing;
-    if request["stream"] != Value::Bool(true) {
-        pause(pacing.buffered_delay).await;
+    if stream != Some(Leaf::Bool(true)) {
+        paused(pacing.buffered_delay, &mut observation).await;
+        let started = observation.now();
+        let buffered = match &paced.reply {
+            None => Some(paced.buffered.clone()),
+            Some(reply) => reply(&body),
+        };
+        let Some(buffered) = buffered else {
+            observation.finish(wyrd_benchmark::ERROR);
+            return (axum::http::StatusCode::BAD_REQUEST, "no scripted answer").into_response();
+        };
         paced.record(&marker);
-        return ([(CONTENT_TYPE, "application/json")], paced.buffered).into_response();
+        let answer = ([(CONTENT_TYPE, "application/json")], buffered).into_response();
+        observation.since("answer", started);
+        observation.finish(wyrd_benchmark::SUCCESS);
+        return answer;
     }
-    pause(pacing.stream_delay).await;
+    let marker = marker.into_owned();
+    paused(pacing.stream_delay, &mut observation).await;
+    let started = observation.now();
     let frames = GatewayCapture::chat_event_frames(&marker, pacing.chunks);
     let events = async_stream::stream! {
         for (index, frame) in frames.into_iter().enumerate() {
@@ -556,9 +670,498 @@ async fn answer(State(paced): State<Paced>, body: Bytes) -> Response {
             yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(frame));
         }
     };
-    (
+    let answer = (
         [(CONTENT_TYPE, "text/event-stream")],
         Body::from_stream(events),
     )
-        .into_response()
+        .into_response();
+    observation.since("answer", started);
+    observation.finish(wyrd_benchmark::SUCCESS);
+    answer
+}
+
+/// One step of a [`pick`] path: an object member or an array element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    /// The member of this name.
+    Key(&'static str),
+    /// The element at this position.
+    Index(usize),
+}
+
+/// The scalar [`pick`] found at a path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Leaf<'a> {
+    /// A string, borrowed from the document unless it holds escapes.
+    Str(Cow<'a, str>),
+    /// An integer a decoded [`Value`] holds as unsigned.
+    U64(u64),
+    /// A Boolean.
+    Bool(bool),
+}
+
+/// Reads `json` as a [`Value`] decode reads it, with the same syntax, number,
+/// string, nesting, and trailing-input rules and the last of duplicate
+/// members winning, but keeps only the scalar at each of `paths`, so no other
+/// member is materialized and an unescaped string is borrowed from `json`.
+///
+/// A path holds `None` where indexing the decoded value along it reaches no
+/// string, unsigned integer, or Boolean.
+///
+/// # Errors
+///
+/// Returns the JSON error of a document that does not decode as a [`Value`].
+///
+/// # Panics
+///
+/// Fails to compile for more than 64 paths.
+pub fn pick<'a, const N: usize>(
+    json: &'a [u8],
+    paths: [&[Step]; N],
+) -> serde_json::Result<[Option<Leaf<'a>>; N]> {
+    const { assert!(N <= 64, "pick reads at most 64 paths") };
+    let mut picked = std::array::from_fn(|_| None);
+    let mut deserializer = serde_json::Deserializer::from_slice(json);
+    Walk {
+        paths: &paths,
+        picked: &mut picked,
+        matching: (0..N).fold(0, |mask, path| mask | 1 << path),
+        depth: 0,
+    }
+    .deserialize(&mut deserializer)?;
+    deserializer.end()?;
+    Ok(picked)
+}
+
+/// One value of [`pick`]'s document at `depth`, under which the paths of the
+/// `matching` mask continue.
+struct Walk<'s, 'de> {
+    /// Every requested path.
+    paths: &'s [&'s [Step]],
+    /// The scalar found for each path so far.
+    picked: &'s mut [Option<Leaf<'de>>],
+    /// Paths this value lies on, one bit per path.
+    matching: u64,
+    /// Steps from the document to this value.
+    depth: usize,
+}
+
+impl<'de> Walk<'_, 'de> {
+    /// The matching paths that `keep` accepts.
+    fn select(&self, keep: impl Fn(&[Step]) -> bool) -> u64 {
+        (0..self.paths.len())
+            .filter(|&index| self.matching & 1 << index != 0 && keep(self.paths[index]))
+            .fold(0, |mask, index| mask | 1 << index)
+    }
+
+    /// A walk of this value's child on the paths of `matching`.
+    fn child(&mut self, matching: u64) -> Walk<'_, 'de> {
+        Walk {
+            paths: self.paths,
+            picked: &mut *self.picked,
+            matching,
+            depth: self.depth + 1,
+        }
+    }
+
+    /// Stores the scalar `leaf` makes for every path ending at this value.
+    fn leaf(self, leaf: impl FnOnce() -> Option<Leaf<'de>>) {
+        let ending = self.select(|path| path.len() == self.depth);
+        if ending != 0 {
+            let leaf = leaf();
+            for (index, picked) in self.picked.iter_mut().enumerate() {
+                if ending & 1 << index != 0 {
+                    picked.clone_from(&leaf);
+                }
+            }
+        }
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for Walk<'_, 'de> {
+    type Value = ();
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for Walk<'_, 'de> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<(), E> {
+        self.leaf(|| Some(Leaf::Bool(value)));
+        Ok(())
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<(), E> {
+        self.leaf(|| u64::try_from(value).ok().map(Leaf::U64));
+        Ok(())
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<(), E> {
+        self.leaf(|| Some(Leaf::U64(value)));
+        Ok(())
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<(), E> {
+        self.leaf(|| None);
+        Ok(())
+    }
+
+    fn visit_unit<E>(self) -> Result<(), E> {
+        self.leaf(|| None);
+        Ok(())
+    }
+
+    fn visit_borrowed_str<E>(self, value: &'de str) -> Result<(), E> {
+        self.leaf(|| Some(Leaf::Str(Cow::Borrowed(value))));
+        Ok(())
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<(), E> {
+        self.leaf(|| Some(Leaf::Str(Cow::Owned(value.to_owned()))));
+        Ok(())
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(mut self, mut seq: A) -> Result<(), A::Error> {
+        let mut index = 0;
+        loop {
+            let under = self.select(|path| path.get(self.depth) == Some(&Step::Index(index)));
+            if seq.next_element_seed(self.child(under))?.is_none() {
+                return Ok(());
+            }
+            index += 1;
+        }
+    }
+
+    fn visit_map<A: MapAccess<'de>>(mut self, mut map: A) -> Result<(), A::Error> {
+        while let Some(Name(name)) = map.next_key()? {
+            let under = self.select(
+                |path| matches!(path.get(self.depth), Some(Step::Key(key)) if *key == name),
+            );
+            // A later duplicate replaces the earlier value whole.
+            for (index, picked) in self.picked.iter_mut().enumerate() {
+                if under & 1 << index != 0 {
+                    *picked = None;
+                }
+            }
+            map.next_value_seed(self.child(under))?;
+        }
+        Ok(())
+    }
+}
+
+/// An object member name, borrowed from the document unless it holds escapes.
+#[derive(Deserialize)]
+#[serde(transparent)]
+struct Name<'a>(#[serde(borrow)] Cow<'a, str>);
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+    use std::time::Duration;
+
+    use serde_json::Value;
+
+    use super::{GatewayCapture, Leaf, MARKER, PacedUpstream, Pacing, STREAM, pick};
+
+    /// The upstream's former projection of `body`: its marker and whether it
+    /// streams, from a decoded value.
+    fn decoded(body: &[u8]) -> Option<(String, bool)> {
+        let request = serde_json::from_slice::<Value>(body).ok()?;
+        let marker = request["messages"][0]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        Some((marker, request["stream"] == Value::Bool(true)))
+    }
+
+    /// The upstream's projection of `body` through [`pick`].
+    fn picked(body: &[u8]) -> Option<(Cow<'_, str>, bool)> {
+        let [marker, stream] = pick(body, [MARKER, STREAM]).ok()?;
+        let marker = match marker {
+            Some(Leaf::Str(marker)) => marker,
+            _ => Cow::Borrowed(""),
+        };
+        Some((marker, stream == Some(Leaf::Bool(true))))
+    }
+
+    /// The paced upstream reads a request's marker and stream flag exactly
+    /// as its decoded-value projection did, over escaped, duplicate,
+    /// mistyped, numeric, deep, and malformed bodies, borrowing an unescaped
+    /// marker from the body; served, a non-JSON body is refused, a buffered
+    /// call is answered and recorded under its marker, and only `stream:
+    /// true` streams.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a projection or an answer differs.
+    #[tokio::test]
+    async fn paced_request_projection_preserves_validation_and_routing() {
+        let deep = |depth: usize| {
+            format!(
+                r#"{{"messages":[{{"content":"m"}}],"x":{}{}}}"#,
+                "[".repeat(depth),
+                "]".repeat(depth)
+            )
+        };
+        let mut cases: Vec<String> = [
+            r#"{"model":"m","messages":[{"role":"system","content":"plain"},{"content":"x"}]}"#,
+            r#"{"messages":[{"content":"plain"}],"stream":true}"#,
+            r#"{"messages":[{"content":"plain"}],"stream":false}"#,
+            r#"{"messages":[{"content":"plain"}],"stream":"true"}"#,
+            r#"{"messages":[{"content":"plain"}],"stream":1}"#,
+            r#"{"messages":[{"content":"plain"}],"stream":null}"#,
+            r#"{"messages":[{"content":"q\"é\n"}]}"#,
+            r#"{"messages":[{"content":"a"}],"messages":[{"content":"b"}]}"#,
+            r#"{"messages":[{"content":"a"}],"messages":[]}"#,
+            r#"{"messages":[{"content":"a","content":7}]}"#,
+            r#"{"stream":true,"stream":false,"messages":[{"content":"a"}]}"#,
+            r#"{"stream":false,"stream":true,"messages":[{"content":"a"}]}"#,
+            r#"{"messages":[{"content":"escaped name"}],"stream":true}"#,
+            r#"{"messages":{"0":{"content":"object"}}}"#,
+            r#"{"messages":[["content"]]}"#,
+            r#"{"messages":[{"content":["a"]}]}"#,
+            r#"{"messages":[{"content":{"text":"a"}}]}"#,
+            r#"[{"messages":[{"content":"a"}]}]"#,
+            r#""messages""#,
+            "{}",
+            r#"{"messages":[{"content":"a"}],"n":1e400}"#,
+            r#"{"messages":[{"content":"a"}],"n":-0,"f":1.5,"i":-7}"#,
+            r#"{"messages":[{"content":"\ud800"}]}"#,
+            r#"{"messages":[{"content":"🦀"}]}"#,
+            r#"{"messages":[{"content":"a"}]} "#,
+            r#"{"messages":[{"content":"a"}]}x"#,
+            r#"{"messages":[{"content":"a"}"#,
+            "",
+        ]
+        .map(str::to_owned)
+        .into();
+        cases.extend([deep(100), deep(126), deep(127), deep(400)]);
+        let mut decodable = 0;
+        for case in &cases {
+            let expected = decoded(case.as_bytes());
+            let got = picked(case.as_bytes());
+            assert_eq!(
+                got.as_ref()
+                    .map(|(marker, stream)| (marker.as_ref(), *stream)),
+                expected
+                    .as_ref()
+                    .map(|(marker, stream)| (marker.as_str(), *stream)),
+                "{case}"
+            );
+            decodable += usize::from(expected.is_some());
+        }
+        assert_eq!(decodable, 25, "decodable bodies");
+
+        let body = format!(
+            r#"{{"messages":[{{"content":"marker-1"}},{{"content":"{}"}}]}}"#,
+            GatewayCapture::prose(65_536)
+        );
+        let (marker, _) = picked(body.as_bytes()).expect("decodes");
+        let Cow::Borrowed(marker) = marker else {
+            panic!("an unescaped marker is borrowed");
+        };
+        assert!(body.as_bytes().as_ptr_range().contains(&marker.as_ptr()));
+        assert!(matches!(
+            picked(br#"{"messages":[{"content":"a\nb"}]}"#),
+            Some((Cow::Owned(_), false))
+        ));
+
+        let upstream = PacedUpstream::start(
+            Pacing {
+                buffered_delay: Duration::ZERO,
+                buffered_bytes: 16,
+                stream_delay: Duration::ZERO,
+                chunks: 3,
+                chunk_interval: Duration::ZERO,
+            },
+            8,
+        )
+        .await
+        .expect("upstream starts");
+        let http = reqwest::Client::new();
+        let send = |body: String| {
+            http.post(format!("{}/chat/v1/chat/completions", upstream.uri()))
+                .header("content-type", "application/json")
+                .body(body)
+                .send()
+        };
+        let refused = send("not json".to_owned()).await.expect("answers");
+        assert_eq!(refused.status(), 400);
+        let buffered = send(body.clone()).await.expect("answers");
+        assert_eq!(buffered.status(), 200);
+        let answer: Value = buffered.json().await.expect("json answer");
+        assert_eq!(
+            answer,
+            GatewayCapture::sized_completion(16),
+            "the buffered answer"
+        );
+        assert_eq!(upstream.take("marker-1").len(), 1, "one buffered send");
+        let streamed = send(r#"{"messages":[{"content":"q\"m"}],"stream":true}"#.to_owned())
+            .await
+            .expect("answers")
+            .text()
+            .await
+            .expect("stream body");
+        assert_eq!(streamed, GatewayCapture::chat_events("q\"m", 3));
+        assert_eq!(upstream.take("q\"m").len(), 3, "one send per data event");
+        let unstreamed = send(r#"{"messages":[{"content":"s"}],"stream":"true"}"#.to_owned())
+            .await
+            .expect("answers");
+        assert_eq!(
+            unstreamed.headers()["content-type"],
+            "application/json",
+            "only a Boolean true streams"
+        );
+    }
+}
+
+/// A local provider in front of a scripted `wiremock` upstream that holds
+/// chosen answers until the test releases them.
+///
+/// Every request is forwarded to the upstream as it arrives, so the
+/// upstream records it and scripts its answer; that answer is handed back
+/// only once no hold matches the request's body; a hold matches a body
+/// containing every one of its fragments. `wiremock`
+/// answers on one thread after a fixed delay, so it cannot wait for a test
+/// event; this provider orders a race by the test's own observations rather
+/// than by elapsed time. A forward the upstream refuses answers `502`.
+/// Dropping it stops serving; a held caller then sees its connection close.
+pub struct HeldUpstream {
+    /// The bound address.
+    address: SocketAddr,
+    /// The fragment sets whose answers are held.
+    held: Arc<tokio::sync::watch::Sender<Vec<Vec<String>>>>,
+    /// The serving task.
+    serving: tokio::task::JoinHandle<()>,
+}
+
+/// What every [`HeldUpstream`] connection shares.
+#[derive(Clone)]
+struct Holding {
+    /// The scripted upstream's base URL.
+    upstream: String,
+    /// The forwarding client.
+    client: reqwest::Client,
+    /// The fragment sets whose answers are held.
+    held: Arc<tokio::sync::watch::Sender<Vec<Vec<String>>>>,
+}
+
+impl HeldUpstream {
+    /// Binds a loopback port and forwards every request to `upstream`,
+    /// holding none yet.
+    ///
+    /// # Errors
+    /// Returns the bind failure.
+    pub async fn start(upstream: &MockServer) -> std::io::Result<Self> {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+        let address = listener.local_addr()?;
+        let held = Arc::new(tokio::sync::watch::Sender::new(Vec::new()));
+        let router = Router::new().fallback(forward).with_state(Holding {
+            upstream: upstream.uri(),
+            client: reqwest::Client::new(),
+            held: Arc::clone(&held),
+        });
+        let serving = tokio::spawn(async move {
+            if let Err(error) = axum::serve(listener, router).await {
+                tracing::error!(%error, "the held upstream stopped serving");
+            }
+        });
+        Ok(Self {
+            address,
+            held,
+            serving,
+        })
+    }
+
+    /// The base URL every path prefix hangs off.
+    pub fn uri(&self) -> String {
+        format!("http://{}", self.address)
+    }
+
+    /// Holds the answer to every request whose body contains each of
+    /// `fragments`, including one already waiting, until [`Self::release`].
+    pub fn hold(&self, fragments: &[&str]) {
+        let hold = fragments
+            .iter()
+            .map(|&fragment| fragment.to_owned())
+            .collect();
+        self.held.send_modify(|held| held.push(hold));
+    }
+
+    /// Hands back every answer the hold on `fragments` held, and answers
+    /// its later requests at once.
+    pub fn release(&self, fragments: &[&str]) {
+        self.held
+            .send_modify(|held| held.retain(|hold| hold.as_slice() != fragments));
+    }
+}
+
+impl Drop for HeldUpstream {
+    /// Stops serving.
+    fn drop(&mut self) {
+        self.serving.abort();
+    }
+}
+
+/// Forwards one request to the scripted upstream, then hands back its
+/// answer once no hold matches the request's body; an
+/// unreadable request body answers `400`, and a refused forward `502`.
+async fn forward(State(holding): State<Holding>, request: axum::extract::Request) -> Response {
+    let (parts, body) = request.into_parts();
+    let Ok(body) = axum::body::to_bytes(body, usize::MAX).await else {
+        return (axum::http::StatusCode::BAD_REQUEST, "unreadable body").into_response();
+    };
+    let target = format!(
+        "{}{}",
+        holding.upstream,
+        parts
+            .uri
+            .path_and_query()
+            .map_or("/", axum::http::uri::PathAndQuery::as_str)
+    );
+    let mut headers = parts.headers;
+    headers.remove(axum::http::header::HOST);
+    let answered = holding
+        .client
+        .request(parts.method, target)
+        .headers(headers)
+        .body(body.clone())
+        .send()
+        .await;
+    let (status, content_type, answer) = match answered {
+        Ok(answered) => (
+            answered.status(),
+            answered.headers().get(CONTENT_TYPE).cloned(),
+            answered.bytes().await,
+        ),
+        Err(error) => {
+            return (axum::http::StatusCode::BAD_GATEWAY, error.to_string()).into_response();
+        }
+    };
+    let Ok(answer) = answer else {
+        return (axum::http::StatusCode::BAD_GATEWAY, "unreadable answer").into_response();
+    };
+    let text = String::from_utf8_lossy(&body).into_owned();
+    // The sender lives as long as the serving task, so the wait ends only
+    // when the request is no longer held.
+    let mut held = holding.held.subscribe();
+    let _released = held
+        .wait_for(|held| {
+            !held
+                .iter()
+                .any(|hold| hold.iter().all(|fragment| text.contains(fragment.as_str())))
+        })
+        .await;
+    let mut response = (status, answer).into_response();
+    if let Some(content_type) = content_type {
+        response.headers_mut().insert(CONTENT_TYPE, content_type);
+    }
+    response
 }

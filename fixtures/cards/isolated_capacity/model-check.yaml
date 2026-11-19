@@ -1,0 +1,20 @@
+# Takes a model call: an Agent with no tools.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: model-check
+  version: 1.0.0
+spec:
+  description: An Agent answers without tools.
+  inputs:
+    question: {type: json, schema: {type: string}}
+  steps:
+    - id: answer
+      action:
+        kind: agent
+        agent: ./answerer.yaml
+        inputs: {question: inputs.question}
+  requirements:
+    - id: answered
+      statement: The answerer finished
+      check: {kind: assert, path: steps.answer.output.done, operator: equals, expected: true}

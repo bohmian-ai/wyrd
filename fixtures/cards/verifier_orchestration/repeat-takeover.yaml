@@ -1,0 +1,26 @@
+# One refinement whose retry lets an iteration interrupted by a takeover
+# run once more, so a second worker resumes it without overlapping the
+# stalled first one.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: repeat-takeover
+  version: 1.0.0
+spec:
+  description: Sequential refinement a second worker takes over mid-iteration.
+  inputs:
+    question: {type: json, schema: {type: string}}
+  steps:
+    - id: draft
+      retries: 1
+      repeat:
+        max_iterations: 3
+        until: {path: iteration.output.score, operator: greater_than_or_equals, expected: 2}
+      action:
+        kind: agent
+        agent: ./refiner.yaml
+        inputs: {question: inputs.question, index: iteration.index, previous: iteration.previous}
+  requirements:
+    - id: final
+      statement: The refined report reached its score
+      check: {kind: assert, path: steps.draft.output.score, operator: greater_than_or_equals, expected: 2}

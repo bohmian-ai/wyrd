@@ -492,7 +492,8 @@ where
 ///
 /// This router mounts exactly the closed set of private services this target's
 /// selected roles own: the Oracle peer service, the Scribe tail service, the
-/// upstream DataFusion worker adapter, and the Oracle lifecycle service. It
+/// upstream DataFusion worker adapter, the Forge leader peer service, and the
+/// Oracle lifecycle service. It
 /// deliberately mounts neither health nor reflection — a private listener
 /// advertises nothing to an unauthenticated caller.
 ///
@@ -502,9 +503,9 @@ where
 /// service checks its typed context against its own trusted state before any
 /// plan decode or storage IO.
 ///
-/// Returns `Ok(None)` when this target selects no private service, which is the
-/// Forge-worker case: it only dials the elected Forge leader's peer route and
-/// opens no peer socket.
+/// The Forge maintenance target mounts the Forge leader peer route, so workers
+/// and notifiers on other pods reach whichever maintenance pod holds the
+/// leader term. Returns `Ok(None)` when this target selects no private service.
 ///
 /// # Errors
 /// Returns [`GrpcError::Transport`] when tonic rejects the peer TLS material.
@@ -512,9 +513,10 @@ pub fn build_peer_grpc(
     state: &AppState,
     tls: wyrd_tonic::server::MutualTlsServerConfig,
 ) -> Result<Option<TonicRouter>, GrpcError> {
-    let serves_ingest = state.bifrost_ingest().is_some();
-    let serves_query = state.bifrost_query().is_some();
-    if !state.bifrost.serves_api() || !(serves_ingest || serves_query) {
+    if state.bifrost_ingest().is_none()
+        && state.bifrost_query().is_none()
+        && state.forge_handle().is_none()
+    {
         return Ok(None);
     }
     let transport = state.bifrost.transport_admission();

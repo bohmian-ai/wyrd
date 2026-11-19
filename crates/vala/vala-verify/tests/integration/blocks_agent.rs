@@ -17,9 +17,11 @@ use skald_spec::{MediaRef, ProviderName, ProviderRequest, ProviderResponse};
 use skald_tool::{AgentTool, ToolError, ToolRegistry};
 use tokio::time::Instant;
 use vala_verify::blocks::{
-    ActionExecutor, AgentCardResolver, AgentExecutor, AgentToolset, BlockCall, BlockError,
-    CallInput, CallValue, CheckExecutor, EvidenceReader, Position, PromptCardResolver, ToolSession,
+    AGENT_PHASE_DURATION_SECONDS, ActionExecutor, AgentCardResolver, AgentExecutor, AgentToolset,
+    BlockCall, BlockError, CallInput, CallValue, CheckExecutor, EvidenceReader, Position,
+    PromptCardResolver, ToolCallsOwner, ToolLimits, ToolSession,
 };
+use wyrd_benchmark::MetricValue;
 use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::card::agent::{AgentRunConfigSpec, AgentSpec, BuiltinTool, ExecutionRoute};
 use wyrd_spec::card::verifier::{Action, AgentCall, Check};
@@ -27,7 +29,9 @@ use wyrd_spec::ids::SlotName;
 use wyrd_spec::reference::{CardRef, InlineableRef};
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::VerificationVerdict;
-use wyrd_spec::verification::execution::{CallProvenance, Citation, InputDeclaration, Locator};
+use wyrd_spec::verification::execution::{
+    CallProvenance, Citation, InputDeclaration, Locator, Producer, ToolRecipient,
+};
 
 /// Build the [`TaskId`] used for a requirement or step in these fixtures.
 ///
@@ -151,6 +155,15 @@ impl AgentTool for FixedRead {
     }
 }
 
+/// Session limits small enough to reach in a test.
+const fn limits() -> ToolLimits {
+    ToolLimits {
+        max_result_bytes: 1024,
+        max_argument_bytes: 1024,
+        max_calls: 16,
+    }
+}
+
 /// A toolset binding [`FixedRead`] for any call.
 struct FixedToolset;
 
@@ -169,12 +182,13 @@ impl AgentToolset for FixedToolset {
         _workspace: &BTreeMap<String, CallInput>,
         _deadline: Instant,
         _tools: &[BuiltinTool],
+        _producer: Option<&Producer>,
     ) -> Result<ToolSession, BlockError> {
         let registry = ToolRegistry::new();
         registry
             .register(Arc::new(FixedRead))
             .expect("one tool registers");
-        Ok(ToolSession::new(registry, 1024, Box::new(())))
+        Ok(ToolSession::new(registry, limits(), Box::new(())))
     }
 }
 
@@ -260,7 +274,7 @@ fn input(name: &str, value: Value) -> BTreeMap<String, CallInput> {
     BTreeMap::from([(
         name.to_owned(),
         CallInput {
-            value: CallValue::Json(value),
+            value: CallValue::Json(value.into()),
             sources: BTreeSet::new(),
         },
     )])
@@ -305,9 +319,23 @@ async fn step(
     call: &AgentCall,
     inputs: BTreeMap<String, CallInput>,
 ) -> Result<vala_verify::blocks::ActionOutput, BlockError> {
+    step_recording(executor, call, inputs, &ToolCallsOwner::default()).await
+}
+
+/// Run `call` as a step action with `inputs`, recording into `calls`, and
+/// return once the host work it started has settled.
+///
+/// # Errors
+/// Returns the executor's [`BlockError`] for the step.
+async fn step_recording(
+    executor: &AgentExecutor,
+    call: &AgentCall,
+    inputs: BTreeMap<String, CallInput>,
+    calls: &ToolCallsOwner,
+) -> Result<vala_verify::blocks::ActionOutput, BlockError> {
     let id = tid("summarize");
     let action = Action::Agent(call.clone());
-    ActionExecutor::execute(
+    let output = ActionExecutor::execute(
         executor,
         BlockCall {
             id: &id,
@@ -316,12 +344,19 @@ async fn step(
             inputs,
             workspace: BTreeMap::new(),
             deadline: Instant::now() + Duration::from_secs(30),
+            attempt: 1,
+            item_index: None,
+            iteration_index: None,
+            tool_calls: calls.handle(),
         },
     )
-    .await
+    .await;
+    calls.settle().await;
+    output
 }
 
-/// Run `call` as a Verifier requirement check with `inputs`.
+/// Run `call` as a Verifier requirement check with `inputs`, returning once
+/// the host work it started has settled.
 ///
 /// # Errors
 /// Returns the executor's [`BlockError`] for the check.
@@ -332,7 +367,8 @@ async fn check(
 ) -> Result<vala_verify::blocks::CheckOutput, BlockError> {
     let id = tid("grounded");
     let block = Check::Agent(call.clone());
-    CheckExecutor::execute(
+    let calls = ToolCallsOwner::default();
+    let output = CheckExecutor::execute(
         executor,
         BlockCall {
             id: &id,
@@ -341,9 +377,15 @@ async fn check(
             inputs,
             workspace: BTreeMap::new(),
             deadline: Instant::now() + Duration::from_secs(30),
+            attempt: 1,
+            item_index: None,
+            iteration_index: None,
+            tool_calls: calls.handle(),
         },
     )
-    .await
+    .await;
+    calls.settle().await;
+    output
 }
 
 /// A step Agent with a structured Prompt returns its schema-valid answer and
@@ -436,19 +478,23 @@ async fn agent_inputs_must_match_placeholders() {
 async fn step_agent_records_declared_tool_calls() {
     let executor = executor(vec![read_call(), openai_text_response("revenue is 42")])
         .with_toolset(Arc::new(FixedToolset));
-    let output = step(
+    let calls = ToolCallsOwner::default();
+    let output = step_recording(
         &executor,
         &agent(text_prompt(), &["fs.read"]),
         input("document", json!("report")),
+        &calls,
     )
     .await
     .expect("the step runs");
     assert_eq!(output.output, json!("revenue is 42"));
     let returned = json!({"text": "revenue is 42"}).to_string();
-    assert_eq!(output.tool_calls.len(), 1);
-    let record = &output.tool_calls[0];
+    let records = calls.settled();
+    assert_eq!(records.len(), 1);
+    let record = &records[0];
     assert_eq!(record.tool, BuiltinTool::FsRead);
     assert_eq!(record.arguments, json!({"path": "/inputs/report.txt"}));
+    assert_eq!(record.recipient, ToolRecipient::Model);
     assert_eq!(
         record.output_sha256,
         Some(Sha256Hex::digest(returned.as_bytes()))
@@ -483,7 +529,10 @@ impl EvidenceReader for PinnedDeck {
     ///
     /// # Errors
     /// Always [`BlockError::Terminal`].
-    async fn media(&self, _evidence: &InputDeclaration) -> Result<MediaRef, BlockError> {
+    async fn media(
+        &self,
+        _evidence: &InputDeclaration,
+    ) -> Result<(skald_spec::MediaRef, Box<dyn std::any::Any + Send + Sync>), BlockError> {
         Err(BlockError::Terminal {
             reason: "no media".to_owned(),
         })
@@ -517,7 +566,7 @@ fn from_deck(value: Value) -> BTreeMap<String, CallInput> {
     BTreeMap::from([(
         "response".to_owned(),
         CallInput {
-            value: CallValue::Json(value),
+            value: CallValue::Json(value.into()),
             sources: BTreeSet::from([SlotName::new("deck").expect("slot")]),
         },
     )])
@@ -580,6 +629,39 @@ async fn check_agent_keeps_only_valid_citations() {
         .await
         .expect("the check runs");
     assert_eq!(output.verdict.outcome, VerificationVerdict::Inconclusive);
+}
+
+/// A benchmark-recorded Agent check times each of its phases once into
+/// [`AGENT_PHASE_DURATION_SECONDS`].
+///
+/// # Panics
+/// Panics when the check fails or a phase is missing or counted twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn benchmark_check_agent_times_each_phase() {
+    wyrd_benchmark::install().expect("the only recorder");
+    let pinned = executor(vec![openai_text_response(
+        &json!({"outcome": "passed", "reason": "grounded", "citations": [{"slot": "deck", "locator": {"page": 3}}]})
+            .to_string(),
+    )])
+    .with_evidence(Arc::new(PinnedDeck));
+    check(
+        &pinned,
+        &agent(verdict_prompt(), &[]),
+        from_deck(json!("deck text")),
+    )
+    .await
+    .expect("the check runs");
+    let metrics = wyrd_benchmark::snapshot().metrics;
+    for phase in ["resolve", "bind", "run", "verdict", "cite"] {
+        let series = metrics
+            .iter()
+            .find(|metric| metric.matches(AGENT_PHASE_DURATION_SECONDS, &[("phase", phase)]))
+            .unwrap_or_else(|| panic!("no {phase} phase: {metrics:?}"));
+        assert!(
+            matches!(series.value, MetricValue::Histogram { count: 1, .. }),
+            "{phase}: {series:?}"
+        );
+    }
 }
 
 /// An Agent Card whose inline portable Prompt over `{{response}}` declares
@@ -858,7 +940,7 @@ impl Provider for Recording {
     ///
     /// # Panics
     /// Panics when the request log's lock is poisoned.
-    async fn send(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+    async fn send(&self, request: &ProviderRequest) -> Result<ProviderResponse, ProviderError> {
         self.requests
             .lock()
             .expect("unpoisoned")
@@ -870,7 +952,7 @@ impl Provider for Recording {
     ///
     /// # Errors
     /// Always the mock's empty-stream error.
-    async fn stream(&self, request: ProviderRequest) -> Result<ProviderStream, ProviderError> {
+    async fn stream(&self, request: &ProviderRequest) -> Result<ProviderStream, ProviderError> {
         self.mock.stream(request).await
     }
 
@@ -918,7 +1000,7 @@ fn sourced(value: &str, slots: &[&str]) -> BTreeMap<String, CallInput> {
     BTreeMap::from([(
         "response".to_owned(),
         CallInput {
-            value: CallValue::Json(json!(value)),
+            value: CallValue::Json(json!(value).into()),
             sources: slots
                 .iter()
                 .map(|&slot| SlotName::new(slot).expect("slot"))
@@ -1004,6 +1086,7 @@ async fn check_agent_reads_its_workspace_through_declared_tools() {
     .with_evidence(Arc::new(PinnedDeck));
     let id = tid("grounded");
     let block = Check::Agent(agent(verdict_prompt(), &["fs.read"]));
+    let calls = ToolCallsOwner::default();
     let output = CheckExecutor::execute(
         &executor,
         BlockCall {
@@ -1014,15 +1097,20 @@ async fn check_agent_reads_its_workspace_through_declared_tools() {
             workspace: BTreeMap::from([(
                 "/inputs/report.txt".to_owned(),
                 CallInput {
-                    value: CallValue::Json(json!("report")),
+                    value: CallValue::Json(json!("report").into()),
                     sources: BTreeSet::from([SlotName::new("deck").expect("slot")]),
                 },
             )]),
             deadline: Instant::now() + Duration::from_secs(30),
+            attempt: 1,
+            item_index: None,
+            iteration_index: None,
+            tool_calls: calls.handle(),
         },
     )
-    .await
-    .expect("the check runs");
+    .await;
+    calls.settle().await;
+    let output = output.expect("the check runs");
     assert_eq!(output.verdict.outcome, VerificationVerdict::Passed);
     assert_eq!(output.verdict.citations.len(), 1);
 }
@@ -1077,11 +1165,13 @@ impl AgentTool for BusyCode {
         json!({"type": "object"})
     }
 
-    /// Fail with a [`BlockError::Busy`] cause.
+    /// Fail with a [`BlockError::Busy`] cause after yielding once, so a
+    /// sibling call is already in flight when the session stops.
     ///
     /// # Errors
     /// Always [`ToolError::Invocation`] caused by [`BlockError::Busy`].
     async fn invoke(&self, _args: Value) -> Result<Value, ToolError> {
+        tokio::task::yield_now().await;
         let busy = BlockError::Busy {
             reason: "no worker".to_owned(),
         };
@@ -1162,6 +1252,7 @@ impl AgentToolset for BusyToolset {
         _workspace: &BTreeMap<String, CallInput>,
         _deadline: Instant,
         _tools: &[BuiltinTool],
+        _producer: Option<&Producer>,
     ) -> Result<ToolSession, BlockError> {
         let registry = ToolRegistry::new();
         registry
@@ -1172,7 +1263,7 @@ impl AgentToolset for BusyToolset {
                 dropped: Arc::clone(&self.dropped),
             }))
             .expect("query registers");
-        Ok(ToolSession::new(registry, 1024, Box::new(())))
+        Ok(ToolSession::new(registry, limits(), Box::new(())))
     }
 }
 
@@ -1296,4 +1387,2350 @@ async fn busy_tool_ends_the_agent_step_before_a_pending_sibling() {
         dropped.load(std::sync::atomic::Ordering::SeqCst),
         "the pending sibling was dropped"
     );
+}
+
+/// `call` limited to `iterations` model calls.
+fn iterations(mut call: AgentCall, iterations: u32) -> AgentCall {
+    if let InlineableRef::Inline(spec) = &mut call.agent {
+        spec.run_config.max_iterations = Some(iterations);
+    }
+    call
+}
+
+/// Run `spec` once over a JSON `document` on `executor`.
+///
+/// # Errors
+/// Returns the engine's error for the execution.
+///
+/// # Panics
+/// Panics when `spec` is not a valid Verifier.
+async fn run_engine(
+    executor: AgentExecutor,
+    spec: Value,
+) -> Result<wyrd_spec::verification::execution::ExecutedOutcome, vala_verify::blocks::EngineError> {
+    let spec: wyrd_spec::card::verifier::VerifierSpec =
+        serde_json::from_value(spec).expect("Verifier");
+    spec.validate().expect("valid Verifier");
+    let executor = Arc::new(executor);
+    let engine = vala_verify::blocks::VerificationEngine::new(
+        Arc::clone(&executor) as Arc<dyn ActionExecutor>,
+        executor as Arc<dyn CheckExecutor>,
+        Arc::new(vala_verify::InMemoryTraceSource::new()),
+        std::num::NonZeroUsize::new(1).expect("positive"),
+    );
+    engine
+        .run(
+            Arc::new(spec),
+            BTreeMap::from([(
+                SlotName::new("document").expect("slot"),
+                InputDeclaration::Json {
+                    value: json!("report"),
+                },
+            )]),
+            Instant::now() + Duration::from_secs(60),
+        )
+        .await
+}
+
+/// `block` bound to `inputs.document` through `{{response}}` and as its
+/// workspace file.
+///
+/// # Panics
+/// Panics when `block` does not serialize to a JSON object.
+fn bound<B: serde::Serialize>(block: B) -> Value {
+    let mut block = serde_json::to_value(block).expect("block serializes");
+    block["inputs"] = json!({"response": "inputs.document"});
+    block["workspace"] = json!({"/inputs/report.txt": "inputs.document"});
+    block
+}
+
+/// Tool calls an Agent made before its answer was refused stay on the
+/// produced result: a failed step and an inconclusive check each carry
+/// their completed call with its digest.
+///
+/// # Panics
+/// Panics when the step does not fail, the check is not inconclusive, or
+/// either result loses its recorded call.
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_records_survive_failed_steps_and_inconclusive_checks() {
+    let executor = executor(vec![
+        read_call(),
+        openai_text_response(r#"{"passed": "not a boolean"}"#),
+        read_call(),
+        openai_text_response(r#"{"not": "a verdict"}"#),
+    ])
+    .with_toolset(Arc::new(FixedToolset));
+    let step = bound(Action::Agent(iterations(
+        agent(structured_prompt(), &["fs.read"]),
+        2,
+    )));
+    let mut judge = named_judge(json!("verdict"));
+    if let InlineableRef::Inline(spec) = &mut judge.agent {
+        spec.tool_names = vec!["fs.read".to_owned()];
+    }
+    let check = bound(Check::Agent(iterations(judge, 2)));
+    let outcome = run_engine(
+        executor,
+        json!({
+            "inputs": {"document": {"type": "json"}},
+            "steps": [{"id": "draft", "action": step}],
+            "requirements": [{"id": "grounded", "statement": "Grounded", "check": check}]
+        }),
+    )
+    .await
+    .expect("the execution settles");
+    let returned = json!({"text": "revenue is 42"}).to_string();
+    let step = &outcome.steps[0];
+    assert_eq!(
+        step.status,
+        wyrd_spec::verification::execution::StepStatus::Failed,
+        "{step:?}"
+    );
+    assert_eq!(step.tool_calls.len(), 1, "failed step records: {step:?}");
+    assert_eq!(
+        step.tool_calls[0].output_sha256,
+        Some(Sha256Hex::digest(returned.as_bytes()))
+    );
+    let requirement = &outcome.requirements[0];
+    assert_eq!(
+        requirement.result.outcome,
+        wyrd_spec::verification::execution::RequirementOutcome::Inconclusive,
+        "{requirement:?}"
+    );
+    assert_eq!(
+        requirement.tool_calls.len(),
+        1,
+        "inconclusive check records: {requirement:?}"
+    );
+    assert_eq!(requirement.tool_calls[0].tool, BuiltinTool::FsRead);
+}
+
+/// A toolset binding [`FixedRead`] and a [`PendingQuery`] within a
+/// `max_calls` allowance.
+struct BudgetToolset {
+    /// Requests each logical invocation may make.
+    max_calls: u32,
+    /// Flag handed to the pending query.
+    dropped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl AgentToolset for BudgetToolset {
+    /// Open a session holding [`FixedRead`] and [`PendingQuery`].
+    ///
+    /// # Errors
+    /// Never fails.
+    ///
+    /// # Panics
+    /// Panics when the empty registry refuses either tool.
+    async fn open(
+        &self,
+        _id: &TaskId,
+        _workspace: &BTreeMap<String, CallInput>,
+        _deadline: Instant,
+        _tools: &[BuiltinTool],
+        _producer: Option<&Producer>,
+    ) -> Result<ToolSession, BlockError> {
+        let registry = ToolRegistry::new();
+        registry
+            .register(Arc::new(FixedRead))
+            .expect("read registers");
+        registry
+            .register(Arc::new(PendingQuery {
+                dropped: Arc::clone(&self.dropped),
+            }))
+            .expect("query registers");
+        Ok(ToolSession::new(
+            registry,
+            ToolLimits {
+                max_calls: self.max_calls,
+                ..limits()
+            },
+            Box::new(()),
+        ))
+    }
+}
+
+/// An OpenAI answer calling `bifrost_query` once.
+///
+/// # Panics
+/// Panics when [`read_call`] carries no tool call.
+fn query_call() -> ProviderResponse {
+    let ProviderResponse::OpenAiChatCompletion(mut response) = read_call() else {
+        unreachable!("read_call is an OpenAI completion");
+    };
+    let call = &mut response.choices[0]
+        .message
+        .tool_calls
+        .as_mut()
+        .expect("calls")[0];
+    "bifrost_query".clone_into(&mut call.function.name);
+    "{}".clone_into(&mut call.function.arguments);
+    ProviderResponse::OpenAiChatCompletion(response)
+}
+
+/// One step's request allowance spans its retries without refund: a call
+/// cancelled by the attempt timeout still spent its request and is recorded
+/// with no digest, zero bytes, and a cancellation error; the retry's next
+/// request fails the step terminally with the budget code and no further
+/// model call. Spending exactly the allowance still lets the Agent answer.
+///
+/// # Panics
+/// Panics when the allowance is refunded, exceeded, or renewed by the
+/// retry, the cancelled call is lost or reports a result, or the final
+/// allowance cannot answer.
+#[tokio::test(start_paused = true)]
+async fn agent_tool_budget_spans_attempts_without_refund() {
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mock = MockProvider::new(ProviderName::OpenAi);
+    for response in [
+        read_call(),
+        query_call(),
+        read_call(),
+        openai_text_response("unreachable"),
+    ] {
+        mock.push_response(response);
+    }
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(mock.clone()));
+    let executor = AgentExecutor::new(
+        Arc::new(registry),
+        Arc::new(NoRegistry),
+        Arc::new(NoRegistry),
+    )
+    .with_toolset(Arc::new(BudgetToolset {
+        max_calls: 2,
+        dropped: Arc::clone(&dropped),
+    }));
+    let mut action = bound(Action::Agent(agent(
+        structured_prompt(),
+        &["fs.read", "bifrost.query"],
+    )));
+    action["workspace"] = json!({"/inputs/report.txt": "inputs.document"});
+    let outcome = run_engine(
+        executor,
+        json!({
+            "inputs": {"document": {"type": "json"}},
+            "steps": [{"id": "draft", "action": action, "timeout_seconds": 5, "retries": 1}],
+            "requirements": [{"id": "drafted", "statement": "Drafted", "check": {
+                "kind": "assert", "path": "steps.draft.output", "operator": "is_not_null"
+            }}]
+        }),
+    )
+    .await
+    .expect("the execution settles");
+    let step = &outcome.steps[0];
+    assert_eq!(
+        step.attempts, 2,
+        "the timed-out attempt was retried: {step:?}"
+    );
+    let reason = step.reason.as_deref().unwrap_or_default();
+    assert!(
+        reason.starts_with("WYRD_VERIFICATION_422_TOOL_BUDGET_EXCEEDED: "),
+        "{reason}"
+    );
+    assert_eq!(mock.remaining(), 1, "no model call followed the refusal");
+    assert!(
+        dropped.load(std::sync::atomic::Ordering::SeqCst),
+        "the timed-out query was dropped"
+    );
+    let tools: Vec<_> = step.tool_calls.iter().map(|record| record.tool).collect();
+    assert_eq!(tools, [BuiltinTool::FsRead, BuiltinTool::BifrostQuery]);
+    let cancelled = &step.tool_calls[1];
+    assert_eq!(cancelled.output_sha256, None);
+    assert_eq!(cancelled.returned_bytes, 0);
+    assert!(
+        cancelled
+            .error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("cancelled")),
+        "{cancelled:?}"
+    );
+
+    let last = executor_with_budget(vec![
+        read_call(),
+        read_call(),
+        openai_text_response(r#"{"passed": true}"#),
+    ]);
+    let calls = ToolCallsOwner::default();
+    let output = step_recording(
+        &last,
+        &agent(structured_prompt(), &["fs.read", "bifrost.query"]),
+        input("response", json!("ok")),
+        &calls,
+    )
+    .await
+    .expect("the final allowance still answers");
+    assert_eq!(output.output, json!({"passed": true}));
+    assert_eq!(calls.settled().len(), 2);
+}
+
+/// An executor over `responses` whose tools allow two requests.
+fn executor_with_budget(responses: Vec<ProviderResponse>) -> AgentExecutor {
+    executor(responses).with_toolset(Arc::new(BudgetToolset {
+        max_calls: 2,
+        dropped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    }))
+}
+
+/// A `fs.read` double that yields while active and keeps the peak number
+/// of concurrent calls.
+#[derive(Default)]
+struct CountingRead {
+    /// Calls running now.
+    active: std::sync::atomic::AtomicUsize,
+    /// Most calls ever running at once.
+    peak: std::sync::atomic::AtomicUsize,
+}
+
+/// A registry entry over one shared [`CountingRead`].
+struct SharedRead(Arc<CountingRead>);
+
+#[async_trait]
+impl AgentTool for SharedRead {
+    /// The built-in wire name.
+    fn name(&self) -> &str {
+        BuiltinTool::FsRead.as_str()
+    }
+
+    /// A fixed description.
+    fn description(&self) -> &'static str {
+        "read a workspace file"
+    }
+
+    /// Any object.
+    fn input_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+
+    /// Any object.
+    fn output_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+
+    /// Count this call as active across a few yields, then return its
+    /// `path` back.
+    ///
+    /// # Errors
+    /// Never fails.
+    async fn invoke(&self, args: Value) -> Result<Value, ToolError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let now = self.0.active.fetch_add(1, SeqCst) + 1;
+        self.0.peak.fetch_max(now, SeqCst);
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        self.0.active.fetch_sub(1, SeqCst);
+        Ok(json!({"text": args["path"]}))
+    }
+}
+
+/// The registry face of `code.run`; the session runs [`Script`] instead.
+struct CodeFace;
+
+#[async_trait]
+impl AgentTool for CodeFace {
+    /// The built-in wire name.
+    fn name(&self) -> &str {
+        BuiltinTool::CodeRun.as_str()
+    }
+
+    /// A fixed description.
+    fn description(&self) -> &'static str {
+        "run code"
+    }
+
+    /// Any object.
+    fn input_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+
+    /// Any object.
+    fn output_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+
+    /// Refuse: a session with a [`CodeTool`] never reaches this.
+    ///
+    /// # Errors
+    /// Always [`ToolError::Invocation`].
+    async fn invoke(&self, _args: Value) -> Result<Value, ToolError> {
+        Err(ToolError::Invocation {
+            detail: "ran without a bridge".to_owned(),
+            cause: None,
+        })
+    }
+}
+
+/// A `code.run` program making two concurrent reads, then each refused
+/// request kind, then a read it returns before receiving, and returning
+/// every received outcome's value or stable code.
+struct Script;
+
+#[async_trait]
+impl vala_verify::blocks::CodeTool for Script {
+    /// Run the fixed program through `bridge`.
+    ///
+    /// # Errors
+    /// Never fails; refusals are part of the result.
+    async fn run(
+        &self,
+        _args: Value,
+        bridge: vala_verify::blocks::ToolBridge,
+    ) -> Result<Value, ToolError> {
+        let outcome = |result: Result<vala_verify::blocks::Delivery, ToolError>| match result {
+            Ok(delivery) => delivery.deliver(),
+            Err(error) => json!(wyrd_spec::error::WyrdError::from(&error).code()),
+        };
+        let (first, second) = tokio::join!(
+            bridge.call("fs.read", json!({"path": "/inputs/a.txt"})),
+            bridge.call("fs.read", json!({"path": "/inputs/b.txt"})),
+        );
+        let mut outcomes = vec![outcome(first), outcome(second)];
+        for (name, args) in [
+            ("cards.get", json!({})),
+            ("code.run", json!({"source": "1"})),
+            ("fs_read", json!({})),
+            ("fs.read", json!(["/inputs/a.txt"])),
+            ("fs.read", json!({"path": "x".repeat(2048)})),
+        ] {
+            outcomes.push(outcome(bridge.call(name, args).await));
+        }
+        drop(
+            bridge
+                .call("fs.read", json!({"path": "/inputs/unreceived.txt"}))
+                .await,
+        );
+        Ok(json!({"outcomes": outcomes, "halted": bridge.halted()}))
+    }
+}
+
+/// A toolset binding `code.run` through [`Script`] and a shared
+/// [`CountingRead`].
+struct ScriptToolset {
+    /// The read every session shares.
+    read: Arc<CountingRead>,
+}
+
+#[async_trait]
+impl AgentToolset for ScriptToolset {
+    /// Open a session running [`Script`] with nested reads.
+    ///
+    /// # Errors
+    /// Never fails.
+    ///
+    /// # Panics
+    /// Panics when the empty registry refuses either tool.
+    async fn open(
+        &self,
+        _id: &TaskId,
+        _workspace: &BTreeMap<String, CallInput>,
+        _deadline: Instant,
+        _tools: &[BuiltinTool],
+        _producer: Option<&Producer>,
+    ) -> Result<ToolSession, BlockError> {
+        let registry = ToolRegistry::new();
+        registry
+            .register(Arc::new(SharedRead(Arc::clone(&self.read))))
+            .expect("read registers");
+        registry
+            .register(Arc::new(CodeFace))
+            .expect("code registers");
+        Ok(ToolSession::new(registry, limits(), Box::new(())).with_code(Arc::new(Script)))
+    }
+}
+
+/// An OpenAI answer calling `code_run` once.
+///
+/// # Panics
+/// Panics when [`read_call`] carries no tool call.
+fn code_call() -> ProviderResponse {
+    let ProviderResponse::OpenAiChatCompletion(mut response) = read_call() else {
+        unreachable!("read_call is an OpenAI completion");
+    };
+    let call = &mut response.choices[0]
+        .message
+        .tool_calls
+        .as_mut()
+        .expect("calls")[0];
+    "code_run".clone_into(&mut call.function.name);
+    call.function.arguments = json!({"source": "..."}).to_string();
+    ProviderResponse::OpenAiChatCompletion(response)
+}
+
+/// Nested requests take the direct path: a declared read returns its value
+/// to the program and is recorded once with recipient `code` after the
+/// outer `code.run` recorded for the model; undeclared, recursive, and
+/// provider-spelled names are not in the Agent and malformed or oversized
+/// arguments are invalid input, none of them recorded or halting; and at
+/// concurrency cap 1 the outer `code.run` holds no permit, so its two
+/// concurrent reads complete one at a time, while cap 2 runs them together.
+/// A read that settles but is never received by the program keeps no
+/// digest or size and settles as cancelled, while the received reads keep
+/// theirs.
+///
+/// # Panics
+/// Panics when a refusal has another code, is recorded, or halts, a read
+/// is lost, an unreceived value is recorded as returned, or the shared cap
+/// is passed or deadlocks.
+#[tokio::test(flavor = "multi_thread")]
+async fn code_bridge_shares_the_recorded_path() {
+    for cap in [1, 2] {
+        let read = Arc::new(CountingRead::default());
+        let executor = executor(vec![code_call(), openai_text_response("done")]).with_toolset(
+            Arc::new(ScriptToolset {
+                read: Arc::clone(&read),
+            }),
+        );
+        let mut call = agent(text_prompt(), &["fs.read", "code.run"]);
+        if let InlineableRef::Inline(spec) = &mut call.agent {
+            spec.run_config.tool_concurrency_cap = Some(cap);
+        }
+        let calls = ToolCallsOwner::default();
+        let output = tokio::time::timeout(
+            Duration::from_secs(10),
+            step_recording(&executor, &call, input("document", json!("x")), &calls),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("cap {cap} deadlocked"))
+        .expect("the step runs");
+        assert_eq!(output.output, json!("done"));
+        assert_eq!(
+            read.peak.load(std::sync::atomic::Ordering::SeqCst),
+            cap,
+            "peak concurrent reads at cap {cap}"
+        );
+        let records = calls.settled();
+        let shape: Vec<_> = records
+            .iter()
+            .map(|record| (record.tool, record.recipient))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                (BuiltinTool::CodeRun, ToolRecipient::Model),
+                (BuiltinTool::FsRead, ToolRecipient::Code),
+                (BuiltinTool::FsRead, ToolRecipient::Code),
+                (BuiltinTool::FsRead, ToolRecipient::Code),
+            ]
+        );
+        for received in &records[1..3] {
+            assert!(
+                received.error.is_none() && received.output_sha256.is_some(),
+                "{received:?}"
+            );
+        }
+        let unreceived = &records[3];
+        assert_eq!(
+            (unreceived.output_sha256, unreceived.returned_bytes),
+            (None, 0),
+            "an unreceived value is not recorded as returned: {unreceived:?}"
+        );
+        assert!(
+            unreceived
+                .error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("cancelled")),
+            "{unreceived:?}"
+        );
+        let result = json!({
+                "outcomes": [
+                    {"text": "/inputs/a.txt"},
+                    {"text": "/inputs/b.txt"},
+                    "WYRD_AGENT_404_TOOL_NOT_IN_AGENT",
+                    "WYRD_AGENT_404_TOOL_NOT_IN_AGENT",
+                    "WYRD_AGENT_404_TOOL_NOT_IN_AGENT",
+                    "WYRD_TOOL_422_INPUT",
+                    "WYRD_TOOL_422_INPUT",
+                ],
+            "halted": false
+        });
+        assert_eq!(
+            records[0].output_sha256,
+            Some(Sha256Hex::digest(result.to_string().as_bytes())),
+            "the outer record digests the program's result"
+        );
+        assert!(records[0].error.is_none(), "{records:?}");
+    }
+}
+
+/// A `fs.read` double recording each invoked path; a read of `/held`
+/// waits for one permit of `gate`.
+struct GatedRead {
+    /// Paths invoked, in order.
+    invoked: Arc<std::sync::Mutex<Vec<String>>>,
+    /// Released by the program to let the held read finish.
+    gate: Arc<tokio::sync::Semaphore>,
+}
+
+#[async_trait]
+impl AgentTool for GatedRead {
+    /// The built-in wire name.
+    fn name(&self) -> &str {
+        BuiltinTool::FsRead.as_str()
+    }
+
+    /// A fixed description.
+    fn description(&self) -> &'static str {
+        "read a workspace file"
+    }
+
+    /// Any object.
+    fn input_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+
+    /// Any object.
+    fn output_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+
+    /// Record the path, wait on the gate for `/held`, and return the path.
+    ///
+    /// # Errors
+    /// Never fails.
+    ///
+    /// # Panics
+    /// Panics when the record lock is poisoned or the gate is closed.
+    async fn invoke(&self, args: Value) -> Result<Value, ToolError> {
+        let path = args["path"].as_str().unwrap_or_default().to_owned();
+        self.invoked.lock().expect("invoked").push(path.clone());
+        if path == "/held" {
+            self.gate.acquire().await.expect("gate").forget();
+        }
+        Ok(json!({"text": path}))
+    }
+}
+
+/// A `code.run` program that starts a read holding the only permit and a
+/// second read waiting for it, then makes a request past the allowance and
+/// only afterwards releases the first read and awaits both, all within one
+/// poll of the program.
+struct HaltScript {
+    /// The gate of the held read.
+    gate: Arc<tokio::sync::Semaphore>,
+}
+
+#[async_trait]
+impl vala_verify::blocks::CodeTool for HaltScript {
+    /// Run the fixed program through `bridge`.
+    ///
+    /// # Errors
+    /// Never fails; outcomes are part of the result.
+    ///
+    /// # Panics
+    /// Panics when a read finishes before the refusal.
+    async fn run(
+        &self,
+        _args: Value,
+        bridge: vala_verify::blocks::ToolBridge,
+    ) -> Result<Value, ToolError> {
+        let outcome = |result: Result<vala_verify::blocks::Delivery, ToolError>| match result {
+            Ok(delivery) => delivery.deliver(),
+            Err(error) => json!(wyrd_spec::error::WyrdError::from(&error).code()),
+        };
+        let mut held = std::pin::pin!(bridge.call("fs.read", json!({"path": "/held"})));
+        let mut waiting = std::pin::pin!(bridge.call("fs.read", json!({"path": "/waiting"})));
+        for read in [held.as_mut(), waiting.as_mut()] {
+            assert!(futures_poll_once(read).is_none(), "a read finished early");
+        }
+        let refused = outcome(bridge.call("fs.read", json!({"path": "/refused"})).await);
+        self.gate.add_permits(1);
+        let held = outcome(held.await);
+        let waiting = outcome(waiting.await);
+        Ok(json!({"outcomes": [held, waiting, refused], "halted": bridge.halted()}))
+    }
+}
+
+/// Poll `future` once, returning its output when it is ready.
+fn futures_poll_once<F: Future>(future: std::pin::Pin<&mut F>) -> Option<F::Output> {
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    match future.poll(&mut context) {
+        std::task::Poll::Ready(output) => Some(output),
+        std::task::Poll::Pending => None,
+    }
+}
+
+/// A toolset binding [`HaltScript`] and a [`GatedRead`] with three
+/// requests.
+struct HaltToolset {
+    /// Paths the read invoked.
+    invoked: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl AgentToolset for HaltToolset {
+    /// Open a session running [`HaltScript`] with a gated read.
+    ///
+    /// # Errors
+    /// Never fails.
+    ///
+    /// # Panics
+    /// Panics when the empty registry refuses either tool.
+    async fn open(
+        &self,
+        _id: &TaskId,
+        _workspace: &BTreeMap<String, CallInput>,
+        _deadline: Instant,
+        _tools: &[BuiltinTool],
+        _producer: Option<&Producer>,
+    ) -> Result<ToolSession, BlockError> {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let registry = ToolRegistry::new();
+        registry
+            .register(Arc::new(GatedRead {
+                invoked: Arc::clone(&self.invoked),
+                gate: Arc::clone(&gate),
+            }))
+            .expect("read registers");
+        registry
+            .register(Arc::new(CodeFace))
+            .expect("code registers");
+        Ok(ToolSession::new(
+            registry,
+            ToolLimits {
+                max_calls: 3,
+                ..limits()
+            },
+            Box::new(()),
+        )
+        .with_code(Arc::new(HaltScript { gate })))
+    }
+}
+
+/// At concurrency cap 1 with three requests, `code.run` spends the first,
+/// a held read the second, and a read waiting for the permit the third;
+/// the program's fourth request stops the session before the held read
+/// finishes in that same poll. The waiting read is never invoked, though
+/// the permit frees before the Agent executor regains control, and stays
+/// recorded in admission order as cancelled, with no digest or bytes; the
+/// step fails with the budget code and no model call follows.
+///
+/// # Panics
+/// Panics when the waiting read runs, its record is lost or reports a
+/// value, the spent count passes three, or the model is called again.
+#[tokio::test(flavor = "multi_thread")]
+async fn admitted_waiters_survive_halt_without_dispatch() {
+    let invoked = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mock = MockProvider::new(ProviderName::OpenAi);
+    mock.push_response(code_call());
+    mock.push_response(openai_text_response("unreachable"));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(mock.clone()));
+    let executor = AgentExecutor::new(
+        Arc::new(registry),
+        Arc::new(NoRegistry),
+        Arc::new(NoRegistry),
+    )
+    .with_toolset(Arc::new(HaltToolset {
+        invoked: Arc::clone(&invoked),
+    }));
+    let mut call = agent(text_prompt(), &["fs.read", "code.run"]);
+    if let InlineableRef::Inline(spec) = &mut call.agent {
+        spec.run_config.tool_concurrency_cap = Some(1);
+    }
+    let calls = ToolCallsOwner::default();
+    let error = step_recording(&executor, &call, input("document", json!("x")), &calls)
+        .await
+        .expect_err("the spent allowance stops the step");
+    assert!(
+        matches!(&error, BlockError::Terminal { reason }
+            if reason.starts_with("WYRD_VERIFICATION_422_TOOL_BUDGET_EXCEEDED: ")),
+        "{error}"
+    );
+    assert_eq!(
+        *invoked.lock().expect("invoked"),
+        ["/held"],
+        "nothing was invoked after the stop"
+    );
+    assert_eq!(mock.remaining(), 1, "no model call followed the stop");
+    let records = calls.settled();
+    let shape: Vec<_> = records
+        .iter()
+        .map(|record| (record.tool, record.arguments["path"].clone()))
+        .collect();
+    assert_eq!(
+        shape,
+        [
+            (BuiltinTool::CodeRun, Value::Null),
+            (BuiltinTool::FsRead, json!("/held")),
+            (BuiltinTool::FsRead, json!("/waiting")),
+        ],
+        "admitted calls in start order; the refused request has no record"
+    );
+    let waiting = &records[2];
+    assert_eq!(waiting.recipient, ToolRecipient::Code);
+    assert_eq!((waiting.output_sha256, waiting.returned_bytes), (None, 0));
+    assert!(
+        waiting
+            .error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("cancelled")),
+        "{waiting:?}"
+    );
+}
+
+/// A `bifrost.query` double failing with `error`'s structured catalog
+/// problem, exactly as the hosted query tool projects an Oracle refusal.
+struct RefusedQuery {
+    /// The Oracle error every call fails with.
+    error: wyrd_spec::vala::error::BifrostError,
+}
+
+#[async_trait]
+impl AgentTool for RefusedQuery {
+    /// The built-in wire name.
+    fn name(&self) -> &str {
+        BuiltinTool::BifrostQuery.as_str()
+    }
+
+    /// A fixed description.
+    fn description(&self) -> &'static str {
+        "query"
+    }
+
+    /// Any object.
+    fn input_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+
+    /// Any object.
+    fn output_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+
+    /// Fail with the structured problem of the configured Oracle error.
+    ///
+    /// # Errors
+    /// Always that problem.
+    async fn invoke(&self, _args: Value) -> Result<Value, ToolError> {
+        Err(vala_verify::blocks::tool_error(
+            &wyrd_spec::error::WyrdError::from(self.error.clone()),
+        ))
+    }
+}
+
+/// A `code.run` program that catches every failure of a nested query and
+/// then reads a file, returning what each call gave it.
+struct CatchAll;
+
+#[async_trait]
+impl vala_verify::blocks::CodeTool for CatchAll {
+    /// Run the fixed program through `bridge`.
+    ///
+    /// # Errors
+    /// Never fails; the query's failure is caught.
+    async fn run(
+        &self,
+        _args: Value,
+        bridge: vala_verify::blocks::ToolBridge,
+    ) -> Result<Value, ToolError> {
+        let outcome = |result: Result<vala_verify::blocks::Delivery, ToolError>| match result {
+            Ok(delivery) => delivery.deliver(),
+            Err(error) => json!(wyrd_spec::error::WyrdError::from(&error).code()),
+        };
+        let query = outcome(
+            bridge
+                .call("bifrost.query", json!({"sql": "SELECT 1"}))
+                .await,
+        );
+        let read = outcome(bridge.call("fs.read", json!({"path": "/after"})).await);
+        Ok(json!({"query": query, "read": read}))
+    }
+}
+
+/// A toolset of a [`RefusedQuery`], a recording [`GatedRead`], and
+/// [`CatchAll`] as `code.run`.
+struct RefusedToolset {
+    /// The Oracle error of every query.
+    error: wyrd_spec::vala::error::BifrostError,
+    /// Paths the read invoked.
+    invoked: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl AgentToolset for RefusedToolset {
+    /// Open a session over the refused query, the read, and [`CatchAll`].
+    ///
+    /// # Errors
+    /// Never fails.
+    ///
+    /// # Panics
+    /// Panics when the empty registry refuses a tool.
+    async fn open(
+        &self,
+        _id: &TaskId,
+        _workspace: &BTreeMap<String, CallInput>,
+        _deadline: Instant,
+        _tools: &[BuiltinTool],
+        _producer: Option<&Producer>,
+    ) -> Result<ToolSession, BlockError> {
+        let registry = ToolRegistry::new();
+        registry
+            .register(Arc::new(RefusedQuery {
+                error: self.error.clone(),
+            }))
+            .expect("query registers");
+        registry
+            .register(Arc::new(GatedRead {
+                invoked: Arc::clone(&self.invoked),
+                gate: Arc::new(tokio::sync::Semaphore::new(0)),
+            }))
+            .expect("read registers");
+        registry
+            .register(Arc::new(CodeFace))
+            .expect("code registers");
+        Ok(ToolSession::new(registry, limits(), Box::new(())).with_code(Arc::new(CatchAll)))
+    }
+}
+
+/// An Oracle queue refusal is the process's capacity, not the program's
+/// failure: whether the model calls `bifrost.query` directly or a program
+/// calls it and catches every error, the invocation stops busy, nothing
+/// the program asks for afterwards runs, no model call follows, and the
+/// engine stops the execution busy so its host defers it unjudged. An
+/// admitted query that ran out of its own resources stays an ordinary
+/// failure the program catches and continues past, and a fresh invocation
+/// after the refusal answers normally.
+///
+/// # Panics
+/// Panics when a queue refusal is caught or judged, work follows it, or the
+/// ordinary failure stops the step.
+#[tokio::test(flavor = "multi_thread")]
+async fn oracle_queue_refusal_is_busy_at_every_origin() {
+    use wyrd_spec::vala::error::BifrostError;
+    let run = |error: BifrostError, responses: Vec<ProviderResponse>| {
+        let invoked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mock = MockProvider::new(ProviderName::OpenAi);
+        for response in responses {
+            mock.push_response(response);
+        }
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(mock.clone()));
+        let executor = AgentExecutor::new(
+            Arc::new(registry),
+            Arc::new(NoRegistry),
+            Arc::new(NoRegistry),
+        )
+        .with_toolset(Arc::new(RefusedToolset {
+            error,
+            invoked: Arc::clone(&invoked),
+        }));
+        (executor, mock, invoked)
+    };
+    let tools = ["bifrost.query", "fs.read", "code.run"];
+    for (origin, first) in [("direct", query_call()), ("nested", code_call())] {
+        let (executor, mock, invoked) = run(
+            BifrostError::QueryQueueFull,
+            vec![first.clone(), openai_text_response("unreachable")],
+        );
+        let calls = ToolCallsOwner::default();
+        let error = step_recording(
+            &executor,
+            &agent(text_prompt(), &tools),
+            input("document", json!("x")),
+            &calls,
+        )
+        .await
+        .expect_err("a queue refusal stops the step");
+        assert!(
+            matches!(&error, BlockError::Busy { reason }
+                if reason.starts_with("WYRD_VALA_429_QUERY_QUEUE_FULL: ")),
+            "{origin}: {error}"
+        );
+        assert!(invoked.lock().expect("invoked").is_empty(), "{origin}");
+        assert_eq!(mock.remaining(), 1, "{origin}: no model call followed");
+        let query = calls
+            .settled()
+            .into_iter()
+            .find(|record| record.tool == BuiltinTool::BifrostQuery)
+            .expect("the refused query is recorded");
+        assert!(
+            query
+                .error
+                .as_deref()
+                .is_some_and(|error| error.ends_with("query queue full")),
+            "{origin}: {query:?}"
+        );
+
+        let (executor, _, _) = run(BifrostError::QueryQueueFull, vec![first]);
+        let mut action = bound(Action::Agent(agent(text_prompt(), &tools)));
+        action["inputs"] = json!({"document": "inputs.document"});
+        let refused = run_engine(
+            executor,
+            json!({
+                "inputs": {"document": {"type": "json"}},
+                "steps": [{"id": "draft", "action": action, "retries": 1}],
+                "requirements": [{"id": "drafted", "statement": "Drafted", "check": {
+                    "kind": "assert", "path": "steps.draft.output", "operator": "is_not_null"
+                }}]
+            }),
+        )
+        .await;
+        assert!(
+            matches!(&refused, Err(vala_verify::blocks::EngineError::Busy(reason))
+                if reason.starts_with("WYRD_VALA_429_QUERY_QUEUE_FULL: ")),
+            "{origin}: {refused:?}"
+        );
+    }
+
+    let (executor, mock, invoked) = run(
+        BifrostError::QueryResourcesExhausted,
+        vec![code_call(), openai_text_response("done")],
+    );
+    let output = step(
+        &executor,
+        &agent(text_prompt(), &tools),
+        input("document", json!("x")),
+    )
+    .await
+    .expect("an exhausted query is the program's to handle");
+    assert_eq!(output.output, json!("done"));
+    assert_eq!(*invoked.lock().expect("invoked"), ["/after"]);
+    assert_eq!(mock.remaining(), 0);
+}
+
+/// A `fs.extract` double whose blocking work takes the caller's permit with
+/// [`vala_verify::blocks::hold_permit`], reports that it started, runs
+/// until released, and reports that it finished.
+struct HeldWork {
+    /// Gains one permit when the work starts.
+    started: Arc<tokio::sync::Semaphore>,
+    /// Gains one permit when the work ends.
+    finished: Arc<tokio::sync::Semaphore>,
+    /// Ends the work when sent to or dropped.
+    release: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>,
+    /// Whether the work received the caller's permit.
+    held: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl AgentTool for HeldWork {
+    /// The built-in wire name.
+    fn name(&self) -> &str {
+        BuiltinTool::FsExtract.as_str()
+    }
+
+    /// A fixed description.
+    fn description(&self) -> &'static str {
+        "extract a workspace document"
+    }
+
+    /// Any object.
+    fn input_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+
+    /// Any object.
+    fn output_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+
+    /// Run the held work on the blocking pool, keeping the caller's permit
+    /// until it ends.
+    ///
+    /// # Errors
+    /// Never fails.
+    ///
+    /// # Panics
+    /// Panics when the release lock is poisoned or the blocking task
+    /// panics.
+    async fn invoke(&self, _args: Value) -> Result<Value, ToolError> {
+        let permit = vala_verify::blocks::hold_permit();
+        self.held
+            .store(permit.is_some(), std::sync::atomic::Ordering::SeqCst);
+        let started = Arc::clone(&self.started);
+        let finished = Arc::clone(&self.finished);
+        let release = Arc::clone(&self.release);
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            started.add_permits(1);
+            release.lock().expect("release").recv().ok();
+            finished.add_permits(1);
+        })
+        .await
+        .expect("the work runs");
+        Ok(json!({}))
+    }
+}
+
+/// A `code.run` program that drops an extraction once its blocking work
+/// has started, checks that a following read is not dispatched, then
+/// releases the work and awaits the read.
+struct InterruptScript {
+    /// Gains one permit when the extraction's work starts.
+    started: Arc<tokio::sync::Semaphore>,
+    /// Releases the extraction's work.
+    release: std::sync::Mutex<std::sync::mpsc::Sender<()>>,
+    /// Paths the read invoked.
+    invoked: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl vala_verify::blocks::CodeTool for InterruptScript {
+    /// Run the fixed program through `bridge`.
+    ///
+    /// # Errors
+    /// Returns the read's error.
+    ///
+    /// # Panics
+    /// Panics when the extraction ends while held, or a lock or channel
+    /// fails.
+    async fn run(
+        &self,
+        _args: Value,
+        bridge: vala_verify::blocks::ToolBridge,
+    ) -> Result<Value, ToolError> {
+        let mut extract = Box::pin(bridge.call("fs.extract", json!({})));
+        tokio::select! {
+            ended = &mut extract => panic!("the extraction ended while held: {:?}", ended.map(vala_verify::blocks::Delivery::deliver)),
+            started = self.started.acquire() => started.expect("started").forget(),
+        }
+        drop(extract);
+        let mut read = Box::pin(bridge.call("fs.read", json!({"path": "/after"})));
+        let polled = futures_poll_once(read.as_mut());
+        let pending = polled.is_none() && self.invoked.lock().expect("invoked").is_empty();
+        self.release
+            .lock()
+            .expect("release")
+            .send(())
+            .expect("the work waits");
+        let read = match polled {
+            Some(read) => read,
+            None => read.await,
+        }?
+        .deliver();
+        Ok(json!({"pending": pending, "read": read}))
+    }
+}
+
+/// A toolset binding [`InterruptScript`] over [`HeldWork`] and a
+/// [`GatedRead`].
+struct InterruptToolset {
+    /// Paths the read invoked.
+    invoked: Arc<std::sync::Mutex<Vec<String>>>,
+    /// Whether the held work received the caller's permit.
+    held: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl AgentToolset for InterruptToolset {
+    /// Open a session running [`InterruptScript`].
+    ///
+    /// # Errors
+    /// Never fails.
+    ///
+    /// # Panics
+    /// Panics when the empty registry refuses a tool.
+    async fn open(
+        &self,
+        _id: &TaskId,
+        _workspace: &BTreeMap<String, CallInput>,
+        _deadline: Instant,
+        _tools: &[BuiltinTool],
+        _producer: Option<&Producer>,
+    ) -> Result<ToolSession, BlockError> {
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let (release, gate) = std::sync::mpsc::channel();
+        let registry = ToolRegistry::new();
+        registry
+            .register(Arc::new(HeldWork {
+                started: Arc::clone(&started),
+                finished: Arc::new(tokio::sync::Semaphore::new(0)),
+                release: Arc::new(std::sync::Mutex::new(gate)),
+                held: Arc::clone(&self.held),
+            }))
+            .expect("extract registers");
+        registry
+            .register(Arc::new(GatedRead {
+                invoked: Arc::clone(&self.invoked),
+                gate: Arc::new(tokio::sync::Semaphore::new(0)),
+            }))
+            .expect("read registers");
+        registry
+            .register(Arc::new(CodeFace))
+            .expect("code registers");
+        Ok(
+            ToolSession::new(registry, limits(), Box::new(())).with_code(Arc::new(
+                InterruptScript {
+                    started,
+                    release: std::sync::Mutex::new(release),
+                    invoked: Arc::clone(&self.invoked),
+                },
+            )),
+        )
+    }
+}
+
+/// At concurrency cap 1, blocking work keeps its call's permit after the
+/// call is dropped: a following read is not dispatched until the work is
+/// released, then runs. The dropped call is recorded as cancelled with no
+/// digest.
+///
+/// # Panics
+/// Panics when the permit frees before the work ends, the work never
+/// receives it, or a record is lost or misreported.
+#[tokio::test(flavor = "multi_thread")]
+async fn interrupted_blocking_work_keeps_its_permit() {
+    let invoked = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let held = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let executor = executor(vec![code_call(), openai_text_response("done")]).with_toolset(
+        Arc::new(InterruptToolset {
+            invoked: Arc::clone(&invoked),
+            held: Arc::clone(&held),
+        }),
+    );
+    let mut call = agent(text_prompt(), &["fs.extract", "fs.read", "code.run"]);
+    if let InlineableRef::Inline(spec) = &mut call.agent {
+        spec.run_config.tool_concurrency_cap = Some(1);
+    }
+    let calls = ToolCallsOwner::default();
+    let output = tokio::time::timeout(
+        Duration::from_secs(10),
+        step_recording(&executor, &call, input("document", json!("x")), &calls),
+    )
+    .await
+    .expect("the step ends")
+    .expect("the step runs");
+    assert_eq!(output.output, json!("done"));
+    assert!(
+        held.load(std::sync::atomic::Ordering::SeqCst),
+        "the work holds the permit"
+    );
+    let records = calls.settled();
+    assert_eq!(
+        records[0].output_sha256,
+        Some(Sha256Hex::digest(
+            json!({"pending": true, "read": {"text": "/after"}})
+                .to_string()
+                .as_bytes()
+        )),
+        "the read waited for the work's permit: {records:?}"
+    );
+    let shape: Vec<_> = records.iter().map(|record| record.tool).collect();
+    assert_eq!(
+        shape,
+        [
+            BuiltinTool::CodeRun,
+            BuiltinTool::FsExtract,
+            BuiltinTool::FsRead
+        ]
+    );
+    assert_eq!(
+        (records[1].output_sha256, records[1].returned_bytes),
+        (None, 0)
+    );
+    assert!(
+        records[1]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("cancelled")),
+        "{records:?}"
+    );
+    assert_eq!(*invoked.lock().expect("invoked"), ["/after"]);
+}
+
+/// An OpenAI answer calling `fs_extract` once.
+///
+/// # Panics
+/// Panics when [`read_call`] carries no tool call.
+fn extract_call() -> ProviderResponse {
+    let ProviderResponse::OpenAiChatCompletion(mut response) = read_call() else {
+        unreachable!("read_call is an OpenAI completion");
+    };
+    let call = &mut response.choices[0]
+        .message
+        .tool_calls
+        .as_mut()
+        .expect("calls")[0];
+    "fs_extract".clone_into(&mut call.function.name);
+    call.function.arguments = json!({"path": "/inputs/report.txt"}).to_string();
+    ProviderResponse::OpenAiChatCompletion(response)
+}
+
+/// How a [`SettlingToolset`]'s held extraction starts and how the Agent ends
+/// while it runs.
+#[derive(Debug, Clone)]
+enum Held {
+    /// The model calls `fs_extract` directly and waits on it.
+    Direct,
+    /// A [`DropHeld`] program returns once the extraction starts.
+    Returned,
+    /// A [`DropHeld`] program stops the session with this host error once
+    /// the extraction starts.
+    Stopped(BlockError),
+}
+
+/// A `code.run` program that starts a nested [`HeldWork`] extraction, drops
+/// it once its work has started, and returns or stops as its [`Held`] says.
+struct DropHeld {
+    /// Has a permit once the extraction's work has started; only peeked.
+    started: Arc<tokio::sync::Semaphore>,
+    /// Gains one permit as the program ends.
+    ended: Arc<tokio::sync::Semaphore>,
+    /// How the program ends.
+    held: Held,
+}
+
+#[async_trait]
+impl vala_verify::blocks::CodeTool for DropHeld {
+    /// Run the fixed program through `bridge`.
+    ///
+    /// # Errors
+    /// Returns [`ToolError::Invocation`] caused by the [`Held::Stopped`]
+    /// error.
+    ///
+    /// # Panics
+    /// Panics when the extraction ends while held.
+    async fn run(
+        &self,
+        _args: Value,
+        bridge: vala_verify::blocks::ToolBridge,
+    ) -> Result<Value, ToolError> {
+        let mut extract = Box::pin(bridge.call("fs.extract", json!({})));
+        tokio::select! {
+            ended = &mut extract => panic!("the extraction ended while held: {:?}", ended.map(vala_verify::blocks::Delivery::deliver)),
+            started = self.started.acquire() => drop(started.expect("started")),
+        }
+        drop(extract);
+        self.ended.add_permits(1);
+        match &self.held {
+            Held::Stopped(error) => Err(ToolError::Invocation {
+                detail: error.to_string(),
+                cause: Some(Box::new(error.clone())),
+            }),
+            Held::Direct | Held::Returned => Ok(json!({})),
+        }
+    }
+}
+
+/// A toolset whose first session runs one [`HeldWork`] extraction, started
+/// as its [`Held`] says, and settles only once that work ends; later
+/// sessions start no work.
+struct SettlingToolset {
+    /// How the held extraction starts and the Agent ends.
+    held: Held,
+    /// Gains one permit when the held work starts; only peeked.
+    started: Arc<tokio::sync::Semaphore>,
+    /// Gains one permit when the held work ends.
+    finished: Arc<tokio::sync::Semaphore>,
+    /// Gains one permit when a settlement is first polled.
+    awaited: Arc<tokio::sync::Semaphore>,
+    /// Gains one permit when a [`DropHeld`] program ends.
+    ended: Arc<tokio::sync::Semaphore>,
+    /// Releases the held work.
+    release: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>,
+    /// The first session's deadline.
+    deadline: std::sync::Mutex<Option<Instant>>,
+    /// Resolves once the first session's settlement completes, or fails
+    /// once it is dropped before completing.
+    settled: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    /// For each session after the first, whether the held work had ended
+    /// when it opened.
+    reopened: Arc<std::sync::Mutex<Vec<bool>>>,
+    /// Sessions opened.
+    opens: std::sync::atomic::AtomicUsize,
+}
+
+impl SettlingToolset {
+    /// A toolset holding its first extraction until `release` sends.
+    fn new(held: Held, release: std::sync::mpsc::Receiver<()>) -> Self {
+        Self {
+            held,
+            started: Arc::new(tokio::sync::Semaphore::new(0)),
+            finished: Arc::new(tokio::sync::Semaphore::new(0)),
+            awaited: Arc::new(tokio::sync::Semaphore::new(0)),
+            ended: Arc::new(tokio::sync::Semaphore::new(0)),
+            release: Arc::new(std::sync::Mutex::new(release)),
+            deadline: std::sync::Mutex::new(None),
+            settled: std::sync::Mutex::new(None),
+            reopened: Arc::new(std::sync::Mutex::new(Vec::new())),
+            opens: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// The first session's deadline.
+    ///
+    /// # Panics
+    /// Panics before the first session opens or when the lock is poisoned.
+    fn deadline(&self) -> Instant {
+        self.deadline
+            .lock()
+            .expect("deadline")
+            .expect("the first session opened")
+    }
+
+    /// Take the first session's settlement signal.
+    ///
+    /// # Panics
+    /// Panics before the first session opens, once taken, or when the lock
+    /// is poisoned.
+    fn settled(&self) -> tokio::sync::oneshot::Receiver<()> {
+        self.settled
+            .lock()
+            .expect("settled")
+            .take()
+            .expect("the first session opened")
+    }
+}
+
+#[async_trait]
+impl AgentToolset for SettlingToolset {
+    /// Open a session over the held extraction, recording whether earlier
+    /// work had ended.
+    ///
+    /// # Errors
+    /// Never fails.
+    ///
+    /// # Panics
+    /// Panics when the empty registry refuses a tool or a lock is poisoned.
+    async fn open(
+        &self,
+        _id: &TaskId,
+        _workspace: &BTreeMap<String, CallInput>,
+        deadline: Instant,
+        _tools: &[BuiltinTool],
+        _producer: Option<&Producer>,
+    ) -> Result<ToolSession, BlockError> {
+        let first = self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+        let done = if first {
+            *self.deadline.lock().expect("deadline") = Some(deadline);
+            let (done, settled) = tokio::sync::oneshot::channel();
+            *self.settled.lock().expect("settled") = Some(settled);
+            Some(done)
+        } else {
+            self.reopened
+                .lock()
+                .expect("reopened")
+                .push(self.finished.available_permits() > 0);
+            None
+        };
+        let registry = ToolRegistry::new();
+        registry
+            .register(Arc::new(HeldWork {
+                started: Arc::clone(&self.started),
+                finished: Arc::clone(&self.finished),
+                release: Arc::clone(&self.release),
+                held: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }))
+            .expect("extract registers");
+        if !matches!(self.held, Held::Direct) {
+            registry
+                .register(Arc::new(CodeFace))
+                .expect("code registers");
+        }
+        let awaited = Arc::clone(&self.awaited);
+        let finished = Arc::clone(&self.finished);
+        let session =
+            ToolSession::new(registry, limits(), Box::new(())).with_settlement(async move {
+                awaited.add_permits(1);
+                if let Some(done) = done {
+                    drop(finished.acquire().await.expect("finished"));
+                    done.send(()).ok();
+                }
+            });
+        Ok(match self.held {
+            Held::Direct => session,
+            Held::Returned | Held::Stopped(_) => session.with_code(Arc::new(DropHeld {
+                started: Arc::clone(&self.started),
+                ended: Arc::clone(&self.ended),
+                held: self.held.clone(),
+            })),
+        })
+    }
+}
+
+/// An executor over the `responses` script whose built-ins are `toolset`.
+fn settling_executor(
+    responses: Vec<ProviderResponse>,
+    toolset: &Arc<SettlingToolset>,
+) -> (AgentExecutor, MockProvider) {
+    let mock = MockProvider::new(ProviderName::OpenAi);
+    for response in responses {
+        mock.push_response(response);
+    }
+    let mut providers = ProviderRegistry::new();
+    providers.register(Arc::new(mock.clone()));
+    let executor = AgentExecutor::new(
+        Arc::new(providers),
+        Arc::new(NoRegistry),
+        Arc::new(NoRegistry),
+    )
+    .with_toolset(Arc::clone(toolset) as Arc<dyn AgentToolset>);
+    (executor, mock)
+}
+
+/// The one cancelled `fs.extract` record among `records`.
+///
+/// # Panics
+/// Panics when there is not exactly one extraction, or it returned a value
+/// or is not recorded as cancelled.
+fn cancelled_extraction(
+    label: &str,
+    records: &[wyrd_spec::verification::execution::ToolCallRecord],
+) {
+    let extracts: Vec<_> = records
+        .iter()
+        .filter(|record| record.tool == BuiltinTool::FsExtract)
+        .collect();
+    let [extract] = extracts.as_slice() else {
+        panic!("{label}: one extraction: {records:?}");
+    };
+    assert_eq!(
+        (extract.output_sha256, extract.returned_bytes),
+        (None, 0),
+        "{label}"
+    );
+    assert!(
+        extract
+            .error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("cancelled")),
+        "{label}: {extract:?}"
+    );
+}
+
+/// An attempt's host work settles before the engine retries the step or
+/// produces its result, whether the step's `timeout_seconds` ends the
+/// attempt while the Agent is running or after a host stop ended it early.
+///
+/// Each case starts an extraction held past the one-second attempt timeout.
+/// Timed out while the model waits on it, the engine must await the
+/// attempt's settlement while the work is held; once released, with one
+/// retry a new session opens only after the old work ended and the step
+/// succeeds, and with none the step fails as timed out with no further
+/// model call. Stopped earlier by a `code.run` host error with the work
+/// still running, the settlement must survive the attempt timeout instant
+/// and the engine must not advance; once released, the stop keeps its own
+/// classification, a failed step or a busy execution, and is not retried as
+/// a timeout. Every result keeps the interrupted call as cancelled with no
+/// digest.
+///
+/// # Panics
+/// Panics when the engine retries or produces a result while the work is
+/// held, the settlement is dropped or ends early, a new session overlaps
+/// the old work, or the outcome or records differ.
+#[tokio::test(flavor = "multi_thread")]
+async fn timed_out_attempt_settles_before_retry_or_result() {
+    use wyrd_spec::verification::execution::StepStatus;
+
+    let limit = BlockError::Terminal {
+        reason: "code.run exceeded its operation deadline".to_owned(),
+    };
+    let busy = BlockError::Busy {
+        reason: "no worker".to_owned(),
+    };
+    for (retries, held) in [
+        (1, Held::Direct),
+        (0, Held::Direct),
+        (1, Held::Stopped(limit)),
+        (1, Held::Stopped(busy)),
+    ] {
+        let label = format!("retries {retries}, {held:?}");
+        let (release, gate) = std::sync::mpsc::channel();
+        let toolset = Arc::new(SettlingToolset::new(held.clone(), gate));
+        let mut responses = vec![match held {
+            Held::Direct => extract_call(),
+            Held::Returned | Held::Stopped(_) => code_call(),
+        }];
+        if retries > 0 && matches!(held, Held::Direct) {
+            responses.push(openai_text_response("done"));
+        }
+        let (executor, mock) = settling_executor(responses, &toolset);
+        let tools: &[&str] = match held {
+            Held::Direct => &["fs.extract"],
+            Held::Returned | Held::Stopped(_) => &["fs.extract", "code.run"],
+        };
+        let mut action = bound(Action::Agent(agent(text_prompt(), tools)));
+        action["inputs"] = json!({"document": "inputs.document"});
+        let mut engine = tokio::spawn(run_engine(
+            executor,
+            json!({
+                "inputs": {"document": {"type": "json"}},
+                "steps": [{"id": "draft", "action": action, "retries": retries, "timeout_seconds": 1}],
+                "requirements": [{"id": "drafted", "statement": "Drafted", "check": {
+                    "kind": "assert", "path": "steps.draft.output", "operator": "is_not_null"
+                }}]
+            }),
+        ));
+        tokio::select! {
+            ended = &mut engine => panic!("{label}: ended before the work started: {ended:?}"),
+            started = toolset.started.acquire() => drop(started.expect("the work starts")),
+        }
+        tokio::select! {
+            ended = &mut engine => panic!("{label}: advanced while the work was held: {ended:?}"),
+            awaited = toolset.awaited.acquire() => awaited.expect("awaited").forget(),
+        }
+        if let Held::Stopped(_) = held {
+            let deadline = toolset.deadline();
+            assert_eq!(
+                toolset.ended.available_permits(),
+                1,
+                "{label}: the Agent stopped first"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "{label}: stopped before the attempt timeout"
+            );
+            let mut settled = toolset.settled();
+            tokio::select! {
+                ended = &mut engine => panic!("{label}: advanced while the work was held: {ended:?}"),
+                settled = &mut settled => panic!(
+                    "{label}: the settlement {} while the work was held",
+                    if settled.is_ok() { "ended" } else { "was dropped" }
+                ),
+                () = tokio::time::sleep_until(deadline + Duration::from_secs(1)) => {}
+            }
+        }
+        assert_eq!(
+            toolset.opens.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "{label}: no new session before settlement"
+        );
+        release.send(()).expect("the work waits for release");
+        let outcome = engine.await.expect("the engine task runs");
+        assert_eq!(mock.remaining(), 0, "{label}: the script is spent");
+        if let Held::Stopped(BlockError::Busy { reason }) = &held {
+            assert!(
+                matches!(&outcome, Err(vala_verify::blocks::EngineError::Busy(busy)) if busy == reason),
+                "{label}: {outcome:?}"
+            );
+            assert_eq!(toolset.opens.load(std::sync::atomic::Ordering::SeqCst), 1);
+            continue;
+        }
+        let outcome = outcome.expect("the execution settles");
+        let step = &outcome.steps[0];
+        match &held {
+            Held::Direct if retries > 0 => {
+                assert_eq!(step.status, StepStatus::Succeeded, "{label}: {step:?}");
+                assert_eq!(step.attempts, 2, "{label}: {step:?}");
+                assert_eq!(
+                    *toolset.reopened.lock().expect("reopened"),
+                    [true],
+                    "{label}: the retry opened only after the old work ended"
+                );
+            }
+            Held::Direct => {
+                assert_eq!(step.status, StepStatus::Failed, "{label}: {step:?}");
+                assert!(
+                    step.reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.contains("timed out")),
+                    "{label}: {step:?}"
+                );
+                assert_eq!(toolset.opens.load(std::sync::atomic::Ordering::SeqCst), 1);
+            }
+            Held::Returned | Held::Stopped(_) => {
+                assert_eq!(step.status, StepStatus::Failed, "{label}: {step:?}");
+                assert_eq!(step.attempts, 1, "{label}: a stop is not retried: {step:?}");
+                assert_eq!(
+                    step.reason.as_deref(),
+                    Some("code.run exceeded its operation deadline"),
+                    "{label}: the stop keeps its classification"
+                );
+                assert_eq!(toolset.opens.load(std::sync::atomic::Ordering::SeqCst), 1);
+            }
+        }
+        cancelled_extraction(&label, &step.tool_calls);
+    }
+}
+
+/// An Agent check's host work settles before the engine judges the
+/// requirement, whether the check returns an answer or a host stop ends it.
+///
+/// A `code.run` program drops a held extraction once it starts; the check
+/// then answers a failed judgment, or its session stops with a terminal host
+/// error. Either way the engine must await the check's settlement while
+/// the work is held and must not produce the requirement until release;
+/// then the failure or the inconclusive stop is judged with the interrupted
+/// call recorded as cancelled with no digest.
+///
+/// # Panics
+/// Panics when the engine produces a result while the work is held, the
+/// check returns only after the work ends, or the judgment or records
+/// differ.
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_check_settles_before_result() {
+    use wyrd_spec::verification::execution::RequirementOutcome;
+
+    let limit = BlockError::Terminal {
+        reason: "code.run exceeded its operation deadline".to_owned(),
+    };
+    for held in [Held::Returned, Held::Stopped(limit)] {
+        let label = format!("{held:?}");
+        let (release, gate) = std::sync::mpsc::channel();
+        let toolset = Arc::new(SettlingToolset::new(held.clone(), gate));
+        let mut responses = vec![code_call()];
+        if let Held::Returned = held {
+            responses.push(openai_text_response(
+                &json!({"outcome": "failed", "reason": "judged", "citations": []}).to_string(),
+            ));
+        }
+        let (executor, mock) = settling_executor(responses, &toolset);
+        let mut judge = named_judge(json!("verdict"));
+        if let InlineableRef::Inline(spec) = &mut judge.agent {
+            spec.tool_names = vec!["fs.extract".to_owned(), "code.run".to_owned()];
+        }
+        let mut engine = tokio::spawn(run_engine(
+            executor,
+            json!({
+                "inputs": {"document": {"type": "json"}},
+                "requirements": [{"id": "grounded", "statement": "Grounded", "check": bound(Check::Agent(judge))}]
+            }),
+        ));
+        tokio::select! {
+            ended = &mut engine => panic!("{label}: ended before the work started: {ended:?}"),
+            started = toolset.started.acquire() => drop(started.expect("the work starts")),
+        }
+        tokio::select! {
+            ended = &mut engine => panic!("{label}: judged while the work was held: {ended:?}"),
+            awaited = toolset.awaited.acquire() => awaited.expect("awaited").forget(),
+        }
+        assert_eq!(
+            toolset.ended.available_permits(),
+            1,
+            "{label}: the check returned while the work was held"
+        );
+        assert!(
+            !engine.is_finished(),
+            "{label}: judged while the work was held"
+        );
+        release.send(()).expect("the work waits for release");
+        let outcome = engine
+            .await
+            .expect("the engine task runs")
+            .expect("the execution settles");
+        assert_eq!(mock.remaining(), 0, "{label}: the script is spent");
+        let requirement = &outcome.requirements[0];
+        if let Held::Stopped(BlockError::Terminal { reason }) = &held {
+            assert_eq!(
+                requirement.result.outcome,
+                RequirementOutcome::Inconclusive,
+                "{label}: {requirement:?}"
+            );
+            assert_eq!(&requirement.result.reason, reason, "{label}");
+        } else {
+            assert_eq!(
+                requirement.result.outcome,
+                RequirementOutcome::Failed,
+                "{label}: {requirement:?}"
+            );
+            assert_eq!(requirement.result.reason, "judged", "{label}");
+        }
+        cancelled_extraction(&label, &requirement.tool_calls);
+    }
+}
+
+/// A writable built-in double recording the provider call ID of each
+/// invocation, `None` for a call outside any provider call.
+struct WriteFace {
+    /// The built-in it stands for.
+    tool: BuiltinTool,
+    /// Every invocation's call ID, in order.
+    invoked: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+}
+
+#[async_trait]
+impl AgentTool for WriteFace {
+    /// The built-in wire name.
+    fn name(&self) -> &str {
+        self.tool.as_str()
+    }
+
+    /// A fixed description.
+    fn description(&self) -> &'static str {
+        "write"
+    }
+
+    /// Any object.
+    fn input_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+
+    /// Any object.
+    fn output_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+
+    /// Record a call without a provider call ID.
+    ///
+    /// # Errors
+    /// Never fails.
+    ///
+    /// # Panics
+    /// Panics when the record lock is poisoned.
+    async fn invoke(&self, _args: Value) -> Result<Value, ToolError> {
+        self.invoked.lock().expect("invoked").push(None);
+        Ok(json!({}))
+    }
+
+    /// Record provider call `call_id`.
+    ///
+    /// # Errors
+    /// Never fails.
+    ///
+    /// # Panics
+    /// Panics when the record lock is poisoned.
+    async fn invoke_call(&self, call_id: &str, _args: Value) -> Result<Value, ToolError> {
+        self.invoked
+            .lock()
+            .expect("invoked")
+            .push(Some(call_id.to_owned()));
+        Ok(json!({}))
+    }
+}
+
+/// A `code.run` program requesting `fs.write` and `publish` and returning
+/// each outcome's stable code or value.
+struct WritingScript;
+
+#[async_trait]
+impl vala_verify::blocks::CodeTool for WritingScript {
+    /// Request both writable tools through `bridge`.
+    ///
+    /// # Errors
+    /// Never fails; refusals are part of the result.
+    async fn run(
+        &self,
+        _args: Value,
+        bridge: vala_verify::blocks::ToolBridge,
+    ) -> Result<Value, ToolError> {
+        let mut outcomes = Vec::new();
+        for name in ["fs.write", "publish"] {
+            outcomes.push(match bridge.call(name, json!({"path": "/work/a"})).await {
+                Ok(delivery) => delivery.deliver(),
+                Err(error) => json!(wyrd_spec::error::WyrdError::from(&error).code()),
+            });
+        }
+        Ok(json!(outcomes))
+    }
+}
+
+/// A toolset declaring `fs.write`, `publish`, and `code.run` through
+/// [`WritingScript`], recording the writable calls in `invoked`.
+struct WritingToolset {
+    /// Every writable invocation's call ID.
+    invoked: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+}
+
+#[async_trait]
+impl AgentToolset for WritingToolset {
+    /// Open a session over the writable doubles and [`WritingScript`].
+    ///
+    /// # Errors
+    /// Never fails.
+    ///
+    /// # Panics
+    /// Panics when the empty registry refuses a tool.
+    async fn open(
+        &self,
+        _id: &TaskId,
+        _workspace: &BTreeMap<String, CallInput>,
+        _deadline: Instant,
+        _tools: &[BuiltinTool],
+        _producer: Option<&Producer>,
+    ) -> Result<ToolSession, BlockError> {
+        let registry = ToolRegistry::new();
+        for tool in [BuiltinTool::FsWrite, BuiltinTool::Publish] {
+            registry
+                .register(Arc::new(WriteFace {
+                    tool,
+                    invoked: Arc::clone(&self.invoked),
+                }))
+                .expect("writable tool registers");
+        }
+        registry
+            .register(Arc::new(CodeFace))
+            .expect("code registers");
+        Ok(ToolSession::new(registry, limits(), Box::new(())).with_code(Arc::new(WritingScript)))
+    }
+}
+
+/// The model's `publish` call reaches its tool under the provider call ID
+/// it was made with, while code requesting the declared `fs.write` and
+/// `publish` is refused as not in the Agent and never invokes either, so a
+/// nested call can neither write nor publish.
+///
+/// # Panics
+/// Panics when the model call loses its call ID, a nested writable call is
+/// invoked or refused with another code, or the records disagree.
+#[tokio::test(flavor = "multi_thread")]
+async fn nested_calls_refuse_writable_tools_and_model_calls_keep_their_call_id() {
+    let ProviderResponse::OpenAiChatCompletion(mut publish) = read_call() else {
+        unreachable!("read_call is an OpenAI completion");
+    };
+    let call = &mut publish.choices[0]
+        .message
+        .tool_calls
+        .as_mut()
+        .expect("calls")[0];
+    "publish".clone_into(&mut call.function.name);
+    let invoked = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let executor = executor(vec![
+        ProviderResponse::OpenAiChatCompletion(publish),
+        code_call(),
+        openai_text_response("done"),
+    ])
+    .with_toolset(Arc::new(WritingToolset {
+        invoked: Arc::clone(&invoked),
+    }));
+    let calls = ToolCallsOwner::default();
+    let output = step_recording(
+        &executor,
+        &agent(text_prompt(), &["fs.write", "publish", "code.run"]),
+        input("document", json!("x")),
+        &calls,
+    )
+    .await
+    .expect("the step runs");
+    assert_eq!(output.output, json!("done"));
+    assert_eq!(
+        *invoked.lock().expect("invoked"),
+        [Some("call_1".to_owned())],
+        "only the model's publish ran, under its provider call ID"
+    );
+    let records = calls.settled();
+    let shape: Vec<_> = records
+        .iter()
+        .map(|record| (record.tool, record.recipient))
+        .collect();
+    assert_eq!(
+        shape,
+        [
+            (BuiltinTool::Publish, ToolRecipient::Model),
+            (BuiltinTool::CodeRun, ToolRecipient::Model),
+        ],
+        "refused nested requests are not recorded"
+    );
+    let refused = json!([
+        "WYRD_AGENT_404_TOOL_NOT_IN_AGENT",
+        "WYRD_AGENT_404_TOOL_NOT_IN_AGENT"
+    ]);
+    assert_eq!(
+        records[1].output_sha256,
+        Some(Sha256Hex::digest(refused.to_string().as_bytes())),
+        "code saw both writable tools refused"
+    );
+}
+
+/// Evidence whose media is one PNG image, guarded by a clone of `held` so
+/// a test can see whether the guard is still alive.
+struct HeldMedia {
+    /// Cloned into every guard the reader returns.
+    held: Arc<()>,
+}
+
+#[async_trait]
+impl EvidenceReader for HeldMedia {
+    /// One PNG image, guarded by a clone of `held`.
+    ///
+    /// # Errors
+    /// Never fails.
+    async fn media(
+        &self,
+        _evidence: &InputDeclaration,
+    ) -> Result<(MediaRef, Box<dyn std::any::Any + Send + Sync>), BlockError> {
+        Ok((
+            MediaRef::image_base64("image/png", "iVBORw0KGgo="),
+            Box::new(Arc::clone(&self.held)),
+        ))
+    }
+
+    /// No citations.
+    ///
+    /// # Errors
+    /// Never fails.
+    async fn cited(
+        &self,
+        _reachable: &BTreeSet<SlotName>,
+        _citations: Vec<Citation>,
+    ) -> Result<Vec<Citation>, BlockError> {
+        Ok(Vec::new())
+    }
+}
+
+/// A provider that records how many holders `held` has when a request
+/// arrives, then answers from its queue or, when `pend` is set, never.
+#[derive(Clone)]
+struct WatchingMedia {
+    /// The scripted answers.
+    mock: MockProvider,
+    /// The reader's guard target.
+    held: Arc<()>,
+    /// Holders of `held` seen at each request.
+    seen: Arc<std::sync::Mutex<Vec<usize>>>,
+    /// Never answer.
+    pend: bool,
+}
+
+#[async_trait]
+impl Provider for WatchingMedia {
+    /// Record the holders of `held`, then answer or pend.
+    ///
+    /// # Errors
+    /// Returns the mock's error for an empty queue.
+    ///
+    /// # Panics
+    /// Panics when the log's lock is poisoned.
+    async fn send(&self, request: &ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+        self.seen
+            .lock()
+            .expect("unpoisoned")
+            .push(Arc::strong_count(&self.held));
+        if self.pend {
+            std::future::pending::<()>().await;
+        }
+        self.mock.send(request).await
+    }
+
+    /// Streams are not used.
+    ///
+    /// # Errors
+    /// Always the mock's empty-stream error.
+    async fn stream(&self, request: &ProviderRequest) -> Result<ProviderStream, ProviderError> {
+        self.mock.stream(request).await
+    }
+
+    /// The mocked provider name.
+    fn name(&self) -> ProviderName {
+        self.mock.name()
+    }
+}
+
+/// The media an Agent binds stays held by its evidence reader's guard
+/// while the provider request carries it, and the guard is released once
+/// the call completes or is cancelled mid-request.
+///
+/// # Panics
+/// Panics when the provider sees the guard released, or the guard outlives
+/// the finished or cancelled call.
+#[tokio::test]
+async fn bound_media_stays_held_until_the_agent_call_ends() {
+    for pend in [false, true] {
+        let held = Arc::new(());
+        let provider = WatchingMedia {
+            mock: MockProvider::new(ProviderName::OpenAi),
+            held: Arc::clone(&held),
+            seen: Arc::default(),
+            pend,
+        };
+        provider.mock.push_response(openai_text_response("a cat"));
+        let mut providers = ProviderRegistry::new();
+        providers.register(Arc::new(provider.clone()));
+        let executor = AgentExecutor::new(
+            Arc::new(providers),
+            Arc::new(NoRegistry),
+            Arc::new(NoRegistry),
+        )
+        .with_evidence(Arc::new(HeldMedia {
+            held: Arc::clone(&held),
+        }));
+        let prompt = openai_chat(
+            "gpt-test",
+            OpenAiChatOptions {
+                messages: vec!["Describe ${media:shot}".to_owned()],
+                ..OpenAiChatOptions::default()
+            },
+        )
+        .expect("static prompt is valid");
+        let inputs = BTreeMap::from([(
+            "shot".to_owned(),
+            CallInput {
+                value: CallValue::Evidence(InputDeclaration::File {
+                    sha256: Sha256Hex::digest(b"png"),
+                    size_bytes: 3,
+                    format: skald_spec::MediaFormat::Png,
+                    filename: None,
+                }),
+                sources: BTreeSet::new(),
+            },
+        )]);
+
+        let call = agent(prompt, &[]);
+        let idle = Arc::strong_count(&held);
+        let run = step(&executor, &call, inputs);
+        if pend {
+            let cancelled = tokio::time::timeout(Duration::from_millis(200), run).await;
+            assert!(cancelled.is_err(), "the pending provider never answers");
+        } else {
+            run.await.expect("the media step runs");
+        }
+
+        assert_eq!(
+            *provider.seen.lock().expect("unpoisoned"),
+            [idle + 1],
+            "the provider request sees the guard held (pend: {pend})"
+        );
+        assert_eq!(
+            Arc::strong_count(&held),
+            idle,
+            "the guard is released once the call ends (pend: {pend})"
+        );
+    }
+}
+
+/// A byte budget shared by a media reader and its sibling promises.
+#[derive(Default)]
+struct Memory {
+    /// Most bytes it promises at once.
+    capacity: u64,
+    /// Bytes promised now.
+    used: std::sync::atomic::AtomicU64,
+}
+
+impl Memory {
+    /// Promise `bytes`, or `None` when they would pass the capacity.
+    fn charge(self: &Arc<Self>, bytes: u64) -> Option<Promise> {
+        self.used
+            .try_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |used| {
+                    used.checked_add(bytes)
+                        .filter(|total| *total <= self.capacity)
+                },
+            )
+            .ok()?;
+        Some(Promise(Arc::clone(self), bytes))
+    }
+
+    /// Bytes promised now.
+    fn used(&self) -> u64 {
+        self.used.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Bytes promised from a [`Memory`] until dropped.
+struct Promise(
+    /// The budget the bytes were promised from.
+    Arc<Memory>,
+    /// The promised bytes.
+    u64,
+);
+
+impl Drop for Promise {
+    /// Returns the promised bytes.
+    fn drop(&mut self) {
+        self.0
+            .used
+            .fetch_sub(self.1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Evidence whose media is one `raw`-byte PNG, charged like the host's
+/// reader: the returned guard holds the encoding, charged from `memory`
+/// before the encoding exists.
+struct ChargedMedia {
+    /// The budget the media is charged to.
+    memory: Arc<Memory>,
+    /// Raw media bytes.
+    raw: usize,
+    /// How many times the media was read.
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl EvidenceReader for ChargedMedia {
+    /// The PNG with its charge, or `Busy` when `memory` cannot hold it.
+    ///
+    /// # Errors
+    /// Returns [`BlockError::Busy`] when the budget refuses the encoding.
+    async fn media(
+        &self,
+        _evidence: &InputDeclaration,
+    ) -> Result<(MediaRef, Box<dyn std::any::Any + Send + Sync>), BlockError> {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let promise = self
+            .memory
+            .charge((self.raw.div_ceil(3) * 4) as u64)
+            .ok_or_else(|| BlockError::Busy {
+                reason: "no memory for the media".to_owned(),
+            })?;
+        let data = "A".repeat(self.raw.div_ceil(3) * 4);
+        Ok((
+            MediaRef::image_base64("image/png", &data),
+            Box::new(promise),
+        ))
+    }
+
+    /// No citations.
+    ///
+    /// # Errors
+    /// Never fails.
+    async fn cited(
+        &self,
+        _reachable: &BTreeSet<SlotName>,
+        _citations: Vec<Citation>,
+    ) -> Result<Vec<Citation>, BlockError> {
+        Ok(Vec::new())
+    }
+}
+
+/// A provider that, while a request is pending, records the bytes
+/// promised from `memory` and whether a sibling could still be promised
+/// `sibling` bytes, then answers from its queue or, with `pend`, never.
+#[derive(Clone)]
+struct MeteredMedia {
+    /// The scripted answers.
+    mock: MockProvider,
+    /// The shared budget.
+    memory: Arc<Memory>,
+    /// The sibling promise tried during the request.
+    sibling: u64,
+    /// `(promised, sibling admitted)` at each request.
+    seen: Arc<std::sync::Mutex<Vec<(u64, bool)>>>,
+    /// Never answer.
+    pend: bool,
+}
+
+#[async_trait]
+impl Provider for MeteredMedia {
+    /// Record the promised bytes and the sibling's admission, then answer
+    /// or pend.
+    ///
+    /// # Errors
+    /// Returns the mock's error for an empty queue.
+    ///
+    /// # Panics
+    /// Panics when the log's lock is poisoned.
+    async fn send(&self, request: &ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+        let sibling = self.memory.charge(self.sibling).is_some();
+        self.seen
+            .lock()
+            .expect("unpoisoned")
+            .push((self.memory.used(), sibling));
+        if self.pend {
+            std::future::pending::<()>().await;
+        }
+        self.mock.send(request).await
+    }
+
+    /// Streams are not used.
+    ///
+    /// # Errors
+    /// Always the mock's empty-stream error.
+    async fn stream(&self, request: &ProviderRequest) -> Result<ProviderStream, ProviderError> {
+        self.mock.stream(request).await
+    }
+
+    /// The mocked provider name.
+    fn name(&self) -> ProviderName {
+        self.mock.name()
+    }
+}
+
+/// Bound media is read once per input and charged only the guard its reader
+/// returns, however often its placeholder occurs: no provider copies are
+/// promised. Memory short of that guard refuses before the provider sees
+/// anything and holds nothing, and with enough memory the held call keeps
+/// the guard, refusing a sibling the read and encoding, until it completes
+/// or is cancelled.
+///
+/// # Panics
+/// Panics when a refusal reaches the provider or keeps a charge, binding
+/// reads the media other than once, the held call is charged other than the
+/// guard, a sibling reuses its bytes, or the charge outlives the call.
+#[tokio::test]
+async fn bound_media_holds_only_its_guard_through_the_call() {
+    let raw = 48 * 1024;
+    let encoded = (raw / 3 * 4) as u64;
+    for (messages, occurrences) in [
+        (vec!["Describe ${media:shot}".to_owned()], 1_u64),
+        (
+            vec![
+                "Describe ${media:shot}".to_owned(),
+                "Then compare ${media:shot}".to_owned(),
+            ],
+            2,
+        ),
+    ] {
+        let prompt = || {
+            openai_chat(
+                "gpt-test",
+                OpenAiChatOptions {
+                    messages: messages.clone(),
+                    ..OpenAiChatOptions::default()
+                },
+            )
+            .expect("static prompt is valid")
+        };
+        let inputs = BTreeMap::from([(
+            "shot".to_owned(),
+            CallInput {
+                value: CallValue::Evidence(InputDeclaration::File {
+                    sha256: Sha256Hex::digest(b"png"),
+                    size_bytes: raw as u64,
+                    format: skald_spec::MediaFormat::Png,
+                    filename: None,
+                }),
+                sources: BTreeSet::new(),
+            },
+        )]);
+        let peak = encoded;
+
+        for (capacity, pend) in [
+            (peak - 1, false),
+            (peak + raw as u64, false),
+            (peak + raw as u64, true),
+        ] {
+            let memory = Arc::new(Memory {
+                capacity,
+                ..Memory::default()
+            });
+            let provider = MeteredMedia {
+                mock: MockProvider::new(ProviderName::OpenAi),
+                memory: Arc::clone(&memory),
+                sibling: raw as u64 + encoded,
+                seen: Arc::default(),
+                pend,
+            };
+            provider.mock.push_response(openai_text_response("a cat"));
+            let mut providers = ProviderRegistry::new();
+            providers.register(Arc::new(provider.clone()));
+            let reader = Arc::new(ChargedMedia {
+                memory: Arc::clone(&memory),
+                raw,
+                reads: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let executor = AgentExecutor::new(
+                Arc::new(providers),
+                Arc::new(NoRegistry),
+                Arc::new(NoRegistry),
+            )
+            .with_evidence(Arc::clone(&reader) as Arc<dyn EvidenceReader>);
+            let call = agent(prompt(), &[]);
+            let run = step(&executor, &call, inputs.clone());
+            let result = if pend {
+                let cancelled = tokio::time::timeout(Duration::from_millis(200), run).await;
+                assert!(cancelled.is_err(), "the pending provider never answers");
+                None
+            } else {
+                Some(run.await)
+            };
+
+            assert_eq!(
+                reader.reads.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "binding reads the media once for {occurrences} occurrence(s)"
+            );
+            let seen = provider.seen.lock().expect("unpoisoned").clone();
+            if capacity < peak {
+                assert!(
+                    matches!(result, Some(Err(BlockError::Busy { .. }))),
+                    "{result:?}"
+                );
+                assert!(seen.is_empty(), "a refusal precedes the provider call");
+            } else {
+                if let Some(result) = result {
+                    result.expect("the media step runs");
+                }
+                assert_eq!(
+                    seen,
+                    [(peak, false)],
+                    "the held call keeps its peak and refuses the sibling (pend: {pend})"
+                );
+            }
+            assert_eq!(memory.used(), 0, "the call's end returns the charge");
+        }
+    }
 }

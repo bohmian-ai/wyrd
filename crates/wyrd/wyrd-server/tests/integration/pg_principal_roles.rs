@@ -561,7 +561,7 @@ async fn register_service(
 ///
 /// # Panics
 /// Panics when the registration is refused or returns no UID.
-async fn register_agent(server: &WyrdTestServer, jwt: &str, name: &str) -> CardUid {
+pub(crate) async fn register_agent(server: &WyrdTestServer, jwt: &str, name: &str) -> CardUid {
     let prompt = format!("{name}-prompt");
     register(
         server,

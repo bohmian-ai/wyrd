@@ -8,6 +8,12 @@
 //! claim owns is proportional to the number of runs rather than to the object
 //! it produces.
 //!
+//! Every emitted batch carries the claim's selected physical Variant layout. A
+//! run already staged in that layout is merged as decoded, so its shredded
+//! columns reach the writer without reconstruction or reshredding; only a run
+//! in another layout is converted, batch by batch, to complete logical values
+//! and then to the selected layout.
+//!
 //! Ordering is the layout's sort keys, then claim run order, then position
 //! within a run. That makes the merge total: rows that tie on every layout key
 //! still have exactly one order, because
@@ -22,20 +28,27 @@ use arrow::array::RecordBatch;
 use arrow::compute::interleave_record_batch;
 use arrow::datatypes::SchemaRef;
 use arrow::row::{Row, RowConverter, Rows, SortField};
+use iceberg::writer::file_writer::variant_shredding::VariantLayout;
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
+use parquet::basic::Type as PhysicalType;
+use parquet::file::metadata::ParquetMetaData;
 
 use wyrd_spec::DataTenantId;
 
 use crate::catalog::layout::PhysicalLayout;
 use crate::contracts::ScribeError;
 use crate::parquet::footer::{footer_schema_fingerprint, verify_footer_tenant};
+use crate::resources::{ScribeMemoryLease, ScribeResources};
 use crate::schema::SchemaFingerprint;
+use crate::scribe::claim_assembly::MERGE_BATCH_BYTES;
+use crate::scribe::memory::MemoryCategory;
 
 /// One staged run positioned on the row it currently offers to the merge.
 ///
 /// The cursor owns the decoded batch and its comparable row encoding together
 /// because both are replaced at the same moment: a refill invalidates every
-/// index into the previous batch.
+/// index into the previous batch. Its lease charges both to the Scribe
+/// persistence reservation for as long as they are held.
 struct RunCursor {
     /// Reader producing bounded batches from one staged run.
     reader: ParquetRecordBatchReader,
@@ -47,6 +60,14 @@ struct RunCursor {
     index: usize,
     /// Whether the reader has produced its final batch.
     drained: bool,
+    /// Whether the run is staged in another layout and each batch is converted.
+    converts: bool,
+    /// Estimated decoded bytes of one of this run's rows, from its footer.
+    row_bytes: usize,
+    /// Bytes reserved before decoding one batch, including conversion overlap.
+    workspace: usize,
+    /// Persistence reservation for the batch and rows this cursor holds.
+    lease: ScribeMemoryLease,
 }
 
 impl RunCursor {
@@ -67,8 +88,14 @@ impl RunCursor {
 /// readers, their decoded batches, and the row encoder across calls: each
 /// [`Self::next_batch`] resumes exactly where the previous one stopped.
 pub struct StagedRunMerge {
-    /// Logical schema every emitted batch carries.
+    /// Logical schema the claim's runs were sealed under.
     schema: SchemaRef,
+    /// Variant layout the claim's sample selected.
+    variant_layout: VariantLayout,
+    /// Physical schema of `variant_layout` that every emitted batch carries.
+    physical: SchemaRef,
+    /// Rows decoded from runs in another layout and converted to `physical`.
+    converted_rows: usize,
     /// Tenant whose footer a run must carry before its physical layout may differ.
     tenant: DataTenantId,
     /// Encoder turning sort-key columns into byte-comparable rows.
@@ -77,8 +104,10 @@ pub struct StagedRunMerge {
     key_columns: Vec<usize>,
     /// One cursor per staged run, in claim order.
     cursors: Vec<RunCursor>,
-    /// Maximum rows one emitted batch may carry.
+    /// Maximum rows one emitted or decoded batch may carry.
     batch_rows: usize,
+    /// Scribe capability every cursor's workspace is reserved from.
+    memory: ScribeResources,
 }
 
 impl StagedRunMerge {
@@ -89,22 +118,36 @@ impl StagedRunMerge {
     /// can reach an object that claims the key's fingerprint. A run may hold
     /// shredded Variant columns — its generation's layout — and is then
     /// accepted only when its footer names the claim's logical schema
-    /// fingerprint and `tenant`; its rows are reconstructed to the logical
-    /// schema as they are decoded, so every cursor offers one schema.
+    /// fingerprint and `tenant`. Every cursor offers `variant_layout`'s
+    /// physical schema: a run whose columns already have exactly those types,
+    /// nested field names, nullability and metadata included, is offered as
+    /// decoded; any other run is reconstructed to the logical schema and
+    /// shredded with `variant_layout` as it is decoded.
+    ///
+    /// Each run decodes batches of at most `batch_rows` rows shaped to
+    /// [`MERGE_BATCH_BYTES`] by its footer's row width. Before a batch is
+    /// decoded its cursor reserves that estimate from `memory` — three times
+    /// over for a converting run, whose decoded, logical and shredded batches
+    /// overlap — and then settles the reservation to the batch and sort-key
+    /// rows it holds.
     ///
     /// # Errors
     ///
     /// Returns [`ScribeError::Internal`] when a run cannot be opened or read,
     /// a run's schema is not the claim's schema, a shredded run's footer names
-    /// another logical schema or tenant, a sort key or stable
-    /// tie-breaker is missing from that schema, the row encoder cannot be built
-    /// for the key's types, or `batch_rows` is zero.
+    /// another logical schema or tenant, `variant_layout` cannot shred the
+    /// schema, a sort key or stable tie-breaker is missing from that schema,
+    /// the row encoder cannot be built for the key's types, or `batch_rows` is
+    /// zero, and [`ScribeError::IngestBusy`] when the shared root cannot hold
+    /// a run's workspace.
     pub fn open(
         runs: &[PathBuf],
         schema: SchemaRef,
+        variant_layout: VariantLayout,
         tenant: DataTenantId,
         layout: &PhysicalLayout,
         batch_rows: usize,
+        memory: &ScribeResources,
     ) -> Result<Self, ScribeError> {
         if batch_rows == 0 {
             return Err(ScribeError::Internal {
@@ -127,13 +170,23 @@ impl StagedRunMerge {
         let converter = RowConverter::new(fields).map_err(|error| ScribeError::Internal {
             detail: format!("build the staged merge row encoder: {error}"),
         })?;
+        let physical =
+            variant_layout
+                .physical_schema(&schema)
+                .map_err(|error| ScribeError::Internal {
+                    detail: format!("derive the claim's physical Variant schema: {error}"),
+                })?;
         let mut merge = Self {
             schema,
+            variant_layout,
+            physical,
+            converted_rows: 0,
             tenant,
             converter,
             key_columns,
             cursors: Vec::with_capacity(runs.len()),
             batch_rows,
+            memory: memory.clone(),
         };
         for run in runs {
             if let Some(cursor) = merge.open_cursor(run)? {
@@ -143,22 +196,41 @@ impl StagedRunMerge {
         Ok(merge)
     }
 
+    /// Returns the logical schema the claim's objects are sealed under.
+    #[must_use]
+    pub fn logical_schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    /// Returns how many decoded rows were converted from another Variant layout.
+    ///
+    /// Rows of runs already in the selected layout are never counted, so a
+    /// claim whose runs all match converts none.
+    #[must_use]
+    pub const fn converted_rows(&self) -> usize {
+        self.converted_rows
+    }
+
     /// Returns the next globally ordered batch, or `None` when every run is drained.
     ///
-    /// A batch ends at `batch_rows`, or earlier when a run must decode its next
+    /// A batch ends at `batch_rows` or once its rows' estimated bytes reach
+    /// [`MERGE_BATCH_BYTES`], or earlier when a run must decode its next
     /// batch: the emitted batch is built by interleaving the cursors' current
     /// batches, so a refill would invalidate the rows already chosen from the
     /// batch it replaces. Ending early is therefore a bounded-memory property,
     /// not a partial result — the caller simply receives more, smaller batches.
+    /// The caller charges the emitted batch while it holds it.
     ///
     /// # Errors
     ///
     /// Returns [`ScribeError::Internal`] when a run cannot be decoded, its
     /// schema changes mid-run, its sort key cannot be encoded, or the merged
-    /// rows cannot be interleaved into an output batch.
+    /// rows cannot be interleaved into an output batch, and
+    /// [`ScribeError::IngestBusy`] when a refill's workspace cannot be reserved.
     pub fn next_batch(&mut self) -> Result<Option<RecordBatch>, ScribeError> {
         let mut picks: Vec<(usize, usize)> = Vec::with_capacity(self.batch_rows);
-        while picks.len() < self.batch_rows {
+        let mut picked_bytes = 0_usize;
+        while picks.len() < self.batch_rows && picked_bytes < MERGE_BATCH_BYTES {
             if let Some(cursor) = self.cursor_needing_refill() {
                 if !picks.is_empty() {
                     break;
@@ -171,6 +243,7 @@ impl StagedRunMerge {
             };
             let row = self.cursors[cursor].index;
             picks.push((cursor, row));
+            picked_bytes = picked_bytes.saturating_add(self.cursors[cursor].row_bytes);
             self.cursors[cursor].index += 1;
         }
         if picks.is_empty() {
@@ -221,43 +294,77 @@ impl StagedRunMerge {
 
     /// Decodes one cursor's next batch, marking the run drained when it ends.
     ///
+    /// The spent batch is released first, then the workspace is reserved,
+    /// then the new batch is decoded and the reservation settled to what the
+    /// cursor holds; a drained run holds nothing.
+    ///
     /// # Errors
     ///
     /// Returns [`ScribeError::Internal`] when the run cannot be decoded, its
-    /// schema changes mid-run, or its sort key cannot be encoded.
+    /// schema changes mid-run, or its sort key cannot be encoded, and
+    /// [`ScribeError::IngestBusy`] when the workspace cannot be reserved.
     fn refill(&mut self, cursor: usize) -> Result<(), ScribeError> {
+        let converts = self.cursors[cursor].converts;
+        let workspace = self.cursors[cursor].workspace;
+        self.cursors[cursor].batch = RecordBatch::new_empty(Arc::clone(&self.physical));
+        self.cursors[cursor].rows = self.converter.empty_rows(0, 0);
+        self.cursors[cursor].lease.resize_maintenance(workspace)?;
         let Some(batch) = decode_next(&mut self.cursors[cursor].reader)? else {
             self.cursors[cursor].drained = true;
-            return Ok(());
+            return self.cursors[cursor].lease.resize_maintenance(0);
         };
-        let batch = self.logical(batch)?;
-        if !self.is_claim_schema(batch.schema_ref()) {
-            return Err(ScribeError::Internal {
-                detail: "staged run changed schema between batches".to_owned(),
-            });
-        }
+        let batch = self.physical_batch(batch, converts)?;
         let rows = self.encode_keys(&batch)?;
+        self.cursors[cursor]
+            .lease
+            .resize_maintenance(held_bytes(&batch, &rows))?;
         self.cursors[cursor].batch = batch;
         self.cursors[cursor].rows = rows;
         self.cursors[cursor].index = 0;
         Ok(())
     }
 
-    /// Reconstructs a decoded batch's shredded Variant columns to the claim's logical schema.
+    /// Returns a decoded batch in the claim's selected physical layout.
     ///
-    /// A batch already in the claim's schema is returned as is.
+    /// A batch of a matching run keeps its columns and takes the physical
+    /// schema, which refuses any column whose type differs. A batch of a
+    /// converting run is reconstructed to the logical schema, which must be
+    /// the claim's, and shredded with the selected layout.
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::Internal`] when a column cannot be reconstructed
-    /// to its logical type.
-    fn logical(&self, batch: RecordBatch) -> Result<RecordBatch, ScribeError> {
-        if self.is_claim_schema(batch.schema_ref()) {
-            return Ok(batch);
+    /// Returns [`ScribeError::Internal`] when a matching batch's columns are
+    /// not the physical types, a converted batch is not the claim's logical
+    /// schema, or a column cannot be reconstructed or shredded.
+    fn physical_batch(
+        &mut self,
+        batch: RecordBatch,
+        converts: bool,
+    ) -> Result<RecordBatch, ScribeError> {
+        let changed = |detail: String| ScribeError::Internal {
+            detail: format!("staged run batch does not hold the claim's schema: {detail}"),
+        };
+        if !converts {
+            return RecordBatch::try_new(Arc::clone(&self.physical), batch.columns().to_vec())
+                .map_err(|error| changed(error.to_string()));
         }
-        crate::schema::logical_batch(&batch, &self.schema).map_err(|detail| ScribeError::Internal {
-            detail: format!("reconstruct a shredded staged run: {detail}"),
-        })
+        let logical = crate::schema::logical_batch(&batch, &self.schema).map_err(|detail| {
+            ScribeError::Internal {
+                detail: format!("reconstruct a shredded staged run: {detail}"),
+            }
+        })?;
+        if !self.is_claim_schema(logical.schema_ref()) {
+            return Err(changed(field_names(logical.schema_ref())));
+        }
+        let shredded =
+            self.variant_layout
+                .shred(&logical)
+                .map_err(|error| ScribeError::Internal {
+                    detail: format!("shred a staged run to the claim's Variant layout: {error}"),
+                })?;
+        self.converted_rows = self.converted_rows.saturating_add(batch.num_rows());
+        RecordBatch::try_new(Arc::clone(&self.physical), shredded.columns().to_vec())
+            .map_err(|error| changed(error.to_string()))
     }
 
     /// Proves a run whose physical schema differs was sealed for this claim's logical schema and tenant.
@@ -334,8 +441,21 @@ impl StagedRunMerge {
         if !self.is_claim_schema(builder.schema()) {
             self.verify_layout_footer(run, builder.metadata().file_metadata())?;
         }
+        let converts = !builder
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.data_type())
+            .eq(self.physical.fields().iter().map(|field| field.data_type()));
+        let (batch_rows, row_bytes) = shaped_batch_rows(builder.metadata(), None, self.batch_rows);
+        let workspace = batch_rows
+            .saturating_mul(row_bytes)
+            .saturating_mul(if converts { 3 } else { 1 });
+        let mut lease = self
+            .memory
+            .try_reserve_maintenance(MemoryCategory::Persistence, workspace)?;
         let mut reader = builder
-            .with_batch_size(self.batch_rows)
+            .with_batch_size(batch_rows)
             .build()
             .map_err(|error| ScribeError::Internal {
                 detail: format!("start the staged run merge read: {error}"),
@@ -343,24 +463,19 @@ impl StagedRunMerge {
         let Some(batch) = decode_next(&mut reader)? else {
             return Ok(None);
         };
-        let batch = self.logical(batch)?;
-        if !self.is_claim_schema(batch.schema_ref()) {
-            return Err(ScribeError::Internal {
-                detail: format!(
-                    "staged run `{}` was encoded under a different physical schema: run [{}], claim [{}]",
-                    run.display(),
-                    field_names(batch.schema_ref()),
-                    field_names(&self.schema)
-                ),
-            });
-        }
+        let batch = self.physical_batch(batch, converts)?;
         let rows = self.encode_keys(&batch)?;
+        lease.resize_maintenance(held_bytes(&batch, &rows))?;
         Ok(Some(RunCursor {
             reader,
             batch,
             rows,
             index: 0,
             drained: false,
+            converts,
+            row_bytes,
+            workspace,
+            lease,
         }))
     }
 
@@ -420,6 +535,77 @@ fn column_index(schema: &SchemaRef, column: &str) -> Result<usize, ScribeError> 
     schema.index_of(column).map_err(|_| ScribeError::Internal {
         detail: format!("staged merge sort column `{column}` is not in the claim schema"),
     })
+}
+
+/// Returns the rows one decoded batch of a run may carry and its estimated row width.
+///
+/// The width is the widest row group's decoded bytes per row, over the
+/// projected `roots` when given, rounded up and never zero. A leaf's decoded
+/// bytes are its byte-array payload as the footer's size statistics record
+/// it before any encoding, plus its values' fixed width — an offset for byte
+/// arrays — and never less than its encoded pages, since dictionary encoding
+/// can shrink a repeated payload to almost nothing. Rows follow from
+/// [`MERGE_BATCH_BYTES`] over that width, between one and `max_rows` or the
+/// run's own row count when it is smaller, so the
+/// shape is a pure function of the run's footer and a retry decodes the same
+/// batches.
+pub(crate) fn shaped_batch_rows(
+    metadata: &ParquetMetaData,
+    roots: Option<&[usize]>,
+    max_rows: usize,
+) -> (usize, usize) {
+    let schema = metadata.file_metadata().schema_descr();
+    let row_bytes = metadata
+        .row_groups()
+        .iter()
+        .filter(|group| group.num_rows() > 0)
+        .map(|group| {
+            let bytes = group
+                .columns()
+                .iter()
+                .enumerate()
+                .filter(|(leaf, _)| {
+                    roots.is_none_or(|roots| roots.contains(&schema.get_column_root_idx(*leaf)))
+                })
+                .map(|(_, column)| {
+                    let width = match column.column_type() {
+                        PhysicalType::BOOLEAN => 1,
+                        PhysicalType::INT32 | PhysicalType::FLOAT | PhysicalType::BYTE_ARRAY => 4,
+                        PhysicalType::INT64 | PhysicalType::DOUBLE => 8,
+                        PhysicalType::INT96 => 12,
+                        PhysicalType::FIXED_LEN_BYTE_ARRAY => {
+                            u64::try_from(column.column_descr().type_length()).unwrap_or(0)
+                        }
+                    };
+                    let values = u64::try_from(column.num_values()).unwrap_or(0);
+                    let payload = column
+                        .unencoded_byte_array_data_bytes()
+                        .and_then(|bytes| u64::try_from(bytes).ok())
+                        .unwrap_or(0);
+                    let encoded = u64::try_from(column.uncompressed_size()).unwrap_or(0);
+                    values
+                        .saturating_mul(width)
+                        .saturating_add(payload)
+                        .max(encoded)
+                })
+                .fold(0_u64, u64::saturating_add);
+            let rows = u64::try_from(group.num_rows()).unwrap_or(1);
+            usize::try_from(bytes.div_ceil(rows)).unwrap_or(usize::MAX)
+        })
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    let run_rows = usize::try_from(metadata.file_metadata().num_rows()).unwrap_or(usize::MAX);
+    let max_rows = max_rows.min(run_rows).max(1);
+    (
+        (MERGE_BATCH_BYTES / row_bytes).clamp(1, max_rows),
+        row_bytes,
+    )
+}
+
+/// Bytes one cursor holds for a decoded batch and its sort-key rows.
+fn held_bytes(batch: &RecordBatch, rows: &Rows) -> usize {
+    crate::scribe::memory::retained_arrow_bytes(batch).saturating_add(rows.size())
 }
 
 /// Decodes one run's next batch, skipping empty batches.
@@ -584,9 +770,11 @@ mod tests {
         let mut merge = StagedRunMerge::open(
             &runs,
             Arc::clone(&schema),
+            VariantLayout::default(),
             DataTenantId::new_v7(),
             &layout,
             2,
+            &ScribeResources::for_test(),
         )
         .expect("merge opens");
         let merged = drain(&mut merge);
@@ -609,9 +797,11 @@ mod tests {
         let mut replay = StagedRunMerge::open(
             &runs,
             Arc::clone(&schema),
+            VariantLayout::default(),
             DataTenantId::new_v7(),
             &layout,
             3,
+            &ScribeResources::for_test(),
         )
         .expect("merge reopens");
         assert_eq!(
@@ -640,8 +830,16 @@ mod tests {
         foreign_fields.push(Arc::new(Field::new("later_column", DataType::Int32, true)));
         let foreign = Arc::new(Schema::new(foreign_fields));
 
-        let refusal = StagedRunMerge::open(&[run], foreign, DataTenantId::new_v7(), &layout, 8)
-            .expect_err("a foreign schema is refused");
+        let refusal = StagedRunMerge::open(
+            &[run],
+            foreign,
+            VariantLayout::default(),
+            DataTenantId::new_v7(),
+            &layout,
+            8,
+            &ScribeResources::for_test(),
+        )
+        .expect_err("a foreign schema is refused");
         assert!(
             refusal.to_string().contains("physical schema"),
             "refusal names the schema disagreement: {refusal}"

@@ -55,8 +55,8 @@ impl PromptSpec {
     }
 }
 
-/// Compiles an authored Prompt, resolving a named `response_format` as the
-/// Wyrd-owned `verdict` format.
+/// Compiles an authored Prompt, resolving a named `response_format` as one
+/// of the Wyrd-owned `verdict` or `code_review` formats.
 ///
 /// Every Card decode path compiles Prompts through here, so a stored Prompt
 /// never runs with an unresolved name.
@@ -67,7 +67,7 @@ impl PromptSpec {
 pub fn compile_prompt(
     authored: &skald_spec::AuthoredPrompt,
 ) -> Result<skald_spec::Prompt, skald_spec::SkaldError> {
-    authored.compile_with(crate::verification::execution::Verdict::response_format)
+    authored.compile_with(crate::verification::report::resolve_response_format)
 }
 
 impl<'de> Deserialize<'de> for PromptSpec {

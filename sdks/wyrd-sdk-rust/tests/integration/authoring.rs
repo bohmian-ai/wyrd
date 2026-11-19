@@ -24,7 +24,9 @@ use wyrd_ai::verify::{
     CodeSource, Component, Data, Experiment, InputSlot, Inputs, LocalArtifact, Mcp, Model,
     OpenAiChatOptions, Operator, Requirement, Service, Step, Trigger, Verifier, openai_chat,
 };
-use wyrd_ai::{Locator, RequirementOutcome, StepStatus, VerificationResult, VerificationVerdict};
+use wyrd_ai::{
+    Locator, RequirementOutcome, StepResult, StepStatus, VerificationResult, VerificationVerdict,
+};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::registry::DeclarationOutcomeKind;
 use wyrd_testing::server::WyrdTestServer;
@@ -484,29 +486,34 @@ fn outcome(result: &VerificationResult, id: &str) -> RequirementOutcome {
 }
 
 /// Assert `result` judged the component `alias` by `verifier` and executed
-/// exactly the steps `steps`, in any stage order.
+/// exactly the steps `steps`, in any stage order, and return the executed
+/// steps read from its explicitly requested details.
 ///
 /// # Panics
-/// Panics when the subject, Verifier, or executed steps differ, or `alias`
-/// is not a component of `state`.
-fn assert_attributed(
+/// Panics when the subject, Verifier, or executed steps differ, the details
+/// do not read, or `alias` is not a component of `state`.
+async fn assert_attributed(
+    deployment: &Deployment,
     result: &VerificationResult,
     state: &WyrdState,
     alias: &str,
     verifier: &str,
     steps: &[&str],
-) {
+) -> Vec<StepResult> {
     let subject = state.card_ref(alias).expect("component alias resolves");
     assert_eq!(&result.subject.name, &subject.name, "{result:#?}");
     assert_eq!(&result.subject.version, &subject.version, "{result:#?}");
     assert_eq!(result.verifier.name.as_str(), verifier, "{result:#?}");
-    let executed: std::collections::BTreeSet<&str> = result
-        .outcome
-        .steps
-        .iter()
-        .map(|step| step.id.as_str())
-        .collect();
-    assert_eq!(executed, steps.iter().copied().collect(), "{result:#?}");
+    let executed = deployment.details(result.execution_id).await.outcome.steps;
+    assert_eq!(
+        executed
+            .iter()
+            .map(|step| step.id.as_str())
+            .collect::<std::collections::BTreeSet<_>>(),
+        steps.iter().copied().collect(),
+        "{executed:#?}"
+    );
+    executed
 }
 
 /// The authored two-component Service declares through `WyrdState` and
@@ -532,28 +539,30 @@ async fn multi_component_service_verifies_each_subject() {
         report.expect("report-policy runs"),
         access.expect("release-access runs"),
     );
-    assert_attributed(
+    let report_steps = assert_attributed(
+        &story_server.deployment,
         &report,
         &state,
         "report-reviewer",
         "report-policy",
         &["policy", "policy-context"],
-    );
-    assert_attributed(
+    )
+    .await;
+    let access_steps = assert_attributed(
+        &story_server.deployment,
         &access,
         &state,
         "release-controls",
         "release-access",
         &["recipient", "destination"],
-    );
+    )
+    .await;
     assert!(
-        report
-            .outcome
-            .steps
+        report_steps
             .iter()
-            .chain(&access.outcome.steps)
+            .chain(&access_steps)
             .all(|step| step.status == StepStatus::Succeeded),
-        "{report:#?} {access:#?}"
+        "{report_steps:#?} {access_steps:#?}"
     );
     assert!(releases(&report, &access), "{report:#?} {access:#?}");
     assert_eq!(
@@ -1233,16 +1242,16 @@ async fn dependent_steps_consume_prior_outputs() {
     ] {
         let (_, access) = verify_both(&state, &request).await;
         let access = access.expect("release-access runs");
-        assert_attributed(
+        let steps = assert_attributed(
+            &story_server.deployment,
             &access,
             &state,
             "release-controls",
             "release-access",
             &["recipient", "destination", "summary"],
-        );
-        let summary = access
-            .outcome
-            .steps
+        )
+        .await;
+        let summary = steps
             .iter()
             .find(|step| step.id.as_str() == "summary")
             .expect("summary ran");

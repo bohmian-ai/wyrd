@@ -134,6 +134,11 @@ id_type!(
     validate_group_id
 );
 id_type!(SplitName, "DataCard split label.", validate_card_token);
+id_type!(
+    RepositoryId,
+    "Stable provider repository id: a positive decimal integer, as a string, that survives repository renames and transfers.",
+    validate_positive_decimal
+);
 id_type!(QueryName, "DataCard SQL query key.", validate_card_token);
 id_type!(
     TenantSlug,
@@ -375,6 +380,27 @@ uuid7_id_type!(
 );
 
 uuid7_id_type!(
+    /// Identity of one piece of published deferred evidence.
+    ///
+    /// Named by its source repository, commit, input name, and content, so
+    /// publishing the same content again for the same source answers the
+    /// same id, and every subscriber that accepted it holds the same id.
+    EvidenceId
+);
+
+uuid7_id_type!(
+    /// Server-issued identity of one approval occurrence.
+    ///
+    /// Derived from the execution and the approval step's logical
+    /// occurrence (step, fanout item, repeat iteration), so every attempt
+    /// and recovery of the same execution reaching the same occurrence names
+    /// the same approval, a fanout item or repeat iteration names another,
+    /// and another execution, such as a newer pull request head, never
+    /// shares one.
+    ApprovalId
+);
+
+uuid7_id_type!(
     /// Durable identity of one Operator dispatch in `wyrd.operator_dispatches`.
     ///
     /// Settlement of a failed binding-created run mints one per distinct
@@ -421,6 +447,23 @@ fn validate_token_with_min(value: &str, min_len: usize) -> Result<(), IdError> {
         Ok(())
     } else {
         Err(IdError::InvalidToken)
+    }
+}
+
+/// Accepts a positive decimal integer of at most 20 digits without a sign or
+/// leading zero.
+///
+/// # Errors
+///
+/// Returns [`IdError::InvalidPositiveDecimal`] for any other value.
+fn validate_positive_decimal(value: &str) -> Result<(), IdError> {
+    if (1..=20).contains(&value.len())
+        && !value.starts_with('0')
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        Ok(())
+    } else {
+        Err(IdError::InvalidPositiveDecimal)
     }
 }
 
@@ -530,6 +573,9 @@ pub enum IdError {
     /// a control character.
     #[error("group_id must be 1..=256 UTF-8 bytes without whitespace or control characters")]
     InvalidGroupId,
+    /// Provider repository id was not a positive decimal integer.
+    #[error("repository_id must be a positive decimal integer string without a leading zero")]
+    InvalidPositiveDecimal,
 }
 
 #[cfg(test)]

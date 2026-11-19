@@ -1,0 +1,9 @@
+apiVersion: wyrd/v1
+kind: Repository
+metadata:
+  name: web
+spec:
+  repository_id: "4242"  # your repository's numeric GitHub id
+  verified_by:
+    - verifier: ./verifier.yaml
+      runs_on: {kind: pull_request}

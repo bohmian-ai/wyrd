@@ -81,7 +81,7 @@ fn encode_query_frame(
 }
 
 /// One public query's server timing, recorded once through
-/// [`wyrd_telemetry::record_timing`] at boundary `bifrost.query` when
+/// [`wyrd_benchmark::record_timing`] at boundary `bifrost.query` when
 /// dropped: from its HTTP arrival through the handoff of its terminal frame
 /// to the response body, or through its refusal.
 ///
@@ -103,7 +103,7 @@ impl QueryTiming {
     /// current span; without benchmark timing it holds neither, so it
     /// records nothing.
     fn new(arrival: Option<RequestArrival>) -> Self {
-        let enabled = wyrd_telemetry::timing::enabled();
+        let enabled = wyrd_benchmark::enabled();
         Self {
             parent: if enabled {
                 tracing::Span::current()
@@ -136,7 +136,7 @@ impl Drop for QueryTiming {
     /// Records the timing with the outcome observed so far.
     fn drop(&mut self) {
         if let Some(arrival) = self.arrival {
-            wyrd_telemetry::record_timing(
+            wyrd_benchmark::record_timing(
                 &self.parent,
                 "bifrost.query",
                 self.outcome,
@@ -1034,7 +1034,7 @@ mod tests {
         tracing::subscriber::with_default(tracing_subscriber::registry(), || {
             let span = tracing::info_span!("request");
             let _entered = span.enter();
-            assert!(!wyrd_telemetry::timing::enabled());
+            assert!(!wyrd_benchmark::enabled());
             let timing = QueryTiming::new(Some(RequestArrival(std::time::Instant::now())));
             assert!(timing.parent.is_none(), "no span is cloned");
             assert_eq!(timing.arrival, None, "no arrival is kept");
@@ -1050,9 +1050,9 @@ mod tests {
     /// Panics when an outcome, count, or elapsed bound is wrong.
     #[tokio::test]
     async fn histograms_cover_arrival_through_terminal_handoff() {
-        use wyrd_telemetry::timing;
+        use wyrd_benchmark as timing;
 
-        timing::enable();
+        timing::install().expect("the benchmark recorder installs");
         let before = timing::snapshot();
         let arrived = || QueryTiming {
             parent: tracing::Span::none(),

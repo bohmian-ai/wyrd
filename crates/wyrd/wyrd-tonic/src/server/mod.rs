@@ -225,7 +225,7 @@ where
 /// trace stages its tenant span copies on the serving server's
 /// `tenant_spans` sink. A benchmark server attaches its declared benchmark
 /// metadata to the span as it opens
-/// ([`wyrd_telemetry::timing::label_request`]); it selects a timing series
+/// ([`wyrd_benchmark::label_request`]); it selects a timing series
 /// only and carries no authority.
 fn request_span(
     request: &HttpRequest<()>,
@@ -249,7 +249,7 @@ fn request_span(
         wyrd_telemetry::inbound_context(request.headers()).as_ref(),
         tenant_spans,
     );
-    wyrd_telemetry::timing::label_request(&span, request.headers());
+    wyrd_benchmark::label_request(&span, request.headers());
     span
 }
 

@@ -36,6 +36,13 @@ impl RequestId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Take the inner identifier string, so an owner projecting it moves it
+    /// rather than copying it.
+    #[must_use]
+    pub fn into_inner(self) -> String {
+        self.0
+    }
 }
 
 fn is_uuid7(value: &str) -> bool {

@@ -327,6 +327,8 @@ pub enum BindingActivation {
     },
     /// A `group_end` Trigger's pinned duration and exact source bindings.
     GroupEnd(GroupEndSettings),
+    /// A `pull_request` Trigger on a Repository; it has no cursor.
+    PullRequest,
 }
 
 impl BindingActivation {
@@ -342,6 +344,7 @@ impl BindingActivation {
         match self {
             Self::Schedule { cron, tz } => ("schedule", Some(cron.as_str()), tz.as_deref(), None),
             Self::GroupEnd(settings) => ("group_end", None, None, Some(Json(settings))),
+            Self::PullRequest => ("pull_request", None, None, None),
         }
     }
 }

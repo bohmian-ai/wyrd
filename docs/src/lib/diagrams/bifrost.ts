@@ -75,11 +75,12 @@ const PART_NAME: Record<Part, string> = {
 
 /** Every `WYRD_TARGET` value and the Bifrost parts it runs. */
 export const TARGETS: { id: string; sub: string; parts: Part[]; api: boolean; peer?: boolean }[] = [
-  { id: 'all', sub: 'everything · default', parts: ['gate', 'scribe', 'oracle', 'leader', 'worker'], api: true },
-  { id: 'server', sub: 'API + Forge leader', parts: ['gate', 'scribe', 'oracle', 'leader'], api: true },
-  { id: 'scribe', sub: 'writes · peer mode', parts: ['gate', 'scribe'], api: true, peer: true },
-  { id: 'oracle', sub: 'queries · peer mode', parts: ['gate', 'oracle'], api: true, peer: true },
-  { id: 'forge-worker', sub: 'compaction · no API', parts: ['worker'], api: false }
+  { id: 'combined', sub: 'everything · default', parts: ['gate', 'scribe', 'oracle', 'leader', 'worker'], api: true },
+  { id: 'direct', sub: 'direct verify', parts: ['gate', 'scribe', 'oracle'], api: true, peer: true },
+  { id: 'worker', sub: 'queued verify', parts: ['gate', 'scribe', 'oracle'], api: true, peer: true },
+  { id: 'bifrost-ingest', sub: 'writes', parts: ['gate', 'scribe'], api: true, peer: true },
+  { id: 'bifrost-query', sub: 'queries', parts: ['gate', 'oracle'], api: true, peer: true },
+  { id: 'bifrost-maintenance', sub: 'compaction · no API', parts: ['leader', 'worker'], api: false, peer: true }
 ];
 
 const runsOn = (part: Part) =>
@@ -93,7 +94,7 @@ function targetCards(): { nodes: DiagramNode[]; texts: DiagramText[] } {
   TARGETS.forEach((t, i) => {
     const x = 16 + i * 168;
     const y = 36;
-    const w = 156;
+    const w = 160;
     nodes.push({ id: t.id, kind: 'pod', x, y, w, h: 330, title: t.id, sub: t.sub, tags: t.parts });
     PARTS.forEach((p, j) => {
       const on = t.parts.includes(p);
@@ -115,7 +116,7 @@ function targetCards(): { nodes: DiagramNode[]; texts: DiagramText[] } {
       {
         x: x + 12,
         y: y + 310,
-        text: t.peer ? '!  needs peer mTLS' : '·  peers optional',
+        text: t.peer ? '!  peer mTLS' : '·  peers optional',
         anchor: 'start',
         cls: t.peer ? 'yes' : 'no'
       }
@@ -147,8 +148,8 @@ export const bifrostPods: DiagramSpec = {
   views: [
     {
       label: 'Targets',
-      size: [860, 384],
-      rest: 'Every pod is the same <code>wyrd-server</code> binary. <code>WYRD_TARGET</code> picks which parts it runs. The default, <code>all</code>, runs everything, which is what a single-pod install uses. Pick a part to see where it lives.',
+      size: [1032, 384],
+      rest: 'Every pod is the same <code>wyrd-server</code> binary. <code>WYRD_TARGET</code> picks which parts it runs. The default, <code>combined</code>, runs everything, which is what a single-pod install uses. Pick a part to see where it lives.',
       nodes: cards.nodes,
       edges: [],
       texts: cards.texts
@@ -156,32 +157,31 @@ export const bifrostPods: DiagramSpec = {
     {
       label: 'Example team',
       size: [860, 470],
-      rest: 'One way a team splits Bifrost: Scribes on persistent disks for writes, autoscaled Oracles for queries, one <code>server</code> pod holding the Forge leader, and workers sized to the compaction backlog. Pick a part to follow it.',
+      rest: 'One way a team splits Bifrost: ingest pods on persistent disks for writes, autoscaled query pods, a <code>direct</code> pod for verification, and maintenance pods sized to the compaction backlog. One maintenance pod holds the Forge leader at a time. Pick a part to follow it.',
       groups: [
-        { x: 340, y: 14, w: 210, h: 166, label: 'StatefulSet · scribe ×2' },
-        { x: 340, y: 214, w: 210, h: 166, label: 'Deployment + HPA · oracle ×2' },
-        { x: 600, y: 14, w: 244, h: 96, label: 'server ×1' },
-        { x: 600, y: 144, w: 244, h: 236, label: 'Deployment · forge-worker ×3' }
+        { x: 340, y: 14, w: 210, h: 166, label: 'StatefulSet · bifrost-ingest ×2' },
+        { x: 340, y: 214, w: 210, h: 166, label: 'Deployment + HPA · bifrost-query ×2' },
+        { x: 600, y: 14, w: 244, h: 96, label: 'direct ×1' },
+        { x: 600, y: 144, w: 244, h: 236, label: 'Deployment · bifrost-maintenance ×3' }
       ],
       nodes: [
         { id: 'sdk', kind: 'client', x: 16, y: 170, w: 140, h: 58, title: 'SDKs · agents', sub: 'OTLP · MCP' },
         { id: 'lb', kind: 'client', x: 186, y: 170, w: 120, h: 58, title: 'Load balancer', sub: 'yours' },
-        pod('s0', 352, 40, 186, 'scribe-0', ['gate', 'scribe']),
-        pod('s1', 352, 110, 186, 'scribe-1', ['gate', 'scribe']),
-        pod('o0', 352, 240, 186, 'oracle-…', ['gate', 'oracle']),
-        pod('o1', 352, 310, 186, 'oracle-…', ['gate', 'oracle']),
-        pod('srv', 612, 40, 220, 'server-0', ['gate', 'scribe', 'oracle', 'leader']),
-        pod('w0', 612, 170, 220, 'forge-worker-…', ['worker']),
-        pod('w1', 612, 240, 220, 'forge-worker-…', ['worker']),
-        pod('w2', 612, 310, 220, 'forge-worker-…', ['worker']),
+        pod('s0', 352, 40, 186, 'bifrost-ingest-0', ['gate', 'scribe']),
+        pod('s1', 352, 110, 186, 'bifrost-ingest-1', ['gate', 'scribe']),
+        pod('o0', 352, 240, 186, 'bifrost-query-…', ['gate', 'oracle']),
+        pod('o1', 352, 310, 186, 'bifrost-query-…', ['gate', 'oracle']),
+        pod('srv', 612, 40, 220, 'direct-…', ['gate', 'scribe', 'oracle']),
+        pod('w0', 612, 170, 220, 'bifrost-maintenance-…', ['leader', 'worker']),
+        pod('w1', 612, 240, 220, 'bifrost-maintenance-…', ['worker']),
+        pod('w2', 612, 310, 220, 'bifrost-maintenance-…', ['worker']),
         { id: 'obj', kind: 'store', x: 352, y: 400, w: 220, h: 58, title: 'Object storage', sub: 'Iceberg · Parquet' },
         { id: 'pg', kind: 'store', x: 612, y: 400, w: 220, h: 58, title: 'Postgres', sub: 'catalog · Forge election' }
       ],
       edges: [
         { id: 'in', kind: 'data', pts: [[156, 199], [186, 199]] },
         { id: 'w', kind: 'data', pts: [[306, 190], [322, 190], [322, 97], [352, 97]], label: 'gRPC writes', lx: 316, ly: 150, anchor: 'end' },
-        { id: 'q', kind: 'control', pts: [[306, 208], [322, 208], [322, 297], [352, 297]], label: 'HTTP queries', lx: 316, ly: 256, anchor: 'end' },
-        { id: 'due', kind: 'control', pts: [[810, 94], [810, 170]], label: 'due tables', lx: 804, ly: 132, anchor: 'end' }
+        { id: 'q', kind: 'control', pts: [[306, 208], [322, 208], [322, 297], [352, 297]], label: 'HTTP queries', lx: 316, ly: 256, anchor: 'end' }
       ],
       links: [
         {
@@ -239,8 +239,8 @@ export const bifrostPods: DiagramSpec = {
         '<b>Forge leader.</b> Decides maintenance. Exactly one is active per deployment, elected through Postgres; it tracks which tables are due for compaction and retention and hands them to workers.',
       rows: [
         ['Runs on', runsOn('leader')],
-        ['Scale it when', 'Never. Run it on one or two pods (<code>all</code> or <code>server</code>); extra copies wait as standbys.'],
-        ['Needs', 'Postgres for the election. It does no rewriting itself on a <code>server</code> pod.'],
+        ['Scale it when', 'Never. Every <code>combined</code> and <code>bifrost-maintenance</code> pod runs one; one leads and the rest wait as standbys.'],
+        ['Needs', 'Postgres for the election. A split deployment runs at least one <code>bifrost-maintenance</code> pod.'],
         ['Watch', '<code>bifrost_forge_leader_decision_seconds</code>']
       ]
     },
@@ -251,7 +251,7 @@ export const bifrostPods: DiagramSpec = {
         '<b>Forge worker.</b> Does the rewriting. Pulls due tables from the leader, compacts small files into larger ones, applies retention, and commits new Iceberg snapshots.',
       rows: [
         ['Runs on', runsOn('worker')],
-        ['Scale it when', 'Compaction backlog: when tables stay due, add <code>forge-worker</code> pods.'],
+        ['Scale it when', 'Compaction backlog: when tables stay due, add <code>bifrost-maintenance</code> pods.'],
         ['Needs', 'Object storage and Postgres. It opens no public API, so nothing routes client traffic to it.'],
         ['Watch', 'Iceberg snapshot count per table']
       ]

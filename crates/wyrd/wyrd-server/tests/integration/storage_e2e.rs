@@ -19,13 +19,13 @@ use wyrd_client::storage::WyrdStorageClient;
 use wyrd_client::transport::HttpTransport;
 use wyrd_client::transport::config::HttpConfig;
 use wyrd_client::transport::credential::ResolvedCredential;
-use wyrd_server::config::BifrostTarget;
+use wyrd_server::config::ServerTarget;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::registry::{CardUploadEntry, DeclareCardResponse};
 use wyrd_spec::storage::{
-    DownloadInitRequest, DownloadInitResponse, DownloadPlan, StorageBackendKind, UploadInitRequest,
+    DownloadInitRequest, DownloadInitResponse, StorageBackendKind, UploadInitRequest,
     UploadInitResponse, UploadPlan,
 };
 use wyrd_spec::verification::execution::{EvidenceFile, EvidencePlanRequest, EvidencePlanResponse};
@@ -154,7 +154,7 @@ async fn register_card(
 /// Starts a bound artifact-storage server over `settings`.
 ///
 /// Storage journeys exercise artifact upload and download only, so the server
-/// runs the API `Server` target without an embedded Forge worker: a worker
+/// runs the `direct` target, which composes no Forge worker: a worker
 /// refuses staging backends lacking native `start_after` listing (Azure), which
 /// is Forge behavior these journeys do not cover.
 ///
@@ -163,7 +163,7 @@ async fn register_card(
 /// Panics when the server fails to start or become ready.
 async fn server_from_settings(settings: StorageSettings) -> WyrdTestServer {
     WyrdTestServer::builder()
-        .with_bifrost_target_for_test(BifrostTarget::Server)
+        .with_bifrost_target_for_test(ServerTarget::Direct)
         .with_storage_settings(settings)
         .start_bound()
         .await
@@ -354,18 +354,7 @@ async fn run_client_server_journey(
         )
         .await
         .expect("download init succeeds");
-    let plan = if relative_path.starts_with("local/") {
-        let base_url = srv.base_url().expect("bound server exposes base URL");
-        DownloadPlan {
-            get_url: format!(
-                "{base_url}/v1/cards/download/local?path={}",
-                wyrd_storage::tenant_path::build(tenant, card_uid.as_str(), relative_path)
-            ),
-            ttl_secs: 0,
-        }
-    } else {
-        download.plan
-    };
+    let plan = download.plan;
     // The download outcome is held rather than asserted so a transfer failure
     // still reaches the cleanup below; a panic here would strand the uploaded
     // artifact in a durable cloud bucket.

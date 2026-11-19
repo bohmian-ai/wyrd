@@ -201,6 +201,9 @@ impl ReferenceSlotVisitor {
             Spec::Agent(agent) => agent.visit(&mut f),
             Spec::Verifier(verifier) => verifier.visit(&mut f),
             Spec::Service(service) => service.visit(&mut f),
+            Spec::Repository(repository) => {
+                visit_verified_by(&mut repository.verified_by, "spec.verified_by", &mut f);
+            }
             Spec::Mcp(mcp) => mcp.visit(&mut f),
             Spec::Audit(audit) => audit.visit(&mut f),
             Spec::Artifact(artifact) => artifact.visit(&mut f),
@@ -343,7 +346,7 @@ impl Visit for VerifierSpec {
         for (i, step) in self.steps.iter_mut().enumerate() {
             let prefix = format!("spec.steps[{i}].action");
             match &mut step.action {
-                Action::Extract { .. } => {}
+                Action::Extract { .. } | Action::Approval { .. } => {}
                 Action::Agent(call) => visit_agent_call(call, &prefix, f),
                 Action::Code(call) => visit_code_call(call, &prefix, f),
             }
@@ -728,6 +731,8 @@ mod completeness_tests {
     fn agent_verifier() -> VerifierSpec {
         VerifierSpec {
             description: None,
+            limits: None,
+            queue_only: false,
             inputs: BTreeMap::new(),
             steps: Vec::new(),
             requirements: vec![Requirement {

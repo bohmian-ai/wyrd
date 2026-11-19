@@ -387,7 +387,7 @@ fn openai_chat_response_format(
             json_schema: skald_spec::wire::openai_chat::OpenAiJsonSchema {
                 name: name.clone(),
                 description: None,
-                schema: Some(schema_object(schema)?),
+                schema: Some(schema_object(schema)?.into()),
                 strict: Some(true),
             },
         },
@@ -413,7 +413,7 @@ fn openai_responses_text(
                 OpenAiTextResponseFormat::JsonSchema {
                     name: name.clone(),
                     description: None,
-                    schema: Some(schema_object(schema)?),
+                    schema: Some(schema_object(schema)?.into()),
                     strict: Some(true),
                 }
             }
@@ -442,7 +442,7 @@ fn anthropic_output_config(
             schema_object(schema)?;
             Some(AnthropicOutputConfig {
                 format: AnthropicOutputFormat::JsonSchema {
-                    schema: schema.clone(),
+                    schema: schema.clone().into(),
                 },
             })
         }
@@ -478,7 +478,7 @@ fn google_settings(
                 config.response_mime_type = Some("application/json".to_owned());
                 // Google refuses a config carrying both schema fields.
                 config.response_schema = None;
-                config.response_json_schema = Some(schema.clone());
+                config.response_json_schema = Some(schema.clone().into());
             }
         }
     }
@@ -578,6 +578,47 @@ mod builder_tests {
         assert!(refused.to_string().contains("2020-12"), "{refused}");
     }
 
+    /// `ResponseFormat::code_review` authors the named `code_review` format,
+    /// whose fixed report schema resolves into the native request.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the format does not build, keep its name, or resolve to
+    /// the report schema.
+    #[test]
+    fn code_review_format_resolves_to_the_report_schema() {
+        let prompt = openai_chat(
+            "gpt-4o",
+            OpenAiChatOptions {
+                messages: vec!["Review {{diff}}".into()],
+                response_format: Some(ResponseFormat::code_review()),
+                ..Default::default()
+            },
+        )
+        .expect("code_review builds");
+        assert_eq!(
+            serde_json::to_value(
+                &prompt
+                    .native()
+                    .authored()
+                    .expect("authored")
+                    .response_format
+            )
+            .expect("serializes"),
+            json!("code_review")
+        );
+        let ProviderRequest::OpenAiChatCompletion(request) = &prompt.native().request else {
+            panic!("an OpenAI Chat request");
+        };
+        let Some(OpenAiResponseFormat::JsonSchema { json_schema }) = &request.response_format
+        else {
+            panic!("the report schema is native: {:?}", request.response_format);
+        };
+        let schema = json_schema.schema.as_ref().expect("a schema");
+        assert!(schema["properties"].get("summary").is_some(), "{schema:?}");
+        assert!(schema["properties"].get("findings").is_some(), "{schema:?}");
+    }
+
     #[test]
     fn openai_chat_emits_native_variant_and_response_format() {
         let schema = json!({
@@ -604,7 +645,7 @@ mod builder_tests {
             prompt.native().response_type,
             ResponseType::JsonSchema {
                 name: "answer".to_owned(),
-                schema
+                schema: schema.into()
             }
         );
         let ProviderRequest::OpenAiChatCompletion(request) = &prompt.native().request else {
@@ -766,7 +807,7 @@ mod builder_tests {
             prompt.native().response_type,
             ResponseType::JsonSchema {
                 name: "summary".to_owned(),
-                schema: output_schema
+                schema: output_schema.into()
             }
         );
         let ProviderRequest::OpenAiChatCompletion(request) = &prompt.native().request else {
@@ -880,7 +921,7 @@ mod builder_tests {
                 generation_config: Some(
                     skald_spec::wire::google_generate::GoogleGenerationConfig {
                         temperature: Some(0.5),
-                        response_schema: Some(json!({"type": "STRING"})),
+                        response_schema: Some(json!({"type": "STRING"}).into()),
                         ..Default::default()
                     },
                 ),

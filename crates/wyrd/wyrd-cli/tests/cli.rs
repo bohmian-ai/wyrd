@@ -5,6 +5,9 @@ mod card_lifecycle;
 mod cli_login_journey;
 #[path = "gateway_server_journey.rs"]
 mod gateway_server_journey;
+/// Tenant GitHub connection through `wyrd github`, following the guide.
+#[path = "github_journey.rs"]
+mod github_journey;
 #[path = "loader.rs"]
 mod loader;
 /// `wyrd mcp proxy` and `wyrd mcp install` journeys.

@@ -1,8 +1,8 @@
 //! Cross-backend `StorageHandle` data-plane CRUD suite.
 //!
 //! [`run_handle_crud`] is the single body exercised against every backend
-//! through the public [`StorageHandle`] surface (`put_object` / `get_object` /
-//! `get_object_bounded` / `list_objects` / `delete_object`). It is the server-side direct-CRUD path:
+//! through the public [`StorageHandle`] surface (`put_object` / `create_object` /
+//! `get_object` / `get_object_bounded` / `list_objects` / `delete_object`). It is the server-side direct-CRUD path:
 //! an agent request resolves a tenant from its JWT, a tenant-scoped
 //! [`ValidatedPath`] is built, and the handle reads/writes/lists/deletes the
 //! object itself (no client presign round-trip).
@@ -20,7 +20,7 @@ use wyrd_storage::error::StorageError;
 use wyrd_storage::settings;
 use wyrd_storage::{LocalSigner, StorageHandle, ValidatedPath, tenant_path};
 
-/// Write/read/list/delete round-trip plus a missing-key `NotFound`, all through
+/// Write/read/list/delete round-trip and a missing-key `NotFound`, all through
 /// the public [`StorageHandle`] data-plane API.
 ///
 /// Every object lives under a fresh tenant and Card prefix and is deleted before
@@ -121,6 +121,47 @@ async fn run_handle_crud(handle: &StorageHandle) {
         .expect("delete c");
 }
 
+/// A create-only write that refuses an occupied path and leaves it unchanged,
+/// then an idempotent delete, through [`StorageHandle::create_object`].
+///
+/// The GCS emulator ignores `x-goog-if-generation-match`, so GCS runs this only
+/// against real GCS in `test:storage:gcs:cloud`.
+///
+/// # Panics
+/// Panics when a create, get, or delete fails, a create overwrites an existing
+/// object, or deleting the absent object fails. A panic can leave one small
+/// object under a fresh tenant prefix.
+async fn run_create_only(handle: &StorageHandle) {
+    let tenant = DataTenantId::new_v7();
+    let card = uuid::Uuid::now_v7();
+    let cache = tenant_path::code_review(tenant, &format!("crud/{card}/snapshot"))
+        .expect("code-review path");
+    assert!(
+        handle
+            .create_object(&cache, b"first".to_vec())
+            .await
+            .expect("create"),
+        "a free path is created"
+    );
+    assert!(
+        !handle
+            .create_object(&cache, b"second".to_vec())
+            .await
+            .expect("create again"),
+        "an occupied path is refused"
+    );
+    assert_eq!(
+        handle.get_object(&cache).await.expect("get created"),
+        b"first",
+        "a refused create leaves the object unchanged"
+    );
+    handle.delete_object(&cache).await.expect("delete created");
+    handle
+        .delete_object(&cache)
+        .await
+        .expect("deleting an absent object succeeds");
+}
+
 /// Boot the handle described by the process storage environment, logging
 /// to stderr when `WYRD_LOG` or `RUST_LOG` is set so a refused credential
 /// probe shows the backend's own error.
@@ -129,7 +170,8 @@ async fn run_handle_crud(handle: &StorageHandle) {
 /// Panics when the environment is incomplete, selects a backend other than
 /// `kind`, or the handle cannot be built.
 async fn configured_handle(kind: StorageBackendKind) -> Arc<StorageHandle> {
-    wyrd_testing::capacity::install_tracing();
+    // An earlier handle in the same process may already have installed it.
+    let _ = wyrd_testing::capacity::install_tracing();
     let settings = settings::from_env().expect("WYRD_STORAGE_URL configures storage");
     assert_eq!(
         settings.backend.kind(),
@@ -153,6 +195,7 @@ async fn local_handle_crud() {
     let handle =
         StorageHandle::new(LocalSigner::new(dir.path().to_path_buf()).expect("local signer"));
     run_handle_crud(&handle).await;
+    run_create_only(&handle).await;
 }
 
 /// CRUD against the configured S3 or S3-compatible bucket.
@@ -163,7 +206,9 @@ async fn local_handle_crud() {
 /// Panics when the environment selects another backend or CRUD fails.
 #[tokio::test]
 async fn s3_handle_crud() {
-    run_handle_crud(configured_handle(StorageBackendKind::S3).await.as_ref()).await;
+    let handle = configured_handle(StorageBackendKind::S3).await;
+    run_handle_crud(&handle).await;
+    run_create_only(&handle).await;
 }
 
 /// CRUD against the configured GCS bucket or emulator.
@@ -185,5 +230,19 @@ async fn gcs_handle_crud() {
 /// Panics when the environment selects another backend or CRUD fails.
 #[tokio::test]
 async fn azure_handle_crud() {
-    run_handle_crud(configured_handle(StorageBackendKind::Azure).await.as_ref()).await;
+    let handle = configured_handle(StorageBackendKind::Azure).await;
+    run_handle_crud(&handle).await;
+    run_create_only(&handle).await;
+}
+
+/// Create-only writes against real GCS.
+///
+/// Runs only in `test:storage:gcs:cloud`; see [`run_create_only`].
+///
+/// # Panics
+/// Panics when the environment selects another backend or a create-only write
+/// misbehaves.
+#[tokio::test]
+async fn gcs_create_only() {
+    run_create_only(configured_handle(StorageBackendKind::Gcs).await.as_ref()).await;
 }

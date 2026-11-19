@@ -183,7 +183,9 @@ impl Agent {
 /// output: the terminal in text mode, else an append-only diagnostic log, so
 /// JSON mode keeps stdout and stderr for its machine documents.
 enum Diagnostics {
-    /// Progress on stdout, notices on stderr; the child inherits both.
+    /// Progress on stdout, notices on stderr; the CLI relays each child's
+    /// output to them, since a child sharing the CLI's own descriptors may
+    /// make them non-blocking, as Node does, and fail the CLI's next write.
     Terminal,
     /// JSON mode's diagnostic log beneath the server directory.
     Log {
@@ -241,23 +243,50 @@ impl Diagnostics {
         }
     }
 
-    /// Point the serving child's stdout and stderr at this destination.
+    /// Point a serving child's stdout and stderr at this destination: the
+    /// diagnostic log, else pipes that [`Diagnostics::relay`] copies to the
+    /// terminal.
     ///
     /// # Errors
     /// Returns a startup stage error when the log handle cannot be shared.
     fn attach(&self, command: &mut Command) -> Result<(), WyrdCliError> {
-        if let Self::Log { file, .. } = self {
-            let shared = || {
-                file.try_clone().map_err(|_| {
-                    dev_error(
-                        "startup",
-                        "the diagnostic log could not be shared with the server; rerun",
-                    )
-                })
-            };
-            command.stdout(shared()?).stderr(shared()?);
+        match self {
+            Self::Terminal => {
+                command.stdout(Stdio::piped()).stderr(Stdio::piped());
+            }
+            Self::Log { file, .. } => {
+                let shared = || {
+                    file.try_clone().map_err(|_| {
+                        dev_error(
+                            "startup",
+                            "the diagnostic log could not be shared with the server; rerun",
+                        )
+                    })
+                };
+                command.stdout(shared()?).stderr(shared()?);
+            }
         }
         Ok(())
+    }
+
+    /// Copy a terminal-attached `child`'s piped output to the CLI's stdout
+    /// and stderr until the child closes it; a log-attached child writes its
+    /// own. A failed copy drops the rest of that output and never fails
+    /// startup.
+    fn relay(&self, child: &mut Child) {
+        if !matches!(self, Self::Terminal) {
+            return;
+        }
+        if let Some(mut out) = child.stdout.take() {
+            tokio::spawn(
+                async move { drop(tokio::io::copy(&mut out, &mut tokio::io::stdout()).await) },
+            );
+        }
+        if let Some(mut err) = child.stderr.take() {
+            tokio::spawn(
+                async move { drop(tokio::io::copy(&mut err, &mut tokio::io::stderr()).await) },
+            );
+        }
     }
 
     /// Attach the diagnostic log to a local-startup stage error.
@@ -1233,6 +1262,7 @@ impl DevServer {
                 "check the installed server and listener availability, then rerun",
             )
         })?);
+        self.diagnostics.relay(child);
         Self::ready(child, &format!("{}/readyz", self.endpoint)).await?;
         drop(ui_reservation);
         let mut command = self.ui_command();
@@ -1241,6 +1271,7 @@ impl DevServer {
             self.ui.insert(command.spawn().map_err(|_| {
                 dev_error("startup", "check the installed UI and Node.js, then rerun")
             })?);
+        self.diagnostics.relay(ui);
         Self::ready(ui, &format!("http://{}/", self.inputs.ui)).await
     }
 

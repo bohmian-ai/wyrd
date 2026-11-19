@@ -2055,3 +2055,81 @@ async fn standard_variant_layouts_round_trip_per_file() {
         "the twice-compacted read returns the logical rows"
     );
 }
+
+/// Critical process pressure refuses a Forge rewrite before its execution
+/// starts, and a later attempt rewrites on a shared CPU lane once pressure
+/// recovers.
+///
+/// A worker reporting more allocator commitment than the process ceiling
+/// turns every sample critical without filling the byte ledger the fixture's
+/// stores need. The attempt under pressure is refused as retryable capacity
+/// and writes nothing. After two recovering samples, other work holds every
+/// CPU lane: the fresh attempt queues for one and does not finish, then
+/// finishes with real output once the lanes free.
+///
+/// # Panics
+///
+/// Panics when the attempt under critical pressure is not refused as
+/// capacity, the attempt after recovery rewrites without a lane, or it fails
+/// or produces nothing.
+#[tokio::test]
+async fn managed_rewrite_is_refused_under_critical_pressure() {
+    use wyrd_runtime::resources::PressureState;
+
+    let fixture = PromotedRewriteFixture::start("rewrite_pressure").await;
+    let workloads = fixture.fixture.forge_resources.workloads().clone();
+    let overcommitted = workloads.observe_commitment();
+    overcommitted.set(u64::MAX);
+    assert_eq!(workloads.sample(0).state, PressureState::Critical);
+
+    let forge = fixture.forge(
+        fixture.fixture.catalog.iceberg_catalog(),
+        CountingObjectStore::new(&fixture.fixture.storage) as Arc<dyn ForgeObjectStore>,
+    );
+    let refused = fixture
+        .run_attempt(
+            &forge,
+            uuid::Uuid::now_v7(),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+    assert!(
+        matches!(refused.failure, Some(ForgeError::Capacity { .. })),
+        "critical pressure refuses the rewrite as capacity: {:?}",
+        refused.failure
+    );
+    assert!(
+        refused.handoffs.is_empty(),
+        "the refused attempt rewrites nothing"
+    );
+
+    overcommitted.set(0);
+    workloads.sample(0);
+    workloads.sample(0);
+    let lanes = workloads.lanes().clone();
+    let other = workloads.begin(wyrd_runtime::resources::Workload::Gateway, None, None);
+    let mut held = Vec::new();
+    while lanes.free() > 0 {
+        held.push(lanes.acquire(other.context()).await);
+    }
+    let rewrite = rewrite_whole_attempt(&fixture);
+    tokio::pin!(rewrite);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while lanes.waiting() == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the rewrite never queued for a CPU lane"
+        );
+        tokio::select! {
+            biased;
+            _ = &mut rewrite => panic!("the rewrite ran while every lane was held"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+        }
+    }
+    drop(held);
+    let run = rewrite.await;
+    assert!(
+        !run.handoffs.is_empty(),
+        "an attempt after recovery rewrites"
+    );
+}

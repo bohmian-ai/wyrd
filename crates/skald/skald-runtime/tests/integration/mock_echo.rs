@@ -8,7 +8,7 @@ use skald_spec::{ProviderRequest, ProviderResponse};
 #[tokio::test]
 async fn test_echo_returns_user_input_verbatim() {
     let response = MockProvider::echo()
-        .send(openai_request("hello world"))
+        .send(&openai_request("hello world"))
         .await
         .expect("mock echoes");
 
@@ -23,7 +23,7 @@ async fn test_default_registry_has_mock_provider() {
         .expect("mock provider registered");
 
     let response = provider
-        .send(openai_request("hello world"))
+        .send(&openai_request("hello world"))
         .await
         .expect("mock echoes");
 
@@ -38,11 +38,11 @@ async fn test_scripted_expectation_overrides_echo() {
         .respond_with(openai_text_response("custom"));
 
     let scripted = provider
-        .send(expected)
+        .send(&expected)
         .await
         .expect("scripted response wins");
     let echo = provider
-        .send(openai_request("fallback"))
+        .send(&openai_request("fallback"))
         .await
         .expect("echo fallback works");
 

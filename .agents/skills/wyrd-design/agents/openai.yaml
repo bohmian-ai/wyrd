@@ -1,0 +1,4 @@
+interface:
+  display_name: "Wyrd Design"
+  short_description: "Settle a Wyrd solution, flow, and observable success"
+  default_prompt: "Use $wyrd-design to settle the solution, implementation flow, material decisions, and observable success with me, maintaining notes for spec and task handoff."

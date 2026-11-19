@@ -1,0 +1,43 @@
+# Proposed revision 16 contract; not runnable on today's engine.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: code-review-repeated-sweeps
+  version: 0.1.0
+spec:
+  steps:
+    - id: extract-pr
+      action:
+        kind: extract
+        extractor: pull_request
+
+    # Three independent calls, each with the same evidence and separate scratch.
+    - id: review
+      foreach:
+        count: 3
+      action:
+        kind: agent
+        agent: ./agents/reviewer.yaml
+        workspace:
+          /inputs/pr: steps.extract-pr.publications.evidence
+
+    - id: consolidate
+      action:
+        kind: agent
+        agent: ./agents/consolidator.yaml
+        workspace:
+          /inputs/pr: steps.extract-pr.publications.evidence
+          /inputs/reviews/general: steps.review.publications
+
+  requirements:
+    - id: reviewed
+      statement: >-
+        The review completed with sufficient evidence and no substantiated
+        defects introduced by the pull request that require changes.
+      check:
+        kind: agent
+        agent: ./agents/final-judge.yaml
+        workspace:
+          /inputs/pr: steps.extract-pr.publications.evidence
+          /inputs/report: steps.consolidate.publications.report
+  decide: all

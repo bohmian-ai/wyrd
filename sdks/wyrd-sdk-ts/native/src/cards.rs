@@ -12,6 +12,7 @@ use napi::Result;
 use napi::bindgen_prelude::PromiseRaw;
 use napi_derive::napi;
 use serde::Serialize;
+use wyrd_benchmark::{Cohort, Observation};
 use wyrd_client::cards::{BundleMode, CardKind, CardSelector, Cards, Declarable, ListCardsRequest};
 use wyrd_client::observe::Run;
 use wyrd_client::state::{ConfigureOptions, DeclareOptions, TelemetryFlushFailure, WyrdState};
@@ -21,6 +22,16 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::CardName;
 use wyrd_spec::reference::{CardRef, CardRefParseError};
 use wyrd_spec::{Prompt, ResponseType};
+
+/// The benchmark boundary of one `verify` through this addon: from the napi
+/// call's entry, its JavaScript arguments already converted, until its
+/// result is built for conversion back to JavaScript, with components
+/// `dispatch` (until the spawned future first runs), `input` (input
+/// projection), `core` (the shared client's `verify`, its `client.verify`
+/// root nested inside), and `output` (the result projection). The napi
+/// argument and return conversions and the JavaScript wrapper lie outside
+/// it. A stateless no-op outside `bench` builds.
+const SDK_VERIFY: &str = "sdk.verify";
 
 use crate::authoring::NativeAuthored;
 use crate::client::{NativeWyrdClient, NativeWyrdClientResult};
@@ -911,7 +922,7 @@ struct HydratedAgentProjection<'a> {
 /// exactly what the Rust and Python surfaces report.
 fn hydrated_prompt<'a>(card: &'a Card, prompt: &'a Prompt) -> HydratedPromptProjection<'a> {
     let (response_schema, response_schema_name) = match &prompt.response_type {
-        ResponseType::JsonSchema { name, schema } => (Some(schema), Some(name.as_str())),
+        ResponseType::JsonSchema { name, schema } => (Some(&**schema), Some(name.as_str())),
         ResponseType::Text => (None, None),
     };
     HydratedPromptProjection {
@@ -1040,15 +1051,31 @@ impl NativeRun {
         inputs: Vec<NativeVerifierInput>,
         group_id: Option<String>,
     ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let mut observation = Observation::start(SDK_VERIFY, || Cohort::NONE);
+        let entered = observation.now();
         let run = self.run.clone();
         crate::trace::spawn(env, async move {
+            observation.since("dispatch", entered);
+            let started = observation.now();
             let prepared = crate::verification::inputs(inputs)
                 .and_then(|inputs| Ok((inputs, run.observe().grouped(group_id.as_deref())?)));
+            observation.since("input", started);
+            let started = observation.now();
             let result = match prepared {
                 Ok((inputs, observe)) => Box::pin(observe.verify(&verifier, inputs)).await,
                 Err(error) => Err(error),
             };
-            NativeLifecycleResult::outcome(result)
+            observation.since("core", started);
+            let started = observation.now();
+            let failed = result.is_err();
+            let outcome = NativeLifecycleResult::outcome(result);
+            observation.since("output", started);
+            observation.finish(if failed || outcome.is_err() {
+                wyrd_benchmark::ERROR
+            } else {
+                wyrd_benchmark::SUCCESS
+            });
+            outcome
         })
     }
 

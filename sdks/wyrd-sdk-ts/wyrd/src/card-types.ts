@@ -3099,6 +3099,51 @@ export type GithubDeliveryReason = "superseded" | "access_removed" | "github_ref
 export type GithubDeliveryStatus = "pending" | "delivered" | "skipped" | "failed";
 
 /**
+ * `POST /v1/integrations/github/pull-requests/reviews` body: request a
+ * fresh review of one pull request by its selected Repository's whole
+ * `pull_request` binding set, under the `Idempotency-Key` header.
+ *
+ * The tenant and caller come from authentication. The server resolves the
+ * connected repository, the PR's current open source, the selected policy,
+ * its members and their execution authority; a caller never supplies them.
+ * A distinct key admits a new generation even at an unchanged head, and a
+ * retry of the same key for the same pull request returns that generation.
+ */
+export interface GithubPullRequestReviewRequest {
+  /**
+   * The configured GitHub web host, such as `github.com`, as the
+   * connection view reports it.
+   */
+  readonly host: string;
+  /**
+   * Pull request number in that repository.
+   */
+  readonly number: number;
+  /**
+   * Stable GitHub id of the pull request's base repository.
+   */
+  readonly repository_id: RepositoryId;
+}
+
+/**
+ * `POST /v1/integrations/github/pull-requests/reviews` response: the
+ * accepted generation and every member execution, refused members
+ * included, once each member is durably admitted or settled.
+ */
+export interface GithubPullRequestReviewResponse {
+  /**
+   * Every member execution in binding order, as each execution's
+   * `pull_request.members` records it.
+   */
+  readonly executions: readonly ExecutionId[];
+  /**
+   * The admission every member shares, as each execution's
+   * `pull_request.generation` records it.
+   */
+  readonly generation: string;
+}
+
+/**
  * A repository the tenant selected that its installation can currently
  * reach.
  */
@@ -5665,13 +5710,19 @@ export interface PublishEvidenceResponse {
 /**
  * The pull request source one queued execution was admitted for.
  *
- * Every execution of one admission shares its `generation`. A newer
- * source of the same pull request supersedes the generation: its unfinished
- * executions are cancelled with code `pull_request_superseded`. A close or
- * draft conversion cancels them with `pull_request_closed` or
+ * Every execution of one admission shares its `generation` and lists the
+ * generation's complete `members`, so a reader that sees fewer members'
+ * records than `members` names knows the set is not yet fully visible. A
+ * newer source of the same pull request supersedes the generation: its
+ * unfinished executions are cancelled with code `pull_request_superseded`.
+ * A close or draft conversion cancels them with `pull_request_closed` or
  * `pull_request_draft`, and losing the repository through removal,
  * suspension or disconnect with `repository_access_lost`. Settled history
  * keeps these pins.
+ *
+ * A provider delivery admits a generation under its `delivery_id`; an
+ * explicit fresh-review request admits one under its `request_key`
+ * instead.
  */
 export interface PullRequestActivation {
   /**
@@ -5680,9 +5731,9 @@ export interface PullRequestActivation {
   readonly base: PullRequestRef;
   /**
    * Provider delivery that admitted the source, for matching the
-   * provider's delivery log.
+   * provider's delivery log; absent for an explicit review request.
    */
-  readonly delivery_id: string;
+  readonly delivery_id?: string | null;
   /**
    * The admission every execution of this source shares.
    */
@@ -5701,6 +5752,12 @@ export interface PullRequestActivation {
    */
   readonly host: string;
   /**
+   * Every execution of the generation, refused members included, in
+   * binding order; empty only on a generation recorded before
+   * membership was retained.
+   */
+  readonly members?: readonly ExecutionId[];
+  /**
    * Pull request number in the base repository.
    */
   readonly number: number;
@@ -5708,6 +5765,12 @@ export interface PullRequestActivation {
    * Stable provider id of the base repository.
    */
   readonly repository_id: RepositoryId;
+  /**
+   * Idempotency key of the explicit fresh-review request that admitted
+   * the source; absent for a provider delivery. A retry of the same key
+   * for the same pull request returns this generation.
+   */
+  readonly request_key?: string | null;
 }
 
 /**

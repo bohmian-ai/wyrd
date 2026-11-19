@@ -63,6 +63,8 @@ import type {
   GithubConnectResponse,
   GithubConnectionState,
   GithubConnectionView,
+  GithubPullRequestReviewRequest,
+  GithubPullRequestReviewResponse,
   GithubRepositoryAccess,
   HttpAuthScheme,
   HttpConnectionAuth,
@@ -233,6 +235,8 @@ export type {
   GithubConnectResponse,
   GithubConnectionState,
   GithubConnectionView,
+  GithubPullRequestReviewRequest,
+  GithubPullRequestReviewResponse,
   GithubRepositoryAccess,
   HttpAuthScheme,
   HttpConnectionAuth,
@@ -2117,7 +2121,8 @@ export class OperatorConnections {
 /**
  * Tenant GitHub connection client over the shared Rust handle.
  *
- * Connects, reads, and disconnects the deployment's configured GitHub App.
+ * Connects, reads, and disconnects the deployment's configured GitHub App,
+ * and requests fresh reviews of its connected pull requests.
  * The server verifies, associates, authorizes, and audits; every response is
  * the redacted {@link GithubConnectionView} or the transaction receipt, and
  * failures throw a structured {@link WyrdError}.
@@ -2180,6 +2185,34 @@ export class GithubConnection {
    */
   async disconnect(): Promise<GithubConnectionView> {
     return lifecycleValue<GithubConnectionView>(await this.#native.disconnect());
+  }
+
+  /**
+   * Request a fresh review of one connected pull request by its selected
+   * Repository's whole `pull_request` binding set, even at an unchanged head;
+   * requires `cards:read`, and `verifier:read` and `verifier:run` on every
+   * selected Verifier. Members run under the Repository declaration's
+   * authority.
+   *
+   * @param request - The connection's `host`, GitHub's numeric
+   * `repository_id` and the pull request `number`.
+   * @param idempotencyKey - Names the request: a retry with the same key for
+   * the same pull request returns the same generation and members; a new key
+   * admits a new generation and supersedes the older one.
+   * @returns The accepted generation and every member execution ID in
+   * binding order, refused members included.
+   * @throws {@link WyrdError} `WYRD_GITHUB_409_PULL_REQUEST_NOT_REVIEWABLE`
+   * (`details.reason` `not_found`, `closed`, `draft` or `no_bindings`) accepting
+   * nothing, `WYRD_PERMISSION_403_DENIED_RBAC` without the permissions above,
+   * or `WYRD_GITHUB_503_PROVIDER_UNAVAILABLE`, retryable under the same key.
+   */
+  async reviewPullRequest(
+    request: GithubPullRequestReviewRequest,
+    idempotencyKey: string,
+  ): Promise<GithubPullRequestReviewResponse> {
+    return lifecycleValue<GithubPullRequestReviewResponse>(
+      await this.#native.reviewPullRequest(request.host, request.repository_id, request.number, idempotencyKey),
+    );
   }
 }
 

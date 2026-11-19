@@ -77,8 +77,9 @@ def test_verify_waits_for_hosted_memory_then_passes(tmp_path: Path) -> None:
 def test_submit_defers_under_hosted_memory_then_passes(tmp_path: Path) -> None:
     with capacity_desk(tmp_path) as (server, state):
         with server.occupy_hosted_memory(SHORT_OF_A_SESSION):
-            accepted = state.run("agent").observe.submit("adds-one", 2)
-            assert isinstance(accepted, verify.Execution)
+            submitted = state.run("agent").observe.submit("adds-one", 2)
+            assert isinstance(submitted, verify.Execution)
+            accepted: verify.Execution = submitted
             # A claim refused capacity returns the execution to the queue: it neither completes nor fails.
             with pytest.raises(WyrdError) as deferred:
                 accepted.wait(DEFERRED_SECONDS)

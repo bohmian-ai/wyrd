@@ -1033,6 +1033,16 @@ export declare class NativeGithubConnection {
    * server refusal is returned in the result.
    */
   disconnect(): Promise<NativeLifecycleResult>
+  /**
+   * Requests a fresh review of one connected pull request under
+   * `idempotency_key` and returns the accepted generation and members.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the response cannot be serialized; an
+   * invalid repository id or a server refusal is returned in the result.
+   */
+  reviewPullRequest(host: string, repositoryId: string, number: number, idempotencyKey: string): Promise<NativeLifecycleResult>
 }
 
 /** Tenant-scoped Operator connection handle over the shared `wyrd_client` handle. */

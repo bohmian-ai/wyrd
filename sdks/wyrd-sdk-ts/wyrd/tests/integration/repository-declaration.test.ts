@@ -191,3 +191,34 @@ test("pull requests admit pinned executions and supersede them", async ({ server
   const closed = await inspect(pushed.execution_id);
   expect([closed.status, closed.error?.code]).toEqual(["cancelled", "pull_request_closed"]);
 });
+
+test("a review request admits a new generation and replays by key", async ({ server, cards, admin }) => {
+  const github = server.githubApp;
+  await cards.declareFromPath(policy(checkout(github.host, "acme/api"), "minimal"));
+  const connection = await GithubConnection.connect({ client: admin });
+  const review = (key: string, number = 8) =>
+    connection.reviewPullRequest({ host: github.host, repository_id: "1", number }, key);
+  const inspect = async (id: string) => (await verify.Execution.connect(id, { client: admin })).status();
+  github.setPullRequest(1, 8, "b1", "a1");
+
+  const first = await review("ts-review-a");
+  const [member] = first.executions;
+  expect((await inspect(member)).pull_request).toMatchObject({
+    generation: first.generation,
+    members: [member],
+    request_key: "ts-review-a",
+  });
+  expect(await review("ts-review-a")).toEqual(first);
+
+  const second = await review("ts-review-b");
+  expect(second.generation).not.toBe(first.generation);
+  const superseded = await inspect(member);
+  expect([superseded.status, superseded.error?.code]).toEqual(["cancelled", "pull_request_superseded"]);
+  expect(await review("ts-review-a")).toEqual(first);
+
+  github.setPullRequest(1, 9, "b1", "a1", false, false);
+  await expect(review("ts-review-closed", 9)).rejects.toMatchObject({
+    code: "WYRD_GITHUB_409_PULL_REQUEST_NOT_REVIEWABLE",
+    details: { reason: "closed" },
+  });
+});

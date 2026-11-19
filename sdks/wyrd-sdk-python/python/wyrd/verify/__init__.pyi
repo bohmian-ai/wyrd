@@ -610,7 +610,9 @@ class PullRequestActivation(TypedDict):
     of the same pull request cancels unfinished work with
     ``pull_request_superseded``; close, draft conversion and lost repository
     access cancel it with ``pull_request_closed``, ``pull_request_draft`` and
-    ``repository_access_lost``. Settled history keeps these pins.
+    ``repository_access_lost``. Settled history keeps these pins. ``members``
+    lists every execution the generation admitted, refused ones included, so
+    fewer visible retained records than members means the set is incomplete.
     """
 
     generation: str
@@ -621,8 +623,12 @@ class PullRequestActivation(TypedDict):
     head: PullRequestRef
     head_repository_id: NotRequired[str | None]
     """Differs from ``repository_id`` for a fork; absent once the fork is deleted."""
-    delivery_id: str
-    """Provider delivery that admitted the source."""
+    delivery_id: NotRequired[str]
+    """Provider delivery that admitted the source; absent for a review request."""
+    request_key: NotRequired[str]
+    """Idempotency key of the review request that admitted the source."""
+    members: NotRequired[list[str]]
+    """Every execution ID the generation admitted."""
 
 ApprovalStatus: TypeAlias = Literal["pending", "approved", "rejected", "expired"]
 """Where one approval occurrence stands; ``expired`` ends with its execution."""

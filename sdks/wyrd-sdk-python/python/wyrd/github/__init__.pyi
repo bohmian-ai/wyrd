@@ -43,12 +43,24 @@ class GithubConnectionView(TypedDict):
     connected_at: str | None
     updated_at: str | None
 
+class GithubPullRequestReviewResponse(TypedDict):
+    """An accepted pull request review: its generation and every member.
+
+    ``executions`` lists every member execution ID in binding order,
+    refused members included, as each execution's
+    ``pull_request.members`` records it.
+    """
+
+    generation: str
+    executions: list[str]
+
 class GithubConnection:
     """Tenant-scoped GitHub connection handle.
 
-    Every call blocks with the GIL released until the server answers and
-    needs ``identity_connections:write``. No call ever returns a GitHub
-    token, code, or key.
+    Every call blocks with the GIL released until the server answers. The
+    connection calls need ``identity_connections:write``; a review request
+    needs ``cards:read`` and ``verifier:read`` and ``verifier:run`` on every
+    selected Verifier. No call ever returns a GitHub token, code, or key.
     """
 
     def __init__(self, client: WyrdClient | None = None) -> None:
@@ -116,6 +128,35 @@ class GithubConnection:
                 has no GitHub App; ``WYRD_PERMISSION_403_DENIED_RBAC`` without
                 ``identity_connections:write``; ``WYRD_GITHUB_404_NOT_CONNECTED``
                 when nothing is connected.
+
+        """
+        ...
+
+    def review_pull_request(
+        self, *, host: str, repository_id: str, number: int, idempotency_key: str
+    ) -> GithubPullRequestReviewResponse:
+        """Request a fresh review of one connected pull request.
+
+        The selected Repository's whole ``pull_request`` binding set reviews
+        the pull request's current source, even at an unchanged head, and
+        supersedes the older generation. Members run under the Repository
+        declaration's authority.
+
+        Args:
+            host: the connection's GitHub host, as ``get()["host"]`` reports it.
+            repository_id: GitHub's numeric id of the base repository.
+            number: the pull request number.
+            idempotency_key: names the request; a retry with the same key
+                for the same pull request returns the same generation and
+                members, and a new key admits a new generation.
+
+        Raises:
+            WyrdError: ``WYRD_PERMISSION_403_DENIED_RBAC`` without the
+                permissions above; ``WYRD_GITHUB_409_PULL_REQUEST_NOT_REVIEWABLE``
+                with ``details["reason"]`` ``not_found``, ``closed``, ``draft``
+                or ``no_bindings``, accepting nothing;
+                ``WYRD_GITHUB_503_PROVIDER_UNAVAILABLE`` when GitHub cannot
+                answer, retryable under the same key.
 
         """
         ...

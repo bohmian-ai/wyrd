@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use serde_json::value::RawValue;
@@ -31,6 +32,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
+use wyrd_runtime::resources::{ByteCharge, LedgerRefusal};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::gateway::{
@@ -82,6 +84,9 @@ pub struct ProviderAttempt<'a> {
     /// Caller cancellation or server drain; a relayed stream observes it
     /// after the answer reaches the caller.
     pub cancel: &'a CancellationToken,
+    /// An empty process memory charge attributed to the call's operation;
+    /// a relayed stream charges each frame it retains as a sibling of it.
+    pub memory: &'a ByteCharge,
 }
 
 /// One complete JSON value, held as its exact text without surrounding
@@ -110,6 +115,13 @@ impl JsonAnswer {
     #[must_use]
     pub fn get(&self) -> &str {
         &self.0
+    }
+
+    /// The bytes the text's allocation holds, spare capacity included: what
+    /// retaining the answer actually costs.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.0.capacity()
     }
 
     /// Moves the JSON text out.
@@ -160,6 +172,84 @@ impl ResponseBody {
     }
 }
 
+/// One relayed stream frame: a slice of a charged allocation.
+///
+/// The allocation's process memory charge lives with the allocation, so it
+/// returns only when the last frame sliced from it drops, wherever its
+/// consumer moves it: a queued frame, one the response body is writing, and
+/// one the caller still holds all count.
+#[derive(Debug)]
+pub struct Frame(Bytes);
+
+/// An allocation together with the charge of its capacity, the owner behind
+/// every [`Frame`] sliced from it.
+struct Charged {
+    /// The allocation's bytes.
+    bytes: Vec<u8>,
+    /// The charge of `bytes`' capacity, a sibling of the call's.
+    _charge: ByteCharge,
+}
+
+impl AsRef<[u8]> for Charged {
+    /// The allocation's bytes.
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl Frame {
+    /// Charges `bytes`' allocation once as a sibling of the call's `memory`
+    /// and yields it as frames of at most `piece` bytes, sharing the
+    /// allocation without copying; empty `bytes` yields nothing.
+    ///
+    /// # Errors
+    /// Returns [`LedgerRefusal`] when process memory cannot hold the
+    /// allocation; the caller discards it before any frame exists.
+    pub(crate) fn split(
+        bytes: Vec<u8>,
+        piece: usize,
+        memory: &ByteCharge,
+    ) -> Result<impl Iterator<Item = Self>, LedgerRefusal> {
+        let mut charge = memory.sibling();
+        charge.try_grow(u64::try_from(bytes.capacity()).unwrap_or(u64::MAX))?;
+        let shared = Bytes::from_owner(Charged {
+            bytes,
+            _charge: charge,
+        });
+        let len = shared.len();
+        Ok((0..len)
+            .step_by(piece.max(1))
+            .map(move |start| Self(shared.slice(start..len.min(start + piece.max(1))))))
+    }
+
+    /// Charges a small terminal frame the stream must still deliver, even
+    /// past the limit.
+    pub(crate) fn mandatory(bytes: Vec<u8>, memory: &ByteCharge) -> Self {
+        let mut charge = memory.sibling();
+        charge.grow_infallible(u64::try_from(bytes.capacity()).unwrap_or(u64::MAX));
+        Self(Bytes::from_owner(Charged {
+            bytes,
+            _charge: charge,
+        }))
+    }
+}
+
+impl std::ops::Deref for Frame {
+    type Target = [u8];
+
+    /// The frame's bytes.
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl From<Frame> for Bytes {
+    /// The frame's bytes, still holding its allocation's charge.
+    fn from(frame: Frame) -> Self {
+        frame.0
+    }
+}
+
 /// Incremental answer relayed from one upstream stream.
 ///
 /// The frame channel is bounded, so a slow caller stops upstream reads, and
@@ -170,7 +260,7 @@ impl ResponseBody {
 #[derive(Debug)]
 pub struct EventStream {
     /// Server-sent event bytes in delivery order; closes when the relay ends.
-    pub(crate) frames: mpsc::Receiver<Vec<u8>>,
+    pub(crate) frames: mpsc::Receiver<Frame>,
     /// Set by the relay, before it closes `frames`, once the stream ended
     /// explicitly with success or a delivered terminal error.
     terminated: Arc<AtomicBool>,
@@ -209,6 +299,10 @@ pub struct StreamEnd {
     /// the capture ceiling, had no JSON form, or held the credential, or when
     /// a media stream did not end cleanly.
     pub capture: Option<ResponseCapture>,
+    /// The process memory charge still holding `capture`'s content, a
+    /// sibling of the call's; whoever takes `capture` keeps it until that
+    /// content drops or the outbox takes its custody over.
+    pub custody: Option<ByteCharge>,
     /// When the relay received the last upstream body byte; `None` when no
     /// body byte arrived. Transient, for telemetry only.
     pub last_byte: Option<std::time::Instant>,
@@ -227,7 +321,7 @@ pub struct StreamAborted;
 impl EventStream {
     /// Wraps a relay's `frames`, its `terminated` flag, and its `end`.
     pub(crate) fn new(
-        frames: mpsc::Receiver<Vec<u8>>,
+        frames: mpsc::Receiver<Frame>,
         terminated: Arc<AtomicBool>,
         end: oneshot::Receiver<StreamEnd>,
     ) -> Self {
@@ -255,7 +349,7 @@ impl EventStream {
     ///
     /// Each frame's handoff instant is kept, so the stream's drop reports
     /// when the consumer took the final one.
-    pub async fn recv(&mut self) -> Option<Result<Vec<u8>, StreamAborted>> {
+    pub async fn recv(&mut self) -> Option<Result<Frame, StreamAborted>> {
         if let Some(frame) = self.frames.recv().await {
             self.handed = Some(std::time::Instant::now());
             return Some(Ok(frame));
@@ -558,6 +652,9 @@ pub struct CallInput<'a> {
     pub deadline: Instant,
     /// Caller cancellation or server drain.
     pub cancel: &'a CancellationToken,
+    /// An empty process memory charge attributed to the call's operation;
+    /// a relayed stream charges each frame it retains as a sibling of it.
+    pub memory: &'a ByteCharge,
 }
 
 /// Dependency-owning gateway execution component.
@@ -803,6 +900,7 @@ impl GatewayEngine {
                 capture: input.capture,
                 deadline: input.deadline,
                 cancel: input.cancel,
+                memory: input.memory,
             })
             .await;
         timing.attempt(dispatching.elapsed(), &exchange::take());
@@ -1137,6 +1235,7 @@ mod tests {
                 capture: false,
                 deadline: Instant::now() + deadline,
                 cancel,
+                memory: &wyrd_runtime::resources::ByteLedger::new(u64::MAX).empty_charge(),
             })
             .await
     }

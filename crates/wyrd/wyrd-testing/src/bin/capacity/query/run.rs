@@ -22,6 +22,7 @@ use wyrd_client::{Bifrost, WyrdClient};
 use wyrd_spec::vala::api::{BifrostQueryRequest, QueryTerminalOutcome};
 use wyrd_testing::release_server::LocalServer;
 use wyrd_tonic::otlp::logs_service::logs_service_client::LogsServiceClient;
+use wyrd_tonic::otlp::metrics_service::metrics_service_client::MetricsServiceClient;
 use wyrd_tonic::otlp::trace_service::trace_service_client::TraceServiceClient;
 use wyrd_tonic::prost::Message as _;
 use wyrd_tonic::tonic::Request;
@@ -31,6 +32,7 @@ use wyrd_tonic::tonic_types::StatusExt as _;
 use crate::query::Result;
 use crate::query::logs::{self, Logs};
 use crate::query::telemetry::{self, Telemetry};
+use crate::query::ui::fixture::{Export, Journey};
 use crate::query::workload::{self, Case, Fixture, Rows};
 
 /// Oracle's production queue places.
@@ -74,7 +76,7 @@ impl Admission {
     }
 
     /// Whether a request may still be admitted.
-    fn open(&self) -> bool {
+    pub fn open(&self) -> bool {
         self.stop.is_none_or(|stop| Instant::now() < stop)
     }
 
@@ -137,7 +139,7 @@ impl Outcome {
 
     /// Records one success of `rows` rows and `wire` bytes, sent at `sent`,
     /// late when it completed after `admission`'s stop.
-    fn succeeded(&mut self, admission: &Admission, sent: Instant, rows: u64, wire: u64) {
+    pub fn succeeded(&mut self, admission: &Admission, sent: Instant, rows: u64, wire: u64) {
         self.latencies_us.push(micros(sent));
         self.rows += rows;
         self.wire_bytes += wire;
@@ -181,6 +183,9 @@ pub enum Sender {
     /// Bulky Kubernetes logs through the logs service into
     /// `bifrost.logs.records`.
     Logs(Otlp, Logs),
+    /// The `ui-sql` journey's spans, logs and metrics, one export request
+    /// per index.
+    Ui(Otlp, Journey),
 }
 
 /// The server's OTLP gRPC collector, reached with the client's exchanged
@@ -261,6 +266,7 @@ impl Sender {
             Self::Native { .. } => workload::REQUEST_ROWS,
             Self::Spans(..) => telemetry::REQUEST_SPANS,
             Self::Logs(..) => logs::REQUEST_RECORDS,
+            Self::Ui(..) => 1,
         }
     }
 
@@ -314,6 +320,43 @@ impl Sender {
                     .into_inner()
                     .partial_success
                     .map_or(0, |partial| partial.rejected_log_records);
+                Ok(accepted(encoded, rejected)?)
+            }
+            Self::Ui(otlp, journey) => {
+                let token = otlp.token().await?;
+                let channel = otlp.channel.clone();
+                let (encoded, rejected) = match journey.export(first) {
+                    Export::Spans(body) => (
+                        body.encoded_len(),
+                        TraceServiceClient::new(channel)
+                            .export(authorized(body, &token)?)
+                            .await
+                            .map_err(|status| Refused::otlp(&status))?
+                            .into_inner()
+                            .partial_success
+                            .map_or(0, |partial| partial.rejected_spans),
+                    ),
+                    Export::Logs(body) => (
+                        body.encoded_len(),
+                        LogsServiceClient::new(channel)
+                            .export(authorized(body, &token)?)
+                            .await
+                            .map_err(|status| Refused::otlp(&status))?
+                            .into_inner()
+                            .partial_success
+                            .map_or(0, |partial| partial.rejected_log_records),
+                    ),
+                    Export::Metrics(body) => (
+                        body.encoded_len(),
+                        MetricsServiceClient::new(channel)
+                            .export(authorized(body, &token)?)
+                            .await
+                            .map_err(|status| Refused::otlp(&status))?
+                            .into_inner()
+                            .partial_success
+                            .map_or(0, |partial| partial.rejected_data_points),
+                    ),
+                };
                 Ok(accepted(encoded, rejected)?)
             }
         }
@@ -703,7 +746,7 @@ pub async fn ask(
 }
 
 /// The stable code a client error projects to.
-fn code(error: &BifrostClientError) -> String {
+pub fn code(error: &BifrostClientError) -> String {
     tracing::debug!(%error, "benchmark request failed");
     wyrd_spec::error::WyrdError::from(error).code().to_owned()
 }
@@ -730,7 +773,7 @@ fn int_rows(batch: &RecordBatch) -> std::result::Result<Rows, arrow::error::Arro
 
 /// Waits for every task and merges their results; a panicked task counts as
 /// one `panicked` error.
-async fn join(mut tasks: JoinSet<Outcome>) -> Outcome {
+pub async fn join(mut tasks: JoinSet<Outcome>) -> Outcome {
     let mut total = Outcome::default();
     while let Some(joined) = tasks.join_next().await {
         match joined {

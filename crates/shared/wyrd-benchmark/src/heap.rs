@@ -76,6 +76,54 @@ thread_local! {
     static IN_SAMPLER: Cell<bool> = const { Cell::new(false) };
 }
 
+/// [`System`] plus this sampler's allocation and free hooks: the global
+/// allocator of a benchmark binary or native module that has no allocator
+/// of its own, such as the capacity driver and the `bench` builds of the
+/// Python and TypeScript SDK modules.
+pub struct SampledSystem;
+
+// SAFETY: every method forwards its arguments unchanged to `System` and
+// returns what `System` returned. No pointer is fabricated, aliased or freed
+// here, so this upholds exactly the invariants `System` upholds.
+#[expect(
+    unsafe_code,
+    reason = "a global allocator is unsafe; the sampling it adds is safe"
+)]
+unsafe impl std::alloc::GlobalAlloc for SampledSystem {
+    /// Allocates `layout` from the system and reports it.
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        // SAFETY: `layout` comes from the caller and is forwarded unchanged.
+        let ptr = unsafe { std::alloc::System.alloc(layout) };
+        allocated(ptr, layout.size());
+        ptr
+    }
+
+    /// Reports the free, then returns `ptr` to the system.
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        freed(ptr);
+        // SAFETY: `ptr` came from our `alloc`/`realloc` with this same `layout`.
+        unsafe { std::alloc::System.dealloc(ptr, layout) };
+    }
+
+    /// Takes the system's pre-zeroed allocation and reports it.
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        // SAFETY: `layout` comes from the caller and is forwarded unchanged.
+        let ptr = unsafe { std::alloc::System.alloc_zeroed(layout) };
+        allocated(ptr, layout.size());
+        ptr
+    }
+
+    /// Reports the old block freed and the resized block allocated.
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        freed(ptr);
+        // SAFETY: `ptr`/`layout` describe a live block from this allocator, and
+        // `new_size` is the caller's — all forwarded unchanged.
+        let new_ptr = unsafe { std::alloc::System.realloc(ptr, layout, new_size) };
+        allocated(new_ptr, new_size);
+        new_ptr
+    }
+}
+
 /// The samples taken since [`start`].
 struct Samples {
     /// Samples not yet freed, by address.

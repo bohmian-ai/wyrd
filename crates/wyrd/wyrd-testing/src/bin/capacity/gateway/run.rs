@@ -71,8 +71,19 @@ pub const QUEUE_DELAY_SECONDS: &str = "wyrd_gateway_queue_delay_seconds";
 /// The server's benchmark-only Gateway controlled-wait histogram.
 pub const WAIT_SECONDS: &str = "wyrd_gateway_wait_seconds";
 
-/// Every controlled wait a governed call records once while benchmarking.
-pub const WAITS: [&str; 4] = ["dispatch", "provider_headers", "provider_body", "resume"];
+/// Every controlled wait a governed call records once while benchmarking;
+/// `capture_slot` only when the call captures.
+pub const WAITS: [&str; 9] = [
+    "dispatch",
+    "provider_headers",
+    "provider_body",
+    "resume",
+    "admission",
+    "pressure",
+    "capture_slot",
+    "execute",
+    "settle",
+];
 
 /// The driver roots a Gateway window diagnoses, each with whether it
 /// excludes waits and its components; the streamed head, last, only for a
@@ -86,6 +97,13 @@ pub const DRIVER_ROOTS: [(&str, bool, &[&str]); 4] = [
 
 /// The server's outbox batch write histogram.
 pub const OUTBOX_WRITE_SECONDS: &str = "outbox_write_seconds";
+
+/// The server's benchmark-only Scribe outbox write-stage histogram.
+pub const OUTBOX_STAGE_SECONDS: &str = "wyrd_scribe_outbox_stage_seconds";
+
+/// Every Scribe outbox write stage the server times while benchmarking: per
+/// write `frames`, per chunk the rest.
+pub const OUTBOX_STAGES: [&str; 5] = ["frames", "permit", "encode_queue", "encode", "submit"];
 
 /// Every Gateway call phase in request order, each recorded once per call
 /// by a successful call without retries; `relay` only by a stream.
@@ -528,6 +546,10 @@ impl Observed {
         repetition.diagnose("residual", residual, true);
         let writes = population.histogram(OUTBOX_WRITE_SECONDS, &[("outbox", "scribe")]);
         repetition.diagnose("outbox_write.scribe", writes, true);
+        for stage in OUTBOX_STAGES {
+            let distribution = population.histogram(OUTBOX_STAGE_SECONDS, &[("stage", stage)]);
+            repetition.diagnose(&format!("outbox_stage.{stage}"), distribution, true);
+        }
         for wait in WAITS {
             let observation = format!("wait.{wait}");
             let distribution = population.histogram(WAIT_SECONDS, &[("wait", wait)]);
@@ -928,8 +950,9 @@ mod tests {
     use wyrd_testing::experiment::Reading;
 
     use super::{
-        BUFFERED, Drain, Integrity, OUTBOX_WRITE_SECONDS, Observed, PHASE_SECONDS, PHASES,
-        QUEUE_DELAY_SECONDS, STREAM_END, STREAM_HEAD, Samples, WAIT_SECONDS, WAITS,
+        BUFFERED, Drain, Integrity, OUTBOX_STAGE_SECONDS, OUTBOX_STAGES, OUTBOX_WRITE_SECONDS,
+        Observed, PHASE_SECONDS, PHASES, QUEUE_DELAY_SECONDS, STREAM_END, STREAM_HEAD, Samples,
+        WAIT_SECONDS, WAITS,
     };
 
     /// A cumulative `_seconds` histogram series `name` with `labels` holding
@@ -986,6 +1009,13 @@ mod tests {
             &[("outbox", "scribe")],
             &vec![2_000_000 + offset_ns; writes],
         ));
+        metrics.extend(OUTBOX_STAGES.iter().zip(1_u64..).map(|(stage, step)| {
+            histogram(
+                OUTBOX_STAGE_SECONDS,
+                &[("stage", stage)],
+                &vec![step * 100_000 + offset_ns; writes],
+            )
+        }));
         metrics.extend(WAITS.iter().zip(1_u64..).map(|(wait, step)| {
             histogram(
                 WAIT_SECONDS,
@@ -1276,6 +1306,8 @@ mod tests {
         );
         assert_eq!(exact(&reading("outbox_write.scribe.count")), Some(3.0));
         assert!(holds(&reading("outbox_write.scribe.p50_us"), 2_000.0));
+        assert_eq!(exact(&reading("outbox_stage.frames.count")), Some(3.0));
+        assert!(holds(&reading("outbox_stage.submit.p50_us"), 500.0));
         assert!(holds(&reading("queue_delay.p95_us"), 70.0));
         assert_eq!(exact(&reading("server_elapsed.count")), Some(1_000.0));
         assert!(holds(&reading("provider_excluded.p50_us"), 2_000.0));

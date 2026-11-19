@@ -14,8 +14,11 @@ import {
   type VerificationDetails,
   type VerificationExecutionState,
   type VerificationResult,
+  type VerifierInput,
+  type VerifierInputs,
   WyrdClient,
   type WorkloadKind,
+  type WyrdState,
 } from "wyrd-ai";
 import { type NativeWyrdTestServer, startTestServer } from "@wyrd/testing";
 import { test as base, vi } from "vitest";
@@ -124,6 +127,22 @@ export async function binding(cards: Cards, owner: CardRef): Promise<string> {
 }
 
 /**
+ * Submit `inputs` to the queued-only `verifier` in a new Run of `state` and
+ * wait for its result.
+ */
+export async function queued(
+  state: WyrdState,
+  verifier: string,
+  inputs: VerifierInput | VerifierInputs,
+): Promise<VerificationResult> {
+  const submitted = await state.run().observe.submit(verifier, inputs);
+  if (submitted.kind !== "queued") {
+    throw new Error(`${verifier} queues an execution`);
+  }
+  return submitted.execution.wait({ timeoutMs: 60_000 });
+}
+
+/**
  * What execution `id` ran, read as the ambient administrator once its result
  * is visible.
  */
@@ -198,13 +217,17 @@ export async function groupExecution(
 /** How a story file starts its server. */
 export interface ServerOptions {
   /** Answers the Gateway adapters and Verifier Agents send to the server's provider upstream. */
-  readonly provider?: (request: ReceivedRequest) => Reply;
+  readonly provider?: (request: ReceivedRequest) => Reply | Promise<Reply>;
   /** Run Drift baseline fitting, scheduled Verifier runs, and Operators. */
   readonly verificationRuntime?: boolean;
   /** Access-token lifetime in seconds, verified with no clock-skew allowance. */
   readonly accessTtlSeconds?: number;
   /** Scribe outbox capacity in items; the production capacity by default. */
   readonly scribeOutboxCapacity?: number;
+  /** Configure the deployment's GitHub App against a loopback GitHub mock, reachable as `server.githubApp`. */
+  readonly githubApp?: boolean;
+  /** Direct verification deadline from arrival in milliseconds; the production deadline by default. */
+  readonly verifyTimeoutMs?: number;
   /** Start a fresh server for every test instead of one per story file. */
   readonly perTest?: boolean;
 }
@@ -251,6 +274,8 @@ export function serverTest(options: ServerOptions = {}) {
           verificationRuntime: options.verificationRuntime,
           accessTtlSeconds: options.accessTtlSeconds,
           scribeOutboxCapacity: options.scribeOutboxCapacity,
+          githubApp: options.githubApp,
+          verifyTimeoutMs: options.verifyTimeoutMs,
         });
         deploy(server);
         await use(server);

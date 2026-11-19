@@ -132,6 +132,28 @@ pub struct ArtifactManifestEntry {
 pub struct DeclareCardRequest {
     /// Flat list of cards. The server topo-sorts the graph and derives root.
     pub submissions: Vec<CardSubmission>,
+    /// Identity hint for a Repository root inferred from `wyrd.toml`; absent
+    /// for every other declaration, including an authored Repository Card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<RepositoryHint>,
+}
+
+/// Local identity hint for an inferred Repository root.
+///
+/// The server resolves the hint against the tenant's GitHub connection: it
+/// sets the root's `host` and `repository_id` and, when `infer_name`, its Card
+/// name. An established Repository family keeps its name across provider
+/// renames. The hint grants nothing; an unconnected repository is refused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub struct RepositoryHint {
+    /// The checkout's origin remote, or the explicit `--repository` remote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<crate::card::repository::RepositoryRemote>,
+    /// Whether the server chooses the root's Card name; false when the
+    /// author set `[repository.metadata] name`.
+    pub infer_name: bool,
 }
 
 /// Outcome for one submission in a composite declaration.

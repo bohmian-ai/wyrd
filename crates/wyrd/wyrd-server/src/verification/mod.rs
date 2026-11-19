@@ -9,12 +9,14 @@
 //! runtime holds no process-local registry, so any process may crash and
 //! another reclaims its leases.
 
+pub(crate) mod approvals;
 pub mod authority;
 pub(crate) mod cache;
 mod claims;
 mod completions;
 pub mod drift;
 pub mod engines;
+pub(crate) mod evidence;
 #[cfg(feature = "test-support")]
 pub mod fault;
 pub mod fitter;
@@ -22,12 +24,13 @@ pub mod groups;
 pub mod health;
 pub mod hosted;
 pub mod inputs;
-mod leases;
+pub mod leases;
 pub mod operators;
 pub mod permits;
 pub mod results;
 pub mod runner;
 pub mod scheduler;
+pub mod state;
 pub mod submissions;
 pub mod telemetry;
 
@@ -75,11 +78,15 @@ pub struct Verification {
     submissions: Arc<SubmissionOutbox>,
     /// Operator connection key owner.
     operator_keys: Arc<OperatorKeys>,
+    /// The configured queued execution deadline, measured from admission,
+    /// which also closes the execution's approval occurrences.
+    execution_timeout: Duration,
 }
 
 impl Verification {
-    /// Capabilities over `postgres`, hosting `blocks` and sealing Operator
-    /// connections with `operator_keys`.
+    /// Capabilities over `postgres`, hosting `blocks`, sealing Operator
+    /// connections with `operator_keys`, and closing queued executions
+    /// `execution_timeout` after admission.
     ///
     /// # Panics
     /// Panics when called outside a Tokio runtime, because the submission
@@ -89,12 +96,14 @@ impl Verification {
         postgres: wyrd_sql::WyrdPostgres,
         blocks: Option<HostedBlocks>,
         operator_keys: OperatorKeys,
+        execution_timeout: Duration,
     ) -> Self {
         Self {
             health: Arc::default(),
             blocks: blocks.map(Arc::new),
             submissions: SubmissionSink::outbox(postgres),
             operator_keys: Arc::new(operator_keys),
+            execution_timeout,
         }
     }
 
@@ -120,6 +129,12 @@ impl Verification {
     #[must_use]
     pub const fn operator_keys(&self) -> &Arc<OperatorKeys> {
         &self.operator_keys
+    }
+
+    /// The configured queued execution deadline, measured from admission.
+    #[must_use]
+    pub const fn execution_timeout(&self) -> Duration {
+        self.execution_timeout
     }
 
     /// The target invalidation listener over `postgres`, which runs until
@@ -595,6 +610,44 @@ impl VerificationRuntimeBuilder<'_> {
     }
 }
 
+/// Bytes `value` encodes to as JSON, pretty-printed when `pretty`, counted
+/// as it streams into a sink that keeps none of them, so a caller can charge
+/// an encoding before building it. A value that fails to encode counts what
+/// was written before the error, which its encoder then refuses.
+pub(crate) fn encoded_len(value: &impl serde::Serialize, pretty: bool) -> u64 {
+    /// A sink counting the bytes written to it.
+    struct Counted(
+        /// Bytes written so far, saturating at `u64::MAX`.
+        u64,
+    );
+    impl std::io::Write for Counted {
+        /// Count `bytes`, saturating, and keep none of them.
+        ///
+        /// # Errors
+        /// Never fails: every byte is accepted.
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+            Ok(bytes.len())
+        }
+        /// Nothing is buffered, so there is nothing to flush.
+        ///
+        /// # Errors
+        /// Never fails.
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counted = Counted(0);
+    let _ = if pretty {
+        serde_json::to_writer_pretty(&mut counted, value)
+    } else {
+        serde_json::to_writer(&mut counted, value)
+    };
+    counted.0
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -622,13 +675,23 @@ mod tests {
         );
     }
 
-    /// Production defaults retain 16 process-wide and 4 per-tenant Operator
+    /// Production defaults retain 64 queued execution slots under a
+    /// five-minute execution deadline, 16 process-wide and 4 per-tenant Operator
     /// deliveries, a 30-second drain, and Operator
     /// dispatches of three attempts, each capped at 30 seconds, retried after
     /// 30 seconds and then two minutes, inside a five-minute deadline.
+    ///
+    /// # Panics
+    /// Panics when a default queued slot count, execution deadline, Operator
+    /// delivery ceiling, drain, or dispatch retry schedule differs from its
+    /// specified value.
     #[test]
     fn production_defaults_are_the_specified_ceilings() {
         let limits = RuntimeLimits::default();
+        assert_eq!(
+            (limits.execution_slots, limits.execution_timeout),
+            (64, Duration::from_mins(5))
+        );
         assert_eq!(
             (
                 limits.operator_global_permits,

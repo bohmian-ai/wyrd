@@ -35,11 +35,28 @@ use wyrd_spec::verification::execution::{
 
 use crate::client::WyrdClient;
 
+mod evidence;
 mod execution;
 
 use crate::storage::upload::sha256_file;
 use crate::storage::{FileSource, WyrdStorageClient};
+pub use evidence::{
+    COMMIT_VAR, Evidence, EvidenceRepository, EvidenceStatus, PublishEvidenceResponse,
+    REPOSITORY_VAR, source,
+};
 pub use execution::Execution;
+/// The download plan [`Execution::download`] returns.
+pub use wyrd_spec::storage::DownloadInitResponse;
+/// The wire shapes [`Execution`]'s inspection and cancellation exchange.
+pub use wyrd_spec::verification::execution::{
+    ApprovalDecision, ApprovalOccurrenceState, ApprovalReceipt, ApprovalStatus,
+    CancelExecutionResponse, ExecutionInvocation, ExecutionPageQuery, HistoryProjection,
+    InvocationPage, InvocationProgress, Producer, Publication, PublicationContent, PublicationFile,
+    PublicationKind, PublicationManifest, PublicationPage, PublicationSelector, PublicationSummary,
+    Speculation,
+};
+/// The identities a publication read selects, and an execution's status.
+pub use wyrd_spec::verification::{PublicationName, TaskId, VerificationExecutionStatus};
 
 pub use crate::authoring::{
     Action, Agent, Artifact, ArtifactFile, Audit, Binding, CardDefinition, CardRef, Check,
@@ -467,9 +484,8 @@ impl Target<'_> {
     ///
     /// One `Idempotency-Key` is minted per call and replayed on every
     /// transport retry, so a retried request names the same execution.
-    /// `202` confirms staging only: replay or conflict is decided when the
-    /// queue accepts it, and a conflict surfaces through the execution's
-    /// status and `wait`.
+    /// `202` confirms durable admission: a replay returns the original
+    /// execution, and a conflict or a loss before admission is an error.
     ///
     /// # Errors
     /// As [`Target::execute`].

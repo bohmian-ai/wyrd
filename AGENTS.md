@@ -24,7 +24,7 @@ the owner; never add an alias or a parallel contract.
 change, not whole documents. Generated schemas, source code, tests, and old
 plans never override these documents; implementation that disagrees is drift.
 Directory rules live beside the code: `docs/`, `sdks/wyrd-sdk-python/`,
-`sdks/wyrd-sdk-ts/`, `crates/wyrd/wyrd-sql/`.
+`sdks/wyrd-sdk-ts/`, `crates/wyrd/wyrd-sql/`, `benchmarks/`.
 
 ## Repository map
 
@@ -95,8 +95,9 @@ These are not open for discussion in a task or review.
   careful, literal reader who cannot ask for clarification.
 - **Cards.** Envelope `apiVersion: wyrd/v1`, `metadata`, `kind`, `spec`,
   server-derived `relationships`, server-managed `status`; no outer
-  `kind: Card`. 12 kinds: `Data`, `Model`, `Artifact`, `Experiment`, `Prompt`,
-  `Agent`, `Mcp`, `Service`, `Audit`, `Verifier`, `Trigger`, `Operator`. Drift and Agent judging are Verifier check kinds.
+  `kind: Card`. 13 kinds: `Data`, `Model`, `Artifact`, `Experiment`, `Prompt`,
+  `Agent`, `Mcp`, `Service`, `Audit`, `Verifier`, `Trigger`, `Operator`,
+  `Repository`. Drift and Agent judging are Verifier check kinds.
   `CardKind::External` is not registrable. `Tool`, `Skill`, and `SubAgent` are
   not Card kinds. `CardRef` is `kind`, `name`, one `version`, optional
   `uid`; Card identity is tenant, kind, name, and version.

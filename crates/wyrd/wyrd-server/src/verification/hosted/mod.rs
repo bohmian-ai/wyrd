@@ -7,11 +7,11 @@
 //! own: each execution composes them with its accepted authority and pinned
 //! evidence, and every limit comes from [`HostedLimits`].
 
-use monty_types::memory_limit_with_headroom;
 use std::time::Duration;
 
 pub mod blocks;
 pub mod evidence;
+pub mod publications;
 pub mod registry;
 pub mod sandbox;
 pub mod tools;
@@ -36,6 +36,21 @@ pub(crate) fn statement_caller(
     }
 }
 
+/// Every free permit of `permits`, held until the returned permit drops, so
+/// a test can saturate an idle admission.
+///
+/// # Panics
+/// Panics when `permits` is closed or a permit is taken concurrently.
+#[cfg(feature = "test-support")]
+pub(crate) fn hold_all(
+    permits: &std::sync::Arc<tokio::sync::Semaphore>,
+) -> tokio::sync::OwnedSemaphorePermit {
+    let free = u32::try_from(permits.available_permits()).unwrap_or(u32::MAX);
+    std::sync::Arc::clone(permits)
+        .try_acquire_many_owned(free)
+        .expect("a test saturates an open, idle admission")
+}
+
 /// An extractor refusal as the terminal block error it always is.
 pub(crate) fn extract_refused(error: wyrd_loader::ExtractError) -> vala_verify::blocks::BlockError {
     vala_verify::blocks::BlockError::Terminal { reason: error.0 }
@@ -49,8 +64,12 @@ pub(crate) fn extract_refused(error: wyrd_loader::ExtractError) -> vala_verify::
 pub struct HostedLimits {
     /// Largest input file, in bytes.
     pub file_max_bytes: u64,
-    /// Largest combined input-file bytes per execution.
+    /// Largest combined input-file bytes per execution, and the most bytes
+    /// one execution's accepted publications may retain together, so every
+    /// publication set stays mountable as successor input.
     pub files_max_bytes: u64,
+    /// Most publications one execution may accept across all its attempts.
+    pub publications_max: u32,
     /// Largest decompressed bytes per archive, including OOXML containers.
     pub archive_max_bytes: u64,
     /// Most entries per archive.
@@ -67,21 +86,25 @@ pub struct HostedLimits {
     pub work_write_max_bytes: u64,
     /// Largest serialized tool result, in bytes.
     pub tool_result_max_bytes: usize,
-    /// Most concurrent workspaces per process.
-    pub max_workspaces: usize,
-    /// Prewarmed Python worker processes.
+    /// Largest compact JSON argument object of one direct or nested tool
+    /// call, `code.run` source included, in bytes.
+    pub tool_argument_max_bytes: usize,
+    /// Most direct and nested tool requests of one logical Agent
+    /// invocation, across its retries.
+    pub agent_tool_max_calls: u32,
+    /// Most concurrently running direct `verify` executions per process;
+    /// queued executions are bounded by the runtime's own execution slots.
+    pub direct_executions: usize,
+    /// Most concurrent gateway model calls of every direct and queued
+    /// execution in the process; a further call waits for one to finish
+    /// before it reaches gateway admission.
+    pub model_calls: usize,
+    /// Python worker processes the pool prewarms when process memory holds
+    /// them; a target, not a floor, since idle workers are reaped under
+    /// pressure.
     pub monty_min_workers: usize,
-    /// Most live Python worker processes.
-    pub monty_max_workers: usize,
-    /// Most Python operations waiting for a worker.
-    pub monty_max_waiters: usize,
     /// Monty allocation budget per Python operation, in bytes.
     pub monty_memory_bytes: u64,
-    /// Memory ceiling of one worker process, in bytes; must hold the
-    /// operation budget plus Monty's allocator headroom.
-    pub monty_process_memory_bytes: u64,
-    /// Combined memory ceiling of every live worker process, in bytes.
-    pub monty_pool_memory_bytes: u64,
     /// One complete Python operation, from checkout wait to result.
     pub code_timeout: Duration,
     /// Cumulative Python-operation time within one Agent invocation.
@@ -102,26 +125,6 @@ impl HostedLimits {
             extract_text_max_bytes: self.extract_text_max_bytes,
         }
     }
-
-    /// Most live workers the memory ceilings allow: `monty_max_workers`,
-    /// lowered until every live worker's process ceiling fits the pool
-    /// ceiling together.
-    ///
-    /// Returns `None` when one operation's allocator ceiling (budget plus
-    /// Monty's headroom) exceeds the process ceiling, or the pool ceiling
-    /// cannot hold one worker.
-    #[must_use]
-    pub fn live_workers(&self) -> Option<usize> {
-        let ceiling =
-            memory_limit_with_headroom(usize::try_from(self.monty_memory_bytes).ok(), false)?;
-        if u64::try_from(ceiling).ok()? > self.monty_process_memory_bytes {
-            return None;
-        }
-        let fit =
-            usize::try_from(self.monty_pool_memory_bytes / self.monty_process_memory_bytes.max(1))
-                .ok()?;
-        Some(fit.min(self.monty_max_workers)).filter(|&workers| workers > 0)
-    }
 }
 
 impl Default for HostedLimits {
@@ -132,6 +135,7 @@ impl Default for HostedLimits {
         Self {
             file_max_bytes: 20 * MIB,
             files_max_bytes: 100 * MIB,
+            publications_max: 1_000,
             archive_max_bytes: 200 * MIB,
             archive_max_entries: 10_000,
             archive_max_ratio: 100,
@@ -140,53 +144,15 @@ impl Default for HostedLimits {
             scratch_max_bytes: 250 * MIB,
             work_write_max_bytes: 50 * MIB,
             tool_result_max_bytes: 64 * 1024,
-            max_workspaces: 16,
-            monty_min_workers: 2,
-            monty_max_workers: 8,
-            monty_max_waiters: 16,
+            tool_argument_max_bytes: 64 * 1024,
+            agent_tool_max_calls: 128,
+            direct_executions: 256,
+            model_calls: 256,
+            monty_min_workers: 1,
             monty_memory_bytes: 256 * MIB,
-            monty_process_memory_bytes: 384 * MIB,
-            monty_pool_memory_bytes: 2048 * MIB,
             code_timeout: Duration::from_secs(10),
             agent_code_budget: Duration::from_secs(60),
             verify_timeout: Duration::from_secs(60),
-        }
-    }
-}
-
-/// Memory ceilings bound the live worker count on every platform.
-#[cfg(test)]
-mod tests {
-    use super::HostedLimits;
-
-    /// The defaults fit five 384 MiB workers in 2 GiB; a pool ceiling below
-    /// one worker or a process ceiling below the allocator ceiling refuses.
-    ///
-    /// # Panics
-    /// Panics when the worker cap ignores either ceiling.
-    #[test]
-    fn memory_ceilings_cap_live_workers() {
-        let limits = HostedLimits::default();
-        assert_eq!(limits.live_workers(), Some(5));
-        assert_eq!(
-            HostedLimits {
-                monty_max_workers: 3,
-                ..limits
-            }
-            .live_workers(),
-            Some(3)
-        );
-        for impossible in [
-            HostedLimits {
-                monty_pool_memory_bytes: limits.monty_process_memory_bytes - 1,
-                ..limits
-            },
-            HostedLimits {
-                monty_process_memory_bytes: limits.monty_memory_bytes,
-                ..limits
-            },
-        ] {
-            assert_eq!(impossible.live_workers(), None);
         }
     }
 }

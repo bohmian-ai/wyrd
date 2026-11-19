@@ -1,32 +1,45 @@
 //! The tool seam an Agent step action or check uses.
 //!
-//! The host binds executable built-ins to one invocation's authority,
-//! deadline, and workspace and hands them over as a [`ToolSession`]: a Skald
-//! [`ToolRegistry`] holding only the tools the Agent declared, plus a guard
-//! that releases the invocation's resources when dropped. The Agent executor
-//! resolves each declared name through the registry, wraps every tool in a
-//! [`RecordedTool`] that records the call for provenance, and attaches the
-//! tools to the ordinary Skald Agent loop. A tool whose failure's cause is
-//! [`BlockError::Busy`] raises the session's refusal, which wakes the Agent
-//! executor so the invocation fails busy at once, dropping sibling tool calls
-//! still in flight; the session's `before_model` hook also ends the loop
-//! before the model sees the refusal. Nothing here is shared between
-//! invocations.
+//! The host binds executable built-ins to one attempt's authority, deadline,
+//! and workspace and hands them over as a [`ToolSession`]: a Skald
+//! [`ToolRegistry`] holding only the tools the Agent declared, the optional
+//! [`CodeTool`] that runs `code.run` with a [`ToolBridge`], and a guard that
+//! releases the attempt's resources when dropped. The Agent executor resolves
+//! each declared name through the registry and attaches recording tools to
+//! the ordinary Skald Agent loop.
+//!
+//! Direct calls from the model and nested `call_tool` requests from
+//! `code.run` share one path: each request first spends one unit of the
+//! logical invocation's [`ToolCalls`] allowance, then its arguments are
+//! bounded, every operation except `code.run` holds one of the session's
+//! concurrency permits, and the admitted call is recorded in start order
+//! with the recipient its result goes to. A request past the allowance, or a
+//! host failure (a [`BlockError`] cause, such as a capacity refusal or a
+//! `code.run` time limit or program failure, or an Oracle queue refusal),
+//! halts the session: the Agent executor wakes and ends the invocation at
+//! once, dropping calls still in flight, and the session's `before_model`
+//! hook ends the loop before the model sees the stop. Nothing here is shared between invocations except
+//! the engine-owned [`ToolCallsOwner`] of one step's attempts.
 
 use std::any::Any;
 use std::collections::BTreeMap;
+use std::fmt;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{Value, json};
 use skald_agent::{BeforeModelFn, CallbackOutcome};
-use skald_tool::{AgentTool, ToolError, ToolRegistry};
-use tokio::sync::watch;
+use skald_tool::{AgentTool, StructuredInvocationError, ToolError, ToolRegistry};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::time::Instant;
 use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::card::agent::BuiltinTool;
+use wyrd_spec::error::WyrdError;
+use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::verification::TaskId;
-use wyrd_spec::verification::execution::ToolCallRecord;
+use wyrd_spec::verification::execution::{Producer, ToolCallRecord, ToolRecipient};
 
 use super::{BlockError, CallInput};
 
@@ -39,7 +52,8 @@ use super::{BlockError, CallInput};
 #[async_trait]
 pub trait AgentToolset: Send + Sync {
     /// Open the tool session for `tools` of the Agent call `id`, in its
-    /// resolved `workspace` and cancelled at `deadline`.
+    /// resolved `workspace` and cancelled at `deadline`. `producer` is the
+    /// step attempt a `publish` call retains content for; a check has none.
     ///
     /// Called once per Agent step or check attempt, before the first model
     /// call. The returned session lives exactly as long as that attempt.
@@ -55,70 +69,474 @@ pub trait AgentToolset: Send + Sync {
         workspace: &BTreeMap<String, CallInput>,
         deadline: Instant,
         tools: &[BuiltinTool],
+        producer: Option<&Producer>,
     ) -> Result<ToolSession, BlockError>;
 }
 
-/// The tools of one invocation and the resources they hold.
+/// Bounds every call of one tool session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolLimits {
+    /// Largest compact JSON result delivered to a recipient, in bytes.
+    pub max_result_bytes: usize,
+    /// Largest compact JSON argument object of one call, in bytes.
+    pub max_argument_bytes: usize,
+    /// Most direct and nested requests of one logical invocation.
+    pub max_calls: u32,
+}
+
+/// Runs `code.run` with nested tool calls.
+///
+/// The host implements it for its sandbox; the session hands each run a
+/// [`ToolBridge`] through which the program's `call_tool` requests take the
+/// same path as the model's direct calls.
+#[async_trait]
+pub trait CodeTool: Send + Sync {
+    /// Run the `code.run` arguments `args`, sending nested requests to
+    /// `bridge`.
+    ///
+    /// # Errors
+    /// Returns the tool failure the model sees; a failure whose cause is a
+    /// [`BlockError`] halts the session with that error instead, so a time
+    /// limit or a program failure ends the invocation.
+    async fn run(&self, args: Value, bridge: ToolBridge) -> Result<Value, ToolError>;
+}
+
+/// The caller-owned tool-call records, request allowance, and host-work
+/// settlement of one logical invocation: a step action across its retries,
+/// or one check.
+///
+/// The engine creates one per invocation, keeps it outside every attempt it
+/// times, and hands each attempt only a [`ToolCalls`] handle in
+/// [`BlockCall::tool_calls`](super::BlockCall). After each attempt, even one
+/// it timed out and dropped, it awaits [`Self::settle`] so host work the
+/// attempt started ends before a retry or result, then reads
+/// [`Self::settled`] into the produced result whatever the outcome. It is the
+/// only way to await or read that state, so an executor cannot take the
+/// cleanup its caller must finish.
+///
+/// When the owner itself is dropped before settling, as when its run
+/// discards a speculative step or reaches its deadline, the host work still
+/// owed moves to the [`HostWork`] it was [adopted by](Self::adopted_by), so
+/// the run's owner can settle it before it records what follows.
+#[derive(Debug)]
+pub struct ToolCallsOwner {
+    /// The state its handles share.
+    calls: ToolCalls,
+    /// Where settlements still owed go when the owner is dropped; `None`
+    /// drops them with it.
+    orphans: Option<HostWork>,
+}
+
+impl Default for ToolCallsOwner {
+    /// A fresh invocation: no records, nothing spent, nothing to settle.
+    fn default() -> Self {
+        Self {
+            calls: ToolCalls {
+                inner: Arc::default(),
+            },
+            orphans: None,
+        }
+    }
+}
+
+impl Drop for ToolCallsOwner {
+    /// Hands every settlement whose host work has not ended, including one
+    /// a dropped [`Self::settle`] was awaiting, to the adopting
+    /// [`HostWork`].
+    fn drop(&mut self) {
+        if let Some(orphans) = &self.orphans {
+            let owed = std::mem::take(&mut *self.calls.inner.settlements());
+            orphans.pending().extend(owed);
+        }
+    }
+}
+
+/// Host work that outlived the invocation that started it.
+///
+/// One run owns one, shared by its clones: every [`ToolCallsOwner`] the run
+/// creates is [adopted](ToolCallsOwner::adopted_by) by it, so an invocation
+/// dropped mid-attempt still leaves its started work owed here.
+/// [`Self::settle`] waits for that work, which the run awaits before it
+/// records a discarded step's disposition or its own deadline result.
+#[derive(Clone, Default)]
+pub struct HostWork {
+    /// Settlements of dropped invocations whose host work has not ended.
+    pending: Arc<Mutex<Vec<Owed>>>,
+}
+
+impl fmt::Debug for HostWork {
+    /// The number of settlements owed, never their futures.
+    ///
+    /// # Errors
+    /// Returns the formatter's error when writing to it fails.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HostWork")
+            .field("pending", &self.pending().len())
+            .finish()
+    }
+}
+
+impl HostWork {
+    /// Locks the owed settlements; a poisoned lock is recovered, because
+    /// every holder only adds or removes whole settlements under it.
+    fn pending(&self) -> std::sync::MutexGuard<'_, Vec<Owed>> {
+        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Leave `settlement`, which resolves once some started host work has
+    /// ended, for the next [`Self::settle`].
+    pub fn adopt(&self, settlement: impl Future<Output = ()> + Send + 'static) {
+        self.pending().push(Owed::new(Box::pin(settlement)));
+    }
+
+    /// Wait until the host work of every invocation dropped so far, and of
+    /// any dropped while waiting, has ended.
+    pub async fn settle(&self) {
+        drain(&self.pending).await;
+    }
+}
+
+/// One settlement owed until its host work ends.
+///
+/// It stays in its list while awaited and leaves only once it resolved, so
+/// a waiter that is dropped mid-await leaves it owed, and to whichever
+/// owner the list moves to, rather than taking it away. Its future sits
+/// behind an async lock: one waiter polls it at a time, a waiter dropped
+/// mid-await releases it for the next, and every other waiter waits for
+/// the same end instead of finding the list empty.
+#[derive(Clone)]
+struct Owed(
+    /// The settlement, `None` once it resolved; shared by every list and
+    /// waiter holding this entry.
+    Arc<tokio::sync::Mutex<Option<Settlement>>>,
+);
+
+impl Owed {
+    /// Owes `settlement` until it resolves.
+    fn new(settlement: Settlement) -> Self {
+        Self(Arc::new(tokio::sync::Mutex::new(Some(settlement))))
+    }
+
+    /// Waits until the settlement resolved, polling it unless another
+    /// waiter already is or it already resolved.
+    ///
+    /// # Cancellation
+    /// Dropping the wait leaves the settlement unresolved and owed, for the
+    /// next waiter to continue.
+    async fn settle(&self) {
+        let mut settlement = self.0.lock().await;
+        if let Some(pending) = settlement.as_mut() {
+            pending.await;
+            *settlement = None;
+        }
+    }
+}
+
+/// Await each settlement in `pending`, including ones added while waiting,
+/// removing each only once it resolved and never holding the list's lock
+/// across an await.
+///
+/// # Cancellation
+/// Dropping the wait removes nothing still unresolved, so `pending`, and
+/// any owner it is handed to, still owes the work.
+async fn drain(pending: &Mutex<Vec<Owed>>) {
+    loop {
+        let next = pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .last()
+            .cloned();
+        let Some(owed) = next else {
+            return;
+        };
+        owed.settle().await;
+        pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|other| !Arc::ptr_eq(&other.0, &owed.0));
+    }
+}
+
+impl ToolCallsOwner {
+    /// The invocation as earlier runs of its execution left it, having
+    /// spent `spent` requests.
+    #[must_use]
+    pub fn resumed(spent: u32) -> Self {
+        let owner = Self::default();
+        owner.calls.inner.spent.store(spent, Ordering::SeqCst);
+        owner
+    }
+
+    /// Leave host work still owed when this owner is dropped to `work`.
+    #[must_use]
+    pub fn adopted_by(mut self, work: &HostWork) -> Self {
+        self.orphans = Some(work.clone());
+        self
+    }
+
+    /// Report the invocation's spent count to `recorder` after each request
+    /// spends one, replacing any earlier recorder, so each attempt reports
+    /// under its own record.
+    pub(crate) fn record_with(&self, recorder: Recorder) {
+        *self
+            .calls
+            .inner
+            .recorder
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(recorder);
+    }
+
+    /// Requests the invocation has spent so far, restored spend included.
+    #[must_use]
+    pub fn spent(&self) -> u32 {
+        self.calls.inner.spent.load(Ordering::SeqCst)
+    }
+
+    /// A handle an attempt records into, spends from, and registers its host
+    /// work with; it cannot await or read that state.
+    #[must_use]
+    pub fn handle(&self) -> ToolCalls {
+        self.calls.clone()
+    }
+
+    /// Every admitted call in start order.
+    ///
+    /// A call still in flight when its attempt ended keeps its arguments and
+    /// recipient but returned nothing, so it has no digest, zero bytes, and a
+    /// cancellation error.
+    #[must_use]
+    pub fn settled(&self) -> Vec<ToolCallRecord> {
+        self.calls
+            .lock()
+            .iter()
+            .map(|(record, finished)| {
+                let mut record = record.clone();
+                if !finished {
+                    record.output_sha256 = None;
+                    record.returned_bytes = 0;
+                    record.error =
+                        Some("cancelled: the invocation ended before the call returned".to_owned());
+                }
+                record
+            })
+            .collect()
+    }
+
+    /// Wait until the host work every attempt's session started has ended.
+    ///
+    /// A session registers its settlement when it opens, so this still
+    /// waits after the attempt that owned the session was dropped, as when
+    /// the engine timed it out.
+    pub async fn settle(&self) {
+        drain(&self.calls.inner.settlements).await;
+    }
+}
+
+/// An attempt's handle on its invocation's [`ToolCallsOwner`].
+///
+/// Tool calls spend its allowance and record into it, and a session
+/// registers its host-work settlement with it; only the owner awaits that
+/// settlement or reads the records. A clone shares the same state.
+#[derive(Clone)]
+pub struct ToolCalls {
+    /// Shared state.
+    inner: Arc<CallLog>,
+}
+
+/// The state behind [`ToolCallsOwner`] and its [`ToolCalls`] handles.
+#[derive(Default)]
+struct CallLog {
+    /// Requests spent; never refunded.
+    spent: AtomicU32,
+    /// Where each new spent count is reported.
+    recorder: Mutex<Option<Recorder>>,
+    /// Admitted calls in start order, each with whether it finished.
+    records: Mutex<Vec<(ToolCallRecord, bool)>>,
+    /// Settlements of attempts' sessions whose host work has not ended.
+    settlements: Mutex<Vec<Owed>>,
+}
+
+/// Receives an invocation's spent tool-request count after each request.
+pub(crate) type Recorder = Arc<dyn Fn(u32) + Send + Sync>;
+
+/// Resolves once the host work one session's calls started has ended.
+type Settlement = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+impl fmt::Debug for ToolCalls {
+    /// The spent count and record count, never arguments.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ToolCalls")
+            .field("spent", &self.inner.spent.load(Ordering::SeqCst))
+            .field("records", &self.lock().len())
+            .finish()
+    }
+}
+
+impl CallLog {
+    /// Locks the settlements still owed; a poisoned lock is recovered,
+    /// because every holder only adds or removes whole settlements under it.
+    fn settlements(&self) -> std::sync::MutexGuard<'_, Vec<Owed>> {
+        self.settlements
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl ToolCalls {
+    /// Keep `settlement` for the owner's next [`ToolCallsOwner::settle`].
+    fn defer(&self, settlement: Settlement) {
+        self.inner.settlements().push(Owed::new(settlement));
+    }
+
+    /// Spend one request of `limit` and report the new count to the
+    /// recorder, or return `false` once all are spent.
+    pub(super) fn spend(&self, limit: u32) -> bool {
+        let Ok(before) = self
+            .inner
+            .spent
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |spent| {
+                (spent < limit).then(|| spent + 1)
+            })
+        else {
+            return false;
+        };
+        let recorder = self
+            .inner
+            .recorder
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(recorder) = recorder {
+            recorder(before + 1);
+        }
+        true
+    }
+
+    /// Record an admitted call's start, returning its slot.
+    fn start(&self, record: ToolCallRecord) -> usize {
+        let mut records = self.lock();
+        records.push((record, false));
+        records.len() - 1
+    }
+
+    /// Replace the call at `slot` with its finished `record`.
+    ///
+    /// # Panics
+    /// Panics when `slot` was not returned by [`Self::start`] on these
+    /// records, which only ever grow.
+    fn finish(&self, slot: usize, record: ToolCallRecord) {
+        self.lock()[slot] = (record, true);
+    }
+
+    /// The records, surviving a poisoned lock.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<(ToolCallRecord, bool)>> {
+        self.inner
+            .records
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// The tools of one attempt and the resources they hold.
 pub struct ToolSession {
     /// Executable tools keyed by built-in wire name.
     registry: ToolRegistry,
-    /// Largest serialized result returned to the model, in bytes.
-    max_result_bytes: usize,
-    /// Released when the session drops, such as the invocation workspace.
+    /// What runs `code.run` with a bridge; without one `code.run` runs as
+    /// its registry tool, computation only.
+    code: Option<Arc<dyn CodeTool>>,
+    /// Bounds of every call.
+    limits: ToolLimits,
+    /// Released when the session drops, such as the attempt workspace.
     _guard: Box<dyn Any + Send + Sync>,
-    /// Raised by the first tool refused process capacity.
-    refusal: Refusal,
+    /// Resolves once host work the session's calls started has ended; it
+    /// moves to the invocation's [`ToolCalls`] when the session opens. In a
+    /// mutex only so the session is `Sync`.
+    settled: Mutex<Option<Settlement>>,
+    /// Raised by the first request that stops the session.
+    halt: Halt,
 }
 
 impl ToolSession {
-    /// A session over `registry`, refusing results above `max_result_bytes`
-    /// and holding `guard` until it drops.
+    /// A session over `registry` bounded by `limits`, holding `guard` until
+    /// it drops.
     #[must_use]
     pub fn new(
         registry: ToolRegistry,
-        max_result_bytes: usize,
+        limits: ToolLimits,
         guard: Box<dyn Any + Send + Sync>,
     ) -> Self {
         Self {
             registry,
-            max_result_bytes,
+            code: None,
+            limits,
             _guard: guard,
-            refusal: Refusal::default(),
+            settled: Mutex::new(None),
+            halt: Halt::default(),
         }
     }
 
-    /// The reason of the first tool call refused process capacity, if any.
-    ///
-    /// The Agent executor reads it once the loop ends: a raised refusal
-    /// makes the invocation [`BlockError::Busy`] whatever the loop returned.
-    pub(crate) fn refused(&self) -> Option<String> {
-        self.refusal.reason.borrow().clone()
+    /// Wait for `settled` before the attempt ends, so blocking host work a
+    /// dropped call started, such as an extraction, ends before the
+    /// attempt's resources are released and before the engine retries the
+    /// step or produces its result, even when it timed the attempt out.
+    #[must_use]
+    pub fn with_settlement(mut self, settled: impl Future<Output = ()> + Send + 'static) -> Self {
+        self.settled = Mutex::new(Some(Box::pin(settled)));
+        self
     }
 
-    /// Resolves once any tool of this session is refused process capacity,
-    /// immediately when one already was.
+    /// Register the session's settlement with `calls`, whose owner awaits
+    /// it after the attempt however it ended.
+    pub(crate) fn register_with(&self, calls: &ToolCalls) {
+        let settled = self
+            .settled
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(settled) = settled {
+            calls.defer(settled);
+        }
+    }
+
+    /// Run `code.run` through `code`, which receives a [`ToolBridge`].
+    #[must_use]
+    pub fn with_code(mut self, code: Arc<dyn CodeTool>) -> Self {
+        self.code = Some(code);
+        self
+    }
+
+    /// Why the session stopped, if a request stopped it.
     ///
-    /// The Agent executor races the loop against it, so a refusal ends the
+    /// The Agent executor reads it once the loop ends: a raised halt decides
+    /// the invocation's error whatever the loop returned: the host's
+    /// [`BlockError`], such as [`BlockError::Busy`] for a capacity refusal,
+    /// or a terminal `WYRD_VERIFICATION_422_TOOL_BUDGET_EXCEEDED` for a
+    /// spent allowance.
+    pub(crate) fn halted(&self) -> Option<BlockError> {
+        self.halt.stop.borrow().as_ref().map(Stop::error)
+    }
+
+    /// Resolves once a request stops this session, immediately when one
+    /// already did.
+    ///
+    /// The Agent executor races the loop against it, so a stop ends the
     /// invocation while sibling tool calls are still pending; dropping the
-    /// loop drops those calls. Never resolves for a session without a
-    /// refusal.
-    pub(crate) async fn refusal_raised(&self) {
-        let mut raised = self.refusal.reason.subscribe();
-        // The sender lives in `self`, so the wait cannot observe a closed
-        // channel; an error would only mean no refusal can ever be raised.
-        if raised.wait_for(Option::is_some).await.is_err() {
-            std::future::pending::<()>().await;
-        }
+    /// loop drops those calls.
+    pub(crate) async fn halt_raised(&self) {
+        self.halt.raised().await;
     }
 
-    /// A `before_model` hook that aborts the Agent loop once any tool of this
-    /// session is refused process capacity, so the refusal never reaches the
-    /// model and no further model call is made.
-    pub(crate) fn halt_on_refusal(&self) -> BeforeModelFn {
-        let refusal = self.refusal.clone();
-        Arc::new(move |_, _| match refusal.reason.borrow().as_deref() {
-            Some(reason) => CallbackOutcome::Abort(wyrd_spec::error::WyrdError::internal(format!(
-                "a tool was refused process capacity: {reason}"
+    /// A `before_model` hook that aborts the Agent loop once the session
+    /// stopped, so the stop never reaches the model and no further model
+    /// call is made.
+    pub(crate) fn halt_before_model(&self) -> BeforeModelFn {
+        let halt = self.halt.clone();
+        Arc::new(move |_, _| match halt.stop.borrow().as_ref() {
+            Some(stop) => CallbackOutcome::Abort(WyrdError::internal(format!(
+                "the tool session stopped: {}",
+                stop.error()
             ))),
             None => CallbackOutcome::Continue,
         })
@@ -126,8 +544,10 @@ impl ToolSession {
 
     /// Resolve every declared built-in into a recording tool for the loop.
     ///
-    /// Resolution goes through the Skald [`ToolRegistry`]; the returned tools
-    /// append to `records` in call order.
+    /// Resolution goes through the Skald [`ToolRegistry`]. The returned tools
+    /// and any [`ToolBridge`] share `calls` and at most `concurrency` active
+    /// operations other than `code.run`, which holds no permit so its nested
+    /// calls can always acquire one.
     ///
     /// # Errors
     /// Returns [`BlockError::Terminal`] when the registry lacks a declared
@@ -135,27 +555,38 @@ impl ToolSession {
     pub(crate) fn resolve(
         &self,
         tools: &[BuiltinTool],
-        records: &Arc<Mutex<Vec<Option<ToolCallRecord>>>>,
+        calls: &ToolCalls,
+        concurrency: usize,
     ) -> Result<Vec<Arc<dyn AgentTool>>, BlockError> {
-        tools
+        let declared = tools
             .iter()
             .map(|&tool| {
-                let inner =
-                    self.registry
-                        .resolve(tool.as_str())
-                        .map_err(|error| BlockError::Terminal {
-                            reason: format!("tool {}: {error}", tool.as_str()),
-                        })?;
-                Ok(Arc::new(RecordedTool {
+                self.registry
+                    .resolve(tool.as_str())
+                    .map(|inner| (tool, inner))
+                    .map_err(|error| BlockError::Terminal {
+                        reason: format!("tool {}: {error}", tool.as_str()),
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let dispatch = Arc::new(Dispatch {
+            declared,
+            code: self.code.clone(),
+            limits: self.limits,
+            calls: calls.clone(),
+            halt: self.halt.clone(),
+            permits: Arc::new(Semaphore::new(concurrency.max(1))),
+        });
+        Ok(tools
+            .iter()
+            .map(|&tool| {
+                Arc::new(RecordedTool {
                     tool,
                     name: provider_tool_name(tool),
-                    inner,
-                    max_result_bytes: self.max_result_bytes,
-                    records: Arc::clone(records),
-                    refusal: self.refusal.clone(),
-                }) as Arc<dyn AgentTool>)
+                    dispatch: Arc::clone(&dispatch),
+                }) as Arc<dyn AgentTool>
             })
-            .collect()
+            .collect())
     }
 }
 
@@ -168,60 +599,499 @@ pub fn provider_tool_name(tool: BuiltinTool) -> String {
     tool.as_str().replace('.', "_")
 }
 
-/// One session's capacity refusal: the first reason wins and stays raised.
-#[derive(Clone)]
-struct Refusal {
-    /// The first refused call's bounded reason; unset until one is refused.
-    /// A watch channel so the executor can wait for it without missing a
-    /// refusal raised before it subscribed.
-    reason: Arc<watch::Sender<Option<String>>>,
+/// A Wyrd error as a structured tool failure keeping its stable problem.
+#[must_use]
+pub fn tool_error(error: &WyrdError) -> ToolError {
+    let problem = error.problem();
+    ToolError::StructuredInvocation(Box::new(StructuredInvocationError {
+        code: problem.code,
+        status: problem.status,
+        title: problem.title,
+        detail: problem.detail,
+        remediation: problem.remediation,
+        safe_details: Some(problem.details),
+    }))
 }
 
-impl Default for Refusal {
-    /// An unraised refusal.
+/// Why a session stopped.
+#[derive(Debug, Clone)]
+enum Stop {
+    /// A call failed with the host's own [`BlockError`]: process capacity
+    /// was refused, or `code.run` hit a time limit or its program failed.
+    Block(BlockError),
+    /// A request came after the allowance was spent.
+    Exhausted(u32),
+}
+
+impl Stop {
+    /// The invocation error this stop decides.
+    fn error(&self) -> BlockError {
+        match self {
+            Self::Block(error) => error.clone(),
+            Self::Exhausted(limit) => {
+                let error = exhausted(*limit);
+                BlockError::Terminal {
+                    reason: format!("{}: {}", error.code(), error.problem().detail),
+                }
+            }
+        }
+    }
+}
+
+/// The catalog error of a request past a `limit`-request allowance.
+fn exhausted(limit: u32) -> WyrdError {
+    WyrdError::VerificationToolBudgetExceeded {
+        message: format!("the invocation already made its {limit} allowed tool requests"),
+        details: json!({"max_calls": limit}),
+    }
+}
+
+/// One session's stop: the first cause wins and stays raised.
+#[derive(Clone)]
+struct Halt {
+    /// The first stop; unset until one is raised. A watch channel so the
+    /// executor can wait for it without missing a stop raised before it
+    /// subscribed.
+    stop: Arc<watch::Sender<Option<Stop>>>,
+}
+
+impl Default for Halt {
+    /// An unraised halt.
     fn default() -> Self {
         Self {
-            reason: Arc::new(watch::channel(None).0),
+            stop: Arc::new(watch::channel(None).0),
         }
     }
 }
 
-impl Refusal {
-    /// Raise the refusal when `error`'s cause is [`BlockError::Busy`], the
-    /// typed cause a host attaches to a tool refused process capacity; any
-    /// other failure is the model's to see.
+impl Halt {
+    /// Raise `stop` unless an earlier stop is already raised.
+    fn raise(&self, stop: Stop) {
+        self.stop.send_if_modified(|current| {
+            let first = current.is_none();
+            if first {
+                *current = Some(stop);
+            }
+            first
+        });
+    }
+
+    /// Whether a stop is raised.
+    fn is_raised(&self) -> bool {
+        self.stop.borrow().is_some()
+    }
+
+    /// Resolves once a stop is raised.
+    async fn raised(&self) {
+        let mut raised = self.stop.subscribe();
+        // The sender lives in `self`, so the wait cannot observe a closed
+        // channel; an error would only mean no stop can ever be raised.
+        if raised.wait_for(Option::is_some).await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    /// Raise a stop when `error` is the host's own failure rather than the
+    /// recipient's to see: a [`BlockError`] cause, which a host attaches to
+    /// a call refused process capacity and to a `code.run` stopped by a time
+    /// limit or failed by its program, or the structured
+    /// `WYRD_VALA_429_QUERY_QUEUE_FULL` problem of a query refused a place
+    /// in this process's Oracle queue, which stops it busy.
     fn observe(&self, error: &ToolError) {
-        if let ToolError::Invocation {
-            cause: Some(cause), ..
-        } = error
-            && let Some(BlockError::Busy { reason }) = cause.downcast_ref::<BlockError>()
-        {
-            self.reason.send_if_modified(|current| {
-                let first = current.is_none();
-                if first {
-                    *current = Some(reason.clone());
+        match error {
+            ToolError::Invocation {
+                cause: Some(cause), ..
+            } => {
+                if let Some(error) = cause.downcast_ref::<BlockError>() {
+                    self.raise(Stop::Block(error.clone()));
                 }
-                first
-            });
+            }
+            ToolError::StructuredInvocation(problem)
+                if problem.code == BifrostError::QueryQueueFull.code() =>
+            {
+                self.raise(Stop::Block(BlockError::Busy {
+                    reason: format!("{}: {}", problem.code, problem.detail),
+                }));
+            }
+            _ => {}
         }
     }
 }
 
-/// A built-in that records each call as a [`ToolCallRecord`].
+/// What every call of one attempt shares, whichever its origin.
+struct Dispatch {
+    /// The declared tools' registry entries.
+    declared: Vec<(BuiltinTool, Arc<dyn AgentTool>)>,
+    /// What runs `code.run` with a bridge.
+    code: Option<Arc<dyn CodeTool>>,
+    /// Bounds of every call.
+    limits: ToolLimits,
+    /// The logical invocation's records and allowance.
+    calls: ToolCalls,
+    /// The session's stop.
+    halt: Halt,
+    /// Active operations other than `code.run`.
+    permits: Arc<Semaphore>,
+}
+
+impl Dispatch {
+    /// The registry entry of declared `tool`.
+    fn declared(&self, tool: BuiltinTool) -> Option<&Arc<dyn AgentTool>> {
+        self.declared
+            .iter()
+            .find_map(|(declared, inner)| (*declared == tool).then_some(inner))
+    }
+
+    /// Spend one request of the invocation's allowance.
+    ///
+    /// # Errors
+    /// Returns `WYRD_VERIFICATION_422_TOOL_BUDGET_EXCEEDED` and raises the
+    /// session's halt once the allowance is spent, or when the session
+    /// already stopped, so no further work starts.
+    fn spend(&self) -> Result<(), ToolError> {
+        if self.halt.is_raised() {
+            return Err(stopped());
+        }
+        if self.calls.spend(self.limits.max_calls) {
+            return Ok(());
+        }
+        self.halt.raise(Stop::Exhausted(self.limits.max_calls));
+        Err(tool_error(&exhausted(self.limits.max_calls)))
+    }
+
+    /// Run the admitted `tool` with `args` for `recipient` and record it.
+    ///
+    /// Arguments must be one JSON object within the argument limit, checked
+    /// before anything is recorded. The record then starts, before the call
+    /// waits for one of the concurrency permits every operation except
+    /// `code.run` holds, so a call cancelled while waiting is still recorded.
+    /// A session stopped before the permit is granted ends the wait, and one
+    /// stopped while it was granted invokes nothing; either way the record
+    /// stays unfinished and settles as cancelled. A result larger than the
+    /// result limit is replaced by an error, so the recipient never receives
+    /// it and the record shows no returned bytes. A failed call records its
+    /// error prefixed with its stable Wyrd code; a host failure also halts
+    /// the session (see [`Halt::observe`]). A successful call's record
+    /// finishes only when its [`Delivery`] is delivered.
+    ///
+    /// # Errors
+    /// Returns [`ToolError::InvalidInput`] for arguments that are not an
+    /// object or exceed the limit, [`ToolError::Invocation`] once the
+    /// session stopped and for an oversized or unserializable result, or
+    /// the tool's own error.
+    ///
+    /// # Panics
+    /// Panics when `tool` is not declared, which every caller checks first.
+    async fn call(
+        self: &Arc<Self>,
+        tool: BuiltinTool,
+        call_id: Option<&str>,
+        args: Value,
+        recipient: ToolRecipient,
+    ) -> Result<Delivery, ToolError> {
+        if !args.is_object() {
+            return Err(ToolError::InvalidInput(
+                "tool arguments must be one JSON object".to_owned(),
+            ));
+        }
+        let max = self.limits.max_argument_bytes;
+        if serde_json::to_writer(&mut Capped::new(max), &args).is_err() {
+            return Err(ToolError::InvalidInput(format!(
+                "the arguments exceed the {max}-byte tool argument limit"
+            )));
+        }
+        let mut record = ToolCallRecord {
+            tool,
+            arguments: args.clone(),
+            recipient,
+            output_sha256: None,
+            returned_bytes: 0,
+            error: None,
+        };
+        let slot = self.calls.start(record.clone());
+        let result = match (&self.code, tool) {
+            (Some(code), BuiltinTool::CodeRun) => {
+                code.run(
+                    args,
+                    ToolBridge {
+                        dispatch: Arc::clone(self),
+                    },
+                )
+                .await
+            }
+            (_, BuiltinTool::CodeRun) => self.invoke(tool, call_id, args).await,
+            _ => {
+                let permit = Mutex::new(Some(self.permit().await?));
+                ACTIVE.scope(permit, self.invoke(tool, call_id, args)).await
+            }
+        };
+        let result = result.and_then(|output| {
+            // Encoding stops at the limit, so an oversized result never
+            // allocates more than the limit.
+            let mut writer = Capped::new(self.limits.max_result_bytes);
+            match serde_json::to_writer(&mut writer, &output) {
+                Ok(()) => {}
+                Err(error) if error.is_io() => {
+                    return Err(ToolError::Invocation {
+                        detail: format!(
+                            "the result exceeds the {}-byte tool result limit",
+                            self.limits.max_result_bytes
+                        ),
+                        cause: None,
+                    });
+                }
+                Err(error) => return Err(ToolError::OutputSerialization(error.to_string())),
+            }
+            Ok((output, writer.bytes))
+        });
+        match result {
+            Ok((value, bytes)) => {
+                record.output_sha256 = Some(Sha256Hex::digest(&bytes));
+                record.returned_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                Ok(Delivery {
+                    value,
+                    calls: self.calls.clone(),
+                    slot,
+                    record,
+                })
+            }
+            Err(error) => {
+                self.halt.observe(&error);
+                self.calls.finish(slot, failed(record, &error));
+                Err(error)
+            }
+        }
+    }
+
+    /// Invoke declared `tool`'s registry entry with `args`, for provider
+    /// call `call_id` when the model made the request.
+    ///
+    /// # Errors
+    /// Returns the tool's own error.
+    ///
+    /// # Panics
+    /// Panics when `tool` is not declared, which every caller checks first.
+    async fn invoke(
+        &self,
+        tool: BuiltinTool,
+        call_id: Option<&str>,
+        args: Value,
+    ) -> Result<Value, ToolError> {
+        let inner = self
+            .declared(tool)
+            .expect("only declared tools are dispatched");
+        match call_id {
+            Some(call_id) => inner.invoke_call(call_id, args).await,
+            None => inner.invoke(args).await,
+        }
+    }
+
+    /// One concurrency permit, unless the session stops first.
+    ///
+    /// # Errors
+    /// Returns [`ToolError::Invocation`] when the session stopped before or
+    /// while the permit was granted, so nothing is invoked after a stop.
+    ///
+    /// # Panics
+    /// Panics when the semaphore is closed, which the session never does.
+    async fn permit(&self) -> Result<OwnedSemaphorePermit, ToolError> {
+        let permit = tokio::select! {
+            permit = Arc::clone(&self.permits).acquire_owned() => {
+                permit.expect("the session never closes its permits")
+            }
+            () = self.halt.raised() => return Err(stopped()),
+        };
+        if self.halt.is_raised() {
+            return Err(stopped());
+        }
+        Ok(permit)
+    }
+}
+
+tokio::task_local! {
+    /// The concurrency permit of the call whose tool is being invoked.
+    static ACTIVE: Mutex<Option<OwnedSemaphorePermit>>;
+}
+
+/// Take the concurrency permit of the call now invoking this tool, so the
+/// blocking work it starts keeps the permit until that work ends, even when
+/// the call is dropped first.
+///
+/// `None` outside a permit-holding call, such as `code.run`, or once taken.
+#[must_use]
+pub fn hold_permit() -> Option<OwnedSemaphorePermit> {
+    ACTIVE
+        .try_with(|permit| permit.lock().unwrap_or_else(PoisonError::into_inner).take())
+        .ok()
+        .flatten()
+}
+
+/// The refusal of a request once the session stopped.
+fn stopped() -> ToolError {
+    ToolError::Invocation {
+        detail: "the tool session stopped".to_owned(),
+        cause: None,
+    }
+}
+
+/// `record` as delivering no value because of `error`, which it keeps
+/// prefixed with its stable Wyrd code.
+fn failed(mut record: ToolCallRecord, error: &ToolError) -> ToolCallRecord {
+    record.output_sha256 = None;
+    record.returned_bytes = 0;
+    record.error = Some(format!("{}: {error}", WyrdError::from(error).code()));
+    record
+}
+
+/// A successful call's value, recorded as returned only once delivered.
+///
+/// The record already carries the value's digest and size, but its call
+/// stays unfinished until [`Self::deliver`]: dropping the delivery, as when
+/// a program ends before Python receives the value, settles the record as
+/// cancelled with no digest, and [`Self::refuse`] records why the value
+/// could not be handed over.
+pub struct Delivery {
+    /// The result.
+    value: Value,
+    /// The logical invocation's records.
+    calls: ToolCalls,
+    /// The call's record slot.
+    slot: usize,
+    /// The finished record.
+    record: ToolCallRecord,
+}
+
+impl Delivery {
+    /// The result about to be delivered.
+    #[must_use]
+    pub const fn value(&self) -> &Value {
+        &self.value
+    }
+
+    /// Record the value as returned to its recipient and hand it over.
+    pub fn deliver(self) -> Value {
+        self.calls.finish(self.slot, self.record);
+        self.value
+    }
+
+    /// Record that the value never reached its recipient because of
+    /// `error`, such as a value Python cannot represent.
+    pub fn refuse(self, error: &ToolError) {
+        self.calls.finish(self.slot, failed(self.record, error));
+    }
+}
+
+/// The nested-call entry `code.run` hands its program.
+///
+/// Each request spends the invocation's allowance, resolves only a declared
+/// built-in other than `code.run`, `fs.write`, or `publish`, and then runs through the same recorded
+/// path as a direct call, recorded with recipient `code`.
+pub struct ToolBridge {
+    /// The attempt's shared dispatch.
+    dispatch: Arc<Dispatch>,
+}
+
+impl ToolBridge {
+    /// Call the declared built-in named `name` with `args`.
+    ///
+    /// # Errors
+    /// Returns `WYRD_VERIFICATION_422_TOOL_BUDGET_EXCEEDED` once the
+    /// allowance is spent, `WYRD_AGENT_404_TOOL_NOT_IN_AGENT` for a name
+    /// that is not a declared built-in or is one [`Self::resolve`] keeps from
+    /// code, and otherwise the
+    /// recorded call's errors. Check [`Self::halted`] after any error: a
+    /// halted session must not continue. The value counts as returned only
+    /// once the [`Delivery`] is delivered to the program.
+    pub async fn call(&self, name: &str, args: Value) -> Result<Delivery, ToolError> {
+        self.dispatch.spend()?;
+        let tool = self.resolve(name)?;
+        self.dispatch
+            .call(tool, None, args, ToolRecipient::Code)
+            .await
+    }
+
+    /// Refuse a request to `name` whose arguments could not be read as JSON
+    /// for `reason`, spending and resolving it as [`Self::call`] does.
+    ///
+    /// Returns the budget or unavailable-target error when one applies and
+    /// otherwise invalid input; nothing is dispatched or recorded.
+    #[must_use]
+    pub fn refuse(&self, name: &str, reason: String) -> ToolError {
+        match self.dispatch.spend().and_then(|()| self.resolve(name)) {
+            Ok(_) => ToolError::InvalidInput(reason),
+            Err(error) => error,
+        }
+    }
+
+    /// The declared built-in `name` names, never `code.run`, `fs.write`, or
+    /// `publish`.
+    ///
+    /// Code already writes its private `/work` directly, and a nested
+    /// request has no provider call identity a publication could replay
+    /// under, so neither writable tool is reachable from code.
+    ///
+    /// # Errors
+    /// Returns `WYRD_AGENT_404_TOOL_NOT_IN_AGENT` for any other name.
+    fn resolve(&self, name: &str) -> Result<BuiltinTool, ToolError> {
+        BuiltinTool::from_name(name)
+            .filter(|tool| {
+                !matches!(
+                    tool,
+                    BuiltinTool::CodeRun | BuiltinTool::FsWrite | BuiltinTool::Publish
+                ) && self.dispatch.declared(*tool).is_some()
+            })
+            .ok_or_else(|| {
+                tool_error(&WyrdError::AgentToolNotInAgent {
+                    message: "code may call only the Agent's declared tools other than \
+                              code.run, fs.write, and publish"
+                        .to_owned(),
+                    details: json!({}),
+                })
+            })
+    }
+
+    /// Whether the session stopped, so the program must end without a
+    /// result: its allowance is spent or a call was refused capacity.
+    #[must_use]
+    pub fn halted(&self) -> bool {
+        self.dispatch.halt.is_raised()
+    }
+
+    /// Largest compact JSON argument object of one request, in bytes.
+    #[must_use]
+    pub fn max_argument_bytes(&self) -> usize {
+        self.dispatch.limits.max_argument_bytes
+    }
+
+    /// Largest compact JSON result one request delivers, in bytes.
+    #[must_use]
+    pub fn max_result_bytes(&self) -> usize {
+        self.dispatch.limits.max_result_bytes
+    }
+}
+
+/// A declared built-in as the model calls it, recorded with recipient
+/// `model`.
 struct RecordedTool {
     /// The built-in the record names.
     tool: BuiltinTool,
     /// Provider-safe name.
     name: String,
-    /// The bound tool.
-    inner: Arc<dyn AgentTool>,
-    /// Largest serialized result returned to the model.
-    max_result_bytes: usize,
-    /// The invocation's records; a slot is reserved when a call starts so the
-    /// list keeps call order under concurrent tool calls.
-    records: Arc<Mutex<Vec<Option<ToolCallRecord>>>>,
-    /// The session's capacity refusal this tool raises.
-    refusal: Refusal,
+    /// The attempt's shared dispatch.
+    dispatch: Arc<Dispatch>,
+}
+
+impl RecordedTool {
+    /// The registry tool behind this name.
+    ///
+    /// # Panics
+    /// Panics when the tool is not declared, which [`ToolSession::resolve`]
+    /// prevents.
+    fn inner(&self) -> &Arc<dyn AgentTool> {
+        self.dispatch
+            .declared(self.tool)
+            .expect("every recorded tool is declared")
+    }
 }
 
 #[async_trait]
@@ -233,88 +1103,44 @@ impl AgentTool for RecordedTool {
 
     /// The bound tool's description.
     fn description(&self) -> &str {
-        self.inner.description()
+        self.inner().description()
     }
 
     /// The bound tool's argument schema.
     fn input_schema(&self) -> Value {
-        self.inner.input_schema()
+        self.inner().input_schema()
     }
 
     /// The bound tool's result schema.
     fn output_schema(&self) -> Value {
-        self.inner.output_schema()
+        self.inner().output_schema()
     }
 
-    /// Invoke the bound tool and record arguments, output digest, and size.
-    ///
-    /// A failed call records its error prefixed with its stable Wyrd code, so
-    /// a denied call names `WYRD_PERMISSION_403_DENIED_RBAC`. A result larger than the session limit is replaced by an error, so
-    /// the model never receives it and the record shows no returned bytes.
-    /// A failure caused by [`BlockError::Busy`] also raises the session's
-    /// refusal.
+    /// Spend one request, then run and record the call for the model
+    /// outside any provider call.
     ///
     /// # Errors
-    /// Returns the bound tool's error, or [`ToolError::Invocation`] for an
-    /// oversized or unserializable result.
+    /// Returns the spend refusal or [`Dispatch::call`] failures.
     async fn invoke(&self, args: Value) -> Result<Value, ToolError> {
-        let slot = {
-            let mut records = self.records.lock().unwrap_or_else(PoisonError::into_inner);
-            records.push(None);
-            records.len() - 1
-        };
-        let mut record = ToolCallRecord {
-            tool: self.tool,
-            arguments: args.clone(),
-            output_sha256: None,
-            returned_bytes: 0,
-            error: None,
-        };
-        let result = self.inner.invoke(args).await.and_then(|output| {
-            // Encoding stops at the limit, so an oversized result never
-            // allocates more than the limit.
-            let mut writer = Capped {
-                bytes: Vec::new(),
-                max: self.max_result_bytes,
-            };
-            match serde_json::to_writer(&mut writer, &output) {
-                Ok(()) => {}
-                Err(error) if error.is_io() => {
-                    return Err(ToolError::Invocation {
-                        detail: format!(
-                            "the result exceeds the {}-byte tool result limit",
-                            self.max_result_bytes
-                        ),
-                        cause: None,
-                    });
-                }
-                Err(error) => return Err(ToolError::OutputSerialization(error.to_string())),
-            }
-            let bytes = writer.bytes;
-            record.output_sha256 = Some(Sha256Hex::digest(&bytes));
-            record.returned_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-            Ok(output)
-        });
-        if let Err(error) = &result {
-            self.refusal.observe(error);
-            let code = wyrd_spec::error::WyrdError::from(error).code();
-            record.error = Some(format!("{code}: {error}"));
-        }
-        self.records.lock().unwrap_or_else(PoisonError::into_inner)[slot] = Some(record);
-        result
+        self.dispatch.spend()?;
+        self.dispatch
+            .call(self.tool, None, args, ToolRecipient::Model)
+            .await
+            .map(Delivery::deliver)
     }
-}
 
-/// The finished records of an invocation, dropping calls still in flight
-/// when the loop ended.
-pub(crate) fn finished(records: &Mutex<Vec<Option<ToolCallRecord>>>) -> Vec<ToolCallRecord> {
-    records
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .iter()
-        .flatten()
-        .cloned()
-        .collect()
+    /// Spend one request, then run and record the model's provider call
+    /// `call_id`, which a `publish` call retains its content under.
+    ///
+    /// # Errors
+    /// Returns the spend refusal or [`Dispatch::call`] failures.
+    async fn invoke_call(&self, call_id: &str, args: Value) -> Result<Value, ToolError> {
+        self.dispatch.spend()?;
+        self.dispatch
+            .call(self.tool, Some(call_id), args, ToolRecipient::Model)
+            .await
+            .map(Delivery::deliver)
+    }
 }
 
 /// Encoded bytes limited to `max`; a write past the limit fails without
@@ -324,6 +1150,16 @@ struct Capped {
     bytes: Vec<u8>,
     /// Byte limit.
     max: usize,
+}
+
+impl Capped {
+    /// Empty bytes limited to `max`.
+    const fn new(max: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            max,
+        }
+    }
 }
 
 impl std::io::Write for Capped {
@@ -345,5 +1181,113 @@ impl std::io::Write for Capped {
     /// Never.
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use tokio::sync::Notify;
+
+    use super::{HostWork, ToolCallsOwner};
+
+    /// Host work a test holds until it releases it.
+    fn held(release: &Arc<Notify>, ended: &Arc<AtomicBool>) -> super::Settlement {
+        let (release, ended) = (Arc::clone(release), Arc::clone(ended));
+        Box::pin(async move {
+            release.notified().await;
+            ended.store(true, Ordering::SeqCst);
+        })
+    }
+
+    /// Whether `waiting` is still pending after five seconds, dropping it.
+    async fn pending(waiting: impl Future<Output = ()>) -> bool {
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .is_err()
+    }
+
+    /// A settlement already being awaited stays owed when its waiter is
+    /// dropped: concurrent waiters keep waiting for it, it moves with its
+    /// dropped owner to the run's [`HostWork`], and every waiter there
+    /// finishes only once the work ends.
+    ///
+    /// # Panics
+    /// Panics when any waiter finishes before the held work ends, or the
+    /// work is not owed once its waiter is dropped.
+    #[tokio::test(start_paused = true)]
+    async fn an_awaited_settlement_stays_owed_when_its_waiter_is_dropped() {
+        let (release, ended) = (Arc::new(Notify::new()), Arc::new(AtomicBool::new(false)));
+        let work = HostWork::default();
+        let owner = ToolCallsOwner::default().adopted_by(&work);
+        owner.handle().defer(held(&release, &ended));
+
+        assert!(
+            pending(owner.settle()).await,
+            "the active waiter is dropped"
+        );
+        assert!(pending(owner.settle()).await, "a later waiter still waits");
+        let concurrent = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(5), owner.settle()),
+            tokio::time::timeout(Duration::from_secs(5), owner.settle()),
+        );
+        assert!(
+            concurrent.0.is_err() && concurrent.1.is_err(),
+            "a waiter behind another's poll does not infer completion"
+        );
+        drop(owner);
+        assert!(
+            pending(work.settle()).await,
+            "the dropped owner's work moves"
+        );
+        assert!(pending(work.settle()).await, "and stays owed after a drop");
+
+        let settling = tokio::spawn({
+            let work = work.clone();
+            async move { work.settle().await }
+        });
+        let observer = work.settle();
+        tokio::pin!(observer);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), &mut observer)
+                .await
+                .is_err(),
+            "a second waiter waits for the first's work"
+        );
+        assert!(!ended.load(Ordering::SeqCst));
+        release.notify_one();
+        observer.await;
+        settling.await.expect("settled");
+        assert!(ended.load(Ordering::SeqCst), "settlement follows the work");
+        assert_eq!(format!("{work:?}"), "HostWork { pending: 0 }");
+    }
+
+    /// An invocation with nothing spent spends its allowance afresh and one
+    /// with a recorded spend resumes from it; every admitted request reports
+    /// its new count to the latest recorder, and a refused one reports
+    /// nothing.
+    ///
+    /// # Panics
+    /// Panics when a resumed allowance admits a request past its limit,
+    /// refuses one within it, or reports a count other than the spent one.
+    #[test]
+    fn resumed_invocation_continues_from_its_recorded_spend() {
+        let fresh = ToolCallsOwner::resumed(0).handle();
+        assert!(fresh.spend(1));
+        assert!(!fresh.spend(1), "the allowance holds one request");
+        let known = ToolCallsOwner::resumed(2);
+        let reported = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&reported);
+        known.record_with(std::sync::Arc::new(move |spent| {
+            sink.lock().expect("sink").push(spent);
+        }));
+        assert!(known.handle().spend(4), "two of four spent leaves two");
+        assert!(known.handle().spend(4));
+        assert!(!known.handle().spend(4));
+        assert_eq!(known.spent(), 4);
+        assert_eq!(*reported.lock().expect("reports"), [3, 4]);
     }
 }

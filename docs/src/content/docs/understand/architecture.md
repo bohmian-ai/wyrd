@@ -12,7 +12,7 @@ A Wyrd deployment is one server binary, run as one pod or as several pods with d
 
 ## One binary, several roles
 
-Every pod runs `wyrd-server`. `WYRD_TARGET` chooses what a pod does: `all` runs everything and is a complete deployment on its own; `server`, `scribe`, `oracle`, and `forge-worker` split API, writes, queries, and compaction so each scales on its own load. Splitting changes resource ownership, not the API: clients see one server either way. [Bifrost](/understand/bifrost/#where-each-part-runs) shows which part each target runs.
+Every pod runs `wyrd-server`. `WYRD_TARGET` chooses what a pod does: `combined` runs everything and is a complete deployment on its own. `direct` runs synchronous verification, `worker` runs queued verification and GitHub webhooks, and `bifrost-ingest`, `bifrost-query`, and `bifrost-maintenance` run writes, queries, and compaction, so each scales on its own load. A pod refuses verification work its target does not run with `WYRD_VERIFICATION_421_WRONG_TARGET`. Splitting changes resource ownership, not the API: clients see one server either way. [Bifrost](/understand/bifrost/#where-each-part-runs) shows which part each target runs.
 
 ## One endpoint
 

@@ -6,6 +6,7 @@ use aes_gcm::aead::rand_core::RngCore;
 use aes_gcm::aead::{Aead, KeyInit, OsRng, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use argon2::Argon2;
+use hmac::Mac as _;
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -440,6 +441,35 @@ fn canonical_aad(domain: &str, context: &[&str]) -> Vec<u8> {
     out
 }
 
+/// HMAC-SHA256 (RFC 2104) of `message` under `key`.
+///
+/// Authenticates provider deliveries signed with a shared secret, such as a
+/// GitHub webhook's `X-Hub-Signature-256`. Any key length is accepted, as
+/// the RFC allows.
+#[must_use]
+pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    hmac_of(key, message).finalize().into_bytes().into()
+}
+
+/// Whether `tag` is the full HMAC-SHA256 of `message` under `key`, compared
+/// in constant time so a forger learns nothing from how long refusal takes.
+/// A truncated tag is refused.
+#[must_use]
+pub fn verify_hmac_sha256(key: &[u8], message: &[u8], tag: &[u8]) -> bool {
+    hmac_of(key, message).verify_slice(tag).is_ok()
+}
+
+/// The keyed HMAC-SHA256 state after absorbing `message`.
+///
+/// # Panics
+/// Never: HMAC accepts a key of any length.
+fn hmac_of(key: &[u8], message: &[u8]) -> hmac::Hmac<Sha256> {
+    let mut mac = <hmac::Hmac<Sha256> as hmac::Mac>::new_from_slice(key)
+        .expect("invariant: HMAC accepts a key of any length");
+    mac.update(message);
+    mac
+}
+
 /// Cryptography helper errors.
 #[derive(Debug, thiserror::Error)]
 pub enum CryptError {
@@ -463,8 +493,63 @@ pub enum CryptError {
 #[cfg(test)]
 mod tests {
     use super::{
-        SealingKeyId, SealingKeyring, SecretKey, decrypt, derive_key, encrypt, open, rewrap, seal,
+        SealingKeyId, SealingKeyring, SecretKey, decrypt, derive_key, encrypt, hmac_sha256, open,
+        rewrap, seal, verify_hmac_sha256,
     };
+
+    /// HMAC-SHA256 matches the RFC 4231 vectors for a short key (case 2) and
+    /// a key longer than one block (case 6), and verification refuses a
+    /// changed message or a truncated tag.
+    ///
+    /// # Panics
+    /// Panics when a computed tag differs from the published one.
+    #[test]
+    fn hmac_sha256_matches_rfc_4231() {
+        let short = hmac_sha256(b"Jefe", b"what do ya want for nothing?");
+        assert_eq!(
+            hex(&short),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        let long = hmac_sha256(
+            &[0xaa; 131],
+            b"Test Using Larger Than Block-Size Key - Hash Key First",
+        );
+        assert_eq!(
+            hex(&long),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
+        assert!(verify_hmac_sha256(
+            b"Jefe",
+            b"what do ya want for nothing?",
+            &short
+        ));
+        assert!(!verify_hmac_sha256(
+            b"Jefe",
+            b"what do ya want for nothing!",
+            &short
+        ));
+        assert!(!verify_hmac_sha256(
+            b"Jefe",
+            b"what do ya want for nothing?",
+            &short[..31]
+        ));
+        let mut wrong = short;
+        wrong[0] ^= 1;
+        assert!(!verify_hmac_sha256(
+            b"Jefe",
+            b"what do ya want for nothing?",
+            &wrong
+        ));
+    }
+
+    /// Lowercase hex of `bytes`.
+    fn hex(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+        bytes.iter().fold(String::new(), |mut out, byte| {
+            write!(out, "{byte:02x}").expect("writing to a String cannot fail");
+            out
+        })
+    }
 
     /// Seal `plaintext` in the unversioned `nonce ‖ ciphertext` form that
     /// predates the keyring, as rows written before rotation support hold.

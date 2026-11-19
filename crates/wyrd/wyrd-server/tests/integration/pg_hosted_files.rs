@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use skald_spec::{MediaFormat, MediaSource};
 use vala_verify::blocks::{
     ActionExecutor, BlockCall, BlockError, CallInput, CallValue, EvidenceReader, Position,
+    ToolCallsOwner,
 };
 use wyrd_server::verification::hosted::HostedLimits;
 use wyrd_server::verification::hosted::evidence::TenantEvidence;
@@ -65,6 +66,7 @@ impl Uploads {
             self.server.state().clone(),
             user(self.server.data_tenant_id(), []),
             HostedLimits::default(),
+            wyrd_runtime::resources::ByteLedger::new(u64::MAX),
         )
     }
 }
@@ -95,7 +97,7 @@ async fn evidence_reads_only_matching_files() {
         .await
         .expect("the uploaded file reads");
     assert_eq!(
-        (bytes.as_slice(), format),
+        (bytes.bytes.as_slice(), format),
         (&b"%PDF-1.5 body"[..], MediaFormat::Pdf)
     );
 
@@ -155,18 +157,27 @@ async fn evidence_refuses_tampered_body() {
         .expect("test server shuts down");
 }
 
-/// Native media is base64 with the format's MIME type; non-native formats
-/// are refused.
+/// Native media is base64 with the format's MIME type and comes with a
+/// guard holding the process memory of its encoding until it drops; the read
+/// bytes are charged only until they are encoded, and no provider-shaped
+/// copies are promised. Memory short of the read bytes and their encoding
+/// refuses before anything is held, and non-native formats are refused.
 ///
 /// # Panics
-/// Panics when media binding differs.
+/// Panics when media binding or its charge differs.
 #[tokio::test(flavor = "current_thread")]
 async fn evidence_binds_native_media_only() {
     let uploads = Uploads::start().await;
     let pdf = uploads.put(b"%PDF-1.5").await;
     let csv = uploads.put(b"a,b").await;
-    let evidence = uploads.reader();
-    let media = evidence
+    let memory = wyrd_runtime::resources::ByteLedger::new(u64::MAX);
+    let evidence = TenantEvidence::new(
+        uploads.server.state().clone(),
+        user(uploads.server.data_tenant_id(), []),
+        HostedLimits::default(),
+        memory.clone(),
+    );
+    let (media, charge) = evidence
         .media(&file(pdf, 8, MediaFormat::Pdf))
         .await
         .expect("pdf is native");
@@ -177,6 +188,28 @@ async fn evidence_binds_native_media_only() {
             data: "JVBERi0xLjU=".to_owned(),
         }
     );
+    assert_eq!(
+        memory.used(),
+        12,
+        "the returned guard holds the encoding the media retains, nothing more"
+    );
+    drop(charge);
+    assert_eq!(memory.used(), 0, "dropping the guard returns the charge");
+    let short = wyrd_runtime::resources::ByteLedger::new(8 + 12 - 1);
+    let refusing = TenantEvidence::new(
+        uploads.server.state().clone(),
+        user(uploads.server.data_tenant_id(), []),
+        HostedLimits::default(),
+        short.clone(),
+    );
+    assert!(
+        matches!(
+            refusing.media(&file(pdf, 8, MediaFormat::Pdf)).await,
+            Err(BlockError::Busy { .. })
+        ),
+        "memory short of the read bytes and their encoding refuses before encoding"
+    );
+    assert_eq!(short.used(), 0, "a refusal holds nothing");
     assert!(
         evidence
             .media(&file(csv, 3, MediaFormat::Csv))
@@ -217,6 +250,10 @@ async fn extract_action_returns_locked_shape() {
         )]),
         workspace: BTreeMap::new(),
         deadline: tokio::time::Instant::now(),
+        attempt: 1,
+        item_index: None,
+        iteration_index: None,
+        tool_calls: ToolCallsOwner::default().handle(),
     };
     let output = ActionExecutor::execute(
         &evidence,

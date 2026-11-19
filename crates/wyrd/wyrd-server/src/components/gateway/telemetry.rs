@@ -21,6 +21,7 @@
 use std::time::{Duration, Instant};
 
 use wyrd_gateway::outcome_name;
+use wyrd_runtime::resources::ByteCharge;
 use wyrd_spec::gateway::{GatewayCallOutcome, GatewayOperation};
 
 use super::capture::operation_name;
@@ -28,6 +29,7 @@ use crate::app::metrics::{
     GATEWAY_DURATION_SECONDS, GATEWAY_OVERHEAD_SECONDS, GATEWAY_PHASE_DURATION_SECONDS,
     GATEWAY_UPSTREAM_SECONDS, GATEWAY_WAIT_SECONDS,
 };
+use crate::http::middleware::body_limit::BodyCustody;
 use crate::http::middleware::metrics::RequestArrival;
 
 /// One request-path phase of a governed call, as its `phase` label names it.
@@ -82,7 +84,10 @@ impl Phase {
 /// Waits are diagnostics beside the phases, never part of them: dispatch
 /// and resumption are handoffs between the caller's task and the call's
 /// execution task, and the provider waits split the exchanges the `answer`
-/// point already subtracts. They overlap phases and are never summed.
+/// point already subtracts. Admission, execution, and settlement time the
+/// call's consecutive steps between those handoffs, executing and waiting
+/// alike, so a call's own time is their sum with dispatch and resumption.
+/// They overlap phases and are never summed with them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Wait {
     /// The spawn of an admitted call's execution task until it starts;
@@ -97,6 +102,24 @@ pub(crate) enum Wait {
     ProviderHeaders,
     /// Ended provider exchanges' body receipt outside every header wait.
     ProviderBody,
+    /// The caller's task from receiving the call until it spawns the
+    /// admitted call's execution task: every admission phase and what lies
+    /// between them.
+    Admission,
+    /// Inside admission, the pause for process memory pressure before the
+    /// call holds any reservation.
+    Pressure,
+    /// Inside admission, a capturing unbound call's wait for a Scribe outbox
+    /// slot, item and reserved-byte limits alike.
+    CaptureSlot,
+    /// The execution task's provider attempts, from their start until the
+    /// engine returns: the provider waits, credential and translation, and
+    /// the engine's own work around them.
+    Execute,
+    /// The settlement step from the engine's return until the answer is sent:
+    /// a buffered call's accounting, evidence facts, observation, and
+    /// response, or an opened stream's response head.
+    Settle,
 }
 
 impl Wait {
@@ -107,12 +130,18 @@ impl Wait {
             Self::Resume => "resume",
             Self::ProviderHeaders => "provider_headers",
             Self::ProviderBody => "provider_body",
+            Self::Admission => "admission",
+            Self::Pressure => "pressure",
+            Self::CaptureSlot => "capture_slot",
+            Self::Execute => "execute",
+            Self::Settle => "settle",
         }
     }
 }
 
-/// Request-path timing the gateway ingress middleware hands to its handler.
-#[derive(Debug, Clone, Copy)]
+/// Request-path timing the gateway ingress middleware hands to its handler,
+/// with the request body's memory charge the handler's call takes over.
+#[derive(Debug, Clone)]
 pub(crate) struct IngressClock {
     /// When the request reached the server.
     arrival: Instant,
@@ -120,23 +149,37 @@ pub(crate) struct IngressClock {
     authenticating: Instant,
     /// When authentication finished.
     authenticated: Instant,
+    /// The buffered body's charge, when the body limit charged one.
+    body: Option<BodyCustody>,
 }
 
 impl IngressClock {
     /// The clock of a request authenticated from `authenticating` until now,
     /// arriving at `arrival`, or at `authenticating` when the arrival
-    /// middleware did not run.
-    pub(crate) fn authenticated(arrival: Option<RequestArrival>, authenticating: Instant) -> Self {
+    /// middleware did not run, whose buffered body the body limit charged
+    /// to `body`.
+    pub(crate) fn authenticated(
+        arrival: Option<RequestArrival>,
+        authenticating: Instant,
+        body: Option<BodyCustody>,
+    ) -> Self {
         Self {
             arrival: arrival.map_or(authenticating, RequestArrival::instant),
             authenticating,
             authenticated: Instant::now(),
+            body,
         }
+    }
+
+    /// Takes the request body's memory charge; `None` once taken or when
+    /// the body limit charged none.
+    pub(crate) fn body(&self) -> Option<ByteCharge> {
+        self.body.as_ref().and_then(BodyCustody::take)
     }
 
     /// Records the `authenticate` phase and the `parse` phase, which ends
     /// now, for `operation`, and returns the arrival.
-    pub(crate) fn parsed(self, operation: GatewayOperation) -> Instant {
+    pub(crate) fn parsed(&self, operation: GatewayOperation) -> Instant {
         let telemetry = CallTelemetry::new(operation, false, None);
         telemetry.phase(
             Phase::Authenticate,
@@ -386,6 +429,11 @@ mod tests {
             (Wait::ProviderHeaders, 80),
             (Wait::ProviderBody, 20),
             (Wait::Resume, 2),
+            (Wait::Admission, 3),
+            (Wait::Pressure, 5),
+            (Wait::CaptureSlot, 6),
+            (Wait::Execute, 101),
+            (Wait::Settle, 4),
         ] {
             call.wait(wait, Duration::from_millis(ms));
         }
@@ -396,6 +444,11 @@ mod tests {
             ("provider_headers", 80),
             ("provider_body", 20),
             ("resume", 2),
+            ("admission", 3),
+            ("pressure", 5),
+            ("capture_slot", 6),
+            ("execute", 101),
+            ("settle", 4),
         ] {
             let recorded = interval
                 .histogram(

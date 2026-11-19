@@ -661,6 +661,7 @@ fn embedded_scribe_resources(config: AdmissionConfig) -> crate::resources::Scrib
                 roles: [crate::resources::BifrostRole::Scribe]
                     .into_iter()
                     .collect(),
+                process_memory_limit_bytes: None,
                 server_memory_min_bytes: None,
                 bifrost_memory_limit_bytes: None,
                 scratch_limit_bytes: Some(crate::resources::MIN_SCRATCH_FREE_BYTES),
@@ -1167,10 +1168,12 @@ impl ScribeImpl {
         } = config;
         let seal_max_age = geometry.generation_max_age();
         let ScribeExecutionPools {
-            ingress_cpu,
-            persistence_cpu,
+            mut ingress_cpu,
+            mut persistence_cpu,
             wal_io,
         } = execution_pools;
+        ingress_cpu.join_lanes(memory.workloads());
+        persistence_cpu.join_lanes(memory.workloads());
         let control_postgres = persistence_config
             .as_ref()
             .map(|config| Arc::clone(&config.postgres));
@@ -1928,7 +1931,8 @@ impl Scribe for ScribeImpl {
                     | ScribeError::FingerprintMismatch { .. }
                     | ScribeError::TableNotFound { .. }
                     | ScribeError::CardScopeDenied
-                    | ScribeError::StreamMismatch { .. } => Some("invalid"),
+                    | ScribeError::StreamMismatch { .. }
+                    | ScribeError::BatchConflict => Some("invalid"),
                     ScribeError::IngressClosed
                     | ScribeError::IngestBusy { .. }
                     | ScribeError::Internal { .. } => None,
@@ -1952,8 +1956,8 @@ fn record_scribe_rejection(reason: &'static str) {
 /// [`record_scribe_rejection`] but attaches the closed
 /// [`ScribeRejectionCeiling::as_metric_label`] value as the `reason`, so a
 /// dashboard can tell a Scribe-child overflow apart from an ingress-sublimit,
-/// parent-ceiling, or cgroup-breaker rejection instead of reading one collapsed
-/// `reason="memory"`. The label set is closed to the five ceiling values and
+/// parent-ceiling, or process-memory rejection instead of reading one collapsed
+/// `reason="memory"`. The label set is closed to the four ceiling values and
 /// carries no tenant, table, or request identity.
 fn record_scribe_ceiling_rejection(ceiling: ScribeRejectionCeiling) {
     record_scribe_rejection(ceiling.as_metric_label());
@@ -2259,22 +2263,20 @@ mod telemetry_tests {
         let recorder = wyrd_bench::BenchmarkRecorder::default();
         metrics::with_local_recorder(&recorder, || {
             for ceiling in [
-                ScribeRejectionCeiling::CgroupBreaker,
+                ScribeRejectionCeiling::ProcessMemory,
                 ScribeRejectionCeiling::ScribeChild,
                 ScribeRejectionCeiling::IngressSublimit,
                 ScribeRejectionCeiling::BifrostParent,
-                ScribeRejectionCeiling::CgroupParent,
             ] {
                 super::record_scribe_ceiling_rejection(ceiling);
             }
         });
         let snapshot = recorder.snapshot();
         for reason in [
-            "cgroup_breaker",
+            "process_memory",
             "scribe_child",
             "ingress_sublimit",
             "bifrost_parent",
-            "cgroup_parent",
         ] {
             let key = format!("bifrost_scribe_rejections_total{{reason=\"{reason}\"}}");
             assert_eq!(

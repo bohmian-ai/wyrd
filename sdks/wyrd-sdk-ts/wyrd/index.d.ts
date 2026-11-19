@@ -737,6 +737,25 @@ export declare class NativeCards {
   delete(cardRef: string): Promise<NativeLifecycleResult>
 }
 
+/**
+ * Node-facing deferred evidence publisher over the shared
+ * [`Evidence`] handle; source resolution and upload stay in Rust.
+ */
+export declare class NativeEvidence {
+  /**
+   * Publishes `value` as the deferred input `name`; an omitted
+   * `repository` or `commit` resolves as `wyrd_client::verify::source`
+   * does, from `WYRD_REPOSITORY` / `WYRD_COMMIT`, then the working
+   * directory's Git checkout.
+   *
+   * # Errors
+   * Returns a napi error only when the receipt cannot be projected; a
+   * malformed value, an unresolvable source, and a server refusal are
+   * carried in the result.
+   */
+  publish(name: string, value: NativeVerifierInput, repository?: string | undefined | null, commit?: string | undefined | null): Promise<NativeLifecycleResult>
+}
+
 /** Node-facing handle of one queued Verifier execution. */
 export declare class NativeExecution {
   /** The server-issued execution ID. */
@@ -764,10 +783,63 @@ export declare class NativeExecution {
    *
    * # Errors
    * Returns a napi error only when the result cannot be projected; the
-   * terminal error and `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT` are returned
-   * in [`NativeLifecycleResult`].
+   * terminal error, `WYRD_SDK_409_VERIFICATION_CANCELLED`, and
+   * `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT` are returned in
+   * [`NativeLifecycleResult`].
    */
   wait(timeoutMs: number): Promise<NativeLifecycleResult>
+  /**
+   * Reads one stable page of the execution's invocation attempts.
+   *
+   * # Errors
+   * Returns a napi error only when the page cannot be projected; a
+   * malformed `page_json` and read failures are returned in
+   * [`NativeLifecycleResult`].
+   */
+  invocations(pageJson: string): Promise<NativeLifecycleResult>
+  /**
+   * Reads one stable page of the execution's accepted publications.
+   *
+   * # Errors
+   * As [`Self::invocations`].
+   */
+  publications(pageJson: string): Promise<NativeLifecycleResult>
+  /**
+   * Reads publication `name` of `step_id`'s exact producer attempt.
+   *
+   * # Errors
+   * Returns a napi error only when the publication cannot be projected; a
+   * malformed step, name, or selector and read failures are returned in
+   * [`NativeLifecycleResult`].
+   */
+  publication(stepId: string, name: string, selectorJson: string): Promise<NativeLifecycleResult>
+  /**
+   * Plans the download of a file publication, or of one listed file of a
+   * directory publication.
+   *
+   * # Errors
+   * As [`Self::publication`].
+   */
+  download(stepId: string, name: string, selectorJson: string): Promise<NativeLifecycleResult>
+  /**
+   * Cancels the execution durably; a terminal execution keeps its status.
+   *
+   * # Errors
+   * Returns a napi error only when the response cannot be projected;
+   * refusals are returned in [`NativeLifecycleResult`].
+   */
+  cancel(): Promise<NativeLifecycleResult>
+  /**
+   * Approves or rejects the pending approval occurrence `approval_id`
+   * and resolves to its durable receipt; the same decision and reason
+   * replay it.
+   *
+   * # Errors
+   * Returns a napi error only when the receipt cannot be projected; an
+   * invalid ID or decision and every server refusal are returned in
+   * [`NativeLifecycleResult`].
+   */
+  decide(approvalId: string, decision: string, reason?: string | undefined | null): Promise<NativeLifecycleResult>
 }
 
 /**
@@ -908,6 +980,38 @@ export declare class NativeGateway {
    * failures are returned in the result.
    */
   capturePolicy(): Promise<NativeLifecycleResult>
+}
+
+/** Tenant-scoped GitHub connection handle over the shared `wyrd_client` handle. */
+export declare class NativeGithubConnection {
+  /**
+   * Begins one connection transaction and returns GitHub's install URL
+   * and its expiry.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the receipt cannot be serialized; a
+   * server refusal is returned in the result.
+   */
+  begin(): Promise<NativeLifecycleResult>
+  /**
+   * Reads the tenant's redacted connection view.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the view cannot be serialized; a
+   * server refusal is returned in the result.
+   */
+  get(): Promise<NativeLifecycleResult>
+  /**
+   * Releases the tenant's installation and returns the released view.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the view cannot be serialized; a
+   * server refusal is returned in the result.
+   */
+  disconnect(): Promise<NativeLifecycleResult>
 }
 
 /** Tenant-scoped Operator connection handle over the shared `wyrd_client` handle. */
@@ -1347,6 +1451,20 @@ export declare class NativeWyrdClient {
    */
   gateway(): Promise<NativeGatewayConnection>
   /**
+   * Connects one GitHub connection handle that calls the server as this client.
+   *
+   * Completes any credential exchange this client requires before
+   * resolving, as `GithubConnection::connect_with` does; the public
+   * TypeScript `GithubConnection.connect` passes the caller's client or the
+   * ambient one. A refused or unreachable exchange is returned as catalog
+   * metadata.
+   *
+   * # Errors
+   *
+   * Never returns a napi error; failures are carried in the result.
+   */
+  githubConnection(): Promise<NativeGithubConnectionConnection>
+  /**
    * Connects one Operator connection handle that calls the server as this client.
    *
    * Completes any credential exchange this client requires before
@@ -1380,6 +1498,15 @@ export declare class NativeWyrdClient {
    * exchange are carried in the result.
    */
   connectExecution(id: string): Promise<NativeSubmission>
+  /**
+   * Connects one evidence publisher that calls the server as this client,
+   * as `Evidence::connect_with` does.
+   *
+   * # Errors
+   * Never returns a napi error; a refused or unreachable exchange is
+   * carried in the result.
+   */
+  evidence(): Promise<NativeEvidenceConnection>
 }
 
 /**
@@ -1651,6 +1778,17 @@ export interface NativeConfigureOptions {
   deploymentEnvironment?: string
 }
 
+/**
+ * Closed result of connecting one evidence publisher: the handle or a
+ * catalog error.
+ */
+export interface NativeEvidenceConnection {
+  /** Connected handle when the connection succeeded. */
+  handle?: NativeEvidence
+  /** Catalog failure otherwise. */
+  error?: NativeWyrdError
+}
+
 /** A local file for a `media` slot, read only when the call pins it. */
 export interface NativeFileInput {
   /** A file on disk; exclusive with `bytes`. */
@@ -1670,6 +1808,17 @@ export interface NativeFileInput {
 export interface NativeGatewayConnection {
   /** Connected handle when the connection succeeded. */
   handle?: NativeGateway
+  /** Catalog failure otherwise. */
+  error?: NativeWyrdError
+}
+
+/**
+ * Closed result of connecting one GitHub connection handle: the handle or a
+ * catalog error.
+ */
+export interface NativeGithubConnectionConnection {
+  /** Connected handle when the connection succeeded. */
+  handle?: NativeGithubConnection
   /** Catalog failure otherwise. */
   error?: NativeWyrdError
 }

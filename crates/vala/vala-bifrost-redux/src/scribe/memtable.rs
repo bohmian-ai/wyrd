@@ -159,8 +159,9 @@ pub(crate) struct PressureCandidate {
 ///
 /// # Errors
 ///
-/// Returns an invariant error when a caller reuses a retained batch ID for a
-/// different schema/data, length, slice ordinal, or complete slice count.
+/// Returns [`ScribeError::BatchConflict`] when a caller reuses a retained
+/// batch ID for a different schema/data, length, slice ordinal, or complete
+/// slice count.
 fn retained_identity_rows(
     meta: &ScribeAppendMeta,
     identity: crate::scribe::wal::ScribeAppendPayloadIdentity,
@@ -171,10 +172,7 @@ fn retained_identity_rows(
         || meta.slice_index != identity.slice_index
         || meta.slice_count != identity.slice_count
     {
-        return Err(ScribeError::Internal {
-            detail: "retained Scribe batch ID was reused with contradictory payload identity"
-                .to_owned(),
-        });
+        return Err(ScribeError::BatchConflict);
     }
     Ok(Some(u64::try_from(meta.rows_accepted).unwrap_or(u64::MAX)))
 }
@@ -422,6 +420,12 @@ impl Memtable {
     /// The lookup is the runtime idempotency index. It is intentionally
     /// derived from the bounded buckets instead of maintaining a process-wide
     /// append-ID set whose memory would grow with the lifetime of a shard.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::BatchConflict`] when the retained batch holds
+    /// this ID with a different payload identity, and [`ScribeError::Internal`]
+    /// when a memtable lock is poisoned.
     pub(crate) fn retained_batch_rows(
         &self,
         seal_key: &SealKey,
@@ -2335,12 +2339,19 @@ impl ReadableSource {
                 continue;
             }
             workspace.free();
-            let captured = batch;
+            // Every batch held below derives from the source columns the
+            // projection reads, so only their allocations can be shared; they
+            // are collected once for every charge against this batch.
+            let captured = crate::scribe::memory::allocations(
+                projection
+                    .iter()
+                    .filter_map(|(_, source)| source.map(|column| batch.column(column))),
+            );
             let hold = |held: &[RecordBatch]| {
                 workspace
-                    .try_resize(crate::scribe::memory::unshared_arrow_bytes(
+                    .try_resize(crate::scribe::memory::unshared_beyond(
                         held,
-                        &[captured],
+                        captured.clone(),
                     ))
                     .map_err(refused)
             };
@@ -2398,9 +2409,9 @@ impl ReadableSource {
             // takes over whatever allocations the output kept from it.
             workspace.free();
             query
-                .try_grow(crate::scribe::memory::unshared_arrow_bytes(
+                .try_grow(crate::scribe::memory::unshared_beyond(
                     std::slice::from_ref(&batch),
-                    &[captured],
+                    captured,
                 ))
                 .map_err(refused)?;
             output.push(ReadableBatch {

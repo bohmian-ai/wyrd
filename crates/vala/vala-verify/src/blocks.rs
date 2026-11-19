@@ -21,7 +21,10 @@ pub use agent::{
     AGENT_PHASE_DURATION_SECONDS, AgentCardResolver, AgentExecutor, EvidenceReader,
     PromptCardResolver, block_error,
 };
-pub use tools::{AgentToolset, ToolSession, provider_tool_name};
+pub use tools::{
+    AgentToolset, CodeTool, Delivery, HostWork, ToolBridge, ToolCalls, ToolCallsOwner, ToolLimits,
+    ToolSession, hold_permit, provider_tool_name, tool_error,
+};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
@@ -35,17 +38,21 @@ use tokio::time::Instant;
 
 use wyrd_spec::card::verifier::{Action, Check, PathSegment};
 use wyrd_spec::ids::SlotName;
-use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::{
-    CallProvenance, InputDeclaration, RequirementDetail, ToolCallRecord, Verdict,
+    CallProvenance, InputDeclaration, InvocationSettlement, Producer, PublicationCollection,
+    RequirementDetail, Verdict,
 };
+use wyrd_spec::verification::state::{ApprovalOccurrence, ControlRecord};
+use wyrd_spec::verification::{PublicationName, TaskId};
 
 mod drift;
 mod engine;
 mod scope;
 
 pub use drift::DriftChecks;
-pub use engine::{BLOCK_DURATION_SECONDS, BlockClock, EngineError, VerificationEngine};
+pub use engine::{
+    BLOCK_DURATION_SECONDS, BlockClock, Decisions, EngineError, VerificationEngine, conform,
+};
 
 /// Where a block sits in the Verifier, which fixes what it may read and do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +75,23 @@ pub enum CallValue {
     Json(BoundJson),
     /// Pinned original evidence a media slot names; executors fetch bytes.
     Evidence(InputDeclaration),
+    /// `steps.<id>.publications.<name>`: what `producer`, the step's
+    /// successful attempt, published under `name`. The host mounts it, or
+    /// refuses the call before it runs when no such publication exists.
+    Publication {
+        /// The successful producer attempt.
+        producer: Producer,
+        /// The logical name.
+        name: PublicationName,
+    },
+    /// `steps.<id>.publications`: the settled step's collection, whose
+    /// `entries` the host fills from the execution's admitted publications.
+    Publications {
+        /// The producer step.
+        step: TaskId,
+        /// Its status and attempts, with no entries yet.
+        collection: PublicationCollection,
+    },
 }
 
 /// The JSON one binding reads, dereferencing to the selected value.
@@ -203,6 +227,34 @@ pub struct BlockCall<'a, B> {
     pub workspace: BTreeMap<String, CallInput>,
     /// When the engine cancels this attempt.
     pub deadline: Instant,
+    /// The one-based attempt this call is, counting the block's recorded
+    /// attempts, so a host attributes what the attempt retains to it.
+    pub attempt: u32,
+    /// The zero-based fanout item this call serves, when its step fans out.
+    pub item_index: Option<u32>,
+    /// The zero-based repeat iteration this call serves, when its step
+    /// repeats.
+    pub iteration_index: Option<u32>,
+    /// A handle on the logical invocation's tool-call records, request
+    /// allowance, and host-work settlement, shared by every attempt of one
+    /// step; the engine keeps their [`ToolCallsOwner`], settles the work
+    /// before retrying or producing a result, and reads the records into the
+    /// result whatever the attempt returns.
+    pub tool_calls: ToolCalls,
+}
+
+impl<B> BlockCall<'_, B> {
+    /// The invocation attempt this call is: its block, item, iteration, and
+    /// attempt, the identity its retained work is attributed to.
+    #[must_use]
+    pub fn producer(&self) -> Producer {
+        Producer {
+            step_id: self.id.clone(),
+            item_index: self.item_index,
+            iteration_index: self.iteration_index,
+            attempt: self.attempt,
+        }
+    }
 }
 
 /// Data one step action produced.
@@ -212,8 +264,6 @@ pub struct ActionOutput {
     pub output: Value,
     /// What executed the action.
     pub provenance: Option<CallProvenance>,
-    /// Tools an Agent action called, in call order.
-    pub tool_calls: Vec<ToolCallRecord>,
 }
 
 /// The judgment one requirement check produced.
@@ -260,6 +310,17 @@ pub enum BlockError {
         /// Bounded, secret-free cause.
         reason: String,
     },
+    /// An exact definition the block requires, such as its Agent or Prompt
+    /// Card, is unavailable.
+    ///
+    /// The block cannot run as declared, so it is never judged and spends
+    /// no authored retry: the engine stops the whole execution with
+    /// [`EngineError::DefinitionUnavailable`].
+    #[error("a required definition is unavailable: {reason}")]
+    Unavailable {
+        /// Bounded, secret-free cause naming the definition.
+        reason: String,
+    },
 }
 
 impl BlockError {
@@ -290,6 +351,73 @@ pub trait CheckExecutor: Send + Sync {
     /// Returns a [`BlockError`] when no verdict was produced; the engine
     /// records the requirement as inconclusive with the error as reason.
     async fn execute(&self, call: BlockCall<'_, Check>) -> Result<CheckOutput, BlockError>;
+}
+
+/// The durable record of one queued execution's block invocations.
+///
+/// The engine records each action or check attempt before dispatching it and
+/// commits the block's settlement before its dependents run, so a reclaimed
+/// execution restores what settled and counts what never did. The host fences
+/// both writes with the execution's lease; direct verify runs without one.
+#[async_trait]
+pub trait Checkpoints: Send + Sync {
+    /// Record that the invocation attempt `producer` starts: a block, its
+    /// item and iteration, and its one-based attempt.
+    ///
+    /// # Errors
+    /// Returns a bounded reason when the record cannot commit, such as a lost
+    /// lease; the attempt is then not dispatched.
+    async fn begin(&self, producer: &Producer) -> Result<(), String>;
+
+    /// Forget the unsettled attempt `producer`, which was refused process
+    /// capacity or its definition after its host work settled, so it spends
+    /// no retry, while recording `tool_calls_spent`, the requests its
+    /// invocation had spent, so the deferred retry resumes from that count.
+    /// A host keeps the record of an attempt that already retained work as a
+    /// spent attempt.
+    ///
+    /// # Errors
+    /// Returns a bounded reason when the record cannot commit.
+    async fn forget(&self, producer: &Producer, tool_calls_spent: u32) -> Result<(), String>;
+
+    /// Record that the unsettled attempt `producer`'s invocation has spent
+    /// `tool_calls_spent` tool requests, called as each request spends one.
+    ///
+    /// Nothing waits for it to persist: a reclaimed invocation resumes from
+    /// the latest count the host persisted, so a request spent just before
+    /// an interruption may be spent again. A host that can no longer record
+    /// ignores it; its next commit reports the failure.
+    fn spent(&self, producer: &Producer, tool_calls_spent: u32);
+
+    /// Commit `settled` as the outcome of the attempt `producer`.
+    ///
+    /// # Errors
+    /// Returns a bounded reason when the settlement cannot commit; the block's
+    /// dependents then do not run.
+    async fn settle(
+        &self,
+        producer: &Producer,
+        settled: &InvocationSettlement,
+    ) -> Result<(), String>;
+
+    /// Record a scheduling decision recovery must reproduce rather than make
+    /// again, such as a step's frozen fanout items or a speculative step's
+    /// disposition, before anything depends on it.
+    ///
+    /// # Errors
+    /// Returns a bounded reason when the decision cannot commit; nothing that
+    /// depends on it then runs.
+    async fn control(&self, control: &ControlRecord) -> Result<(), String>;
+
+    /// Record that the engine reached the undecided approval `occurrence`
+    /// while other work may still run, so the host can offer it for a
+    /// decision at once rather than only when the execution parks.
+    /// Recording the same occurrence again changes nothing.
+    ///
+    /// # Errors
+    /// Returns a bounded reason when the occurrence cannot be recorded, such
+    /// as a lost lease; nothing downstream of it then runs.
+    async fn reached(&self, occurrence: &ApprovalOccurrence) -> Result<(), String>;
 }
 
 /// Decodes a check's raw `response` as the Verdict its declared `schema`
@@ -330,7 +458,7 @@ pub fn verdict_from(
 
 #[cfg(test)]
 mod tests {
-    //! Executor seam calls and the tool-record handoff into step results.
+    //! Executor seam calls and Verdict decoding.
 
     use std::sync::Arc;
     use std::time::Duration;
@@ -355,7 +483,6 @@ mod tests {
                 Some(CallValue::Json(value)) => Ok(ActionOutput {
                     output: Value::clone(value),
                     provenance: None,
-                    tool_calls: Vec::new(),
                 }),
                 _ => Err(BlockError::Terminal {
                     reason: "from is not JSON".to_owned(),
@@ -387,45 +514,13 @@ mod tests {
             inputs: BTreeMap::from([("from".to_owned(), input)]),
             workspace: BTreeMap::new(),
             deadline: Instant::now() + Duration::from_secs(5),
+            attempt: 1,
+            item_index: None,
+            iteration_index: None,
+            tool_calls: ToolCallsOwner::default().handle(),
         };
         let output = executor.execute(call).await.expect("output");
         assert_eq!(output.output, json!({"slides": []}));
-    }
-
-    /// A tool record an action returns is the record a step result carries:
-    /// its digest and returned byte count survive the result wire round trip.
-    ///
-    /// # Panics
-    /// Panics when the step result does not round-trip the record unchanged.
-    #[test]
-    fn action_tool_calls_carry_into_step_results() {
-        use wyrd_spec::card::agent::BuiltinTool;
-        use wyrd_spec::verification::execution::{StepResult, StepStatus};
-        let record: ToolCallRecord = serde_json::from_value(json!({
-            "tool": "fs.read", "arguments": {"path": "/inputs/a.pdf"},
-            "output_sha256": "c".repeat(64), "returned_bytes": 512
-        }))
-        .expect("record");
-        let output = ActionOutput {
-            output: json!({"cap": 24}),
-            provenance: None,
-            tool_calls: vec![record.clone()],
-        };
-        let step = StepResult {
-            id: TaskId::new("findings").expect("id"),
-            status: StepStatus::Succeeded,
-            output: Some(output.output),
-            attempts: 1,
-            duration_ms: 5,
-            reason: None,
-            provenance: output.provenance,
-            tool_calls: output.tool_calls,
-        };
-        let wire = serde_json::to_value(&step).expect("serialize");
-        let parsed: StepResult = serde_json::from_value(wire).expect("deserialize");
-        assert_eq!(parsed.tool_calls, vec![record]);
-        assert_eq!(parsed.tool_calls[0].tool, BuiltinTool::FsRead);
-        assert_eq!(parsed.tool_calls[0].returned_bytes, 512);
     }
 
     /// A declared data schema keeps its own reference root once embedded in

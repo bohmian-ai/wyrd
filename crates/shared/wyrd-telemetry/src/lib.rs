@@ -545,7 +545,10 @@ pub fn init_test_capture(
 /// operator verbosity records, so neither filter can add to a tenant copy
 /// either; the copy drops the attribute. Spans carry no busy/idle times, thread, or
 /// code location: each costs work on every span or every poll of an
-/// instrumented future, and no tenant copy keeps them.
+/// instrumented future, and no tenant copy keeps them. Entering a span does
+/// not attach its OpenTelemetry context either: parents and readers resolve
+/// it from the current `tracing` span, so attaching would only add a context
+/// push and pop to every poll.
 fn subscriber<W>(
     logs: EnvFilter,
     traces: EnvFilter,
@@ -563,21 +566,114 @@ where
         *metadata.level() <= tracing::Level::INFO
             && (metadata.is_event() || export::in_catalog(metadata.name()))
     });
+    // Color only a terminal: styling every span's fields costs CPU on every
+    // span, and piped or collected logs would carry the escape codes.
+    let ansi = std::io::IsTerminal::is_terminal(&std::io::stdout())
+        && std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty());
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
+                .with_ansi(ansi)
                 .with_writer(writer)
-                .with_filter(logs),
+                .with_filter(EnvDirectives::new(logs)),
         )
         .with(
             tracing_opentelemetry::layer()
                 .with_tracer(tracer)
                 .with_level(true)
                 .with_tracked_inactivity(false)
+                .with_context_activation(false)
                 .with_threads(false)
                 .with_location(false)
-                .with_filter(traces.or(tenant)),
+                .with_filter(EnvDirectives::new(traces).or(tenant)),
         )
+}
+
+/// An [`EnvFilter`] that keeps its span bookkeeping only when it has a span
+/// directive.
+///
+/// `EnvFilter` takes a lock on every span's creation, entry, exit, record and
+/// close to track the spans its span directives (`target[span{field}]=level`)
+/// match, and an instrumented future enters and exits its span on every poll.
+/// Without a span directive it never tracks a span, so those locks only
+/// contend across worker threads. This forwards every enable decision
+/// unchanged and drops the bookkeeping calls exactly when no directive could
+/// use them.
+struct EnvDirectives {
+    /// The wrapped filter.
+    filter: EnvFilter,
+    /// Whether any directive names a span or its fields, the only directives
+    /// `EnvFilter` prints in brackets.
+    spans: bool,
+}
+
+impl EnvDirectives {
+    /// Wraps `filter`, reading from its directives whether it tracks spans.
+    fn new(filter: EnvFilter) -> Self {
+        let spans = filter.to_string().contains('[');
+        Self { filter, spans }
+    }
+}
+
+impl<S> tracing_subscriber::layer::Filter<S> for EnvDirectives {
+    fn enabled(
+        &self,
+        metadata: &tracing::Metadata<'_>,
+        context: &tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        tracing_subscriber::layer::Filter::<S>::enabled(&self.filter, metadata, context)
+    }
+
+    fn callsite_enabled(
+        &self,
+        metadata: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing_subscriber::layer::Filter::<S>::callsite_enabled(&self.filter, metadata)
+    }
+
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        tracing_subscriber::layer::Filter::<S>::max_level_hint(&self.filter)
+    }
+
+    fn on_new_span(
+        &self,
+        attributes: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        context: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if self.spans {
+            self.filter.on_new_span(attributes, id, context);
+        }
+    }
+
+    fn on_record(
+        &self,
+        id: &tracing::span::Id,
+        values: &tracing::span::Record<'_>,
+        context: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if self.spans {
+            self.filter.on_record(id, values, context);
+        }
+    }
+
+    fn on_enter(&self, id: &tracing::span::Id, context: tracing_subscriber::layer::Context<'_, S>) {
+        if self.spans {
+            self.filter.on_enter(id, context);
+        }
+    }
+
+    fn on_exit(&self, id: &tracing::span::Id, context: tracing_subscriber::layer::Context<'_, S>) {
+        if self.spans {
+            self.filter.on_exit(id, context);
+        }
+    }
+
+    fn on_close(&self, id: tracing::span::Id, context: tracing_subscriber::layer::Context<'_, S>) {
+        if self.spans {
+            self.filter.on_close(id, context);
+        }
+    }
 }
 
 /// Build the process resource shared by production and test exporters.
@@ -807,6 +903,37 @@ mod tests {
                 "verification.run",
                 "request"
             ]
+        );
+    }
+
+    /// A span directive still scopes both destinations: inside
+    /// `verification.run` the log and the operator export follow
+    /// `[verification.run]=debug`, and without it they stay at `warn`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the span-scoped event or debug span is missing under the
+    /// span directive, or present without it.
+    #[test]
+    fn span_directives_scope_logs_and_operator_spans() {
+        let scoped = "warn,[verification.run]=debug";
+        let (_, operator, logs) = serve(scoped, scoped, 1.0);
+        assert!(
+            logs.contains("verification step"),
+            "scoped info is logged: {logs}"
+        );
+        assert!(
+            operator.iter().any(|span| span == "verification.detail"),
+            "scoped debug span is exported: {operator:?}"
+        );
+        let (_, operator, logs) = serve("warn", "warn", 1.0);
+        assert!(
+            !logs.contains("verification step"),
+            "unscoped info is filtered: {logs}"
+        );
+        assert!(
+            !operator.iter().any(|span| span == "verification.detail"),
+            "unscoped debug span is filtered: {operator:?}"
         );
     }
 

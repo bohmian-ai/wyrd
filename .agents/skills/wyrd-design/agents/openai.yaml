@@ -1,4 +1,4 @@
 interface:
   display_name: "Wyrd Design"
-  short_description: "Develop a simple, evidence-backed Wyrd proposal"
-  default_prompt: "Use $wyrd-design as my design partner to clarify this idea and develop a concrete implementation proposal before spec and planning."
+  short_description: "Settle a Wyrd solution, flow, and observable success"
+  default_prompt: "Use $wyrd-design to settle the solution, implementation flow, material decisions, and observable success with me, maintaining notes for spec and task handoff."

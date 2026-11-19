@@ -12,7 +12,7 @@ use crate::components::auth::ServerAuth;
 use crate::components::gateway::Gateway;
 use crate::components::health::Health;
 use crate::components::operators::keys::OperatorKeys;
-use crate::config::{BifrostTarget, DeploymentProfile, GatewayConfig};
+use crate::config::{DeploymentProfile, GatewayConfig, ServerTarget};
 use crate::mcp::Mcp;
 use crate::postgres::ServerPostgres;
 use crate::state::{AppState, AppStateInner, Bifrost, LimitsConfig, ServerSettings, TestHooks};
@@ -156,11 +156,16 @@ pub fn shell_owners(
     storage: Arc<StorageHandle>,
     bifrost: Arc<Bifrost>,
 ) -> AppStateInner {
-    let verification = Verification::new(postgres.wyrd().clone(), None, OperatorKeys::default());
+    let verification = Verification::new(
+        postgres.wyrd().clone(),
+        None,
+        OperatorKeys::default(),
+        crate::verification::RuntimeLimits::default().execution_timeout,
+    );
     AppStateInner {
         settings: ServerSettings {
             deployment_profile: DeploymentProfile::Development,
-            role: BifrostTarget::All,
+            role: ServerTarget::Combined,
             limits: LimitsConfig::default(),
         },
         postgres,
@@ -173,8 +178,14 @@ pub fn shell_owners(
             None,
         )
         .expect("the default gateway builds"),
+        resources: wyrd_runtime::resources::ProcessResources::new(
+            std::num::NonZeroUsize::MIN,
+            u64::MAX,
+            u64::MAX,
+        ),
         verification,
         mcp: Mcp::default(),
+        github: None,
         health: Health::default(),
         shutdown_token: tokio_util::sync::CancellationToken::new(),
         test_hooks: TestHooks::default(),

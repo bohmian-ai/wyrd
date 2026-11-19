@@ -32,8 +32,9 @@ use wyrd_ai::cards::CardRef;
 use wyrd_ai::state::WyrdState;
 use wyrd_ai::verify::{Execution, File, Input, Inputs, Submission};
 use wyrd_ai::{
-    Bifrost, CallProvenance, Citation, Locator, MediaFormat, RequirementOutcome, RequirementResult,
-    StepResult, StepStatus, VerificationResult, VerificationVerdict, WyrdClient,
+    Bifrost, CallProvenance, Citation, Locator, MediaFormat, RequirementDetails,
+    RequirementOutcome, RequirementResult, StepResult, StepStatus, ToolCallRecord, ToolRecipient,
+    VerificationDetails, VerificationResult, VerificationVerdict, WyrdClient,
 };
 use wyrd_spec::auth::TokenAudience;
 use wyrd_testing::server::WyrdTestServer;
@@ -156,6 +157,135 @@ async fn script_investigator(upstream: &MockServer) {
         .await;
 }
 
+/// The Python a `NESTED` investigation runs through `code.run`: it reads the
+/// policy desk's Card, then queries Bifrost; a denied query is caught by its
+/// catalog code and repaired with a second Card read. It prints `query
+/// <allowed or code> repaired <whether the second read matched the first>`.
+const NESTED: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../fixtures/cards/verifier_building_blocks/programs/nested-investigation.py"
+));
+
+/// The Python a `BUDGET` investigation runs: Card reads past the Agent's
+/// 128-request allowance, each refusal caught, then a line it never prints.
+const BUDGET: &str = "for _ in range(200):
+    try:
+        await call_tool('cards.get', {'card_ref': {'kind': 'Service', 'name': 'policy-desk', 'version': '1.0.0'}})
+    except RuntimeError:
+        pass
+print('escaped the budget')";
+
+/// The Python a `STALL` investigation runs: one Bifrost query the test
+/// server holds after its schema, so the program waits on it until its
+/// time limit.
+const STALL: &str = "await call_tool('bifrost.query', {'sql': 'SELECT execution_id FROM bifrost.verification.results LIMIT 1', 'max_rows': 1})
+print('the query returned')";
+
+/// Script investigations whose question starts with `marker` to call only
+/// `code.run` with `source`; the tool-result turn finishes through
+/// [`script_investigator`]'s answer, which is mounted first at the same
+/// priority.
+async fn script_code(upstream: &MockServer, marker: &str, source: &str) {
+    let calls = [tool_call(
+        "call-code",
+        TOOLS[2],
+        &json!({ "source": source }),
+    )];
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains(format!("INVESTIGATE: {marker}")))
+        .respond_with(completion(
+            json!({ "role": "assistant", "content": null, "tool_calls": calls }),
+        ))
+        .with_priority(1)
+        .mount(upstream)
+        .await;
+}
+
+/// The Python a `CODE` `evidence-reduction` Agent runs through `code.run`:
+/// it lists the notes, reads each one, and searches the note over the limit,
+/// each call consuming the one before, then prints only the hits and the
+/// search's match count.
+const REDUCE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../fixtures/cards/verifier_building_blocks/programs/reduce-notes.py"
+));
+
+/// The note over the refund limit, among the twenty `evidence-reduction`
+/// reads.
+const OVER: &str = "n07";
+
+/// The twenty `evidence-reduction` notes, `n01` to `n20`: each at least
+/// 4 KiB of distinct refund history, and only [`OVER`] marked `OVER-LIMIT`.
+fn notes() -> Value {
+    (1..=20)
+        .map(|index| {
+            let name = format!("n{index:02}");
+            let mark = if name == OVER { "OVER-LIMIT" } else { "within" };
+            let text = format!(
+                "{name} {mark}: {}",
+                format!("refund {index} kept. ").repeat(300)
+            );
+            (name, json!(text))
+        })
+        .collect::<serde_json::Map<_, _>>()
+        .into()
+}
+
+/// Script both `evidence-reduction` Agents in both modes: `DIRECT` asks for
+/// one `fs.read` per note in one turn, `CODE` for one `code.run` of
+/// [`REDUCE`]; either way the tool-result turn answers [`OVER`], the step as
+/// its hits and the check as a failed Verdict citing that note with the same
+/// hits as data.
+async fn script_reduction(upstream: &MockServer) {
+    let verdict = json!({
+        "outcome": "failed", "reason": "one note is over the limit",
+        "citations": [{"slot": "notes", "locator": {"json_pointer": format!("/{OVER}")}}],
+        "data": {"hits": [OVER]},
+    });
+    let finals = [
+        ("REDUCE-STEP", json!({"hits": [OVER]}).to_string()),
+        ("REDUCE-CHECK", verdict.to_string()),
+    ];
+    let reads: Vec<Value> = (1..=20)
+        .map(|index| {
+            tool_call(
+                &format!("call-read-{index}"),
+                "fs.read",
+                &json!({"path": format!("/inputs/notes/n{index:02}.json")}),
+            )
+        })
+        .collect();
+    let code = [tool_call(
+        "call-code",
+        TOOLS[2],
+        &json!({ "source": REDUCE }),
+    )];
+    for (marker, content) in finals {
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains(marker))
+            .and(body_string_contains(r#""role":"tool""#))
+            .respond_with(completion(
+                json!({ "role": "assistant", "content": content }),
+            ))
+            .with_priority(1)
+            .mount(upstream)
+            .await;
+        for (mode, calls) in [("DIRECT", &reads[..]), ("CODE", &code[..])] {
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .and(body_string_contains(format!("{marker}: {mode}")))
+                .respond_with(completion(
+                    json!({ "role": "assistant", "content": null, "tool_calls": calls }),
+                ))
+                .with_priority(1)
+                .mount(upstream)
+                .await;
+        }
+    }
+}
+
 /// Mount the answer `content` for Chat Completions requests whose body
 /// contains `marker`, ranked by `priority` (lower wins).
 async fn answer(upstream: &MockServer, marker: &str, content: &str, priority: u8) {
@@ -239,7 +369,11 @@ pub(crate) fn requirement<'a>(result: &'a VerificationResult, id: &str) -> &'a R
 ///
 /// # Panics
 /// Panics when the details do not read or have no such step.
-async fn step(deployment: &Deployment, result: &VerificationResult, id: &str) -> StepResult {
+pub(crate) async fn step(
+    deployment: &Deployment,
+    result: &VerificationResult,
+    id: &str,
+) -> StepResult {
     let details = deployment.details(result.execution_id).await;
     details
         .outcome
@@ -247,6 +381,32 @@ async fn step(deployment: &Deployment, result: &VerificationResult, id: &str) ->
         .into_iter()
         .find(|step| step.id.as_str() == id)
         .unwrap_or_else(|| panic!("step {id}: {result:#?}"))
+}
+
+/// The step `id` of `details`.
+///
+/// # Panics
+/// Panics when the details have no such step.
+fn detailed_step<'a>(details: &'a VerificationDetails, id: &str) -> &'a StepResult {
+    details
+        .outcome
+        .steps
+        .iter()
+        .find(|step| step.id.as_str() == id)
+        .unwrap_or_else(|| panic!("step {id}: {details:#?}"))
+}
+
+/// The requirement `id` of `details`, with the records of its check.
+///
+/// # Panics
+/// Panics when the details have no such requirement.
+fn checked<'a>(details: &'a VerificationDetails, id: &str) -> &'a RequirementDetails {
+    details
+        .outcome
+        .requirements
+        .iter()
+        .find(|requirement| requirement.result.id.as_str() == id)
+        .unwrap_or_else(|| panic!("requirement {id}: {details:#?}"))
 }
 
 /// One retained result's subject and actor.
@@ -334,6 +494,10 @@ impl PolicyDesk {
         answer(&upstream, "JUDGE-REPAIRED", "not a verdict", 3).await;
         answer(&upstream, "JUDGE-FOREIGN-CITE", FOREIGN_CITE, 3).await;
         script_investigator(&upstream).await;
+        for (marker, source) in [("NESTED", NESTED), ("BUDGET", BUDGET), ("STALL", STALL)] {
+            script_code(&upstream, marker, source).await;
+        }
+        script_reduction(&upstream).await;
         answer(&upstream, "Claim:", FOLLOWS, 4).await;
         answer(&upstream, "Judge whether", FOLLOWS, 4).await;
         score(
@@ -519,6 +683,70 @@ impl PolicyDesk {
             turn.contains("document-formats"),
             allowed.contains(&TOOLS[0]),
             "{question}: the Card reaches the model only when its read is allowed"
+        );
+    }
+
+    /// Assert the `NESTED` investigation `question` made one model-visible
+    /// `code.run` call whose nested calls, recorded for `code` in start
+    /// order, are `children` as (tool, allowed), each denied one carrying
+    /// [`DENIED`] and returning nothing, and that the model received only
+    /// the program's `printed` line.
+    ///
+    /// # Panics
+    /// Panics when the step, a record, or the model's tool turn differs.
+    async fn assert_nested(
+        &self,
+        result: &VerificationResult,
+        question: &str,
+        children: &[(&str, bool)],
+        printed: &str,
+    ) {
+        let investigate = step(&self.deployment, result, "investigate").await;
+        assert_eq!(investigate.status, StepStatus::Succeeded, "{question}");
+        let records: Vec<(Value, Value, bool)> = investigate
+            .tool_calls
+            .iter()
+            .map(|call| {
+                assert_eq!(
+                    call.error.is_some(),
+                    call.output_sha256.is_none() && call.returned_bytes == 0,
+                    "{question}: {call:?}"
+                );
+                assert!(
+                    call.error
+                        .as_deref()
+                        .is_none_or(|error| error.contains(DENIED)),
+                    "{question}: {call:?}"
+                );
+                (
+                    serde_json::to_value(call.recipient).expect("the recipient serializes"),
+                    serde_json::to_value(call.tool).expect("the tool serializes"),
+                    call.error.is_none(),
+                )
+            })
+            .collect();
+        let expected: Vec<(Value, Value, bool)> = [(json!("model"), json!(TOOLS[2]), true)]
+            .into_iter()
+            .chain(
+                children
+                    .iter()
+                    .map(|(tool, allowed)| (json!("code"), json!(tool), *allowed)),
+            )
+            .collect();
+        assert_eq!(records, expected, "{question}");
+        let turn = self
+            .upstream
+            .received_requests()
+            .await
+            .expect("the upstream records requests")
+            .iter()
+            .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+            .find(|body| body.contains(question) && body.contains(r#""role":"tool""#))
+            .expect("the model received the tool results");
+        assert!(turn.contains(printed), "{question}: {turn}");
+        assert!(
+            !turn.contains("document-formats"),
+            "{question}: a nested Card read never reaches the model"
         );
     }
 }
@@ -1332,6 +1560,34 @@ async fn hosted_tools_need_the_tool_and_domain_grants() {
         .await;
     desk.assert_tools(&result, "card_tool_only", &[TOOLS[0]])
         .await;
+
+    let denied = format!("query {DENIED} repaired True");
+    let nested = [
+        (
+            "NESTED all_tools",
+            &["tool:invoke", "cards:read", "bifrost_query:read"][..],
+            &[(TOOLS[0], true), (TOOLS[1], true)][..],
+            "query allowed repaired False",
+        ),
+        (
+            "NESTED no_domain_grant",
+            &["tool:invoke", "cards:read"][..],
+            &[(TOOLS[0], true), (TOOLS[1], false), (TOOLS[0], true)][..],
+            denied.as_str(),
+        ),
+    ];
+    for (question, extra, children, printed) in nested {
+        let permissions = [&VERIFIES[..], extra].concat();
+        let key = desk
+            .deployment
+            .scoped_key(&question.to_lowercase().replace(' ', "_"), &permissions)
+            .await;
+        let result = desk
+            .investigate(desk.deployment.client(&key), question)
+            .await;
+        desk.assert_nested(&result, question, children, printed)
+            .await;
+    }
     desk.deployment.shutdown().await;
 }
 
@@ -1404,6 +1660,539 @@ async fn delegated_tools_keep_the_narrower_authority() {
     desk.deployment.shutdown().await;
 }
 
+/// Verify the twenty [`notes`] with `evidence-reduction` in `mode`, as a
+/// principal that may run Verifiers and invoke tools.
+///
+/// # Panics
+/// Panics when the principal does not seed or the verify is refused.
+async fn reduce(desk: &PolicyDesk, mode: &str) -> VerificationResult {
+    let permissions = [&VERIFIES[..], &["tool:invoke"]].concat();
+    let key = desk
+        .deployment
+        .scoped_key(&format!("reducer_{}", mode.to_lowercase()), &permissions)
+        .await;
+    desk.state_as(desk.deployment.client(&key))
+        .run()
+        .observe()
+        .verify(
+            "evidence-reduction",
+            Inputs::named([
+                ("mode", Input::from(json!(mode))),
+                ("notes", Input::from(notes())),
+            ]),
+        )
+        .await
+        .expect("the reduction runs")
+}
+
+/// The leaf evidence of `records`: each `fs.read`'s arguments, delivered
+/// digest, and delivered bytes, in start order.
+///
+/// # Panics
+/// Panics when a record's tool does not serialize.
+fn leaves(records: &[ToolCallRecord]) -> Vec<(Value, Option<String>, u64)> {
+    records
+        .iter()
+        .filter(|record| {
+            serde_json::to_value(record.tool).expect("the tool serializes") == json!("fs.read")
+        })
+        .map(|record| {
+            (
+                record.arguments.clone(),
+                record.output_sha256.as_ref().map(ToString::to_string),
+                record.returned_bytes,
+            )
+        })
+        .collect()
+}
+
+/// The tools of `records` sent to `recipient`, in start order.
+///
+/// # Panics
+/// Panics when a record's tool does not serialize.
+fn tools_for(records: &[ToolCallRecord], recipient: ToolRecipient) -> Vec<Value> {
+    records
+        .iter()
+        .filter(|record| record.recipient == recipient)
+        .map(|record| serde_json::to_value(record.tool).expect("the tool serializes"))
+        .collect()
+}
+
+/// The compact UTF-8 bytes of the tool requests and results the model saw
+/// in the request whose prompt contains `marker`: every assistant tool
+/// call's arguments, `code.run` source included, and every tool message.
+///
+/// # Panics
+/// Panics when the upstream received no such tool-result request.
+async fn tool_bytes(upstream: &MockServer, marker: &str) -> usize {
+    let requests = upstream
+        .received_requests()
+        .await
+        .expect("the upstream records requests");
+    let body: Value = requests
+        .iter()
+        .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+        .find(|body| body.contains(marker) && body.contains(r#""role":"tool""#))
+        .and_then(|body| serde_json::from_str(&body).ok())
+        .unwrap_or_else(|| panic!("{marker}: the model received the tool results"));
+    body["messages"]
+        .as_array()
+        .expect("the request has messages")
+        .iter()
+        .map(|message| match message["role"].as_str() {
+            Some("tool") => message["content"].as_str().map_or(0, str::len),
+            _ => message["tool_calls"].as_array().map_or(0, |calls| {
+                calls
+                    .iter()
+                    .filter_map(|call| call["function"]["arguments"].as_str())
+                    .map(str::len)
+                    .sum()
+            }),
+        })
+        .sum()
+}
+
+/// An ML engineer reduces twenty 4 KiB notes in one Python program instead
+/// of twenty direct reads: the step's hits and the check's failed Verdict,
+/// citation, and data are the same; every leaf `fs.read` delivers the same
+/// digest and bytes, recorded for `code` behind one model-visible
+/// `code.run`; the model never receives a note; the model-visible tool
+/// bytes are at most a quarter of the direct path's; and the retained
+/// outcome reads back unchanged.
+///
+/// # Panics
+/// Panics when a judgment, record, byte total, or readback differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn code_mode_reduces_evidence_and_preserves_citations() {
+    let desk = PolicyDesk::start().await;
+    let direct = reduce(&desk, "DIRECT").await;
+    let code = reduce(&desk, "CODE").await;
+    let cited = [Citation {
+        slot: "notes".parse().expect("slot name"),
+        locator: Locator::JsonPointer(format!("/{OVER}")),
+    }];
+    let hits = json!({"hits": [OVER]});
+
+    for (mode, result) in [("DIRECT", &direct), ("CODE", &code)] {
+        assert_eq!(
+            result.outcome.verdict,
+            VerificationVerdict::Failed,
+            "{mode}"
+        );
+        let prepared = step(&desk.deployment, result, "over-limit").await;
+        assert_eq!(
+            prepared.status,
+            StepStatus::Succeeded,
+            "{mode}: {prepared:?}"
+        );
+        assert_eq!(prepared.output.as_ref(), Some(&hits), "{mode}");
+        let judged = requirement(result, "within-limit");
+        assert_eq!(
+            judged.outcome,
+            RequirementOutcome::Failed,
+            "{mode}: {judged:?}"
+        );
+        assert_eq!(judged.citations, cited, "{mode}");
+        assert_eq!(
+            judged.data.clone().map(Value::Object),
+            Some(hits.clone()),
+            "{mode}"
+        );
+    }
+    let reads = vec![json!("fs.read"); 20];
+    let nested = [
+        vec![json!("fs.list")],
+        reads.clone(),
+        vec![json!("fs.search")],
+    ]
+    .concat();
+    let direct_details = desk.deployment.details(direct.execution_id).await;
+    let code_details = desk.deployment.details(code.execution_id).await;
+    for (position, direct, code) in [
+        (
+            "step",
+            &detailed_step(&direct_details, "over-limit").tool_calls,
+            &detailed_step(&code_details, "over-limit").tool_calls,
+        ),
+        (
+            "check",
+            &checked(&direct_details, "within-limit").tool_calls,
+            &checked(&code_details, "within-limit").tool_calls,
+        ),
+    ] {
+        assert!(
+            code.iter().all(|record| record.error.is_none()),
+            "{position}: {code:?}"
+        );
+        assert_eq!(
+            tools_for(direct, ToolRecipient::Model),
+            reads,
+            "{position} direct"
+        );
+        assert_eq!(
+            tools_for(direct, ToolRecipient::Code),
+            Vec::<Value>::new(),
+            "{position}"
+        );
+        assert_eq!(
+            tools_for(code, ToolRecipient::Model),
+            [json!(TOOLS[2])],
+            "{position} code"
+        );
+        assert_eq!(
+            tools_for(code, ToolRecipient::Code),
+            nested,
+            "{position} nested"
+        );
+        let leaf = leaves(direct);
+        assert!(
+            leaf.iter()
+                .all(|(_, digest, bytes)| digest.is_some() && *bytes >= 4096),
+            "{position}: {leaf:?}"
+        );
+        assert_eq!(leaves(code), leaf, "{position}: the same leaf evidence");
+    }
+    for marker in ["REDUCE-STEP", "REDUCE-CHECK"] {
+        let direct = tool_bytes(&desk.upstream, &format!("{marker}: DIRECT")).await;
+        let code = tool_bytes(&desk.upstream, &format!("{marker}: CODE")).await;
+        println!("{marker}: model-visible tool bytes direct {direct}, code {code}");
+        assert!(code * 4 <= direct, "{marker}: {code} of {direct} bytes");
+    }
+    let replayed = desk
+        .upstream
+        .received_requests()
+        .await
+        .expect("the upstream records requests")
+        .iter()
+        .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+        .any(|body| body.contains(": CODE") && body.contains("kept."));
+    assert!(!replayed, "no note reaches the model in code mode");
+    let printed = format!(r#"{{\\\"hits\\\": [\\\"{OVER}\\\"], \\\"matches\\\": 1}}"#);
+    for marker in ["REDUCE-STEP: CODE", "REDUCE-CHECK: CODE"] {
+        let turn = desk
+            .upstream
+            .received_requests()
+            .await
+            .expect("the upstream records requests")
+            .iter()
+            .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+            .find(|body| body.contains(marker) && body.contains(r#""role":"tool""#))
+            .expect("the model received the tool results");
+        assert!(
+            turn.contains(&printed),
+            "{marker}: the program's hits reach the model: {turn}"
+        );
+    }
+    assert_eq!(
+        retained(&desk, &code).await,
+        Retained {
+            requirements: code.outcome.requirements.clone(),
+            steps: code_details.outcome.steps.clone(),
+        },
+        "the retained requirements and steps"
+    );
+    desk.deployment.shutdown().await;
+}
+
+/// The Python every `nested-sweep` Agent runs through `code.run`: it lists
+/// its workspace, reads the file the listing found, and prints the note.
+const SWEEP: &str = "listing = await call_tool('fs.list', {'path': '/inputs'})
+read = await call_tool('fs.read', {'path': listing['files'][0]['path']})
+print(read['units'][0]['text'])";
+
+/// The two `nested-sweep` batch notes and its lead note.
+const SWEPT: [&str; 2] = ["alpha-note", "beta-note"];
+
+/// The `nested-sweep` lead note.
+const LEAD: &str = "lead-note";
+
+/// Script `nested-sweep`: each item and round first runs [`SWEEP`] through
+/// one `code.run`; once it has the program's result, an item answers read
+/// and a round answers read only from round 1, so the repeat runs twice.
+async fn script_sweep(upstream: &MockServer) {
+    let code = [tool_call(
+        "call-sweep",
+        TOOLS[2],
+        &json!({ "source": SWEEP }),
+    )];
+    for (marker, read) in [
+        ("NESTED-ITEM: 0", true),
+        ("NESTED-ITEM: 1", true),
+        ("NESTED-ROUND: 0", false),
+        ("NESTED-ROUND: 1", true),
+    ] {
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains(marker))
+            .and(body_string_contains(r#""role":"tool""#))
+            .respond_with(completion(
+                json!({ "role": "assistant", "content": json!({"read": read}).to_string() }),
+            ))
+            .with_priority(1)
+            .mount(upstream)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains(marker))
+            .respond_with(completion(
+                json!({ "role": "assistant", "content": null, "tool_calls": code }),
+            ))
+            .with_priority(2)
+            .mount(upstream)
+            .await;
+    }
+}
+
+/// The body of the tool-result request whose prompt contains `marker`.
+///
+/// # Panics
+/// Panics when the upstream received no such request.
+async fn tool_turn(upstream: &MockServer, marker: &str) -> String {
+    upstream
+        .received_requests()
+        .await
+        .expect("the upstream records requests")
+        .iter()
+        .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+        .find(|body| body.contains(marker) && body.contains(r#""role":"tool""#))
+        .unwrap_or_else(|| panic!("{marker}: the model received the program's result"))
+}
+
+/// An ML engineer's Python programs call tools inside array and repeated
+/// work: each batch item's program lists and then reads its own note, and
+/// only that note reaches its model; each round of the repeat reads the lead
+/// note, the second round ending the repeat; every nested call succeeds,
+/// recorded for `code` behind its model-visible `code.run` in item order.
+///
+/// # Panics
+/// Panics when a step, record, or delivered note differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn nested_tools_run_inside_fanout_and_repeat() {
+    let desk = PolicyDesk::start().await;
+    script_sweep(&desk.upstream).await;
+    let permissions = [&VERIFIES[..], &["tool:invoke"]].concat();
+    let key = desk.deployment.scoped_key("sweeper", &permissions).await;
+    let result = desk
+        .state_as(desk.deployment.client(&key))
+        .run()
+        .observe()
+        .verify(
+            "nested-sweep",
+            Inputs::named([
+                ("batch", Input::from(json!(SWEPT))),
+                ("lead", Input::from(json!(LEAD))),
+            ]),
+        )
+        .await
+        .expect("the sweep runs");
+
+    assert_eq!(
+        result.outcome.verdict,
+        VerificationVerdict::Passed,
+        "{result:?}"
+    );
+    let details = desk.deployment.details(result.execution_id).await;
+    let items = &detailed_step(&details, "per-note");
+    assert_eq!(items.status, StepStatus::Succeeded, "{items:?}");
+    assert_eq!(items.output, Some(json!([{"read": true}, {"read": true}])));
+    let rounds = &detailed_step(&details, "rounds");
+    assert_eq!(rounds.status, StepStatus::Succeeded, "{rounds:?}");
+    assert_eq!(rounds.output, Some(json!({"read": true})));
+    for (step, runs) in [(items, 2), (rounds, 1)] {
+        let records = &step.tool_calls;
+        assert!(
+            records.iter().all(|record| record.error.is_none()),
+            "{records:?}"
+        );
+        assert_eq!(
+            tools_for(records, ToolRecipient::Model),
+            vec![json!(TOOLS[2]); runs]
+        );
+        assert_eq!(
+            tools_for(records, ToolRecipient::Code),
+            (0..runs)
+                .flat_map(|_| [json!("fs.list"), json!("fs.read")])
+                .collect::<Vec<_>>(),
+            "{:?}: each program lists, then reads what it found",
+            step.id
+        );
+    }
+    let digests = leaves(&items.tool_calls);
+    assert_ne!(digests[0].1, digests[1].1, "each item read its own note");
+
+    for (index, note) in SWEPT.iter().enumerate() {
+        let turn = tool_turn(&desk.upstream, &format!("NESTED-ITEM: {index}")).await;
+        let other = SWEPT[1 - index];
+        assert!(
+            turn.contains(note) && !turn.contains(other),
+            "item {index} receives only its own note: {turn}"
+        );
+    }
+    for round in 0..2 {
+        let turn = tool_turn(&desk.upstream, &format!("NESTED-ROUND: {round}")).await;
+        assert!(
+            turn.contains(LEAD),
+            "round {round} reads the lead note: {turn}"
+        );
+    }
+    desk.deployment.shutdown().await;
+}
+
+/// A released Bifrost query's resources: no admission or peer slot and no
+/// reserved memory.
+const RELEASED: wyrd_testing::server::BifrostQueryResourceSnapshot =
+    wyrd_testing::server::BifrostQueryResourceSnapshot {
+        admission_slots: 0,
+        memory_bytes: 0,
+        peer_slots: 0,
+    };
+
+/// A platform engineer sees Python orchestration fail honestly and then
+/// succeed: a program catching every refusal still stops at the Agent's
+/// 128-request allowance, failing the step with the catalog code, leaving
+/// the requirement inconclusive rather than failed, and asking the model
+/// nothing more; a program waiting on a held query is stopped at its time
+/// limit, failing the step the same way, its pending call settles with
+/// nothing delivered, and the query returns every resource; the same
+/// principal's next investigation then calls every tool.
+///
+/// # Panics
+/// Panics when a stop is caught or answered, the subject is judged failed,
+/// the held query keeps resources, or the recovery differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn code_mode_failure_releases_session() {
+    let desk = PolicyDesk::start().await;
+    let permissions = [
+        &VERIFIES[..],
+        &["tool:invoke", "cards:read", "bifrost_query:read"],
+    ]
+    .concat();
+    let key = desk
+        .deployment
+        .scoped_key("code_failure", &permissions)
+        .await;
+
+    let spent = desk
+        .investigate(desk.deployment.client(&key), "BUDGET")
+        .await;
+    let investigate = step(&desk.deployment, &spent, "investigate").await;
+    assert_eq!(
+        investigate.status,
+        StepStatus::Failed,
+        "budget: {investigate:?}"
+    );
+    assert!(
+        investigate
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("WYRD_VERIFICATION_422_TOOL_BUDGET_EXCEEDED")),
+        "budget: {investigate:?}"
+    );
+    assert_eq!(
+        tools_for(&investigate.tool_calls, ToolRecipient::Model),
+        [json!(TOOLS[2])],
+        "budget: one model-visible call"
+    );
+    assert_eq!(
+        tools_for(&investigate.tool_calls, ToolRecipient::Code),
+        vec![json!(TOOLS[0]); 127],
+        "budget: the nested reads fill the rest of the allowance"
+    );
+    let investigated = requirement(&spent, "investigated");
+    assert_eq!(
+        investigated.outcome,
+        RequirementOutcome::Inconclusive,
+        "budget: {investigated:?}"
+    );
+    assert_ne!(spent.outcome.verdict, VerificationVerdict::Failed, "budget");
+    let asked = desk
+        .upstream
+        .received_requests()
+        .await
+        .expect("the upstream records requests")
+        .iter()
+        .filter(|request| String::from_utf8_lossy(&request.body).contains("INVESTIGATE: BUDGET"))
+        .count();
+    assert_eq!(
+        asked, 1,
+        "budget: the model is asked nothing after the stop"
+    );
+
+    let server = desk.deployment.server();
+    server.stall_next_query_after_schema();
+    let (stalled, query) = tokio::join!(
+        desk.investigate(desk.deployment.client(&key), "STALL"),
+        server.wait_query_schema_stall(),
+    );
+    let query = query.expect("the nested query stalls");
+    server
+        .wait_bifrost_query_resources_released(&query, RELEASED)
+        .await
+        .expect("the time limit releases the query");
+    let investigate = step(&desk.deployment, &stalled, "investigate").await;
+    assert_eq!(
+        investigate.status,
+        StepStatus::Failed,
+        "stall: {investigate:?}"
+    );
+    assert!(
+        investigate
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("time limit")),
+        "stall: {investigate:?}"
+    );
+    assert_eq!(
+        requirement(&stalled, "investigated").outcome,
+        RequirementOutcome::Inconclusive,
+        "stall"
+    );
+    assert_ne!(
+        stalled.outcome.verdict,
+        VerificationVerdict::Failed,
+        "stall"
+    );
+    let asked = desk
+        .upstream
+        .received_requests()
+        .await
+        .expect("the upstream records requests")
+        .iter()
+        .filter(|request| String::from_utf8_lossy(&request.body).contains("INVESTIGATE: STALL"))
+        .count();
+    assert_eq!(asked, 1, "stall: the model is asked nothing after the stop");
+    let [outer, pending] = investigate.tool_calls.as_slice() else {
+        panic!("stall: one code.run and its query: {investigate:?}");
+    };
+    assert_eq!(
+        (outer.recipient, pending.recipient),
+        (ToolRecipient::Model, ToolRecipient::Code),
+        "stall"
+    );
+    assert!(
+        outer
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("time limit")),
+        "stall: {outer:?}"
+    );
+    assert!(pending.error.is_some(), "stall: {pending:?}");
+    assert_eq!(
+        (pending.output_sha256.as_ref(), pending.returned_bytes),
+        (None, 0),
+        "stall: the pending query delivered nothing"
+    );
+
+    let recovered = desk
+        .investigate(desk.deployment.client(&key), "recovered")
+        .await;
+    desk.assert_tools(&recovered, "recovered", &TOOLS).await;
+    desk.deployment.shutdown().await;
+}
+
 /// The custom data of `scored-review`'s scored requirements: the Agent
 /// judge's score, the code check's score, and the step check's word count.
 #[derive(Debug, PartialEq, Deserialize)]
@@ -1423,18 +2212,21 @@ enum Scored {
     },
 }
 
+/// The judgment a retained output Variant holds: exactly the result's
+/// requirements and steps.
+#[derive(Debug, PartialEq, Deserialize)]
+struct Retained {
+    /// Every retained requirement, step requirements included.
+    requirements: Vec<RequirementResult>,
+    /// Every retained step, tool-call records included.
+    steps: Vec<StepResult>,
+}
+
 /// One retained execution's output, read back as JSON text.
 #[derive(Debug, Deserialize)]
 struct RetainedOutput {
     /// The stored output Variant as JSON text.
     output: String,
-}
-
-/// The requirements a retained output Variant holds.
-#[derive(Debug, Deserialize)]
-struct RetainedRequirements {
-    /// Every retained requirement, step requirements included.
-    requirements: Vec<RequirementResult>,
 }
 
 /// Assert `result` carries `scored-review`'s readback for a four-word answer:
@@ -1508,7 +2300,7 @@ async fn custom_verdict_data_survives_readback() {
     assert_eq!(status.result.as_ref(), Some(&waited));
 
     assert_eq!(
-        retained(&desk, &waited).await,
+        retained(&desk, &waited).await.requirements,
         waited.outcome.requirements,
         "the retained output keeps its data"
     );
@@ -1535,7 +2327,7 @@ async fn custom_verdict_data_survives_readback() {
         let status = execution.status().await.expect("the status reads");
         assert_eq!(status.result.as_ref(), Some(&waited), "{marker}: status");
         assert_eq!(
-            retained(&desk, &waited).await,
+            retained(&desk, &waited).await.requirements,
             waited.outcome.requirements,
             "{marker}: retained"
         );
@@ -1543,13 +2335,13 @@ async fn custom_verdict_data_survives_readback() {
     desk.deployment.shutdown().await;
 }
 
-/// The retained requirements of `result`'s execution, read back from Bifrost
-/// after publishing pending rows.
+/// The retained requirements and steps of `result`'s execution, read back
+/// from Bifrost after publishing pending rows.
 ///
 /// # Panics
 /// Panics when rows do not publish or the execution has not exactly one
 /// decodable retained output.
-async fn retained(desk: &PolicyDesk, result: &VerificationResult) -> Vec<RequirementResult> {
+async fn retained(desk: &PolicyDesk, result: &VerificationResult) -> Retained {
     desk.deployment
         .server()
         .flush_bifrost()
@@ -1569,9 +2361,7 @@ async fn retained(desk: &PolicyDesk, result: &VerificationResult) -> Vec<Require
     let [retained] = retained.as_slice() else {
         panic!("one retained result: {retained:?}");
     };
-    serde_json::from_str::<RetainedRequirements>(&retained.output)
-        .expect("the output decodes")
-        .requirements
+    serde_json::from_str(&retained.output).expect("the output decodes")
 }
 
 /// The `well-formed` code check's data at its inclusive bounds, by answer
@@ -1962,7 +2752,7 @@ async fn typed_verdict_data_mismatch_keeps_original_result() {
 /// The grants of a principal that verifies, invokes the gateway, reads Cards
 /// and Bifrost, and may call the tools `tool_scope` covers: `"all"` or one
 /// exact `{"tool": name}`.
-fn grants(tool_scope: Value) -> [Value; 5] {
+pub(crate) fn grants(tool_scope: Value) -> [Value; 5] {
     [
         json!({ "resource": "verifier", "action": "run", "scope": "all" }),
         json!({ "resource": "gateway", "action": "invoke", "scope": "all" }),

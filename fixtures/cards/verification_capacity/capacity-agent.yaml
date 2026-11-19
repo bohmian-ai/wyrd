@@ -1,0 +1,11 @@
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: capacity-agent
+  version: 1.0.0
+spec:
+  prompt: ./capacity-prompt.yaml
+  execution_route:
+    kind: native
+  run_config:
+    max_iterations: 1

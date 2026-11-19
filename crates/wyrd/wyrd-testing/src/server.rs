@@ -60,8 +60,8 @@ use wyrd_server::boot::data_root::BifrostDataRoot;
 use wyrd_server::boot::{BifrostExternalDependencies, BootedServer, StartInputs};
 use wyrd_server::components::platform::builtins::BuiltinTables;
 use wyrd_server::config::{
-    BifrostRuntimeRole, BifrostTarget, ForgeRuntimeConfig, GatewayConfig, IssuerEntry,
-    OperatorKeySource, OperatorKeysConfig, ServeMode, WorkloadBindingEntry,
+    BifrostRuntimeRole, ForgeRuntimeConfig, GatewayConfig, IssuerEntry, OperatorKeySource,
+    OperatorKeysConfig, ServeMode, ServerTarget, WorkloadBindingEntry,
 };
 use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::query::scheduled::ScheduledQueryCaller;
@@ -69,7 +69,16 @@ use wyrd_server::state::{
     BifrostShutdownReport, BifrostTestControls, EngineWorker, QueryStreamFault,
     QueryStreamFaultController, ScribeCoordinationRuntime, TestHooks,
 };
-use wyrd_server::verification::hosted::HostedLimits;
+/// The runtime bounds [`WyrdTestServerBuilder::with_verification_runtime_limits_for_test`] takes.
+pub use wyrd_server::verification::RuntimeLimits;
+/// The hosted Verifier limits [`WyrdTestServerBuilder::with_verification_limits_for_test`] takes.
+pub use wyrd_server::verification::hosted::HostedLimits;
+/// The execution lane a journey selects hosted capacity by.
+pub use wyrd_server::verification::telemetry::ExecutionMode;
+/// Reserved Scribe outbox slots a journey holds to fill the server's
+/// reserved share; dropping it releases them.
+pub type ScribeReservation =
+    wyrd_runtime::outbox::Reservation<wyrd_server::scribe_outbox::ScribeSink>;
 use wyrd_server::{AppState, WyrdServer, WyrdServerConfig, build_router};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::NodeId;
@@ -247,7 +256,11 @@ struct WyrdTestServerInner {
     /// Lifetime guard retained only for local storage-backed servers.
     storage_root: Option<Arc<TempDir>>,
     /// Lifetime guard for a harness-created Bifrost data directory.
-    _bifrost_data_dir: Arc<TempDir>,
+    bifrost_data_dir: Arc<TempDir>,
+    /// The directory [`Self::bifrost_data_root`] was prepared over: the
+    /// caller's durable root when one was mounted, else
+    /// [`Self::bifrost_data_dir`]. A restart reopens exactly this path.
+    bifrost_data_path: std::path::PathBuf,
     /// Exclusive owner of this server's one Bifrost data root.
     bifrost_data_root: BifrostDataRoot,
     state: AppState,
@@ -266,7 +279,7 @@ struct WyrdTestServerInner {
     /// Ranged-read probe wrapping this server's Bifrost object store.
     object_reads: Arc<ObjectReadProbe>,
     /// Process composition selected for this test server.
-    forge_process_role: BifrostTarget,
+    forge_process_role: ServerTarget,
     /// Stable identity assigned to this server process.
     node_id: NodeId,
     /// Atomic one-shot query truncation controls for language journeys.
@@ -519,6 +532,8 @@ pub struct WyrdTestServerBuilder {
     telemetry: Option<Arc<TelemetryGuard>>,
     /// Optional fixed HTTP/gRPC addresses used for truthful peer advertisement.
     bind_addrs: Option<(std::net::SocketAddr, std::net::SocketAddr)>,
+    /// The loopback GitHub this server's App is configured against.
+    github: Option<crate::github::GithubAppMock>,
     /// Optional production-shaped Oracle server identity and peer trust paths.
     /// Peer identity for this server; provisioned by the builder when absent.
     peer_tls: Option<TestBifrostPeerTls>,
@@ -527,7 +542,7 @@ pub struct WyrdTestServerBuilder {
     /// Exact private peer address this server binds and advertises.
     peer_bind: Option<std::net::SocketAddr>,
     /// Production Forge process role used by bound test servers.
-    forge_process_role: BifrostTarget,
+    forge_process_role: ServerTarget,
     /// Optional observer of successful supervised worker completions.
     forge_completion_observer: Option<ForgeWorkerCompletionObserver>,
     /// Optional test-only Forge catalog wrapper.
@@ -572,6 +587,9 @@ pub struct WyrdTestServerBuilder {
     /// Hosted Verifier Deployment limits; `None` keeps the defaults with no
     /// prewarmed worker.
     verification_limits: Option<HostedLimits>,
+    /// Queued runtime bounds; `None` keeps the production defaults. Boxed
+    /// so the builder a journey holds across awaits stays small.
+    verification_runtime_limits: Option<Box<RuntimeLimits>>,
     /// Hosted Verifier worker executable replacing the shipped same-profile
     /// `wyrd-server`, so a journey can prove a bad worker fails startup.
     verification_worker: Option<std::path::PathBuf>,
@@ -679,10 +697,11 @@ impl Default for WyrdTestServerBuilder {
             oracle_runtime: None,
             telemetry: None,
             bind_addrs: None,
+            github: None,
             peer_tls: None,
             peer_tls_root: None,
             peer_bind: None,
-            forge_process_role: BifrostTarget::All,
+            forge_process_role: ServerTarget::Combined,
             forge_completion_observer: None,
             forge_catalog: None,
             forge_config: None,
@@ -700,6 +719,7 @@ impl Default for WyrdTestServerBuilder {
             mcp_context_probe: false,
             operator_keys: None,
             verification_limits: None,
+            verification_runtime_limits: None,
             verification_worker: None,
         }
     }
@@ -707,6 +727,17 @@ impl Default for WyrdTestServerBuilder {
 
 /// Result of a fixture-path principal bootstrap.
 pub use crate::principal::Bootstrap;
+/// Process memory a test holds until it drops.
+pub use wyrd_server::verification::hosted::sandbox::OccupiedForTest;
+
+/// The hosted limits a test server starts with: the defaults with no
+/// prewarmed worker.
+fn test_verification_limits() -> HostedLimits {
+    HostedLimits {
+        monty_min_workers: 0,
+        ..HostedLimits::default()
+    }
+}
 
 /// Write key version 1 as an owner-only file in a fresh directory and return
 /// the file-sourced Operator key config over it.
@@ -783,6 +814,19 @@ pub enum WyrdTestServerError {
         /// fitted baseline at all.
         last: Option<Box<DriftBaselineStatus>>,
     },
+    /// The hosted memory queue did not reach the awaited length by the
+    /// caller's deadline.
+    #[error(
+        "{expected} hosted operations never waited for memory within {timeout:?}; last observed: {last}"
+    )]
+    HostedWaitersNotReached {
+        /// The awaited queue length.
+        expected: usize,
+        /// The deadline the caller allowed.
+        timeout: Duration,
+        /// The last queue length read.
+        last: usize,
+    },
 }
 
 impl From<WyrdTestServerError> for wyrd_spec::error::WyrdError {
@@ -794,10 +838,13 @@ impl From<WyrdTestServerError> for wyrd_spec::error::WyrdError {
             | WyrdTestServerError::Sql(_)
             | WyrdTestServerError::Http { .. }
             | WyrdTestServerError::Io(_)
-            | WyrdTestServerError::Unsupported(_) => wyrd_spec::error::WyrdError::HarnessStart {
-                message: msg,
-                details: serde_json::json!({}),
-            },
+            | WyrdTestServerError::Unsupported(_)
+            | WyrdTestServerError::HostedWaitersNotReached { .. } => {
+                wyrd_spec::error::WyrdError::HarnessStart {
+                    message: msg,
+                    details: serde_json::json!({}),
+                }
+            }
             WyrdTestServerError::Bind(_) | WyrdTestServerError::Join(_) => {
                 wyrd_spec::error::WyrdError::HarnessBound {
                     message: msg,
@@ -962,9 +1009,13 @@ impl WyrdTestServer {
     /// This is what a process restart looks like to durable state: every
     /// committed row — principals, API keys, role grants, gateway
     /// configuration, and sealed managed-secret envelopes — survives, while
-    /// in-memory state, the token-signing key, sockets, and the Bifrost data
-    /// root are rebuilt. The fixture and storage are retained across the
-    /// shutdown so dropping the old server does not release the database.
+    /// in-memory state, the token-signing key, and sockets are rebuilt. The
+    /// fixture and storage are retained across the shutdown so dropping the
+    /// old server does not release the database. The Bifrost data root is a
+    /// pod's volume: unless `builder` mounts another, the replacement reopens
+    /// the same directory, after shutdown released the old owner's lock, so
+    /// acknowledged data still in its WAL or staged files, and its volume
+    /// identity, survive even a shutdown that aborted at its budget.
     /// Previously minted access tokens are signed by the old process's key, so
     /// callers exchange their API keys again against the restarted server.
     ///
@@ -978,7 +1029,11 @@ impl WyrdTestServer {
         let fixture = Arc::clone(&self.inner.fixture);
         let storage = Arc::clone(&self.inner.state.storage);
         let storage_root = self.inner.storage_root.clone();
+        let data_dir = Arc::clone(&self.inner.bifrost_data_dir);
+        let data_path = self.inner.bifrost_data_path.clone();
         self.shutdown().await?;
+        builder.bifrost_data_dir.get_or_insert(data_dir);
+        builder.bifrost_data_path.get_or_insert(data_path);
         if builder.bind_addrs.is_none() {
             builder.bind_addrs = Some((reserve_loopback_addr()?, reserve_loopback_addr()?));
         }
@@ -2603,7 +2658,7 @@ impl WyrdTestServer {
 
     /// Return the production Forge process role selected for this server.
     #[must_use]
-    pub const fn forge_process_role(&self) -> BifrostTarget {
+    pub const fn forge_process_role(&self) -> ServerTarget {
         self.inner.forge_process_role
     }
 
@@ -2909,6 +2964,69 @@ impl WyrdTestServer {
         self.bifrost_scribe()
             .map(|scribe| scribe.stall_next_ingest_into_for_test(table))
             .ok_or_else(|| WyrdTestServerError::Start("server has no Bifrost Scribe".to_owned()))
+    }
+
+    /// Hold process memory so at most `leave` bytes stay free, so a hosted
+    /// Python operation whose retained request bytes do not fit is refused,
+    /// until the returned hold drops.
+    ///
+    /// # Panics
+    /// Panics when called outside a Tokio runtime.
+    ///
+    /// # Errors
+    /// Returns an error when this server hosts no Verifier blocks.
+    pub fn occupy_hosted_memory(&self, leave: u64) -> Result<OccupiedForTest, WyrdTestServerError> {
+        Ok(self.hosted_sandbox()?.occupy_for_test(leave))
+    }
+
+    /// Wait until exactly `count` hosted Python operations wait for process
+    /// admission, such as a verification paused by critical process
+    /// pressure, or one that stopped waiting.
+    ///
+    /// # Errors
+    /// Returns [`WyrdTestServerError::HostedWaitersNotReached`] with the last
+    /// count when `timeout` elapses first, and an error when this server
+    /// hosts no Verifier blocks.
+    pub async fn wait_for_hosted_waiters(
+        &self,
+        count: usize,
+        timeout: Duration,
+    ) -> Result<(), WyrdTestServerError> {
+        let sandbox = self.hosted_sandbox()?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            let last = sandbox.waiting();
+            if last == count {
+                return Ok(());
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(WyrdTestServerError::HostedWaitersNotReached {
+                    expected: count,
+                    timeout,
+                    last,
+                });
+            }
+            // ponytail: the sandbox publishes no waiter-change signal, so this
+            // polls; add one if a test ever needs a tighter wake.
+            tokio::time::sleep(HOSTED_WAITERS_POLL_INTERVAL.min(deadline - now)).await;
+        }
+    }
+
+    /// The hosted Python sandbox of this server's Verifier blocks.
+    ///
+    /// # Errors
+    /// Returns an error when this server hosts no Verifier blocks.
+    fn hosted_sandbox(
+        &self,
+    ) -> Result<&Arc<wyrd_server::verification::hosted::sandbox::Sandbox>, WyrdTestServerError>
+    {
+        self.inner
+            .state
+            .verification
+            .blocks()
+            .map(|blocks| blocks.sandbox())
+            .ok_or_else(|| WyrdTestServerError::Start("server hosts no Verifier blocks".to_owned()))
     }
 
     /// Return the fixture tenant id.
@@ -4080,6 +4198,15 @@ impl WyrdTestServer {
             .map_err(|error| WyrdTestServerError::Io(error.to_string()))
     }
 
+    /// The local directory this server created for its Card storage, so a
+    /// test can make storage fail after registration and then restore it.
+    ///
+    /// `None` when the builder was given storage settings or a handle.
+    #[must_use]
+    pub fn local_storage_root(&self) -> Option<&std::path::Path> {
+        self.inner.storage_root.as_deref().map(TempDir::path)
+    }
+
     /// Return the Postgres fixture for direct SQL access in tests.
     #[must_use]
     pub fn pg_fixture(&self) -> &PgFixture {
@@ -4171,6 +4298,68 @@ impl WyrdTestServer {
             .map_err(|error| WyrdTestServerError::Sql(error.to_string()))
     }
 
+    /// Admit one execution of a fresh Drift Verifier named `name` and hold it
+    /// unfinished with four accepted publications, so a language journey can
+    /// read successful publications through its public SDK without a
+    /// production upload route.
+    ///
+    /// Delegates to [`VerificationFixture::submit`] and
+    /// [`VerificationFixture::publish`]: attempt 1 of step `review` publishes
+    /// JSON `verdict` `{"ok": true}` and JSON `nothing` `null`; attempt 1 of
+    /// step `draft` publishes file `report` (`# Report` and a newline) and
+    /// directory `tree` (`a.md` = `alpha`, `nested/b.md` = `beta`). The execution stays
+    /// leased and running. Returns the execution and its Verifier Card UID.
+    ///
+    /// Only for a server built without the verification runtime, which would
+    /// race the fixture for the claim.
+    ///
+    /// # Errors
+    /// Returns [`WyrdTestServerError::Sql`] when the tenant cannot be
+    /// provisioned, `name` is not a Card name, or the submission or a
+    /// publication is refused.
+    pub async fn hold_publications(
+        &self,
+        name: &str,
+    ) -> Result<(wyrd_spec::ids::ExecutionId, CardUid), WyrdTestServerError> {
+        use crate::verification::Published;
+        let sql = |error: VerificationFixtureError| WyrdTestServerError::Sql(error.to_string());
+        let fixture = self.verification_fixture().await.map_err(sql)?;
+        let (subject, _) = fixture
+            .service(&format!("{name}-subject"))
+            .await
+            .map_err(sql)?;
+        let verifier = fixture.drift_verifier(name).await.map_err(sql)?;
+        fixture
+            .submit(&verifier, &subject, std::collections::BTreeMap::new())
+            .await
+            .map_err(sql)?;
+        let tree = vec![
+            ("a.md".to_owned(), b"alpha".to_vec()),
+            ("nested/b.md".to_owned(), b"beta".to_vec()),
+        ];
+        let execution = fixture
+            .publish(
+                &self.inner.state,
+                &[
+                    (
+                        "review",
+                        "verdict",
+                        Published::Json(serde_json::json!({"ok": true})),
+                    ),
+                    (
+                        "review",
+                        "nothing",
+                        Published::Json(serde_json::Value::Null),
+                    ),
+                    ("draft", "report", Published::File(b"# Report\n".to_vec())),
+                    ("draft", "tree", Published::Directory(tree)),
+                ],
+            )
+            .await
+            .map_err(sql)?;
+        Ok((execution, verifier))
+    }
+
     /// Cancel and drain a partially started bound server while preserving the
     /// startup error that caused rollback.
     async fn rollback_bound_startup(
@@ -4189,24 +4378,6 @@ impl WyrdTestServer {
         // drives the exact same immutable Bifrost owner as mounted routes.
         let state = self.inner.state.clone();
         let shutdown_token = state.shutdown_token.clone();
-
-        if self.forge_process_role() == BifrostTarget::ForgeWorker {
-            let worker = wyrd_server::boot::spawn_forge_worker(&state, shutdown_token.clone())
-                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-            // A dedicated Forge worker never runs the bounded Bifrost drain, so
-            // its serve task reports that nothing drained rather than claiming a
-            // drain outcome it did not produce.
-            let serve_handle = wyrd_runtime::runtime().spawn(async move {
-                worker
-                    .await
-                    .map(|()| BifrostShutdownReport::none_drained())
-                    .map_err(|error| wyrd_server::BootExit::Other(Box::new(error)))
-            });
-            self.shutdown_token = Some(shutdown_token);
-            self.serve_handle = Some(serve_handle);
-            self.mode = Mode::InProcess;
-            return Ok(self);
-        }
 
         // Ephemeral ports, metrics off (the recorder is a process-global
         // singleton that must not be installed per-test), reflection off.
@@ -4242,6 +4413,16 @@ impl WyrdTestServer {
             .bind(ServeMode::Both)
             .await
             .map_err(|e| WyrdTestServerError::Bind(format!("{e:?}")))?;
+
+        // The Forge maintenance target opens no public listener: it runs the
+        // production serving owner's scheduler, worker, and peer listener only.
+        if self.forge_process_role() == ServerTarget::BifrostMaintenance {
+            let serve_handle = wyrd_runtime::runtime().spawn(async move { bound.run().await });
+            self.shutdown_token = Some(shutdown_token);
+            self.serve_handle = Some(serve_handle);
+            self.mode = Mode::InProcess;
+            return Ok(self);
+        }
 
         let addr = bound
             .http_addr()
@@ -4352,7 +4533,7 @@ impl WyrdTestServerBuilder {
 
     /// Select the production Forge process role for this fixture.
     #[must_use]
-    pub fn with_forge_process_role_for_test(mut self, role: BifrostTarget) -> Self {
+    pub fn with_forge_process_role_for_test(mut self, role: ServerTarget) -> Self {
         self.forge_process_role = role;
         self
     }
@@ -4477,6 +4658,17 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Configure the deployment's GitHub App against `mock`, with this
+    /// server's bound address as its public URL.
+    ///
+    /// Without it the server has no GitHub App, as when an operator configures
+    /// none. The server must start bound so GitHub can redirect to it.
+    #[must_use]
+    pub fn with_github_app_for_test(mut self, mock: &crate::github::GithubAppMock) -> Self {
+        self.github = Some(mock.clone());
+        self
+    }
+
     /// Register the test-support MCP context probe in this server's `/mcp`
     /// tool catalog.
     ///
@@ -4508,6 +4700,28 @@ impl WyrdTestServerBuilder {
     #[must_use]
     pub const fn with_verification_limits_for_test(mut self, limits: HostedLimits) -> Self {
         self.verification_limits = Some(limits);
+        self
+    }
+
+    /// Run the queued runtime under `limits` instead of the production
+    /// defaults, through the same configuration production reads its queued
+    /// execution slots and deadline from.
+    #[must_use]
+    pub fn with_verification_runtime_limits_for_test(mut self, limits: RuntimeLimits) -> Self {
+        self.verification_runtime_limits = Some(Box::new(limits));
+        self
+    }
+
+    /// End each direct verification `timeout` after its arrival instead of
+    /// the default, keeping every other hosted limit already selected.
+    #[must_use]
+    pub fn with_verify_timeout_for_test(mut self, timeout: Duration) -> Self {
+        self.verification_limits = Some(HostedLimits {
+            verify_timeout: timeout,
+            ..self
+                .verification_limits
+                .unwrap_or_else(test_verification_limits)
+        });
         self
     }
 
@@ -4811,7 +5025,7 @@ impl WyrdTestServerBuilder {
     /// server activates exactly the subsystems a Scribe pod activates, without
     /// a test-specific topology.
     #[must_use]
-    pub fn with_bifrost_target_for_test(mut self, target: BifrostTarget) -> Self {
+    pub fn with_bifrost_target_for_test(mut self, target: ServerTarget) -> Self {
         self.bifrost_roles = wyrd_server::config::BifrostRoles::for_target(target)
             .iter()
             .copied()
@@ -5090,9 +5304,12 @@ impl WyrdTestServerBuilder {
         let data_dir = self.bifrost_data_dir.clone().unwrap_or(Arc::new(
             tempfile::tempdir().map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
         ));
-        let data_root =
-            BifrostDataRoot::prepare(self.bifrost_data_path.as_deref().unwrap_or(data_dir.path()))
-                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        let bifrost_data_path = self
+            .bifrost_data_path
+            .clone()
+            .unwrap_or_else(|| data_dir.path().to_path_buf());
+        let data_root = BifrostDataRoot::prepare(&bifrost_data_path)
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         let scratch_root = data_root.oracle_spill().to_path_buf();
         let volume_roots = (!self.bifrost_roles.is_empty()).then(|| data_root.volume_roots());
         let snapshot = self.system_resources.unwrap_or(SystemResourceSnapshot {
@@ -5235,6 +5452,17 @@ impl WyrdTestServerBuilder {
             ..ForgeRuntimeConfig::default()
         };
         config.gateway = test_gateway_config(tenant_id, self.gateway_vault_backend.clone())?;
+        if let Some(mock) = &self.github {
+            let (http, _) = self.bind_addrs.ok_or_else(|| {
+                WyrdTestServerError::Start("a GitHub App test server must start bound".to_owned())
+            })?;
+            let public_url = format!("http://{http}");
+            mock.set_public_url(&public_url);
+            config.github = wyrd_server::config::GithubConfig {
+                public_url: Some(public_url),
+                ..mock.server_config()
+            };
+        }
         if let Some(endpoints) = self.gateway_endpoints {
             config.gateway.endpoints = endpoints;
         }
@@ -5249,10 +5477,12 @@ impl WyrdTestServerBuilder {
         // Hosted blocks always start, so direct verification runs; only an
         // opted-in server runs the queued runtime over them.
         config.verification.enabled = true;
-        config.verification.limits = self.verification_limits.unwrap_or(HostedLimits {
-            monty_min_workers: 0,
-            ..HostedLimits::default()
-        });
+        config.verification.limits = self
+            .verification_limits
+            .unwrap_or_else(test_verification_limits);
+        if let Some(limits) = self.verification_runtime_limits.take() {
+            config.verification.runtime = *limits;
+        }
         let (operator_keys, operator_keys_dir) = match self.operator_keys.take() {
             Some(config) => (config, None),
             None => generated_operator_keys()?,
@@ -5281,6 +5511,9 @@ impl WyrdTestServerBuilder {
         } = Box::pin(AppState::start(
             &config,
             StartInputs {
+                // The test process's allocator is not observed; the ledger
+                // is its only pressure reading.
+                parent_committed: || 0,
                 dependencies: BifrostExternalDependencies {
                     postgres,
                     storage,
@@ -5347,7 +5580,8 @@ impl WyrdTestServerBuilder {
                 fixture,
                 operator_keys_dir,
                 storage_root,
-                _bifrost_data_dir: data_dir,
+                bifrost_data_dir: data_dir,
+                bifrost_data_path,
                 bifrost_data_root,
                 state,
                 router,
@@ -5443,6 +5677,9 @@ const FLUSH_BIFROST_BOUND: std::time::Duration = std::time::Duration::from_mins(
 
 /// Pause between baseline status reads in [`WyrdTestServer::wait_for_baseline`].
 const BASELINE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Pause between queue reads in [`WyrdTestServer::wait_for_hosted_waiters`].
+const HOSTED_WAITERS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Operator binding every test server declares for `Environment` gateway credentials.
 pub const TEST_GATEWAY_CREDENTIAL_BINDING: &str = "test-provider-key";
@@ -6047,7 +6284,7 @@ mod production_composition_tests {
         BifrostResourcePolicy, BifrostRuntimeResources, ResourceSource, SystemResourceSnapshot,
     };
 
-    use super::{BifrostRuntimeRole, BifrostTarget, WyrdTestServerBuilder};
+    use super::{BifrostRuntimeRole, ServerTarget, WyrdTestServerBuilder};
 
     /// Injected raw observations reach production composition unmodified.
     ///
@@ -6073,6 +6310,7 @@ mod production_composition_tests {
                 roles: [vala_bifrost_redux::resources::BifrostRole::Oracle]
                     .into_iter()
                     .collect(),
+                process_memory_limit_bytes: None,
                 server_memory_min_bytes: None,
                 bifrost_memory_limit_bytes: None,
                 scratch_limit_bytes: None,
@@ -6101,7 +6339,7 @@ mod production_composition_tests {
         assert_eq!(sources.cpu, ResourceSource::Injected);
 
         let builder = WyrdTestServerBuilder::default();
-        assert_eq!(builder.forge_process_role, BifrostTarget::All);
+        assert_eq!(builder.forge_process_role, ServerTarget::Combined);
         assert_eq!(
             builder.bifrost_roles,
             [
@@ -6204,15 +6442,29 @@ mod tests {
         "/../../../sdks/wyrd-sdk-ts/testing/native.d.cts"
     ));
 
-    /// The three Python controls REQ-195 sanctions.
-    const PYTHON_CONTROLS: [&str; 3] = ["flush_bifrost", "wait_for_baseline", "make_binding_due"];
+    /// The six Python controls REQ-195 sanctions.
+    const PYTHON_CONTROLS: [&str; 6] = [
+        "flush_bifrost",
+        "wait_for_baseline",
+        "make_binding_due",
+        "hold_publications",
+        "occupy_hosted_memory",
+        "wait_for_hosted_waiters",
+    ];
 
-    /// The same three controls in TypeScript's camelCase projection.
-    const TYPESCRIPT_CONTROLS: [&str; 3] = ["flushBifrost", "waitForBaseline", "makeBindingDue"];
+    /// The same six controls in TypeScript's camelCase projection.
+    const TYPESCRIPT_CONTROLS: [&str; 6] = [
+        "flushBifrost",
+        "waitForBaseline",
+        "makeBindingDue",
+        "holdPublications",
+        "occupyHostedMemory",
+        "waitForHostedWaiters",
+    ];
 
     /// Python members that start, address, or credential the server and so
     /// neither steer nor inspect its state.
-    const PYTHON_SETUP: [&str; 23] = [
+    const PYTHON_SETUP: [&str; 24] = [
         "__init__",
         "__enter__",
         "__exit__",
@@ -6220,6 +6472,7 @@ mod tests {
         "grpc_url",
         "api_key",
         "tenant_id",
+        "tenant_slug",
         "access_token",
         "bootstrap_service",
         "bootstrap_user",
@@ -6239,11 +6492,13 @@ mod tests {
     ];
 
     /// TypeScript members that start, address, or credential the server.
-    const TYPESCRIPT_SETUP: [&str; 21] = [
+    const TYPESCRIPT_SETUP: [&str; 23] = [
         "baseUrl",
         "grpcUrl",
         "token",
         "tableFqn",
+        "tenantSlug",
+        "githubApp",
         "apiKey",
         "cardRef",
         "bootstrapService",
@@ -6318,20 +6573,29 @@ mod tests {
             .collect();
         assert!(
             hooks.is_empty(),
-            "{language} WyrdTestServer exposes test hooks outside the three sanctioned controls: {hooks:?}"
+            "{language} WyrdTestServer exposes test hooks outside the six sanctioned controls: {hooks:?}"
         );
     }
 
     /// Rust, Python, and TypeScript test servers expose `flush_bifrost`,
-    /// `wait_for_baseline`, and `make_binding_due`, and the Python and
-    /// TypeScript projections expose no other hook that steers or inspects
-    /// server state.
+    /// `wait_for_baseline`, `make_binding_due`, `hold_publications`,
+    /// `occupy_hosted_memory`, and `wait_for_hosted_waiters`, and the Python
+    /// and TypeScript projections expose no other hook that steers or
+    /// inspects server state.
+    ///
+    /// # Panics
+    /// Panics when a Rust control is not the named `WyrdTestServer` method, or
+    /// a Python or TypeScript projection misses one of the six controls or
+    /// exposes any member beyond them and its setup surface.
     #[test]
-    fn public_controls_are_the_three_sanctioned_operations() {
+    fn public_controls_are_the_six_sanctioned_operations() {
         let rust_controls = [
             std::any::type_name_of_val(&WyrdTestServer::flush_bifrost),
             std::any::type_name_of_val(&WyrdTestServer::wait_for_baseline),
             std::any::type_name_of_val(&WyrdTestServer::make_binding_due),
+            std::any::type_name_of_val(&WyrdTestServer::hold_publications),
+            std::any::type_name_of_val(&WyrdTestServer::occupy_hosted_memory),
+            std::any::type_name_of_val(&WyrdTestServer::wait_for_hosted_waiters),
         ];
         for (path, control) in rust_controls.iter().zip(PYTHON_CONTROLS) {
             assert!(

@@ -29,6 +29,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use wyrd_runtime::{Permission, PermissionSet};
+use wyrd_server::scribe_outbox::ScribeWrite;
 use wyrd_server::verification::authority::BackgroundAuthority;
 use wyrd_server::verification::drift::DRIFT_INVALID;
 use wyrd_server::verification::drift::DriftEngine;
@@ -37,10 +38,12 @@ use wyrd_server::verification::fault::{PublicationFault, SentBatch};
 use wyrd_server::verification::fitter::{BaselineFitter, FitGate};
 use wyrd_server::verification::groups::GroupPoller;
 use wyrd_server::verification::health::RuntimeCapability;
+use wyrd_server::verification::results::{ResultPayloadBuilder, ResultRun};
 use wyrd_server::verification::runner::{EngineScript, VERIFIER_UNAVAILABLE};
 use wyrd_server::verification::scheduler::{GroupHandoff, VerificationScheduler};
 use wyrd_server::verification::{CapabilityCrash, RuntimeLimits, VerificationRuntime};
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::Attribution;
 use wyrd_spec::card::drift::DriftMethod;
 use wyrd_spec::card::trigger::TriggerDuration;
 use wyrd_spec::card::verifier::{Check, DriftBaselineState, OWNER_OCCURRENCE_KEY};
@@ -52,6 +55,7 @@ use wyrd_spec::verification::execution::InputDeclaration;
 use wyrd_spec::verification::execution::{
     ExecutedOutcome, ExecutedRequirement, RequirementDetail, RequirementOutcome, RequirementResult,
 };
+use wyrd_spec::verification::state::ExecutionState;
 use wyrd_spec::verification::{
     DriftReport, DriftVerdict, FeatureDriftReport, GroupEndSettings, GroupSource,
     VerificationError, VerificationVerdict,
@@ -79,6 +83,9 @@ const RESULTS: &str = "bifrost.verification.results";
 
 /// Output table every completed result's summary follows.
 const OUTPUTS: &str = "bifrost.verification.execution_outputs";
+
+/// History table execution events are projected into beside results.
+const EVENTS: &str = "bifrost.verification.execution_events";
 
 /// One bound server, one seeded tenant, and the controls a runtime is built with.
 struct Harness {
@@ -273,12 +280,15 @@ impl Harness {
 
     /// The destination table of every result batch the runtime submitted to
     /// Scribe once its outbox settles, in submission order, resends included.
+    /// Execution history batches are projected independently of results and
+    /// are left out.
     async fn writes(&self) -> Vec<String> {
         self.fault
             .sent()
             .await
             .into_iter()
             .map(|sent| sent.table)
+            .filter(|table| table != EVENTS)
             .collect()
     }
 
@@ -462,6 +472,114 @@ impl Harness {
         .expect("execution lease reads")
     }
 
+    /// Record every committed update of a queue row from now on, as its
+    /// status, through a test-only trigger. A
+    /// rolled-back update records nothing, so [`Self::commits`] reads the
+    /// transactions that actually committed.
+    ///
+    /// # Panics
+    /// Panics when the log or its trigger cannot be installed.
+    async fn log_commits(&self) {
+        for statement in [
+            "CREATE TABLE public.queue_commits (seq bigserial PRIMARY KEY, \
+             execution_id uuid NOT NULL, status text NOT NULL)",
+            "CREATE FUNCTION public.log_queue_commit() RETURNS trigger LANGUAGE plpgsql \
+             SECURITY DEFINER AS $$ BEGIN INSERT INTO public.queue_commits \
+             (execution_id, status) VALUES (NEW.execution_id, NEW.status); \
+             RETURN NEW; END $$",
+            "CREATE TRIGGER log_queue_commit AFTER UPDATE ON wyrd.verifier_executions \
+             FOR EACH ROW EXECUTE FUNCTION public.log_queue_commit()",
+        ] {
+            sqlx::query(statement)
+                .execute(&self.assertion)
+                .await
+                .expect("the commit log installs");
+        }
+    }
+
+    /// Every update of `execution` [`Self::log_commits`] recorded, in commit
+    /// order.
+    ///
+    /// # Panics
+    /// Panics when the log cannot be read.
+    async fn commits(&self, execution: ExecutionId) -> Vec<String> {
+        sqlx::query_scalar(
+            "SELECT status FROM public.queue_commits WHERE execution_id = $1 ORDER BY seq",
+        )
+        .bind(execution.as_uuid())
+        .fetch_all(&self.assertion)
+        .await
+        .expect("the commit log reads")
+    }
+
+    /// The accepted Bifrost state of `execution`.
+    ///
+    /// # Panics
+    /// Panics when the state cannot be read or none was accepted.
+    async fn state(&self, execution: ExecutionId) -> ExecutionState {
+        self.seed
+            .execution_state(self.server.state(), execution)
+            .await
+            .expect("the execution state reads")
+            .expect("the execution has accepted state")
+    }
+
+    /// Assert `state` records a failure of `status` and `code` for the
+    /// harness Verifier and subject, and no selected outcome.
+    ///
+    /// # Panics
+    /// Panics when the state holds another decision or identity.
+    fn assert_failure(&self, state: &ExecutionState, status: &str, code: &str) {
+        let failure = state.failure.as_ref().expect("a failure is recorded");
+        assert_eq!(
+            (<&str>::from(failure.status), failure.error.code.as_str()),
+            (status, code),
+            "the canonical failure is recorded"
+        );
+        assert_eq!(state.terminal, None, "no outcome beside the failure");
+        let identity = state.identity.as_ref().expect("the identity is recorded");
+        assert_eq!(
+            (
+                identity.verifier.uid.as_ref(),
+                identity.subject.uid.as_ref()
+            ),
+            (Some(&self.verifier), Some(&self.subject)),
+            "the failure records the execution's identity"
+        );
+    }
+
+    /// The number of retained outputs and the verdict of every retained
+    /// summary naming `result_id`, once the result outbox has settled and
+    /// Scribe has flushed.
+    ///
+    /// # Panics
+    /// Panics when the outbox does not settle or a retained read fails.
+    async fn retained_result(&self, result_id: &str) -> (usize, Vec<String>) {
+        self.durable_rows().await;
+        let read = async |sql: String| {
+            self.server
+                .retained_records(self.seed.tenant(), sql)
+                .await
+                .expect("the retained result reads")
+        };
+        let outputs = read(format!(
+            "SELECT CAST(result_id AS VARCHAR) FROM {OUTPUTS} \
+             WHERE CAST(result_id AS VARCHAR) = '{result_id}'"
+        ))
+        .await;
+        let summaries = read(format!(
+            "SELECT verdict FROM {RESULTS} WHERE CAST(result_id AS VARCHAR) = '{result_id}'"
+        ))
+        .await;
+        (
+            outputs.len(),
+            summaries
+                .into_iter()
+                .map(|row| row[0].clone().unwrap_or_default())
+                .collect(),
+        )
+    }
+
     /// Every retained audit operation of the tenant in decision order, once
     /// the Scribe outbox has settled.
     ///
@@ -596,6 +714,8 @@ fn drift_outcome(
             result: RequirementResult {
                 id: drift_requirement(),
                 step: None,
+                item_index: None,
+                iteration_index: None,
                 statement: "The window does not drift.".to_owned(),
                 outcome,
                 reason: "scripted".to_owned(),
@@ -611,6 +731,7 @@ fn drift_outcome(
             }))
             .expect("the fixture drift check decodes"),
             provenance: None,
+            tool_calls: Vec::new(),
         }],
         steps: Vec::new(),
         evidence: BTreeMap::new(),
@@ -1226,24 +1347,141 @@ async fn verification_records_have_one_payload_owner() {
 }
 
 /// Without a scripted outcome the real Drift engine refuses a scheduled
-/// occurrence of the fixture Verifier, which declares no profile, settling
-/// the execution `errored` with `drift_invalid` and publishing nothing.
+/// occurrence of a registered PSI Verifier whose stored fitted baseline does
+/// not decode, settling the execution `errored` with `drift_invalid` and
+/// publishing nothing.
 ///
 /// # Panics
-/// Panics when the execution is not errored with that code or anything is
-/// written.
+/// Panics when the Verifier does not register, or the execution is not
+/// errored with that code or anything is written.
 #[tokio::test]
 async fn unscorable_verifier_errors_without_publishing() {
     let harness = Harness::start().await;
+    let verifier = harness
+        .seed
+        .fitted_verifier(
+            "unscorable",
+            &serde_json::json!({
+                "inputs": { "samples": { "type": "samples", "features": ["value"] } },
+                "requirements": [{
+                    "id": "drift",
+                    "statement": "The window does not drift.",
+                    "check": {
+                        "kind": "drift", "on": "inputs.samples", "method": "Psi",
+                        "signal": { "kind": "Distribution",
+                                    "baseline_ref": { "kind": "Data", "name": "unscorable-baseline",
+                                                      "version": "1.0.0" },
+                                    "features": ["value"] },
+                        "condition": { "kind": "Statistical" },
+                        "profile": { "kind": "Psi",
+                                     "binning_strategy": { "kind": "EqualWidth", "n_bins": 10 },
+                                     "threshold": { "kind": "Fixed", "value": 0.25 } }
+                    }
+                }]
+            }),
+            &serde_json::json!({ "Psi": { "format": 2 } }),
+        )
+        .await
+        .expect("the PSI Verifier registers with a baseline that does not decode");
     let runtime = harness.spawn(&Harness::limits(), &EngineScript::default());
-    let run = harness
-        .schedule("unscorable-owner", &harness.verifier)
-        .await;
+    let run = harness.schedule("unscorable-owner", &verifier).await;
 
     let row = harness.wait_execution(run, status("errored")).await;
     assert_eq!(row.error_code.as_deref(), Some(DRIFT_INVALID));
     assert_eq!(row.result_id, None, "no verdict is fabricated");
     assert!(harness.writes().await.is_empty());
+    runtime.stop().await;
+}
+
+/// A run commits `completed` only once Scribe acknowledges its result: while
+/// the result is held before Scribe the run stays `running` with no selected
+/// result, and completes on its first attempt once released. A result Scribe
+/// rejects retries the run within its attempt budget, and the next claim
+/// delivers the same selected result; a result still unacknowledged at the
+/// deadline keeps the run waiting for it rather than timing out an outcome
+/// its state already selected.
+///
+/// # Panics
+/// Panics when a run completes before its result is acknowledged, a
+/// rejected result is not delivered again under its identity, or an
+/// unacknowledged one ends the run at its deadline.
+#[tokio::test]
+async fn completion_waits_for_the_durable_result() {
+    let harness = Harness::start().await;
+    let script = EngineScript::default();
+    for _ in 0..4 {
+        script.push(EngineOutcome::Completed(unscored_report()));
+    }
+    let runtime = harness.spawn(
+        &RuntimeLimits {
+            execution_timeout: Duration::from_secs(5),
+            ..Harness::limits()
+        },
+        &script,
+    );
+
+    let hold = harness.fault.hold_next(OUTPUTS);
+    let run = harness.submit().await;
+    tokio::time::timeout(WAIT, hold.arrived())
+        .await
+        .expect("the result reaches Scribe");
+    let row = harness.seed.execution(run).await.expect("execution reads");
+    assert_eq!(
+        (row.status.as_str(), row.result_id),
+        ("running", None),
+        "no run completes before its result is durable"
+    );
+    hold.release();
+    let row = harness.wait_execution(run, status("completed")).await;
+    assert_eq!(row.attempts, 1);
+    assert!(row.result_id.is_some());
+
+    harness.fault.reject_next(OUTPUTS);
+    let run = harness.submit().await;
+    let row = harness.wait_execution(run, status("completed")).await;
+    assert_eq!(row.attempts, 2, "the rejected delivery is retried");
+    let outputs = sent_to(&harness.fault, OUTPUTS).await;
+    let delivered: Vec<_> = outputs[1..].iter().map(sent_result_id).collect();
+    assert_eq!(
+        delivered,
+        vec![row.result_id.expect("a result").to_string(); 2],
+        "the rejected result is delivered again under its identity"
+    );
+
+    let hold = harness.fault.hold_next(OUTPUTS);
+    let run = harness.submit().await;
+    tokio::time::timeout(WAIT, hold.arrived())
+        .await
+        .expect("the result reaches Scribe");
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let passed: bool = sqlx::query_scalar(
+            "SELECT created_at + INTERVAL '5 seconds' < statement_timestamp() \
+             FROM wyrd.verifier_executions \
+             WHERE execution_id = $1",
+        )
+        .bind(run.as_uuid())
+        .fetch_one(&harness.assertion)
+        .await
+        .expect("the deadline reads");
+        if passed {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for the execution deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let row = harness.seed.execution(run).await.expect("execution reads");
+    assert_eq!(
+        (row.status.as_str(), row.result_id),
+        ("running", None),
+        "a selected result is awaited past the deadline"
+    );
+    hold.release();
+    let row = harness.wait_execution(run, status("completed")).await;
+    assert_eq!((row.attempts, row.error_code), (1, None));
     runtime.stop().await;
 }
 
@@ -1510,6 +1748,132 @@ async fn cancellation_and_deadline_settle_without_a_verdict() {
     assert_eq!(row.result_id, None);
     script.release();
     assert!(harness.writes().await.is_empty());
+    runtime.stop().await;
+}
+
+/// An execution whose engine reaches its deadline while host work it
+/// started still runs stays `running` until that work settles, then settles
+/// `timed_out` without a verdict.
+///
+/// # Panics
+/// Panics when the run settles before its host work, reaches another state,
+/// or writes a result.
+#[tokio::test]
+async fn deadline_terminal_waits_for_started_host_work() {
+    let harness = Harness::start().await;
+    let script = EngineScript::default();
+    let runtime = harness.spawn(
+        &RuntimeLimits {
+            execution_timeout: Duration::from_millis(500),
+            ..Harness::limits()
+        },
+        &script,
+    );
+    script.hold();
+    script.hold_host_work();
+    script.push(EngineOutcome::Completed(unscored_report()));
+    let run = harness.submit().await;
+    wait_until("the engine to start", || script.entered() == 1).await;
+    let started: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT statement_timestamp()")
+        .fetch_one(&harness.assertion)
+        .await
+        .expect("the database clock reads");
+    let waited = tokio::time::Instant::now() + WAIT;
+    loop {
+        let passed: bool =
+            sqlx::query_scalar("SELECT $1 + INTERVAL '1 second' < statement_timestamp()")
+                .bind(started)
+                .fetch_one(&harness.assertion)
+                .await
+                .expect("the database clock reads");
+        if passed {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < waited,
+            "timed out waiting past the execution deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let row = harness.seed.execution(run).await.expect("execution reads");
+    assert_eq!(
+        (row.status.as_str(), row.result_id),
+        ("running", None),
+        "the deadline outcome waits for started host work"
+    );
+    script.release_host_work();
+    let row = harness.wait_execution(run, status("timed_out")).await;
+    assert_eq!(row.error_code.as_deref(), Some("execution_timed_out"));
+    assert_eq!(row.result_id, None);
+    script.release();
+    assert!(harness.writes().await.is_empty());
+    runtime.stop().await;
+}
+
+/// Target loading spends the claimed deadline: a run whose Verifier read
+/// waits past its remaining time times out without dispatching its engine.
+///
+/// # Panics
+/// Panics when the Card lock, cache flush, or deadline wait fails, or the run
+/// dispatches or reaches another state.
+#[tokio::test]
+async fn target_loading_spends_the_claimed_deadline() {
+    let harness = Harness::start().await;
+    let script = EngineScript::default();
+    script.push(EngineOutcome::Completed(unscored_report()));
+    let run = harness.submit().await;
+    let cache = harness.server.state().verification.verifier_cards();
+    let before = cache.invalidations();
+    sqlx::query("NOTIFY wyrd_verification_target, 'flush'")
+        .execute(&harness.assertion)
+        .await
+        .expect("the target cache is flushed");
+    wait_until("the flush reaches the cache", || {
+        cache.invalidations() != before
+    })
+    .await;
+    let mut cards = harness.assertion.begin().await.expect("lock transaction");
+    sqlx::query("LOCK TABLE wyrd.cards IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *cards)
+        .await
+        .expect("Card reads wait");
+    let runtime = harness.spawn(
+        &RuntimeLimits {
+            execution_timeout: Duration::from_millis(300),
+            ..Harness::limits()
+        },
+        &script,
+    );
+    // The claim statement ran before the runner's blocked target read began,
+    // so its deadline has passed once the database clock is a budget past
+    // that read. Other Card readers, such as ingest attribution, may block
+    // earlier and are not the runner.
+    let wait = tokio::time::Instant::now() + WAIT;
+    while !sqlx::query_scalar::<_, bool>(
+        "SELECT coalesce(bool_or(statement_timestamp() > a.query_start + INTERVAL '300 milliseconds'), false) \
+           FROM pg_locks l JOIN pg_stat_activity a USING (pid) \
+          WHERE NOT l.granted AND l.relation = 'wyrd.cards'::regclass \
+            AND a.query LIKE '%wyrd.verification_target(%'",
+    )
+    .fetch_one(&harness.assertion)
+    .await
+    .expect("blocked read")
+    {
+        assert!(tokio::time::Instant::now() < wait, "the Verifier read never waits");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    cards.commit().await.expect("Card reads resume");
+
+    let row = harness
+        .wait_execution(run, |row| {
+            ["completed", "timed_out"].contains(&row.status.as_str())
+        })
+        .await;
+    assert_eq!(
+        (row.status.as_str(), row.error_code.as_deref()),
+        ("timed_out", Some("execution_timed_out"))
+    );
+    assert_eq!(script.entered(), 0, "nothing dispatches after the deadline");
     runtime.stop().await;
 }
 
@@ -1896,77 +2260,72 @@ fn sent_values(sent: &SentBatch, column: &str) -> std::collections::BTreeSet<Str
 }
 
 /// An attempt whose result was staged but whose settlement never commits
-/// loses to the reclaiming attempt: each produced result carries its own
-/// identity, the execution selects the winner's, and its status read returns
-/// the winner's verdict, never the abandoned attempt's output.
+/// hands its selected result to the reclaiming attempt: the reclaim runs no
+/// engine, re-delivers the result under the same identity, and the status
+/// read returns that selected verdict.
+///
+/// # Panics
+/// Panics as [`redelivers_the_selected_result`] does.
+#[tokio::test]
+async fn reclaimed_attempt_after_a_failed_settlement_redelivers_the_selected_result() {
+    redelivers_the_selected_result(false).await;
+}
+
+/// A final attempt whose result was staged but whose settlement never
+/// commits is reconciled before exhaustion: the exhausted reclaim counts no
+/// attempt, runs no engine, and completes with the selected result.
+///
+/// # Panics
+/// Panics as [`redelivers_the_selected_result`] does.
+#[tokio::test]
+async fn final_attempt_after_a_failed_settlement_completes_instead_of_exhausting() {
+    redelivers_the_selected_result(true).await;
+}
+
+/// Fail the first attempt's settlement after its result was staged, on the
+/// final attempt when `final_attempt`, and prove the reclaim completes the
+/// execution with that result.
 ///
 /// A test-only deferred constraint trigger fails every completing commit made
 /// under the first attempt's lease token, so its result reaches Scribe while
-/// its settlement rolls back; the lease is then expired and a fresh runner
-/// reclaims and completes the execution with a different verdict.
+/// its settlement rolls back; the lease is then expired and a fresh runner,
+/// scripted with a different verdict, reclaims and completes the execution.
 ///
 /// # Panics
 /// Panics when the fault cannot be installed, the execution does not complete
-/// on its reclaim, the attempts share a result identity, or the status read
-/// returns the abandoned attempt's outcome.
-#[tokio::test]
-async fn reclaimed_attempt_after_a_failed_settlement_selects_its_own_result() {
+/// on its reclaim, the reclaim counts the wrong attempt, runs its engine, or
+/// mints another result identity, or the status read returns another
+/// outcome.
+async fn redelivers_the_selected_result(final_attempt: bool) {
     let harness = Harness::start().await;
-    let abandoned = EngineScript::default();
-    abandoned.hold();
-    abandoned.push(EngineOutcome::Completed(drifting_report()));
-    let stale = harness.spawn(&Harness::limits(), &abandoned);
-    let run = harness.submit().await;
-    wait_until("the first claim", || abandoned.entered() == 1).await;
-    let (Some(token), _) = harness.lease(run).await else {
-        panic!("the first attempt holds a lease");
-    };
-    for statement in [
-        "CREATE OR REPLACE FUNCTION public.fail_settlement() RETURNS trigger \
-         LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected settlement failure'; END $$"
-            .to_owned(),
-        format!(
-            "CREATE CONSTRAINT TRIGGER fail_settlement AFTER UPDATE ON wyrd.verifier_executions \
-             DEFERRABLE INITIALLY DEFERRED FOR EACH ROW \
-             WHEN (NEW.status = 'completed' AND OLD.lease_token = '{token}'::uuid) \
-             EXECUTE FUNCTION public.fail_settlement()"
-        ),
-    ] {
-        sqlx::query(AssertSqlSafe(statement))
-            .execute(&harness.assertion)
-            .await
-            .expect("the settlement fault installs");
-    }
-    abandoned.release();
-    let deadline = tokio::time::Instant::now() + WAIT;
-    while !harness.writes().await.iter().any(|table| table == RESULTS) {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for the abandoned result to be staged"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-
-    stale.stop.cancel();
+    let (run, stale) = stage_unsettled_result(&harness, final_attempt).await;
     harness.expire(run).await;
     let winner = EngineScript::default();
     winner.push(EngineOutcome::Completed(unscored_report()));
     let fresh = harness.spawn(&Harness::limits(), &winner);
     let row = harness.wait_execution(run, status("completed")).await;
-    assert_eq!(row.attempts, 2, "the reclaim is the second attempt");
+    assert_eq!(
+        row.attempts,
+        if final_attempt { 1 } else { 2 },
+        "only a reclaim within the budget counts an attempt"
+    );
     stale.stop().await;
     fresh.stop().await;
 
+    assert_eq!(winner.entered(), 0, "the reclaim runs no engine");
     let summaries = sent_to(&harness.fault, RESULTS).await;
-    assert_eq!(summaries.len(), 2, "both attempts published a summary");
-    let (lost, won) = (sent_result_id(&summaries[0]), sent_result_id(&summaries[1]));
-    assert_ne!(lost, won, "each produced result has its own identity");
-    assert_eq!(row.result_id.map(|id| id.to_string()), Some(won.clone()));
+    assert_eq!(summaries.len(), 2, "both attempts delivered the summary");
+    let (first, again) = (sent_result_id(&summaries[0]), sent_result_id(&summaries[1]));
+    assert_eq!(
+        first, again,
+        "the reclaim re-delivers the selected identity"
+    );
+    assert_eq!(row.result_id.map(|id| id.to_string()), Some(first.clone()));
     let outputs = sent_to(&harness.fault, OUTPUTS).await;
     assert_eq!(
         outputs.iter().map(sent_result_id).collect::<Vec<_>>(),
-        [lost, won],
-        "each attempt wrote one output under its own result identity"
+        [first.clone(), first],
+        "each delivery wrote the output under the selected identity"
     );
 
     harness.durable_rows().await;
@@ -1994,8 +2353,768 @@ async fn reclaimed_attempt_after_a_failed_settlement_selects_its_own_result() {
         .expect("status body reads");
     let state: serde_json::Value = serde_json::from_slice(&body).expect("status is JSON");
     assert_eq!(
-        state["result"]["outcome"]["verdict"], "inconclusive",
-        "the winner's verdict is read: {state}"
+        state["result"]["outcome"]["verdict"], "failed",
+        "the selected verdict is read: {state}"
+    );
+}
+
+/// A final attempt whose selected result was staged but whose settlement
+/// never commits is not exhausted while its state cannot be read or its
+/// result cannot be staged: an exhausted reclaim that cannot read its state
+/// leaves its lease to expire without computing, counting an attempt, or
+/// settling, and a reclaim that meets a full outbox holds its claim and
+/// waits for capacity in background, then completes the execution with the
+/// selected result instead of erroring.
+///
+/// The source outage revokes the tenant role's read of the Scribe batch
+/// fences the accepted revision is recovered from; it is restored once the
+/// reclaim has reported the state unusable. The capacity outage holds the
+/// whole reservable item share of the server's shared Scribe outbox, which
+/// the recovery runtime stages through; it is released once the reclaim has
+/// committed its claim.
+///
+/// # Panics
+/// Panics as [`stage_unsettled_result`] does, when the grant cannot change,
+/// the share cannot be held, a reclaim never meets its outage or settles or
+/// computes while blocked, or the execution does not complete on its first
+/// attempt with the selected result.
+#[tokio::test]
+async fn exhausted_reconciliation_survives_source_and_capacity_outage() {
+    let logs = LogCapture::install();
+    let harness = Harness::start().await;
+    harness.log_commits().await;
+    let (run, stale) = stage_unsettled_result(&harness, true).await;
+    let grant = |statement: &'static str| {
+        let pool = harness.assertion.clone();
+        async move {
+            sqlx::query(statement)
+                .execute(&pool)
+                .await
+                .expect("the fence grant changes");
+        }
+    };
+    grant("REVOKE SELECT ON vala.scribe_batch_commits FROM wyrd_tenant").await;
+    harness.expire(run).await;
+    let winner = EngineScript::default();
+    winner.push(EngineOutcome::Completed(unscored_report()));
+    let fresh = harness.spawn(&Harness::limits(), &winner);
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !logs.text().contains("the execution state cannot be used") {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for the reclaim to meet the outage"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    fresh.stop().await;
+    stale.stop().await;
+    grant("GRANT SELECT ON vala.scribe_batch_commits TO wyrd_tenant").await;
+
+    let outbox = harness.server.state().bifrost.scribe_outbox();
+    let full = outbox
+        .reserve(usize::MAX)
+        .expect_err("no reservation holds every slot");
+    let share = outbox
+        .reserve(full.limit - full.admitted)
+        .expect("the free reservable share is held");
+    assert!(outbox.reserve(1).is_err(), "the reservable share is full");
+    let before = harness.commits(run).await.len();
+    harness.expire(run).await;
+    let recovery = RunningRuntime::spawn(
+        VerificationRuntime::builder(harness.server.state())
+            .limits(Harness::limits())
+            .engine_script(winner.clone())
+            .build()
+            .expect("the recovery runtime composes"),
+    );
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while harness.commits(run).await.len() == before {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for the reclaim to commit its claim"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let row = harness.seed.execution(run).await.expect("execution reads");
+    assert_eq!(
+        (row.status.as_str(), row.attempts),
+        ("running", 1),
+        "a reclaim waiting for capacity neither settles nor counts an attempt"
+    );
+    let commits = harness.commits(run).await;
+    assert!(
+        commits[before..].iter().all(|commit| commit == "running"),
+        "the blocked reclaim commits only its claim: {commits:?}"
+    );
+    drop(share);
+    let row = harness.wait_execution(run, status("completed")).await;
+    recovery.stop().await;
+    assert_eq!(row.attempts, 1, "no reclaim counts an attempt");
+    assert_eq!(winner.entered(), 0, "no reclaim computes");
+    let summaries = sent_to(&harness.fault, RESULTS).await;
+    assert_eq!(
+        row.result_id.map(|id| id.to_string()),
+        Some(sent_result_id(&summaries[0])),
+        "the execution completes with the selected result"
+    );
+}
+
+/// Result delivery is mandatory drain work: it keeps progressing while
+/// process pressure stays critical.
+///
+/// A queued execution computes its result while the result outbox's share
+/// is held, so the result waits in the claim's custody. Pressure then turns
+/// critical and stays critical through two samples, which select victims;
+/// the waiting delivery is never one. Once the share frees, the execution
+/// completes with the result Scribe received while pressure is still
+/// critical.
+///
+/// # Panics
+/// Panics when the share cannot be held, pressure is not critical, the
+/// execution does not complete on its first attempt under critical pressure,
+/// or Scribe did not receive its result.
+#[tokio::test]
+async fn result_delivery_drains_while_pressure_stays_critical() {
+    use wyrd_runtime::resources::PressureState;
+    let harness = Harness::start().await;
+    let run = harness.submit().await;
+    let script = EngineScript::default();
+    script.push(EngineOutcome::Completed(unscored_report()));
+    let limits = Harness::limits();
+    let composed = harness.runtime(&limits, &script, &CapabilityCrash::default());
+    let outbox = harness
+        .fault
+        .composed_outbox()
+        .expect("the runtime composed its result outbox");
+    let full = outbox
+        .reserve(usize::MAX)
+        .expect_err("no reservation holds every slot");
+    let share = outbox
+        .reserve(full.limit - full.admitted)
+        .expect("the free reservable share is held");
+    let runtime = RunningRuntime::spawn(composed);
+    wait_until("the execution computes", || script.entered() == 1).await;
+
+    let workloads = harness.server.state().resources.workloads().clone();
+    let overcommitted = workloads.observe_commitment();
+    overcommitted.set(u64::MAX);
+    assert_eq!(workloads.sample(0).state, PressureState::Critical);
+    // The first critical sample reclaims; the next selects a victim.
+    assert_eq!(workloads.sample(0).state, PressureState::Critical);
+    let waiting = harness.seed.execution(run).await.expect("execution reads");
+    assert_eq!(
+        (waiting.status.as_str(), waiting.result_id),
+        ("running", None),
+        "the result still waits in the claim's custody"
+    );
+    assert!(sent_to(&harness.fault, RESULTS).await.is_empty());
+    drop(share);
+    let row = harness.wait_execution(run, status("completed")).await;
+    assert_eq!(
+        workloads.pressure().state,
+        PressureState::Critical,
+        "the result drained under critical pressure"
+    );
+    runtime.stop().await;
+    overcommitted.set(0);
+    assert_eq!(row.attempts, 1, "the delivery was never cancelled");
+    let sent: Vec<String> = sent_to(&harness.fault, RESULTS)
+        .await
+        .iter()
+        .map(sent_result_id)
+        .collect();
+    let result = row.result_id.map(|id| id.to_string());
+    assert!(
+        result.as_ref().is_some_and(|id| sent.contains(id)),
+        "the execution completes with a result Scribe received: {result:?} of {sent:?}"
+    );
+}
+
+/// While Scribe cannot accept queued work, finished queued results are held
+/// by the claims that computed them, and those claims bound how much more
+/// is claimed.
+///
+/// Three executions are queued and the whole reservable item share of the
+/// result outbox a runtime with two execution slots stages through is held
+/// before it starts; the server's own outbox, which direct work stages
+/// through, stays free. Both claims compute and select their results from memory, then
+/// keep their claims: across ten claim rounds the third execution stays
+/// queued and nothing settles, while a direct execution still answers. Once
+/// the share is released, every execution completes on its first attempt
+/// with a result Scribe received, and nothing computes twice.
+///
+/// # Panics
+/// Panics when the share cannot be held, a claim settles or a third
+/// computes while persistence is held, the direct execution is refused, or
+/// an execution does not complete once on its first attempt.
+#[tokio::test]
+async fn held_persistence_bounds_queued_custody_by_claim_permits() {
+    use crate::pg_verification_routes::execute;
+    let harness = Harness::start().await;
+    harness.log_commits().await;
+    let direct = harness
+        .seed
+        .verifier("custody-assertion", &assertion_spec())
+        .await
+        .expect("assertion Verifier registers");
+    let wyrd_testing::Bootstrap::User { jwt, .. } = harness
+        .server
+        .bootstrap_user("custody-direct", &["admin"])
+        .await
+        .expect("direct caller bootstraps")
+    else {
+        panic!("user bootstrap returned a machine principal");
+    };
+    let mut runs = Vec::new();
+    for _ in 0..3 {
+        runs.push(harness.submit().await);
+    }
+    let script = EngineScript::default();
+    for _ in 0..3 {
+        script.push(EngineOutcome::Completed(unscored_report()));
+    }
+    let limits = RuntimeLimits {
+        execution_slots: 2,
+        ..Harness::limits()
+    };
+    let composed = harness.runtime(&limits, &script, &CapabilityCrash::default());
+    let outbox = harness
+        .fault
+        .composed_outbox()
+        .expect("the runtime composed its result outbox");
+    let full = outbox
+        .reserve(usize::MAX)
+        .expect_err("no reservation holds every slot");
+    let share = outbox
+        .reserve(full.limit - full.admitted)
+        .expect("the free reservable share is held");
+    let runtime = RunningRuntime::spawn(composed);
+
+    wait_until("both claims compute", || script.entered() == 2).await;
+    // Absence is observed across ten claim rounds of the runtime.
+    tokio::time::sleep(limits.poll_interval * 10).await;
+    assert_eq!(script.entered(), 2, "no third execution is claimed");
+    let mut statuses = Vec::new();
+    for run in &runs {
+        let row = harness.seed.execution(*run).await.expect("execution reads");
+        statuses.push((row.status, row.attempts));
+    }
+    statuses.sort();
+    assert_eq!(
+        statuses,
+        [
+            ("pending".to_owned(), 0),
+            ("running".to_owned(), 1),
+            ("running".to_owned(), 1)
+        ],
+        "the finished claims hold their results and nothing settles"
+    );
+    let (code, answered) = execute(
+        &harness.server,
+        &jwt,
+        serde_json::json!({
+            "verifier_card_uid": direct,
+            "card_uid": harness.subject,
+            "inputs": { "x": { "kind": "json", "value": 1 } },
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(
+        code,
+        axum::http::StatusCode::OK,
+        "direct work answers: {answered}"
+    );
+
+    drop(share);
+    let mut completed = Vec::new();
+    for run in &runs {
+        completed.push(harness.wait_execution(*run, status("completed")).await);
+    }
+    runtime.stop().await;
+    assert_eq!(script.entered(), 3, "nothing computes twice");
+    let sent: std::collections::BTreeSet<String> = sent_to(&harness.fault, RESULTS)
+        .await
+        .iter()
+        .map(sent_result_id)
+        .collect();
+    for (run, row) in runs.iter().zip(&completed) {
+        assert_eq!(row.attempts, 1, "{run} completes on its first attempt");
+        let result = row.result_id.map(|id| id.to_string());
+        assert!(
+            result.as_ref().is_some_and(|id| sent.contains(id)),
+            "{run} completes with a result Scribe received: {result:?} of {sent:?}"
+        );
+        let commits = harness.commits(*run).await;
+        assert!(
+            commits
+                .iter()
+                .all(|commit| commit == "running" || commit == "completed"),
+            "{run} neither retries nor errors: {commits:?}"
+        );
+    }
+}
+
+/// A failed group commit retries its runs as a group rather than settling
+/// each run in its own transaction.
+///
+/// A test-only trigger fails the first batched completion statement once
+/// and records, for every completion that commits, whether the batched
+/// statement or the single-run statement applied it. Three queued runs
+/// compute while their claims are held, so they complete together; every
+/// run then commits through the batched statement on its first attempt.
+///
+/// # Panics
+/// Panics when the fault cannot be installed, no batch failed, or any run
+/// commits through the single-run statement or retries its attempt.
+#[tokio::test]
+async fn failed_group_commits_retry_as_groups() {
+    let harness = Harness::start().await;
+    for statement in [
+        "CREATE SEQUENCE public.batch_failures",
+        "CREATE TABLE public.completion_paths (execution_id uuid NOT NULL, batched boolean NOT NULL)",
+        "CREATE FUNCTION public.fail_first_batch() RETURNS trigger LANGUAGE plpgsql \
+         SECURITY DEFINER AS $$ DECLARE batched boolean := \
+         current_query() LIKE '%complete_verifier_executions%'; BEGIN \
+         IF batched AND nextval('public.batch_failures') = 1 THEN \
+         RAISE EXCEPTION 'test-only batched completion failure'; END IF; \
+         INSERT INTO public.completion_paths VALUES (NEW.execution_id, batched); \
+         RETURN NEW; END $$",
+        "CREATE TRIGGER fail_first_batch BEFORE UPDATE ON wyrd.verifier_executions \
+         FOR EACH ROW WHEN (NEW.status = 'completed') \
+         EXECUTE FUNCTION public.fail_first_batch()",
+    ] {
+        sqlx::query(statement)
+            .execute(&harness.assertion)
+            .await
+            .expect("the batch fault installs");
+    }
+    let mut runs = Vec::new();
+    for _ in 0..3 {
+        runs.push(harness.submit().await);
+    }
+    let script = EngineScript::default();
+    script.hold();
+    for _ in 0..3 {
+        script.push(EngineOutcome::Completed(unscored_report()));
+    }
+    let runtime = harness.spawn(&Harness::limits(), &script);
+    wait_until("every claim computes", || script.entered() == 3).await;
+    script.release();
+    for run in &runs {
+        let row = harness.wait_execution(*run, status("completed")).await;
+        assert_eq!(row.attempts, 1, "{run} completes on its first attempt");
+    }
+    runtime.stop().await;
+    let failures: i64 = sqlx::query_scalar("SELECT last_value FROM public.batch_failures")
+        .fetch_one(&harness.assertion)
+        .await
+        .expect("the failure count reads");
+    assert!(failures >= 1, "the first batch failed");
+    let mut paths: Vec<(Uuid, bool)> =
+        sqlx::query_as("SELECT execution_id, batched FROM public.completion_paths")
+            .fetch_all(&harness.assertion)
+            .await
+            .expect("the completion paths read");
+    paths.sort();
+    let mut expected: Vec<(Uuid, bool)> = runs.iter().map(|run| (run.as_uuid(), true)).collect();
+    expected.sort();
+    assert_eq!(
+        paths, expected,
+        "every run commits once through the batched statement"
+    );
+}
+
+/// Stage `harness`'s submitted execution's selected result while its
+/// settlement never commits, on its final attempt when `final_attempt`, and
+/// return the execution and its stopping runtime.
+///
+/// A test-only deferred constraint trigger fails every completing commit
+/// made under the first attempt's lease token, so its result reaches Scribe
+/// while its settlement rolls back; the runtime's claim loop is closed, so
+/// only a fresh runtime reclaims the execution once its lease is expired.
+///
+/// # Panics
+/// Panics when the fault cannot be installed or the result is never staged.
+async fn stage_unsettled_result(
+    harness: &Harness,
+    final_attempt: bool,
+) -> (ExecutionId, RunningRuntime) {
+    let abandoned = EngineScript::default();
+    abandoned.hold();
+    abandoned.push(EngineOutcome::Completed(drifting_report()));
+    let stale = harness.spawn(&Harness::limits(), &abandoned);
+    let run = harness.submit().await;
+    wait_until("the first claim", || abandoned.entered() == 1).await;
+    let (Some(token), _) = harness.lease(run).await else {
+        panic!("the first attempt holds a lease");
+    };
+    for statement in [
+        "CREATE OR REPLACE FUNCTION public.fail_settlement() RETURNS trigger \
+         LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected settlement failure'; END $$"
+            .to_owned(),
+        format!(
+            "CREATE CONSTRAINT TRIGGER fail_settlement AFTER UPDATE ON wyrd.verifier_executions \
+             DEFERRABLE INITIALLY DEFERRED FOR EACH ROW \
+             WHEN (NEW.status = 'completed' AND OLD.lease_token = '{token}'::uuid) \
+             EXECUTE FUNCTION public.fail_settlement()"
+        ),
+    ] {
+        sqlx::query(AssertSqlSafe(statement))
+            .execute(&harness.assertion)
+            .await
+            .expect("the settlement fault installs");
+    }
+    if final_attempt {
+        sqlx::query(
+            "UPDATE wyrd.verifier_executions SET max_attempts = attempts WHERE execution_id = $1",
+        )
+        .bind(run.as_uuid())
+        .execute(&harness.assertion)
+        .await
+        .expect("the attempt becomes the final one");
+    }
+    abandoned.release();
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !harness.writes().await.iter().any(|table| table == RESULTS) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for the abandoned result to be staged"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    stale.stop.cancel();
+    (run, stale)
+}
+
+/// Assert `commits` owe no delivery at any commit and settle `terminal`
+/// exactly once.
+///
+/// # Panics
+/// Panics when a commit owes a delivery or `terminal` committed other than
+/// once.
+fn assert_one_settlement(commits: &[String], terminal: &str) {
+    assert_eq!(
+        commits.iter().filter(|status| *status == terminal).count(),
+        1,
+        "the attempt settles {terminal} in one commit: {commits:?}"
+    );
+}
+
+/// An engine failure, a deadline, and a final attempt's retryable failure
+/// each settle once their failure is acknowledged: while the failure's state
+/// frame is held before Scribe the execution stays `running` with no failure
+/// accepted, and once released the attempt terminates with the canonical
+/// failure and identity in one commit. A retryable failure with attempts
+/// left still retries.
+///
+/// Every committed update of the queue row is logged by a test-only trigger,
+/// so a second settlement commit shows.
+///
+/// # Panics
+/// Panics when an execution settles before its failure is acknowledged,
+/// settles in more than one commit, the state records another decision or identity,
+/// or a retryable failure with attempts left does not retry.
+#[tokio::test]
+async fn terminal_failures_use_one_acknowledged_settlement() {
+    let harness = Harness::start().await;
+    harness.log_commits().await;
+    let script = EngineScript::default();
+    let runtime = harness.spawn(
+        &RuntimeLimits {
+            execution_timeout: Duration::from_secs(3),
+            ..Harness::limits()
+        },
+        &script,
+    );
+    let error = |code: &str| VerificationError {
+        code: code.to_owned(),
+        message: "the engine failed".to_owned(),
+    };
+    let cases = [
+        (
+            EngineOutcome::Terminal(TerminalStatus::Errored, error("engine_refused")),
+            ("errored", "engine_refused"),
+            false,
+        ),
+        (
+            EngineOutcome::Completed(unscored_report()),
+            ("timed_out", "execution_timed_out"),
+            false,
+        ),
+        (
+            EngineOutcome::Retry(error("engine_unavailable")),
+            ("errored", "engine_unavailable"),
+            true,
+        ),
+    ];
+    for (outcome, (terminal, code), final_attempt) in cases {
+        let timeout = terminal == "timed_out";
+        let (retries, claims) = if final_attempt { (2, 3) } else { (0, 1) };
+        script.hold();
+        for _ in 0..retries {
+            script.push_unheld(EngineOutcome::Retry(error("engine_unavailable")));
+        }
+        script.push(outcome);
+        let entered = script.entered();
+        let run = harness.submit().await;
+        for attempt in 1..=retries {
+            harness
+                .wait_execution(run, move |row| {
+                    row.status == "retrying" && row.attempts == attempt
+                })
+                .await;
+            harness.expire(run).await;
+        }
+        wait_until("the claim", || script.entered() == entered + claims).await;
+        let hold = harness.fault.hold_next(EVENTS);
+        if !timeout {
+            script.release();
+        }
+        tokio::time::timeout(WAIT, hold.arrived())
+            .await
+            .expect("the failure reaches Scribe");
+        let row = harness.seed.execution(run).await.expect("execution reads");
+        assert_eq!(row.status, "running", "{terminal} waits for its failure");
+        let accepted = harness
+            .seed
+            .execution_state(harness.server.state(), run)
+            .await
+            .expect("the execution state reads");
+        assert_eq!(accepted.and_then(|state| state.failure), None);
+        hold.release();
+        script.release();
+        let row = harness.wait_execution(run, status(terminal)).await;
+        assert_eq!(
+            (row.attempts, row.error_code.as_deref()),
+            (retries + 1, Some(code))
+        );
+        assert_one_settlement(&harness.commits(run).await, terminal);
+        harness.assert_failure(&harness.state(run).await, terminal, code);
+    }
+
+    script.push(EngineOutcome::Retry(error("engine_unavailable")));
+    let run = harness.submit().await;
+    let row = harness.wait_execution(run, status("retrying")).await;
+    assert_eq!(
+        (row.attempts, row.error_code.as_deref()),
+        (1, Some("engine_unavailable"))
+    );
+    runtime.stop().await;
+    assert!(harness.writes().await.is_empty(), "no result is written");
+}
+
+/// A terminal failure accepted in the execution's state is never recomputed:
+/// the failure is canonical in the state before its termination commit fails,
+/// and the reclaim runs no engine and terminates with the recorded error in
+/// one commit.
+///
+/// A test-only deferred constraint trigger fails every `errored` commit made
+/// under the first attempt's lease token, so the failure reaches the state
+/// while its termination rolls back; the lease is then expired and a fresh
+/// runner, scripted to complete, reclaims the execution. Every committed
+/// update of the queue row is logged, so a second settlement commit shows.
+///
+/// # Panics
+/// Panics when the fault cannot be installed, the failure is not accepted
+/// before the reclaim, the reclaim runs its engine, settles another status or
+/// error, writes a result, or settles in more than one commit.
+#[tokio::test]
+async fn terminal_failure_reclaims_without_reentering_the_engine() {
+    let harness = Harness::start().await;
+    let failing = EngineScript::default();
+    failing.hold();
+    failing.push(EngineOutcome::Terminal(
+        TerminalStatus::Errored,
+        VerificationError {
+            code: "engine_refused".to_owned(),
+            message: "the engine refused the input".to_owned(),
+        },
+    ));
+    let stale = harness.spawn(&Harness::limits(), &failing);
+    let run = harness.submit().await;
+    wait_until("the first claim", || failing.entered() == 1).await;
+    let (Some(token), _) = harness.lease(run).await else {
+        panic!("the first attempt holds a lease");
+    };
+    harness.log_commits().await;
+    for statement in [
+        "CREATE OR REPLACE FUNCTION public.fail_termination() RETURNS trigger \
+         LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected termination failure'; END $$"
+            .to_owned(),
+        format!(
+            "CREATE CONSTRAINT TRIGGER fail_termination AFTER UPDATE ON wyrd.verifier_executions \
+             DEFERRABLE INITIALLY DEFERRED FOR EACH ROW \
+             WHEN (NEW.status = 'errored' AND OLD.lease_token = '{token}'::uuid) \
+             EXECUTE FUNCTION public.fail_termination()"
+        ),
+    ] {
+        sqlx::query(AssertSqlSafe(statement))
+            .execute(&harness.assertion)
+            .await
+            .expect("the termination fault installs");
+    }
+    let claimed = sent_to(&harness.fault, EVENTS).await.len();
+    failing.release();
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while sent_to(&harness.fault, EVENTS).await.len() == claimed {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for the failure to reach the state"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    stale.stop.cancel();
+    harness.assert_failure(&harness.state(run).await, "errored", "engine_refused");
+    assert_eq!(
+        harness
+            .seed
+            .execution(run)
+            .await
+            .expect("execution reads")
+            .status,
+        "running",
+        "the termination commit failed"
+    );
+
+    harness.expire(run).await;
+    let winner = EngineScript::default();
+    winner.push(EngineOutcome::Completed(unscored_report()));
+    let fresh = harness.spawn(&Harness::limits(), &winner);
+    let row = harness.wait_execution(run, status("errored")).await;
+    stale.stop().await;
+    fresh.stop().await;
+    assert_eq!(row.error_code.as_deref(), Some("engine_refused"));
+    assert_eq!(row.result_id, None);
+    assert_one_settlement(&harness.commits(run).await, "errored");
+    assert_eq!(winner.entered(), 0, "the reclaim runs no engine");
+    assert!(harness.writes().await.is_empty(), "no result is written");
+    harness.assert_failure(&harness.state(run).await, "errored", "engine_refused");
+}
+
+/// A selected result delivered again by a later claim is retained once.
+///
+/// First the attempt's result is accepted while its settlement fails, and a
+/// fresh runtime reclaims and completes the execution. Then another
+/// execution's output is accepted while its summary is refused, the
+/// runtime stops, and a fresh runtime delivers the result again. Each
+/// redelivery runs no engine, resends every record under its first batch ID
+/// and bytes, and leaves exactly one output and one summary retained under
+/// the selected result identity. Last, different rows staged under that
+/// accepted identity are refused: they are never acknowledged and the
+/// retained result is unchanged.
+///
+/// # Panics
+/// Panics when a redelivery computes, changes an identity or its rows,
+/// leaves a duplicate or missing record, or a conflicting write is
+/// acknowledged or replaces the retained result.
+#[tokio::test]
+async fn result_redelivery_is_idempotent_after_restart() {
+    let harness = Harness::start().await;
+    let (settled, stale) = stage_unsettled_result(&harness, false).await;
+    harness.expire(settled).await;
+    let reclaim = EngineScript::default();
+    reclaim.push(EngineOutcome::Completed(unscored_report()));
+    let fresh = harness.spawn(&Harness::limits(), &reclaim);
+    let row = harness.wait_execution(settled, status("completed")).await;
+    stale.stop().await;
+    fresh.stop().await;
+    assert_eq!(reclaim.entered(), 0, "the reclaim runs no engine");
+    let id = row.result_id.expect("a completed result").to_string();
+    assert_eq!(
+        harness.retained_result(&id).await,
+        (1, vec!["failed".to_owned()]),
+        "the settled result is retained once"
+    );
+    for table in [OUTPUTS, RESULTS] {
+        let sent = sent_to(&harness.fault, table).await;
+        assert_eq!(sent.len(), 2, "both claims delivered {table}");
+        assert_eq!(sent[0], sent[1], "the redelivery repeats {table}'s batch");
+        assert_eq!(sent_result_id(&sent[0]), id);
+    }
+
+    let partial = EngineScript::default();
+    partial.hold();
+    partial.push(EngineOutcome::Completed(drifting_report()));
+    let interrupted = harness.spawn(&Harness::limits(), &partial);
+    let run = harness.submit().await;
+    wait_until("the partial claim", || partial.entered() == 1).await;
+    harness.fault.reject_next(RESULTS);
+    interrupted.stop.cancel();
+    partial.release();
+    interrupted.stop().await;
+    let selected = harness
+        .state(run)
+        .await
+        .terminal
+        .expect("the selection is accepted before its result");
+    let id = selected.result_id.to_string();
+    assert_eq!(
+        harness.retained_result(&id).await,
+        (1, Vec::new()),
+        "only the output was accepted"
+    );
+    let redelivery = EngineScript::default();
+    let restarted = harness.spawn(&Harness::limits(), &redelivery);
+    let row = harness.wait_execution(run, status("completed")).await;
+    restarted.stop().await;
+    assert_eq!(redelivery.entered(), 0, "the redelivery runs no engine");
+    assert_eq!(row.result_id.map(|id| id.to_string()), Some(id.clone()));
+    assert_eq!(
+        harness.retained_result(&id).await,
+        (1, vec!["failed".to_owned()]),
+        "the interrupted result is retained once"
+    );
+    for table in [OUTPUTS, RESULTS] {
+        let sent = sent_to(&harness.fault, table)
+            .await
+            .into_iter()
+            .filter(|sent| sent_result_id(sent) == id)
+            .collect::<Vec<_>>();
+        assert_eq!(sent.len(), 2, "both claims delivered {table}");
+        assert_eq!(sent[0], sent[1], "the redelivery repeats {table}'s batch");
+    }
+
+    let now = Utc::now();
+    let conflicting = ResultPayloadBuilder::new(
+        ResultRun {
+            execution_id: run,
+            run_id: None,
+            verifier_version: "0.0.0",
+            card_uid: &harness.subject,
+            owner_card_uid: None,
+            group_id: None,
+            deployment_environment: None,
+            binding_id: None,
+            trigger: None,
+            window: None,
+        },
+        &harness.verifier,
+        now,
+        now,
+    )
+    .build_as(selected.result_id, &unscored_report())
+    .expect("the conflicting result builds");
+    let (sender, acked) = tokio::sync::oneshot::channel();
+    harness.server.state().bifrost.scribe_outbox().stage(
+        harness.seed.tenant(),
+        ScribeWrite::Result {
+            payload: conflicting,
+            attribution: Attribution::unresolved(),
+            acked: std::sync::Mutex::new(Some(sender)),
+        },
+    );
+    assert!(
+        tokio::time::timeout(WAIT, acked)
+            .await
+            .expect("the conflicting write is answered")
+            .is_err(),
+        "different rows under an accepted identity are never acknowledged"
+    );
+    assert_eq!(
+        harness.retained_result(&id).await,
+        (1, vec!["failed".to_owned()]),
+        "the accepted result is not replaced"
     );
 }
 
@@ -2461,9 +3580,10 @@ impl Harness {
 /// acknowledgement: while that record's Scribe write is held, the pass has
 /// staged the run but no queue row exists, the cursor stays due, another
 /// queued execution's admission does not admit it, and a later pass does not
-/// prepare the occurrence again; a direct execution still returns. Once the
-/// write is released, the run is admitted under its staged identity and the
-/// cursor moves to the tick's next occurrence in the same commit.
+/// prepare the occurrence again. Once the write is released, a direct
+/// execution racing it returns with its state accepted, the run is admitted
+/// under its staged identity, and the cursor moves to the tick's next
+/// occurrence in the same commit.
 ///
 /// # Panics
 /// Panics when a run exists before its input is acknowledged, the cursor
@@ -2474,6 +3594,15 @@ async fn queued_origins_require_their_own_input_ack() {
     let harness = Harness::start().await;
     let (binding, armed) = harness.due_schedule("owner").await;
     assert!(armed.is_some(), "activation armed the schedule cursor");
+    // Registered before the stall: its storage row shares the held tenant's
+    // outbox lanes and would otherwise wait behind the stalled write.
+    let (verifier, subject, _, jwt) = traced_tenant(
+        &harness.server,
+        harness.server.pg_fixture().data_tenant_id(),
+        "direct-caller",
+        Registration::Declared,
+    )
+    .await;
     harness.server.flush_bifrost().await.expect("setup settles");
     let scheduler = harness.scheduler();
     let stop = CancellationToken::new();
@@ -2507,9 +3636,14 @@ async fn queued_origins_require_their_own_input_ack() {
         .seed_additional_tenant_with_uuid(elsewhere, "queued-elsewhere")
         .await
         .expect("second tenant seeds");
-    let (queued, subject, _, caller) =
-        traced_tenant(&harness.server, elsewhere, "queued-caller").await;
-    let other = enqueue(&harness.server, &caller, (&queued, &subject)).await;
+    let (queued, queued_subject, _, caller) = traced_tenant(
+        &harness.server,
+        elsewhere,
+        "queued-caller",
+        Registration::Declared,
+    )
+    .await;
+    let other = enqueue(&harness.server, &caller, (&queued, &queued_subject)).await;
     let reader = VerificationFixture::provision(harness.server.state(), elsewhere)
         .await
         .expect("tenant provisions");
@@ -2528,27 +3662,24 @@ async fn queued_origins_require_their_own_input_ack() {
         again.is_empty(),
         "the outstanding occurrence is not prepared again: {again:?}"
     );
-    let (verifier, subject, _, jwt) = traced_tenant(
-        &harness.server,
-        harness.server.pg_fixture().data_tenant_id(),
-        "direct-caller",
-    )
-    .await;
-    let direct = traced_execute(
-        &harness.server,
-        Some(&jwt),
-        (&verifier, &subject),
-        "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
-    )
-    .await;
+    let (direct, ()) = tokio::join!(
+        traced_execute(
+            &harness.server,
+            Some(&jwt),
+            (&verifier, &subject),
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+        ),
+        async {
+            stall.release();
+            stall.wait_completed().await;
+        }
+    );
     assert_eq!(
         direct,
         axum::http::StatusCode::OK,
-        "a direct execution returns while a queued input is held"
+        "a direct execution racing a held queued input returns once Scribe accepts its state"
     );
 
-    stall.release();
-    stall.wait_completed().await;
     harness
         .server
         .flush_bifrost()
@@ -3174,6 +4305,58 @@ async fn the_runner_claims_no_more_than_its_execution_slots() {
     claim_first_round(3, 2).await;
 }
 
+/// A parked attempt keeps its claim until Scribe acknowledges the parked
+/// revision, and only then returns its row to the queue.
+///
+/// While the revision is held the row stays leased to the claim; once it is
+/// acknowledged the row is pending again with its lease cleared and its
+/// attempt refunded.
+///
+/// # Panics
+/// Panics when the row returns to the queue before the acknowledgement or
+/// stays leased after it.
+#[tokio::test]
+async fn a_parked_attempt_keeps_its_claim_until_acknowledged() {
+    let harness = Harness::start().await;
+    let script = EngineScript::default();
+    let run = harness.submit().await;
+    script.push(EngineOutcome::Parked(
+        [SlotName::new("ci").expect("slot name")].into(),
+        Vec::new(),
+    ));
+    let stall = harness
+        .server
+        .stall_next_bifrost_write_into("bifrost.verification.execution_events")
+        .expect("Scribe stalls");
+    let runtime = harness.spawn(&Harness::limits(), &script);
+    stall.wait_entered().await;
+    let pool = harness.assertion.clone();
+    let leased = || {
+        sqlx::query_as::<_, (String, bool)>(
+            "SELECT status, lease_expires_at IS NOT NULL
+               FROM wyrd.verifier_executions WHERE execution_id = $1",
+        )
+        .bind(run.as_uuid())
+        .fetch_one(&pool)
+    };
+    assert_eq!(
+        leased().await.expect("lease reads"),
+        ("running".to_owned(), true),
+        "the held park keeps its claim"
+    );
+
+    stall.release();
+    stall.wait_completed().await;
+    let parked = wait_execution_in(&harness.seed, run, status("pending")).await;
+    assert_eq!(parked.attempts, 0, "parking refunds its attempt");
+    assert_eq!(
+        leased().await.expect("lease reads"),
+        ("pending".to_owned(), false),
+        "the acknowledged park returns its row"
+    );
+    runtime.stop().await;
+}
+
 /// A burst of queued runs in one tenant is claimed in the runner's first
 /// round up to its free slots, through repeated passes over the single due
 /// tenant, not one run per round.
@@ -3332,8 +4515,11 @@ async fn claim_first_round(tenants: usize, slots: usize) {
     for _ in 0..tenants {
         script.push(EngineOutcome::Completed(unscored_report()));
     }
+    // The deadline counts from admission, and seeding many tenants can
+    // outlast the harness timeout before the runner starts.
     let limits = RuntimeLimits {
         execution_slots: slots,
+        execution_timeout: Duration::from_mins(5),
         ..Harness::limits()
     };
     let runtime = harness.spawn(&limits, &script);
@@ -3872,6 +5058,17 @@ fn assertion_spec() -> serde_json::Value {
     })
 }
 
+/// How [`traced_tenant`] registers its assertion Verifier.
+#[derive(Clone, Copy)]
+enum Registration {
+    /// Through the server's declaration, as every real Verifier is.
+    Declared,
+    /// Written directly, for a cluster whose Scribe is down from the start,
+    /// where a declaration cannot store its Card. The assertion Verifier has
+    /// no server-derived field, so the row equals the declared one.
+    WithoutScribe,
+}
+
 /// Seeds a deterministic assertion Verifier and a subject in `tenant` and returns
 /// a token for a caller there, so a traced execution needs no provider.
 ///
@@ -3881,6 +5078,7 @@ async fn traced_tenant(
     server: &WyrdTestServer,
     tenant: DataTenantId,
     name: &str,
+    registration: Registration,
 ) -> (CardUid, CardUid, wyrd_spec::auth::PrincipalId, String) {
     server
         .ensure_builtin_tables_for_test(tenant)
@@ -3890,10 +5088,14 @@ async fn traced_tenant(
         .await
         .expect("tenant provisions");
     let (subject, _) = seed.service("traced").await.expect("subject registers");
-    let verifier = seed
-        .verifier("traced-assertion", &assertion_spec())
-        .await
-        .expect("assertion Verifier registers");
+    let verifier = match registration {
+        Registration::Declared => seed.verifier("traced-assertion", &assertion_spec()).await,
+        Registration::WithoutScribe => {
+            seed.declare("Verifier", "traced-assertion", &assertion_spec())
+                .await
+        }
+    }
+    .expect("assertion Verifier registers");
     let wyrd_testing::Bootstrap::Machine { id, api_key, .. } = server
         .bootstrap_service_in_tenant(tenant, name, &["editor"])
         .await
@@ -4088,7 +5290,8 @@ async fn continued_request_spans_reach_operator_and_tenant() {
         .await
         .expect("test server starts");
     let tenant = server.data_tenant_id();
-    let (verifier, subject, principal, jwt) = traced_tenant(&server, tenant, "traced-caller").await;
+    let (verifier, subject, principal, jwt) =
+        traced_tenant(&server, tenant, "traced-caller", Registration::Declared).await;
     let unsampled = "5bf92f3577b34da6a3ce929d0e0e4736";
     let checkpoint = traces.checkpoint();
     for (trace, flags) in [(EXPORT_TRACE, "01"), (unsampled, "00")] {
@@ -4148,7 +5351,7 @@ async fn operator_rejected_requests_still_reach_a_continuing_tenant() {
         .expect("test server starts");
     let tenant = server.data_tenant_id();
     let (verifier, subject, principal, jwt) =
-        traced_tenant(&server, tenant, "rejected-caller").await;
+        traced_tenant(&server, tenant, "rejected-caller", Registration::Declared).await;
     let unsampled = "6bf92f3577b34da6a3ce929d0e0e4736";
     let checkpoint = traces.checkpoint();
     for (trace, flags) in [(EXPORT_TRACE, "01"), (unsampled, "00")] {
@@ -4207,7 +5410,8 @@ async fn same_inbound_trace_id_routes_each_tenant_separately() {
         (server.data_tenant_id(), "first-caller", "00f067aa0ba902b1"),
         (other, "second-caller", "00f067aa0ba902b2"),
     ] {
-        let (verifier, subject, principal, jwt) = traced_tenant(&server, tenant, name).await;
+        let (verifier, subject, principal, jwt) =
+            traced_tenant(&server, tenant, name, Registration::Declared).await;
         let status = traced_execute(
             &server,
             Some(&jwt),
@@ -4251,7 +5455,8 @@ async fn unrouted_spans_export_only_to_the_operator() {
         .await
         .expect("test server starts");
     let tenant = server.data_tenant_id();
-    let (verifier, subject, _, _) = traced_tenant(&server, tenant, "unrouted-caller").await;
+    let (verifier, subject, _, _) =
+        traced_tenant(&server, tenant, "unrouted-caller", Registration::Declared).await;
     let checkpoint = traces.checkpoint();
     let status = traced_execute(
         &server,
@@ -4301,22 +5506,6 @@ fn lost_scribe_writes(cluster: &wyrd_testing::bifrost::cluster::WyrdTestCluster)
         .filter_map(|line| line.rsplit_once(' '))
         .map(|(_, value)| value.trim().parse::<u64>().expect("an integer counter"))
         .sum()
-}
-
-/// Durable rows `tenant` holds in `table`, from the published file list.
-///
-/// # Panics
-/// Panics when the file list cannot be read.
-async fn published_rows(assertion: &PgPool, tenant: DataTenantId, table: &str) -> i64 {
-    sqlx::query_scalar(
-        "SELECT COALESCE(SUM(row_count), 0)::bigint FROM vala.file_list \
-         WHERE data_tenant_id = $1 AND namespace || '.' || table_name = $2",
-    )
-    .bind(tenant.as_uuid())
-    .bind(table)
-    .fetch_one(assertion)
-    .await
-    .expect("published row count")
 }
 
 /// Calls `tools/list` on `server`'s stateless `/mcp` as `jwt`, returning the
@@ -4386,16 +5575,15 @@ async fn grpc_health_answers(server: &WyrdTestServer) {
 ///
 /// The role-separated cluster boots its Oracle pods while its only Scribe pod
 /// is held back, so the Oracle pod's peer route reaches no Scribe. Traced
-/// executions continue a sampled caller until the Scribe-outbox loss counter
-/// rises, proving copies past the permit pool are dropped at once; each also
-/// stages its Verifier result, and HTTP, gRPC, and MCP keep answering. Once
-/// the Scribe pod joins, that same outbox drains: exactly the permitted copies
-/// and every result publish, and one later copy is accepted with no loss.
+/// reads continue a sampled caller until the Scribe-outbox loss counter
+/// rises, proving copies past the permit pool are dropped at once, while
+/// HTTP, gRPC, and MCP keep answering. Once the Scribe pod joins, that same
+/// outbox drains: exactly the permitted copies publish, and a later traced
+/// read publishes its copy with no loss.
 ///
 /// # Panics
 /// Panics when the cluster or seeding fails, a request is refused, the cap
-/// does not hold, a result is lost, the outbox does not drain, or the later
-/// copy is dropped.
+/// does not hold, the outbox does not drain, or the later copy is dropped.
 #[tokio::test]
 async fn sustained_scribe_outage_caps_tenant_spans() {
     use wyrd_testing::bifrost::cluster::{BifrostClusterSpec, WyrdTestCluster};
@@ -4407,12 +5595,9 @@ async fn sustained_scribe_outage_caps_tenant_spans() {
         .expect("the Oracle pods start without their Scribe");
     let tenant = cluster.data_tenant_id();
     let oracle = cluster.server(0).expect("an Oracle pod");
-    let (verifier, subject, _, jwt) = traced_tenant(oracle, tenant, "outage-caller").await;
+    let (_, _, _, jwt) =
+        traced_tenant(oracle, tenant, "outage-caller", Registration::WithoutScribe).await;
     let outbox = Arc::clone(oracle.state().bifrost.scribe_outbox());
-    let assertion = oracle
-        .pg_fixture()
-        .superuser_pool()
-        .expect("fixture exposes a superuser pool");
 
     let lost_before = lost_scribe_writes(&cluster);
     let mut requests = 0_u64;
@@ -4422,13 +5607,19 @@ async fn sustained_scribe_outage_caps_tenant_spans() {
             "the tenant span cap never dropped a copy"
         );
         requests += 1;
-        let status = traced_execute(
-            oracle,
-            Some(&jwt),
-            (&verifier, &subject),
-            &format!("00-{OUTAGE_TRACE}-{requests:016x}-01"),
-        )
-        .await;
+        let request = axum::http::Request::builder()
+            .uri("/v1/cards")
+            .header(
+                "traceparent",
+                format!("00-{OUTAGE_TRACE}-{requests:016x}-01"),
+            )
+            .body(axum::body::Body::empty())
+            .expect("read request builds");
+        let status = oracle
+            .oneshot_authenticated(&jwt, request)
+            .await
+            .expect("read request responds")
+            .status();
         assert!(status.is_success(), "request {requests}: {status}");
     }
     assert!(
@@ -4467,20 +5658,20 @@ async fn sustained_scribe_outage_caps_tenant_spans() {
         SPAN_PERMITS,
         "exactly the permitted copies publish"
     );
-    assert_eq!(
-        published_rows(&assertion, tenant, RESULTS).await,
-        i64::try_from(requests).expect("a small count"),
-        "every Verifier result staged during the outage publishes"
-    );
-
     let lost_after_recovery = lost_scribe_writes(&cluster);
-    let status = traced_execute(
-        oracle,
-        Some(&jwt),
-        (&verifier, &subject),
-        &format!("00-{RECOVERED_TRACE}-00f067aa0ba902b7-01"),
-    )
-    .await;
+    let request = axum::http::Request::builder()
+        .uri("/v1/cards")
+        .header(
+            "traceparent",
+            format!("00-{RECOVERED_TRACE}-00f067aa0ba902b7-01"),
+        )
+        .body(axum::body::Body::empty())
+        .expect("read request builds");
+    let status = oracle
+        .oneshot_authenticated(&jwt, request)
+        .await
+        .expect("read request responds")
+        .status();
     assert!(status.is_success(), "{status}");
     assert_eq!(outbox.settle(std::time::Instant::now() + WAIT).await, 0);
     scribe_pod.flush_bifrost().await.expect("Scribe flushes");
@@ -4574,7 +5765,7 @@ fn service_ref(name: &str, version: &str) -> wyrd_spec::reference::CardRef {
 /// subject is also a component of another owner's binding. The accepted
 /// snapshot is the subject/actor intersection: the actor's root and
 /// credential provenance, a Card scope that carries the subject but not an
-/// unrelated Service (whose enqueue is refused), and none of the User's
+/// unrelated Service, and none of the User's
 /// excess admin wildcard. The first attempt retries; the runtime stops; the
 /// actor loses its role, its family restriction, and its key; a fresh
 /// runtime reclaims and completes the run. The stored authority and pair are
@@ -4654,16 +5845,6 @@ async fn accepted_authority_survives_account_and_context_changes() {
         })
     };
     let post = axum::http::Method::POST;
-    let (code, problem) = send(
-        server,
-        &delegated,
-        post.clone(),
-        "/v1/verification/enqueue",
-        Some(enqueue(&other)),
-    )
-    .await;
-    assert_eq!(code, axum::http::StatusCode::FORBIDDEN, "{problem}");
-    assert_eq!(problem["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
 
     let script = EngineScript::default();
     script.push(EngineOutcome::Retry(VerificationError {
@@ -5898,7 +7079,8 @@ async fn accepted_origins_run_without_local_notification() {
     let producer = cluster.server(0).expect("a producer pod");
     let replica = cluster.server(1).expect("a runner pod");
     let state = producer.state();
-    let (assertion, subject, _, jwt) = traced_tenant(producer, tenant, "producer-caller").await;
+    let (assertion, subject, _, jwt) =
+        traced_tenant(producer, tenant, "producer-caller", Registration::Declared).await;
     let seed = VerificationFixture::provision(state, tenant)
         .await
         .expect("tenant provisions");

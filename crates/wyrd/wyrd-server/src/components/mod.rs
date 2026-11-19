@@ -4,6 +4,8 @@ pub mod admin;
 pub mod auth;
 pub mod cards;
 pub mod gateway;
+/// Tenant GitHub App connection, webhooks and installation tokens.
+pub mod github;
 pub mod health;
 pub mod operators;
 pub mod platform;

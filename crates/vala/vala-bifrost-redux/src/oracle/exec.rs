@@ -4686,7 +4686,10 @@ pub(super) mod tests {
             .put(&path, data.clone().into())
             .await
             .expect("the object is stored");
-        let cache = Arc::new(RangeCache::new(1 << 20));
+        let cache = Arc::new(RangeCache::new(
+            1 << 20,
+            crate::resources::OracleResources::for_test().metadata(),
+        ));
         let reads = Arc::new(std::sync::Mutex::new(Vec::new()));
         let reader = |scanned: &Count| TenantParquetReader {
             inner: Box::new(RecordingReader {

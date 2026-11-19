@@ -221,6 +221,7 @@ describe("internal native run wrapper", () => {
       "CodeSource",
       "Component",
       "Data",
+      "Evidence",
       "Execution",
       "Experiment",
       "File",

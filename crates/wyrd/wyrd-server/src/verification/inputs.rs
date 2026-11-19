@@ -21,13 +21,18 @@ use arrow::util::display::array_value_to_string;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::card::agent::ExecutionRoute;
 use wyrd_spec::card::verifier::{SourceField, SourceText};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::{CardUid, ExecutionId, GroupId, SlotName, VerificationResultId};
+use wyrd_spec::ids::{
+    ApprovalId, CardUid, EvidenceId, ExecutionId, GroupId, SlotName, VerificationResultId,
+};
 use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::ids::RunId;
-use wyrd_spec::verification::execution::InputDeclaration;
+use wyrd_spec::verification::execution::{
+    ApprovalReceipt, ApprovalStatus, GithubDelivery, InputDeclaration,
+};
 use wyrd_spec::verification::{DriftWindow, GroupSnapshot, GroupSourceSnapshot, TaskId};
 
 use super::drift::ObservationWindow;
@@ -47,6 +52,8 @@ pub enum InputOrigin {
     Group,
     /// A scheduled drift occurrence.
     Schedule,
+    /// A `pull_request` binding's admission of one pinned PR source.
+    PullRequest,
 }
 
 impl InputOrigin {
@@ -58,15 +65,22 @@ impl InputOrigin {
             Self::Submitted => "submitted",
             Self::Group => "group",
             Self::Schedule => "schedule",
+            Self::PullRequest => "pull_request",
         }
     }
 
     /// Decode a stored `origin`, `None` outside the closed set.
     #[must_use]
     pub fn parse(stored: &str) -> Option<Self> {
-        [Self::Direct, Self::Submitted, Self::Group, Self::Schedule]
-            .into_iter()
-            .find(|origin| origin.as_str() == stored)
+        [
+            Self::Direct,
+            Self::Submitted,
+            Self::Group,
+            Self::Schedule,
+            Self::PullRequest,
+        ]
+        .into_iter()
+        .find(|origin| origin.as_str() == stored)
     }
 }
 
@@ -252,8 +266,179 @@ impl<'q> InputResolver<'q> {
         Ok(rows.into_values().next())
     }
 
+    /// The value of `execution`'s state at exactly `revision`, `None` while
+    /// that revision is not visible.
+    ///
+    /// Only the exact revision is read: an earlier one is never returned in
+    /// its place, so a revision still held by an unreachable writer reads as
+    /// not visible rather than as older state.
+    ///
+    /// # Errors
+    /// Returns the query refusal or failure, and an internal error when the
+    /// stored row is malformed.
+    pub async fn state(
+        &self,
+        execution: ExecutionId,
+        revision: i64,
+    ) -> Result<Option<Value>, WyrdError> {
+        let batches = self
+            .rows(&format!(
+                "SELECT value FROM bifrost.verification.execution_events \
+                 WHERE execution_id = {} AND sequence = {revision} AND event = 'checkpoint'",
+                quote(&execution.to_string())
+            ))
+            .await?;
+        batches
+            .iter()
+            .find(|batch| batch.num_rows() > 0)
+            .map(|batch| variant(batch, "value", 0))
+            .transpose()
+    }
+
+    /// The GitHub delivery outcome `event` recorded for `execution`'s state
+    /// at exactly `revision`; `None` while no such row is visible.
+    ///
+    /// # Errors
+    /// Returns the query refusal or failure, and an internal error when the
+    /// stored row is malformed.
+    pub(crate) async fn delivery(
+        &self,
+        execution: ExecutionId,
+        revision: i64,
+        event: &str,
+    ) -> Result<Option<GithubDelivery>, WyrdError> {
+        let batches = self
+            .rows(&format!(
+                "SELECT status, reason, value FROM bifrost.verification.execution_events \
+                 WHERE execution_id = {} AND sequence = {revision} AND event = {}",
+                quote(&execution.to_string()),
+                quote(event)
+            ))
+            .await?;
+        let Some(batch) = batches.iter().find(|batch| batch.num_rows() > 0) else {
+            return Ok(None);
+        };
+        let malformed =
+            |error: serde_json::Error| WyrdError::internal(format!("GitHub delivery row: {error}"));
+        let reason = (!column(batch, "reason")?.is_null(0))
+            .then(|| text(batch, "reason", 0))
+            .transpose()?;
+        let problems = variant(batch, "value", 0)?;
+        Ok(Some(GithubDelivery {
+            status: serde_json::from_value(Value::String(text(batch, "status", 0)?))
+                .map_err(malformed)?,
+            reason: reason
+                .map(|reason| serde_json::from_value(Value::String(reason)))
+                .transpose()
+                .map_err(malformed)?,
+            problems: if problems.is_null() {
+                Vec::new()
+            } else {
+                serde_json::from_value(problems).map_err(malformed)?
+            },
+        }))
+    }
+
+    /// Every visible acceptance of deferred evidence for `input` of `source`,
+    /// by subscribing Verifier version.
+    ///
+    /// # Errors
+    /// Returns the query refusal or failure, and an internal error when a
+    /// stored row is malformed.
+    pub(crate) async fn published(
+        &self,
+        source: super::evidence::EvidenceSource<'_>,
+        input: &SlotName,
+    ) -> Result<BTreeMap<CardUid, super::evidence::Accepted>, WyrdError> {
+        let batches = self
+            .rows(&format!(
+                "SELECT evidence_id, verifier_card_uid, sha256, value, recorded_at \
+                 FROM bifrost.verification.evidence \
+                 WHERE host = {} AND repository_id = {} AND \"commit\" = {} AND input = {}",
+                quote(source.host),
+                quote(source.repository_id.as_str()),
+                quote(source.commit),
+                quote(input.as_str()),
+            ))
+            .await?;
+        let mut found = BTreeMap::new();
+        for batch in &batches {
+            for row in 0..batch.num_rows() {
+                let verifier = CardUid::new(text(batch, "verifier_card_uid", row)?)
+                    .map_err(|error| invalid(error.to_string()))?;
+                let evidence_id = EvidenceId::new(
+                    uuid::Uuid::parse_str(&text(batch, "evidence_id", row)?)
+                        .map_err(|error| invalid(error.to_string()))?,
+                )
+                .map_err(|error| invalid(error.to_string()))?;
+                let recorded_at = timestamp(batch, "recorded_at", row)?;
+                let accepted = super::evidence::Accepted {
+                    published: super::evidence::Published {
+                        evidence_id,
+                        sha256: text(batch, "sha256", row)?,
+                        value: decode(variant(batch, "value", row)?)?,
+                    },
+                    recorded_at,
+                };
+                found.insert(verifier, accepted);
+            }
+        }
+        Ok(found)
+    }
+
+    /// Every visible decision of an approval occurrence of `execution_id`,
+    /// by approval id.
+    ///
+    /// # Errors
+    /// Returns the query refusal or failure, and an internal error when a
+    /// stored row is malformed.
+    pub(crate) async fn decisions(
+        &self,
+        execution_id: ExecutionId,
+    ) -> Result<BTreeMap<ApprovalId, ApprovalReceipt>, WyrdError> {
+        let batches = self
+            .rows(&format!(
+                "SELECT approval_id, decision, actor_id, reason, decided_at \
+                 FROM bifrost.verification.approvals WHERE execution_id = {}",
+                quote(&execution_id.to_string()),
+            ))
+            .await?;
+        let mut found = BTreeMap::new();
+        for batch in &batches {
+            for row in 0..batch.num_rows() {
+                let parsed = |name: &str| {
+                    text(batch, name, row).and_then(|value| {
+                        uuid::Uuid::parse_str(&value).map_err(|error| invalid(error.to_string()))
+                    })
+                };
+                let approval_id = ApprovalId::new(parsed("approval_id")?)
+                    .map_err(|error| invalid(error.to_string()))?;
+                let status = match text(batch, "decision", row)?.as_str() {
+                    "approved" => ApprovalStatus::Approved,
+                    "rejected" => ApprovalStatus::Rejected,
+                    other => return Err(invalid(format!("unknown approval decision {other}"))),
+                };
+                let reason = (!column(batch, "reason")?.is_null(row))
+                    .then(|| text(batch, "reason", row))
+                    .transpose()?;
+                found.insert(
+                    approval_id,
+                    ApprovalReceipt {
+                        approval_id,
+                        status,
+                        actor_id: Some(PrincipalId::new(parsed("actor_id")?)),
+                        decided_at: Some(timestamp(batch, "decided_at", row)?),
+                        reason,
+                    },
+                );
+            }
+        }
+        Ok(found)
+    }
+
     /// The evidence `row` judges: a supplied record's declarations, a
-    /// group's resolved slot lists, or a schedule's empty map. `None` while a
+    /// group's resolved slot lists, or the empty map of a schedule or a pull
+    /// request, whose pins the claim carries. `None` while a
     /// group source's input or selected output is not visible.
     ///
     /// # Errors
@@ -268,7 +453,7 @@ impl<'q> InputResolver<'q> {
                 InputOrigin::Direct | InputOrigin::Submitted => {
                     decode(row.inputs.clone()).map(Some)
                 }
-                InputOrigin::Schedule => Ok(Some(BTreeMap::new())),
+                InputOrigin::Schedule | InputOrigin::PullRequest => Ok(Some(BTreeMap::new())),
                 InputOrigin::Group => {
                     let selector: GroupSelector = decode(row.inputs.clone())?;
                     self.slots(&selector.slots).await
@@ -439,9 +624,10 @@ impl<'q> InputResolver<'q> {
         Ok(Some((run_id, decode(outcome)?)))
     }
 
-    /// The published summary of a direct execution, which has no queue row:
-    /// only a result whose input record has the `direct` origin, so a queued
-    /// execution is never read this way. `None` until both are visible.
+    /// The published summary of a direct execution, which has no queue row
+    /// or execution state: only a result whose input record has the `direct`
+    /// origin, so a queued execution is never read this way. `None` until
+    /// both are visible.
     ///
     /// # Errors
     /// Returns the query refusal or failure, and an internal error when a
@@ -642,6 +828,20 @@ fn text(batch: &RecordBatch, name: &str, row: usize) -> Result<String, WyrdError
     array_value_to_string(column, row).map_err(|error| invalid(error.to_string()))
 }
 
+/// Timestamp cell `row` of microsecond column `name`.
+///
+/// # Errors
+/// Returns an internal error when the column is absent, not a microsecond
+/// timestamp, or the cell is null or out of range.
+fn timestamp(batch: &RecordBatch, name: &str, row: usize) -> Result<DateTime<Utc>, WyrdError> {
+    column(batch, name)?
+        .as_any()
+        .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+        .filter(|times| !times.is_null(row))
+        .and_then(|times| DateTime::from_timestamp_micros(times.value(row)))
+        .ok_or_else(|| invalid(format!("{name} is not a timestamp")))
+}
+
 /// Variant cell `row` of column `name` as JSON.
 ///
 /// # Errors
@@ -709,6 +909,7 @@ mod tests {
             (InputOrigin::Submitted, "submitted"),
             (InputOrigin::Group, "group"),
             (InputOrigin::Schedule, "schedule"),
+            (InputOrigin::PullRequest, "pull_request"),
         ] {
             assert_eq!(origin.as_str(), stored);
             assert_eq!(InputOrigin::parse(stored), Some(origin));

@@ -101,6 +101,8 @@ fn take_transport_decode_owner(
 
 /// Move-only context required to form one admitted row source.
 struct AdmittedRowContext {
+    /// The frame's data tenant, whose CPU lane service the decode counts as.
+    tenant: wyrd_spec::DataTenantId,
     /// Source of the trusted subject/actor pair moved into the retained
     /// source.
     attribution: StampedAttribution,
@@ -372,6 +374,7 @@ impl ScribeImpl {
         context: AdmittedRowContext,
     ) -> Result<AdmittedRows, ScribeError> {
         let AdmittedRowContext {
+            tenant,
             attribution,
             workload,
             card_scope,
@@ -406,6 +409,7 @@ impl ScribeImpl {
                 let rows = self
                     .ingress_cpu
                     .decode(
+                        Some(tenant),
                         IngressPayload::Canonical(canonical),
                         crate::scribe::execution_lanes::IngressDecodeInputs {
                             attribution,
@@ -559,7 +563,10 @@ impl ScribeImpl {
     /// Returns [`ScribeError::IngestBusy`] when the ingress queue is saturated
     /// and any preprocessing error from [`prepare_append`].
     async fn preprocess(&self, admitted: AdmittedAppend) -> Result<PreparedAppend, ScribeError> {
-        self.ingress_cpu.run(move || prepare_append(admitted)).await
+        let tenant = admitted.tenant;
+        self.ingress_cpu
+            .run(Some(tenant), move || prepare_append(admitted))
+            .await
     }
 
     /// Prepares one request and dispatches its owned packet to its fixed shard.
@@ -723,6 +730,7 @@ impl ScribeImpl {
             .prepare_admitted_rows(
                 frame.payload,
                 AdmittedRowContext {
+                    tenant,
                     card_scope: frame
                         .attributed_cards
                         .or_else(|| frame.principal.card_scope().map(<[_]>::to_vec)),
@@ -970,8 +978,9 @@ impl ScribeImpl {
     /// when the shared root refuses the resize, request a shard-count-invariant
     /// pressure seal toward the low-water mark
     /// ([`ScribeImpl::request_pressure_seal_toward_low_water`]), then retry
-    /// exactly once. An engaged cgroup tripwire is a container-level limit a
-    /// Scribe seal cannot relieve, so it returns `IngestBusy` without a retry.
+    /// exactly once. A process memory ledger with no room for the growth is held
+    /// by other capabilities a Scribe seal cannot relieve, so it returns
+    /// `IngestBusy` without a retry.
     /// A retry that still fails records the rejection labelled by the ceiling
     /// that tripped (D84, via [`super::record_scribe_ceiling_rejection`]) and
     /// returns `IngestBusy`, deferring to D71 client backoff. There is no
@@ -980,7 +989,7 @@ impl ScribeImpl {
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::IngestBusy`] when the cgroup tripwire is engaged or
+    /// Returns [`ScribeError::IngestBusy`] when the process ledger is exhausted or
     /// when the single post-seal retry still cannot fit under the shared cap,
     /// and an internal error when root accounting is poisoned.
     pub(super) fn resize_after_pressure_seal(
@@ -992,9 +1001,12 @@ impl ScribeImpl {
         if lease.resize_ingress(bytes).is_ok() {
             return Ok(());
         }
-        if self.memory.cgroup_tripwire_engaged() {
+        if self
+            .memory
+            .process_memory_exhausted(bytes.saturating_sub(lease.bytes()))
+        {
             super::record_scribe_ceiling_rejection(
-                crate::scribe::memory::ScribeRejectionCeiling::CgroupBreaker,
+                crate::scribe::memory::ScribeRejectionCeiling::ProcessMemory,
             );
             return Err(ScribeError::IngestBusy {
                 table: table.to_owned(),

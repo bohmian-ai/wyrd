@@ -10,6 +10,7 @@ use std::fmt::Display;
 
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyMapping, PyModule, PyString, PyTuple, PyType};
+use wyrd_benchmark::{Cohort, Observation};
 use wyrd_client::observe::{Observe, Run};
 use wyrd_client::verify::{Input, Inputs, Submission};
 use wyrd_spec::error::WyrdError;
@@ -147,7 +148,7 @@ pub(crate) fn json_value(
 ///
 /// # Errors
 /// As [`json_value`].
-fn input(py: Python<'_>, field: &str, value: &Bound<'_, PyAny>) -> WyrdPyResult<Input> {
+pub(crate) fn input(py: Python<'_>, field: &str, value: &Bound<'_, PyAny>) -> WyrdPyResult<Input> {
     if let Ok(file) = value.cast::<PyFile>() {
         return Ok(Input::File(file.get().inner.clone()));
     }
@@ -356,6 +357,20 @@ impl PyRunBifrost {
     }
 }
 
+/// The benchmark boundary of one `verify` through this module: from the
+/// call's entry with its Python arguments until its Python result exists,
+/// with components `input` (argument extraction), `core` (the shared
+/// client's `verify`, its `client.verify` root nested inside), and `output`
+/// (the result's Python projection). A stateless no-op outside `bench`
+/// builds.
+const SDK_VERIFY: &str = "sdk.verify";
+
+/// The benchmark boundary of one `verify`'s `core`, nested in
+/// [`SDK_VERIFY`], with components `trace` (reading the caller's span),
+/// `run` (the shared client with the GIL released), and `attach` (waiting
+/// to hold the GIL again); see [`crate::trace::block_on_timed`].
+const SDK_VERIFY_NATIVE: &str = "sdk.verify.native";
+
 /// Python wrapper for the verify and submit calls on one scoped run.
 ///
 /// It owns its own view clone rather than borrowing the `Run`, because a Python
@@ -391,11 +406,31 @@ impl PyObserveHandle {
         group_id: Option<&str>,
         named: Option<&Bound<'_, PyDict>>,
     ) -> WyrdPyResult<PyVerificationResult> {
-        let inputs = inputs(py, value, named)?;
-        let observe = self.observe().grouped(group_id)?;
-        crate::trace::block_on(py, observe.verify(verifier, inputs))
+        let mut observation = Observation::start(SDK_VERIFY, || Cohort::NONE);
+        let started = observation.now();
+        let prepared = inputs(py, value, named)
+            .and_then(|inputs| Ok::<_, WyrdPyError>((inputs, self.observe().grouped(group_id)?)));
+        observation.since("input", started);
+        let (inputs, observe) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                observation.finish(wyrd_benchmark::ERROR);
+                return Err(error);
+            }
+        };
+        let started = observation.now();
+        let mut native = observation.child(SDK_VERIFY_NATIVE);
+        let result =
+            crate::trace::block_on_timed(py, &mut native, observe.verify(verifier, inputs));
+        native.settle(&result);
+        observation.since("core", started);
+        let started = observation.now();
+        let result = result
             .map(PyVerificationResult::plain)
-            .map_err(WyrdPyError::from)
+            .map_err(WyrdPyError::from);
+        observation.since("output", started);
+        observation.settle(&result);
+        result
     }
 
     /// [`PyObserveHandle::verify`], with every requirement's custom `data`

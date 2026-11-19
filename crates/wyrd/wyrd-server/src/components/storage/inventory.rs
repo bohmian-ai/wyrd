@@ -134,7 +134,7 @@ impl ObjectFact {
                 "upload_id" => Cell::text(self.upload_id.as_deref()),
                 "backend" => Cell::text(Some(self.backend.as_str())),
                 "sha256" => Cell::text(sha256.as_deref()),
-                "size_bytes" => Cell::Int(self.size_bytes),
+                "size_bytes" => Cell::Int(Some(self.size_bytes)),
                 "content_type" => Cell::text(self.content_type.as_deref()),
                 "sse_marker" => Cell::text(self.sse_marker.as_deref()),
                 "origin" => Cell::text(Some(self.origin.as_str())),

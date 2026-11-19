@@ -1641,7 +1641,7 @@ table on `(data_tenant_id, result_id)`.
   documentation disagreed. The exact Card reference for an alias stays
   available from the state as a typed `CardRef` (`state.card_ref(alias)`).
 - **REQ-195**: `WyrdTestServer` in all three SDKs documents exactly three
-  test controls, each test-only and backed by the production code path:
+  (now six; see below) test controls, each test-only and backed by the production code path:
   - `flush_bifrost()`: publish every accepted row now, so the next query
     sees it. (revised in revision 71) Python's `flush_bifrost(to=...)` also
     takes `"staged"`, which freezes every accepted row into a staged run and
@@ -1654,6 +1654,17 @@ table on `(data_tenant_id, result_id)`.
     Verifier's baseline is ready, or fail at the deadline with the last
     observed baseline state; and
   - `make_binding_due(...)`: make a schedule due.
+
+  (reconciled by GitHub Verifier pipelines spec revision 12, 2026-11-15)
+  The sanctioned set is now exactly six controls, under the same strict
+  guard that rejects any other: the three above, plus
+  `hold_publications(...)`, which seeds a leased queued execution holding
+  fixed JSON, file and directory publications for publication-mount
+  journeys; `occupy_hosted_memory(leave)`, which holds hosted process
+  memory so at most `leave` bytes stay free until the hold is released; and
+  `wait_for_hosted_waiters(count, timeout)`, which blocks until exactly
+  `count` hosted Python operations wait for process memory, or fails at the
+  deadline with the last count.
 
   (revised in revision 65) It also provides credential fixtures that return an
   API key holding named Roles: a machine principal in the session tenant or a

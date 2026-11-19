@@ -12,7 +12,8 @@ use wyrd_client::WyrdClient;
 use wyrd_client::cards::DeclarationReceipt;
 use wyrd_client::cards::{BundleMode, CardSelector, Cards, PullSummary};
 use wyrd_loader::{
-    DeclarationInput, Diagnostic, LoadError, build_declaration_input, load as load_tree,
+    DeclarationInput, Diagnostic, LoadError, build_declaration_input,
+    load_with_repository as load_tree,
 };
 use wyrd_semver::VersionBlock;
 use wyrd_spec::envelope::{Card, CardKind};
@@ -70,9 +71,14 @@ pub struct SelectorArgs {
 /// Arguments for `wyrd declare`.
 #[derive(Debug, Args)]
 pub struct DeclareArgs {
-    /// Card file or directory to load and declare.
+    /// Card file, directory, or `wyrd.toml` to load and declare.
     #[arg(value_name = "PATH")]
     pub path: PathBuf,
+    /// Git remote URL identifying the repository a `wyrd.toml` declares,
+    /// replacing the checkout's origin remote; the server still verifies it
+    /// against the tenant's connection.
+    #[arg(long, value_name = "URL")]
+    pub repository: Option<String>,
     /// Check the local files and report the declaration candidates without
     /// contacting a server, uploading artifacts, or assigning versions.
     #[arg(long)]
@@ -456,6 +462,8 @@ pub struct CheckReport {
     pub cards: Vec<CheckCard>,
     /// Non-fatal loader diagnostics.
     pub diagnostics: Vec<Diagnostic>,
+    /// Checks only the server can make, which this local check skipped.
+    pub deferred: Vec<&'static str>,
 }
 
 /// One declaration candidate in a [`CheckReport`], identified as authored.
@@ -494,22 +502,36 @@ struct DeleteOutput {
 /// Returns `WYRD_LOADER_400_INVALID_ENVELOPE`, with the loader diagnostics as
 /// details, when the tree cannot be loaded or resolved.
 pub fn declare_check(path: impl AsRef<Path>) -> Result<CheckReport, WyrdError> {
-    check_tree(path.as_ref()).map_err(WyrdError::from)
+    check_tree(path.as_ref(), None).map_err(WyrdError::from)
 }
 
 /// Load and resolve a local Card tree into its declaration candidates.
 ///
+/// `repository` is the `--repository` remote of a `wyrd.toml` entry. The
+/// report lists the server-side checks it deferred, including Repository
+/// identity verification for a `wyrd.toml` entry.
+///
 /// # Errors
 /// Returns `WyrdCliError::CardLoad` when loading or local declaration-input
 /// construction fails.
-fn check_tree(path: &Path) -> Result<CheckReport, WyrdCliError> {
-    let tree = load_tree(path).map_err(WyrdCliError::CardLoad)?;
+fn check_tree(path: &Path, repository: Option<&str>) -> Result<CheckReport, WyrdCliError> {
+    let tree = load_tree(path, repository).map_err(WyrdCliError::CardLoad)?;
     let diagnostics = tree.diagnostics.clone();
     let input = build_declaration_input(tree).map_err(WyrdCliError::CardLoad)?;
+    let mut deferred = Vec::new();
+    if input.repository.is_some() {
+        deferred.push("repository_identity");
+    }
+    deferred.extend([
+        "registered_references",
+        "authorization",
+        "version_assignment",
+    ]);
     Ok(CheckReport {
         ok: true,
         cards: check_cards(&input),
         diagnostics,
+        deferred,
     })
 }
 
@@ -521,8 +543,12 @@ fn check_tree(path: &Path) -> Result<CheckReport, WyrdCliError> {
 /// # Errors
 /// Returns `WyrdCliError::CardLoad` when loading or local declaration-input
 /// construction fails, or an output error when JSON serialization fails.
-fn dispatch_check(path: &Path, format: OutputFormat) -> Result<ExitCode, WyrdCliError> {
-    let report = match check_tree(path) {
+fn dispatch_check(
+    path: &Path,
+    repository: Option<&str>,
+    format: OutputFormat,
+) -> Result<ExitCode, WyrdCliError> {
+    let report = match check_tree(path, repository) {
         Ok(report) => report,
         Err(WyrdCliError::CardLoad(error)) if format == OutputFormat::Text => {
             print_load_failure(&error);
@@ -564,15 +590,18 @@ pub async fn declare(
     path: impl AsRef<Path>,
     client: Option<WyrdClient>,
 ) -> Result<DeclarationReceipt, WyrdError> {
-    declare_tree(path.as_ref(), || crate::client::explicit_or_ambient(client))
-        .await
-        .map_err(WyrdError::from)
+    declare_tree(path.as_ref(), None, || {
+        crate::client::explicit_or_ambient(client)
+    })
+    .await
+    .map_err(WyrdError::from)
 }
 
 /// Load, resolve, and declare one local Card tree.
 ///
 /// `connect` supplies the client only after the tree loads and resolves, so
-/// invalid local input never resolves a credential.
+/// invalid local input never resolves a credential. `repository` is the
+/// `--repository` remote of a `wyrd.toml` entry.
 ///
 /// # Errors
 /// Returns a CLI load error for invalid local input, the error of `connect`
@@ -580,9 +609,10 @@ pub async fn declare(
 /// when declaration fails.
 async fn declare_tree(
     path: &Path,
+    repository: Option<&str>,
     connect: impl FnOnce() -> Result<WyrdClient, WyrdCliError>,
 ) -> Result<DeclarationReceipt, WyrdCliError> {
-    let tree = load_tree(path).map_err(WyrdCliError::CardLoad)?;
+    let tree = load_tree(path, repository).map_err(WyrdCliError::CardLoad)?;
     let input = build_declaration_input(tree).map_err(WyrdCliError::CardLoad)?;
     Cards::connect_with(&connect()?)
         .await?
@@ -599,10 +629,13 @@ async fn declare_tree(
 /// error when JSON serialization fails.
 pub async fn dispatch_declare(args: DeclareArgs) -> Result<ExitCode, WyrdCliError> {
     if args.check {
-        return dispatch_check(&args.path, args.format);
+        return dispatch_check(&args.path, args.repository.as_deref(), args.format);
     }
     let server = args.connection.server.as_deref();
-    let receipt = declare_tree(&args.path, || crate::client::from_global(server)).await?;
+    let receipt = declare_tree(&args.path, args.repository.as_deref(), || {
+        crate::client::from_global(server)
+    })
+    .await?;
     match args.format {
         OutputFormat::Text => print_declare_text(&receipt),
         OutputFormat::Json => print_json(&receipt)?,
@@ -1023,6 +1056,7 @@ fn print_check_text(report: &CheckReport) {
     for diagnostic in &report.diagnostics {
         println!("warning {}: {}", diagnostic.code, diagnostic.message);
     }
+    println!("deferred to the server: {}", report.deferred.join(", "));
 }
 
 /// Print a load failure's diagnostics for a person; JSON callers read the
@@ -1108,7 +1142,42 @@ pub(crate) fn print_json<T: Serialize>(value: &T) -> Result<(), WyrdCliError> {
 mod tests {
     use serde_json::json;
 
-    use super::{SelectorArgs, declare, declare_check, get, pull};
+    use super::{SelectorArgs, check_tree, declare, declare_check, get, pull};
+
+    /// `--check` on a `wyrd.toml` loads the Repository root from an explicit
+    /// remote with no checkout and no server, and labels the identity,
+    /// reference, authorization and version checks deferred.
+    ///
+    /// # Panics
+    /// Panics when the check fails or omits a deferred server check.
+    #[test]
+    fn check_on_wyrd_toml_is_local_and_labels_server_checks_deferred() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            temp.path().join("wyrd.toml"),
+            "[repository.verified_by]\nverifier = [{ kind = \"Verifier\", name = \"shared\", version = \"1.0.0\" }]\nruns_on = { kind = \"pull_request\" }\n",
+        )
+        .unwrap();
+        let report = check_tree(
+            &temp.path().join("wyrd.toml"),
+            Some("https://github.com/acme/widget.git"),
+        )
+        .unwrap();
+        let root = &report.cards[0];
+        assert_eq!(
+            (root.kind.as_str(), root.name.as_str()),
+            ("Repository", "widget")
+        );
+        assert_eq!(
+            report.deferred,
+            [
+                "repository_identity",
+                "registered_references",
+                "authorization",
+                "version_assignment"
+            ]
+        );
+    }
 
     /// A named selector whose kind is not a Card kind, refused before any
     /// client is built.
@@ -1149,6 +1218,7 @@ mod tests {
                     "version": "1.0.0",
                 }],
                 "diagnostics": [],
+                "deferred": ["registered_references", "authorization", "version_assignment"],
             })
         );
         assert_eq!(

@@ -1,12 +1,16 @@
 //! The process-wide composition of every hosted Verifier block.
 //!
-//! [`HostedBlocks`] owns the capacity one server process shares — the Python
-//! sandbox pool, the workspace permits, and the Deployment limits — and
-//! builds one [`VerificationEngine`] per execution over them. Each engine's
-//! executors are bound to that execution's accepted caller and pinned
-//! evidence, so interleaved executions never share authority, evidence, or a
-//! workspace. Direct verification and the queued runner both build their
-//! engine here, which keeps one execution path for every caller.
+//! [`HostedBlocks`] owns the capacity of one server process — one Python
+//! sandbox pool and one set of workspaces charged to the process ledgers
+//! only while in use, model-call permits for each [`ExecutionMode`], the
+//! direct execution permits, and the Deployment limits — and builds one
+//! [`VerificationEngine`] per execution. Direct and queued executions share
+//! the pool and workspaces; nothing is reserved for either, and a deployment
+//! that needs direct work isolated runs it on its own `direct` target.
+//! Each engine's executors are bound to that execution's accepted caller and
+//! pinned evidence, so interleaved executions never share authority,
+//! evidence, or a workspace. Direct verification and the queued runner both
+//! build their engine here, which keeps one execution path for every caller.
 //!
 //! The engine records every block's run interval on the execution's
 //! [`BlockClock`], so `wyrd_verification_verifier_seconds` holds the
@@ -15,20 +19,27 @@
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use monty_pool::PoolError;
 use skald_spec::PreparedSchemas;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::time::Instant;
 use vala_verify::blocks::{
-    ActionExecutor, ActionOutput, AgentCardResolver, AgentExecutor, BlockCall, BlockClock,
-    BlockError, CheckExecutor, CheckOutput, DriftChecks, EvidenceReader, PromptCardResolver,
-    VerificationEngine,
+    ActionExecutor, ActionOutput, AgentCardResolver, AgentExecutor, AgentToolset, BlockCall,
+    BlockClock, BlockError, CallInput, CheckExecutor, CheckOutput, DriftChecks, EvidenceReader,
+    PromptCardResolver, ToolSession, VerificationEngine,
 };
-use wyrd_spec::card::agent::ExecutionRoute;
+use vala_verify::{TraceSource, TraceUnavailable};
+use wyrd_spec::card::agent::{BuiltinTool, ExecutionRoute};
 use wyrd_spec::card::verifier::{Action, Check};
-use wyrd_spec::error::WyrdError;
+use wyrd_spec::ids::CardUid;
+use wyrd_spec::vala::ids::TraceId;
+use wyrd_spec::vala::trace::SpanRecord;
 use wyrd_spec::verification::TaskId;
+use wyrd_spec::verification::execution::{CallProvenance, Producer};
 
 use super::HostedLimits;
 use super::evidence::TenantEvidence;
@@ -39,19 +50,30 @@ use super::traces::CallerTraces;
 use super::workspace::Workspaces;
 use crate::components::auth::Caller;
 use crate::components::gateway::{GatewayCallContext, ServerWyrdGatewayCaller};
+use crate::components::github::extraction::{PULL_REQUEST_EXTRACT_VERSION, PullRequestSource};
+use crate::components::github::service::GithubConnections;
 use crate::state::AppState;
+use crate::verification::state::RunState;
+use crate::verification::telemetry::{Envelopes, ExecutionMode};
+use wyrd_runtime::resources::{ProcessResources, Workload};
 
 /// Most steps or checks one execution runs at once.
 // ponytail: fixed per-execution fan-out; the sandbox and workspace pools
 // bound process capacity, so make this a Deployment limit only if needed.
 const STEP_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(4).expect("4 is non-zero");
 
-/// The hosted block capacity one server process shares.
+/// The hosted block capacity of one server process.
 pub struct HostedBlocks {
-    /// The process-wide Python sandbox pool.
+    /// The process resources every Python session and workspace charges.
+    resources: ProcessResources,
+    /// The process Python sandbox pool, charged to `resources`.
     sandbox: Arc<Sandbox>,
-    /// The process-wide workspace permits.
+    /// The process workspaces, charged to `resources`.
     workspaces: Arc<Workspaces>,
+    /// Model-call permits every direct and queued execution shares.
+    model_calls: Arc<Semaphore>,
+    /// One permit per running direct execution.
+    direct_executions: Arc<Semaphore>,
     /// The Deployment limits every block enforces.
     limits: HostedLimits,
     /// Agent response and Verdict schema preparation every execution reuses;
@@ -64,6 +86,9 @@ pub struct Execution<'a> {
     /// The accepted authority every Card, evidence, query, tool, and model
     /// call is authorized and audited as.
     pub caller: &'a Caller,
+    /// The executing Verifier, whose `verifier:run` authorizes loading its
+    /// Agent and Prompt definitions.
+    pub verifier: &'a CardUid,
     /// Per-requirement or per-step Agent route overrides.
     pub routes: &'a BTreeMap<TaskId, ExecutionRoute>,
     /// The Card and application Run model calls are attributed to.
@@ -77,37 +102,91 @@ pub struct Execution<'a> {
     /// The execution's block clock (`ExecutionTelemetry::clock`), on which
     /// the engine records every block's run interval.
     pub clock: BlockClock,
+    /// The execution's envelope record (`ExecutionTelemetry::envelopes`),
+    /// on which the hosted tools and Gateway caller time nested Agent work.
+    pub envelopes: Envelopes,
+    /// The execution state whose accepted publications workspaces mount;
+    /// `None` for an engine bound to no execution.
+    pub execution: Option<Arc<RunState>>,
+    /// The accepted execution mode, which labels the execution's model
+    /// calls.
+    pub mode: ExecutionMode,
+    /// The accepted PR source a `pull_request` extractor reads; `None` for
+    /// an execution not admitted from a pull request.
+    pub pull_request: Option<PullRequestSource>,
 }
 
 impl HostedBlocks {
-    /// Start the sandbox pool over the Monty worker at `worker` under
-    /// `limits`, prewarming `limits.monty_min_workers`.
+    /// Start the process pool over the Monty worker at `worker` under
+    /// `limits`, prewarming up to `limits.monty_min_workers` and writing
+    /// workspaces under `scratch`, all charged to `process` only while in use.
     ///
     /// # Errors
-    /// Returns [`Sandbox::start`]'s [`PoolError`] when the limits hold no
-    /// worker or a prewarmed worker cannot start.
-    pub async fn start(worker: PathBuf, limits: HostedLimits) -> Result<Self, PoolError> {
+    /// Returns [`Sandbox::start`]'s [`PoolError`] when `process` memory holds
+    /// no Python session or a prewarmed worker cannot start.
+    pub async fn start(
+        worker: PathBuf,
+        limits: HostedLimits,
+        process: &ProcessResources,
+        scratch: PathBuf,
+    ) -> Result<Self, PoolError> {
         Ok(Self {
-            sandbox: Arc::new(Sandbox::start(worker, limits).await?),
-            workspaces: Arc::new(Workspaces::new(limits)),
+            sandbox: Arc::new(Sandbox::start(worker, limits, process).await?),
+            workspaces: Arc::new(Workspaces::new(limits, process, scratch)),
+            model_calls: Arc::new(Semaphore::new(limits.model_calls)),
+            direct_executions: Arc::new(Semaphore::new(limits.direct_executions)),
+            resources: process.clone(),
             limits,
             schemas: Arc::default(),
         })
     }
 
-    /// Settle the Python sandbox's admitted operations, refuse new ones,
-    /// and reap its workers by `deadline`; see [`Sandbox::shutdown`].
-    /// Returns whether everything settled.
+    /// Settle the pool's admitted Python operations, refuse new ones, and
+    /// reap its workers by `deadline`; see [`Sandbox::shutdown`]. Returns
+    /// whether everything settled.
     pub async fn shutdown(&self, deadline: tokio::time::Instant) -> bool {
         self.sandbox.shutdown(deadline).await
     }
 
-    /// The process-wide Python sandbox pool, so a test can hold one of its
-    /// admissions while a queued execution runs.
+    /// One direct execution permit, held for the execution's lifetime, or
+    /// `None` when every direct execution permit is taken. Admission never
+    /// waits.
+    #[must_use]
+    pub fn admit_direct(&self) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.direct_executions).try_acquire_owned().ok()
+    }
+
+    /// The process Python sandbox pool, so a test can occupy its memory
+    /// ([`Sandbox::occupy_for_test`]) or await its waiters.
     #[cfg(feature = "test-support")]
     #[must_use]
     pub const fn sandbox(&self) -> &Arc<Sandbox> {
         &self.sandbox
+    }
+
+    /// The process resources the pool and workspaces charge.
+    #[must_use]
+    pub const fn resources(&self) -> &ProcessResources {
+        &self.resources
+    }
+
+    /// Every free model-call permit, held until the returned permit drops.
+    ///
+    /// # Panics
+    /// Panics when a permit is taken concurrently.
+    #[cfg(feature = "test-support")]
+    pub fn hold_model_calls_for_test(&self) -> OwnedSemaphorePermit {
+        super::hold_all(&self.model_calls)
+    }
+
+    /// Every free direct execution permit, held until the returned permit
+    /// drops.
+    ///
+    /// # Panics
+    /// Panics when a permit is taken concurrently.
+    #[cfg(feature = "test-support")]
+    pub fn hold_direct_executions_for_test(&self) -> OwnedSemaphorePermit {
+        super::hold_all(&self.direct_executions)
     }
 
     /// The Deployment limits in force.
@@ -116,96 +195,350 @@ impl HostedBlocks {
         &self.limits
     }
 
-    /// Build the engine of one execution over `state`.
+    /// Build the engine of one execution over `state`, with the model-call
+    /// permits of `execution.mode`.
     ///
-    /// The evidence reader, registry, code executor, built-in tools, and
-    /// gateway caller are all bound to `execution.caller`; the evidence
-    /// reader also admits the evidence the engine run pins, sharing the
-    /// engine's one copy, before any block runs, and
-    /// every block's run interval is recorded on `execution.clock`; Agent and Prompt
-    /// Cards resolve through the caller's audited `card:read`, and every
-    /// model call goes through the in-process gateway as that caller,
-    /// attributed to `execution.subject`.
-    ///
-    /// # Errors
-    /// Returns the [`CallerTraces::new`] refusal when the caller cannot form
-    /// a query context.
-    pub fn engine(
-        &self,
-        state: &AppState,
-        execution: Execution<'_>,
-    ) -> Result<VerificationEngine, WyrdError> {
+    /// Setup binds the execution once: its evidence reader, which admits the
+    /// evidence the engine run pins before any block runs, its code executor,
+    /// and an [`ExecutionBinding`] holding the accepted caller, Verifier,
+    /// attribution, route overrides, and hosted capacity. The Agent executor,
+    /// its registry, built-in tools, gateway caller, and the trace reader are
+    /// built from that binding only when the execution first runs an Agent
+    /// block, opens a tool, or reads a trace, so a Verifier that never does
+    /// never builds them. Every one of them is bound to `execution.caller`:
+    /// Agent and Prompt Cards resolve through the caller's audited
+    /// `verifier:run` on `execution.verifier`, and every model call holds one
+    /// of its mode's model-call permits while it goes through the in-process
+    /// gateway as that caller, attributed to `execution.subject`. Every
+    /// block's run interval is recorded on `execution.clock`.
+    pub fn engine(&self, state: &AppState, execution: Execution<'_>) -> VerificationEngine {
         let caller = execution.caller;
-        let evidence = Arc::new(TenantEvidence::new(
+        let evidence = TenantEvidence::new(
             state.clone(),
             caller.clone(),
             self.limits,
-        ));
-        let registry = Arc::new(TenantRegistry::new(state.clone(), Some(caller.clone())));
-        let agent = AgentExecutor::new(
-            Arc::default(),
-            Arc::clone(&registry) as Arc<dyn AgentCardResolver>,
-            registry as Arc<dyn PromptCardResolver>,
-        )
-        .with_evidence(Arc::clone(&evidence) as Arc<dyn EvidenceReader>)
-        .with_toolset(Arc::new(HostedTools::new(
-            state.clone(),
-            caller.clone(),
-            Arc::clone(&evidence),
-            Arc::clone(&self.workspaces),
-            Arc::clone(&self.sandbox),
-            self.limits,
-        )))
-        .with_wyrd_gateway(Arc::new(
-            ServerWyrdGatewayCaller::new(state.clone(), caller.clone())
-                .attributed(Some(execution.subject)),
-        ))
-        .with_route_overrides(execution.routes.clone())
-        .with_prepared_schemas(Arc::clone(&self.schemas));
+            self.resources.memory().clone(),
+        );
+        let evidence = Arc::new(match &execution.execution {
+            Some(state) => evidence.with_execution(Arc::clone(state)),
+            None => evidence,
+        });
+        let binding = Arc::new(ExecutionBinding {
+            state: state.clone(),
+            caller: caller.clone(),
+            verifier: execution.verifier.clone(),
+            subject: execution.subject,
+            routes: execution.routes.clone(),
+            execution: execution.execution,
+            mode: execution.mode,
+            envelopes: execution.envelopes,
+            evidence: Arc::clone(&evidence),
+            workspaces: Arc::clone(&self.workspaces),
+            sandbox: Arc::clone(&self.sandbox),
+            model_calls: Arc::clone(&self.model_calls),
+            limits: self.limits,
+            schemas: Arc::clone(&self.schemas),
+            tools: OnceLock::new(),
+            traces: OnceLock::new(),
+            pull_request: execution.pull_request,
+        });
         let blocks = Arc::new(Blocks {
             code: CodeExecutor::new(Arc::clone(&self.sandbox), Arc::clone(&evidence)),
-            evidence: Arc::clone(&evidence),
-            agent,
+            binding: Arc::clone(&binding),
+            agent: OnceLock::new(),
         });
-        let traces = CallerTraces::new(state.clone(), caller.clone())?;
         let engine = VerificationEngine::new(
             Arc::clone(&blocks) as Arc<dyn ActionExecutor>,
             blocks,
-            Arc::new(traces),
+            binding,
             STEP_CONCURRENCY,
         )
         .with_drift(execution.drift)
         .with_evidence(evidence)
         .with_clock(execution.clock);
-        Ok(if execution.defer_unlanded_traces {
+        if execution.defer_unlanded_traces {
             engine.with_unlanded_traces_deferred()
         } else {
             engine
+        }
+    }
+}
+
+/// One execution's accepted authority and hosted capacity, from which its
+/// Agent executor, built-in tools, and trace reader are built on first use.
+///
+/// It is bound to exactly one execution and never shared with another, so
+/// interleaved executions never exchange authority, evidence, publications,
+/// or Python budgets. It owns nothing that owns it: [`Blocks`] holds it, and
+/// the Agent executor holds it as its toolset.
+struct ExecutionBinding {
+    /// Server state every Card, evidence, query, tool, and model call uses.
+    state: AppState,
+    /// The accepted caller every one of them is authorized and audited as.
+    caller: Caller,
+    /// The executing Verifier, whose `verifier:run` authorizes loading its
+    /// Agent and Prompt definitions.
+    verifier: CardUid,
+    /// The Card and application Run model calls are attributed to.
+    subject: GatewayCallContext,
+    /// Per-requirement or per-step Agent route overrides.
+    routes: BTreeMap<TaskId, ExecutionRoute>,
+    /// The execution state `publish` accepts into; `None` for an engine
+    /// bound to no execution.
+    execution: Option<Arc<RunState>>,
+    /// The accepted execution mode, which names its model-call permits.
+    mode: ExecutionMode,
+    /// The execution's envelope record, on which tools and model calls are
+    /// timed.
+    envelopes: Envelopes,
+    /// The execution's pinned evidence.
+    evidence: Arc<TenantEvidence>,
+    /// The process workspaces.
+    workspaces: Arc<Workspaces>,
+    /// The process Python sandbox pool.
+    sandbox: Arc<Sandbox>,
+    /// The process model-call permits.
+    model_calls: Arc<Semaphore>,
+    /// The Deployment limits in force.
+    limits: HostedLimits,
+    /// The process's shared schema preparation.
+    schemas: Arc<PreparedSchemas>,
+    /// The execution's built-in tools, built when an Agent first opens a
+    /// tool session; they keep each action's Python budget across attempts.
+    tools: OnceLock<HostedTools>,
+    /// The execution's trace reader, built on its first trace read.
+    traces: OnceLock<CallerTraces>,
+    /// The accepted PR source a `pull_request` extractor reads.
+    pull_request: Option<PullRequestSource>,
+}
+
+/// Runs one verification execution's engine `run` as a single Verification
+/// operation of `tenant`, so its Python steps, model calls and other nested
+/// admissions all join it: their bytes count as the execution's, and under
+/// critical pressure the execution is cancelled as a whole.
+///
+/// With `admit_by`, the execution starts only once process pressure admits
+/// new Verification work of `tenant`, waiting no later than `admit_by`; a
+/// queued execution passes the current instant, so it defers at once
+/// rather than reading its inputs into a paused process. Without it the
+/// execution starts unconditionally and its nested owners bound their own
+/// admission waits.
+///
+/// Pressure choosing the execution as its victim cancels it through
+/// [`cancellable`], which refuses the running block, so the engine itself
+/// ends the attempt as a capacity refusal.
+///
+/// # Errors
+/// Returns `run`'s error, or [`EngineError::Busy`] when pressure did not
+/// admit the execution by `admit_by`.
+pub async fn as_one_operation<T>(
+    state: &AppState,
+    tenant: wyrd_spec::ids::DataTenantId,
+    admit_by: Option<tokio::time::Instant>,
+    run: impl Future<Output = Result<T, vala_verify::blocks::EngineError>>,
+) -> Result<T, vala_verify::blocks::EngineError> {
+    let victim = Some(tokio_util::sync::CancellationToken::new());
+    let workloads = state.resources.workloads();
+    let operation = match admit_by {
+        None => workloads.begin(Workload::Verification, Some(tenant), victim),
+        Some(deadline) => tokio::time::timeout_at(
+            deadline,
+            workloads.admit(Workload::Verification, Some(tenant), victim),
+        )
+        .await
+        .map_err(|_| {
+            vala_verify::blocks::EngineError::Busy(
+                "process memory pressure pauses new executions".to_owned(),
+            )
+        })?,
+    };
+    operation.scope(run).await
+}
+
+/// Run one block of the current execution, refused as
+/// [`BlockError::Busy`] once process pressure cancels the execution.
+///
+/// The refusal comes from inside the engine, so the engine settles the
+/// cancelled attempt as a capacity refusal, releasing its recorded
+/// attempt, rather than having the attempt dropped mid-call and later
+/// recovered as an interrupted one. Outside an [`as_one_operation`], or in
+/// an operation pressure may not cancel, `block` runs unwatched.
+///
+/// # Errors
+/// Returns `block`'s error, or [`BlockError::Busy`] once pressure cancels
+/// the execution.
+pub async fn cancellable<T>(
+    block: impl Future<Output = Result<T, BlockError>>,
+) -> Result<T, BlockError> {
+    let Some(victim) = wyrd_runtime::resources::Operation::current_cancellation() else {
+        return block.await;
+    };
+    tokio::select! {
+        biased;
+        () = victim.cancelled() => Err(BlockError::Busy {
+            reason: "process memory pressure cancelled the execution".to_owned(),
+        }),
+        ran = block => ran,
+    }
+}
+
+impl ExecutionBinding {
+    /// Extract the execution's accepted PR source as its caller's tenant;
+    /// see [`GithubConnections::extract_pull_request`].
+    ///
+    /// # Errors
+    /// Returns [`BlockError::Terminal`] before any acquisition when the
+    /// execution was not admitted from a pull request, and the extraction's
+    /// errors.
+    async fn pull_request(&self) -> Result<ActionOutput, BlockError> {
+        let source = self.pull_request.as_ref().ok_or_else(|| BlockError::Terminal {
+            reason: "the pull_request extractor reads only a queued pull request execution's accepted source".to_owned(),
+        })?;
+        let extraction = GithubConnections::new(&self.state)
+            .extract_pull_request(self.caller.data_tenant_id, source)
+            .await?;
+        Ok(ActionOutput {
+            output: serde_json::to_value(extraction).map_err(|error| BlockError::Terminal {
+                reason: format!("extraction output does not serialize: {error}"),
+            })?,
+            provenance: Some(CallProvenance::Extract {
+                version: PULL_REQUEST_EXTRACT_VERSION.to_owned(),
+            }),
         })
+    }
+
+    /// The Agent executor of `binding`'s execution, resolving Agent and
+    /// Prompt Cards as its caller and calling models through the gateway on
+    /// the process model-call permits, with `binding` as its toolset.
+    fn agent(binding: &Arc<Self>) -> AgentExecutor {
+        let registry = Arc::new(TenantRegistry::new(
+            binding.state.clone(),
+            Some(binding.caller.clone()),
+            binding.verifier.clone(),
+        ));
+        AgentExecutor::new(
+            Arc::default(),
+            Arc::clone(&registry) as Arc<dyn AgentCardResolver>,
+            registry as Arc<dyn PromptCardResolver>,
+        )
+        .with_evidence(Arc::clone(&binding.evidence) as Arc<dyn EvidenceReader>)
+        .with_toolset(Arc::clone(binding) as Arc<dyn AgentToolset>)
+        .with_wyrd_gateway(Arc::new(
+            ServerWyrdGatewayCaller::new(binding.state.clone(), binding.caller.clone())
+                .attributed(Some(binding.subject.clone()))
+                .admitted(binding.mode.as_str(), Arc::clone(&binding.model_calls))
+                .timed(binding.envelopes.clone()),
+        ))
+        .with_route_overrides(binding.routes.clone())
+        .with_prepared_schemas(Arc::clone(&binding.schemas))
+    }
+
+    /// The execution's built-in tools, built on first use.
+    fn tools(&self) -> &HostedTools {
+        self.tools.get_or_init(|| {
+            let tools = HostedTools::new(
+                self.state.clone(),
+                self.caller.clone(),
+                Arc::clone(&self.evidence),
+                Arc::clone(&self.workspaces),
+                Arc::clone(&self.sandbox),
+                self.limits,
+            )
+            .timed(self.envelopes.clone());
+            match &self.execution {
+                Some(run) => tools.with_execution(Arc::clone(run)),
+                None => tools,
+            }
+        })
+    }
+}
+
+#[async_trait]
+impl AgentToolset for ExecutionBinding {
+    /// Open the tool session through the execution's built-in tools; see
+    /// [`HostedTools`].
+    ///
+    /// # Errors
+    /// Returns the [`HostedTools`] refusal.
+    async fn open(
+        &self,
+        id: &TaskId,
+        workspace: &BTreeMap<String, CallInput>,
+        deadline: Instant,
+        tools: &[BuiltinTool],
+        producer: Option<&Producer>,
+    ) -> Result<ToolSession, BlockError> {
+        self.tools()
+            .open(id, workspace, deadline, tools, producer)
+            .await
+    }
+}
+
+#[async_trait]
+impl TraceSource for ExecutionBinding {
+    /// Read `trace_id` as the execution's caller; see [`CallerTraces`].
+    ///
+    /// # Errors
+    /// Returns the [`CallerTraces`] [`TraceUnavailable`].
+    async fn fetch(
+        &self,
+        trace_id: TraceId,
+        deadline: Duration,
+    ) -> Result<Arc<Vec<SpanRecord>>, TraceUnavailable> {
+        self.traces
+            .get_or_init(|| CallerTraces::new(self.state.clone(), self.caller.clone()))
+            .fetch(trace_id, deadline)
+            .await
     }
 }
 
 /// One execution's block executors, routed by block kind.
 struct Blocks {
-    /// Runs `extract` actions over the pinned evidence.
-    evidence: Arc<TenantEvidence>,
+    /// The execution's binding; runs `extract` actions over its evidence.
+    binding: Arc<ExecutionBinding>,
     /// Runs `code` actions and checks in the sandbox.
     code: CodeExecutor,
-    /// Runs `agent` actions and checks.
-    agent: AgentExecutor,
+    /// Runs `agent` actions and checks; built on the first one.
+    agent: OnceLock<AgentExecutor>,
+}
+
+impl Blocks {
+    /// The execution's Agent executor, built once on first use.
+    fn agent(&self) -> &AgentExecutor {
+        self.agent
+            .get_or_init(|| ExecutionBinding::agent(&self.binding))
+    }
 }
 
 #[async_trait]
 impl ActionExecutor for Blocks {
-    /// Route `call` to the executor of its action kind.
+    /// Route `call` to the executor of its action kind, refused once
+    /// pressure cancels the execution; see [`cancellable`].
+    ///
+    /// # Errors
+    /// Returns the routed executor's [`BlockError`], or
+    /// [`BlockError::Busy`] once pressure cancels the execution.
+    async fn execute(&self, call: BlockCall<'_, Action>) -> Result<ActionOutput, BlockError> {
+        cancellable(self.action(call)).await
+    }
+}
+
+impl Blocks {
+    /// Route action `call` to the executor of its kind.
     ///
     /// # Errors
     /// Returns the routed executor's [`BlockError`].
-    async fn execute(&self, call: BlockCall<'_, Action>) -> Result<ActionOutput, BlockError> {
+    async fn action(&self, call: BlockCall<'_, Action>) -> Result<ActionOutput, BlockError> {
         match call.block {
-            Action::Extract { .. } => self.evidence.execute(call).await,
-            Action::Agent(_) => ActionExecutor::execute(&self.agent, call).await,
+            Action::Extract {
+                extractor: Some(_), ..
+            } => self.binding.pull_request().await,
+            Action::Extract { .. } => self.binding.evidence.execute(call).await,
+            Action::Agent(_) => ActionExecutor::execute(self.agent(), call).await,
             Action::Code(_) => ActionExecutor::execute(&self.code, call).await,
+            Action::Approval { .. } => Err(BlockError::Terminal {
+                reason: "an approval is decided by a person, never executed".to_owned(),
+            }),
         }
     }
 }
@@ -214,15 +547,20 @@ impl ActionExecutor for Blocks {
 impl CheckExecutor for Blocks {
     /// Route a `code` check to the sandbox and every other executor-run
     /// check (`agent`) to the Agent executor; the engine itself judges
-    /// `assert`, `trace`, and `drift`.
+    /// `assert`, `trace`, and `drift`; refused once pressure cancels the
+    /// execution, see [`cancellable`].
     ///
     /// # Errors
-    /// Returns the routed executor's [`BlockError`].
+    /// Returns the routed executor's [`BlockError`], or
+    /// [`BlockError::Busy`] once pressure cancels the execution.
     async fn execute(&self, call: BlockCall<'_, Check>) -> Result<CheckOutput, BlockError> {
-        match call.block {
-            Check::Code(_) => CheckExecutor::execute(&self.code, call).await,
-            _ => CheckExecutor::execute(&self.agent, call).await,
-        }
+        cancellable(async {
+            match call.block {
+                Check::Code(_) => CheckExecutor::execute(&self.code, call).await,
+                _ => CheckExecutor::execute(self.agent(), call).await,
+            }
+        })
+        .await
     }
 }
 
@@ -249,7 +587,6 @@ mod tests {
             Ok(ActionOutput {
                 output: serde_json::json!({}),
                 provenance: None,
-                tool_calls: Vec::new(),
             })
         }
     }
@@ -329,7 +666,8 @@ mod tests {
     /// 100, and whose residual is the execution less that union; its
     /// engine phase lands as one `verification.direct.engine` part holding
     /// the run, and the time outside every phase as one
-    /// `verification.direct.outside` part; no production duration histogram
+    /// `verification.direct.outside` part with its before, between and after
+    /// split; no production duration histogram
     /// counts the execution a second time.
     ///
     /// # Panics
@@ -386,6 +724,9 @@ mod tests {
                 ("verification.direct", "completed", 1),
                 ("verification.direct.engine", "completed", 1),
                 ("verification.direct.outside", "completed", 1),
+                ("verification.direct.outside.after", "completed", 1),
+                ("verification.direct.outside.before", "completed", 1),
+                ("verification.direct.outside.between", "completed", 1),
             ]
         );
         let series = &interval.series[0];
@@ -473,7 +814,6 @@ mod pg_tests {
                     .take()
                     .unwrap_or(Value::Null),
                 provenance: None,
-                tool_calls: Vec::new(),
             })
         }
     }
@@ -532,11 +872,18 @@ mod pg_tests {
             .block_on(HostedBlocks::start(
                 PathBuf::from("/nonexistent/wyrd-server"),
                 limits,
+                &wyrd_runtime::resources::ProcessResources::new(
+                    NonZeroUsize::MIN,
+                    4 << 30,
+                    4 << 30,
+                ),
+                std::env::temp_dir(),
             ))
             .expect("an empty pool starts");
         let state = runtime.block_on(test_state());
         let caller = test_caller([]);
         let routes = BTreeMap::new();
+        let uid = CardUid::from_uuid(uuid::Uuid::now_v7()).expect("uid");
         let deadline = || tokio::time::Instant::now() + Duration::from_secs(30);
         let verifier = |spec: Value| -> Arc<VerifierSpec> {
             Arc::new(serde_json::from_value(spec).expect("Verifier"))
@@ -565,19 +912,22 @@ mod pg_tests {
             )]);
             let expected = evidence.clone();
             let (outcome, allocated) = CountingAllocator::measure(|| {
-                let engine = blocks
-                    .engine(
-                        &state,
-                        Execution {
-                            caller: &caller,
-                            routes: &routes,
-                            subject: GatewayCallContext::default(),
-                            defer_unlanded_traces: false,
-                            drift: DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
-                            clock: BlockClock::default(),
-                        },
-                    )
-                    .expect("engine builds");
+                let engine = blocks.engine(
+                    &state,
+                    Execution {
+                        caller: &caller,
+                        verifier: &uid,
+                        routes: &routes,
+                        subject: GatewayCallContext::default(),
+                        defer_unlanded_traces: false,
+                        drift: DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
+                        clock: BlockClock::default(),
+                        envelopes: Envelopes::default(),
+                        execution: None,
+                        mode: ExecutionMode::Direct,
+                        pull_request: None,
+                    },
+                );
                 runtime.block_on(engine.run(Arc::clone(&assertion), evidence, deadline()))
             });
             let outcome = outcome.expect("outcome");
@@ -613,6 +963,7 @@ mod pg_tests {
                     state.clone(),
                     caller.clone(),
                     limits,
+                    wyrd_runtime::resources::ByteLedger::new(u64::MAX),
                 )));
                 runtime.block_on(engine.run(Arc::clone(&dependent), BTreeMap::new(), deadline()))
             });

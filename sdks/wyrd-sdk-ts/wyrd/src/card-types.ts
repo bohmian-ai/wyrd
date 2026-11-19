@@ -22,7 +22,7 @@ export type AccountAuthentication = "password" | "sso";
 /**
  * A data-producing step action. Actions read and compute only.
  */
-export type Action = ActionExtract | ActionAgent | ActionCode;
+export type Action = ActionExtract | ActionAgent | ActionCode | ActionApproval;
 
 /**
  * Invoke an Agent; its output follows the Prompt's response schema.
@@ -42,6 +42,20 @@ export interface ActionAgent {
    * destination, in step and check position alike.
    */
   readonly workspace?: Readonly<Record<string, WorkspaceSource>>;
+}
+
+/**
+ * Wait for a person to approve or reject this occurrence. The step's
+ * output is the decision receipt; a rejection is data, not a failure.
+ * Pending approvals share the execution's own expiration. A Verifier
+ * declaring one runs only as queued work.
+ */
+export interface ActionApproval {
+  readonly kind: "approval";
+  /**
+   * What the approver is asked, shown with the pending occurrence.
+   */
+  readonly message: string;
 }
 
 /**
@@ -68,13 +82,20 @@ export interface ActionCode {
 }
 
 /**
- * Extract text and structure from one media slot.
+ * Extract one document: text and structure from the media slot
+ * `from`, or the pinned source of a queued pull request with
+ * `extractor: pull_request`. Exactly one of the two is set; validation
+ * refuses neither and both.
  */
 export interface ActionExtract {
   /**
+   * The extractor to run instead of reading a media slot.
+   */
+  readonly extractor?: Extractor | null;
+  /**
    * The media slot, as `inputs.<slot>`.
    */
-  readonly from: Reference;
+  readonly from?: Reference | null;
   readonly kind: "extract";
 }
 
@@ -160,6 +181,25 @@ export interface AlterTableRequest {
 }
 
 /**
+ * A report finding anchor the retained source does not hold.
+ */
+export interface AnchorProblem {
+  /**
+   * The finding's report ID.
+   */
+  readonly finding: string;
+  /**
+   * Why the anchor was refused.
+   */
+  readonly reason: AnchorProblemReason;
+}
+
+/**
+ * Why a finding anchor was refused.
+ */
+export type AnchorProblemReason = "anchor_commit_mismatch" | "anchor_path_unknown" | "anchor_source_unavailable" | "anchor_out_of_range";
+
+/**
  * Validated value for free-form Card annotations.
  */
 export type AnnotationValue = string;
@@ -168,6 +208,102 @@ export type AnnotationValue = string;
  * Canonical Wyrd API version.
  */
 export type ApiVersion = string;
+
+/**
+ * A person's decision on one pending approval.
+ */
+export type ApprovalDecision = "approved" | "rejected";
+
+/**
+ * Server-issued identity of one approval occurrence.
+ *
+ * Derived from the execution and the approval step's logical
+ * occurrence (step, fanout item, repeat iteration), so every attempt
+ * and recovery of the same execution reaching the same occurrence names
+ * the same approval, a fanout item or repeat iteration names another,
+ * and another execution, such as a newer pull request head, never
+ * shares one.
+ */
+export type ApprovalId = string;
+
+/**
+ * One approval occurrence of an execution, as inspection reports it.
+ *
+ * It expires with the execution itself; there is no per-approval deadline.
+ */
+export interface ApprovalOccurrenceState {
+  /**
+   * The principal who decided, once decided.
+   */
+  readonly actor_id: PrincipalId | null;
+  /**
+   * The identity a decision names.
+   */
+  readonly approval_id: ApprovalId;
+  /**
+   * When the decision was accepted, once decided.
+   */
+  readonly decided_at: string | null;
+  /**
+   * Zero-based fanout item, for a fanout step.
+   */
+  readonly item?: number | null;
+  /**
+   * Zero-based repeat iteration, for a repeating step.
+   */
+  readonly iteration?: number | null;
+  /**
+   * What the approver is asked.
+   */
+  readonly message: string;
+  /**
+   * The decider's stated reason.
+   */
+  readonly reason: string | null;
+  /**
+   * Where the occurrence stands.
+   */
+  readonly status: ApprovalStatus;
+  /**
+   * The approval step.
+   */
+  readonly step_id: TaskId;
+}
+
+/**
+ * The decision receipt of one approval occurrence, and an approval step's
+ * output.
+ *
+ * Returned only once the decision is durably accepted. `actor_id` and
+ * `decided_at` are absent while pending and for an expired occurrence.
+ */
+export interface ApprovalReceipt {
+  /**
+   * The principal who decided.
+   */
+  readonly actor_id: PrincipalId | null;
+  /**
+   * The occurrence decided.
+   */
+  readonly approval_id: ApprovalId;
+  /**
+   * When the decision was accepted.
+   */
+  readonly decided_at: string | null;
+  /**
+   * The decider's stated reason.
+   */
+  readonly reason: string | null;
+  /**
+   * `approved` or `rejected` once decided.
+   */
+  readonly status: ApprovalStatus;
+}
+
+/**
+ * Where one approval occurrence stands.
+ */
+export type ApprovalStatus = "pending" | "approved" | "rejected" | "expired";
 
 /**
  * Arrow serialization formats accepted by DataCard.
@@ -443,7 +579,7 @@ export type BlockSource = string | MediaSource;
  * may be scoped to. Registration and authorization share this one
  * vocabulary, so a name is either a built-in everywhere or nowhere.
  */
-export type BuiltinTool = "cards.list" | "cards.get" | "bifrost.list_tables" | "bifrost.describe_table" | "bifrost.query" | "fs.list" | "fs.read" | "fs.search" | "fs.extract" | "code.run";
+export type BuiltinTool = "cards.list" | "cards.get" | "bifrost.list_tables" | "bifrost.describe_table" | "bifrost.query" | "fs.list" | "fs.read" | "fs.search" | "fs.extract" | "fs.write" | "code.run" | "publish";
 
 /**
  * What executed one Agent, code, extract, or drift block.
@@ -507,6 +643,21 @@ export interface CallProvenanceExtract {
 }
 
 /**
+ * `POST /v1/verification/executions/{execution_id}/cancel` response.
+ */
+export interface CancelExecutionResponse {
+  /**
+   * The execution.
+   */
+  readonly execution_id: ExecutionId;
+  /**
+   * Its status after the cancellation fence: `cancelled` for work that
+   * was unfinished, otherwise the terminal status it already had.
+   */
+  readonly status: VerificationExecutionStatus;
+}
+
+/**
  * Idempotent cancellation result for one active Oracle query.
  */
 export interface CancelRunningQueryResponse {
@@ -553,7 +704,7 @@ export interface CardDeclarationOutcome {
 /**
  * Wyrd Card kind.
  */
-export type CardKind = "Data" | "Model" | "Experiment" | "Prompt" | "Agent" | "Verifier" | "Service" | "Policy" | "Mcp" | "Audit" | "Artifact" | "Trigger" | "Operator" | "Source";
+export type CardKind = "Data" | "Model" | "Experiment" | "Prompt" | "Agent" | "Verifier" | "Service" | "Policy" | "Mcp" | "Audit" | "Artifact" | "Trigger" | "Operator" | "Source" | "Repository";
 
 /**
  * Server-managed lifecycle state for a Card.
@@ -1765,6 +1916,26 @@ export interface DeclarationReceipt {
 }
 
 /**
+ * A step's dependencies beyond the ones its references imply.
+ *
+ * The list form orders the step after every listed step whatever its
+ * status. The object form `{any_succeeded: [...]}` makes the step
+ * eligible once any listed step settled `succeeded`; when every listed step
+ * settled otherwise, the step does not run.
+ */
+export type DependsOn = readonly TaskId[] | DependsOnAnySucceeded;
+
+/**
+ * Predecessors of which one must succeed.
+ */
+export interface DependsOnAnySucceeded {
+  /**
+   * Nonempty, unique, known steps.
+   */
+  readonly any_succeeded: readonly TaskId[];
+}
+
+/**
  * Who may invoke a deployment beyond its administrators.
  *
  * Neither value permits anonymous inference: every call still needs a
@@ -1800,6 +1971,42 @@ export interface DimFixed {
  * [`ComparisonOperator::DivergenceLessThan`].
  */
 export type DivergenceMetric = "kl" | "js" | "wasserstein";
+
+/**
+ * Server response to a download-init request.
+ */
+export interface DownloadInitResponse {
+  /**
+   * Backend-specific download plan.
+   */
+  readonly plan: DownloadPlan;
+  /**
+   * Expected base64-encoded SHA-256 digest.
+   */
+  readonly sha256: string;
+  /**
+   * Expected object size in bytes.
+   */
+  readonly size_bytes: number;
+}
+
+/**
+ * Presigned GET plan for any backend.
+ */
+export interface DownloadPlan {
+  /**
+   * Presigned GET URL or local server route URL.
+   */
+  readonly get_url: string;
+  /**
+   * URL time-to-live in seconds.
+   *
+   * For presigned URL backends (S3, GCS, Azure) this is the URL expiry in
+   * seconds. For the local filesystem backend this field is `0` (the server
+   * route does not expire).
+   */
+  readonly ttl_secs: number;
+}
 
 /**
  * Lifecycle of one PSI or SPC Verifier's server-fitted baseline.
@@ -2018,6 +2225,48 @@ export interface DriftWindow {
 }
 
 /**
+ * Identity of one piece of published deferred evidence.
+ *
+ * Named by its source repository, commit, input name, and content, so
+ * publishing the same content again for the same source answers the
+ * same id, and every subscriber that accepted it holds the same id.
+ */
+export type EvidenceId = string;
+
+/**
+ * The connected provider repository a deferred publication is about.
+ *
+ * The stable identity a Repository Card names, not a Card reference: the
+ * provider web host and the provider's repository id.
+ */
+export interface EvidenceRepository {
+  /**
+   * Provider web host, such as `github.com`.
+   */
+  readonly host: string;
+  /**
+   * Stable provider id of the repository.
+   */
+  readonly repository_id: RepositoryId;
+}
+
+/**
+ * Whether a publication was newly accepted or an earlier acceptance
+ * replayed.
+ */
+export type EvidenceStatus = "accepted" | "replayed";
+
+/**
+ * The source tags a deferred publication matches on: only the commit.
+ */
+export interface EvidenceTags {
+  /**
+   * The exact full 40-character commit the evidence was produced from.
+   */
+  readonly commit: CommitSha;
+}
+
+/**
  * Server-issued identity of one exact Verifier execution.
  *
  * The server mints it for every real-time or queued execution. One
@@ -2027,6 +2276,103 @@ export interface DriftWindow {
  * lease reclaims keep it.
  */
 export type ExecutionId = string;
+
+/**
+ * One checkpointed invocation attempt of a queued execution.
+ */
+export type ExecutionInvocation = ExecutionInvocationStarted | ExecutionInvocationAction | ExecutionInvocationRequirement;
+
+/**
+ * A step action settled.
+ */
+export interface ExecutionInvocationAction {
+  /**
+   * The step or requirement, item, iteration, and attempt.
+   */
+  readonly producer: Producer;
+  /**
+   * Why a settled attempt failed, was skipped, or was judged as it was;
+   * `null` otherwise.
+   */
+  readonly reason?: string | null;
+  /**
+   * The attempt's speculative disposition.
+   */
+  readonly speculation: Speculation;
+  readonly state: "action";
+  /**
+   * How the action ended.
+   */
+  readonly status: StepStatus;
+}
+
+/**
+ * A requirement was judged.
+ */
+export interface ExecutionInvocationRequirement {
+  /**
+   * The judgment.
+   */
+  readonly outcome: RequirementOutcome;
+  /**
+   * The step or requirement, item, iteration, and attempt.
+   */
+  readonly producer: Producer;
+  /**
+   * Why a settled attempt failed, was skipped, or was judged as it was;
+   * `null` otherwise.
+   */
+  readonly reason?: string | null;
+  /**
+   * The attempt's speculative disposition.
+   */
+  readonly speculation: Speculation;
+  readonly state: "requirement";
+}
+
+/**
+ * Dispatched and not settled: still running, or abandoned when its
+ * execution is terminal.
+ */
+export interface ExecutionInvocationStarted {
+  /**
+   * The step or requirement, item, iteration, and attempt.
+   */
+  readonly producer: Producer;
+  /**
+   * Why a settled attempt failed, was skipped, or was judged as it was;
+   * `null` otherwise.
+   */
+  readonly reason?: string | null;
+  /**
+   * The attempt's speculative disposition.
+   */
+  readonly speculation: Speculation;
+  readonly state: "started";
+}
+
+/**
+ * Query of the paginated execution listings,
+ * `GET /v1/verification/executions/{execution_id}/invocations` and
+ * `/publications`.
+ *
+ * The first page fixes the listing's cut: every page of one listing,
+ * followed through `next_cursor`, reads exactly the entries committed
+ * before the first page was read, in commit order, with no gap or
+ * duplicate. Entries committed later appear when a new listing is started.
+ * A cursor binds its tenant, execution, and listing and confers no
+ * authority, which every page re-checks.
+ */
+export interface ExecutionPageQuery {
+  /**
+   * Opaque continuation from the previous page's `next_cursor`.
+   */
+  readonly cursor?: string | null;
+  /**
+   * Page size, 1–200; 50 when omitted.
+   */
+  readonly limit?: number | null;
+}
 
 /**
  * Topologically sorted task DAG.
@@ -2126,6 +2472,11 @@ export interface ExperimentSpec {
  * whole reference is at most 1024 bytes without control characters.
  */
 export type ExternalSecretReference = string;
+
+/**
+ * The extractor an `extract` action runs instead of reading a media slot.
+ */
+export type Extractor = "pull_request";
 
 /**
  * Ordered fallback candidates for one scope.
@@ -2290,6 +2641,32 @@ export interface FieldSpec2Input {
    * Whether the column is nullable. Defaults to `true`.
    */
   readonly nullable?: boolean;
+}
+
+/**
+ * Bounded fanout of one step's action: exactly one of `count` or `items`.
+ *
+ * Each item is an independent invocation with its own zero-based index,
+ * attempts, and private scratch. Validation refuses any other shape.
+ */
+export interface Foreach {
+  /**
+   * Most items running at once; only lowers the execution's limit.
+   */
+  readonly concurrency?: number | null;
+  /**
+   * A positive number of identical invocations.
+   */
+  readonly count?: number | null;
+  /**
+   * A reference to a JSON array frozen whole before any item runs.
+   */
+  readonly items?: Reference | null;
+  /**
+   * The most items `items` may hold; required with `items`. A longer
+   * array fails the step without running any item.
+   */
+  readonly max_items?: number | null;
 }
 
 /**
@@ -2617,6 +2994,126 @@ export interface GatewayPriceRate {
 }
 
 /**
+ * The deployment's configured GitHub App.
+ */
+export interface GithubAppIdentity {
+  /**
+   * GitHub App id.
+   */
+  readonly id: number;
+  /**
+   * GitHub App slug, as in `https://github.com/apps/<slug>`.
+   */
+  readonly slug: string;
+}
+
+/**
+ * `POST /v1/integrations/github/connect` response: a durable, bounded
+ * connection transaction.
+ */
+export interface GithubConnectResponse {
+  /**
+   * GitHub's install page for the configured App. It carries the
+   * transaction's one-use state, which completes only in a browser signed
+   * in to Wyrd as the principal that began it.
+   */
+  readonly authorization_url: AbsoluteUrl;
+  /**
+   * Instant after which the transaction can no longer complete.
+   */
+  readonly expires_at: string;
+}
+
+/**
+ * Lifecycle state of a tenant's GitHub connection.
+ */
+export type GithubConnectionState = "not_connected" | "active" | "suspended";
+
+/**
+ * `GET /v1/integrations/github` response, and the result of a completed
+ * callback or a disconnect: the redacted connection and access view.
+ */
+export interface GithubConnectionView {
+  /**
+   * The deployment's configured App.
+   */
+  readonly app: GithubAppIdentity;
+  /**
+   * When the current association was verified; `None` when not connected.
+   */
+  readonly connected_at?: string | null;
+  /**
+   * Configured GitHub web host, such as `github.com`.
+   */
+  readonly host: string;
+  /**
+   * Verified installation id; `None` when not connected.
+   */
+  readonly installation_id?: number | null;
+  /**
+   * Selected repositories the installation can currently reach, by id.
+   */
+  readonly repositories: readonly GithubRepositoryAccess[];
+  /**
+   * Connection state.
+   */
+  readonly state: GithubConnectionState;
+  /**
+   * Last change to the association or its access; `None` when not
+   * connected.
+   */
+  readonly updated_at?: string | null;
+}
+
+/**
+ * The GitHub delivery of one `pull_request` execution's current state: its
+ * one Check and its one `COMMENT` review.
+ */
+export interface GithubDelivery {
+  /**
+   * Report findings whose anchors the retained source does not hold.
+   * Each is listed in the Check summary instead of inline, never moved
+   * to another line.
+   */
+  readonly problems?: readonly AnchorProblem[];
+  /**
+   * Why a `skipped` or `failed` delivery did not finish, or why a
+   * `delivered` Check shows no report; absent otherwise.
+   */
+  readonly reason?: GithubDeliveryReason | null;
+  /**
+   * The outcome recorded for the execution's current state.
+   */
+  readonly status: GithubDeliveryStatus;
+}
+
+/**
+ * Why GitHub delivery was skipped or failed, or why a delivered Check
+ * shows no report.
+ */
+export type GithubDeliveryReason = "superseded" | "access_removed" | "github_refused" | "github_unavailable" | "report_ambiguous" | "report_invalid";
+
+/**
+ * One outcome of GitHub delivery.
+ */
+export type GithubDeliveryStatus = "pending" | "delivered" | "skipped" | "failed";
+
+/**
+ * A repository the tenant selected that its installation can currently
+ * reach.
+ */
+export interface GithubRepositoryAccess {
+  /**
+   * `owner/name` as GitHub last reported it; display only, not identity.
+   */
+  readonly full_name: string;
+  /**
+   * Stable provider repository id as a positive decimal string.
+   */
+  readonly repository_id: string;
+}
+
+/**
  * Caller-chosen opaque group identity, such as a conversation or order ID, scoped to the tenant and owner Service.
  */
 export type GroupId = string;
@@ -2648,6 +3145,29 @@ export interface GroupSourceSnapshot {
    * The authored source declaration.
    */
   readonly reference: SourceText;
+}
+
+/**
+ * How far one execution's history has been projected into
+ * `bifrost.verification.execution_events`.
+ *
+ * Projection lag delays history only: invocation progress and publications
+ * read from the execution's records whatever this reports.
+ */
+export interface HistoryProjection {
+  /**
+   * Events Scribe acknowledged.
+   */
+  readonly acknowledged: number;
+  /**
+   * Events submitted without an acknowledgement, to be resubmitted under
+   * the same batch identity.
+   */
+  readonly failed: number;
+  /**
+   * Events not yet submitted.
+   */
+  readonly pending: number;
 }
 
 /**
@@ -3036,6 +3556,32 @@ export interface InstrumentationScope {
    * Instrumentation library version, when known.
    */
   readonly version?: string | null;
+}
+
+/**
+ * `GET /v1/verification/executions/{execution_id}/invocations` response.
+ */
+export interface InvocationPage {
+  /**
+   * The execution.
+   */
+  readonly execution_id: ExecutionId;
+  /**
+   * The execution's history projection position.
+   */
+  readonly history: HistoryProjection;
+  /**
+   * The page's invocation attempts, in commit order.
+   */
+  readonly items: readonly ExecutionInvocation[];
+  /**
+   * Continuation of this listing; `null` on its last page.
+   */
+  readonly next_cursor?: string | null;
+  /**
+   * Its current lifecycle status.
+   */
+  readonly status: VerificationExecutionStatus;
 }
 
 /**
@@ -4479,6 +5025,32 @@ export interface PrincipalSummary {
 }
 
 /**
+ * The producer invocation attempt that accepted a publication.
+ *
+ * This is the host-assigned logical invocation identity: the step, its
+ * zero-based fanout item and repeat iteration when those constructs exist,
+ * and its one-based attempt. Authors never supply it.
+ */
+export interface Producer {
+  /**
+   * One-based attempt.
+   */
+  readonly attempt: number;
+  /**
+   * Zero-based fanout item; `None` without fanout.
+   */
+  readonly item_index?: number | null;
+  /**
+   * Zero-based repeat iteration; `None` without repeat.
+   */
+  readonly iteration_index?: number | null;
+  /**
+   * The producing step.
+   */
+  readonly step_id: TaskId;
+}
+
+/**
  * The authored Prompt: provider and model once, plus portable content or
  * one native protocol body.
  *
@@ -4862,6 +5434,280 @@ export interface PsiThresholdNormal {
 }
 
 /**
+ * One accepted, immutable execution publication.
+ */
+export type Publication = PublicationFile2 | PublicationDirectory | PublicationJson;
+
+/**
+ * One directory tree.
+ */
+export interface PublicationDirectory {
+  readonly kind: "directory";
+  /**
+   * The retained tree.
+   */
+  readonly manifest: PublicationManifest;
+  /**
+   * The logical name, unique within its producer attempt.
+   */
+  readonly name: PublicationName;
+  /**
+   * The invocation attempt that accepted it.
+   */
+  readonly producer: Producer;
+}
+
+/**
+ * One regular file a file or directory publication retains.
+ */
+export interface PublicationFile {
+  /**
+   * Path relative to the publication root; a file publication's one entry
+   * is its basename.
+   */
+  readonly path: string;
+  /**
+   * SHA-256 of the file's bytes, the verification File that holds them.
+   */
+  readonly sha256: Sha256Hex;
+  /**
+   * File size in bytes.
+   */
+  readonly size_bytes: number;
+}
+
+/**
+ * One regular file; its manifest holds exactly one entry.
+ */
+export interface PublicationFile2 {
+  readonly kind: "file";
+  /**
+   * The retained file.
+   */
+  readonly manifest: PublicationManifest;
+  /**
+   * The logical name, unique within its producer attempt.
+   */
+  readonly name: PublicationName;
+  /**
+   * The invocation attempt that accepted it.
+   */
+  readonly producer: Producer;
+}
+
+/**
+ * One JSON value, `null` included.
+ */
+export interface PublicationJson {
+  readonly kind: "json";
+  /**
+   * The logical name, unique within its producer attempt.
+   */
+  readonly name: PublicationName;
+  /**
+   * The invocation attempt that accepted it.
+   */
+  readonly producer: Producer;
+  /**
+   * The retained value.
+   */
+  readonly value: JsonValue;
+}
+
+/**
+ * The content kind one execution publication retains.
+ */
+export type PublicationKind = "file" | "directory" | "json";
+
+/**
+ * The immutable manifest of a file or directory publication.
+ *
+ * Every byte it names was completed as a verification File before the
+ * manifest committed, so a manifest never names partial content.
+ */
+export interface PublicationManifest {
+  /**
+   * Every directory below a directory publication's root, empty ones
+   * included, sorted; empty for a file.
+   */
+  readonly directories: readonly string[];
+  /**
+   * Every regular file, sorted by path.
+   */
+  readonly files: readonly PublicationFile[];
+}
+
+export type PublicationName = string;
+
+/**
+ * `GET /v1/verification/executions/{execution_id}/publications` response.
+ */
+export interface PublicationPage {
+  /**
+   * The execution.
+   */
+  readonly execution_id: ExecutionId;
+  /**
+   * The page's publications, in acceptance order.
+   */
+  readonly items: readonly PublicationSummary[];
+  /**
+   * Continuation of this listing; `null` on its last page.
+   */
+  readonly next_cursor?: string | null;
+}
+
+/**
+ * Producer selection of one publication read or download, the query of
+ * `GET` and `POST /v1/verification/executions/{execution_id}/publications/{step_id}/{name}[/download]`.
+ *
+ * It names the exact producer attempt a listing reports, never the latest
+ * attempt.
+ */
+export interface PublicationSelector {
+  /**
+   * One-based producer attempt.
+   */
+  readonly attempt: number;
+  /**
+   * Zero-based fanout item; omitted without fanout.
+   */
+  readonly item_index?: number | null;
+  /**
+   * Zero-based repeat iteration; omitted without repeat.
+   */
+  readonly iteration_index?: number | null;
+  /**
+   * For a directory download, the regular file's path relative to the
+   * publication root, as its manifest lists it; omitted otherwise.
+   */
+  readonly path?: string | null;
+}
+
+/**
+ * One accepted publication as a listing names it, without its content.
+ */
+export interface PublicationSummary {
+  /**
+   * The content kind retained.
+   */
+  readonly kind: PublicationKind;
+  /**
+   * The logical name, unique within its producer attempt.
+   */
+  readonly name: PublicationName;
+  /**
+   * The invocation attempt that accepted it.
+   */
+  readonly producer: Producer;
+  /**
+   * Its producer's speculative disposition.
+   */
+  readonly speculation: Speculation;
+}
+
+/**
+ * `POST /v1/verification/evidence/publish` response: the durable receipt.
+ *
+ * Returned only once every matched subscriber's acceptance is durable; it
+ * does not mean any execution ran.
+ */
+export interface PublishEvidenceResponse {
+  /**
+   * The evidence identity; the same for the same source and content.
+   */
+  readonly evidence_id: EvidenceId;
+  /**
+   * The deferred input supplied.
+   */
+  readonly input: SlotName;
+  /**
+   * How many subscribed Verifier versions hold the evidence.
+   */
+  readonly matched_subscriptions: number;
+  /**
+   * When the evidence was first accepted.
+   */
+  readonly recorded_at: string;
+  /**
+   * The connected repository the slug resolved to.
+   */
+  readonly repository: EvidenceRepository;
+  /**
+   * Whether this call accepted the evidence or replayed an earlier
+   * acceptance.
+   */
+  readonly status: EvidenceStatus;
+  /**
+   * The matched source tags.
+   */
+  readonly tags: EvidenceTags;
+}
+
+/**
+ * The pull request source one queued execution was admitted for.
+ *
+ * Every execution of one admission shares its `generation`. A newer
+ * source of the same pull request supersedes the generation: its unfinished
+ * executions are cancelled with code `pull_request_superseded`. A close or
+ * draft conversion cancels them with `pull_request_closed` or
+ * `pull_request_draft`, and losing the repository through removal,
+ * suspension or disconnect with `repository_access_lost`. Settled history
+ * keeps these pins.
+ */
+export interface PullRequestActivation {
+  /**
+   * Base branch and commit.
+   */
+  readonly base: PullRequestRef;
+  /**
+   * Provider delivery that admitted the source, for matching the
+   * provider's delivery log.
+   */
+  readonly delivery_id: string;
+  /**
+   * The admission every execution of this source shares.
+   */
+  readonly generation: string;
+  /**
+   * Head branch and commit.
+   */
+  readonly head: PullRequestRef;
+  /**
+   * Stable provider id of the head repository; differs from
+   * `repository_id` for a fork and is absent once the fork is deleted.
+   */
+  readonly head_repository_id?: RepositoryId | null;
+  /**
+   * Provider web host, such as `github.com`.
+   */
+  readonly host: string;
+  /**
+   * Pull request number in the base repository.
+   */
+  readonly number: number;
+  /**
+   * Stable provider id of the base repository.
+   */
+  readonly repository_id: RepositoryId;
+}
+
+/**
+ * One side of a pull request as an admission pinned it: the branch name
+ * then and the exact commit.
+ */
+export interface PullRequestRef {
+  /**
+   * Branch name when the source was admitted.
+   */
+  readonly ref: string;
+  /**
+   * Exact commit SHA the execution reviews.
+   */
+  readonly sha: string;
+}
+
+/**
  * Server-derived class of one query: how Oracle admits and executes it.
  *
  * Never a request field. Oracle reads it from the one physical root it built:
@@ -4987,7 +5833,7 @@ export interface RefSibling {
 }
 
 /**
- * Scope reference: inputs.<slot>, steps.<id>.output, steps.<id>.status, steps.<id>.requirements.<id>.outcome|reason, requirement.id, or requirement.statement, with .field, [n], and (in assert each) [*] selectors below inputs and step outputs.
+ * Scope reference: inputs.<slot>, steps.<id>.output, steps.<id>.status, steps.<id>.requirements.<id>.outcome|reason, requirement.id, requirement.statement, item, item_index, iteration.output, iteration.previous, or iteration.index, with .field, [n], and (in assert each) [*] selectors below inputs, step outputs, item, and iteration outputs; an Agent workspace source may also mount steps.<id>.publications or steps.<id>.publications.<name>.
  */
 export type Reference = string;
 
@@ -5084,7 +5930,7 @@ export interface RegisteredAuditCard {
 /**
  * One registered Card envelope as `cards.get` returns it, discriminated by `kind`.
  */
-export type RegisteredCard = RegisteredDataCard | RegisteredModelCard | RegisteredArtifactCard | RegisteredExperimentCard | RegisteredPromptCard | RegisteredAgentCard | RegisteredMcpCard | RegisteredServiceCard | RegisteredAuditCard | RegisteredVerifierCard | RegisteredTriggerCard | RegisteredOperatorCard | RegisteredUntypedCard;
+export type RegisteredCard = RegisteredDataCard | RegisteredModelCard | RegisteredArtifactCard | RegisteredExperimentCard | RegisteredPromptCard | RegisteredAgentCard | RegisteredMcpCard | RegisteredServiceCard | RegisteredAuditCard | RegisteredVerifierCard | RegisteredTriggerCard | RegisteredOperatorCard | RegisteredRepositoryCard | RegisteredUntypedCard;
 
 /**
  * Registered `Data` Card envelope.
@@ -5297,6 +6143,36 @@ export interface RegisteredPromptCard {
 }
 
 /**
+ * Registered `Repository` Card envelope.
+ */
+export interface RegisteredRepositoryCard {
+  /**
+   * API version. Must be `wyrd/v1` for v1 Cards.
+   */
+  readonly apiVersion: ApiVersion;
+  /**
+   * Card kind discriminator.
+   */
+  readonly kind: "Repository";
+  /**
+   * Card metadata.
+   */
+  readonly metadata: Metadata;
+  /**
+   * Server-derived relationship summary.
+   */
+  readonly relationships?: Relationships;
+  /**
+   * Kind-specific spec payload.
+   */
+  readonly spec: RepositorySpec;
+  /**
+   * Optional server-derived status.
+   */
+  readonly status?: Status | null;
+}
+
+/**
  * Registered `Service` Card envelope.
  */
 export interface RegisteredServiceCard {
@@ -5449,6 +6325,90 @@ export interface Relationships {
 export type RelativeArtifactPath = string;
 
 /**
+ * Bounded sequential repetition of one step's action.
+ *
+ * Each iteration and its step requirements settle before `until` is
+ * evaluated; true stops successfully, false runs the next iteration, and
+ * exhausting `max_iterations` fails the step.
+ */
+export interface Repeat {
+  /**
+   * The positive iteration bound.
+   */
+  readonly max_iterations: number;
+  /**
+   * The stop condition; it may read `iteration.output`.
+   */
+  readonly until: Condition;
+}
+
+/**
+ * Stable provider repository id: a positive decimal integer, as a string, that survives repository renames and transfers.
+ */
+export type RepositoryId = string;
+
+/**
+ * Source-hosting provider of a Repository.
+ */
+export type RepositoryProvider = "github";
+
+/**
+ * A connected provider repository and the Verifiers bound to it.
+ */
+export interface RepositorySpec {
+  /**
+   * Canonical configured provider web host, such as `github.com`.
+   *
+   * May be omitted when authoring; the server sets the configured host
+   * and refuses any other value.
+   */
+  readonly host?: string | null;
+  /**
+   * Source-hosting provider; `github` when omitted.
+   */
+  readonly provider?: RepositoryProvider;
+  /**
+   * Stable provider repository id, the Repository's durable identity.
+   *
+   * May be omitted when the declaration carries a repository hint, from
+   * which the server resolves it through the tenant's connection; a
+   * registered Repository always carries it.
+   */
+  readonly repository_id?: RepositoryId | null;
+  /**
+   * The complete desired list of Verifier bindings. Each binding's
+   * `runs_on`, when present, must be the `pull_request` activation.
+   */
+  readonly verified_by?: readonly VerificationBinding[];
+}
+
+/**
+ * Server-derived state of one Repository Card version.
+ *
+ * Exactly one version of a Repository family is selected once a
+ * declaration of it has completed: future pull request reviews use the
+ * selected version's bindings. Selection is separate from the Card's
+ * lifecycle `phase`: an Active version that a later declaration replaced
+ * stays readable and Active but is no longer selected.
+ */
+export interface RepositoryStatus {
+  /**
+   * `owner/name` as the provider last reported it, while the tenant's
+   * connection can reach the repository; `None` when it cannot.
+   */
+  readonly full_name?: string | null;
+  /**
+   * Whether this exact version is the family's selected policy.
+   */
+  readonly selected: boolean;
+  /**
+   * The family's selected version; `None` before any declaration of the
+   * family completed.
+   */
+  readonly selected_version?: VersionBlock | null;
+}
+
+/**
  * Request correlation ID; required to be a UUID v7.
  */
 export type RequestId = string;
@@ -5515,6 +6475,16 @@ export interface RequirementDetails {
    */
   readonly id: TaskId;
   /**
+   * Zero-based fanout item of the owning step's invocation this instance
+   * judged; absent without fanout.
+   */
+  readonly item_index?: number | null;
+  /**
+   * Zero-based repeat iteration of the owning step's invocation this
+   * instance judged; absent without repeat.
+   */
+  readonly iteration_index?: number | null;
+  /**
    * The outcome.
    */
   readonly outcome: RequirementOutcome;
@@ -5534,6 +6504,11 @@ export interface RequirementDetails {
    * Owning step of a step requirement.
    */
   readonly step?: TaskId | null;
+  /**
+   * Tools an Agent check called, direct and nested, in start order;
+   * empty for every other check and for historical results.
+   */
+  readonly tool_calls?: readonly ToolCallRecord[];
 }
 
 /**
@@ -5569,6 +6544,16 @@ export interface RequirementResult {
    * Requirement ID.
    */
   readonly id: TaskId;
+  /**
+   * Zero-based fanout item of the owning step's invocation this instance
+   * judged; absent without fanout.
+   */
+  readonly item_index?: number | null;
+  /**
+   * Zero-based repeat iteration of the owning step's invocation this
+   * instance judged; absent without repeat.
+   */
+  readonly iteration_index?: number | null;
   /**
    * The outcome.
    */
@@ -6354,6 +7339,11 @@ export interface SpanStatusUnset {
 export type SpecHash = string;
 
 /**
+ * A step's speculative disposition, as a collection manifest reports it.
+ */
+export type Speculation = "none" | "pending" | "admitted" | "discarded" | "blocked";
+
+/**
  * DataCard split label.
  */
 export type SplitName = string;
@@ -6478,6 +7468,11 @@ export interface Status {
    */
   readonly phase: string;
   /**
+   * Server-derived Repository policy selection and access, present only
+   * on a Repository Card. Read-side projection, like `verification`.
+   */
+  readonly repository?: RepositoryStatus | null;
+  /**
    * Last status update timestamp.
    */
   readonly updated_at?: string | null;
@@ -6499,13 +7494,22 @@ export interface Step {
    */
   readonly action: Action;
   /**
-   * Ordering-only dependencies beyond those implied by references.
+   * Dependencies beyond those implied by references: an ordering-only
+   * list, or `{any_succeeded: [...]}`.
    */
-  readonly depends_on?: readonly TaskId[];
+  readonly depends_on?: DependsOn;
+  /**
+   * Runs the action once per frozen item or a fixed number of times.
+   */
+  readonly foreach?: Foreach | null;
   /**
    * Verifier-unique block ID.
    */
   readonly id: TaskId;
+  /**
+   * Runs the action sequentially until a condition holds.
+   */
+  readonly repeat?: Repeat | null;
   /**
    * Requirements judged after the action, before dependents start.
    */
@@ -6514,6 +7518,11 @@ export interface Step {
    * Retries after the first failed attempt, at most [`MAX_STEP_RETRIES`].
    */
   readonly retries?: number;
+  /**
+   * Lets the action start before `when` resolves, withholding its
+   * contribution until the condition admits it. Requires `when`.
+   */
+  readonly speculative?: boolean;
   /**
    * Per-attempt timeout in seconds.
    */
@@ -6661,12 +7670,12 @@ export type TimeUnit = "Second" | "Millisecond" | "Microsecond" | "Nanosecond";
 export type TokenAudience = "wyrd" | "bifrost";
 
 /**
- * One tool call an Agent action made.
+ * One tool call an Agent step or check made, directly or from its Python.
  *
- * Records what the model received, never the raw tool output: the digest
- * and size describe the bounded output actually returned. A call that
- * returned no output, such as one that failed, has no digest and zero
- * returned bytes rather than a digest of nothing.
+ * Records what its recipient received, never the raw tool output: the
+ * digest and size describe the bounded output actually delivered. A call
+ * that delivered no output, such as one that failed or was cancelled, has
+ * no digest and zero returned bytes rather than a digest of nothing.
  */
 export interface ToolCallRecord {
   /**
@@ -6674,16 +7683,23 @@ export interface ToolCallRecord {
    */
   readonly arguments: JsonValue;
   /**
-   * Error the tool returned, when it failed.
+   * Error the tool returned, when it failed or was cancelled.
    */
   readonly error?: string | null;
   /**
-   * SHA-256 of the bounded output returned to the model; absent when the
-   * call returned none.
+   * SHA-256 of the bounded output delivered to the recipient; absent
+   * when the call delivered none.
    */
   readonly output_sha256?: Sha256Hex | null;
   /**
-   * Bytes of output returned to the model; zero when it returned none.
+   * Where the output went, or would have gone: the model for a direct
+   * call, Python for a call `code.run` made. Absent on historical
+   * records, which were all direct.
+   */
+  readonly recipient: ToolRecipient;
+  /**
+   * Bytes of output delivered to the recipient; zero when it delivered
+   * none.
    */
   readonly returned_bytes: number;
   /**
@@ -6691,6 +7707,11 @@ export interface ToolCallRecord {
    */
   readonly tool: BuiltinTool;
 }
+
+/**
+ * Who receives a tool call's output.
+ */
+export type ToolRecipient = "model" | "code";
 
 /**
  * Torch interface metadata.
@@ -6744,7 +7765,7 @@ export type TriggerDuration = string;
 /**
  * Declarative activation for a bound Verifier.
  */
-export type TriggerSpec = TriggerSpecSchedule | TriggerSpecGroupEnd;
+export type TriggerSpec = TriggerSpecSchedule | TriggerSpecGroupEnd | TriggerSpecPullRequest;
 
 /**
  * Activate once per `group_id` group of source executions this long
@@ -6761,6 +7782,21 @@ export interface TriggerSpecGroupEnd {
    */
   readonly description?: string | null;
   readonly kind: "group_end";
+}
+
+/**
+ * Activate on each eligible pull request event of the owning
+ * Repository: opened, reopened, ready for review, or a new head or base.
+ *
+ * Valid only on a Repository's binding. It carries no event names: the
+ * eligible events are fixed, and an arbitrary event name is refused.
+ */
+export interface TriggerSpecPullRequest {
+  /**
+   * Optional human-readable purpose.
+   */
+  readonly description?: string | null;
+  readonly kind: "pull_request";
 }
 
 /**
@@ -6785,7 +7821,7 @@ export interface TriggerSpecSchedule {
 /**
  * Card kinds whose `spec` and `status` `cards.get` types.
  */
-export type TypedCardKind = "Data" | "Model" | "Artifact" | "Experiment" | "Prompt" | "Agent" | "Mcp" | "Service" | "Audit" | "Verifier" | "Trigger" | "Operator";
+export type TypedCardKind = "Data" | "Model" | "Artifact" | "Experiment" | "Prompt" | "Agent" | "Mcp" | "Service" | "Audit" | "Verifier" | "Trigger" | "Operator" | "Repository";
 
 /**
  * One named evidence slot.
@@ -6802,6 +7838,11 @@ export type TypedInputSlot = TypedInputSlotJson | TypedInputSlotMedia | TypedInp
  */
 export interface TypedInputSlotJson {
   /**
+   * Whether the value arrives later as published evidence instead of
+   * with the request. See [`InputSlot::is_deferred`].
+   */
+  readonly deferred?: boolean;
+  /**
    * JSON Schema the value must satisfy.
    */
   readonly schema?: JsonValue;
@@ -6812,6 +7853,11 @@ export interface TypedInputSlotJson {
  * A pinned file in one of the accepted formats.
  */
 export interface TypedInputSlotMedia {
+  /**
+   * Whether the file arrives later as published evidence instead of
+   * with the request. See [`InputSlot::is_deferred`].
+   */
+  readonly deferred?: boolean;
   /**
    * Accepted formats.
    */
@@ -7012,6 +8058,11 @@ export interface VerificationError {
  */
 export interface VerificationExecutionState {
   /**
+   * Every approval occurrence the execution reached, pending or
+   * decided, in step order; empty when it reached none.
+   */
+  readonly approvals?: readonly ApprovalOccurrenceState[];
+  /**
    * Every Operator dispatch of a failed background binding execution or a
    * changed group verdict, in identity order; empty otherwise. Delivery
    * completes independently of the execution and never changes its verdict.
@@ -7026,6 +8077,12 @@ export interface VerificationExecutionState {
    */
   readonly execution_id: ExecutionId;
   /**
+   * How far GitHub delivery of a `pull_request` execution's current
+   * state got; absent for every other origin. Delivery never changes the
+   * verdict, and its failure never fails the execution.
+   */
+  readonly github_delivery?: GithubDelivery | null;
+  /**
    * The source snapshot a group execution judges.
    */
   readonly group?: GroupSnapshot | null;
@@ -7039,6 +8096,11 @@ export interface VerificationExecutionState {
    */
   readonly owner_card_uid?: CardUid | null;
   /**
+   * The pull request source a `pull_request` binding execution was
+   * admitted for, frozen at admission.
+   */
+  readonly pull_request?: PullRequestActivation | null;
+  /**
    * The result once completed and visible.
    */
   readonly result?: VerificationResult | null;
@@ -7046,6 +8108,11 @@ export interface VerificationExecutionState {
    * Lifecycle status, independent of the verdict.
    */
   readonly status: VerificationExecutionStatus;
+  /**
+   * The deferred inputs a `waiting` execution is parked for; empty
+   * otherwise.
+   */
+  readonly waiting?: readonly SlotName[];
 }
 
 /**
@@ -7055,7 +8122,7 @@ export interface VerificationExecutionState {
  * result. `cancelled`, `timed_out`, and `errored` never carry a verdict or
  * dispatch an Operator.
  */
-export type VerificationExecutionStatus = "pending" | "running" | "retrying" | "completed" | "cancelled" | "timed_out" | "errored";
+export type VerificationExecutionStatus = "pending" | "running" | "retrying" | "waiting" | "completed" | "cancelled" | "timed_out" | "errored";
 
 /**
  * Overall verdict with its requirement judgments.
@@ -7140,6 +8207,28 @@ export interface VerificationStatus {
 export type VerificationVerdict = "passed" | "failed" | "inconclusive";
 
 /**
+ * Authored execution ceilings. Each one only lowers the server's effective
+ * limit; omitted values use the server's published defaults.
+ */
+export interface VerifierLimits {
+  /**
+   * Most actions and checks running at once across the whole execution,
+   * fanout items included.
+   */
+  readonly concurrency?: number | null;
+  /**
+   * Most Agent action and check attempts, retries included, the
+   * execution may start over its whole life; recovery never replenishes
+   * it.
+   */
+  readonly max_agent_invocations?: number | null;
+  /**
+   * Whole-execution deadline in seconds, queue and retry waits included.
+   */
+  readonly timeout_seconds?: number | null;
+}
+
+/**
  * A subject-less Verifier: inputs, optional steps, requirements, decision.
  */
 export interface VerifierSpec {
@@ -7160,11 +8249,25 @@ export interface VerifierSpec {
    */
   readonly inputs?: Readonly<Record<string, InputSlot>>;
   /**
+   * Ceilings that only lower the server's effective execution limits.
+   */
+  readonly limits?: VerifierLimits | null;
+  /**
    * Order of a group Verifier's source lists: `recorded_at`, or an input
    * key that orders every slot reading the same source binding. Absent
    * means `recorded_at`.
    */
   readonly order_by?: OrderBy | null;
+  /**
+   * Whether this Verifier runs only as queued work, so a direct `verify`
+   * is refused before any step.
+   *
+   * Server-derived: registration replaces whatever the author sent with
+   * the value the Verifier's steps and their Agents imply, before the
+   * spec is hashed and stored. Omitted when `false`, so a Verifier that
+   * can run directly stores and hashes as if the field did not exist.
+   */
+  readonly queue_only?: boolean;
   /**
    * Whole-Verifier requirements, judged after every step finishes.
    */

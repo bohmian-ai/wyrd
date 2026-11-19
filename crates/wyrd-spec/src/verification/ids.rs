@@ -62,6 +62,83 @@ impl schemars::JsonSchema for TaskId {
     }
 }
 
+/// Validated logical name of one execution publication.
+///
+/// A publication name is one ASCII segment matching `^[A-Za-z0-9_-]{1,64}$`;
+/// it labels retained content within one producer invocation attempt and is
+/// never a filename. Deserialization goes through [`PublicationName::new`] so
+/// wire payloads cannot bypass validation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(transparent)]
+pub struct PublicationName(String);
+
+impl PublicationName {
+    /// Constructs a validated publication name.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::Validation`] when the name is empty, longer than
+    /// 64 bytes, or holds a byte outside `[A-Za-z0-9_-]`.
+    pub fn new(value: impl Into<String>) -> Result<Self, WyrdError> {
+        let value = value.into();
+        let valid = (1..=64).contains(&value.len())
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-');
+        if !valid {
+            return Err(WyrdError::Validation {
+                message: format!("publication name {value:?} must match ^[A-Za-z0-9_-]{{1,64}}$"),
+                details: serde_json::json!({ "field": "name" }),
+            });
+        }
+        Ok(Self(value))
+    }
+
+    /// Borrows the validated name as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for PublicationName {
+    type Err = WyrdError;
+
+    /// Parses and validates a publication name, as [`PublicationName::new`].
+    ///
+    /// # Errors
+    /// Returns the [`PublicationName::new`] error when `value` is not 1 to 64
+    /// ASCII letters, digits, `_`, or `-`.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for PublicationName {
+    /// Deserializes a string and validates it, so no invalid name crosses the
+    /// wire.
+    ///
+    /// # Errors
+    /// Returns the deserializer's error when the value is not a string or is
+    /// not a valid publication name.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+impl schemars::JsonSchema for PublicationName {
+    /// Names the schema `PublicationName`.
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "PublicationName".into()
+    }
+
+    /// The string grammar [`PublicationName::new`] enforces.
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({ "type": "string", "minLength": 1, "maxLength": 64, "pattern": r"^[A-Za-z0-9_-]{1,64}$" })
+    }
+}
+
 /// Validated JSONPath expression used to address workflow and scenario fields.
 ///
 /// This surface accepts a small RFC 9535-style subset: the path must start
@@ -199,7 +276,22 @@ fn task_id_regex() -> &'static Regex {
 
 #[cfg(test)]
 mod tests {
-    use super::{JsonPath, TaskId};
+    use super::{JsonPath, PublicationName, TaskId};
+
+    /// Publication names are one bounded ASCII segment, never a path.
+    ///
+    /// # Panics
+    /// Panics when a valid name is refused or an invalid one accepted.
+    #[test]
+    fn publication_name_is_one_bounded_segment() {
+        for valid in ["report", "0-review_A", &"a".repeat(64)] {
+            assert_eq!(PublicationName::new(valid).expect("valid").as_str(), valid);
+        }
+        for invalid in ["", "a/b", "a.b", "é", "a b", &"a".repeat(65)] {
+            assert!(PublicationName::new(invalid).is_err(), "{invalid:?}");
+        }
+        assert!(serde_json::from_str::<PublicationName>("\"../x\"").is_err());
+    }
 
     #[test]
     fn task_id_accepts_simple_identifier() {

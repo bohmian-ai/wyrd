@@ -5,7 +5,6 @@ members = [
     "crates/vala/*",
     "crates/skald/*",
     "crates/shared/*",
-    "crates/patches/*",
     "crates/wyrd-spec",
     "examples",
     "sdks/wyrd-sdk-python",
@@ -147,22 +146,26 @@ csv = "1.4"
 lopdf = { version = "0.45", default-features = false }
 quick-xml = "0.41"
 # Sandboxed Verifier Python pool and the hardened worker binary it spawns.
-monty-pool = "1.1"
-monty-proto = "1.1"
-monty-types = "1.1"
+monty-pool = "1.6"
+monty-proto = "1.6"
+monty-types = "1.6"
 tar = { version = "0.4", default-features = false }
 zip = { version = "8.6", default-features = false, features = ["deflate-flate2"] }
 zstd = "0.13"
 walkdir = "2.*"
 sha2 = "0.10"
+# Git blob ids in code-review pipeline fixtures.
+sha1 = "0.10"
 uuid = { version = "1", default-features = false, features = ["serde"] }
 crc32c = "0.6"
-rustix = { version = "1.1.4", features = ["fs"] }
+rustix = { version = "1.1.4", features = ["fs", "process"] }
 semver = { version = "1", features = ["serde"] }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 metrics = { version = "0.24", default-features = false }
 # Global allocator for server binaries only; libraries never set one.
 mimalloc = "0.1.50"
+# mimalloc's own aggregate process statistics, read by server binaries only.
+libmimalloc-sys = "0.1.49"
 metrics-exporter-prometheus = { version = "0.16", default-features = false }
 mini-moka = { version = "0.10", features = ["sync"] }
 proptest = "1"
@@ -171,7 +174,9 @@ aes-gcm = "0.10"
 argon2 = "0.5"
 password-hash = { version = "0.5", features = ["getrandom"] }
 unicode-normalization = "0.1"
+unicase = "2.9"
 secrecy = "0.10"
+hmac = "0.12"
 subtle = "2.6"
 zeroize = "1"
 rand = "0.9"
@@ -235,6 +240,9 @@ typetag = "0.2.23"
 lru = "=0.12.5"
 # Safe macOS host and process readings for the release-server benchmark harness.
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
+# Safe `getrusage(RUSAGE_CHILDREN)`: the CPU a `bench` server's reaped worker
+# children used, which no reading of live processes can recover.
+nix = { version = "0.31.3", default-features = false, features = ["resource"] }
 # Safe `proc_pid_rusage` wrapper: lifetime peak footprint of a macOS process.
 # =55.1.0 matches the managed iceberg-rust arrow-60 line. The four iceberg
 # crates share one immutable SCRIBE_ICEBERG_SHA so the analytical graph stays a
@@ -251,6 +259,8 @@ parquet = "60.0"
 parquet-variant = { package = "bohmian-parquet-variant", version = "60.0.0" }
 parquet-variant-compute = { package = "bohmian-parquet-variant-compute", version = "60.0.0" }
 parquet-variant-json = { package = "bohmian-parquet-variant-json", version = "60.0.0" }
+# Pinned PR source preparation, repository snapshots and review context selection.
+bohmian-code-review-pipeline = { git = "https://github.com/bohmian-ai/bohmian-code-review", rev = "9046d1035538df8dfb661f826b102316ee6d0b4e" }
 iceberg = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "e849bc4fa46430e6278a4c201106cdd68dc5b244" }
 # The fork's SQL catalog is on the workspace's sqlx 0.9, so one sqlx is linked.
 iceberg-catalog-sql = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "e849bc4fa46430e6278a4c201106cdd68dc5b244" }
@@ -261,7 +271,7 @@ iceberg-datafusion = { git = "https://github.com/bohmian-ai/iceberg-rust", rev =
 # universe. The revision is literal and must never be a branch: the branch it was
 # published on can move, and a moved core would silently change selection,
 # grouping, delete application, and output identity underneath Forge.
-iceberg-compaction-core = { git = "https://github.com/bohmian-ai/iceberg-compaction", rev = "764fe2a8bbf2a8d1577ca27fec76751ac91c07ff" }
+iceberg-compaction-core = { git = "https://github.com/bohmian-ai/iceberg-compaction", rev = "21ceaf7172d7666e30e2f8527e70f22a7aea9741" }
 # Oracle's distributed query planner and worker runtime. Pinned to an immutable
 # revision over the one shared native DataFusion 55 universe. The Wyrd fork carries the Arrow 60 port; upstream is still on Arrow 59.
 datafusion-distributed = { git = "https://github.com/bohmian-ai/datafusion-distributed", rev = "bbbd1d9af4633499b736a98da62868ce32bc3d16" }
@@ -272,10 +282,16 @@ datafusion-distributed = { git = "https://github.com/bohmian-ai/datafusion-distr
 # Parquet read planner, and field-id column resolution) replaces these crates for every consumer, including the
 # iceberg, compaction, and distributed git dependencies.
 [patch.crates-io]
-# monty-proto's `worker` feature, which wyrd-server needs to serve as its own
-# Monty worker, hard-depends on the ty/ruff type checker; Wyrd never type checks,
-# so a stand-in with the same API refuses every check and keeps the checker out.
-monty-type-checking = { path = "crates/patches/monty-type-checking" }
+# Monty 1.6.0 plus Wyrd's fork commits: monty-proto's `worker-core` feature builds the
+# worker without the ty/ruff type checker, and worker hosts report memory in a
+# `MemorySample` event that the pool reads outside turns, including from idle
+# workers. Every Monty crate comes from this rev so the graph holds one copy.
+monty = { git = "https://github.com/bohmian-ai/monty", rev = "e54ecafaad8323d88ded7ca2a73ede62d30cf441" }
+monty-fs = { git = "https://github.com/bohmian-ai/monty", rev = "e54ecafaad8323d88ded7ca2a73ede62d30cf441" }
+monty-macros = { git = "https://github.com/bohmian-ai/monty", rev = "e54ecafaad8323d88ded7ca2a73ede62d30cf441" }
+monty-pool = { git = "https://github.com/bohmian-ai/monty", rev = "e54ecafaad8323d88ded7ca2a73ede62d30cf441" }
+monty-proto = { git = "https://github.com/bohmian-ai/monty", rev = "e54ecafaad8323d88ded7ca2a73ede62d30cf441" }
+monty-types = { git = "https://github.com/bohmian-ai/monty", rev = "e54ecafaad8323d88ded7ca2a73ede62d30cf441" }
 datafusion = { git = "https://github.com/bohmian-ai/datafusion", rev = "5f4b1713af4f0394c7c564b6bc6de42e92640186" }
 datafusion-common = { git = "https://github.com/bohmian-ai/datafusion", rev = "5f4b1713af4f0394c7c564b6bc6de42e92640186" }
 datafusion-datasource = { git = "https://github.com/bohmian-ai/datafusion", rev = "5f4b1713af4f0394c7c564b6bc6de42e92640186" }

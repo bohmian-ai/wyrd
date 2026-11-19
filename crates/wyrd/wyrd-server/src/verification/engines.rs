@@ -6,18 +6,27 @@
 //! lifecycle transition. The helpers here derive the bounded Operator failure
 //! context from a completed [`ExecutedOutcome`].
 
+use std::collections::BTreeSet;
+
 use wyrd_spec::card::operator::DriftCounts;
-use wyrd_spec::verification::execution::{ExecutedOutcome, RequirementDetail, RequirementOutcome};
+use wyrd_spec::ids::SlotName;
+use wyrd_spec::verification::execution::{
+    CallProvenance, ExecutedOutcome, RequirementDetail, RequirementOutcome, StepStatus,
+};
+use wyrd_spec::verification::state::ApprovalOccurrence;
 use wyrd_spec::verification::{DriftVerdict, VerificationError};
 use wyrd_sql::queries::verifier_executions::TerminalStatus;
+
+use crate::components::github::extraction::PULL_REQUEST_EXTRACT_VERSION;
 
 /// The typed result of one engine execution.
 ///
 /// The runner maps each variant to exactly one transition: `Completed`
 /// stages the result and completes, `Retry` reschedules the same execution
 /// and input within its attempt budget, `Deferred` requeues after one poll
-/// interval without charging an attempt, and `Terminal` settles without a
-/// verdict.
+/// interval without charging an attempt, `Parked` persists the waiting
+/// state and requeues the same execution without charging an attempt, and
+/// `Terminal` settles without a verdict.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EngineOutcome {
     /// The engine produced a verdict and its breakdown.
@@ -30,6 +39,11 @@ pub enum EngineOutcome {
     /// shared capacity, not a failure of this execution, so it waits one poll
     /// interval and tries again without spending an attempt.
     Deferred(VerificationError),
+    /// Every runnable step settled and the rest read deferred inputs not yet
+    /// published or wait on undecided approval occurrences, both named here.
+    /// The execution releases its compute and waits for the publication or
+    /// decision, or its deadline.
+    Parked(BTreeSet<SlotName>, Vec<ApprovalOccurrence>),
     /// A terminal failure that carries no verdict.
     Terminal(TerminalStatus, VerificationError),
 }
@@ -84,6 +98,24 @@ pub fn drift_counts(outcome: &ExecutedOutcome) -> Option<DriftCounts> {
     })
 }
 
+/// Whether `outcome` extracted its pull request source: some step succeeded
+/// with the pull_request extractor's server-assigned provenance.
+///
+/// Recorded with the completion as the execution's eligibility to be a later
+/// head's incremental review baseline. The judgment's verdict plays no part:
+/// a failed or inconclusive review of extracted source still counts, and a
+/// failed extraction never does.
+#[must_use]
+pub fn pr_source_extracted(outcome: &ExecutedOutcome) -> bool {
+    outcome.steps.iter().any(|step| {
+        step.status == StepStatus::Succeeded
+            && matches!(
+                &step.provenance,
+                Some(CallProvenance::Extract { version }) if version == PULL_REQUEST_EXTRACT_VERSION
+            )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     //! Operator failure context derived from an outcome.
@@ -108,6 +140,8 @@ mod tests {
             result: RequirementResult {
                 id: TaskId::new(id).expect("valid task id"),
                 step: None,
+                item_index: None,
+                iteration_index: None,
                 statement: id.to_owned(),
                 outcome: RequirementOutcome::Failed,
                 reason: "failed".to_owned(),
@@ -121,6 +155,7 @@ mod tests {
             }))
             .expect("assert check decodes"),
             provenance: None,
+            tool_calls: Vec::new(),
         }
     }
 

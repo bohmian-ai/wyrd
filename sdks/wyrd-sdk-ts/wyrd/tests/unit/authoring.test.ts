@@ -611,6 +611,15 @@ test("versions_are_optional_and_prompts_are_native", () => {
     body: { messages: [{ role: "user", content: "Judge {{report}}" }] },
     response_format: "verdict",
   });
+  const reviewer = new Agent("reviewer", {
+    version: "1.0.0",
+    prompt: Prompt.openaiChat("gpt-4o", { messages: "Review {{diff}}", responseFormat: { type: "code_review" } }),
+    execution_route: { kind: "wyrd_gateway", deployment: "openai" },
+  });
+  expect(
+    (spec(reviewer).prompt as { response_format: unknown }).response_format,
+    "the code_review format keeps its name",
+  ).toBe("code_review");
 
   let refused: unknown;
   try {

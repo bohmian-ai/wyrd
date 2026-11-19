@@ -36,7 +36,9 @@ use wyrd_spec::ids::{
 };
 use wyrd_spec::vala::ids::{RunId, SpanId, TraceId};
 use wyrd_spec::verification::TaskId;
-use wyrd_spec::verification::execution::{VerificationExecutionState, VerificationRequest};
+use wyrd_spec::verification::execution::{
+    PullRequestActivation, VerificationExecutionState, VerificationRequest,
+};
 use wyrd_spec::verification::{
     DriftWindow, FrozenTarget, GroupEndSettings, OperatorDispatchState, VerificationBindingStatus,
     VerificationError, VerificationVerdict, VerifierReadiness,
@@ -44,6 +46,15 @@ use wyrd_spec::verification::{
 
 use crate::queries::verification::{BindingSchedule, InactivityTimeout, binding_activity};
 use crate::{OperatorPool, TenantConn};
+
+mod approvals;
+mod pull_requests;
+
+pub use pull_requests::{
+    PullRequestBaseline, PullRequestBinding, PullRequestEnd, PullRequestExecution,
+    PullRequestGeneration, PullRequestHistory, PullRequestKey, PullRequestTarget, access_lost,
+    superseded,
+};
 
 /// Resolve a binding target's frozen identities and readiness.
 const RESOLVE_BINDING_SQL: &str = r"
@@ -370,14 +381,14 @@ const ADVANCE_EXPECTED_CURSOR_SQL: &str = r"
      WHERE binding_id = $1 AND next_run_at = $3
 ";
 
-/// Claim up to `$3` of the oldest due, retry-due, or lease-expired executions,
+/// Claim up to `$2` of the oldest due, retry-due, or lease-expired executions,
 /// each under its own fresh lease, in one statement.
 ///
-/// The `exhausted` CTE first settles, as `errored` with error `$1`, every
-/// expired lease that has no attempt left; data-modifying CTEs always run,
-/// and the candidate scan excludes exactly those rows, so one statement both
-/// exhausts and claims without the two touching the same row. Every claimed
-/// row draws its own random lease token, returned as `lease_token`, so each
+/// An expired lease with no attempt left is claimed without counting an
+/// attempt and returned as `exhausted`, so its runner delivers a terminal
+/// outcome the execution already selected, or settles the exhaustion,
+/// without computing; the queue cannot see Bifrost to decide that itself.
+/// Every claimed row draws its own random lease token, returned as `lease_token`, so each
 /// claim renews and settles independently.
 ///
 /// Due and lease-expired rows are each read in the order of their own
@@ -387,50 +398,45 @@ const ADVANCE_EXPECTED_CURSOR_SQL: &str = r"
 /// either scan but not claimed stay locked only until the claim commits,
 /// and concurrent claims skip them.
 ///
+/// The execution deadline is its admission time plus `$3` milliseconds, and
+/// every claim returns what remains of it, so a reclaim never replenishes it.
+///
 /// Availability, expiry, and the new lease deadline are all PostgreSQL's
-/// statement time; `$2` is only the lease length in milliseconds, so a pod
+/// statement time; `$1` is only the lease length in milliseconds, so a pod
 /// whose clock differs from the database can neither claim early nor hold a
 /// lease the database believes already expired. Each claim also returns the
 /// Verifier's ready fitted Drift baselines keyed by requirement, so the drift
 /// engine opens no connection to read them; the Verifier, subject, and SYSTEM
 /// principal are resolved by the caller through `wyrd.verification_target`.
 const CLAIM_SQL: &str = r"
-    WITH exhausted AS (
-        UPDATE wyrd.verifier_executions x
-           SET status = 'errored', error = $1, lease_expires_at = NULL,
-               next_attempt_at = NULL, settled_at = statement_timestamp(),
-               updated_at = statement_timestamp()
-         WHERE x.status = 'running'
-           AND x.lease_expires_at <= statement_timestamp()
-           AND x.attempts >= x.max_attempts
-    ),
-    due AS (
-        SELECT execution_id, next_attempt_at AS due_at
+    WITH due AS (
+        SELECT execution_id, next_attempt_at AS due_at, false AS exhausted
           FROM wyrd.verifier_executions
          WHERE status IN ('pending', 'retrying') AND next_attempt_at <= statement_timestamp()
          ORDER BY next_attempt_at, execution_id
-         LIMIT $3
+         LIMIT $2
            FOR UPDATE SKIP LOCKED
     ),
     expired AS (
-        SELECT execution_id, lease_expires_at AS due_at
+        SELECT execution_id, lease_expires_at AS due_at, attempts >= max_attempts AS exhausted
           FROM wyrd.verifier_executions
          WHERE status = 'running' AND lease_expires_at <= statement_timestamp()
-           AND attempts < max_attempts
          ORDER BY lease_expires_at, execution_id
-         LIMIT $3
+         LIMIT $2
            FOR UPDATE SKIP LOCKED
     ),
     candidate AS (
-        SELECT execution_id, due_at FROM due
+        SELECT execution_id, due_at, exhausted FROM due
         UNION ALL
-        SELECT execution_id, due_at FROM expired
+        SELECT execution_id, due_at, exhausted FROM expired
         ORDER BY due_at, execution_id
-        LIMIT $3
+        LIMIT $2
     )
     UPDATE wyrd.verifier_executions e
-       SET status = 'running', attempts = e.attempts + 1, lease_token = gen_random_uuid(),
-           lease_expires_at = statement_timestamp() + ($2::bigint * INTERVAL '1 millisecond'),
+       SET status = 'running',
+           attempts = CASE WHEN candidate.exhausted THEN e.attempts ELSE e.attempts + 1 END,
+           lease_token = gen_random_uuid(),
+           lease_expires_at = statement_timestamp() + ($1::bigint * INTERVAL '1 millisecond'),
            next_attempt_at = NULL, updated_at = statement_timestamp()
       FROM candidate
      WHERE e.execution_id = candidate.execution_id
@@ -439,12 +445,17 @@ const CLAIM_SQL: &str = r"
               e.trigger_digest, e.window_start, e.window_end,
               e.run_id,
               e.sub_principal_id, e.act_principal_id, e.authority, e.attempts,
-              e.max_attempts, e.lease_expires_at, e.cause_trace_id, e.cause_span_id,
-              e.cause_sampled, e.group_id, e.deployment_environment,
+              e.max_attempts, e.lease_expires_at, e.cause_trace_id,
+              e.cause_span_id, e.cause_sampled, e.group_id, e.deployment_environment,
+              e.pull_request, candidate.exhausted,
               GREATEST(0, (EXTRACT(EPOCH FROM statement_timestamp() - candidate.due_at)
                            * 1000)::bigint) AS queue_wait_ms,
               GREATEST(0, (EXTRACT(EPOCH FROM statement_timestamp() - e.created_at)
                            * 1000)::bigint) AS age_ms,
+              GREATEST(0, (EXTRACT(EPOCH FROM e.created_at
+                                              + ($3::bigint * INTERVAL '1 millisecond')
+                                              - statement_timestamp())
+                           * 1000)::bigint) AS remaining_ms,
               (SELECT jsonb_object_agg(f.requirement_id, f.fitted)
                  FROM wyrd.drift_baselines f
                 WHERE f.verifier_uid = e.verifier_card_uid
@@ -469,13 +480,15 @@ const RENEW_LEASES_SQL: &str = r"
 /// Complete a leased execution, or re-apply the same completion idempotently.
 ///
 /// A group execution also keeps its verdict (`$4`) so later group results of
-/// its binding and group can be compared with it. `replayed` is whether the
+/// its binding and group can be compared with it. `$5` records whether a
+/// `pull_request` execution extracted its admitted source. `replayed` is whether the
 /// execution had already completed before this statement, read from the
 /// statement's snapshot of the row.
 const COMPLETE_SQL: &str = r"
     UPDATE wyrd.verifier_executions e
        SET status = 'completed', result_id = $3, error = NULL,
            group_verdict = CASE WHEN e.origin = 'group' THEN $4 END,
+           pr_source_extracted = $5,
            lease_expires_at = NULL, next_attempt_at = NULL,
            settled_at = COALESCE(e.settled_at, statement_timestamp()),
            updated_at = statement_timestamp()
@@ -490,7 +503,8 @@ const COMPLETE_SQL: &str = r"
 /// Complete many leased non-group executions in one round trip through
 /// `wyrd.complete_verifier_executions`, or re-apply the same completions
 /// idempotently, exactly as [`COMPLETE_SQL`] does one: `$1` executions, `$2`
-/// their lease tokens, and `$3` their results, aligned by position. Returns
+/// their lease tokens, `$3` their results, and `$4` whether each extracted
+/// its pull request source, aligned by position. Returns
 /// each applied execution with its binding and frozen Operators; a group
 /// execution, a lost lease, or a different result returns nothing.
 ///
@@ -500,7 +514,7 @@ const COMPLETE_SQL: &str = r"
 /// executions never deadlock.
 const COMPLETE_MANY_SQL: &str = r"
     SELECT execution_id, binding_id, operators
-      FROM wyrd.complete_verifier_executions($1, $2, $3)
+      FROM wyrd.complete_verifier_executions($1, $2, $3, $4)
 ";
 
 /// Insert one Operator dispatch; the (tenant, execution, Operator) key absorbs retries.
@@ -586,11 +600,52 @@ const RELEASE_SQL: &str = r"
      WHERE execution_id = $1 AND lease_token = $2 AND status = 'running'
 ";
 
+/// Cancel one unfinished execution; a settled one is left as it is.
+///
+/// Clearing the lease and leaving `running` fences the worker holding it: every
+/// later write it attempts is fenced on `status = 'running'` and its lease.
+const CANCEL_SQL: &str = r"
+    UPDATE wyrd.verifier_executions
+       SET status = 'cancelled', error = $2, lease_expires_at = NULL,
+           next_attempt_at = NULL, settled_at = statement_timestamp(),
+           updated_at = statement_timestamp()
+     WHERE execution_id = $1 AND status IN ('pending', 'retrying', 'running')
+";
+
+/// Cancel every unfinished execution a principal submitted or accepted.
+const CANCEL_PRINCIPAL_SQL: &str = r"
+    UPDATE wyrd.verifier_executions
+       SET status = 'cancelled', error = $2, lease_expires_at = NULL,
+           next_attempt_at = NULL, settled_at = statement_timestamp(),
+           updated_at = statement_timestamp()
+     WHERE (sub_principal_id = $1 OR act_principal_id = $1)
+       AND status IN ('pending', 'retrying', 'running')
+";
+
+/// Which of principals `$1` are no longer active, read once every listed
+/// principal row is share-locked in a stable order.
+///
+/// The share lock conflicts with the suspension a revocation writes, so it
+/// waits out a revocation in flight and reads its committed status, and a
+/// later revocation waits for the admitting commit and then cancels what it
+/// admitted. An id with no principal row is never inactive.
+const INACTIVE_PRINCIPALS_SQL: &str = r"
+    WITH users AS (
+        SELECT id, status FROM wyrd.auth_users WHERE id = ANY($1) ORDER BY id FOR SHARE
+    ), machines AS (
+        SELECT id, status FROM wyrd.auth_service_accounts
+         WHERE id = ANY($1) ORDER BY id FOR SHARE
+    )
+    SELECT id FROM users WHERE status <> 'active'
+    UNION
+    SELECT id FROM machines WHERE status <> 'active'
+";
+
 /// Read one execution's control-plane status.
 const STATUS_SQL: &str = r"
     SELECT execution_id, status, sub_principal_id, act_principal_id,
            verifier_card_uid, card_uid, result_id, error,
-           group_id, owner_card_uid, deployment_environment
+           group_id, owner_card_uid, deployment_environment, pull_request
       FROM wyrd.verifier_executions
      WHERE execution_id = $1
 ";
@@ -785,6 +840,8 @@ pub enum ExecutionOrigin {
     Manual,
     /// A `group_end` binding's judgment of one pinned group snapshot.
     Group,
+    /// A `pull_request` binding's review of one admitted PR source.
+    PullRequest,
 }
 
 impl ExecutionOrigin {
@@ -795,6 +852,7 @@ impl ExecutionOrigin {
             Self::Schedule => "schedule",
             Self::Manual => "manual",
             Self::Group => "group",
+            Self::PullRequest => "pull_request",
         }
     }
 
@@ -808,6 +866,7 @@ impl ExecutionOrigin {
             "schedule" => Ok(Self::Schedule),
             "manual" => Ok(Self::Manual),
             "group" => Ok(Self::Group),
+            "pull_request" => Ok(Self::PullRequest),
             other => Err(SqlxError::Decode(
                 format!("unknown verifier execution origin {other:?}").into(),
             )),
@@ -833,6 +892,12 @@ pub enum ExecutionInput {
     /// A group snapshot. Its selector lives in the execution's Bifrost input
     /// record; PostgreSQL holds only the snapshot digest.
     Grouped,
+    /// A pull request source admitted for a `pull_request` binding: the
+    /// pins frozen at admission, which every attempt reviews.
+    PullRequest {
+        /// The admitted PR source.
+        pull_request: Box<PullRequestActivation>,
+    },
 }
 
 /// Who one scheduled execution serves, who accepted it, and the authority it
@@ -1030,6 +1095,19 @@ pub enum Admission {
     Scheduled(ScheduledAdmission),
     /// A group snapshot.
     Grouped(GroupedAdmission),
+    /// A reserved pull request execution, activated by
+    /// [`VerifierExecutionQueue::activate_pull_requests`].
+    PullRequest(PullRequestAdmission),
+}
+
+/// One reserved pull request execution whose input record Scribe
+/// acknowledged; everything else was frozen when it was reserved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PullRequestAdmission {
+    /// The reserved execution.
+    pub execution_id: ExecutionId,
+    /// Who it serves and who accepted it.
+    pub attribution: Attribution,
 }
 
 impl Admission {
@@ -1040,6 +1118,7 @@ impl Admission {
             Self::Submitted(submission) => submission.execution_id,
             Self::Scheduled(admission) => admission.execution_id,
             Self::Grouped(admission) => admission.execution_id,
+            Self::PullRequest(admission) => admission.execution_id,
         }
     }
 
@@ -1051,6 +1130,7 @@ impl Admission {
             Self::Submitted(submission) => submission.authority.attribution(),
             Self::Scheduled(admission) => admission.authority.attribution(),
             Self::Grouped(admission) => admission.authority.attribution(),
+            Self::PullRequest(admission) => admission.attribution,
         }
     }
 }
@@ -1446,6 +1526,15 @@ impl PinnedGroup {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LeaseToken(pub(crate) Uuid);
 
+impl LeaseToken {
+    /// The token's value, which identifies this claim as the only writer of
+    /// the execution's recoverable state.
+    #[must_use]
+    pub const fn as_uuid(&self) -> Uuid {
+        self.0
+    }
+}
+
 /// The identity a runner settles a claimed execution with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExecutionLease {
@@ -1469,6 +1558,10 @@ pub struct Completion {
     pub summary: String,
     /// The counts of the Verifier's one drift check, when it has exactly one.
     pub drift: Option<DriftCounts>,
+    /// Whether a `pull_request` execution's pull_request extraction of its
+    /// admitted source succeeded, which makes it eligible as a later
+    /// review's baseline. Always `false` for other origins.
+    pub pr_source_extracted: bool,
 }
 
 /// An execution claimed for running, with every frozen identity the runner needs.
@@ -1482,6 +1575,11 @@ pub struct ClaimedExecution {
     pub attempt: i32,
     /// Attempt budget frozen at admission.
     pub max_attempts: i32,
+    /// Whether the claim took an expired lease of the final attempt, which
+    /// counts no attempt: the claimant only delivers a terminal outcome the
+    /// execution already selected, or settles it as exhausted, and never
+    /// computes.
+    pub exhausted: bool,
     /// Exact Verifier Card UID.
     pub verifier_card_uid: CardUid,
     /// Exact Verifier Card version.
@@ -1517,6 +1615,10 @@ pub struct ClaimedExecution {
     /// statement's PostgreSQL instant less `created_at`. Telemetry, and the
     /// runner's bound on waiting for the execution's input record to publish.
     pub age: std::time::Duration,
+    /// What remains of the execution deadline, its admission plus the
+    /// claim's execution timeout, as of this claim's PostgreSQL instant; zero
+    /// once it has passed. A reclaim never replenishes it.
+    pub remaining: std::time::Duration,
     /// The Verifier's ready fitted Drift baselines keyed by requirement ID,
     /// read in the claim transaction; empty when it has none.
     pub fitted_baselines: BTreeMap<TaskId, Value>,
@@ -1699,7 +1801,9 @@ impl VerifierExecutionQueue {
     /// accepted submission stores its key, digest, optional Run, inputs,
     /// route overrides, cause, and accepted authority on a `pending` row due
     /// at PostgreSQL's statement time. Conflicting and refused rows never
-    /// execute or dispatch. The caller commits.
+    /// execute or dispatch. A row whose subject or accepting actor is no
+    /// longer active is cancelled before the commit, as its revocation does
+    /// (see [`Self::fence_principals`]). The caller commits.
     ///
     /// # Errors
     /// Returns the database error when a lock, read, or insert fails, or an
@@ -1954,6 +2058,43 @@ impl VerifierExecutionQueue {
             )
             .execute(&mut **conn.transaction())
             .await?;
+        self.fence_principals(conn, attributions.iter().copied())
+            .await
+    }
+
+    /// Order admissions just written for `attributions` against principal
+    /// revocation, before the caller commits.
+    ///
+    /// Share-locks every subject and accepting actor through
+    /// [`INACTIVE_PRINCIPALS_SQL`], then cancels the unfinished executions of
+    /// any no longer active, exactly as their revocation does, so a revoked
+    /// principal's delayed admission never commits runnable work. Every
+    /// submitted, scheduled, and group admission calls it after its insert.
+    ///
+    /// # Errors
+    /// Returns the database error when the lock, read, or cancellation fails.
+    async fn fence_principals(
+        &self,
+        conn: &mut TenantConn<'_>,
+        attributions: impl IntoIterator<Item = Attribution>,
+    ) -> Result<(), SqlxError> {
+        let ids: Vec<Uuid> = attributions
+            .into_iter()
+            .flat_map(|attribution| {
+                [
+                    attribution.sub_principal_id.as_uuid(),
+                    attribution.act_principal_id.as_uuid(),
+                ]
+            })
+            .collect();
+        let inactive: Vec<Uuid> = sqlx::query_scalar(INACTIVE_PRINCIPALS_SQL)
+            .bind(&ids)
+            .fetch_all(&mut **conn.transaction())
+            .await?;
+        for principal in inactive {
+            self.cancel_principal(conn, PrincipalId::new(principal))
+                .await?;
+        }
         Ok(())
     }
 
@@ -2000,7 +2141,8 @@ impl VerifierExecutionQueue {
     /// transaction and move its expected cursor.
     ///
     /// Inserts a `pending` execution under the prepared ID and frozen
-    /// identities, due at PostgreSQL's statement time. An occurrence that
+    /// identities, due at PostgreSQL's statement time, then fenced against
+    /// revocation by [`Self::fence_principals`]. An occurrence that
     /// already has an execution, including an earlier admission of this
     /// candidate, returns it as [`EnqueueOutcome::AlreadyEnqueued`]; a binding
     /// deleted since preparation is [`EnqueueRefusal::BindingNotFound`]. The
@@ -2048,6 +2190,7 @@ impl VerifierExecutionQueue {
                 .await?;
             let outcome = match inserted {
                 Some(execution_id) => {
+                    self.fence_principals(conn, [attribution]).await?;
                     EnqueueOutcome::Enqueued(stored(ExecutionId::new(execution_id))?)
                 }
                 None => {
@@ -2549,7 +2692,8 @@ impl VerifierExecutionQueue {
     /// and consume the pending activity it was selected from.
     ///
     /// Inserts a `pending` execution under the prepared ID and frozen
-    /// identities, due at PostgreSQL's statement time. A snapshot the binding
+    /// identities, due at PostgreSQL's statement time, then fenced against
+    /// revocation by [`Self::fence_principals`]. A snapshot the binding
     /// and group already hold, including an earlier admission of this
     /// candidate, returns that execution as
     /// [`EnqueueOutcome::AlreadyEnqueued`]; a binding deleted since
@@ -2599,6 +2743,7 @@ impl VerifierExecutionQueue {
                 .await?;
             let outcome = match inserted {
                 Some(execution_id) => {
+                    self.fence_principals(conn, [attribution]).await?;
                     EnqueueOutcome::Enqueued(stored(ExecutionId::new(execution_id))?)
                 }
                 None => match Self::existing_snapshot(
@@ -2678,14 +2823,18 @@ impl VerifierExecutionQueue {
     /// Claim up to `limit` runnable executions of the caller's tenant, each
     /// under its own fresh lease, in one statement.
     ///
-    /// The statement first settles, as `errored`, every expired lease whose
-    /// attempts are exhausted, so a crash loop cannot exceed the budget. It
-    /// then locks the oldest `pending` or `retrying` executions due at
+    /// The statement locks the oldest `pending` or `retrying` executions due at
     /// PostgreSQL's statement time, or `running` executions whose lease the
     /// database considers expired, with `SKIP LOCKED`; marks each `running`
     /// with its own lease token expiring `lease_for` after that same database
-    /// instant; and counts the attempt. Returns nothing when nothing is
-    /// runnable, and never more than `limit`; the order is unspecified. The
+    /// instant; counts the attempt; and returns what remains of the execution
+    /// deadline, `deadline_for` after its admission, which a reclaim never
+    /// replenishes. An
+    /// expired lease with no attempt left is claimed without counting one,
+    /// as [`ClaimedExecution::exhausted`], so a crash loop cannot exceed the
+    /// budget. Returns
+    /// nothing when nothing is runnable, and never more than `limit`; the
+    /// order is unspecified. The
     /// caller commits before executing. The statement opens no span of its
     /// own: the runner records it on each attempt's `claim` span once the
     /// claimed row names the attempt's cause.
@@ -2697,17 +2846,14 @@ impl VerifierExecutionQueue {
         &self,
         conn: &mut TenantConn<'_>,
         lease_for: Duration,
+        deadline_for: Duration,
         limit: u32,
     ) -> Result<Vec<ClaimedExecution>, SqlxError> {
         timed("claim", async {
-            let exhausted = VerificationError {
-                code: "lease_expired".to_owned(),
-                message: "the execution's lease expired after its final attempt".to_owned(),
-            };
             let rows: Vec<ClaimedRow> = sqlx::query_as(CLAIM_SQL)
-                .bind(Json(&exhausted))
                 .bind(lease_for.num_milliseconds())
                 .bind(i64::from(limit))
+                .bind(deadline_for.num_milliseconds())
                 .fetch_all(&mut **conn.transaction())
                 .await?;
             rows.into_iter().map(ClaimedRow::into_claimed).collect()
@@ -2748,7 +2894,8 @@ impl VerifierExecutionQueue {
         .await
     }
 
-    /// Settle a claimed execution `completed`, pointing at its staged result.
+    /// Settle a claimed execution `completed`, pointing at its staged result,
+    /// and record [`Completion::pr_source_extracted`] in the same statement.
     ///
     /// Only the current lease holder can complete; re-completing with the
     /// same token and result is an idempotent [`Settlement::Applied`]. For a
@@ -2776,16 +2923,20 @@ impl VerifierExecutionQueue {
     /// # Errors
     /// Returns the database error when a statement fails, or a decode error
     /// when the frozen Operators are malformed.
-    #[tracing::instrument(skip(self, conn), fields(operation = "verification.executions.complete", execution_id = %lease.execution_id))]
+    #[tracing::instrument(skip(self, conn), fields(operation = "verification.executions.complete", execution_id = %completion.lease.execution_id))]
     pub async fn complete(
         &self,
         conn: &mut TenantConn<'_>,
-        lease: ExecutionLease,
-        result_id: VerificationResultId,
-        verdict: VerificationVerdict,
-        summary: &str,
-        drift: Option<DriftCounts>,
+        completion: &Completion,
     ) -> Result<Settlement, SqlxError> {
+        let Completion {
+            lease,
+            result_id,
+            verdict,
+            ref summary,
+            drift,
+            pr_source_extracted,
+        } = *completion;
         timed("complete", async {
             let verdict_text: &'static str = verdict.into();
             sqlx::query(LOCK_GROUP_BINDING_SQL)
@@ -2797,6 +2948,7 @@ impl VerifierExecutionQueue {
                 .bind(lease.token.0)
                 .bind(result_id.as_uuid())
                 .bind(verdict_text)
+                .bind(pr_source_extracted)
                 .fetch_optional(&mut **conn.transaction())
                 .await?;
             let Some((binding_id, Json(operators), grouped, replayed)) = settled else {
@@ -2858,20 +3010,20 @@ impl VerifierExecutionQueue {
     ) -> Result<Vec<Settlement>, SqlxError> {
         let applied: Vec<(Uuid, Option<Uuid>, Json<Vec<FrozenTarget>>)> =
             timed("complete_many", async {
-                let (executions, (tokens, results)): (Vec<Uuid>, (Vec<Uuid>, Vec<Uuid>)) =
-                    completions
-                        .iter()
-                        .map(|c| {
-                            (
-                                c.lease.execution_id.as_uuid(),
-                                (c.lease.token.0, c.result_id.as_uuid()),
-                            )
-                        })
-                        .unzip();
+                let executions: Vec<Uuid> = completions
+                    .iter()
+                    .map(|c| c.lease.execution_id.as_uuid())
+                    .collect();
+                let tokens: Vec<Uuid> = completions.iter().map(|c| c.lease.token.0).collect();
+                let results: Vec<Uuid> =
+                    completions.iter().map(|c| c.result_id.as_uuid()).collect();
+                let extracted: Vec<bool> =
+                    completions.iter().map(|c| c.pr_source_extracted).collect();
                 sqlx::query_as(COMPLETE_MANY_SQL)
                     .bind(executions)
                     .bind(tokens)
                     .bind(results)
+                    .bind(extracted)
                     .fetch_all(&mut **conn.transaction())
                     .await
             })
@@ -2898,10 +3050,7 @@ impl VerifierExecutionQueue {
                     }
                     Settlement::Applied
                 }
-                None => {
-                    self.complete(conn, c.lease, c.result_id, c.verdict, &c.summary, c.drift)
-                        .await?
-                }
+                None => self.complete(conn, c).await?,
             };
             settlements.push(settlement);
         }
@@ -3008,6 +3157,72 @@ impl VerifierExecutionQueue {
         .await
     }
 
+    /// Cancel `execution` if it is still unfinished.
+    ///
+    /// The execution settles `cancelled` with no result and keeps its
+    /// recorded state. A worker holding its lease is fenced: its renewal and
+    /// settlement report [`Settlement::StaleLease`]. Cancelling a running
+    /// execution notifies `wyrd_verification_cancelled` on commit, so the
+    /// holder renews and stops at once. Cancelling a settled or unknown
+    /// execution writes nothing,
+    /// so repeating a cancel is harmless.
+    /// Returns whether this call cancelled it. The caller authorizes first
+    /// and commits.
+    ///
+    /// # Errors
+    /// Returns the database error when the update fails.
+    #[tracing::instrument(skip(self, conn), fields(operation = "verification.executions.cancel", execution_id = %execution))]
+    pub async fn cancel(
+        &self,
+        conn: &mut TenantConn<'_>,
+        execution: ExecutionId,
+    ) -> Result<bool, SqlxError> {
+        timed("cancel", async {
+            let error = VerificationError {
+                code: "cancelled".to_owned(),
+                message: "the execution was cancelled".to_owned(),
+            };
+            let result = sqlx::query(CANCEL_SQL)
+                .bind(execution.as_uuid())
+                .bind(Json(&error))
+                .execute(&mut **conn.transaction())
+                .await?;
+            Ok(result.rows_affected() > 0)
+        })
+        .await
+    }
+
+    /// Cancel every unfinished execution `principal` is the subject or the
+    /// accepting actor of, because its authority was revoked.
+    ///
+    /// Runs on the revocation's own connection so the suspension and the
+    /// cancellations commit together; each settles `cancelled` with the
+    /// `principal_revoked` code and fences its worker as [`Self::cancel`]
+    /// does. Returns how many executions were cancelled.
+    ///
+    /// # Errors
+    /// Returns the database error when the update fails.
+    #[tracing::instrument(skip(self, conn), fields(operation = "verification.executions.cancel_principal", principal_id = %principal))]
+    pub async fn cancel_principal(
+        &self,
+        conn: &mut TenantConn<'_>,
+        principal: PrincipalId,
+    ) -> Result<u64, SqlxError> {
+        timed("cancel_principal", async {
+            let error = VerificationError {
+                code: "principal_revoked".to_owned(),
+                message: "the principal the execution acts for was revoked".to_owned(),
+            };
+            let result = sqlx::query(CANCEL_PRINCIPAL_SQL)
+                .bind(principal.as_uuid())
+                .bind(Json(&error))
+                .execute(&mut **conn.transaction())
+                .await?;
+            Ok(result.rows_affected())
+        })
+        .await
+    }
+
     /// Read one execution's status projection.
     ///
     /// Returns execution status, the last error, every dispatch's delivery
@@ -3054,6 +3269,10 @@ impl VerifierExecutionQueue {
                         .map(|uid| stored(CardUid::from_uuid(uid)))
                         .transpose()?,
                     group: None,
+                    pull_request: row.pull_request.map(|Json(pull_request)| pull_request),
+                    waiting: std::collections::BTreeSet::new(),
+                    approvals: Vec::new(),
+                    github_delivery: None,
                 },
                 attribution: Attribution::new(
                     PrincipalId::new(row.sub_principal_id),
@@ -3377,6 +3596,8 @@ struct ClaimedRow {
     attempts: i32,
     /// Attempt budget.
     max_attempts: i32,
+    /// Whether this claim took an expired final attempt.
+    exhausted: bool,
     /// Lease expiry.
     lease_expires_at: DateTime<Utc>,
     /// Submitting request's trace id, 16 bytes.
@@ -3389,12 +3610,63 @@ struct ClaimedRow {
     group_id: Option<String>,
     /// Accepted deployment environment tag.
     deployment_environment: Option<String>,
+    /// Admitted pull request pins of a `pull_request` execution.
+    pull_request: Option<Json<PullRequestActivation>>,
     /// Milliseconds the execution was claimable before this claim.
     queue_wait_ms: i64,
     /// Milliseconds since the execution was admitted.
     age_ms: i64,
+    /// Milliseconds left before the execution deadline.
+    remaining_ms: i64,
     /// The Verifier's ready fitted baselines by requirement; `None` when none.
     fitted_baselines: Option<Json<BTreeMap<TaskId, Value>>>,
+}
+
+/// The single frozen input of an execution of `origin` with a scheduled
+/// window `start`..`end`, a submitted `run_id`, or admitted `pull_request`
+/// pins.
+///
+/// # Errors
+/// Returns [`SqlxError::Decode`] when the columns violate their closed shape.
+fn frozen_input(
+    origin: ExecutionOrigin,
+    start: Option<DateTime<Utc>>,
+    end: Option<DateTime<Utc>>,
+    run_id: Option<String>,
+    pull_request: Option<Json<PullRequestActivation>>,
+) -> Result<ExecutionInput, SqlxError> {
+    if let (ExecutionOrigin::PullRequest, Some(Json(pull_request))) = (origin, pull_request) {
+        return Ok(ExecutionInput::PullRequest {
+            pull_request: Box::new(pull_request),
+        });
+    }
+    match (origin, start, end) {
+        (ExecutionOrigin::Schedule, Some(start), Some(end)) => Ok(ExecutionInput::Scheduled {
+            window: DriftWindow { start, end },
+        }),
+        (ExecutionOrigin::Group, None, None) => Ok(ExecutionInput::Grouped),
+        (ExecutionOrigin::Manual, None, None) => Ok(ExecutionInput::Submitted {
+            run_id: run_id.map(RunId::from_string),
+        }),
+        _ => Err(SqlxError::Decode(
+            "verifier execution has no single frozen input".into(),
+        )),
+    }
+}
+
+/// The effective Trigger a stored Card UID or inline digest names.
+///
+/// # Errors
+/// Returns [`SqlxError::Decode`] when the UID is not a Card UID.
+fn frozen_trigger(
+    uid: Option<Uuid>,
+    digest: Option<String>,
+) -> Result<Option<FrozenTarget>, SqlxError> {
+    Ok(match (uid, digest) {
+        (Some(uid), _) => Some(FrozenTarget::Uid(stored(CardUid::from_uuid(uid))?)),
+        (None, Some(digest)) => Some(FrozenTarget::Digest(digest)),
+        (None, None) => None,
+    })
 }
 
 impl ClaimedRow {
@@ -3406,25 +3678,14 @@ impl ClaimedRow {
     /// negative.
     fn into_claimed(self) -> Result<ClaimedExecution, SqlxError> {
         let origin = ExecutionOrigin::parse(&self.origin)?;
-        let input = match (origin, self.window_start, self.window_end) {
-            (ExecutionOrigin::Schedule, Some(start), Some(end)) => ExecutionInput::Scheduled {
-                window: DriftWindow { start, end },
-            },
-            (ExecutionOrigin::Group, None, None) => ExecutionInput::Grouped,
-            (ExecutionOrigin::Manual, None, None) => ExecutionInput::Submitted {
-                run_id: self.run_id.map(RunId::from_string),
-            },
-            _ => {
-                return Err(SqlxError::Decode(
-                    "verifier execution has no single frozen input".into(),
-                ));
-            }
-        };
-        let trigger = match (self.trigger_uid, self.trigger_digest) {
-            (Some(uid), _) => Some(FrozenTarget::Uid(stored(CardUid::from_uuid(uid))?)),
-            (None, Some(digest)) => Some(FrozenTarget::Digest(digest)),
-            (None, None) => None,
-        };
+        let input = frozen_input(
+            origin,
+            self.window_start,
+            self.window_end,
+            self.run_id,
+            self.pull_request,
+        )?;
+        let trigger = frozen_trigger(self.trigger_uid, self.trigger_digest)?;
         Ok(ClaimedExecution {
             lease: ExecutionLease {
                 execution_id: stored(ExecutionId::new(self.execution_id))?,
@@ -3433,6 +3694,7 @@ impl ClaimedRow {
             lease_expires_at: self.lease_expires_at,
             attempt: self.attempts,
             max_attempts: self.max_attempts,
+            exhausted: self.exhausted,
             verifier_card_uid: stored(CardUid::from_uuid(self.verifier_card_uid))?,
             verifier_version: self.verifier_version,
             card_uid: stored(CardUid::from_uuid(self.card_uid))?,
@@ -3468,6 +3730,7 @@ impl ClaimedRow {
                 self.queue_wait_ms,
             ))?),
             age: std::time::Duration::from_millis(stored(u64::try_from(self.age_ms))?),
+            remaining: std::time::Duration::from_millis(stored(u64::try_from(self.remaining_ms))?),
             fitted_baselines: self
                 .fitted_baselines
                 .map(|Json(fitted)| fitted)
@@ -3525,6 +3788,8 @@ struct StatusRow {
     owner_card_uid: Option<Uuid>,
     /// Deployment environment tag supplied at acceptance.
     deployment_environment: Option<String>,
+    /// Admitted pull request pins of a `pull_request` execution.
+    pull_request: Option<Json<PullRequestActivation>>,
 }
 
 /// A dispatch row from [`DISPATCHES_SQL`].
@@ -3875,7 +4140,10 @@ mod pg_tests {
         for (node, index) in execution_reads(&plan) {
             assert!(
                 (node == "Index Only Scan" || node == "Index Scan")
-                    && (index == "verifier_runs_due" || index == "verifier_runs_leased"),
+                    && matches!(
+                        index.as_str(),
+                        Some("verifier_runs_due" | "verifier_runs_leased")
+                    ),
                 "{node} via {index} in {plan}"
             );
         }

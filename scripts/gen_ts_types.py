@@ -41,6 +41,7 @@ SUPPORTED_KINDS = [
     "Verifier",
     "Trigger",
     "Operator",
+    "Repository",
 ]
 
 # Bundle roots, by Rust type name, whose wire contracts the SDK exposes. Each
@@ -83,13 +84,25 @@ WIRE_ROOTS = [
     "ProviderCredentialView",
     "ProviderDeployment",
     # Verification and Operator connections.
+    "CancelExecutionResponse",
     "CreateOperatorConnectionRequest",
+    "DownloadInitResponse",
+    "ExecutionPageQuery",
+    "InvocationPage",
+    "Publication",
+    "PublicationPage",
+    "PublicationSelector",
     "OperatorConnectionView",
+    "GithubConnectResponse",
+    "GithubConnectionView",
     "UpdateOperatorConnectionRequest",
     "ExecutionPlan",
     "VerificationDetails",
     "VerificationExecutionState",
     "VerificationResult",
+    "PublishEvidenceResponse",
+    "ApprovalDecision",
+    "ApprovalReceipt",
 ]
 
 # Wire roots the SDK sends. Every definition reachable from one of these or
@@ -100,12 +113,14 @@ REQUEST_ROOTS = {
     "CreateOperatorConnectionRequest",
     "CreateServicePrincipalRequest",
     "CredentialListQuery",
+    "ExecutionPageQuery",
     "GatewayCapturePolicyWrite",
     "GatewayFallbackPolicy",
     "GatewayGovernancePolicy",
     "ListCardsRequest",
     "PrincipalQuery",
     "ProviderDeployment",
+    "PublicationSelector",
     "RevokePrincipalRequest",
     "UpdateOperatorConnectionRequest",
 }

@@ -53,6 +53,8 @@ chrono = { workspace = true }
 wyrd-auth-verify = { workspace = true }
 # The journeys run the in-process CLI commands, `wyrd_ai::cli`.
 wyrd-ai = { path = ".", features = ["otel", "testing"] }
+# Encodes a publication manifest's digest as a download plan carries it.
+base64 = { workspace = true }
 # Reads the Arrow batches a streamed Bifrost query yields.
 arrow = { workspace = true }
 # The stock OpenTelemetry exporter the OTLP export story configures from

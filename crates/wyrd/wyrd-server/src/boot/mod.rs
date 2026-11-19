@@ -61,6 +61,7 @@ use crate::auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
 use crate::boot::data_root::{BifrostDataRoot, BifrostDataRootError};
 use crate::components::auth::ServerAuth;
 use crate::components::gateway::Gateway;
+use crate::components::github::review_cache::{CodeReviewMetadata, CodeReviewObjects};
 use crate::components::health::Health;
 use crate::components::operators::keys::{KeyError, KeyFailure, OperatorKeys};
 use crate::config::{BifrostRuntimeRole, WorkloadBindingEntry, WyrdServerConfig};
@@ -72,7 +73,7 @@ use crate::state::{
     Scribe, ScribeCoordinationRuntime, ServerSettings,
 };
 use crate::verification::hosted::blocks::HostedBlocks;
-use crate::verification::{RuntimeLimits, Verification, VerificationRuntime};
+use crate::verification::{Verification, VerificationRuntime};
 
 /// Cadence of the leader's Forge maintenance timer when `[forge]` sets no
 /// `maintenance_interval_secs`; [`resolve_forge_config`] applies it.
@@ -130,6 +131,9 @@ pub enum ServerBootError {
     /// and failure class.
     #[error("Operator connection keys are unavailable: {0}")]
     OperatorKeys(#[from] KeyError),
+    /// The GitHub App configuration is invalid.
+    #[error(transparent)]
+    Github(#[from] crate::config::ConfigError),
     /// Pool construction, schema readiness, or a SQL operation failed.
     #[error(transparent)]
     Sql(#[from] wyrd_sql::error::SqlError),
@@ -330,7 +334,7 @@ async fn build_bifrost_external_dependencies(
     dsns: &ResolvedDsns,
     config: &crate::config::BifrostRuntimeConfig,
     forge: &ForgeRuntimeConfig,
-    target: crate::config::BifrostTarget,
+    target: crate::config::ServerTarget,
 ) -> Result<BifrostExternalDependencies, ServerBootError> {
     let data_root = BifrostDataRoot::prepare(config.data_dir())?;
     let postgres = Arc::new(ServerPostgres::connect_from_dsns(dsns).await?);
@@ -534,6 +538,24 @@ pub async fn compose_bifrost(
         .map_err(Box::new)?;
     let scribe_config = bifrost_config.scribe;
     let resource_plan = bifrost_resources.plan();
+    for (resource, value) in [
+        ("effective_cpu", resource_plan.effective_cpu as f64),
+        (
+            "memory_limit_bytes",
+            resource_plan.memory_limit_bytes as f64,
+        ),
+        (
+            "managed_memory_bytes",
+            resource_plan.managed_memory_bytes as f64,
+        ),
+        (
+            "scratch_limit_bytes",
+            resource_plan.scratch_limit_bytes as f64,
+        ),
+    ] {
+        metrics::gauge!(crate::app::metrics::PROCESS_RESOURCE_PLAN, "resource" => resource)
+            .set(value);
+    }
     let scribe_workers = resource_plan.scribe_workers;
     let pod_memory_limit = resource_plan.managed_memory_bytes;
     if roles.contains(&BifrostRuntimeRole::Scribe) {
@@ -919,7 +941,8 @@ pub async fn compose_bifrost(
     // The one process Scribe outbox: Gate, Oracle, peer security, every
     // request-path decision, gateway capture, and Verifier results stage on
     // it. It submits to the local Scribe, else to a peer Scribe, in frames
-    // that fit the configured Scribe request ceiling.
+    // that fit the configured Scribe request ceiling, and charges what it
+    // holds to the process memory ledger.
     let scribe_outbox = crate::scribe_outbox::ScribeSink::bounded_outbox(
         crate::scribe_outbox::ScribeRoute::select(
             scribe.as_ref().map(|parts| &parts.scribe),
@@ -933,6 +956,7 @@ pub async fn compose_bifrost(
             bytes: scribe_config.outbox_bytes,
         },
         Some(postgres.wyrd().clone()),
+        Some(bifrost_resources.process().memory()),
     );
     let scribe = if let Some(parts) = scribe {
         let fragment_security_audit = Arc::new(
@@ -1194,6 +1218,10 @@ pub struct StartInputs {
     /// The `wyrd-server` executable the hosted Python sandbox spawns as its
     /// worker.
     pub worker: PathBuf,
+    /// Reads this process's allocator commitment for the pressure sampler;
+    /// only the binary owning the global allocator can supply it, and an
+    /// embedder that cannot returns zero.
+    pub parent_committed: fn() -> u64,
     /// Deterministic Bifrost controls of a test server.
     #[cfg(feature = "test-support")]
     pub bifrost_test_controls: Option<crate::state::BifrostTestControls>,
@@ -1206,14 +1234,17 @@ impl StartInputs {
     /// The production inputs for `config`: dependencies from the
     /// environment's DSNs and storage settings, the configured key material,
     /// default auth settings and RBAC, and this executable as the sandbox
-    /// worker.
+    /// worker, whose allocator commitment `parent_committed` reads.
     ///
     /// # Errors
     /// Returns [`ServerBootError`] when the database URLs, storage, catalog,
     /// resource detection, data root, sealing or signing key, or peer TLS
     /// bundle is invalid or unavailable, or this executable's path is not
     /// available.
-    pub async fn production(config: &WyrdServerConfig) -> Result<Self, ServerBootError> {
+    pub async fn production(
+        config: &WyrdServerConfig,
+        parent_committed: fn() -> u64,
+    ) -> Result<Self, ServerBootError> {
         let dsns = ResolvedDsns::from_env()?;
         let dependencies =
             build_bifrost_external_dependencies(&dsns, &config.bifrost, &config.forge, config.role)
@@ -1231,6 +1262,7 @@ impl StartInputs {
                     "cannot locate this executable: {error}"
                 ))
             })?,
+            parent_committed,
             #[cfg(feature = "test-support")]
             bifrost_test_controls: None,
             #[cfg(feature = "test-support")]
@@ -1269,6 +1301,7 @@ impl AppState {
             permission_check,
             peer_tls,
             worker,
+            parent_committed,
             #[cfg(feature = "test-support")]
             bifrost_test_controls,
             #[cfg(feature = "test-support")]
@@ -1292,6 +1325,7 @@ impl AppState {
         if test_hooks.omit_token_verifier {
             auth.token_verifier = None;
         }
+        let process = dependencies.resources.process();
         let crate::state::ComposedBifrost {
             bifrost,
             coordination_runtime,
@@ -1330,11 +1364,16 @@ impl AppState {
                 config.deployment_profile,
                 sealing_key.clone(),
             )?;
-            let blocks = if config.verification.enabled && config.role.serves_api() {
+            let blocks = if config.verification.enabled && config.role.serves_verifiers() {
                 Some(
-                    HostedBlocks::start(worker, config.verification.limits)
-                        .await
-                        .map_err(|error| ServerBootError::VerificationBlocks(error.to_string()))?,
+                    HostedBlocks::start(
+                        worker,
+                        config.verification.limits,
+                        &process,
+                        data_root.verification_scratch().to_path_buf(),
+                    )
+                    .await
+                    .map_err(|error| ServerBootError::VerificationBlocks(error.to_string()))?,
                 )
             } else {
                 None
@@ -1343,10 +1382,22 @@ impl AppState {
                 dependencies.postgres.wyrd().clone(),
                 blocks,
                 OperatorKeys::for_role(config.role, &config.verification.operator_keys)?,
+                config.verification.runtime.execution_timeout,
             );
-            Ok::<_, ServerBootError>((gateway, verification))
+            let github = config
+                .github
+                .resolve(config.deployment_profile.is_production())?
+                .map(|settings| {
+                    Arc::new(crate::components::github::GithubApp::new(
+                        settings,
+                        config.deployment_profile.screened_http(),
+                        CodeReviewObjects::new(Arc::clone(&dependencies.storage)),
+                        CodeReviewMetadata::new(Arc::clone(&dependencies.postgres)),
+                    ))
+                });
+            Ok::<_, ServerBootError>((gateway, verification, github))
         };
-        let (gateway, verification) = match owners.await {
+        let (gateway, verification, github) = match owners.await {
             Ok(owners) => owners,
             Err(error) => {
                 rollback_roles(&bifrost).await;
@@ -1364,8 +1415,10 @@ impl AppState {
             bifrost,
             auth,
             gateway,
+            resources: process.clone(),
             verification,
             mcp: Mcp::default(),
+            github,
             health: Health::default(),
             shutdown_token: shutdown,
             #[cfg(feature = "test-support")]
@@ -1375,7 +1428,16 @@ impl AppState {
             rollback_roles(&state.bifrost).await;
             return Err(error);
         }
-        let workers = state.engine_workers(config);
+        let mut workers = state.engine_workers(config);
+        let workloads = state.resources.workloads().clone();
+        let stop = state.shutdown_token.clone();
+        workers.push((
+            "process_pressure",
+            Box::pin(async move {
+                stop.run_until_cancelled(workloads.sample_every(parent_committed))
+                    .await;
+            }),
+        ));
         Ok(BootedServer {
             state,
             coordination_runtime,
@@ -1405,8 +1467,9 @@ impl AppState {
 
     /// The engine-owned background work this process runs until shutdown:
     /// each owner's cache invalidation listener where its cache serves, and
-    /// the verification runtime of an API-serving process with verification
-    /// enabled, its drain grace clipped inside the server's shutdown budget.
+    /// the queued verification runtime of a target that runs queued work with
+    /// verification enabled, its drain grace clipped inside the server's
+    /// shutdown budget. A `direct` target never claims queued executions.
     fn engine_workers(&self, config: &WyrdServerConfig) -> Vec<EngineWorker> {
         let postgres = self.postgres.wyrd();
         let shutdown = &self.shutdown_token;
@@ -1425,10 +1488,13 @@ impl AppState {
         #[cfg(not(feature = "test-support"))]
         let held = false;
         if config.verification.enabled
+            && config.role.runs_queued()
             && !held
             && let Some(runtime) = VerificationRuntime::builder(self)
                 .limits(
-                    RuntimeLimits::default()
+                    config
+                        .verification
+                        .runtime
                         .within_server_drain(Duration::from_millis(config.shutdown.drain_ms)),
                 )
                 .build()
@@ -1677,7 +1743,7 @@ struct OracleRoleBuilder<'a> {
     /// Validated Bifrost configuration borrowed for this activation.
     config: &'a crate::config::BifrostRuntimeConfig,
     /// Closed process target controlling Oracle selection.
-    target: crate::config::BifrostTarget,
+    target: crate::config::ServerTarget,
     /// Deployment posture used for remote TLS validation.
     deployment_profile: crate::config::DeploymentProfile,
     /// Cluster registry owning the role fence and readiness publication.
@@ -2595,18 +2661,19 @@ pub(crate) mod pg_tests {
     /// Panics when the shared boot helper duplicates Gate, catalog, peer, or tail owners.
     #[test]
     fn production_and_test_server_share_bifrost_composition() {
-        use crate::config::{BifrostRoles, BifrostRuntimeRole as Role, BifrostTarget};
+        use crate::config::{BifrostRoles, BifrostRuntimeRole as Role, ServerTarget};
 
         let cases = [
+            (ServerTarget::Direct, vec![Role::Scribe, Role::Oracle]),
+            (ServerTarget::Worker, vec![Role::Scribe, Role::Oracle]),
+            (ServerTarget::BifrostQuery, vec![Role::Oracle]),
+            (ServerTarget::BifrostIngest, vec![Role::Scribe]),
             (
-                BifrostTarget::Server,
-                vec![Role::Scribe, Role::ForgeCoordinator, Role::Oracle],
+                ServerTarget::BifrostMaintenance,
+                vec![Role::ForgeCoordinator, Role::ForgeWorker],
             ),
-            (BifrostTarget::Oracle, vec![Role::Oracle]),
-            (BifrostTarget::Scribe, vec![Role::Scribe]),
-            (BifrostTarget::ForgeWorker, vec![Role::ForgeWorker]),
             (
-                BifrostTarget::All,
+                ServerTarget::Combined,
                 vec![
                     Role::Scribe,
                     Role::ForgeCoordinator,

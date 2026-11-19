@@ -10,10 +10,18 @@ mod action_timeline;
 /// Cards authored in code: two components, each verified by its own Verifier.
 mod authoring;
 mod declare_and_pull;
+/// CI publishes a deferred input; the waiting pull request execution resumes.
+mod deferred_evidence;
+/// Queued work, acknowledged only once durably admitted.
+mod durable_verifier_work;
 mod gateway_admin;
 mod gateway_inference;
 /// TypeSafe Jev through the Gateway, natively and through Chat Completions.
 mod gateway_jev;
+/// The tenant GitHub App connection, through the SDK and a browser.
+mod github_connection;
+/// Agents write private scratch and publish it for the steps that read it.
+mod hosted_agent_tools;
 /// The admin-key local workflow, start to finish, without a publication flush.
 mod local_development;
 mod observe_a_run;
@@ -24,6 +32,8 @@ mod principal_roles;
 mod query_bifrost;
 /// Common analytical SQL over part-published, part-live tables.
 mod query_coverage;
+/// A connected repository's review policy, declared and selected.
+mod repository_declaration;
 mod saved_user_auth;
 mod scheduled_drift_alerts_operator;
 /// Every handle's `connect` forms against a real server.
@@ -33,6 +43,10 @@ mod signed_in_development;
 mod support;
 /// The canonical support desk, from the checked-in example.
 mod support_desk;
+/// Hosted verification under contended process memory and its deadline.
+mod verification_capacity;
 /// Every Verifier action and Run check kind, and every extractable format.
 mod verifier_building_blocks;
+/// Verifier steps fan out, branch, repeat, and speculate over real Agents.
+mod verifier_orchestration;
 mod verify_in_real_time;

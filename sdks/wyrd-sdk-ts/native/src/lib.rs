@@ -1,15 +1,19 @@
 //! Thin napi projection of the Rust-owned `wyrd_client` capabilities:
 //! the shared client, Bifrost, Cards, Verification, Operator connections,
-//! Gateway administration, offline `WyrdState`, and the in-process `wyrd`
-//! CLI commands.
+//! the GitHub connection, Gateway administration, offline `WyrdState`, and
+//! the in-process `wyrd` CLI commands.
 
 #![deny(missing_docs)]
 
 pub mod authoring;
+#[cfg(feature = "bench")]
+pub mod benchmark;
 pub mod cards;
 pub mod cli;
 pub mod client;
 pub mod gateway;
+/// napi projection of the tenant GitHub connection handle.
+pub mod github;
 pub mod operators;
 /// The napi projection of the tenant principal handle.
 pub mod principals;

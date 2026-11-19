@@ -555,6 +555,8 @@ fn failing_script(runs: usize) -> EngineScript {
             result: RequirementResult {
                 id: TaskId::new("drift").expect("task id"),
                 step: None,
+                item_index: None,
+                iteration_index: None,
                 statement: "The window does not drift.".to_owned(),
                 outcome: RequirementOutcome::Failed,
                 reason: "latency drifted".to_owned(),
@@ -570,6 +572,7 @@ fn failing_script(runs: usize) -> EngineScript {
             }))
             .expect("drift check decodes"),
             provenance: None,
+            tool_calls: Vec::new(),
         }],
         steps: Vec::new(),
         evidence: BTreeMap::new(),
@@ -1800,21 +1803,27 @@ async fn verifiers_progress_while_operator_deliveries_are_capped() {
         .fetch_one(&delivery.assertion)
         .await
         .expect("quiet dispatch reads");
-        if (busy_runs, busy_dispatches, quiet_runs, quiet_delivered) == (6, 4, 2, 1) {
+        // A claimed run recovers its execution state before its engine
+        // starts, so every run having started is polled, not assumed.
+        let entered = script.entered();
+        if (
+            busy_runs,
+            busy_dispatches,
+            quiet_runs,
+            quiet_delivered,
+            entered,
+        ) == (6, 4, 2, 1, 10)
+        {
             break;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "pools never saturated with the quiet tenant delivered: busy \
-             {busy_runs}/{busy_dispatches}, quiet {quiet_runs}, delivered {quiet_delivered}"
+            "pools never saturated with the quiet tenant delivered and every \
+             Verifier run started: busy {busy_runs}/{busy_dispatches}, quiet \
+             {quiet_runs}, delivered {quiet_delivered}, started {entered} of 10"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert_eq!(
-        script.entered(),
-        2 + 6 + 2,
-        "all Verifier runs started while Operator deliveries remained capped"
-    );
 
     script.release();
     for (seed, run) in held {

@@ -1,0 +1,428 @@
+---
+id: TASK-012
+status: proposed
+approved_spec_revision: 13
+requirements: [REQ-015, REQ-016, REQ-017, REQ-018]
+acceptance: [AC-010, AC-011, AC-012, AC-014]
+invariants: [INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, INV-007]
+depends_on: []
+---
+
+# Integrate code mode without losing dynamic pipelines
+
+Allocation follow-up: the maintainer requested
+[TASK-012-R1-allocation](012-R1-allocation.md) after this composed implementation
+and before TASK-013. It owns the agreed workload-manager amendment and its own
+functional/L1 proof. This task's port scope, historical evidence and no-benchmark
+boundary are unchanged.
+
+A developer can use generated Python to gather evidence through declared tools
+inside B's existing dynamic Verifier pipelines. Steps, fanout, repeats,
+speculation, approvals, deferred inputs, queued recovery and GitHub delivery
+keep their behavior. The port also supplies the shared resource ledger, reusable
+workers and workspaces, streamed evidence, throughput fixes, instrumentation,
+three-language benchmark consumed by TASK-013 and TASK-014.
+
+## Authority, inputs and integration choice
+
+This task derives from approved GitHub pipeline spec revision 13 and contracts,
+code-mode spec revision 9 as amended by pipeline revisions 12 and 13, and the settled
+maintainer directions recorded in TASK-013 and TASK-014. Revision 12 decides
+nested exclusions, crates.io Monty, capacity isolation, recovery spend and the
+contributor-contract reconciliation. The original directions replaced A's
+200-tenant requirement with 100 tenants; the task correction below updates its
+proof and downstream ownership. Revision 13 replaces revision 12's capacity
+isolation with deployment
+targets ([decision](../design/approved-deployment-targets.md)). Reconcile those contracts at their owners before affected
+implementation. The present planning handoff changes only tasks and their index.
+
+Inputs are B at `fa7c86dba8c3148a9621248dac94a7353ead24c8`, A at
+`0eb5ccdd9ac0b7b35fa4d4f3c6afd8e091a176f0` (`change/verifier-code-mode`), and
+merge base `11474b4a9aa95499c3fbd3a69393ff7590a5b245`. Revalidate identities
+before execution; record any maintainer-selected successor, never silently
+change the imported range. Read A's tracked packet through the pinned tree, at
+`changes/active/verifier-code-mode/`: `spec.md`, `design/notes.md`,
+`design/capacity-diagnosis.md`, TASK-001/002 and TASK-003/R1/R3 task files,
+their cited review evidence and `spec-revisions/`. Read with `git show
+change/verifier-code-mode:<path>` after confirming that ref still matches the
+pinned A commit; otherwise read the pinned commit directly. B's applicable
+supplements are `design/approved-nonblocking-execution.md`,
+`design/task-010-benchmark-remediation.md`, and its runtime, extraction,
+deferred-input and report-delivery agreements.
+
+Use a **staged port of A's committed delta from the merge base into B's
+owners**. B contains the larger orchestration workflow; reviewable,
+owner-by-owner composition makes preservation explicit and avoids installing A's
+incompatible capacity policy as an intermediate accepted implementation. This
+costs a source-to-port coverage record instead of recording A as a merge parent.
+Retain source commit identities and account for every A-only change as carried,
+adapted or excluded with an authoritative reason. Do not cherry-pick shared
+resource-scaling ancestry again or port only a chosen subset of A's runtime. Git
+scheduling and commits remain maintainer-owned; this task authorizes no staging,
+commits, checkout, reset, stash, merge or push.
+
+The integration inventory and verification recipe are in
+`/home/thorrester/Documents/GitHub/wyrd-worktrees/verifier-code-mode/target/codex-merge-plan.md`,
+sections 2–7. Resolve all 37 listed textual paths, inspect the 38 shared
+textually clean files and all 17 semantic conflicts; textual cleanliness is not
+acceptance. Its reserved-decisions section is superseded by the decisions above.
+Use its file table as a coverage inventory, not an instruction to replace whole
+files. Preserve the local modified task index and untracked TASK-011 exactly
+apart from separately authorized index additions. Exclude A's untracked
+payload-sizing packet and unrelated software-factory work.
+
+## Task correction — isolation proof split (2026-11-16)
+
+The maintainer requested this planning correction under approved revision 15;
+it changes downstream proof placement, not TASK-012's port or recorded verdicts.
+The existing L2 `competing` run already exercises direct and queued traffic on
+one `combined` server. TASK-013 adds only its same-rate direct-only control,
+standard comparison output and full clean L2 baseline, preserving the existing
+L1 direct-only baseline. Its deterministic Postgres integration test owns
+100-tenant first-round fairness, completion, empty queued/leased state and return
+to the starting process memory charge. TASK-014 consumes those outputs and owns
+direct-throughput optimization and post-optimization L1/L2 qualification;
+long-run memory plateau remains an L2 observation.
+
+The earlier assignments of sustained 100-tenant qualification and a two-real-
+process repeat to TASK-014 are superseded. Existing shared-Postgres replica
+claiming is the integration proof cited with its focused command in TASK-013/014.
+See [port record](../design/code-mode-port.md#isolation-proof-and-throughput-qualification)
+for inherited row dispositions. This correction does not grant PASS to any
+inherited row and adds no benchmark or implementation work to TASK-012.
+
+## Existing owners and required composition
+
+Extend the complete existing workflows, rather than introduce another engine,
+dispatcher, persistence service or resource authority:
+
+- `vala-verify/src/blocks/{engine,agent,tools}.rs` and `blocks.rs` retain B's
+  logical step/item/iteration/attempt identities, producer restrictions and
+  checkpoint flow. Add A's tool ownership and settlement around B's borrowed,
+  unspawned block futures. Keep B's `walk.rs` scheduling during this port;
+  TASK-014 owns any later execution redesign, without a preselected scheduler. Cancellation dropping a block does
+  not prove already-issued host work has settled. Settle it before retry,
+  result selection, checkpoint or release of its resource ownership.
+- One direct/nested tool dispatcher preserves declared-name and typed-argument
+  validation, per-call tool/data permissions and nonblocking audits, bounded
+  arguments/results, shared request/concurrency budgets, start-order records,
+  recipient tags, original evidence/citations and check-Agent records. Forward
+  B's provider `call_id` and producer through the recorder: ordinary model
+  publication remains replay-safe and step-only. The nested bridge excludes
+  `code.run`, `fs.write` and `publish`; Python already writes private `/work`,
+  and nested publication has no provider call identity. **Decided in revision 12: nested `fs.write` and `publish` are excluded.**
+  Ordinary declared model calls retain both tools; check Agents still cannot
+  publish. Nested publication identities are outside tasks 012–014.
+- Restore tool-call spend through the same attempt records B uses for
+  `max_agent_invocations` after `db5520e38`. Each attempt records its
+  invocation's spent count as each request spends, persisted in background
+  with the execution state, and a later attempt, after a refusal or an
+  interruption, resumes from the latest persisted count (revision 15). Share
+  allowance across authored retries and preserve the original deadline
+  across park/takeover. No direct resumable state is introduced.
+- `wyrd-server/src/verification/hosted/` composes A's reusable fresh-session
+  sandbox, runnable-turn bound and charged streamed workspace with B's mounted
+  publications/collections, extraction, writes and immutable snapshots. Charge
+  growth before mutation, preserve replacement/no-overwrite distinctions and
+  unchanged content on refusal, and release scratch only after deletion or
+  ownership transfer. Keep suspended session envelopes charged through reset or
+  reap; retain charges for surviving references after cache eviction.
+- The existing `wyrd-runtime` memory/scratch owner remains the single process
+  ledger, including Bifrost, edge bodies, live queued state, frozen copies,
+  encoding and terminal/outbox custody. Reserve before copying, transfer charges
+  without gaps or double promises, and retain B's memory-first progress,
+  bounded background group commit, ACK-before-retirement and claim backpressure.
+  Do not add persistence waits to engine mutations or direct verification.
+- Keep arrival-based direct deadlines through target lookup/admission/model
+  work, lowered by the authored timeout. Retain B's verification-only gateway
+  capture bypass, destination-batched direct evidence, individually fenced
+  queued ACKs, mode-aware target cache and invalidation, queue-only refusal
+  before steps, compact/details distinction and HTTP/MCP-only inspection.
+  Preserve RBAC-only verification authorization and `verifier:approve`.
+- Monty stays on its crates.io release; exclude A's Monty `[patch.crates-io]`
+  entries, their git-source type-checking patch, and the fork-only sandbox code
+  that depends on them (the `service_mounts`/`resume_serviced` split), recording
+  each as excluded by maintainer decision in the coverage record. Keep the
+  sandbox's runnable-turn bound working against the crates.io API. Keep B's
+  pinned code-review library; resolve lockfile, workspace-hack
+  and feature graph together. Benchmark dependencies and instrumentation stay
+  behind diagnostic builds and out of production SDK packages. Compose authored
+  Python stubs/exports and native sources; regenerate wire types, errors,
+  loaders/declarations, testing declarations and docs from final sources.
+
+## Capacity boundary and architecture handoff
+
+**Revision 13 sets the isolation boundary through deployment targets, and it
+lands here.** Delete the rejected queued reservation (`QueuedShare`,
+`HostedLimits.queued_share`, the queued CPU/memory/scratch percent settings,
+reservation-only tests and `ProcessResources::reserve` unless another
+production owner uses it). In `combined`, direct and queued work share one
+hosted capacity owner (one sandbox pool, runnable-turn bound and model-call
+limit) charged to the one process ledger only while in use;
+`WYRD_VERIFICATION_QUEUED_EXECUTIONS` caps queued concurrency and holds nothing
+idle. Admission stays tenant-fair, replica budgets stay local, and the paths
+stay portable with no OS isolation controls.
+
+Replace the closed `WYRD_TARGET` set with `combined` (default), `direct`,
+`worker`, `bifrost-ingest`, `bifrost-query` and `bifrost-maintenance`, with no
+aliases. `direct` and `worker` run Scribe and Oracle without Forge;
+`bifrost-maintenance` runs both Forge roles. Route, readiness, hosted blocks, gateway, queued runtime and GitHub ingress
+follow the target's capabilities. A target refuses work it does not accept
+before admission or any side effect, identically over HTTP and MCP, and never
+forwards it. Update test-server target derivation and the Kubernetes
+deployment manifests. Original deadlines, Busy deferral, fenced takeover and
+ordered drain are unchanged. TASK-014 owns throughput optimization and final
+saturation qualification on one server.
+
+Before affected changes, reconcile only the shipped contract in
+`architecture/wyrd-design.md` (Verifier / Agents, tools, and workspaces),
+`architecture/bifrost-design.md` (Admission and memory / Resource and failure
+invariants) and the accepted-authority security section. B's orchestration,
+recovery, GitHub and Repository contracts stay normative; A's `call_tool` and
+ledger mechanics stay normative. Remove forbidden OS-identity/network-isolation
+wording and every queued-reservation, reserved-direct and borrowing claim; document
+the target set in `architecture/operations/`; describe portable
+interpreter/allocator limits and parent-mediated access honestly. TASK-014
+rewrites the in-revision direct/capacity design; do not claim HA qualification
+from functional integration. Keep Repository as kind 13, including the stale
+architecture count. Reconcile the exact six-control union (`flush_bifrost`,
+`wait_for_baseline`, `make_binding_due`, `hold_publications`,
+`occupy_hosted_memory`, `wait_for_hosted_waiters`) across REQ-195, contributor
+guidance, Rust guard, Python and TypeScript. Preserve strict detection of every
+unsanctioned control, blocking wait semantics and production exclusion.
+
+## Outputs, obligation coverage and observable proof
+
+| Obligation source | Trigger and required observation |
+|---|---|
+| Code-mode revision 9 functional requirements/invariants and AC-001–018; diagnosis conflicts 1–3,7–8,11,13 | Real declared Agent step and check call nested tools inside fanout/repeat; dependent calls complete at concurrency one, record recipients and retain citations. Preserve the existing reduced-evidence efficiency journey and its byte bound, least-privilege recovery and authored-code isolation. Model-originated publication replays its original receipt; nested write/publication and check publication refuse. Cancel/timeout during host work, retry, park and take over: settled work and receipts persist, unsettled attempts consume their allowance, authority/deadline never replenish, and ownership releases only after settlement. |
+| Pipeline REQ-001–014/016, AC-001–009/011 and INV-001–007; conflicts 9–13,16 | Retain connect→Repository→PR admission→pinned extraction→review→approval/deferred evidence→same execution→report/Check/comment journeys and negative flows across shipped surfaces. Source supersession/access loss fences continuation and delivery; provider retry never recomputes verification. No newly added SDK/CLI inspection where HTTP/MCP alone is sanctioned. |
+| REQ-015/017–018, AC-010/012/014; code-mode resource requirements and AC-028–034; conflicts 1,4–6,10,12,14 | Pressure on publication mounts, scratch replacement, queued snapshots and held persistence remains fully charged and bounded; compute frees before queued ACK without losing custody. Each target accepts exactly its work and refuses the rest before any side effect over HTTP and MCP; `combined` holds no idle queued reservation; a `worker` completes webhook, deferred-input and approval journeys and its crash allows takeover without resetting deadlines; a `direct` pod never claims queued work. No warm-cache direct SQL/state, queued-only cache bypass, lost write, starvation or premature release. |
+| REQ-195 and both packets' projection/isolation obligations; conflicts 14–17 | Exact six-control guard rejects any additional hook in all projections. Dependencies resolve against crates.io Monty with no fork patch; regenerated consumers compile, historical records decode, production packages exclude testing/benchmark machinery. |
+| Diagnosis sections 5/7 and inherited TASK-003/R1/R3 obligations | Retain A's tracked packet and referenced evidence in B's change tracking with source identities and an explicit carried/changed/pending disposition for every inherited row. Keep TASK-003-R2 superseded and TASK-003-R3 open. Under the task correction above, TASK-013 owns deterministic 100-tenant fairness/drain/ledger proof and the existing L2 competing experiment's direct-only control and baseline; TASK-014 owns direct optimization, remaining qualification, artifact analysis and post-optimization L2 comparison. Replica claiming uses the existing shared-Postgres integration proof, without a two-process capacity run. Record the 100-tenant amendment against inherited REQ-033/AC-034 and R3 V6 rather than retaining their older threshold; no historical FAIL/UNVERIFIED becomes PASS by importing it. Preserve the shared resource-scaling packet, historical deprecated verifier-review packet and B's intentional execution/inspection distinctions. Reconcile packet coverage/status only against actual evidence, never invent review verdicts. |
+
+Use diagnosis section 6's functional coverage on the composed tree, subject to
+this task's superseding decisions and scoped verification below: real SDK →
+WyrdTestServer + repository Postgres → SDK in Rust/Python/TypeScript; real
+HTTP/MCP/CLI at their existing owners; engine unit/integration and server/SQL
+seam tests. Add combined-path tests described above at those owners, not new
+test binaries. Record each new test's actual focused command before RED.
+
+Existing exact selectors (the code-mode selector arrives from A; build the
+worker executable first):
+
+```bash
+mise run build:server
+mise exec -- scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p wyrd-server --test integration -E 'test(=pg_durable_verifier_work::only_queued_verification_keeps_run_state)'
+mise exec -- scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(=verifier_building_blocks::code_mode_reduces_evidence_and_preserves_citations)'
+```
+
+Combined server seam coverage, retaining the existing target and module names:
+
+```bash
+mise exec -- scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p wyrd-server --test integration --run-ignored=all -E 'test(/^(pg_durable_verifier_work|pg_hosted_artifacts|pg_hosted_files|sandbox_worker|pg_verification_routes|pg_verification_runtime|pg_github_pull_requests|pg_github_pull_request_extraction|pg_deferred_evidence|pg_approvals|pg_github_delivery)::/)'
+```
+
+Regenerate with `mise run codegen:regen`, `mise run ts:build`, `mise run
+ts:build:testing`, `mise run docs:generate`. Use the combined-runtime selector
+above and affected owner lanes: `test:verification:sandbox`,
+`test:principals:integration`, `test:rust-sdk:journey`, `py:test:integration`,
+`ts:test:integration`, `test:bifrost`, `test:sql`, plus affected MCP/CLI
+journeys. Run `mise run check`, `check:deps`, `check:tenant-isolation`,
+`codegen:check`, `py:lints`, `py:typecheck`, `ts:lints`, `ts:typecheck`,
+`ts:napi:check` and `docs:check` through their existing mise tasks; format
+changed languages. Explicitly inspect generated testing declarations: public
+`ts:napi:check` does not cover them. Full shipped-surface suites and any
+required broad aggregate belong to integrated change review. These are future
+implementation commands, not planning-run actions.
+
+Use existing functional pressure journeys for the port's isolation boundary.
+This task runs no benchmark: the approved benchmarks are the code-mode
+worktree's existing ones, TASK-013's L2 comparison and TASK-014's qualification,
+which also owns AC-010's direct c64 comparison on one `combined` server
+while queued work saturates it, and AC-013.
+
+Deliver the composed source/contracts/projections, conflict coverage and
+inherited-obligation dispositions, and functional evidence with exact commands
+to TASK-013 and TASK-014. Local diagnostic artifacts
+referenced by the diagnosis must have retained, readable evidence or be marked
+unavailable and rerun; a vanished target path is not closure. No source
+modification of external reviewed libraries, payload-sizing redesign or nested
+publication identity extension belongs here.
+
+## Maintainer scope direction
+
+The maintainer struck these proof cases from this task. The port did not
+change the behavior they cover, so they need no new test here:
+
+- nested tool calls in fanout and repeat on Python, TypeScript and MCP (the
+  Rust journey remains);
+- readiness, hosted blocks and gateway following the target, and the
+  Kubernetes manifests;
+- a crashed-`worker` pod journey (takeover stays proven at the claim seam);
+- rejection of an extra test control in Rust and in loaded native exports;
+- MCP extraction and delivery inspection;
+- no SQL on a warm direct execution;
+- replica-local budgets (existing shared-Postgres claim proof; see the task correction above).
+
+## Obligations
+
+| ID | Promise (contract source) | Planned proof |
+|---|---|---|
+| OBL-1 | Port integrity: A's delta `11474b4a9..0eb5ccdd9` is ported into B owners; every A-only path is carried, adapted or excluded with a reason; source identities retained; A's payload-sizing and software-factory work excluded; local task index and TASK-011 untouched (task: integration choice) | Coverage record below; `git diff` audit |
+| OBL-2 | Contract reconciliation before affected code: wyrd-design Verifier/Agents/tools/workspaces, bifrost-design Admission/memory, security accepted-authority; no OS-identity/network-isolation wording; no queued-reservation/reserved-direct/borrowing claims; operations target table and readiness mapping; Repository kind 13 incl. stale count; six-control union in REQ-195 and contributor guidance (REQ-015, rev 12–13) | Content review of owner sections |
+| OBL-3 | Engine: B's step/item/iteration/attempt identities, producer restriction, checkpoints and `walk.rs` scheduling kept; A's tool ownership settles host work before retry, result selection, checkpoint or resource release, including when a block future is dropped (AC-010, INV-001..003; code-mode AC) | vala-verify unit/integration tests incl. cancel/timeout during host work |
+| OBL-4 | One direct/nested dispatcher: name/typed-arg validation, per-call tool/data permission + nonblocking audit, bounded args/results, shared request/concurrency budget, start order, recipient tags, citations, check-Agent records; provider `call_id` and producer forwarded; nested bridge excludes `code.run`, `fs.write`, `publish`; check Agents cannot publish (rev 12) | blocks_agent/tools tests; hosted tools pg_tests; code-mode journey |
+| OBL-5 | Tool-call spend restored from attempt records like `max_agent_invocations`; each attempt records its spent count as requests spend and a later attempt, after a refusal or interruption, resumes from the latest persisted count; allowance shared across retries; original deadline kept across park/takeover (rev 12, rev 15) | engine recovery tests; pg_durable_verifier_work takeover |
+| OBL-6 | Hosted workspace: A's reusable fresh-session sandbox, runnable-turn bound, charged streamed workspace composed with B's publication/collection mounts, extraction, writes, immutable snapshots; charge before mutation, replacement vs no-overwrite, unchanged on refusal, release after delete/transfer; suspended envelopes charged until reset/reap (REQ-015, code-mode resource reqs) | workspace tests/pg_tests, sandbox_worker, pg_hosted_* |
+| OBL-7 | One `wyrd-runtime` memory/scratch ledger covers Bifrost, edge bodies, live queued state, frozen copies, encoding, terminal/outbox custody; reserve before copy; transfers without gap/double count; B's memory-first progress, group commit, ACK-before-retirement, claim backpressure kept; no persistence waits on engine mutation/direct path (REQ-017/018, AC-012/013) | runtime/state unit tests; pg_durable_verifier_work |
+| OBL-8 | Direct path: arrival-based deadline lowered by authored timeout through lookup/admission/model; verification-only capture bypass; destination-batched direct evidence; individually fenced queued ACKs; mode-aware target cache + invalidation; queue-only refusal before steps; compact/details; HTTP/MCP-only inspection; RBAC-only authz and `verifier:approve` (REQ-016, AC-011) | pg_verification_routes/runtime, existing selectors |
+| OBL-9 | Isolation by deployment target: closed `WYRD_TARGET` set `combined` (default)/`direct`/`worker`/`bifrost-ingest`/`bifrost-query`/`bifrost-maintenance`, old values removed; each target accepts exactly its work and refuses the rest before admission or side effect over HTTP and MCP, never forwarding; readiness follows owners and capabilities; `direct`/`worker` run Scribe+Oracle without Forge, `bifrost-maintenance` both Forge roles; `combined` has one hosted capacity owner charged per use, no reservation, queued concurrency cap; reservation code and percent settings deleted; deadlines, Busy deferral, fenced takeover and drain unchanged; portable only (REQ-015, AC-010, rev 13) | target journeys over HTTP/MCP; pg seam tests |
+| OBL-10 | Dependencies: Monty on crates.io, no `[patch.crates-io]`/git type-checking patch/fork-only `service_mounts`/`resume_serviced`; runnable-turn bound works on crates.io API; B's code-review pin kept; lockfile/workspace-hack/features coherent; benchmark deps diagnostic-only and out of SDK packages (rev 12) | `check:deps`, Cargo.toml inspection, package contents |
+| OBL-11 | Projections: authored Python stubs/exports and native sources composed; wire types, errors, loaders/declarations, testing declarations, docs regenerated; historical records decode; six-control guard rejects any extra hook in Rust/Python/TS with blocking waits and production exclusion (REQ-195) | codegen:check, ts:napi:check, testing d.ts inspection, guard tests |
+| OBL-12 | Pipeline journeys preserved: connect→Repository→PR admission→pinned extraction→review→approval/deferred→same execution→report/Check/comment and negatives; supersession/access loss fences; provider retry never recomputes (REQ-001–014/016, AC-001–009/011, INV-001–007) | combined server seam selector; SDK journey lanes |
+| OBL-13 | Packet carry: A's tracked packet + evidence retained with source identities and carried/changed/pending disposition per inherited row; TASK-003-R2 superseded, R3 open; 100-tenant amendment recorded against REQ-033/AC-034 and R3 V6; no historical FAIL becomes PASS; diagnosis artifacts retained or marked unavailable | content review |
+
+## Evidence
+
+Candidate: branch `task/github-verifier-pipelines/TASK-012-integrate-code-mode`,
+commits `ee068f5a2..HEAD` (port, contract reconciliation, revisions 13–15,
+and the journey repairs below). Selector prefixes: **E**
+`-p vala-verify --lib` `blocks::engine::tests::`; **VI** `-p vala-verify
+--test integration` `blocks_agent::`; **SL** `-p wyrd-server --lib`; **SI**
+`-p wyrd-server --test integration --run-ignored=all`, run under
+`scripts/postgres/with-test-postgres.sh`; **J** `-p wyrd-ai --test integration
+-P journey --run-ignored=all`; **T** `-p wyrd-testing --test server -P journey
+--run-ignored=all`; **M** `-p wyrd-mcp` verification journeys.
+
+| Obligation and required cases | Implementation evidence | Proof location | Verification evidence | Result |
+|---|---|---|---|---|
+| OBL-1 port integrity, A-only paths carried/adapted/excluded, identities, exclusions, index and TASK-011 untouched | ee068f5a2; `design/code-mode-port.md` | code-mode-port.md §Source identities, §Path coverage, §Excluded, §Conflict coverage (all 17 semantic conflicts and the 37 textual paths) | content review; `git status` shows `tasks/README.md` modified and TASK-011 untracked, neither staged in any task commit | PASS |
+| OBL-2 owner reconciliation, no OS-isolation/reservation/borrowing claims, target table, kind 13, six-control union | bb78916eb, 5b358f452, 456546fbb, b2afb89a8, 9755b9c2a (last queued-reservation sentence removed) | `architecture/wyrd-design.md` Verifier/Agents and capacity paragraphs; `architecture/operations/README.md:52-69`; REQ-195 | content review; `docs:check` | PASS |
+| OBL-3 identities, producer restriction, checkpoints, walk scheduling; settlement before retry/result/checkpoint/release, cancel/timeout, dropped future | ee068f5a2 engine/agent/tools | E `array_fanout_freezes_and_orders_items` (tests.rs:3112), `repeat_refines_one_iteration_at_a_time` (:3356), `checkpoints_restore_settled_blocks_and_count_interrupted_attempts` (:2859), `publication_references_resolve_to_attempts_and_statuses` (:2516), `ready_successors_do_not_wait_for_unrelated_steps` (:3026), `capacity_refusal_lets_dispatched_work_settle` (:1994); VI `timed_out_attempt_settles_before_retry_or_result` (blocks_agent.rs:2911), `agent_check_settles_before_result` (:3050); SI `pg_hosted_artifacts::code_host_waits_obey_deadlines_and_cancellation` (:2797), `code_shutdown_settles_pending_host_work` (:2954), `pg_durable_verifier_work::dropped_agent_work_makes_no_later_call` (:2253) | E 82/82, VI 23/23, SI combined seam selector | PASS |
+| OBL-4 one dispatcher: validation, tool+data permission, nonblocking audit, bounds, shared budget, start order/recipients, citations, check records, `call_id`/producer, nested exclusions, check cannot publish | ee068f5a2 `hosted/tools.rs`, `blocks/tools.rs` | VI `step_agent_refuses_unknown_tool`, `agent_tool_budget_spans_attempts_without_refund`, `code_bridge_shares_the_recorded_path`, `check_agent_keeps_only_valid_citations`, `agent_records_survive_failed_steps_and_inconclusive_checks`, `nested_calls_refuse_writable_tools_and_model_calls_keep_their_call_id` (:3255); SL `verification::hosted::tools::pg_tests::{tools_require_their_exact_invoke_grant,tool_and_domain_grants_are_both_required,tools_refuse_forged_arguments_and_spent_budgets}`, `verification::hosted::tools::tests::reprs_stop_at_the_limit`; `wyrd-runtime` `outbox::tests::bounded_audit_staging_remains_nonblocking`; SI `pg_hosted_artifacts::{code_bridge_preserves_declared_tool_boundaries,code_calls_share_non_code_concurrency}`; `wyrd-spec` `card::verifier::validate::tests::verifier_spec_admits_every_builtin_step_tool` (check publish refused, validate.rs:2304); J `verifier_building_blocks::code_mode_reduces_evidence_and_preserves_citations`; J `hosted_agent_tools::agent_publish_retries_use_host_identity` (producer) | VI, SL, SI, J 7/7 hosted_agent_tools, code-mode selector | **PASS**: J `verifier_building_blocks::nested_tools_run_inside_fanout_and_repeat` runs dependent nested calls in each fanout item and each repeat round, asserting per-item notes, records and the second round ending the repeat. The tool-permission audit cannot block: every call audits through the synchronous `audit::authorize` (tools.rs:291, audit/mod.rs:121), which only stages on the outbox, and `bounded_audit_staging_remains_nonblocking` proves staging never waits |
+| OBL-5 spend from attempt records, recorded as spent, resumed after refusal or interruption, shared across retries, deadline kept | 91c48a972, b78edf183 | E `refused_attempts_keep_their_tool_spend` (:1907); `vala-verify` `blocks::tools::tests::resumed_invocation_continues_from_its_recorded_spend`; SI `pg_durable_verifier_work::invocations_resume_from_bifrost` (:2353); SI `pg_deferred_evidence::a_resumed_execution_keeps_its_admission_deadline`; `wyrd-sql` `pg_verifier_executions::reclaims_keep_the_admission_deadline` | E, SI, `test:sql` | PASS |
+| OBL-6 sandbox reuse, runnable-turn bound, streamed charged workspace, mounts, extraction, writes charged before mutation, snapshots, replacement/no-overwrite/unchanged on refusal, release after delete/transfer, suspended envelopes | ee068f5a2; 68b4fb9b3 (`fs.write` admits through the scratch ledger) | SI `sandbox_worker::{sandbox_reuses_processes_with_fresh_tenant_sessions,suspended_sessions_release_runnable_capacity,prewarmed_workers_are_charged_and_reaped_under_pressure,failed_workers_settle_before_capacity_returns,workspace_writes_share_one_budget}`; SI `pg_hosted_artifacts::{workspaces_stream_evidence_to_disk,evidence_reads_charge_process_memory_before_reading}`; SI `pg_durable_verifier_work::{publication_mounts_preserve_status_and_lineage,file_and_json_publications_are_immutable}` (no-overwrite); SL `verification::hosted::workspace::tests::{extraction_charges_process_memory_and_scratch,admitted_writes_charge_process_scratch,writes_charge_process_scratch,cancelled_snapshot_keeps_writer_exclusion}`; SL `verification::hosted::workspace::pg_tests::{workspace_cleans_up_on_drop,cancelled_open_returns_its_charges}`; J `hosted_agent_tools::tool_limits_release_capacity_and_preserve_provenance` (replacement fits, refused replacement leaves the old file) ; SL `vala-bifrost-redux` `storage::range_cache::tests::range_cache_charges_retained_bytes_until_released` and `storage::footer_cache::tests::footer_cache_charges_held_parquet_footers_until_released` (an evicted entry a reader still holds stays charged until its last reference drops; the Bifrost root charges the process ledger, `resources.rs:2339`) | SL workspace 13/13 + pg 5/5, SI seam, J 7/7, SL caches 2/2 | **PASS**; the workspace replacement versus extraction no-overwrite distinction (`workspace/tests.rs:660`) is the cited no-overwrite case; hosted verification holds no byte-charged cache of its own |
+| OBL-7 one ledger incl. edge bodies, queued state, frozen copies, outbox custody; reserve before copy; no double count; memory-first, group commit, ACK-before-retirement, claim backpressure; no persistence waits | ee068f5a2, 35fd76607 | `wyrd-runtime` `resources::tests::{process_grants_follow_use_without_double_promises,release_wakes_a_registered_waiter}`; SL `http::middleware::body_limit::tests::generic_bodies_charge_process_memory`; SL `verification::state::tests::{transitions_complete_while_persistence_is_held,held_changes_coalesce_into_the_next_revision}`; SI `pg_verification_runtime::{failed_group_commits_retry_as_groups,a_parked_attempt_keeps_its_claim_until_acknowledged,lost_result_ack_replays_the_identical_sealed_batch_and_scribe_deduplicates,held_persistence_bounds_queued_custody_by_claim_permits,sustained_scribe_outage_caps_tenant_spans}`; SI `pg_durable_verifier_work::{state_format_changes_preserve_existing_custody,batched_checkpoints_recover_exactly_the_accepted_batch}` ; SL `wyrd-runtime` `outbox::tests::admitted_items_charge_process_memory_until_written` (staged and reserved writes charged to the process ledger until written, shed writes never); SL `scribe_outbox::tests::checkpoint_charge_tracks_variable_settlements` (a waiting revision holds its whole weight, which covers the frozen state, its encoding and the prepared row, `state.rs` `Checkpoint::COPIES`, on the process ledger, and returns it once written); reserve before copy: `state.rs` `Writer::flush` reserves the outbox slot before freezing and stages in the same step | SL, SI seam, SL runtime 77/77, SL state + outbox 36/36 | **PASS**; RED: `Outbox::charging` did not exist, so no write was charged to the ledger and the live state was copied before its slot was reserved |
+| OBL-8 arrival deadline, capture bypass, destination batches, fenced queued ACKs, mode-aware cache, queue-only refusal, compact/details, HTTP/MCP-only inspection, RBAC-only authz, `verifier:approve` | ee068f5a2 | SI `pg_verification_routes::{direct_execution_waits_end_at_the_arrival_deadline,details_preserve_retained_execution_evidence,direct_execution_is_authorized_by_rbac_alone}`; SI `pg_verification_runtime::{target_loading_spends_the_claimed_deadline,queued_origins_require_their_own_input_ack}`; SL `components::gateway::pg_invocation_tests::capturing_call_waits_for_a_capture_slot_and_refuses_at_its_deadline` (bound call never waits); SL `scribe_outbox::tests::direct_results_deliver_as_destination_batches`; SL `verification::cache::tests::*`; SI `pg_github_pull_request_extraction::direct_verification_of_a_pull_request_verifier_refuses_before_any_step`; SI `pg_approvals::a_service_account_decides_on_a_users_behalf`; inspection is served by the HTTP and MCP routes only (no SDK/CLI inspection added: `git diff ee068f5a2^ -- crates/shared/wyrd-client/src crates/wyrd/wyrd-cli/src sdks/*/src` adds no execution-inspection call) | SL, SI seam, J `verification_capacity::*` | PASS |
+| OBL-9 six targets, wrong-target refusal before side effects over HTTP and MCP, readiness, Forge placement, one shared owner in `combined`, reservation deleted, worker completes webhook/deferred/approval journeys, worker crash takeover keeps deadline, direct never claims queued work | 5b358f452, 35fd76607, 507dbd866, e8d845674, 5083ffc98, b2afb89a8, 712227050 | SI `pg_verification_routes::{direct_target_runs_only_direct_work,worker_target_runs_only_queued_work}`; `config::tests::targets_refuse_verifier_work_they_do_not_run` (config.rs:4580); SI `pg_router_smoke::forge_checks_follow_target_selection` (:938, Forge placement); T `verification_runtime::isolated_capacity::direct_verification_runs_while_queued_capacity_is_held`; the 5 `pg_deferred_evidence` and 4 `pg_approvals` tests that call `Deployment::start_limited` run on `worker` (pg_github_pull_requests.rs:112), each admitting through the webhook; `wyrd-sql` `reclaims_keep_the_admission_deadline` (claim reads the remaining admission deadline on every target) | SI 40/40 on the three GitHub suites; T pass | **PASS**: `bifrost-*` refusal over HTTP and MCP is SI `pg_verification_routes::bifrost_targets_refuse_all_verifier_work`; the direct c64 comparison on one `combined` server while queued work saturates it is TASK-014's (AC-010, its Queued isolation row), and the crashed-`worker` journey, readiness, hosted blocks, gateway and manifests were struck (Maintainer scope direction). |
+| OBL-10 crates.io Monty, A's fork patches excluded, no fork-only sandbox split, bound on crates.io API, pins, features, benchmark deps diagnostic-only | ee068f5a2, dfa919edc | `Cargo.toml:150-152`; the remaining `monty-type-checking` path stand-in predates the merge base (`0e886ceec`) and is not A's patch; no `service_mounts`/`resume_serviced`; `scripts/checks/deps.sh`; the three-language benchmark harness delivered for TASK-013/014: `wyrd-testing` `capacity` bin `verification::` tests, Python `test_verifier_building_blocks.py::{test_benchmark_driver_preserves_public_call_boundary,test_benchmark_heap_capture_holds_real_conversion_work}` (:500, :566) and their TypeScript twins (`verifier-building-blocks.test.ts:475`, `:557`) | `check:deps`, `check`, `lints`; `capacity` 25/25; Python and TS integration | PASS |
+| OBL-11 projections regenerated, historical decode, six-control guard in Rust/Python/TS with blocking waits and production exclusion | 2aecc1fee | `wyrd-testing` `server::tests::public_controls_are_the_six_sanctioned_operations` (server.rs:6584); J `verification_capacity::{verify_waits_for_hosted_memory_then_passes,submit_defers_under_hosted_memory_then_passes}`; historical decode: `wyrd-spec` `verification::execution::tests::verification_result_round_trips_documented_outcome` (execution.rs:1914–1935: records without a recipient or requirement calls decode); SI `pg_durable_verifier_work::state_format_changes_preserve_existing_custody` (an unknown state format is refused, not misread); `sdks/wyrd-sdk-ts/testing/native.d.cts` inspected | `codegen:check`, `ts:napi:check`, `check:deps`, `check:py-wheel-no-testing` | **PASS**: the guard rejects any Python or TypeScript hook outside the six; rejecting an extra Rust hook or loaded native export was struck (Maintainer scope direction); `check:py-wheel-no-testing` (mise.toml:1101–1135) passes and rejects testing and benchmark machinery in the production wheel |
+| OBL-12 pipeline journeys and negatives, supersession/access fences, provider retry | preserved; 9edfa4fa7 etc. repair stale journey expectations only | J `github_connection::connections_associate_only_after_github_confirms_them`, `repository_declaration::pull_requests_admit_pinned_executions_and_supersede_them`; SI `pg_github_pull_requests::*`, `pg_github_pull_request_extraction::*`, `pg_deferred_evidence::*`, `pg_approvals::*`, `pg_github_delivery::*`; Python `test_repository_declaration.py` (5, incl. `test_pull_requests_admit_pinned_executions_and_supersede_them`), `test_deferred_evidence.py::{test_published_evidence_resumes_the_waiting_execution,test_a_person_approves_the_pending_signoff}`, `test_github_connection.py` (3); TypeScript `repository-declaration.test.ts` (5), `deferred-evidence.test.ts` (2), `github-connection.test.ts` (2), `github-connection-not-configured.test.ts` (1); MCP `github::pg_tests::{an_agent_manages_the_github_connection,an_agent_reads_the_selected_repository_policy,an_agent_publishes_deferred_evidence_for_a_waiting_execution,an_agent_approves_a_pending_signoff}` | SI combined seam selector, `test:rust-sdk:journey` (192/193; the one failure, a cross-clock expiry assertion, fixed in 61e198851 by proving the expiry on PostgreSQL's clock in `pg_github_installations::github_transactions_are_flow_principal_and_browser_bound`), Python 10/10, `ts:test:integration`, `test:bifrost` MCP | PASS |
+| OBL-13 inherited packet carried with dispositions, R2 superseded, R3 open, 100-tenant amendment, no FAIL made PASS | c33e9a137 | code-mode-port.md §Inherited packet, §100-tenant amendment, §TASK-003-R3 obligations (stale R3 rows updated to revision 13), §Other inherited rows | content review | PASS |
+| AC-014 fresh isolated migration comparison: only permitted deltas beyond main, no generic execution payload schema, grants/RLS/cancellation kept | `git diff --name-status main...HEAD -- '*migrations*'`: nine added migrations (verifier cancel notify, GitHub installations, gateway usage contributions/overlap, Repository Cards, selection occurrence, code-review cache, pull-request admission, pull-request source extracted), none of main's modified or deleted; each of the six new tables enables and forces RLS with `tenant_isolation` and `operator_access` policies; no execution-state or terminal-delivery table or column | fresh repository Postgres | `db:migrate:all:inner` twice (idempotent, Wyrd and Vala); `check:tenant-isolation`; `test:sql` 235 + 7 + 88 + 3 passed (cancellation: `pg_verifier_executions::background_admission_of_a_revoked_owner_is_cancelled`); SI `pg_verification_runtime::{cancellation_and_deadline_settle_without_a_verdict,renewal_keeps_a_long_run_and_a_taken_token_cancels_it,claim_committed_after_cancellation_is_released_unexecuted}` 3/3 | PASS |
+
+The independent checker found AC-014 and several output cases missing from
+the ledger. AC-014 is the row above; the output cases are cited, struck or
+handed to TASK-014 under Open-item decisions and Maintainer scope direction.
+
+### Open-item decisions
+
+An independent read-only review decided each open item from the spec, this
+task and AGENTS.
+
+Cited (assertions read):
+- Least-privilege recovery: `pg_hosted_artifacts::recovered_authority_bounds_every_agent_tool` (:873; denied-table and undeclared-tool assertions :1059–1125).
+- Authored-code isolation: `sandbox_worker::sandbox_reaches_only_its_mounts` (:233); journey `verifier_building_blocks::forbidden_code_access_cannot_pass_dependent_work` (:943).
+- Model publication replays its receipt: `hosted_agent_tools::agent_publish_retries_use_host_identity` (:1124; :1140–1207).
+- No starvation: `hosted::admission::tests::a_non_fitting_head_does_not_block_another_tenant` (:490); `pg_verification_runtime::a_flooding_tenant_does_not_delay_another_tenants_run` (:1966). TASK-013 scales the queue test to 100 tenants and adds drain/ledger assertions under the task correction above.
+- Tenant-fair admission: `hosted::admission::tests::admission_rotates_tenants_and_accounts_waiting_bytes` (:402).
+
+Out of this task:
+- A second wheel-content check for OBL-11: `check:py-wheel-no-testing` (mise.toml:1101–1135) already rejects testing and benchmark machinery in the production wheel; AGENTS forbids a duplicate check.
+
+Handoff to TASK-013 and TASK-014: this file's coverage, obligations and
+evidence, and `design/code-mode-port.md`'s conflict coverage and inherited-row
+dispositions, at this branch's head. No benchmark is run here.
+
+Written after the maintainer's scope direction: OBL-7's ledger custody,
+`outbox::tests::admitted_items_charge_process_memory_until_written`; OBL-9's `bifrost-*` refusal over HTTP and MCP,
+`pg_verification_routes::bifrost_targets_refuse_all_verifier_work`; OBL-4's
+nested calls, `verifier_building_blocks::nested_tools_run_inside_fanout_and_repeat`;
+compute freed before the queued ACK (the model-call permit is held only
+inside one gateway call, `components/gateway/caller.rs:151`, so no step,
+park or terminal holds it; the two tests prove Python and workspace release),
+for a park
+(`pg_deferred_evidence::a_parked_execution_releases_compute_before_its_park_is_acknowledged`)
+and for a terminal
+(`pg_deferred_evidence::a_finished_execution_releases_compute_before_its_terminal_is_acknowledged`,
+spec.md:344).
+
+### Diagnoses
+
+- **Symptom:** every `wyrd-testing::forge scribe_promotion::*` test panicked
+  at `forge_harness.rs:1808`, "production server has Forge". **Evidence:**
+  `start_engine_fixture_server` (forge/support.rs:33) selected
+  `ServerTarget::Direct`, which composes no Forge role (config.rs:540,
+  boot/mod.rs:809). **Cause:** e8d845674 mapped the old API-server target to
+  `direct`; revision 13 gives `direct` no Forge. **Fix site:** the helper
+  selects `combined` (Codex diagnostician); all ten callers route through it
+  and pass.
+
+- **Symptom:** `pg_verification_runtime::queued_origins_require_their_own_input_ack`
+  failed about half its runs, alone or in the seam lane, with
+  `writer unavailable for table: bifrost.storage.objects` at Card registration.
+  **Evidence:** the test holds a scheduled input write open on outbox lane 0
+  (`submissions.rs:170`); the direct caller's inventory row routes by path hash
+  over four lanes (`scribe_outbox.rs:2052`) and `ObjectInventory::record`
+  times out at half the limit (`inventory.rs:220`). **Cause:** the test
+  registered the direct caller in the stalled tenant while the stall was held.
+  **Fix site:** the test: register before the stall, and name the second
+  tenant's subject apart so it no longer shadows the direct one (two
+  diagnosticians; 8/8 stress runs pass). Other stall users checked; none wait
+  on a write in the held tenant.
+
+- **Scribe outage journey.** The recovered-span proof needed a Verifier
+  execute on a query-only pod. Fix: a traced card read on the query pod
+  (e9cd7e78c), approved.
+- **Capacity journey submit hang.** Cause: since 35fd76607 Python and Scribe
+  share process memory; holding all of it left the queued submission unable to
+  stage. Fix: the queued hold leaves 64 MiB (9edfa4fa7). The server already
+  ends the wait at the 30 s edge timeout with a stable error.
+- **Capacity journey scratch deferral.** Cause: `Workspace::write` checked
+  only its own `/work` budget and never the process scratch ledger, so a full
+  ledger neither deferred queued work nor refused direct work. Fix: admit each
+  write through `admit_write`, a full ledger stopping busy (68b4fb9b3). RED:
+  `verification::hosted::workspace::tests::writes_charge_process_scratch`
+  failed with "the written bytes are charged" before the fix. The journey then
+  counts the deferred attempt's model call (0c4a767e8).
+- **Fan-out journey.** Cause: it asserted an item-scoped hold from the removed
+  workspace bound; a model-call permit is per call. Fix: assert at most two
+  calls in flight and that the limit is reached (ea34e9566).
+- **Limits journey.** Cause: the 64 KiB tool-argument cap refused the large
+  writes before the publication and `/work` limits. Fix: the journey's
+  server allows arguments up to twice its `/work` size (f456470aa).
+- **Merged lane run.** Symptom: after the merge, `test:rust-sdk:journey`,
+  `test:bifrost`, `py:test:integration` and `ts:test:integration` failed 1,
+  9, 5 and 4 journeys. Evidence and cause (Codex diagnostician): the GitHub
+  expiry journey compared PostgreSQL's `statement_timestamp()` expiry with
+  the test process clock; A's journeys verified publishing Verifiers directly,
+  which REQ-015 makes queued-only (spec.md:302), and inspected executions
+  without `verifier:read`; the MCP catalog test missed
+  `verification.publish_evidence` and `verification.decide_approval`; three
+  Oracle journeys delayed a `direct` node, which runs no Forge, after
+  e8d845674 mapped the old server target to it; four verification journeys
+  ran on Bifrost-only nodes, which revision 13 refuses verifier work. Fix
+  site: the tests (61e198851, 870ff98fa, 4154649e8, ac9a01580); the two
+  peer-routing journeys were deleted as unreachable, their other assertions
+  covered by `system_and_dynamic_tables_share_attribution` and
+  `scheduled_owner_authority_is_retained`. Every named test passes on rerun.
+- A suspected wrong error code (`SKALD_TOOL_422_INPUT` on direct calls) is the
+  documented direct-call convention; no change.
+
+Each diagnosis that touched a test had a read-only diagnostician's report
+before the fix.
+
+### Process exceptions
+
+Revision 13–15 production changes in 5b358f452, 35fd76607, 91c48a972,
+b2afb89a8 and b78edf183 were written before their changed tests failed; their
+proof is the changed tests listed above, not RED.
+
+### Status
+
+`IMPLEMENTED`: OBL-1 to OBL-13 and AC-014 pass. The merged tree passes the
+seam, principals, `test:rust-sdk:journey` (after 61e198851), `test:bifrost`,
+`check:py-wheel-no-testing`, `py:test:integration` and `ts:test:integration`
+lanes once the journeys above were repaired and rerun by exact selector. No
+benchmark runs here; TASK-013 and TASK-014 own them.

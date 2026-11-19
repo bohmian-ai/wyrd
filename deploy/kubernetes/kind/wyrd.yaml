@@ -38,7 +38,7 @@ spec:
           image: wyrd:kind
           imagePullPolicy: Never
           env:
-            - {name: WYRD_TARGET, value: all}
+            - {name: WYRD_TARGET, value: combined}
             - name: POD_IP
               valueFrom: {fieldRef: {fieldPath: status.podIP}}
             - {name: WYRD_PEER_ADDRESS, value: "$(POD_IP):50052"}
@@ -108,7 +108,7 @@ spec:
           image: wyrd:kind
           imagePullPolicy: Never
           env:
-            - {name: WYRD_TARGET, value: oracle}
+            - {name: WYRD_TARGET, value: bifrost-query}
             - name: POD_IP
               valueFrom: {fieldRef: {fieldPath: status.podIP}}
             - {name: WYRD_PEER_ADDRESS, value: "$(POD_IP):50052"}

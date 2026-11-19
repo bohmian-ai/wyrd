@@ -21,7 +21,7 @@ use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_server::app::metrics::install_recorder;
 use wyrd_server::components::platform::builtins::BuiltinTables;
 use wyrd_server::config::BifrostRuntimeRole;
-use wyrd_server::config::BifrostTarget;
+use wyrd_server::config::ServerTarget;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Attribution;
 use wyrd_spec::vala::api::{NodeId, TenantTableBinding};
@@ -150,6 +150,12 @@ pub struct BifrostClusterSpec {
     /// a journey drives gateway calls through the cluster.
     gateway_provider_root: Option<url::Url>,
 }
+
+/// The exact Bifrost owners of one `bifrost-maintenance` node.
+const MAINTENANCE_ROLES: [BifrostRuntimeRole; 2] = [
+    BifrostRuntimeRole::ForgeCoordinator,
+    BifrostRuntimeRole::ForgeWorker,
+];
 
 impl BifrostClusterSpec {
     /// Construct one mixed node.
@@ -297,18 +303,15 @@ impl BifrostClusterSpec {
         Self::mixed(6)
     }
 
-    /// Construct one server process and three worker-only Forge processes.
+    /// Construct one `direct` process and three `bifrost-maintenance`
+    /// processes, which elect one Forge coordinator among themselves.
     #[must_use]
     pub fn dedicated_forge_workers() -> Self {
         let mut nodes = vec![Self::node(
             1,
-            [
-                BifrostRuntimeRole::Scribe,
-                BifrostRuntimeRole::ForgeCoordinator,
-                BifrostRuntimeRole::Oracle,
-            ],
+            [BifrostRuntimeRole::Scribe, BifrostRuntimeRole::Oracle],
         )];
-        nodes.extend((2..=4).map(|id| Self::node(id, [BifrostRuntimeRole::ForgeWorker])));
+        nodes.extend((2..=4).map(|id| Self::node(id, MAINTENANCE_ROLES)));
         Self {
             nodes,
             scribe_geometry_for_test: None,
@@ -319,27 +322,19 @@ impl BifrostClusterSpec {
         }
     }
 
-    /// Construct the deterministic three-Server/three-ForgeWorker matrix.
+    /// Construct the deterministic three-`direct`/three-`bifrost-maintenance`
+    /// matrix.
     ///
-    /// The first three nodes carry the complete public Server role set. The
-    /// remaining three nodes carry only Forge, which the server harness maps
-    /// to the closed `ForgeWorker` process role. Keeping the descriptor
+    /// The first three nodes carry the `direct` Scribe and Oracle owners. The
+    /// remaining three carry both Forge roles, which the server harness maps
+    /// to the closed `bifrost-maintenance` target. Keeping the descriptor
     /// explicit prevents a mixed role from accidentally satisfying this lane.
     #[must_use]
     pub fn three_servers_three_forge_workers() -> Self {
         let mut nodes = (1..=3)
-            .map(|id| {
-                Self::node(
-                    id,
-                    [
-                        BifrostRuntimeRole::Scribe,
-                        BifrostRuntimeRole::ForgeCoordinator,
-                        BifrostRuntimeRole::Oracle,
-                    ],
-                )
-            })
+            .map(|id| Self::node(id, [BifrostRuntimeRole::Scribe, BifrostRuntimeRole::Oracle]))
             .collect::<Vec<_>>();
-        nodes.extend((4..=6).map(|id| Self::node(id, [BifrostRuntimeRole::ForgeWorker])));
+        nodes.extend((4..=6).map(|id| Self::node(id, MAINTENANCE_ROLES)));
         Self {
             nodes,
             scribe_geometry_for_test: None,
@@ -360,7 +355,7 @@ impl BifrostClusterSpec {
     /// spill thresholds are the same numbers on every host rather than a
     /// property of whichever machine ran the journey.
     #[must_use]
-    pub fn for_targets(targets: &[BifrostTarget]) -> Self {
+    pub fn for_targets(targets: &[ServerTarget]) -> Self {
         let pod_floor = SystemResourceSnapshot {
             memory_limit_bytes: vala_bifrost_redux::resources::MIN_POD_MEMORY_BYTES,
             effective_cpu: 4,
@@ -789,7 +784,7 @@ struct NodeResources {
     /// back at the address membership already published for it.
     peer_addr: std::net::SocketAddr,
     /// Closed production process role derived from the component set.
-    process_role: BifrostTarget,
+    process_role: ServerTarget,
 }
 
 /// Optional Forge supervision controls shared by every node in one cluster.
@@ -2713,13 +2708,14 @@ fn is_exact_reclaimed_panic_row(row: &(String, i32, Option<String>, bool, bool))
 }
 
 /// Maps one exact concrete role set to its public process target.
-fn process_target_for_roles(roles: &BTreeSet<BifrostRuntimeRole>) -> Option<BifrostTarget> {
+fn process_target_for_roles(roles: &BTreeSet<BifrostRuntimeRole>) -> Option<ServerTarget> {
+    // `worker` shares `direct`'s owners; Bifrost journeys run `direct`.
     [
-        BifrostTarget::All,
-        BifrostTarget::Server,
-        BifrostTarget::Oracle,
-        BifrostTarget::Scribe,
-        BifrostTarget::ForgeWorker,
+        ServerTarget::Combined,
+        ServerTarget::Direct,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostIngest,
+        ServerTarget::BifrostMaintenance,
     ]
     .into_iter()
     .find(|target| {
@@ -2736,24 +2732,19 @@ fn classify_topology(spec: &BifrostClusterSpec) -> BifrostTopology {
     match spec.nodes.len() {
         1 => BifrostTopology::OnePod,
         2 => BifrostTopology::TwoPod,
-        6 if spec.nodes[..3].iter().all(|node| {
-            node.roles.contains(&BifrostRuntimeRole::Scribe)
-                && node.roles.contains(&BifrostRuntimeRole::ForgeCoordinator)
-                && node.roles.contains(&BifrostRuntimeRole::Oracle)
-                && node.roles.len() == 3
-        }) && spec.nodes[3..].iter().all(|node| {
-            node.roles.len() == 1 && node.roles.contains(&BifrostRuntimeRole::ForgeWorker)
-        }) =>
+        6 if spec.nodes[..3]
+            .iter()
+            .all(|node| process_target_for_roles(&node.roles) == Some(ServerTarget::Direct))
+            && spec.nodes[3..].iter().all(|node| {
+                process_target_for_roles(&node.roles) == Some(ServerTarget::BifrostMaintenance)
+            }) =>
         {
             BifrostTopology::ThreeServersThreeForgeWorkers
         }
         4 if spec.nodes.first().is_some_and(|node| {
-            node.roles.contains(&BifrostRuntimeRole::Scribe)
-                && node.roles.contains(&BifrostRuntimeRole::ForgeCoordinator)
-                && node.roles.contains(&BifrostRuntimeRole::Oracle)
-                && node.roles.len() == 3
+            process_target_for_roles(&node.roles) == Some(ServerTarget::Direct)
         }) && spec.nodes[1..].iter().all(|node| {
-            node.roles.len() == 1 && node.roles.contains(&BifrostRuntimeRole::ForgeWorker)
+            process_target_for_roles(&node.roles) == Some(ServerTarget::BifrostMaintenance)
         }) =>
         {
             BifrostTopology::DedicatedForgeWorkers
@@ -2902,8 +2893,9 @@ mod tests {
         assert!(function.contains("(Some(shutdown), Err(inspection))"));
     }
 
-    /// The six-process matrix contains exactly three complete Servers and
-    /// three Forge-only workers, with no mixed or partial role descriptors.
+    /// The six-process matrix contains exactly three `direct` processes and
+    /// three `bifrost-maintenance` processes, with no mixed or partial role
+    /// descriptors.
     #[test]
     fn three_servers_three_workers_descriptor_is_exact() {
         let spec = BifrostClusterSpec::three_servers_three_forge_workers();
@@ -2912,12 +2904,12 @@ mod tests {
         assert!(
             spec.nodes[..3]
                 .iter()
-                .all(|node| process_target_for_roles(&node.roles) == Some(BifrostTarget::Server))
+                .all(|node| process_target_for_roles(&node.roles) == Some(ServerTarget::Direct))
         );
         assert!(
             spec.nodes[3..]
                 .iter()
-                .all(|node| node.roles == BTreeSet::from([BifrostRuntimeRole::ForgeWorker]))
+                .all(|node| node.roles == BTreeSet::from(MAINTENANCE_ROLES))
         );
         assert_eq!(
             classify_topology(&spec),
@@ -2925,7 +2917,8 @@ mod tests {
         );
     }
 
-    /// The dedicated-worker descriptor keeps the serving coordinator out of the worker pool.
+    /// The dedicated-worker descriptor keeps every Forge role off the serving
+    /// process.
     ///
     /// # Panics
     ///
@@ -2938,12 +2931,12 @@ mod tests {
         assert_eq!(spec.nodes.len(), 4);
         assert_eq!(
             process_target_for_roles(&spec.nodes[0].roles),
-            Some(BifrostTarget::Server)
+            Some(ServerTarget::Direct)
         );
         assert!(
             spec.nodes[1..]
                 .iter()
-                .all(|node| node.roles == BTreeSet::from([BifrostRuntimeRole::ForgeWorker]))
+                .all(|node| node.roles == BTreeSet::from(MAINTENANCE_ROLES))
         );
         assert_eq!(
             classify_topology(&spec),
@@ -3012,18 +3005,9 @@ mod tests {
             .expect("restarted resource snapshot");
         assert_eq!(restarted_resources.plan, original_resources.plan);
         assert_eq!(restarted_resources.scribe_memory_used_bytes, 0);
-        // The footer and byte-range caches' whole budgets are charged once at
-        // composition, so a fresh node holds exactly those and nothing a query
-        // left behind.
-        let policy = server
-            .state()
-            .bifrost_storage()
-            .expect("restarted storage owner")
-            .policy();
-        assert_eq!(
-            u64::try_from(restarted_resources.governed_memory_used_bytes).expect("fits u64"),
-            policy.metadata_cache_bytes() + policy.data_cache_bytes()
-        );
+        // The footer and byte-range caches charge only the entries they hold,
+        // so a fresh node's empty caches withhold nothing.
+        assert_eq!(restarted_resources.governed_memory_used_bytes, 0);
         assert!(!restarted_resources.oracle_query_active);
         cluster.shutdown().await.expect("cluster shuts down");
     }

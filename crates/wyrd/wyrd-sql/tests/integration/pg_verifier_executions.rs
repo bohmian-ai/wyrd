@@ -21,16 +21,22 @@ use wyrd_spec::card::operator::{DriftCounts, MAX_SUMMARY_CHARS, OperatorFailureC
 use wyrd_spec::card::trigger::TriggerDuration;
 use wyrd_spec::card::verifier::{OWNER_OCCURRENCE_KEY, SourceText};
 use wyrd_spec::envelope::{Card, CardKind};
-use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, GroupId, SlotName, VerificationResultId};
+use wyrd_spec::ids::{
+    BindingId, CardUid, ExecutionId, GroupId, RepositoryId, SlotName, VerificationResultId,
+};
 use wyrd_spec::registry::DeclarationOperationId;
 use wyrd_spec::vala::ids::{RunId, SpanId, TraceId};
-use wyrd_spec::verification::execution::{InputDeclaration, VerificationRequest};
+use wyrd_spec::verification::execution::{
+    InputDeclaration, PullRequestActivation, PullRequestRef, VerificationRequest,
+};
 use wyrd_spec::verification::{
     DriftWindow, GroupEndSettings, GroupSource, OperatorDispatchStatus, VerificationError,
     VerificationExecutionStatus, VerificationVerdict, VerifierReadiness,
 };
 use wyrd_sql::TenantConn;
-use wyrd_sql::queries::auth::{insert_service_account, provision_system_principal};
+use wyrd_sql::queries::auth::{
+    insert_service_account, provision_system_principal, suspend_service_account_principal,
+};
 use wyrd_sql::queries::cards::{
     NewCardRow, NewDeclarationOperation, insert_card_row, insert_declaration_operation,
 };
@@ -42,7 +48,8 @@ use wyrd_sql::queries::verification_target::VerificationTargets;
 use wyrd_sql::queries::verifier_executions::{
     Cause, ClaimedExecution, Completion, DueSettlement, EnqueueOutcome, EnqueueRefusal,
     ExecutionAuthority, ExecutionInput, ExecutionLease, ExecutionOrigin, ExecutionStatus,
-    GroupActivity, GroupSelection, PinnedGroup, Prepared, QueueCounts, RetryOutcome,
+    GroupActivity, GroupSelection, PinnedGroup, Prepared, PullRequestBaseline, PullRequestEnd,
+    PullRequestHistory, PullRequestKey, PullRequestTarget, QueueCounts, RetryOutcome,
     ScheduleOutcome, ScheduleSkip, ScheduleTick, ScheduledAdmission, Settlement, Submission,
     SubmissionOutcome, TerminalStatus, VerifierExecutionQueue,
 };
@@ -625,7 +632,7 @@ fn engine_error() -> VerificationError {
 /// Panics when the claim fails or nothing is runnable.
 async fn claim(queue: &VerifierExecutionQueue, conn: &mut TenantConn<'_>) -> ClaimedExecution {
     queue
-        .claim(conn, Duration::minutes(5), 1)
+        .claim(conn, Duration::minutes(5), Duration::minutes(5), 1)
         .await
         .expect("claim runs")
         .pop()
@@ -793,7 +800,7 @@ async fn unrunnable_targets_are_refused() {
     }
     assert!(
         queue
-            .claim(&mut conn, Duration::minutes(5), 1)
+            .claim(&mut conn, Duration::minutes(5), Duration::minutes(5), 1)
             .await
             .expect("claim runs")
             .is_empty(),
@@ -1085,6 +1092,213 @@ async fn concurrent_keyed_writers_serialize_on_the_key() {
     );
 }
 
+/// Revoke `principal` the way its revocation does: suspend the account, then
+/// cancel its unfinished executions, returning how many were cancelled.
+///
+/// # Panics
+/// Panics when the suspension or cancellation fails.
+async fn revoke(
+    queue: &VerifierExecutionQueue,
+    conn: &mut TenantConn<'_>,
+    principal: PrincipalId,
+) -> u64 {
+    assert!(
+        suspend_service_account_principal(conn, principal.as_uuid())
+            .await
+            .expect("account suspends"),
+        "the account exists"
+    );
+    queue
+        .cancel_principal(conn, principal)
+        .await
+        .expect("executions cancel")
+}
+
+/// Assert that `execution` is cancelled because its principal was revoked.
+///
+/// # Panics
+/// Panics when the execution is runnable or settled otherwise.
+async fn assert_revoked(
+    queue: &VerifierExecutionQueue,
+    conn: &mut TenantConn<'_>,
+    execution: ExecutionId,
+) {
+    let state = status(queue, conn, execution).await.state;
+    assert_eq!(state.status, VerificationExecutionStatus::Cancelled);
+    assert_eq!(
+        state.error.map(|error| error.code),
+        Some("principal_revoked".to_owned())
+    );
+}
+
+/// A submission and its principal's revocation order on the principal row
+/// whichever commits first: an admission racing an uncommitted revocation
+/// waits for it and commits cancelled, and a revocation racing an
+/// uncommitted admission waits for it and cancels the committed execution.
+/// Neither order leaves runnable work for a revoked principal.
+///
+/// # Panics
+/// Panics when either contender does not wait, or a revoked principal's
+/// execution stays runnable.
+#[tokio::test]
+async fn revocation_and_admission_order_on_the_principal() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let alice = actor(tenant);
+    let queue = VerifierExecutionQueue::default();
+    let mut setup = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    let (first_card, first) = declare_service(&mut setup, &alice, "first").await;
+    let (second_card, second) = declare_service(&mut setup, &alice, "second").await;
+    let custom = register_verifier(&mut setup, &alice, "custom", custom_drift()).await;
+    setup.commit().await.expect("setup commits");
+    let mut probe = fixture.tenant_conn().await.expect("probe opens");
+
+    let mut revoker = fixture.tenant_conn().await.expect("revoker opens");
+    assert_eq!(revoke(&queue, &mut revoker, first).await, 0);
+    let late = submission(
+        tenant,
+        owner_authority(tenant, first),
+        request(&custom, &first_card),
+        None,
+    );
+    let mut admitter = fixture.tenant_conn().await.expect("admitter opens");
+    let admission = async {
+        let outcome = accept(&queue, &mut admitter, &late).await;
+        admitter.commit().await.expect("admission commits");
+        outcome
+    };
+    tokio::pin!(admission);
+    let raced = tokio::select! {
+        outcome = &mut admission => Some(outcome),
+        () = await_blocked_backend(&mut probe) => None,
+    };
+    assert_eq!(
+        raced, None,
+        "an admission waits for an uncommitted revocation"
+    );
+    revoker.commit().await.expect("revocation commits");
+    assert_eq!(admission.await, SubmissionOutcome::Accepted);
+    let mut reader = fixture.tenant_conn().await.expect("reader opens");
+    assert_revoked(&queue, &mut reader, late.execution_id).await;
+    reader.rollback().await.expect("reader rolls back");
+
+    let early = submission(
+        tenant,
+        owner_authority(tenant, second),
+        request(&custom, &second_card),
+        None,
+    );
+    let mut admitter = fixture.tenant_conn().await.expect("admitter opens");
+    submitted(&queue, &mut admitter, &early).await;
+    let mut revoker = fixture.tenant_conn().await.expect("revoker opens");
+    let revocation = async {
+        let cancelled = revoke(&queue, &mut revoker, second).await;
+        revoker.commit().await.expect("revocation commits");
+        cancelled
+    };
+    tokio::pin!(revocation);
+    let raced = tokio::select! {
+        cancelled = &mut revocation => Some(cancelled),
+        () = await_blocked_backend(&mut probe) => None,
+    };
+    assert_eq!(
+        raced, None,
+        "a revocation waits for an uncommitted admission"
+    );
+    admitter.commit().await.expect("admission commits");
+    assert_eq!(
+        revocation.await,
+        1,
+        "the revocation cancels the admitted execution"
+    );
+    let mut reader = fixture.tenant_conn().await.expect("reader opens");
+    assert_revoked(&queue, &mut reader, early.execution_id).await;
+}
+
+/// A scheduled occurrence and a group end prepared before their owner's
+/// revocation are admitted cancelled once it is suspended, so a delayed
+/// background admission never revives a revoked owner's work.
+///
+/// # Panics
+/// Panics when either admission is refused or its execution stays runnable.
+#[tokio::test]
+async fn background_admission_of_a_revoked_owner_is_cancelled() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let actor = actor(fixture.data_tenant_id());
+    let queue = VerifierExecutionQueue::default();
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    provision_system_principal(&mut conn, Attribution::unresolved())
+        .await
+        .expect("the tenant SYSTEM principal provisions");
+    let (owner, principal) = declare_service(&mut conn, &actor, "svc").await;
+    let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
+    let binding = bind(&mut conn, &owner, &verifier, Vec::new()).await;
+    record_machine_authentication(&mut conn, principal, &owner)
+        .await
+        .expect("owner activates");
+    let due = database_now(&mut conn).await - SCHEDULE_CLAIM_DELAY;
+    set_cursor(&mut conn, binding, Some(due)).await;
+    let (group_binding, activity) = group_end(&mut conn, &actor, &owner).await;
+    let authority = background(&mut conn, principal).await;
+    queue
+        .record_group_activity(&mut conn, &[activity])
+        .await
+        .expect("activity records");
+    sqlx::query(
+        "UPDATE wyrd.verification_group_pending
+            SET due_at = statement_timestamp() - INTERVAL '1 second'
+          WHERE binding_id = $1",
+    )
+    .bind(group_binding.as_uuid())
+    .execute(&mut **conn.transaction())
+    .await
+    .expect("group expires");
+    let occurrence = scheduled_candidate(&queue, &mut conn, principal).await;
+    let group = queue
+        .claim_due_group(&mut conn, &[])
+        .await
+        .expect("group claims")
+        .expect("an expired group is due");
+    let snapshot = pinned(group_binding, "order-1", &[(ExecutionId::new_v7(), None)]);
+    let Prepared::Candidate(group) = queue
+        .prepare_group(
+            &mut conn,
+            group_binding,
+            &snapshot,
+            &authority,
+            Some(group.generation),
+        )
+        .await
+        .expect("group prepares")
+    else {
+        panic!("expected a group candidate");
+    };
+
+    assert_eq!(revoke(&queue, &mut conn, principal).await, 0);
+    assert_eq!(
+        queue
+            .accept_scheduled(&mut conn, &occurrence)
+            .await
+            .expect("occurrence admits"),
+        EnqueueOutcome::Enqueued(occurrence.execution_id)
+    );
+    assert_eq!(
+        queue
+            .accept_grouped(&mut conn, &group)
+            .await
+            .expect("group admits"),
+        EnqueueOutcome::Enqueued(group.execution_id)
+    );
+    assert_revoked(&queue, &mut conn, occurrence.execution_id).await;
+    assert_revoked(&queue, &mut conn, group.execution_id).await;
+}
+
 /// Wait until some backend of this fixture's database is blocked behind
 /// another transaction's lock.
 ///
@@ -1094,6 +1308,16 @@ async fn concurrent_keyed_writers_serialize_on_the_key() {
 /// # Panics
 /// Panics when the probe query fails or nothing blocks within 30 seconds.
 async fn await_blocked_backend(conn: &mut TenantConn<'_>) {
+    await_blocked_backends(conn, 1).await;
+}
+
+/// Wait until at least `count` backends of this fixture's database are
+/// blocked behind other transactions' locks, as [`await_blocked_backend`]
+/// waits for one.
+///
+/// # Panics
+/// Panics when the probe query fails or too few block within 30 seconds.
+async fn await_blocked_backends(conn: &mut TenantConn<'_>, count: i64) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         sqlx::query("SELECT pg_stat_clear_snapshot()")
@@ -1107,7 +1331,7 @@ async fn await_blocked_backend(conn: &mut TenantConn<'_>) {
         .fetch_one(&mut **conn.transaction())
         .await
         .expect("blocked backends count");
-        if blocked > 0 {
+        if blocked >= count {
             return;
         }
         assert!(
@@ -1391,7 +1615,7 @@ async fn reclaimed_lease_fences_the_stale_token() {
     );
     assert!(
         queue
-            .claim(&mut conn, Duration::minutes(5), 1)
+            .claim(&mut conn, Duration::minutes(5), Duration::minutes(5), 1)
             .await
             .expect("claim runs")
             .is_empty(),
@@ -1408,11 +1632,14 @@ async fn reclaimed_lease_fences_the_stale_token() {
         queue
             .complete(
                 &mut conn,
-                stale.lease,
-                result,
-                VerificationVerdict::Passed,
-                "drift detected",
-                Some(DRIFT_COUNTS)
+                &Completion {
+                    lease: stale.lease,
+                    result_id: result,
+                    verdict: VerificationVerdict::Passed,
+                    summary: "drift detected".into(),
+                    drift: Some(DRIFT_COUNTS),
+                    pr_source_extracted: false
+                },
             )
             .await
             .expect("stale completion answers"),
@@ -1430,11 +1657,14 @@ async fn reclaimed_lease_fences_the_stale_token() {
             queue
                 .complete(
                     &mut conn,
-                    current.lease,
-                    result,
-                    VerificationVerdict::Passed,
-                    "drift detected",
-                    Some(DRIFT_COUNTS)
+                    &Completion {
+                        lease: current.lease,
+                        result_id: result,
+                        verdict: VerificationVerdict::Passed,
+                        summary: "drift detected".into(),
+                        drift: Some(DRIFT_COUNTS),
+                        pr_source_extracted: false
+                    },
                 )
                 .await
                 .expect("completion answers"),
@@ -1445,11 +1675,14 @@ async fn reclaimed_lease_fences_the_stale_token() {
         queue
             .complete(
                 &mut conn,
-                current.lease,
-                VerificationResultId::new_v7(),
-                VerificationVerdict::Passed,
-                "drift detected",
-                Some(DRIFT_COUNTS),
+                &Completion {
+                    lease: current.lease,
+                    result_id: VerificationResultId::new_v7(),
+                    verdict: VerificationVerdict::Passed,
+                    summary: "drift detected".into(),
+                    drift: Some(DRIFT_COUNTS),
+                    pr_source_extracted: false
+                },
             )
             .await
             .expect("conflicting completion answers"),
@@ -1464,6 +1697,44 @@ async fn reclaimed_lease_fences_the_stale_token() {
     assert_eq!(status.state.status, VerificationExecutionStatus::Completed);
     assert_eq!(status.result_id, Some(result));
     assert_eq!(status.state.error, None);
+}
+
+/// A reclaim under the same execution timeout keeps the deadline its
+/// admission fixed and never replenishes what remains of it: a minute after
+/// admission, at most four of its five minutes remain.
+///
+/// # Panics
+/// Panics when a reclaim replenishes the deadline.
+#[tokio::test]
+async fn reclaims_keep_the_admission_deadline() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let actor = actor(fixture.data_tenant_id());
+    let queue = VerifierExecutionQueue::default();
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    let (owner, _) = declare_service(&mut conn, &actor, "svc").await;
+    let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
+    let binding = bind(&mut conn, &owner, &verifier, Vec::new()).await;
+    let execution = scheduled(&queue, &mut conn, binding).await;
+    let stale = claim(&queue, &mut conn).await;
+    expire_deadlines(&mut conn, execution).await;
+    sqlx::query(
+        "UPDATE wyrd.verifier_executions SET created_at = created_at - INTERVAL '1 minute' \
+          WHERE execution_id = $1",
+    )
+    .bind(execution.as_uuid())
+    .execute(&mut **conn.transaction())
+    .await
+    .expect("the admission is backdated");
+    let current = claim(&queue, &mut conn).await;
+    assert_eq!(current.lease.execution_id, execution);
+    assert!(
+        current.remaining <= std::time::Duration::from_mins(4)
+            && current.remaining < stale.remaining,
+        "a reclaim never replenishes the deadline"
+    );
 }
 
 /// A submission's enqueuing cause, including the caller's sampling
@@ -1565,7 +1836,7 @@ async fn retries_back_off_then_exhaust_to_errored() {
         assert_eq!(status.state.error, Some(engine_error()));
         assert!(
             queue
-                .claim(&mut conn, Duration::minutes(5), 1)
+                .claim(&mut conn, Duration::minutes(5), Duration::minutes(5), 1)
                 .await
                 .expect("early claim runs")
                 .is_empty(),
@@ -1601,12 +1872,13 @@ async fn retries_back_off_then_exhaust_to_errored() {
 }
 
 /// Cancelled and timed-out executions settle with their error and no result, and a
-/// crash on the final attempt is settled `errored` by the next claim instead of
-/// being reclaimed past the budget.
+/// crash on the final attempt is claimed once more as exhausted, counting no
+/// attempt, so its claimant can deliver an already selected outcome or
+/// settle the exhaustion; only a counted attempt computes.
 ///
 /// # Panics
 /// Panics when a terminal status carries a result or dispatch, or an
-/// exhausted expired lease is reclaimed.
+/// exhausted expired lease is claimed as a counted attempt.
 #[tokio::test]
 async fn terminal_failures_and_expired_final_attempts_carry_no_verdict() {
     let fixture = PgFixture::start().await.expect("fixture starts");
@@ -1652,17 +1924,48 @@ async fn terminal_failures_and_expired_final_attempts_carry_no_verdict() {
     }
 
     let execution = scheduled(&queue, &mut conn, binding).await;
-    for _ in 0..3 {
-        claim(&queue, &mut conn).await;
+    for attempt in 1..=3 {
+        let claimed = claim(&queue, &mut conn).await;
+        assert_eq!(
+            (claimed.attempt, claimed.exhausted),
+            (attempt, false),
+            "each attempt within the budget computes"
+        );
         expire_deadlines(&mut conn, execution).await;
     }
+    for _ in 0..2 {
+        let claimed = claim(&queue, &mut conn).await;
+        assert_eq!(
+            (claimed.attempt, claimed.exhausted),
+            (3, true),
+            "an expired final attempt is claimed again without counting one"
+        );
+        expire_deadlines(&mut conn, execution).await;
+    }
+    let claimed = claim(&queue, &mut conn).await;
+    let exhausted = VerificationError {
+        code: "lease_expired".to_owned(),
+        message: "the execution's lease expired after its final attempt".to_owned(),
+    };
+    assert_eq!(
+        queue
+            .terminate(
+                &mut conn,
+                claimed.lease,
+                TerminalStatus::Errored,
+                &exhausted
+            )
+            .await
+            .expect("terminate answers"),
+        Settlement::Applied
+    );
     assert!(
         queue
-            .claim(&mut conn, Duration::minutes(5), 1)
+            .claim(&mut conn, Duration::minutes(5), Duration::minutes(5), 1)
             .await
             .expect("claim runs")
             .is_empty(),
-        "an exhausted expired lease is not reclaimed"
+        "a settled exhaustion is not claimed again"
     );
     let status = queue
         .execution_status(&mut conn, execution)
@@ -1731,11 +2034,14 @@ async fn failed_binding_runs_dispatch_each_distinct_operator_once() {
                 queue
                     .complete(
                         &mut conn,
-                        claimed.lease,
-                        result,
-                        verdict,
-                        "drift detected",
-                        Some(DRIFT_COUNTS)
+                        &Completion {
+                            lease: claimed.lease,
+                            result_id: result,
+                            verdict,
+                            summary: "drift detected".into(),
+                            drift: Some(DRIFT_COUNTS),
+                            pr_source_extracted: false
+                        },
                     )
                     .await
                     .expect("completion answers"),
@@ -1921,11 +2227,14 @@ async fn queue_state_is_tenant_isolated() {
     queue
         .complete(
             &mut conn,
-            claimed.lease,
-            VerificationResultId::new_v7(),
-            VerificationVerdict::Failed,
-            "drift detected",
-            Some(DRIFT_COUNTS),
+            &Completion {
+                lease: claimed.lease,
+                result_id: VerificationResultId::new_v7(),
+                verdict: VerificationVerdict::Failed,
+                summary: "drift detected".into(),
+                drift: Some(DRIFT_COUNTS),
+                pr_source_extracted: false,
+            },
         )
         .await
         .expect("execution completes");
@@ -1966,7 +2275,7 @@ async fn queue_state_is_tenant_isolated() {
     );
     assert!(
         queue
-            .claim(&mut foreign, Duration::minutes(5), 1)
+            .claim(&mut foreign, Duration::minutes(5), Duration::minutes(5), 1)
             .await
             .expect("foreign claim runs")
             .is_empty()
@@ -2186,7 +2495,7 @@ async fn database_clock_owns_verifier_queue_deadlines() {
     );
     assert!(
         queue
-            .claim(&mut conn, Duration::minutes(5), 1)
+            .claim(&mut conn, Duration::minutes(5), Duration::minutes(5), 1)
             .await
             .expect("early claim runs")
             .is_empty(),
@@ -2200,11 +2509,14 @@ async fn database_clock_owns_verifier_queue_deadlines() {
         queue
             .complete(
                 &mut conn,
-                settled.lease,
-                VerificationResultId::new_v7(),
-                VerificationVerdict::Failed,
-                "drift detected",
-                Some(DRIFT_COUNTS),
+                &Completion {
+                    lease: settled.lease,
+                    result_id: VerificationResultId::new_v7(),
+                    verdict: VerificationVerdict::Failed,
+                    summary: "drift detected".into(),
+                    drift: Some(DRIFT_COUNTS),
+                    pr_source_extracted: false
+                },
             )
             .await
             .expect("completion answers"),
@@ -2295,11 +2607,14 @@ async fn failed_execution_with_two_dispatches(
     queue
         .complete(
             conn,
-            claimed.lease,
-            VerificationResultId::new_v7(),
-            VerificationVerdict::Failed,
-            &summary,
-            Some(DRIFT_COUNTS),
+            &Completion {
+                lease: claimed.lease,
+                result_id: VerificationResultId::new_v7(),
+                verdict: VerificationVerdict::Failed,
+                summary: summary.clone(),
+                drift: Some(DRIFT_COUNTS),
+                pr_source_extracted: false,
+            },
         )
         .await
         .expect("failed completion settles");
@@ -2884,7 +3199,17 @@ async fn group_snapshots_are_idempotent_and_react_in_settlement_order() {
     let complete =
         async |conn: &mut TenantConn<'_>, claimed: &ClaimedExecution, result, verdict| {
             queue
-                .complete(conn, claimed.lease, result, verdict, "verification", None)
+                .complete(
+                    conn,
+                    &Completion {
+                        lease: claimed.lease,
+                        result_id: result,
+                        verdict,
+                        summary: "verification".into(),
+                        drift: None,
+                        pr_source_extracted: false,
+                    },
+                )
                 .await
                 .expect("group settles")
         };
@@ -3038,7 +3363,7 @@ async fn group_snapshots_are_idempotent_and_react_in_settlement_order() {
     );
     assert!(
         queue
-            .claim(&mut conn, Duration::minutes(5), 1)
+            .claim(&mut conn, Duration::minutes(5), Duration::minutes(5), 1)
             .await
             .expect("claim runs")
             .is_empty(),
@@ -3194,15 +3519,15 @@ async fn a_claim_takes_up_to_its_limit_in_one_statement() {
     }
 
     let first = queue
-        .claim(&mut conn, Duration::minutes(5), 2)
+        .claim(&mut conn, Duration::minutes(5), Duration::minutes(5), 2)
         .await
         .expect("claim runs");
     let rest = queue
-        .claim(&mut conn, Duration::minutes(5), 5)
+        .claim(&mut conn, Duration::minutes(5), Duration::minutes(5), 5)
         .await
         .expect("claim runs");
     let drained = queue
-        .claim(&mut conn, Duration::minutes(5), 5)
+        .claim(&mut conn, Duration::minutes(5), Duration::minutes(5), 5)
         .await
         .expect("claim runs");
 
@@ -3355,6 +3680,7 @@ async fn a_batch_completes_many_executions_like_complete() {
         verdict,
         summary: "drift detected".to_owned(),
         drift: Some(DRIFT_COUNTS),
+        pr_source_extracted: false,
     };
     let batch = vec![
         completion(failed_claim.lease, VerificationVerdict::Failed),
@@ -3883,4 +4209,840 @@ async fn queued_admission_preserves_tenant_and_input_identity() {
     );
     assert_eq!(pending_groups(&mut conn, group_binding).await, 0);
     conn.commit().await.expect("writer commits");
+}
+
+/// Register one active Repository Card owning `count` `pull_request`
+/// bindings of one ready Verifier; return the Repository and its bindings.
+///
+/// # Panics
+/// Panics when a Card or binding write fails.
+async fn repository_with_bindings(
+    conn: &mut TenantConn<'_>,
+    actor: &Principal,
+    count: usize,
+) -> (CardUid, Vec<BindingId>) {
+    let repository = insert_card(conn, actor, &service_card("acme-api")).await;
+    sqlx::query("UPDATE wyrd.cards SET kind = 'Repository', status = 'active' WHERE card_uid = $1")
+        .bind(repository.as_uuid())
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("repository card rewrites");
+    let mut bindings = Vec::new();
+    for index in 0..count {
+        let verifier =
+            register_verifier(conn, actor, &format!("review-{index}"), custom_drift()).await;
+        bindings.extend(
+            project_bindings(
+                conn,
+                &repository,
+                &CardKind::Repository,
+                &[NewBinding {
+                    subject_occurrence_key: OWNER_OCCURRENCE_KEY.to_owned(),
+                    card_uid: repository.clone(),
+                    verifier_card_uid: verifier,
+                    trigger: FrozenTarget::Digest("sha256:pull-request".to_owned()),
+                    operators: Vec::new(),
+                    activation: BindingActivation::PullRequest,
+                }],
+            )
+            .await
+            .expect("binding projects"),
+        );
+    }
+    (repository, bindings)
+}
+
+/// The pins of PR 7 of repository 42 at head `head`.
+///
+/// # Panics
+/// Panics when the fixed repository id is rejected.
+fn pins(head: &str) -> PullRequestActivation {
+    PullRequestActivation {
+        host: "github.com".to_owned(),
+        repository_id: RepositoryId::new("42").expect("valid repository id"),
+        number: 7,
+        base: PullRequestRef {
+            ref_name: "main".to_owned(),
+            sha: "b".repeat(40),
+        },
+        head: PullRequestRef {
+            ref_name: "feature".to_owned(),
+            sha: head.repeat(40),
+        },
+        head_repository_id: Some(RepositoryId::new("42").expect("valid repository id")),
+        delivery_id: Uuid::now_v7().to_string(),
+        generation: Uuid::now_v7(),
+    }
+}
+
+/// The key of every PR these tests admit.
+fn pr_key(repository: &RepositoryId) -> PullRequestKey<'_> {
+    PullRequestKey {
+        host: "github.com",
+        repository_id: repository,
+        number: 7,
+    }
+}
+
+/// Every binding admitted under `owner`'s background authority.
+///
+/// # Panics
+/// Panics when the tenant's SYSTEM principal cannot be provisioned.
+async fn pr_targets(
+    conn: &mut TenantConn<'_>,
+    owner: PrincipalId,
+    bindings: &[BindingId],
+) -> Vec<PullRequestTarget> {
+    let authority = background(conn, owner).await;
+    bindings
+        .iter()
+        .map(|binding| PullRequestTarget {
+            binding_id: *binding,
+            authority: Ok(authority.clone()),
+        })
+        .collect()
+}
+
+/// A reserved generation is frozen but unclaimable until its handoff
+/// activates it; activation is idempotent and a replay completes a partial
+/// fanout; a new source cancels the queued
+/// and the running executions of the old one, fencing the running worker,
+/// and keeps their pins; an observation older than the newest generation is
+/// obsolete.
+///
+/// # Panics
+/// Panics when a reservation, activation, claim or supersession differs.
+#[tokio::test]
+async fn pull_request_generations_reserve_activate_and_supersede() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let actor = actor(fixture.data_tenant_id());
+    let queue = VerifierExecutionQueue::default();
+    let mut conn = fixture.tenant_conn().await.expect("tenant connection");
+    let (repository, bindings) = repository_with_bindings(&mut conn, &actor, 2).await;
+    assert_eq!(
+        queue
+            .pull_request_bindings(&mut conn, &repository)
+            .await
+            .expect("bindings read")
+            .iter()
+            .map(|binding| binding.binding_id)
+            .collect::<Vec<_>>(),
+        bindings
+    );
+    let repository_id = RepositoryId::new("42").expect("valid repository id");
+    let first = pins("a");
+    let t1 = database_now(&mut conn).await;
+    let history = queue
+        .lock_pull_request(&mut conn, pr_key(&repository_id))
+        .await
+        .expect("PR locks");
+    assert_eq!(history, PullRequestHistory::default());
+    let targets = pr_targets(&mut conn, actor.id, &bindings).await;
+    let (a, superseded) = queue
+        .reserve_pull_request(&mut conn, &first, t1, &targets)
+        .await
+        .expect("generation reserves");
+    assert_eq!((a.len(), superseded.len()), (2, 0));
+    assert!(
+        queue
+            .claim(&mut conn, Duration::minutes(5), Duration::minutes(5), 10)
+            .await
+            .expect("claim runs")
+            .is_empty(),
+        "a reserved generation is not claimable"
+    );
+    let state = status(&queue, &mut conn, a[0]).await.state;
+    assert_eq!(state.status, VerificationExecutionStatus::Pending);
+    assert_eq!(state.pull_request.as_ref(), Some(&first));
+
+    let history = queue
+        .lock_pull_request(&mut conn, pr_key(&repository_id))
+        .await
+        .expect("PR locks");
+    let current = history.current.clone().expect("a current generation");
+    assert!(current.reviews(&first) && !current.deactivated);
+    assert!(
+        current
+            .executions
+            .iter()
+            .all(|execution| execution.reserved)
+    );
+    assert!(history.obsolete(t1), "the same observation is not newer");
+
+    assert_eq!(
+        queue
+            .activate_pull_requests(&mut conn, &a[..1])
+            .await
+            .expect("activates"),
+        a[..1],
+        "a partial handoff activates only what reached the queue"
+    );
+    assert_eq!(
+        queue
+            .activate_pull_requests(&mut conn, &a)
+            .await
+            .expect("replay activates"),
+        a[1..],
+        "a replay completes the fanout without activating a binding twice"
+    );
+    assert!(
+        queue
+            .activate_pull_requests(&mut conn, &a)
+            .await
+            .expect("replay activates")
+            .is_empty(),
+        "a replayed handoff activates nothing"
+    );
+    let running = claim(&queue, &mut conn).await;
+    assert_eq!(
+        running.input,
+        ExecutionInput::PullRequest {
+            pull_request: Box::new(first.clone())
+        }
+    );
+    assert_eq!(running.origin, ExecutionOrigin::PullRequest);
+
+    let second = pins("c");
+    let t2 = database_now(&mut conn).await;
+    let (b, superseded) = queue
+        .reserve_pull_request(&mut conn, &second, t2, &targets)
+        .await
+        .expect("new generation reserves");
+    assert_eq!(b.len(), 2);
+    assert_eq!(
+        superseded.iter().copied().collect::<BTreeSet<_>>(),
+        a.iter().copied().collect::<BTreeSet<_>>()
+    );
+    for execution in &a {
+        let state = status(&queue, &mut conn, *execution).await.state;
+        assert_eq!(state.status, VerificationExecutionStatus::Cancelled);
+        assert_eq!(
+            state.error.map(|error| error.code).as_deref(),
+            Some("pull_request_superseded")
+        );
+        assert_eq!(state.pull_request.as_ref(), Some(&first), "pins are kept");
+    }
+    assert_eq!(
+        queue
+            .terminate(
+                &mut conn,
+                running.lease,
+                TerminalStatus::Errored,
+                &engine_error()
+            )
+            .await
+            .expect("settlement runs"),
+        Settlement::StaleLease,
+        "the superseded worker is fenced"
+    );
+    let history = queue
+        .lock_pull_request(&mut conn, pr_key(&repository_id))
+        .await
+        .expect("PR locks");
+    assert!(
+        history.obsolete(t1),
+        "an observation older than B is obsolete"
+    );
+    assert!(history.current.expect("current").reviews(&second));
+}
+
+/// Closing a PR cancels its unfinished executions with the close code and
+/// deactivates its generation, keeping settled history; access loss does
+/// the same for the repository's PRs, and a reservation it cancels is never
+/// activated; a binding refused at admission settles errored with its pins
+/// and runs nothing.
+///
+/// # Panics
+/// Panics when a cancellation, deactivation, activation or refusal differs.
+#[tokio::test]
+async fn pull_request_ends_access_loss_and_refusals_settle_durably() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let actor = actor(fixture.data_tenant_id());
+    let queue = VerifierExecutionQueue::default();
+    let mut conn = fixture.tenant_conn().await.expect("tenant connection");
+    let (_, bindings) = repository_with_bindings(&mut conn, &actor, 2).await;
+    let repository_id = RepositoryId::new("42").expect("valid repository id");
+    let mut targets = pr_targets(&mut conn, actor.id, &bindings).await;
+    let refusal = VerificationError {
+        code: "WYRD_PERMISSION_403_DENIED_RBAC".to_owned(),
+        message: "the Repository owner may not run this Verifier".to_owned(),
+    };
+    targets[1].authority = Err((Attribution::direct(actor.id), refusal.clone()));
+    let observed = database_now(&mut conn).await;
+    let (executions, _) = queue
+        .reserve_pull_request(&mut conn, &pins("a"), observed, &targets)
+        .await
+        .expect("generation reserves");
+    let refused = status(&queue, &mut conn, executions[1]).await.state;
+    assert_eq!(refused.status, VerificationExecutionStatus::Errored);
+    assert_eq!(refused.error, Some(refusal));
+    assert!(refused.pull_request.is_some());
+
+    let closed_at = database_now(&mut conn).await;
+    let cancelled = queue
+        .deactivate_pull_request(
+            &mut conn,
+            pr_key(&repository_id),
+            closed_at,
+            PullRequestEnd::Closed,
+        )
+        .await
+        .expect("PR deactivates");
+    assert_eq!(cancelled, vec![executions[0]]);
+    let state = status(&queue, &mut conn, executions[0]).await.state;
+    assert_eq!(
+        state.error.map(|error| error.code).as_deref(),
+        Some("pull_request_closed")
+    );
+    assert_eq!(
+        status(&queue, &mut conn, executions[1]).await.state.status,
+        VerificationExecutionStatus::Errored,
+        "settled history keeps its status"
+    );
+    let history = queue
+        .lock_pull_request(&mut conn, pr_key(&repository_id))
+        .await
+        .expect("PR locks");
+    assert!(history.current.expect("current").deactivated);
+    assert_eq!(history.latest_at, Some(closed_at));
+
+    let reopened = database_now(&mut conn).await;
+    let (reopened_executions, _) = queue
+        .reserve_pull_request(&mut conn, &pins("a"), reopened, &targets[..1])
+        .await
+        .expect("reopened generation reserves");
+    queue
+        .activate_pull_requests(&mut conn, &reopened_executions)
+        .await
+        .expect("activates");
+    assert_eq!(
+        queue
+            .cancel_pull_request_repositories(&mut conn, "github.com", Some(&["9".to_owned()]))
+            .await
+            .expect("other repository cancels"),
+        0,
+        "another repository's loss cancels nothing here"
+    );
+    queue
+        .cancel_pull_request_repositories(&mut conn, "github.com", Some(&["42".to_owned()]))
+        .await
+        .expect("repository cancels");
+    let state = status(&queue, &mut conn, reopened_executions[0])
+        .await
+        .state;
+    assert_eq!(state.status, VerificationExecutionStatus::Cancelled);
+    assert_eq!(
+        state.error.map(|error| error.code).as_deref(),
+        Some("repository_access_lost")
+    );
+
+    let reserved_at = database_now(&mut conn).await;
+    let (reserved, _) = queue
+        .reserve_pull_request(&mut conn, &pins("d"), reserved_at, &targets[..1])
+        .await
+        .expect("a generation reserves");
+    queue
+        .cancel_pull_request_repositories(&mut conn, "github.com", Some(&["42".to_owned()]))
+        .await
+        .expect("repository cancels");
+    assert!(
+        queue
+            .activate_pull_requests(&mut conn, &reserved)
+            .await
+            .expect("activation runs")
+            .is_empty(),
+        "a reservation cancelled by access loss is never activated"
+    );
+}
+
+/// Reserve and activate a generation of the test PR at `head` for
+/// `targets`, claim each execution, and return the claims in binding order.
+///
+/// # Panics
+/// Panics when the generation cannot be reserved, activated or claimed.
+async fn running_generation(
+    queue: &VerifierExecutionQueue,
+    conn: &mut TenantConn<'_>,
+    head: &str,
+    targets: &[PullRequestTarget],
+) -> Vec<ClaimedExecution> {
+    let observed = database_now(conn).await;
+    let (reserved, _) = queue
+        .reserve_pull_request(conn, &pins(head), observed, targets)
+        .await
+        .expect("generation reserves");
+    queue
+        .activate_pull_requests(conn, &reserved)
+        .await
+        .expect("generation activates");
+    let mut claims = Vec::new();
+    for _ in &reserved {
+        claims.push(claim(queue, conn).await);
+    }
+    claims.sort_by_key(|claim| {
+        reserved
+            .iter()
+            .position(|id| *id == claim.lease.execution_id)
+    });
+    claims
+}
+
+/// The completion of `claimed` with `verdict`, recording whether its pull
+/// request source was `extracted`.
+fn completion(
+    claimed: &ClaimedExecution,
+    verdict: VerificationVerdict,
+    extracted: bool,
+) -> Completion {
+    Completion {
+        lease: claimed.lease,
+        result_id: VerificationResultId::new_v7(),
+        verdict,
+        summary: "verification".to_owned(),
+        drift: None,
+        pr_source_extracted: extracted,
+    }
+}
+
+/// Whether `execution`'s row records its pull request source as extracted.
+///
+/// # Panics
+/// Panics when the read fails or `execution` has no row visible to `conn`.
+async fn source_extracted(conn: &mut TenantConn<'_>, execution: ExecutionId) -> bool {
+    sqlx::query_scalar(
+        "SELECT pr_source_extracted FROM wyrd.verifier_executions WHERE execution_id = $1",
+    )
+    .bind(execution.as_uuid())
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("execution reads")
+}
+
+/// A PR execution's baseline is the latest completed execution of the same
+/// PR under the exact same Verifier that extracted its source: with none it
+/// is the first review, and
+/// when only another version of the Verifier completed, the policy changed.
+/// Work that never completed is never a baseline, and a later generation
+/// reviews against the newest completed one, not the one it superseded.
+///
+/// # Panics
+/// Panics when a selected baseline differs.
+#[tokio::test]
+async fn pull_request_baseline_is_the_latest_extracted_review_under_the_same_policy() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let actor = actor(fixture.data_tenant_id());
+    let queue = VerifierExecutionQueue::default();
+    let mut conn = fixture.tenant_conn().await.expect("tenant connection");
+    let (_, bindings) = repository_with_bindings(&mut conn, &actor, 1).await;
+    let targets = pr_targets(&mut conn, actor.id, &bindings).await;
+    let complete = async |conn: &mut TenantConn<'_>, claimed: &ClaimedExecution| {
+        queue
+            .complete(
+                conn,
+                &completion(claimed, VerificationVerdict::Passed, true),
+            )
+            .await
+            .expect("execution settles");
+    };
+
+    let p = running_generation(&queue, &mut conn, "a", &targets)
+        .await
+        .remove(0);
+    assert_eq!(
+        queue
+            .pull_request_baseline(&mut conn, p.lease.execution_id)
+            .await
+            .expect("baseline reads"),
+        PullRequestBaseline::FirstReview
+    );
+    complete(&mut conn, &p).await;
+
+    let a = running_generation(&queue, &mut conn, "c", &targets)
+        .await
+        .remove(0);
+    let b = running_generation(&queue, &mut conn, "d", &targets)
+        .await
+        .remove(0);
+    let previous = PullRequestBaseline::Previous {
+        execution_id: p.lease.execution_id,
+        head: "a".repeat(40),
+    };
+    assert_eq!(
+        queue
+            .pull_request_baseline(&mut conn, b.lease.execution_id)
+            .await
+            .expect("baseline reads"),
+        previous,
+        "B, admitted while A ran, reviews from P"
+    );
+    assert_eq!(
+        queue
+            .pull_request_baseline(&mut conn, a.lease.execution_id)
+            .await
+            .expect("baseline reads"),
+        previous
+    );
+
+    let mut next = service_card("review-0");
+    next.metadata.version = Some("2.0.0".parse().expect("version"));
+    let other_version = insert_card(&mut conn, &actor, &next).await;
+    sqlx::query("UPDATE wyrd.cards SET kind = 'Verifier', status = 'active' WHERE card_uid = $1")
+        .bind(other_version.as_uuid())
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("another version of the Verifier registers");
+    sqlx::query(
+        "UPDATE wyrd.verifier_executions SET verifier_card_uid = $1 WHERE execution_id = $2",
+    )
+    .bind(other_version.as_uuid())
+    .bind(p.lease.execution_id.as_uuid())
+    .execute(&mut **conn.transaction())
+    .await
+    .expect("P ran another version of the Verifier");
+    assert_eq!(
+        queue
+            .pull_request_baseline(&mut conn, b.lease.execution_id)
+            .await
+            .expect("baseline reads"),
+        PullRequestBaseline::PolicyChanged
+    );
+
+    sqlx::query(
+        "UPDATE wyrd.verifier_executions SET pr_source_extracted = false WHERE execution_id = $1",
+    )
+    .bind(p.lease.execution_id.as_uuid())
+    .execute(&mut **conn.transaction())
+    .await
+    .expect("P extracted nothing");
+    assert_eq!(
+        queue
+            .pull_request_baseline(&mut conn, b.lease.execution_id)
+            .await
+            .expect("baseline reads"),
+        PullRequestBaseline::FirstReview,
+        "an unextracted review under another version is no policy change"
+    );
+}
+
+/// Another tenant's extracted review is never a baseline: tenant B reviews
+/// the same pull request of the same repository id under a Verifier of the
+/// same name after tenant A completed one, and starts from a first review.
+///
+/// # Panics
+/// Panics when tenant B's baseline sees tenant A's history.
+#[tokio::test]
+async fn pull_request_baseline_is_tenant_isolated() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let other = fixture
+        .seed_additional_tenant("pull-request-baseline-other")
+        .await
+        .expect("second tenant seeds");
+    let queue = VerifierExecutionQueue::default();
+    let tenant_a = actor(fixture.data_tenant_id());
+    let mut conn = fixture.tenant_conn().await.expect("tenant A connection");
+    let (_, bindings) = repository_with_bindings(&mut conn, &tenant_a, 1).await;
+    let targets = pr_targets(&mut conn, tenant_a.id, &bindings).await;
+    let reviewed = running_generation(&queue, &mut conn, "a", &targets)
+        .await
+        .remove(0);
+    queue
+        .complete(
+            &mut conn,
+            &completion(&reviewed, VerificationVerdict::Passed, true),
+        )
+        .await
+        .expect("tenant A's extracted review completes");
+    conn.commit().await.expect("tenant A commits");
+
+    let tenant_b = actor(other);
+    let mut foreign = fixture
+        .tenant_conn_for(other)
+        .await
+        .expect("tenant B connection");
+    let (_, bindings) = repository_with_bindings(&mut foreign, &tenant_b, 1).await;
+    let targets = pr_targets(&mut foreign, tenant_b.id, &bindings).await;
+    let next = running_generation(&queue, &mut foreign, "c", &targets)
+        .await
+        .remove(0);
+    assert_eq!(
+        queue
+            .pull_request_baseline(&mut foreign, next.lease.execution_id)
+            .await
+            .expect("baseline reads"),
+        PullRequestBaseline::FirstReview,
+        "tenant A's review is invisible to tenant B"
+    );
+}
+
+/// A completed review whose extraction failed is never a baseline, while a
+/// failed or inconclusive judgment after a successful extraction is: the
+/// baseline follows the extracted source, not the verdict.
+///
+/// # Panics
+/// Panics when a selected baseline differs.
+#[tokio::test]
+async fn pull_request_baseline_follows_extracted_source_not_the_verdict() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let actor = actor(fixture.data_tenant_id());
+    let queue = VerifierExecutionQueue::default();
+    let mut conn = fixture.tenant_conn().await.expect("tenant connection");
+    let (_, bindings) = repository_with_bindings(&mut conn, &actor, 1).await;
+    let targets = pr_targets(&mut conn, actor.id, &bindings).await;
+    let reviewed = running_generation(&queue, &mut conn, "a", &targets)
+        .await
+        .remove(0);
+    queue
+        .complete(
+            &mut conn,
+            &completion(&reviewed, VerificationVerdict::Passed, true),
+        )
+        .await
+        .expect("the extracted review completes");
+    let unreadable = running_generation(&queue, &mut conn, "c", &targets)
+        .await
+        .remove(0);
+    queue
+        .complete(
+            &mut conn,
+            &completion(&unreadable, VerificationVerdict::Inconclusive, false),
+        )
+        .await
+        .expect("the review whose extraction failed completes");
+
+    let next = running_generation(&queue, &mut conn, "d", &targets)
+        .await
+        .remove(0);
+    assert_eq!(
+        queue
+            .pull_request_baseline(&mut conn, next.lease.execution_id)
+            .await
+            .expect("baseline reads"),
+        PullRequestBaseline::Previous {
+            execution_id: reviewed.lease.execution_id,
+            head: "a".repeat(40),
+        },
+        "the review that could not read its source is skipped"
+    );
+
+    queue
+        .complete(
+            &mut conn,
+            &completion(&next, VerificationVerdict::Inconclusive, true),
+        )
+        .await
+        .expect("the extracted but inconclusive review completes");
+    let last = running_generation(&queue, &mut conn, "e", &targets)
+        .await
+        .remove(0);
+    assert_eq!(
+        queue
+            .pull_request_baseline(&mut conn, last.lease.execution_id)
+            .await
+            .expect("baseline reads"),
+        PullRequestBaseline::Previous {
+            execution_id: next.lease.execution_id,
+            head: "d".repeat(40),
+        },
+        "an inconclusive judgment of extracted source still advances"
+    );
+}
+
+/// Batched completion records each execution's extracted source exactly as
+/// single completion does, and an identical replay keeps it.
+///
+/// # Panics
+/// Panics when a recorded fact differs.
+#[tokio::test]
+async fn batched_and_single_completion_record_extracted_source_alike() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let actor = actor(fixture.data_tenant_id());
+    let queue = VerifierExecutionQueue::default();
+    let mut conn = fixture.tenant_conn().await.expect("tenant connection");
+    let (_, bindings) = repository_with_bindings(&mut conn, &actor, 3).await;
+    let targets = pr_targets(&mut conn, actor.id, &bindings).await;
+    let claims = running_generation(&queue, &mut conn, "a", &targets).await;
+    let batch = [
+        completion(&claims[0], VerificationVerdict::Passed, true),
+        completion(&claims[1], VerificationVerdict::Failed, false),
+    ];
+    let single = completion(&claims[2], VerificationVerdict::Passed, true);
+
+    let settled = queue
+        .complete_many(&mut conn, &batch)
+        .await
+        .expect("batch completes");
+    assert_eq!(settled, [Settlement::Applied, Settlement::Applied]);
+    assert_eq!(
+        queue
+            .complete(&mut conn, &single)
+            .await
+            .expect("single completes"),
+        Settlement::Applied
+    );
+    let recorded = [
+        source_extracted(&mut conn, claims[0].lease.execution_id).await,
+        source_extracted(&mut conn, claims[1].lease.execution_id).await,
+        source_extracted(&mut conn, claims[2].lease.execution_id).await,
+    ];
+    assert_eq!(recorded, [true, false, true]);
+
+    let replayed = queue
+        .complete_many(&mut conn, &batch)
+        .await
+        .expect("replay completes");
+    assert_eq!(replayed, [Settlement::Applied, Settlement::Applied]);
+    assert_eq!(
+        queue
+            .complete(&mut conn, &single)
+            .await
+            .expect("single replay completes"),
+        Settlement::Applied
+    );
+    let replayed = [
+        source_extracted(&mut conn, claims[0].lease.execution_id).await,
+        source_extracted(&mut conn, claims[1].lease.execution_id).await,
+        source_extracted(&mut conn, claims[2].lease.execution_id).await,
+    ];
+    assert_eq!(replayed, recorded, "identical replay preserves each fact");
+}
+
+/// A completion under a lost lease, one whose transaction rolls back, and
+/// one arriving after cancellation record no extracted source, single and
+/// batched alike.
+///
+/// # Panics
+/// Panics when a stale or rolled-back completion leaves the fact behind.
+#[tokio::test]
+async fn stale_or_rolled_back_completion_records_no_extracted_source() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let actor = actor(fixture.data_tenant_id());
+    let queue = VerifierExecutionQueue::default();
+    let mut conn = fixture.tenant_conn().await.expect("tenant connection");
+    let (_, bindings) = repository_with_bindings(&mut conn, &actor, 1).await;
+    let targets = pr_targets(&mut conn, actor.id, &bindings).await;
+    let stale = running_generation(&queue, &mut conn, "a", &targets)
+        .await
+        .remove(0);
+    expire_deadlines(&mut conn, stale.lease.execution_id).await;
+    let current = claim(&queue, &mut conn).await;
+    conn.commit().await.expect("the reclaimed review commits");
+
+    let mut conn = fixture.tenant_conn().await.expect("tenant connection");
+    assert_eq!(
+        queue
+            .complete(
+                &mut conn,
+                &completion(&stale, VerificationVerdict::Passed, true)
+            )
+            .await
+            .expect("stale completion answers"),
+        Settlement::StaleLease
+    );
+    assert_eq!(
+        queue
+            .complete(
+                &mut conn,
+                &completion(&current, VerificationVerdict::Passed, true)
+            )
+            .await
+            .expect("completion applies"),
+        Settlement::Applied
+    );
+    conn.rollback().await.expect("completion rolls back");
+
+    let mut conn = fixture.tenant_conn().await.expect("tenant connection");
+    assert!(!source_extracted(&mut conn, current.lease.execution_id).await);
+
+    assert_eq!(
+        queue
+            .complete_many(
+                &mut conn,
+                &[completion(&stale, VerificationVerdict::Passed, true)],
+            )
+            .await
+            .expect("stale batched completion answers"),
+        [Settlement::StaleLease]
+    );
+    assert_eq!(
+        queue
+            .complete_many(
+                &mut conn,
+                &[completion(&current, VerificationVerdict::Passed, true)],
+            )
+            .await
+            .expect("batched completion applies"),
+        [Settlement::Applied]
+    );
+    conn.rollback()
+        .await
+        .expect("batched completion rolls back");
+    let mut conn = fixture.tenant_conn().await.expect("tenant connection");
+    assert!(!source_extracted(&mut conn, current.lease.execution_id).await);
+
+    assert!(
+        queue
+            .cancel(&mut conn, current.lease.execution_id)
+            .await
+            .expect("cancel applies")
+    );
+    let late = completion(&current, VerificationVerdict::Passed, true);
+    assert_eq!(
+        queue
+            .complete(&mut conn, &late)
+            .await
+            .expect("late completion answers"),
+        Settlement::StaleLease
+    );
+    assert_eq!(
+        queue
+            .complete_many(&mut conn, std::slice::from_ref(&late))
+            .await
+            .expect("late batched completion answers"),
+        [Settlement::StaleLease]
+    );
+    conn.commit().await.expect("cancellation commits");
+    let mut conn = fixture.tenant_conn().await.expect("tenant connection");
+    assert!(
+        !source_extracted(&mut conn, current.lease.execution_id).await,
+        "cancelled work never becomes eligible"
+    );
+}
+
+/// Only a completed `pull_request` execution can record extracted source:
+/// a submission's completion claiming it is refused.
+///
+/// # Panics
+/// Panics when the database accepts the fact on another origin.
+#[tokio::test]
+async fn only_pull_request_executions_record_extracted_source() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let actor = actor(tenant);
+    let queue = VerifierExecutionQueue::default();
+    let mut conn = fixture.tenant_conn().await.expect("tenant connection");
+    let (owner, _) = declare_service(&mut conn, &actor, "svc").await;
+    let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
+    submitted(
+        &queue,
+        &mut conn,
+        &submission(tenant, authority(&actor), request(&verifier, &owner), None),
+    )
+    .await;
+    let claimed = claim(&queue, &mut conn).await;
+
+    let refused = queue
+        .complete(
+            &mut conn,
+            &completion(&claimed, VerificationVerdict::Passed, true),
+        )
+        .await
+        .expect_err("a submission cannot record extracted source");
+
+    assert_eq!(
+        refused
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .as_deref(),
+        Some("23514")
+    );
 }

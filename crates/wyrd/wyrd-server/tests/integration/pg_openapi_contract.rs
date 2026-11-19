@@ -17,7 +17,7 @@ use std::collections::BTreeSet;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
 use secrecy::ExposeSecret as _;
-use serde_json::Value;
+use serde_json::{Value, json};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::storage::ids::UploadId;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
@@ -290,6 +290,69 @@ async fn the_served_document_describes_the_composed_surface() {
     );
 
     server.shutdown().await.expect("server shuts down");
+}
+
+/// The GitHub connection surface is served: its five tenant operations take
+/// the Wyrd access token or the browser session and answer their documented
+/// success status, and the webhook clears that requirement because GitHub
+/// authenticates it by signature.
+///
+/// # Panics
+/// Panics when the server does not start or an operation's success
+/// status, security, schema or problem responses differ.
+#[tokio::test]
+async fn github_connection_operations_publish_their_contract() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    for (path, method, success) in [
+        ("/v1/integrations/github", "get", "200"),
+        ("/v1/integrations/github", "delete", "200"),
+        ("/v1/integrations/github/connect", "post", "201"),
+        ("/v1/integrations/github/setup", "get", "302"),
+        ("/v1/integrations/github/callback", "get", "200"),
+    ] {
+        let operation = &document["paths"][path][method];
+        assert!(
+            operation["responses"][success].is_object(),
+            "{method} {path}"
+        );
+        assert_eq!(
+            operation.get("security"),
+            Some(&token_or_browser_session()),
+            "{method} {path}"
+        );
+    }
+    let schema = |path: &str, method: &str, status: &str| {
+        document["paths"][path][method]["responses"][status]["content"]["application/json"]
+            ["schema"]["$ref"]
+            .clone()
+    };
+    for (path, method, status) in [
+        ("/v1/integrations/github", "get", "200"),
+        ("/v1/integrations/github", "delete", "200"),
+        ("/v1/integrations/github/callback", "get", "200"),
+    ] {
+        assert_eq!(
+            schema(path, method, status),
+            json!("#/components/schemas/GithubConnectionView"),
+            "{method} {path}"
+        );
+    }
+    assert_eq!(
+        schema("/v1/integrations/github/connect", "post", "201"),
+        json!("#/components/schemas/GithubConnectResponse")
+    );
+    assert_eq!(
+        document["paths"]["/v1/integrations/github/connect"]["post"]["requestBody"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        json!("#/components/schemas/GithubConnectRequest")
+    );
+    let webhook = &document["paths"]["/v1/integrations/github/webhook"]["post"];
+    assert!(webhook["responses"]["202"].is_object(), "{webhook}");
+    assert_eq!(webhook["security"], json!([{}]));
+    server.shutdown().await.expect("test server shuts down");
 }
 
 /// The tenant human-connection administration surface is served with its typed
@@ -1432,7 +1495,8 @@ async fn gateway_inference_ingress_publishes_the_fallback_header() {
 /// shapes.
 ///
 /// Also walks the served `Card -> Status -> verification -> binding_ids`
-/// chain, proving the read-side binding identities are a UUID array.
+/// chain, proving the read-side binding identities are a UUID array, and
+/// serves the Repository kind with its named selection status.
 ///
 /// # Panics
 /// Panics when the server fails to start or stop or any published shape
@@ -1474,8 +1538,16 @@ async fn card_contract_publishes_typed_lifecycle_and_problem_shapes() {
             .as_array()
             .expect("typed spec alternatives")
             .len(),
-        14,
+        15,
         "one typed spec per registrable native Card kind"
+    );
+    assert!(
+        document["components"]["schemas"]["CardKind"]["enum"]
+            .as_array()
+            .expect("Card kinds")
+            .iter()
+            .any(|kind| kind == "Repository"),
+        "Repository is a native Card kind"
     );
 
     let status = resolve_schema(&document, &card["properties"]["status"]);
@@ -1483,6 +1555,11 @@ async fn card_contract_publishes_typed_lifecycle_and_problem_shapes() {
     assert_eq!(
         verification, &document["components"]["schemas"]["VerificationStatus"],
         "Card status carries the named verification status"
+    );
+    let repository = resolve_schema(&document, &status["properties"]["repository"]);
+    assert_eq!(
+        repository, &document["components"]["schemas"]["RepositoryStatus"],
+        "Card status carries the named Repository selection"
     );
     let binding_ids = resolve_schema(&document, &verification["properties"]["binding_ids"]);
     assert_eq!(binding_ids["type"], "array", "binding IDs are an array");
@@ -1513,10 +1590,13 @@ async fn card_contract_publishes_typed_lifecycle_and_problem_shapes() {
     server.shutdown().await.expect("server shuts down");
 }
 
-/// The Verification surface is exactly five typed operations.
+/// The Verification surface is exactly fourteen typed operations.
 ///
-/// Binding status, evidence planning, direct execution, enqueue, and
-/// execution status publish their typed request and response schemas,
+/// Binding status, evidence planning, deferred evidence publication, direct
+/// execution, enqueue, execution
+/// status, invocation and publication pages, publication read, download, and
+/// local content, cancellation, and an approval decision publish their typed
+/// request and response schemas; local content answers `application/octet-stream` bytes,
 /// enqueue answers `202 Accepted`, direct execution answers `200` with its
 /// compact result and documents its stable refusals, execution details are
 /// their own read whose requirements add the check and provenance the
@@ -1526,14 +1606,23 @@ async fn card_contract_publishes_typed_lifecycle_and_problem_shapes() {
 /// document names no retired evaluation identifier — neither an abbreviation
 /// (`Eval…`, `…_EVAL_…`) nor an expanded product name (`EvaluationRun`,
 /// `evaluation_runs`, `/evaluations`), while descriptive `Evaluation` prose
-/// and words such as `retrieval` stay legal.
+/// and words such as `retrieval` stay legal. A recorded tool call names one
+/// built-in by its dotted identity, the new `fs.write` and `publish`
+/// included, and never by its provider-facing spelling. A step publishes
+/// its orchestration controls (`depends_on` with its `any_succeeded` form,
+/// `when`, `foreach`, `repeat`, `speculative`) and a Verifier its `limits`;
+/// invocation and publication listings report each producer's speculative
+/// disposition, one of the five the contract names, and its branch item,
+/// iteration, and attempt.
 ///
 /// # Panics
 /// Panics when the server fails to start or stop, when a Verification path,
-/// method, status, or schema reference differs, or when the document names a
-/// retired evaluation identifier.
+/// method, status, or schema reference differs, when a recorded tool
+/// identity is missing or provider-spelled, when an orchestration control,
+/// disposition, or producer field is unpublished, or when the document names
+/// a retired evaluation identifier.
 #[tokio::test]
-async fn verification_contract_publishes_six_typed_operations_and_the_local_upload() {
+async fn verification_contract_publishes_fourteen_typed_operations_and_the_local_upload() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -1557,9 +1646,35 @@ async fn verification_contract_publishes_six_typed_operations_and_the_local_uplo
             ("/v1/verification/bindings/{binding_id}", "get"),
             ("/v1/verification/enqueue", "post"),
             ("/v1/verification/evidence", "post"),
+            ("/v1/verification/evidence/publish", "post"),
             ("/v1/verification/execute", "post"),
             ("/v1/verification/executions/{execution_id}", "get"),
+            (
+                "/v1/verification/executions/{execution_id}/approvals/{approval_id}",
+                "post"
+            ),
+            ("/v1/verification/executions/{execution_id}/cancel", "post"),
             ("/v1/verification/executions/{execution_id}/details", "get"),
+            (
+                "/v1/verification/executions/{execution_id}/invocations",
+                "get"
+            ),
+            (
+                "/v1/verification/executions/{execution_id}/publications",
+                "get"
+            ),
+            (
+                "/v1/verification/executions/{execution_id}/publications/{step_id}/{name}",
+                "get"
+            ),
+            (
+                "/v1/verification/executions/{execution_id}/publications/{step_id}/{name}/content",
+                "get"
+            ),
+            (
+                "/v1/verification/executions/{execution_id}/publications/{step_id}/{name}/download",
+                "post"
+            ),
         ])
     );
 
@@ -1576,6 +1691,16 @@ async fn verification_contract_publishes_six_typed_operations_and_the_local_uplo
     assert_eq!(
         schema_ref(enqueue, "202").as_deref(),
         Some("#/components/schemas/EnqueueVerificationResponse")
+    );
+    let decide =
+        &paths["/v1/verification/executions/{execution_id}/approvals/{approval_id}"]["post"];
+    assert_eq!(
+        decide["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/DecideApprovalRequest"
+    );
+    assert_eq!(
+        schema_ref(decide, "200").as_deref(),
+        Some("#/components/schemas/ApprovalReceipt")
     );
     let evidence = &paths["/v1/verification/evidence"]["post"];
     assert_eq!(
@@ -1602,6 +1727,42 @@ async fn verification_contract_publishes_six_typed_operations_and_the_local_uplo
         .as_deref(),
         Some("#/components/schemas/VerificationExecutionState")
     );
+    let publication = "/v1/verification/executions/{execution_id}/publications/{step_id}/{name}";
+    assert!(
+        paths[format!("{publication}/content").as_str()]["get"]["responses"]["200"]["content"]
+            ["application/octet-stream"]
+            .is_object(),
+        "local content answers bytes"
+    );
+    for (path, method, schema) in [
+        (
+            "/v1/verification/executions/{execution_id}/invocations",
+            "get",
+            "InvocationPage",
+        ),
+        (
+            "/v1/verification/executions/{execution_id}/publications",
+            "get",
+            "PublicationPage",
+        ),
+        (publication, "get", "Publication"),
+        (
+            &format!("{publication}/download"),
+            "post",
+            "DownloadInitResponse",
+        ),
+        (
+            "/v1/verification/executions/{execution_id}/cancel",
+            "post",
+            "CancelExecutionResponse",
+        ),
+    ] {
+        assert_eq!(
+            schema_ref(&paths[path][method], "200").as_deref(),
+            Some(format!("#/components/schemas/{schema}").as_str()),
+            "{method} {path}"
+        );
+    }
     assert_eq!(
         schema_ref(
             &paths["/v1/verification/executions/{execution_id}/details"]["get"],
@@ -1669,10 +1830,177 @@ async fn verification_contract_publishes_six_typed_operations_and_the_local_uplo
         "{documented:?}"
     );
 
+    let tool = resolve_schema(
+        &document,
+        &document["components"]["schemas"]["ToolCallRecord"]["properties"]["tool"],
+    );
+    let tools: BTreeSet<&str> = tool["enum"]
+        .as_array()
+        .expect("a recorded tool is one built-in")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        ["fs.write", "publish", "fs.read", "code.run"]
+            .iter()
+            .all(|name| tools.contains(name)),
+        "{tools:?}"
+    );
+    assert!(
+        tools
+            .iter()
+            .all(|name| name.contains('.') || *name == "publish"),
+        "recorded tools keep their dotted identity, never a provider spelling: {tools:?}"
+    );
+
+    let schemas = &document["components"]["schemas"];
+    let properties = |name: &str| -> BTreeSet<String> {
+        let schema = resolve_schema(&document, &schemas[name]);
+        let flattened = schema["allOf"].as_array().into_iter().flatten();
+        let found: BTreeSet<String> = std::iter::once(schema)
+            .chain(flattened)
+            .filter_map(|part| part["properties"].as_object())
+            .flat_map(|properties| properties.keys().cloned())
+            .collect();
+        assert!(!found.is_empty(), "{name} is an object schema: {schema}");
+        found
+    };
+    let step = properties("Step");
+    assert!(
+        ["depends_on", "when", "foreach", "repeat", "speculative"]
+            .iter()
+            .all(|control| step.contains(*control)),
+        "a step publishes every orchestration control: {step:?}"
+    );
+    assert!(
+        properties("VerifierSpec").contains("limits"),
+        "a Verifier publishes its authored limits"
+    );
+    assert!(
+        schemas["DependsOn"].to_string().contains("any_succeeded"),
+        "depends_on publishes its any_succeeded form: {}",
+        schemas["DependsOn"]
+    );
+    let speculation: BTreeSet<&str> = resolve_schema(&document, &schemas["Speculation"])["enum"]
+        .as_array()
+        .expect("a speculative disposition is an enum")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(
+        speculation,
+        BTreeSet::from(["none", "pending", "admitted", "discarded", "blocked"])
+    );
+    for listed in ["ExecutionInvocation", "PublicationSummary"] {
+        assert!(
+            properties(listed).contains("speculation"),
+            "{listed} reports its producer's speculative disposition"
+        );
+    }
+    let producer = properties("Producer");
+    assert!(
+        ["step_id", "item_index", "iteration_index", "attempt"]
+            .iter()
+            .all(|field| producer.contains(*field)),
+        "a producer names its branch item, iteration, and attempt: {producer:?}"
+    );
+
     let retired = retired_vocabulary(&document.to_string());
     assert!(
         retired.is_empty(),
         "served OpenAPI names the retired evaluation vocabulary: {retired:?}"
+    );
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// The served verification details declare the code-mode tool records the
+/// Rust contract writes: every step and detailed requirement may carry
+/// `tool_calls` of the one `ToolCallRecord` component, which is optional so
+/// historical results without it still conform, while the compact
+/// requirement result carries none; each record may name its `recipient`,
+/// optional because a historical record without one was model-directed, as
+/// exactly `model` or `code`; and digest, bytes, and error keep their meaning.
+///
+/// # Panics
+/// Panics when the server fails to start or stop, or when a record field,
+/// its optionality, or its schema shape differs.
+#[tokio::test]
+async fn verification_tool_records_match_served_contract() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let schemas = &document["components"]["schemas"];
+    let required = |name: &str| -> BTreeSet<String> {
+        schemas[name]["required"]
+            .as_array()
+            .map(|required| {
+                required
+                    .iter()
+                    .filter_map(|field| field.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    assert!(
+        schemas["RequirementResult"]["properties"]
+            .get("tool_calls")
+            .is_none(),
+        "the compact requirement result omits tool calls"
+    );
+    for owner in ["StepResult", "RequirementDetails"] {
+        let schema = &schemas[owner];
+        let arms: Vec<&Value> = std::iter::once(schema)
+            .chain(schema["allOf"].as_array().into_iter().flatten())
+            .collect();
+        let calls = arms
+            .iter()
+            .map(|arm| &arm["properties"]["tool_calls"])
+            .find(|calls| !calls.is_null())
+            .unwrap_or(&Value::Null);
+        assert_eq!(calls["type"], "array", "{owner}: {calls}");
+        assert_eq!(
+            calls["items"]["$ref"], "#/components/schemas/ToolCallRecord",
+            "{owner}: {calls}"
+        );
+        assert!(
+            arms.iter()
+                .filter_map(|arm| arm["required"].as_array())
+                .flatten()
+                .all(|field| field != "tool_calls"),
+            "{owner}: a historical result without tool calls conforms"
+        );
+    }
+    let record = &schemas["ToolCallRecord"];
+    let fields: BTreeSet<&str> = record["properties"]
+        .as_object()
+        .expect("record properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        fields,
+        BTreeSet::from([
+            "arguments",
+            "error",
+            "output_sha256",
+            "recipient",
+            "returned_bytes",
+            "tool"
+        ]),
+        "{record}"
+    );
+    assert_eq!(
+        required("ToolCallRecord"),
+        BTreeSet::from(["arguments", "returned_bytes", "tool"].map(str::to_owned)),
+        "a historical record without a recipient conforms: {record}"
+    );
+    assert_eq!(
+        resolve_schema(&document, &record["properties"]["recipient"])["enum"],
+        serde_json::json!(["model", "code"]),
+        "{record}"
     );
 
     server.shutdown().await.expect("server shuts down");

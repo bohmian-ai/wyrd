@@ -4,6 +4,8 @@ pub mod bifrost;
 pub mod capacity;
 pub mod experiment;
 pub mod gateway_capture;
+/// A loopback GitHub for GitHub App connection journeys.
+pub mod github;
 pub mod human_login;
 pub mod interleaving;
 pub mod keys;

@@ -138,6 +138,7 @@ impl ArtifactUpload {
             input: DeclarationInput {
                 submissions: Vec::new(),
                 artifact_sources: BTreeMap::new(),
+                repository: None,
             },
             extracted: Vec::new(),
             skipped: Vec::new(),

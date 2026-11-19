@@ -4,6 +4,8 @@
 //! without it compiles an empty library and never activates `PyO3` or an
 //! owner crate's Python boundary.
 
+#[cfg(feature = "bench")]
+mod benchmark;
 #[cfg(feature = "python")]
 mod bifrost;
 #[cfg(feature = "python")]
@@ -12,6 +14,9 @@ mod cli;
 mod client;
 #[cfg(feature = "python")]
 mod gateway_admin;
+/// `PyO3` boundary for the tenant GitHub connection handle.
+#[cfg(feature = "python")]
+mod github;
 #[cfg(feature = "python")]
 mod observe;
 #[cfg(feature = "python")]
@@ -131,10 +136,23 @@ fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_submodule(&operators)?;
     register_submodule(py, "wyrd._wyrd.operators", &operators)?;
 
+    let github = PyModule::new(py, "github")?;
+    github::register(&github)?;
+    m.add_submodule(&github)?;
+    register_submodule(py, "wyrd._wyrd.github", &github)?;
+
     let principals = PyModule::new(py, "auth")?;
     principals::register(&principals)?;
     m.add_submodule(&principals)?;
     register_submodule(py, "wyrd._wyrd.auth", &principals)?;
+
+    #[cfg(feature = "bench")]
+    {
+        let benchmark = PyModule::new(py, "_benchmark")?;
+        benchmark::register(&benchmark)?;
+        m.add_submodule(&benchmark)?;
+        register_submodule(py, "wyrd._wyrd._benchmark", &benchmark)?;
+    }
 
     #[cfg(feature = "testing")]
     {

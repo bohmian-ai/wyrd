@@ -118,8 +118,12 @@ non-tail WAL is a no-go and invokes full restore or incident escalation.
 ### Scribe outbox path
 
 1. A rising `outbox_write_failures_total{outbox="scribe"}` means audit
-   decisions, gateway captures, or Verifier results are not reaching Scribe.
-   Requests, gateway calls, and run settlement keep succeeding. The writer
+   decisions, gateway captures, verification state revisions, or Verifier
+   results are not reaching Scribe. Requests, gateway calls, direct verification
+   and running engine work keep succeeding. Finished queued executions hold
+   their claims until Scribe acknowledges their terminal state and results, so
+   new queued claims pause once claim capacity is full; they settle without
+   recomputation when Scribe recovers. The writer
    resubmits the identical slice after each retryable failure, so
    `outbox_pending{outbox="scribe"}` grows while the failure lasts. Restore the
    local Scribe or the peer-plane path to a Scribe pod; the logged error names

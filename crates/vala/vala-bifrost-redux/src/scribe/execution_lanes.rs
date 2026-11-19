@@ -9,8 +9,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use arrow::array::{Array, ArrayRef, AsArray, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use futures_util::FutureExt as _;
 use iceberg::spec::Schema as IcebergSchema;
 use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
+use wyrd_runtime::resources::{Operation, Workload, WorkloadManager};
 
 use crate::catalog::TenantTableBinding;
 use crate::contracts::{IngressPayload, ScribeError, StampedAttribution};
@@ -24,7 +26,7 @@ use crate::scribe::wal::{
 };
 use std::str::FromStr;
 use wyrd_spec::auth::{Attribution, PrincipalId};
-use wyrd_spec::ids::CardUid;
+use wyrd_spec::ids::{CardUid, DataTenantId};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::managed_columns::{
@@ -116,6 +118,20 @@ fn record_lane_finished(lane: &'static str) {
     metrics::gauge!("bifrost_scribe_lane_active", "lane" => lane).decrement(1.0);
 }
 
+/// Records the time since `queued`, when a `lane` job was submitted, as one
+/// [`LANE_WAIT_SECONDS`] observation, only while benchmarking.
+fn record_lane_wait(lane: &'static str, queued: std::time::Instant) {
+    if wyrd_benchmark::enabled() {
+        metrics::histogram!(LANE_WAIT_SECONDS, "lane" => lane)
+            .record(queued.elapsed().as_secs_f64());
+    }
+}
+
+/// Benchmark-only histogram of a lane job's wait from submission until a
+/// worker started it, by `lane`; the job's own run is
+/// `bifrost_scribe_lane_job_seconds`.
+const LANE_WAIT_SECONDS: &str = "bifrost_scribe_lane_wait_seconds";
+
 fn record_lane_job(lane: &'static str, succeeded: bool, elapsed: std::time::Duration) {
     let status = if succeeded { "completed" } else { "failed" };
     metrics::counter!("bifrost_scribe_lane_jobs_total", "lane" => lane, "status" => status)
@@ -138,6 +154,13 @@ fn record_lane_saturation(lane: &'static str) {
     metrics::counter!("bifrost_scribe_lane_saturation_total", "lane" => lane).increment(1);
 }
 
+/// One claimed application queue slot of the ingress lane.
+///
+/// Claimed by [`ScribeIngressCpuPool::try_slot`] and consumed by
+/// [`ScribeIngressCpuPool::spawn`]; dropping an unused slot returns it.
+#[derive(Debug)]
+pub(crate) struct IngressSlot(tokio::sync::OwnedSemaphorePermit);
+
 /// The latency-sensitive native decode lane. Its queue is application-bounded;
 /// Rayon never becomes the source of untracked backpressure.
 #[derive(Debug, Clone)]
@@ -154,9 +177,16 @@ pub struct ScribeIngressCpuPool {
     capacity: usize,
     /// Conform plans shared by every decode this lane runs.
     conform: Arc<ConformPlans>,
+    /// The process workload manager whose CPU lanes every job runs on, once
+    /// the pool joins them at Scribe build.
+    workloads: Option<WorkloadManager>,
 }
 
 impl ScribeIngressCpuPool {
+    /// Runs every later job on the process CPU lanes as Bifrost work.
+    pub(crate) fn join_lanes(&mut self, workloads: &WorkloadManager) {
+        self.workloads = Some(workloads.clone());
+    }
     /// The conform plans this lane's decodes remember, shared with native
     /// sources that conform on the persistence lane.
     pub(crate) const fn conform_plans(&self) -> &Arc<ConformPlans> {
@@ -206,7 +236,43 @@ impl ScribeIngressCpuPool {
             drained: Arc::new(Notify::new()),
             capacity,
             conform: Arc::default(),
+            workloads: None,
         })
+    }
+
+    /// Admits one fresh external write as `tenant`'s Bifrost work when the
+    /// pool has joined the process lanes, without waiting.
+    ///
+    /// Gate asks before it accepts a public write: while process pressure
+    /// pauses new Bifrost work the write is refused as busy, Scribe's existing
+    /// capacity answer, before it takes a queue slot or any memory. Accepted
+    /// work, such as server outbox deliveries and persistence, never asks, so
+    /// it keeps draining.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::IngestBusy`] while pressure pauses new Bifrost
+    /// work.
+    pub(crate) fn admit(
+        &self,
+        tenant: Option<DataTenantId>,
+    ) -> Result<Option<Operation>, ScribeError> {
+        let Some(workloads) = &self.workloads else {
+            return Ok(None);
+        };
+        // Admission answers on its first poll unless pressure pauses the work;
+        // dropping the pending admission withdraws its demand.
+        let Some(operation) = workloads
+            .admit(Workload::Bifrost, tenant, None)
+            .now_or_never()
+        else {
+            self.saturation_events.fetch_add(1, Ordering::Relaxed);
+            record_lane_saturation("ingress");
+            return Err(ScribeError::IngestBusy {
+                table: "ingress".to_owned(),
+            });
+        };
+        Ok(Some(operation))
     }
 
     /// Submit one native decode without waiting for an application queue slot.
@@ -217,6 +283,7 @@ impl ScribeIngressCpuPool {
     /// and propagates any error produced by the free [`decode`] function.
     pub(crate) async fn decode(
         &self,
+        tenant: Option<DataTenantId>,
         payload: IngressPayload,
         inputs: IngressDecodeInputs,
     ) -> Result<RecordBatch, ScribeError> {
@@ -248,26 +315,31 @@ impl ScribeIngressCpuPool {
         let completed = Arc::clone(&self.completed);
         let failed = Arc::clone(&self.failed);
         let conform = Arc::clone(&self.conform);
+        let workloads = self.workloads.clone();
+        let queued = std::time::Instant::now();
         self.pool.spawn_fifo(move || {
+            record_lane_wait("ingress", queued);
             let started = std::time::Instant::now();
             active.fetch_add(1, Ordering::AcqRel);
             record_lane_started("ingress");
             let result = catch_unwind(AssertUnwindSafe(|| {
-                decode(
-                    payload,
-                    &DecodeContext {
-                        attribution,
-                        workload: workload.as_ref(),
-                        card_scope: card_scope.as_deref(),
-                        dimensions: dimensions.as_ref(),
-                        expected_schema_fingerprint,
-                        request_id: &request_id,
-                        receipt_micros,
-                        definition,
-                        registered_schema: registered_schema.as_ref(),
-                        conform: Some(&conform),
-                    },
-                )
+                on_lane(workloads.as_ref(), tenant, || {
+                    decode(
+                        payload,
+                        &DecodeContext {
+                            attribution,
+                            workload: workload.as_ref(),
+                            card_scope: card_scope.as_deref(),
+                            dimensions: dimensions.as_ref(),
+                            expected_schema_fingerprint,
+                            request_id: &request_id,
+                            receipt_micros,
+                            definition,
+                            registered_schema: registered_schema.as_ref(),
+                            conform: Some(&conform),
+                        },
+                    )
+                })
             }));
             depth.fetch_sub(1, Ordering::AcqRel);
             active.fetch_sub(1, Ordering::AcqRel);
@@ -296,7 +368,7 @@ impl ScribeIngressCpuPool {
     }
 
     /// Runs one pre-ACK CPU job, such as preprocessing an admitted append, on
-    /// this lane.
+    /// this lane as `tenant`'s work.
     ///
     /// Request-path work stays here rather than on the persistence lane, so a
     /// background staging encode or claim merge never queues ahead of a write.
@@ -308,18 +380,71 @@ impl ScribeIngressCpuPool {
     /// Returns [`ScribeError::IngestBusy`] when the ingress queue is saturated,
     /// the job's own error, or [`ScribeError::Internal`] when the worker panics
     /// or drops its result.
-    pub(crate) async fn run<T, F>(&self, job: F) -> Result<T, ScribeError>
+    pub(crate) async fn run<T, F>(
+        &self,
+        tenant: Option<DataTenantId>,
+        job: F,
+    ) -> Result<T, ScribeError>
     where
         T: Send + 'static,
         F: FnOnce() -> Result<T, ScribeError> + Send + 'static,
     {
-        let Ok(permit) = self.permits.clone().try_acquire_owned() else {
+        let slot = self.claim_slot()?;
+        self.spawn(slot, tenant, job).await
+    }
+
+    /// Claims one application queue slot for a job that cannot wait.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::IngestBusy`] when the lane is full, counting the
+    /// refusal as lane saturation.
+    pub(crate) fn claim_slot(&self) -> Result<IngressSlot, ScribeError> {
+        self.try_slot().ok_or_else(|| {
             self.saturation_events.fetch_add(1, Ordering::Relaxed);
             record_lane_saturation("ingress");
-            return Err(ScribeError::IngestBusy {
+            ScribeError::IngestBusy {
                 table: "ingress".to_owned(),
-            });
-        };
+            }
+        })
+    }
+
+    /// Claims one of this lane's application queue slots without waiting.
+    ///
+    /// Returns `None` when the lane is full. Unlike [`Self::run`], a miss is
+    /// not counted as saturation: a caller that can fall back to running the
+    /// job later, such as a group's optional second conversion, has refused
+    /// nothing.
+    pub(crate) fn try_slot(&self) -> Option<IngressSlot> {
+        self.permits
+            .clone()
+            .try_acquire_owned()
+            .ok()
+            .map(IngressSlot)
+    }
+
+    /// Starts `job` on this lane in `slot` as `tenant`'s work and returns its
+    /// completion.
+    ///
+    /// The job and the slot move to the worker at once, so dropping the
+    /// returned future never cancels the job: the job still owns whatever
+    /// memory it carries until it finishes, and the slot frees only then.
+    ///
+    /// # Errors
+    ///
+    /// The returned future yields the job's own error, or
+    /// [`ScribeError::Internal`] when the worker panics or drops its result.
+    pub(crate) fn spawn<T, F>(
+        &self,
+        slot: IngressSlot,
+        tenant: Option<DataTenantId>,
+        job: F,
+    ) -> impl std::future::Future<Output = Result<T, ScribeError>> + Send + 'static
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, ScribeError> + Send + 'static,
+    {
+        let IngressSlot(permit) = slot;
         self.depth.fetch_add(1, Ordering::AcqRel);
         record_lane_enqueued("ingress");
         let (sender, receiver) = oneshot::channel();
@@ -329,11 +454,16 @@ impl ScribeIngressCpuPool {
         let panics = Arc::clone(&self.panics);
         let completed = Arc::clone(&self.completed);
         let failed = Arc::clone(&self.failed);
+        let workloads = self.workloads.clone();
+        let queued = std::time::Instant::now();
         self.pool.spawn_fifo(move || {
+            record_lane_wait("ingress", queued);
             let started = std::time::Instant::now();
             active.fetch_add(1, Ordering::AcqRel);
             record_lane_started("ingress");
-            let result = catch_unwind(AssertUnwindSafe(job));
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                on_lane(workloads.as_ref(), tenant, job)
+            }));
             depth.fetch_sub(1, Ordering::AcqRel);
             active.fetch_sub(1, Ordering::AcqRel);
             record_lane_finished("ingress");
@@ -355,9 +485,11 @@ impl ScribeIngressCpuPool {
             record_lane_job("ingress", result.is_ok(), started.elapsed());
             let _ = sender.send(result);
         });
-        receiver.await.map_err(|_| ScribeError::Internal {
-            detail: "Scribe ingress CPU worker dropped its result".to_owned(),
-        })?
+        async move {
+            receiver.await.map_err(|_| ScribeError::Internal {
+                detail: "Scribe ingress CPU worker dropped its result".to_owned(),
+            })?
+        }
     }
 
     pub(crate) fn snapshot(&self) -> crate::scribe::telemetry::ExecutorSnapshot {
@@ -1695,6 +1827,25 @@ pub(crate) enum ScribePersistenceCpuResult {
 ///
 /// Returns the stable preprocessing, projection, encoding, replay, or
 /// test-synchronization error produced by the selected operation.
+/// Runs one Scribe CPU job on its Rayon worker, on a shared process CPU lane
+/// as `tenant`'s Bifrost work when the pool has joined the lanes.
+///
+/// The job begins its own non-cancellable operation: Scribe keeps its own
+/// queue bounds and byte admission, and acknowledged durable work must not
+/// be a pressure victim. Request-path jobs pass their frame's tenant;
+/// persistence jobs mix tenants and pass `None`.
+fn on_lane<T>(
+    workloads: Option<&WorkloadManager>,
+    tenant: Option<DataTenantId>,
+    job: impl FnOnce() -> T,
+) -> T {
+    let Some(workloads) = workloads else {
+        return job();
+    };
+    let operation = workloads.begin(Workload::Bifrost, tenant, None);
+    workloads.lanes().run_blocking(operation.context(), job)
+}
+
 fn execute_persistence_operation(
     operation: ScribePersistenceCpuOp,
 ) -> Result<ScribePersistenceCpuResult, ScribeError> {
@@ -1805,9 +1956,17 @@ pub struct ScribePersistenceCpuPool {
     saturation_events: Arc<AtomicU64>,
     drained: Arc<Notify>,
     capacity: usize,
+    /// The process workload manager whose CPU lanes every job runs on, once
+    /// the pool joins them at Scribe build.
+    workloads: Option<WorkloadManager>,
 }
 
 impl ScribePersistenceCpuPool {
+    /// Runs every later job on the process CPU lanes as Bifrost work.
+    pub(crate) fn join_lanes(&mut self, workloads: &WorkloadManager) {
+        self.workloads = Some(workloads.clone());
+    }
+
     /// Closes admission to the persistence CPU lane without waiting for active Rayon work.
     pub(crate) fn close(&self) {
         self.permits.close();
@@ -1857,6 +2016,7 @@ impl ScribePersistenceCpuPool {
             saturation_events: Arc::new(AtomicU64::new(0)),
             drained: Arc::new(Notify::new()),
             capacity,
+            workloads: None,
         })
     }
 
@@ -1916,12 +2076,15 @@ impl ScribePersistenceCpuPool {
         depth.fetch_add(1, Ordering::AcqRel);
         record_lane_enqueued("persistence");
         let active = Arc::clone(&self.active);
+        let workloads = self.workloads.clone();
         self.pool.spawn_fifo(move || {
             let started = std::time::Instant::now();
             active.fetch_add(1, Ordering::AcqRel);
             record_lane_started("persistence");
             let result = catch_unwind(AssertUnwindSafe(|| {
-                execute_persistence_operation(operation)
+                on_lane(workloads.as_ref(), None, || {
+                    execute_persistence_operation(operation)
+                })
             }));
             depth.fetch_sub(1, Ordering::AcqRel);
             active.fetch_sub(1, Ordering::AcqRel);
@@ -2199,7 +2362,9 @@ impl ScribeWalIoPool {
         depth.fetch_add(1, Ordering::AcqRel);
         record_lane_enqueued("wal_io");
         let active = Arc::clone(&self.active);
+        let queued = std::time::Instant::now();
         self.pool.spawn_fifo(move || {
+            record_lane_wait("wal_io", queued);
             let started = std::time::Instant::now();
             active.fetch_add(1, Ordering::AcqRel);
             record_lane_started("wal_io");
@@ -2527,6 +2692,7 @@ mod tests {
     use crate::tables::managed_columns::ensure_managed_columns;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Notify;
+    use wyrd_runtime::resources::{Workload, WorkloadManager};
 
     fn principal() -> Principal {
         Principal::new(
@@ -3470,7 +3636,7 @@ mod tests {
     async fn ingress_cpu_runs_bounded_projection_jobs_on_its_lane() {
         let pool = ScribeIngressCpuPool::new_with_capacity(1, 1);
         let worker_name = pool
-            .run(|| {
+            .run(None, || {
                 Ok(std::thread::current()
                     .name()
                     .unwrap_or("unnamed")
@@ -3490,7 +3656,7 @@ mod tests {
     async fn rayon_lane_panic_releases_permit_and_returns_typed_error() {
         let pool = ScribeIngressCpuPool::new_with_capacity(1, 1);
         let error = pool
-            .run(|| -> Result<(), crate::contracts::ScribeError> {
+            .run(None, || -> Result<(), crate::contracts::ScribeError> {
                 panic!("intentional lane panic");
             })
             .await
@@ -3500,7 +3666,7 @@ mod tests {
             crate::contracts::ScribeError::Internal { .. }
         ));
         let result = pool
-            .run(|| Ok::<_, crate::contracts::ScribeError>(()))
+            .run(None, || Ok::<_, crate::contracts::ScribeError>(()))
             .await;
         assert!(result.is_ok(), "panic must release the queue permit");
         let snapshot = pool.snapshot();
@@ -3572,7 +3738,7 @@ mod tests {
     async fn ingress_pool_drain_settles_after_submitted_work() {
         let pool = ScribeIngressCpuPool::new(2);
         for iteration in 0..500 {
-            let job = pool.run(|| Ok::<_, crate::contracts::ScribeError>(()));
+            let job = pool.run(None, || Ok::<_, crate::contracts::ScribeError>(()));
             let (job_result, drain_result) = tokio::join!(
                 job,
                 tokio::time::timeout(std::time::Duration::from_secs(5), pool.drain())
@@ -3640,6 +3806,177 @@ mod tests {
                 .expect("settled snapshot")
                 .scribe_memory_used_bytes,
             0
+        );
+    }
+
+    /// The process workload manager of a one-lane test process.
+    fn one_lane() -> WorkloadManager {
+        wyrd_runtime::resources::ProcessResources::new(
+            std::num::NonZeroUsize::MIN,
+            1 << 30,
+            1 << 30,
+        )
+        .workloads()
+        .clone()
+    }
+
+    /// Waits, bounded, until `count` acquirers queue for a lane.
+    fn await_waiting(workloads: &WorkloadManager, count: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while workloads.lanes().waiting() < count {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no Scribe job queued for the held lane"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    /// An ingress job waits for a shared CPU lane another workload holds and
+    /// then runs as its tenant's Bifrost work.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ingress_jobs_run_on_the_shared_cpu_lanes() {
+        let workloads = one_lane();
+        let gateway = workloads.begin(Workload::Gateway, None, None);
+        let held = workloads.lanes().acquire(gateway.context()).await;
+        let mut pool = ScribeIngressCpuPool::new_with_capacity(1, 1);
+        pool.join_lanes(&workloads);
+        let tenant = wyrd_spec::ids::DataTenantId::new(uuid::Uuid::now_v7()).expect("tenant id");
+        let job = tokio::spawn(async move {
+            pool.run(Some(tenant), || {
+                Ok(wyrd_runtime::resources::WorkContext::current())
+            })
+            .await
+        });
+        let waiter = workloads.clone();
+        tokio::task::spawn_blocking(move || await_waiting(&waiter, 1))
+            .await
+            .expect("waiting check");
+        drop(held);
+        let context = job
+            .await
+            .expect("ingress waiter")
+            .expect("ingress job completes")
+            .expect("the job runs on a lane");
+        assert_eq!(context.workload, Workload::Bifrost);
+        assert_eq!(
+            context.tenant,
+            Some(tenant),
+            "the lane serves the job's tenant"
+        );
+    }
+
+    /// Under critical allocator pressure with ledger room, a fresh external
+    /// write is refused admission as busy, the existing capacity answer, while
+    /// accepted persistence still runs; once pressure recovers a fresh write
+    /// is admitted again.
+    ///
+    /// # Panics
+    /// Panics when fresh ingress runs under critical pressure, persistence
+    /// does not drain, or ingress stays refused after recovery.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn critical_pressure_refuses_fresh_ingress_but_drains_persistence() {
+        use wyrd_runtime::resources::PressureState;
+        let roles = BifrostRuntimeResources::composed_for_test(
+            1024 * 1024 * 1024,
+            1024 * 1024 * 1024,
+            [BifrostRole::Scribe],
+        );
+        let memory = roles
+            .scribe()
+            .expect("Scribe role")
+            .try_reserve_ingress(ScribeMemoryCategory::Raw, 4096)
+            .expect("root-backed test lease");
+        let workloads = one_lane();
+        let overcommitted = workloads.observe_commitment();
+        overcommitted.set(u64::MAX);
+        assert_eq!(workloads.sample(0).state, PressureState::Critical);
+        let mut ingress = ScribeIngressCpuPool::new_with_capacity(1, 1);
+        ingress.join_lanes(&workloads);
+        let mut persistence = ScribePersistenceCpuPool::new(1);
+        persistence.join_lanes(&workloads);
+        let tenant = wyrd_spec::ids::DataTenantId::new(uuid::Uuid::now_v7()).expect("tenant id");
+
+        let refused = ingress.admit(Some(tenant)).map(|_| ());
+        assert!(
+            matches!(refused, Err(ScribeError::IngestBusy { .. })),
+            "fresh ingress is refused under critical pressure: {refused:?}"
+        );
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        release_tx.send(()).expect("pre-released job");
+        // The stalled-ownership job always ends with its own sentinel error.
+        let _ = persistence
+            .submit(ScribePersistenceCpuOp::HoldMemory(Box::new(
+                super::HoldMemoryOp {
+                    memory,
+                    started: started_tx,
+                    release: release_rx,
+                },
+            )))
+            .await;
+        assert!(
+            started_rx.try_recv().is_ok(),
+            "accepted persistence drains under critical pressure"
+        );
+
+        overcommitted.set(0);
+        workloads.sample(0);
+        assert!(
+            ingress
+                .admit(Some(tenant))
+                .expect("a fresh write is admitted once pressure recovers")
+                .is_some()
+        );
+    }
+
+    /// A persistence job waits for a shared CPU lane another workload holds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn persistence_jobs_run_on_the_shared_cpu_lanes() {
+        let roles = BifrostRuntimeResources::composed_for_test(
+            1024 * 1024 * 1024,
+            1024 * 1024 * 1024,
+            [BifrostRole::Scribe],
+        );
+        let memory = roles
+            .scribe()
+            .expect("Scribe role")
+            .try_reserve_ingress(ScribeMemoryCategory::Raw, 4096)
+            .expect("root-backed test lease");
+        let workloads = one_lane();
+        let gateway = workloads.begin(Workload::Gateway, None, None);
+        let held = workloads.lanes().acquire(gateway.context()).await;
+        let mut pool = ScribePersistenceCpuPool::new(1);
+        pool.join_lanes(&workloads);
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        release_tx.send(()).expect("pre-released job");
+        let submitted = pool.clone();
+        let job = tokio::spawn(async move {
+            submitted
+                .submit(ScribePersistenceCpuOp::HoldMemory(Box::new(
+                    super::HoldMemoryOp {
+                        memory,
+                        started: started_tx,
+                        release: release_rx,
+                    },
+                )))
+                .await
+        });
+        let waiter = workloads.clone();
+        tokio::task::spawn_blocking(move || await_waiting(&waiter, 1))
+            .await
+            .expect("waiting check");
+        assert!(
+            started_rx.try_recv().is_err(),
+            "the job waits while the lane is held"
+        );
+        drop(held);
+        // The stalled-ownership job always ends with its own sentinel error.
+        let _ = job.await.expect("persistence waiter");
+        assert!(
+            started_rx.try_recv().is_ok(),
+            "the job ran once the lane was released"
         );
     }
 
@@ -3714,7 +4051,7 @@ mod tests {
         wal_io: &ScribeWalIoPool,
     ) {
         ingress
-            .run(|| Ok::<_, ScribeError>(()))
+            .run(None, || Ok::<_, ScribeError>(()))
             .await
             .expect("ingress job");
         let replayed = ReplayedSealKey {

@@ -12,7 +12,7 @@ use rmcp::model::{CallToolRequest, CallToolRequestParams, CallToolResult, Client
 use rmcp::service::PeerRequestOptions;
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
-use wyrd_server::config::BifrostTarget;
+use wyrd_server::config::ServerTarget;
 use wyrd_testing::WyrdTestServer;
 
 use crate::peer_cluster::PeerCluster;
@@ -159,10 +159,9 @@ mod pg_tests {
     use rmcp::ClientServiceExt as _;
 
     use super::{
-        BifrostTarget, COORDINATOR, CallToolRequest, CallToolRequestParams, ClientRequest,
-        FIXTURE_GROUPS, FIXTURE_ROWS, JourneyError, PEER_FOLLOWERS, PEER_SCRIBE, PeerCluster,
-        PeerRequestOptions, await_baseline, bearer, discover, problem, query, structured,
-        transport,
+        COORDINATOR, CallToolRequest, CallToolRequestParams, ClientRequest, FIXTURE_GROUPS,
+        FIXTURE_ROWS, JourneyError, PEER_FOLLOWERS, PEER_SCRIBE, PeerCluster, PeerRequestOptions,
+        ServerTarget, await_baseline, bearer, discover, problem, query, structured, transport,
     };
 
     /// An agent joins three tables it discovered and gets one Analytical result.
@@ -190,10 +189,10 @@ mod pg_tests {
     /// charged during the hold, or a refusal includes partial rows.
     async fn prove_analytical_mcp_journey() -> Result<(), JourneyError> {
         let mut cluster = PeerCluster::start(&[
-            BifrostTarget::Oracle,
-            BifrostTarget::Oracle,
-            BifrostTarget::Oracle,
-            BifrostTarget::Scribe,
+            ServerTarget::BifrostQuery,
+            ServerTarget::BifrostQuery,
+            ServerTarget::BifrostQuery,
+            ServerTarget::BifrostIngest,
         ])
         .await?;
         let api_key = cluster

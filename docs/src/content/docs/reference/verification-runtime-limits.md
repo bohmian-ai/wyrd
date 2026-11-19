@@ -1,12 +1,12 @@
 ---
 title: Runtime limits
-description: Environment settings that bound Verifier files, extraction, workspaces, and Python code, with defaults and startup rules.
+description: Server settings that bound Verifier files, extraction, workspaces, Python code, model calls, and direct and queued executions, with defaults and startup rules.
 pillar: wyrd
 section: Reference
 order: 4
 ---
 
-Environment variables on `wyrd-server`, read once at startup; a change takes a restart. Apart from `WYRD_VERIFICATION_ENABLED`, none has a TOML equivalent. Each process applies them on its own.
+Environment variables on `wyrd-server`, read once at startup; a change takes a restart. Execution slots, model calls, and the queued execution timeout can also be set in the [server TOML file](#server-toml-file); the other settings are environment variables only. Each process applies them on its own.
 
 ## Settings
 
@@ -14,8 +14,12 @@ Environment variables on `wyrd-server`, read once at startup; a change takes a r
 | --- | ---: | --- |
 | `WYRD_VERIFICATION_ENABLED` | `1` | Whether an API-serving process runs Verifiers: `1` or `0`. Also `[verification] enabled` in TOML |
 | `WYRD_VERIFICATION_TIMEOUT_MS` | 60000 | The whole `verify` call |
-| `WYRD_VERIFICATION_FILE_MAX_MIB` | 20 | One input file |
-| `WYRD_VERIFICATION_FILES_MAX_MIB` | 100 | All input files of one request or one workspace together |
+| `WYRD_VERIFICATION_EXECUTION_TIMEOUT_MS` | 300000 | One queued execution, from its first claim; waiting and retries do not reset it |
+| `WYRD_VERIFICATION_DIRECT_EXECUTIONS` | 256 | `verify` calls running at once in one server process |
+| `WYRD_VERIFICATION_QUEUED_EXECUTIONS` | 64 | Queued executions running at once in one server process; more wait in the queue |
+| `WYRD_VERIFICATION_FILE_MAX_MIB` | 20 | One input file, and one file a publication retains |
+| `WYRD_VERIFICATION_FILES_MAX_MIB` | 100 | All input files of one request or one workspace together, and all bytes one execution's publications retain |
+| `WYRD_VERIFICATION_PUBLICATIONS_MAX` | 1000 | Publications one execution accepts across all its attempts |
 | `WYRD_VERIFICATION_ARCHIVE_MAX_MIB` | 200 | Decompressed bytes of one archive, including DOCX, XLSX, and PPTX containers |
 | `WYRD_VERIFICATION_ARCHIVE_MAX_ENTRIES` | 10000 | Entries in one archive |
 | `WYRD_VERIFICATION_ARCHIVE_MAX_RATIO` | 100 | Decompressed-to-compressed size ratio of one archive |
@@ -24,17 +28,25 @@ Environment variables on `wyrd-server`, read once at startup; a change takes a r
 | `WYRD_VERIFICATION_SCRATCH_MAX_MIB` | 250 | All bytes in one workspace: materialized `/inputs` plus `/work` |
 | `WYRD_VERIFICATION_WORK_WRITE_MAX_MIB` | 50 | Bytes held under `/work` in one workspace |
 | `WYRD_VERIFICATION_TOOL_RESULT_MAX_KIB` | 64 | One tool result or one Python operation's printed output, cut off while it is collected |
-| `WYRD_VERIFICATION_MAX_WORKSPACES` | 16 | Workspaces open at once in one server process |
-| `WYRD_VERIFICATION_MONTY_MIN_WORKERS` | 2 | Python workers started with the server |
-| `WYRD_VERIFICATION_MONTY_MAX_WORKERS` | 8 | Python workers alive at once, before the memory cap below |
-| `WYRD_VERIFICATION_MONTY_MAX_WAITERS` | 16 | Python operations waiting for a worker |
+| `WYRD_VERIFICATION_MODEL_CALLS` | 256 | Gateway model calls `verify` calls and queued executions make at once in one server process; another waits for one to finish |
+| `WYRD_VERIFICATION_TOOL_ARGUMENT_MAX_KIB` | 64 | One tool call's arguments as compact JSON, `code.run` source included |
+| `WYRD_VERIFICATION_AGENT_TOOL_MAX_CALLS` | 128 | Tool calls of one Agent step or check, from the model and from Python together, across its retries |
+| `WYRD_VERIFICATION_MONTY_MIN_WORKERS` | 1 | Python workers prewarmed with the server, as many as fit in process memory; stopped when an operation needs their memory |
 | `WYRD_VERIFICATION_MONTY_MEMORY_MIB` | 256 | Memory one Python operation may allocate |
-| `WYRD_VERIFICATION_MONTY_PROCESS_MEMORY_MIB` | 384 | What one worker process is counted at against the pool ceiling |
-| `WYRD_VERIFICATION_MONTY_POOL_MEMORY_MIB` | 2048 | All worker processes together, idle ones included |
-| `WYRD_VERIFICATION_CODE_TIMEOUT_MS` | 10000 | One Python operation, from waiting for a worker through compiling, running, and its file calls |
-| `WYRD_VERIFICATION_AGENT_CODE_BUDGET_MS` | 60000 | All `code.run` calls of one Agent step together, across its retries |
+| `WYRD_VERIFICATION_CODE_TIMEOUT_MS` | 10000 | One Python operation, from waiting for a worker through compiling, running, its file calls, and its waits on `call_tool` |
+| `WYRD_VERIFICATION_AGENT_CODE_BUDGET_MS` | 60000 | All `code.run` calls of one Agent step together, waits on `call_tool` included, across its retries |
 
 `_MIB` and `_KIB` are binary units; `_MS` is milliseconds. A `media` slot's `max_bytes` can lower `FILE_MAX_MIB` for that slot, never raise it. No setting disables a limit or worker isolation.
+
+## Direct and queued capacity
+
+`verify` calls and queued executions share one process's Python pool, CPU turns, model calls, memory, and scratch, charged only while in use; nothing is reserved for either. `DIRECT_EXECUTIONS` and `QUEUED_EXECUTIONS` cap how many of each run at once and hold nothing while idle. A queued execution resumed after it waited, was deferred, or was retried is admitted again. Both run the same engine with the same authority, evidence, billing, and cancellation rules, and every model call still passes the gateway's own tenant and subject limits and budgets.
+
+A deployment may also run `direct` and `worker` processes separately (see [deployment targets](/understand/architecture/#one-binary-several-roles)). Postgres, the gateway, and model providers stay shared.
+
+The defaults give each process headroom to start from, not measured throughput or latency guarantees, and not every mix of workloads is guaranteed to fit a host.
+
+`EXECUTION_TIMEOUT_MS` is the ceiling of one queued execution from its first claim. Waiting for capacity, deferrals, and retries count against it and never reset it; anything an execution waits for, including an intended human approval period, must fit inside it.
 
 ## Server TOML file
 
@@ -48,18 +60,31 @@ Environment variables on `wyrd-server`, read once at startup; a change takes a r
 
 With no file, the server uses its defaults and environment variables.
 
+Under `[verification]`, the file can set the execution slots, model calls, and the queued execution timeout. The matching environment variable overrides each value on its own, and a value left out keeps its default.
+
+| TOML key | Environment variable |
+| --- | --- |
+| `[verification] direct_executions` | `WYRD_VERIFICATION_DIRECT_EXECUTIONS` |
+| `[verification] queued_executions` | `WYRD_VERIFICATION_QUEUED_EXECUTIONS` |
+| `[verification] execution_timeout_ms` | `WYRD_VERIFICATION_EXECUTION_TIMEOUT_MS` |
+| `[verification] model_calls` | `WYRD_VERIFICATION_MODEL_CALLS` |
+
+```toml
+[verification]
+direct_executions = 256
+queued_executions = 64
+execution_timeout_ms = 300000
+model_calls = 256
+```
+
 ## Startup rules
 
-The server refuses to start, naming the variable, when a value is empty, not a positive integer, or overflows once scaled to bytes, or when `WYRD_VERIFICATION_ENABLED` is not `1` or `0`. It also refuses these combinations, naming both variables (prefix `WYRD_VERIFICATION_` omitted):
+The server refuses to start, naming the variable, when a value is empty, not a positive integer, or overflows once scaled to bytes, or when `WYRD_VERIFICATION_ENABLED` is not `1` or `0`. A TOML value is checked only when no environment variable overrides it, so a valid variable replaces a stale file value; a winning TOML value that is zero or overflows is refused naming its key, and a negative one fails to parse. Whichever source wins is also refused, naming it, when an execution, workspace, or model-call count exceeds 2305843009213693951, the most permits the runtime can hold, or when the queued execution timeout would end after the latest timestamp the queue can represent, about the year 262000. The combinations below are checked after file and environment values are merged, whichever source set them, and are refused naming both variables (prefix `WYRD_VERIFICATION_` omitted):
 
-- `MONTY_MIN_WORKERS` above `MONTY_MAX_WORKERS`
-- `MONTY_MEMORY_MIB` at or above `MONTY_PROCESS_MEMORY_MIB`
-- `MONTY_POOL_MEMORY_MIB` below `MONTY_PROCESS_MEMORY_MIB`
-- `MONTY_PROCESS_MEMORY_MIB` below `MONTY_MEMORY_MIB` + 4 MiB allocator headroom
 - `FILE_MAX_MIB` above `FILES_MAX_MIB`
 - `WORK_WRITE_MAX_MIB` above `SCRATCH_MAX_MIB`
 
-Live workers are capped by `MONTY_MAX_WORKERS` and by `MONTY_POOL_MEMORY_MIB / MONTY_PROCESS_MEMORY_MIB`, rounded down: 5 at the defaults.
+A process that runs Verifiers also refuses to start when process memory cannot hold one Python session envelope: twice `MONTY_MEMORY_MIB` + 4 MiB of allocator headroom, plus 32 MiB for the worker, which is 552 MiB at the defaults. There is no worker or waiter count. Process memory bounds how many operations run and wait.
 
 ## If a limit is reached
 
@@ -68,6 +93,10 @@ Live workers are capped by `MONTY_MAX_WORKERS` and by `MONTY_POOL_MEMORY_MIB / M
 | A file over its slot or `FILE_MAX_MIB`, or a request over `FILES_MAX_MIB` | `WYRD_VERIFICATION_413_INPUT_TOO_LARGE` before anything runs |
 | The server's verification staging is full (`scribe.outbox_capacity` or `scribe.outbox_bytes`) | Direct and new queued calls: `WYRD_VERIFICATION_429_STAGING_FULL` with `Retry-After`, before anything is staged. Accepted queued executions stay queued until there is room for their result |
 | `TIMEOUT_MS` in `verify` | `WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT` |
-| No Python worker or workspace free | Direct call: `WYRD_SERVER_503_SERVICE_UNAVAILABLE`. Queued: stays queued, attempt not counted |
+| No direct execution slot, or process memory or scratch cannot hold a Python operation's waiting bytes, frees too late for its envelope, or cannot hold a workspace | `verify`: `WYRD_SERVER_503_SERVICE_UNAVAILABLE` |
+| No queued execution slot, or process memory or scratch cannot hold the same | Queued: stays queued, attempt not counted |
+| Every model call in use | The call waits for one, within the execution's deadline |
 | Verification disabled on this process | `WYRD_SERVER_503_SERVICE_UNAVAILABLE` |
+| A publication over `FILE_MAX_MIB`, `FILES_MAX_MIB`, or `PUBLICATIONS_MAX` | The publish call is refused with the limit and nothing is published; the execution's accepted publications and their totals survive retries and recovery |
+| `AGENT_TOOL_MAX_CALLS` | The step fails or the check is `inconclusive`, with `WYRD_VERIFICATION_422_TOOL_BUDGET_EXCEEDED` in its `reason`; a program cannot catch it |
 | Any other limit in a step or check, including `AGENT_CODE_BUDGET_MS` | The step fails or the check is `inconclusive`, with the limit in its `reason` |

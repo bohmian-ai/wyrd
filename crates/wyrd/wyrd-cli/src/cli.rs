@@ -6,7 +6,10 @@ use crate::auth::AuthCommand;
 use crate::card::{
     ArtifactCommand, DeclareArgs, DeleteArgs, GetArgs, LatestArgs, ListArgs, PullArgs,
 };
+use crate::evidence::EvidenceCommand;
+use crate::execution::ExecutionCommand;
 use crate::gateway::GatewayCommand;
+use crate::github::GithubCommand;
 use crate::init::InitArgs;
 use crate::mcp::McpCommand;
 use crate::operator_connection::OperatorConnectionCommand;
@@ -58,10 +61,15 @@ impl Cli {
             Command::OperatorConnection(command) => crate::operator_connection::dispatch(command)
                 .await
                 .map_err(Into::into),
+            Command::Github(command) => crate::github::dispatch(command).await.map_err(Into::into),
             Command::Principal(command) => crate::principal::dispatch(command)
                 .await
                 .map_err(Into::into),
             Command::Query(command) => crate::query::dispatch(command).await,
+            Command::Execution(command) => command.dispatch().await.map_err(Into::into),
+            Command::Evidence(command) => {
+                crate::evidence::dispatch(command).await.map_err(Into::into)
+            }
             Command::Gateway(command) => command.dispatch().await,
             Command::Init(args) => args.run().await.map_err(Into::into),
             Command::Server(command) => command.dispatch().await.map_err(Into::into),
@@ -100,11 +108,21 @@ pub enum Command {
     /// Manage the tenant's encrypted Operator provider connections.
     #[command(subcommand)]
     OperatorConnection(OperatorConnectionCommand),
+    /// Connect the tenant to the deployment's GitHub App, read or release it.
+    #[command(subcommand)]
+    Github(GithubCommand),
     /// Manage Wyrd principals (revoke).
     #[command(subcommand)]
     Principal(PrincipalCommand),
     /// Run a terminal-safe streaming Oracle query.
     Query(QueryCommand),
+    /// Inspect and cancel one queued Verifier execution: status, invocation
+    /// and publication pages, publication reads, and download plans.
+    Execution(ExecutionCommand),
+    /// Publish evidence for a deferred Verifier input at one repository
+    /// commit.
+    #[command(subcommand)]
+    Evidence(EvidenceCommand),
     /// Administer tenant gateway credentials, deployments, and policies.
     Gateway(GatewayCommand),
     /// Migrate, start, and configure a local Wyrd server, then hand off the

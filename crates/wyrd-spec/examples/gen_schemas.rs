@@ -39,6 +39,7 @@ use wyrd_spec::card::operator::{
 };
 use wyrd_spec::card::policy::{InvokeContext, InvokeOutcome, PolicyDecision, PolicySpec};
 use wyrd_spec::card::prompt::{ParameterName, PromptRef, PromptSpec};
+use wyrd_spec::card::repository::{RepositoryProvider, RepositorySpec};
 use wyrd_spec::card::service::{LockedComponent, ServiceLock};
 use wyrd_spec::card::service::{
     ServiceRuntime, ServiceRuntimeKind, ServiceRuntimeMode, ServiceRuntimePolicy, ServiceSpec,
@@ -57,6 +58,7 @@ use wyrd_spec::gateway::{
     GatewayFallbackPolicy, GatewayGovernancePolicy, ProviderCredentialView,
     ProviderCredentialWrite, ProviderDeployment,
 };
+use wyrd_spec::github_connection::{GithubConnectResponse, GithubConnectionView};
 use wyrd_spec::operator_connection::{
     CreateOperatorConnectionRequest, OperatorConnectionView, UpdateOperatorConnectionRequest,
 };
@@ -87,7 +89,9 @@ use wyrd_spec::vala::api::{
 };
 use wyrd_spec::vala::trace::SpanRecord;
 use wyrd_spec::verification::execution::{
-    EnqueueVerificationResponse, EvidencePlanRequest, EvidencePlanResponse, VerificationDetails,
+    ApprovalDecision, ApprovalReceipt, CancelExecutionResponse, EnqueueVerificationResponse,
+    EvidencePlanRequest, EvidencePlanResponse, ExecutionPageQuery, InvocationPage, Publication,
+    PublicationPage, PublicationSelector, PublishEvidenceResponse, VerificationDetails,
     VerificationExecutionState, VerificationRequest, VerificationResult,
 };
 use wyrd_spec::verification::{ExecutionPlan, VerificationBindingStatus};
@@ -180,6 +184,8 @@ fn contracts() -> Value {
         DriftSpec,
         TriggerSpec,
         TriggerActivation,
+        RepositorySpec,
+        RepositoryProvider,
         VerifierSpec,
         VerificationBinding,
         OperatorSpec,
@@ -314,11 +320,22 @@ fn contracts() -> Value {
         VerificationBindingStatus,
         VerificationResult,
         VerificationExecutionState,
+        PublishEvidenceResponse,
+        ApprovalDecision,
+        ApprovalReceipt,
+        InvocationPage,
+        PublicationPage,
+        Publication,
+        CancelExecutionResponse,
+        ExecutionPageQuery,
+        PublicationSelector,
         ExecutionPlan,
         VerificationDetails,
         CreateOperatorConnectionRequest,
         UpdateOperatorConnectionRequest,
         OperatorConnectionView,
+        GithubConnectResponse,
+        GithubConnectionView,
         SpanRecord,
     )
     .into_iter()

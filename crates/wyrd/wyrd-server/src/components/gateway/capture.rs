@@ -29,6 +29,7 @@ use vala_bifrost_redux::tables::gateway::{CallsTable, REQUEST_PAYLOAD, RESPONSE_
 use vala_bifrost_redux::tables::signal::correlation_fields;
 use wyrd_gateway::{AttemptRecord, IngressDialect, MediaRequest, UploadContent};
 use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder};
+use wyrd_runtime::resources::ByteCharge;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Attribution;
 use wyrd_spec::gateway::{
@@ -168,6 +169,9 @@ pub(crate) struct CallFacts {
     /// Bytes of every selected binary object already substituted by a typed
     /// reference, awaiting persistence before the referencing row is delivered.
     pub(crate) objects: PayloadObjects,
+    /// The process memory charge of a streamed `response`'s content, kept
+    /// until the capture drops or the outbox takes it over.
+    pub(crate) custody: Option<ByteCharge>,
 }
 
 /// One call's validated analytical record: its row and attempt spans.
@@ -200,6 +204,9 @@ pub struct CallCapture {
     /// Context of the `gateway.call` span the attempt spans are children of,
     /// when the call continued a caller's trace.
     trace: Option<TraceContext>,
+    /// The charge of the captured content this record still carries, handed
+    /// to the outbox with the record once it is staged.
+    custody: Option<ByteCharge>,
 }
 
 impl CallCapture {
@@ -302,6 +309,7 @@ impl CallCapture {
             attribution: facts.attribution,
             subject: facts.subject,
             trace: facts.trace,
+            custody: facts.custody,
         })
     }
 
@@ -597,6 +605,12 @@ impl CallCapture {
             projected.push((ScribeTable::Spans, spans, owners));
         }
         Ok(projected)
+    }
+
+    /// Takes the charge of the content this record carries, for the outbox
+    /// to take over as the record is staged.
+    pub(crate) const fn take_custody(&mut self) -> Option<ByteCharge> {
+        self.custody.take()
     }
 
     /// Tenant the record belongs to.
@@ -1269,6 +1283,7 @@ pub(crate) mod tests {
             })),
             response: Ok(Some(json!({"id": "chatcmpl-1", "token": CANARY}))),
             objects: PayloadObjects::default(),
+            custody: None,
         }
     }
 
@@ -2209,6 +2224,78 @@ pub(crate) mod recording {
             Err(ScribeError::Internal {
                 detail: "the recording Scribe resolves no table".to_owned(),
             })
+        }
+    }
+
+    /// A Scribe that admits every frame through `inner`, holding each frame
+    /// bound for `table` until `release` has a permit.
+    pub(crate) struct TableGate {
+        /// Records every admitted frame and answers scripted refusals.
+        pub(crate) inner: Arc<RecordingScribe>,
+        /// The destination whose frames are held.
+        pub(crate) table: ScribeTable,
+        /// Permits the held frames wait for.
+        pub(crate) release: tokio::sync::Semaphore,
+        /// Signalled when a held frame arrives.
+        pub(crate) arrived: tokio::sync::Notify,
+    }
+
+    impl TableGate {
+        /// Holds every frame bound for `table`.
+        pub(crate) fn new(table: ScribeTable) -> Self {
+            Self {
+                inner: Arc::default(),
+                table,
+                release: tokio::sync::Semaphore::new(0),
+                arrived: tokio::sync::Notify::new(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Scribe for TableGate {
+        /// Always ready.
+        fn is_ready(&self) -> bool {
+            true
+        }
+
+        /// Admits `frame` through the recording Scribe, after a release
+        /// permit when it is bound for the held table.
+        ///
+        /// # Errors
+        ///
+        /// Returns the recording Scribe's scripted refusal.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the release semaphore is closed while a held frame
+        /// waits.
+        async fn ingest_frame(
+            &self,
+            frame: ScribeIngressFrame,
+        ) -> Result<FrameAdmission, ScribeError> {
+            if frame.table.fqn() == self.table.fqn() {
+                self.arrived.notify_one();
+                self.release
+                    .acquire()
+                    .await
+                    .expect("the release stays open")
+                    .forget();
+            }
+            self.inner.ingest_frame(frame).await
+        }
+
+        /// Resolves through the recording Scribe.
+        ///
+        /// # Errors
+        ///
+        /// Returns the recording Scribe's resolution error.
+        async fn resolve_write_table(
+            &self,
+            tenant: DataTenantId,
+            table: &TableRef,
+        ) -> Result<TableUid, ScribeError> {
+            self.inner.resolve_write_table(tenant, table).await
         }
     }
 }

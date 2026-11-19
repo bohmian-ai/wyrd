@@ -9,9 +9,10 @@
 //! any number of distinct Agents, and no call can see another's media,
 //! tools, or workspace.
 
+use std::any::Any;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{Map, Value};
@@ -23,7 +24,6 @@ use skald_prompt::Prompt;
 use skald_providers::ProviderError;
 use skald_runtime::{ProviderRegistry, SkaldRuntimeError};
 use skald_spec::{MediaRef, PreparedSchemas, ResponseType};
-use tokio::time::Instant;
 use wyrd_spec::card::agent::{AgentSpec, BuiltinTool, ExecutionRoute};
 use wyrd_spec::card::verifier::{Action, AgentCall, Check, InputSlot};
 use wyrd_spec::error::WyrdError;
@@ -31,9 +31,11 @@ use wyrd_spec::ids::SlotName;
 use wyrd_spec::reference::{CardRef, InlineableRef};
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::VerificationVerdict;
-use wyrd_spec::verification::execution::{CallProvenance, Citation, InputDeclaration, Verdict};
+use wyrd_spec::verification::execution::{
+    CallProvenance, Citation, InputDeclaration, Producer, Verdict,
+};
 
-use super::tools::{AgentToolset, ToolSession, finished};
+use super::tools::{AgentToolset, ToolSession};
 use super::{
     ActionExecutor, ActionOutput, BlockCall, BlockError, CallInput, CallValue, CheckExecutor,
     CheckOutput, EngineError, Position, verdict_from,
@@ -96,13 +98,22 @@ pub trait PromptCardResolver: Send + Sync {
 /// provider media kind.
 #[async_trait]
 pub trait EvidenceReader: Send + Sync {
-    /// Read `evidence` as inline provider-native media.
+    /// Read `evidence` as inline provider-native media, with a guard holding
+    /// the host resources the returned media's bytes take, such as their
+    /// process memory charge. The Agent call keeps the guard until the bound
+    /// Prompt that carries the media is dropped, on completion or
+    /// cancellation. Copies made later by rendering and provider requests are
+    /// the gateway's own buffers, which it accounts for itself.
     ///
     /// # Errors
     /// Returns [`BlockError::Terminal`] for missing, unauthorized,
-    /// mismatched, oversized, or non-native evidence and
-    /// [`BlockError::Retryable`] for a transient storage failure.
-    async fn media(&self, evidence: &InputDeclaration) -> Result<MediaRef, BlockError>;
+    /// mismatched, oversized, or non-native evidence,
+    /// [`BlockError::Busy`] when the host cannot hold the media now, and [`BlockError::Retryable`] for a transient storage
+    /// failure.
+    async fn media(
+        &self,
+        evidence: &InputDeclaration,
+    ) -> Result<(MediaRef, Box<dyn Any + Send + Sync>), BlockError>;
 
     /// The subset of `citations` whose slot is in `reachable` and whose
     /// locator names a location in that slot's pinned original evidence.
@@ -297,7 +308,9 @@ impl AgentExecutor {
         }
     }
 
-    /// Bind `inputs` to the placeholders of `prompt`, the call's own copy.
+    /// Bind `inputs` to the placeholders of `prompt`, the call's own copy,
+    /// returning it with its text variables and the guards of the media it
+    /// binds, which must outlive every use of the bound copy.
     ///
     /// Input keys must equal the Prompt's text and media placeholders. JSON
     /// strings render raw and other JSON as JSON text; evidence binds as
@@ -316,7 +329,7 @@ impl AgentExecutor {
         prompt: Prompt,
         inputs: &BTreeMap<String, CallInput>,
         slots: &BTreeSet<SlotName>,
-    ) -> Result<(Prompt, Vec<(String, String)>), BlockError> {
+    ) -> Result<Bound, BlockError> {
         let mut bound = prompt.into_native();
         let placeholders: BTreeSet<&str> = bound
             .variables
@@ -328,6 +341,7 @@ impl AgentExecutor {
             return Err(terminal("Agent inputs must match the Prompt placeholders"));
         }
         let mut vars = Vec::new();
+        let mut media_guards = Vec::new();
         for (name, input) in inputs {
             let is_media = bound.media_variables.contains(name);
             match (&input.value, is_media) {
@@ -337,7 +351,8 @@ impl AgentExecutor {
                         .evidence
                         .as_ref()
                         .ok_or_else(|| terminal("media inputs need an evidence reader"))?;
-                    let media = reader.media(evidence).await?;
+                    let (media, guard) = reader.media(evidence).await?;
+                    media_guards.push(guard);
                     bound
                         .bind_media_mut(name, &media)
                         .map_err(|error| BlockError::Terminal {
@@ -354,6 +369,9 @@ impl AgentExecutor {
                         reason: format!("text placeholder {name} cannot bind media"),
                     });
                 }
+                (CallValue::Publication { .. } | CallValue::Publications { .. }, _) => {
+                    return Err(terminal("publications mount only in a workspace"));
+                }
             }
         }
         if !slots.is_empty() {
@@ -368,42 +386,66 @@ impl AgentExecutor {
                     reason: format!("the Verdict citation slots cannot be narrowed: {error}"),
                 })?;
         }
-        Ok((Prompt::from_native(bound), vars))
+        Ok(Bound {
+            prompt: Prompt::from_native(bound),
+            vars,
+            media_guards,
+        })
     }
 
-    /// Run one Agent call and return its raw run plus provenance.
+    /// Run the Agent `call` of `block` and return its raw run plus
+    /// provenance.
     ///
-    /// `slots` are the citation slots a check invocation can reach, empty for
-    /// a step; see [`Self::bind`].
+    /// The run uses `block`'s inputs, workspace, deadline, and tool-call
+    /// records. `role` carries a step's producing attempt or a check's
+    /// reachable citation slots; see [`Role`].
     ///
-    /// Steps and checks get exactly their declared built-ins from the toolset, which holds the
-    /// invocation's workspace until the run ends. The first tool refused
-    /// process capacity ends the invocation busy at once: the loop is raced
-    /// against the session's refusal and dropped with any sibling tool calls
-    /// still pending, so no further model call or tool result follows.
+    /// Steps and checks get exactly their declared built-ins from the
+    /// toolset, which holds the attempt's workspace until the run ends. Every
+    /// call is recorded in `calls` and spends its allowance; at most the
+    /// Agent's effective tool concurrency cap of operations other than
+    /// `code.run` run at once across direct and nested calls. A session stop
+    /// ends the invocation at once: the loop is raced against it and dropped
+    /// with any sibling tool calls still pending, so no further model call or
+    /// tool result follows.
     ///
     /// # Errors
     /// Returns resolution, binding, route, tool, and run failures as
-    /// [`BlockError`]s, and [`BlockError::Busy`] when the workspace or a tool
-    /// is refused process capacity.
+    /// [`BlockError`]s, [`BlockError::Busy`] when the workspace or a tool is
+    /// refused process capacity, and a terminal
+    /// `WYRD_VERIFICATION_422_TOOL_BUDGET_EXCEEDED` failure once a request
+    /// comes after the invocation's allowance is spent.
     ///
     /// # Panics
-    /// Never panics: the loop stops before completing only once a refusal
-    /// is raised, and a raised refusal returns busy first.
-    async fn invoke(
+    /// Never panics: the loop stops before completing only once the session
+    /// stops, and a stopped session returns its error first.
+    async fn invoke<B: Sync>(
         &self,
-        id: &TaskId,
+        block: &BlockCall<'_, B>,
         call: &AgentCall,
-        inputs: &BTreeMap<String, CallInput>,
-        workspace: &BTreeMap<String, CallInput>,
-        slots: &BTreeSet<SlotName>,
-        deadline: Instant,
+        role: &Role<'_>,
     ) -> Result<Invoked, BlockError> {
         let started = phase_start();
+        let BlockCall {
+            id,
+            inputs,
+            workspace,
+            deadline,
+            tool_calls: calls,
+            ..
+        } = block;
         let resolved = self.resolve(&call.agent).await?;
         let route = self.route(id, &resolved.spec.execution_route)?;
+        let (slots, producer) = match role {
+            Role::Step(producer) => (&BTreeSet::new(), Some(producer)),
+            Role::Check(slots) => (*slots, None),
+        };
         let started = phase_end("resolve", started);
-        let (prompt, vars) = self.bind(resolved.prompt, inputs, slots).await?;
+        let Bound {
+            prompt,
+            vars,
+            media_guards,
+        } = self.bind(resolved.prompt, inputs, slots).await?;
         let started = phase_end("bind", started);
         let declared = resolved
             .spec
@@ -415,7 +457,6 @@ impl AgentExecutor {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let records = Arc::new(Mutex::new(Vec::new()));
         if declared.is_empty() && !call.workspace.is_empty() {
             return Err(terminal("a workspace needs a filesystem or code tool"));
         }
@@ -426,25 +467,32 @@ impl AgentExecutor {
                 .toolset
                 .as_ref()
                 .ok_or_else(|| terminal("this host provides no built-in tools"))?;
-            Some(toolset.open(id, workspace, deadline, &declared).await?)
+            let session = toolset
+                .open(id, workspace, *deadline, &declared, producer)
+                .await?;
+            session.register_with(calls);
+            Some(session)
         };
+        let run_config = run_config_from_agent_run_config_spec(&resolved.spec.run_config);
         let tools = match &session {
-            Some(session) => session.resolve(&declared, &records)?,
+            Some(session) => session.resolve(
+                &declared,
+                calls,
+                run_config.tool_concurrency_cap.unwrap_or(8),
+            )?,
             None => Vec::new(),
         };
         let prompt = Arc::new(prompt);
         let mut agent = Agent::from_resolved(id.as_str(), Arc::clone(&prompt))
             .with_prepared_schemas(Arc::clone(&self.schemas))
             .with_tools(tools)
-            .with_run_config(run_config_from_agent_run_config_spec(
-                &resolved.spec.run_config,
-            ))
+            .with_run_config(run_config)
             .with_execution_route(route.clone());
         if let Some(caller) = &self.gateway {
             agent = agent.with_gateway_caller(Arc::clone(caller));
         }
         if let Some(session) = &session {
-            agent = agent.before_model(session.halt_on_refusal());
+            agent = agent.before_model(session.halt_before_model());
         }
         let borrowed: Vec<(&str, &str)> = vars
             .iter()
@@ -454,29 +502,29 @@ impl AgentExecutor {
         let run = match &session {
             Some(session) => tokio::select! {
                 run = run => Some(run),
-                () = session.refusal_raised() => None,
+                () = session.halt_raised() => None,
             },
             None => Some(run.await),
         };
-        let refused = session.as_ref().and_then(ToolSession::refused);
+        let halted = session.as_ref().and_then(ToolSession::halted);
         drop(session);
-        if let Some(reason) = refused {
-            return Err(BlockError::Busy { reason });
+        if let Some(error) = halted {
+            return Err(error);
         }
         let run = run
-            .expect("the loop only stops early for a raised refusal")
+            .expect("the loop only stops early for a stopped session")
             .map_err(block_error)?;
         phase_end("run", started);
         Ok(Invoked {
             structured: run.structured_output,
             text: run.output,
             prompt,
+            _media_guards: media_guards,
             provenance: CallProvenance::Agent {
                 agent: resolved.agent_ref,
                 prompt: resolved.prompt_ref,
                 route,
             },
-            tool_calls: finished(&records),
         })
     }
 }
@@ -496,14 +544,7 @@ impl ActionExecutor for AgentExecutor {
             return Err(terminal("the Agent executor runs only Agent actions"));
         };
         let invoked = self
-            .invoke(
-                call.id,
-                agent,
-                &call.inputs,
-                &call.workspace,
-                &BTreeSet::new(),
-                call.deadline,
-            )
+            .invoke(&call, agent, &Role::Step(call.producer()))
             .await?;
         let output = invoked
             .structured
@@ -511,7 +552,6 @@ impl ActionExecutor for AgentExecutor {
         Ok(ActionOutput {
             output,
             provenance: Some(invoked.provenance),
-            tool_calls: invoked.tool_calls,
         })
     }
 }
@@ -540,16 +580,7 @@ impl CheckExecutor for AgentExecutor {
             .chain(call.workspace.values())
             .flat_map(|input| input.sources.iter().cloned())
             .collect();
-        let invoked = self
-            .invoke(
-                call.id,
-                agent,
-                &call.inputs,
-                &call.workspace,
-                &reachable,
-                call.deadline,
-            )
-            .await?;
+        let invoked = self.invoke(&call, agent, &Role::Check(&reachable)).await?;
         let answer = invoked
             .structured
             .ok_or_else(|| terminal("the check Agent returned no structured Verdict"))?;
@@ -594,6 +625,15 @@ struct Resolved<'a> {
     prompt_ref: Option<CardRef>,
 }
 
+/// What one Agent call is invoked as.
+enum Role<'a> {
+    /// A step action: the attempt the toolset attributes publications to.
+    Step(Producer),
+    /// A check: the citation slots its Verdict may cite, narrowed by
+    /// [`AgentExecutor::bind`] when non-empty.
+    Check(&'a BTreeSet<SlotName>),
+}
+
 /// The result of one Agent run.
 struct Invoked {
     /// Structured output of a structured Prompt.
@@ -602,10 +642,20 @@ struct Invoked {
     text: String,
     /// The bound Prompt that ran.
     prompt: Arc<Prompt>,
+    /// Guards of the media `prompt` carries, released with it.
+    _media_guards: Vec<Box<dyn Any + Send + Sync>>,
     /// Agent, Prompt, and effective route.
     provenance: CallProvenance,
-    /// Tool calls in call order.
-    tool_calls: Vec<wyrd_spec::verification::execution::ToolCallRecord>,
+}
+
+/// One call's Prompt copy with its inputs bound.
+struct Bound {
+    /// The bound copy.
+    prompt: Prompt,
+    /// Text placeholder values.
+    vars: Vec<(String, String)>,
+    /// Guards of the bound media, held while the copy is in use.
+    media_guards: Vec<Box<dyn Any + Send + Sync>>,
 }
 
 /// The stable code of a server that cannot take the call now.

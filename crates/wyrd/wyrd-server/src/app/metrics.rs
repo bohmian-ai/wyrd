@@ -148,6 +148,36 @@ pub const OPERATOR_DISPATCH_ATTEMPTS_TOTAL: &str = "wyrd_operator_dispatch_attem
 /// Claim-to-settlement latency of one Operator attempt, by `outcome`.
 pub const OPERATOR_DISPATCH_DURATION_SECONDS: &str = "wyrd_operator_dispatch_duration_seconds";
 
+/// The process resource plan every capacity owner sizes from, by `resource`
+/// (`effective_cpu`, `memory_limit_bytes`, `managed_memory_bytes`,
+/// `scratch_limit_bytes`); set once at boot.
+pub const PROCESS_RESOURCE_PLAN: &str = "wyrd_process_resource_plan";
+
+/// User plus system CPU seconds of every child the process has reaped, such
+/// as exited Python workers, as `getrusage(RUSAGE_CHILDREN)` reports it; set
+/// by each `bench` snapshot, so a benchmark window counts workers that exit
+/// inside it. Live workers are read from the OS by the benchmark itself.
+pub const PROCESS_REAPED_CHILDREN_CPU_SECONDS: &str = "wyrd_process_reaped_children_cpu_seconds";
+/// Hosted Python operations `active` from their admission until they end.
+pub const VERIFICATION_HOSTED_OPERATIONS: &str = "wyrd_verification_hosted_operations";
+/// The inputs active [`VERIFICATION_HOSTED_OPERATIONS`] retain, in bytes.
+pub const VERIFICATION_HOSTED_BYTES: &str = "wyrd_verification_hosted_bytes";
+/// Hosted Python operations refused by the process, by `reason`: `memory`
+/// (its retained inputs did not fit) or `expired` (the deadline passed while
+/// pressure or stale worker telemetry held it).
+pub const VERIFICATION_HOSTED_REFUSALS_TOTAL: &str = "wyrd_verification_hosted_refusals_total";
+/// How long one hosted Python operation waited for process admission, by
+/// `outcome` (`granted`, `expired`); a cancelled one records nothing.
+pub const VERIFICATION_HOSTED_WAIT_SECONDS: &str = "wyrd_verification_hosted_wait_seconds";
+/// Checked-out Python workers, by `state`: `runnable` while a turn runs,
+/// `suspended` while the program waits on its host or for a CPU lane.
+pub const VERIFICATION_PYTHON_WORKERS: &str = "wyrd_verification_python_workers";
+/// Python worker lifecycle events, by `event`: `spawn` (a new worker
+/// process tracked), `reset` (a worker returned for reuse), and `reap` (a
+/// gone worker's charge returned).
+pub const VERIFICATION_PYTHON_WORKER_EVENTS_TOTAL: &str =
+    "wyrd_verification_python_worker_events_total";
+
 /// A governed gateway call's arrival until its answer, or stream end, was
 /// handed to the response body.
 pub const GATEWAY_DURATION_SECONDS: &str = "wyrd_gateway_duration_seconds";
@@ -170,6 +200,12 @@ pub const GATEWAY_QUEUE_DELAY_SECONDS: &str = "wyrd_gateway_queue_delay_seconds"
 /// benchmarking: its execution task's dispatch, the caller's resumption on
 /// its answer, or its provider header wait and body receipt.
 pub const GATEWAY_WAIT_SECONDS: &str = "wyrd_gateway_wait_seconds";
+/// One stage of a Scribe outbox write, by `stage`, recorded only while
+/// benchmarking: the write's row projection into frames (`frames`), and per
+/// chunk its delivery-permit wait (`permit`), blocking-pool start delay
+/// (`encode_queue`), encoding (`encode`), and each stream's submission until
+/// Scribe answers it (`submit`).
+pub const SCRIBE_OUTBOX_STAGE_SECONDS: &str = "wyrd_scribe_outbox_stage_seconds";
 
 /// Gateway latency families sharing [`VERIFICATION_DURATION_BUCKETS`], so a
 /// sub-millisecond overhead p99 is resolvable.
@@ -197,6 +233,7 @@ const VERIFICATION_DURATION_FAMILIES: &[&str] = &[
     VERIFICATION_STORE_DURATION_SECONDS,
     VERIFICATION_SCHEDULE_PASS_SECONDS,
     VERIFICATION_GROUP_SNAPSHOT_SECONDS,
+    VERIFICATION_HOSTED_WAIT_SECONDS,
 ];
 
 /// Every production Bifrost duration family whose p99 is consumed by qualification.
@@ -229,6 +266,7 @@ pub enum MetricsError {
     #[error("failed to install metrics recorder")]
     Install(#[source] metrics_exporter_prometheus::BuildError),
     /// Another recorder was installed before the benchmark recorder.
+    #[cfg(feature = "bench")]
     #[error("failed to install the benchmark recorder")]
     Benchmark(#[source] metrics::SetRecorderError<wyrd_benchmark::BenchmarkRecorder>),
     /// The benchmark recorder was requested from a build without the `bench`
@@ -242,7 +280,9 @@ pub enum MetricsError {
 pub enum MetricsBackend {
     /// The production Prometheus recorder and its render handle.
     Prometheus(PrometheusHandle),
-    /// The [`wyrd_benchmark`] recorder of an explicit benchmark server.
+    /// The [`wyrd_benchmark`] recorder of an explicit benchmark server;
+    /// only a `bench` build has it.
+    #[cfg(feature = "bench")]
     Benchmark,
 }
 
@@ -276,6 +316,7 @@ impl MetricsBackend {
     pub fn prometheus(&self) -> Option<&PrometheusHandle> {
         match self {
             Self::Prometheus(handle) => Some(handle),
+            #[cfg(feature = "bench")]
             Self::Benchmark => None,
         }
     }
@@ -448,27 +489,51 @@ pub const BENCHMARK_SNAPSHOT_PATH: &str = "/benchmark/snapshot";
 /// allocated and still live, as a gzipped pprof profile of sizes and code
 /// locations only.
 pub fn metrics_router(backend: MetricsBackend) -> Router {
-    let MetricsBackend::Prometheus(handle) = backend else {
-        return benchmark_router();
-    };
-    Router::new().route("/metrics", get(move || ready(handle.render())))
+    match backend {
+        MetricsBackend::Prometheus(handle) => {
+            Router::new().route("/metrics", get(move || ready(handle.render())))
+        }
+        #[cfg(feature = "bench")]
+        MetricsBackend::Benchmark => benchmark_router(),
+    }
 }
 
-/// The benchmark backend's snapshot router.
+/// The benchmark backend's snapshot and heap router.
+#[cfg(feature = "bench")]
 fn benchmark_router() -> Router {
-    let router = Router::new().route(
-        BENCHMARK_SNAPSHOT_PATH,
-        get(|| ready(axum::Json(wyrd_benchmark::snapshot()))),
-    );
-    #[cfg(feature = "bench")]
-    let router = router.route(
-        wyrd_benchmark::heap::PATH,
-        get(heap_profile).post(|| {
-            wyrd_benchmark::heap::start();
-            ready(axum::http::StatusCode::NO_CONTENT)
-        }),
-    );
-    router
+    Router::new()
+        .route(
+            BENCHMARK_SNAPSHOT_PATH,
+            get(|| {
+                record_reaped_children_cpu();
+                ready(axum::Json(wyrd_benchmark::snapshot()))
+            }),
+        )
+        .route(
+            wyrd_benchmark::heap::PATH,
+            get(heap_profile).post(|| {
+                wyrd_benchmark::heap::start();
+                ready(axum::http::StatusCode::NO_CONTENT)
+            }),
+        )
+}
+
+/// Sets [`PROCESS_REAPED_CHILDREN_CPU_SECONDS`] for the snapshot about to be
+/// taken. An unreadable counter leaves the gauge unset, so the benchmark
+/// reports worker CPU unavailable rather than zero.
+#[cfg(feature = "bench")]
+fn record_reaped_children_cpu() {
+    use nix::sys::resource::{UsageWho, getrusage};
+    use nix::sys::time::TimeValLike as _;
+
+    match getrusage(UsageWho::RUSAGE_CHILDREN) {
+        Ok(usage) => {
+            let micros =
+                usage.user_time().num_microseconds() + usage.system_time().num_microseconds();
+            metrics::gauge!(PROCESS_REAPED_CHILDREN_CPU_SECONDS).set(micros as f64 / 1e6);
+        }
+        Err(error) => tracing::warn!(%error, "reaped children CPU is unreadable"),
+    }
 }
 
 /// The sampled heap profile, rendered on a blocking thread because
@@ -757,6 +822,12 @@ mod tests {
                 .any(|metric| metric
                     .matches("bifrost_gate_requests_total", &[("operation", "write")])),
             "series registered at startup land in the benchmark recorder"
+        );
+        assert!(
+            before.metrics.iter().any(|metric| metric.name
+                == PROCESS_REAPED_CHILDREN_CPU_SECONDS
+                && matches!(metric.value, wyrd_benchmark::MetricValue::Gauge { value, .. } if value >= 0.0)),
+            "each snapshot reports the CPU of the children the server reaped"
         );
         metrics::counter!(HTTP_REQUESTS_TOTAL, "status" => "200").increment(3);
         metrics::gauge!(VERIFICATION_ACTIVE_RUNS, "mode" => "direct").increment(2.0);

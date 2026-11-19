@@ -1246,6 +1246,9 @@ pub struct AnalyticalStageIngressConfig {
     pub egress: Arc<AnalyticalStageEgress>,
     /// The node's warehouse store every stage scan on this node reads through.
     pub objects: Arc<BifrostIcebergStorage>,
+    /// The process workload manager whose CPU lanes every authorized stage
+    /// message, and every poll of its response, runs on.
+    pub workloads: wyrd_runtime::resources::WorkloadManager,
 }
 
 /// Authenticated follower entry point for Analytical stage operations.
@@ -1283,6 +1286,8 @@ pub struct AnalyticalStageIngress {
     egress: Arc<AnalyticalStageEgress>,
     /// The node's warehouse store every graph worker's stage scans read through.
     objects: Arc<BifrostIcebergStorage>,
+    /// The process workload manager whose CPU lanes stage work runs on.
+    workloads: wyrd_runtime::resources::WorkloadManager,
     /// Bounded queue the caller-drop path hands graphs to for settlement.
     ///
     /// Cleared by shutdown, which is how the driver learns to finish. A send
@@ -1465,6 +1470,7 @@ impl AnalyticalStageIngress {
             reservations,
             egress,
             objects,
+            workloads,
         } = config;
         // Sized from the one capacity root that already bounds graph
         // admission, so the queue can always hold every graph this node is
@@ -1501,6 +1507,7 @@ impl AnalyticalStageIngress {
                 graphs: Mutex::new(HashMap::new()),
                 egress,
                 objects,
+                workloads,
                 settlement: Mutex::new(Some(sender)),
                 driver: Mutex::new(driver),
                 accepting: AtomicBool::new(true),
@@ -1523,6 +1530,38 @@ impl AnalyticalStageIngress {
             Arc::clone(&self.egress),
             Arc::clone(&self.objects),
         ))
+    }
+
+    /// Begins one authorized stage message's CPU work on this node: Bifrost
+    /// work of `graph`'s verified tenant on the shared CPU lanes. The
+    /// operation keeps the work counted as demand while it lives; callers
+    /// poll on the lanes and hold none between polls.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::QueryPeerSecurity`] when this node recorded no
+    /// verified identity for `graph`, and [`BifrostError::Internal`] when the
+    /// identity lock is poisoned.
+    pub(crate) fn stage_work(
+        &self,
+        graph: AnalyticalGraphKey,
+    ) -> Result<
+        (
+            wyrd_runtime::resources::CpuLanes,
+            wyrd_runtime::resources::Operation,
+        ),
+        BifrostError,
+    > {
+        let tenant = self
+            .egress
+            .tenant(graph)?
+            .ok_or(BifrostError::QueryPeerSecurity)?;
+        let operation = self.workloads.begin(
+            wyrd_runtime::resources::Workload::Bifrost,
+            Some(tenant),
+            None,
+        );
+        Ok((self.workloads.lanes().clone(), operation))
     }
 
     /// Returns the upstream worker that must serve one graph's stage operation.
@@ -3597,6 +3636,7 @@ mod tests {
             roles: [crate::resources::BifrostRole::Oracle]
                 .into_iter()
                 .collect(),
+            process_memory_limit_bytes: None,
             server_memory_min_bytes: None,
             bifrost_memory_limit_bytes: None,
             scratch_limit_bytes: None,
@@ -3712,6 +3752,7 @@ mod tests {
                 reservations: Arc::clone(&reservations),
                 egress: fixture_egress(),
                 objects: fixture_objects(),
+                workloads: fixture_oracle_role().workloads().clone(),
             });
             let graph = AnalyticalGraphKey::new(
                 PublicQueryId::from_uuid(Uuid::from_u128(11)),

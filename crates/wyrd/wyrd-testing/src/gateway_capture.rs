@@ -11,7 +11,9 @@
 //! frames [`PacedUpstream`] writes one at a time. `wiremock` returns one
 //! whole body after one delay, so it cannot pace a stream; [`PacedUpstream`]
 //! is the bounded local provider that does, recording when it sent each
-//! frame. [`pick`] reads only the request and answer members a fixture
+//! frame. Nor can it wait for a test event, so [`HeldUpstream`] forwards to
+//! a scripted upstream and holds chosen answers until the test releases
+//! them. [`pick`] reads only the request and answer members a fixture
 //! judges or routes by, under a decoded value's rules.
 
 use std::borrow::Cow;
@@ -422,6 +424,10 @@ pub struct Pacing {
 /// Monotonic send times [`PacedUpstream`] recorded, by call marker.
 type Sends = Arc<Mutex<HashMap<String, Vec<Instant>>>>;
 
+/// The buffered answer [`PacedUpstream::replying`] builds from one request
+/// body, or `None` to refuse it.
+pub type Reply = Arc<dyn Fn(&[u8]) -> Option<Bytes> + Send + Sync>;
+
 /// What every [`PacedUpstream`] connection shares.
 #[derive(Clone)]
 struct Paced {
@@ -430,6 +436,8 @@ struct Paced {
     /// The buffered answer's body, identical on every call, so it is built
     /// once.
     buffered: Bytes,
+    /// Builds each buffered answer from its request instead, when set.
+    reply: Option<Reply>,
     /// Frame send times of calls not yet taken.
     sends: Sends,
     /// Calls whose send times may be held at once; a later call is answered
@@ -443,7 +451,7 @@ struct Paced {
 /// It serves `POST /v1/chat/completions` under any path prefix. The call's
 /// marker is its first message's content, which the caller makes unique. A
 /// buffered call waits [`Pacing::buffered_delay`] and answers a sized
-/// completion; a `stream: true` call waits [`Pacing::stream_delay`], then
+/// completion, or what its [`Reply`] builds from the request; a `stream: true` call waits [`Pacing::stream_delay`], then
 /// writes [`GatewayCapture::chat_event_frames`] with the marker as its id,
 /// [`Pacing::chunk_interval`] apart. Just before handing each data event (or
 /// the buffered body) to the connection it records [`Instant::now`] under
@@ -486,6 +494,32 @@ impl PacedUpstream {
         bound: usize,
         completion: &Value,
     ) -> std::io::Result<Self> {
+        Self::serve(pacing, bound, Bytes::from(completion.to_string()), None).await
+    }
+
+    /// [`Self::start`], answering every buffered call with what `reply`
+    /// builds from its request body, so a scripted conversation answers each
+    /// turn from that request's own messages; a request `reply` refuses is
+    /// answered `400`. [`Pacing::buffered_bytes`] is unused.
+    ///
+    /// # Errors
+    /// Returns the bind failure.
+    pub async fn replying(pacing: Pacing, bound: usize, reply: Reply) -> std::io::Result<Self> {
+        Self::serve(pacing, bound, Bytes::new(), Some(reply)).await
+    }
+
+    /// Binds a loopback port and serves `pacing` with the buffered answer
+    /// `buffered`, or what `reply` builds, holding at most `bound` calls'
+    /// send times.
+    ///
+    /// # Errors
+    /// Returns the bind failure.
+    async fn serve(
+        pacing: Pacing,
+        bound: usize,
+        buffered: Bytes,
+        reply: Option<Reply>,
+    ) -> std::io::Result<Self> {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
         let address = listener.local_addr()?;
         let sends: Sends = Arc::default();
@@ -493,7 +527,8 @@ impl PacedUpstream {
             .route("/{*path}", post(answer))
             .with_state(Paced {
                 pacing,
-                buffered: Bytes::from(completion.to_string()),
+                buffered,
+                reply,
                 sends: Arc::clone(&sends),
                 bound,
             });
@@ -606,8 +641,16 @@ async fn answer(State(paced): State<Paced>, headers: HeaderMap, body: Bytes) -> 
     if stream != Some(Leaf::Bool(true)) {
         paused(pacing.buffered_delay, &mut observation).await;
         let started = observation.now();
+        let buffered = match &paced.reply {
+            None => Some(paced.buffered.clone()),
+            Some(reply) => reply(&body),
+        };
+        let Some(buffered) = buffered else {
+            observation.finish(wyrd_benchmark::ERROR);
+            return (axum::http::StatusCode::BAD_REQUEST, "no scripted answer").into_response();
+        };
         paced.record(&marker);
-        let answer = ([(CONTENT_TYPE, "application/json")], paced.buffered).into_response();
+        let answer = ([(CONTENT_TYPE, "application/json")], buffered).into_response();
         observation.since("answer", started);
         observation.finish(wyrd_benchmark::SUCCESS);
         return answer;
@@ -977,4 +1020,148 @@ mod tests {
             "only a Boolean true streams"
         );
     }
+}
+
+/// A local provider in front of a scripted `wiremock` upstream that holds
+/// chosen answers until the test releases them.
+///
+/// Every request is forwarded to the upstream as it arrives, so the
+/// upstream records it and scripts its answer; that answer is handed back
+/// only once no hold matches the request's body; a hold matches a body
+/// containing every one of its fragments. `wiremock`
+/// answers on one thread after a fixed delay, so it cannot wait for a test
+/// event; this provider orders a race by the test's own observations rather
+/// than by elapsed time. A forward the upstream refuses answers `502`.
+/// Dropping it stops serving; a held caller then sees its connection close.
+pub struct HeldUpstream {
+    /// The bound address.
+    address: SocketAddr,
+    /// The fragment sets whose answers are held.
+    held: Arc<tokio::sync::watch::Sender<Vec<Vec<String>>>>,
+    /// The serving task.
+    serving: tokio::task::JoinHandle<()>,
+}
+
+/// What every [`HeldUpstream`] connection shares.
+#[derive(Clone)]
+struct Holding {
+    /// The scripted upstream's base URL.
+    upstream: String,
+    /// The forwarding client.
+    client: reqwest::Client,
+    /// The fragment sets whose answers are held.
+    held: Arc<tokio::sync::watch::Sender<Vec<Vec<String>>>>,
+}
+
+impl HeldUpstream {
+    /// Binds a loopback port and forwards every request to `upstream`,
+    /// holding none yet.
+    ///
+    /// # Errors
+    /// Returns the bind failure.
+    pub async fn start(upstream: &MockServer) -> std::io::Result<Self> {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+        let address = listener.local_addr()?;
+        let held = Arc::new(tokio::sync::watch::Sender::new(Vec::new()));
+        let router = Router::new().fallback(forward).with_state(Holding {
+            upstream: upstream.uri(),
+            client: reqwest::Client::new(),
+            held: Arc::clone(&held),
+        });
+        let serving = tokio::spawn(async move {
+            if let Err(error) = axum::serve(listener, router).await {
+                tracing::error!(%error, "the held upstream stopped serving");
+            }
+        });
+        Ok(Self {
+            address,
+            held,
+            serving,
+        })
+    }
+
+    /// The base URL every path prefix hangs off.
+    pub fn uri(&self) -> String {
+        format!("http://{}", self.address)
+    }
+
+    /// Holds the answer to every request whose body contains each of
+    /// `fragments`, including one already waiting, until [`Self::release`].
+    pub fn hold(&self, fragments: &[&str]) {
+        let hold = fragments
+            .iter()
+            .map(|&fragment| fragment.to_owned())
+            .collect();
+        self.held.send_modify(|held| held.push(hold));
+    }
+
+    /// Hands back every answer the hold on `fragments` held, and answers
+    /// its later requests at once.
+    pub fn release(&self, fragments: &[&str]) {
+        self.held
+            .send_modify(|held| held.retain(|hold| hold.as_slice() != fragments));
+    }
+}
+
+impl Drop for HeldUpstream {
+    /// Stops serving.
+    fn drop(&mut self) {
+        self.serving.abort();
+    }
+}
+
+/// Forwards one request to the scripted upstream, then hands back its
+/// answer once no hold matches the request's body; an
+/// unreadable request body answers `400`, and a refused forward `502`.
+async fn forward(State(holding): State<Holding>, request: axum::extract::Request) -> Response {
+    let (parts, body) = request.into_parts();
+    let Ok(body) = axum::body::to_bytes(body, usize::MAX).await else {
+        return (axum::http::StatusCode::BAD_REQUEST, "unreadable body").into_response();
+    };
+    let target = format!(
+        "{}{}",
+        holding.upstream,
+        parts
+            .uri
+            .path_and_query()
+            .map_or("/", axum::http::uri::PathAndQuery::as_str)
+    );
+    let mut headers = parts.headers;
+    headers.remove(axum::http::header::HOST);
+    let answered = holding
+        .client
+        .request(parts.method, target)
+        .headers(headers)
+        .body(body.clone())
+        .send()
+        .await;
+    let (status, content_type, answer) = match answered {
+        Ok(answered) => (
+            answered.status(),
+            answered.headers().get(CONTENT_TYPE).cloned(),
+            answered.bytes().await,
+        ),
+        Err(error) => {
+            return (axum::http::StatusCode::BAD_GATEWAY, error.to_string()).into_response();
+        }
+    };
+    let Ok(answer) = answer else {
+        return (axum::http::StatusCode::BAD_GATEWAY, "unreadable answer").into_response();
+    };
+    let text = String::from_utf8_lossy(&body).into_owned();
+    // The sender lives as long as the serving task, so the wait ends only
+    // when the request is no longer held.
+    let mut held = holding.held.subscribe();
+    let _released = held
+        .wait_for(|held| {
+            !held
+                .iter()
+                .any(|hold| hold.iter().all(|fragment| text.contains(fragment.as_str())))
+        })
+        .await;
+    let mut response = (status, answer).into_response();
+    if let Some(content_type) = content_type {
+        response.headers_mut().insert(CONTENT_TYPE, content_type);
+    }
+    response
 }

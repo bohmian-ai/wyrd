@@ -1,4 +1,5 @@
-//! Shutdown ownership: what a pod publishes before it stops and what it keeps.
+//! Shutdown ownership: what a pod publishes before it stops and what it keeps,
+//! and how a fenced execution state recovers across takeover and restart.
 
 use std::time::Duration;
 
@@ -9,12 +10,18 @@ use vala_bifrost_redux::scribe::geometry::{
     DEFAULT_WAL_SEGMENT_BYTES, ScribeGeometry,
 };
 use vala_bifrost_redux::scribe::persistence::PersistenceFaults;
+use vala_verify::blocks::Checkpoints as _;
+use wyrd_server::verification::state::{RunState, StateError, revision_fence};
+use wyrd_spec::verification::TaskId;
+use wyrd_spec::verification::execution::Producer;
+use wyrd_spec::verification::state::ExecutionState;
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
+use wyrd_testing::verification::VerificationFixture;
 
 use super::support::{
-    append_values, await_persistence_drained, published_rows, register_table, sorted_values,
-    tenant_client, unique_table,
+    append_values, await_persistence_drained, published_rows, read_sql, register_table,
+    sorted_values, tenant_client, unique_table,
 };
 
 /// Retention the idle-publication case configures.
@@ -568,4 +575,360 @@ async fn scribe_shutdown_drains_or_preserves_replay() {
         .shutdown()
         .await
         .expect("the cluster drains cleanly");
+}
+
+/// Starts one bound pod over a durable Bifrost data root and provisions one
+/// queued Verifier execution in its tenant.
+///
+/// # Panics
+///
+/// Panics when the pod cannot start or the fixture, subject, Verifier, or
+/// submission fails.
+async fn execution_pod(
+    root: &std::path::Path,
+) -> (
+    WyrdTestServer,
+    VerificationFixture,
+    wyrd_spec::ids::ExecutionId,
+) {
+    let server = WyrdTestServer::builder()
+        .with_durable_bifrost_data_root(root.to_path_buf())
+        .start_bound()
+        .await
+        .expect("the pod starts on a durable data root");
+    let fixture = VerificationFixture::provision(server.state(), server.data_tenant_id())
+        .await
+        .expect("the tenant provisions");
+    let (subject, _) = fixture.service("recovered").await.expect("service");
+    let verifier = fixture
+        .drift_verifier("recovering")
+        .await
+        .expect("verifier");
+    let execution = fixture
+        .submit(&verifier, &subject, std::collections::BTreeMap::new())
+        .await
+        .expect("the execution is admitted");
+    (server, fixture, execution)
+}
+
+/// Takes over `execution` as the next claim of its lease and returns that
+/// writer's recovery of the Bifrost state.
+///
+/// # Errors
+///
+/// Returns the [`StateError`] refusing the recovery: an accepted revision
+/// that cannot be found or read is unavailable, and one in another format is
+/// incompatible.
+///
+/// # Panics
+///
+/// Panics when the lease cannot be expired or the execution is not claimable.
+async fn take_over(
+    fixture: &VerificationFixture,
+    server: &WyrdTestServer,
+    execution: wyrd_spec::ids::ExecutionId,
+) -> Result<RunState, StateError> {
+    fixture
+        .expire_lease(execution)
+        .await
+        .expect("the lease expires");
+    fixture
+        .claim_state(server.state())
+        .await
+        .expect("the execution is reclaimable")
+        .1
+}
+
+/// The (step, attempt) of every invocation in `state`, in commit order.
+fn invocations(state: &ExecutionState) -> Vec<(String, u32)> {
+    state
+        .invocations
+        .iter()
+        .map(|invocation| {
+            (
+                invocation.producer.step_id.as_str().to_owned(),
+                invocation.producer.attempt,
+            )
+        })
+        .collect()
+}
+
+/// Recovery loads exactly the accepted revision or fails closed.
+///
+/// A writer accepts two invocations, which background persistence may
+/// coalesce into one revision or write as two. When the next revision's
+/// batch fence is durable but its row is not visible, as when the Scribe holding
+/// it was unavailable before the read discovered it, a takeover is refused
+/// as unavailable instead of starting fresh or loading the older revision,
+/// and changes nothing. Once every fenced revision is readable, a takeover
+/// loads the accepted revision exactly, and the same revision reads back
+/// after the pod restarts on its retained data root and replays its WAL.
+///
+/// # Panics
+///
+/// Panics when the pod cannot start or restart, a revision is not accepted,
+/// recovery falls back to an older or fresh state, or a recovered state
+/// differs from the accepted one.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn execution_recovery_requires_exact_accepted_state() {
+    let root = tempfile::tempdir().expect("durable Bifrost data root");
+    let (server, fixture, execution) = execution_pod(root.path()).await;
+    let (_, first) = fixture
+        .claim_state(server.state())
+        .await
+        .expect("the execution is claimable");
+    let first = first.expect("a fresh execution's state claims");
+    for step in ["review", "judge"] {
+        first
+            .begin(&Producer::plain(&TaskId::new(step).expect("task"), 1))
+            .await
+            .expect("the revision is accepted");
+    }
+    first.persisted().await.expect("the revisions are accepted");
+    let accepted = first.snapshot();
+    drop(first);
+
+    let pool = server
+        .pg_fixture()
+        .superuser_pool()
+        .expect("fixture exposes a superuser pool");
+    let fences: Vec<Uuid> = (1..=2)
+        .map(|revision| revision_fence(server.data_tenant_id(), execution, revision))
+        .collect();
+    let (last,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM vala.scribe_batch_commits WHERE batch_id = ANY($1)")
+            .bind(&fences)
+            .fetch_one(&pool)
+            .await
+            .expect("the accepted fences read");
+    assert!(last >= 1, "the accepted invocations are fenced");
+    let unseen = revision_fence(server.data_tenant_id(), execution, last + 1);
+    let fenced = sqlx::query(
+        "INSERT INTO vala.scribe_batch_commits \
+         SELECT (jsonb_populate_record(c, jsonb_build_object('batch_id', $2::uuid))).* \
+           FROM vala.scribe_batch_commits c \
+          WHERE logical_table_fqn = 'bifrost.verification.execution_events' AND batch_id = $1",
+    )
+    .bind(revision_fence(server.data_tenant_id(), execution, last))
+    .bind(unseen)
+    .execute(&pool)
+    .await
+    .expect("the next revision's fence is durable");
+    assert_eq!(
+        fenced.rows_affected(),
+        1,
+        "exactly the next fence is copied"
+    );
+    let refused = take_over(&fixture, &server, execution).await;
+    assert!(
+        matches!(refused, Err(StateError::Unavailable(_))),
+        "a fenced revision no read can see fails closed: {:?}",
+        refused.as_ref().err()
+    );
+    sqlx::query("DELETE FROM vala.scribe_batch_commits WHERE batch_id = $1")
+        .bind(unseen)
+        .execute(&pool)
+        .await
+        .expect("the unseen fence is withdrawn");
+    let recovered = take_over(&fixture, &server, execution)
+        .await
+        .expect("the accepted revision recovers");
+    assert_eq!(recovered.snapshot(), accepted);
+    assert_eq!(
+        invocations(&accepted),
+        [("review".to_owned(), 1), ("judge".to_owned(), 1)]
+    );
+    drop(recovered);
+
+    let server = Box::pin(server.restart_bound(
+        WyrdTestServer::builder().with_durable_bifrost_data_root(root.path().to_path_buf()),
+    ))
+    .await
+    .expect("the pod restarts on its retained data root");
+    assert_eq!(
+        fixture
+            .execution_state(server.state(), execution)
+            .await
+            .expect("the accepted revision reads after replay"),
+        Some(accepted)
+    );
+    server.shutdown().await.expect("the server drains cleanly");
+}
+
+/// A restarted pod keeps its own Bifrost data root, so a checkpoint
+/// acknowledged into its WAL but never published survives a shutdown that
+/// aborts at its budget and recovers exactly.
+///
+/// Every object write is held and a publication of the acknowledged
+/// revisions is in flight at the hold when the pod stops, so its Bifrost
+/// drain cannot finish within the shutdown budget and is aborted. The harness
+/// restart mounts no explicit data root; the replacement reopens the original
+/// one, reads the accepted revision, and a takeover recovers it without
+/// running an accepted invocation again.
+///
+/// # Panics
+///
+/// Panics when the pod cannot start or restart, the revisions are not
+/// accepted, or the state after restart differs from the accepted one.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn restart_recovers_an_acknowledged_unpublished_checkpoint() {
+    let faults = PersistenceFaults::default();
+    faults.hold_object_writes_for_test();
+    let server = WyrdTestServer::builder()
+        .with_scribe_persistence_faults_for_test(faults.clone())
+        .start_bound()
+        .await
+        .expect("the pod starts");
+    let fixture = VerificationFixture::provision(server.state(), server.data_tenant_id())
+        .await
+        .expect("the tenant provisions");
+    let (subject, _) = fixture.service("unpublished").await.expect("service");
+    let verifier = fixture
+        .drift_verifier("unpublished-recovery")
+        .await
+        .expect("verifier");
+    let execution = fixture
+        .submit(&verifier, &subject, std::collections::BTreeMap::new())
+        .await
+        .expect("the execution is admitted");
+    let (_, writer) = fixture
+        .claim_state(server.state())
+        .await
+        .expect("the execution is claimable");
+    let writer = writer.expect("a fresh execution's state claims");
+    for step in ["review", "judge"] {
+        writer
+            .begin(&Producer::plain(&TaskId::new(step).expect("task"), 1))
+            .await
+            .expect("the revision is accepted");
+    }
+    writer
+        .persisted()
+        .await
+        .expect("the revisions are acknowledged before any publishes");
+    let accepted = writer.snapshot();
+    drop(writer);
+    let state = server.state().clone();
+    let publishing = tokio::spawn(async move { state.flush_scribe_for_test().await });
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        faults.wait_for_held_object_writes_for_test(1),
+    )
+    .await
+    .expect("the acknowledged revisions start publishing");
+
+    let server = Box::pin(server.restart_bound(WyrdTestServer::builder()))
+        .await
+        .expect("the pod restarts on its own data root");
+    publishing.abort();
+    assert_eq!(
+        fixture
+            .execution_state(server.state(), execution)
+            .await
+            .expect("the acknowledged revision reads after restart"),
+        Some(accepted.clone())
+    );
+    let recovered = take_over(&fixture, &server, execution)
+        .await
+        .expect("the acknowledged revision recovers");
+    assert_eq!(recovered.snapshot(), accepted);
+    assert_eq!(
+        invocations(&recovered.snapshot()),
+        [("review".to_owned(), 1), ("judge".to_owned(), 1)],
+        "no accepted invocation is recomputed"
+    );
+    drop(recovered);
+    server.shutdown().await.expect("the server drains cleanly");
+}
+
+/// A takeover inherits progress accepted before it, the first accepted
+/// writer of a revision keeps it, and the refused write never resurrects
+/// through WAL replay.
+///
+/// Writer A accepts one revision and is taken over by writer B, which
+/// inherits it. B accepts the next revision; A, delayed past the takeover,
+/// offers its own rows for that same revision and is refused. After the pod
+/// restarts on its retained data root and replays its WAL, the execution
+/// holds exactly B's two revisions, one row each, and a further takeover
+/// recovers B's state.
+///
+/// # Panics
+///
+/// Panics when the pod cannot start or restart, an accepted revision is
+/// refused or lost, the replaced writer's revision is accepted or replayed,
+/// or a recovered state differs from the accepted one.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn execution_takeover_rejects_late_writes_after_replay() {
+    let root = tempfile::tempdir().expect("durable Bifrost data root");
+    let (server, fixture, execution) = execution_pod(root.path()).await;
+    let (_, replaced) = fixture
+        .claim_state(server.state())
+        .await
+        .expect("the execution is claimable");
+    let replaced = replaced.expect("a fresh execution's state claims");
+    replaced
+        .begin(&Producer::plain(&TaskId::new("review").expect("task"), 1))
+        .await
+        .expect("A's first revision is recorded");
+    replaced
+        .persisted()
+        .await
+        .expect("A's first revision is accepted");
+
+    let current = take_over(&fixture, &server, execution)
+        .await
+        .expect("B takes the state over");
+    assert_eq!(
+        invocations(&current.snapshot()),
+        [("review".to_owned(), 1)],
+        "B inherits the progress accepted before its takeover"
+    );
+    current
+        .begin(&Producer::plain(&TaskId::new("judge").expect("task"), 1))
+        .await
+        .expect("B's revision is recorded");
+    current.persisted().await.expect("B's revision is accepted");
+    replaced
+        .begin(&Producer::plain(&TaskId::new("late").expect("task"), 1))
+        .await
+        .expect("the replaced writer records its revision in memory");
+    replaced
+        .persisted()
+        .await
+        .expect_err("the replaced writer cannot take B's revision");
+    let accepted = current.snapshot();
+    drop((replaced, current));
+
+    let server = Box::pin(server.restart_bound(
+        WyrdTestServer::builder().with_durable_bifrost_data_root(root.path().to_path_buf()),
+    ))
+    .await
+    .expect("the pod restarts on its retained data root");
+    server.flush_bifrost().await.expect("the replay publishes");
+    let client = tenant_client(&server, server.data_tenant_id()).await;
+    assert_eq!(
+        read_sql(
+            &client,
+            &format!(
+                "SELECT sequence AS value FROM bifrost.verification.execution_events \
+                 WHERE execution_id = '{execution}' ORDER BY sequence"
+            ),
+        )
+        .await,
+        [1, 2],
+        "exactly the accepted revisions are retained once each"
+    );
+    let recovered = take_over(&fixture, &server, execution)
+        .await
+        .expect("the accepted revision recovers after replay");
+    assert_eq!(recovered.snapshot(), accepted);
+    assert_eq!(
+        invocations(&accepted),
+        [("review".to_owned(), 1), ("judge".to_owned(), 1)]
+    );
+    drop(recovered);
+    server.shutdown().await.expect("the server drains cleanly");
 }

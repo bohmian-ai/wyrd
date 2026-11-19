@@ -1,6 +1,6 @@
 ---
 name: wyrd-design
-description: Act as a Wyrd design partner before wyrd-spec and wyrd-plan. Create and maintain design notes, clarify the problem and outcome, research evidence, and develop the simplest concrete implementation proposal with the user. Use for exploring a change idea or resuming its design conversation; ordinary advice and implementation belong to their existing workflows.
+description: Settle a Wyrd change's solution, implementation flow, material decisions, and observable success with the user, maintaining design notes for wyrd-spec and wyrd-plan. Use for exploring or resuming a design; ordinary advice and implementation belong to their existing workflows.
 ---
 
 # Wyrd Design
@@ -8,7 +8,9 @@ description: Act as a Wyrd design partner before wyrd-spec and wyrd-plan. Create
 Help the user turn an idea into the simplest evidence-backed implementation
 proposal that solves the agreed problem. Maintain the design record throughout
 the conversation. The user owns the decisions and decides when design is
-finished. Produce a proposal, not just a recommendation.
+finished. Produce a decision-complete implementation proposal for `$wyrd-spec`
+to record and `$wyrd-plan` to divide into deliverable tasks. Preserve the shared
+handoff agreement; do not expand scope to make the proposal seem complete.
 
 ## Start or resume
 
@@ -78,10 +80,12 @@ never imply inspection or experimental verification that did not occur.
 
 Explain enough for the user to assess:
 
-- the end-to-end flow, what changes, and what can be reused;
+- the end-to-end flow, its actual inputs and sources, what changes, what each
+  part produces and consumes, and what can be reused;
 - affected owners and consumers, including public surfaces or stored data;
 - important success, failure, edge, and transition behavior where relevant;
 - why the approach achieves the agreed outcome, its costs and limitations;
+- how the connected flow will be exercised and what observation proves success;
 - supporting evidence and uncertainties that could change the choice.
 
 Algorithms, code sketches, and possible module changes are welcome when they
@@ -128,21 +132,21 @@ or execution permissions.
 
 ## Finalize and hand off
 
-When the user says there is enough or asks to finalize, reconcile the notes and
-set `Status: finalized`. Ensure the problem, desired outcome, implementation
-proposal, rationale, material decisions, limits, standards conflicts, and
-supplemental links make sense without the conversation. Remove stale or
-contradictory proposals; retain rejected approaches only when their rationale
-will prevent useful context from being lost.
+When the user asks to finalize, reconcile the notes and relevant supplements.
+The agreed solution, end-to-end implementation flow, material decisions,
+constraints, limits and observable success must make sense without the
+conversation. Remove stale or contradictory proposals; retain rejected
+approaches only when their rationale is useful.
 
-Do not force another design round to eliminate every unknown. Record remaining
-questions, distinguishing material decisions needed before spec approval from
-private choices implementation can resolve. Finalization records the user's
-stopping point; it grants neither spec approval nor implementation readiness.
-A later resumed design returns to `exploring` while being revised.
+Set `Status: finalized` when the user agrees the proposal and no unresolved
+decision would materially change the solution. If such a decision remains,
+name it and keep `exploring`; ending a conversation does not make an incomplete
+design ready for handoff. Do not reopen settled decisions or require another
+round to resolve ordinary private coding choices. Record those choices as
+implementation-owned. A resumed design returns to `exploring` while revised.
 
-Return the notes path, proposed change and main trade-off, and material open
-decisions. Do not automatically invoke `$wyrd-spec` or `$wyrd-plan`. They consume
-this folder as reference material: the approved spec owns required behavior,
-and current authority and code must be revalidated before research becomes
-implementation work.
+Finalization makes the design ready for specification, not approved for
+implementation. Return the notes path, agreed approach, connected flow and
+proof, and any remaining private choices. Do not automatically invoke
+`$wyrd-spec` or `$wyrd-plan`. The spec records the agreement for human approval;
+planning uses both that approved contract and this design to write tasks.

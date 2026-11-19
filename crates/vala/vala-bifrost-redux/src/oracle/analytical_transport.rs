@@ -1166,8 +1166,8 @@ pub struct GraphWorkerServices<S> {
     ingress: Arc<AnalyticalStageIngress>,
     /// Upstream's own constructor from a worker to its generated service.
     build: fn(Worker) -> S,
-    /// The graph-bound service, present only on a resolved value.
-    resolved: Option<S>,
+    /// The graph-bound service and its graph, present only on a resolved value.
+    resolved: Option<(S, AnalyticalGraphKey)>,
 }
 
 impl<S> Clone for GraphWorkerServices<S>
@@ -1228,7 +1228,7 @@ where
         Some(Self {
             ingress: Arc::clone(&self.ingress),
             build: self.build,
-            resolved: Some((self.build)(worker)),
+            resolved: Some(((self.build)(worker), *graph)),
         })
     }
 }
@@ -1243,39 +1243,160 @@ where
 
 impl<S, B> tower::Service<Request<B>> for GraphWorkerServices<S>
 where
-    S: tower::Service<Request<B>> + Clone + Send + 'static,
-    S::Response: RefusalResponse,
+    S: tower::Service<Request<B>, Response = Response<TonicBody>> + Clone + Send + 'static,
     S::Future: Send,
     B: Send + 'static,
 {
-    type Response = S::Response;
+    type Response = Response<TonicBody>;
     type Error = S::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     /// An unresolved resolver is ready; a resolved one defers to its service.
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         match self.resolved.as_mut() {
-            Some(service) => service.poll_ready(cx),
+            Some((service, _)) => service.poll_ready(cx),
             None => Poll::Ready(Ok(())),
         }
     }
 
-    /// Serves the request on the graph's own worker.
+    /// Serves the request on the graph's own worker, as the graph tenant's
+    /// Bifrost CPU work: the call and every poll of its response body run on
+    /// the shared lanes, so the stage tasks they spawn inherit the lane
+    /// context, and no lane is held between polls.
     ///
     /// An unresolved value is refused rather than served: the auth layer only
     /// ever calls a value returned by [`StageUpstream::for_graph`], so reaching
     /// this branch would mean the layer was bypassed.
     fn call(&mut self, request: Request<B>) -> Self::Future {
-        let Some(service) = self.resolved.as_mut() else {
+        let Some((service, graph)) = self.resolved.as_mut() else {
             tracing::error!("Oracle analytical stage ingress called an unresolved graph worker");
-            return Box::pin(async { Ok(S::Response::refused()) });
+            return Box::pin(async { Ok(Response::<TonicBody>::refused()) });
+        };
+        let (lanes, operation) = match self.ingress.stage_work(*graph) {
+            Ok(work) => work,
+            Err(error) => {
+                tracing::warn!(%error, "Oracle analytical stage has no verified tenant to run as");
+                return Box::pin(async { Ok(Response::<TonicBody>::refused()) });
+            }
         };
         // Same Tower readiness contract as the layers around it: the future
         // owns the value that was polled ready, and an unreadied clone takes
         // its place.
         let unreadied = service.clone();
         let mut service = std::mem::replace(service, unreadied);
-        Box::pin(async move { service.call(request).await })
+        Box::pin(async move {
+            let response = lanes
+                .laned(
+                    operation.context(),
+                    async move { service.call(request).await },
+                )
+                .await?;
+            Ok(response.map(|body| TonicBody::new(LanedBody::new(lanes, operation, body))))
+        })
+    }
+}
+
+/// One stage response frame being produced, with the body that produces it.
+type NextFrame = Pin<
+    Box<
+        dyn Future<
+                Output = (
+                    TonicBody,
+                    Option<Result<Frame<Bytes>, wyrd_tonic::tonic::Status>>,
+                ),
+            > + Send,
+    >,
+>;
+
+/// A stage response body whose every frame poll runs on the process CPU
+/// lanes as one graph's work.
+///
+/// Upstream produces a stage's rows while its response body is polled, so
+/// this is where the stage's own execution, and the tasks it spawns, enter
+/// the lanes. A poll waiting on a peer or the caller returns its lane; the
+/// operation keeps the stage counted as demand until the body drops.
+struct LanedBody {
+    /// The lanes each frame poll runs on.
+    lanes: wyrd_runtime::resources::CpuLanes,
+    /// The graph's Bifrost work, live for the body's lifetime.
+    operation: wyrd_runtime::resources::Operation,
+    /// The idle body, or the frame poll that owns it while queued or running.
+    state: LanedFrame,
+}
+
+/// Where a [`LanedBody`]'s inner body is between polls.
+enum LanedFrame {
+    /// Not being polled.
+    Idle(TonicBody),
+    /// Owned by a frame poll that is waiting for a lane or for its frame.
+    Polling(NextFrame),
+}
+
+impl LanedBody {
+    /// Wraps `body` so each frame poll runs on `lanes` as `operation`'s work.
+    fn new(
+        lanes: wyrd_runtime::resources::CpuLanes,
+        operation: wyrd_runtime::resources::Operation,
+        body: TonicBody,
+    ) -> Self {
+        Self {
+            lanes,
+            operation,
+            state: LanedFrame::Idle(body),
+        }
+    }
+}
+
+impl Body for LanedBody {
+    /// The stage body's own data type.
+    type Data = Bytes;
+    /// The stage body's own status.
+    type Error = wyrd_tonic::tonic::Status;
+
+    /// Polls the next frame on a lane, resuming a poll already queued for one.
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = &mut *self;
+        let mut next = match std::mem::replace(
+            &mut this.state,
+            LanedFrame::Polling(Box::pin(std::future::pending())),
+        ) {
+            LanedFrame::Polling(next) => next,
+            LanedFrame::Idle(mut body) => {
+                Box::pin(this.lanes.laned(this.operation.context(), async move {
+                    let frame = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await;
+                    (body, frame)
+                }))
+            }
+        };
+        match next.as_mut().poll(cx) {
+            Poll::Ready((body, frame)) => {
+                this.state = LanedFrame::Idle(body);
+                Poll::Ready(frame)
+            }
+            Poll::Pending => {
+                this.state = LanedFrame::Polling(next);
+                Poll::Pending
+            }
+        }
+    }
+
+    /// Reports the idle body's end; a body mid-poll has not ended.
+    fn is_end_stream(&self) -> bool {
+        match &self.state {
+            LanedFrame::Idle(body) => body.is_end_stream(),
+            LanedFrame::Polling(_) => false,
+        }
+    }
+
+    /// Reports the idle body's hint; a body mid-poll reports none.
+    fn size_hint(&self) -> SizeHint {
+        match &self.state {
+            LanedFrame::Idle(body) => body.size_hint(),
+            LanedFrame::Polling(_) => SizeHint::default(),
+        }
     }
 }
 
@@ -2207,6 +2328,7 @@ mod tests {
             roles: [crate::resources::BifrostRole::Oracle]
                 .into_iter()
                 .collect(),
+            process_memory_limit_bytes: None,
             server_memory_min_bytes: None,
             bifrost_memory_limit_bytes: None,
             scratch_limit_bytes: None,
@@ -2335,6 +2457,7 @@ mod tests {
                     BifrostPeerTls::unreachable_for_test(),
                 )),
                 objects: crate::oracle::exec::tests::warehouse_objects(&std::env::temp_dir()),
+                workloads: fixture_oracle_role().workloads().clone(),
             });
             let identity = StageWireIdentity {
                 source_node_id: NodeId::new(Uuid::from_u128(1)),

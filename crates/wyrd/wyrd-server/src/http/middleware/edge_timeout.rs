@@ -27,19 +27,28 @@ const QUERY_PATH: &str = "/v1/query";
 /// deadline.
 const EXECUTE_PATH: &str = "/v1/verification/execute";
 
-/// Reports whether `request` is the public SQL query, `POST /v1/query`.
-///
-/// Its waiting belongs to Oracle rather than to the generic protected edge,
-/// and edge capacity treats it separately.
-pub(crate) fn is_public_query<B>(request: &Request<B>) -> bool {
-    request.method() == Method::POST && request.uri().path() == QUERY_PATH
+/// Path of the queued verification route, whose runner owns admission.
+const ENQUEUE_PATH: &str = "/v1/verification/enqueue";
+
+/// Reports whether `request` is `POST` to `path`.
+fn is_post_to<B>(request: &Request<B>, path: &str) -> bool {
+    request.method() == Method::POST && request.uri().path() == path
+}
+
+/// Reports whether `request` waits in its owner's admission rather than the
+/// generic protected edge: the public SQL query (Oracle's tenant-fair queue)
+/// or verification execute and enqueue (hosted admission over process
+/// memory). Edge capacity passes these straight through.
+pub(crate) fn owns_admission<B>(request: &Request<B>) -> bool {
+    is_post_to(request, QUERY_PATH)
+        || is_post_to(request, EXECUTE_PATH)
+        || is_post_to(request, ENQUEUE_PATH)
 }
 
 /// Reports whether `request`'s edge timer is staged: the public query or a
 /// direct verification execution.
 fn is_staged<B>(request: &Request<B>) -> bool {
-    is_public_query(request)
-        || (request.method() == Method::POST && request.uri().path() == EXECUTE_PATH)
+    is_post_to(request, QUERY_PATH) || is_post_to(request, EXECUTE_PATH)
 }
 
 /// Request extension that ends the generic edge timer for one staged request.

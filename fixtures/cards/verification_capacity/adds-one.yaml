@@ -1,0 +1,25 @@
+# A code check: sandboxed Python passes an answer of 2. No model.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: adds-one
+  version: 1.0.0
+spec:
+  description: The agent adds one to one.
+  inputs:
+    answer: {type: json}
+  requirements:
+    - id: answers-two
+      statement: The answer is 2
+      check:
+        kind: code
+        entrypoint: check
+        inputs: {answer: inputs.answer}
+        source:
+          inline: |
+            def check(answer):
+                return {
+                    "outcome": "passed" if answer == 2 else "failed",
+                    "reason": "the answer is " + str(answer),
+                    "citations": [{"slot": "answer", "locator": {"json_pointer": ""}}],
+                }

@@ -412,6 +412,74 @@ async fn oversized_body_returns_413_problem_json() {
     server.shutdown().await.expect("server shuts down");
 }
 
+/// A generic buffered body is charged to the process memory ledger before
+/// it is buffered: when process memory cannot hold it, a sized or streamed
+/// body is refused as retryable 503 problem+json with `Retry-After: 1` before
+/// any credential check, and once the memory frees the same request reaches
+/// the auth layer.
+///
+/// # Panics
+/// Panics when the server fails to start or a status, header, or code differs.
+#[tokio::test]
+async fn generic_body_beyond_process_memory_returns_503() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let memory = server
+        .state()
+        .bifrost
+        .transport_admission()
+        .process_memory()
+        .clone();
+    let request = |body: axum::body::Body| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/cards/upload/init")
+            .header("content-type", "application/json")
+            .header("x-wyrd-access-token", "Bearer invalid.token.here")
+            .body(body)
+            .expect("request builds")
+    };
+    let streamed = || {
+        axum::body::Body::from_stream(tokio_stream::iter(
+            (0..10).map(|_| Ok::<_, std::io::Error>("a".repeat(10))),
+        ))
+    };
+
+    let occupant = memory
+        .try_charge(memory.available() - 10)
+        .expect("the test occupies process memory");
+    for body in [axum::body::Body::from("a".repeat(100)), streamed()] {
+        let response = server
+            .oneshot(request(body))
+            .await
+            .expect("router responds");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        let problem = problem_json(response).await;
+        assert_eq!(problem["code"], "WYRD_SERVER_503_SERVICE_UNAVAILABLE");
+    }
+    drop(occupant);
+
+    let response = server
+        .oneshot(request(axum::body::Body::from("a".repeat(100))))
+        .await
+        .expect("router responds");
+    let problem = problem_json(response).await;
+    assert_eq!(
+        problem["code"], "WYRD_AUTH_400_BAD_TOKEN_FORMAT",
+        "the body passes the edge and the auth layer judges the credential"
+    );
+
+    server.shutdown().await.expect("server shuts down");
+}
+
 /// The default-deny layer wraps the `/v1` fallback, so an unknown `/v1` path
 /// with no token is rejected with 401 before `v1_not_found` runs — not 404.
 /// This is the "no route-existence oracle" guarantee: an unauthenticated caller
@@ -866,11 +934,24 @@ async fn published_snapshot(server: &WyrdTestServer) -> Arc<ReadinessSnapshot> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn forge_checks_follow_target_selection() {
     for (target, coordinator, worker) in [
-        (wyrd_server::config::BifrostTarget::All, true, true),
-        (wyrd_server::config::BifrostTarget::Server, true, false),
-        (wyrd_server::config::BifrostTarget::Oracle, false, false),
-        (wyrd_server::config::BifrostTarget::Scribe, false, false),
-        (wyrd_server::config::BifrostTarget::ForgeWorker, false, true),
+        (wyrd_server::config::ServerTarget::Combined, true, true),
+        (wyrd_server::config::ServerTarget::Direct, false, false),
+        (wyrd_server::config::ServerTarget::Worker, false, false),
+        (
+            wyrd_server::config::ServerTarget::BifrostQuery,
+            false,
+            false,
+        ),
+        (
+            wyrd_server::config::ServerTarget::BifrostIngest,
+            false,
+            false,
+        ),
+        (
+            wyrd_server::config::ServerTarget::BifrostMaintenance,
+            true,
+            true,
+        ),
     ] {
         let server = WyrdTestServer::builder()
             .with_bifrost_target_for_test(target)
@@ -2284,7 +2365,7 @@ async fn forge_runtime_composes_only_for_forge_targets() {
     server.shutdown().await.expect("server shuts down");
 
     let scribe = WyrdTestServer::builder()
-        .with_bifrost_target_for_test(wyrd_server::config::BifrostTarget::Scribe)
+        .with_bifrost_target_for_test(wyrd_server::config::ServerTarget::BifrostIngest)
         .start_in_process()
         .await
         .expect("a Scribe-only server starts");
@@ -2387,5 +2468,39 @@ async fn malformed_traceparent_starts_a_new_trace() {
             request.parent_span_id, "0000000000000000",
             "{parents:?}: {request:?}"
         );
+    }
+}
+
+/// Boot publishes the one resolved process resource plan every capacity owner
+/// sizes from, each resource a positive gauge.
+///
+/// # Panics
+/// Panics when the server does not start or a plan resource is missing or
+/// not positive.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boot_publishes_the_process_resource_plan() {
+    let metrics = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .install_recorder()
+        .expect("process-local Prometheus recorder");
+    let _server = WyrdTestServer::builder()
+        .start_in_process()
+        .await
+        .expect("the test server starts");
+    let rendered = metrics.render();
+    for resource in [
+        "effective_cpu",
+        "memory_limit_bytes",
+        "managed_memory_bytes",
+        "scratch_limit_bytes",
+    ] {
+        let series = format!("wyrd_process_resource_plan{{resource=\"{resource}\"}} ");
+        let value: f64 = rendered
+            .lines()
+            .find_map(|line| line.strip_prefix(&series))
+            .unwrap_or_else(|| panic!("{series}missing from {rendered}"))
+            .parse()
+            .expect("a numeric sample");
+        assert!(value > 0.0, "{series}{value}");
     }
 }

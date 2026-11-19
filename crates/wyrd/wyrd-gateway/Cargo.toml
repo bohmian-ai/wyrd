@@ -30,6 +30,7 @@ skald-providers = { workspace = true }
 skald-spec = { workspace = true }
 url = { workspace = true }
 wyrd-crypt = { workspace = true }
+wyrd-runtime = { workspace = true }
 wyrd-spec = { workspace = true }
 wyrd-tls = { workspace = true }
 wyrd-utils = { workspace = true }

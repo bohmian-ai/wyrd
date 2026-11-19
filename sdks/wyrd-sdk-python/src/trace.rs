@@ -8,9 +8,11 @@
 //! tracer, so it reaches the application's exporter with the caller's spans.
 
 use std::future::Future;
+use std::time::Instant;
 
 use pyo3::prelude::*;
 use pyo3::types::{IntoPyDict, PyDict};
+use wyrd_benchmark::Observation;
 use wyrd_client::transport::trace::{with_caller_trace, with_producer_span};
 use wyrd_spec::trace::TraceContext;
 
@@ -93,8 +95,36 @@ where
     F: Future + Send,
     F::Output: Send,
 {
+    block_on_timed(py, &mut Observation::default(), future)
+}
+
+/// [`block_on`], timing its three parts as `observation`'s components:
+/// `trace`, reading the caller's span with the GIL held; `run`, the future
+/// on the shared runtime with the GIL released; and `attach`, from the
+/// future's end until this thread holds the GIL again. Reads no clock when
+/// `observation` is inactive.
+pub(crate) fn block_on_timed<F>(
+    py: Python<'_>,
+    observation: &mut Observation,
+    future: F,
+) -> F::Output
+where
+    F: Future + Send,
+    F::Output: Send,
+{
+    let started = observation.now();
     let caller = active_trace_context(py);
-    py.detach(|| wyrd_runtime::runtime().block_on(with_caller_trace(caller, future)))
+    observation.since("trace", started);
+    let detached = observation.now();
+    let (output, ran) = py.detach(|| {
+        let output = wyrd_runtime::runtime().block_on(with_caller_trace(caller, future));
+        (output, detached.map(|detached| (detached, Instant::now())))
+    });
+    if let Some((detached, ended)) = ran {
+        observation.component("run", ended.duration_since(detached));
+        observation.since("attach", Some(ended));
+    }
+    output
 }
 
 /// Run the synchronous client call `call` so each queued write it makes

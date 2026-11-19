@@ -1,0 +1,20 @@
+# Answers in one model call without tools.
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: answerer
+  version: 1.0.0
+spec:
+  execution_route: {kind: wyrd_gateway, deployment: openai}
+  run_config: {max_iterations: 1}
+  prompt:
+    provider: openai
+    model: gpt-4o
+    messages:
+      - role: user
+        content: "ANSWER: {{question}}"
+    response_format:
+      type: object
+      properties: {done: {type: boolean}}
+      required: [done]
+      additionalProperties: false

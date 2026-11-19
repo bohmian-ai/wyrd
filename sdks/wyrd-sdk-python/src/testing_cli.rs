@@ -123,6 +123,9 @@ pub struct PyCheckReport {
     /// Non-fatal loader diagnostics.
     #[pyo3(get)]
     diagnostics: Vec<Py<PyCheckDiagnostic>>,
+    /// Checks only the server can make, which this local check skipped.
+    #[pyo3(get)]
+    deferred: Vec<&'static str>,
 }
 
 impl PyCheckReport {
@@ -144,6 +147,7 @@ impl PyCheckReport {
                 .into_iter()
                 .map(|inner| Py::new(py, PyCheckDiagnostic { inner }))
                 .collect::<PyResult<_>>()?,
+            deferred: report.deferred,
         })
     }
 }

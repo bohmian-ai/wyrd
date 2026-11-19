@@ -67,6 +67,8 @@ impl Mcp {
 pub(crate) mod bifrost;
 pub(crate) mod cards;
 mod gateway;
+/// Tenant GitHub connection over MCP.
+mod github;
 mod guide;
 mod operators;
 mod principals;
@@ -169,8 +171,8 @@ impl WyrdMcpHandler {
     ///
     /// Ordinary startup — production and an ordinary `WyrdTestServer` alike —
     /// advertises the three read-only Bifrost tools, the read-only principal
-    /// credential listing, the Card, Verification, and Operator connection read
-    /// tools, and the gateway tools, whose replacement and delete
+    /// credential listing, the Card, Verification, Operator connection and
+    /// GitHub connection read tools, and the gateway tools, whose replacement and delete
     /// operations require explicit gateway write or delete scopes at dispatch.
     /// Principal write tools are per caller and the test-support probe is
     /// opt-in, so neither belongs here.
@@ -180,6 +182,7 @@ impl WyrdMcpHandler {
         catalog.extend(cards::descriptors());
         catalog.extend(verification::descriptors_unscoped());
         catalog.extend(operators::descriptors_unscoped());
+        catalog.extend(github::descriptors_unscoped());
         catalog.extend(gateway::descriptors_unscoped());
         catalog.push(guide::descriptor());
         catalog
@@ -227,7 +230,9 @@ impl ServerHandler for WyrdMcpHandler {
             .chain(principals::write_descriptors())
             .chain(principals::admin_descriptors())
             .chain(verification::write_descriptors())
+            .chain(verification::approve_descriptors())
             .chain(operators::write_descriptors())
+            .chain(github::write_descriptors())
             .chain(gateway::descriptors())
             .chain(self.probe_descriptors())
             .find(|tool| tool.name == name)
@@ -258,8 +263,14 @@ impl ServerHandler for WyrdMcpHandler {
             if verification::may_run_verifiers(&caller) {
                 catalog.extend(verification::write_descriptors());
             }
+            if verification::may_approve(&caller) {
+                catalog.extend(verification::approve_descriptors());
+            }
             if operators::may_manage(&caller) {
                 catalog.extend(operators::write_descriptors());
+            }
+            if github::may_manage(&caller) {
+                catalog.extend(github::write_descriptors());
             }
             catalog.extend(gateway::write_descriptors(&caller));
         }
@@ -434,7 +445,21 @@ impl WyrdMcpHandler {
                     .await
                     .map_err(wyrd_error_to_mcp)
             }
-            name @ (verification::EVIDENCE | verification::EXECUTE | verification::ENQUEUE) => {
+            name @ (verification::LIST_INVOCATIONS
+            | verification::LIST_PUBLICATIONS
+            | verification::GET_PUBLICATION
+            | verification::DOWNLOAD_PUBLICATION) => {
+                let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
+                self.mcp_verification_inspect(name, caller, request.arguments)
+                    .await
+                    .map_err(wyrd_error_to_mcp)
+            }
+            name @ (verification::EVIDENCE
+            | verification::PUBLISH_EVIDENCE
+            | verification::EXECUTE
+            | verification::ENQUEUE
+            | verification::CANCEL
+            | verification::DECIDE_APPROVAL) => {
                 let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
                 // Authorized and audited by the operation, like revocation.
                 self.mcp_verification_write(name, caller, request.arguments)
@@ -453,6 +478,13 @@ impl WyrdMcpHandler {
                 let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
                 // Authorized and audited by the operation, like revocation.
                 self.mcp_operator_connections(name, caller, request.arguments)
+                    .await
+                    .map_err(wyrd_error_to_mcp)
+            }
+            name @ (github::GET | github::CONNECT | github::DISCONNECT) => {
+                let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
+                // Authorized and audited by the operation.
+                self.mcp_github(name, caller, request.arguments)
                     .await
                     .map_err(wyrd_error_to_mcp)
             }
@@ -536,7 +568,7 @@ pub(crate) fn wyrd_error_to_mcp(error: WyrdError) -> ErrorData {
 
 #[cfg(test)]
 mod tests {
-    use super::{WyrdMcpHandler, gateway, operators, principals, verification};
+    use super::{WyrdMcpHandler, gateway, github, operators, principals, verification};
 
     /// Top-level input keywords OpenAI function tools refuse, rejecting the
     /// whole tool list when any advertised tool carries one.
@@ -557,7 +589,9 @@ mod tests {
             .chain(principals::write_descriptors())
             .chain(principals::admin_descriptors())
             .chain(verification::write_descriptors())
+            .chain(verification::approve_descriptors())
             .chain(operators::write_descriptors())
+            .chain(github::write_descriptors())
             .chain(gateway::descriptors())
             .collect();
         assert!(catalog.iter().any(|tool| tool.name == operators::CREATE));

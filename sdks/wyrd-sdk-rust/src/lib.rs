@@ -3,7 +3,8 @@
 //! A thin projection of `wyrd-client`, the sole shared client implementation:
 //! client configuration, [`cards::Cards`], [`auth::Principals`],
 //! [`platform::Platform`], [`state::WyrdState`],
-//! [`operator_connections::OperatorConnections`], and [`Bifrost`], plus the
+//! [`operator_connections::OperatorConnections`], [`github::GithubConnection`],
+//! and [`Bifrost`], plus the
 //! [`WyrdError`] every capability returns. This
 //! package adds no transport, validation, registry, storage, or lifecycle
 //! behavior of its own, and never enables an owner crate's `python` feature.
@@ -126,9 +127,9 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 
 pub use wyrd_client::{
-    Bifrost, Gateway, GlobalConfig, OperatorConnections, Platform, Principals, QueueConfig,
-    WyrdClient, bifrost, cards, client, config, environment, error, gateway_admin, global_config,
-    observe, operator_connections, platform, state, verify,
+    Bifrost, Gateway, GithubConnection, GlobalConfig, OperatorConnections, Platform, Principals,
+    QueueConfig, WyrdClient, bifrost, cards, client, config, environment, error, gateway_admin,
+    github, global_config, observe, operator_connections, platform, state, verify,
 };
 
 /// Tenant principal administration: the [`auth::Principals`] handle and its
@@ -186,8 +187,8 @@ pub use wyrd_spec::ExecutionRoute;
 pub use wyrd_spec::verification::VerificationVerdict;
 pub use wyrd_spec::verification::execution::{
     CallProvenance, Citation, Locator, OutcomeDetails, RequirementDetail, RequirementDetails,
-    RequirementOutcome, RequirementResult, StepResult, StepStatus, VerificationDetails,
-    VerificationOutcome, VerificationResult,
+    RequirementOutcome, RequirementResult, StepResult, StepStatus, ToolCallRecord, ToolRecipient,
+    VerificationDetails, VerificationOutcome, VerificationResult,
 };
 
 /// The identity of one queued Verifier execution, as `submit` returns it and
@@ -237,6 +238,8 @@ mod tests {
         let _ = super::auth::Principals::connect_with;
         let _ = super::operator_connections::OperatorConnections::connect;
         let _ = super::operator_connections::OperatorConnections::connect_with;
+        let _ = super::github::GithubConnection::connect;
+        let _ = super::github::GithubConnection::connect_with;
         let _ = super::platform::Platform::connect;
         let _ = super::platform::Platform::connect_with;
         let _ = super::Gateway::connect;
@@ -256,6 +259,8 @@ mod tests {
         let _ = super::WyrdClient::with_config;
         let _ = super::verify::Execution::connect;
         let _ = super::verify::Execution::connect_with;
+        let _ = super::verify::Evidence::connect;
+        let _ = super::verify::Evidence::connect_with;
         let _ =
             |bytes: Vec<u8>| super::verify::File::bytes(bytes).with_format(super::MediaFormat::Pdf);
         let _ = super::WyrdError::code;

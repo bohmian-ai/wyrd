@@ -31,7 +31,7 @@ Tables are Apache Iceberg tables of Parquet files in the deployment's object sto
 
 ## Where each part runs
 
-Every pod runs the same `wyrd-server` binary, and `WYRD_TARGET` picks which parts it runs. The default, `all`, runs every part, so a single pod is a complete deployment. A larger team splits writes, queries, and compaction so each scales on its own load.
+Every pod runs the same `wyrd-server` binary, and `WYRD_TARGET` picks which parts it runs. The default, `combined`, runs every part, so a single pod is a complete deployment. A larger team splits writes, queries, and compaction so each scales on its own load.
 
 <WyrdDiagram name="bifrost-pods" />
 

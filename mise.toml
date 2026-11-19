@@ -104,6 +104,8 @@ cargo test --locked -p wyrd-sql --test integration -- pg_cards_declare:: --nocap
 cargo nextest run --locked -p wyrd-server --test integration --test-threads=1 -E 'test(/^pg_card_declaration_route::/)'
 cargo nextest run --locked -p wyrd-server --test integration --test-threads=1 -E 'test(/^pg_verification_routes::/)'
 cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(/^declare_and_pull::/)'
+cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(/^repository_declaration::/)'
+cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(/^deferred_evidence::/)'
 """
 
 [tasks."test:principals:unit"]
@@ -189,7 +191,9 @@ description = "Run the real-server CLI and Rust SDK typed WyrdState journeys wit
 run = [
   "cargo nextest run --locked -p wyrd-cli --test cli -E 'test(=card_lifecycle::pg_tests::cli_bundle_loads_typed_wyrdstate_after_server_shutdown)'",
   "cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(=declare_and_pull::service_graph_declares_and_pulls)'",
-  "cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(/^(gateway_admin|operator_connections)::/)'",
+  "cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(/^(gateway_admin|operator_connections|github_connection::pg_tests)::/)'",
+  "cargo nextest run --locked -p wyrd-server --test integration -E 'test(/^pg_github_connection::/)'",
+  "cargo nextest run --locked -p wyrd-cli --test cli -E 'test(/^github_journey::pg_tests::/)'",
 ]
 
 [tasks."test:gateway:native"]
@@ -542,13 +546,22 @@ run = [
   "cargo build --locked --release -p wyrd-testing --bin capacity --target-dir target/profiling",
 ]
 
+[tasks."bench:build:sdks"]
+hide = true
+description = "Builds the local diagnostic SDK modules the bench:l1:verification Python and TypeScript drivers load through their public packages: the release-profile Python extension with the `bench` feature and without the wyrd.testing harness, into the Python SDK's environment, and the release-profile wyrd-ai napi addon with the `bench` feature, over the package's compiled JavaScript. `bench` adds the shared benchmark recorder, the `sdk.verify` boundary timings, and the native heap sampler; these are never published artifacts. Its type declarations go to target/benchmark-sdk/ and bypass napi's shared type-definition cache, so neither this build nor a later cached ts:build writes the bench exports into the committed index.d.ts. It replaces the development extension and addon, so run py:setup and ts:build again before SDK tests or packaging, after any benchmark."
+run = [
+  "cd sdks/wyrd-sdk-python && uv sync --all-extras --group dev && uv run maturin develop --release --features bench",
+  "mise run ts:build",
+  "mkdir -p target/benchmark-sdk && cd sdks/wyrd-sdk-ts/wyrd && pnpm exec napi build --platform --profile release --features bench --manifest-path ../native/Cargo.toml --output-dir . --package-json-path package.json --no-js --no-dts-cache --dts ../../../target/benchmark-sdk/index.d.ts",
+]
+
 [tasks."bench:results"]
 description = "Writes every recorded benchmark run under benchmarks/history/ (the benchmark-records worktree) into one self-contained HTML page at target/benchmarks/results.html: each experiment's question, method, results and verdict, and its runs in chronological order with a history chart per metric and step and a side-by-side comparison of chosen runs. Reads only the records; runs no benchmark."
 run = "cargo run --locked --quiet -p wyrd-testing --bin capacity -- results"
 
 [tasks."bench:smoke"]
-description = "Smoke of every default benchmark plan: `capacity l1 --smoke` (Bifrost writes-parquet, hot and parquet, Verification, Gateway) and `capacity l2 <engine> --smoke` for Bifrost, Verification and Gateway, each under its own fresh Postgres. A smoke runs the normal command's whole workflow (fixture loading and publication waits, every declared step, capacity/overload/recovery, measured stop, drain, exact reconciliation, judgment, record, timing evidence and report) at smoke-scale fixtures with one 1 s warmup and one 3 s repetition per L1 step (3 s and 36 s at L2), within a 10 min (L1) or 15 min (L2) budget. A smoke judges no criterion: readings, errors and target misses are recorded beside inapplicable criteria, so it is VALID, or INVALID when the measurement itself is broken; a busy driver does not invalidate it. Records `mode: smoke` under target/benchmarks/smoke/, never benchmarks/history/, and is never a calibration. Full bench:l1 and bench:l2 commands never run it first; pass --smoke to one of them to smoke just that plan. Exits 0 only when every smoke exits 0, else 2. Opt-in; part of no gate, CI or verify lane."
-depends = ["bench:build"]
+description = "Smoke of every default benchmark plan: `capacity l1 --smoke` (Bifrost writes-parquet, hot, parquet and ui-sql, Verification, Gateway) and `capacity l2 <engine> --smoke` for Bifrost, Verification and Gateway, each under its own fresh Postgres. A smoke runs the normal command's whole workflow (fixture loading and publication waits, every declared step, capacity/overload/recovery, measured stop, drain, exact reconciliation, judgment, record, timing evidence and report) at smoke-scale fixtures with one 1 s warmup and one 3 s repetition per L1 step (3 s and 36 s at L2), within a 10 min (L1) or 15 min (L2) budget. A smoke judges no criterion: readings, errors and target misses are recorded beside inapplicable criteria, so it is VALID, or INVALID when the measurement itself is broken; a busy driver does not invalidate it. Records `mode: smoke` under target/benchmarks/smoke/, never benchmarks/history/, and is never a calibration. Full bench:l1 and bench:l2 commands never run it first; pass --smoke to one of them to smoke just that plan. Exits 0 only when every smoke exits 0, else 2. Opt-in; part of no gate, CI or verify lane."
+depends = ["bench:build", "bench:build:sdks"]
 run = """
 worst=0
 target/profiling/release/capacity l1 --smoke || worst=2
@@ -559,12 +572,12 @@ exit "$worst"
 """
 
 [tasks."bench:l1"]
-description = "Level 1, every engine in order (Bifrost, Verification, Gateway), each under its own fresh Postgres and with its own record; forwards --profile, --allow-dirty and --smoke, keeps going after an invalid engine, and exits 0 only when every engine exits 0, else 2; at most 28 min. Opt-in benchmark experiment; part of no gate, CI or verify lane. Builds the release wyrd-server and capacity driver with frame pointers into target/profiling before the experiment clock starts, `--smoke` runs the same plan at smoke scale instead (see bench:smoke), then runs under a fresh repository Postgres on the whole host (macOS arm64, Linux x86_64, Linux arm64) with a file:// store. Exits 0 (VALID) or 2 (INVALID: a busy host, dirty source unless --allow-dirty, overrun, unresolved evidence, or a correctness or integrity criterion failing in any repetition); performance targets are reported as met, missed or unsettled and never change the exit. Appends one schema-3 record under benchmarks/history/<engine>/<experiment>/ (the benchmark-records worktree; a --steps, --profile or --allow-dirty run under target/benchmarks/ instead) and prints its report; raw artifacts stay under target/benchmarks/. `--profile` adds optional samply CPU captures and per-step server heap profiles, `--steps a,b` runs a declared subset that records its omissions. See benchmarks/README.md."
+description = "Level 1, every engine in order (Bifrost, Verification, Gateway), each under its own fresh Postgres and with its own record; forwards --profile, --allow-dirty and --smoke, keeps going after an invalid engine, and exits 0 only when every engine exits 0, else 2; at most 33 min. Opt-in benchmark experiment; part of no gate, CI or verify lane. Builds the release wyrd-server and capacity driver with frame pointers into target/profiling before the experiment clock starts, `--smoke` runs the same plan at smoke scale instead (see bench:smoke), then runs under a fresh repository Postgres on the whole host (macOS arm64, Linux x86_64, Linux arm64) with a file:// store. Exits 0 (VALID) or 2 (INVALID: a busy host, dirty source unless --allow-dirty, overrun, unresolved evidence, or a correctness or integrity criterion failing in any repetition); performance targets are reported as met, missed or unsettled and never change the exit. Appends one schema-3 record under benchmarks/history/<engine>/<experiment>/ (the benchmark-records worktree; a --steps, --profile or --allow-dirty run under target/benchmarks/ instead) and prints its report; raw artifacts stay under target/benchmarks/. `--profile` adds optional samply CPU captures and per-step server heap profiles, `--steps a,b` runs a declared subset that records its omissions. See benchmarks/README.md."
 depends = ["bench:build"]
 run = "target/profiling/release/capacity l1"
 
 [tasks."bench:l1:bifrost"]
-description = "Level 1 Bifrost: the writes-parquet, hot and parquet experiments in order (25 measured cases), each with its own fresh Postgres and record; forwards --profile, --allow-dirty and --smoke, keeps going after an invalid experiment, and exits 0 only when every experiment exits 0, else 2; at most 18 min (1,080 s). A complete Bifrost L1 suite is all three records at full default coverage. Opt-in benchmark experiment; part of no gate, CI or verify lane. See bench:l1:bifrost:writes, :hot and :parquet and benchmarks/README.md."
+description = "Level 1 Bifrost: the writes-parquet, hot, parquet and ui-sql experiments in order (31 measured cases), each with its own fresh Postgres and record; forwards --profile, --allow-dirty and --smoke, keeps going after an invalid experiment, and exits 0 only when every experiment exits 0, else 2; at most 23 min (1,380 s). A complete Bifrost L1 suite is all four records at full default coverage. Opt-in benchmark experiment; part of no gate, CI or verify lane. See bench:l1:bifrost:writes, :hot, :parquet and :ui and benchmarks/README.md."
 depends = ["bench:build"]
 run = "target/profiling/release/capacity l1 bifrost"
 
@@ -583,9 +596,24 @@ description = "Level 1 Bifrost `parquet` (5 s warmup, 3 x 5 s per step and 3 x 1
 depends = ["bench:build"]
 run = "scripts/postgres/with-test-postgres.sh -- target/profiling/release/capacity l1 bifrost parquet"
 
-[tasks."bench:l1:verification"]
-description = "Level 1 Verification `direct-verify` (5 s warmup, 3 x 5 s per step, 5 min budget): direct observe().verify at 1 and 64 closed-loop clients, server overhead p99 < 500 us at 64 clients, server overhead components and verifications per server CPU-second, with correct verdicts, no refusal and no lost Scribe outbox write in every repetition. Opt-in benchmark experiment; part of no gate, CI or verify lane. Builds the release wyrd-server and capacity driver with frame pointers into target/profiling before the experiment clock starts, `--smoke` runs the same plan at smoke scale instead (see bench:smoke), then runs under a fresh repository Postgres on the whole host (macOS arm64, Linux x86_64, Linux arm64) with a file:// store. Exits 0 (VALID) or 2 (INVALID: a busy host, dirty source unless --allow-dirty, overrun, unresolved evidence, or a correctness or integrity criterion failing in any repetition); performance targets are reported as met, missed or unsettled and never change the exit. Appends one schema-3 record under benchmarks/history/<engine>/<experiment>/ (the benchmark-records worktree; a --steps, --profile or --allow-dirty run under target/benchmarks/ instead) and prints its report; raw artifacts stay under target/benchmarks/. `--profile` adds optional samply CPU captures and per-step server heap profiles, `--steps a,b` runs a declared subset that records its omissions. See benchmarks/README.md."
+[tasks."bench:l1:bifrost:ui"]
+description = "Level 1 Bifrost `ui-sql` (5 s warmup, 3 x 5 s per step, 6 steps, 5 min budget): the frozen original UI SQL catalog (benchmarks/fixtures/bifrost/ui-sql/queries.json, its SHA-256 a declared control) over a deterministic 500-request journey of OTLP spans, logs and metrics in 2026-11-18T12:00-13:00Z under the hot Scribe settings, so rows move only by the bench build's stage/publish control. Before any window every statement's binds are resolved from the loaded rows and its typed answer recorded; each residence (memtable, staged, published) is placed outside every window and every catalog statement, standalone ones included, must answer there exactly as in memtables. One step per residence at 1 and 8 closed-loop clients, each cycling the traces, verification, logs and metrics pages in a fixed order from its own offset with each page's dependencies and concurrency, every answer checked against its typed reference, with pooled server and client latency, each page's and page statement's client latency and sample count (a percentile under its sample floor is inconclusive), pages per second, CPU, memory, scan facts and the first request after each placement. Opt-in benchmark experiment; part of no gate, CI or verify lane. Builds the release wyrd-server and capacity driver with frame pointers into target/profiling before the experiment clock starts, `--smoke` runs the same plan at smoke scale instead (see bench:smoke), then runs under a fresh repository Postgres on the whole host (macOS arm64, Linux x86_64, Linux arm64) with a file:// store. Exits 0 (VALID) or 2 (INVALID: a busy host, dirty source unless --allow-dirty, overrun, unresolved evidence, or a correctness or integrity criterion failing in any repetition); performance targets are reported as met, missed or unsettled and never change the exit. Appends one schema-3 record under benchmarks/history/<engine>/<experiment>/ (the benchmark-records worktree; a --steps, --profile or --allow-dirty run under target/benchmarks/ instead) and prints its report; raw artifacts stay under target/benchmarks/. `--profile` adds optional samply CPU captures and per-step server heap profiles, `--steps a,b` runs a declared subset that records its omissions. See benchmarks/README.md."
 depends = ["bench:build"]
+run = "scripts/postgres/with-test-postgres.sh -- target/profiling/release/capacity l1 bifrost ui-sql"
+
+[tasks."bench:l1:bifrost:ui:10x"]
+description = "Level 1 Bifrost `ui-sql-10x` (5 s warmup, 3 x 5 s per step, 6 steps, 5 min budget): bench:l1:bifrost:ui unchanged over a 5,000-request journey, ten times the default, with the same seeded gateway calls and verifications, so the record compares the original UI pages at default and 10x volume in each residence. Opt-in extended benchmark experiment, outside bench:l1:bifrost and bench:l1; part of no gate, CI or verify lane. Builds the release wyrd-server and capacity driver with frame pointers into target/profiling before the experiment clock starts, `--smoke` runs the same plan at smoke scale instead, then runs under a fresh repository Postgres on the whole host (macOS arm64, Linux x86_64, Linux arm64) with a file:// store. Exits 0 (VALID) or 2 (INVALID: a busy host, dirty source unless --allow-dirty, overrun, unresolved evidence, or a correctness or integrity criterion failing in any repetition); performance targets are reported as met, missed or unsettled and never change the exit. Appends one schema-3 record under benchmarks/history/<engine>/<experiment>/ (the benchmark-records worktree; a --steps, --profile or --allow-dirty run under target/benchmarks/ instead) and prints its report; raw artifacts stay under target/benchmarks/. `--profile` adds optional samply CPU captures and per-step server heap profiles, `--steps a,b` runs a declared subset that records its omissions. See benchmarks/README.md."
+depends = ["bench:build"]
+run = "scripts/postgres/with-test-postgres.sh -- target/profiling/release/capacity l1 bifrost ui-sql-10x"
+
+[tasks."bench:l1:bifrost:ui:learned"]
+description = "Level 1 Bifrost `ui-sql-learned` (5 s warmup, 3 x 5 s per step, 6 steps, 5 min budget): bench:l1:bifrost:ui unchanged after a 10,000-span sample of the hot span generator, dated 2026-01-01 with its own trace ids, is published so the server learns a bifrost.traces Variant layout before the default journey loads (INVALID if none is learned), so the record compares the original UI pages in the learned and canonical layouts in each residence. Opt-in extended benchmark experiment, outside bench:l1:bifrost and bench:l1; part of no gate, CI or verify lane. Builds the release wyrd-server and capacity driver with frame pointers into target/profiling before the experiment clock starts, `--smoke` runs the same plan at smoke scale instead, then runs under a fresh repository Postgres on the whole host (macOS arm64, Linux x86_64, Linux arm64) with a file:// store. Exits 0 (VALID) or 2 (INVALID: a busy host, dirty source unless --allow-dirty, overrun, unresolved evidence, or a correctness or integrity criterion failing in any repetition); performance targets are reported as met, missed or unsettled and never change the exit. Appends one schema-3 record under benchmarks/history/<engine>/<experiment>/ (the benchmark-records worktree; a --steps, --profile or --allow-dirty run under target/benchmarks/ instead) and prints its report; raw artifacts stay under target/benchmarks/. `--profile` adds optional samply CPU captures and per-step server heap profiles, `--steps a,b` runs a declared subset that records its omissions. See benchmarks/README.md."
+depends = ["bench:build"]
+run = "scripts/postgres/with-test-postgres.sh -- target/profiling/release/capacity l1 bifrost ui-sql-learned"
+
+[tasks."bench:l1:verification"]
+description = "Level 1 Verification `direct-verify` (5 s warmup, 3 x 5 s per step, 5 min budget): direct observe().verify of the canonical Verifier (one Assert, two code-running Agent checks) through the Rust, Python and TypeScript SDKs at 1 and 64 closed-loop clients and at 64 clients paced to 3,000 verifications/s (the matched-load comparison across SDKs, INVALID on a missed or late arrival), server overhead p99 < 500 us at 64 closed-loop clients, the server concurrency each step carried, server overhead components and verifications per server CPU-second; `server` is server-induced latency and `client` is end-to-end client-server-client latency holding all elapsed work, reported as call-return and result-ready totals with no target, with correct verdicts, no refusal and no lost Scribe outbox write in every repetition. Opt-in benchmark experiment; part of no gate, CI or verify lane. Builds the release wyrd-server and capacity driver with frame pointers into target/profiling before the experiment clock starts, `--smoke` runs the same plan at smoke scale instead (see bench:smoke), then runs under a fresh repository Postgres on the whole host (macOS arm64, Linux x86_64, Linux arm64) with a file:// store. Exits 0 (VALID) or 2 (INVALID: a busy host, dirty source unless --allow-dirty, overrun, unresolved evidence, or a correctness or integrity criterion failing in any repetition); performance targets are reported as met, missed or unsettled and never change the exit. Appends one schema-3 record under benchmarks/history/<engine>/<experiment>/ (the benchmark-records worktree; a --steps, --profile or --allow-dirty run under target/benchmarks/ instead) and prints its report; raw artifacts stay under target/benchmarks/. `--profile` adds optional samply CPU captures and per-step server heap profiles, `--steps a,b` runs a declared subset that records its omissions. See benchmarks/README.md."
+depends = ["bench:build", "bench:build:sdks"]
 run = "scripts/postgres/with-test-postgres.sh -- target/profiling/release/capacity l1 verification"
 
 [tasks."bench:l1:gateway"]
@@ -642,7 +670,7 @@ hide = true
 description = "Run Python Bifrost journeys against an already-provisioned Postgres lifecycle."
 dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup"]
-run = "uv run python -m pytest -q -m 'integration and not local_dev' tests/integration/bifrost tests/integration/test_query_bifrost.py tests/integration/test_otel_export.py tests/integration/otel/test_otel_signals.py tests/integration/test_observe_a_run.py tests/integration/observe/test_observation_surface.py tests/integration/test_verify_in_real_time.py tests/integration/test_verifier_building_blocks.py tests/integration/test_local_development.py tests/integration/test_support_desk.py tests/integration/test_scheduled_drift_alerts_operator.py tests/integration/test_operator_connections.py tests/integration/otel/frameworks tests/integration/test_asgi_integration.py"
+run = "uv run python -m pytest -q -m 'integration and not local_dev' tests/integration/bifrost tests/integration/test_query_bifrost.py tests/integration/test_otel_export.py tests/integration/otel/test_otel_signals.py tests/integration/test_observe_a_run.py tests/integration/observe/test_observation_surface.py tests/integration/test_verify_in_real_time.py tests/integration/test_verifier_building_blocks.py tests/integration/test_local_development.py tests/integration/test_support_desk.py tests/integration/test_scheduled_drift_alerts_operator.py tests/integration/test_operator_connections.py tests/integration/test_github_connection.py tests/integration/otel/frameworks tests/integration/test_asgi_integration.py"
 
 [tasks."test:bifrost:journey:typescript"]
 description = "Tier-1 journeys: TypeScript Bifrost client, query and write surfaces"
@@ -653,7 +681,7 @@ hide = true
 description = "Run the TypeScript Bifrost journey against an already-provisioned Postgres lifecycle."
 dir = "sdks/wyrd-sdk-ts/wyrd"
 depends = ["ts:build", "ts:build:testing"]
-run = "pnpm exec vitest run tests/integration/query-bifrost.test.ts tests/integration/query-results.test.ts tests/integration/variant-tables.test.ts tests/integration/every-iceberg-column-type.test.ts tests/integration/register-a-table-from-a-model.test.ts tests/integration/three-timestamp-types.test.ts tests/integration/table-time-column.test.ts tests/integration/bifrost-write.test.ts tests/integration/otel-export.test.ts tests/integration/otel-signals.test.ts tests/integration/agents-trace-processor.test.ts tests/integration/observe-a-run.test.ts tests/integration/observation-surface.test.ts tests/integration/verify-in-real-time.test.ts tests/integration/verifier-building-blocks.test.ts tests/integration/action-timeline.test.ts tests/integration/local-development.test.ts tests/integration/support-desk.test.ts tests/integration/scheduled-drift-alerts-operator.test.ts tests/integration/operator-connections.test.ts tests/integration/operator-connection-refusals.test.ts"
+run = "pnpm exec vitest run tests/integration/query-bifrost.test.ts tests/integration/query-results.test.ts tests/integration/variant-tables.test.ts tests/integration/every-iceberg-column-type.test.ts tests/integration/register-a-table-from-a-model.test.ts tests/integration/three-timestamp-types.test.ts tests/integration/table-time-column.test.ts tests/integration/bifrost-write.test.ts tests/integration/otel-export.test.ts tests/integration/otel-signals.test.ts tests/integration/agents-trace-processor.test.ts tests/integration/observe-a-run.test.ts tests/integration/observation-surface.test.ts tests/integration/verify-in-real-time.test.ts tests/integration/verifier-building-blocks.test.ts tests/integration/action-timeline.test.ts tests/integration/local-development.test.ts tests/integration/support-desk.test.ts tests/integration/scheduled-drift-alerts-operator.test.ts tests/integration/operator-connections.test.ts tests/integration/operator-connection-refusals.test.ts tests/integration/github-connection.test.ts tests/integration/github-connection-not-configured.test.ts"
 
 [tasks."verify:bifrost"]
 description = "Complete Bifrost change gate: fmt, Clippy, dependency and tenant-isolation checks, plus every Bifrost test tier and language surface."
@@ -903,7 +931,7 @@ hide = true
 description = "Run the StorageHandle CRUD + server multipart e2e against real GCS (merge-to-main only; requires GCP credentials and WYRD_STORAGE_URL in env)"
 env = { WYRD_STORAGE_PART_SIZE_BYTES = "16777216", WYRD_STORAGE_MULTIPART_THRESHOLD_BYTES = "8388608" }
 run = """
-cargo nextest run -p wyrd-storage --features emulator --test integration -E 'test(=handle_crud::gcs_handle_crud) | test(/^integration_gcs::gcs_multipart_/)'
+cargo nextest run -p wyrd-storage --features emulator --test integration -E 'test(=handle_crud::gcs_handle_crud) | test(=handle_crud::gcs_create_only) | test(/^integration_gcs::gcs_multipart_/)'
 cargo nextest run -p wyrd-server --features storage-emulator --test integration --test-threads=1 -E 'test(=storage_e2e::gcs_multipart_e2e) | test(=storage_e2e::gcs_single_put_e2e)'
 """
 
@@ -1087,7 +1115,7 @@ run = "uv run python -m pytest -q -m integration tests/integration/state/test_st
 
 [tasks."check:py-wheel-no-testing"]
 hide = true
-description = "Assert the production wyrd-sdk-python wheel does not expose wyrd.testing"
+description = "Assert the production wyrd-sdk-python wheel exposes neither wyrd.testing nor benchmark machinery"
 dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup"]
 # py:setup installs the testing-enabled development build, so the check builds
@@ -1104,6 +1132,22 @@ if uv run --isolated --no-project --with "$wheel" python -c 'import wyrd.testing
   echo 'FAIL: wyrd.testing leaked into the default wyrd-sdk-python wheel'
   exit 1
 fi
+# A bench build has the _benchmark submodule and the benchmark registry,
+# whose histogram setup message no other code carries.
+if uv run --isolated --no-project --with "$wheel" python -c 'import wyrd._wyrd._benchmark' 2>/dev/null; then
+  echo 'FAIL: the benchmark recorder leaked into the default wyrd-sdk-python wheel'
+  exit 1
+fi
+python3 - "$wheel" <<'PY'
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as wheel:
+    native = [name for name in wheel.namelist() if name.endswith((".so", ".pyd", ".dylib"))]
+    if not native:
+        sys.exit("FAIL: the wheel holds no native module")
+    for name in native:
+        if b"constant duration histogram bounds are valid" in wheel.read(name):
+            sys.exit(f"FAIL: {name} holds the benchmark registry")
+PY
 """
 
 [tasks."examples:python:datacard"]

@@ -26,8 +26,8 @@ use crate::query::telemetry::{self, Telemetry};
 use crate::query::workload::{Case, Fixture, Rows, TABLE};
 use crate::query::{
     Experiment, Half, Lane, OTLP_DECODE_PHASE, PAIR, PHASE_STATISTICS, Read, Residence, SETTLED,
-    SPLIT, Scale, WRITE_FIXTURE_ROWS, WRITE_PHASES, WriteOp, client, lanes, parquet_bytes,
-    platform, read_op, start, table_files,
+    SPLIT, Scale, WRITE_FIXTURE_ROWS, WRITE_PHASES, WriteOp, client, lanes, learn_span_layout,
+    parquet_bytes, platform, read_op, start, table_files,
 };
 
 /// Concurrent writers loading the read fixture.
@@ -35,9 +35,6 @@ const LOADERS: usize = 16;
 
 /// How long the read fixture may take to publish after its load.
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(300);
-
-/// Scribe's gauge of cached learned Variant layouts, by namespace.
-const LAYOUTS_LEARNED: &str = "bifrost_scribe_variant_layouts_learned";
 
 /// Scribe's counter of Arrow bytes inserted into memtables.
 pub const INSERTED: &str = "bifrost_scribe_memtable_bytes_inserted_total";
@@ -143,20 +140,9 @@ impl Isolated {
             WRITE_FIXTURE_ROWS + self.scale.spans / 2,
         )
         .await?;
-        let claims = platform
-            .publish_scribe()
+        learn_span_layout(server)
             .await
             .map_err(ExperimentError::workload)?;
-        let learned = server
-            .metrics()
-            .await
-            .map_err(ExperimentError::workload)?
-            .sum(LAYOUTS_LEARNED, &["namespace=\"bifrost.traces\""]);
-        if claims == 0 || learned < 1.0 {
-            return Err(ExperimentError::workload(format!(
-                "publishing the span sample published {claims} claims and taught {learned} bifrost.traces Variant layouts"
-            )));
-        }
         let whole = Fixture {
             first: 0,
             rows: events,

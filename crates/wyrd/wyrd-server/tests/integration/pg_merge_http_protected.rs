@@ -18,7 +18,7 @@ use tower::ServiceExt;
 use wyrd_auth_verify::TokenPrincipalRef;
 use wyrd_runtime::PrincipalId;
 
-use wyrd_server::config::{BifrostTarget, ScribeRuntimeConfig, WyrdServerConfig};
+use wyrd_server::config::{ScribeRuntimeConfig, ServerTarget, WyrdServerConfig};
 use wyrd_server::state::LimitsConfig;
 use wyrd_server::{AppState, WyrdServer};
 use wyrd_spec::DataTenantId;
@@ -270,7 +270,7 @@ async fn pg_scribe_body_limit_is_route_and_role_local() {
     );
 
     let oracle_only = WyrdTestServer::builder()
-        .with_forge_process_role_for_test(BifrostTarget::Oracle)
+        .with_forge_process_role_for_test(ServerTarget::BifrostQuery)
         .with_limits_for_test(LimitsConfig {
             body_bytes: 1024,
             ..LimitsConfig::default()

@@ -9,6 +9,9 @@
 //! - `l2 <engine>`: competing open-loop work through capacity, overload, and
 //!   recovery, through `mise run bench:l2:<engine>`.
 //! - `report <record.json>`: regenerates a persisted record's report.
+//! - `profile <cpu-capture.json.gz> [thread-name]`: lists the functions each
+//!   sampled thread group of a CPU capture spends its samples in, from its
+//!   Samply symbol sidecar.
 //! - `results`: writes every recorded run of `benchmarks/history/` into one HTML
 //!   page at `target/benchmarks/results.html`, through
 //!   `mise run bench:results`.
@@ -34,7 +37,6 @@ mod levels;
 mod query;
 mod verification;
 
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -47,52 +49,7 @@ use crate::levels::{Context, Plan};
 /// or `both` starts it, so the driver's heap profiles follow the server's
 /// sampling contract.
 #[global_allocator]
-static GLOBAL: SampledSystem = SampledSystem;
-
-/// [`System`] plus the heap sampler's allocation and free hooks.
-struct SampledSystem;
-
-// SAFETY: every method forwards its arguments unchanged to `System` and
-// returns what `System` returned. No pointer is fabricated, aliased or freed
-// here, so this upholds exactly the invariants `System` upholds.
-#[expect(
-    unsafe_code,
-    reason = "a global allocator is unsafe; the sampling it adds is safe"
-)]
-unsafe impl GlobalAlloc for SampledSystem {
-    /// Allocates `layout` from the system and reports it.
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: `layout` comes from the caller and is forwarded unchanged.
-        let ptr = unsafe { System.alloc(layout) };
-        wyrd_benchmark::heap::allocated(ptr, layout.size());
-        ptr
-    }
-
-    /// Reports the free, then returns `ptr` to the system.
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        wyrd_benchmark::heap::freed(ptr);
-        // SAFETY: `ptr` came from our `alloc`/`realloc` with this same `layout`.
-        unsafe { System.dealloc(ptr, layout) };
-    }
-
-    /// Takes the system's pre-zeroed allocation and reports it.
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: `layout` comes from the caller and is forwarded unchanged.
-        let ptr = unsafe { System.alloc_zeroed(layout) };
-        wyrd_benchmark::heap::allocated(ptr, layout.size());
-        ptr
-    }
-
-    /// Reports the old block freed and the resized block allocated.
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        wyrd_benchmark::heap::freed(ptr);
-        // SAFETY: `ptr`/`layout` describe a live block from this allocator, and
-        // `new_size` is the caller's — all forwarded unchanged.
-        let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
-        wyrd_benchmark::heap::allocated(new_ptr, new_size);
-        new_ptr
-    }
-}
+static GLOBAL: wyrd_benchmark::heap::SampledSystem = wyrd_benchmark::heap::SampledSystem;
 
 /// Where `results` writes the results page, under the repository root.
 const RESULTS: &str = "target/benchmarks/results.html";
@@ -184,6 +141,19 @@ async fn dispatch(arguments: &[String], root: &Path) -> u8 {
                 }
             }
         }
+        (Some("profile"), _, _) if (3..=4).contains(&arguments.len()) => {
+            let threads = arguments.get(3).map_or("", String::as_str);
+            match levels::cpu_report(Path::new(&arguments[2]), threads) {
+                Ok(report) => {
+                    print!("{report}");
+                    0
+                }
+                Err(message) => {
+                    eprintln!("capacity profile: {message}");
+                    2
+                }
+            }
+        }
         (Some("results"), _, _) if arguments.len() == 2 => {
             let out = root.join(RESULTS);
             match levels::results(root, &out) {
@@ -199,7 +169,7 @@ async fn dispatch(arguments: &[String], root: &Path) -> u8 {
         }
         _ => {
             eprintln!(
-                "capacity: expected `l1 [bifrost [writes-parquet|hot|parquet]|verification|gateway]`, `l2 <bifrost|verification|gateway>`, `report <record.json>`, or `results`, got {:?}",
+                "capacity: expected `l1 [bifrost [writes-parquet|hot|parquet]|verification|gateway]`, `l2 <bifrost|verification|gateway>`, `report <record.json>`, `profile <cpu-capture.json.gz> [thread-name]`, or `results`, got {:?}",
                 &arguments[1.min(arguments.len())..]
             );
             2
@@ -600,10 +570,100 @@ mod tests {
             declare(Engine::Bifrost, Level::One, &rest, host, &root)
         };
         assert_eq!(
-            query::Experiment::ALL.map(query::Experiment::name),
-            ["writes-parquet", "hot", "parquet"],
-            "a complete Bifrost L1 suite is three records"
+            query::Experiment::ALL
+                .map(query::Experiment::name)
+                .as_slice(),
+            ["writes-parquet", "hot", "parquet", "ui-sql"],
+            "a complete Bifrost L1 suite is four records"
         );
+        let ui = query::Experiment::parse("ui-sql")
+            .map(|ui| experiment(ui, &[], HOST))
+            .expect("ui-sql is an L1 experiment");
+        assert!(ui.refusals().is_empty(), "{:?}", ui.refusals());
+        for control in ["fixture", "limits", "workload", "corpus"] {
+            assert!(ui.controls.contains_key(control), "ui-sql {control}");
+        }
+        assert_eq!(
+            ui.controls["corpus"]["sha256"].as_str(),
+            Some(query::ui::corpus_digest().as_str()),
+            "a ui-sql record names the exact frozen SQL it ran"
+        );
+        let ui_steps: Vec<&str> = ui.steps.iter().map(|step| step.id.as_str()).collect();
+        assert_eq!(
+            ui_steps,
+            [
+                "memtable-ui-c1",
+                "memtable-ui-c8",
+                "staged-ui-c1",
+                "staged-ui-c8",
+                "published-ui-c1",
+                "published-ui-c8"
+            ],
+            "one combined step per residence and client count"
+        );
+        assert_eq!(
+            ui.timing, timing,
+            "ui-sql keeps the standard L1 windows and budget"
+        );
+        let declared = |id: String| ui.metrics.iter().any(|metric| metric.id == id);
+        for observation in [
+            "page.traces",
+            "page.metrics",
+            "statement.trace-list",
+            "statement.verify-chart-verdict",
+            "statement.metrics-histogram",
+        ] {
+            for stat in ["count", "p95_us"] {
+                let id = format!("diagnostic.driver.{observation}.{stat}");
+                assert!(declared(id.clone()), "ui-sql declares {id}");
+            }
+        }
+        assert!(
+            !declared("diagnostic.driver.statement.span-detail.count".to_owned()),
+            "standalone statements are checked for correctness, not timed"
+        );
+        for criterion in ["no-errors", "exact-answers", "p95-samples"] {
+            assert!(
+                ui.criteria.iter().any(|judged| judged.id == criterion),
+                "ui-sql judges {criterion}"
+            );
+        }
+        for (name, requests, layout) in [
+            ("ui-sql-10x", 5_000, "canonical"),
+            ("ui-sql-learned", 500, "learned"),
+        ] {
+            let extended = query::Experiment::parse(name).map_or_else(
+                || panic!("{name} is an extended L1 experiment"),
+                |extended| experiment(extended, &[], HOST),
+            );
+            assert!(
+                !query::Experiment::ALL
+                    .map(query::Experiment::name)
+                    .contains(&name),
+                "{name} runs only when selected"
+            );
+            assert!(extended.refusals().is_empty(), "{:?}", extended.refusals());
+            assert_eq!(extended.experiment, name);
+            assert_eq!(
+                extended.controls["fixture"]["journey"]["requests"],
+                requests
+            );
+            assert_eq!(extended.controls["fixture"]["layout"], layout);
+            assert_eq!(
+                extended
+                    .steps
+                    .iter()
+                    .map(|step| step.id.as_str())
+                    .collect::<Vec<_>>(),
+                ui_steps,
+                "{name} measures the same steps as ui-sql"
+            );
+            assert_eq!(
+                extended.timing, timing,
+                "{name} keeps the L1 windows and budget"
+            );
+        }
+        assert_eq!(ui.controls["fixture"]["layout"], "canonical");
         assert_eq!(
             query::Experiment::parse("writes-hot"),
             None,
@@ -905,19 +965,28 @@ mod tests {
             verification.refusals()
         );
         assert_eq!(verification.timing, timing);
-        assert_eq!(
-            steps(&verification, true),
-            sweep("direct-verify", "-", &verification::CLIENTS)
-        );
+        let languages: Vec<String> = ["", "python-", "typescript-"]
+            .iter()
+            .flat_map(|language| {
+                let mut steps = sweep(
+                    &format!("direct-verify-{language}"),
+                    "",
+                    &verification::CLIENTS,
+                );
+                steps.push(format!(
+                    "direct-verify-{language}r{}",
+                    verification::PACED_RATE
+                ));
+                steps
+            })
+            .collect();
+        assert_eq!(steps(&verification, true), languages);
         assert_eq!(
             applies(&verification, "overhead-p99"),
             ["direct-verify-c64"]
         );
-        assert_eq!(
-            applies(&verification, "no-errors"),
-            sweep("direct-verify", "-", &verification::CLIENTS)
-        );
-        assert_eq!(applies(&verification, "correct-verdicts").len(), 2);
+        assert_eq!(applies(&verification, "no-errors"), languages);
+        assert_eq!(applies(&verification, "correct-verdicts"), languages);
         for metric in [
             "verifications_per_s_per_vcpu",
             "verifications_per_cpu_s",
@@ -2276,6 +2345,18 @@ mod tests {
             &["completed", "cancelled"],
         ),
         ("verification.direct.outside", &["completed", "cancelled"]),
+        (
+            "verification.direct.outside.before",
+            &["completed", "cancelled"],
+        ),
+        (
+            "verification.direct.outside.between",
+            &["completed", "cancelled"],
+        ),
+        (
+            "verification.direct.outside.after",
+            &["completed", "cancelled"],
+        ),
     ];
 
     /// Every Gateway call outcome (`wyrd_gateway::outcome_name`).

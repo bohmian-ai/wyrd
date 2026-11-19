@@ -93,7 +93,7 @@ pub(crate) fn session_cookies(headers: &HeaderMap) -> Vec<(Option<TenantSlug>, S
 
 /// Every cookie (name, value) pair a request presents, split per RFC 6265
 /// §5.4 across every `Cookie` header, in presentation order.
-fn cookie_pairs(headers: &HeaderMap) -> impl Iterator<Item = (&str, &str)> {
+pub(crate) fn cookie_pairs(headers: &HeaderMap) -> impl Iterator<Item = (&str, &str)> {
     headers
         .get_all(header::COOKIE)
         .iter()

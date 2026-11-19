@@ -100,8 +100,11 @@ type Fields<S> = { readonly [K in keyof S]?: Authorable<S[K]> };
 /** The value the field `K` of `S` takes. */
 type Value<S, K extends keyof S> = Exclude<S[K], undefined>;
 
-/** One entry of the list field `K` of `S`. */
-type Item<S, K extends keyof S> = NonNullable<S[K]> extends readonly (infer U)[] ? U : never;
+/** One entry of the list field `K` of `S`, including a field that is a list or an object. */
+type Item<S, K extends keyof S> = ListEntry<NonNullable<S[K]>>;
+
+/** One entry of each list member of the union `T`. */
+type ListEntry<T> = T extends readonly (infer U)[] ? U : never;
 
 /** One entry's value of the map field `K` of `S`. */
 type Entry<S, K extends keyof S> = NonNullable<S[K]> extends { readonly [key: string]: infer V } ? V : never;
@@ -2131,7 +2134,7 @@ export class Action {
    * @param from - The media slot reference.
    * @returns The action.
    */
-  static extract(from: Wire.ActionExtract["from"]): Action {
+  static extract(from: string): Action {
     return adopt(Action.prototype, NativeAuthored.actionExtract(from));
   }
 
@@ -2386,14 +2389,16 @@ export class Check {
 
 /**
  * One response format for a {@link Prompt}: plain text, a JSON object, a
- * named JSON Schema, or the canonical Verdict with an optional custom `data`
- * schema, which the native builder expands.
+ * named JSON Schema, the canonical Verdict with an optional custom `data`
+ * schema, which the native builder expands, or the standard code review
+ * report (`code_review`), whose schema is fixed.
  */
 export type ResponseFormat =
   | { readonly type: "text" }
   | { readonly type: "json_object" }
   | { readonly type: "json_schema"; readonly name: string; readonly schema: Readonly<Record<string, Wire.JsonValue>> }
-  | { readonly type: "verdict"; readonly data?: Readonly<Record<string, Wire.JsonValue>> };
+  | { readonly type: "verdict"; readonly data?: Readonly<Record<string, Wire.JsonValue>> }
+  | { readonly type: "code_review" };
 
 /** The options every {@link Prompt} factory takes, by the native builder's names. */
 export type PromptOptions = {

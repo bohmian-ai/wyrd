@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 use vala_verify::blocks::{
     ActionExecutor, AgentCardResolver, AgentExecutor, BlockCall, BlockClock, BlockError, CallInput,
     CallValue, CheckExecutor, DriftChecks, EngineError, EvidenceReader, Position,
-    PromptCardResolver,
+    PromptCardResolver, ToolCallsOwner,
 };
 use wyrd_client::WyrdClient;
 use wyrd_client::auth::AuthMiddleware;
@@ -44,11 +44,12 @@ use wyrd_server::components::auth::Caller;
 use wyrd_server::components::gateway::GatewayCallContext;
 use wyrd_server::verification::hosted::HostedLimits;
 use wyrd_server::verification::hosted::blocks::{Execution, HostedBlocks};
-use wyrd_server::verification::hosted::evidence::TenantEvidence;
+use wyrd_server::verification::hosted::evidence::{Loaded, TenantEvidence};
 use wyrd_server::verification::hosted::registry::TenantRegistry;
 use wyrd_server::verification::hosted::sandbox::{CodeExecutor, Sandbox};
 use wyrd_server::verification::hosted::tools::HostedTools;
 use wyrd_server::verification::hosted::workspace::Workspaces;
+use wyrd_server::verification::telemetry::{Envelopes, ExecutionMode};
 use wyrd_server::verification::{RuntimeLimits, VerificationRuntime};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{Attribution, PrincipalId, Sha256Hex};
@@ -62,12 +63,14 @@ use wyrd_spec::reference::{CardRef, InlineableRef, Ref};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::VerificationVerdict;
-use wyrd_spec::verification::execution::{CallProvenance, Citation, InputDeclaration, Locator};
+use wyrd_spec::verification::execution::{
+    CallProvenance, Citation, InputDeclaration, InvocationSettlement, Locator,
+};
 use wyrd_testing::logs::LogCapture;
 use wyrd_testing::verification::VerificationFixture;
 use wyrd_testing::{Bootstrap, WyrdTestServer, WyrdTestServerBuilder};
 
-use crate::sandbox_worker::worker;
+use crate::sandbox_worker::{roomy, worker, workspaces};
 
 /// The registered Artifact's text evidence.
 const NOTES: &[u8] = b"alpha\nbeta\n";
@@ -133,6 +136,43 @@ impl Registered {
         }
     }
 
+    /// Register Experiment `seeded` 1.0.0, whose structured `seed`
+    /// default parameter is `u64::MAX`, as another writer of the tenant.
+    ///
+    /// # Panics
+    /// Panics when bootstrap, load, or registration fails.
+    async fn seeded_experiment(&self) {
+        let temp = tempfile::tempdir().expect("loader workspace creates");
+        let card = temp.path().join("experiment.yaml");
+        std::fs::write(
+            &card,
+            format!(
+                "apiVersion: wyrd/v1\nkind: Experiment\nmetadata:\n  name: seeded\n  version: 1.0.0\nspec:\n  default_parameters:\n    seed:\n      type: json\n      value: {}\n",
+                u64::MAX
+            ),
+        )
+        .expect("card writes");
+        let input = build_declaration_input(load(&card).expect("loader tree builds"))
+            .expect("registration input builds");
+        let Bootstrap::User { jwt, .. } = self
+            .server
+            .bootstrap_user("hosted-experiment-writer", &["editor"])
+            .await
+            .expect("writer bootstraps")
+        else {
+            panic!("user bootstrap returned a non-user principal");
+        };
+        let cards = Cards::connect_with(&client(
+            self.server.base_url().expect("bound server has a base URL"),
+            &jwt,
+        ))
+        .await
+        .expect("handle connects");
+        Box::pin(cards.declare(&input))
+            .await
+            .expect("the Experiment registers");
+    }
+
     /// Evidence read as a user of `tenant` holding `permissions`, under
     /// `limits`, citing what it admits.
     fn evidence(
@@ -145,6 +185,7 @@ impl Registered {
             self.server.state().clone(),
             user(tenant, permissions),
             limits,
+            wyrd_runtime::resources::ByteLedger::new(u64::MAX),
         )
     }
 
@@ -190,7 +231,7 @@ pub(crate) fn user(
 ///
 /// # Panics
 /// Panics when the client cannot be assembled.
-fn client(base_url: &str, jwt: &str) -> WyrdClient {
+pub(crate) fn client(base_url: &str, jwt: &str) -> WyrdClient {
     let config = ClientConfig {
         http: HttpConfig {
             base_url: base_url.to_owned(),
@@ -215,6 +256,97 @@ fn notes() -> SlotName {
     SlotName::new("notes").expect("slot")
 }
 
+/// Reading evidence as native media charges the raw bytes it read and their
+/// encoding together while it encodes, then hands the Agent call only the
+/// encoding's charge, which lasts exactly as long as the call holds it.
+///
+/// # Panics
+/// Panics when memory one byte short of both copies admits the read, a
+/// refusal keeps a charge, the guard is charged other than the encoding, or
+/// the charge outlives the guard.
+#[tokio::test]
+async fn native_media_holds_raw_and_encoded_bytes_only_while_they_live() {
+    let registered = Registered::start().await;
+    let declaration = registered.file("notes.txt");
+    let raw = NOTES.len() as u64;
+    let encoded = (NOTES.len().div_ceil(3) * 4) as u64;
+    let pinned = Arc::new(BTreeMap::from([(notes(), declaration.clone())]));
+    for (capacity, fits) in [(raw + encoded - 1, false), (raw + encoded, true)] {
+        let memory = wyrd_runtime::resources::ByteLedger::new(capacity);
+        let evidence = TenantEvidence::new(
+            registered.server.state().clone(),
+            user(
+                registered.server.data_tenant_id(),
+                [Permission::card_read()],
+            ),
+            HostedLimits::default(),
+            memory.clone(),
+        );
+        evidence
+            .admit(&BTreeMap::new(), &pinned)
+            .await
+            .expect("the notes are admitted");
+        let media = evidence.media(&declaration).await;
+        if !fits {
+            assert!(
+                matches!(media, Err(BlockError::Busy { .. })),
+                "the raw bytes and their encoding are charged together"
+            );
+            assert_eq!(memory.used(), 0, "a refused read holds nothing");
+            continue;
+        }
+        let (_media, guard) = media.expect("both copies fit");
+        assert_eq!(
+            memory.used(),
+            encoded,
+            "the call holds only the encoding once the raw bytes drop"
+        );
+        drop(guard);
+        assert_eq!(memory.used(), 0, "the charge ends with its guard");
+    }
+}
+
+/// Encoding evidence as native media is CPU work: it waits for a CPU lane
+/// while every lane is held, and finishes once one is free.
+///
+/// # Panics
+/// Panics when the encoding finishes while every lane is held, never queues
+/// for a lane, or fails once a lane is free.
+#[tokio::test]
+async fn native_media_encoding_waits_for_a_cpu_lane() {
+    let registered = Registered::start().await;
+    let declaration = registered.file("notes.txt");
+    let pinned = Arc::new(BTreeMap::from([(notes(), declaration.clone())]));
+    let evidence = registered.readable();
+    evidence
+        .admit(&BTreeMap::new(), &pinned)
+        .await
+        .expect("the notes are admitted");
+    let workloads = registered.server.state().resources.workloads().clone();
+    let lanes = workloads.lanes().clone();
+    let other = workloads.begin(wyrd_runtime::resources::Workload::Gateway, None, None);
+    let mut held = Vec::new();
+    while lanes.free() > 0 {
+        held.push(lanes.acquire(other.context()).await);
+    }
+    let media = evidence.media(&declaration);
+    tokio::pin!(media);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while lanes.waiting() == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the media encoding never queued for a CPU lane"
+        );
+        tokio::select! {
+            biased;
+            _ = &mut media => panic!("the media encoded while every lane was held"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+    }
+    drop(held);
+    media.await.expect("the media encodes once a lane is free");
+}
+
 /// One exact Artifact file feeds native media, citations, a workspace, and
 /// Python code, all through the same authorized loader.
 ///
@@ -233,7 +365,7 @@ async fn artifact_evidence_and_code_reach_every_consumer() {
 
     let (bytes, format) = evidence.read(&declaration).await.expect("the file reads");
     assert_eq!(
-        (bytes.as_slice(), format),
+        (bytes.bytes.as_slice(), format),
         (NOTES, skald_spec::MediaFormat::Text)
     );
     evidence
@@ -252,7 +384,7 @@ async fn artifact_evidence_and_code_reach_every_consumer() {
         vec![cited]
     );
 
-    let workspace = Workspaces::new(HostedLimits::default())
+    let workspace = workspaces(HostedLimits::default())
         .open(
             &BTreeMap::from([(
                 "/inputs/notes.txt".to_owned(),
@@ -277,6 +409,7 @@ async fn artifact_evidence_and_code_reach_every_consumer() {
                 monty_min_workers: 0,
                 ..HostedLimits::default()
             },
+            &roomy(),
         )
         .await
         .expect("pool starts"),
@@ -306,6 +439,10 @@ async fn artifact_evidence_and_code_reach_every_consumer() {
             )]),
             workspace: BTreeMap::new(),
             deadline: Instant::now() + Duration::from_secs(30),
+            attempt: 1,
+            item_index: None,
+            iteration_index: None,
+            tool_calls: ToolCallsOwner::default().handle(),
         },
     )
     .await
@@ -337,7 +474,7 @@ async fn artifact_reads_refuse_before_use() {
         .expect("the other tenant seeds");
     let card = &registered.card;
     let readable = registered.readable();
-    let refused = |result: Result<(Vec<u8>, Option<skald_spec::MediaFormat>), BlockError>| {
+    let refused = |result: Result<(Loaded, Option<skald_spec::MediaFormat>), BlockError>| {
         let error = result.expect_err("refused");
         assert!(matches!(error, BlockError::Terminal { .. }), "{error}");
     };
@@ -388,6 +525,151 @@ async fn artifact_reads_refuse_before_use() {
     }
 }
 
+/// An evidence read charges process memory for the declared size before
+/// it fetches a byte: a read the ledger cannot hold is refused busy and
+/// leaves no charge, and a read that fits holds its charge exactly as long
+/// as the caller keeps the bytes.
+///
+/// # Panics
+/// Panics when a read past process memory is not busy, or a charge is
+/// left behind or ends before the bytes do.
+#[tokio::test]
+async fn evidence_reads_charge_process_memory_before_reading() {
+    let registered = Registered::start().await;
+    let reader = |memory: &wyrd_runtime::resources::ByteLedger| {
+        TenantEvidence::new(
+            registered.server.state().clone(),
+            user(
+                registered.server.data_tenant_id(),
+                [Permission::card_read()],
+            ),
+            HostedLimits::default(),
+            memory.clone(),
+        )
+    };
+    let size = NOTES.len() as u64;
+
+    let cramped = wyrd_runtime::resources::ByteLedger::new(size - 1);
+    let refused = reader(&cramped)
+        .artifact(&registered.card, Some("notes.txt"))
+        .await
+        .expect_err("process memory cannot hold the read");
+    assert!(matches!(refused, BlockError::Busy { .. }), "{refused}");
+    assert_eq!(cramped.used(), 0, "a refused read leaves no charge");
+
+    let roomy = wyrd_runtime::resources::ByteLedger::new(size);
+    let (loaded, _) = reader(&roomy)
+        .artifact(&registered.card, Some("notes.txt"))
+        .await
+        .expect("the read fits");
+    assert_eq!(loaded.bytes, NOTES);
+    assert_eq!(roomy.used(), size, "the bytes held are charged");
+    drop(loaded);
+    assert_eq!(roomy.used(), 0, "dropping the bytes returns the charge");
+}
+
+/// A workspace streams uploaded evidence from storage straight into its
+/// `/inputs` file: a File four times the size of process memory stages,
+/// with memory charged only for the chunk in flight and the whole file
+/// charged to scratch, and dropping the workspace returns it. A stored body
+/// that no longer matches its declaration is refused terminal and leaves no
+/// file or charge behind.
+///
+/// # Panics
+/// Panics when the File does not stage byte for byte, a charge is wrong or
+/// left behind, or the tampered body stages.
+#[tokio::test]
+async fn workspaces_stream_evidence_to_disk() {
+    let registered = Registered::start().await;
+    let server = &registered.server;
+    let tenant = server.data_tenant_id();
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("hosted-stream-writer", &["editor"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let document = "streamed evidence line\n".repeat(12_000).into_bytes();
+    let stored = crate::pg_verification_routes::upload_file(server, &jwt, &document).await;
+    let size = document.len() as u64;
+    let process = wyrd_runtime::resources::ProcessResources::new(
+        std::num::NonZeroUsize::MIN,
+        size / 4,
+        1 << 30,
+    );
+    let evidence = TenantEvidence::new(
+        server.state().clone(),
+        Caller {
+            executed_by: Some(PrincipalId::new(uuid::Uuid::now_v7())),
+            ..user(tenant, [Permission::card_read()])
+        },
+        HostedLimits::default(),
+        process.memory().clone(),
+    );
+    let root = tempfile::tempdir().expect("scratch root");
+    let workspaces = Workspaces::new(HostedLimits::default(), &process, root.path().to_owned());
+    let files = BTreeMap::from([(
+        "/inputs/doc.txt".to_owned(),
+        CallInput {
+            value: CallValue::Evidence(InputDeclaration::File {
+                sha256: Sha256Hex::digest(&document),
+                size_bytes: size,
+                format: skald_spec::MediaFormat::Text,
+                filename: None,
+            }),
+            sources: BTreeSet::from([notes()]),
+        },
+    )]);
+
+    let workspace = workspaces
+        .open(&files, &evidence)
+        .await
+        .expect("a File larger than process memory stages");
+    assert_eq!(
+        std::fs::read(workspace.inputs_dir().join("doc.txt")).expect("staged file"),
+        document
+    );
+    assert_eq!(process.memory().used(), 0, "no chunk stays charged");
+    assert_eq!(
+        process.scratch().used(),
+        size,
+        "the file is charged to scratch"
+    );
+    let returned = process.scratch().changed();
+    let mut returned = std::pin::pin!(returned);
+    returned.as_mut().enable();
+    drop(workspace);
+    tokio::time::timeout(Duration::from_secs(10), returned)
+        .await
+        .expect("the charge returns once the directory is emptied");
+    assert_eq!(process.scratch().used(), 0);
+
+    let mut tampered = document.clone();
+    tampered[0] ^= 1;
+    let object = wyrd_storage::tenant_path::validate_evidence(&stored, tenant).expect("valid path");
+    server
+        .state()
+        .storage
+        .put_object(&object, tampered)
+        .await
+        .expect("tamper");
+    let refused = workspaces.open(&files, &evidence).await.map(drop);
+    assert!(
+        matches!(&refused, Err(BlockError::Terminal { reason }) if reason.contains("digest")),
+        "{refused:?}"
+    );
+    assert_eq!(process.scratch().used(), 0);
+    assert_eq!(process.memory().used(), 0);
+    assert_eq!(
+        std::fs::read_dir(root.path())
+            .expect("scratch root")
+            .count(),
+        0,
+        "the refused workspace is removed"
+    );
+}
+
 /// One execution resolves each input's metadata once: an uploaded File's
 /// recorded location is read from the object inventory, and an exact
 /// Artifact's files from its Card manifest, a single time each, at
@@ -435,7 +717,12 @@ async fn evidence_metadata_is_resolved_once() {
         executed_by: Some(executor),
         ..user(tenant, [Permission::card_read()])
     };
-    let evidence = TenantEvidence::new(server.state().clone(), caller, HostedLimits::default());
+    let evidence = TenantEvidence::new(
+        server.state().clone(),
+        caller,
+        HostedLimits::default(),
+        wyrd_runtime::resources::ByteLedger::new(u64::MAX),
+    );
     let before = server
         .bifrost_read_decision_count()
         .await
@@ -446,13 +733,13 @@ async fn evidence_metadata_is_resolved_once() {
         .await
         .expect("both inputs are admitted");
     for _ in 0..2 {
-        let (bytes, _) = evidence.read(&file).await.expect("the File reads");
-        assert_eq!(bytes, document);
+        let (read, _) = evidence.read(&file).await.expect("the File reads");
+        assert_eq!(read.bytes, document);
         let (bytes, _) = evidence
             .artifact(&registered.card, Some("notes.txt"))
             .await
             .expect("the Artifact file reads");
-        assert_eq!(bytes, NOTES);
+        assert_eq!(bytes.bytes, NOTES);
     }
     assert_eq!(
         evidence
@@ -480,7 +767,7 @@ async fn evidence_metadata_is_resolved_once() {
         value: CallValue::Evidence(value),
         sources: BTreeSet::from([slot.clone()]),
     };
-    let workspace = Workspaces::new(HostedLimits::default())
+    let workspace = workspaces(HostedLimits::default())
         .open(
             &BTreeMap::from([
                 ("/inputs/doc.json".to_owned(), mounted(file.clone(), &doc)),
@@ -543,7 +830,7 @@ async fn evidence_metadata_is_resolved_once() {
 }
 
 /// Refuses every registry lookup; the Agent here is authored inline.
-struct NoRegistry;
+pub(crate) struct NoRegistry;
 
 #[async_trait::async_trait]
 impl AgentCardResolver for NoRegistry {
@@ -572,7 +859,7 @@ impl PromptCardResolver for NoRegistry {
 }
 
 /// One scripted OpenAI answer: `text`, or else the `calls` it requests.
-fn answer(text: Option<&str>, calls: &[(&str, Value)]) -> ProviderResponse {
+pub(crate) fn answer(text: Option<&str>, calls: &[(&str, Value)]) -> ProviderResponse {
     let tool_calls = (!calls.is_empty()).then(|| {
         calls
             .iter()
@@ -621,7 +908,7 @@ fn answer(text: Option<&str>, calls: &[(&str, Value)]) -> ProviderResponse {
 ///
 /// # Panics
 /// Panics when the static Prompt or schema is invalid.
-fn reviewer(tools: &[&str]) -> AgentCall {
+pub(crate) fn reviewer(tools: &[&str]) -> AgentCall {
     let prompt = openai_chat(
         "gpt-test",
         OpenAiChatOptions {
@@ -736,7 +1023,12 @@ async fn recovered_authority_bounds_every_agent_tool() {
         ..HostedLimits::default()
     };
     let declaration = registered.file("notes.txt");
-    let evidence = Arc::new(TenantEvidence::new(state.clone(), caller.clone(), limits));
+    let evidence = Arc::new(TenantEvidence::new(
+        state.clone(),
+        caller.clone(),
+        limits,
+        wyrd_runtime::resources::ByteLedger::new(u64::MAX),
+    ));
     let pinned = Arc::new(BTreeMap::from([(notes(), declaration.clone())]));
     evidence
         .admit(&BTreeMap::new(), &pinned)
@@ -746,15 +1038,22 @@ async fn recovered_authority_bounds_every_agent_tool() {
         state,
         caller,
         Arc::clone(&evidence),
-        Arc::new(Workspaces::new(limits)),
-        Arc::new(Sandbox::start(worker(), limits).await.expect("pool starts")),
+        Arc::new(workspaces(limits)),
+        Arc::new(
+            Sandbox::start(worker(), limits, &roomy())
+                .await
+                .expect("pool starts"),
+        ),
         limits,
     );
     let read = json!({"path": "/inputs/notes.txt", "start": 0});
     let code = json!({"source": "from pathlib import Path\nPath('/inputs/notes.txt').read_text()"});
+    // Python catches the nested denial and repairs it with an allowed read.
+    let nested = json!({"source": format!(
+        "import json\ntry:\n    await call_tool('bifrost.query', {{'sql': '{SPANS}'}})\n    denied = {{}}\nexcept RuntimeError as error:\n    denied = json.loads(str(error))\nrows = (await call_tool('bifrost.query', {{'sql': '{LOGS}'}}))['rows']\nprint(json.dumps({{'code': denied.get('code'), 'value': 'rows' in denied, 'rows': rows}}))"
+    )});
     let cited = json!({"slot": "notes", "locator": {"lines": {"start": 1, "end": 1}}});
-    let mock = MockProvider::new(ProviderName::OpenAi);
-    for response in [
+    let mock = Scripted::new([
         answer(
             None,
             &[
@@ -763,6 +1062,7 @@ async fn recovered_authority_bounds_every_agent_tool() {
                 ("bifrost_query", json!({"sql": MIXED})),
                 ("code_run", code.clone()),
                 ("fs_read", read.clone()),
+                ("code_run", nested.clone()),
             ],
         ),
         answer(
@@ -780,11 +1080,9 @@ async fn recovered_authority_bounds_every_agent_tool() {
             &[],
         ),
         answer(None, &[("cards_list", json!({}))]),
-    ] {
-        mock.push_response(response);
-    }
+    ]);
     let mut providers = ProviderRegistry::new();
-    providers.register(Arc::new(mock));
+    providers.register(Arc::new(mock.clone()));
     let executor = AgentExecutor::new(
         Arc::new(providers),
         Arc::new(NoRegistry),
@@ -796,8 +1094,9 @@ async fn recovered_authority_bounds_every_agent_tool() {
     let declared = reviewer(&["bifrost.query", "code.run", "fs.read"]);
     let id = TaskId::new("review").expect("task id");
     let (executor, id, registered) = (&executor, &id, &registered);
-    let step = |action: Action| async move {
-        ActionExecutor::execute(
+    let calls = ToolCallsOwner::default();
+    let step = async |action: Action, calls: &ToolCallsOwner| {
+        let output = ActionExecutor::execute(
             executor,
             BlockCall {
                 id,
@@ -812,22 +1111,56 @@ async fn recovered_authority_bounds_every_agent_tool() {
                     },
                 )]),
                 deadline: Instant::now() + Duration::from_secs(60),
+                attempt: 1,
+                item_index: None,
+                iteration_index: None,
+                tool_calls: calls.handle(),
             },
         )
-        .await
+        .await;
+        calls.settle().await;
+        output
     };
-    let output = step(Action::Agent(declared.clone()))
+    let output = step(Action::Agent(declared.clone()), &calls)
         .await
         .expect("the step runs");
+    let records = calls.settled();
     let error = |tool: BuiltinTool, args: &Value| {
-        let record = output
-            .tool_calls
+        let record = records
             .iter()
             .find(|record| record.tool == tool && &record.arguments == args)
             .expect("the call is recorded");
         record.error.clone()
     };
-    assert_eq!(output.tool_calls.len(), 5);
+    assert_eq!(records.len(), 8);
+    let nested_records: Vec<_> = records[5..]
+        .iter()
+        .map(|record| {
+            (
+                record.tool,
+                serde_json::to_value(record.recipient).expect("recipient"),
+                record.arguments["sql"].clone(),
+                record
+                    .error
+                    .as_deref()
+                    .map(|error| error.contains("query forbidden")),
+            )
+        })
+        .collect();
+    assert_eq!(
+        nested_records,
+        [
+            (BuiltinTool::CodeRun, json!("model"), Value::Null, None),
+            (
+                BuiltinTool::BifrostQuery,
+                json!("code"),
+                json!(SPANS),
+                Some(true)
+            ),
+            (BuiltinTool::BifrostQuery, json!("code"), json!(LOGS), None),
+        ],
+        "nested calls keep the accepted authority's narrow scope"
+    );
     assert_eq!(
         error(BuiltinTool::BifrostQuery, &json!({"sql": LOGS})),
         None
@@ -844,8 +1177,15 @@ async fn recovered_authority_bounds_every_agent_tool() {
     assert_eq!(error(BuiltinTool::CodeRun, &code), None);
     assert_eq!(error(BuiltinTool::FsRead, &read), None);
     assert_eq!(output.output["citations"], json!([cited]));
+    let shown = mock.tool_results();
+    assert_eq!(
+        printed(shown.last().expect("the nested program's result")),
+        json!({"code": "WYRD_VALA_403_QUERY_FORBIDDEN", "value": false, "rows": []}),
+        "the caught denial is the safe problem with no rows, and the repair succeeds"
+    );
 
     let check = Check::Agent(reviewer(&[]));
+    let checked = ToolCallsOwner::default();
     let verdict = CheckExecutor::execute(
         executor,
         BlockCall {
@@ -855,32 +1195,39 @@ async fn recovered_authority_bounds_every_agent_tool() {
             inputs: document(output.output.clone()),
             workspace: BTreeMap::new(),
             deadline: Instant::now() + Duration::from_secs(60),
+            attempt: 1,
+            item_index: None,
+            iteration_index: None,
+            tool_calls: checked.handle(),
         },
     )
-    .await
-    .expect("the check runs")
-    .verdict;
+    .await;
+    checked.settle().await;
+    let verdict = verdict.expect("the check runs").verdict;
     assert_eq!(verdict.outcome, VerificationVerdict::Passed);
     assert_eq!(
         serde_json::to_value(&verdict.citations).expect("citations"),
         json!([cited])
     );
 
-    let refused = step(Action::Agent(declared))
+    let refused = step(Action::Agent(declared), &ToolCallsOwner::default())
         .await
         .expect_err("cards.list was not declared");
     assert!(matches!(refused, BlockError::Terminal { .. }), "{refused}");
 }
 
-/// Agent and Prompt Card resolution is the caller's audited `card:read`:
-/// a caller with the grant reaches the Card (and is then told it is not an
-/// Agent or Prompt), while no grant, another tenant, or no caller at all
-/// refuses before the Card is read.
+/// Agent and Prompt Card resolution is the caller's audited `verifier:run`
+/// on the executing Verifier, never `cards:read`: a caller holding only that
+/// grant resolves the exact Agent and its Prompt, which it could not read as
+/// Cards. Another kind, a mismatched UID, a `cards:read`-only caller,
+/// another tenant, or a deleted Agent is unavailable, and no caller at all
+/// refuses.
 ///
 /// # Panics
-/// Panics when a lookup reads a Card its caller may not read.
+/// Panics when a lookup resolves what its caller may not run, or refuses
+/// what it may.
 #[tokio::test]
-async fn card_resolution_is_the_callers_read() {
+async fn card_resolution_is_the_verifier_run() {
     let registered = Registered::start().await;
     let state = registered.server.state().clone();
     let tenant = registered.server.data_tenant_id();
@@ -889,50 +1236,96 @@ async fn card_resolution_is_the_callers_read() {
         .seed_tenant("hosted-registry-other")
         .await
         .expect("the other tenant seeds");
-    let card = &registered.card;
-    let registry = |caller: Option<Caller>| TenantRegistry::new(state.clone(), caller);
-    let reason = |error: BlockError| match error {
-        BlockError::Terminal { reason } => reason,
-        BlockError::Retryable { reason } => panic!("retryable: {reason}"),
-        BlockError::Busy { reason } => panic!("busy: {reason}"),
+    let Bootstrap::User { jwt, .. } = registered
+        .server
+        .bootstrap_user("hosted-registry-writer", &["editor"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
     };
-
-    let readable = registry(Some(user(tenant, [Permission::card_read()])));
-    let read = reason(
-        AgentCardResolver::resolve(&readable, card)
-            .await
-            .expect_err("an Artifact is not an Agent"),
+    let uid = crate::pg_principal_roles::register_agent(&registered.server, &jwt, "reviewer").await;
+    let exact = |kind: &str, name: &str, uid: Option<&CardUid>| -> CardRef {
+        serde_json::from_value(json!({"kind": kind, "name": name, "version": "1.0.0", "uid": uid}))
+            .expect("reference")
+    };
+    let agent = exact("Agent", "reviewer", Some(&uid));
+    let prompt = exact("Prompt", "reviewer-prompt", None);
+    let verifier = CardUid::from_uuid(uuid::Uuid::now_v7()).expect("uid");
+    let registry =
+        |caller: Option<Caller>| TenantRegistry::new(state.clone(), caller, verifier.clone());
+    let runner = user(tenant, [Permission::verifier_run(verifier.clone())]);
+    assert!(
+        state
+            .auth
+            .permission_check
+            .check(&runner.principal, &Permission::card_read())
+            .into_result()
+            .is_err(),
+        "the runner may not read Cards"
     );
-    assert!(read.contains("is not an Agent"), "{read}");
-    let read = reason(
-        PromptCardResolver::resolve(&readable, card)
-            .await
-            .expect_err("an Artifact is not a Prompt"),
-    );
-    assert!(read.contains("is not a Prompt"), "{read}");
+    AgentCardResolver::resolve(&registry(Some(runner.clone())), &agent)
+        .await
+        .expect("the exact Agent resolves");
+    PromptCardResolver::resolve(&registry(Some(runner.clone())), &prompt)
+        .await
+        .expect("its exact Prompt resolves");
 
-    for caller in [
-        Some(user(tenant, [])),
-        Some(user(other, [Permission::card_read()])),
-        None,
+    let mismatched = exact("Agent", "reviewer", registered.card.uid.as_ref());
+    for (caller, reference) in [
+        (Some(runner.clone()), &registered.card),
+        (Some(runner), &mismatched),
+        (Some(user(tenant, [Permission::card_read()])), &agent),
+        (
+            Some(user(other, [Permission::verifier_run(verifier.clone())])),
+            &agent,
+        ),
     ] {
-        let refused = reason(
-            AgentCardResolver::resolve(&registry(caller), card)
-                .await
-                .expect_err("refused"),
+        let refused = AgentCardResolver::resolve(&registry(caller), reference)
+            .await
+            .expect_err("unavailable");
+        assert!(
+            matches!(&refused, BlockError::Unavailable { reason } if reason.contains("is unavailable")),
+            "{refused}"
         );
-        assert!(!refused.contains("is not an Agent"), "{refused}");
     }
+    let refused = AgentCardResolver::resolve(&registry(None), &agent)
+        .await
+        .expect_err("no caller");
+    assert!(matches!(refused, BlockError::Terminal { .. }), "{refused}");
+
+    let mut conn = registered
+        .server
+        .tenant_conn_for(tenant)
+        .await
+        .expect("tenant connection");
+    sqlx::query("UPDATE wyrd.cards SET status = 'deleted' WHERE card_uid = $1")
+        .bind(uid.as_uuid())
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("the Agent is deleted");
+    conn.commit().await.expect("deletion commits");
+    let deleted = AgentCardResolver::resolve(
+        &registry(Some(user(
+            tenant,
+            [Permission::verifier_run(verifier.clone())],
+        ))),
+        &agent,
+    )
+    .await
+    .expect_err("a deleted Agent is unavailable");
+    assert!(
+        matches!(deleted, BlockError::Unavailable { .. }),
+        "{deleted}"
+    );
 }
 
-/// Hosted limits of a one-worker pool with no waiters and one workspace, so
-/// a single held admission saturates each.
-fn saturable() -> HostedLimits {
+/// Hosted limits of one workspace, no prewarmed worker, and a short code
+/// timeout, so a single held workspace saturates the workspaces and an
+/// operation waiting for process memory gives up quickly.
+pub(crate) fn saturable() -> HostedLimits {
     HostedLimits {
         monty_min_workers: 0,
-        monty_max_workers: 1,
-        monty_max_waiters: 0,
-        max_workspaces: 1,
         code_timeout: Duration::from_secs(2),
         ..HostedLimits::default()
     }
@@ -951,10 +1344,10 @@ fn notes_workspace(registered: &Registered) -> BTreeMap<String, CallInput> {
 
 /// Process-capacity refusal stays busy through every hosted consumer: a
 /// code action, a code check, an Agent step's `code.run`, and an Agent step
-/// whose workspace finds every workspace taken. None is reported as a
+/// whose workspace finds process scratch full. None is reported as a
 /// retryable or terminal block failure, the Agent never answers the model
 /// with the refusal, and the refused workspace open never waits. Once the
-/// held worker admission and workspace drop, the same code runs.
+/// occupied process memory and scratch drop, the same code runs.
 ///
 /// # Panics
 /// Panics when a refusal is not busy, a refused call waits, or capacity
@@ -973,16 +1366,17 @@ async fn capacity_refusal_is_busy_at_every_hosted_consumer() {
         .admit(&BTreeMap::new(), &pinned)
         .await
         .expect("the notes are admitted");
-    let sandbox = Arc::new(Sandbox::start(worker(), limits).await.expect("pool starts"));
-    let workspaces = Arc::new(Workspaces::new(limits));
-    let none = serde_json::Map::new();
-    let far = Instant::now() + Duration::from_secs(30);
-    // One admitted operation holds the only worker admission while pending.
-    let mut held = Box::pin(sandbox.run("def f():\n    return 1", "f", &none, Vec::new(), far));
-    assert!(
-        futures_util::FutureExt::now_or_never(&mut held).is_none(),
-        "the held operation waits for its worker"
+    let sandbox = Arc::new(
+        Sandbox::start(worker(), limits, &roomy())
+            .await
+            .expect("pool starts"),
     );
+    let process = roomy();
+    let workspaces = Arc::new(Workspaces::new(limits, &process, std::env::temp_dir()));
+    let far = Instant::now() + Duration::from_secs(30);
+    // Holding all of this sandbox's process memory refuses each operation's
+    // waiting bytes.
+    let held = sandbox.occupy_for_test(0);
 
     let busy = |result: Result<(), BlockError>, consumer: &str| match result {
         Err(BlockError::Busy { .. }) => {}
@@ -1016,6 +1410,10 @@ async fn capacity_refusal_is_busy_at_every_hosted_consumer() {
                 inputs: one(),
                 workspace: BTreeMap::new(),
                 deadline: far,
+                attempt: 1,
+                item_index: None,
+                iteration_index: None,
+                tool_calls: ToolCallsOwner::default().handle(),
             },
         )
     };
@@ -1034,6 +1432,10 @@ async fn capacity_refusal_is_busy_at_every_hosted_consumer() {
                 inputs: one(),
                 workspace: BTreeMap::new(),
                 deadline: far,
+                attempt: 1,
+                item_index: None,
+                iteration_index: None,
+                tool_calls: ToolCallsOwner::default().handle(),
             },
         )
         .await
@@ -1063,25 +1465,28 @@ async fn capacity_refusal_is_busy_at_every_hosted_consumer() {
         limits,
     )))
     .with_evidence(Arc::clone(&evidence) as Arc<dyn EvidenceReader>);
-    let step = |tools: &[&str]| {
+    let step_recording = async |tools: &[&str], calls: &ToolCallsOwner| {
         let action = Action::Agent(reviewer(tools));
-        let (agent, id, registered) = (&agent, &id, &registered);
-        async move {
-            ActionExecutor::execute(
-                agent,
-                BlockCall {
-                    id,
-                    position: Position::Step,
-                    block: &action,
-                    inputs: document(json!("the notes")),
-                    workspace: notes_workspace(registered),
-                    deadline: Instant::now() + Duration::from_secs(30),
-                },
-            )
-            .await
-            .map(drop)
-        }
+        let output = ActionExecutor::execute(
+            &agent,
+            BlockCall {
+                id: &id,
+                position: Position::Step,
+                block: &action,
+                inputs: document(json!("the notes")),
+                workspace: notes_workspace(&registered),
+                deadline: Instant::now() + Duration::from_secs(30),
+                attempt: 1,
+                item_index: None,
+                iteration_index: None,
+                tool_calls: calls.handle(),
+            },
+        )
+        .await;
+        calls.settle().await;
+        output.map(drop)
     };
+    let step = async |tools: &[&str]| step_recording(tools, &ToolCallsOwner::default()).await;
     busy(step(&["code.run"]).await, "an Agent's code.run");
     assert_eq!(
         mock.remaining(),
@@ -1089,30 +1494,87 @@ async fn capacity_refusal_is_busy_at_every_hosted_consumer() {
         "the refusal ends the loop before the model is called again"
     );
 
-    let taken = workspaces
-        .open(&notes_workspace(&registered), &evidence)
-        .await
-        .expect("the only workspace opens");
-    // A waiting open would never finish while `taken` is held.
+    let scratch = process.scratch();
+    // The whole limit, not what is free now: the step above returns its
+    // workspace's charge only once its directory is emptied in the
+    // background. A waiting open would never finish while `taken` is held.
+    let taken = scratch.charge_infallible(scratch.limit());
     busy(step(&["fs.read"]).await, "an Agent's workspace");
 
     drop(taken);
     drop(held);
     let ran = act().await.expect("capacity returns once released");
     assert_eq!(ran.output, json!(2));
+
+    step(&["code.run"])
+        .await
+        .expect("the answer the refused step left unread finishes a step");
+    // Two programs at once with 4 KiB free beside the one idle worker: the
+    // short catching program is admitted once that worker is reaped for it,
+    // and the sibling, whose 8 KiB source is more than the free waiting
+    // bytes, is refused at once and stops the step busy. The admitted one,
+    // though it catches `RuntimeError` around its nested read, cannot turn
+    // the refusal into a result.
+    assert_eq!(
+        sandbox.charged_worker_pids().len(),
+        1,
+        "one worker served every step so far"
+    );
+    let held = sandbox.occupy_for_test(4096);
+    let catching = "try:\n    await call_tool('fs.read', {'path': '/inputs/notes.txt', 'start': 0})\nexcept RuntimeError:\n    pass\n'caught'";
+    mock.push_response(answer(
+        None,
+        &[
+            ("code_run", json!({"source": catching})),
+            (
+                "code_run",
+                json!({"source": format!("# {}\n1", "x".repeat(8192))}),
+            ),
+        ],
+    ));
+    busy(
+        step(&["code.run", "fs.read"]).await,
+        "a program beside a refused sibling",
+    );
+    assert_eq!(mock.remaining(), 0, "no model turn follows the refusal");
+    drop(held);
+    mock.push_response(answer(None, &[("code_run", json!({"source": catching}))]));
+    mock.push_response(answer(Some("{}"), &[]));
+    let calls = ToolCallsOwner::default();
+    step_recording(&["code.run", "fs.read"], &calls)
+        .await
+        .expect("the same program runs once capacity allows");
+    assert_eq!(
+        mock.remaining(),
+        0,
+        "the program ran, then the model answered"
+    );
+    let ran: Vec<_> = calls
+        .settled()
+        .into_iter()
+        .map(|record| (record.tool, record.error, record.output_sha256.is_some()))
+        .collect();
+    assert_eq!(
+        ran,
+        [
+            (BuiltinTool::CodeRun, None, true),
+            (BuiltinTool::FsRead, None, true),
+        ],
+        "the program and its nested read both ran and returned"
+    );
 }
 
-/// A queued execution refused the only Python worker returns to the queue
-/// with its attempt refunded and runs once capacity frees.
+/// A queued execution that process memory cannot admit returns to the
+/// queue with its attempt refunded and runs once memory frees.
 ///
-/// The runtime hosts a one-worker pool with no waiters, whose one admission
-/// the test holds. The queued execution is refused busy and deferred rather
-/// than failed, retried, or judged; once the admission drops, it completes
-/// on its first counted attempt with its real verdict.
+/// An overcommitted worker turns process pressure critical. The queued
+/// execution waits out its code timeout, is refused busy, and is
+/// deferred rather than failed, retried, or judged; once the memory frees,
+/// it completes on its first counted attempt with its real verdict.
 ///
 /// # Panics
 /// Panics when the server, seeding, or runtime fails, the execution is never
-/// deferred, settles while the admission is held, or settles other than
+/// deferred, settles while the memory is occupied, or settles other than
 /// `completed` on one attempt.
 #[tokio::test]
 async fn busy_queued_execution_is_deferred_until_capacity_frees() {
@@ -1161,8 +1623,6 @@ async fn busy_queued_execution_is_deferred_until_capacity_frees() {
             InputDeclaration::Json { value: json!(1) },
         )])
     };
-    let none = serde_json::Map::new();
-    let far = Instant::now() + Duration::from_secs(30);
     let sandbox = Arc::clone(
         state
             .verification
@@ -1170,12 +1630,10 @@ async fn busy_queued_execution_is_deferred_until_capacity_frees() {
             .expect("blocks are hosted")
             .sandbox(),
     );
-    // One admitted operation holds the only worker admission while pending.
-    let mut held = Box::pin(sandbox.run("def f():\n    return 1", "f", &none, Vec::new(), far));
-    assert!(
-        futures_util::FutureExt::now_or_never(&mut held).is_none(),
-        "the held operation waits for its worker"
-    );
+    // An overcommitted worker keeps pressure critical, pausing the queued
+    // operation until its code timeout, when it defers; the byte ledger
+    // keeps room for the run's input read and result.
+    let held = sandbox.overcommit_for_test();
     let deferred = seed
         .submit(&adder, &subject, one())
         .await
@@ -1276,7 +1734,7 @@ fn two_extracts(formats: &[&str], max_bytes: Option<u64>) -> Arc<VerifierSpec> {
 #[tokio::test]
 async fn artifact_evidence_is_admitted_against_its_slot_and_the_combined_limit() {
     let registered = Registered::start().await;
-    let blocks = HostedBlocks::start(worker(), tight_files())
+    let blocks = HostedBlocks::start(worker(), tight_files(), &roomy(), std::env::temp_dir())
         .await
         .expect("pool starts");
     let caller = user(
@@ -1290,6 +1748,8 @@ async fn artifact_evidence_is_admitted_against_its_slot_and_the_combined_limit()
             file_max_bytes: 4,
             ..tight_files()
         },
+        &roomy(),
+        std::env::temp_dir(),
     )
     .await
     .expect("cramped pool starts");
@@ -1300,19 +1760,24 @@ async fn artifact_evidence_is_admitted_against_its_slot_and_the_combined_limit()
         let (caller, state) = (&caller, registered.server.state());
         async move {
             let routes = BTreeMap::new();
+            let verifier = CardUid::from_uuid(uuid::Uuid::now_v7()).expect("uid");
             blocks
                 .engine(
                     state,
                     Execution {
                         caller,
+                        verifier: &verifier,
                         routes: &routes,
                         subject: GatewayCallContext::default(),
                         defer_unlanded_traces: false,
                         drift: DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
                         clock: BlockClock::default(),
+                        execution: None,
+                        mode: ExecutionMode::Direct,
+                        pull_request: None,
+                        envelopes: Envelopes::default(),
                     },
                 )
-                .expect("engine builds")
                 .run(spec, evidence, Instant::now() + Duration::from_secs(30))
                 .await
         }
@@ -1514,4 +1979,1136 @@ async fn nonconforming_queued_evidence_errors_without_a_verdict() {
     }
     assert_eq!(settled[3].status, "completed", "{:?}", settled[3]);
     assert!(settled[3].result_id.is_some(), "{:?}", settled[3]);
+}
+
+/// A queued execution whose exact Agent, or that Agent's Prompt, was
+/// deleted before its Agent step starts settles `errored` with
+/// `capability_unavailable` on its first attempt under a submitter holding
+/// only `verifier:run` on the Verifier: the predecessor code step's
+/// committed checkpoint stays readable, the Agent step leaves no invocation,
+/// and no verdict is judged. The hosted engine's native provider registry
+/// is empty and the test gateway reaches no provider, so no model call can
+/// happen.
+///
+/// # Panics
+/// Panics when the server, seeding, or runtime fails, or an execution
+/// settles otherwise or loses its predecessor checkpoint.
+#[tokio::test]
+async fn deleted_agent_definition_errors_queued_execution_as_unavailable() {
+    let registered = Registered::start().await;
+    let tenant = registered.server.data_tenant_id();
+    registered
+        .server
+        .ensure_builtin_tables_for_test(tenant)
+        .await
+        .expect("tenant receives every built-in table");
+    let state = registered.server.state().clone();
+    let seed = VerificationFixture::provision(&state, tenant)
+        .await
+        .expect("tenant provisions");
+    let (subject, _) = seed
+        .service("unavailable-subject")
+        .await
+        .expect("subject registers");
+    let Bootstrap::User { jwt, .. } = registered
+        .server
+        .bootstrap_user("unavailable-writer", &["editor"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let mut executions = Vec::new();
+    for deleted_kind in ["Agent", "Prompt"] {
+        let name = format!("unavailable-{}", deleted_kind.to_lowercase());
+        let agent =
+            crate::pg_principal_roles::register_agent(&registered.server, &jwt, &name).await;
+        let verifier = seed
+            .verifier(
+                &format!("{name}-verifier"),
+                &json!({
+                    "steps": [
+                        { "id": "prepare",
+                          "action": { "kind": "code", "entrypoint": "f",
+                                      "source": { "inline": "def f():\n    return 1" } } },
+                        { "id": "review",
+                          "action": { "kind": "agent",
+                                      "agent": { "kind": "Agent", "name": name, "version": "1.0.0", "uid": agent },
+                                      "inputs": { "prepared": "steps.prepare.output" } },
+                          "requirements": [{ "id": "reviewed", "statement": "The Agent reviews.",
+                              "check": { "kind": "assert", "path": "steps.review.output",
+                                         "operator": "is_not_null" } }] }
+                    ]
+                }),
+            )
+            .await
+            .expect("Verifier registers");
+        let deleted = if deleted_kind == "Agent" {
+            name.clone()
+        } else {
+            format!("{name}-prompt")
+        };
+        let mut conn = registered
+            .server
+            .tenant_conn_for(tenant)
+            .await
+            .expect("tenant connection");
+        sqlx::query("UPDATE wyrd.cards SET status = 'deleted' WHERE name = $1")
+            .bind(&deleted)
+            .execute(&mut **conn.transaction())
+            .await
+            .expect("the definition is deleted");
+        conn.commit().await.expect("deletion commits");
+        let runner = seed
+            .clone()
+            .with_actor_permissions(PermissionSet::from_iter([Permission::verifier_run(
+                verifier.clone(),
+            )]));
+        executions.push(
+            runner
+                .submit(&verifier, &subject, BTreeMap::new())
+                .await
+                .expect("execution queues"),
+        );
+    }
+
+    let runtime = VerificationRuntime::builder(&state)
+        .limits(RuntimeLimits {
+            lease: Duration::from_mins(1),
+            execution_timeout: Duration::from_secs(20),
+            poll_interval: Duration::from_millis(50),
+            ..RuntimeLimits::default()
+        })
+        .build()
+        .expect("the runtime composes");
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(runtime.run(stop.clone()));
+    let deadline = Instant::now() + Duration::from_mins(1);
+    let mut settled = Vec::new();
+    for &execution in &executions {
+        settled.push(loop {
+            let row = seed.execution(execution).await.expect("execution reads");
+            if !matches!(row.status.as_str(), "pending" | "running" | "retrying") {
+                break row;
+            }
+            assert!(Instant::now() < deadline, "{execution} never settled");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        });
+    }
+    stop.cancel();
+    task.await.expect("the runtime stops");
+
+    for (execution, row) in executions.into_iter().zip(settled) {
+        assert_eq!(
+            (row.status.as_str(), row.attempts, row.error_code.as_deref()),
+            ("errored", 1, Some("capability_unavailable")),
+            "{row:?}"
+        );
+        assert!(row.result_id.is_none(), "no verdict is judged: {row:?}");
+        let accepted = seed
+            .execution_state(&state, execution)
+            .await
+            .expect("the state reads")
+            .expect("the execution claimed its state");
+        let invocations: Vec<(&str, bool, bool)> = accepted
+            .invocations
+            .iter()
+            .map(|entry| {
+                (
+                    entry.producer.step_id.as_str(),
+                    matches!(entry.settlement, Some(InvocationSettlement::Action { .. })),
+                    entry.released,
+                )
+            })
+            .collect();
+        assert_eq!(
+            invocations,
+            [("prepare", true, false), ("review", false, true)],
+            "the predecessor's checkpoint settles and the refused review keeps only its tool spend"
+        );
+    }
+}
+
+/// A scripted model that keeps every request it receives.
+#[derive(Clone)]
+struct Scripted {
+    /// The scripted answers, in order.
+    mock: MockProvider,
+    /// Every received request as JSON, in order.
+    seen: Arc<std::sync::Mutex<Vec<Value>>>,
+}
+
+impl Scripted {
+    /// A model answering `responses` in order.
+    fn new(responses: impl IntoIterator<Item = ProviderResponse>) -> Self {
+        let mock = MockProvider::new(ProviderName::OpenAi);
+        for response in responses {
+            mock.push_response(response);
+        }
+        Self {
+            mock,
+            seen: Arc::default(),
+        }
+    }
+
+    /// The requests received so far.
+    ///
+    /// # Panics
+    /// Panics when the lock is poisoned.
+    fn seen(&self) -> Vec<Value> {
+        self.seen.lock().expect("requests").clone()
+    }
+
+    /// The JSON content of every tool message in the latest request, in
+    /// order: each tool result the model was shown.
+    ///
+    /// # Panics
+    /// Panics when no request arrived or a tool message is not JSON text.
+    fn tool_results(&self) -> Vec<Value> {
+        let last = self.seen().pop().expect("the model was called");
+        last["body"]["messages"]
+            .as_array()
+            .expect("chat messages")
+            .iter()
+            .filter(|message| message["role"] == "tool")
+            .map(|message| {
+                serde_json::from_str(message["content"].as_str().expect("text content"))
+                    .expect("JSON tool result")
+            })
+            .collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl skald_runtime::provider::Provider for Scripted {
+    /// Keep `request`, then answer the next scripted response.
+    ///
+    /// # Errors
+    /// Returns the mock's error once the script is spent.
+    ///
+    /// # Panics
+    /// Panics when the request cannot serialize or the lock is poisoned.
+    async fn send(
+        &self,
+        request: &skald_spec::ProviderRequest,
+    ) -> Result<ProviderResponse, skald_providers::ProviderError> {
+        self.seen
+            .lock()
+            .expect("requests")
+            .push(serde_json::to_value(request).expect("request serializes"));
+        self.mock.send(request).await
+    }
+
+    /// Delegates to the mock.
+    ///
+    /// # Errors
+    /// Returns the mock's stream error.
+    async fn stream(
+        &self,
+        request: &skald_spec::ProviderRequest,
+    ) -> Result<skald_providers::ProviderStream, skald_providers::ProviderError> {
+        self.mock.stream(request).await
+    }
+
+    /// The mock's name.
+    fn name(&self) -> ProviderName {
+        self.mock.name()
+    }
+}
+
+/// A model turn asking `code.run` to run `source`.
+fn code_run(source: &str) -> ProviderResponse {
+    answer(None, &[("code_run", json!({"source": source}))])
+}
+
+/// A hosted Agent over the notes file, running as one user of the server's
+/// tenant.
+struct CodeAgent {
+    /// The Agent executor.
+    executor: AgentExecutor,
+    /// Its model.
+    model: Scripted,
+    /// Its sandbox.
+    sandbox: Arc<Sandbox>,
+}
+
+impl CodeAgent {
+    /// An Agent whose user holds `permissions`, under `limits`, answering
+    /// `responses` in order.
+    ///
+    /// # Panics
+    /// Panics when the pool does not start.
+    async fn start(
+        registered: &Registered,
+        permissions: &[Permission],
+        limits: HostedLimits,
+        responses: impl IntoIterator<Item = ProviderResponse>,
+    ) -> Self {
+        let tenant = registered.server.data_tenant_id();
+        let evidence = Arc::new(registered.evidence(tenant, permissions.iter().cloned(), limits));
+        let pinned = Arc::new(BTreeMap::from([(notes(), registered.file("notes.txt"))]));
+        evidence
+            .admit(&BTreeMap::new(), &pinned)
+            .await
+            .expect("the notes are admitted");
+        let sandbox = Arc::new(
+            Sandbox::start(worker(), limits, &roomy())
+                .await
+                .expect("pool starts"),
+        );
+        let model = Scripted::new(responses);
+        let mut providers = ProviderRegistry::new();
+        providers.register(Arc::new(model.clone()));
+        let executor = AgentExecutor::new(
+            Arc::new(providers),
+            Arc::new(NoRegistry),
+            Arc::new(NoRegistry),
+        )
+        .with_toolset(Arc::new(HostedTools::new(
+            registered.server.state().clone(),
+            user(tenant, permissions.iter().cloned()),
+            Arc::clone(&evidence),
+            Arc::new(workspaces(limits)),
+            Arc::clone(&sandbox),
+            limits,
+        )))
+        .with_evidence(evidence as Arc<dyn EvidenceReader>);
+        Self {
+            executor,
+            model,
+            sandbox,
+        }
+    }
+
+    /// Run one Agent step declaring `tools` over the notes workspace,
+    /// recording into `calls` and returning once its host work has settled.
+    ///
+    /// # Errors
+    /// Returns the step's [`BlockError`].
+    async fn step(
+        &self,
+        registered: &Registered,
+        tools: &[&str],
+        calls: &ToolCallsOwner,
+    ) -> Result<Value, BlockError> {
+        self.call(registered, "reduce", reviewer(tools), calls)
+            .await
+    }
+
+    /// Run `call` as Agent step `id` over the notes workspace, recording
+    /// into `calls` and returning once its host work has settled; steps
+    /// sharing `id` share its Python budget.
+    ///
+    /// # Errors
+    /// Returns the step's [`BlockError`].
+    ///
+    /// # Panics
+    /// Panics when `id` is not a valid task id.
+    async fn call(
+        &self,
+        registered: &Registered,
+        id: &str,
+        call: AgentCall,
+        calls: &ToolCallsOwner,
+    ) -> Result<Value, BlockError> {
+        let id = TaskId::new(id).expect("task id");
+        let action = Action::Agent(call);
+        let output = ActionExecutor::execute(
+            &self.executor,
+            BlockCall {
+                id: &id,
+                position: Position::Step,
+                block: &action,
+                inputs: document(json!("the notes")),
+                workspace: notes_workspace(registered),
+                deadline: Instant::now() + Duration::from_secs(30),
+                attempt: 1,
+                item_index: None,
+                iteration_index: None,
+                tool_calls: calls.handle(),
+            },
+        )
+        .await;
+        calls.settle().await;
+        output.map(|output| output.output)
+    }
+}
+
+/// The JSON a `code.run` program printed, from its tool result.
+///
+/// # Panics
+/// Panics when the output is not one JSON document.
+fn printed(result: &Value) -> Value {
+    serde_json::from_str(result["output"].as_str().expect("printed output"))
+        .expect("the program printed JSON")
+}
+
+/// `call_tool` reaches exactly the Agent's declared tools through the one
+/// recorded path.
+///
+/// A program awaits `fs.list`, then reads the file it named: the dependent
+/// result reaches Python, both children are recorded for `code` after the
+/// outer `code.run` for the `model`, and the model sees only the outer
+/// result. An Experiment's structured `u64::MAX` seed reaches Python as the
+/// exact integer. Undeclared, unknown, and recursive targets and unconvertible
+/// arguments are refused catchably with their codes before anything is
+/// dispatched or recorded; arguments the tool itself rejects are recorded
+/// failures. An undefined host function stays an ordinary `NameError`. An
+/// uncaught error after a delivered read fails the step with no later model
+/// turn; the read keeps its digest and a call Python never awaited is not
+/// recorded as returned. An Agent declaring only `code.run` reaches no other
+/// tool, and authored code has no bridge.
+///
+/// # Panics
+/// Panics when a refused call dispatches, a value is lost or misrecorded, a
+/// failed program is answered, or authored code reaches a tool.
+#[tokio::test(flavor = "multi_thread")]
+async fn code_bridge_preserves_declared_tool_boundaries() {
+    const PROGRAM: &str = r"import json
+async def code(name, arguments):
+    try:
+        await call_tool(name, arguments)
+        return 'ok'
+    except RuntimeError as error:
+        return json.loads(str(error))['code']
+listing = await call_tool('fs.list', {'path': '/inputs'})
+read = await call_tool('fs.read', {'path': listing['files'][0]['path'], 'start': 0})
+experiment = await call_tool('cards.get', {'card_ref': {'kind': 'Experiment', 'name': 'seeded', 'version': '1.0.0'}})
+seed = experiment['card']['spec']['default_parameters']['seed']['value']
+codes = {
+    'undeclared': await code('cards.list', {}),
+    'recursive': await code('code.run', {'source': '1'}),
+    'unknown': await code('fs.nope', {}),
+    'non_string_key': await code('fs.read', {1: 'x'}),
+    'non_finite': await code('fs.read', {'path': float('nan')}),
+    'not_an_object': await code('fs.read', ['/inputs/notes.txt']),
+    'wrong_type': await code('fs.read', {'path': 1}),
+    'identity_field': await code('fs.read', {'path': '/inputs/notes.txt', 'tenant': 'other'}),
+}
+try:
+    other_host_function()
+    codes['host_function'] = 'ok'
+except NameError:
+    codes['host_function'] = 'NameError'
+print(json.dumps({'lines': [unit['text'] for unit in read['units']], 'seed': str(seed), 'max': seed == 2 ** 64 - 1, 'codes': codes}))
+";
+    const FAILING: &str = r"read = await call_tool('fs.read', {'path': '/inputs/notes.txt', 'start': 0})
+pending = call_tool('fs.list', {'path': '/inputs'})
+raise ValueError('after delivery')
+";
+    let registered = Registered::start().await;
+    registered.seeded_experiment().await;
+    let agent = CodeAgent::start(
+        &registered,
+        &[Permission::card_read(), Permission::tool_invoke_any()],
+        HostedLimits {
+            monty_min_workers: 0,
+            ..HostedLimits::default()
+        },
+        [
+            code_run(PROGRAM),
+            answer(Some("{}"), &[]),
+            code_run(FAILING),
+            code_run("import json\ntry:\n    await call_tool('fs.read', {'path': '/inputs/notes.txt', 'start': 0})\nexcept RuntimeError as error:\n    print(json.loads(str(error))['code'])"),
+            answer(Some("{}"), &[]),
+        ],
+    )
+    .await;
+    let calls = ToolCallsOwner::default();
+    agent
+        .step(
+            &registered,
+            &["code.run", "fs.list", "fs.read", "cards.get"],
+            &calls,
+        )
+        .await
+        .expect("the step runs");
+    let results = agent.model.tool_results();
+    assert_eq!(
+        results.len(),
+        1,
+        "the model sees only code.run: {results:?}"
+    );
+    assert_eq!(
+        printed(&results[0]),
+        json!({
+            "lines": ["alpha", "beta"],
+            "seed": u64::MAX.to_string(),
+            "max": true,
+            "codes": {
+                "undeclared": "WYRD_AGENT_404_TOOL_NOT_IN_AGENT",
+                "recursive": "WYRD_AGENT_404_TOOL_NOT_IN_AGENT",
+                "unknown": "WYRD_AGENT_404_TOOL_NOT_IN_AGENT",
+                "non_string_key": "WYRD_TOOL_422_INPUT",
+                "non_finite": "WYRD_TOOL_422_INPUT",
+                "not_an_object": "WYRD_TOOL_422_INPUT",
+                "wrong_type": "WYRD_TOOL_422_INPUT",
+                "identity_field": "WYRD_TOOL_422_INPUT",
+                "host_function": "NameError",
+            },
+        }),
+        "{}",
+        results[0]
+    );
+    let records = calls.settled();
+    let shape: Vec<_> = records
+        .iter()
+        .map(|record| {
+            (
+                record.tool,
+                serde_json::to_value(record.recipient).expect("recipient"),
+                record.error.is_some(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        [
+            (BuiltinTool::CodeRun, json!("model"), false),
+            (BuiltinTool::FsList, json!("code"), false),
+            (BuiltinTool::FsRead, json!("code"), false),
+            (BuiltinTool::CardsGet, json!("code"), false),
+            (BuiltinTool::FsRead, json!("code"), true),
+            (BuiltinTool::FsRead, json!("code"), true),
+        ],
+        "only admitted calls are recorded, in start order: {records:?}"
+    );
+
+    let seen = agent.model.seen().len();
+    let failing = ToolCallsOwner::default();
+    let failure = agent
+        .step(&registered, &["code.run", "fs.list", "fs.read"], &failing)
+        .await
+        .expect_err("an uncaught program error fails the step");
+    assert!(
+        matches!(&failure, BlockError::Terminal { reason } if reason.contains("ValueError")),
+        "{failure}"
+    );
+    assert_eq!(
+        agent.model.seen().len(),
+        seen + 1,
+        "no model turn follows the failed program"
+    );
+    let records = failing.settled();
+    assert_eq!(
+        (records[0].tool, records[0].error.is_some()),
+        (BuiltinTool::CodeRun, true),
+        "{records:?}"
+    );
+    assert!(
+        records[1].tool == BuiltinTool::FsRead
+            && records[1].error.is_none()
+            && records[1].output_sha256.is_some(),
+        "the delivered read keeps its digest: {records:?}"
+    );
+    assert!(
+        records[2..]
+            .iter()
+            .all(|record| record.tool == BuiltinTool::FsList
+                && record.output_sha256.is_none()
+                && record.returned_bytes == 0
+                && record
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.starts_with("cancelled"))),
+        "the never-awaited list is never recorded as returned: {records:?}"
+    );
+
+    let only_code = ToolCallsOwner::default();
+    agent
+        .step(&registered, &["code.run"], &only_code)
+        .await
+        .expect("the code-only step runs");
+    assert_eq!(
+        agent.model.tool_results()[0]["output"],
+        json!("WYRD_AGENT_404_TOOL_NOT_IN_AGENT\n"),
+        "declaring only code.run reaches no other tool"
+    );
+    assert_eq!(only_code.settled().len(), 1);
+
+    let authored = agent
+        .sandbox
+        .run(
+            DataTenantId::new_v7(),
+            "def f():\n    return call_tool('fs.read', {'path': '/inputs/notes.txt'})",
+            "f",
+            &serde_json::Map::new(),
+            Vec::new(),
+            Instant::now() + Duration::from_secs(30),
+        )
+        .await
+        .expect_err("authored code has no bridge");
+    assert!(
+        matches!(&authored, BlockError::Terminal { reason } if reason.contains("NameError")),
+        "{authored}"
+    );
+}
+
+/// Python and nested extraction share one `/work`: no lock recursion, no
+/// overwrite, one write budget.
+///
+/// The program awaits `fs.extract` and reads its output back (it is visible
+/// once awaited, and the suspended program held no lock extraction needed).
+/// Extraction never replaces a file, whether extraction or Python wrote it.
+/// Python then fills `/work` so the next extraction no longer fits and is
+/// refused; a Python write past what is left is an `OSError` even though
+/// this program alone wrote less than the limit, and a write of exactly
+/// what is left lands.
+///
+/// # Panics
+/// Panics when extraction deadlocks, overwrites, or either writer exceeds
+/// the shared budget.
+#[tokio::test(flavor = "multi_thread")]
+async fn code_calls_share_workspace_mutations() {
+    const LIMIT: u64 = 8192;
+    const PROGRAM: &str = r"import json
+from pathlib import Path
+async def rule(arguments):
+    try:
+        await call_tool('fs.extract', arguments)
+        return 'ok'
+    except RuntimeError as error:
+        return json.loads(str(error))['details']['rule']
+notes = '/inputs/notes.txt'
+await call_tool('fs.extract', {'path': notes, 'output_path': '/work/a.json'})
+extracted = Path('/work/a.json').read_text()
+size = len(extracted)
+Path('/work/b.txt').write_text('mine')
+report = {
+    'visible': 'alpha' in extracted,
+    'over_extraction': await rule({'path': notes, 'output_path': '/work/a.json'}),
+    'over_python': await rule({'path': notes, 'output_path': '/work/b.txt'}),
+    'b': Path('/work/b.txt').read_text(),
+}
+Path('/work/filler').write_text('x' * (LIMIT - 2 * size - 4 + 1))
+report['no_room'] = await rule({'path': notes, 'output_path': '/work/c.json'})
+try:
+    Path('/work/d').write_text('x' * size)
+    report['past_room'] = 'ok'
+except OSError:
+    report['past_room'] = 'OSError'
+Path('/work/d').write_text('x' * (size - 1))
+report['held'] = sum(len(Path('/work/' + name).read_text()) for name in ['a.json', 'b.txt', 'filler', 'd'])
+print(json.dumps(report))
+";
+    let registered = Registered::start().await;
+    let agent = CodeAgent::start(
+        &registered,
+        &[Permission::card_read(), Permission::tool_invoke_any()],
+        HostedLimits {
+            monty_min_workers: 0,
+            work_write_max_bytes: LIMIT,
+            ..HostedLimits::default()
+        },
+        [
+            code_run(&PROGRAM.replace("LIMIT", &LIMIT.to_string())),
+            answer(Some("{}"), &[]),
+        ],
+    )
+    .await;
+    let calls = ToolCallsOwner::default();
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        agent.step(&registered, &["code.run", "fs.extract"], &calls),
+    )
+    .await
+    .expect("nested extraction never waits on the suspended program")
+    .expect("the step runs");
+    let results = agent.model.tool_results();
+    assert_eq!(
+        printed(&results[0]),
+        json!({
+            "visible": true,
+            "over_extraction": "output_exists",
+            "over_python": "output_exists",
+            "b": "mine",
+            "no_room": "work_budget",
+            "past_room": "OSError",
+            "held": LIMIT,
+        }),
+        "{}",
+        results[0]
+    );
+}
+
+/// [`reviewer`] declaring `tools` with tool concurrency `cap`.
+///
+/// # Panics
+/// Never; [`reviewer`] is inline.
+fn capped(tools: &[&str], cap: usize) -> AgentCall {
+    let mut call = reviewer(tools);
+    let InlineableRef::Inline(spec) = &mut call.agent else {
+        unreachable!("reviewer is inline")
+    };
+    spec.run_config.tool_concurrency_cap = Some(cap);
+    call
+}
+
+/// Concurrent Python futures share the Agent's tool concurrency and each
+/// gets its own answer.
+///
+/// At caps 1 and 2, a program gathers four reads of different pieces of the
+/// notes and two Bifrost queries. Each completes (the suspended `code.run`
+/// holds no permit its children need), each future receives the result of
+/// its own request, the two concurrent queries run under their own request
+/// identities without colliding in the running-query registry, and records
+/// keep start order. The peak of active operations at the shared boundary
+/// is pinned with deterministic barriers in Vala's
+/// `code_bridge_shares_the_recorded_path`.
+///
+/// # Panics
+/// Panics when a cap deadlocks, a value reaches the wrong future, or records
+/// lose order.
+#[tokio::test(flavor = "multi_thread")]
+async fn code_calls_share_non_code_concurrency() {
+    const PROGRAM: &str = r"import asyncio, json
+reads = [call_tool('fs.read', {'path': '/inputs/notes.txt', 'start': start}) for start in [1, 0, 1, 0]]
+queries = [call_tool('bifrost.query', {'sql': 'SELECT severity_text FROM bifrost.logs.records'}) for _ in range(2)]
+done = await asyncio.gather(*reads, *queries)
+print(json.dumps({
+    'reads': [[unit['text'] for unit in read['units']] for read in done[:4]],
+    'rows': [query['rows'] for query in done[4:]],
+}))
+";
+    let registered = Registered::start().await;
+    let tenant = registered.server.data_tenant_id();
+    registered
+        .server
+        .ensure_builtin_tables_for_test(tenant)
+        .await
+        .expect("tenant receives every built-in table");
+    for cap in [1, 2] {
+        let agent = CodeAgent::start(
+            &registered,
+            &[
+                Permission::card_read(),
+                Permission::tool_invoke_any(),
+                Permission::bifrost_query_read(),
+            ],
+            HostedLimits {
+                monty_min_workers: 0,
+                ..HostedLimits::default()
+            },
+            [code_run(PROGRAM), answer(Some("{}"), &[])],
+        )
+        .await;
+        let calls = ToolCallsOwner::default();
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            agent.call(
+                &registered,
+                "reduce",
+                capped(&["code.run", "fs.read", "bifrost.query"], cap),
+                &calls,
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("cap {cap} completes"))
+        .unwrap_or_else(|error| panic!("cap {cap}: {error}"));
+        let results = agent.model.tool_results();
+        assert_eq!(
+            printed(&results[0]),
+            json!({
+                "reads": [["beta"], ["alpha", "beta"], ["beta"], ["alpha", "beta"]],
+                "rows": [[], []],
+            }),
+            "cap {cap}: {}",
+            results[0]
+        );
+        let order: Vec<_> = calls
+            .settled()
+            .iter()
+            .map(|record| {
+                (
+                    record.tool,
+                    record.arguments["start"].clone(),
+                    record.error.clone(),
+                )
+            })
+            .collect();
+        let query = (BuiltinTool::BifrostQuery, Value::Null, None);
+        assert_eq!(
+            order,
+            [
+                (BuiltinTool::CodeRun, Value::Null, None),
+                (BuiltinTool::FsRead, json!(1), None),
+                (BuiltinTool::FsRead, json!(0), None),
+                (BuiltinTool::FsRead, json!(1), None),
+                (BuiltinTool::FsRead, json!(0), None),
+                query.clone(),
+                query,
+            ],
+            "cap {cap} keeps start order"
+        );
+    }
+}
+
+/// One request allowance spans direct calls, `code.run`, its nested calls,
+/// and refused requests across attempts, and is never refunded.
+///
+/// With five requests, a first attempt spends four (an outer `code.run`,
+/// one read, one unconvertible request, one undeclared target) and a second
+/// spends the last on a direct read and still answers. A third attempt's
+/// request is refused with the catalog exhaustion code and the model is
+/// never asked again. In a fresh execution allowing two, a program that
+/// catches `RuntimeError` around its over-budget request cannot continue:
+/// the step fails with exhaustion, nothing past the limit is recorded, and
+/// no later model work starts.
+///
+/// # Panics
+/// Panics when a request is refunded or skipped, the final allowance is
+/// refused, or exhaustion is caught.
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_tool_budget_spans_origins_and_retries() {
+    const SPEND: &str = r"import json
+await call_tool('fs.read', {'path': '/inputs/notes.txt', 'start': 0})
+for name, arguments in [('fs.read', {1: 'x'}), ('cards.list', {})]:
+    try:
+        await call_tool(name, arguments)
+    except RuntimeError:
+        pass
+";
+    const CATCH: &str = r"from pathlib import Path
+await call_tool('fs.read', {'path': '/inputs/notes.txt', 'start': 0})
+try:
+    await call_tool('fs.read', {'path': '/inputs/notes.txt', 'start': 0})
+except RuntimeError:
+    pass
+await call_tool('fs.read', {'path': '/inputs/notes.txt', 'start': 0})
+";
+    let registered = Registered::start().await;
+    let read = json!({"path": "/inputs/notes.txt", "start": 0});
+    let limits = |max_calls| HostedLimits {
+        monty_min_workers: 0,
+        agent_tool_max_calls: max_calls,
+        ..HostedLimits::default()
+    };
+    let permissions = [Permission::card_read(), Permission::tool_invoke_any()];
+    let agent = CodeAgent::start(
+        &registered,
+        &permissions,
+        limits(5),
+        [
+            code_run(SPEND),
+            answer(Some("{}"), &[]),
+            answer(None, &[("fs_read", read.clone())]),
+            answer(Some("{}"), &[]),
+            answer(None, &[("fs_read", read.clone())]),
+            answer(Some("{\"never\": true}"), &[]),
+        ],
+    )
+    .await;
+    let tools = ["code.run", "fs.read"];
+    let calls = ToolCallsOwner::default();
+    agent
+        .step(&registered, &tools, &calls)
+        .await
+        .expect("the first attempt answers");
+    assert_eq!(calls.settled().len(), 2, "refused requests leave no record");
+    agent
+        .step(&registered, &tools, &calls)
+        .await
+        .expect("the final allowance still answers");
+    let exhausted = agent
+        .step(&registered, &tools, &calls)
+        .await
+        .expect_err("a sixth request is refused");
+    assert!(
+        matches!(&exhausted, BlockError::Terminal { reason }
+            if reason.starts_with("WYRD_VERIFICATION_422_TOOL_BUDGET_EXCEEDED")),
+        "{exhausted}"
+    );
+    assert_eq!(
+        agent.model.mock.remaining(),
+        1,
+        "no model turn follows exhaustion"
+    );
+    assert_eq!(calls.settled().len(), 3);
+
+    let fresh = CodeAgent::start(
+        &registered,
+        &permissions,
+        limits(3),
+        [code_run(CATCH), answer(Some("{\"never\": true}"), &[])],
+    )
+    .await;
+    let calls = ToolCallsOwner::default();
+    let caught = fresh
+        .step(&registered, &tools, &calls)
+        .await
+        .expect_err("exhaustion cannot be caught");
+    assert!(
+        matches!(&caught, BlockError::Terminal { reason }
+            if reason.starts_with("WYRD_VERIFICATION_422_TOOL_BUDGET_EXCEEDED")),
+        "{caught}"
+    );
+    assert_eq!(
+        fresh.model.mock.remaining(),
+        1,
+        "no model turn follows exhaustion"
+    );
+    let records = calls.settled();
+    assert_eq!(
+        records.iter().map(|record| record.tool).collect::<Vec<_>>(),
+        [
+            BuiltinTool::CodeRun,
+            BuiltinTool::FsRead,
+            BuiltinTool::FsRead
+        ],
+        "a fresh execution starts with its own allowance: {records:?}"
+    );
+}
+
+/// Released Oracle resources: no admission, memory, or peer slot held.
+const RELEASED: wyrd_testing::server::BifrostQueryResourceSnapshot =
+    wyrd_testing::server::BifrostQueryResourceSnapshot {
+        admission_slots: 0,
+        memory_bytes: 0,
+        peer_slots: 0,
+    };
+
+/// Host waits end with their invocation and are charged as Python time.
+///
+/// A program catching `RuntimeError` awaits a nested query held after its
+/// schema. Dropping the step cancels the query, which returns every Oracle
+/// resource; the later read is never dispatched and both admitted calls
+/// settle as cancelled, with no digest and no bytes. When the same wait
+/// instead outlasts the action's Python budget, the time limit ends the
+/// program, its query, and the step, which fails before the model sees
+/// anything, though the program caught every `RuntimeError`; a retry of the
+/// step gets none of the spent time back and stops the same way. A new
+/// action then runs a query to completion on the same one-worker pool.
+///
+/// # Panics
+/// Panics when a query outlives its invocation, a later call dispatches,
+/// the model answers after a time stop, spent time is restored, or the
+/// pool does not recover.
+#[tokio::test(flavor = "multi_thread")]
+async fn code_host_waits_obey_deadlines_and_cancellation() {
+    const WAIT: &str = r"try:
+    await call_tool('bifrost.query', {'sql': 'SELECT severity_text FROM bifrost.logs.records'})
+except RuntimeError:
+    pass
+await call_tool('fs.read', {'path': '/inputs/notes.txt', 'start': 0})
+";
+    const QUERY: &str = "rows = (await call_tool('bifrost.query', {'sql': 'SELECT severity_text FROM bifrost.logs.records'}))['rows']\nprint(len(rows))";
+    let registered = Registered::start().await;
+    let server = &registered.server;
+    server
+        .ensure_builtin_tables_for_test(server.data_tenant_id())
+        .await
+        .expect("tenant receives every built-in table");
+    let agent = CodeAgent::start(
+        &registered,
+        &[
+            Permission::card_read(),
+            Permission::tool_invoke_any(),
+            Permission::bifrost_query_read(),
+        ],
+        HostedLimits {
+            monty_min_workers: 0,
+            code_timeout: Duration::from_secs(2),
+            agent_code_budget: Duration::from_secs(2),
+            ..HostedLimits::default()
+        },
+        [
+            code_run(WAIT),
+            code_run(WAIT),
+            code_run("1"),
+            code_run(QUERY),
+            answer(Some("{}"), &[]),
+        ],
+    )
+    .await;
+    let tools = ["code.run", "fs.read", "bifrost.query"];
+
+    server.stall_next_query_after_schema();
+    let calls = ToolCallsOwner::default();
+    let query = {
+        let step = agent.call(&registered, "cancelled", reviewer(&tools), &calls);
+        tokio::pin!(step);
+        tokio::select! {
+            ended = &mut step => panic!("the step ended before its query stalled: {ended:?}"),
+            stalled = server.wait_query_schema_stall() => stalled.expect("the nested query stalls"),
+        }
+    };
+    // The step future dropped with its block.
+    server
+        .wait_bifrost_query_resources_released(&query, RELEASED)
+        .await
+        .expect("cancelling the step releases the query");
+    let cancelled: Vec<_> = calls
+        .settled()
+        .into_iter()
+        .map(|record| {
+            (
+                record.tool,
+                record.output_sha256,
+                record.returned_bytes,
+                record.error,
+            )
+        })
+        .collect();
+    let gone = Some("cancelled: the invocation ended before the call returned".to_owned());
+    assert_eq!(
+        cancelled,
+        [
+            (BuiltinTool::CodeRun, None, 0, gone.clone()),
+            (BuiltinTool::BifrostQuery, None, 0, gone.clone()),
+        ],
+        "the later read never dispatches"
+    );
+
+    server.stall_next_query_after_schema();
+    let calls = ToolCallsOwner::default();
+    let waited = {
+        let step = agent.call(&registered, "timed", reviewer(&tools), &calls);
+        tokio::pin!(step);
+        let query = tokio::select! {
+            ended = &mut step => panic!("the step ended before its query stalled: {ended:?}"),
+            stalled = server.wait_query_schema_stall() => stalled.expect("the nested query stalls"),
+        };
+        let ended = step.await;
+        server
+            .wait_bifrost_query_resources_released(&query, RELEASED)
+            .await
+            .expect("the time limit releases the query");
+        ended
+    };
+    let stopped = |result: Result<Value, BlockError>, expected: &str| match result {
+        Err(BlockError::Terminal { reason }) if reason.contains(expected) => {}
+        other => panic!("the step must fail with {expected:?}, got {other:?}"),
+    };
+    stopped(waited, "time limit");
+    assert_eq!(
+        agent.model.seen().len(),
+        2,
+        "no model turn follows the stop"
+    );
+    let errors: Vec<_> = calls
+        .settled()
+        .into_iter()
+        .map(|record| (record.tool, record.error.unwrap_or_default()))
+        .collect();
+    assert_eq!(
+        errors,
+        [
+            (BuiltinTool::CodeRun, errors[0].1.clone()),
+            (BuiltinTool::BifrostQuery, gone.clone().unwrap_or_default()),
+        ],
+        "the stop cancels the pending query and dispatches nothing more"
+    );
+    assert!(errors[0].1.contains("time limit"), "{errors:?}");
+    let retried = ToolCallsOwner::default();
+    stopped(
+        agent
+            .call(&registered, "timed", reviewer(&tools), &retried)
+            .await,
+        "budget is spent",
+    );
+    assert_eq!(agent.model.seen().len(), 3, "the retry asks the model once");
+    assert!(
+        retried.settled()[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("budget is spent")),
+        "a retry restores no time: {:?}",
+        retried.settled()
+    );
+
+    let fresh = ToolCallsOwner::default();
+    agent
+        .call(&registered, "fresh", reviewer(&tools), &fresh)
+        .await
+        .expect("a new action runs");
+    assert_eq!(
+        agent.model.tool_results()[0]["output"],
+        json!("0\n"),
+        "the one worker serves a new action"
+    );
+}
+
+/// Sandbox shutdown settles a program suspended on host work only once its
+/// invocation ends.
+///
+/// While a program awaits a nested query held after its schema, shutdown
+/// cannot settle by its deadline: the worker stays checked out. Ending the
+/// step drops the query, which returns every Oracle resource, and the
+/// worker's checkout; shutdown then settles and reaps, and later code is
+/// refused busy.
+///
+/// # Panics
+/// Panics when shutdown settles under a running program, the query outlives
+/// its step, or the closed sandbox admits code.
+#[tokio::test(flavor = "multi_thread")]
+async fn code_shutdown_settles_pending_host_work() {
+    let registered = Registered::start().await;
+    let server = &registered.server;
+    server
+        .ensure_builtin_tables_for_test(server.data_tenant_id())
+        .await
+        .expect("tenant receives every built-in table");
+    let agent = CodeAgent::start(
+        &registered,
+        &[
+            Permission::card_read(),
+            Permission::tool_invoke_any(),
+            Permission::bifrost_query_read(),
+        ],
+        HostedLimits {
+            monty_min_workers: 0,
+            ..HostedLimits::default()
+        },
+        [code_run(
+            "await call_tool('bifrost.query', {'sql': 'SELECT severity_text FROM bifrost.logs.records'})",
+        )],
+    )
+    .await;
+    server.stall_next_query_after_schema();
+    let calls = ToolCallsOwner::default();
+    let query = {
+        let step = agent.call(
+            &registered,
+            "shutdown",
+            reviewer(&["code.run", "bifrost.query"]),
+            &calls,
+        );
+        tokio::pin!(step);
+        let query = tokio::select! {
+            ended = &mut step => panic!("the step ended before its query stalled: {ended:?}"),
+            stalled = server.wait_query_schema_stall() => stalled.expect("the nested query stalls"),
+        };
+        assert!(
+            !agent
+                .sandbox
+                .shutdown(Instant::now() + Duration::from_millis(300))
+                .await,
+            "a suspended program keeps its worker"
+        );
+        query
+    };
+    server
+        .wait_bifrost_query_resources_released(&query, RELEASED)
+        .await
+        .expect("ending the step releases the query");
+    assert!(
+        agent
+            .sandbox
+            .shutdown(Instant::now() + Duration::from_secs(10))
+            .await,
+        "shutdown settles once the program ends"
+    );
+    let refused = agent
+        .sandbox
+        .run(
+            DataTenantId::new_v7(),
+            "def f():\n    return 1",
+            "f",
+            &serde_json::Map::new(),
+            Vec::new(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect_err("a closed sandbox admits nothing");
+    assert!(matches!(refused, BlockError::Busy { .. }), "{refused}");
 }

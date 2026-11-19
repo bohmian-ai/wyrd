@@ -12,6 +12,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+use wyrd_runtime::resources::{ByteCharge, ByteLedger};
 use wyrd_spec::gateway::{
     GATEWAY_JSON_MAX_BYTES, GatewayCallId, GatewayCallOutcome, GatewayDecimal, GatewayOperation,
     GatewayUsageAmount, ProviderDeployment,
@@ -156,6 +157,12 @@ async fn attempt(
     attempt_mode(dispatch, ingress, deployment, credential, body, false).await
 }
 
+/// An empty charge on an unbounded process memory ledger, for attempts whose
+/// retained bytes the test does not observe.
+fn unbounded() -> ByteCharge {
+    ByteLedger::new(u64::MAX).empty_charge()
+}
+
 /// Runs one chat attempt of `body` in `ingress` against `deployment`,
 /// streamed when `stream` is set.
 async fn attempt_mode(
@@ -184,6 +191,7 @@ async fn attempt_mode(
             capture: false,
             deadline: Instant::now() + Duration::from_secs(10),
             cancel: &cancel,
+            memory: &unbounded(),
         })
         .await
 }
@@ -235,7 +243,7 @@ async fn collect(result: AttemptResult) -> (Vec<u8>, bool, StreamEnd) {
     let mut aborted = false;
     while let Some(frame) = events.recv().await {
         match frame {
-            Ok(frame) => bytes.extend(frame),
+            Ok(frame) => bytes.extend_from_slice(&frame),
             Err(_) => aborted = true,
         }
     }
@@ -1258,6 +1266,7 @@ async fn embeddings_preserve_batches_and_reject_invalid_requests() {
             capture: false,
             deadline: later(),
             cancel: &cancel,
+            memory: &unbounded(),
         })
         .await;
     let AttemptResult::Completed {
@@ -1320,6 +1329,63 @@ fn payloads(bytes: &[u8]) -> Vec<String> {
         .filter_map(|frame| frame.strip_prefix("data: "))
         .map(str::to_owned)
         .collect()
+}
+
+/// A translated Gemini stream relays only the candidates the caller asked
+/// for: a candidate index at or beyond the requested `n` is a provider
+/// protocol failure, so a provider cannot make the relay remember an
+/// unbounded set of choices.
+///
+/// # Panics
+///
+/// Panics when the out-of-range candidate is relayed or the stream does not
+/// end as an upstream failure.
+#[tokio::test]
+async fn a_gemini_candidate_beyond_the_requested_count_fails_the_stream() {
+    let requested = concat!(
+        "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Sun\"}]},\"index\":1}]}\r\n\r\n",
+        "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ny\"}]},\"finishReason\":\"STOP\",\"index\":0},{\"content\":{\"role\":\"model\",\"parts\":[]},\"finishReason\":\"STOP\",\"index\":1}]}\r\n\r\n",
+    );
+    let rogue = "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"rogue\"}]},\"index\":2}]}\r\n\r\n";
+    let gemini = deployment(
+        "gemini/gemini-2.5-flash",
+        json!("gemini"),
+        api_key("x-goog-api-key"),
+    );
+    let chat = json!({"model": "m", "n": 2, "stream": true, "messages": [{"role": "user", "content": "hi"}]});
+    let mut relayed = Vec::new();
+    for answer in [requested.to_owned(), format!("{rogue}{requested}")] {
+        let server = MockServer::start().await;
+        events(
+            &server,
+            "/v1beta/models/gemini-2.5-flash:streamGenerateContent",
+            &answer,
+        )
+        .await;
+        let result = attempt_mode(
+            &dispatch(&server),
+            IngressDialect::OpenAi,
+            &gemini,
+            Some("key"),
+            &chat,
+            true,
+        )
+        .await;
+        let (bytes, _, end) = collect(result).await;
+        relayed.push((String::from_utf8(bytes).expect("utf-8 frames"), end.outcome));
+    }
+    let (within, outcome) = &relayed[0];
+    assert!(
+        within.contains("\"index\":1"),
+        "the second requested choice relays: {within}"
+    );
+    assert_eq!(*outcome, GatewayCallOutcome::Succeeded);
+    let (beyond, outcome) = &relayed[1];
+    assert!(
+        !beyond.contains("rogue"),
+        "an unrequested choice is not relayed: {beyond}"
+    );
+    assert_eq!(*outcome, GatewayCallOutcome::Failed);
 }
 
 /// Translated Anthropic and Gemini streams become `OpenAI` chat completion
@@ -1497,6 +1563,7 @@ async fn open_stream(
             capture: false,
             deadline,
             cancel: &cancel,
+            memory: &unbounded(),
         })
         .await;
     collect(result).await
@@ -1721,6 +1788,204 @@ async fn deadline_and_cancellation_end_in_terminal_errors() {
         assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
         assert!(upstream.await.expect("upstream task"), "upstream closed");
     }
+}
+
+/// Serves one streaming answer whose whole `body` is written at once, then
+/// holds the connection until the gateway closes it.
+///
+/// # Panics
+///
+/// Panics when the listener cannot bind, accept, or read.
+async fn served_stream(body: String) -> u16 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let mut buffer = [0_u8; 4096];
+        let mut request = Vec::new();
+        while !String::from_utf8_lossy(&request).contains("\r\n\r\n") {
+            let read = socket.read(&mut buffer).await.expect("read");
+            if read == 0 {
+                return;
+            }
+            request.extend_from_slice(&buffer[..read]);
+        }
+        let head = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n",
+            body.len()
+        );
+        // A gateway that stops reading leaves these writes pending.
+        if socket.write_all(head.as_bytes()).await.is_ok()
+            && socket.write_all(body.as_bytes()).await.is_ok()
+        {
+            let _closed = socket.read(&mut buffer).await;
+        }
+    });
+    port
+}
+
+/// A caller that stops reading leaves the relay's queue full of frames that
+/// process memory is charged for: each frame is at most
+/// [`super::stream::FRAME_BYTES`], so the queued frames are bounded by
+/// bytes, and a frame the caller took stays charged until it drops, after
+/// the stream itself completed.
+///
+/// # Panics
+///
+/// Panics when the stream does not open or complete, or the charged bytes
+/// are zero while frames wait, exceed the bound, or outlive the frames.
+#[tokio::test]
+async fn a_stalled_reader_holds_only_charged_bounded_frames() {
+    use super::stream::{FRAME_BUFFER, FRAME_BYTES};
+
+    let pad = "x".repeat(1_000);
+    let mut answer = format!("data: {{\"choices\":[],\"pad\":\"{pad}\"}}\n\n").repeat(1_024);
+    answer.push_str("data: [DONE]\n\n");
+    let port = served_stream(answer.clone()).await;
+    let compatible = deployment(
+        "acme/m",
+        json!({"openai_compatible": {"base_url": format!("http://127.0.0.1:{port}/v1")}}),
+        bearer(),
+    );
+    let dispatch =
+        HttpProviderDispatch::new(EndpointPolicy::new(false), BuiltinEndpoints::default())
+            .expect("dispatch builds");
+    let ledger = ByteLedger::new(u64::MAX);
+    let cancel = CancellationToken::new();
+    let secret = ProviderSecret::new("sk".to_owned().into());
+    let result = dispatch
+        .dispatch(ProviderAttempt {
+            call_id: GatewayCallId::from_uuid(uuid::Uuid::from_u128(0xabc)),
+            ordinal: NonZeroU32::MIN,
+            operation: GatewayOperation::ChatCompletions,
+            ingress: IngressDialect::OpenAi,
+            deployment: &compatible,
+            model: model_of(&compatible),
+            credential: Some(&secret),
+            body: &request(&json!({"model": "m", "messages": [], "stream": true})),
+            media: None,
+            batch: None,
+            stream: true,
+            capture: false,
+            deadline: Instant::now() + Duration::from_secs(10),
+            cancel: &cancel,
+            memory: &ledger.empty_charge(),
+        })
+        .await;
+    let AttemptResult::Completed {
+        body: ResponseBody::Events(mut events),
+        ..
+    } = result
+    else {
+        panic!("event stream expected, got {result:?}");
+    };
+    let end = events.end.take().expect("end receiver");
+    let first = events
+        .recv()
+        .await
+        .expect("a first frame")
+        .expect("the stream is open");
+
+    // The caller stops reading; the relay keeps reading until its queue
+    // is full.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while events.frames.len() < FRAME_BUFFER {
+            assert!(!events.frames.is_closed(), "the relay ended early");
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the relay fills its queue");
+    let held = ledger.used();
+    assert!(
+        held > u64::try_from(first.len()).expect("length"),
+        "queued frames are charged: {held}"
+    );
+    // The taken frame, the queue, and the one frame awaiting a slot.
+    let bound = (FRAME_BUFFER + 2) * FRAME_BYTES;
+    assert!(
+        held <= u64::try_from(bound).expect("bound"),
+        "{held} bytes exceed the {bound}-byte bound"
+    );
+
+    let mut relayed = first.len();
+    while let Some(frame) = events.recv().await {
+        let frame = frame.expect("the stream terminates");
+        assert!(frame.len() <= FRAME_BYTES, "a {}-byte frame", frame.len());
+        relayed += frame.len();
+    }
+    assert_eq!(relayed, answer.len(), "every byte arrives");
+    drop(events);
+    assert_eq!(
+        end.await.expect("the relay reports its end").outcome,
+        GatewayCallOutcome::Succeeded
+    );
+    assert_eq!(
+        ledger.used(),
+        u64::try_from(first.len()).expect("length"),
+        "a frame the caller still holds stays charged"
+    );
+    drop(first);
+    assert_eq!(ledger.used(), 0, "every frame's charge returns");
+}
+
+/// A frame process memory cannot hold is discarded and the stream ends with
+/// the existing capacity error as its in-band terminal error, a failed
+/// outcome, and no charge left behind.
+///
+/// # Panics
+///
+/// Panics when the stream does not open, relays the refused frame, ends
+/// without the capacity error, or leaves bytes charged.
+#[tokio::test]
+async fn a_frame_memory_cannot_hold_ends_the_stream_with_capacity() {
+    let port = served_stream("data: {\"choices\":[]}\n\ndata: [DONE]\n\n".to_owned()).await;
+    let compatible = deployment(
+        "acme/m",
+        json!({"openai_compatible": {"base_url": format!("http://127.0.0.1:{port}/v1")}}),
+        bearer(),
+    );
+    let dispatch =
+        HttpProviderDispatch::new(EndpointPolicy::new(false), BuiltinEndpoints::default())
+            .expect("dispatch builds");
+    // Too small for the provider's first frame.
+    let ledger = ByteLedger::new(8);
+    let cancel = CancellationToken::new();
+    let secret = ProviderSecret::new("sk".to_owned().into());
+    let result = dispatch
+        .dispatch(ProviderAttempt {
+            call_id: GatewayCallId::from_uuid(uuid::Uuid::from_u128(0xabc)),
+            ordinal: NonZeroU32::MIN,
+            operation: GatewayOperation::ChatCompletions,
+            ingress: IngressDialect::OpenAi,
+            deployment: &compatible,
+            model: model_of(&compatible),
+            credential: Some(&secret),
+            body: &request(&json!({"model": "m", "messages": [], "stream": true})),
+            media: None,
+            batch: None,
+            stream: true,
+            capture: false,
+            deadline: Instant::now() + Duration::from_secs(10),
+            cancel: &cancel,
+            memory: &ledger.empty_charge(),
+        })
+        .await;
+    let (relayed, aborted, end) = collect(result).await;
+    let relayed = String::from_utf8(relayed).expect("utf-8 frames");
+    assert!(!aborted, "the capacity error terminates the stream");
+    assert!(
+        !relayed.contains("\"choices\""),
+        "the refused frame is discarded: {relayed}"
+    );
+    assert!(
+        relayed.contains("WYRD_SERVER_503_SERVICE_UNAVAILABLE"),
+        "the capacity error is the terminal error: {relayed}"
+    );
+    assert_eq!(end.outcome, GatewayCallOutcome::Failed);
+    assert_eq!(ledger.used(), 0, "nothing stays charged");
 }
 
 /// Dropping the caller's stream aborts the upstream request: the provider
@@ -2292,6 +2557,7 @@ async fn media_attempt(
             capture: false,
             deadline: later(),
             cancel: &cancel,
+            memory: &unbounded(),
         })
         .await
 }
@@ -2440,6 +2706,7 @@ async fn media_capturing(
             capture,
             deadline: later(),
             cancel: &cancel,
+            memory: &unbounded(),
         })
         .await
 }
@@ -2817,6 +3084,7 @@ async fn batch_actions_reach_their_routes_with_native_files() {
                     capture: false,
                     deadline: later(),
                     cancel,
+                    memory: &unbounded(),
                 })
                 .await
         }
@@ -3030,6 +3298,7 @@ async fn embeddings_attempt(encoding: &str, answer: &Value) -> AttemptResult {
             capture: false,
             deadline: later(),
             cancel: &cancel,
+            memory: &unbounded(),
         })
         .await;
     received(&server).await;
@@ -3206,7 +3475,7 @@ async fn dropping_a_speech_stream_closes_the_upstream_connection() {
         panic!("speech stream expected: {spoken:?}");
     };
     let first = events.recv().await.expect("first chunk").expect("chunk");
-    assert_eq!(first, b"abc");
+    assert_eq!(&*first, b"abc");
     drop(events);
     assert!(upstream.await.expect("upstream task"), "upstream closed");
 }
@@ -3278,6 +3547,7 @@ async fn capturing(
             capture: true,
             deadline: later(),
             cancel: &cancel,
+            memory: &unbounded(),
         })
         .await
 }
@@ -3434,6 +3704,7 @@ async fn image_capturing(
             capture: true,
             deadline: later(),
             cancel: &cancel,
+            memory: &unbounded(),
         })
         .await
 }
@@ -3675,6 +3946,7 @@ async fn held_open_streams_settle_at_their_terminator() {
                 capture: true,
                 deadline: later(),
                 cancel: &cancel,
+                memory: &unbounded(),
             })
             .await;
         let (bytes, aborted, end) = tokio::time::timeout(Duration::from_secs(10), collect(result))
@@ -3903,6 +4175,7 @@ async fn jev_attempt(
             capture: false,
             deadline: later(),
             cancel: &cancel,
+            memory: &unbounded(),
         })
         .await
 }

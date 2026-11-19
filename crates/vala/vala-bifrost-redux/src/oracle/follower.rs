@@ -1315,7 +1315,8 @@ pub(crate) mod tests {
                 )),
                 0,
             )
-            .expect("governed follower runtime"),
+            .expect("governed follower runtime")
+            .0,
             granted_memory_bytes,
             target_partitions,
         )

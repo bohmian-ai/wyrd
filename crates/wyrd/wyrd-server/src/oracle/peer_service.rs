@@ -23,6 +23,7 @@ use vala_bifrost_redux::oracle::peer::{
     PeerSecurityAudit, PeerTicketClaims, PeerTicketVerifier, ReservationBinding,
     ReservationOperationV1,
 };
+use wyrd_runtime::resources::Workload;
 use wyrd_spec::vala::api::BifrostSecurityViolationKind;
 use wyrd_spec::vala::api::{ClusterRole, ExecuteFragmentRequest};
 use wyrd_tonic::private_conversion::PrivateConversionError;
@@ -350,9 +351,20 @@ impl ScribeFragmentExecutor {
                 tracing::error!(%error, "Scribe follower execution could not be built");
                 DispatchError::Terminal
             })?;
-        let execution = scribe
-            .fragment_follower()
-            .execute(&request, authenticated, &follower)
+        // Decode, execution start, and every batch poll are this tenant's
+        // Bifrost CPU work on the pod's shared lanes, so DataFusion tasks they
+        // spawn inherit the lane context; no lane is held between polls.
+        let resources = scribe.resources();
+        let workloads = resources.workloads();
+        let operation = workloads.begin(Workload::Bifrost, Some(tenant_id), None);
+        let (lanes, context) = (workloads.lanes().clone(), operation.context());
+        let execution = lanes
+            .laned(
+                context,
+                scribe
+                    .fragment_follower()
+                    .execute(&request, authenticated, &follower),
+            )
             .await
             .map_err(|error| {
                 tracing::warn!(?error, "Scribe physical follower could not start");
@@ -366,8 +378,9 @@ impl ScribeFragmentExecutor {
         let scribe_owner = Arc::clone(scribe);
         let plan_fingerprint = request.plan_fingerprint;
         let output = async_stream::try_stream! {
+            let _operation = operation;
             let mut tally = NativeOutputTally::default();
-            while let Some(batch) = batches.next().await {
+            while let Some(batch) = lanes.laned(context, batches.next()).await {
                 let batch = batch.map_err(|error| {
                     // The classification below keeps only a closed outcome, so
                     // without this the cause of a failed hot-tail fragment is

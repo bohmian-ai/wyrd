@@ -150,6 +150,8 @@ impl EvidenceInvestigation {
                     result: RequirementResult {
                         id: TaskId::new(id)?,
                         step: None,
+                        item_index: None,
+                        iteration_index: None,
                         statement: statement.to_owned(),
                         outcome: RequirementOutcome::Failed,
                         reason: "seeded failure".to_owned(),
@@ -160,6 +162,7 @@ impl EvidenceInvestigation {
                     },
                     check: serde_json::from_value::<Check>(check)?,
                     provenance: None,
+                    tool_calls: Vec::new(),
                 }],
                 steps: Vec::new(),
                 evidence: std::collections::BTreeMap::new(),
@@ -220,6 +223,7 @@ impl EvidenceInvestigation {
                 ScribeWrite::Result {
                     payload,
                     attribution: Attribution::direct(PrincipalId::new(seed.system_principal())),
+                    acked: std::sync::Mutex::new(None),
                 },
             );
         }

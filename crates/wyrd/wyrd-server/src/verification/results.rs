@@ -27,7 +27,8 @@ use serde_json::Error as JsonError;
 use vala_bifrost_redux::tables::DomainTable;
 use vala_bifrost_redux::tables::staged::{Cell, StagedRow};
 use vala_bifrost_redux::tables::verification::{
-    ACTIVATION, ExecutionInputsTable, ExecutionOutputsTable, INPUTS, OUTPUT, ResultsTable,
+    ACTIVATION, ExecutionEventsTable, ExecutionInputsTable, ExecutionOutputsTable, INPUTS, OUTPUT,
+    ResultsTable, VALUE,
 };
 use wyrd_queue::variant::EncodedVariant;
 use wyrd_runtime::request_context::AcceptedAuthority;
@@ -41,7 +42,7 @@ use wyrd_spec::vala::managed_columns::{
 };
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::{
-    ExecutedOutcome, ExecutedRequirement, InputDeclaration, StepResult,
+    ExecutedOutcome, ExecutedRequirement, InputDeclaration, PullRequestActivation, StepResult,
 };
 use wyrd_spec::verification::{DriftWindow, FrozenTarget, VerificationVerdict};
 use wyrd_sql::queries::verifier_executions::Submission;
@@ -89,7 +90,7 @@ type NamedColumn = (&'static str, Cell);
 /// Each result row is staged on its own until the Scribe outbox builds a
 /// slice of them into one batch, so one shared schema lets the outbox group
 /// rows by pointer and spares every row its own field allocations.
-static SCHEMAS: LazyLock<[(TypeId, String, SchemaRef); 3]> = LazyLock::new(|| {
+static SCHEMAS: LazyLock<[(TypeId, String, SchemaRef); 4]> = LazyLock::new(|| {
     /// `T`'s name and fields followed by the correlation columns, keyed by `T`.
     fn schema<T: DomainTable + 'static>() -> (TypeId, String, SchemaRef) {
         let mut fields = T::arrow_fields();
@@ -104,8 +105,22 @@ static SCHEMAS: LazyLock<[(TypeId, String, SchemaRef); 3]> = LazyLock::new(|| {
         schema::<ResultsTable>(),
         schema::<ExecutionOutputsTable>(),
         schema::<ExecutionInputsTable>(),
+        schema::<ExecutionEventsTable>(),
     ]
 });
+
+/// The schema every execution state revision's row fills.
+///
+/// # Panics
+/// Panics only if [`SCHEMAS`] lacked the execution events table, which its
+/// construction rules out.
+pub(crate) fn checkpoint_schema() -> &'static SchemaRef {
+    &SCHEMAS
+        .iter()
+        .find(|(table, _, _)| *table == TypeId::of::<ExecutionEventsTable>())
+        .expect("every result table has a shared schema")
+        .2
+}
 
 /// The correlation columns every result row carries after its table's
 /// fields, in this order.
@@ -200,6 +215,8 @@ pub enum InputRecord<'r> {
     Group(&'r GroupSelector),
     /// A scheduled drift execution's frozen observation selection.
     Schedule(&'r ScheduleSelector),
+    /// A pull-request execution's frozen repository, PR, base and head pins.
+    PullRequest(&'r PullRequestActivation),
 }
 
 /// The identities of the execution a result belongs to.
@@ -288,7 +305,20 @@ impl<'a> ResultPayloadBuilder<'a> {
     /// [`ResultPayloadError::Variant`] when the outcome exceeds a Variant
     /// limit, and a JSON or Arrow error when encoding fails.
     pub fn build(&self, outcome: &ExecutedOutcome) -> Result<ResultPayload, ResultPayloadError> {
-        let result_id = VerificationResultId::new_v7();
+        self.build_as(VerificationResultId::new_v7(), outcome)
+    }
+
+    /// Map `outcome` to its ordered rows under `result_id`, the identity an
+    /// execution's state already selected, so delivering a selected outcome
+    /// again writes the same result.
+    ///
+    /// # Errors
+    /// As [`Self::build`].
+    pub fn build_as(
+        &self,
+        result_id: VerificationResultId,
+        outcome: &ExecutedOutcome,
+    ) -> Result<ResultPayload, ResultPayloadError> {
         let output = StoredOutput {
             requirements: &outcome.requirements,
             steps: &outcome.steps,
@@ -356,8 +386,8 @@ impl<'a> ResultPayloadBuilder<'a> {
     /// `bifrost.verification.execution_inputs` row, recorded at `started_at`.
     ///
     /// The row's `origin` names the record kind and its `inputs` Variant holds
-    /// the supplied declarations or the selector. Every queued origin,
-    /// submitted, group, or schedule, marks the row `queue_execution`; a
+    /// the supplied declarations, the selector, or the PR pins. Every queued
+    /// origin, submitted, group, schedule, or pull request, marks the row `queue_execution`; a
     /// direct row never queues work. Only a submission records its accepted
     /// request context — route overrides, idempotency key and request
     /// digest, and the accepted authority — as the `activation` Variant.
@@ -379,6 +409,7 @@ impl<'a> ResultPayloadBuilder<'a> {
             ),
             InputRecord::Group(selector) => (InputOrigin::Group, encoded(selector)?, None),
             InputRecord::Schedule(selector) => (InputOrigin::Schedule, encoded(selector)?, None),
+            InputRecord::PullRequest(pins) => (InputOrigin::PullRequest, encoded(pins)?, None),
         };
         let activation = submission.map(|submission| Activation {
             route_overrides: &submission.request.execution_route_overrides,
@@ -405,6 +436,56 @@ impl<'a> ResultPayloadBuilder<'a> {
             (INPUTS, inputs),
             (ACTIVATION, variant(ACTIVATION, activation.as_ref())?),
             ("recorded_at", time(Some(self.started_at))),
+        ])
+    }
+
+    /// One accepted revision of an execution's recoverable state as its
+    /// `bifrost.verification.execution_events` row: `sequence` is the
+    /// revision, `status` is `terminal` once an outcome is selected and
+    /// `running` before, and the value is the complete `state`. The row
+    /// carries the run's shared dimensions and correlation columns.
+    ///
+    /// # Errors
+    /// Returns a Variant error when the state cannot be encoded, and the
+    /// [`Self::finish`] errors.
+    pub fn checkpoint(
+        &self,
+        revision: i64,
+        terminal: bool,
+        state: &serde_json::Value,
+    ) -> Result<ResultRow, ResultPayloadError> {
+        let none = || Cell::text(None::<&str>);
+        self.finish::<ExecutionEventsTable>(vec![
+            (
+                "event_id",
+                Cell::text(Some(uuid::Uuid::now_v7().to_string())),
+            ),
+            (
+                "execution_id",
+                Cell::text(Some(self.run.execution_id.to_string())),
+            ),
+            ("sequence", Cell::Int(Some(revision))),
+            ("event", Cell::text(Some("checkpoint"))),
+            (
+                "status",
+                Cell::text(Some(if terminal { "terminal" } else { "running" })),
+            ),
+            (
+                "verifier_card_uid",
+                Cell::text(Some(self.verifier_uid.as_str())),
+            ),
+            ("step_id", none()),
+            ("item_index", Cell::Int(None)),
+            ("iteration_index", Cell::Int(None)),
+            ("attempt", Cell::Int(None)),
+            ("publication_name", none()),
+            ("publication_kind", none()),
+            ("size_bytes", Cell::Int(None)),
+            ("file_count", Cell::Int(None)),
+            ("sha256", none()),
+            ("reason", none()),
+            (VALUE, variant(VALUE, Some(state))?),
+            ("occurred_at", time(Some(Utc::now()))),
         ])
     }
 
@@ -661,6 +742,8 @@ mod tests {
             result: RequirementResult {
                 id: TaskId::new(id).expect("valid task id"),
                 step: None,
+                item_index: None,
+                iteration_index: None,
                 statement: id.to_owned(),
                 outcome: RequirementOutcome::Failed,
                 reason: "drifted".to_owned(),
@@ -674,6 +757,7 @@ mod tests {
             }))
             .expect("assert check decodes"),
             provenance: None,
+            tool_calls: Vec::new(),
         };
         ExecutedOutcome {
             verdict: VerificationVerdict::Failed,

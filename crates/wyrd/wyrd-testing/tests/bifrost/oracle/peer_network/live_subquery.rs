@@ -15,7 +15,7 @@ use datafusion_proto::protobuf::physical_plan_node::PhysicalPlanType;
 use serde::Deserialize;
 use vala_bifrost_redux::oracle::codec::remote_scan_filter_for_test;
 use wyrd_client::bifrost::BifrostClientError;
-use wyrd_server::config::BifrostTarget;
+use wyrd_server::config::ServerTarget;
 use wyrd_tonic::prost::Message as _;
 
 use super::support::PeerJourneyError;
@@ -407,9 +407,9 @@ async fn prove_remote_live_join_returns_its_rows() -> Result<(), PeerJourneyErro
 /// Returns the cluster, registration, or ingest failure.
 async fn seed() -> Result<LiveTables, PeerJourneyError> {
     let cluster = PeerCluster::start(&[
-        BifrostTarget::Oracle,
-        BifrostTarget::Oracle,
-        BifrostTarget::Scribe,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostQuery,
+        ServerTarget::BifrostIngest,
     ])
     .await?;
     let now = chrono::Utc::now().timestamp_micros();

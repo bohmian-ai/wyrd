@@ -106,6 +106,41 @@ unsafe impl GlobalAlloc for CountingMiMalloc {
     }
 }
 
+/// Bytes mimalloc has committed for this process: its aggregate commitment
+/// statistic, which the release allocator keeps without detailed statistics.
+///
+/// The server samples it for process pressure and a worker reports it in its
+/// telemetry; it overlaps the server's ledger and is never added to it.
+fn committed_bytes() -> u64 {
+    let mut fields = [0_usize; 8];
+    let [
+        elapsed,
+        user,
+        system,
+        rss,
+        peak_rss,
+        commit,
+        peak_commit,
+        faults,
+    ] = &mut fields;
+    // SAFETY: every argument points at a distinct live `usize`, which is all
+    // `mi_process_info` writes through.
+    #[expect(unsafe_code, reason = "mimalloc's statistics are a C API")]
+    unsafe {
+        libmimalloc_sys::mi_process_info(
+            elapsed,
+            user,
+            system,
+            rss,
+            peak_rss,
+            commit,
+            peak_commit,
+            faults,
+        );
+    }
+    u64::try_from(fields[5]).unwrap_or(u64::MAX)
+}
+
 const EX_CONFIG: i32 = 78;
 const EX_SOFTWARE: i32 = 70;
 
@@ -170,7 +205,7 @@ struct SetupArgs {
 /// The worker check runs before any runtime, CLI, or telemetry exists, so a
 /// worker process holds only the interpreter thread and its own heap count.
 fn main() -> std::process::ExitCode {
-    if let Some(code) = worker::dispatch() {
+    if let Some(code) = worker::dispatch(committed_bytes) {
         return code;
     }
     server_main();
@@ -192,7 +227,7 @@ async fn server_main() {
     // `None` arm stays byte-for-byte today's `run()`.
     let cli = Cli::parse();
     let result = match cli.command {
-        None => Box::pin(run(cli.mode)).await,
+        None => Box::pin(run(cli.mode, committed_bytes)).await,
         Some(Command::Init) => init().await,
         Some(Command::RecoverRoot) => recover_root().await,
         Some(Command::Migrate) => migrate().await,
@@ -492,4 +527,26 @@ async fn operator_pool() -> Result<OperatorPool, BootExit> {
             "platform control plane is not configured; set the platform-admin DSN",
         )))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::committed_bytes;
+
+    /// The pressure sampler reads the allocator's live commitment, which
+    /// always covers a touched block the process still holds.
+    ///
+    /// # Panics
+    /// Panics when the reading is below the held 64 MiB block.
+    #[test]
+    fn committed_bytes_follow_touched_allocations() {
+        const BLOCK: usize = 64 << 20;
+        let block = std::hint::black_box(vec![1_u8; BLOCK]);
+        let committed = committed_bytes();
+        assert!(
+            committed >= BLOCK as u64,
+            "a held, touched {BLOCK}-byte block is committed: {committed}"
+        );
+        drop(block);
+    }
 }

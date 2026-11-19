@@ -337,6 +337,8 @@ class DataModel(Protocol):
         """
         ...
 
+Speculation: TypeAlias = Literal["none", "pending", "admitted", "discarded", "blocked"]
+
 class RequirementResult(TypedDict, Generic[DataT]):
     """One requirement's judgment.
 
@@ -359,11 +361,16 @@ class RequirementDetails(RequirementResult[DataT], Generic[DataT]):
     """One requirement's judgment beside what produced it.
 
     ``check`` is the Verifier Card's check declaration as authored, never
-    compiled; ``provenance`` is the call that judged it, when one did.
+    compiled; ``provenance`` is the call that judged it, when one did;
+    ``tool_calls`` are the tools an Agent check called, direct and nested,
+    absent for every other check.
     """
 
     check: CheckWire
     provenance: NotRequired[CallProvenance]
+    item_index: NotRequired[int | None]
+    iteration_index: NotRequired[int | None]
+    tool_calls: NotRequired[list[ToolCallRecord]]
 
 BuiltinTool: TypeAlias = Literal[
     "cards.list",
@@ -375,14 +382,25 @@ BuiltinTool: TypeAlias = Literal[
     "fs.read",
     "fs.search",
     "fs.extract",
+    "fs.write",
     "code.run",
+    "publish",
 ]
 
+ToolRecipient: TypeAlias = Literal["model", "code"]
+
 class ToolCallRecord(TypedDict):
-    """One tool call an Agent action made; the raw output is never kept."""
+    """One tool call an Agent step or check made, directly or from its Python.
+
+    ``recipient`` is ``model`` for a call the model made and ``code`` for one
+    a ``code.run`` program awaited; ``output_sha256`` and ``returned_bytes``
+    describe the bounded output that recipient received. The raw output is
+    never kept.
+    """
 
     tool: BuiltinTool
     arguments: JsonValue
+    recipient: ToolRecipient
     output_sha256: NotRequired[str]
     returned_bytes: int
     error: NotRequired[str]
@@ -442,8 +460,16 @@ class VerificationError(TypedDict):
     message: str
 
 ExecutionStatus: TypeAlias = Literal[
-    "pending", "running", "retrying", "completed", "cancelled", "timed_out", "errored"
+    "pending",
+    "running",
+    "retrying",
+    "waiting",
+    "completed",
+    "cancelled",
+    "timed_out",
+    "errored",
 ]
+"""``waiting``: parked until the deferred inputs in ``waiting`` are published."""
 
 class FrozenUid(TypedDict):
     """A dispatch's frozen Operator Card UID."""
@@ -474,6 +500,163 @@ class GroupSnapshot(TypedDict):
 
     sources: dict[str, GroupSourceSnapshot]
 
+class Producer(TypedDict):
+    """The exact invocation attempt of a step: zero-based item and iteration, one-based attempt.
+
+    Pages always carry ``item_index`` and ``iteration_index``, ``None``
+    without fanout or repeat; a selector may omit them.
+    """
+
+    step_id: str
+    item_index: NotRequired[int | None]
+    iteration_index: NotRequired[int | None]
+    attempt: int
+
+class ExecutionInvocation(TypedDict):
+    """One invocation attempt and its progress."""
+
+    producer: Producer
+    state: Literal["started", "action", "requirement"]
+    status: NotRequired[Literal["succeeded", "failed", "skipped"]]
+    outcome: NotRequired[RequirementOutcome]
+    reason: str | None
+    speculation: Speculation
+
+class HistoryProjection(TypedDict):
+    """How many of the execution's history batches Bifrost acknowledged, holds, or failed."""
+
+    acknowledged: int
+    pending: int
+    failed: int
+
+class InvocationPage(TypedDict):
+    """``Execution.invocations()``: one page of invocation attempts in commit order."""
+
+    execution_id: str
+    status: ExecutionStatus
+    items: list[ExecutionInvocation]
+    next_cursor: str | None
+    history: HistoryProjection
+
+PublicationKind: TypeAlias = Literal["file", "directory", "json"]
+
+class PublicationSummary(TypedDict):
+    """One accepted publication's name, kind, and producer, never its content."""
+
+    name: str
+    kind: PublicationKind
+    producer: Producer
+    speculation: Speculation
+
+class PublicationPage(TypedDict):
+    """``Execution.publications()``: one page of accepted publications in commit order."""
+
+    execution_id: str
+    items: list[PublicationSummary]
+    next_cursor: str | None
+
+class PublicationFile(TypedDict):
+    """One retained regular file."""
+
+    path: str
+    sha256: str
+    size_bytes: int
+
+class PublicationManifest(TypedDict):
+    """The immutable files and directories of a file or directory publication."""
+
+    files: list[PublicationFile]
+    directories: list[str]
+
+class Publication(TypedDict):
+    """``Execution.publication()``: a JSON ``value`` or a file or directory ``manifest``."""
+
+    name: str
+    producer: Producer
+    kind: PublicationKind
+    value: NotRequired[JsonValue]
+    manifest: NotRequired[PublicationManifest]
+
+class DownloadPlan(TypedDict):
+    """Where to fetch the bytes."""
+
+    get_url: str
+    ttl_secs: int
+    """URL lifetime in seconds; ``0`` for the local server route, which does not expire."""
+
+class DownloadInit(TypedDict):
+    """``Execution.download()``: the plan, size, and base64 SHA-256 of one retained file."""
+
+    plan: DownloadPlan
+    size_bytes: int
+    sha256: str
+
+class CancelledExecution(TypedDict):
+    """``Execution.cancel()``: the execution and its status after the cancel."""
+
+    execution_id: str
+    status: ExecutionStatus
+
+class PullRequestRef(TypedDict):
+    """One side of a pull request as an admission pinned it: the branch and exact commit."""
+
+    ref: str
+    sha: str
+
+class PullRequestActivation(TypedDict):
+    """The pull request source a queued execution was admitted for.
+
+    Every execution of one admission shares its ``generation``. A newer source
+    of the same pull request cancels unfinished work with
+    ``pull_request_superseded``; close, draft conversion and lost repository
+    access cancel it with ``pull_request_closed``, ``pull_request_draft`` and
+    ``repository_access_lost``. Settled history keeps these pins.
+    """
+
+    generation: str
+    host: str
+    repository_id: str
+    number: int
+    base: PullRequestRef
+    head: PullRequestRef
+    head_repository_id: NotRequired[str | None]
+    """Differs from ``repository_id`` for a fork; absent once the fork is deleted."""
+    delivery_id: str
+    """Provider delivery that admitted the source."""
+
+ApprovalStatus: TypeAlias = Literal["pending", "approved", "rejected", "expired"]
+"""Where one approval occurrence stands; ``expired`` ends with its execution."""
+
+class ApprovalOccurrence(TypedDict):
+    """One approval occurrence an execution reached, pending or decided.
+
+    It expires with the execution's own deadline; there is no per-approval
+    deadline. ``actor_id``, ``decided_at`` and ``reason`` are ``None`` until
+    a person decides it, and stay ``None`` for an expired occurrence.
+    """
+
+    approval_id: str
+    step_id: str
+    item: NotRequired[int]
+    """Zero-based fanout item, for a fanout step."""
+    iteration: NotRequired[int]
+    """Zero-based repeat iteration, for a repeating step."""
+    message: str
+    status: ApprovalStatus
+    actor_id: str | None
+    decided_at: str | None
+    reason: str | None
+
+class ApprovalReceipt(TypedDict):
+    """``Execution.decide()``: the durable decision of one approval occurrence."""
+
+    approval_id: str
+    status: ApprovalStatus
+    actor_id: str | None
+    decided_at: str | None
+    """RFC 3339 UTC time the decision was accepted."""
+    reason: str | None
+
 class ExecutionState(TypedDict, Generic[DataT]):
     """``Execution.status()``: the lifecycle, terminal error, visible result, and grouping."""
 
@@ -485,6 +668,102 @@ class ExecutionState(TypedDict, Generic[DataT]):
     group_id: NotRequired[str]
     owner_card_uid: NotRequired[str]
     group: NotRequired[GroupSnapshot]
+    pull_request: NotRequired[PullRequestActivation]
+    waiting: NotRequired[list[str]]
+    """The deferred inputs a ``waiting`` execution is parked for."""
+    approvals: NotRequired[list[ApprovalOccurrence]]
+    """Every approval occurrence the execution reached, in step order."""
+
+class EvidenceRepository(TypedDict):
+    """The connected repository a publication's slug resolved to."""
+
+    host: str
+    repository_id: str
+
+class EvidenceTags(TypedDict):
+    """The source a publication matches on: only the commit."""
+
+    commit: str
+
+class EvidenceReceipt(TypedDict):
+    """``Evidence.publish``: the durable receipt.
+
+    ``status`` is ``accepted`` when a subscribed Verifier received the
+    evidence for the first time and ``replayed`` when every one already held
+    it; ``recorded_at`` is the RFC 3339 UTC time it was first accepted.
+    """
+
+    evidence_id: str
+    repository: EvidenceRepository
+    tags: EvidenceTags
+    input: str
+    status: Literal["accepted", "replayed"]
+    matched_subscriptions: int
+    recorded_at: str
+
+class Evidence:
+    """Publish evidence for a Verifier input declared ``deferred: true``.
+
+    Every Verifier bound to the repository, or already executing for the
+    commit, that declares the input receives the evidence, and its waiting
+    executions resume; publishing never starts an execution::
+
+        Evidence().publish("ci", {"status": "green"})
+        Evidence().publish("report", File("report.pdf"), repository="acme/web", commit=sha)
+    """
+
+    def __init__(self, client: WyrdClient | None = None) -> None:
+        """Build a publisher; no IO or credential resolution happens here.
+
+        Args:
+            client: the ``WyrdClient`` to act as. Omitted, the ambient client
+                resolves from ``config.toml``, then the environment, then the
+                saved ``wyrd auth login``.
+        """
+        ...
+
+    @staticmethod
+    def connect(client: WyrdClient | None = None) -> Evidence:
+        """Build a publisher and connect it now.
+
+        Args:
+            client: the ``WyrdClient`` to act as; omitted, the ambient client.
+
+        Raises:
+            WyrdError: the client's configuration or credential error.
+        """
+        ...
+
+    def publish(
+        self,
+        name: str,
+        value: object,
+        repository: str | None = None,
+        commit: str | None = None,
+    ) -> EvidenceReceipt:
+        """Publish ``value`` as the deferred input ``name`` and return the receipt.
+
+        Args:
+            name: the deferred input name.
+            value: JSON for a ``json`` input; a ``File`` or ``ArtifactRef``
+                for a ``media`` input. A ``File`` is uploaded first unless the
+                tenant already holds it.
+            repository: the repository as ``owner/name``. Omitted, it is
+                ``WYRD_REPOSITORY``, else the working directory's Git
+                ``origin``.
+            commit: the full commit SHA the evidence is about. Omitted, it is
+                ``WYRD_COMMIT``, else the checkout's ``HEAD``.
+
+        Raises:
+            WyrdError: ``WYRD_VERIFICATION_400_INPUT_INVALID`` when no source
+                names the repository or commit, or the value does not fit its
+                subscribers; ``WYRD_GITHUB_403_REPOSITORY_INACCESSIBLE`` for a
+                repository the tenant has not connected;
+                ``WYRD_VERIFICATION_409_EVIDENCE_UNMATCHED`` when no Verifier
+                subscribes; ``WYRD_VERIFICATION_409_EVIDENCE_CONFLICT`` when
+                different evidence was already accepted.
+        """
+        ...
 
 class File:
     """A local file to verify, read only when ``verify`` or ``submit`` uses it.
@@ -741,13 +1020,132 @@ class Execution:
             The execution's result.
 
         Raises:
-            WyrdError: the execution's own error when it settled as errored,
-                cancelled, or timed out, including a delayed
-                ``WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT``;
+            WyrdError: the execution's own error when it settled as errored
+                or timed out; ``WYRD_SDK_409_VERIFICATION_CANCELLED`` when it
+                was cancelled;
                 ``WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT`` when ``timeout``
                 passes first; ``WYRD_SPEC_400_VALIDATION`` for a negative
                 ``timeout``; the client's connection error on first use; and
                 any other status-read error.
+        """
+        ...
+
+    def invocations(self, limit: int | None = None, cursor: str | None = None) -> InvocationPage:
+        """Read one page of the execution's invocation attempts.
+
+        The first page fixes the listing's cut; ``next_cursor`` continues it
+        without gaps or duplicates and is ``None`` on its last page.
+
+        Args:
+            limit: entries per page, 1–200; 50 when omitted.
+            cursor: a previous page's ``next_cursor`` of this listing.
+
+        Returns:
+            The page, the execution's status, and its history projection.
+
+        Raises:
+            WyrdError: ``WYRD_SPEC_400_VALIDATION`` for a ``limit`` outside
+                1–200 or another listing's cursor;
+                ``WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND`` for an absent or
+                foreign execution; the ``verifier:read`` authorization error;
+                and the client's connection or transport error.
+        """
+        ...
+
+    def publications(self, limit: int | None = None, cursor: str | None = None) -> PublicationPage:
+        """Read one page of the execution's accepted publications, without content.
+
+        Args:
+            limit: entries per page, 1–200; 50 when omitted.
+            cursor: a previous page's ``next_cursor`` of this listing.
+
+        Returns:
+            The page of names, kinds, and producers.
+
+        Raises:
+            WyrdError: As ``invocations``.
+        """
+        ...
+
+    def publication(self, producer: Producer, name: str) -> Publication:
+        """Read publication ``name`` of the exact ``producer`` attempt.
+
+        Args:
+            producer: a page item's ``producer``, or a ``step_id`` and
+                ``attempt`` with optional ``item_index`` and
+                ``iteration_index``.
+            name: the publication name.
+
+        Returns:
+            Its JSON ``value``, ``None`` included, or its file or directory
+            ``manifest``.
+
+        Raises:
+            WyrdError: ``WYRD_SPEC_400_VALIDATION`` for a malformed producer
+                or name or a zero attempt;
+                ``WYRD_VERIFICATION_404_PUBLICATION_NOT_FOUND`` when that
+                attempt published no such name; and as ``invocations``.
+        """
+        ...
+
+    def download(self, producer: Producer, name: str, path: str | None = None) -> DownloadInit:
+        """Plan the download of a file publication, or of one file of a directory publication.
+
+        Args:
+            producer: as ``publication``.
+            name: the publication name.
+            path: a directory publication's manifest path; ``None`` for a file.
+
+        Returns:
+            The download plan with the file's size and base64 SHA-256.
+
+        Raises:
+            WyrdError: ``WYRD_SPEC_400_VALIDATION`` for a JSON publication, a
+                ``path`` on a file, or a directory ``path`` its manifest does
+                not list; and as ``publication``.
+        """
+        ...
+
+    def cancel(self) -> CancelledExecution:
+        """Cancel the execution durably; an already terminal execution keeps its status.
+
+        Returns:
+            The execution and its status after the cancel.
+
+        Raises:
+            WyrdError: ``WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND`` for an
+                absent or foreign execution; the ``verifier:run``
+                authorization error; and the client's connection or
+                transport error.
+        """
+        ...
+
+    def decide(
+        self,
+        approval_id: str,
+        decision: Literal["approved", "rejected"],
+        reason: str | None = None,
+    ) -> ApprovalReceipt:
+        """Approve or reject one pending approval occurrence and return its receipt.
+
+        The receipt returns only once the decision is durable, and the same
+        execution then continues. Sending the same decision and reason again
+        returns the same receipt, so a retry is safe.
+
+        Args:
+            approval_id: A pending occurrence from ``status()["approvals"]``.
+            decision: ``"approved"`` or ``"rejected"``.
+            reason: Why, recorded with the decision.
+
+        Raises:
+            WyrdError: ``WYRD_SPEC_400_VALIDATION`` for a malformed ID or
+                decision; ``WYRD_PERMISSION_403_DENIED_RBAC`` without
+                ``verifier:approve`` on the execution's Verifier;
+                ``WYRD_VERIFICATION_404_APPROVAL_NOT_FOUND`` for an occurrence
+                the execution never reached;
+                ``WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING`` once another
+                decision was accepted or the execution ended or expired; and
+                the client's connection or transport error.
         """
         ...
 
@@ -3673,6 +4071,7 @@ __all__ = [
     "ComparisonOperator",
     "Component",
     "Data",
+    "Evidence",
     "Execution",
     "ExecutionRoute",
     "Experiment",

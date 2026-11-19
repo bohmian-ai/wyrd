@@ -19,6 +19,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use wyrd_runtime::resources::CpuLanes;
 
 use chrono::{DateTime, Utc};
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
@@ -189,32 +190,38 @@ impl ScribeMemberStager {
         );
         let member = StagedMemberId::new(request.origin.shard, request.origin.generation);
         let directory = self.stage.member_directory(&key, member);
-        let staged = directory
-            .join(RECORD_FILE_NAME)
-            .try_exists()
-            .map_err(|error| ScribeError::Internal {
-                detail: format!("inspect the staged member record: {error}"),
-            })?;
-        if staged {
-            return Err(ScribeError::Internal {
-                detail: format!(
-                    "staged member {}-{} already occupies its durable directory",
-                    member.shard(),
-                    member.generation()
-                ),
-            });
-        }
-        match std::fs::remove_dir_all(&directory) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
+        // Directory preparation and the final syncs wait on the disk, so they
+        // run off the CPU lane the persistence job holds; only encoding
+        // keeps it.
+        CpuLanes::off_lane(|| -> Result<(), ScribeError> {
+            let staged = directory
+                .join(RECORD_FILE_NAME)
+                .try_exists()
+                .map_err(|error| ScribeError::Internal {
+                    detail: format!("inspect the staged member record: {error}"),
+                })?;
+            if staged {
                 return Err(ScribeError::Internal {
-                    detail: format!("remove the unrecorded staged member residue: {error}"),
+                    detail: format!(
+                        "staged member {}-{} already occupies its durable directory",
+                        member.shard(),
+                        member.generation()
+                    ),
                 });
             }
-        }
-        std::fs::create_dir_all(&directory).map_err(|error| ScribeError::Internal {
-            detail: format!("create the staged member directory: {error}"),
+            match std::fs::remove_dir_all(&directory) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(ScribeError::Internal {
+                        detail: format!("remove the unrecorded staged member residue: {error}"),
+                    });
+                }
+            }
+            std::fs::create_dir_all(&directory).map_err(|error| ScribeError::Internal {
+                detail: format!("create the staged member directory: {error}"),
+            })?;
+            Ok(())
         })?;
         let encode_started = std::time::Instant::now();
         let encoded = crate::scribe::parquet_writer::encode_batch(
@@ -228,29 +235,32 @@ impl ScribeMemberStager {
         )?;
         crate::scribe::persistence::record_persist_stage("encode", encode_started);
         let sync_started = std::time::Instant::now();
-        let mut runs = Vec::with_capacity(encoded.artifacts.len());
-        let mut footers = Vec::with_capacity(encoded.artifacts.len());
-        let mut staged_bytes = 0_u64;
-        for artifact in &encoded.artifacts {
-            let file_name = file_name_of(&artifact.scratch_path)?;
-            staged_bytes = staged_bytes
-                .checked_add(artifact.file_size)
-                .ok_or_else(|| ScribeError::Internal {
-                    detail: "staged member size exceeds u64".to_owned(),
-                })?;
-            fsync_file(&artifact.scratch_path)?;
-            footers.push(preflight_run(&artifact.scratch_path)?);
-            runs.push(StagedRunFile::new(
-                file_name,
-                artifact.file_size,
-                u64::try_from(artifact.row_count).map_err(|_| ScribeError::Internal {
-                    detail: "staged run row count exceeds u64".to_owned(),
-                })?,
-                run_digest(&artifact.checksum)?,
-            ));
-        }
-        encoded.artifacts.retain_for_reconciliation();
-        fsync_directory(&directory)?;
+        let (runs, footers, staged_bytes) = CpuLanes::off_lane(|| -> Result<_, ScribeError> {
+            let mut runs = Vec::with_capacity(encoded.artifacts.len());
+            let mut footers = Vec::with_capacity(encoded.artifacts.len());
+            let mut staged_bytes = 0_u64;
+            for artifact in &encoded.artifacts {
+                let file_name = file_name_of(&artifact.scratch_path)?;
+                staged_bytes = staged_bytes
+                    .checked_add(artifact.file_size)
+                    .ok_or_else(|| ScribeError::Internal {
+                        detail: "staged member size exceeds u64".to_owned(),
+                    })?;
+                fsync_file(&artifact.scratch_path)?;
+                footers.push(preflight_run(&artifact.scratch_path)?);
+                runs.push(StagedRunFile::new(
+                    file_name,
+                    artifact.file_size,
+                    u64::try_from(artifact.row_count).map_err(|_| ScribeError::Internal {
+                        detail: "staged run row count exceeds u64".to_owned(),
+                    })?,
+                    run_digest(&artifact.checksum)?,
+                ));
+            }
+            encoded.artifacts.retain_for_reconciliation();
+            fsync_directory(&directory)?;
+            Ok((runs, footers, staged_bytes))
+        })?;
         crate::scribe::persistence::record_persist_stage("sync_runs", sync_started);
         Ok(StagedRuns {
             key,
@@ -556,6 +566,55 @@ mod tests {
         for path in members[0].run_paths() {
             assert!(path.exists(), "recovery names a run that exists: {path:?}");
         }
+    }
+
+    /// Encoding a member inside laned persistence work returns the CPU lane
+    /// for the stager's directory and fsync IO instead of holding it across
+    /// the disk waits.
+    ///
+    /// # Panics
+    /// Panics when the member does not encode or the lane is still held
+    /// after the stager's disk IO.
+    #[test]
+    fn staging_disk_io_returns_the_cpu_lane() {
+        use std::pin::pin;
+        use std::task::{Context, Poll, Waker};
+
+        use wyrd_runtime::resources::{ProcessResources, Workload};
+
+        let root = tempfile::tempdir().expect("staged root");
+        let stage = Arc::new(ScribeHotStage::new(root.path().join("stage")));
+        let stager = ScribeMemberStager::new(stage);
+        let tenant = DataTenantId::new_v7();
+        let frozen = frozen_member(tenant, 64);
+        let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone()))
+            .expect("tenant binding");
+        let layout = crate::tables::hourly_test_layout(frozen.schema.as_ref());
+        let resources = ProcessResources::new(std::num::NonZeroUsize::MIN, 1 << 30, 1 << 30);
+        let workloads = resources.workloads();
+        let operation = workloads.begin(Workload::Bifrost, None, None);
+        let lanes = workloads.lanes();
+        let mut poll = pin!(lanes.laned(operation.context(), async {
+            let before = lanes.free();
+            stager
+                .encode_runs(StageMemberRequest {
+                    frozen: &frozen,
+                    binding: &binding,
+                    layout: &layout,
+                    origin: origin(),
+                    memory: crate::resources::ScribeResources::for_test(),
+                })
+                .expect("frozen member encodes into local runs");
+            (before, lanes.free())
+        }));
+        let Poll::Ready((before, after)) =
+            poll.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            panic!("the poll completes");
+        };
+        assert_eq!(before, 0, "the poll runs on the only lane");
+        assert_eq!(after, 1, "the stager's disk IO returned the lane");
+        assert_eq!(lanes.free(), 1, "the lane is returned exactly once");
     }
 
     /// Re-encoding a member whose record is published is refused: the record

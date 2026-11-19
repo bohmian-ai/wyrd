@@ -28,6 +28,7 @@ use wyrd_gateway::{
 };
 use wyrd_runtime::outbox::Reservation;
 use wyrd_runtime::principal::CardAttribution;
+use wyrd_runtime::resources::{ByteCharge, ByteLedger, Operation, Workload};
 use wyrd_runtime::{Permission, PermissionDenyReason, Principal};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{Attribution, GatewayAccess};
@@ -174,6 +175,10 @@ pub struct GatewayCallResponse {
     /// Operation response bytes or event stream, or the refusal rendered in
     /// the caller's dialect.
     pub body: ResponseBody,
+    /// The process memory charge of a buffered `body`, attributed to the
+    /// call's operation and returned when the response drops; `None` for a
+    /// stream, whose frames are bounded by their channel.
+    pub(crate) custody: Option<ByteCharge>,
 }
 
 /// A governed call that ended in an error, with whether a provider may have
@@ -219,6 +224,15 @@ pub struct GatewayInvocation<'a> {
     /// When the public request carrying the call reached the server; `None`
     /// for a server-internal call, which records phase telemetry only.
     arrival: Option<std::time::Instant>,
+    /// Deadline the caller fixed before waiting for its own admission; `None`
+    /// starts the call's relative timeout once it is routed.
+    bound: Option<Instant>,
+    /// The workload the call is admitted as: [`Workload::Gateway`] for a
+    /// standalone call, the initiating workload for a nested one.
+    workload: Workload,
+    /// The request body's charge [`Self::parsed`] took from the HTTP body
+    /// limit, taken once at admission.
+    body: std::sync::Mutex<Option<ByteCharge>>,
 }
 
 /// Everything admission fixed for one call, owned so execution and accounting
@@ -258,12 +272,48 @@ struct AdmittedCall {
     /// caller's trace; its captured attempt spans are children of that span.
     trace: Option<TraceContext>,
     /// The Scribe outbox slot admission reserved for the call's capture;
-    /// `None` when the admitted policy captures nothing. Dropping it unused
-    /// returns the slot.
+    /// `None` when the admitted policy captures nothing or a bound call found
+    /// no free slot, whose capture is then staged unreserved. Dropping it
+    /// unused returns the slot.
     capture_slot: Option<Reservation<ScribeSink>>,
+    /// The call's admitted process operation, live until the call settles:
+    /// its demand under pressure and the owner of the bytes it retains.
+    /// Pressure may cancel the call through `cancel` while it runs.
+    operation: Operation,
+    /// The process memory charge of the request `body`, attributed to
+    /// `operation` and returned when the call settles.
+    _body_custody: ByteCharge,
 }
 
 impl AdmittedCall {
+    /// Charges `memory` for a buffered `body` the call materialized and
+    /// attributes the charge to the call's operation; a stream's relay
+    /// charges each frame it retains instead. The answer is new memory the call would retain, so a charge
+    /// memory cannot hold is refused, and the caller discards the answer.
+    ///
+    /// # Errors
+    /// Returns `ServiceUnavailable` when process memory cannot hold the
+    /// buffered answer now.
+    fn custody(
+        &self,
+        memory: &ByteLedger,
+        body: &ResponseBody,
+    ) -> Result<Option<ByteCharge>, WyrdError> {
+        let bytes = match body {
+            ResponseBody::Json(answer) => answer.capacity(),
+            ResponseBody::Media(answer) => answer.bytes.len(),
+            ResponseBody::Events(_) | ResponseBody::MediaStream { .. } => return Ok(None),
+        };
+        let mut charge = memory
+            .try_charge(u64::try_from(bytes).unwrap_or(u64::MAX))
+            .map_err(|_| WyrdError::ServiceUnavailable {
+                message: "process memory cannot hold the gateway answer now".to_owned(),
+                details: json!({ "call_id": self.call_id }),
+            })?;
+        charge.attribute(&self.operation);
+        Ok(Some(charge))
+    }
+
     /// Borrows the ledger's view of this call.
     fn ledger(&self) -> LedgerCall<'_> {
         LedgerCall {
@@ -286,19 +336,53 @@ impl<'a> GatewayInvocation<'a> {
         Self {
             state,
             arrival: None,
+            bound: None,
+            workload: Workload::Gateway,
+            body: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Admits the call this handle runs as `workload` work, the workload
+    /// that initiated it, such as a verification's Agent model call, so it
+    /// shares capacity as part of that work rather than as gateway traffic.
+    #[must_use]
+    pub(crate) const fn nested(mut self, workload: Workload) -> Self {
+        self.workload = workload;
+        self
+    }
+
+    /// Bounds the call this handle runs by `deadline`, an instant its caller
+    /// fixed before waiting for its own admission, such as a verification
+    /// lane's model-call permit. Snapshot, authorization, and routing that
+    /// outlive it refuse the call before the ledger is charged, and a bound
+    /// call never waits for a capture slot; an admitted call's provider deadline
+    /// is `deadline` itself. A ledger write already started when it passes
+    /// still hands off to settlement, and the engine then refuses to start an
+    /// attempt.
+    #[must_use]
+    pub(crate) fn bounded(mut self, deadline: Instant) -> Self {
+        self.bound = Some(deadline);
+        self
     }
 
     /// Times the call this handle runs from the arrival of the public
     /// request `clock` timed, recording its `authenticate` and `parse` phases
     /// for `operation` now that the request is decoded and validated; a
     /// request without a clock keeps phase telemetry only.
+    ///
+    /// The call takes the memory charge of the request body the HTTP body
+    /// limit buffered, which the parsed body shares without a copy.
+    /// Admission attributes it to the call's operation and the call keeps
+    /// it until it settles, so the body counts once, as the call's work,
+    /// however long a stream runs. A call without one, such as a nested
+    /// call's serialized body, is charged its body's kept text at admission.
     #[must_use]
     pub(crate) fn parsed(
         mut self,
         clock: Option<IngressClock>,
         operation: GatewayOperation,
     ) -> Self {
+        self.body = std::sync::Mutex::new(clock.as_ref().and_then(IngressClock::body));
         self.arrival = clock.map(|clock| clock.parsed(operation));
         self
     }
@@ -470,17 +554,21 @@ impl<'a> GatewayInvocation<'a> {
         let received = Instant::now();
         let (ingress, stream) = (request.ingress, request.stream);
         let telemetry = CallTelemetry::new(request.operation, stream, self.arrival);
-        let (call, plan, admission) = match self.admit_call(caller, request, &telemetry).await {
+        let call_cancel = cancel.child_token();
+        let admitted = self
+            .admit_call(caller, request, &telemetry, &call_cancel)
+            .await;
+        let (call, plan, admission) = match admitted {
             Ok(admitted) => admitted,
             Err(failure) => {
                 telemetry.answered(self.unsettled(&failure.error, cancel), Duration::ZERO);
                 return Err(failure);
             }
         };
-        let call_cancel = cancel.child_token();
         let cancel_on_drop = call_cancel.clone().drop_guard();
         let (head, answer) = oneshot::channel();
         let spawned = Instant::now();
+        telemetry.wait(Wait::Admission, spawned.duration_since(received));
         let task = CallTask {
             state: self.state.clone(),
             call,
@@ -494,9 +582,16 @@ impl<'a> GatewayInvocation<'a> {
             call_span: tracing::Span::current(),
             cancel: call_cancel,
         };
+        // Each poll of the call's task, where it prepares, translates and
+        // decodes, runs on a shared CPU lane as the call's work; a poll that
+        // waits on the provider, admission or capture returns its lane.
+        let context = task.call.operation.context();
         self.state.gateway.tasks().spawn(
-            task.run(head)
-                .instrument(tracing::info_span!("gateway.execute")),
+            self.state.resources.workloads().lanes().laned(
+                context,
+                task.run(head)
+                    .instrument(tracing::info_span!("gateway.execute")),
+            ),
         );
         let Answer {
             result,
@@ -533,18 +628,26 @@ impl<'a> GatewayInvocation<'a> {
     ///
     /// Latency: on the request path, with no Postgres wait. The tenant
     /// snapshot is served from the process cache, and [`Self::admit`]
-    /// charges process memory. A capturing call first waits
+    /// charges process memory. A standalone capturing call first waits
     /// for a Scribe outbox capture slot ([`Self::capture_slot`]), which is
-    /// immediate unless the outbox is full. Every invoke-decision audit, here and per fallback
+    /// immediate unless the outbox is full; a [bound](Self::bounded) call
+    /// takes a free slot without waiting, else its capture is staged
+    /// unreserved and may be shed, so capture capacity never delays it. Every invoke-decision audit, here and per fallback
     /// model in [`Self::route`], is staged on the process audit outbox and is
     /// not a request-path round trip.
+    ///
+    /// Before any reservation the call is admitted as a process operation of
+    /// its workload and tenant, waiting while process pressure pauses that
+    /// work; pressure may later cancel the call through `cancel`.
     ///
     /// # Errors
     /// Returns `ServiceUnavailable` while the server drains or before the
     /// tenant's snapshot is cached (queueing its background load),
     /// `GatewayInvalidRequest` for an invalid fallback override or
     /// out-of-range timeout, the mapped permission denial of the requested
-    /// model, and every error of [`Self::route`],
+    /// model, `GatewayDeadlineExceeded` when a [bound](Self::bounded) passes
+    /// before [`Self::admit`] starts or process pressure stays paused past
+    /// the call's deadline, and every error of [`Self::route`],
     /// [`Self::capture_slot`], and [`Self::admit`]. Every one is undispatched.
     ///
     /// The snapshot, authorize, route, and admit phases are recorded on
@@ -554,6 +657,7 @@ impl<'a> GatewayInvocation<'a> {
         caller: &Caller,
         mut request: GatewayCallRequest,
         telemetry: &CallTelemetry,
+        cancel: &CancellationToken,
     ) -> Result<(AdmittedCall, CallPlan, Admission), CallFailure> {
         let call_id = GatewayCallId::new_v7();
         tracing::Span::current().record("call_id", tracing::field::display(call_id.as_uuid()));
@@ -576,54 +680,96 @@ impl<'a> GatewayInvocation<'a> {
                 invalid_request(GatewayContractError::new("timeout", "is out of range"))
             })?;
         let tenant = caller.data_tenant_id;
-        let started = std::time::Instant::now();
-        let snapshot = self
-            .state
-            .gateway
-            .snapshots()
-            .admitted(tenant)
-            .ok_or_else(|| WyrdError::ServiceUnavailable {
-                message: "gateway configuration is loading; retry shortly".to_owned(),
-                details: json!({}),
-            })?;
-        telemetry.since(Phase::Snapshot, started);
-        let started = std::time::Instant::now();
-        self.decide(caller, OPERATION, &request.model, &snapshot)
-            .map_err(permission_deny_reason_to_wyrd)?;
-        // A caller's own call is owned by its verified workload root; a
-        // server-derived context already names its accepted owner.
-        let subject = Some(match request.subject.take() {
-            Some(GatewayCallAttribution::Resolved(context)) => context,
-            requested => GatewayCallContext {
-                workload_card_uid: wyrd_runtime::owning_root(
-                    &caller.principal,
-                    &caller.delegation_chain,
-                )
-                .cloned(),
-                ..match requested {
-                    Some(GatewayCallAttribution::Requested(context)) => {
-                        self.attribute(caller, context).await?
+        let prepared = async {
+            let started = std::time::Instant::now();
+            let snapshot = GatewayAdministration::new(self.state)
+                .snapshot(tenant)
+                .await?;
+            telemetry.since(Phase::Snapshot, started);
+            let started = std::time::Instant::now();
+            self.decide(caller, OPERATION, &request.model, &snapshot)
+                .map_err(permission_deny_reason_to_wyrd)?;
+            // A caller's own call is owned by its verified workload root; a
+            // server-derived context already names its accepted owner.
+            let subject = Some(match request.subject.take() {
+                Some(GatewayCallAttribution::Resolved(context)) => context,
+                requested => GatewayCallContext {
+                    workload_card_uid: wyrd_runtime::owning_root(
+                        &caller.principal,
+                        &caller.delegation_chain,
+                    )
+                    .cloned(),
+                    ..match requested {
+                        Some(GatewayCallAttribution::Requested(context)) => {
+                            self.attribute(caller, context).await?
+                        }
+                        _ => GatewayCallContext::default(),
                     }
-                    _ => GatewayCallContext::default(),
-                }
-            },
+                },
+            });
+            telemetry.since(Phase::Authorize, started);
+            // A call continuing a caller's trace parents its captured attempts on
+            // this `gateway.call` span; an untraced call keeps its own trace.
+            let trace = wyrd_telemetry::continued_context();
+
+            let started = std::time::Instant::now();
+            let plan = self.route(caller, &request, &snapshot, call_id).await?;
+            telemetry.since(Phase::Route, started);
+            Ok::<_, CallFailure>((snapshot, subject, trace, plan))
+        };
+        // A bound caller's deadline covers this reversible preparation, which
+        // a refusal abandons before anything is charged.
+        let (snapshot, subject, trace, mut plan) = match self.bound {
+            Some(deadline) => tokio::time::timeout_at(deadline, prepared)
+                .await
+                .map_err(|_| expired(call_id))??,
+            None => prepared.await?,
+        };
+
+        // Admission is the capture-slot wait and the ledger statement. A
+        // bound call, a verification lane's, never waits for capture
+        // capacity: it takes a free slot or stages its capture unreserved.
+        let deadline = self
+            .bound
+            .unwrap_or_else(|| Instant::now() + request.timeout);
+        let started = std::time::Instant::now();
+        // Process pressure pauses the call before it holds any reservation;
+        // it registers as demand of its workload and tenant meanwhile.
+        let operation = tokio::time::timeout_at(
+            deadline,
+            self.state.resources.workloads().admit(
+                self.workload,
+                Some(tenant),
+                Some(cancel.clone()),
+            ),
+        )
+        .await
+        .map_err(|_| expired(call_id))?;
+        telemetry.wait(Wait::Pressure, started.elapsed());
+        let handed = self
+            .body
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        // ponytail: a body held only as a decoded tree, never kept as text,
+        // is uncharged; every nested caller serializes its body to text.
+        let mut body_custody = handed.unwrap_or_else(|| {
+            let kept = request.body.text().map_or(0, <[u8]>::len);
+            self.state
+                .resources
+                .memory()
+                .charge_infallible(u64::try_from(kept).unwrap_or(u64::MAX))
         });
-        telemetry.since(Phase::Authorize, started);
-        // A call continuing a caller's trace parents its captured attempts on
-        // this `gateway.call` span; an untraced call keeps its own trace.
-        let trace = wyrd_telemetry::continued_context();
-
-        let started = std::time::Instant::now();
-        let mut plan = self.route(caller, &request, &snapshot, call_id).await?;
-        telemetry.since(Phase::Route, started);
-
-        // Admission is the capture-slot wait and the ledger statement.
-        let deadline = Instant::now() + request.timeout;
-        let started = std::time::Instant::now();
+        body_custody.attribute(&operation);
         let capture_slot = if snapshot.capture.mode == GatewayCaptureMode::Disabled {
             None
+        } else if self.bound.is_some() {
+            self.state.bifrost.scribe_outbox().reserve(1).ok()
         } else {
-            Some(self.capture_slot(deadline).await?)
+            let waiting = std::time::Instant::now();
+            let slot = self.capture_slot(deadline).await?;
+            telemetry.wait(Wait::CaptureSlot, waiting.elapsed());
+            Some(slot)
         };
 
         let admitted_at = Utc::now();
@@ -645,7 +791,13 @@ impl<'a> GatewayInvocation<'a> {
             subject,
             trace,
             capture_slot,
+            operation,
+            _body_custody: body_custody,
         };
+        // Only a bound caller's deadline can pass before the ledger is charged.
+        if self.bound.is_some_and(|bound| bound <= Instant::now()) {
+            return Err(expired(call_id).into());
+        }
         let admission = self.admit(&call, &mut plan)?;
         telemetry.since(Phase::Admit, started);
         Ok((call, plan, admission))
@@ -755,12 +907,13 @@ impl<'a> GatewayInvocation<'a> {
     ///
     /// # Errors
     /// Returns `GatewayDeadlineExceeded` for a timed-out call,
-    /// `ServiceUnavailable` for a cancelled call or a refusal body that cannot
-    /// be serialized, and `GatewayUpstreamUnavailable` when no attempt
+    /// `ServiceUnavailable` for a cancelled call, a refusal body that cannot
+    /// be serialized, or a buffered answer process memory cannot hold, and `GatewayUpstreamUnavailable` when no attempt
     /// completed.
     fn respond(
         call: &AdmittedCall,
         execution: CallExecution,
+        memory: &ByteLedger,
     ) -> Result<GatewayCallResponse, WyrdError> {
         let call_id = call.call_id;
         let (last_model, deployment) = execution
@@ -781,17 +934,23 @@ impl<'a> GatewayInvocation<'a> {
                     resolved,
                     deployment,
                     status: 200,
+                    custody: call.custody(memory, &body)?,
                     body,
                 })
             }
-            (GatewayCallOutcome::Failed, _, _, Some(refusal)) => Ok(GatewayCallResponse {
-                call_id,
-                resolved: last_model.unwrap_or_else(|| call.requested.clone()),
-                requested: call.requested.clone(),
-                deployment,
-                status: refusal.status,
-                body: ResponseBody::Json(to_raw_value(&refusal.body).map_err(unavailable)?.into()),
-            }),
+            (GatewayCallOutcome::Failed, _, _, Some(refusal)) => {
+                let body =
+                    ResponseBody::Json(to_raw_value(&refusal.body).map_err(unavailable)?.into());
+                Ok(GatewayCallResponse {
+                    call_id,
+                    resolved: last_model.unwrap_or_else(|| call.requested.clone()),
+                    requested: call.requested.clone(),
+                    deployment,
+                    status: refusal.status,
+                    custody: call.custody(memory, &body)?,
+                    body,
+                })
+            }
             (GatewayCallOutcome::TimedOut, ..) => Err(WyrdError::GatewayDeadlineExceeded {
                 message: "the gateway call exceeded its deadline".to_owned(),
                 details: json!({ "call_id": call_id }),
@@ -1013,7 +1172,9 @@ impl<'a> GatewayInvocation<'a> {
     /// attempt's. The outcome and error code start as `execution`'s; a
     /// buffered call whose accounting then fails overrides both with its
     /// settled failure. Request content is resolved later by
-    /// [`Self::capture`], after the caller has its answer.
+    /// [`Self::capture`], after the caller has its answer. `custody` is
+    /// the charge of a streamed response capture's content, which the facts
+    /// carry until the outbox takes it over.
     fn facts(
         call: &AdmittedCall,
         operation: GatewayOperation,
@@ -1021,6 +1182,7 @@ impl<'a> GatewayInvocation<'a> {
         stream: bool,
         execution: &mut CallExecution,
         entries: Option<&[GatewayAccountingEntryV1]>,
+        custody: Option<ByteCharge>,
     ) -> Option<CallFacts> {
         let policy = &call.snapshot.capture;
         if policy.mode == GatewayCaptureMode::Disabled {
@@ -1074,6 +1236,7 @@ impl<'a> GatewayInvocation<'a> {
             request: None,
             response,
             objects,
+            custody,
         })
     }
 
@@ -1086,7 +1249,8 @@ impl<'a> GatewayInvocation<'a> {
     /// hung dependency cannot hold facts, object bytes, or this task past the
     /// call; work still running when it passes is dropped, releasing what it
     /// held, and one [`CaptureDrop::Unavailable`] is recorded. Staging never
-    /// waits and is never shed: it spends the slot admission reserved, and
+    /// waits: it spends the slot admission reserved, which is never shed, or
+    /// for a bound call that found none stages unreserved, and
     /// the outbox owns encoding and delivery. `body` is the call's request
     /// body, moved in so capture redacts and encodes it without a copy.
     async fn capture(
@@ -1111,13 +1275,17 @@ impl<'a> GatewayInvocation<'a> {
         }
         .instrument(tracing::debug_span!("gateway.capture"));
         let result = match tokio::time::timeout_at(call.deadline, work).await {
-            Ok(Ok(capture)) => {
-                match &call.capture_slot {
-                    Some(slot) => slot.stage(capture.tenant(), capture),
-                    None => state
-                        .bifrost
-                        .scribe_outbox()
-                        .stage(capture.tenant(), capture),
+            Ok(Ok(mut capture)) => {
+                let tenant = capture.tenant();
+                match (&call.capture_slot, capture.take_custody()) {
+                    (Some(slot), Some(custody)) => slot.stage_charged(tenant, capture, custody),
+                    (Some(slot), None) => slot.stage(tenant, capture),
+                    // The unreserved outbox charges the record itself; the
+                    // content's charge returns only once it has.
+                    (None, custody) => {
+                        state.bifrost.scribe_outbox().stage(tenant, capture);
+                        drop(custody);
+                    }
                 }
                 Ok(())
             }
@@ -1255,6 +1423,10 @@ impl CallTask {
             "operation" => operation_name(self.plan.operation)
         )
         .record(self.received.elapsed().as_secs_f64());
+        // A relayed stream charges the frames it retains to the call.
+        let mut memory = self.state.resources.memory().empty_charge();
+        memory.attribute(&self.call.operation);
+        let executing = Instant::now();
         let mut execution = self
             .state
             .gateway
@@ -1271,8 +1443,10 @@ impl CallTask {
                 capture: selects(&self.call.snapshot.capture, GatewayPayloadField::Response),
                 deadline: self.call.deadline,
                 cancel: &self.cancel,
+                memory: &memory,
             })
             .await;
+        self.telemetry.wait(Wait::Execute, executing.elapsed());
         if !execution.attempts.is_empty() {
             self.telemetry
                 .phase(Phase::Credential, execution.timing.credential);
@@ -1317,6 +1491,7 @@ impl CallTask {
         dispatched: bool,
         head: oneshot::Sender<Answer>,
     ) {
+        let settling = std::time::Instant::now();
         let operation = self.plan.operation;
         let upstream = execution.timing.upstream;
         let accounted = Accounted::new(&self.call.ledger(), &self.admission, &execution);
@@ -1334,6 +1509,7 @@ impl CallTask {
             self.stream,
             &mut execution,
             entries,
+            None,
         );
         let outcome = match (&accounted, facts.as_mut()) {
             (Ok(_), _) => execution.outcome,
@@ -1352,11 +1528,12 @@ impl CallTask {
                 let started = std::time::Instant::now();
                 GatewayLedger::settle(&mut self.admission, &mut accounted);
                 self.telemetry.since(Phase::Account, started);
-                GatewayInvocation::respond(&self.call, execution)
+                GatewayInvocation::respond(&self.call, execution, self.state.resources.memory())
             }
             Err(error) => Err(error),
         };
         record_call(&self.call_span, outcome, answer.is_ok());
+        self.telemetry.wait(Wait::Settle, settling.elapsed());
         // A dropped caller no longer awaits the answer.
         head.send(Answer {
             result: answer,
@@ -1392,6 +1569,7 @@ impl CallTask {
         dispatched: bool,
         head: oneshot::Sender<Answer>,
     ) {
+        let settling = std::time::Instant::now();
         let operation = self.plan.operation;
         let resolved = execution.resolved.clone();
         let timing = execution.timing;
@@ -1399,8 +1577,11 @@ impl CallTask {
         let mut attempts = std::mem::take(&mut execution.attempts);
         let attempt_span = std::mem::replace(&mut execution.attempt_span, tracing::Span::none());
         record_first_byte(operation, self.received);
+        let result =
+            GatewayInvocation::respond(&self.call, execution, self.state.resources.memory());
+        self.telemetry.wait(Wait::Settle, settling.elapsed());
         head.send(Answer {
-            result: GatewayInvocation::respond(&self.call, execution),
+            result,
             dispatched,
             outcome: opened,
             upstream: timing.until_headers(),
@@ -1412,6 +1593,7 @@ impl CallTask {
             terminal_at: Utc::now(),
             usage: AttemptUsage::default(),
             capture: None,
+            custody: None,
             last_byte: None,
             relay: Duration::ZERO,
         });
@@ -1434,6 +1616,7 @@ impl CallTask {
             }
         }
         record_call(&self.call_span, end.outcome, true);
+        let custody = end.custody;
         let mut accounted = CallExecution {
             outcome: end.outcome,
             response: None,
@@ -1463,6 +1646,7 @@ impl CallTask {
             self.stream,
             &mut accounted,
             entries,
+            custody,
         );
         GatewayInvocation::observe(operation, self.received, end.outcome, &accounted, entries);
         let started = std::time::Instant::now();
@@ -1529,6 +1713,15 @@ pub(crate) fn invalid_request(error: GatewayContractError) -> WyrdError {
     WyrdError::GatewayInvalidRequest {
         message: error.to_string(),
         details: json!({ "field": error.field, "reason": error.reason }),
+    }
+}
+
+/// The `GatewayDeadlineExceeded` refusal of call `call_id`, whose bound
+/// passed before the ledger was charged; no provider saw it.
+fn expired(call_id: GatewayCallId) -> WyrdError {
+    WyrdError::GatewayDeadlineExceeded {
+        message: "the gateway call exceeded its deadline before admission".to_owned(),
+        details: json!({ "call_id": call_id }),
     }
 }
 

@@ -24,7 +24,7 @@ use crate::boot::{
 };
 use crate::components::cards::reconciler;
 use crate::components::health::readiness_loop;
-use crate::config::{BifrostTarget, ServeMode, WyrdServerConfig};
+use crate::config::{BifrostRoles, BifrostRuntimeRole, ServeMode, WyrdServerConfig};
 use crate::grpc::{
     GrpcRouterConfig, build_app_grpc, build_peer_grpc, drive_health_status, publish_initial_health,
     serve_grpc_with_listener, serve_peer_grpc_with_listener,
@@ -288,7 +288,9 @@ impl WyrdServer {
     /// until the returned future and its owned server state are dropped.
     pub async fn bind(self, mode: ServeMode) -> Result<BoundServer, BootExit> {
         wyrd_tls::install_crypto_provider().map_err(|error| BootExit::Other(Box::new(error)))?;
-        let (http_listener, http_addr) = if mode.serves_http() {
+        // The Forge maintenance target opens no public listener.
+        let serves_api = self.config.role.serves_api();
+        let (http_listener, http_addr) = if serves_api && mode.serves_http() {
             let bind = self.config.http.bind;
             let listener = TcpListener::bind(bind).await.map_err(|e| {
                 BootExit::Other(format!("HTTP listener failed to bind {bind}: {e}").into())
@@ -300,7 +302,7 @@ impl WyrdServer {
         } else {
             (None, None)
         };
-        let (grpc_listener, grpc_addr) = if mode.serves_grpc() {
+        let (grpc_listener, grpc_addr) = if serves_api && mode.serves_grpc() {
             let bind = self.config.grpc.bind;
             let listener = TcpListener::bind(bind).await.map_err(|e| {
                 BootExit::Other(format!("gRPC listener failed to bind {bind}: {e}").into())
@@ -642,11 +644,9 @@ impl BoundServer {
             .map_err(|e| BootExit::Other(Box::new(e)))?;
             set.spawn(scheduler);
         }
-        // `All` owns one bounded Forge worker in addition to the scheduler;
-        // `Server` intentionally schedules maintenance without executing it.
-        // The dedicated `ForgeWorker` process is composed by
-        // `run_forge_worker_process` and never reaches this serving owner.
-        if self.config.role == BifrostTarget::All {
+        // `combined` and `bifrost-maintenance` own one bounded Forge worker in
+        // addition to the scheduler; no other target runs Forge.
+        if BifrostRoles::for_target(self.config.role).contains(&BifrostRuntimeRole::ForgeWorker) {
             let state = self.state.clone();
             let worker = restarting_worker(
                 "forge_worker",
@@ -658,7 +658,32 @@ impl BoundServer {
             set.spawn(worker);
         }
 
-        if let Some(operator) = self.state.postgres.operator_pool() {
+        // GitHub delivery recovery is queued work.
+        if self.state.github.is_some() && self.config.role.runs_queued() {
+            set.spawn(worker_task(
+                TaskId::Worker("github_report_recovery"),
+                crate::components::github::delivery::GithubDeliveries::recover(
+                    self.state.clone(),
+                    shutdown.clone(),
+                ),
+            ));
+            let state = self.state.clone();
+            let shutdown = shutdown.clone();
+            set.spawn(worker_task(
+                TaskId::Worker("github_delivery_recovery"),
+                async move {
+                    crate::components::github::service::GithubConnections::new(&state)
+                        .run_delivery_recovery(shutdown)
+                        .await;
+                },
+            ));
+        }
+        if let Some(operator) = self
+            .state
+            .postgres
+            .operator_pool()
+            .filter(|_| self.config.role.serves_api())
+        {
             set.spawn(worker_task(
                 TaskId::Worker("card_reconciler"),
                 reconciler::run(self.state.clone(), operator, shutdown.clone()),
@@ -1008,12 +1033,12 @@ mod pg_tests {
             config.http.bind = "127.0.0.1:0".parse().expect("static bind is valid");
             config.metrics.enabled = false;
             config.shutdown.drain_ms = 1_000;
-            // The unit shell composes no Forge, and the default `All` target
-            // refuses to run without a retained Forge worker before shutdown
-            // is ever reached. `Server` is the serving target that schedules
-            // maintenance without executing it; it reaches the identical
-            // readiness, transport, Oracle, and Scribe shutdown phases.
-            config.role = BifrostTarget::Server;
+            // The unit shell composes no Forge, and the default `combined`
+            // target refuses to run without a retained Forge worker before
+            // shutdown is ever reached. `direct` runs no Forge role and reaches
+            // the identical readiness, transport, Oracle, and Scribe shutdown
+            // phases.
+            config.role = crate::config::ServerTarget::Direct;
             let probe = ShutdownTestProbe::new(stall);
             let server = WyrdServer::new(config, test_state_with_auth())
                 .expect("test server builds")

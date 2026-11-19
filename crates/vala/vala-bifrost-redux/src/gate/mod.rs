@@ -42,8 +42,9 @@ use crate::oracle::{AuthorizedQueryContext, OracleQueryStream, QueryStreamLifecy
 pub use crate::otlp_contract::{IngestOutcome, LogsOutcome, MetricsOutcome};
 use crate::scribe::preprocess::logical_data_identity;
 use crate::tables::{
-    CallsTable, DomainTable, ExecutionInputsTable, ExecutionOutputsTable, ObjectsTable,
-    ResultsTable, SeriesTable, TableError,
+    ApprovalsTable, CallsTable, DomainTable, EvidenceTable, ExecutionEventsTable,
+    ExecutionInputsTable, ExecutionOutputsTable, ObjectsTable, ResultsTable, SeriesTable,
+    TableError,
 };
 use wyrd_runtime::principal::CardAttribution;
 use wyrd_spec::auth::Attribution;
@@ -355,6 +356,10 @@ pub struct Gate<A: GateAudit + 'static> {
     auth: IngestAuthInterceptor,
     /// Shared admission closure observed by ingest and query alike.
     closed: Arc<AtomicBool>,
+    /// The attached Scribe's ingress lane, which Gate asks to admit each new
+    /// public write as Bifrost work before accepting it; absent with no
+    /// production Scribe.
+    fresh: Option<crate::scribe::execution_lanes::ScribeIngressCpuPool>,
 }
 
 impl<A: GateAudit + 'static> Clone for Gate<A> {
@@ -373,6 +378,7 @@ impl<A: GateAudit + 'static> Clone for Gate<A> {
             limits: self.limits,
             auth: self.auth.clone(),
             closed: Arc::clone(&self.closed),
+            fresh: self.fresh.clone(),
         }
     }
 }
@@ -421,6 +427,7 @@ impl<A: GateAudit + 'static> Gate<A> {
     ) -> Self {
         initialize_gate_metrics();
         Self {
+            fresh: Some(scribe.ingress_cpu_pool()),
             scribe: Some(scribe),
             query: None,
             cards: None,
@@ -447,6 +454,7 @@ impl<A: GateAudit + 'static> Gate<A> {
             limits,
             auth,
             closed: Arc::new(AtomicBool::new(false)),
+            fresh: None,
         }
     }
 
@@ -466,6 +474,7 @@ impl<A: GateAudit + 'static> Gate<A> {
             limits,
             auth,
             closed: Arc::new(AtomicBool::new(false)),
+            fresh: None,
         }
     }
 
@@ -663,18 +672,26 @@ impl<A: GateAudit + 'static> Gate<A> {
         self.closed.load(Ordering::Acquire)
     }
 
-    /// Refuses new ingest once the Gate is closed or Scribe is not ready.
+    /// Refuses new ingest once the Gate is closed, Scribe is not ready, or
+    /// process pressure pauses new Bifrost work.
+    ///
+    /// Only public writes pass here; server outboxes deliver accepted work to
+    /// Scribe directly, so they keep draining under pressure.
     ///
     /// # Errors
     ///
     /// Returns [`IngestError::IngressClosed`] after `close()` and while the
-    /// local Scribe is absent or still recovering.
+    /// local Scribe is absent or still recovering, and
+    /// [`IngestError::IngestBusy`] while pressure pauses new Bifrost work.
     fn ensure_open(&self) -> Result<(), IngestError> {
         if self.is_closed() {
             return Err(IngestError::IngressClosed);
         }
         if !self.scribe.as_ref().is_some_and(|scribe| scribe.is_ready()) {
             return Err(IngestError::IngressClosed);
+        }
+        if let Some(fresh) = &self.fresh {
+            fresh.admit(None).map_err(IngestError::from_scribe)?;
         }
         Ok(())
     }
@@ -1134,8 +1151,8 @@ impl<A: GateAudit + 'static> Gate<A> {
     }
 }
 
-/// Whether `table` is one of the verification result or input tables only the
-/// server's internal writer writes.
+/// Whether `table` is one of the verification result, input, or event tables
+/// only the server's internal writer writes.
 ///
 /// The set is closed and owned by the table definitions themselves, so a
 /// renamed result table cannot silently fall out of the reservation.
@@ -1147,6 +1164,9 @@ fn is_verification_result_table(table: &TableRef) -> bool {
             ExecutionOutputsTable::NAMESPACE,
             ExecutionOutputsTable::NAME,
         ),
+        (ExecutionEventsTable::NAMESPACE, ExecutionEventsTable::NAME),
+        (EvidenceTable::NAMESPACE, EvidenceTable::NAME),
+        (ApprovalsTable::NAMESPACE, ApprovalsTable::NAME),
     ]
     .into_iter()
     .any(|(namespace, name)| {
@@ -2772,6 +2792,9 @@ mod tests {
             "bifrost.verification.results",
             "bifrost.verification.execution_inputs",
             "bifrost.verification.execution_outputs",
+            "bifrost.verification.execution_events",
+            "bifrost.verification.evidence",
+            "bifrost.verification.approvals",
             "bifrost.metrics.series",
         ] {
             for (label, auth) in &principals {

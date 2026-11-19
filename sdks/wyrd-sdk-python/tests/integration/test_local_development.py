@@ -1016,7 +1016,7 @@ def interrupt_hidden_question(cli_path: str, home: Path, env: dict[str, str], se
         assert b"typed-but-unsent" not in shown + stdout + stderr
         assert not (home / "wyrd/config.toml").exists()
         assert not (home / "wyrd/credentials.toml").exists()
-        assert not (home / "wyrd/server/sealing.key").exists()
+        assert not (home / "wyrd/server/kms/local").exists()
     finally:
         os.close(master)
         os.close(slave)

@@ -17,8 +17,8 @@ impl SecretKey {
     /// Construct a [`SecretKey`] directly from a 32-byte AES-256 key.
     ///
     /// The bytes are used as-is — no KDF is applied. Use this when the caller
-    /// already holds a uniform deployment sealing key (e.g. a config-provided
-    /// secret) and must not re-hash it through Argon2.
+    /// already holds a uniform 32-byte key (e.g. a generated data key or a
+    /// config-provided secret) and must not re-hash it through Argon2.
     #[must_use]
     pub fn from_bytes(bytes: [u8; 32]) -> SecretKey {
         SecretKey(bytes)

@@ -3501,7 +3501,7 @@ impl WyrdTestServer {
     /// `state` (`Active` or `Candidate`).
     ///
     /// Reads the stored column byte-for-byte through a [`TenantConn`], so a
-    /// journey can assert ciphertext at rest and which sealing key a rotation
+    /// journey can assert ciphertext at rest and which `[kms]` key a rotation
     /// left it under. Returns `None` when no such connection exists or it
     /// stores no secret.
     ///
@@ -3524,7 +3524,7 @@ impl WyrdTestServer {
     ///
     /// Opens a [`TenantConn`] on the supplied tenant and reads the stored
     /// column byte-for-byte (never text-decoded), so the journey can assert the
-    /// sealing key wrote ciphertext at rest rather than plaintext. Returns
+    /// `[kms]` envelope holds ciphertext at rest rather than plaintext. Returns
     /// `None` when no issuer with that URL exists for the tenant, and `None`
     /// when the issuer stores no secret (public client).
     ///

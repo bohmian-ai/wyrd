@@ -1898,6 +1898,7 @@ async fn init_keeps_one_stored_secret_key_for_every_owner() {
     assert_eq!(mode & 0o077, 0, "the local key is owner-only");
     let kept = fs::read(&key).expect("local key");
 
+    let server = format!("http://{}", local.bind);
     let mut printed = String::new();
     for (args, document) in [
         (
@@ -1917,7 +1918,14 @@ async fn init_keeps_one_stored_secret_key_for_every_owner() {
             .to_string(),
         ),
         (
-            vec!["operator-connection", "create", "--body-file", "-"],
+            vec![
+                "operator-connection",
+                "create",
+                "--body-file",
+                "-",
+                "--server",
+                &server,
+            ],
             json!({
                 "provider": "http",
                 "name": "local-hooks",
@@ -1982,7 +1990,7 @@ async fn init_keeps_one_stored_secret_key_for_every_owner() {
         printed.push_str(&body);
         let listed = local
             .command()
-            .args(["operator-connection", "list"])
+            .args(["operator-connection", "list", "--server", &server])
             .output()
             .await
             .expect("connection list");

@@ -181,6 +181,35 @@ unknowns, native ordering/null semantics and unchanged pushdown interactions.
 Measure additional append CPU/work and retained memory. Repeat the original UI
 experiments after this change, preserving comparable evidence between variants.
 
+**Evidence (step 5).**
+
+- Implementation: `57ec43e29` (UTF8, LargeUtf8, Utf8View and FixedSizeBinary
+  min/max in `scribe::memtable::batch_statistics`, each bound capped at
+  `IDENTITY_BOUND_BYTES` = 64); `06d3916d6` computes the bounds before the
+  shard's shared memtable lock.
+- Proof: `scribe::memtable::tests::batch_statistics_bound_primitive_and_identity_columns`
+  (exact Int64/Utf8 bounds; an over-long string and Binary stay unknown) and
+  `scribe::memtable::tests::identity_time_and_child_predicates_prune_only_by_known_bounds`
+  (`cdd4f8e62`: id+time and `parent_id` child matches prune by exact bounds; a
+  generation predating `parent_id` is kept; `IS NULL` keeps only the null
+  batch; a Utf8View-adapted read prunes nothing). Command:
+  `mise run test:bifrost:integration:redux` — 1036 passed.
+- TDD: `VIOLATED` for the second test, which passed on first run because the
+  bounds code already existed; it proves behavior, not test-first order.
+- Append cost, `mise run bench:l1:bifrost:writes`, quiet host (1-min load
+  < 2), all VALID; `d310d770c` → `57ec43e29` → `06d3916d6`:
+  CPU per row at c1 +1–6% (spans 15.5 → 16.5 µs; native 1.52 → 1.62 µs);
+  `otlp-spans-c64` 608–639 → 515–528 → 503 req/s with cores used
+  6.3 → 5.8 → 5.5; logs c64 547 → 482 → 488 req/s. Moving the bounds out of
+  the lock did not recover throughput.
+- Retained memory: code-bounded at two values of ≤ 64 bytes per identity
+  column per batch; peak resident memory showed no consistent change
+  (±150 MiB, no direction). Per-batch retained bytes are not measured.
+- Open: the c64 OTLP write regression (~17% spans) is a write-performance
+  regression and keeps the parent incomplete until its cause is found or the
+  maintainer accepts it. CPU profiles of `otlp-spans-c64` at `d310d770c` and
+  `57ec43e29` are the next diagnostic.
+
 ### 6. Decide any remaining batching work from evidence
 
 Do not concatenate batches solely because their count is high. If tiny batches
@@ -188,6 +217,21 @@ remain a material contributor after the selected changes, report normalized
 execution costs, allocation/memory evidence and a bounded coalescing proposal
 before implementing that redesign. Account for retained original buffers,
 workspace and output together; an output-byte bound alone does not bound memory.
+
+**Evidence (step 6).** The maintainer chose write-side coalescing over a
+proposal. `fcbd72567` merges consecutive small appends as a bucket's tail seals
+(`APPEND_RUN_LEN` = 8; binary-counter folding within `COALESCE_ROWS` = 8192 and
+`COALESCE_BYTES` = 4 MiB), copies only when no capture holds the bucket charge,
+and never copies a large append; metas stay per append.
+Proof: `scribe::memtable::tests::small_appends_coalesce_unless_a_read_holds_the_bucket`.
+TDD: `VIOLATED` — the held-bucket guard was written before its assertion.
+UI SQL against `c9ba1fdef` (all VALID, exact answers): memtable c8
+323 → 457 req/s (default), 189 → 311 (10×), 320 → 433 (learned); c8 p95
+43.4 → 23.4 ms (default). Staged and published dipped in every run (published
+c8 −3%, −6%, −13%; staged c1 −4% to −6%), cause unexplained. Writes
+(`57ec43e29` → `fcbd72567`/`cdd4f8e62`): native c64 132 → 141, logs c64
+482 → 506, `otlp-spans-1k-c64` 315 → 291 and 295 → 269 in two pairs (−8–9%,
+unexplained).
 
 Unresolved material slowdown keeps the parent task incomplete unless the
 maintainer accepts the evidenced limit. Do not silently expand scope or claim

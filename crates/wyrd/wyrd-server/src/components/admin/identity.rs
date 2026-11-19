@@ -184,7 +184,11 @@ async fn put_candidate(
 ) -> Result<Json<HumanConnectionView>, WyrdErrorResponse> {
     let decision = decide(&state, &caller, "identity.oidc.candidate.put")?;
     let owner = connections(&state)?;
-    let staged = match ConnectionInput::from_slice(&body).and_then(|input| owner.stage(input)) {
+    let staged = match ConnectionInput::from_slice(&body) {
+        Ok(input) => owner.stage(caller.data_tenant_id, input).await,
+        Err(refusal) => Err(refusal),
+    };
+    let staged = match staged {
         Ok(staged) => staged,
         Err(refusal) => return refuse_after_decision(&state, &caller, decision, refusal),
     };
@@ -210,7 +214,7 @@ async fn put_candidate(
 /// credential, or User.
 ///
 /// # Errors
-/// Returns `400` when no sealing key is configured, `403`
+/// Returns `400` when no `[kms]` is configured, `403`
 /// without `identity_connections:write`, `409` for a stale revision
 /// (`CONNECTION_CONFLICT`) or a failed check (`CONNECTION_NOT_TESTED`), and
 /// `503` when the provider is refused by address screening or unavailable, the
@@ -222,7 +226,7 @@ async fn put_candidate(
     responses(
         (status = 200, description = "The provider checks passed; complete the sign-in at \
           authorization_url to mark this candidate revision tested", body = ConnectionTestResponse),
-        (status = 400, description = "No sealing key is configured \
+        (status = 400, description = "No [kms] is configured \
           (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
@@ -411,7 +415,6 @@ mod pg_tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     use wyrd_auth_oidc::ScreenedHttp;
-    use wyrd_crypt::{SealingKeyring, SecretKey};
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_runtime::{
         PermissionCheck, PermissionDenyReason, PermissionSet, PermissionVerdict, Principal,
@@ -503,7 +506,7 @@ mod pg_tests {
         server
     }
 
-    /// Build handler state whose connection owner holds a sealing keyring,
+    /// Build handler state whose connection owner holds a `[kms]` facade,
     /// may reach loopback providers, whose permission check is `check`, and
     /// whose audit decisions land in `scribe`.
     async fn test_state(
@@ -532,9 +535,7 @@ mod pg_tests {
                 owners.auth = ServerAuth {
                     human_connections: Some(HumanConnections::new(
                         fixture.wyrd_postgres().clone(),
-                        Some(Arc::new(SealingKeyring::new(SecretKey::from_bytes(
-                            [7_u8; 32],
-                        )))),
+                        Some(crate::test_support::seeded_kms(7, &[])),
                         ScreenedHttp::allowing_internal(),
                         audit,
                     )),
@@ -582,7 +583,7 @@ mod pg_tests {
         let input = ConnectionInput::from_slice(&candidate_body(&provider.uri(), "Public"))
             .expect("candidate input is valid");
         let owner = connections(state).expect("owner configured");
-        let staged = owner.stage(input).expect("candidate stages");
+        let staged = owner.stage(tenant, input).await.expect("candidate stages");
         let decision = audit::audit_event(
             &caller(tenant),
             "identity.oidc.candidate.put",

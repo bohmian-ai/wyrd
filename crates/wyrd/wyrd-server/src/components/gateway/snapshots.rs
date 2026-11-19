@@ -38,6 +38,7 @@ use tokio::sync::{Notify, watch};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use wyrd_gateway::GatewayTenantSnapshot;
+use wyrd_kms::WyrdKms;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
 
@@ -179,21 +180,30 @@ pub struct GatewaySnapshots {
     /// its last participant stops waiting; see [`Participant`]. Held only
     /// to join or leave a load, never across one.
     loads: Mutex<HashMap<DataTenantId, Load>>,
+    /// Facade that opens managed secrets while a snapshot loads; `None`
+    /// without `[kms]`, which leaves them unprepared.
+    kms: Option<Arc<WyrdKms>>,
 }
 
 impl Default for GatewaySnapshots {
-    /// No snapshots and not yet listening.
+    /// No snapshots, not yet listening, and no facade.
     fn default() -> Self {
+        Self::new(None)
+    }
+}
+
+impl GatewaySnapshots {
+    /// An empty cache whose loads open managed secrets with `kms`.
+    pub(crate) fn new(kms: Option<Arc<WyrdKms>>) -> Self {
         Self {
             entries: Mutex::default(),
             wake: Notify::new(),
             live: watch::Sender::new(false),
             loads: Mutex::default(),
+            kms,
         }
     }
-}
 
-impl GatewaySnapshots {
     /// Locks the entries; a poisoned lock is recovered, because every holder
     /// leaves them consistent before anything under it could panic.
     fn entries(&self) -> MutexGuard<'_, Entries> {
@@ -219,6 +229,12 @@ impl GatewaySnapshots {
     /// next miss loads again. A load that raced an invalidation is returned
     /// but not cached, as [`Self::insert`] decides.
     ///
+    /// The caller waits on this load, so it opens managed secrets only with
+    /// a local facade, which waits on no external service. With a remote
+    /// one it leaves them unprepared, so those credentials resolve as
+    /// unavailable, and queues the background reload that prepares them;
+    /// every other credential serves at once.
+    ///
     /// # Errors
     /// Returns the load's error, such as `ServiceUnavailable` when storage
     /// fails.
@@ -231,8 +247,19 @@ impl GatewaySnapshots {
         if let Some(snapshot) = self.cached(tenant) {
             return Ok(snapshot);
         }
-        self.share(tenant, load_snapshot(postgres, config, tenant))
-            .await
+        let kms = self.kms.as_deref();
+        let local = kms.filter(|kms| kms.backend().is_local());
+        let snapshot = self
+            .share(tenant, async {
+                load_snapshot(postgres, config, tenant, local)
+                    .await
+                    .map(|(snapshot, _)| snapshot)
+            })
+            .await?;
+        if kms.is_some() && local.is_none() && snapshot.unprepared() {
+            self.requeue(tenant);
+        }
+        Ok(snapshot)
     }
 
     /// Runs `load` as `tenant`'s one miss load unless a load for it is
@@ -276,14 +303,20 @@ impl GatewaySnapshots {
         }
     }
 
-    /// Loads `tenant`'s snapshot from `postgres` with `config`'s bindings and
-    /// installs it; see [`Self::install`] for what a load that does not
-    /// install leaves behind.
+    /// Loads `tenant`'s snapshot from `postgres` with `config`'s bindings,
+    /// opening its managed secrets, and installs it; see [`Self::install`]
+    /// for what a load that does not install leaves behind.
+    ///
+    /// This background owner is where a remote facade's waits belong. A
+    /// managed secret that fails to open retryably is installed unprepared,
+    /// so every other credential serves, and the tenant stays queued until a
+    /// load prepares it.
     ///
     /// Returns whether the snapshot was cached.
     ///
     /// # Errors
-    /// Returns the load's error after logging it.
+    /// Returns the load's error after logging it, or `ServiceUnavailable`
+    /// when a managed secret failed to open retryably.
     pub(crate) async fn reload(
         &self,
         postgres: &wyrd_sql::WyrdPostgres,
@@ -293,8 +326,17 @@ impl GatewaySnapshots {
         let Some(generation) = self.fill_generation() else {
             return Ok(false);
         };
-        let loaded = load_snapshot(postgres, config, tenant).await;
-        self.install(tenant, generation, loaded)
+        let loaded = load_snapshot(postgres, config, tenant, self.kms.as_deref()).await;
+        let retry = matches!(loaded, Ok((_, true)));
+        let cached = self.install(tenant, generation, loaded.map(|(snapshot, _)| snapshot))?;
+        if retry {
+            self.requeue(tenant);
+            return Err(WyrdError::ServiceUnavailable {
+                message: "gateway managed secret preparation is unavailable".to_owned(),
+                details: serde_json::json!({ "resource": "credential" }),
+            });
+        }
+        Ok(cached)
     }
 
     /// Installs one reload of `tenant` that started under `generation`,

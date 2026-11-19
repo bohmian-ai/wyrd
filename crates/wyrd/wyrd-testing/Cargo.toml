@@ -104,6 +104,7 @@ wyrd-auth-issue = { workspace = true }
 wyrd-auth-oidc = { workspace = true }
 wyrd-auth-verify = { workspace = true }
 wyrd-crypt = { workspace = true }
+wyrd-kms = { workspace = true }
 wyrd-client = { workspace = true, features = ["internal", "test-support"] }
 wyrd-queue = { workspace = true }
 wyrd-types = { workspace = true }

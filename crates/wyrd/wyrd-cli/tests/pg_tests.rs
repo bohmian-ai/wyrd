@@ -114,8 +114,6 @@ impl LocalDev {
             .env_remove("WYRD_PLATFORM_DATABASE_URL")
             .env_remove("WYRD_STORAGE_URL")
             .env_remove("WYRD_CONFIG_PATH")
-            .env_remove("WYRD_SEALING_KEY_FILE")
-            .env_remove("WYRD_SEALING_KEY_BASE64")
             .env("APP_ENV", "development")
             .env("WYRD_SERVER_BIND", &self.bind)
             .env("WYRD_GRPC_BIND", &self.grpc)
@@ -1814,24 +1812,58 @@ async fn guided_init_lifecycle_and_prompt() {
 /// Provider key the quickstart form stores and the mock provider demands.
 const LOCAL_PROVIDER_KEY: &str = "sk-local-dev-managed-secret";
 
-/// Supplied sealing key, base64 of 32 bytes, that a deployment retains.
-const SUPPLIED_SEALING_KEY: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=";
+/// Operator connection bearer token the init journey stores.
+const LOCAL_HOOK_TOKEN: &str = "local-dev-operator-hook-token";
 
-/// A fresh `wyrd init` deployment seals a quickstart-form managed
-/// secret on first boot with no extra key step, delivers it to a local
-/// provider through the gateway, and keeps delivering it after a bare rerun
-/// from another working directory. The sealing key is generated, or supplied
-/// through `WYRD_SEALING_KEY_FILE` or `WYRD_SEALING_KEY_BASE64` on the first
-/// run only and retained; a different supplied key is later refused without
-/// replacing it. The tenant key is unchanged and the secret never reaches any
-/// captured output.
+/// Every stored secret envelope's magic prefix.
+const ENVELOPE_MAGIC: &[u8] = b"WKMS";
+
+/// The stored secret columns of the local tenant's gateway credential and
+/// Operator connection, read in an operator session.
 ///
 /// # Panics
-/// Panics when setup, the credential or deployment write, either gateway
-/// call, the retained key, the refusal, or a leak check fails.
+/// Panics when the database cannot be reached or either row is absent.
+async fn stored_envelopes(dsn: &SecretString) -> (Vec<u8>, Vec<u8>) {
+    let pool = sqlx::PgPool::connect(dsn.expose_secret())
+        .await
+        .expect("deployment database connects");
+    let mut operator = pool.begin().await.expect("operator transaction");
+    sqlx::query("SELECT set_config('app.operator', 'on', true)")
+        .execute(&mut *operator)
+        .await
+        .expect("operator session");
+    let gateway = sqlx::query_scalar(
+        "SELECT secret_ciphertext FROM wyrd.gateway_provider_credentials WHERE name = 'local-key'",
+    )
+    .fetch_one(&mut *operator)
+    .await
+    .expect("gateway credential row");
+    let connection = sqlx::query_scalar(
+        "SELECT secret_ciphertext FROM wyrd.operator_connections WHERE name = 'local-hooks'",
+    )
+    .fetch_one(&mut *operator)
+    .await
+    .expect("operator connection row");
+    drop(operator);
+    pool.close().await;
+    (gateway, connection)
+}
+
+/// A fresh `wyrd init` deployment stores a gateway managed secret and an
+/// Operator connection secret with no extra key step, uses the managed
+/// secret through the gateway, and keeps both usable after a bare rerun
+/// from another working directory. Both rows hold the common stored-secret
+/// envelope under the one owner-only key file init generated and reuses;
+/// the views stay redacted, the tenant key is unchanged, and no secret
+/// reaches any captured output.
+///
+/// # Panics
+/// Panics when setup, a credential, connection, or deployment write, either
+/// gateway call, the retained key, the stored envelopes, or a leak check
+/// fails.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "launches the built server and production UI; run via `mise run test:local-dev:journey`"]
-async fn init_keeps_the_gateway_managed_secret_key() {
+async fn init_keeps_one_stored_secret_key_for_every_owner() {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1850,123 +1882,139 @@ async fn init_keeps_the_gateway_managed_secret_key() {
             "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop", "logprobs": null}],
             "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
         })))
-        .expect(6)
+        .expect(2)
         .mount(&provider)
         .await;
 
-    for source in ["generated", "file", "inline"] {
-        let mut local = LocalDev::new().await;
-        let mut first = local.command();
-        let supplied = local.home.path().join("supplied.key");
-        fs::write(&supplied, SUPPLIED_SEALING_KEY).expect("supplied key");
-        fs::set_permissions(&supplied, fs::Permissions::from_mode(0o600)).expect("owner-only");
-        match source {
-            "file" => first.env("WYRD_SEALING_KEY_FILE", &supplied),
-            "inline" => first.env("WYRD_SEALING_KEY_BASE64", SUPPLIED_SEALING_KEY),
-            _ => &mut first,
-        };
-        first.args(["init", "--tenant", "local"]);
-        local.start_with(first).await;
-        let retained = local.home.path().join("wyrd/server/sealing.key");
-        if source != "generated" {
-            assert_eq!(
-                fs::read_to_string(&retained).expect("retained key").trim(),
-                SUPPLIED_SEALING_KEY,
-                "{source}: the supplied key is retained"
-            );
-        }
-        let mut printed = String::new();
-        for (args, document) in [
-            (
-                ["gateway", "credential", "put", "--file", "-"],
-                format!(
-                    r#"{{"name":"local-key","provider":"local-mock","source":{{"managed_secret":{{"secret":"{LOCAL_PROVIDER_KEY}"}}}}}}"#
-                ),
-            ),
-            (
-                ["gateway", "deployment", "put", "--file", "-"],
-                json!({
-                    "name": "local-mock",
-                    "adapter": {"openai_compatible": {"base_url": format!("{}/v1", provider.uri())}},
-                    "auth": {"bearer": {"credential": "local-key"}},
-                    "capabilities": ["chat_completions"],
-                })
-                .to_string(),
-            ),
-        ] {
-            let output = local.stdin_command(&args, &document).await;
-            let text = format!(
-                "{}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            assert!(output.status.success(), "{source} {args:?} failed: {text}");
-            printed.push_str(&text);
-        }
-        let credentials = local.home.path().join("wyrd/credentials.toml");
-        let saved = fs::read(&credentials).expect("saved credentials");
-        let elsewhere = local.home.path().join("elsewhere");
-        fs::create_dir_all(&elsewhere).expect("other working directory");
+    let mut local = LocalDev::new().await;
+    let mut first = local.command();
+    first.args(["init", "--tenant", "local"]);
+    local.start_with(first).await;
+    let key = local.home.path().join("wyrd/server/kms/local");
+    let mode = fs::metadata(&key)
+        .expect("init keeps a local key")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o077, 0, "the local key is owner-only");
+    let kept = fs::read(&key).expect("local key");
 
-        for run in ["first run", "rerun"] {
-            if run == "rerun" {
-                let mut bare = local.command();
-                bare.current_dir(&elsewhere)
-                    .args(["init", "--non-interactive"]);
-                local.start_with(bare).await;
-            }
-            let token = local
-                .client()
-                .access_token()
-                .await
-                .expect("saved key exchanges");
-            let answer = reqwest::Client::new()
-                .post(format!("http://{}/v1/chat/completions", local.bind))
-                .bearer_auth(token.expose())
-                .json(&json!({
-                    "model": "local-mock/m",
-                    "messages": [{"role": "user", "content": "hi"}],
-                }))
-                .send()
-                .await
-                .expect("gateway call sends");
-            let status = answer.status();
-            let body = answer.text().await.expect("gateway answer");
-            assert_eq!(status.as_u16(), 200, "{source} {run}: {body}");
-            assert!(body.contains("chatcmpl-local"), "{source} {run}: {body}");
-            printed.push_str(&body);
-            let stopped = local.stop("-INT").await;
-            if run == "rerun" {
-                assert!(
-                    stopped.contains("[configured] Gateway: local-mock (existing)"),
-                    "{source} {run}: {stopped}"
-                );
-            }
-            printed.push_str(&stopped);
-        }
-        assert_eq!(fs::read(&credentials).expect("credentials"), saved);
-
-        let kept = fs::read(&retained).expect("retained key");
-        let other = local
-            .command()
-            .env(
-                "WYRD_SEALING_KEY_BASE64",
-                "CAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg=",
-            )
-            .args(["init", "--non-interactive"])
-            .output()
-            .await
-            .expect("different key");
-        let refused = String::from_utf8_lossy(&other.stderr);
-        assert!(!other.status.success(), "{source}: {refused}");
-        assert!(
-            refused.contains("differs from the retained"),
-            "{source}: {refused}"
+    let mut printed = String::new();
+    for (args, document) in [
+        (
+            vec!["gateway", "credential", "put", "--file", "-"],
+            format!(
+                r#"{{"name":"local-key","provider":"local-mock","source":{{"managed_secret":{{"secret":"{LOCAL_PROVIDER_KEY}"}}}}}}"#
+            ),
+        ),
+        (
+            vec!["gateway", "deployment", "put", "--file", "-"],
+            json!({
+                "name": "local-mock",
+                "adapter": {"openai_compatible": {"base_url": format!("{}/v1", provider.uri())}},
+                "auth": {"bearer": {"credential": "local-key"}},
+                "capabilities": ["chat_completions"],
+            })
+            .to_string(),
+        ),
+        (
+            vec!["operator-connection", "create", "--body-file", "-"],
+            json!({
+                "provider": "http",
+                "name": "local-hooks",
+                "origin": provider.uri(),
+                "auth": {"scheme": "bearer", "token": LOCAL_HOOK_TOKEN},
+            })
+            .to_string(),
+        ),
+    ] {
+        let output = local.stdin_command(&args, &document).await;
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(fs::read(&retained).expect("retained key"), kept);
+        assert!(output.status.success(), "{args:?} failed: {text}");
+        printed.push_str(&text);
+    }
+    let (gateway, connection) = stored_envelopes(&local.dsn).await;
+    for (owner, stored) in [("gateway", &gateway), ("operator", &connection)] {
         assert!(
-            !printed.contains(LOCAL_PROVIDER_KEY) && !printed.contains(SUPPLIED_SEALING_KEY),
-            "{source}: no provider secret or sealing key reaches CLI, server, or gateway output"
+            stored.starts_with(ENVELOPE_MAGIC),
+            "{owner}: the row holds the common envelope"
+        );
+        assert!(
+            !String::from_utf8_lossy(stored).contains(LOCAL_PROVIDER_KEY)
+                && !String::from_utf8_lossy(stored).contains(LOCAL_HOOK_TOKEN),
+            "{owner}: the row discloses no plaintext"
         );
     }
+    let credentials = local.home.path().join("wyrd/credentials.toml");
+    let saved = fs::read(&credentials).expect("saved credentials");
+    let elsewhere = local.home.path().join("elsewhere");
+    fs::create_dir_all(&elsewhere).expect("other working directory");
+
+    for run in ["first run", "rerun"] {
+        if run == "rerun" {
+            let mut bare = local.command();
+            bare.current_dir(&elsewhere)
+                .args(["init", "--non-interactive"]);
+            local.start_with(bare).await;
+        }
+        let token = local
+            .client()
+            .access_token()
+            .await
+            .expect("saved key exchanges");
+        let answer = reqwest::Client::new()
+            .post(format!("http://{}/v1/chat/completions", local.bind))
+            .bearer_auth(token.expose())
+            .json(&json!({
+                "model": "local-mock/m",
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .send()
+            .await
+            .expect("gateway call sends");
+        let status = answer.status();
+        let body = answer.text().await.expect("gateway answer");
+        assert_eq!(status.as_u16(), 200, "{run}: {body}");
+        assert!(body.contains("chatcmpl-local"), "{run}: {body}");
+        printed.push_str(&body);
+        let listed = local
+            .command()
+            .args(["operator-connection", "list"])
+            .output()
+            .await
+            .expect("connection list");
+        let text = String::from_utf8_lossy(&listed.stdout).into_owned();
+        assert!(listed.status.success(), "{run}: {text}");
+        assert!(text.contains("local-hooks"), "{run}: {text}");
+        printed.push_str(&text);
+        let stopped = local.stop("-INT").await;
+        if run == "rerun" {
+            assert!(
+                stopped.contains("[configured] Gateway: local-mock (existing)"),
+                "{run}: {stopped}"
+            );
+        }
+        printed.push_str(&stopped);
+    }
+    assert_eq!(fs::read(&credentials).expect("credentials"), saved);
+    assert_eq!(
+        fs::read(&key).expect("local key"),
+        kept,
+        "the rerun reuses the key"
+    );
+    assert_eq!(
+        stored_envelopes(&local.dsn).await,
+        (gateway, connection),
+        "a rerun rewrites no stored secret"
+    );
+    let key_text = String::from_utf8_lossy(&kept).trim().to_owned();
+    assert!(
+        !printed.contains(LOCAL_PROVIDER_KEY)
+            && !printed.contains(LOCAL_HOOK_TOKEN)
+            && !printed.contains(&key_text),
+        "no secret or key reaches CLI, server, or gateway output"
+    );
 }

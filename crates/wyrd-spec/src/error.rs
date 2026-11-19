@@ -2407,13 +2407,14 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: Value,
     },
-    /// The tenant already has an Operator connection of this provider and name.
+    /// The tenant already has an Operator connection of this provider and
+    /// name, or an update kept losing to concurrent writes.
     #[error("[WYRD_OPERATOR_409_CONNECTION_CONFLICT] {message}")]
     #[wyrd_error(
         code = "WYRD_OPERATOR_409_CONNECTION_CONFLICT",
         status = 409,
-        title = "Operator connection name conflict",
-        remediation = "Choose another name, or PATCH the existing connection to rotate its secret."
+        title = "Operator connection conflict",
+        remediation = "For a create, choose another name or PATCH the existing connection to rotate its secret; for a concurrent update, read the connection again and retry."
     )]
     OperatorConnectionConflict {
         /// Human-readable error message.
@@ -2435,13 +2436,14 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: Value,
     },
-    /// The server has no usable key-encryption key for Operator connection secrets.
+    /// Stored-secret encryption could not seal or open an Operator connection
+    /// secret.
     #[error("[WYRD_OPERATOR_503_KEY_UNAVAILABLE] {message}")]
     #[wyrd_error(
         code = "WYRD_OPERATOR_503_KEY_UNAVAILABLE",
         status = 503,
         title = "Operator connection key unavailable",
-        remediation = "Restore the configured Operator key provider so it can supply the active key, then retry."
+        remediation = "Configure [kms] (WYRD_KMS_*) and restore its wrapping backend so it can serve the active and retained keys, then retry."
     )]
     OperatorKeyUnavailable {
         /// Human-readable error message.

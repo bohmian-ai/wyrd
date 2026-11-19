@@ -36,7 +36,7 @@ use uuid::Uuid;
 use wyrd_auth_oidc::{
     ProviderMetadata, RelyingParty, RelyingPartyError, ScreenedHttp, TrustedIssuer,
 };
-use wyrd_crypt::SealingKeyring;
+use wyrd_kms::{SecretPurpose, SecretScope, WyrdKms};
 use wyrd_runtime::Permission;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
@@ -64,7 +64,7 @@ use crate::error::{relying_party_error, store_error};
 use crate::exchange_api_key::{ExchangeError, role_refs, verify_api_key};
 use crate::issuance::resolve_permissions;
 use crate::login::LOGIN_STATE_TTL;
-use crate::pg_resolvers::{human_connection_trusted_issuer, seal_secret};
+use crate::pg_resolvers::{ClientSecretOwner, IssuerSealError, human_connection_trusted_issuer};
 
 /// How long a successful candidate test authorizes activation.
 pub const CONNECTION_TEST_VALIDITY: Duration = Duration::from_mins(15);
@@ -86,16 +86,16 @@ const CONNECTION_RESOURCE: &str = "identity:oidc_connection";
 /// The tenant human-connection owner.
 ///
 /// Holds the role-separated runtime store (every statement runs on an RLS
-/// [`TenantConn`] acquired through [`WyrdPostgres`]), the deployment sealing
-/// keyring, and the human-login relying party. Built once per server and cheap to clone;
+/// [`TenantConn`] acquired through [`WyrdPostgres`]), the deployment
+/// stored-secret facade, and the human-login relying party. Built once per server and cheap to clone;
 /// clones share the relying party's provider cache.
 #[derive(Clone)]
 pub struct HumanConnections {
     /// Runtime Postgres handle every tenant transaction is acquired from.
     postgres: WyrdPostgres,
-    /// Sealing keyring for provider client secrets; `None` on a keyless
-    /// deployment, which can then stage only public clients.
-    keyring: Option<Arc<SealingKeyring>>,
+    /// Stored-secret facade for provider client secrets; `None` without
+    /// `[kms]`, which can then stage only public clients.
+    kms: Option<Arc<WyrdKms>>,
     /// The human-login relying party; every provider request it makes goes
     /// through the screened, redirect-disabled, proxy-free HTTP capability.
     relying_party: RelyingParty,
@@ -143,18 +143,18 @@ pub struct ActiveHumanConnection {
 }
 
 impl HumanConnections {
-    /// Build the owner over the runtime store, keyring, screened HTTP, and
+    /// Build the owner over the runtime store, facade, screened HTTP, and
     /// the process audit stage its decisions are staged on.
     #[must_use]
     pub fn new(
         postgres: WyrdPostgres,
-        keyring: Option<Arc<SealingKeyring>>,
+        kms: Option<Arc<WyrdKms>>,
         http: ScreenedHttp,
         audit: Arc<dyn AuditStage>,
     ) -> Self {
         Self {
             postgres,
-            keyring,
+            kms,
             relying_party: RelyingParty::new(http),
             audit,
         }
@@ -211,24 +211,48 @@ impl HumanConnections {
         Ok(response)
     }
 
-    /// Prepare a candidate write without IO: seal the secret under the
-    /// keyring's write key.
+    /// Prepare `tenant`'s candidate write with no database IO: seal the
+    /// secret into the common envelope bound to the tenant, issuer, client
+    /// id, and method.
     ///
     /// `input` must come from [`ConnectionInput::from_slice`], which is the one
     /// place its cross-field rules are checked; the durable table re-asserts
     /// the Public-has-no-secret invariant. Callers run this before
-    /// authorizing, so every refusal it can produce is a deployment or input
-    /// fact rather than an unaudited decision.
+    /// authorizing and before any transaction opens, so every refusal it can
+    /// produce is a deployment or input fact rather than an unaudited
+    /// decision, and a key-service wait holds no lock.
     ///
     /// # Errors
     /// Returns [`WyrdError::Validation`] when a secret must be sealed without
-    /// a keyring, and [`WyrdError::Internal`] when sealing or JSON encoding
-    /// fails.
-    pub fn stage(&self, input: ConnectionInput) -> Result<StagedCandidate, WyrdError> {
+    /// `[kms]`, [`WyrdError::ServiceUnavailable`] when sealing fails, and
+    /// [`WyrdError::Internal`] when JSON encoding fails.
+    pub async fn stage(
+        &self,
+        tenant: DataTenantId,
+        input: ConnectionInput,
+    ) -> Result<StagedCandidate, WyrdError> {
         let client_secret_enc = match &input.client_secret {
             Some(secret) => {
-                let keyring = self.require_keyring()?;
-                Some(seal_secret(keyring, secret.expose().as_bytes()).map_err(internal)?)
+                let kms = self.require_kms()?;
+                let owner = ClientSecretOwner {
+                    scope: SecretScope::Tenant(tenant),
+                    purpose: SecretPurpose::AuthHumanConnection,
+                    issuer_url: input.issuer.as_str(),
+                    client_id: &input.client_id,
+                };
+                Some(
+                    owner
+                        .seal_secret(
+                            input.client_auth.as_str(),
+                            secret.expose().as_bytes(),
+                            Some(kms),
+                        )
+                        .await
+                        .map_err(|_: IssuerSealError| WyrdError::ServiceUnavailable {
+                            message: "provider client secret protection is unavailable".to_owned(),
+                            details: json!({ "reason": "kms_unavailable" }),
+                        })?,
+                )
             }
             None => None,
         };
@@ -408,7 +432,8 @@ impl HumanConnections {
             return Ok(None);
         };
         row.jwks_uri = Some(jwks_uri.to_string());
-        let trusted = human_connection_trusted_issuer(tenant, row, self.keyring.as_deref())
+        let trusted = human_connection_trusted_issuer(tenant, row, self.kms.as_deref())
+            .await
             .map_err(|error| {
                 tracing::error!(error = %error, tenant_id = %tenant, "tested candidate is unusable");
                 WyrdError::AuthVerifyUnavailable {
@@ -650,7 +675,8 @@ impl HumanConnections {
             connection_id: row.connection_id,
             connection_revision: row.revision,
         };
-        let trusted = human_connection_trusted_issuer(tenant, row, self.keyring.as_deref())
+        let trusted = human_connection_trusted_issuer(tenant, row, self.kms.as_deref())
+            .await
             .map_err(|error| {
                 tracing::error!(error = %error, tenant_id = %tenant, "active human connection is unusable");
                 WyrdError::AuthVerifyUnavailable {
@@ -661,20 +687,21 @@ impl HumanConnections {
         Ok(Some(ActiveHumanConnection { trusted, binding }))
     }
 
-    /// The deployment sealing keyring, required wherever this owner seals.
+    /// The deployment stored-secret facade, required wherever this owner
+    /// seals.
     ///
-    /// A provider client secret is sealed before it is stored, so a keyless
-    /// deployment can stage only public-client connections.
+    /// A provider client secret is sealed before it is stored, so a
+    /// deployment without `[kms]` can stage only public-client connections.
     ///
     /// # Errors
-    /// Returns [`WyrdError::Validation`] with reason `sealing_key_missing`
-    /// when no sealing keyring is configured.
-    pub(crate) fn require_keyring(&self) -> Result<&Arc<SealingKeyring>, WyrdError> {
-        self.keyring.as_ref().ok_or_else(|| WyrdError::Validation {
-            message: "a deployment sealing key (WYRD_SEALING_KEY_FILE) is required to seal \
-                      provider client secrets at rest"
+    /// Returns [`WyrdError::Validation`] with reason `kms_unconfigured` when
+    /// no `[kms]` is configured.
+    pub(crate) fn require_kms(&self) -> Result<&WyrdKms, WyrdError> {
+        self.kms.as_deref().ok_or_else(|| WyrdError::Validation {
+            message: "stored-secret encryption ([kms], WYRD_KMS_*) is required to store \
+                      provider client secrets"
                 .to_owned(),
-            details: json!({ "reason": "sealing_key_missing" }),
+            details: json!({ "reason": "kms_unconfigured" }),
         })
     }
 

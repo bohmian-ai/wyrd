@@ -5129,6 +5129,7 @@ async fn a_trailing_slash_platform_issuer_completes_first_login() {
         .expect("connection reads")
         .expect("a connection was configured");
     let connection = wyrd_auth::pg_resolvers::platform_connection_from_row(row, None)
+        .await
         .expect("the stored connection decodes");
     let searched = connection.verification.issuer.as_str();
     assert_eq!(

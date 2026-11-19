@@ -10297,8 +10297,8 @@ dependencies = [
  "wyrd-auth-issue",
  "wyrd-auth-oidc",
  "wyrd-auth-verify",
- "wyrd-crypt",
  "wyrd-dev-fixtures",
+ "wyrd-kms",
  "wyrd-runtime",
  "wyrd-semver",
  "wyrd-spec",
@@ -10633,7 +10633,7 @@ dependencies = [
  "wiremock",
  "workspace-hack",
  "wyrd-benchmark",
- "wyrd-crypt",
+ "wyrd-kms",
  "wyrd-runtime",
  "wyrd-skald-providers",
  "wyrd-skald-spec",
@@ -10641,7 +10641,6 @@ dependencies = [
  "wyrd-tls",
  "wyrd-utils",
  "wyrd-vault",
- "zeroize",
 ]
 
 [[package]]
@@ -10986,6 +10985,7 @@ dependencies = [
  "wyrd-crypt",
  "wyrd-dev-fixtures",
  "wyrd-gateway",
+ "wyrd-kms",
  "wyrd-loader",
  "wyrd-queue",
  "wyrd-runtime",
@@ -11006,7 +11006,6 @@ dependencies = [
  "wyrd-tonic",
  "wyrd-types",
  "wyrd-utils",
- "wyrd-vault",
  "zeroize",
  "zip",
 ]
@@ -11332,6 +11331,7 @@ dependencies = [
  "wyrd-crypt",
  "wyrd-dev-fixtures",
  "wyrd-gateway",
+ "wyrd-kms",
  "wyrd-queue",
  "wyrd-runtime",
  "wyrd-semver",

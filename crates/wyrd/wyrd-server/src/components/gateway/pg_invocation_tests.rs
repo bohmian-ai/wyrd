@@ -30,7 +30,6 @@ use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use wiremock::matchers::{body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
-use wyrd_crypt::{SealingKeyring, SecretKey};
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_gateway::{
     AttemptRecord, AttemptResult, AttemptUsage, CallExecution, CallPlan, CredentialResolver,
@@ -59,7 +58,7 @@ use wyrd_storage::{LocalSigner, StorageHandle};
 use super::capture::object_path;
 use super::capture::recording::RecordingScribe;
 use super::ledger::{Accounted, GatewayLedger, LedgerCall};
-use super::pg_administration_tests::{admin, audit_decisions, sealing_keyring, test_state};
+use super::pg_administration_tests::{admin, audit_decisions, test_state};
 use super::routes::JsonBody;
 use super::telemetry::IngressClock;
 use super::{GatewayAdministration, GatewayCallRequest, GatewayCallResponse, GatewayInvocation};
@@ -67,6 +66,7 @@ use crate::components::auth::Caller;
 use crate::http::error::WyrdErrorResponse;
 use crate::http::middleware::body_limit::BodyCustody;
 use crate::state::AppState;
+use crate::test_support::seeded_kms;
 
 /// One scripted provider attempt.
 enum Step {
@@ -209,6 +209,7 @@ async fn replica(fixture: &PgFixture, dispatch: Arc<dyn ProviderDispatch>) -> Ap
                 DeploymentHealth::default(),
                 dispatch,
             ),
+            None,
         );
     }))
     .await
@@ -658,28 +659,29 @@ impl ProviderDispatch for RecordingKeys {
     }
 }
 
-/// Builds one replica whose administration and resolver share the deployment
-/// sealing `keyring`, the shape a restarted or additional process has when it
-/// boots with the same `WYRD_SEALING_KEY_FILE`.
+/// Builds one replica whose administration and snapshot loads share the
+/// deployment `[kms]` facade `kms`, the shape a restarted or additional
+/// process has when it boots with the same `[kms]` configuration.
 ///
 /// # Panics
 ///
 /// Panics when the replica's application state cannot be built on `fixture`.
 async fn managed_replica(
     fixture: &PgFixture,
-    keyring: Option<Arc<SealingKeyring>>,
+    kms: Option<Arc<wyrd_kms::WyrdKms>>,
     dispatch: Arc<dyn ProviderDispatch>,
 ) -> AppState {
     let state = test_state(fixture).await;
-    let state = state.with_owners_for_test(|owners| owners.auth.sealing_key = keyring.clone());
+    let state = state.with_owners_for_test(|owners| owners.auth.kms = kms.clone());
     serving(state.with_owners_for_test(|owners| {
         owners.gateway = crate::components::gateway::Gateway::new(
             crate::config::GatewayConfig::default(),
             GatewayEngine::new(
-                CredentialResolver::new(std::collections::BTreeMap::new(), keyring),
+                CredentialResolver::default(),
                 DeploymentHealth::default(),
                 dispatch,
             ),
+            kms,
         );
     }))
     .await
@@ -808,10 +810,10 @@ async fn assert_refused(state: &AppState, tenant: DataTenantId, reason: &str) {
     );
 }
 
-/// Managed credentials are sealed with the deployment sealing keyring and stay
+/// Managed credentials are sealed through the deployment `[kms]` and stay
 /// tenant-bound: two tenants send their own key upstream, a restarted replica
 /// with the same key keeps resolving, the production boot rewrap moves every
-/// envelope onto a rotated write key, and an envelope copied into another
+/// envelope onto a rotated active key, and an envelope copied into another
 /// tenant's row, a keyless deployment, a key retired before rewrap, or a
 /// revoked credential all fail with the stable 503-class error before any
 /// dispatch.
@@ -832,7 +834,7 @@ async fn gateway_managed_credentials_resolve_per_tenant_across_restart_and_rotat
     let tenants = [first, second];
     let dispatch = RecordingKeys::shared();
 
-    let state = managed_replica(&fixture, Some(sealing_keyring(1)), dispatch.clone()).await;
+    let state = managed_replica(&fixture, Some(seeded_kms(1, &[])), dispatch.clone()).await;
     configure_managed(&state, first, "sk-first-tenant").await;
     configure_managed(&state, second, "sk-second-tenant").await;
     for tenant in tenants {
@@ -844,24 +846,21 @@ async fn gateway_managed_credentials_resolve_per_tenant_across_restart_and_rotat
         "each tenant's own key, and only it, reaches dispatch"
     );
 
-    // A restarted replica booting with the same sealing key resolves
+    // A restarted replica booting with the same `[kms]` key resolves
     // committed values.
-    let restarted = managed_replica(&fixture, Some(sealing_keyring(1)), dispatch.clone()).await;
+    let restarted = managed_replica(&fixture, Some(seeded_kms(1, &[])), dispatch.clone()).await;
     warm(&restarted, [first, second]).await;
     invoke_managed(&restarted, first).await.expect("restart");
     assert_eq!(dispatch.seen().len(), 3);
 
-    // Rotation follows the deployment procedure: the new write key with the
+    // Rotation follows the deployment procedure: the new active key with the
     // old one retained still resolves, while a replica holding only the new
-    // key refuses until the boot rewrap has resealed every envelope.
-    let rotation = Arc::new(
-        SealingKeyring::new(SecretKey::from_bytes([2; 32]))
-            .with_retained(SecretKey::from_bytes([1; 32])),
-    );
+    // key refuses until the boot rewrap has rewrapped every envelope.
+    let rotation = seeded_kms(2, &[1]);
     let rotated = managed_replica(&fixture, Some(Arc::clone(&rotation)), dispatch.clone()).await;
     warm(&rotated, [first, second]).await;
     invoke_managed(&rotated, first).await.expect("retained key");
-    let retired = managed_replica(&fixture, Some(sealing_keyring(2)), dispatch.clone()).await;
+    let retired = managed_replica(&fixture, Some(seeded_kms(2, &[])), dispatch.clone()).await;
     warm(&retired, [first, second]).await;
     assert_refused(&retired, first, "the old key was retired before rewrap").await;
     assert_eq!(dispatch.seen().len(), 4, "the refusal did not dispatch");
@@ -876,11 +875,11 @@ async fn gateway_managed_credentials_resolve_per_tenant_across_restart_and_rotat
     assert_ne!(
         managed_envelope(&fixture, first).await,
         committed,
-        "the rewrap resealed the stored envelope"
+        "the rewrap rewrapped the stored envelope"
     );
     // A replica booting with only the new key after the rewrap opens every
     // envelope. It is a fresh process, as in the rollout.
-    let rewrapped = managed_replica(&fixture, Some(sealing_keyring(2)), dispatch.clone()).await;
+    let rewrapped = managed_replica(&fixture, Some(seeded_kms(2, &[])), dispatch.clone()).await;
     warm(&rewrapped, [first, second]).await;
     for tenant in tenants {
         invoke_managed(&rewrapped, tenant)
@@ -892,7 +891,7 @@ async fn gateway_managed_credentials_resolve_per_tenant_across_restart_and_rotat
         ["sk-first-tenant", "sk-first-tenant", "sk-second-tenant"]
     );
 
-    // Every tenant shares the deployment keyring, yet an envelope copied into
+    // Every tenant shares the deployment `[kms]`, yet an envelope copied into
     // another tenant's row never opens there, and a keyless deployment opens
     // nothing.
     let dispatched = dispatch.seen().len();
@@ -2080,6 +2079,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
                     .expect("gateway dispatch builds"),
                 ),
             ),
+            None,
         );
     });
     let (state, scribe) = RecordingScribe::attach(state);
@@ -2848,6 +2848,7 @@ async fn http_replica(fixture: &PgFixture, tenant: DataTenantId, secret: &Path) 
                     .expect("gateway dispatch builds"),
                 ),
             ),
+            None,
         );
     });
     serving(state).await
@@ -3634,7 +3635,7 @@ async fn gateway_batch_dispatch_reauthorizes_against_its_routing_snapshot() {
     // decision, turns the deployment `granted`, then releases it.
     let race = |caller: &Caller, n: &'static str| {
         let (fixture, deploy) = (&fixture, &deploy);
-        let creation = create(caller, n);
+        let creation = Box::pin(create(caller, n));
         async move {
             let mut barrier = fixture.tenant_conn_for(tenant).await.expect("tenant conn");
             sqlx::query("LOCK TABLE wyrd.gateway_batches IN EXCLUSIVE MODE")
@@ -4115,6 +4116,7 @@ async fn replica_with_fixture_catalog(
                     DeploymentHealth::default(),
                     dispatch,
                 ),
+                None,
             );
         });
     serving(state).await
@@ -5150,6 +5152,7 @@ async fn gateway_observations_are_bounded_correlated_and_secret_free() {
                         .expect("gateway dispatch builds"),
                     ),
                 ),
+                None,
             );
         }));
     let state = serving(state).await;
@@ -6471,7 +6474,7 @@ async fn public_ingress_fallback_override() {
         },
     )
     .expect("gateway dispatch builds");
-    let state = managed_replica(&fixture, Some(sealing_keyring(1)), Arc::new(dispatch)).await;
+    let state = managed_replica(&fixture, Some(seeded_kms(1, &[])), Arc::new(dispatch)).await;
     let admin = admin(tenant);
     let gateway = GatewayAdministration::new(&state);
     for (provider, auth, capabilities, served) in [

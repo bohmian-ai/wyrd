@@ -140,13 +140,30 @@ pub async fn delete_platform_oidc_connection(conn: &mut TenantConn<'_>) -> Resul
         .map_err(SqlError::from)
 }
 
-/// Read the platform connection's sealed client secret for sealing-key rewrap.
+/// The platform connection's stored client secret with the owner metadata
+/// its envelope context binds.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct PlatformSealedSecretRow {
+    /// Issuer URL, the envelope's owner.
+    pub issuer_url: String,
+    /// OAuth client id.
+    pub client_id: String,
+    /// Client-authentication method.
+    pub client_auth: String,
+    /// The stored envelope exactly as stored.
+    pub client_secret_enc: Vec<u8>,
+}
+
+/// Read the platform connection's stored client secret for rewrap.
 ///
 /// # Errors
 /// Returns [`SqlError::Query`] when the read fails.
-pub async fn platform_sealed_secret(pool: &OperatorPool) -> Result<Option<Vec<u8>>, SqlError> {
-    sqlx::query_scalar(
-        "SELECT client_secret_enc FROM platform.oidc_connection
+pub async fn platform_sealed_secret(
+    pool: &OperatorPool,
+) -> Result<Option<PlatformSealedSecretRow>, SqlError> {
+    sqlx::query_as(
+        "SELECT issuer_url, client_id, client_auth, client_secret_enc
+           FROM platform.oidc_connection
           WHERE client_secret_enc IS NOT NULL",
     )
     .fetch_optional(pool.pool())

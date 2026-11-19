@@ -19,7 +19,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
 use uuid::Uuid;
-use wyrd_auth::pg_resolvers::{client_auth_label, seal_platform_client_secret};
+use wyrd_auth::pg_resolvers::{IssuerSealError, client_auth_label, seal_platform_client_secret};
 use wyrd_auth::platform_authz::{
     PLATFORM_ADMINS_RESOURCE, PLATFORM_CONNECTION_RESOURCE, PlatformAuthorization,
     PlatformAuthzError, platform_principal_resource,
@@ -219,13 +219,17 @@ async fn configure_connection(
     // The handle must outlive the transaction it lends out.
     let authz =
         PlatformAuthorization::new(pool.clone(), Arc::clone(state.bifrost.scribe_outbox()) as _);
-    let mut decision = authorize(
-        &authz,
-        &caller,
-        &Permission::platform_identity_write(),
-        PLATFORM_CONNECTION_RESOURCE,
-    )
-    .await?;
+    let required = Permission::platform_identity_write();
+    // Discovery and sealing wait on remote services, so the decision is made
+    // first and the operation's transaction opens only after both.
+    authz
+        .decide(
+            &caller.context,
+            &required,
+            caller.request_id.as_str(),
+            PLATFORM_CONNECTION_RESOURCE,
+        )
+        .map_err(|error| platform_authz_error(&error, &required))?;
 
     let client_auth = match request.client_auth {
         PlatformClientAuth::SecretBasic { secret } => {
@@ -262,17 +266,36 @@ async fn configure_connection(
         .map_err(|error| crate::components::admin::routes::discovery_error(&issuer, error))?;
     let jwks_uri = provider.jwks_uri().url().clone();
 
-    let sealed = seal_platform_client_secret(&client_auth, state.auth.sealing_key.as_deref())
-        .map_err(|error| {
-            // A secret-bearing connection with no sealing key fails closed
-            // rather than being stored in the clear. The sealing failure names
-            // the key store, so it stays server-side.
-            tracing::error!(cause = %error, "platform client secret could not be sealed");
-            WyrdErrorResponse::from(WyrdError::Validation {
-                message: "platform client secret could not be sealed".to_owned(),
-                details: serde_json::json!({}),
-            })
-        })?;
+    let sealed = seal_platform_client_secret(
+        issuer.as_str(),
+        &request.client_id,
+        &client_auth,
+        state.auth.kms.as_deref(),
+    )
+    .await
+    .map_err(|error| {
+        // A secret-bearing connection with no `[kms]` fails closed rather
+        // than being stored in the clear. The sealing failure names the key
+        // service, so it stays server-side.
+        tracing::error!(cause = %error, "platform client secret could not be sealed");
+        WyrdErrorResponse::from(match error {
+            IssuerSealError::KmsMissing => WyrdError::Validation {
+                message: "platform client secret could not be sealed: no [kms] is configured"
+                    .to_owned(),
+                details: serde_json::json!({ "reason": "kms_unconfigured" }),
+            },
+            IssuerSealError::Encrypt | IssuerSealError::Serialize(_) => {
+                WyrdError::ServiceUnavailable {
+                    message: "platform client secret could not be sealed".to_owned(),
+                    details: serde_json::json!({ "reason": "kms_unavailable" }),
+                }
+            }
+        })
+    })?;
+    let mut decision = authz
+        .begin()
+        .await
+        .map_err(|error| platform_authz_error(&error, &required))?;
 
     // The parsed issuer, not the request text, is what gets stored: login
     // reparses the stored row into an `IssuerUrl` and pins the identity by that

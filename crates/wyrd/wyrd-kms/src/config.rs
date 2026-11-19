@@ -43,6 +43,13 @@ impl KmsBackendKind {
         }
     }
 
+    /// Whether the backend's keys live in process memory, so wrap and unwrap
+    /// wait on no external service.
+    #[must_use]
+    pub const fn is_local(self) -> bool {
+        matches!(self, Self::File | Self::Memory)
+    }
+
     /// Parse the canonical spelling.
     fn parse(value: &str) -> Option<Self> {
         Some(match value {
@@ -122,6 +129,32 @@ impl fmt::Debug for KmsConfig {
 }
 
 impl KmsConfig {
+    /// The explicit development `memory` selection with `active_key`: an
+    /// ephemeral random key per facade, refused in production.
+    #[must_use]
+    pub fn memory(active_key: &str) -> Self {
+        Self {
+            backend: Some(KmsBackendKind::Memory),
+            active_key: Some(active_key.to_owned()),
+            ..Self::default()
+        }
+    }
+
+    /// Whether no setting is present, which leaves a deployment without
+    /// recoverable stored secrets rather than with a default backend.
+    #[must_use]
+    pub fn is_unset(&self) -> bool {
+        self.backend.is_none()
+            && self.active_key.is_none()
+            && self.retained_keys.is_empty()
+            && self.key_dir.is_none()
+            && self.endpoint.is_none()
+            && self.vault_mount.is_none()
+            && self.vault_namespace.is_none()
+            && self.vault_token_file.is_none()
+            && self.vault_token.is_none()
+    }
+
     /// Apply the `WYRD_KMS_*` environment projections over this
     /// configuration; a set variable replaces its setting.
     ///

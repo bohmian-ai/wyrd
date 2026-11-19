@@ -1,6 +1,6 @@
 //! PgFixture coverage for Operator connection persistence: redacted authority,
-//! ciphertext-only storage, UUIDv7 identity, forced tenant RLS, updates, and
-//! key-version rewrap discovery.
+//! envelope-only storage, UUIDv7 identity, forced tenant RLS, updates fenced
+//! on the observed row, fenced rewrap, and rewrap tenant discovery.
 //!
 //! Every tenant read and write runs through [`TenantConn`], so forced RLS
 //! applies exactly as it does for the server.
@@ -16,18 +16,14 @@ use wyrd_spec::operator_connection::{
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::operator_connections::{
     ConnectionChange, NewConnection, SealedSecret, StoredConnection, find_connection,
-    get_connection, insert_connection, list_connections, referenced_key_versions,
-    rewrap_connection, stale_key_connections, update_connection,
+    get_connection, insert_connection, list_connections, rewrap_connection,
+    tenants_with_connections, update_connection,
 };
 
-/// Opaque sealed bytes standing in for `wyrd-crypt` output.
-fn sealed(marker: u8, key_version: i32) -> SealedSecret {
+/// Opaque envelope bytes standing in for `[kms]` output.
+fn sealed(marker: u8) -> SealedSecret {
     SealedSecret {
-        ciphertext: vec![marker; 24],
-        nonce: [marker; 12],
-        wrapped_dek: vec![marker.wrapping_add(1); 48],
-        dek_nonce: [marker.wrapping_add(1); 12],
-        key_version,
+        envelope: vec![marker; 24],
     }
 }
 
@@ -47,7 +43,6 @@ async fn insert(
     conn: &mut TenantConn<'_>,
     connection_name: &str,
     config: &OperatorConnectionConfig,
-    key_version: i32,
 ) -> StoredConnection {
     insert_connection(
         conn,
@@ -55,7 +50,7 @@ async fn insert(
             connection_id: OperatorConnectionId::new_v7(),
             name: &name(connection_name),
             config,
-            sealed: &sealed(7, key_version),
+            sealed: &sealed(7),
             secret_version: 1,
             attribution: wyrd_spec::auth::Attribution::direct(PrincipalId::new(Uuid::now_v7())),
         },
@@ -100,7 +95,7 @@ async fn connections_store_redacted_authority_and_isolate_tenants() {
     let mut conn = fixture.tenant_conn().await.expect("tenant connection");
     let mut stored = Vec::new();
     for config in &configs() {
-        let row = insert(&mut conn, "ops", config, 1).await;
+        let row = insert(&mut conn, "ops", config).await;
         assert_eq!(row.view.connection_id.as_uuid().get_version_num(), 7);
         assert_eq!(row.view.config, *config);
         assert_eq!(row.view.status, OperatorConnectionStatus::Active);
@@ -113,7 +108,7 @@ async fn connections_store_redacted_authority_and_isolate_tenants() {
             connection_id: OperatorConnectionId::new_v7(),
             name: &name("ops"),
             config: &configs()[0],
-            sealed: &sealed(9, 1),
+            sealed: &sealed(9),
             secret_version: 1,
             attribution: wyrd_spec::auth::Attribution::direct(PrincipalId::new(Uuid::now_v7())),
         },
@@ -130,7 +125,7 @@ async fn connections_store_redacted_authority_and_isolate_tenants() {
         .expect("http connection exists");
     assert_eq!(found, stored[2]);
     let raw: (String, Vec<u8>, i32) = sqlx::query_as(
-        "SELECT config::text, secret_ciphertext, key_version
+        "SELECT config::text, secret_ciphertext, secret_version
            FROM wyrd.operator_connections WHERE connection_id = $1",
     )
     .bind(stored[2].view.connection_id.as_uuid())
@@ -153,7 +148,7 @@ async fn connections_store_redacted_authority_and_isolate_tenants() {
             .is_empty()
     );
     assert!(
-        get_connection(&mut foreign, stored[0].view.connection_id, false)
+        get_connection(&mut foreign, stored[0].view.connection_id)
             .await
             .expect("get answers")
             .is_none()
@@ -164,7 +159,7 @@ async fn connections_store_redacted_authority_and_isolate_tenants() {
             .expect("find answers")
             .is_none()
     );
-    insert(&mut foreign, "ops", &configs()[0], 1).await;
+    insert(&mut foreign, "ops", &configs()[0]).await;
     foreign.commit().await.expect("other tenant commits");
 
     let forced: (bool, bool) = sqlx::query_as(
@@ -175,98 +170,100 @@ async fn connections_store_redacted_authority_and_isolate_tenants() {
     .await
     .expect("rls metadata reads");
     assert_eq!(forced, (true, true));
-    let versions = referenced_key_versions(fixture.operator_pool())
+    let tenants = tenants_with_connections(fixture.operator_pool())
         .await
-        .expect("key versions read");
-    assert_eq!(versions.len(), 2, "one (tenant, version) pair per tenant");
+        .expect("tenants read");
+    assert_eq!(tenants.len(), 2, "each tenant holding a connection, once");
 }
 
 /// Updates keep identity: status-only keeps the secret, a rotation replaces
-/// ciphertext and bumps the secret version, and a rewrap is fenced on the
-/// secret version it read.
+/// the envelope and bumps the secret version, an update read before another
+/// write committed changes nothing, and a rewrap is fenced on the secret
+/// version and exact envelope it read.
 ///
 /// # Panics
-/// Panics when an update loses identity, keeps a stale secret, or a stale
-/// rewrap is applied.
+/// Panics when an update loses identity, keeps a stale secret, a stale update
+/// or rewrap is applied, or a fresh one is refused.
 #[tokio::test]
-async fn updates_rotate_in_place_and_rewrap_is_fenced() {
+async fn updates_rotate_in_place_and_are_fenced_on_the_observed_row() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let mut conn = fixture.tenant_conn().await.expect("tenant connection");
-    let created = insert(&mut conn, "ops", &configs()[1], 1).await;
+    let created = insert(&mut conn, "ops", &configs()[1]).await;
     let id = created.view.connection_id;
     let principal = PrincipalId::new(Uuid::now_v7());
 
-    let locked = get_connection(&mut conn, id, true)
-        .await
-        .expect("locked read")
-        .expect("exists");
     let disabled = update_connection(
         &mut conn,
-        id,
+        &created,
         &ConnectionChange {
-            config: &locked.view.config,
+            config: &created.view.config,
             status: OperatorConnectionStatus::Disabled,
             secret: None,
             principal,
         },
     )
     .await
-    .expect("status updates");
+    .expect("status updates")
+    .expect("the observed row is current");
     assert_eq!(disabled.view.status, OperatorConnectionStatus::Disabled);
     assert_eq!(disabled.sealed, created.sealed);
     assert_eq!(disabled.view.created_at, created.view.created_at);
 
-    let rotated = update_connection(
-        &mut conn,
-        id,
-        &ConnectionChange {
-            config: &locked.view.config,
-            status: OperatorConnectionStatus::Active,
-            secret: Some((&sealed(3, 2), 2)),
-            principal,
-        },
-    )
-    .await
-    .expect("secret rotates");
+    let rotate = ConnectionChange {
+        config: &created.view.config,
+        status: OperatorConnectionStatus::Active,
+        secret: Some((&sealed(3), 2)),
+        principal,
+    };
+    assert_eq!(
+        update_connection(&mut conn, &created, &rotate)
+            .await
+            .expect("stale update answers"),
+        None,
+        "an update observed before the disable commits nothing"
+    );
+    let rotated = update_connection(&mut conn, &disabled, &rotate)
+        .await
+        .expect("secret rotates")
+        .expect("the observed row is current");
     assert_eq!(rotated.view.connection_id, id);
     assert_eq!(rotated.secret_version, 2);
-    assert_eq!(rotated.sealed, sealed(3, 2));
+    assert_eq!(rotated.sealed, sealed(3));
 
-    insert(&mut conn, "legacy", &configs()[0], 1).await;
-    let stale = stale_key_connections(&mut conn, 2, 10)
-        .await
-        .expect("stale rows lock");
-    assert_eq!(stale.len(), 1, "only the version-1 row is stale");
-    let target = &stale[0];
     assert!(
-        !rewrap_connection(
-            &mut conn,
-            target.view.connection_id,
-            target.secret_version + 1,
-            &[1, 2, 3],
-            &[4; 12],
-            2
-        )
-        .await
-        .expect("fenced rewrap answers"),
-        "a rewrap read at another secret version is refused"
-    );
-    assert!(
-        rewrap_connection(
-            &mut conn,
-            target.view.connection_id,
-            target.secret_version,
-            &[1, 2, 3],
-            &[4; 12],
-            2
-        )
-        .await
-        .expect("rewrap applies")
-    );
-    assert!(
-        stale_key_connections(&mut conn, 2, 10)
+        !rewrap_connection(&mut conn, &disabled, &[1, 2, 3])
             .await
-            .expect("stale rows lock")
-            .is_empty()
+            .expect("fenced rewrap answers"),
+        "a rewrap read before the rotation is refused"
+    );
+    assert_eq!(
+        get_connection(&mut conn, id)
+            .await
+            .expect("read")
+            .expect("exists"),
+        rotated,
+        "the refused rewrap left the rotation in place"
+    );
+    assert!(
+        rewrap_connection(&mut conn, &rotated, &[1, 2, 3])
+            .await
+            .expect("rewrap applies")
+    );
+    let rewrapped = get_connection(&mut conn, id)
+        .await
+        .expect("read")
+        .expect("exists");
+    assert_eq!(
+        (
+            rewrapped.sealed.envelope.as_slice(),
+            rewrapped.secret_version
+        ),
+        (&[1_u8, 2, 3][..], 2)
+    );
+    assert!(
+        !rewrap_connection(&mut conn, &rotated, &[4, 5, 6])
+            .await
+            .expect("second rewrap answers"),
+        "a second rewrap of the same observed envelope is refused"
     );
 }

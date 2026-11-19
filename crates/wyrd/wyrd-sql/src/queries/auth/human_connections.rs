@@ -163,6 +163,12 @@ pub struct SealedSecretRow {
     /// Row key as text: the connection id, the trusted issuer URL, or the
     /// gateway credential name.
     pub row_key: String,
+    /// Owner identity the envelope context binds: the issuer URL, or the
+    /// gateway credential name.
+    pub owner: String,
+    /// Authority the envelope context binds, in order: the client id and
+    /// client-authentication method, or the gateway provider.
+    pub authority: Vec<String>,
     /// The sealed bytes of the table's sealed column exactly as stored.
     pub client_secret_enc: Vec<u8>,
 }
@@ -377,8 +383,8 @@ pub async fn remove_human_connection(
         .map_err(SqlError::from)
 }
 
-/// List every sealed value of one [`SealedSecretTable`] column across all
-/// tenants, for sealing-key rewrap.
+/// List every stored envelope of one [`SealedSecretTable`] column across all
+/// tenants, with the owner metadata its context binds, for rewrap.
 ///
 /// Every column lists every stored (non-null) envelope, regardless of the
 /// row's lifecycle.
@@ -421,15 +427,16 @@ pub async fn swap_sealed_tenant_secret(
         .map_err(SqlError::from)
 }
 
-/// A tenant table column that holds keyring envelopes, as rewrap walks it.
+/// A tenant table column that holds stored-secret envelopes, as rewrap walks
+/// it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SealedSecretTable {
     /// `wyrd.auth_human_connections.client_secret_enc`, keyed by connection id.
     HumanConnections,
     /// `wyrd.auth_trusted_issuers.client_secret_enc`, keyed by issuer URL.
     TrustedIssuers,
-    /// `wyrd.gateway_provider_credentials.secret_ciphertext`, the sealed
-    /// managed-secret provider keys, keyed by credential name.
+    /// `wyrd.gateway_provider_credentials.secret_ciphertext`, the managed
+    /// provider keys, keyed by credential name.
     GatewayProviderCredentials,
 }
 
@@ -457,15 +464,18 @@ impl SealedSecretTable {
     fn select_sql(self) -> &'static str {
         match self {
             Self::HumanConnections => {
-                "SELECT data_tenant_id, connection_id::text AS row_key, client_secret_enc
+                "SELECT data_tenant_id, connection_id::text AS row_key, issuer_url AS owner,
+                        ARRAY[client_id, client_auth] AS authority, client_secret_enc
                    FROM wyrd.auth_human_connections WHERE client_secret_enc IS NOT NULL"
             }
             Self::TrustedIssuers => {
-                "SELECT data_tenant_id, issuer_url AS row_key, client_secret_enc
+                "SELECT data_tenant_id, issuer_url AS row_key, issuer_url AS owner,
+                        ARRAY[client_id, client_auth] AS authority, client_secret_enc
                    FROM wyrd.auth_trusted_issuers WHERE client_secret_enc IS NOT NULL"
             }
             Self::GatewayProviderCredentials => {
-                "SELECT data_tenant_id, name AS row_key, secret_ciphertext AS client_secret_enc
+                "SELECT data_tenant_id, name AS row_key, name AS owner,
+                        ARRAY[provider] AS authority, secret_ciphertext AS client_secret_enc
                    FROM wyrd.gateway_provider_credentials WHERE secret_ciphertext IS NOT NULL"
             }
         }

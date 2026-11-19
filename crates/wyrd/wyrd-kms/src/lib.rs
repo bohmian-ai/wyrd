@@ -220,18 +220,23 @@ enum Backend {
 impl Backend {
     /// Wrap `dek` under the configured key `key_ref`, authenticating `aad`.
     ///
+    /// Remote calls are boxed so a caller's future carries a pointer, not
+    /// every provider's HTTP state; the local arm allocates nothing.
+    ///
     /// # Errors
     /// Returns [`KmsError`] when wrapping fails.
     async fn wrap(&self, key_ref: &str, dek: &SecretKey, aad: &[u8]) -> Result<Vec<u8>, KmsError> {
         match self {
             Self::Local(keys) => keys.wrap(key_ref, dek, aad),
-            Self::Gcp(kms) => kms.wrap(key_ref, dek.expose(), aad).await,
-            Self::Aws(kms) => kms.wrap(key_ref, dek.expose(), aad).await,
-            Self::Transit(kms) => kms.wrap(key_ref, dek.expose(), aad).await,
+            Self::Gcp(kms) => Box::pin(kms.wrap(key_ref, dek.expose(), aad)).await,
+            Self::Aws(kms) => Box::pin(kms.wrap(key_ref, dek.expose(), aad)).await,
+            Self::Transit(kms) => Box::pin(kms.wrap(key_ref, dek.expose(), aad)).await,
         }
     }
 
     /// Unwrap the opaque `wrapped` DEK under the configured key `key_ref`.
+    ///
+    /// Remote calls are boxed as in [`Self::wrap`].
     ///
     /// # Errors
     /// Returns [`KmsError`] when unwrapping fails or does not authenticate.
@@ -243,9 +248,9 @@ impl Backend {
     ) -> Result<SecretBytes, KmsError> {
         match self {
             Self::Local(keys) => keys.unwrap(key_ref, wrapped, aad).map(SecretBytes::from),
-            Self::Gcp(kms) => kms.unwrap(key_ref, wrapped, aad).await,
-            Self::Aws(kms) => kms.unwrap(key_ref, wrapped, aad).await,
-            Self::Transit(kms) => kms.unwrap(key_ref, wrapped, aad).await,
+            Self::Gcp(kms) => Box::pin(kms.unwrap(key_ref, wrapped, aad)).await,
+            Self::Aws(kms) => Box::pin(kms.unwrap(key_ref, wrapped, aad)).await,
+            Self::Transit(kms) => Box::pin(kms.unwrap(key_ref, wrapped, aad)).await,
         }
     }
 }
@@ -437,6 +442,12 @@ impl WyrdKms {
             ..old
         }
         .encode()
+    }
+
+    /// The configured backend kind.
+    #[must_use]
+    pub const fn backend(&self) -> KmsBackendKind {
+        self.kind
     }
 
     /// Whether `envelope` already names the active wrapping key.

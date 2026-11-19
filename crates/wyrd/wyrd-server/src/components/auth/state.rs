@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::scribe_outbox::ScribeOutbox;
 use wyrd_auth_issue::IssuingKey;
-use wyrd_crypt::SealingKeyring;
+use wyrd_kms::WyrdKms;
 use wyrd_runtime::{PermissionCheck, RbacCheck};
 
 use wyrd_auth::connections::HumanConnections;
@@ -30,12 +30,12 @@ pub struct ServerAuth {
     pub trusted_issuer_resolver: Option<Arc<PgIssuerResolver>>,
     /// Resolves workload-to-principal bindings from Postgres for the JWT-bearer exchange path.
     pub workload_binding_resolver: Option<Arc<PgWorkloadBindingResolver>>,
-    /// Sealing keyring for provider client secrets at rest: one write key plus
-    /// retained keys that still open older ciphertext during rotation.
-    /// Required only while provider secrets are stored.
-    pub sealing_key: Option<Arc<SealingKeyring>>,
+    /// The deployment stored-secret facade every recoverable secret owner
+    /// seals and opens through; `None` without `[kms]`, where only
+    /// secret-free connections can be stored.
+    pub kms: Option<Arc<WyrdKms>>,
     /// The tenant human-connection owner, built once at boot over the runtime
-    /// store, keyring, and screened HTTP. Human login, the callback, and
+    /// store, facade, and screened HTTP. Human login, the callback, and
     /// connection administration all resolve human trust through it; the
     /// callback URL comes from each request's origin.
     pub human_connections: Option<HumanConnections>,
@@ -60,7 +60,7 @@ impl Default for ServerAuth {
             external_verifier: None,
             trusted_issuer_resolver: None,
             workload_binding_resolver: None,
-            sealing_key: None,
+            kms: None,
             human_connections: None,
             platform_login: None,
             token_exchange_settings: TokenExchangeSettings::default(),

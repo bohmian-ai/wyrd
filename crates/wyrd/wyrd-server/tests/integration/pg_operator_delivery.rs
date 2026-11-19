@@ -21,8 +21,8 @@ use url::Url;
 use uuid::Uuid;
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, Request as MockRequest, ResponseTemplate};
-use wyrd_server::components::operators::keys::OperatorKeys;
-use wyrd_server::config::{OperatorKeySource, OperatorKeysConfig, VaultKeysConfig};
+use wyrd_kms::{KmsBackendKind, KmsConfig, WyrdKms};
+use wyrd_server::components::operators::secrets::OperatorSecrets;
 use wyrd_server::state::AppState;
 use wyrd_server::verification::engines::EngineOutcome;
 use wyrd_server::verification::health::RuntimeCapability;
@@ -98,7 +98,16 @@ impl Delivery {
     /// # Panics
     /// Panics when startup, seeding, or a connection create fails.
     async fn start() -> Self {
-        let delivery = Self::boot().await;
+        Self::start_on(None).await
+    }
+
+    /// [`Self::start`] on a server booted with `kms` as its `[kms]`, or the
+    /// test server's generated file key when `None`.
+    ///
+    /// # Panics
+    /// Panics when startup, seeding, or a connection create fails.
+    async fn start_on(kms: Option<KmsConfig>) -> Self {
+        let delivery = Self::boot_on(kms).await;
         delivery
             .connect(&[
                 json!({ "provider": "slack", "name": "ops-slack", "workspace_id": "T0001",
@@ -118,10 +127,21 @@ impl Delivery {
     /// # Panics
     /// Panics when startup or seeding fails.
     async fn boot() -> Self {
-        let server = WyrdTestServer::builder()
-            .start_bound()
-            .await
-            .expect("bound server starts");
+        Self::boot_on(None).await
+    }
+
+    /// [`Self::boot`] on a server booted with `kms` as its `[kms]`, or the
+    /// test server's generated file key when `None`.
+    ///
+    /// # Panics
+    /// Panics when startup or seeding fails.
+    async fn boot_on(kms: Option<KmsConfig>) -> Self {
+        let builder = WyrdTestServer::builder();
+        let builder = match kms {
+            Some(kms) => builder.with_kms_for_test(kms),
+            None => builder,
+        };
+        let server = builder.start_bound().await.expect("bound server starts");
         let tenant = server.pg_fixture().data_tenant_id();
         let seed = VerificationFixture::provision(server.state(), tenant)
             .await
@@ -363,14 +383,14 @@ impl Delivery {
         )
     }
 
-    /// Spawn a runtime over this server's state as a replica holding `keys`
-    /// would run it, delivering to the mock provider.
+    /// Spawn a runtime over this server's state as a replica holding
+    /// `secrets` would run it, delivering to the mock provider.
     ///
     /// # Panics
     /// Panics when the runtime cannot compose.
     fn spawn_replica(
         &self,
-        keys: Arc<OperatorKeys>,
+        secrets: OperatorSecrets,
         limits: &RuntimeLimits,
         script: &EngineScript,
         crash: &CapabilityCrash,
@@ -381,7 +401,7 @@ impl Delivery {
             limits,
             script,
             crash,
-            Some(keys),
+            Some(secrets),
             ProviderEndpoints {
                 slack: base.join("/slack").expect("slack URL"),
                 pager_duty: base.join("/pagerduty").expect("pagerduty URL"),
@@ -390,7 +410,8 @@ impl Delivery {
     }
 
     /// Spawn a runtime over `state` delivering fixed providers to `endpoints`,
-    /// with `keys` standing in for the process's Operator keys when given.
+    /// with `secrets` standing in for the process's Operator secrets when
+    /// given.
     ///
     /// # Panics
     /// Panics when the runtime cannot compose.
@@ -400,7 +421,7 @@ impl Delivery {
         limits: &RuntimeLimits,
         script: &EngineScript,
         crash: &CapabilityCrash,
-        keys: Option<Arc<OperatorKeys>>,
+        secrets: Option<OperatorSecrets>,
         endpoints: ProviderEndpoints,
     ) -> Running {
         let builder = VerificationRuntime::builder(state)
@@ -408,8 +429,8 @@ impl Delivery {
             .engine_script(script.clone())
             .crash_switch(crash.clone())
             .provider_endpoints(endpoints);
-        let builder = match keys {
-            Some(keys) => builder.operator_keys(keys),
+        let builder = match secrets {
+            Some(secrets) => builder.operator_secrets(secrets),
             None => builder,
         };
         let runtime = builder.build().expect("the runtime composes");
@@ -876,23 +897,10 @@ async fn next_attempt_on_another_replica_uses_the_rotated_credential() {
         .await;
     assert_eq!(status, StatusCode::OK, "{view}");
 
-    let dir = delivery
-        .server
-        .operator_keys_dir_for_test()
-        .expect("generated key directory");
-    std::fs::copy(dir.join("v1"), dir.join("v2")).expect("key v2 publishes");
-    let replica = Arc::new(
-        OperatorKeys::new(OperatorKeysConfig {
-            source: OperatorKeySource::File,
-            dir: Some(dir.to_path_buf()),
-            active_version: std::num::NonZeroU32::new(2).expect("nonzero"),
-            ..OperatorKeysConfig::default()
-        })
-        .expect("file keys build"),
-    );
+    let replica = rotated_file_kms(&delivery.server);
     delivery.make_retries_due(run).await;
     let second = delivery.spawn_replica(
-        Arc::clone(&replica),
+        OperatorSecrets::new(Some(Arc::clone(&replica))),
         &Delivery::limits(),
         &EngineScript::default(),
         &CapabilityCrash::default(),
@@ -902,14 +910,15 @@ async fn next_attempt_on_another_replica_uses_the_rotated_credential() {
         .await;
     let deadline = tokio::time::Instant::now() + WAIT;
     loop {
-        let version: i32 = sqlx::query_scalar(
-            "SELECT key_version FROM wyrd.operator_connections WHERE connection_id = $1::uuid",
+        let envelope: Vec<u8> = sqlx::query_scalar(
+            "SELECT secret_ciphertext FROM wyrd.operator_connections \
+              WHERE connection_id = $1::uuid",
         )
         .bind(&slack_id)
         .fetch_one(&delivery.assertion)
         .await
-        .expect("key version reads");
-        if version == 2 {
+        .expect("envelope reads");
+        if replica.is_current(&envelope).expect("a common envelope") {
             break;
         }
         assert!(
@@ -1082,13 +1091,14 @@ async fn slow_endpoint_exhausts_the_budget_and_shutdown_releases() {
 
 /// Delivery re-checks authority and decrypts per attempt: a connection
 /// disabled after registration fails its dispatch closed without a provider
-/// call, and a key provider outage retries instead of failing.
+/// call, and an unreachable wrapping backend retries instead of failing.
 ///
 /// # Panics
 /// Panics when either dispatch settles differently or a provider is called.
 #[tokio::test]
 async fn revoked_connection_fails_closed_and_key_outage_retries() {
-    let delivery = Delivery::start().await;
+    let transit = transit_fake().await;
+    let delivery = Delivery::start_on(Some(transit_kms(&transit.uri(), "ops", &[]))).await;
     let origin = delivery.mock.uri();
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(204))
@@ -1120,17 +1130,12 @@ async fn revoked_connection_fails_closed_and_key_outage_retries() {
     assert_eq!(status, StatusCode::OK, "{view}");
     delivery.fail_binding("owner", &[&revoked, &hooked]).await;
 
-    let empty = tempfile::tempdir().expect("empty key directory");
-    let outage = Arc::new(
-        OperatorKeys::new(OperatorKeysConfig {
-            source: OperatorKeySource::File,
-            dir: Some(empty.path().to_path_buf()),
-            ..OperatorKeysConfig::default()
-        })
-        .expect("file keys build"),
-    );
+    let outage = OperatorSecrets::new(Some(Arc::new(
+        WyrdKms::new(&transit_kms(&unreachable_endpoint(), "ops", &[]), false)
+            .expect("transit facade builds"),
+    )));
     let running = delivery.spawn_replica(
-        Arc::clone(&outage),
+        outage,
         &Delivery::limits(),
         &failing_script(1),
         &CapabilityCrash::default(),
@@ -1839,74 +1844,158 @@ async fn verifiers_progress_while_operator_deliveries_are_capped() {
     runtime.stop().await;
 }
 
-/// Key versions of every Operator connection of `tenant`.
+/// Whether each Operator connection envelope of `tenant` names `kms`'s
+/// active key, in connection order.
 ///
 /// # Panics
-/// Panics when the connection table cannot be read.
-async fn key_versions(pool: &PgPool, tenant: DataTenantId) -> Vec<i32> {
-    sqlx::query_scalar(
-        "SELECT key_version FROM wyrd.operator_connections \
+/// Panics when the connection table cannot be read or a row holds no
+/// common envelope.
+async fn current(pool: &PgPool, tenant: DataTenantId, kms: &WyrdKms) -> Vec<bool> {
+    let envelopes: Vec<Vec<u8>> = sqlx::query_scalar(
+        "SELECT secret_ciphertext FROM wyrd.operator_connections \
           WHERE data_tenant_id = $1 ORDER BY connection_id",
     )
     .bind(tenant.as_uuid())
     .fetch_all(pool)
     .await
-    .expect("key versions read")
+    .expect("envelopes read");
+    envelopes
+        .iter()
+        .map(|envelope| kms.is_current(envelope).expect("a common envelope"))
+        .collect()
 }
 
-/// Rewrap runs beside delivery, never ahead of it: while a stalled key
+/// Publish a new owner-only file key `next` beside `server`'s generated
+/// `[kms]` key and return a facade rotated onto it with that key retained,
+/// as a rolling replica configures it.
+///
+/// # Panics
+/// Panics when the server used no generated key or the key cannot be written.
+fn rotated_file_kms(server: &WyrdTestServer) -> Arc<WyrdKms> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use base64::Engine as _;
+    let dir = server.kms_dir_for_test().expect("generated key directory");
+    let next = dir.join("next");
+    if !next.exists() {
+        std::fs::write(
+            &next,
+            base64::engine::general_purpose::STANDARD.encode([8_u8; 32]),
+        )
+        .expect("key next writes");
+        std::fs::set_permissions(&next, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    }
+    let mut config = server.kms_config_for_test().clone();
+    config.retained_keys = vec![config.active_key.take().expect("active key")];
+    config.active_key = Some("next".to_owned());
+    Arc::new(WyrdKms::new(&config, false).expect("rotated file facade builds"))
+}
+
+/// A `vault_transit` `[kms]` at `endpoint` with `active` and `retained`
+/// Transit key names and an inline token.
+fn transit_kms(endpoint: &str, active: &str, retained: &[&str]) -> KmsConfig {
+    KmsConfig {
+        backend: Some(KmsBackendKind::VaultTransit),
+        active_key: Some(active.to_owned()),
+        retained_keys: retained.iter().map(|key| (*key).to_owned()).collect(),
+        endpoint: Some(endpoint.to_owned()),
+        vault_token: Some(secrecy::SecretString::from("rewrap-vault-token")),
+        ..KmsConfig::default()
+    }
+}
+
+/// A loopback URL nothing listens on.
+///
+/// # Panics
+/// Panics when no loopback port can be reserved.
+fn unreachable_endpoint() -> String {
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("port reserves");
+    let endpoint = format!("http://{}", closed.local_addr().expect("addr"));
+    drop(closed);
+    endpoint
+}
+
+/// Local Vault Transit protocol fixture: an encrypt answers `vault:v1:`
+/// ciphertext sealing `{context, plaintext}`, and a decrypt under another
+/// context answers 400, the way Transit authenticates associated data.
+struct Transit;
+
+impl wiremock::Respond for Transit {
+    fn respond(&self, request: &MockRequest) -> ResponseTemplate {
+        use base64::Engine as _;
+        let engine = base64::engine::general_purpose::STANDARD;
+        let body: Value = serde_json::from_slice(&request.body).expect("json");
+        if request.url.path().contains("/encrypt/") {
+            let blob = json!({"context": body["associated_data"], "plaintext": body["plaintext"]});
+            let ciphertext = format!("vault:v1:{}", engine.encode(blob.to_string()));
+            return ResponseTemplate::new(200)
+                .set_body_json(json!({"data": {"ciphertext": ciphertext}}));
+        }
+        let blob: Value = body["ciphertext"]
+            .as_str()
+            .and_then(|text| text.strip_prefix("vault:v1:"))
+            .and_then(|encoded| engine.decode(encoded).ok())
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        if blob["context"] != body["associated_data"] {
+            return ResponseTemplate::new(400)
+                .set_body_json(json!({"errors": ["cipher: message authentication failed"]}));
+        }
+        ResponseTemplate::new(200).set_body_json(json!({"data": {"plaintext": blob["plaintext"]}}))
+    }
+}
+
+/// Start a [`Transit`] fixture.
+async fn transit_fake() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(Transit)
+        .mount(&server)
+        .await;
+    server
+}
+
+/// Rewrap runs beside delivery, never ahead of it: while a stalled wrapping
 /// provider times out every rewrap of one tenant's stale rows, another
 /// tenant's due dispatch is still claimed and delivered; each timed-out pass
 /// rolls back and is retried, and shutdown cancels the stalled pass at once.
-/// Once the provider answers, one pass rewraps every row reading each key
-/// version exactly once.
+/// Once the provider answers, a pass moves every row onto the active key.
 ///
 /// # Panics
 /// Panics when delivery waits on rewrap, a stalled pass commits or blocks
-/// shutdown, or a key version is read more than once in a pass.
+/// shutdown, or the answered pass leaves a row on the retained key.
 #[tokio::test]
 async fn slow_rewrap_never_holds_back_another_tenants_delivery() {
-    use base64::Engine as _;
-    let delivery = Delivery::start().await;
+    let transit = transit_fake().await;
+    let delivery = Delivery::start_on(Some(transit_kms(&transit.uri(), "old", &[]))).await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(204))
         .mount(&delivery.mock)
         .await;
     let stale_tenant = delivery.seed.tenant();
+    let old = WyrdKms::new(&transit_kms(&transit.uri(), "old", &[]), false).expect("old facade");
     assert_eq!(
-        key_versions(&delivery.assertion, stale_tenant).await,
-        vec![1, 1, 1]
+        current(&delivery.assertion, stale_tenant, &old).await,
+        vec![true; 3]
     );
 
     let other_tenant = delivery.quiet_tenant("operator-rewrap-other").await.tenant;
 
-    let vault = MockServer::start().await;
-    Mock::given(method("GET"))
+    let stalled = MockServer::start().await;
+    Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_mins(1)))
-        .mount(&vault)
+        .mount(&stalled)
         .await;
-    let replica = Arc::new(
-        OperatorKeys::new(OperatorKeysConfig {
-            source: OperatorKeySource::Vault,
-            active_version: std::num::NonZeroU32::new(2).expect("nonzero"),
-            vault: Some(VaultKeysConfig {
-                addr: vault.uri(),
-                mount: "secret".to_owned(),
-                prefix: "wyrd/operator-keys".to_owned(),
-                token_file: None,
-                token: Some(secrecy::SecretString::from("rewrap-vault-token")),
-            }),
-            ..OperatorKeysConfig::default()
-        })
-        .expect("vault keys build"),
-    );
+    let replica = OperatorSecrets::new(Some(Arc::new(
+        WyrdKms::new(&transit_kms(&stalled.uri(), "new", &["old"]), false).expect("stalled facade"),
+    )));
     let limits = RuntimeLimits {
         rewrap_interval: Duration::from_millis(50),
         rewrap_tenant_budget: Duration::from_millis(300),
         ..Delivery::limits()
     };
     let running = delivery.spawn_replica(
-        Arc::clone(&replica),
+        replica,
         &limits,
         &failing_script(1),
         &CapabilityCrash::default(),
@@ -1931,7 +2020,7 @@ async fn slow_rewrap_never_holds_back_another_tenants_delivery() {
     };
     assert_eq!(delivered.as_deref(), Some("delivered"));
     let deadline = tokio::time::Instant::now() + WAIT;
-    while vault.received_requests().await.expect("recorded").len() < 2 {
+    while stalled.received_requests().await.expect("recorded").len() < 2 {
         assert!(
             tokio::time::Instant::now() < deadline,
             "a timed-out rewrap pass is retried"
@@ -1946,41 +2035,23 @@ async fn slow_rewrap_never_holds_back_another_tenants_delivery() {
         stopping.elapsed()
     );
     assert_eq!(
-        key_versions(&delivery.assertion, stale_tenant).await,
-        vec![1, 1, 1],
+        current(&delivery.assertion, stale_tenant, &old).await,
+        vec![true; 3],
         "timed-out and cancelled passes roll back"
     );
 
-    let engine = base64::engine::general_purpose::STANDARD;
-    let v1 = std::fs::read_to_string(
-        delivery
-            .server
-            .operator_keys_dir_for_test()
-            .expect("generated key directory")
-            .join("v1"),
-    )
-    .expect("key v1 reads");
-    vault.reset().await;
-    let key_path =
-        |version: u32| format!("/v1/secret/data/wyrd/operator-keys/{stale_tenant}/{version}");
-    for (version, key) in [(1, v1.trim().to_owned()), (2, engine.encode([8_u8; 32]))] {
-        Mock::given(method("GET"))
-            .and(path(key_path(version)))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({ "data": { "data": { "key": key } } })),
-            )
-            .mount(&vault)
-            .await;
-    }
+    let answered = Arc::new(
+        WyrdKms::new(&transit_kms(&transit.uri(), "new", &["old"]), false)
+            .expect("answered facade"),
+    );
     let running = delivery.spawn_replica(
-        Arc::clone(&replica),
+        OperatorSecrets::new(Some(Arc::clone(&answered))),
         &limits,
         &EngineScript::default(),
         &CapabilityCrash::default(),
     );
     let deadline = tokio::time::Instant::now() + WAIT;
-    while key_versions(&delivery.assertion, stale_tenant).await != vec![2, 2, 2] {
+    while current(&delivery.assertion, stale_tenant, &answered).await != vec![true; 3] {
         assert!(
             tokio::time::Instant::now() < deadline,
             "rewrap never completed"
@@ -1988,18 +2059,6 @@ async fn slow_rewrap_never_holds_back_another_tenants_delivery() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     running.stop().await;
-    let reads: Vec<String> = vault
-        .received_requests()
-        .await
-        .expect("recorded")
-        .iter()
-        .map(|request| request.url.path().to_owned())
-        .collect();
-    assert_eq!(
-        reads,
-        vec![key_path(2), key_path(1)],
-        "one pass reads the active and the repeated old version once each"
-    );
 }
 
 /// A cross-tenant rewrap discovery stalled behind a lock on the connection
@@ -2011,29 +2070,10 @@ async fn slow_rewrap_never_holds_back_another_tenants_delivery() {
 /// later pass does not rewrap.
 #[tokio::test]
 async fn stalled_rewrap_discovery_returns_within_the_pass_budget() {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    use base64::Engine as _;
     let delivery = Delivery::start().await;
     let tenant = delivery.seed.tenant();
-    let dir = delivery
-        .server
-        .operator_keys_dir_for_test()
-        .expect("generated key directory");
-    let v2 = dir.join("v2");
-    std::fs::write(
-        &v2,
-        base64::engine::general_purpose::STANDARD.encode([8_u8; 32]),
-    )
-    .expect("key v2 writes");
-    std::fs::set_permissions(&v2, std::fs::Permissions::from_mode(0o600)).expect("chmod");
-    let keys = OperatorKeys::new(OperatorKeysConfig {
-        source: OperatorKeySource::File,
-        active_version: std::num::NonZeroU32::new(2).expect("nonzero"),
-        dir: Some(dir.to_path_buf()),
-        vault: None,
-    })
-    .expect("file keys build");
+    let kms = rotated_file_kms(&delivery.server);
+    let keys = OperatorSecrets::new(Some(Arc::clone(&kms)));
     let state = delivery.server.state();
     let operator = state.postgres.operator_pool().expect("operator pool");
 
@@ -2059,8 +2099,8 @@ async fn stalled_rewrap_discovery_returns_within_the_pass_budget() {
     );
     lock.rollback().await.expect("lock releases");
     assert_eq!(
-        key_versions(&delivery.assertion, tenant).await,
-        vec![1, 1, 1],
+        current(&delivery.assertion, tenant, &kms).await,
+        vec![false; 3],
         "a timed-out discovery mutates nothing"
     );
 
@@ -2070,7 +2110,7 @@ async fn stalled_rewrap_discovery_returns_within_the_pass_budget() {
         .expect("the next pass runs");
     assert_eq!(moved, 3);
     assert_eq!(
-        key_versions(&delivery.assertion, tenant).await,
-        vec![2, 2, 2]
+        current(&delivery.assertion, tenant, &kms).await,
+        vec![true; 3]
     );
 }

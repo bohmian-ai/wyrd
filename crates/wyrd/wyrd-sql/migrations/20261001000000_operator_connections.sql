@@ -2,10 +2,11 @@
 --
 -- `wyrd.operator_connections` is the only home of an Operator credential. Each
 -- row stores the nonsecret authority in the clear (`config`, the redacted
--- read shape) and the secret only as envelope ciphertext: the secret under a
--- fresh per-version data key, and that data key wrapped under the tenant's
--- externally held key-encryption key `key_version`. No plaintext secret or
--- key-encryption key is ever written here. Rows are never deleted: DELETE
+-- read shape) and the secret only as the common stored-secret envelope in
+-- `secret_ciphertext`: the secret under a fresh per-version data key bound to
+-- the tenant, connection, provider, name, and `secret_version`, and that data
+-- key wrapped by the deployment's configured `[kms]` key. No plaintext secret
+-- or wrapping key is ever written here. Rows are never deleted: DELETE
 -- disables, so Cards, dispatches, audit, and key rotation keep their lineage.
 
 CREATE TABLE wyrd.operator_connections (
@@ -19,10 +20,6 @@ CREATE TABLE wyrd.operator_connections (
     status            TEXT        NOT NULL DEFAULT 'active'
         CHECK (status IN ('active','disabled')),
     secret_ciphertext BYTEA       NOT NULL,
-    secret_nonce      BYTEA       NOT NULL CHECK (length(secret_nonce) = 12),
-    wrapped_dek       BYTEA       NOT NULL,
-    dek_nonce         BYTEA       NOT NULL CHECK (length(dek_nonce) = 12),
-    key_version       INTEGER     NOT NULL CHECK (key_version > 0),
     secret_version    INTEGER     NOT NULL CHECK (secret_version > 0),
     sub_principal_id  UUID        NOT NULL,
     act_principal_id  UUID        NOT NULL,
@@ -34,10 +31,6 @@ CREATE TABLE wyrd.operator_connections (
     CHECK (config ->> 'provider' = provider)
 );
 
--- Key rotation finds rows still wrapped under an older key version.
-CREATE INDEX operator_connections_key_version
-    ON wyrd.operator_connections (data_tenant_id, key_version);
-
 ALTER TABLE wyrd.operator_connections ENABLE ROW LEVEL SECURITY;
 ALTER TABLE wyrd.operator_connections FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON wyrd.operator_connections
@@ -46,8 +39,8 @@ CREATE POLICY tenant_isolation ON wyrd.operator_connections
 CREATE POLICY operator_access ON wyrd.operator_connections TO CURRENT_USER
     USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
--- Rotation discovers which tenants and key versions are still referenced;
--- it never needs ciphertext across tenants.
+-- Rewrap discovers which tenants hold connections; it reads each tenant's
+-- envelopes only through that tenant's own session.
 
 -- ---------------------------------------------------------------------------
 -- Dispatch failure context

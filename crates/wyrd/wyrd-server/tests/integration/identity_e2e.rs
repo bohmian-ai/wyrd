@@ -20,7 +20,7 @@ use wyrd_client::auth::AuthMiddleware;
 use wyrd_client::config::{ClientConfig, TokenCacheMode};
 use wyrd_client::transport::config::HttpConfig;
 use wyrd_client::transport::credential::ResolvedCredential;
-use wyrd_crypt::{SealingKeyring, SecretKey};
+use wyrd_kms::{KmsBackendKind, KmsConfig, WyrdKms};
 use wyrd_semver::VersionBlock;
 use wyrd_server::config::{ClaimMappingEntry, ClientAuthEntry, IssuerEntry, WorkloadBindingEntry};
 use wyrd_spec::DataTenantId;
@@ -2874,8 +2874,8 @@ async fn tenant_connection_admin_journey() {
 
 /// Candidate lifecycle, secret rotation, and replica safety for one tenant.
 ///
-/// Two replicas share one database. Replica A seals with key K1 and retains
-/// K2; the journey proves:
+/// Two replicas share one database and one `[kms]` key directory. Replica A
+/// seals with active key K1 and retains K2; the journey proves:
 ///   1. an unsafe issuer (cloud metadata address) stages but fails its test
 ///      before any connection, and a stale `expected_revision` conflicts;
 ///   2. a candidate with a wrong secret begins its test, but the provider
@@ -2886,7 +2886,7 @@ async fn tenant_connection_admin_journey() {
 ///      refused;
 ///   4. two concurrent activations of the same revision, recovered by a
 ///      principal distinct from the bearer caller, yield exactly one winner;
-///   5. replica B boots with K2 as the write key and K1 retained, rewraps the
+///   5. replica B boots with K2 as the active key and K1 retained, rewraps the
 ///      stored secret under K2, and both replicas still sign alice in;
 ///   6. A, still sealing with K1, stages a late secret after B's pass; A,
 ///      the only K1 writer, is then shut down, so the final pass (replica C,
@@ -2905,16 +2905,28 @@ async fn tenant_connection_admin_journey() {
 #[tokio::test]
 #[ignore = "requires the Keycloak and Dex identity lane"]
 async fn tenant_connection_rotation_journey() {
-    let k1 = [0x11_u8; 32];
-    let k2 = [0x22_u8; 32];
-    let keyring = |write: [u8; 32], retained: [u8; 32]| {
-        std::sync::Arc::new(
-            SealingKeyring::new(SecretKey::from_bytes(write))
-                .with_retained(SecretKey::from_bytes(retained)),
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use base64::Engine as _;
+    let keys = tempfile::tempdir().expect("key directory");
+    for (name, byte) in [("k1", 0x11_u8), ("k2", 0x22_u8)] {
+        let path = keys.path().join(name);
+        std::fs::write(
+            &path,
+            base64::engine::general_purpose::STANDARD.encode([byte; 32]),
         )
+        .expect("key file writes");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    }
+    let keyring = |active: &str, retained: &[&str]| KmsConfig {
+        backend: Some(KmsBackendKind::File),
+        active_key: Some(active.to_owned()),
+        retained_keys: retained.iter().map(|key| (*key).to_owned()).collect(),
+        key_dir: Some(keys.path().to_path_buf()),
+        ..KmsConfig::default()
     };
     let replica_a = WyrdTestServerBuilder::default()
-        .with_sealing_keyring(keyring(k1, k2))
+        .with_kms_for_test(keyring("k1", &["k2"]))
         .start_in_process()
         .await
         .expect("replica A starts");
@@ -3165,13 +3177,13 @@ async fn tenant_connection_rotation_journey() {
         .await
         .expect("ciphertext reads")
         .expect("active connection stores a secret");
-    let k2_only = SealingKeyring::new(SecretKey::from_bytes(k2));
+    let k2_only = WyrdKms::new(&keyring("k2", &[]), false).expect("K2 facade builds");
     assert!(
-        k2_only.open(&under_k1).is_err(),
+        !k2_only.is_current(&under_k1).expect("a common envelope"),
         "K1 sealed the first secret"
     );
     let replica_b = replica_a
-        .start_replica(WyrdTestServerBuilder::default().with_sealing_keyring(keyring(k2, k1)))
+        .start_replica(WyrdTestServerBuilder::default().with_kms_for_test(keyring("k2", &["k1"])))
         .await
         .expect("replica B starts");
     let under_k2 = replica_a
@@ -3180,12 +3192,9 @@ async fn tenant_connection_rotation_journey() {
         .expect("ciphertext reads")
         .expect("active connection stores a secret");
     assert_ne!(under_k1, under_k2, "boot rewrapped the stored secret");
-    assert_eq!(
-        k2_only
-            .rewrap(&under_k2)
-            .expect("K2 opens the rewrapped secret"),
-        None,
-        "the rewrapped secret references only the write key"
+    assert!(
+        k2_only.is_current(&under_k2).expect("a common envelope"),
+        "the rewrapped secret references only the active key"
     );
     for (replica, label) in [(&replica_a, "rotation-a"), (&replica_b, "rotation-b")] {
         let session = human_login(
@@ -3228,7 +3237,9 @@ async fn tenant_connection_rotation_journey() {
         .expect("ciphertext reads")
         .expect("the late candidate stores a secret");
     assert!(
-        k2_only.open(&late_under_k1).is_err(),
+        !k2_only
+            .is_current(&late_under_k1)
+            .expect("a common envelope"),
         "A sealed the late write under K1"
     );
     let mut recovery_decisions = activation_decisions(&replica_a, tenant).await;
@@ -3237,7 +3248,7 @@ async fn tenant_connection_rotation_journey() {
         .await
         .expect("replica A, the last K1 writer, shuts down");
     let replica_c = replica_b
-        .start_replica(WyrdTestServerBuilder::default().with_sealing_keyring(keyring(k2, k1)))
+        .start_replica(WyrdTestServerBuilder::default().with_kms_for_test(keyring("k2", &["k1"])))
         .await
         .expect("final-pass replica C starts");
     for state in ["Active", "Candidate"] {
@@ -3246,22 +3257,16 @@ async fn tenant_connection_rotation_journey() {
             .await
             .expect("ciphertext reads")
             .expect("the connection stores a secret");
-        assert_eq!(
-            k2_only
-                .rewrap(&sealed)
-                .expect("K2 opens every stored secret"),
-            None,
+        assert!(
+            k2_only.is_current(&sealed).expect("a common envelope"),
             "the final pass left the {state} secret current under K2"
         );
     }
     replica_c.shutdown().await.expect("replica C shuts down");
-    let replica_k2 =
-        replica_b
-            .start_replica(WyrdTestServerBuilder::default().with_sealing_keyring(
-                std::sync::Arc::new(SealingKeyring::new(SecretKey::from_bytes(k2))),
-            ))
-            .await
-            .expect("a K2-only replica starts once nothing needs K1");
+    let replica_k2 = replica_b
+        .start_replica(WyrdTestServerBuilder::default().with_kms_for_test(keyring("k2", &[])))
+        .await
+        .expect("a K2-only replica starts once nothing needs K1");
     let session = human_login(
         &replica_k2,
         &keycloak,

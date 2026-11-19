@@ -54,7 +54,8 @@ use super::RuntimeLimits;
 use super::claims::{ClaimLoop, LeasedWork, settled};
 use super::health::RuntimeCapability;
 use super::permits::OperatorPermits;
-use crate::components::operators::keys::{KeyError, OperatorKeys};
+use crate::components::operators::secrets::OperatorSecrets;
+use wyrd_kms::KmsError;
 
 mod pager_duty;
 mod slack;
@@ -161,8 +162,8 @@ pub struct OperatorWorker {
     /// Shared claim loop owning Operator execution capacity (separate from
     /// the Verifier pool), admission, and drain.
     claims: ClaimLoop,
-    /// Tenant key-encryption keys for opening credentials.
-    keys: Arc<OperatorKeys>,
+    /// Credential owner that opens stored connection secrets.
+    secrets: OperatorSecrets,
     /// Provider wire adapters.
     delivery: OperatorDelivery,
     /// Runtime bounds.
@@ -175,7 +176,7 @@ impl OperatorWorker {
     pub fn new(
         postgres: WyrdPostgres,
         operator: OperatorPool,
-        keys: Arc<OperatorKeys>,
+        secrets: OperatorSecrets,
         delivery: OperatorDelivery,
         limits: RuntimeLimits,
     ) -> Self {
@@ -197,7 +198,7 @@ impl OperatorWorker {
                 limits.operator_deadline,
                 limits.operator_lease,
             ),
-            keys,
+            secrets,
             delivery,
             limits,
         }
@@ -237,7 +238,7 @@ impl OperatorWorker {
             tokio::select! {
                 biased;
                 () = stop.cancelled() => return,
-                pass = self.keys.rewrap_pass(
+                pass = self.secrets.rewrap_pass(
                     &self.postgres,
                     &self.operator,
                     self.limits.rewrap_pass_budget,
@@ -378,14 +379,20 @@ impl OperatorWorker {
             ));
         };
         let plaintext = self
-            .keys
+            .secrets
             .open(tenant, &stored)
             .await
             .map_err(|error| match error {
-                KeyError::Unavailable { .. } | KeyError::Client | KeyError::VersionOutOfRange => {
+                KmsError::Unavailable { .. }
+                | KmsError::Config { .. }
+                | KmsError::KeyNotAllowed => {
+                    tracing::warn!(%error, "operator credential cannot be opened yet");
                     store_down()
                 }
-                KeyError::Authentication { .. } => Attempt::terminal(
+                KmsError::UnknownFormat
+                | KmsError::Authentication
+                | KmsError::InvalidDek
+                | KmsError::Encrypt => Attempt::terminal(
                     CREDENTIAL_INVALID,
                     "the stored credential failed authentication",
                 ),

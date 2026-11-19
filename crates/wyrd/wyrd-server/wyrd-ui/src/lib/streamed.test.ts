@@ -42,3 +42,18 @@ test('a remounted page shows the last section its address settled until the newe
   await Promise.resolve();
   expect(back.value).toBe('current');
 });
+
+test('a read whose successful answer is not JSON fails the section instead of clearing it', async () => {
+  const section = new Streamed<string>();
+  section.follow('first', '/t/acme/verify');
+  const fetched = globalThis.fetch;
+  globalThis.fetch = async () => new Response('<html>proxy page</html>', { status: 200 });
+  try {
+    await section.read('/t/acme/verify/support', '/t/acme/verify');
+  } finally {
+    globalThis.fetch = fetched;
+  }
+  flushSync();
+  expect(section.value).toBeUndefined();
+  expect(section.problem).toMatchObject({ code: 'WYRD_SPEC_502_UPSTREAM_FAILURE' });
+});

@@ -88,7 +88,15 @@ async function supportGate(target: string) {
       const gate = grouped && holding ? new Promise<void>((resolve) => (open = resolve)) : undefined;
       if (gate) {
         const ended = new Promise<'finished' | 'abandoned' | 'failed'>((resolve) => res.once('close', () => resolve(broken ? 'failed' : res.writableFinished ? 'finished' : 'abandoned')));
-        held.push({ sql, ended, release: open, fail: () => ((broken = true), open()) });
+        held.push({
+          sql,
+          ended,
+          release: open,
+          fail: () => {
+            broken = true;
+            open();
+          }
+        });
       }
       const upstream = httpRequest(new URL(req.url ?? '/', target), { method: req.method, headers: req.headers }, async (answer) => {
         res.writeHead(answer.statusCode ?? 502, answer.headers);
@@ -903,7 +911,11 @@ async function liveWaitsForSupport(browser: Browser, page: Page, gate: Awaited<R
     await live.goto(at);
     await expect.poll(() => facets.getByRole('button').count(), { timeout: 30_000 }).toBeGreaterThan(0);
     // The page's own timers run only as the clock does: wait while it advances in steps far shorter than a tick.
-    const running = <T,>(read: () => T | Promise<T>) => expect.poll(async () => (await live.clock.runFor(50), read()));
+    const running = <T,>(read: () => T | Promise<T>) =>
+      expect.poll(async () => {
+        await live.clock.runFor(50);
+        return read();
+      });
     gate.held.length = 0;
     gate.hold(true);
     // The first tick refreshes the list, then holds on its support across two more tick opportunities.
@@ -939,7 +951,8 @@ async function liveWaitsForSupport(browser: Browser, page: Page, gate: Awaited<R
     await live.waitForURL((url) => !url.pathname.endsWith(`/${board}`));
     const left = refreshes.length;
     await live.clock.runFor(60_000);
-    expect(refreshes.length).toBe(left);
+    // Three ticks, the pause and the resume: five list reads, then none.
+    expect([left, refreshes.length]).toEqual([5, 5]);
     return { refreshes: refreshes.length, held: gate.held.length };
   } finally {
     await context.close();
@@ -994,8 +1007,9 @@ test('Observe reads support once per population, stops it when superseded or lef
     await page.goto(observe);
     await expect.poll(() => facets.textContent(), { timeout: 30_000 }).toContain('ui-worker');
     expect([await rows.count(), reads]).toEqual([50, []]);
+    // Traces support is three grouped queries per population.
     const population = gate.supporting();
-    expect(population).toBeGreaterThan(0);
+    expect(population).toBe(3);
     const counts = await facets.textContent();
 
     // Paging, sorting and shown columns read only the list: no support read, and the facets and overview stay as they were.
@@ -1829,7 +1843,9 @@ judged('the Verify dashboard filters, groups, brushes, pages, opens an execution
 
   const tenant = 'test-tenant-1';
   buildUi();
-  const bff = await startBff(server.baseUrl);
+  // Every server read passes through the support gate, which holds supporting queries only when asked.
+  const gate = await supportGate(server.baseUrl);
+  const bff = await startBff(gate.url);
   const browser = await chromium.launch();
   let memory: { release(): void } | undefined;
   try {
@@ -2001,6 +2017,95 @@ judged('the Verify dashboard filters, groups, brushes, pages, opens an execution
     await captureExecution(page, 'verify-dashboard');
     await page.setViewportSize({ width: 1280, height: 720 });
 
+    // Support is read once per population: showing more, sorting and grouping read only the list, and the facets and charts stay as they were.
+    await page.setViewportSize(LIFECYCLE_VIEWPORT);
+    await page.goto(list);
+    await expect.poll(() => rail.getByRole('button', { name: /failed/ }).count(), { timeout: 30_000 }).toBe(1);
+    const reads: string[] = [];
+    page.on('request', (request) => new URL(request.url()).pathname.endsWith('/support') && reads.push(new URL(request.url()).pathname));
+    const ended = (answers: readonly HeldAnswer[]) => Promise.all(answers.map((answer) => answer.ended));
+    const supported = { queries: gate.supporting(), rail: await rail.textContent(), charts: await page.locator('[data-panel="charts"] svg.plot').count() };
+    await page.getByRole('button', { name: 'Show 7 more' }).click();
+    await expect.poll(() => rows.count()).toBe(57);
+    await page.locator('[aria-label="executions rows"] th button.sort').first().click();
+    await expect.poll(query).toHaveProperty('sort');
+    await page.getByRole('group', { name: 'Group by' }).getByRole('button', { name: 'session' }).click();
+    await expect.poll(query).toMatchObject({ group: 'group_id' });
+    await expect.poll(() => rows.count()).toBeGreaterThan(0);
+    expect([reads, gate.supporting(), await rail.textContent(), await page.locator('[data-panel="charts"] svg.plot').count()]).toEqual([[], supported.queries, supported.rail, supported.charts]);
+
+    // A filter is another population: the list is shown at once and its support is read once, after the list.
+    await page.goto(list);
+    await expect.poll(() => rail.getByRole('button', { name: /failed/ }).count(), { timeout: 30_000 }).toBe(1);
+    reads.length = 0;
+    gate.held.length = 0;
+    gate.hold(true);
+    await rail.getByRole('button', { name: /failed/ }).click();
+    await expect.poll(() => gate.held.length).toBeGreaterThan(0);
+    await expect.poll(() => rows.count()).toBe(1);
+    // Verify support is one discovery query per population.
+    const population = gate.held.length;
+    expect([population, reads.length]).toEqual([1, 1]);
+    // A newer filter supersedes it: its upstream queries are closed unread.
+    await rail.getByRole('button', { name: /completed/ }).click();
+    await expect.poll(() => gate.held.length).toBe(2 * population);
+    expect(await ended(gate.held.slice(0, population))).toEqual(Array(population).fill('abandoned'));
+    const narrowed = page.url();
+    // Leaving while it is read closes its upstream queries too.
+    await page.getByRole('navigation', { name: 'Destinations' }).getByRole('link', { name: 'Observe' }).click();
+    await page.waitForURL(/\/observe/);
+    expect(await ended(gate.held.slice(population, 2 * population))).toEqual(Array(population).fill('abandoned'));
+    // Back to that filter: nothing settled for it, so its list is shown with its support explicitly loading, until it settles.
+    await page.goBack();
+    await page.waitForURL(narrowed);
+    await expect.poll(() => rows.count()).toBe(1);
+    await expect.poll(() => page.locator('[data-state="loading"]', { hasText: 'Counting the facets' }).count()).toBe(1);
+    await captureLifecycle(page, 'verify-loading');
+    gate.hold(false);
+    for (const answer of gate.held) answer.release();
+    await expect.poll(async () => (await where.textContent())?.trim()).toBe("verdict = 'failed' AND status = 'completed'");
+    await expect.poll(() => rail.getByRole('button', { name: /failed/ }).count()).toBe(1);
+    await captureLifecycle(page, 'verify-settled');
+
+    // A failed support read says so beside the list it did not remove, and shows no counts at all rather than zeros.
+    gate.held.length = 0;
+    gate.hold(true);
+    await page.getByRole('link', { name: 'Clear' }).click();
+    await page.waitForURL(list);
+    await expect.poll(() => gate.held.length).toBe(population);
+    for (const answer of gate.held) answer.fail();
+    gate.hold(false);
+    await expect.poll(() => page.locator('[data-state="error"]').count()).toBeGreaterThan(0);
+    expect([await rows.count(), await rail.getByRole('button').count()]).toEqual([50, 0]);
+    await captureLifecycle(page, 'verify-support-error');
+
+    // Live waits for its support before its next refresh, and stops when paused or left.
+    await liveWaitsForSupport(browser, page, gate, `${list}?live=1`, 'verify');
+
+    // Back from an execution restores the shown rows and scroll position, at the page's height, while support is read again.
+    await page.goto(list);
+    await expect.poll(() => rail.getByRole('button', { name: /failed/ }).count(), { timeout: 30_000 }).toBe(1);
+    await page.getByRole('button', { name: 'Show 7 more' }).click();
+    await expect.poll(() => rows.count()).toBe(57);
+    await page.setViewportSize({ width: LIFECYCLE_VIEWPORT.width, height: 600 });
+    await rows.last().scrollIntoViewIfNeeded();
+    const left = { url: page.url(), scroll: await page.evaluate(() => window.scrollY), height: await page.evaluate(() => document.documentElement.scrollHeight) };
+    expect(left.scroll).toBeGreaterThan(0);
+    await rows.last().click();
+    await page.waitForURL(/\/verify\/executions\//);
+    await expect.poll(() => page.locator('[data-execution-status]').getAttribute('data-execution-status')).toBe('completed');
+    gate.held.length = 0;
+    gate.hold(true);
+    await page.goBack();
+    await page.waitForURL(left.url);
+    await expect.poll(() => gate.held.length).toBe(population);
+    await expect.poll(() => page.evaluate(() => window.scrollY)).toBe(left.scroll);
+    expect([await rows.count(), await page.evaluate(() => document.documentElement.scrollHeight) >= left.height, await rail.getByRole('button', { name: /failed/ }).count()]).toEqual([57, true, 1]);
+    await captureLifecycle(page, 'verify-back');
+    gate.hold(false);
+    for (const answer of gate.held) answer.release();
+    await page.setViewportSize({ width: 1280, height: 720 });
+
     // Results in Verify on the exact Verifier Card page opens the list for that Verifier version only.
     await page.goto(`${bff.url}/t/${tenant}/cards/detail?kind=Verifier&name=answer-check&version=1.0.0`);
     await page.getByRole('link', { name: 'Results in Verify' }).click();
@@ -2009,8 +2114,11 @@ judged('the Verify dashboard filters, groups, brushes, pages, opens an execution
     await expect.poll(() => rows.count()).toBe(1);
     await expect.poll(() => rows.first().textContent()).toContain('answer-check');
   } finally {
+    gate.hold(false);
+    for (const answer of gate.held) answer.release();
     await browser.close();
     bff.stop();
+    gate.stop();
     memory?.release();
     await counter.shutdown();
   }

@@ -964,7 +964,7 @@ test('a client navigation reads only its list, and support reads the population 
   }
 
   // The support routes read the population only: list choices change nothing they read or answer.
-  const read = async (handler: (event: never) => Promise<Response>, path: string) => {
+  const read = async (handler: (event: never) => Response | Promise<Response>, path: string) => {
     requests.length = 0;
     const response = await handler(asSession(path));
     return { status: response.status, body: await response.json(), requests: [...requests] };

@@ -12,6 +12,8 @@ Add UI-shaped cases to the existing Bifrost L1 harness, record the original
 baseline, then optimize shared hot execution against those unchanged queries.
 
 **Design:** [hot-read design notes](../design/task-012-r2-hot-reads.md).
+**Continuation:** [memtable timing supplement](012-R2-supplement-memtable-timing.md)
+records the baseline pickup state and the ordered remaining work.
 **Queries:** [catalog and schedules](../design/ui-sql/README.md),
 [exact SQL and binds](../design/ui-sql/queries.json).
 

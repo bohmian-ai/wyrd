@@ -184,6 +184,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_GITHUB_403_REPOSITORY_INACCESSIBLE` | 403 | GitHub repository not accessible | Select the repository in the tenant's GitHub installation and reconnect, or restore the installation; Wyrd uses a repository only while the installation can reach it and the tenant selected it. |
 | `WYRD_GITHUB_404_NOT_CONNECTED` | 404 | GitHub not connected | Connect the tenant with POST /v1/integrations/github/connect and complete the GitHub installation and authorization in a signed-in browser. |
 | `WYRD_GITHUB_409_CONNECTION_CONFLICT` | 409 | GitHub connection conflict | An installation belongs to at most one tenant and a tenant to one installation: disconnect the existing association first, or begin a new connection when details.reason is connection_changed. |
+| `WYRD_GITHUB_409_PULL_REQUEST_NOT_REVIEWABLE` | 409 | Pull request not reviewable | Request a review only for an open, ready pull request of a repository whose selected Repository declares pull_request bindings; details.reason is not_found, closed, draft or no_bindings, and no work was accepted. |
 | `WYRD_GITHUB_503_NOT_CONFIGURED` | 503 | GitHub integration not configured | Ask the deployment operator to configure the GitHub App (WYRD_GITHUB_* settings) and restart the server; every other Wyrd operation is unaffected. |
 | `WYRD_GITHUB_503_PROVIDER_UNAVAILABLE` | 503 | GitHub unavailable | Retry after the GitHub API recovers; when it persists, check the configured API URL, App credentials and network policy. |
 

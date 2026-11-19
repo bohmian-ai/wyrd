@@ -2117,6 +2117,9 @@ pub(crate) struct Retained {
     pub(crate) workload_card_uid: Option<String>,
     /// Its frozen PR pins.
     pub(crate) inputs: Value,
+    /// When its generation observed the pull request, as text that orders
+    /// chronologically.
+    pub(crate) recorded_at: String,
 }
 
 impl Deployment {
@@ -2128,22 +2131,12 @@ impl Deployment {
     /// Panics when the query fails or fewer than `count` are visible after
     /// ten seconds.
     pub(crate) async fn retained_as(&self, jwt: &str, number: u64, count: usize) -> Vec<Retained> {
-        let sdk = client(self.base(), jwt);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
-            let rows: Vec<Retained> = Bifrost::query_only(&sdk)
-                .sql_as(
-                    "SELECT execution_id, workload_card_uid, inputs \
-                       FROM bifrost.verification.execution_inputs \
-                      WHERE origin = 'pull_request' ORDER BY execution_id",
-                    &[],
-                )
+            let rows = self
+                .history_as(jwt, number, "TRUE")
                 .await
                 .expect("retained inputs query");
-            let rows: Vec<Retained> = rows
-                .into_iter()
-                .filter(|row| row.inputs["number"] == json!(number))
-                .collect();
             if rows.len() >= count {
                 return rows;
             }
@@ -2154,6 +2147,35 @@ impl Deployment {
             );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
+    }
+
+    /// The retained `pull_request` input records of PR `number` matching
+    /// the SQL `predicate`, read once as `jwt` through the SDK's Bifrost
+    /// query.
+    ///
+    /// # Errors
+    /// Returns the query's refusal, such as a caller lacking the table.
+    pub(crate) async fn history_as(
+        &self,
+        jwt: &str,
+        number: u64,
+        predicate: &str,
+    ) -> Result<Vec<Retained>, wyrd_client::bifrost::BifrostClientError> {
+        let rows: Vec<Retained> = Bifrost::query_only(&client(self.base(), jwt))
+            .sql_as(
+                &format!(
+                    "SELECT execution_id, workload_card_uid, inputs, \
+                            CAST(recorded_at AS VARCHAR) AS recorded_at \
+                       FROM bifrost.verification.execution_inputs \
+                      WHERE origin = 'pull_request' AND ({predicate}) ORDER BY execution_id"
+                ),
+                &[],
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter(|row| row.inputs["number"] == json!(number))
+            .collect())
     }
 
     /// The card UID of Repository `policy` at `version`.
@@ -2668,4 +2690,263 @@ async fn refused_review_requests_accept_nothing() {
         ids(&deployment.rows(41).await),
         "no state changed"
     );
+}
+
+/// The newest retained generation in `retained` by its observation time,
+/// and whether every member it names is visible.
+fn current(retained: &[Retained]) -> Option<(Value, bool)> {
+    let newest = retained
+        .iter()
+        .max_by(|a, b| a.recorded_at.cmp(&b.recorded_at))?;
+    let generation = &newest.inputs["generation"];
+    let visible: Vec<Value> = retained
+        .iter()
+        .filter(|row| &row.inputs["generation"] == generation)
+        .map(|row| json!(row.execution_id.to_string()))
+        .collect();
+    let members = newest.inputs["members"].as_array()?;
+    Some((
+        generation.clone(),
+        members.iter().all(|member| visible.contains(member)),
+    ))
+}
+
+/// The retained records of `generation` in `retained`.
+fn of<'r>(retained: &'r [Retained], generation: &Value) -> Vec<&'r Retained> {
+    retained
+        .iter()
+        .filter(|row| &row.inputs["generation"] == generation)
+        .collect()
+}
+
+/// Authorized retained reads resolve a pull request's current review set
+/// and history from its records alone: while a generation's handoff is
+/// interrupted its visible records are fewer than the members the domain
+/// read names, so it is never presented as complete, and recovery completes
+/// it; the current set is the one with the latest PostgreSQL observation
+/// time its records carry, whatever order they are read in, and every
+/// earlier set keeps its complete membership; a time bound selects history
+/// before it. A caller without the table is refused before any row or
+/// count, and another tenant's reader sees none of them.
+///
+/// # Panics
+/// Panics when visibility is reported complete early, latest regresses,
+/// history differs, or an unauthorized reader sees membership or counts.
+#[tokio::test(flavor = "multi_thread")]
+async fn retained_reads_resolve_current_and_history_membership() {
+    let deployment = Deployment::start().await;
+    let Bootstrap::User { jwt: reader, .. } = deployment
+        .server
+        .bootstrap_user("pull-request-historian", &["viewer"])
+        .await
+        .expect("reader bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let github = deployment.github(&deployment.jwt).await;
+    deployment
+        .mock
+        .set_pull_request(REPOSITORY, 51, PullRequest::open(REPOSITORY, "b1", "h1"));
+    let first = github
+        .review_pull_request(&deployment.review(51), "history-51-a")
+        .await
+        .expect("the first review is accepted");
+    let first_generation = json!(first.generation.to_string());
+    let retained = deployment.retained_as(&reader, 51, 2).await;
+    assert_eq!(current(&retained), Some((first_generation.clone(), true)));
+
+    deployment
+        .server
+        .flush_bifrost()
+        .await
+        .expect("setup settles");
+    let held = deployment
+        .server
+        .stall_next_bifrost_write_into("bifrost.verification.execution_inputs")
+        .expect("Scribe stalls");
+    let delayed = {
+        let github = deployment.github(&deployment.jwt).await;
+        let request = deployment.review(51);
+        tokio::spawn(async move {
+            github
+                .review_pull_request(&request, "history-51-b")
+                .await
+                .expect("the delayed review is accepted")
+        })
+    };
+    held.wait_entered().await;
+    let rows = deployment.rows(51).await;
+    assert_eq!(
+        rows.len(),
+        4,
+        "the delayed generation is reserved: {rows:?}"
+    );
+    let pending = deployment.status(rows[2].execution_id).await;
+    let delayed_generation = pending["pull_request"]["generation"].clone();
+    assert_eq!(
+        pending["pull_request"]["members"],
+        json!([rows[2].execution_id, rows[3].execution_id]),
+        "the domain read names the whole interrupted set"
+    );
+    let during = deployment
+        .history_as(&reader, 51, "TRUE")
+        .await
+        .expect("history reads");
+    assert!(
+        of(&during, &delayed_generation).len() < 2,
+        "the interrupted set is not fully visible: {during:?}"
+    );
+    assert_ne!(
+        current(&during),
+        Some((delayed_generation.clone(), true)),
+        "an interrupted set is never complete"
+    );
+
+    held.release();
+    let recovered = delayed.await.expect("the delayed review joins");
+    assert_eq!(json!(recovered.generation.to_string()), delayed_generation);
+    let after = deployment.retained_as(&reader, 51, 4).await;
+    assert_eq!(
+        current(&after),
+        Some((delayed_generation.clone(), true)),
+        "recovery completes the interrupted set"
+    );
+
+    let newest = github
+        .review_pull_request(&deployment.review(51), "history-51-c")
+        .await
+        .expect("the newer review is accepted");
+    let newest_generation = json!(newest.generation.to_string());
+    let mut history = deployment.retained_as(&reader, 51, 6).await;
+    assert_eq!(current(&history), Some((newest_generation.clone(), true)));
+    let observed: Vec<&String> = [&first_generation, &delayed_generation, &newest_generation]
+        .iter()
+        .map(|generation| {
+            let members = of(&history, generation);
+            assert_eq!(members.len(), 2, "{generation}: {history:?}");
+            assert!(members.iter().all(|row| {
+                row.inputs["members"].as_array().map(Vec::len) == Some(2)
+                    && row.recorded_at == members[0].recorded_at
+            }));
+            &members[0].recorded_at
+        })
+        .collect();
+    assert!(
+        observed.windows(2).all(|pair| pair[0] < pair[1]),
+        "each generation records its own later observation: {observed:?}"
+    );
+    history.sort_by(|a, b| b.recorded_at.cmp(&a.recorded_at));
+    assert_eq!(
+        current(&history),
+        Some((newest_generation.clone(), true)),
+        "older records read last do not replace the current set"
+    );
+    let cutoff = &of(&history, &newest_generation)[0].recorded_at;
+    let earlier = deployment
+        .history_as(
+            &reader,
+            51,
+            &format!("recorded_at < CAST('{cutoff}' AS TIMESTAMP)"),
+        )
+        .await
+        .expect("bounded history reads");
+    let mut generations: Vec<Value> = earlier
+        .iter()
+        .map(|row| row.inputs["generation"].clone())
+        .collect();
+    generations.dedup();
+    assert_eq!(earlier.len(), 4, "{earlier:?}");
+    assert!(
+        !generations.contains(&newest_generation),
+        "a bound before the current set selects only history"
+    );
+
+    let elsewhere = wyrd_runtime::Permission {
+        scope: wyrd_runtime::PermissionScope::Bifrost(
+            wyrd_runtime::BifrostPermissionScope::Schema(wyrd_runtime::BifrostSchemaScope {
+                catalog: "bifrost".to_owned(),
+                schema: "logs".to_owned(),
+            }),
+        ),
+        ..wyrd_runtime::Permission::bifrost_query_read()
+    };
+    for (role, query, code) in [
+        (
+            "pull_request_blind",
+            None,
+            "WYRD_PERMISSION_403_DENIED_RBAC",
+        ),
+        (
+            "pull_request_elsewhere",
+            Some(elsewhere),
+            "WYRD_VALA_403_QUERY_FORBIDDEN",
+        ),
+    ] {
+        let mut grants = vec![
+            wyrd_runtime::Permission::card_read(),
+            wyrd_runtime::Permission::verifier_read_any(),
+        ];
+        grants.extend(query);
+        deployment
+            .server
+            .seed_role(role, &grants)
+            .await
+            .expect("role seeds");
+        let Bootstrap::User { jwt, .. } = deployment
+            .server
+            .bootstrap_user(&role.replace('_', "-"), &[role])
+            .await
+            .expect("reader bootstraps")
+        else {
+            panic!("user bootstrap returned a non-user principal");
+        };
+        let refusal = |error: wyrd_client::bifrost::BifrostClientError| match error {
+            wyrd_client::bifrost::BifrostClientError::Transport(error) => error.code().to_owned(),
+            other => format!("{other:?}"),
+        };
+        let members = deployment
+            .history_as(&jwt, 51, "TRUE")
+            .await
+            .expect_err("membership is refused");
+        assert_eq!(refusal(members), code, "{role}");
+        let counted = Bifrost::query_only(&client(deployment.base(), &jwt))
+            .sql_as::<Value>(
+                "SELECT count(*) AS members FROM bifrost.verification.execution_inputs",
+                &[],
+            )
+            .await
+            .expect_err("counts are refused");
+        assert_eq!(refusal(counted), code, "{role}");
+    }
+
+    let other = deployment
+        .server
+        .seed_tenant("pull-request-foreign")
+        .await
+        .expect("second tenant seeds");
+    let foreigner = deployment
+        .server
+        .bootstrap_service_in_tenant(other, "pull-request-foreigner", &["viewer"])
+        .await
+        .expect("foreign reader bootstraps");
+    let foreign = deployment
+        .server
+        .exchange_api_key(foreigner.api_key().expect("a machine principal"))
+        .await
+        .expect("foreign key exchanges");
+    assert!(
+        deployment
+            .history_as(&foreign, 51, "TRUE")
+            .await
+            .expect("foreign history reads")
+            .is_empty()
+    );
+    let counted: Vec<Value> = Bifrost::query_only(&client(deployment.base(), &foreign))
+        .sql_as(
+            "SELECT count(*) AS members FROM bifrost.verification.execution_inputs",
+            &[],
+        )
+        .await
+        .expect("foreign count reads");
+    assert_eq!(counted, [json!({ "members": 0 })]);
 }

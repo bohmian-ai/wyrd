@@ -4428,6 +4428,10 @@ async fn pull_request_generations_reserve_activate_and_supersede() {
         .expect("generation reserves")
         .outcome;
     assert_eq!((a.len(), superseded.len()), (2, 0));
+    let first = PullRequestActivation {
+        members: a.clone(),
+        ..first
+    };
     assert!(
         queue
             .claim(&mut conn, Duration::minutes(5), Duration::minutes(5), 10)

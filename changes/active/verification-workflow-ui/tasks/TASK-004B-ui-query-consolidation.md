@@ -160,12 +160,31 @@ request budgets implement the maintainer-selected optimization.
      `ui/load` (one `loadPanel`), cancel/download (dependent POST then GET).
    - Analytical owners changed below: Observe layout (facets now 1 read; overview,
      StatStrip still pending scenario 2) and Verify (2 Bifrost reads + Card names).
-   - Domain-read duplicates found, not yet changed: the hook and tenant layout both
-     read `/auth/browser/session` on every page load; Card detail re-reads the same
-     Card 3x (plain), 5x (Verifier), 7x (Prompt overview) and lists versions twice;
-     Observe validates the same `where_sql` once per panel (up to 4x); account
-     settings awaits `/principals/me` only for an id the session holds;
-     repositories index awaits the GitHub connection before an independent listing.
+   - Domain-read duplicates, now removed:
+     - Card detail read the same Card 3x (plain), 5x (Verifier), 7x (Prompt). `readCard`
+       and `listVersions` (cards.ts) now share one read per load context (WeakMap, as
+       `predicateFor`); `loadCardHeader` and `readVerifier` route through them.
+       `ui-pages.test.ts` "a Card page reads its Card once and lists its versions once":
+       RED "Service support-api@1.0.0: expected { cardReads: 3 } to equal { cardReads: 1 }";
+       GREEN for Service, Prompt and Verifier. Two integration tests that reused one
+       context across standalone loaders now give each its own context (still one read
+       each, no dependent read).
+     - Session: the hook resolves only the selected tenant's cookie and the tenant layout
+       enumerates every signed-in tenant; both are tested contracts
+       (`browser-sessions.test.ts`), so both stay on a full page load. The layout read
+       `url` (origin/host/protocol) and so reran on every client navigation. It now
+       passes `untrack(() => new URL(url.origin))`. "the tenant layout enumerates sessions
+       without depending on the URL": RED "expected ['origin','host','protocol'] to equal
+       []"; GREEN. A navigation now costs the hook's one read.
+     - Account settings: the key page uses the session's server-resolved principal and
+       reads with the profile at once. "account settings reads the profile and the own
+       key page at once": RED "(profile answered: true)"; GREEN.
+     - Repositories index: the Card listing starts with the GitHub connection read, which
+       is awaited only for the join. "the Repositories index lists its Cards without
+       waiting for the GitHub connection": RED "expected false to be true"; GREEN.
+       Declare and Integration still gate on the connection (refused connection, no Card read).
+     - Observe validated one `where_sql` once per panel (up to 4x): one validation per
+       refresh (scenario 5).
    - Deliberate dependent waits kept: Card header gates panels; execution detail
      status gates invocations; GitHub connection gates declare/integration joins.
 2. **Consolidate overview, facets and statistics exactly.** With repeated trace
@@ -234,10 +253,10 @@ request budgets implement the maintainer-selected optimization.
      observed RED was the removed `loadExecutionCharts` export, not a count.
    - Real server (`ui-library.integration.test.ts` "Verify lists executions..."):
      discovery facets equal the facet rail's rows; both charts total every listed
-     execution; top/more match the distinct Verifier count. The test then fails in
-     its hosted-runner step ("1 hosted operations never waited for memory within
-     60s; last observed: 0"), reproduced 3x and in `ui-pages.integration.test.ts`
-     "the Verify dashboard filters..."; not diagnosed, no query code on that path.
+     execution; top/more match the distinct Verifier count. The same test compares the
+     discovery read with the original seven facet and two chart reads over that
+     population (see scenario 7). The hosted-runner step that was red is fixed in
+     scenario 6; the test and "the Verify dashboard filters..." are GREEN.
 4. **Preserve Metrics while removing eager support reads.** Load real scalar,
    integer-above-2^53, cumulative/delta/reset and histogram data at 1h/24h.
    Assert plots/summaries/labels and bounded outputs match original SQL; one
@@ -259,8 +278,9 @@ request budgets implement the maintainer-selected optimization.
    - Real server: `ui-pages.integration.test.ts` "authenticated metrics investigation"
      asserts no `attributes.route` suggestion before the picker is used, then one after
      typing; GREEN. Metric math, labels and points-on-request assertions unchanged.
-   - Not separately exercised here: integer-above-2^53 and reset data (existing metric
-     integration fixtures unchanged by this work).
+   - Integer above 2^53, cumulative resets, delta and histogram windows: the existing
+     `ui-library.integration.test.ts` "TASK-004: Metric windows count every recorded value"
+     (gauge `9007199254740993` exact, restart and smaller-value resets), GREEN in the full run.
 5. **Primary content and navigation do not wait on unrelated work.** Delay a
    supporting aggregate or Card-name response in the existing executor/test
    seam: a successful list/plot renders while it remains pending. Counts and
@@ -374,13 +394,28 @@ request budgets implement the maintainer-selected optimization.
    | Logs facets, consolidated | 1 | 1 | 1 | 0.74 ms | 0 | 36 ms |
    | StatStrip 10 stats, original | 20 | 20 | 18 | 1.60 ms | 0 | 42 ms |
    | StatStrip, consolidated | 6 | 6 | 5 | 2.31 ms | 0 | 39 ms |
+   | Verify 7 facets + 2 charts, original | 9 | 37 | 288 | 257.9 ms | 0 | 121 ms |
+   | Verify discovery, consolidated | 1 | 5 | 40 | 34.6 ms | 0 | 167 ms |
 
-   Scans fall 10->3, 4->1, 20->6 with no new spill or refusal. Summed operator compute
+   Scans fall 10->3, 4->1, 20->6, 37->5 with no new spill or refusal. Verify is measured in
+   "Verify lists executions..." on its populated fixture (real direct, queued, drift,
+   group, cancelled and deferred executions): facet and verdict rows equal the original
+   as multisets, the top three Verifiers keep their rows and the rest equal the original
+   per-bucket sums. Its operator compute falls 258 -> 35 ms because the original joined
+   the execution events nine times; one normal run's elapsed was higher (167 vs 121 ms),
+   so no latency gain is claimed. Summed operator compute
    on this three-span fixture is fixed-cost noise (grouping-set expansion adds a little
    on traces and stats), so no compute or latency gain is claimed; elapsed is one
-   normal-query run each. Limits: Verify discovery and Metrics are not in this pair
-   (Verify's fixture lives in the hosted-blocked test; Metrics reads were removed, not
+   normal-query run each. Limits: Metrics is not in this pair (its reads were removed, not
    rewritten); Oracle DEBUG profiles and peak memory were not collected.
+
+   Lanes for the EXPLAIN backend (this branch, full runs): `test:bifrost:journey:oracle`
+   69/69, `test:bifrost:journey:typescript` 210 passed, `test:bifrost:journey:python`
+   225 passed, `test:bifrost:journey:mcp` 49/50. The MCP failure is
+   `verification::pg_tests::execution_waits_and_refusals_follow_hosted_capacity`: with the
+   hold counted as verification work (scenario 6), a request under `occupy_hosted_memory`
+   now waits to the 504 deadline instead of being refused at once with 503. Open: one
+   control serves both the refusal and the wait journeys; needs a maintainer decision.
 
 ## Verification and handoff
 

@@ -26,6 +26,12 @@ Do not create another secret registry or a public encryption/decryption API.
 
 ## Existing owner and scope
 
+This task implements stored-secret encryption, not new authentication flows.
+Reuse existing provider credential acquisition and refresh. Provider API
+support does not require adding a vendor SDK or federation support; a new
+authentication capability needs separately agreed scope. Auth-owned secrets
+remain in scope as encryption consumers.
+
 `crates/shared/wyrd-crypt/src/lib.rs` already provides AES-GCM/AAD, fresh-DEK
 envelope helpers, canonical length-prefixed context, and zeroizing key types.
 Its envelope helpers currently require a raw local KEK and cannot call remote

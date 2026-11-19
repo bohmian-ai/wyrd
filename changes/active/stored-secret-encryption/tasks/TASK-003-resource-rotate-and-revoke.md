@@ -27,6 +27,20 @@ consuming paths. This task adds/extends their administration, not a new registry
 
 ## Existing owners and scope
 
+Use the provider APIs behind the existing facade/adapters, reusing installed
+HTTP clients and credential/signing code. Do not add a provider SDK or other
+external dependency where those APIs and existing mechanisms suffice.
+
+The new behavior is administration of stored secrets under existing resource
+identities. A replacement credential is supplied to Wyrd, not minted by a new
+authentication integration. Reuse Task 2 encryption and the existing owner
+permissions, validation, activation, disable/revoke, and session behavior.
+Do not add login methods, federation, grants, token issuance/exchange protocols,
+or provider credential acquisition. Public resource actions are in scope;
+a redesign of authentication is not. No new vendor SDK or authentication
+stack is required. If one appears necessary, identify the exact approved
+requirement and reuse limitation for the maintainer before adding it.
+
 Extend `OperatorConnectionControl` update/disable, `GatewayAdministration`
 credential replacement/revoke, auth `HumanConnections` candidate/test/activate,
 issuer configuration owners, and platform identity administration. Existing
@@ -64,7 +78,9 @@ in these entries; test variant owners/surfaces under the same scenarios.
    decrypt, supply a valid replacement through its typed owner operation.
    Actual downstream use receives the replacement under the same identity with
    a fresh DEK. Auth replacement follows candidate/test/activate and its existing
-   session effects. Provider failure/invalid input leaves committed state intact.
+   session effects; extend the existing flow only to use the common facade and
+   expose the approved action. Do not replace its authentication machinery.
+   Provider failure/invalid input leaves committed state intact.
    Server/SDK journeys plus OIDC/provider fixtures assert the consuming effect;
    RED is absent action/mode or replacement incorrectly depending on old decrypt.
 3. **Revoke without resurrection** — REQ-007–009.
@@ -110,8 +126,9 @@ Run affected owner/projection tests, `mise run codegen:check`,
 `mise run check:deps`, `mise run check:tenant-isolation`, Rust format/lints,
 Python format/lints/typecheck, TypeScript format/lints/typecheck and native
 declaration checks for the changed surfaces, and `mise run docs:check`.
-If runtime hot-path code changes, enumerate external waits and run the applicable
-clean full L1 benchmark/comparison as required by the spec and benchmark rules.
+If runtime hot-path code changes, enumerate added/moved external waits and
+their authority. Benchmarks are not assigned by this task and require an
+explicit maintainer request for the current change.
 
 Output: tested, documented resource actions on every required surface. Task 4
 is independent after Task 2; selected-secret actions do not depend on a new

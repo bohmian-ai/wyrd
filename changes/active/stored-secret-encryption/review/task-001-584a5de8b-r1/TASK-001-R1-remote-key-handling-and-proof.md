@@ -7,15 +7,14 @@ spec_revision: 1
 requirements: [REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, REQ-008]
 depends_on: [TASK-001]
 parent_task: TASK-001
-remediates: [FIND-TASK-001-1, FIND-TASK-001-2]
+remediates: [FIND-TASK-001-1]
 ---
 
 # Complete remote key handling and acceptance proof
 
 ## Outcome and reviewed subject
 
-Make the existing remote KMS capability preserve its secret-buffer invariant,
-accept the advertised federated GCP workload ADC configuration. Successful
+Make the existing remote KMS capability preserve its secret-buffer invariant. Successful
 closure lets the next task consume the common facade without changing its
 envelope, authority context or deployment key trust.
 
@@ -37,16 +36,9 @@ plaintext body duplicate. Preserve wire shapes, authentication context,
 bounded transport, refusal classes, secret-free errors and existing KV reads.
 Do not broaden this to arbitrary third-party transport/kernel allocations.
 
-**FIND-TASK-001-2 — REQ-005 and deployment ADC authority.** A self-hosted
-deployment supplying a Workload Identity Federation ADC file through
-`GOOGLE_APPLICATION_CREDENTIALS` cannot construct `GcpKms`, because the current
-storage client's ADC enum rejects `external_account`. Correct reusable
-credential acquisition behind the existing `GcpKms` owner, including refresh.
-Retain configured CryptoKey selection and the current common API. Test the
-actual constructor path; the existing injected credentials bypass the gap.
-No new public authentication option or live production cloud account is
-needed. Narrowing the approved contract requires specification authority and
-is not an implementation fix under this task.
+FIND-TASK-001-2 is withdrawn following maintainer clarification on
+2026-11-19: federation is authentication work outside this encryption packet.
+No new authentication flow or vendor SDK is required by this task.
 
 The maintainer withdrew FIND-TASK-001-3 and its benchmark requirement on
 2026-11-19. No benchmark is assigned by this remediation task.
@@ -121,15 +113,7 @@ The maintainer withdrew FIND-TASK-001-3 and its benchmark requirement on
      cancellation follows from ownership, shown in the source: every
      key-bearing buffer is owned by `SecretBytes` or `Zeroizing` until it
      drops.
-2. **Federated ADC constructor and refresh** — FIND-TASK-001-2, REQ-005.
-   Supply a valid federated workload ADC fixture through the actual ambient
-   credential constructor, with local subject-token/exchange services. Build
-   the GCP backend, seal/open through the facade, expire/refresh its access
-   credential and observe a subsequent authenticated request using the new
-   credential. A refused exchange must return redacted failure and no
-   replacement envelope. Use local protocol fixtures in the KMS owner; keep
-   the existing injected-credential tests for KMS wire assertions. Do not
-   substitute a direct injected provider for the constructor being fixed.
+## Historical disposition of withdrawn authentication work
 
    **WITHDRAWN.** The reviewer withdrew FIND-TASK-001-2 from this task as
    scope expansion: no Wyrd authority requires Workload Identity Federation.
@@ -137,6 +121,7 @@ The maintainer withdrew FIND-TASK-001-3 and its benchmark requirement on
    reverted. `GcpKms::new` is back on the existing `object_store` credential
    chain (service-account key, gcloud user credential, metadata server), and
    the federation test and its reference-page wording are removed.
+
 ## Preserved external-wait audit
 
 The recorded audit traces Gateway ExternalSecret

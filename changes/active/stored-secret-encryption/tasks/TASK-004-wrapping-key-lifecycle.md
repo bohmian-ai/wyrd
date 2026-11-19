@@ -29,6 +29,20 @@ tenant resource, and does not need that task's new action implementation.
 
 ## Existing owner and scope
 
+Use the provider APIs behind the existing facade/adapters, reusing installed
+HTTP clients and credential/signing code. Do not add a provider SDK or other
+external dependency where those APIs and existing mechanisms suffice.
+
+This task changes stored-secret wrapping-key lifecycle. Reuse Task 1 provider
+clients and existing credential acquisition/refresh; extend wrapping adapters
+only for the approved key-lifecycle operations. It does not add federation,
+identity provisioning, new token-acquisition methods, IAM policy administration,
+or a general cloud-management SDK. A compromised provider identity is repaired
+through deployment administration, not a new authentication feature here.
+If an existing adapter cannot perform a named key-lifecycle operation, identify
+that exact gap and any proposed dependency cost for the maintainer before
+extending scope.
+
 Consolidate the complete workflow of auth `SealedSecretRewrap` and Operator
 `OperatorKeys` maintenance/verification runner: discover affected rows/tenants,
 perform bounded cancellable work, compare-and-swap, report failures/counts,
@@ -36,6 +50,13 @@ retry/resume, and trigger existing runtime preparation/invalidation. Reuse the
 existing SQL swap/version fences and named platform cross-tenant capabilities.
 Task 2 has replaced crypto/key retrieval; remove duplicate rotation orchestration
 here without adding a second loop around its leaf helpers.
+
+Reuse the complete pass behavior, not its transaction scope unchanged:
+`OperatorKeys::rewrap_tenant` currently locks a batch and then awaits key reads.
+Prepare remote wrapping work outside those locks/transactions and commit through
+the existing SQL owner with observed-envelope and authority fences. Preserve
+bounded work, cancellation, and retry; no new lease or coordination framework
+is implied. Task 2 must already preserve this boundary during its crypto cutover.
 
 Extend existing platform administration for start/progress and the approved
 disable workflow, under platform authority. Carry the affected platform client
@@ -49,8 +70,9 @@ new cache TTL, or arbitrary key/endpoint selector.
 Update operator rotation/recovery documentation and runbooks with exact usable
 backend instructions, including what is a provider version versus a new logical
 key, what Wyrd loads, how access is retained, and how to read pass counts.
-Describe identity-access remediation and backup retention separately from
-rewrapping; do not claim provider tokens are revoked by key maintenance.
+Describe identity-access remediation as an operator responsibility and backup
+retention separately from rewrapping; do not implement new IAM/token flows or
+claim provider tokens are revoked by key maintenance.
 
 ## Ordered acceptance scenarios and evidence
 
@@ -74,6 +96,10 @@ Record actual assertions, focused commands, RED/GREEN and limitations here.
    logical-key replacement updates persisted references. Server/SQL integration
    plus backend tests assert the complete consuming transition. RED is uncovered
    owners or duplicate/incorrect maintenance, not missing new per-tenant keys.
+   Native-rotation checks demonstrate retained decryption and new wrapping;
+   do not require discovery or retirement counts for opaque AWS material
+   generations. Whole-store reference-transition counts concern the configured
+   logical-key replacement, using the common envelope's trusted key reference.
 3. **Recover from compromised wrapping material** — REQ-002 as exercised by
    REQ-010, REQ-011. Given affected values and a permitted safe replacement,
    invoke compromise recovery rather than routine rewrap. Assert fresh DEKs and
@@ -118,10 +144,11 @@ test service setup; identify local protocol versus live-provider evidence.
 Run affected owner/projection tests, codegen and boundary checks, Rust and changed
 language format/lint/type/declaration checks, and `mise run docs:check` /
 `mise run check:examples` where applicable. External IO belongs in maintenance
-and preparation. If hot-path code changes, list every added/moved wait and obtain
-the applicable clean full L1 VALID comparison, including Gateway qualification.
+and preparation. If hot-path code changes, list every added/moved wait and
+its authority. Benchmarks are not assigned by this task and require an explicit
+maintainer request for the current change.
 
 Integrated change review closes the four spec journeys across these four tasks,
-with full required language/owner lanes and benchmarks, rather than treating
-isolated provider tests as delivered proof. No cloud credentials, benchmark
+with full required language/owner lanes, rather than treating isolated
+provider tests as delivered proof. No cloud credentials, benchmark
 results, runtime success, or independent security audit are claimed by this plan.

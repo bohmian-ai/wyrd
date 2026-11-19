@@ -186,6 +186,10 @@ Details: `agent_docs/rust.md`, `agent_docs/errors.md`,
   before diagnosing. Never generate synthetic host load.
 - Run the narrowest lanes for what you changed, plus the exact nextest command
   for every test you name. `gate` only for broad, CI, or release changes.
+- Benchmarks require an explicit maintainer request for the current change.
+  Do not add them to tasks, remediation, or review gates merely because code
+  touches a hot path or inherited generic instructions mention benchmarks.
+  Continue source-based hot-path wait audits and focused functional checks.
 - Never circumvent a gate: no `#[allow]`, `#[ignore]`, deleted or weakened
   tests, or widened boundary globs. A red gate is yours to fix whoever turned
   it red; don't spend effort proving a failure predates you.

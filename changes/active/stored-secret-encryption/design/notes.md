@@ -51,6 +51,15 @@ invariants are supporting checks rather than separate journeys.
 
 ## Constraints and non-goals
 
+Maintainer scope clarification, 2026-11-19: this packet changes stored-secret
+encryption, including protection of auth-owned secrets. It does not add
+authentication methods, federation, or identity/token-exchange flows. Reuse
+existing provider authentication. Backend API support does not require a
+vendor SDK for each backend. Use provider APIs through existing HTTP clients
+and credential/signing mechanisms where possible. A new dependency needs a
+concrete unmet encryption/key-lifecycle requirement and discussion of the reuse
+limit and dependency costs before addition. SDK selection cannot expand scope.
+
 - Nothing shipped: replace initial formats and schemas directly after spec
   approval. No migrations for existing data, compatibility readers, or aliases.
 - No production, authority, branch, staging, or commit changes during design.
@@ -410,7 +419,9 @@ was created, and no authority or production code changed.
 Use the [recommended behavior-driven scenarios](journey-scenarios.md) as the
 acceptance discussion for the specification, with existing local-dev, Operator,
 identity, and Gateway lanes as verification owners. Each new action needs proof
-on every surface that ships it. Gateway changes require a full clean applicable
-L1 benchmark and an enumeration of added/moved external waits. No runtime tests,
-cloud experiments, benchmarks, or independent security audit were performed.
+on every surface that ships it. Enumerate added/moved external waits and their
+authority. The maintainer withdrew automatic benchmark qualification on
+2026-11-19; benchmarks require an explicit request for the current change.
+No runtime tests, cloud experiments, benchmarks, or independent security audit
+were performed.
 Local design-document links were checked.

@@ -33,6 +33,13 @@ continues through the repository's task workflow.
 
 ## Agreed approach and limits
 
+This is a stored-secret encryption change, not an authentication change
+packet. It changes how existing secrets, including auth-owned client secrets,
+are protected at rest. Existing identity, credential acquisition, token
+issuance/exchange, and authentication/session semantics retain their owners.
+Adding a workload authentication method such as federation is outside this
+packet; backend support does not implicitly require every provider login flow.
+
 Use envelope encryption: a **data-encryption key (DEK)** encrypts one stored
 secret value; a **key-encryption key (KEK)** wraps that DEK. One deployment KEK
 protects fresh, independent, tenant-bound DEKs. There is no reused tenant-wide
@@ -107,7 +114,9 @@ existing [configuration authority](../../../architecture/operations/deployment-a
 Backend identity and allowed-key changes use controlled deployment rollout;
 an admin action cannot grant itself arbitrary cloud key access. No backend
 silently falls back to another. Reusable provider clients refresh their access
-credentials using the selected provider's authentication lifecycle.
+credentials using the selected provider's existing authentication lifecycle.
+Authenticate the wrapping API through existing supported credential sources;
+this requirement does not introduce new identity or token-exchange flows.
 
 | Deployment/backend | Setup and read/write behavior |
 |---|---|
@@ -262,8 +271,15 @@ the replacement contracts are implemented.
 
 Signing, password hashing/token digests, Wyrd-issued API-key/token lifecycle,
 external Gateway secret references, and object-store encryption are excluded.
-Private crate placement, method signatures, provider SDK choice, envelope binary
-encoding, and test fixtures remain implementation decisions within this contract.
+Call backend provider APIs directly where possible, reusing the existing HTTP
+clients and credential/signing mechanisms. Do not add a vendor SDK or another
+dependency when those mechanisms satisfy the encryption/key-lifecycle need.
+If a named requirement cannot be met with that reuse, explain the concrete
+limitation and proposed dependency, including its transitive/runtime costs,
+to the maintainer before adding it. Backend integration does not authorize
+new authentication capabilities. Private crate placement, method signatures,
+envelope binary encoding, and test fixtures remain implementation decisions
+within this contract.
 
 ## Acceptance observations
 
@@ -283,10 +299,14 @@ purpose binding, tamper and unknown-key refusal, permissions, redaction, and
 provider-outage behavior through the real consuming owners. Journey proof uses
 the real server and repository Postgres on each shipped public projection;
 provider adapter checks do not substitute for the consuming journey.
-Gateway hot-path verification enumerates added/moved external waits and includes
-the required clean full `mise run bench:l1:gateway` VALID comparison under
-repository benchmark rules. Other changed hot paths retain their applicable
-proof obligations. These are implementation acceptance requirements; no runtime
+Supporting provider proof includes small live GCP/AWS integration tests and
+the existing real dev Vault Transit test. Follow storage integration-test
+layout, naming, mise runners, and credentialed CI organization. Reuse existing
+provider APIs and credential mechanisms; live tests add no authentication
+capability or provider SDK requirement.
+Hot-path verification enumerates added/moved external waits and their authority.
+The maintainer withdrew automatic benchmark qualification on 2026-11-19;
+benchmarks require an explicit request for the current change. No runtime
 tests, cloud experiments, or benchmarks have been executed for this specification.
 
 ## Approval and revision

@@ -190,3 +190,22 @@ startup proof, benchmarks and unrelated cleanup remain outside this remediation.
 Handoff records exact RED/GREEN commands and results, added/moved wait inventory,
 remaining accepted CI limits, and original TDD violations. Return implementation
 evidence to the caller; do not automatically launch review.
+
+## Handoff
+
+- Commits: `6360b5f4d` (scenario 4), `d725e6e11` (scenario 1), `d4bc8d8d0`
+  (scenario 3) and `e8306fee8` (scenario 2). The RED/GREEN commands and results are
+  under each scenario. Every scenario is behaviorally PASS and TDD PASS.
+- Wait inventory: no hot-path wait was added or moved.
+  - The Gateway resolution still reads only the admitted snapshot; the pending flag is
+    set by the existing background reload.
+  - Operator rewrap is background maintenance. It now issues one short read, then one
+    fenced swap transaction per row, with no transaction held across a key-service call.
+  - Operator `change` and human-connection `stage` keep sealing outside transactions.
+- Final checks pass: `mise run fmt`, `mise run lints`, `check:deps`,
+  `check:tenant-isolation`, `codegen:check` (the `OperatorConnectionConflict` rustdoc
+  changed) and `git diff --check`. No migration was added; docs did not change.
+- Accepted CI limits remain: the Linux startup-prod lane and the
+  `kms-integration-cloud` live-cloud keys, both per the TASK-002 evidence.
+- The original TASK-002 TDD violations for scenarios 2 and 3 stay recorded there.
+- Review is left to the maintainer.

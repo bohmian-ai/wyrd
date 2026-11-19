@@ -96,6 +96,39 @@ Unsuffixed `WYRD_DB_*` variables tune the tenant pool. `_MIGRATOR` and
 pool. Missing suffixed values use that role's typed defaults; they do not
 inherit the application value.
 
+### Stored-secret encryption
+
+`[kms]` is the one typed configuration of the `WyrdKms` wrapping backend that
+every recoverable stored secret uses. Its canonical environment projections
+are `WYRD_KMS_*`; no other key setting, alias, or fallback exists.
+
+| Setting | Environment | Meaning |
+|---|---|---|
+| `backend` | `WYRD_KMS_BACKEND` | `file`, `memory`, `gcp_kms`, `aws_kms`, or `vault_transit`; required |
+| `active_key` | `WYRD_KMS_ACTIVE_KEY` | Logical reference new envelopes are wrapped under; required |
+| `retained_keys` | `WYRD_KMS_RETAINED_KEYS` (comma-separated) | References still allowed to open existing envelopes |
+| `key_dir` | `WYRD_KMS_KEY_DIR` | `file` only: directory of owner-only base64 32-byte key files named by reference |
+| `endpoint` | `WYRD_KMS_ENDPOINT` | Remote API base URL; required for `vault_transit`, optional override for the cloud backends |
+| `vault_mount` | `WYRD_KMS_VAULT_MOUNT` | `vault_transit` only: Transit mount, default `transit` |
+| `vault_namespace` | `WYRD_KMS_VAULT_NAMESPACE` | `vault_transit` only: optional Enterprise namespace |
+| `vault_token_file` | `WYRD_KMS_VAULT_TOKEN_FILE` | `vault_transit` only: owner-only token file, re-read per request |
+| — | `WYRD_KMS_VAULT_TOKEN` | `vault_transit` only: inline token; environment only, exclusive with the file |
+
+References are key names for `file`, `memory`, and `vault_transit`, CryptoKey
+resource names (no version) for `gcp_kms`, and key ARNs (not aliases) for
+`aws_kms`. GCP and AWS authenticate with the provider's standard workload
+credentials (application default credentials or metadata server; the AWS
+environment, web-identity, container, or instance chain), refreshed by the
+provider client. Startup refuses an unknown backend, a missing or malformed
+reference, an active key repeated as retained, settings that do not apply to
+the selected backend, an unreadable or non-owner-only key file, both Vault
+token forms, `memory` in production, and a non-`https` endpoint in
+production. `memory` is explicit and ephemeral: losing the process loses every
+envelope it wrote. Diagnostics name the setting, never its value, path, token,
+or key. Backend identity and allowed-key changes are static and roll out by
+controlled restart; no tenant or administrator action can grant the server
+another key.
+
 ## Browser-session deployment
 
 First-party UI sessions are Rust-owned and persisted by digest in the existing
@@ -103,7 +136,7 @@ Postgres database. Node forwards the selected tenant's opaque cookie and public
 origin; it needs no separate OAuth client credential or cookie-encryption key.
 No UI-specific environment variable, secret file, bootstrap step, session
 service, Redis instance or sticky routing is required. This does not remove
-existing server signing/sealing keys, database credentials or external-provider
+existing server signing keys, stored-secret wrapping keys, database credentials or external-provider
 client configuration.
 
 Every replica uses the existing database authority. Replacing either a Rust or

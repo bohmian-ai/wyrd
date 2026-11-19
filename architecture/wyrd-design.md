@@ -2753,20 +2753,17 @@ protocol-versioned additions):
 tenant connection by provider and name. Tenant administrators manage
 connections through `/v1/operator-connections` (`operators:read` /
 `operators:write`) and every SDK, CLI, and MCP projection. Wyrd stores each
-secret itself in Postgres, envelope-encrypted: a per-row data key sealed with
-AAD binding tenant, connection, provider, name, and secret version, wrapped by
-a versioned key-encryption key from an environment variable, owner-only
-files, or HashiCorp Vault KV v2. Multi-tenant production requires Vault over
-HTTPS so each tenant has its own key, and fails startup if the provider or any
-active tenant's active 32-byte key is unavailable; environment keys are
-development-only, and owner-only key files may serve an explicitly
-single-tenant deployment. Without a readable key only connection
-create/update refuses; other surfaces keep working and delivery retries with
-`credential_store_unavailable`. Vault reads use the shared screened and
-pinned `wyrd-vault` KV v2 reader that Gateway also uses for provider
-credentials; only the Operator owner interprets and validates the KEK, and no
-general secret resolver backs Operator keys. Rewrap onto a new active version
-runs beside delivery in bounded, cancellable tenant-scoped passes. Responses, errors,
+secret itself in Postgres as one common `WyrdKms` envelope in
+`secret_ciphertext`: a fresh data key per secret version, authenticated with
+tenant, connection, provider, name, and secret version, wrapped by the
+deployment's configured stored-secret backend (file, development memory, GCP
+KMS, AWS KMS, or Vault Transit). The Operator owner keeps connection
+authorization, persistence, reversible disable, and delivery checks; it owns no
+key source, cipher, or provider client of its own. When the wrapping backend
+cannot serve, connection create/update refuses; other surfaces keep working
+and delivery retries with `credential_store_unavailable`. Wrapping-key rewrap
+runs beside delivery in bounded, cancellable passes fenced on the secret
+version. Responses, errors,
 logs, and audit carry only redacted metadata, never key locations. Declaration
 and every delivery attempt require an active connection whose provider — and,
 for HTTP, auth scheme, header name, and origin of every effective URL —

@@ -121,6 +121,12 @@ Backups cover all authoritative and recovery-critical state:
   configured retention protection;
 - encrypted signing, peer, Source, and storage key backups under separate
   access control;
+- the stored-secret wrapping keys every backed-up envelope references: `file`
+  key files, or continued access to the remote KMS or Transit key and its
+  retained versions, plus the matching `[kms]` active and retained
+  references. Database backups alone cannot recover stored credentials, and a
+  wrapping key is retired only after no live, cached, or backed-up envelope
+  depends on it;
 - deployment and redacted configuration fingerprints; and
 - node-to-volume identity needed to recover Scribe WAL and staged runs.
 
@@ -141,7 +147,9 @@ Restore proceeds under write isolation:
 1. Select one mutually consistent recovery point and preserve incident
    evidence before mutation.
 2. Restore keys and trust configuration required to verify, but not yet serve,
-   the recovered state.
+   the recovered state, including the stored-secret wrapping keys the
+   recovered envelopes reference. A missing wrapping key is a recovery
+   failure, never permission to generate a replacement.
 3. Restore Postgres and verify migrations, roles, RLS, sentinels,
    task/lease state, and catalog pointers.
 4. Restore or select the object-store version set and verify every referenced

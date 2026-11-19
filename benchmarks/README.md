@@ -414,6 +414,23 @@ When reporting a run, paste this report, fresh or regenerated with
 `capacity report <record>`, and append interpretation below it. Do not
 replace it with hand-built tables or extract results from raw snapshots.
 
+To compare two VALID runs of one experiment, such as a change against its
+baseline:
+
+```bash
+target/profiling/release/capacity compare <before.json> <after.json>
+```
+
+Each step both runs measured gets one table, with a row for every metric
+(diagnostics aside): `before` and `after` are each run's median with its
+repetition range as `[min–max]`, `change` is the change of the medians, and
+`outside spread` says `outside: higher` or `outside: lower` when the two
+ranges do not overlap, adding `better` or `worse` for a metric that declares
+a direction, and `no measured change` when they overlap. A histogram median
+shows its bucket; its change compares the bucket upper bounds and it has no
+spread verdict. Runs of different experiments, or an INVALID run, are
+refused with exit 2.
+
 ## History
 
 History is the `benchmark-records` branch, which shares no commits with the

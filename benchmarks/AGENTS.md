@@ -12,8 +12,8 @@ whoever runs it.
   `--allow-dirty`.
 - NEVER start a run by invoking `capacity` or `wyrd-server` directly, copy
   binaries into scratch directories, or wrap a run in your own script or
-  loop. The `capacity report` and `capacity profile` readers are the only
-  direct invocations. Each
+  loop. The `capacity report`, `capacity compare` and `capacity profile`
+  readers are the only direct invocations. Each
   repetition count, warmup, and step order comes from the plan.
 - To compare builds, run the same task with the same flags in a worktree
   checked out at each commit. To compare code variants, measure each variant
@@ -26,7 +26,9 @@ whoever runs it.
 ## Reading results
 
 - ALWAYS report a run by pasting its `capacity report <record.json>` output,
-  then add interpretation below it. Compare runs with `mise run bench:results`.
+  then add interpretation below it. Compare two runs with
+  `capacity compare <before.json> <after.json>` and paste its output as the
+  Comparison; `mise run bench:results` charts a metric across history.
 - `capacity report` shows every series the server records for each step. A
   value the run keeps but the report omits is a reader defect: extend the
   reader.
@@ -58,7 +60,8 @@ order and nothing else:
 4. **Comparison.** The named earlier record it is compared against (same
    task, same flags, same host), and for each metric the answer relies on:
    before, after, change, and whether the change is outside the
-   repetitions' spread. Compare only VALID records.
+   repetitions' spread: the `capacity compare <before.json> <after.json>`
+   output, pasted unedited. Compare only VALID records.
 5. **Answer.** The conclusion in plain words, tied to the numbers above.
 6. **Unproven.** What the run does not show, and what would show it.
 

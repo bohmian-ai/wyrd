@@ -1807,6 +1807,18 @@ pub struct Summary {
     pub spread: Option<f64>,
 }
 
+impl Summary {
+    /// The median and the repetition range as one comparison cell, such as
+    /// `100 [98–101]`; a histogram median shows its bucket.
+    fn spread_cell(&self) -> String {
+        let median = self.median.cell("");
+        match self.min.zip(self.max) {
+            Some((min, max)) => format!("{median} [{}–{}]", number(min), number(max)),
+            None => median,
+        }
+    }
+}
+
 /// How a step came to be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -2922,6 +2934,156 @@ impl Record {
         self.verdict.exit_code()
     }
 
+    /// Compares this record, the earlier run, with `after`, a later run of
+    /// the same experiment: the Comparison section of a benchmark report.
+    ///
+    /// Each step both runs measured gets a table, in `after`'s step order,
+    /// with a row for every metric either summarizes, diagnostics aside as in
+    /// [`Record::render`]'s step detail: each run's median and
+    /// repetition range, the change of the medians, and whether `after`'s
+    /// range lies outside `before`'s; a histogram median's change compares
+    /// bucket upper bounds. An outside change names its direction,
+    /// and whether that is better for a metric that declares a
+    /// [`Direction`]; an overlapping one is no measured change. A step only
+    /// one run measured is listed by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the runs are of different engines,
+    /// experiments, or levels, or either is not VALID.
+    pub fn compare(&self, after: &Self) -> Result<String, String> {
+        if (self.engine, &self.experiment, self.level)
+            != (after.engine, &after.experiment, after.level)
+        {
+            return Err(format!(
+                "{} {} and {} {} are different experiments",
+                self.engine.name(),
+                self.experiment,
+                after.engine.name(),
+                after.experiment
+            ));
+        }
+        if let Some(invalid) = [self, after]
+            .into_iter()
+            .find(|record| record.verdict != Verdict::Valid)
+        {
+            return Err(format!(
+                "the {} run of {} is INVALID; compare only VALID runs",
+                &invalid.commit[..invalid.commit.len().min(9)],
+                invalid.started_at.to_rfc3339()
+            ));
+        }
+        let mut out = String::new();
+        let _ = writeln!(
+            out,
+            "# compare {} L{} {}\n",
+            self.engine.name(),
+            u8::from(self.level),
+            self.experiment
+        );
+        for (label, record) in [("before", self), ("after", after)] {
+            let _ = writeln!(
+                out,
+                "{label}: commit {}{} | started {}",
+                record.commit,
+                if record.dirty { " (dirty)" } else { "" },
+                record.started_at.to_rfc3339()
+            );
+        }
+        out.push_str(
+            "\nMedians of the repetitions, [min–max] their range. A change is \
+             outside the spread when the ranges do not overlap; otherwise it is \
+             no measured change. A histogram median shows its bucket: its change \
+             compares the upper bounds, and with no exact range it has no spread \
+             verdict. Diagnostic readings are in each run's report.\n",
+        );
+        let earlier = self.measured();
+        let later = after.measured();
+        let direction = |id: &str| {
+            after
+                .criteria
+                .metrics
+                .iter()
+                .find(|metric| metric.id == id)
+                .and_then(|metric| metric.direction)
+        };
+        for step in after.steps.iter().filter(|step| !step.summary.is_empty()) {
+            let Some(before) = earlier.get(step.id.as_str()) else {
+                continue;
+            };
+            let _ = writeln!(out, "\n## {}\n", step.id);
+            out.push_str("| metric | before | after | change | outside spread |\n");
+            out.push_str("|---|---|---|---|---|\n");
+            let ids: std::collections::BTreeSet<&String> = before
+                .summary
+                .keys()
+                .chain(step.summary.keys())
+                .filter(|id| !id.starts_with(DIAGNOSTIC))
+                .collect();
+            for id in ids {
+                let (was, now) = (before.summary.get(id), step.summary.get(id));
+                let unit = now.or(was).map_or("", |summary| summary.unit.as_str());
+                let cell = |summary: Option<&Summary>| {
+                    summary.map_or_else(|| "—".to_owned(), Summary::spread_cell)
+                };
+                let exact = |summary: Option<&Summary>| summary.and_then(|s| s.median.value);
+                let change = match (exact(was), exact(now)) {
+                    (Some(was), Some(now)) if was != 0.0 => {
+                        format!("{:+.1}%", (now - was) / was * 100.0)
+                    }
+                    _ => "—".to_owned(),
+                };
+                let range = |summary: Option<&Summary>| summary.and_then(|s| s.min.zip(s.max));
+                let outside = match (range(was), range(now), exact(was), exact(now)) {
+                    (Some((low, high)), Some((min, max)), Some(was), Some(now))
+                        if min > high || max < low =>
+                    {
+                        let higher = now > was;
+                        let verdict = match (direction(id), higher) {
+                            (Some(Direction::Higher), true) | (Some(Direction::Lower), false) => {
+                                ", better"
+                            }
+                            (Some(_), _) => ", worse",
+                            (None, _) => "",
+                        };
+                        format!(
+                            "outside: {}{verdict}",
+                            if higher { "higher" } else { "lower" }
+                        )
+                    }
+                    (Some(_), Some(_), _, _) => "no measured change".to_owned(),
+                    _ => "—".to_owned(),
+                };
+                let _ = writeln!(
+                    out,
+                    "| {id} ({unit}) | {} | {} | {change} | {outside} |",
+                    cell(was),
+                    cell(now)
+                );
+            }
+        }
+        for (label, only, other) in [("before", &earlier, &later), ("after", &later, &earlier)] {
+            let only: Vec<&str> = only
+                .keys()
+                .filter(|id| !other.contains_key(*id))
+                .copied()
+                .collect();
+            if !only.is_empty() {
+                let _ = writeln!(out, "\nMeasured only {label}: {}", only.join(", "));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Each step this record measured, by id.
+    fn measured(&self) -> BTreeMap<&str, &StepRecord> {
+        self.steps
+            .iter()
+            .filter(|step| !step.summary.is_empty())
+            .map(|step| (step.id.as_str(), step))
+            .collect()
+    }
+
     /// Renders the report: a title, the common table with one row per
     /// step and criterion, engine detail per step, and every reason. The
     /// same text comes from a fresh or a re-read record.
@@ -3840,6 +4002,76 @@ mod tests {
             .iter()
             .map(|reason| reason.code.as_str())
             .collect()
+    }
+
+    /// Comparing two VALID runs of one experiment gives each step both
+    /// measured a row per metric: the medians and ranges, the change, and
+    /// whether it is outside both runs' spread, in which direction, and,
+    /// for a metric that declares one, whether that is better. Runs of
+    /// different experiments, or an INVALID run, are refused.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a row is missing or wrong, or a refused pair compares.
+    #[tokio::test(start_paused = true)]
+    async fn compare_marks_each_change_against_both_spreads() {
+        let directory = tempfile::tempdir().expect("artifacts");
+        let options = options(directory.path());
+        let before = execute(
+            declaration(),
+            &mut Scripted::always(&good()),
+            [Some(quiet()), Some(quiet())],
+            &options,
+        )
+        .await;
+        let mut faster = good();
+        faster.set("ops", Reading::exact(2_000.0));
+        let after = execute(
+            declaration(),
+            &mut Scripted::always(&faster),
+            [Some(quiet()), Some(quiet())],
+            &options,
+        )
+        .await;
+
+        let compared = before.compare(&after).expect("compares");
+
+        assert!(compared.contains("## op-64\n"), "{compared}");
+        assert!(
+            compared.contains(
+                "| ops (ops) | 1000 [1000–1000] | 2000 [2000–2000] | +100.0% | outside: higher |"
+            ),
+            "{compared}"
+        );
+        assert!(
+            compared.contains("| ops_per_cpu_s (ops/cpu-s) | 500 [500–500] | 1000 [1000–1000] | +100.0% | outside: higher, better |"),
+            "{compared}"
+        );
+        assert!(
+            compared.contains(
+                "| rate (ops/s) | 100 [100–100] | 100 [100–100] | +0.0% | no measured change |"
+            ),
+            "{compared}"
+        );
+        let mut other = declaration();
+        other.experiment = "other".to_owned();
+        let other = execute(
+            other,
+            &mut Scripted::always(&good()),
+            [Some(quiet()), Some(quiet())],
+            &options,
+        )
+        .await;
+        assert!(before.compare(&other).is_err());
+        let invalid = execute(
+            declaration(),
+            &mut Scripted::always(&good()),
+            [None, None],
+            &options,
+        )
+        .await;
+        assert_eq!(invalid.verdict, Verdict::Invalid);
+        assert!(before.compare(&invalid).is_err());
     }
 
     /// A declared `compare` control puts each group of steps side by side,

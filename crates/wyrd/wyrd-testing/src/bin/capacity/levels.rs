@@ -416,6 +416,19 @@ pub fn report(path: &Path) -> Result<String, String> {
         .map_err(|error| error.to_string())
 }
 
+/// Reads two persisted records of one experiment and returns
+/// [`Record::compare`] of `before` against `after`.
+///
+/// # Errors
+///
+/// Returns a message when a record is unreadable, malformed, or of an
+/// unsupported schema version, or when the two do not compare.
+pub fn compare(before: &Path, after: &Path) -> Result<String, String> {
+    let before = Record::read(before).map_err(|error| error.to_string())?;
+    let after = Record::read(after).map_err(|error| error.to_string())?;
+    before.compare(&after)
+}
+
 /// Functions each sampled thread group of a CPU capture spends its samples
 /// in, from the capture's Samply sidecar: [`SymbolizedCapture::report`] of
 /// the threads whose name contains `threads`, the top [`PROFILE_TOP`] each.

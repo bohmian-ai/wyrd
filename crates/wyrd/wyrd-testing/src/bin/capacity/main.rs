@@ -141,6 +141,18 @@ async fn dispatch(arguments: &[String], root: &Path) -> u8 {
                 }
             }
         }
+        (Some("compare"), _, _) if arguments.len() == 4 => {
+            match levels::compare(Path::new(&arguments[2]), Path::new(&arguments[3])) {
+                Ok(comparison) => {
+                    print!("{comparison}");
+                    0
+                }
+                Err(message) => {
+                    eprintln!("capacity compare: {message}");
+                    2
+                }
+            }
+        }
         (Some("profile"), _, _) if (3..=4).contains(&arguments.len()) => {
             let threads = arguments.get(3).map_or("", String::as_str);
             match levels::cpu_report(Path::new(&arguments[2]), threads) {
@@ -169,7 +181,7 @@ async fn dispatch(arguments: &[String], root: &Path) -> u8 {
         }
         _ => {
             eprintln!(
-                "capacity: expected `l1 [bifrost [writes-parquet|hot|parquet]|verification|gateway]`, `l2 <bifrost|verification|gateway>`, `report <record.json>`, `profile <cpu-capture.json.gz> [thread-name]`, or `results`, got {:?}",
+                "capacity: expected `l1 [bifrost [writes-parquet|hot|parquet]|verification|gateway]`, `l2 <bifrost|verification|gateway>`, `report <record.json>`, `compare <before.json> <after.json>`, `profile <cpu-capture.json.gz> [thread-name]`, or `results`, got {:?}",
                 &arguments[1.min(arguments.len())..]
             );
             2
@@ -1788,6 +1800,13 @@ mod tests {
             assert_eq!(report, record.render());
             let arguments = line(&["report", path.to_str().expect("path")]);
             assert_eq!(dispatch(&arguments, root.path()).await, 0);
+            let path = path.to_str().expect("path");
+            let compared = dispatch(&line(&["compare", path, path]), root.path()).await;
+            assert_eq!(
+                compared,
+                record.exit_code(),
+                "a VALID record compares with itself"
+            );
         }
 
         let stale = root

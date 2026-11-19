@@ -86,7 +86,7 @@ const runCorrelation: SpanProcessor = {
  * Put it once in an application-owned provider's construction-time
  * `spanProcessors`, beside {@link spanExporter} or any other exporter; the
  * provider keeps its own sampler, resource, and lifecycle. It holds no state
- * and creates no provider or exporter; `WyrdState.startTelemetry` installs the
+ * and creates no provider or exporter; `WyrdState.configure` installs the
  * same processor on its managed provider.
  *
  * ```ts
@@ -100,7 +100,7 @@ export function runCorrelationProcessor(): SpanProcessor {
 }
 
 /**
- * @internal `WyrdState.startTelemetry`: install the global tracer provider
+ * @internal `WyrdState.configure`: install the global tracer provider
  * exporting through {@link spanExporter} and stamping `Run.scope`, Node's
  * `AsyncLocalStorage` context manager, and the W3C trace-context propagator,
  * unless the application registered a tracer provider. The provider's

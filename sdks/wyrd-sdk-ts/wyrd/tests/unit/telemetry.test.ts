@@ -51,9 +51,7 @@ afterEach(async () => {
 
 test("telemetry setup", async () => {
   const state = offlineState();
-  state.configure({ deploymentEnvironment: "prod" });
-  // Overlapping calls on one state install a single provider.
-  await Promise.all([state.startTelemetry(), state.startTelemetry()]);
+  await state.configure({ deploymentEnvironment: "prod" });
   const installed = globalProvider();
   expect(installed).toBeInstanceOf(BasicTracerProvider);
   // Its resource carries the configured Service and environment; the span is never ended, so nothing exports.
@@ -63,12 +61,13 @@ test("telemetry setup", async () => {
     "service.version": state.rootRef.version,
     "deployment.environment.name": "prod",
   });
-  await state.startTelemetry();
+  // Configuration stays fixed; a second configure refuses and keeps the provider.
+  await expect(state.configure()).rejects.toMatchObject({ code: "WYRD_SDK_409_STATE_CONFIG_FROZEN" });
   expect(globalProvider()).toBe(installed);
 
   // Another state's provider is preserved and refused; the refused attempt releases its own.
   const release = vi.spyOn(BasicTracerProvider.prototype, "shutdown");
-  await expect(offlineState("wyrd_unit_other").startTelemetry()).rejects.toMatchObject({
+  await expect(offlineState("wyrd_unit_other").configure()).rejects.toMatchObject({
     code: "WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS",
   });
   expect(globalProvider()).toBe(installed);
@@ -80,10 +79,47 @@ test("telemetry setup", async () => {
   trace.disable();
   const application = new BasicTracerProvider();
   trace.setGlobalTracerProvider(application);
-  await expect(offlineState().startTelemetry()).rejects.toMatchObject({
+  await expect(offlineState().configure()).rejects.toMatchObject({
     code: "WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS",
   });
   expect(globalProvider()).toBe(application);
+});
+
+test("configure reports a missing optional telemetry package", async () => {
+  const missing = "@opentelemetry/exporter-logs-otlp-proto";
+  vi.resetModules();
+  // Fail the import the way Node does when the optional peer is not installed.
+  vi.doMock(missing, () => {
+    throw Object.assign(new Error(`Cannot find package '${missing}'`), { code: "ERR_MODULE_NOT_FOUND" });
+  });
+  try {
+    const fresh = await import("wyrd-ai");
+    const state = fresh.WyrdState.fromPath(BUNDLE, {
+      client: fresh.WyrdClient.connect({ serverUrl: UNREACHABLE, credential: "wyrd_unit_unused" }),
+    });
+
+    // configure rejects with the load failure; Vitest wraps a failing mock factory, keeping it as the cause.
+    await expect(state.configure()).rejects.toMatchObject({
+      cause: { code: "ERR_MODULE_NOT_FOUND", message: expect.stringContaining(missing) },
+    });
+    expect(globalProvider()).not.toBeInstanceOf(BasicTracerProvider);
+    // The context was fixed before the install failed; fixing it again is refused.
+    await expect(state.configure({ telemetry: false })).rejects.toMatchObject({
+      code: "WYRD_SDK_409_STATE_CONFIG_FROZEN",
+    });
+  } finally {
+    vi.doUnmock(missing);
+    vi.resetModules();
+  }
+});
+
+test("configure without telemetry installs no provider", async () => {
+  const state = offlineState();
+  await state.configure({ deploymentEnvironment: "prod", telemetry: false });
+
+  expect(state.deploymentEnvironment).toBe("prod");
+  expect(globalProvider()).not.toBeInstanceOf(BasicTracerProvider);
+  await state.flush();
 });
 
 test("owned provider correlation", async () => {
@@ -135,8 +171,8 @@ test("owned provider correlation", async () => {
 });
 
 test("managed telemetry lifecycle", async () => {
-  // Bifrost is never started, so a flush's drain reports BIFROST_NOT_STARTED and a
-  // shutdown's drain succeeds: either outcome in the error proves the drain ran.
+  // Bifrost is never started, so both drains succeed with nothing to drain: a
+  // null native code in the error proves the drain ran after the failed flush.
   const timeout = [new Error("Span processor did not completed within timeout period of 1 ms")];
   const failure = [new TypeError("SECRET payload in an exporter error")];
   const cases = [
@@ -144,15 +180,15 @@ test("managed telemetry lifecycle", async () => {
       method: "flush",
       outcome: timeout,
       code: "WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT",
-      native: "WYRD_SDK_400_BIFROST_NOT_STARTED",
+      native: null,
     },
     {
       method: "flush",
       outcome: failure,
       code: "WYRD_SDK_503_TELEMETRY_FLUSH_FAILED",
-      native: "WYRD_SDK_400_BIFROST_NOT_STARTED",
+      native: null,
     },
-    { method: "flush", outcome: undefined, code: "WYRD_SDK_400_BIFROST_NOT_STARTED", native: undefined },
+    { method: "flush", outcome: undefined, code: undefined, native: undefined },
     { method: "shutdown", outcome: timeout, code: "WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT", native: null },
     { method: "shutdown", outcome: failure, code: "WYRD_SDK_503_TELEMETRY_FLUSH_FAILED", native: null },
     { method: "shutdown", outcome: undefined, code: undefined, native: undefined },
@@ -160,7 +196,7 @@ test("managed telemetry lifecycle", async () => {
   for (const { method, outcome, code, native } of cases) {
     trace.disable();
     const state = offlineState();
-    await state.startTelemetry();
+    await state.configure();
     const provider = globalProvider();
     const flush = vi.spyOn(provider, "forceFlush");
     if (outcome === undefined) {

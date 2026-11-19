@@ -12,7 +12,7 @@ the ``otel`` extra (``uv add 'wyrd-ai[otel]'``).
 ``wyrd.run_id`` attributes Bifrost extracts. Everything in that path is
 optional and fail-open: without ``opentelemetry-api`` it is a no-op.
 
-``WyrdState.start_telemetry`` delegates to ``_start_telemetry``, which installs
+``WyrdState.configure`` delegates to ``_start_telemetry``, which installs
 the global SDK tracer, meter, and logger providers, exporting through these
 exporters and sharing one Resource naming the state's Service and deployment
 environment.

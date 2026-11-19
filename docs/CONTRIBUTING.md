@@ -30,7 +30,8 @@ Navigation, search, the landing page's section links, and `llms.txt` are all der
 
 | Field | Required | Values |
 | --- | --- | --- |
-| `title` | yes | Page heading, browser title, and sidebar label. Name the reader's goal or the contract. Start the body at `##`; a `#` heading fails the build. |
+| `title` | yes | Page heading and sidebar label, and, followed by the site name, the browser title. Name the reader's goal or the contract. Start the body at `##`; a `#` heading fails the build. |
+| `browserTitle` | no | Full browser and social title when the search title must differ from the heading |
 | `pillar` | yes | `wyrd`, `fathom`, or `shared` |
 | `section` | yes | `Get started`, `Build and verify`, `Connect`, `Operate`, `Understand`, or `Reference` |
 | `topic` | under `Build and verify` only | `Declare`, `Observe`, or `Verify` |

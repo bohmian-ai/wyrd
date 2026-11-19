@@ -1,0 +1,2 @@
+{"decision":"released","run_id":"0193f1c2-5a7e-7c41-9d2a-3b8e4f6a1c90","execution_id":"0193f1c2-5b10-7e2f-8a64-91d0c3e5b7a2"}
+{"decision":"held for review","verdict":"failed","run_id":"0193f1c2-6c3d-7a18-b5e9-2f47d8a0c6e1","execution_id":"0193f1c2-6d02-7b9c-a1f3-58e2b6c4d9f0","requirements":{"follows-policy":"failed"}}

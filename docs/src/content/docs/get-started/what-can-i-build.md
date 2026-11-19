@@ -6,7 +6,7 @@ section: Get started
 order: 4
 ---
 
-Wyrd gives you primitives, and you compose them into whatever verification your system needs. The workflows below are examples, not a complete list. Each names a problem, the composition that solves it, and the page that shows how. [Run your first verification](/get-started/quickstart/) builds the smallest one: a single assertion.
+Wyrd gives you primitives, and you compose them into whatever verification your system needs. The workflows below are examples, not a complete list. Each names a problem, the composition that solves it, and the page that shows how. [Run your first verification](/get-started/quickstart/) builds the smallest one: three requirements on a finance report, one judged by a model reading a policy PDF.
 
 Every workflow uses the same parts. Cards declare exact versions of what you ship: Services, Agents, Prompts, Models, Data, and uploaded Artifacts. A Verifier composes deterministic checks (`assert`, `trace`, `code`) with model judgments (`agent`) and scheduled `drift`. Each verdict cites its evidence and is stored in Bifrost with the exact versions it judged. Your application runs the workflow and decides what a verdict means; Wyrd does not orchestrate or enforce it.
 
@@ -36,7 +36,7 @@ Every workflow uses the same parts. Cards declare exact versions of what you shi
 
 **Problem.** A request must be checked before your application acts on it, or checked in the background without delaying it.
 
-**Workflow.** `verify` returns the verdict to the caller, so your code can act on it before it responds. `submit` queues the check and returns an execution that any process can wait on. [verify and submit](/understand/how-verification-works/#verify-and-submit) explains both. An `agent` check adds a model call to the wait; an `assert` check needs none.
+**Workflow.** `verify` returns the verdict to the caller, so your code can act on it before it responds. `submit` queues the check and returns an execution that any process can wait on. [verify and submit](/understand/how-verification-works/#verify-and-submit) explains both and when each fits. An `agent` check adds a model call to the wait; an `assert` check needs none.
 
 ## Observability
 

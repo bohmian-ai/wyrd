@@ -54,12 +54,6 @@ AGREES = (
 )
 """The judge's Verdict for ``answer-judged``: passed, citing the whole answer."""
 
-RELEASE_APPROVED = (
-    '{"outcome":"passed","reason":"an external audit may receive this report",'
-    '"citations":[{"slot":"report","locator":{"json_pointer":"/text"}}]}'
-)
-"""The finance release example judge's Verdict: every release follows the policy, citing the report."""
-
 REPORT_SUPPORTED = (
     '{"outcome":"passed","reason":"the report matches its source",'
     '"citations":[{"slot":"report","locator":{"json_pointer":"/text"}}]}'
@@ -257,27 +251,64 @@ def handbook_verdict(messages: list[dict]) -> str:
     return json.dumps({"outcome": "passed", "reason": reason, "citations": [citation]})
 
 
-READ_SHARING_POLICY = {
-    "role": "assistant",
-    "content": None,
-    "tool_calls": [
+def read_sharing_policy(text: str) -> dict:
+    """The sharing-policy judge's first turn: ``fs_read`` the policy path its prompt in ``text`` names."""
+    found = re.search(r"read (/inputs/[\w./-]+) with fs\.read", text, re.IGNORECASE)
+    assert found is not None, "the judge's prompt names the policy it reads"
+    path = found[1]
+    return {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": "call-policy",
+                "type": "function",
+                "function": {"name": "fs_read", "arguments": json.dumps({"path": path})},
+            }
+        ],
+    }
+
+
+SUPPORT_AGENT = "You are a support agent."
+"""The README support agent's system prompt, which the local model answers with ``SUPPORT_ANSWER``."""
+
+SUPPORT_ANSWER = (
+    "Refunds are possible within 30 days of purchase, so this order no longer qualifies."
+)
+"""The local model's reply as the README support agent."""
+
+SUPPORT_JUDGE = "Does this support answer follow the policy?"
+"""The README support judge's prompt: it fails an answer promising a guaranteed refund and passes every other."""
+
+
+def support_verdict(text: str) -> str:
+    """The README support judge's Verdict for the request ``text``, citing the answer."""
+    broken = "guaranteed refund" in text
+    return json.dumps(
         {
-            "id": "call-policy",
-            "type": "function",
-            "function": {"name": "fs_read", "arguments": '{"path":"/inputs/policy.json"}'},
+            "outcome": "failed" if broken else "passed",
+            "reason": "the answer promises a refund the policy does not allow"
+            if broken
+            else "the answer follows the 30-day policy",
+            "citations": [{"slot": "answer", "locator": {"json_pointer": ""}}],
         }
-    ],
-}
-"""The sharing-policy judge's first turn: read its mounted policy as ``fs_read``."""
+    )
 
 
-def sharing_verdict(messages: list[dict]) -> str:
+FINANCE_POLICY_JUDGE = "Decide whether the company sharing policy permits sharing this report"
+"""The finance release example judge's prompt, which the local model answers as the sharing-policy judge."""
+
+
+def sharing_verdict(messages: list[dict], *, by_purpose: bool) -> str:
     """The sharing-policy judge's Verdict once ``messages`` carry its ``fs.read`` result.
 
     It is inconclusive for a release naming ``PROVIDER-UNCERTAIN``, fails one
     naming ``BANK-ACCOUNT-DEMO-001``, and otherwise passes; a decided Verdict
     cites the report text and the policy line permitting ``external-audit``.
-    It answers no Verdict when the read carries no such line.
+    It answers no Verdict when the read carries no such line. When
+    ``by_purpose``, as for the finance release judge, it passes only an
+    ``external audit`` purpose, or a ``regulator request`` when that policy
+    line also permits regulators.
     """
     release = json.dumps([each["content"] for each in messages if each.get("role") == "user"])
     [read] = [each for each in messages if each.get("role") == "tool"]
@@ -288,8 +319,9 @@ def sharing_verdict(messages: list[dict]) -> str:
     lines = [unit for unit in output.get("units", []) if "external-audit" in unit["text"]]
     if not lines:
         return "the policy did not read"
+    report = {"slot": "report", "locator": {"json_pointer": "/text"}}
     citations = [
-        {"slot": "report", "locator": {"json_pointer": "/text"}},
+        report,
         {"slot": output["sources"][0], "locator": lines[0]["locator"]},
     ]
     if "PROVIDER-UNCERTAIN" in release:
@@ -301,13 +333,22 @@ def sharing_verdict(messages: list[dict]) -> str:
     elif "BANK-ACCOUNT-DEMO-001" in release:
         verdict = {
             "outcome": "failed",
-            "reason": "the report names a bank account identifier",
+            "reason": "the report names a bank account identifier, which the policy forbids",
+            "citations": citations,
+        }
+    elif by_purpose and not (
+        "external audit" in release
+        or ("regulator request" in release and "regulator" in lines[0]["text"])
+    ):
+        verdict = {
+            "outcome": "failed",
+            "reason": "the policy does not permit sharing for this purpose",
             "citations": citations,
         }
     else:
         verdict = {
             "outcome": "passed",
-            "reason": "an external audit may receive this report",
+            "reason": "the policy permits sharing for this purpose",
             "citations": citations,
         }
     return json.dumps(verdict)
@@ -371,22 +412,31 @@ def completion(body: dict) -> tuple[int, dict]:
     otherwise passes citing the answer text. The scored judge (its prompt carries
     ``SCORE:``) answers ``scored``. The handbook judge reads its mount and
     answers ``handbook_verdict``, and the sharing-policy judge (its prompt
-    carries ``POLICY JUDGE``) reads its mount and answers ``sharing_verdict``;
-    the finance release example's judge answers ``RELEASE_APPROVED``, and the
+    carries ``POLICY JUDGE``), like the finance release example's judge, reads
+    its mount and answers ``sharing_verdict``; the
     modular finance Service's judges answer ``REPORT_SUPPORTED`` and
-    ``AUDIT_PURPOSE``; the file probe plays ``probe_turn``. Every
+    ``AUDIT_PURPOSE``; the file probe plays ``probe_turn``. The README
+    support agent answers ``SUPPORT_ANSWER`` and its judge answers
+    ``support_verdict``. Every
     other judge agrees.
     """
     text = json.dumps(body)
     returned = any(message.get("role") == "tool" for message in body.get("messages", []))
-    if "POLICY JUDGE" in text:
+    if SUPPORT_AGENT in text:
+        message = {"role": "assistant", "content": SUPPORT_ANSWER}
+    elif SUPPORT_JUDGE in text:
+        message = {"role": "assistant", "content": support_verdict(text)}
+    elif "POLICY JUDGE" in text or FINANCE_POLICY_JUDGE in text:
         message = (
-            {"role": "assistant", "content": sharing_verdict(body["messages"])}
+            {
+                "role": "assistant",
+                "content": sharing_verdict(
+                    body["messages"], by_purpose=FINANCE_POLICY_JUDGE in text
+                ),
+            }
             if returned
-            else READ_SHARING_POLICY
+            else read_sharing_policy(text)
         )
-    elif "follows the company sharing policy" in text:
-        message = {"role": "assistant", "content": RELEASE_APPROVED}
     elif "accurately summarizes the source" in text:
         message = {"role": "assistant", "content": REPORT_SUPPORTED}
     elif "specific financial-audit need" in text:

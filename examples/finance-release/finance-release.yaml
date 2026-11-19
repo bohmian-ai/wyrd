@@ -1,0 +1,8 @@
+# The finance-release Service, verified by release-check.
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: finance-release
+spec:
+  verified_by:
+    - verifier: ./release-check.yaml

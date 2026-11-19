@@ -1,5 +1,6 @@
 ---
 title: Recipes
+browserTitle: Verifier recipes for common AI checks | Wyrd
 description: Copyable Verifiers for common checks, each with its YAML and the Python that calls it - assertions, traces, Python checks, model judges, multi-step, uploaded files, grouped sessions, and drift.
 pillar: wyrd
 section: Build and verify
@@ -7,7 +8,7 @@ topic: Verify
 order: 1
 ---
 
-Pick the check you need, bind its Verifier under `verified_by` to what it checks (a Service, one of its Agents, Models, or Data, or a standalone Agent), and call it from your code. Each recipe's Python declares `support-reply.yaml`, a Service that binds the recipe's Verifier, as in [Run your first verification](/get-started/quickstart/).
+Pick the check you need, bind its Verifier under `verified_by` to what it checks (a Service, one of its Agents, Models, or Data, or a standalone Agent), and call it from your code. Each recipe's Python declares `support-reply.yaml`, a Service that binds the recipe's Verifier, as in the [setup check](/get-started/setup/#3-check-it-end-to-end). To declare a recipe in Python, Rust, or TypeScript instead of YAML, see [Author in code](/build-and-verify/declare/author-in-code/).
 
 | To check | Use | Kind |
 | --- | --- | --- |
@@ -103,7 +104,7 @@ from opentelemetry import trace
 from wyrd import WyrdState
 
 state = WyrdState.declare("support-reply.yaml")
-state.start_telemetry()  # export OpenTelemetry spans, logs, and metrics to Wyrd
+state.configure()  # export OpenTelemetry spans, logs, and metrics to Wyrd
 tracer = trace.get_tracer("support")
 
 # Your code's real work, traced as it runs.
@@ -582,4 +583,4 @@ A drift Verifier refuses `verify`; only the schedule judges it.
 
 ## Next
 
-[How verification works](/understand/how-verification-works/) explains steps, verdicts, and where each check runs.
+[How verification works in Wyrd](/understand/how-verification-works/) explains steps, verdicts, and where each check runs. [Write verifiable requirements](/build-and-verify/declare/write-verifiable-requirements/) shows how to test a model judge before relying on it.

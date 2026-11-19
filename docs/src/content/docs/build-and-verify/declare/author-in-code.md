@@ -7,7 +7,7 @@ topic: Declare
 order: 3
 ---
 
-Build your Cards in code instead of YAML files. One program defines a Service, the Agent it runs, and a Verifier bound to that Agent, declares them, verifies a passing and a failing answer, and records each answer in the Service's table.
+Build your Cards in code instead of YAML files. Code is the quickest way to start; in production, Cards usually live in YAML files, as [Code or YAML](/understand/how-verification-works/#code-or-yaml) explains. One program defines a Service, the Agent it runs, and a Verifier bound to that Agent, declares them, verifies a passing and a failing answer, and records each answer in the Service's table.
 
 You need the server and the `quickstart` directory from [Set up Wyrd](/get-started/setup/). Run everything below there.
 
@@ -19,7 +19,7 @@ You need the server and the `quickstart` directory from [Set up Wyrd](/get-start
 The Python program uses Pydantic models. Add them with the `pydantic` extra:
 
 ```bash
-uv add "wyrd-ai[pydantic]==0.4.1"
+uv add "wyrd-ai[pydantic]==0.4.2"
 ```
 
 Without Pydantic, map each input slot to its own schema, `inputs={"answer": {"type": "string"}}`. `Table` takes the row's whole object schema, and `write` takes a dictionary row.
@@ -172,7 +172,7 @@ Release controls: passed
 
 `ComparisonOperator` and `ExecutionRoute` are typed forms of the YAML values, and `AgentRunConfig`, also from `wyrd.verify`, sets an Agent's run limits through `run_config`:
 
-<CodeFromFile file="examples/finance-release/finance_release.py" region="run-config" lang="python" title="finance_release.py" />
+<CodeFromFile file="examples/finance-release/finance_service.py" region="run-config" lang="python" title="finance_service.py" />
 
 The [Verifier reference](/reference/verifier-card/) lists every operator and field.
 
@@ -181,7 +181,6 @@ The [Verifier reference](/reference/verifier-card/) lists every operator and fie
 | You see | Fix |
 | --- | --- |
 | `WYRD_SDK_404_UNKNOWN_VERIFIER` | Verify on the view the Verifier is bound to: `state.run("agent")` |
-| `WYRD_SDK_400_BIFROST_NOT_STARTED` | Call `start_bifrost` before the first `write` |
 | `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH` | The table exists with different columns: keep its schema, or use a new table name |
 | No rows after a minute | Check that the program reached `shutdown` without an error |
 

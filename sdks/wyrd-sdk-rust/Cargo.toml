@@ -6,7 +6,7 @@ license = { workspace = true }
 rust-version = "1.95"
 repository = { workspace = true }
 authors = { workspace = true }
-description = "First-class Rust Wyrd SDK: a thin projection of wyrd-client."
+description = "Rust SDK for Wyrd, the real-time verification system built for your applications."
 
 [features]
 # Test-only surface: the in-process `wyrd` CLI commands (`wyrd_ai::cli`),

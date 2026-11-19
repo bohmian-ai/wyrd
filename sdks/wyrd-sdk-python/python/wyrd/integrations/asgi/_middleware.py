@@ -69,7 +69,7 @@ class WyrdMiddleware:
             app: The ASGI application to wrap.
             state: An already loaded state; the middleware never declares or
                 registers Cards.
-            telemetry: Whether lifespan startup calls ``state.start_telemetry()``.
+            telemetry: Whether lifespan startup installs the telemetry ``state.configure()`` installs.
                 ``False`` leaves the tracer provider, its installation, and its
                 flushing to the application.
             alias: Given the ASGI scope, returns the Card alias the request's
@@ -107,7 +107,7 @@ class WyrdMiddleware:
         if not self.telemetry:
             return
         try:
-            self.state.start_telemetry()
+            self.state._start_telemetry()
         except Exception:
             try:
                 self.state.shutdown()

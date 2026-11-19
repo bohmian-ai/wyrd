@@ -576,6 +576,21 @@ class VerificationResult(Generic[DataT]):
         ...
 
     @property
+    def passed(self) -> bool:
+        """Whether ``verdict`` is ``passed``: the only verdict that releases what was verified."""
+        ...
+
+    @property
+    def failed(self) -> bool:
+        """Whether ``verdict`` is ``failed``: an expectation was violated."""
+        ...
+
+    @property
+    def inconclusive(self) -> bool:
+        """Whether ``verdict`` is ``inconclusive``: no judgment could be made, never a pass."""
+        ...
+
+    @property
     def requirements(self) -> list[RequirementResult[DataT]]:
         """Every requirement's judgment as its wire mapping, in plan order."""
         ...
@@ -3111,6 +3126,20 @@ class Requirement:
         """
         ...
 
+class Trace(str):
+    """A trace slot's value: the trace ID of the work a Verifier judges.
+
+    A Pydantic model field, or a Verifier ``inputs`` mapping value, of this
+    type declares a ``trace`` slot; every other field declares a ``json``
+    slot. A model field validates as a plain ``str`` and serializes as the
+    bare ID, so one model both declares a Verifier's inputs and supplies them.
+    """
+
+    @classmethod
+    def model_json_schema(cls) -> dict[str, Any]:
+        """The marked string schema a mapping value ``Trace`` stands for."""
+        ...
+
 class InputSlot:
     """One named evidence slot of a Verifier.
 
@@ -3659,6 +3688,7 @@ __all__ = [
     "Service",
     "Step",
     "Table",
+    "Trace",
     "Trigger",
     "VerificationResult",
     "Verifier",

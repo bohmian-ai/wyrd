@@ -3062,7 +3062,11 @@ mod pg_tests {
         assert_eq!(disabled["status"], "disabled", "{disabled}");
         let renewed = connection_json(
             "renew-encryption",
-            &connection_cli(verb("renew-encryption", &["--connection-id", &http]), &admin).await,
+            &connection_cli(
+                verb("renew-encryption", &["--connection-id", &http]),
+                &admin,
+            )
+            .await,
         );
         assert_eq!(
             (&renewed["connection_id"], &renewed["status"]),

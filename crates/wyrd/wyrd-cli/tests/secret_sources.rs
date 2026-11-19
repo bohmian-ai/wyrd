@@ -154,6 +154,69 @@ async fn trusted_issuer_add_reads_the_client_secret_from_the_environment() {
     assert_issuer_posted(&server).await;
 }
 
+/// `wyrd auth trusted-issuer renew-encryption` asks the server to reseal the
+/// stored client secret, addressing the issuer by query and sending no
+/// secret at all, then prints the redacted issuer view.
+///
+/// # Panics
+///
+/// Panics when the command fails, the request is not one bodyless POST to the
+/// renewal route for the issuer, or stdout lacks the issuer.
+#[tokio::test]
+async fn trusted_issuer_renew_encryption_sends_no_secret() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/admin/trusted-issuers/renew-encryption"))
+        .and(wiremock::matchers::query_param(
+            "issuer",
+            "https://idp.example.com",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "issuer": "https://idp.example.com",
+            "jwks_uri": "https://idp.example.com/jwks",
+            "expected_audience": "wyrd",
+            "client_id": "myapp",
+            "client_auth": "SecretPost",
+            "principal_kind": "Workload",
+            "jwks_ttl_secs": 3600,
+            "claim_mapping": { "subject": "sub" },
+            "group_role_map": {},
+            "default_roles": ["viewer"]
+        })))
+        .mount(&server)
+        .await;
+
+    let output = run(
+        [
+            "auth",
+            "trusted-issuer",
+            "renew-encryption",
+            "--issuer",
+            "https://idp.example.com",
+            "--server",
+        ]
+        .map(str::to_owned)
+        .into_iter()
+        .chain([server.uri()])
+        .collect(),
+        vec![("WYRD_ACCESS_TOKEN", "ambient-access-token".to_owned())],
+    )
+    .await;
+
+    assert!(
+        output.status.success(),
+        "renew-encryption failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "renewed: https://idp.example.com"
+    );
+    let requests = server.received_requests().await.expect("requests recorded");
+    assert_eq!(requests.len(), 1, "exactly one request");
+    assert!(requests[0].body.is_empty(), "the renewal carries no secret");
+}
+
 /// The issuer client secret is read from a file, trailing newline trimmed.
 ///
 /// # Panics

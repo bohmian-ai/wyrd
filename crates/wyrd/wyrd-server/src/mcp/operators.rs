@@ -207,7 +207,11 @@ impl WyrdMcpHandler {
             }
             RENEW_ENCRYPTION => {
                 let args: IdArgs = parse_args(arguments, RENEW_ENCRYPTION)?;
-                structured(&control.renew_encryption(&caller, args.connection_id).await?)
+                structured(
+                    &control
+                        .renew_encryption(&caller, args.connection_id)
+                        .await?,
+                )
             }
             _ => {
                 let args: IdArgs = parse_args(arguments, DISABLE)?;

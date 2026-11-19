@@ -29,11 +29,11 @@ use wyrd_spec::gateway::{
 use wyrd_spec::ids::{ProviderCredentialName, ProviderDeploymentName, ProviderId};
 use wyrd_sql::queries::gateway::{
     GatewayCredentialWrite, GatewayDeploymentWrite, GatewayPricingWrite, delete_gateway_credential,
-    delete_gateway_deployment, gateway_credential, gateway_credential_for_share, gateway_credential_secret,
-    gateway_credentials, gateway_deployment, gateway_deployments, gateway_policies,
-    gateway_pricing, gateway_snapshot, lock_gateway_policies, revoke_gateway_credential,
-    renew_gateway_credential, update_gateway_policies, upsert_gateway_credential, upsert_gateway_deployment,
-    upsert_gateway_pricing,
+    delete_gateway_deployment, gateway_credential, gateway_credential_for_share,
+    gateway_credential_secret, gateway_credentials, gateway_deployment, gateway_deployments,
+    gateway_policies, gateway_pricing, gateway_snapshot, lock_gateway_policies,
+    renew_gateway_credential, revoke_gateway_credential, update_gateway_policies,
+    upsert_gateway_credential, upsert_gateway_deployment, upsert_gateway_pricing,
 };
 use wyrd_sql::row_types::gateway::{GatewayCredentialRow, GatewayPricingRow};
 use wyrd_sql::{SqlError, TenantConn, WyrdPostgres};
@@ -241,7 +241,10 @@ impl<'a> GatewayAdministration<'a> {
                     .await
                     .map_err(unavailable)?
                     .ok_or_else(|| {
-                        conflict("credential changed during encryption renewal", name.as_str())
+                        conflict(
+                            "credential changed during encryption renewal",
+                            name.as_str(),
+                        )
                     })?;
                 let view = credential_view(row)?;
                 conn.commit().await.map_err(unavailable)?;
@@ -263,7 +266,11 @@ impl<'a> GatewayAdministration<'a> {
         tenant: DataTenantId,
         name: &ProviderCredentialName,
     ) -> Result<(Vec<u8>, Vec<u8>), WyrdError> {
-        let mut conn = self.postgres.tenant_conn(tenant).await.map_err(unavailable)?;
+        let mut conn = self
+            .postgres
+            .tenant_conn(tenant)
+            .await
+            .map_err(unavailable)?;
         let (provider, state, sealed) = gateway_credential_secret(&mut conn, name.as_str())
             .await
             .map_err(unavailable)?
@@ -273,7 +280,10 @@ impl<'a> GatewayAdministration<'a> {
             return Err(conflict("credential is revoked", name.as_str()));
         }
         let Some(sealed) = sealed else {
-            return Err(conflict("credential holds no managed secret", name.as_str()));
+            return Err(conflict(
+                "credential holds no managed secret",
+                name.as_str(),
+            ));
         };
         let protection = || WyrdError::ServiceUnavailable {
             message: "gateway credential protection is unavailable".to_owned(),

@@ -444,7 +444,10 @@ async fn remove_connection(
     ),
     tag = "Identity"
 )]
-#[tracing::instrument(skip_all, fields(operation = "identity.oidc.connection.renew_encryption"))]
+#[tracing::instrument(
+    skip_all,
+    fields(operation = "identity.oidc.connection.renew_encryption")
+)]
 async fn renew_connection_encryption(
     State(state): State<AppState>,
     RequestOrigin(origin): RequestOrigin,
@@ -861,16 +864,17 @@ mod pg_tests {
     async fn renewing_a_connection_secret_keeps_its_revision_and_login() {
         use secrecy::ExposeSecret as _;
         use wyrd_auth_oidc::ClientAuth;
-        use wyrd_sql::queries::auth::{promote_tested_human_candidate, stamp_human_candidate_tested};
+        use wyrd_sql::queries::auth::{
+            promote_tested_human_candidate, stamp_human_candidate_tested,
+        };
         const SECRET: &str = "human-client-secret-unchanged";
 
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
         let provider = passing_provider().await;
-        let transit = wyrd_testing::kms::TransitFixture::start_delayed(
-            std::time::Duration::from_millis(300),
-        )
-        .await;
+        let transit =
+            wyrd_testing::kms::TransitFixture::start_delayed(std::time::Duration::from_millis(300))
+                .await;
         let kms = Arc::new(
             wyrd_kms::WyrdKms::new(&transit.config("human", &[]), false).expect("transit facade"),
         );
@@ -950,8 +954,18 @@ mod pg_tests {
         .await
         .expect("renewal");
         assert_eq!(
-            (renewed.id, renewed.revision, renewed.state, renewed.tested_revision),
-            (candidate.id, 1, wyrd_spec::auth::HumanConnectionState::Active, Some(1)),
+            (
+                renewed.id,
+                renewed.revision,
+                renewed.state,
+                renewed.tested_revision
+            ),
+            (
+                candidate.id,
+                1,
+                wyrd_spec::auth::HumanConnectionState::Active,
+                Some(1)
+            ),
             "renewal keeps the connection's identity, revision, and stamp"
         );
         let after = active_row().await.expect("still active");
@@ -969,7 +983,11 @@ mod pg_tests {
         let ClientAuth::SecretBasic(opened) = &active.trusted.client_auth else {
             panic!("the connection still authenticates with its secret");
         };
-        assert_eq!(opened.expose_secret(), SECRET, "login uses the unchanged secret");
+        assert_eq!(
+            opened.expose_secret(),
+            SECRET,
+            "login uses the unchanged secret"
+        );
 
         let foreign = fixture
             .seed_additional_tenant("human-renewal-foreign")
@@ -1018,11 +1036,17 @@ mod pg_tests {
         let (lost, retired) = tokio::join!(renewal, deactivate);
         assert_eq!(retired.expect("deactivation"), StatusCode::NO_CONTENT);
         assert_eq!(
-            lost.expect_err("the renewal loses to the deactivation").0.code(),
+            lost.expect_err("the renewal loses to the deactivation")
+                .0
+                .code(),
             "WYRD_AUTH_409_CONNECTION_CONFLICT"
         );
         assert!(
-            owner.active_connection(tenant).await.expect("reads").is_none(),
+            owner
+                .active_connection(tenant)
+                .await
+                .expect("reads")
+                .is_none(),
             "renewal never re-enables a retired connection"
         );
         let retired = renew_connection_encryption(
@@ -1056,7 +1080,12 @@ mod pg_tests {
         .expect_err("an unauthorized caller is refused");
         assert_eq!(refused.0.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
         assert_eq!(
-            decisions(&denied, &scribe, "identity.oidc.connection.renew_encryption").await,
+            decisions(
+                &denied,
+                &scribe,
+                "identity.oidc.connection.renew_encryption"
+            )
+            .await,
             vec![("allowed".to_owned(), 5), ("denied".to_owned(), 1)]
         );
     }

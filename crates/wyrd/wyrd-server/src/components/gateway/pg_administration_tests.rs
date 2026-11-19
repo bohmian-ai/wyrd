@@ -608,7 +608,10 @@ async fn gateway_managed_secret_renewal_keeps_the_key_and_loses_races() {
         (renewed.name.as_str(), renewed.state),
         ("managed", ProviderCredentialState::Active)
     );
-    assert!(renewed.rotated_at.is_none(), "renewal is not a credential rotation");
+    assert!(
+        renewed.rotated_at.is_none(),
+        "renewal is not a credential rotation"
+    );
     let (row, after) = stored_credential(&fixture, tenant, "managed").await;
     assert!(!row.contains(SUBMITTED), "the row never holds plaintext");
     assert_ne!(after, before, "the envelope is resealed under a fresh DEK");
@@ -694,7 +697,9 @@ async fn gateway_managed_secret_renewal_keeps_the_key_and_loses_races() {
         .await
         .expect("environment credential stores");
     assert!(matches!(
-        gateway.renew_credential_encryption(&admin, &environment).await,
+        gateway
+            .renew_credential_encryption(&admin, &environment)
+            .await,
         Err(WyrdError::GatewayResourceConflict { .. })
     ));
     assert!(matches!(
@@ -717,7 +722,10 @@ async fn gateway_managed_secret_renewal_keeps_the_key_and_loses_races() {
         matches!(refused, Err(WyrdError::ServiceUnavailable { .. })),
         "{refused:?}"
     );
-    assert_eq!(stored_credential(&fixture, tenant, "outage").await.1, sealed);
+    assert_eq!(
+        stored_credential(&fixture, tenant, "outage").await.1,
+        sealed
+    );
     settle_audit(&state).await;
 }
 

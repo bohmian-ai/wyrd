@@ -25,6 +25,9 @@ pub enum TrustedIssuerCommand {
     List(ListArgs),
     /// Remove a trusted OIDC issuer (DELETE /v1/admin/trusted-issuers?issuer=&cascade=).
     Rm(RmArgs),
+    /// Reseal an issuer's unchanged client secret under a fresh data key
+    /// (POST /v1/admin/trusted-issuers/renew-encryption?issuer=).
+    RenewEncryption(RenewArgs),
 }
 
 #[derive(Debug, Args)]
@@ -109,6 +112,19 @@ pub struct RmArgs {
     pub server: Url,
 }
 
+/// Arguments for `wyrd auth trusted-issuer renew-encryption`.
+#[derive(Debug, Args)]
+pub struct RenewArgs {
+    /// Trusted issuer URL whose stored client secret to renew.
+    #[arg(long, value_name = "URL")]
+    pub issuer: String,
+    /// Wyrd server base URL. The credential is read from the ambient chain
+    /// (`WYRD_ACCESS_TOKEN`, workload identity, `WYRD_API_KEY`, or
+    /// `credentials.toml`), never from an argument.
+    #[arg(long, value_name = "URL", env = "WYRD_SERVER_URL")]
+    pub server: Url,
+}
+
 /// Run one `wyrd auth trusted-issuer` subcommand.
 ///
 /// # Errors
@@ -119,6 +135,7 @@ pub async fn dispatch(command: TrustedIssuerCommand) -> Result<ExitCode, WyrdCli
         TrustedIssuerCommand::Add(args) => add(*args).await,
         TrustedIssuerCommand::List(args) => list(args).await,
         TrustedIssuerCommand::Rm(args) => rm(args).await,
+        TrustedIssuerCommand::RenewEncryption(args) => renew(args).await,
     }
 }
 
@@ -220,6 +237,29 @@ async fn rm(args: RmArgs) -> Result<ExitCode, WyrdCliError> {
         .map_err(|source| WyrdCliError::Server { source })?;
 
     println!("deleted: {}", args.issuer);
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Renew a trusted issuer's client-secret encryption. The issuer, its secret
+/// at the provider, and its bindings are unchanged; no secret is sent.
+///
+/// # Errors
+/// Returns a client-construction error for a rejected endpoint and the server's
+/// stable Wyrd error when the caller is unauthorized, the issuer is unknown,
+/// holds no secret, changed concurrently, or the key service is unavailable.
+async fn renew(args: RenewArgs) -> Result<ExitCode, WyrdCliError> {
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("issuer", &args.issuer)
+        .finish();
+    let view: TrustedIssuerView = crate::client::from_global(Some(args.server.as_str()))?
+        .request_json::<(), _>(
+            Method::POST,
+            &format!("{TRUSTED_ISSUERS_PATH}/renew-encryption?{query}"),
+            None,
+        )
+        .await
+        .map_err(|source| WyrdCliError::Server { source })?;
+    println!("renewed: {}", view.issuer);
     Ok(ExitCode::SUCCESS)
 }
 

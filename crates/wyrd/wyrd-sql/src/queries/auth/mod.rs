@@ -44,7 +44,8 @@ pub use human_connections::{
     human_candidate_test_is_current, human_connection_in_state, human_connection_is_active,
     insert_human_candidate, live_human_connections, lock_human_connection_slot,
     promote_tested_human_candidate, remove_human_connection, renew_human_connection_secret,
-    replace_human_candidate, sealed_tenant_secrets, stamp_human_candidate_tested, swap_sealed_tenant_secret,
+    replace_human_candidate, sealed_tenant_secrets, stamp_human_candidate_tested,
+    swap_sealed_tenant_secret,
 };
 pub use local_passwords::{
     AttemptScope, InvitationRow, PasswordResetRow, attempt_refusal, consume_invitation,
@@ -80,8 +81,8 @@ pub use service_accounts::{
 };
 pub use trusted_issuers::{
     TrustedIssuerWrite, delete_trusted_issuer, insert_trusted_issuer, renew_trusted_issuer_secret,
-    trusted_issuer_by_url,
-    trusted_issuer_exists, trusted_issuers_for_tenant, upsert_trusted_issuer,
+    trusted_issuer_by_url, trusted_issuer_exists, trusted_issuers_for_tenant,
+    upsert_trusted_issuer,
 };
 pub use user_identities::{upsert_user_identity, user_id_by_identity};
 pub use users::{

@@ -189,12 +189,12 @@ pub async fn swap_platform_sealed_secret(
     rewrapped: &[u8],
 ) -> Result<bool, SqlError> {
     sqlx::query(SWAP_PLATFORM_SEALED_SECRET_SQL)
-    .bind(previous)
-    .bind(rewrapped)
-    .execute(pool.pool())
-    .await
-    .map(|done| done.rows_affected() == 1)
-    .map_err(SqlError::from)
+        .bind(previous)
+        .bind(rewrapped)
+        .execute(pool.pool())
+        .await
+        .map(|done| done.rows_affected() == 1)
+        .map_err(SqlError::from)
 }
 
 /// [`swap_platform_sealed_secret`] on an open platform transaction, so an

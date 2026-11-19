@@ -302,7 +302,10 @@ async fn renewal_keeps_revocation_and_refuses_without_authority() {
         "renewal does not re-enable: {view}"
     );
     let (_, renewed_envelope, renewed_version) = stored_row(&server, tenant, &id).await;
-    assert_ne!(renewed_envelope, disabled_envelope, "the envelope is resealed");
+    assert_ne!(
+        renewed_envelope, disabled_envelope,
+        "the envelope is resealed"
+    );
     assert_eq!(renewed_version, version, "the secret version is unchanged");
 
     custom_role(
@@ -324,7 +327,10 @@ async fn renewal_keeps_revocation_and_refuses_without_authority() {
         decisions(&server, reader_id, "operator_connection.renew_encryption").await,
         vec![("operators:write".to_owned(), "denied".to_owned())]
     );
-    let other = server.seed_tenant("oc-renew-other").await.expect("tenant seeds");
+    let other = server
+        .seed_tenant("oc-renew-other")
+        .await
+        .expect("tenant seeds");
     let foreign = server
         .bootstrap_service_in_tenant(other, "oc-renew-foreign", &["admin"])
         .await
@@ -353,7 +359,10 @@ async fn renewal_keeps_revocation_and_refuses_without_authority() {
         )
     );
     let (_, after_outage, _) = stored_row(&server, tenant, &id).await;
-    assert_eq!(after_outage, renewed_envelope, "a failed renewal writes nothing");
+    assert_eq!(
+        after_outage, renewed_envelope,
+        "a failed renewal writes nothing"
+    );
 
     let mut conn = server
         .tenant_conn_for(tenant)
@@ -376,10 +385,21 @@ async fn renewal_keeps_revocation_and_refuses_without_authority() {
     );
     let replace = json!({ "provider": "slack", "bot_token": SECRETS[3] });
     let (status, view) = call(&server, &jwt, Method::PATCH, &uri, Some(&replace)).await;
-    assert_eq!(status, StatusCode::OK, "replacement never opens the old value: {view}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "replacement never opens the old value: {view}"
+    );
     let (_, replaced, replaced_version) = stored_row(&server, tenant, &id).await;
-    assert!(replaced.starts_with(b"WKMS"), "a complete envelope is stored");
-    assert_eq!(replaced_version, version + 1, "replacement is the next secret version");
+    assert!(
+        replaced.starts_with(b"WKMS"),
+        "a complete envelope is stored"
+    );
+    assert_eq!(
+        replaced_version,
+        version + 1,
+        "replacement is the next secret version"
+    );
 }
 
 /// A tenant administrator creates, lists, reads, updates, rotates, disables,

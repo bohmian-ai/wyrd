@@ -257,6 +257,22 @@ impl Platform {
             .await
     }
 
+    /// Reseal the platform connection's unchanged client secret under a
+    /// fresh data key; the connection and sign-in are unchanged.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the caller is unauthorized, no connection is
+    /// configured, it holds no secret or changed concurrently, or the key
+    /// service is unavailable.
+    pub async fn renew_oidc_encryption(&self) -> Result<PlatformOidcConnectionView, WyrdError> {
+        self.call::<(), _>(
+            Method::POST,
+            "/platform/oidc/connection/renew-encryption",
+            None,
+        )
+        .await
+    }
+
     /// Pre-register a human platform administrator.
     ///
     /// # Arguments

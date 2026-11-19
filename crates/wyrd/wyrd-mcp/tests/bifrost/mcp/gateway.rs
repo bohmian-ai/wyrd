@@ -233,8 +233,12 @@ mod pg_tests {
             (&rotated["state"], &rotated["rotated_at"]),
             "renewing encryption keeps the credential and is not a rotation"
         );
-        let again = serde_json::to_value(credential_admin.renew_credential_encryption(&name).await?)?;
-        assert_eq!(again["rotated_at"], rotated["rotated_at"], "HTTP renews the same way");
+        let again =
+            serde_json::to_value(credential_admin.renew_credential_encryption(&name).await?)?;
+        assert_eq!(
+            again["rotated_at"], rotated["rotated_at"],
+            "HTTP renews the same way"
+        );
         credential_admin.delete_credential(&name).await?;
 
         let apply = |document: serde_json::Value| {

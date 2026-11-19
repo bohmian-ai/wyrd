@@ -1104,7 +1104,11 @@ async fn renewed_encryption_keeps_the_credential_and_delivers_it() {
         .await;
     assert_eq!(status, StatusCode::OK, "{renewed}");
     assert_eq!(
-        (&renewed["connection_id"], &renewed["status"], &renewed["name"]),
+        (
+            &renewed["connection_id"],
+            &renewed["status"],
+            &renewed["name"]
+        ),
         (&before["connection_id"], &before["status"], &before["name"]),
         "renewal keeps the connection identity and status"
     );

@@ -535,7 +535,11 @@ async fn delete_trusted_issuer_route(
     ),
     tag = "Admin"
 )]
-#[tracing::instrument(level = "info", skip(state, caller, query), fields(operation = "admin.trusted_issuer.renew_encryption"))]
+#[tracing::instrument(
+    level = "info",
+    skip(state, caller, query),
+    fields(operation = "admin.trusted_issuer.renew_encryption")
+)]
 async fn renew_trusted_issuer_encryption(
     State(state): State<AppState>,
     caller: Caller,
@@ -1516,10 +1520,11 @@ mod pg_tests {
             })
         };
 
-        let renewed = renew_trusted_issuer_encryption(State(state.clone()), writer(tenant), query())
-            .await
-            .expect("renewal succeeds")
-            .0;
+        let renewed =
+            renew_trusted_issuer_encryption(State(state.clone()), writer(tenant), query())
+                .await
+                .expect("renewal succeeds")
+                .0;
         assert_eq!(
             serde_json::to_value(&renewed).expect("view"),
             serde_json::to_value(&created).expect("view"),
@@ -1547,9 +1552,10 @@ mod pg_tests {
             .seed_additional_tenant("issuer-renewal-foreign")
             .await
             .expect("second tenant seeds");
-        let hidden = renew_trusted_issuer_encryption(State(state.clone()), writer(foreign), query())
-            .await
-            .expect_err("another tenant cannot see the issuer");
+        let hidden =
+            renew_trusted_issuer_encryption(State(state.clone()), writer(foreign), query())
+                .await
+                .expect_err("another tenant cannot see the issuer");
         assert_eq!(hidden.0.code(), "WYRD_AUTH_404_ADMIN_NOT_FOUND");
 
         delete_trusted_issuer_route(

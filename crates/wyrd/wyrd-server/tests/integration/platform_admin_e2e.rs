@@ -2029,12 +2029,40 @@ async fn renewing_platform_connection_encryption_keeps_its_sign_in() {
     let status = resp.status();
     let renewed = body_json(resp).await;
     assert_eq!(status, StatusCode::OK, "renewal succeeds: {renewed}");
-    assert_eq!(renewed, configured, "the connection is unchanged and redacted");
+    assert_eq!(
+        renewed, configured,
+        "the connection is unchanged and redacted"
+    );
     assert_eq!(
         transit.requests("encrypt").await,
         2,
         "the unchanged secret is resealed once under a fresh data key"
     );
+    confidential_platform_sign_in(&srv, &provider).await;
+
+    // The public client handle renews the same way.
+    let client = wyrd_client::WyrdClient::with_config(wyrd_client::config::ClientConfig {
+        http: wyrd_client::transport::HttpConfig {
+            base_url: srv.base_url().expect("bound HTTP URL").to_owned(),
+            ..wyrd_client::transport::HttpConfig::default()
+        },
+        credential: Some(root.clone()),
+        ..wyrd_client::config::ClientConfig::default()
+    })
+    .expect("client builds");
+    let platform = wyrd_client::Platform::connect_with(&client)
+        .await
+        .expect("platform session exchanges");
+    let renewed = platform
+        .renew_oidc_encryption()
+        .await
+        .expect("the client renews");
+    assert_eq!(
+        serde_json::to_value(&renewed).expect("view serializes"),
+        configured,
+        "the client sees the same redacted connection"
+    );
+    assert_eq!(transit.requests("encrypt").await, 3, "resealed again");
     confidential_platform_sign_in(&srv, &provider).await;
 
     let resp = srv

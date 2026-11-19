@@ -414,7 +414,11 @@ async fn read_connection(
     ),
     tag = "Platform"
 )]
-#[tracing::instrument(level = "info", skip(state, caller), fields(operation = "platform.oidc_connection.renew_encryption"))]
+#[tracing::instrument(
+    level = "info",
+    skip(state, caller),
+    fields(operation = "platform.oidc_connection.renew_encryption")
+)]
 async fn renew_connection_encryption(
     State(state): State<AppState>,
     caller: PlatformCaller,

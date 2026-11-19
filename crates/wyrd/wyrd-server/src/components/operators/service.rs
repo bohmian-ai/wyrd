@@ -259,8 +259,13 @@ impl<'a> OperatorConnectionControl<'a> {
         caller: &Caller,
         connection_id: OperatorConnectionId,
     ) -> Result<OperatorConnectionView, WyrdError> {
-        self.change(caller, connection_id, RENEW_ENCRYPTION, Change::RenewEncryption)
-            .await
+        self.change(
+            caller,
+            connection_id,
+            RENEW_ENCRYPTION,
+            Change::RenewEncryption,
+        )
+        .await
     }
 
     /// Read, prepare, and store one connection after staging its decision.

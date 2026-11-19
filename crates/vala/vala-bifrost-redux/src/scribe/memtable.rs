@@ -3787,6 +3787,159 @@ pub(crate) mod tests {
         assert_eq!(lsns(None), vec![1, 2]);
     }
 
+    /// Catalog identity, time and child-match predicates prune memory
+    /// batches by their recorded bounds, and only where the bounds are known
+    /// to describe the column read.
+    ///
+    /// Columns carry field ids, as catalog tables do. An older generation
+    /// predates `parent_id`, so its unknown bounds keep it
+    /// for a parent lookup. `IS NULL` keeps exactly the batch holding nulls.
+    /// Reading `id` cast to `Utf8View` adapts the column, so its bounds are
+    /// unknown and nothing is pruned.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a batch that can match is pruned, or one that cannot is
+    /// kept where its bounds are known.
+    #[test]
+    fn identity_time_and_child_predicates_prune_only_by_known_bounds() {
+        use datafusion::common::ScalarValue;
+        use datafusion::logical_expr::Operator;
+        use datafusion::physical_expr::PhysicalExpr;
+        use datafusion::physical_expr::expressions::{BinaryExpr, IsNullExpr, col, lit};
+
+        let memtable = Memtable::new();
+        let key = make_test_seal_key();
+        let with_id = |field: Field, id: &str| {
+            field.with_metadata([(PARQUET_FIELD_ID.to_owned(), id.to_owned())])
+        };
+        let id = with_id(Field::new("id", DataType::Utf8, true), "1");
+        let time = with_id(Field::new("time", DataType::Int64, false), "2");
+        let parent = with_id(
+            Field::new("parent_id", DataType::FixedSizeBinary(8), true),
+            "3",
+        );
+        let older = Arc::new(Schema::new(vec![id.clone(), time.clone()]));
+        let current = Arc::new(Schema::new(vec![id.clone(), time.clone(), parent.clone()]));
+        let row = |lsn: u64, id: Option<&str>, at: i64, parent_id: Option<u8>| {
+            let mut columns: Vec<arrow::array::ArrayRef> = vec![
+                Arc::new(arrow::array::StringArray::from(vec![id])),
+                Arc::new(Int64Array::from(vec![at])),
+            ];
+            let schema = match parent_id {
+                Some(byte) => {
+                    columns.push(Arc::new(
+                        arrow::array::FixedSizeBinaryArray::try_from_iter(std::iter::once(
+                            [byte; 8],
+                        ))
+                        .expect("parent ids"),
+                    ));
+                    Arc::clone(&current)
+                }
+                None => Arc::clone(&older),
+            };
+            let batch = RecordBatch::try_new(schema, columns).expect("row batch");
+            memtable
+                .insert(&key, make_test_meta(lsn), batch)
+                .expect("insert");
+        };
+        row(1, Some("m1"), 40, None);
+        memtable.freeze(&key).expect("older generation");
+        row(2, Some("a1"), 10, Some(1));
+        row(3, Some("m1"), 20, Some(2));
+        row(4, None, 30, Some(3));
+
+        let partitions = key.partition.time()..=key.partition.time();
+        let capture = LiveCapture::take([&memtable], key.tenant, &key.table, None)
+            .expect("locks")
+            .expect("no registry to wait on");
+        let kept = |schema: &SchemaRef, predicate: Arc<dyn PhysicalExpr>| {
+            let pruning = crate::scan_sizing::BatchPruning::try_new(schema, predicate)
+                .expect("pruning plans");
+            let mut lsns = capture
+                .read(
+                    &partitions,
+                    schema.fields(),
+                    Some(&pruning),
+                    None,
+                    &unbounded_pool(),
+                )
+                .expect("capture read")
+                .evaluated()
+                .expect("batches evaluate")
+                .iter()
+                .map(|batch| batch.wal_lsn_max.as_u64())
+                .collect::<Vec<_>>();
+            lsns.sort_unstable();
+            lsns
+        };
+        let and = |left, right| -> Arc<dyn PhysicalExpr> {
+            Arc::new(BinaryExpr::new(left, Operator::And, right))
+        };
+        let compare = |schema: &SchemaRef, name: &str, operator, value: ScalarValue| {
+            Arc::new(BinaryExpr::new(
+                col(name, schema).expect("column"),
+                operator,
+                lit(value),
+            )) as Arc<dyn PhysicalExpr>
+        };
+
+        assert_eq!(
+            kept(
+                &current,
+                and(
+                    compare(&current, "id", Operator::Eq, ScalarValue::from("m1")),
+                    compare(
+                        &current,
+                        "time",
+                        Operator::GtEq,
+                        ScalarValue::Int64(Some(15))
+                    ),
+                ),
+            ),
+            vec![1, 3],
+            "an id and time lookup keeps only the batches that can match"
+        );
+        assert_eq!(
+            kept(
+                &current,
+                compare(
+                    &current,
+                    "parent_id",
+                    Operator::Eq,
+                    ScalarValue::FixedSizeBinary(8, Some(vec![1; 8])),
+                ),
+            ),
+            vec![1, 2],
+            "a child lookup keeps the match and the batch whose bounds are unknown"
+        );
+        assert_eq!(
+            kept(
+                &current,
+                Arc::new(IsNullExpr::new(col("id", &current).expect("id column"))),
+            ),
+            vec![4],
+            "IS NULL keeps exactly the batch holding a null id"
+        );
+        let adapted = Arc::new(Schema::new(vec![with_id(
+            Field::new("id", DataType::Utf8View, true),
+            "1",
+        )]));
+        assert_eq!(
+            kept(
+                &adapted,
+                compare(
+                    &adapted,
+                    "id",
+                    Operator::Eq,
+                    ScalarValue::Utf8View(Some("m1".to_owned())),
+                ),
+            ),
+            vec![1, 2, 3, 4],
+            "a cast column's bounds are unknown, so nothing is pruned"
+        );
+    }
+
     /// A live read counts the rows and decoded bytes of exactly the captured
     /// batches it examines: a batch its bounds prune adds nothing, and a kept
     /// batch adds its rows before any row filter and the recorded Arrow bytes

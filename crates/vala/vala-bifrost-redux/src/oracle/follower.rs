@@ -3213,6 +3213,87 @@ pub(crate) mod tests {
         );
     }
 
+    /// A resolved memtable leaf reads the capture it opened, not the
+    /// memtable's current state: a batch appended after resolution, before
+    /// any row is pulled, is not in the answer.
+    ///
+    /// # Panics
+    /// Panics when resolution, the append or execution fails, or when the
+    /// answer differs from the captured rows.
+    #[tokio::test]
+    async fn a_memtable_leaf_keeps_its_capture_through_later_writes() {
+        let session = SessionContext::new().state();
+        let tenant_id = DataTenantId::new_v7();
+        let schema = closure_fixture_schema();
+        let day = crate::test_support::day_partition(2026, 8, 19);
+        let (key, memtable) = closure_fixture_memtable(tenant_id, day, &schema);
+        let stream = StreamIdentity::new(
+            crate::scribe::stream_identity::NodeId::new(uuid::Uuid::now_v7()),
+            WriterEpoch::new(2),
+        );
+        let resolver = ScribeTailResolver::with_schema(
+            Arc::new(FetchLiveTailService::new(stream, Arc::clone(&memtable))),
+            Arc::clone(&schema),
+        );
+        let binding = closure_fixture_binding(tenant_id);
+        let assignment = reading_capture(
+            &resolver.tail,
+            closure_assignment(
+                local_scribe_scan_id(&binding, stream),
+                binding,
+                schema.as_ref(),
+                signed_closure(),
+                super::super::assignment_schema_fingerprint(schema.as_ref()),
+            ),
+        )
+        .await;
+        let plan = resolver
+            .resolve(
+                ClusterRole::Scribe,
+                test_query_id(),
+                &assignment,
+                &RemoteScanPayload::default(),
+                &session,
+            )
+            .await
+            .expect("the capture resolves")
+            .plan;
+
+        let later = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["later"])),
+                Arc::new(Int64Array::from(vec![113_i64])),
+                Arc::new(StringArray::from(vec!["STATUS_CODE_OK"])),
+            ],
+        )
+        .expect("later batch");
+        let meta = ScribeAppendMeta {
+            batch_id: *uuid::Uuid::now_v7().as_bytes(),
+            schema_fingerprint: [0; 32],
+            data_digest: [0; 32],
+            data_len: 0,
+            payload_digest: [0; 32],
+            payload_len: 0,
+            slice_index: 0,
+            slice_count: 1,
+            rows_accepted: 1,
+            wal_lsn_min: WalLsn::new(8),
+            wal_lsn_max: WalLsn::new(8),
+            seal_key: key.to_string(),
+        };
+        memtable
+            .insert(&key, meta, later)
+            .expect("the later batch inserts");
+        let rows = collect(plan, Arc::new(TaskContext::default()))
+            .await
+            .expect("the capture executes");
+
+        let mut values = first_int64_values(&rows);
+        values.sort_unstable();
+        assert_eq!(values, vec![41, 97], "only the captured rows");
+    }
+
     /// Every authenticated request-component contradiction fails before resolution.
     ///
     /// # Panics

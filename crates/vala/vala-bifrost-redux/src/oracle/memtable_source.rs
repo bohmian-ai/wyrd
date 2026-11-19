@@ -58,15 +58,15 @@ impl MemtableRows {
     /// Returns the Scribe evaluation error, or the `DataFusion` error raised
     /// when the evaluated rows do not project to `schema`.
     fn evaluate(&self, schema: &SchemaRef) -> DataFusionResult<Option<RecordBatch>> {
-        match self {
+        let rows = match self {
             Self::Captured(batch) => batch
                 .evaluate()
-                .map_err(|error| DataFusionError::External(Box::new(error)))?
-                .map(|rows| super::exec::project_batch(&rows, Arc::clone(schema)))
-                .transpose(),
+                .map_err(|error| DataFusionError::External(Box::new(error)))?,
             #[cfg(test)]
-            Self::Evaluated(batch) => Ok(Some(batch.clone())),
-        }
+            Self::Evaluated(batch) => Some(batch.clone()),
+        };
+        rows.map(|rows| super::exec::project_batch(&rows, Arc::clone(schema)))
+            .transpose()
     }
 }
 
@@ -289,7 +289,8 @@ impl DataSource for MemtableSource {
     /// from the capture, filtered by the filters this source took over unless
     /// its bounds prove it fully matching, dropped when left empty, projected,
     /// and cut at the partition's limit, after which no later batch is
-    /// evaluated. The stream holds the source's accounting owners until it
+    /// evaluated. A batch that fails ends the stream with that error. The
+    /// stream holds the source's accounting owners until it
     /// drops, since a stream can outlive its plan.
     ///
     /// # Errors
@@ -330,17 +331,23 @@ impl DataSource for MemtableSource {
                     })
                     .transpose()
                 });
-                let mut rows = match pulled {
-                    Ok(Some(rows)) if rows.num_rows() > 0 => rows,
-                    Ok(_) => continue,
-                    Err(error) => return Some(Err(error)),
+                let projected = pulled.and_then(|rows| {
+                    rows.filter(|rows| rows.num_rows() > 0)
+                        .map(|rows| match &projection {
+                            Some(projection) => rows.project(projection).map_err(Into::into),
+                            None => Ok(rows),
+                        })
+                        .transpose()
+                });
+                let mut rows = match projected {
+                    Ok(Some(rows)) => rows,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        // A failure is terminal: no later batch is evaluated.
+                        remaining = Some(0);
+                        return Some(Err(error));
+                    }
                 };
-                if let Some(projection) = &projection {
-                    rows = match rows.project(projection) {
-                        Ok(rows) => rows,
-                        Err(error) => return Some(Err(error.into())),
-                    };
-                }
                 if let Some(remaining) = remaining.as_mut() {
                     rows = rows.slice(0, rows.num_rows().min(*remaining));
                     *remaining -= rows.num_rows();
@@ -924,5 +931,69 @@ mod tests {
 
         assert_eq!(total.column_statistics[0].min_value, Precision::Absent);
         assert_eq!(total.column_statistics[0].max_value, Precision::Absent);
+    }
+
+    /// A batch that fails to evaluate ends its partition's stream: the
+    /// batches before it stream, the failure is yielded once, no later batch
+    /// is evaluated, and the capture's accounting owners stay held while the
+    /// stream reads and are released once it and its source drop.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a batch streams after the failure, the failure is not
+    /// yielded, or the owners are not held and released as described.
+    #[tokio::test]
+    async fn a_failed_batch_ends_its_stream_and_releases_its_owners() {
+        use futures_util::StreamExt as _;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let unreadable = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "other",
+                DataType::Int64,
+                false,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![5_i64]))],
+        )
+        .expect("unreadable batch");
+        let charges = Arc::new(crate::scribe::memtable::LiveReadOwners::default());
+        let source = evaluated_source(
+            vec![
+                bounded(&[1, 2]),
+                (unreadable, Arc::new(Statistics::new_unknown(&schema))),
+                bounded(&[3, 4]),
+            ],
+            Arc::clone(&charges),
+            crate::scan_sizing::OraclePartitioning::new(
+                1,
+                crate::scan_sizing::ORACLE_PARTITION_SCAN_BYTES,
+            ),
+            1,
+            Arc::clone(&schema),
+        )
+        .expect("memtable source");
+        let mut stream = source
+            .open(0, Arc::new(datafusion::execution::TaskContext::default()))
+            .expect("the partition opens");
+
+        let first = stream
+            .next()
+            .await
+            .expect("a first batch")
+            .expect("it reads");
+        assert_eq!(first.num_rows(), 2);
+        assert_eq!(
+            Arc::strong_count(&charges),
+            3,
+            "the open stream holds the owners"
+        );
+        assert!(stream.next().await.expect("the failure").is_err());
+        assert!(
+            stream.next().await.is_none(),
+            "no batch follows the failure"
+        );
+        drop(stream);
+        drop(source);
+        assert_eq!(Arc::strong_count(&charges), 1, "the owners are released");
     }
 }

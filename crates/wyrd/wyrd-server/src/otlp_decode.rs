@@ -523,15 +523,66 @@ pub(crate) fn preflight_trace_protobuf(
     })
 }
 
+/// Byte lengths of a message's singular length-delimited fields, kept
+/// last-wins while the message is walked once.
+///
+/// Protobuf retains only the final occurrence of a singular field, so the
+/// preflight charges each one after the walk instead of rescanning the message
+/// per field.
+#[derive(Clone, Copy, Debug)]
+struct LastLengths<const N: usize>([Option<usize>; N]);
+
+impl<const N: usize> Default for LastLengths<N> {
+    /// No field seen yet.
+    fn default() -> Self {
+        Self([None; N])
+    }
+}
+
+impl<const N: usize> LastLengths<N> {
+    /// Records one occurrence of the singular field at `index`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same wrong-wire refusal a rescan would, when the occurrence
+    /// is not length-delimited.
+    fn record(&mut self, index: usize, value: WireValue<'_>) -> Result<(), IngestError> {
+        let WireValue::Bytes(value) = value else {
+            return Err(wrong_wire("singular bytes field"));
+        };
+        self.0[index] = Some(value.len());
+        Ok(())
+    }
+
+    /// Keeps every field `later` carries, as merging a later message does.
+    fn merge(&mut self, later: Self) {
+        for (slot, value) in self.0.iter_mut().zip(later.0) {
+            if value.is_some() {
+                *slot = value;
+            }
+        }
+    }
+
+    /// Charges every retained field's bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stable malformed-request error on arithmetic overflow.
+    fn charge(self, facts: &mut TraceWireFacts) -> Result<(), IngestError> {
+        self.0
+            .into_iter()
+            .flatten()
+            .try_for_each(|bytes| facts.add_value_bytes(bytes))
+    }
+}
+
 /// Visits one `ResourceSpans` message and its nested scope groups.
 ///
 /// # Errors
 ///
 /// Returns a stable malformed-request error for invalid wire shapes or limits.
 fn visit_resource_spans(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), IngestError> {
-    if let Some(schema_url) = last_bytes_field(bytes, 3)? {
-        facts.add_value_bytes(schema_url.len())?;
-    }
+    let mut schema_url = LastLengths::<1>::default();
     let mut fields = WireFields::with_group_depth(bytes, facts.limits.value_depth);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
@@ -544,12 +595,12 @@ fn visit_resource_spans(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), 
                 visit_scope_spans(scope, facts)?;
                 facts.output.close_group(facts.decode_bytes, GROUP_FAN_OUT);
             }
-            (3, WireValue::Bytes(_)) => {}
-            (1..=3, _) => return Err(wrong_wire("resource spans")),
+            (3, value) => schema_url.record(0, value)?,
+            (1 | 2, _) => return Err(wrong_wire("resource spans")),
             _ => {}
         }
     }
-    Ok(())
+    schema_url.charge(facts)
 }
 
 /// Visits one OTLP resource and counts attribute/entity backing storage.
@@ -576,20 +627,25 @@ fn visit_resource(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), Ingest
 
 /// Visits one instrumentation scope and its repeated attributes.
 ///
+/// Returns its retained name and version lengths, which merge across every
+/// occurrence of the scope in its `ScopeSpans`.
+///
 /// # Errors
 ///
 /// Returns a stable malformed-request error for invalid nested fields or limits.
-fn visit_scope(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), IngestError> {
+fn visit_scope(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<LastLengths<2>, IngestError> {
+    let mut text = LastLengths::<2>::default();
     let mut fields = WireFields::with_group_depth(bytes, facts.limits.value_depth);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
             (3, WireValue::Bytes(attribute)) => visit_attribute(attribute, 0, facts)?,
-            (1 | 2, WireValue::Bytes(_)) | (4, WireValue::Varint(_)) => {}
-            (1..=4, _) => return Err(wrong_wire("instrumentation scope")),
+            (1 | 2, value) => text.record(usize::try_from(tag - 1).unwrap_or(0), value)?,
+            (4, WireValue::Varint(_)) => {}
+            (3 | 4, _) => return Err(wrong_wire("instrumentation scope")),
             _ => {}
         }
     }
-    Ok(())
+    Ok(text)
 }
 
 /// Visits one `ScopeSpans` message and its repeated spans.
@@ -598,18 +654,12 @@ fn visit_scope(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), IngestErr
 ///
 /// Returns a stable malformed-request error for invalid nested fields or limits.
 fn visit_scope_spans(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), IngestError> {
-    for tag in [1, 2] {
-        if let Some(text) = last_bytes_across_messages(bytes, 1, tag)? {
-            facts.add_value_bytes(text.len())?;
-        }
-    }
-    if let Some(schema_url) = last_bytes_field(bytes, 3)? {
-        facts.add_value_bytes(schema_url.len())?;
-    }
+    let mut scope_text = LastLengths::<2>::default();
+    let mut schema_url = LastLengths::<1>::default();
     let mut fields = WireFields::with_group_depth(bytes, facts.limits.value_depth);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
-            (1, WireValue::Bytes(scope)) => visit_scope(scope, facts)?,
+            (1, WireValue::Bytes(scope)) => scope_text.merge(visit_scope(scope, facts)?),
             (2, WireValue::Bytes(span)) => {
                 facts.output.open(facts.decode_bytes, size_of::<Span>());
                 facts.add_decode_bytes(size_of::<Span>())?;
@@ -618,12 +668,14 @@ fn visit_scope_spans(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), Ing
                     .output
                     .close_record(facts.decode_bytes, facts.widths.row);
             }
-            (3, WireValue::Bytes(_)) => {}
-            (1..=3, _) => return Err(wrong_wire("scope spans")),
+            (3, value) => schema_url.record(0, value)?,
+            (1, _) => return Err(wrong_wire("optional OTLP message")),
+            (2, _) => return Err(wrong_wire("scope spans")),
             _ => {}
         }
     }
-    Ok(())
+    scope_text.charge(facts)?;
+    schema_url.charge(facts)
 }
 
 /// Visits one span, including events, links, and attributes.
@@ -632,17 +684,12 @@ fn visit_scope_spans(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), Ing
 ///
 /// Returns a stable malformed-request error for invalid nested fields or limits.
 fn visit_span(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), IngestError> {
-    for tag in 1..=5 {
-        if let Some(value) = last_bytes_field(bytes, tag)? {
-            facts.add_value_bytes(value.len())?;
-        }
-    }
-    if let Some(message) = last_bytes_across_messages(bytes, 15, 2)? {
-        facts.add_value_bytes(message.len())?;
-    }
+    let mut text = LastLengths::<5>::default();
+    let mut status_message = LastLengths::<1>::default();
     let mut fields = WireFields::with_group_depth(bytes, facts.limits.value_depth);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
+            (1..=5, value) => text.record(usize::try_from(tag - 1).unwrap_or(0), value)?,
             (9, WireValue::Bytes(attribute)) => visit_attribute(attribute, 0, facts)?,
             (11, WireValue::Bytes(event)) => {
                 facts.output.add(facts.widths.event);
@@ -654,16 +701,17 @@ fn visit_span(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), IngestErro
                 facts.add_decode_bytes(size_of::<wyrd_tonic::otlp::trace::v1::span::Link>())?;
                 visit_span_link(link, facts)?;
             }
-            (15, WireValue::Bytes(status)) => visit_status(status, facts)?,
-            (1..=5, WireValue::Bytes(_))
-            | (6 | 10 | 12 | 14, WireValue::Varint(_))
+            (15, WireValue::Bytes(status)) => status_message.merge(visit_status(status, facts)?),
+            (15, _) => return Err(wrong_wire("optional OTLP message")),
+            (6 | 10 | 12 | 14, WireValue::Varint(_))
             | (7 | 8, WireValue::Fixed64(_))
             | (16, WireValue::Fixed32(_)) => {}
-            (1..=16, _) => return Err(wrong_wire("span")),
+            (6..=16, _) => return Err(wrong_wire("span")),
             _ => {}
         }
     }
-    Ok(())
+    text.charge(facts)?;
+    status_message.charge(facts)
 }
 
 /// Visits one entity reference and accounts for repeated string elements.
@@ -672,41 +720,40 @@ fn visit_span(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), IngestErro
 ///
 /// Returns a stable malformed-request error for invalid framing or limits.
 fn visit_entity_ref(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), IngestError> {
-    for tag in [1, 2] {
-        if let Some(value) = last_bytes_field(bytes, tag)? {
-            facts.add_value_bytes(value.len())?;
-        }
-    }
+    let mut text = LastLengths::<2>::default();
     let mut fields = WireFields::with_group_depth(bytes, facts.limits.value_depth);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
-            (1 | 2, WireValue::Bytes(_)) => {}
+            (1 | 2, value) => text.record(usize::try_from(tag - 1).unwrap_or(0), value)?,
             (3 | 4, WireValue::Bytes(value)) => {
                 facts.add_decode_bytes(size_of::<String>())?;
                 facts.add_value_bytes(value.len())?;
             }
-            (1..=4, _) => return Err(wrong_wire("entity reference")),
+            (3 | 4, _) => return Err(wrong_wire("entity reference")),
             _ => {}
         }
     }
-    Ok(())
+    text.charge(facts)
 }
 
-/// Visits one span status and accounts for its message backing storage.
+/// Visits one span status, returning its retained message length, which
+/// merges across every occurrence of the status in its span.
 ///
 /// # Errors
 ///
 /// Returns a stable malformed-request error for invalid framing or limits.
-fn visit_status(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), IngestError> {
+fn visit_status(bytes: &[u8], facts: &TraceWireFacts) -> Result<LastLengths<1>, IngestError> {
+    let mut message = LastLengths::<1>::default();
     let mut fields = WireFields::with_group_depth(bytes, facts.limits.value_depth);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
-            (2, WireValue::Bytes(_)) | (3, WireValue::Varint(_)) => {}
-            (2 | 3, _) => return Err(wrong_wire("span status")),
+            (2, value) => message.record(0, value)?,
+            (3, WireValue::Varint(_)) => {}
+            (3, _) => return Err(wrong_wire("span status")),
             _ => {}
         }
     }
-    Ok(())
+    Ok(message)
 }
 
 /// Visits one span event and its repeated attributes.
@@ -715,19 +762,18 @@ fn visit_status(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), IngestEr
 ///
 /// Returns a stable malformed-request error for invalid nested fields or limits.
 fn visit_span_event(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), IngestError> {
-    if let Some(name) = last_bytes_field(bytes, 2)? {
-        facts.add_value_bytes(name.len())?;
-    }
+    let mut name = LastLengths::<1>::default();
     let mut fields = WireFields::with_group_depth(bytes, facts.limits.value_depth);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
+            (2, value) => name.record(0, value)?,
             (3, WireValue::Bytes(attribute)) => visit_attribute(attribute, 0, facts)?,
-            (2, WireValue::Bytes(_)) | (1, WireValue::Fixed64(_)) | (4, WireValue::Varint(_)) => {}
-            (1..=4, _) => return Err(wrong_wire("span event")),
+            (1, WireValue::Fixed64(_)) | (4, WireValue::Varint(_)) => {}
+            (1 | 3 | 4, _) => return Err(wrong_wire("span event")),
             _ => {}
         }
     }
-    Ok(())
+    name.charge(facts)
 }
 
 /// Visits one span link and its identifier, trace-state, and attributes.
@@ -736,26 +782,25 @@ fn visit_span_event(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), Inge
 ///
 /// Returns a stable malformed-request error for invalid nested fields or limits.
 fn visit_span_link(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), IngestError> {
-    for tag in 1..=3 {
-        if let Some(value) = last_bytes_field(bytes, tag)? {
-            facts.add_value_bytes(value.len())?;
-        }
-    }
+    let mut text = LastLengths::<3>::default();
     let mut fields = WireFields::with_group_depth(bytes, facts.limits.value_depth);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
+            (1..=3, value) => text.record(usize::try_from(tag - 1).unwrap_or(0), value)?,
             (4, WireValue::Bytes(attribute)) => visit_attribute(attribute, 0, facts)?,
-            (1..=3, WireValue::Bytes(_))
-            | (5, WireValue::Varint(_))
-            | (6, WireValue::Fixed32(_)) => {}
-            (1..=6, _) => return Err(wrong_wire("span link")),
+            (5, WireValue::Varint(_)) | (6, WireValue::Fixed32(_)) => {}
+            (4..=6, _) => return Err(wrong_wire("span link")),
             _ => {}
         }
     }
-    Ok(())
+    text.charge(facts)
 }
 
 /// Visits one key/value attribute and its optional recursive value.
+///
+/// The entry is walked once. Its value, almost always one occurrence carrying
+/// one oneof field, is visited directly; anything protobuf must merge takes
+/// the general [`visit_merged_any_value`] path, so both charge the same bytes.
 ///
 /// # Errors
 ///
@@ -766,8 +811,24 @@ fn visit_attribute(
     facts: &mut TraceWireFacts,
 ) -> Result<(), IngestError> {
     facts.add_attribute()?;
-    if let Some(key) = last_bytes_field(bytes, 1)? {
-        facts.add_value_bytes(key.len())?;
+    let mut key = LastLengths::<1>::default();
+    let mut value_body = None;
+    let mut value_count = 0_usize;
+    let mut fields = WireFields::with_group_depth(bytes, facts.limits.value_depth);
+    while let Some((tag, value)) = fields.next()? {
+        match (tag, value) {
+            (1, value) => key.record(0, value)?,
+            (2, WireValue::Bytes(body)) => {
+                value_body = Some(body);
+                value_count = value_count.saturating_add(1);
+            }
+            (2, _) => return Err(wrong_wire("optional any value")),
+            _ => {}
+        }
+    }
+    key.charge(facts)?;
+    if let (1, Some(body)) = (value_count, value_body) {
+        return visit_any_value(body, value_depth + 1, facts);
     }
     visit_merged_any_value(
         AnyValueBodies::Repeated {
@@ -776,19 +837,14 @@ fn visit_attribute(
         },
         value_depth + 1,
         facts,
-    )?;
-    let mut fields = WireFields::with_group_depth(bytes, facts.limits.value_depth);
-    while let Some((tag, value)) = fields.next()? {
-        match (tag, value) {
-            (1 | 2, WireValue::Bytes(_)) => {}
-            (1 | 2, _) => return Err(wrong_wire("key/value")),
-            _ => {}
-        }
-    }
-    Ok(())
+    )
 }
 
-/// Visits one recursive OTLP `AnyValue` without constructing it.
+/// Visits one recursive OTLP `AnyValue` body without constructing it.
+///
+/// A body carrying exactly one oneof field, the shape every exporter writes,
+/// is charged from that field alone; a body protobuf must merge goes through
+/// [`visit_merged_any_value`].
 ///
 /// # Errors
 ///
@@ -799,7 +855,65 @@ fn visit_any_value(
     depth: usize,
     facts: &mut TraceWireFacts,
 ) -> Result<(), IngestError> {
-    visit_merged_any_value(AnyValueBodies::Single(bytes), depth, facts)
+    if depth > facts.limits.value_depth {
+        return Err(malformed("OTLP value nesting depth exceeded"));
+    }
+    let mut only = None;
+    let mut oneofs = 0_usize;
+    let mut fields = WireFields::with_group_depth(bytes, facts.limits.value_depth);
+    while let Some((tag, value)) = fields.next()? {
+        if (1..=7).contains(&tag) {
+            only = Some((tag, value));
+            oneofs = oneofs.saturating_add(1);
+        }
+    }
+    let Some((tag, value)) = only.filter(|_| oneofs == 1) else {
+        return visit_merged_any_value(AnyValueBodies::Single(bytes), depth, facts);
+    };
+    validate_any_value_wire(tag, value)?;
+    visit_selected_value(tag, value, depth, facts)
+}
+
+/// Charges the retained oneof field of one `AnyValue`.
+///
+/// # Errors
+///
+/// Returns a stable malformed-request error for invalid nested fields, excess
+/// depth, or configured capacity excess.
+fn visit_selected_value(
+    tag: u32,
+    value: WireValue<'_>,
+    depth: usize,
+    facts: &mut TraceWireFacts,
+) -> Result<(), IngestError> {
+    match (tag, value) {
+        (1 | 7, WireValue::Bytes(value)) => facts.add_value_bytes(value.len()),
+        (2 | 3, WireValue::Varint(_)) | (4, WireValue::Fixed64(_)) => Ok(()),
+        (5, WireValue::Bytes(array)) => {
+            let mut values = WireFields::with_group_depth(array, facts.limits.value_depth);
+            while let Some((value_tag, value)) = values.next()? {
+                if let (1, WireValue::Bytes(value)) = (value_tag, value) {
+                    facts.add_decode_bytes(size_of::<AnyValue>())?;
+                    visit_any_value(value, depth + 1, facts)?;
+                } else if value_tag == 1 {
+                    return Err(wrong_wire("OTLP value array"));
+                }
+            }
+            Ok(())
+        }
+        (6, WireValue::Bytes(list)) => {
+            let mut values = WireFields::with_group_depth(list, facts.limits.value_depth);
+            while let Some((value_tag, value)) = values.next()? {
+                if let (1, WireValue::Bytes(value)) = (value_tag, value) {
+                    visit_attribute(value, depth, facts)?;
+                } else if value_tag == 1 {
+                    return Err(wrong_wire("OTLP key/value list"));
+                }
+            }
+            Ok(())
+        }
+        _ => Err(wrong_wire("OTLP any value")),
+    }
 }
 
 /// Visits only the retained final oneof run across merged `AnyValue` bodies.
@@ -830,32 +944,7 @@ fn visit_merged_any_value(
             if ordinal < selection.run_start || tag != selection.tag {
                 continue;
             }
-            match (tag, value) {
-                (1 | 7, WireValue::Bytes(value)) => facts.add_value_bytes(value.len())?,
-                (2 | 3, WireValue::Varint(_)) | (4, WireValue::Fixed64(_)) => {}
-                (5, WireValue::Bytes(array)) => {
-                    let mut values = WireFields::with_group_depth(array, facts.limits.value_depth);
-                    while let Some((value_tag, value)) = values.next()? {
-                        if let (1, WireValue::Bytes(value)) = (value_tag, value) {
-                            facts.add_decode_bytes(size_of::<AnyValue>())?;
-                            visit_any_value(value, depth + 1, facts)?;
-                        } else if value_tag == 1 {
-                            return Err(wrong_wire("OTLP value array"));
-                        }
-                    }
-                }
-                (6, WireValue::Bytes(list)) => {
-                    let mut values = WireFields::with_group_depth(list, facts.limits.value_depth);
-                    while let Some((value_tag, value)) = values.next()? {
-                        if let (1, WireValue::Bytes(value)) = (value_tag, value) {
-                            visit_attribute(value, depth, facts)?;
-                        } else if value_tag == 1 {
-                            return Err(wrong_wire("OTLP key/value list"));
-                        }
-                    }
-                }
-                _ => return Err(wrong_wire("OTLP any value")),
-            }
+            visit_selected_value(tag, value, depth, facts)?;
         }
         Ok(())
     })?;
@@ -1510,17 +1599,31 @@ fn merge_status(bytes: &[u8], status: &mut Status) -> Result<(), IngestError> {
 /// # Errors
 ///
 /// Returns a malformed-request error for invalid framing, UTF-8, or wire types.
+///
+/// The entry is walked once; a wrongly typed key or value is still refused
+/// only after the value and key decode, the order a rescan reports them in.
 pub(crate) fn decode_key_value(bytes: &[u8]) -> Result<KeyValue, IngestError> {
-    let scanned = Scanned::<3>::of(bytes)?;
-    let value = scanned.singular(2, decode_any_value, decode_merged_any_value)?;
-    let key = scanned.string(1)?;
+    let (mut key, mut value_body, mut values, mut wrong_wire_type) = (None, None, 0_usize, false);
     let mut fields = WireFields::new(bytes);
     while let Some((tag, wire_value)) = fields.next()? {
         match (tag, wire_value) {
-            (1 | 2, WireValue::Bytes(_)) => {}
-            (1 | 2, _) => return Err(wrong_wire("key/value")),
+            (1, WireValue::Bytes(body)) => key = Some(body),
+            (2, WireValue::Bytes(body)) => {
+                value_body = Some(body);
+                values = values.saturating_add(1);
+            }
+            (1 | 2, _) => wrong_wire_type = true,
             _ => {}
         }
+    }
+    let value = match (values, value_body) {
+        (0, _) => None,
+        (1, Some(body)) => Some(decode_any_value(body)?),
+        _ => decode_merged_any_value(bytes, 2)?,
+    };
+    let key = key.map(fixed_string).transpose()?.unwrap_or_default();
+    if wrong_wire_type {
+        return Err(wrong_wire("key/value"));
     }
     Ok(KeyValue { key, value })
 }
@@ -1591,8 +1694,47 @@ pub(crate) struct AnyValueSelection {
 /// # Errors
 ///
 /// Returns a malformed-request error for invalid framing, UTF-8, or wire types.
+///
+/// A body carrying exactly one oneof field, the shape every exporter writes,
+/// is built from that field without a separate selection pass; any body
+/// protobuf must merge takes [`decode_any_value_bodies`].
 pub(crate) fn decode_any_value(bytes: &[u8]) -> Result<AnyValue, IngestError> {
-    decode_any_value_bodies(AnyValueBodies::Single(bytes))
+    let mut only = None;
+    let mut oneofs = 0_usize;
+    let mut fields = WireFields::new(bytes);
+    while let Some((tag, value)) = fields.next()? {
+        if (1..=7).contains(&tag) {
+            only = Some((tag, value));
+            oneofs = oneofs.saturating_add(1);
+        }
+    }
+    let Some((tag, value)) = only.filter(|_| oneofs == 1) else {
+        return decode_any_value_bodies(AnyValueBodies::Single(bytes));
+    };
+    validate_any_value_wire(tag, value)?;
+    let value = match (tag, value) {
+        (1, WireValue::Bytes(bytes)) => any_value::Value::StringValue(fixed_string(bytes)?),
+        (2, WireValue::Varint(value)) => any_value::Value::BoolValue(value != 0),
+        (3, WireValue::Varint(value)) => any_value::Value::IntValue(protobuf_i64(value)),
+        (4, WireValue::Fixed64(value)) => any_value::Value::DoubleValue(f64::from_bits(value)),
+        (5, WireValue::Bytes(bytes)) => {
+            let mut array = ArrayValue {
+                values: Vec::with_capacity(repeated_message_count(bytes, 1)?),
+            };
+            merge_array_value(bytes, &mut array)?;
+            any_value::Value::ArrayValue(array)
+        }
+        (6, WireValue::Bytes(bytes)) => {
+            let mut list = KeyValueList {
+                values: Vec::with_capacity(repeated_message_count(bytes, 1)?),
+            };
+            merge_key_value_list(bytes, &mut list)?;
+            any_value::Value::KvlistValue(list)
+        }
+        (7, WireValue::Bytes(bytes)) => any_value::Value::BytesValue(fixed_bytes(bytes)),
+        _ => return Err(wrong_wire("OTLP any value")),
+    };
+    Ok(AnyValue { value: Some(value) })
 }
 
 /// Merges every occurrence of a singular `AnyValue` field.

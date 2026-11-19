@@ -1,0 +1,21 @@
+# A model that reads the policy with fs.read and returns a verdict on the
+# report. Its model calls go through the `openai` gateway deployment.
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: policy-judge
+spec:
+  execution_route: {kind: wyrd_gateway, deployment: openai}
+  tool_names: [fs.read]
+  run_config: {max_iterations: 3}
+  prompt:
+    provider: openai
+    model: gpt-4o
+    messages:
+      - role: user
+        content: >-
+          Read /inputs/company-sharing-policy.pdf.json with fs.read. Decide whether the
+          company sharing policy permits sharing this report with this recipient for this
+          purpose, citing the report and the policy line you apply. Purpose: {{purpose}}
+          Report: {{report}} Recipient: {{recipient}}
+    response_format: verdict

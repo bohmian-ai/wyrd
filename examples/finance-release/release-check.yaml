@@ -1,0 +1,35 @@
+# The release-check Verifier that finance_service.py declares in code. Upload
+# the policy with its extracted text first:
+#   wyrd artifact upload company-sharing-policy.pdf --name company-sharing-policy --version 0.1.0 --extract
+# ANCHOR: verifier
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: release-check
+spec:
+  inputs:
+    purpose: {type: json}
+    report: {type: json}
+    recipient: {type: json}
+    destination: {type: json}
+  # ANCHOR: requirements
+  requirements:
+    - id: recipient-authorized
+      statement: The recipient is authorized to receive the report.
+      check: {kind: assert, path: inputs.recipient.authorized, operator: equals, expected: true}
+    - id: follows-policy
+      statement: The company sharing policy permits this release.
+      check:
+        kind: agent
+        agent: ./policy-judge.yaml
+        inputs: {purpose: inputs.purpose, report: inputs.report, recipient: inputs.recipient}
+        workspace:
+          /inputs/company-sharing-policy.pdf.json:
+            artifact:
+              card: {kind: Artifact, name: company-sharing-policy, version: 0.1.0}
+              path: extracted/company-sharing-policy.pdf.json
+    - id: destination-restricted
+      statement: The destination restricts access to the report.
+      check: {kind: assert, path: inputs.destination.restricted, operator: equals, expected: true}
+  # ANCHOR_END: requirements
+# ANCHOR_END: verifier

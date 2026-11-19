@@ -1,5 +1,6 @@
 ---
 title: Add people
+browserTitle: Add people with single sign-on | Wyrd
 description: Connect your identity provider, such as Okta or Keycloak, so people sign in to Wyrd, then grant them roles.
 pillar: wyrd
 section: Operate

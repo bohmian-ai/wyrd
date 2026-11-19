@@ -11,7 +11,7 @@ from pathlib import Path
 DOCS_ROOT = Path(__file__).resolve().parents[1]
 SCAN_ROOTS = [DOCS_ROOT / "src" / "content" / "docs", DOCS_ROOT / "CONTRIBUTING.md"]
 # Cargo, uv, and pnpm are forbidden only where they drive this repository: a
-# reader's own project (`cargo run`, `uv run quickstart.py`, `pnpm add`) has
+# reader's own project (`cargo run`, `uv run check.py`, `pnpm add`) has
 # no mise.
 FORBIDDEN = re.compile(
     r"^\s*(?:[$>]?\s*)?("
@@ -78,9 +78,9 @@ def self_check() -> None:
                  "uv run python scripts/check_links.py", "uv run scripts/x.py", "uv run --project sdks/wyrd-sdk-python pytest",
                  "pnpm test", "pnpm check", "pnpm install --frozen-lockfile", "pnpm -C docs build"]:
         assert FORBIDDEN.match(line), line
-    for line in ["cargo new quickstart && cd quickstart", "cargo add wyrd-ai@0.4.1 serde_json", "cargo run", "cargo install wyrd-cli --version 0.4.1 --locked",
-                 "uv run quickstart.py", "uv run wyrd init",
-                 "pnpm init && pnpm pkg set type=module", "pnpm add wyrd-ai@0.4.1", "pnpm wyrd init"]:
+    for line in ["cargo new quickstart && cd quickstart", "cargo add wyrd-ai@0.4.2 serde_json", "cargo run", "cargo install wyrd-cli --version 0.4.2 --locked",
+                 "uv run check.py", "uv run wyrd init",
+                 "pnpm init && pnpm pkg set type=module", "pnpm add wyrd-ai@0.4.2", "pnpm wyrd init"]:
         assert not FORBIDDEN.match(line), line
 
 

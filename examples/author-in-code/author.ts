@@ -42,7 +42,6 @@ const id = (ref: CardRef) => `${ref.kind}/${ref.name}@${ref.version}#${ref.uid}`
 console.log(`service: ${id(state.rootRef)}`);
 console.log(`agent:   ${id(state.cardRef("agent"))}`);
 
-await state.startBifrost(); // the writer; the one declared table is active
 try {
   for (const answer of ["Your refund request is approved.", "You have a guaranteed refund."]) {
     // A Run whose view is the Agent, where the Verifier is bound.

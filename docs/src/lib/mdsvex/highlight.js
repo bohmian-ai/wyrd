@@ -74,6 +74,20 @@ export function highlight(code, lang, transformers = []) {
 }
 
 /**
+ * Shiki tokens for `code` on the Wyrd theme, one array per line. Each token's
+ * `color` is a `var(--shiki-*)` reference, so a figure that draws code as SVG
+ * text keeps the docs' syntax colors.
+ * @param {string} code
+ * @param {import('shiki').BundledLanguage} lang
+ * @returns {{ content: string, color: string }[][]}
+ */
+export function tokenLines(code, lang) {
+  return highlighter
+    .codeToTokens(code, { lang, theme: WYRD_THEME })
+    .tokens.map((line) => line.map(({ content, color }) => ({ content, color: color ?? 'var(--shiki-foreground)' })));
+}
+
+/**
  * Render a markdown fence. The info string after the language may carry
  * `title="file.py"` and a `{3,5-7}` line list to mark.
  * @param {string} code
@@ -161,12 +175,13 @@ function sliceRange(src, range) {
 const ANCHOR = /\bANCHOR(_END)?:\s*([\w-]+)/;
 
 /**
- * The lines strictly between `ANCHOR: name` and `ANCHOR_END: name`.
+ * The lines strictly between `ANCHOR: name` and `ANCHOR_END: name`, dedented.
+ * Throws when `file` has no such region.
  * @param {string} src
  * @param {string} name
  * @param {string} file
  */
-function sliceRegion(src, name, file) {
+export function sliceRegion(src, name, file) {
   const lines = src.split('\n');
   const at = (/** @type {boolean} */ end) => lines.findIndex((l) => {
     const m = l.match(ANCHOR);
@@ -178,8 +193,11 @@ function sliceRegion(src, name, file) {
   return dedent(lines.slice(start + 1, end));
 }
 
-/** @param {string} body */
-function stripAnchors(body) {
+/**
+ * `body` without its `ANCHOR:` and `ANCHOR_END:` lines.
+ * @param {string} body
+ */
+export function stripAnchors(body) {
   return body.split('\n').filter((l) => !ANCHOR.test(l)).join('\n');
 }
 

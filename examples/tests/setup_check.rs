@@ -1,7 +1,7 @@
-//! The docs Quickstart's Rust program, run as a reader runs it.
+//! The Set up Wyrd page's model-free check in Rust, run as a reader runs it.
 //!
-//! The journey copies the Quickstart's two Card files into an empty
-//! directory and runs the built `quickstart` binary there, twice, against a
+//! The journey copies the check's two Card files into an empty directory
+//! and runs the built `setup_check` binary there, twice, against a
 //! real server reached through the environment a saved local setup provides.
 
 use std::path::{Path, PathBuf};
@@ -10,8 +10,8 @@ use std::process::Command;
 use secrecy::ExposeSecret;
 use wyrd_testing::server::WyrdTestServer;
 
-/// The Quickstart's directory, holding its Card files and programs.
-const QUICKSTART: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/quickstart");
+/// The check's directory, holding its Card files and programs.
+const SETUP_CHECK: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/setup-check");
 
 /// Where and as whom a reader's program runs: its working directory and the
 /// server address and key a saved local setup would provide.
@@ -29,13 +29,13 @@ struct Reader {
 }
 
 impl Reader {
-    /// Run the `quickstart` binary in the reader's directory and return what
+    /// Run the `setup_check` binary in the reader's directory and return what
     /// it printed.
     ///
     /// # Panics
     /// Panics when the binary cannot start or exits unsuccessfully.
-    fn run_quickstart(&self) -> String {
-        let output = Command::new(env!("CARGO_BIN_EXE_quickstart"))
+    fn run_check(&self) -> String {
+        let output = Command::new(env!("CARGO_BIN_EXE_setup_check"))
             .current_dir(&self.dir)
             .env("WYRD_CONFIG_HOME", &self.config)
             .env("WYRD_SERVER_URL", &self.server_url)
@@ -45,17 +45,17 @@ impl Reader {
             .env_remove("WYRD_WORKLOAD_TOKEN")
             .env_remove("WYRD_TENANT")
             .output()
-            .expect("the quickstart binary starts");
+            .expect("the setup_check binary starts");
         assert!(
             output.status.success(),
-            "the quickstart fails: {}",
+            "the check fails: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        String::from_utf8(output.stdout).expect("the quickstart prints UTF-8")
+        String::from_utf8(output.stdout).expect("the check prints UTF-8")
     }
 }
 
-/// The Rust Quickstart prints a passing and a failing verdict with the exact
+/// The Rust setup check prints a passing and a failing verdict with the exact
 /// subject and Verifier identities, and an unchanged rerun prints the same
 /// identities and leaves only the Card files in the reader's directory.
 ///
@@ -63,7 +63,7 @@ impl Reader {
 /// Panics when the server cannot start or the printed verdicts differ.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn quickstart_verifies_and_repeats() {
+async fn setup_check_verifies_and_repeats() {
     let server = WyrdTestServer::builder()
         .with_verification_runtime_for_test()
         .start_bound()
@@ -72,7 +72,7 @@ async fn quickstart_verifies_and_repeats() {
     let dir = tempfile::tempdir().expect("reader directory creates");
     let config = tempfile::tempdir().expect("config directory creates");
     for file in ["no-refund-promise.yaml", "support-reply.yaml"] {
-        std::fs::copy(Path::new(QUICKSTART).join(file), dir.path().join(file))
+        std::fs::copy(Path::new(SETUP_CHECK).join(file), dir.path().join(file))
             .expect("Card file copies");
     }
     let reader = Reader {
@@ -93,7 +93,7 @@ async fn quickstart_verifies_and_repeats() {
 
     // The in-process server keeps serving on the runtime while the binary runs.
     let (first, again) = tokio::task::spawn_blocking(move || {
-        let printed = (reader.run_quickstart(), reader.run_quickstart());
+        let printed = (reader.run_check(), reader.run_check());
         (printed, reader)
     })
     .await
@@ -106,7 +106,7 @@ async fn quickstart_verifies_and_repeats() {
         assert_eq!(files, ["no-refund-promise.yaml", "support-reply.yaml"]);
         printed
     })
-    .expect("the quickstart task joins");
+    .expect("the check task joins");
 
     let lines: Vec<&str> = first.lines().collect();
     let [
@@ -118,7 +118,7 @@ async fn quickstart_verifies_and_repeats() {
         failed_verifier,
     ] = lines[..]
     else {
-        panic!("the quickstart prints two verdicts: {first}");
+        panic!("the check prints two verdicts: {first}");
     };
     assert_eq!(passed, "passed: the comparison held");
     assert_eq!(failed, "failed: operator NotContains returned false");

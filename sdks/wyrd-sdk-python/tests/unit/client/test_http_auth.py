@@ -104,7 +104,7 @@ def test_state_auth_snapshots_context_before_token_refresh(fixtures_dir: Path) -
                 "training_data": TinyDataInterface(),
             },
         )
-        state.configure(deployment_environment=environment)
+        state.configure(deployment_environment=environment, telemetry=False)
         return state
 
     prod, staging = configured("prod"), configured("staging")

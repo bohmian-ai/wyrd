@@ -1,0 +1,4 @@
+latency-budget@1.0.0 on checkout@1.0.0
+  14:03-14:04 inconclusive
+  14:02-14:03 failed
+  14:01-14:02 passed

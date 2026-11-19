@@ -1,5 +1,6 @@
 ---
 title: Permissions
+browserTitle: Grant and inspect permissions | Wyrd
 description: See which roles a principal holds, grant or revoke a role, cut a principal off, and confirm the result in the audit log.
 pillar: wyrd
 section: Operate

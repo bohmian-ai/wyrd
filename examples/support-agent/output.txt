@@ -1,0 +1,4 @@
+passed: Refunds are possible within 30 days of purchase, so this order no longer qualifies.
+failed: Yes, you have a guaranteed refund.
+  no-refund-promise: operator NotContains returned false
+  follows-policy: the answer promises a refund the policy does not allow

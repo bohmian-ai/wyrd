@@ -123,4 +123,4 @@ A dispatch is `pending`, `running`, `retrying`, `delivered`, or `failed`. Each o
 | `WYRD_SPEC_400_OPERATOR_CONNECTION_UNAVAILABLE` at declaration | No active connection has that name, or its auth scheme or origin differs from the Operator's | Create the connection first, and match `auth.scheme` and the origin |
 | The check failed but `dispatches` is empty | The verdict came from `verify`, or it was `inconclusive` | Only a `failed` verdict from `submit` or a schedule runs Operators |
 | A dispatch is `failed` | The webhook refused the request or was unreachable after retries | Read the dispatch's `error`, fix the receiver, and check the connection's token |
-| Nothing ran at all | The binding is inactive or its baseline is not ready | [Check the binding](/build-and-verify/verify/run-a-verification-and-inspect-its-evidence/#4-check-a-binding) |
+| Nothing ran at all | The binding is inactive or its baseline is not ready | [Check the account](/build-and-verify/verify/monitor-drift/#2-create-the-services-account) and the [baseline](/reference/verifier-card/#checks) |

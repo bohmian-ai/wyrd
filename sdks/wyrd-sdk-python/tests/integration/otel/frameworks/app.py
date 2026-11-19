@@ -10,7 +10,7 @@ the environment, as in a deployment, and the bundle path from
 A real process matters: OpenTelemetry installs one global provider per
 process, and Google ADK binds its tracer at import, so each setup gets its own.
 
-``SETUP`` is ``managed`` (``WyrdState.start_telemetry``) or ``owned`` (an
+``SETUP`` is ``managed`` (``WyrdState.configure``) or ``owned`` (an
 application ``TracerProvider`` with ``span_exporter`` and
 ``install_run_correlation``). ``SCENARIO`` is ``run`` (one tool-calling turn
 inside an enclosing span), ``edges`` (model and tool failures, a stream that
@@ -354,7 +354,7 @@ def main(framework: str, setup: str, scenario: str) -> None:
     url = f"http://127.0.0.1:{upstream.server_address[1]}"
     state = hydrated(Path(os.environ["WYRD_TEST_BUNDLE"]))
     if setup == "managed":
-        state.start_telemetry()
+        state.configure()
     else:
         from opentelemetry.sdk.trace import TracerProvider
         from opentelemetry.sdk.trace.export import BatchSpanProcessor

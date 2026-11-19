@@ -1,7 +1,7 @@
 ---
 id: TASK-002
 kind: implementation
-status: review
+status: implemented
 spec: SPEC-positioning
 spec_revision: 4
 requirements: [REQ-007, REQ-008, REQ-010, REQ-011, REQ-013, REQ-014, REQ-015, REQ-016, INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, AC-006, AC-007, AC-009, AC-010, AC-012, AC-013, AC-014, AC-015]

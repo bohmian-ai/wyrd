@@ -27,7 +27,6 @@ Wyrd provides the open-source building blocks for creating your own verification
 ## Wyrd
 
 The only real-time verification system built for your applications.  
-You built the system. How do you know it's behaving correctly?  
 Verifying application behavior shouldn't mean building your own infrastructure from scratch.  
 Every system has its own requirements, workflows, and definitions of correct behavior. But turning those expectations into repeatable checks often means stitching together evaluation frameworks, observability tools, custom scripts, and data pipelines.  
 Wyrd provides the open-source building blocks for creating your own verification systems.  

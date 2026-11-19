@@ -123,11 +123,11 @@ Each resource that stores a secret offers three separate actions under its exist
 
 | Resource | Renew encryption | Replace | Revoke |
 | --- | --- | --- | --- |
-| Operator connection | `POST /v1/operator-connections/{connection_id}/renew-encryption`, `wyrd operator-connection renew-encryption`, SDK `renew_encryption`, MCP `operator_connections.renew_encryption` | Update with a new credential | Disable |
-| Gateway managed secret | `POST /v1/admin/gateway/provider-credentials/{name}/renew-encryption`, `wyrd gateway credential renew-encryption`, MCP `gateway.renew_provider_credential_encryption` | Put the credential again | Revoke |
+| Operator connection | `POST /v1/operator-connections/{connection_id}/renew-encryption`, `wyrd operator-connection renew-encryption` | Update with a new credential | Disable |
+| Gateway managed secret | `POST /v1/admin/gateway/provider-credentials/{name}/renew-encryption`, `wyrd gateway credential renew-encryption` | Put the credential again | Revoke |
 | Human OIDC connection | `POST /v1/identity/oidc/connections/{id}/renew-encryption` | Stage, test, and activate a candidate | Delete the connection |
 | Trusted issuer | `POST /v1/admin/trusted-issuers/renew-encryption?issuer=`, `wyrd auth trusted-issuer renew-encryption` | Delete and add the issuer again | Delete the issuer |
-| Platform OIDC connection | `POST /platform/oidc/connection/renew-encryption`, Rust client `Platform::renew_oidc_encryption` | `PUT /platform/oidc/connection` | `DELETE /platform/oidc/connection` |
+| Platform OIDC connection | `POST /platform/oidc/connection/renew-encryption` | `PUT /platform/oidc/connection` | `DELETE /platform/oidc/connection` |
 
 A renewal reads the secret, reseals it outside any database transaction, and stores the result only if the resource still holds the secret it read. A renewal that races a replacement, revocation, or deletion loses with a `409` and the other change stands; a renewal never restores a revoked or deleted resource.
 

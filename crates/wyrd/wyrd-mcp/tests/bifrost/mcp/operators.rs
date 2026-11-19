@@ -1,8 +1,7 @@
 //! Tier-1 journey: an agent administers Operator connections over `/mcp`.
 //!
 //! A tenant administrator creates Slack, PagerDuty, and HTTP connections,
-//! lists, reads, and rotates them, renews a disabled one's encryption without
-//! re-enabling it, and disables and re-enables one through a
+//! lists, reads, and rotates them, and disables and re-enables one through a
 //! real `rmcp` client; no answer or refusal carries a secret. A writer keeps
 //! the read tools but is neither offered nor allowed the write tools, and
 //! another tenant's administrator can neither read nor mutate them.
@@ -200,19 +199,6 @@ mod pg_tests {
                 .await?,
         )?;
         assert_eq!(read["status"], "disabled");
-        let renewed = admin_client
-            .call_tool(call(
-                "operator_connections.renew_encryption",
-                json!({ "connection_id": id }),
-            )?)
-            .await?;
-        redacted(&renewed);
-        let renewed = structured(renewed)?;
-        assert_eq!(
-            (&renewed["connection_id"], &renewed["status"]),
-            (&json!(id), &json!("disabled")),
-            "renewal keeps the identity and does not re-enable"
-        );
         let enabled = admin_client
             .call_tool(call(
                 "operator_connections.update",
@@ -248,10 +234,6 @@ mod pg_tests {
                 "operator_connections.disable",
                 json!({ "connection_id": id }),
             ),
-            (
-                "operator_connections.renew_encryption",
-                json!({ "connection_id": id }),
-            ),
         ] {
             let refused = foreign_client.call_tool(call(tool, arguments)?).await;
             let rendered = match refused {
@@ -279,10 +261,6 @@ mod pg_tests {
         let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
         assert!(names.contains(&"operator_connections.list"), "{names:?}");
         assert!(!names.contains(&"operator_connections.create"), "{names:?}");
-        assert!(
-            !names.contains(&"operator_connections.renew_encryption"),
-            "{names:?}"
-        );
         let refused = writer_client
             .call_tool(call(
                 "operator_connections.create",

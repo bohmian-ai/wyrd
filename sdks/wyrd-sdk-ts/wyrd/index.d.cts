@@ -1061,15 +1061,6 @@ export declare class NativeOperatorConnections {
    * malformed ID or server refusal is returned in the result.
    */
   disable(id: string): Promise<NativeLifecycleResult>
-  /**
-   * Reseals one connection's unchanged secret under a fresh data key.
-   *
-   * # Errors
-   *
-   * Returns a napi error only when the view cannot be serialized; a
-   * malformed ID or server refusal is returned in the result.
-   */
-  renewEncryption(id: string): Promise<NativeLifecycleResult>
 }
 
 /** Tenant principal handle over the shared `wyrd_client` handle. */

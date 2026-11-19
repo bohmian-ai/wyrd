@@ -2044,31 +2044,6 @@ async fn renewing_platform_connection_encryption_keeps_its_sign_in() {
     );
     confidential_platform_sign_in(&srv, &provider).await;
 
-    // The public client handle renews the same way.
-    let client = wyrd_client::WyrdClient::with_config(wyrd_client::config::ClientConfig {
-        http: wyrd_client::transport::HttpConfig {
-            base_url: srv.base_url().expect("bound HTTP URL").to_owned(),
-            ..wyrd_client::transport::HttpConfig::default()
-        },
-        credential: Some(root.clone()),
-        ..wyrd_client::config::ClientConfig::default()
-    })
-    .expect("client builds");
-    let platform = wyrd_client::Platform::connect_with(&client)
-        .await
-        .expect("platform session exchanges");
-    let renewed = platform
-        .renew_oidc_encryption()
-        .await
-        .expect("the client renews");
-    assert_eq!(
-        serde_json::to_value(&renewed).expect("view serializes"),
-        configured,
-        "the client sees the same redacted connection"
-    );
-    assert_eq!(transit.requests("encrypt").await, 3, "resealed again");
-    confidential_platform_sign_in(&srv, &provider).await;
-
     // A key outage refuses the renewal and changes nothing.
     transit.set_available(false);
     let resp = renew().await.expect("renew route responds");
@@ -2080,7 +2055,7 @@ async fn renewing_platform_connection_encryption_keeps_its_sign_in() {
     );
     assert_eq!(
         transit.requests("encrypt").await,
-        3,
+        2,
         "the outage resealed nothing"
     );
     confidential_platform_sign_in(&srv, &provider).await;

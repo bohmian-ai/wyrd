@@ -59,9 +59,7 @@ mod pg_tests {
         }
     }
 
-    /// MCP gateway reads return the HTTP-configured redacted resources, a
-    /// managed credential's encryption renews over MCP and HTTP without
-    /// counting as a rotation,
+    /// MCP gateway reads return the HTTP-configured redacted resources,
     /// a composite apply commits its credentials and deployments together,
     /// redacted, while a refused one commits nothing,
     /// including a named deployment's model allowlist and access level; MCP
@@ -88,7 +86,7 @@ mod pg_tests {
     /// not return their expected problem or empty result; credentials remain
     /// after deletion; a composite apply repeats its secret, commits after a
     /// refusal, or differs from HTTP; or the reader is not denied reads,
-    /// writes, renewals, and applies with 403.
+    /// writes, and applies with 403.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires the Postgres-backed MCP journey lane"]
     async fn agent_administers_redacted_gateway_configuration() -> Result<(), McpJourneyError> {
@@ -216,28 +214,6 @@ mod pg_tests {
             serde_json::to_value(gateway.credential(&name).await?)?,
             rotated,
             "HTTP reads the same redacted managed view"
-        );
-        let renewed = client
-            .call_tool(
-                CallToolRequestParams::new("gateway.renew_provider_credential_encryption")
-                    .with_arguments(object(serde_json::json!({"name": "managed"}))?),
-            )
-            .await?;
-        assert!(
-            !serde_json::to_string(&renewed)?.contains(ROTATED),
-            "a renewal answer never repeats the provider key"
-        );
-        let renewed = structured(renewed)?;
-        assert_eq!(
-            (&renewed["state"], &renewed["rotated_at"]),
-            (&rotated["state"], &rotated["rotated_at"]),
-            "renewing encryption keeps the credential and is not a rotation"
-        );
-        let again =
-            serde_json::to_value(credential_admin.renew_credential_encryption(&name).await?)?;
-        assert_eq!(
-            again["rotated_at"], rotated["rotated_at"],
-            "HTTP renews the same way"
         );
         credential_admin.delete_credential(&name).await?;
 
@@ -410,15 +386,6 @@ mod pg_tests {
                 .await?,
         )?;
         assert_eq!(denied_write["status"], 403, "{denied_write}");
-        let denied_renewal = problem(
-            reader_client
-                .call_tool(
-                    CallToolRequestParams::new("gateway.renew_provider_credential_encryption")
-                        .with_arguments(object(serde_json::json!({"name": "primary"}))?),
-                )
-                .await?,
-        )?;
-        assert_eq!(denied_renewal["status"], 403, "{denied_renewal}");
         let denied_apply = problem(
             reader_client
                 .call_tool(

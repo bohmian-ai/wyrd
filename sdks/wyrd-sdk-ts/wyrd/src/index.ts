@@ -2085,23 +2085,6 @@ export class OperatorConnections {
   async disable(connectionId: string): Promise<OperatorConnectionView> {
     return lifecycleValue<OperatorConnectionView>(await this.#native.disable(connectionId));
   }
-
-  /**
-   * Reseal one connection's unchanged secret under a fresh data key; requires
-   * `operators:write`. The connection keeps its ID, status, and secret
-   * version, and a disabled connection stays disabled. This does not replace
-   * or revoke the credential at its provider: replace a leaked or expired
-   * secret with {@link OperatorConnections.update}.
-   *
-   * @param connectionId - The connection's UUID.
-   * @returns The connection's redacted view.
-   * @throws {@link WyrdError} for a malformed ID, an unknown connection, a
-   * concurrent change, an unavailable key, or a transport or authorization
-   * failure.
-   */
-  async renewEncryption(connectionId: string): Promise<OperatorConnectionView> {
-    return lifecycleValue<OperatorConnectionView>(await this.#native.renewEncryption(connectionId));
-  }
 }
 
 /**

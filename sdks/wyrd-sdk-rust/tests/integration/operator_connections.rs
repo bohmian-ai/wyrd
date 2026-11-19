@@ -55,7 +55,7 @@ async fn admin_with_slack(deployment: &Deployment) -> (OperatorConnections, Oper
 }
 
 /// The administrator creates Slack, `PagerDuty`, and HTTP connections, rotates
-/// a secret, disables one, renews its encryption, and re-enables it; a duplicate name is refused,
+/// a secret, and disables and re-enables one; a duplicate name is refused,
 /// and every view and refusal is redacted.
 ///
 /// # Panics
@@ -78,10 +78,6 @@ async fn admin_manages_redacted_connections() {
         .await
         .expect("secret rotates");
     let disabled = admin.disable(&slack_id).await.expect("connection disables");
-    let renewed = admin
-        .renew_encryption(&slack_id)
-        .await
-        .expect("encryption renews");
     let enabled = admin
         .update(
             &slack_id,
@@ -118,14 +114,9 @@ async fn admin_manages_redacted_connections() {
     let listed = admin.list().await.expect("connections list");
 
     assert_redacted(&(
-        &rotated, &disabled, &renewed, &enabled, &http, &pager, &duplicate, &listed,
+        &rotated, &disabled, &enabled, &http, &pager, &duplicate, &listed,
     ));
     assert_eq!(rotated.connection_id, slack_id);
-    assert_eq!(
-        (renewed.connection_id, renewed.status),
-        (slack_id, OperatorConnectionStatus::Disabled),
-        "renewal keeps the identity and does not re-enable"
-    );
     assert_eq!(
         [disabled.status, enabled.status],
         [
@@ -222,7 +213,7 @@ async fn other_tenant_sees_nothing() {
 }
 
 /// A caller holding only `operators:read` reads a connection exactly as the
-/// administrator does but cannot disable it or renew its encryption.
+/// administrator does but cannot disable it.
 ///
 /// # Panics
 /// Panics when a read fails or differs, or the disable succeeds or is
@@ -250,12 +241,7 @@ async fn reader_cannot_disable_a_connection() {
         .disable(&slack_id)
         .await
         .expect_err("a reader cannot disable");
-    let renewal = reader
-        .renew_encryption(&slack_id)
-        .await
-        .expect_err("a reader cannot renew encryption");
 
     assert_eq!(refused.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
-    assert_eq!(renewal.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
     deployment.shutdown().await;
 }

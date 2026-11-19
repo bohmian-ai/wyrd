@@ -29,7 +29,6 @@ const test = serverTest().extend<{ connections: OperatorConnections; slack: stri
 test("admin manages redacted connections", async ({ connections, slack }) => {
   const rotated = await connections.update(slack, { provider: "slack", bot_token: SECRETS[1] });
   const disabled = await connections.disable(slack);
-  const renewed = await connections.renewEncryption(slack);
   const enabled = await connections.update(slack, { provider: "slack", status: "active" });
   const http = await connections.create({
     provider: "http",
@@ -39,9 +38,8 @@ test("admin manages redacted connections", async ({ connections, slack }) => {
   });
   const pager = await connections.create({ provider: "pager_duty", name: "ops-pager", integration_key: SECRETS[0] });
 
-  expectRedacted([rotated, disabled, renewed, enabled, http, pager, await connections.list()]);
+  expectRedacted([rotated, disabled, enabled, http, pager, await connections.list()]);
   expect([disabled.status, enabled.status]).toEqual(["disabled", "active"]);
-  expect([renewed.connection_id, renewed.status]).toEqual([slack, "disabled"]);
   expect(http).toMatchObject({ origin: "https://hooks.example.com", auth: { scheme: "header", name: "X-Api-Key" } });
 });
 
@@ -71,5 +69,4 @@ test("reader cannot disable a connection", async ({ server, connections, slack }
 
   expect(await reader.get(slack)).toEqual(await connections.get(slack));
   await expect(reader.disable(slack)).rejects.toMatchObject({ code: "WYRD_PERMISSION_403_DENIED_RBAC" });
-  await expect(reader.renewEncryption(slack)).rejects.toMatchObject({ code: "WYRD_PERMISSION_403_DENIED_RBAC" });
 });

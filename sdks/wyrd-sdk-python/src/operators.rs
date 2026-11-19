@@ -44,8 +44,7 @@ pub(crate) fn to_python<T: Serialize>(py: Python<'_>, value: &T) -> WyrdPyResult
     Ok(json_to_pyobject(py, &serde_json::to_value(value)?)?)
 }
 
-/// Python-facing Operator connection handle: create, list, get, update,
-/// disable, and encryption renewal.
+/// Python-facing Operator connection handle: create, list, get, update, disable.
 ///
 /// Every call blocks the calling thread with the GIL released and returns the
 /// server's redacted connection view; no call ever returns a secret.
@@ -178,20 +177,6 @@ impl OperatorConnections {
     fn disable(&self, py: Python<'_>, connection_id: &str) -> WyrdPyResult<Py<PyAny>> {
         let id: OperatorConnectionId = decode("connection_id", Value::from(connection_id))?;
         let view = crate::trace::block_on(py, self.handle(py)?.disable(&id))?;
-        to_python(py, &view)
-    }
-
-    /// Reseal one connection's unchanged secret under a fresh data key; its
-    /// identity, status, and secret version are kept.
-    ///
-    /// # Errors
-    /// Raises `WyrdError` when `connection_id` is not a `UUIDv7`, the caller
-    /// lacks `operators:write`, the connection is unknown, a concurrent write
-    /// changed it first, the secret cannot be opened or resealed, or the
-    /// request fails.
-    fn renew_encryption(&self, py: Python<'_>, connection_id: &str) -> WyrdPyResult<Py<PyAny>> {
-        let id: OperatorConnectionId = decode("connection_id", Value::from(connection_id))?;
-        let view = crate::trace::block_on(py, self.handle(py)?.renew_encryption(&id))?;
         to_python(py, &view)
     }
 }

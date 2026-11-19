@@ -36,7 +36,6 @@ def slack(connections: OperatorConnections) -> str:
 def test_admin_manages_redacted_connections(connections: OperatorConnections, slack: str) -> None:
     rotated = connections.update(slack, {"provider": "slack", "bot_token": SECRETS[1]})
     disabled = connections.disable(slack)
-    renewed = connections.renew_encryption(slack)
     enabled = connections.update(slack, {"provider": "slack", "status": "active"})
     http = connections.create(
         {
@@ -46,9 +45,8 @@ def test_admin_manages_redacted_connections(connections: OperatorConnections, sl
             "auth": {"scheme": "header", "name": "X-Api-Key", "value": SECRETS[0]},
         }
     )
-    assert_redacted([rotated, disabled, renewed, enabled, http, connections.list()])
+    assert_redacted([rotated, disabled, enabled, http, connections.list()])
     assert (disabled["status"], enabled["status"]) == ("disabled", "active")
-    assert (renewed["connection_id"], renewed["status"]) == (slack, "disabled")
     assert http.get("origin") == "https://hooks.example.com"
     assert http.get("auth") == {"scheme": "header", "name": "X-Api-Key"}
 
@@ -74,9 +72,6 @@ def test_reader_cannot_disable_a_connection(
     assert reader.get(slack) == connections.get(slack)
     with pytest.raises(WyrdError) as raised:
         reader.disable(slack)
-    assert raised.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
-    with pytest.raises(WyrdError) as raised:
-        reader.renew_encryption(slack)
     assert raised.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
 
 

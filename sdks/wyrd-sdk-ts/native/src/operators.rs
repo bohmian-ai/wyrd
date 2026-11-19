@@ -203,26 +203,4 @@ impl NativeOperatorConnections {
             NativeLifecycleResult::outcome(result)
         })
     }
-
-    /// Reseals one connection's unchanged secret under a fresh data key.
-    ///
-    /// # Errors
-    ///
-    /// Returns a napi error only when the view cannot be serialized; a
-    /// malformed ID or server refusal is returned in the result.
-    #[napi]
-    pub fn renew_encryption<'env>(
-        &self,
-        env: &'env Env,
-        id: String,
-    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
-        let connections = self.connections.clone();
-        crate::trace::spawn(env, async move {
-            let result = match connection_id(id) {
-                Ok(id) => connections.renew_encryption(&id).await,
-                Err(error) => Err(error),
-            };
-            NativeLifecycleResult::outcome(result)
-        })
-    }
 }

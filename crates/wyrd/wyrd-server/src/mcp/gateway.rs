@@ -72,9 +72,6 @@ pub(super) const PUT_CAPTURE: &str = "gateway.put_capture_policy";
 /// Wire name of the terminal provider credential revocation.
 pub(super) const REVOKE_CREDENTIAL: &str = "gateway.revoke_provider_credential";
 
-/// Wire name of the managed provider credential encryption renewal.
-pub(super) const RENEW_CREDENTIAL: &str = "gateway.renew_provider_credential_encryption";
-
 /// Wire name of the unreferenced provider credential deletion.
 pub(super) const DELETE_CREDENTIAL: &str = "gateway.delete_provider_credential";
 
@@ -89,7 +86,7 @@ pub(super) const DELETE_GOVERNANCE: &str = "gateway.delete_governance_policy";
 
 /// Every gateway tool in catalog order: reads, replacements, then destructive
 /// operations.
-pub(super) const TOOLS: [&str; 19] = [
+pub(super) const TOOLS: [&str; 18] = [
     LIST_CREDENTIALS,
     LIST_DEPLOYMENTS,
     GET_FALLBACK,
@@ -104,7 +101,6 @@ pub(super) const TOOLS: [&str; 19] = [
     PUT_GOVERNANCE,
     PUT_CAPTURE,
     REVOKE_CREDENTIAL,
-    RENEW_CREDENTIAL,
     DELETE_CREDENTIAL,
     DELETE_DEPLOYMENT,
     DELETE_FALLBACK,
@@ -309,16 +305,6 @@ fn gated() -> Vec<(Tool, Permission)> {
             Permission::gateway_write(),
         ),
         (
-            RENEW_CREDENTIAL,
-            "Renew gateway provider credential encryption",
-            "Reseal an active managed provider credential's unchanged key under a fresh data \
-             key and return its redacted view; deployments keep using it by name. Refuses a \
-             revoked or non-managed credential. Requires gateway write permission.",
-            literal(NAME_INPUT),
-            Effect::Replace,
-            Permission::gateway_write(),
-        ),
-        (
             DELETE_CREDENTIAL,
             "Delete gateway provider credential",
             "Delete a provider credential no deployment references; an absent name succeeds. \
@@ -473,12 +459,6 @@ impl WyrdMcpHandler {
             REVOKE_CREDENTIAL => Ok(structured(async {
                 gateway
                     .revoke_credential(caller, &credential_name(arguments)?)
-                    .await
-            })
-            .await),
-            RENEW_CREDENTIAL => Ok(structured(async {
-                gateway
-                    .renew_credential_encryption(caller, &credential_name(arguments)?)
                     .await
             })
             .await),

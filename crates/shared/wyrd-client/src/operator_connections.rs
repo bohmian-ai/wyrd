@@ -174,6 +174,9 @@ impl OperatorConnections {
     /// This does not replace or revoke the credential at its provider; use
     /// [`Self::update`] with a new secret for a leaked or expired one.
     ///
+    /// Renewal ships through HTTP and the CLI only, so it is gated on
+    /// `internal`, which no first-class SDK enables.
+    ///
     /// # Arguments
     /// * `connection_id` - The connection whose secret is resealed.
     ///
@@ -181,6 +184,7 @@ impl OperatorConnections {
     /// Returns a Wyrd error when the caller lacks `operators:write`, the
     /// connection is unknown, a concurrent write changed it first, the stored
     /// secret cannot be opened or resealed, or the request fails.
+    #[cfg(feature = "internal")]
     pub async fn renew_encryption(
         &self,
         connection_id: &OperatorConnectionId,

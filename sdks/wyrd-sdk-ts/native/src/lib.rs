@@ -321,6 +321,9 @@ pub struct NativeTableConfigResult {
 /// running work nobody will read.
 #[napi]
 pub struct NativeAbort {
+    /// Whether the signal aborted. Starts `false` and only ever becomes
+    /// `true`; every call given this signal watches its own receiver, so one
+    /// abort stops all of them, including calls started after it.
     aborted: tokio::sync::watch::Sender<bool>,
 }
 
@@ -343,6 +346,7 @@ impl NativeAbort {
 }
 
 impl Default for NativeAbort {
+    /// A fresh signal not yet aborted, as [`NativeAbort::new`] gives.
     fn default() -> Self {
         Self::new()
     }

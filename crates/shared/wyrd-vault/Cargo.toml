@@ -7,9 +7,10 @@ rust-version = { workspace = true }
 repository = { workspace = true }
 authors = { workspace = true }
 publish = false
-description = "Bounded, screened, and pinned HashiCorp Vault KV v2 reader shared by the gateway and Operator key reads."
+description = "Bounded, screened, and pinned HashiCorp Vault client: the KV v2 reader the gateway uses and the Transit wrap/unwrap the stored-secret facade uses."
 
 [dependencies]
+base64 = { workspace = true }
 reqwest = { workspace = true }
 secrecy = { workspace = true }
 serde_json = { workspace = true }
@@ -17,6 +18,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["net", "time"] }
 url = { workspace = true }
 wyrd-tls = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

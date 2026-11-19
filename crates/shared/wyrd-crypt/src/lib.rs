@@ -30,6 +30,18 @@ impl SecretKey {
         SecretKey(bytes)
     }
 
+    /// Generate a fresh AES-256 key from the operating system's
+    /// cryptographic random source.
+    ///
+    /// Envelope owners call this once per stored value to obtain an
+    /// independent data-encryption key; the bytes are zeroized on drop.
+    #[must_use]
+    pub fn generate() -> SecretKey {
+        let mut bytes = [0_u8; 32];
+        OsRng.fill_bytes(&mut bytes);
+        SecretKey(bytes)
+    }
+
     /// Borrow raw key bytes.
     #[must_use]
     pub fn expose(&self) -> &[u8; 32] {
@@ -363,9 +375,7 @@ pub struct Envelope {
 /// # Errors
 /// Returns [`CryptError::Encrypt`] when either layer fails.
 pub fn seal(kek: &SecretKey, plaintext: &[u8], context: &[&str]) -> Result<Envelope, CryptError> {
-    let mut dek = [0_u8; 32];
-    OsRng.fill_bytes(&mut dek);
-    let dek = SecretKey(dek);
+    let dek = SecretKey::generate();
     Ok(Envelope {
         secret: encrypt_aad(&dek, plaintext, &canonical_aad(SECRET_DOMAIN, context))?,
         wrapped_dek: encrypt_aad(kek, dek.expose(), &canonical_aad(DEK_DOMAIN, context))?,
@@ -431,7 +441,12 @@ fn unwrap_dek(
 
 /// Encode `domain` and `context` unambiguously: each part as a u32 big-endian
 /// length followed by its bytes.
-fn canonical_aad(domain: &str, context: &[&str]) -> Vec<u8> {
+///
+/// Envelope owners authenticate this encoding as AES-GCM associated data, or
+/// hand it to a remote wrapping provider as its authenticated context, so the
+/// same identity always produces the same bytes and no two part lists collide.
+#[must_use]
+pub fn canonical_aad(domain: &str, context: &[&str]) -> Vec<u8> {
     let mut out = Vec::new();
     for part in std::iter::once(&domain).chain(context) {
         let len = u32::try_from(part.len()).unwrap_or(u32::MAX);

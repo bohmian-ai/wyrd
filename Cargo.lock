@@ -11393,6 +11393,7 @@ dependencies = [
 name = "wyrd-vault"
 version = "0.4.2"
 dependencies = [
+ "base64 0.22.1",
  "reqwest 0.13.4",
  "secrecy",
  "serde_json",
@@ -11402,6 +11403,7 @@ dependencies = [
  "wiremock",
  "workspace-hack",
  "wyrd-tls",
+ "zeroize",
 ]
 
 [[package]]

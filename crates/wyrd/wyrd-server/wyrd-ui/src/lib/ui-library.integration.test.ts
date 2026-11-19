@@ -4,7 +4,7 @@
  * `@wyrd/testing` over repository Postgres, through the SDK, the MCP endpoint,
  * and the BFF's real browser session. Nothing here mocks the server.
  */
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
@@ -47,6 +47,7 @@ import {
   type Executor,
   type QueryResult,
   type WireRequest,
+  executionDiscoveryQuery,
   facetsQuery,
   statQueries,
   traceOverviewReads
@@ -462,12 +463,12 @@ test('TASK-004: Authorized Observe across hosts', async ({ server, seeded }) => 
 type Read = { readonly sql: string; readonly params: readonly unknown[] };
 
 /** The audited original read `id`, test-only reference SQL, rebound to the fixture's range and `bucket`. */
-function originalRead(id: string, bucket: string): Read {
+function originalRead(id: string, bucket: string, range: { from: string; to: string } = RANGE): Read {
   const audit = JSON.parse(readFileSync(join(process.cwd(), '../../../../changes/active/verification-workflow-ui/design/query-audit/queries.json'), 'utf8')) as { queries: (Read & { id: string })[] };
   const found = audit.queries.find((each) => each.id === id);
   if (!found) throw new Error(`no audited query ${id}`);
   const rest = found.params.slice(2).map((param, index) => (index === 0 && /^\d+ \w+$/.test(String(param)) ? bucket : param));
-  return { sql: found.sql, params: [RANGE.from, RANGE.to, ...rest] };
+  return { sql: found.sql, params: [range.from, range.to, ...rest] };
 }
 
 /** Run a page's reads together, as the page does, timing the batch from submission to its last terminal. */
@@ -511,6 +512,14 @@ async function executedWork(executor: Executor, reads: readonly Read[]) {
 /** The value and its counts for facet `index` of a grouping-set facet read over `facets` columns. */
 const facetRows = (result: QueryResult, index: number, facets: number, counts = 1) =>
   result.rows.filter((row) => Number(row[0]) === index).map((row) => [row[1 + index], ...row.slice(1 + facets, 1 + facets + counts)]);
+
+/** Add bundle comparisons to the diagnostic report, kept only where the run names a file. */
+function recordDiagnostics(bundles: Record<string, unknown>) {
+  const path = process.env.WYRD_QUERY_DIAGNOSTICS;
+  if (!path) return;
+  const kept = existsSync(path) ? (JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>) : {};
+  writeFileSync(path, JSON.stringify({ ...kept, ...bundles }, null, 2));
+}
 
 /** Rows as sorted JSON, compared as a multiset. */
 const multiset = (rows: readonly (readonly unknown[])[]) => rows.map((row) => JSON.stringify(row)).sort();
@@ -570,7 +579,7 @@ test('consolidated Observe bundles return the original results; EXPLAIN ANALYZE 
   });
   report.statstrip = { original: { ...(await executedWork(run, statOriginal)), elapsed_ms: Math.round(statBefore.elapsed) }, consolidated: { ...(await executedWork(run, statNew)), elapsed_ms: Math.round(statAfter.elapsed) } };
   // The plan comparison is diagnostic evidence, kept only where the run names a file.
-  if (process.env.WYRD_QUERY_DIAGNOSTICS) writeFileSync(process.env.WYRD_QUERY_DIAGNOSTICS, JSON.stringify(report, null, 2));
+  recordDiagnostics(report);
 });
 
 test('TASK-004: Metric windows count every recorded value', async ({ server }) => {
@@ -762,16 +771,17 @@ test('card and prompt components use authorized host reads and actions', async (
   // A principal without card permission sees each component denied and no dependent read.
   const runs: WireRequest[][] = [];
   const queryOnly = nodeExecutor(WyrdClient.connect({ credential: server.scopedApiKey('ui_cards_denied', ['bifrost_query:read']) }));
-  const denied: { executor: Executor } = { executor: { run: ((requests, signal) => (runs.push([...requests]), queryOnly.run(requests, signal))) as Executor['run'] } };
+  // Each loader stands alone here: a page's panels share one context, and with it one read of each Card.
+  const denied = (): { executor: Executor } => ({ executor: { run: ((requests, signal) => (runs.push([...requests]), queryOnly.run(requests, signal))) as Executor['run'] } });
   for (const loaded of await Promise.all([
-    loadCardInventory({}, denied),
-    loadCardFacts({ cardRef: agent }, denied),
-    loadRelationshipList({ cardRef: agent }, denied),
-    loadArtifactTable({ cardRef: seeded.model }, denied),
-    loadPromptMessages({ cardRef: prompt }, denied),
-    loadPromptVariables({ cardRef: prompt }, denied),
-    loadUsedBy({ cardRef: prompt }, denied),
-    loadVersionDiff({ cardRef: prompt }, denied)
+    loadCardInventory({}, denied()),
+    loadCardFacts({ cardRef: agent }, denied()),
+    loadRelationshipList({ cardRef: agent }, denied()),
+    loadArtifactTable({ cardRef: seeded.model }, denied()),
+    loadPromptMessages({ cardRef: prompt }, denied()),
+    loadPromptVariables({ cardRef: prompt }, denied()),
+    loadUsedBy({ cardRef: prompt }, denied()),
+    loadVersionDiff({ cardRef: prompt }, denied())
   ]))
     expect(loaded.result).toMatchObject({ state: 'denied', problem: { code: DENIED } });
   expect(runs.every((requests) => requests.length === 1)).toBe(true);
@@ -897,8 +907,8 @@ test('an exact Verifier definition and where it runs load through every authoriz
   // A principal without card permission sees both denied after one read each.
   const runs: WireRequest[][] = [];
   const queryOnly = nodeExecutor(WyrdClient.connect({ credential: server.scopedApiKey('ui_verifier_denied', ['bifrost_query:read']) }));
-  const denied: { executor: Executor } = { executor: { run: ((requests, signal) => (runs.push([...requests]), queryOnly.run(requests, signal))) as Executor['run'] } };
-  for (const loaded of [await loadVerifierDefinition({ cardRef: review }, denied), await loadRunsOn({ cardRef: review }, denied)])
+  const denied = (): { executor: Executor } => ({ executor: { run: ((requests, signal) => (runs.push([...requests]), queryOnly.run(requests, signal))) as Executor['run'] } });
+  for (const loaded of [await loadVerifierDefinition({ cardRef: review }, denied()), await loadRunsOn({ cardRef: review }, denied())])
     expect(loaded.result).toMatchObject({ state: 'denied', problem: { code: DENIED } });
   expect(runs.map((requests) => requests.length)).toEqual([1, 1]);
 
@@ -1444,6 +1454,31 @@ judged('Verify lists executions with and without a recorded result as one author
   }
   const verifierCount = new Set(listed.map((each) => each.verifier_card_uid)).size;
   expect([discovered.charts.verifierSeries.top.length, discovered.charts.verifierSeries.more]).toEqual([Math.min(3, verifierCount), Math.max(0, verifierCount - 3)]);
+
+  // The discovery read returns what the original seven facet and two chart reads did; EXPLAIN ANALYZE compares their work.
+  const discoveryColumns = ['status', 'verdict', 'verifier_card_uid', 'service_name', 'subject_name', 'run_id', 'group_id'];
+  const discovery = executionDiscoveryQuery({ signal: 'executions', facets: discoveryColumns }, range);
+  const discoveryBucket = String(discovery.params.find((param) => /^\d+ \w+$/.test(String(param))));
+  const verifyOriginal = [...discoveryColumns.map((column) => `verify-facet-${column}`), 'verify-chart-verdict', 'verify-chart-verifier'].map((id) => originalRead(id, discoveryBucket, range));
+  const [verifyBefore, verifyAfter] = [await readAll(nodeExecutor(client), verifyOriginal), await readAll(nodeExecutor(client), [discovery])];
+  const of = (facet: number, names: readonly string[]) =>
+    verifyAfter.values[0].rows.filter((row) => Number(row[0]) === facet).map((row) => names.map((name) => row[verifyAfter.values[0].columns.findIndex((column) => column.name === name)]));
+  discoveryColumns.forEach((column, index) => expect(multiset(of(index, [`f${index}`, 'n'])), column).toEqual(multiset(verifyBefore.values[index].rows)));
+  expect(multiset(of(7, ['at', 'verdict', 'n']))).toEqual(multiset(verifyBefore.values[7].rows));
+  // The top three Verifiers keep their rows; the rest fold into one row per bucket.
+  const kept = of(8, ['at', 'verifier', 'n']).filter((row) => row[1] !== null);
+  const folded = new Map(of(8, ['at', 'verifier', 'n']).filter((row) => row[1] === null).map((row) => [String(row[0]), Number(row[2])]));
+  const namedUids = new Set(kept.map((row) => row[1]));
+  expect(multiset(kept)).toEqual(multiset(verifyBefore.values[8].rows.filter((row) => namedUids.has(row[1]))));
+  const others = new Map<string, number>();
+  for (const row of verifyBefore.values[8].rows.filter((each) => !namedUids.has(each[1]))) others.set(String(row[0]), (others.get(String(row[0])) ?? 0) + Number(row[2]));
+  expect(folded).toEqual(others);
+  recordDiagnostics({
+    verify: {
+      original: { ...(await executedWork(nodeExecutor(client), verifyOriginal)), elapsed_ms: Math.round(verifyBefore.elapsed) },
+      consolidated: { ...(await executedWork(nodeExecutor(client), [discovery])), elapsed_ms: Math.round(verifyAfter.elapsed) }
+    }
+  });
 
   // Unfinished work: under contended memory each claim returns a queued execution to the queue, so it is listed once, unfinished,
   // with no verdict.

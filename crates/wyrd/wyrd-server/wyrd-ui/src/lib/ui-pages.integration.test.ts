@@ -1725,6 +1725,7 @@ judged('the Verify dashboard filters, groups, brushes, pages, opens an execution
     // Results in Verify on the exact Verifier Card page opens the list for that Verifier version only.
     await page.goto(`${bff.url}/t/${tenant}/cards/detail?kind=Verifier&name=answer-check&version=1.0.0`);
     await page.getByRole('link', { name: 'Results in Verify' }).click();
+    await page.waitForURL((url) => url.pathname === `/t/${tenant}/verify` && url.searchParams.has('where'));
     await expect.poll(async () => (await where.textContent())?.trim()).toBe(`verifier_card_uid = '${assistant.answerCheck.uid}'`);
     await expect.poll(() => rows.count()).toBe(1);
     await expect.poll(() => rows.first().textContent()).toContain('answer-check');

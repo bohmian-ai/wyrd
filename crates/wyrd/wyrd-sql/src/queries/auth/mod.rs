@@ -80,7 +80,7 @@ pub use service_accounts::{
     system_principal_id, tenant_admin_principal_id, touch_api_key_last_used, workload_family,
 };
 pub use trusted_issuers::{
-    TrustedIssuerWrite, delete_trusted_issuer, insert_trusted_issuer, renew_trusted_issuer_secret,
+    TrustedIssuerWrite, delete_trusted_issuer, insert_trusted_issuer, swap_trusted_issuer_secret,
     trusted_issuer_by_url, trusted_issuer_exists, trusted_issuers_for_tenant,
     upsert_trusted_issuer,
 };

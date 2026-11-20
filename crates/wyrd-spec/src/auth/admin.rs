@@ -99,6 +99,18 @@ pub struct CreateTrustedIssuerRequest {
     pub jwks_ttl_secs: Option<u64>,
 }
 
+/// `PUT /v1/admin/trusted-issuers/client-secret` body: the replacement client
+/// secret for a `SecretBasic` or `SecretPost` issuer.
+///
+/// A [`SecretBearer`]: redacted in `Debug` and write-only in the schema.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ReplaceTrustedIssuerSecretRequest {
+    /// The new client secret the issuer accepts.
+    pub client_secret: SecretBearer,
+}
+
 /// Redacted issuer projection. Never carries the client secret.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]

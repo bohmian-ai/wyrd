@@ -889,6 +889,31 @@ pub async fn renew_trusted_issuer_secret(
     .await
 }
 
+/// Seal `secret` as the replacement client secret of a stored trusted issuer,
+/// bound to its tenant, issuer URL, client id, and method. The old envelope is
+/// never opened, so a replacement succeeds when it can no longer decrypt.
+/// Callers run this outside any transaction, then swap on the observed bytes.
+///
+/// # Errors
+/// Returns [`IssuerSealError::KmsMissing`] without a facade and
+/// [`IssuerSealError::Encrypt`] when sealing fails.
+pub async fn seal_trusted_issuer_replacement(
+    tenant: DataTenantId,
+    row: &TrustedIssuerRow,
+    secret: &[u8],
+    kms: Option<&WyrdKms>,
+) -> Result<Vec<u8>, IssuerSealError> {
+    ClientSecretOwner {
+        scope: SecretScope::Tenant(tenant),
+        purpose: SecretPurpose::AuthTrustedIssuer,
+        issuer_url: &row.issuer_url,
+        client_id: &row.client_id,
+        connection_id: None,
+    }
+    .seal_secret(&row.client_auth, secret, kms)
+    .await
+}
+
 /// Encode a [`WorkloadBinding`] into a [`WorkloadBindingWrite`] for boot seeding.
 #[must_use]
 pub fn binding_write_from_binding(binding: &WorkloadBinding) -> WorkloadBindingWrite {

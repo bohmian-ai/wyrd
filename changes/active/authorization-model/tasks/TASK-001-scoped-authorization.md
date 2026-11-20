@@ -615,15 +615,69 @@ Evidence (in progress):
 - Revoked principal's issued bearer refused within the bound: CLI `principal_journey`,
   `platform_admin_e2e`, `identity_e2e` through `wyrd_testing::principal::within_propagation`.
   The identity lane exited 0 (31/31 and the BFF/CLI/SDK slices) at `d74c8ec61`.
-- Not yet proven here:
-  - interrupted confirmation allowing only within five minutes, and renewal not
-    extending it
-  - streams stopping when authority becomes unusable
-  - the refusal code for unavailable authority, as distinct from missing permission
-  - ceiling/delegation intersections and frozen accepted work
-  - the issued-claims inspection
-
-  Each remains FAIL until proven.
+- Interrupted confirmation, against real PostgreSQL — PASS:
+  `authority::pg_tests::an_outage_serves_only_within_the_bound_then_refuses_as_unavailable`.
+  - With the process pool closed, a confirmed snapshot still serves inside
+    `FRESHNESS_BOUND`.
+  - Past the bound it refuses as `WyrdError::AuthorizationUnavailable`
+    (`WYRD_AUTH_503_AUTHORIZATION_UNAVAILABLE`), and so does a tenant the process never
+    loaded. Neither case reads as a missing permission.
+  - Requests never renew the bound:
+    `authority::tests::requests_never_extend_an_unconfirmed_snapshot`. Only an
+    installed reload confirms again. Renewal and failed refresh go through the same
+    `acquire`/`reload`, which renews only on an installed load.
+  - These passed on their first run: existing-behavior proof, not RED (`b40433fe0`,
+    `31dafab0c`).
+- Streams stop before later output when authority is lost — PASS.
+  - Journey `principal_roles::an_open_stream_stops_once_its_grant_is_removed` (Rust SDK
+    → `WyrdTestServer`):
+    - A Service holding only `workload` opens a 100M-row Bifrost query stream and
+      reads its first batch.
+    - The administrator unbinds `workload`, and a fresh request observes the loss
+      within `AUTHORITY_PROPAGATION`.
+    - The stream then fails without a terminal and before delivering all rows.
+      Batches already delivered are not retracted.
+  - RED: before the fix, the stream delivered all 100,000,000 rows and a success
+    terminal ("the stream fails instead of completing").
+  - Fix site: `query::service::stream_query`, the one owner for HTTP, gRPC, MCP and
+    scheduled readers.
+    - It binds the admitted stream to `wyrd_auth::authority::StreamAuthority`. Before
+      each frame is released, `revalidate` reacquires the tenant snapshot from memory,
+      or does the sanctioned one-statement reload on invalidation or expiry.
+    - The stream stops with `QueryVisibilityUnavailable` when authority is
+      unavailable. It stops with `QueryForbidden` when the caller's subject or actor
+      grants, or its credential state, changed (`TenantAuthority::unchanged_for`). A
+      widening also stops it.
+    - Work run under accepted authority (`executed_by`) keeps its frozen limit and is
+      not rebound.
+  - Unit test: `authority::tests::a_stream_keeps_only_unchanged_authority` (an
+    unrelated revision keeps the stream; narrowing, widening or a removed account stop
+    it).
+  - GREEN: the journey plus `principal_roles`/`query_bifrost`, 21/21. Server
+    integration 436/436, server lib 678/678 (`56f7d81d7`).
+  - Hot-path waits: none added when warm (a mutex map lookup per frame). On a known
+    newer revision or expired freshness, one sanctioned authority reload, the same one
+    request authorization already uses.
+  - TDD: test first, RED observed.
+- Ceiling and delegation intersections: existing proof, PASS.
+  - `wyrd-runtime` `permission::tests::ceilings_only_restrict_current_grants` covers
+    absent/empty ceilings and family/exact narrowing.
+  - `exchange_api_key::pg_tests::delegation_preserves_roots_and_exact_intersections`
+    covers overlap, disjoint, rootless and refused cases.
+  - `exchange_api_key::pg_tests::an_exchange_names_subject_and_actor_and_carries_only_the_intersection`.
+  - Rust SDK `gateway_inference::user_through_service_gateway_delegation_keeps_the_intersection`.
+- Frozen accepted work: existing proof, PASS.
+  `pg_verification_runtime::accepted_authority_survives_account_and_context_changes`.
+  The actor loses its role, family restriction and key; a restarted runtime reclaims
+  and completes with byte-identical stored authority and the original owner.
+- Issued claims: existing proof, PASS.
+  - `AccessTokenClaims` is `deny_unknown_fields`, with no roles or grants.
+  - `wyrd-auth-verify` `tests::token_verifier_refuses_other_versions_and_removed_claims`
+    refuses `permissions`/`roles`.
+  - `tests::token_verifier_carries_identity_and_ceiling_but_no_authority` (2/2).
+  - Issuer root and delegation shape: `wyrd-auth-issue`
+    `issue_access_token_signs_exact_root_scope_and_refuses_inconsistent_access` and
+    `issue_access_token_delegated_*`.
 
 ## Verification and handoff
 

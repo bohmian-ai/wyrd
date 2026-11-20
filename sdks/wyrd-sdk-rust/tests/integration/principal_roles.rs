@@ -936,3 +936,180 @@ async fn a_family_bound_viewer_queries_only_that_familys_records() {
     );
     deployment.shutdown().await;
 }
+
+/// A group binding, a custom role and an exact-version binding each bound a
+/// signed-in User's Card reads alike. Carol reads the `code-review` family
+/// through a group holding viewer there, and loses it at her next request
+/// once removed from the group. Dave holds a custom Card-reading role at
+/// version 1.0.0 only, so he reads that version and not 2.0.0, published
+/// after the grant. Neither reads the unrelated family.
+///
+/// # Panics
+/// Panics when a step fails or an outcome differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn group_custom_and_exact_version_bindings_scope_reads() {
+    use wyrd_ai::auth::{CreateGroupRequest, Operation, PutRoleRequest};
+    use wyrd_ai::cards::{CardKind, CardSelector, ListCardsRequest};
+    use wyrd_spec::auth::CardPermissionScope;
+    use wyrd_spec::ids::CardName;
+
+    let deployment = Deployment::start().await;
+    let cards = deployment.cards().await;
+    let first = declare(&cards, "cards/repository_declaration/code-review.yaml").await;
+    declare(&cards, "cards/repository_declaration/unrelated.yaml").await;
+    let family = CardName::new("code-review").expect("valid name");
+    let version_one = crate::support::declared(&first, "code-review");
+    let uid_one = version_one
+        .uid
+        .clone()
+        .expect("the server resolves the UID");
+    let admin = Principals::connect_with(&deployment.admin())
+        .await
+        .expect("handle connects");
+    // Every User is created with one grant at a family no Card belongs to.
+    let elsewhere = || ScopedRoleAssignment {
+        role: "viewer".to_owned(),
+        scope: PermissionScope::Card(CardPermissionScope::family(
+            CardKind::Verifier,
+            CardName::new("no-such-family").expect("valid name"),
+        )),
+    };
+    let user = async |name: &str| {
+        let password = format!("{name} long password");
+        let created = admin
+            .create_user(&CreateUserRequest {
+                username: name.to_owned(),
+                password: SecretBearer::new(password.clone()),
+                assignments: vec![elsewhere()],
+            })
+            .await
+            .unwrap_or_else(|error| panic!("{name} is created: {error}"));
+        (
+            created.principal_id,
+            signed_in(&deployment, name, &password).await,
+        )
+    };
+    let verifiers = async |signed: &SignedIn| {
+        Cards::connect_with(&signed.client)
+            .await
+            .expect("the saved login connects")
+            .list(ListCardsRequest {
+                kind: Some(CardKind::Verifier),
+                name: None,
+                version_range: None,
+                status: None,
+                filter: None,
+                include_prerelease: false,
+                limit: None,
+                cursor: None,
+            })
+            .await
+            .expect("Verifiers list")
+            .items
+            .into_iter()
+            .map(|card| card.name.as_str().to_owned())
+            .collect::<Vec<_>>()
+    };
+
+    // Carol reads the family through her group, and not after leaving it.
+    let (carol_id, carol) = user("carol").await;
+    let group = admin
+        .create_group(&CreateGroupRequest {
+            name: "payments-readers".to_owned(),
+        })
+        .await
+        .expect("the group is created");
+    admin
+        .add_group_member(&group.id, &carol_id)
+        .await
+        .expect("Carol joins the group");
+    admin
+        .bind(&CreateRoleBindingRequest {
+            subject: BindingSubject::Group { id: group.id },
+            role: "viewer".to_owned(),
+            scope: PermissionScope::Card(CardPermissionScope::family(
+                CardKind::Verifier,
+                family.clone(),
+            )),
+        })
+        .await
+        .expect("the group is bound");
+    assert_eq!(verifiers(&carol).await, ["code-review"]);
+    let held = admin.access(&carol_id).await.expect("access reads");
+    assert!(
+        held.grants
+            .iter()
+            .any(|grant| matches!(&grant.source, GrantSource::Group { name, .. } if name == "payments-readers")),
+        "{held:?}"
+    );
+    admin
+        .remove_group_member(&group.id, &carol_id)
+        .await
+        .expect("Carol leaves the group");
+    assert!(verifiers(&carol).await.is_empty());
+
+    // Dave's custom role at version 1.0.0 reaches neither 2.0.0 nor the
+    // unrelated family.
+    let (dave_id, dave) = user("dave").await;
+    admin
+        .put_role(
+            "payments_reader",
+            &PutRoleRequest {
+                operations: vec![
+                    serde_json::from_value::<Operation>(
+                        json!({"resource": "cards", "action": "read"}),
+                    )
+                    .expect("operation parses"),
+                ],
+            },
+        )
+        .await
+        .expect("the custom role is stored");
+    admin
+        .bind(&CreateRoleBindingRequest {
+            subject: BindingSubject::Principal {
+                id: dave_id,
+                kind: PrincipalKindTag::User,
+            },
+            role: "payments_reader".to_owned(),
+            scope: PermissionScope::Card(CardPermissionScope::version(
+                CardKind::Verifier,
+                family.clone(),
+                uid_one,
+            )),
+        })
+        .await
+        .expect("Dave is bound at version 1.0.0");
+    let later = tempfile::tempdir().expect("directory creates");
+    let source = std::fs::read_to_string(fixture("cards/repository_declaration/code-review.yaml"))
+        .expect("fixture reads");
+    std::fs::write(
+        later.path().join("code-review.yaml"),
+        source.replace("version: 1.0.0", "version: 2.0.0"),
+    )
+    .expect("writes");
+    let second = cards
+        .declare_from_path(later.path().join("code-review.yaml"))
+        .await
+        .expect("version 2.0.0 registers");
+    let version_two = crate::support::declared(&second, "code-review");
+    let own = Cards::connect_with(&dave.client)
+        .await
+        .expect("Dave connects");
+    own.get(CardSelector::Exact(version_one))
+        .await
+        .expect("Dave reads version 1.0.0");
+    for hidden in [
+        CardSelector::Exact(version_two),
+        CardSelector::Named {
+            kind: CardKind::Verifier,
+            name: CardName::new("unrelated-check").expect("valid name"),
+            version: None,
+        },
+    ] {
+        let refused = own.get(hidden).await.expect_err("hidden");
+        assert_eq!(refused.code(), "WYRD_REGISTRY_404_CARD_NOT_FOUND");
+    }
+    deployment.shutdown().await;
+}

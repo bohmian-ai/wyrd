@@ -681,6 +681,36 @@ mod tests {
         assert!(cache.cached(tenant).is_none(), "expired freshness refuses");
     }
 
+    /// While confirmation is interrupted, a snapshot serves only until the
+    /// freshness bound since its last confirmation: serving requests never
+    /// extends it, and only an installed reload confirms it again.
+    ///
+    /// # Panics
+    /// Panics when a request extends the bound or a reload does not renew it.
+    #[test]
+    fn requests_never_extend_an_unconfirmed_snapshot() {
+        let (tenant, user) = (DataTenantId::new_v7(), Uuid::now_v7());
+        let cache = AuthorityCache::default();
+        cache.install(
+            tenant,
+            TenantAuthority::compile(state(1, user)).expect("compiles"),
+        );
+        cache.age(tenant, FRESHNESS_BOUND - Duration::from_secs(1));
+        for _ in 0..3 {
+            assert!(cache.cached(tenant).is_some(), "inside the bound it serves");
+        }
+        cache.age(tenant, Duration::from_secs(2));
+        assert!(
+            cache.cached(tenant).is_none(),
+            "serving requests did not renew the confirmation"
+        );
+        cache.install(
+            tenant,
+            TenantAuthority::compile(state(1, user)).expect("compiles"),
+        );
+        assert!(cache.cached(tenant).is_some(), "a reload confirms it again");
+    }
+
     /// A token naming a credential the snapshot does not hold predates it
     /// only when issued no earlier than its load, so the cache reloads once
     /// for a key committed after the load; an older token's unknown

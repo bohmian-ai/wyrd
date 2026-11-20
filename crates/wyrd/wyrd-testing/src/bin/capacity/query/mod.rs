@@ -37,9 +37,10 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use wyrd_client::config::ClientConfig;
 use wyrd_client::{GlobalConfig, Platform, WyrdClient};
+use wyrd_testing::capacity::Population;
 use wyrd_testing::experiment::{
     Criterion, Declaration, Derive, Direction, Engine, HISTORY_DIRECTORY, Level, Metric, Mode, Op,
-    Reason, Record, Status, Step, Verdict, WINDOW_SECONDS,
+    Reason, Record, Role, Status, Step, Verdict, WINDOW_SECONDS,
 };
 use wyrd_testing::release_server::{LocalServer, SERVER_URL};
 
@@ -900,6 +901,10 @@ fn isolated_metrics() -> Vec<Metric> {
             ));
         }
     }
+    metrics.extend(Population::root_metrics(
+        Role::Driver,
+        &[run::OTLP_DRIVER_ROOT],
+    ));
     metrics
 }
 

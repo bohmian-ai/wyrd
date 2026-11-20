@@ -16,8 +16,9 @@ use arrow::datatypes::{DataType, Int64Type};
 use num_traits::ToPrimitive;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use wyrd_benchmark::Observation;
 use wyrd_client::bifrost::{BifrostClientError, BifrostOptions, TableConfig};
-use wyrd_client::transport::trace::{benchmark_headers, with_benchmark_labels};
+use wyrd_client::transport::trace::{benchmark_cohort, benchmark_headers, with_benchmark_labels};
 use wyrd_client::{Bifrost, WyrdClient};
 use wyrd_spec::vala::api::{BifrostQueryRequest, QueryTerminalOutcome};
 use wyrd_testing::release_server::LocalServer;
@@ -295,28 +296,46 @@ impl Sender {
                 Ok(0)
             }
             Self::Spans(otlp, fixture) => {
+                let mut observation = Observation::start(OTLP_EXPORT_ROOT, benchmark_cohort);
+                let started = observation.now();
                 let body = fixture.request(first, last);
                 let encoded = body.encoded_len();
+                observation.since("build", started);
+                let started = observation.now();
                 let token = otlp.token().await?;
+                observation.since("token", started);
+                let request = authorized(body, &token)?;
+                let started = observation.now();
                 let response = TraceServiceClient::new(otlp.channel.clone())
-                    .export(authorized(body, &token)?)
-                    .await
-                    .map_err(|status| Refused::otlp(&status))?;
+                    .export(request)
+                    .await;
+                observation.since("export", started);
+                observation.settle(&response);
                 let rejected = response
+                    .map_err(|status| Refused::otlp(&status))?
                     .into_inner()
                     .partial_success
                     .map_or(0, |partial| partial.rejected_spans);
                 Ok(accepted(encoded, rejected)?)
             }
             Self::Logs(otlp, fixture) => {
+                let mut observation = Observation::start(OTLP_EXPORT_ROOT, benchmark_cohort);
+                let started = observation.now();
                 let body = fixture.request(first, last);
                 let encoded = body.encoded_len();
+                observation.since("build", started);
+                let started = observation.now();
                 let token = otlp.token().await?;
+                observation.since("token", started);
+                let request = authorized(body, &token)?;
+                let started = observation.now();
                 let response = LogsServiceClient::new(otlp.channel.clone())
-                    .export(authorized(body, &token)?)
-                    .await
-                    .map_err(|status| Refused::otlp(&status))?;
+                    .export(request)
+                    .await;
+                observation.since("export", started);
+                observation.settle(&response);
                 let rejected = response
+                    .map_err(|status| Refused::otlp(&status))?
                     .into_inner()
                     .partial_success
                     .map_or(0, |partial| partial.rejected_log_records);
@@ -422,6 +441,18 @@ impl Sender {
         join(tasks).await
     }
 }
+
+/// The driver's benchmark root of one OTLP export attempt, from building its
+/// request until its decoded response or refusal.
+pub const OTLP_EXPORT_ROOT: &str = "client.otlp.export";
+
+/// [`OTLP_EXPORT_ROOT`] with its disjoint components, as a driver root a
+/// write window diagnoses: `build` makes the fixture's request and sizes it,
+/// `token` reads the cached bearer token, and `export` is the gRPC call from
+/// handing the request to the channel until its decoded response, so it
+/// holds encoding, transmission, the server's handling, and response delivery.
+pub const OTLP_DRIVER_ROOT: (&str, bool, &[&str]) =
+    (OTLP_EXPORT_ROOT, false, &["build", "token", "export"]);
 
 /// The delay the server advertises for a busy ingest refusal (`Retry-After`
 /// and `retry-after-ms`), used once the native client's own bounded busy

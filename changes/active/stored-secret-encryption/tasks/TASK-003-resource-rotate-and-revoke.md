@@ -155,7 +155,10 @@ in these entries; test variant owners/surfaces under the same scenarios.
      - Operator: `card_lifecycle::pg_tests::cli_manages_redacted_operator_connections`.
      - Gateway: `gateway_server_journey::gateway_commands_manage_redacted_tenant_configuration`.
      - Trusted issuer: `wyrd-cli/tests/secret_sources.rs::trusted_issuer_renew_encryption_sends_no_secret`. RED: "unrecognized subcommand 'renew-encryption'" (behavioral). GREEN: `secret_sources::` 5/5.
-     - Human and platform connections have no CLI surface; they renew over HTTP.
+     - Historical evidence records human and platform connection renewal over
+       HTTP only. This does not establish the CLI coverage required by REQ-008
+       and scenario 5, or approve a surface exception. That coverage remains
+       unproven; revision 2's deployment-maintenance changes do not close it.
    - CLI command: `mise exec -- cargo build --locked -p wyrd-cli -p wyrd-server --bins`, then `PG` + `cargo nextest run --locked -p wyrd-cli --test cli -E '<selector>'`.
    - Docs: `docs/src/content/docs/reference/stored-secret-encryption.md` § "Renew, replace, or revoke a stored secret" separates encryption renewal, replacement, Wyrd revoke, and upstream revocation.
 

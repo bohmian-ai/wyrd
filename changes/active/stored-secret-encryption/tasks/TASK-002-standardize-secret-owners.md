@@ -68,8 +68,11 @@ Delete direct sealing, unversioned readers, Operator raw-key/Vault KV ownership,
 and old configuration/env projections once callers move. Update fixtures and
 schema comments. Existing maintenance must use the common crypto path; retain
 its safety behavior while Task 4 consolidates orchestration and exposes actions.
-Do not remove maintenance safeguards in anticipation of that task. Keep the
-shared Vault KV reader for external Gateway references and all excluded crypto.
+Do not remove maintenance safeguards in anticipation of that task. This task
+and its evidence remain pinned to revision 1; revision-2 Task 004 owns removal
+of automatic boot/Operator rewrap scheduling and the affected test expectations.
+Keep the shared Vault KV reader for external Gateway references and all excluded
+crypto.
 
 Remote crypto for existing writes must run outside held DB locks/transactions
 and use existing version/byte fences for atomic commits. This includes the

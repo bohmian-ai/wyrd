@@ -3,152 +3,178 @@ id: TASK-004
 kind: implementation
 status: proposed
 spec: SPEC-stored-secret-encryption
-spec_revision: 1
+spec_revision: 2
 requirements: [REQ-002, REQ-004, REQ-005, REQ-008, REQ-009, REQ-010, REQ-011, REQ-012]
 depends_on: [TASK-002]
 ---
 
-# Deliver deployment wrapping-key rotation and recovery
+# Deliver explicit deployment wrapping-key rotation and recovery
 
 ## Outcome and flow
 
-A deployment administrator configures a permitted replacement wrapping key,
-rolls out the approved active/retained configuration, and starts maintenance.
-Existing owner rows → common facade rewrap or fresh-DEK recovery → fenced
-owner updates → existing runtime refresh and per-pass reporting. Stored secrets
-remain attached to their resource identities, and interrupted work resumes.
-The workflow makes safe key retention and deployment-wide disable effects clear.
+A deployment administrator configures and rolls out a permitted replacement,
+then explicitly runs planned rotation or compromise recovery through HTTP or
+CLI. Activation alone leaves existing envelopes untouched. Existing owner rows
+→ common facade rewrap or fresh-DEK renewal → fenced owner commits → existing
+runtime refresh → per-pass counts and redacted failures. Repeating the operation
+resumes unfinished work without changing resource identities or client references.
 
-Use the [approved spec](../spec.md), design
-[What rotation versions mean and what Wyrd loads](../design/notes.md#what-rotation-versions-mean-and-what-wyrd-loads),
-[Compromise and revocation boundary](../design/notes.md#compromise-and-revocation-boundary),
-and [Deployment wrapping-key operation](../design/admin-journey.md#deployment-wrapping-key-operation).
-Task 2 supplies every owner row/consumer using the common facade and config.
-Task 3 is not a dependency: this operates on the deployment, not a selected
-tenant resource, and does not need that task's new action implementation.
+Use the [approved revision-2 spec](../spec.md) and finalized
+[lifecycle design](../design/task-004-lifecycle.md), especially Recommended
+contract and Connected recovery flow and limits. The spec defines behavior;
+this task owns implementation scenarios and evidence.
 
-## Existing owner and scope
+Task 002 supplies common envelopes and trusted binding metadata in all five
+current stores: human connections, workload issuers, platform OIDC, Gateway
+managed credentials, and Operator connections. It also supplies consuming readers,
+runtime preparation, configuration, and fenced update owners. Task 001 supplies
+the facade and backend clients through that dependency. Task 003's resource
+actions are independent; maintenance does not require them. The integrated
+incident runbook may reference them for credential replacement.
 
-Use the provider APIs behind the existing facade/adapters, reusing installed
-HTTP clients and credential/signing code. Do not add a provider SDK or other
-external dependency where those APIs and existing mechanisms suffice.
+## Existing owner and implementation scope
 
-This task changes stored-secret wrapping-key lifecycle. Reuse Task 1 provider
-clients and existing credential acquisition/refresh; extend wrapping adapters
-only for the approved key-lifecycle operations. It does not add federation,
-identity provisioning, new token-acquisition methods, IAM policy administration,
-or a general cloud-management SDK. A compromised provider identity is repaired
-through deployment administration, not a new authentication feature here.
-If an existing adapter cannot perform a named key-lifecycle operation, identify
-that exact gap and any proposed dependency cost for the maintainer before
-extending scope.
+Extend the existing auth `SealedSecretRewrap` and Operator maintenance workflows
+into one explicit platform-owned pass across their current stores. Reuse scans,
+budgets, cancellation, CAS/version fences, reports, and runtime refresh. Do not
+add parallel rotation orchestration around leaf calls. The facade's `rewrap`
+and `renew` already provide the two crypto operations; `is_current` compares
+logical references, not native provider material generations. No provider-admin
+adapter operation, new authentication method, dependency, or key registry is
+needed. Keep provision/activate/disable outside this platform maintenance action.
 
-Consolidate the complete workflow of auth `SealedSecretRewrap` and Operator
-`OperatorKeys` maintenance/verification runner: discover affected rows/tenants,
-perform bounded cancellable work, compare-and-swap, report failures/counts,
-retry/resume, and trigger existing runtime preparation/invalidation. Reuse the
-existing SQL swap/version fences and named platform cross-tenant capabilities.
-Task 2 has replaced crypto/key retrieval; remove duplicate rotation orchestration
-here without adding a second loop around its leaf helpers.
+Remove automatic auth/Gateway rewrap from server boot and automatic Operator
+rewrap scheduling beside delivery. Preserve boot's independent missing-KMS
+refusal, delivery scheduling, runtime invalidation, and owner safety checks.
+Carry affected production/test-server boot callers, maintenance callers, tests,
+fixtures, configuration references, and docs together. Task 002's revision-1
+evidence remains historical; this task owns expectations changed by revision 2.
 
-Reuse the complete pass behavior, not its transaction scope unchanged:
-`OperatorKeys::rewrap_tenant` currently locks a batch and then awaits key reads.
-Prepare remote wrapping work outside those locks/transactions and commit through
-the existing SQL owner with observed-envelope and authority fences. Preserve
-bounded work, cancellation, and retry; no new lease or coordination framework
-is implied. Task 2 must already preserve this boundary during its crypto cutover.
+Prepare remote crypto outside held database locks/transactions and commit using
+observed-envelope and authority fences at each SQL owner. Existing maintenance
+scanning/reporting is reusable, but unchanged automatic scheduling or a batch
+transaction held across remote operations cannot deliver the approved flow.
+No new migration, table, lease framework, global completion barrier, cache TTL,
+or durable incident/mode lock is authorized.
 
-Extend existing platform administration for start/progress and the approved
-disable workflow, under platform authority. Carry the affected platform client
-projections, typed contracts/errors, permissions, exports/stubs and generated
-outputs with those actions. Never make a tenant writer a cloud key administrator.
-Replacement provisioning remains deployment setup; activating a configured
-replacement respects controlled rollout and role configuration authority.
-Do not add a job/progress table, recovery service, global completion barrier,
-new cache TTL, or arbitrary key/endpoint selector.
+Expose one typed platform-authorized maintenance action on HTTP and CLI, with
+an explicit routine/recovery choice and destination taken from active trusted
+configuration. Carry server contracts/errors, permission checks, asynchronous
+permission auditing through the existing outbox, CLI transport and output, and
+affected generated projections. Use existing platform authority; tenant write
+permission is insufficient. Do not expose SDK or MCP methods, a disable endpoint,
+an activation endpoint, a background job, or a status-polling API. The action
+returns the bounded pass report without waiting for asynchronous audit custody.
 
-Update operator rotation/recovery documentation and runbooks with exact usable
-backend instructions, including what is a provider version versus a new logical
-key, what Wyrd loads, how access is retained, and how to read pass counts.
-Describe identity-access remediation as an operator responsibility and backup
-retention separately from rewrapping; do not implement new IAM/token flows or
-claim provider tokens are revoked by key maintenance.
+Update setup/rotation/recovery docs and runbooks with the two complete admin
+procedures, administrative mode-isolation preconditions, key retention/restore,
+credential issuer remediation, and truthful pass-count interpretation. Reconcile
+the owning security posture and operations guidance with REQ-010/011 where
+needed; do not change unrelated authority. Provider-specific instructions explain
+deployment setup/access denial, never different Wyrd semantics.
 
 ## Ordered acceptance scenarios and evidence
 
-Record actual assertions, focused commands, RED/GREEN and limitations here.
+Add actual assertion locations, focused commands, observed RED failures, GREEN
+results, and limitations to these entries. New test names/selectors remain
+implementation-owned and must be recorded before RED.
 
-1. **Rewrap one existing owner value** — REQ-004, REQ-010–011.
-   Given a Task 2-created credential under an old allowed key and a configured
-   replacement, start routine maintenance through the platform-authorized owner.
-   Its row changes to the replacement reference/wrapped DEK while plaintext,
-   DEK, payload ciphertext and resource identity are retained; actual downstream
-   use succeeds. Begin with real-server/Postgres integration for the smallest
-   owner, consuming the facade from Task 1. RED is absent common maintenance,
-   not an isolated direct call to the facade's already-proven rewrap.
-2. **Complete a whole-store routine pass** — REQ-005, REQ-010–012.
-   Create values for each existing owner across tenants and platform scope,
-   roll writers to the permitted active replacement retaining old reads, and
-   start maintenance. Verify actual continued use and accurate per-pass current/
-   changed/remaining observations and failed-owner diagnostics. Exercise GCP/
-   Transit same-name versions and AWS opaque historical material at their adapter
-   boundaries without inventing portable material-version IDs; separately prove
-   logical-key replacement updates persisted references. Server/SQL integration
-   plus backend tests assert the complete consuming transition. RED is uncovered
-   owners or duplicate/incorrect maintenance, not missing new per-tenant keys.
-   Native-rotation checks demonstrate retained decryption and new wrapping;
-   do not require discovery or retirement counts for opaque AWS material
-   generations. Whole-store reference-transition counts concern the configured
-   logical-key replacement, using the common envelope's trusted key reference.
-3. **Recover from compromised wrapping material** — REQ-002 as exercised by
-   REQ-010, REQ-011. Given affected values and a permitted safe replacement,
-   invoke compromise recovery rather than routine rewrap. Assert fresh DEKs and
-   payload ciphertext across owners, stable resource identities/values, and
-   successful actual use. Demonstrate that routine rewrap alone retains the DEK
-   and therefore is not the recovery mode. Integration covers resource updates;
-   facade tests alone cannot prove the deployment action selected the right mode.
-   RED is absent recovery mode or use of rewrap where fresh protection is required.
-4. **Resume safely across interruption and races** — REQ-008–010.
-   Interrupt a bounded pass, restart it from stored state, deny one required key,
-   and race a credential replacement/revocation with a prepared update. Observe
-   resumable remaining work, redacted failures, preserved concurrent changes and
-   authority, no partial envelope, and existing cache refresh. Real Postgres/
-   server integration uses deterministic interruption/race controls. Counts are
-   pass observations, not a global acknowledgement or proof that backups are safe.
-   RED is unsafe/missing consolidated resumption or fencing; retain already-correct
-   maintenance cases as regression evidence without rewriting their semantics.
-5. **Retain recovery access and contain deliberately** — REQ-005, REQ-009,
-   REQ-011–012. Exercise live old-key reads during rollout and isolated restore
-   with retained key access, then loss/denial of a required key. Use fails closed
-   without generating substitutes. A Wyrd-initiated shared-key disable is platform
-   authorized, clearly deployment-wide, and triggers existing invalidation;
-   direct provider disable refuses subsequent provider calls but does not notify
-   Wyrd or erase prepared keys. Verify those runtime boundaries without promising
-   cancellation of admitted work. Review the retirement/runbook dependency proof
-   for live/cached/backup references; ordinary disable must not destroy recovery
-   keys. Integration and runbook/source proof cover their respective effects.
+1. **Activation does not move stored secrets** — REQ-004–005, REQ-010.
+   Given real Task-002-created envelopes under an old permitted reference,
+   configure a replacement as active, retain old reads, restart through the
+   production/test-server boot path, and allow Operator delivery maintenance
+   opportunities. Existing envelopes remain byte-identical, new writes use the
+   replacement, and actual auth/Gateway/Operator consumption still succeeds.
+   Removing automatic transitions must preserve boot refusal when stored
+   secrets exist without required KMS configuration. Server/Postgres integration
+   covers both startup callers and the Operator runner with deterministic
+   synchronization. Expected RED is automatic envelope mutation, not failure of
+   an isolated facade test.
+2. **Explicit routine pass moves one existing value** — REQ-008–010.
+   With an old envelope and configured active replacement, a platform-authorized
+   administrator invokes routine maintenance through HTTP and the CLI. Assert
+   the stored reference/wrapped DEK changes while DEK, payload, plaintext and
+   resource identity remain unchanged; actual downstream use succeeds. The
+   response returns pass counts and contains no secret material. Tenant-only or
+   unauthenticated callers are refused without row mutation. Real-server/Postgres
+   journeys exercise the smallest owner first and both shipped surfaces.
+   Expected RED is missing explicit action/CLI consumption or platform authority.
+3. **Whole-store pass covers every current owner** — REQ-005, REQ-010–012.
+   Create common envelopes across multiple tenants and platform scope in all
+   five stores, complete writer rollout, and repeat explicit bounded routine
+   passes. Assert every eligible owner can transition, actual consuming use
+   succeeds, and current/changed/remaining observations plus redacted failed-owner
+   diagnostics match observed rows, including values left by the work bound.
+   Use platform HTTP/CLI real-server journeys and SQL integration. Reuse backend
+   adapter proof for native rotation and retained decryption; do not invent
+   portable native-version inventory or retirement counts. Expected RED is
+   omitted owners, incorrect bounded traversal/counts, or missing runtime refresh.
+4. **Recovery renews exposed data keys** — REQ-002, REQ-004, REQ-010–011.
+   Given envelopes across the same owners/scopes and independently provisioned
+   safe material under a fresh logical destination, complete rollout and select
+   recovery. Assert each older envelope receives a fresh DEK/nonce/payload
+   ciphertext, keeps its value/resource identity, opens through its actual
+   consuming owner, and refreshes prepared runtime material. Compare with
+   scenario 2's retained DEK to prove mode selection reaches the facade correctly.
+   Include an incident discovered after routine rewrap to an earlier destination:
+   activate another fresh destination and prove those envelopes are renewed too.
+   HTTP/CLI plus server/Postgres integration owns this proof. Expected RED is
+   missing recovery selection, skipped affected owners, or using rewrap for
+   recovery. Runbook/source review verifies fresh-destination and mode-isolation
+   preconditions without inventing an incident lock.
+5. **Repeat after interruption, denial, or concurrent change** — REQ-008–010.
+   Interrupt recovery after some real commits; restart and repeat the same mode
+   and destination. Already transitioned envelopes remain byte-identical; old
+   ones are renewed. Deny an old key and observe redacted remaining/failure
+   reports with committed state intact. Race prepared routine/recovery updates
+   against replacement and revocation: stale writes lose their fences, preserve
+   the winning envelope and authority, never re-enable a resource, and remain
+   safely retryable where work is still required. Server/Postgres integration
+   uses deterministic barriers and proves downstream use/refusal and existing
+   cache behavior. Expected RED is unsafe resumption, false completion, lost
+   changes, or bypassed authority; no global acknowledgement is expected.
+6. **Contain and restore through deployment administration** — REQ-005,
+   REQ-009, REQ-011–012.
+   Given old-key dependencies, remove a reference from trusted configuration and
+   replace affected processes; subsequent attempts to open it refuse without
+   fallback. With retained key access, an isolated restore can use the recovered
+   credentials. With access denied, renewal fails without mutation; documented
+   recovery restores controlled read access or replaces the actual credential
+   through its owner. Integration proves refusal/restore boundaries; source and
+   runbook review prove the procedure accounts for live/prepared/backup
+   dependencies and stops processes when immediate containment is required.
+   External key-service denial alone must not be described as cache erasure.
+   There is no Wyrd disable action or promise to cancel admitted work. Expected
+   RED is fallback, substitute-key generation, broken restore, or documentation
+   still directing administrators to the removed action.
 
 ## Verification and handoff
 
-Use `wyrd-auth`/server maintenance PG owners, SQL swap integration, platform
-administration real-server journeys, and the journey targets for affected
-platform client projections. Start with focused tests under the actual package's
-existing nextest runner and repository Postgres setup; record actual selectors
-before RED.
-Existing environment-owning lanes include `mise run test:platform:journey`,
-`mise run test:operators:integration`, and `mise run test:sql`; broader identity/
-Gateway/language journeys run on the integrated candidate as needed to prove
-continued consuming use. Backend boundaries reuse Task 1's real adapters and
-test service setup; identify local protocol versus live-provider evidence.
+Use server maintenance/boot and SQL PG integration owners, existing platform
+administration real-server journeys for HTTP, and CLI tests exercising the actual
+command/transport/report path against `WyrdTestServer` and repository Postgres.
+Add maintenance journey coverage to existing runner selection where needed so
+these scenarios are selected, rather than creating unreferenced fixtures or
+disconnected client/parser tests.
 
-Run affected owner/projection tests, codegen and boundary checks, Rust and changed
-language format/lint/type/declaration checks, and `mise run docs:check` /
-`mise run check:examples` where applicable. External IO belongs in maintenance
-and preparation. If hot-path code changes, list every added/moved wait and
-its authority. Benchmarks are not assigned by this task and require an explicit
-maintainer request for the current change.
+Existing environment-owning runners are `mise run test:platform:journey`,
+`mise run test:operators:integration`, and `mise run test:sql`. The platform
+runner currently selects server `platform_admin_e2e` in the `integration` target;
+the Operator runner selects connection/delivery PG modules with `test-support`.
+Record exact focused nextest commands for each new test before its RED run;
+this plan names no existing individual tests. Use `mise run test:cli:journey`
+for the CLI surface and relevant boot/module regression lanes. Backend boundaries
+reuse Task 001/002's adapter and live-provider evidence, clearly distinguishing
+local protocol tests from live runs.
 
-Integrated change review closes the four spec journeys across these four tasks,
-with full required language/owner lanes, rather than treating isolated
-provider tests as delivered proof. No cloud credentials, benchmark
-results, runtime success, or independent security audit are claimed by this plan.
+Run affected owner/projection checks, `mise run fmt`, `mise run lints`,
+`mise run codegen:check`, `mise run check:deps`, `mise run check:tenant-isolation`,
+and `mise run docs:check`; use `mise run check:examples` if examples change.
+No Python/TypeScript API expansion is assigned. External crypto IO belongs in
+control/maintenance/preparation. If hot-path code changes, enumerate every
+added/moved external wait and its sanctioned authority. Benchmarks require an
+explicit maintainer request for the current change and are not assigned here.
+
+Integrated change review closes the four spec journeys with affected
+surface/owner lanes. This task's planning does not claim runtime success,
+cloud experiments, benchmark results, or an independent security audit.

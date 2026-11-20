@@ -2,8 +2,11 @@
 
 Status: finalized
 
-Finalized at the maintainer's explicit request. This locks the design direction;
-it does not approve a specification, implementation tasks, or production changes.
+The maintainer approved the revised lifecycle design and corresponding spec/
+task revisions on 2026-11-19. [Spec revision 2](../spec.md) records that approval;
+[task 004 lifecycle](task-004-lifecycle.md) explains the rationale. Task 004 owns
+explicit maintenance and removal of automatic rewrap. Unaffected decisions and
+revision-1 implementation evidence remain settled.
 
 ## Problem
 
@@ -130,8 +133,8 @@ to a new memory or file key.
 
 Vault KV is a raw-secret store and is not equivalent to Transit: the finalized
 remote wrapping backend is Transit. The superseded KV-only setup proposal has
-been removed. Exact provider configuration/provisioning contracts still need to
-be fixed before specification approval.
+been removed. The approved spec and common typed configuration now define provider
+configuration/provisioning boundaries.
 
 ### One credential write and read
 
@@ -182,8 +185,8 @@ constructed per request.
 Future secret owners add a typed identity/purpose and call this facade. They do
 not introduce a new key source or separate crypto helper. This is a reusable
 capability, not automatic discovery of future database columns or a new generic
-secret registry. SDKs project resource operations; they do not receive server
-DEKs, KEKs, or plaintext through a decryption endpoint.
+secret registry. SDKs never receive server DEKs, KEKs, or plaintext through a
+decryption endpoint; this packet exposes admin actions only through HTTP/CLI.
 
 ### What rotation versions mean and what Wyrd loads
 
@@ -243,16 +246,21 @@ DEK cache, new TTL policy, or new propagation/completion protocol.
 Changing to a different logical key is separate from native rotation. Example:
 `wyrd-secrets` to `wyrd-secrets-replacement`. Publish the replacement as readable,
 then activate it for writes across replicas while retaining the original
-reference for reads. A background pass changes the stored wrapped DEKs and
-logical references through CAS. Drop the old reference and retire its key only
+reference for reads. An explicitly invoked routine maintenance pass changes
+the stored wrapped DEKs and logical references through CAS; activation and
+startup do not rewrite existing envelopes. Drop the old reference and retire its key only
 after live/cached/backup dependencies are resolved. Unlike native rotation,
 this requires a configuration rollout and persisted-reference changes.
 
 ### Rotation, failure, and performance
 
-New writes use the active deployment KEK version. Background maintenance rewraps
-DEKs under the new version, preserving payload ciphertext and racing safely
-with credential replacement through existing version/CAS fences. The portable
+New writes use the active deployment KEK. Explicit routine maintenance moves
+DEKs to a different active logical reference, preserving payload ciphertext and
+racing safely with credential replacement through existing version/CAS fences.
+There is no automatic envelope rewrap at boot or beside Operator delivery.
+Compromise recovery instead renews every older-reference envelope under a fresh,
+never-reused destination with independent safe wrapping material; see the
+[lifecycle flow and administrative preconditions](task-004-lifecycle.md). The portable
 operation can unwrap then wrap; native provider rewrap is an optimization,
 not a different lifecycle. Routine rotation is distinct from replacing a
 provider credential after exposure.
@@ -297,7 +305,7 @@ KEK, and cached plaintext, are also accounted for.
 - Routine KEK rotation: new wraps use new key material; old wrapped DEKs remain
   readable while old material is retained. Native rotation alone does not
   rewrite stored ciphertext or repair an exposed DEK.
-- Retirement of an old KEK: background unwrap/rewrap every affected DEK under
+- Retirement of an old KEK: explicitly invoke unwrap/rewrap of affected DEKs under
   the replacement KEK, preserve payload ciphertext, use CAS/version fencing,
   and prove live/cached/backup references are safe before disabling/destroying
   the old key. AWS rotation retains historical material inside one logical KMS
@@ -339,9 +347,10 @@ Verified repository reuse and gaps:
 - [wyrd-crypt](../../../../crates/shared/wyrd-crypt/src/lib.rs): existing
   `Envelope`, `seal`, `open`, `rewrap`, direct AAD operations, zeroizing key type,
   and length-prefixed context. Reuse these instead of inventing cryptography.
-- [OperatorKeys](../../../../crates/wyrd/wyrd-server/src/components/operators/keys.rs):
-  tenant/owner/version binding, bounded rotation, and fenced updates exist;
-  raw KEK retrieval and Operator-only ownership must be replaced.
+- [OperatorSecrets](../../../../crates/wyrd/wyrd-server/src/components/operators/secrets.rs):
+  the current common-facade consumer retains tenant/owner/version binding,
+  bounded maintenance, and fenced updates; Task 004 replaces its automatic
+  maintenance scheduling with explicit passes.
 - [Auth resolvers](../../../../crates/wyrd/wyrd-auth/src/pg_resolvers.rs) and
   [Gateway managed secrets](../../../../crates/wyrd/wyrd-gateway/src/managed.rs)
   currently use direct deployment sealing. They must adopt the common envelope.
@@ -368,7 +377,7 @@ fixtures, schemas, setup/deployment docs, and the parked Operator guide together
 The maintainer has aligned with one deployment wrapping key, fresh tenant-bound
 DEKs per secret, all backends behind one facade, all current/future secret owners,
 no shipped-data migration, and simple Rotate/Revoke operations with stable client
-references. This is design alignment; no approved specification exists.
+references. These decisions are recorded in the approved spec.
 Direct deployment sealing, mandatory Vault, permanent tenant-wide DEKs, and
 extra key hierarchies are superseded alternatives. The maintainer conditionally
 requested both encryption renewal and credential replacement to cover leaked
@@ -378,20 +387,20 @@ selected-secret rotation.
 
 ## Standards conflicts
 
-[Security posture](../../../../architecture/wyrd-security-posture.md) limits
-sealing to auth/Gateway and requires tenant isolation.
-[Operator design](../../../../architecture/wyrd-design.md) prescribes its own
-Vault KV/raw-KEK owner. Revise those authorities through an approved spec before
-implementation. Keep [operations](../../../../architecture/operations/deployment-and-release.md)
-configuration authority and recovery rules. The unshipped-schema exception was
-explicitly supplied by the maintainer; the spec must name any initial schema
-changes. No authority or production files have changed.
+Revision 1 authorized replacing the separate encryption rules; the current
+[security posture](../../../../architecture/wyrd-security-posture.md) describes
+the common facade and shared-KEK boundary. Revision 2 retains tenant isolation,
+[configuration authority](../../../../architecture/operations/deployment-and-release.md),
+and backup dependencies. Task 004 carries any lifecycle documentation updates
+required by its explicit-maintenance flow. It adds no schema change beyond
+revision 1's named initial definitions.
 
 ## Open questions
 
-No new policy decision is required for cross-replica propagation, in-flight
-operations, owner-cache validity, auth session effects, or maintenance progress.
-Those behaviors already have owners and are preserved:
+No material design question remains. Revision 2 settles maintenance mode,
+selection, surfaces, and containment; existing cross-replica propagation,
+in-flight operations, owner-cache validity, and auth session effects retain
+their owners:
 
 | Behavior | Existing owner and retained behavior |
 |---|---|
@@ -404,17 +413,16 @@ This corrects earlier notes that turned these into artificial open design
 questions. Do not add distributed completion acknowledgements, a new TTL system,
 a separate recovery framework, or new job tables. The common facade/adapters,
 common persisted envelope, and requested admin actions are new work; route them
-through the existing lifecycle owners. The later spec records the concrete API,
-configuration, and envelope contracts without reopening these established
-semantics. The four journeys are acceptance recommendations, not extra policy.
+through the existing lifecycle owners. The approved spec records configuration,
+envelope, surface scope, and explicit maintenance semantics without reopening
+unaffected owner behavior. The four journeys are acceptance recommendations, not extra policy.
 
 ## Handoff
 
-Design is finalized. The agreed hierarchy, one facade, owner coverage, and
-Rotate/Revoke administrator experience are locked as design input. Existing
-owner semantics above carry into the later human-approved spec; finalization
-does not grant implementation readiness. No spec or task packet
-was created, and no authority or production code changed.
+Design is finalized and spec revision 2 is approved. Task 004 now carries the
+explicit routine/recovery passes and deployment-admin containment flow. Tasks
+001–003 retain their revision-1 obligations and historical evidence. This
+revision changes planning documents only; no production code changed.
 
 Use the [recommended behavior-driven scenarios](journey-scenarios.md) as the
 acceptance discussion for the specification, with existing local-dev, Operator,

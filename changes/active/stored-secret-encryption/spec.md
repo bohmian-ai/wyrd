@@ -1,6 +1,6 @@
 ---
 id: SPEC-stored-secret-encryption
-revision: 1
+revision: 2
 status: approved
 ---
 
@@ -27,9 +27,10 @@ feature-specific key setup.
 
 This records the [finalized design](design/notes.md),
 [administrator journey](design/admin-journey.md), and
-[four journeys](design/journey-scenarios.md). The maintainer approved revision 1,
-including that behavior and the authority/schema replacements below. Execution
-continues through the repository's task workflow.
+[four journeys](design/journey-scenarios.md), as revised by the agreed
+[task 004 lifecycle](design/task-004-lifecycle.md). The maintainer approved
+revision 2's explicit-maintenance and containment changes on 2026-11-19.
+The remaining revision-1 behavior and authority/schema replacements are retained.
 
 ## Agreed approach and limits
 
@@ -185,19 +186,43 @@ replacement/revocation where Wyrd has no supported issuer integration.
 ### Deployment wrapping-key lifecycle
 
 **REQ-010 — Rotation and recovery.** A deployment/platform-authorized action
-starts whole-store maintenance against a configured permitted replacement.
-New writes use the activated replacement; retained keys keep existing values
-readable during rollout. Routine rotation rewraps DEKs without changing values
-or resource identities. Compromise recovery generates fresh DEKs and payload
-ciphertext for affected secrets; rewrapping potentially exposed DEKs is
-insufficient. Extend existing bounded, cancellable maintenance and CAS/version
-fences across all secret owners, with current/changed/remaining counts and
-redacted failed-owner diagnostics. Interrupted work resumes from stored state
-without overwriting concurrent replacement or revocation. No new job/progress
-table or recovery framework is required. Counts describe each maintenance pass:
-already-current values, successfully transitioned values, and observed values
-still requiring transition. Concurrent writes can change the next pass's counts;
-a completed pass is not a global retirement or backup-safety acknowledgement.
+runs one bounded, synchronous, cancellable maintenance pass through HTTP or CLI,
+explicitly selecting routine rewrap or compromise recovery. SDKs, MCP, and UI
+do not expose this action. The destination is the deployment-configured active
+logical key; the action cannot provision or activate keys or select arbitrary
+resources. New writes use that active key; retained keys keep old values readable.
+Activation, startup, and background delivery do not automatically rewrite
+existing envelopes. Remove automatic boot and Operator rewrap scheduling while
+preserving boot's refusal to serve stored secrets without required KMS
+configuration and the existing delivery/runtime safeguards.
+
+Routine rotation rewraps envelopes not naming the destination, retaining their
+DEKs, payload ciphertext, values, and resource identities. Compromise recovery
+requires independent safe wrapping material under a fresh, never-reused logical
+reference, even when native material versions exist under the old name. It
+generates fresh DEKs and payload ciphertext for every envelope not naming that
+destination, across all owners and tenant/platform scopes. Same-reference native
+rotation cannot identify affected envelopes portably and is not recovery.
+
+Before recovery, deployment administration completes the configuration rollout
+and stops/drains old writers and maintenance workers. Routine rewrap must not be
+run into a recovery destination: it would preserve exposed DEKs while marking
+the envelopes current. If rewrap already occurred, recovery uses another fresh
+destination. These are explicit administrative preconditions, not a new durable
+incident lock or a guarantee against an authorized administrator choosing the
+wrong mode. This choice avoids new incident state and coordination machinery.
+
+Reuse existing maintenance scans and CAS/version fences, with remote crypto
+outside held database locks/transactions. Each pass returns current/changed/
+remaining observations and redacted failed-owner diagnostics: already-current
+values, successfully transitioned values, and observed values still requiring
+transition. Repeating the same mode and destination resumes from committed
+envelope references: completed rows are skipped; uncommitted rows remain eligible.
+Concurrent replacement or revocation is never overwritten or undone. There is
+no persistent job, status API, job/progress table, or recovery framework.
+Counts describe only the pass's observations; concurrent writes can change the
+next pass's counts. A completed pass is not a global retirement or backup-safety
+acknowledgement.
 
 **REQ-011 — Version retention and retirement.** Native GCP/Transit rotation
 adds versions under the same key name; AWS retains historical material inside
@@ -209,15 +234,26 @@ stored envelopes. Old keys are retired only after live, prepared/cached, and
 backup recovery dependencies are accounted for. Restore makes required keys
 available before serving recovered credentials.
 
-Disabling the shared wrapping key is deployment-wide containment, not tenant
-revocation. A Wyrd-initiated disable must make that scope clear and trigger
-existing owner invalidation for dependent material. Disabling a key directly in
-the provider does not itself notify Wyrd or invalidate its caches; subsequent
-provider calls refuse access. Neither path instantly erases cached plaintext
-or cancels admitted operations. Ordinary disable does not
-silently destroy recovery keys. A leaked provider identity also requires access
-remediation: rotating material does not remove its authorization. No operation
-can withdraw plaintext or ciphertext already copied by an attacker.
+Key disable/refusal is deployment administration, not a Wyrd API action or
+tenant revocation. The wrap/unwrap backend contract gains no key-admin operation
+and this change adds no persisted disabled-key state. Removing a reference from
+the trusted active/retained configuration and restarting/replacing every affected
+process establishes durable Wyrd refusal and clears their process-held prepared
+material. A rolling configuration change is not immediate containment; stop
+affected serving processes when immediate containment is required, then restart
+with restricted configuration. Do not claim cancellation of admitted work or
+erasure of material outside those processes.
+
+Deployment administrators may also deny external key-service access. Such denial
+does not notify Wyrd or erase prepared keys; subsequent provider calls refuse.
+Containment can interrupt dependent operations deployment-wide. Do not destroy
+recovery keys as an implicit side effect. If old-key access was denied, recovery
+requires controlled restoration of that access or replacement of the actual
+credentials through existing owner actions without opening the old envelopes.
+A leaked provider identity also requires access remediation: rotating material
+does not remove its authorization. Potentially disclosed credentials require
+replacement/revocation at their issuers; encryption recovery cannot withdraw
+plaintext or ciphertext already copied by an attacker.
 
 ### Replacement and documentation
 
@@ -292,7 +328,7 @@ creating another behavioral contract.
 | Get started and use stored credentials | Initialize a durable local server, create an Operator connection without extra key setup, fail a Verifier, and observe delivery; restart and repeat. Exercise actual use of auth, issuer, platform, and Gateway secrets through the common facade, including distinct tenants and each backend's integration boundary. | REQ-001–005, REQ-012 |
 | Rotate without changing clients | Renew encryption and replace an expired/leaked credential while retaining client references. Verify fresh DEKs, unchanged value/session semantics for renewal, existing auth activation behavior for replacement, and replacement when the old envelope cannot open. Inject provider failure and race replacement/revocation; committed state is preserved or the losing write conflicts. | REQ-002, REQ-006, REQ-008–009 |
 | Revoke and stop use | Revoke an in-use resource, exercise owner refresh including replicas and restart, and observe refusal under the retained propagation/admission rules. Race rotation against revocation; it cannot re-enable the resource. Another resource still works. | REQ-007–009 |
-| Rotate the deployment wrapping key safely | Exercise routine rewrap and compromise recovery across owners/tenants, interrupt/resume maintenance, and race a credential update. Verify truthful counts, retained old reads, safe retirement/restore dependencies, and explicit deployment-wide disable effects. | REQ-010–011 |
+| Rotate the deployment wrapping key safely | Activate a configured replacement and restart without rewriting old envelopes. Explicitly run routine rewrap and fresh-destination compromise recovery through HTTP/CLI across owners/tenants; interrupt/resume and race a credential update/revocation. Verify truthful counts, retained old reads, safe retirement/restore dependencies, and refusal after restricted configuration and process replacement. | REQ-010–011 |
 
 Supporting crypto/integration checks demonstrate independent DEKs, tenant/owner/
 purpose binding, tamper and unknown-key refusal, permissions, redaction, and
@@ -311,9 +347,16 @@ tests, cloud experiments, or benchmarks have been executed for this specificatio
 
 ## Approval and revision
 
-Revision 1 records the finalized design. No new cache, session, distributed
-completion, or maintenance-policy decision is requested. Approval accepts the
-behavior, backend coverage, shared-KEK limits, four journeys, and named
-authority/initial-schema replacements. The maintainer explicitly approved
-revision 1 and requested the four agreed implementation tasks. This records
-approval without changing the revision's behavioral requirements.
+Revision 1 established the common encryption owner, backend coverage, resource
+actions, shared-KEK limits, four journeys, and named authority/initial-schema
+replacements. Tasks 001–003 and their historical evidence remain pinned to that
+revision; their assigned obligations are unchanged by revision 2.
+
+Revision 2 records the maintainer's explicit approval to make the agreed spec
+and task revisions on 2026-11-19: explicit HTTP/CLI maintenance passes, no
+automatic envelope rewrap, fresh-logical-key recovery with administrative mode
+isolation, and containment through deployment administration instead of a Wyrd
+disable action. Task 004 targets revision 2 and owns the resulting scheduling,
+consumer-test, and operational-documentation changes. No new persistent schema,
+backend admin rights, cache/session policy, or distributed completion protocol
+is authorized.

@@ -346,3 +346,28 @@ def test_a_family_bound_viewer_reads_only_that_family(server: WyrdTestServer) ->
     with pytest.raises(WyrdError) as hidden:
         own.get(other)
     assert hidden.value.code == "WYRD_REGISTRY_404_CARD_NOT_FOUND"
+
+
+def test_a_release_grants_nothing_and_its_account_holds_only_its_grants(
+    server: WyrdTestServer, tmp_path: Path
+) -> None:
+    root = next(iter(releases(server, tmp_path)))
+    principals = Principals(client_of(server))
+    assert principals.list(kind="service", name=f"{FAMILY}-runtime")["principals"] == []
+
+    account, key = runtime_account(FAMILY, client=client_of(server))
+    access = principals.access(account)
+    assert grants(access) == [("workload", "direct")]
+    (summary,) = principals.list(kind="service", name=f"{FAMILY}-runtime")["principals"]
+    assert summary["workload_restriction"] == {"mode": "family", "kind": "Service", "name": FAMILY}
+
+    with pytest.raises(WyrdError) as ungranted:
+        Cards(client_of(server, key, root)).declare_from_path(AUTHORED)
+    assert ungranted.value.code == DENIED
+    for refused_root, code in (
+        ("not-a-card-uid", "WYRD_SPEC_400_VALIDATION"),
+        ("01900000-0000-7000-8000-000000000000", "WYRD_AUTH_401_WORKLOAD_UID_REFUSED"),
+    ):
+        with pytest.raises(WyrdError) as refused:
+            client_of(server, key, refused_root).access_token()
+        assert refused.value.code == code, refused_root

@@ -2634,7 +2634,7 @@ async function chooseFamilyGrant(form: ReturnType<Page['locator']>, role: string
   await form.getByLabel('Card name').fill(name);
 }
 
-connected('an administrator invites Alice with payments access in Settings, and the saved binding matches her Access summary', async ({ server }) => {
+connected('an administrator gives Alice payments access in Settings, and her browser, CLI login and SDK see only payments', async ({ server }) => {
   const github = server.githubApp;
   github.addInstallation(101, [
     { id: 1, fullName: 'acme/payments' },
@@ -2657,7 +2657,7 @@ connected('an administrator invites Alice with payments access in Settings, and 
     await connectGithub(page, base);
     await cards.declareFromPath(fixture('cards/verify_in_real_time/answer-check.yaml'));
     await declarePolicy(cards, github.host, 'acme/payments', 'minimal');
-    await declarePolicy(cards, github.host, 'acme/ledger', 'minimal');
+    const ledger = await declarePolicy(cards, github.host, 'acme/ledger', 'minimal');
     github.setPullRequest(1, 7, 'b1', 'a1');
     github.setPullRequest(2, 9, 'b2', 'a2');
     expect(github.deliverPullRequest(server.baseUrl, 101, 1, 7, 'opened')).toBe(202);
@@ -2697,7 +2697,55 @@ connected('an administrator invites Alice with payments access in Settings, and 
     await expect.poll(() => grants.count()).toBe(1);
     const row = (await grants.first().textContent()) ?? '';
     for (const text of ['viewer', 'Repository/payments', 'every version, including future ones', 'Direct', 'cards:read', 'executions:read']) expect(row).toContain(text);
+
+    // Alice signs in with her username and password. Her Repositories index holds payments and nothing of ledger.
+    const her = await (await browser.newContext()).newPage();
+    await her.goto(`${base}/login`);
+    await her.getByLabel('Username').fill('alice');
+    await her.getByLabel('Password').fill(password);
+    await her.getByRole('button', { name: 'Sign in', exact: true }).click();
+    await her.waitForURL(base);
+    await her.goto(`${base}/repositories`);
+    const index = her.getByRole('region', { name: 'Repositories', exact: true });
+    await expect.poll(() => index.locator('tbody tr').count()).toBe(1);
+    expect(await index.textContent()).toContain('payments');
+    expect(await her.locator('main').textContent()).not.toContain('ledger');
+
+    // The ledger Repository she was not granted reads as no such Card, and GitHub setup and Access administration are refused.
+    await her.goto(`${base}/repositories/ledger?version=${ledger.version}`);
+    expect(await her.locator('main').textContent()).toContain('WYRD_REGISTRY_404_CARD_NOT_FOUND');
+    await her.goto(`${base}/settings/integrations/github`);
+    expect(await her.locator('main').textContent()).toContain('WYRD_PERMISSION_403_DENIED_RBAC');
+    await her.goto(`${base}/settings/access`);
+    expect(await her.locator('main').textContent()).toContain("You can't administer access for this tenant");
+    expect(await her.getByRole('form').count()).toBe(0);
+
+    // She starts a CLI login in a terminal and approves its code in the browser she is signed in to: no provider is involved.
+    const config = mkdtempSync(join(tmpdir(), 'wyrd-ui-alice-'));
+    const cliEnv = { ...process.env, WYRD_CONFIG_HOME: config, WYRD_API_KEY: '', WYRD_TENANT: tenant, WYRD_SERVER_URL: server.baseUrl };
+    const login = spawn(join(REPO, 'target/debug/wyrd'), ['auth', 'login', '--server', server.baseUrl, '--tenant', tenant, '--no-browser'], { env: cliEnv });
+    let terminal = '';
+    login.stderr.on('data', (chunk: Buffer) => (terminal += chunk.toString()));
+    const finished = new Promise<number | null>((done) => login.on('close', done));
+    await vi.waitFor(() => expect(terminal).toMatch(/\/auth\/device\?\S*user_code=/), { timeout: 30_000 });
+    const verification = new URL(/https?:\/\/\S+\/auth\/device\?\S+/.exec(terminal)![0]);
+    await her.goto(`${bff.url}${verification.pathname}${verification.search}`);
+    await her.getByRole('button', { name: 'Approve and sign in' }).click();
+    await expect.poll(() => her.getByRole('heading').textContent()).toBe('Login approved');
+    expect(await finished, terminal).toBe(0);
+
+    // The terminal's login and the SDK that reads it carry the same grant: payments only.
+    const listed = execFileSync(join(REPO, 'target/debug/wyrd'), ['list', '--kind', 'Repository'], { env: cliEnv }).toString();
+    expect(listed).toContain('payments');
+    expect(listed).not.toContain('ledger');
+    vi.stubEnv('WYRD_CONFIG_HOME', config);
+    vi.stubEnv('WYRD_API_KEY', undefined);
+    vi.stubEnv('WYRD_TENANT', tenant);
+    const hers = await Cards.connect({ client: WyrdClient.connect() });
+    expect((await hers.list({ kind: 'Repository' })).items.map((card) => card.name)).toEqual(['payments']);
+    await expect(hers.get(ledger)).rejects.toMatchObject({ code: 'WYRD_REGISTRY_404_CARD_NOT_FOUND' });
   } finally {
+    vi.unstubAllEnvs();
     await browser.close();
     bff.stop();
   }

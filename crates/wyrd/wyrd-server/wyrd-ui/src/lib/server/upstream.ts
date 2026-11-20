@@ -50,15 +50,20 @@ const dropped = [
 /** The server's sign-in binding cookie, which every forwarded `/auth/*` request carries. */
 const loginCookie = 'wyrd_login';
 
-/** Prefix of the server's tenant session cookies, which only `/auth/browser/*` requests carry. */
+/**
+ * Prefix of the server's tenant session cookies, which only `/auth/browser/*`
+ * and the CLI login approval at `/auth/device` carry.
+ */
 const sessionPrefix = 'wyrd_session_';
 
 /**
  * Send one browser `/auth/*` request to the configured Wyrd server and return
  * its answer unchanged: method, path and query, body, the server's own cookies,
  * redirects (never followed here), and error responses. Every request carries
- * the login binding; the browser-session operations also carry the tenant
- * session cookies, which the server alone selects, validates, and revokes.
+ * the login binding; the browser-session operations and the CLI login approval
+ * also carry the tenant session cookies, which the server alone selects,
+ * validates, and revokes. That lets a signed-in person approve a terminal's
+ * code without a provider.
  * `url` is the request's public URL as this BFF established it, so the server
  * derives sign-in redirects and callbacks from the origin the browser actually
  * reached, never from a forwarded header the browser sent. A server that
@@ -72,7 +77,7 @@ export async function forwardAuth(
   const headers = new Headers(request.headers);
   for (const name of dropped) headers.delete(name);
   // Unrelated application cookies never ride a forwarded request.
-  const sessions = url.pathname.startsWith('/auth/browser/');
+  const sessions = url.pathname.startsWith('/auth/browser/') || url.pathname === '/auth/device';
   const forwarded = (request.headers.get('cookie') ?? '')
     .split(';')
     .map((pair) => pair.trim())

@@ -33,7 +33,8 @@ use wyrd_client::state::WyrdState;
 use wyrd_client::{Gateway, GlobalConfig, Principals, WyrdClient};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
-    CreateServicePrincipalRequest, WorkloadFamily, WorkloadKind, WorkloadRestriction,
+    CreateServicePrincipalRequest, ScopedRoleAssignment, WorkloadFamily, WorkloadKind,
+    WorkloadRestriction,
 };
 use wyrd_testing::gateway_capture::GatewayCapture;
 use wyrd_testing::release_server::{SERVER_URL, SetupTenant};
@@ -401,7 +402,7 @@ impl Tenant {
             std::fs::write(directory.join(name), body)?;
         }
         let admin = connect(&setup.api_key)?;
-        let mut roles = vec!["workload".to_owned()];
+        let mut roles = vec![ScopedRoleAssignment::tenant("workload")];
         if let Some(provider) = provider {
             let deployment = serde_json::from_value(serde_json::json!({
                 "name": JUDGE_DEPLOYMENT,
@@ -414,7 +415,10 @@ impl Tenant {
                 .put_deployment(&deployment)
                 .await?;
             seed_code_role(setup.tenant_id.parse()?).await?;
-            roles.push(CODE_ROLE.to_owned());
+            roles.push(ScopedRoleAssignment {
+                role: CODE_ROLE.to_owned(),
+                scope: serde_json::from_value(json!({ "tool": "code.run" }))?,
+            });
         }
         let service = service(provider.is_some(), provider.is_some() && judge);
         let cards = Cards::connect_with(&admin).await?;
@@ -440,7 +444,7 @@ impl Tenant {
 
     /// Declares Service `bench-service-<index>` from `service` beside the
     /// shared Verifiers and Model in `directory` (an identical redeclaration
-    /// of those reuses them), creates its family runtime account holding
+    /// of those reuses them), creates its family runtime account bound to
     /// `roles`, and pulls its bundle; a state loaded from it runs as the
     /// Service root.
     ///
@@ -452,7 +456,7 @@ impl Tenant {
         cards: &Cards,
         directory: &Path,
         service: &str,
-        roles: &[String],
+        roles: &[ScopedRoleAssignment],
         index: usize,
     ) -> Result<Application> {
         let file = directory.join(format!("service-{index}.yaml"));
@@ -463,10 +467,7 @@ impl Tenant {
             .await?
             .create_service_principal(&CreateServicePrincipalRequest {
                 name: format!("bench-service-{index}-runtime"),
-                assignments: roles
-                    .iter()
-                    .map(|role| wyrd_spec::auth::ScopedRoleAssignment::tenant(role.clone()))
-                    .collect(),
+                assignments: roles.to_vec(),
                 description: None,
                 workload_restriction: Some(WorkloadRestriction::Family(WorkloadFamily {
                     kind: WorkloadKind::Service,
@@ -488,9 +489,10 @@ impl Tenant {
     }
 }
 
-/// Seeds [`CODE_ROLE`] in `tenant`, granting `tool:invoke` on `code.run`
-/// alone, through repository Postgres: the server has no Role authoring
-/// route, so a tenant administrator's custom Role is a row.
+/// Seeds [`CODE_ROLE`] in `tenant`, the one operation `tool:invoke`, which
+/// each runtime account is bound to at the `code.run` tool scope alone,
+/// through repository Postgres: the server has no Role authoring route, so a
+/// tenant administrator's custom Role is a row.
 ///
 /// # Errors
 ///
@@ -503,7 +505,7 @@ async fn seed_code_role(tenant: DataTenantId) -> Result<()> {
         &mut conn,
         uuid::Uuid::new_v4(),
         CODE_ROLE,
-        &json!([{ "resource": "tool", "action": "invoke", "scope": { "tool": "code.run" } }]),
+        &json!([{ "resource": "tool", "action": "invoke" }]),
         false,
     )
     .await?;

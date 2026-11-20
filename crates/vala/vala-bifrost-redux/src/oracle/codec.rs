@@ -743,6 +743,87 @@ mod tests {
         assert_eq!(totals.value(0), 7);
     }
 
+    /// A family reader's masked verification plan, encoded for a peer and
+    /// decoded there, returns exactly the rows it returns locally: the row
+    /// filter and column masking travel inside the native plan.
+    ///
+    /// # Panics
+    /// Panics if planning, the codec round trip or execution fails, or the
+    /// peer's rows differ from the local rows.
+    #[tokio::test]
+    async fn a_masked_verification_plan_executes_identically_on_a_peer() {
+        use super::super::tests::{payload_context, statement, verification_session};
+        use wyrd_runtime::{CardPermissionScope, Permission, PermissionScope};
+        use wyrd_spec::envelope::CardKind;
+        use wyrd_spec::ids::CardName;
+
+        let family = payload_context(&[
+            Permission::bifrost_query_read(),
+            Permission::executions_read_any().at(PermissionScope::Card(
+                CardPermissionScope::family(
+                    CardKind::Repository,
+                    CardName::new("payments").expect("name"),
+                ),
+            )),
+        ]);
+        let session = verification_session();
+        let plan = super::super::Oracle::plan_logical(
+            &session,
+            &family,
+            &statement("SELECT result_id FROM bifrost.verification.results"),
+            &[],
+        )
+        .await
+        .expect("plan builds");
+        let native = session
+            .state()
+            .create_physical_plan(&plan)
+            .await
+            .expect("physical planning succeeds");
+        let ids = |batches: &[RecordBatch]| {
+            let mut ids: Vec<Option<String>> = batches
+                .iter()
+                .flat_map(|batch| {
+                    let column = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .expect("result_id is utf8");
+                    column
+                        .iter()
+                        .map(|id| id.map(str::to_owned))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            ids.sort();
+            ids
+        };
+        let local = ids(&collect(Arc::clone(&native), session.task_ctx())
+            .await
+            .expect("local plan executes"));
+        assert_eq!(local, [Some("p1".to_owned())]);
+
+        let mut source = None;
+        let outbound = replace_source(native, &mut source).expect("source replacement succeeds");
+        let bytes = physical_plan_to_bytes_with_extension_codec(
+            outbound,
+            &OraclePhysicalExtensionCodec::encoder(),
+        )
+        .expect("masked plan encodes");
+        let codec = OraclePhysicalExtensionCodec::decoder(HashMap::from([(
+            "scan".to_owned(),
+            source.expect("one source leaf was captured"),
+        )]));
+        let task = session.task_ctx();
+        let decoded = physical_plan_from_bytes_with_extension_codec(&bytes, &task, &codec)
+            .expect("masked plan decodes");
+        codec
+            .require_complete_consumption()
+            .expect("provider is consumed once");
+        let peer = ids(&collect(decoded, task).await.expect("peer plan executes"));
+        assert_eq!(peer, local);
+    }
+
     /// Every malformed tree or request-component contradiction fails before effects.
     ///
     /// # Panics

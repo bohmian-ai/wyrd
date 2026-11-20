@@ -4682,7 +4682,7 @@ mod tests {
     /// # Panics
     ///
     /// Panics when the fixture principal cannot form a context.
-    fn payload_context(permissions: &[Permission]) -> AuthorizedQueryContext {
+    pub(super) fn payload_context(permissions: &[Permission]) -> AuthorizedQueryContext {
         let tenant = DataTenantId::new_v7();
         let mut effective_permissions = wyrd_runtime::PermissionSet::default();
         for permission in permissions {
@@ -4880,7 +4880,7 @@ mod tests {
     /// # Panics
     ///
     /// Panics when the query is not one valid Bifrost `SELECT`.
-    fn statement(sql: &str) -> DfStatement {
+    pub(super) fn statement(sql: &str) -> DfStatement {
         parse_select(sql).expect("test query validates").0
     }
 
@@ -5161,7 +5161,7 @@ mod tests {
         );
     }
 
-    fn verification_session() -> SessionContext {
+    pub(super) fn verification_session() -> SessionContext {
         use datafusion::arrow::array::StringArray;
         use datafusion::arrow::datatypes::{DataType, Field, Schema};
         use datafusion::arrow::record_batch::RecordBatch;

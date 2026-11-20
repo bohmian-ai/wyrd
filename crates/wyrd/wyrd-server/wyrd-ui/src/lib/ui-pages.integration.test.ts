@@ -14,7 +14,8 @@ import { chromium, type Browser, type Page } from 'playwright';
 import { test as base, expect, vi } from 'vitest';
 import { AGREES, assistantTest, judgeReply } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/assistant';
 import { declared, fixture, groupExecution, runtimeAccount, scheduledResult, serverTest } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/server';
-import { Cards, Principals, WyrdClient, WyrdState } from 'wyrd-ai';
+import { Bifrost, Cards, Principals, WyrdClient, WyrdState } from 'wyrd-ai';
+import { z } from 'zod';
 import { loadExecution } from 'wyrd-ai-ui/loaders';
 import { nodeExecutor } from 'wyrd-ai-ui/node';
 import { declarePolicy, exportOtlp, nanos, seedSignals } from '$lib/ui-signals.integration';
@@ -2875,6 +2876,131 @@ test('an administrator manages direct, group and custom-role grants in Access, a
     expect((await principals.access(bob)).grants.map((held) => `${held.role} ${held.source.kind}`).sort()).toEqual(['prompt_reader group', 'viewer direct']);
   } finally {
     await context.close();
+    await page.context().close();
+  }
+});
+
+test('an administrator creates a runtime Service account in Access, and its one key runs two releases of the family', async ({ server, ui }) => {
+  const tenantKey = 'ui-runtime';
+  const tenant = server.seedTenant(tenantKey);
+  const adminKey = server.bootstrapServiceInTenant(tenant, ['admin'], 'ui-runtime-admin');
+  const admin = WyrdClient.connect({ serverUrl: ui.serverUrl, credential: adminKey });
+  const cards = await Cards.connect({ client: admin });
+  const principals = await Principals.connect({ client: admin });
+  const reader = await Bifrost.connect({ client: admin });
+  // Two releases of the observed-service family, each with its own pulled bundle.
+  await cards.declareFromPath(fixture('cards/observe_a_run/observed-model.yaml'));
+  const releases = [];
+  for (const file of ['observed-service.yaml', 'observed-service-2.yaml']) {
+    const { root } = await cards.declareFromPath(fixture(`cards/observe_a_run/${file}`));
+    const bundle = mkdtempSync(join(tmpdir(), 'wyrd-ui-runtime-'));
+    await cards.pull(root, bundle);
+    releases.push(bundle);
+  }
+  // Reading a table's definition is tenant-wide, so the runtime holds it through its own narrow role.
+  await principals.putRole('runtime_tables', { operations: [{ resource: 'bifrost_table', action: 'read' }] });
+  const base = `${ui.base}/t/${tenantKey}`;
+  const page = await signIn(ui.browser, ui.base, tenantKey, adminKey);
+  try {
+    // The form asks for the Service family only: no release version or UID, and no operation.
+    await page.goto(`${base}/settings/access?tab=services`);
+    const create = page.getByRole('form', { name: 'Create a Service account' });
+    expect(await create.getByRole('textbox').evaluateAll((inputs) => inputs.map((input) => (input as HTMLInputElement).name))).toEqual(['name', 'description', 'family']);
+    await create.getByLabel('Name').fill('checkout-runtime');
+    await create.getByLabel('Runtime family').fill('observed-service');
+    await create.getByRole('button', { name: 'Create Service account' }).click();
+    const secret = page.locator('[data-secret]');
+    await expect.poll(() => secret.count()).toBe(1);
+    const key = (await secret.textContent()) ?? '';
+
+    // The server holds one account restricted to the family and granting nothing yet.
+    const [account] = (await principals.list({ kind: 'service', name: 'checkout-runtime' })).principals;
+    expect(account.workload_restriction).toEqual({ mode: 'family', kind: 'Service', name: 'observed-service' });
+    expect((await principals.access(account.principal_id)).grants).toEqual([]);
+
+    // Its page shows the family apart from its bindings, says it grants nothing, and never shows the key again.
+    await page.getByRole('link', { name: 'Access for checkout-runtime' }).click();
+    const detail = page.getByRole('region', { name: 'Access for checkout-runtime' });
+    await expect.poll(() => detail.locator('[data-runtime-family]').textContent()).toBe('Service/observed-service · every release');
+    expect(await detail.textContent()).toContain('The runtime family grants no operation and no access to the Service\'s dependencies');
+    expect(await detail.textContent()).toContain('– No access');
+    expect(await serverHtml(page, page.url())).not.toContain(key);
+    await page.reload();
+    expect(await secret.count()).toBe(0);
+
+    // Operations are separate bindings saved through the same grant form: workload at the Service family and at the drift schema it records to, and table definitions tenant-wide.
+    await chooseFamilyGrant(page.getByRole('form', { name: 'Grant access to checkout-runtime' }), 'workload', 'Service', 'observed-service');
+    await page.getByRole('form', { name: 'Grant access to checkout-runtime' }).getByRole('button', { name: 'Save binding' }).click();
+    await expect.poll(() => page.getByRole('region', { name: 'Bindings of checkout-runtime' }).locator('tbody tr').count()).toBe(1);
+    const grant = page.getByRole('form', { name: 'Grant access to checkout-runtime' });
+    await grant.getByLabel('Role').selectOption('workload');
+    await grant.getByLabel('Scope', { exact: true }).selectOption('bifrost_schema');
+    await grant.getByLabel('Schema').fill('drift');
+    await grant.getByRole('button', { name: 'Save binding' }).click();
+    await expect.poll(() => page.getByRole('region', { name: 'Bindings of checkout-runtime' }).locator('tbody tr').count()).toBe(2);
+    await grant.getByLabel('Role').selectOption('runtime_tables');
+    await grant.getByLabel('Scope', { exact: true }).selectOption('all');
+    await grant.getByRole('button', { name: 'Save binding' }).click();
+    await expect.poll(() => page.getByRole('region', { name: 'Bindings of checkout-runtime' }).locator('tbody tr').count()).toBe(3);
+    expect((await principals.access(account.principal_id)).grants.map((held) => [held.role, held.scope, held.source.kind])).toEqual(
+      expect.arrayContaining([
+        ['workload', { card: { family: { kind: 'Service', name: 'observed-service' } } }, 'direct'],
+        ['workload', { bifrost: { schema: { catalog: 'bifrost', schema: 'drift' } } }, 'direct'],
+        ['runtime_tables', 'all', 'direct']
+      ])
+    );
+
+    // The one key runs both releases; each observation retained for the observed-drift Verifier names its own release, the observed Model, the series, and this account as subject and actor.
+    const runtime = WyrdClient.connect({ serverUrl: ui.serverUrl, credential: key });
+    const states = releases.map((bundle) => WyrdState.fromPath(bundle, { client: runtime }));
+    const runs = [];
+    for (const [index, state] of states.entries()) {
+      await state.startBifrost();
+      const run = state.run();
+      expect(await run.forCard('model').observe.submit('observed-drift', { latency: index + 1 })).toEqual({ kind: 'recorded' });
+      await state.shutdown();
+      runs.push(run.runId);
+    }
+    server.flushBifrost();
+    const rows = await reader.sql(
+      'SELECT workload_card_uid, subject_card_uid, series, sub_principal_id, act_principal_id, num_value FROM bifrost.drift.observations WHERE run_id = $1 OR run_id = $2 ORDER BY num_value',
+      runs,
+      z.object({ workload_card_uid: z.string(), subject_card_uid: z.string(), series: z.string(), sub_principal_id: z.string(), act_principal_id: z.string(), num_value: z.number() })
+    );
+    expect(states[0].rootRef.uid).not.toBe(states[1].rootRef.uid);
+    expect(rows).toEqual(
+      states.map((state, index) => ({
+        workload_card_uid: state.rootRef.uid,
+        subject_card_uid: state.cardRef('model').uid,
+        series: 'latency',
+        sub_principal_id: account.principal_id,
+        act_principal_id: account.principal_id,
+        num_value: index + 1
+      }))
+    );
+
+    // The key does nothing it was not granted, and cannot run as a Card outside its family.
+    await expect((await Cards.connect({ client: runtime })).declareFromPath(fixture('cards/gateway_inference/ask-prompt.yaml'))).rejects.toMatchObject({ code: 'WYRD_PERMISSION_403_DENIED_RBAC' });
+    await expect(runtime.forWorkload(states[0].cardRef('agent').uid ?? '').accessToken()).rejects.toMatchObject({ code: 'WYRD_AUTH_401_WORKLOAD_UID_REFUSED' });
+
+    // Rotation: a second key is issued and shown once, the first is revoked by its prefix, and only the second still works.
+    await page.getByRole('button', { name: 'Issue key' }).click();
+    await expect.poll(() => secret.count()).toBe(1);
+    const next = (await secret.textContent()) ?? '';
+    expect(next).not.toBe(key);
+    const [first] = (await principals.listCredentials(account.principal_id)).credentials.filter((credential) => key.startsWith(credential.prefix));
+    await page.getByRole('button', { name: `Revoke key ${first.prefix}` }).click();
+    await expect.poll(() => page.getByRole('region', { name: 'Keys of checkout-runtime' }).textContent()).toContain('⊘ revoked');
+    await expect(WyrdClient.connect({ serverUrl: ui.serverUrl, credential: key }).accessToken()).rejects.toMatchObject({ code: 'WYRD_AUTH_401_API_KEY_INVALID' });
+    expect(await WyrdClient.connect({ serverUrl: ui.serverUrl, credential: next }).accessToken()).toBeTruthy();
+
+    // An account created through the SDK reads the same way in Access.
+    await principals.createServicePrincipal({ name: 'spare-runtime', workload_restriction: { mode: 'family', kind: 'Service', name: 'spare-service' } });
+    await page.goto(`${base}/settings/access?tab=services`);
+    const listed = page.getByRole('region', { name: 'Service account list' }).locator('tbody tr');
+    expect((await listed.allTextContents()).find((row) => row.includes('spare-runtime'))).toContain('Service/spare-service');
+  } finally {
+    await reader.shutdown();
     await page.context().close();
   }
 });

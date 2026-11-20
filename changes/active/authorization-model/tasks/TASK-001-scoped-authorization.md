@@ -391,10 +391,56 @@ Evidence (in progress):
   - Server `pg_*`/`platform_admin_e2e` combined run: 439/441 at 2936d9e4c; both failures
     were diagnosed above. `test:verification:sandbox` 34/34.
   - `lints` and `py:lints` are clean.
-- Not yet proven in this cycle: direct/group/custom-role variants, exact UID vs future
-  versions, CLI/Python/TypeScript/MCP, review sets/executions/approvals through
-  dedicated reads, peer execution of the masked plan, scoped invitations. Each remains
-  FAIL until proven.
+- Group, custom-role and exact-version grants — PASS (Rust SDK).
+  `principal_roles::group_custom_and_exact_version_bindings_scope_reads`: Carol reads
+  only `code-review` through a group bound viewer at that family; her access summary
+  names the group source, and she reads nothing at her next request after leaving the
+  group. Dave's custom `payments_reader` role (`cards:read`), bound at
+  `CardPermissionScope::version` for 1.0.0, reads 1.0.0. He gets
+  `WYRD_REGISTRY_404_CARD_NOT_FOUND` for 2.0.0, which was published after the grant,
+  and for `unrelated-check`. The family binding covers future versions; see the smallest
+  case. Selector: the `wyrd-ai` journey command above with
+  `-E 'test(/^principal_roles::/)'`, 9/9 GREEN at `4733e3ced`. No RED: the server
+  behavior already existed, so this is existing-behavior proof.
+- The same family boundary on the other surfaces — PASS, no RED (existing behavior):
+  - Python: `test_principal_roles.py::test_a_family_bound_viewer_reads_only_that_family`,
+    9/9 for the file.
+  - TypeScript: `principal-roles.test.ts` "a family bound viewer reads only that
+    family", 8/8.
+  - CLI: `card_lifecycle::pg_tests::a_family_bound_viewer_lists_only_that_family`. A
+    `list --kind Verifier` names only `code-review`, `latest` succeeds for it, and
+    `latest unrelated-check` returns `WYRD_REGISTRY_404_CARD_NOT_FOUND`.
+  - MCP: `principals::pg_tests::a_family_bound_agent_reads_only_that_family` checks
+    `cards.list` and `cards.get` the same way, 4/4 for the module.
+
+  Each surface uses a Service account bound viewer at `Verifier/code-review`. Commands:
+  the CLI ran `cargo nextest run --locked -p wyrd-cli --test cli --run-ignored=all`, and
+  the MCP run used `-p wyrd-mcp --test mcp`, each under `with-test-postgres.sh` after
+  `db:migrate:all:inner`. Python and TypeScript ran their file under the same lifecycle.
+  Commits `e98c6e45f`, `7affd3ceb` and `589e35bd8`.
+- Diagnosis, CLI `principal_journey::principal_revoke_cli_journey` (401, expected 200).
+  - Symptom: the CLI journey asserted that a revoked principal's issued token keeps
+    working.
+  - Cause: once the in-process harness ran the `authorization_cache` worker, the revoke
+    notification marked the snapshot newer. The next request reloads it without the
+    suspended account and refuses with "inactive". That is posture 326-330: an issued
+    tenant token spends current cached authority, and only credential revocation leaves
+    an issued bearer working.
+  - Timing: the revoking replica does not mark its own cache, so an immediate 401 races
+    the notification.
+  - Diagnostician report: the assertion was wrong and the server is right. Make it
+    deterministic by polling until 401 within the five-second propagation bound, or by
+    adding same-replica invalidation after commit.
+  - Fix: the test polls until 401 within the bound. Same-replica invalidation was not
+    taken: about 30 revision-advance call sites would have to carry the cache, which is
+    a redesign. The CLI and server `revoke` rustdoc that still claimed a five-minute
+    snapshot is corrected.
+  - Material risk: `platform_admin_e2e` (revoked principal 401 "inactive") and the
+    `identity_e2e` revoke journeys still assert an immediate refusal on the same race.
+  - GREEN: 5/5 in `principal_journey` plus the CLI scope journey.
+- Not yet proven in this cycle: review sets/members/executions/approvals and downloads
+  through dedicated reads, peer execution of the masked plan. Each remains FAIL until
+  proven. Scoped invitations: see `pg_browser_sessions`.
 - TDD: VIOLATED for slices committed in `8e33913ed` and `0c3a7d36f` (production code
   preceded tests). Test-first resumed from the smallest case above.
 

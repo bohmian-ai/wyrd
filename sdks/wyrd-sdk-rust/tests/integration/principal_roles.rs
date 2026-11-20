@@ -1213,3 +1213,164 @@ async fn group_custom_and_exact_version_bindings_scope_reads() {
     }
     deployment.shutdown().await;
 }
+
+/// Family and exact-version editors author, upload and delete only the Cards
+/// their grants cover.
+///
+/// An editor of the `support-model` family declares a release whose file
+/// uploads and completes, and deletes a later release by UID; a Prompt
+/// declaration, a Prompt delete and a desk graph that also carries
+/// uncovered Agent, Verifier and Operator members are refused, and the
+/// refused graph persists no member. An editor of exactly 1.0.0 deletes it
+/// by reference and is refused the Prompt.
+///
+/// # Panics
+/// Panics when a step fails or an outcome differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn scoped_editors_change_only_the_cards_they_cover() {
+    use wyrd_ai::cards::{CardKind, CardSelector, ListCardsRequest};
+    use wyrd_spec::auth::CardPermissionScope;
+    use wyrd_spec::ids::CardName;
+
+    let deployment = Deployment::start().await;
+    let admin = Principals::connect_with(&deployment.admin())
+        .await
+        .expect("handle connects");
+    let editor_at = async |name: &str, scopes: Vec<CardPermissionScope>| {
+        let created = admin
+            .create_service_principal(&CreateServicePrincipalRequest {
+                name: name.to_owned(),
+                assignments: scopes
+                    .into_iter()
+                    .map(|scope| ScopedRoleAssignment {
+                        role: "editor".to_owned(),
+                        scope: PermissionScope::Card(scope),
+                    })
+                    .collect(),
+                description: None,
+                workload_restriction: None,
+            })
+            .await
+            .unwrap_or_else(|error| panic!("{name} is created: {error}"));
+        Cards::connect_with(&deployment.client(created.credential.expose()))
+            .await
+            .expect("handle connects")
+    };
+    let model = CardName::new("support-model").expect("valid name");
+    let family = editor_at(
+        "model-editor",
+        vec![
+            CardPermissionScope::family(CardKind::Model, model.clone()),
+            CardPermissionScope::family(
+                CardKind::Service,
+                CardName::new("support-desk").expect("valid name"),
+            ),
+        ],
+    )
+    .await;
+    let denied = |error: WyrdError| assert_eq!(error.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
+
+    let first = family
+        .declare_from_path(&fixture("cards/declare_and_pull/support-model.yaml"))
+        .await
+        .expect("the family editor declares its release and uploads its file");
+    assert!(first.outcomes[0].artifact_hash.is_some());
+    let first = crate::support::declared(&first, "support-model");
+
+    denied(
+        family
+            .declare_from_path(&fixture(AUTHORED))
+            .await
+            .expect_err("another family is refused"),
+    );
+    let cards = deployment.cards().await;
+    let prompt = declare(&cards, AUTHORED).await.root;
+    denied(
+        family
+            .delete(CardSelector::Exact(prompt.clone()))
+            .await
+            .expect_err("another family's delete is refused"),
+    );
+    denied(
+        family
+            .declare_from_path(&fixture("cards/declare_and_pull/support-desk.yaml"))
+            .await
+            .expect_err("a graph with uncovered members is refused"),
+    );
+    let services = cards
+        .list(ListCardsRequest {
+            kind: None,
+            name: None,
+            version_range: None,
+            status: None,
+            filter: None,
+            include_prerelease: false,
+            limit: None,
+            cursor: None,
+        })
+        .await
+        .expect("Cards list");
+    let names: BTreeSet<&str> = services
+        .items
+        .iter()
+        .map(|card| card.name.as_str())
+        .collect();
+    for member in [
+        "support-desk",
+        "support-agent",
+        "no-refund-promise",
+        "notify-support",
+    ] {
+        assert!(!names.contains(member), "{member} persisted: {names:?}");
+    }
+
+    let later = tempfile::tempdir().expect("directory creates");
+    let source = std::fs::read_to_string(fixture("cards/declare_and_pull/support-model.yaml"))
+        .expect("fixture reads");
+    std::fs::write(
+        later.path().join("support-model.yaml"),
+        source.replace("version: 1.0.0", "version: 2.0.0"),
+    )
+    .expect("writes");
+    std::fs::copy(
+        fixture("cards/declare_and_pull/support-model.bin"),
+        later.path().join("support-model.bin"),
+    )
+    .expect("copies");
+    let second = family
+        .declare_from_path(later.path().join("support-model.yaml"))
+        .await
+        .expect("the family editor declares a later release");
+    let second = crate::support::declared(&second, "support-model");
+    family
+        .delete(CardSelector::Uid {
+            kind: CardKind::Model,
+            name: None,
+            version: None,
+            uid: second.uid.clone().expect("the server resolves the UID"),
+        })
+        .await
+        .expect("the family editor deletes its release by UID");
+
+    let exact = editor_at(
+        "release-editor",
+        vec![CardPermissionScope::version(
+            CardKind::Model,
+            model,
+            first.uid.clone().expect("the server resolves the UID"),
+        )],
+    )
+    .await;
+    denied(
+        exact
+            .delete(CardSelector::Exact(prompt))
+            .await
+            .expect_err("the exact editor cannot delete the Prompt"),
+    );
+    exact
+        .delete(CardSelector::Exact(first))
+        .await
+        .expect("the exact editor deletes its version by reference");
+    deployment.shutdown().await;
+}

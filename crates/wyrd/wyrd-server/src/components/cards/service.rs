@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
-use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
+use wyrd_runtime::{Permission, PermissionSet, Principal, PrincipalKind};
 use wyrd_semver::{VersionBlock, VersionRange, VersionSpec};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::api_version::ApiVersion;
@@ -79,6 +79,7 @@ use wyrd_storage::service::{reconcile_upload, upload_abort, upload_init};
 use wyrd_storage::tenant_path;
 use wyrd_types::json_schema_to_fieldspec;
 
+use crate::audit;
 use crate::bifrost::service::register_table;
 use crate::components::auth::Caller;
 use crate::components::cards::mapping::{
@@ -88,6 +89,7 @@ use crate::components::cards::resolve::{
     EffectiveSpecs, GroupSite, ResolvedRefs, ambiguous_source, bind_card_references,
     sibling_identities, site_subjects, source_binding, validate_and_collect_refs,
 };
+use crate::components::cards::routes::authorize_card_at;
 use crate::components::github::service::GithubConnections;
 use crate::components::storage::inventory::{
     ObjectFact, ObjectInventory, ObjectOrigin, ObjectState,
@@ -787,10 +789,13 @@ pub async fn declare_card(
 /// name already established for that repository id, or on first
 /// registration by the name inferred from the connection's `owner/name`, so
 /// a provider rename keeps the family. An explicit name must equal the
-/// established one, and no other repository may own the name.
+/// established one, and no other repository may own the name. For a caller
+/// without tenant-wide `cards:write`, a settled inferred name is then
+/// authorized on its family before anything is written.
 ///
 /// # Errors
-/// Returns the refusals of [`GithubConnections::verify_repository`],
+/// Returns the public permission error for an uncovered inferred family,
+/// the refusals of [`GithubConnections::verify_repository`],
 /// `WYRD_REGISTRY_409_REPOSITORY_IDENTITY_CONFLICT` when the name and the
 /// repository identity disagree with an established family,
 /// `WYRD_REGISTRY_422_INVALID_CARD_SPEC` for an undecodable spec, and
@@ -837,6 +842,14 @@ async fn resolve_repositories(
                 .unwrap_or_else(|| submission.metadata.name.clone()),
             (_, false) => submission.metadata.name.clone(),
         };
+        if infer_name
+            && !caller
+                .principal
+                .effective_permissions
+                .contains(&Permission::card_write())
+        {
+            authorize_family_write(state, caller, &CardKind::Repository, &name)?;
+        }
         admit_repository_family(&mut conn, &name, &repository_id).await?;
         conn.commit().await.map_err(registry_db_error)?;
         spec.host = Some(host);
@@ -965,6 +978,68 @@ fn declared_tables(submissions: &[CardSubmission]) -> Result<Vec<RegisterTableRe
         }
     }
     Ok(tables)
+}
+
+/// Audit operation of a Card declaration's family decisions.
+const DECLARE: &str = "card.declaration.create";
+
+/// Authorize and audit `cards:write` on the family of every submitted Card,
+/// before the idempotency key is read or anything is resolved or persisted.
+///
+/// A caller holding `cards:write` tenant-wide is allowed, and one holding it
+/// at no scope refused, by one tenant-wide decision. Otherwise each distinct
+/// family is decided separately, so a family or exact-version
+/// editor can declare only the graph members its grants cover and one
+/// uncovered member refuses the whole graph. A Repository whose name the
+/// server infers is decided by [`resolve_repositories`] once the name is
+/// settled.
+///
+/// # Errors
+/// Returns the public permission error for the first uncovered family.
+pub(crate) fn authorize_declared_families(
+    state: &AppState,
+    caller: &Caller,
+    request: &DeclareCardRequest,
+) -> Result<(), WyrdError> {
+    let required = Permission::card_write();
+    let held = &caller.principal.effective_permissions;
+    if held.contains(&required) || !held.covers_operation(&required.resource, &required.action) {
+        return audit::authorize(state, caller, &required, DECLARE, "cards");
+    }
+    let inferred = request
+        .repository
+        .as_ref()
+        .is_some_and(|hint| hint.infer_name);
+    let mut decided: Vec<(&CardKind, &CardName)> = Vec::new();
+    for submission in &request.submissions {
+        let family = (&submission.kind, &submission.metadata.name);
+        if (inferred && submission.kind == CardKind::Repository) || decided.contains(&family) {
+            continue;
+        }
+        decided.push(family);
+        authorize_family_write(state, caller, &submission.kind, &submission.metadata.name)?;
+    }
+    Ok(())
+}
+
+/// Decide and audit `cards:write` on Card family `kind`/`name`.
+///
+/// # Errors
+/// Returns the public permission error when no grant covers the family.
+fn authorize_family_write(
+    state: &AppState,
+    caller: &Caller,
+    kind: &CardKind,
+    name: &CardName,
+) -> Result<(), WyrdError> {
+    authorize_card_at(
+        state,
+        caller,
+        &Permission::card_write(),
+        DECLARE,
+        &format!("card:{}/{name}", kind.wire_name()),
+        CardPermissionScope::family(kind.clone(), name.clone()),
+    )
 }
 
 /// Whether any submitted verification binding names an `on_failure` Operator.

@@ -4,7 +4,8 @@ The pull request's execution waits for ``ci``; ``Evidence.publish`` names the
 repository and commit explicitly or through ``WYRD_REPOSITORY`` /
 ``WYRD_COMMIT``, and the receipt is durable and replayable. A pull request may
 also wait for a person: another principal approves the pending signoff with
-``Execution.decide`` and the same execution passes.
+``Execution.decide`` and the same execution passes. An approver bound only on
+the shared Verifier is refused until it may also read the owning Repository.
 """
 
 import time
@@ -13,6 +14,7 @@ from pathlib import Path
 
 import pytest
 from wyrd import WyrdError, verify
+from wyrd.auth import Principals
 from wyrd.cards import Cards
 from wyrd.client import WyrdClient
 from wyrd.github import GithubConnection
@@ -149,7 +151,35 @@ def test_a_person_approves_the_pending_signoff(
         editor.decide(approval_id, "approved")
     assert refused.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
 
-    approver = verify.Execution(execution_id, client_for(server, "approver"))
+    principals = Principals(admin)
+    created = principals.create_service_principal(
+        {
+            "name": "signoff-approver",
+            "assignments": [
+                {
+                    "role": "approver",
+                    "scope": {"card": {"family": {"kind": "Verifier", "name": "signoff"}}},
+                }
+            ],
+        }
+    )
+    approver = verify.Execution(
+        execution_id,
+        WyrdClient(
+            server_url=server.base_url, credential=created["credential"], grpc_url=server.grpc_url
+        ),
+    )
+    with pytest.raises(WyrdError) as refused:
+        approver.decide(approval_id, "approved")
+    assert refused.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
+
+    principals.bind(
+        {
+            "subject": {"principal": {"id": created["principal_id"], "kind": "service"}},
+            "role": "viewer",
+            "scope": {"card": {"family": {"kind": "Repository", "name": "web"}}},
+        }
+    )
     decided = approver.decide(approval_id, "approved", reason="reviewed the diff")
     assert decided["approval_id"] == approval_id
     assert decided["status"] == "approved"

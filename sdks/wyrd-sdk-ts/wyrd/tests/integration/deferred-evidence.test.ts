@@ -8,7 +8,15 @@ import { join } from "node:path";
 
 import { expect, vi } from "vitest";
 
-import { Cards, GithubConnection, type VerificationExecutionState, WyrdClient, WyrdError, verify } from "wyrd-ai";
+import {
+  Cards,
+  GithubConnection,
+  Principals,
+  type VerificationExecutionState,
+  WyrdClient,
+  WyrdError,
+  verify,
+} from "wyrd-ai";
 import { signInGithubBrowser } from "@wyrd/testing";
 
 import { fixture, serverTest } from "../support/server.js";
@@ -145,7 +153,23 @@ test("another principal approves the pending signoff and the same execution pass
   expect(editorRefused).toBeInstanceOf(WyrdError);
   expect((editorRefused as WyrdError).code).toBe("WYRD_PERMISSION_403_DENIED_RBAC");
 
-  const approver = await as("signoff_approver", "approver");
+  const principals = await Principals.connect({ client: admin });
+  const created = await principals.createServicePrincipal({
+    name: "signoff-approver",
+    assignments: [{ role: "approver", scope: { card: { family: { kind: "Verifier", name: "signoff" } } } }],
+  });
+  const approver = await verify.Execution.connect(id, {
+    client: WyrdClient.connect({ credential: created.credential }),
+  });
+  await expect(approver.decide(pending.approval_id, "approved")).rejects.toMatchObject({
+    code: "WYRD_PERMISSION_403_DENIED_RBAC",
+  });
+
+  await principals.bind({
+    subject: { principal: { id: created.principal_id, kind: "service" } },
+    role: "viewer",
+    scope: { card: { family: { kind: "Repository", name: "web" } } },
+  });
   const decided = await approver.decide(pending.approval_id, "approved", "reviewed the diff");
   expect(decided).toMatchObject({ approval_id: pending.approval_id, status: "approved", reason: "reviewed the diff" });
   expect(decided.actor_id).toBeTruthy();

@@ -753,6 +753,7 @@ mod pg_tests {
     use wyrd_client::config::ClientConfig;
     use wyrd_client::transport::{HttpTransport, ResolvedCredential};
     use wyrd_testing::Bootstrap;
+    use wyrd_testing::principal::within_propagation;
 
     async fn start_cli_server() -> (
         WyrdTestServer,
@@ -3410,6 +3411,261 @@ mod pg_tests {
                 );
             }
         }
+
+        stop_cli_server(server, shutdown, serve_handle).await;
+    }
+
+    /// An administrator grants, inspects and removes scoped access through
+    /// `wyrd principal access`, and the account's Card reads follow it.
+    ///
+    /// A direct `viewer` grant on the `code-review` family lets the account
+    /// read that family and nothing else; a custom role bound to a local
+    /// group reaches `unrelated-check` only while the account is a member.
+    /// `show` names each grant's binding, scope and source. Revoking the
+    /// binding, deleting the group and its role end both reads. The
+    /// account's own grant attempt is refused without creating a binding.
+    ///
+    /// # Panics
+    /// Panics when a command succeeds, fails or prints contrary to the
+    /// contract, or a read does not follow the access within propagation.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the repository-managed Postgres journey lifecycle"]
+    async fn administrators_manage_scoped_access_through_the_cli() {
+        let (server, base_url, _storage_root, shutdown, serve_handle) = start_cli_server().await;
+        let Bootstrap::User { jwt, .. } = server
+            .bootstrap_user("cli-access-admin", &["admin"])
+            .await
+            .expect("admin bootstraps")
+        else {
+            panic!("admin bootstrap returned a non-user principal");
+        };
+        let cards = public_cards_client(&base_url, &jwt).await;
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../fixtures/cards");
+        for fixture in ["code-review.yaml", "unrelated.yaml"] {
+            cards
+                .declare_from_path(fixtures.join("repository_declaration").join(fixture))
+                .await
+                .unwrap_or_else(|error| panic!("{fixture} declares: {error}"));
+        }
+        let run = |token: &str, arguments: &[&str]| {
+            let mut arguments: Vec<String> = arguments.iter().map(|&arg| arg.to_owned()).collect();
+            arguments.extend(["--server".to_owned(), base_url.clone()]);
+            run_cli_owned_with_token(arguments, Some(token.to_owned()))
+        };
+        let succeeded = |output: &Output| {
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            assert!(
+                output.status.success(),
+                "command failed: stdout={stdout} stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            stdout
+        };
+        let field = |stdout: &str, name: &str| {
+            stdout
+                .lines()
+                .find_map(|line| line.strip_prefix(name))
+                .unwrap_or_else(|| panic!("{name} is printed: {stdout}"))
+                .to_owned()
+        };
+        let created = succeeded(
+            &run(
+                &jwt,
+                &[
+                    "principal",
+                    "credential",
+                    "create-principal",
+                    "--name",
+                    "cli-access-target",
+                ],
+            )
+            .await,
+        );
+        let target = field(&created, "principal_id: ");
+        let token = server
+            .exchange_api_key(&SecretString::from(field(&created, "credential: ")))
+            .await
+            .expect("the key exchanges");
+        let reads = |name: &'static str| {
+            let token = token.clone();
+            let base_url = base_url.clone();
+            async move {
+                run_cli_owned_with_token(
+                    [
+                        "latest", "--kind", "Verifier", "--name", name, "--server", &base_url,
+                    ]
+                    .map(str::to_owned)
+                    .to_vec(),
+                    Some(token),
+                )
+                .await
+                .status
+                .success()
+            }
+        };
+        let show = || {
+            run(
+                &jwt,
+                &["principal", "access", "show", "--principal", &target],
+            )
+        };
+        let direct = ["--principal", target.as_str(), "--kind", "service"];
+        let family = "viewer:Verifier/code-review";
+
+        let refused = run(
+            &token,
+            &[
+                &["principal", "access", "grant"][..],
+                &direct,
+                &["--grant", family],
+            ]
+            .concat(),
+        )
+        .await;
+        assert!(!refused.status.success(), "the account cannot grant itself");
+        assert_eq!(
+            first_stderr_json(&refused)["code"],
+            "WYRD_PERMISSION_403_DENIED_RBAC"
+        );
+        assert!(
+            !succeeded(&show().await).contains("grant  "),
+            "the refused grant created no binding"
+        );
+        assert!(!reads("code-review").await);
+
+        let granted = succeeded(
+            &run(
+                &jwt,
+                &[
+                    &["principal", "access", "grant"][..],
+                    &direct,
+                    &["--grant", family],
+                ]
+                .concat(),
+            )
+            .await,
+        );
+        let binding = granted
+            .split_whitespace()
+            .next()
+            .expect("grant prints its binding")
+            .to_owned();
+        assert_eq!(
+            granted,
+            format!("{binding}  {family}  service:{target}  direct\n")
+        );
+        assert!(
+            succeeded(&show().await).contains(&format!("grant  {binding}  {family}  direct")),
+            "show names the binding"
+        );
+        assert!(within_propagation(&true, || reads("code-review")).await);
+        assert!(
+            !reads("unrelated-check").await,
+            "only the family is granted"
+        );
+
+        succeeded(
+            &run(
+                &jwt,
+                &[
+                    "principal",
+                    "access",
+                    "put-role",
+                    "--role",
+                    "cli_reader",
+                    "--operation",
+                    "cards:read",
+                ],
+            )
+            .await,
+        );
+        let group = succeeded(
+            &run(
+                &jwt,
+                &[
+                    "principal",
+                    "access",
+                    "create-group",
+                    "--name",
+                    "cli-readers",
+                ],
+            )
+            .await,
+        );
+        let group = group
+            .split_whitespace()
+            .next()
+            .expect("group id")
+            .to_owned();
+        succeeded(
+            &run(
+                &jwt,
+                &[
+                    "principal",
+                    "access",
+                    "grant",
+                    "--group",
+                    &group,
+                    "--grant",
+                    "cli_reader:Verifier/unrelated-check",
+                ],
+            )
+            .await,
+        );
+        let member = ["--group", group.as_str(), "--principal", target.as_str()];
+        succeeded(
+            &run(
+                &jwt,
+                &[&["principal", "access", "add-member"][..], &member].concat(),
+            )
+            .await,
+        );
+        assert!(
+            succeeded(&show().await)
+                .contains("cli_reader:Verifier/unrelated-check  group:cli-readers"),
+            "show names the group source"
+        );
+        assert!(within_propagation(&true, || reads("unrelated-check")).await);
+        succeeded(
+            &run(
+                &jwt,
+                &[&["principal", "access", "remove-member"][..], &member].concat(),
+            )
+            .await,
+        );
+        assert!(!within_propagation(&false, || reads("unrelated-check")).await);
+
+        assert_eq!(
+            succeeded(
+                &run(
+                    &jwt,
+                    &["principal", "access", "revoke", "--binding", &binding]
+                )
+                .await
+            ),
+            granted,
+            "revoke prints the removed binding"
+        );
+        assert!(!within_propagation(&false, || reads("code-review")).await);
+        assert!(!succeeded(&show().await).contains("grant  "));
+        succeeded(
+            &run(
+                &jwt,
+                &["principal", "access", "delete-group", "--group", &group],
+            )
+            .await,
+        );
+        succeeded(
+            &run(
+                &jwt,
+                &["principal", "access", "delete-role", "--role", "cli_reader"],
+            )
+            .await,
+        );
+        assert!(
+            !succeeded(&run(&jwt, &["principal", "access", "roles"]).await).contains("cli_reader"),
+            "the custom role is gone"
+        );
 
         stop_cli_server(server, shutdown, serve_handle).await;
     }

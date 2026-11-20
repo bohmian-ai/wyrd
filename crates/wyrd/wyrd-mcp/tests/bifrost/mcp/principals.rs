@@ -930,6 +930,25 @@ mod pg_tests {
             hidden.contains("WYRD_REGISTRY_404_CARD_NOT_FOUND"),
             "another family reads as absent: {hidden}"
         );
+        // A name no Card has, and the readable Card's reference beside the
+        // hidden Card's UID, are refused in the same words as the hidden
+        // Card.
+        let mut absent = serde_json::to_value(other)?;
+        absent["name"] = "no-such-check".into();
+        absent["uid"] = serde_json::Value::Null;
+        let mut mismatched = serde_json::to_value(payments)?;
+        mismatched["uid"] = serde_json::to_value(&other.uid)?;
+        for card_ref in [absent, mismatched] {
+            let refused = refusal(
+                agent
+                    .call_tool(call(
+                        "cards.get",
+                        serde_json::json!({ "card_ref": card_ref }),
+                    )?)
+                    .await,
+            )?;
+            assert_eq!(refused, hidden);
+        }
 
         agent.cancel().await?;
         Ok(())

@@ -1169,7 +1169,7 @@ async fn group_custom_and_exact_version_bindings_scope_reads() {
             scope: PermissionScope::Card(CardPermissionScope::version(
                 CardKind::Verifier,
                 family.clone(),
-                uid_one,
+                uid_one.clone(),
             )),
         })
         .await
@@ -1182,20 +1182,55 @@ async fn group_custom_and_exact_version_bindings_scope_reads() {
     let own = Cards::connect_with(&dave.client)
         .await
         .expect("Dave connects");
-    own.get(CardSelector::Exact(version_one))
+    own.get(CardSelector::Exact(version_one.clone()))
         .await
         .expect("Dave reads version 1.0.0");
-    for hidden in [
-        CardSelector::Exact(version_two),
-        CardSelector::Named {
-            kind: CardKind::Verifier,
-            name: CardName::new("unrelated-check").expect("valid name"),
-            version: None,
-        },
+    // Every read that finds no Card visible to its reader answers alike: a
+    // hidden version or family, a name or UID no Card has, a visible Card's
+    // UID under another kind, and another tenant's administrator asking for
+    // this tenant's Card. Nothing in the answer tells a hidden Card from an
+    // absent one.
+    let uid_two = version_two
+        .uid
+        .clone()
+        .expect("the server resolves the UID");
+    let named = |name: &str| CardSelector::Named {
+        kind: CardKind::Verifier,
+        name: CardName::new(name).expect("valid name"),
+        version: None,
+    };
+    let absent = wyrd_ai::cards::CardRef {
+        name: CardName::new("no-such-check").expect("valid name"),
+        uid: None,
+        ..version_one.clone()
+    };
+    let no_uid = wyrd_spec::ids::CardUid::new("0190aaaa-bbbb-7ccc-8ddd-eeeeeeeeeeee".to_owned())
+        .expect("a UUIDv7 is a valid Card UID");
+    let outsider =
+        Cards::connect_with(&deployment.client(&deployment.other_tenant_admin("elsewhere").await))
+            .await
+            .expect("the other tenant's administrator connects");
+    let mut answers = BTreeSet::new();
+    for (reader, selector) in [
+        (&own, CardSelector::Exact(version_two)),
+        (&own, named("unrelated-check")),
+        (&own, CardSelector::uid(CardKind::Verifier, uid_two)),
+        (&own, CardSelector::Exact(absent)),
+        (&own, named("no-such-check")),
+        (&own, CardSelector::uid(CardKind::Verifier, no_uid)),
+        (&own, CardSelector::uid(CardKind::Model, uid_one.clone())),
+        (&outsider, CardSelector::Exact(version_one)),
+        (&outsider, CardSelector::uid(CardKind::Verifier, uid_one)),
     ] {
-        let refused = own.get(hidden).await.expect_err("hidden");
+        let refused = reader.get(selector).await.expect_err("no Card is visible");
         assert_eq!(refused.code(), "WYRD_REGISTRY_404_CARD_NOT_FOUND");
+        answers.insert(refused.to_string());
     }
+    assert_eq!(
+        answers.len(),
+        1,
+        "every refusal reads the same: {answers:?}"
+    );
     deployment.shutdown().await;
 }
 

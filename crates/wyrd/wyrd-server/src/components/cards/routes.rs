@@ -27,7 +27,9 @@ use wyrd_sql::queries::cards::{card_scopes, find_card_by_ref};
 
 use crate::audit;
 use crate::components::auth::Caller;
-use crate::components::cards::service::{self, CardFiles, require_object};
+use crate::components::cards::service::{
+    self, CardFiles, conceal_absence, no_visible_card, require_object,
+};
 use crate::http::error::WyrdErrorResponse;
 use crate::state::{AppState, registry_db_error};
 use utoipa_axum::router::OpenApiRouter;
@@ -89,8 +91,9 @@ async fn get_card_http(
 ///
 /// # Errors
 /// Returns [`WyrdError::PermissionDeniedRbac`] without `cards:read`,
-/// [`WyrdError::RegistryCardNotFound`] when the UID is absent or of another
-/// kind, and the registry errors of [`service::get_card_by_uid`].
+/// [`WyrdError::RegistryCardNotFound`], with the one detail of
+/// [`no_visible_card`], when the UID is absent, hidden, or of another kind,
+/// and the other registry errors of [`service::get_card_by_uid`].
 pub(crate) async fn get_card_for(
     state: &AppState,
     caller: &Caller,
@@ -99,12 +102,12 @@ pub(crate) async fn get_card_for(
 ) -> Result<GetCardResponse, WyrdError> {
     let objects =
         authorize_card_objects(state, caller, "card.read.uid", &format!("card:{card_uid}"))?;
-    let response = service::get_card_by_uid(state, caller, card_uid).await?;
+    let response = service::get_card_by_uid(state, caller, card_uid)
+        .await
+        .map_err(conceal_absence)?;
     require_visible(objects.as_deref(), &response.card)?;
     if &response.card.kind != kind {
-        return Err(WyrdError::registry_card_not_found(
-            "card UID is not in the requested kind namespace",
-        ));
+        return Err(no_visible_card());
     }
     Ok(response)
 }
@@ -178,22 +181,24 @@ pub(crate) async fn get_card_by_ref_for(
 ///
 /// # Errors
 /// Returns the errors of [`authorize_card_ref`],
-/// [`WyrdError::RegistryCardNotFound`] when the named UID is another Card's,
-/// and the errors of [`service::get_card_objects_by_ref`].
+/// [`WyrdError::RegistryCardNotFound`], with the one detail of
+/// [`no_visible_card`], when the Card is absent or hidden or the named UID is
+/// another Card's, and the other errors of
+/// [`service::get_card_objects_by_ref`].
 pub(crate) async fn get_card_objects_by_ref_for(
     state: &AppState,
     caller: &Caller,
     card_ref: &CardRef,
 ) -> Result<(GetCardResponse, CardFiles), WyrdError> {
     let objects = authorize_card_ref(state, caller, card_ref)?;
-    let (response, files) = service::get_card_objects_by_ref(state, caller, card_ref).await?;
+    let (response, files) = service::get_card_objects_by_ref(state, caller, card_ref)
+        .await
+        .map_err(conceal_absence)?;
     require_visible(objects.as_deref(), &response.card)?;
     if let Some(uid) = &card_ref.uid
         && response.card.metadata.uid.as_ref() != Some(uid)
     {
-        return Err(WyrdError::registry_card_not_found(
-            "card UID does not match the referenced identity",
-        ));
+        return Err(no_visible_card());
     }
     Ok((response, files))
 }
@@ -221,8 +226,10 @@ pub(crate) fn authorize_card_ref(
 ///
 /// # Errors
 /// Returns `WYRD_REGISTRY_400_INVALID_CARD_SPEC` for an ill-formed kind or
-/// name, `WYRD_PERMISSION_403_DENIED_RBAC` without `card:read`, and the
-/// not-found and availability errors of [`service::get_latest_card`].
+/// name, `WYRD_PERMISSION_403_DENIED_RBAC` without `card:read`,
+/// `WYRD_REGISTRY_404_CARD_NOT_FOUND`, with the one detail of
+/// [`no_visible_card`], for an absent or hidden line, and the availability
+/// errors of [`service::get_latest_card`].
 #[utoipa::path(
     get,
     path = "/cards/{kind}/{name}/latest",
@@ -262,7 +269,9 @@ async fn get_latest_card_http(
         "card.read.latest",
         &format!("card:{}/{name}", kind.wire_name()),
     )?;
-    let response = service::get_latest_card(&state, &caller, kind, name).await?;
+    let response = service::get_latest_card(&state, &caller, kind, name)
+        .await
+        .map_err(conceal_absence)?;
     require_visible(objects.as_deref(), &response.card)?;
     Ok(Json(response))
 }

@@ -412,10 +412,27 @@ pub(crate) fn require_object(
     required: &CardPermissionScope,
 ) -> Result<(), WyrdError> {
     match objects {
-        Some(objects) if !objects.iter().any(|scope| scope.covers(required)) => Err(
-            WyrdError::registry_card_not_found("no such Card is visible to this principal"),
-        ),
+        Some(objects) if !objects.iter().any(|scope| scope.covers(required)) => {
+            Err(no_visible_card())
+        }
         _ => Ok(()),
+    }
+}
+
+/// The one answer every Card read gives when it finds no Card its reader
+/// may see: a hidden Card, an absent one, a UID of another kind and a UID
+/// beside another identity all read alike.
+pub(crate) fn no_visible_card() -> WyrdError {
+    WyrdError::registry_card_not_found("no such Card is visible to this principal")
+}
+
+/// Rewrite any not-found `error` of a Card read to [`no_visible_card`], so a
+/// reader cannot tell a hidden Card from an absent one. Every other error,
+/// an unavailable registry included, passes through unchanged.
+pub(crate) fn conceal_absence(error: WyrdError) -> WyrdError {
+    match error {
+        WyrdError::RegistryCardNotFound { .. } => no_visible_card(),
+        other => other,
     }
 }
 
@@ -3782,6 +3799,20 @@ mod tests {
 
         assert_eq!(error.code(), "WYRD_REGISTRY_400_INVALID_CARD_SPEC");
         assert!(error.to_string().contains("artifact hash"));
+    }
+
+    /// Every not-found of a Card read becomes the hidden Card's answer; an
+    /// unavailable registry stays what it is.
+    #[test]
+    fn a_card_read_conceals_absence_and_keeps_operational_errors() {
+        let absent = super::conceal_absence(super::WyrdError::registry_card_not_found(
+            "no card with uid x",
+        ));
+        assert_eq!(absent.to_string(), super::no_visible_card().to_string());
+
+        let down = super::conceal_absence(super::WyrdError::registry_unavailable("pool closed"));
+        assert_eq!(down.code(), "WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE");
+        assert!(down.to_string().contains("pool closed"));
     }
 }
 

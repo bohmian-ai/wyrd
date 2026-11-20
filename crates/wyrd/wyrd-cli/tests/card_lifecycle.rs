@@ -3314,4 +3314,103 @@ mod pg_tests {
 
         stop_cli_server(server, shutdown, serve_handle).await;
     }
+
+    /// A Service account bound viewer at one Verifier family lists and reads
+    /// only that family through the CLI; the other family's Card is the same
+    /// not-found an absent Card is.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the repository-managed Postgres journey lifecycle"]
+    async fn a_family_bound_viewer_lists_only_that_family() {
+        use wyrd_client::principals::{
+            CreateServicePrincipalRequest, PermissionScope, Principals, ScopedRoleAssignment,
+        };
+        use wyrd_spec::auth::CardPermissionScope;
+        use wyrd_spec::envelope::CardKind;
+        use wyrd_spec::ids::CardName;
+
+        let (server, base_url, _storage_root, shutdown, serve_handle) = start_cli_server().await;
+        let Bootstrap::User { jwt, .. } = server
+            .bootstrap_user("cli-scope-admin", &["admin"])
+            .await
+            .expect("admin bootstraps")
+        else {
+            panic!("admin bootstrap returned a non-user principal");
+        };
+        let cards = public_cards_client(&base_url, &jwt).await;
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../fixtures/cards");
+        for fixture in ["code-review.yaml", "unrelated.yaml"] {
+            cards
+                .declare_from_path(fixtures.join("repository_declaration").join(fixture))
+                .await
+                .unwrap_or_else(|error| panic!("{fixture} declares: {error}"));
+        }
+        let mut config = ClientConfig::default();
+        config.http.base_url.clone_from(&base_url);
+        let auth = AuthMiddleware::new(
+            &config,
+            ResolvedCredential::BearerToken(SecretString::from(jwt.clone())),
+        )
+        .expect("admin auth builds");
+        let transport =
+            HttpTransport::new(&config.http, Arc::clone(&auth)).expect("transport builds");
+        let created =
+            Principals::connect_with(&WyrdClient::from_parts(auth, transport, config.grpc))
+                .await
+                .expect("principals connect")
+                .create_service_principal(&CreateServicePrincipalRequest {
+                    name: "cli-payments-reader".to_owned(),
+                    description: None,
+                    assignments: vec![ScopedRoleAssignment {
+                        role: "viewer".to_owned(),
+                        scope: PermissionScope::Card(CardPermissionScope::family(
+                            CardKind::Verifier,
+                            CardName::new("code-review").expect("valid name"),
+                        )),
+                    }],
+                    workload_restriction: None,
+                })
+                .await
+                .expect("the scoped account is created");
+        let token = server
+            .exchange_api_key(&SecretString::from(created.credential.expose().to_owned()))
+            .await
+            .expect("the key exchanges");
+
+        let list = run_cli_async_with_token!(
+            &token, "list", "--kind", "Verifier", "--server", &base_url, "--format", "json",
+        );
+        assert!(
+            list.status.success(),
+            "{}",
+            String::from_utf8_lossy(&list.stderr)
+        );
+        let listed: Value = serde_json::from_slice(&list.stdout).expect("list output is JSON");
+        let names = listed["items"]
+            .as_array()
+            .expect("list items")
+            .iter()
+            .map(|item| item["name"].as_str().expect("item name"))
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["code-review"], "{listed}");
+        for (name, found) in [("code-review", true), ("unrelated-check", false)] {
+            let read = run_cli_async_with_token!(
+                &token, "latest", "--kind", "Verifier", "--name", name, "--server", &base_url,
+                "--format", "json",
+            );
+            assert_eq!(
+                read.status.success(),
+                found,
+                "{name}: {}",
+                String::from_utf8_lossy(&read.stderr)
+            );
+            if !found {
+                assert_eq!(
+                    first_stderr_json(&read)["code"],
+                    "WYRD_REGISTRY_404_CARD_NOT_FOUND"
+                );
+            }
+        }
+
+        stop_cli_server(server, shutdown, serve_handle).await;
+    }
 }

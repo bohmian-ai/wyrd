@@ -161,9 +161,10 @@ pub(crate) async fn machine_token(server: &WyrdTestServer, bootstrap: &Bootstrap
 /// An administrator revokes a principal through the CLI, against a real server.
 ///
 /// Revocation suspends the principal: its API key can no longer mint a token,
-/// while the token it already holds is a five-minute snapshot that keeps
-/// working until expiry. The pre-revocation probe proves the CLI really
-/// authenticated, so the refused exchange is the revocation's doing.
+/// and the token it already holds spends current authority, so it is refused
+/// once the change propagates, within the five-second bound. The
+/// pre-revocation probe proves the CLI really authenticated, so both refusals
+/// are the revocation's doing.
 #[tokio::test]
 async fn principal_revoke_cli_journey() {
     let (server, base_url, shutdown, serve_handle) = start_served("principal revoke").await;
@@ -213,11 +214,20 @@ async fn principal_revoke_cli_journey() {
             .is_err(),
         "the revoked principal cannot mint another token"
     );
-    assert_eq!(
-        v1_status(&server, &target_token).await,
-        StatusCode::OK,
-        "a token minted before revocation is a snapshot that lapses at expiry"
-    );
+    // The revoking request does not mark this replica's cache; the change
+    // arrives by notification, which the contract bounds at five seconds.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let status = v1_status(&server, &target_token).await;
+        if status == StatusCode::UNAUTHORIZED {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a token minted before revocation is refused within the propagation bound; last {status}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 
     stop_served(server, shutdown, serve_handle).await;
 }

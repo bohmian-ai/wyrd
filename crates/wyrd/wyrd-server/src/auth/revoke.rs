@@ -21,8 +21,8 @@ use wyrd_sql::TenantConn;
 /// Revoke one principal under the caller's tenant.
 ///
 /// Revocation suspends the principal, so every tenant issuance path refuses its
-/// next token; a token it already holds lapses at its five-minute expiry. Its
-/// unfinished Verifier executions are cancelled in the same commit.
+/// next token; a token it already holds is refused once the change
+/// propagates, within five seconds. Its unfinished Verifier executions are cancelled in the same commit.
 ///
 /// Revocation is an administrative authorization boundary: the
 /// `service_accounts:write` verdict is audited for both outcomes. Either

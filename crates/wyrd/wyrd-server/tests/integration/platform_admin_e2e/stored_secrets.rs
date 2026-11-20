@@ -651,3 +651,171 @@ async fn bounded_routine_passes_cover_every_store_and_report_what_remains() {
     );
     srv.shutdown().await.expect("server shuts down");
 }
+
+/// Recovery reseals every stored secret under a fresh data key, including
+/// secrets a routine pass already moved before the incident was found: after
+/// routine rotation onto `k2` keeps every payload, activating a fresh `k3`
+/// and running recovery changes every payload, names `k3`, and every owner
+/// opens its value with only `k3` configured.
+///
+/// # Panics
+/// Panics when routine changes a payload, recovery keeps one, an envelope is
+/// skipped, or an owner cannot open its secret afterwards.
+#[tokio::test]
+async fn recovery_renews_every_data_key_even_after_a_routine_rotation() {
+    let transit = TransitFixture::start().await;
+    let srv = start(&transit, "k1", &[]).await;
+    let provider = wiremock::MockServer::start().await;
+    let seeded = seed(&srv, &provider, &["acme-a"]).await;
+    let sealed = stored_envelopes(&srv).await;
+
+    let srv = roll_out(srv, &transit, "k2", &["k1"]).await;
+    let (status, routine) = maintain(
+        &srv,
+        &seeded.session(&srv).await,
+        json!({ "mode": "routine" }),
+    )
+    .await;
+    assert_eq!(
+        (status, &routine["changed"]),
+        (StatusCode::OK, &json!(5)),
+        "{routine}"
+    );
+    let rotated = stored_envelopes(&srv).await;
+    assert_eq!(
+        payloads(&rotated),
+        payloads(&sealed),
+        "routine keeps every payload"
+    );
+
+    // The incident is found after the routine rotation: activate a fresh key.
+    let srv = roll_out(srv, &transit, "k3", &["k2"]).await;
+    let (status, recovery) = maintain(
+        &srv,
+        &seeded.session(&srv).await,
+        json!({ "mode": "recovery" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{recovery}");
+    assert_eq!(
+        (
+            &recovery["mode"],
+            &recovery["changed"],
+            &recovery["remaining"]
+        ),
+        (&json!("recovery"), &json!(5), &json!(0)),
+        "{recovery}"
+    );
+    let renewed = stored_envelopes(&srv).await;
+    assert_eq!(
+        owners(&renewed),
+        owners(&rotated),
+        "resource identities are kept"
+    );
+    assert!(key_refs(&renewed).iter().all(|key| *key == "k3"));
+    for (fresh, old) in payloads(&renewed).iter().zip(payloads(&rotated)) {
+        assert_ne!(*fresh, old, "recovery reseals every payload");
+    }
+
+    let srv = roll_out(srv, &transit, "k3", &[]).await;
+    seeded.every_owner_opens(&srv, &provider).await;
+    srv.shutdown().await.expect("server shuts down");
+}
+
+/// An interrupted recovery resumes safely and a denied key leaves state
+/// intact: a bounded recovery commits some renewals; after a restart the same
+/// mode leaves those byte-identical, counts them current, and renews the rest;
+/// with the wrapping backend refusing, a routine pass reports each owner as
+/// `key_unavailable`, moves nothing, and a later pass converges.
+///
+/// # Panics
+/// Panics when a resumed pass re-renews a finished envelope, a denied pass
+/// mutates a row or reports completion, or the final pass does not converge.
+#[tokio::test]
+async fn interrupted_or_denied_passes_resume_without_losing_committed_work() {
+    let transit = TransitFixture::start().await;
+    let srv = start(&transit, "k1", &[]).await;
+    let provider = wiremock::MockServer::start().await;
+    let seeded = seed(&srv, &provider, &["acme-a"]).await;
+
+    let srv = roll_out(srv, &transit, "k2", &["k1"]).await;
+    let (_, partial) = maintain(
+        &srv,
+        &seeded.session(&srv).await,
+        json!({ "mode": "recovery", "limit": 2 }),
+    )
+    .await;
+    assert_eq!(
+        (
+            &partial["changed"],
+            &partial["remaining"],
+            &partial["bounded"]
+        ),
+        (&json!(2), &json!(3), &json!(true)),
+        "{partial}"
+    );
+    let interrupted = stored_envelopes(&srv).await;
+    let finished: Vec<&Stored> = interrupted
+        .iter()
+        .filter(|(_, _, envelope)| envelope_parts(envelope).0 == "k2")
+        .collect();
+    assert_eq!(finished.len(), 2);
+
+    let srv = roll_out(srv, &transit, "k2", &["k1"]).await;
+    let (_, resumed) = maintain(
+        &srv,
+        &seeded.session(&srv).await,
+        json!({ "mode": "recovery" }),
+    )
+    .await;
+    assert_eq!(
+        (
+            &resumed["current"],
+            &resumed["changed"],
+            &resumed["remaining"]
+        ),
+        (&json!(2), &json!(3), &json!(0)),
+        "{resumed}"
+    );
+    let after = stored_envelopes(&srv).await;
+    for row in finished {
+        assert!(
+            after.contains(row),
+            "a finished renewal is never redone: {}",
+            row.1
+        );
+    }
+
+    let srv = roll_out(srv, &transit, "k3", &["k2"]).await;
+    let session = seeded.session(&srv).await;
+    let before = stored_envelopes(&srv).await;
+    transit.set_available(false);
+    let (status, denied) = maintain(&srv, &session, json!({ "mode": "routine" })).await;
+    assert_eq!(status, StatusCode::OK, "{denied}");
+    assert_eq!(
+        (&denied["changed"], &denied["remaining"]),
+        (&json!(0), &json!(5)),
+        "{denied}"
+    );
+    let reasons: Vec<&Value> = denied["failures"]
+        .as_array()
+        .expect("failures")
+        .iter()
+        .map(|failure| &failure["reason"])
+        .collect();
+    assert_eq!(reasons, vec![&json!("key_unavailable"); 5], "{denied}");
+    assert_eq!(
+        stored_envelopes(&srv).await,
+        before,
+        "a denied pass moved nothing"
+    );
+
+    transit.set_available(true);
+    let (_, recovered) = maintain(&srv, &session, json!({ "mode": "routine" })).await;
+    assert_eq!(
+        (&recovered["changed"], &recovered["remaining"]),
+        (&json!(5), &json!(0)),
+        "{recovered}"
+    );
+    srv.shutdown().await.expect("server shuts down");
+}

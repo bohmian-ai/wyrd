@@ -1,21 +1,26 @@
 //! Wrapping-key lifecycle journeys: activation, explicit maintenance passes,
 //! recovery, interruption, denial, races, and containment, against a real
-//! server, Vault Transit fixture, and repository Postgres.
+//! server, a Vault Transit fixture, and repository Postgres.
 
-use axum::http::{Method, StatusCode};
+use axum::body::{Body, to_bytes};
+use axum::http::{Method, Response, StatusCode};
 use serde_json::{Value, json};
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::kms::TransitFixture;
 
 use super::{
-    PLATFORM_CLIENT, PLATFORM_CLIENT_SECRET, body_json, confidential_platform_sign_in,
+    PLATFORM_CLIENT, PLATFORM_CLIENT_SECRET, anonymous_post, confidential_platform_sign_in,
     initialize_platform_root, mount_platform_provider, platform_key_set, platform_post,
-    platform_request, platform_session, tenant_request, tenant_token,
+    platform_request, platform_session, system_audit_decisions, tenant_request, tenant_token,
 };
+
+/// The maintenance route.
+const MAINTENANCE: &str = "/platform/stored-secrets/maintenance";
 
 /// Every stored envelope with its store and owner, in a stable order.
 const STORED_ENVELOPES: &str = "SELECT store, owner, envelope FROM (
-      SELECT 'human_connection' AS store, connection_id::text AS owner,
+      SELECT 'human_connection' AS store,
+             data_tenant_id::text || ' ' || connection_id::text AS owner,
              client_secret_enc AS envelope
         FROM wyrd.auth_human_connections WHERE client_secret_enc IS NOT NULL
       UNION ALL SELECT 'trusted_issuer', data_tenant_id::text || ' ' || issuer_url,
@@ -26,7 +31,8 @@ const STORED_ENVELOPES: &str = "SELECT store, owner, envelope FROM (
       UNION ALL SELECT 'gateway_credential', data_tenant_id::text || ' ' || name,
              secret_ciphertext
         FROM wyrd.gateway_provider_credentials WHERE secret_ciphertext IS NOT NULL
-      UNION ALL SELECT 'operator_connection', connection_id::text, secret_ciphertext
+      UNION ALL SELECT 'operator_connection',
+             data_tenant_id::text || ' ' || connection_id::text, secret_ciphertext
         FROM wyrd.operator_connections
     ) stored ORDER BY store, owner";
 
@@ -58,6 +64,14 @@ fn envelope_parts(envelope: &[u8]) -> (&str, &[u8]) {
     (key_ref, &envelope[at + 4 + wrapped_len..])
 }
 
+/// The store and owner of each stored envelope.
+fn owners(stored: &[Stored]) -> Vec<(&str, &str)> {
+    stored
+        .iter()
+        .map(|(store, owner, _)| (store.as_str(), owner.as_str()))
+        .collect()
+}
+
 /// The wrapping-key reference each stored envelope names.
 fn key_refs(stored: &[Stored]) -> Vec<&str> {
     stored
@@ -66,30 +80,17 @@ fn key_refs(stored: &[Stored]) -> Vec<&str> {
         .collect()
 }
 
-/// Send `method uri` with an optional JSON body as `token` and decode the
-/// answer.
-///
-/// # Panics
-/// Panics when the route does not respond or the body is not JSON.
-async fn call(
-    srv: &WyrdTestServer,
-    token: &str,
-    method: Method,
-    uri: &str,
-    body: Option<Value>,
-) -> (StatusCode, Value) {
-    let resp = srv
-        .oneshot_authenticated(token, tenant_request(method, uri, body))
-        .await
-        .expect("route responds");
-    let status = resp.status();
-    let body = to_bytes_json(resp).await;
-    (status, body)
+/// The payload tail (nonce and ciphertext) of each stored envelope.
+fn payloads(stored: &[Stored]) -> Vec<&[u8]> {
+    stored
+        .iter()
+        .map(|(_, _, envelope)| envelope_parts(envelope).1)
+        .collect()
 }
 
 /// Decode a JSON body, or `null` for an empty one.
-async fn to_bytes_json(resp: axum::http::Response<axum::body::Body>) -> Value {
-    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+async fn json_body(resp: Response<Body>) -> Value {
+    let bytes = to_bytes(resp.into_body(), 1 << 20)
         .await
         .expect("read body");
     if bytes.is_empty() {
@@ -99,12 +100,92 @@ async fn to_bytes_json(resp: axum::http::Response<axum::body::Body>) -> Value {
     }
 }
 
-/// A deployment with a secret in every store it seeds.
+/// Run one maintenance pass with `body` as the platform session `session`.
+///
+/// # Panics
+/// Panics when the route does not respond.
+async fn maintain(srv: &WyrdTestServer, session: &str, body: Value) -> (StatusCode, Value) {
+    let resp = srv
+        .oneshot(platform_post(MAINTENANCE, session, body))
+        .await
+        .expect("maintenance route responds");
+    let status = resp.status();
+    (status, json_body(resp).await)
+}
+
+/// One seeded tenant: its public host and administrator credential.
+struct Tenant {
+    /// The tenant slug; its public host is `<slug>.wyrd.test`.
+    slug: String,
+    /// The administrator credential; exchanged afresh for every call so it
+    /// survives a restart.
+    credential: String,
+}
+
+impl Tenant {
+    /// A fresh administrator access token on `srv`.
+    ///
+    /// # Panics
+    /// Panics when the credential no longer exchanges.
+    async fn token(&self, srv: &WyrdTestServer) -> String {
+        tenant_token(srv, &self.credential)
+            .await
+            .expect("the tenant administrator authenticates")
+    }
+
+    /// Send `method uri` with an optional JSON body as this tenant's
+    /// administrator, reached at the tenant's public host.
+    ///
+    /// # Panics
+    /// Panics when the route does not respond or the body is not JSON.
+    async fn call(
+        &self,
+        srv: &WyrdTestServer,
+        method: Method,
+        uri: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let mut request = tenant_request(method, uri, body);
+        request.headers_mut().insert(
+            "x-forwarded-host",
+            format!("{}.wyrd.test", self.slug)
+                .parse()
+                .expect("host header"),
+        );
+        let resp = srv
+            .oneshot_authenticated(&self.token(srv).await, request)
+            .await
+            .expect("route responds");
+        let status = resp.status();
+        (status, json_body(resp).await)
+    }
+
+    /// The id of this tenant's only Operator connection.
+    ///
+    /// # Panics
+    /// Panics when the list is refused or holds no connection.
+    async fn operator_connection(&self, srv: &WyrdTestServer) -> String {
+        let (status, list) = self
+            .call(srv, Method::GET, "/v1/operator-connections", None)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+        list.as_array()
+            .or_else(|| list["connections"].as_array())
+            .and_then(|views| views.first())
+            .and_then(|view| view["connection_id"].as_str())
+            .expect("an Operator connection")
+            .to_owned()
+    }
+}
+
+/// A deployment with a secret in every store.
 struct Seeded {
     /// The deployment root credential; exchange it again after a restart.
     root: secrecy::SecretString,
-    /// Administrator credential of each seeded tenant.
-    admins: Vec<String>,
+    /// Each seeded tenant.
+    tenants: Vec<Tenant>,
+    /// Each tenant's staged human connection id, in tenant order.
+    human_connections: Vec<String>,
 }
 
 impl Seeded {
@@ -113,20 +194,36 @@ impl Seeded {
         platform_session(srv, secrecy::ExposeSecret::expose_secret(&self.root)).await
     }
 
-    /// A fresh access token for the `index`th tenant administrator on `srv`.
+    /// Prove every seeded owner opens its stored secret on `srv` through its
+    /// own consuming route: the platform sign-in sends its client secret, and
+    /// each tenant's human connection, trusted issuer, Gateway credential, and
+    /// Operator connection reseal their unchanged value.
     ///
     /// # Panics
-    /// Panics when the credential no longer exchanges.
-    async fn admin(&self, srv: &WyrdTestServer, index: usize) -> String {
-        tenant_token(srv, &self.admins[index])
-            .await
-            .expect("the tenant administrator authenticates")
+    /// Panics when any owner cannot open its secret.
+    async fn every_owner_opens(&self, srv: &WyrdTestServer, provider: &wiremock::MockServer) {
+        confidential_platform_sign_in(srv, provider).await;
+        let issuer: String =
+            url::form_urlencoded::byte_serialize(provider.uri().as_bytes()).collect();
+        for (tenant, human) in self.tenants.iter().zip(&self.human_connections) {
+            let operator = tenant.operator_connection(srv).await;
+            for uri in [
+                format!("/v1/identity/oidc/connections/{human}/renew-encryption"),
+                format!("/v1/admin/trusted-issuers/renew-encryption?issuer={issuer}"),
+                "/v1/admin/gateway/provider-credentials/managed/renew-encryption".to_owned(),
+                format!("/v1/operator-connections/{operator}/renew-encryption"),
+            ] {
+                let (status, body) = tenant.call(srv, Method::POST, &uri, None).await;
+                assert_eq!(status, StatusCode::OK, "{uri} opens its secret: {body}");
+            }
+        }
     }
 }
 
 /// Initialize the deployment, configure confidential platform sign-in
-/// against `provider`, and give each of `slugs` a Gateway managed credential
-/// and an Operator connection.
+/// against `provider`, and give each of `slugs` a workload trusted issuer and
+/// a staged human connection on `provider`, a Gateway managed credential, and
+/// an Operator connection: a secret in every store.
 ///
 /// # Panics
 /// Panics when any seeding request is refused.
@@ -141,94 +238,154 @@ async fn seed(srv: &WyrdTestServer, provider: &wiremock::MockServer, slugs: &[&s
         wiremock::ResponseTemplate::new(500),
     )
     .await;
-    let resp = srv
-        .oneshot(platform_request(
-            Method::PUT,
+    for (uri, method, body) in [
+        (
             "/platform/oidc/connection",
-            &session,
-            Some(json!({
+            Method::PUT,
+            json!({
                 "issuer_url": provider.uri(),
                 "client_id": PLATFORM_CLIENT,
                 "client_auth": { "method": "secret_post", "secret": PLATFORM_CLIENT_SECRET },
-            })),
-        ))
-        .await
-        .expect("configure route responds");
-    assert_eq!(
-        resp.status(),
-        StatusCode::OK,
-        "platform connection configures"
-    );
-    let resp = srv
-        .oneshot(platform_request(
-            Method::POST,
+            }),
+        ),
+        (
             "/platform/admins",
-            &session,
-            Some(json!({ "name": "ops-lead", "match_claim": "ops@example.com" })),
-        ))
-        .await
-        .expect("register route responds");
-    assert_eq!(resp.status(), StatusCode::OK, "administrator registers");
+            Method::POST,
+            json!({ "name": "ops-lead", "match_claim": "ops@example.com" }),
+        ),
+    ] {
+        let resp = srv
+            .oneshot(platform_request(method, uri, &session, Some(body)))
+            .await
+            .expect("platform route responds");
+        assert_eq!(resp.status(), StatusCode::OK, "{uri} succeeds");
+    }
 
-    let mut admins = Vec::new();
+    let mut tenants = Vec::new();
+    let mut human_connections = Vec::new();
     for slug in slugs {
-        let created = body_json(
-            srv.oneshot(platform_post(
+        let resp = srv
+            .oneshot(platform_post(
                 "/platform/tenants",
                 &session,
                 json!({ "slug": slug, "display_name": slug }),
             ))
             .await
-            .expect("tenant route responds"),
-        )
-        .await;
-        let credential = created["admin"]["credential"]
-            .as_str()
-            .expect("admin credential")
-            .to_owned();
-        let admin = tenant_token(srv, &credential)
-            .await
-            .expect("the tenant administrator authenticates");
-        let (status, body) = call(
-            srv,
-            &admin,
-            Method::PUT,
-            "/v1/admin/gateway/provider-credentials/managed",
-            Some(json!({
-                "name": "managed",
-                "provider": "acme",
-                "source": { "managed_secret": { "secret": format!("sk-{slug}") } },
-            })),
-        )
-        .await;
-        assert!(status.is_success(), "gateway credential stores: {body}");
-        let (status, body) = call(
-            srv,
-            &admin,
-            Method::POST,
-            "/v1/operator-connections",
-            Some(json!({
-                "provider": "slack",
-                "name": "ops-slack",
-                "workspace_id": "T0001",
-                "bot_token": format!("xoxb-{slug}"),
-            })),
-        )
-        .await;
-        assert_eq!(
-            status,
-            StatusCode::CREATED,
-            "operator connection stores: {body}"
+            .expect("tenant route responds");
+        let created = json_body(resp).await;
+        let tenant = Tenant {
+            slug: (*slug).to_owned(),
+            credential: created["admin"]["credential"]
+                .as_str()
+                .expect("admin credential")
+                .to_owned(),
+        };
+        for (method, uri, body) in [
+            (
+                Method::PUT,
+                "/v1/admin/gateway/provider-credentials/managed",
+                json!({
+                    "name": "managed",
+                    "provider": "acme",
+                    "source": { "managed_secret": { "secret": format!("sk-{slug}") } },
+                }),
+            ),
+            (
+                Method::POST,
+                "/v1/operator-connections",
+                json!({
+                    "provider": "slack",
+                    "name": "ops-slack",
+                    "workspace_id": "T0001",
+                    "bot_token": format!("xoxb-{slug}"),
+                }),
+            ),
+            (
+                Method::POST,
+                "/v1/admin/trusted-issuers",
+                json!({
+                    "issuer": provider.uri(),
+                    "expected_audience": "wyrd",
+                    "client_id": "workload-client",
+                    "client_auth": "SecretPost",
+                    "client_secret": format!("issuer-{slug}"),
+                    "claim_mapping": { "subject": "sub" },
+                    "principal_kind": "workload",
+                }),
+            ),
+        ] {
+            let (status, body) = tenant.call(srv, method, uri, Some(body)).await;
+            assert!(status.is_success(), "{uri} stores: {body}");
+        }
+        let (status, staged) = tenant
+            .call(
+                srv,
+                Method::PUT,
+                "/v1/identity/oidc/candidate",
+                Some(json!({
+                    "issuer": provider.uri(),
+                    "client_id": "human-client",
+                    "client_auth": "SecretPost",
+                    "client_secret": format!("human-{slug}"),
+                    "claim_mapping": { "subject": "sub", "email": "email", "groups": "groups" },
+                    "group_role_map": {},
+                })),
+            )
+            .await;
+        assert!(status.is_success(), "human connection stages: {staged}");
+        human_connections.push(
+            staged["connection_id"]
+                .as_str()
+                .or_else(|| staged["id"].as_str())
+                .expect("staged connection id")
+                .to_owned(),
         );
-        admins.push(credential);
+        tenants.push(tenant);
     }
-    Seeded { root, admins }
+    Seeded {
+        root,
+        tenants,
+        human_connections,
+    }
+}
+
+/// Start a server sealing under Transit key `active`, keeping `retained`
+/// readable.
+///
+/// # Panics
+/// Panics when the server cannot start.
+async fn start(transit: &TransitFixture, active: &str, retained: &[&str]) -> WyrdTestServer {
+    Box::pin(
+        WyrdTestServer::builder()
+            .with_kms_for_test(transit.config(active, retained))
+            .start_bound(),
+    )
+    .await
+    .expect("server starts")
+}
+
+/// Restart `srv` sealing under Transit key `active`, keeping `retained`
+/// readable, as a rolled-out writer configuration.
+///
+/// # Panics
+/// Panics when the server cannot restart.
+async fn roll_out(
+    srv: WyrdTestServer,
+    transit: &TransitFixture,
+    active: &str,
+    retained: &[&str],
+) -> WyrdTestServer {
+    Box::pin(srv.restart_bound(
+        WyrdTestServer::builder().with_kms_for_test(transit.config(active, retained)),
+    ))
+    .await
+    .expect("server restarts")
 }
 
 /// Activating a replacement wrapping key moves no stored secret: a restart
-/// with `k2` active and `k1` retained leaves every stored envelope
-/// byte-identical, the platform sign-in still opens its secret through the
-/// retained key, and only a new write seals under `k2`.
+/// with `k2` active and `k1` retained leaves every stored envelope in all five
+/// stores byte-identical, the platform sign-in still opens its secret through
+/// the retained key, and only a new write seals under `k2`.
 ///
 /// # Panics
 /// Panics when any envelope changes on activation or a new write does not
@@ -236,44 +393,40 @@ async fn seed(srv: &WyrdTestServer, provider: &wiremock::MockServer, slugs: &[&s
 #[tokio::test]
 async fn activating_a_replacement_wrapping_key_rewrites_no_stored_secret() {
     let transit = TransitFixture::start().await;
-    let srv = Box::pin(
-        WyrdTestServer::builder()
-            .with_kms_for_test(transit.config("k1", &[]))
-            .start_bound(),
-    )
-    .await
-    .expect("server starts");
+    let srv = start(&transit, "k1", &[]).await;
     let provider = wiremock::MockServer::start().await;
     let seeded = seed(&srv, &provider, &["acme-a"]).await;
     let before = stored_envelopes(&srv).await;
-    assert_eq!(before.len(), 3, "one secret per seeded store: {before:?}");
+    assert_eq!(
+        before.len(),
+        5,
+        "one secret per store: {:?}",
+        owners(&before)
+    );
     assert!(key_refs(&before).iter().all(|key| *key == "k1"));
 
-    let srv =
-        Box::pin(srv.restart_bound(
-            WyrdTestServer::builder().with_kms_for_test(transit.config("k2", &["k1"])),
-        ))
-        .await
-        .expect("server restarts with the replacement key active");
+    let srv = roll_out(srv, &transit, "k2", &["k1"]).await;
+    let after = stored_envelopes(&srv).await;
     assert_eq!(
-        stored_envelopes(&srv).await,
-        before,
-        "activation rewrote no stored envelope"
+        key_refs(&after),
+        key_refs(&before),
+        "activation moved no envelope"
     );
+    assert_eq!(after, before, "activation rewrote no stored envelope");
     confidential_platform_sign_in(&srv, &provider).await;
 
-    let (status, body) = call(
-        &srv,
-        &seeded.admin(&srv, 0).await,
-        Method::PUT,
-        "/v1/admin/gateway/provider-credentials/written-after",
-        Some(json!({
-            "name": "written-after",
-            "provider": "acme",
-            "source": { "managed_secret": { "secret": "sk-after" } },
-        })),
-    )
-    .await;
+    let (status, body) = seeded.tenants[0]
+        .call(
+            &srv,
+            Method::PUT,
+            "/v1/admin/gateway/provider-credentials/written-after",
+            Some(json!({
+                "name": "written-after",
+                "provider": "acme",
+                "source": { "managed_secret": { "secret": "sk-after" } },
+            })),
+        )
+        .await;
     assert!(status.is_success(), "a new credential stores: {body}");
     let after = stored_envelopes(&srv).await;
     let written: Vec<&Stored> = after.iter().filter(|row| !before.contains(row)).collect();
@@ -282,6 +435,219 @@ async fn activating_a_replacement_wrapping_key_rewrites_no_stored_secret() {
         envelope_parts(&written[0].2).0,
         "k2",
         "new writes seal under the active key"
+    );
+    srv.shutdown().await.expect("server shuts down");
+}
+
+/// A platform administrator's routine pass moves every stored secret onto the
+/// active key and keeps each value's data key and payload: the reference and
+/// wrapped data key change, the nonce and payload ciphertext do not, and every
+/// owner opens its secret with the old key gone. Tenant-only and anonymous
+/// callers are refused without touching a row, the allowed platform decision
+/// is audited, and the report carries counts only.
+///
+/// # Panics
+/// Panics when a refusal mutates a row, the pass changes a payload, the
+/// report differs, or an owner cannot open its secret afterwards.
+#[tokio::test]
+async fn a_routine_pass_rewraps_stored_secrets_and_keeps_their_payloads() {
+    let transit = TransitFixture::start().await;
+    let srv = start(&transit, "k1", &[]).await;
+    let provider = wiremock::MockServer::start().await;
+    let seeded = seed(&srv, &provider, &["acme-a"]).await;
+    let srv = roll_out(srv, &transit, "k2", &["k1"]).await;
+    let before = stored_envelopes(&srv).await;
+
+    let routine = json!({ "mode": "routine" });
+    let tenant = seeded.tenants[0].token(&srv).await;
+    let resp = srv
+        .oneshot(platform_post(MAINTENANCE, &tenant, routine.clone()))
+        .await
+        .expect("maintenance route responds");
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "a tenant token is refused"
+    );
+    let resp = srv
+        .oneshot(anonymous_post(MAINTENANCE, routine.clone()))
+        .await
+        .expect("maintenance route responds");
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "an anonymous call is refused"
+    );
+    assert_eq!(
+        stored_envelopes(&srv).await,
+        before,
+        "refusals moved nothing"
+    );
+
+    let session = seeded.session(&srv).await;
+    let (status, report) = maintain(&srv, &session, routine).await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    assert_eq!(
+        report,
+        json!({
+            "mode": "routine",
+            "current": 0,
+            "changed": 5,
+            "remaining": 0,
+            "bounded": false,
+            "failures": [],
+        })
+    );
+    let after = stored_envelopes(&srv).await;
+    assert_eq!(
+        owners(&after),
+        owners(&before),
+        "resource identities are kept"
+    );
+    assert!(
+        key_refs(&after).iter().all(|key| *key == "k2"),
+        "{:?}",
+        key_refs(&after)
+    );
+    assert_eq!(
+        payloads(&after),
+        payloads(&before),
+        "data key and payload are kept"
+    );
+    assert!(
+        after
+            .iter()
+            .zip(&before)
+            .all(|((_, _, moved), (_, _, old))| moved != old),
+        "every wrapped data key changed"
+    );
+
+    let allowed: Vec<_> = system_audit_decisions(&srv)
+        .await
+        .into_iter()
+        .filter(|row| row["resource"].as_deref() == Some("platform:stored_secrets"))
+        .map(|row| (row["permission"].clone(), row["outcome"].clone()))
+        .collect();
+    assert_eq!(
+        allowed,
+        vec![(
+            Some("platform_credentials:write".to_owned()),
+            Some("allowed".to_owned())
+        )],
+        "the pass audits its one platform decision"
+    );
+
+    let srv = roll_out(srv, &transit, "k2", &[]).await;
+    seeded.every_owner_opens(&srv, &provider).await;
+    srv.shutdown().await.expect("server shuts down");
+}
+
+/// Bounded routine passes cover every owner in all five stores across two
+/// tenants and the platform: each pass changes at most its limit, reports the
+/// rest as remaining and bounded, and repeating converges; an envelope copied
+/// onto another tenant's owner is never moved and is reported by store,
+/// tenant, owner, and reason with no secret material; and a final pass finds
+/// everything else current.
+///
+/// # Panics
+/// Panics when a count differs from the rows observed, an owner is skipped,
+/// the copied envelope moves, or a report carries key or secret material.
+#[tokio::test]
+async fn bounded_routine_passes_cover_every_store_and_report_what_remains() {
+    let transit = TransitFixture::start().await;
+    let srv = start(&transit, "k1", &[]).await;
+    let provider = wiremock::MockServer::start().await;
+    let seeded = seed(&srv, &provider, &["acme-a", "acme-b"]).await;
+    let srv = roll_out(srv, &transit, "k2", &["k1"]).await;
+    let session = seeded.session(&srv).await;
+
+    // Copy tenant A's Gateway envelope onto tenant B's credential: its context
+    // names A, so it must never open, or move, as B's.
+    let pool = srv.operator_pool().pool().clone();
+    let tenants: Vec<String> = sqlx::query_scalar(
+        "SELECT data_tenant_id::text FROM wyrd.gateway_provider_credentials
+          WHERE name = 'managed' ORDER BY data_tenant_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("tenants read");
+    let (source, tampered_tenant) = (&tenants[0], &tenants[1]);
+    let copied: Vec<u8> = sqlx::query_scalar(
+        "UPDATE wyrd.gateway_provider_credentials
+            SET secret_ciphertext = (SELECT secret_ciphertext
+                                       FROM wyrd.gateway_provider_credentials
+                                      WHERE data_tenant_id = $1::uuid AND name = 'managed')
+          WHERE data_tenant_id = $2::uuid AND name = 'managed'
+         RETURNING secret_ciphertext",
+    )
+    .bind(source)
+    .bind(tampered_tenant)
+    .fetch_one(&pool)
+    .await
+    .expect("envelope copies");
+    let total = stored_envelopes(&srv).await.len();
+    assert_eq!(total, 9, "four tenant stores per tenant and the platform");
+
+    let limited = json!({ "mode": "routine", "limit": 3 });
+    let mut changed = 0;
+    let mut passes = 0;
+    let last = loop {
+        let (status, report) = maintain(&srv, &session, limited.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{report}");
+        let stored = stored_envelopes(&srv).await;
+        let on_k2 = key_refs(&stored).iter().filter(|key| **key == "k2").count();
+        let pass_changed = report["changed"].as_u64().expect("changed");
+        assert!(
+            pass_changed <= 3,
+            "a pass changes at most its limit: {report}"
+        );
+        changed += pass_changed;
+        passes += 1;
+        assert_eq!(
+            usize::try_from(changed).expect("fits"),
+            on_k2,
+            "changed counts the rows that moved"
+        );
+        assert_eq!(
+            report["current"].as_u64().expect("current")
+                + pass_changed
+                + report["remaining"].as_u64().expect("remaining"),
+            u64::try_from(total).expect("fits"),
+            "every observed envelope is counted once: {report}"
+        );
+        if report["bounded"] == false {
+            break report;
+        }
+        assert!(passes < 10, "passes never converged");
+    };
+    assert!(passes >= 3, "the limit bounded earlier passes");
+    assert_eq!(changed, 8, "every openable envelope moved");
+    // A remote backend refuses the mismatched context like any refusal.
+    assert_eq!(
+        last["failures"],
+        json!([{
+            "store": "gateway_credential",
+            "data_tenant_id": tampered_tenant,
+            "owner": "managed",
+            "reason": "key_unavailable",
+        }])
+    );
+    assert_eq!(last["remaining"], 1, "only the copied envelope remains");
+    let text = last.to_string();
+    for secret in ["k1", "k2", "sk-acme", "xoxb-", "issuer-acme", "human-acme"] {
+        assert!(!text.contains(secret), "the report names {secret}: {text}");
+    }
+    let stored = stored_envelopes(&srv).await;
+    assert!(
+        stored.iter().any(|(_, _, envelope)| *envelope == copied),
+        "the copied envelope was not moved"
+    );
+
+    let (_, again) = maintain(&srv, &session, json!({ "mode": "routine" })).await;
+    assert_eq!(
+        (&again["current"], &again["changed"], &again["remaining"]),
+        (&json!(8), &json!(0), &json!(1)),
+        "{again}"
     );
     srv.shutdown().await.expect("server shuts down");
 }

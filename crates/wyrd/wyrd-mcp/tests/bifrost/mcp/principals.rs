@@ -822,4 +822,116 @@ mod pg_tests {
         assert!(server.exchange_api_key(&key).await.is_err());
         Ok(())
     }
+
+    /// An agent holding viewer at one Verifier family lists and reads only
+    /// that family over MCP; the other family's Card is the same not-found an
+    /// absent Card is.
+    ///
+    /// # Errors
+    ///
+    /// Returns server startup, bootstrap, declaration, MCP transport, or
+    /// tool-call failures.
+    ///
+    /// # Panics
+    /// Panics when the list names another family or the hidden read is not
+    /// the registry's not-found.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn a_family_bound_agent_reads_only_that_family() -> Result<(), McpJourneyError> {
+        use wyrd_client::cards::Cards;
+        use wyrd_client::principals::{
+            CreateServicePrincipalRequest, PermissionScope, Principals, ScopedRoleAssignment,
+        };
+        use wyrd_spec::auth::CardPermissionScope;
+        use wyrd_spec::envelope::CardKind;
+        use wyrd_spec::ids::CardName;
+
+        let server = WyrdTestServer::start_bound().await?;
+        let admin = server
+            .bootstrap_service("mcp-scope-admin", &["admin"])
+            .await?;
+        let admin_key = ResolvedCredential::ApiKey(
+            admin
+                .api_key()
+                .ok_or("a bootstrapped service carries a machine key")?
+                .expose_secret()
+                .to_owned()
+                .into(),
+        );
+        let admin_client = crate::connectivity::client(&server, admin_key)?;
+        let cards = Cards::connect_with(&admin_client).await?;
+        let mut declared = Vec::new();
+        for fixture in ["code-review.yaml", "unrelated.yaml"] {
+            let path = format!(
+                "{}/../../../fixtures/cards/repository_declaration/{fixture}",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            declared.push(Box::pin(cards.declare_from_path(path)).await?.root);
+        }
+        let created = Principals::connect_with(&admin_client)
+            .await?
+            .create_service_principal(&CreateServicePrincipalRequest {
+                name: "mcp-payments-reader".to_owned(),
+                description: None,
+                assignments: vec![ScopedRoleAssignment {
+                    role: "viewer".to_owned(),
+                    scope: PermissionScope::Card(CardPermissionScope::family(
+                        CardKind::Verifier,
+                        CardName::new("code-review")?,
+                    )),
+                }],
+                workload_restriction: None,
+            })
+            .await?;
+        let agent = ()
+            .serve_with_lifecycle(
+                transport(
+                    &server,
+                    ResolvedCredential::ApiKey(created.credential.expose().to_owned().into()),
+                    None,
+                )?,
+                discover(),
+            )
+            .await?;
+
+        let listed = structured(
+            agent
+                .call_tool(call(
+                    "cards.list",
+                    serde_json::json!({ "kind": "Verifier" }),
+                )?)
+                .await?,
+        )?;
+        let names: Vec<&str> = listed["items"]
+            .as_array()
+            .ok_or("items")?
+            .iter()
+            .filter_map(|item| item["name"].as_str())
+            .collect();
+        assert_eq!(names, ["code-review"], "{listed}");
+        let [payments, other] = declared.as_slice() else {
+            return Err("two Cards declared".into());
+        };
+        let read = structured(
+            agent
+                .call_tool(call(
+                    "cards.get",
+                    serde_json::json!({ "card_ref": payments }),
+                )?)
+                .await?,
+        )?;
+        assert_eq!(read["card"]["metadata"]["name"], "code-review", "{read}");
+        let hidden = refusal(
+            agent
+                .call_tool(call("cards.get", serde_json::json!({ "card_ref": other }))?)
+                .await,
+        )?;
+        assert!(
+            hidden.contains("WYRD_REGISTRY_404_CARD_NOT_FOUND"),
+            "another family reads as absent: {hidden}"
+        );
+
+        agent.cancel().await?;
+        Ok(())
+    }
 }

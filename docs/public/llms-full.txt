@@ -8362,8 +8362,8 @@ retained_keys = ["arn:aws:kms:us-east-1:111122223333:key/1111aaaa-1111-1111-1111
 
 Each resource that stores a secret offers three separate actions under its existing name or id and permission:
 
-- **Renew encryption** reseals the unchanged secret under a fresh data key wrapped by the active key. The resource, its view, and the secret the provider accepts do not change, so clients need no reconfiguration. A human connection keeps its revision and its sessions.
-- **Replace** stores a new secret supplied by the administrator. Wyrd never mints one.
+- **Renew encryption** reseals the unchanged secret under a fresh data key wrapped by the active key. The resource's identity, settings, and state, and the secret the provider accepts, do not change, so clients need no reconfiguration. A human connection keeps its revision and its sessions. Only modification metadata changes: `updated_at`, and an Operator connection's `updated_by`.
+- **Replace** stores a new secret supplied by the administrator, without opening the old one. Wyrd never mints one.
 - **Revoke** stops Wyrd using the secret. It does not revoke the credential at its provider; do that at the provider, then replace or revoke it in Wyrd.
 
 | Resource | Renew encryption | Replace | Revoke |
@@ -8371,17 +8371,22 @@ Each resource that stores a secret offers three separate actions under its exist
 | Operator connection | `POST /v1/operator-connections/{connection_id}/renew-encryption`, `wyrd operator-connection renew-encryption` | Update with a new credential | Disable |
 | Gateway managed secret | `POST /v1/admin/gateway/provider-credentials/{name}/renew-encryption`, `wyrd gateway credential renew-encryption` | Put the credential again | Revoke |
 | Human OIDC connection | `POST /v1/identity/oidc/connections/{id}/renew-encryption` | Stage, test, and activate a candidate | Delete the connection |
-| Trusted issuer | `POST /v1/admin/trusted-issuers/renew-encryption?issuer=`, `wyrd auth trusted-issuer renew-encryption` | Delete and add the issuer again | Delete the issuer |
+| Trusted issuer | `POST /v1/admin/trusted-issuers/renew-encryption?issuer=`, `wyrd auth trusted-issuer renew-encryption` | `PUT /v1/admin/trusted-issuers/client-secret?issuer=` with `{"client_secret": "..."}`, `wyrd auth trusted-issuer replace-secret`; workload bindings are kept | Delete the issuer |
 | Platform OIDC connection | `POST /platform/oidc/connection/renew-encryption` | `PUT /platform/oidc/connection` | `DELETE /platform/oidc/connection` |
 
-A renewal reads the secret, reseals it outside any database transaction, and stores the result only if the resource still holds the secret it read. A renewal that races a replacement, revocation, or deletion loses with a `409` and the other change stands; a renewal never restores a revoked or deleted resource.
+`wyrd auth trusted-issuer replace-secret` reads the new secret from `--client-secret-file` or `WYRD_ISSUER_CLIENT_SECRET`, never from an argument.
 
-| Condition | Result |
-| --- | --- |
-| No such resource in the caller's tenant | `404` |
-| The resource is revoked, disabled, or holds no stored secret | `409` |
-| The resource changed between the read and the store | `409`; nothing is written |
-| The backend is unavailable | `503`; the stored secret is unchanged |
+A renewal or trusted-issuer replacement reads the secret, seals outside any database transaction, and stores the result only if the resource still holds the secret it read. One that races a replacement, revocation, or deletion loses with a `409` and the other change stands; neither restores a revoked or deleted resource.
+
+| Resource | `404` | `409` |
+| --- | --- | --- |
+| Operator connection | No such connection in the caller's tenant | The connection changed between the read and the store. A disabled connection renews and stays disabled |
+| Gateway managed secret | No such credential | The credential is revoked, holds no managed secret, or changed |
+| Human OIDC connection | No Active or Candidate connection with the id; an inactive connection is not found | The connection holds no client secret, or was deactivated, replaced, or renewed after the read |
+| Trusted issuer | No such issuer in the caller's tenant | The issuer holds no client secret, or was deleted or changed |
+| Platform OIDC connection | No connection is configured | The connection holds no client secret, or was removed or replaced |
+
+Every action answers `503` with the stored secret unchanged when the key service or the store is unavailable. A trusted-issuer replacement with an empty secret answers `400`.
 
 ## Startup refusals
 

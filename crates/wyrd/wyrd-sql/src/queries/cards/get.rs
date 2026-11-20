@@ -26,6 +26,23 @@ const SELECT_BY_REF: &str = r"
       AND status != 'deleted'
 ";
 
+const SELECT_SCOPES: &str = r"
+    SELECT card_uid, kind, name
+    FROM wyrd.cards
+    WHERE card_uid = ANY($1)
+";
+
+/// One registered Card's identity as an authorization check needs it.
+#[derive(sqlx::FromRow)]
+struct ScopeRow {
+    /// The Card's UID.
+    card_uid: uuid::Uuid,
+    /// The stored Card kind.
+    kind: String,
+    /// The stored Card name.
+    name: String,
+}
+
 const SELECT_FOR_RECONCILIATION: &str = r"
     SELECT card_uid, data_tenant_id, kind, name, version,
            spec, spec_hash, artifact_hash, labels, annotations,
@@ -181,22 +198,27 @@ pub async fn card_scopes(
     uids: &[CardUid],
 ) -> Result<std::collections::HashMap<CardUid, wyrd_spec::auth::CardPermissionScope>, WyrdError> {
     let ids: Vec<uuid::Uuid> = uids.iter().map(CardUid::as_uuid).collect();
-    let rows: Vec<(uuid::Uuid, String, String)> =
-        sqlx::query_as("SELECT card_uid, kind, name FROM wyrd.cards WHERE card_uid = ANY($1)")
-            .bind(&ids)
-            .fetch_all(&mut **conn.transaction())
-            .await
-            .map_err(super::registry_db_error)?;
+    let rows = sqlx::query_as::<_, ScopeRow>(SELECT_SCOPES)
+        .bind(&ids)
+        .fetch_all(&mut **conn.transaction())
+        .await
+        .map_err(super::registry_db_error)?;
     rows.into_iter()
-        .map(|(uid, kind, name)| {
-            let uid = CardUid::from_uuid(uid).map_err(super::registry_db_error)?;
-            let kind: CardKind = serde_json::from_value(serde_json::Value::String(kind))
-                .map_err(super::registry_db_error)?;
-            let name = CardName::new(name).map_err(super::registry_db_error)?;
-            Ok((
-                uid.clone(),
-                wyrd_spec::auth::CardPermissionScope::version(kind, name, uid),
-            ))
-        })
+        .map(
+            |ScopeRow {
+                 card_uid: uid,
+                 kind,
+                 name,
+             }| {
+                let uid = CardUid::from_uuid(uid).map_err(super::registry_db_error)?;
+                let kind: CardKind = serde_json::from_value(serde_json::Value::String(kind))
+                    .map_err(super::registry_db_error)?;
+                let name = CardName::new(name).map_err(super::registry_db_error)?;
+                Ok((
+                    uid.clone(),
+                    wyrd_spec::auth::CardPermissionScope::version(kind, name, uid),
+                ))
+            },
+        )
         .collect()
 }

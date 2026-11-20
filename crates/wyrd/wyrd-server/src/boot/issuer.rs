@@ -5,7 +5,7 @@
 //! because human login trust lives only in the tenant OIDC connection store. At boot, [`seed_trusted_issuers`] runs OIDC discovery per entry
 //! (under a bounded retry schedule), maps each config DTO to the
 //! [`TrustedIssuer`] domain type, encrypts any client secret with the sealing
-//! key, and upserts the row into `wyrd.auth_trusted_issuers`. Postgres is then
+//! key (keeping an unchanged committed envelope), and upserts the row into `wyrd.auth_trusted_issuers`. Postgres is then
 //! the single source of issuer resolution for every request via
 //! [`crate::auth::pg_resolvers::PgIssuerResolver`].
 //!
@@ -33,7 +33,8 @@ use wyrd_spec::auth::IssuerUrl;
 use wyrd_spec::{DataTenantId, TenantSlug};
 use wyrd_sql::WyrdPostgres;
 use wyrd_sql::queries::auth::{
-    TrustedIssuerWrite, trusted_issuer_exists, upsert_trusted_issuer, upsert_workload_binding,
+    TrustedIssuerWrite, trusted_issuer_by_url, trusted_issuer_exists, upsert_trusted_issuer,
+    upsert_workload_binding,
 };
 
 use crate::auth::pg_resolvers::{binding_write_from_binding, issuer_write_from_trusted};
@@ -83,9 +84,12 @@ pub async fn resolve_implicit_tenant(
 
 /// Seed every `[[trusted_issuers]]` config entry into Postgres for `tenant_id`.
 ///
-/// For each entry, before any transaction opens: run OIDC discovery (bounded
-/// retry), map the config DTO to a [`TrustedIssuer`], and seal any client
-/// secret through `kms`. Then upsert every row (`ON CONFLICT DO UPDATE`, so
+/// First read each entry's committed envelope in a short tenant transaction.
+/// Then, with no transaction open: run OIDC discovery (bounded retry), map
+/// the config DTO to a [`TrustedIssuer`], and seal any client secret through
+/// `kms`, keeping the committed envelope byte-for-byte when it already seals
+/// the configured secret for the configured client id and method, so a
+/// restart under a newly active key moves no unchanged issuer. Then upsert every row (`ON CONFLICT DO UPDATE`, so
 /// re-seeding from config is idempotent) in one tenant transaction opened
 /// through [`WyrdPostgres::tenant_conn`], committed once at the end.
 ///
@@ -129,11 +133,26 @@ pub async fn seed_trusted_issuers(
     // Boot issuers are operator configuration, so internal addresses stay
     // reachable; requests still go through the redirect-disabled transport.
     let discovery = ScreenedHttp::allowing_internal();
-    // Discovery and sealing wait on remote services, so both run before the
-    // seeding transaction opens.
-    let mut writes = Vec::with_capacity(entries.len());
+    let mut conn = postgres.tenant_conn(tenant_id).await?;
+    let mut stored = Vec::with_capacity(entries.len());
     for entry in entries {
-        writes.push(prepare_trusted_issuer(tenant_id, entry, kms, &discovery).await?);
+        let envelope = match IssuerUrl::new(entry.issuer.clone()) {
+            Ok(issuer_url) => trusted_issuer_by_url(&mut conn, issuer_url.as_str())
+                .await
+                .map_err(|error| ServerBootError::Sql(error.into()))?
+                .and_then(|row| row.client_secret_enc),
+            Err(_) => None,
+        };
+        stored.push(envelope);
+    }
+    conn.commit().await?;
+    // Discovery and sealing wait on remote services, so both run between the
+    // read and the seeding transaction.
+    let mut writes = Vec::with_capacity(entries.len());
+    for (entry, stored) in entries.iter().zip(&stored) {
+        writes.push(
+            prepare_trusted_issuer(tenant_id, entry, stored.as_deref(), kms, &discovery).await?,
+        );
     }
     let mut conn = postgres.tenant_conn(tenant_id).await?;
     for prepared in writes {
@@ -177,8 +196,9 @@ enum Prepared {
     },
 }
 
-/// Discover one issuer and seal its row, honoring the already-seeded
-/// restart exemption; runs with no transaction open.
+/// Discover one issuer and seal its row, keeping its committed `stored`
+/// envelope when unchanged and honoring the already-seeded restart
+/// exemption; runs with no transaction open.
 ///
 /// # Errors
 /// Returns the discovery error for a malformed issuer URL, and
@@ -186,13 +206,14 @@ enum Prepared {
 async fn prepare_trusted_issuer(
     tenant_id: DataTenantId,
     entry: &IssuerEntry,
+    stored: Option<&[u8]>,
     kms: Option<&WyrdKms>,
     discovery: &ScreenedHttp,
 ) -> Result<Prepared, ServerBootError> {
     match discover_with_retry(&entry.issuer, discovery).await {
         Ok(jwks_uri) => {
             let trusted = build_trusted_issuer(entry, tenant_id, jwks_uri)?;
-            issuer_write_from_trusted(&trusted, kms)
+            issuer_write_from_trusted(&trusted, stored, kms)
                 .await
                 .map(|write| Prepared::Write(Box::new(write)))
                 .map_err(|error| ServerBootError::IssuerSeal {
@@ -570,9 +591,10 @@ mod pg_tests {
         let entry = issuer_entry(UNREACHABLE_ISSUER);
         let trusted = build_trusted_issuer(&entry, tenant_id, fake_jwks_uri(UNREACHABLE_ISSUER))
             .expect("issuer maps");
-        let write = crate::auth::pg_resolvers::issuer_write_from_trusted(&trusted, Some(&key))
-            .await
-            .expect("issuer encodes");
+        let write =
+            crate::auth::pg_resolvers::issuer_write_from_trusted(&trusted, None, Some(&key))
+                .await
+                .expect("issuer encodes");
         let mut conn = fixture.tenant_conn().await.expect("tenant conn");
         upsert_trusted_issuer(&mut conn, &write)
             .await

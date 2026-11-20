@@ -477,6 +477,38 @@ impl ClientSecretOwner<'_> {
         .map(Some)
     }
 
+    /// Keep `stored` when it opens under this owner to `client_auth`'s
+    /// secret, else seal that secret afresh; `None` for a method that holds
+    /// none.
+    ///
+    /// Re-applying an unchanged configuration therefore leaves its envelope,
+    /// and the wrapping key it names, untouched. A changed secret, client id,
+    /// or method, or an envelope that no longer opens, is sealed under the
+    /// active key.
+    ///
+    /// # Errors
+    /// Returns the errors of [`Self::seal_secret`].
+    pub(crate) async fn keep_or_seal(
+        &self,
+        client_auth: &ClientAuth,
+        stored: Option<&[u8]>,
+        kms: Option<&WyrdKms>,
+    ) -> Result<Option<Vec<u8>>, IssuerSealError> {
+        if let (
+            Some(stored),
+            Some(kms),
+            ClientAuth::SecretBasic(secret) | ClientAuth::SecretPost(secret),
+        ) = (stored, kms, client_auth)
+        {
+            let authority = self.authority(client_auth_discriminant(client_auth));
+            let opened = kms.open(&self.context(&authority), stored).await;
+            if opened.is_ok_and(|plain| plain.as_slice() == secret.expose_secret().as_bytes()) {
+                return Ok(Some(stored.to_vec()));
+            }
+        }
+        self.seal(client_auth, kms).await
+    }
+
     /// Seal `secret` for the stored client-authentication `method`.
     ///
     /// # Errors
@@ -827,15 +859,19 @@ pub fn client_auth_label(auth: &ClientAuth) -> &'static str {
 ///
 /// The client secret (for `SecretBasic`/`SecretPost`) is sealed into the
 /// common envelope bound to the issuer's tenant, URL, client id, and method.
-/// Callers run this before opening the transaction that writes it, since a
-/// remote backend waits on its key service. A secret-bearing issuer with no
-/// facade fails closed via [`IssuerSealError::KmsMissing`].
+/// When `stored` is the issuer's committed envelope and it already seals that
+/// secret for that binding, it is kept byte-for-byte, so re-seeding an
+/// unchanged configuration never moves it to a newly active key. Callers run
+/// this before opening the transaction that writes it, since a remote backend
+/// waits on its key service. A secret-bearing issuer with no facade fails
+/// closed via [`IssuerSealError::KmsMissing`].
 ///
 /// # Errors
 /// Returns [`IssuerSealError`] when a secret is present without a facade,
 /// sealing fails, or a JSONB column cannot be serialized.
 pub async fn issuer_write_from_trusted(
     issuer: &TrustedIssuer,
+    stored: Option<&[u8]>,
     kms: Option<&WyrdKms>,
 ) -> Result<TrustedIssuerWrite, IssuerSealError> {
     let client_secret_enc = ClientSecretOwner {
@@ -845,7 +881,7 @@ pub async fn issuer_write_from_trusted(
         client_id: &issuer.client_id,
         connection_id: None,
     }
-    .seal(&issuer.client_auth, kms)
+    .keep_or_seal(&issuer.client_auth, stored, kms)
     .await?;
 
     Ok(TrustedIssuerWrite {
@@ -1020,7 +1056,7 @@ mod pg_tests {
         let key = kms();
         let issuer = sample_issuer(tenant);
 
-        let write = issuer_write_from_trusted(&issuer, Some(&key))
+        let write = issuer_write_from_trusted(&issuer, None, Some(&key))
             .await
             .expect("encode succeeds");
         let row = wyrd_sql::row_types::auth::TrustedIssuerRow {
@@ -1108,7 +1144,7 @@ mod pg_tests {
             .expect("tenant id is valid");
         let issuer = sample_issuer(tenant);
 
-        let error = issuer_write_from_trusted(&issuer, None)
+        let error = issuer_write_from_trusted(&issuer, None, None)
             .await
             .expect_err("a secret-bearing issuer with no facade must fail closed");
         assert!(matches!(error, IssuerSealError::KmsMissing));
@@ -1127,7 +1163,7 @@ mod pg_tests {
             .expect("tenant id is valid");
         let key = kms();
         let issuer = sample_issuer(tenant);
-        let write = issuer_write_from_trusted(&issuer, Some(&key))
+        let write = issuer_write_from_trusted(&issuer, None, Some(&key))
             .await
             .expect("encode succeeds");
         let row = wyrd_sql::row_types::auth::TrustedIssuerRow {
@@ -1182,7 +1218,7 @@ mod pg_tests {
         for (tenant, secret) in [(first, "first-secret"), (second, "second-secret")] {
             let mut issuer = sample_issuer(tenant);
             issuer.client_auth = ClientAuth::SecretPost(SecretString::from(secret.to_owned()));
-            let write = issuer_write_from_trusted(&issuer, Some(&key))
+            let write = issuer_write_from_trusted(&issuer, None, Some(&key))
                 .await
                 .expect("encode succeeds");
             let mut conn = fixture
@@ -1229,7 +1265,7 @@ mod pg_tests {
         let tenant = fixture.data_tenant_id();
         let key = kms();
         let issuer = sample_issuer(tenant);
-        let write = issuer_write_from_trusted(&issuer, Some(&key))
+        let write = issuer_write_from_trusted(&issuer, None, Some(&key))
             .await
             .expect("encode succeeds");
 
@@ -1283,7 +1319,7 @@ mod pg_tests {
         let tenant = fixture.data_tenant_id();
         let key = kms();
         let issuer = sample_issuer(tenant);
-        let issuer_write = issuer_write_from_trusted(&issuer, Some(&key))
+        let issuer_write = issuer_write_from_trusted(&issuer, None, Some(&key))
             .await
             .expect("encode succeeds");
 

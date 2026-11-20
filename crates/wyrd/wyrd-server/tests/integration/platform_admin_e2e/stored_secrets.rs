@@ -5,6 +5,7 @@
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Response, StatusCode};
 use serde_json::{Value, json};
+use wyrd_auth_oidc::IssuerConfigResolver as _;
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::kms::TransitFixture;
 
@@ -1327,5 +1328,179 @@ async fn a_swap_stalled_on_a_locked_row_is_abandoned_and_resumed() {
             row.1
         );
     }
+    srv.shutdown().await.expect("server shuts down");
+}
+
+/// A confidential `[[trusted_issuers]]` entry for `issuer` holding `auth`.
+fn configured_issuer(
+    issuer: &str,
+    auth: wyrd_server::config::ClientAuthEntry,
+) -> wyrd_server::config::IssuerEntry {
+    wyrd_server::config::IssuerEntry {
+        issuer: issuer.to_owned(),
+        client_id: "configured-client".to_owned(),
+        expected_audience: "wyrd".to_owned(),
+        client_auth: auth,
+        claim_mapping: wyrd_server::config::ClaimMappingEntry::default(),
+        group_role_map: std::collections::HashMap::new(),
+        default_roles: Vec::new(),
+        principal_kind: wyrd_spec::auth::IssuerTokenPolicy::Workload,
+        jwks_ttl_secs: Some(300),
+    }
+}
+
+/// `SecretPost` holding `secret`.
+fn secret_post(secret: &str) -> wyrd_server::config::ClientAuthEntry {
+    wyrd_server::config::ClientAuthEntry::SecretPost(secrecy::SecretString::from(secret.to_owned()))
+}
+
+/// Restart `srv` sealing under Transit key `active`, keeping `retained`
+/// readable, with `issuer` as its only configured trusted issuer.
+///
+/// # Panics
+/// Panics when the server cannot restart.
+async fn reboot_with_issuer(
+    srv: WyrdTestServer,
+    transit: &TransitFixture,
+    (active, retained): (&str, &[&str]),
+    issuer: wyrd_server::config::IssuerEntry,
+) -> WyrdTestServer {
+    Box::pin(
+        srv.restart_bound(
+            WyrdTestServer::builder()
+                .with_kms_for_test(transit.config(active, retained))
+                .with_trusted_issuer_configs(vec![issuer]),
+        ),
+    )
+    .await
+    .expect("server restarts")
+}
+
+/// The configured issuer's stored envelope.
+async fn configured_envelope(srv: &WyrdTestServer) -> Vec<u8> {
+    let stored = stored_envelopes(srv).await;
+    let [(_, _, envelope)] = of_store(&stored, "trusted_issuer")[..] else {
+        panic!("one configured issuer: {stored:?}")
+    };
+    envelope.clone()
+}
+
+/// The client authentication the server resolves for the configured issuer,
+/// opening its secret.
+async fn resolved_auth(srv: &WyrdTestServer) -> String {
+    let issuers = srv
+        .state()
+        .auth
+        .trusted_issuer_resolver
+        .as_ref()
+        .expect("issuer resolver")
+        .trusted_issuers(&srv.data_tenant_id())
+        .await
+        .expect("configured issuer opens");
+    let [issuer] = &issuers[..] else {
+        panic!("one configured issuer")
+    };
+    match &issuer.client_auth {
+        wyrd_auth_oidc::ClientAuth::SecretPost(secret) => {
+            format!("post {}", secrecy::ExposeSecret::expose_secret(secret))
+        }
+        wyrd_auth_oidc::ClientAuth::SecretBasic(secret) => {
+            format!("basic {}", secrecy::ExposeSecret::expose_secret(secret))
+        }
+        other => panic!("a secret method, got {other:?}"),
+    }
+}
+
+/// Run one unbounded pass through the maintenance owner.
+async fn pass(
+    srv: &WyrdTestServer,
+) -> wyrd_spec::security::stored_secret::StoredSecretMaintenanceReport {
+    wyrd_server::components::platform::stored_secrets::StoredSecretMaintenance::new(
+        srv.operator_pool().clone(),
+        srv.state().auth.kms.clone(),
+    )
+    .run(
+        wyrd_spec::security::stored_secret::StoredSecretMaintenanceMode::Routine,
+        None,
+        std::time::Duration::from_secs(30),
+    )
+    .await
+    .expect("the pass reads the catalog")
+}
+
+/// A configured confidential issuer survives key activation untouched: a
+/// restart with `k2` active and the same `[[trusted_issuers]]` entry leaves
+/// its envelope byte-identical and still openable, and only an explicit pass
+/// moves it to `k2`. Changing the configured secret or its client
+/// authentication method still takes effect at the next boot, sealed under
+/// the active key.
+///
+/// # Panics
+/// Panics when activation rewrites the unchanged envelope, the server cannot
+/// open it, or a configuration change is not applied.
+#[tokio::test]
+async fn activation_keeps_an_unchanged_configured_issuer_secret() {
+    let transit = TransitFixture::start().await;
+    let provider = wiremock::MockServer::start().await;
+    mount_platform_provider(
+        &provider,
+        platform_key_set("mock-1"),
+        wiremock::ResponseTemplate::new(500),
+    )
+    .await;
+    let configured = |auth| configured_issuer(&provider.uri(), auth);
+    let srv = Box::pin(
+        WyrdTestServer::builder()
+            .with_kms_for_test(transit.config("k1", &[]))
+            .with_trusted_issuer_configs(vec![configured(secret_post("configured-1"))])
+            .start_bound(),
+    )
+    .await
+    .expect("server starts");
+    let sealed = configured_envelope(&srv).await;
+    assert_eq!(envelope_parts(&sealed).0, "k1");
+
+    let srv = reboot_with_issuer(
+        srv,
+        &transit,
+        ("k2", &["k1"]),
+        configured(secret_post("configured-1")),
+    )
+    .await;
+    assert_eq!(
+        configured_envelope(&srv).await,
+        sealed,
+        "activation rewrote the unchanged configured issuer"
+    );
+    assert_eq!(resolved_auth(&srv).await, "post configured-1");
+
+    let report = pass(&srv).await;
+    assert_eq!((report.changed, report.remaining), (1, 0), "{report:?}");
+    let rotated = configured_envelope(&srv).await;
+    assert_eq!(envelope_parts(&rotated).0, "k2");
+    assert_eq!(envelope_parts(&rotated).1, envelope_parts(&sealed).1);
+
+    // A changed secret, then a changed method, is a new configured credential.
+    let srv = reboot_with_issuer(
+        srv,
+        &transit,
+        ("k3", &["k2"]),
+        configured(secret_post("configured-2")),
+    )
+    .await;
+    let replaced = configured_envelope(&srv).await;
+    assert_eq!(envelope_parts(&replaced).0, "k3");
+    assert_eq!(resolved_auth(&srv).await, "post configured-2");
+    let srv = reboot_with_issuer(
+        srv,
+        &transit,
+        ("k3", &[]),
+        configured(wyrd_server::config::ClientAuthEntry::SecretBasic(
+            secrecy::SecretString::from("configured-2".to_owned()),
+        )),
+    )
+    .await;
+    assert_ne!(configured_envelope(&srv).await, replaced);
+    assert_eq!(resolved_auth(&srv).await, "basic configured-2");
     srv.shutdown().await.expect("server shuts down");
 }

@@ -39,7 +39,7 @@ use wyrd_spec::security::stored_secret::{
     StoredSecretMaintenanceMode, StoredSecretMaintenanceReport, StoredSecretMaintenanceRequest,
     StoredSecretStore,
 };
-use wyrd_sql::queries::stored_secrets::{
+use wyrd_sql::queries::auth::{
     StoredSecretRow, StoredSecretTable, stored_secrets, swap_stored_secret,
 };
 use wyrd_sql::{OperatorPool, SqlError};

@@ -9,8 +9,8 @@ use wyrd_runtime::principal::PrincipalId;
 use wyrd_spec::ids::{ConnectionName, OperatorConnectionId};
 use wyrd_spec::operator_connection::OperatorConnectionConfig;
 use wyrd_sql::TenantConn;
+use wyrd_sql::queries::auth::{StoredSecretTable, stored_secrets, swap_stored_secret};
 use wyrd_sql::queries::operator_connections::{NewConnection, SealedSecret, insert_connection};
-use wyrd_sql::queries::stored_secrets::{StoredSecretTable, stored_secrets, swap_stored_secret};
 
 /// Insert one Slack connection named `name` sealed as `envelope`.
 ///

@@ -100,8 +100,13 @@ configuration declares server limits.
   also pays for the competing work. Each report row stands on its own:
   its rate cell carries every `(W/T)/P`, `W/C`, and `C/W` metric, and its
   latency cell the server and client p50/p95/p99.
-- **Bytes have declared sources.** Writes report rows, retained Arrow MiB
-  (uncompressed), and encoded OTLP wire MiB. Queries report the mean scanned
+- **Bytes have declared sources.** An OTLP write's headline is
+  `input_mib_per_s_per_vcpu` and `input_mib_per_cpu_s`: the uncompressed
+  OTLP protobuf the clients sent and the server acknowledged, the bytes
+  ingest comparisons count. Rows per vCPU and per CPU-second follow. The
+  uncompressed Arrow MiB the server stored (`stored_mib_*`) come last: they
+  fall whenever the schema stores less per row, so they never measure ingest
+  speed. Queries report the mean scanned
   rows and bytes of each query's own executed plan, from the same snapshots.
   Those are physical Parquet facts; a memtable batch is never one. `ui-sql`
   also reports `memtable_rows_per_query` and `memtable_bytes_per_query`: the
@@ -109,9 +114,11 @@ configuration declares server limits.
   before any row filter, and the recorded decoded Arrow bytes of the columns
   they read, from the window's `bifrost_scribe_live_rows_examined_total` and
   `bifrost_scribe_live_bytes_examined_total` movement per answered query;
-  missing, never zero, without the counter or an answered query. The L1
-  storage ratio is published Parquet bytes over retained Arrow bytes of one
-  settled sample per path, excluding WAL, staging, and catalog bytes.
+  missing, never zero, without the counter or an answered query. Each OTLP
+  path's L1 `compression` is the input bytes of one settled sample per
+  published Parquet byte of it, input over stored; its `storage_ratio`, which
+  native also reports, is published Parquet bytes over retained Arrow bytes.
+  Both exclude WAL, staging, and catalog bytes.
 - The `timing` control records the method, precision, range, series bounds,
   the server's benchmark snapshot setting, and the host's measured timer
   resolution. Operator span export stays disabled.
@@ -166,10 +173,10 @@ What each engine covers:
       attribute filters at 1. Each settled query must carry its own scan
       facts. After settlement, outside every window, it checks that span
       files shred exactly the keys over the 10% threshold and that a
-      span-time window prunes, and reads each write path's storage ratio.
+      span-time window prunes, and reads each write path's storage ratio and each OTLP path's compression.
     - Scaling is reported for reads measured at both 1 and 64.
   - L1 sanity floors are the only absolute throughput limits: the native
-    peak must reach at least 200k rows/s, and the OTLP peak at least 30 wire
+    peak must reach at least 200k rows/s, and the OTLP peak at least 30 input
     MiB per server CPU-second.
   - L2 `competing` runs the 100M-row fixture with Forge compaction on:
     - open-loop ingest split 50% spans, 30% logs, 20% native;

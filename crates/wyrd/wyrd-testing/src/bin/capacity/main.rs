@@ -707,8 +707,8 @@ mod tests {
         for metric in [
             "rows_per_s_per_vcpu",
             "rows_per_cpu_s",
-            "mib_per_s_per_vcpu",
-            "mib_per_cpu_s",
+            "stored_mib_per_s_per_vcpu",
+            "stored_mib_per_cpu_s",
             "memory_per_mib_s",
             "published_files",
             "memtable_backlog_mib",
@@ -721,6 +721,8 @@ mod tests {
             "queries_per_cpu_s",
             "span_shredding_faults",
             "storage_ratio.otlp-spans",
+            "compression.otlp-spans",
+            "compression.otlp-logs",
         ] {
             assert!(parquet.metric(metric).is_some(), "{metric}");
         }
@@ -865,8 +867,8 @@ mod tests {
             floors,
             [
                 ("native-write-peak", "rows_per_s", 200_000.0),
-                ("otlp-spans-peak", "wire_mib_per_cpu_s", 30.0),
-                ("otlp-logs-peak", "wire_mib_per_cpu_s", 30.0),
+                ("otlp-spans-peak", "input_mib_per_cpu_s", 30.0),
+                ("otlp-logs-peak", "input_mib_per_cpu_s", 30.0),
             ],
             "only the two approved sanity floors are absolute throughput limits"
         );
@@ -1091,10 +1093,10 @@ mod tests {
                     "rows_per_s_per_vcpu",
                     "rows_per_cpu_s",
                     "cpu_us_per_row",
-                    "mib_per_s_per_vcpu",
-                    "mib_per_cpu_s",
-                    "wire_mib_per_s_per_vcpu",
-                    "wire_mib_per_cpu_s",
+                    "stored_mib_per_s_per_vcpu",
+                    "stored_mib_per_cpu_s",
+                    "input_mib_per_s_per_vcpu",
+                    "input_mib_per_cpu_s",
                     "memory_per_mib_s",
                 ],
                 vec![
@@ -1124,7 +1126,7 @@ mod tests {
                     "rows_per_s_per_vcpu",
                     "rows_per_cpu_s",
                     "cpu_us_per_row",
-                    "mib_per_cpu_s",
+                    "stored_mib_per_cpu_s",
                 ],
                 vec![
                     "requests",
@@ -1274,6 +1276,18 @@ mod tests {
                 assert!(row.contains(&unit), "{name} row shows {unit}: {row}");
             }
             assert!(row.contains("cores used") && row.contains("vCPU"), "{row}");
+            if raw.contains(&"wire_bytes") {
+                let cell = |id: &str| {
+                    let unit = &declaration.metric(id).expect("metric").unit;
+                    step.summary[id].median.cell(unit)
+                };
+                let at = |id: &str| row.find(&cell(id)).unwrap_or(usize::MAX);
+                assert!(
+                    at("input_mib_per_s_per_vcpu") < at("rows_per_s_per_vcpu")
+                        && at("rows_per_s_per_vcpu") < at("stored_mib_per_s_per_vcpu"),
+                    "{name} leads with client input MiB, then rows, and shows stored MiB last: {row}"
+                );
+            }
 
             let (unmeasured, _) = execute(
                 declaration.clone(),

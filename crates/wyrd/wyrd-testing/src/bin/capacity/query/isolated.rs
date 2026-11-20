@@ -594,7 +594,9 @@ fn read_outcome(repetition: &mut Repetition, outcome: &Outcome, read: Option<Rea
 /// The `parquet` settled-state facts of the settled `server`, in
 /// [`SETTLED`] order: the span shredding and span-time pruning judgments
 /// over its `spans` spans, then each write path's storage ratio from its
-/// `samples` (path, table bytes before, inserted Arrow bytes, outcome).
+/// `samples` (path, table bytes before, inserted Arrow bytes, outcome),
+/// then each OTLP path's compression: the sample's acknowledged input bytes
+/// per published Parquet byte.
 async fn settled(
     server: &LocalServer,
     bench: &Bench,
@@ -634,28 +636,44 @@ async fn settled(
         }
     };
     let mut facts = vec![shredding, pruned];
+    let mut compression = Vec::new();
     for (op, _) in SPLIT {
-        let ratio = samples
-            .iter()
-            .find(|(sampled, ..)| *sampled == op)
-            .map_or_else(
+        let sampled = samples.iter().find(|(sampled, ..)| *sampled == op);
+        // `ratio` of the sample's published table growth, its inserted Arrow
+        // bytes, and its outcome, or why the sample cannot give one.
+        let settled = |ratio: fn(f64, f64, &Outcome) -> f64| {
+            sampled.map_or_else(
                 || Reading::missing("the path's storage sample was not taken"),
                 |(_, stored, inserted, sample)| {
-                    let stored = parquet_bytes(&root, op.table()).saturating_sub(*stored);
+                    let stored = parquet_bytes(&root, op.table())
+                        .saturating_sub(*stored)
+                        .to_f64()
+                        .unwrap_or(f64::MAX);
+                    let sent = sample.wire_bytes.to_f64().unwrap_or(0.0);
                     if sample.error_count() > 0 {
                         Reading::missing(format!(
                             "the storage sample failed with {:?}",
                             sample.errors
                         ))
-                    } else if *inserted > 0.0 && stored > 0 {
-                        Reading::exact(stored.to_f64().unwrap_or(f64::MAX) / inserted)
+                    } else if *inserted > 0.0
+                        && stored > 0.0
+                        && (op == WriteOp::Native || sent > 0.0)
+                    {
+                        Reading::exact(ratio(stored, *inserted, sample))
                     } else {
-                        Reading::missing("the storage sample inserted or published no bytes")
+                        Reading::missing("the storage sample sent, inserted, or published no bytes")
                     }
                 },
-            );
-        facts.push(ratio);
+            )
+        };
+        facts.push(settled(|stored, inserted, _| stored / inserted));
+        if op != WriteOp::Native {
+            compression.push(settled(|stored, _, sample| {
+                sample.wire_bytes.to_f64().unwrap_or(0.0) / stored
+            }));
+        }
     }
+    facts.extend(compression);
     SETTLED
         .iter()
         .zip(facts)

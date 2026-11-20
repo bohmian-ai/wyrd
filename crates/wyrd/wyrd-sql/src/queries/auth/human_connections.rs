@@ -532,27 +532,6 @@ impl StoredSecretTable {
 /// PostgreSQL's `query_canceled` code: a statement ended by `statement_timeout`.
 const QUERY_CANCELED: &str = "57014";
 
-/// Open an operator transaction whose statements PostgreSQL itself cancels
-/// once `wait` elapses, so neither a lock wait nor a slow read outlives a
-/// caller's budget and an abandoned write rolls back with the transaction.
-///
-/// # Errors
-/// Returns [`SqlError`] when the transaction cannot begin.
-async fn bounded_transaction(
-    operator: &OperatorPool,
-    wait: Duration,
-) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, SqlError> {
-    let mut tx = operator.pool().begin().await.map_err(SqlError::from)?;
-    // A zero timeout disables the limit, so the shortest bound is 1 ms.
-    let millis = wait.as_millis().clamp(1, i32::MAX as u128);
-    sqlx::query("SELECT set_config('statement_timeout', $1, true)")
-        .bind(format!("{millis}ms"))
-        .execute(&mut *tx)
-        .await
-        .map_err(SqlError::from)?;
-    Ok(tx)
-}
-
 /// `Ok(None)` when `result` failed because its statement timeout elapsed.
 fn unless_timed_out<T>(result: Result<T, sqlx::Error>) -> Result<Option<T>, SqlError> {
     match result {
@@ -578,7 +557,7 @@ pub async fn stored_secrets(
     table: StoredSecretTable,
     wait: Duration,
 ) -> Result<Option<Vec<StoredSecretRow>>, SqlError> {
-    let mut tx = bounded_transaction(operator, wait).await?;
+    let mut tx = operator.begin_bounded(wait).await?;
     unless_timed_out(
         sqlx::query_as::<_, StoredSecretRow>(table.select_sql())
             .fetch_all(&mut *tx)
@@ -605,7 +584,7 @@ pub async fn swap_stored_secret(
     replacement: &[u8],
     wait: Duration,
 ) -> Result<Option<bool>, SqlError> {
-    let mut tx = bounded_transaction(operator, wait).await?;
+    let mut tx = operator.begin_bounded(wait).await?;
     let swapped = unless_timed_out(
         sqlx::query(table.swap_sql())
             .bind(row.data_tenant_id)

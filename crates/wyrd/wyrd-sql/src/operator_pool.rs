@@ -7,7 +7,9 @@
 //! query modules are allowed to hold for cross-tenant SQL; no query fn may take
 //! a bare `&PgPool`.
 
-use sqlx::PgPool;
+use std::time::Duration;
+
+use sqlx::{PgPool, Postgres, Transaction};
 use wyrd_spec::DataTenantId;
 
 use crate::{SqlError, TenantConn};
@@ -50,6 +52,33 @@ impl OperatorPool {
     /// and [`SqlError::TxFailed`] when the tenant binding fails.
     pub async fn begin_platform_audited(&self) -> Result<TenantConn<'_>, SqlError> {
         TenantConn::acquire(&self.0, DataTenantId::SYSTEM_OWNER).await
+    }
+
+    /// Opens one operator transaction whose statements PostgreSQL itself
+    /// cancels once `wait` elapses.
+    ///
+    /// A statement still waiting then, for example on a lock, fails with
+    /// `query_canceled` (`57014`), so no read or write outlives the caller's
+    /// budget, and an abandoned write rolls back with the transaction rather
+    /// than landing later. The timeout is transaction-local and never returns
+    /// to the pool.
+    ///
+    /// # Errors
+    /// Returns [`SqlError`] when the transaction cannot begin or its timeout
+    /// cannot be set.
+    pub async fn begin_bounded(
+        &self,
+        wait: Duration,
+    ) -> Result<Transaction<'static, Postgres>, SqlError> {
+        let mut tx = self.0.begin().await.map_err(SqlError::from)?;
+        // A zero timeout disables the limit, so the shortest bound is 1 ms.
+        let millis = wait.as_millis().clamp(1, i32::MAX as u128);
+        sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+            .bind(format!("{millis}ms"))
+            .execute(&mut *tx)
+            .await
+            .map_err(SqlError::from)?;
+        Ok(tx)
     }
 
     /// Borrow the underlying operator-session pool.

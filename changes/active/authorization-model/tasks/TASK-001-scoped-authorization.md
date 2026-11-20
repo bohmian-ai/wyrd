@@ -438,9 +438,46 @@ Evidence (in progress):
   - Material risk: `platform_admin_e2e` (revoked principal 401 "inactive") and the
     `identity_e2e` revoke journeys still assert an immediate refusal on the same race.
   - GREEN: 5/5 in `principal_journey` plus the CLI scope journey.
-- Not yet proven in this cycle: review sets/members/executions/approvals and downloads
-  through dedicated reads, peer execution of the masked plan. Each remains FAIL until
-  proven. Scoped invitations: see `pg_browser_sessions`.
+- Review sets, members and executions through SQL and the dedicated read.
+  `pg_github_pull_requests::retained_reads_resolve_current_and_history_membership`
+  binds `executions:read` at Repository family `policy` (the PR trusted parent).
+  - The reader sees exactly the viewer's six members, and the same count, from
+    `bifrost.verification.execution_inputs`.
+  - It opens a member through `GET /v1/verification/executions/{id}`.
+  - Another family's reader gets the same status for that execution as for an unknown
+    id.
+  - RED 1: the family reader got `[]`.
+    - Diagnostician report: `restrict_verification_rows` rebuilt each column as
+      CASE + alias, which drops field metadata, so Variant columns such as `inputs`
+      came back undecoded for every non-tenant-wide reader of any
+      `bifrost.verification` table.
+    - Fix site: the same projection now aliases with the field's metadata
+      (`alias_qualified_with_metadata`).
+    - Unit test `oracle::tests::masked_verification_columns_keep_their_metadata`: RED
+      (metadata `None`), then GREEN, 33/33 Oracle tests (`f9e554154`).
+  - RED 2: another family's reader got 403 for a real execution and 404 for an unknown
+    one, which discloses existence. The authority is posture "Point reads, downloads
+    … Unknown/inaccessible exact objects are indistinguishable" and REQ-006.
+    - Fix site: `VerificationService::retained` (`service/inspection.rs`). A reader
+      denied the trusted parent now gets `execution_not_found`; the denial is still
+      audited. Approval decisions keep their 403.
+    - Stale assertions updated:
+      - `pull_request_inspection_requires_repository_read` (Verifier-only reader,
+        before and after queue cleanup).
+      - `local_publication_downloads_redeem_under_verifier_read` (another-parent
+        download content).
+  - GREEN: `pg_github_pull_requests` 26/26 (`ed400d4ea`). The server integration run
+    passed 435/438 before the last assertion update. The 3 failures were that
+    assertion and two live PagerDuty/Slack smokes, which need external credentials and
+    were selected only by `--run-ignored=all`.
+  - Command: `cargo nextest run --locked -p wyrd-server --test integration
+    --run-ignored=all -E '<selector>'` under `with-test-postgres.sh` after
+    `db:migrate:all:inner`.
+  - TDD: the scenario test was written first. Both production fixes followed observed
+    failures.
+- Not yet proven in this cycle: approvals and downloads under a Repository-family
+  reader through the SDKs, and peer execution of the masked plan. Each remains FAIL
+  until proven. Scoped invitations: see `pg_browser_sessions`.
 - TDD: VIOLATED for slices committed in `8e33913ed` and `0c3a7d36f` (production code
   preceded tests). Test-first resumed from the smallest case above.
 
@@ -553,6 +590,40 @@ counters; combine them with real database notification/replica proof rather
 than using long sleeps or substituting unit tests for propagation. SQL/auth
 integration proves transactional revisions and invalidation; issuer/verifier
 unit tests pin claim refusal. Record performance and wait evidence here.
+
+Evidence (in progress):
+
+- Smallest case, existing bearer gains and loses a grant at its next request — PASS:
+  `principal_roles::bound_editor_reaches_the_next_request_until_unbound` (Rust, Python
+  and TypeScript twins).
+- Real replicas within five seconds, and warm requests compile nothing — PASS.
+  `pg_principal_roles::access_changes_reach_another_replica_within_the_bound`: two
+  in-process replicas over shared PostgreSQL. A binding committed through the first
+  reaches the second replica's existing bearer within `AUTHORITY_PROPAGATION` (5s), and
+  so does its removal. Twenty warm requests leave `AuthorityCache::compiles()`
+  unchanged.
+  - RED: the replica never saw the grant within 5s.
+  - Cause: `WyrdTestServer::start_replica` composed the replica without starting its
+    `authorization_cache` worker. Only `start_in_process` did, so a replica learned
+    changes only at the 5-minute freshness bound.
+  - Fix site: `WyrdTestServer::propagate_authority`, shared by `start_in_process` and
+    `start_replica`.
+  - GREEN 1/1 (`7affd3ceb`..`7d426e40c`).
+- Cold state, known invalidation and expired freshness refuse; an equal revision
+  changes nothing: unit `authority::tests::snapshots_serve_only_while_fresh_and_current`.
+  The compile counter does not move on an equal-revision notification.
+- Revoked principal's issued bearer refused within the bound: CLI `principal_journey`,
+  `platform_admin_e2e`, `identity_e2e` through `wyrd_testing::principal::within_propagation`.
+  The identity lane exited 0 (31/31 and the BFF/CLI/SDK slices) at `d74c8ec61`.
+- Not yet proven here:
+  - interrupted confirmation allowing only within five minutes, and renewal not
+    extending it
+  - streams stopping when authority becomes unusable
+  - the refusal code for unavailable authority, as distinct from missing permission
+  - ceiling/delegation intersections and frozen accepted work
+  - the issued-claims inspection
+
+  Each remains FAIL until proven.
 
 ## Verification and handoff
 

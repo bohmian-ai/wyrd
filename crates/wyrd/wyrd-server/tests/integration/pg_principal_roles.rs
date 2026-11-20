@@ -447,9 +447,7 @@ async fn provisioning_a_services_roles_requires_tenant_administration() {
         .await
         .expect("role seeds");
     let (lesser, lesser_jwt) = user(&server, "prov-credentials", &["prov_credential_admin"]).await;
-    let request = |role: &str| {
-        json!({ "name": "prov-escalation", "assignments": [{ "role": role, "scope": "all" }] })
-    };
+    let request = |role: &str| json!({ "name": "prov-escalation", "assignments": [{ "role": role, "scope": "all" }] });
 
     for role in ["admin", "prov_credential_admin"] {
         let (status, problem) = send(
@@ -489,7 +487,11 @@ async fn provisioning_a_services_roles_requires_tenant_administration() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{bare}");
-    let bare = bare["principal_id"].as_str().expect("id").parse().expect("uuid");
+    let bare = bare["principal_id"]
+        .as_str()
+        .expect("id")
+        .parse()
+        .expect("uuid");
     assert_eq!(
         assignments(&access(&server, &admin_jwt, bare).await),
         pairs(&[]),
@@ -505,7 +507,11 @@ async fn provisioning_a_services_roles_requires_tenant_administration() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{created}");
-    let created = created["principal_id"].as_str().expect("id").parse().expect("uuid");
+    let created = created["principal_id"]
+        .as_str()
+        .expect("id")
+        .parse()
+        .expect("uuid");
     assert_eq!(
         assignments(&access(&server, &admin_jwt, created).await),
         pairs(&[("admin", "direct")]),
@@ -554,9 +560,7 @@ async fn exact_card_grants_must_name_a_registered_version_of_their_family() {
         .await
         .expect("foreign Card seeds");
 
-    let exact = |uid: &CardUid| {
-        json!({ "card": { "version": { "kind": "Service", "name": "ex-checkout", "uid": uid } } })
-    };
+    let exact = |uid: &CardUid| json!({ "card": { "version": { "kind": "Service", "name": "ex-checkout", "uid": uid } } });
     let grant = |scope: Value| {
         json!({
             "subject": { "principal": { "id": target, "kind": "service" } },

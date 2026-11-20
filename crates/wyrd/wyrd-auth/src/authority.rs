@@ -416,9 +416,8 @@ impl TenantAuthority {
             .settled
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let unknown_account = |id: PrincipalId| {
-            self.account(id).is_none() && !settled.contains(&id.as_uuid())
-        };
+        let unknown_account =
+            |id: PrincipalId| self.account(id).is_none() && !settled.contains(&id.as_uuid());
         unknown_account(verified.principal.id)
             || verified
                 .delegation_chain
@@ -443,7 +442,12 @@ impl TenantAuthority {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let accounts = std::iter::once(verified.principal.id)
-            .chain(verified.delegation_chain.iter().map(|step| step.principal.id))
+            .chain(
+                verified
+                    .delegation_chain
+                    .iter()
+                    .map(|step| step.principal.id),
+            )
             .filter(|id| self.account(*id).is_none())
             .map(|id| id.as_uuid());
         settled.extend(accounts);
@@ -870,13 +874,19 @@ mod pg_tests {
             exp: chrono::Utc::now(),
             iat: chrono::Utc::now(),
         };
-        let first = cache.authorize(&postgres, &token).await.expect_err("unknown");
+        let first = cache
+            .authorize(&postgres, &token)
+            .await
+            .expect_err("unknown");
         assert!(matches!(first, WyrdError::PermissionUnauthenticated { .. }));
         let compiled = cache.compiles();
 
         postgres.app_pool().close().await;
         for _ in 0..3 {
-            let again = cache.authorize(&postgres, &token).await.expect_err("unknown");
+            let again = cache
+                .authorize(&postgres, &token)
+                .await
+                .expect_err("unknown");
             assert!(
                 matches!(again, WyrdError::PermissionUnauthenticated { .. }),
                 "answered from memory: {again:?}"
@@ -1051,7 +1061,9 @@ mod tests {
         assert!(cache.install(tenant, load(5)).is_some());
         assert_eq!(cache.cached(tenant).map(|s| s.revision()), Some(5));
         assert!(
-            cache.install(tenant, load(4)).is_some_and(|s| s.revision() == 5),
+            cache
+                .install(tenant, load(4))
+                .is_some_and(|s| s.revision() == 5),
             "a late older load leaves the current snapshot serving"
         );
 

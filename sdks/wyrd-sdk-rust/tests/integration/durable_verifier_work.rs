@@ -285,11 +285,17 @@ async fn a_direct_execution_survives_deleting_its_cards() {
         .verify("answer-check", json!("yes"))
         .await
         .expect("the answer is judged");
-    deployment.server().flush_bifrost().await.expect("rows publish");
+    deployment
+        .server()
+        .flush_bifrost()
+        .await
+        .expect("rows publish");
     let reader = |family: String| async move {
-        let grants = [json!({"resource": "executions", "action": "read", "scope": {"card": {
-            "family": {"kind": "Agent", "name": family}
-        }}})];
+        let grants = [
+            json!({"resource": "executions", "action": "read", "scope": {"card": {
+                "family": {"kind": "Agent", "name": family}
+            }}}),
+        ];
         let key = deployment
             .granted_key(&format!("retained_{family}").replace('-', "_"), &grants)
             .await;

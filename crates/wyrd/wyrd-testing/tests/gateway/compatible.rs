@@ -921,11 +921,12 @@ async fn managed_secret_rotation_survives_server_restart() {
 ///
 /// The administrator's submission seals through Vault Transit and the
 /// background reloads its writes queue open it. Once they settle, warm calls
-/// make no Transit request. A rotation is prepared again the same way. After
-/// a restart, the cold first call is refused retryably until the background
-/// reload has opened the committed envelope through Transit, and warm calls
-/// again make no Transit request. The upstream receives exactly the
-/// submitted, then the rotated, key.
+/// make no Transit request. A rotation, and then an encryption renewal, is
+/// prepared again the same way. After a restart, the cold first call is
+/// refused retryably until the background reload has opened the committed
+/// envelope through Transit, and warm calls again make no Transit request.
+/// The upstream receives exactly the submitted, then the rotated, key; the
+/// renewal changes no key the upstream sees.
 ///
 /// # Panics
 ///
@@ -984,6 +985,33 @@ async fn managed_secret_opens_through_vault_transit_only_while_preparing() {
         "warm calls after the rotation make no Transit request"
     );
 
+    // Renewing encryption reseals the same key; the reload prepares it and
+    // the upstream still receives the rotated key.
+    let before = journey.invalidations();
+    let renewed = journey
+        .http
+        .post(format!(
+            "{}/v1/admin/gateway/provider-credentials/openai-key/renew-encryption",
+            journey.base
+        ))
+        .header("x-wyrd-access-token", format!("Bearer {}", journey.admin))
+        .send()
+        .await
+        .expect("renewal sends");
+    assert_eq!(renewed.status().as_u16(), 200, "renewal succeeds");
+    journey.settled(before + 1).await;
+    let reprepared = transit.requests("decrypt").await;
+    assert!(
+        reprepared > rotated,
+        "the renewed envelope is prepared again"
+    );
+    invoke(&journey).await;
+    assert_eq!(
+        transit.requests("decrypt").await,
+        reprepared,
+        "warm calls after the renewal make no Transit request"
+    );
+
     let journey = journey.restart().await;
     invoke(&journey).await;
     journey.settled(journey.invalidations()).await;
@@ -1003,6 +1031,7 @@ async fn managed_secret_opens_through_vault_transit_only_while_preparing() {
         &[
             PROVIDER_KEY,
             PROVIDER_KEY,
+            ROTATED_KEY,
             ROTATED_KEY,
             ROTATED_KEY,
             ROTATED_KEY,

@@ -812,7 +812,7 @@ async fn assert_refused(state: &AppState, tenant: DataTenantId, reason: &str) {
 
 /// Managed credentials are sealed through the deployment `[kms]` and stay
 /// tenant-bound: two tenants send their own key upstream, a restarted replica
-/// with the same key keeps resolving, the production boot rewrap moves every
+/// with the same key keeps resolving, a routine maintenance pass moves every
 /// envelope onto a rotated active key, and an envelope copied into another
 /// tenant's row, a keyless deployment, a key retired before rewrap, or a
 /// revoked credential all fail with the stable 503-class error before any
@@ -855,7 +855,8 @@ async fn gateway_managed_credentials_resolve_per_tenant_across_restart_and_rotat
 
     // Rotation follows the deployment procedure: the new active key with the
     // old one retained still resolves, while a replica holding only the new
-    // key refuses until the boot rewrap has rewrapped every envelope.
+    // key refuses until a routine maintenance pass has rewrapped every
+    // envelope.
     let rotation = seeded_kms(2, &[1]);
     let rotated = managed_replica(&fixture, Some(Arc::clone(&rotation)), dispatch.clone()).await;
     warm(&rotated, [first, second]).await;
@@ -866,12 +867,18 @@ async fn gateway_managed_credentials_resolve_per_tenant_across_restart_and_rotat
     assert_eq!(dispatch.seen().len(), 4, "the refusal did not dispatch");
 
     let committed = managed_envelope(&fixture, first).await;
-    crate::boot::rewrap_sealed_secrets(
-        Some(fixture.operator_pool().clone()),
+    let report = crate::components::platform::stored_secrets::StoredSecretMaintenance::new(
+        fixture.operator_pool().clone(),
         Some(Arc::clone(&rotation)),
     )
+    .run(
+        wyrd_spec::security::stored_secret::StoredSecretMaintenanceMode::Routine,
+        None,
+        Duration::from_secs(30),
+    )
     .await
-    .expect("boot rewrap");
+    .expect("routine pass");
+    assert_eq!((report.changed, report.remaining), (2, 0), "{report:?}");
     assert_ne!(
         managed_envelope(&fixture, first).await,
         committed,

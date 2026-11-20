@@ -37,6 +37,10 @@ pub const PLATFORM_AUTHZ_OPERATION: &str = "platform.authz";
 /// object rather than an identifier.
 pub const PLATFORM_CONNECTION_RESOURCE: &str = "platform:oidc_connection";
 
+/// Audited resource for a deployment wrapping-key maintenance pass over every
+/// recoverable stored secret.
+pub const PLATFORM_STORED_SECRETS_RESOURCE: &str = "platform:stored_secrets";
+
 /// Audited resource for a decision about the platform administrator directory
 /// as a whole, rather than about one administrator in it.
 pub const PLATFORM_ADMINS_RESOURCE: &str = "platform:admins";

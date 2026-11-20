@@ -824,13 +824,14 @@ async fn failed_verdict_fans_out_to_every_provider_independently() {
 }
 
 /// A transient failure retries after the 30-second backoff; the credential is
-/// rotated in Postgres and a second replica, on a newer key version, delivers
-/// the next attempt with the rotated token and rewraps the stored credential,
-/// with no Card revision.
+/// rotated in Postgres and a second replica, with a newer wrapping key active
+/// and the old one retained, delivers the next attempt with the rotated token,
+/// with no Card revision. Activating the newer key moves no stored credential:
+/// the replica's runner leaves the envelope exactly as the rotation stored it.
 ///
 /// # Panics
-/// Panics when the retry schedule, rotation, rewrap, or frozen kind counts
-/// differ between attempts.
+/// Panics when the retry schedule, rotation, or frozen kind counts differ
+/// between attempts, or the runner rewrites the stored credential.
 #[tokio::test]
 async fn next_attempt_on_another_replica_uses_the_rotated_credential() {
     let delivery = Delivery::start().await;
@@ -897,6 +898,17 @@ async fn next_attempt_on_another_replica_uses_the_rotated_credential() {
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{view}");
+    let stored = || async {
+        sqlx::query_scalar::<_, Vec<u8>>(
+            "SELECT secret_ciphertext FROM wyrd.operator_connections \
+              WHERE connection_id = $1::uuid",
+        )
+        .bind(&slack_id)
+        .fetch_one(&delivery.assertion)
+        .await
+        .expect("envelope reads")
+    };
+    let rotated = stored().await;
 
     let replica = rotated_file_kms(&delivery.server);
     delivery.make_retries_due(run).await;
@@ -909,26 +921,16 @@ async fn next_attempt_on_another_replica_uses_the_rotated_credential() {
     let rows = delivery
         .wait_dispatches(run, 1, |row| row.status == "delivered")
         .await;
-    let deadline = tokio::time::Instant::now() + WAIT;
-    loop {
-        let envelope: Vec<u8> = sqlx::query_scalar(
-            "SELECT secret_ciphertext FROM wyrd.operator_connections \
-              WHERE connection_id = $1::uuid",
-        )
-        .bind(&slack_id)
-        .fetch_one(&delivery.assertion)
-        .await
-        .expect("envelope reads");
-        if replica.is_current(&envelope).expect("a common envelope") {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "credential never rewrapped"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
     second.stop().await;
+    let envelope = stored().await;
+    assert!(
+        !replica.is_current(&envelope).expect("a common envelope"),
+        "the runner moved the credential to the newly active key"
+    );
+    assert_eq!(
+        envelope, rotated,
+        "the runner left the stored credential unchanged"
+    );
     assert_eq!(rows[&posted.as_uuid()].attempts, 2);
     let posts = delivery.requests("/slack").await;
     let texts: Vec<Value> = posts
@@ -2200,27 +2202,6 @@ async fn verifiers_progress_while_operator_deliveries_are_capped() {
     runtime.stop().await;
 }
 
-/// Whether each Operator connection envelope of `tenant` names `kms`'s
-/// active key, in connection order.
-///
-/// # Panics
-/// Panics when the connection table cannot be read or a row holds no
-/// common envelope.
-async fn current(pool: &PgPool, tenant: DataTenantId, kms: &WyrdKms) -> Vec<bool> {
-    let envelopes: Vec<Vec<u8>> = sqlx::query_scalar(
-        "SELECT secret_ciphertext FROM wyrd.operator_connections \
-          WHERE data_tenant_id = $1 ORDER BY connection_id",
-    )
-    .bind(tenant.as_uuid())
-    .fetch_all(pool)
-    .await
-    .expect("envelopes read");
-    envelopes
-        .iter()
-        .map(|envelope| kms.is_current(envelope).expect("a common envelope"))
-        .collect()
-}
-
 /// Publish a new owner-only file key `next` beside `server`'s generated
 /// `[kms]` key and return a facade rotated onto it with that key retained,
 /// as a rolling replica configures it.
@@ -2256,248 +2237,4 @@ fn unreachable_endpoint() -> String {
     let endpoint = format!("http://{}", closed.local_addr().expect("addr"));
     drop(closed);
     endpoint
-}
-
-/// Rewrap runs beside delivery, never ahead of it: while a stalled wrapping
-/// provider times out every rewrap of one tenant's stale rows, another
-/// tenant's due dispatch is still claimed and delivered; each timed-out pass
-/// rolls back and is retried, and shutdown cancels the stalled pass at once.
-/// Once the provider answers, a pass moves every row onto the active key.
-///
-/// # Panics
-/// Panics when delivery waits on rewrap, a stalled pass commits or blocks
-/// shutdown, or the answered pass leaves a row on the retained key.
-#[tokio::test]
-async fn slow_rewrap_never_holds_back_another_tenants_delivery() {
-    let transit = TransitFixture::start().await;
-    let delivery = Delivery::start_on(Some(transit_config(&transit.uri(), "old", &[]))).await;
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(204))
-        .mount(&delivery.mock)
-        .await;
-    let stale_tenant = delivery.seed.tenant();
-    let old = WyrdKms::new(&transit_config(&transit.uri(), "old", &[]), false).expect("old facade");
-    assert_eq!(
-        current(&delivery.assertion, stale_tenant, &old).await,
-        vec![true; 3]
-    );
-
-    let other_tenant = delivery.quiet_tenant("operator-rewrap-other").await.tenant;
-
-    let stalled = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_mins(1)))
-        .mount(&stalled)
-        .await;
-    let replica = OperatorSecrets::new(Some(Arc::new(
-        WyrdKms::new(&transit_config(&stalled.uri(), "new", &["old"]), false)
-            .expect("stalled facade"),
-    )));
-    let limits = RuntimeLimits {
-        rewrap_interval: Duration::from_millis(50),
-        rewrap_tenant_budget: Duration::from_millis(300),
-        ..Delivery::limits()
-    };
-    let running = delivery.spawn_replica(
-        replica,
-        &limits,
-        &failing_script(1),
-        &CapabilityCrash::default(),
-    );
-    let deadline = tokio::time::Instant::now() + WAIT;
-    let delivered = loop {
-        let status: Option<String> = sqlx::query_scalar(
-            "SELECT status FROM wyrd.operator_dispatches WHERE data_tenant_id = $1",
-        )
-        .bind(other_tenant.as_uuid())
-        .fetch_optional(&delivery.assertion)
-        .await
-        .expect("dispatch reads");
-        if status.as_deref() == Some("delivered") {
-            break status;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the other tenant's dispatch was held back: {status:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    };
-    assert_eq!(delivered.as_deref(), Some("delivered"));
-    let deadline = tokio::time::Instant::now() + WAIT;
-    while stalled.received_requests().await.expect("recorded").len() < 2 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "a timed-out rewrap pass is retried"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let stopping = tokio::time::Instant::now();
-    running.stop().await;
-    assert!(
-        stopping.elapsed() < Duration::from_secs(5),
-        "shutdown cancels a stalled rewrap pass: {:?}",
-        stopping.elapsed()
-    );
-    assert_eq!(
-        current(&delivery.assertion, stale_tenant, &old).await,
-        vec![true; 3],
-        "timed-out and cancelled passes roll back"
-    );
-
-    let answered = Arc::new(
-        WyrdKms::new(&transit_config(&transit.uri(), "new", &["old"]), false)
-            .expect("answered facade"),
-    );
-    let running = delivery.spawn_replica(
-        OperatorSecrets::new(Some(Arc::clone(&answered))),
-        &limits,
-        &EngineScript::default(),
-        &CapabilityCrash::default(),
-    );
-    let deadline = tokio::time::Instant::now() + WAIT;
-    while current(&delivery.assertion, stale_tenant, &answered).await != vec![true; 3] {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "rewrap never completed"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    running.stop().await;
-}
-
-/// Rewrap keeps the work it finishes: with every key-service answer held back
-/// so the tenant's stale rows together outlast one pass's tenant budget, each
-/// pass commits the rows it rewrapped before the budget ran out, and repeated
-/// passes move every row onto the active key. A rotation and a disable racing
-/// the first pass win their rows: the rotated token is the one that opens and
-/// the disabled connection stays disabled.
-///
-/// # Panics
-/// Panics when a pass commits nothing, the passes do not converge, or a
-/// racing write is lost.
-#[tokio::test]
-async fn rewrap_commits_progress_across_tenant_budgets() {
-    let transit = TransitFixture::start_delayed(Duration::from_millis(200)).await;
-    let delivery = Delivery::start_on(Some(transit.config("old", &[]))).await;
-    let tenant = delivery.seed.tenant();
-    let state = delivery.server.state();
-    let operator = state.postgres.operator_pool().expect("operator pool");
-    let kms =
-        Arc::new(WyrdKms::new(&transit.config("new", &["old"]), false).expect("rotated facade"));
-    let keys = OperatorSecrets::new(Some(Arc::clone(&kms)));
-    let budget = Duration::from_millis(600);
-    let (_, list) = delivery
-        .call(Method::GET, "/v1/operator-connections", None)
-        .await;
-    let id_of = |provider: &str| {
-        list.as_array()
-            .or_else(|| list["connections"].as_array())
-            .expect("connection list")
-            .iter()
-            .find(|view| view["provider"] == provider)
-            .and_then(|view| view["connection_id"].as_str())
-            .expect("connection")
-            .to_owned()
-    };
-    let (slack_id, pager_id) = (id_of("slack"), id_of("pager_duty"));
-
-    let slack_uri = format!("/v1/operator-connections/{slack_id}");
-    let pager_uri = format!("/v1/operator-connections/{pager_id}");
-    let rotate = json!({ "provider": "slack", "bot_token": ROTATED_TOKEN });
-    let (moved, (rotated, _), (disabled, _)) = tokio::join!(
-        keys.rewrap_pass(state.postgres.wyrd(), &operator, WAIT, budget),
-        delivery.call(Method::PATCH, &slack_uri, Some(&rotate)),
-        delivery.call(Method::DELETE, &pager_uri, None),
-    );
-    assert_eq!((rotated, disabled), (StatusCode::OK, StatusCode::OK));
-    let moved = moved.expect("the pass runs");
-    assert!(
-        (1..3).contains(&moved),
-        "one pass commits the rows it finished within its budget: {moved}"
-    );
-    let mut passes = 1;
-    while current(&delivery.assertion, tenant, &kms).await != vec![true; 3] {
-        assert!(passes < 10, "rewrap never converged");
-        keys.rewrap_pass(state.postgres.wyrd(), &operator, WAIT, budget)
-            .await
-            .expect("the pass runs");
-        passes += 1;
-    }
-
-    let mut conn = state
-        .postgres
-        .wyrd()
-        .tenant_conn(tenant)
-        .await
-        .expect("conn");
-    let slack = wyrd_sql::queries::operator_connections::get_connection(
-        &mut conn,
-        slack_id.parse().expect("connection id"),
-    )
-    .await
-    .expect("connection reads")
-    .expect("connection exists");
-    conn.commit().await.expect("read commits");
-    let opened = keys
-        .open(tenant, &slack)
-        .await
-        .expect("rotated token opens");
-    let opened: Value = serde_json::from_slice(&opened).expect("stored secret is JSON");
-    assert_eq!(opened["value"], ROTATED_TOKEN, "the rotation's token opens");
-    let (_, pager) = delivery.call(Method::GET, &pager_uri, None).await;
-    assert_eq!(pager["status"], "disabled", "the disable is kept");
-}
-
-/// A cross-tenant rewrap discovery stalled behind a lock on the connection
-/// table returns within the pass budget without touching a row, and the next
-/// pass after the stall clears rewraps every stale row.
-///
-/// # Panics
-/// Panics when the stalled pass outlives its budget, mutates a row, or the
-/// later pass does not rewrap.
-#[tokio::test]
-async fn stalled_rewrap_discovery_returns_within_the_pass_budget() {
-    let delivery = Delivery::start().await;
-    let tenant = delivery.seed.tenant();
-    let kms = rotated_file_kms(&delivery.server);
-    let keys = OperatorSecrets::new(Some(Arc::clone(&kms)));
-    let state = delivery.server.state();
-    let operator = state.postgres.operator_pool().expect("operator pool");
-
-    let mut lock = delivery.assertion.begin().await.expect("lock transaction");
-    sqlx::query("LOCK TABLE wyrd.operator_connections IN ACCESS EXCLUSIVE MODE")
-        .execute(&mut *lock)
-        .await
-        .expect("connection table locks");
-    let budget = Duration::from_millis(300);
-    let started = tokio::time::Instant::now();
-    let moved = tokio::time::timeout(
-        WAIT,
-        keys.rewrap_pass(state.postgres.wyrd(), &operator, budget, budget),
-    )
-    .await
-    .expect("the stalled pass returns")
-    .expect("a stalled discovery is not a pass failure");
-    let elapsed = started.elapsed();
-    assert_eq!(moved, 0);
-    assert!(
-        elapsed < budget + Duration::from_secs(2),
-        "the stalled discovery outlived the pass budget: {elapsed:?}"
-    );
-    lock.rollback().await.expect("lock releases");
-    assert_eq!(
-        current(&delivery.assertion, tenant, &kms).await,
-        vec![false; 3],
-        "a timed-out discovery mutates nothing"
-    );
-
-    let moved = keys
-        .rewrap_pass(state.postgres.wyrd(), &operator, WAIT, WAIT)
-        .await
-        .expect("the next pass runs");
-    assert_eq!(moved, 3);
-    assert_eq!(
-        current(&delivery.assertion, tenant, &kms).await,
-        vec![true; 3]
-    );
 }

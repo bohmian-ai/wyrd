@@ -3,9 +3,11 @@
 //! `TlsConfig` and `SecretRef` are consumed by the external client
 //! (`wyrd-client::transport`). Keeping them in `wyrd-spec::security` gives
 //! them one durable, schema-bearing definition without a cross-crate
-//! dependency cycle.
+//! dependency cycle. `stored_secret` holds the platform wrapping-key
+//! maintenance contracts.
 
 pub mod secret_ref;
+pub mod stored_secret;
 pub mod tls;
 
 #[cfg(any(test, feature = "test-utils"))]

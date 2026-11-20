@@ -140,65 +140,15 @@ pub async fn delete_platform_oidc_connection(conn: &mut TenantConn<'_>) -> Resul
         .map_err(SqlError::from)
 }
 
-/// The platform connection's stored client secret with the owner metadata
-/// its envelope context binds.
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct PlatformSealedSecretRow {
-    /// Issuer URL, the envelope's owner.
-    pub issuer_url: String,
-    /// OAuth client id.
-    pub client_id: String,
-    /// Client-authentication method.
-    pub client_auth: String,
-    /// The stored envelope exactly as stored.
-    pub client_secret_enc: Vec<u8>,
-}
-
-/// Read the platform connection's stored client secret for rewrap.
-///
-/// # Errors
-/// Returns [`SqlError::Query`] when the read fails.
-pub async fn platform_sealed_secret(
-    pool: &OperatorPool,
-) -> Result<Option<PlatformSealedSecretRow>, SqlError> {
-    sqlx::query_as(
-        "SELECT issuer_url, client_id, client_auth, client_secret_enc
-           FROM platform.oidc_connection
-          WHERE client_secret_enc IS NOT NULL",
-    )
-    .fetch_optional(pool.pool())
-    .await
-    .map_err(SqlError::from)
-}
-
 /// Compare-and-swap of the platform connection's sealed secret.
 const SWAP_PLATFORM_SEALED_SECRET_SQL: &str = "UPDATE platform.oidc_connection
     SET client_secret_enc = $2
   WHERE client_secret_enc = $1";
 
-/// Replace the platform connection's sealed secret if it still holds `previous`.
-///
-/// Returns `false` when the connection changed since it was read, so a
-/// concurrent reconfiguration is never overwritten by a rewrap.
-///
-/// # Errors
-/// Returns [`SqlError::Query`] when the update fails.
-pub async fn swap_platform_sealed_secret(
-    pool: &OperatorPool,
-    previous: &[u8],
-    rewrapped: &[u8],
-) -> Result<bool, SqlError> {
-    sqlx::query(SWAP_PLATFORM_SEALED_SECRET_SQL)
-        .bind(previous)
-        .bind(rewrapped)
-        .execute(pool.pool())
-        .await
-        .map(|done| done.rows_affected() == 1)
-        .map_err(SqlError::from)
-}
-
-/// [`swap_platform_sealed_secret`] on an open platform transaction, so an
-/// administrative renewal commits with its audited decision.
+/// Replace the platform connection's sealed secret with `renewed` on an open
+/// platform transaction if it still holds `previous`, so an administrative
+/// renewal commits with its audited decision. Returns `false` when the
+/// connection changed since it was read.
 ///
 /// # Errors
 /// Returns [`SqlError::Query`] when the update fails.

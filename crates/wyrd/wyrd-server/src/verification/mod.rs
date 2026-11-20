@@ -201,20 +201,11 @@ pub struct RuntimeLimits {
     /// Server backoff after the first and every later failed Operator
     /// attempt.
     pub operator_backoff: [Duration; 2],
-    /// Wait between Operator key-rewrap passes; rewrap runs beside, never
-    /// inside, the delivery claim loop.
-    pub rewrap_interval: Duration,
-    /// Elapsed-time ceiling of one cross-tenant rewrap pass.
-    pub rewrap_pass_budget: Duration,
-    /// Elapsed-time ceiling of one tenant's rewrap transaction.
-    pub rewrap_tenant_budget: Duration,
 }
 
 impl Default for RuntimeLimits {
     /// Production bounds: 64 running Verifier executions, 16 process-wide and 4 per-tenant Operator deliveries, a ten-minute
-    /// renewed lease over a five-minute execution, a
-    /// thirty-second drain, and a five-minute rewrap interval whose passes stop after
-    /// two minutes and thirty seconds per tenant.
+    /// renewed lease over a five-minute execution, and a thirty-second drain.
     fn default() -> Self {
         Self {
             execution_slots: 64,
@@ -230,9 +221,6 @@ impl Default for RuntimeLimits {
             operator_lease: Duration::from_secs(45),
             operator_attempt_timeout: Duration::from_secs(30),
             operator_backoff: [Duration::from_secs(30), Duration::from_mins(2)],
-            rewrap_interval: Duration::from_mins(5),
-            rewrap_pass_budget: Duration::from_mins(2),
-            rewrap_tenant_budget: Duration::from_secs(30),
         }
     }
 }

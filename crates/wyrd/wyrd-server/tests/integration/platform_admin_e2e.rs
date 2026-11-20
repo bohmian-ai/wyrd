@@ -24,6 +24,9 @@ use wyrd_server::boot::init::InitError;
 use wyrd_spec::DataTenantId;
 use wyrd_testing::WyrdTestServer;
 
+/// Wrapping-key lifecycle and stored-secret maintenance journeys.
+mod stored_secrets;
+
 /// The one header every Wyrd plane authenticates on.
 ///
 /// Spelled here rather than imported because the server keeps it private: a test

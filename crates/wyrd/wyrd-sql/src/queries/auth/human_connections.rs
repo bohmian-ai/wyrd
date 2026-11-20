@@ -6,13 +6,6 @@
 //! transaction, which serializes every lifecycle change for one tenant across
 //! all replicas while the partial unique indexes remain the final guard for
 //! "one Active, one Candidate".
-//!
-//! The two sealed-secret rewrap functions are the only cross-tenant slots: they
-//! run on the cross-tenant [`OperatorPool`] because sealing-key rotation is a
-//! deployment operation over every tenant's ciphertext, and each update is a
-//! compare-and-swap on the exact bytes read so a concurrent rotation cannot be
-//! overwritten. Besides this table's client secrets they cover the workload
-//! issuer secrets, so one inventory answers for every tenant ciphertext.
 // raw-query grep allowlist: auth tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use std::time::Duration;
@@ -21,7 +14,7 @@ use serde_json::Value;
 use sqlx::types::Uuid;
 
 use crate::row_types::auth::HumanConnectionRow;
-use crate::{OperatorPool, SqlError, TenantConn};
+use crate::{SqlError, TenantConn};
 
 /// Serializes every lifecycle mutation for the bound tenant; see
 /// [`lock_human_connection_slot`].
@@ -166,24 +159,6 @@ pub struct HumanConnectionWrite {
     pub group_role_map: Value,
     /// JWKS key-cache TTL in seconds.
     pub jwks_ttl_secs: i64,
-}
-
-/// One sealed secret column value, addressed for a compare-and-swap rewrap.
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct SealedSecretRow {
-    /// Owning tenant, used only for operator diagnostics.
-    pub data_tenant_id: Uuid,
-    /// Row key as text: the connection id, the trusted issuer URL, or the
-    /// gateway credential name.
-    pub row_key: String,
-    /// Owner identity the envelope context binds: the issuer URL, or the
-    /// gateway credential name.
-    pub owner: String,
-    /// Authority the envelope context binds, in order: the client id and
-    /// client-authentication method, or the gateway provider.
-    pub authority: Vec<String>,
-    /// The sealed bytes of the table's sealed column exactly as stored.
-    pub client_secret_enc: Vec<u8>,
 }
 
 /// Serialize every lifecycle mutation for the bound tenant.
@@ -423,124 +398,4 @@ pub async fn renew_human_connection_secret(
         .fetch_optional(&mut **conn.transaction())
         .await
         .map_err(SqlError::from)
-}
-
-/// List every stored envelope of one [`SealedSecretTable`] column across all
-/// tenants, with the owner metadata its context binds, for rewrap.
-///
-/// Every column lists every stored (non-null) envelope, regardless of the
-/// row's lifecycle.
-///
-/// # Errors
-/// Returns [`SqlError`] when the query fails.
-// tenant-isolation: cross-tenant OperatorPool
-pub async fn sealed_tenant_secrets(
-    operator: &OperatorPool,
-    table: SealedSecretTable,
-) -> Result<Vec<SealedSecretRow>, SqlError> {
-    sqlx::query_as::<_, SealedSecretRow>(table.select_sql())
-        .fetch_all(operator.pool())
-        .await
-        .map_err(SqlError::from)
-}
-
-/// Replace one sealed secret if it still holds exactly `previous`.
-///
-/// Returns `false` when the row changed or disappeared since it was read; the
-/// rewrap owner then leaves it for the next pass.
-///
-/// # Errors
-/// Returns [`SqlError`] when the update fails.
-// tenant-isolation: cross-tenant OperatorPool
-pub async fn swap_sealed_tenant_secret(
-    operator: &OperatorPool,
-    table: SealedSecretTable,
-    row: &SealedSecretRow,
-    rewrapped: &[u8],
-) -> Result<bool, SqlError> {
-    sqlx::query(table.swap_sql())
-        .bind(row.data_tenant_id)
-        .bind(&row.row_key)
-        .bind(&row.client_secret_enc)
-        .bind(rewrapped)
-        .execute(operator.pool())
-        .await
-        .map(|result| result.rows_affected() == 1)
-        .map_err(SqlError::from)
-}
-
-/// A tenant table column that holds stored-secret envelopes, as rewrap walks
-/// it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SealedSecretTable {
-    /// `wyrd.auth_human_connections.client_secret_enc`, keyed by connection id.
-    HumanConnections,
-    /// `wyrd.auth_trusted_issuers.client_secret_enc`, keyed by issuer URL.
-    TrustedIssuers,
-    /// `wyrd.gateway_provider_credentials.secret_ciphertext`, the managed
-    /// provider keys, keyed by credential name.
-    GatewayProviderCredentials,
-}
-
-impl SealedSecretTable {
-    /// Every column rewrap walks, in a stable order.
-    pub const ALL: [Self; 3] = [
-        Self::HumanConnections,
-        Self::TrustedIssuers,
-        Self::GatewayProviderCredentials,
-    ];
-
-    /// Stable label for operator logs.
-    #[must_use]
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::HumanConnections => "wyrd.auth_human_connections",
-            Self::TrustedIssuers => "wyrd.auth_trusted_issuers",
-            Self::GatewayProviderCredentials => "wyrd.gateway_provider_credentials",
-        }
-    }
-
-    /// The operator statement listing every stored (non-null) sealed value in
-    /// this column, with no liveness or expiry filter, so the rewrap report
-    /// and keyless boot decision cover all ciphertext the table holds.
-    fn select_sql(self) -> &'static str {
-        match self {
-            Self::HumanConnections => {
-                "SELECT data_tenant_id, connection_id::text AS row_key, issuer_url AS owner,
-                        ARRAY[client_id, client_auth, connection_id::text] AS authority,
-                        client_secret_enc
-                   FROM wyrd.auth_human_connections WHERE client_secret_enc IS NOT NULL"
-            }
-            Self::TrustedIssuers => {
-                "SELECT data_tenant_id, issuer_url AS row_key, issuer_url AS owner,
-                        ARRAY[client_id, client_auth] AS authority, client_secret_enc
-                   FROM wyrd.auth_trusted_issuers WHERE client_secret_enc IS NOT NULL"
-            }
-            Self::GatewayProviderCredentials => {
-                "SELECT data_tenant_id, name AS row_key, name AS owner,
-                        ARRAY[provider] AS authority, secret_ciphertext AS client_secret_enc
-                   FROM wyrd.gateway_provider_credentials WHERE secret_ciphertext IS NOT NULL"
-            }
-        }
-    }
-
-    /// The operator compare-and-swap statement replacing one sealed value; it
-    /// matches only while the column still holds exactly the bytes read.
-    fn swap_sql(self) -> &'static str {
-        match self {
-            Self::HumanConnections => {
-                "UPDATE wyrd.auth_human_connections SET client_secret_enc = $4
-                  WHERE data_tenant_id = $1 AND connection_id::text = $2
-                    AND client_secret_enc = $3"
-            }
-            Self::TrustedIssuers => {
-                "UPDATE wyrd.auth_trusted_issuers SET client_secret_enc = $4
-                  WHERE data_tenant_id = $1 AND issuer_url = $2 AND client_secret_enc = $3"
-            }
-            Self::GatewayProviderCredentials => {
-                "UPDATE wyrd.gateway_provider_credentials SET secret_ciphertext = $4
-                  WHERE data_tenant_id = $1 AND name = $2 AND secret_ciphertext = $3"
-            }
-        }
-    }
 }

@@ -904,7 +904,10 @@ async fn complete_login(
 }
 
 /// Project a platform authorization failure onto the public catalog.
-fn platform_authz_error(error: &PlatformAuthzError, required: &Permission) -> WyrdErrorResponse {
+pub(super) fn platform_authz_error(
+    error: &PlatformAuthzError,
+    required: &Permission,
+) -> WyrdErrorResponse {
     match error {
         PlatformAuthzError::Denied { .. } => {
             WyrdErrorResponse::from(WyrdError::PermissionDeniedRbac {

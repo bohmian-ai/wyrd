@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use vala_bifrost_redux::resources::ResourcePlan;
 
+use crate::components::platform::stored_secrets::StoredSecretMaintenance;
 use secrecy::{ExposeSecret, SecretString};
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::catalog::BifrostCatalog;
@@ -43,7 +44,6 @@ use wyrd_auth::connections::HumanConnections;
 use wyrd_auth::issuance::TokenExchangeSettings;
 use wyrd_auth::platform_login::PlatformLogin;
 use wyrd_auth::platform_sessions::PlatformSessions;
-use wyrd_auth::sealing::SealedSecretRewrap;
 use wyrd_auth_oidc::WorkloadBinding;
 use wyrd_auth_verify::WyrdAuthVerifySettings;
 use wyrd_kms::WyrdKms;
@@ -1441,7 +1441,8 @@ impl AppState {
     }
 
     /// The startup steps that need the assembled state: seed configured
-    /// federation, rewrap or prove absent stored secrets, and validate the
+    /// federation, refuse stored secrets a keyless deployment cannot open,
+    /// and validate the
     /// production posture.
     ///
     /// # Errors
@@ -1452,7 +1453,7 @@ impl AppState {
         kms: Option<Arc<WyrdKms>>,
     ) -> Result<(), ServerBootError> {
         seed_federation(&self.postgres, config, kms.as_deref()).await?;
-        rewrap_sealed_secrets(self.postgres.operator_pool(), kms).await?;
+        refuse_unopenable_secrets(self.postgres.operator_pool(), kms.as_deref()).await?;
         self.production_validate()
             .map_err(ServerBootError::ProductionValidation)
     }
@@ -1546,48 +1547,39 @@ fn resolve_signing_key(config: &WyrdServerConfig) -> Result<SecretString, Server
     Ok(ephemeral)
 }
 
-/// Rewrap every stored auth, platform, and Gateway managed secret onto the
-/// active `[kms]` key, or prove a deployment without `[kms]` stores none.
+/// Prove a deployment without `[kms]` stores no secret it could not open.
 ///
-/// This is the rewrap step of wrapping-key rotation: with the new key active
-/// and the old one retained, every boot converges stored envelopes onto the
-/// active key, and the logged `remaining` count — from a pass that started
-/// after every writer moved to the new key — tells the operator when the old
-/// key may be retired. With `[kms]`, a failure is logged and left for the
-/// next boot: retained keys still open everything, so serving is unaffected.
-/// Without it, the same pass counts every stored envelope as unopenable, and
-/// any count fails boot before readiness, because the server could never
-/// open those secrets. Production boot and the test harness both call this,
-/// so they behave identically. Skipped when no cross-tenant operator pool is
-/// configured, since nothing can be read.
+/// Boot never moves stored envelopes: activating a wrapping key changes only
+/// where new secrets are sealed, and a platform administrator moves stored
+/// ones with an explicit maintenance pass. With `[kms]` configured this does
+/// nothing. Without it, any stored envelope in any store fails boot before
+/// readiness, because the server could never open it. Production boot and the
+/// test harness both call this, so they behave identically. Skipped when no
+/// cross-tenant operator pool is configured, since nothing can be read.
 ///
 /// # Errors
 /// Returns [`ServerBootError::Kms`] when no `[kms]` is configured and any
-/// provider or workload-issuer client secret or Gateway managed secret is
-/// stored, or the store cannot be read to prove there is none.
-pub async fn rewrap_sealed_secrets(
+/// stored secret exists, or the stores cannot be read to prove there is none.
+pub async fn refuse_unopenable_secrets(
     operator: Option<OperatorPool>,
-    kms: Option<Arc<WyrdKms>>,
+    kms: Option<&WyrdKms>,
 ) -> Result<(), ServerBootError> {
-    let Some(operator) = operator else {
+    let (Some(operator), None) = (operator, kms) else {
         return Ok(());
     };
-    let unconfigured = kms.is_none();
-    match SealedSecretRewrap::new(operator, kms).run().await {
-        Ok(report) if unconfigured && report.remaining > 0 => Err(ServerBootError::Kms(format!(
-            "{} stored secret(s) (provider or workload-issuer client secrets or \
-             gateway managed secrets) exist but no [kms] is configured; configure \
-             the [kms] key they were sealed under",
-            report.remaining
-        ))),
-        Ok(_) => Ok(()),
-        Err(error) if unconfigured => Err(ServerBootError::Kms(format!(
+    match StoredSecretMaintenance::new(operator, None)
+        .holds_envelopes()
+        .await
+    {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(ServerBootError::Kms(
+            "stored secrets exist but no [kms] is configured; configure the [kms] \
+             keys they were sealed under"
+                .to_owned(),
+        )),
+        Err(error) => Err(ServerBootError::Kms(format!(
             "stored secrets could not be checked with no [kms] configured: {error}"
         ))),
-        Err(error) => {
-            tracing::error!(error = %error, "stored secret rewrap failed; retrying next boot");
-            Ok(())
-        }
     }
 }
 
@@ -2649,26 +2641,64 @@ mod kms_boot_pg_tests {
 
     use super::*;
 
-    /// A deployment without `[kms]` boots while no provider secret is stored,
-    /// and refuses to boot with `Kms` once one is, since it could never open
+    /// A deployment without `[kms]` boots while no secret is stored, and
+    /// refuses to boot with `Kms` once any store holds one, Operator
+    /// connections and human connections alike, since it could never open
     /// that envelope.
     ///
     /// # Panics
-    /// Panics when the fixture cannot be seeded or either boot outcome differs.
+    /// Panics when the fixture cannot be seeded or a boot outcome differs.
     #[tokio::test]
     async fn keyless_boot_refuses_only_when_ciphertext_is_stored() {
+        use wyrd_spec::ids::{ConnectionName, OperatorConnectionId};
+        use wyrd_spec::operator_connection::OperatorConnectionConfig;
+        use wyrd_sql::queries::operator_connections::{
+            NewConnection, SealedSecret, insert_connection,
+        };
+
         let fixture = PgFixture::start().await.expect("fixture starts");
         let operator = fixture.operator_pool().clone();
-        rewrap_sealed_secrets(Some(operator.clone()), None)
+        refuse_unopenable_secrets(Some(operator.clone()), None)
             .await
             .expect("a keyless deployment with no stored secret boots");
 
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        insert_connection(
+            &mut conn,
+            &NewConnection {
+                connection_id: OperatorConnectionId::new_v7(),
+                name: &ConnectionName::new("ops").expect("connection name"),
+                config: &OperatorConnectionConfig::Slack {
+                    workspace_id: "T0001".to_owned(),
+                },
+                sealed: &SealedSecret {
+                    envelope: vec![1, 2],
+                },
+                secret_version: 1,
+                attribution: wyrd_spec::auth::Attribution::direct(
+                    wyrd_runtime::principal::PrincipalId::new(uuid::Uuid::now_v7()),
+                ),
+            },
+        )
+        .await
+        .expect("connection inserts")
+        .expect("connection name is free");
+        conn.commit().await.expect("seed commits");
+        let refused = refuse_unopenable_secrets(Some(operator.clone()), None)
+            .await
+            .expect_err("a keyless deployment with an Operator secret refuses to boot");
+        assert!(matches!(refused, ServerBootError::Kms(_)), "{refused:?}");
+
+        let superuser = fixture.superuser_pool().expect("superuser pool opens");
+        sqlx::query("DELETE FROM wyrd.operator_connections")
+            .execute(&superuser)
+            .await
+            .expect("the Operator secret is removed");
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let binding = seed_active_human_connection(&mut conn)
             .await
             .expect("connection seeds");
         conn.commit().await.expect("seed commits");
-        let superuser = fixture.superuser_pool().expect("superuser pool opens");
         sqlx::query(
             "UPDATE wyrd.auth_human_connections \
              SET client_auth = 'SecretPost', client_secret_enc = '\\x0102'::bytea \
@@ -2679,7 +2709,7 @@ mod kms_boot_pg_tests {
         .await
         .expect("a sealed secret is stored");
 
-        let refused = rewrap_sealed_secrets(Some(operator), None)
+        let refused = refuse_unopenable_secrets(Some(operator), None)
             .await
             .expect_err("a keyless deployment with a stored secret refuses to boot");
         assert!(matches!(refused, ServerBootError::Kms(_)), "{refused:?}");

@@ -1,6 +1,6 @@
 //! PgFixture coverage for Operator connection persistence: redacted authority,
 //! envelope-only storage, UUIDv7 identity, forced tenant RLS, updates fenced
-//! on the observed row, fenced rewrap, and rewrap tenant discovery.
+//! on the observed row.
 //!
 //! Every tenant read and write runs through [`TenantConn`], so forced RLS
 //! applies exactly as it does for the server.
@@ -16,8 +16,7 @@ use wyrd_spec::operator_connection::{
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::operator_connections::{
     ConnectionChange, NewConnection, SealedSecret, StoredConnection, find_connection,
-    get_connection, insert_connection, list_connections, rewrap_connection,
-    tenants_with_connections, update_connection,
+    get_connection, insert_connection, list_connections, update_connection,
 };
 
 /// Opaque envelope bytes standing in for `[kms]` output.
@@ -170,20 +169,15 @@ async fn connections_store_redacted_authority_and_isolate_tenants() {
     .await
     .expect("rls metadata reads");
     assert_eq!(forced, (true, true));
-    let tenants = tenants_with_connections(fixture.operator_pool())
-        .await
-        .expect("tenants read");
-    assert_eq!(tenants.len(), 2, "each tenant holding a connection, once");
 }
 
 /// Updates keep identity: status-only keeps the secret, a rotation replaces
-/// the envelope and bumps the secret version, an update read before another
-/// write committed changes nothing, and a rewrap is fenced on the secret
-/// version and exact envelope it read.
+/// the envelope and bumps the secret version, and an update read before
+/// another write committed changes nothing.
 ///
 /// # Panics
 /// Panics when an update loses identity, keeps a stale secret, a stale update
-/// or rewrap is applied, or a fresh one is refused.
+/// is applied, or a fresh one is refused.
 #[tokio::test]
 async fn updates_rotate_in_place_and_are_fenced_on_the_observed_row() {
     let fixture = PgFixture::start().await.expect("fixture starts");
@@ -229,41 +223,4 @@ async fn updates_rotate_in_place_and_are_fenced_on_the_observed_row() {
     assert_eq!(rotated.view.connection_id, id);
     assert_eq!(rotated.secret_version, 2);
     assert_eq!(rotated.sealed, sealed(3));
-
-    assert!(
-        !rewrap_connection(&mut conn, &disabled, &[1, 2, 3])
-            .await
-            .expect("fenced rewrap answers"),
-        "a rewrap read before the rotation is refused"
-    );
-    assert_eq!(
-        get_connection(&mut conn, id)
-            .await
-            .expect("read")
-            .expect("exists"),
-        rotated,
-        "the refused rewrap left the rotation in place"
-    );
-    assert!(
-        rewrap_connection(&mut conn, &rotated, &[1, 2, 3])
-            .await
-            .expect("rewrap applies")
-    );
-    let rewrapped = get_connection(&mut conn, id)
-        .await
-        .expect("read")
-        .expect("exists");
-    assert_eq!(
-        (
-            rewrapped.sealed.envelope.as_slice(),
-            rewrapped.secret_version
-        ),
-        (&[1_u8, 2, 3][..], 2)
-    );
-    assert!(
-        !rewrap_connection(&mut conn, &rotated, &[4, 5, 6])
-            .await
-            .expect("second rewrap answers"),
-        "a second rewrap of the same observed envelope is refused"
-    );
 }

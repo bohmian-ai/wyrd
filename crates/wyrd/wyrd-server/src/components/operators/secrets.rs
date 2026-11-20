@@ -3,7 +3,7 @@
 //! Wyrd stores every Slack, PagerDuty, and HTTP credential in
 //! `wyrd.operator_connections.secret_ciphertext` as the common envelope.
 //! [`OperatorSecrets`] binds each envelope to its tenant, connection,
-//! provider, name, and secret version, and seals, opens, and rewraps it
+//! provider, name, and secret version, and seals, renews, and opens it
 //! through the deployment's [`WyrdKms`]. Every key-service call runs with no
 //! transaction or row lock held; writes are fenced on the exact row read.
 //!
@@ -12,18 +12,12 @@
 //! only the facade's bounded failure text, never keys or plaintext.
 
 use std::sync::Arc;
-use std::time::Duration;
-
-use tokio::time::Instant;
 use wyrd_kms::{KmsError, SecretContext, SecretPurpose, SecretScope, WyrdKms};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{ConnectionName, OperatorConnectionId};
 use wyrd_spec::operator_connection::{OperatorConnectionView, OperatorProvider};
-use wyrd_sql::queries::operator_connections::{
-    SealedSecret, StoredConnection, list_connections, rewrap_connection, tenants_with_connections,
-};
-use wyrd_sql::{OperatorPool, SqlError, WyrdPostgres};
+use wyrd_sql::queries::operator_connections::{SealedSecret, StoredConnection};
 use zeroize::Zeroizing;
 
 /// The constant public detail of every key failure; the cause stays internal.
@@ -102,7 +96,7 @@ impl<'a> SecretIdentity<'a> {
     }
 }
 
-/// Owner of Operator credential sealing, opening, and rewrap.
+/// Owner of Operator credential sealing, renewal, and opening.
 ///
 /// Cheap to clone; clones share the deployment facade. `None` means the
 /// deployment has no `[kms]`: writes refuse and deliveries stay retryable.
@@ -180,118 +174,4 @@ impl OperatorSecrets {
         let identity = SecretIdentity::of(tenant, &stored.view, stored.secret_version);
         kms.open(&identity.context(), &stored.sealed.envelope).await
     }
-
-    /// One bounded rewrap pass over every tenant holding connections.
-    ///
-    /// The whole pass, including the cross-tenant discovery read, runs under
-    /// `pass_budget`, and each tenant under `tenant_budget` capped by what
-    /// remains; an overrun drops the in-flight future, which rolls back the
-    /// row swap in progress while every row already swapped stays committed.
-    /// A tenant whose rewrap fails or runs out of budget is logged and
-    /// skipped so it cannot stall the others; the next pass continues it. Without `[kms]` the pass does nothing.
-    /// Returns the rows moved, including those of a tenant cut off by its
-    /// budget.
-    ///
-    /// # Errors
-    /// Returns the database error when the cross-tenant discovery read fails.
-    pub async fn rewrap_pass(
-        &self,
-        postgres: &WyrdPostgres,
-        operator: &OperatorPool,
-        pass_budget: Duration,
-        tenant_budget: Duration,
-    ) -> Result<usize, sqlx::Error> {
-        let Some(kms) = self.kms.as_deref() else {
-            return Ok(0);
-        };
-        let deadline = Instant::now() + pass_budget;
-        let Ok(discovered) =
-            tokio::time::timeout_at(deadline, tenants_with_connections(operator)).await
-        else {
-            pass_elapsed();
-            return Ok(0);
-        };
-        let mut moved = 0;
-        for tenant in discovered? {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                pass_elapsed();
-                break;
-            }
-            match tokio::time::timeout(
-                tenant_budget.min(remaining),
-                rewrap_tenant(kms, postgres, tenant, &mut moved),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    tracing::warn!(%tenant, %error, "operator key rewrap skipped a tenant this pass");
-                }
-                Err(_) => tracing::warn!(
-                    %tenant,
-                    failure = "timed_out",
-                    "operator key rewrap skipped a tenant this pass"
-                ),
-            }
-        }
-        Ok(moved)
-    }
-}
-
-/// Rewrap `tenant`'s envelopes that do not name the active key.
-///
-/// Reads the rows in one short transaction, then rewraps each with no
-/// transaction open and swaps it in its own short transaction, fenced on the
-/// secret version and envelope it read so a concurrent rotation or replica
-/// wins. Each swap commits before the next row's key-service calls, so a
-/// pass cut off by its budget keeps the rows it finished and the next pass
-/// continues from the rows still stale. A row that does not rewrap is logged
-/// and left for the next pass. Every committed swap is counted in `moved`
-/// as it commits, so the count survives a pass cut off by its budget.
-///
-/// # Errors
-/// Returns [`SqlError`] when a read or swap fails.
-async fn rewrap_tenant(
-    kms: &WyrdKms,
-    postgres: &WyrdPostgres,
-    tenant: DataTenantId,
-    moved: &mut usize,
-) -> Result<(), SqlError> {
-    let mut conn = postgres.tenant_conn(tenant).await?;
-    let rows = list_connections(&mut conn).await.map_err(SqlError::from)?;
-    conn.commit().await?;
-    for row in rows {
-        if kms.is_current(&row.sealed.envelope).unwrap_or(false) {
-            continue;
-        }
-        let identity = SecretIdentity::of(tenant, &row.view, row.secret_version);
-        let envelope = match kms.rewrap(&identity.context(), &row.sealed.envelope).await {
-            Ok(envelope) => envelope,
-            Err(error) => {
-                tracing::warn!(
-                    %tenant,
-                    connection_id = %row.view.connection_id,
-                    %error,
-                    "operator credential could not be rewrapped"
-                );
-                continue;
-            }
-        };
-        let mut conn = postgres.tenant_conn(tenant).await?;
-        let swapped = rewrap_connection(&mut conn, &row, &envelope)
-            .await
-            .map_err(SqlError::from)?;
-        conn.commit().await?;
-        *moved += usize::from(swapped);
-    }
-    Ok(())
-}
-
-/// Log that a rewrap pass ran out of budget and left the rest to the next.
-fn pass_elapsed() {
-    tracing::warn!(
-        failure = "timed_out",
-        "operator key rewrap pass budget elapsed; the next pass continues"
-    );
 }

@@ -1,7 +1,7 @@
 //! Operator connections: tenant-managed Slack, PagerDuty, and HTTP
 //! credentials stored as the common stored-secret envelope.
 //!
-//! [`secrets::OperatorSecrets`] owns sealing, opening, and rewrap, and
+//! [`secrets::OperatorSecrets`] owns sealing, renewal, and opening, and
 //! [`service::OperatorConnectionControl`] the management operations; HTTP
 //! and MCP are thin projections of it.
 

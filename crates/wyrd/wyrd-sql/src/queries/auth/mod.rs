@@ -40,12 +40,11 @@ pub use device_authorizations::{
     poll_device_authorization,
 };
 pub use human_connections::{
-    HumanConnectionWrite, SealedSecretRow, SealedSecretTable, deactivate_active_human_connection,
-    human_candidate_test_is_current, human_connection_in_state, human_connection_is_active,
-    insert_human_candidate, live_human_connections, lock_human_connection_slot,
-    promote_tested_human_candidate, remove_human_connection, renew_human_connection_secret,
-    replace_human_candidate, sealed_tenant_secrets, stamp_human_candidate_tested,
-    swap_sealed_tenant_secret,
+    HumanConnectionWrite, deactivate_active_human_connection, human_candidate_test_is_current,
+    human_connection_in_state, human_connection_is_active, insert_human_candidate,
+    live_human_connections, lock_human_connection_slot, promote_tested_human_candidate,
+    remove_human_connection, renew_human_connection_secret, replace_human_candidate,
+    stamp_human_candidate_tested,
 };
 pub use local_passwords::{
     AttemptScope, InvitationRow, PasswordResetRow, attempt_refusal, consume_invitation,

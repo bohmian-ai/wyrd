@@ -5,8 +5,7 @@
 //! the [`SealedSecret`] stored-secret envelope the server's facade produced.
 //! Every tenant function runs on the caller's [`TenantConn`] under forced RLS
 //! and never commits. Writes are fenced on the exact row they were prepared
-//! from, so the server seals with no row lock held. Rewrap discovery is the
-//! one explicit [`OperatorPool`] read, and it returns only tenant ids.
+//! from, so the server seals with no row lock held.
 // raw-query grep allowlist: operator connection tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use std::error::Error as StdError;
@@ -16,14 +15,13 @@ use chrono::{DateTime, Utc};
 use sqlx::Error as SqlxError;
 use sqlx::types::{Json, Uuid};
 use wyrd_runtime::principal::PrincipalId;
-use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Attribution;
 use wyrd_spec::ids::{ConnectionName, OperatorConnectionId};
 use wyrd_spec::operator_connection::{
     OperatorConnectionConfig, OperatorConnectionStatus, OperatorConnectionView, OperatorProvider,
 };
 
-use crate::{OperatorPool, TenantConn};
+use crate::TenantConn;
 
 /// Every column a connection read returns, as a literal for `concat!`.
 macro_rules! columns {
@@ -242,53 +240,6 @@ pub async fn update_connection(
         .fetch_optional(&mut **conn.transaction())
         .await?;
     row.map(ConnectionRow::into_stored).transpose()
-}
-
-/// Replace one connection's envelope with its rewrap.
-///
-/// Fenced on the secret version and exact envelope it was read with, so a
-/// concurrent secret rotation or another replica's rewrap is never
-/// overwritten. Returns whether this write won.
-///
-/// # Errors
-/// Returns the database error when the update fails.
-pub async fn rewrap_connection(
-    conn: &mut TenantConn<'_>,
-    observed: &StoredConnection,
-    envelope: &[u8],
-) -> Result<bool, SqlxError> {
-    let updated = sqlx::query(
-        "UPDATE wyrd.operator_connections
-            SET secret_ciphertext = $4
-          WHERE connection_id = $1 AND secret_version = $2 AND secret_ciphertext = $3",
-    )
-    .bind(observed.view.connection_id.as_uuid())
-    .bind(observed.secret_version)
-    .bind(&observed.sealed.envelope)
-    .bind(envelope)
-    .execute(&mut **conn.transaction())
-    .await?;
-    Ok(updated.rows_affected() == 1)
-}
-
-/// Every tenant holding at least one connection, across tenants.
-///
-/// Rewrap visits each of them through its own tenant session.
-///
-/// # Errors
-/// Returns the database error when the read fails.
-// tenant-isolation: cross-tenant OperatorPool
-pub async fn tenants_with_connections(
-    operator: &OperatorPool,
-) -> Result<Vec<DataTenantId>, SqlxError> {
-    let rows: Vec<(Uuid,)> = sqlx::query_as(
-        "SELECT DISTINCT data_tenant_id FROM wyrd.operator_connections ORDER BY data_tenant_id",
-    )
-    .fetch_all(operator.pool())
-    .await?;
-    rows.into_iter()
-        .map(|(tenant,)| stored(DataTenantId::new(tenant)))
-        .collect()
 }
 
 /// One `wyrd.operator_connections` row.

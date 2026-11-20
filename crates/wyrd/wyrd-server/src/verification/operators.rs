@@ -10,11 +10,8 @@
 //! Verifier result. Claims and settlements are engine mechanics, not
 //! authorization decisions, so none of them writes audit.
 //!
-//! Key rewrap runs beside the claim loop, never inside it, under its own
-//! cancellation and elapsed-time budgets, so a slow key provider cannot hold
-//! back another tenant's due dispatch. HTTP credentials are attached only to
-//! the request built from a client already screened and pinned to that
-//! effective URL.
+//! HTTP credentials are attached only to the request built from a client
+//! already screened and pinned to that effective URL.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -155,7 +152,7 @@ pub struct OperatorWorker {
     /// Wyrd Postgres owner that opens every tenant-scoped claim, read, and
     /// settlement transaction.
     postgres: WyrdPostgres,
-    /// Operator pool for the cross-tenant due list and rewrap passes.
+    /// Operator pool for the cross-tenant due list.
     operator: OperatorPool,
     /// Delivery ceilings and fenced transitions.
     queue: OperatorDispatchQueue,
@@ -212,48 +209,17 @@ impl OperatorWorker {
         self
     }
 
-    /// Claim and deliver dispatches until `stop` is cancelled, then drain,
-    /// while rewrapping stale keys beside the claim loop.
+    /// Claim and deliver dispatches until `stop` is cancelled, then drain.
     ///
     /// Delivery runs on the shared [`ClaimLoop`] exactly like the Verifier
     /// runner: each round claims one dispatch per due tenant with capacity;
     /// on `stop` no claim is admitted, in-flight attempts get the drain grace,
     /// and the rest are cancelled and released with their attempt refunded.
-    /// Rewrap is polled concurrently in the same task, so a slow key provider
-    /// delays only rewrap, and `stop` cancels it with the loop.
     ///
     /// # Panics
     /// Panics under `test-support` when a test armed an Operator-worker crash.
     pub async fn run(self: Arc<Self>, stop: CancellationToken) {
-        tokio::join!(self.claims.run(&self, stop.clone()), self.rewrap(&stop));
-    }
-
-    /// Rewrap rows still on an older key version every rewrap interval until
-    /// `stop`, each pass bounded by the runtime's pass and tenant budgets.
-    ///
-    /// Cancellation drops the pass in progress, rolling back its open tenant
-    /// transaction; the next pass (here or on another replica) retries it.
-    async fn rewrap(&self, stop: &CancellationToken) {
-        loop {
-            tokio::select! {
-                biased;
-                () = stop.cancelled() => return,
-                pass = self.secrets.rewrap_pass(
-                    &self.postgres,
-                    &self.operator,
-                    self.limits.rewrap_pass_budget,
-                    self.limits.rewrap_tenant_budget,
-                ) => {
-                    if let Err(error) = pass {
-                        tracing::warn!(%error, "operator key rewrap pass failed");
-                    }
-                }
-            }
-            tokio::select! {
-                () = stop.cancelled() => return,
-                () = tokio::time::sleep(self.limits.rewrap_interval) => {}
-            }
-        }
+        self.claims.run(&self, stop).await;
     }
 
     /// Resolve, authorize, decrypt, and deliver one attempt.

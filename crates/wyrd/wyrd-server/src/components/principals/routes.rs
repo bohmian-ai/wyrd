@@ -254,7 +254,9 @@ async fn mint_credential(
 ///
 /// A family `workload_restriction` makes the account that family's unique
 /// scheduled runtime account and additionally requires tenant administration
-/// (`*`), checked and audited before anything is written.
+/// (`*`), as do any requested assignments; each is checked and audited
+/// before anything is written, so a refusal commits no account, binding or
+/// credential.
 ///
 /// # Errors
 /// Returns a stable Wyrd error when the caller is unauthorized, a requested
@@ -274,7 +276,8 @@ async fn mint_credential(
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
           WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
         (status = 403, description = "Tenant principal administration required, and tenant \
-          administration for a family restriction (WYRD_PERMISSION_403_DENIED_RBAC)",
+          administration for a family restriction or any assignment \
+          (WYRD_PERMISSION_403_DENIED_RBAC)",
          body = WyrdProblem),
         (status = 409, description = "The family already has a runtime account \
           (WYRD_AUTH_409_WORKLOAD_BINDING_CONFLICT)", body = WyrdProblem),
@@ -304,6 +307,18 @@ async fn create_service_principal(
             &caller,
             &Permission::wildcard(),
             "auth.principal.workload_restriction.set",
+            &resource,
+        )?;
+    }
+    // Assignments are binding administration, never covered by the lesser
+    // principal-administration permission, so a credential administrator
+    // cannot mint a key for an account stronger than itself.
+    if !request.assignments.is_empty() {
+        audit::authorize(
+            &state,
+            &caller,
+            &Permission::wildcard(),
+            "auth.binding.create",
             &resource,
         )?;
     }

@@ -423,6 +423,96 @@ async fn binding_writes_require_tenant_administration() {
     );
 }
 
+/// A credential administrator creates a Service with no assignments, but
+/// cannot provision one holding any role: the refusal is audited as binding
+/// administration and commits no account, binding or key. A tenant
+/// administrator provisions the same request.
+///
+/// # Panics
+/// Panics when the server fails to start, a stronger Service is provisioned
+/// by the lesser caller, or the refusal leaves anything behind.
+#[tokio::test(flavor = "current_thread")]
+async fn provisioning_a_services_roles_requires_tenant_administration() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let (_, admin_jwt) = user(&server, "prov-admin", &["admin"]).await;
+    server
+        .seed_role(
+            "prov_credential_admin",
+            &["service_accounts:write"
+                .parse::<wyrd_runtime::Permission>()
+                .expect("permission parses")],
+        )
+        .await
+        .expect("role seeds");
+    let (lesser, lesser_jwt) = user(&server, "prov-credentials", &["prov_credential_admin"]).await;
+    let request = |role: &str| {
+        json!({ "name": "prov-escalation", "assignments": [{ "role": role, "scope": "all" }] })
+    };
+
+    for role in ["admin", "prov_credential_admin"] {
+        let (status, problem) = send(
+            &server,
+            &lesser_jwt,
+            Method::POST,
+            "/v1/principals",
+            Some(request(role)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{role}: {problem}");
+        assert_eq!(problem["code"], json!("WYRD_PERMISSION_403_DENIED_RBAC"));
+        assert!(problem.get("credential").is_none(), "no key is issued");
+    }
+    let (_, page) = call(
+        &server,
+        &admin_jwt,
+        Method::GET,
+        "/v1/principals?name=prov-escalation",
+    )
+    .await;
+    assert_eq!(page["principals"], json!([]), "no account was created");
+    assert_eq!(
+        decisions(&server, "auth.binding.create", lesser).await,
+        vec![
+            ("wildcard:wildcard".to_owned(), "denied".to_owned()),
+            ("wildcard:wildcard".to_owned(), "denied".to_owned()),
+        ]
+    );
+
+    let (status, bare) = send(
+        &server,
+        &lesser_jwt,
+        Method::POST,
+        "/v1/principals",
+        Some(json!({ "name": "prov-bare" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{bare}");
+    let bare = bare["principal_id"].as_str().expect("id").parse().expect("uuid");
+    assert_eq!(
+        assignments(&access(&server, &admin_jwt, bare).await),
+        pairs(&[]),
+        "the credential administrator's Service holds no role"
+    );
+
+    let (status, created) = send(
+        &server,
+        &admin_jwt,
+        Method::POST,
+        "/v1/principals",
+        Some(request("admin")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let created = created["principal_id"].as_str().expect("id").parse().expect("uuid");
+    assert_eq!(
+        assignments(&access(&server, &admin_jwt, created).await),
+        pairs(&[("admin", "direct")]),
+        "a tenant administrator provisions it"
+    );
+}
+
 /// Unknown, deleted, foreign-tenant, and tenant-administrator principals all
 /// answer with one non-enumerating not-found error; malformed ids, unknown
 /// Roles, and out-of-range pages are validation errors.
@@ -783,7 +873,7 @@ async fn stable_account_restrictions_and_credentials() {
         &principal_admin_jwt,
         Method::POST,
         "/v1/principals",
-        Some(create("sa-automation", None)),
+        Some(json!({ "name": "sa-automation" })),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{unrestricted}");

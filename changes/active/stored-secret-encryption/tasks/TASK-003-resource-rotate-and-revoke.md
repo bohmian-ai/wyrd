@@ -139,7 +139,8 @@ in these entries; test variant owners/surfaces under the same scenarios.
    - Gateway: `gateway_credential_lifecycle_rotates_revokes_and_redacts`; the renewal-vs-replacement race in the Gateway test above (the replacement wins and the snapshot prepares REPLACED).
    - Human connections: `identity_e2e::tenant_connection_rotation_journey` covers candidate, test, and activate with its existing session effects.
    - Platform: `platform_admin_e2e::an_operator_configures_and_removes_federated_platform_sign_in` (PUT upsert).
-   - Limit: trusted issuers have no in-place replace route. Replacement is delete-and-add, or the boot seed's upsert. No new replace route was added; the task forbids authentication redesign and the spec names none. These are existing proofs, so there is no RED.
+   - Trusted issuer: `PUT /v1/admin/trusted-issuers/client-secret?issuer=` and `wyrd auth trusted-issuer replace-secret` replace the secret in place and keep bindings; added by remediation TASK-003-R1, whose evidence is in `review/task-003-c93287b54/TASK-003-R1-complete-resource-actions-and-proof.md`.
+   - The other owners' rows are existing proofs, so there is no RED.
 
    **Evidence (renewal).** Common prefix `PG` = `scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner; <cmd>"`.
    - Operator: `wyrd-server/tests/integration/pg_operator_delivery.rs::renewed_encryption_keeps_the_credential_and_delivers_it` asserts the same id and plaintext, a changed envelope, a redacted view, and actual delivery with the unchanged credential. `PG` + `cargo nextest run --locked -p wyrd-server --features test-support --test integration -E 'test(=pg_operator_delivery::renewed_encryption_keeps_the_credential_and_delivers_it)'`. RED: 404 "Wyrd route not found" for `/operator-connections/{id}/renew-encryption` (behavioral). GREEN: 22/22 with `pg_operator_connection_routes`.

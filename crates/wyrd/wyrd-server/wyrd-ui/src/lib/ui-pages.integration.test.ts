@@ -2698,6 +2698,15 @@ connected('an administrator gives Alice payments access in Settings, and her bro
     const row = (await grants.first().textContent()) ?? '';
     for (const text of ['viewer', 'Repository/payments', 'every version, including future ones', 'Direct', 'cards:read', 'executions:read']) expect(row).toContain(text);
 
+    // The tenant's own administrative account is not offered in Access, and a direct request to remove its admin binding is refused.
+    server.tenantAdminKey();
+    const admins = (await principals.bindings({ role: 'admin' })).bindings;
+    const listed = new Set((await principals.list({})).principals.map((principal) => principal.principal_id));
+    const [held] = admins.filter((binding) => 'principal' in binding.subject && !listed.has(binding.subject.principal.id));
+    const refused = await page.request.post(`${base}/settings/access?/unbind`, { form: { bindingId: held.id }, headers: { origin: bff.url } });
+    expect(await refused.json()).toMatchObject({ type: 'failure', status: 400 });
+    expect((await principals.bindings({ role: 'admin' })).bindings.map((binding) => binding.id)).toContain(held.id);
+
     // Alice signs in with her username and password. Her Repositories index holds payments and nothing of ledger.
     const her = await (await browser.newContext()).newPage();
     await her.goto(`${base}/login`);
@@ -2735,9 +2744,9 @@ connected('an administrator gives Alice payments access in Settings, and her bro
     expect(await finished, terminal).toBe(0);
 
     // The terminal's login and the SDK that reads it carry the same grant: payments only.
-    const listed = execFileSync(join(REPO, 'target/debug/wyrd'), ['list', '--kind', 'Repository'], { env: cliEnv }).toString();
-    expect(listed).toContain('payments');
-    expect(listed).not.toContain('ledger');
+    const terminalList = execFileSync(join(REPO, 'target/debug/wyrd'), ['list', '--kind', 'Repository'], { env: cliEnv }).toString();
+    expect(terminalList).toContain('payments');
+    expect(terminalList).not.toContain('ledger');
     vi.stubEnv('WYRD_CONFIG_HOME', config);
     vi.stubEnv('WYRD_API_KEY', undefined);
     vi.stubEnv('WYRD_TENANT', tenant);
@@ -2748,5 +2757,124 @@ connected('an administrator gives Alice payments access in Settings, and her bro
     vi.unstubAllEnvs();
     await browser.close();
     bff.stop();
+  }
+});
+
+test('an administrator manages direct, group and custom-role grants in Access, and a refused grant saves nothing', async ({ server, ui }) => {
+  const tenantKey = 'ui-access';
+  const tenant = server.seedTenant(tenantKey);
+  const adminKey = server.bootstrapServiceInTenant(tenant, ['admin'], 'ui-access-admin');
+  const admin = WyrdClient.connect({ serverUrl: ui.serverUrl, credential: adminKey });
+  const cards = await Cards.connect({ client: admin });
+  const principals = await Principals.connect({ client: admin });
+  const prompt = (await cards.declareFromPath(fixture('cards/gateway_inference/ask-prompt.yaml'))).root;
+  const uid = (await cards.get(prompt)).metadata.uid as string;
+  const base = `${ui.base}/t/${tenantKey}`;
+  const page = await signIn(ui.browser, ui.base, tenantKey, adminKey);
+  const context = await ui.browser.newContext();
+  try {
+    /** Post one Access form action directly, as a request that skipped the page's own controls. */
+    const post = async (action: string, form: Record<string, string>) =>
+      ((await (await page.request.post(`${base}/settings/access?/${action}`, { form, headers: { origin: ui.base } })).json()) as { type: string; status: number });
+    await page.goto(`${base}/settings/access`);
+
+    // An invitation that names no scope is refused: nobody is enrolled with a tenant-wide default.
+    expect(await post('invite', { role: 'viewer' })).toMatchObject({ type: 'failure', status: 400 });
+
+    // Bob is invited as viewer of the ask-prompt family and sets his own password.
+    const invite = page.getByRole('form', { name: 'Invite a user' });
+    await chooseFamilyGrant(invite, 'viewer', 'Prompt', 'ask-prompt');
+    await invite.getByRole('button', { name: 'Create invitation' }).click();
+    const code = page.locator('[data-secret]');
+    await expect.poll(() => code.count()).toBe(1);
+    const signup = await context.newPage();
+    await signup.goto(`${base}/signup`);
+    await signup.getByLabel('Invitation code').fill((await code.textContent()) ?? '');
+    await signup.getByLabel('Username').fill('bob');
+    await signup.getByLabel('Password').fill(strongPassword());
+    await signup.getByRole('button', { name: 'Create account' }).click();
+    await signup.waitForURL(base);
+    const bob = (await principals.list({ kind: 'user', name: 'bob' })).principals[0].principal_id;
+    const saved = async () => (await principals.bindings({ principal_id: bob })).bindings.map((binding) => `${binding.role} ${JSON.stringify(binding.scope)}`);
+    const family = `viewer ${JSON.stringify({ card: { family: { kind: 'Prompt', name: 'ask-prompt' } } })}`;
+    const exact = `viewer ${JSON.stringify({ card: { version: { kind: 'Prompt', name: 'ask-prompt', uid } } })}`;
+    expect(await saved()).toEqual([family]);
+
+    // On Bob's Access page the administrator adds one exact version; the page tells it apart from the family grant.
+    await page.goto(`${base}/settings/access`);
+    await page.getByRole('link', { name: 'Access for bob' }).click();
+    const grant = page.getByRole('form', { name: 'Grant access to bob' });
+    const rows = page.getByRole('region', { name: 'Bindings of bob' }).locator('tbody tr');
+    const refuse = async (role: string, scopeType: string, fill: () => Promise<void>) => {
+      await grant.getByLabel('Role').selectOption(role);
+      await grant.getByLabel('Scope', { exact: true }).selectOption(scopeType);
+      await fill();
+      await grant.getByRole('button', { name: 'Save binding' }).click();
+      await expect.poll(() => page.getByRole('alert').textContent()).toContain('Nothing was changed');
+    };
+    await grant.getByLabel('Role').selectOption('viewer');
+    await grant.getByLabel('Scope', { exact: true }).selectOption('card_version');
+    await grant.getByLabel('Card kind').selectOption('Prompt');
+    await grant.getByLabel('Card name').fill('ask-prompt');
+    await grant.getByLabel('Card UID').fill(uid);
+    await grant.getByRole('button', { name: 'Save binding' }).click();
+    await expect.poll(() => rows.count()).toBe(2);
+    expect(await rows.allTextContents()).toEqual([expect.stringContaining('every version, including future ones'), expect.stringContaining(`exact version ${uid}`)]);
+    expect((await saved()).sort()).toEqual([family, exact].sort());
+
+    // A role that does not apply at the scope, a Card of no such identity, and a malformed name each save nothing.
+    await refuse('admin', 'card_family', async () => {
+      await grant.getByLabel('Card kind').selectOption('Prompt');
+      await grant.getByLabel('Card name').fill('ask-prompt');
+    });
+    await refuse('viewer', 'card_version', async () => {
+      await grant.getByLabel('Card kind').selectOption('Prompt');
+      await grant.getByLabel('Card name').fill('ask-prompt');
+      await grant.getByLabel('Card UID').fill(crypto.randomUUID());
+    });
+    await refuse('viewer', 'card_family', async () => {
+      await grant.getByLabel('Card kind').selectOption('Prompt');
+      await grant.getByLabel('Card name').fill('Not A Name!');
+    });
+    expect((await saved()).sort()).toEqual([family, exact].sort());
+
+    // Built-in roles offer no edit, and a direct request to change one is refused. A custom role is created from operations.
+    await page.getByRole('link', { name: 'Roles', exact: true }).click();
+    await expect.poll(() => page.locator('[data-role="viewer"]').textContent()).toContain('built-in · read-only');
+    expect(await page.getByRole('form', { name: 'Edit role viewer' }).count()).toBe(0);
+    expect(await post('putRole', { role: 'viewer', operation: 'cards:write' })).toMatchObject({ type: 'failure', status: 400 });
+    const create = page.getByRole('form', { name: 'Create a custom role' });
+    await create.getByLabel('Role name').fill('prompt_reader');
+    await create.getByRole('group', { name: 'cards' }).getByLabel('read').check();
+    await create.getByRole('button', { name: 'Create role' }).click();
+    await expect.poll(() => page.locator('[data-role="prompt_reader"]').count()).toBe(1);
+    expect((await principals.roles()).roles.find((role) => role.name === 'prompt_reader')).toMatchObject({ builtin: false, operations: [{ resource: 'cards', action: 'read' }] });
+
+    // A group holds Bob and the custom role at the family; Bob's page names the group as that grant's source.
+    await page.getByRole('link', { name: 'Groups', exact: true }).click();
+    const group = page.getByRole('form', { name: 'Create a group' });
+    await group.getByLabel('Group name').fill('reviewers');
+    await group.getByRole('button', { name: 'Create group' }).click();
+    const member = page.getByRole('form', { name: 'Add a member to reviewers' });
+    await member.getByLabel('Account').selectOption(bob);
+    await member.getByRole('button', { name: 'Add member' }).click();
+    await expect.poll(() => page.locator('[data-group="reviewers"] .members').textContent()).toContain('bob');
+    await page.getByText('Grant access to reviewers', { exact: true }).click();
+    await chooseFamilyGrant(page.getByRole('form', { name: 'Grant access to reviewers' }), 'prompt_reader', 'Prompt', 'ask-prompt');
+    await page.getByRole('form', { name: 'Grant access to reviewers' }).getByRole('button', { name: 'Save binding' }).click();
+    await expect.poll(() => page.getByRole('region', { name: 'Bindings of reviewers' }).locator('tbody tr').count()).toBe(1);
+    await page.getByRole('link', { name: 'Users', exact: true }).click();
+    await page.getByRole('link', { name: 'Access for bob' }).click();
+    await expect.poll(() => rows.count()).toBe(3);
+    expect((await rows.allTextContents()).filter((row) => row.includes('Group reviewers'))).toEqual([expect.stringContaining('prompt_reader')]);
+
+    // Removing Bob's direct family grant leaves the group's: the page still shows it, and the server still grants the family read.
+    await page.getByRole('button', { name: 'Remove viewer at Prompt/ask-prompt · every version, including future ones from bob' }).click();
+    await expect.poll(() => rows.count()).toBe(2);
+    expect(await page.locator('[data-combined]').textContent()).toContain('cards:read at Prompt/ask-prompt · every version, including future ones');
+    expect((await principals.access(bob)).grants.map((held) => `${held.role} ${held.source.kind}`).sort()).toEqual(['prompt_reader group', 'viewer direct']);
+  } finally {
+    await context.close();
+    await page.context().close();
   }
 });

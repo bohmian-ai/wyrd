@@ -45,6 +45,11 @@
   const keyState = (key: { revoked_at: string | null; expires_at: string | null }) =>
     key.revoked_at ? '⊘ revoked' : key.expires_at && Date.parse(key.expires_at) <= Date.now() ? '– expired' : '✓ active';
   const href = (target: string, account?: string) => `?tab=${target}${account ? `&account=${encodeURIComponent(account)}` : ''}`;
+  /** A form action that keeps the section and selected account when the form posts without JavaScript. */
+  const action = (name: string) => {
+    const kept = [...page.url.searchParams].filter(([key]) => !key.startsWith('/'));
+    return `?/${name}${kept.length ? `&${new URLSearchParams(kept)}` : ''}`;
+  };
   async function copy(secret: string) {
     await navigator.clipboard.writeText(secret);
     copied = true;
@@ -78,7 +83,7 @@
       <td><code>{granted(row.permissions)}</code></td>
       <td>
         {#if source.kind === 'direct'}
-          <form method="POST" action="?/unbind" use:enhance>
+          <form method="POST" action={action('unbind')} use:enhance>
             <input type="hidden" name="bindingId" value={row.id} />
             <button class="app-control" type="submit" aria-label="Remove {row.role} at {scopeLabel(row.scope)} from {owner}">Remove</button>
           </form>
@@ -191,7 +196,7 @@
               <li>None</li>
             {/each}
           </ul>
-          <form class="stack" method="POST" action="?/grant" aria-label="Grant access to {name}" use:enhance>
+          <form class="stack" method="POST" action={action('grant')} aria-label="Grant access to {name}" use:enhance>
             <h3>Grant access</h3>
             <input type="hidden" name="principalId" value={selected.principal_id} />
             <input type="hidden" name="principalKind" value={selected.kind} />
@@ -214,7 +219,7 @@
                       <td>{keyState(key)}</td>
                       <td>
                         {#if !key.revoked_at}
-                          <form method="POST" action="?/revokeKey" use:enhance>
+                          <form method="POST" action={action('revokeKey')} use:enhance>
                             <input type="hidden" name="principalId" value={selected.principal_id} />
                             <input type="hidden" name="credentialId" value={key.id} />
                             <button class="app-control" type="submit" aria-label="Revoke key {key.prefix}">Revoke</button>
@@ -226,7 +231,7 @@
                 </tbody>
               </table>
             </div>
-            <form method="POST" action="?/issueKey" use:enhance>
+            <form method="POST" action={action('issueKey')} use:enhance>
               <input type="hidden" name="principalId" value={selected.principal_id} />
               <p>To rotate, issue a new key, deploy it, then revoke the old one. Keys carry the account's bindings; they add none.</p>
               <button class="app-control" type="submit">Issue key</button>
@@ -266,7 +271,7 @@
       {#if tab === 'users'}
         <section>
           <h2>Invite a user</h2>
-          <form class="stack" method="POST" action="?/invite" aria-label="Invite a user" use:enhance>
+          <form class="stack" method="POST" action={action('invite')} aria-label="Invite a user" use:enhance>
             <p>The person sets their own username and password with a one-time code. Their account is created holding exactly this binding; add more from their Access page afterwards.</p>
             <GrantFields roles={access.roles} />
             <button class="app-control primary" type="submit">Create invitation</button>
@@ -275,7 +280,7 @@
       {:else if tab === 'services'}
         <section>
           <h2>Create a Service account</h2>
-          <form class="stack" method="POST" action="?/createService" aria-label="Create a Service account" use:enhance>
+          <form class="stack" method="POST" action={action('createService')} aria-label="Create a Service account" use:enhance>
             <label>Name <input class="app-input mono" name="name" required maxlength="128" autocomplete="off" /></label>
             <label>Description <input class="app-input" name="description" maxlength="256" autocomplete="off" /></label>
             <label>Runtime family <input class="app-input mono" name="family" autocomplete="off" placeholder="Service Card name, e.g. checkout" /></label>
@@ -298,14 +303,14 @@
               {#if !role.builtin}
                 <details>
                   <summary>Edit {role.name}</summary>
-                  <form class="stack" method="POST" action="?/putRole" aria-label="Edit role {role.name}" use:enhance>
+                  <form class="stack" method="POST" action={action('putRole')} aria-label="Edit role {role.name}" use:enhance>
                     <input type="hidden" name="role" value={role.name} />
                     {#if bound}<p>Saving changes the access of all {bound} binding{bound === 1 ? '' : 's'} that use this role.</p>{/if}
                     {@render operationChecks(held)}
                     <button class="app-control primary" type="submit">Save {role.name}</button>
                   </form>
                 </details>
-                <form method="POST" action="?/deleteRole" use:enhance>
+                <form method="POST" action={action('deleteRole')} use:enhance>
                   <input type="hidden" name="role" value={role.name} />
                   <button class="app-control" type="submit" disabled={bound > 0} title={bound > 0 ? 'Remove its bindings first' : undefined}>Delete {role.name}</button>
                 </form>
@@ -315,8 +320,9 @@
         </section>
         <section>
           <h2>Create a custom role</h2>
-          <form class="stack wide" method="POST" action="?/putRole" aria-label="Create a custom role" use:enhance>
-            <label>Role name <input class="app-input mono" name="role" required maxlength="64" autocomplete="off" /></label>
+          <form class="stack wide" method="POST" action={action('putRole')} aria-label="Create a custom role" use:enhance>
+            <label>Role name <input class="app-input mono" name="role" required maxlength="64" pattern="[a-z0-9_]+" title="Lowercase letters, digits and underscores" autocomplete="off" /></label>
+            <p>Lowercase letters, digits and underscores. A role needs at least one operation.</p>
             {@render operationChecks([])}
             <button class="app-control primary" type="submit">Create role</button>
           </form>
@@ -333,7 +339,7 @@
                 {#each group.members as member (member.principal_id)}
                   <li>
                     {nameOf(member.principal_id)} <span class="tag">{member.kind}</span>
-                    <form method="POST" action="?/removeMember" use:enhance>
+                    <form method="POST" action={action('removeMember')} use:enhance>
                       <input type="hidden" name="groupId" value={group.id} />
                       <input type="hidden" name="principalId" value={member.principal_id} />
                       <button class="app-control" type="submit" aria-label="Remove {nameOf(member.principal_id)} from {group.name}">Remove</button>
@@ -343,7 +349,7 @@
                   <li class="muted">No members</li>
                 {/each}
               </ul>
-              <form class="row" method="POST" action="?/addMember" aria-label="Add a member to {group.name}" use:enhance>
+              <form class="row" method="POST" action={action('addMember')} aria-label="Add a member to {group.name}" use:enhance>
                 <input type="hidden" name="groupId" value={group.id} />
                 <label>Account
                   <select class="app-input" name="principalId" required>
@@ -364,13 +370,13 @@
               {/if}
               <details>
                 <summary>Grant access to {group.name}</summary>
-                <form class="stack" method="POST" action="?/grant" aria-label="Grant access to {group.name}" use:enhance>
+                <form class="stack" method="POST" action={action('grant')} aria-label="Grant access to {group.name}" use:enhance>
                   <input type="hidden" name="groupId" value={group.id} />
                   <GrantFields roles={access.roles} />
                   <button class="app-control primary" type="submit">Save binding</button>
                 </form>
               </details>
-              <form method="POST" action="?/deleteGroup" use:enhance>
+              <form method="POST" action={action('deleteGroup')} use:enhance>
                 <input type="hidden" name="groupId" value={group.id} />
                 <button class="app-control" type="submit">Delete {group.name}</button>
               </form>
@@ -381,7 +387,7 @@
         </section>
         <section>
           <h2>Create a group</h2>
-          <form class="stack" method="POST" action="?/createGroup" aria-label="Create a group" use:enhance>
+          <form class="stack" method="POST" action={action('createGroup')} aria-label="Create a group" use:enhance>
             <label>Group name <input class="app-input" name="name" required maxlength="128" autocomplete="off" /></label>
             <button class="app-control primary" type="submit">Create group</button>
           </form>

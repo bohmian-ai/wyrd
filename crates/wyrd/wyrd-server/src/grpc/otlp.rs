@@ -316,9 +316,9 @@ struct OtlpGrpcAuthentication {
 impl OtlpGrpcAuthentication {
     /// Authenticate one OTLP/gRPC call from its metadata.
     ///
-    /// A bearer without `x-wyrd-workload-uid` is Gate's to verify. With one,
-    /// the server verifies the bearer and applies the selector through
-    /// [`select_bearer_root`](super::select_bearer_root), like OTLP/HTTP and
+    /// The server verifies a bearer, resolves its current authority and
+    /// applies any `x-wyrd-workload-uid` selector through
+    /// [`authorize_bearer`](super::authorize_bearer), like OTLP/HTTP and
     /// native ingest, and Gate admits the result; an API key is exchanged
     /// under the selected root.
     ///
@@ -339,12 +339,8 @@ impl OtlpGrpcAuthentication {
         let api_key = match metadata.get(WYRD_API_KEY_HEADER.as_str()) {
             Some(api_key) if !metadata.contains_key(WYRD_ACCESS_TOKEN_HEADER.as_str()) => api_key,
             _ => {
-                let Some(root) = workload_uid else {
-                    return gate
-                        .authenticate_otlp_metadata(metadata)
-                        .map_err(ingest_status);
-                };
-                let verified = super::select_bearer_root(&self.state, metadata, &root).await?;
+                let verified =
+                    super::authorize_bearer(&self.state, metadata, workload_uid.as_ref()).await?;
                 return gate
                     .admit_verified(verified, metadata)
                     .map_err(ingest_status);

@@ -91,4 +91,46 @@ impl ServerAuth {
             )
         })
     }
+
+    /// The current-authority propagation worker over `postgres`, which runs
+    /// until `shutdown`.
+    ///
+    /// It applies every `wyrd_authorization` notification, so a committed
+    /// access change stops a stale snapshot from serving as soon as it is
+    /// heard, and confirms each cached tenant's revision every
+    /// [`CONFIRM_INTERVAL`](wyrd_auth::authority::CONFIRM_INTERVAL), which
+    /// bounds propagation when a notification is missed and is the only
+    /// renewal of a snapshot's freshness. Requests never renew it.
+    pub(crate) fn refresh_worker(
+        &self,
+        postgres: &wyrd_sql::WyrdPostgres,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> crate::state::EngineWorker {
+        let postgres = postgres.clone();
+        let authority = Arc::clone(&self.authority);
+        (
+            "authorization_cache",
+            Box::pin(async move {
+                let listener = postgres.listener(wyrd_sql::queries::auth::AUTHORIZATION_CHANNEL);
+                let listen = listener.watch(
+                    shutdown.clone(),
+                    |_| {},
+                    |payload| authority.notify(payload),
+                );
+                let confirm = async {
+                    let mut ticks = tokio::time::interval(wyrd_auth::authority::CONFIRM_INTERVAL);
+                    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        ticks.tick().await;
+                        authority.confirm(&postgres).await;
+                    }
+                };
+                tokio::select! {
+                    () = shutdown.cancelled() => {}
+                    () = listen => {}
+                    () = confirm => {}
+                }
+            }),
+        )
+    }
 }

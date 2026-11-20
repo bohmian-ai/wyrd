@@ -95,7 +95,7 @@ pub async fn bind_test_permissions(
         insert_role(
             conn,
             role_id,
-            &format!("test-{role_id}"),
+            &format!("test_{}", role_id.simple()),
             &operations,
             false,
         )

@@ -1482,6 +1482,7 @@ impl AppState {
         if !config.role.serves_api() {
             return workers;
         }
+        workers.push(self.auth.refresh_worker(postgres, shutdown.clone()));
         workers.push(self.gateway.refresh_worker(postgres, shutdown.clone()));
         workers.extend(self.verification.refresh_worker(postgres, shutdown.clone()));
         #[cfg(feature = "test-support")]

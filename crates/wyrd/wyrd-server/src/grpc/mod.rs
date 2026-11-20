@@ -331,23 +331,27 @@ where
     }
 }
 
-/// Verify `metadata`'s Bifrost-audience bearer and narrow it to the request's
-/// selected workload `root`.
+/// Verify `metadata`'s Bifrost-audience bearer, resolve its caller's current
+/// authority, and narrow it to the request's selected workload `root`.
 ///
-/// Native and OTLP gRPC ingest both select through here, and from here
+/// Native and OTLP gRPC ingest both authorize through here, and from here
 /// through the same
+/// [`authorize`](crate::components::auth::token_extract::VerifiedBearer::authorize)
+/// and
 /// [`select_root`](crate::components::auth::AuthenticatedPrincipal::select_root)
-/// every HTTP bearer ingress uses: signature checks stay store-free, a bearer
-/// already signing `root` is returned without a store read, and a rootless
-/// bearer is narrowed under its signed Card access.
+/// every HTTP bearer ingress uses: signature checks stay store-free, current
+/// grants come from the process authority cache, a bearer already signing
+/// `root` is returned without a store read, and a rootless bearer is narrowed
+/// under its signed Card access.
 ///
 /// # Errors
-/// Returns the canonical status of a missing or invalid bearer, and of a
-/// mismatched, unknown, foreign, or otherwise unusable root.
-async fn select_bearer_root(
+/// Returns the canonical status of a missing or invalid bearer, of
+/// unavailable authority or an inactive account, and of a mismatched,
+/// unknown, foreign, or otherwise unusable root.
+async fn authorize_bearer(
     state: &AppState,
     metadata: &MetadataMap,
-    root: &CardUid,
+    root: Option<&CardUid>,
 ) -> Result<VerifiedToken, Status> {
     let status = |error| wyrd_error_to_status(error, None);
     let token = extract_bearer(metadata).map_err(Status::from)?;
@@ -357,22 +361,25 @@ async fn select_bearer_root(
         wyrd_auth_verify::TokenAudience::Bifrost,
     )
     .map_err(|WyrdErrorResponse(error)| status(error))?
-    .select_root(state, Some(root))
+    .authorize(state)
+    .await
+    .map_err(status)?
+    .select_root(state, root)
     .await
     .map_err(status)?
     .into_verified())
 }
 
-/// Native ingest's server-owned workload-root selection, run before Gate.
+/// Native ingest's server-owned authorization and workload-root selection,
+/// run before Gate.
 ///
-/// Gate verifies bearers without a store, so it refuses a selector that
-/// needs the registry to resolve, such as a User bearer driving a loaded
-/// state. A bearer request carrying `x-wyrd-workload-uid` is therefore
-/// verified and narrowed here through [`select_bearer_root`], and Gate admits
-/// the result as a [`ResolvedCaller`] under its own readiness, frame, and
-/// permission rules. A refused selection never reaches Gate. A request with
-/// no bearer or no well-formed selector reaches Gate unchanged and is
-/// verified, or refused, there.
+/// Tokens carry no grants and Gate verifies bearers without a store, so
+/// every bearer request is verified, given its caller's current authority,
+/// and narrowed to any `x-wyrd-workload-uid` root here through
+/// [`authorize_bearer`]; Gate admits the result as a [`ResolvedCaller`] under
+/// its own readiness, frame, and permission rules. A refused bearer never
+/// reaches Gate. A request with no bearer or a malformed selector reaches
+/// Gate unchanged and is refused there.
 #[derive(Clone)]
 struct NativeRootSelection<S> {
     /// The Gate's generated ingest service.
@@ -416,10 +423,10 @@ where
                     .map(HeaderValue::as_bytes),
             );
             if headers.contains_key(WYRD_ACCESS_TOKEN_HEADER)
-                && let Ok(Some(root)) = selector
+                && let Ok(root) = selector
             {
                 let metadata = MetadataMap::from_headers(headers.clone());
-                match select_bearer_root(&state, &metadata, &root).await {
+                match authorize_bearer(&state, &metadata, root.as_ref()).await {
                     Ok(verified) => {
                         request.extensions_mut().insert(ResolvedCaller(verified));
                     }

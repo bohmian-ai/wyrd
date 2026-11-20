@@ -1765,8 +1765,8 @@ mod pg_tests {
         counts.into_iter().collect()
     }
 
-    /// An issuer created without `default_roles` grants `viewer`, while an
-    /// explicit empty list stays empty.
+    /// Authentication alone grants nothing: an issuer created without
+    /// `default_roles` stores no role, exactly as an explicit empty list does.
     ///
     /// The request is decoded from JSON so the omission is the wire's, not a
     /// Rust default.
@@ -1775,7 +1775,7 @@ mod pg_tests {
     ///
     /// Panics when the fixture cannot start or any assertion fails.
     #[tokio::test]
-    async fn omitted_default_roles_grant_viewer_and_explicit_empty_stays_empty() {
+    async fn omitted_default_roles_grant_nothing_like_an_explicit_empty_list() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
         let state = test_state(&fixture).await;
@@ -1804,7 +1804,7 @@ mod pg_tests {
             created.push(view.default_roles);
         }
 
-        assert_eq!(created, [vec!["viewer".to_owned()], Vec::new()]);
+        assert_eq!(created, [Vec::<String>::new(), Vec::new()]);
     }
 
     /// A binding create that cannot open its tenant connection still stages

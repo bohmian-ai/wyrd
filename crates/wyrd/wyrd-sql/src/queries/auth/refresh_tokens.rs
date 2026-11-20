@@ -50,7 +50,7 @@ const INSERT_HUMAN_REFRESH_TOKEN_SQL: &str = r"
         id, data_tenant_id, principal_kind, principal_id,
         token_hash, expires_at, rotated_from,
         human_connection_id, human_connection_revision, client_id, password_revision
-    ) VALUES ($1, $2, 'user', $3, $4, $5, $6, $7, $8, $9)
+    ) VALUES ($1, $2, 'user', $3, $4, $5, $6, $7, $8, $9, $10)
 ";
 
 /// Sample the `PostgreSQL` issuance instant for a refresh token, truncated to a

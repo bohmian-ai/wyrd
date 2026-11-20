@@ -123,10 +123,11 @@ impl FromRequestParts<AppState> for AuthenticatedPrincipal {
     /// routes authenticate identically to `/v1`.
     ///
     /// # Errors
-    /// Returns `401` when the access-token header is missing or verification
-    /// fails, `400` when the token is malformed, and `503` when no token
-    /// verifier is configured.
-    /// Resolution completes before the returned future is polled.
+    /// Returns `401` when the access-token header is missing, verification
+    /// fails or the account is no longer active, `400` when the token is
+    /// malformed, and `503` when no token verifier is configured or current
+    /// authority is unavailable. Verification completes before the returned
+    /// future is polled; authorization runs when it is.
     fn from_request_parts(
         parts: &mut Parts,
         state: &AppState,
@@ -134,20 +135,24 @@ impl FromRequestParts<AppState> for AuthenticatedPrincipal {
         // Fast path: require_authenticated (post-verify) is the sole trusted producer
         // of this extension. Any future insertion site must verify before inserting;
         // reading an unverified principal here would be a silent auth bypass.
-        let resolved = parts
+        let pending = parts
             .extensions
             .get::<AuthenticatedPrincipal>()
-            .map_or_else(
-                || {
-                    verify_authenticated_principal(
-                        state.auth.token_verifier.as_deref(),
-                        &parts.headers,
-                        wyrd_auth_verify::TokenAudience::Wyrd,
-                    )
-                },
-                |principal| Ok(principal.clone()),
-            );
-        std::future::ready(resolved)
+            .cloned()
+            .ok_or_else(|| {
+                verify_authenticated_principal(
+                    state.auth.token_verifier.as_deref(),
+                    &parts.headers,
+                    wyrd_auth_verify::TokenAudience::Wyrd,
+                )
+            });
+        let state = state.clone();
+        async move {
+            match pending {
+                Ok(principal) => Ok(principal),
+                Err(bearer) => Ok(bearer?.authorize(&state).await?),
+            }
+        }
     }
 }
 

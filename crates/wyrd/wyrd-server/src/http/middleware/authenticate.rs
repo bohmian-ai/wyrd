@@ -216,11 +216,14 @@ async fn authenticate_on(
         request.headers(),
         surface,
     ) {
-        Ok(principal) => principal,
+        Ok(bearer) => bearer,
         Err(rejection) => return rejection.into_response(),
     };
     let selected = match workload_uid_header(request.headers()) {
-        Ok(root) => verified.select_root(state, root.as_ref()).await,
+        Ok(root) => match verified.authorize(state).await {
+            Ok(principal) => principal.select_root(state, root.as_ref()).await,
+            Err(error) => Err(error),
+        },
         Err(error) => Err(error),
     };
     match selected {

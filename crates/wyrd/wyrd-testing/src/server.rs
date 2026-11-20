@@ -100,7 +100,8 @@ use wyrd_sql::queries::auth::{
     SubjectColumns, TrustedIssuerWrite, advance_authorization_revision, delete_role_binding,
     family_account_id, insert_api_key, insert_role_binding, insert_service_account,
     insert_trusted_issuer, insert_user, list_role_bindings, provision_system_principal,
-    role_by_name, tenant_admin_principal_id, trusted_issuer_by_url, workload_binding_by_subject,
+    replace_idp_user_bindings, role_by_name, tenant_admin_principal_id, trusted_issuer_by_url,
+    workload_binding_by_subject,
 };
 use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
 use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
@@ -3183,8 +3184,9 @@ impl WyrdTestServer {
             .await
     }
 
-    /// Bootstrap a user principal of `tenant_id` holding tenant-wide `roles`
-    /// through fixture SQL, signed in through the production login grant.
+    /// Bootstrap a user principal of `tenant_id` holding tenant-wide
+    /// provider-sourced `roles` through fixture SQL, signed in through the
+    /// production login grant.
     ///
     /// # Errors
     /// Returns an error when SQL writes or test JWT minting fail.
@@ -3205,9 +3207,17 @@ impl WyrdTestServer {
         )
         .await
         .map_err(sql)?;
+        // A signed-in User's roles come from its identity provider; an unknown
+        // role is a fixture error, never silently dropped.
         for role in roles {
-            grant_role(&mut conn, user_id, PrincipalTable::User, role).await?;
+            lookup_role_id(&mut conn, role).await?;
         }
+        replace_idp_user_bindings(&mut conn, user_id, roles)
+            .await
+            .map_err(sql)?;
+        advance_authorization_revision(&mut conn)
+            .await
+            .map_err(sql)?;
         // Mint through the production login grant, as a signed-in User is.
         let issuer = self
             .inner

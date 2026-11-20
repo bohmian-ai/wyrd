@@ -763,10 +763,14 @@ pub(crate) mod pg_tests {
     }
 
     /// Mint a rootless unrestricted token for a freshly seeded Service
-    /// subject, ceilinged at `permissions`.
+    /// subject granted and ceilinged at exactly `permissions`.
     async fn subject_token(fixture: &PgFixture, permissions: PermissionSet) -> String {
+        let grants: Vec<Permission> = permissions.iter().cloned().collect();
         mint(
-            service_ref(seed_subject(fixture).await, fixture.data_tenant_id()),
+            service_ref(
+                seed_subject(fixture, &grants).await,
+                fixture.data_tenant_id(),
+            ),
             permissions,
             None,
             CardAccess::AnyRegistered,
@@ -1561,17 +1565,17 @@ pub(crate) mod pg_tests {
         }
     }
 
-    /// Seed an active unrestricted Service account holding tenant-wide
-    /// administration and return its id, so a subject or earlier actor's
-    /// authority is exactly what its token's ceiling allows.
+    /// Seed an active unrestricted Service account bound to `grants` and
+    /// return its id. A subject or earlier actor's authority is its current
+    /// grants bounded by its token's ceiling.
     ///
     /// # Panics
     /// Panics when a seed write or commit fails.
-    async fn seed_subject(fixture: &PgFixture) -> Uuid {
+    async fn seed_subject(fixture: &PgFixture, grants: &[Permission]) -> Uuid {
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let creator = insert_test_user(&mut conn, fixture.data_tenant_id()).await;
         let id = insert_test_service_account(&mut conn, creator, None).await;
-        bind_test_permissions(&mut conn, service_subject(id), &[Permission::wildcard()])
+        bind_test_permissions(&mut conn, service_subject(id), grants)
             .await
             .expect("subject grants bind");
         conn.commit().await.expect("seed commits");
@@ -1797,8 +1801,11 @@ pub(crate) mod pg_tests {
                 table_uid: table,
             })),
         };
-        let subject_id = seed_subject(&fixture).await;
-        let earlier = service_ref(seed_subject(&fixture).await, tenant);
+        let subject_id = seed_subject(&fixture, &[Permission::wildcard()]).await;
+        let earlier = service_ref(
+            seed_subject(&fixture, &[Permission::wildcard()]).await,
+            tenant,
+        );
         let subject = mint(
             service_ref(subject_id, tenant),
             [
@@ -1974,8 +1981,8 @@ pub(crate) mod pg_tests {
         .await;
         let verifier = delegate_service(&RecordedAudit::new()).verifier;
         let subject_root = unregistered_uid();
-        let subject_id = seed_subject(&fixture).await;
-        let earlier_id = seed_subject(&fixture).await;
+        let subject_id = seed_subject(&fixture, &[Permission::wildcard()]).await;
+        let earlier_id = seed_subject(&fixture, &[Permission::wildcard()]).await;
         let earlier_root = unregistered_uid();
         let earlier_credential = Uuid::now_v7();
         let reads: PermissionSet = std::iter::once(Permission::card_read()).collect();

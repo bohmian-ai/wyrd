@@ -149,12 +149,47 @@ pub(crate) fn verify_authenticated_principal(
     verifier: Option<&wyrd_auth_verify::TokenVerifier>,
     headers: &HeaderMap,
     surface: wyrd_auth_verify::TokenAudience,
-) -> Result<AuthenticatedPrincipal, WyrdErrorResponse> {
+) -> Result<VerifiedBearer, WyrdErrorResponse> {
     verify_access_token(verifier, extract_wyrd_access_token(headers)?, surface)
 }
 
-/// Verifies an already extracted Wyrd access `token` and builds the
-/// authenticated principal.
+/// A bearer whose signature, expiry and claims verified, before its caller's
+/// current authority is resolved.
+///
+/// Tokens carry identity and restrictions, never grants, so the only way to
+/// an [`AuthenticatedPrincipal`] is [`Self::authorize`] against the server's
+/// current authority.
+#[derive(Debug)]
+pub(crate) struct VerifiedBearer(wyrd_auth_verify::VerifiedToken);
+
+impl VerifiedBearer {
+    /// Resolves the caller's current grants from the process authority cache
+    /// and bounds them by the token's ceiling, its credential's current
+    /// ceiling and every delegation actor's current grants.
+    ///
+    /// A warm cache answers from memory; a miss, known newer revision or
+    /// expired freshness reloads with one statement.
+    ///
+    /// # Errors
+    /// [`WyrdError::AuthorizationUnavailable`] when no usable authority can be
+    /// acquired, and [`WyrdError::PermissionUnauthenticated`] when the
+    /// account, an actor or the credential is no longer active.
+    pub(crate) async fn authorize(
+        self,
+        state: &crate::state::AppState,
+    ) -> Result<AuthenticatedPrincipal, WyrdError> {
+        let Self(mut verified) = self;
+        verified.principal = state
+            .auth
+            .authority
+            .authorize(state.postgres.wyrd(), &verified)
+            .await?;
+        Ok(AuthenticatedPrincipal::from_verified(Arc::new(verified)))
+    }
+}
+
+/// Verifies an already extracted Wyrd access `token`; its caller is
+/// authorized separately by [`VerifiedBearer::authorize`].
 ///
 /// The token's unverified tenant claim selects the verification tenant; the
 /// verifier then checks signature, expiry, and claims against it. Only a
@@ -171,7 +206,7 @@ pub(crate) fn verify_access_token(
     verifier: Option<&wyrd_auth_verify::TokenVerifier>,
     token: SecretString,
     surface: wyrd_auth_verify::TokenAudience,
-) -> Result<AuthenticatedPrincipal, WyrdErrorResponse> {
+) -> Result<VerifiedBearer, WyrdErrorResponse> {
     let expected_tenant = tenant_from_unverified_access_token(token.expose_secret())?;
     let refused =
         |error: WyrdErrorResponse| match AccessTokenClaims::unverified(token.expose_secret()) {
@@ -182,7 +217,7 @@ pub(crate) fn verify_access_token(
     let verified = verifier
         .verify_on(&token, &expected_tenant, surface)
         .map_err(|error| refused(WyrdErrorResponse::from(error)))?;
-    Ok(AuthenticatedPrincipal::from_verified(Arc::new(verified)))
+    Ok(VerifiedBearer(verified))
 }
 
 /// Header an Anthropic SDK carries its credential in.

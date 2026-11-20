@@ -238,8 +238,14 @@ async fn the_served_document_describes_the_composed_surface() {
         "/v1/cards/download/init",
         "/v1/principals/{principal_id}/credentials/{credential_id}",
         "/v1/principals",
-        "/v1/principals/{principal_id}/roles",
-        "/v1/principals/{principal_id}/roles/{role}",
+        "/v1/principals/{principal_id}/access",
+        "/v1/access/roles",
+        "/v1/access/roles/{role}",
+        "/v1/access/bindings",
+        "/v1/access/bindings/{binding_id}",
+        "/v1/access/groups",
+        "/v1/access/groups/{group_id}",
+        "/v1/access/groups/{group_id}/members/{principal_id}",
         "/v1/verification/bindings/{binding_id}",
         "/v1/verification/evidence",
         "/v1/verification/execute",
@@ -268,6 +274,10 @@ async fn the_served_document_describes_the_composed_surface() {
     ] {
         assert!(paths.contains_key(path), "missing {path}");
     }
+    assert!(
+        !paths.contains_key("/v1/principals/{principal_id}/roles"),
+        "superseded role-assignment routes are not documented"
+    );
     assert!(
         !paths.contains_key("/v1/cards/{card_uid}/abort"),
         "a route the server does not mount is not documented"

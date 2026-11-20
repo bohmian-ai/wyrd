@@ -141,8 +141,8 @@ async fn bound_editor_reaches_the_next_request_until_unbound() {
     assert_eq!(
         grants(&held),
         [
-            ("editor", &GrantSource::Direct),
-            ("workload", &GrantSource::Direct)
+            ("workload", &GrantSource::Direct),
+            ("editor", &GrantSource::Direct)
         ]
     );
     author(&deployment, &key)
@@ -314,8 +314,8 @@ async fn direct_and_idp_user_assignments_coexist() {
     assert_eq!(
         grants(&access),
         [
-            ("viewer", &GrantSource::Direct),
-            ("viewer", &GrantSource::Provider)
+            ("viewer", &GrantSource::Provider),
+            ("viewer", &GrantSource::Direct)
         ]
     );
     principals

@@ -147,7 +147,10 @@ impl GatewayIngress {
                     token,
                     wyrd_auth_verify::TokenAudience::Wyrd,
                 ) {
-                    Ok(principal) => principal.select_root(&state, root.as_ref()).await,
+                    Ok(bearer) => match bearer.authorize(&state).await {
+                        Ok(principal) => principal.select_root(&state, root.as_ref()).await,
+                        Err(error) => Err(error),
+                    },
                     Err(WyrdErrorResponse(error)) => Err(error),
                 }
             }

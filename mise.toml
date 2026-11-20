@@ -116,7 +116,7 @@ cargo nextest run --locked -p wyrd-runtime --lib -E 'test(/^principal::/)'
 cargo nextest run --locked -p wyrd-auth-verify --lib -E 'test(/^tests::(into_verified_|token_verifier_)/)'
 cargo nextest run --locked -p wyrd-auth-issue --lib -E 'test(/^tests::issue_access_token_/)'
 cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^platform_credentials::tests::/)'
-cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^issuance::tests::/)'
+cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^authority::tests::/)'
 """
 
 [tasks."test:platform:journey"]

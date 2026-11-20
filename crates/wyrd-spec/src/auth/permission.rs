@@ -186,6 +186,9 @@ pub enum Resource {
     /// implies this one.
     Tool,
     /// One of several resources.
+    // `no_recursion` stops OpenAPI schema collection from re-entering
+    // `Resource`; the variant still references it by name.
+    #[cfg_attr(feature = "server", schema(no_recursion))]
     AnyOf(Vec<Resource>),
     /// All resources.
     Wildcard,
@@ -224,6 +227,9 @@ pub enum Action {
     /// grant and in audit, rather than hiding inside a general write.
     Recover,
     /// One of several actions.
+    // `no_recursion` stops OpenAPI schema collection from re-entering
+    // `Action`; the variant still references it by name.
+    #[cfg_attr(feature = "server", schema(no_recursion))]
     AnyOf(Vec<Action>),
     /// All actions.
     Wildcard,

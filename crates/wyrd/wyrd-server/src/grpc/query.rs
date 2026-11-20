@@ -72,31 +72,35 @@ impl BifrostQueryGrpc {
     }
 }
 
-/// Authenticates request metadata before any local role-availability lookup.
+/// Authenticates request metadata and resolves the caller's current
+/// authority before any local role-availability lookup.
 ///
-/// Verification is local and synchronous: the bearer is checked once, when the
-/// query stream begins, and the stream never re-verifies it.
+/// The bearer is verified and authorized once, when the query stream begins,
+/// through the same [`authorize_bearer`](super::authorize_bearer) every gRPC
+/// ingress uses.
 ///
 /// # Errors
 ///
-/// Returns unauthenticated when the bearer credential is missing or invalid,
-/// and unavailable when the verifier was not configured.
-fn caller(
+/// Returns the canonical status of a missing or invalid bearer, a malformed
+/// or unusable `x-wyrd-workload-uid` selector, an inactive account, or
+/// unavailable authority.
+async fn caller(
     state: &AppState,
     metadata: &wyrd_tonic::tonic::metadata::MetadataMap,
 ) -> Result<Caller, Status> {
-    let verifier = state
-        .auth
-        .token_verifier
-        .as_deref()
-        .ok_or_else(|| Status::unavailable("auth backend not configured"))?;
-    let auth = vala_bifrost_redux::gate::auth::authenticate(verifier, metadata)
-        .map_err(|error| Status::unauthenticated(error.to_string()))?;
+    let root = wyrd_spec::auth::workload_uid_selector(
+        metadata
+            .get_all(wyrd_spec::auth::WORKLOAD_UID_HEADER)
+            .iter()
+            .map(wyrd_tonic::tonic::metadata::MetadataValue::as_bytes),
+    )
+    .map_err(|error| wyrd_tonic::error::wyrd_error_to_status(error, None))?;
+    let verified = super::authorize_bearer(state, metadata, root.as_ref()).await?;
     Ok(Caller {
-        data_tenant_id: auth.tenant,
-        principal: auth.principal,
-        request_id: auth.request_id,
-        delegation_chain: auth.delegation_chain,
+        data_tenant_id: verified.principal.tenant_id,
+        principal: verified.principal,
+        request_id: vala_bifrost_redux::gate::auth::read_or_mint_request_id(metadata),
+        delegation_chain: verified.delegation_chain,
         executed_by: None,
     })
 }
@@ -123,7 +127,7 @@ impl BifrostQueryService for BifrostQueryGrpc {
         request: Request<BifrostQueryRequest>,
     ) -> Result<Response<Self::QueryStream>, Status> {
         async {
-            let caller = caller(&self.state, request.metadata())?;
+            let caller = caller(&self.state, request.metadata()).await?;
             let request_id = caller.request_id.clone();
             let request = wyrd_spec::vala::api::BifrostQueryRequest::try_from(request.into_inner())
                 .map_err(|error| Status::invalid_argument(error.to_string()))?;
@@ -157,7 +161,7 @@ impl BifrostQueryService for BifrostQueryGrpc {
         &self,
         request: Request<proto::ListRunningQueriesRequest>,
     ) -> Result<Response<proto::ListRunningQueriesResponse>, Status> {
-        let caller = caller(&self.state, request.metadata())?;
+        let caller = caller(&self.state, request.metadata()).await?;
         let request_id = caller.request_id.clone();
         let queries = crate::query::service::list_running_queries(&self.state, &caller)
             .await
@@ -181,7 +185,7 @@ impl BifrostQueryService for BifrostQueryGrpc {
         &self,
         request: Request<proto::GetRunningQueryRequest>,
     ) -> Result<Response<proto::RunningQuerySummary>, Status> {
-        let caller = caller(&self.state, request.metadata())?;
+        let caller = caller(&self.state, request.metadata()).await?;
         let request_id = caller.request_id.clone();
         let lookup = wyrd_spec::vala::api::GetRunningQueryRequest::try_from(request.into_inner())
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
@@ -207,7 +211,7 @@ impl BifrostQueryService for BifrostQueryGrpc {
         &self,
         request: Request<proto::CancelRunningQueryRequest>,
     ) -> Result<Response<proto::CancelRunningQueryResponse>, Status> {
-        let caller = caller(&self.state, request.metadata())?;
+        let caller = caller(&self.state, request.metadata()).await?;
         let request_id = caller.request_id.clone();
         let cancellation =
             wyrd_spec::vala::api::CancelRunningQueryRequest::try_from(request.into_inner())

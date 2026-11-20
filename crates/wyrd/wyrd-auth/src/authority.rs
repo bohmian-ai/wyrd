@@ -15,7 +15,6 @@
 //! serves for at most [`FRESHNESS_BOUND`] after its last successful
 //! confirmation. Requests never renew it.
 
-use std::collections::hash_map::Entry as Slot;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -469,10 +468,13 @@ fn role_names(names: Option<Vec<RoleRef>>) -> Arc<[RoleRef]> {
 
 /// One tenant's cached snapshot and its freshness.
 struct Entry {
-    snapshot: Arc<TenantAuthority>,
-    /// The last successful confirmation, or `None` once a malformed
-    /// notification made it unknowable.
-    confirmed_at: Option<Instant>,
+    /// The installed snapshot, or `None` while this process has only
+    /// observed a revision for a tenant it has not yet loaded.
+    snapshot: Option<Arc<TenantAuthority>>,
+    /// The snapshot's last successful confirmation.
+    confirmed_at: Instant,
+    /// The invalidation generation that confirmation began under.
+    generation: u64,
     /// The highest revision this process has observed for the tenant, by
     /// notification, confirmation or load. The snapshot serves only while it
     /// is at least this current; an older load never lowers it.
@@ -480,20 +482,47 @@ struct Entry {
 }
 
 impl Entry {
-    /// Whether the snapshot may serve: current with every observed revision
-    /// and confirmed within [`FRESHNESS_BOUND`].
-    fn usable(&self) -> bool {
-        self.snapshot.revision >= self.observed
-            && self
-                .confirmed_at
-                .is_some_and(|confirmed| confirmed.elapsed() <= FRESHNESS_BOUND)
+    /// An entry holding only an observation of `revision`.
+    fn observed(revision: i64) -> Self {
+        Self {
+            snapshot: None,
+            confirmed_at: Instant::now(),
+            generation: 0,
+            observed: revision,
+        }
+    }
+
+    /// The snapshot when it may serve under the cache's current
+    /// `generation`: current with every observed revision, confirmed by a
+    /// read begun after the last unknown invalidation, and within
+    /// [`FRESHNESS_BOUND`] of that confirmation. This is the one validity
+    /// rule for cold, warm and confirmed tenants.
+    fn usable(&self, generation: u64) -> Option<&Arc<TenantAuthority>> {
+        self.snapshot.as_ref().filter(|snapshot| {
+            snapshot.revision >= self.observed
+                && self.generation == generation
+                && self.confirmed_at.elapsed() <= FRESHNESS_BOUND
+        })
     }
 }
 
+/// The cache's tenants and its invalidation generation, behind one lock.
+#[derive(Default)]
+struct Entries {
+    tenants: HashMap<DataTenantId, Entry>,
+    /// Advanced by every notification whose revision is unknown. A load or
+    /// confirmation begun under an earlier generation may predate the
+    /// change it announced, so it cannot make a snapshot serve.
+    generation: u64,
+}
+
 /// Process-local current authority, one snapshot per tenant.
+// ponytail: an observed-only entry is kept for every notifying tenant, so
+// memory grows with tenant count; drop observed-only entries once no load
+// can be in flight if tenant counts make that matter.
 #[derive(Default)]
 pub struct AuthorityCache {
-    entries: Mutex<HashMap<DataTenantId, Entry>>,
+    entries: Mutex<Entries>,
     compiles: AtomicU64,
 }
 
@@ -506,7 +535,7 @@ impl std::fmt::Debug for AuthorityCache {
 }
 
 impl AuthorityCache {
-    fn entries(&self) -> MutexGuard<'_, HashMap<DataTenantId, Entry>> {
+    fn entries(&self) -> MutexGuard<'_, Entries> {
         self.entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -518,13 +547,24 @@ impl AuthorityCache {
         self.compiles.load(Ordering::Relaxed)
     }
 
+    /// The invalidation generation a load must read under: take it before
+    /// the load's statement begins and pass it to [`Self::install`].
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.entries().generation
+    }
+
     /// The tenant's usable snapshot from memory, or `None` when it must be
-    /// reloaded: absent, a newer revision is known, or freshness expired.
+    /// reloaded: absent, a newer revision or an unknown invalidation is
+    /// known, or freshness expired.
     #[must_use]
     pub fn cached(&self, tenant: DataTenantId) -> Option<Arc<TenantAuthority>> {
         let entries = self.entries();
-        let entry = entries.get(&tenant)?;
-        entry.usable().then(|| Arc::clone(&entry.snapshot))
+        entries
+            .tenants
+            .get(&tenant)?
+            .usable(entries.generation)
+            .map(Arc::clone)
     }
 
     /// The tenant's usable snapshot, reloading it with one statement when
@@ -548,13 +588,15 @@ impl AuthorityCache {
     ///
     /// # Errors
     ///
-    /// [`WyrdError::AuthorizationUnavailable`] when the reload fails or reads
-    /// a revision older than one this process has already observed.
+    /// [`WyrdError::AuthorizationUnavailable`] when the reload fails, or
+    /// when a newer revision or an unknown invalidation was observed while
+    /// it ran.
     async fn reload(
         &self,
         postgres: &WyrdPostgres,
         tenant: DataTenantId,
     ) -> Result<Arc<TenantAuthority>, WyrdError> {
+        let generation = self.generation();
         let loaded = async {
             let mut conn = postgres.tenant_conn(tenant).await.ok()?;
             let snapshot = TenantAuthority::load(&mut conn).await;
@@ -565,7 +607,7 @@ impl AuthorityCache {
         }
         .await
         .ok_or_else(|| WyrdError::authorization_unavailable("reload_failed"))?;
-        self.install(tenant, loaded)
+        self.install(tenant, generation, loaded)
             .ok_or_else(|| WyrdError::authorization_unavailable("reload_superseded"))
     }
 
@@ -604,45 +646,55 @@ impl AuthorityCache {
             })
     }
 
-    /// Installs a freshly loaded snapshot, confirmed now, unless a newer one
-    /// is already cached; returns the snapshot now serving, or `None` when
-    /// it is older than a revision this process has observed, so a load that
-    /// started before a change can never make the obsolete state usable.
+    /// Installs a snapshot loaded under `generation`, confirmed now, unless
+    /// a newer one is already cached; returns the snapshot now serving.
+    ///
+    /// Returns `None` when the load is older than a revision this process
+    /// has observed, cold tenant included, or an unknown invalidation
+    /// arrived after `generation` was taken: a load that started before a
+    /// change can never make the obsolete state usable.
     pub fn install(
         &self,
         tenant: DataTenantId,
+        generation: u64,
         loaded: TenantAuthority,
     ) -> Option<Arc<TenantAuthority>> {
         self.compiles.fetch_add(1, Ordering::Relaxed);
         let mut entries = self.entries();
-        let entry = match entries.entry(tenant) {
-            Slot::Occupied(slot) => {
-                let entry = slot.into_mut();
-                if entry.snapshot.revision <= loaded.revision {
-                    entry.snapshot = Arc::new(loaded);
-                    entry.confirmed_at = Some(Instant::now());
-                }
-                entry
-            }
-            Slot::Vacant(slot) => slot.insert(Entry {
-                observed: loaded.revision,
-                snapshot: Arc::new(loaded),
-                confirmed_at: Some(Instant::now()),
-            }),
-        };
-        entry.usable().then(|| Arc::clone(&entry.snapshot))
+        let current = entries.generation;
+        let entry = entries
+            .tenants
+            .entry(tenant)
+            .or_insert_with(|| Entry::observed(loaded.revision));
+        entry.observed = entry.observed.max(loaded.revision);
+        let replaces = entry.snapshot.as_ref().is_none_or(|snapshot| {
+            entry.generation != current || snapshot.revision <= loaded.revision
+        });
+        if generation == current && replaces {
+            entry.snapshot = Some(Arc::new(loaded));
+            entry.confirmed_at = Instant::now();
+            entry.generation = current;
+        }
+        entry.usable(current).map(Arc::clone)
     }
 
     /// Records that the tenant's committed revision is at least `revision`,
-    /// so no older snapshot serves until a load reaches it.
+    /// so no older snapshot serves, including one whose first load is in
+    /// flight, until a load reaches it.
     fn observe(&self, tenant: DataTenantId, revision: i64) {
-        if let Some(entry) = self.entries().get_mut(&tenant) {
-            entry.observed = entry.observed.max(revision);
-        }
+        let mut entries = self.entries();
+        let entry = entries
+            .tenants
+            .entry(tenant)
+            .or_insert_with(|| Entry::observed(revision));
+        entry.observed = entry.observed.max(revision);
     }
 
     /// Applies a committed-revision notification `<tenant>:<revision>`: a
     /// newer revision stops the cached snapshot from serving until reloaded.
+    /// A malformed one names no revision, so it advances the generation and
+    /// no snapshot serves until a read begun after it confirms that tenant;
+    /// observed revisions still fence older loads.
     pub fn notify(&self, payload: &str) {
         let parsed = payload.split_once(':').and_then(|(tenant, revision)| {
             Some((
@@ -653,27 +705,26 @@ impl AuthorityCache {
         if let Some((tenant, revision)) = parsed {
             self.observe(tenant, revision);
         } else {
-            // The revision is unknown, so no snapshot serves until a reload
-            // confirms it again; observed revisions still fence older loads.
             tracing::warn!(payload, "malformed authorization notification");
-            for entry in self.entries().values_mut() {
-                entry.confirmed_at = None;
-            }
+            self.entries().generation += 1;
         }
     }
 
     /// Confirms every cached tenant against its committed revision: an
     /// unchanged revision renews freshness without recompiling, a changed one
-    /// stops the old snapshot serving at once and reloads. A failed read
-    /// leaves the entry to age toward [`FRESHNESS_BOUND`]; a failed reload
-    /// after a changed revision leaves it unusable.
+    /// stops the old snapshot serving at once and reloads. A read begun
+    /// before an unknown invalidation confirms nothing. A failed read leaves
+    /// the entry to age toward [`FRESHNESS_BOUND`]; a failed reload after a
+    /// changed revision leaves it unusable.
     pub async fn confirm(&self, postgres: &WyrdPostgres) {
         let tenants: Vec<(DataTenantId, i64)> = self
             .entries()
+            .tenants
             .iter()
-            .map(|(tenant, entry)| (*tenant, entry.snapshot.revision))
+            .filter_map(|(tenant, entry)| Some((*tenant, entry.snapshot.as_ref()?.revision)))
             .collect();
         for (tenant, cached) in tenants {
+            let generation = self.generation();
             let Ok(mut conn) = postgres.tenant_conn(tenant).await else {
                 continue;
             };
@@ -681,10 +732,17 @@ impl AuthorityCache {
             match committed {
                 Ok(revision) if revision == cached => {
                     drop(conn.commit().await);
-                    if let Some(entry) = self.entries().get_mut(&tenant)
-                        && entry.snapshot.revision == revision
+                    let mut entries = self.entries();
+                    let current = entries.generation;
+                    if let Some(entry) = entries.tenants.get_mut(&tenant)
+                        && generation == current
+                        && entry
+                            .snapshot
+                            .as_ref()
+                            .is_some_and(|snapshot| snapshot.revision == revision)
                     {
-                        entry.confirmed_at = Some(Instant::now());
+                        entry.confirmed_at = Instant::now();
+                        entry.generation = current;
                     }
                 }
                 Ok(revision) => {
@@ -693,7 +751,7 @@ impl AuthorityCache {
                     drop(conn.commit().await);
                     match loaded {
                         Ok(loaded) => {
-                            self.install(tenant, loaded);
+                            self.install(tenant, generation, loaded);
                         }
                         Err(error) => tracing::warn!(%tenant, %error, "authority reload failed"),
                     }
@@ -709,12 +767,8 @@ impl AuthorityCache {
     /// freshness bound without waiting it out.
     #[cfg(test)]
     fn age(&self, tenant: DataTenantId, age: Duration) {
-        if let Some(confirmed) = self
-            .entries()
-            .get_mut(&tenant)
-            .and_then(|entry| entry.confirmed_at.as_mut())
-        {
-            *confirmed -= age;
+        if let Some(entry) = self.entries().tenants.get_mut(&tenant) {
+            entry.confirmed_at -= age;
         }
     }
 }
@@ -940,6 +994,7 @@ mod tests {
 
         cache.install(
             tenant,
+            cache.generation(),
             TenantAuthority::compile(state(3, user)).expect("compiles"),
         );
         assert!(cache.cached(tenant).is_some());
@@ -958,6 +1013,7 @@ mod tests {
 
         cache.install(
             tenant,
+            cache.generation(),
             TenantAuthority::compile(state(4, user)).expect("compiles"),
         );
         assert!(cache.cached(tenant).is_some());
@@ -977,6 +1033,7 @@ mod tests {
         let cache = AuthorityCache::default();
         cache.install(
             tenant,
+            cache.generation(),
             TenantAuthority::compile(state(1, user)).expect("compiles"),
         );
         cache.age(
@@ -993,6 +1050,7 @@ mod tests {
         );
         cache.install(
             tenant,
+            cache.generation(),
             TenantAuthority::compile(state(1, user)).expect("compiles"),
         );
         assert!(cache.cached(tenant).is_some(), "a reload confirms it again");
@@ -1044,25 +1102,25 @@ mod tests {
         let (tenant, user) = (DataTenantId::new_v7(), Uuid::now_v7());
         let cache = AuthorityCache::default();
         let load = |revision| TenantAuthority::compile(state(revision, user)).expect("compiles");
-        assert!(cache.install(tenant, load(3)).is_some());
+        assert!(cache.install(tenant, cache.generation(), load(3)).is_some());
 
         cache.notify(&format!("{tenant}:4"));
         assert!(
-            cache.install(tenant, load(3)).is_none(),
+            cache.install(tenant, cache.generation(), load(3)).is_none(),
             "an in-flight load of 3 does not serve once 4 is observed"
         );
         assert!(cache.cached(tenant).is_none());
 
         // Confirmation read 5 and then failed to load it.
         cache.observe(tenant, 5);
-        assert!(cache.install(tenant, load(4)).is_none());
+        assert!(cache.install(tenant, cache.generation(), load(4)).is_none());
         assert!(cache.cached(tenant).is_none(), "no obsolete grants serve");
 
-        assert!(cache.install(tenant, load(5)).is_some());
+        assert!(cache.install(tenant, cache.generation(), load(5)).is_some());
         assert_eq!(cache.cached(tenant).map(|s| s.revision()), Some(5));
         assert!(
             cache
-                .install(tenant, load(4))
+                .install(tenant, cache.generation(), load(4))
                 .is_some_and(|s| s.revision() == 5),
             "a late older load leaves the current snapshot serving"
         );
@@ -1071,10 +1129,70 @@ mod tests {
         cache.notify("malformed");
         assert!(cache.cached(tenant).is_none(), "malformed: nothing serves");
         assert!(
-            cache.install(tenant, load(5)).is_none(),
+            cache.install(tenant, cache.generation(), load(5)).is_none(),
             "a malformed notification keeps the observed fence"
         );
-        assert!(cache.install(tenant, load(6)).is_some());
+        assert!(cache.install(tenant, cache.generation(), load(6)).is_some());
+    }
+
+    /// A replica's first load of a tenant reads revision N; N+1 is observed
+    /// before that load installs. The N snapshot refuses, and a load that
+    /// reached N+1 serves.
+    ///
+    /// # Panics
+    /// Panics when the first load serves after a newer revision was observed.
+    #[test]
+    fn a_first_load_never_serves_after_a_newer_revision_is_observed() {
+        let (tenant, user) = (DataTenantId::new_v7(), Uuid::now_v7());
+        let cache = AuthorityCache::default();
+        let load = |revision| TenantAuthority::compile(state(revision, user)).expect("compiles");
+
+        let pending = cache.generation();
+        cache.notify(&format!("{tenant}:4"));
+        assert!(
+            cache.install(tenant, pending, load(3)).is_none(),
+            "the cold load of 3 does not serve once 4 is observed"
+        );
+        assert!(cache.cached(tenant).is_none());
+        assert_eq!(
+            cache
+                .install(tenant, cache.generation(), load(4))
+                .map(|s| s.revision()),
+            Some(4)
+        );
+    }
+
+    /// A malformed notification arriving while a load is in flight stops
+    /// that load's snapshot from serving, cold or warm, with no numeric fence
+    /// to mask it; a load begun after the invalidation serves.
+    ///
+    /// # Panics
+    /// Panics when a load begun before the invalidation serves.
+    #[test]
+    fn an_unknown_invalidation_refuses_a_load_begun_before_it() {
+        let (cold, warm, user) = (
+            DataTenantId::new_v7(),
+            DataTenantId::new_v7(),
+            Uuid::now_v7(),
+        );
+        let cache = AuthorityCache::default();
+        let load = |revision| TenantAuthority::compile(state(revision, user)).expect("compiles");
+        assert!(cache.install(warm, cache.generation(), load(1)).is_some());
+
+        let pending = cache.generation();
+        cache.notify("malformed");
+        assert!(cache.cached(warm).is_none(), "nothing serves once unknown");
+        for tenant in [cold, warm] {
+            assert!(
+                cache.install(tenant, pending, load(1)).is_none(),
+                "a load begun before the invalidation does not serve"
+            );
+            assert!(cache.cached(tenant).is_none());
+            assert!(
+                cache.install(tenant, cache.generation(), load(1)).is_some(),
+                "a load begun after it serves"
+            );
+        }
     }
 
     /// A refreshed human token names its consumed refresh row, which is

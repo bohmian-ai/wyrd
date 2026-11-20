@@ -331,7 +331,8 @@ pub(crate) fn admit_accounts(
         api_keys: Json(Vec::new()),
     })
     .expect("an empty authority compiles");
-    state.auth.authority.install(tenant, loaded);
+    let generation = state.auth.authority.generation();
+    state.auth.authority.install(tenant, generation, loaded);
 }
 
 /// The library test binary's allocator: the system allocator plus a count of

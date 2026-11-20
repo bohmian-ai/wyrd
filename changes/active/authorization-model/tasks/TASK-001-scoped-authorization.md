@@ -150,10 +150,116 @@ Evidence (in progress):
 - Local device approval: a recent password/provider browser session approves with its
   own human anchor (`CliLogins::approve_signed_in`, `device_decision`); otherwise the
   provider redirect is unchanged.
+- Oracle managed-row visibility. Owner: `restrict_verification_rows` and
+  `authorize_resolved_tables` (`crates/vala/vala-bifrost-redux/src/oracle/mod.rs`),
+  applied in `Oracle::plan_logical` before optimization. Every `bifrost.verification`
+  scan, including views, joins and subqueries, gets a filter on the registry-stamped
+  `subject_kind/subject_name/subject_card_uid` parent. A restricted reader also gets a
+  projection that nulls every column outside its visible parents, so pushed or reordered
+  user predicates never evaluate hidden values. DataFusion's `FilterExec` absorbs parent
+  filters ahead of its own predicate (`datafusion/physical-plan/src/filter.rs`
+  `handle_child_pushdown_result`), so a bare filter could not meet the design rule
+  against a movable predicate. The plan stays native, so peers execute the same masking.
+  Rows without a provable parent are read by nobody. Execution read at any scope admits
+  the managed tables and only them. A table grant alone reads no row.
+  Unit tests: `oracle::tests::verification_rows_are_filtered_by_the_readers_card_scope`
+  (family, exact, table-only, tenant-wide, join, `IN` subquery, CTE, count, other-family
+  predicate, a failing cast over a hidden row) and
+  `oracle::tests::execution_read_admits_only_managed_verification_tables`.
+  Command: `cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=oracle::tests::<name>)'`.
+  RED 1: the family reader saw `["o1","p1","u1"]`. RED 2: the masking case failed with
+  `Cannot cast string 'hidden' to value of Int64 type`. GREEN after both changes.
+  TDD VIOLATED for the admission slice (`authorize_resolved_tables`/`admit_capability`):
+  the test followed the code.
+- Trusted parent on evidence and approvals. The approval writer
+  (`verification/approvals.rs::row`) and the deferred-evidence writer
+  (`verification/evidence.rs::row`, subject per subscriber from
+  `VerificationService::subscribers`) now stamp the execution's exact subject. Scribe
+  then stamps its kind and name from the registry. Results, inputs, outputs and events
+  already carried the subject through `ResultRun.card_uid`. No historical conversion.
+- Diagnosis, journey regression after row visibility (40 of 78 SDK journeys failed).
+  Symptom 1: `role seeds: Io("role datasets_reader names a scoped operation ...")` at
+  `support/mod.rs:240` and `query_bifrost.rs:776`. Cause: `WyrdTestServer::seed_role`
+  refused scoped operations after roles became operation bundles, but 84 fixture
+  callers seed a role at one scope and then bootstrap with it. Fix site:
+  `wyrd-testing/src/server.rs`. `seed_role` records the operations' single shared scope,
+  and `grant_role`/bootstrap bind there. A role with several scopes is refused.
+  Symptom 2: `SdkVerificationWaitTimedOut ... last_status: Null` with no error in a
+  `WYRD_LOG=wyrd_server=debug` trace. Every `GET /v1/verification/executions/{id}` read
+  returned no row. Cause: `SystemReadAuthority` held only table-UID grants, so the new
+  parent filter hid every managed row from the server's own record reader. Fix site:
+  `verification/authority.rs::SystemReadAuthority::resolve`, shared by the execution,
+  group, drift, inventory and runner readers. It adds tenant-wide execution read when a
+  requested table is in `bifrost.verification`. Caller-facing reads authorize the
+  caller's access to the execution before this read.
+- Diagnosis, the 15 journeys still failing after the fixes above.
+  Symptom A, fixture: multi-scope roles and the retired `{"verifier": uid}` grant scope
+  were refused. Fix site: `seed_role` stores one part role per scope and binds each part
+  at its scope (`<name>_scope<n>`, because `RoleRef` forbids `.`). Grants now use the
+  Verifier Card version scope; an execution read is `executions:read` there, since
+  `verifier:read` is not valid at a Card scope.
+  Symptom B, `QueryVisibilityUnavailable`, and GitHub delivery "recorded outcome is not
+  visible yet". Status and delivery rows carried no subject, so no parent was provable.
+  Fix site: `ScribeWrite::status` and `github/delivery.rs::row` stamp the execution's
+  subject. The cancel SQL returns `card_uid` for the same reason.
+  Symptom C, `PEER_SECURITY` on forwarded queries. `oracle/forwarding.rs::validate_context`
+  demanded `bifrost_query:read` while `query/service.rs::admit_capability` admits Card
+  readers. Both now use `EffectivePermissions::reads_bifrost`.
+  Symptom D, `ROLE_CORRUPT` 500 for every caller in a tenant that held one corrupt role.
+  `TenantAuthority::compile` failed the whole tenant. Fix site: `wyrd-auth/authority.rs`
+  marks only the corrupt binding's subjects. `TenantAuthority::check` refuses them at
+  issuance, API-key exchange and `current_grants`.
+  Symptom E: a saved login dropped the gRPC endpoint (`TransportDown`); fixed in the
+  `principal_roles` fixture.
+  Symptom F: a hosted `bifrost.query` refusal surfaced as `WYRD_TOOL_500_CALL`.
+  `skald-tool/toolerror.rs` lost every `WYRD_VALA_*` code. It now reconstructs Bifrost
+  unit codes (`toolerror::tests::tool_errors_project_onto_the_catalog`; test written after
+  the fix, TDD VIOLATED).
+  Diagnostician report: no production defect remained in five journeys whose assertions
+  predate REQ-006 and the role table. Card read admits the query surface, so an uncovered
+  ordinary table is `WYRD_VALA_403_QUERY_FORBIDDEN`, not RBAC denial. An editor cannot
+  approve ("no approvals or access administration"). The hosted no-domain case must query
+  an ordinary table (`bifrost.traces.spans`). The grouped coding journey binds
+  `bifrost_query:read` at the verification schema. These were updated in the Rust, Python,
+  TypeScript and MCP counterparts.
+- Diagnosis, the MCP, Python and TypeScript journeys after those fixes.
+  Symptom G: PR supersede returned 503, "no column found for name: card_uid". Cause:
+  `CancelledRow` gained `card_uid`, but the three PR statements in
+  `verifier_executions/pull_requests.rs` did not return it. Fix site: those `RETURNING`
+  lists; `CANCEL_PRINCIPAL_SQL` was already updated.
+  Symptom H: delegating to a new role-less account answered 401 `inactive`. Cause:
+  account and credential writes never advanced the authorization revision, so the
+  authority cache never reloaded the new account, and a revoked key stayed usable until
+  the freshness bound. The spec requires every access-affecting change to advance it.
+  Fix site: the `wyrd-sql` account and credential writers advance the revision
+  themselves: user and Service insert, suspension and deletion, workload restriction,
+  key insert and key revocation.
+  Diagnostician report (stale tests, no further production defect):
+  - The MCP catalog tests predate `github_connection.review_pull_request` (`f4ce139ce`).
+  - Tenant-wide `cards:read` reads executions, outputs and publications (REQ-006), so
+    those refusal cases now use a `verifier:run`-only caller.
+  - An exact execution read is `executions:read` on the execution's subject Card, its
+    trusted parent, not the Verifier.
+  - The access summary promises no grant order, so the TypeScript `principal-roles`
+    assertions sort.
+  - The speculative-disposition reader held only `verifier:read`, and the trace refuses it
+    with `lacks Executions/Read`: `verifier:read` covers the Verifier Card alone. The
+    reader now holds `executions:read` in the Rust, Python and TypeScript journeys.
+  - The MCP onboarding check that no tool name contains "pull" misread
+    `github_connection.review_pull_request`; it now tests the operation's leading word.
+- Open, unreproduced: `verifier_orchestration::repeat_stops_or_exhausts_without_overlapping`
+  timed out once (`last_status: null` after 98s) in a 14-test parallel run. Alone it passed
+  in 10s; two traced reruns of the same 14-test set passed 14/14 in 38s. No cause has been
+  established and no fix has been made.
+- TDD: these production fixes preceded their focused failing tests, which is a process
+  violation. They are the hosted refusal code (`toolerror.rs`), the PR `RETURNING`
+  lists, and the account and credential revision advance. The journeys above observed
+  each defect first; the unit test for the hosted refusal code was added after the fix.
 - Not yet proven in this cycle: direct/group/custom-role variants, exact UID vs future
-  versions, CLI/Python/TypeScript/MCP/raw SQL, review sets/executions/evidence/approvals,
-  Oracle row filtering, scoped invitations, password-change refresh refusal, GitHub
-  configuration permission. Each remains FAIL until proven.
+  versions, CLI/Python/TypeScript/MCP, review sets/executions/approvals through
+  dedicated reads, peer execution of the masked plan, scoped invitations,
+  password-change refresh refusal, GitHub configuration permission. Each remains FAIL
+  until proven.
 - TDD: VIOLATED for slices committed in `8e33913ed` and `0c3a7d36f` (production code
   preceded tests). Test-first resumed from the smallest case above.
 

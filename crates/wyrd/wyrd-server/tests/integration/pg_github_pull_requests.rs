@@ -2021,7 +2021,7 @@ async fn read_as(deployment: &Deployment, jwt: &str, uri: &str) -> (StatusCode, 
 
 /// Inspecting a PR execution, and its sibling progress read, needs
 /// `executions:read` on its trusted parent, the Repository: the same grant
-/// on the shared Verifier is refused, also once the queue row is gone and
+/// on the shared Verifier reads it as unknown, also once the queue row is gone and
 /// only the accepted state remains.
 ///
 /// # Panics
@@ -2095,9 +2095,10 @@ async fn pull_request_inspection_requires_repository_read() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     for uri in [&status, &invocations] {
+        // Without the Repository parent the execution reads as unknown.
         let (code, body) = read_as(&deployment, &verifier_only, uri).await;
-        assert_eq!(code, StatusCode::FORBIDDEN, "{uri}: {body}");
-        assert_eq!(body["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
+        assert_eq!(code, StatusCode::NOT_FOUND, "{uri}: {body}");
+        assert_eq!(body["code"], "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND");
         assert_eq!(
             read_as(&deployment, &both, uri).await.0,
             StatusCode::OK,
@@ -2117,7 +2118,7 @@ async fn pull_request_inspection_requires_repository_read() {
     let (code, body) = read_as(&deployment, &verifier_only, &status).await;
     assert_eq!(
         code,
-        StatusCode::FORBIDDEN,
+        StatusCode::NOT_FOUND,
         "retained PR state still needs repository read: {body}"
     );
     let (code, body) = read_as(&deployment, &both, &status).await;
@@ -2939,8 +2940,65 @@ async fn retained_reads_resolve_current_and_history_membership() {
             .is_empty()
     );
     assert_eq!(
-        counted(elsewhere).await.expect("another family counts"),
+        counted(elsewhere.clone())
+            .await
+            .expect("another family counts"),
         [json!({"members": 0})]
+    );
+
+    // A reader of executions at this Repository's family sees exactly the
+    // viewer's membership and count, and opens each member through the
+    // dedicated execution read, which another family's reader cannot tell
+    // from an absent execution.
+    let policy = reader_of(
+        "pull_request_policy",
+        vec![wyrd_runtime::Permission::executions_read(
+            wyrd_runtime::CardPermissionScope::family(
+                wyrd_spec::envelope::CardKind::Repository,
+                wyrd_spec::ids::CardName::new("policy").expect("name"),
+            ),
+        )],
+    )
+    .await;
+    let scoped = deployment
+        .history_as(&policy, 51, "TRUE")
+        .await
+        .expect("the family reader's history reads");
+    let ids = |rows: &[Retained]| rows.iter().map(|row| row.execution_id).collect::<Vec<_>>();
+    let viewed = deployment
+        .history_as(&reader, 51, "TRUE")
+        .await
+        .expect("the viewer's history reads");
+    assert_eq!(ids(&scoped), ids(&viewed));
+    assert_eq!(scoped.len(), 6, "{scoped:?}");
+    assert_eq!(
+        counted(policy.clone())
+            .await
+            .expect("the family reader counts"),
+        counted(reader.clone()).await.expect("the viewer counts"),
+    );
+    let read_as = |jwt: String, execution: Uuid| {
+        let server = &deployment.server;
+        async move {
+            server
+                .oneshot_authenticated(
+                    &jwt,
+                    Request::builder()
+                        .uri(format!("/v1/verification/executions/{execution}"))
+                        .body(Body::empty())
+                        .expect("request builds"),
+                )
+                .await
+                .expect("the execution read responds")
+                .status()
+        }
+    };
+    let (execution, unknown) = (scoped[0].execution_id, Uuid::now_v7());
+    assert_eq!(read_as(policy, execution).await, StatusCode::OK);
+    assert_eq!(
+        read_as(elsewhere.clone(), execution).await,
+        read_as(elsewhere, unknown).await,
+        "another family's execution reads as an unknown one"
     );
 
     let other = deployment

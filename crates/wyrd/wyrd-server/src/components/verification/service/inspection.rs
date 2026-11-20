@@ -476,9 +476,10 @@ impl<'a> VerificationControl<'a> {
     /// Cards; until they are visible, or once a Card is gone, it is not found.
     ///
     /// # Errors
-    /// Returns [`WyrdError::PermissionDeniedRbac`] without a grant,
-    /// [`WyrdError::VerificationExecutionNotFound`] when the tenant has
-    /// neither a queue row nor an accepted state for the execution, a
+    /// Returns [`WyrdError::PermissionDeniedRbac`] when a decision lacks a
+    /// grant, [`WyrdError::VerificationExecutionNotFound`] when the tenant has
+    /// neither a queue row nor an accepted state for the execution or a
+    /// reader cannot read its trusted parent, a
     /// registry error when a read fails, and
     /// `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` when the accepted state
     /// cannot be read now.
@@ -554,14 +555,22 @@ impl<'a> VerificationControl<'a> {
             audit::authorize(self.state, caller, &required, operation, &resource)?;
         }
         // Reading, and deciding an approval, both need the execution's
-        // trusted parent to be readable.
+        // trusted parent to be readable. A reader denied it sees the same
+        // not-found an unknown execution gives; the denial is still audited.
         audit::authorize(
             self.state,
             caller,
             &Permission::executions_read(parent),
             operation,
             &resource,
-        )?;
+        )
+        .map_err(|error| {
+            if reading {
+                execution_not_found(execution_id)
+            } else {
+                error
+            }
+        })?;
         let approvals: Vec<ApprovalId> = state
             .approvals
             .iter()

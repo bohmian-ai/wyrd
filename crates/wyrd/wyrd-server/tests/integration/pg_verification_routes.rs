@@ -2702,7 +2702,7 @@ async fn custom_verdict_data_is_tenant_isolated() {
 /// directory. A caller holding only `executions:read` on the subject plans
 /// both downloads, and each plan's root-relative URL answers exactly the
 /// published bytes. The same grant on the execution's Verifier, which is not
-/// its parent, or `cards:read` on another Card, is refused at that URL.
+/// its parent, or `cards:read` on another Card, reads it as unknown there.
 ///
 /// # Panics
 /// Panics when a plan, its URL, its bytes, or a refusal differs.
@@ -2808,13 +2808,14 @@ async fn local_publication_downloads_redeem_under_verifier_read() {
             "{}",
             String::from_utf8_lossy(&fetched)
         );
+        // Without the parent the execution's content reads as unknown.
         for refused in [&elsewhere, &cards] {
             let (status, problem) = get(&server, refused, url).await;
             assert_eq!(
                 (status, problem["code"].as_str()),
                 (
-                    StatusCode::FORBIDDEN,
-                    Some("WYRD_PERMISSION_403_DENIED_RBAC")
+                    StatusCode::NOT_FOUND,
+                    Some("WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND")
                 ),
                 "{name}"
             );

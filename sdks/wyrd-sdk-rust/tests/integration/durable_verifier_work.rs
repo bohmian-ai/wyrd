@@ -280,8 +280,9 @@ fn refused<T: std::fmt::Debug>(result: Result<T, wyrd_ai::WyrdError>) -> String 
 /// and a listed directory file plan their downloads with the manifest's size
 /// and digest, and a JSON or unlisted download, a path on a read, and
 /// another attempt are refused. Tenant-wide `cards:read` reads; a caller holding only
-/// `verifier:run`, or `executions:read` on another subject Card only, is refused; one
-/// scoped to this execution's subject Card reads.
+/// `verifier:run` is refused, and one holding `executions:read` on another subject
+/// Card only reads and downloads it as unknown; one scoped to this execution's
+/// subject Card version reads, and one scoped to its family also downloads.
 /// Another tenant sees no such execution. A viewer cannot cancel; the
 /// administrator's cancel and its repeat both answer `cancelled`, and the
 /// publications stay listed. The `wyrd execution` command lists, reads,
@@ -605,6 +606,35 @@ async fn execution_pages_are_stable_and_tenant_scoped() {
             .expect("an exact executions:read grant reads")
             .items,
         publications
+    );
+    // A family grant reads and downloads exactly as the exact grant does;
+    // another family's reader cannot tell the download from an unknown one.
+    let family = as_key(
+        deployment
+            .granted_key(
+                "pages_family",
+                &[json!({"resource": "executions", "action": "read", "scope": {"card": {"family": {
+                    "kind": "Service", "name": "pages-subject"
+                }}}})],
+            )
+            .await,
+    )
+    .await;
+    let planned = family
+        .download(&step("draft"), &name("report"), &attempt(None))
+        .await
+        .expect("a family executions:read grant downloads");
+    assert_eq!(
+        (planned.size_bytes, planned.sha256),
+        (file.files[0].size_bytes, digest(&file.files[0]))
+    );
+    assert_eq!(
+        refused(
+            elsewhere
+                .download(&step("draft"), &name("report"), &attempt(None))
+                .await
+        ),
+        "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND"
     );
     let foreign = as_key(deployment.other_tenant_admin("pages-foreign").await).await;
     assert_eq!(

@@ -477,9 +477,29 @@ Evidence (in progress):
     `db:migrate:all:inner`.
   - TDD: the scenario test was written first. Both production fixes followed observed
     failures.
-- Not yet proven in this cycle: approvals and downloads under a Repository-family
-  reader through the SDKs, and peer execution of the masked plan. Each remains FAIL
-  until proven. Other-parent downloads read as unknown:
+- Approval under a parent-scoped reader — PASS (Rust SDK, `9c37ae2d2`).
+  `deferred_evidence::pg_tests::a_person_approves_the_pending_signoff`: an approver bound
+  only on the shared Verifier family (`verifier:approve` + `cards:read`) reads the
+  Repository-owned execution as `WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND` and its
+  decision is refused `WYRD_PERMISSION_403_DENIED_RBAC`. With `cards:read` and
+  `executions:read` added at Repository family `web`, it reads the pending approval,
+  approves, the decision replays and the execution passes. GREEN 1/1 on first run
+  (existing behavior).
+- Downloads under a family reader — PASS (Rust SDK, `a28f2889d`).
+  `durable_verifier_work::execution_pages_are_stable_and_tenant_scoped`: `executions:read`
+  at the parent's family plans the file download with the manifest's size and digest;
+  another family's reader gets `WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND` for the same
+  download. GREEN 1/1 on first run. The parent in this journey is a Service; downloads
+  use the same `VerificationService::retained` parent check for a Repository parent,
+  whose family read is proven by `pg_github_pull_requests` above.
+- Peer execution of the masked plan — PASS (unit, `9c37ae2d2`).
+  `oracle::codec::tests::a_masked_verification_plan_executes_identically_on_a_peer`: a
+  Repository-family reader's plan over `bifrost.verification.results` returns `["p1"]`
+  locally; encoded with `OraclePhysicalExtensionCodec`, decoded and run as a peer, it
+  returns the same rows. GREEN 1/1.
+  `cargo nextest run --locked -p vala-bifrost-redux --lib -E
+  'test(=oracle::codec::tests::a_masked_verification_plan_executes_identically_on_a_peer)'`.
+- Other-parent downloads read as unknown:
   `pg_verification_routes::local_publication_downloads_redeem_under_verifier_read` and
   the SDK/MCP pages tests above. Scoped invitations: see `pg_browser_sessions`.
 - TDD: VIOLATED for slices committed in `8e33913ed` and `0c3a7d36f` (production code
@@ -749,5 +769,34 @@ partial and dirty runs are insufficient. Warm checks add no IO; audit staging
 must remain nonblocking. No measurement is claimed by this plan.
 
 Hand off the working contracts and their actual consumer proof to TASK-002.
+
+Recorded results:
+
+- Final checks at `a28f2889d`, all exit 0: `mise run lints`, `codegen:check`,
+  `check:deps`, `check:tenant-isolation`, `py:lints`, `py:typecheck`,
+  `ts:format:check`, `ts:lints`, `ts:typecheck`, and `git diff --check` over the
+  task's commits. `fmt` applied before each commit.
+- Hot-path waits added or moved: none when warm. Bearer authorization, Oracle
+  row visibility and stream revalidation read the in-process `AuthorityCache`. On a
+  known newer revision or expired freshness, one sanctioned authority-cache reload
+  statement (the permission-check boundary). Audit staging is unchanged and
+  nonblocking.
+- Benchmarks (full, clean, same host; numbers reported to the maintainer for the
+  pass decision, no comparison claimed here; the maintainer accepted all three as
+  passing on 2026-11-20):
+  - `bench:l1:bifrost` VALID, `benchmarks/history/bifrost/parquet/20261120T111551Z-1cbe26031.json`.
+  - `bench:l1:gateway` VALID, `benchmarks/history/gateway/overhead/20261120T112543Z-1cbe26031.json`.
+    Overhead p99 at 64 clients: 1 KiB buffered 0.415 ms, streamed 0.201 ms, 64 KiB
+    metadata 1.140 ms, 64 KiB payload 55.706 ms.
+  - `bench:l1:verification` VALID, `benchmarks/history/verification/direct-verify/20261120T114155Z-9c37ae2d2.json`.
+    Overhead p99 at 64 clients: Rust 0.978 ms, Python 0.410 ms, TypeScript 1.024 ms;
+    admit (authorization) p99 0.012 ms; zero errors, wrong verdicts and lost writes.
+  - The first verification run (`20261120T112512Z-1cbe26031`) was INVALID: its workload
+    seeded `bench_code` with a scope inside the stored operation, which the scope-free
+    `Operation` (`deny_unknown_fields`) rejects in `roles::validate_assignments`.
+    Diagnostician: fix site is the workload seed; no other seeder affected. Fix:
+    store `{resource: tool, action: invoke}` and bind it at `{"tool": "code.run"}`
+    (`9c37ae2d2`).
+
 Additional schema purposes or changed authorization semantics require a spec
 revision; reversible implementation details remain with the implementer.

@@ -23,6 +23,7 @@ use serde_json::{Value, json};
 use wyrd_server::boot::init::InitError;
 use wyrd_spec::DataTenantId;
 use wyrd_testing::WyrdTestServer;
+use wyrd_testing::principal::within_propagation;
 
 /// The one header every Wyrd plane authenticates on.
 ///
@@ -2917,6 +2918,13 @@ async fn a_tenant_revokes_a_compromised_principal_with_its_reason() {
         .expect("revoke route responds");
     assert_eq!(resp.status(), StatusCode::OK, "the revocation is accepted");
 
+    let cards_status = || async {
+        srv.oneshot_authenticated(&live_token, tenant_request(Method::GET, "/v1/cards", None))
+            .await
+            .expect("cards route responds")
+            .status()
+    };
+    within_propagation(&StatusCode::UNAUTHORIZED, cards_status).await;
     let resp = srv
         .oneshot_authenticated(&live_token, tenant_request(Method::GET, "/v1/cards", None))
         .await

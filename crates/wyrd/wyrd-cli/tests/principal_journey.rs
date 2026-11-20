@@ -13,6 +13,7 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use wyrd_testing::principal::within_propagation;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
 /// Run the shipped CLI with one named credential and a scrubbed ambient
@@ -214,20 +215,15 @@ async fn principal_revoke_cli_journey() {
             .is_err(),
         "the revoked principal cannot mint another token"
     );
-    // The revoking request does not mark this replica's cache; the change
-    // arrives by notification, which the contract bounds at five seconds.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        let status = v1_status(&server, &target_token).await;
-        if status == StatusCode::UNAUTHORIZED {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "a token minted before revocation is refused within the propagation bound; last {status}"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+    assert_eq!(
+        within_propagation(&StatusCode::UNAUTHORIZED, || v1_status(
+            &server,
+            &target_token
+        ))
+        .await,
+        StatusCode::UNAUTHORIZED,
+        "a token minted before revocation is refused within the propagation bound"
+    );
 
     stop_served(server, shutdown, serve_handle).await;
 }

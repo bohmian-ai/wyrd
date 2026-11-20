@@ -30,6 +30,7 @@ use wyrd_spec::auth::{
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardName, CardUid};
 use wyrd_spec::reference::CardRef;
+use wyrd_testing::principal::within_propagation;
 use wyrd_testing::{
     Bootstrap, KeycloakAdmin, OidcIssuerFixture, WyrdTestServer, WyrdTestServerBuilder,
     provider_sign_in,
@@ -827,9 +828,14 @@ async fn revocation_journey() {
     );
 
     // The token minted before revocation spends the account's current
-    // authority, so the revoked account is refused at its next request.
+    // authority, so the revoked account is refused once the change propagates.
     assert_eq!(
-        card_write_status(&srv, &target_token, "revoke-window").await,
+        within_propagation(&StatusCode::UNAUTHORIZED, || card_write_status(
+            &srv,
+            &target_token,
+            "revoke-window"
+        ))
+        .await,
         StatusCode::UNAUTHORIZED,
         "a revoked account's earlier token is refused"
     );
@@ -2351,9 +2357,14 @@ async fn revoking_a_human_kills_the_session_refresh_authority() {
     );
 
     // The access token spends the account's current authority, so the
-    // revoked human is refused at its next request.
+    // revoked human is refused once the change propagates.
     assert_eq!(
-        card_write_status(&srv, &access_token, "human-revoke-window").await,
+        within_propagation(&StatusCode::UNAUTHORIZED, || card_write_status(
+            &srv,
+            &access_token,
+            "human-revoke-window"
+        ))
+        .await,
         StatusCode::UNAUTHORIZED,
         "a revoked human's earlier access token is refused"
     );

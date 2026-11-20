@@ -1617,7 +1617,7 @@ async fn file_upload_authority_and_validation_are_preserved() {
 }
 
 /// A binding status read authorizes and audits `cards:read` and an execution
-/// status read `verifier:read`: a viewer is allowed and stages one allowed
+/// status read `executions:read` on its trusted parent: a viewer is allowed and stages one allowed
 /// decision per read, while a principal with no role is refused with the
 /// stable RBAC code and stages one denied decision per read, before any
 /// lookup.
@@ -1658,7 +1658,7 @@ async fn status_reads_audit_their_decisions() {
     );
     assert_eq!(
         decisions(&server, "verification.execution.read", reader).await,
-        decision("verifier:read", "allowed")
+        decision("executions:read", "allowed")
     );
 
     let (outsider, outsider_jwt) = user(&server, "vr-status-outsider", &[]).await;
@@ -1679,7 +1679,7 @@ async fn status_reads_audit_their_decisions() {
     );
     assert_eq!(
         decisions(&server, "verification.execution.read", outsider).await,
-        decision("verifier:read", "denied")
+        decision("executions:read", "denied")
     );
     server.shutdown().await.expect("test server shuts down");
 }
@@ -3079,7 +3079,7 @@ async fn details_report_absence_when_retained_records_are_missing() {
 
 /// Details are readable exactly where the execution status is. An unknown
 /// execution is not found, as is another tenant's. A reader holding
-/// `verifier:read` on the execution's Verifier reads them, and that decision
+/// `executions:read` on the execution's trusted parent reads them, and that decision
 /// is audited under the details operation; a caller without it, including one holding only
 /// `verifier:run`, is refused as it is refused the status, and each refusal
 /// is audited as denied.
@@ -3129,14 +3129,14 @@ async fn details_preserve_visibility_and_read_authority() {
     assert_eq!((status, &read), (StatusCode::OK, &details));
     assert_eq!(
         decisions(&server, "verification.execution.details.read", reader).await,
-        vec![("verifier:read".to_owned(), "allowed".to_owned())]
+        vec![("executions:read".to_owned(), "allowed".to_owned())]
     );
 
     server
         .seed_role("vr_run_only", &[Permission::verifier_run_any()])
         .await
         .expect("run-only role seeds");
-    let denied = vec![("verifier:read".to_owned(), "denied".to_owned())];
+    let denied = vec![("executions:read".to_owned(), "denied".to_owned())];
     for (name, roles) in [
         ("vr-visibility-outsider", &[][..]),
         ("vr-visibility-runner", &["vr_run_only"][..]),

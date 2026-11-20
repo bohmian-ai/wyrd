@@ -3025,6 +3025,7 @@ mod tests {
                     delegation_chain: Vec::new(),
                     permission_ceiling: None,
                     exp: chrono::Utc::now() + chrono::Duration::hours(1),
+                    iat: chrono::Utc::now(),
                 },
             ));
             request

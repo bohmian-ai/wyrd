@@ -347,7 +347,11 @@ async fn stable_account_context_cli_journey() {
     // family's runtime account. A credential administrator cannot do the latter.
     let free = principal_id(&succeeded(
         &run(
-            &[&create[..], &["--name", "cli-free", "--role", "viewer"]].concat(),
+            &[
+                &create[..],
+                &["--name", "cli-free", "--grant", "viewer:all"],
+            ]
+            .concat(),
             &admin_token,
         )
         .await,
@@ -527,8 +531,8 @@ async fn principal_user_cli_journey() {
                     "create",
                     "--username",
                     "development",
-                    "--role",
-                    "admin",
+                    "--grant",
+                    "admin:all",
                     "--server",
                     &base_url,
                 ])
@@ -569,8 +573,8 @@ async fn principal_user_cli_journey() {
                 "principal".to_owned(),
                 "user".to_owned(),
                 "invite".to_owned(),
-                "--role".to_owned(),
-                "editor".to_owned(),
+                "--grant".to_owned(),
+                "editor:all".to_owned(),
                 "--server".to_owned(),
                 base_url.clone(),
             ],

@@ -69,6 +69,9 @@ enum KeyState {
 #[derive(Debug, Default)]
 pub struct TenantAuthority {
     revision: i64,
+    /// When this snapshot was compiled. A token issued in or after this
+    /// second may name an account or credential committed after the load.
+    loaded_at: chrono::DateTime<chrono::Utc>,
     accounts: HashMap<Uuid, AccountAuthority>,
     keys: HashMap<Uuid, KeyState>,
     /// Accounts whose stored authority does not decode, with the row naming
@@ -271,6 +274,7 @@ impl TenantAuthority {
         }
         Ok(Self {
             revision: state.revision,
+            loaded_at: chrono::Utc::now(),
             accounts,
             keys,
             corrupt,
@@ -339,12 +343,14 @@ impl TenantAuthority {
             authority = authority.restricted_by(Arc::new(ceiling.clone()));
         }
         if let Some(credential) = subject.credential_id {
-            match self.keys.get(&credential) {
-                Some(KeyState::Inactive) => return None,
-                Some(KeyState::Active(Some(ceiling))) => {
+            // The snapshot holds every stored key, revoked ones included, so
+            // an unknown key was committed after the load: a miss.
+            match self.keys.get(&credential)? {
+                KeyState::Inactive => return None,
+                KeyState::Active(Some(ceiling)) => {
                     authority = authority.restricted_by(Arc::clone(ceiling));
                 }
-                Some(KeyState::Active(None)) | None => {}
+                KeyState::Active(None) => {}
             }
         }
         for step in &verified.delegation_chain {
@@ -427,6 +433,19 @@ impl AuthorityCache {
         if let Some(snapshot) = self.cached(tenant) {
             return Ok(snapshot);
         }
+        self.reload(postgres, tenant).await
+    }
+
+    /// Reloads the tenant's snapshot with one statement and installs it.
+    ///
+    /// # Errors
+    ///
+    /// [`WyrdError::AuthorizationUnavailable`] when the reload fails.
+    async fn reload(
+        &self,
+        postgres: &WyrdPostgres,
+        tenant: DataTenantId,
+    ) -> Result<Arc<TenantAuthority>, WyrdError> {
         let loaded = async {
             let mut conn = postgres.tenant_conn(tenant).await.ok()?;
             let snapshot = TenantAuthority::load(&mut conn).await;
@@ -442,6 +461,13 @@ impl AuthorityCache {
 
     /// Authorizes a verified token against the tenant's current authority.
     ///
+    /// A token issued no earlier than the snapshot's load second may name an
+    /// account, actor or key committed after the load, before this process
+    /// has applied its notification; such a miss reloads once, the
+    /// sanctioned cache-miss statement. An older token refused by the
+    /// snapshot is refused without a reload, so a removed account's tokens
+    /// never cost a statement per request.
+    ///
     /// # Errors
     ///
     /// [`WyrdError::AuthorizationUnavailable`] when no usable snapshot can be
@@ -452,7 +478,14 @@ impl AuthorityCache {
         postgres: &WyrdPostgres,
         verified: &VerifiedToken,
     ) -> Result<Principal, WyrdError> {
-        let snapshot = self.acquire(postgres, verified.principal.tenant_id).await?;
+        let tenant = verified.principal.tenant_id;
+        let mut snapshot = self.acquire(postgres, tenant).await?;
+        if let Some(principal) = snapshot.authorize(verified) {
+            return Ok(principal);
+        }
+        if verified.iat.timestamp() >= snapshot.loaded_at.timestamp() {
+            snapshot = self.reload(postgres, tenant).await?;
+        }
         snapshot
             .authorize(verified)
             .ok_or_else(|| WyrdError::PermissionUnauthenticated {
@@ -628,6 +661,34 @@ mod tests {
         assert!(cache.cached(tenant).is_some());
         cache.age(tenant, FRESHNESS_BOUND + Duration::from_secs(1));
         assert!(cache.cached(tenant).is_none(), "expired freshness refuses");
+    }
+
+    /// A token presenting a key the snapshot does not hold is a miss, never
+    /// an active key without a ceiling: the snapshot holds every stored key,
+    /// revoked ones included, so an unknown key was committed after the load.
+    ///
+    /// # Panics
+    /// Panics when the snapshot authorizes the unknown key or refuses the
+    /// same account without one.
+    #[test]
+    fn an_unknown_key_is_a_miss() {
+        let (tenant, user) = (DataTenantId::new_v7(), Uuid::now_v7());
+        let authority = TenantAuthority::compile(state(1, user)).expect("compiles");
+        let token = |credential: Option<Uuid>| wyrd_auth_verify::VerifiedToken {
+            principal: wyrd_runtime::Principal::new(
+                wyrd_runtime::PrincipalId::new(user),
+                wyrd_runtime::PrincipalKind::User,
+                tenant,
+                wyrd_runtime::permission::PermissionSet::new(),
+            )
+            .with_credential_id(credential),
+            permission_ceiling: None,
+            delegation_chain: Vec::new(),
+            exp: chrono::Utc::now(),
+            iat: chrono::Utc::now(),
+        };
+        assert!(authority.authorize(&token(None)).is_some());
+        assert!(authority.authorize(&token(Some(Uuid::now_v7()))).is_none());
     }
 
     /// A binding whose role operations or scope do not decode makes only its

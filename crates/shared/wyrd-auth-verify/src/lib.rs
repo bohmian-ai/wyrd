@@ -131,6 +131,10 @@ pub struct VerifiedToken {
     pub delegation_chain: Vec<DelegationStep>,
     /// JWT expiry as a UTC timestamp.
     pub exp: DateTime<Utc>,
+    /// JWT issue time as a UTC timestamp, whole seconds. The authority
+    /// cache compares it with its snapshot's load time to tell a token newer
+    /// than the snapshot from one for an account since removed.
+    pub iat: DateTime<Utc>,
 }
 
 /// Token verification settings.
@@ -909,12 +913,17 @@ impl AccessTokenClaims {
             .ok()
             .and_then(|exp| DateTime::<Utc>::from_timestamp(exp, 0))
             .ok_or(AuthError::InvalidToken)?;
+        let iat = i64::try_from(self.iat)
+            .ok()
+            .and_then(|iat| DateTime::<Utc>::from_timestamp(iat, 0))
+            .ok_or(AuthError::InvalidToken)?;
 
         Ok(VerifiedToken {
             principal,
             permission_ceiling: self.permission_ceiling.clone(),
             delegation_chain,
             exp,
+            iat,
         })
     }
 }

@@ -623,8 +623,10 @@ async fn stable_accounts_preserve_execution_identity() {
 struct SignedIn {
     /// Client reading the saved login.
     client: wyrd_ai::WyrdClient,
+    /// The server's human login driver.
+    sso: wyrd_testing::human_login::HumanSso,
     /// Private config home holding the saved login.
-    _config: tempfile::TempDir,
+    config: tempfile::TempDir,
 }
 
 /// Signs `username` in with `password` through the CLI device login, with no
@@ -633,9 +635,6 @@ struct SignedIn {
 /// # Panics
 /// Panics when the login cannot be saved or the client cannot be built.
 async fn signed_in(deployment: &Deployment, username: &str, password: &str) -> SignedIn {
-    use wyrd_ai::config::ClientConfig;
-    use wyrd_ai::environment::Environment;
-    use wyrd_ai::{GlobalConfig, WyrdClient};
     use wyrd_testing::human_login::{FIXTURE_TENANT_SLUG, HumanSso};
 
     let sso = HumanSso::new(
@@ -647,10 +646,27 @@ async fn signed_in(deployment: &Deployment, username: &str, password: &str) -> S
     let config = wyrd_testing::human_login::private_config_home();
     sso.save_local_login(config.path(), FIXTURE_TENANT_SLUG, username, password)
         .await;
+    SignedIn {
+        client: saved_client(deployment, config.path()),
+        sso,
+        config,
+    }
+}
+
+/// A fresh client reading the saved login under `config_home`, holding no
+/// access token of its own.
+///
+/// # Panics
+/// Panics when the client cannot be built.
+fn saved_client(deployment: &Deployment, config_home: &std::path::Path) -> wyrd_ai::WyrdClient {
+    use wyrd_ai::config::ClientConfig;
+    use wyrd_ai::environment::Environment;
+    use wyrd_ai::{GlobalConfig, WyrdClient};
+
     let mut saved = ClientConfig::from_environment(
         Environment::from([(
             "WYRD_CONFIG_HOME",
-            config.path().to_str().expect("UTF-8 config home"),
+            config_home.to_str().expect("UTF-8 config home"),
         )]),
         &GlobalConfig::default(),
         deployment.server().base_url(),
@@ -660,16 +676,14 @@ async fn signed_in(deployment: &Deployment, username: &str, password: &str) -> S
         .server()
         .grpc_url()
         .expect("bound server has a gRPC URL");
-    SignedIn {
-        client: WyrdClient::with_config(saved).expect("client builds"),
-        _config: config,
-    }
+    WyrdClient::with_config(saved).expect("client builds")
 }
 
 /// Viewer bound at the `code-review` Verifier family lets a local User, signed
 /// in through the CLI device login with no identity provider, read that
 /// family and nothing else: the other family is absent from listing and
-/// refused on a direct read.
+/// refused on a direct read. Once Alice changes her password, the saved
+/// login no longer renews.
 ///
 /// # Panics
 /// Panics when a step fails or an outcome differs.
@@ -679,6 +693,7 @@ async fn a_family_bound_viewer_reads_only_that_family() {
     use wyrd_ai::cards::{CardKind, CardSelector, ListCardsRequest};
     use wyrd_spec::auth::CardPermissionScope;
     use wyrd_spec::ids::CardName;
+    use wyrd_testing::human_login::FIXTURE_TENANT_SLUG;
 
     let deployment = Deployment::start().await;
     let cards = deployment.cards().await;
@@ -740,6 +755,32 @@ async fn a_family_bound_viewer_reads_only_that_family() {
         .await
         .expect_err("the other family is hidden");
     assert_eq!(refused.code(), "WYRD_REGISTRY_404_CARD_NOT_FOUND");
+
+    // A changed password ends the saved login at its next renewal.
+    alice
+        .sso
+        .change_local_password(
+            FIXTURE_TENANT_SLUG,
+            "alice",
+            password,
+            "alice changed password",
+        )
+        .await;
+    alice
+        .sso
+        .expire_saved(alice.config.path(), FIXTURE_TENANT_SLUG);
+    let Err(stale) = Cards::connect_with(&saved_client(&deployment, alice.config.path())).await
+    else {
+        panic!("the saved login no longer renews");
+    };
+    assert_eq!(
+        (stale.code(), stale.problem().details["reason"].as_str()),
+        (
+            "WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE",
+            Some("refresh_refused")
+        ),
+        "{stale}"
+    );
     deployment.shutdown().await;
 }
 

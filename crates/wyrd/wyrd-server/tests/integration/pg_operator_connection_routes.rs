@@ -466,7 +466,7 @@ async fn read_write_separation_and_tenant_isolation() {
     custom_role(
         &server,
         "operators_reader",
-        json!([{ "resource": "operators", "action": "read", "scope": "all" }]),
+        json!([{ "resource": "operators", "action": "read" }]),
     )
     .await;
     let (reader_id, reader) = user(&server, "oc-reader", &["operators_reader"]).await;
@@ -494,7 +494,7 @@ async fn read_write_separation_and_tenant_isolation() {
     custom_role(
         &server,
         "cards_reader",
-        json!([{ "resource": "cards", "action": "read", "scope": "all" }]),
+        json!([{ "resource": "cards", "action": "read" }]),
     )
     .await;
     let (_, outsider) = user(&server, "oc-outsider", &["cards_reader"]).await;

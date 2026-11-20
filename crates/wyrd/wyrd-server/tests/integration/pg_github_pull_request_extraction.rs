@@ -168,7 +168,10 @@ impl Deployment {
             .await
             .expect("the tool role seeds");
         let Bootstrap::User { jwt, .. } = server
-            .bootstrap_user("pull-request-editor", &["editor", MODEL_ROLE, TOOL_ROLE])
+            .bootstrap_user(
+                "pull-request-editor",
+                &["editor", "approver", MODEL_ROLE, TOOL_ROLE],
+            )
             .await
             .expect("editor bootstraps")
         else {

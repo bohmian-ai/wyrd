@@ -268,7 +268,7 @@ fn occurrence_status<'a>(served: &'a Value, step: &str) -> &'a Value {
 /// occurrence. Publishing `ci` resumes it, but it still waits for the
 /// approval alone. A viewer, a person allowed to approve only another
 /// Verifier, and another tenant cannot decide; an unknown occurrence is not
-/// found. An editor approves with a reason and receives the durable receipt;
+/// found. An approver approves with a reason and receives the durable receipt;
 /// the same request replays it, while a different decision or decider is
 /// refused as not pending. The execution passes under its original id and
 /// inspection shows who approved. A second pull request is rejected by a
@@ -374,7 +374,9 @@ async fn a_pending_approval_is_decided_once_and_resumes_the_same_execution() {
     assert_eq!(status, StatusCode::NOT_FOUND, "{refused}");
     assert_eq!(refused["code"], "WYRD_VERIFICATION_404_APPROVAL_NOT_FOUND");
 
-    let (approver, approver_jwt) = deployment.user("approval-editor", &["editor"]).await;
+    let (approver, approver_jwt) = deployment
+        .user("approval-editor", &["approver", "viewer"])
+        .await;
     let (status, receipt) = deployment
         .decide(&approver_jwt, execution, &approval, &approve)
         .await;
@@ -428,6 +430,18 @@ async fn a_pending_approval_is_decided_once_and_resumes_the_same_execution() {
             Some(&PermissionScope::Card(verifier)),
         )
         .await;
+    deployment
+        .server
+        .grant_role_at(
+            &Bootstrap::User {
+                id: wyrd_spec::auth::PrincipalId::new(scoped),
+                jwt: scoped_jwt.clone(),
+            },
+            "viewer",
+            &PermissionScope::All,
+        )
+        .await
+        .expect("the scoped approver reads the parent");
     let rejected = deployment.open(2, H2).await;
     deployment.until(rejected, "waiting").await;
     let (status, receipt) = deployment.publish_ci(H2, json!({"status": "green"})).await;
@@ -507,7 +521,9 @@ async fn an_approval_expires_with_its_execution() {
     assert_ne!(first, second, "each execution has its own occurrence");
     deployment.until(current, "timed_out").await;
 
-    let (_, approver) = deployment.user("approval-late", &["editor"]).await;
+    let (_, approver) = deployment
+        .user("approval-late", &["approver", "viewer"])
+        .await;
     for (execution, approval) in [(superseded, &first), (current, &second)] {
         let served = deployment.status(execution).await;
         let expired = occurrence(&served);
@@ -916,7 +932,7 @@ async fn a_cold_decision_needs_only_its_own_connection() {
             .await
             .expect("server restarts");
     let Bootstrap::User { jwt, .. } = server
-        .bootstrap_user("pull-request-editor-again", &["editor"])
+        .bootstrap_user("pull-request-editor-again", &["approver", "viewer"])
         .await
         .expect("editor bootstraps")
     else {
@@ -946,7 +962,7 @@ async fn a_cold_decision_needs_only_its_own_connection() {
 
 /// A service account deciding on a user's behalf is the decision's actor.
 ///
-/// A user delegates to an `editor` Service rooted at its own Card, whose Card
+/// A user delegates to an approving Service rooted at its own Card, whose Card
 /// scope does not carry the Repository subject; the delegated token approves,
 /// and the receipt and inspection name the Service as the actor. The same
 /// delegated request replays the receipt, while the user directly and a second
@@ -965,11 +981,13 @@ async fn a_service_account_decides_on_a_users_behalf() {
         .expect("approval id")
         .to_owned();
 
-    let (_, user_jwt) = deployment.user("approval-delegator", &["editor"]).await;
+    let (_, user_jwt) = deployment
+        .user("approval-delegator", &["approver", "viewer"])
+        .await;
     let on_behalf = async |name: &str| {
         let actor = deployment
             .server
-            .bootstrap_service(name, &["editor"])
+            .bootstrap_service(name, &["approver", "viewer"])
             .await
             .expect("actor Service bootstraps");
         let actor_jwt = deployment

@@ -4712,7 +4712,7 @@ async fn runtime_activity_follows_only_qualifying_exchanges() {
                 .uri("/v1/principals")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
-                    json!({ "name": "vb-automation", "roles": ["editor"] }).to_string(),
+                    json!({ "name": "vb-automation", "assignments": [{ "role": "editor", "scope": "all" }] }).to_string(),
                 ))
                 .expect("automation request builds"),
         )

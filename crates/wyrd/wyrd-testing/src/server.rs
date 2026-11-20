@@ -100,8 +100,7 @@ use wyrd_sql::queries::auth::{
     SubjectColumns, TrustedIssuerWrite, advance_authorization_revision, delete_role_binding,
     family_account_id, insert_api_key, insert_role_binding, insert_service_account,
     insert_trusted_issuer, insert_user, list_role_bindings, provision_system_principal,
-    replace_idp_user_bindings, role_by_name, tenant_admin_principal_id, trusted_issuer_by_url,
-    workload_binding_by_subject,
+    role_by_name, tenant_admin_principal_id, trusted_issuer_by_url, workload_binding_by_subject,
 };
 use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
 use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
@@ -2030,7 +2029,9 @@ impl WyrdTestServer {
     ///
     /// It is the same context the public query service builds, except that its
     /// principal is the fixed [`AUDIT_INSPECTION_PRINCIPAL`], which is what lets
-    /// a retained read exclude the decisions inspection itself commits.
+    /// a retained read exclude the decisions inspection itself commits. It
+    /// reads every parent's managed verification rows, so inspection sees the
+    /// whole tenant's retained evidence.
     ///
     /// # Errors
     /// Returns the tenant invariant error when the principal and tenant disagree.
@@ -2043,7 +2044,10 @@ impl WyrdTestServer {
             PrincipalId::new(AUDIT_INSPECTION_PRINCIPAL),
             wyrd_runtime::PrincipalKind::User,
             tenant,
-            wyrd_runtime::permission::PermissionSet::from_iter([permission.clone()]),
+            wyrd_runtime::permission::PermissionSet::from_iter([
+                permission.clone(),
+                Permission::executions_read_any(),
+            ]),
         );
         vala_bifrost_redux::oracle::AuthorizedQueryContext::try_new(
             principal,
@@ -3184,9 +3188,10 @@ impl WyrdTestServer {
             .await
     }
 
-    /// Bootstrap a user principal of `tenant_id` holding tenant-wide
-    /// provider-sourced `roles` through fixture SQL, signed in through the
-    /// production login grant.
+    /// Bootstrap a user principal of `tenant_id` holding provider-sourced
+    /// `roles` through fixture SQL, signed in through the production login
+    /// grant. A role [`Self::seed_role`] seeded binds at its seeded scopes,
+    /// any other tenant-wide.
     ///
     /// # Errors
     /// Returns an error when SQL writes or test JWT minting fail.
@@ -3207,14 +3212,24 @@ impl WyrdTestServer {
         )
         .await
         .map_err(sql)?;
-        // A signed-in User's roles come from its identity provider; an unknown
-        // role is a fixture error, never silently dropped.
+        // A signed-in User's roles come from its identity provider, each bound
+        // at the scopes it was seeded with; an unknown role is a fixture
+        // error, never silently dropped.
         for role in roles {
-            lookup_role_id(&mut conn, role).await?;
+            for (part, scope) in seeded_role_bindings(tenant_id, role) {
+                let role_id = lookup_role_id(&mut conn, &part).await?;
+                insert_role_binding(
+                    &mut conn,
+                    Uuid::now_v7(),
+                    role_id,
+                    subject_columns(user_id, PrincipalTable::User),
+                    &scope,
+                    RoleSource::Idp,
+                )
+                .await
+                .map_err(sql)?;
+            }
         }
-        replace_idp_user_bindings(&mut conn, user_id, roles)
-            .await
-            .map_err(sql)?;
         advance_authorization_revision(&mut conn)
             .await
             .map_err(sql)?;

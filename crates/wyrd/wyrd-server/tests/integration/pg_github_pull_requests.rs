@@ -150,7 +150,7 @@ impl Deployment {
             .expect("bound test server starts");
         Self::connect(&server, &mock).await;
         let Bootstrap::User { jwt, .. } = server
-            .bootstrap_user("pull-request-editor", &["editor"])
+            .bootstrap_user("pull-request-editor", &["editor", "approver"])
             .await
             .expect("editor bootstraps")
         else {
@@ -2020,12 +2020,13 @@ async fn read_as(deployment: &Deployment, jwt: &str, uri: &str) -> (StatusCode, 
 }
 
 /// Inspecting a PR execution, and its sibling progress read, needs
-/// repository read as well as `verifier:read`, also once the queue row is
-/// gone and only the accepted state remains.
+/// `executions:read` on its trusted parent, the Repository: the same grant
+/// on the shared Verifier is refused, also once the queue row is gone and
+/// only the accepted state remains.
 ///
 /// # Panics
-/// Panics when a caller without `cards:read` reads a PR execution, or one
-/// holding both is refused.
+/// Panics when a caller reading only the Verifier reads a PR execution, or
+/// one reading the Repository is refused.
 #[tokio::test(flavor = "multi_thread")]
 async fn pull_request_inspection_requires_repository_read() {
     use wyrd_runtime::Permission;
@@ -2037,8 +2038,25 @@ async fn pull_request_inspection_requires_repository_read() {
         .set_pull_request(REPOSITORY, 30, PullRequest::open(REPOSITORY, "b1", "i1"));
     assert_eq!(deployment.send(30, "opened").await.0, StatusCode::ACCEPTED);
     let execution = deployment.settled(30..=30).await[0].execution_id;
+    let verifier = {
+        let mut conn = deployment.conn().await;
+        let (uid,): (Uuid,) = sqlx::query_as(
+            "SELECT verifier_card_uid FROM wyrd.verifier_executions WHERE execution_id = $1",
+        )
+        .bind(execution)
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("execution reads");
+        let uid = wyrd_spec::ids::CardUid::from_uuid(uid).expect("card uid");
+        let mut scopes =
+            wyrd_sql::queries::cards::card_scopes(&mut conn, std::slice::from_ref(&uid))
+                .await
+                .expect("scope reads");
+        conn.commit().await.expect("read commits");
+        scopes.remove(&uid).expect("the Verifier is registered")
+    };
     server
-        .seed_role("pr_verifier_only", &[Permission::executions_read_any()])
+        .seed_role("pr_verifier_only", &[Permission::executions_read(verifier)])
         .await
         .expect("role seeds");
     server
@@ -2726,8 +2744,9 @@ fn of<'r>(retained: &'r [Retained], generation: &Value) -> Vec<&'r Retained> {
 /// it; the current set is the one with the latest PostgreSQL observation
 /// time its records carry, whatever order they are read in, and every
 /// earlier set keeps its complete membership; a time bound selects history
-/// before it. A caller without the table is refused before any row or
-/// count, and another tenant's reader sees none of them.
+/// before it. A caller with no read is refused before any row or count, a
+/// reader of another Repository family sees none of them and counts none,
+/// and another tenant's reader sees none of them.
 ///
 /// # Panics
 /// Panics when visibility is reported complete early, latest regresses,
@@ -2861,63 +2880,68 @@ async fn retained_reads_resolve_current_and_history_membership() {
         "a bound before the current set selects only history"
     );
 
-    let elsewhere = wyrd_runtime::Permission {
-        scope: wyrd_runtime::PermissionScope::Bifrost(
-            wyrd_runtime::BifrostPermissionScope::Schema(wyrd_runtime::BifrostSchemaScope {
-                catalog: "bifrost".to_owned(),
-                schema: "logs".to_owned(),
-            }),
-        ),
-        ..wyrd_runtime::Permission::bifrost_query_read()
+    let refusal = |error: wyrd_client::bifrost::BifrostClientError| match error {
+        wyrd_client::bifrost::BifrostClientError::Transport(error) => error.code().to_owned(),
+        other => format!("{other:?}"),
     };
-    for (role, query, code) in [
-        (
-            "pull_request_blind",
-            None,
-            "WYRD_PERMISSION_403_DENIED_RBAC",
-        ),
-        (
-            "pull_request_elsewhere",
-            Some(elsewhere),
-            "WYRD_VALA_403_QUERY_FORBIDDEN",
-        ),
-    ] {
-        let mut grants = vec![
-            wyrd_runtime::Permission::card_read(),
-            wyrd_runtime::Permission::executions_read_any(),
-        ];
-        grants.extend(query);
+    let reader_of = |name: &'static str, grants: Vec<wyrd_runtime::Permission>| {
+        let server = &deployment.server;
+        async move {
+            server.seed_role(name, &grants).await.expect("role seeds");
+            let Bootstrap::User { jwt, .. } = server
+                .bootstrap_user(&name.replace('_', "-"), &[name])
+                .await
+                .expect("reader bootstraps")
+            else {
+                panic!("user bootstrap returned a non-user principal");
+            };
+            jwt
+        }
+    };
+    let counted = |jwt: String| {
+        let base = deployment.base().to_owned();
+        async move {
+            Bifrost::query_only(&client(&base, &jwt))
+                .sql_as::<Value>(
+                    "SELECT count(*) AS members FROM bifrost.verification.execution_inputs",
+                    &[],
+                )
+                .await
+        }
+    };
+
+    // A caller with no read is refused before any row or count.
+    let blind = reader_of("pull_request_blind", Vec::new()).await;
+    let members = deployment
+        .history_as(&blind, 51, "TRUE")
+        .await
+        .expect_err("membership is refused");
+    assert_eq!(refusal(members), "WYRD_PERMISSION_403_DENIED_RBAC");
+    let refused = counted(blind).await.expect_err("counts are refused");
+    assert_eq!(refusal(refused), "WYRD_PERMISSION_403_DENIED_RBAC");
+
+    // A reader of another Repository family sees no membership and counts none.
+    let other_family =
+        wyrd_runtime::PermissionScope::Card(wyrd_runtime::CardPermissionScope::family(
+            wyrd_spec::envelope::CardKind::Repository,
+            wyrd_spec::ids::CardName::new("other").expect("name"),
+        ));
+    let elsewhere = reader_of(
+        "pull_request_elsewhere",
+        vec![wyrd_runtime::Permission::card_read().at(other_family)],
+    )
+    .await;
+    assert!(
         deployment
-            .server
-            .seed_role(role, &grants)
+            .history_as(&elsewhere, 51, "TRUE")
             .await
-            .expect("role seeds");
-        let Bootstrap::User { jwt, .. } = deployment
-            .server
-            .bootstrap_user(&role.replace('_', "-"), &[role])
-            .await
-            .expect("reader bootstraps")
-        else {
-            panic!("user bootstrap returned a non-user principal");
-        };
-        let refusal = |error: wyrd_client::bifrost::BifrostClientError| match error {
-            wyrd_client::bifrost::BifrostClientError::Transport(error) => error.code().to_owned(),
-            other => format!("{other:?}"),
-        };
-        let members = deployment
-            .history_as(&jwt, 51, "TRUE")
-            .await
-            .expect_err("membership is refused");
-        assert_eq!(refusal(members), code, "{role}");
-        let counted = Bifrost::query_only(&client(deployment.base(), &jwt))
-            .sql_as::<Value>(
-                "SELECT count(*) AS members FROM bifrost.verification.execution_inputs",
-                &[],
-            )
-            .await
-            .expect_err("counts are refused");
-        assert_eq!(refusal(counted), code, "{role}");
-    }
+            .expect("another family's history reads")
+            .is_empty()
+    );
+    assert_eq!(
+        counted(elsewhere).await.expect("another family counts"),
+        [json!({"members": 0})]
+    );
 
     let other = deployment
         .server

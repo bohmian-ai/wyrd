@@ -6279,7 +6279,7 @@ async fn only_associated_account_activity_activates_exact_root() {
         "/v1/principals",
         Some(serde_json::json!({
             "name": "fam-runtime-next",
-            "roles": ["editor"],
+            "assignments": [{ "role": "editor", "scope": "all" }],
             "workload_restriction": { "mode": "family", "kind": "Service", "name": "fam" },
         })),
     )

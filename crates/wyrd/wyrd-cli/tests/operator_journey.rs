@@ -203,8 +203,8 @@ async fn operator_administers_a_deployment_through_the_cli() {
         "create-principal".to_owned(),
         "--name".to_owned(),
         "cli-runner".to_owned(),
-        "--role".to_owned(),
-        "viewer".to_owned(),
+        "--grant".to_owned(),
+        "viewer:all".to_owned(),
     ];
     arguments.extend(endpoint());
     let principal = succeeded(

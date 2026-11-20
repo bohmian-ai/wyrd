@@ -832,7 +832,7 @@ async fn a_tenant_rotates_an_automation_credential_without_an_outage() {
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "ci-runner", "roles": ["viewer"] })),
+                Some(json!({ "name": "ci-runner", "assignments": [{ "role": "viewer", "scope": "all" }] })),
             ),
         )
         .await
@@ -986,7 +986,7 @@ async fn replaying_a_revoke_does_not_disturb_the_surviving_credential() {
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "ci-runner", "roles": ["viewer"] })),
+                Some(json!({ "name": "ci-runner", "assignments": [{ "role": "viewer", "scope": "all" }] })),
             ),
         )
         .await
@@ -1225,7 +1225,7 @@ async fn a_credential_cannot_be_revoked_through_another_principal() {
                 tenant_request(
                     Method::POST,
                     "/v1/principals",
-                    Some(json!({ "name": name, "roles": ["viewer"] })),
+                    Some(json!({ "name": name, "assignments": [{ "role": "viewer", "scope": "all" }] })),
                 ),
             )
             .await
@@ -1305,7 +1305,7 @@ async fn automation_cannot_escalate_itself_to_an_administrator() {
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "ci-runner", "roles": ["viewer"] })),
+                Some(json!({ "name": "ci-runner", "assignments": [{ "role": "viewer", "scope": "all" }] })),
             ),
         )
         .await
@@ -1323,7 +1323,7 @@ async fn automation_cannot_escalate_itself_to_an_administrator() {
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "escalated", "roles": ["admin"] })),
+                Some(json!({ "name": "escalated", "assignments": [{ "role": "admin", "scope": "all" }] })),
             ),
         )
         .await
@@ -2834,7 +2834,7 @@ async fn a_tenant_revokes_a_compromised_principal_with_its_reason() {
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "leaked-runner", "roles": ["viewer"] })),
+                Some(json!({ "name": "leaked-runner", "assignments": [{ "role": "viewer", "scope": "all" }] })),
             ),
         )
         .await
@@ -3126,7 +3126,7 @@ async fn recovery_is_refused_for_every_state_but_active() {
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "post-recovery", "roles": ["viewer"] })),
+                Some(json!({ "name": "post-recovery", "assignments": [{ "role": "viewer", "scope": "all" }] })),
             ),
         )
         .await
@@ -3195,7 +3195,7 @@ async fn one_tenant_cannot_reach_another_tenants_identities() {
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "beta-runner", "roles": ["viewer"] })),
+                Some(json!({ "name": "beta-runner", "assignments": [{ "role": "viewer", "scope": "all" }] })),
             ),
         )
         .await
@@ -3291,7 +3291,7 @@ async fn one_tenant_cannot_reach_another_tenants_identities() {
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "escalated", "roles": ["admin"] })),
+                Some(json!({ "name": "escalated", "assignments": [{ "role": "admin", "scope": "all" }] })),
             ),
         )
         .await
@@ -3413,7 +3413,7 @@ async fn an_operator_suspends_and_resumes_a_tenant_through_the_platform_plane() 
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "before-suspension", "roles": ["viewer"] })),
+                Some(json!({ "name": "before-suspension", "assignments": [{ "role": "viewer", "scope": "all" }] })),
             ),
         )
         .await
@@ -3451,7 +3451,7 @@ async fn an_operator_suspends_and_resumes_a_tenant_through_the_platform_plane() 
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "during-suspension", "roles": ["viewer"] })),
+                Some(json!({ "name": "during-suspension", "assignments": [{ "role": "viewer", "scope": "all" }] })),
             ),
         )
         .await
@@ -3491,7 +3491,7 @@ async fn an_operator_suspends_and_resumes_a_tenant_through_the_platform_plane() 
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "after-resume", "roles": ["viewer"] })),
+                Some(json!({ "name": "after-resume", "assignments": [{ "role": "viewer", "scope": "all" }] })),
             ),
         )
         .await
@@ -3593,9 +3593,9 @@ async fn every_durable_provisioning_stage_fails_closed_and_retries_clean() {
         ),
         (
             "grant",
-            "CREATE TRIGGER fail_stage BEFORE INSERT ON wyrd.auth_service_account_roles
+            "CREATE TRIGGER fail_stage BEFORE INSERT ON wyrd.auth_role_bindings
              FOR EACH ROW EXECUTE FUNCTION wyrd.injected_stage_failure('stage-grant')",
-            "DROP TRIGGER fail_stage ON wyrd.auth_service_account_roles",
+            "DROP TRIGGER fail_stage ON wyrd.auth_role_bindings",
         ),
         (
             "credential",
@@ -3698,7 +3698,7 @@ async fn every_durable_provisioning_stage_fails_closed_and_retries_clean() {
         let counts: (i64, i64, i64, i64) = sqlx::query_as(
             "SELECT (SELECT count(*) FROM wyrd.auth_service_accounts
                       WHERE data_tenant_id = $1 AND principal_kind <> 'system'),
-                    (SELECT count(*) FROM wyrd.auth_service_account_roles WHERE data_tenant_id = $1),
+                    (SELECT count(*) FROM wyrd.auth_role_bindings WHERE data_tenant_id = $1 AND service_account_id IS NOT NULL),
                     (SELECT count(*) FROM wyrd.auth_api_keys
                       WHERE data_tenant_id = $1 AND revoked_at IS NULL),
                     (SELECT count(*) FROM wyrd.auth_service_accounts
@@ -4234,7 +4234,7 @@ async fn an_uninitialized_deployment_serves_tenants_and_refuses_the_platform_pla
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "unaffected", "roles": ["viewer"] })),
+                Some(json!({ "name": "unaffected", "assignments": [{ "role": "viewer", "scope": "all" }] })),
             ),
         )
         .await
@@ -4697,7 +4697,9 @@ async fn an_authorized_request_that_changes_nothing_still_records_the_decision()
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "roleless", "roles": ["absent_role"] })),
+                Some(
+                    json!({ "name": "roleless", "assignments": [{ "role": "absent_role", "scope": "all" }] }),
+                ),
             ),
             StatusCode::BAD_REQUEST,
             "creating a principal with a role that does not exist",

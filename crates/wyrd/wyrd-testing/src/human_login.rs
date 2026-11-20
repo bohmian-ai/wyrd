@@ -250,6 +250,44 @@ impl HumanSso {
             .device_authorization(&tenant)
             .await
             .expect("the device login begins");
+        let (browser, cookie) = self.password_session(&tenant, username, password).await;
+        let approved = browser
+            .post(format!("{}/auth/device", self.server))
+            .header(reqwest::header::ORIGIN, HUMAN_PUBLIC_ORIGIN)
+            .header(reqwest::header::COOKIE, cookie)
+            .form(&[
+                ("tenant", tenant.as_str()),
+                ("user_code", device.user_code().secret()),
+                ("decision", "approve"),
+            ])
+            .send()
+            .await
+            .expect("verification page answers");
+        let status = approved.status();
+        let page = approved.text().await.unwrap_or_default();
+        assert_eq!(
+            status,
+            reqwest::StatusCode::OK,
+            "local approval answered {status}: {page}"
+        );
+        self.exchange
+            .device_access_token(&device)
+            .await
+            .expect("the device code redeems")
+    }
+
+    /// Sign the local User `username` in to `tenant` with `password` through
+    /// the browser password route; returns the browser and its session
+    /// cookie pair.
+    ///
+    /// # Panics
+    /// Panics when the client cannot be built or the login is refused.
+    async fn password_session(
+        &self,
+        tenant: &TenantSlug,
+        username: &str,
+        password: &str,
+    ) -> (reqwest::Client, String) {
         let browser = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .default_headers(forwarded_host())
@@ -284,29 +322,42 @@ impl HumanSso {
             })
             .expect("password login sets a session cookie")
             .to_owned();
-        let approved = browser
-            .post(format!("{}/auth/device", self.server))
+        (browser, cookie)
+    }
+
+    /// Change the local User `username`'s password in `tenant` from
+    /// `current` to `new` through the browser password routes, as the
+    /// account page does.
+    ///
+    /// # Panics
+    /// Panics when the sign-in or the change is refused.
+    pub async fn change_local_password(
+        &self,
+        tenant: &str,
+        username: &str,
+        current: &str,
+        new: &str,
+    ) {
+        let tenant: TenantSlug = tenant.parse().expect("tenant route key parses");
+        let (browser, cookie) = self.password_session(&tenant, username, current).await;
+        let changed = browser
+            .post(format!("{}/auth/browser/password/change", self.server))
             .header(reqwest::header::ORIGIN, HUMAN_PUBLIC_ORIGIN)
             .header(reqwest::header::COOKIE, cookie)
-            .form(&[
-                ("tenant", tenant.as_str()),
-                ("user_code", device.user_code().secret()),
-                ("decision", "approve"),
-            ])
+            .json(&serde_json::json!({
+                "tenant": tenant.as_str(),
+                "current_password": current,
+                "new_password": new,
+            }))
             .send()
             .await
-            .expect("verification page answers");
-        let status = approved.status();
-        let page = approved.text().await.unwrap_or_default();
-        assert_eq!(
-            status,
-            reqwest::StatusCode::OK,
-            "local approval answered {status}: {page}"
+            .expect("password change answers");
+        let status = changed.status();
+        assert!(
+            status.is_success(),
+            "password change answered {status}: {}",
+            changed.text().await.unwrap_or_default()
         );
-        self.exchange
-            .device_access_token(&device)
-            .await
-            .expect("the device code redeems")
     }
 
     /// Log the local User `username` in to `tenant` through the CLI device

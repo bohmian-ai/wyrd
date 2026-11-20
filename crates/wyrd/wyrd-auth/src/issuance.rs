@@ -450,6 +450,7 @@ pub async fn select_request_root(
         permission_ceiling: verified.permission_ceiling.clone(),
         delegation_chain: verified.delegation_chain.clone(),
         exp: verified.exp,
+        iat: verified.iat,
     }))
 }
 

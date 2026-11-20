@@ -13,46 +13,26 @@ use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use axum::routing::{get, post};
-use chrono::Duration;
 use tower::ServiceExt;
-use wyrd_auth_verify::TokenPrincipalRef;
-use wyrd_runtime::PrincipalId;
 
 use wyrd_server::config::{ScribeRuntimeConfig, ServerTarget, WyrdServerConfig};
 use wyrd_server::state::LimitsConfig;
 use wyrd_server::{AppState, WyrdServer};
-use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::PrincipalKindTag;
 use wyrd_testing::WyrdTestServer;
 
-/// Mint a user access token from the composed server's issuing key.
+/// The access token of a fresh signed-in User holding no role.
 ///
 /// # Panics
-/// Panics when the composed state has no issuing key or minting fails.
-fn mint_user_jwt(state: &AppState, tenant: DataTenantId) -> String {
-    let principal = TokenPrincipalRef {
-        id: PrincipalId::new(uuid::Uuid::now_v7()),
-        kind: PrincipalKindTag::User,
-        tenant_id: tenant,
-    };
-    state
-        .auth
-        .issuing_key
-        .as_ref()
-        .expect("composed server carries an issuing key")
-        .issue_access_token(
-            wyrd_auth_issue::AccessGrant {
-                principal,
-                permission_ceiling: None,
-                card_access: wyrd_spec::auth::CardAccess::AnyRegistered,
-                workload_uid: None,
-                credential_id: None,
-                act: None,
-                audience: wyrd_spec::auth::TokenAudience::Wyrd,
-            },
-            Duration::minutes(5),
-        )
-        .expect("test jwt mints")
+/// Panics when the bootstrap fails or returns a machine principal.
+async fn user_jwt(server: &WyrdTestServer) -> String {
+    match server
+        .bootstrap_user(&format!("merge-{}", uuid::Uuid::now_v7()), &[])
+        .await
+        .expect("user bootstraps")
+    {
+        wyrd_testing::Bootstrap::User { jwt, .. } => jwt,
+        wyrd_testing::Bootstrap::Machine { .. } => panic!("user bootstrap returned a machine"),
+    }
 }
 
 /// A handler that always panics, used to prove the catch-panic layer converts
@@ -120,7 +100,7 @@ async fn extension_panic_maps_to_500() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
-    let token = mint_user_jwt(server.state(), server.data_tenant_id());
+    let token = user_jwt(&server).await;
     let router = protected_server(server.state().clone())
         .merge_http_protected(probe_router())
         .into_http_router();
@@ -200,7 +180,7 @@ async fn pg_scribe_body_limit_is_route_and_role_local() {
         "resource composition freezes the selected Scribe request maximum"
     );
 
-    let token = mint_user_jwt(server.state(), server.data_tenant_id());
+    let token = user_jwt(&server).await;
     let router = protected_server(server.state().clone())
         .merge_http_protected(probe_router())
         .into_http_router();

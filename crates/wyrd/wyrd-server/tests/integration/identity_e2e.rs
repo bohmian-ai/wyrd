@@ -3545,7 +3545,7 @@ async fn tenant_connection_session_cutoff_journey() {
                       WHERE principal_id = $1::uuid),
                     (SELECT count(*) FROM wyrd.auth_browser_sessions
                       WHERE principal_id = $1::uuid),
-                    (SELECT count(*) FROM wyrd.auth_user_roles WHERE user_id = $1::uuid)",
+                    (SELECT count(*) FROM wyrd.auth_role_bindings WHERE user_id = $1::uuid)",
         )
         .bind(&principal)
         .fetch_one(&superuser)
@@ -3680,7 +3680,7 @@ async fn user_role_count(srv: &WyrdTestServer, principal_id: &str) -> i64 {
         .pg_fixture()
         .superuser_pool()
         .expect("superuser pool opens");
-    sqlx::query_scalar("SELECT count(*) FROM wyrd.auth_user_roles WHERE user_id = $1::uuid")
+    sqlx::query_scalar("SELECT count(*) FROM wyrd.auth_role_bindings WHERE user_id = $1::uuid")
         .bind(principal_id)
         .fetch_one(&superuser)
         .await
@@ -4408,7 +4408,7 @@ async fn tenant_callback_refusal_journey() {
     let persisted: (i64, i64, i64, i64, i64) = sqlx::query_as(
         "SELECT (SELECT count(*) FROM wyrd.auth_users WHERE data_tenant_id = $1), \
                 (SELECT count(*) FROM wyrd.auth_user_identities WHERE data_tenant_id = $1), \
-                (SELECT count(*) FROM wyrd.auth_user_roles WHERE data_tenant_id = $1), \
+                (SELECT count(*) FROM wyrd.auth_role_bindings WHERE data_tenant_id = $1 AND user_id IS NOT NULL), \
                 (SELECT count(*) FROM wyrd.auth_refresh_tokens WHERE data_tenant_id = $1), \
                 (SELECT count(*) FROM wyrd.auth_browser_sessions WHERE data_tenant_id = $1)",
     )

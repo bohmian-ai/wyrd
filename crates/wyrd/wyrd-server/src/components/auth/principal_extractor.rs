@@ -228,6 +228,7 @@ mod pg_tests {
             permission_ceiling: None,
             delegation_chain: Vec::new(),
             exp: chrono::Utc::now() + chrono::Duration::minutes(5),
+            iat: chrono::Utc::now(),
         }));
         // No token header — fallback path would reject with Unauthenticated;
         // extension hit must short-circuit and return the stored principal.

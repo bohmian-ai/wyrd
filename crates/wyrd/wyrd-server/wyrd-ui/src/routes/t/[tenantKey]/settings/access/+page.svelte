@@ -9,6 +9,7 @@
   import type { CardTypes } from 'wyrd-ai';
   import { OPERATIONS, operationName, scopeLabel } from '$lib/access';
   import { guidance } from '$lib/Entry.svelte';
+  import AccessRequest from '$lib/AccessRequest.svelte';
   import GrantFields from './GrantFields.svelte';
   import type { PageProps } from './$types';
   let { data, form }: PageProps = $props();
@@ -120,6 +121,7 @@
       <p>Access administration is for tenant administrators. Ask one to grant what you need.</p>
       <code>{data.problem.code}</code>
     </div>
+    <AccessRequest action="Administer access" />
   {:else if data.problem || !access}
     <div class="app-problem" data-state="error">
       <strong>✕ Access administration is unavailable</strong>

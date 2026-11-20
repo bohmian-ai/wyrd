@@ -83,6 +83,17 @@ export function scopeLabel(scope: Scope): string {
   return `Built-in tool ${scope.tool}`;
 }
 
+/**
+ * Whether a failed load, or a loaded panel whose result failed, is one an
+ * administrator's grant could resolve: a refusal or a not-found, which the
+ * server keeps alike for a hidden target. An unavailable server or an invalid
+ * request is not.
+ */
+export function requestable(loaded: { readonly code: string } | { readonly result: object }): boolean {
+  const problem = 'code' in loaded ? loaded : 'problem' in loaded.result ? loaded.result.problem : null;
+  return typeof problem === 'object' && problem !== null && 'code' in problem && typeof problem.code === 'string' && /_40[34]_/.test(problem.code);
+}
+
 /** What a copied access request names: who asks, where, for what, and the link or identifier they supplied. */
 export interface AccessRequest {
   /** The signed-in account's display name. */

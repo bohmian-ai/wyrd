@@ -5,6 +5,8 @@
   selection. A row opens its exact execution page.
 -->
 <script lang="ts">
+  import { requestable } from '$lib/access';
+  import AccessRequest from '$lib/AccessRequest.svelte';
   import { goto } from '$app/navigation';
   import { EmptyState, RecordTable, RepositoryPolicy, type ActionIntent, type ActionState, type CardRef } from 'wyrd-ai-ui';
   import { validateIntent, type ComponentName } from 'wyrd-ai-ui/loaders';
@@ -60,6 +62,7 @@
       </section>
     {/if}
   {/if}
+  {#if requestable(data.policy)}<AccessRequest action="Read this Repository" />{/if}
 </div>
 
 <style>

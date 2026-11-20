@@ -5,6 +5,8 @@
   and the page always shows the connection as the server reads it back.
 -->
 <script lang="ts">
+  import { requestable } from '$lib/access';
+  import AccessRequest from '$lib/AccessRequest.svelte';
   import { goto, invalidateAll } from '$app/navigation';
   import { EmptyState, GithubIntegration, type ActionIntent, type ActionState, type CardRef, type Problem } from 'wyrd-ai-ui';
   import { validateIntent } from 'wyrd-ai-ui/loaders';
@@ -51,6 +53,7 @@
   {:else}
     <GithubIntegration {...data.github} {actions} {onaction} />
   {/if}
+  {#if requestable(data.github)}<AccessRequest action="Configure the GitHub connection" />{/if}
 </div>
 
 <style>

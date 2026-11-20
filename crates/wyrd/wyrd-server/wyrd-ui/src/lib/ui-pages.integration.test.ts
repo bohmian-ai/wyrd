@@ -2635,7 +2635,7 @@ async function chooseFamilyGrant(form: ReturnType<Page['locator']>, role: string
   await form.getByLabel('Card name').fill(name);
 }
 
-connected('an administrator gives Alice payments access in Settings, and her browser, CLI login and SDK see only payments', async ({ server }) => {
+connected('Alice is given payments in Settings and sees only payments in her browser, CLI and SDK, then gains and loses ledger without signing in again', async ({ server }) => {
   const github = server.githubApp;
   github.addInstallation(101, [
     { id: 1, fullName: 'acme/payments' },
@@ -2754,6 +2754,54 @@ connected('an administrator gives Alice payments access in Settings, and her bro
     const hers = await Cards.connect({ client: WyrdClient.connect() });
     expect((await hers.list({ kind: 'Repository' })).items.map((card) => card.name)).toEqual(['payments']);
     await expect(hers.get(ledger)).rejects.toMatchObject({ code: 'WYRD_REGISTRY_404_CARD_NOT_FOUND' });
+
+    // Alice follows a link to ledger. The page offers a request to copy: her account, the tenant, the action and the link she opened. Copying sends nothing.
+    await her.context().grantPermissions(['clipboard-read', 'clipboard-write']);
+    const copied = async (url: string) => {
+      await her.goto(url);
+      const sent: string[] = [];
+      // The page's own static script and style files may still be loading; anything else would be a message leaving the browser.
+      const record = (request: { url(): string }) => request.url().includes('/_app/immutable/') || sent.push(request.url());
+      her.on('request', record);
+      await her.getByRole('button', { name: 'Copy access request' }).click();
+      await expect.poll(() => her.getByRole('button', { name: 'Copied' }).count()).toBe(1);
+      her.off('request', record);
+      expect(sent).toEqual([]);
+      return her.evaluate(() => navigator.clipboard.readText());
+    };
+    const request = (target: string) =>
+      ['Wyrd access request', 'Account: alice', `Tenant: ${tenant}`, 'Requested action: Read this Repository', `Target: ${target}`, 'Please grant this in Settings → Access, or tell me if the target is wrong.'].join('\n');
+    const ledgerUrl = `${base}/repositories/ledger?version=${ledger.version}`;
+    expect(await copied(ledgerUrl)).toBe(request(ledgerUrl));
+    // A Repository that does not exist gets the same problem code and the same request, differing only by the link she typed.
+    const unknownUrl = `${base}/repositories/nosuch?version=${ledger.version}`;
+    expect(await copied(unknownUrl)).toBe(request(unknownUrl));
+    expect(await her.locator('main').textContent()).toContain('WYRD_REGISTRY_404_CARD_NOT_FOUND');
+
+    // The administrator grants ledger over HTTP. Alice's same browser session, CLI login and SDK client gain it without signing in again.
+    await principals.bind({ subject: { principal: { id: account.principal_id, kind: 'user' } }, role: 'viewer', scope: { card: { family: { kind: 'Repository', name: 'ledger' } } } });
+    const ledgerInBrowser = async () => {
+      await her.goto(ledgerUrl);
+      return !((await her.locator('main').textContent()) ?? '').includes('WYRD_REGISTRY_404_CARD_NOT_FOUND');
+    };
+    const ledgerInSdk = () => hers.get(ledger).then(() => true, () => false);
+    const ledgerInCli = () => execFileSync(join(REPO, 'target/debug/wyrd'), ['list', '--kind', 'Repository'], { env: cliEnv }).toString().includes('ledger');
+    await expect.poll(ledgerInBrowser, { timeout: 30_000 }).toBe(true);
+    await expect.poll(ledgerInSdk, { timeout: 30_000 }).toBe(true);
+    await expect.poll(ledgerInCli, { timeout: 30_000 }).toBe(true);
+
+    // The administrator removes that binding in Access. Alice loses ledger everywhere and keeps payments.
+    await page.goto(`${base}/settings/access`);
+    await page.getByRole('link', { name: 'Access for alice' }).click();
+    await page.getByRole('button', { name: 'Remove viewer at Repository/ledger · every version, including future ones from alice' }).click();
+    await expect.poll(() => grants.count()).toBe(1);
+    await expect.poll(ledgerInBrowser, { timeout: 30_000 }).toBe(false);
+    await expect.poll(ledgerInSdk, { timeout: 30_000 }).toBe(false);
+    await expect.poll(ledgerInCli, { timeout: 30_000 }).toBe(false);
+    expect((await hers.list({ kind: 'Repository' })).items.map((card) => card.name)).toEqual(['payments']);
+
+    // Her browser holds no credential a script can read.
+    expect(await her.evaluate(() => `${document.cookie} ${JSON.stringify(localStorage)} ${JSON.stringify(sessionStorage)}`)).not.toMatch(/wyrd_session|eyJ|wyrd_[a-z]+_[A-Za-z0-9]{16}/);
   } finally {
     vi.unstubAllEnvs();
     await browser.close();

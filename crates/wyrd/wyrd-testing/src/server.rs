@@ -1050,7 +1050,8 @@ impl WyrdTestServer {
     /// sealing keyring from `builder`, so a journey can prove that durable
     /// state written through one replica is served by another without a
     /// restart, and that replicas holding different keyrings interoperate
-    /// during sealing-key rotation.
+    /// during sealing-key rotation. Like [`Self::start_in_process`], it runs
+    /// the current-authority propagation worker.
     ///
     /// # Errors
     /// Returns an error when the replica fails to start.
@@ -1061,8 +1062,34 @@ impl WyrdTestServer {
         let fixture = Arc::clone(&self.inner.fixture);
         let storage = Arc::clone(&self.inner.state.storage);
         let storage_root = self.inner.storage_root.clone();
-        on_shared_runtime(move || builder.start_with_resources(fixture, storage, storage_root))
-            .await
+        let replica =
+            on_shared_runtime(move || builder.start_with_resources(fixture, storage, storage_root))
+                .await?;
+        replica.propagate_authority();
+        Ok(replica)
+    }
+
+    /// Start the current-authority propagation worker of an unbound server,
+    /// leaving its other workers for [`Self::bind`].
+    ///
+    /// Current authority reaches an unbound server's cache as it reaches a
+    /// bound one's, so a test observes access changes committed through
+    /// another replica within the propagation bound. Idempotent: the worker
+    /// leaves the pending set when it starts.
+    fn propagate_authority(&self) {
+        let authority = {
+            let mut workers = self
+                .workers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            workers
+                .iter()
+                .position(|(name, _)| *name == "authorization_cache")
+                .map(|at| workers.remove(at).1)
+        };
+        if let Some(worker) = authority {
+            wyrd_runtime::runtime().spawn(worker);
+        }
     }
 
     /// Start `builder` as a second replica like
@@ -5294,21 +5321,7 @@ impl WyrdTestServerBuilder {
     /// created, or when the composing task panics.
     pub async fn start_in_process(self) -> Result<WyrdTestServer, WyrdTestServerError> {
         let server = on_shared_runtime(move || self.compose_in_process()).await?;
-        // Current authority propagates to an in-process server as it does to
-        // a bound one; its other workers start only when a test binds it.
-        let authority = {
-            let mut workers = server
-                .workers
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            workers
-                .iter()
-                .position(|(name, _)| *name == "authorization_cache")
-                .map(|at| workers.remove(at).1)
-        };
-        if let Some(worker) = authority {
-            wyrd_runtime::runtime().spawn(worker);
-        }
+        server.propagate_authority();
         Ok(server)
     }
 

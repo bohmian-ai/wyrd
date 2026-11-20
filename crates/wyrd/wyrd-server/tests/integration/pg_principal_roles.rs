@@ -1134,3 +1134,71 @@ async fn workload_roots_and_families_are_services_only() {
         "a refused replacement changes nothing"
     );
 }
+
+/// A grant committed through one replica reaches an existing bearer on
+/// another replica over the shared database within the propagation bound,
+/// and its removal does the same; once warm, the replica serves requests from
+/// memory without compiling authority again.
+///
+/// # Panics
+/// Panics when a replica fails to start, a change does not reach the other
+/// replica within the bound, or a warm request recompiles authority.
+#[tokio::test(flavor = "multi_thread")]
+async fn access_changes_reach_another_replica_within_the_bound() {
+    use wyrd_testing::principal::within_propagation;
+
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let replica = server
+        .start_replica(WyrdTestServer::builder())
+        .await
+        .expect("replica starts");
+    let (_, admin_jwt) = user(&server, "replica-admin", &["admin"]).await;
+    let (target, target_jwt) = service(&server, "replica-target", &["workload"]).await;
+    let administers = || async {
+        call(&replica, &target_jwt, Method::GET, "/v1/access/bindings")
+            .await
+            .0
+    };
+    assert_eq!(administers().await, StatusCode::FORBIDDEN);
+
+    let (status, granted) = send(
+        &server,
+        &admin_jwt,
+        Method::POST,
+        "/v1/access/bindings",
+        Some(binding(target, "service", "admin")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{granted}");
+    assert_eq!(
+        within_propagation(&StatusCode::OK, administers).await,
+        StatusCode::OK,
+        "the other replica's existing bearer gains the grant"
+    );
+
+    let authority = &replica.state().auth.authority;
+    let compiled = authority.compiles();
+    for _ in 0..20 {
+        assert_eq!(administers().await, StatusCode::OK);
+    }
+    assert_eq!(
+        authority.compiles(),
+        compiled,
+        "warm requests resolve authority from memory"
+    );
+
+    let removal = format!(
+        "/v1/access/bindings/{}",
+        granted["id"].as_str().expect("binding id")
+    );
+    let (status, removed) = call(&server, &admin_jwt, Method::DELETE, &removal).await;
+    assert_eq!(status, StatusCode::OK, "{removed}");
+    assert_eq!(
+        within_propagation(&StatusCode::FORBIDDEN, administers).await,
+        StatusCode::FORBIDDEN,
+        "the other replica's existing bearer loses the grant"
+    );
+    replica.shutdown().await.expect("replica shuts down");
+}

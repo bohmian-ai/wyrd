@@ -21,7 +21,9 @@ use std::time::Duration;
 
 use serde_json::Value;
 use sqlx::types::Uuid;
+use tokio::time::Instant;
 
+use crate::operator_pool::within;
 use crate::row_types::auth::HumanConnectionRow;
 use crate::{OperatorPool, SqlError, TenantConn};
 
@@ -546,8 +548,9 @@ fn unless_timed_out<T>(result: Result<T, sqlx::Error>) -> Result<Option<T>, SqlE
 /// List every stored envelope of `table` across all tenants, with the owner
 /// metadata its context binds.
 ///
-/// Returns `None` when the read is still waiting, for example on a lock, once
-/// `wait` elapses; the caller has then observed nothing of `table`.
+/// Returns `None` when `deadline` passes first, whether the read is still
+/// waiting for a connection or on a lock; the caller has then observed
+/// nothing of `table`. A `None` deadline waits as long as the read takes.
 ///
 /// # Errors
 /// Returns [`SqlError`] when the query fails for another reason.
@@ -555,24 +558,27 @@ fn unless_timed_out<T>(result: Result<T, sqlx::Error>) -> Result<Option<T>, SqlE
 pub async fn stored_secrets(
     operator: &OperatorPool,
     table: StoredSecretTable,
-    wait: Duration,
+    deadline: Option<Instant>,
 ) -> Result<Option<Vec<StoredSecretRow>>, SqlError> {
-    let mut tx = operator.begin_bounded(wait).await?;
-    unless_timed_out(
-        sqlx::query_as::<_, StoredSecretRow>(table.select_sql())
-            .fetch_all(&mut *tx)
-            .await,
-    )
+    let Some(mut tx) = operator.begin_bounded(deadline).await? else {
+        return Ok(None);
+    };
+    let read = sqlx::query_as::<_, StoredSecretRow>(table.select_sql()).fetch_all(&mut *tx);
+    within(deadline, read)
+        .await
+        .map_or(Ok(None), unless_timed_out)
 }
 
 /// Replace `row`'s envelope with `replacement` if the column still holds
-/// exactly the bytes `row` was read with.
+/// exactly the bytes `row` was read with, finishing by `deadline`.
 ///
-/// Returns `Some(false)` when the row changed or disappeared since it was
-/// read; the caller leaves it for the next pass and the concurrent write
-/// stands. Returns `None` when the update is still waiting once `wait`
-/// elapses: PostgreSQL cancels it and its transaction rolls back, so the row
-/// keeps its bytes and the abandoned update never lands later.
+/// Returns `Some(true)` only for a commit PostgreSQL acknowledged, and
+/// `Some(false)` when the row changed or disappeared since it was read; the
+/// caller leaves it for the next pass and the concurrent write stands.
+/// Returns `None` when `deadline` passes first. A swap cut before its commit
+/// is sent never lands: PostgreSQL cancels a still-waiting update and its
+/// transaction rolls back. A commit cut after it was sent may have landed,
+/// which the next pass observes from the stored bytes.
 ///
 /// # Errors
 /// Returns [`SqlError`] when the update or commit fails for another reason.
@@ -582,21 +588,27 @@ pub async fn swap_stored_secret(
     table: StoredSecretTable,
     row: &StoredSecretRow,
     replacement: &[u8],
-    wait: Duration,
+    deadline: Instant,
 ) -> Result<Option<bool>, SqlError> {
-    let mut tx = operator.begin_bounded(wait).await?;
-    let swapped = unless_timed_out(
-        sqlx::query(table.swap_sql())
-            .bind(row.data_tenant_id)
-            .bind(&row.row_key)
-            .bind(&row.envelope)
-            .bind(replacement)
-            .execute(&mut *tx)
-            .await,
-    )?;
-    let Some(result) = swapped else {
+    let deadline = Some(deadline);
+    let Some(mut tx) = operator.begin_bounded(deadline).await? else {
         return Ok(None);
     };
-    tx.commit().await.map_err(SqlError::from)?;
+    let update = sqlx::query(table.swap_sql())
+        .bind(row.data_tenant_id)
+        .bind(&row.row_key)
+        .bind(&row.envelope)
+        .bind(replacement)
+        .execute(&mut *tx);
+    let Some(result) = within(deadline, update)
+        .await
+        .map_or(Ok(None), unless_timed_out)?
+    else {
+        return Ok(None);
+    };
+    let Some(committed) = within(deadline, tx.commit()).await else {
+        return Ok(None);
+    };
+    committed.map_err(SqlError::from)?;
     Ok(Some(result.rows_affected() == 1))
 }

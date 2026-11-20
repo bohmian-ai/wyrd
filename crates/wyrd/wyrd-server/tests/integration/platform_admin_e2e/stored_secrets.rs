@@ -1331,6 +1331,193 @@ async fn a_swap_stalled_on_a_locked_row_is_abandoned_and_resumed() {
     srv.shutdown().await.expect("server shuts down");
 }
 
+/// Check out every connection of the serving process's operator pool, as
+/// concurrent platform work would, so a pass can only wait for one.
+///
+/// # Panics
+/// Panics when the pool's connections cannot all be acquired.
+async fn hold_every_connection(
+    srv: &WyrdTestServer,
+) -> Vec<sqlx::pool::PoolConnection<sqlx::Postgres>> {
+    let operator = srv
+        .state()
+        .postgres
+        .operator_pool()
+        .expect("serving operator pool");
+    let pool = operator.pool();
+    let mut held = Vec::new();
+    // Background workers share the pool, so an acquire can time out while
+    // one of them holds a connection; it frees it within a few attempts.
+    for _ in 0..5 {
+        while held.len() < pool.options().get_max_connections() as usize {
+            match pool.acquire().await {
+                Ok(connection) => held.push(connection),
+                Err(sqlx::Error::PoolTimedOut) => break,
+                Err(error) => panic!("connection acquires: {error}"),
+            }
+        }
+    }
+    assert_eq!(
+        held.len(),
+        pool.options().get_max_connections() as usize,
+        "every connection is held"
+    );
+    held
+}
+
+/// The budget of a pass driven directly against the serving pool.
+const PASS_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Run one routine pass over the serving process's operator pool with a
+/// [`PASS_BUDGET`] budget, as an already-authorized request would.
+///
+/// # Panics
+/// Panics when the pass fails, for example on a pool timeout.
+async fn serving_pass(
+    srv: &WyrdTestServer,
+    limit: Option<u32>,
+) -> wyrd_spec::security::stored_secret::StoredSecretMaintenanceReport {
+    wyrd_server::components::platform::stored_secrets::StoredSecretMaintenance::new(
+        srv.state()
+            .postgres
+            .operator_pool()
+            .expect("serving operator pool"),
+        srv.state().auth.kms.clone(),
+    )
+    .run(
+        wyrd_spec::security::stored_secret::StoredSecretMaintenanceMode::Routine,
+        limit.and_then(std::num::NonZeroU32::new),
+        PASS_BUDGET,
+    )
+    .await
+    .expect("the pass answers")
+}
+
+/// The counts of `report`: current, changed, remaining, and bounded.
+fn counts(
+    report: &wyrd_spec::security::stored_secret::StoredSecretMaintenanceReport,
+) -> (u64, u64, u64, bool) {
+    (
+        report.current,
+        report.changed,
+        report.remaining,
+        report.bounded,
+    )
+}
+
+/// An authorized pass that cannot get an operator connection answers within
+/// its own budget, not the pool's longer acquisition timeout: it observes and
+/// counts nothing, and the envelopes an earlier pass committed stand. Once
+/// capacity returns, the same mode moves exactly the rest and leaves the
+/// earlier ones byte-identical.
+///
+/// # Panics
+/// Panics when the pass outlives its budget, counts or moves anything while
+/// starved, or the repeat redoes finished work.
+#[tokio::test]
+async fn a_pass_starved_of_connections_answers_within_its_budget() {
+    let transit = TransitFixture::start().await;
+    let srv = start(&transit, "k1", &[]).await;
+    let provider = wiremock::MockServer::start().await;
+    seed(&srv, &provider, &["starved"]).await;
+    let srv = roll_out(srv, &transit, "k2", &["k1"]).await;
+    let first = serving_pass(&srv, Some(2)).await;
+    assert_eq!(first.changed, 2, "{first:?}");
+    let before = stored_envelopes(&srv).await;
+
+    let held = hold_every_connection(&srv).await;
+    let started = std::time::Instant::now();
+    let starved = serving_pass(&srv, None).await;
+    let elapsed = started.elapsed();
+    drop(held);
+
+    assert!(
+        elapsed < PASS_BUDGET + PASS_BUDGET / 4,
+        "the pass took {elapsed:?}"
+    );
+    assert_eq!(counts(&starved), (0, 0, 0, true), "{starved:?}");
+    assert_eq!(
+        stored_envelopes(&srv).await,
+        before,
+        "a starved pass moves nothing"
+    );
+
+    let resumed = serving_pass(&srv, None).await;
+    assert_eq!(counts(&resumed), (2, 3, 0, false), "{resumed:?}");
+    let after = stored_envelopes(&srv).await;
+    for row in before
+        .iter()
+        .filter(|(_, _, envelope)| envelope_parts(envelope).0 == "k2")
+    {
+        assert!(
+            after.contains(row),
+            "a finished envelope is never redone: {}",
+            row.1
+        );
+    }
+    srv.shutdown().await.expect("server shuts down");
+}
+
+/// Time an authorized pass spends waiting for a connection is spent from its
+/// budget, not granted again to the statement that follows: capacity returns
+/// late in the budget, the first store's read then waits on a lock, and the
+/// pass still answers at its own deadline with nothing observed. Once the
+/// lock is released, the same mode moves every envelope.
+///
+/// # Panics
+/// Panics when the pass outlives its budget, counts or moves anything, or
+/// the repeat does not finish.
+#[tokio::test]
+async fn a_pass_that_waited_for_a_connection_keeps_its_deadline_on_a_lock() {
+    let transit = TransitFixture::start().await;
+    let srv = start(&transit, "k1", &[]).await;
+    let provider = wiremock::MockServer::start().await;
+    seed(&srv, &provider, &["late-capacity"]).await;
+    let srv = roll_out(srv, &transit, "k2", &["k1"]).await;
+    let before = stored_envelopes(&srv).await;
+
+    // One held connection locks the first store the pass reads; the others
+    // stay busy until three quarters of the budget have passed.
+    let mut held = hold_every_connection(&srv).await;
+    let mut lock = held.pop().expect("a connection to lock with");
+    sqlx::query("BEGIN")
+        .execute(&mut *lock)
+        .await
+        .expect("lock begins");
+    sqlx::query("LOCK TABLE wyrd.auth_human_connections IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock)
+        .await
+        .expect("store locks");
+    let started = tokio::time::Instant::now();
+    // The scenario's release point, not a synchronization wait.
+    let release = async {
+        tokio::time::sleep_until(started + PASS_BUDGET * 3 / 4).await;
+        drop(held);
+    };
+    let (stalled, ()) = tokio::join!(serving_pass(&srv, None), release);
+    let elapsed = started.elapsed();
+    sqlx::query("ROLLBACK")
+        .execute(&mut *lock)
+        .await
+        .expect("lock releases");
+    drop(lock);
+
+    assert!(
+        elapsed < PASS_BUDGET + PASS_BUDGET / 4,
+        "the pass took {elapsed:?} of a {PASS_BUDGET:?} budget"
+    );
+    assert_eq!(counts(&stalled), (0, 0, 0, true), "{stalled:?}");
+    assert_eq!(
+        stored_envelopes(&srv).await,
+        before,
+        "a cut read moves nothing"
+    );
+
+    let resumed = serving_pass(&srv, None).await;
+    assert_eq!(counts(&resumed), (0, 5, 0, false), "{resumed:?}");
+    srv.shutdown().await.expect("server shuts down");
+}
+
 /// A confidential `[[trusted_issuers]]` entry for `issuer` holding `auth`.
 fn configured_issuer(
     issuer: &str,

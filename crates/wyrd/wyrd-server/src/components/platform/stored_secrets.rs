@@ -77,7 +77,7 @@ impl StoredSecretMaintenance {
     /// Returns [`SqlError`] when a read fails.
     pub async fn holds_envelopes(&self) -> Result<bool, SqlError> {
         for table in StoredSecretTable::ALL {
-            if stored_secrets(&self.operator, table, Duration::MAX)
+            if stored_secrets(&self.operator, table, None)
                 .await?
                 .is_none_or(|rows| !rows.is_empty())
             {
@@ -134,13 +134,7 @@ impl StoredSecretMaintenance {
             moved_gateway_tenants: BTreeSet::new(),
         };
         for table in StoredSecretTable::ALL {
-            let wait = deadline.saturating_duration_since(Instant::now());
-            let rows = if wait.is_zero() {
-                None
-            } else {
-                stored_secrets(&self.operator, table, wait).await?
-            };
-            let Some(rows) = rows else {
+            let Some(rows) = stored_secrets(&self.operator, table, Some(deadline)).await? else {
                 pass.report.bounded = true;
                 break;
             };
@@ -246,13 +240,9 @@ impl StoredSecretMaintenance {
             }
             Ok(Err(error)) => pass.fail(table, row, reason(&error)),
             Ok(Ok(envelope)) => {
-                let wait = pass.deadline.saturating_duration_since(Instant::now());
-                let swapped = if wait.is_zero() {
-                    None
-                } else {
-                    swap_stored_secret(&self.operator, table, row, &envelope, wait).await?
-                };
-                match swapped {
+                match swap_stored_secret(&self.operator, table, row, &envelope, pass.deadline)
+                    .await?
+                {
                     Some(true) => {
                         pass.report.changed += 1;
                         if table == StoredSecretTable::GatewayProviderCredentials

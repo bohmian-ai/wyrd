@@ -7,9 +7,10 @@
 //! query modules are allowed to hold for cross-tenant SQL; no query fn may take
 //! a bare `&PgPool`.
 
-use std::time::Duration;
+use std::future::Future;
 
 use sqlx::{PgPool, Postgres, Transaction};
+use tokio::time::Instant;
 use wyrd_spec::DataTenantId;
 
 use crate::{SqlError, TenantConn};
@@ -54,31 +55,43 @@ impl OperatorPool {
         TenantConn::acquire(&self.0, DataTenantId::SYSTEM_OWNER).await
     }
 
-    /// Opens one operator transaction whose statements PostgreSQL itself
-    /// cancels once `wait` elapses.
+    /// Opens one operator transaction for an operation that must finish by
+    /// `deadline`, or `None` once the deadline passes first.
     ///
-    /// A statement still waiting then, for example on a lock, fails with
-    /// `query_canceled` (`57014`), so no read or write outlives the caller's
-    /// budget, and an abandoned write rolls back with the transaction rather
-    /// than landing later. The timeout is transaction-local and never returns
-    /// to the pool.
+    /// Waiting for a connection, `BEGIN`, and the setup statement all spend
+    /// the same deadline; none of them restarts it. The transaction's
+    /// statements then carry a transaction-local `statement_timeout` of the
+    /// time left, so PostgreSQL itself cancels a statement still waiting, for
+    /// example on a lock, with `query_canceled` (`57014`) and an abandoned
+    /// write rolls back with the transaction rather than landing later. Each
+    /// later step of the operation, including its commit, must also run
+    /// [`within`] the same deadline. The timeout never returns to the pool. A
+    /// `None` deadline waits as long as the pool and statements take.
     ///
     /// # Errors
     /// Returns [`SqlError`] when the transaction cannot begin or its timeout
     /// cannot be set.
     pub async fn begin_bounded(
         &self,
-        wait: Duration,
-    ) -> Result<Transaction<'static, Postgres>, SqlError> {
-        let mut tx = self.0.begin().await.map_err(SqlError::from)?;
-        // A zero timeout disables the limit, so the shortest bound is 1 ms.
-        let millis = wait.as_millis().clamp(1, i32::MAX as u128);
-        sqlx::query("SELECT set_config('statement_timeout', $1, true)")
-            .bind(format!("{millis}ms"))
-            .execute(&mut *tx)
-            .await
-            .map_err(SqlError::from)?;
-        Ok(tx)
+        deadline: Option<Instant>,
+    ) -> Result<Option<Transaction<'static, Postgres>>, SqlError> {
+        let begin = async {
+            let mut tx = self.0.begin().await.map_err(SqlError::from)?;
+            if let Some(deadline) = deadline {
+                // A zero timeout disables the limit, so the shortest bound is 1 ms.
+                let millis = deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis()
+                    .clamp(1, i32::MAX as u128);
+                sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+                    .bind(format!("{millis}ms"))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(SqlError::from)?;
+            }
+            Ok(tx)
+        };
+        within(deadline, begin).await.transpose()
     }
 
     /// Borrow the underlying operator-session pool.
@@ -95,4 +108,25 @@ impl From<PgPool> for OperatorPool {
     fn from(pool: PgPool) -> Self {
         Self(pool)
     }
+}
+
+/// Await `operation` until `deadline`, or `None` once the deadline passes
+/// first; a `None` deadline awaits it to completion.
+///
+/// An expired deadline starts nothing. A cut operation is dropped where it
+/// stands: an open transaction it borrowed queues its rollback for the
+/// connection's return to the pool, and a commit it had not yet sent is never
+/// sent. A commit already sent may still land, so a cut caller counts only
+/// what it observed and resumes from what is stored.
+pub(crate) async fn within<F: Future>(
+    deadline: Option<Instant>,
+    operation: F,
+) -> Option<F::Output> {
+    let Some(deadline) = deadline else {
+        return Some(operation.await);
+    };
+    if Instant::now() >= deadline {
+        return None;
+    }
+    tokio::time::timeout_at(deadline, operation).await.ok()
 }

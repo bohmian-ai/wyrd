@@ -12,8 +12,10 @@ use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{StoredSecretTable, stored_secrets, swap_stored_secret};
 use wyrd_sql::queries::operator_connections::{NewConnection, SealedSecret, insert_connection};
 
-/// How long each read and swap here may wait; nothing contends with them.
-const WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// The deadline for one read or swap here; nothing contends with them.
+fn deadline() -> tokio::time::Instant {
+    tokio::time::Instant::now() + std::time::Duration::from_secs(5)
+}
 
 /// Insert one Slack connection named `name` sealed as `envelope`.
 ///
@@ -66,7 +68,7 @@ async fn maintenance_lists_every_tenant_and_swaps_only_the_bytes_it_read() {
     let operator = fixture.operator_pool();
     let table = StoredSecretTable::OperatorConnections;
 
-    let rows = stored_secrets(operator, table, WAIT)
+    let rows = stored_secrets(operator, table, Some(deadline()))
         .await
         .expect("rows list")
         .expect("read finishes");
@@ -84,14 +86,14 @@ async fn maintenance_lists_every_tenant_and_swaps_only_the_bytes_it_read() {
 
     let first = &rows[0];
     assert!(
-        swap_stored_secret(operator, table, first, &[9; 24], WAIT)
+        swap_stored_secret(operator, table, first, &[9; 24], deadline())
             .await
             .expect("swap runs")
             .expect("swap finishes"),
         "a swap on the bytes read wins"
     );
     assert!(
-        !swap_stored_secret(operator, table, first, &[8; 24], WAIT)
+        !swap_stored_secret(operator, table, first, &[8; 24], deadline())
             .await
             .expect("swap runs")
             .expect("swap finishes"),
@@ -100,14 +102,14 @@ async fn maintenance_lists_every_tenant_and_swaps_only_the_bytes_it_read() {
     let mut foreign = rows[1].clone();
     foreign.data_tenant_id = first.data_tenant_id;
     assert!(
-        !swap_stored_secret(operator, table, &foreign, &[7; 24], WAIT)
+        !swap_stored_secret(operator, table, &foreign, &[7; 24], deadline())
             .await
             .expect("swap runs")
             .expect("swap finishes"),
         "a swap under another tenant matches nothing"
     );
 
-    let after = stored_secrets(operator, table, WAIT)
+    let after = stored_secrets(operator, table, Some(deadline()))
         .await
         .expect("rows list")
         .expect("read finishes");

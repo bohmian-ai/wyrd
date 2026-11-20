@@ -362,7 +362,9 @@ typed columns:
   `gen_ai_*`, `http_request_method`, `http_route`,
   `http_response_status_code`, `url_full`, and the `exception_*` columns of the
   span's last `exception` event on spans; the record's own `exception_*`
-  attributes and `body_text` (the body when it is a string) on logs.
+  attributes on logs. A log body that is a string is stored once, in
+  `body_text`, with `body` null; `body` holds only a non-string body, so no
+  row carries its body twice.
 - `bifrost.metrics.points` carries `series_id`, a nullable
   `FixedSizeBinary(16)` column with a Bloom filter, derived at admission from
   the point's series identity and never taken from a writer: Scribe replaces

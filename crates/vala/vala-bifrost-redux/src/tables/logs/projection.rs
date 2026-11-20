@@ -34,17 +34,19 @@ use wyrd_spec::ids::CardUid;
 use wyrd_spec::vala::BifrostError;
 
 /// Refuse a native canonical log batch whose derived columns differ from
-/// what [`project_resource_logs`] derives from the same source fields.
+/// what [`project_resource_logs`] derives from the same source fields, or
+/// whose body is not stored the way the projection stores it.
 ///
 /// The exception promotions and `is_exception` are re-derived from each row's
-/// `attributes`, and `body_text` from a string `body`, with the projection's
-/// own rules, so a native writer cannot store a filter value the projection
-/// would not.
+/// `attributes` with the projection's own rules, so a native writer cannot
+/// store a filter value the projection would not. A string body lives only in
+/// `body_text`, so a row whose `body` Variant holds a string, or that sets
+/// both `body` and `body_text`, is refused.
 ///
 /// # Errors
 ///
-/// Returns [`BifrostError::SchemaParse`] for a malformed source column or the
-/// first derived column that differs.
+/// Returns [`BifrostError::SchemaParse`] for a malformed source column, a
+/// body stored twice, or the first derived column that differs.
 pub(crate) fn refuse_forged_log_derivations(batch: &RecordBatch) -> Result<(), BifrostError> {
     let column = |name: &str| {
         batch
@@ -53,12 +55,21 @@ pub(crate) fn refuse_forged_log_derivations(batch: &RecordBatch) -> Result<(), B
                 detail: format!("canonical batch is missing column {name}"),
             })
     };
-    let (attributes, body) = (column("attributes")?, column("body")?);
+    let (attributes, body, body_text) =
+        (column("attributes")?, column("body")?, column("body_text")?);
     let mut stored = Vec::with_capacity(batch.num_rows());
-    let mut body_text = Vec::with_capacity(batch.num_rows());
     for row in 0..batch.num_rows() {
         stored.push(stored_attributes(attributes.as_ref(), row)?);
-        body_text.push(stored_text(body.as_ref(), row)?);
+        if !body.is_null(row)
+            && (!body_text.is_null(row) || stored_text(body.as_ref(), row)?.is_some())
+        {
+            return Err(BifrostError::SchemaParse {
+                detail: format!(
+                    "canonical log row {row} stores its body twice: a string body \
+                     belongs only in body_text"
+                ),
+            });
+        }
     }
     let exception: Vec<ExceptionPromotions<'_>> = stored
         .iter()
@@ -71,7 +82,6 @@ pub(crate) fn refuse_forged_log_derivations(batch: &RecordBatch) -> Result<(), B
         ("exception_type", text(|row| row.exception_type)),
         ("exception_message", text(|row| row.message)),
         ("exception_stacktrace", text(|row| row.stacktrace)),
-        ("body_text", utf8_opt_column(&body_text)),
         (
             "is_exception",
             bool_column(exception.iter().map(ExceptionPromotions::any).collect()),
@@ -80,6 +90,10 @@ pub(crate) fn refuse_forged_log_derivations(batch: &RecordBatch) -> Result<(), B
     .iter()
     .try_for_each(|(name, derived)| refuse_forged(batch, name, derived))
 }
+
+/// Bytes a string Variant adds to its text at most: its metadata and its
+/// long-string value header.
+const STRING_VARIANT_OVERHEAD_BYTES: usize = 16;
 
 /// Largest accepted severity text, in bytes.
 const MAX_SEVERITY_TEXT_BYTES: usize = 64;
@@ -187,7 +201,8 @@ struct LogColumns {
     severity_number: Vec<i32>,
     severity_text: Vec<String>,
     event_name: Vec<Option<String>>,
-    /// Record body as a Variant; null when the record carries none.
+    /// Record body as a Variant; null when the record carries none or a
+    /// string, which `body_text` stores alone.
     body: Vec<Option<EncodedVariant>>,
     trace_id: Vec<Option<Vec<u8>>>,
     span_id: Vec<Option<Vec<u8>>>,
@@ -224,7 +239,7 @@ struct LogColumns {
     exception_message: Vec<Option<String>>,
     /// Promoted `exception.stacktrace` attribute string.
     exception_stacktrace: Vec<Option<String>>,
-    /// The body when it is a string, else null.
+    /// The body when it is a string, stored only here; else null.
     body_text: Vec<Option<String>>,
     /// Whether any promoted exception string is present.
     is_exception: Vec<bool>,
@@ -281,17 +296,32 @@ impl LogColumns {
             0 => observed_time_unix_nano,
             time => checked_i64(time)?,
         };
-        let body = record
+        let body_text = match record.body.as_ref().and_then(|value| value.value.as_ref()) {
+            Some(Value::StringValue(text)) => Some(text.clone()),
+            _ => None,
+        };
+        // A string body is stored only as `body_text`; it is encoded as a
+        // Variant only when it nears the limit, so it is refused with exactly
+        // the reason and boundary a stored Variant body would have.
+        let near_limit = body_text.as_ref().is_some_and(|text| {
+            text.len() + STRING_VARIANT_OVERHEAD_BYTES
+                > wyrd_spec::vala::logs::record::MAX_LOG_BODY_BYTES
+        });
+        let encoded = record
             .body
             .as_ref()
+            .filter(|_| body_text.is_none() || near_limit)
             .map(|value| any_value_variant("body", value))
             .transpose()
             .map_err(|failure| failure.reason(row))?;
-        if body.as_ref().is_some_and(|encoded| {
-            encoded.encoded_bytes() > wyrd_spec::vala::logs::record::MAX_LOG_BODY_BYTES
-        }) {
+        let body_bytes = encoded.as_ref().map_or_else(
+            || body_text.as_ref().map_or(0, String::len),
+            EncodedVariant::encoded_bytes,
+        );
+        if body_bytes > wyrd_spec::vala::logs::record::MAX_LOG_BODY_BYTES {
             return Err("log body exceeds the accepted payload size".into());
         }
+        let body = encoded.filter(|_| body_text.is_none());
         let attributes = attributes_variant("attributes", &record.attributes)
             .map_err(|failure| failure.reason(row))?;
         if attributes.encoded_bytes() > wyrd_spec::vala::logs::record::MAX_LOG_ATTRIBUTES_BYTES {
@@ -299,16 +329,11 @@ impl LogColumns {
         }
         let correlation = RecordCorrelation::extract(&record.attributes, card_scope)?;
         let exception = ExceptionPromotions::from_attributes(&record.attributes);
-        let body_text = match record.body.as_ref().and_then(|value| value.value.as_ref()) {
-            Some(Value::StringValue(text)) => Some(text.clone()),
-            _ => None,
-        };
         let payload_bytes = record.severity_text.len()
             + record.event_name.len()
-            + body.as_ref().map_or(0, EncodedVariant::encoded_bytes)
+            + body_bytes
             + attributes.encoded_bytes()
             + exception.bytes()
-            + body_text.as_ref().map_or(0, String::len)
             + correlation.card_uid.as_ref().map_or(0, String::len)
             + correlation.run_id.as_ref().map_or(0, String::len);
 

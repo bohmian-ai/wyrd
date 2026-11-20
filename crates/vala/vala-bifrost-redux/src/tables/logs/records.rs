@@ -29,7 +29,8 @@ use wyrd_spec::vala::api::PhysicalLayoutWire;
 /// present but unset value. The trailing promoted columns copy well-known
 /// semantic-convention values out of the Variant collections so they can be
 /// filtered without decoding; each is null when its source is absent or
-/// carries the wrong type, and `body_text` is set only for a string body.
+/// carries the wrong type. A string body is stored once, in `body_text`, with
+/// `body` null; `body` holds only a non-string body.
 /// `is_exception` is non-null and true exactly when a promoted exception
 /// string is present, an empty one included; severity never sets it. The
 /// subject columns are reserved for server attribution and stay null on

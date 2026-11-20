@@ -211,6 +211,62 @@ mod tests {
         );
     }
 
+    /// A string body is refused exactly where and why its Variant would be:
+    /// the largest text whose Variant fits the body limit lands, one byte
+    /// more is refused by size, and a text past the Variant limit is refused
+    /// with the catalogued Variant code.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a boundary body lands on the wrong side or a refusal
+    /// gives a different reason.
+    #[test]
+    fn string_log_body_limits_match_its_variant() {
+        let limit = wyrd_spec::vala::logs::record::MAX_LOG_BODY_BYTES;
+        let text = |len: usize| AnyValue {
+            value: Some(Value::StringValue("x".repeat(len))),
+        };
+        let overhead = any_value_variant("body", &text(limit))
+            .expect("encodes")
+            .encoded_bytes()
+            - limit;
+        let variant_limit =
+            usize::try_from(wyrd_spec::vala::api::VARIANT_MAX_ENCODED_BYTES).expect("fits");
+        let project = |len: usize| {
+            let request = vec![ResourceLogs {
+                resource: None,
+                scope_logs: vec![ScopeLogs {
+                    scope: None,
+                    log_records: vec![LogRecord {
+                        body: Some(text(len)),
+                        ..LogRecord::default()
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }];
+            project_resource_logs(&request, None, usize::MAX)
+                .expect("logs project")
+                .1
+                .rejection_message
+        };
+
+        assert_eq!(
+            project(limit - overhead),
+            None,
+            "the largest fitting body lands"
+        );
+        assert_eq!(
+            project(limit - overhead + 1).as_deref(),
+            Some("log body exceeds the accepted payload size")
+        );
+        let reason = project(variant_limit).expect("a body past the Variant limit is refused");
+        assert!(
+            reason.starts_with("WYRD_VALA_413_VARIANT_TOO_LARGE"),
+            "{reason}"
+        );
+    }
+
     /// Downcast one named column, panicking when its Arrow type differs.
     fn typed<'a, T: 'static>(batch: &'a RecordBatch, name: &str) -> &'a T {
         column(batch, name)
@@ -249,7 +305,13 @@ mod tests {
             "the ledger columns plus the two appended correlation columns"
         );
 
-        for (row, value) in forms.into_iter().enumerate() {
+        let body_text = typed::<StringArray>(&batch, "body_text");
+        assert_eq!(body_text.value(0), "body text");
+        assert!(
+            column(&batch, "body").is_null(0),
+            "a string body is stored once, in body_text"
+        );
+        for (row, value) in forms.into_iter().enumerate().skip(1) {
             let expected = any_value_variant("body", &AnyValue { value: Some(value) })
                 .expect("every body form projects");
             assert_eq!(
@@ -257,14 +319,12 @@ mod tests {
                 (expected.metadata(), expected.value()),
                 "body row {row}"
             );
+            assert!(body_text.is_null(row), "a non-string body has no text");
         }
         assert!(
             column(&batch, "body").is_null(correlated),
             "an absent body projects to null"
         );
-        let body_text = typed::<StringArray>(&batch, "body_text");
-        assert_eq!(body_text.value(0), "body text");
-        assert!(body_text.is_null(1), "a non-string body promotes no text");
         assert!(body_text.is_null(correlated));
 
         let names = typed::<StringArray>(&batch, "event_name");

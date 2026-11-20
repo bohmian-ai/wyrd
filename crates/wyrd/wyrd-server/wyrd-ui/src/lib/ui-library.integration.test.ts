@@ -129,6 +129,8 @@ const LATENCY_CHART: ChartInput = {
   series: 'model'
 };
 const DENIED = 'WYRD_PERMISSION_403_DENIED_RBAC';
+/** A Bifrost query over tables the principal's grants do not cover. */
+const QUERY_FORBIDDEN = 'WYRD_VALA_403_QUERY_FORBIDDEN';
 
 /** Register the latency table as `client` and publish three rows inside {@link RANGE}. */
 async function seedLatency(server: { flushBifrost(): void }, client?: WyrdClient) {
@@ -249,7 +251,7 @@ test('TASK-003: Identical authorized reads', async ({ server, seeded }) => {
     const request: WireRequest = { op: 'bifrost.query', sql: LATENCY_CHART.sql, params: [RANGE.from, RANGE.to] };
     const [[direct], [tool]] = await Promise.all([nodeExecutor(reader).run([request]), readerMcp.executor.run([request])]);
     expect(tool).toEqual(direct);
-    expect(direct).toMatchObject({ ok: false, problem: { code: DENIED } });
+    expect(direct).toMatchObject({ ok: false, problem: { code: QUERY_FORBIDDEN } });
   } finally {
     await readerMcp.close();
   }
@@ -293,7 +295,7 @@ test('TASK-003: Actual four-host foundation proof', async ({ server, seeded }) =
   expect(populated.executed).toEqual({ sql: LATENCY_CHART.sql, params: [RANGE.from, RANGE.to] });
   expect((await loadChart(LATENCY_CHART, { ...node, range: BEFORE })).result).toMatchObject({ state: 'empty' });
   const cardReader = { executor: nodeExecutor(WyrdClient.connect({ credential: server.scopedApiKey('ui_chart_denied', ['cards:read']) })) };
-  expect((await loadChart(LATENCY_CHART, { ...cardReader, range: RANGE })).result).toMatchObject({ state: 'denied', problem: { code: DENIED } });
+  expect((await loadChart(LATENCY_CHART, { ...cardReader, range: RANGE })).result).toMatchObject({ state: 'denied', problem: { code: QUERY_FORBIDDEN } });
   const header = await loadCardHeader({ cardRef: seeded.model }, node);
   expect(header.result).toMatchObject({
     state: 'populated',
@@ -442,7 +444,7 @@ test('TASK-004: Authorized Observe across hosts', async ({ server, seeded }) => 
     loadFacetRail({ signal: 'traces', facets: ['service_name'] }, cardReader),
     loadStatStrip({ stats: ['traces'] }, cardReader)
   ]))
-    expect(loaded.result).toMatchObject({ state: 'denied', problem: { code: DENIED } });
+    expect(loaded.result).toMatchObject({ state: 'denied', problem: { code: QUERY_FORBIDDEN } });
 
   // T4: the built HTML renders Observe panels through host tools/call alone.
   const doc = {
@@ -1434,8 +1436,8 @@ judged('a judged execution shows its judgments, accepted inputs, completed detai
 
   // Another tenant reads none of them, by ID alone, through either host.
   const outsider = WyrdClient.connect({ credential: server.bootstrapServiceInTenant(server.seedTenant('ui-judged-foreign'), ['admin'], 'ui-judged-admin') });
-  // A principal that may read executions only: the recorded state loads, and the Card and query reads are each denied apart.
-  const limited = WyrdClient.connect({ credential: server.scopedApiKey('ui_judged_narrow', ['verifier:read']) });
+  // A principal that may read executions only: the recorded judgments and the retained inputs load, and the Verifier's definition, a separate Card read, is denied.
+  const limited = WyrdClient.connect({ credential: server.scopedApiKey('ui_judged_narrow', ['executions:read']) });
   const [foreignMcp, narrowMcp] = [await mcpOver(server.baseUrl, outsider), await mcpOver(server.baseUrl, limited)];
   try {
     for (const [surface, foreign, narrow] of [['node', nodeExecutor(outsider), nodeExecutor(limited)], ['mcp', foreignMcp.executor, narrowMcp.executor]] as const) {
@@ -1446,7 +1448,7 @@ judged('a judged execution shows its judgments, accepted inputs, completed detai
       expect(partial.invocations, surface).toBeUndefined();
       expect([partial.definition, partial.inputs], surface).toMatchObject([
         { state: 'denied', problem: { code: DENIED } },
-        { state: 'denied', problem: { code: DENIED } }
+        { state: 'populated', data: { kind: 'json', value: 'no' } }
       ]);
     }
   } finally {
@@ -2066,15 +2068,15 @@ traced('a session judgment cites an exact trace: the citation leads to its pinne
     }
 
     // A principal that may read executions but not traces still sees the citation; the trace itself is refused to it, and the refusal is drawn.
-    const narrowClient = WyrdClient.connect({ credential: server.scopedApiKey('ui_traced_narrow', ['verifier:read']) });
+    const narrowClient = WyrdClient.connect({ credential: server.scopedApiKey('ui_traced_narrow', ['executions:read']) });
     const narrowMcp = await mcpOver(server.baseUrl, narrowClient);
     try {
       for (const [surface, narrow] of [['node', nodeExecutor(narrowClient)], ['mcp', narrowMcp.executor]] as const) {
         expect((await recorded(narrow, surface)).requirements, surface).toEqual(before.requirements);
         const refused = await loadTraceWaterfall({ traceId: SESSION_TRACE }, { executor: narrow });
-        expect(refused.result, surface).toMatchObject({ state: 'denied', problem: { code: DENIED } });
+        expect(refused.result, surface).toMatchObject({ state: 'denied', problem: { code: QUERY_FORBIDDEN } });
         const drawn = render(TraceWaterfall, refused);
-        expect(drawn.container.textContent, surface).toContain(DENIED);
+        expect(drawn.container.textContent, surface).toContain(QUERY_FORBIDDEN);
         expect(drawn.container.textContent, surface).not.toContain('edit-file');
         drawn.unmount();
       }

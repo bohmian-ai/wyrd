@@ -185,8 +185,18 @@ async function humanSignIn(browser: Browser, base: string, tenantKey: string, co
   return page;
 }
 
-/** Builds the production BFF that `startBff` runs. */
-const buildUi = () => execFileSync('pnpm', ['exec', 'vite', 'build'], { stdio: 'inherit', env: { ...process.env, VITEST: '' } });
+let built = false;
+
+/**
+ * Builds the production BFF that `startBff` runs, once for the file. A build
+ * replaces `build/`, and a host still serving the previous one exits on its
+ * first missing asset, so no journey rebuilds under a running host.
+ */
+const buildUi = () => {
+  if (built) return;
+  execFileSync('pnpm', ['exec', 'vite', 'build'], { stdio: 'inherit', env: { ...process.env, VITEST: '' } });
+  built = true;
+};
 
 /** The built BFF, a browser, and a tenant holding one trace; the default tenant holds another. */
 const test = serverTest().extend<{ ui: { base: string; browser: Browser; tenant: string; adminKey: string; readerKey: string; serverUrl: string } }>({
@@ -1835,11 +1845,13 @@ judged('session, drift and cited judgments open as pages: members in recorded or
     expect(await agrees.locator('li .mono').allTextContents()).toEqual(['answer']);
     await captureExecution(page, 'judged');
 
-    // A principal that may read executions but not query evidence sees the drift judgment, and its window and history as refused.
-    const narrow = await signIn(browser, bff.url, tenant, server.scopedApiKey('ui_page_narrow', ['verifier:read']));
+    // Execution read covers the judgment with its window and history; the Verifier that declares the baseline is a separate Card and stays refused.
+    const narrow = await signIn(browser, bff.url, tenant, server.scopedApiKey('ui_page_narrow', ['executions:read']));
     await narrow.goto(at(drifted));
-    await expect.poll(() => narrow.locator('[data-drift] [data-part="Window and history"]').textContent()).toContain('WYRD_PERMISSION_403_DENIED_RBAC');
-    expect(await narrow.getByRole('region', { name: 'Drift features' }).locator('tbody tr').count()).toBeGreaterThan(0);
+    await expect.poll(() => narrow.getByRole('region', { name: 'Drift features' }).locator('tbody tr').count()).toBeGreaterThan(0);
+    expect(await narrow.locator('[data-drift] [data-part="Window and history"]').count()).toBe(0);
+    expect(await narrow.locator('[data-drift] [data-declared]').count()).toBe(0);
+    expect(await narrow.locator('main').textContent()).toContain('WYRD_PERMISSION_403_DENIED_RBAC');
     await captureExecution(narrow, 'drift-refused');
   } finally {
     await browser.close();
@@ -2525,11 +2537,11 @@ connected('a tenant connects GitHub from Settings, reads its Repository Cards ap
     }
     expect(await serverHtml(page, `${base}/repositories/nowhere?version=1.0.0`)).toMatch(/WYRD_[A-Z]+_404_/);
 
-    // A viewer reads the Cards but not the connection: the refusal is shown as such, with no control and no guessed access.
+    // A viewer reads the Cards but not the connection: the refusal is shown as such, with the access request as its only control and no guessed access.
     const viewer = await signIn(browser, bff.url, tenant, server.bootstrapService(['viewer'], 'repositories_ui_viewer'));
     await viewer.goto(`${base}/settings/integrations/github`);
     await expect.poll(() => viewer.locator('main').textContent()).toContain('WYRD_PERMISSION_403_DENIED_RBAC');
-    expect(await viewer.locator('main').getByRole('button').count()).toBe(0);
+    expect(await viewer.locator('main').getByRole('button').allTextContents()).toEqual(['Copy access request']);
     expect(await viewer.locator('main').textContent()).not.toContain('acme/');
     await viewer.goto(`${base}/repositories`);
     await expect.poll(() => viewer.locator('main').textContent()).toContain('GitHub connection unavailable');
@@ -3099,5 +3111,37 @@ test('Access tells an unavailable server apart from a refusal', async ({ ui }) =
     for (const page of contexts) await page.context().close();
     bff.stop();
     hop.close();
+  }
+});
+
+test('Access works from the keyboard and fits a phone and a desktop in light and dark', async ({ ui }) => {
+  const page = await signIn(ui.browser, ui.base, TENANT, ui.adminKey);
+  try {
+    await page.goto(`${ui.base}/t/${TENANT}/settings/access`);
+    for (const width of [1280, 390]) {
+      await page.setViewportSize({ width, height: 900 });
+      for (const mode of ['light', 'dark'] as const) {
+        await page.evaluate((next) => ((document.querySelector('.app-root') as HTMLElement).dataset.mode = next), mode);
+        // Nothing is pushed off the side of the screen; a wide table scrolls inside its own region.
+        expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(width);
+        if (process.env.WYRD_UI_CAPTURE_DIR) await page.screenshot({ path: join(process.env.WYRD_UI_CAPTURE_DIR, `access-${mode}-${width}.png`), fullPage: true });
+      }
+    }
+
+    // The keyboard alone opens another tab, and the control it lands on next shows a focus ring.
+    await page.getByRole('link', { name: 'Service accounts', exact: true }).focus();
+    await page.keyboard.press('Enter');
+    await page.waitForURL(/tab=services/);
+    await page.getByLabel('Name', { exact: true }).focus();
+    await page.keyboard.press('Tab');
+    const ring = await page.evaluate(() => {
+      const style = getComputedStyle(document.activeElement as Element);
+      return { inMain: Boolean(document.activeElement?.closest('main')), style: style.outlineStyle, width: parseFloat(style.outlineWidth) };
+    });
+    expect(ring.inMain).toBe(true);
+    expect(ring.style).not.toBe('none');
+    expect(ring.width).toBeGreaterThan(0);
+  } finally {
+    await page.context().close();
   }
 });

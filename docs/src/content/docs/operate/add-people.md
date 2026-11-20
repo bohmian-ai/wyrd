@@ -128,7 +128,7 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/
 
 The response shows `"state":"Active"`. The recovery key proves an administrator can still get in with a key if the provider ever breaks; Wyrd checks it and does not store it. Keep the `admin_credential` in your secret manager for that reason.
 
-## 6. Sign in and grant roles
+## 6. Sign in and grant access
 
 Each person signs in once from a terminal:
 
@@ -136,14 +136,14 @@ Each person signs in once from a terminal:
 wyrd auth login --server https://wyrd.example.com --tenant acme
 ```
 
-The browser opens at your provider. After sign-in, the CLI and every SDK on that machine use the saved login. That first sign-in creates their account, which holds no role yet. As the administrator, find it and grant a role:
+The browser opens at your provider. After sign-in, the CLI and every SDK on that machine use the saved login. That first sign-in creates their account, which holds no grant yet. As the administrator, find it and bind a role at a scope:
 
 ```bash
 wyrd principal list --kind user --email alice@example.com
-wyrd principal role grant --principal <principal-id> --role editor
+wyrd principal access grant --principal <principal-id> --kind user --grant editor:all
 ```
 
-The role takes effect within 5 minutes, when their access token next renews. [Roles](/understand/identity-and-authorization/#roles) lists what each role allows.
+`editor:all` covers the whole tenant; `viewer:Repository/payments` would cover one Repository family. The grant reaches their current session within about 5 seconds; they do not sign in again. [Roles](/understand/identity-and-authorization/#roles) lists what each role allows.
 
 ## Map provider groups to roles
 
@@ -177,14 +177,14 @@ Then add `groups` to `claim_mapping` and a `group_role_map` to `connection.json`
 
 Repeat steps 3 to 5 with the new `revision` the stage call returns. Only a connection that passes its own test replaces the active one, so sign-in keeps working until then.
 
-Wyrd recomputes a person's group roles at every sign-in. Remove someone from `wyrd-editors` and they lose `editor` the next time they sign in. Groups not in the map grant nothing, and a role name that does not exist in the tenant is ignored. Roles you grant with `wyrd principal role grant` are separate: sign-in never adds or removes them.
+Wyrd recomputes a person's group roles at every sign-in. Remove someone from `wyrd-editors` and they lose `editor` the next time they sign in. Groups not in the map grant nothing, and a role name that does not exist in the tenant is ignored. Bindings you grant with `wyrd principal access grant` are separate: sign-in never adds or removes them.
 
 ## Without an identity provider
 
 Until you connect a provider, give each person a key on their own account:
 
 ```bash
-wyrd principal credential create-principal --name alice --role editor
+wyrd principal credential create-principal --name alice --grant editor:all
 ```
 
 They set it as `WYRD_API_KEY`. Each call is audited under that account. The account is a Service account, not a user, and has no browser sign-in. Revoke it with `wyrd principal revoke` when they leave.
@@ -196,7 +196,7 @@ They set it as `WYRD_API_KEY`. Each call is audited under that account. The acco
 | The provider says the redirect URI is invalid | Register the exact `callback_url` from step 1. Call the API at the public address, not an internal one |
 | `WYRD_AUTH_409_CONNECTION_NOT_TESTED` from activate | The test expired after 15 minutes, or you staged a new revision since. Rerun step 4 |
 | `WYRD_AUTH_409_CONNECTION_CONFLICT` | `expected_revision` is stale, or the recovery key is not an admin key of this tenant. Read the current revision with the step 1 call |
-| A person signs in but every call returns `WYRD_PERMISSION_403_DENIED_RBAC` | They hold no role yet. Grant one as in step 6, or check the `groups` claim and `group_role_map` if you map groups |
+| A person signs in but every call returns `WYRD_PERMISSION_403_DENIED_RBAC` | They hold no grant yet. Bind one as in step 6, or check the `groups` claim and `group_role_map` if you map groups |
 
 ## Next
 

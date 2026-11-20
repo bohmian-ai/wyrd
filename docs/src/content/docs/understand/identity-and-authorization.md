@@ -40,21 +40,37 @@ Each Service has at most one restricted account, and its scheduled Verifiers run
 
 ## Keys and tokens
 
-The client exchanges a key for an access token that lasts 5 minutes, and renews it automatically. A role change reaches a running Service at its next renewal. An account can hold several keys, which is how keys rotate: issue a new key, deploy it, then revoke the old one.
+The client exchanges a key for an access token that lasts 5 minutes, and renews it automatically. The token says who is calling; it does not carry the account's grants. The server checks current grants on every call, so a grant or removal reaches running servers within about 5 seconds, on tokens already issued, without a new sign-in or renewal. An account can hold several keys, which is how keys rotate: issue a new key, deploy it, then revoke the old one.
 
 ## Roles
 
-A permission is written `resource:action`, such as `cards:write`. A role is a set of permissions. Every tenant has four built-in roles, each including everything in the one above it:
+A permission is written `resource:action`, such as `cards:write`. A role is a set of operations; it says what an account may do, never where. A binding gives one role to one account or group at one explicit scope:
 
-| Role | Adds | Typical holder |
+| Scope | Covers |
+| --- | --- |
+| `all` | Every object in the tenant |
+| `KIND/NAME`, such as `Repository/payments` | That Card family: every version, future versions, and their retained evidence |
+| `KIND/NAME@UID` | One exact Card version only |
+
+Grants from several bindings add up, and nothing is granted by default: signing in alone grants nothing. Every tenant has six built-in roles. They are separate bundles, not a ladder:
+
+| Role | Allows within its scope | Typical holder |
 | --- | --- | --- |
-| `viewer` | Reading Cards, results, the audit log, and Bifrost tables | A person who inspects results |
-| `workload` | Recording Runs and observations, running Verifiers, calling the LLM gateway | A running Service |
-| `editor` | Declaring and deleting Cards, uploading artifacts | CI, or a person who changes declarations |
-| `admin` | Everything, including accounts, keys, and gateway settings | The tenant administrator |
+| `viewer` | Reading Cards, executions, results, and evidence, and authorized Bifrost queries; not the audit log or captured gateway payloads | A person who inspects results |
+| `workload` | Viewer reads, plus recording Runs and observations, running and cancelling Verifiers, and calling granted LLM gateways | A running Service |
+| `editor` | Workload operations, plus declaring and deleting Cards, uploading artifacts, and locking policy; no approvals or access administration | CI, or a person who changes declarations |
+| `approver` | Reading Cards and deciding pending approvals of the bound Verifiers; no execution reads, authoring, or running | A person who signs off on a step |
+| `auditor` | Reading the tenant audit log; nothing else | A security reviewer |
+| `admin` | Everything, including accounts, keys, grants, and gateway settings; bound at `all` only | The tenant administrator |
 
-Roles apply to the whole tenant. `workload` cannot change a Card, so a running Service cannot change what it is verified against.
+`workload` cannot change a Card, so a running Service cannot change what it is verified against. Built-in roles are read-only; an administrator can add custom roles from the same operations with `wyrd principal access put-role`.
+
+## Executions and their evidence
+
+An execution and everything it records, including results, publications, approvals, and evidence, are read through its trusted parent, which the server fixes when it accepts the work: the subject Card for ordinary verification, the Verifier for direct work with no subject, and the Repository for pull request work. Reading them needs `executions:read` on that parent, which `viewer` holds; access to the Verifier that ran is not needed and does not unlock them. An execution whose parent the caller cannot read looks the same as one that does not exist.
+
+Deciding an approval needs `verifier:approve` on the execution's Verifier and `executions:read` on its parent. An `approver` bound to a Verifier therefore also needs a `viewer` binding on the parent, such as the Repository for pull request work.
 
 ## Every decision is audited
 
-Wyrd checks the permission before the operation proceeds. Each `allowed` or `denied` decision is recorded in the background in `bifrost.system.audit_log`, a Bifrost table a `viewer` can query.
+Wyrd checks the permission before the operation proceeds. Each `allowed` or `denied` decision is recorded in the background in `bifrost.system.audit_log`, a Bifrost table only `auditor` and `admin` can query.

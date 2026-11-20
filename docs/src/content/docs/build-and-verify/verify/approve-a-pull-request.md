@@ -12,7 +12,7 @@ Have a pull request's Verifier wait for a person to sign off, then approve it so
 ## Before you start
 
 - A repository connected and declared as in [Repositories](/build-and-verify/declare/declare-a-repository/).
-- A credential for the approver that holds `verifier:approve` on the Verifier, such as one with the `editor` role.
+- A credential for the approver with two grants: `approver` on the Verifier, and `viewer` on the Repository, because a pull request's execution is read through its Repository. `editor` cannot approve. [Permissions](/operate/grant-and-inspect-permissions/#2-bind-or-remove-a-role) shows how to bind them, such as `approver:Verifier/<verifier-name>` and `viewer:Repository/<repository-name>`.
 
 ## 1. Add an approval step
 
@@ -92,7 +92,7 @@ The SDKs decide on the execution handle: `execution.decide(approval_id, "approve
 
 | You see | Fix |
 | --- | --- |
-| `WYRD_PERMISSION_403_DENIED_RBAC` | The approver needs `verifier:approve` on this Verifier and read access to the Card it verifies |
+| `WYRD_PERMISSION_403_DENIED_RBAC` | The approver needs `approver` on this Verifier and `viewer` on the Repository |
 | `WYRD_VERIFICATION_404_APPROVAL_NOT_FOUND` | Copy the `approval_id` from this execution's `approvals`; each execution has its own |
 | `WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING` | It was already decided, or the execution ended; `details.status` says which. Inspect the execution |
 | `WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE` | The outcome is unknown: run the same command again; a stored decision replays |

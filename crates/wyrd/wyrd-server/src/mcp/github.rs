@@ -107,7 +107,7 @@ pub(super) fn review_descriptors() -> Vec<Tool> {
          host is the connection's host; repository_id is GitHub's numeric repository id. \
          Reuse idempotency_key to retry the same request; a new key admits a new generation \
          and supersedes the older one. Members run under the Repository declaration's \
-         authority. Requires cards:read, and verifier:read and verifier:run on every selected \
+         authority. Requires cards:read, and verifier:run on every selected \
          Verifier; WYRD_GITHUB_409_PULL_REQUEST_NOT_REVIEWABLE (details.reason not_found, \
          closed, draft or no_bindings) accepts nothing.",
         false,

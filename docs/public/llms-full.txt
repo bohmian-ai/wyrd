@@ -1712,9 +1712,9 @@ Open a pull request on the repository. When GitHub delivers the event, Wyrd queu
 wyrd execution status --execution-id <execution_id>
 ```
 
-Reading a pull request's execution needs `cards:read` as well as `verifier:read` on its Verifier. Its `pull_request` field shows what the execution was pinned to when GitHub's delivery was accepted: the pull request `number`, the `base` and `head` branch and exact commit, the head repository (it differs for a fork), the `generation` shared by every execution admitted together, its complete `members`, and the `delivery_id` or review `request_key` that admitted it. The policy is always the repository's selected version at that moment, never `wyrd.toml` from the pull request's own branch.
+Reading a pull request's execution, its results, and its evidence needs `executions:read` on the Repository, which a `viewer` binding on the Repository gives; no grant on the Verifier is needed. Its `pull_request` field shows what the execution was pinned to when GitHub's delivery was accepted: the pull request `number`, the `base` and `head` branch and exact commit, the head repository (it differs for a fork), the `generation` shared by every execution admitted together, its complete `members`, and the `delivery_id` or review `request_key` that admitted it. The policy is always the repository's selected version at that moment, never `wyrd.toml` from the pull request's own branch.
 
-To review a pull request again without a new commit, send `POST /v1/integrations/github/pull-requests/reviews` with its `host`, `repository_id` and `number` and an `Idempotency-Key`, or call `review_pull_request` on `GithubConnection` in an SDK or `github_connection.review_pull_request` over MCP. Wyrd admits a new generation under the selected policy, supersedes the older one, and returns the `generation` and every member execution, refused ones included. A retry with the same key returns the same generation, even after the head moves. It needs `cards:read`, and `verifier:read` and `verifier:run` on every selected Verifier. A pull request that is closed, a draft, missing, or bound to no Verifier answers `WYRD_GITHUB_409_PULL_REQUEST_NOT_REVIEWABLE` with `details.reason`, and nothing is admitted.
+To review a pull request again without a new commit, send `POST /v1/integrations/github/pull-requests/reviews` with its `host`, `repository_id` and `number` and an `Idempotency-Key`, or call `review_pull_request` on `GithubConnection` in an SDK or `github_connection.review_pull_request` over MCP. Wyrd admits a new generation under the selected policy, supersedes the older one, and returns the `generation` and every member execution, refused ones included. A retry with the same key returns the same generation, even after the head moves. It needs `cards:read`, and `verifier:run` on every selected Verifier. A pull request that is closed, a draft, missing, or bound to no Verifier answers `WYRD_GITHUB_409_PULL_REQUEST_NOT_REVIEWABLE` with `details.reason`, and nothing is admitted.
 
 Every member, refused ones included, keeps its pins in `bifrost.verification.execution_inputs` with origin `pull_request`, and its `recorded_at` is the time its generation observed the pull request. The current set is the generation with the latest `recorded_at`. A set is complete only when every execution in its `members` has a record; fewer visible records mean its handoff has not finished.
 
@@ -2862,7 +2862,7 @@ Have a pull request's Verifier wait for a person to sign off, then approve it so
 ## Before you start
 
 - A repository connected and declared as in [Repositories](/wyrd/build-and-verify/declare/declare-a-repository/).
-- A credential for the approver that holds `verifier:approve` on the Verifier, such as one with the `editor` role.
+- A credential for the approver with two grants: `approver` on the Verifier, and `viewer` on the Repository, because a pull request's execution is read through its Repository. `editor` cannot approve. [Permissions](/wyrd/operate/grant-and-inspect-permissions/#2-bind-or-remove-a-role) shows how to bind them, such as `approver:Verifier/<verifier-name>` and `viewer:Repository/<repository-name>`.
 
 ## 1. Add an approval step
 
@@ -2972,7 +2972,7 @@ The SDKs decide on the execution handle: `execution.decide(approval_id, "approve
 
 | You see | Fix |
 | --- | --- |
-| `WYRD_PERMISSION_403_DENIED_RBAC` | The approver needs `verifier:approve` on this Verifier and read access to the Card it verifies |
+| `WYRD_PERMISSION_403_DENIED_RBAC` | The approver needs `approver` on this Verifier and `viewer` on the Repository |
 | `WYRD_VERIFICATION_404_APPROVAL_NOT_FOUND` | Copy the `approval_id` from this execution's `approvals`; each execution has its own |
 | `WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING` | It was already decided, or the execution ended; `details.status` says which. Inspect the execution |
 | `WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE` | The outcome is unknown: run the same command again; a stored decision replays |
@@ -3685,7 +3685,7 @@ Ship a Service with two keys: one for CI, which declares the Service and pulls i
 Once per tenant, as an administrator:
 
 ```bash
-wyrd principal credential create-principal --name ci-deploy --role editor
+wyrd principal credential create-principal --name ci-deploy --grant editor:all
 ```
 
 ```text
@@ -3694,14 +3694,14 @@ credential: <key>
 This is the only time the credential is shown. Store it now.
 ```
 
-Save the credential as the CI secret `WYRD_API_KEY`, and the server URL as `WYRD_SERVER_URL`. `editor` can declare Cards for every Service in the tenant, so one CI account covers all your repositories.
+Save the credential as the CI secret `WYRD_API_KEY`, and the server URL as `WYRD_SERVER_URL`. `editor:all` can declare Cards for every Service in the tenant, so one CI account covers all your repositories.
 
 ## 2. Create the Service's account
 
 Once per Service, not once per release:
 
 ```bash
-wyrd principal credential create-principal --name checkout-runtime --role workload --workload-name checkout
+wyrd principal credential create-principal --name checkout-runtime --grant workload:all --workload-name checkout
 ```
 
 Store this credential where your deployment reads secrets. `workload` records evidence and runs Verifiers, but cannot change a Card, so a leaked runtime key cannot change what your Service is verified against. `--workload-name checkout` limits the key to releases of `checkout`, and makes it the account that scheduled Verifiers for `checkout` run as.
@@ -3910,7 +3910,7 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/
 
 The response shows `"state":"Active"`. The recovery key proves an administrator can still get in with a key if the provider ever breaks; Wyrd checks it and does not store it. Keep the `admin_credential` in your secret manager for that reason.
 
-## 6. Sign in and grant roles
+## 6. Sign in and grant access
 
 Each person signs in once from a terminal:
 
@@ -3918,14 +3918,14 @@ Each person signs in once from a terminal:
 wyrd auth login --server https://wyrd.example.com --tenant acme
 ```
 
-The browser opens at your provider. After sign-in, the CLI and every SDK on that machine use the saved login. That first sign-in creates their account, which holds no role yet. As the administrator, find it and grant a role:
+The browser opens at your provider. After sign-in, the CLI and every SDK on that machine use the saved login. That first sign-in creates their account, which holds no grant yet. As the administrator, find it and bind a role at a scope:
 
 ```bash
 wyrd principal list --kind user --email alice@example.com
-wyrd principal role grant --principal <principal-id> --role editor
+wyrd principal access grant --principal <principal-id> --kind user --grant editor:all
 ```
 
-The role takes effect within 5 minutes, when their access token next renews. [Roles](/wyrd/understand/identity-and-authorization/#roles) lists what each role allows.
+`editor:all` covers the whole tenant; `viewer:Repository/payments` would cover one Repository family. The grant reaches their current session within about 5 seconds; they do not sign in again. [Roles](/wyrd/understand/identity-and-authorization/#roles) lists what each role allows.
 
 ## Map provider groups to roles
 
@@ -3954,14 +3954,14 @@ Then add `groups` to `claim_mapping` and a `group_role_map` to `connection.json`
 
 Repeat steps 3 to 5 with the new `revision` the stage call returns. Only a connection that passes its own test replaces the active one, so sign-in keeps working until then.
 
-Wyrd recomputes a person's group roles at every sign-in. Remove someone from `wyrd-editors` and they lose `editor` the next time they sign in. Groups not in the map grant nothing, and a role name that does not exist in the tenant is ignored. Roles you grant with `wyrd principal role grant` are separate: sign-in never adds or removes them.
+Wyrd recomputes a person's group roles at every sign-in. Remove someone from `wyrd-editors` and they lose `editor` the next time they sign in. Groups not in the map grant nothing, and a role name that does not exist in the tenant is ignored. Bindings you grant with `wyrd principal access grant` are separate: sign-in never adds or removes them.
 
 ## Without an identity provider
 
 Until you connect a provider, give each person a key on their own account:
 
 ```bash
-wyrd principal credential create-principal --name alice --role editor
+wyrd principal credential create-principal --name alice --grant editor:all
 ```
 
 They set it as `WYRD_API_KEY`. Each call is audited under that account. The account is a Service account, not a user, and has no browser sign-in. Revoke it with `wyrd principal revoke` when they leave.
@@ -3973,7 +3973,7 @@ They set it as `WYRD_API_KEY`. Each call is audited under that account. The acco
 | The provider says the redirect URI is invalid | Register the exact `callback_url` from step 1. Call the API at the public address, not an internal one |
 | `WYRD_AUTH_409_CONNECTION_NOT_TESTED` from activate | The test expired after 15 minutes, or you staged a new revision since. Rerun step 4 |
 | `WYRD_AUTH_409_CONNECTION_CONFLICT` | `expected_revision` is stale, or the recovery key is not an admin key of this tenant. Read the current revision with the step 1 call |
-| A person signs in but every call returns `WYRD_PERMISSION_403_DENIED_RBAC` | They hold no role yet. Grant one as in step 6, or check the `groups` claim and `group_role_map` if you map groups |
+| A person signs in but every call returns `WYRD_PERMISSION_403_DENIED_RBAC` | They hold no grant yet. Bind one as in step 6, or check the `groups` claim and `group_role_map` if you map groups |
 
 ## Next
 
@@ -4034,9 +4034,9 @@ Only a server that runs this release's Verifiers offers `call_tool` to `code.run
 
 Page: /wyrd/operate/grant-and-inspect-permissions/
 
-> See which roles a principal holds, grant or revoke a role, cut a principal off, and confirm the result in the audit log.
+> See a principal's access, bind or remove a role at an explicit scope, cut a principal off, and confirm the result in the audit log.
 
-Grant a role to give a principal more access, revoke it to take access away, and read the audit log to confirm what the server decided. Every command here changes access for the whole tenant.
+Bind a role at a scope to give a principal more access, remove the binding to take it away, and read the audit log to confirm what the server decided. Every grant names its scope: `all` for the whole tenant, or one Card family such as `Repository/payments`.
 
 ## Prerequisites
 
@@ -4045,25 +4045,30 @@ Grant a role to give a principal more access, revoke it to take access away, and
 
 If you are not sure which role you need, [Identity and access](/wyrd/understand/identity-and-authorization/#roles) lists what each built-in role allows.
 
-## 1. Find the principal and its roles
+## 1. Find the principal and its access
 
 The CLI uses your saved endpoint, or `--server` / `WYRD_SERVER_URL`:
 
 ```bash
 wyrd principal list --kind service
-wyrd principal role list --principal <principal-id>
+wyrd principal access show --principal <principal-id>
 ```
 
-A Service account holds the roles it was created with; [Deploy a Service from CI](/wyrd/operate/deploy-a-service-from-ci/) creates one with `editor` and one with `workload`. A tenant administrator holds `admin`.
+`show` prints one `grant` line per binding, with its binding ID, `role:scope`, and source (`direct`, `provider`, or `group:<name>`), then the combined permissions. A Service account holds the grants it was created with; [Deploy a Service from CI](/wyrd/operate/deploy-a-service-from-ci/) creates one with `editor:all` and one with `workload:all`. A tenant administrator holds `admin:all`.
 
-## 2. Grant or revoke a role
+## 2. Bind or remove a role
+
+A grant is `ROLE:SCOPE`. The scope is required: `all`, `KIND/NAME` for a Card family and its future versions, or `KIND/NAME@UID` for one exact version.
 
 ```bash
-wyrd principal role grant --principal <principal-id> --role editor
-wyrd principal role revoke --principal <principal-id> --role editor
+wyrd principal access grant --principal <principal-id> --kind service --grant editor:all
+wyrd principal access grant --principal <principal-id> --kind user --grant viewer:Repository/payments
+wyrd principal access revoke --binding <binding-id>
 ```
 
-The same call from an SDK:
+`grant` prints the binding: its ID, `role:scope`, subject, and source. `revoke` takes that binding ID, which `show` also lists.
+
+The same calls from an SDK:
 
 **Python**
 
@@ -4071,18 +4076,28 @@ The same call from an SDK:
 from wyrd.auth import Principals
 
 principals = Principals()
-result = principals.grant_role(principal_id, "editor")
-print(result["changed"], result["roles"])
+binding = principals.bind(
+    {"subject": {"principal": {"id": principal_id, "kind": "service"}}, "role": "editor", "scope": "all"}
+)
+print([(grant["role"], grant["source"]["kind"]) for grant in principals.access(principal_id)["grants"]])
+principals.unbind(binding["id"])
 ```
 
 **Rust**
 
 ```rust
-use wyrd_ai::auth::Principals;
+use wyrd_ai::auth::{BindingSubject, CreateRoleBindingRequest, PermissionScope, PrincipalKindTag, Principals};
 
 let principals = Principals::connect().await?;
-let result = principals.grant_role(&principal_id, "editor").await?;
-println!("{} {:?}", result.changed, result.roles);
+let binding = principals
+    .bind(&CreateRoleBindingRequest {
+        subject: BindingSubject::Principal { id: principal_id, kind: PrincipalKindTag::Service },
+        role: "editor".to_owned(),
+        scope: PermissionScope::All,
+    })
+    .await?;
+println!("{:?}", principals.access(&principal_id).await?.grants);
+principals.unbind(&binding.id).await?;
 ```
 
 **TypeScript**
@@ -4091,13 +4106,18 @@ println!("{} {:?}", result.changed, result.roles);
 import { Principals } from "wyrd-ai";
 
 const principals = await Principals.connect();
-const result = await principals.grantRole(principalId, "editor");
-console.log(result.changed, result.roles);
+const binding = await principals.bind({
+  subject: { principal: { id: principalId, kind: "service" } },
+  role: "editor",
+  scope: "all",
+});
+console.log((await principals.access(principalId)).grants);
+await principals.unbind(binding.id);
 ```
 
-A grant is idempotent: granting a role the principal already holds returns `changed: false` and the unchanged role list.
+A bind is idempotent: binding the same role at the same scope again returns the same binding.
 
-The change reaches a running service within 5 minutes, when its access token is next renewed. Revoking a role that a person also gets from an identity-provider group does not remove it; change the group mapping instead.
+The change reaches running servers within about 5 seconds, including on credentials and tokens the principal already holds; nothing needs to sign in again or renew a token. Removing one binding leaves any other binding that grants the same access, such as `admin:all` or a group or identity-provider binding. A provider binding cannot be removed here; change the group mapping instead.
 
 ## 3. Cut a principal off
 
@@ -4127,9 +4147,9 @@ Run it with any SDK's `Bifrost.sql`, or the `bifrost.query` MCP tool. A refused 
 
 | Error code | Cause | Fix |
 | --- | --- | --- |
-| `WYRD_PERMISSION_403_DENIED_RBAC` on `grant` or `revoke` | Your credential does not hold `admin` | Use the tenant administrator's credential |
+| `WYRD_PERMISSION_403_DENIED_RBAC` on `grant` or `revoke` | Your credential is not a tenant administrator's | Use the tenant administrator's credential |
 | `WYRD_AUTH_401_CREDENTIAL_REVOKED` | The principal or its tenant is suspended | Ask a tenant or platform administrator to restore it |
-| The service still has the old access | Its token was issued before the change | Wait up to 5 minutes for the next renewal |
+| The principal still has the old access after 5 seconds | Another binding still grants it | Run `wyrd principal access show` and remove or change the binding that still grants it |
 
 # Troubleshooting
 
@@ -4316,7 +4336,7 @@ To release the installation, run `wyrd github disconnect`. Wyrd stops starting G
 
 ## Next
 
-- [Grant and inspect permissions](/wyrd/operate/grant-and-inspect-permissions/): connecting needs `identity_connections:write`, which `admin` holds.
+- [Grant and inspect permissions](/wyrd/operate/grant-and-inspect-permissions/): reading the connection needs `github_connections:read` and connecting or disconnecting `github_connections:write`; `admin` holds both. Neither grants OIDC administration or any Card.
 
 # Architecture
 
@@ -4732,24 +4752,40 @@ Each Service has at most one restricted account, and its scheduled Verifiers run
 
 ## Keys and tokens
 
-The client exchanges a key for an access token that lasts 5 minutes, and renews it automatically. A role change reaches a running Service at its next renewal. An account can hold several keys, which is how keys rotate: issue a new key, deploy it, then revoke the old one.
+The client exchanges a key for an access token that lasts 5 minutes, and renews it automatically. The token says who is calling; it does not carry the account's grants. The server checks current grants on every call, so a grant or removal reaches running servers within about 5 seconds, on tokens already issued, without a new sign-in or renewal. An account can hold several keys, which is how keys rotate: issue a new key, deploy it, then revoke the old one.
 
 ## Roles
 
-A permission is written `resource:action`, such as `cards:write`. A role is a set of permissions. Every tenant has four built-in roles, each including everything in the one above it:
+A permission is written `resource:action`, such as `cards:write`. A role is a set of operations; it says what an account may do, never where. A binding gives one role to one account or group at one explicit scope:
 
-| Role | Adds | Typical holder |
+| Scope | Covers |
+| --- | --- |
+| `all` | Every object in the tenant |
+| `KIND/NAME`, such as `Repository/payments` | That Card family: every version, future versions, and their retained evidence |
+| `KIND/NAME@UID` | One exact Card version only |
+
+Grants from several bindings add up, and nothing is granted by default: signing in alone grants nothing. Every tenant has six built-in roles. They are separate bundles, not a ladder:
+
+| Role | Allows within its scope | Typical holder |
 | --- | --- | --- |
-| `viewer` | Reading Cards, results, the audit log, and Bifrost tables | A person who inspects results |
-| `workload` | Recording Runs and observations, running Verifiers, calling the LLM gateway | A running Service |
-| `editor` | Declaring and deleting Cards, uploading artifacts | CI, or a person who changes declarations |
-| `admin` | Everything, including accounts, keys, and gateway settings | The tenant administrator |
+| `viewer` | Reading Cards, executions, results, and evidence, and authorized Bifrost queries; not the audit log or captured gateway payloads | A person who inspects results |
+| `workload` | Viewer reads, plus recording Runs and observations, running and cancelling Verifiers, and calling granted LLM gateways | A running Service |
+| `editor` | Workload operations, plus declaring and deleting Cards, uploading artifacts, and locking policy; no approvals or access administration | CI, or a person who changes declarations |
+| `approver` | Reading Cards and deciding pending approvals of the bound Verifiers; no execution reads, authoring, or running | A person who signs off on a step |
+| `auditor` | Reading the tenant audit log; nothing else | A security reviewer |
+| `admin` | Everything, including accounts, keys, grants, and gateway settings; bound at `all` only | The tenant administrator |
 
-Roles apply to the whole tenant. `workload` cannot change a Card, so a running Service cannot change what it is verified against.
+`workload` cannot change a Card, so a running Service cannot change what it is verified against. Built-in roles are read-only; an administrator can add custom roles from the same operations with `wyrd principal access put-role`.
+
+## Executions and their evidence
+
+An execution and everything it records, including results, publications, approvals, and evidence, are read through its trusted parent, which the server fixes when it accepts the work: the subject Card for ordinary verification, the Verifier for direct work with no subject, and the Repository for pull request work. Reading them needs `executions:read` on that parent, which `viewer` holds; access to the Verifier that ran is not needed and does not unlock them. An execution whose parent the caller cannot read looks the same as one that does not exist.
+
+Deciding an approval needs `verifier:approve` on the execution's Verifier and `executions:read` on its parent. An `approver` bound to a Verifier therefore also needs a `viewer` binding on the parent, such as the Repository for pull request work.
 
 ## Every decision is audited
 
-Wyrd checks the permission before the operation proceeds. Each `allowed` or `denied` decision is recorded in the background in `bifrost.system.audit_log`, a Bifrost table a `viewer` can query.
+Wyrd checks the permission before the operation proceeds. Each `allowed` or `denied` decision is recorded in the background in `bifrost.system.audit_log`, a Bifrost table only `auditor` and `admin` can query.
 
 # Verifier Card
 
@@ -5143,7 +5179,7 @@ import json
 
 card = await call_tool('cards.get', {'card_ref': {'kind': 'Service', 'name': 'policy-desk', 'version': '1.0.0'}})
 try:
-    await call_tool('bifrost.query', {'sql': 'SELECT execution_id FROM bifrost.verification.results LIMIT 1', 'max_rows': 1})
+    await call_tool('bifrost.query', {'sql': 'SELECT name FROM bifrost.traces.spans LIMIT 1', 'max_rows': 1})
     query = 'allowed'
     again = None
 except RuntimeError as error:
@@ -5368,20 +5404,20 @@ Tool names contain dots, which many model providers refuse, so each framework fo
 | `cards.list` | `cards:read` | List filters and optional cursor → `{items, next_cursor}` | List Card summaries |
 | `cards.get` | `cards:read` | `{card_ref}` or `{kind, card_uid}` → `{card, created_at, updated_at}` | Read one Card; pass exactly one form |
 | `verification.get_binding` | `cards:read` | `{binding_id}` → binding status | Read one binding |
-| `verification.get_execution` | `verifier:read` on the execution's Verifier | `{execution_id}` → execution status with its compact result | Read one execution |
-| `verification.get_execution_details` | `verifier:read` on the execution's Verifier | `{execution_id}` → execution details: checks, provenance, steps, and pinned evidence | Read what one completed execution ran |
-| `verification.list_invocations` | `verifier:read` on the execution's Verifier | `{execution_id, limit?, cursor?}` → `{execution_id, status, items, next_cursor, history}` | Page invocation attempts and their progress |
-| `verification.list_publications` | `verifier:read` on the execution's Verifier | `{execution_id, limit?, cursor?}` → `{execution_id, items, next_cursor}` | Page publication names, kinds, and producers |
-| `verification.get_publication` | `verifier:read` on the execution's Verifier | `{execution_id, step_id, name, attempt, item_index?, iteration_index?}` → publication | Read one publication's JSON value or manifest |
-| `verification.download_publication` | `verifier:read` on the execution's Verifier | The `verification.get_publication` arguments plus `path` for a directory → `{plan, size_bytes, sha256}` | Plan one publication file's download |
+| `verification.get_execution` | `executions:read` on the execution's trusted parent | `{execution_id}` → execution status with its compact result | Read one execution |
+| `verification.get_execution_details` | `executions:read` on the execution's trusted parent | `{execution_id}` → execution details: checks, provenance, steps, and pinned evidence | Read what one completed execution ran |
+| `verification.list_invocations` | `executions:read` on the execution's trusted parent | `{execution_id, limit?, cursor?}` → `{execution_id, status, items, next_cursor, history}` | Page invocation attempts and their progress |
+| `verification.list_publications` | `executions:read` on the execution's trusted parent | `{execution_id, limit?, cursor?}` → `{execution_id, items, next_cursor}` | Page publication names, kinds, and producers |
+| `verification.get_publication` | `executions:read` on the execution's trusted parent | `{execution_id, step_id, name, attempt, item_index?, iteration_index?}` → publication | Read one publication's JSON value or manifest |
+| `verification.download_publication` | `executions:read` on the execution's trusted parent | The `verification.get_publication` arguments plus `path` for a directory → `{plan, size_bytes, sha256}` | Plan one publication file's download |
 | `verification.evidence` | `verifier:run` | `{files: [{sha256, size_bytes}]}` → `{uploads: [{sha256, upload_id, plan}]}` | Plan uploads for files the tenant lacks; complete each with `POST /v1/cards/upload/{upload_id}/complete` |
 | `verification.publish_evidence` | `verifier:run` on each subscribed Verifier | `{repository: "owner/name", tags: {commit}, input, value}` → `{evidence_id, repository, tags, input, status, matched_subscriptions, recorded_at}` | Publish a deferred input for one commit; waiting executions resume; `status` is `accepted` or `replayed` |
 | `verification.execute` | `verifier:run` on exact Verifier | Verifier, subject, optional `run_id`, and named input declarations → `VerificationResult` | Verify now and store the result; no Operator dispatch |
 | `verification.enqueue` | `verifier:run` on exact Verifier | The `verification.execute` arguments plus optional `idempotency_key` → `{execution_id}` | Queue a verification; poll `verification.get_execution` |
 | `verification.cancel` | `verifier:run` on the execution's Verifier | `{execution_id}` → `{execution_id, status}` | Cancel unfinished queued work; settled work keeps its status |
-| `verification.decide_approval` | `verifier:approve` on the execution's Verifier and `cards:read` on its subject | `{execution_id, approval_id, decision, reason?}` → `{approval_id, status, actor_id, decided_at, reason}` | Approve or reject one pending approval; the same execution continues; the same decision and reason replays |
+| `verification.decide_approval` | `verifier:approve` on the execution's Verifier and `executions:read` on its trusted parent | `{execution_id, approval_id, decision, reason?}` → `{approval_id, status, actor_id, decided_at, reason}` | Approve or reject one pending approval; the same execution continues; the same decision and reason replays |
 
-`cards.list.filter` is a query string, such as `labels.env = "prod" and labels.deprecated not exists`, over `labels.<key>`, `annotations.<key>`, and `attributes.<key>`, with `=`, `in`, `not exists`, `and`, `or`, and `not`; at most 64 predicates. A caller passes `next_cursor` back unchanged with the same filters. Missing and foreign-tenant Cards look the same. `verification.execute` refuses a scheduled drift Verifier.
+`cards.list.filter` is a query string, such as `labels.env = "prod" and labels.deprecated not exists`, over `labels.<key>`, `annotations.<key>`, and `attributes.<key>`, with `=`, `in`, `not exists`, `and`, `or`, and `not`; at most 64 predicates. A caller passes `next_cursor` back unchanged with the same filters. Missing and foreign-tenant Cards look the same. An execution's trusted parent is fixed when the work is accepted: the subject Card, the Verifier for direct work with no subject, or the Repository for pull request work; a grant on the Verifier that ran does not unlock it. An execution whose parent the caller cannot read answers not found. `verification.execute` refuses a scheduled drift Verifier.
 
 ## Bifrost
 
@@ -5428,16 +5464,16 @@ A token already minted from a revoked credential lapses within five minutes.
 ## GitHub connection
 
 The read is listed for every caller; connect and disconnect are listed only for
-a caller holding `identity_connections:write`, and the review request only for
+a caller holding `github_connections:write`, and the review request only for
 one holding any `verifier:run`. GitHub's setup and OAuth callback are
 browser redirects, not tools.
 
 | Tool | Permission | Input → output | Purpose |
 | --- | --- | --- | --- |
-| `github_connection.get` | `identity_connections:write` | `{}` → GithubConnectionView | Read the tenant's redacted connection |
-| `github_connection.connect` | `identity_connections:write` | `{}` → GithubConnectResponse | Begin a connection; a signed-in human opens the returned install URL |
-| `github_connection.disconnect` | `identity_connections:write` | `{}` → GithubConnectionView | Fence GitHub work and release the installation |
-| `github_connection.review_pull_request` | `cards:read`; `verifier:read` and `verifier:run` on every selected Verifier | `{host, repository_id, number, idempotency_key}` → GithubPullRequestReviewResponse | Request a fresh review of an open, ready pull request by its Repository's whole binding set; a retry of the key returns the same generation and members |
+| `github_connection.get` | `github_connections:read` | `{}` → GithubConnectionView | Read the tenant's redacted connection |
+| `github_connection.connect` | `github_connections:write` | `{}` → GithubConnectResponse | Begin a connection; a signed-in human opens the returned install URL |
+| `github_connection.disconnect` | `github_connections:write` | `{}` → GithubConnectionView | Fence GitHub work and release the installation |
+| `github_connection.review_pull_request` | `cards:read`; `verifier:run` on every selected Verifier | `{host, repository_id, number, idempotency_key}` → GithubPullRequestReviewResponse | Request a fresh review of an open, ready pull request by its Repository's whole binding set; a retry of the key returns the same generation and members |
 
 ## Gateway administration
 

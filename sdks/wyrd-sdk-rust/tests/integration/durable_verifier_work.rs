@@ -587,9 +587,10 @@ async fn execution_pages_are_stable_and_tenant_scoped() {
             .await,
     )
     .await;
+    // Without the parent the execution reads as unknown.
     assert_eq!(
         refused(elsewhere.publications(&ExecutionPageQuery::default()).await),
-        "WYRD_PERMISSION_403_DENIED_RBAC"
+        "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND"
     );
     let exact = as_key(
         deployment

@@ -125,7 +125,7 @@ def test_execution_pages_are_stable_and_tenant_scoped(
             ],
         )
     )
-    assert refused(elsewhere.publications) == DENIED
+    assert refused(elsewhere.publications) == "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND"
     exact = as_key(
         wyrd_server.scoped_api_key(
             "pages_exact", [executions_read(submitted.wait(WAIT_SECONDS).subject)]

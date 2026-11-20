@@ -662,7 +662,7 @@ impl StreamAuthority {
     ///
     /// [`WyrdError::AuthorizationUnavailable`] when no usable snapshot can be
     /// acquired, and [`WyrdError::PermissionUnauthenticated`] when the
-    /// caller's grants already differ from the snapshot's.
+    /// caller is not a live account holding the snapshot's grants.
     pub async fn admit(
         cache: Arc<AuthorityCache>,
         postgres: WyrdPostgres,
@@ -674,7 +674,10 @@ impl StreamAuthority {
             .account(principal.id)
             .is_some_and(|account| *account.grants == *principal.effective_permissions.grants());
         if !current {
-            return Err(authority_changed());
+            return Err(WyrdError::PermissionUnauthenticated {
+                message: "the caller's account is not live in current authority".to_owned(),
+                details: serde_json::json!({ "reason": "inactive" }),
+            });
         }
         Ok(Self {
             cache,

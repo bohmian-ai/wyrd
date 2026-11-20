@@ -207,7 +207,9 @@ impl Registered {
     }
 }
 
-/// A fresh user of `tenant` holding exactly `permissions`.
+/// A fresh user of `tenant` holding exactly `permissions`, whose work Wyrd
+/// executes as hosted work always runs: under the accepted authority, with a
+/// SYSTEM executor, never rebound to live grants.
 pub(crate) fn user(
     tenant: DataTenantId,
     permissions: impl IntoIterator<Item = Permission>,
@@ -222,7 +224,7 @@ pub(crate) fn user(
         ),
         request_id: RequestId::now_v7(),
         delegation_chain: Vec::new(),
-        executed_by: None,
+        executed_by: Some(PrincipalId::new(uuid::Uuid::now_v7())),
     }
 }
 

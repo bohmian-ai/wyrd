@@ -3444,7 +3444,11 @@ mod pg_tests {
                     .call_tool(call(LIST_PUBLICATIONS, listing.clone())?)
                     .await,
             )?;
-            assert!(refused.contains(DENIED), "{name}: {refused}");
+            // Without the parent the execution reads as unknown.
+            assert!(
+                refused.contains("WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND"),
+                "{name}: {refused}"
+            );
             caller.cancel().await?;
         }
         let exact = server.bootstrap_service("mcp_pages_exact", &[]).await?;

@@ -754,8 +754,8 @@ fn saved_client(deployment: &Deployment, config_home: &std::path::Path) -> wyrd_
 /// Viewer bound at the `code-review` Verifier family lets a local User, signed
 /// in through the CLI device login with no identity provider, read that
 /// family and nothing else: the other family is absent from listing and
-/// refused on a direct read. Once Alice changes her password, the saved
-/// login no longer renews.
+/// refused on a direct read. A renewed login reads from memory once warm.
+/// Once Alice changes her password, the saved login no longer renews.
 ///
 /// # Panics
 /// Panics when a step fails or an outcome differs.
@@ -827,6 +827,34 @@ async fn a_family_bound_viewer_reads_only_that_family() {
         .await
         .expect_err("the other family is hidden");
     assert_eq!(refused.code(), "WYRD_REGISTRY_404_CARD_NOT_FOUND");
+
+    // A renewed login's token names its consumed refresh row, which is no
+    // stored key; after the first request settles that, the rest of its
+    // issuance second is served from memory without recompiling authority.
+    alice
+        .sso
+        .expire_saved(alice.config.path(), FIXTURE_TENANT_SLUG);
+    let renewed = Cards::connect_with(&saved_client(&deployment, alice.config.path()))
+        .await
+        .expect("the saved login renews");
+    let read = || {
+        renewed.get(CardSelector::Named {
+            kind: CardKind::Verifier,
+            name: CardName::new("code-review").expect("valid name"),
+            version: None,
+        })
+    };
+    read().await.expect("the renewed login reads");
+    let authority = &deployment.server().state().auth.authority;
+    let compiled = authority.compiles();
+    for _ in 0..20 {
+        read().await.expect("the renewed login reads");
+    }
+    assert_eq!(
+        authority.compiles(),
+        compiled,
+        "warm requests of a renewed login never recompile authority"
+    );
 
     // A changed password ends the saved login at its next renewal.
     alice

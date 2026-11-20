@@ -1316,8 +1316,9 @@ async fn password_routes_refuse_invalid_bodies() {
 ///
 /// An administrator invites with `viewer` at the payments Repository family;
 /// signup creates the User with that one binding at that scope, never
-/// tenant-wide. An assignment with no scope, or an administrative role at a
-/// Card scope, is refused at issue. An invitation whose custom role was
+/// tenant-wide. An assignment with no scope, an administrative role at a
+/// Card scope, or an exact version the tenant never registered is refused at
+/// issue. An invitation whose custom role was
 /// deleted, or whose issuer no longer administers the tenant, is refused at
 /// signup with the one-time-code refusal and creates no User.
 ///
@@ -1396,10 +1397,15 @@ async fn scoped_invitations_enroll_exactly_their_assignments() {
     .expect("bindings read");
     assert_eq!(bindings, vec![("viewer".to_owned(), payments.clone())]);
 
-    // A missing or inapplicable scope is refused at issue.
+    // A missing or inapplicable scope, or an exact version this tenant never
+    // registered, is refused at issue.
+    let unknown_version = json!({ "card": { "version": {
+        "kind": "Repository", "name": "payments", "uid": Uuid::now_v7().to_string()
+    } } });
     for assignments in [
         json!([{ "role": "viewer" }]),
         json!([{ "role": "admin", "scope": payments }]),
+        json!([{ "role": "viewer", "scope": unknown_version }]),
     ] {
         let refused = issue(admin.clone(), assignments.clone()).await;
         assert_eq!(

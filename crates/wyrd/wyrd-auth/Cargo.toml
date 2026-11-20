@@ -28,6 +28,7 @@ tracing = { workspace = true }
 unicode-normalization = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true, features = ["std", "v4"] }
+vala-sql = { workspace = true }
 wyrd-auth-issue = { workspace = true }
 wyrd-auth-oidc = { workspace = true }
 wyrd-auth-verify = { workspace = true }

@@ -106,6 +106,22 @@ pub async fn get_by_fqn(
     .map_err(SqlError::from)
 }
 
+/// The FQN of the current tenant's table registered under `table_uid`, so a
+/// grant naming that UID can be checked against the table it claims.
+///
+/// # Errors
+/// Returns [`SqlError`] when the query fails.
+pub async fn table_fqn_by_uid(
+    conn: &mut TenantConn<'_>,
+    table_uid: uuid::Uuid,
+) -> Result<Option<String>, SqlError> {
+    sqlx::query_scalar::<_, String>("SELECT fqn FROM vala.bifrost_tables WHERE table_uid = $1")
+        .bind(table_uid.as_bytes().as_slice())
+        .fetch_optional(&mut **conn.transaction())
+        .await
+        .map_err(SqlError::from)
+}
+
 /// Publish one table definition edit's Iceberg pointer and version reference
 /// in the caller's tenant transaction.
 ///

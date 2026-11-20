@@ -513,6 +513,119 @@ async fn provisioning_a_services_roles_requires_tenant_administration() {
     );
 }
 
+/// An exact Card grant must name a registered version of the family it
+/// claims in this tenant: an unknown UID, another tenant's Card, and a UID
+/// of another family are refused for a binding and for account creation,
+/// writing nothing. An exact grant of a live or deleted version and a family
+/// grant with no registered version yet are accepted.
+///
+/// # Panics
+/// Panics when the server fails to start, an invalid target is bound or
+/// creates an account, or a valid one is refused.
+#[tokio::test(flavor = "current_thread")]
+async fn exact_card_grants_must_name_a_registered_version_of_their_family() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let (_, admin_jwt) = user(&server, "ex-admin", &["admin"]).await;
+    let (target, _) = service(&server, "ex-target", &[]).await;
+    let live = register_service(&server, &admin_jwt, "ex-checkout", "1.0.0").await;
+    let deleted = register_service(&server, &admin_jwt, "ex-checkout", "2.0.0").await;
+    let other_family = register_service(&server, &admin_jwt, "ex-ledger", "1.0.0").await;
+    let (status, body) = call(
+        &server,
+        &admin_jwt,
+        Method::DELETE,
+        &format!("/v1/cards/by-uid/Service/{deleted}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let other = server.seed_tenant("ex-other").await.expect("tenant seeds");
+    let foreign = CardUid::new(Uuid::now_v7().to_string()).expect("uid");
+    server
+        .seed_card_principal_in_tenant(
+            other,
+            &serde_json::from_value(json!({
+                "kind": "Service", "name": "ex-checkout", "version": "1.0.0", "uid": foreign
+            }))
+            .expect("reference parses"),
+            &[],
+        )
+        .await
+        .expect("foreign Card seeds");
+
+    let exact = |uid: &CardUid| {
+        json!({ "card": { "version": { "kind": "Service", "name": "ex-checkout", "uid": uid } } })
+    };
+    let grant = |scope: Value| {
+        json!({
+            "subject": { "principal": { "id": target, "kind": "service" } },
+            "role": "viewer",
+            "scope": scope,
+        })
+    };
+    let unknown = CardUid::new(Uuid::now_v7().to_string()).expect("uid");
+    for (case, scope) in [
+        ("unknown", exact(&unknown)),
+        ("foreign", exact(&foreign)),
+        ("other family", exact(&other_family)),
+    ] {
+        let (status, problem) = send(
+            &server,
+            &admin_jwt,
+            Method::POST,
+            "/v1/access/bindings",
+            Some(grant(scope.clone())),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{case}: {problem}");
+        assert_eq!(problem["code"], json!("WYRD_SPEC_400_VALIDATION"), "{case}");
+
+        let name = format!("ex-{}", case.replace(' ', "-"));
+        let (status, problem) = send(
+            &server,
+            &admin_jwt,
+            Method::POST,
+            "/v1/principals",
+            Some(json!({ "name": name, "assignments": [{ "role": "viewer", "scope": scope }] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{case}: {problem}");
+        let (_, page) = call(
+            &server,
+            &admin_jwt,
+            Method::GET,
+            &format!("/v1/principals?name={name}"),
+        )
+        .await;
+        assert_eq!(page["principals"], json!([]), "{case}: no account");
+    }
+    assert_eq!(
+        assignments(&access(&server, &admin_jwt, target).await),
+        pairs(&[]),
+        "the refused bindings wrote nothing"
+    );
+
+    for (case, scope) in [
+        ("live", exact(&live)),
+        ("deleted", exact(&deleted)),
+        (
+            "future family",
+            json!({ "card": { "family": { "kind": "Service", "name": "ex-unreleased" } } }),
+        ),
+    ] {
+        let (status, body) = send(
+            &server,
+            &admin_jwt,
+            Method::POST,
+            "/v1/access/bindings",
+            Some(grant(scope)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{case}: {body}");
+    }
+}
+
 /// Unknown, deleted, foreign-tenant, and tenant-administrator principals all
 /// answer with one non-enumerating not-found error; malformed ids, unknown
 /// Roles, and out-of-range pages are validation errors.

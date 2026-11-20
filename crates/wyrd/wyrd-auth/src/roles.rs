@@ -2,12 +2,18 @@
 
 use serde_json::json;
 use uuid::Uuid;
-use wyrd_spec::auth::{Operation, RoleSource, ScopedRoleAssignment, compile_binding};
+use vala_sql::queries::olap_catalog::table_fqn_by_uid;
+use wyrd_spec::auth::{
+    BifrostPermissionScope, CardPermissionScope, Operation, PermissionScope, RoleSource,
+    ScopedRoleAssignment, compile_binding,
+};
 use wyrd_spec::error::WyrdError;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
     SubjectColumns, advance_authorization_revision, insert_role_binding, role_by_name,
 };
+use wyrd_sql::queries::cards::card_scopes;
+use wyrd_sql::queries::github_installations::github_installation;
 
 use crate::error::store_error;
 
@@ -15,8 +21,9 @@ use crate::error::store_error;
 /// returns each assignment's role id, in order.
 ///
 /// Each role must exist and grant at least one operation applicable to its
-/// explicit, valid scope, so an invitation or account creation can never
-/// become broader than it reads.
+/// explicit, valid scope, and an exact scope must name an object of this
+/// tenant with the identity it claims, so an invitation or account creation
+/// can never become broader, or other, than it reads.
 ///
 /// # Errors
 ///
@@ -51,9 +58,60 @@ pub async fn validate_assignments(
             .map_err(|_| invalid("the Role's stored operations are corrupt"))?;
         compile_binding(&operations, &assignment.scope)
             .map_err(|_| invalid("the Role grants no operation applicable to this scope"))?;
+        if !target_exists(conn, &assignment.scope).await? {
+            return Err(invalid(
+                "the assignment scope names no object of this tenant with that identity",
+            ));
+        }
         role_ids.push(role.id);
     }
     Ok(role_ids)
+}
+
+/// Whether the object an exact `scope` names exists in the caller's tenant
+/// with the identity the scope claims.
+///
+/// An exact Card version must be a registered UID of the scope's kind and
+/// name, deleted versions included, so retained history stays grantable; a
+/// Bifrost table must be registered under the scope's catalog and schema;
+/// a GitHub connection must be the tenant's own. Tenant-wide, family,
+/// schema, gateway and tool scopes name no stored object and always pass,
+/// so a family grant keeps covering future versions.
+///
+/// # Errors
+///
+/// [`WyrdError::AuthVerifyUnavailable`] or the registry error when a lookup
+/// fails.
+async fn target_exists(
+    conn: &mut TenantConn<'_>,
+    scope: &PermissionScope,
+) -> Result<bool, WyrdError> {
+    Ok(match scope {
+        PermissionScope::Card(exact @ CardPermissionScope::Version { uid, .. }) => {
+            card_scopes(conn, std::slice::from_ref(uid))
+                .await?
+                .get(uid)
+                .is_some_and(|stored| stored == exact)
+        }
+        PermissionScope::Bifrost(BifrostPermissionScope::Table(table)) => {
+            table_fqn_by_uid(conn, table.table_uid)
+                .await
+                .map_err(store_error)?
+                .is_some_and(|fqn| {
+                    fqn.strip_prefix(&format!("{}.{}.", table.catalog, table.schema))
+                        .is_some_and(|name| !name.is_empty() && !name.contains('.'))
+                })
+        }
+        PermissionScope::GithubConnection(id) => github_installation(conn)
+            .await
+            .map_err(store_error)?
+            .is_some_and(|slot| slot.connection_id == id.as_uuid()),
+        PermissionScope::All
+        | PermissionScope::Card(CardPermissionScope::Family { .. })
+        | PermissionScope::Bifrost(BifrostPermissionScope::Schema(_))
+        | PermissionScope::Gateway(_)
+        | PermissionScope::Tool(_) => true,
+    })
 }
 
 /// Binds each of `assignments` to `subject` as direct bindings and advances
@@ -88,6 +146,7 @@ pub async fn bind_assignments(
     Ok(())
 }
 
+/// Role administration failure: why [`delete_role`] removed nothing.
 #[derive(Debug, thiserror::Error)]
 pub enum RoleAdminError {
     /// Builtin roles cannot be deleted.

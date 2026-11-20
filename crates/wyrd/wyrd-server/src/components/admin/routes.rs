@@ -349,7 +349,7 @@ async fn create_trusted_issuer(
 
     // Seal before the insert's transaction opens. A secret-bearing issuer
     // with no `[kms]` fails closed here — plaintext never lands in a column.
-    let write = issuer_write_from_trusted(&trusted, None, state.auth.kms.as_deref())
+    let write = issuer_write_from_trusted(&trusted, state.auth.kms.as_deref())
         .await
         .map_err(seal_error)?;
 
@@ -1409,7 +1409,7 @@ mod pg_tests {
             principal_kind: IssuerTokenPolicy::Workload,
             jwks_ttl: Duration::from_hours(1),
         };
-        let write = issuer_write_from_trusted(&trusted, None, None)
+        let write = issuer_write_from_trusted(&trusted, None)
             .await
             .expect("issuer encodes");
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
@@ -2323,7 +2323,7 @@ mod pg_tests {
                 principal_kind: IssuerTokenPolicy::Workload,
                 jwks_ttl: Duration::from_hours(1),
             };
-            let write = issuer_write_from_trusted(&trusted, None, None)
+            let write = issuer_write_from_trusted(&trusted, None)
                 .await
                 .expect("issuer encodes");
             let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");

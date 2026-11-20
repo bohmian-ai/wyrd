@@ -1691,3 +1691,131 @@ async fn activation_keeps_an_unchanged_configured_issuer_secret() {
     assert_eq!(resolved_auth(&srv).await, "basic configured-2");
     srv.shutdown().await.expect("server shuts down");
 }
+
+/// Replace the configured issuer's secret through the typed owner route as a
+/// tenant administrator, and return the answer's status.
+///
+/// # Panics
+/// Panics when the administrator cannot be bootstrapped or the route does
+/// not respond.
+async fn replace_configured_secret(srv: &WyrdTestServer, issuer: &str, secret: &str) -> StatusCode {
+    let admin = srv
+        .bootstrap_service("issuer-admin", &["admin"])
+        .await
+        .expect("admin bootstraps");
+    let token = srv
+        .exchange_api_key(admin.api_key().expect("admin has an API key"))
+        .await
+        .expect("admin key exchanges");
+    srv.oneshot_authenticated(
+        &token,
+        axum::http::Request::builder()
+            .method(Method::PUT)
+            .uri(format!(
+                "/v1/admin/trusted-issuers/client-secret?issuer={issuer}"
+            ))
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({ "client_secret": secret }).to_string()))
+            .expect("request builds"),
+    )
+    .await
+    .expect("replacement route responds")
+    .status()
+}
+
+/// A configured issuer whose envelope no longer opens is never resealed by a
+/// restart that cannot compare it: with its key removed, an unchanged entry
+/// keeps its exact bytes and refuses ordinary use while the server serves.
+/// Restoring the key opens the same bytes, and only an explicit pass moves
+/// them. While the old key is denied, the typed owner replacement still
+/// works without opening the old envelope, and a changed client id still
+/// takes effect sealed for the new binding.
+///
+/// # Panics
+/// Panics when an unreadable envelope is resealed, the server stops serving,
+/// or an intentional replacement or binding change is not applied.
+#[tokio::test]
+async fn a_restart_keeps_a_configured_issuer_secret_it_cannot_open() {
+    let transit = TransitFixture::start().await;
+    let provider = wiremock::MockServer::start().await;
+    mount_platform_provider(
+        &provider,
+        platform_key_set("mock-1"),
+        wiremock::ResponseTemplate::new(500),
+    )
+    .await;
+    let configured = || configured_issuer(&provider.uri(), secret_post("configured-1"));
+    let srv = Box::pin(
+        WyrdTestServer::builder()
+            .with_kms_for_test(transit.config("k1", &[]))
+            .with_trusted_issuer_configs(vec![configured()])
+            .start_bound(),
+    )
+    .await
+    .expect("server starts");
+    let sealed = configured_envelope(&srv).await;
+
+    // k1 removed: the restart cannot compare, so it keeps the bytes.
+    let encrypts = transit.requests("encrypt").await;
+    let srv = reboot_with_issuer(srv, &transit, ("k2", &[]), configured()).await;
+    assert_eq!(
+        configured_envelope(&srv).await,
+        sealed,
+        "a restart resealed an envelope it could not open"
+    );
+    assert_eq!(
+        transit.requests("encrypt").await,
+        encrypts,
+        "nothing was sealed for the unchanged entry"
+    );
+    let resolver = srv
+        .state()
+        .auth
+        .trusted_issuer_resolver
+        .clone()
+        .expect("issuer resolver");
+    assert!(
+        resolver
+            .trusted_issuers(&srv.data_tenant_id())
+            .await
+            .is_err(),
+        "the issuer refuses while its key is removed"
+    );
+    // An unrelated operation still works: a Service signs in by API key.
+    let service = srv
+        .bootstrap_service("unrelated", &["viewer"])
+        .await
+        .expect("service bootstraps");
+    srv.exchange_api_key(service.api_key().expect("service has an API key"))
+        .await
+        .expect("an unrelated sign-in still works");
+
+    // k1 restored: the same bytes open, and only a pass moves them.
+    let srv = reboot_with_issuer(srv, &transit, ("k2", &["k1"]), configured()).await;
+    assert_eq!(configured_envelope(&srv).await, sealed);
+    assert_eq!(resolved_auth(&srv).await, "post configured-1");
+    let report = pass(&srv).await;
+    assert_eq!((report.changed, report.remaining), (1, 0), "{report:?}");
+    let rotated = configured_envelope(&srv).await;
+    assert_eq!(envelope_parts(&rotated).0, "k2");
+
+    // k2 removed: the owner replacement needs no old decrypt.
+    let srv = reboot_with_issuer(srv, &transit, ("k3", &[]), configured()).await;
+    assert_eq!(configured_envelope(&srv).await, rotated);
+    assert_eq!(
+        replace_configured_secret(&srv, &provider.uri(), "replaced-1").await,
+        StatusCode::OK
+    );
+    assert_eq!(envelope_parts(&configured_envelope(&srv).await).0, "k3");
+    assert_eq!(resolved_auth(&srv).await, "post replaced-1");
+
+    // k3 removed: a changed client id is a new binding, sealed for it.
+    let rebound = wyrd_server::config::IssuerEntry {
+        client_id: "rebound-client".to_owned(),
+        ..configured()
+    };
+    let srv = reboot_with_issuer(srv, &transit, ("k4", &[]), rebound).await;
+    assert_eq!(envelope_parts(&configured_envelope(&srv).await).0, "k4");
+    assert_eq!(resolved_auth(&srv).await, "post configured-1");
+    srv.shutdown().await.expect("server shuts down");
+}

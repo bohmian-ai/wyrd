@@ -36,8 +36,12 @@ use wyrd_sql::queries::auth::{
     TrustedIssuerWrite, trusted_issuer_by_url, trusted_issuer_exists, upsert_trusted_issuer,
     upsert_workload_binding,
 };
+use wyrd_sql::row_types::auth::TrustedIssuerRow;
 
-use crate::auth::pg_resolvers::{binding_write_from_binding, issuer_write_from_trusted};
+use crate::auth::pg_resolvers::{
+    IssuerSealError, binding_write_from_binding, client_auth_label, issuer_write_from_trusted,
+    issuer_write_with_envelope, trusted_issuer_secret_matches,
+};
 use crate::boot::ServerBootError;
 use wyrd_spec::auth::IssuerTokenPolicy;
 
@@ -134,25 +138,23 @@ pub async fn seed_trusted_issuers(
     // reachable; requests still go through the redirect-disabled transport.
     let discovery = ScreenedHttp::allowing_internal();
     let mut conn = postgres.tenant_conn(tenant_id).await?;
-    let mut stored = Vec::with_capacity(entries.len());
+    let mut prior = Vec::with_capacity(entries.len());
     for entry in entries {
-        let envelope = match IssuerUrl::new(entry.issuer.clone()) {
+        let row = match IssuerUrl::new(entry.issuer.clone()) {
             Ok(issuer_url) => trusted_issuer_by_url(&mut conn, issuer_url.as_str())
                 .await
-                .map_err(|error| ServerBootError::Sql(error.into()))?
-                .and_then(|row| row.client_secret_enc),
+                .map_err(|error| ServerBootError::Sql(error.into()))?,
             Err(_) => None,
         };
-        stored.push(envelope);
+        prior.push(row);
     }
     conn.commit().await?;
     // Discovery and sealing wait on remote services, so both run between the
     // read and the seeding transaction.
     let mut writes = Vec::with_capacity(entries.len());
-    for (entry, stored) in entries.iter().zip(&stored) {
-        writes.push(
-            prepare_trusted_issuer(tenant_id, entry, stored.as_deref(), kms, &discovery).await?,
-        );
+    for (entry, prior) in entries.iter().zip(&prior) {
+        writes
+            .push(prepare_trusted_issuer(tenant_id, entry, prior.as_ref(), kms, &discovery).await?);
     }
     let mut conn = postgres.tenant_conn(tenant_id).await?;
     for prepared in writes {
@@ -196,8 +198,8 @@ enum Prepared {
     },
 }
 
-/// Discover one issuer and seal its row, keeping its committed `stored`
-/// envelope when unchanged and honoring the already-seeded restart
+/// Discover one issuer and build its row against its committed `prior` row
+/// (see [`reconcile_trusted_issuer`]), honoring the already-seeded restart
 /// exemption; runs with no transaction open.
 ///
 /// # Errors
@@ -206,14 +208,14 @@ enum Prepared {
 async fn prepare_trusted_issuer(
     tenant_id: DataTenantId,
     entry: &IssuerEntry,
-    stored: Option<&[u8]>,
+    prior: Option<&TrustedIssuerRow>,
     kms: Option<&WyrdKms>,
     discovery: &ScreenedHttp,
 ) -> Result<Prepared, ServerBootError> {
     match discover_with_retry(&entry.issuer, discovery).await {
         Ok(jwks_uri) => {
             let trusted = build_trusted_issuer(entry, tenant_id, jwks_uri)?;
-            issuer_write_from_trusted(&trusted, stored, kms)
+            reconcile_trusted_issuer(&trusted, prior, kms)
                 .await
                 .map(|write| Prepared::Write(Box::new(write)))
                 .map_err(|error| ServerBootError::IssuerSeal {
@@ -230,6 +232,49 @@ async fn prepare_trusted_issuer(
             }),
             Err(_) => Err(discovery_error),
         },
+    }
+}
+
+/// Build the configured `trusted` issuer's write against its committed
+/// `prior` row, sealing a client secret only when the configuration
+/// establishes a new one.
+///
+/// A new issuer, a row without a secret, or a changed client id or method (a
+/// new binding the old envelope cannot serve) is sealed afresh. Under an
+/// unchanged binding the committed envelope stays byte-for-byte when it opens
+/// to the configured secret, and is resealed when it opens to another one.
+/// When it cannot be opened for any reason, nothing establishes a change, so
+/// it also stays: the issuer keeps refusing as before, and the administrator
+/// restores the old key or replaces the secret through its owner. A restart
+/// therefore never renews or heals an existing credential.
+///
+/// # Errors
+/// Returns [`IssuerSealError`] when a needed seal fails or a JSONB column
+/// cannot be serialized.
+async fn reconcile_trusted_issuer(
+    trusted: &TrustedIssuer,
+    prior: Option<&TrustedIssuerRow>,
+    kms: Option<&WyrdKms>,
+) -> Result<TrustedIssuerWrite, IssuerSealError> {
+    let same_binding = prior.and_then(|row| {
+        let unchanged = row.client_id == trusted.client_id
+            && row.client_auth == client_auth_label(&trusted.client_auth);
+        row.client_secret_enc.as_deref().filter(|_| unchanged)
+    });
+    let Some(stored) = same_binding else {
+        return issuer_write_from_trusted(trusted, kms).await;
+    };
+    match trusted_issuer_secret_matches(trusted, stored, kms).await {
+        Some(false) => issuer_write_from_trusted(trusted, kms).await,
+        Some(true) => issuer_write_with_envelope(trusted, Some(stored.to_vec())),
+        None => {
+            tracing::warn!(
+                issuer = %trusted.issuer.as_str(),
+                "configured issuer secret could not be compared with its stored envelope; \
+                 keeping the stored envelope"
+            );
+            issuer_write_with_envelope(trusted, Some(stored.to_vec()))
+        }
     }
 }
 
@@ -591,10 +636,9 @@ mod pg_tests {
         let entry = issuer_entry(UNREACHABLE_ISSUER);
         let trusted = build_trusted_issuer(&entry, tenant_id, fake_jwks_uri(UNREACHABLE_ISSUER))
             .expect("issuer maps");
-        let write =
-            crate::auth::pg_resolvers::issuer_write_from_trusted(&trusted, None, Some(&key))
-                .await
-                .expect("issuer encodes");
+        let write = crate::auth::pg_resolvers::issuer_write_from_trusted(&trusted, Some(&key))
+            .await
+            .expect("issuer encodes");
         let mut conn = fixture.tenant_conn().await.expect("tenant conn");
         upsert_trusted_issuer(&mut conn, &write)
             .await

@@ -477,36 +477,30 @@ impl ClientSecretOwner<'_> {
         .map(Some)
     }
 
-    /// Keep `stored` when it opens under this owner to `client_auth`'s
-    /// secret, else seal that secret afresh; `None` for a method that holds
-    /// none.
+    /// Whether `stored` opens under this owner to `client_auth`'s secret.
     ///
-    /// Re-applying an unchanged configuration therefore leaves its envelope,
-    /// and the wrapping key it names, untouched. A changed secret, client id,
-    /// or method, or an envelope that no longer opens, is sealed under the
-    /// active key.
-    ///
-    /// # Errors
-    /// Returns the errors of [`Self::seal_secret`].
-    pub(crate) async fn keep_or_seal(
+    /// `None` when the comparison is unavailable: there is no facade, or the
+    /// envelope does not open, whatever the reason (a removed or denied key,
+    /// a key-service failure, or damaged bytes). An unavailable comparison
+    /// proves neither equality nor a change. A method that holds no secret
+    /// never matches.
+    pub(crate) async fn opens_to(
         &self,
         client_auth: &ClientAuth,
-        stored: Option<&[u8]>,
+        stored: &[u8],
         kms: Option<&WyrdKms>,
-    ) -> Result<Option<Vec<u8>>, IssuerSealError> {
-        if let (
-            Some(stored),
-            Some(kms),
-            ClientAuth::SecretBasic(secret) | ClientAuth::SecretPost(secret),
-        ) = (stored, kms, client_auth)
-        {
-            let authority = self.authority(client_auth_discriminant(client_auth));
-            let opened = kms.open(&self.context(&authority), stored).await;
-            if opened.is_ok_and(|plain| plain.as_slice() == secret.expose_secret().as_bytes()) {
-                return Ok(Some(stored.to_vec()));
+    ) -> Option<bool> {
+        let (ClientAuth::SecretBasic(secret) | ClientAuth::SecretPost(secret)) = client_auth else {
+            return Some(false);
+        };
+        let authority = self.authority(client_auth_discriminant(client_auth));
+        match kms?.open(&self.context(&authority), stored).await {
+            Ok(plain) => Some(plain.as_slice() == secret.expose_secret().as_bytes()),
+            Err(error) => {
+                tracing::warn!(%error, purpose = self.purpose.as_str(), "stored client secret could not be compared");
+                None
             }
         }
-        self.seal(client_auth, kms).await
     }
 
     /// Seal `secret` for the stored client-authentication `method`.
@@ -855,14 +849,13 @@ pub fn client_auth_label(auth: &ClientAuth) -> &'static str {
 // TrustedIssuer -> write (seed path)
 // --------------------------------------------------------------------------
 
-/// Encode a [`TrustedIssuer`] into a [`TrustedIssuerWrite`] for boot seeding.
+/// Encode a [`TrustedIssuer`] into a [`TrustedIssuerWrite`], sealing its
+/// configured client secret afresh.
 ///
 /// The client secret (for `SecretBasic`/`SecretPost`) is sealed into the
-/// common envelope bound to the issuer's tenant, URL, client id, and method.
-/// When `stored` is the issuer's committed envelope and it already seals that
-/// secret for that binding, it is kept byte-for-byte, so re-seeding an
-/// unchanged configuration never moves it to a newly active key. Callers run
-/// this before opening the transaction that writes it, since a remote backend
+/// common envelope bound to the issuer's tenant, URL, client id, and method,
+/// so this is for an intentional creation or replacement. Callers run this
+/// before opening the transaction that writes it, since a remote backend
 /// waits on its key service. A secret-bearing issuer with no facade fails
 /// closed via [`IssuerSealError::KmsMissing`].
 ///
@@ -871,19 +864,28 @@ pub fn client_auth_label(auth: &ClientAuth) -> &'static str {
 /// sealing fails, or a JSONB column cannot be serialized.
 pub async fn issuer_write_from_trusted(
     issuer: &TrustedIssuer,
-    stored: Option<&[u8]>,
     kms: Option<&WyrdKms>,
 ) -> Result<TrustedIssuerWrite, IssuerSealError> {
-    let client_secret_enc = ClientSecretOwner {
-        scope: SecretScope::Tenant(issuer.tenant_id),
-        purpose: SecretPurpose::AuthTrustedIssuer,
-        issuer_url: issuer.issuer.as_str(),
-        client_id: &issuer.client_id,
-        connection_id: None,
-    }
-    .keep_or_seal(&issuer.client_auth, stored, kms)
-    .await?;
+    let client_secret_enc = trusted_issuer_owner(issuer)
+        .seal(&issuer.client_auth, kms)
+        .await?;
+    issuer_write_with_envelope(issuer, client_secret_enc)
+}
 
+/// Encode a [`TrustedIssuer`] into a [`TrustedIssuerWrite`] that stores
+/// `client_secret_enc` as its envelope, byte-for-byte.
+///
+/// For re-seeding an issuer whose committed envelope stays: the caller has
+/// established that the envelope already belongs to this issuer's tenant,
+/// URL, client id, and method.
+///
+/// # Errors
+/// Returns [`IssuerSealError::Serialize`] when a JSONB column cannot be
+/// serialized.
+pub fn issuer_write_with_envelope(
+    issuer: &TrustedIssuer,
+    client_secret_enc: Option<Vec<u8>>,
+) -> Result<TrustedIssuerWrite, IssuerSealError> {
     Ok(TrustedIssuerWrite {
         issuer_url: issuer.issuer.as_str().to_owned(),
         jwks_uri: issuer.jwks_uri.to_string(),
@@ -897,6 +899,33 @@ pub async fn issuer_write_from_trusted(
         jwks_ttl_secs: i64::try_from(issuer.jwks_ttl.as_secs()).unwrap_or(i64::MAX),
         client_secret_enc,
     })
+}
+
+/// Whether `stored` opens, bound to `issuer`'s tenant, URL, client id, and
+/// method, to its configured client secret.
+///
+/// `None` when the comparison is unavailable, for any reason the envelope
+/// does not open; the caller must then neither keep it as equal nor seal over
+/// it as changed on this evidence alone.
+pub async fn trusted_issuer_secret_matches(
+    issuer: &TrustedIssuer,
+    stored: &[u8],
+    kms: Option<&WyrdKms>,
+) -> Option<bool> {
+    trusted_issuer_owner(issuer)
+        .opens_to(&issuer.client_auth, stored, kms)
+        .await
+}
+
+/// The secret owner of a configured trusted issuer.
+fn trusted_issuer_owner(issuer: &TrustedIssuer) -> ClientSecretOwner<'_> {
+    ClientSecretOwner {
+        scope: SecretScope::Tenant(issuer.tenant_id),
+        purpose: SecretPurpose::AuthTrustedIssuer,
+        issuer_url: issuer.issuer.as_str(),
+        client_id: &issuer.client_id,
+        connection_id: None,
+    }
 }
 
 /// Renew a stored trusted issuer's client-secret encryption: the same secret
@@ -1056,7 +1085,7 @@ mod pg_tests {
         let key = kms();
         let issuer = sample_issuer(tenant);
 
-        let write = issuer_write_from_trusted(&issuer, None, Some(&key))
+        let write = issuer_write_from_trusted(&issuer, Some(&key))
             .await
             .expect("encode succeeds");
         let row = wyrd_sql::row_types::auth::TrustedIssuerRow {
@@ -1144,7 +1173,7 @@ mod pg_tests {
             .expect("tenant id is valid");
         let issuer = sample_issuer(tenant);
 
-        let error = issuer_write_from_trusted(&issuer, None, None)
+        let error = issuer_write_from_trusted(&issuer, None)
             .await
             .expect_err("a secret-bearing issuer with no facade must fail closed");
         assert!(matches!(error, IssuerSealError::KmsMissing));
@@ -1163,7 +1192,7 @@ mod pg_tests {
             .expect("tenant id is valid");
         let key = kms();
         let issuer = sample_issuer(tenant);
-        let write = issuer_write_from_trusted(&issuer, None, Some(&key))
+        let write = issuer_write_from_trusted(&issuer, Some(&key))
             .await
             .expect("encode succeeds");
         let row = wyrd_sql::row_types::auth::TrustedIssuerRow {
@@ -1218,7 +1247,7 @@ mod pg_tests {
         for (tenant, secret) in [(first, "first-secret"), (second, "second-secret")] {
             let mut issuer = sample_issuer(tenant);
             issuer.client_auth = ClientAuth::SecretPost(SecretString::from(secret.to_owned()));
-            let write = issuer_write_from_trusted(&issuer, None, Some(&key))
+            let write = issuer_write_from_trusted(&issuer, Some(&key))
                 .await
                 .expect("encode succeeds");
             let mut conn = fixture
@@ -1265,7 +1294,7 @@ mod pg_tests {
         let tenant = fixture.data_tenant_id();
         let key = kms();
         let issuer = sample_issuer(tenant);
-        let write = issuer_write_from_trusted(&issuer, None, Some(&key))
+        let write = issuer_write_from_trusted(&issuer, Some(&key))
             .await
             .expect("encode succeeds");
 
@@ -1319,7 +1348,7 @@ mod pg_tests {
         let tenant = fixture.data_tenant_id();
         let key = kms();
         let issuer = sample_issuer(tenant);
-        let issuer_write = issuer_write_from_trusted(&issuer, None, Some(&key))
+        let issuer_write = issuer_write_from_trusted(&issuer, Some(&key))
             .await
             .expect("encode succeeds");
 

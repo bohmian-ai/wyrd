@@ -892,7 +892,7 @@ mod pg_tests {
         // test issuers use PrivateKeyJwt and carry no secret, so no `[kms]` is
         // needed. Each issuer/binding carries its own tenant for tenant-scoping.
         for issuer in &trusted {
-            let write = issuer_write_from_trusted(issuer, None, None)
+            let write = issuer_write_from_trusted(issuer, None)
                 .await
                 .expect("issuer encodes");
             let mut conn = fixture

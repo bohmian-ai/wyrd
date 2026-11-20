@@ -20,6 +20,7 @@
 //! the value it lost to counts as `remaining`. Logs and reports carry store,
 //! tenant, owner, and a reason code, never key or secret material.
 
+use std::collections::BTreeSet;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,6 +47,7 @@ use wyrd_sql::{OperatorPool, SqlError};
 
 use super::identity::{operator, platform_authz_error};
 use crate::components::auth::PlatformCaller;
+use crate::components::gateway::GatewayAdministration;
 use crate::http::error::{WyrdErrorResponse, internal_failure};
 use crate::state::AppState;
 
@@ -104,6 +106,19 @@ impl StoredSecretMaintenance {
         limit: Option<NonZeroU32>,
         budget: Duration,
     ) -> Result<StoredSecretMaintenanceReport, SqlError> {
+        self.pass(mode, limit, budget).await.map(|pass| pass.report)
+    }
+
+    /// Run the pass [`Self::run`] describes and return its full outcome.
+    ///
+    /// # Errors
+    /// Returns the errors of [`Self::run`].
+    async fn pass(
+        &self,
+        mode: StoredSecretMaintenanceMode,
+        limit: Option<NonZeroU32>,
+        budget: Duration,
+    ) -> Result<Pass, SqlError> {
         let deadline = Instant::now() + budget;
         let mut pass = Pass {
             report: StoredSecretMaintenanceReport {
@@ -116,6 +131,7 @@ impl StoredSecretMaintenance {
             },
             attempts_left: limit.map_or(u64::MAX, |limit| u64::from(limit.get())),
             deadline,
+            moved_gateway_tenants: BTreeSet::new(),
         };
         for table in StoredSecretTable::ALL {
             let wait = deadline.saturating_duration_since(Instant::now());
@@ -132,15 +148,50 @@ impl StoredSecretMaintenance {
                 self.settle(&mut pass, table, row).await?;
             }
         }
-        let report = pass.report;
         tracing::info!(
-            changed = report.changed,
-            current = report.current,
-            remaining = report.remaining,
-            bounded = report.bounded,
+            changed = pass.report.changed,
+            current = pass.report.current,
+            remaining = pass.report.remaining,
+            bounded = pass.report.bounded,
             "stored secret maintenance pass finished"
         );
-        Ok(report)
+        Ok(pass)
+    }
+
+    /// Run one pass for a request served by `state`, bounded by half its
+    /// request timeout (see [`Self::run`]), then warm `state`'s Gateway for
+    /// each tenant whose credential the pass moved, as any Gateway write
+    /// does, so this server serves the committed envelope at once.
+    ///
+    /// Warming is best effort and bounded by a further quarter of the
+    /// timeout; a cut warm, like a failed one, leaves the background reload
+    /// to recover. A credential that lost its swap to a concurrent write is
+    /// not warmed: that writer's own warm and notification cover it.
+    ///
+    /// # Errors
+    /// Returns the errors of [`Self::run`].
+    pub(crate) async fn run_serving(
+        &self,
+        state: &AppState,
+        mode: StoredSecretMaintenanceMode,
+        limit: Option<NonZeroU32>,
+    ) -> Result<StoredSecretMaintenanceReport, SqlError> {
+        // ponytail: half the request timeout leaves room to answer before the
+        // edge drops the handler; a configurable budget if operators need
+        // longer passes.
+        let timeout = state.settings.limits.timeout;
+        let pass = self.pass(mode, limit, timeout / 2).await?;
+        let gateway = GatewayAdministration::new(state);
+        let warmed = tokio::time::timeout(timeout / 4, async {
+            for tenant in &pass.moved_gateway_tenants {
+                gateway.warm(*tenant).await;
+            }
+        })
+        .await;
+        if warmed.is_err() {
+            tracing::warn!("gateway warm after stored secret maintenance was cut by its budget");
+        }
+        Ok(pass.report)
     }
 
     /// Classify one envelope, move it when needed and the bound allows, and
@@ -202,7 +253,16 @@ impl StoredSecretMaintenance {
                     swap_stored_secret(&self.operator, table, row, &envelope, wait).await?
                 };
                 match swapped {
-                    Some(true) => pass.report.changed += 1,
+                    Some(true) => {
+                        pass.report.changed += 1;
+                        if table == StoredSecretTable::GatewayProviderCredentials
+                            && let Some(tenant) = row
+                                .data_tenant_id
+                                .and_then(|id| DataTenantId::try_from(id).ok())
+                        {
+                            pass.moved_gateway_tenants.insert(tenant);
+                        }
+                    }
                     Some(false) => {
                         pass.fail(table, row, StoredSecretFailureReason::ConcurrentChange);
                     }
@@ -225,6 +285,8 @@ struct Pass {
     attempts_left: u64,
     /// When the pass stops waiting on the key service or the database.
     deadline: Instant,
+    /// Tenants whose Gateway credential this pass swapped.
+    moved_gateway_tenants: BTreeSet<DataTenantId>,
 }
 
 impl Pass {
@@ -366,11 +428,8 @@ async fn maintain_stored_secrets(
             details: serde_json::json!({ "reason": "kms_not_configured" }),
         }));
     };
-    // ponytail: half the request timeout leaves room to answer before the edge
-    // drops the handler; a configurable budget if operators need longer passes.
-    let budget = state.settings.limits.timeout / 2;
     StoredSecretMaintenance::new(pool, Some(kms))
-        .run(request.mode, request.limit, budget)
+        .run_serving(&state, request.mode, request.limit)
         .await
         .map(Json)
         .map_err(|error| {

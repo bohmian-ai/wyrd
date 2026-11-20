@@ -949,6 +949,92 @@ async fn gateway_managed_credentials_resolve_per_tenant_across_restart_and_rotat
     drain_gateway(&unconfigured).await;
 }
 
+/// Runs one `mode` maintenance pass on `state`, as its platform route does,
+/// and asserts that `state` serves `tenant`'s moved credential when the pass
+/// returns and calls it without opening the secret again.
+///
+/// # Panics
+///
+/// Panics when the pass does not move exactly the one credential, returns
+/// before `state` reloads `tenant`, or a later call unwraps the secret.
+async fn assert_pass_serves(
+    state: &AppState,
+    tenant: DataTenantId,
+    mode: wyrd_spec::security::stored_secret::StoredSecretMaintenanceMode,
+    transit: &wyrd_testing::kms::TransitFixture,
+) {
+    let before = served(state, tenant);
+    let report = crate::components::platform::stored_secrets::StoredSecretMaintenance::new(
+        state.postgres.operator_pool().expect("operator pool"),
+        state.auth.kms.clone(),
+    )
+    .run_serving(state, mode, None)
+    .await
+    .expect("pass runs");
+    assert_eq!((report.changed, report.remaining), (1, 0), "{report:?}");
+    assert!(
+        !Arc::ptr_eq(&served(state, tenant), &before),
+        "the {mode:?} pass returned before its own server served the moved envelope"
+    );
+    let unwraps = transit.requests("decrypt").await;
+    invoke_managed(state, tenant).await.expect("invoke");
+    assert_eq!(
+        transit.requests("decrypt").await,
+        unwraps,
+        "a call reuses the prepared secret"
+    );
+}
+
+/// The server that runs an explicit maintenance pass serves what it
+/// committed: once a routine pass, and later a recovery pass into a fresh
+/// key, returns, that replica's Gateway already serves a snapshot loaded from
+/// the moved envelope, with no restart, renewal, or wait on its background
+/// reload (held back here by a slow key service), and the next call sends the
+/// unchanged secret without opening it again.
+///
+/// # Panics
+///
+/// Panics when a pass returns before its own replica reloads, a call after it
+/// unwraps the secret or sends another, or a pass moves the wrong count.
+#[tokio::test]
+async fn a_maintenance_pass_refreshes_the_gateway_that_ran_it() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let transit =
+        wyrd_testing::kms::TransitFixture::start_delayed(Duration::from_millis(300)).await;
+    let kms = |active: &str, retained: &[&str]| {
+        Arc::new(wyrd_kms::WyrdKms::new(&transit.config(active, retained), false).expect("facade"))
+    };
+    let dispatch = RecordingKeys::shared();
+    let writer = managed_replica(&fixture, Some(kms("k1", &[])), dispatch.clone()).await;
+    configure_managed(&writer, tenant, "sk-maintained").await;
+
+    let rotating = managed_replica(&fixture, Some(kms("k2", &["k1"])), dispatch.clone()).await;
+    warm(&rotating, [tenant]).await;
+    assert_pass_serves(
+        &rotating,
+        tenant,
+        wyrd_spec::security::stored_secret::StoredSecretMaintenanceMode::Routine,
+        &transit,
+    )
+    .await;
+
+    let recovering = managed_replica(&fixture, Some(kms("k3", &["k2"])), dispatch.clone()).await;
+    warm(&recovering, [tenant]).await;
+    assert_pass_serves(
+        &recovering,
+        tenant,
+        wyrd_spec::security::stored_secret::StoredSecretMaintenanceMode::Recovery,
+        &transit,
+    )
+    .await;
+
+    assert_eq!(dispatch.seen(), ["sk-maintained", "sk-maintained"]);
+    drain_gateway(&writer).await;
+    drain_gateway(&rotating).await;
+    drain_gateway(&recovering).await;
+}
+
 /// Public handler and internal seam share one pipeline: the requested model
 /// is authorized and audited before dispatch, an unauthorized fallback is
 /// skipped and audited, fallback preserves requested and resolved identity,

@@ -25,6 +25,7 @@ use parquet_variant::{
     VariantBuilderExt,
 };
 use std::borrow::Cow;
+use std::ops::Range;
 use std::str::FromStr;
 use std::sync::Arc;
 use wyrd_queue::variant::{
@@ -117,12 +118,66 @@ pub struct AttributePool<'a> {
     pub values: Vec<PooledValue<'a>>,
 }
 
-impl AttributePool<'_> {
+impl<'a> AttributePool<'a> {
     /// The pooled attribute list at `range`.
     #[must_use]
     pub fn attributes(&self, range: PoolRange) -> Attributes<'_> {
         Attributes::Pooled(self, range)
     }
+
+    /// Read one attribute list of an input this pool belongs to.
+    #[must_use]
+    pub fn list(&self, list: AttributeList<'a>) -> Attributes<'_> {
+        match list {
+            AttributeList::Generated(entries) => Attributes::Generated(entries),
+            AttributeList::Pooled(range) => self.attributes(range),
+        }
+    }
+
+    /// Read the pooled value at `index` of [`Self::values`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when `index` is not below the length of [`Self::values`].
+    #[must_use]
+    pub fn value(&self, index: usize) -> ValueRef<'_> {
+        ValueRef::pooled(self, self.values[index])
+    }
+}
+
+/// One attribute list of a flattened `OTLP` input, by source.
+#[derive(Debug, Clone, Copy)]
+pub enum AttributeList<'a> {
+    /// A generated message's entries.
+    Generated(&'a [KeyValue]),
+    /// Entries of the input's [`AttributePool`].
+    Pooled(PoolRange),
+}
+
+/// One resource group of a flattened `OTLP` input.
+///
+/// The resource itself is decoded once per group, so a wire decoder owns it
+/// and a generated input borrows it.
+#[derive(Debug)]
+pub struct ResourceInput<'a> {
+    /// The group's resource, when present.
+    pub resource: Option<Cow<'a, Resource>>,
+    /// The group's schema URL.
+    pub schema_url: &'a str,
+    /// The group's scope groups, as positions in the input's scope list.
+    pub scopes: Range<usize>,
+}
+
+/// One scope group of a flattened `OTLP` input.
+#[derive(Debug)]
+pub struct ScopeInput<'a> {
+    /// The group's instrumentation scope, when present.
+    pub scope: Option<Cow<'a, InstrumentationScope>>,
+    /// The group's schema URL.
+    pub schema_url: &'a str,
+    /// The group's records (spans or log records), as positions in the
+    /// input's record list.
+    pub records: Range<usize>,
 }
 
 /// One `OTLP` attribute collection, borrowed from either a generated message
@@ -365,6 +420,28 @@ pub fn append_attributes(
 ) -> Result<usize, VariantFailure> {
     column
         .append(|row| append_object(row, attributes, scratch))
+        .map_err(|violation| VariantFailure { field, violation })
+}
+
+/// Encode one `OTLP` value as the next row of `column`, typed as
+/// [`any_value_variant`] types it.
+///
+/// The value is written straight into the column and checked there; `scratch`
+/// is the request's duplicate-key stack, left as it was found. Returns the
+/// row's encoded bytes.
+///
+/// # Errors
+///
+/// Returns the same [`VariantFailure`] [`any_value_variant`] returns for
+/// `field`; the column is then unchanged.
+pub fn append_value(
+    column: &mut VariantColumnEncoder,
+    field: &'static str,
+    value: ValueRef<'_>,
+    scratch: &mut Vec<usize>,
+) -> Result<usize, VariantFailure> {
+    column
+        .append(|row| append_any_value(row, value, scratch))
         .map_err(|violation| VariantFailure { field, violation })
 }
 
@@ -945,6 +1022,113 @@ impl ScopeEnvelope {
             + self.version.len()
             + self.attributes.encoded_bytes()
             + self.schema_url.len()
+    }
+}
+
+/// The resource and scope envelopes one accepted row repeats, as positions
+/// in [`RowEnvelopes`].
+#[derive(Debug, Clone, Copy)]
+pub struct Context {
+    /// Position of the row's resource envelope.
+    pub resource: usize,
+    /// Position of the row's scope envelope.
+    pub scope: usize,
+}
+
+/// Each resource and scope envelope of one projection, retained once, plus
+/// the envelopes every accepted row repeats.
+///
+/// A signal projector retains each group's envelope when it reaches the
+/// group and pushes one [`Context`] per accepted row, so no envelope is
+/// copied before its final Arrow column.
+#[derive(Debug, Default)]
+pub struct RowEnvelopes {
+    /// Every projected resource envelope, in request order.
+    resources: Vec<ResourceEnvelope>,
+    /// Every projected scope envelope, in request order.
+    scopes: Vec<ScopeEnvelope>,
+    /// Each accepted row's envelopes.
+    rows: Vec<Context>,
+}
+
+impl RowEnvelopes {
+    /// Retain one projected resource envelope for the rows beneath it.
+    ///
+    /// Returns its position and the payload bytes it adds to each row.
+    pub fn retain_resource(&mut self, envelope: ResourceEnvelope) -> (usize, usize) {
+        let retained = (self.resources.len(), envelope.repeated_bytes());
+        self.resources.push(envelope);
+        retained
+    }
+
+    /// Retain one projected scope envelope for the rows beneath it.
+    ///
+    /// Returns its position and the payload bytes it adds to each row.
+    pub fn retain_scope(&mut self, envelope: ScopeEnvelope) -> (usize, usize) {
+        let retained = (self.scopes.len(), envelope.repeated_bytes());
+        self.scopes.push(envelope);
+        retained
+    }
+
+    /// Record the envelopes of one accepted row.
+    pub fn push(&mut self, row: Context) {
+        self.rows.push(row);
+    }
+
+    /// Each accepted row's resource envelope, in row order.
+    pub fn resources(&self) -> impl ExactSizeIterator<Item = &ResourceEnvelope> + Clone {
+        self.rows.iter().map(|row| &self.resources[row.resource])
+    }
+
+    /// Each accepted row's scope envelope, in row order.
+    pub fn scopes(&self) -> impl ExactSizeIterator<Item = &ScopeEnvelope> + Clone {
+        self.rows.iter().map(|row| &self.scopes[row.scope])
+    }
+
+    /// One text column read from each row's resource envelope.
+    pub fn resource_text(&self, pick: fn(&ResourceEnvelope) -> Option<&str>) -> ArrayRef {
+        utf8_opt_column_from(self.resources().map(pick))
+    }
+
+    /// The eleven columns every signal ledger declares from
+    /// `resource_present` through `scope_schema_url`, in ledger order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TableError::Internal`] when the entity-reference column does
+    /// not match its declared element.
+    pub fn columns(&self) -> Result<[ArrayRef; 11], TableError> {
+        let scope_text = |pick: fn(&ScopeEnvelope) -> &str| {
+            utf8_opt_column_from(self.scopes().map(|row| Some(pick(row))))
+        };
+        let entity_ref_lengths: Vec<Option<usize>> = self
+            .resources()
+            .map(|row| Some(row.entity_refs.len()))
+            .collect();
+        Ok([
+            bool_column(self.resources().map(|row| row.present).collect()),
+            variant_column(self.resources().map(|row| Some(&row.attributes))),
+            u32_as_i64_column(
+                self.resources()
+                    .map(|row| row.dropped_attributes_count)
+                    .collect(),
+            ),
+            self.resource_text(|row| Some(&row.schema_url)),
+            entity_refs_column(
+                self.resources().flat_map(|row| &row.entity_refs),
+                &entity_ref_lengths,
+            )?,
+            bool_column(self.scopes().map(|row| row.present).collect()),
+            scope_text(|row| &row.name),
+            scope_text(|row| &row.version),
+            variant_column(self.scopes().map(|row| Some(&row.attributes))),
+            u32_as_i64_column(
+                self.scopes()
+                    .map(|row| row.dropped_attributes_count)
+                    .collect(),
+            ),
+            scope_text(|row| &row.schema_url),
+        ])
     }
 }
 

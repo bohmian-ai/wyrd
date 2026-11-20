@@ -1,9 +1,13 @@
 //! Canonical log-signal table definition and its table-owned projection.
 
+pub mod input;
 pub mod projection;
 pub mod records;
 
-pub use projection::{canonical_log_schema, log_row_output_bytes, project_resource_logs};
+pub use input::LogInput;
+pub use projection::{
+    canonical_log_schema, log_row_output_bytes, project_log_input, project_resource_logs,
+};
 pub use records::RecordsTable;
 
 #[cfg(test)]
@@ -209,6 +213,50 @@ mod tests {
             reason.contains("WYRD_VALA_400_VARIANT_NUMERIC_OUT_OF_RANGE"),
             "{reason}"
         );
+    }
+
+    /// A record refused after its body and attributes are encoded, here by a
+    /// malformed `wyrd.card_uid`, leaves no Variant row behind: the next
+    /// accepted record keeps its own body and attributes.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the refused record is accepted or a later row reads its
+    /// body or attributes.
+    #[test]
+    fn a_record_refused_after_encoding_leaves_no_variant_row() {
+        let record = |body: i64| LogRecord {
+            body: Some(AnyValue {
+                value: Some(Value::IntValue(body)),
+            }),
+            attributes: vec![attribute("index", Value::IntValue(body))],
+            ..LogRecord::default()
+        };
+        let mut refused = record(2);
+        refused.attributes.push(attribute(
+            "wyrd.card_uid",
+            Value::StringValue("not-a-card-uid".to_owned()),
+        ));
+        let request = vec![ResourceLogs {
+            resource: None,
+            scope_logs: vec![ScopeLogs {
+                scope: None,
+                log_records: vec![record(1), refused, record(3)],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }];
+        let (batch, outcome) =
+            project_resource_logs(&request, None, usize::MAX).expect("logs project");
+        assert_eq!((outcome.accepted_records, outcome.rejected_records), (2, 1));
+        let body = |row| variant_cell_to_json(column(&batch, "body"), row).expect("body reads");
+        let index = |row| {
+            variant_cell_to_json(column(&batch, "attributes"), row).expect("attributes read")
+                ["index"]
+                .clone()
+        };
+        assert_eq!((body(0), index(0)), (json!(1), json!(1)));
+        assert_eq!((body(1), index(1)), (json!(3), json!(3)));
     }
 
     /// A string body is refused exactly where and why its Variant would be:

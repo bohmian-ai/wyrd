@@ -41,6 +41,7 @@ use crate::namespaces::BifrostNamespace;
 use crate::oracle::{AuthorizedQueryContext, OracleQueryStream, QueryStreamLifecycle};
 pub use crate::otlp_contract::{IngestOutcome, LogsOutcome, MetricsOutcome};
 use crate::scribe::preprocess::logical_data_identity;
+use crate::tables::logs::LogInput;
 use crate::tables::traces::TraceInput;
 use crate::tables::{
     ApprovalsTable, CallsTable, DomainTable, EvidenceTable, ExecutionEventsTable,
@@ -54,16 +55,19 @@ use wyrd_spec::vala::api::{AuditDetail, AuditEvent, AuditOutcome, BifrostQueryRe
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::vala::ids::{SpanId, TableVersion, TraceId};
 
-/// One trace export authorized, attributed, and projected, owning its batch.
+/// One OTLP export authorized, attributed, and projected, owning its batch.
 ///
-/// Returned by [`Gate::prepare_trace_input`] and consumed by
-/// [`Gate::dispatch_traces`].
+/// Returned by [`Gate::prepare_trace_input`] or [`Gate::prepare_log_input`]
+/// and consumed by [`Gate::dispatch_prepared`]; `O` is the signal's
+/// partial-success outcome.
 #[derive(Debug)]
-pub struct PreparedTraces {
-    /// The accepted spans' canonical batch.
+pub struct PreparedExport<O> {
+    /// The table the batch lands in.
+    table: TableRef,
+    /// The accepted records' canonical batch.
     batch: RecordBatch,
     /// The partial-success outcome.
-    outcome: IngestOutcome,
+    outcome: O,
     /// The Cards the export is attributed to.
     attributed: Option<Vec<wyrd_spec::ids::CardUid>>,
 }
@@ -888,7 +892,7 @@ impl<A: GateAudit + 'static> Gate<A> {
         // The generated request is no longer read; free its backing before
         // Scribe adopts the decode owner and charges the projected Arrow.
         drop(decoded.request);
-        self.dispatch_prepared_traces(auth, prepared, decoded.wire_bytes, decoded.owner)
+        self.dispatch_export(auth, prepared, decoded.wire_bytes, decoded.owner)
             .await
     }
 
@@ -897,7 +901,7 @@ impl<A: GateAudit + 'static> Gate<A> {
     /// This is the first half of trace ingest for a decoder whose input
     /// borrows its transport buffer: the returned batch owns its data, so the
     /// caller releases the input and buffer before
-    /// [`Self::dispatch_traces`] hands the batch to Scribe. Card attribution
+    /// [`Self::dispatch_prepared`] hands the batch to Scribe. Card attribution
     /// reads every span, including spans projection then rejects.
     ///
     /// # Errors
@@ -908,10 +912,10 @@ impl<A: GateAudit + 'static> Gate<A> {
         &self,
         auth: &AuthContext,
         input: &TraceInput<'_>,
-    ) -> Result<PreparedTraces, IngestError> {
+    ) -> Result<PreparedExport<IngestOutcome>, IngestError> {
+        let table = TableRef::new(BifrostNamespace::Traces, "spans");
         self.ensure_open()?;
-        self.authorize_record_write(auth, &TableRef::new(BifrostNamespace::Traces, "spans"))
-            .await?;
+        self.authorize_record_write(auth, &table).await?;
         let attributed = self
             .attributed_cards(auth, || attribution::span_card_uids(input))
             .await?;
@@ -921,14 +925,15 @@ impl<A: GateAudit + 'static> Gate<A> {
             self.limits.expanded_bytes(),
         )
         .map_err(|error| projection_error("trace", &error))?;
-        Ok(PreparedTraces {
+        Ok(PreparedExport {
+            table,
             batch,
             outcome,
             attributed,
         })
     }
 
-    /// Hand one prepared trace export and its decode owner to Scribe.
+    /// Hand one prepared export and its decode owner to Scribe.
     ///
     /// `wire_bytes` is the export's encoded size. Returns the partial-success
     /// outcome projection produced.
@@ -937,32 +942,32 @@ impl<A: GateAudit + 'static> Gate<A> {
     ///
     /// Returns request-limit or Scribe errors.
     #[tracing::instrument(skip_all, fields(tenant = %auth.tenant, request_id = %auth.request_id))]
-    pub async fn dispatch_traces(
+    pub async fn dispatch_prepared<O>(
         &self,
         auth: &AuthContext,
-        prepared: PreparedTraces,
+        prepared: PreparedExport<O>,
         wire_bytes: usize,
         owner: OtlpDecodeOwner,
-    ) -> Result<IngestOutcome, IngestError> {
-        self.dispatch_prepared_traces(auth, prepared, wire_bytes, Some(owner))
+    ) -> Result<O, IngestError> {
+        self.dispatch_export(auth, prepared, wire_bytes, Some(owner))
             .await
     }
 
-    /// Dispatch a prepared trace export with its optional decode owner.
+    /// Dispatch a prepared export with its optional decode owner.
     ///
     /// # Errors
     ///
     /// Returns request-limit or Scribe errors.
-    async fn dispatch_prepared_traces(
+    async fn dispatch_export<O>(
         &self,
         auth: &AuthContext,
-        prepared: PreparedTraces,
+        prepared: PreparedExport<O>,
         wire_bytes: usize,
         owner: Option<OtlpDecodeOwner>,
-    ) -> Result<IngestOutcome, IngestError> {
+    ) -> Result<O, IngestError> {
         self.dispatch_canonical(
             auth,
-            TableRef::new(BifrostNamespace::Traces, "spans"),
+            prepared.table,
             wire_bytes,
             prepared.batch,
             owner,
@@ -1021,31 +1026,53 @@ impl<A: GateAudit + 'static> Gate<A> {
         auth: &AuthContext,
         decoded: DecodedOtlp<ExportLogsServiceRequest>,
     ) -> Result<LogsOutcome, IngestError> {
+        let prepared = self
+            .prepare_log_input(
+                auth,
+                &LogInput::from_generated(&decoded.request.resource_logs),
+            )
+            .await?;
+        // The generated request is no longer read; free its backing before
+        // Scribe adopts the decode owner and charges the projected Arrow.
+        drop(decoded.request);
+        self.dispatch_export(auth, prepared, decoded.wire_bytes, decoded.owner)
+            .await
+    }
+
+    /// Authorize, attribute, and project one flattened log export.
+    ///
+    /// The log counterpart of [`Self::prepare_trace_input`]: the returned
+    /// batch owns its data, so the caller releases the input and buffer before
+    /// [`Self::dispatch_prepared`]. Card attribution reads every record,
+    /// including records projection then rejects.
+    ///
+    /// # Errors
+    ///
+    /// Returns authorization, attribution, or projection errors.
+    #[tracing::instrument(skip_all, fields(tenant = %auth.tenant, request_id = %auth.request_id))]
+    pub async fn prepare_log_input(
+        &self,
+        auth: &AuthContext,
+        input: &LogInput<'_>,
+    ) -> Result<PreparedExport<LogsOutcome>, IngestError> {
+        let table = TableRef::new(BifrostNamespace::Logs, "records");
         self.ensure_open()?;
-        self.authorize_record_write(auth, &TableRef::new(BifrostNamespace::Logs, "records"))
-            .await?;
+        self.authorize_record_write(auth, &table).await?;
         let attributed = self
-            .attributed_cards(auth, || attribution::log_card_uids(&decoded.request))
+            .attributed_cards(auth, || attribution::log_card_uids(input))
             .await?;
-        let (batch, outcome) = crate::tables::logs::project_resource_logs(
-            &decoded.request.resource_logs,
+        let (batch, outcome) = crate::tables::logs::project_log_input(
+            input,
             attributed.as_deref(),
             self.limits.expanded_bytes(),
         )
         .map_err(|error| projection_error("log", &error))?;
-        // The generated request is no longer read; free its backing before
-        // Scribe adopts the decode owner and charges the projected Arrow.
-        drop(decoded.request);
-        self.dispatch_canonical(
-            auth,
-            TableRef::new(BifrostNamespace::Logs, "records"),
-            decoded.wire_bytes,
+        Ok(PreparedExport {
+            table,
             batch,
-            decoded.owner,
+            outcome,
             attributed,
-        )
-        .await?;
-        Ok(outcome)
+        })
     }
 
     /// Routes one projected canonical OTLP batch to Scribe under retry

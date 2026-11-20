@@ -28,14 +28,14 @@ use crate::otlp_contract::IngestOutcome;
 use crate::tables::TableError;
 use crate::tables::fields::canonical_arrow_fields;
 use crate::tables::signal::{
-    Attributes, ExceptionPromotions, OutputBudget, RecordCorrelation, ResourceEnvelope,
-    ResourcePromotionColumns, ScopeEnvelope, ValueRef, VariantFailure, append_attributes,
-    bool_column, checked_i64, distinct_keys, entity_refs_column, fixed_binary_column,
+    Attributes, Context, ExceptionPromotions, OutputBudget, RecordCorrelation, ResourceEnvelope,
+    ResourcePromotionColumns, RowEnvelopes, ScopeEnvelope, ValueRef, VariantFailure,
+    append_attributes, bool_column, checked_i64, distinct_keys, fixed_binary_column,
     fixed_binary_opt_column, fixed_row_bytes, i32_column, i32_opt_column, i64_column,
     i64_opt_column, internal, last_attribute, last_string_attribute, list_column, nested_fields,
     otlp_instant_column, projected_signal_schema, promoted_int, refuse_forged, span_id_bytes,
     stored_attributes, struct_column, trace_id_bytes, u32_as_i64_column, utf8_column,
-    utf8_opt_column, utf8_opt_column_from, variant_column,
+    utf8_opt_column,
 };
 use wyrd_spec::ids::CardUid;
 
@@ -132,13 +132,13 @@ pub fn project_trace_input(
 
     for resource in &input.resources {
         let envelope = ResourceEnvelope::project(resource.resource.as_deref(), resource.schema_url)
-            .map(|envelope| columns.retain_resource(envelope));
+            .map(|envelope| columns.envelopes.retain_resource(envelope));
         let resource_defect = validate_resource(resource.resource.as_deref());
         for scope in &input.scopes[resource.scopes.clone()] {
             let scope_envelope = ScopeEnvelope::project(scope.scope.as_deref(), scope.schema_url)
-                .map(|envelope| columns.retain_scope(envelope));
+                .map(|envelope| columns.envelopes.retain_scope(envelope));
             let scope_defect = resource_defect.or_else(|| validate_scope(scope.scope.as_deref()));
-            for span in &input.spans[scope.spans.clone()] {
+            for span in &input.spans[scope.records.clone()] {
                 let row = ordinal;
                 ordinal = ordinal.saturating_add(1);
                 let outcome = match (scope_defect, &envelope, &scope_envelope) {
@@ -254,16 +254,6 @@ fn validate_scope(scope: Option<&InstrumentationScope>) -> Option<&'static str> 
         .then_some("scope declares too many distinct attribute keys")
 }
 
-/// The resource and scope envelopes one accepted span repeats, as indices
-/// into [`SpanColumns::resources`] and [`SpanColumns::scopes`].
-#[derive(Debug, Clone, Copy)]
-struct Context {
-    /// Index of the span's resource envelope.
-    resource: usize,
-    /// Index of the span's scope envelope.
-    scope: usize,
-}
-
 /// Column-wise accumulator for the accepted canonical span rows.
 ///
 /// One vector per declared ledger field, plus flattened child storage and per
@@ -275,12 +265,8 @@ struct Context {
 #[derive(Debug, Default)]
 struct SpanColumns<'a> {
     rows: usize,
-    /// Every projected resource envelope, in request order.
-    resources: Vec<ResourceEnvelope>,
-    /// Every projected scope envelope, in request order.
-    scopes: Vec<ScopeEnvelope>,
-    /// Each accepted row's envelopes.
-    context: Vec<Context>,
+    /// Each resource and scope envelope, and the ones every row repeats.
+    envelopes: RowEnvelopes,
     trace_id: Vec<[u8; 16]>,
     span_id: Vec<[u8; 8]>,
     parent_span_id: Vec<Option<[u8; 8]>>,
@@ -342,24 +328,6 @@ struct SpanColumns<'a> {
 }
 
 impl<'a> SpanColumns<'a> {
-    /// Retain one projected resource envelope for the rows beneath it.
-    ///
-    /// Returns its index and the payload bytes it adds to each row.
-    fn retain_resource(&mut self, envelope: ResourceEnvelope) -> (usize, usize) {
-        let retained = (self.resources.len(), envelope.repeated_bytes());
-        self.resources.push(envelope);
-        retained
-    }
-
-    /// Retain one projected scope envelope for the rows beneath it.
-    ///
-    /// Returns its index and the payload bytes it adds to each row.
-    fn retain_scope(&mut self, envelope: ScopeEnvelope) -> (usize, usize) {
-        let retained = (self.scopes.len(), envelope.repeated_bytes());
-        self.scopes.push(envelope);
-        retained
-    }
-
     /// Validate one span completely, then append its canonical row.
     ///
     /// # Errors
@@ -463,7 +431,7 @@ impl<'a> SpanColumns<'a> {
         self.link_lengths.push(Some(span.links.len()));
         self.dropped_links_count.push(span.dropped_links_count);
 
-        self.context.push(context);
+        self.envelopes.push(context);
         for (column, value) in self.gen_ai_strings.iter_mut().zip(promotions.strings) {
             column.push(value);
         }
@@ -690,17 +658,6 @@ impl<'a> SpanColumns<'a> {
         )
         .map_err(internal)?;
 
-        let resource = || self.context.iter().map(|row| &self.resources[row.resource]);
-        let scope = || self.context.iter().map(|row| &self.scopes[row.scope]);
-        let resource_text = |pick: fn(&ResourceEnvelope) -> Option<&str>| {
-            utf8_opt_column_from(resource().map(pick))
-        };
-        let scope_text = |pick: fn(&ScopeEnvelope) -> &str| {
-            utf8_opt_column_from(scope().map(|row| Some(pick(row))))
-        };
-        let entity_ref_lengths: Vec<Option<usize>> =
-            resource().map(|row| Some(row.entity_refs.len())).collect();
-
         let mut gen_ai_strings = self.gen_ai_strings.into_iter();
         let mut gen_ai_ints = self.gen_ai_ints.into_iter();
         let mut columns: Vec<ArrayRef> = vec![
@@ -727,32 +684,24 @@ impl<'a> SpanColumns<'a> {
             list_column(&SPAN_LINK_ELEMENT.to_arrow(), links, &self.link_lengths)
                 .map_err(internal)?,
             u32_as_i64_column(self.dropped_links_count),
-            bool_column(resource().map(|row| row.present).collect()),
-            variant_column(resource().map(|row| Some(&row.attributes))),
-            u32_as_i64_column(resource().map(|row| row.dropped_attributes_count).collect()),
-            resource_text(|row| Some(&row.schema_url)),
-            entity_refs_column(
-                resource().flat_map(|row| &row.entity_refs),
-                &entity_ref_lengths,
-            )?,
-            bool_column(scope().map(|row| row.present).collect()),
-            scope_text(|row| &row.name),
-            scope_text(|row| &row.version),
-            variant_column(scope().map(|row| Some(&row.attributes))),
-            u32_as_i64_column(scope().map(|row| row.dropped_attributes_count).collect()),
-            scope_text(|row| &row.schema_url),
-            resource_text(|row| row.promotions.service_name.as_deref()),
-            utf8_opt_column(&gen_ai_strings.next().unwrap_or_default()),
-            utf8_opt_column(&gen_ai_strings.next().unwrap_or_default()),
-            utf8_opt_column(&gen_ai_strings.next().unwrap_or_default()),
-            utf8_opt_column(&gen_ai_strings.next().unwrap_or_default()),
-            i64_opt_column(gen_ai_ints.next().unwrap_or_default()),
-            i64_opt_column(gen_ai_ints.next().unwrap_or_default()),
-            resource_text(|row| row.promotions.service_version.as_deref()),
-            resource_text(|row| row.promotions.deployment_environment.as_deref()),
         ];
+        columns.extend(self.envelopes.columns()?);
+        columns.extend([
+            self.envelopes
+                .resource_text(|row| row.promotions.service_name.as_deref()),
+            utf8_opt_column(&gen_ai_strings.next().unwrap_or_default()),
+            utf8_opt_column(&gen_ai_strings.next().unwrap_or_default()),
+            utf8_opt_column(&gen_ai_strings.next().unwrap_or_default()),
+            utf8_opt_column(&gen_ai_strings.next().unwrap_or_default()),
+            i64_opt_column(gen_ai_ints.next().unwrap_or_default()),
+            i64_opt_column(gen_ai_ints.next().unwrap_or_default()),
+            self.envelopes
+                .resource_text(|row| row.promotions.service_version.as_deref()),
+            self.envelopes
+                .resource_text(|row| row.promotions.deployment_environment.as_deref()),
+        ]);
         columns.extend(ResourcePromotionColumns::from_rows(
-            resource().map(|row| &row.promotions),
+            self.envelopes.resources().map(|row| &row.promotions),
         ));
         columns.extend([
             utf8_opt_column(&self.http_request_method),

@@ -830,6 +830,11 @@ impl VariantColumnEncoder {
         }
     }
 
+    /// Append one null row, as [`VariantColumnBuilder::append_null`] does.
+    pub fn append_null(&mut self) {
+        self.rows.append_null();
+    }
+
     /// The column state after its last complete row, for [`Self::rollback`].
     #[must_use]
     pub fn checkpoint(&self) -> parquet_variant_compute::VariantArrayCheckpoint {

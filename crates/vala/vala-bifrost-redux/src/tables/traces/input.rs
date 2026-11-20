@@ -11,12 +11,10 @@
 use std::borrow::Cow;
 use std::ops::Range;
 
-use wyrd_tonic::otlp::common::v1::{InstrumentationScope, KeyValue};
-use wyrd_tonic::otlp::resource::v1::Resource;
 use wyrd_tonic::otlp::trace::v1::ResourceSpans;
 use wyrd_tonic::otlp::trace::v1::span::{Event, Link};
 
-use crate::tables::signal::{AttributePool, Attributes, PoolRange};
+use crate::tables::signal::{AttributeList, AttributePool, Attributes, ResourceInput, ScopeInput};
 
 /// One flattened trace export.
 #[derive(Debug, Default)]
@@ -33,40 +31,6 @@ pub struct TraceInput<'a> {
     pub links: Vec<LinkInput<'a>>,
     /// Attributes of a wire-decoded input; empty for a generated one.
     pub pool: AttributePool<'a>,
-}
-
-/// One resource group.
-///
-/// The resource itself is decoded once per group, so a wire decoder owns it
-/// and a generated input borrows it.
-#[derive(Debug)]
-pub struct ResourceInput<'a> {
-    /// The group's resource, when present.
-    pub resource: Option<Cow<'a, Resource>>,
-    /// The group's schema URL.
-    pub schema_url: &'a str,
-    /// The group's scope groups in [`TraceInput::scopes`].
-    pub scopes: Range<usize>,
-}
-
-/// One scope group.
-#[derive(Debug)]
-pub struct ScopeInput<'a> {
-    /// The group's instrumentation scope, when present.
-    pub scope: Option<Cow<'a, InstrumentationScope>>,
-    /// The group's schema URL.
-    pub schema_url: &'a str,
-    /// The group's spans in [`TraceInput::spans`].
-    pub spans: Range<usize>,
-}
-
-/// One attribute list, by source.
-#[derive(Debug, Clone, Copy)]
-pub enum AttributeList<'a> {
-    /// A generated message's entries.
-    Generated(&'a [KeyValue]),
-    /// Entries of [`TraceInput::pool`].
-    Pooled(PoolRange),
 }
 
 /// One span's protocol fields.
@@ -198,7 +162,7 @@ impl<'a> TraceInput<'a> {
                 input.scopes.push(ScopeInput {
                     scope: scope.scope.as_ref().map(Cow::Borrowed),
                     schema_url: &scope.schema_url,
-                    spans: first_span..input.spans.len(),
+                    records: first_span..input.spans.len(),
                 });
             }
             input.resources.push(ResourceInput {
@@ -213,10 +177,7 @@ impl<'a> TraceInput<'a> {
     /// Read one attribute list.
     #[must_use]
     pub fn attributes(&self, list: AttributeList<'a>) -> Attributes<'_> {
-        match list {
-            AttributeList::Generated(entries) => Attributes::Generated(entries),
-            AttributeList::Pooled(range) => self.pool.attributes(range),
-        }
+        self.pool.list(list)
     }
 
     /// One span's events.

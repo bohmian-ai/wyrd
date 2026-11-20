@@ -47,7 +47,7 @@ use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use std::sync::Arc;
 use vala_bifrost_redux::contracts::DecodedOtlp;
-use vala_bifrost_redux::gate::{AuthContext, IngestError, IngestOutcome};
+use vala_bifrost_redux::gate::{AuthContext, IngestError, IngestOutcome, LogsOutcome};
 use wyrd_tonic::otlp::logs_service::{ExportLogsServiceRequest, ExportLogsServiceResponse};
 use wyrd_tonic::otlp::metrics_service::{
     ExportMetricsServiceRequest, ExportMetricsServiceResponse,
@@ -59,7 +59,7 @@ use crate::components::auth::Caller;
 use crate::http::error::WyrdErrorResponse;
 use crate::otlp_decode::{decode_trace, preflight_trace_protobuf};
 use crate::otlp_json::{preflight_logs_json, preflight_metrics_json, preflight_trace_json};
-use crate::otlp_logs_decode::{decode_logs_protobuf, preflight_logs_protobuf};
+use crate::otlp_logs_decode::{decode_logs, preflight_logs_protobuf};
 use crate::otlp_logs_json::decode_logs_json;
 use crate::otlp_metrics_decode::{decode_metrics_protobuf, preflight_metrics_protobuf};
 use crate::otlp_metrics_json::decode_metrics_json;
@@ -268,7 +268,7 @@ async fn export_traces(
             // the decode owner.
             drop(body);
             let outcome = gate
-                .dispatch_traces(&auth, prepared, wire_bytes, owner)
+                .dispatch_prepared(&auth, prepared, wire_bytes, owner)
                 .await
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
             return Ok(trace_response(encoding, &outcome));
@@ -493,17 +493,28 @@ async fn export_logs(
     let auth = caller_auth_context(&caller);
 
     let bifrost = Arc::clone(&state.bifrost);
+    let gate = bifrost.gate();
     let (owner, request) = match encoding {
         OtlpEncoding::Protobuf => {
-            let plan = preflight_logs_protobuf(&body, bifrost.gate().otlp_wire_limits())
+            let (plan, counts) = preflight_logs_protobuf(&body, gate.otlp_wire_limits())
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
-            let owner = bifrost
-                .gate()
+            let owner = gate
                 .reserve_otlp_decode(plan.reservation_bytes())
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
-            let request = decode_logs_protobuf(&body)
+            let prepared = decode_logs(&body, counts)
+                .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?
+                .prepare(gate, &auth)
+                .await
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
-            (owner, request)
+            let wire_bytes = body.len();
+            // The batch owns its data; release the wire before Scribe adopts
+            // the decode owner.
+            drop(body);
+            let outcome = gate
+                .dispatch_prepared(&auth, prepared, wire_bytes, owner)
+                .await
+                .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
+            return Ok(logs_response(encoding, &outcome));
         }
         OtlpEncoding::Json => {
             let plan = preflight_logs_json(&body, bifrost.gate().otlp_wire_limits())
@@ -522,19 +533,22 @@ async fn export_logs(
             (owner, request)
         }
     };
-    let outcome = bifrost
-        .gate()
+    let outcome = gate
         .ingest_decoded_resource_logs(&auth, DecodedOtlp::new(request, body.len(), owner))
         .await
         .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
+    Ok(logs_response(encoding, &outcome))
+}
 
+/// Records one log export's counts on the request span and encodes its
+/// partial-success response.
+fn logs_response(encoding: OtlpEncoding, outcome: &LogsOutcome) -> Response {
     tracing::Span::current().record("accepted_records", outcome.accepted_records);
     tracing::Span::current().record("rejected_records", outcome.rejected_records);
-
     let response = ExportLogsServiceResponse {
         partial_success: outcome.partial_success(),
     };
-    Ok(encode_response(encoding, &response))
+    encode_response(encoding, &response)
 }
 
 /// Build the token-derived [`AuthContext`] for the shared ingest core.

@@ -4,11 +4,13 @@ use std::borrow::Cow;
 use std::mem::size_of;
 
 use crate::state::ServerGate;
-use vala_bifrost_redux::gate::{AuthContext, IngestError, OtlpWireLimits, PreparedTraces};
-use vala_bifrost_redux::tables::signal::{AttributePool, PoolRange, PooledEntry, PooledValue};
-use vala_bifrost_redux::tables::traces::input::{
-    AttributeList, EventInput, LinkInput, ResourceInput, ScopeInput, SpanInput, StatusInput,
+use vala_bifrost_redux::gate::{
+    AuthContext, IngestError, IngestOutcome, OtlpWireLimits, PreparedExport,
 };
+use vala_bifrost_redux::tables::signal::{
+    AttributeList, AttributePool, PoolRange, PooledEntry, PooledValue, ResourceInput, ScopeInput,
+};
+use vala_bifrost_redux::tables::traces::input::{EventInput, LinkInput, SpanInput, StatusInput};
 use vala_bifrost_redux::tables::traces::{SpanOutputWidths, TraceInput};
 use wyrd_tonic::otlp::common::v1::{
     AnyValue, ArrayValue, EntityRef, InstrumentationScope, KeyValue, KeyValueList, any_value,
@@ -1970,21 +1972,18 @@ fn merge_key_value_list(bytes: &[u8], value: &mut KeyValueList) -> Result<(), In
 /// the generated request [`OtlpDecodePlan::reservation_bytes`] admitted.
 pub(crate) fn decode_trace_input(bytes: &[u8], counts: TracePoolCounts) -> Option<TraceInput<'_>> {
     let mut decoder = TraceInputDecoder {
-        wire: bytes,
+        pool: PoolDecoder::new(bytes, counts.entries, counts.values),
         input: TraceInput {
             resources: Vec::with_capacity(counts.resources),
             scopes: Vec::with_capacity(counts.scopes),
             spans: Vec::with_capacity(counts.spans),
             events: Vec::with_capacity(counts.events),
             links: Vec::with_capacity(counts.links),
-            pool: AttributePool {
-                entries: Vec::with_capacity(counts.entries),
-                values: Vec::with_capacity(counts.values),
-            },
+            pool: AttributePool::default(),
         },
     };
     decoder.request(bytes)?;
-    decoder.resolve_nested()?;
+    decoder.input.pool = decoder.pool.finish()?;
     Some(decoder.input)
 }
 
@@ -2030,7 +2029,7 @@ impl DecodedTrace<'_> {
         &self,
         gate: &ServerGate,
         auth: &AuthContext,
-    ) -> Result<PreparedTraces, IngestError> {
+    ) -> Result<PreparedExport<IngestOutcome>, IngestError> {
         match self {
             Self::Borrowed(input) => gate.prepare_trace_input(auth, input).await,
             Self::Generated(request) => {
@@ -2042,15 +2041,11 @@ impl DecodedTrace<'_> {
 }
 
 /// Fills one [`TraceInput`] from protobuf wire; see [`decode_trace_input`].
-///
-/// A nested array or key/value list is pooled after the list holding it, so
-/// every list stays contiguous: until [`Self::resolve_nested`] reaches it, its
-/// placeholder range is its body's offsets in `wire`.
 #[derive(Debug)]
 struct TraceInputDecoder<'a> {
-    /// The whole export.
-    wire: &'a [u8],
-    /// The input being filled.
+    /// The export's attributes, pooled as they are reached.
+    pool: PoolDecoder<'a>,
+    /// The input being filled; its pool is moved in when the walk ends.
     input: TraceInput<'a>,
 }
 
@@ -2119,7 +2114,7 @@ impl<'a> TraceInputDecoder<'a> {
                 None => None,
             },
             schema_url,
-            spans: first_span..self.input.spans.len(),
+            records: first_span..self.input.spans.len(),
         });
         Some(())
     }
@@ -2127,7 +2122,7 @@ impl<'a> TraceInputDecoder<'a> {
     /// Walks one span, then its events and links, so each list stays
     /// contiguous.
     fn span(&mut self, bytes: &'a [u8]) -> Option<()> {
-        let first_entry = self.input.pool.entries.len();
+        let first_entry = self.pool.entries();
         let mut span = SpanInput {
             trace_id: &[],
             span_id: &[],
@@ -2158,7 +2153,7 @@ impl<'a> TraceInputDecoder<'a> {
                 (6, WireValue::Varint(value)) => span.kind = protobuf_i32(value),
                 (7, WireValue::Fixed64(value)) => span.start_time_unix_nano = value,
                 (8, WireValue::Fixed64(value)) => span.end_time_unix_nano = value,
-                (9, WireValue::Bytes(body)) => self.entry(body)?,
+                (9, WireValue::Bytes(body)) => self.pool.entry(body)?,
                 (10, WireValue::Varint(value)) => {
                     span.dropped_attributes_count = protobuf_u32(value);
                 }
@@ -2174,7 +2169,7 @@ impl<'a> TraceInputDecoder<'a> {
         if statuses > 1 {
             return None;
         }
-        span.attributes = AttributeList::Pooled(self.range_from(first_entry));
+        span.attributes = AttributeList::Pooled(self.pool.range_from(first_entry));
         span.status = match status {
             Some(body) => Some(status_input(body)?),
             None => None,
@@ -2196,20 +2191,20 @@ impl<'a> TraceInputDecoder<'a> {
 
     /// Walks one span event.
     fn event(&mut self, bytes: &'a [u8]) -> Option<()> {
-        let first_entry = self.input.pool.entries.len();
+        let first_entry = self.pool.entries();
         let (mut time_unix_nano, mut name, mut dropped_attributes_count) = (0, "", 0);
         let mut fields = WireFields::new(bytes);
         while let Some((tag, value)) = fields.next().ok()? {
             match (tag, value) {
                 (1, WireValue::Fixed64(value)) => time_unix_nano = value,
                 (2, WireValue::Bytes(body)) => name = text(body)?,
-                (3, WireValue::Bytes(body)) => self.entry(body)?,
+                (3, WireValue::Bytes(body)) => self.pool.entry(body)?,
                 (4, WireValue::Varint(value)) => dropped_attributes_count = protobuf_u32(value),
                 (1..=4, _) => return None,
                 _ => {}
             }
         }
-        let attributes = AttributeList::Pooled(self.range_from(first_entry));
+        let attributes = AttributeList::Pooled(self.pool.range_from(first_entry));
         self.input.events.push(EventInput {
             time_unix_nano,
             name,
@@ -2221,7 +2216,7 @@ impl<'a> TraceInputDecoder<'a> {
 
     /// Walks one span link.
     fn link(&mut self, bytes: &'a [u8]) -> Option<()> {
-        let first_entry = self.input.pool.entries.len();
+        let first_entry = self.pool.entries();
         let mut link = LinkInput {
             trace_id: &[],
             span_id: &[],
@@ -2236,7 +2231,7 @@ impl<'a> TraceInputDecoder<'a> {
                 (1, WireValue::Bytes(body)) => link.trace_id = body,
                 (2, WireValue::Bytes(body)) => link.span_id = body,
                 (3, WireValue::Bytes(body)) => link.trace_state = text(body)?,
-                (4, WireValue::Bytes(body)) => self.entry(body)?,
+                (4, WireValue::Bytes(body)) => self.pool.entry(body)?,
                 (5, WireValue::Varint(value)) => {
                     link.dropped_attributes_count = protobuf_u32(value);
                 }
@@ -2245,13 +2240,61 @@ impl<'a> TraceInputDecoder<'a> {
                 _ => {}
             }
         }
-        link.attributes = AttributeList::Pooled(self.range_from(first_entry));
+        link.attributes = AttributeList::Pooled(self.pool.range_from(first_entry));
         self.input.links.push(link);
         Some(())
     }
+}
+
+/// Pools one export's attribute entries and values straight from its wire.
+///
+/// A nested array or key/value list is pooled after the list holding it, so
+/// every list stays contiguous: until [`Self::finish`] resolves it, its
+/// placeholder range is its body's offsets in `wire`. Every method returns
+/// `None` for wire the generated decoder must decide: a framing, wire-type,
+/// or UTF-8 refusal, or an encoding protobuf merges.
+#[derive(Debug)]
+pub(crate) struct PoolDecoder<'a> {
+    /// The whole export.
+    wire: &'a [u8],
+    /// The pool being filled.
+    pool: AttributePool<'a>,
+}
+
+impl<'a> PoolDecoder<'a> {
+    /// Starts an empty pool over `wire`, sized for `entries` key/value
+    /// entries and `values` values.
+    pub(crate) fn new(wire: &'a [u8], entries: usize, values: usize) -> Self {
+        Self {
+            wire,
+            pool: AttributePool {
+                entries: Vec::with_capacity(entries),
+                values: Vec::with_capacity(values),
+            },
+        }
+    }
+
+    /// The number of entries pooled so far.
+    pub(crate) fn entries(&self) -> usize {
+        self.pool.entries.len()
+    }
+
+    /// Pools one top-level value, such as a log body, returning its position
+    /// in [`AttributePool::values`].
+    pub(crate) fn push_value(&mut self, bytes: &'a [u8]) -> Option<usize> {
+        let value = self.value(bytes)?;
+        self.pool.values.push(value);
+        Some(self.pool.values.len() - 1)
+    }
+
+    /// Resolves every placeholder list and yields the finished pool.
+    pub(crate) fn finish(mut self) -> Option<AttributePool<'a>> {
+        self.resolve_nested()?;
+        Some(self.pool)
+    }
 
     /// Pools one key/value entry.
-    fn entry(&mut self, bytes: &'a [u8]) -> Option<()> {
+    pub(crate) fn entry(&mut self, bytes: &'a [u8]) -> Option<()> {
         let (mut key, mut value, mut values) = ("", None, 0_usize);
         let mut fields = WireFields::new(bytes);
         while let Some((tag, wire)) = fields.next().ok()? {
@@ -2267,7 +2310,7 @@ impl<'a> TraceInputDecoder<'a> {
             (1, Some(body)) => self.value(body)?,
             _ => return None,
         };
-        self.input.pool.entries.push(PooledEntry { key, value });
+        self.pool.entries.push(PooledEntry { key, value });
         Some(())
     }
 
@@ -2314,13 +2357,13 @@ impl<'a> TraceInputDecoder<'a> {
     fn resolve_nested(&mut self) -> Option<()> {
         let (mut entry, mut item) = (0, 0);
         loop {
-            if entry < self.input.pool.entries.len() {
-                let value = self.resolve(self.input.pool.entries[entry].value)?;
-                self.input.pool.entries[entry].value = value;
+            if entry < self.pool.entries.len() {
+                let value = self.resolve(self.pool.entries[entry].value)?;
+                self.pool.entries[entry].value = value;
                 entry += 1;
-            } else if item < self.input.pool.values.len() {
-                let value = self.resolve(self.input.pool.values[item])?;
-                self.input.pool.values[item] = value;
+            } else if item < self.pool.values.len() {
+                let value = self.resolve(self.pool.values[item])?;
+                self.pool.values[item] = value;
                 item += 1;
             } else {
                 return Some(());
@@ -2339,13 +2382,13 @@ impl<'a> TraceInputDecoder<'a> {
 
     /// Pools the items of the `ArrayValue` at `body` in the wire.
     fn array(&mut self, body: PoolRange) -> Option<PoolRange> {
-        let start = self.input.pool.values.len();
+        let start = self.pool.values.len();
         let mut fields = WireFields::new(&self.wire[body.start..body.end]);
         while let Some((tag, wire)) = fields.next().ok()? {
             match (tag, wire) {
                 (1, WireValue::Bytes(item)) => {
                     let item = self.value(item)?;
-                    self.input.pool.values.push(item);
+                    self.pool.values.push(item);
                 }
                 (1, _) => return None,
                 _ => {}
@@ -2353,13 +2396,13 @@ impl<'a> TraceInputDecoder<'a> {
         }
         Some(PoolRange {
             start,
-            end: self.input.pool.values.len(),
+            end: self.pool.values.len(),
         })
     }
 
     /// Pools the entries of the `KeyValueList` at `body` in the wire.
     fn kvlist(&mut self, body: PoolRange) -> Option<PoolRange> {
-        let start = self.input.pool.entries.len();
+        let start = self.pool.entries.len();
         let mut fields = WireFields::new(&self.wire[body.start..body.end]);
         while let Some((tag, wire)) = fields.next().ok()? {
             match (tag, wire) {
@@ -2372,10 +2415,10 @@ impl<'a> TraceInputDecoder<'a> {
     }
 
     /// The pooled entries pushed since `start`.
-    fn range_from(&self, start: usize) -> PoolRange {
+    pub(crate) fn range_from(&self, start: usize) -> PoolRange {
         PoolRange {
             start,
-            end: self.input.pool.entries.len(),
+            end: self.pool.entries.len(),
         }
     }
 }
@@ -2399,7 +2442,7 @@ fn status_input(bytes: &[u8]) -> Option<StatusInput<'_>> {
 }
 
 /// Borrows one protobuf string, refusing invalid UTF-8.
-fn text(bytes: &[u8]) -> Option<&str> {
+pub(crate) fn text(bytes: &[u8]) -> Option<&str> {
     std::str::from_utf8(bytes).ok()
 }
 
@@ -2419,9 +2462,14 @@ mod tests {
     use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span, status};
     use wyrd_tonic::prost::Message;
 
-    /// The trace preflight's plan alone, shaped like the other signals'.
+    /// The trace preflight's plan alone, shaped like the metrics preflight.
     fn trace_plan(bytes: &[u8], limits: OtlpWireLimits) -> Result<OtlpDecodePlan, IngestError> {
         preflight_trace_protobuf(bytes, limits).map(|(plan, _)| plan)
+    }
+
+    /// The logs preflight's plan alone, shaped like the metrics preflight.
+    fn logs_plan(bytes: &[u8], limits: OtlpWireLimits) -> Result<OtlpDecodePlan, IngestError> {
+        crate::otlp_logs_decode::preflight_logs_protobuf(bytes, limits).map(|(plan, _)| plan)
     }
 
     /// Builds one attribute for rich trace decode fixtures.
@@ -3319,10 +3367,7 @@ mod tests {
         };
         [
             (trace_plan as Preflight, traces.encode_to_vec()),
-            (
-                crate::otlp_logs_decode::preflight_logs_protobuf,
-                logs.encode_to_vec(),
-            ),
+            (logs_plan, logs.encode_to_vec()),
             (
                 crate::otlp_metrics_decode::preflight_metrics_protobuf,
                 metrics.encode_to_vec(),
@@ -3356,7 +3401,7 @@ mod tests {
                 size_of::<ResourceSpans>(),
             ),
             (
-                crate::otlp_logs_decode::preflight_logs_protobuf,
+                logs_plan,
                 ExportLogsServiceRequest {
                     resource_logs: vec![ResourceLogs::default(); groups],
                 }
@@ -3493,7 +3538,7 @@ mod tests {
     /// Computes the heap one borrowed trace input holds, owned resources and
     /// scopes included.
     fn borrowed_trace_capacity(input: &TraceInput<'_>) -> usize {
-        use vala_bifrost_redux::tables::traces::input::{EventInput, LinkInput, ResourceInput};
+        use vala_bifrost_redux::tables::traces::input::{EventInput, LinkInput};
         input.resources.capacity() * size_of::<ResourceInput<'_>>()
             + input
                 .resources

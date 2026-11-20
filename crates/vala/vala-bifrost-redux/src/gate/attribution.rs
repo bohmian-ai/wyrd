@@ -22,12 +22,12 @@ use wyrd_spec::vala::{SUBJECT_CARD_UID, WORKLOAD_CARD_UID};
 use wyrd_sql::WyrdPostgres;
 use wyrd_sql::queries::cards::{get_card_by_uid, get_card_for_reconciliation};
 use wyrd_tonic::otlp::common::v1::KeyValue;
-use wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest;
 use wyrd_tonic::otlp::metrics::v1::{Metric, metric};
 use wyrd_tonic::otlp::metrics_service::ExportMetricsServiceRequest;
 
 use super::auth::AuthContext;
 use super::error::IngestError;
+use crate::tables::logs::LogInput;
 use crate::tables::signal::card_uid_text;
 use crate::tables::traces::TraceInput;
 use crate::tables::{CardDescriptor, FrameDimensions};
@@ -396,14 +396,12 @@ pub fn span_card_uids(input: &TraceInput<'_>) -> Vec<CardUid> {
 
 /// Collects the distinct `wyrd.card_uid` values of a log export's records.
 #[must_use]
-pub fn log_card_uids(request: &ExportLogsServiceRequest) -> Vec<CardUid> {
+pub fn log_card_uids(input: &LogInput<'_>) -> Vec<CardUid> {
     parse_distinct(
-        request
-            .resource_logs
+        input
+            .records
             .iter()
-            .flat_map(|resource| &resource.scope_logs)
-            .flat_map(|scope| &scope.log_records)
-            .filter_map(|record| card_uid_text(&record.attributes)),
+            .filter_map(|record| card_uid_text(input.attributes(record.attributes))),
     )
 }
 

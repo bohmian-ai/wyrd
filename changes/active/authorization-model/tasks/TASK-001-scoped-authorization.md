@@ -474,6 +474,42 @@ Shared auth/runtime unit tests cover pure root/ceiling containment and SQL
 integration tests cover family uniqueness. Existing federation regressions run
 with repository identity providers; local Service journeys require none.
 
+Evidence (in progress):
+
+- Provisioning, two releases and attribution — PASS, existing behavior.
+  - Rust `principal_roles::stable_accounts_preserve_execution_identity`. The admin
+    creates the family-restricted `observed-service-runtime` account through
+    `Principals`, and the listed summary shows that restriction. A second account's
+    claim on the family is refused with `WYRD_AUTH_409_WORKLOAD_BINDING_CONFLICT`. One
+    key drives both releases concurrently across token renewal, and each run's rows
+    keep the shared Model as subject and their own `run_id`. A root of another family
+    is refused with `WYRD_AUTH_401_WORKLOAD_UID_REFUSED`. Revocation ends the key's
+    exchange.
+  - Python `test_stable_accounts_preserve_execution_identity` additionally checks
+    `sub_principal_id`/`act_principal_id` on retained rows.
+  - Python `test_a_delegate_acts_for_its_subject_from_its_own_root` covers the
+    delegation chain and refuses a rootless delegation.
+  - Python `test_another_familys_account_cannot_run_as_the_root` covers a foreign root
+    over SDK and raw HTTP.
+- Releases grant nothing; the account reaches only its grants and roots — PASS.
+  Python `test_a_release_grants_nothing_and_its_account_holds_only_its_grants`:
+  - Declaring both releases creates no runtime account.
+  - The account's access summary is exactly `workload` direct, with its family
+    restriction.
+  - Under its own root it is refused an ungranted declaration
+    (`WYRD_PERMISSION_403_DENIED_RBAC`).
+  - A malformed root is `WYRD_SPEC_400_VALIDATION`, and an unknown root is
+    `WYRD_AUTH_401_WORKLOAD_UID_REFUSED`.
+
+  The first run failed on my guessed code for the malformed root
+  (`WYRD_SPEC_400_VALIDATION`, not REFUSED). That was the new test's expectation, not
+  missing behavior, so it is not RED. GREEN: `test_principal_roles.py` 10/10
+  (`9ceb23907`).
+- Not yet proven here: signed-root mismatch, and provider-assignment updates leaving
+  direct bindings intact. The latter is covered by
+  `principal_roles::direct_and_idp_user_assignments_coexist` (Rust) and its Python and
+  TypeScript twins. FAIL for signed-root mismatch until proven.
+
 ### 3. Change access under existing credentials and observe bounded enforcement
 
 Maps the programmatic portion of AC-003 to REQ-001, REQ-004, REQ-005, REQ-008

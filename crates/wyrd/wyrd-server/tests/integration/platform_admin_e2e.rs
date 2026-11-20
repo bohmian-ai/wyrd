@@ -814,10 +814,11 @@ async fn provisioned_tenant_admin(srv: &WyrdTestServer, slug: &str) -> String {
 ///
 /// This is the whole point of separating credentials from identity: the
 /// principal, its roles, and everything it owns survive the rotation, and the
-/// old credential mints nothing once the operator retires it. A token it
-/// already minted is a self-contained snapshot that lapses at its five-minute
-/// expiry, while the surviving credential exchanges and spends immediately —
-/// no ordering between the two tokens is involved.
+/// old credential mints nothing once the operator retires it. Revocation ends
+/// renewal and does not withdraw a token the credential already minted, which
+/// spends the account's current authority until its five-minute expiry, while
+/// the surviving credential exchanges and spends immediately — no ordering
+/// between the two tokens is involved.
 #[tokio::test]
 async fn a_tenant_rotates_an_automation_credential_without_an_outage() {
     let srv = WyrdTestServer::start_in_process()
@@ -952,7 +953,7 @@ async fn a_tenant_rotates_an_automation_credential_without_an_outage() {
     assert_eq!(
         resp.status(),
         StatusCode::OK,
-        "a token the revoked credential already minted keeps its snapshot until expiry"
+        "revoking a credential does not withdraw a token it already minted"
     );
     let surviving = tenant_token(&srv, &second)
         .await
@@ -1189,7 +1190,7 @@ async fn a_revoked_credential_mints_nothing_and_its_token_lapses_at_expiry() {
     assert_eq!(
         cards(&token_a).await,
         StatusCode::OK,
-        "A's existing token keeps its snapshot authority before expiry"
+        "revoking A does not withdraw a token A already minted"
     );
     let token_b = tenant_token(&srv, &second)
         .await
@@ -2820,7 +2821,8 @@ async fn an_operator_rotates_the_deployment_root_credential() {
 /// operator reached for it. The journey therefore proves three things a
 /// generated client depends on: the declared kind selects the table, a reason
 /// that looks like a credential is refused rather than persisted, and an
-/// accepted reason is what the audit row carries.
+/// accepted reason is what the audit row carries. A token the principal held
+/// before the revocation is refused as inactive at its next request.
 #[tokio::test]
 async fn a_tenant_revokes_a_compromised_principal_with_its_reason() {
     let srv = WyrdTestServer::start_in_process()
@@ -2921,9 +2923,16 @@ async fn a_tenant_revokes_a_compromised_principal_with_its_reason() {
         .expect("cards route responds");
     assert_eq!(
         resp.status(),
-        StatusCode::OK,
-        "a token minted before the revocation keeps its snapshot until expiry"
+        StatusCode::UNAUTHORIZED,
+        "a token minted before the revocation spends current authority, and the account is inactive"
     );
+    let problem: Value = serde_json::from_slice(
+        &to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("problem body reads"),
+    )
+    .expect("problem is JSON");
+    assert_eq!(problem["details"]["reason"], "inactive", "{problem}");
     assert_eq!(
         tenant_token(&srv, &credential).await.unwrap_err(),
         StatusCode::BAD_REQUEST,
@@ -3403,7 +3412,8 @@ async fn an_operator_suspends_and_resumes_a_tenant_through_the_platform_plane() 
     );
 
     // A token minted before the suspension is the interesting one: suspension
-    // governs issuance, and an issued token is a self-contained snapshot.
+    // governs issuance, and an issued token spends its account's current
+    // authority, which suspending the tenant does not withdraw.
     let live_token = tenant_token(&srv, &admin_credential)
         .await
         .expect("the tenant administers before suspension");
@@ -3459,8 +3469,8 @@ async fn an_operator_suspends_and_resumes_a_tenant_through_the_platform_plane() 
     assert_eq!(
         resp.status(),
         StatusCode::OK,
-        "a token minted before the suspension keeps its snapshot authority \
-         until its five-minute expiry; verification reads no tenant state"
+        "a token minted before the suspension keeps its account's current authority \
+         until its five-minute expiry"
     );
 
     // Replaying the same transition changes nothing and says so.

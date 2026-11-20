@@ -5284,6 +5284,8 @@ impl WyrdTestServerBuilder {
     ///
     /// The server is composed on the shared Wyrd runtime, so every background
     /// owner it starts lives on the runtime [`WyrdTestServer`]'s `Drop` drives.
+    /// It runs the current-authority propagation worker, so committed access
+    /// changes reach its cache as they reach a production server's.
     /// Composed on a caller's current-thread runtime, those owners would wait
     /// on a thread the dropping test blocks, and teardown would never settle.
     ///
@@ -5291,7 +5293,23 @@ impl WyrdTestServerBuilder {
     /// Returns an error when database, storage, auth, or router state cannot be
     /// created, or when the composing task panics.
     pub async fn start_in_process(self) -> Result<WyrdTestServer, WyrdTestServerError> {
-        on_shared_runtime(move || self.compose_in_process()).await
+        let server = on_shared_runtime(move || self.compose_in_process()).await?;
+        // Current authority propagates to an in-process server as it does to
+        // a bound one; its other workers start only when a test binds it.
+        let authority = {
+            let mut workers = server
+                .workers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            workers
+                .iter()
+                .position(|(name, _)| *name == "authorization_cache")
+                .map(|at| workers.remove(at).1)
+        };
+        if let Some(worker) = authority {
+            wyrd_runtime::runtime().spawn(worker);
+        }
+        Ok(server)
     }
 
     /// Composes the in-process server on the calling runtime.

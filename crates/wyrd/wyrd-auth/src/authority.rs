@@ -56,13 +56,16 @@ pub struct AccountAuthority {
     pub restriction: Option<WorkloadFamily>,
 }
 
-/// One stored credential's current state.
+/// What one stored credential, revoked or not, bounds.
+///
+/// Revocation ends renewal; it does not withdraw a bearer the key already
+/// minted, which stays bounded by the key's ceiling.
 #[derive(Clone, Debug)]
 enum KeyState {
-    /// Usable, with its restrictive ceiling when it carries one.
-    Active(Option<Arc<PermissionSet>>),
-    /// Revoked or expired.
-    Inactive,
+    /// Its restrictive ceiling, when it carries one.
+    Bounded(Option<Arc<PermissionSet>>),
+    /// Its stored ceiling does not decode, so nothing it minted is usable.
+    Corrupt,
 }
 
 /// A tenant's compiled authority at one authorization revision.
@@ -262,14 +265,13 @@ impl TenantAuthority {
                         .map(Arc::new)
                 })
                 .transpose();
-            let stateful = match ceiling {
-                Ok(ceiling) if key.active => KeyState::Active(ceiling),
-                Ok(_) => KeyState::Inactive,
-                Err(_) => {
+            let stateful = ceiling.map_or_else(
+                |_| {
                     tracing::error!(credential = %key.id, "a stored credential ceiling is corrupt; the credential is unusable");
-                    KeyState::Inactive
-                }
-            };
+                    KeyState::Corrupt
+                },
+                KeyState::Bounded,
+            );
             keys.insert(key.id, stateful);
         }
         Ok(Self {
@@ -343,14 +345,14 @@ impl TenantAuthority {
             authority = authority.restricted_by(Arc::new(ceiling.clone()));
         }
         if let Some(credential) = subject.credential_id {
-            // The snapshot holds every stored key, revoked ones included, so
-            // an unknown key was committed after the load: a miss.
-            match self.keys.get(&credential)? {
-                KeyState::Inactive => return None,
-                KeyState::Active(Some(ceiling)) => {
+            // A credential that is not a stored key, such as a consumed
+            // refresh row, adds no key ceiling.
+            match self.keys.get(&credential) {
+                Some(KeyState::Corrupt) => return None,
+                Some(KeyState::Bounded(Some(ceiling))) => {
                     authority = authority.restricted_by(Arc::clone(ceiling));
                 }
-                KeyState::Active(None) => {}
+                Some(KeyState::Bounded(None)) | None => {}
             }
         }
         for step in &verified.delegation_chain {
@@ -363,6 +365,25 @@ impl TenantAuthority {
         principal.effective_permissions = authority;
         principal.roles = account.roles.to_vec();
         Some(principal)
+    }
+
+    /// Whether `verified` may name state committed after this snapshot
+    /// loaded: it was issued no earlier than the load second, and its
+    /// account, an actor in its chain, or its credential is not held here.
+    ///
+    /// The snapshot holds every stored key, revoked ones included, so an
+    /// unknown credential of a token older than the load is not a key.
+    pub fn predates(&self, verified: &VerifiedToken) -> bool {
+        verified.iat.timestamp() >= self.loaded_at.timestamp()
+            && (self.account(verified.principal.id).is_none()
+                || verified
+                    .delegation_chain
+                    .iter()
+                    .any(|step| self.account(step.principal.id).is_none())
+                || verified
+                    .principal
+                    .credential_id
+                    .is_some_and(|credential| !self.keys.contains_key(&credential)))
     }
 }
 
@@ -480,10 +501,7 @@ impl AuthorityCache {
     ) -> Result<Principal, WyrdError> {
         let tenant = verified.principal.tenant_id;
         let mut snapshot = self.acquire(postgres, tenant).await?;
-        if let Some(principal) = snapshot.authorize(verified) {
-            return Ok(principal);
-        }
-        if verified.iat.timestamp() >= snapshot.loaded_at.timestamp() {
+        if snapshot.predates(verified) {
             snapshot = self.reload(postgres, tenant).await?;
         }
         snapshot
@@ -663,18 +681,20 @@ mod tests {
         assert!(cache.cached(tenant).is_none(), "expired freshness refuses");
     }
 
-    /// A token presenting a key the snapshot does not hold is a miss, never
-    /// an active key without a ceiling: the snapshot holds every stored key,
-    /// revoked ones included, so an unknown key was committed after the load.
+    /// A token naming a credential the snapshot does not hold predates it
+    /// only when issued no earlier than its load, so the cache reloads once
+    /// for a key committed after the load; an older token's unknown
+    /// credential, such as a consumed refresh row, is not a key and is
+    /// authorized with no key ceiling.
     ///
     /// # Panics
-    /// Panics when the snapshot authorizes the unknown key or refuses the
-    /// same account without one.
+    /// Panics when a new unknown credential does not predate the snapshot, or
+    /// an older one predates it or is refused.
     #[test]
-    fn an_unknown_key_is_a_miss() {
+    fn an_unknown_credential_reloads_only_for_a_newer_token() {
         let (tenant, user) = (DataTenantId::new_v7(), Uuid::now_v7());
         let authority = TenantAuthority::compile(state(1, user)).expect("compiles");
-        let token = |credential: Option<Uuid>| wyrd_auth_verify::VerifiedToken {
+        let token = |credential: Option<Uuid>, iat| wyrd_auth_verify::VerifiedToken {
             principal: wyrd_runtime::Principal::new(
                 wyrd_runtime::PrincipalId::new(user),
                 wyrd_runtime::PrincipalKind::User,
@@ -685,10 +705,14 @@ mod tests {
             permission_ceiling: None,
             delegation_chain: Vec::new(),
             exp: chrono::Utc::now(),
-            iat: chrono::Utc::now(),
+            iat,
         };
-        assert!(authority.authorize(&token(None)).is_some());
-        assert!(authority.authorize(&token(Some(Uuid::now_v7()))).is_none());
+        let earlier = authority.loaded_at - chrono::Duration::seconds(5);
+        let unknown = Some(Uuid::now_v7());
+        assert!(!authority.predates(&token(None, chrono::Utc::now())));
+        assert!(authority.predates(&token(unknown, chrono::Utc::now())));
+        assert!(!authority.predates(&token(unknown, earlier)));
+        assert!(authority.authorize(&token(unknown, earlier)).is_some());
     }
 
     /// A binding whose role operations or scope do not decode makes only its

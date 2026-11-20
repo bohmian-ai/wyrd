@@ -1943,6 +1943,20 @@ async fn direct_execution_refusals_are_stable() {
         decisions(&server, "verification.execute", reader).await,
         vec![run_decision("denied")]
     );
+    // A caller without run authority learns nothing about a target it names:
+    // an unregistered one is refused exactly as a registered one is.
+    let (status, problem) = execute(
+        &server,
+        &reader_jwt,
+        fixture.request(&unregistered, json!(1)).to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
+    assert_eq!(problem["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
+    assert_eq!(
+        decisions(&server, "verification.execute", reader).await,
+        vec![run_decision("denied"), run_decision("denied")]
+    );
     server
         .seed_role("vx_cards", &[Permission::card_read()])
         .await

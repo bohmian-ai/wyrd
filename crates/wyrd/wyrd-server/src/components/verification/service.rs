@@ -482,8 +482,10 @@ impl<'a> VerificationControl<'a> {
     /// not run direct work, [`WyrdError::PermissionDeniedRbac`] without
     /// `verifier:run` on the Verifier,
     /// [`WyrdError::VerificationTargetNotFound`] for an
-    /// unknown, inactive, or non-Verifier target,
-    /// [`WyrdError::VerificationInputUnsupported`] for a Window Verifier,
+    /// unknown, inactive, or non-Verifier target, and
+    /// [`WyrdError::VerificationInputUnsupported`] for a Window Verifier, each
+    /// only to a caller holding `verifier:run` somewhere (any other caller is
+    /// refused with [`WyrdError::PermissionDeniedRbac`]),
     /// [`WyrdError::VerificationInputInvalid`] for evidence that does not
     /// conform to the Verifier's input slots,
     /// [`WyrdError::VerificationInputTooLarge`] for evidence past a slot or
@@ -583,7 +585,18 @@ impl<'a> VerificationControl<'a> {
         .await
         {
             Ok(Ok(target)) => target,
-            Ok(Err(error)) => return ("refused", Err(error)),
+            // As enqueue does, a target that does not resolve reveals its
+            // reason only to a caller holding run authority somewhere; any
+            // other caller is refused exactly as at a registered target.
+            Ok(Err(error)) => {
+                let admitted = self.authorize_verifier(
+                    caller,
+                    Permission::verifier_run_any(),
+                    EXECUTE,
+                    &resource,
+                );
+                return ("refused", Err(admitted.err().unwrap_or(error)));
+            }
             Err(_) => return timed_out(),
         };
         let verifier_scope =

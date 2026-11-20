@@ -756,14 +756,14 @@ async fn ttl_expiry_journey() {
 // ─── Revocation journey ───────────────────────────────────────────────────────
 
 /// Mint a token, reach a real `/v1/cards` `200`, revoke the principal via
-/// admin, and show revocation governs issuance: the principal's durable key can
-/// no longer exchange, while the token it already holds keeps its immutable
-/// authority until its short expiry.
+/// admin, and show revocation governs issuance and current authority: the
+/// principal's durable key can no longer exchange, and the token it already
+/// holds is refused at its next request.
 ///
 /// # Panics
 /// Panics when bootstrap or key exchange fails, the revoke `POST` does not
 /// succeed, the revoked key can still exchange, or the pre-revocation token
-/// stops reaching `200` before its expiry.
+/// is not refused with `401`.
 #[tokio::test]
 #[ignore = "requires the Keycloak and Dex identity lane"]
 async fn revocation_journey() {
@@ -826,9 +826,13 @@ async fn revocation_journey() {
         "a revoked principal cannot exchange its key again"
     );
 
-    // The token minted before revocation is a self-contained snapshot, so it
-    // keeps authorizing until it expires rather than being introspected.
-    assert_v1_delegated_write_ok(&srv, &target_token, "revoke-window").await;
+    // The token minted before revocation spends the account's current
+    // authority, so the revoked account is refused at its next request.
+    assert_eq!(
+        card_write_status(&srv, &target_token, "revoke-window").await,
+        StatusCode::UNAUTHORIZED,
+        "a revoked account's earlier token is refused"
+    );
 }
 
 /// Non-admin cannot revoke a principal — must return 403.
@@ -2266,14 +2270,14 @@ async fn post_refresh(srv: &WyrdTestServer, refresh_token: &str) -> (StatusCode,
 /// journey drives the served path an operator actually uses: log in, use the
 /// access token, revoke the User principal through `/v1/principals/{id}/revoke`,
 /// and then show the session cannot continue — the rotated refresh token no longer
-/// renews — while the access token already issued keeps its
-/// snapshot authority only until its five-minute expiry.
+/// renews — and the access token already issued is refused at its next
+/// request.
 ///
 /// # Panics
 /// Panics when login yields no access or refresh token, admin bootstrap or
 /// exchange fails, the revoke `POST` does not succeed, the issued access token
-/// stops reaching `200` inside its window, or the refresh rotation is not `401`
-/// or returns any successor token.
+/// is not refused with `401`, or the refresh rotation is not refused or returns
+/// any successor token.
 #[tokio::test]
 #[ignore = "requires the Keycloak and Dex identity lane"]
 async fn revoking_a_human_kills_the_session_refresh_authority() {
@@ -2346,8 +2350,13 @@ async fn revoking_a_human_kills_the_session_refresh_authority() {
         revoke_resp.status()
     );
 
-    // The access token is a self-contained snapshot and lapses at expiry.
-    assert_v1_delegated_write_ok(&srv, &access_token, "human-revoke-window").await;
+    // The access token spends the account's current authority, so the
+    // revoked human is refused at its next request.
+    assert_eq!(
+        card_write_status(&srv, &access_token, "human-revoke-window").await,
+        StatusCode::UNAUTHORIZED,
+        "a revoked human's earlier access token is refused"
+    );
 
     // The refresh half is retired in the same transaction, so renewal is
     // refused and mints nothing for the session to continue under.

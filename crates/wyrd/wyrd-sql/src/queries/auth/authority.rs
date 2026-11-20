@@ -40,9 +40,7 @@ SELECT
   ), '[]'::jsonb) AS service_accounts,
   COALESCE((
     SELECT jsonb_agg(jsonb_build_object(
-             'id', id, 'permission_ceiling', permission_ceiling,
-             'active', revoked_at IS NULL
-                       AND (expires_at IS NULL OR expires_at > statement_timestamp())))
+             'id', id, 'permission_ceiling', permission_ceiling))
       FROM wyrd.auth_api_keys
   ), '[]'::jsonb) AS api_keys
 ";
@@ -88,15 +86,13 @@ pub struct AuthorityServiceAccount {
     pub restriction_name: Option<String>,
 }
 
-/// One API key's current state.
+/// One stored API key, revoked or not, and the ceiling it bounds.
 #[derive(Clone, Debug, Deserialize)]
 pub struct AuthorityApiKey {
     /// Credential id.
     pub id: Uuid,
     /// Stored permission-expression ceiling, when the key carries one.
     pub permission_ceiling: Option<Vec<String>>,
-    /// Unrevoked and unexpired at the statement's timestamp.
-    pub active: bool,
 }
 
 /// A tenant's complete current authorization state at one revision.

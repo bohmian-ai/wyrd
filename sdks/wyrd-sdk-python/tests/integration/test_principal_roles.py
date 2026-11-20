@@ -63,8 +63,8 @@ def bind_all(principal: str, kind: PrincipalKind, role: str) -> CreateRoleBindin
 
 
 def grants(access: AccessSummary) -> list[tuple[str, str]]:
-    """Each grant's role and source kind, in the summary's order."""
-    return [(grant["role"], grant["source"]["kind"]) for grant in access["grants"]]
+    """Each grant's role and source kind, sorted: the summary promises no grant order."""
+    return sorted((grant["role"], grant["source"]["kind"]) for grant in access["grants"])
 
 
 def author(server: WyrdTestServer, key: str) -> None:

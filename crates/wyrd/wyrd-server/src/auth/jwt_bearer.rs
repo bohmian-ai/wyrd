@@ -219,13 +219,13 @@ mod pg_tests {
         .await
         .expect("jwt-bearer exchange succeeds");
 
-        let verified = verify_issued_token(&state, tenant, exchanged.access_token.expose_secret())
-            .expect("issued token verifies");
-        assert_eq!(verified.principal.kind, PrincipalKind::Service);
-        assert_eq!(verified.principal.id.as_uuid(), account);
-        assert_eq!(verified.principal.card_access, CardAccess::AnyRegistered);
-        assert_eq!(verified.principal.workload_uid, None);
-        assert_eq!(role_names(&verified.principal.roles), set_of(&[role_name]));
+        let principal =
+            authorize_issued_token(&state, tenant, exchanged.access_token.expose_secret()).await;
+        assert_eq!(principal.kind, PrincipalKind::Service);
+        assert_eq!(principal.id.as_uuid(), account);
+        assert_eq!(principal.card_access, CardAccess::AnyRegistered);
+        assert_eq!(principal.workload_uid, None);
+        assert_eq!(role_names(&principal.roles), set_of(&[role_name]));
         assert_eq!(exchanged.token_type, TokenType::Bearer);
         assert!(
             exchanged.refresh_token.is_none(),
@@ -754,7 +754,7 @@ mod pg_tests {
                 // Assertion claims naming another account or root grant nothing.
                 claims["principal_id"] = serde_json::json!(other.to_string());
                 claims["workload_uid"] = serde_json::json!(foreign_claim());
-                exchange_jwt_bearer(
+                let exchanged = exchange_jwt_bearer(
                     &state,
                     &tenant_headers(slug),
                     SecretString::from(encode_external_token(&claims)),
@@ -762,12 +762,11 @@ mod pg_tests {
                     workload_uid,
                     "req-select",
                 )
-                .await
-                .map(|exchanged| {
-                    verify_issued_token(&state, tenant, exchanged.access_token.expose_secret())
-                        .expect("issued token verifies")
-                        .principal
-                })
+                .await?;
+                Ok::<_, crate::http::error::WyrdErrorResponse>(
+                    authorize_issued_token(&state, tenant, exchanged.access_token.expose_secret())
+                        .await,
+                )
             }
         };
 
@@ -1219,6 +1218,25 @@ mod pg_tests {
                 }
             })
             .collect()
+    }
+
+    /// Verify `token` as `tenant` and authorize it against the tenant's
+    /// current authority, the principal a request with it would act as.
+    ///
+    /// # Panics
+    /// Panics when the token does not verify or its account is not current.
+    async fn authorize_issued_token(
+        state: &AppState,
+        tenant: DataTenantId,
+        token: &str,
+    ) -> wyrd_runtime::Principal {
+        let verified = verify_issued_token(state, tenant, token).expect("issued token verifies");
+        state
+            .auth
+            .authority
+            .authorize(state.postgres.wyrd(), &verified)
+            .await
+            .expect("the issued token's account is current")
     }
 
     fn verify_issued_token(

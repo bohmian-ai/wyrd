@@ -13,6 +13,7 @@ use axum::extract::{Extension, Form, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use serde::Deserialize;
+use wyrd_auth::browser_sessions::BrowserSession;
 use wyrd_auth::cli_logins::{CliLogins, DEVICE_VERIFICATION_PATH};
 use wyrd_spec::auth::{
     DeviceAuthorization, DeviceAuthorizationRequest, OAuthClientId, OAuthErrorResponse,
@@ -21,7 +22,9 @@ use wyrd_spec::auth::{
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::ids::TenantSlug;
 use wyrd_spec::request_id::RequestId;
+use wyrd_sql::row_types::auth::HumanLoginAnchor;
 
+use crate::auth::browser::{browser_sessions, session_cookies};
 use crate::auth::oauth::{ClientForm, OAuthError, OAuthForm, no_store};
 use crate::auth::{RequestOrigin, auth_not_configured};
 use crate::http::error::WyrdErrorResponse;
@@ -167,8 +170,10 @@ pub async fn device_page(Query(query): Query<DeviceQuery>) -> Response {
 ///
 /// Only a form posted from the origin the request arrived at is accepted, so
 /// another site cannot approve its own code in the person's browser. Approve
-/// redirects (`303`) to the tenant's provider sign-in, bound to the code's
-/// device authorization; Deny ends the CLI's login.
+/// with a recent password or provider session for the tenant records that
+/// session's human anchor and answers `200`; without one it redirects
+/// (`303`) to the tenant's provider sign-in, bound to the code's device
+/// authorization. Deny ends the CLI's login.
 ///
 /// # Errors
 /// Answers a plain `400` page for an unknown, expired, or denied code, a
@@ -179,8 +184,8 @@ pub async fn device_page(Query(query): Query<DeviceQuery>) -> Response {
     path = "/auth/device",
     request_body(content = DeviceForm, content_type = "application/x-www-form-urlencoded"),
     responses(
-        (status = 200, description = "The code was denied", content_type = "text/html",
-          body = String),
+        (status = 200, description = "The code was approved with the recent session, or denied",
+          content_type = "text/html", body = String),
         (status = 303, description = "Approved; sign in at the tenant's provider",
           headers(("Location" = String, description = "Provider authorization URL"))),
         (status = 400, description = "The code is unknown, expired, or denied",
@@ -215,10 +220,28 @@ pub async fn device_decision(
         ));
     }
     let result = match form.decision {
-        DeviceDecision::Approve => logins
-            .approve(&form.tenant, &form.user_code, &origin)
-            .await
-            .map(|url| Redirect::to(url.as_str()).into_response()),
+        DeviceDecision::Approve => match signed_in(&state, &headers, &form.tenant).await? {
+            Some((session, anchor)) => logins
+                .approve_signed_in(
+                    &form.tenant,
+                    &form.user_code,
+                    session.verified.principal.tenant_id,
+                    session.verified.principal.id,
+                    anchor,
+                )
+                .await
+                .map(|()| {
+                    page(
+                        StatusCode::OK,
+                        "<h1>Login approved</h1><p>Return to your terminal. You can close this \
+                         page.</p>",
+                    )
+                }),
+            None => logins
+                .approve(&form.tenant, &form.user_code, &origin)
+                .await
+                .map(|url| Redirect::to(url.as_str()).into_response()),
+        },
         DeviceDecision::Deny => logins.deny(&form.tenant, &form.user_code).await.map(|()| {
             page(
                 StatusCode::OK,
@@ -235,6 +258,38 @@ pub async fn device_decision(
         )),
         other => other.map_err(WyrdErrorResponse::from),
     }
+}
+
+/// The recent human browser session the request presents for
+/// `tenant_route_key`, with the human anchor it was created through, which is
+/// fresh proof to approve a device login.
+///
+/// Only a password or provider session created in the last five minutes
+/// counts; a recovery session, an older session, a cookie for another tenant
+/// and a cookie that no longer resolves all yield `None`, so the approval
+/// falls back to the provider sign-in.
+///
+/// # Errors
+/// Returns `WYRD_SPEC_500_INTERNAL` when no browser-session owner is
+/// configured.
+async fn signed_in(
+    state: &AppState,
+    headers: &HeaderMap,
+    tenant_route_key: &TenantSlug,
+) -> Result<Option<(BrowserSession, HumanLoginAnchor)>, WyrdErrorResponse> {
+    let Some(cookie) = session_cookies(headers)
+        .into_iter()
+        .find_map(|(label, value)| (label.as_ref() == Some(tenant_route_key)).then_some(value))
+    else {
+        return Ok(None);
+    };
+    let sessions = browser_sessions(state)?;
+    Ok(sessions
+        .resolve(&cookie)
+        .await
+        .ok()
+        .filter(|session| session.recent)
+        .and_then(|session| session.anchor.map(|anchor| (session, anchor))))
 }
 
 /// A plain HTML page with `body`, which may not be framed.

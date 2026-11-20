@@ -40,7 +40,7 @@ use vala_verify::blocks::{
 };
 use wyrd_loader::{EXTRACT_VERSION, Extraction, lines, locates, units};
 use wyrd_runtime::resources::{ByteCharge, ByteLedger, Workload};
-use wyrd_spec::auth::Sha256Hex;
+use wyrd_spec::auth::{CardPermissionScope, Sha256Hex};
 use wyrd_spec::card::verifier::{Action, InputSlot};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardUid, SlotName};
@@ -60,6 +60,7 @@ use super::registry::refusal;
 use super::{HostedLimits, extract_refused};
 use crate::components::auth::Caller;
 use crate::components::cards::routes::{authorize_card_ref, get_card_objects_by_ref_for};
+use crate::components::cards::service::require_object;
 use crate::components::storage::inventory::ObjectInventory;
 use crate::state::AppState;
 use crate::verification::state::RunState;
@@ -534,7 +535,17 @@ impl TenantEvidence {
         let key = (card.identity_key(), card.uid.clone());
         let known = lock(&self.artifacts).get(&key).cloned();
         if let Some(inventory) = known {
-            authorize_card_ref(&self.state, &self.caller, card).map_err(|error| refusal(&error))?;
+            let objects = authorize_card_ref(&self.state, &self.caller, card)
+                .map_err(|error| refusal(&error))?;
+            require_object(
+                objects.as_deref(),
+                &CardPermissionScope::version(
+                    card.kind.clone(),
+                    card.name.clone(),
+                    inventory.uid.clone(),
+                ),
+            )
+            .map_err(|error| refusal(&error))?;
             return Ok(inventory);
         }
         let (resolved, files) = get_card_objects_by_ref_for(&self.state, &self.caller, card)

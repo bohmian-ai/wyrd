@@ -617,3 +617,101 @@ async fn stable_accounts_preserve_execution_identity() {
     assert_eq!(revoked.code(), "WYRD_AUTH_401_API_KEY_INVALID");
     deployment.shutdown().await;
 }
+
+/// Viewer bound at the `code-review` Verifier family lets a local User, signed
+/// in through the CLI device login with no identity provider, read that
+/// family and nothing else: the other family is absent from listing and
+/// refused on a direct read.
+///
+/// # Panics
+/// Panics when a step fails or an outcome differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn a_family_bound_viewer_reads_only_that_family() {
+    use wyrd_ai::cards::{CardKind, CardSelector, ListCardsRequest};
+    use wyrd_ai::config::ClientConfig;
+    use wyrd_ai::environment::Environment;
+    use wyrd_ai::{GlobalConfig, WyrdClient};
+    use wyrd_spec::auth::CardPermissionScope;
+    use wyrd_spec::ids::CardName;
+    use wyrd_testing::human_login::{FIXTURE_TENANT_SLUG, HumanSso};
+
+    let deployment = Deployment::start().await;
+    let cards = deployment.cards().await;
+    declare(&cards, "cards/repository_declaration/code-review.yaml").await;
+    declare(&cards, "cards/repository_declaration/unrelated.yaml").await;
+    let payments = CardName::new("code-review").expect("valid name");
+    let other = CardName::new("unrelated-check").expect("valid name");
+    let admin = Principals::connect_with(&deployment.admin())
+        .await
+        .expect("handle connects");
+    let password = "alice payments password";
+    admin
+        .create_user(&CreateUserRequest {
+            username: "alice".to_owned(),
+            password: SecretBearer::new(password.to_owned()),
+            assignments: vec![ScopedRoleAssignment {
+                role: "viewer".to_owned(),
+                scope: PermissionScope::Card(CardPermissionScope::family(
+                    CardKind::Verifier,
+                    payments.clone(),
+                )),
+            }],
+        })
+        .await
+        .expect("an administrator creates Alice");
+    let sso = HumanSso::new(
+        deployment
+            .server()
+            .base_url()
+            .expect("bound server has a URL"),
+    );
+    let config = wyrd_testing::human_login::private_config_home();
+    sso.save_local_login(config.path(), FIXTURE_TENANT_SLUG, "alice", password)
+        .await;
+    let saved = ClientConfig::from_environment(
+        Environment::from([(
+            "WYRD_CONFIG_HOME",
+            config.path().to_str().expect("UTF-8 config home"),
+        )]),
+        &GlobalConfig::default(),
+        deployment.server().base_url(),
+        None,
+    );
+    let own = Cards::connect_with(&WyrdClient::with_config(saved).expect("client builds"))
+        .await
+        .expect("Alice connects with her saved login");
+
+    let listed = own
+        .list(ListCardsRequest {
+            kind: Some(CardKind::Verifier),
+            name: None,
+            version_range: None,
+            status: None,
+            filter: None,
+            include_prerelease: false,
+            limit: None,
+            cursor: None,
+        })
+        .await
+        .expect("Alice lists Verifiers");
+    let names: Vec<&str> = listed.items.iter().map(|card| card.name.as_str()).collect();
+    assert_eq!(names, ["code-review"]);
+    own.get(CardSelector::Named {
+        kind: CardKind::Verifier,
+        name: payments,
+        version: None,
+    })
+    .await
+    .expect("Alice reads the payments family");
+    let refused = own
+        .get(CardSelector::Named {
+            kind: CardKind::Verifier,
+            name: other,
+            version: None,
+        })
+        .await
+        .expect_err("the other family is hidden");
+    assert_eq!(refused.code(), "WYRD_REGISTRY_404_CARD_NOT_FOUND");
+    deployment.shutdown().await;
+}

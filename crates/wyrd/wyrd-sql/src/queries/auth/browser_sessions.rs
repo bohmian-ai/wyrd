@@ -16,7 +16,7 @@ use uuid::Uuid;
 use wyrd_spec::auth::Sha256Hex;
 
 use crate::TenantConn;
-use crate::row_types::auth::HumanConnectionBinding;
+use crate::row_types::auth::{HumanConnectionBinding, HumanLoginAnchor};
 
 /// Drop this tenant's sessions past their absolute expiry.
 const PURGE_EXPIRED_BROWSER_SESSIONS_SQL: &str = r"
@@ -81,6 +81,19 @@ pub enum BrowserSessionAuthority {
     /// A local password sign-in at this password revision of the session's
     /// User.
     Password(i64),
+}
+
+impl BrowserSessionAuthority {
+    /// The human login anchor this authority is, or `None` for a recovery
+    /// sign-in, which proves no human authentication.
+    #[must_use]
+    pub const fn human_anchor(&self) -> Option<HumanLoginAnchor> {
+        match *self {
+            Self::Connection(binding) => Some(HumanLoginAnchor::Connection(binding)),
+            Self::Password(revision) => Some(HumanLoginAnchor::Password(revision)),
+            Self::ApiKey(_) => None,
+        }
+    }
 }
 
 /// A live browser session as [`live_browser_session`] found it.

@@ -12,7 +12,8 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use wyrd_runtime::Permission;
-use wyrd_spec::envelope::CardKind;
+use wyrd_runtime::permission::{Action, CardPermissionScope, Resource};
+use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::ids::{CardName, CardUid, IdempotencyKey};
 use wyrd_spec::reference::CardRef;
@@ -21,10 +22,11 @@ use wyrd_spec::registry::{
     GetCardResponse, ListCardsRequest, ListCardsResponse, ListVersionsResponse,
 };
 use wyrd_spec::storage::IDEMPOTENCY_KEY_HEADER;
+use wyrd_spec::vala::api::AuditOutcome;
 
 use crate::audit;
 use crate::components::auth::Caller;
-use crate::components::cards::service::{self, CardFiles};
+use crate::components::cards::service::{self, CardFiles, require_object};
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 use utoipa_axum::router::OpenApiRouter;
@@ -94,14 +96,10 @@ pub(crate) async fn get_card_for(
     kind: &CardKind,
     card_uid: &CardUid,
 ) -> Result<GetCardResponse, WyrdError> {
-    audit::authorize(
-        state,
-        caller,
-        &Permission::card_read(),
-        "card.read.uid",
-        &format!("card:{card_uid}"),
-    )?;
+    let objects =
+        authorize_card_objects(state, caller, "card.read.uid", &format!("card:{card_uid}"))?;
     let response = service::get_card_by_uid(state, caller, card_uid).await?;
+    require_visible(objects.as_deref(), &response.card)?;
     if &response.card.kind != kind {
         return Err(WyrdError::registry_card_not_found(
             "card UID is not in the requested kind namespace",
@@ -186,8 +184,9 @@ pub(crate) async fn get_card_objects_by_ref_for(
     caller: &Caller,
     card_ref: &CardRef,
 ) -> Result<(GetCardResponse, CardFiles), WyrdError> {
-    authorize_card_ref(state, caller, card_ref)?;
+    let objects = authorize_card_ref(state, caller, card_ref)?;
     let (response, files) = service::get_card_objects_by_ref(state, caller, card_ref).await?;
+    require_visible(objects.as_deref(), &response.card)?;
     if let Some(uid) = &card_ref.uid
         && response.card.metadata.uid.as_ref() != Some(uid)
     {
@@ -199,23 +198,19 @@ pub(crate) async fn get_card_objects_by_ref_for(
 }
 
 /// Authorize and audit the caller's `cards:read` of one exact Card
-/// reference, the decision every read of that reference makes.
+/// reference, the decision every read of that reference makes, returning
+/// the Card objects of [`authorize_card_objects`] for the read to apply
+/// through [`require_visible`].
 ///
 /// # Errors
-/// Returns [`WyrdError::PermissionDeniedRbac`] without `cards:read`.
+/// Returns [`WyrdError::PermissionDeniedRbac`] without `cards:read` at any
+/// scope.
 pub(crate) fn authorize_card_ref(
     state: &AppState,
     caller: &Caller,
     card_ref: &CardRef,
-) -> Result<(), WyrdError> {
-    audit::authorize(
-        state,
-        caller,
-        &Permission::card_read(),
-        "card.read.ref",
-        &card_resource(card_ref),
-    )?;
-    Ok(())
+) -> Result<Option<Vec<CardPermissionScope>>, WyrdError> {
+    authorize_card_objects(state, caller, "card.read.ref", &card_resource(card_ref))
 }
 
 /// Resolve the newest stable Active Card in an identity line.
@@ -260,16 +255,15 @@ async fn get_latest_card_http(
 ) -> Result<Json<GetCardResponse>, WyrdErrorResponse> {
     let kind = parse_card_kind(&kind)?;
     let name = parse_name(&name)?;
-    authorize_card_read(
+    let objects = authorize_card_read(
         &state,
         &caller,
         "card.read.latest",
         &format!("card:{}/{name}", kind.wire_name()),
     )?;
-    service::get_latest_card(&state, &caller, kind, name)
-        .await
-        .map(Json)
-        .map_err(WyrdErrorResponse::from)
+    let response = service::get_latest_card(&state, &caller, kind, name).await?;
+    require_visible(objects.as_deref(), &response.card)?;
+    Ok(Json(response))
 }
 
 /// List versions in one exact Card identity line.
@@ -314,16 +308,23 @@ async fn list_versions_http(
     let query = card_query(query)?;
     let kind = parse_card_kind(&kind)?;
     let name = parse_name(&name)?;
-    authorize_card_read(
+    let objects = authorize_card_read(
         &state,
         &caller,
         "card.read.versions",
         &format!("card:{}/{name}", kind.wire_name()),
     )?;
-    service::list_card_versions(&state, &caller, kind, name, query.include_prerelease)
-        .await
-        .map(Json)
-        .map_err(WyrdErrorResponse::from)
+    service::list_card_versions(
+        &state,
+        &caller,
+        kind,
+        name,
+        query.include_prerelease,
+        objects.as_deref(),
+    )
+    .await
+    .map(Json)
+    .map_err(WyrdErrorResponse::from)
 }
 
 /// List tenant-visible Card summaries with keyset pagination.
@@ -383,8 +384,8 @@ pub(crate) async fn list_cards_for(
     caller: &Caller,
     request: ListCardsRequest,
 ) -> Result<ListCardsResponse, WyrdError> {
-    authorize_card_read(state, caller, "card.read.list", "cards")?;
-    service::list_cards(state, caller, request).await
+    let objects = authorize_card_objects(state, caller, "card.read.list", "cards")?;
+    service::list_cards(state, caller, request, objects).await
 }
 
 /// List server-authoritative stored artifacts for one Card.
@@ -417,13 +418,13 @@ async fn list_artifacts_http(
     Path(card_uid): Path<String>,
 ) -> Result<Json<wyrd_spec::registry::ArtifactInventoryResponse>, WyrdErrorResponse> {
     let card_uid = parse_card_uid(&card_uid)?;
-    authorize_card_read(
+    let objects = authorize_card_read(
         &state,
         &caller,
         "card.read.artifacts",
         &format!("card:{card_uid}"),
     )?;
-    service::list_card_artifacts(&state, &caller, &card_uid)
+    service::list_card_artifacts(&state, &caller, &card_uid, objects.as_deref())
         .await
         .map(Json)
         .map_err(WyrdErrorResponse::from)
@@ -848,9 +849,67 @@ fn authorize_card_read(
     caller: &Caller,
     operation: &str,
     resource: &str,
-) -> Result<(), WyrdErrorResponse> {
-    audit::authorize(state, caller, &Permission::card_read(), operation, resource)
-        .map_err(WyrdErrorResponse::from)
+) -> Result<Option<Vec<CardPermissionScope>>, WyrdErrorResponse> {
+    authorize_card_objects(state, caller, operation, resource).map_err(WyrdErrorResponse::from)
+}
+
+/// Authorize and audit `cards:read` for `operation` on `resource`, returning
+/// the Card objects the read reaches: `None` for every Card, otherwise the
+/// caller's granted families and exact versions, which the read applies
+/// before building any result.
+///
+/// A caller with no Card read at any scope is refused; a scoped caller is
+/// admitted and every hidden Card answers as not found.
+///
+/// # Errors
+/// Returns [`WyrdError::PermissionDeniedRbac`] without `cards:read` at any
+/// scope.
+pub(crate) fn authorize_card_objects(
+    state: &AppState,
+    caller: &Caller,
+    operation: &str,
+    resource: &str,
+) -> Result<Option<Vec<CardPermissionScope>>, WyrdError> {
+    let objects = caller
+        .principal
+        .effective_permissions
+        .card_objects(&Resource::Cards, &Action::Read);
+    match objects {
+        Some(objects) if !objects.is_empty() => {
+            let allowed = audit::audit_event(
+                caller,
+                operation,
+                resource,
+                &Permission::card_read().to_string(),
+                AuditOutcome::Allowed,
+            );
+            state
+                .bifrost
+                .scribe_outbox()
+                .stage(caller.data_tenant_id, allowed);
+            Ok(Some(objects))
+        }
+        objects => audit::authorize(state, caller, &Permission::card_read(), operation, resource)
+            .map(|()| objects),
+    }
+}
+
+/// Refuse `card` as not found when it is outside a scoped reader's
+/// `objects`, so an inaccessible Card and an unknown one look the same.
+///
+/// # Errors
+/// Returns the errors of [`require_object`].
+pub(crate) fn require_visible(
+    objects: Option<&[CardPermissionScope]>,
+    card: &Card,
+) -> Result<(), WyrdError> {
+    let required = match &card.metadata.uid {
+        Some(uid) => {
+            CardPermissionScope::version(card.kind.clone(), card.metadata.name.clone(), uid.clone())
+        }
+        None => CardPermissionScope::family(card.kind.clone(), card.metadata.name.clone()),
+    };
+    require_object(objects, &required)
 }
 
 fn parse_card_kind(value: &str) -> Result<CardKind, WyrdErrorResponse> {

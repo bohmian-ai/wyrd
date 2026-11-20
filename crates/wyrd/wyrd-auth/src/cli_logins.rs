@@ -32,11 +32,11 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::TenantSlug;
 use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
 use wyrd_sql::queries::auth::{
-    delete_device_authorization, deny_device_authorization, insert_device_authorization,
-    lock_refresh_family, pending_device_authorization, poll_device_authorization, refresh_by_hash,
-    revoke_refresh_chain,
+    approve_device_authorization, delete_device_authorization, deny_device_authorization,
+    insert_device_authorization, lock_refresh_family, pending_device_authorization,
+    poll_device_authorization, refresh_by_hash, revoke_refresh_chain,
 };
-use wyrd_sql::row_types::auth::HumanSessionBinding;
+use wyrd_sql::row_types::auth::{HumanLoginAnchor, HumanSessionBinding};
 
 use crate::audit::{auth_event, auth_failure_code, principal_event, principal_kind_tag};
 use crate::connections::HumanConnections;
@@ -106,9 +106,10 @@ impl CliLogins {
 
     /// Begin a device login at `tenant_route_key` (RFC 8628 §3.1).
     ///
-    /// Resolves the tenant and requires its Active connection (an unknown
-    /// tenant and one without a connection get the same generic refusal as
-    /// the authorization endpoint), then commits a device authorization holding the
+    /// Resolves the tenant (an unknown tenant gets the same generic refusal
+    /// as the authorization endpoint) without requiring an identity provider,
+    /// since a local password User approves through their own session, then
+    /// commits a device authorization holding the
     /// SHA-256 of a fresh device code and a random user code, with a
     /// ten-minute `PostgreSQL`-derived expiry. The device code is
     /// `{tenant_id}.{256-bit secret}`, so a token poll routes itself to its
@@ -117,7 +118,7 @@ impl CliLogins {
     ///
     /// # Errors
     /// Returns [`WyrdError::InvalidToken`] when the route key names no active
-    /// tenant or the tenant has no Active connection, and
+    /// tenant, and
     /// [`WyrdError::AuthVerifyUnavailable`] when the store fails, including
     /// the negligible chance of a user code already live in the tenant.
     pub async fn authorize(
@@ -128,10 +129,6 @@ impl CliLogins {
         let origin = origin.origin().ascii_serialization();
         let tenant = self
             .tenant(tenant_route_key)
-            .await?
-            .ok_or_else(login_unavailable)?;
-        self.connections
-            .active_connection(tenant)
             .await?
             .ok_or_else(login_unavailable)?;
         let device_code = format!("{tenant}.{}", new_device_secret());
@@ -208,6 +205,55 @@ impl CliLogins {
         self.connections
             .begin_bound(tenant_route_key, LoginInitiation::Device(device_id), origin)
             .await
+    }
+
+    /// Approve `user_code` at `tenant_route_key` for `principal_id` of
+    /// `principal_tenant`, who is already signed in through the human
+    /// `anchor`. A principal of any other tenant approves nothing.
+    ///
+    /// The approval records exactly that anchor — a local password revision
+    /// or a provider connection revision — on the tenant's unexpired,
+    /// undenied device authorization, so redemption and every refresh check
+    /// the same authentication. No provider sign-in begins and no connection
+    /// is synthesized for a local User. The caller supplies only a recent
+    /// human session's anchor; a recovery session has none.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::InvalidState`] with reason `user_code_unavailable`
+    /// for an unknown tenant or a malformed, unknown, expired, denied, or
+    /// already approved user code, all indistinguishable, and
+    /// [`WyrdError::AuthVerifyUnavailable`] when the store fails.
+    pub async fn approve_signed_in(
+        &self,
+        tenant_route_key: &TenantSlug,
+        user_code: &str,
+        principal_tenant: DataTenantId,
+        principal_id: PrincipalId,
+        anchor: HumanLoginAnchor,
+    ) -> Result<(), WyrdError> {
+        let user_code = normalize_user_code(user_code).ok_or_else(user_code_unavailable)?;
+        let tenant = self
+            .tenant(tenant_route_key)
+            .await?
+            .filter(|tenant| *tenant == principal_tenant)
+            .ok_or_else(user_code_unavailable)?;
+        let mut conn = self
+            .connections
+            .postgres()
+            .tenant_conn(tenant)
+            .await
+            .map_err(store_error)?;
+        let device_id = pending_device_authorization(&mut conn, &user_code)
+            .await
+            .map_err(store_error)?
+            .ok_or_else(user_code_unavailable)?;
+        if !approve_device_authorization(&mut conn, device_id, principal_id.as_uuid(), anchor)
+            .await
+            .map_err(store_error)?
+        {
+            return Err(user_code_unavailable());
+        }
+        conn.commit().await.map_err(store_error)
     }
 
     /// Deny `user_code` at `tenant_route_key`, so the CLI's next poll ends

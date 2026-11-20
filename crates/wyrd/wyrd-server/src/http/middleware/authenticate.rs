@@ -404,7 +404,7 @@ mod pg_tests {
         })
     }
 
-    /// Mint a `wyrd`-audience access token lasting `ttl` for a fresh User
+    /// Mint a `wyrd`-audience access token lasting `ttl` for a fresh live User
     /// principal in `tenant`, signed by the test state's issuing key and
     /// carrying no permissions; a negative `ttl` yields an expired token.
     ///
@@ -416,6 +416,7 @@ mod pg_tests {
             kind: PrincipalKindTag::User,
             tenant_id: tenant,
         };
+        crate::test_support::admit_accounts(state, tenant, &[principal.id], &[]);
         state
             .auth
             .issuing_key

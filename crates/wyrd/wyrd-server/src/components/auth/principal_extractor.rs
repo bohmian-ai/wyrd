@@ -328,7 +328,7 @@ mod pg_tests {
     }
 
     /// Mint a direct (non-delegated) Wyrd-audience access token for a fresh
-    /// User principal in `tenant`, expiring after `ttl`.
+    /// live User principal in `tenant`, expiring after `ttl`.
     ///
     /// # Panics
     /// Panics when `state` has no issuing key or the token fails to mint.
@@ -342,6 +342,7 @@ mod pg_tests {
             kind: PrincipalKindTag::User,
             tenant_id: tenant,
         };
+        crate::test_support::admit_accounts(state, tenant, &[principal.id], &[]);
         state
             .auth
             .issuing_key
@@ -364,7 +365,8 @@ mod pg_tests {
 
     /// Mint an access token whose outer `act` names the Service `initiator`,
     /// running under its own root, as the sole actor working for `subject`;
-    /// the delegated Card access is the empty exact intersection.
+    /// the delegated Card access is the empty exact intersection. Both
+    /// accounts are live.
     ///
     /// # Panics
     /// Panics when `state` has no issuing key or the token fails to mint.
@@ -374,6 +376,7 @@ mod pg_tests {
         initiator: PrincipalId,
         subject: PrincipalId,
     ) -> String {
+        crate::test_support::admit_accounts(state, tenant, &[subject], &[initiator]);
         let actor = wyrd_auth_verify::ActClaim {
             sub: initiator.to_string(),
             principal: TokenPrincipalRef {

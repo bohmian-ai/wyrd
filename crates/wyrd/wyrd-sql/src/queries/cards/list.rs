@@ -8,6 +8,7 @@
 use chrono::{DateTime, Utc};
 use sqlx::{Postgres, QueryBuilder};
 use wyrd_semver::VersionRange;
+use wyrd_spec::auth::CardPermissionScope;
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, CardUid};
@@ -60,6 +61,9 @@ pub struct CardQuery {
     pub filter: Option<MetadataQuery>,
     /// Include pre-release versions. Default false excludes pre-releases.
     pub include_prerelease: bool,
+    /// The Card families and exact versions the caller may read; `None`
+    /// reads every Card, an empty list none.
+    pub visible: Option<Vec<CardPermissionScope>>,
 }
 
 fn validate_cursor(cursor: &ListCursor) -> Result<(), WyrdError> {
@@ -205,7 +209,28 @@ fn push_card_filters(qb: &mut QueryBuilder<Postgres>, query: &CardQuery) -> Resu
         qb.push(" AND ");
         compile_query(filter, &CardFieldResolver, qb)?;
     }
+    if let Some(visible) = &query.visible {
+        push_visible(qb, visible);
+    }
     Ok(())
+}
+
+/// Append the predicate keeping only rows in `visible`: a family scope
+/// matches every version of its kind and name, an exact scope only its UID.
+/// An empty list matches nothing.
+pub(crate) fn push_visible(qb: &mut QueryBuilder<Postgres>, visible: &[CardPermissionScope]) {
+    qb.push(" AND (FALSE");
+    for scope in visible {
+        qb.push(" OR (kind = ")
+            .push_bind(scope.kind().wire_name())
+            .push(" AND name = ")
+            .push_bind(scope.name().as_str().to_owned());
+        if let CardPermissionScope::Version { uid, .. } = scope {
+            qb.push(" AND card_uid = ").push_bind(uid.as_uuid());
+        }
+        qb.push(")");
+    }
+    qb.push(")");
 }
 
 /// Append the keyset continuation predicate for `(created_at, card_uid)` when

@@ -296,6 +296,44 @@ pub(crate) fn test_caller(
     }
 }
 
+/// Install a current authority for `tenant` in which `users` are live
+/// User accounts and `services` live Service accounts, none holding any
+/// grant, so a token naming them authorizes without a database read.
+pub(crate) fn admit_accounts(
+    state: &AppState,
+    tenant: wyrd_spec::DataTenantId,
+    users: &[wyrd_spec::auth::PrincipalId],
+    services: &[wyrd_spec::auth::PrincipalId],
+) {
+    use sqlx::types::Json;
+    use wyrd_sql::queries::auth::{AuthorityServiceAccount, AuthorityState};
+    let loaded = wyrd_auth::authority::TenantAuthority::compile(AuthorityState {
+        revision: 0,
+        bindings: Json(Vec::new()),
+        memberships: Json(Vec::new()),
+        users: Json(
+            users
+                .iter()
+                .map(wyrd_spec::auth::PrincipalId::as_uuid)
+                .collect(),
+        ),
+        service_accounts: Json(
+            services
+                .iter()
+                .map(|id| AuthorityServiceAccount {
+                    id: id.as_uuid(),
+                    principal_kind: "service".to_owned(),
+                    restriction_kind: None,
+                    restriction_name: None,
+                })
+                .collect(),
+        ),
+        api_keys: Json(Vec::new()),
+    })
+    .expect("an empty authority compiles");
+    state.auth.authority.install(tenant, loaded);
+}
+
 /// The library test binary's allocator: the system allocator plus a count of
 /// the bytes each thread requests, so a test can observe whether a workflow
 /// allocates a payload-sized buffer.

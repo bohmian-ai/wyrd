@@ -14,7 +14,7 @@ use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
 use wyrd_semver::{VersionBlock, VersionRange, VersionSpec};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::api_version::ApiVersion;
-use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
+use wyrd_spec::auth::{CardPermissionScope, PLATFORM_AUDIT_PRINCIPAL};
 use wyrd_spec::card::drift::DriftSignal;
 use wyrd_spec::card::repository::infer_card_name;
 use wyrd_spec::card::trigger::TriggerActivation;
@@ -245,7 +245,8 @@ pub async fn get_latest_card(
     .await
 }
 
-/// List versions in one card identity line, excluding deleted rows.
+/// List versions in one card identity line, excluding deleted rows and,
+/// for a scoped reader, every version outside `visible`.
 ///
 /// The line is the caller tenant's flat `kind`/`name`; the read runs in one
 /// tenant transaction that commits before the response is built.
@@ -260,15 +261,19 @@ pub async fn list_card_versions(
     kind: CardKind,
     name: CardName,
     include_prerelease: bool,
+    visible: Option<&[CardPermissionScope]>,
 ) -> Result<ListVersionsResponse, WyrdError> {
     let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
-    let versions = list_versions(&mut conn, kind, &name, include_prerelease).await?;
+    let versions = list_versions(&mut conn, kind, &name, include_prerelease, visible).await?;
     conn.commit().await.map_err(registry_db_error)?;
     Ok(ListVersionsResponse { versions })
 }
 
 /// List metadata-only Cards with deterministic tenant-scoped keyset pagination.
 ///
+/// `visible` limits a scoped reader to its granted families and exact
+/// versions inside the query, so pages and cursors never count a hidden
+/// Card.
 /// A `Deleted` status filter answers empty without a read. Otherwise one
 /// tenant transaction reads the page and commits before each row is projected
 /// through [`summary_from_row`].
@@ -284,6 +289,7 @@ pub async fn list_cards(
     state: &AppState,
     caller: &Caller,
     request: ListCardsRequest,
+    visible: Option<Vec<CardPermissionScope>>,
 ) -> Result<ListCardsResponse, WyrdError> {
     if request.status == Some(CardLifecycleStatus::Deleted) {
         return Ok(ListCardsResponse {
@@ -308,6 +314,7 @@ pub async fn list_cards(
         status: request.status.map(sql_status),
         filter: request.filter,
         include_prerelease: request.include_prerelease,
+        visible,
     };
     let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
     let page = query_cards(&mut conn, &query, cursor).await?;
@@ -321,7 +328,8 @@ pub async fn list_cards(
     Ok(ListCardsResponse { items, next_cursor })
 }
 
-/// Return the server-authoritative artifact inventory for one Card.
+/// Return the server-authoritative artifact inventory for one Card, which
+/// a scoped reader sees only when `visible` reaches it.
 ///
 /// # Errors
 /// Returns the registry not-found or unavailable errors of the Card read and
@@ -330,13 +338,16 @@ pub async fn list_card_artifacts(
     state: &AppState,
     caller: &Caller,
     card_uid: &CardUid,
+    visible: Option<&[CardPermissionScope]>,
 ) -> Result<ArtifactInventoryResponse, WyrdError> {
-    let manifests = card_manifests(state, caller, card_uid).await?;
+    let manifests = card_manifests(state, caller, card_uid, visible).await?;
     let artifacts = card_files(&manifests)?.into_values().collect();
     Ok(ArtifactInventoryResponse { artifacts })
 }
 
 /// Resolve one completed file of a Card from its manifest.
+///
+/// A Card outside a scoped reader's `visible` objects is not found.
 ///
 /// Card listing, downloads, verification evidence, and baseline fitting
 /// share this one bounded lookup after their own Card authorization.
@@ -351,8 +362,9 @@ pub async fn card_file(
     caller: &Caller,
     card_uid: &CardUid,
     relative_path: &str,
+    visible: Option<&[CardPermissionScope]>,
 ) -> Result<StoredArtifactEntry, WyrdError> {
-    let manifests = card_manifests(state, caller, card_uid).await?;
+    let manifests = card_manifests(state, caller, card_uid, visible).await?;
     card_files(&manifests)?
         .remove(relative_path)
         .ok_or_else(|| {
@@ -375,12 +387,34 @@ async fn card_manifests(
     state: &AppState,
     caller: &Caller,
     card_uid: &CardUid,
+    visible: Option<&[CardPermissionScope]>,
 ) -> Result<Vec<CardManifestCompletionRow>, WyrdError> {
     let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
-    let _ = sql_get_card_by_uid(&mut conn, card_uid).await?;
+    let row = sql_get_card_by_uid(&mut conn, card_uid).await?;
+    require_object(
+        visible,
+        &CardPermissionScope::version(row.kind, row.name, card_uid.clone()),
+    )?;
     let manifests = manifest_completion_rows(&mut conn, card_uid).await?;
     conn.commit().await.map_err(registry_db_error)?;
     Ok(manifests)
+}
+
+/// Refuse the Card `required` names as not found when it is outside a scoped
+/// reader's `objects`; `None` reaches every Card.
+///
+/// # Errors
+/// Returns [`WyrdError::RegistryCardNotFound`] for a hidden Card.
+pub(crate) fn require_object(
+    objects: Option<&[CardPermissionScope]>,
+    required: &CardPermissionScope,
+) -> Result<(), WyrdError> {
+    match objects {
+        Some(objects) if !objects.iter().any(|scope| scope.covers(required)) => Err(
+            WyrdError::registry_card_not_found("no such Card is visible to this principal"),
+        ),
+        _ => Ok(()),
+    }
 }
 
 /// A Card's completed files by Card-relative path.

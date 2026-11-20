@@ -108,6 +108,44 @@ impl EffectivePermissions {
         }
         Ok(flat)
     }
+
+    /// The Card objects `action` on `resource` reaches: `None` when it
+    /// reaches every Card, otherwise exactly the granted families and exact
+    /// versions, empty when none.
+    ///
+    /// Reads, lists and counts filter by this before building results, so
+    /// a family grant shows that family's existing, future and retained
+    /// versions and nothing else. Authority that has no single-set form
+    /// reaches nothing, so the view fails closed.
+    #[must_use]
+    pub fn card_objects(
+        &self,
+        resource: &Resource,
+        action: &Action,
+    ) -> Option<Vec<CardPermissionScope>> {
+        let every = Permission {
+            resource: resource.clone(),
+            action: action.clone(),
+            scope: PermissionScope::All,
+        };
+        if self.contains(&every) {
+            return None;
+        }
+        let Ok(flat) = self.flatten() else {
+            return Some(Vec::new());
+        };
+        Some(
+            flat.iter()
+                .filter(|granted| {
+                    granted.resource.covers(resource) && granted.action.covers(action)
+                })
+                .filter_map(|granted| match &granted.scope {
+                    PermissionScope::Card(scope) => Some(scope.clone()),
+                    _ => None,
+                })
+                .collect(),
+        )
+    }
 }
 
 impl From<PermissionSet> for EffectivePermissions {
@@ -222,5 +260,49 @@ mod tests {
         let json = serde_json::to_value(&restricted).expect("serializes");
         let back: EffectivePermissions = serde_json::from_value(json).expect("decodes");
         assert_eq!(back, restricted);
+    }
+
+    /// Proves Card visibility: tenant-wide read reaches every Card, family
+    /// and exact grants reach only themselves, a ceiling narrows a family
+    /// grant to its exact version, and other operations' grants add nothing.
+    ///
+    /// # Panics
+    /// Panics when a view widens or omits a granted object.
+    #[test]
+    fn card_objects_are_exactly_the_granted_cards() {
+        use super::{Action, Resource};
+        let scope = |permission: PermissionScope| match permission {
+            PermissionScope::Card(scope) => scope,
+            other => panic!("not a Card scope: {other:?}"),
+        };
+        let objects = |grants: Vec<Permission>| {
+            EffectivePermissions::from(grants.into_iter().collect::<PermissionSet>())
+        };
+
+        assert_eq!(
+            objects(vec![Permission::card_read()]).card_objects(&Resource::Cards, &Action::Read),
+            None
+        );
+        let family = objects(vec![
+            Permission::card_read().at(payments()),
+            Permission::card_write(),
+        ]);
+        assert_eq!(
+            family.card_objects(&Resource::Cards, &Action::Read),
+            Some(vec![scope(payments())])
+        );
+        assert_eq!(
+            objects(vec![Permission::card_write()]).card_objects(&Resource::Cards, &Action::Read),
+            Some(Vec::new())
+        );
+        let narrowed = family.restricted_by(Arc::new(
+            [Permission::card_read().at(payments_v1())]
+                .into_iter()
+                .collect(),
+        ));
+        assert_eq!(
+            narrowed.card_objects(&Resource::Cards, &Action::Read),
+            Some(vec![scope(payments_v1())])
+        );
     }
 }

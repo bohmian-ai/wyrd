@@ -710,12 +710,16 @@ mod pg_tests {
         let sessions = crate::auth::browser::browser_sessions(&state)
             .expect("browser sessions are configured");
         for completion in [completion_a, completion_b] {
-            let roles = sessions
+            let session = sessions
                 .resolve(signed_in(&completion).cookie.expose_secret())
                 .await
-                .expect("the session resolves")
-                .verified
-                .principal
+                .expect("the session resolves");
+            let roles = state
+                .auth
+                .authority
+                .authorize(state.postgres.wyrd(), &session.verified)
+                .await
+                .expect("the session's account is current")
                 .roles;
             assert_eq!(role_set(roles), BTreeSet::from([BETA.to_owned()]));
         }
@@ -877,8 +881,10 @@ mod pg_tests {
                 &mut conn,
                 Uuid::now_v7(),
                 "connection_tester",
-                &serde_json::to_value([Permission::identity_connections_write()])
-                    .expect("permission encodes"),
+                &serde_json::to_value([wyrd_spec::auth::Operation::of(
+                    &Permission::identity_connections_write(),
+                )])
+                .expect("operation encodes"),
                 false,
             )
             .await
@@ -938,7 +944,8 @@ mod pg_tests {
     /// The tenant role the role-sync cases map a provider group to.
     const SYNC_ROLE: &str = "login_sync_probe";
 
-    /// Create and commit tenant role `name`.
+    /// Create and commit tenant role `name`, bundling `cards:read` so a
+    /// binding of it contributes authority.
     ///
     /// # Panics
     /// Panics when the role cannot be written.
@@ -948,7 +955,8 @@ mod pg_tests {
             &mut conn,
             Uuid::now_v7(),
             name,
-            &serde_json::json!([]),
+            &serde_json::to_value([wyrd_spec::auth::Operation::of(&Permission::card_read())])
+                .expect("operation encodes"),
             false,
         )
         .await

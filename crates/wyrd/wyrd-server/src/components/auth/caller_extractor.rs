@@ -213,7 +213,7 @@ mod pg_tests {
         })
     }
 
-    /// Mint a five-minute `wyrd`-audience access token for a fresh User
+    /// Mint a five-minute `wyrd`-audience access token for a fresh live User
     /// principal in `tenant`, signed by the test state's issuing key and
     /// carrying no permissions.
     ///
@@ -225,6 +225,7 @@ mod pg_tests {
             kind: PrincipalKindTag::User,
             tenant_id: tenant,
         };
+        crate::test_support::admit_accounts(state, tenant, &[principal.id], &[]);
         state
             .auth
             .issuing_key

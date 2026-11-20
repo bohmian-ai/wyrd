@@ -35,6 +35,7 @@ use wyrd_sql::queries::auth::{
     BrowserSessionAuthority, LiveBrowserSession, human_connection_is_active,
     insert_browser_session, live_browser_session, local_username, revoke_browser_session,
 };
+use wyrd_sql::row_types::auth::HumanLoginAnchor;
 
 use crate::audit::{LOGIN_OPERATION, principal_event};
 use crate::callback::audit_authorization_code_failure;
@@ -60,6 +61,10 @@ pub struct BrowserSession {
     /// Whether this is recent human sign-in proof: a password or provider
     /// session created in the last five minutes. A recovery session never is.
     pub recent: bool,
+    /// The human authentication the session was created through: a local
+    /// password revision or a provider connection revision. `None` for a
+    /// recovery session, which is never human sign-in proof.
+    pub anchor: Option<HumanLoginAnchor>,
 }
 
 /// A session just created, with the cookie value returned exactly once.
@@ -430,6 +435,7 @@ impl BrowserSessions {
             credential,
             expires_at: live.expires_at,
             recent: live.recent && credential != BrowserCredential::ApiKey,
+            anchor: live.authority.human_anchor(),
         })
     }
 
@@ -485,6 +491,7 @@ pub(crate) async fn create_session(
             credential,
             expires_at,
             recent: credential != BrowserCredential::ApiKey,
+            anchor: authority.human_anchor(),
         },
     })
 }

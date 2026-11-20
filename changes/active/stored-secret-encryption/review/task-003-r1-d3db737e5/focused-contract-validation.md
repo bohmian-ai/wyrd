@@ -1,0 +1,17 @@
+# Focused independent validation: issuer replacement 503 contract
+
+Subject: remediation candidate `d3db737e5fccacbe02421ea135fd5327b6335d79`. HEAD `fa990be1989959de963d062ad8a47336b40c62da` adds prior review evidence only. Scope is the validator's new proposed OpenAPI mismatch; no other findings or original closures were reviewed here.
+
+## Disposition: CONFIRMED, narrowly an incorrect public error description
+
+The new `PUT /v1/admin/trusted-issuers/client-secret` response annotation in `crates/wyrd/wyrd-server/src/components/admin/routes.rs:631` explicitly describes **store or key-service unavailability**, listing only `WYRD_SERVER_503_SERVICE_UNAVAILABLE`. The key-service branch at `:683–690` does return that code, but every database acquisition, read, CAS and commit failure in this handler (`:668–672`, `:693–697`) returns the other stable code through `sql_unavailable`. `acquire_conn` at `:944–953` also delegates to that mapper. `sql_unavailable` at `:1206–1212` constructs `WyrdError::AuthVerifyUnavailable`, whose declared catalog code is `WYRD_AUTH_503_VERIFY_UNAVAILABLE` (`crates/wyrd-spec/src/error.rs:1137–1145`).
+
+Concrete supported trigger: an authorized administrator supplies a nonempty replacement and the tenant database connection cannot be acquired, or a later store operation fails. Expected: the operation's served contract describes the actual 503 code. Actual: its published store-unavailable description names only the KMS/server code while runtime returns the auth-store code. This is a documentation/contract defect, not a claim of unsafe replacement, missing stable runtime code, or state corruption.
+
+The material boundary is the open client protocol: `architecture/wyrd-design.md:329–345` makes typed wire contracts the source of truth and requires stable errors and machine-readable documentation sufficient to implement a complete client without Rust internals. `agent_docs/agent-surfaces.md` identifies runtime OpenAPI as an agent-facing contract and requires changes be proved against the served document. A caller relying on this operation's listed codes cannot identify its documented store failure by the listed code. Adjacent existing create annotation (`routes.rs:304–309`) publishes `WYRD_AUTH_503_VERIFY_UNAVAILABLE`, corroborating the established mapping rather than authorizing a new error policy.
+
+The generic served test `every_problem_response_declares_its_media_type_and_stable_code` (`pg_openapi_contract.rs:691–759`) checks that listed codes exist and match status; it does not compare all reachable handler codes with their descriptions. Both codes are valid 503 entries, so that test can pass while this mismatch remains. The focused replacement code is not asserted elsewhere in that contract file.
+
+Smallest correction: keep existing runtime error mapping, add `WYRD_AUTH_503_VERIFY_UNAVAILABLE` to the new replacement operation's 503 description with the KMS code, and add a focused served-document assertion for both codes using the existing contract fixture. No additional endpoints, provider flow, database mutation, or production behavior change is needed. This is a new bounded contract finding arising from the remediation's new endpoint; it does not reopen the five corrected findings.
+
+Verification: source and actual remediation diff only; no Cargo commands, production edits, or broad review. The retained finding's exact runtime mapping is statically established; no live outage is needed to establish this annotation mismatch. Root owns execution and immutable-subject confirmation.

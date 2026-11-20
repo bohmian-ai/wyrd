@@ -632,7 +632,8 @@ async fn renew_trusted_issuer_encryption(
         (status = 409, description = "The issuer authenticates without a client secret, or was \
           deleted or changed during the replacement (WYRD_AUTH_409_ADMIN_CONFLICT)",
          body = WyrdProblem),
-        (status = 503, description = "The store or the key service is unavailable \
+        (status = 503, description = "The store is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE), or the key service is unavailable \
           (WYRD_SERVER_503_SERVICE_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Admin"

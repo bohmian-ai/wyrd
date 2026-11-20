@@ -2179,6 +2179,41 @@ async fn operator_connection_contract_publishes_six_typed_operations() {
     server.shutdown().await.expect("server shuts down");
 }
 
+/// Replacing a trusted issuer's secret declares both unavailable refusals it
+/// returns: the auth store's code when the issuer row cannot be read or
+/// swapped, and the server code when the key service cannot seal.
+///
+/// # Panics
+/// Panics when the server fails to start or stop, or when the `503` response
+/// is not a problem body naming exactly those two codes.
+#[tokio::test]
+async fn trusted_issuer_secret_replacement_declares_both_unavailable_codes() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let unavailable =
+        &document["paths"]["/v1/admin/trusted-issuers/client-secret"]["put"]["responses"]["503"];
+    assert_eq!(
+        unavailable["content"][PROBLEM_MEDIA_TYPE]["schema"]["$ref"],
+        "#/components/schemas/WyrdProblem",
+        "{unavailable}"
+    );
+    let codes: BTreeSet<String> =
+        stable_codes(unavailable["description"].as_str().unwrap_or_default())
+            .into_iter()
+            .collect();
+    assert_eq!(
+        codes,
+        BTreeSet::from([
+            "WYRD_AUTH_503_VERIFY_UNAVAILABLE".to_owned(),
+            "WYRD_SERVER_503_SERVICE_UNAVAILABLE".to_owned(),
+        ])
+    );
+
+    server.shutdown().await.expect("server shuts down");
+}
+
 /// Issued and listed credential ids publish the same UUID contract the revoke
 /// path parameter and the MCP tools use, so no surface advertises free text.
 ///

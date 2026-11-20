@@ -1812,7 +1812,7 @@ mod pg_tests {
         .0;
         let subject = "system:serviceaccount:default/bound";
         let account = seed_service_account(&fixture, tenant).await;
-        create_workload_binding(
+        let _binding = create_workload_binding(
             State(state.clone()),
             writer(tenant),
             Json(CreateWorkloadBindingRequest {
@@ -1900,7 +1900,7 @@ mod pg_tests {
         .await
         .expect("envelope corrupts");
         conn.commit().await.expect("corruption commits");
-        replace_trusted_issuer_secret(
+        let _replaced = replace_trusted_issuer_secret(
             State(state.clone()),
             writer(tenant),
             query(),

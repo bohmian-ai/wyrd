@@ -435,8 +435,10 @@ Evidence (in progress):
     taken: about 30 revision-advance call sites would have to carry the cache, which is
     a redesign. The CLI and server `revoke` rustdoc that still claimed a five-minute
     snapshot is corrected.
-  - Material risk: `platform_admin_e2e` (revoked principal 401 "inactive") and the
-    `identity_e2e` revoke journeys still assert an immediate refusal on the same race.
+  - The same race in `platform_admin_e2e` (revoked principal 401 "inactive") and the
+    `identity_e2e` revoke journeys is resolved the same way: each now waits through
+    `wyrd_testing::principal::within_propagation` (platform_admin_e2e 40/40, identity
+    lane exit 0).
   - GREEN: 5/5 in `principal_journey` plus the CLI scope journey.
 - Review sets, members and executions through SQL and the dedicated read.
   `pg_github_pull_requests::retained_reads_resolve_current_and_history_membership`
@@ -477,7 +479,9 @@ Evidence (in progress):
     failures.
 - Not yet proven in this cycle: approvals and downloads under a Repository-family
   reader through the SDKs, and peer execution of the masked plan. Each remains FAIL
-  until proven. Scoped invitations: see `pg_browser_sessions`.
+  until proven. Other-parent downloads read as unknown:
+  `pg_verification_routes::local_publication_downloads_redeem_under_verifier_read` and
+  the SDK/MCP pages tests above. Scoped invitations: see `pg_browser_sessions`.
 - TDD: VIOLATED for slices committed in `8e33913ed` and `0c3a7d36f` (production code
   preceded tests). Test-first resumed from the smallest case above.
 
@@ -659,6 +663,44 @@ Evidence (in progress):
     newer revision or expired freshness, one sanctioned authority reload, the same one
     request authorization already uses.
   - TDD: test first, RED observed.
+  - Consumer diagnosis after the stream binding.
+    - Symptom: 3 `pg_hosted_artifacts::code_*` tests failed. Hosted
+      `call_tool('bifrost.query', …)` raised `WYRD_PERMISSION_401_UNAUTHENTICATED`.
+    - Evidence: the test helper `user()` built a random, accountless principal with
+      `executed_by: None`, and `CodeAgent::start` handed it to `HostedTools`.
+    - Cause: `StreamAuthority::admit` correctly refuses a caller that is not a live
+      account. No production path reaches `stream_query` that way.
+      - HTTP, gRPC and MCP callers come from `TenantAuthority::authorize`.
+      - Hosted execution always runs `executed_by_system` (`Caller::accepted`,
+        `components/verification/service.rs`).
+    - Fix site: the test fixture now runs its hosted caller under a SYSTEM executor, as
+      production does.
+    - Diagnostician report: "Fix site: test. Make `user()` match production … No
+      production path reaches `stream_query` with `executed_by: None` and a non-account
+      principal."
+    - The refusal for an accountless caller now says the account is not live (reason
+      `inactive`) rather than "changed".
+    - GREEN: `pg_hosted_artifacts` 20/20 (`1cbe26031`).
+- Other-parent execution reads now report not-found on every surface.
+  - Stale assertions found by the consumer lanes, fixed to the posture/REQ-009 404:
+    - Rust SDK `durable_verifier_work::execution_pages_are_stable_and_tenant_scoped`
+    - MCP `verification::pg_tests::durable_verifier_work_execution_pages_are_stable_and_tenant_scoped`
+    - Python `test_durable_verifier_work.py::test_execution_pages_are_stable_and_tenant_scoped`
+  - The diagnostician confirmed that each refused caller holds `executions:read`
+    somewhere other than the parent. A caller with no execution read at all still gets
+    403 from the operation check that runs first.
+  - GREEN: MCP 1/1, Rust SDK `durable_verifier_work` + `principal_roles` 14/14, Python
+    12/12.
+- Consumer lanes at `1cbe26031` or later:
+  - `test:verification:sandbox` exit 0.
+  - TS integration 294 passed / 3 skipped.
+  - Python integration: 368 passed, plus the one stale assertion above, now fixed.
+  - Rust SDK journey: 195/196, plus the stale assertion above, now fixed.
+  - MCP 51/51 after the fix.
+  - CLI 61/62 at `--test-threads=2` (the owning lane runs it serially). The one
+    failure, `cli_device_login_journey`, needs Keycloak/Dex and runs in
+    `test:identity:journey`, which passed at `d74c8ec61`.
+  - Server integration 436/436 and server lib 678/678 at `56f7d81d7`.
 - Ceiling and delegation intersections: existing proof, PASS.
   - `wyrd-runtime` `permission::tests::ceilings_only_restrict_current_grants` covers
     absent/empty ceilings and family/exact narrowing.

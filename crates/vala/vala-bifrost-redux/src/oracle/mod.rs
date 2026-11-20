@@ -3948,9 +3948,17 @@ pub(super) fn restrict_verification_rows(
             .fields()
             .iter()
             .map(|field| {
+                // The alias carries the field's metadata, which a CASE
+                // drops, so extension-typed columns such as Variants decode.
                 when(visible.clone(), column(field.name()))
                     .end()
-                    .map(|expr| expr.alias_qualified(Some(table.clone()), field.name()))
+                    .map(|expr| {
+                        expr.alias_qualified_with_metadata(
+                            Some(table.clone()),
+                            field.name(),
+                            Some(field.metadata().into()),
+                        )
+                    })
             })
             .collect::<datafusion::common::Result<Vec<_>>>()?;
         LogicalPlanBuilder::from(node)
@@ -5112,6 +5120,47 @@ mod tests {
     /// # Panics
     ///
     /// Panics when the fixture tables cannot be built.
+    /// Field metadata the fixture's `result_id` carries, standing in for the
+    /// extension tag a Variant column needs to decode.
+    const VARIANT_TAG: (&str, &str) = ("ARROW:extension:name", "arrow.parquet.variant");
+
+    /// A restricted reader's masked columns keep their field metadata, so an
+    /// extension-typed column such as a Variant still decodes.
+    ///
+    /// # Panics
+    /// Panics when the plan fails or drops the column's metadata.
+    #[tokio::test]
+    async fn masked_verification_columns_keep_their_metadata() {
+        use wyrd_runtime::CardPermissionScope;
+        use wyrd_spec::envelope::CardKind;
+        use wyrd_spec::ids::CardName;
+
+        let family = payload_context(&[
+            Permission::bifrost_query_read(),
+            Permission::executions_read_any().at(PermissionScope::Card(
+                CardPermissionScope::family(
+                    CardKind::Repository,
+                    CardName::new("payments").expect("name"),
+                ),
+            )),
+        ]);
+        let session = verification_session();
+        let plan = Oracle::plan_logical(
+            &session,
+            &family,
+            &statement("SELECT result_id FROM bifrost.verification.results"),
+            &[],
+        )
+        .await
+        .expect("plan builds");
+        let field = plan.schema().field(0);
+        assert_eq!(
+            field.metadata().get(VARIANT_TAG.0).map(String::as_str),
+            Some(VARIANT_TAG.1),
+            "{field:?}"
+        );
+    }
+
     fn verification_session() -> SessionContext {
         use datafusion::arrow::array::StringArray;
         use datafusion::arrow::datatypes::{DataType, Field, Schema};
@@ -5122,7 +5171,12 @@ mod tests {
         use wyrd_spec::vala::managed_columns::{SUBJECT_CARD_UID, SUBJECT_KIND, SUBJECT_NAME};
 
         let schema = Arc::new(Schema::new(vec![
-            Field::new("result_id", DataType::Utf8, false),
+            Field::new("result_id", DataType::Utf8, false).with_metadata(
+                std::collections::HashMap::from([(
+                    VARIANT_TAG.0.to_owned(),
+                    VARIANT_TAG.1.to_owned(),
+                )]),
+            ),
             Field::new(SUBJECT_KIND, DataType::Utf8, true),
             Field::new(SUBJECT_NAME, DataType::Utf8, true),
             Field::new(SUBJECT_CARD_UID, DataType::Utf8, true),

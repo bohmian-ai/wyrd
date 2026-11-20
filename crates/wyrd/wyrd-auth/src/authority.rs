@@ -613,6 +613,56 @@ impl AuthorityCache {
 }
 
 #[cfg(test)]
+mod pg_tests {
+    use std::time::Duration;
+
+    use wyrd_dev_fixtures::pg::PgFixture;
+    use wyrd_spec::error::WyrdError;
+
+    use super::{AuthorityCache, FRESHNESS_BOUND};
+
+    /// With PostgreSQL unreachable, a confirmed snapshot keeps serving until
+    /// the freshness bound and is then refused as unavailable authority, as
+    /// is a tenant this process never loaded; neither reads as a missing
+    /// permission.
+    ///
+    /// # Panics
+    /// Panics when the fixture fails, the snapshot stops serving inside the
+    /// bound, or a refusal is anything but `AuthorizationUnavailable`.
+    #[tokio::test]
+    async fn an_outage_serves_only_within_the_bound_then_refuses_as_unavailable() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let other = fixture
+            .seed_additional_tenant("authority-outage-other")
+            .await
+            .expect("tenant seeds");
+        let (postgres, _vala) = fixture.fresh_runtime_handles().await.expect("handles");
+        let cache = AuthorityCache::default();
+        cache.acquire(&postgres, tenant).await.expect("first load");
+
+        postgres.app_pool().close().await;
+        cache.age(
+            tenant,
+            FRESHNESS_BOUND.saturating_sub(Duration::from_secs(1)),
+        );
+        cache
+            .acquire(&postgres, tenant)
+            .await
+            .expect("inside the bound the confirmed snapshot serves");
+
+        cache.age(tenant, Duration::from_secs(2));
+        for (tenant, case) in [(tenant, "expired"), (other, "cold")] {
+            let refused = cache.acquire(&postgres, tenant).await.expect_err(case);
+            assert!(
+                matches!(refused, WyrdError::AuthorizationUnavailable { .. }),
+                "{case}: {refused:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::time::Duration;
 
@@ -695,7 +745,10 @@ mod tests {
             tenant,
             TenantAuthority::compile(state(1, user)).expect("compiles"),
         );
-        cache.age(tenant, FRESHNESS_BOUND - Duration::from_secs(1));
+        cache.age(
+            tenant,
+            FRESHNESS_BOUND.saturating_sub(Duration::from_secs(1)),
+        );
         for _ in 0..3 {
             assert!(cache.cached(tenant).is_some(), "inside the bound it serves");
         }

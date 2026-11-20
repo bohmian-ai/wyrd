@@ -268,6 +268,99 @@ fn refused<T: std::fmt::Debug>(result: Result<T, wyrd_ai::WyrdError>) -> String 
     result.expect_err("the call is refused").code().to_owned()
 }
 
+/// A reader of a Repository family downloads the publication of an execution
+/// whose trusted parent is that Repository, and a reader of another
+/// Repository family cannot tell the same download from an unknown one.
+///
+/// # Panics
+/// Panics when the family reader's download plan differs from the manifest
+/// or the other family's refusal is not `EXECUTION_NOT_FOUND`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lane"]
+async fn a_repository_family_reader_downloads_its_execution_publications() {
+    use wyrd_ai::verify::{PublicationContent, PublicationName, PublicationSelector, TaskId};
+    use wyrd_testing::verification::Published;
+
+    let deployment = crate::support::Deployment::start().await;
+    let server = deployment.server();
+    let fixture = VerificationFixture::provision(server.state(), server.data_tenant_id())
+        .await
+        .expect("the tenant provisions");
+    let repository = fixture
+        .declare("Repository", "payments", &json!({"repository_id": "41"}))
+        .await
+        .expect("the Repository registers");
+    fixture
+        .declare("Repository", "ledger", &json!({"repository_id": "42"}))
+        .await
+        .expect("another Repository registers");
+    let verifier = fixture.drift_verifier("downloads").await.expect("verifier");
+    fixture
+        .submit(&verifier, &repository, std::collections::BTreeMap::new())
+        .await
+        .expect("the execution is admitted");
+    let id = fixture
+        .publish(
+            server.state(),
+            &[("draft", "report", Published::File(b"# Report\n".to_vec()))],
+        )
+        .await
+        .expect("the held execution publishes");
+
+    let step = TaskId::new("draft").expect("step");
+    let name = PublicationName::new("report").expect("name");
+    let attempt = PublicationSelector {
+        attempt: 1,
+        item_index: None,
+        iteration_index: None,
+        path: None,
+    };
+    let reader = |family: &'static str| {
+        let deployment = &deployment;
+        async move {
+            let grants = [
+                json!({"resource": "executions", "action": "read", "scope": {"card": {
+                    "family": {"kind": "Repository", "name": family}
+                }}}),
+            ];
+            let key = deployment
+                .granted_key(&format!("downloads_{family}"), &grants)
+                .await;
+            Execution::connect_with(id, &deployment.client(&key))
+                .await
+                .expect("the execution handle connects")
+        }
+    };
+    let payments = reader("payments").await;
+    let PublicationContent::File { manifest } = payments
+        .publication(&step, &name, &attempt)
+        .await
+        .expect("the Repository-family reader reads the publication")
+        .content
+    else {
+        panic!("the report is a file publication");
+    };
+    let planned = payments
+        .download(&step, &name, &attempt)
+        .await
+        .expect("the Repository-family reader downloads");
+    let digest = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(manifest.files[0].sha256.as_bytes())
+    };
+    assert_eq!(
+        (planned.size_bytes, planned.sha256),
+        (manifest.files[0].size_bytes, digest)
+    );
+
+    let ledger = reader("ledger").await;
+    assert_eq!(
+        refused(ledger.download(&step, &name, &attempt).await),
+        "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND"
+    );
+    deployment.shutdown().await;
+}
+
 /// A queued execution's invocations and publications read back as stable,
 /// authorized pages, each publication by its exact producer attempt, and
 /// cancelling it is durable and repeatable.

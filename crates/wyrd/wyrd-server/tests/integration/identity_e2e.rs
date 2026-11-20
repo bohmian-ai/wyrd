@@ -5614,6 +5614,200 @@ async fn auth_client_secrets_open_through_vault_transit_across_restart() {
     srv.shutdown().await.expect("server shuts down cleanly");
 }
 
+/// Renewing and replacing auth client secrets through the shipped surfaces
+/// keeps every client working with no reconfiguration:
+///   1. a person signs in through a confidential Keycloak connection;
+///   2. `POST /v1/identity/oidc/connections/{id}/renew-encryption` reseals its
+///      secret under the same id and revision; the existing session still
+///      reaches `/v1` and refreshes, and a fresh sign-in, whose code exchange
+///      opens the renewed secret, completes;
+///   3. a `SecretPost` trusted issuer and its workload binding are authored
+///      through the CLI, and a workload exchanges against them;
+///   4. `wyrd auth trusted-issuer renew-encryption` reseals the issuer secret
+///      and `wyrd auth trusted-issuer replace-secret` stores a new one, each
+///      changing the stored envelope while the binding keeps the workload
+///      exchanging; `replace-secret` with no secret source is refused before
+///      any request.
+///
+/// # Panics
+/// Panics when any step deviates from the contract above.
+#[tokio::test]
+#[ignore = "requires the Keycloak and Dex identity lane"]
+async fn renewing_and_replacing_auth_secrets_keeps_clients_working() {
+    let srv = WyrdTestServerBuilder::default()
+        .start_bound()
+        .await
+        .expect("bound server starts");
+    let server_url: Url = srv
+        .base_url()
+        .expect("bound server exposes a base URL")
+        .parse()
+        .expect("base URL parses");
+    let keycloak = OidcIssuerFixture::connect(&keycloak_issuer()).await;
+
+    // 1. A live session through a confidential connection.
+    let admin = tenant_admin(&srv, srv.data_tenant_id(), "renewal-admin").await;
+    let active = activate_keycloak_connection(
+        &srv,
+        &admin,
+        CONFIDENTIAL_HUMAN_CLIENT,
+        "SecretPost",
+        Some(CONFIDENTIAL_HUMAN_SECRET),
+    )
+    .await;
+    let session = human_login(
+        &srv,
+        &keycloak,
+        CONFIDENTIAL_HUMAN_CLIENT,
+        "alice",
+        "alice-password",
+    )
+    .await;
+
+    // 2. Renew over HTTP; the session and later sign-ins continue.
+    let id = active["id"].as_str().expect("connection id");
+    let (status, renewed) = call_json(
+        &srv,
+        &admin.token,
+        Method::POST,
+        &format!("{CONNECTIONS}/{id}/renew-encryption"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "renewal: {renewed}");
+    assert_eq!(
+        (&renewed["id"], &renewed["revision"], &renewed["state"]),
+        (&active["id"], &active["revision"], &active["state"]),
+        "renewal keeps the connection's identity and revision"
+    );
+    assert!(
+        !renewed.to_string().contains(CONFIDENTIAL_HUMAN_SECRET),
+        "the view never carries the secret"
+    );
+    let access_token = session["access_token"].as_str().expect("access token");
+    assert_v1_delegated_write_ok(&srv, access_token, "renewed-session").await;
+    let (status, refreshed) = post_refresh(
+        &srv,
+        session["refresh_token"].as_str().expect("refresh token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the session refreshes: {refreshed}");
+    human_login(
+        &srv,
+        &keycloak,
+        CONFIDENTIAL_HUMAN_CLIENT,
+        "alice",
+        "alice-password",
+    )
+    .await;
+
+    // 3. A CLI-authored confidential issuer and binding exchange.
+    let assertion = keycloak
+        .workload_token("wyrd-workload", "wyrd-workload-secret", "wyrd-workload")
+        .await;
+    let subject = jwt_claims(&assertion)["sub"]
+        .as_str()
+        .expect("workload token carries a subject")
+        .to_owned();
+    let card_ref = binding_card_ref(CardKind::Service, "renewal-workload");
+    let principal = srv
+        .seed_card_principal(&card_ref, &["editor"])
+        .await
+        .expect("workload principal seeds");
+    let credential = [("WYRD_ACCESS_TOKEN", admin.token.clone())];
+    assert_cli_succeeded(
+        &wyrd_cli(
+            trusted_issuer_add_args(&server_url, "SecretPost", "Workload"),
+            &[
+                ("WYRD_ACCESS_TOKEN", admin.token.clone()),
+                ("WYRD_ISSUER_CLIENT_SECRET", "issuer-secret-v1".to_owned()),
+            ],
+        )
+        .await,
+        "CLI trusted-issuer add succeeds",
+    );
+    assert_cli_succeeded(
+        &wyrd_cli(
+            workload_binding_add_args(&server_url, &subject, principal, card_ref.uid.as_ref()),
+            &credential,
+        )
+        .await,
+        "CLI workload-binding add succeeds",
+    );
+    let exchanges = |label: &'static str| {
+        let srv = &srv;
+        let assertion = &assertion;
+        async move {
+            assert_eq!(
+                post_jwt_bearer(srv, assertion).await.status(),
+                StatusCode::OK,
+                "the workload exchanges {label}"
+            );
+        }
+    };
+    exchanges("before any rotation").await;
+    let stored = || async {
+        srv.trusted_issuer_secret_ciphertext(srv.data_tenant_id(), &keycloak_issuer())
+            .await
+            .expect("ciphertext reads")
+            .expect("the issuer stores a sealed secret")
+    };
+    let sealed = stored().await;
+
+    // 4. Renew and replace through the CLI; the binding keeps working.
+    let issuer_args = |verb: &str| {
+        [
+            "auth",
+            "trusted-issuer",
+            verb,
+            "--issuer",
+            &keycloak_issuer(),
+            "--server",
+            server_url.as_str(),
+        ]
+        .map(str::to_owned)
+        .to_vec()
+    };
+    let output = wyrd_cli(issuer_args("renew-encryption"), &credential).await;
+    assert_cli_succeeded(&output, "CLI trusted-issuer renew-encryption succeeds");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("renewed:"));
+    let renewed_envelope = stored().await;
+    assert_ne!(renewed_envelope, sealed, "renewal reseals the secret");
+    exchanges("after renewal").await;
+
+    let refused = wyrd_cli(issuer_args("replace-secret"), &credential).await;
+    assert!(
+        !refused.status.success()
+            && String::from_utf8_lossy(&refused.stderr).contains("WYRD_ISSUER_CLIENT_SECRET"),
+        "replace-secret needs a secret source: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert_eq!(
+        stored().await,
+        renewed_envelope,
+        "a refused replacement sends nothing"
+    );
+    let output = wyrd_cli(
+        issuer_args("replace-secret"),
+        &[
+            ("WYRD_ACCESS_TOKEN", admin.token.clone()),
+            ("WYRD_ISSUER_CLIENT_SECRET", "issuer-secret-v2".to_owned()),
+        ],
+    )
+    .await;
+    assert_cli_succeeded(&output, "CLI trusted-issuer replace-secret succeeds");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("replaced:") && !stdout.contains("issuer-secret-v2"));
+    assert_ne!(
+        stored().await,
+        renewed_envelope,
+        "replacement stores a new secret"
+    );
+    exchanges("after replacement, through the unchanged binding").await;
+
+    srv.shutdown().await.expect("server shuts down cleanly");
+}
+
 /// Assert the production `wyrd-client` workload-credential lifecycle end-to-end
 /// against the live bound server: one cached exchange, reuse while fresh, and a
 /// fresh re-exchange on `force_refresh` — the exact path a workload's transport

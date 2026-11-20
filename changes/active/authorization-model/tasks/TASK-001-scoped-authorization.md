@@ -489,9 +489,13 @@ Evidence (in progress):
   `durable_verifier_work::execution_pages_are_stable_and_tenant_scoped`: `executions:read`
   at the parent's family plans the file download with the manifest's size and digest;
   another family's reader gets `WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND` for the same
-  download. GREEN 1/1 on first run. The parent in this journey is a Service; downloads
-  use the same `VerificationService::retained` parent check for a Repository parent,
-  whose family read is proven by `pg_github_pull_requests` above.
+  download. GREEN 1/1 on first run. The parent in this journey is a Service.
+  Repository parent: `durable_verifier_work::a_repository_family_reader_downloads_its_execution_publications`
+  submits against Repository `payments`, so the trusted parent is that Repository.
+  `executions:read` at Repository family `payments` reads the file publication and
+  plans its download with the manifest's size and digest; the same grant at family
+  `ledger` gets `WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND`. GREEN 1/1 on first run
+  (existing behavior).
 - Peer execution of the masked plan — PASS (unit, `9c37ae2d2`).
   `oracle::codec::tests::a_masked_verification_plan_executes_identically_on_a_peer`: a
   Repository-family reader's plan over `bifrost.verification.results` returns `["p1"]`
@@ -783,7 +787,9 @@ Recorded results:
   nonblocking.
 - Benchmarks (full, clean, same host; numbers reported to the maintainer for the
   pass decision, no comparison claimed here; the maintainer accepted all three as
-  passing on 2026-11-20):
+  passing on 2026-11-20, after seeing the table that flagged the 64-client
+  overhead p99 values above the 0.5 ms target for Rust and TypeScript
+  direct-verify and both 64 KiB gateway cases):
   - `bench:l1:bifrost` VALID, `benchmarks/history/bifrost/parquet/20261120T111551Z-1cbe26031.json`.
   - `bench:l1:gateway` VALID, `benchmarks/history/gateway/overhead/20261120T112543Z-1cbe26031.json`.
     Overhead p99 at 64 clients: 1 KiB buffered 0.415 ms, streamed 0.201 ms, 64 KiB

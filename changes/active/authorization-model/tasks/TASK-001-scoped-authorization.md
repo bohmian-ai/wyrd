@@ -255,11 +255,147 @@ Evidence (in progress):
   violation. They are the hosted refusal code (`toolerror.rs`), the PR `RETURNING`
   lists, and the account and credential revision advance. The journeys above observed
   each defect first; the unit test for the hosted refusal code was added after the fix.
+- GitHub configuration permission (REQ-007) — PASS (HTTP and MCP).
+  `pg_github_connection::github_configuration_needs_its_own_permission`
+  (`crates/wyrd/wyrd-server/tests/integration/pg_github_connection.rs`):
+  - A `github_connections:read`+`write` configurator reads (200) and connects (201), and is
+    refused OIDC administration (`GET /v1/identity/oidc/connections` 403) and Card reads
+    (`GET /v1/cards` 403).
+  - An `identity_connections:write`-only administrator is refused the read and connect
+    (403); a reader of the payments Repository family is refused the read (403).
+  - `installation_tokens_follow_repository_access` now pins the audited permission per
+    operation (`github_connections:read` for the read, `:write` for the others).
+  Command: inside `scripts/postgres/with-test-postgres.sh` after migrations,
+  `cargo nextest run --locked -p wyrd-server --test integration -E 'test(/^pg_github_connection::/)'`.
+  RED: `the configurator reads` got 403, because `GithubConnections::authorize` checked
+  `identity_connections:write`. GREEN: 5/5 after `6b7ef570f`. MCP
+  `-E 'test(/github|discovery|connectivity/)'` 10/10.
+- Password-change refresh refusal — PASS (Rust SDK).
+  `principal_roles::a_family_bound_viewer_reads_only_that_family`
+  (`sdks/wyrd-sdk-rust/tests/integration/principal_roles.rs`): after Alice changes her
+  local password (`HumanSso::change_local_password`) and her saved access token expires,
+  a fresh client from the saved login fails to connect with
+  `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE`, reason `refresh_refused`. Command:
+  `cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all
+  -E 'test(=principal_roles::a_family_bound_viewer_reads_only_that_family)'` inside
+  `with-test-postgres.sh`, 1/1. No RED: the server already compared the password revision
+  on refresh (`wyrd-auth/src/issuance.rs`); the first run observed the refusal.
+- Diagnosis, the full server integration run after the revision advance.
+  Symptom I: six `pg_verification_routes` tests answered 401 `inactive` for a caller
+  bootstrapped moments before its request. Evidence: `AuthorityCache::authorize`
+  refused any subject, actor or key missing from a warm snapshot; the creating write had
+  advanced the revision, but this process had not yet applied the notification. Cause: a
+  warm snapshot cannot tell "created after my load" from "removed". Fix site:
+  `crates/wyrd/wyrd-auth/src/authority.rs`. `VerifiedToken` now carries `iat`. When a
+  token issued no earlier than the snapshot's load second misses, the cache reloads once
+  (the sanctioned cache-miss statement). An older token is refused without a reload, so a
+  removed account's tokens cost no statement. Every `VerifiedToken` construction was
+  updated (`wyrd-auth-verify`, `issuance.rs`, `principal_extractor.rs`, the Gate test).
+  RED: the six tests in the full run. GREEN: `-E 'test(/^pg_verification_routes::/)'`
+  answers no 401 `inactive`.
+  Diagnostician report, stale tests in the same run, no further production defect:
+  - Role assignment bodies use `{"assignments": [{"role", "scope"}]}`, and stored
+    bindings are in `wyrd.auth_role_bindings` (`pg_browser_sessions`,
+    `pg_verification_runtime`, `pg_verification_groups`, `identity_e2e`,
+    `platform_admin_e2e`). The retired `PUT /v1/principals/{id}/roles/{role}` is now
+    `POST /v1/access/bindings`.
+  - A decider needs `verifier:approve` and `executions:read` on the parent
+    (`inspection.rs`). The editor deciders in `pg_approvals`, the PR extraction harness
+    and the CLI GitHub journey are approvers that also read; for delegation, the user and
+    the actor both are.
+  - `WyrdTestServer::retained_records` inspects every parent's managed verification rows,
+    so its inspection context also holds `executions:read`.
+  - The PR "Verifier only" reader holds `executions:read` on the Verifier Card, which does
+    not reach the Repository parent.
+  - The CLI journeys use `--grant ROLE:SCOPE`.
+  Symptom J: a reader holding a key whose id the snapshot did not yet hold was authorized
+  with the stale grants and no key ceiling (`direct_execution_refusals_are_stable`, 403).
+  Cause: `TenantAuthority::authorize` treated an unknown key as active without a
+  ceiling, but the snapshot holds every stored key, revoked ones included, so an
+  unknown key was committed after the load. Fix site: the same method; an unknown key
+  is now a miss and reloads under the rule above. RED:
+  `authority::tests::an_unknown_key_is_a_miss` failed on the unknown-key assertion. GREEN:
+  `cargo nextest run --locked -p wyrd-auth --lib -E 'not test(/pg_tests/)'`, 23/23.
+  Symptom K (regression from the Symptom J fix): `identity_e2e::human_oidc_login_journey`,
+  `revocation_journey` and `revoking_a_human_kills_the_session_refresh_authority` were refused
+  delegation with `WYRD_AUTH_401_CREDENTIAL_REVOKED` (identity_e2e.rs:226). Cause: a refreshed
+  human token carries the consumed refresh row as `credential_id`
+  (`TenantGrant::Refresh`, issuance.rs `credential_id`), which is not a key. Treating every
+  unknown credential as a miss refused it. Fix site: `TenantAuthority::predates` decides the
+  one reload (issued no earlier than the load, and the account, an actor or the credential
+  is unknown). `TenantAuthority::authorize` again gives an unknown credential no key ceiling.
+  Unit test: `authority::tests::an_unknown_credential_reloads_only_for_a_newer_token`
+  replaces `an_unknown_key_is_a_miss`. TDD: the production fix preceded this unit test
+  (process violation); the identity journeys are the RED.
+  Third diagnostician report:
+  - Principal revocation: `platform_admin_e2e::a_tenant_revokes_a_compromised_principal_with_its_reason`
+    and the two `identity_e2e` revocation journeys asserted that a pre-revocation token
+    "keeps its snapshot". Posture 325-329 and REQ-005 make that stale: an issued token
+    spends current account authority. The tests now assert 401 (`details.reason ==
+    "inactive"`) at the next request.
+  - Key revocation: posture 328-329 says "Credential revocation ends renewal; it does not
+    itself withdraw an already-issued bearer". `TenantAuthority::authorize` refused a
+    revoked key's bearer, which is drift introduced in 8e33913ed. The key-rotation journeys passed only
+    because the notification had not yet landed. Fix site: `KeyState` is now
+    `Bounded(ceiling) | Corrupt`, and a revoked key's bearer stays bounded by its ceiling.
+    The unused `active` key column is removed from `AUTHORITY_STATE_SQL`.
+  - `pg_hosted_artifacts::busy_queued_execution_is_deferred_until_capacity_frees`: another
+    test's runtime on the shared database claimed its queued execution. `RUNNABLE_TENANTS_SQL`
+    is cross-tenant by design. The owning lane `test:verification:sandbox` isolates this
+    test; the failure came from my combined ad-hoc invocation, not from a lane.
+  Second diagnostician report (no further production defect):
+  - `WyrdTestServer::bootstrap_user` bound every role tenant-wide through the provider
+    replacement, ignoring the scopes `seed_role` recorded. Scoped negative cases passed
+    over-granted. Fix site: `wyrd-testing/src/server.rs::bootstrap_user_in_tenant` binds
+    each seeded part at its scope with provider source. This corrects the earlier
+    "bootstrap binds there" note.
+  - A PR execution's parent is its Repository (`STATUS_SQL` `card_scope` from
+    `e.card_uid`); `executions:read` on the Verifier alone is refused once the fixture
+    binds it at its scope.
+  - Retained PR membership: a tenant-wide Card reader reads membership (REQ-006). The
+    refusal cases are a caller with no read (`DENIED_RBAC`) and a reader of another
+    Repository family, who sees no rows and counts zero.
+  - `pg_merge_http_protected` minted tokens for accounts that do not exist; it now
+    bootstraps a User. `pg_operator_connection_routes` stored role operations with a
+    `scope` field, which operations no longer carry.
+  - The verification route docs described `verifier:read` on the Verifier; they now
+    name `executions:read` on the trusted parent.
+  - `pg_hosted_artifacts::busy_queued_execution_is_deferred_until_capacity_frees`: see the
+    third report below (the cause is test isolation).
+  Fourth diagnostician report (revoked account still authorized in-process): an in-process
+  `WyrdTestServer` never ran the `authorization_cache` worker (listener plus confirm), so a
+  revocation never reached a snapshot that already held the account. Fix site:
+  `WyrdTestServerBuilder::start_in_process` spawns that worker under the state shutdown
+  token. The two `identity_e2e` revocation journeys now assert 401.
+  Fifth diagnostician report (Python):
+  - `test_principal_roles.py` assumed a grant order the access summary does not promise.
+    Its `grants` helper now sorts, as the TypeScript twin's does.
+  - The MCP reader tests in `test_agent_frameworks.py` exposed a production defect from
+    8e33913ed. Direct execute resolved the target before authorizing, so a caller without
+    `verifier:run` got 404 for an unknown target but 403 for a real one, which reveals
+    whether a target exists (REQ-009, posture 665-666, 732). Fix site:
+    `VerificationService::run_direct` checks `verifier_run_any` for an unresolved target,
+    as enqueue does. RED: the new reader-unknown-target case in
+    `pg_verification_routes::direct_execution_refusals_are_stable` (404 instead of 403).
+    GREEN: `-E 'test(/^pg_verification_routes::/)'`, 27/27.
+  Runs at e5101241d:
+  - `test:identity:journey` exit 0: 31/31 server journeys plus the UI BFF, CLI device
+    login and each SDK saved-login journey.
+  - `test:rust-sdk:journey`: 195/195.
+  - `ts:test:integration`: 40/40 files.
+  - `py:test:integration`: 5 failed before the fixes above; after them, the affected files
+    `test_principal_roles.py` and `test_agent_frameworks.py` pass 14/14. The full Python lane
+    has not been rerun.
+  - CLI `--test cli`: 59/61. `cli_device_login_journey` belongs to the identity lane (green).
+    `retired_tables_are_unknown` failed once at server start ("peer security audit cannot be
+    composed") and passed twice alone; no cause has been established.
+  - Server `pg_*`/`platform_admin_e2e` combined run: 439/441 at 2936d9e4c; both failures
+    were diagnosed above. `test:verification:sandbox` 34/34.
+  - `lints` and `py:lints` are clean.
 - Not yet proven in this cycle: direct/group/custom-role variants, exact UID vs future
   versions, CLI/Python/TypeScript/MCP, review sets/executions/approvals through
-  dedicated reads, peer execution of the masked plan, scoped invitations,
-  password-change refresh refusal, GitHub configuration permission. Each remains FAIL
-  until proven.
+  dedicated reads, peer execution of the masked plan, scoped invitations. Each remains
+  FAIL until proven.
 - TDD: VIOLATED for slices committed in `8e33913ed` and `0c3a7d36f` (production code
   preceded tests). Test-first resumed from the smallest case above.
 

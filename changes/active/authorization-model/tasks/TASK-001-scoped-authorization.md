@@ -383,9 +383,8 @@ Evidence (in progress):
     login and each SDK saved-login journey.
   - `test:rust-sdk:journey`: 195/195.
   - `ts:test:integration`: 40/40 files.
-  - `py:test:integration`: 5 failed before the fixes above; after them, the affected files
-    `test_principal_roles.py` and `test_agent_frameworks.py` pass 14/14. The full Python lane
-    has not been rerun.
+  - `py:test:integration`: 5 failed before the fixes above. After them, the full lane passes
+    367 passed, 2 skipped, at e5101241d.
   - CLI `--test cli`: 59/61. `cli_device_login_journey` belongs to the identity lane (green).
     `retired_tables_are_unknown` failed once at server start ("peer security audit cannot be
     composed") and passed twice alone; no cause has been established.

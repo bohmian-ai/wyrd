@@ -2081,19 +2081,11 @@ async fn scoped_readers_query_only_their_parents_records_across_pods() -> Result
         .provision_public_api_key("verification-admin")
         .await?;
     let producer = public_client(cluster.server(PRODUCER)?, &admin_key)?;
-    let quickstart = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../examples/quickstart");
-    let other = tempfile::tempdir()?;
-    for file in ["support-reply.yaml", "no-refund-promise.yaml"] {
-        let source = std::fs::read_to_string(quickstart.join(file))?;
-        std::fs::write(
-            other.path().join(file),
-            source.replace("name: support-reply", "name: other-reply"),
-        )?;
-    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
     let mut states = Vec::new();
     for path in [
-        quickstart.join("support-reply.yaml"),
-        other.path().join("support-reply.yaml"),
+        root.join("examples/quickstart/support-reply.yaml"),
+        root.join("fixtures/cards/scoped_peer_reads/other-reply.yaml"),
     ] {
         let declared = DeclareOptions {
             client: Some(producer.clone()),

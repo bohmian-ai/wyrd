@@ -911,17 +911,10 @@ async fn a_family_bound_viewer_queries_only_that_familys_records() {
     let deployment =
         Deployment::start_with(WyrdTestServer::builder().with_verification_runtime_for_test())
             .await;
-    let quickstart = fixture("../examples/quickstart/support-reply.yaml");
-    let other = tempfile::tempdir().expect("copy directory creates");
-    for file in ["support-reply.yaml", "no-refund-promise.yaml"] {
-        let source = std::fs::read_to_string(quickstart.with_file_name(file)).expect("reads");
-        std::fs::write(
-            other.path().join(file),
-            source.replace("name: support-reply", "name: other-reply"),
-        )
-        .expect("writes");
-    }
-    for path in [quickstart, other.path().join("support-reply.yaml")] {
+    for path in [
+        fixture("../examples/quickstart/support-reply.yaml"),
+        fixture("cards/scoped_peer_reads/other-reply.yaml"),
+    ] {
         let state = WyrdState::declare_with(
             &path,
             DeclareOptions {
@@ -1181,16 +1174,8 @@ async fn group_custom_and_exact_version_bindings_scope_reads() {
         })
         .await
         .expect("Dave is bound at version 1.0.0");
-    let later = tempfile::tempdir().expect("directory creates");
-    let source = std::fs::read_to_string(fixture("cards/repository_declaration/code-review.yaml"))
-        .expect("fixture reads");
-    std::fs::write(
-        later.path().join("code-review.yaml"),
-        source.replace("version: 1.0.0", "version: 2.0.0"),
-    )
-    .expect("writes");
     let second = cards
-        .declare_from_path(later.path().join("code-review.yaml"))
+        .declare_from_path(fixture("cards/repository_declaration/code-review-2.yaml"))
         .await
         .expect("version 2.0.0 registers");
     let version_two = crate::support::declared(&second, "code-review");
@@ -1325,21 +1310,8 @@ async fn scoped_editors_change_only_the_cards_they_cover() {
         assert!(!names.contains(member), "{member} persisted: {names:?}");
     }
 
-    let later = tempfile::tempdir().expect("directory creates");
-    let source = std::fs::read_to_string(fixture("cards/declare_and_pull/support-model.yaml"))
-        .expect("fixture reads");
-    std::fs::write(
-        later.path().join("support-model.yaml"),
-        source.replace("version: 1.0.0", "version: 2.0.0"),
-    )
-    .expect("writes");
-    std::fs::copy(
-        fixture("cards/declare_and_pull/support-model.bin"),
-        later.path().join("support-model.bin"),
-    )
-    .expect("copies");
     let second = family
-        .declare_from_path(later.path().join("support-model.yaml"))
+        .declare_from_path(fixture("cards/declare_and_pull/support-model-2.yaml"))
         .await
         .expect("the family editor declares a later release");
     let second = crate::support::declared(&second, "support-model");

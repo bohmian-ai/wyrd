@@ -12,6 +12,9 @@ use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{StoredSecretTable, stored_secrets, swap_stored_secret};
 use wyrd_sql::queries::operator_connections::{NewConnection, SealedSecret, insert_connection};
 
+/// How long each read and swap here may wait; nothing contends with them.
+const WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Insert one Slack connection named `name` sealed as `envelope`.
 ///
 /// # Panics
@@ -63,7 +66,10 @@ async fn maintenance_lists_every_tenant_and_swaps_only_the_bytes_it_read() {
     let operator = fixture.operator_pool();
     let table = StoredSecretTable::OperatorConnections;
 
-    let rows = stored_secrets(operator, table).await.expect("rows list");
+    let rows = stored_secrets(operator, table, WAIT)
+        .await
+        .expect("rows list")
+        .expect("read finishes");
     assert_eq!(rows.len(), 2, "every tenant's envelope is listed");
     let mut tenants: Vec<Uuid> = rows.iter().filter_map(|row| row.data_tenant_id).collect();
     tenants.sort_unstable();
@@ -78,27 +84,33 @@ async fn maintenance_lists_every_tenant_and_swaps_only_the_bytes_it_read() {
 
     let first = &rows[0];
     assert!(
-        swap_stored_secret(operator, table, first, &[9; 24])
+        swap_stored_secret(operator, table, first, &[9; 24], WAIT)
             .await
-            .expect("swap runs"),
+            .expect("swap runs")
+            .expect("swap finishes"),
         "a swap on the bytes read wins"
     );
     assert!(
-        !swap_stored_secret(operator, table, first, &[8; 24])
+        !swap_stored_secret(operator, table, first, &[8; 24], WAIT)
             .await
-            .expect("swap runs"),
+            .expect("swap runs")
+            .expect("swap finishes"),
         "a swap on stale bytes loses"
     );
     let mut foreign = rows[1].clone();
     foreign.data_tenant_id = first.data_tenant_id;
     assert!(
-        !swap_stored_secret(operator, table, &foreign, &[7; 24])
+        !swap_stored_secret(operator, table, &foreign, &[7; 24], WAIT)
             .await
-            .expect("swap runs"),
+            .expect("swap runs")
+            .expect("swap finishes"),
         "a swap under another tenant matches nothing"
     );
 
-    let after = stored_secrets(operator, table).await.expect("rows list");
+    let after = stored_secrets(operator, table, WAIT)
+        .await
+        .expect("rows list")
+        .expect("read finishes");
     let replaced = after
         .iter()
         .find(|row| row.row_key == first.row_key)

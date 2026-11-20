@@ -529,44 +529,95 @@ impl StoredSecretTable {
     }
 }
 
+/// PostgreSQL's `query_canceled` code: a statement ended by `statement_timeout`.
+const QUERY_CANCELED: &str = "57014";
+
+/// Open an operator transaction whose statements PostgreSQL itself cancels
+/// once `wait` elapses, so neither a lock wait nor a slow read outlives a
+/// caller's budget and an abandoned write rolls back with the transaction.
+///
+/// # Errors
+/// Returns [`SqlError`] when the transaction cannot begin.
+async fn bounded_transaction(
+    operator: &OperatorPool,
+    wait: Duration,
+) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, SqlError> {
+    let mut tx = operator.pool().begin().await.map_err(SqlError::from)?;
+    // A zero timeout disables the limit, so the shortest bound is 1 ms.
+    let millis = wait.as_millis().clamp(1, i32::MAX as u128);
+    sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+        .bind(format!("{millis}ms"))
+        .execute(&mut *tx)
+        .await
+        .map_err(SqlError::from)?;
+    Ok(tx)
+}
+
+/// `Ok(None)` when `result` failed because its statement timeout elapsed.
+fn unless_timed_out<T>(result: Result<T, sqlx::Error>) -> Result<Option<T>, SqlError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some(QUERY_CANCELED) => {
+            Ok(None)
+        }
+        Err(error) => Err(SqlError::from(error)),
+    }
+}
+
 /// List every stored envelope of `table` across all tenants, with the owner
 /// metadata its context binds.
 ///
+/// Returns `None` when the read is still waiting, for example on a lock, once
+/// `wait` elapses; the caller has then observed nothing of `table`.
+///
 /// # Errors
-/// Returns [`SqlError`] when the query fails.
+/// Returns [`SqlError`] when the query fails for another reason.
 // tenant-isolation: cross-tenant OperatorPool
 pub async fn stored_secrets(
     operator: &OperatorPool,
     table: StoredSecretTable,
-) -> Result<Vec<StoredSecretRow>, SqlError> {
-    sqlx::query_as::<_, StoredSecretRow>(table.select_sql())
-        .fetch_all(operator.pool())
-        .await
-        .map_err(SqlError::from)
+    wait: Duration,
+) -> Result<Option<Vec<StoredSecretRow>>, SqlError> {
+    let mut tx = bounded_transaction(operator, wait).await?;
+    unless_timed_out(
+        sqlx::query_as::<_, StoredSecretRow>(table.select_sql())
+            .fetch_all(&mut *tx)
+            .await,
+    )
 }
 
 /// Replace `row`'s envelope with `replacement` if the column still holds
 /// exactly the bytes `row` was read with.
 ///
-/// Returns `false` when the row changed or disappeared since it was read; the
-/// caller leaves it for the next pass and the concurrent write stands.
+/// Returns `Some(false)` when the row changed or disappeared since it was
+/// read; the caller leaves it for the next pass and the concurrent write
+/// stands. Returns `None` when the update is still waiting once `wait`
+/// elapses: PostgreSQL cancels it and its transaction rolls back, so the row
+/// keeps its bytes and the abandoned update never lands later.
 ///
 /// # Errors
-/// Returns [`SqlError`] when the update fails.
+/// Returns [`SqlError`] when the update or commit fails for another reason.
 // tenant-isolation: cross-tenant OperatorPool
 pub async fn swap_stored_secret(
     operator: &OperatorPool,
     table: StoredSecretTable,
     row: &StoredSecretRow,
     replacement: &[u8],
-) -> Result<bool, SqlError> {
-    sqlx::query(table.swap_sql())
-        .bind(row.data_tenant_id)
-        .bind(&row.row_key)
-        .bind(&row.envelope)
-        .bind(replacement)
-        .execute(operator.pool())
-        .await
-        .map(|result| result.rows_affected() == 1)
-        .map_err(SqlError::from)
+    wait: Duration,
+) -> Result<Option<bool>, SqlError> {
+    let mut tx = bounded_transaction(operator, wait).await?;
+    let swapped = unless_timed_out(
+        sqlx::query(table.swap_sql())
+            .bind(row.data_tenant_id)
+            .bind(&row.row_key)
+            .bind(&row.envelope)
+            .bind(replacement)
+            .execute(&mut *tx)
+            .await,
+    )?;
+    let Some(result) = swapped else {
+        return Ok(None);
+    };
+    tx.commit().await.map_err(SqlError::from)?;
+    Ok(Some(result.rows_affected() == 1))
 }

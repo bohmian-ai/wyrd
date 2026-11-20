@@ -99,7 +99,7 @@ async fn maintain(args: MaintainArgs) -> Result<ExitCode, WyrdCliError> {
     for failure in &report.failures {
         println!("failure: {}", serde_json::json!(failure));
     }
-    if report.remaining > 0 {
+    if report.remaining > 0 || report.bounded {
         println!("Repeat with the same --mode to continue.");
     }
     Ok(ExitCode::SUCCESS)

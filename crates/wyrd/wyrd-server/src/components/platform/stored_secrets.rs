@@ -69,13 +69,16 @@ impl StoredSecretMaintenance {
     /// Whether any store holds an envelope.
     ///
     /// A deployment without `[kms]` must hold none, since it could not open
-    /// them.
+    /// them. Boot waits on these reads as long as they take.
     ///
     /// # Errors
     /// Returns [`SqlError`] when a read fails.
     pub async fn holds_envelopes(&self) -> Result<bool, SqlError> {
         for table in StoredSecretTable::ALL {
-            if !stored_secrets(&self.operator, table).await?.is_empty() {
+            if stored_secrets(&self.operator, table, Duration::MAX)
+                .await?
+                .is_none_or(|rows| !rows.is_empty())
+            {
                 return Ok(true);
             }
         }
@@ -85,10 +88,12 @@ impl StoredSecretMaintenance {
     /// Run one bounded pass moving every observed envelope that does not
     /// name the active key onto it.
     ///
-    /// The pass attempts at most `limit` transitions and stops starting new
-    /// key-service calls once `budget` elapses; envelopes it does not reach
-    /// count as `remaining`, and `bounded` reports the cut. Rows already
-    /// swapped stay swapped, so repeating the pass resumes from the rest.
+    /// The pass attempts at most `limit` transitions, and every store read,
+    /// key-service call, and swap shares one deadline `budget` from now. An
+    /// observed envelope it does not move counts as `remaining`; a store whose
+    /// read the deadline cut, and every later store, is not observed and not
+    /// counted; `bounded` reports either cut. Rows already swapped stay
+    /// swapped, so repeating the pass resumes from the rest.
     ///
     /// # Errors
     /// Returns [`SqlError`] when a read or swap statement fails.
@@ -113,7 +118,17 @@ impl StoredSecretMaintenance {
             deadline,
         };
         for table in StoredSecretTable::ALL {
-            for row in &stored_secrets(&self.operator, table).await? {
+            let wait = deadline.saturating_duration_since(Instant::now());
+            let rows = if wait.is_zero() {
+                None
+            } else {
+                stored_secrets(&self.operator, table, wait).await?
+            };
+            let Some(rows) = rows else {
+                pass.report.bounded = true;
+                break;
+            };
+            for row in &rows {
                 self.settle(&mut pass, table, row).await?;
             }
         }
@@ -180,10 +195,21 @@ impl StoredSecretMaintenance {
             }
             Ok(Err(error)) => pass.fail(table, row, reason(&error)),
             Ok(Ok(envelope)) => {
-                if swap_stored_secret(&self.operator, table, row, &envelope).await? {
-                    pass.report.changed += 1;
+                let wait = pass.deadline.saturating_duration_since(Instant::now());
+                let swapped = if wait.is_zero() {
+                    None
                 } else {
-                    pass.fail(table, row, StoredSecretFailureReason::ConcurrentChange);
+                    swap_stored_secret(&self.operator, table, row, &envelope, wait).await?
+                };
+                match swapped {
+                    Some(true) => pass.report.changed += 1,
+                    Some(false) => {
+                        pass.fail(table, row, StoredSecretFailureReason::ConcurrentChange);
+                    }
+                    None => {
+                        pass.report.bounded = true;
+                        pass.report.remaining += 1;
+                    }
                 }
             }
         }
@@ -197,7 +223,7 @@ struct Pass {
     report: StoredSecretMaintenanceReport,
     /// Transitions the request limit still allows.
     attempts_left: u64,
-    /// When the pass stops starting key-service calls.
+    /// When the pass stops waiting on the key service or the database.
     deadline: Instant,
 }
 
@@ -286,10 +312,12 @@ pub fn platform_stored_secrets_router() -> OpenApiRouter<AppState> {
 /// Run one wrapping-key maintenance pass over every recoverable stored
 /// secret.
 ///
-/// The pass returns its report before the request timeout: it stops starting
-/// key-service calls after half of `limits.timeout_ms`, and envelopes it did
-/// not reach count as `remaining`. Repeat the same mode until `remaining` is
-/// zero or only failures are left.
+/// The pass returns its report before the request timeout: its store reads,
+/// key-service calls, and swaps stop waiting after half of
+/// `limits.timeout_ms`. Observed envelopes it did not move count as
+/// `remaining`; stores it never read are not counted, and `bounded` is set.
+/// Repeat the same mode until `bounded` is false and `remaining` is zero or
+/// only failures are left.
 ///
 /// # Errors
 /// Returns `503` when the deployment has no `[kms]`, and a stable Wyrd error

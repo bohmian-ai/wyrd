@@ -170,7 +170,7 @@ Native provider rotation (`gcloud kms keys versions create`, `vault write -f tra
 
 1. Provision the new key and grant the server its permissions.
 2. Restart every server with the new key as `active_key` and the old key in `retained_keys`.
-3. Run `--mode routine` until `remaining` is `0`.
+3. Run `--mode routine` until `remaining` is `0` and `bounded` is `false`.
 4. Remove the old key from `retained_keys` only when no backup you may restore holds values under it, then restart.
 
 **Compromise recovery**
@@ -178,7 +178,7 @@ Native provider rotation (`gcloud kms keys versions create`, `vault write -f tra
 1. Contain the incident: revoke the exposed access and stop any server that should no longer run.
 2. Provision a fresh key never used as `active_key` before, including by an earlier routine pass.
 3. Restart every server with the fresh key active and the old keys retained. Stop every process still writing under an old key.
-4. Run `--mode recovery` until `remaining` is `0`. Never run `--mode routine` into this key; nothing stops an administrator from choosing the wrong mode.
+4. Run `--mode recovery` until `remaining` is `0` and `bounded` is `false`. Never run `--mode routine` into this key; nothing stops an administrator from choosing the wrong mode.
 5. Replace each exposed credential at its provider and in Wyrd. Resealing does not revoke a credential an attacker already copied.
 
 If containment removed access to an old key, recovery cannot open the values under it. Restore controlled read access to that key, or replace each credential through its owner without opening it. Removing a key from `[kms]` and restarting refuses every value under it until the key is listed again; Wyrd has no action that disables a key or cancels work already admitted.
@@ -196,11 +196,11 @@ If containment removed access to an old key, recovery cannot open the values und
 | --- | --- |
 | `current` | Values the pass saw already under `active_key` |
 | `changed` | Values the pass moved |
-| `remaining` | Values still not under `active_key`: failed, changed concurrently, or left by the bound |
-| `bounded` | The pass stopped at `limit` or its time budget |
+| `remaining` | Values the pass read that are still not under `active_key`: failed, changed concurrently, or left by the bound |
+| `bounded` | The pass stopped at `limit` or its time budget; stores it did not read are not counted |
 | `failures` | Up to 100 values the pass could not move, each with `store`, `data_tenant_id` (absent for the platform connection), `owner`, and `reason` |
 
-Counts describe only what one pass saw. `remaining: 0` does not prove that no backup, cache, or still-running old server depends on a key. Repeat with the same mode while `remaining` is above `0`; a repeated pass leaves values it already moved unchanged.
+Counts describe only what one pass saw. `remaining: 0` does not prove that no backup, cache, or still-running old server depends on a key. Repeat with the same mode while `remaining` is above `0` or `bounded` is `true`; a repeated pass leaves values it already moved unchanged.
 
 | `reason` | Cause |
 | --- | --- |

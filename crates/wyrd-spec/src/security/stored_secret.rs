@@ -63,7 +63,9 @@ pub struct StoredSecretMaintenanceReport {
     /// with the same mode to continue.
     pub remaining: u64,
     /// Whether the pass stopped at its limit or time budget before
-    /// attempting every observed envelope.
+    /// attempting every envelope. When the budget ends a store read, that
+    /// store and every later one go unobserved and uncounted; repeat while
+    /// this is `true`.
     pub bounded: bool,
     /// Up to [`MAX_REPORTED_FAILURES`] owners whose envelope this pass could
     /// not move, with no key or secret material.

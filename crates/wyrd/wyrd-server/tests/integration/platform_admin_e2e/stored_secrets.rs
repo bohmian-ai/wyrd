@@ -1144,3 +1144,188 @@ async fn removing_a_key_refuses_its_envelopes_until_it_is_restored() {
     );
     srv.shutdown().await.expect("server shuts down");
 }
+
+/// The edge request timeout the contention journeys run under; a pass's own
+/// budget is half of it.
+const EDGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// Restart `srv` sealing under `k2` with `k1` retained and an
+/// [`EDGE_TIMEOUT`] request timeout.
+///
+/// # Panics
+/// Panics when the server cannot restart.
+async fn roll_out_with_edge_timeout(
+    srv: WyrdTestServer,
+    transit: &TransitFixture,
+) -> WyrdTestServer {
+    Box::pin(
+        srv.restart_bound(
+            WyrdTestServer::builder()
+                .with_kms_for_test(transit.config("k2", &["k1"]))
+                .with_limits_for_test(wyrd_server::state::LimitsConfig {
+                    timeout: EDGE_TIMEOUT,
+                    ..wyrd_server::state::LimitsConfig::default()
+                }),
+        ),
+    )
+    .await
+    .expect("server restarts")
+}
+
+/// The envelopes of one store.
+fn of_store<'a>(stored: &'a [Stored], store: &str) -> Vec<&'a Stored> {
+    stored.iter().filter(|(name, _, _)| name == store).collect()
+}
+
+/// A pass whose discovery read waits on a locked store answers within its own
+/// budget: it moves the stores it read before the locked one, reports itself
+/// bounded without counting the stores it never read, and leaves those rows
+/// untouched. Once the lock is released, the same mode finishes the rest.
+///
+/// # Panics
+/// Panics when the pass outlives its budget, mutates an unread row, or the
+/// repeat does not finish.
+#[tokio::test]
+async fn a_pass_stalled_on_a_locked_store_answers_within_its_budget() {
+    let transit = TransitFixture::start().await;
+    let srv = start(&transit, "k1", &[]).await;
+    let provider = wiremock::MockServer::start().await;
+    let seeded = seed(&srv, &provider, &["stall-read"]).await;
+    let srv = roll_out_with_edge_timeout(srv, &transit).await;
+    let session = seeded.session(&srv).await;
+    let before = stored_envelopes(&srv).await;
+
+    // An administrator's open transaction holds the Gateway store.
+    let mut lock = srv
+        .operator_pool()
+        .pool()
+        .begin()
+        .await
+        .expect("lock begins");
+    sqlx::query("LOCK TABLE wyrd.gateway_provider_credentials IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock)
+        .await
+        .expect("store locks");
+    let started = std::time::Instant::now();
+    let (status, stalled) = maintain(&srv, &session, json!({ "mode": "routine" })).await;
+    let elapsed = started.elapsed();
+    lock.rollback().await.expect("lock releases");
+
+    assert_eq!(status, StatusCode::OK, "{stalled}");
+    assert!(elapsed < EDGE_TIMEOUT, "the pass took {elapsed:?}");
+    // Human connection, trusted issuer, and platform connection moved; the
+    // Gateway and Operator stores were never read, so they are not counted.
+    assert_eq!(
+        (
+            &stalled["changed"],
+            &stalled["remaining"],
+            &stalled["bounded"]
+        ),
+        (&json!(3), &json!(0), &json!(true)),
+        "{stalled}"
+    );
+    let after = stored_envelopes(&srv).await;
+    for store in ["gateway_credential", "operator_connection"] {
+        assert_eq!(
+            of_store(&after, store),
+            of_store(&before, store),
+            "{store} was not read, so it is unchanged"
+        );
+    }
+
+    let (_, resumed) = maintain(&srv, &session, json!({ "mode": "routine" })).await;
+    assert_eq!(
+        (
+            &resumed["current"],
+            &resumed["changed"],
+            &resumed["remaining"],
+            &resumed["bounded"]
+        ),
+        (&json!(3), &json!(2), &json!(0), &json!(false)),
+        "{resumed}"
+    );
+    srv.shutdown().await.expect("server shuts down");
+}
+
+/// A swap that waits on a locked row is abandoned at the pass budget without
+/// losing earlier work: the three envelopes moved before it stay moved, the
+/// locked Gateway credential keeps its bytes and counts as `remaining`, and
+/// the abandoned update never lands later. The same mode then moves exactly
+/// the two rows left and leaves the finished three byte-identical.
+///
+/// # Panics
+/// Panics when the pass outlives its budget, the abandoned swap applies, or a
+/// finished envelope is moved again.
+#[tokio::test]
+async fn a_swap_stalled_on_a_locked_row_is_abandoned_and_resumed() {
+    let transit = TransitFixture::start().await;
+    let srv = start(&transit, "k1", &[]).await;
+    let provider = wiremock::MockServer::start().await;
+    let seeded = seed(&srv, &provider, &["stall-swap"]).await;
+    let srv = roll_out_with_edge_timeout(srv, &transit).await;
+    let session = seeded.session(&srv).await;
+    let before = stored_envelopes(&srv).await;
+
+    // An open transaction holds the Gateway credential row, which a plain
+    // read still sees, so the pass wraps it and then waits to swap it.
+    let mut lock = srv
+        .operator_pool()
+        .pool()
+        .begin()
+        .await
+        .expect("lock begins");
+    sqlx::query("SELECT 1 FROM wyrd.gateway_provider_credentials FOR UPDATE")
+        .execute(&mut *lock)
+        .await
+        .expect("row locks");
+    let started = std::time::Instant::now();
+    let (status, stalled) = maintain(&srv, &session, json!({ "mode": "routine" })).await;
+    let elapsed = started.elapsed();
+    lock.rollback().await.expect("lock releases");
+
+    assert_eq!(status, StatusCode::OK, "{stalled}");
+    assert!(elapsed < EDGE_TIMEOUT, "the pass took {elapsed:?}");
+    assert_eq!(
+        (
+            &stalled["changed"],
+            &stalled["remaining"],
+            &stalled["bounded"]
+        ),
+        (&json!(3), &json!(1), &json!(true)),
+        "{stalled}"
+    );
+    let interrupted = stored_envelopes(&srv).await;
+    assert_eq!(
+        of_store(&interrupted, "gateway_credential"),
+        of_store(&before, "gateway_credential"),
+        "the abandoned swap left the credential's bytes"
+    );
+    let finished: Vec<&Stored> = interrupted
+        .iter()
+        .filter(|(_, _, envelope)| envelope_parts(envelope).0 == "k2")
+        .collect();
+    assert_eq!(finished.len(), 3);
+
+    // Had the abandoned update landed after the lock released, the Gateway
+    // credential would already be current here.
+    let (_, resumed) = maintain(&srv, &session, json!({ "mode": "routine" })).await;
+    assert_eq!(
+        (
+            &resumed["current"],
+            &resumed["changed"],
+            &resumed["remaining"],
+            &resumed["bounded"]
+        ),
+        (&json!(3), &json!(2), &json!(0), &json!(false)),
+        "{resumed}"
+    );
+    let after = stored_envelopes(&srv).await;
+    for row in finished {
+        assert!(
+            after.contains(row),
+            "a finished envelope is never redone: {}",
+            row.1
+        );
+    }
+    srv.shutdown().await.expect("server shuts down");
+}

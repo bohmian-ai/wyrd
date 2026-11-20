@@ -3,9 +3,9 @@ id: TASK-005
 kind: implementation
 status: proposed
 spec: SPEC-verification-workflow-ui
-spec_revision: 3
+spec_revision: 7
 requirements: [REQ-002, REQ-003, REQ-011, REQ-012, REQ-014, AC-007, AC-008, AC-009]
-depends_on: [TASK-002, TASK-003, TASK-004]
+depends_on: [TASK-002, TASK-003, TASK-004, TASK-005A]
 ---
 
 # Current and historical PR verification sets
@@ -28,17 +28,22 @@ declared Verifiers admitted through the real PR path.
 
 ## Same-commit request dependency
 
+[TASK-005A](TASK-005A-pr-review-admission-prerequisite.md) tracks delivery of this
+backend prerequisite, including retention of refused members and proof of the
+authorized current/history read input. Approved revision 7 defines the explicit
+Wyrd HTTP/SDK/MCP rerequest operation; delivery remains pending. Consume its actual contract and journey evidence
+before activating this task; its existence does not establish readiness.
+
 Before this task is ready, the external admission owner must confirm
 which supported input requests another review at the same commit and exposes
 its durable review-occurrence identity. A distinct explicit request creates a
 new occurrence with the policy/membership frozen at acceptance; retry/redelivery
 of the same request reuses that occurrence and does not admit duplicate members.
-The inspected approved admission contract names opening/reopening,
-readiness and source changes, but does not yet define this request path.
-Exploratory design text is not confirmation or delivered API evidence.
+REQ-019 defines the explicit PR-wide Wyrd operation and REQ-020 defines retained
+membership. Contract approval is not delivered API evidence.
 
 Record the owner's confirmed operation/contract revision and real journey proof
-here before activation. Confirmation is pending; this task remains proposed.
+here before activation. Delivery is pending; this task remains proposed.
 Do not invent a public endpoint, create review membership in the browser or add
 a UI rerun button. This dependency does not block tasks 001–004 or 006/007 beyond
 their own stated predecessors.
@@ -56,7 +61,8 @@ operation supplies full set membership/history. In TASK-001A's integrated
 baseline (`cd204b404`) execution status carries `pull_request`
 (`PullRequestActivation`, `wyrd-spec/src/verification/execution.rs:548`:
 repository, number, base/head, delivery and admission `generation`), but no
-review-set list/history read or same-commit request exists. Record that external capability
+review-set list/history read or same-commit request existed in that baseline.
+TASK-005A supplies the revised admission prerequisite. Record its delivered capability
 before activation; if absent, retain the dependency instead of implementing it
 here. These constraints preserve exact membership and authorization.
 
@@ -120,8 +126,8 @@ mock; no fixture-only admission closes this task.
 
 ## Execution and verification
 
-This task is against approved spec revision 3, whose scope transfer is
-synchronized. Activation requires only this task's named contract/authority
+This task consumes approved spec revision 7, preserving revision 3's synchronized
+UI scope transfer. Activation requires only this task's named contract/authority
 and predecessor outputs. Unrelated backend delivery
 or authority amendments do not block it. This packet consumes existing read/action
 capabilities and adds no underlying server changes; a missing required capability

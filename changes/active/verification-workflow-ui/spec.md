@@ -1,6 +1,6 @@
 ---
 id: SPEC-verification-workflow-ui
-revision: 6
+revision: 7
 status: approved
 ---
 
@@ -35,8 +35,10 @@ and supported hosts. The server continues to own durable behavior. This packet
 adds no server fields, endpoints, query services, storage or execution logic
 apart from REQ-015's status recording and revision 5's bounded verdict/citation
 correction under REQ-016/017, and revision 6's public EXPLAIN support under
-REQ-018. TASK-004A owns the verdict/citation correction and its development
-journey; TASK-004B owns explanation and UI query consolidation. All other
+REQ-018, and revision 7's PR rerequest and retained-membership prerequisite under
+REQ-019/020. TASK-004A owns the verdict/citation correction and its development
+journey; TASK-004B owns explanation and UI query consolidation; TASK-005A owns
+the bounded admission extension before TASK-005. All other
 server exclusions remain unchanged.
 Costs are UI queries, adapters, presentation, status-event writes and real-server visual/journey proof;
 the prototype supplies none of that production evidence.
@@ -81,7 +83,7 @@ read restrictions must be enforced by existing read/query authority before
 pagination and counts; a browser filter is never authorization. If an existing
 surface cannot supply a required authorized projection, record that precise
 external dependency and leave the affected work proposed rather than changing
-the server beyond REQ-015/016/017, relaxing access or fabricating records. Discovery must not enumerate
+the server beyond the explicit REQ-015–020 exceptions, relaxing access or fabricating records. Discovery must not enumerate
 every execution in the browser or infer review membership.
 
 ### Inspect one workflow
@@ -318,6 +320,59 @@ query clients and the query editor can use the same SQL capability.
 integration and evidence collection. Consolidation covers every existing UI
 page/route and uses existing tests, without benchmark runs or `dev:full`.
 
+### PR admission prerequisite
+
+**REQ-019 — Explicit PR-wide fresh review.** Add one tenant-scoped Wyrd write
+operation through HTTP, Rust/Python/TypeScript SDKs and MCP. It accepts provider
+host, stable repository ID, PR number and a caller-supplied idempotency key;
+tenant and caller come from verified authentication. It requests the entire
+selected Repository policy's `pull_request` binding set, not a single Check.
+Require current `cards:read`, `verifier:read` and `verifier:run` for each
+selected Verifier before acceptance, and the existing explicit MCP write scope. Do not let a caller supply
+policy, member IDs, source pins or execution authority.
+
+The existing admission owner resolves connected repository access and current
+open, non-draft provider source under its per-PR lock and connection fence.
+An accepted distinct key creates a new generation even at the same head, freezes
+the selected policy and members, and uses the existing PR binding declaration's
+accountable execution authority. Existing authority refusals remain terminal
+member failures, never a fallback to the requesting caller or SYSTEM. An
+unauthorized request is refused before accepting work or disclosing membership.
+Closed/draft/inaccessible PRs or a selected policy with no PR bindings accept no
+fresh set; unavailable provider/authority state is a typed retryable failure.
+
+The response identifies the accepted generation and its exact member execution
+IDs after normal admission handoff/refusal settlement. A retry of the same
+tenant/PR/key reuses that occurrence and its frozen policy/members across
+concurrency and restart; it never starts another set, even after policy or head
+changes. It cannot reactivate superseded work. Ordinary GitHub source-event
+redelivery keeps its existing source-replay behavior. New generations retain
+existing supersession and lease fencing. GitHub Re-run hooks and a UI rerun
+button are excluded. Public names and wire spellings follow owner conventions.
+
+**REQ-020 — Retain complete review membership.** Through the existing verification
+input/event and Scribe owners, retain each accepted generation's exact frozen
+member execution identities, PR source and selected Repository policy, including
+terminal admission refusals. Retain each member's actual status without making
+refused members runnable or manufacturing a verdict. A reader must distinguish
+incomplete retained visibility from complete membership during interrupted
+handoff; a visible subset cannot be presented as the full set. Retrying/recovering
+handoff preserves the same identities and does not insert duplicate members.
+
+Existing authorized Bifrost/domain reads supply bounded current/history and
+exact membership to TASK-005, independent of its default Verify time range;
+delayed older records cannot replace a newer current set. Apply existing
+tenant, exact Verifier, Card and payload authorization before counts or member
+disclosure. Retained metadata may extend existing verification input/event
+records only; no new table, storage family, history endpoint or payload
+reclassification is authorized. Persist accepted rerequest identity with its
+generation in those existing records for replay. If the existing coordination
+schema cannot implement this safely, a named migration requires a further
+approved specification revision before implementation.
+
+**Implementation boundary for REQ-019/020.** Extend existing admission and
+retention owners; do not change verification execution or other hot paths.
+
 No visual workflow editor, new verification kind, finding schema, separate PR
 dashboard, general Cards redesign, activation/pause/rollback editor or broader
 Changes/collaboration product is included. No new server API, response field, query service, authorization behavior,
@@ -326,7 +381,10 @@ event bus or PostgreSQL table is authorized. REQ-016/017 authorize only the
 existing runtime verdict validation and PR evidence/citation correction; they
 do not authorize unrelated server behavior or a new endpoint. REQ-018 is the
 additional bounded exception for explanation through the existing query API;
-it does not authorize storage/execution redesign or a separate query service. Internal layout algorithms, cursor encoding,
+it does not authorize storage/execution redesign or a separate query service.
+REQ-019/020 are the additional bounded exception for one explicit PR-wide write
+operation, its normal client projections and complete retained admission records;
+they authorize no other server extension or migration. Internal layout algorithms, cursor encoding,
 refresh scheduling and component decomposition remain implementation-owned.
 
 ## Dependencies, authority and scope transfer
@@ -356,7 +414,8 @@ The newest inspected backend contract is revision 7 at source `54aa8f4a9`; its
 approved nonblocking-execution semantics are not proof of implementation.
 Positive approval receipts retain durable decision acceptance; direct/live
 results do not certify retained visibility. This packet neither implements those
-semantics nor changes their storage, credential or permission owners.
+semantics nor changes their storage, credential or permission owners, apart from
+REQ-019/020's explicit admission extension under those same existing owners.
 
 Approval of revision 2 enacts the following bounded transfer. The original
 packet records it beside the affected requirements and tasks:
@@ -373,7 +432,8 @@ enumerated above and was synchronized into the original packet on approval
 here, and its retained Changes obligations are unchanged. Do not execute conflicting original tasks
 or mark the entire original Changes task superseded. Discovery/review-set UI queries and adapters belong to this packet over existing
 read surfaces. Apart from REQ-015's status recording and REQ-016/017's verdict/PR citation
-correction, server contract, engine and installation changes remain outside this packet; a missing input is an external dependency, not an implementation
+correction, REQ-018's query explanation and REQ-019/020's admission prerequisite,
+server contract, engine and installation changes remain outside this packet; a missing input is an external dependency, not an implementation
 assignment here.
 
 The following backend-owned authority amendments are dependencies of the tasks
@@ -401,20 +461,16 @@ its applicable current authority.
 | 003A — Queued status events | Existing queue transition owners, completion group commit and process Scribe outbox; implements only REQ-015. |
 | 004A — Dev repository review and citation correction | Implemented 004 views; existing check/extraction/evidence owners; portable upstream demo files and available pinned commit. Implements REQ-016/017 before completing the passing/failing live PR journey. |
 | 004 — Repositories/settings | 001/003 plus delivered connection/access and native Repository/selected-policy operations with owning authority. |
-| 005 — PR review sets | 002/003/004 plus actual accepted admission membership/history and confirmed same-commit request semantics. |
+| 005A — PR admission prerequisite | Existing GitHub admission, queue and Scribe owners; implements REQ-019/020 and proves the retained input consumed by 005. |
+| 005 — PR review sets | 002/003/004 plus 005A's delivered rerequest operation and complete authorized admission membership/history. |
 | 006 — Waiting/approval | 002 plus delivered occurrence/wait/decision/readback/continuation operations and owning authority. |
 | 007 — Delivery status | 002/005 plus delivered authorized provider delivery projection. |
 
-For 005, a distinct explicit request at an unchanged commit must produce a new
-server-recorded review occurrence; retry/redelivery of that same request must
-reuse its accepted occurrence and frozen membership. The backend admission
-owner must identify the supported request input, durable occurrence identity
-and replay behavior. The inspected backend admission contract does
-not establish that request path; confirmation remains a named dependency of
-005, not permission for the UI to invent an endpoint, synthesize membership or
-add a rerun control. Unrelated UI tasks can proceed; tasks that depend on 005
-still require its completed output. Exact public schema spellings follow owner
-conventions.
+TASK-005A delivers the explicit Wyrd request and retained membership required by
+REQ-019/020 before TASK-005 activates. Specification approval is not delivery
+proof. TASK-005 consumes actual integrated operation/query journeys; it still
+adds no endpoint, synthesized membership or rerun control. Unrelated UI tasks
+can proceed; tasks that depend on 005 still require its completed output.
 
 ## Acceptance observations
 
@@ -437,10 +493,20 @@ not merely the existence of a route/component or a successful command.
 | AC-009 Visual and development journey | Produce representative ordinary, session, drift, PR and approval executions through normal public development workflows; navigate Verify, Repositories and Settings in the real browser. Individually compare components/pages with the approved mock in both themes, narrow/wide layouts and keyboard/touch interaction. No inert fixture action or absent prerequisite is accepted as production completion. | 001,004,007,010–014 |
 | AC-010 Retained lifecycle events | Through real public SDK/server operations, cancel pending and running work, revoke a principal with multiple unfinished executions, and hold other work at running/retrying/input-wait/approval-wait before completion or timeout/error. Public Bifrost queries over `event = 'status'` return the expected newest words and specified row fields. Exercise ordinary release/defer returning to pending/retrying. Repeated cancellation, stale settlement and rollback add no event. Focused owner proof preserves grouped completion, shared status-row batching, attribution and retry identity; existing checkpoint recovery and tenant-isolation proof remains passing. | 015 |
 | AC-011 Verdict and PR evidence integrity | Exercise Agent/code checks returning valid passed/failed/inconclusive outcomes, including an uncited pass; outcomes remain authored. Malformed output and invalid supplied citations produce explicit validation failures, never silently filtered evidence. Run the shipped PR example and pinned demo through real extraction, review and final code check: a clean review passes with a valid citation to the retained pinned PR source, a high finding fails, and incomplete coverage remains inconclusive. Preserve source reachability through workspace/derived output and existing retained recovery; wrong-execution/tenant/locator citations are rejected. Live demo proof still includes actual GitHub delivery and existing UI visibility under AC-009. | 016,017 |
-
 | AC-012 Public query explanation | Through existing SDK/HTTP/MCP query paths and the query editor, explain a bound SELECT and analyze its real execution. Plain EXPLAIN performs no underlying data execution; ANALYZE retains the SELECT's execution selection and governs its work. Both preserve tenant/table/payload checks and complete-stream semantics. Invalid statements, denied access, resource/output exhaustion, deadline and cancellation remain typed failures without successful partial plans. | 018 |
+| AC-013 PR admission prerequisite | Through the real Wyrd HTTP/SDK/MCP operation, rerequest a multi-member PR at the same head, retry concurrently and after restart, then change policy/head and retry the older request. Accepted identities stay stable and obsolete work is never reactivated. Query mixed/all-refused sets and interrupt/recover handoff: every authorized member is retained with exact source/policy/status, incomplete visibility is distinguishable, and denied/foreign callers learn no membership/counts. Refused members never run; ordinary source-event replay remains unchanged. | 019,020 |
 
 ## Approval and revision history
+
+Revision 7 records the maintainer's 2026-11-19 approval of the backend
+prerequisite and subsequent selection of the recommended Wyrd API/SDK/MCP
+entry point. REQ-019/020 and AC-013 authorize TASK-005A before TASK-005: one
+PR-wide idempotent fresh-review operation and complete retained membership,
+including refused members, through existing admission/Scribe/storage owners.
+Trigger, evidence-custody and security authority are reconciled in the same
+documentation change before runtime implementation. Revision 6 is preserved in
+[the prior revision](spec-revisions/revision-6.md). No migration, GitHub Re-run
+hook, UI rerun action or implementation claim is approved by this revision.
 
 Revision 6 records the maintainer's explicit 2026-11-18 direction to add public
 EXPLAIN to TASK-004B rather than use a diagnostics workaround. REQ-018/AC-012
@@ -482,3 +548,4 @@ capability readiness is still checked per task; unavailable data is not invented
 | 5 | approved (2026-11-17) | Preserve valid Agent/code check verdicts; reject invalid supplied citations explicitly; make retained pinned PR extraction citable and carry provenance through the review/check flow; correct shipped example/demo and retain clean-PR passed/success. TASK-004A owns this bounded runtime and development supplement. |
 
 | 6 | approved scope (2026-11-18) | Add maintainer-requested public EXPLAIN and selected EXPLAIN ANALYZE in TASK-004B; all-route consolidation verified with existing tests and query plans, without benchmarks or dev:full. |
+| 7 | approved (2026-11-19) | Add TASK-005A under REQ-019/020 and AC-013: explicit Wyrd PR-wide rerequest via HTTP/SDKs/MCP, replay identity and complete retained membership including refusals. Preserve UI exclusions and existing admission/security owners; no migration authorized. |

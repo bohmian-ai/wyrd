@@ -2,6 +2,36 @@
 
 Status: finalized
 
+## TASK-005 backend readiness — resumed 2026-11-19
+
+On 2026-11-19 the maintainer requested specification approval for the backend
+prerequisite tracked by TASK-005A. This approves the prerequisite's scope:
+same-commit fresh reviews and complete retained membership, including refusals.
+The maintainer then selected the recommended explicit Wyrd PR-wide request
+through HTTP, Rust/Python/TypeScript SDKs and MCP. Approved specification
+revision 7 records that agreement under REQ-019/020 and AC-013; TASK-005A
+implements it. Existing admission and Scribe owners retain request identity and
+complete membership, including refusals, through existing verification records.
+Current caller Card/read and per-Verifier/read/run checks gate the request; execution
+keeps the selected declaration's accountable authority. No GitHub Re-run hook,
+UI rerun action or migration is authorized. Exact wire names, retained metadata
+layout and query mechanics are implementation-owned within those contracts.
+
+The maintainer requires all backend prerequisites to be delivered before
+TASK-005 starts. The [backend readiness investigation](pr-review-set-backend-readiness.md)
+finds a missing same-commit rerequest operation and an admission-refusal path
+that does not stage its member input into Bifrost. Grouping retained successful
+admissions by generation is possible, but is not yet proof of complete sets.
+Interrupted handoff and authorized membership/history queries also need real
+journey proof. TASK-005 remains proposed until TASK-005A delivers it. Owning
+Trigger/security/Bifrost authority is reconciled alongside revision 7 before
+runtime implementation. The earlier finalized visual decisions below remain
+settled. This supplement is the bounded exception to earlier UI-only statements.
+
+TASK-005A extends existing admission and retention owners only; verification
+execution and other hot paths remain outside its scope. Existing repository
+performance rules apply without adding a separate benchmark assignment.
+
 ## UI query consolidation — TASK-004B
 
 The maintainer requested [TASK-004B](../tasks/TASK-004B-ui-query-consolidation.md)
@@ -378,11 +408,11 @@ the compact/details split, with no underlying server changes. The visual design
 and original scope transfer remain intact. Revised TASK-002 through TASK-007
 carry the existing-read map, inputs, consumers and proof; TASK-001 stays complete.
 
-The external admission owner still needs to confirm the supported same-commit
-review-request input and replay identity and expose accepted membership to an
-existing authorized read. That dependency remains on TASK-005, without adding a
-UI rerun action or a new server read. Other tasks depend only on their named
-inputs. Integration and real input proof, not another packet's task numbers,
+Revision 7 settles the same-commit input as an explicit Wyrd PR-wide request
+through HTTP/SDKs/MCP. TASK-005A delivers its replay identity and complete
+retained membership, including admission refusals, before TASK-005 starts.
+There is no UI rerun action or new server history read. Other tasks depend only
+on their named inputs. Integration and real input proof, not task status,
 establish readiness.
 
 The connected flow is Verify → exact workflow → contextual evidence → return;

@@ -167,7 +167,8 @@ services.
     the managed `sub_principal_id`/`act_principal_id` pair. A separate emit credential was redundant — see "Observation
     identity — Card → Run → Observation".
     - **Auth** gates Wyrd API calls: `Permission { resource, action, scope }` on
-      the handler, stateless pubkey verify of the access token. Answers "is this
+      the handler, local signature verification and current cached account grants
+      bounded by signed restrictions. Answers "is this
       principal allowed to hit this Wyrd route, and to reach this object?" This
       covers data-plane ingest (e.g. `bifrost_record:write`) exactly like any
       other route. Wyrd RBAC is the standard operation/object model: `resource`
@@ -178,13 +179,15 @@ services.
       inside `Permission` is the sanctioned model — see
       [Permission model](wyrd-security-posture.md#permission-model).
     Runtime identity is a `Principal { id: PrincipalId, kind: PrincipalKind,
-    tenant_id, roles, effective_permissions, credential_id, card_access,
+    tenant_id, effective_permissions, credential_id, card_access,
     workload_uid }`. `PrincipalId`
     is a `Uuid` newtype; no string-prefix encoding (no `user:`, `sa:`,
     `agent:`) — discrimination lives on the kind. The closed wire set is
     `PrincipalKindTag`: `GlobalAdmin`, `TenantAdmin`, `User`, `Service`,
     `System`, serialized as `global_admin`, `tenant_admin`, `user`,
-    `service`, `system`. A `GlobalAdmin` is a platform-plane principal
+    `service`, `system`. Managed tenant accounts are User and Service; admin
+    is role authority, not another assignable account type. Existing bootstrap
+    and internal tags retain their separate lifecycle. A `GlobalAdmin` is a platform-plane principal
     and has no tenant,
     carried at runtime as `PlatformPrincipal { id, kind,
     effective_permissions, credential_id }`; a platform-plane human is a
@@ -241,8 +244,9 @@ services.
     whose outermost layer is the current actor; a single delegated token
     carries both sides of an invoke. Service B obtains it with
     `WyrdClient::on_behalf_of(A token, audience)`, presenting A's token as
-    `subject_token` and its own as `actor_token`; its permissions are the
-    exact intersection of both. If the existing scopes cannot represent the
+    `subject_token` and its own as `actor_token`; the signed ceiling retains the
+    exact intersection of both authorities and inherited restrictions. Requests
+    also require current subject and actor grants. If the existing scopes cannot represent the
     complete intersection, exchange is refused without issuing a token;
     permissions are never widened or silently dropped to make issuance work.
     On cross-service calls the SDK puts that delegated
@@ -730,11 +734,17 @@ in the tenant; a second live account for the same family conflicts. Setting a
 family restriction, at creation or later, additionally requires
 tenant-administrative wildcard permission; a role name never proves it.
 Restrictions grant no operation authority and do not filter unrelated
-registry or table operations.
+registry or table operations. Retain WorkloadRestriction and WorkloadFamily: the
+family restriction answers which Service family the account may run as, while
+CardPermissionScope answers which target family/version an operation grant may
+reach. Neither supplies the other. The same principal and credential run every
+release; the SDK supplies its exact workload_uid for attribution. A retained
+authorization parent never replaces that root, its owning Card or subject/actor
+identity.
 
 | Operation | Surface | What it does |
 |---|---|---|
-| Create account | `POST /v1/principals`, `wyrd principal credential create-principal` | Atomically creates the account, its roles, optional restriction, and first credential, returned once. |
+| Create account | `POST /v1/principals`, `wyrd principal credential create-principal` | Atomically creates the account, its scoped role bindings, optional restriction, and first credential, returned once. |
 | Replace restriction | `PUT /v1/principals/{principal_id}/workload-restriction`, `wyrd principal credential set-restriction` | Service only; idempotent for an unchanged value; atomically releases and acquires the family association. Id, roles, and credentials are unchanged. |
 | Rotate credentials | `POST`/`GET`/`DELETE /v1/principals/{principal_id}/credentials[/{credential_id}]` | Issue, verify, deploy, then revoke the old key; overlap is allowed and releases never require rotation. |
 | Register a release | `wyrd declare service.yaml` | Writes Card versions; no principal and no secret. |
@@ -846,8 +856,12 @@ no client-supplied tenant header is accepted. The exchange takes an optional
 `workload_uid` naming the exact Service root the account runs as; it
 selects context only and never changes the account, permissions, or tenant.
 The JWT carries the account as the top-level `principal` claim
-(`{id, kind, tenant_id}`, no Card), the `permissions` resolved from its current
-grants at issuance as its only operation authority, an optional `workload_uid`
+(`{id, kind, tenant_id}`, no Card), an explicit token-contract version,
+validated issuer/audience/subject/time/token identity and credential/delegation
+provenance. It carries no `permissions` or `roles`. Optional signed
+`permission_ceiling` restricts current server-cached grants; it never grants
+access. Ordinary human and unrestricted Service-key tokens add no ceiling;
+restricted keys and delegation retain theirs. It also carries an optional `workload_uid`
 root, and a required `card_access` limit: `any_registered` for a rootless
 User, administrator, or unrestricted Service; `root_required` with the family
 snapshot for a rootless family-restricted Service, which permits generic
@@ -898,13 +912,22 @@ connection, administered through `/v1/identity/oidc/*`; Wyrd is an OpenID
 Connect relying party of that provider (`openidconnect`) and the OAuth 2.0
 authorization server for its own clients. The provider authenticates the
 person; Wyrd resolves the tenant `User` by verified `(issuer, subject)`, maps
-provider groups only to that tenant's roles, and issues Wyrd tokens. Provider
+provider groups only to source-qualified scoped bindings in that tenant, and
+issues Wyrd tokens. Local User/password login works without any IdP. Provider
 tokens are never Wyrd authority.
 
 | Client | OAuth client | Grant | Session holder |
 |---|---|---|---|
 | Web app | First-party browser session, not a separate OAuth client | Rust-owned OIDC login, local password login or API-key recovery under `/auth/browser` | Opaque HttpOnly session cookie; only its digest and bound authority persist in Postgres; fixed 12-hour absolute lifetime |
 | CLI and SDKs | `wyrd-cli`, public | Device authorization (RFC 8628) | `credentials.toml`, owned by `wyrd-client`; refresh token rotates on every use |
+
+CLI device approval accepts a human signed in by local password or configured
+OIDC and requires explicit user-code approval. Device approval and its rotating
+refresh family retain exactly one original authentication anchor: local User and
+password revision, or OIDC connection ID and revision, plus CLI client binding.
+Invalidated anchors refuse renewal without switching methods; local login creates
+no synthetic provider connection. Unapproved device records carry no principal
+or anchor; expiry, one-use, replay, polling and browser-origin controls remain.
 
 Rust owns browser login transactions, callbacks, session creation, validation,
 expiry and revocation. Node renders the UI and forwards its selected tenant
@@ -1018,8 +1041,10 @@ principal. `/mcp`, `/v1` management, and Bifrost do not gain it. The JWT
 `X-Wyrd-Access-Token: Bearer <jwt>` header. The JWT must be a **delegated**
 Wyrd token: its top-level `principal` identifies the subject being acted
 for, and its `act` chain identifies the actor(s) acting for it, the
-outermost being the calling Service. Its `permissions` are the
-exact intersection of the actor's and the subject's; `act` is attribution only.
+outermost being the calling Service. Its signed `permission_ceiling` freezes the
+exact intersection of actor/subject authority and inherited restrictions at
+exchange; each request also checks current grants for every participant. The
+`act` chain preserves attribution and identifies those constrained actors.
 An exchange whose complete intersection cannot be represented by the existing
 token scopes is refused before signing, without silent attenuation or new
 authority. Mixed broad and explicit input grants alone are not a refusal:
@@ -1687,8 +1712,9 @@ cancellation expires it. `POST
 status, actor_id, decided_at, reason}` only after the decision is durable. The
 first decision is final: the same actor, decision, and reason replay the
 receipt, and anything else refuses
-`WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING`. Deciding needs only
-`verifier:approve` on the exact Verifier. The same `ExecutionId`
+`WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING`. Deciding requires
+`verifier:approve` on the exact Verifier and read access to the retained
+execution parent; approval authority does not grant that parent implicitly. The same `ExecutionId`
 continues after the decision. A rejection is data: the step succeeds with the receipt (`status:
 rejected`) as `steps.<id>.output`, and a requirement over it fails the verdict.
 
@@ -1967,7 +1993,7 @@ execution; scheduled executions have no `run_id`.
 | `POST /v1/verification/executions/{execution_id}/publications/{step_id}/{name}/download` | The shared download plan of a file publication's file or a directory publication's listed `path`. A cloud backend's plan is presigned; the local backend's points at `.../content` |
 | `GET /v1/verification/executions/{execution_id}/publications/{step_id}/{name}/content` | The local backend's bytes of that same file, selected and authorized as its download plan is |
 | `POST /v1/verification/executions/{execution_id}/cancel` | `{ execution_id, status }` after the cancellation fence commits; settled work keeps its status |
-| `GET /v1/verification/executions/{execution_id}/details` | `200 VerificationDetails` once the execution's complete records are visible; otherwise `404 WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND`, including unknown, not-yet-recorded, and no-longer-readable executions; the same `verifier:read` on the execution's Verifier, audited as its own read |
+| `GET /v1/verification/executions/{execution_id}/details` | `200 VerificationDetails` once the execution's complete records are visible; otherwise `404 WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND`, including unknown, not-yet-recorded, and no-longer-readable executions; read on the retained execution parent with sensitive-content checks, audited as its own read |
 | `GET /v1/verification/bindings/{binding_id}` | Readiness, cadence, `last_execution_id`, and a `group_end` binding's frozen settings and source bindings |
 
 File contents never pass through Postgres or a verification request body; an
@@ -2010,20 +2036,21 @@ input-File discovery or authorize caller-supplied storage paths.
 
 
 Execution reads — status, invocation and publication pages, publication
-reads, download plans, and local publication content — check `verifier:read` against the execution's
-exact Verifier UID, and cancellation checks `verifier:run`; neither falls back
-to `cards:read`. A caller with no grant of the action at any scope is refused
-before the execution is looked up, and an absent or other-tenant execution is
-not found. Pages default to 50 and hold at most 200 entries; a cursor fixes
+reads, download plans, and local publication content — check current read access
+on the trusted retained parent with sensitive-content controls. Repository read
+includes its member executions without separate Verifier read. Cancellation
+requires its distinct `verifier:run` action; read alone never permits mutation.
+An inaccessible, absent or other-tenant execution is not found. Pages default to 50 and hold at most 200 entries; a cursor fixes
 its listing's insertion-sequence cut and is bound to the tenant, execution,
 and listing, so a page neither skips nor repeats entries while the execution
 progresses. Execution status reads its records through the tenant's SYSTEM
 read authority granted only `execution_inputs`, `results`, and
-`execution_outputs`; public Bifrost SQL keeps the caller's own table grants.
+`execution_outputs`; caller-visible results still enforce parent visibility.
+Public Bifrost SQL keeps caller source authority and managed-row visibility.
 
 Public invocation checks `verifier:run` against the selected Verifier's exact
-Card UID. `PermissionScope::Verifier(CardUid)` names one UID; `All` covers
-every Verifier in the tenant. Permission is checked before execution and the
+Card UID. `PermissionScope::Card` names a Verifier family or exact validated
+version; `All` covers every Verifier in the tenant for that operation. Permission is checked before execution and the
 decision is audited. A binding does not replace the invocation permission.
 The engine loads the executing Verifier's exact Agent and Prompt Cards under
 the same audited `verifier:run`, never `cards:read`; a referenced definition
@@ -2229,9 +2256,17 @@ loading reconstructs logical progress rather than replaying engine instructions.
 Unknown IDs are not found only after an authoritative read; unavailable required
 sources cause retryable failure. Existing result payload meanings stay unchanged.
 
-Dedicated execution reads retain exact Verifier/repository feature authorization using
-current caller grants and recorded immutable identities, without requiring source Card
-retrieval or leftover queue rows. The server reads accepted/recovered execution
+Dedicated execution reads check current caller grants on the trusted retained
+authorization parent, plus explicit sensitive-content controls, without requiring
+source Card retrieval or leftover queue rows. At acceptance, the parent is the
+subject Card for ordinary verification, the Verifier for subjectless direct work,
+and the Repository for PR work and all members. Exact and family identity survive
+with inputs, outputs, events, results, evidence and approvals. Unknown/inaccessible
+objects are indistinguishable; unprovable parents remain hidden even from admins.
+Parent visibility governs reads/downloads/lists/search/counts before aggregation
+or pagination, including SQL and peer reads. Opening another Card definition
+requires its own grant. Parent identity never changes owning workload, exact
+Verifier, subject or actor attribution. The server reads accepted/recovered execution
 state and exact references; clients
 do not choose a backend. Ordinary registry/principal control-plane reads retain
 their owners. A publication file is stored by the storage owner's validated
@@ -2242,9 +2277,11 @@ acceptance onward. External File uploads keep their upload-session contract.
 Every work record names who the work was for (`sub_principal_id`) and who
 performed it (`act_principal_id`). A direct caller A records A/A and a
 delegated caller B acting for A records A/B. A queued execution stores the
-accepted authority and delegation, without credentials, through the
-acknowledgment handoff and its row, and keeps it across claim, retry, and
-restart; caller submission never switches to binding-owner or SYSTEM
+accepted frozen permission ceiling, identity and delegation, without credentials,
+through the acknowledgment handoff and its row, and keeps them across claim, retry,
+and restart. Downstream checks require current grants within that ceiling; later
+grants cannot enlarge accepted authority, and principal revocation still cancels
+unfinished work; caller submission never switches to binding-owner or SYSTEM
 authority. A scheduled execution runs with its binding owner's accepted
 authority. Wyrd performs model calls, tool calls, input reads, and result
 writes as the tenant SYSTEM executor, recording the subject with SYSTEM as
@@ -2676,12 +2713,35 @@ access (repository removal, suspension, uninstall or disconnect) cancel with
 `pull_request_closed`, `pull_request_draft` and `repository_access_lost`. Settled history keeps its pins, and a policy
 re-declaration affects only later generations.
 
+An authenticated Wyrd PR-wide fresh-review operation, available through HTTP,
+the SDKs and explicitly write-scoped MCP, is the additional admission input.
+It takes host, repository id, PR number and an idempotency key; tenant and caller
+are authenticated. The caller needs current `cards:read`, `verifier:read` and `verifier:run` on
+every selected member before acceptance. The same admission owner rechecks
+connected access and current open, non-draft source under the per-PR lock and
+connection fence. A distinct request creates a new generation at an unchanged
+head under the selected policy, retaining the declaration's accountable
+execution authority and existing refusal/supersession semantics. Caller-supplied
+policy, membership, source or execution authority is not accepted. No selected
+PR bindings means no fresh set. A retry of the same tenant/PR/key returns its
+accepted generation and members across restart and later source/policy changes,
+never reactivating obsolete work. Retained verification admission records hold
+that identity; ordinary source-event replay remains unchanged. This operation
+does not add GitHub Check rerequest hooks or a UI rerun control.
+
 The reserved executions then follow the same Scribe hand-off and outbox as
 `submit`, keyed by execution so a replay stages identical rows, and become
 due only when the outbox commits them. A delivery is answered 2xx only after
 every execution of its generation is due, or after durable obsolete or
 refusal settlement establishes that no work is owed; a refusal settles as an
 `errored` execution, and an unavailable authority store answers non-2xx. A
+retained admission records the exact generation, source, selected policy and
+full member identities, including terminal refusals that never become runnable.
+Interrupted handoff must remain distinguishable from complete retained membership;
+neither an observed subset nor delayed older records can define a complete or
+newer current set. The existing verification input/event family retains these
+facts under existing tenant/Card/Verifier/payload read authorization, without
+a new SQL evidence ledger or history service. A
 redelivery of an accepted generation that is still current and not
 deactivated re-stages the stored pins, never a newer policy; a newer source
 is admitted under the selected policy instead, and a closed or draft pull
@@ -2691,9 +2751,10 @@ owner scans the App's delivery log and asks GitHub to redeliver each delivery
 without a 2xx attempt until a bounded number of redeliveries is logged;
 replicas scanning at once may each ask, and shutdown abandons a scan still
 waiting on GitHub. Reading a pull request's execution, or its progress and
-publications, needs `cards:read` in addition to `verifier:read` on its exact
-Verifier, decided from the queue row or, once that is gone, the accepted
-input record's origin.
+publications, needs read on its retained Repository authorization parent,
+without separate exact-Verifier read or GitHub configuration access. The trusted
+parent survives in accepted records independently of the queue row; apply
+sensitive-content checks before returning membership or counts.
 
 A `pull_request` execution's results reach GitHub in the background once the
 runner settles or parks it, and again for every current pull request
@@ -2886,6 +2947,22 @@ registration takes its Card name from the provider repository name; later
 declarations keep that family through a provider rename, and declaring the
 same `repository_id` under a second name is refused with
 `WYRD_REGISTRY_409_REPOSITORY_IDENTITY_CONFLICT`.
+
+Repository Card grants address tenant + kind + Card family name, or one exact
+version UID. Family read includes current/future versions and retained reviews,
+review sets, member executions and evidence, including for custom roles; it does
+not require separate referenced-Verifier read or GitHub connection permission.
+Starting fresh work, policy authoring and approvals require their own action
+grants; approvals also require parent visibility. Opening a referenced Card's
+definition requires independent read. Sensitive-content controls still apply.
+
+The connected provider repository determines what Wyrd can fetch, not who can
+read retained Wyrd data. Connection configuration pages, installation inventory
+and UI/HTTP operations require admin or explicit GitHub-configuration permission
+in Rust. That permission confers neither OIDC administration nor data read;
+Repository grants confer no connection administration. Retained reads require no
+GitHub request and survive disconnect; new PR work retains provider availability,
+selected declaration authority and webhook checks.
 
 `status.repository` projects the server-managed `full_name`, whether this
 version is `selected`, and the family's `selected_version`. Adding repository

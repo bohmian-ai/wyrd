@@ -438,7 +438,8 @@ typed columns:
   second verdict. It is staged with its summary in one write, before it.
 - `bifrost.verification.execution_inputs` holds each execution's one input
   record and its closed `origin`: `direct` (`verify`), `submitted`
-  (`submit`), `group`, or `schedule`. The `inputs` Variant holds the named
+  (`submit`), `group`, `schedule`, or `pull_request`. The `inputs` Variant holds
+  the named
   input declarations (JSON values, file digests, Artifact and trace
   references) for `direct` and `submitted`, and an internal selector for
   `group` and `schedule`. A group selector records its half-open
@@ -448,8 +449,9 @@ typed columns:
   selected observation `record_id`s. Selectors reference live logical rows,
   never copy their values, and are resolved on every execution, retry, and
   read. The server-owned `queue_execution` marker is true for every queued
-  origin, `submitted`, `group`, and `schedule`, and false for `direct`; only
-  a marked row's acknowledgement admits queued work. A `submitted` row's
+  origin, `submitted`, `group`, `schedule`, and `pull_request`, and false for
+  `direct`; only a marked row's acknowledgement admits queued work. A refused
+  PR member's retained input never activates its terminal queue row. A `submitted` row's
   `activation` holds the accepted route overrides, idempotency key, request
   digest, and authority.
   Its published input timestamp is `recorded_at`, the server-recorded input
@@ -476,6 +478,15 @@ typed columns:
     terminal decision and its result rows; the runner retains that terminal state
     in memory until then. There is no execution-head table, separate finalizer or
     second writer. Existing inputs/results/outputs retain their meanings.
+  - PR admission retains its exact generation/source/selected-policy and frozen
+    member identities through existing verification input/event records,
+    including terminal admission refusals. Accepted explicit Wyrd rerequest keys
+    identify that generation across retries, restart and later policy/source
+    changes. Incomplete handoff visibility stays distinguishable from complete
+    membership; the retained records are not another verdict. Existing tenant,
+    trusted Repository-parent and sensitive-payload checks govern reads before
+    counts/member disclosure; no separate referenced-Verifier read is required. PostgreSQL coordinates admission; it is not the
+    sole custody of this history. No additional table or storage family is added.
   - A pull request extraction's output, with its exact pinned source and
     selected context, is retained as ordinary step output in the queued
     execution's checkpoint revisions and result rows. Recovery reuses it from
@@ -2170,28 +2181,56 @@ refused for any
 other table, and for the reserved system tenant unless the table is
 `bifrost.system.audit_log`. Sensitive-column metadata remains descriptive; table query
 permission governs every column, including GenAI fields stored on trace spans,
-except that a projection reaching the `bifrost.gateway.calls` request or response
-payload columns also requires the tenant-wide gateway payload-read permission.
+except that any use of `bifrost.gateway.calls` request or response payload
+columns, including predicates, also requires explicit gateway payload-read
+permission. Gateway records retain their deployment boundary. Audit history
+requires explicit tenant audit read; a table grant alone is insufficient for
+these protected records.
 
-Bifrost query permissions carry an object axis. A `bifrost_query:read` grant is
-scoped either to every object (`all`) or to a named Bifrost object: a
-`{ catalog, schema }` schema scope, or a
-`{ catalog, schema, table_uid }` table scope keyed by the existing Bifrost
-`TableUid`. A query names no tables until it is planned, so `POST /v1/query`
-admits on the coarse operation capability only, and the authoritative object
-decision runs inside the Oracle once `pin_cut` has resolved the complete
-`PinnedSealedTable` set — before provider registration, physical planning,
-admission charging, read-audit acceptance, peer dispatch, or any source read.
-Every resolved table, including tables reached only through a join or an
-expansion, must be covered; one uncovered table denies the whole query with
-`WYRD_VALA_403_QUERY_FORBIDDEN` and streams no rows.
+Bifrost query authorization uses current server-cached account grants and all
+applicable signed/credential/delegation ceilings, under the
+[authorization freshness contract](wyrd-security-posture.md#current-authority-and-freshness).
+Native Gate admission and hosted/peer Oracle execution require this resolved
+caller context; signature verification alone grants no access. Warm permission
+checks do no catalog or permission SQL and never re-expand roles or groups.
 
-The permission digest bound into every stage assignment is derived from the
-approved scoped permission together with the exact authorized table identities,
-so a worker cannot execute against a wider object set than the leader approved.
-This is object-scoped RBAC — a static role grant over named objects — and adds
-no grant table, policy lookup, query-path database lookup, cache, or second
-checker.
+A `bifrost_query:read` grant carries All, schema `{ catalog, schema }`, or exact
+`{ catalog, schema, table_uid }` scope. Ordinary user tables and unattributed
+telemetry retain this table boundary. `POST /v1/query` initially admits on coarse
+operation capability; Oracle resolves all source identities in the pinned cut
+before provider registration, physical planning, charging, read-audit acceptance,
+peer dispatch or source IO. Every source in a mixed query needs applicable
+source authority; one uncovered source refuses the query with
+`WYRD_VALA_403_QUERY_FORBIDDEN` and no rows. Card-scoped authorized reads/queries
+of managed verification data additionally use the retained parent boundary;
+a table grant alone never unlocks another Card's managed rows.
+
+Managed verification records in execution_inputs, execution_outputs,
+execution_events, results, evidence and approvals retain a trusted exact/family
+authorization parent from acceptance. Ordinary verification uses its subject;
+subjectless direct verification uses the Verifier; PR work and its members use
+the Repository. Server-owned capture/writers retain this identity through normal
+retry/recovery and Card/queue deletion. Caller labels, current shared Verifier
+membership and historical principal authority cannot supply it. Access parents
+never replace owning workload_uid, subject, Verifier or principal/actor identity.
+
+Oracle installs managed-row visibility at the source boundary before user
+expressions, aggregates, counts, search or pagination. Apply it identically to
+memtables, Parquet, joins, views, subqueries, live fragments and peer execution.
+Family grants cover retained history; exact grants follow only their validated
+UID. Unknown/unprovable parents are hidden, including from admin reads, rather
+than guessed. Fixed internal statements returning caller-visible data preserve
+the same boundary; they cannot expose more through SYSTEM's storage access.
+No arbitrary row-policy language for user tables is introduced.
+
+Each distributed assignment's permission digest binds verified tenant, current
+authorization revision, applicable ceilings, exact source identities and managed
+row boundary. Workers validate this context against trusted query state before
+plan decode/source access. Peer identity, cached plans, reusable query state and
+pagination never enlarge the caller's boundary. Current authority and freshness
+are revalidated before subsequent stream output; loss stops further output.
+Permission and audit mechanics remain the one shared checker and nonblocking
+process Scribe outbox, not a second policy service or query-path role lookup.
 
 There is no `WarehouseCard`, `wyrd.warehouse` compatibility surface,
 asynchronous query-job API, result polling/redirect protocol, or client-selected

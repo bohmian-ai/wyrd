@@ -282,6 +282,11 @@ datafusion-distributed = { git = "https://github.com/bohmian-ai/datafusion-distr
 # Parquet read planner, and field-id column resolution) replaces these crates for every consumer, including the
 # iceberg, compaction, and distributed git dependencies.
 [patch.crates-io]
+# sqlparser 0.63.0 plus one commit: `Parser::parse_joins` takes the crate's own
+# recursive-protection guard. It sits on the query-to-join recursion path and
+# calls itself for nested joins, and without the guard a nested derived-table
+# query overran the stack before the recursion limit refused it.
+sqlparser = { git = "https://github.com/bohmian-ai/datafusion-sqlparser-rs", rev = "016ff514f2c0aa18b7a97b6d4c63ed89b9aa052d" }
 # Monty 1.6.0 plus Wyrd's fork commits: monty-proto's `worker-core` feature builds the
 # worker without the ty/ruff type checker, and worker hosts report memory in a
 # `MemorySample` event that the pool reads outside turns, including from idle

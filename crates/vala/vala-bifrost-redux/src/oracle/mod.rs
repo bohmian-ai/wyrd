@@ -5983,6 +5983,104 @@ mod tests {
         );
     }
 
+    /// Validates `sql` once on each of a run of small thread stacks.
+    ///
+    /// The parser grows its stack only at guarded functions, so whether an
+    /// unguarded stretch overruns depends on how much stack is left when it
+    /// starts. Stepping the stack size moves that offset across the parser's
+    /// whole guard margin; each run parses, resolves the statement's tables and
+    /// drops it on the small stack.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a thread cannot start or its validation panics. A stack
+    /// overrun ends the test process instead.
+    fn validate_on_constrained_stacks(sql: &str) -> Vec<Result<Vec<String>, BifrostError>> {
+        const KIB: usize = 1024;
+        (192 * KIB..=448 * KIB)
+            .step_by(4 * KIB)
+            .map(|stack| {
+                let sql = sql.to_owned();
+                std::thread::Builder::new()
+                    .stack_size(stack)
+                    .spawn(move || {
+                        parse_select(&sql)
+                            .map(|(_, tables)| tables.iter().map(TableRef::fqn).collect())
+                    })
+                    .expect("parser thread starts")
+                    .join()
+                    .expect("validation returns instead of panicking")
+            })
+            .collect()
+    }
+
+    /// `depth` SELECTs, each reading the one inside it as a derived table.
+    fn nested_derived_tables(depth: usize) -> String {
+        (0..depth).fold(
+            "SELECT n FROM bifrost.bifrost.spans".to_owned(),
+            |inner, level| format!("SELECT n FROM ({inner}) AS t{level}"),
+        )
+    }
+
+    /// The Verify discovery query that once overran the parser's stack
+    /// validates on every constrained stack and reads its three tables.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any stack size refuses the query or resolves other tables.
+    #[test]
+    fn nested_verify_discovery_query_validates_on_constrained_stacks() {
+        for tables in validate_on_constrained_stacks(include_str!("verify_discovery_nested.sql")) {
+            assert_eq!(
+                tables.expect("the discovery query validates"),
+                [
+                    "bifrost.verification.execution_events",
+                    "bifrost.verification.execution_inputs",
+                    "bifrost.verification.results",
+                ]
+            );
+        }
+    }
+
+    /// Derived tables and parenthesized joins nested below the parser's
+    /// recursion limit validate on every constrained stack.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any stack size refuses either query.
+    #[test]
+    fn nested_derived_tables_and_joins_validate_on_constrained_stacks() {
+        let joins = (0..12).fold("bifrost.bifrost.spans s".to_owned(), |inner, level| {
+            format!("({inner} JOIN bifrost.bifrost.observations o{level} ON true)")
+        });
+        for sql in [nested_derived_tables(12), format!("SELECT 1 FROM {joins}")] {
+            for tables in validate_on_constrained_stacks(&sql) {
+                tables.unwrap_or_else(|error| panic!("{sql} must validate: {error}"));
+            }
+        }
+    }
+
+    /// Nesting past the parser's recursion limit, and malformed SQL, are
+    /// refused as invalid SQL on every constrained stack; neither ends the
+    /// process.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any stack size accepts either query or refuses it with
+    /// another error.
+    #[test]
+    fn over_nested_and_malformed_sql_are_refused_on_constrained_stacks() {
+        let malformed = format!("{} WHERE", nested_derived_tables(12));
+        for sql in [nested_derived_tables(200), malformed] {
+            for refusal in validate_on_constrained_stacks(&sql) {
+                assert!(
+                    matches!(refusal, Err(BifrostError::QueryInvalidSql { .. })),
+                    "{sql} must be invalid SQL, got {refusal:?}"
+                );
+            }
+        }
+    }
+
     /// Late execution failure produces one closed failed terminal carrying
     /// the catalog error's exact problem.
     #[test]

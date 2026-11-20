@@ -288,8 +288,8 @@ impl GithubConnections<'_> {
     /// under `key`, and return the accepted generation and every member
     /// once each is durably admitted or settled.
     ///
-    /// The caller needs `cards:read`, then `verifier:read` and
-    /// `verifier:run` on every selected Verifier; members still run under
+    /// The caller needs `cards:read`, then `verifier:run` on every selected
+    /// Verifier; members still run under
     /// the selecting declaration's accountable authority. A distinct key
     /// admits a new generation even at the PR's unchanged source and
     /// supersedes the older one. A retry of the same key for the same PR,

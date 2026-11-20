@@ -4,9 +4,10 @@
 //! without a queue row, and a direct execution, which has no state, from its
 //! published `direct` input record and result. The Verifier is the queue
 //! row's while one exists, else the one the state or the direct result
-//! recorded, and `verifier:read` is authorized on exactly that Verifier
-//! before anything is returned, so a grant scoped to one Verifier inspects
-//! only its executions. Invocation and publication history is queued-only: a
+//! recorded. A read authorizes `executions:read` on the execution's trusted
+//! parent before anything is returned, so a grant scoped to one Card family
+//! inspects only its executions, and deleting a Card never hides the
+//! history retained under it. Invocation and publication history is queued-only: a
 //! direct execution has none and those reads answer not found. Cancellation
 //! needs the queue row and authorizes `verifier:run` on its Verifier. An
 //! absent or other-tenant execution is the same not-found.
@@ -44,7 +45,7 @@ use wyrd_spec::verification::{
     PublicationName, TaskId, VerificationExecutionStatus, VerificationVerdict,
 };
 use wyrd_sql::TenantConn;
-use wyrd_sql::queries::cards::get_card_by_uid;
+use wyrd_sql::queries::cards::get_card_for_reconciliation;
 use wyrd_sql::queries::verifier_executions::ExecutionStatus;
 use wyrd_storage::error::StorageError;
 use wyrd_storage::tenant_path::ValidatedPath;
@@ -685,12 +686,15 @@ impl<'a> VerificationControl<'a> {
     }
 
     /// The result and exact identity of direct execution `execution_id`
-    /// from its published `found` summary, reading both Cards, deleted ones
-    /// included, in the caller's tenant.
+    /// from its published `found` summary, reading both Cards in the
+    /// caller's tenant with their retained tombstones, so a deleted subject
+    /// or Verifier keeps the execution's exact original identity. Public Card
+    /// reads still hide deleted definitions.
     ///
     /// # Errors
     /// Returns [`WyrdError::VerificationExecutionNotFound`] when either Card
-    /// is gone, and a registry error when a read fails.
+    /// was never registered in the tenant, and a registry error when a read
+    /// fails.
     async fn direct_identity(
         &self,
         caller: &Caller,
@@ -701,7 +705,7 @@ impl<'a> VerificationControl<'a> {
             .state
             .registry_tenant_conn(caller.data_tenant_id)
             .await?;
-        let mut card = async |uid| match get_card_by_uid(&mut conn, uid).await {
+        let mut card = async |uid| match get_card_for_reconciliation(&mut conn, uid).await {
             Ok(row) => Ok(exact_ref(&row)),
             Err(WyrdError::RegistryCardNotFound { .. }) => Err(execution_not_found(execution_id)),
             Err(error) => Err(error),
@@ -862,8 +866,8 @@ impl<'a> VerificationControl<'a> {
     ///
     /// Cloud backends answer with a presigned URL. The local backend has
     /// none, so its plan points at [`Self::content`]'s root-relative route,
-    /// which authorizes `verifier:read` again rather than the Card read the
-    /// local blob route requires.
+    /// which authorizes `executions:read` on the trusted parent again rather
+    /// than the Card read the local blob route requires.
     ///
     /// # Errors
     /// The errors of [`Self::file`] and the storage planning error.

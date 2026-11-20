@@ -260,6 +260,78 @@ async fn direct_verification_avoids_execution_coordination() {
     assistant.deployment.shutdown().await;
 }
 
+/// A direct execution keeps its retained status after its subject Card is
+/// deleted, and again after its Verifier is deleted: the administrator and a
+/// reader of the subject's family read the same outcome and its details, and
+/// a reader of another family still cannot tell it from an unknown
+/// execution.
+///
+/// # Panics
+/// Panics when a verify, flush or delete fails, the retained execution stops
+/// reading back, or the other family's refusal is not `EXECUTION_NOT_FOUND`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lane"]
+async fn a_direct_execution_survives_deleting_its_cards() {
+    use wyrd_ai::cards::CardSelector;
+
+    let assistant = Assistant::start().await;
+    let deployment = &assistant.deployment;
+    let result = assistant
+        .state()
+        .await
+        .run_for_card("agent")
+        .expect("agent run opens")
+        .observe()
+        .verify("answer-check", json!("yes"))
+        .await
+        .expect("the answer is judged");
+    deployment.server().flush_bifrost().await.expect("rows publish");
+    let reader = |family: String| async move {
+        let grants = [json!({"resource": "executions", "action": "read", "scope": {"card": {
+            "family": {"kind": "Agent", "name": family}
+        }}})];
+        let key = deployment
+            .granted_key(&format!("retained_{family}").replace('-', "_"), &grants)
+            .await;
+        deployment.client(&key)
+    };
+    let family = reader(assistant.agent.name.to_string()).await;
+    let unrelated = reader("unrelated-agent".to_owned()).await;
+    let cards = deployment.cards().await;
+    // The assistant Service references the Agent, so it goes first.
+    cards
+        .delete(CardSelector::Exact(assistant.service.clone()))
+        .await
+        .expect("the referencing Service deletes");
+
+    for deleted in [assistant.agent.clone(), assistant.answer_check.clone()] {
+        cards
+            .delete(CardSelector::Exact(deleted.clone()))
+            .await
+            .expect("the Card deletes");
+        for client in [deployment.admin(), family.clone()] {
+            let retained = Execution::connect_with(result.execution_id, &client)
+                .await
+                .expect("the retained execution connects");
+            let read = retained.wait(WAIT).await.expect("its outcome reads back");
+            assert_eq!(read, result, "after deleting {}", deleted.name);
+            retained.details().await.expect("its details read back");
+        }
+        let hidden = Execution::connect_with(result.execution_id, &unrelated)
+            .await
+            .expect("the handle connects")
+            .status()
+            .await;
+        assert_eq!(
+            refused(hidden),
+            "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND",
+            "after deleting {}",
+            deleted.name
+        );
+    }
+    assistant.deployment.shutdown().await;
+}
+
 /// The `code` of a refused call.
 ///
 /// # Panics

@@ -1,5 +1,15 @@
 # GitHub Verifier pipelines
 
+## UI query and hot-read optimization — proposed supplement
+
+The maintainer requested the [UI query audit and hot-read proposal](ui-hot-read-latency.md)
+for TASK-004B in this UI worktree and TASK-012-R2 in task-004. TASK-012-R2 first
+adds the exact UI SQL L1 scenario and records the original baseline, then changes
+shared hot execution; TASK-004B consolidates page queries. This explicitly adds
+UI work to this packet despite the older non-goal below. Prior agreements remain
+intact. The supplement is exploring, pending agreement, and does not approve
+implementation or replace historical remediation tasks.
+
 Status: exploring (direct-cache eligibility refinement; agreed remediation retained)
 
 ## Direct cache eligibility

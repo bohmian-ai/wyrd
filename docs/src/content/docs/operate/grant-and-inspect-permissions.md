@@ -44,6 +44,18 @@ A bind is idempotent: binding the same role at the same scope again returns the 
 
 The change reaches running servers within about 5 seconds, including on credentials and tokens the principal already holds; nothing needs to sign in again or renew a token. Removing one binding leaves any other binding that grants the same access, such as `admin:all` or a group or identity-provider binding. A provider binding cannot be removed here; change the group mapping instead.
 
+## In the UI
+
+**Settings**, then **Access**, does the same work in the browser for a signed-in tenant administrator. It has four tabs:
+
+- **Users** and **Service accounts** list the accounts. Select one to see each binding with its role, scope and source, and the combined permissions. Grant a role at a scope there, or remove a direct binding. A new Service account's key, and each key you issue later, is shown once.
+- **Roles** lists the built-in roles and creates, edits and deletes custom ones.
+- **Groups** creates groups, changes their members, and grants a group a role at a scope. Members inherit it.
+
+No scope is preselected. A Card family covers every version of that Card, including later ones; an exact version covers only that one. A grant the server refuses saves nothing.
+
+A person who opens a page they have no access to sees **Copy access request**. It copies their account, the tenant, the action and the link they opened, for them to send you in your own channel. Wyrd sends nothing and keeps no record of it, and the text is the same whether the target is hidden or does not exist.
+
 ## 3. Cut a principal off
 
 To stop a principal entirely, suspend it:

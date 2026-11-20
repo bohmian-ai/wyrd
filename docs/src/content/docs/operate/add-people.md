@@ -195,7 +195,9 @@ You can also create the User yourself. The password is read from standard input,
 wyrd principal user create --username alice --grant editor:all < alice-password.txt
 ```
 
-Either way, the account holds exactly the grants you named, and each `--grant` names its scope. The person then signs in from a terminal with `wyrd auth login --server https://wyrd.example.com --tenant acme`, signs in with their password in the browser, and approves the code the CLI shows. Revoke the account with `wyrd principal revoke` when they leave.
+In the UI, **Settings**, then **Access**, then **Users** issues the same invitation: choose a role and a scope, and the page shows the code and signup URL once.
+
+Either way, the account holds exactly the grants you named, and each `--grant` names its scope. The person then signs in from a terminal with `wyrd auth login --server https://wyrd.example.com --tenant acme`, signs in with their password in the browser, and approves the code the CLI shows. The approval page opens at the address they use for the Wyrd UI when the server runs behind it. Revoke the account with `wyrd principal revoke` when they leave.
 
 ## If it fails
 

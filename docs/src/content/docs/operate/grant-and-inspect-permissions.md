@@ -38,58 +38,7 @@ wyrd principal access revoke --binding <binding-id>
 
 `grant` prints the binding: its ID, `role:scope`, subject, and source. `revoke` takes that binding ID, which `show` also lists.
 
-The same calls from an SDK:
-
-<LangTabs langs={['python', 'rust', 'typescript']}>
-<LangTab lang="python">
-
-```python
-from wyrd.auth import Principals
-
-principals = Principals()
-binding = principals.bind(
-    {"subject": {"principal": {"id": principal_id, "kind": "service"}}, "role": "editor", "scope": "all"}
-)
-print([(grant["role"], grant["source"]["kind"]) for grant in principals.access(principal_id)["grants"]])
-principals.unbind(binding["id"])
-```
-
-</LangTab>
-<LangTab lang="rust">
-
-```rust
-use wyrd_ai::auth::{BindingSubject, CreateRoleBindingRequest, PermissionScope, PrincipalKindTag, Principals};
-
-let principals = Principals::connect().await?;
-let binding = principals
-    .bind(&CreateRoleBindingRequest {
-        subject: BindingSubject::Principal { id: principal_id, kind: PrincipalKindTag::Service },
-        role: "editor".to_owned(),
-        scope: PermissionScope::All,
-    })
-    .await?;
-println!("{:?}", principals.access(&principal_id).await?.grants);
-principals.unbind(&binding.id).await?;
-```
-
-</LangTab>
-<LangTab lang="typescript">
-
-```typescript
-import { Principals } from "wyrd-ai";
-
-const principals = await Principals.connect();
-const binding = await principals.bind({
-  subject: { principal: { id: principalId, kind: "service" } },
-  role: "editor",
-  scope: "all",
-});
-console.log((await principals.access(principalId)).grants);
-await principals.unbind(binding.id);
-```
-
-</LangTab>
-</LangTabs>
+Every SDK's `Principals` handle makes the same three calls, `bind`, `access`, and `unbind`, with the same request fields, and so do the `principals.bind`, `principals.access`, and `principals.unbind` [MCP tools](/reference/mcp-tools/#principal-access).
 
 A bind is idempotent: binding the same role at the same scope again returns the same binding.
 

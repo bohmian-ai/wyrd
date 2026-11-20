@@ -3798,7 +3798,7 @@ Page: /wyrd/operate/add-people/
 
 > Connect your identity provider, such as Okta or Keycloak, so people sign in to Wyrd, then grant them roles.
 
-People sign in to Wyrd through your organization's identity provider, such as Okta or Keycloak. Wyrd stores no passwords and has no invite step: a person's account is created the first time they sign in. A new account holds no role until you grant one.
+People sign in to Wyrd with a local username and password, or through your organization's identity provider, such as Okta or Keycloak. This guide connects a provider: then a person's account is created the first time they sign in, and it holds no role until you grant one. To add people without a provider, see [Without an identity provider](#without-an-identity-provider).
 
 You connect the provider once per tenant. Wyrd only trusts a connection after a real test sign-in succeeds, so a typo in the issuer or client ID cannot lock your team out.
 
@@ -3918,7 +3918,7 @@ Each person signs in once from a terminal:
 wyrd auth login --server https://wyrd.example.com --tenant acme
 ```
 
-The browser opens at your provider. After sign-in, the CLI and every SDK on that machine use the saved login. That first sign-in creates their account, which holds no grant yet. As the administrator, find it and bind a role at a scope:
+The browser opens at your provider; they sign in and approve the code the CLI shows. After sign-in, the CLI and every SDK on that machine use the saved login. That first sign-in creates their account, which holds no grant yet. As the administrator, find it and bind a role at a scope:
 
 ```bash
 wyrd principal list --kind user --email alice@example.com
@@ -3958,13 +3958,21 @@ Wyrd recomputes a person's group roles at every sign-in. Remove someone from `wy
 
 ## Without an identity provider
 
-Until you connect a provider, give each person a key on their own account:
+Wyrd keeps local Users of its own, so a team can sign in before or without connecting a provider. As the administrator, invite a person with the grants their account receives:
 
 ```bash
-wyrd principal credential create-principal --name alice --grant editor:all
+wyrd principal user invite --grant viewer:Repository/payments
 ```
 
-They set it as `WYRD_API_KEY`. Each call is audited under that account. The account is a Service account, not a user, and has no browser sign-in. Revoke it with `wyrd principal revoke` when they leave.
+The command prints an `invitation_code` and a `signup_url`, and shows the code only this once. Deliver the code separately. The person opens the signup URL, enters the code, and chooses a username and password. Each code works once and expires.
+
+You can also create the User yourself. The password is read from standard input, so it never enters the command line or your shell history:
+
+```bash
+wyrd principal user create --username alice --grant editor:all < alice-password.txt
+```
+
+Either way, the account holds exactly the grants you named, and each `--grant` names its scope. The person then signs in from a terminal with `wyrd auth login --server https://wyrd.example.com --tenant acme`, signs in with their password in the browser, and approves the code the CLI shows. Revoke the account with `wyrd principal revoke` when they leave.
 
 ## If it fails
 
@@ -4068,52 +4076,7 @@ wyrd principal access revoke --binding <binding-id>
 
 `grant` prints the binding: its ID, `role:scope`, subject, and source. `revoke` takes that binding ID, which `show` also lists.
 
-The same calls from an SDK:
-
-**Python**
-
-```python
-from wyrd.auth import Principals
-
-principals = Principals()
-binding = principals.bind(
-    {"subject": {"principal": {"id": principal_id, "kind": "service"}}, "role": "editor", "scope": "all"}
-)
-print([(grant["role"], grant["source"]["kind"]) for grant in principals.access(principal_id)["grants"]])
-principals.unbind(binding["id"])
-```
-
-**Rust**
-
-```rust
-use wyrd_ai::auth::{BindingSubject, CreateRoleBindingRequest, PermissionScope, PrincipalKindTag, Principals};
-
-let principals = Principals::connect().await?;
-let binding = principals
-    .bind(&CreateRoleBindingRequest {
-        subject: BindingSubject::Principal { id: principal_id, kind: PrincipalKindTag::Service },
-        role: "editor".to_owned(),
-        scope: PermissionScope::All,
-    })
-    .await?;
-println!("{:?}", principals.access(&principal_id).await?.grants);
-principals.unbind(&binding.id).await?;
-```
-
-**TypeScript**
-
-```typescript
-import { Principals } from "wyrd-ai";
-
-const principals = await Principals.connect();
-const binding = await principals.bind({
-  subject: { principal: { id: principalId, kind: "service" } },
-  role: "editor",
-  scope: "all",
-});
-console.log((await principals.access(principalId)).grants);
-await principals.unbind(binding.id);
-```
+Every SDK's `Principals` handle makes the same three calls, `bind`, `access`, and `unbind`, with the same request fields, and so do the `principals.bind`, `principals.access`, and `principals.unbind` [MCP tools](/wyrd/reference/mcp-tools/#principal-access).
 
 A bind is idempotent: binding the same role at the same scope again returns the same binding.
 

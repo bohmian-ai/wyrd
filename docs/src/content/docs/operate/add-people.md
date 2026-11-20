@@ -6,7 +6,7 @@ section: Operate
 order: 3
 ---
 
-People sign in to Wyrd through your organization's identity provider, such as Okta or Keycloak. Wyrd stores no passwords and has no invite step: a person's account is created the first time they sign in. A new account holds no role until you grant one.
+People sign in to Wyrd with a local username and password, or through your organization's identity provider, such as Okta or Keycloak. This guide connects a provider: then a person's account is created the first time they sign in, and it holds no role until you grant one. To add people without a provider, see [Without an identity provider](#without-an-identity-provider).
 
 You connect the provider once per tenant. Wyrd only trusts a connection after a real test sign-in succeeds, so a typo in the issuer or client ID cannot lock your team out.
 
@@ -136,7 +136,7 @@ Each person signs in once from a terminal:
 wyrd auth login --server https://wyrd.example.com --tenant acme
 ```
 
-The browser opens at your provider. After sign-in, the CLI and every SDK on that machine use the saved login. That first sign-in creates their account, which holds no grant yet. As the administrator, find it and bind a role at a scope:
+The browser opens at your provider; they sign in and approve the code the CLI shows. After sign-in, the CLI and every SDK on that machine use the saved login. That first sign-in creates their account, which holds no grant yet. As the administrator, find it and bind a role at a scope:
 
 ```bash
 wyrd principal list --kind user --email alice@example.com
@@ -181,13 +181,21 @@ Wyrd recomputes a person's group roles at every sign-in. Remove someone from `wy
 
 ## Without an identity provider
 
-Until you connect a provider, give each person a key on their own account:
+Wyrd keeps local Users of its own, so a team can sign in before or without connecting a provider. As the administrator, invite a person with the grants their account receives:
 
 ```bash
-wyrd principal credential create-principal --name alice --grant editor:all
+wyrd principal user invite --grant viewer:Repository/payments
 ```
 
-They set it as `WYRD_API_KEY`. Each call is audited under that account. The account is a Service account, not a user, and has no browser sign-in. Revoke it with `wyrd principal revoke` when they leave.
+The command prints an `invitation_code` and a `signup_url`, and shows the code only this once. Deliver the code separately. The person opens the signup URL, enters the code, and chooses a username and password. Each code works once and expires.
+
+You can also create the User yourself. The password is read from standard input, so it never enters the command line or your shell history:
+
+```bash
+wyrd principal user create --username alice --grant editor:all < alice-password.txt
+```
+
+Either way, the account holds exactly the grants you named, and each `--grant` names its scope. The person then signs in from a terminal with `wyrd auth login --server https://wyrd.example.com --tenant acme`, signs in with their password in the browser, and approves the code the CLI shows. Revoke the account with `wyrd principal revoke` when they leave.
 
 ## If it fails
 

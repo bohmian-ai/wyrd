@@ -3052,3 +3052,52 @@ test('an administrator creates a runtime Service account in Access, and its one 
     await page.context().close();
   }
 });
+
+test('Access tells an unavailable server apart from a refusal', async ({ ui }) => {
+  // A loopback hop to the server whose access reads fail while `down`, as an unreachable dependency does.
+  let down = false;
+  const hop = createHttpServer((req, res) => {
+    if (down && req.url?.startsWith('/v1/access/')) return void res.writeHead(503).end();
+    const upstream = httpRequest(new URL(req.url ?? '/', ui.serverUrl), { method: req.method, headers: req.headers }, (answer) => {
+      res.writeHead(answer.statusCode ?? 502, answer.headers);
+      answer.pipe(res);
+    });
+    upstream.on('error', () => res.destroy());
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk: Buffer) => chunks.push(chunk));
+    req.on('end', () => upstream.end(Buffer.concat(chunks)));
+  });
+  await new Promise<void>((resolve) => hop.listen(0, '127.0.0.1', resolve));
+  const bff = await startBff(`http://127.0.0.1:${(hop.address() as { port: number }).port}`);
+  const contexts: Page[] = [];
+  try {
+    const admin = await signIn(ui.browser, bff.url, TENANT, ui.adminKey);
+    contexts.push(admin);
+    const reader = await signIn(ui.browser, bff.url, TENANT, ui.readerKey);
+    contexts.push(reader);
+    const access = `${bff.url}/t/${TENANT}/settings/access`;
+    // A person without administration is refused, and offered a request to copy.
+    await reader.goto(access);
+    expect(await reader.locator('main').textContent()).toContain("⊘ You can't administer access for this tenant");
+    expect(await reader.getByRole('button', { name: 'Copy access request' }).count()).toBe(1);
+
+    // The administrator, while the server cannot answer, is told it is unavailable: no refusal, no request to copy, no form.
+    down = true;
+    await admin.goto(access);
+    const unavailable = (await admin.locator('main').textContent()) ?? '';
+    expect(unavailable).toContain('✕ Access administration is unavailable');
+    expect(unavailable).toContain('WYRD_SPEC_502_UPSTREAM_FAILURE');
+    expect(unavailable).not.toContain("You can't administer access");
+    expect(await admin.getByRole('button', { name: 'Copy access request' }).count()).toBe(0);
+    expect(await admin.getByRole('form').count()).toBe(0);
+
+    // Once it answers again the same session administers access.
+    down = false;
+    await admin.reload();
+    expect(await admin.getByRole('form', { name: 'Invite a user' }).count()).toBe(1);
+  } finally {
+    for (const page of contexts) await page.context().close();
+    bff.stop();
+    hop.close();
+  }
+});

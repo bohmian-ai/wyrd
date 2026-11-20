@@ -812,7 +812,7 @@ impl<'a> ResultLayoutJourney<'a> {
                 inner: Arc::clone(&scribe),
                 straddle,
             }),
-            None,
+            Some(self.server.pg_fixture().wyrd_postgres().clone()),
         );
         outbox.stage(
             self.tenant,
@@ -2830,7 +2830,11 @@ impl TypedPayloadJourney {
                 PrincipalId::new(uuid::Uuid::now_v7()),
                 PrincipalKind::User,
                 self.gateway.tenant,
-                PermissionSet::from_iter([permission.clone(), Permission::gateway_payload_read()]),
+                PermissionSet::from_iter([
+                    permission.clone(),
+                    Permission::gateway_payload_read(),
+                    Permission::executions_read_any(),
+                ]),
             ),
             self.gateway.tenant,
             RequestId::now_v7(),
@@ -3346,7 +3350,9 @@ const NEWEST_STATUS_SQL: &str = "SELECT e.execution_id, e.status \
 
 /// One queued-status journey: a bound server, a Service submitter whose SDK
 /// client runs the assertion Verifier against a Service subject over the
-/// public routes, and an administrator who may revoke the submitter.
+/// public routes, and an administrator who may revoke the submitter and who
+/// reads the recorded status, so a read still answers once the submitter is
+/// revoked.
 struct StatusJourney {
     /// The bound server.
     server: WyrdTestServer,
@@ -3387,7 +3393,14 @@ impl StatusJourney {
             )
             .await?;
         server
-            .seed_role(PRINCIPAL_ADMIN, &[Permission::service_accounts_write()])
+            .seed_role(
+                PRINCIPAL_ADMIN,
+                &[
+                    Permission::service_accounts_write(),
+                    Permission::executions_read_any(),
+                    Permission::bifrost_query_read(),
+                ],
+            )
             .await?;
         let submitter = server
             .bootstrap_service(&format!("{name}-submitter"), &[STATUS_RUNNER])
@@ -3480,7 +3493,7 @@ impl StatusJourney {
     /// Returns route errors.
     async fn inspected(&self, execution: ExecutionId) -> Result<Value, ServerJourneyError> {
         let state: Value = self
-            .client
+            .admin
             .request_json(
                 reqwest::Method::GET,
                 &format!("/v1/verification/executions/{execution}"),
@@ -3508,13 +3521,13 @@ impl StatusJourney {
         Ok(())
     }
 
-    /// Every row of `sql`, each cell as text, read through the submitter's
-    /// SDK Bifrost query.
+    /// Every row of `sql`, each cell as text, read through the
+    /// administrator's SDK Bifrost query.
     ///
     /// # Errors
     /// Returns the query or cast error.
     async fn texts(&self, sql: String) -> Result<Vec<Vec<Option<String>>>, ServerJourneyError> {
-        let mut stream = Bifrost::query_only(&self.client)
+        let mut stream = Bifrost::query_only(&self.admin)
             .query(&BifrostQueryRequest {
                 params: Vec::new(),
                 sql,
@@ -3720,7 +3733,8 @@ async fn pending_cancellation_records_cancelled_status() -> Result<(), ServerJou
         Some(subject),
         Some(actor),
     ];
-    expected.extend(std::iter::repeat_n(None, 13));
+    expected.extend(std::iter::repeat_n(None, 11));
+    expected.extend([Some(journey.subject.to_string()), None]);
     expected.push(Some("true".to_owned()));
     expect_eq("the cancelled status row", &rows, &vec![expected])?;
     if journey.inspected(execution).await? != "cancelled" {
@@ -6694,7 +6708,7 @@ async fn visible_trace_spans_preserve_binding_ownership() -> Result<(), ServerJo
             .flatten()
             .all(|requirement| requirement["reason"]
                 .as_str()
-                .is_some_and(|reason| reason.contains("lacks BifrostQuery/Read"))),
+                .is_some_and(|reason| reason.contains("query forbidden"))),
         "the ordinary query refusal decides: {denied}"
     );
 

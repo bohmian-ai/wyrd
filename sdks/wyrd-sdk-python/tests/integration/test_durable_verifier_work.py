@@ -1,8 +1,8 @@
 """A queued execution's invocations and publications read back as stable, authorized pages.
 
 A settled execution lists its one requirement attempt and no publications.
-``verifier:read`` on the exact Verifier reads; ``cards:read`` alone or a grant
-on another Verifier is refused, another tenant sees no such execution, and a
+``executions:read`` on the exact Verifier or tenant-wide ``cards:read`` reads;
+``verifier:run`` alone or a grant on another Verifier is refused, another tenant sees no such execution, and a
 viewer reads but cannot cancel. Cancelling a settled execution keeps its
 status, again and again.
 
@@ -20,11 +20,11 @@ from collections.abc import Callable
 import httpx
 import pytest
 from wyrd import WyrdError, verify
-from wyrd.cards import Cards
+from wyrd.cards import CardRef, Cards
 from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer
 
-from .support import client_of, declare
+from .support import client_of
 
 pytestmark = pytest.mark.integration
 
@@ -36,10 +36,21 @@ DENIED = "WYRD_PERMISSION_403_DENIED_RBAC"
 INVALID = "WYRD_SPEC_400_VALIDATION"
 
 
-def verifier_read(cards: Cards, verifier: str) -> dict[str, object]:
-    """The ``verifier:read`` grant on exactly the registered ``verifier``."""
-    uid = declare(cards, f"cards/verify_in_real_time/{verifier}.yaml")[verifier].uid
-    return {"resource": "verifier", "action": "read", "scope": {"verifier": str(uid)}}
+def executions_read(subject: CardRef) -> dict[str, object]:
+    """The ``executions:read`` grant on exactly the execution's ``subject`` Card."""
+    return {
+        "resource": "executions",
+        "action": "read",
+        "scope": {
+            "card": {
+                "version": {
+                    "kind": subject.kind.name,
+                    "name": subject.name,
+                    "uid": str(subject.uid),
+                }
+            }
+        },
+    }
 
 
 def refused(call: Callable[[], object]) -> str:
@@ -95,13 +106,30 @@ def test_execution_pages_are_stable_and_tenant_scoped(
             "pages_cards", [{"resource": "cards", "action": "read", "scope": "all"}]
         )
     )
-    assert refused(cards_only.invocations) == DENIED
+    assert cards_only.invocations()["execution_id"] == submitted.id
+    run_only = as_key(
+        wyrd_server.scoped_api_key(
+            "pages_run", [{"resource": "verifier", "action": "run", "scope": "all"}]
+        )
+    )
+    assert refused(run_only.invocations) == DENIED
     elsewhere = as_key(
-        wyrd_server.scoped_api_key("pages_elsewhere", [verifier_read(cards, "answer-judged")])
+        wyrd_server.scoped_api_key(
+            "pages_elsewhere",
+            [
+                {
+                    "resource": "executions",
+                    "action": "read",
+                    "scope": {"card": {"family": {"kind": "Service", "name": "elsewhere"}}},
+                }
+            ],
+        )
     )
     assert refused(elsewhere.publications) == DENIED
     exact = as_key(
-        wyrd_server.scoped_api_key("pages_exact", [verifier_read(cards, "answer-check")])
+        wyrd_server.scoped_api_key(
+            "pages_exact", [executions_read(submitted.wait(WAIT_SECONDS).subject)]
+        )
     )
     assert exact.invocations()["items"] == items
     foreign = wyrd_server.bootstrap_service_in_tenant(other_tenant, ["admin"], name="pages-foreign")
@@ -189,7 +217,24 @@ def test_held_execution_reads_and_downloads_its_publications_and_cancels() -> No
                 server,
                 server.scoped_api_key(
                     "held_exact",
-                    [{"resource": "verifier", "action": "read", "scope": {"verifier": verifier}}],
+                    [
+                        {
+                            "resource": "executions",
+                            "action": "read",
+                            "scope": {
+                                "card": {
+                                    "version": {
+                                        "kind": "Service",
+                                        "name": "held-pages-subject",
+                                        "uid": Cards(admin)
+                                        .list(kind="Service", name="held-pages-subject")
+                                        .items[0]
+                                        .uid,
+                                    }
+                                }
+                            },
+                        }
+                    ],
                 ),
             ),
         )

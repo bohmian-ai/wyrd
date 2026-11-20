@@ -1,7 +1,7 @@
 //! Deferred evidence publication: matching a published input to the
 //! Verifiers subscribed to it and accepting it durably for each.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -101,7 +101,8 @@ impl VerificationControl<'_> {
             repository_id,
             commit: request.tags.commit.as_str(),
         };
-        let subscribers = self.subscribers(caller, source, &request).await?;
+        let subjects = self.subscribers(caller, source, &request).await?;
+        let subscribers: Vec<CardUid> = subjects.keys().cloned().collect();
         if let InputDeclaration::File {
             sha256, size_bytes, ..
         } = &request.value
@@ -145,7 +146,7 @@ impl VerificationControl<'_> {
                     caller.attribution(),
                     (source, &request.input),
                     &published,
-                    (&fresh, now),
+                    (&fresh, &subjects, now),
                     deadline,
                 )
                 .await;
@@ -181,7 +182,9 @@ impl VerificationControl<'_> {
     }
 
     /// The Verifier versions subscribed to `request.input` for `source`
-    /// that the caller may run, each conforming to `request.value`.
+    /// that the caller may run, each conforming to `request.value`, mapped
+    /// to the exact subject Card of the work it subscribes for, which is
+    /// the trusted parent its acceptance is retained under.
     ///
     /// # Errors
     /// Returns [`WyrdError::VerificationEvidenceUnmatched`] when no Verifier
@@ -193,7 +196,7 @@ impl VerificationControl<'_> {
         caller: &Caller,
         source: EvidenceSource<'_>,
         request: &PublishEvidenceRequest,
-    ) -> Result<Vec<CardUid>, WyrdError> {
+    ) -> Result<BTreeMap<CardUid, CardUid>, WyrdError> {
         let tenant = caller.data_tenant_id;
         let mut conn = self
             .state
@@ -241,9 +244,9 @@ impl VerificationControl<'_> {
             }
             _ => None,
         };
-        let (mut kept, mut refused) = (BTreeSet::new(), None);
+        let (mut kept, mut refused) = (BTreeMap::new(), None);
         for (verifier, subject) in candidates {
-            if kept.contains(&verifier) {
+            if kept.contains_key(&verifier) {
                 continue;
             }
             let target = self
@@ -286,7 +289,7 @@ impl VerificationControl<'_> {
                     .await
                     .map_err(nonconforming)?;
             }
-            kept.insert(verifier);
+            kept.insert(verifier, subject);
         }
         if kept.is_empty() {
             return Err(refused.unwrap_or_else(|| WyrdError::VerificationEvidenceUnmatched {
@@ -301,7 +304,7 @@ impl VerificationControl<'_> {
                 }),
             }));
         }
-        Ok(kept.into_iter().collect())
+        Ok(kept)
     }
 
     /// Make the queued consumers of `verifiers` for `source` due now. A

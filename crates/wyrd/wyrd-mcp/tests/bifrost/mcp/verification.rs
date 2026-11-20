@@ -1282,13 +1282,10 @@ mod pg_tests {
         agent_client.cancel().await?;
 
         server
-            .seed_role(
-                "mcp_cards_only",
-                &[Permission::card_read(), Permission::verifier_run_any()],
-            )
+            .seed_role("mcp_runs_only", &[Permission::verifier_run_any()])
             .await?;
         let scoped = server
-            .bootstrap_service("mcp-scored-cards-only", &["mcp_cards_only"])
+            .bootstrap_service("mcp-scored-runs-only", &["mcp_runs_only"])
             .await?;
         let scoped_client = connect(&server, &scoped).await?;
         let denied = refusal(
@@ -3569,7 +3566,7 @@ mod pg_tests {
                     "i-query",
                     "bifrost.query",
                     serde_json::json!({
-                        "sql": "SELECT execution_id FROM bifrost.verification.results LIMIT 1",
+                        "sql": "SELECT name FROM bifrost.traces.spans LIMIT 1",
                         "max_rows": 1,
                     }),
                 ),
@@ -3644,6 +3641,12 @@ mod pg_tests {
     /// The stable code of a permission denial.
     const DENIED: &str = "WYRD_PERMISSION_403_DENIED_RBAC";
 
+    /// The stable code of a query the caller may make but whose table no
+    /// grant covers: Card read admits the query surface for managed
+    /// verification rows, and an ordinary telemetry table still needs its
+    /// own query grant.
+    const QUERY_FORBIDDEN: &str = "WYRD_VALA_403_QUERY_FORBIDDEN";
+
     /// Every tool call the drafter made, from its execution's `described`
     /// details.
     fn drafted(described: &JsonValue) -> Vec<JsonValue> {
@@ -3673,10 +3676,10 @@ mod pg_tests {
     /// the same review with every drafter call denied, returning nothing and
     /// publishing nothing. A Service granted every tool but not
     /// `bifrost_query:read` runs `tool-review`: its investigator reads the
-    /// Card, and its `bifrost.query` is denied and returns nothing. Each
-    /// invalid tool selection is refused at
+    /// Card, and its `bifrost.query` of a telemetry table is forbidden and
+    /// returns nothing. Each invalid tool selection is refused at
     /// registration and never reaches the model, and a caller holding only
-    /// `cards:read` is denied the publication.
+    /// `verifier:run` is denied the publication.
     ///
     /// # Errors
     ///
@@ -3712,7 +3715,7 @@ mod pg_tests {
             .seed_role("mcp_desk_tools", &[Permission::tool_invoke_any()])
             .await?;
         server
-            .seed_role("mcp_desk_cards", &[Permission::card_read()])
+            .seed_role("mcp_desk_runs", &[Permission::verifier_run_any()])
             .await?;
         let admin = server
             .bootstrap_service("mcp-desk-admin", &["admin"])
@@ -3980,7 +3983,7 @@ mod pg_tests {
                     call["tool"].as_str().unwrap_or_default().to_owned(),
                     call["error"]
                         .as_str()
-                        .is_some_and(|error| error.contains(DENIED)),
+                        .is_some_and(|error| error.contains(QUERY_FORBIDDEN)),
                     call["returned_bytes"]
                         .as_u64()
                         .is_some_and(|bytes| bytes > 0),
@@ -4034,7 +4037,7 @@ mod pg_tests {
         );
 
         let reader = server
-            .bootstrap_service("mcp-desk-cards", &["mcp_desk_cards"])
+            .bootstrap_service("mcp-desk-runs", &["mcp_desk_runs"])
             .await?;
         let reader = connect(&server, &reader).await?;
         let denied = refusal(
@@ -5348,7 +5351,8 @@ mod pg_tests {
 
     /// Each of `calls` as its recipient, tool, and whether it delivered
     /// output, after asserting a delivering call has a digest and bytes and
-    /// a refused one has neither and names [`DENIED`].
+    /// a refused one has neither and names [`QUERY_FORBIDDEN`], the only
+    /// refusal these records hold.
     ///
     /// # Errors
     ///
@@ -5375,7 +5379,10 @@ mod pg_tests {
                         "{call}"
                     );
                 } else {
-                    assert!(call["error"].to_string().contains(DENIED), "{call}");
+                    assert!(
+                        call["error"].to_string().contains(QUERY_FORBIDDEN),
+                        "{call}"
+                    );
                     assert_eq!(
                         (call.get("output_sha256"), &call["returned_bytes"]),
                         (None, &serde_json::json!(0)),
@@ -5614,7 +5621,7 @@ mod pg_tests {
                     ("bifrost.query", false),
                     ("cards.get", true),
                 ][..],
-                format!("query {DENIED} repaired True"),
+                format!("query {QUERY_FORBIDDEN} repaired True"),
             ),
             (
                 &granted,

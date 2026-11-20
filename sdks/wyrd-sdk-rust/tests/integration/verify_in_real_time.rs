@@ -29,7 +29,7 @@ use wyrd_ai::{
     Bifrost, CallProvenance, Citation, ExecutionId, Gateway, GroupId, Locator, RequirementOutcome,
     SpanRecord, VerificationVerdict, WyrdClient, WyrdError,
 };
-use wyrd_spec::auth::RevokePrincipalRequest;
+use wyrd_spec::auth::{BifrostPermissionScope, BifrostSchemaScope, RevokePrincipalRequest};
 use wyrd_spec::ids::BindingId;
 use wyrd_spec::verification::execution::VerificationExecutionState;
 use wyrd_spec::verification::{VerificationExecutionStatus, VerifierReadiness};
@@ -2217,15 +2217,23 @@ async fn grouped_coding_uses_declared_sources() {
                 all("bifrost_record", "write"),
                 all("tool", "invoke"),
                 all("gateway", "invoke"),
-                json!({
-                    "resource": "bifrost_query",
-                    "action": "read",
-                    "scope": { "bifrost": { "schema": { "catalog": "bifrost", "schema": "verification" } } },
-                }),
             ],
         )
         .await
         .expect("role seeds");
+    deployment
+        .server()
+        .seed_role(
+            "verification_query",
+            &[json!({ "resource": "bifrost_query", "action": "read", "scope": "all" })],
+        )
+        .await
+        .expect("role seeds");
+    let verification_schema =
+        PermissionScope::Bifrost(BifrostPermissionScope::Schema(BifrostSchemaScope {
+            catalog: "bifrost".to_owned(),
+            schema: "verification".to_owned(),
+        }));
     let mut after = judged.execution_id;
     for (granted, revoked, denial) in [
         (None, "live_reader", "lacks Tool/Invoke"),
@@ -2237,6 +2245,13 @@ async fn grouped_coding_uses_declared_sources() {
     ] {
         if let Some(role) = granted {
             bind_service(&principals, principal, role).await;
+            bind_service_at(
+                &principals,
+                principal,
+                "verification_query",
+                verification_schema.clone(),
+            )
+            .await;
         }
         let bound = principals
             .bindings(&RoleBindingQuery {
@@ -3357,6 +3372,19 @@ async fn verification_staging_refuses_and_recovers() {
 /// # Panics
 /// Panics when the administrator's bind is refused.
 async fn bind_service(principals: &Principals, principal: PrincipalId, role: &str) {
+    bind_service_at(principals, principal, role, PermissionScope::All).await;
+}
+
+/// Bind `role` at `scope` to the Service `principal`.
+///
+/// # Panics
+/// Panics when the administrator's bind is refused.
+async fn bind_service_at(
+    principals: &Principals,
+    principal: PrincipalId,
+    role: &str,
+    scope: PermissionScope,
+) {
     principals
         .bind(&CreateRoleBindingRequest {
             subject: BindingSubject::Principal {
@@ -3364,7 +3392,7 @@ async fn bind_service(principals: &Principals, principal: PrincipalId, role: &st
                 kind: PrincipalKindTag::Service,
             },
             role: role.to_owned(),
-            scope: PermissionScope::All,
+            scope,
         })
         .await
         .expect("the role is bound");

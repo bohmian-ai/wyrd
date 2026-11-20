@@ -301,6 +301,7 @@ mod pg_tests {
                 "verification.execute",
                 "verification.enqueue",
                 "verification.cancel",
+                "github_connection.review_pull_request",
                 "verification.decide_approval",
                 "operator_connections.create",
                 "operator_connections.update",

@@ -94,6 +94,13 @@ TOOLS = ("cards.get", "bifrost.query", "code.run")
 """The three built-ins the investigator calls, in call order."""
 
 DENIED = "WYRD_PERMISSION_403_DENIED_RBAC"
+
+QUERY_FORBIDDEN = "WYRD_VALA_403_QUERY_FORBIDDEN"
+"""A query the caller may make on a table no grant covers.
+
+Card read admits the query surface for managed verification rows; an
+ordinary telemetry table still needs its own query grant.
+"""
 """The stable code of a permission denial, carried by every denied tool call's error."""
 
 VERIFIES = ["verifier:run", "gateway:invoke"]
@@ -369,10 +376,12 @@ def assert_tools(
     receiver: Receiver,
     question: str,
     allowed: Sequence[str],
+    query_denial: str = DENIED,
 ) -> None:
     """Assert each of ``TOOLS`` was called once, in order, and only ``allowed`` returned output.
 
-    Every other call was denied with ``DENIED`` and returned nothing; the
+    Every other call was denied and returned nothing, a denied ``bifrost.query``
+    with ``query_denial`` and any other call with ``DENIED``; the
     model's tool turn shows the policy desk's Card only when its read was
     allowed.
     """
@@ -386,7 +395,8 @@ def assert_tools(
             assert "output_sha256" in call, (question, tool)
             assert call["returned_bytes"] > 0, (question, tool)
         else:
-            assert DENIED in call.get("error", ""), (question, call)
+            expected = query_denial if tool == TOOLS[1] else DENIED
+            assert expected in call.get("error", ""), (question, call)
             assert (call.get("output_sha256"), call["returned_bytes"]) == (None, 0), (
                 question,
                 tool,
@@ -863,14 +873,19 @@ def test_code_check_fails_with_citations_and_is_inconclusive_otherwise(desk: Wyr
 def test_hosted_tools_need_the_tool_and_domain_grants(
     policy_desk_bundle: Path, wyrd_server: WyrdTestServer, receiver: Receiver
 ) -> None:
-    for name, extra, allowed in (
-        ("all_tools", ["tool:invoke", "cards:read", "bifrost_query:read"], TOOLS),
-        ("no_tool_grant", ["cards:read", "bifrost_query:read"], ()),
-        ("no_domain_grant", ["tool:invoke", "cards:read"], (TOOLS[0], TOOLS[2])),
+    for name, extra, allowed, query_denial in (
+        ("all_tools", ["tool:invoke", "cards:read", "bifrost_query:read"], TOOLS, DENIED),
+        ("no_tool_grant", ["cards:read", "bifrost_query:read"], (), DENIED),
+        (
+            "no_domain_grant",
+            ["tool:invoke", "cards:read"],
+            (TOOLS[0], TOOLS[2]),
+            QUERY_FORBIDDEN,
+        ),
     ):
         key = wyrd_server.scoped_api_key(name, [*VERIFIES, *extra])
         result = investigate(policy_desk_bundle, WyrdClient(credential=key), name)
-        assert_tools(result, receiver, name, allowed)
+        assert_tools(result, receiver, name, allowed, query_denial)
     key = wyrd_server.scoped_api_key("card_tool_only", grants({"tool": TOOLS[0]}))
     result = investigate(policy_desk_bundle, WyrdClient(credential=key), "card_tool_only")
     assert_tools(result, receiver, "card_tool_only", (TOOLS[0],))
@@ -979,7 +994,7 @@ def test_code_mode_reduces_evidence_and_preserves_citations(
     kept = retained(wyrd_server, waited.execution_id)
     assert (kept["requirements"], kept["steps"]) == (described["requirements"], described["steps"])
 
-    denied = f"query {DENIED} repaired True"
+    denied = f"query {QUERY_FORBIDDEN} repaired True"
     for name, extra, children, printed in (
         (
             "NESTED no_domain_grant",
@@ -1006,7 +1021,7 @@ def test_code_mode_reduces_evidence_and_preserves_citations(
         ], name
         for call in calls:
             if "error" in call:
-                assert DENIED in call["error"], (name, call)
+                assert QUERY_FORBIDDEN in call["error"], (name, call)
                 assert (call.get("output_sha256"), call["returned_bytes"]) == (None, 0), name
         turn = next(
             body

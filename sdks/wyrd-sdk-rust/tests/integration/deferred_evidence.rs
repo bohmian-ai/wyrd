@@ -282,8 +282,8 @@ mod pg_tests {
     ///
     /// The execution waits for `ci` and lists the pending `signoff`
     /// occurrence. Published CI resumes it, but it still waits for the
-    /// approval alone. A viewer's decision is refused; an editor's approval
-    /// returns the durable receipt, replays on retry, and the execution
+    /// approval alone. A viewer's and an editor's decisions are refused;
+    /// an approver's approval returns the durable receipt, replays on retry, and the execution
     /// passes under its original ID with the decision listed.
     ///
     /// # Panics
@@ -347,12 +347,19 @@ mod pg_tests {
             .expect_err("a viewer cannot approve");
         assert_eq!(refused.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
 
-        let approver = as_principal("signoff_editor", "editor").await;
+        let refused = as_principal("signoff_editor", "editor")
+            .await
+            .decide(approval, ApprovalDecision::Approved, None)
+            .await
+            .expect_err("an editor cannot approve");
+        assert_eq!(refused.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
+
+        let approver = as_principal("signoff_approver", "approver").await;
         let reason = Some("reviewed the diff".to_owned());
         let receipt = approver
             .decide(approval, ApprovalDecision::Approved, reason.clone())
             .await
-            .expect("the editor approves");
+            .expect("the approver approves");
         assert_eq!(receipt.approval_id, approval);
         assert_eq!(receipt.status, ApprovalStatus::Approved);
         assert_eq!(receipt.reason, reason);

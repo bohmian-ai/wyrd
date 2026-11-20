@@ -71,6 +71,10 @@ pub struct TenantAuthority {
     revision: i64,
     accounts: HashMap<Uuid, AccountAuthority>,
     keys: HashMap<Uuid, KeyState>,
+    /// Accounts whose stored authority does not decode, with the row naming
+    /// it. They hold no authority and are absent from `accounts`, so one
+    /// corrupt row fails only its own subjects, never the tenant.
+    corrupt: HashMap<Uuid, String>,
 }
 
 /// Why a stored authorization row cannot be compiled.
@@ -113,37 +117,55 @@ impl TenantAuthority {
     /// Compiles one loaded state. Bindings of inactive or unknown subjects
     /// contribute nothing.
     ///
+    /// A stored role, scope, or account kind that does not decode marks only
+    /// the accounts it binds corrupt: they hold no authority and
+    /// [`Self::check`] names the row, while every other account compiles. A
+    /// binding naming no single subject and a credential ceiling that does
+    /// not decode grant nothing.
+    ///
     /// # Errors
     ///
-    /// [`AuthorityError::Corrupt`] for a stored role, scope or ceiling that
-    /// does not decode.
+    /// Infallible today; the `Result` keeps [`Self::load`]'s error type.
     pub fn compile(state: AuthorityState) -> Result<Self, AuthorityError> {
+        let mut corrupt: HashMap<Uuid, String> = HashMap::new();
+        let mut corrupt_groups: HashMap<Uuid, String> = HashMap::new();
         let mut direct: HashMap<Uuid, Vec<Permission>> = HashMap::new();
         let mut groups: HashMap<Uuid, Vec<Permission>> = HashMap::new();
         let mut direct_roles: HashMap<Uuid, Vec<RoleRef>> = HashMap::new();
         let mut group_roles: HashMap<Uuid, Vec<RoleRef>> = HashMap::new();
         for binding in state.bindings.0 {
-            let corrupt = || AuthorityError::Corrupt {
-                role: binding.role.clone(),
-            };
-            let operations: Vec<Operation> =
-                serde_json::from_value(binding.operations.clone()).map_err(|_| corrupt())?;
-            let scope: PermissionScope =
-                serde_json::from_value(binding.scope.clone()).map_err(|_| corrupt())?;
-            let Ok(permissions) = compile_binding(&operations, &scope) else {
-                continue;
-            };
-            let role = RoleRef::new(&binding.role).map_err(|_| corrupt())?;
-            let (target, names) = match (
+            let subject = match (
                 binding.user_id,
                 binding.service_account_id,
                 binding.group_id,
             ) {
-                (Some(id), None, None) | (None, Some(id), None) => {
-                    (direct.entry(id), direct_roles.entry(id))
+                (Some(id), None, None) | (None, Some(id), None) => Some((id, false)),
+                (None, None, Some(group)) => Some((group, true)),
+                _ => None,
+            };
+            let decoded = serde_json::from_value::<Vec<Operation>>(binding.operations.clone())
+                .ok()
+                .zip(serde_json::from_value::<PermissionScope>(binding.scope.clone()).ok())
+                .zip(RoleRef::new(&binding.role).ok());
+            let (Some((id, group)), Some(((operations, scope), role))) = (subject, decoded) else {
+                tracing::error!(role = %binding.role, "a stored role binding is corrupt; its subjects hold no authority");
+                if let Some((id, group)) = subject {
+                    let marked = if group {
+                        &mut corrupt_groups
+                    } else {
+                        &mut corrupt
+                    };
+                    marked.insert(id, binding.role.clone());
                 }
-                (None, None, Some(group)) => (groups.entry(group), group_roles.entry(group)),
-                _ => return Err(corrupt()),
+                continue;
+            };
+            let Ok(permissions) = compile_binding(&operations, &scope) else {
+                continue;
+            };
+            let (target, names) = if group {
+                (groups.entry(id), group_roles.entry(id))
+            } else {
+                (direct.entry(id), direct_roles.entry(id))
             };
             target.or_default().extend(permissions);
             names.or_default().push(role);
@@ -152,6 +174,9 @@ impl TenantAuthority {
             let Some(member) = membership.user_id.or(membership.service_account_id) else {
                 continue;
             };
+            if let Some(role) = corrupt_groups.get(&membership.group_id) {
+                corrupt.insert(member, role.clone());
+            }
             if let Some(granted) = groups.get(&membership.group_id) {
                 direct
                     .entry(member)
@@ -167,6 +192,9 @@ impl TenantAuthority {
         }
         let mut accounts = HashMap::new();
         for user in state.users.0 {
+            if corrupt.contains_key(&user) {
+                continue;
+            }
             let mut grants: PermissionSet = direct
                 .remove(&user)
                 .unwrap_or_default()
@@ -187,19 +215,23 @@ impl TenantAuthority {
             );
         }
         for account in state.service_accounts.0 {
-            let corrupt = || AuthorityError::Corrupt {
-                role: format!("account {}", account.id),
-            };
+            if corrupt.contains_key(&account.id) {
+                continue;
+            }
             let kind = match account.principal_kind.as_str() {
-                "service" => PrincipalKindTag::Service,
-                "tenant_admin" => PrincipalKindTag::TenantAdmin,
-                _ => return Err(corrupt()),
+                "service" => Some(PrincipalKindTag::Service),
+                "tenant_admin" => Some(PrincipalKindTag::TenantAdmin),
+                _ => None,
             };
             let restriction = workload_family(
                 account.restriction_kind.as_deref(),
                 account.restriction_name.as_deref(),
-            )
-            .map_err(|_| corrupt())?;
+            );
+            let (Some(kind), Ok(restriction)) = (kind, restriction) else {
+                tracing::error!(account = %account.id, "a stored service account is corrupt; it holds no authority");
+                corrupt.insert(account.id, format!("account {}", account.id));
+                continue;
+            };
             let grants = direct
                 .remove(&account.id)
                 .unwrap_or_default()
@@ -217,23 +249,23 @@ impl TenantAuthority {
         }
         let mut keys = HashMap::new();
         for key in state.api_keys.0 {
-            let stateful = if key.active {
-                let ceiling = key
-                    .permission_ceiling
-                    .map(|expressions| {
-                        expressions
-                            .iter()
-                            .map(|expression| expression.parse::<Permission>())
-                            .collect::<Result<PermissionSet, _>>()
-                            .map(Arc::new)
-                    })
-                    .transpose()
-                    .map_err(|_| AuthorityError::Corrupt {
-                        role: format!("credential {}", key.id),
-                    })?;
-                KeyState::Active(ceiling)
-            } else {
-                KeyState::Inactive
+            let ceiling = key
+                .permission_ceiling
+                .map(|expressions| {
+                    expressions
+                        .iter()
+                        .map(|expression| expression.parse::<Permission>())
+                        .collect::<Result<PermissionSet, _>>()
+                        .map(Arc::new)
+                })
+                .transpose();
+            let stateful = match ceiling {
+                Ok(ceiling) if key.active => KeyState::Active(ceiling),
+                Ok(_) => KeyState::Inactive,
+                Err(_) => {
+                    tracing::error!(credential = %key.id, "a stored credential ceiling is corrupt; the credential is unusable");
+                    KeyState::Inactive
+                }
             };
             keys.insert(key.id, stateful);
         }
@@ -241,7 +273,20 @@ impl TenantAuthority {
             revision: state.revision,
             accounts,
             keys,
+            corrupt,
         })
+    }
+
+    /// Refuses account `id` when its stored authority is corrupt.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthorityError::Corrupt`] naming the row that does not decode.
+    pub fn check(&self, id: PrincipalId) -> Result<(), AuthorityError> {
+        match self.corrupt.get(&id.as_uuid()) {
+            Some(role) => Err(AuthorityError::Corrupt { role: role.clone() }),
+            None => Ok(()),
+        }
     }
 
     /// The current grants of live account `id` of `kind`, loaded on the
@@ -257,6 +302,7 @@ impl TenantAuthority {
         kind: PrincipalKindTag,
     ) -> Result<Option<Arc<PermissionSet>>, WyrdError> {
         let authority = Self::load(conn).await?;
+        authority.check(id)?;
         Ok(authority
             .account(id)
             .filter(|account| account.kind == kind)
@@ -584,14 +630,16 @@ mod tests {
         assert!(cache.cached(tenant).is_none(), "expired freshness refuses");
     }
 
-    /// A binding whose role operations or scope do not decode fails the
-    /// whole snapshot naming the role, never compiling partial authority.
+    /// A binding whose role operations or scope do not decode makes only its
+    /// own subject corrupt, naming the role and holding no authority, while
+    /// every other account in the tenant still compiles and holds its grants.
     ///
     /// # Panics
-    /// Panics when a corrupt row compiles or names another role.
+    /// Panics when a corrupt row grants anything, names another role, or
+    /// fails another account.
     #[test]
     fn corrupt_bindings_name_their_role() {
-        let user = Uuid::now_v7();
+        let (user, other) = (Uuid::now_v7(), Uuid::now_v7());
         for (operations, scope) in [
             (
                 json!([{"resource": "cards", "action": "unknown"}]),
@@ -602,14 +650,31 @@ mod tests {
                 json!({"nowhere": {}}),
             ),
         ] {
-            let mut state = state(1, user);
-            state.bindings.0[0].role = "bad_role".to_owned();
-            state.bindings.0[0].operations = operations;
-            state.bindings.0[0].scope = scope;
-            match TenantAuthority::compile(state) {
+            let mut loaded = state(1, user);
+            loaded.bindings.0[0].role = "bad_role".to_owned();
+            loaded.bindings.0[0].operations = operations;
+            loaded.bindings.0[0].scope = scope;
+            loaded.bindings.0.extend(state(1, other).bindings.0);
+            loaded.users.0.push(other);
+            let authority = TenantAuthority::compile(loaded).expect("compiles");
+            match authority.check(wyrd_runtime::PrincipalId::new(user)) {
                 Err(AuthorityError::Corrupt { role }) => assert_eq!(role, "bad_role"),
-                other => panic!("expected a corrupt role, got {:?}", other.map(|_| ())),
+                other => panic!("expected a corrupt role, got {other:?}"),
             }
+            assert!(
+                authority
+                    .account(wyrd_runtime::PrincipalId::new(user))
+                    .is_none()
+            );
+            authority
+                .check(wyrd_runtime::PrincipalId::new(other))
+                .expect("another account is not corrupt");
+            assert!(
+                authority
+                    .account(wyrd_runtime::PrincipalId::new(other))
+                    .is_some_and(|account| !account.grants.is_empty()),
+                "another account keeps its grants"
+            );
         }
     }
 }

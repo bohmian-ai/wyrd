@@ -144,7 +144,12 @@ def test_a_person_approves_the_pending_signoff(
         viewer.decide(approval_id, "approved")
     assert refused.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
 
-    approver = verify.Execution(execution_id, client_for(server, "editor"))
+    editor = verify.Execution(execution_id, client_for(server, "editor"))
+    with pytest.raises(WyrdError) as refused:
+        editor.decide(approval_id, "approved")
+    assert refused.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
+
+    approver = verify.Execution(execution_id, client_for(server, "approver"))
     decided = approver.decide(approval_id, "approved", reason="reviewed the diff")
     assert decided["approval_id"] == approval_id
     assert decided["status"] == "approved"

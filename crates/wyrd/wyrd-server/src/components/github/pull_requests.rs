@@ -803,6 +803,7 @@ impl GithubConnections<'_> {
                     ScribeWrite::status(
                         execution.execution_id,
                         &execution.verifier_card_uid,
+                        &execution.card_uid,
                         execution.status,
                         execution.attribution,
                         generation.observed_at,

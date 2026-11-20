@@ -273,8 +273,10 @@ pub async fn replace_idp_user_bindings(
 /// Advances the tenant's authorization revision and notifies replicas when
 /// the transaction commits. Returns the new revision.
 ///
-/// Call once in every transaction that changes roles, bindings, groups,
-/// memberships, account status, credentials, or provider assignments.
+/// Call in every transaction that changes roles, bindings, groups,
+/// memberships, or provider assignments. The account and credential writers
+/// (account insert, suspension and deletion, workload restriction, and key
+/// insert and revocation) advance it themselves.
 ///
 /// # Errors
 ///

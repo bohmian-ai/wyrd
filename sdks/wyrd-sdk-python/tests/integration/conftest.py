@@ -167,7 +167,7 @@ INVESTIGATE = {
                 "call-query",
                 "bifrost.query",
                 {
-                    "sql": "SELECT execution_id FROM bifrost.verification.results LIMIT 1",
+                    "sql": "SELECT name FROM bifrost.traces.spans LIMIT 1",
                     "max_rows": 1,
                 },
             ),

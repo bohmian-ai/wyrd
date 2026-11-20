@@ -303,14 +303,22 @@ impl DelegateToken {
             Err(AuthorityError::Corrupt { role }) => {
                 Err(DelegateError::Issuance(IssuanceError::RoleCorrupt { role }))
             }
-            Ok(authority) => authority
-                .authorize(&subject)
-                .ok_or(DelegateError::Issuance(IssuanceError::PrincipalInactive))
-                .and_then(|now| {
-                    now.effective_permissions
-                        .flatten()
-                        .map_err(|error| DelegateError::Issuance(error.into()))
-                }),
+            Ok(authority) => match authority.check(subject.principal.id) {
+                Err(AuthorityError::Corrupt { role }) => {
+                    Err(DelegateError::Issuance(IssuanceError::RoleCorrupt { role }))
+                }
+                _ => Ok(()),
+            }
+            .and_then(|()| {
+                authority
+                    .authorize(&subject)
+                    .ok_or(DelegateError::Issuance(IssuanceError::PrincipalInactive))
+                    .and_then(|now| {
+                        now.effective_permissions
+                            .flatten()
+                            .map_err(|error| DelegateError::Issuance(error.into()))
+                    })
+            }),
         };
         let subject_permissions = match subject_permissions {
             Ok(permissions) => permissions,

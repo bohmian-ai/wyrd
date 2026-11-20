@@ -147,6 +147,9 @@ pub enum ApiKeyStatus {
 /// unique index refuses a second live account for one family (`23505`).
 /// `attribution` is the verified subject and actor creating the principal.
 ///
+/// Advances the tenant's authorization revision in the same transaction, so
+/// every replica's authority cache reloads the changed account or credential.
+///
 /// # Errors
 /// Returns a SQLx error when Postgres rejects the insert.
 pub async fn insert_service_account(
@@ -177,6 +180,7 @@ pub async fn insert_service_account(
     .bind(attribution.act_principal_id.as_uuid())
     .execute(&mut **conn.transaction())
     .await?;
+    super::advance_authorization_revision(conn).await?;
     Ok(())
 }
 
@@ -184,6 +188,9 @@ pub async fn insert_service_account(
 ///
 /// `None` makes the account unrestricted. Setting the stored value again is a
 /// no-op success. Returns `Ok(false)` when no live Service account has `id`.
+///
+/// Advances the tenant's authorization revision in the same transaction, so
+/// every replica's authority cache reloads the changed account or credential.
 ///
 /// # Errors
 /// Returns a SQLx error when Postgres rejects the update, including a unique
@@ -199,6 +206,7 @@ pub async fn set_workload_restriction(
         .bind(family.map(|family| family.name.as_str()))
         .execute(&mut **conn.transaction())
         .await?;
+    super::advance_authorization_revision(conn).await?;
     Ok(result.rows_affected() > 0)
 }
 
@@ -225,6 +233,9 @@ pub async fn family_account_id(
 /// Returns `Ok(true)` when a row was updated, `Ok(false)` when no row matched.
 /// The internal SYSTEM writer has no lifecycle and never matches.
 ///
+/// Advances the tenant's authorization revision in the same transaction, so
+/// every replica's authority cache reloads the changed account or credential.
+///
 /// # Errors
 /// Returns a SQLx error when Postgres rejects the update.
 pub async fn delete_service_account(
@@ -241,6 +252,7 @@ pub async fn delete_service_account(
     .bind(id)
     .execute(&mut **conn.transaction())
     .await?;
+    super::advance_authorization_revision(conn).await?;
     Ok(result.rows_affected() > 0)
 }
 
@@ -354,6 +366,9 @@ pub async fn tenant_admin_principal_id(
 /// `created_at` and `expires_at` it wrote so no caller reconstructs them from
 /// the host clock.
 ///
+/// Advances the tenant's authorization revision in the same transaction, so
+/// every replica's authority cache reloads the changed account or credential.
+///
 /// # Errors
 /// Returns the database error when the insert fails, including when `prefix`
 /// collides within the tenant or `principal_id` names no principal.
@@ -366,7 +381,7 @@ pub async fn insert_api_key(
     attribution: Attribution,
     lifetime: Option<Duration>,
 ) -> Result<(DateTime<Utc>, Option<DateTime<Utc>>), sqlx::Error> {
-    sqlx::query_as(
+    let stored = sqlx::query_as(
         r"
         INSERT INTO wyrd.auth_api_keys (
             id, data_tenant_id, principal_id, service_account_id, prefix, key_hash,
@@ -387,13 +402,18 @@ pub async fn insert_api_key(
     .bind(attribution.act_principal_id.as_uuid())
     .bind(lifetime.map(|lifetime| lifetime.as_secs_f64()))
     .fetch_one(&mut **conn.transaction())
-    .await
+    .await?;
+    super::advance_authorization_revision(conn).await?;
+    Ok(stored)
 }
 
 /// Insert a hashed personal credential owned by User `user_id`, named `name`
 /// with the canonical `permission_ceiling` (sorted, distinct expressions), and
 /// expiring `lifetime` after `PostgreSQL`'s statement time; returns the stored
 /// creation and expiry.
+///
+/// Advances the tenant's authorization revision in the same transaction, so
+/// every replica's authority cache reloads the changed account or credential.
 ///
 /// # Errors
 /// Returns the database error when the insert fails, including when `prefix`
@@ -413,7 +433,7 @@ pub async fn insert_user_api_key(
     permission_ceiling: &[String],
     lifetime: Duration,
 ) -> Result<(DateTime<Utc>, DateTime<Utc>), sqlx::Error> {
-    sqlx::query_as(
+    let stored = sqlx::query_as(
         r"
         INSERT INTO wyrd.auth_api_keys (
             id, data_tenant_id, principal_id, user_id, prefix, key_hash,
@@ -434,7 +454,9 @@ pub async fn insert_user_api_key(
     .bind(sqlx::types::Json(permission_ceiling))
     .bind(lifetime.as_secs_f64())
     .fetch_one(&mut **conn.transaction())
-    .await
+    .await?;
+    super::advance_authorization_revision(conn).await?;
+    Ok(stored)
 }
 
 /// A key's stored permission ceiling.

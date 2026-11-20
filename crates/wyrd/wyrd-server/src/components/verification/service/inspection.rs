@@ -1058,6 +1058,7 @@ impl<'a> VerificationControl<'a> {
                 ScribeWrite::status(
                     execution_id,
                     &status.verifier_card_uid,
+                    &status.card_uid,
                     VerificationExecutionStatus::Cancelled,
                     status.attribution,
                     occurred_at,

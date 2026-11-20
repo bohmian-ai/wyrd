@@ -780,25 +780,41 @@ mod pg_tests {
         viewer.cancel().await?;
 
         let editor = opened.agent("mcp-signoff-editor", "editor").await?;
+        let denied = refused(editor.call_tool(decide(Some("looks fine"))?).await)?;
         assert!(
-            tools(&editor)
+            denied.contains("WYRD_PERMISSION_403_DENIED_RBAC"),
+            "an editor cannot approve: {denied}"
+        );
+        editor.cancel().await?;
+
+        let approver = opened.agent("mcp-signoff-approver", "approver").await?;
+        assert!(
+            tools(&approver)
                 .await?
                 .iter()
                 .any(|name| name == "verification.decide_approval")
         );
-        let receipt = structured(editor.call_tool(decide(Some("reviewed the diff"))?).await?)?;
+        let receipt = structured(
+            approver
+                .call_tool(decide(Some("reviewed the diff"))?)
+                .await?,
+        )?;
         assert_eq!(receipt["approval_id"], approval);
         assert_eq!(receipt["status"], "approved");
         assert_eq!(receipt["reason"], "reviewed the diff");
         assert!(receipt["actor_id"].is_string() && receipt["decided_at"].is_string());
-        let replayed = structured(editor.call_tool(decide(Some("reviewed the diff"))?).await?)?;
+        let replayed = structured(
+            approver
+                .call_tool(decide(Some("reviewed the diff"))?)
+                .await?,
+        )?;
         assert_eq!(replayed, receipt);
-        let conflict = refused(editor.call_tool(decide(None)?).await)?;
+        let conflict = refused(approver.call_tool(decide(None)?).await)?;
         assert!(
             conflict.contains("WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING"),
             "{conflict}"
         );
-        editor.cancel().await?;
+        approver.cancel().await?;
 
         let completed = opened
             .until(|state| state["status"] == "completed" && !state["result"].is_null())

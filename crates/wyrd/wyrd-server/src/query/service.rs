@@ -73,7 +73,9 @@ impl<'a> QueryAuthority<'a> {
         Self::new(state, caller, operation, resource)
     }
 
-    /// Admits a request that holds the Bifrost read capability under some scope.
+    /// Admits a request that holds the Bifrost read capability under some
+    /// scope, or reads retained executions of some Card, which reaches the
+    /// managed verification tables filtered to those Cards' rows.
     ///
     /// This is admission, never authorization: it proves only that the caller
     /// operates the Bifrost read surface at all. A principal admitted here is
@@ -83,12 +85,7 @@ impl<'a> QueryAuthority<'a> {
     ///
     /// Returns the stable authorization denial after staging it.
     fn admit_capability(&self) -> Result<(), WyrdError> {
-        if self
-            .caller
-            .principal
-            .effective_permissions
-            .covers_operation(&Resource::BifrostQuery, &Action::Read)
-        {
+        if self.caller.principal.effective_permissions.reads_bifrost() {
             return Ok(());
         }
         Err(self.deny(PermissionDenyReason::Rbac {

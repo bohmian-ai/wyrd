@@ -930,12 +930,12 @@ impl TenantTokenIssuer {
             };
             (principal, row.workload_family()?)
         };
-        let authority = TenantAuthority::load(conn)
-            .await
-            .map_err(|error| match error {
-                AuthorityError::Database(error) => IssuanceError::Database(error),
-                AuthorityError::Corrupt { role } => IssuanceError::RoleCorrupt { role },
-            })?;
+        let refusal = |error| match error {
+            AuthorityError::Database(error) => IssuanceError::Database(error),
+            AuthorityError::Corrupt { role } => IssuanceError::RoleCorrupt { role },
+        };
+        let authority = TenantAuthority::load(conn).await.map_err(refusal)?;
+        authority.check(principal.id).map_err(refusal)?;
         let grants = authority
             .account(principal.id)
             .ok_or(IssuanceError::PrincipalInactive)?

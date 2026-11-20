@@ -112,7 +112,7 @@ def test_caller_without_bifrost_read_is_refused(
 
     with pytest.raises(WyrdError) as refused:
         denied.sql(f"SELECT id FROM {query_table}")
-    assert refused.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
+    assert refused.value.code == "WYRD_VALA_403_QUERY_FORBIDDEN"
 
 
 def ids(bifrost: Bifrost, sql: str) -> list[int]:

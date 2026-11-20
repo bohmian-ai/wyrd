@@ -575,18 +575,21 @@ impl ScribeWrite {
     }
 
     /// The status row recording that queued `execution`, run by Verifier
-    /// `verifier` for `attribution`, entered `status` at `occurred_at`.
+    /// `verifier` over `subject` for `attribution`, entered `status` at
+    /// `occurred_at`.
     ///
     /// Its owner stages it only after the transition's transaction commits.
     /// The row has `event = 'status'`, `status` as the status serializes, a
     /// new event id, and `sequence` 0, which orders nothing: a reader takes
-    /// an execution's newest status by `occurred_at`. Every other content and
+    /// an execution's newest status by `occurred_at`. `subject_card_uid` is the
+    /// execution's subject, its trusted read parent; every other content and
     /// correlation column is null. A status row is never a checkpoint, so
     /// state recovery, which reads checkpoint revisions only, never sees it.
     #[must_use]
     pub fn status(
         execution: ExecutionId,
         verifier: &CardUid,
+        subject: &CardUid,
         status: VerificationExecutionStatus,
         attribution: Attribution,
         occurred_at: DateTime<Utc>,
@@ -603,6 +606,7 @@ impl ScribeWrite {
                 "event" => Cell::text(Some("status")),
                 "status" => Cell::text(Some(<&'static str>::from(status))),
                 "verifier_card_uid" => Cell::text(Some(verifier.as_str())),
+                SUBJECT_CARD_UID => Cell::text(Some(subject.as_str())),
                 "value" => Cell::Variant(None),
                 "occurred_at" => Cell::Micros(Some(occurred_at.timestamp_micros())),
                 "item_index" | "iteration_index" | "attempt" | "size_bytes" | "file_count" => {
@@ -2249,6 +2253,7 @@ pub(crate) fn stage_cancelled(
             ScribeWrite::status(
                 execution.execution_id,
                 &execution.verifier_card_uid,
+                &execution.card_uid,
                 VerificationExecutionStatus::Cancelled,
                 execution.attribution,
                 occurred_at,
@@ -3590,7 +3595,7 @@ mod tests {
             .iter()
             .zip(statuses)
             .map(|(caller, status)| {
-                ScribeWrite::status(ExecutionId::new_v7(), &uid(), status, *caller, at)
+                ScribeWrite::status(ExecutionId::new_v7(), &uid(), &uid(), status, *caller, at)
             })
             .collect();
         let key = uuid::Uuid::now_v7();

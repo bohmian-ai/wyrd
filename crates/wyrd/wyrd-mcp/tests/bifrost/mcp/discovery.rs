@@ -29,7 +29,7 @@ mod pg_tests {
     /// caller that also holds tenant administration (`*`), `verifier:run`,
     /// `operators:write`, `gateway:write`, and `gateway:delete`: every read
     /// tool, then that caller's write tools.
-    const ADVERTISED_TOOLS: [&str; 50] = [
+    const ADVERTISED_TOOLS: [&str; 51] = [
         "bifrost.list_tables",
         "bifrost.describe_table",
         "bifrost.query",
@@ -63,6 +63,7 @@ mod pg_tests {
         "verification.execute",
         "verification.enqueue",
         "verification.cancel",
+        "github_connection.review_pull_request",
         "verification.decide_approval",
         "operator_connections.create",
         "operator_connections.update",
@@ -175,11 +176,14 @@ mod pg_tests {
                 "the checked catalog is the complete every-scope catalog"
             );
             // Declaration, bundle pull, local check, and file upload stay CLI
-            // and SDK operations; onboarding adds no MCP write capability.
+            // and SDK operations; onboarding adds no MCP write capability. The
+            // operation's leading word names it, so a pull request review is
+            // not a bundle pull.
             for tool in &tools {
+                let operation = tool.name.rsplit('.').next().unwrap_or_default();
                 for owned_elsewhere in ["declare", "pull", "check", "upload", "get_by_ref"] {
                     assert!(
-                        !tool.name.contains(owned_elsewhere),
+                        !operation.starts_with(owned_elsewhere),
                         "{} is not an MCP capability",
                         tool.name
                     );

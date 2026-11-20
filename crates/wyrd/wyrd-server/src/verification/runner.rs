@@ -1221,6 +1221,7 @@ impl VerifierRunner {
                 ScribeWrite::status(
                     run.lease.execution_id,
                     &run.verifier_card_uid,
+                    &run.card_uid,
                     status,
                     run.attribution,
                     occurred_at,
@@ -1539,6 +1540,7 @@ impl VerifierRunner {
             ScribeWrite::status(
                 run.lease.execution_id,
                 &run.verifier_card_uid,
+                &run.card_uid,
                 VerificationExecutionStatus::Running,
                 run.attribution,
                 claim.claimed_at,

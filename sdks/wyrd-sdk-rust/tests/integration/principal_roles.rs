@@ -618,6 +618,54 @@ async fn stable_accounts_preserve_execution_identity() {
     deployment.shutdown().await;
 }
 
+/// A local User's saved CLI login: the client built from it, and the
+/// config home that keeps it alive.
+struct SignedIn {
+    /// Client reading the saved login.
+    client: wyrd_ai::WyrdClient,
+    /// Private config home holding the saved login.
+    _config: tempfile::TempDir,
+}
+
+/// Signs `username` in with `password` through the CLI device login, with no
+/// identity provider, and returns a client of the saved login.
+///
+/// # Panics
+/// Panics when the login cannot be saved or the client cannot be built.
+async fn signed_in(deployment: &Deployment, username: &str, password: &str) -> SignedIn {
+    use wyrd_ai::config::ClientConfig;
+    use wyrd_ai::environment::Environment;
+    use wyrd_ai::{GlobalConfig, WyrdClient};
+    use wyrd_testing::human_login::{FIXTURE_TENANT_SLUG, HumanSso};
+
+    let sso = HumanSso::new(
+        deployment
+            .server()
+            .base_url()
+            .expect("bound server has a URL"),
+    );
+    let config = wyrd_testing::human_login::private_config_home();
+    sso.save_local_login(config.path(), FIXTURE_TENANT_SLUG, username, password)
+        .await;
+    let mut saved = ClientConfig::from_environment(
+        Environment::from([(
+            "WYRD_CONFIG_HOME",
+            config.path().to_str().expect("UTF-8 config home"),
+        )]),
+        &GlobalConfig::default(),
+        deployment.server().base_url(),
+        None,
+    );
+    saved.grpc.endpoint = deployment
+        .server()
+        .grpc_url()
+        .expect("bound server has a gRPC URL");
+    SignedIn {
+        client: WyrdClient::with_config(saved).expect("client builds"),
+        _config: config,
+    }
+}
+
 /// Viewer bound at the `code-review` Verifier family lets a local User, signed
 /// in through the CLI device login with no identity provider, read that
 /// family and nothing else: the other family is absent from listing and
@@ -629,12 +677,8 @@ async fn stable_accounts_preserve_execution_identity() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn a_family_bound_viewer_reads_only_that_family() {
     use wyrd_ai::cards::{CardKind, CardSelector, ListCardsRequest};
-    use wyrd_ai::config::ClientConfig;
-    use wyrd_ai::environment::Environment;
-    use wyrd_ai::{GlobalConfig, WyrdClient};
     use wyrd_spec::auth::CardPermissionScope;
     use wyrd_spec::ids::CardName;
-    use wyrd_testing::human_login::{FIXTURE_TENANT_SLUG, HumanSso};
 
     let deployment = Deployment::start().await;
     let cards = deployment.cards().await;
@@ -660,25 +704,8 @@ async fn a_family_bound_viewer_reads_only_that_family() {
         })
         .await
         .expect("an administrator creates Alice");
-    let sso = HumanSso::new(
-        deployment
-            .server()
-            .base_url()
-            .expect("bound server has a URL"),
-    );
-    let config = wyrd_testing::human_login::private_config_home();
-    sso.save_local_login(config.path(), FIXTURE_TENANT_SLUG, "alice", password)
-        .await;
-    let saved = ClientConfig::from_environment(
-        Environment::from([(
-            "WYRD_CONFIG_HOME",
-            config.path().to_str().expect("UTF-8 config home"),
-        )]),
-        &GlobalConfig::default(),
-        deployment.server().base_url(),
-        None,
-    );
-    let own = Cards::connect_with(&WyrdClient::with_config(saved).expect("client builds"))
+    let alice = signed_in(&deployment, "alice", password).await;
+    let own = Cards::connect_with(&alice.client)
         .await
         .expect("Alice connects with her saved login");
 
@@ -713,5 +740,158 @@ async fn a_family_bound_viewer_reads_only_that_family() {
         .await
         .expect_err("the other family is hidden");
     assert_eq!(refused.code(), "WYRD_REGISTRY_404_CARD_NOT_FOUND");
+    deployment.shutdown().await;
+}
+
+/// One retained verification row's trusted parent family.
+#[derive(Debug, Deserialize)]
+struct Parent {
+    /// The verified Card's name.
+    subject_name: String,
+}
+
+/// Viewer bound at the `support-reply` Service family lets a local User
+/// query, through raw SQL, only the verification records retained under that
+/// family. The administrator sees both Services that share the
+/// `no-refund-promise` Verifier. Alice's scans, joins, filters naming the
+/// other family, and counts all see only her family's rows. A table she holds
+/// no grant for is refused.
+///
+/// # Panics
+/// Panics when a step fails or an outcome differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn a_family_bound_viewer_queries_only_that_familys_records() {
+    use wyrd_ai::cards::CardKind;
+    use wyrd_ai::state::DeclareOptions;
+    use wyrd_spec::auth::CardPermissionScope;
+    use wyrd_spec::ids::CardName;
+
+    let deployment =
+        Deployment::start_with(WyrdTestServer::builder().with_verification_runtime_for_test())
+            .await;
+    let quickstart = fixture("../examples/quickstart/support-reply.yaml");
+    let other = tempfile::tempdir().expect("copy directory creates");
+    for file in ["support-reply.yaml", "no-refund-promise.yaml"] {
+        let source = std::fs::read_to_string(quickstart.with_file_name(file)).expect("reads");
+        std::fs::write(
+            other.path().join(file),
+            source.replace("name: support-reply", "name: other-reply"),
+        )
+        .expect("writes");
+    }
+    for path in [quickstart, other.path().join("support-reply.yaml")] {
+        let state = WyrdState::declare_with(
+            &path,
+            DeclareOptions {
+                client: Some(deployment.admin()),
+                ..DeclareOptions::default()
+            },
+        )
+        .await
+        .expect("the Service declares");
+        state
+            .run()
+            .observe()
+            .verify(
+                "no-refund-promise",
+                json!("Your refund request is approved."),
+            )
+            .await
+            .expect("the reply is judged");
+    }
+    deployment
+        .server()
+        .flush_bifrost()
+        .await
+        .expect("rows publish");
+
+    let password = "alice payments password";
+    Principals::connect_with(&deployment.admin())
+        .await
+        .expect("handle connects")
+        .create_user(&CreateUserRequest {
+            username: "alice".to_owned(),
+            password: SecretBearer::new(password.to_owned()),
+            assignments: vec![ScopedRoleAssignment {
+                role: "viewer".to_owned(),
+                scope: PermissionScope::Card(CardPermissionScope::family(
+                    CardKind::Service,
+                    CardName::new("support-reply").expect("valid name"),
+                )),
+            }],
+        })
+        .await
+        .expect("an administrator creates Alice");
+    let alice = signed_in(&deployment, "alice", password).await;
+    let admin = Bifrost::connect_with(&deployment.admin(), BifrostOptions::default())
+        .await
+        .expect("the administrator connects");
+    let own = Bifrost::connect_with(&alice.client, BifrostOptions::default())
+        .await
+        .expect("Alice connects with her saved login");
+    let families = async |bifrost: &Bifrost, sql: &str| {
+        let rows: Vec<Parent> = bifrost
+            .sql_as(sql, &[])
+            .await
+            .unwrap_or_else(|error| panic!("{sql}: {error}"));
+        rows.into_iter()
+            .map(|row| row.subject_name)
+            .collect::<BTreeSet<_>>()
+    };
+    let results = "SELECT subject_name FROM bifrost.verification.results";
+    assert_eq!(
+        families(&admin, results).await,
+        BTreeSet::from(["other-reply".to_owned(), "support-reply".to_owned()])
+    );
+    for sql in [
+        results,
+        "SELECT subject_name FROM bifrost.verification.execution_inputs",
+        "SELECT r.subject_name FROM bifrost.verification.results r \
+         JOIN bifrost.verification.execution_inputs i ON r.execution_id = i.execution_id",
+    ] {
+        assert_eq!(
+            families(&own, sql).await,
+            BTreeSet::from(["support-reply".to_owned()]),
+            "{sql}"
+        );
+    }
+    assert!(
+        families(
+            &own,
+            "SELECT subject_name FROM bifrost.verification.results \
+             WHERE subject_name = 'other-reply'"
+        )
+        .await
+        .is_empty()
+    );
+    let count = async |bifrost: &Bifrost| {
+        let rows: Vec<Count> = bifrost
+            .sql_as(
+                "SELECT COUNT(*) AS n FROM bifrost.verification.results \
+                 WHERE subject_name = 'support-reply'",
+                &[],
+            )
+            .await
+            .expect("results count");
+        rows[0].n
+    };
+    let total: Vec<Count> = own
+        .sql_as(
+            "SELECT COUNT(*) AS n FROM bifrost.verification.results",
+            &[],
+        )
+        .await
+        .expect("Alice counts results");
+    assert_eq!(total[0].n, count(&admin).await);
+    assert_eq!(count(&own).await, count(&admin).await);
+    let refused = own
+        .sql(TENANT_WIDE, &[])
+        .await
+        .expect_err("a table without a grant is refused");
+    assert_eq!(
+        WyrdError::from(refused).code(),
+        "WYRD_VALA_403_QUERY_FORBIDDEN"
+    );
     deployment.shutdown().await;
 }

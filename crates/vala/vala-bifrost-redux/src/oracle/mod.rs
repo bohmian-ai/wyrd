@@ -3829,6 +3829,11 @@ pub(super) fn resolved_table_scope(
 /// acceptance, and peer dispatch. One uncovered table denies the query
 /// outright: there is no partial plan and no silently narrowed result.
 ///
+/// A managed `bifrost.verification` table is covered instead by execution
+/// read at any scope: [`restrict_verification_rows`] then keeps only the rows
+/// whose trusted parent that read reaches, so a table grant without it reads
+/// no row and execution read alone reads no other table.
+///
 /// # Errors
 ///
 /// Returns [`BifrostError::QueryForbidden`] for the first resolved table the
@@ -3837,7 +3842,16 @@ pub(super) fn authorize_resolved_tables(
     context: &AuthorizedQueryContext,
     resolved: &[(TenantTableBinding, TableUid)],
 ) -> Result<(), BifrostError> {
+    let parent_reader = context.principal.effective_permissions.covers_operation(
+        &wyrd_runtime::Resource::Executions,
+        &wyrd_runtime::Action::Read,
+    );
     for (binding, table_uid) in resolved {
+        if parent_reader
+            && binding.table_ref.namespace == crate::namespaces::BifrostNamespace::Verification
+        {
+            continue;
+        }
         let required = Permission {
             resource: wyrd_runtime::Resource::BifrostQuery,
             action: wyrd_runtime::Action::Read,
@@ -3856,18 +3870,25 @@ pub(super) fn authorize_resolved_tables(
 }
 
 /// Limits every scan of a managed `bifrost.verification` table to the rows
-/// whose trusted parent the principal's Card read reaches.
+/// whose trusted parent the principal's execution read reaches; Card read at
+/// a scope compiles to execution read at the same scope.
 ///
 /// Scribe stamps each verification row's `subject_kind`, `subject_name` and
 /// `subject_card_uid` from the Card registry when the row is accepted, never
 /// from row labels: the subject Card, the Verifier of subjectless direct
-/// work, or the Repository of pull-request work. A family grant keeps every
-/// version's rows, an exact grant only its UID's, and no Card read keeps
-/// none; a table grant alone never adds rows. The filter is placed directly
-/// on each scan of the unoptimized plan, including scans inside views,
-/// joins and subqueries, so every user predicate, projection and aggregate
-/// sees only visible rows, and peers execute the same filtered plan.
-/// Tenant-wide Card read leaves the plan unchanged.
+/// work, or the Repository of pull-request work. A row without all three has
+/// no provable parent and is read by nobody. Otherwise tenant-wide execution
+/// read keeps every row, a family grant every version's rows, an exact grant
+/// only its UID's, and no execution read none; a table grant alone never adds
+/// rows.
+///
+/// For a restricted reader each scan, including scans inside views, joins
+/// and subqueries, becomes a filter on the visible parents under a
+/// projection that replaces every column of a row outside them with null.
+/// The optimizer may push or reorder user predicates below that filter, but
+/// every user expression still reads the masked columns, so no predicate,
+/// projection or aggregate can evaluate, or fail on, a hidden row's values.
+/// The plan stays native, so peers execute the same masking.
 ///
 /// # Errors
 ///
@@ -3876,28 +3897,37 @@ pub(super) fn restrict_verification_rows(
     context: &AuthorizedQueryContext,
     plan: datafusion::logical_expr::LogicalPlan,
 ) -> Result<datafusion::logical_expr::LogicalPlan, BifrostError> {
-    use datafusion::common::Column;
     use crate::tables::DomainTable;
+    use datafusion::common::Column;
     use datafusion::common::tree_node::Transformed;
-    use datafusion::logical_expr::{Expr, Filter, LogicalPlan, lit};
+    use datafusion::logical_expr::{Expr, LogicalPlanBuilder, lit, when};
     use wyrd_spec::vala::managed_columns::{SUBJECT_CARD_UID, SUBJECT_KIND, SUBJECT_NAME};
 
-    let Some(objects) = context
-        .principal
-        .effective_permissions
-        .card_objects(&wyrd_runtime::Resource::Cards, &wyrd_runtime::Action::Read)
-    else {
-        return Ok(plan);
-    };
+    let objects = context.principal.effective_permissions.card_objects(
+        &wyrd_runtime::Resource::Executions,
+        &wyrd_runtime::Action::Read,
+    );
     let managed = format!("bifrost.{}.", crate::tables::ResultsTable::NAMESPACE);
     plan.transform_up_with_subqueries(|node| {
-        let LogicalPlan::TableScan(scan) = &node else {
+        let datafusion::logical_expr::LogicalPlan::TableScan(scan) = &node else {
             return Ok(Transformed::no(node));
         };
         if !scan.table_name.to_string().starts_with(&managed) {
             return Ok(Transformed::no(node));
         }
-        let column = |name: &str| Expr::Column(Column::new(Some(scan.table_name.clone()), name));
+        let table = scan.table_name.clone();
+        let column = |name: &str| Expr::Column(Column::new(Some(table.clone()), name));
+        let known = [SUBJECT_KIND, SUBJECT_NAME, SUBJECT_CARD_UID]
+            .map(|name| column(name).is_not_null())
+            .into_iter()
+            .reduce(Expr::and)
+            .unwrap_or_else(|| lit(false));
+        let Some(objects) = &objects else {
+            return LogicalPlanBuilder::from(node)
+                .filter(known)?
+                .build()
+                .map(Transformed::yes);
+        };
         let visible = objects
             .iter()
             .map(|scope| {
@@ -3912,9 +3942,22 @@ pub(super) fn restrict_verification_rows(
                 }
             })
             .reduce(Expr::or)
-            .unwrap_or_else(|| lit(false));
-        Filter::try_new(visible, Arc::new(node))
-            .map(|filter| Transformed::yes(LogicalPlan::Filter(filter)))
+            .map_or_else(|| lit(false), |visible| known.and(visible));
+        let masked = scan
+            .projected_schema
+            .fields()
+            .iter()
+            .map(|field| {
+                when(visible.clone(), column(field.name()))
+                    .end()
+                    .map(|expr| expr.alias_qualified(Some(table.clone()), field.name()))
+            })
+            .collect::<datafusion::common::Result<Vec<_>>>()?;
+        LogicalPlanBuilder::from(node)
+            .filter(visible.clone())?
+            .project(masked)?
+            .build()
+            .map(Transformed::yes)
     })
     .map(|transformed| transformed.data)
     .map_err(|error| map_datafusion_error(&error))
@@ -5010,6 +5053,58 @@ mod tests {
         ));
     }
 
+    /// Proves execution read at any scope admits the managed verification
+    /// tables and no other table, while a table grant still admits only its
+    /// own table.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a table is admitted or refused against these grants.
+    #[test]
+    fn execution_read_admits_only_managed_verification_tables() {
+        use crate::namespaces::BifrostNamespace;
+        use wyrd_runtime::CardPermissionScope;
+        use wyrd_spec::envelope::CardKind;
+        use wyrd_spec::ids::CardName;
+
+        let tenant = DataTenantId::new_v7();
+        let resolved = |namespace, name: &str| {
+            let binding = TenantTableBinding::resolve((tenant, TableRef::new(namespace, name)))
+                .expect("tenant table binding");
+            vec![(binding, TableUid::from_bytes([7; 16]))]
+        };
+        let context = |permissions: &[Permission]| {
+            let mut context = payload_context(permissions);
+            context.principal.tenant_id = tenant;
+            context.data_tenant_id = tenant;
+            context
+        };
+        let family = context(
+            &[Permission::executions_read_any().at(PermissionScope::Card(
+                CardPermissionScope::family(
+                    CardKind::Repository,
+                    CardName::new("payments").expect("name"),
+                ),
+            ))],
+        );
+        let results = resolved(BifrostNamespace::Verification, "results");
+        let logs = resolved(BifrostNamespace::Logs, "records");
+        authorize_resolved_tables(&family, &results)
+            .expect("execution read admits the verification table");
+        assert!(matches!(
+            authorize_resolved_tables(&family, &logs),
+            Err(BifrostError::QueryForbidden)
+        ));
+        let table = context(&[Permission::bifrost_query_read()]);
+        authorize_resolved_tables(&table, &logs).expect("the query grant admits its table");
+        authorize_resolved_tables(&table, &results)
+            .expect("the query grant admits the table, whose rows stay filtered");
+        assert!(matches!(
+            authorize_resolved_tables(&context(&[]), &results),
+            Err(BifrostError::QueryForbidden)
+        ));
+    }
+
     /// A session whose `bifrost.verification.results` and `.evidence` hold
     /// one row under each of two Repository families, `payments` and
     /// `other`, plus one row with no trusted parent.
@@ -5074,12 +5169,14 @@ mod tests {
         session
     }
 
-    /// Proves managed verification rows are filtered by the reader's Card
-    /// read before any user expression: a `payments` family reader sees and
-    /// counts only payments rows through direct scans, predicates naming the
-    /// other family, joins, subqueries and aggregation; an exact-version
-    /// reader sees only its UID; a reader without Card read sees nothing even
-    /// with the table grant; tenant-wide Card read sees every row.
+    /// Proves managed verification rows are filtered by the reader's
+    /// execution read before any user expression: a `payments` family reader
+    /// sees and counts only payments rows through direct scans, predicates
+    /// naming the other family, joins, subqueries and aggregation; an
+    /// exact-version reader sees only its UID; a reader without execution read
+    /// sees nothing even with the table grant; tenant-wide read sees every
+    /// row with a known parent. A predicate that would fail on a hidden row's
+    /// values never sees them, so it cannot reveal the row by failing.
     ///
     /// # Panics
     ///
@@ -5094,22 +5191,25 @@ mod tests {
         let payments = || CardName::new("payments").expect("name");
         let family = payload_context(&[
             Permission::bifrost_query_read(),
-            Permission::card_read().at(PermissionScope::Card(CardPermissionScope::family(
-                CardKind::Repository,
-                payments(),
-            ))),
+            Permission::executions_read_any().at(PermissionScope::Card(
+                CardPermissionScope::family(CardKind::Repository, payments()),
+            )),
         ]);
         let exact = payload_context(&[
             Permission::bifrost_query_read(),
-            Permission::card_read().at(PermissionScope::Card(CardPermissionScope::version(
-                CardKind::Repository,
-                payments(),
-                CardUid::new("01927b4c-0000-7000-8000-000000000001").expect("uid"),
-            ))),
+            Permission::executions_read_any().at(PermissionScope::Card(
+                CardPermissionScope::version(
+                    CardKind::Repository,
+                    payments(),
+                    CardUid::new("01927b4c-0000-7000-8000-000000000001").expect("uid"),
+                ),
+            )),
         ]);
         let table_only = payload_context(&[Permission::bifrost_query_read()]);
-        let tenant_wide =
-            payload_context(&[Permission::bifrost_query_read(), Permission::card_read()]);
+        let tenant_wide = payload_context(&[
+            Permission::bifrost_query_read(),
+            Permission::executions_read_any(),
+        ]);
         let session = verification_session();
         let rows = |context: AuthorizedQueryContext, sql: &'static str| {
             let session = &session;
@@ -5170,6 +5270,11 @@ mod tests {
                  SELECT result_id FROM all_rows",
                 vec!["p1"],
             ),
+            (
+                "SELECT result_id FROM bifrost.verification.results WHERE \
+                 CAST(CASE WHEN subject_name = 'other' THEN 'hidden' ELSE '1' END AS BIGINT) = 1",
+                vec!["p1"],
+            ),
         ] {
             assert_eq!(rows(family.clone(), sql).await, expected, "{sql}");
         }
@@ -5191,7 +5296,7 @@ mod tests {
                 "SELECT result_id FROM bifrost.verification.results"
             )
             .await,
-            vec!["o1", "p1", "u1"]
+            vec!["o1", "p1"]
         );
     }
 

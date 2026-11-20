@@ -1195,6 +1195,7 @@ async fn revocation_and_admission_order_on_the_principal() {
             cancelled: vec![CancelledExecution {
                 execution_id: late.execution_id,
                 verifier_card_uid: custom.clone(),
+                card_uid: first_card.clone(),
                 attribution: late.authority.attribution(),
             }],
         },
@@ -1233,6 +1234,7 @@ async fn revocation_and_admission_order_on_the_principal() {
         [CancelledExecution {
             execution_id: early.execution_id,
             verifier_card_uid: custom,
+            card_uid: second_card,
             attribution: early.authority.attribution(),
         }],
         "the revocation cancels the admitted execution"
@@ -1317,6 +1319,7 @@ async fn background_admission_of_a_revoked_owner_is_cancelled() {
         [CancelledExecution {
             execution_id: occurrence.execution_id,
             verifier_card_uid: verifier,
+            card_uid: owner,
             attribution: authority.attribution(),
         }],
         "the admission returns what its fence cancelled"
@@ -4360,6 +4363,7 @@ async fn stored_cancellations(
         expected.push(CancelledExecution {
             execution_id: *execution,
             verifier_card_uid: stored.verifier_card_uid,
+            card_uid: stored.card_uid,
             attribution: stored.attribution,
         });
     }

@@ -422,7 +422,11 @@ test("caller without the verifier grant is refused", async ({ server, assistant 
   const keys = [
     server.scopedApiKey("operators_only", ["operators:invoke"]),
     server.scopedApiKey("other_verifier", [
-      { resource: "verifier", action: "run", scope: { verifier: assistant.answerJudged.uid } },
+      {
+        resource: "verifier",
+        action: "run",
+        scope: { card: { version: { kind: "Verifier", name: "answer-judged", uid: assistant.answerJudged.uid } } },
+      },
     ]),
   ];
   for (const credential of keys) {
@@ -467,7 +471,11 @@ test("retired verification contracts are refused", async ({ server, assistant })
 
 test("exact verifier grant verifies only that verifier", async ({ server, assistant }) => {
   const credential = server.scopedApiKey("exact_verifier", [
-    { resource: "verifier", action: "run", scope: { verifier: assistant.answerCheck.uid } },
+    {
+      resource: "verifier",
+      action: "run",
+      scope: { card: { version: { kind: "Verifier", name: "answer-check", uid: assistant.answerCheck.uid } } },
+    },
   ]);
   const run = assistantAs(assistant, WyrdClient.connect({ credential })).run("agent");
 
@@ -596,7 +604,11 @@ test("grouped support resumes", async ({ server, assistant }) => {
   );
   await (await verify.Execution.connect(ownerless)).wait({ timeoutMs: WAIT_MS });
   const other = server.scopedApiKey("other_verifier", [
-    { resource: "verifier", action: "run", scope: { verifier: assistant.answerCheck.uid } },
+    {
+      resource: "verifier",
+      action: "run",
+      scope: { card: { version: { kind: "Verifier", name: "answer-check", uid: assistant.answerCheck.uid } } },
+    },
   ]);
   await expect(
     WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: other }) })
@@ -868,7 +880,11 @@ test("grouped sampled frames use visible outcomes", async ({ server, provider, a
   const executions = await submitFrames(state, "door-43", failing);
   await waited(await submitFrames(otherState, "door-43", [frame("other-001")]));
   const unauthorized = server.scopedApiKey("frames_denied", [
-    { resource: "verifier", action: "run", scope: { verifier: assistant.answerCheck.uid } },
+    {
+      resource: "verifier",
+      action: "run",
+      scope: { card: { version: { kind: "Verifier", name: "answer-check", uid: assistant.answerCheck.uid } } },
+    },
   ]);
   await expect(
     WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: unauthorized }) })

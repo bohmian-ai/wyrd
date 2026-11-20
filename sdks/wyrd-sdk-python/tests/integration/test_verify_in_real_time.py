@@ -67,7 +67,11 @@ CALLS = "/v1/chat/completions"
 def verifier_run(cards: Cards, verifier: str) -> dict[str, object]:
     """The ``verifier:run`` grant on exactly the registered ``verifier``."""
     uid = declare(cards, f"cards/verify_in_real_time/{verifier}.yaml")[verifier].uid
-    return {"resource": "verifier", "action": "run", "scope": {"verifier": str(uid)}}
+    return {
+        "resource": "verifier",
+        "action": "run",
+        "scope": {"card": {"version": {"kind": "Verifier", "name": verifier, "uid": str(uid)}}},
+    }
 
 
 def principal(service: str = "assistant") -> str:

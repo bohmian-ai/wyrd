@@ -31,6 +31,9 @@ pub struct UserRow {
 /// `auth_type` must satisfy the database check constraint. `password_hash` is
 /// present only for password-backed users.
 ///
+/// Advances the tenant's authorization revision in the same transaction, so
+/// every replica's authority cache reloads the changed account or credential.
+///
 /// # Errors
 /// Returns a SQLx error when Postgres rejects the insert.
 pub async fn insert_user(
@@ -54,6 +57,7 @@ pub async fn insert_user(
     .bind(auth_type)
     .execute(&mut **conn.transaction())
     .await?;
+    super::advance_authorization_revision(conn).await?;
     Ok(())
 }
 
@@ -96,6 +100,9 @@ pub struct LocalCredentialRow {
 /// Insert a new active local User with canonical `username` and the PHC
 /// `password_hash` verifier, at password revision zero.
 ///
+/// Advances the tenant's authorization revision in the same transaction, so
+/// every replica's authority cache reloads the changed account or credential.
+///
 /// # Errors
 /// Returns a SQLx error when Postgres rejects the insert, including a unique
 /// violation when the tenant already has a local User with `username`.
@@ -118,6 +125,7 @@ pub async fn insert_local_user(
     .bind(password_hash)
     .execute(&mut **conn.transaction())
     .await?;
+    super::advance_authorization_revision(conn).await?;
     Ok(())
 }
 
@@ -220,6 +228,9 @@ pub async fn set_password_hash(
 ///
 /// Returns `Ok(true)` when a row was updated, `Ok(false)` when no row matched.
 ///
+/// Advances the tenant's authorization revision in the same transaction, so
+/// every replica's authority cache reloads the changed account or credential.
+///
 /// # Errors
 /// Returns a SQLx error when Postgres rejects the update.
 pub async fn delete_user(conn: &mut TenantConn<'_>, id: Uuid) -> Result<bool, sqlx::Error> {
@@ -232,6 +243,7 @@ pub async fn delete_user(conn: &mut TenantConn<'_>, id: Uuid) -> Result<bool, sq
     .bind(id)
     .execute(&mut **conn.transaction())
     .await?;
+    super::advance_authorization_revision(conn).await?;
     Ok(result.rows_affected() > 0)
 }
 

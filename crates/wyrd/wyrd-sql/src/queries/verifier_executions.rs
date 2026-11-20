@@ -623,7 +623,7 @@ const CANCEL_PRINCIPAL_SQL: &str = r"
            updated_at = statement_timestamp()
      WHERE (sub_principal_id = $1 OR act_principal_id = $1)
        AND status IN ('pending', 'retrying', 'running')
-    RETURNING execution_id, verifier_card_uid, sub_principal_id, act_principal_id
+    RETURNING execution_id, verifier_card_uid, card_uid, sub_principal_id, act_principal_id
 ";
 
 /// Which of principals `$1` are no longer active, read once every listed
@@ -1011,6 +1011,8 @@ pub struct CancelledExecution {
     pub execution_id: ExecutionId,
     /// The Verifier that would have run it.
     pub verifier_card_uid: CardUid,
+    /// The Card it would have verified, its records' trusted read parent.
+    pub card_uid: CardUid,
     /// Its subject and accepting actor.
     pub attribution: Attribution,
 }
@@ -1022,6 +1024,8 @@ struct CancelledRow {
     execution_id: Uuid,
     /// Frozen Verifier Card UID.
     verifier_card_uid: Uuid,
+    /// Frozen subject Card UID.
+    card_uid: Uuid,
     /// Submitting subject.
     sub_principal_id: Uuid,
     /// Accepting actor.
@@ -1037,6 +1041,7 @@ impl CancelledRow {
         Ok(CancelledExecution {
             execution_id: stored(ExecutionId::new(self.execution_id))?,
             verifier_card_uid: stored(CardUid::from_uuid(self.verifier_card_uid))?,
+            card_uid: stored(CardUid::from_uuid(self.card_uid))?,
             attribution: Attribution::new(
                 PrincipalId::new(self.sub_principal_id),
                 PrincipalId::new(self.act_principal_id),

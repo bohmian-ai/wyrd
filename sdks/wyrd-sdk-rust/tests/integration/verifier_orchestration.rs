@@ -1168,7 +1168,7 @@ async fn reached(
 /// work; a `null` comparison blocks it; a decision known before the extra
 /// review is eligible makes no call. The consolidator only ever reads the
 /// recorded disposition, never a pending one, and receives the account only
-/// when it was admitted, while a caller holding only `verifier:read` still
+/// when it was admitted, while a caller holding only `executions:read` still
 /// inspects the retained excluded account, leaving its disposition unchanged.
 ///
 /// Each race is ordered by holding provider answers and observing the
@@ -1257,7 +1257,7 @@ async fn speculative_disposition_controls_consumer_admission() {
             .deployment
             .granted_key(
                 "speculation_reader",
-                &[json!({"resource": "verifier", "action": "read", "scope": "all"})],
+                &[json!({"resource": "executions", "action": "read", "scope": "all"})],
             )
             .await,
     );
@@ -1398,7 +1398,7 @@ async fn speculative_disposition_controls_consumer_admission() {
                     },
                 )
                 .await
-                .expect("a verifier:read grant inspects the retained account");
+                .expect("an executions:read grant inspects the retained account");
             assert_eq!(
                 inspected.content,
                 PublicationContent::Json {

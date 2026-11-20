@@ -207,7 +207,10 @@ impl Deployment {
         self.granted_key(
             name,
             &[serde_json::json!({
-                "resource": "verifier", "action": "run", "scope": { "verifier": uid }
+                "resource": "verifier", "action": "run",
+                "scope": { "card": { "version": {
+                    "kind": verifier.kind, "name": verifier.name, "uid": uid
+                } } }
             })],
         )
         .await

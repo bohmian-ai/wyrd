@@ -139,7 +139,13 @@ test("another principal approves the pending signoff and the same execution pass
   expect(refused).toBeInstanceOf(WyrdError);
   expect((refused as WyrdError).code).toBe("WYRD_PERMISSION_403_DENIED_RBAC");
 
-  const approver = await as("signoff_editor", "editor");
+  const editorRefused = await (await as("signoff_editor", "editor"))
+    .decide(pending.approval_id, "approved")
+    .catch((error: unknown) => error);
+  expect(editorRefused).toBeInstanceOf(WyrdError);
+  expect((editorRefused as WyrdError).code).toBe("WYRD_PERMISSION_403_DENIED_RBAC");
+
+  const approver = await as("signoff_approver", "approver");
   const decided = await approver.decide(pending.approval_id, "approved", "reviewed the diff");
   expect(decided).toMatchObject({ approval_id: pending.approval_id, status: "approved", reason: "reviewed the diff" });
   expect(decided.actor_id).toBeTruthy();

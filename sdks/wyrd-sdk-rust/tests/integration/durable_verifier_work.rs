@@ -279,8 +279,9 @@ fn refused<T: std::fmt::Debug>(result: Result<T, wyrd_ai::WyrdError>) -> String 
 /// refused. Each publication reads back with its value or manifest, a file
 /// and a listed directory file plan their downloads with the manifest's size
 /// and digest, and a JSON or unlisted download, a path on a read, and
-/// another attempt are refused. A caller with `cards:read` but no `verifier:read`, or
-/// with it for another Verifier only, is refused; one scoped to this Verifier reads.
+/// another attempt are refused. Tenant-wide `cards:read` reads; a caller holding only
+/// `verifier:run`, or `executions:read` on another subject Card only, is refused; one
+/// scoped to this execution's subject Card reads.
 /// Another tenant sees no such execution. A viewer cannot cancel; the
 /// administrator's cancel and its repeat both answer `cancelled`, and the
 /// publications stay listed. The `wyrd execution` command lists, reads,
@@ -305,10 +306,10 @@ async fn execution_pages_are_stable_and_tenant_scoped() {
         .expect("the tenant provisions");
     let (subject, _) = fixture.service("pages-subject").await.expect("service");
     let verifier = fixture.drift_verifier("pages").await.expect("verifier");
-    let other = fixture
-        .drift_verifier("pages-other")
+    let (other, _) = fixture
+        .service("pages-other-subject")
         .await
-        .expect("verifier");
+        .expect("service");
     fixture
         .submit(&verifier, &subject, std::collections::BTreeMap::new())
         .await
@@ -554,7 +555,11 @@ async fn execution_pages_are_stable_and_tenant_scoped() {
         "WYRD_VERIFICATION_404_PUBLICATION_NOT_FOUND"
     );
 
-    let grant = |uid: &dyn std::fmt::Display| json!({"resource": "verifier", "action": "read", "scope": {"verifier": uid.to_string()}});
+    let grant = |name: &str, uid: &dyn std::fmt::Display| {
+        json!({"resource": "executions", "action": "read", "scope": {"card": {"version": {
+            "kind": "Service", "name": name, "uid": uid.to_string()
+        }}}})
+    };
     let session = &deployment;
     let as_key = |key: String| async move {
         Execution::connect_with(id, &session.client(&key))
@@ -562,14 +567,23 @@ async fn execution_pages_are_stable_and_tenant_scoped() {
             .expect("the execution handle connects")
     };
     let cards_only = json!({"resource": "cards", "action": "read", "scope": "all"});
-    let nobody = as_key(deployment.granted_key("pages_cards", &[cards_only]).await).await;
+    let reader = as_key(deployment.granted_key("pages_cards", &[cards_only]).await).await;
+    assert!(
+        reader
+            .invocations(&ExecutionPageQuery::default())
+            .await
+            .is_ok(),
+        "tenant-wide Card read includes every parent's executions"
+    );
+    let run_only = json!({"resource": "verifier", "action": "run", "scope": "all"});
+    let nobody = as_key(deployment.granted_key("pages_run", &[run_only]).await).await;
     assert_eq!(
         refused(nobody.invocations(&ExecutionPageQuery::default()).await),
         "WYRD_PERMISSION_403_DENIED_RBAC"
     );
     let elsewhere = as_key(
         deployment
-            .granted_key("pages_elsewhere", &[grant(&other)])
+            .granted_key("pages_elsewhere", &[grant("pages-other-subject", &other)])
             .await,
     )
     .await;
@@ -579,7 +593,7 @@ async fn execution_pages_are_stable_and_tenant_scoped() {
     );
     let exact = as_key(
         deployment
-            .granted_key("pages_exact", &[grant(&verifier)])
+            .granted_key("pages_exact", &[grant("pages-subject", &subject)])
             .await,
     )
     .await;
@@ -587,7 +601,7 @@ async fn execution_pages_are_stable_and_tenant_scoped() {
         exact
             .publications(&ExecutionPageQuery::default())
             .await
-            .expect("an exact verifier:read grant reads")
+            .expect("an exact executions:read grant reads")
             .items,
         publications
     );

@@ -249,7 +249,7 @@ def test_speculative_disposition_controls_consumer_admission(
     reader = client_of(
         wyrd_server,
         wyrd_server.scoped_api_key(
-            "speculation_reader", [{"resource": "verifier", "action": "read", "scope": "all"}]
+            "speculation_reader", [{"resource": "executions", "action": "read", "scope": "all"}]
         ),
     )
     for question, race, called, status, speculation, names, retained in SPECULATED:

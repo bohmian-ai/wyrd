@@ -43,9 +43,13 @@ function bindAll(id: string, kind: PrincipalKind, role: string): CreateRoleBindi
   return { subject: { principal: { id, kind } }, role, scope: "all" };
 }
 
-/** Each grant's role and source kind, in the summary's order. */
+/** Each grant's role and source kind, in role, then source order; the summary promises no order. */
 function grants(access: AccessSummary): [string, string][] {
-  return access.grants.map((grant) => [grant.role, grant.source.kind]);
+  return access.grants
+    .map((grant): [string, string] => [grant.role, grant.source.kind])
+    .sort(([role, source], [otherRole, otherSource]) =>
+      role === otherRole ? source.localeCompare(otherSource) : role.localeCompare(otherRole),
+    );
 }
 
 /** Register `AUTHORED` through a fresh client, so it carries the key's next token. */

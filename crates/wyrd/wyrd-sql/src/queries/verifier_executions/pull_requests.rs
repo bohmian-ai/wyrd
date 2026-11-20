@@ -139,7 +139,7 @@ const DEACTIVATE_SQL: &str = concat!(
       WHERE ",
     this_pull_request!(),
     " AND (status IN ('pending', 'retrying', 'running') OR pr_deactivated_at IS NULL)
-     RETURNING execution_id, verifier_card_uid, sub_principal_id, act_principal_id,
+     RETURNING execution_id, verifier_card_uid, card_uid, sub_principal_id, act_principal_id,
                status = 'cancelled' AND error = $4 AS cancelled"
 );
 
@@ -152,7 +152,7 @@ const SUPERSEDE_SQL: &str = concat!(
       WHERE ",
     this_pull_request!(),
     " AND status IN ('pending', 'retrying', 'running')
-     RETURNING execution_id, verifier_card_uid, sub_principal_id, act_principal_id"
+     RETURNING execution_id, verifier_card_uid, card_uid, sub_principal_id, act_principal_id"
 );
 
 /// Cancel the unfinished PR executions of host `$1` whose repository is one
@@ -174,7 +174,7 @@ const CANCEL_REPOSITORIES_SQL: &str = "
      WHERE origin = 'pull_request' AND pull_request->>'host' = $1
        AND ($2::text[] IS NULL OR pull_request->>'repository_id' = ANY($2))
        AND (status IN ('pending', 'retrying', 'running') OR pr_deactivated_at IS NULL)
-     RETURNING execution_id, verifier_card_uid, sub_principal_id, act_principal_id,
+     RETURNING execution_id, verifier_card_uid, card_uid, sub_principal_id, act_principal_id,
                status = 'cancelled' AND error = $3 AS cancelled
 ";
 

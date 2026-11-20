@@ -87,6 +87,16 @@ impl EffectivePermissions {
                 .all(|set| set.covers_operation(resource, action))
     }
 
+    /// True when every layer admits the Bifrost read surface: a
+    /// `bifrost_query:read` grant at some scope, or `executions:read` at some
+    /// Card, which reaches the managed verification tables filtered to that
+    /// Card's rows. Coarse admission only; each table is still authorized.
+    #[must_use]
+    pub fn reads_bifrost(&self) -> bool {
+        self.covers_operation(&Resource::BifrostQuery, &Action::Read)
+            || self.covers_operation(&Resource::Executions, &Action::Read)
+    }
+
     /// True when no layer combination could allow anything.
     #[must_use]
     pub fn is_empty(&self) -> bool {

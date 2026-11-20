@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 
 import { expect, vi } from "vitest";
 
-import { type ExecutionInvocation, type PublicationSummary, WyrdClient, verify } from "wyrd-ai";
+import { Cards, type ExecutionInvocation, type PublicationSummary, WyrdClient, verify } from "wyrd-ai";
 
 import { assistantTest } from "../support/assistant.js";
 import { serverTest } from "../support/server.js";
@@ -36,7 +36,7 @@ function retained(path: string, content: string) {
  * Its one requirement attempt reads with its outcome and reason, and pages
  * of one entry end where one page does; a malformed cursor and a limit outside 1–200 are refused, and an
  * attempt that published nothing reads as publication-not-found. A caller
- * with `cards:read` but no `verifier:read` is refused, another tenant sees
+ * with tenant-wide `cards:read` reads, one with only `verifier:run` is refused, another tenant sees
  * no such execution, and a viewer reads but cannot cancel. The
  * administrator's cancel and its repeat both answer the settled status.
  */
@@ -87,8 +87,10 @@ test("execution_pages_are_stable_and_tenant_scoped", async ({ server, state }) =
 
   const as = (credential: string) => verify.Execution.connect(id, { client: WyrdClient.connect({ credential }) });
   const cardsOnly = await as(server.scopedApiKey("pages_cards", [{ resource: "cards", action: "read", scope: "all" }]));
-  await expect(cardsOnly.invocations()).rejects.toMatchObject(DENIED);
-  await expect(cardsOnly.publications()).rejects.toMatchObject(DENIED);
+  expect((await cardsOnly.invocations()).execution_id).toBe(id);
+  const runOnly = await as(server.scopedApiKey("pages_run", [{ resource: "verifier", action: "run", scope: "all" }]));
+  await expect(runOnly.invocations()).rejects.toMatchObject(DENIED);
+  await expect(runOnly.publications()).rejects.toMatchObject(DENIED);
   const foreign = await as(
     server.bootstrapServiceInTenant(server.seedTenant("pages-foreign"), ["admin"], "pages_foreign_admin"),
   );
@@ -118,7 +120,7 @@ test("execution_pages_are_stable_and_tenant_scoped", async ({ server, state }) =
  * answer `cancelled` with the publications still listed.
  */
 held("held_execution_reads_and_downloads_its_publications_and_cancels", async ({ server }) => {
-  const { executionId: id, verifier } = server.holdPublications("held-pages");
+  const { executionId: id } = server.holdPublications("held-pages");
   const admin = WyrdClient.connect({ credential: server.apiKey });
   const execution = await verify.Execution.connect(id, { client: admin });
 
@@ -174,8 +176,20 @@ held("held_execution_reads_and_downloads_its_publications_and_cancels", async ({
   await expect(execution.download("review", "verdict", { attempt: 1 })).rejects.toMatchObject(INVALID);
 
   const as = (credential: string) => verify.Execution.connect(id, { client: WyrdClient.connect({ credential }) });
+  const [subject] = (
+    await (await Cards.connect({ client: admin })).list({ kind: "Service", name: "held-pages-subject" })
+  ).items;
+  if (subject === undefined) {
+    throw new Error("the held execution's subject Service is declared");
+  }
   const exact = await as(
-    server.scopedApiKey("held_exact", [{ resource: "verifier", action: "read", scope: { verifier } }]),
+    server.scopedApiKey("held_exact", [
+      {
+        resource: "executions",
+        action: "read",
+        scope: { card: { version: { kind: "Service", name: "held-pages-subject", uid: subject.card_uid } } },
+      },
+    ]),
   );
   expect(await exact.publications()).toEqual({ execution_id: id, items: listed, next_cursor: null });
   const viewer = await as(server.bootstrapService(["viewer"], "held_viewer"));

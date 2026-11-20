@@ -137,7 +137,7 @@ test("caller without bifrost read is refused", async ({ server }) => {
   });
 
   await expect(denied.sql(`SELECT id FROM ${QUERY_ROWS}`)).rejects.toMatchObject({
-    code: "WYRD_PERMISSION_403_DENIED_RBAC",
+    code: "WYRD_VALA_403_QUERY_FORBIDDEN",
   });
 });
 

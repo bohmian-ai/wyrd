@@ -478,10 +478,7 @@ impl ReadyOracleForwarder {
     fn validate_context(context: &AuthorizedQueryContext) -> Result<(), BifrostError> {
         if context.principal.tenant_id != context.data_tenant_id
             || context.permission != Permission::bifrost_query_read()
-            || !context.principal.effective_permissions.covers_operation(
-                &wyrd_runtime::Resource::BifrostQuery,
-                &wyrd_runtime::Action::Read,
-            )
+            || !context.principal.effective_permissions.reads_bifrost()
         {
             return Err(BifrostError::QueryPeerSecurity);
         }

@@ -3680,17 +3680,22 @@ impl WyrdTestServer {
     /// through the shared upsert and advances the authorization revision.
     ///
     /// A role is an operation bundle; a binding supplies the scope. Each
-    /// permission is stored as its `resource` and `action`: a tenant-wide
-    /// (`all`) scope is dropped, and a narrower scope is refused so a scoped
-    /// grant is written with [`Self::grant_role_at`]. A raw JSON document
-    /// lets a journey seed an operation the current schema rejects so the
-    /// server's own decode, not this fixture, refuses it.
+    /// permission is stored as its `resource` and `action`, and its scope
+    /// becomes a fixture binding: a later bootstrap or [`Self::grant_role`]
+    /// binds the role at the scope its permissions share, so seeding
+    /// `verifier:run` at one Verifier and bootstrapping a principal with that
+    /// role grants exactly that Verifier. Permissions at several scopes are
+    /// also seeded as one part role `{name}_scope{n}` per scope, and granting
+    /// `name` binds every part at its own scope. [`Self::grant_role_at`]
+    /// binds `name`'s whole bundle at any other scope. A raw JSON operation
+    /// lets a journey seed one the current schema rejects so the server's own
+    /// decode, not this fixture, refuses it.
     ///
     /// # Errors
     ///
-    /// Returns an error when the permissions cannot be serialized, one names
-    /// a narrower scope than `all`, the name collides with a builtin role, or
-    /// the tenant write fails.
+    /// Returns an error when the permissions cannot be serialized, name an
+    /// unparseable scope, the name collides with a builtin role, or the
+    /// tenant write fails.
     pub async fn seed_role<P: serde::Serialize>(
         &self,
         name: &str,
@@ -3698,33 +3703,56 @@ impl WyrdTestServer {
     ) -> Result<(), WyrdTestServerError> {
         let mut payload = serde_json::to_value(permissions)
             .map_err(|error| WyrdTestServerError::Io(error.to_string()))?;
+        let mut groups = std::collections::BTreeMap::<String, Vec<serde_json::Value>>::new();
         for operation in payload.as_array_mut().into_iter().flatten() {
             let scope = operation
                 .as_object_mut()
-                .and_then(|fields| fields.remove("scope"));
-            if scope.is_some_and(|scope| scope != "all") {
-                return Err(WyrdTestServerError::Io(format!(
-                    "role {name} names a scoped operation; bind the scope with grant_role_at"
-                )));
-            }
+                .and_then(|fields| fields.remove("scope"))
+                .unwrap_or_else(|| serde_json::json!("all"));
+            groups
+                .entry(scope.to_string())
+                .or_default()
+                .push(operation.clone());
+        }
+        let single = groups.len() <= 1;
+        let mut bindings = Vec::with_capacity(groups.len().max(1));
+        let mut roles = vec![(name.to_owned(), payload.clone())];
+        for (index, (scope, operations)) in groups.into_iter().enumerate() {
+            let scope: wyrd_spec::auth::PermissionScope = serde_json::from_str(&scope)
+                .map_err(|error| WyrdTestServerError::Io(format!("role {name}: {error}")))?;
+            let role = if single {
+                name.to_owned()
+            } else {
+                let part = format!("{name}_scope{index}");
+                roles.push((part.clone(), serde_json::Value::Array(operations)));
+                part
+            };
+            bindings.push((role, scope));
+        }
+        if bindings.is_empty() {
+            bindings.push((name.to_owned(), wyrd_spec::auth::PermissionScope::All));
         }
         let mut conn = self.tenant_conn().await?;
-        wyrd_sql::queries::auth::insert_role(
-            &mut conn,
-            Uuid::new_v5(
-                &wyrd_runtime::builtin_roles::NS_BUILTIN_ROLE,
-                format!("{}:{name}", self.data_tenant_id()).as_bytes(),
-            ),
-            name,
-            &payload,
-            false,
-        )
-        .await
-        .map_err(sql)?;
+        for (role, operations) in &roles {
+            wyrd_sql::queries::auth::insert_role(
+                &mut conn,
+                Uuid::new_v5(
+                    &wyrd_runtime::builtin_roles::NS_BUILTIN_ROLE,
+                    format!("{}:{role}", self.data_tenant_id()).as_bytes(),
+                ),
+                role,
+                operations,
+                false,
+            )
+            .await
+            .map_err(sql)?;
+        }
         advance_authorization_revision(&mut conn)
             .await
             .map_err(sql)?;
-        conn.commit().await.map_err(sql)
+        conn.commit().await.map_err(sql)?;
+        remember_role_bindings(self.data_tenant_id(), name, bindings);
+        Ok(())
     }
 
     /// Deploy `openai/{model}` Chat Completions as the `openai` deployment
@@ -3798,7 +3826,8 @@ impl WyrdTestServer {
         .await
     }
 
-    /// Grant a role to a bootstrapped principal tenant-wide.
+    /// Grant a role to a bootstrapped principal at the scopes it was seeded
+    /// with, tenant-wide for a builtin role.
     ///
     /// # Errors
     /// Returns an error when the role is unknown or SQL fails.
@@ -3807,8 +3836,13 @@ impl WyrdTestServer {
         principal: &Bootstrap,
         role: &str,
     ) -> Result<(), WyrdTestServerError> {
-        self.grant_role_at(principal, role, &wyrd_spec::auth::PermissionScope::All)
-            .await
+        let (id, table) = match principal {
+            Bootstrap::User { id, .. } => (id.as_uuid(), PrincipalTable::User),
+            Bootstrap::Machine { id, .. } => (id.as_uuid(), PrincipalTable::ServiceAccount),
+        };
+        let mut conn = self.tenant_conn().await?;
+        grant_role(&mut conn, id, table, role).await?;
+        conn.commit().await.map_err(sql)
     }
 
     /// Bind a role to a bootstrapped principal at `scope`, advancing the
@@ -3831,7 +3865,8 @@ impl WyrdTestServer {
         conn.commit().await.map_err(sql)
     }
 
-    /// Revoke a role from a bootstrapped principal.
+    /// Revoke a role, and every part role it was seeded as, from a
+    /// bootstrapped principal.
     ///
     /// # Errors
     /// Returns an error when the role is unknown or SQL fails.
@@ -3841,7 +3876,10 @@ impl WyrdTestServer {
         role: &str,
     ) -> Result<(), WyrdTestServerError> {
         let mut conn = self.tenant_conn().await?;
-        let role_id = lookup_role_id(&mut conn, role).await?;
+        let mut role_ids = vec![lookup_role_id(&mut conn, role).await?];
+        for (part, _) in seeded_role_bindings(self.data_tenant_id(), role) {
+            role_ids.push(lookup_role_id(&mut conn, &part).await?);
+        }
         let subject = match principal {
             Bootstrap::User { id, .. } => subject_columns(id.as_uuid(), PrincipalTable::User),
             Bootstrap::Machine { id, .. } => {
@@ -3849,7 +3887,7 @@ impl WyrdTestServer {
             }
         };
         for binding in list_role_bindings(&mut conn).await.map_err(sql)? {
-            if binding.role_id == role_id && binding.subject == subject {
+            if role_ids.contains(&binding.role_id) && binding.subject == subject {
                 delete_role_binding(&mut conn, binding.id)
                     .await
                     .map_err(sql)?;
@@ -5998,20 +6036,50 @@ enum PrincipalTable {
     ServiceAccount,
 }
 
+/// Bind `role` to a fixture account at the scopes it was seeded with.
 async fn grant_role(
     conn: &mut TenantConn<'_>,
     principal_id: Uuid,
     table: PrincipalTable,
     role: &str,
 ) -> Result<(), WyrdTestServerError> {
-    bind_role(
-        conn,
-        principal_id,
-        table,
-        role,
-        &wyrd_spec::auth::PermissionScope::All,
-    )
-    .await
+    for (role, scope) in seeded_role_bindings(conn.data_tenant_id(), role) {
+        bind_role(conn, principal_id, table, &role, &scope).await?;
+    }
+    Ok(())
+}
+
+/// The bindings each role [`WyrdTestServer::seed_role`] seeded in this
+/// process grants: the stored role and scope of each part, keyed by tenant
+/// and role name.
+///
+/// Process-wide so every node of a multi-node harness over one database binds
+/// a seeded role alike. A role not seeded here, such as a builtin, binds
+/// itself tenant-wide.
+static SEEDED_ROLE_BINDINGS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<(DataTenantId, String), RoleBindings>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// The stored role and scope of each binding one seeded role grants.
+type RoleBindings = Vec<(String, wyrd_spec::auth::PermissionScope)>;
+
+/// Record that granting `role` in `tenant` binds `bindings`.
+fn remember_role_bindings(tenant: DataTenantId, role: &str, bindings: RoleBindings) {
+    SEEDED_ROLE_BINDINGS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert((tenant, role.to_owned()), bindings);
+}
+
+/// What granting `role` in `tenant` binds: its seeded bindings, else the
+/// role itself tenant-wide.
+fn seeded_role_bindings(tenant: DataTenantId, role: &str) -> RoleBindings {
+    SEEDED_ROLE_BINDINGS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&(tenant, role.to_owned()))
+        .cloned()
+        .unwrap_or_else(|| vec![(role.to_owned(), wyrd_spec::auth::PermissionScope::All)])
 }
 
 /// Bind `role` to a fixture account at `scope` and advance the revision.

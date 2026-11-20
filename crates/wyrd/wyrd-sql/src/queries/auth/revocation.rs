@@ -15,6 +15,9 @@ use crate::TenantConn;
 /// A deleted user stays deleted; an already-suspended user is left as is and
 /// still reported as found, so a repeated revocation is idempotent.
 ///
+/// Advances the tenant's authorization revision in the same transaction, so
+/// every replica's authority cache reloads the changed account or credential.
+///
 /// # Errors
 /// Returns a SQLx error on database failure.
 pub async fn suspend_user_principal(
@@ -33,6 +36,7 @@ pub async fn suspend_user_principal(
     .bind(id)
     .execute(&mut **conn.transaction())
     .await?;
+    super::advance_authorization_revision(conn).await?;
     Ok(result.rows_affected() > 0)
 }
 
@@ -41,6 +45,9 @@ pub async fn suspend_user_principal(
 /// Same contract as [`suspend_user_principal`], on the machine table. The
 /// internal SYSTEM writer has no lifecycle, so it never matches and reads as
 /// not found.
+///
+/// Advances the tenant's authorization revision in the same transaction, so
+/// every replica's authority cache reloads the changed account or credential.
 ///
 /// # Errors
 /// Returns a SQLx error on database failure.
@@ -61,5 +68,6 @@ pub async fn suspend_service_account_principal(
     .bind(id)
     .execute(&mut **conn.transaction())
     .await?;
+    super::advance_authorization_revision(conn).await?;
     Ok(result.rows_affected() > 0)
 }

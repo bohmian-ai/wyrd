@@ -252,6 +252,7 @@ async fn the_served_document_describes_the_composed_surface() {
         "/auth/device",
         "/auth/revoke",
         "/platform/tenants",
+        "/platform/stored-secrets/maintenance",
         "/v1/admin/gateway/provider-credentials",
         "/v1/admin/gateway/provider-credentials/{name}",
         "/v1/admin/gateway/provider-credentials/{name}/revoke",

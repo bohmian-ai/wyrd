@@ -2872,6 +2872,26 @@ async fn tenant_connection_admin_journey() {
     srv.shutdown().await.expect("server shuts down cleanly");
 }
 
+/// Run one explicit routine wrapping-key maintenance pass on `replica`, as a
+/// platform administrator's `POST /platform/stored-secrets/maintenance` does.
+///
+/// # Panics
+/// Panics when the pass fails or leaves an envelope behind.
+async fn routine_pass(replica: &WyrdTestServer) {
+    let report = wyrd_server::components::platform::stored_secrets::StoredSecretMaintenance::new(
+        replica.operator_pool().clone(),
+        replica.state().auth.kms.clone(),
+    )
+    .run(
+        wyrd_spec::security::stored_secret::StoredSecretMaintenanceMode::Routine,
+        None,
+        std::time::Duration::from_secs(30),
+    )
+    .await
+    .expect("the pass reads the catalog");
+    assert_eq!(report.remaining, 0, "the pass moved everything: {report:?}");
+}
+
 /// Candidate lifecycle, secret rotation, and replica safety for one tenant.
 ///
 /// Two replicas share one database and one `[kms]` key directory. Replica A
@@ -2886,11 +2906,12 @@ async fn tenant_connection_admin_journey() {
 ///      refused;
 ///   4. two concurrent activations of the same revision, recovered by a
 ///      principal distinct from the bearer caller, yield exactly one winner;
-///   5. replica B boots with K2 as the active key and K1 retained, rewraps the
-///      stored secret under K2, and both replicas still sign alice in;
+///   5. replica B boots with K2 as the active key and K1 retained, which moves
+///      no stored secret; an explicit routine pass on B rewraps it under K2,
+///      and both replicas still sign alice in;
 ///   6. A, still sealing with K1, stages a late secret after B's pass; A,
-///      the only K1 writer, is then shut down, so the final pass (replica C,
-///      started from K2-writing B) runs with no K1 writer left in service,
+///      the only K1 writer, is then shut down, so the final explicit pass on
+///      K2-writing B runs with no K1 writer left in service,
 ///      leaves every stored secret current under K2, and a replica holding
 ///      only K2 then signs alice in;
 ///   7. from then on only K2 writers serve: a same-issuer secret rotation
@@ -3171,7 +3192,8 @@ async fn tenant_connection_rotation_journey() {
     )
     .await;
 
-    // 5. Replica B switches the write key to K2; its boot rewraps the secret.
+    // 5. Replica B switches the write key to K2; activation moves nothing,
+    //    and an explicit routine pass on B rewraps the secret.
     let under_k1 = replica_a
         .human_connection_secret_ciphertext(tenant, "Active")
         .await
@@ -3186,12 +3208,25 @@ async fn tenant_connection_rotation_journey() {
         .start_replica(WyrdTestServerBuilder::default().with_kms_for_test(keyring("k2", &["k1"])))
         .await
         .expect("replica B starts");
+    assert_eq!(
+        replica_a
+            .human_connection_secret_ciphertext(tenant, "Active")
+            .await
+            .expect("ciphertext reads")
+            .as_deref(),
+        Some(under_k1.as_slice()),
+        "activation alone moved no stored secret"
+    );
+    routine_pass(&replica_b).await;
     let under_k2 = replica_a
         .human_connection_secret_ciphertext(tenant, "Active")
         .await
         .expect("ciphertext reads")
         .expect("active connection stores a secret");
-    assert_ne!(under_k1, under_k2, "boot rewrapped the stored secret");
+    assert_ne!(
+        under_k1, under_k2,
+        "the routine pass rewrapped the stored secret"
+    );
     assert!(
         k2_only.is_current(&under_k2).expect("a common envelope"),
         "the rewrapped secret references only the active key"
@@ -3215,8 +3250,8 @@ async fn tenant_connection_rotation_journey() {
 
     // 6. A still seals with K1 after B's pass reported nothing left: a late
     //    K1 write. A is then taken out of service, so no K1 writer remains;
-    //    the final pass (replica C, started from K2-writing B) reseals the
-    //    late write, and a K2-only replica then serves login.
+    //    a final explicit pass on K2-writing B reseals the late write, and a
+    //    K2-only replica then serves login.
     let (status, late) = call_json(
         &replica_a,
         token,
@@ -3247,10 +3282,7 @@ async fn tenant_connection_rotation_journey() {
         .shutdown()
         .await
         .expect("replica A, the last K1 writer, shuts down");
-    let replica_c = replica_b
-        .start_replica(WyrdTestServerBuilder::default().with_kms_for_test(keyring("k2", &["k1"])))
-        .await
-        .expect("final-pass replica C starts");
+    routine_pass(&replica_b).await;
     for state in ["Active", "Candidate"] {
         let sealed = replica_b
             .human_connection_secret_ciphertext(tenant, state)
@@ -3262,7 +3294,6 @@ async fn tenant_connection_rotation_journey() {
             "the final pass left the {state} secret current under K2"
         );
     }
-    replica_c.shutdown().await.expect("replica C shuts down");
     let replica_k2 = replica_b
         .start_replica(WyrdTestServerBuilder::default().with_kms_for_test(keyring("k2", &[])))
         .await

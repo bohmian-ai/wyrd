@@ -83,7 +83,7 @@ async fn commit_change(mut conn: TenantConn<'_>) -> Result<(), WyrdErrorResponse
     tag = "Access"
 )]
 #[tracing::instrument(level = "info", skip(state, caller))]
-pub(super) async fn list_access_roles(
+pub(crate) async fn list_access_roles(
     State(state): State<AppState>,
     caller: Caller,
 ) -> Result<Json<RoleList>, WyrdErrorResponse> {
@@ -129,7 +129,7 @@ pub(super) async fn list_access_roles(
     tag = "Access"
 )]
 #[tracing::instrument(level = "info", skip(state, caller, request))]
-pub(super) async fn put_access_role(
+pub(crate) async fn put_access_role(
     State(state): State<AppState>,
     caller: Caller,
     role: Result<Path<String>, PathRejection>,
@@ -189,7 +189,7 @@ pub(super) async fn put_access_role(
     tag = "Access"
 )]
 #[tracing::instrument(level = "info", skip(state, caller))]
-pub(super) async fn delete_access_role(
+pub(crate) async fn delete_access_role(
     State(state): State<AppState>,
     caller: Caller,
     role: Result<Path<String>, PathRejection>,
@@ -247,7 +247,7 @@ pub(super) async fn delete_access_role(
     tag = "Access"
 )]
 #[tracing::instrument(level = "info", skip(state, caller))]
-pub(super) async fn list_access_bindings(
+pub(crate) async fn list_access_bindings(
     State(state): State<AppState>,
     caller: Caller,
     query: Result<Query<RoleBindingQuery>, QueryRejection>,
@@ -313,7 +313,7 @@ pub(super) async fn list_access_bindings(
     tag = "Access"
 )]
 #[tracing::instrument(level = "info", skip(state, caller, request))]
-pub(super) async fn create_access_binding(
+pub(crate) async fn create_access_binding(
     State(state): State<AppState>,
     caller: Caller,
     request: Result<Json<CreateRoleBindingRequest>, JsonRejection>,
@@ -387,7 +387,7 @@ pub(super) async fn create_access_binding(
     tag = "Access"
 )]
 #[tracing::instrument(level = "info", skip(state, caller))]
-pub(super) async fn delete_access_binding(
+pub(crate) async fn delete_access_binding(
     State(state): State<AppState>,
     caller: Caller,
     binding_id: Result<Path<RoleBindingId>, PathRejection>,
@@ -443,7 +443,7 @@ pub(super) async fn delete_access_binding(
     tag = "Access"
 )]
 #[tracing::instrument(level = "info", skip(state, caller))]
-pub(super) async fn list_access_groups(
+pub(crate) async fn list_access_groups(
     State(state): State<AppState>,
     caller: Caller,
 ) -> Result<Json<GroupList>, WyrdErrorResponse> {
@@ -474,7 +474,7 @@ pub(super) async fn list_access_groups(
     tag = "Access"
 )]
 #[tracing::instrument(level = "info", skip(state, caller, request))]
-pub(super) async fn create_access_group(
+pub(crate) async fn create_access_group(
     State(state): State<AppState>,
     caller: Caller,
     request: Result<Json<CreateGroupRequest>, JsonRejection>,
@@ -533,7 +533,7 @@ pub(super) async fn create_access_group(
     tag = "Access"
 )]
 #[tracing::instrument(level = "info", skip(state, caller))]
-pub(super) async fn delete_access_group(
+pub(crate) async fn delete_access_group(
     State(state): State<AppState>,
     caller: Caller,
     group_id: Result<Path<AccessGroupId>, PathRejection>,
@@ -581,7 +581,7 @@ pub(super) async fn delete_access_group(
     tag = "Access"
 )]
 #[tracing::instrument(level = "info", skip(state, caller))]
-pub(super) async fn add_access_group_member(
+pub(crate) async fn add_access_group_member(
     State(state): State<AppState>,
     caller: Caller,
     target: Result<Path<(AccessGroupId, Uuid)>, PathRejection>,
@@ -614,7 +614,7 @@ pub(super) async fn add_access_group_member(
     tag = "Access"
 )]
 #[tracing::instrument(level = "info", skip(state, caller))]
-pub(super) async fn remove_access_group_member(
+pub(crate) async fn remove_access_group_member(
     State(state): State<AppState>,
     caller: Caller,
     target: Result<Path<(AccessGroupId, Uuid)>, PathRejection>,
@@ -684,7 +684,7 @@ async fn change_membership(
     tag = "Principals"
 )]
 #[tracing::instrument(level = "info", skip(state, caller))]
-pub(super) async fn principal_access(
+pub(crate) async fn principal_access(
     State(state): State<AppState>,
     caller: Caller,
     principal_id: Result<Path<Uuid>, PathRejection>,

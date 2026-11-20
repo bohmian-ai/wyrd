@@ -86,6 +86,25 @@ Gateway request and response payload columns also need `gateway_payload:read`.
 
 A token already minted from a revoked credential lapses within five minutes.
 
+## Principal access
+
+| Tool | Permission | Input → output | Purpose |
+| --- | --- | --- | --- |
+| `principals.access` | `service_accounts:write` | `{principal_id}` → AccessSummary | Read an account's grants, their sources, and combined permissions |
+| `principals.list_roles` | `service_accounts:write` | `{}` → RoleList | List built-in and custom roles |
+| `principals.list_bindings` | `service_accounts:write` | `{principal_id?, group_id?, role?}` → RoleBindingList | List role bindings, optionally for one account, group, or role |
+| `principals.list_groups` | `service_accounts:write` | `{}` → GroupList | List local groups and their members |
+| `principals.put_role` | `*` | `{role, operations}` → RoleView | Create or replace a custom role |
+| `principals.delete_role` | `*` | `{role}` → RoleView | Delete a custom role no binding references |
+| `principals.bind` | `*` | CreateRoleBindingRequest → RoleBindingView | Bind a role to an account or group at an explicit scope |
+| `principals.unbind` | `*` | `{binding_id}` → RoleBindingView | Remove a directly administered binding |
+| `principals.create_group` | `*` | `{name}` → GroupView | Create an empty local group |
+| `principals.delete_group` | `*` | `{group_id}` → GroupView | Delete a group with its memberships and bindings |
+| `principals.add_group_member` | `*` | `{group_id, principal_id}` → GroupView | Add an account to a group |
+| `principals.remove_group_member` | `*` | `{group_id, principal_id}` → GroupView | Remove an account from a group |
+
+A binding change reaches the subject's existing credentials within about five seconds.
+
 ## Operator connections
 
 | Tool | Permission | Input → output | Purpose |

@@ -409,3 +409,61 @@ mod tests {
         );
     }
 }
+
+/// Empty input of the read-only MCP role and group listings.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ListAccessArgs {}
+
+/// MCP input naming the account whose access summary to read.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PrincipalAccessArgs {
+    /// Account whose access to summarize.
+    pub principal_id: PrincipalId,
+}
+
+/// MCP input creating or replacing one custom role: the HTTP path's role
+/// name beside its [`PutRoleRequest`] body.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PutRoleArgs {
+    /// Custom role name; built-in roles are read-only.
+    pub role: String,
+    /// Operations from the closed catalog; never empty.
+    pub operations: Vec<Operation>,
+}
+
+/// MCP input naming one custom role to delete.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteRoleArgs {
+    /// Custom role name no binding references.
+    pub role: String,
+}
+
+/// MCP input naming one directly administered binding to remove.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UnbindArgs {
+    /// Binding to remove.
+    pub binding_id: RoleBindingId,
+}
+
+/// MCP input naming one group to delete.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteGroupArgs {
+    /// Group to delete with its memberships and bindings.
+    pub group_id: AccessGroupId,
+}
+
+/// MCP input naming one group membership to add or remove.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GroupMemberArgs {
+    /// Group whose roster changes.
+    pub group_id: AccessGroupId,
+    /// Account added or removed.
+    pub principal_id: PrincipalId,
+}

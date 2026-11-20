@@ -5451,6 +5451,25 @@ Gateway request and response payload columns also need `gateway_payload:read`.
 
 A token already minted from a revoked credential lapses within five minutes.
 
+## Principal access
+
+| Tool | Permission | Input → output | Purpose |
+| --- | --- | --- | --- |
+| `principals.access` | `service_accounts:write` | `{principal_id}` → AccessSummary | Read an account's grants, their sources, and combined permissions |
+| `principals.list_roles` | `service_accounts:write` | `{}` → RoleList | List built-in and custom roles |
+| `principals.list_bindings` | `service_accounts:write` | `{principal_id?, group_id?, role?}` → RoleBindingList | List role bindings, optionally for one account, group, or role |
+| `principals.list_groups` | `service_accounts:write` | `{}` → GroupList | List local groups and their members |
+| `principals.put_role` | `*` | `{role, operations}` → RoleView | Create or replace a custom role |
+| `principals.delete_role` | `*` | `{role}` → RoleView | Delete a custom role no binding references |
+| `principals.bind` | `*` | CreateRoleBindingRequest → RoleBindingView | Bind a role to an account or group at an explicit scope |
+| `principals.unbind` | `*` | `{binding_id}` → RoleBindingView | Remove a directly administered binding |
+| `principals.create_group` | `*` | `{name}` → GroupView | Create an empty local group |
+| `principals.delete_group` | `*` | `{group_id}` → GroupView | Delete a group with its memberships and bindings |
+| `principals.add_group_member` | `*` | `{group_id, principal_id}` → GroupView | Add an account to a group |
+| `principals.remove_group_member` | `*` | `{group_id, principal_id}` → GroupView | Remove an account from a group |
+
+A binding change reaches the subject's existing credentials within about five seconds.
+
 ## Operator connections
 
 | Tool | Permission | Input → output | Purpose |
@@ -5599,6 +5618,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_AUTH_409_WORKLOAD_BINDING_CONFLICT` | 409 | Workload family already has a runtime account | Each Service family has at most one family-restricted runtime account. Issue another credential on that account for rotation or concurrent releases, or first set the existing account's restriction to `unrestricted`. |
 | `WYRD_AUTH_413_CARD_SCOPE_TOO_LARGE` | 413 | Card scope too large | Reduce or split the selected root's declared Card graph so its transitive observation-target scope fits the token size limit, or select a root with a smaller graph. |
 | `WYRD_AUTH_429_PASSWORD_ATTEMPTS` | 429 | Too many password attempts | Wait `details.retry_after_seconds` until the fixed attempt window ends, then try again. |
+| `WYRD_AUTH_503_AUTHORIZATION_UNAVAILABLE` | 503 | Authorization state unavailable | Retry with backoff. The credential is still valid; the server cannot confirm current grants until its database is reachable. |
 | `WYRD_AUTH_503_DISCOVERY_UNAVAILABLE` | 503 | OIDC discovery unavailable | Retry with backoff. Do not re-authenticate; this is an infrastructure or issuer-discovery failure. |
 | `WYRD_AUTH_503_VERIFY_UNAVAILABLE` | 503 | Auth verify backend unavailable | Retry with backoff. Do not re-authenticate; this is an infrastructure failure, not a credential failure. |
 

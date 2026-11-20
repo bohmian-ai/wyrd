@@ -21,9 +21,10 @@ mod workload;
 
 pub use access::{
     AccessGrant, AccessSummary, BindingSubject, CreateGroupRequest, CreateRoleBindingRequest,
-    GrantSource, GroupList, GroupMember, GroupView, NoApplicableOperation, Operation,
+    DeleteGroupArgs, DeleteRoleArgs, GrantSource, GroupList, GroupMember, GroupMemberArgs,
+    GroupView, ListAccessArgs, NoApplicableOperation, Operation, PrincipalAccessArgs, PutRoleArgs,
     PutRoleRequest, RoleBindingList, RoleBindingQuery, RoleBindingView, RoleList, RoleView,
-    ScopedRoleAssignment, compile_binding,
+    ScopedRoleAssignment, UnbindArgs, compile_binding,
 };
 pub use admin::{
     ClaimMappingPayload, ClientAuthKind, CreateTrustedIssuerRequest, CreateWorkloadBindingRequest,

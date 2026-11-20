@@ -1221,7 +1221,9 @@ export const NAMED_VERIFIERS = 3;
 /**
  * The Verify discovery read: every facet and both charts over the population
  * the list reads, under the same range and WHERE, as one grouping-set
- * aggregate that reads the population once.
+ * aggregate that reads the population once. Its stages are sibling named
+ * queries, each reading the one before it, so the statement nests no deeper
+ * than the population.
  *
  * Rows carry a `facet` index: below the facet count, one facet's values as
  * {@link facetsQuery} ranks them; at the count, executions per bucket and
@@ -1247,21 +1249,22 @@ export function executionDiscoveryQuery(input: FacetRailInput, range: AbsoluteRa
     .map((column, index) => `WHEN grouping(${column}) = 0 THEN ${index} `)
     .join('')}ELSE ${facets - 1} END`;
   const grouped =
-    `SELECT ${facet} AS facet, ${columns.map((column, index) => `${column} AS ${values[index]}`).join(', ')}, at, verdict_series, verifier, count(*) AS n FROM (${population}) AS population ` +
+    `SELECT ${facet} AS facet, ${columns.map((column, index) => `${column} AS ${values[index]}`).join(', ')}, at, verdict_series, verifier, count(*) AS n FROM population ` +
     `GROUP BY GROUPING SETS (${[...columns.map((column) => `(${column})`), '(at, verdict_series)', '(at, verifier)'].join(', ')})`;
   const all = `facet, ${values.join(', ')}, at, verdict_series, verifier, n`;
-  const ranked = `SELECT ${all}, row_number() OVER (PARTITION BY facet ORDER BY n DESC, ${values.join(', ')}) AS rank, sum(n) OVER (PARTITION BY facet, verifier) AS total FROM (${grouped}) AS grouped`;
-  const placed = `SELECT ${all}, rank, dense_rank() OVER (PARTITION BY facet ORDER BY total DESC, verifier) AS place FROM (${ranked}) AS ranked`;
-  const counted = `SELECT ${all}, rank, place, max(place) OVER (PARTITION BY facet) AS verifiers FROM (${placed}) AS placed`;
+  const ranked = `SELECT ${all}, row_number() OVER (PARTITION BY facet ORDER BY n DESC, ${values.join(', ')}) AS rank, sum(n) OVER (PARTITION BY facet, verifier) AS total FROM grouped`;
+  const placed = `SELECT ${all}, rank, dense_rank() OVER (PARTITION BY facet ORDER BY total DESC, verifier) AS place FROM ranked`;
+  const counted = `SELECT ${all}, rank, place, max(place) OVER (PARTITION BY facet) AS verifiers FROM placed`;
   const verifierChart = `facet = ${facets + 1}`;
   const kept =
     `SELECT facet, ${values.join(', ')}, at, CASE WHEN facet = ${facets} THEN verdict_series END AS verdict, ` +
     `CASE WHEN ${verifierChart} AND place <= ${NAMED_VERIFIERS} THEN verifier END AS verifier, CASE WHEN ${verifierChart} AND place <= ${NAMED_VERIFIERS} THEN place END AS place, ` +
-    `CASE WHEN ${verifierChart} THEN verifiers END AS verifiers, n FROM (${counted}) AS counted WHERE facet >= ${facets} OR rank <= ${FACET_VALUES + 1}`;
+    `CASE WHEN ${verifierChart} THEN verifiers END AS verifiers, n FROM counted WHERE facet >= ${facets} OR rank <= ${FACET_VALUES + 1}`;
   // Facet rows are already one per value; chart rows of the Verifiers past the named ones fold into one per bucket.
   return {
     sql:
-      `SELECT facet, ${values.join(', ')}, at, verdict, verifier, place, verifiers, sum(n) AS n FROM (${kept}) AS kept ` +
+      `WITH ${Object.entries({ population, grouped, ranked, placed, counted, kept }).map(([name, stage]) => `${name} AS (${stage})`).join(', ')} ` +
+      `SELECT facet, ${values.join(', ')}, at, verdict, verifier, place, verifiers, sum(n) AS n FROM kept ` +
       `GROUP BY facet, ${values.join(', ')}, at, verdict, verifier, place, verifiers ORDER BY facet, at, n DESC, ${values.join(', ')}, place`,
     params: binds.params
   };

@@ -782,6 +782,10 @@ test('executions list, facets and charts read one population in bounded shared q
   const combined = sql(discovered.calls[0]);
   expect(combined).toContain(population.replace(/\$3/g, '$4'));
   expect(combined).toContain('GROUP BY GROUPING SETS ((status), (verdict), (verifier_card_uid), (at, verdict_series), (at, verifier))');
+  // Each stage is a named sibling that reads the one before it, so the read nests no deeper than the population.
+  expect(combined).toMatch(
+    /^WITH population AS \(SELECT .+\), grouped AS \(SELECT .+ FROM population GROUP BY .+\), ranked AS \(SELECT .+ FROM grouped\), placed AS \(SELECT .+ FROM ranked\), counted AS \(SELECT .+ FROM placed\), kept AS \(SELECT .+ FROM counted WHERE .+\) SELECT .+ FROM kept GROUP BY /
+  );
   // No verdict is its own neutral series, never a verdict; the Verifier chart keys each of its three largest Verifiers by UID and counts the rest together.
   expect(combined).toContain("coalesce(verdict, 'no verdict') AS verdict_series");
   expect(combined).toContain('dense_rank() OVER (PARTITION BY facet ORDER BY total DESC, verifier) AS place');

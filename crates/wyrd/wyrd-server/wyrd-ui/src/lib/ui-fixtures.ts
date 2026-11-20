@@ -397,7 +397,7 @@ function facetRows(column: string, executions: boolean): unknown[][] {
 
 /** A facet rail's one grouping-set read: per grouped column, its rows tagged with the facet index. */
 function facetsFor(sql: string): QueryResult {
-  const columns = [...(sql.match(/GROUP BY GROUPING SETS \((.*)\)\) AS grouped/)?.[1] ?? '').matchAll(/\((\w+)\)/g)].map((match) => match[1]);
+  const columns = [...(sql.match(/GROUP BY GROUPING SETS \((.*)\)\)(?: AS grouped|, ranked AS )/)?.[1] ?? '').matchAll(/\((\w+)\)/g)].map((match) => match[1]);
   const executions = sql.includes(') AS executions');
   const rows = columns.flatMap((column, index) =>
     facetRows(column, executions).map(([value, n]) => [index, ...columns.map((_, at) => (at === index ? value : null)), n])

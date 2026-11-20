@@ -79,7 +79,7 @@ impl GithubConnection {
     ///
     /// # Errors
     /// Returns a Wyrd error when the caller lacks
-    /// `identity_connections:write`, no GitHub App is configured, or the
+    /// `github_connections:write`, no GitHub App is configured, or the
     /// request fails.
     pub async fn begin(&self) -> Result<GithubConnectResponse, WyrdError> {
         self.client
@@ -96,7 +96,7 @@ impl GithubConnection {
     ///
     /// # Errors
     /// Returns a Wyrd error when the caller lacks
-    /// `identity_connections:write`, no GitHub App is configured, or the
+    /// `github_connections:read`, no GitHub App is configured, or the
     /// request fails.
     pub async fn get(&self) -> Result<GithubConnectionView, WyrdError> {
         self.client
@@ -110,7 +110,7 @@ impl GithubConnection {
     ///
     /// # Errors
     /// Returns a Wyrd error when the caller lacks
-    /// `identity_connections:write`, no installation is associated, no GitHub
+    /// `github_connections:write`, no installation is associated, no GitHub
     /// App is configured, or the request fails.
     pub async fn disconnect(&self) -> Result<GithubConnectionView, WyrdError> {
         self.client

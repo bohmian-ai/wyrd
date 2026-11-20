@@ -2,7 +2,7 @@
 //!
 //! Typed projections of the same [`GithubConnections`] operations HTTP
 //! serves. The read is advertised to every caller; connect and disconnect
-//! appear only to a caller holding `identity_connections:write`, the
+//! appear only to a caller holding `github_connections:write`, the
 //! pull request review request only to one holding any `verifier:run`, and
 //! every operation authorizes and audits its permissions again when named
 //! directly.
@@ -65,13 +65,13 @@ pub(super) fn descriptors_unscoped() -> Vec<Tool> {
         "Read the GitHub connection",
         "Read this tenant's GitHub App connection: configured host and App, state, verified \
          installation id and the selected repositories it can reach. No token or key is ever \
-         returned. Requires identity_connections:write.",
+         returned. Requires github_connections:read.",
         true,
     )]
 }
 
 /// The write tools shown only to a caller holding
-/// `identity_connections:write`.
+/// `github_connections:write`.
 #[must_use]
 pub(super) fn write_descriptors() -> Vec<Tool> {
     vec![
@@ -81,14 +81,14 @@ pub(super) fn write_descriptors() -> Vec<Tool> {
             "Begin a one-use GitHub connection transaction and return GitHub's install URL and \
              its expiry. A human signed in to Wyrd as this same principal must open the URL in \
              a browser to install and authorize the App; nothing is connected until then. \
-             Requires identity_connections:write.",
+             Requires github_connections:write.",
             false,
         ),
         tool::<NoArgs, GithubConnectionView>(
             DISCONNECT,
             "Disconnect GitHub",
             "Fence this tenant's GitHub work and release its installation, returning the \
-             released view. Requires identity_connections:write.",
+             released view. Requires github_connections:write.",
             false,
         ),
     ]
@@ -114,12 +114,12 @@ pub(super) fn review_descriptors() -> Vec<Tool> {
     )]
 }
 
-/// Whether this caller's token carries `identity_connections:write`.
+/// Whether this caller's token carries `github_connections:write`.
 pub(super) fn may_manage(caller: &Caller) -> bool {
     caller
         .principal
         .effective_permissions
-        .contains(&Permission::identity_connections_write())
+        .contains(&Permission::github_connections_write())
 }
 
 impl WyrdMcpHandler {

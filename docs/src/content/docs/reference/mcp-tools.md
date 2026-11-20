@@ -99,15 +99,15 @@ A token already minted from a revoked credential lapses within five minutes.
 ## GitHub connection
 
 The read is listed for every caller; connect and disconnect are listed only for
-a caller holding `identity_connections:write`, and the review request only for
+a caller holding `github_connections:write`, and the review request only for
 one holding any `verifier:run`. GitHub's setup and OAuth callback are
 browser redirects, not tools.
 
 | Tool | Permission | Input → output | Purpose |
 | --- | --- | --- | --- |
-| `github_connection.get` | `identity_connections:write` | `{}` → GithubConnectionView | Read the tenant's redacted connection |
-| `github_connection.connect` | `identity_connections:write` | `{}` → GithubConnectResponse | Begin a connection; a signed-in human opens the returned install URL |
-| `github_connection.disconnect` | `identity_connections:write` | `{}` → GithubConnectionView | Fence GitHub work and release the installation |
+| `github_connection.get` | `github_connections:read` | `{}` → GithubConnectionView | Read the tenant's redacted connection |
+| `github_connection.connect` | `github_connections:write` | `{}` → GithubConnectResponse | Begin a connection; a signed-in human opens the returned install URL |
+| `github_connection.disconnect` | `github_connections:write` | `{}` → GithubConnectionView | Fence GitHub work and release the installation |
 | `github_connection.review_pull_request` | `cards:read`; `verifier:read` and `verifier:run` on every selected Verifier | `{host, repository_id, number, idempotency_key}` → GithubPullRequestReviewResponse | Request a fresh review of an open, ready pull request by its Repository's whole binding set; a retry of the key returns the same generation and members |
 
 ## Gateway administration

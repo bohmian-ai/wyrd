@@ -2,9 +2,11 @@
 //!
 //! [`GithubConnections`] is the one owner of connect, read, disconnect,
 //! GitHub's setup and OAuth callback redirects, installation webhooks and
-//! narrowed installation tokens. Every caller operation evaluates
-//! `identity_connections:write` and stages the decision on the process audit
-//! outbox before it runs. A connection transaction is one-use login state
+//! narrowed installation tokens. The read evaluates `github_connections:read`
+//! and every other caller operation `github_connections:write`, the GitHub
+//! configuration permission that confers neither OIDC administration nor
+//! tenant data; each stages the decision on the process audit outbox before
+//! it runs. A connection transaction is one-use login state
 //! bound to the beginning principal, its tenant and, from GitHub's setup
 //! redirect on, one browser; the callback consumes it before any provider IO
 //! and associates only after GitHub confirms the installation and the
@@ -186,19 +188,19 @@ impl<'a> GithubConnections<'a> {
         Ok(self.app()?.settings().host())
     }
 
-    /// Evaluate `identity_connections:write` for `operation` and stage the
-    /// decision on the process audit outbox.
+    /// Evaluate the GitHub configuration permission `operation` needs,
+    /// `github_connections:read` for the read and `github_connections:write`
+    /// otherwise, and stage the decision on the process audit outbox.
     ///
     /// # Errors
     /// Returns [`WyrdError::PermissionDeniedRbac`] without it.
     fn authorize(&self, caller: &Caller, operation: &str) -> Result<(), WyrdError> {
-        audit::authorize(
-            self.state,
-            caller,
-            &Permission::identity_connections_write(),
-            operation,
-            RESOURCE,
-        )
+        let permission = if operation == READ {
+            Permission::github_connections_read()
+        } else {
+            Permission::github_connections_write()
+        };
+        audit::authorize(self.state, caller, &permission, operation, RESOURCE)
     }
 
     /// A tenant connection for `tenant`.

@@ -263,28 +263,22 @@ async fn installation_tokens_follow_repository_access() {
         .await
         .expect("read responds");
     assert_eq!(denied.status(), 403);
-    let write = || {
-        (
-            "identity_connections:write".to_owned(),
-            "allowed".to_owned(),
-        )
-    };
-    for operation in [
-        "github_connection.setup",
-        "github_connection.callback",
-        "github_connection.disconnect",
-        "github_connection.connect",
-        "github_connection.read",
+    for (operation, permission) in [
+        ("github_connection.setup", "github_connections:write"),
+        ("github_connection.callback", "github_connections:write"),
+        ("github_connection.disconnect", "github_connections:write"),
+        ("github_connection.connect", "github_connections:write"),
+        ("github_connection.read", "github_connections:read"),
     ] {
         assert_eq!(
             decisions(&server, admin.id(), operation).await,
-            vec![write()],
+            vec![(permission.to_owned(), "allowed".to_owned())],
             "{operation}"
         );
     }
     assert_eq!(
         decisions(&server, viewer.id(), "github_connection.read").await,
-        vec![("identity_connections:write".to_owned(), "denied".to_owned())]
+        vec![("github_connections:read".to_owned(), "denied".to_owned())]
     );
     refused(&server, 1, "WYRD_GITHUB_404_NOT_CONNECTED").await;
 
@@ -782,4 +776,106 @@ async fn state_saved_under_other_app_settings_grants_nothing() {
     assert_eq!(answer.status, 200, "{:?}", answer.body);
     assert_eq!(answer.body["state"], "active");
     minted(server, 1).await;
+}
+
+/// GitHub configuration answers only to `github_connections`, which grants
+/// nothing else.
+///
+/// A configurator holding `github_connections:read` and `:write` reads the
+/// connection and begins one, and is refused OIDC administration and Card
+/// reads. An OIDC administrator holding only `identity_connections:write`,
+/// and a reader of one Repository family, are refused the configuration.
+///
+/// # Panics
+/// Panics when a caller is answered other than this.
+#[tokio::test]
+async fn github_configuration_needs_its_own_permission() {
+    let (connected, _browser) = Connected::start().await;
+    let server = &connected.server;
+    let caller = |name: &'static str, grants: serde_json::Value| async move {
+        let grants = grants.as_array().expect("a grant list").clone();
+        server.seed_role(name, &grants).await.expect("role seeds");
+        let bootstrap = server
+            .bootstrap_service_in_tenant(server.data_tenant_id(), name, &[name])
+            .await
+            .expect("principal bootstraps");
+        server
+            .exchange_api_key(bootstrap.api_key().expect("a machine principal"))
+            .await
+            .expect("api key exchanges")
+    };
+    let status = |token: String, request: Request<Body>| async move {
+        server
+            .oneshot_authenticated(&token, request)
+            .await
+            .expect("request responds")
+            .status()
+            .as_u16()
+    };
+    let view = || {
+        Request::get("/v1/integrations/github")
+            .body(Body::empty())
+            .expect("request builds")
+    };
+    let connect = || {
+        Request::post("/v1/integrations/github/connect")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .expect("request builds")
+    };
+
+    let configurator = caller(
+        "github_configurator",
+        json!([
+            {"resource": "github_connections", "action": "read", "scope": "all"},
+            {"resource": "github_connections", "action": "write", "scope": "all"},
+        ]),
+    )
+    .await;
+    assert_eq!(
+        status(configurator.clone(), view()).await,
+        200,
+        "the configurator reads"
+    );
+    assert_eq!(
+        status(configurator.clone(), connect()).await,
+        201,
+        "the configurator connects"
+    );
+    let oidc = Request::get("/v1/identity/oidc/connections")
+        .header("host", "localhost")
+        .body(Body::empty())
+        .expect("request builds");
+    assert_eq!(
+        status(configurator.clone(), oidc).await,
+        403,
+        "no OIDC administration"
+    );
+    let cards = Request::get("/v1/cards")
+        .body(Body::empty())
+        .expect("request builds");
+    assert_eq!(status(configurator, cards).await, 403, "no tenant data");
+
+    let oidc_admin = caller(
+        "oidc_administrator",
+        json!([{"resource": "identity_connections", "action": "write", "scope": "all"}]),
+    )
+    .await;
+    assert_eq!(
+        status(oidc_admin.clone(), view()).await,
+        403,
+        "OIDC administration is not GitHub configuration"
+    );
+    assert_eq!(status(oidc_admin, connect()).await, 403);
+
+    let repository_reader = caller(
+        "repository_reader",
+        json!([{"resource": "cards", "action": "read", "scope": {"card": {"family": {"kind": "Repository", "name": "payments"}}}}]),
+    )
+    .await;
+    assert_eq!(
+        status(repository_reader, view()).await,
+        403,
+        "a Repository grant does not configure GitHub"
+    );
 }

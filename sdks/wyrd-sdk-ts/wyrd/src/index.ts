@@ -2182,7 +2182,7 @@ export class GithubConnection {
   }
 
   /**
-   * Begin a connection transaction; requires `identity_connections:write`.
+   * Begin a connection transaction; requires `github_connections:write`.
    * Open `authorization_url` in a browser signed in to Wyrd as the same
    * principal to complete it.
    *
@@ -2195,7 +2195,7 @@ export class GithubConnection {
   }
 
   /**
-   * Read the tenant's connection; requires `identity_connections:write`.
+   * Read the tenant's connection; requires `github_connections:read`.
    *
    * @returns The redacted connection view, `not_connected` when none.
    * @throws {@link WyrdError} `WYRD_GITHUB_503_NOT_CONFIGURED` when the
@@ -2206,7 +2206,7 @@ export class GithubConnection {
   }
 
   /**
-   * Release the tenant's installation; requires `identity_connections:write`.
+   * Release the tenant's installation; requires `github_connections:write`.
    *
    * @returns The released, `not_connected` view.
    * @throws {@link WyrdError} `WYRD_GITHUB_404_NOT_CONNECTED` when no

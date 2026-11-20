@@ -58,7 +58,8 @@ class GithubConnection:
     """Tenant-scoped GitHub connection handle.
 
     Every call blocks with the GIL released until the server answers. The
-    connection calls need ``identity_connections:write``; a review request
+    read needs ``github_connections:read`` and connect and disconnect
+    ``github_connections:write``; a review request
     needs ``cards:read`` and ``verifier:read`` and ``verifier:run`` on every
     selected Verifier. No call ever returns a GitHub token, code, or key.
     """
@@ -104,7 +105,7 @@ class GithubConnection:
         Raises:
             WyrdError: ``WYRD_GITHUB_503_NOT_CONFIGURED`` when the deployment
                 has no GitHub App; ``WYRD_PERMISSION_403_DENIED_RBAC`` without
-                ``identity_connections:write``.
+                ``github_connections:write``.
 
         """
         ...
@@ -115,7 +116,7 @@ class GithubConnection:
         Raises:
             WyrdError: ``WYRD_GITHUB_503_NOT_CONFIGURED`` when the deployment
                 has no GitHub App; ``WYRD_PERMISSION_403_DENIED_RBAC`` without
-                ``identity_connections:write``.
+                ``github_connections:read``.
 
         """
         ...
@@ -126,7 +127,7 @@ class GithubConnection:
         Raises:
             WyrdError: ``WYRD_GITHUB_503_NOT_CONFIGURED`` when the deployment
                 has no GitHub App; ``WYRD_PERMISSION_403_DENIED_RBAC`` without
-                ``identity_connections:write``; ``WYRD_GITHUB_404_NOT_CONNECTED``
+                ``github_connections:write``; ``WYRD_GITHUB_404_NOT_CONNECTED``
                 when nothing is connected.
 
         """

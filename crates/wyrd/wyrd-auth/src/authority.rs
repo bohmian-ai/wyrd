@@ -15,7 +15,8 @@
 //! serves for at most [`FRESHNESS_BOUND`] after its last successful
 //! confirmation. Requests never renew it.
 
-use std::collections::HashMap;
+use std::collections::hash_map::Entry as Slot;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -82,6 +83,11 @@ pub struct TenantAuthority {
     /// it. They hold no authority and are absent from `accounts`, so one
     /// corrupt row fails only its own subjects, never the tenant.
     corrupt: HashMap<Uuid, String>,
+    /// Account and credential ids a token named and this snapshot, loaded
+    /// after that token reached this process, does not hold. Such an id is
+    /// not committed state the load missed, so it never forces another
+    /// reload; a consumed refresh row is the usual one.
+    settled: Mutex<HashSet<Uuid>>,
 }
 
 /// Why a stored authorization row cannot be compiled.
@@ -281,6 +287,7 @@ impl TenantAuthority {
             accounts,
             keys,
             corrupt,
+            settled: Mutex::default(),
         })
     }
 
@@ -395,21 +402,56 @@ impl TenantAuthority {
 
     /// Whether `verified` may name state committed after this snapshot
     /// loaded: it was issued no earlier than the load second, and its
-    /// account, an actor in its chain, or its credential is not held here.
+    /// account, an actor in its chain, or its credential is neither held
+    /// here nor [settled](Self::settle).
     ///
     /// The snapshot holds every stored key, revoked ones included, so an
     /// unknown credential of a token older than the load is not a key.
+    #[must_use]
     pub fn predates(&self, verified: &VerifiedToken) -> bool {
-        verified.iat.timestamp() >= self.loaded_at.timestamp()
-            && (self.account(verified.principal.id).is_none()
-                || verified
-                    .delegation_chain
-                    .iter()
-                    .any(|step| self.account(step.principal.id).is_none())
-                || verified
-                    .principal
-                    .credential_id
-                    .is_some_and(|credential| !self.keys.contains_key(&credential)))
+        if verified.iat.timestamp() < self.loaded_at.timestamp() {
+            return false;
+        }
+        let settled = self
+            .settled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let unknown_account = |id: PrincipalId| {
+            self.account(id).is_none() && !settled.contains(&id.as_uuid())
+        };
+        unknown_account(verified.principal.id)
+            || verified
+                .delegation_chain
+                .iter()
+                .any(|step| unknown_account(step.principal.id))
+            || verified.principal.credential_id.is_some_and(|credential| {
+                !self.keys.contains_key(&credential) && !settled.contains(&credential)
+            })
+    }
+
+    /// Records that this snapshot, loaded after `verified` reached the
+    /// process, already answers for every id it names, so later requests
+    /// carrying the same token authorize from memory instead of reloading
+    /// in its issuance second.
+    ///
+    /// Only call this with a snapshot loaded after the request carrying
+    /// `verified` arrived: any key or account that token names was committed
+    /// before it was issued, so one absent here does not exist.
+    fn settle(&self, verified: &VerifiedToken) {
+        let mut settled = self
+            .settled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let accounts = std::iter::once(verified.principal.id)
+            .chain(verified.delegation_chain.iter().map(|step| step.principal.id))
+            .filter(|id| self.account(*id).is_none())
+            .map(|id| id.as_uuid());
+        settled.extend(accounts);
+        if let Some(credential) = verified.principal.credential_id
+            && !self.keys.contains_key(&credential)
+        {
+            settled.insert(credential);
+        }
     }
 }
 
@@ -424,8 +466,24 @@ fn role_names(names: Option<Vec<RoleRef>>) -> Arc<[RoleRef]> {
 /// One tenant's cached snapshot and its freshness.
 struct Entry {
     snapshot: Arc<TenantAuthority>,
-    confirmed_at: Instant,
-    known_newer: bool,
+    /// The last successful confirmation, or `None` once a malformed
+    /// notification made it unknowable.
+    confirmed_at: Option<Instant>,
+    /// The highest revision this process has observed for the tenant, by
+    /// notification, confirmation or load. The snapshot serves only while it
+    /// is at least this current; an older load never lowers it.
+    observed: i64,
+}
+
+impl Entry {
+    /// Whether the snapshot may serve: current with every observed revision
+    /// and confirmed within [`FRESHNESS_BOUND`].
+    fn usable(&self) -> bool {
+        self.snapshot.revision >= self.observed
+            && self
+                .confirmed_at
+                .is_some_and(|confirmed| confirmed.elapsed() <= FRESHNESS_BOUND)
+    }
 }
 
 /// Process-local current authority, one snapshot per tenant.
@@ -462,8 +520,7 @@ impl AuthorityCache {
     pub fn cached(&self, tenant: DataTenantId) -> Option<Arc<TenantAuthority>> {
         let entries = self.entries();
         let entry = entries.get(&tenant)?;
-        (!entry.known_newer && entry.confirmed_at.elapsed() <= FRESHNESS_BOUND)
-            .then(|| Arc::clone(&entry.snapshot))
+        entry.usable().then(|| Arc::clone(&entry.snapshot))
     }
 
     /// The tenant's usable snapshot, reloading it with one statement when
@@ -487,7 +544,8 @@ impl AuthorityCache {
     ///
     /// # Errors
     ///
-    /// [`WyrdError::AuthorizationUnavailable`] when the reload fails.
+    /// [`WyrdError::AuthorizationUnavailable`] when the reload fails or reads
+    /// a revision older than one this process has already observed.
     async fn reload(
         &self,
         postgres: &WyrdPostgres,
@@ -503,7 +561,8 @@ impl AuthorityCache {
         }
         .await
         .ok_or_else(|| WyrdError::authorization_unavailable("reload_failed"))?;
-        Ok(self.install(tenant, loaded))
+        self.install(tenant, loaded)
+            .ok_or_else(|| WyrdError::authorization_unavailable("reload_superseded"))
     }
 
     /// Authorizes a verified token against the tenant's current authority.
@@ -511,9 +570,11 @@ impl AuthorityCache {
     /// A token issued no earlier than the snapshot's load second may name an
     /// account, actor or key committed after the load, before this process
     /// has applied its notification; such a miss reloads once, the
-    /// sanctioned cache-miss statement. An older token refused by the
-    /// snapshot is refused without a reload, so a removed account's tokens
-    /// never cost a statement per request.
+    /// sanctioned cache-miss statement. The reloaded snapshot then answers
+    /// for that token, so its later requests in the same second stay in
+    /// memory. An older token refused by the snapshot is refused without a
+    /// reload, so a removed account's tokens never cost a statement per
+    /// request.
     ///
     /// # Errors
     ///
@@ -529,6 +590,7 @@ impl AuthorityCache {
         let mut snapshot = self.acquire(postgres, tenant).await?;
         if snapshot.predates(verified) {
             snapshot = self.reload(postgres, tenant).await?;
+            snapshot.settle(verified);
         }
         snapshot
             .authorize(verified)
@@ -539,27 +601,39 @@ impl AuthorityCache {
     }
 
     /// Installs a freshly loaded snapshot, confirmed now, unless a newer one
-    /// is already cached; returns the snapshot now serving.
-    pub fn install(&self, tenant: DataTenantId, loaded: TenantAuthority) -> Arc<TenantAuthority> {
+    /// is already cached; returns the snapshot now serving, or `None` when
+    /// it is older than a revision this process has observed, so a load that
+    /// started before a change can never make the obsolete state usable.
+    pub fn install(
+        &self,
+        tenant: DataTenantId,
+        loaded: TenantAuthority,
+    ) -> Option<Arc<TenantAuthority>> {
         self.compiles.fetch_add(1, Ordering::Relaxed);
         let mut entries = self.entries();
-        match entries.get_mut(&tenant) {
-            Some(entry) if entry.snapshot.revision > loaded.revision => Arc::clone(&entry.snapshot),
-            slot => {
-                let snapshot = Arc::new(loaded);
-                let entry = Entry {
-                    snapshot: Arc::clone(&snapshot),
-                    confirmed_at: Instant::now(),
-                    known_newer: false,
-                };
-                match slot {
-                    Some(existing) => *existing = entry,
-                    None => {
-                        entries.insert(tenant, entry);
-                    }
+        let entry = match entries.entry(tenant) {
+            Slot::Occupied(slot) => {
+                let entry = slot.into_mut();
+                if entry.snapshot.revision <= loaded.revision {
+                    entry.snapshot = Arc::new(loaded);
+                    entry.confirmed_at = Some(Instant::now());
                 }
-                snapshot
+                entry
             }
+            Slot::Vacant(slot) => slot.insert(Entry {
+                observed: loaded.revision,
+                snapshot: Arc::new(loaded),
+                confirmed_at: Some(Instant::now()),
+            }),
+        };
+        entry.usable().then(|| Arc::clone(&entry.snapshot))
+    }
+
+    /// Records that the tenant's committed revision is at least `revision`,
+    /// so no older snapshot serves until a load reaches it.
+    fn observe(&self, tenant: DataTenantId, revision: i64) {
+        if let Some(entry) = self.entries().get_mut(&tenant) {
+            entry.observed = entry.observed.max(revision);
         }
     }
 
@@ -572,25 +646,23 @@ impl AuthorityCache {
                 revision.parse::<i64>().ok()?,
             ))
         });
-        let mut entries = self.entries();
         if let Some((tenant, revision)) = parsed {
-            if let Some(entry) = entries.get_mut(&tenant)
-                && entry.snapshot.revision < revision
-            {
-                entry.known_newer = true;
-            }
+            self.observe(tenant, revision);
         } else {
+            // The revision is unknown, so no snapshot serves until a reload
+            // confirms it again; observed revisions still fence older loads.
             tracing::warn!(payload, "malformed authorization notification");
-            for entry in entries.values_mut() {
-                entry.known_newer = true;
+            for entry in self.entries().values_mut() {
+                entry.confirmed_at = None;
             }
         }
     }
 
     /// Confirms every cached tenant against its committed revision: an
     /// unchanged revision renews freshness without recompiling, a changed one
-    /// reloads. A failed read leaves the entry to age toward
-    /// [`FRESHNESS_BOUND`].
+    /// stops the old snapshot serving at once and reloads. A failed read
+    /// leaves the entry to age toward [`FRESHNESS_BOUND`]; a failed reload
+    /// after a changed revision leaves it unusable.
     pub async fn confirm(&self, postgres: &WyrdPostgres) {
         let tenants: Vec<(DataTenantId, i64)> = self
             .entries()
@@ -608,10 +680,11 @@ impl AuthorityCache {
                     if let Some(entry) = self.entries().get_mut(&tenant)
                         && entry.snapshot.revision == revision
                     {
-                        entry.confirmed_at = Instant::now();
+                        entry.confirmed_at = Some(Instant::now());
                     }
                 }
-                Ok(_) => {
+                Ok(revision) => {
+                    self.observe(tenant, revision);
                     let loaded = TenantAuthority::load(&mut conn).await;
                     drop(conn.commit().await);
                     match loaded {
@@ -632,8 +705,12 @@ impl AuthorityCache {
     /// freshness bound without waiting it out.
     #[cfg(test)]
     fn age(&self, tenant: DataTenantId, age: Duration) {
-        if let Some(entry) = self.entries().get_mut(&tenant) {
-            entry.confirmed_at -= age;
+        if let Some(confirmed) = self
+            .entries()
+            .get_mut(&tenant)
+            .and_then(|entry| entry.confirmed_at.as_mut())
+        {
+            *confirmed -= age;
         }
     }
 }
@@ -766,6 +843,46 @@ mod pg_tests {
                 "{case}: {refused:?}"
             );
         }
+    }
+    /// A token whose reload already settled what it names keeps answering
+    /// from memory in its issuance second, so a later PostgreSQL outage does
+    /// not refuse it as unavailable and no request recompiles authority.
+    ///
+    /// # Panics
+    /// Panics when the fixture fails, a settled request reloads, or it is
+    /// refused as unavailable.
+    #[tokio::test]
+    async fn a_settled_token_needs_no_reload_during_an_outage() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let (postgres, _vala) = fixture.fresh_runtime_handles().await.expect("handles");
+        let cache = AuthorityCache::default();
+        let token = wyrd_auth_verify::VerifiedToken {
+            principal: wyrd_runtime::Principal::new(
+                wyrd_runtime::PrincipalId::new(uuid::Uuid::now_v7()),
+                wyrd_runtime::PrincipalKind::User,
+                tenant,
+                wyrd_runtime::permission::PermissionSet::new(),
+            )
+            .with_credential_id(Some(uuid::Uuid::now_v7())),
+            permission_ceiling: None,
+            delegation_chain: Vec::new(),
+            exp: chrono::Utc::now(),
+            iat: chrono::Utc::now(),
+        };
+        let first = cache.authorize(&postgres, &token).await.expect_err("unknown");
+        assert!(matches!(first, WyrdError::PermissionUnauthenticated { .. }));
+        let compiled = cache.compiles();
+
+        postgres.app_pool().close().await;
+        for _ in 0..3 {
+            let again = cache.authorize(&postgres, &token).await.expect_err("unknown");
+            assert!(
+                matches!(again, WyrdError::PermissionUnauthenticated { .. }),
+                "answered from memory: {again:?}"
+            );
+        }
+        assert_eq!(cache.compiles(), compiled, "no request recompiled");
     }
 }
 
@@ -903,6 +1020,88 @@ mod tests {
         assert!(authority.predates(&token(unknown, chrono::Utc::now())));
         assert!(!authority.predates(&token(unknown, earlier)));
         assert!(authority.authorize(&token(unknown, earlier)).is_some());
+    }
+
+    /// A load that read revision N before this process observed N+1, by
+    /// notification or by confirmation, can never make N usable again: it
+    /// installs as unusable until a load reaches N+1. A malformed
+    /// notification stops every snapshot serving without losing that fence.
+    ///
+    /// # Panics
+    /// Panics when an older load serves after a newer revision was observed.
+    #[test]
+    fn an_older_load_never_serves_after_a_newer_revision_is_observed() {
+        let (tenant, user) = (DataTenantId::new_v7(), Uuid::now_v7());
+        let cache = AuthorityCache::default();
+        let load = |revision| TenantAuthority::compile(state(revision, user)).expect("compiles");
+        assert!(cache.install(tenant, load(3)).is_some());
+
+        cache.notify(&format!("{tenant}:4"));
+        assert!(
+            cache.install(tenant, load(3)).is_none(),
+            "an in-flight load of 3 does not serve once 4 is observed"
+        );
+        assert!(cache.cached(tenant).is_none());
+
+        // Confirmation read 5 and then failed to load it.
+        cache.observe(tenant, 5);
+        assert!(cache.install(tenant, load(4)).is_none());
+        assert!(cache.cached(tenant).is_none(), "no obsolete grants serve");
+
+        assert!(cache.install(tenant, load(5)).is_some());
+        assert_eq!(cache.cached(tenant).map(|s| s.revision()), Some(5));
+        assert!(
+            cache.install(tenant, load(4)).is_some_and(|s| s.revision() == 5),
+            "a late older load leaves the current snapshot serving"
+        );
+
+        cache.notify(&format!("{tenant}:6"));
+        cache.notify("malformed");
+        assert!(cache.cached(tenant).is_none(), "malformed: nothing serves");
+        assert!(
+            cache.install(tenant, load(5)).is_none(),
+            "a malformed notification keeps the observed fence"
+        );
+        assert!(cache.install(tenant, load(6)).is_some());
+    }
+
+    /// A refreshed human token names its consumed refresh row, which is
+    /// never a stored key. Once a reload for it has settled that, later
+    /// requests in the same issuance second answer from memory, while a
+    /// different unknown credential, possibly a key committed after the
+    /// load, still predates the snapshot.
+    ///
+    /// # Panics
+    /// Panics when a settled token still predates the snapshot or an
+    /// unsettled credential stops predating it.
+    #[test]
+    fn a_settled_token_stops_reloading_in_its_issuance_second() {
+        let (tenant, user) = (DataTenantId::new_v7(), Uuid::now_v7());
+        let authority = TenantAuthority::compile(state(1, user)).expect("compiles");
+        let token = |credential| wyrd_auth_verify::VerifiedToken {
+            principal: wyrd_runtime::Principal::new(
+                wyrd_runtime::PrincipalId::new(user),
+                wyrd_runtime::PrincipalKind::User,
+                tenant,
+                wyrd_runtime::permission::PermissionSet::new(),
+            )
+            .with_credential_id(Some(credential)),
+            permission_ceiling: None,
+            delegation_chain: Vec::new(),
+            exp: chrono::Utc::now(),
+            iat: authority.loaded_at,
+        };
+        let refreshed = token(Uuid::now_v7());
+        assert!(authority.predates(&refreshed), "first sight reloads once");
+        authority.settle(&refreshed);
+        for _ in 0..3 {
+            assert!(!authority.predates(&refreshed), "settled: no reload");
+        }
+        assert!(authority.authorize(&refreshed).is_some());
+        assert!(
+            authority.predates(&token(Uuid::now_v7())),
+            "a new key still reloads before it is trusted"
+        );
     }
 
     /// A stream's caller keeps its authority across an unrelated revision,

@@ -7,6 +7,7 @@
 //! own.
 
 pub mod credential;
+pub mod stored_secrets;
 pub mod tenant;
 
 use std::process::ExitCode;
@@ -21,6 +22,9 @@ pub enum PlatformCommand {
     /// Issue, list, and retire platform credentials.
     #[command(subcommand)]
     Credential(credential::CredentialCommand),
+    /// Move stored secrets onto the active wrapping key.
+    #[command(subcommand)]
+    StoredSecrets(stored_secrets::StoredSecretsCommand),
     /// Create, inspect, suspend, resume, and recover tenants.
     #[command(subcommand)]
     Tenant(tenant::TenantCommand),
@@ -34,6 +38,7 @@ pub enum PlatformCommand {
 pub async fn dispatch(command: PlatformCommand) -> Result<ExitCode, WyrdCliError> {
     match command {
         PlatformCommand::Credential(command) => credential::dispatch(command).await,
+        PlatformCommand::StoredSecrets(command) => stored_secrets::dispatch(command).await,
         PlatformCommand::Tenant(command) => tenant::dispatch(command).await,
     }
 }

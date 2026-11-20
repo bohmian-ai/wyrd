@@ -505,10 +505,15 @@ Evidence (in progress):
   (`WYRD_SPEC_400_VALIDATION`, not REFUSED). That was the new test's expectation, not
   missing behavior, so it is not RED. GREEN: `test_principal_roles.py` 10/10
   (`9ceb23907`).
-- Not yet proven here: signed-root mismatch, and provider-assignment updates leaving
-  direct bindings intact. The latter is covered by
+- Signed-root mismatch — PASS, existing behavior.
+  `pg_principal_roles::workload_roots_and_families_are_services_only`: a token signed
+  for v1 reads under v1. Presenting v2 is refused with
+  `WYRD_AUTH_400_SIGNED_WORKLOAD_MISMATCH`, reason `signed_workload_mismatch` (posture
+  "a different root is refused as `signed_workload_mismatch`"). The first run asserted
+  a guessed 401, but the catalog status is 400, so it is not RED. GREEN 1/1.
+- Provider-assignment updates leave direct bindings intact: covered by
   `principal_roles::direct_and_idp_user_assignments_coexist` (Rust) and its Python and
-  TypeScript twins. FAIL for signed-root mismatch until proven.
+  TypeScript twins.
 
 ### 3. Change access under existing credentials and observe bounded enforcement
 

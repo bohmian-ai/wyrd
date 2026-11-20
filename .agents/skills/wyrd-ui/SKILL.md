@@ -1,13 +1,37 @@
 ---
 name: wyrd-ui
-description: "Use this repo-level skill when building, editing, debugging, styling, or extending the Wyrd UI in `crates/wyrd/wyrd-server/wyrd-ui`: the `wyrd-ai-ui` component package, the SvelteKit host app, Svelte 5 components, routes and load functions, Tailwind v4 styling, theme tokens, view documents, loaders and executors, and any request mentioning Wyrd UI, Evidence Thread, dark mode, or Wyrd frontend patterns. Wyrd UI is the styling source of truth, not the product or workflow source of truth."
+description: "Use this repo-level skill when building, editing, debugging, styling, or extending the Wyrd UI in `crates/wyrd/wyrd-server/wyrd-ui`: the `wyrd-ai-ui` component package, the SvelteKit host app, Svelte 5 components, routes and load functions, Tailwind v4 styling, theme tokens, view documents, loaders and executors, and any request mentioning Wyrd UI, Evidence Thread, dark mode, or Wyrd frontend patterns. This skill holds styling conventions; an approved change mock decides how that change's pages look, and the server owns product behavior."
 ---
 
 # Wyrd UI
 
 Use this skill before touching anything under `crates/wyrd/wyrd-server/wyrd-ui/`.
-Precedence: the user's instructions, then current code, then `brand/DESIGN.md`, then
-this skill.
+When sources disagree, follow the first that applies:
+
+1. the user's instructions;
+2. for a page or component a change packet builds, that change's approved mock in
+   `changes/active/<slug>/design/mock/`;
+3. `brand/DESIGN.md`;
+4. current code, then this skill.
+
+Use with `$wyrd-implement` when working a task; its scope rules apply here too.
+
+## Matching an approved mock
+
+The mock's source (`design/mock/src/`) is the specification for look and wording.
+Before building, read the mock's source for the page, not only its screenshots.
+Before claiming a match:
+
+- compare against the source for colours, labels, legends, controls, column
+  order, empty and error states, and how each control behaves;
+- capture the mock with its `selfcheck.mjs --shots` and the production page at the
+  same widths, in light and dark, and look at them side by side;
+- list every remaining difference in the task's evidence and get the user's ruling
+  on each one.
+
+Do not replace a mock element with an existing component's different look, and do
+not add a control the mock lacks, without the user's approval. A mock element that
+another task owns, or no task names, is out of scope: report it, do not build it.
 
 ## Product boundary
 
@@ -46,8 +70,8 @@ Authority is `brand/`: read `DESIGN.md` first, then `palette.json` and
   shadows, glow, gradients, scanlines, or lift/sink motion.
 - **Type.** Familjen Grotesk (`--font-sans`) for interface and reading; Fragment Mono
   (`--font-mono`) only for machine-shaped values.
-- **Host controls.** `.app-control` and `.app-input` (`src/app.css`) match the approved
-  mock's buttons: 1px rule, 32px, 13px sans. Add `.mono` to an input that holds a machine
+- **Host controls.** `.app-control` and `.app-input` (`src/app.css`) are the standard
+  buttons and inputs: 1px rule, 32px, 13px sans. Add `.mono` to an input that holds a machine
   value (key, issuer, client id, claim, tenant key). Fonts ship via `@fontsource`; never
   import a font service. No UI component library: Tailwind v4 plus tokens.
 - **Generated, never hand-edited:** `brand/theme.css`, `packages/ui/src/lib/theme.css`,
@@ -74,7 +98,7 @@ Authority is `brand/`: read `DESIGN.md` first, then `palette.json` and
   that use the session cookie (for example `t/[tenantKey]/ui/load`), never the backend
   directly.
 - State users share, reload, or go Back to lives in the URL (`cards-host.ts`,
-  `observe-host.ts`). Page through bounded results from the server; never fetch all
+  `observe-host.ts`, `verify-host.ts`). Page through bounded results from the server; never fetch all
   pages to sort or filter in the browser.
 - Svelte 5 runes: `$derived` for pure values, `$effect` only for external side effects,
   `.svelte.ts` modules only for state several components share. Strict TypeScript;
@@ -91,9 +115,10 @@ Narrowest first: `references/wyrd-testing-verification.md`. The minimum for any 
 under `wyrd-ui/` is `mise run ui:check`, the same lane CI's `ui` job runs. It builds the
 `wyrd-ai` addon, then runs `pnpm check` and `pnpm test`. Add `mise run codegen:check`
 when touching `palette.json`, `schemas.ts`, or the error catalog. For visual work,
-check both modes in `/_gallery` and the affected route.
+check both modes in `/_gallery` and the affected route, and compare with the
+approved mock as described above.
 
 ## Handoff
 
 Report the visible outcome, the changed route or component, verification status, and
-any material limitation.
+every remaining difference from the approved mock.

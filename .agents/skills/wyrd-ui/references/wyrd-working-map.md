@@ -6,7 +6,10 @@ Paths are relative to `crates/wyrd/wyrd-server/wyrd-ui`.
 
 - `DESIGN.md`: doctrine. `palette.json`: canonical tokens. `components.json`: component
   contracts. `gen-theme.mjs`: emits every token projection and the mark SVGs.
-- `renders/`: the styleguide and product mocks.
+- `renders/styleguide.html`: the rendered visual reference. `renders/product/`: older
+  route sheets whose visual treatment is superseded (see its README).
+
+A change's approved page mock lives in `changes/active/<slug>/design/mock/`.
 
 ## Component package (`packages/ui/src/lib`, published as `wyrd-ai-ui`)
 
@@ -35,10 +38,11 @@ Paths are relative to `crates/wyrd/wyrd-server/wyrd-ui`.
   server origin), `problem.ts` (safe problem projection), `form.ts`, `routing/`,
   `development.ts` (local sign-in, unavailable in production builds).
 - `lib/theme.svelte.ts`: the light/dark mode state and its cookie.
-- `lib/cards-host.ts`, `lib/observe-host.ts`: URL state for the Cards and Observe pages.
+- `lib/cards-host.ts`, `lib/observe-host.ts`, `lib/verify-host.ts`: URL state for the
+  Cards, Observe and Verify pages.
 - `lib/ui-fixtures.ts`: synthetic component data for `_gallery` and the tests.
-- `routes/t/[tenantKey]/`: tenant pages (`cards`, `cards/detail`, `observe`, `query`,
-  `settings`). `login`, `signup`, and `reset` use `+page@.svelte` to escape the
+- `routes/t/[tenantKey]/`: tenant pages (`cards`, `cards/detail`, `observe`, `verify`,
+  `query`, `settings`). `login`, `signup`, and `reset` use `+page@.svelte` to escape the
   tenant shell. `ui/load/+server.ts` loads one catalog panel for the browser session.
 - `routes/_gallery`: the dev component gallery.
 

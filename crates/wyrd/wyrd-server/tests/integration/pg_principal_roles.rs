@@ -994,6 +994,44 @@ async fn workload_roots_and_families_are_services_only() {
             .await
             .expect("the family account selects either release");
     }
+    // A token signed for one release cannot present the other as its root.
+    let v1_token = server
+        .exchange_api_key_for_workload(&key, &v1)
+        .await
+        .expect("the family account selects v1");
+    for (presented, mismatch) in [(&v1, false), (&v2, true)] {
+        let response = server
+            .oneshot_authenticated(
+                &v1_token,
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/v1/cards")
+                    .header("x-wyrd-workload-uid", presented.as_str())
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request responds");
+        if !mismatch {
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "the signed root is idempotent"
+            );
+            continue;
+        }
+        let problem: Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), 1 << 20)
+                .await
+                .expect("body reads"),
+        )
+        .expect("body is JSON");
+        assert_eq!(
+            problem["details"]["reason"],
+            json!("signed_workload_mismatch"),
+            "{problem}"
+        );
+    }
     let mut refusals = Vec::new();
     for root in [&other, &agent, &unknown] {
         match server.exchange_api_key_for_workload(&key, root).await {

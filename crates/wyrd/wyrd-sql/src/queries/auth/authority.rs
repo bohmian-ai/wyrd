@@ -11,6 +11,10 @@ use sqlx::types::{Json, Uuid};
 
 use crate::TenantConn;
 
+/// Reads, in one statement, everything one tenant's authority compiles
+/// from: the committed revision, every binding with its role's operations,
+/// group memberships, live Users and Services, and every stored API key,
+/// revoked ones included, with its ceiling.
 const AUTHORITY_STATE_SQL: &str = r"
 SELECT
   COALESCE((SELECT revision FROM wyrd.auth_authorization_revisions), 0) AS revision,

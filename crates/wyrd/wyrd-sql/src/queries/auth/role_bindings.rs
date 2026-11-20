@@ -18,6 +18,8 @@ use crate::TenantConn;
 /// The payload is `<data_tenant_id>:<revision>`.
 pub const AUTHORIZATION_CHANNEL: &str = "wyrd_authorization";
 
+/// Inserts one binding in the caller's tenant; an identical existing
+/// binding is kept, so a repeated grant is idempotent.
 const INSERT_BINDING_SQL: &str = r"
 INSERT INTO wyrd.auth_role_bindings
     (data_tenant_id, id, role_id, user_id, service_account_id, group_id, scope, source)
@@ -25,10 +27,14 @@ VALUES (wyrd.current_tenant(), $1, $2, $3, $4, $5, $6, $7)
 ON CONFLICT DO NOTHING
 ";
 
+/// Deletes one direct binding by id; provider bindings are never removed
+/// here, only by provider projection.
 const DELETE_BINDING_SQL: &str = r"
 DELETE FROM wyrd.auth_role_bindings WHERE id = $1 AND source = 'direct'
 ";
 
+/// Lists every binding of the tenant with its role's name and operations,
+/// in id order.
 const LIST_BINDINGS_SQL: &str = r"
 SELECT b.id, b.role_id, r.name AS role_name, r.permissions AS role_operations,
        b.user_id, b.service_account_id, b.group_id, b.scope, b.source
@@ -37,6 +43,8 @@ SELECT b.id, b.role_id, r.name AS role_name, r.permissions AS role_operations,
  ORDER BY b.id
 ";
 
+/// Replaces one User's provider bindings with the named tenant-wide roles,
+/// leaving its direct bindings untouched; answers whether anything changed.
 const REPLACE_IDP_BINDINGS_SQL: &str = r"
 WITH wanted AS (
     SELECT r.id AS role_id, w.id
@@ -57,6 +65,8 @@ WITH wanted AS (
 SELECT EXISTS (SELECT 1 FROM removed) OR EXISTS (SELECT 1 FROM added)
 ";
 
+/// Advances the tenant's authorization revision and notifies replicas on
+/// [`AUTHORIZATION_CHANNEL`] with `<tenant>:<revision>` at commit.
 const ADVANCE_REVISION_SQL: &str = r"
 WITH advanced AS (
     INSERT INTO wyrd.auth_authorization_revisions (data_tenant_id, revision)
@@ -71,25 +81,31 @@ SELECT revision,
   FROM advanced
 ";
 
+/// Reads the tenant's committed authorization revision; no row means none
+/// was ever advanced.
 const CURRENT_REVISION_SQL: &str = r"
 SELECT revision FROM wyrd.auth_authorization_revisions
 ";
 
+/// Creates one local group in the caller's tenant.
 const INSERT_GROUP_SQL: &str = r"
 INSERT INTO wyrd.auth_groups (data_tenant_id, id, name)
 VALUES (wyrd.current_tenant(), $1, $2)
 ";
 
+/// Deletes one local group by id; its memberships and bindings cascade.
 const DELETE_GROUP_SQL: &str = r"
 DELETE FROM wyrd.auth_groups WHERE id = $1
 ";
 
+/// Adds one User or Service to a group; an existing membership is kept.
 const INSERT_MEMBERSHIP_SQL: &str = r"
 INSERT INTO wyrd.auth_group_memberships (data_tenant_id, group_id, user_id, service_account_id)
 VALUES (wyrd.current_tenant(), $1, $2, $3)
 ON CONFLICT DO NOTHING
 ";
 
+/// Removes one User or Service from a group.
 const DELETE_MEMBERSHIP_SQL: &str = r"
 DELETE FROM wyrd.auth_group_memberships
  WHERE group_id = $1
@@ -97,10 +113,12 @@ DELETE FROM wyrd.auth_group_memberships
    AND service_account_id IS NOT DISTINCT FROM $3
 ";
 
+/// Lists the tenant's local groups in name order.
 const LIST_GROUPS_SQL: &str = r"
 SELECT id, name FROM wyrd.auth_groups ORDER BY name
 ";
 
+/// Lists every group membership of the tenant in a stable order.
 const LIST_MEMBERSHIPS_SQL: &str = r"
 SELECT group_id, user_id, service_account_id
   FROM wyrd.auth_group_memberships
@@ -404,6 +422,12 @@ pub async fn list_group_memberships(
         .collect()
 }
 
+/// Decodes a stored binding `source` column into its [`RoleSource`].
+///
+/// # Errors
+///
+/// [`sqlx::Error::Decode`] when the stored value is neither `idp` nor
+/// `direct`.
 fn decode_source(source: &str) -> Result<RoleSource, sqlx::Error> {
     match source {
         "idp" => Ok(RoleSource::Idp),

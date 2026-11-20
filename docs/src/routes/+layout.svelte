@@ -158,7 +158,7 @@
   <nav aria-label="Footer">
     {#if start}<a href={`${base}${start.path}`}>Get started</a>{/if}
     {#if reference}<a href={`${base}${reference.path}`}>Reference</a>{/if}
-    <a href={`${base}/llms.txt`}>llms.txt</a>
+    <a href={`${base}/llms.txt`} data-sveltekit-reload>llms.txt</a>
     <a href={GITHUB_URL} rel="noreferrer" target="_blank">GitHub</a>
   </nav>
 </footer>

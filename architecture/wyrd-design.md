@@ -2761,9 +2761,9 @@ KMS, AWS KMS, or Vault Transit). The Operator owner keeps connection
 authorization, persistence, reversible disable, and delivery checks; it owns no
 key source, cipher, or provider client of its own. When the wrapping backend
 cannot serve, connection create/update refuses; other surfaces keep working
-and delivery retries with `credential_store_unavailable`. Wrapping-key rewrap
-runs beside delivery in bounded, cancellable passes fenced on the secret
-version. Responses, errors,
+and delivery retries with `credential_store_unavailable`. Delivery never
+moves an envelope between wrapping keys; the platform stored-secret
+maintenance pass does, fenced on the observed envelope. Responses, errors,
 logs, and audit carry only redacted metadata, never key locations. Declaration
 and every delivery attempt require an active connection whose provider — and,
 for HTTP, auth scheme, header name, and origin of every effective URL —

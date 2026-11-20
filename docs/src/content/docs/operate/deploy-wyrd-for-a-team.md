@@ -84,7 +84,7 @@ The server reads only regular files that the user running it owns and nobody els
 
 The signing key signs the access tokens Wyrd issues. Every request carries one, and a replica accepts it only if this key signed it. With one shared key, a token issued by any replica works on all of them and still works after a restart. With `APP_ENV=production` and no signing key, the server refuses to start.
 
-The `kms/v1` key encrypts the secrets Wyrd stores in PostgreSQL, such as LLM provider keys stored as `managed_secret`, identity provider client secrets, and Operator connection credentials, so a copy of the database does not expose them. Back it up separately from the database. If it is lost, those secrets cannot be decrypted, and the server refuses to start while any are stored.
+The `kms/v1` key encrypts the secrets Wyrd stores in PostgreSQL, such as LLM provider keys stored as `managed_secret`, identity provider client secrets, and Operator connection credentials, so a copy of the database does not expose them. Back it up separately from the database. If it is lost, those secrets cannot be decrypted, and the server refuses to start while any are stored. To replace it later, see [Rotate or recover the wrapping key](/reference/stored-secret-encryption/#rotate-or-recover-the-wrapping-key).
 
 <Aside type="note" title="Use a cloud KMS or Vault instead">
 To keep this key in Google Cloud KMS, AWS KMS, or Vault Transit, set the `WYRD_KMS_*` variables in [Stored-secret encryption](/reference/stored-secret-encryption/) instead of the three below.

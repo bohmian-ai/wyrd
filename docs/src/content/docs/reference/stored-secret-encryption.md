@@ -143,6 +143,75 @@ A renewal or trusted-issuer replacement reads the secret, seals outside any data
 
 Every action answers `503` with the stored secret unchanged when the key service or the store is unavailable. A trusted-issuer replacement with an empty secret answers `400`.
 
+## Rotate or recover the wrapping key
+
+Changing `active_key` affects only new writes. Existing values keep the key that wrapped them, and stay readable while that key is listed in `retained_keys`. A platform administrator moves them with one maintenance pass at a time:
+
+```bash
+WYRD_PLATFORM_CREDENTIAL=... wyrd platform stored-secrets maintain --mode routine --server https://wyrd.example.com
+```
+
+```text
+mode: routine
+current: 0
+changed: 9
+remaining: 0
+bounded: false
+```
+
+| Mode | Effect on each value not under `active_key` | Use for |
+| --- | --- | --- |
+| `routine` | Rewraps its data key under `active_key`. The data key and payload ciphertext are kept | Planned rotation |
+| `recovery` | Reseals the value under a fresh data key wrapped by `active_key` | A wrapping key or data key may be exposed |
+
+Native provider rotation (`gcloud kms keys versions create`, `vault write -f transit/keys/<key>/rotate`, AWS automatic rotation) keeps the same reference: values stay readable and need no pass.
+
+**Planned rotation**
+
+1. Provision the new key and grant the server its permissions.
+2. Restart every server with the new key as `active_key` and the old key in `retained_keys`.
+3. Run `--mode routine` until `remaining` is `0`.
+4. Remove the old key from `retained_keys` only when no backup you may restore holds values under it, then restart.
+
+**Compromise recovery**
+
+1. Contain the incident: revoke the exposed access and stop any server that should no longer run.
+2. Provision a fresh key never used as `active_key` before, including by an earlier routine pass.
+3. Restart every server with the fresh key active and the old keys retained. Stop every process still writing under an old key.
+4. Run `--mode recovery` until `remaining` is `0`. Never run `--mode routine` into this key; nothing stops an administrator from choosing the wrong mode.
+5. Replace each exposed credential at its provider and in Wyrd. Resealing does not revoke a credential an attacker already copied.
+
+If containment removed access to an old key, recovery cannot open the values under it. Restore controlled read access to that key, or replace each credential through its owner without opening it. Removing a key from `[kms]` and restarting refuses every value under it until the key is listed again; Wyrd has no action that disables a key or cancels work already admitted.
+
+### Maintenance pass
+
+`POST /platform/stored-secrets/maintenance` with a platform session; the CLI command above calls it. It needs the platform `platform_credentials:write` permission; a tenant token is refused. The destination is always `active_key`; the request cannot name a key, tenant, or resource.
+
+| Request field | Value |
+| --- | --- |
+| `mode` | `routine` or `recovery`. Required |
+| `limit` | Most values the pass attempts to move, at least 1. Omitted, the pass attempts all within half the server's request timeout. CLI `--limit` |
+
+| Report field | Meaning |
+| --- | --- |
+| `current` | Values the pass saw already under `active_key` |
+| `changed` | Values the pass moved |
+| `remaining` | Values still not under `active_key`: failed, changed concurrently, or left by the bound |
+| `bounded` | The pass stopped at `limit` or its time budget |
+| `failures` | Up to 100 values the pass could not move, each with `store`, `data_tenant_id` (absent for the platform connection), `owner`, and `reason` |
+
+Counts describe only what one pass saw. `remaining: 0` does not prove that no backup, cache, or still-running old server depends on a key. Repeat with the same mode while `remaining` is above `0`; a repeated pass leaves values it already moved unchanged.
+
+| `reason` | Cause |
+| --- | --- |
+| `key_not_allowed` | The value's key is neither active nor retained |
+| `key_unavailable` | The backend refused or could not serve the call. Vault Transit also answers a value copied from another owner this way |
+| `unopenable` | The value is not a Wyrd envelope or did not authenticate under its owner |
+| `invalid_owner` | The row's owner metadata cannot bind a value |
+| `concurrent_change` | The owner replaced or renewed the value first; that change stands |
+
+The pass answers `503` with `reason: kms_not_configured` when the server has no `[kms]`, and `401` without a platform session.
+
 ## Startup refusals
 
 Startup fails and names the first offending setting; the message never contains a key, token, path, or URL.

@@ -127,7 +127,11 @@ production. `memory` is explicit and ephemeral: losing the process loses every
 envelope it wrote. Diagnostics name the setting, never its value, path, token,
 or key. Backend identity and allowed-key changes are static and roll out by
 controlled restart; no tenant or administrator action can grant the server
-another key.
+another key. Activating a replacement moves no stored envelope:
+after every writer runs the new configuration, a platform administrator
+repeats the explicit routine or recovery maintenance pass
+(`POST /platform/stored-secrets/maintenance`, `wyrd platform stored-secrets
+maintain`) until it reports nothing remaining.
 
 ## Browser-session deployment
 

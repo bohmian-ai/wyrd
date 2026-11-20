@@ -241,3 +241,18 @@ test("a rooted service acts within its callers authority", async ({ server, stat
   );
   await expect((await Principals.connect({ client: delegated })).list()).rejects.toMatchObject(DENIED);
 });
+
+test("a family bound viewer reads only that family", async ({ bundle: _ }) => {
+  const admin = await Cards.connect();
+  const payments = declared(await admin.declareFromPath(fixture("cards/repository_declaration/code-review.yaml")));
+  const other = declared(await admin.declareFromPath(fixture("cards/repository_declaration/unrelated.yaml")));
+  const created = await (await Principals.connect()).createServicePrincipal({
+    name: "payments-reader",
+    assignments: [{ role: "viewer", scope: { card: { family: { kind: "Verifier", name: "code-review" } } } }],
+  });
+  const own = await Cards.connect({ client: WyrdClient.connect({ credential: created.credential }) });
+
+  expect((await own.list({ kind: "Verifier" })).items.map((card) => card.name)).toEqual(["code-review"]);
+  expect(await own.get(payments)).toMatchObject({ metadata: { name: "code-review" } });
+  await expect(own.get(other)).rejects.toMatchObject({ code: "WYRD_REGISTRY_404_CARD_NOT_FOUND" });
+});

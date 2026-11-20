@@ -323,7 +323,7 @@ class Principals:
         """Create a Service account and its first credential.
 
         Args:
-            request: the account ``name``, its ``roles``, an optional
+            request: the account ``name``, its scoped ``assignments``, an optional
                 ``description``, and an optional ``workload_restriction``.
 
         Raises:

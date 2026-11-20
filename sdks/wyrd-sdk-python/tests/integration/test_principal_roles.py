@@ -322,3 +322,27 @@ def test_a_delegate_acts_for_its_subject_from_its_own_root(
     delegated = client_of(server, key, root).on_behalf_of(subject)
     [row] = attributed(server, [emit(hydrated(bundle, delegated))])
     assert (row.sub_principal_id, row.act_principal_id) == (owner["principal_id"], account)
+
+
+def test_a_family_bound_viewer_reads_only_that_family(server: WyrdTestServer) -> None:
+    cards = Cards(client_of(server))
+    payments = declare(cards, "cards/repository_declaration/code-review.yaml")["code-review"]
+    other = declare(cards, "cards/repository_declaration/unrelated.yaml")["unrelated-check"]
+    created = Principals(client_of(server)).create_service_principal(
+        {
+            "name": "payments-reader",
+            "assignments": [
+                {
+                    "role": "viewer",
+                    "scope": {"card": {"family": {"kind": "Verifier", "name": "code-review"}}},
+                }
+            ],
+        }
+    )
+    own = Cards(client_of(server, created["credential"]))
+
+    assert [ref.name for ref in own.list(kind="Verifier").refs] == ["code-review"]
+    assert own.get(payments).card_ref.name == "code-review"
+    with pytest.raises(WyrdError) as hidden:
+        own.get(other)
+    assert hidden.value.code == "WYRD_REGISTRY_404_CARD_NOT_FOUND"

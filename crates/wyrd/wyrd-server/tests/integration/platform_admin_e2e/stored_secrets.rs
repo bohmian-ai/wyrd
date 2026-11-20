@@ -117,6 +117,8 @@ async fn maintain(srv: &WyrdTestServer, session: &str, body: Value) -> (StatusCo
 struct Tenant {
     /// The tenant slug; its public host is `<slug>.wyrd.test`.
     slug: String,
+    /// The data tenant id, as text.
+    id: String,
     /// The administrator credential; exchanged afresh for every call so it
     /// survives a restart.
     credential: String,
@@ -158,6 +160,39 @@ impl Tenant {
             .expect("route responds");
         let status = resp.status();
         (status, json_body(resp).await)
+    }
+
+    /// Send `method uri` as [`Self::call`] does and require success.
+    ///
+    /// # Panics
+    /// Panics when the route does not answer with a success status.
+    async fn expect_ok(
+        &self,
+        srv: &WyrdTestServer,
+        method: Method,
+        uri: &str,
+        body: Option<Value>,
+    ) {
+        let (status, body) = self.call(srv, method, uri, body).await;
+        assert!(status.is_success(), "{uri} succeeds: {body}");
+    }
+
+    /// Replace this tenant's `managed` Gateway credential with `secret`.
+    ///
+    /// # Panics
+    /// Panics when the replacement is refused.
+    async fn replace_gateway_credential(&self, srv: &WyrdTestServer, secret: &str) {
+        self.expect_ok(
+            srv,
+            Method::PUT,
+            "/v1/admin/gateway/provider-credentials/managed",
+            Some(json!({
+                "name": "managed",
+                "provider": "acme",
+                "source": { "managed_secret": { "secret": secret } },
+            })),
+        )
+        .await;
     }
 
     /// The id of this tenant's only Operator connection.
@@ -275,6 +310,10 @@ async fn seed(srv: &WyrdTestServer, provider: &wiremock::MockServer, slugs: &[&s
         let created = json_body(resp).await;
         let tenant = Tenant {
             slug: (*slug).to_owned(),
+            id: created["tenant"]["id"]
+                .as_str()
+                .expect("tenant id")
+                .to_owned(),
             credential: created["admin"]["credential"]
                 .as_str()
                 .expect("admin credential")
@@ -820,9 +859,63 @@ async fn interrupted_or_denied_passes_resume_without_losing_committed_work() {
     srv.shutdown().await.expect("server shuts down");
 }
 
+/// Stored envelopes the pass wraps before the Gateway store: two human
+/// connections, two trusted issuers, and the platform connection.
+const GATEWAY_STORE: usize = 5;
+
+/// Stored envelopes the pass wraps before the Operator store: the above and
+/// two Gateway credentials.
+const OPERATOR_STORE: usize = 7;
+
+/// Waits until a maintenance pass is wrapping a given row.
+///
+/// A pass reads one store, then wraps its rows in order, sending one
+/// `decrypt` per row; on a delayed Transit fixture the row stays in flight
+/// for the delay, so a write made then lands after the read and before the
+/// swap.
+struct WrapBarrier<'a> {
+    /// The delayed fixture whose decrypt requests mark wrapping progress.
+    transit: &'a TransitFixture,
+    /// Decrypt requests served before the pass started.
+    before: usize,
+}
+
+impl<'a> WrapBarrier<'a> {
+    /// Count from `transit`'s current decrypt requests.
+    async fn new(transit: &'a TransitFixture) -> Self {
+        let before = transit.requests("decrypt").await;
+        Self { transit, before }
+    }
+
+    /// Return once the pass has begun wrapping the first row after `earlier`
+    /// envelopes.
+    async fn first_row_of(&self, earlier: usize) {
+        while self.transit.requests("decrypt").await <= self.before + earlier {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+}
+
+/// `tenants` in the order a pass wraps their rows within each store: by
+/// tenant id.
+///
+/// # Panics
+/// Panics unless there are exactly two tenants.
+fn in_wrap_order(tenants: &[Tenant]) -> (&Tenant, &Tenant) {
+    let [left, right] = tenants else {
+        panic!("two tenants")
+    };
+    if left.id < right.id {
+        (left, right)
+    } else {
+        (right, left)
+    }
+}
+
 /// Concurrent owner writes win over a slow pass: while every wrapping call is
 /// delayed, tenant A replaces its Gateway credential and rotates its Operator
 /// token, and tenant B revokes its credential and disables its connection.
+/// Tenant A is whichever tenant's rows the pass wraps second in each store.
 /// The pass loses its fence on the two replaced envelopes and reports them as
 /// `concurrent_change`, leaving the winning bytes; it moves the revoked and
 /// disabled owners' envelopes without re-enabling either; and the next pass
@@ -839,73 +932,45 @@ async fn a_pass_never_overwrites_or_reenables_a_concurrently_changed_owner() {
     let seeded = seed(&srv, &provider, &["acme-a", "acme-b"]).await;
     let srv = roll_out(srv, &transit, "k2", &["k1"]).await;
     let session = seeded.session(&srv).await;
-    // Each store wraps its rows in tenant order. Tenant `b` owns each store's
-    // first row, wrapped while the races land; tenant `a` owns the second,
-    // which the pass has read but not yet wrapped.
-    let mut tenants = Vec::new();
-    for tenant in &seeded.tenants {
-        let connection = tenant.operator_connection(&srv).await;
-        let tenant_id: String = sqlx::query_scalar(
-            "SELECT data_tenant_id::text FROM wyrd.operator_connections
-              WHERE connection_id = $1::uuid",
-        )
-        .bind(&connection)
-        .fetch_one(srv.operator_pool().pool())
-        .await
-        .expect("connection tenant reads");
-        tenants.push((tenant_id, tenant, connection));
-    }
-    tenants.sort_by(|left, right| left.0.cmp(&right.0));
-    let (_, a, a_operator) = tenants.pop().expect("tenant a");
-    let (b_tenant, b, b_operator) = tenants.pop().expect("tenant b");
-    let decrypts = transit.requests("decrypt").await;
+    let (first, second) = in_wrap_order(&seeded.tenants);
+    let (first_operator, second_operator) = (
+        first.operator_connection(&srv).await,
+        second.operator_connection(&srv).await,
+    );
+    let wrapping = WrapBarrier::new(&transit).await;
 
-    // The pass reads one store at a time, then wraps its rows in order; the
-    // stores before Gateway hold five envelopes. Each racing write starts
-    // when the pass begins wrapping the first row of its store, after it read
-    // the store: tenant `a`'s replacements commit before the pass reaches
-    // their row, and tenant `b`'s lifecycle changes land mid-wrap.
+    // While the pass wraps the first tenant's row in a store, the second
+    // tenant replaces its secret there (committing before the pass reaches
+    // it) and the first tenant changes its own row's lifecycle.
     let racers = async {
-        for (rows, tenant, method, uri, body) in [
-            (
-                6,
-                a,
-                Method::PUT,
-                "/v1/admin/gateway/provider-credentials/managed".to_owned(),
-                Some(json!({
-                    "name": "managed",
-                    "provider": "acme",
-                    "source": { "managed_secret": { "secret": "sk-replaced" } },
-                })),
-            ),
-            (
-                6,
-                b,
+        wrapping.first_row_of(GATEWAY_STORE).await;
+        second.replace_gateway_credential(&srv, "sk-replaced").await;
+        first
+            .expect_ok(
+                &srv,
                 Method::POST,
-                "/v1/admin/gateway/provider-credentials/managed/revoke".to_owned(),
+                "/v1/admin/gateway/provider-credentials/managed/revoke",
                 None,
-            ),
-            (
-                8,
-                a,
+            )
+            .await;
+
+        wrapping.first_row_of(OPERATOR_STORE).await;
+        second
+            .expect_ok(
+                &srv,
                 Method::PATCH,
-                format!("/v1/operator-connections/{a_operator}"),
+                &format!("/v1/operator-connections/{second_operator}"),
                 Some(json!({ "provider": "slack", "bot_token": "xoxb-rotated" })),
-            ),
-            (
-                8,
-                b,
+            )
+            .await;
+        first
+            .expect_ok(
+                &srv,
                 Method::DELETE,
-                format!("/v1/operator-connections/{b_operator}"),
+                &format!("/v1/operator-connections/{first_operator}"),
                 None,
-            ),
-        ] {
-            while transit.requests("decrypt").await < decrypts + rows {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-            let (status, body) = tenant.call(&srv, method, &uri, body).await;
-            assert!(status.is_success(), "{uri} wins its race: {body}");
-        }
+            )
+            .await;
         stored_envelopes(&srv).await
     };
     let ((status, report), winners) = tokio::join!(
@@ -935,7 +1000,7 @@ async fn a_pass_never_overwrites_or_reenables_a_concurrently_changed_owner() {
         lost,
         vec![
             ("gateway_credential", "managed"),
-            ("operator_connection", a_operator.as_str())
+            ("operator_connection", second_operator.as_str())
         ]
     );
 
@@ -958,8 +1023,8 @@ async fn a_pass_never_overwrites_or_reenables_a_concurrently_changed_owner() {
                   WHERE data_tenant_id = $1::uuid AND name = 'managed'),
                 (SELECT status FROM wyrd.operator_connections WHERE connection_id = $2::uuid)",
     )
-    .bind(&b_tenant)
-    .bind(&b_operator)
+    .bind(&first.id)
+    .bind(&first_operator)
     .fetch_one(srv.operator_pool().pool())
     .await
     .expect("lifecycle reads");
@@ -980,16 +1045,15 @@ async fn a_pass_never_overwrites_or_reenables_a_concurrently_changed_owner() {
         (&json!(9), &json!(0), &json!(0)),
         "{again}"
     );
-    let (status, body) = a
-        .call(
+    second
+        .expect_ok(
             &srv,
             Method::POST,
             "/v1/admin/gateway/provider-credentials/managed/renew-encryption",
             None,
         )
         .await;
-    assert_eq!(status, StatusCode::OK, "the replacement opens: {body}");
-    let (status, _) = b
+    let (status, _) = first
         .call(
             &srv,
             Method::POST,
@@ -998,5 +1062,85 @@ async fn a_pass_never_overwrites_or_reenables_a_concurrently_changed_owner() {
         )
         .await;
     assert!(!status.is_success(), "the revoked credential stays refused");
+    srv.shutdown().await.expect("server shuts down");
+}
+
+/// Removing a wrapping key from trusted configuration contains it and adding
+/// it back restores access: with `k1` no longer configured, every owner
+/// refuses to open its `k1` envelope with no backend call and no fallback, a
+/// pass reports each as `key_not_allowed` and moves nothing; configuring `k1`
+/// as retained again lets every owner open its value and a pass converge.
+///
+/// # Panics
+/// Panics when a removed key still opens, a backend decrypt is attempted for
+/// it, a refusal mutates a row, or restoring the key does not restore use.
+#[tokio::test]
+async fn removing_a_key_refuses_its_envelopes_until_it_is_restored() {
+    let transit = TransitFixture::start().await;
+    let srv = start(&transit, "k1", &[]).await;
+    let provider = wiremock::MockServer::start().await;
+    let seeded = seed(&srv, &provider, &["acme-a"]).await;
+    let sealed = stored_envelopes(&srv).await;
+
+    let srv = roll_out(srv, &transit, "k2", &[]).await;
+    let decrypts = transit.requests("decrypt").await;
+    let tenant = &seeded.tenants[0];
+    let human = &seeded.human_connections[0];
+    for uri in [
+        format!("/v1/identity/oidc/connections/{human}/renew-encryption"),
+        "/v1/admin/gateway/provider-credentials/managed/renew-encryption".to_owned(),
+    ] {
+        let (status, body) = tenant.call(&srv, Method::POST, &uri, None).await;
+        assert!(!status.is_success(), "{uri} refuses a removed key: {body}");
+    }
+    let (status, contained) = maintain(
+        &srv,
+        &seeded.session(&srv).await,
+        json!({ "mode": "recovery" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{contained}");
+    assert_eq!(
+        (&contained["changed"], &contained["remaining"]),
+        (&json!(0), &json!(5)),
+        "{contained}"
+    );
+    assert!(
+        contained["failures"]
+            .as_array()
+            .expect("failures")
+            .iter()
+            .all(|failure| failure["reason"] == "key_not_allowed"),
+        "{contained}"
+    );
+    assert_eq!(
+        transit.requests("decrypt").await,
+        decrypts,
+        "no fallback decrypt"
+    );
+    assert_eq!(
+        stored_envelopes(&srv).await,
+        sealed,
+        "containment moved nothing"
+    );
+
+    let srv = roll_out(srv, &transit, "k2", &["k1"]).await;
+    seeded.every_owner_opens(&srv, &provider).await;
+    let (_, restored) = maintain(
+        &srv,
+        &seeded.session(&srv).await,
+        json!({ "mode": "routine" }),
+    )
+    .await;
+    // Each tenant owner's renewal already resealed it; the pass moves the rest.
+    assert_eq!(
+        (
+            &restored["current"],
+            &restored["changed"],
+            &restored["remaining"]
+        ),
+        (&json!(4), &json!(1), &json!(0)),
+        "{restored}"
+    );
     srv.shutdown().await.expect("server shuts down");
 }

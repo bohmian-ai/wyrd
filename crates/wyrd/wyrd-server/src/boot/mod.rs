@@ -1040,6 +1040,7 @@ pub async fn compose_bifrost(
                 max_deadline: bifrost_config.oracle.max_query_deadline(),
                 ..OracleConfig::default()
             },
+            workloads: bifrost_resources.process().workloads().clone(),
         },
     ));
     let interceptor =

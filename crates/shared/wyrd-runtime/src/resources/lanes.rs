@@ -259,6 +259,42 @@ impl CpuLanes {
         job()
     }
 
+    /// Runs the blocking CPU job `job` on a blocking worker once a lane is
+    /// free for `context`, and returns what it returned.
+    ///
+    /// Async request work calls this for synchronous CPU work that must not
+    /// run on its async worker. The wait for a lane is the caller's own, so
+    /// no blocking worker is taken before a lane is granted and at most as
+    /// many dispatched jobs occupy blocking workers as there are lanes.
+    /// Dropping the future while it waits withdraws the request. Dropping it
+    /// once the job has started only discards the job's result: a running
+    /// job cannot be interrupted, so it keeps its lane, and everything it
+    /// captured, until it returns. The lane is returned when the job ends,
+    /// before this future resolves.
+    ///
+    /// # Errors
+    ///
+    /// Returns the join error when `job` panicked or the runtime shut down
+    /// before it ran.
+    ///
+    /// # Panics
+    ///
+    /// Panics when awaited outside a Tokio runtime.
+    pub async fn dispatch_blocking<T: Send + 'static>(
+        &self,
+        context: WorkContext,
+        job: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, tokio::task::JoinError> {
+        let lease = self.acquire(context).await;
+        let lanes = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let _lease = lease;
+            let _running = Scope::enter(&lanes, context);
+            job()
+        })
+        .await
+    }
+
     /// Runs blocking IO `io` off the lane the calling laned work holds.
     ///
     /// Work that writes or syncs files calls this around the IO, so
@@ -1136,5 +1172,51 @@ mod tests {
         assert_eq!(free_during_io, 1, "the lane is free while the poll does IO");
         assert_eq!(after_io, Some(bifrost), "the poll keeps its attribution");
         assert_eq!(lanes.free(), 1, "the lane is returned exactly once");
+    }
+
+    /// A dispatched job takes a blocking worker only once it holds a lane,
+    /// runs as its context's work, and keeps the lane until it returns even
+    /// when its caller stopped waiting.
+    ///
+    /// # Panics
+    /// Panics when a job starts without a lane, runs unattributed, or its
+    /// lane is free before it returns.
+    #[tokio::test]
+    async fn dispatched_jobs_wait_for_a_lane_and_keep_it_until_they_return() {
+        let lanes = CpuLanes::new(1);
+        let bifrost = context(Workload::Bifrost, None);
+        let busy = lanes.acquire(bifrost).await;
+        let (started, starts) = mpsc::channel();
+        let (finish, finishes) = mpsc::channel::<()>();
+        let mut abandoned = Box::pin(lanes.dispatch_blocking(bifrost, move || {
+            started
+                .send(WorkContext::current())
+                .expect("the test listens");
+            finishes.recv().ok();
+        }));
+        queue(abandoned.as_mut());
+        assert_eq!(
+            lanes.waiting(),
+            1,
+            "the caller waits, not a blocking worker"
+        );
+        assert!(starts.try_recv().is_err(), "no job runs without a lane");
+
+        drop(busy);
+        queue(abandoned.as_mut());
+        assert_eq!(
+            starts.recv().expect("the job starts"),
+            Some(bifrost),
+            "the job runs as its context's work"
+        );
+        // The caller gives up; the running job cannot be interrupted.
+        drop(abandoned);
+        assert_eq!(lanes.free(), 0, "an abandoned job keeps its lane");
+        let mut next = pin!(lanes.dispatch_blocking(bifrost, || ()));
+        queue(next.as_mut());
+        finish.send(()).expect("the job is running");
+        next.await
+            .expect("the next job runs once the abandoned one returned its lane");
+        assert_eq!(lanes.free(), 1, "every lane is returned");
     }
 }

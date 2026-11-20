@@ -124,7 +124,7 @@ pub use participant_cut::{
     OracleQueryAttemptCut, OracleQueryAttemptCutError, OracleQueryAttemptRoster,
     OracleQueryParticipant,
 };
-pub use planner::OraclePlanner;
+pub use planner::{OraclePlanner, ParsedQuery};
 pub use query_stream::OracleQueryStream;
 pub use query_stream::QueryStreamLifecycle;
 pub use query_stream::{
@@ -1562,21 +1562,6 @@ impl Oracle {
         self.fragment_dispatcher.as_ref().map(Arc::clone)
     }
 
-    /// Validates the query floor before any asynchronous metadata operation.
-    ///
-    /// Returns the statement's distinct canonical table references, parsed
-    /// once here so no later step of the attempt parses the SQL again.
-    ///
-    /// # Errors
-    /// Returns a stable public query error when the SQL is empty, oversized, or
-    /// contains more than one statement or a non-`SELECT` leading keyword.
-    pub fn validate_query(
-        &self,
-        request: &BifrostQueryRequest,
-    ) -> Result<Vec<TableRef>, BifrostError> {
-        self.planner.validate_query(request)
-    }
-
     /// Returns this node's Analytical follower ingress, when composed.
     ///
     /// The server mounts the upstream worker service behind
@@ -1629,8 +1614,59 @@ impl Oracle {
         request: BifrostQueryRequest,
         absolute_deadline_ms: i64,
     ) -> Result<OracleQueryStream, BifrostError> {
+        let (request, parsed) = self
+            .parse_query(&context, request, absolute_deadline_ms)
+            .await?;
+        self.query_parsed_with_deadline(context, request, parsed, absolute_deadline_ms)
+            .await
+    }
+
+    /// Validates and parses one request on a process CPU lane, off the
+    /// calling async worker, inside its already-captured deadline.
+    ///
+    /// An ingress that selects this Oracle in its own process parses here and
+    /// hands the result to [`Self::query_parsed_with_deadline`], so the
+    /// request is parsed once.
+    ///
+    /// # Errors
+    /// Returns invalid SQL for floor violations and a query timeout when the
+    /// deadline passes first; see [`OraclePlanner::parse_query`].
+    pub async fn parse_query(
+        &self,
+        context: &AuthorizedQueryContext,
+        request: BifrostQueryRequest,
+        absolute_deadline_ms: i64,
+    ) -> Result<(BifrostQueryRequest, ParsedQuery), BifrostError> {
+        let deadline = DateTime::from_timestamp_millis(absolute_deadline_ms)
+            .ok_or(BifrostError::QueryTimeout)
+            .and_then(instant_deadline)?;
+        self.planner
+            .parse_query(
+                self.resources.workloads(),
+                context.data_tenant_id,
+                request,
+                deadline,
+            )
+            .await
+    }
+
+    /// Executes a trusted server-internal query from the one parse of its
+    /// request, under the verified ingress deadline.
+    ///
+    /// `parsed` must be the parse of `request`; the caller that parsed it
+    /// keeps the two together.
+    ///
+    /// # Errors
+    /// Returns the same preparation and execution failures as [`Self::query_sql`].
+    pub async fn query_parsed_with_deadline(
+        &self,
+        context: AuthorizedQueryContext,
+        request: BifrostQueryRequest,
+        parsed: ParsedQuery,
+        absolute_deadline_ms: i64,
+    ) -> Result<OracleQueryStream, BifrostError> {
         let (roster, planned) = self
-            .prepare_query_attempt(&context, &request, absolute_deadline_ms)
+            .prepare_query_attempt(&context, parsed, absolute_deadline_ms)
             .await?;
         self.run_sql_query(context, request, roster, planned).await
     }
@@ -1700,8 +1736,9 @@ impl Oracle {
         BifrostError,
     > {
         let deadline_ms = self.capture_query_deadline(&request)?;
+        let (request, parsed) = self.parse_query(&context, request, deadline_ms).await?;
         let (roster, prepared) = self
-            .prepare_query_attempt(&context, &request, deadline_ms)
+            .prepare_query_attempt(&context, parsed, deadline_ms)
             .await?;
         let deadline = instant_deadline(roster.deadline())?;
         let ClassifiedAttempt {
@@ -1785,10 +1822,9 @@ impl Oracle {
     async fn prepare_query_attempt(
         &self,
         context: &AuthorizedQueryContext,
-        request: &BifrostQueryRequest,
+        ParsedQuery { statement, tables }: ParsedQuery,
         absolute_deadline_ms: i64,
     ) -> Result<(OracleQueryAttemptRoster, PlannedSqlCut), BifrostError> {
-        let (statement, tables) = self.planner.validate_statement(request)?;
         if !self.is_ready() {
             return Err(BifrostError::OracleRoleUnavailable);
         }
@@ -5848,7 +5884,12 @@ mod tests {
                 params: Vec::new(),
                 deadline_ms: None,
             };
-            assert!(planner.validate_query(&request).is_err());
+            assert!(
+                planner
+                    .check_floor(&request)
+                    .and_then(|()| parse_select(&request.sql))
+                    .is_err()
+            );
         }
     }
 

@@ -12,7 +12,8 @@ use tokio::sync::watch::{Sender, error::RecvError};
 use vala_bifrost_redux::cluster::{ClusterRegistry, ClusterSnapshot};
 use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
 use vala_bifrost_redux::oracle::{
-    AuthorizedQueryContext, Oracle, OracleConfig, OraclePlanner, OracleQueryStream, QueryIpcDecoder,
+    AuthorizedQueryContext, Oracle, OracleConfig, OraclePlanner, OracleQueryStream, ParsedQuery,
+    QueryIpcDecoder,
 };
 use wyrd_runtime::Permission;
 use wyrd_spec::error::WyrdError;
@@ -53,6 +54,8 @@ pub struct ReadyOracleForwarder {
     authority: Arc<OraclePeerAuthority>,
     /// Side-effect-free ingress classification owner.
     planner: OraclePlanner,
+    /// Process workload registry whose CPU lanes ingress parsing runs on.
+    workloads: wyrd_runtime::resources::WorkloadManager,
     /// Test-only switch that makes this replica a silent forwarding peer.
     #[cfg(feature = "test-support")]
     silent_peer: SilentForwardPeer,
@@ -170,6 +173,8 @@ pub struct ReadyOracleForwarderInputs {
     pub authority: Arc<OraclePeerAuthority>,
     /// Query floor, classification, and boot-resolved default deadline.
     pub config: OracleConfig,
+    /// Process workload registry whose CPU lanes ingress parsing runs on.
+    pub workloads: wyrd_runtime::resources::WorkloadManager,
 }
 
 impl ReadyOracleForwarder {
@@ -184,6 +189,7 @@ impl ReadyOracleForwarder {
             tls,
             authority,
             config,
+            workloads,
         } = inputs;
         Self {
             cluster,
@@ -193,6 +199,7 @@ impl ReadyOracleForwarder {
             tls,
             authority,
             planner: OraclePlanner::new(config),
+            workloads,
             #[cfg(feature = "test-support")]
             silent_peer: SilentForwardPeer::new(),
         }
@@ -206,6 +213,11 @@ impl ReadyOracleForwarder {
     }
 
     /// Routes one already-authenticated public query to an exact ready Oracle.
+    ///
+    /// The request's deadline is captured first, so it covers the wait for a CPU lane and the
+    /// one parse that validates the request, which runs off this async worker. A local leader
+    /// executes from that parse; a remote leader receives the unchanged request and validates it
+    /// again at its own trust boundary.
     ///
     /// Candidate connections are attempted before the immutable cut is created. Once a local
     /// or connected remote leader is selected and addressed, the request is delivered exactly once;
@@ -221,7 +233,6 @@ impl ReadyOracleForwarder {
         request: BifrostQueryRequest,
     ) -> Result<OracleQueryStream, BifrostError> {
         Self::validate_context(&context)?;
-        self.planner.validate_query(&request)?;
         let duration = self.planner.request_deadline(request.deadline_ms);
         let monotonic_deadline = Instant::now()
             .checked_add(duration)
@@ -229,6 +240,15 @@ impl ReadyOracleForwarder {
         let now = chrono::Utc::now();
         let wall_deadline =
             now + chrono::Duration::from_std(duration).map_err(|_| BifrostError::QueryTimeout)?;
+        let (request, parsed) = self
+            .planner
+            .parse_query(
+                &self.workloads,
+                context.data_tenant_id,
+                request,
+                monotonic_deadline,
+            )
+            .await?;
         let snapshot = self.cluster.snapshot();
         let mut candidates = eligible_oracle_candidates(&snapshot);
         if candidates.is_empty() {
@@ -253,9 +273,11 @@ impl ReadyOracleForwarder {
             }
             .into_claims((local.key.node_id, local.fencing_token))?;
             // Same process: the context is already authorized here, so it is not
-            // encoded only to be decoded again.
-            return self.execute_local(claims).await;
+            // encoded only to be decoded again, and the request is not parsed again.
+            return self.execute_local(claims, Some(parsed)).await;
         }
+        // A remote leader validates the request itself; this parse only refused bad SQL early.
+        drop(parsed);
         let remote_candidates = candidates
             .drain(..)
             .filter(|lease| lease.key.node_id != self.local_node_id)
@@ -304,7 +326,7 @@ impl ReadyOracleForwarder {
             .authority
             .verify_forward_query(&context, self.local_node_id, fence, chrono::Utc::now())
             .map_err(|_| BifrostError::QueryPeerSecurity)?;
-        self.execute_local(claims).await
+        self.execute_local(claims, None).await
     }
 
     /// Runs already-authorized forwarding claims on this replica's local Oracle.
@@ -312,22 +334,42 @@ impl ReadyOracleForwarder {
     /// Both entries reach here: a remote envelope after peer-context verification,
     /// and a same-process selection whose context this node verified itself.
     /// The claims are still checked against this Oracle's audience and fence.
+    /// `parsed` is this process's own parse of the claims' request; a remote
+    /// envelope carries none, so the Oracle validates and parses its request.
     ///
     /// # Errors
     /// Returns a closed role-fence, deadline, or query failure.
     async fn execute_local(
         &self,
         claims: ForwardQueryClaims,
+        parsed: Option<ParsedQuery>,
     ) -> Result<OracleQueryStream, BifrostError> {
         let fence = self
             .local_fence
             .ok_or(BifrostError::OracleRoleUnavailable)?;
         Self::validate_claims(&claims, self.local_node_id, fence)?;
-        self.local_oracle
+        let oracle = self
+            .local_oracle
             .as_ref()
-            .ok_or(BifrostError::OracleRoleUnavailable)?
-            .query_sql_with_deadline(claims.context, claims.request, claims.absolute_deadline_ms)
-            .await
+            .ok_or(BifrostError::OracleRoleUnavailable)?;
+        let ForwardQueryClaims {
+            context,
+            request,
+            absolute_deadline_ms,
+            ..
+        } = claims;
+        match parsed {
+            Some(parsed) => {
+                oracle
+                    .query_parsed_with_deadline(context, request, parsed, absolute_deadline_ms)
+                    .await
+            }
+            None => {
+                oracle
+                    .query_sql_with_deadline(context, request, absolute_deadline_ms)
+                    .await
+            }
+        }
     }
 
     /// Encodes a shortened ingress budget and exercises ordinary acceptance.

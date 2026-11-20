@@ -1984,7 +1984,7 @@ traced('a session judgment cites an exact trace: the citation leads to its pinne
   const { principalId, key } = await runtimeAccount({ kind: 'Service', name: coding.root.name });
   // The judge reads spans as the Service, which needs the tool and query grants.
   server.scopedApiKey('ui_live_reader', ['tool:invoke', 'bifrost_query:read']);
-  await (await Principals.connect()).grantRole(principalId, 'ui_live_reader');
+  await (await Principals.connect()).bind({ subject: { principal: { id: principalId, kind: 'service' } }, role: 'ui_live_reader', scope: 'all' });
   const token = await WyrdClient.connect().accessToken();
   /** The binding of `owner` that judges a session when it ends. */
   const sessionBinding = async (owner: Exact) => {

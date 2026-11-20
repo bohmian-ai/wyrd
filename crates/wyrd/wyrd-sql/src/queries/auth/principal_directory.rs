@@ -20,7 +20,7 @@ macro_rules! assignable_principals_sql {
         SELECT id, kind, status, email, name, restriction_kind, restriction_name
           FROM (
                 SELECT id, 'user'::text AS kind, status, email,
-                       NULL::text AS name, NULL::text AS restriction_kind,
+                       username AS name, NULL::text AS restriction_kind,
                        NULL::text AS restriction_name
                   FROM wyrd.auth_users
                  WHERE data_tenant_id = wyrd.current_tenant()
@@ -64,7 +64,7 @@ pub struct AssignablePrincipalRow {
     pub status: String,
     /// Email, for users that have one.
     pub email: Option<String>,
-    /// Principal name, for Service accounts.
+    /// A Service account's name, or a local User's username.
     pub name: Option<String>,
     /// Restricting family kind, for a family-restricted Service account.
     pub restriction_kind: Option<String>,
@@ -93,7 +93,7 @@ pub struct PrincipalFilter<'a> {
     pub kind: Option<&'a str>,
     /// Exact email; only users carry one.
     pub email: Option<&'a str>,
-    /// Exact name; only Service accounts carry one.
+    /// Exact name: a Service account's name or a local User's username.
     pub name: Option<&'a str>,
     /// Return only principals whose id sorts after this one.
     pub after: Option<Uuid>,

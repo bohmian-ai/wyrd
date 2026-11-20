@@ -19,6 +19,7 @@
 <div class="heading">
   <h1>Settings</h1>
   <p>Single sign-on for {data.tenant.name}. Secrets are write-only and never shown.</p>
+  <p>Accounts, roles and grants: <a href={`/t/${encodeURIComponent(data.tenant.key)}/settings/access`}>Access</a></p>
   <p>Integrations: <a href={`/t/${encodeURIComponent(data.tenant.key)}/settings/integrations/github`}>GitHub</a></p>
 </div>
 

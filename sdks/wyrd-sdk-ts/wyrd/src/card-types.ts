@@ -5473,7 +5473,7 @@ export interface PrincipalQuery {
    */
   readonly limit?: number | null;
   /**
-   * Exact account name; matches services only.
+   * Exact account name: a Service's name or a local User's username.
    */
   readonly name?: string | null;
 }
@@ -5497,7 +5497,8 @@ export interface PrincipalSummary {
    */
   readonly kind: PrincipalKindTag;
   /**
-   * Account name, for services.
+   * Account name: a Service's name, or a local User's username; `null`
+   * for an SSO-only User.
    */
   readonly name: string | null;
   /**

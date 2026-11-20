@@ -156,7 +156,7 @@ async function invitation(serverUrl: string, adminKey: string, role: string): Pr
       'x-wyrd-access-token': `Bearer ${await WyrdClient.connect({ serverUrl, credential: adminKey }).accessToken()}`,
       'content-type': 'application/json'
     },
-    body: JSON.stringify({ roles: [role] })
+    body: JSON.stringify({ assignments: [{ role, scope: 'all' }] })
   });
   expect(issued.status).toBe(201);
   return ((await issued.json()) as { invitation_code: string }).invitation_code;
@@ -2613,6 +2613,90 @@ connected('a tenant connects GitHub from Settings, reads its Repository Cards ap
       { repository: 'web', version: expect.any(String), access: 'Granted', verification: 'Not configured' },
       { repository: 'acme/docs', version: '', access: 'Granted', verification: 'Not declared' }
     ]);
+  } finally {
+    await browser.close();
+    bff.stop();
+  }
+});
+
+/** Connect installation 101 from Settings as the signed-in administrator on `page`. */
+async function connectGithub(page: Page, base: string) {
+  await page.goto(`${base}/settings/integrations/github`);
+  await page.getByRole('button', { name: 'Connect GitHub' }).click();
+  await page.waitForURL(/\/v1\/integrations\/github\/callback/);
+}
+
+/** Choose `role` at the `kind`/`name` Card family in the grant fields inside `form`. */
+async function chooseFamilyGrant(form: ReturnType<Page['locator']>, role: string, kind: string, name: string) {
+  await form.getByLabel('Role').selectOption(role);
+  await form.getByLabel('Scope', { exact: true }).selectOption('card_family');
+  await form.getByLabel('Card kind').selectOption(kind);
+  await form.getByLabel('Card name').fill(name);
+}
+
+connected('an administrator invites Alice with payments access in Settings, and the saved binding matches her Access summary', async ({ server }) => {
+  const github = server.githubApp;
+  github.addInstallation(101, [
+    { id: 1, fullName: 'acme/payments' },
+    { id: 2, fullName: 'acme/ledger' }
+  ]);
+  github.addUser('octo', [101]);
+  github.signIn('octo');
+  github.installTarget(101);
+  const tenant = server.tenantSlug;
+  const adminKey = server.bootstrapService(['admin'], 'access_ui_admin');
+  const admin = WyrdClient.connect({ credential: adminKey });
+  const cards = await Cards.connect({ client: admin });
+  const principals = await Principals.connect({ client: admin });
+  buildUi();
+  const bff = await startBff(server.baseUrl);
+  const browser = await chromium.launch();
+  try {
+    const base = `${bff.url}/t/${tenant}`;
+    const page = await signIn(browser, bff.url, tenant, adminKey);
+    await connectGithub(page, base);
+    await cards.declareFromPath(fixture('cards/verify_in_real_time/answer-check.yaml'));
+    await declarePolicy(cards, github.host, 'acme/payments', 'minimal');
+    await declarePolicy(cards, github.host, 'acme/ledger', 'minimal');
+    github.setPullRequest(1, 7, 'b1', 'a1');
+    github.setPullRequest(2, 9, 'b2', 'a2');
+    expect(github.deliverPullRequest(server.baseUrl, 101, 1, 7, 'opened')).toBe(202);
+    expect(github.deliverPullRequest(server.baseUrl, 101, 2, 9, 'opened')).toBe(202);
+
+    // Settings leads to Access. The administrator invites a user with viewer at the payments family: no IdP, no tenant-wide default.
+    await page.goto(`${base}/settings`);
+    await page.getByRole('link', { name: 'Access', exact: true }).click();
+    await page.waitForURL(`${base}/settings/access`);
+    const invite = page.getByRole('form', { name: 'Invite a user' });
+    await chooseFamilyGrant(invite, 'viewer', 'Repository', 'payments');
+    await invite.getByRole('button', { name: 'Create invitation' }).click();
+    const code = page.locator('[data-secret]');
+    await expect.poll(() => code.count()).toBe(1);
+    const invitationCode = (await code.textContent()) ?? '';
+
+    // Alice sets her own password with the invitation; the server created her account and exactly the invited binding.
+    const password = strongPassword();
+    const alice = await (await browser.newContext()).newPage();
+    await alice.goto(`${base}/signup`);
+    await alice.getByLabel('Invitation code').fill(invitationCode);
+    await alice.getByLabel('Username').fill('alice');
+    await alice.getByLabel('Password').fill(password);
+    await alice.getByRole('button', { name: 'Create account' }).click();
+    await alice.waitForURL(base);
+    const account = (await principals.list({ kind: 'user' })).principals.find((principal) => principal.name === 'alice' || principal.email === 'alice');
+    if (!account) throw new Error('the server lists no alice');
+    const payments = { card: { family: { kind: 'Repository', name: 'payments' } } };
+    expect((await principals.bindings({ principal_id: account.principal_id })).bindings).toMatchObject([
+      { subject: { principal: { id: account.principal_id, kind: 'user' } }, role: 'viewer', scope: payments, source: 'direct' }
+    ]);
+
+    // Access shows the same account, role, scope and source the server holds.
+    await page.goto(`${base}/settings/access`);
+    await page.getByRole('link', { name: 'Access for alice' }).click();
+    const grants = page.getByRole('region', { name: 'Access for alice' }).locator('tbody tr');
+    await expect.poll(() => grants.count()).toBe(1);
+    const row = (await grants.first().textContent()) ?? '';
+    for (const text of ['viewer', 'Repository/payments', 'every version, including future ones', 'Direct', 'cards:read', 'executions:read']) expect(row).toContain(text);
   } finally {
     await browser.close();
     bff.stop();

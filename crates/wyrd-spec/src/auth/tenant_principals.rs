@@ -440,7 +440,8 @@ pub struct PrincipalSummary {
     /// Email, for users.
     #[serde(default)]
     pub email: Option<String>,
-    /// Account name, for services.
+    /// Account name: a Service's name, or a local User's username; `null`
+    /// for an SSO-only User.
     #[serde(default)]
     pub name: Option<String>,
     /// The account's workload restriction: explicit for a Service, null for a
@@ -473,7 +474,7 @@ pub struct PrincipalQuery {
     /// Exact email; matches users only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
-    /// Exact account name; matches services only.
+    /// Exact account name: a Service's name or a local User's username.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// Page size between 1 and 200; default 100.

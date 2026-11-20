@@ -1310,32 +1310,24 @@ async fn prove_explanations() -> Result<(), JourneyError> {
     // Table authority covers the explained SELECT: a caller granted only the
     // gateway schema is refused before any plan of another schema's table.
     coordinator
-        .seed_role(
+        .seed_role("explain_gateway_only", &[Permission::bifrost_query_read()])
+        .await?;
+    let tableless_account = coordinator
+        .bootstrap_service_in_tenant(cluster.tenant(), "explain-tableless", &[])
+        .await?;
+    coordinator
+        .grant_role_at(
+            &tableless_account,
             "explain_gateway_only",
-            &[Permission {
-                resource: wyrd_runtime::Resource::BifrostQuery,
-                action: wyrd_runtime::Action::Read,
-                scope: wyrd_runtime::PermissionScope::Bifrost(
-                    wyrd_runtime::BifrostPermissionScope::Schema(
-                        wyrd_runtime::BifrostSchemaScope {
-                            catalog: "bifrost".to_owned(),
-                            schema: "gateway".to_owned(),
-                        },
-                    ),
-                ),
-            }],
+            &wyrd_runtime::PermissionScope::Bifrost(wyrd_runtime::BifrostPermissionScope::Schema(
+                wyrd_runtime::BifrostSchemaScope {
+                    catalog: "bifrost".to_owned(),
+                    schema: "gateway".to_owned(),
+                },
+            )),
         )
         .await?;
-    let tableless = client_from_bootstrap(
-        coordinator,
-        coordinator
-            .bootstrap_service_in_tenant(
-                cluster.tenant(),
-                "explain-tableless",
-                &["explain_gateway_only"],
-            )
-            .await?,
-    )?;
+    let tableless = client_from_bootstrap(coordinator, tableless_account)?;
     // Another tenant naming this tenant's table finds none, and no plan of it.
     let foreign = public_client(
         coordinator,

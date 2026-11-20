@@ -3234,7 +3234,8 @@ impl Oracle {
     /// The optimized plan passes the payload-column gate before it is
     /// returned, so a projection or filter reaching `bifrost.gateway.calls`
     /// payload content without payload-read authority never becomes
-    /// executable.
+    /// executable. Before optimization, [`restrict_verification_rows`]
+    /// limits every managed verification scan to the reader's visible rows.
     async fn plan_logical(
         session: &SessionContext,
         context: &AuthorizedQueryContext,
@@ -3246,6 +3247,7 @@ impl Oracle {
             .statement_to_plan(explained_select(statement).clone())
             .await
             .map_err(|error| map_sql_planning_error(&error))?;
+        let plan = restrict_verification_rows(context, plan)?;
         let frame = session
             .execute_logical_plan(plan)
             .await
@@ -3851,6 +3853,71 @@ pub(super) fn authorize_resolved_tables(
         }
     }
     Ok(())
+}
+
+/// Limits every scan of a managed `bifrost.verification` table to the rows
+/// whose trusted parent the principal's Card read reaches.
+///
+/// Scribe stamps each verification row's `subject_kind`, `subject_name` and
+/// `subject_card_uid` from the Card registry when the row is accepted, never
+/// from row labels: the subject Card, the Verifier of subjectless direct
+/// work, or the Repository of pull-request work. A family grant keeps every
+/// version's rows, an exact grant only its UID's, and no Card read keeps
+/// none; a table grant alone never adds rows. The filter is placed directly
+/// on each scan of the unoptimized plan, including scans inside views,
+/// joins and subqueries, so every user predicate, projection and aggregate
+/// sees only visible rows, and peers execute the same filtered plan.
+/// Tenant-wide Card read leaves the plan unchanged.
+///
+/// # Errors
+///
+/// Returns the mapped planning error when the plan cannot be rewritten.
+pub(super) fn restrict_verification_rows(
+    context: &AuthorizedQueryContext,
+    plan: datafusion::logical_expr::LogicalPlan,
+) -> Result<datafusion::logical_expr::LogicalPlan, BifrostError> {
+    use datafusion::common::Column;
+    use crate::tables::DomainTable;
+    use datafusion::common::tree_node::Transformed;
+    use datafusion::logical_expr::{Expr, Filter, LogicalPlan, lit};
+    use wyrd_spec::vala::managed_columns::{SUBJECT_CARD_UID, SUBJECT_KIND, SUBJECT_NAME};
+
+    let Some(objects) = context
+        .principal
+        .effective_permissions
+        .card_objects(&wyrd_runtime::Resource::Cards, &wyrd_runtime::Action::Read)
+    else {
+        return Ok(plan);
+    };
+    let managed = format!("bifrost.{}.", crate::tables::ResultsTable::NAMESPACE);
+    plan.transform_up_with_subqueries(|node| {
+        let LogicalPlan::TableScan(scan) = &node else {
+            return Ok(Transformed::no(node));
+        };
+        if !scan.table_name.to_string().starts_with(&managed) {
+            return Ok(Transformed::no(node));
+        }
+        let column = |name: &str| Expr::Column(Column::new(Some(scan.table_name.clone()), name));
+        let visible = objects
+            .iter()
+            .map(|scope| {
+                let family = column(SUBJECT_KIND)
+                    .eq(lit(scope.kind().wire_name()))
+                    .and(column(SUBJECT_NAME).eq(lit(scope.name().as_str())));
+                match scope {
+                    wyrd_runtime::CardPermissionScope::Family { .. } => family,
+                    wyrd_runtime::CardPermissionScope::Version { uid, .. } => {
+                        family.and(column(SUBJECT_CARD_UID).eq(lit(uid.as_str())))
+                    }
+                }
+            })
+            .reduce(Expr::or)
+            .unwrap_or_else(|| lit(false));
+        Filter::try_new(visible, Arc::new(node))
+            .map(|filter| Transformed::yes(LogicalPlan::Filter(filter)))
+    })
+    .map(|transformed| transformed.data)
+    .map_err(|error| map_datafusion_error(&error))
 }
 
 /// Refuses a plan reaching `bifrost.gateway.calls` payload content without the
@@ -4941,6 +5008,191 @@ mod tests {
             ),
             Err(BifrostError::QueryForbidden)
         ));
+    }
+
+    /// A session whose `bifrost.verification.results` and `.evidence` hold
+    /// one row under each of two Repository families, `payments` and
+    /// `other`, plus one row with no trusted parent.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture tables cannot be built.
+    fn verification_session() -> SessionContext {
+        use datafusion::arrow::array::StringArray;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::arrow::record_batch::RecordBatch;
+        use datafusion::catalog::{
+            CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider, SchemaProvider,
+        };
+        use wyrd_spec::vala::managed_columns::{SUBJECT_CARD_UID, SUBJECT_KIND, SUBJECT_NAME};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("result_id", DataType::Utf8, false),
+            Field::new(SUBJECT_KIND, DataType::Utf8, true),
+            Field::new(SUBJECT_NAME, DataType::Utf8, true),
+            Field::new(SUBJECT_CARD_UID, DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["p1", "o1", "u1"])),
+                Arc::new(StringArray::from(vec![
+                    Some("Repository"),
+                    Some("Repository"),
+                    None,
+                ])),
+                Arc::new(StringArray::from(vec![
+                    Some("payments"),
+                    Some("other"),
+                    None,
+                ])),
+                Arc::new(StringArray::from(vec![
+                    Some("01927b4c-0000-7000-8000-000000000001"),
+                    Some("01927b4c-0000-7000-8000-000000000002"),
+                    None,
+                ])),
+            ],
+        )
+        .expect("fixture batch builds");
+        let provider = MemorySchemaProvider::new();
+        for name in ["results", "evidence"] {
+            let table = datafusion::datasource::MemTable::try_new(
+                Arc::clone(&schema),
+                vec![vec![batch.clone()]],
+            )
+            .expect("fixture table builds");
+            provider
+                .register_table(name.to_owned(), Arc::new(table))
+                .expect("table registers");
+        }
+        let catalog = MemoryCatalogProvider::new();
+        catalog
+            .register_schema("verification", Arc::new(provider))
+            .expect("schema registers");
+        let session = SessionContext::new();
+        session.register_catalog("bifrost", Arc::new(catalog));
+        session
+    }
+
+    /// Proves managed verification rows are filtered by the reader's Card
+    /// read before any user expression: a `payments` family reader sees and
+    /// counts only payments rows through direct scans, predicates naming the
+    /// other family, joins, subqueries and aggregation; an exact-version
+    /// reader sees only its UID; a reader without Card read sees nothing even
+    /// with the table grant; tenant-wide Card read sees every row.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any query returns a row outside the reader's visibility.
+    #[tokio::test]
+    async fn verification_rows_are_filtered_by_the_readers_card_scope() {
+        use datafusion::arrow::array::{Array, AsArray};
+        use wyrd_runtime::CardPermissionScope;
+        use wyrd_spec::envelope::CardKind;
+        use wyrd_spec::ids::{CardName, CardUid};
+
+        let payments = || CardName::new("payments").expect("name");
+        let family = payload_context(&[
+            Permission::bifrost_query_read(),
+            Permission::card_read().at(PermissionScope::Card(CardPermissionScope::family(
+                CardKind::Repository,
+                payments(),
+            ))),
+        ]);
+        let exact = payload_context(&[
+            Permission::bifrost_query_read(),
+            Permission::card_read().at(PermissionScope::Card(CardPermissionScope::version(
+                CardKind::Repository,
+                payments(),
+                CardUid::new("01927b4c-0000-7000-8000-000000000001").expect("uid"),
+            ))),
+        ]);
+        let table_only = payload_context(&[Permission::bifrost_query_read()]);
+        let tenant_wide =
+            payload_context(&[Permission::bifrost_query_read(), Permission::card_read()]);
+        let session = verification_session();
+        let rows = |context: AuthorizedQueryContext, sql: &'static str| {
+            let session = &session;
+            async move {
+                let plan = Oracle::plan_logical(session, &context, &statement(sql), &[])
+                    .await
+                    .unwrap_or_else(|error| panic!("{sql} plans: {error}"));
+                let batches = session
+                    .execute_logical_plan(plan)
+                    .await
+                    .expect("plan executes")
+                    .collect()
+                    .await
+                    .expect("plan collects");
+                let mut values = Vec::new();
+                for batch in &batches {
+                    let column = batch.column(0);
+                    for index in 0..column.len() {
+                        values.push(match column.as_string_opt::<i32>() {
+                            Some(text) => text.value(index).to_owned(),
+                            None => column
+                                .as_primitive::<datafusion::arrow::datatypes::Int64Type>()
+                                .value(index)
+                                .to_string(),
+                        });
+                    }
+                }
+                values.sort();
+                values
+            }
+        };
+
+        for (sql, expected) in [
+            (
+                "SELECT result_id FROM bifrost.verification.results",
+                vec!["p1"],
+            ),
+            (
+                "SELECT result_id FROM bifrost.verification.results WHERE subject_name = 'other'",
+                vec![],
+            ),
+            (
+                "SELECT count(*) FROM bifrost.verification.results",
+                vec!["1"],
+            ),
+            (
+                "SELECT r.result_id FROM bifrost.verification.results r \
+                 JOIN bifrost.verification.evidence e ON r.result_id = e.result_id",
+                vec!["p1"],
+            ),
+            (
+                "SELECT result_id FROM bifrost.verification.results WHERE result_id IN \
+                 (SELECT result_id FROM bifrost.verification.evidence)",
+                vec!["p1"],
+            ),
+            (
+                "WITH all_rows AS (SELECT * FROM bifrost.verification.evidence) \
+                 SELECT result_id FROM all_rows",
+                vec!["p1"],
+            ),
+        ] {
+            assert_eq!(rows(family.clone(), sql).await, expected, "{sql}");
+        }
+        assert_eq!(
+            rows(exact, "SELECT result_id FROM bifrost.verification.results").await,
+            vec!["p1"]
+        );
+        assert_eq!(
+            rows(
+                table_only,
+                "SELECT count(*) FROM bifrost.verification.results"
+            )
+            .await,
+            vec!["0"]
+        );
+        assert_eq!(
+            rows(
+                tenant_wide,
+                "SELECT result_id FROM bifrost.verification.results"
+            )
+            .await,
+            vec!["o1", "p1", "u1"]
+        );
     }
 
     /// Builds one Bifrost table scope for the supplied schema and UID.

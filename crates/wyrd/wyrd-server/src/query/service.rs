@@ -213,7 +213,7 @@ pub async fn stream_query(
         edge_timer.hand_off();
     }
     match state.bifrost.query_sql(context, request).await {
-        Ok(stream) => Ok(stream),
+        Ok(stream) => revalidated(&state, caller, stream).await,
         // Oracle took the authoritative object decision against its resolved
         // scan set. The tenant and principal are verified here, so the refusal
         // is recorded on the same audited boundary as a coarse route denial.
@@ -222,6 +222,51 @@ pub async fn stream_query(
         }
         Err(other) => Err(other.into()),
     }
+}
+
+/// Binds an admitted stream to the authority its request was authorized
+/// under, so each later frame is released only while that authority is still
+/// usable and unchanged. Work run under accepted authority keeps its frozen
+/// limit and is not rebound to live grants.
+///
+/// # Errors
+///
+/// [`WyrdError::AuthorizationUnavailable`] or
+/// [`WyrdError::PermissionUnauthenticated`] when the caller's authority is
+/// already unusable or changed.
+async fn revalidated(
+    state: &AppState,
+    caller: Caller,
+    mut stream: OracleQueryStream,
+) -> Result<OracleQueryStream, WyrdError> {
+    if caller.executed_by.is_some() {
+        return Ok(stream);
+    }
+    let mut authority = wyrd_auth::authority::StreamAuthority::admit(
+        std::sync::Arc::clone(&state.auth.authority),
+        state.postgres.wyrd().clone(),
+        caller.principal,
+        caller.delegation_chain,
+    )
+    .await?;
+    let mut frames = stream.frames;
+    stream.frames = Box::pin(async_stream::stream! {
+        use futures_util::StreamExt as _;
+        while let Some(frame) = frames.next().await {
+            if let Err(error) = authority.revalidate().await {
+                tracing::info!(%error, "query stream stopped: caller authority lost");
+                yield Err(match error {
+                    WyrdError::AuthorizationUnavailable { .. } => {
+                        wyrd_spec::vala::error::BifrostError::QueryVisibilityUnavailable
+                    }
+                    _ => wyrd_spec::vala::error::BifrostError::QueryForbidden,
+                });
+                return;
+            }
+            yield frame;
+        }
+    });
+    Ok(stream)
 }
 
 /// Lists active queries visible to the authenticated tenant.

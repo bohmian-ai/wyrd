@@ -23,6 +23,7 @@ use wyrd_ai::observe::Run;
 use wyrd_ai::state::WyrdState;
 use wyrd_ai::{Bifrost, WyrdError};
 use wyrd_testing::Bootstrap;
+use wyrd_testing::principal::within_propagation;
 use wyrd_testing::server::WyrdTestServer;
 
 use crate::support::{Deployment, declare, fixture, pull, runtime_account};
@@ -159,6 +160,77 @@ async fn bound_editor_reaches_the_next_request_until_unbound() {
         .await
         .expect_err("the unbind reaches the next request");
     assert_eq!(refused.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
+    deployment.shutdown().await;
+}
+
+/// An open query stream stops once its caller loses the grant it was
+/// admitted under: after the administrator unbinds the Service's only role
+/// and a fresh request observes the loss, the stream fails instead of
+/// delivering the rest of its rows or a success terminal. Batches already
+/// delivered are not retracted.
+///
+/// # Panics
+/// Panics when a step fails, the stream completes, or the loss never
+/// propagates.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn an_open_stream_stops_once_its_grant_is_removed() {
+    const ROWS: i64 = 10_000 * 10_000;
+    let (deployment, principal, key) = service_principal().await;
+    let principals = Principals::connect_with(&deployment.admin())
+        .await
+        .expect("handle connects");
+    let bifrost = Bifrost::connect_with(&deployment.client(&key), BifrostOptions::default())
+        .await
+        .expect("Bifrost connects");
+    let mut stream = bifrost
+        .stream(
+            "SELECT a.v FROM (SELECT unnest(range(0, 10000)) AS v) a \
+             CROSS JOIN (SELECT unnest(range(0, 10000)) AS v) b \
+             LEFT JOIN bifrost.drift.observations o ON FALSE",
+            &[],
+            None,
+        )
+        .await
+        .expect("the stream opens");
+    let mut delivered = stream
+        .next_batch()
+        .await
+        .expect("the first batch decodes")
+        .expect("the stream has a first batch")
+        .num_rows();
+
+    let held = principals.access(&principal).await.expect("access reads");
+    principals
+        .unbind(&held.grants[0].binding_id)
+        .await
+        .expect("the administrator unbinds workload");
+    let refused = within_propagation(
+        &Some("WYRD_VALA_403_QUERY_FORBIDDEN".to_owned()),
+        || async {
+            bifrost
+                .sql(TENANT_WIDE, &[])
+                .await
+                .err()
+                .map(|error| WyrdError::from(error).code().to_owned())
+        },
+    )
+    .await;
+    assert_eq!(refused.as_deref(), Some("WYRD_PERMISSION_403_DENIED_RBAC"));
+
+    let stopped = loop {
+        match stream.next_batch().await {
+            Ok(Some(batch)) => delivered += batch.num_rows(),
+            Ok(None) => break None,
+            Err(error) => break Some(WyrdError::from(error)),
+        }
+    };
+    let stopped = stopped.expect("the stream fails instead of completing");
+    assert!(
+        i64::try_from(delivered).expect("row count fits") < ROWS,
+        "{delivered} rows delivered"
+    );
+    assert!(stream.terminal().is_none(), "{stopped:?}");
     deployment.shutdown().await;
 }
 

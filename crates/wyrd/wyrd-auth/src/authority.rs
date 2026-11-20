@@ -23,7 +23,8 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 use wyrd_auth_verify::VerifiedToken;
 use wyrd_runtime::{
-    EffectivePermissions, Permission, PermissionSet, Principal, PrincipalId, RoleRef,
+    DelegationStep, EffectivePermissions, Permission, PermissionSet, Principal, PrincipalId,
+    RoleRef,
 };
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
@@ -60,7 +61,7 @@ pub struct AccountAuthority {
 ///
 /// Revocation ends renewal; it does not withdraw a bearer the key already
 /// minted, which stays bounded by the key's ceiling.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum KeyState {
     /// Its restrictive ceiling, when it carries one.
     Bounded(Option<Arc<PermissionSet>>),
@@ -367,6 +368,31 @@ impl TenantAuthority {
         Some(principal)
     }
 
+    /// Whether `principal`, acting through `chain`, holds here exactly the
+    /// authority it held in `admitted`: the same live subject and actor
+    /// grants and the same state of its credential. Any difference, including
+    /// a widening, is a change, so an open stream never gains authority.
+    #[must_use]
+    pub fn unchanged_for(
+        &self,
+        admitted: &Self,
+        principal: &Principal,
+        chain: &[DelegationStep],
+    ) -> bool {
+        let same_account = |id: PrincipalId| {
+            !self.corrupt.contains_key(&id.as_uuid())
+                && match (self.account(id), admitted.account(id)) {
+                    (Some(now), Some(then)) => now.kind == then.kind && now.grants == then.grants,
+                    _ => false,
+                }
+        };
+        same_account(principal.id)
+            && chain.iter().all(|step| same_account(step.principal.id))
+            && principal.credential_id.is_none_or(|credential| {
+                self.keys.get(&credential) == admitted.keys.get(&credential)
+            })
+    }
+
     /// Whether `verified` may name state committed after this snapshot
     /// loaded: it was issued no earlier than the load second, and its
     /// account, an actor in its chain, or its credential is not held here.
@@ -612,6 +638,84 @@ impl AuthorityCache {
     }
 }
 
+/// The authority an open stream was admitted under, revalidated before each
+/// later output.
+///
+/// Reacquiring through [`AuthorityCache::acquire`] answers from memory while
+/// the snapshot is warm; a known newer revision or expired freshness costs
+/// the sanctioned reload, and holding the admitted snapshot never extends its
+/// freshness. The stream stops when authority is unavailable or the caller's
+/// authority changed.
+pub struct StreamAuthority {
+    cache: Arc<AuthorityCache>,
+    postgres: WyrdPostgres,
+    principal: Principal,
+    chain: Vec<DelegationStep>,
+    admitted: Arc<TenantAuthority>,
+}
+
+impl StreamAuthority {
+    /// Binds a stream to `principal`'s current authority, as the request
+    /// that opened it was authorized.
+    ///
+    /// # Errors
+    ///
+    /// [`WyrdError::AuthorizationUnavailable`] when no usable snapshot can be
+    /// acquired, and [`WyrdError::PermissionUnauthenticated`] when the
+    /// caller's grants already differ from the snapshot's.
+    pub async fn admit(
+        cache: Arc<AuthorityCache>,
+        postgres: WyrdPostgres,
+        principal: Principal,
+        chain: Vec<DelegationStep>,
+    ) -> Result<Self, WyrdError> {
+        let admitted = cache.acquire(&postgres, principal.tenant_id).await?;
+        let current = admitted
+            .account(principal.id)
+            .is_some_and(|account| *account.grants == *principal.effective_permissions.grants());
+        if !current {
+            return Err(authority_changed());
+        }
+        Ok(Self {
+            cache,
+            postgres,
+            principal,
+            chain,
+            admitted,
+        })
+    }
+
+    /// Confirms the stream may release its next output.
+    ///
+    /// # Errors
+    ///
+    /// [`WyrdError::AuthorizationUnavailable`] when no usable snapshot can be
+    /// acquired, and [`WyrdError::PermissionUnauthenticated`] when the
+    /// caller's authority changed since admission.
+    pub async fn revalidate(&mut self) -> Result<(), WyrdError> {
+        let current = self
+            .cache
+            .acquire(&self.postgres, self.principal.tenant_id)
+            .await?;
+        if Arc::ptr_eq(&current, &self.admitted) {
+            return Ok(());
+        }
+        if !current.unchanged_for(&self.admitted, &self.principal, &self.chain) {
+            return Err(authority_changed());
+        }
+        self.admitted = current;
+        Ok(())
+    }
+}
+
+/// The refusal for a stream whose caller's authority changed.
+fn authority_changed() -> WyrdError {
+    WyrdError::PermissionUnauthenticated {
+        message: "the caller's authority changed while the stream was open".to_owned(),
+        details: serde_json::json!({ "reason": "authority_changed" }),
+    }
+}
+
 #[cfg(test)]
 mod pg_tests {
     use std::time::Duration;
@@ -796,6 +900,36 @@ mod tests {
         assert!(authority.predates(&token(unknown, chrono::Utc::now())));
         assert!(!authority.predates(&token(unknown, earlier)));
         assert!(authority.authorize(&token(unknown, earlier)).is_some());
+    }
+
+    /// A stream's caller keeps its authority across an unrelated revision,
+    /// and loses it when its grants narrow, widen, or its account goes.
+    ///
+    /// # Panics
+    /// Panics when a change is missed or an unrelated revision stops it.
+    #[test]
+    fn a_stream_keeps_only_unchanged_authority() {
+        let (tenant, user) = (DataTenantId::new_v7(), Uuid::now_v7());
+        let admitted = TenantAuthority::compile(state(1, user)).expect("compiles");
+        let principal = wyrd_runtime::Principal::new(
+            wyrd_runtime::PrincipalId::new(user),
+            wyrd_runtime::PrincipalKind::User,
+            tenant,
+            wyrd_runtime::permission::PermissionSet::new(),
+        );
+        let unrelated = TenantAuthority::compile(state(2, user)).expect("compiles");
+        assert!(unrelated.unchanged_for(&admitted, &principal, &[]));
+
+        let mut widened = state(3, user);
+        widened.bindings.0[0].operations = json!([
+            {"resource": "cards", "action": "read"},
+            {"resource": "cards", "action": "write"}
+        ]);
+        let widened = TenantAuthority::compile(widened).expect("compiles");
+        assert!(!widened.unchanged_for(&admitted, &principal, &[]));
+
+        let gone = TenantAuthority::compile(state(4, Uuid::now_v7())).expect("compiles");
+        assert!(!gone.unchanged_for(&admitted, &principal, &[]));
     }
 
     /// A binding whose role operations or scope do not decode makes only its

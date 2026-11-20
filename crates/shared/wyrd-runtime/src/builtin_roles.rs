@@ -1,9 +1,14 @@
 //! Builtin RBAC roles shared across Wyrd server surfaces.
+//!
+//! A role is an operation bundle: it says what an account can do, never
+//! where. A role binding supplies the scope, and
+//! [`wyrd_spec::auth::compile_binding`] applies the bundle there.
 
 use uuid::Uuid;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::Operation;
 
-use crate::permission::Permission;
+use crate::permission::{Action, Resource};
 
 /// Fixed namespace for deterministic per-tenant builtin role IDs.
 pub const NS_BUILTIN_ROLE: Uuid = Uuid::from_u128(0x6ad8_2377_3a8f_5f42_9d17_a9f5_5b1c_5c63);
@@ -11,108 +16,113 @@ pub const NS_BUILTIN_ROLE: Uuid = Uuid::from_u128(0x6ad8_2377_3a8f_5f42_9d17_a9f
 /// A builtin role definition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuiltinRole {
-    /// Stable role name referenced by JWT role claims.
+    /// Stable, read-only role name.
     pub name: &'static str,
-    /// Permissions seeded into `wyrd.auth_roles.permissions`.
-    pub permissions: &'static [Permission],
+    /// Operations seeded into `wyrd.auth_roles.permissions`.
+    pub operations: &'static [Operation],
 }
 
-/// Every read a tenant principal can be granted: Cards, artifacts, audit,
-/// Operators, gateway configuration and captured payloads, Bifrost table
-/// definitions, Bifrost queries, and Verifier execution inspection.
-const VIEWER: &[Permission] = &[
-    Permission::card_read(),
-    Permission::verifier_read_any(),
-    Permission::artifact_read(),
-    Permission::audit_read(),
-    Permission::operators_read(),
-    Permission::gateway_read(),
-    Permission::gateway_payload_read(),
-    Permission::bifrost_table_read(),
-    Permission::bifrost_query_read(),
+const fn op(resource: Resource, action: Action) -> Operation {
+    Operation { resource, action }
+}
+
+/// Resource and derived-record reads plus authorized queries. No audit
+/// history and no captured gateway payloads.
+const VIEWER: &[Operation] = &[
+    op(Resource::Cards, Action::Read),
+    op(Resource::Executions, Action::Read),
+    op(Resource::Artifacts, Action::Read),
+    op(Resource::Operators, Action::Read),
+    op(Resource::Gateway, Action::Read),
+    op(Resource::BifrostTable, Action::Read),
+    op(Resource::BifrostQuery, Action::Read),
 ];
 
-/// [`VIEWER`] plus every runtime write a running Service or Agent performs:
-/// Bifrost table and record writes, evaluation, explicit invocation of every
-/// Verifier, Trigger writes, Operator invocation, and gateway invocation on every model.
-const WORKLOAD: &[Permission] = &[
-    Permission::card_read(),
-    Permission::verifier_read_any(),
-    Permission::artifact_read(),
-    Permission::audit_read(),
-    Permission::operators_read(),
-    Permission::gateway_read(),
-    Permission::gateway_payload_read(),
-    Permission::bifrost_table_read(),
-    Permission::bifrost_query_read(),
-    Permission::bifrost_table_write(),
-    Permission::bifrost_record_write(),
-    Permission::verifier_run_any(),
-    Permission::trigger_write(),
-    Permission::operator_invoke(),
-    Permission::gateway_invoke_any(),
+/// A running Service: read its granted runtime resources and their execution
+/// context, execute verification, append authorized data, and invoke granted
+/// gateways. No authoring, approval, audit, or captured payload read.
+const WORKLOAD: &[Operation] = &[
+    op(Resource::Cards, Action::Read),
+    op(Resource::Executions, Action::Read),
+    op(Resource::Artifacts, Action::Read),
+    op(Resource::Operators, Action::Read),
+    op(Resource::Gateway, Action::Read),
+    op(Resource::BifrostTable, Action::Read),
+    op(Resource::BifrostQuery, Action::Read),
+    op(Resource::BifrostTable, Action::Write),
+    op(Resource::BifrostRecord, Action::Write),
+    op(Resource::Verifier, Action::Run),
+    op(Resource::Triggers, Action::Write),
+    op(Resource::Operators, Action::Invoke),
+    op(Resource::Gateway, Action::Invoke),
 ];
 
-/// [`WORKLOAD`] plus authoring: Card and artifact writes, Card deletion, policy
-/// lock, Service installation, and Verifier approval decisions. Changing what
-/// a workload is verified against, and approving its verification, belong to
-/// people, not to the workload itself.
-const EDITOR: &[Permission] = &[
-    Permission::card_read(),
-    Permission::verifier_read_any(),
-    Permission::artifact_read(),
-    Permission::audit_read(),
-    Permission::operators_read(),
-    Permission::gateway_read(),
-    Permission::gateway_payload_read(),
-    Permission::bifrost_table_read(),
-    Permission::bifrost_query_read(),
-    Permission::bifrost_table_write(),
-    Permission::bifrost_record_write(),
-    Permission::verifier_run_any(),
-    Permission::trigger_write(),
-    Permission::operator_invoke(),
-    Permission::gateway_invoke_any(),
-    Permission::card_write(),
-    Permission::card_delete(),
-    Permission::artifact_write(),
-    Permission::policy_lock(),
-    Permission::service_install(),
-    Permission::verifier_approve_any(),
+/// [`VIEWER`] plus authoring, verification binding management, execution,
+/// and cancellation. No approvals and no access administration.
+const EDITOR: &[Operation] = &[
+    op(Resource::Cards, Action::Read),
+    op(Resource::Executions, Action::Read),
+    op(Resource::Artifacts, Action::Read),
+    op(Resource::Operators, Action::Read),
+    op(Resource::Gateway, Action::Read),
+    op(Resource::BifrostTable, Action::Read),
+    op(Resource::BifrostQuery, Action::Read),
+    op(Resource::BifrostTable, Action::Write),
+    op(Resource::BifrostRecord, Action::Write),
+    op(Resource::Verifier, Action::Run),
+    op(Resource::Triggers, Action::Write),
+    op(Resource::Operators, Action::Invoke),
+    op(Resource::Gateway, Action::Invoke),
+    op(Resource::Cards, Action::Write),
+    op(Resource::Cards, Action::Delete),
+    op(Resource::Artifacts, Action::Write),
+    op(Resource::Policy, Action::Lock),
+    op(Resource::Services, Action::Install),
 ];
+
+/// Read and decide approvals on the bound Verifiers. Deciding also needs the
+/// execution's parent to be readable, which a Repository-owned execution
+/// requires a separate Repository binding for.
+const APPROVER: &[Operation] = &[
+    op(Resource::Cards, Action::Read),
+    op(Resource::Verifier, Action::Approve),
+];
+
+/// Explicit tenant audit-history read; nothing else.
+const AUDITOR: &[Operation] = &[op(Resource::Audit, Action::Read)];
 
 /// Source of truth for Wyrd's per-tenant builtin roles.
 ///
-/// Exactly four Roles ordered `viewer` ⊂ `workload` ⊂ `editor` ⊂ `admin`.
-/// Only `admin` (through `*`) holds credential, user, identity-connection,
+/// Bundles, not a ladder. Only `admin` (through `*`, tenant scope only)
+/// holds credential, user, identity-connection, GitHub-connection,
 /// Operator-secret, and gateway-configuration administration. Platform-plane
-/// and engine-peer permissions belong to no tenant Role. Narrower Roles are a
-/// tenant administrator's choice.
+/// and engine-peer permissions belong to no tenant Role.
 pub const BUILTIN_ROLES: &[BuiltinRole] = &[
     BuiltinRole {
         name: "admin",
-        permissions: &[Permission::wildcard()],
+        operations: &[op(Resource::Wildcard, Action::Wildcard)],
     },
     BuiltinRole {
         name: "editor",
-        permissions: EDITOR,
+        operations: EDITOR,
     },
     BuiltinRole {
         name: "workload",
-        permissions: WORKLOAD,
+        operations: WORKLOAD,
     },
     BuiltinRole {
-        name: DEFAULT_ISSUER_ROLE,
-        permissions: VIEWER,
+        name: "viewer",
+        operations: VIEWER,
+    },
+    BuiltinRole {
+        name: "approver",
+        operations: APPROVER,
+    },
+    BuiltinRole {
+        name: "auditor",
+        operations: AUDITOR,
     },
 ];
-
-/// Built-in Role a trusted issuer grants every principal it authenticates
-/// when its create request omits `default_roles`.
-///
-/// Read-only by design: an explicit empty list still grants nothing, and
-/// issuers already stored keep the Roles they were created with.
-pub const DEFAULT_ISSUER_ROLE: &str = "viewer";
 
 /// Deterministic UUID for a tenant-scoped builtin role row.
 #[must_use]
@@ -127,171 +137,148 @@ pub fn builtin_role_uuid(data_tenant_id: DataTenantId, role_name: &str) -> Uuid 
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{BUILTIN_ROLES, builtin_role_uuid};
-    use crate::Permission;
+    use wyrd_spec::auth::{CardPermissionScope, Operation, PermissionScope, compile_binding};
+    use wyrd_spec::envelope::CardKind;
+    use wyrd_spec::ids::CardName;
 
-    /// Returns the named built-in Role's permissions.
-    ///
-    /// # Panics
-    ///
-    /// Panics when `name` is not built in.
-    fn permissions(name: &str) -> &'static [Permission] {
+    use super::{BUILTIN_ROLES, builtin_role_uuid};
+    use crate::{Permission, PermissionSet};
+
+    fn operations(name: &str) -> &'static [Operation] {
         BUILTIN_ROLES
             .iter()
             .find(|role| role.name == name)
             .expect("role is built in")
-            .permissions
+            .operations
     }
 
-    /// True when the named Role covers `required`.
-    fn holds(name: &str, required: &Permission) -> bool {
-        permissions(name)
-            .iter()
-            .any(|permission| permission.covers(required))
+    fn at(name: &str, scope: &PermissionScope) -> PermissionSet {
+        compile_binding(operations(name), scope)
+            .map(PermissionSet::from_iter)
+            .unwrap_or_default()
     }
 
-    /// Proves every seeded permission survives its JSON round trip.
+    fn family(kind: CardKind, name: &str) -> PermissionScope {
+        PermissionScope::Card(CardPermissionScope::family(
+            kind,
+            CardName::new(name).expect("name"),
+        ))
+    }
+
+    /// Proves the six agreed bundles exist and every operation round-trips.
     ///
     /// # Panics
-    ///
-    /// Panics when a permission fails to serialize or decode identically.
+    /// Panics when the name set differs or an operation fails to decode.
     #[test]
-    fn all_seeds_are_valid_permissions() {
-        for role in BUILTIN_ROLES {
-            let value = serde_json::to_value(role.permissions).expect("permissions serialize");
-            let round_trip: Vec<Permission> =
-                serde_json::from_value(value).expect("permissions deserialize");
-            assert_eq!(round_trip, role.permissions);
-        }
-    }
-
-    /// Proves Wyrd ships exactly the four persona Roles and no retired name.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the built-in name set differs.
-    #[test]
-    fn exactly_four_roles_are_built_in() {
+    fn the_agreed_bundles_are_built_in() {
         let names = BUILTIN_ROLES
             .iter()
             .map(|role| role.name)
             .collect::<BTreeSet<_>>();
         assert_eq!(
             names,
-            BTreeSet::from(["admin", "editor", "viewer", "workload"])
+            BTreeSet::from([
+                "admin", "approver", "auditor", "editor", "viewer", "workload"
+            ])
         );
-    }
-
-    /// Proves `viewer` ⊂ `workload` ⊂ `editor` ⊂ `admin`, each strictly.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a lower Role holds a permission its successor does not, or
-    /// when two adjacent Roles are equal.
-    #[test]
-    fn roles_are_strictly_nested() {
-        for (lower, upper) in [
-            ("viewer", "workload"),
-            ("workload", "editor"),
-            ("editor", "admin"),
-        ] {
-            for permission in permissions(lower) {
-                assert!(holds(upper, permission), "{upper} lacks {permission}");
-            }
-            assert!(
-                permissions(upper)
-                    .iter()
-                    .any(|permission| !holds(lower, permission)),
-                "{upper} adds nothing to {lower}"
-            );
+        for role in BUILTIN_ROLES {
+            let value = serde_json::to_value(role.operations).expect("serializes");
+            let round_trip: Vec<Operation> = serde_json::from_value(value).expect("decodes");
+            assert_eq!(round_trip, role.operations);
         }
     }
 
-    /// Proves each non-admin Role's exact permission set.
+    /// Proves each tenant-scoped bundle's boundary: no audit or captured
+    /// payload outside auditor/admin, no approval outside approver/admin, no
+    /// administration outside admin, and no authoring for workload.
     ///
     /// # Panics
-    ///
-    /// Panics when a Role's seeded permissions differ from the specified set.
+    /// Panics when a bundle holds or lacks a boundary permission.
     #[test]
-    fn each_role_holds_its_exact_permissions() {
-        let viewer = vec![
-            Permission::card_read(),
-            Permission::verifier_read_any(),
-            Permission::artifact_read(),
-            Permission::audit_read(),
-            Permission::operators_read(),
-            Permission::gateway_read(),
-            Permission::gateway_payload_read(),
-            Permission::bifrost_table_read(),
-            Permission::bifrost_query_read(),
-        ];
-        let mut workload = viewer.clone();
-        workload.extend([
-            Permission::bifrost_table_write(),
-            Permission::bifrost_record_write(),
-            Permission::verifier_run_any(),
-            Permission::trigger_write(),
-            Permission::operator_invoke(),
-            Permission::gateway_invoke_any(),
-        ]);
-        let mut editor = workload.clone();
-        editor.extend([
-            Permission::card_write(),
-            Permission::card_delete(),
-            Permission::artifact_write(),
-            Permission::policy_lock(),
-            Permission::service_install(),
-            Permission::verifier_approve_any(),
-        ]);
-        assert!(
-            !permissions("workload")
-                .iter()
-                .any(|held| held.covers(&Permission::verifier_approve_any())),
-            "the workload Role holds no approval"
-        );
-        assert_eq!(permissions("viewer"), viewer.as_slice());
-        assert_eq!(permissions("workload"), workload.as_slice());
-        assert_eq!(permissions("editor"), editor.as_slice());
-        assert_eq!(permissions("admin"), [Permission::wildcard()].as_slice());
-    }
-
-    /// Proves tenant administration, platform-plane, and engine-peer
-    /// permissions are reachable only through `admin`'s wildcard, and that
-    /// `workload` cannot author Cards or artifacts.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a non-admin Role covers an administrative permission.
-    #[test]
-    fn only_admin_holds_administration() {
+    fn bundles_hold_their_agreed_boundaries() {
+        let all = PermissionScope::All;
+        for name in ["viewer", "workload", "editor", "approver"] {
+            let held = at(name, &all);
+            assert!(
+                !held.contains(&Permission::audit_read()),
+                "{name} reads audit"
+            );
+            assert!(
+                !held.contains(&Permission::gateway_payload_read()),
+                "{name} reads payloads"
+            );
+        }
+        for name in ["viewer", "workload", "editor", "auditor"] {
+            assert!(
+                !at(name, &all).contains(&Permission::verifier_approve_any()),
+                "{name} approves"
+            );
+        }
+        assert!(at("auditor", &all).contains(&Permission::audit_read()));
+        assert!(!at("auditor", &all).contains(&Permission::card_read()));
+        assert!(!at("approver", &all).contains(&Permission::verifier_run_any()));
+        assert!(!at("approver", &all).contains(&Permission::card_write()));
+        assert!(!at("workload", &all).contains(&Permission::card_write()));
+        assert!(at("editor", &all).contains(&Permission::card_write()));
+        assert!(at("viewer", &all).contains(&Permission::executions_read_any()));
         for required in [
             Permission::service_accounts_write(),
             Permission::identity_connections_write(),
+            Permission::github_connections_write(),
             Permission::users_manage(),
             Permission::operators_write(),
             Permission::gateway_write(),
-            Permission::gateway_delete(),
             Permission::bifrost_peer_invoke(),
-            Permission::bifrost_table_install(),
             Permission::tenant_create(),
         ] {
             let granting = BUILTIN_ROLES
                 .iter()
-                .filter(|role| holds(role.name, &required))
+                .filter(|role| at(role.name, &all).contains(&required))
                 .map(|role| role.name)
                 .collect::<Vec<_>>();
             assert_eq!(granting, vec!["admin"], "{required}");
         }
-        assert!(!holds("workload", &Permission::card_write()));
-        assert!(!holds("workload", &Permission::artifact_write()));
+    }
+
+    /// Proves resource-scoped bundles: viewer at a Repository family reads
+    /// that family's Cards and executions only; approver at a Verifier
+    /// decides that Verifier only; admin and auditor have no resource scope.
+    ///
+    /// # Panics
+    /// Panics when a scoped bundle compiles to the wrong authority.
+    #[test]
+    fn bundles_compile_at_resource_scope() {
+        let payments = family(CardKind::Repository, "payments");
+        let viewer = at("viewer", &payments);
+        assert!(viewer.contains(&Permission::card_read().at(payments.clone())));
+        assert!(viewer.contains(&Permission::executions_read_any().at(payments.clone())));
+        assert!(!viewer.contains(&Permission::card_read()));
+        assert!(
+            !viewer.contains(&Permission::card_read().at(family(CardKind::Repository, "ledger")))
+        );
+        let lint = family(CardKind::Verifier, "lint");
+        assert!(
+            at("approver", &lint).contains(&Permission::verifier_approve_any().at(lint.clone()))
+        );
+        assert!(
+            compile_binding(operations("approver"), &payments)
+                .expect("reads apply")
+                .iter()
+                .all(|permission| permission.action != wyrd_spec::auth::Action::Approve),
+            "approving is Verifier-scoped"
+        );
+        for name in ["admin", "auditor"] {
+            assert!(
+                compile_binding(operations(name), &payments).is_err(),
+                "{name}"
+            );
+        }
     }
 
     /// Proves deterministic role ids are stable per tenant and name.
     ///
     /// # Panics
-    ///
-    /// Panics when the same input yields different ids or different names
-    /// collide.
+    /// Panics when the same input yields different ids or names collide.
     #[test]
     fn role_uuid_is_stable_per_tenant_and_name() {
         let tenant = wyrd_spec::DataTenantId::new_v7();

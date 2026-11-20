@@ -27,8 +27,9 @@ use wyrd_spec::auth::{
     ProvisionedTenantAdmin, SecretBearer, TenantListResponse,
 };
 use wyrd_sql::queries::auth::{
-    grant_role_to_service_account, insert_api_key, insert_service_account, list_api_key_metadata,
-    provision_system_principal, revoke_api_key, role_by_name, tenant_admin_principal_id,
+    SubjectColumns, advance_authorization_revision, insert_api_key, insert_role_binding,
+    insert_service_account, list_api_key_metadata, provision_system_principal, revoke_api_key,
+    role_by_name, tenant_admin_principal_id,
 };
 use wyrd_sql::queries::platform::provisioning::{
     insert_provisioning_tenant, mark_tenant_active, mark_tenant_failed, set_tenant_suspended,
@@ -499,7 +500,20 @@ impl TenantProvisioning {
             .await
             .map_err(|e| ProvisionError::Store(e.to_string()))?
             .ok_or_else(|| ProvisionError::Store("tenant admin role was not seeded".to_owned()))?;
-        grant_role_to_service_account(&mut conn, principal_id, role.id)
+        insert_role_binding(
+            &mut conn,
+            Uuid::now_v7(),
+            role.id,
+            SubjectColumns {
+                service_account_id: Some(principal_id),
+                ..SubjectColumns::default()
+            },
+            &wyrd_spec::auth::PermissionScope::All,
+            wyrd_spec::auth::RoleSource::Direct,
+        )
+        .await
+        .map_err(|e| ProvisionError::Store(e.to_string()))?;
+        advance_authorization_revision(&mut conn)
             .await
             .map_err(|e| ProvisionError::Store(e.to_string()))?;
 

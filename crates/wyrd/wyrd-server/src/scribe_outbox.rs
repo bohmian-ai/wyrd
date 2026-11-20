@@ -944,7 +944,6 @@ impl ScribeBatch {
                 PLATFORM_AUDIT_PRINCIPAL,
                 PrincipalKind::User,
                 self.tenant,
-                Vec::new(),
                 PermissionSet::new(),
             ),
             authenticated_tenant: self.tenant,

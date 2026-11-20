@@ -415,7 +415,7 @@ mod pg_tests {
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_runtime::{
         PermissionCheck, PermissionDenyReason, PermissionSet, PermissionVerdict, Principal,
-        PrincipalId, PrincipalKind, RoleRef,
+        PrincipalId, PrincipalKind,
     };
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::{LoginInitiation, PrincipalKindTag, Sha256Hex};
@@ -552,7 +552,6 @@ mod pg_tests {
                 PrincipalId::new(Uuid::nil()),
                 PrincipalKind::User,
                 tenant,
-                Vec::<RoleRef>::new(),
                 PermissionSet::from_iter([Permission::identity_connections_write()]),
             ),
             request_id: RequestId::now_v7(),

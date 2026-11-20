@@ -1,5 +1,6 @@
-//! A tenant administrator discovers principals and grants and revokes their
-//! Roles through `Principals`; each change reaches the principal's next token.
+//! A tenant administrator discovers principals and binds and unbinds their
+//! scoped roles through `Principals`; each change reaches the principal's
+//! next request.
 //! One stable Service account runs every release of its family, each run
 //! keeping its own exact root.
 
@@ -10,10 +11,11 @@ use secrecy::ExposeSecret as _;
 use serde::Deserialize;
 use serde_json::json;
 use wyrd_ai::auth::{
-    AccountAuthentication, CreateServicePrincipalRequest, CreateUserInvitationRequest,
-    CreateUserRequest, CredentialListQuery, PrincipalId, PrincipalKindTag, PrincipalQuery,
-    Principals, RevokePrincipalRequest, RoleAssignment, RoleSource, SecretBearer, WorkloadFamily,
-    WorkloadKind, WorkloadRestriction,
+    AccessSummary, AccountAuthentication, BindingSubject, CreateRoleBindingRequest,
+    CreateServicePrincipalRequest, CreateUserInvitationRequest, CreateUserRequest,
+    CredentialListQuery, GrantSource, PermissionScope, PrincipalId, PrincipalKindTag,
+    PrincipalQuery, Principals, RevokePrincipalRequest, ScopedRoleAssignment, SecretBearer,
+    WorkloadFamily, WorkloadKind, WorkloadRestriction,
 };
 use wyrd_ai::bifrost::{BifrostOptions, QueryParam};
 use wyrd_ai::cards::Cards;
@@ -38,11 +40,21 @@ struct Count {
     n: i64,
 }
 
-/// One `(role, source)` assignment.
-fn assignment(role: &str, source: RoleSource) -> RoleAssignment {
-    RoleAssignment {
+/// Each grant's `(role, source)`, in the summary's order.
+fn grants(access: &AccessSummary) -> Vec<(&str, &GrantSource)> {
+    access
+        .grants
+        .iter()
+        .map(|grant| (grant.role.as_str(), &grant.source))
+        .collect()
+}
+
+/// A request binding `role` tenant-wide to the Service or User `id`.
+fn bind_all(id: PrincipalId, kind: PrincipalKindTag, role: &str) -> CreateRoleBindingRequest {
+    CreateRoleBindingRequest {
+        subject: BindingSubject::Principal { id, kind },
         role: role.to_owned(),
-        source,
+        scope: PermissionScope::All,
     }
 }
 
@@ -58,7 +70,7 @@ async fn service_principal() -> (Deployment, PrincipalId, String) {
         .expect("handle connects")
         .create_service_principal(&CreateServicePrincipalRequest {
             name: "observed-service-runtime".to_owned(),
-            roles: vec!["workload".to_owned()],
+            assignments: vec![ScopedRoleAssignment::tenant("workload")],
             description: None,
             workload_restriction: None,
         })
@@ -84,22 +96,22 @@ async fn author(deployment: &Deployment, key: &str) -> Result<(), WyrdError> {
 }
 
 /// A new Service key holds direct `workload`: it queries but cannot author
-/// until an administrator grants `editor`, and the revoke reaches its next
-/// token. Grants and revokes are idempotent.
+/// until an administrator binds `editor`, and the unbind reaches its next
+/// request. A repeated bind returns the same binding.
 ///
 /// # Panics
 /// Panics when a step fails or an outcome differs.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn granted_editor_reaches_the_next_token_until_revoked() {
+async fn bound_editor_reaches_the_next_request_until_unbound() {
     let (deployment, principal, key) = service_principal().await;
     let principals = Principals::connect_with(&deployment.admin())
         .await
         .expect("handle connects");
 
-    let held = principals.roles(&principal).await.expect("roles list");
+    let held = principals.access(&principal).await.expect("access reads");
     assert_eq!(held.kind, PrincipalKindTag::Service);
-    assert_eq!(held.roles, [assignment("workload", RoleSource::Direct)]);
+    assert_eq!(grants(&held), [("workload", &GrantSource::Direct)]);
     let counted: Vec<Count> =
         Bifrost::connect_with(&deployment.client(&key), BifrostOptions::default())
             .await
@@ -114,42 +126,44 @@ async fn granted_editor_reaches_the_next_token_until_revoked() {
         .expect_err("workload cannot author");
     assert_eq!(refused.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
 
+    let editor = bind_all(principal, PrincipalKindTag::Service, "editor");
     let granted = principals
-        .grant_role(&principal, "editor")
+        .bind(&editor)
         .await
-        .expect("the administrator grants editor");
-    assert!(granted.changed);
+        .expect("the administrator binds editor");
+    assert_eq!(granted.scope, PermissionScope::All);
+    let again = principals
+        .bind(&editor)
+        .await
+        .expect("a repeat bind succeeds");
+    assert_eq!(again.id, granted.id);
+    let held = principals.access(&principal).await.expect("access reads");
     assert_eq!(
-        granted.roles,
+        grants(&held),
         [
-            assignment("editor", RoleSource::Direct),
-            assignment("workload", RoleSource::Direct)
+            ("editor", &GrantSource::Direct),
+            ("workload", &GrantSource::Direct)
         ]
     );
-    let again = principals
-        .grant_role(&principal, "editor")
-        .await
-        .expect("a repeat grant succeeds");
-    assert!(!again.changed);
     author(&deployment, &key)
         .await
-        .expect("editor authors at its next token");
+        .expect("editor authors at its next request");
 
-    let revoked = principals
-        .revoke_role(&principal, "editor")
+    principals
+        .unbind(&granted.id)
         .await
-        .expect("the administrator revokes editor");
-    assert!(revoked.changed);
-    assert_eq!(revoked.roles, [assignment("workload", RoleSource::Direct)]);
+        .expect("the administrator unbinds editor");
+    let held = principals.access(&principal).await.expect("access reads");
+    assert_eq!(grants(&held), [("workload", &GrantSource::Direct)]);
     let refused = author(&deployment, &key)
         .await
-        .expect_err("the revoke reaches the next token");
+        .expect_err("the unbind reaches the next request");
     assert_eq!(refused.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
     deployment.shutdown().await;
 }
 
 /// The Service's own key, which is no tenant administrator, can neither
-/// grant nor revoke a Role.
+/// bind nor unbind a role.
 ///
 /// # Panics
 /// Panics when a write succeeds or is refused with another code.
@@ -157,26 +171,31 @@ async fn granted_editor_reaches_the_next_token_until_revoked() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn only_a_tenant_admin_assigns_roles() {
     let (deployment, principal, key) = service_principal().await;
+    let admin = Principals::connect_with(&deployment.admin())
+        .await
+        .expect("handle connects");
+    let workload_binding =
+        admin.access(&principal).await.expect("access reads").grants[0].binding_id;
     let principals = Principals::connect_with(&deployment.client(&key))
         .await
         .expect("handle connects");
 
     let granted = principals
-        .grant_role(&principal, "editor")
+        .bind(&bind_all(principal, PrincipalKindTag::Service, "editor"))
         .await
-        .expect_err("a workload cannot grant");
+        .expect_err("a workload cannot bind");
     let revoked = principals
-        .revoke_role(&principal, "workload")
+        .unbind(&workload_binding)
         .await
-        .expect_err("a workload cannot revoke");
+        .expect_err("a workload cannot unbind");
 
     assert_eq!(granted.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
     assert_eq!(revoked.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
     deployment.shutdown().await;
 }
 
-/// A tenant administrator creates a local User holding the named Role and
-/// invites another by Role name; policy, duplicate and unknown-Role inputs are
+/// A tenant administrator creates a local User holding a scoped role and
+/// invites another with one; policy, duplicate and unknown-role inputs are
 /// refused, and a workload that is no administrator can do neither.
 ///
 /// # Panics
@@ -191,7 +210,7 @@ async fn administrators_create_and_invite_users() {
     let request = |username: &str, password: &str, role: &str| CreateUserRequest {
         username: username.to_owned(),
         password: SecretBearer::new(password.to_owned()),
-        roles: vec![role.to_owned()],
+        assignments: vec![ScopedRoleAssignment::tenant(role)],
     };
 
     let created = admin
@@ -199,11 +218,11 @@ async fn administrators_create_and_invite_users() {
         .await
         .expect("an administrator creates a User");
     assert_eq!(created.username, "development");
-    let roles = admin
-        .roles(&created.principal_id)
+    let access = admin
+        .access(&created.principal_id)
         .await
-        .expect("roles read");
-    assert_eq!(roles.roles, vec![assignment("admin", RoleSource::Direct)]);
+        .expect("access reads");
+    assert_eq!(grants(&access), [("admin", &GrantSource::Direct)]);
     for (refused, why) in [
         (
             request("development", "development", "admin"),
@@ -215,7 +234,7 @@ async fn administrators_create_and_invite_users() {
         ),
         (
             request("unknown", "development", "no-such-role"),
-            "an unknown Role",
+            "an unknown role",
         ),
     ] {
         let error = admin.create_user(&refused).await.expect_err(why);
@@ -224,12 +243,15 @@ async fn administrators_create_and_invite_users() {
 
     let invited = admin
         .invite_user(&CreateUserInvitationRequest {
-            roles: vec!["editor".to_owned()],
+            assignments: vec![ScopedRoleAssignment::tenant("editor")],
         })
         .await
         .expect("an administrator invites");
     assert_eq!(invited.invitation_code.expose().len(), 43);
-    assert_eq!(invited.invitation.role_ids.len(), 1);
+    assert_eq!(
+        invited.invitation.assignments,
+        [ScopedRoleAssignment::tenant("editor")]
+    );
     assert!(invited.signup_url.as_str().ends_with("/signup"));
 
     let workload = Principals::connect_with(&deployment.client(&key))
@@ -241,7 +263,7 @@ async fn administrators_create_and_invite_users() {
         .expect_err("a workload cannot create Users");
     let invite = workload
         .invite_user(&CreateUserInvitationRequest {
-            roles: vec!["admin".to_owned()],
+            assignments: vec![ScopedRoleAssignment::tenant("admin")],
         })
         .await
         .expect_err("a workload cannot invite");
@@ -250,9 +272,9 @@ async fn administrators_create_and_invite_users() {
     deployment.shutdown().await;
 }
 
-/// A signed-in user discovered by email keeps its identity-provider Role
-/// beside a direct grant of the same Role; revoking removes only the direct
-/// one.
+/// A signed-in user discovered by email keeps its identity-provider binding
+/// beside a direct binding of the same role; unbinding removes only the
+/// direct one.
 ///
 /// # Panics
 /// Panics when a step fails or an outcome differs.
@@ -285,23 +307,23 @@ async fn direct_and_idp_user_assignments_coexist() {
     assert_eq!(page.next, None);
 
     let granted = principals
-        .grant_role(&id, "viewer")
+        .bind(&bind_all(id, PrincipalKindTag::User, "viewer"))
         .await
-        .expect("the administrator grants viewer directly");
-    assert!(granted.changed);
+        .expect("the administrator binds viewer directly");
+    let access = principals.access(&id).await.expect("access reads");
     assert_eq!(
-        granted.roles,
+        grants(&access),
         [
-            assignment("viewer", RoleSource::Direct),
-            assignment("viewer", RoleSource::Idp)
+            ("viewer", &GrantSource::Direct),
+            ("viewer", &GrantSource::Provider)
         ]
     );
-    let revoked = principals
-        .revoke_role(&id, "viewer")
+    principals
+        .unbind(&granted.id)
         .await
-        .expect("the administrator revokes viewer");
-    assert!(revoked.changed);
-    assert_eq!(revoked.roles, [assignment("viewer", RoleSource::Idp)]);
+        .expect("the administrator unbinds viewer");
+    let access = principals.access(&id).await.expect("access reads");
+    assert_eq!(grants(&access), [("viewer", &GrantSource::Provider)]);
     deployment.shutdown().await;
 }
 
@@ -506,7 +528,7 @@ async fn stable_accounts_preserve_execution_identity() {
     let spare = principals
         .create_service_principal(&CreateServicePrincipalRequest {
             name: "spare-runtime".to_owned(),
-            roles: vec!["workload".to_owned()],
+            assignments: vec![ScopedRoleAssignment::tenant("workload")],
             description: None,
             workload_restriction: Some(WorkloadRestriction::Unrestricted),
         })

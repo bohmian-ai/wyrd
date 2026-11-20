@@ -9,6 +9,7 @@ use chrono::{DateTime, SubsecRound, Utc};
 use vala_verify::blocks::{EngineError, EvidenceReader as _, conform};
 use wyrd_runtime::Permission;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::CardPermissionScope;
 use wyrd_spec::card::repository::RepositoryRemote;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, CardUid, RepositoryId, SlotName};
@@ -268,7 +269,10 @@ impl VerificationControl<'_> {
             }
             if let Err(error) = self.authorize_verifier(
                 caller,
-                Permission::verifier_run(verifier.clone()),
+                Permission::verifier_run(CardPermissionScope::exact(
+                    &target.verifier,
+                    verifier.clone(),
+                )),
                 PUBLISH_EVIDENCE,
                 "verification.evidence.publish",
             ) {

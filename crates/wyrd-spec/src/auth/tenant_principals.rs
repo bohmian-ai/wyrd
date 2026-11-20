@@ -16,9 +16,11 @@ use crate::auth::{PrincipalId, PrincipalKindTag, SecretBearer, WorkloadRestricti
 pub struct CreateServicePrincipalRequest {
     /// Operator-facing name, unique within the tenant.
     pub name: String,
-    /// Roles to grant. Narrower than tenant administration, so automation never
-    /// needs the tenant administrative credential.
-    pub roles: Vec<String>,
+    /// Roles to bind, each at an explicit scope. Narrower than tenant
+    /// administration, so automation never needs the tenant administrative
+    /// credential. Empty creates an account with no operation grants.
+    #[serde(default)]
+    pub assignments: Vec<crate::auth::ScopedRoleAssignment>,
     /// Optional description.
     #[serde(default)]
     pub description: Option<String>,
@@ -277,9 +279,10 @@ pub struct CredentialRevoked {
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct CreateUserInvitationRequest {
-    /// Distinct existing tenant Role names the enrolled User receives, such
-    /// as `editor`; nonempty.
-    pub roles: Vec<String>,
+    /// Roles the enrolled User receives, each at an explicit scope;
+    /// nonempty. Revalidated against the issuer's current authority when
+    /// the invitation is accepted.
+    pub assignments: Vec<crate::auth::ScopedRoleAssignment>,
 }
 
 /// Body of `POST /v1/principals/users`: an administrator creates a local
@@ -293,8 +296,8 @@ pub struct CreateUserRequest {
     /// The User's password, checked against the local password policy.
     #[schemars(with = "String")]
     pub password: SecretBearer,
-    /// Distinct existing tenant Role names the User receives, such as `admin`.
-    pub roles: Vec<String>,
+    /// Roles the User receives, each at an explicit scope; nonempty.
+    pub assignments: Vec<crate::auth::ScopedRoleAssignment>,
 }
 
 /// The local User created by `POST /v1/principals/users`.
@@ -317,8 +320,8 @@ pub struct UserInvitationView {
     pub id: Uuid,
     /// The tenant's route key.
     pub tenant: crate::ids::TenantSlug,
-    /// Role ids granted at enrollment, ordered by UUID.
-    pub role_ids: Vec<Uuid>,
+    /// Scoped role assignments created at enrollment.
+    pub assignments: Vec<crate::auth::ScopedRoleAssignment>,
     /// Creation time.
     pub created_at: chrono::DateTime<chrono::Utc>,
     /// Absolute expiry, twenty-four hours after creation.
@@ -409,53 +412,6 @@ impl RoleSource {
             Self::Direct => "direct",
         }
     }
-}
-
-/// One Role a principal holds, and where that assignment came from.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(deny_unknown_fields)]
-pub struct RoleAssignment {
-    /// Role name.
-    pub role: String,
-    /// Assignment source.
-    pub source: RoleSource,
-}
-
-/// Response of `GET /v1/principals/{principal_id}/roles`.
-///
-/// The principal's effective Roles are the distinct names across every source.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(deny_unknown_fields)]
-pub struct PrincipalRoles {
-    /// Principal the assignments belong to.
-    pub principal_id: PrincipalId,
-    /// Principal kind the server resolved from the id: `user` or `service`.
-    pub kind: PrincipalKindTag,
-    /// Assignments ordered by Role name, then source.
-    pub roles: Vec<RoleAssignment>,
-}
-
-/// Response of `PUT` and `DELETE /v1/principals/{principal_id}/roles/{role}`.
-///
-/// Both writes are idempotent. A change takes effect at the principal's next
-/// token; tokens already issued keep their bounded lifetime.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(deny_unknown_fields)]
-pub struct RoleAssignmentChange {
-    /// Principal the assignment belongs to.
-    pub principal_id: PrincipalId,
-    /// Principal kind the server resolved from the id.
-    pub kind: PrincipalKindTag,
-    /// Role the call granted or revoked.
-    pub role: String,
-    /// `true` when this call added or removed the direct assignment, `false`
-    /// when it already held the requested state.
-    pub changed: bool,
-    /// Every assignment after the change, ordered by Role name, then source.
-    pub roles: Vec<RoleAssignment>,
 }
 
 /// Lifecycle status of an assignable principal. Deleted principals are never

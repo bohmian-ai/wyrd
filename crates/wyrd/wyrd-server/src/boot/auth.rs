@@ -175,8 +175,7 @@ mod tests {
             .issue_access_token(
                 AccessGrant {
                     principal: user_principal(),
-                    roles: Vec::new(),
-                    permissions: std::iter::once(Permission::card_read()).collect(),
+                    permission_ceiling: Some(std::iter::once(Permission::card_read()).collect()),
                     card_access: wyrd_spec::auth::CardAccess::AnyRegistered,
                     workload_uid: None,
                     credential_id: None,
@@ -198,9 +197,8 @@ mod tests {
         assert_eq!(verified.principal.kind.tag(), PrincipalKindTag::User);
         assert!(
             verified
-                .principal
-                .effective_permissions
-                .contains(&Permission::card_read())
+                .permission_ceiling
+                .is_some_and(|ceiling| ceiling.contains(&Permission::card_read()))
         );
     }
 

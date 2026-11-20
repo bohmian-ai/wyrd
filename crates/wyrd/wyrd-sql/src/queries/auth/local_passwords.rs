@@ -12,20 +12,22 @@
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use sqlx::types::Json;
 use uuid::Uuid;
-use wyrd_spec::auth::Sha256Hex;
+use wyrd_spec::auth::{ScopedRoleAssignment, Sha256Hex};
 
 use crate::TenantConn;
 
 /// A stored enrollment invitation's safe metadata.
-#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct InvitationRow {
     /// Invitation id.
     pub id: Uuid,
     /// The principal that issued it.
     pub issuer_principal_id: Uuid,
-    /// Role ids granted at enrollment, ordered by UUID.
-    pub role_ids: Vec<Uuid>,
+    /// Role-and-scope assignments enrollment creates, revalidated against
+    /// current roles and issuer authority at consumption.
+    pub assignments: Json<Vec<ScopedRoleAssignment>>,
     /// Creation time.
     pub created_at: DateTime<Utc>,
     /// Absolute expiry.
@@ -66,7 +68,7 @@ impl AttemptScope {
     }
 }
 
-/// Record an invitation for `role_ids` (stored ordered by UUID), issued by
+/// Record an invitation for scoped `assignments`, issued by
 /// `issuer`, whose code hashes to `code_hash`, expiring twenty-four hours
 /// after creation; returns its stored metadata. Expired invitations are
 /// purged first.
@@ -78,27 +80,25 @@ pub async fn insert_invitation(
     id: Uuid,
     code_hash: &Sha256Hex,
     issuer: Uuid,
-    role_ids: &[Uuid],
+    assignments: &[ScopedRoleAssignment],
 ) -> Result<InvitationRow, sqlx::Error> {
     sqlx::query("DELETE FROM wyrd.auth_user_invitations WHERE expires_at <= statement_timestamp()")
         .execute(&mut **conn.transaction())
         .await?;
-    let mut ordered = role_ids.to_vec();
-    ordered.sort_unstable();
     sqlx::query_as::<_, InvitationRow>(
         r"
         INSERT INTO wyrd.auth_user_invitations (
-            id, data_tenant_id, code_hash, issuer_principal_id, role_ids, created_at, expires_at
+            id, data_tenant_id, code_hash, issuer_principal_id, assignments, created_at, expires_at
         ) VALUES ($1, $2, $3, $4, $5, statement_timestamp(),
                   statement_timestamp() + interval '24 hours')
-        RETURNING id, issuer_principal_id, role_ids, created_at, expires_at
+        RETURNING id, issuer_principal_id, assignments, created_at, expires_at
         ",
     )
     .bind(id)
     .bind(conn.data_tenant_id().as_uuid())
     .bind(code_hash.as_bytes().as_slice())
     .bind(issuer)
-    .bind(&ordered)
+    .bind(Json(assignments))
     .fetch_one(&mut **conn.transaction())
     .await
 }
@@ -127,7 +127,7 @@ pub async fn consume_invitation(
            AND consumed_at IS NULL
            AND revoked_at IS NULL
            AND expires_at > statement_timestamp()
-        RETURNING id, issuer_principal_id, role_ids, created_at, expires_at
+        RETURNING id, issuer_principal_id, assignments, created_at, expires_at
         ",
     )
     .bind(code_hash.as_bytes().as_slice())

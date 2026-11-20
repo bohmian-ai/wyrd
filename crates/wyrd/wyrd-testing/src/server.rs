@@ -97,9 +97,9 @@ use wyrd_spec::ids::{BindingId, CardName, CardUid};
 use wyrd_spec::reference::CardRef;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
-    TrustedIssuerWrite, family_account_id, grant_role_to_service_account, grant_role_to_user,
-    insert_api_key, insert_service_account, insert_trusted_issuer, insert_user,
-    provision_system_principal, revoke_role_from_service_account, revoke_role_from_user,
+    SubjectColumns, TrustedIssuerWrite, advance_authorization_revision, delete_role_binding,
+    family_account_id, insert_api_key, insert_role_binding, insert_service_account,
+    insert_trusted_issuer, insert_user, list_role_bindings, provision_system_principal,
     role_by_name, tenant_admin_principal_id, trusted_issuer_by_url, workload_binding_by_subject,
 };
 use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
@@ -2042,7 +2042,6 @@ impl WyrdTestServer {
             PrincipalId::new(AUDIT_INSPECTION_PRINCIPAL),
             wyrd_runtime::PrincipalKind::User,
             tenant,
-            Vec::new(),
             wyrd_runtime::permission::PermissionSet::from_iter([permission.clone()]),
         );
         vala_bifrost_redux::oracle::AuthorizedQueryContext::try_new(
@@ -3180,8 +3179,23 @@ impl WyrdTestServer {
         name: &str,
         roles: &[&str],
     ) -> Result<Bootstrap, WyrdTestServerError> {
+        self.bootstrap_user_in_tenant(self.data_tenant_id(), name, roles)
+            .await
+    }
+
+    /// Bootstrap a user principal of `tenant_id` holding tenant-wide `roles`
+    /// through fixture SQL, signed in through the production login grant.
+    ///
+    /// # Errors
+    /// Returns an error when SQL writes or test JWT minting fail.
+    pub async fn bootstrap_user_in_tenant(
+        &self,
+        tenant_id: DataTenantId,
+        name: &str,
+        roles: &[&str],
+    ) -> Result<Bootstrap, WyrdTestServerError> {
         let user_id = Uuid::now_v7();
-        let mut conn = self.tenant_conn().await?;
+        let mut conn = self.tenant_conn_for(tenant_id).await?;
         insert_user(
             &mut conn,
             user_id,
@@ -3194,8 +3208,7 @@ impl WyrdTestServer {
         for role in roles {
             grant_role(&mut conn, user_id, PrincipalTable::User, role).await?;
         }
-        // Mint through the production login grant so the token carries the
-        // permissions the server itself would sign for these roles.
+        // Mint through the production login grant, as a signed-in User is.
         let issuer = self
             .inner
             .state
@@ -3238,7 +3251,10 @@ impl WyrdTestServer {
             .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?;
         let roles = roles
             .iter()
-            .map(|role| (*role).to_owned())
+            .map(|role| wyrd_spec::auth::ScopedRoleAssignment {
+                role: (*role).to_owned(),
+                scope: wyrd_spec::auth::PermissionScope::All,
+            })
             .collect::<Vec<_>>();
         let mut conn = self.tenant_conn().await?;
         let user_id = wyrd_auth::passwords::create_local_user(&mut conn, name, &verifier, &roles)
@@ -3645,31 +3661,43 @@ impl WyrdTestServer {
         Ok(api_key.secret)
     }
 
-    /// Seed one non-builtin role carrying exactly the requested permissions.
+    /// Seed one non-builtin role bundling exactly the requested operations.
     ///
     /// The builtin roles are coarse — `admin` holds the wildcard and no other
     /// builtin grants `bifrost_query:read` at all — so a case that needs an
-    /// authenticated caller holding one permission and deliberately lacking
+    /// authenticated caller holding one operation and deliberately lacking
     /// another cannot express that with a builtin name. This seeds the role
-    /// the same way tenant seeding does, through the shared upsert, so a
-    /// principal granted it is issued exactly that permission set.
+    /// through the shared upsert and advances the authorization revision.
     ///
-    /// Each permission is stored exactly as it serializes: a typed
-    /// [`Permission`] or a raw JSON document. The raw form lets a journey
-    /// seed a grant the current schema rejects so the server's own issuance
-    /// decode, not this fixture, refuses it.
+    /// A role is an operation bundle; a binding supplies the scope. Each
+    /// permission is stored as its `resource` and `action`: a tenant-wide
+    /// (`all`) scope is dropped, and a narrower scope is refused so a scoped
+    /// grant is written with [`Self::grant_role_at`]. A raw JSON document
+    /// lets a journey seed an operation the current schema rejects so the
+    /// server's own decode, not this fixture, refuses it.
     ///
     /// # Errors
     ///
-    /// Returns an error when the permissions cannot be serialized, when the
-    /// name collides with a builtin role, or when the tenant write fails.
+    /// Returns an error when the permissions cannot be serialized, one names
+    /// a narrower scope than `all`, the name collides with a builtin role, or
+    /// the tenant write fails.
     pub async fn seed_role<P: serde::Serialize>(
         &self,
         name: &str,
         permissions: &[P],
     ) -> Result<(), WyrdTestServerError> {
-        let payload = serde_json::to_value(permissions)
+        let mut payload = serde_json::to_value(permissions)
             .map_err(|error| WyrdTestServerError::Io(error.to_string()))?;
+        for operation in payload.as_array_mut().into_iter().flatten() {
+            let scope = operation
+                .as_object_mut()
+                .and_then(|fields| fields.remove("scope"));
+            if scope.is_some_and(|scope| scope != "all") {
+                return Err(WyrdTestServerError::Io(format!(
+                    "role {name} names a scoped operation; bind the scope with grant_role_at"
+                )));
+            }
+        }
         let mut conn = self.tenant_conn().await?;
         wyrd_sql::queries::auth::insert_role(
             &mut conn,
@@ -3683,6 +3711,9 @@ impl WyrdTestServer {
         )
         .await
         .map_err(sql)?;
+        advance_authorization_revision(&mut conn)
+            .await
+            .map_err(sql)?;
         conn.commit().await.map_err(sql)
     }
 
@@ -3757,7 +3788,7 @@ impl WyrdTestServer {
         .await
     }
 
-    /// Grant a role to a bootstrapped principal.
+    /// Grant a role to a bootstrapped principal tenant-wide.
     ///
     /// # Errors
     /// Returns an error when the role is unknown or SQL fails.
@@ -3766,21 +3797,27 @@ impl WyrdTestServer {
         principal: &Bootstrap,
         role: &str,
     ) -> Result<(), WyrdTestServerError> {
+        self.grant_role_at(principal, role, &wyrd_spec::auth::PermissionScope::All)
+            .await
+    }
+
+    /// Bind a role to a bootstrapped principal at `scope`, advancing the
+    /// tenant's authorization revision.
+    ///
+    /// # Errors
+    /// Returns an error when the role is unknown or SQL fails.
+    pub async fn grant_role_at(
+        &self,
+        principal: &Bootstrap,
+        role: &str,
+        scope: &wyrd_spec::auth::PermissionScope,
+    ) -> Result<(), WyrdTestServerError> {
+        let (id, table) = match principal {
+            Bootstrap::User { id, .. } => (id.as_uuid(), PrincipalTable::User),
+            Bootstrap::Machine { id, .. } => (id.as_uuid(), PrincipalTable::ServiceAccount),
+        };
         let mut conn = self.tenant_conn().await?;
-        match principal {
-            Bootstrap::User { id, .. } => {
-                grant_role(&mut conn, id.as_uuid(), PrincipalTable::User, role).await?;
-            }
-            Bootstrap::Machine { id, .. } => {
-                grant_role(
-                    &mut conn,
-                    id.as_uuid(),
-                    PrincipalTable::ServiceAccount,
-                    role,
-                )
-                .await?;
-            }
-        }
+        bind_role(&mut conn, id, table, role, scope).await?;
         conn.commit().await.map_err(sql)
     }
 
@@ -3795,18 +3832,22 @@ impl WyrdTestServer {
     ) -> Result<(), WyrdTestServerError> {
         let mut conn = self.tenant_conn().await?;
         let role_id = lookup_role_id(&mut conn, role).await?;
-        match principal {
-            Bootstrap::User { id, .. } => {
-                revoke_role_from_user(&mut conn, id.as_uuid(), role_id, RoleSource::Idp)
-                    .await
-                    .map_err(sql)?;
-            }
+        let subject = match principal {
+            Bootstrap::User { id, .. } => subject_columns(id.as_uuid(), PrincipalTable::User),
             Bootstrap::Machine { id, .. } => {
-                revoke_role_from_service_account(&mut conn, id.as_uuid(), role_id)
+                subject_columns(id.as_uuid(), PrincipalTable::ServiceAccount)
+            }
+        };
+        for binding in list_role_bindings(&mut conn).await.map_err(sql)? {
+            if binding.role_id == role_id && binding.subject == subject {
+                delete_role_binding(&mut conn, binding.id)
                     .await
                     .map_err(sql)?;
             }
         }
+        advance_authorization_revision(&mut conn)
+            .await
+            .map_err(sql)?;
         conn.commit().await.map_err(sql)
     }
 
@@ -5953,18 +5994,50 @@ async fn grant_role(
     table: PrincipalTable,
     role: &str,
 ) -> Result<(), WyrdTestServerError> {
+    bind_role(
+        conn,
+        principal_id,
+        table,
+        role,
+        &wyrd_spec::auth::PermissionScope::All,
+    )
+    .await
+}
+
+/// Bind `role` to a fixture account at `scope` and advance the revision.
+async fn bind_role(
+    conn: &mut TenantConn<'_>,
+    principal_id: Uuid,
+    table: PrincipalTable,
+    role: &str,
+    scope: &wyrd_spec::auth::PermissionScope,
+) -> Result<(), WyrdTestServerError> {
     let role_id = lookup_role_id(conn, role).await?;
+    insert_role_binding(
+        conn,
+        Uuid::now_v7(),
+        role_id,
+        subject_columns(principal_id, table),
+        scope,
+        RoleSource::Direct,
+    )
+    .await
+    .map_err(sql)?;
+    advance_authorization_revision(conn).await.map_err(sql)?;
+    Ok(())
+}
+
+/// The binding columns of a fixture account.
+fn subject_columns(principal_id: Uuid, table: PrincipalTable) -> SubjectColumns {
     match table {
-        PrincipalTable::User => grant_role_to_user(conn, principal_id, role_id, RoleSource::Idp)
-            .await
-            .map(|_| ())
-            .map_err(sql),
-        PrincipalTable::ServiceAccount => {
-            grant_role_to_service_account(conn, principal_id, role_id)
-                .await
-                .map(|_| ())
-                .map_err(sql)
-        }
+        PrincipalTable::User => SubjectColumns {
+            user_id: Some(principal_id),
+            ..SubjectColumns::default()
+        },
+        PrincipalTable::ServiceAccount => SubjectColumns {
+            service_account_id: Some(principal_id),
+            ..SubjectColumns::default()
+        },
     }
 }
 

@@ -43,8 +43,7 @@ fn mint_user_jwt(state: &AppState, tenant: DataTenantId) -> String {
         .issue_access_token(
             wyrd_auth_issue::AccessGrant {
                 principal,
-                roles: vec![],
-                permissions: wyrd_runtime::PermissionSet::new(),
+                permission_ceiling: None,
                 card_access: wyrd_spec::auth::CardAccess::AnyRegistered,
                 workload_uid: None,
                 credential_id: None,

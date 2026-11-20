@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use sqlx::types::Uuid;
 use wyrd_spec::auth::OAuthClientId;
 
-use crate::row_types::auth::{HumanConnectionBinding, HumanSessionBinding};
+use crate::row_types::auth::{HumanLoginAnchor, HumanSessionBinding};
 
 /// SQL row for `wyrd.auth_refresh_tokens`.
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -39,6 +39,9 @@ pub struct RefreshTokenRow {
     /// OAuth client a `user` session was issued to (`wyrd-ui` or
     /// `wyrd-cli`); set exactly when [`Self::human_connection_id`] is.
     pub client_id: Option<String>,
+    /// Local password revision a `user` session was established at; set
+    /// instead of the connection columns for a local login.
+    pub password_revision: Option<i64>,
 }
 
 impl RefreshTokenRow {
@@ -48,10 +51,11 @@ impl RefreshTokenRow {
     #[must_use]
     pub fn human_session(&self) -> Option<HumanSessionBinding> {
         Some(HumanSessionBinding {
-            connection: HumanConnectionBinding {
-                connection_id: self.human_connection_id?,
-                connection_revision: self.human_connection_revision?,
-            },
+            anchor: HumanLoginAnchor::from_columns(
+                self.human_connection_id,
+                self.human_connection_revision,
+                self.password_revision,
+            )?,
             client: OAuthClientId::parse(self.client_id.as_deref()?)?,
         })
     }

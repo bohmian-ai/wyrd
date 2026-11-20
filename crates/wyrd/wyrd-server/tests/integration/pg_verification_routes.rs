@@ -25,9 +25,10 @@ use wyrd_runtime::Permission;
 use wyrd_server::components::storage::inventory::{
     ObjectFact, ObjectInventory, ObjectOrigin, ObjectState,
 };
-use wyrd_spec::auth::{Attribution, PrincipalId, Sha256Hex, TokenAudience};
+use wyrd_spec::auth::{Attribution, PermissionScope, PrincipalId, Sha256Hex, TokenAudience};
 use wyrd_spec::ids::{BindingId, CardUid, DataTenantId, ExecutionId};
 use wyrd_spec::reference::CardRef;
+use wyrd_sql::queries::cards::card_scopes;
 use wyrd_testing::verification::{Published, VerificationFixture};
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
@@ -339,6 +340,35 @@ async fn user(server: &WyrdTestServer, name: &str, roles: &[&str]) -> (Uuid, Str
         Bootstrap::User { id, jwt } => (id.as_uuid(), jwt),
         Bootstrap::Machine { .. } => panic!("user bootstrap returned a machine principal"),
     }
+}
+
+/// `id` as a bound account, for [`bind_at`].
+fn as_user(id: Uuid, jwt: &str) -> Bootstrap {
+    Bootstrap::User {
+        id: PrincipalId::new(id),
+        jwt: jwt.to_owned(),
+    }
+}
+
+/// Bind `role` to `principal` at the exact registered scope of `card`.
+///
+/// # Panics
+/// Panics when `card` is not registered or the binding fails.
+async fn bind_at(server: &WyrdTestServer, principal: &Bootstrap, role: &str, card: &CardUid) {
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let scope = card_scopes(&mut conn, std::slice::from_ref(card))
+        .await
+        .expect("the Card scope reads")
+        .remove(card)
+        .expect("the Card is registered");
+    conn.commit().await.expect("read commits");
+    server
+        .grant_role_at(principal, role, &PermissionScope::Card(scope))
+        .await
+        .expect("the role binds");
 }
 
 /// Exchange a bootstrapped machine principal's API key for an access token
@@ -719,37 +749,25 @@ async fn enqueue_is_authorized_by_rbac_alone() {
     let fixture = Fixture::seed(&server).await;
     let body = fixture.request(&fixture.assertion, json!(1));
     server
-        .seed_role(
-            "vq_exact_verifier",
-            &[
-                Permission::card_read(),
-                Permission::verifier_run(fixture.assertion.clone()),
-                Permission::verifier_read(fixture.assertion.clone()),
-            ],
-        )
+        .seed_role("vq_cards", &[Permission::card_read()])
         .await
         .expect("role seeds");
     server
-        .seed_role(
-            "vq_other_verifier",
-            &[
-                Permission::card_read(),
-                Permission::verifier_run(fixture.drift.clone()),
-                Permission::verifier_read(fixture.drift.clone()),
-            ],
-        )
+        .seed_role("vq_run", &[Permission::verifier_run_any()])
         .await
         .expect("role seeds");
 
     let owner = server
-        .credential_registered_service(&fixture.subject_ref(), &["vq_exact_verifier"])
+        .credential_registered_service(&fixture.subject_ref(), &["vq_cards"])
         .await
         .expect("subject Service is credentialed");
+    bind_at(&server, &owner, "vq_run", &fixture.assertion).await;
     let owner_jwt = machine_jwt(&server, &owner).await;
     let foreign = server
-        .bootstrap_service("vq-foreign-service", &["vq_exact_verifier"])
+        .bootstrap_service("vq-foreign-service", &["vq_cards"])
         .await
         .expect("unrelated Card-bound Service bootstraps");
+    bind_at(&server, &foreign, "vq_run", &fixture.assertion).await;
     let foreign_jwt = machine_jwt(&server, &foreign).await;
     let actor = server
         .bootstrap_service("vq-editor-actor", &["editor"])
@@ -780,9 +798,10 @@ async fn enqueue_is_authorized_by_rbac_alone() {
     );
 
     let other = server
-        .bootstrap_service("vq-other-verifier", &["vq_other_verifier"])
+        .bootstrap_service("vq-other-verifier", &["vq_cards"])
         .await
         .expect("other-Verifier Service bootstraps");
+    bind_at(&server, &other, "vq_run", &fixture.drift).await;
     let (status, problem) =
         enqueue(&server, &machine_jwt(&server, &other).await, &body, None).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
@@ -1361,16 +1380,15 @@ async fn file_upload_authority_and_validation_are_preserved() {
         .await
         .expect("document Verifier registers");
     server
-        .seed_role(
-            "ve_exact_verifier",
-            &[
-                Permission::card_read(),
-                Permission::verifier_run(document.clone()),
-            ],
-        )
+        .seed_role("ve_cards", &[Permission::card_read()])
         .await
         .expect("role seeds");
-    let (exact, exact_jwt) = user(&server, "ve-exact", &["ve_exact_verifier"]).await;
+    server
+        .seed_role("ve_run", &[Permission::verifier_run_any()])
+        .await
+        .expect("role seeds");
+    let (exact, exact_jwt) = user(&server, "ve-exact", &["ve_cards"]).await;
+    bind_at(&server, &as_user(exact, &exact_jwt), "ve_run", &document).await;
     let (_, editor_jwt) = user(&server, "ve-editor", &["editor"]).await;
     let code = |problem: &Value| problem["code"].as_str().map(str::to_owned);
 
@@ -1925,18 +1943,30 @@ async fn direct_execution_refusals_are_stable() {
         decisions(&server, "verification.execute", reader).await,
         vec![run_decision("denied")]
     );
-    for (role, permission) in [
-        ("vx_operators_only", Permission::operator_invoke()),
+    server
+        .seed_role("vx_cards", &[Permission::card_read()])
+        .await
+        .expect("role seeds");
+    for (role, permission, card) in [
+        ("vx_operators_only", Permission::operator_invoke(), None),
         (
             "vx_other_verifier",
-            Permission::verifier_run(fixture.drift.clone()),
+            Permission::verifier_run_any(),
+            Some(&fixture.drift),
         ),
     ] {
         server
-            .seed_role(role, &[Permission::card_read(), permission])
+            .seed_role(role, &[permission])
             .await
             .expect("role seeds");
-        let (denied, denied_jwt) = user(&server, &format!("{role}-user"), &[role]).await;
+        let (denied, denied_jwt) = match card {
+            None => user(&server, &format!("{role}-user"), &["vx_cards", role]).await,
+            Some(card) => {
+                let (id, jwt) = user(&server, &format!("{role}-user"), &["vx_cards"]).await;
+                bind_at(&server, &as_user(id, &jwt), role, card).await;
+                (id, jwt)
+            }
+        };
         let (status, problem) = execute(&server, &denied_jwt, allowed.clone()).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{role}: {problem}");
         assert_eq!(problem["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
@@ -1947,16 +1977,14 @@ async fn direct_execution_refusals_are_stable() {
         );
     }
     server
-        .seed_role(
-            "vx_exact_verifier",
-            &[Permission::verifier_run(fixture.assertion.clone())],
-        )
+        .seed_role("vx_exact_verifier", &[Permission::verifier_run_any()])
         .await
         .expect("role seeds");
     let machine = server
-        .credential_registered_service(&fixture.subject_ref(), &["vx_exact_verifier"])
+        .credential_registered_service(&fixture.subject_ref(), &[])
         .await
         .expect("subject Service is credentialed");
+    bind_at(&server, &machine, "vx_exact_verifier", &fixture.assertion).await;
     let machine_token = machine_jwt(&server, &machine).await;
     let (status, judged) = execute(&server, &machine_token, allowed).await;
     assert_eq!(status, StatusCode::OK, "{judged}");
@@ -2653,13 +2681,14 @@ async fn custom_verdict_data_is_tenant_isolated() {
 }
 
 /// A local publication download plan is redeemed through its Verifier's own
-/// content route, under `verifier:read` on that Verifier and nothing else.
+/// content route, under `executions:read` on the execution's trusted parent,
+/// its subject Card, and nothing else.
 ///
 /// The fixture holds the execution's lease and publishes a file and a
-/// directory. A caller holding only `verifier:read` on the execution's
-/// Verifier plans both downloads, and each plan's root-relative URL answers
-/// exactly the published bytes. A grant on another Verifier, or `cards:read`
-/// alone, is refused at that URL.
+/// directory. A caller holding only `executions:read` on the subject plans
+/// both downloads, and each plan's root-relative URL answers exactly the
+/// published bytes. The same grant on the execution's Verifier, which is not
+/// its parent, or `cards:read` on another Card, is refused at that URL.
 ///
 /// # Panics
 /// Panics when a plan, its URL, its bytes, or a refusal differs.
@@ -2699,8 +2728,7 @@ async fn local_publication_downloads_redeem_under_verifier_read() {
         .await
         .expect("the held execution publishes");
     for (role, permission) in [
-        ("lp_exact", Permission::verifier_read(verifier)),
-        ("lp_elsewhere", Permission::verifier_read(other)),
+        ("lp_executions", Permission::executions_read_any()),
         ("lp_cards", Permission::card_read()),
     ] {
         server
@@ -2708,9 +2736,24 @@ async fn local_publication_downloads_redeem_under_verifier_read() {
             .await
             .expect("role seeds");
     }
-    let (_, exact) = user(&server, "lp-exact", &["lp_exact"]).await;
-    let (_, elsewhere) = user(&server, "lp-elsewhere", &["lp_elsewhere"]).await;
-    let (_, cards) = user(&server, "lp-cards", &["lp_cards"]).await;
+    let (exact_id, exact) = user(&server, "lp-exact", &[]).await;
+    bind_at(
+        &server,
+        &as_user(exact_id, &exact),
+        "lp_executions",
+        &subject,
+    )
+    .await;
+    let (elsewhere_id, elsewhere) = user(&server, "lp-elsewhere", &[]).await;
+    bind_at(
+        &server,
+        &as_user(elsewhere_id, &elsewhere),
+        "lp_executions",
+        &verifier,
+    )
+    .await;
+    let (cards_id, cards) = user(&server, "lp-cards", &[]).await;
+    bind_at(&server, &as_user(cards_id, &cards), "lp_cards", &other).await;
 
     for (name, selector, bytes) in [
         ("report", "attempt=1", b"# Report\n".as_slice()),

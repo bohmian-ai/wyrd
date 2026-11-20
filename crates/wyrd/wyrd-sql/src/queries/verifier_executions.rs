@@ -27,7 +27,7 @@ use sqlx::types::{Json, Uuid};
 use wyrd_runtime::AcceptedAuthority;
 use wyrd_runtime::principal::PrincipalId;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::Attribution;
+use wyrd_spec::auth::{Attribution, CardPermissionScope};
 use wyrd_spec::card::operator::{DriftCounts, MAX_SUMMARY_CHARS};
 use wyrd_spec::card::verifier::SourceText;
 use wyrd_spec::error::WyrdError;
@@ -647,11 +647,19 @@ const INACTIVE_PRINCIPALS_SQL: &str = r"
 
 /// Read one execution's control-plane status.
 const STATUS_SQL: &str = r"
-    SELECT execution_id, status, sub_principal_id, act_principal_id,
-           verifier_card_uid, card_uid, result_id, error,
-           group_id, owner_card_uid, deployment_environment, pull_request
-      FROM wyrd.verifier_executions
-     WHERE execution_id = $1
+    SELECT e.execution_id, e.status, e.sub_principal_id, e.act_principal_id,
+           e.verifier_card_uid, e.card_uid, e.result_id, e.error,
+           e.group_id, e.owner_card_uid, e.deployment_environment, e.pull_request,
+           CASE WHEN v.card_uid IS NOT NULL THEN jsonb_build_object('version',
+                jsonb_build_object('kind', v.kind, 'name', v.name, 'uid', v.card_uid))
+           END AS verifier_scope,
+           CASE WHEN s.card_uid IS NOT NULL THEN jsonb_build_object('version',
+                jsonb_build_object('kind', s.kind, 'name', s.name, 'uid', s.card_uid))
+           END AS card_scope
+      FROM wyrd.verifier_executions e
+      LEFT JOIN wyrd.cards v ON v.card_uid = e.verifier_card_uid
+      LEFT JOIN wyrd.cards s ON s.card_uid = e.card_uid
+     WHERE e.execution_id = $1
 ";
 
 /// Read one execution's dispatches in identity order.
@@ -1760,6 +1768,13 @@ pub struct ExecutionStatus {
     pub verifier_card_uid: CardUid,
     /// Exact Card verified.
     pub card_uid: CardUid,
+    /// The Verifier's exact scope from its registered Card, which authorizes
+    /// running and cancelling; `None` once the Card is gone.
+    pub verifier_scope: Option<CardPermissionScope>,
+    /// The verified Card's exact scope from its registered Card: the trusted
+    /// parent that authorizes reading the execution; `None` once it is gone,
+    /// which hides the execution from ordinary reads.
+    pub card_scope: Option<CardPermissionScope>,
     /// Result pointer of a completed execution.
     pub result_id: Option<VerificationResultId>,
     /// The deployment environment tag the execution was accepted with;
@@ -3380,6 +3395,8 @@ impl VerifierExecutionQueue {
                 ),
                 verifier_card_uid: stored(CardUid::from_uuid(row.verifier_card_uid))?,
                 card_uid: stored(CardUid::from_uuid(row.card_uid))?,
+                verifier_scope: row.verifier_scope.map(|Json(scope)| scope),
+                card_scope: row.card_scope.map(|Json(scope)| scope),
                 result_id: row
                     .result_id
                     .map(|id| stored(VerificationResultId::new(id)))
@@ -3890,6 +3907,10 @@ struct StatusRow {
     deployment_environment: Option<String>,
     /// Admitted pull request pins of a `pull_request` execution.
     pull_request: Option<Json<PullRequestActivation>>,
+    /// The Verifier's exact registered scope; `None` once its Card is gone.
+    verifier_scope: Option<Json<CardPermissionScope>>,
+    /// The verified Card's exact registered scope; `None` once it is gone.
+    card_scope: Option<Json<CardPermissionScope>>,
 }
 
 /// A dispatch row from [`DISPATCHES_SQL`].

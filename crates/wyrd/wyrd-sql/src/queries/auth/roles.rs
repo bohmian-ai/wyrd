@@ -1,4 +1,4 @@
-//! Queries for `wyrd.auth_roles` and `wyrd.auth_user_roles`.
+//! Queries for `wyrd.auth_roles`.
 //!
 //! Tenant-scoped functions here take `&mut TenantConn<'_>`.
 // raw-query grep allowlist: auth tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.

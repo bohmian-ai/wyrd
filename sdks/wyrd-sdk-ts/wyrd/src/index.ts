@@ -82,7 +82,6 @@ import type {
   PrincipalKindTag as PrincipalKind,
   PrincipalPage,
   PrincipalQuery,
-  PrincipalRoles,
   PrincipalSummary,
   ProviderAdapter,
   ProviderAuth,
@@ -100,9 +99,25 @@ import type {
   RegisteredServiceCard,
   RegisteredVerifierCard,
   DeclarationReceipt,
+  AccessGrant,
+  AccessSummary,
+  BindingSubject,
+  CreateGroupRequest,
+  CreateRoleBindingRequest,
+  GrantSource,
+  GroupList,
+  GroupMember,
+  GroupView,
+  Operation as AccessOperation,
+  PermissionScope,
+  PutRoleRequest,
+  RoleBindingList,
+  RoleBindingQuery,
+  RoleBindingView,
+  RoleList,
+  RoleView,
+  ScopedRoleAssignment,
   RevokePrincipalRequest,
-  RoleAssignment,
-  RoleAssignmentChange,
   RoleSource,
   RunningQueryLifecycleState,
   RunningQuerySummary,
@@ -253,7 +268,6 @@ export type {
   PrincipalKind,
   PrincipalPage,
   PrincipalQuery,
-  PrincipalRoles,
   PrincipalSummary,
   ProviderAdapter,
   ProviderAuth,
@@ -263,9 +277,25 @@ export type {
   QueryParam,
   QueryTerminal,
   DeclarationReceipt,
+  AccessGrant,
+  AccessSummary,
+  BindingSubject,
+  CreateGroupRequest,
+  CreateRoleBindingRequest,
+  GrantSource,
+  GroupList,
+  GroupMember,
+  GroupView,
+  AccessOperation,
+  PermissionScope,
+  PutRoleRequest,
+  RoleBindingList,
+  RoleBindingQuery,
+  RoleBindingView,
+  RoleList,
+  RoleView,
+  ScopedRoleAssignment,
   RevokePrincipalRequest,
-  RoleAssignment,
-  RoleAssignmentChange,
   RoleSource,
   SortKey,
   TableEntry,
@@ -2353,40 +2383,140 @@ export class Principals {
   }
 
   /**
-   * A principal's Role assignments; requires `service_accounts:write`.
+   * One account's current access: each binding, its source, and the scoped
+   * permissions it compiles to; requires `service_accounts:write`.
    *
-   * @param principalId - The principal to read.
-   * @returns Its assignments ordered by Role and source.
-   * @throws {@link WyrdError} for a principal that is not assignable, or a transport or authorization failure.
+   * @param principalId - The account to read.
+   * @returns Its grants and their combined permissions.
+   * @throws {@link WyrdError} for an account that is not assignable, or a transport or authorization failure.
    */
-  async roles(principalId: string): Promise<PrincipalRoles> {
-    return lifecycleValue(await this.#native.roles(principalId));
+  async access(principalId: string): Promise<AccessSummary> {
+    return lifecycleValue(await this.#native.access(principalId));
   }
 
   /**
-   * Idempotently grant a direct Role; requires tenant administration.
+   * Every role and the operations it bundles; requires `service_accounts:write`.
    *
-   * @param principalId - The principal to grant to.
-   * @param role - The Role name.
-   * @returns Whether the call changed anything and the resulting assignments.
-   * @throws {@link WyrdError} for an unknown Role, a principal that is not
-   * assignable, or a transport or authorization failure.
+   * @returns The roles ordered by name.
+   * @throws {@link WyrdError} for a transport or authorization failure.
    */
-  async grantRole(principalId: string, role: string): Promise<RoleAssignmentChange> {
-    return lifecycleValue(await this.#native.grantRole(principalId, role));
+  async roles(): Promise<RoleList> {
+    return lifecycleValue(await this.#native.roles());
   }
 
   /**
-   * Idempotently revoke a direct Role; identity-provider assignments stay.
+   * Create or replace a custom role; requires tenant administration. Built-in roles are read-only.
    *
-   * @param principalId - The principal to revoke from.
-   * @param role - The Role name.
-   * @returns Whether the call changed anything and the resulting assignments.
-   * @throws {@link WyrdError} for an unknown Role, a principal that is not
-   * assignable, or a transport or authorization failure.
+   * @param role - The custom role name.
+   * @param request - The operations the role bundles.
+   * @returns The stored role.
+   * @throws {@link WyrdError} for a built-in or empty role, or a transport or authorization failure.
    */
-  async revokeRole(principalId: string, role: string): Promise<RoleAssignmentChange> {
-    return lifecycleValue(await this.#native.revokeRole(principalId, role));
+  async putRole(role: string, request: PutRoleRequest): Promise<RoleView> {
+    return lifecycleValue(await this.#native.putRole(role, JSON.stringify(request)));
+  }
+
+  /**
+   * Delete a custom role no binding uses; requires tenant administration.
+   *
+   * @param role - The custom role name.
+   * @returns The deleted role.
+   * @throws {@link WyrdError} for a built-in, unknown, or still-bound role, or a transport or authorization failure.
+   */
+  async deleteRole(role: string): Promise<RoleView> {
+    return lifecycleValue(await this.#native.deleteRole(role));
+  }
+
+  /**
+   * Bindings, optionally for one account, group, or role; requires `service_accounts:write`.
+   *
+   * @param query - Exact filters.
+   * @returns The matching bindings.
+   * @throws {@link WyrdError} for an invalid filter or a transport or authorization failure.
+   */
+  async bindings(query: RoleBindingQuery = {}): Promise<RoleBindingList> {
+    return lifecycleValue(await this.#native.bindings(JSON.stringify(query)));
+  }
+
+  /**
+   * Idempotently bind a role at an explicit scope to an account or group;
+   * requires tenant administration.
+   *
+   * @param request - The subject, role, and scope.
+   * @returns The binding; granting the same binding again returns it unchanged.
+   * @throws {@link WyrdError} for an unknown role, an inapplicable scope, an
+   * account that is not assignable, or a transport or authorization failure.
+   */
+  async bind(request: CreateRoleBindingRequest): Promise<RoleBindingView> {
+    return lifecycleValue(await this.#native.bind(JSON.stringify(request)));
+  }
+
+  /**
+   * Remove one directly administered binding; requires tenant administration.
+   * Authority another binding still grants remains.
+   *
+   * @param bindingId - The binding to remove.
+   * @returns The removed binding.
+   * @throws {@link WyrdError} for an unknown or provider binding, or a transport or authorization failure.
+   */
+  async unbind(bindingId: string): Promise<RoleBindingView> {
+    return lifecycleValue(await this.#native.unbind(bindingId));
+  }
+
+  /**
+   * Every local group and its members; requires `service_accounts:write`.
+   *
+   * @returns The groups ordered by name.
+   * @throws {@link WyrdError} for a transport or authorization failure.
+   */
+  async groups(): Promise<GroupList> {
+    return lifecycleValue(await this.#native.groups());
+  }
+
+  /**
+   * Create a local group; requires tenant administration.
+   *
+   * @param request - The tenant-unique group name.
+   * @returns The new, empty group.
+   * @throws {@link WyrdError} for a taken name, or a transport or authorization failure.
+   */
+  async createGroup(request: CreateGroupRequest): Promise<GroupView> {
+    return lifecycleValue(await this.#native.createGroup(JSON.stringify(request)));
+  }
+
+  /**
+   * Delete a local group with its memberships and bindings; requires tenant administration.
+   *
+   * @param groupId - The group to delete.
+   * @returns The deleted group.
+   * @throws {@link WyrdError} for an unknown group, or a transport or authorization failure.
+   */
+  async deleteGroup(groupId: string): Promise<GroupView> {
+    return lifecycleValue(await this.#native.deleteGroup(groupId));
+  }
+
+  /**
+   * Add an account to a local group; requires tenant administration.
+   *
+   * @param groupId - The group.
+   * @param principalId - The account to add.
+   * @returns The group with its members.
+   * @throws {@link WyrdError} for an unknown group or account, or a transport or authorization failure.
+   */
+  async addGroupMember(groupId: string, principalId: string): Promise<GroupView> {
+    return lifecycleValue(await this.#native.addGroupMember(groupId, principalId));
+  }
+
+  /**
+   * Remove an account from a local group; requires tenant administration.
+   *
+   * @param groupId - The group.
+   * @param principalId - The account to remove.
+   * @returns The group with its members.
+   * @throws {@link WyrdError} for an unknown group or account, or a transport or authorization failure.
+   */
+  async removeGroupMember(groupId: string, principalId: string): Promise<GroupView> {
+    return lifecycleValue(await this.#native.removeGroupMember(groupId, principalId));
   }
 }
 

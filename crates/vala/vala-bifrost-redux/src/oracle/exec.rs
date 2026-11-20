@@ -4048,7 +4048,6 @@ pub(super) mod tests {
             PrincipalId::new(uuid::Uuid::now_v7()),
             wyrd_runtime::PrincipalKind::User,
             tenant,
-            Vec::new(),
             PermissionSet::default(),
         );
         let context = AuthorizedQueryContext::try_new(

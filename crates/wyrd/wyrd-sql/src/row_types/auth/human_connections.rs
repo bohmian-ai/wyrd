@@ -65,7 +65,57 @@ pub struct HumanConnectionBinding {
     pub connection_revision: i64,
 }
 
-/// What a human refresh family is bound to: the connection revision its login
+/// The human authentication a CLI or browser login went through, which every
+/// later renewal must find still current.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HumanLoginAnchor {
+    /// A provider sign-in through this exact connection revision.
+    Connection(HumanConnectionBinding),
+    /// A local password sign-in at this password revision of the User.
+    Password(i64),
+}
+
+impl HumanLoginAnchor {
+    /// The connection columns, set only for a provider anchor.
+    #[must_use]
+    pub fn connection(&self) -> Option<HumanConnectionBinding> {
+        match self {
+            Self::Connection(binding) => Some(*binding),
+            Self::Password(_) => None,
+        }
+    }
+
+    /// The password revision, set only for a local anchor.
+    #[must_use]
+    pub fn password_revision(&self) -> Option<i64> {
+        match self {
+            Self::Connection(_) => None,
+            Self::Password(revision) => Some(*revision),
+        }
+    }
+
+    /// Decodes stored anchor columns; `None` unless exactly one complete
+    /// anchor is present.
+    #[must_use]
+    pub fn from_columns(
+        connection_id: Option<Uuid>,
+        connection_revision: Option<i64>,
+        password_revision: Option<i64>,
+    ) -> Option<Self> {
+        match (connection_id, connection_revision, password_revision) {
+            (Some(connection_id), Some(connection_revision), None) => {
+                Some(Self::Connection(HumanConnectionBinding {
+                    connection_id,
+                    connection_revision,
+                }))
+            }
+            (None, None, Some(revision)) => Some(Self::Password(revision)),
+            _ => None,
+        }
+    }
+}
+
+/// What a human refresh family is bound to: the login anchor its sign-in
 /// went through and the OAuth client it was issued to.
 ///
 /// Every row of a family carries the same binding. The client decides
@@ -73,8 +123,8 @@ pub struct HumanConnectionBinding {
 /// (`wyrd-ui`), and only that client may refresh or revoke it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HumanSessionBinding {
-    /// The login connection revision.
-    pub connection: HumanConnectionBinding,
+    /// The login anchor.
+    pub anchor: HumanLoginAnchor,
     /// The OAuth client the session was issued to.
     pub client: wyrd_spec::auth::OAuthClientId,
 }

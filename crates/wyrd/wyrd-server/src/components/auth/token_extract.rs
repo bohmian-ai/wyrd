@@ -376,14 +376,14 @@ mod tests {
     fn claims() -> serde_json::Value {
         let principal = wyrd_runtime::PrincipalId::new(uuid::Uuid::now_v7());
         serde_json::to_value(wyrd_auth_verify::AccessTokenClaims {
+            version: wyrd_auth_verify::ACCESS_TOKEN_VERSION,
             sub: principal.to_string(),
             principal: wyrd_auth_verify::TokenPrincipalRef {
                 id: principal,
                 kind: wyrd_spec::auth::PrincipalKindTag::User,
                 tenant_id: wyrd_spec::DataTenantId::new_v7(),
             },
-            roles: vec![],
-            permissions: wyrd_runtime::PermissionSet::default(),
+            permission_ceiling: None,
             workload_uid: None,
             card_access: wyrd_spec::auth::CardAccess::AnyRegistered,
             act: None,

@@ -1182,32 +1182,114 @@ export declare class NativePrincipals {
    */
   list(queryJson: string): Promise<NativeLifecycleResult>
   /**
-   * Reads a principal's Role assignments.
+   * Reads one account's current access: its bindings, their sources, and
+   * the permissions they compile to.
    *
    * # Errors
    *
-   * Returns a napi error only when the assignments cannot be serialized; a
-   * malformed id or server refusal is returned in the result.
+   * Returns a napi error only when the response cannot be serialized; a
+   * malformed argument or server refusal is returned in the result.
    */
-  roles(principalId: string): Promise<NativeLifecycleResult>
+  access(principalId: string): Promise<NativeLifecycleResult>
   /**
-   * Idempotently grants a direct Role.
+   * Lists every role and its operations.
    *
    * # Errors
    *
-   * Returns a napi error only when the change cannot be serialized; a
-   * malformed id or server refusal is returned in the result.
+   * Returns a napi error only when the response cannot be serialized; a
+   * malformed argument or server refusal is returned in the result.
    */
-  grantRole(principalId: string, role: string): Promise<NativeLifecycleResult>
+  roles(): Promise<NativeLifecycleResult>
   /**
-   * Idempotently revokes a direct Role; identity-provider assignments stay.
+   * Creates or replaces a custom role from a serialized `PutRoleRequest`.
    *
    * # Errors
    *
-   * Returns a napi error only when the change cannot be serialized; a
-   * malformed id or server refusal is returned in the result.
+   * Returns a napi error only when the response cannot be serialized; a
+   * malformed argument or server refusal is returned in the result.
    */
-  revokeRole(principalId: string, role: string): Promise<NativeLifecycleResult>
+  putRole(role: string, requestJson: string): Promise<NativeLifecycleResult>
+  /**
+   * Deletes an unbound custom role.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the response cannot be serialized; a
+   * malformed argument or server refusal is returned in the result.
+   */
+  deleteRole(role: string): Promise<NativeLifecycleResult>
+  /**
+   * Lists bindings matching a serialized `RoleBindingQuery`.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the response cannot be serialized; a
+   * malformed argument or server refusal is returned in the result.
+   */
+  bindings(queryJson: string): Promise<NativeLifecycleResult>
+  /**
+   * Binds a role at a scope from a serialized `CreateRoleBindingRequest`.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the response cannot be serialized; a
+   * malformed argument or server refusal is returned in the result.
+   */
+  bind(requestJson: string): Promise<NativeLifecycleResult>
+  /**
+   * Removes one directly administered binding.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the response cannot be serialized; a
+   * malformed argument or server refusal is returned in the result.
+   */
+  unbind(bindingId: string): Promise<NativeLifecycleResult>
+  /**
+   * Lists local groups and their members.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the response cannot be serialized; a
+   * malformed argument or server refusal is returned in the result.
+   */
+  groups(): Promise<NativeLifecycleResult>
+  /**
+   * Creates a local group from a serialized `CreateGroupRequest`.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the response cannot be serialized; a
+   * malformed argument or server refusal is returned in the result.
+   */
+  createGroup(requestJson: string): Promise<NativeLifecycleResult>
+  /**
+   * Deletes a local group with its memberships and bindings.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the response cannot be serialized; a
+   * malformed argument or server refusal is returned in the result.
+   */
+  deleteGroup(groupId: string): Promise<NativeLifecycleResult>
+  /**
+   * Adds an account to a local group.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the response cannot be serialized; a
+   * malformed argument or server refusal is returned in the result.
+   */
+  addGroupMember(groupId: string, principalId: string): Promise<NativeLifecycleResult>
+  /**
+   * Removes an account from a local group.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the response cannot be serialized; a
+   * malformed argument or server refusal is returned in the result.
+   */
+  removeGroupMember(groupId: string, principalId: string): Promise<NativeLifecycleResult>
 }
 
 /** Structured result of starting a native terminal-safe query. */

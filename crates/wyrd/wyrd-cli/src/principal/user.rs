@@ -26,9 +26,9 @@ pub struct CreateUserArgs {
     /// Username the User signs in with.
     #[arg(long, value_name = "NAME")]
     pub username: String,
-    /// Role to grant, such as `admin`; repeat for several.
-    #[arg(long = "role", value_name = "ROLE", required = true)]
-    pub roles: Vec<String>,
+    /// `ROLE:SCOPE` to bind, such as `admin:all`; repeat for several.
+    #[arg(long = "grant", value_name = "ROLE:SCOPE", required = true, value_parser = crate::principal::access::parse_assignment)]
+    pub grants: Vec<wyrd_spec::auth::ScopedRoleAssignment>,
     /// Deployment; the credential comes from the ambient chain.
     #[command(flatten)]
     pub endpoint: TenantEndpoint,
@@ -37,9 +37,10 @@ pub struct CreateUserArgs {
 /// The invitation to issue.
 #[derive(Debug, Args)]
 pub struct InviteArgs {
-    /// Role the enrolled User receives, such as `editor`; repeat for several.
-    #[arg(long = "role", value_name = "ROLE", required = true)]
-    pub roles: Vec<String>,
+    /// `ROLE:SCOPE` the enrolled User receives, such as
+    /// `viewer:Repository/payments`; repeat for several.
+    #[arg(long = "grant", value_name = "ROLE:SCOPE", required = true, value_parser = crate::principal::access::parse_assignment)]
+    pub grants: Vec<wyrd_spec::auth::ScopedRoleAssignment>,
     /// Deployment; the credential comes from the ambient chain.
     #[command(flatten)]
     pub endpoint: TenantEndpoint,
@@ -75,7 +76,7 @@ async fn create(args: CreateUserArgs) -> Result<ExitCode, WyrdCliError> {
         .create_user(&CreateUserRequest {
             username: args.username,
             password: SecretBearer::new(password.to_owned()),
-            roles: args.roles,
+            assignments: args.grants,
         })
         .await
         .map_err(|source| WyrdCliError::Server { source })?;
@@ -91,7 +92,9 @@ async fn create(args: CreateUserArgs) -> Result<ExitCode, WyrdCliError> {
 async fn invite(args: InviteArgs) -> Result<ExitCode, WyrdCliError> {
     let issued = crate::client::principals(args.endpoint.server.as_str())
         .await?
-        .invite_user(&CreateUserInvitationRequest { roles: args.roles })
+        .invite_user(&CreateUserInvitationRequest {
+            assignments: args.grants,
+        })
         .await
         .map_err(|source| WyrdCliError::Server { source })?;
     println!("invitation_id: {}", issued.invitation.id);

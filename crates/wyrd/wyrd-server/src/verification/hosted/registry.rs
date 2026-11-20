@@ -16,7 +16,7 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::CardRef;
 
 use wyrd_runtime::Permission;
-use wyrd_spec::ids::CardUid;
+use wyrd_spec::auth::CardPermissionScope;
 
 use crate::audit;
 use crate::components::auth::Caller;
@@ -33,14 +33,18 @@ pub struct TenantRegistry {
     /// when the execution has no accepted caller, and every lookup refuses.
     caller: Option<Caller>,
     /// The executing Verifier, whose `verifier:run` authorizes each lookup.
-    verifier: CardUid,
+    verifier: CardPermissionScope,
 }
 
 impl TenantRegistry {
     /// A resolver reading `verifier`'s definitions as `caller`; with no
     /// caller, every lookup refuses rather than reading without authority.
     #[must_use]
-    pub const fn new(state: AppState, caller: Option<Caller>, verifier: CardUid) -> Self {
+    pub const fn new(
+        state: AppState,
+        caller: Option<Caller>,
+        verifier: CardPermissionScope,
+    ) -> Self {
         Self {
             state,
             caller,

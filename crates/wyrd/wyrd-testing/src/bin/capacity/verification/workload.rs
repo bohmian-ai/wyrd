@@ -463,7 +463,10 @@ impl Tenant {
             .await?
             .create_service_principal(&CreateServicePrincipalRequest {
                 name: format!("bench-service-{index}-runtime"),
-                roles: roles.to_vec(),
+                assignments: roles
+                    .iter()
+                    .map(|role| wyrd_spec::auth::ScopedRoleAssignment::tenant(role.clone()))
+                    .collect(),
                 description: None,
                 workload_restriction: Some(WorkloadRestriction::Family(WorkloadFamily {
                     kind: WorkloadKind::Service,

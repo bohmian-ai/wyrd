@@ -21,7 +21,7 @@ use wyrd_auth_oidc::{
 };
 use wyrd_runtime::{
     DelegationStep, PermissionSet, Principal, PrincipalId, PrincipalKind,
-    PrincipalRef as RuntimePrincipalRef, RoleRef,
+    PrincipalRef as RuntimePrincipalRef,
 };
 use wyrd_spec::DataTenantId;
 pub use wyrd_spec::auth::TokenAudience;
@@ -111,15 +111,21 @@ impl From<jsonwebtoken::errors::Error> for AuthError {
     }
 }
 
-/// Tenant-checked token claims ready to populate request context.
+/// Tenant-checked token identity and restrictions, before authorization.
 ///
-/// Built entirely from one verified JWT: the principal's authority is the
-/// token's `permissions` claim, fixed when the token was issued.
+/// A token identifies its caller; it carries no grants. `principal` holds the
+/// verified identity, Card limit, root, and credential with **no** authority:
+/// the server's authority owner attaches the account's current grants, bounded
+/// by [`Self::permission_ceiling`], before any check. A caller that skips that
+/// step is denied everything.
 #[derive(Clone, Debug)]
 pub struct VerifiedToken {
-    /// The token's subject, carrying the token's permission snapshot as its
-    /// authority. For a delegated token this is the party being acted for.
+    /// The token's subject, with empty authority. For a delegated token this
+    /// is the party being acted for.
     pub principal: Principal,
+    /// The signed upper bound on this token's authority: `None` adds no
+    /// restriction, an empty set permits nothing.
+    pub permission_ceiling: Option<PermissionSet>,
     /// Flattened RFC 8693 actor chain, earliest actor first. The last entry is
     /// the current actor; the chain is attribution, never authority.
     pub delegation_chain: Vec<DelegationStep>,
@@ -326,20 +332,21 @@ impl TokenVerifier {
     /// configured skew), then requires the token's tenant to be the request's
     /// tenant and builds the runtime principal from the claims. The accepted
     /// audiences are `wyrd` — which every tenant surface honors — and
-    /// `surface` itself. Nothing is read from a store: the token's
-    /// `permissions` claim is its authority until it expires, so a token this
-    /// verifier already accepted for the same tenant and surface is accepted
-    /// again from memory until its `exp`, without re-checking its signature.
-    /// That is the same decision the full check would make, since no key of
-    /// this verifier can be removed and no tenant token is revoked before it
-    /// expires; the configured skew past `exp` is left to the full check.
+    /// `surface` itself. Nothing is read from a store and no authority is
+    /// produced: the server's authority owner attaches the account's current
+    /// grants afterwards. A token this verifier already accepted for the same
+    /// tenant and surface is accepted again from memory until its `exp`,
+    /// without re-checking its signature; that is the same identity decision
+    /// the full check would make, since no key of this verifier can be
+    /// removed. Credential and account state are checked by the server, not
+    /// here. The configured skew past `exp` is left to the full check.
     ///
     /// # Errors
     /// Returns [`AuthError::BadTokenFormat`] for an oversized bearer,
     /// [`AuthError::InvalidToken`] for an unknown key, a wrong issuer or
     /// audience, or a token belonging to another tenant,
     /// [`AuthError::Jwt`] for a failed signature or undecodable claims
-    /// (including malformed permissions), [`AuthError::TokenExpired`] for an
+    /// (including a malformed ceiling), [`AuthError::TokenExpired`] for an
     /// expired token, and the claim-shape errors of
     /// [`AccessTokenClaims::into_verified`].
     #[tracing::instrument(
@@ -623,29 +630,36 @@ impl<I: IssuerConfigResolver> ExternalVerifier<I> {
     }
 }
 
-/// Resolved Wyrd access-token claims.
+/// The tenant access-token contract version this verifier accepts.
+pub const ACCESS_TOKEN_VERSION: u16 = 2;
+
+/// Wyrd tenant access-token claims: caller identity and restrictions, never
+/// grants.
+///
+/// Current authority comes from the server's resolved account state. A
+/// restricted-key or delegated token carries a signed
+/// [`Self::permission_ceiling`] bounding it; ordinary login and unrestricted
+/// Service-key tokens carry none.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AccessTokenClaims {
+    /// Token contract version; only [`ACCESS_TOKEN_VERSION`] verifies.
+    pub version: u16,
     /// Subject id, JWT `sub`; always `principal.id`.
     pub sub: String,
-    /// Subject whose attenuated authority the token carries.
+    /// Subject the token identifies.
     pub principal: TokenPrincipalRef,
-    /// Roles assigned to the subject at issue time.
+    /// Maximum authority available through this token, never a grant.
     ///
-    /// Informational metadata only. No request resolves or authorizes from
-    /// it; [`Self::permissions`] is the token's authority.
-    pub roles: Vec<RoleRef>,
-    /// Effective permissions resolved when the token was issued — for a
-    /// delegated token, the intersection of the subject's and the actor's.
-    /// The only tenant authority claim.
-    pub permissions: PermissionSet,
+    /// Absent adds no restriction; present-and-empty permits nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_ceiling: Option<PermissionSet>,
     /// The subject's exact selected Service root, when one was
     /// selected. Execution context, never account identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workload_uid: Option<CardUid>,
     /// Required explicit limit on which Cards the token may attribute
-    /// evidence to; checked independently of `permissions`.
+    /// evidence to; checked independently of operation authority.
     pub card_access: CardAccess,
     /// RFC 8693 actor chain for delegated tokens: the outermost layer is the
     /// current actor, and earlier actors nest inside it.
@@ -848,12 +862,12 @@ impl AccessTokenClaims {
 
     /// Convert verified claims into a runtime verified-token envelope.
     ///
-    /// The runtime principal is built directly from the claims: its effective
-    /// permissions are the `permissions` claim, its Card limit the
-    /// `card_access` claim, and nothing is read from a store. `roles` is
-    /// copied through as informational metadata.
+    /// The runtime principal carries the claims' identity, Card limit, root,
+    /// and credential with empty authority; the signed ceiling rides beside
+    /// it. Nothing is read from a store.
     ///
-    /// Fails closed on every inconsistent shape: a subject other than the
+    /// Fails closed on every inconsistent shape: a contract version other than
+    /// [`ACCESS_TOKEN_VERSION`], a subject other than the
     /// account id, a kind other than `tenant_admin`, `user`, or `service`, a
     /// duplicate or oversized scope, a direct scope without its root, a root
     /// beside unscoped access, an unresolved `root_required` on a non-Service
@@ -866,7 +880,7 @@ impl AccessTokenClaims {
     /// actors, and [`AuthError::InvalidToken`] for an out-of-range expiry.
     pub fn into_verified(&self) -> Result<VerifiedToken, AuthError> {
         let kind = tenant_account_kind(self.principal.kind)?;
-        if self.sub != self.principal.id.to_string() {
+        if self.version != ACCESS_TOKEN_VERSION || self.sub != self.principal.id.to_string() {
             return Err(AuthError::InvalidToken);
         }
         let direct = self.act.is_none();
@@ -886,8 +900,7 @@ impl AccessTokenClaims {
             self.principal.id,
             kind,
             self.principal.tenant_id,
-            self.roles.clone(),
-            self.permissions.clone(),
+            PermissionSet::new(),
         )
         .with_credential_id(parse_cid(self.cid.as_deref())?)
         .with_card_access(self.card_access.clone(), self.workload_uid.clone());
@@ -899,6 +912,7 @@ impl AccessTokenClaims {
 
         Ok(VerifiedToken {
             principal,
+            permission_ceiling: self.permission_ceiling.clone(),
             delegation_chain,
             exp,
         })
@@ -1067,7 +1081,7 @@ mod tests {
     use wyrd_runtime::{
         BifrostPermissionScope, BifrostTableScope, Permission, PermissionScope, PermissionSet,
     };
-    use wyrd_runtime::{CardAttribution, Principal, PrincipalId, PrincipalKind, RoleRef};
+    use wyrd_runtime::{CardAttribution, Principal, PrincipalId, PrincipalKind};
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::IssuerTokenPolicy;
     use wyrd_spec::auth::IssuerUrl;
@@ -1096,7 +1110,7 @@ mod tests {
 
         assert_eq!(decoded.sub, claims.sub);
         assert_eq!(decoded.principal, claims.principal);
-        assert_eq!(decoded.roles, claims.roles);
+        assert_eq!(decoded.permission_ceiling, claims.permission_ceiling);
         assert_eq!(decoded.jti, claims.jti);
     }
 
@@ -1106,7 +1120,6 @@ mod tests {
             principal_id(),
             PrincipalKind::Service,
             tenant_id(),
-            vec![role()],
             wyrd_runtime::PermissionSet::new(),
         );
 
@@ -1209,12 +1222,7 @@ mod tests {
         let verified = claims.into_verified().expect("claims convert");
 
         assert_eq!(verified.principal.id, principal_id());
-        assert!(
-            verified
-                .principal
-                .effective_permissions
-                .contains(&Permission::card_read())
-        );
+        assert!(verified.principal.effective_permissions.is_empty());
         assert_eq!(verified.delegation_chain.len(), 2);
         assert_eq!(
             verified.delegation_chain[0].principal.workload_uid,
@@ -1513,11 +1521,12 @@ mod tests {
     // Claim-built principals
     // -------------------------------------------------------------------------
 
-    /// The verifier builds the runtime principal from the token alone: its
-    /// authority is the signed `permissions` claim, `roles` rides along as
-    /// metadata, and the credential attribution survives.
+    /// The verifier produces identity, never authority: the principal holds no
+    /// permissions whatever the token says, the credential attribution
+    /// survives, and a signed ceiling — absent, empty, or scoped — rides
+    /// beside it unchanged.
     #[test]
-    fn token_verifier_builds_principal_from_permissions_claim() {
+    fn token_verifier_carries_identity_and_ceiling_but_no_authority() {
         let credential = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b0c";
         let claims = AccessTokenClaims {
             cid: Some(credential.to_owned()),
@@ -1531,36 +1540,78 @@ mod tests {
 
         assert_eq!(verified.principal.id, principal_id());
         assert_eq!(verified.principal.tenant_id, tenant_id());
-        assert_eq!(verified.principal.roles, vec![role()]);
-        assert_eq!(verified.principal.effective_permissions, claims.permissions);
+        assert!(verified.principal.effective_permissions.is_empty());
+        assert!(
+            !verified
+                .principal
+                .effective_permissions
+                .contains(&Permission::card_read())
+        );
+        assert_eq!(verified.permission_ceiling, None);
         assert_eq!(
             verified.principal.credential_id.map(|id| id.to_string()),
             Some(credential.to_owned())
         );
+
+        for ceiling in [
+            PermissionSet::new(),
+            PermissionSet::from_iter([Permission::card_read()]),
+        ] {
+            let claims = AccessTokenClaims {
+                permission_ceiling: Some(ceiling.clone()),
+                ..claims_with_times(now() + 3_600, now())
+            };
+            let token = SecretString::from(encode_eddsa_with_kid(&claims));
+            let verified = verifier(WyrdAuthVerifySettings::default())
+                .verify(&token, &tenant_id())
+                .expect("restricted token verifies");
+            assert_eq!(verified.permission_ceiling, Some(ceiling));
+            assert!(verified.principal.effective_permissions.is_empty());
+        }
     }
 
-    /// `roles` carries no authority: a token naming a role but granting no
-    /// permissions yields a principal with no permissions.
+    /// A token naming another contract version, or carrying the removed
+    /// `permissions` or `roles` claims, is refused: there is no old-token
+    /// reader.
     #[test]
-    fn token_verifier_treats_roles_as_informational() {
+    fn token_verifier_refuses_other_versions_and_removed_claims() {
         let claims = AccessTokenClaims {
-            permissions: PermissionSet::new(),
+            version: 1,
             ..claims_with_times(now() + 3_600, now())
         };
         let token = SecretString::from(encode_eddsa_with_kid(&claims));
+        let result = verifier(WyrdAuthVerifySettings::default()).verify(&token, &tenant_id());
+        assert!(matches!(result, Err(AuthError::InvalidToken)), "{result:?}");
 
-        let verified = verifier(WyrdAuthVerifySettings::default())
-            .verify(&token, &tenant_id())
-            .expect("valid token verifies");
-
-        assert_eq!(verified.principal.roles, vec![role()]);
-        assert!(verified.principal.effective_permissions.is_empty());
+        for (field, value) in [
+            (
+                "permissions",
+                serde_json::json!([{"resource": "cards", "action": "read", "scope": "all"}]),
+            ),
+            ("roles", serde_json::json!(["viewer"])),
+        ] {
+            let mut claims = serde_json::to_value(claims_with_times(now() + 3_600, now()))
+                .expect("claims serialize");
+            claims[field] = value;
+            let mut header = Header::new(Algorithm::EdDSA);
+            header.kid = Some("k1".to_owned());
+            let token = encode(&header, &claims, &private_key()).expect("test token signs");
+            let result = verifier(WyrdAuthVerifySettings::default())
+                .verify(&SecretString::from(token), &tenant_id());
+            assert!(
+                matches!(result, Err(AuthError::Jwt(_))),
+                "{field}: {result:?}"
+            );
+        }
     }
 
-    /// The `permissions` claim round-trips through signing and decoding.
+    /// The `permission_ceiling` claim round-trips through signing and decoding.
     #[test]
-    fn access_token_claims_round_trip_permissions() {
-        let claims = claims_with_times(now() + 3_600, now());
+    fn access_token_claims_round_trip_ceiling() {
+        let claims = AccessTokenClaims {
+            permission_ceiling: Some(PermissionSet::from_iter([Permission::card_read()])),
+            ..claims_with_times(now() + 3_600, now())
+        };
         let decoded = verify_eddsa_with::<AccessTokenClaims>(
             &encode_eddsa(&claims),
             &public_key(),
@@ -1666,12 +1717,12 @@ mod tests {
         assert!(matches!(result, Err(AuthError::TokenExpired)), "{result:?}");
     }
 
-    /// A signed token whose `permissions` claim is not a permission set fails.
+    /// A signed token whose ceiling is not a valid permission set fails.
     #[test]
-    fn token_verifier_rejects_malformed_permissions() {
+    fn token_verifier_rejects_malformed_ceiling() {
         let mut claims = serde_json::to_value(claims_with_times(now() + 3_600, now()))
             .expect("claims serialize");
-        claims["permissions"] = serde_json::json!([{ "resource": "nope" }]);
+        claims["permission_ceiling"] = serde_json::json!([{ "resource": "nope" }]);
         let mut header = Header::new(Algorithm::EdDSA);
         header.kid = Some("k1".to_owned());
         let token = encode(&header, &claims, &private_key()).expect("test token signs");
@@ -1784,14 +1835,14 @@ mod tests {
     fn token_verifier_refuses_every_system_claim_set() {
         let write = system_claims();
         let read = AccessTokenClaims {
-            permissions: PermissionSet::from_iter([Permission {
+            permission_ceiling: Some(PermissionSet::from_iter([Permission {
                 scope: PermissionScope::Bifrost(BifrostPermissionScope::Table(BifrostTableScope {
                     catalog: "bifrost".to_owned(),
                     schema: "drift".to_owned(),
                     table_uid: uuid::Uuid::now_v7(),
                 })),
                 ..Permission::bifrost_query_read()
-            }]),
+            }])),
             ..write.clone()
         };
         let unscoped = AccessTokenClaims {
@@ -1839,8 +1890,9 @@ mod tests {
                 kind: PrincipalKindTag::System,
                 ..user_ref()
             },
-            roles: Vec::new(),
-            permissions: PermissionSet::from_iter([Permission::bifrost_record_write()]),
+            permission_ceiling: Some(PermissionSet::from_iter([
+                Permission::bifrost_record_write(),
+            ])),
             card_access: CardAccess::Scoped {
                 cards: vec![verifier.clone()],
             },
@@ -1894,10 +1946,10 @@ mod tests {
     /// the defect under test; everything else stays verifiable.
     fn claims_with_times(exp: usize, iat: usize) -> AccessTokenClaims {
         AccessTokenClaims {
+            version: super::ACCESS_TOKEN_VERSION,
             sub: principal_id().to_string(),
             principal: user_ref(),
-            roles: vec![role()],
-            permissions: PermissionSet::from_iter([Permission::card_read()]),
+            permission_ceiling: None,
             workload_uid: None,
             card_access: CardAccess::AnyRegistered,
             act: None,
@@ -1962,10 +2014,6 @@ mod tests {
         "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b01"
             .parse()
             .expect("static tenant id is valid")
-    }
-
-    fn role() -> RoleRef {
-        RoleRef::new("editor").expect("static role is valid")
     }
 
     fn assert_no_sqlx_in_dir(path: impl AsRef<std::path::Path>) {

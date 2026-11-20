@@ -144,8 +144,8 @@ mod pg_tests {
     use wyrd_spec::reference::CardRef;
     use wyrd_sql::TenantConn;
     use wyrd_sql::queries::auth::{
-        grant_role_to_service_account, insert_service_account, role_by_name, upsert_trusted_issuer,
-        upsert_workload_binding,
+        SubjectColumns, advance_authorization_revision, insert_role_binding,
+        insert_service_account, role_by_name, upsert_trusted_issuer, upsert_workload_binding,
     };
     use wyrd_storage::{LocalSigner, StorageHandle};
 
@@ -998,8 +998,22 @@ mod pg_tests {
             let role = role_by_name(&mut conn, role_name)
                 .await?
                 .expect("builtin role exists");
-            grant_role_to_service_account(&mut conn, id, role.id).await?;
+            let subject = SubjectColumns {
+                user_id: None,
+                service_account_id: Some(id),
+                group_id: None,
+            };
+            insert_role_binding(
+                &mut conn,
+                Uuid::now_v7(),
+                role.id,
+                subject,
+                &wyrd_spec::auth::PermissionScope::All,
+                wyrd_spec::auth::RoleSource::Direct,
+            )
+            .await?;
         }
+        advance_authorization_revision(&mut conn).await?;
         conn.commit().await.expect("principal seed commits");
         Ok(id)
     }

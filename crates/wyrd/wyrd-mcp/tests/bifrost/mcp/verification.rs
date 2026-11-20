@@ -43,14 +43,16 @@ mod pg_tests {
     use wyrd_client::cards::Cards;
     use wyrd_client::transport::credential::ResolvedCredential;
     use wyrd_runtime::Permission;
-    use wyrd_spec::auth::TokenAudience;
+    use wyrd_spec::auth::{CardPermissionScope, PermissionScope, TokenAudience};
     use wyrd_spec::envelope::CardKind;
+    use wyrd_spec::ids::CardUid;
     use wyrd_spec::reference::CardRef;
     use wyrd_spec::registry::{GetCardResponse, ListCardsResponse};
     use wyrd_spec::storage::DownloadInitResponse;
     use wyrd_spec::verification::execution::{
         Publication, PublicationContent, PublicationKind, PublicationPage,
     };
+    use wyrd_sql::queries::cards::card_scopes;
     use wyrd_testing::gateway_capture::HeldUpstream;
     use wyrd_testing::{Bootstrap, WyrdTestServer};
 
@@ -1414,19 +1416,28 @@ mod pg_tests {
         std::fs::write(root.join("verifier.yaml"), DOCUMENT_VERIFIER)?;
         let document = Box::pin(cards.declare_from_path(&root.join("verifier.yaml"))).await?;
         std::fs::remove_dir_all(&root)?;
-        let document_uid = document.root.uid.ok_or("a registered Card has a UID")?;
+        let document_uid = document
+            .root
+            .uid
+            .clone()
+            .ok_or("a registered Card has a UID")?;
+        let document_scope = CardPermissionScope::exact(&document.root, document_uid.clone());
         let document = document_uid.to_string();
         server
-            .seed_role(
-                "mcp_file_exact",
-                &[
-                    Permission::card_read(),
-                    Permission::verifier_run(document_uid),
-                ],
-            )
+            .seed_role("mcp_file_cards", &[Permission::card_read()])
+            .await?;
+        server
+            .seed_role("mcp_file_exact", &[Permission::verifier_run_any()])
             .await?;
         let agent = server
-            .credential_registered_service(&fixture.service_ref, &["mcp_file_exact"])
+            .credential_registered_service(&fixture.service_ref, &["mcp_file_cards"])
+            .await?;
+        server
+            .grant_role_at(
+                &agent,
+                "mcp_file_exact",
+                &PermissionScope::Card(document_scope),
+            )
             .await?;
         let agent_client = connect_rooted(&server, &agent).await?;
         let http = rooted_client(&server, &agent)?;
@@ -3397,28 +3408,51 @@ mod pg_tests {
         );
 
         let listing = serde_json::json!({ "execution_id": id });
+        let mut conn = server.tenant_conn_for(server.data_tenant_id()).await?;
+        let mut scopes = card_scopes(
+            &mut conn,
+            &[subject.clone(), verifier.clone(), other.clone()],
+        )
+        .await?;
+        conn.commit().await?;
+        let mut scope_of = |uid: &CardUid| {
+            scopes
+                .remove(uid)
+                .map(PermissionScope::Card)
+                .ok_or("the Card is registered")
+        };
+        let (subject_scope, verifier_scope, other_scope) =
+            (scope_of(&subject)?, scope_of(&verifier)?, scope_of(&other)?);
         server
             .seed_role("mcp_pages_cards", &[Permission::card_read()])
             .await?;
         server
-            .seed_role("mcp_pages_elsewhere", &[Permission::verifier_read(other)])
+            .seed_role("mcp_pages_executions", &[Permission::executions_read_any()])
             .await?;
-        server
-            .seed_role("mcp_pages_exact", &[Permission::verifier_read(verifier)])
-            .await?;
-        for role in ["mcp_pages_cards", "mcp_pages_elsewhere"] {
-            let caller = server.bootstrap_service(role, &[role]).await?;
+        // An execution's parent is its subject: the same read on its Verifier,
+        // or Card reads on another Card, disclose nothing.
+        for (name, role, scope) in [
+            ("mcp_pages_cards", "mcp_pages_cards", &other_scope),
+            (
+                "mcp_pages_elsewhere",
+                "mcp_pages_executions",
+                &verifier_scope,
+            ),
+        ] {
+            let caller = server.bootstrap_service(name, &[]).await?;
+            server.grant_role_at(&caller, role, scope).await?;
             let caller = connect(&server, &caller).await?;
             let refused = refusal(
                 caller
                     .call_tool(call(LIST_PUBLICATIONS, listing.clone())?)
                     .await,
             )?;
-            assert!(refused.contains(DENIED), "{role}: {refused}");
+            assert!(refused.contains(DENIED), "{name}: {refused}");
             caller.cancel().await?;
         }
-        let exact = server
-            .bootstrap_service("mcp_pages_exact", &["mcp_pages_exact"])
+        let exact = server.bootstrap_service("mcp_pages_exact", &[]).await?;
+        server
+            .grant_role_at(&exact, "mcp_pages_executions", &subject_scope)
             .await?;
         let exact = connect(&server, &exact).await?;
         let read: PublicationPage = serde_json::from_value(structured(
@@ -3428,7 +3462,7 @@ mod pg_tests {
         )?)?;
         assert_eq!(
             read.items, publications,
-            "an exact verifier:read grant reads"
+            "executions:read on the execution's subject reads"
         );
         exact.cancel().await?;
 
@@ -3908,7 +3942,7 @@ mod pg_tests {
                 "mcp_desk_no_query",
                 &[
                     Permission::card_read(),
-                    Permission::verifier_read_any(),
+                    Permission::executions_read_any(),
                     Permission::verifier_run_any(),
                     Permission::tool_invoke_any(),
                 ],
@@ -5480,7 +5514,7 @@ mod pg_tests {
         let tools = [
             Permission::card_read(),
             Permission::verifier_run_any(),
-            Permission::verifier_read_any(),
+            Permission::executions_read_any(),
             Permission::tool_invoke_any(),
         ];
         server.seed_role("mcp_code_no_query", &tools).await?;

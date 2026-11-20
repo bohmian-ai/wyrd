@@ -403,7 +403,6 @@ mod tests {
             PrincipalId::new(Uuid::now_v7()),
             PrincipalKind::Service,
             tenant,
-            Vec::new(),
             PermissionSet::default(),
         );
         (0..count)
@@ -420,7 +419,7 @@ mod tests {
                 let key = keys.map(|keys| format!("key-{}", position % keys));
                 Submission::new(
                     tenant,
-                    AcceptedAuthority::new(&caller, &[]),
+                    AcceptedAuthority::new(&caller, &[]).expect("authority accepts"),
                     request,
                     None,
                     key,

@@ -1148,6 +1148,23 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// The server holds no usable current authorization state for the
+    /// tenant: none was loaded, a newer committed change is known but not yet
+    /// applied, or database confirmation has failed for longer than the
+    /// freshness bound. Never a missing-permission decision.
+    #[error("[WYRD_AUTH_503_AUTHORIZATION_UNAVAILABLE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_503_AUTHORIZATION_UNAVAILABLE",
+        status = 503,
+        title = "Authorization state unavailable",
+        remediation = "Retry with backoff. The credential is still valid; the server cannot confirm current grants until its database is reachable."
+    )]
+    AuthorizationUnavailable {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// OIDC discovery document is unreachable or does not match the configured issuer.
     #[error("[WYRD_AUTH_503_DISCOVERY_UNAVAILABLE] {message}")]
     #[wyrd_error(
@@ -4181,6 +4198,7 @@ impl WyrdError {
             | Self::GatewayUpstreamUnavailable { message, details }
             | Self::GatewayDeadlineExceeded { message, details }
             | Self::AuthVerifyUnavailable { message, details }
+            | Self::AuthorizationUnavailable { message, details }
             | Self::DiscoveryUnavailable { message, details }
             | Self::MissingRequiredField { message, details }
             | Self::PermissionUnauthenticated { message, details }
@@ -4558,6 +4576,15 @@ impl WyrdError {
         Self::WorkloadContextRequired {
             message: message.into(),
             details: serde_json::json!({ "reason": "workload_context_required" }),
+        }
+    }
+
+    /// Construct [`WyrdError::AuthorizationUnavailable`] for `reason`.
+    #[must_use]
+    pub fn authorization_unavailable(reason: &'static str) -> Self {
+        Self::AuthorizationUnavailable {
+            message: format!("current authorization state is unavailable: {reason}"),
+            details: serde_json::json!({ "reason": reason }),
         }
     }
 
@@ -5145,6 +5172,10 @@ mod tests {
             },
             WyrdError::AuthVerifyUnavailable {
                 message: "permission resolver unavailable".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::AuthorizationUnavailable {
+                message: "authorization state unavailable".to_owned(),
                 details: serde_json::json!({}),
             },
             WyrdError::DiscoveryUnavailable {

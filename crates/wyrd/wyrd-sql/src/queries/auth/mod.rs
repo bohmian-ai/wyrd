@@ -8,6 +8,7 @@
 //! query-file macros.
 
 pub mod api_keys;
+pub mod authority;
 pub mod browser_sessions;
 pub mod device_authorizations;
 pub mod human_connections;
@@ -18,7 +19,7 @@ pub mod login_state;
 pub mod principal_directory;
 pub mod refresh_tokens;
 pub mod revocation;
-pub mod role_assignments;
+pub mod role_bindings;
 pub mod roles;
 pub mod service_accounts;
 pub mod trusted_issuers;
@@ -29,6 +30,10 @@ pub mod workload_bindings;
 pub use api_keys::{
     ApiKeyMetadataRow, credential_belongs_to, list_api_key_metadata, page_api_key_metadata,
     revoke_api_key,
+};
+pub use authority::{
+    AuthorityApiKey, AuthorityBinding, AuthorityMembership, AuthorityServiceAccount,
+    AuthorityState, authority_state,
 };
 pub use browser_sessions::{
     BrowserSessionAuthority, LiveBrowserSession, insert_browser_session, live_browser_session,
@@ -63,10 +68,12 @@ pub use refresh_tokens::{
     refresh_issuance_instant, revoke_refresh, revoke_refresh_chain, revoke_refresh_family,
 };
 pub use revocation::{suspend_service_account_principal, suspend_user_principal};
-pub use role_assignments::{
-    grant_role_to_service_account, grant_role_to_user, list_service_account_roles,
-    list_user_role_assignments, list_user_roles, replace_idp_user_roles,
-    revoke_role_from_service_account, revoke_role_from_user,
+pub use role_bindings::{
+    AUTHORIZATION_CHANNEL, MembershipRow, RoleBindingRow, SubjectColumns,
+    advance_authorization_revision, current_authorization_revision, delete_group,
+    delete_group_membership, delete_role_binding, insert_group, insert_group_membership,
+    insert_role_binding, list_group_memberships, list_groups, list_role_bindings,
+    replace_idp_user_bindings,
 };
 pub use roles::{
     RoleRow, delete_role, insert_role, list_roles, role_by_id, role_by_name, roles_by_name,

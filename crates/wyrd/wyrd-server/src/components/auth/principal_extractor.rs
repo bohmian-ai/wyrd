@@ -218,9 +218,9 @@ mod pg_tests {
                 principal_id,
                 PrincipalKind::User,
                 tenant,
-                Vec::new(),
                 PermissionSet::default(),
             ),
+            permission_ceiling: None,
             delegation_chain: Vec::new(),
             exp: chrono::Utc::now() + chrono::Duration::minutes(5),
         }));
@@ -345,8 +345,7 @@ mod pg_tests {
             .issue_access_token(
                 wyrd_auth_issue::AccessGrant {
                     principal,
-                    roles: vec![],
-                    permissions: wyrd_runtime::PermissionSet::new(),
+                    permission_ceiling: None,
                     card_access: wyrd_spec::auth::CardAccess::AnyRegistered,
                     workload_uid: None,
                     credential_id: None,
@@ -394,8 +393,7 @@ mod pg_tests {
                         kind: PrincipalKindTag::User,
                         tenant_id: tenant,
                     },
-                    roles: vec![],
-                    permissions: wyrd_runtime::PermissionSet::new(),
+                    permission_ceiling: None,
                     card_access: wyrd_spec::auth::CardAccess::Scoped { cards: Vec::new() },
                     workload_uid: None,
                     credential_id: None,

@@ -9,19 +9,20 @@ use pyo3::prelude::*;
 use pyo3::types::PyModule;
 use serde_json::Value;
 use wyrd_client::principals::{
-    CreateServicePrincipalRequest, CredentialListQuery, PrincipalId, PrincipalQuery,
-    Principals as NativePrincipals, RevokePrincipalRequest, WorkloadRestriction,
+    AccessGroupId, CreateGroupRequest, CreateRoleBindingRequest, CreateServicePrincipalRequest,
+    CredentialListQuery, PrincipalId, PrincipalQuery, Principals as NativePrincipals,
+    PutRoleRequest, RevokePrincipalRequest, RoleBindingId, RoleBindingQuery, WorkloadRestriction,
 };
 use wyrd_utils::py::{WyrdPyResult, pyobject_to_json};
 
 use crate::operators::{decode, to_python};
 
 /// Python-facing tenant principal handle: create Service principals, manage
-/// their credentials, discover principals, and grant or revoke direct Roles.
+/// their credentials, discover principals, and administer scoped role
+/// bindings, custom roles, and local groups.
 ///
-/// Every call blocks the calling thread with the GIL released. A Role change
-/// reaches the principal at its next token; already-issued tokens keep the
-/// Roles they were signed with.
+/// Every call blocks the calling thread with the GIL released. A binding
+/// change reaches the account at its next request.
 #[pyclass(module = "wyrd._wyrd.auth", name = "Principals")]
 pub struct Principals {
     /// The one native connection every call delegates to, connected on the
@@ -36,6 +37,15 @@ pub struct Principals {
 /// not a principal id.
 fn principal_id(value: &str) -> WyrdPyResult<PrincipalId> {
     decode("principal_id", Value::from(value))
+}
+
+/// Decode a local group id argument.
+///
+/// # Errors
+/// Returns `WYRD_SPEC_400_VALIDATION` naming `group_id` when the value is not
+/// a group id.
+fn group_id(value: &str) -> WyrdPyResult<AccessGroupId> {
+    decode("group_id", Value::from(value))
 }
 
 impl Principals {
@@ -259,52 +269,167 @@ impl Principals {
         to_python(py, &page)
     }
 
-    /// A principal's Role assignments ordered by Role and source.
+    /// One account's current access: its bindings, their sources, and the
+    /// scoped permissions they compile to.
     ///
     /// # Errors
     /// Raises `WyrdError` when `principal_id` is malformed, the caller lacks
-    /// `service_accounts:write`, the principal is not assignable, or the
+    /// `service_accounts:write`, the account is not assignable, or the
     /// request fails.
-    fn roles(&self, py: Python<'_>, principal_id: &str) -> WyrdPyResult<Py<PyAny>> {
+    fn access(&self, py: Python<'_>, principal_id: &str) -> WyrdPyResult<Py<PyAny>> {
         let id = self::principal_id(principal_id)?;
-        let roles = crate::trace::block_on(py, self.handle(py)?.roles(&id))?;
+        let access = crate::trace::block_on(py, self.handle(py)?.access(&id))?;
+        to_python(py, &access)
+    }
+
+    /// Every role and the operations it bundles.
+    ///
+    /// # Errors
+    /// Raises `WyrdError` when the caller lacks `service_accounts:write` or the
+    /// request fails.
+    fn roles(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
+        let roles = crate::trace::block_on(py, self.handle(py)?.roles())?;
         to_python(py, &roles)
     }
 
-    /// Idempotently grant a direct Role, returning `changed` and the
-    /// resulting assignments.
+    /// Create or replace a custom role from a `PutRoleRequest` dict.
     ///
     /// # Errors
-    /// Raises `WyrdError` when `principal_id` is malformed, the caller is not
-    /// a tenant administrator, the principal is not assignable, the Role is
-    /// unknown, or the request fails.
-    fn grant_role(
+    /// Raises `WyrdError` when `request` does not match the wire contract, the
+    /// role is built in, the caller is not a tenant administrator, or the
+    /// request fails.
+    fn put_role(
         &self,
         py: Python<'_>,
-        principal_id: &str,
         role: &str,
+        request: &Bound<'_, PyAny>,
     ) -> WyrdPyResult<Py<PyAny>> {
-        let id = self::principal_id(principal_id)?;
-        let change = crate::trace::block_on(py, self.handle(py)?.grant_role(&id, role))?;
-        to_python(py, &change)
+        let request: PutRoleRequest = decode("request", pyobject_to_json(request)?)?;
+        let stored = crate::trace::block_on(py, self.handle(py)?.put_role(role, &request))?;
+        to_python(py, &stored)
     }
 
-    /// Idempotently revoke a direct Role, returning `changed` and the
-    /// resulting assignments; identity-provider assignments are untouched.
+    /// Delete a custom role no binding uses.
     ///
     /// # Errors
-    /// Raises `WyrdError` when `principal_id` is malformed, the caller is not
-    /// a tenant administrator, the principal is not assignable, the Role is
-    /// unknown, or the request fails.
-    fn revoke_role(
+    /// Raises `WyrdError` when the role is built in, unknown, or still bound,
+    /// the caller is not a tenant administrator, or the request fails.
+    fn delete_role(&self, py: Python<'_>, role: &str) -> WyrdPyResult<Py<PyAny>> {
+        let deleted = crate::trace::block_on(py, self.handle(py)?.delete_role(role))?;
+        to_python(py, &deleted)
+    }
+
+    /// Bindings, optionally for one account, group, or role.
+    ///
+    /// # Errors
+    /// Raises `WyrdError` when a filter is malformed, the caller lacks
+    /// `service_accounts:write`, or the request fails.
+    #[pyo3(signature = (*, principal_id=None, group_id=None, role=None))]
+    fn bindings(
         &self,
         py: Python<'_>,
-        principal_id: &str,
-        role: &str,
+        principal_id: Option<&str>,
+        group_id: Option<&str>,
+        role: Option<&str>,
     ) -> WyrdPyResult<Py<PyAny>> {
-        let id = self::principal_id(principal_id)?;
-        let change = crate::trace::block_on(py, self.handle(py)?.revoke_role(&id, role))?;
-        to_python(py, &change)
+        let query: RoleBindingQuery = decode(
+            "query",
+            serde_json::json!({ "principal_id": principal_id, "group_id": group_id, "role": role }),
+        )?;
+        let bindings = crate::trace::block_on(py, self.handle(py)?.bindings(&query))?;
+        to_python(py, &bindings)
+    }
+
+    /// Idempotently bind a role at an explicit scope from a
+    /// `CreateRoleBindingRequest` dict; a repeat returns the same binding.
+    ///
+    /// # Errors
+    /// Raises `WyrdError` when `request` does not match the wire contract, the
+    /// role is unknown, the scope does not apply to it, the subject is not
+    /// assignable, the caller is not a tenant administrator, or the request
+    /// fails.
+    fn bind(&self, py: Python<'_>, request: &Bound<'_, PyAny>) -> WyrdPyResult<Py<PyAny>> {
+        let request: CreateRoleBindingRequest = decode("request", pyobject_to_json(request)?)?;
+        let binding = crate::trace::block_on(py, self.handle(py)?.bind(&request))?;
+        to_python(py, &binding)
+    }
+
+    /// Remove one directly administered binding.
+    ///
+    /// # Errors
+    /// Raises `WyrdError` when `binding_id` is malformed, unknown, or a
+    /// provider binding, the caller is not a tenant administrator, or the
+    /// request fails.
+    fn unbind(&self, py: Python<'_>, binding_id: &str) -> WyrdPyResult<Py<PyAny>> {
+        let id: RoleBindingId = decode("binding_id", Value::from(binding_id))?;
+        let binding = crate::trace::block_on(py, self.handle(py)?.unbind(&id))?;
+        to_python(py, &binding)
+    }
+
+    /// Every local group and its members.
+    ///
+    /// # Errors
+    /// Raises `WyrdError` when the caller lacks `service_accounts:write` or the
+    /// request fails.
+    fn groups(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
+        let groups = crate::trace::block_on(py, self.handle(py)?.groups())?;
+        to_python(py, &groups)
+    }
+
+    /// Create a local group named `name`.
+    ///
+    /// # Errors
+    /// Raises `WyrdError` when the name is invalid or taken, the caller is not
+    /// a tenant administrator, or the request fails.
+    fn create_group(&self, py: Python<'_>, name: &str) -> WyrdPyResult<Py<PyAny>> {
+        let request: CreateGroupRequest = decode("request", serde_json::json!({ "name": name }))?;
+        let group = crate::trace::block_on(py, self.handle(py)?.create_group(&request))?;
+        to_python(py, &group)
+    }
+
+    /// Delete a local group with its memberships and bindings.
+    ///
+    /// # Errors
+    /// Raises `WyrdError` when `group_id` is malformed or unknown, the caller
+    /// is not a tenant administrator, or the request fails.
+    fn delete_group(&self, py: Python<'_>, group_id: &str) -> WyrdPyResult<Py<PyAny>> {
+        let id = self::group_id(group_id)?;
+        let group = crate::trace::block_on(py, self.handle(py)?.delete_group(&id))?;
+        to_python(py, &group)
+    }
+
+    /// Add an account to a local group.
+    ///
+    /// # Errors
+    /// Raises `WyrdError` when an id is malformed or unknown, the caller is
+    /// not a tenant administrator, or the request fails.
+    fn add_group_member(
+        &self,
+        py: Python<'_>,
+        group_id: &str,
+        principal_id: &str,
+    ) -> WyrdPyResult<Py<PyAny>> {
+        let (group, principal) = (self::group_id(group_id)?, self::principal_id(principal_id)?);
+        let view =
+            crate::trace::block_on(py, self.handle(py)?.add_group_member(&group, &principal))?;
+        to_python(py, &view)
+    }
+
+    /// Remove an account from a local group.
+    ///
+    /// # Errors
+    /// Raises `WyrdError` when an id is malformed or unknown, the caller is
+    /// not a tenant administrator, or the request fails.
+    fn remove_group_member(
+        &self,
+        py: Python<'_>,
+        group_id: &str,
+        principal_id: &str,
+    ) -> WyrdPyResult<Py<PyAny>> {
+        let (group, principal) = (self::group_id(group_id)?, self::principal_id(principal_id)?);
+        let view =
+            crate::trace::block_on(py, self.handle(py)?.remove_group_member(&group, &principal))?;
+        to_python(py, &view)
     }
 }
 

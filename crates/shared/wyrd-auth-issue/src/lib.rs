@@ -15,10 +15,10 @@ use subtle::ConstantTimeEq;
 use ulid::Ulid;
 use uuid::Uuid;
 use wyrd_auth_verify::{
-    AccessTokenClaims, ActClaim, Kid, PLATFORM_TOKEN_SCOPE, PlatformAccessTokenClaims,
-    RefreshTokenClaims, TokenAudience, TokenPrincipalRef,
+    ACCESS_TOKEN_VERSION, AccessTokenClaims, ActClaim, Kid, PLATFORM_TOKEN_SCOPE,
+    PlatformAccessTokenClaims, RefreshTokenClaims, TokenAudience, TokenPrincipalRef,
 };
-use wyrd_runtime::{PermissionSet, PrincipalId, RoleRef};
+use wyrd_runtime::{PermissionSet, PrincipalId};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{CardAccess, PrincipalKindTag};
 use wyrd_spec::ids::CardUid;
@@ -100,11 +100,12 @@ pub struct AccessGrant {
     /// Subject the token is minted for: the requesting principal for a direct
     /// token, the party being acted for in an RFC 8693 exchange.
     pub principal: TokenPrincipalRef,
-    /// Roles assigned to the subject; informational metadata only.
-    pub roles: Vec<RoleRef>,
-    /// The token's authority: the subject's effective permissions, already
-    /// attenuated to the actor's for a delegated token.
-    pub permissions: PermissionSet,
+    /// The signed upper bound on the token's authority, never a grant.
+    ///
+    /// `None` for ordinary login and unrestricted Service-key tokens; the
+    /// frozen key limit for a restricted key; required for delegation, where
+    /// it bounds the subject's and every actor's effective authority.
+    pub permission_ceiling: Option<PermissionSet>,
     /// The signed Card limit: `any_registered`, `root_required`, or the exact
     /// resolved (or delegated-intersection) UID scope.
     pub card_access: CardAccess,
@@ -237,9 +238,9 @@ impl IssuingKey {
     ///
     /// The single tenant access-token claim builder. It refuses kinds that
     /// never hold a tenant token, bounds a delegated grant's RFC 8693 `act`
-    /// chain, stamps `sub` as the subject, the grant's audience, its
-    /// `permissions` authority snapshot, Card access, root, informational
-    /// `roles`, and the credential attribution, and then admits the claims
+    /// chain, stamps the contract version, `sub` as the subject, the grant's
+    /// audience, its optional permission ceiling, Card access, root, and the
+    /// credential attribution, and then admits the claims
     /// through the verifier's own shape check so no token is minted that the
     /// verifier would refuse.
     ///
@@ -271,8 +272,7 @@ impl IssuingKey {
     ) -> Result<AccessTokenClaims, IssueError> {
         let AccessGrant {
             principal,
-            roles,
-            permissions,
+            permission_ceiling,
             card_access,
             workload_uid,
             credential_id,
@@ -305,10 +305,10 @@ impl IssuingKey {
         let jti = new_jti();
         tracing::Span::current().record("jti", &jti);
         let claims = AccessTokenClaims {
+            version: ACCESS_TOKEN_VERSION,
             sub,
             principal,
-            roles,
-            permissions,
+            permission_ceiling,
             workload_uid,
             card_access,
             act,
@@ -478,12 +478,15 @@ mod tests {
     use chrono::{Duration, Utc};
     use jsonwebtoken::{Algorithm, decode_header};
     use secrecy::{ExposeSecret, SecretString};
+    use wyrd_auth_verify::ACCESS_TOKEN_VERSION;
     use wyrd_auth_verify::{
         AccessTokenClaims, ActClaim, PLATFORM_TOKEN_SCOPE, PlatformAccessTokenClaims,
         RefreshTokenClaims, TokenAudience, TokenPrincipalRef, decode_kid, public_key_from_pem,
         verify_eddsa,
     };
-    use wyrd_runtime::{Permission, PermissionSet, PrincipalId, RoleRef};
+    use wyrd_runtime::{
+        CardPermissionScope, Permission, PermissionScope, PermissionSet, PrincipalId,
+    };
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::{CardAccess, PrincipalKindTag};
     use wyrd_spec::ids::CardUid;
@@ -497,21 +500,18 @@ mod tests {
     const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n";
 
     /// A direct (undelegated) user grant mints a token whose `sub`, principal,
-    /// roles, permission snapshot, default `wyrd` audience, issuer, and ULID-shaped
-    /// `jti` all come from the grant, with no Card binding, credential id, or
-    /// `act` chain.
+    /// contract version, default `wyrd` audience, issuer, and ULID-shaped `jti`
+    /// all come from the grant, with no grants, ceiling, Card binding,
+    /// credential id, or `act` chain.
     ///
     /// # Panics
     ///
     /// Panics when issuance or verification fails or any verified claim differs
     /// from the grant.
     #[test]
-    fn issue_access_token_uses_principal_roles_permissions_audience_and_jti_shape() {
+    fn issue_access_token_uses_principal_version_audience_and_jti_shape() {
         let token = issuing_key()
-            .issue_access_token(
-                grant(user_principal(), vec![role("editor")]),
-                Duration::minutes(5),
-            )
+            .issue_access_token(grant(user_principal()), Duration::minutes(5))
             .expect("token issues");
         let claims = verify_access_token(&token);
 
@@ -522,8 +522,8 @@ mod tests {
         assert_eq!(claims.principal.kind, PrincipalKindTag::User);
         assert_eq!(claims.card_access, CardAccess::AnyRegistered);
         assert_eq!(claims.workload_uid, None);
-        assert_eq!(claims.roles, vec![role("editor")]);
-        assert_eq!(claims.permissions, permissions());
+        assert_eq!(claims.version, ACCESS_TOKEN_VERSION);
+        assert_eq!(claims.permission_ceiling, None);
         assert_eq!(claims.aud, "wyrd");
         assert_eq!(claims.cid, None);
         assert_eq!(claims.act, None);
@@ -546,7 +546,7 @@ mod tests {
                 AccessGrant {
                     card_access: scoped(vec![root.clone(), member.clone()]),
                     workload_uid: Some(root.clone()),
-                    ..grant(service_principal(), vec![role("service")])
+                    ..grant(service_principal())
                 },
                 Duration::minutes(5),
             )
@@ -577,7 +577,7 @@ mod tests {
                 AccessGrant {
                     card_access,
                     workload_uid,
-                    ..grant(service_principal(), vec![role("service")])
+                    ..grant(service_principal())
                 },
                 Duration::minutes(5),
             );
@@ -592,13 +592,10 @@ mod tests {
     #[test]
     fn issue_access_token_rejects_platform_kind() {
         let result = issuing_key().issue_access_token(
-            grant(
-                TokenPrincipalRef {
-                    kind: PrincipalKindTag::GlobalAdmin,
-                    ..user_principal()
-                },
-                Vec::new(),
-            ),
+            grant(TokenPrincipalRef {
+                kind: PrincipalKindTag::GlobalAdmin,
+                ..user_principal()
+            }),
             Duration::minutes(5),
         );
 
@@ -609,12 +606,21 @@ mod tests {
     /// refused at issuance rather than minted unverifiable or truncated.
     #[test]
     fn issue_access_token_rejects_token_over_bearer_limit() {
-        let roles = (0..800)
-            .map(|index| role(&format!("role_{index:04}")))
+        let ceiling = (0..800)
+            .map(|index| {
+                Permission::card_read().at(PermissionScope::Card(CardPermissionScope::family(
+                    wyrd_spec::envelope::CardKind::Model,
+                    wyrd_spec::ids::CardName::new(format!("model-{index:04}")).expect("name"),
+                )))
+            })
             .collect();
-
-        let result =
-            issuing_key().issue_access_token(grant(user_principal(), roles), Duration::minutes(5));
+        let result = issuing_key().issue_access_token(
+            AccessGrant {
+                permission_ceiling: Some(ceiling),
+                ..grant(user_principal())
+            },
+            Duration::minutes(5),
+        );
 
         assert!(matches!(
             result,
@@ -633,7 +639,7 @@ mod tests {
             .issue_access_token(
                 AccessGrant {
                     credential_id: Some(credential),
-                    ..grant(service_principal(), vec![role("service")])
+                    ..grant(service_principal())
                 },
                 Duration::minutes(5),
             )
@@ -670,19 +676,14 @@ mod tests {
 
     #[test]
     fn issue_access_token_rejects_zero_ttl() {
-        let result = issuing_key().issue_access_token(
-            grant(user_principal(), vec![role("editor")]),
-            Duration::zero(),
-        );
+        let result = issuing_key().issue_access_token(grant(user_principal()), Duration::zero());
         assert!(matches!(result, Err(IssueError::InvalidTtl)));
     }
 
     #[test]
     fn issue_access_token_rejects_negative_ttl() {
-        let result = issuing_key().issue_access_token(
-            grant(user_principal(), vec![role("editor")]),
-            Duration::minutes(-1),
-        );
+        let result =
+            issuing_key().issue_access_token(grant(user_principal()), Duration::minutes(-1));
         assert!(matches!(result, Err(IssueError::InvalidTtl)));
     }
 
@@ -781,8 +782,10 @@ mod tests {
             (
                 "direct result write",
                 AccessGrant {
-                    permissions: PermissionSet::from_iter([Permission::bifrost_record_write()]),
-                    ..grant(system.clone(), Vec::new())
+                    permission_ceiling: Some(PermissionSet::from_iter([
+                        Permission::bifrost_record_write(),
+                    ])),
+                    ..grant(system.clone())
                 },
             ),
             (
@@ -792,15 +795,14 @@ mod tests {
                         cards: vec![uid(11)],
                     },
                     workload_uid: Some(uid(11)),
-                    ..grant(system.clone(), Vec::new())
+                    ..grant(system.clone())
                 },
             ),
-            ("role", grant(system.clone(), vec![role("editor")])),
             (
                 "credential",
                 AccessGrant {
                     credential_id: Some(uuid::Uuid::now_v7()),
-                    ..grant(system.clone(), Vec::new())
+                    ..grant(system.clone())
                 },
             ),
             (
@@ -911,10 +913,7 @@ mod tests {
             public_key_from_pem(derived_pem.as_bytes()).expect("derived public key loads");
 
         let token = key
-            .issue_access_token(
-                grant(user_principal(), vec![role("editor")]),
-                Duration::minutes(5),
-            )
+            .issue_access_token(grant(user_principal()), Duration::minutes(5))
             .expect("token issues");
         let claims = verify_eddsa::<AccessTokenClaims>(&token, &decoding, Some("wyrd"))
             .expect("token verifies against the derived public key");
@@ -935,10 +934,7 @@ mod tests {
         .expect("derived public key loads");
 
         let token = key
-            .issue_access_token(
-                grant(user_principal(), vec![role("editor")]),
-                Duration::minutes(5),
-            )
+            .issue_access_token(grant(user_principal()), Duration::minutes(5))
             .expect("token issues");
         let claims = verify_eddsa::<AccessTokenClaims>(&token, &decoding, Some("wyrd"))
             .expect("token verifies against the generated key's derived public key");
@@ -1017,12 +1013,11 @@ mod tests {
         .expect("test private key loads")
     }
 
-    /// A direct, credential-free grant carrying the test permission set.
-    fn grant(principal: TokenPrincipalRef, roles: Vec<RoleRef>) -> AccessGrant {
+    /// A direct, credential-free, unrestricted grant.
+    fn grant(principal: TokenPrincipalRef) -> AccessGrant {
         AccessGrant {
             principal,
-            roles,
-            permissions: permissions(),
+            permission_ceiling: None,
             card_access: CardAccess::AnyRegistered,
             workload_uid: None,
             credential_id: None,
@@ -1037,7 +1032,8 @@ mod tests {
         AccessGrant {
             card_access: CardAccess::Scoped { cards: Vec::new() },
             act: Some(Box::new(actor_layer(None))),
-            ..grant(subject, vec![role("viewer")])
+            permission_ceiling: Some(PermissionSet::from_iter([Permission::card_read()])),
+            ..grant(subject)
         }
     }
 
@@ -1060,18 +1056,13 @@ mod tests {
         CardUid::new(format!("01890f28-7c4a-7cc3-98e7-{n:012x}")).expect("static uid is valid")
     }
 
-    /// The permission set every test grant carries.
-    fn permissions() -> PermissionSet {
-        PermissionSet::from_iter([Permission::card_read()])
-    }
-
     fn public_key() -> jsonwebtoken::DecodingKey {
         public_key_from_pem(PUBLIC_KEY_PEM).expect("test public key loads")
     }
 
     fn issue_user_test_token(ttl: Duration) -> String {
         issuing_key()
-            .issue_access_token(grant(user_principal(), vec![role("editor")]), ttl)
+            .issue_access_token(grant(user_principal()), ttl)
             .expect("token issues")
     }
 
@@ -1113,10 +1104,6 @@ mod tests {
         "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b01"
             .parse()
             .expect("static tenant id is valid")
-    }
-
-    fn role(name: &str) -> RoleRef {
-        RoleRef::new(name).expect("static role is valid")
     }
 
     fn assert_no_sqlx_in_dir(path: impl AsRef<std::path::Path>) {

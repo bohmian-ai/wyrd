@@ -849,7 +849,6 @@ fn fixture_principal(tenant: DataTenantId) -> wyrd_runtime::principal::Principal
         wyrd_spec::auth::PrincipalId::new(uuid::Uuid::now_v7()),
         wyrd_runtime::principal::PrincipalKind::User,
         tenant,
-        Vec::new(),
         wyrd_runtime::PermissionSet::new(),
     )
 }

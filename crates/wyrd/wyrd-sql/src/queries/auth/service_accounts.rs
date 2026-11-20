@@ -437,14 +437,18 @@ pub async fn insert_user_api_key(
     .await
 }
 
-/// A User key's stored permission ceiling.
+/// A key's stored permission ceiling.
 type StoredCeiling = sqlx::types::Json<Vec<String>>;
 
 /// The owner of credential `id` as token issuance resolves it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApiKeyOwner {
-    /// A Service or Admin account, with that account's own authority.
-    Account,
+    /// A Service or Admin account, with that account's own authority,
+    /// optionally bounded by the key's restrictive ceiling.
+    Account {
+        /// The stored ceiling's permission expressions, when the key has one.
+        permission_ceiling: Option<Vec<String>>,
+    },
     /// A User, bounded by the key's stored permission ceiling.
     User {
         /// The stored ceiling's permission expressions.
@@ -468,7 +472,9 @@ pub async fn api_key_owner(
             .fetch_optional(&mut **conn.transaction())
             .await?;
     row.map(|(user, ceiling)| match (user, ceiling) {
-        (None, None) => Ok(ApiKeyOwner::Account),
+        (None, ceiling) => Ok(ApiKeyOwner::Account {
+            permission_ceiling: ceiling.map(|ceiling| ceiling.0),
+        }),
         (Some(_), Some(ceiling)) => Ok(ApiKeyOwner::User {
             permission_ceiling: ceiling.0,
         }),

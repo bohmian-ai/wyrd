@@ -154,7 +154,7 @@ pub(crate) mod pg_tests {
         insert_human_refresh_token, insert_refresh_token, insert_user, refresh_by_hash,
         service_account_by_id, user_by_id,
     };
-    use wyrd_sql::row_types::auth::HumanSessionBinding;
+    use wyrd_sql::row_types::auth::{HumanLoginAnchor, HumanSessionBinding};
 
     use super::revoke_principal_in_conn;
     use crate::audit::test_audit::RecordedAudit;
@@ -474,7 +474,7 @@ pub(crate) mod pg_tests {
             Utc::now() + Duration::days(30),
             None,
             HumanSessionBinding {
-                connection: binding,
+                anchor: HumanLoginAnchor::Connection(binding),
                 client: OAuthClientId::WyrdCli,
             },
         )

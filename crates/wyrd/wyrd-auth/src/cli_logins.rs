@@ -252,7 +252,7 @@ impl CliLogins {
     /// told to slow down; until the callback has recorded an approval the
     /// poll is pending. Once it has, the poll deletes the device
     /// authorization, mints the `wyrd-cli` session for the approving
-    /// principal through the connection revision it signed in with
+    /// principal through the login anchor it signed in with
     /// ([`TenantTokenIssuer::issue_human_session`], with its canonical
     /// token-exchange audit), appends one allowed `auth.device_code.grant`
     /// audit event for the User, and commits, so a second poll finds nothing
@@ -342,7 +342,7 @@ impl CliLogins {
             conn.commit().await.map_err(store_error)?;
             return Err(device_error("slow_down", "poll less often"));
         }
-        let Some((principal_id, connection)) = poll.approval() else {
+        let Some((principal_id, anchor)) = poll.approval() else {
             conn.commit().await.map_err(store_error)?;
             return Err(device_error(
                 "authorization_pending",
@@ -359,7 +359,7 @@ impl CliLogins {
                 principal_id,
                 None,
                 HumanSessionBinding {
-                    connection,
+                    anchor,
                     client: OAuthClientId::WyrdCli,
                 },
                 request_id,
@@ -561,7 +561,7 @@ mod pg_tests {
         insert_human_refresh_token, insert_login_state, pending_device_authorization,
         refresh_by_hash,
     };
-    use wyrd_sql::row_types::auth::HumanSessionBinding;
+    use wyrd_sql::row_types::auth::{HumanLoginAnchor, HumanSessionBinding};
 
     use super::{CliLogins, TOKEN_REVOCATION_OPERATION};
     use crate::audit::test_audit::RecordedAudit;
@@ -857,9 +857,14 @@ mod pg_tests {
             .expect("lookup runs")
             .expect("code is pending");
         assert!(
-            approve_device_authorization(&mut conn, approved_id, user, binding)
-                .await
-                .expect("approval runs")
+            approve_device_authorization(
+                &mut conn,
+                approved_id,
+                user,
+                HumanLoginAnchor::Connection(binding)
+            )
+            .await
+            .expect("approval runs")
         );
         assert!(
             !deny_device_authorization(&mut conn, &approved.user_code)
@@ -873,9 +878,14 @@ mod pg_tests {
                 .expect("denial runs")
         );
         assert!(
-            !approve_device_authorization(&mut conn, denied_id, user, binding)
-                .await
-                .expect("approval runs"),
+            !approve_device_authorization(
+                &mut conn,
+                denied_id,
+                user,
+                HumanLoginAnchor::Connection(binding)
+            )
+            .await
+            .expect("approval runs"),
             "a denied code cannot be approved"
         );
         conn.commit().await.expect("approval commits");
@@ -1194,7 +1204,7 @@ mod pg_tests {
                 Utc::now() + Duration::days(1),
                 rotated_from.map(|index: usize| ids[index]),
                 HumanSessionBinding {
-                    connection: binding,
+                    anchor: HumanLoginAnchor::Connection(binding),
                     client: OAuthClientId::WyrdCli,
                 },
             )

@@ -43,16 +43,16 @@ use wyrd_spec::auth::{
     AbsoluteUrl, Attribution, ClaimMappingPayload, ConnectionActivate, ConnectionInput,
     ConnectionTestResponse, ConnectionTester, HumanClientAuth, HumanConnectionState,
     HumanConnectionView, HumanConnectionsResponse, IssuerUrl, LoginInitiation, PrincipalId,
-    PrincipalKindTag, Sha256Hex,
+    Sha256Hex,
 };
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{AuditEvent, AuditOutcome};
 use wyrd_sql::queries::auth::{
     HumanConnectionWrite, LoginState, deactivate_active_human_connection,
     human_candidate_test_is_current, human_connection_in_state, insert_human_candidate,
-    insert_login_state, list_service_account_roles, list_user_roles, live_human_connections,
-    lock_human_connection_slot, promote_tested_human_candidate, remove_human_connection,
-    replace_human_candidate, service_account_by_id, stamp_human_candidate_tested, user_by_id,
+    insert_login_state, live_human_connections, lock_human_connection_slot,
+    promote_tested_human_candidate, remove_human_connection, replace_human_candidate,
+    stamp_human_candidate_tested,
 };
 use wyrd_sql::row_types::auth::{HumanConnectionBinding, HumanConnectionRow};
 use wyrd_sql::{TenantConn, WyrdPostgres};
@@ -60,9 +60,9 @@ use wyrd_sql::{TenantConn, WyrdPostgres};
 use wyrd_runtime::audit::AuditStage;
 
 use crate::audit::{principal_event, principal_kind_tag};
+use crate::authority::TenantAuthority;
 use crate::error::{relying_party_error, store_error};
-use crate::exchange_api_key::{ExchangeError, role_refs, verify_api_key};
-use crate::issuance::resolve_permissions;
+use crate::exchange_api_key::{ExchangeError, verify_api_key};
 use crate::login::LOGIN_STATE_TTL;
 use crate::pg_resolvers::{human_connection_trusted_issuer, seal_secret};
 
@@ -786,13 +786,12 @@ pub fn provider_callback(origin: &Url) -> Result<Url, WyrdError> {
 }
 
 /// Whether a test sign-in's tester is still authorized to mark a candidate
-/// tested: an active principal of the RLS tenant whose stored roles grant
+/// tested: an active principal of the RLS tenant whose current bindings grant
 /// `identity_connections:write`.
 ///
-/// A user's roles are its synced grants; a headless principal's are its
-/// service-account grants and its stored kind must still match the recorded
-/// one. A principal that is gone, inactive, or of a kind that holds no tenant
-/// roles is not authorized.
+/// The account's stored kind must still match the recorded one. A principal
+/// that is gone, inactive, or of a kind that holds no tenant bindings is not
+/// authorized.
 ///
 /// # Errors
 /// Returns [`WyrdError::AuthVerifyUnavailable`] when a store read fails,
@@ -802,31 +801,9 @@ async fn tester_authorized(
     conn: &mut TenantConn<'_>,
     tester: ConnectionTester,
 ) -> Result<bool, WyrdError> {
-    let id = tester.principal_id.as_uuid();
-    let roles = match tester.principal_kind {
-        PrincipalKindTag::User => match user_by_id(conn, id).await.map_err(store_error)? {
-            Some(user) if user.status == "active" => {
-                list_user_roles(conn, id).await.map_err(store_error)?
-            }
-            _ => return Ok(false),
-        },
-        PrincipalKindTag::TenantAdmin | PrincipalKindTag::Service => {
-            match service_account_by_id(conn, id).await.map_err(store_error)? {
-                Some(row) if principal_kind_tag(&row.principal_kind) == tester.principal_kind => {
-                    list_service_account_roles(conn, id)
-                        .await
-                        .map_err(store_error)?
-                }
-                _ => return Ok(false),
-            }
-        }
-        PrincipalKindTag::GlobalAdmin | PrincipalKindTag::System => return Ok(false),
-    };
-    let roles = role_refs(roles).map_err(internal)?;
-    let permissions = resolve_permissions(conn, &roles)
-        .await
-        .map_err(WyrdError::from)?;
-    Ok(permissions.contains(&Permission::identity_connections_write()))
+    let grants =
+        TenantAuthority::current_grants(conn, tester.principal_id, tester.principal_kind).await?;
+    Ok(grants.is_some_and(|grants| grants.contains(&Permission::identity_connections_write())))
 }
 
 /// Verify a recovery API key against this tenant, constant-cost on refusal,
@@ -865,15 +842,14 @@ async fn recovery_key_authorizes(
     if row.status != "active" {
         return Ok(false);
     }
-    let roles = list_service_account_roles(conn, row.principal_id)
-        .await
-        .map_err(store_error)?;
-    let roles = role_refs(roles).map_err(internal)?;
-    let permissions = resolve_permissions(conn, &roles)
-        .await
-        .map_err(WyrdError::from)?;
+    let grants = TenantAuthority::current_grants(
+        conn,
+        PrincipalId::new(row.principal_id),
+        principal_kind_tag(&row.principal_kind),
+    )
+    .await?;
     let required = Permission::identity_connections_write();
-    let allowed = permissions.contains(&required);
+    let allowed = grants.is_some_and(|grants| grants.contains(&required));
     let recovery = AuditEvent {
         card_ref: None,
         sub_principal_id: PrincipalId::new(row.principal_id),

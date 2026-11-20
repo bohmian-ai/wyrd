@@ -559,7 +559,7 @@ fn bad_subject_token_format() -> WyrdError {
 mod tests {
     use base64::Engine;
     use wyrd_auth_verify::{AccessTokenClaims, TokenPrincipalRef};
-    use wyrd_runtime::{PermissionSet, PrincipalId};
+    use wyrd_runtime::PrincipalId;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::{CardAccess, PrincipalKindTag};
 
@@ -586,14 +586,14 @@ mod tests {
             .parse()
             .expect("static principal id is valid");
         let claims = AccessTokenClaims {
+            version: wyrd_auth_verify::ACCESS_TOKEN_VERSION,
             sub: principal_id.to_string(),
             principal: TokenPrincipalRef {
                 id: principal_id,
                 kind: PrincipalKindTag::User,
                 tenant_id,
             },
-            roles: vec![],
-            permissions: PermissionSet::default(),
+            permission_ceiling: None,
             workload_uid: None,
             card_access: CardAccess::AnyRegistered,
             act: None,

@@ -12,8 +12,10 @@ use uuid::Uuid;
 use wyrd_runtime::Permission;
 use wyrd_server::state::LimitsConfig;
 use wyrd_server::verification::VerificationRuntime;
-use wyrd_spec::auth::TokenAudience;
-use wyrd_spec::ids::CardUid;
+use wyrd_spec::auth::{CardPermissionScope, PermissionScope, TokenAudience};
+use wyrd_spec::envelope::CardKind;
+use wyrd_spec::ids::{CardName, CardUid};
+use wyrd_sql::queries::cards::card_scopes;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
 use super::pg_deferred_evidence::limits;
@@ -108,11 +110,11 @@ impl Deployment {
         }
     }
 
-    /// The Verifier Card `execution` froze.
+    /// The exact scope of the Verifier Card `execution` froze.
     ///
     /// # Panics
-    /// Panics when the read fails.
-    async fn verifier_of(&self, execution: Uuid) -> CardUid {
+    /// Panics when the read fails or the Verifier is not registered.
+    async fn verifier_of(&self, execution: Uuid) -> CardPermissionScope {
         let mut conn = self.conn().await;
         let (uid,): (Uuid,) = sqlx::query_as(
             "SELECT verifier_card_uid FROM wyrd.verifier_executions WHERE execution_id = $1",
@@ -121,8 +123,12 @@ impl Deployment {
         .fetch_one(&mut **conn.transaction())
         .await
         .expect("execution reads");
+        let uid = CardUid::from_uuid(uid).expect("card uid");
+        let mut scopes = card_scopes(&mut conn, std::slice::from_ref(&uid))
+            .await
+            .expect("scope reads");
         conn.commit().await.expect("read commits");
-        CardUid::from_uuid(uid).expect("card uid")
+        scopes.remove(&uid).expect("the Verifier is registered")
     }
 
     /// A user of this tenant holding `roles`, as its id and JWT.
@@ -130,6 +136,42 @@ impl Deployment {
     /// # Panics
     /// Panics when the bootstrap fails.
     async fn user(&self, name: &str, roles: &[&str]) -> (Uuid, String) {
+        self.user_at(name, roles, None).await
+    }
+
+    /// A user of this tenant holding `roles`, bound at `scope` when given and
+    /// tenant-wide otherwise, as its id and JWT.
+    ///
+    /// # Panics
+    /// Panics when the bootstrap or binding fails.
+    async fn user_at(
+        &self,
+        name: &str,
+        roles: &[&str],
+        scope: Option<&PermissionScope>,
+    ) -> (Uuid, String) {
+        let Some(scope) = scope else {
+            return self.bootstrapped(name, roles).await;
+        };
+        let (id, jwt) = self.bootstrapped(name, &[]).await;
+        let principal = Bootstrap::User {
+            id: wyrd_spec::auth::PrincipalId::new(id),
+            jwt: jwt.clone(),
+        };
+        for role in roles {
+            self.server
+                .grant_role_at(&principal, role, scope)
+                .await
+                .expect("scoped role binds");
+        }
+        (id, jwt)
+    }
+
+    /// A bootstrapped user holding tenant-wide `roles`.
+    ///
+    /// # Panics
+    /// Panics when the bootstrap fails.
+    async fn bootstrapped(&self, name: &str, roles: &[&str]) -> (Uuid, String) {
         let Bootstrap::User { id, jwt } = self
             .server
             .bootstrap_user(name, roles)
@@ -271,20 +313,23 @@ async fn a_pending_approval_is_decided_once_and_resumes_the_same_execution() {
     assert_eq!(denied["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
 
     let verifier = deployment.verifier_of(execution).await;
-    let other = CardUid::from_uuid(Uuid::now_v7()).expect("card uid");
+    let other = PermissionScope::Card(CardPermissionScope::family(
+        CardKind::Verifier,
+        CardName::new("other-signoff").expect("name"),
+    ));
     deployment
         .server
         .seed_role(
             "other_approver",
             &[
-                Permission::verifier_read_any(),
-                Permission::verifier_approve(other),
+                Permission::executions_read_any(),
+                Permission::verifier_approve_any(),
             ],
         )
         .await
         .expect("role seeds");
     let (_, misscoped) = deployment
-        .user("approval-misscoped", &["other_approver"])
+        .user_at("approval-misscoped", &["other_approver"], Some(&other))
         .await;
     let (status, denied) = deployment
         .decide(&misscoped, execution, &approval, &approve)
@@ -373,14 +418,15 @@ async fn a_pending_approval_is_decided_once_and_resumes_the_same_execution() {
 
     deployment
         .server
-        .seed_role(
-            "signoff_approver",
-            &[Permission::verifier_approve(verifier)],
-        )
+        .seed_role("signoff_approver", &[Permission::verifier_approve_any()])
         .await
         .expect("role seeds");
     let (scoped, scoped_jwt) = deployment
-        .user("approval-scoped", &["signoff_approver"])
+        .user_at(
+            "approval-scoped",
+            &["signoff_approver"],
+            Some(&PermissionScope::Card(verifier)),
+        )
         .await;
     let rejected = deployment.open(2, H2).await;
     deployment.until(rejected, "waiting").await;

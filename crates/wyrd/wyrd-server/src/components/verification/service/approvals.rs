@@ -270,7 +270,6 @@ mod tests {
                 PrincipalId::new(uuid::Uuid::now_v7()),
                 PrincipalKind::User,
                 tenant,
-                Vec::new(),
                 PermissionSet::default(),
             ),
             request_id: wyrd_spec::request_id::RequestId::now_v7(),

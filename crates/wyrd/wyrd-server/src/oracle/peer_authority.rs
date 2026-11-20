@@ -1049,7 +1049,6 @@ mod tests {
             PrincipalId::new(uuid::Uuid::now_v7()),
             PrincipalKind::User,
             tenant_id,
-            Vec::new(),
             PermissionSet::from_iter([Permission::bifrost_query_read()]),
         );
         let context = vala_bifrost_redux::oracle::AuthorizedQueryContext::try_new(

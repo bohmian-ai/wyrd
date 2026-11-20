@@ -4575,7 +4575,6 @@ mod tests {
                 wyrd_runtime::PrincipalId::new(uuid::Uuid::now_v7()),
                 wyrd_runtime::PrincipalKind::User,
                 tenant,
-                Vec::new(),
                 effective_permissions,
             ),
             tenant,

@@ -18,12 +18,15 @@ pub use handle::Principals;
 // module for the capability and its types rather than depending on `wyrd-spec`
 // directly.
 pub use wyrd_spec::auth::{
-    AccountAuthentication, CreateServicePrincipalRequest, CreateServicePrincipalResponse,
+    AccessGrant, AccessSummary, AccountAuthentication, BindingSubject, CreateGroupRequest,
+    CreateRoleBindingRequest, CreateServicePrincipalRequest, CreateServicePrincipalResponse,
     CreateUserInvitationRequest, CreateUserRequest, CreatedUser, CredentialListQuery,
-    CredentialListResponse, CredentialMetadata, CurrentUserProfile, IssuedCredential,
-    IssuedUserInvitation, PrincipalId, PrincipalKindTag, PrincipalPage, PrincipalQuery,
-    PrincipalRoles, PrincipalStatus, PrincipalSummary, RevokePrincipalRequest, RoleAssignment,
-    RoleAssignmentChange, RoleSource, SecretBearer, WorkloadFamily, WorkloadKind,
-    WorkloadRestriction,
+    CredentialListResponse, CredentialMetadata, CurrentUserProfile, GrantSource, GroupList,
+    GroupMember, GroupView, IssuedCredential, IssuedUserInvitation, Operation, PermissionScope,
+    PrincipalId, PrincipalKindTag, PrincipalPage, PrincipalQuery, PrincipalStatus,
+    PrincipalSummary, PutRoleRequest, RevokePrincipalRequest, RoleBindingList, RoleBindingQuery,
+    RoleBindingView, RoleList, RoleSource, RoleView, ScopedRoleAssignment, SecretBearer,
+    WorkloadFamily, WorkloadKind, WorkloadRestriction,
 };
 pub use wyrd_spec::error::WyrdError;
+pub use wyrd_spec::ids::{AccessGroupId, RoleBindingId};

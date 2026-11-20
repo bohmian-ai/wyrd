@@ -97,7 +97,6 @@ fn actor(tenant: DataTenantId) -> Principal {
         PrincipalId::new(Uuid::now_v7()),
         PrincipalKind::User,
         tenant,
-        Vec::new(),
         PermissionSet::new(),
     )
 }
@@ -414,7 +413,7 @@ async fn execution_count(conn: &mut TenantConn<'_>) -> i64 {
 
 /// The direct accepted authority of `principal`, with no delegation chain.
 fn authority(principal: &Principal) -> AcceptedAuthority {
-    AcceptedAuthority::new(principal, &[])
+    AcceptedAuthority::new(principal, &[]).expect("representable")
 }
 
 /// The accepted authority of the binding owner's family account `principal`.
@@ -426,7 +425,6 @@ fn owner_authority(tenant: DataTenantId, principal: PrincipalId) -> AcceptedAuth
         principal,
         PrincipalKind::Service,
         tenant,
-        Vec::new(),
         PermissionSet::new(),
     ))
 }
@@ -939,6 +937,7 @@ async fn keyed_submissions_replay_conflict_and_scope_to_subject_and_actor() {
 
     let mut pairs = Vec::new();
     for accepted in [through(&alice, &bob), through(&carol, &bob)] {
+        let accepted = accepted.expect("representable");
         let pair = accepted.attribution();
         let keyed = submission(tenant, accepted, original_request.clone(), Some("retry-1"));
         let execution_id = submitted(&queue, &mut conn, &keyed).await;

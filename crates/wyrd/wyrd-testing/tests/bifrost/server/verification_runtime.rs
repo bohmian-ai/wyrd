@@ -2830,7 +2830,6 @@ impl TypedPayloadJourney {
                 PrincipalId::new(uuid::Uuid::now_v7()),
                 PrincipalKind::User,
                 self.gateway.tenant,
-                Vec::new(),
                 PermissionSet::from_iter([permission.clone(), Permission::gateway_payload_read()]),
             ),
             self.gateway.tenant,
@@ -2992,7 +2991,7 @@ async fn queued_subject_authority_survives_restart() -> Result<(), ServerJourney
             &[
                 Permission::card_read(),
                 Permission::verifier_run_any(),
-                Permission::verifier_read_any(),
+                Permission::executions_read_any(),
             ],
         )
         .await?;
@@ -3382,7 +3381,7 @@ impl StatusJourney {
                 &[
                     Permission::card_read(),
                     Permission::verifier_run_any(),
-                    Permission::verifier_read_any(),
+                    Permission::executions_read_any(),
                     Permission::bifrost_query_read(),
                 ],
             )

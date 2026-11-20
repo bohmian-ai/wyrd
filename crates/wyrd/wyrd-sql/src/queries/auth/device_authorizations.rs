@@ -19,7 +19,7 @@ use uuid::Uuid;
 use wyrd_spec::auth::Sha256Hex;
 
 use crate::TenantConn;
-use crate::row_types::auth::HumanConnectionBinding;
+use crate::row_types::auth::HumanLoginAnchor;
 
 /// Drop this tenant's device authorizations that can no longer be redeemed.
 const PURGE_EXPIRED_DEVICE_AUTHORIZATIONS_SQL: &str = r"
@@ -61,7 +61,8 @@ const APPROVE_DEVICE_AUTHORIZATION_SQL: &str = r"
     UPDATE wyrd.auth_device_authorizations
        SET principal_id = $2,
            connection_id = $3,
-           connection_revision = $4
+           connection_revision = $4,
+           password_revision = $5
      WHERE device_id = $1
        AND NOT denied
        AND principal_id IS NULL
@@ -72,7 +73,7 @@ const APPROVE_DEVICE_AUTHORIZATION_SQL: &str = r"
 /// returning its state and whether the previous poll was within the interval.
 const POLL_DEVICE_AUTHORIZATION_SQL: &str = r"
     WITH device AS (
-        SELECT device_id, denied, principal_id, connection_id, connection_revision,
+        SELECT device_id, denied, principal_id, connection_id, connection_revision, password_revision,
                expires_at <= statement_timestamp() AS expired,
                COALESCE(last_polled_at > statement_timestamp() - ($2 * interval '1 second'),
                         false) AS too_fast
@@ -85,7 +86,8 @@ const POLL_DEVICE_AUTHORIZATION_SQL: &str = r"
       FROM device
      WHERE polled.device_id = device.device_id
     RETURNING device.device_id, device.denied, device.principal_id, device.connection_id,
-              device.connection_revision, device.expired, device.too_fast
+              device.connection_revision, device.password_revision, device.expired,
+              device.too_fast
 ";
 
 /// Delete the device authorization with this id and any login state still
@@ -112,8 +114,11 @@ pub struct DevicePoll {
     pub principal_id: Option<Uuid>,
     /// The connection id that sign-in went through, set with `principal_id`.
     pub connection_id: Option<Uuid>,
-    /// That connection's revision, set with `principal_id`.
+    /// That connection's revision, set with `connection_id`.
     pub connection_revision: Option<i64>,
+    /// The local password revision a local sign-in approved at; set instead
+    /// of the connection columns.
+    pub password_revision: Option<i64>,
     /// The device code has expired.
     pub expired: bool,
     /// The previous poll was less than the interval ago.
@@ -121,24 +126,18 @@ pub struct DevicePoll {
 }
 
 impl DevicePoll {
-    /// The approving principal and the connection revision its sign-in went
+    /// The approving principal and the login anchor its sign-in went
     /// through, once the device authorization is approved.
     #[must_use]
-    pub fn approval(&self) -> Option<(Uuid, HumanConnectionBinding)> {
-        match (
-            self.principal_id,
-            self.connection_id,
-            self.connection_revision,
-        ) {
-            (Some(principal_id), Some(connection_id), Some(connection_revision)) => Some((
-                principal_id,
-                HumanConnectionBinding {
-                    connection_id,
-                    connection_revision,
-                },
-            )),
-            _ => None,
-        }
+    pub fn approval(&self) -> Option<(Uuid, HumanLoginAnchor)> {
+        Some((
+            self.principal_id?,
+            HumanLoginAnchor::from_columns(
+                self.connection_id,
+                self.connection_revision,
+                self.password_revision,
+            )?,
+        ))
     }
 }
 
@@ -206,7 +205,7 @@ pub async fn deny_device_authorization(
 }
 
 /// Record that `principal_id` approved this tenant's device authorization
-/// `device_id` by signing in through `connection`, and return whether it was
+/// `device_id` by signing in through `anchor`, and return whether it was
 /// still unexpired and undecided.
 ///
 /// # Errors
@@ -215,13 +214,14 @@ pub async fn approve_device_authorization(
     conn: &mut TenantConn<'_>,
     device_id: Uuid,
     principal_id: Uuid,
-    connection: HumanConnectionBinding,
+    anchor: HumanLoginAnchor,
 ) -> Result<bool, sqlx::Error> {
     let updated = sqlx::query(APPROVE_DEVICE_AUTHORIZATION_SQL)
         .bind(device_id)
         .bind(principal_id)
-        .bind(connection.connection_id)
-        .bind(connection.connection_revision)
+        .bind(anchor.connection().map(|c| c.connection_id))
+        .bind(anchor.connection().map(|c| c.connection_revision))
+        .bind(anchor.password_revision())
         .execute(&mut **conn.transaction())
         .await?;
     Ok(updated.rows_affected() == 1)

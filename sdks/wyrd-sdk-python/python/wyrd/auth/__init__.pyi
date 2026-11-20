@@ -5,36 +5,6 @@ from ..client import WyrdClient
 PrincipalKind: TypeAlias = Literal["user", "service"]
 """The kind of an assignable principal."""
 
-RoleSource: TypeAlias = Literal["idp", "direct"]
-"""Where a Role assignment comes from: the identity provider at login, or a
-tenant administrator's direct grant."""
-
-class RoleAssignment(TypedDict):
-    """One Role a principal holds and its source."""
-
-    role: str
-    source: RoleSource
-
-class PrincipalRoles(TypedDict):
-    """A principal's Role assignments, ordered by Role and then source."""
-
-    principal_id: str
-    kind: PrincipalKind
-    roles: list[RoleAssignment]
-
-class RoleAssignmentChange(TypedDict):
-    """The outcome of a direct grant or revoke.
-
-    ``changed`` is ``False`` when the assignment already matched; ``roles`` is
-    the principal's complete resulting assignment set.
-    """
-
-    principal_id: str
-    kind: PrincipalKind
-    role: str
-    changed: bool
-    roles: list[RoleAssignment]
-
 class Unrestricted(TypedDict):
     """No workload-family limit."""
 
@@ -52,6 +22,175 @@ class FamilyRestriction(TypedDict):
 
 WorkloadRestriction: TypeAlias = Unrestricted | FamilyRestriction
 """A Service account's workload restriction."""
+
+class CardFamilyScope(TypedDict):
+    """Every version of one Card family."""
+
+    kind: str
+    name: str
+
+class CardVersionScope(TypedDict):
+    """One exact Card version, with its trusted family."""
+
+    kind: str
+    name: str
+    uid: str
+
+class _CardFamily(TypedDict):
+    family: CardFamilyScope
+
+class _CardVersion(TypedDict):
+    version: CardVersionScope
+
+class CardScope(TypedDict):
+    """A binding scope over one Card family or exact version."""
+
+    card: _CardFamily | _CardVersion
+
+PermissionScope: TypeAlias = Literal["all"] | CardScope | dict[str, object]
+"""The objects a binding reaches: ``"all"`` for the whole tenant, a
+``CardScope``, or a Bifrost, gateway, GitHub connection, or tool scope as the
+wire contract spells it."""
+
+class ScopedRoleAssignment(TypedDict):
+    """One role and the explicit scope it is granted at."""
+
+    role: str
+    scope: PermissionScope
+
+class Operation(TypedDict):
+    """One resource action a role bundles; roles carry no scope."""
+
+    resource: str
+    action: str
+
+class Permission(TypedDict):
+    """One compiled permission: an operation at a scope."""
+
+    resource: str
+    action: str
+    scope: PermissionScope
+
+class _PrincipalSubject(TypedDict):
+    id: str
+    kind: PrincipalKind
+
+class PrincipalBindingSubject(TypedDict):
+    """A binding on one account."""
+
+    principal: _PrincipalSubject
+
+class _GroupSubject(TypedDict):
+    id: str
+
+class GroupBindingSubject(TypedDict):
+    """A binding on one local group."""
+
+    group: _GroupSubject
+
+BindingSubject: TypeAlias = PrincipalBindingSubject | GroupBindingSubject
+"""The account or group a binding is on."""
+
+RoleSource: TypeAlias = Literal["idp", "direct"]
+"""Where a binding comes from: the identity provider at login, or a tenant
+administrator."""
+
+class DirectGrant(TypedDict):
+    """A binding on the account itself."""
+
+    kind: Literal["direct"]
+
+class ProviderGrant(TypedDict):
+    """A binding the identity provider's login projected onto the account."""
+
+    kind: Literal["provider"]
+
+class GroupGrant(TypedDict):
+    """A binding on a group the account belongs to."""
+
+    kind: Literal["group"]
+    id: str
+    name: str
+
+GrantSource: TypeAlias = DirectGrant | ProviderGrant | GroupGrant
+"""How an account receives one grant."""
+
+class CreateRoleBindingRequest(TypedDict):
+    """Bind ``role`` at ``scope`` to ``subject``."""
+
+    subject: BindingSubject
+    role: str
+    scope: PermissionScope
+
+class RoleBinding(TypedDict):
+    """One binding and the permissions it compiles to."""
+
+    id: str
+    subject: BindingSubject
+    role: str
+    scope: PermissionScope
+    source: RoleSource
+    permissions: list[Permission]
+
+class RoleBindingList(TypedDict):
+    """Bindings ordered by id."""
+
+    bindings: list[RoleBinding]
+
+class AccessGrant(TypedDict):
+    """One binding an account receives, by any source."""
+
+    binding_id: str
+    role: str
+    scope: PermissionScope
+    source: GrantSource
+    permissions: list[Permission]
+
+class AccessSummary(TypedDict):
+    """One account's current access and its sources."""
+
+    principal_id: str
+    kind: PrincipalKind
+    status: str
+    workload_restriction: NotRequired[WorkloadRestriction]
+    grants: list[AccessGrant]
+    permissions: list[Permission]
+
+class Role(TypedDict):
+    """One role and the operations it bundles."""
+
+    id: str
+    name: str
+    operations: list[Operation]
+    builtin: bool
+
+class RoleList(TypedDict):
+    """Roles ordered by name."""
+
+    roles: list[Role]
+
+class PutRoleRequest(TypedDict):
+    """A custom role's complete operation set."""
+
+    operations: list[Operation]
+
+class GroupMember(TypedDict):
+    """One account in a group."""
+
+    principal_id: str
+    kind: PrincipalKind
+
+class Group(TypedDict):
+    """One local group and its members."""
+
+    id: str
+    name: str
+    members: list[GroupMember]
+
+class GroupList(TypedDict):
+    """Groups ordered by name."""
+
+    groups: list[Group]
 
 class PrincipalSummary(TypedDict):
     """One assignable principal; ``email`` is set for users and ``name`` for
@@ -79,11 +218,11 @@ class _CreateServicePrincipalOptional(TypedDict, total=False):
     workload_restriction: WorkloadRestriction | None
 
 class CreateServicePrincipalRequest(_CreateServicePrincipalOptional):
-    """Create a Service account holding ``roles``; omitting
+    """Create a Service account bound to ``assignments``; omitting
     ``workload_restriction`` makes it unrestricted."""
 
     name: str
-    roles: list[str]
+    assignments: list[ScopedRoleAssignment]
 
 class CreateServicePrincipalResponse(TypedDict):
     """The created principal and its first plaintext credential, returned once."""
@@ -334,49 +473,171 @@ class Principals:
         """
         ...
 
-    def roles(self, principal_id: str) -> PrincipalRoles:
-        """A principal's Role assignments.
+    def access(self, principal_id: str) -> AccessSummary:
+        """One account's bindings, their sources, and compiled permissions.
 
         Args:
-            principal_id: the principal to read.
+            principal_id: the account to read.
 
         Raises:
             WyrdError: ``WYRD_PERMISSION_403_DENIED_RBAC`` without
                 ``service_accounts:write``;
-                ``WYRD_AUTH_404_PRINCIPAL_NOT_FOUND`` for a principal that is
+                ``WYRD_AUTH_404_PRINCIPAL_NOT_FOUND`` for an account that is
                 not assignable.
 
         """
         ...
 
-    def grant_role(self, principal_id: str, role: str) -> RoleAssignmentChange:
-        """Idempotently grant a direct Role.
-
-        Args:
-            principal_id: the principal to grant to.
-            role: the built-in or custom Role name.
+    def roles(self) -> RoleList:
+        """Every role and the operations it bundles.
 
         Raises:
-            WyrdError: ``WYRD_PERMISSION_403_DENIED_RBAC`` unless the caller is
-                a tenant administrator;
-                ``WYRD_AUTH_404_PRINCIPAL_NOT_FOUND`` for a principal that is
-                not assignable, or a validation error for an unknown Role.
+            WyrdError: ``WYRD_PERMISSION_403_DENIED_RBAC`` without
+                ``service_accounts:write``.
 
         """
         ...
 
-    def revoke_role(self, principal_id: str, role: str) -> RoleAssignmentChange:
-        """Idempotently revoke a direct Role; identity-provider assignments stay.
+    def put_role(self, role: str, request: PutRoleRequest) -> Role:
+        """Create or replace a custom role; built-in roles are read-only.
 
         Args:
-            principal_id: the principal to revoke from.
-            role: the Role name.
+            role: the custom role name.
+            request: the operations the role bundles.
+
+        Raises:
+            WyrdError: ``WYRD_PERMISSION_403_DENIED_RBAC`` unless the caller is
+                a tenant administrator, or a validation error for a built-in
+                or empty role.
+
+        """
+        ...
+
+    def delete_role(self, role: str) -> Role:
+        """Delete a custom role no binding uses.
+
+        Args:
+            role: the custom role name.
+
+        Raises:
+            WyrdError: ``WYRD_PERMISSION_403_DENIED_RBAC`` unless the caller is
+                a tenant administrator, or a validation error for a built-in,
+                unknown, or still-bound role.
+
+        """
+        ...
+
+    def bindings(
+        self,
+        *,
+        principal_id: str | None = None,
+        group_id: str | None = None,
+        role: str | None = None,
+    ) -> RoleBindingList:
+        """Bindings matching exact filters, ordered by id.
+
+        Args:
+            principal_id: only bindings on this account.
+            group_id: only bindings on this group.
+            role: only bindings of this role.
+
+        Raises:
+            WyrdError: ``WYRD_PERMISSION_403_DENIED_RBAC`` without
+                ``service_accounts:write``.
+
+        """
+        ...
+
+    def bind(self, request: CreateRoleBindingRequest) -> RoleBinding:
+        """Idempotently bind a role at an explicit scope; a repeat returns the same binding.
+
+        Args:
+            request: the subject, role, and scope.
 
         Raises:
             WyrdError: ``WYRD_PERMISSION_403_DENIED_RBAC`` unless the caller is
                 a tenant administrator;
-                ``WYRD_AUTH_404_PRINCIPAL_NOT_FOUND`` for a principal that is
-                not assignable, or a validation error for an unknown Role.
+                ``WYRD_AUTH_404_PRINCIPAL_NOT_FOUND`` for an account that is
+                not assignable, or a validation error for an unknown role or a
+                scope the role cannot use.
+
+        """
+        ...
+
+    def unbind(self, binding_id: str) -> RoleBinding:
+        """Remove one directly administered binding; other bindings keep their authority.
+
+        Args:
+            binding_id: the binding to remove.
+
+        Raises:
+            WyrdError: ``WYRD_PERMISSION_403_DENIED_RBAC`` unless the caller is
+                a tenant administrator, or a not-found error for an unknown or
+                identity-provider binding.
+
+        """
+        ...
+
+    def groups(self) -> GroupList:
+        """Every local group and its members.
+
+        Raises:
+            WyrdError: ``WYRD_PERMISSION_403_DENIED_RBAC`` without
+                ``service_accounts:write``.
+
+        """
+        ...
+
+    def create_group(self, name: str) -> Group:
+        """Create an empty local group.
+
+        Args:
+            name: the tenant-unique group name.
+
+        Raises:
+            WyrdError: ``WYRD_PERMISSION_403_DENIED_RBAC`` unless the caller is
+                a tenant administrator, or a validation error for a taken name.
+
+        """
+        ...
+
+    def delete_group(self, group_id: str) -> Group:
+        """Delete a local group with its memberships and bindings.
+
+        Args:
+            group_id: the group to delete.
+
+        Raises:
+            WyrdError: ``WYRD_PERMISSION_403_DENIED_RBAC`` unless the caller is
+                a tenant administrator, or a not-found error.
+
+        """
+        ...
+
+    def add_group_member(self, group_id: str, principal_id: str) -> Group:
+        """Add an account to a local group.
+
+        Args:
+            group_id: the group.
+            principal_id: the account to add.
+
+        Raises:
+            WyrdError: ``WYRD_PERMISSION_403_DENIED_RBAC`` unless the caller is
+                a tenant administrator, or a not-found error.
+
+        """
+        ...
+
+    def remove_group_member(self, group_id: str, principal_id: str) -> Group:
+        """Remove an account from a local group.
+
+        Args:
+            group_id: the group.
+            principal_id: the account to remove.
+
+        Raises:
+            WyrdError: ``WYRD_PERMISSION_403_DENIED_RBAC`` unless the caller is
+                a tenant administrator, or a not-found error.
 
         """
         ...

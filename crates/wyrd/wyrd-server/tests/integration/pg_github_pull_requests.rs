@@ -2038,13 +2038,13 @@ async fn pull_request_inspection_requires_repository_read() {
     assert_eq!(deployment.send(30, "opened").await.0, StatusCode::ACCEPTED);
     let execution = deployment.settled(30..=30).await[0].execution_id;
     server
-        .seed_role("pr_verifier_only", &[Permission::verifier_read_any()])
+        .seed_role("pr_verifier_only", &[Permission::executions_read_any()])
         .await
         .expect("role seeds");
     server
         .seed_role(
             "pr_verifier_and_repository",
-            &[Permission::verifier_read_any(), Permission::card_read()],
+            &[Permission::executions_read_any(), Permission::card_read()],
         )
         .await
         .expect("role seeds");
@@ -2884,7 +2884,7 @@ async fn retained_reads_resolve_current_and_history_membership() {
     ] {
         let mut grants = vec![
             wyrd_runtime::Permission::card_read(),
-            wyrd_runtime::Permission::verifier_read_any(),
+            wyrd_runtime::Permission::executions_read_any(),
         ];
         grants.extend(query);
         deployment

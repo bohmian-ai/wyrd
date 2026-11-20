@@ -17,7 +17,7 @@ use uuid::Uuid;
 use wyrd_crypt::{SealingKeyring, SecretKey};
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_gateway::{CredentialAssignment, CredentialError, ManagedSecretBinding};
-use wyrd_runtime::{Permission, PermissionSet, Principal, PrincipalId, PrincipalKind, RoleRef};
+use wyrd_runtime::{Permission, PermissionSet, Principal, PrincipalId, PrincipalKind};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::GatewayAccess;
 use wyrd_spec::error::WyrdError;
@@ -157,7 +157,6 @@ pub(super) fn caller(
             PrincipalId::new(Uuid::nil()),
             PrincipalKind::User,
             tenant,
-            Vec::<RoleRef>::new(),
             PermissionSet::from_iter(permissions),
         ),
         request_id: RequestId::now_v7(),

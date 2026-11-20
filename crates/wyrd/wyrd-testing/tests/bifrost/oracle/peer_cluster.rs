@@ -600,7 +600,6 @@ impl PeerCluster {
             wyrd_spec::auth::PrincipalId::new(uuid::Uuid::now_v7()),
             wyrd_runtime::principal::PrincipalKind::User,
             tenant,
-            Vec::new(),
             wyrd_runtime::PermissionSet::new(),
         );
         scribe
@@ -1675,7 +1674,6 @@ async fn drive_sql(
         wyrd_spec::auth::PrincipalId::new(uuid::Uuid::now_v7()),
         wyrd_runtime::PrincipalKind::User,
         tenant,
-        Vec::new(),
         wyrd_runtime::permission::PermissionSet::from_iter([permission.clone()]),
     );
     let context = vala_bifrost_redux::oracle::AuthorizedQueryContext::try_new(

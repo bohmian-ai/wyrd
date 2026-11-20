@@ -421,7 +421,6 @@ mod tests {
                 PrincipalId::new(uuid::Uuid::now_v7()),
                 PrincipalKind::User,
                 tenant,
-                Vec::new(),
                 PermissionSet::from_iter(permissions),
             ),
             request_id: RequestId::now_v7(),

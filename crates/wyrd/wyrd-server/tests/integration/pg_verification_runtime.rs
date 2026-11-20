@@ -6038,8 +6038,7 @@ async fn accepted_authority_survives_account_and_context_changes() {
         !frozen
             .principal
             .effective_permissions
-            .iter()
-            .any(|permission| *permission == wyrd_runtime::Permission::wildcard()),
+            .contains(&wyrd_runtime::Permission::wildcard()),
         "the User's admin wildcard never passes the actor's roles"
     );
 

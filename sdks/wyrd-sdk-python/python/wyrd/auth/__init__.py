@@ -1,14 +1,18 @@
-"""Tenant principals: discovery, credentials, and direct Role assignment.
+"""Tenant principals: discovery, credentials, and scoped role bindings.
 
 The server authorizes and audits every call; this handle only calls it::
 
     principals = Principals()
     page = principals.list(email="ada@example.com")
     user = page["principals"][0]["principal_id"]
-    principals.grant_role(user, "editor")
+    principals.bind({
+        "subject": {"principal": {"id": user, "kind": "user"}},
+        "role": "editor",
+        "scope": "all",
+    })
 
-A Role change reaches the principal at its next token. Identity-provider
-assignments are owned by login; ``revoke_role`` removes only direct grants.
+A binding change reaches the account at its next request. Identity-provider
+bindings are owned by login; ``unbind`` removes only direct bindings.
 """
 
 from .._wyrd.auth import Principals

@@ -52,13 +52,13 @@ use wyrd_server::verification::hosted::workspace::Workspaces;
 use wyrd_server::verification::telemetry::{Envelopes, ExecutionMode};
 use wyrd_server::verification::{RuntimeLimits, VerificationRuntime};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{Attribution, PrincipalId, Sha256Hex};
+use wyrd_spec::auth::{Attribution, CardPermissionScope, PrincipalId, Sha256Hex};
 use wyrd_spec::card::agent::{AgentRunConfigSpec, AgentSpec, BuiltinTool, ExecutionRoute};
 use wyrd_spec::card::verifier::{
     Action, AgentCall, Check, CodeCall, CodeCheck, CodeRuntime, CodeSource, VerifierSpec,
 };
 use wyrd_spec::envelope::CardKind;
-use wyrd_spec::ids::{CardUid, SlotName};
+use wyrd_spec::ids::{CardName, CardUid, SlotName};
 use wyrd_spec::reference::{CardRef, InlineableRef, Ref};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::verification::TaskId;
@@ -218,7 +218,6 @@ pub(crate) fn user(
             PrincipalId::new(uuid::Uuid::now_v7()),
             PrincipalKind::User,
             tenant,
-            Vec::new(),
             PermissionSet::from_iter(permissions),
         ),
         request_id: RequestId::now_v7(),
@@ -990,7 +989,6 @@ async fn recovered_authority_bounds_every_agent_tool() {
         PrincipalId::new(uuid::Uuid::now_v7()),
         PrincipalKind::User,
         tenant,
-        Vec::new(),
         PermissionSet::from_iter([
             Permission::tool_invoke_any(),
             Permission::card_read(),
@@ -1001,7 +999,6 @@ async fn recovered_authority_bounds_every_agent_tool() {
         PrincipalId::new(uuid::Uuid::now_v7()),
         PrincipalKind::User,
         tenant,
-        Vec::new(),
         PermissionSet::from_iter([Permission::bifrost_query_read()]),
     );
     let authority = AcceptedAuthority::new(
@@ -1010,7 +1007,10 @@ async fn recovered_authority_bounds_every_agent_tool() {
             principal: PrincipalRef::from_principal(&initiator),
         }],
     );
-    let caller = Caller::accepted(&authority, PrincipalId::new(uuid::Uuid::now_v7()));
+    let caller = Caller::accepted(
+        &authority.expect("the delegated authority accepts"),
+        PrincipalId::new(uuid::Uuid::now_v7()),
+    );
 
     let limits = HostedLimits {
         monty_min_workers: 0,
@@ -1261,7 +1261,7 @@ async fn card_resolution_is_the_verifier_run() {
     };
     let agent = exact("Agent", "reviewer", Some(&uid));
     let prompt = exact("Prompt", "reviewer-prompt", None);
-    let verifier = CardUid::from_uuid(uuid::Uuid::now_v7()).expect("uid");
+    let verifier = stand_in_verifier();
     let registry =
         |caller: Option<Caller>| TenantRegistry::new(state.clone(), caller, verifier.clone());
     let runner = user(tenant, [Permission::verifier_run(verifier.clone())]);
@@ -1770,7 +1770,7 @@ async fn artifact_evidence_is_admitted_against_its_slot_and_the_combined_limit()
         let (caller, state) = (&caller, registered.server.state());
         async move {
             let routes = BTreeMap::new();
-            let verifier = CardUid::from_uuid(uuid::Uuid::now_v7()).expect("uid");
+            let verifier = stand_in_verifier();
             blocks
                 .engine(
                     state,
@@ -2072,7 +2072,11 @@ async fn deleted_agent_definition_errors_queued_execution_as_unavailable() {
         let runner = seed
             .clone()
             .with_actor_permissions(PermissionSet::from_iter([Permission::verifier_run(
-                verifier.clone(),
+                CardPermissionScope::version(
+                    CardKind::Verifier,
+                    CardName::new(format!("{name}-verifier")).expect("name"),
+                    verifier.clone(),
+                ),
             )]));
         executions.push(
             runner
@@ -3121,4 +3125,17 @@ async fn code_shutdown_settles_pending_host_work() {
         .await
         .expect_err("a closed sandbox admits nothing");
     assert!(matches!(refused, BlockError::Busy { .. }), "{refused}");
+}
+
+/// The exact scope of a Verifier the registry is never asked to load, so a
+/// definition check authorizes against it alone.
+///
+/// # Panics
+/// Panics when a `UUIDv7` is not a Card UID.
+fn stand_in_verifier() -> CardPermissionScope {
+    CardPermissionScope::version(
+        CardKind::Verifier,
+        CardName::new("stand-in").expect("name"),
+        CardUid::from_uuid(uuid::Uuid::now_v7()).expect("uid"),
+    )
 }

@@ -294,7 +294,7 @@ def runtime_account(name: str, client: WyrdClient | None = None) -> tuple[str, s
     created = principals.create_service_principal(
         {
             "name": account,
-            "roles": ["workload"],
+            "assignments": [{"role": "workload", "scope": "all"}],
             "workload_restriction": {"mode": "family", "kind": "Service", "name": name},
         }
     )

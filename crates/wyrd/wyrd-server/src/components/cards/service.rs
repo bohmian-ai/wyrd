@@ -2577,7 +2577,6 @@ pub(crate) fn reconciliation_caller(tenant_id: DataTenantId) -> Caller {
             PLATFORM_AUDIT_PRINCIPAL,
             PrincipalKind::User,
             tenant_id,
-            Vec::new(),
             PermissionSet::new(),
         ),
         request_id: RequestId::now_v7(),

@@ -6111,7 +6111,6 @@ async fn tenant_scoped_cut_is_one_statement_and_one_bounded_retry() -> Result<()
         PrincipalId::new(uuid::Uuid::now_v7()),
         PrincipalKind::User,
         tenant,
-        Vec::new(),
         PermissionSet::from_iter([scoped]),
     );
     // The action permission is tenant-wide, exactly as the public query

@@ -21,9 +21,9 @@ mod pg_tests {
         ApiKeyStatus, api_key_by_prefix, api_key_status_by_prefix, credential_belongs_to,
         delete_service_account, family_account_id, insert_api_key, insert_refresh_token,
         insert_role, insert_service_account, insert_user, list_api_key_metadata,
-        list_service_account_roles, list_user_roles, provision_system_principal,
-        replace_idp_user_roles, service_account_by_id, set_workload_restriction,
-        suspend_service_account_principal, system_principal_id, tenant_admin_principal_id,
+        list_role_bindings, provision_system_principal, replace_idp_user_bindings,
+        service_account_by_id, set_workload_restriction, suspend_service_account_principal,
+        system_principal_id, tenant_admin_principal_id,
     };
     use wyrd_sql::queries::platform::credentials::{
         insert_platform_credential_tx, list_platform_credentials, platform_credential_by_prefix,
@@ -806,7 +806,7 @@ mod pg_tests {
         insert_role(&mut conn, role_a, "rls-probe", &permissions, false)
             .await
             .expect("A role inserts");
-        replace_idp_user_roles(&mut conn, user, &["rls-probe"])
+        replace_idp_user_bindings(&mut conn, user, &["rls-probe"])
             .await
             .expect("A replaces roles against its own role");
         assert_eq!(
@@ -825,26 +825,22 @@ mod pg_tests {
                 .await
                 .expect("A checks ownership")
         );
+        let bindings = list_role_bindings(&mut conn)
+            .await
+            .expect("A lists bindings");
+        assert_eq!(bindings.len(), 1);
         assert_eq!(
-            list_user_roles(&mut conn, user)
-                .await
-                .expect("A lists roles"),
-            ["rls-probe"]
+            bindings[0].role_id, role_a,
+            "the shared role name binds A's role only"
         );
-        let bound: Uuid =
-            sqlx::query_scalar("SELECT role_id FROM wyrd.auth_user_roles WHERE user_id = $1")
-                .bind(user)
-                .fetch_one(&mut **conn.transaction())
-                .await
-                .expect("A binding reads");
-        assert_eq!(bound, role_a, "the shared role name binds A's role only");
-        replace_idp_user_roles(&mut conn, user, &[])
+        assert_eq!(bindings[0].subject.user_id, Some(user));
+        replace_idp_user_bindings(&mut conn, user, &[])
             .await
             .expect("A clears roles");
         assert!(
-            list_user_roles(&mut conn, user)
+            list_role_bindings(&mut conn)
                 .await
-                .expect("A lists roles")
+                .expect("A lists bindings")
                 .is_empty()
         );
         conn.commit().await.expect("A commits");
@@ -921,10 +917,11 @@ mod pg_tests {
             assert_eq!(row.get::<Option<String>, _>(column), None, "{column}");
         }
         assert!(
-            list_service_account_roles(&mut conn, first)
+            list_role_bindings(&mut conn)
                 .await
-                .expect("roles read")
-                .is_empty()
+                .expect("bindings read")
+                .iter()
+                .all(|binding| binding.subject.service_account_id != Some(first))
         );
         assert!(
             list_api_key_metadata(&mut conn, first)

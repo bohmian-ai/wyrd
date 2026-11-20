@@ -10,6 +10,7 @@ import { expect, vi } from "vitest";
 import { z } from "zod";
 
 import { Bifrost, Cards, Principals, WyrdClient, WyrdState } from "wyrd-ai";
+import type { AccessSummary, CreateRoleBindingRequest, PrincipalKind } from "wyrd-ai";
 
 import { observedServiceTest as test } from "../support/observed-service.js";
 import { declared, fixture, runtimeAccount } from "../support/server.js";
@@ -30,8 +31,21 @@ const KEY_REFUSED = { code: "WYRD_AUTH_401_API_KEY_INVALID" };
 
 /** Create the unrestricted Service account `name` holding only `workload`; its principal id and key. */
 async function issue(name: string): Promise<{ principal: string; key: string }> {
-  const created = await (await Principals.connect()).createServicePrincipal({ name, roles: ["workload"] });
+  const created = await (await Principals.connect()).createServicePrincipal({
+    name,
+    assignments: [{ role: "workload", scope: "all" }],
+  });
   return { principal: created.principal_id, key: created.credential };
+}
+
+/** A request binding `role` tenant-wide to one account. */
+function bindAll(id: string, kind: PrincipalKind, role: string): CreateRoleBindingRequest {
+  return { subject: { principal: { id, kind } }, role, scope: "all" };
+}
+
+/** Each grant's role and source kind, in the summary's order. */
+function grants(access: AccessSummary): [string, string][] {
+  return access.grants.map((grant) => [grant.role, grant.source.kind]);
 }
 
 /** Register `AUTHORED` through a fresh client, so it carries the key's next token. */
@@ -39,38 +53,40 @@ async function author(key: string): Promise<unknown> {
   return (await Cards.connect({ client: WyrdClient.connect({ credential: key }) })).declareFromPath(AUTHORED);
 }
 
-test("granted editor reaches the next token until revoked", async ({ bundle: _ }) => {
+test("bound editor reaches the next request until unbound", async ({ bundle: _ }) => {
   const { principal, key } = await issue("granted-editor");
   const principals = await Principals.connect();
 
   const [found] = (await principals.list({ kind: "service", name: "granted-editor" })).principals;
   expect(found?.principal_id).toBe(principal);
   expect(found?.workload_restriction).toEqual({ mode: "unrestricted" });
-  expect((await principals.roles(principal)).roles).toEqual([{ role: "workload", source: "direct" }]);
+  expect(grants(await principals.access(principal))).toEqual([["workload", "direct"]]);
   const reader = await Bifrost.connect({ client: WyrdClient.connect({ credential: key }) });
   expect((await reader.sql(TENANT_WIDE)).numRows).toBe(1);
   await reader.shutdown();
   await expect(author(key)).rejects.toMatchObject(DENIED);
 
-  const granted = await principals.grantRole(principal, "editor");
-  expect(granted.changed).toBe(true);
-  expect(granted.roles).toEqual([
-    { role: "editor", source: "direct" },
-    { role: "workload", source: "direct" },
+  const granted = await principals.bind(bindAll(principal, "service", "editor"));
+  expect(granted.scope).toBe("all");
+  expect((await principals.bind(bindAll(principal, "service", "editor"))).id).toBe(granted.id);
+  expect(grants(await principals.access(principal))).toEqual([
+    ["editor", "direct"],
+    ["workload", "direct"],
   ]);
-  expect((await principals.grantRole(principal, "editor")).changed).toBe(false);
   await author(key);
 
-  expect((await principals.revokeRole(principal, "editor")).changed).toBe(true);
+  await principals.unbind(granted.id);
+  expect(grants(await principals.access(principal))).toEqual([["workload", "direct"]]);
   await expect(author(key)).rejects.toMatchObject(DENIED);
 });
 
 test("only a tenant admin assigns roles", async ({ bundle: _ }) => {
   const { principal, key } = await issue("own-roles");
+  const [workload] = (await (await Principals.connect()).access(principal)).grants;
   const own = await Principals.connect({ client: WyrdClient.connect({ credential: key }) });
 
-  await expect(own.grantRole(principal, "editor")).rejects.toMatchObject(DENIED);
-  await expect(own.revokeRole(principal, "workload")).rejects.toMatchObject(DENIED);
+  await expect(own.bind(bindAll(principal, "service", "editor"))).rejects.toMatchObject(DENIED);
+  await expect(own.unbind(workload?.binding_id ?? "")).rejects.toMatchObject(DENIED);
 });
 
 test("direct and idp user assignments coexist", async ({ server }) => {
@@ -82,15 +98,13 @@ test("direct and idp user assignments coexist", async ({ server }) => {
   expect(page.next).toBeNull();
   expect(page.principals[0]?.workload_restriction).toBeNull();
 
-  const granted = await principals.grantRole(user, "viewer");
-  expect(granted.changed).toBe(true);
-  expect(granted.roles).toEqual([
-    { role: "viewer", source: "direct" },
-    { role: "viewer", source: "idp" },
+  const granted = await principals.bind(bindAll(user, "user", "viewer"));
+  expect(grants(await principals.access(user))).toEqual([
+    ["viewer", "direct"],
+    ["viewer", "provider"],
   ]);
-  const revoked = await principals.revokeRole(user, "viewer");
-  expect(revoked.changed).toBe(true);
-  expect(revoked.roles).toEqual([{ role: "viewer", source: "idp" }]);
+  await principals.unbind(granted.id);
+  expect(grants(await principals.access(user))).toEqual([["viewer", "provider"]]);
 });
 
 test("users manage personal keys", async ({ server }) => {

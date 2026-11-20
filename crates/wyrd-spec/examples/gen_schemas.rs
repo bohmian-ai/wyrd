@@ -13,10 +13,11 @@ use std::path::Path;
 use schemars::SchemaGenerator;
 use serde_json::{Map, Value, json, to_string_pretty};
 use wyrd_spec::auth::{
-    AbsoluteUrl, CallbackQuery, CreateServicePrincipalRequest, CreateServicePrincipalResponse,
-    CredentialListQuery, CredentialListResponse, CurrentUserProfile, GatewayAccess,
-    IssuedCredential, IssuerUrl, LoginInitResponse, PrincipalKindTag, PrincipalPage,
-    PrincipalQuery, PrincipalRoles, RevokePrincipalRequest, RoleAssignmentChange, TokenAudience,
+    AbsoluteUrl, AccessSummary, CallbackQuery, CreateGroupRequest, CreateRoleBindingRequest,
+    CreateServicePrincipalRequest, CreateServicePrincipalResponse, CredentialListQuery,
+    CredentialListResponse, CurrentUserProfile, GatewayAccess, GroupList, IssuedCredential,
+    IssuerUrl, LoginInitResponse, PrincipalKindTag, PrincipalPage, PrincipalQuery, PutRoleRequest,
+    RevokePrincipalRequest, RoleBindingList, RoleBindingQuery, RoleList, TokenAudience,
     TokenRequest, TokenResponse,
 };
 use wyrd_spec::card::agent::AgentSpec;
@@ -269,8 +270,14 @@ fn contracts() -> Value {
         CredentialListResponse,
         CredentialListQuery,
         CurrentUserProfile,
-        PrincipalRoles,
-        RoleAssignmentChange,
+        AccessSummary,
+        CreateRoleBindingRequest,
+        RoleBindingList,
+        RoleBindingQuery,
+        RoleList,
+        PutRoleRequest,
+        GroupList,
+        CreateGroupRequest,
         PrincipalPage,
         PrincipalQuery,
         SecretRef,

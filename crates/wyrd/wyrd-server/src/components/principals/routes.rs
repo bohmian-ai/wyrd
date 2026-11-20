@@ -23,24 +23,21 @@ use secrecy::ExposeSecret;
 use std::fmt::Display;
 use uuid::Uuid;
 use wyrd_auth::issue_api_key::WyrdApiKey;
-use wyrd_runtime::{Permission, RoleRef};
+use wyrd_runtime::Permission;
 use wyrd_spec::auth::{
     Attribution, CreateServicePrincipalRequest, CreateServicePrincipalResponse,
     CreateUserCredentialRequest, CredentialListQuery, CredentialListResponse, CredentialMetadata,
-    IssuedCredential, PrincipalId, PrincipalKindTag, PrincipalPage, PrincipalQuery, PrincipalRoles,
-    PrincipalStatus, PrincipalSummary, RoleAssignment, RoleAssignmentChange, RoleSource,
-    SecretBearer, WorkloadFamily, WorkloadRestriction,
+    IssuedCredential, PrincipalId, PrincipalKindTag, PrincipalPage, PrincipalQuery,
+    PrincipalStatus, PrincipalSummary, SecretBearer, WorkloadFamily, WorkloadRestriction,
 };
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::vala::api::AuditOutcome;
 use wyrd_sql::SqlError;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
-    ApiKeyMetadataRow, AssignablePrincipalRow, PrincipalFilter, assignable_principal,
-    credential_belongs_to, grant_role_to_service_account, grant_role_to_user, insert_api_key,
-    insert_service_account, list_api_key_metadata, list_assignable_principals,
-    list_service_account_roles, list_user_role_assignments, revoke_api_key,
-    revoke_role_from_service_account, revoke_role_from_user, role_by_name, service_account_by_id,
+    ApiKeyMetadataRow, AssignablePrincipalRow, PrincipalFilter, SubjectColumns,
+    assignable_principal, credential_belongs_to, insert_api_key, insert_service_account,
+    list_api_key_metadata, list_assignable_principals, revoke_api_key, service_account_by_id,
     set_workload_restriction, user_by_id,
 };
 
@@ -76,8 +73,26 @@ pub fn principals_router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(crate::auth::revoke::revoke_principal))
         .routes(routes!(list_principals, create_service_principal))
-        .routes(routes!(list_principal_roles))
-        .routes(routes!(grant_principal_role, revoke_principal_role))
+        .routes(routes!(super::access::principal_access))
+        .routes(routes!(super::access::list_access_roles))
+        .routes(routes!(
+            super::access::put_access_role,
+            super::access::delete_access_role
+        ))
+        .routes(routes!(
+            super::access::list_access_bindings,
+            super::access::create_access_binding
+        ))
+        .routes(routes!(super::access::delete_access_binding))
+        .routes(routes!(
+            super::access::list_access_groups,
+            super::access::create_access_group
+        ))
+        .routes(routes!(super::access::delete_access_group))
+        .routes(routes!(
+            super::access::add_access_group_member,
+            super::access::remove_access_group_member
+        ))
         .routes(routes!(super::accounts::current_user))
         .routes(routes!(super::accounts::create_user))
         .routes(routes!(super::accounts::create_user_invitation))
@@ -110,7 +125,7 @@ fn require_principal_admin(caller: &Caller, action: &str) -> Result<(), WyrdErro
 /// # Errors
 /// Returns [`WyrdError::PermissionDeniedRbac`] when the caller lacks the
 /// permission, and an internal error when the connection cannot be opened.
-async fn authorize<'a>(
+pub(super) async fn authorize<'a>(
     state: &'a AppState,
     caller: &Caller,
     action: &str,
@@ -140,7 +155,7 @@ async fn authorize<'a>(
 ///
 /// # Errors
 /// Returns an internal error when the connection cannot be opened.
-async fn tenant_conn<'a>(
+pub(super) async fn tenant_conn<'a>(
     state: &'a AppState,
     caller: &Caller,
 ) -> Result<TenantConn<'a>, WyrdErrorResponse> {
@@ -277,14 +292,6 @@ async fn create_service_principal(
     request: Result<Json<CreateServicePrincipalRequest>, JsonRejection>,
 ) -> Result<Json<CreateServicePrincipalResponse>, WyrdErrorResponse> {
     let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
-    for role in &request.roles {
-        RoleRef::new(role).map_err(|_| {
-            WyrdErrorResponse::from(WyrdError::Validation {
-                message: "role name is not valid".to_owned(),
-                details: serde_json::json!({ "role": role }),
-            })
-        })?;
-    }
 
     let resource = format!("principal:{}", request.name);
     let family = request
@@ -309,19 +316,15 @@ async fn create_service_principal(
     )
     .await?;
 
-    // Every role is resolved before anything is written. An absent role is a
-    // stable refusal of an evaluated permission, so the decision commits alone
-    // and no tentative principal ever exists to roll back with it.
-    let mut role_ids = Vec::with_capacity(request.roles.len());
-    for role in &request.roles {
-        let Some(row) = role_by_name(&mut conn, role).await.map_err(internal)? else {
-            conn.commit().await.map_err(internal)?;
-            return Err(WyrdErrorResponse::from(WyrdError::Validation {
-                message: "role does not exist in this tenant".to_owned(),
-                details: serde_json::json!({ "role": role }),
-            }));
-        };
-        role_ids.push(row.id);
+    // Every assignment is validated before anything is written. An invalid
+    // one is a stable refusal of an evaluated permission, so the decision
+    // commits alone and no tentative principal ever exists to roll back.
+    if !request.assignments.is_empty()
+        && let Err(error) =
+            wyrd_auth::roles::validate_assignments(&mut conn, &request.assignments).await
+    {
+        conn.commit().await.map_err(internal)?;
+        return Err(WyrdErrorResponse::from(error));
     }
 
     let principal_id = Uuid::now_v7();
@@ -337,10 +340,12 @@ async fn create_service_principal(
     .await
     .map_err(|error| restriction_write_error(error, family))?;
 
-    for role_id in role_ids {
-        grant_role_to_service_account(&mut conn, principal_id, role_id)
-            .await
-            .map_err(internal)?;
+    if !request.assignments.is_empty() {
+        let subject = SubjectColumns {
+            service_account_id: Some(principal_id),
+            ..SubjectColumns::default()
+        };
+        wyrd_auth::roles::bind_assignments(&mut conn, subject, &request.assignments).await?;
     }
 
     let issued = mint_credential(&mut conn, principal_id, caller.attribution()).await?;
@@ -810,160 +815,6 @@ async fn list_principals(
     Ok(Json(PrincipalPage { principals, next }))
 }
 
-/// List one principal's Role assignments and their sources.
-///
-/// # Errors
-/// Returns `WYRD_SPEC_400_VALIDATION` for a malformed id, the RBAC denial
-/// without principal administration, the non-enumerating not-found error for
-/// a principal that is not assignable in this tenant, and an internal error
-/// when the read fails.
-#[utoipa::path(
-    get,
-    path = "/principals/{principal_id}/roles",
-    params(("principal_id" = Uuid, Path, description = "Principal whose Roles to list")),
-    responses(
-        (status = 200, description = "Assignments ordered by Role, then source",
-         body = PrincipalRoles),
-        (status = 400, description = "A path identifier is not a valid UUID \
-          (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
-        (status = 401, description = "The request carried no usable access token \
-          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
-          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
-        (status = 403, description = "Tenant principal administration required \
-          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
-        (status = 404, description = "No assignable principal with this id in the caller's \
-          tenant (WYRD_AUTH_404_PRINCIPAL_NOT_FOUND)", body = WyrdProblem),
-        (status = 500, description = "A tenant store read failed \
-          (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
-        (status = 503, description = "No verifier is configured for the access token (\
-          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
-    ),
-    tag = "Principals"
-)]
-#[tracing::instrument(level = "info", skip(state, caller))]
-async fn list_principal_roles(
-    State(state): State<AppState>,
-    caller: Caller,
-    principal_id: Result<Path<Uuid>, PathRejection>,
-) -> Result<Json<PrincipalRoles>, WyrdErrorResponse> {
-    let Path(principal_id) = principal_id.map_err(|rejection| path_rejection(&rejection))?;
-    let mut conn = authorize(
-        &state,
-        &caller,
-        "list principal roles",
-        "auth.principal.role.list",
-        &format!("principal:{principal_id}"),
-    )
-    .await?;
-    let (principal, kind) = require_assignable(&mut conn, principal_id).await?;
-    let roles = role_assignments(&mut conn, principal.id, kind).await?;
-    conn.commit().await.map_err(internal)?;
-    Ok(Json(PrincipalRoles {
-        principal_id: PrincipalId::new(principal.id),
-        kind,
-        roles,
-    }))
-}
-
-/// Grant a principal a direct Role assignment.
-///
-/// Idempotent: a principal already holding the Role directly is answered with
-/// `changed: false`. A user's `idp` assignment of the same Role is independent
-/// and unaffected. The Role reaches the principal's next token.
-///
-/// # Errors
-/// Returns `WYRD_SPEC_400_VALIDATION` for a malformed id or a Role that does
-/// not exist in the tenant, the RBAC denial without tenant administration,
-/// the non-enumerating not-found error for a principal that is not assignable
-/// in this tenant, and an internal error when the store fails.
-#[utoipa::path(
-    put,
-    path = "/principals/{principal_id}/roles/{role}",
-    params(
-        ("principal_id" = Uuid, Path, description = "Principal to grant the Role to"),
-        ("role" = String, Path, description = "Role to grant directly")
-    ),
-    responses(
-        (status = 200, description = "The principal holds the Role directly",
-         body = RoleAssignmentChange),
-        (status = 400, description = "A path identifier is not a valid UUID, or the Role is \
-          malformed or does not exist in this tenant (WYRD_SPEC_400_VALIDATION)",
-         body = WyrdProblem),
-        (status = 401, description = "The request carried no usable access token \
-          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
-          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
-        (status = 403, description = "Tenant administration required \
-          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
-        (status = 404, description = "No assignable principal with this id in the caller's \
-          tenant (WYRD_AUTH_404_PRINCIPAL_NOT_FOUND)", body = WyrdProblem),
-        (status = 500, description = "A tenant store read or write failed \
-          (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
-        (status = 503, description = "No verifier is configured for the access token (\
-          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
-    ),
-    tag = "Principals"
-)]
-#[tracing::instrument(level = "info", skip(state, caller))]
-async fn grant_principal_role(
-    State(state): State<AppState>,
-    caller: Caller,
-    target: Result<Path<(Uuid, String)>, PathRejection>,
-) -> Result<Json<RoleAssignmentChange>, WyrdErrorResponse> {
-    let Path((principal_id, role)) = target.map_err(|rejection| path_rejection(&rejection))?;
-    change_direct_role(&state, &caller, principal_id, &role, RoleChange::Grant)
-        .await
-        .map(Json)
-}
-
-/// Revoke a principal's direct Role assignment.
-///
-/// Idempotent: a principal not holding the Role directly is answered with
-/// `changed: false`. A user's `idp` assignment of the same Role remains, and
-/// only the identity provider removes it at the next login. The removal
-/// reaches the principal's next token; tokens already issued keep their
-/// bounded lifetime.
-///
-/// # Errors
-/// Returns the errors documented on [`grant_principal_role`].
-#[utoipa::path(
-    delete,
-    path = "/principals/{principal_id}/roles/{role}",
-    params(
-        ("principal_id" = Uuid, Path, description = "Principal to revoke the Role from"),
-        ("role" = String, Path, description = "Role whose direct assignment to remove")
-    ),
-    responses(
-        (status = 200, description = "The principal no longer holds the Role directly",
-         body = RoleAssignmentChange),
-        (status = 400, description = "A path identifier is not a valid UUID, or the Role is \
-          malformed or does not exist in this tenant (WYRD_SPEC_400_VALIDATION)",
-         body = WyrdProblem),
-        (status = 401, description = "The request carried no usable access token \
-          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
-          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
-        (status = 403, description = "Tenant administration required \
-          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
-        (status = 404, description = "No assignable principal with this id in the caller's \
-          tenant (WYRD_AUTH_404_PRINCIPAL_NOT_FOUND)", body = WyrdProblem),
-        (status = 500, description = "A tenant store read or write failed \
-          (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
-        (status = 503, description = "No verifier is configured for the access token (\
-          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
-    ),
-    tag = "Principals"
-)]
-#[tracing::instrument(level = "info", skip(state, caller))]
-async fn revoke_principal_role(
-    State(state): State<AppState>,
-    caller: Caller,
-    target: Result<Path<(Uuid, String)>, PathRejection>,
-) -> Result<Json<RoleAssignmentChange>, WyrdErrorResponse> {
-    let Path((principal_id, role)) = target.map_err(|rejection| path_rejection(&rejection))?;
-    change_direct_role(&state, &caller, principal_id, &role, RoleChange::Revoke)
-        .await
-        .map(Json)
-}
-
 /// Replace one Service account's workload restriction.
 ///
 /// Requires tenant administration (`*`). Setting the stored value again is an
@@ -1083,88 +934,6 @@ fn restriction_write_error(
     }
 }
 
-/// Which direct-assignment write a Role route performs.
-#[derive(Debug, Clone, Copy)]
-enum RoleChange {
-    /// Add the direct assignment.
-    Grant,
-    /// Remove the direct assignment.
-    Revoke,
-}
-
-impl RoleChange {
-    /// Audit operation recorded for this write's authorization decision.
-    const fn operation(self) -> &'static str {
-        match self {
-            Self::Grant => "auth.principal.role.grant",
-            Self::Revoke => "auth.principal.role.revoke",
-        }
-    }
-}
-
-/// Grant or revoke one direct Role assignment and report the resulting set.
-///
-/// Tenant administration is checked and its decision staged before anything
-/// else, then the Role and principal are resolved in the caller's tenant. The
-/// write and the read of the resulting assignments share one transaction, so
-/// the response is exactly what was committed.
-///
-/// # Errors
-/// Returns the errors documented on [`grant_principal_role`].
-async fn change_direct_role(
-    state: &AppState,
-    caller: &Caller,
-    principal_id: Uuid,
-    role: &str,
-    change: RoleChange,
-) -> Result<RoleAssignmentChange, WyrdErrorResponse> {
-    audit::authorize(
-        state,
-        caller,
-        &Permission::wildcard(),
-        change.operation(),
-        &format!("principal:{principal_id}/role:{role}"),
-    )?;
-    let unknown_role = || {
-        invalid(
-            "role does not exist in this tenant",
-            serde_json::json!({ "role": role }),
-        )
-    };
-    RoleRef::new(role).map_err(|_| unknown_role())?;
-    let mut conn = tenant_conn(state, caller).await?;
-    let (principal, kind) = require_assignable(&mut conn, principal_id).await?;
-    let role_id = role_by_name(&mut conn, role)
-        .await
-        .map_err(internal)?
-        .ok_or_else(unknown_role)?
-        .id;
-    let changed = match (change, kind) {
-        (RoleChange::Grant, PrincipalKindTag::User) => {
-            grant_role_to_user(&mut conn, principal.id, role_id, RoleSource::Direct).await
-        }
-        (RoleChange::Revoke, PrincipalKindTag::User) => {
-            revoke_role_from_user(&mut conn, principal.id, role_id, RoleSource::Direct).await
-        }
-        (RoleChange::Grant, _) => {
-            grant_role_to_service_account(&mut conn, principal.id, role_id).await
-        }
-        (RoleChange::Revoke, _) => {
-            revoke_role_from_service_account(&mut conn, principal.id, role_id).await
-        }
-    }
-    .map_err(internal)?;
-    let roles = role_assignments(&mut conn, principal.id, kind).await?;
-    conn.commit().await.map_err(internal)?;
-    Ok(RoleAssignmentChange {
-        principal_id: PrincipalId::new(principal.id),
-        kind,
-        role: role.to_owned(),
-        changed,
-        roles,
-    })
-}
-
 /// Resolve an assignable principal in the caller's tenant and its kind.
 ///
 /// Unknown, deleted, foreign-tenant, tenant-administrator, and `system` ids
@@ -1173,7 +942,7 @@ async fn change_direct_role(
 /// # Errors
 /// Returns [`WyrdError::PrincipalNotFound`] when no assignable principal has
 /// this id, and an internal error when the lookup fails.
-async fn require_assignable(
+pub(super) async fn require_assignable(
     conn: &mut TenantConn<'_>,
     principal_id: Uuid,
 ) -> Result<(AssignablePrincipalRow, PrincipalKindTag), WyrdErrorResponse> {
@@ -1190,41 +959,12 @@ async fn require_assignable(
     Ok((principal, kind))
 }
 
-/// Read a principal's assignments ordered by Role, then source.
-///
-/// Service and Agent assignments have one source, `direct`.
-///
-/// # Errors
-/// Returns an internal error when the read fails.
-async fn role_assignments(
-    conn: &mut TenantConn<'_>,
-    principal_id: Uuid,
-    kind: PrincipalKindTag,
-) -> Result<Vec<RoleAssignment>, WyrdErrorResponse> {
-    let assignments = if kind == PrincipalKindTag::User {
-        list_user_role_assignments(conn, principal_id)
-            .await
-            .map_err(internal)?
-    } else {
-        list_service_account_roles(conn, principal_id)
-            .await
-            .map_err(internal)?
-            .into_iter()
-            .map(|role| (role, RoleSource::Direct))
-            .collect()
-    };
-    Ok(assignments
-        .into_iter()
-        .map(|(role, source)| RoleAssignment { role, source })
-        .collect())
-}
-
 /// Project a directory row onto its wire summary.
 ///
 /// # Errors
 /// Returns an internal error for a stored kind or status the directory query
 /// cannot produce.
-fn summary(row: AssignablePrincipalRow) -> Result<PrincipalSummary, WyrdErrorResponse> {
+pub(super) fn summary(row: AssignablePrincipalRow) -> Result<PrincipalSummary, WyrdErrorResponse> {
     let kind = assignable_kind(&row.kind)?;
     let status = match row.status.as_str() {
         "active" => PrincipalStatus::Active,
@@ -1258,7 +998,7 @@ fn assignable_kind(kind: &str) -> Result<PrincipalKindTag, WyrdErrorResponse> {
 }
 
 /// The validation refusal for a malformed request on this surface.
-fn invalid(message: &str, details: serde_json::Value) -> WyrdErrorResponse {
+pub(super) fn invalid(message: &str, details: serde_json::Value) -> WyrdErrorResponse {
     WyrdErrorResponse::from(WyrdError::Validation {
         message: message.to_owned(),
         details,
@@ -1280,7 +1020,7 @@ pub(crate) fn metadata(row: ApiKeyMetadataRow) -> CredentialMetadata {
 }
 
 /// Map any internal failure onto the stable catalog without leaking detail.
-fn internal(error: impl Display) -> WyrdErrorResponse {
+pub(super) fn internal(error: impl Display) -> WyrdErrorResponse {
     WyrdErrorResponse::from(internal_failure(
         "tenant principal administration failed",
         &error,

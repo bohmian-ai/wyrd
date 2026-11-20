@@ -47,7 +47,7 @@ use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_verify::blocks::{Checkpoints, Decisions, DriftChecks, EngineError, HostWork};
 use wyrd_runtime::AcceptedAuthority;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{Attribution, PrincipalId};
+use wyrd_spec::auth::{Attribution, CardPermissionScope, PrincipalId};
 use wyrd_spec::card::agent::ExecutionRoute;
 use wyrd_spec::card::operator::DriftCounts;
 use wyrd_spec::card::verifier::VerifierSpec;
@@ -556,7 +556,7 @@ impl VerifierRunner {
             let outcome = if deadline <= tokio::time::Instant::now() {
                 timed_out()
             } else {
-                self.compute(tenant, run, &verifier.spec, system, &state, telemetry)
+                self.compute(tenant, run, &verifier, system, &state, telemetry)
                     .await
             };
             match outcome {
@@ -736,7 +736,7 @@ impl VerifierRunner {
         &self,
         tenant: DataTenantId,
         run: &ClaimedExecution,
-        spec: &Arc<VerifierSpec>,
+        verifier: &Target,
         system: PrincipalId,
         state: &Arc<RunState>,
         telemetry: &ExecutionTelemetry,
@@ -749,17 +749,22 @@ impl VerifierRunner {
             {
                 return outcome;
             }
-            let prepared = match self.prepare(tenant, run, spec, system, telemetry).await {
+            let prepared = match self
+                .prepare(tenant, run, &verifier.spec, system, telemetry)
+                .await
+            {
                 Ok(mut prepared) => self
-                    .deferred(tenant, run, spec, system, state, &mut prepared.1)
+                    .deferred(tenant, run, &verifier.spec, system, state, &mut prepared.1)
                     .await
                     .map(|()| prepared),
                 Err(outcome) => Err(outcome),
             };
             match prepared {
                 Ok(prepared) => {
-                    self.dispatch(tenant, run, spec, system, state, telemetry, &work, prepared)
-                        .await
+                    self.dispatch(
+                        tenant, run, verifier, system, state, telemetry, &work, prepared,
+                    )
+                    .await
                 }
                 Err(outcome) => outcome,
             }
@@ -917,7 +922,7 @@ impl VerifierRunner {
         Ok(())
     }
 
-    /// Run `spec` over the claimed execution's `prepared` input.
+    /// Run `verifier` over the claimed execution's `prepared` input.
     ///
     /// The engine executes as the authority accepted with the execution,
     /// executed by `system`, with model calls attributed to the verified Card
@@ -936,7 +941,7 @@ impl VerifierRunner {
         &self,
         tenant: DataTenantId,
         run: &ClaimedExecution,
-        spec: &Arc<VerifierSpec>,
+        verifier: &Target,
         system: PrincipalId,
         state: &Arc<RunState>,
         telemetry: &ExecutionTelemetry,
@@ -944,12 +949,17 @@ impl VerifierRunner {
         (drift, evidence, routes, run_id): Prepared,
     ) -> EngineOutcome {
         let caller = Caller::accepted(&run.authority, system);
+        let verifier_scope = CardPermissionScope::version(
+            verifier.verifier.kind.clone(),
+            verifier.verifier.name.clone(),
+            run.verifier_card_uid.clone(),
+        );
         let engine = telemetry.time(Phase::Setup, || {
             self.blocks.engine(
                 &self.state,
                 Execution {
                     caller: &caller,
-                    verifier: &run.verifier_card_uid,
+                    verifier: &verifier_scope,
                     routes: &routes,
                     subject: GatewayCallContext {
                         workload_card_uid: run
@@ -988,7 +998,7 @@ impl VerifierRunner {
             .with_approvals(decisions)
             .with_host_work(work.clone());
         match engine
-            .run(Arc::clone(spec), evidence, state.deadline())
+            .run(Arc::clone(&verifier.spec), evidence, state.deadline())
             .await
         {
             Ok(outcome) => EngineOutcome::Completed(outcome),

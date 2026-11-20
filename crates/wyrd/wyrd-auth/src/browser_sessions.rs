@@ -381,7 +381,12 @@ impl BrowserSessions {
             username,
             principal_kind: principal.kind.tag(),
             credential: session.credential,
-            permissions: permission_names(&principal.effective_permissions),
+            permissions: permission_names(
+                &principal
+                    .effective_permissions
+                    .flatten()
+                    .unwrap_or_default(),
+            ),
             expires_at: session.expires_at,
         })
     }

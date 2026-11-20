@@ -32,7 +32,6 @@ use wyrd_auth_oidc::{
     ClaimMapping, ClaimPath, ClientAuth, RelyingPartyError, ScreenError, TrustedIssuer,
     WorkloadBinding,
 };
-use wyrd_runtime::builtin_roles::DEFAULT_ISSUER_ROLE;
 use wyrd_spec::auth::{
     ClaimMappingPayload, ClientAuthKind, CreateTrustedIssuerRequest, CreateWorkloadBindingRequest,
     IssuerTokenPolicy, IssuerUrl, PrincipalId, TrustedIssuerView, WorkloadBindingView,
@@ -325,10 +324,8 @@ async fn create_trusted_issuer(
         client_auth,
         claim_mapping: claim_mapping_into_domain(request.claim_mapping.clone()),
         group_role_map: request.group_role_map.clone(),
-        default_roles: request
-            .default_roles
-            .clone()
-            .unwrap_or_else(|| vec![DEFAULT_ISSUER_ROLE.to_owned()]),
+        // Authentication alone grants nothing: no implicit viewer fallback.
+        default_roles: request.default_roles.clone().unwrap_or_default(),
         principal_kind: principal_kind_policy(request.principal_kind),
         jwks_ttl: request
             .jwks_ttl_secs
@@ -1010,7 +1007,7 @@ mod pg_tests {
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_runtime::{
         Permission, PermissionCheck, PermissionDenyReason, PermissionSet, PermissionVerdict,
-        Principal, PrincipalId, PrincipalKind, RoleRef,
+        Principal, PrincipalId, PrincipalKind,
     };
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::IssuerTokenPolicy;
@@ -1063,7 +1060,6 @@ mod pg_tests {
                 PrincipalId::new(uuid::Uuid::nil()),
                 PrincipalKind::User,
                 tenant,
-                Vec::<RoleRef>::new(),
                 perms,
             ),
             request_id: RequestId::now_v7(),

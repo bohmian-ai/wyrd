@@ -88,7 +88,7 @@ mod pg_tests {
     use wyrd_sql::queries::auth::{
         HumanConnectionWrite, LoginState, consume_login_state, human_connection_in_state,
         insert_device_authorization, insert_human_candidate, insert_login_state, insert_role,
-        insert_user, list_user_roles, lock_refresh_family, replace_idp_user_roles,
+        insert_user, list_role_bindings, lock_refresh_family, replace_idp_user_bindings,
         user_id_by_identity,
     };
     use wyrd_sql::row_types::auth::HumanConnectionBinding;
@@ -883,7 +883,7 @@ mod pg_tests {
             )
             .await
             .expect("role inserts");
-            replace_idp_user_roles(&mut conn, user, &["connection_tester"])
+            replace_idp_user_bindings(&mut conn, user, &["connection_tester"])
                 .await
                 .expect("role grants");
         }
@@ -978,9 +978,13 @@ mod pg_tests {
     /// Panics when the query fails.
     async fn user_roles(fixture: &PgFixture, user: Uuid) -> Vec<String> {
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        list_user_roles(&mut conn, user)
+        list_role_bindings(&mut conn)
             .await
-            .expect("role list runs")
+            .expect("binding list runs")
+            .into_iter()
+            .filter(|binding| binding.subject.user_id == Some(user))
+            .map(|binding| binding.role_name)
+            .collect()
     }
 
     /// A mock JWKS endpoint serving the test Ed25519 key.

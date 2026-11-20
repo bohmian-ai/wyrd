@@ -10,8 +10,9 @@ use napi::Env;
 use napi::bindgen_prelude::PromiseRaw;
 use napi_derive::napi;
 use wyrd_client::principals::{
-    CreateServicePrincipalRequest, CredentialListQuery, PrincipalId, PrincipalQuery, Principals,
-    RevokePrincipalRequest, WorkloadRestriction,
+    AccessGroupId, CreateGroupRequest, CreateRoleBindingRequest, CreateServicePrincipalRequest,
+    CredentialListQuery, PrincipalId, PrincipalQuery, Principals, PutRoleRequest,
+    RevokePrincipalRequest, RoleBindingId, RoleBindingQuery, WorkloadRestriction,
 };
 use wyrd_spec::error::WyrdError;
 
@@ -295,70 +296,279 @@ impl NativePrincipals {
         })
     }
 
-    /// Reads a principal's Role assignments.
+    /// Reads one account's current access: its bindings, their sources, and
+    /// the permissions they compile to.
     ///
     /// # Errors
     ///
-    /// Returns a napi error only when the assignments cannot be serialized; a
-    /// malformed id or server refusal is returned in the result.
+    /// Returns a napi error only when the response cannot be serialized; a
+    /// malformed argument or server refusal is returned in the result.
+    #[napi]
+    pub fn access<'env>(
+        &self,
+        env: &'env Env,
+        principal_id: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let principals = self.principals.clone();
+        crate::trace::spawn(env, async move {
+            let result = async {
+                let principal = self::principal_id(principal_id)?;
+                principals.access(&principal).await
+            }
+            .await;
+            NativeLifecycleResult::outcome(result)
+        })
+    }
+
+    /// Lists every role and its operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the response cannot be serialized; a
+    /// malformed argument or server refusal is returned in the result.
     #[napi]
     pub fn roles<'env>(
         &self,
         env: &'env Env,
-        principal_id: String,
     ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
         let principals = self.principals.clone();
         crate::trace::spawn(env, async move {
-            let result = match self::principal_id(principal_id) {
-                Ok(id) => principals.roles(&id).await,
-                Err(error) => Err(error),
-            };
+            NativeLifecycleResult::outcome(principals.roles().await)
+        })
+    }
+
+    /// Creates or replaces a custom role from a serialized `PutRoleRequest`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the response cannot be serialized; a
+    /// malformed argument or server refusal is returned in the result.
+    #[napi]
+    pub fn put_role<'env>(
+        &self,
+        env: &'env Env,
+        role: String,
+        request_json: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let principals = self.principals.clone();
+        crate::trace::spawn(env, async move {
+            let result = async {
+                let request = decode::<PutRoleRequest>("request", &request_json)?;
+                principals.put_role(&role, &request).await
+            }
+            .await;
             NativeLifecycleResult::outcome(result)
         })
     }
 
-    /// Idempotently grants a direct Role.
+    /// Deletes an unbound custom role.
     ///
     /// # Errors
     ///
-    /// Returns a napi error only when the change cannot be serialized; a
-    /// malformed id or server refusal is returned in the result.
+    /// Returns a napi error only when the response cannot be serialized; a
+    /// malformed argument or server refusal is returned in the result.
     #[napi]
-    pub fn grant_role<'env>(
+    pub fn delete_role<'env>(
         &self,
         env: &'env Env,
-        principal_id: String,
         role: String,
     ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
         let principals = self.principals.clone();
         crate::trace::spawn(env, async move {
-            let result = match self::principal_id(principal_id) {
-                Ok(id) => principals.grant_role(&id, &role).await,
-                Err(error) => Err(error),
-            };
+            NativeLifecycleResult::outcome(principals.delete_role(&role).await)
+        })
+    }
+
+    /// Lists bindings matching a serialized `RoleBindingQuery`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the response cannot be serialized; a
+    /// malformed argument or server refusal is returned in the result.
+    #[napi]
+    pub fn bindings<'env>(
+        &self,
+        env: &'env Env,
+        query_json: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let principals = self.principals.clone();
+        crate::trace::spawn(env, async move {
+            let result = async {
+                let request = decode::<RoleBindingQuery>("query", &query_json)?;
+                principals.bindings(&request).await
+            }
+            .await;
             NativeLifecycleResult::outcome(result)
         })
     }
 
-    /// Idempotently revokes a direct Role; identity-provider assignments stay.
+    /// Binds a role at a scope from a serialized `CreateRoleBindingRequest`.
     ///
     /// # Errors
     ///
-    /// Returns a napi error only when the change cannot be serialized; a
-    /// malformed id or server refusal is returned in the result.
+    /// Returns a napi error only when the response cannot be serialized; a
+    /// malformed argument or server refusal is returned in the result.
     #[napi]
-    pub fn revoke_role<'env>(
+    pub fn bind<'env>(
         &self,
         env: &'env Env,
-        principal_id: String,
-        role: String,
+        request_json: String,
     ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
         let principals = self.principals.clone();
         crate::trace::spawn(env, async move {
-            let result = match self::principal_id(principal_id) {
-                Ok(id) => principals.revoke_role(&id, &role).await,
-                Err(error) => Err(error),
-            };
+            let result = async {
+                let request = decode::<CreateRoleBindingRequest>("request", &request_json)?;
+                principals.bind(&request).await
+            }
+            .await;
+            NativeLifecycleResult::outcome(result)
+        })
+    }
+
+    /// Removes one directly administered binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the response cannot be serialized; a
+    /// malformed argument or server refusal is returned in the result.
+    #[napi]
+    pub fn unbind<'env>(
+        &self,
+        env: &'env Env,
+        binding_id: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let principals = self.principals.clone();
+        crate::trace::spawn(env, async move {
+            let result = async {
+                let id = decode::<RoleBindingId>(
+                    "binding_id",
+                    &serde_json::Value::String(binding_id).to_string(),
+                )?;
+                principals.unbind(&id).await
+            }
+            .await;
+            NativeLifecycleResult::outcome(result)
+        })
+    }
+
+    /// Lists local groups and their members.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the response cannot be serialized; a
+    /// malformed argument or server refusal is returned in the result.
+    #[napi]
+    pub fn groups<'env>(
+        &self,
+        env: &'env Env,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let principals = self.principals.clone();
+        crate::trace::spawn(env, async move {
+            NativeLifecycleResult::outcome(principals.groups().await)
+        })
+    }
+
+    /// Creates a local group from a serialized `CreateGroupRequest`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the response cannot be serialized; a
+    /// malformed argument or server refusal is returned in the result.
+    #[napi]
+    pub fn create_group<'env>(
+        &self,
+        env: &'env Env,
+        request_json: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let principals = self.principals.clone();
+        crate::trace::spawn(env, async move {
+            let result = async {
+                let request = decode::<CreateGroupRequest>("request", &request_json)?;
+                principals.create_group(&request).await
+            }
+            .await;
+            NativeLifecycleResult::outcome(result)
+        })
+    }
+
+    /// Deletes a local group with its memberships and bindings.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the response cannot be serialized; a
+    /// malformed argument or server refusal is returned in the result.
+    #[napi]
+    pub fn delete_group<'env>(
+        &self,
+        env: &'env Env,
+        group_id: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let principals = self.principals.clone();
+        crate::trace::spawn(env, async move {
+            let result = async {
+                let id = decode::<AccessGroupId>(
+                    "group_id",
+                    &serde_json::Value::String(group_id).to_string(),
+                )?;
+                principals.delete_group(&id).await
+            }
+            .await;
+            NativeLifecycleResult::outcome(result)
+        })
+    }
+
+    /// Adds an account to a local group.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the response cannot be serialized; a
+    /// malformed argument or server refusal is returned in the result.
+    #[napi]
+    pub fn add_group_member<'env>(
+        &self,
+        env: &'env Env,
+        group_id: String,
+        principal_id: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let principals = self.principals.clone();
+        crate::trace::spawn(env, async move {
+            let result = async {
+                let id = decode::<AccessGroupId>(
+                    "group_id",
+                    &serde_json::Value::String(group_id).to_string(),
+                )?;
+                let principal = self::principal_id(principal_id)?;
+                principals.add_group_member(&id, &principal).await
+            }
+            .await;
+            NativeLifecycleResult::outcome(result)
+        })
+    }
+
+    /// Removes an account from a local group.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the response cannot be serialized; a
+    /// malformed argument or server refusal is returned in the result.
+    #[napi]
+    pub fn remove_group_member<'env>(
+        &self,
+        env: &'env Env,
+        group_id: String,
+        principal_id: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let principals = self.principals.clone();
+        crate::trace::spawn(env, async move {
+            let result = async {
+                let id = decode::<AccessGroupId>(
+                    "group_id",
+                    &serde_json::Value::String(group_id).to_string(),
+                )?;
+                let principal = self::principal_id(principal_id)?;
+                principals.remove_group_member(&id, &principal).await
+            }
+            .await;
             NativeLifecycleResult::outcome(result)
         })
     }

@@ -952,7 +952,6 @@ async fn exact_delete_enforces_inbound_references_and_is_idempotent() {
         PrincipalId::new(Uuid::now_v7()),
         PrincipalKind::User,
         tenant,
-        Vec::new(),
         PermissionSet::new(),
     );
     let target_operation = DeclarationOperationId::new(Uuid::now_v7());

@@ -1,2088 +1,226 @@
 //! Runtime RBAC permission model.
+//!
+//! The vocabulary and permission values are pure contracts owned by
+//! `wyrd_spec::auth`; runtime re-exports them beside the checker and the
+//! request-time effective-permission view.
 
-use std::fmt;
-use std::str::FromStr;
+use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
 pub use wyrd_spec::auth::{
-    BifrostPermissionScope, BifrostSchemaScope, BifrostTableScope, GatewayAccess, PermissionScope,
-    PermissionScopeError,
+    Action, BifrostPermissionScope, BifrostSchemaScope, BifrostTableScope, CardPermissionScope,
+    GatewayAccess, Permission, PermissionParseError, PermissionScope, PermissionScopeError,
+    PermissionSet, Resource, UnrepresentableIntersection,
 };
-use wyrd_spec::card::agent::BuiltinTool;
-use wyrd_spec::ids::CardUid;
 
-/// One operation/object authorization triple.
+/// The authority one request holds: the account's current grants, bounded by
+/// every mandatory restriction layer.
 ///
-/// Wyrd RBAC is `(resource, action, scope)`: the first two axes name the
-/// operation and the third names the objects it reaches. Scope is required, so
-/// a grant that targets no particular object states [`PermissionScope::All`]
-/// explicitly rather than leaving the object axis unsaid.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(try_from = "PermissionWire")]
-pub struct Permission {
-    /// Resource the permission applies to.
-    pub resource: Resource,
-    /// Action allowed on the resource.
-    pub action: Action,
-    /// Objects of that resource the permission reaches.
-    pub scope: PermissionScope,
+/// `grants` is the server's cached view of the account's direct, group, and
+/// provider bindings, shared by reference rather than copied per request.
+/// Each ceiling — a signed token ceiling, a credential's current ceiling, a
+/// delegation participant's current grants, an accepted execution's frozen
+/// authority — is additive internally, and every layer must allow. A layer
+/// can only remove authority; none can add what `grants` lacks.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EffectivePermissions {
+    grants: Arc<PermissionSet>,
+    ceilings: Vec<Arc<PermissionSet>>,
 }
 
-/// Exact persisted and wire projection of one permission, before validation.
-///
-/// [`Permission`] deserializes through this shape so every decode — role JSON
-/// in `wyrd.auth_roles.permissions`, a request body, a signed forwarding
-/// envelope — runs the same validation. Scope has no default: a two-field
-/// object is rejected rather than silently promoted to
-/// [`PermissionScope::All`].
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PermissionWire {
-    /// Resource the permission applies to.
-    resource: Resource,
-    /// Action allowed on the resource.
-    action: Action,
-    /// Objects of that resource the permission reaches.
-    scope: PermissionScope,
-}
-
-impl TryFrom<PermissionWire> for Permission {
-    type Error = PermissionScopeError;
-
-    /// Validates one decoded permission before it becomes an effective grant.
-    ///
-    /// # Errors
-    ///
-    /// Returns the scope's own identity failure, or
-    /// [`PermissionScopeError::InvalidIdentifier`] with field `resource` when a
-    /// Bifrost object scope is attached to a resource that owns no Bifrost
-    /// object.
-    fn try_from(wire: PermissionWire) -> Result<Self, Self::Error> {
-        let permission = Self {
-            resource: wire.resource,
-            action: wire.action,
-            scope: wire.scope,
-        };
-        permission.validate()?;
-        Ok(permission)
-    }
-}
-
-/// Resource the permission applies to.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Resource {
-    /// Cards and specs.
-    Cards,
-    /// Service cards and deployment-facing service operations.
-    Services,
-    /// Operator cards and invocations.
-    Operators,
-    /// Explicit invocation of a Verifier Card, optionally scoped to one UID.
-    Verifier,
-    /// Drift-backed Verifier Cards and drift observations.
-    Drift,
-    /// Artifact bytes and metadata.
-    Artifacts,
-    /// Audit records and audit cards.
-    Audit,
-    /// Policy cards and policy administration.
-    Policy,
-    /// Trigger cards.
-    Triggers,
-    /// Service and agent API-key principals.
-    ServiceAccounts,
-    /// Human user administration.
-    Users,
-    /// The tenant's human OIDC login connection: staging, testing,
-    /// activating, deactivating, and removing the provider its people sign in
-    /// through.
-    ///
-    /// Separate from [`Resource::ServiceAccounts`] so that holding credential
-    /// administration alone never confers authority over who may sign in to
-    /// the tenant. The built-in `admin` role reaches it through its wildcard;
-    /// no other built-in role grants it.
-    IdentityConnections,
-    /// The calling User's own personal API keys.
-    ///
-    /// Self-only: a real User's resolved authority always includes
-    /// `personal_credentials:read` and `personal_credentials:write`, which
-    /// list and revoke (and, after a recent human sign-in, create) only that
-    /// User's own keys. Service and Admin authority never receives them, and
-    /// they never reach another principal's credentials.
-    PersonalCredentials,
-    /// The tenant directory itself: creating, inspecting, suspending, and
-    /// recovering administration for a tenant.
-    ///
-    /// This is a platform-control-plane resource. It governs the lifecycle of a
-    /// tenant, never the resources inside one, so holding it grants no access
-    /// to any tenant's data.
-    Tenants,
-    /// The deployment's platform-scope human identity: its one OIDC connection
-    /// and the human platform principals registered against it.
-    ///
-    /// A platform-control-plane resource, distinct from [`Resource::Tenants`]
-    /// so that administering who may sign in to the platform is visible in a
-    /// grant and in audit separately from administering tenants. Holding it
-    /// grants no access to any tenant's data.
-    PlatformIdentity,
-    /// Platform-scope credentials: the secrets that authenticate a platform
-    /// principal to the control plane.
-    ///
-    /// Separate from [`Resource::PlatformIdentity`] because the two answer
-    /// different questions. Identity administration decides *who* the platform
-    /// recognizes; credential administration mints and retires the secrets that
-    /// prove it. An operator may need to rotate the deployment's root
-    /// credential without also being able to register new administrators.
-    PlatformCredentials,
-    /// Bifrost table definitions (DDL: create/list/describe).
-    BifrostTable,
-    /// Bifrost record ingest (the streaming write surface).
-    BifrostRecord,
-    /// Bifrost table reads (SQL/scan).
-    BifrostQuery,
-    /// Private Bifrost peer plane: reservation, execution, tail, and lifecycle.
-    ///
-    /// Role-neutral on purpose. Every peer-bearing target answers the same
-    /// private services, so a Scribe and an Oracle are authorized by the same
-    /// permission rather than by role-specific resources.
-    BifrostPeer,
-    /// Gateway administration (provider credentials, deployments, policies)
-    /// and deployment/model invocation.
-    Gateway,
-    /// Captured gateway request and response payload fields.
-    GatewayPayload,
-    /// Built-in Agent tool invocation, optionally scoped to one tool.
-    ///
-    /// Invocation authority only: a tool's underlying Cards or Bifrost access
-    /// is checked separately against those resources, and holding them never
-    /// implies this one.
-    Tool,
-    /// One of several resources.
-    AnyOf(Vec<Resource>),
-    /// All resources.
-    Wildcard,
-}
-
-/// Action performed against a resource.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Action {
-    /// Read.
-    Read,
-    /// Create or update.
-    Write,
-    /// Delete.
-    Delete,
-    /// Invoke runtime behavior.
-    Invoke,
-    /// Install or deploy.
-    Install,
-    /// Lock.
-    Lock,
-    /// Run.
-    Run,
-    /// Decide a pending approval of a Verifier execution.
-    ///
-    /// Distinct from [`Self::Run`]: whoever may run a Verifier does not
-    /// thereby decide its approvals.
-    Approve,
-    /// Suspend a resource without destroying it, and resume it.
-    Suspend,
-    /// Restore administrative access a tenant can no longer reach itself.
-    ///
-    /// Named separately from [`Self::Write`] so the one operation that lets the
-    /// platform plane act on a tenant's administration is distinguishable in a
-    /// grant and in audit, rather than hiding inside a general write.
-    Recover,
-    /// One of several actions.
-    AnyOf(Vec<Action>),
-    /// All actions.
-    Wildcard,
-}
-
-impl Resource {
-    /// True if this resource covers `other`.
+impl EffectivePermissions {
+    /// Authority of exactly `grants`, with no further restriction.
     #[must_use]
-    pub fn covers(&self, other: &Resource) -> bool {
-        match (self, other) {
-            (Self::Wildcard, _) => true,
-            (Self::AnyOf(resources), other) => {
-                resources.iter().any(|resource| resource.covers(other))
-            }
-            (self_resource, other_resource) => self_resource == other_resource,
-        }
-    }
-
-    /// The single resources this one names: an `AnyOf` flattened, anything
-    /// else itself. Used to meet two grants member by member.
-    fn members(&self) -> Vec<&Self> {
-        match self {
-            Self::AnyOf(resources) => resources.iter().flat_map(Self::members).collect(),
-            resource => vec![resource],
-        }
-    }
-
-    /// True when this resource owns Bifrost objects a grant may be scoped to.
-    ///
-    /// Bifrost query reads and record writes name a table. `AnyOf` and
-    /// `Wildcard` are deliberately excluded: a multi-resource or wildcard grant
-    /// reaches objects only through [`PermissionScope::All`].
-    #[must_use]
-    pub const fn accepts_bifrost_scope(&self) -> bool {
-        matches!(self, Self::BifrostQuery | Self::BifrostRecord)
-    }
-
-    /// Stable label for this resource, or `None` for a composite `AnyOf`.
-    ///
-    /// Audit records the label rather than the enum's debug shape so a stored
-    /// decision stays readable and comparable across releases.
-    #[must_use]
-    pub fn as_str(&self) -> Option<&'static str> {
-        Some(match self {
-            Self::Cards => "cards",
-            Self::Services => "services",
-            Self::Operators => "operators",
-            Self::Verifier => "verifier",
-            Self::Drift => "drift",
-            Self::Artifacts => "artifacts",
-            Self::Audit => "audit",
-            Self::Policy => "policy",
-            Self::Triggers => "triggers",
-            Self::ServiceAccounts => "service_accounts",
-            Self::Users => "users",
-            Self::IdentityConnections => "identity_connections",
-            Self::PersonalCredentials => "personal_credentials",
-            Self::Tenants => "tenants",
-            Self::PlatformIdentity => "platform_identity",
-            Self::PlatformCredentials => "platform_credentials",
-            Self::BifrostTable => "bifrost_table",
-            Self::BifrostRecord => "bifrost_record",
-            Self::BifrostQuery => "bifrost_query",
-            Self::BifrostPeer => "bifrost_peer",
-            Self::Gateway => "gateway",
-            Self::GatewayPayload => "gateway_payload",
-            Self::Tool => "tool",
-            Self::Wildcard => "wildcard",
-            Self::AnyOf(_) => return None,
-        })
-    }
-}
-
-impl Action {
-    /// True if this action covers `other`.
-    #[must_use]
-    pub fn covers(&self, other: &Action) -> bool {
-        match (self, other) {
-            (Self::Wildcard, _) => true,
-            (Self::AnyOf(actions), other) => actions.iter().any(|action| action.covers(other)),
-            (self_action, other_action) => self_action == other_action,
-        }
-    }
-
-    /// The single actions this one names: an `AnyOf` flattened, anything else
-    /// itself. Used to meet two grants member by member.
-    fn members(&self) -> Vec<&Self> {
-        match self {
-            Self::AnyOf(actions) => actions.iter().flat_map(Self::members).collect(),
-            action => vec![action],
-        }
-    }
-
-    /// Stable label for this action, or `None` for a composite `AnyOf`.
-    ///
-    /// Audit records the label rather than the enum's debug shape so a stored
-    /// decision stays readable and comparable across releases.
-    #[must_use]
-    pub fn as_str(&self) -> Option<&'static str> {
-        Some(match self {
-            Self::Read => "read",
-            Self::Write => "write",
-            Self::Delete => "delete",
-            Self::Invoke => "invoke",
-            Self::Install => "install",
-            Self::Lock => "lock",
-            Self::Run => "run",
-            Self::Approve => "approve",
-            Self::Suspend => "suspend",
-            Self::Recover => "recover",
-            Self::Wildcard => "wildcard",
-            Self::AnyOf(_) => return None,
-        })
-    }
-}
-
-impl Permission {
-    /// True if this permission covers `required`.
-    #[must_use]
-    pub fn covers(&self, required: &Permission) -> bool {
-        self.resource.covers(&required.resource)
-            && self.action.covers(&required.action)
-            && self.scope.covers(&required.scope)
-    }
-
-    /// True when holding `self` makes `other` redundant in a [`PermissionSet`].
-    ///
-    /// Subsumption is [`Self::covers`] except that an `all`-scoped grant never
-    /// subsumes an explicit gateway grant: `all` reaches only `open`
-    /// deployments, while the explicit grant is the only one reaching a
-    /// `granted` deployment. Requirement matching still uses `covers`.
-    #[must_use]
-    pub fn subsumes(&self, other: &Permission) -> bool {
-        self.covers(other) && !(self.scope == PermissionScope::All && other.scope.is_gateway())
-    }
-
-    /// Rejects a permission whose object scope cannot apply to its operation.
-    ///
-    /// Bifrost object scope is meaningful only for Bifrost query reads and
-    /// record writes, gateway object scope only for gateway invocation,
-    /// Verifier object scope only for `verifier:run` and `verifier:read`, and
-    /// tool object scope only for `tool:invoke`. A wildcard or
-    /// multi-resource grant on either axis keeps object-wide reach only with
-    /// [`PermissionScope::All`], which is what stops a wildcard from inheriting
-    /// one object's narrow authority.
-    ///
-    /// # Errors
-    ///
-    /// Returns the scope's own identity failure, or
-    /// [`PermissionScopeError::InvalidIdentifier`] with field `resource` when an
-    /// object scope is attached to a resource that does not own that object, or
-    /// with field `action` when a Bifrost scope is attached to an action other
-    /// than [`Action::Read`] for query or [`Action::Write`] for record, a
-    /// gateway or tool scope to any action other than [`Action::Invoke`], or a
-    /// Verifier scope to any action other than [`Action::Run`],
-    /// [`Action::Read`], or [`Action::Approve`].
-    pub fn validate(&self) -> Result<(), PermissionScopeError> {
-        self.scope.validate()?;
-        let (resource_accepts, required_action) = match &self.scope {
-            PermissionScope::All => return Ok(()),
-            PermissionScope::Bifrost(_) => (
-                self.resource.accepts_bifrost_scope(),
-                if self.resource == Resource::BifrostRecord {
-                    Action::Write
-                } else {
-                    Action::Read
-                },
-            ),
-            PermissionScope::Gateway(_) => (self.resource == Resource::Gateway, Action::Invoke),
-            PermissionScope::Verifier(_) => (
-                self.resource == Resource::Verifier,
-                match self.action {
-                    Action::Read => Action::Read,
-                    Action::Approve => Action::Approve,
-                    _ => Action::Run,
-                },
-            ),
-            PermissionScope::Tool(_) => (self.resource == Resource::Tool, Action::Invoke),
-        };
-        if !resource_accepts {
-            return Err(PermissionScopeError::InvalidIdentifier {
-                field: "resource",
-                value: self.resource.as_str().unwrap_or("any_of").to_owned(),
-            });
-        }
-        if self.action != required_action {
-            return Err(PermissionScopeError::InvalidIdentifier {
-                field: "action",
-                value: self.action.as_str().unwrap_or("any_of").to_owned(),
-            });
-        }
-        Ok(())
-    }
-
-    /// Read cards.
-    #[must_use]
-    pub const fn card_read() -> Self {
+    pub fn new(grants: Arc<PermissionSet>) -> Self {
         Self {
-            resource: Resource::Cards,
-            action: Action::Read,
-            scope: PermissionScope::All,
+            grants,
+            ceilings: Vec::new(),
         }
     }
 
-    /// Write cards.
+    /// The same authority bounded additionally by `ceiling`.
     #[must_use]
-    pub const fn card_write() -> Self {
-        Self {
-            resource: Resource::Cards,
-            action: Action::Write,
-            scope: PermissionScope::All,
-        }
+    pub fn restricted_by(mut self, ceiling: Arc<PermissionSet>) -> Self {
+        self.ceilings.push(ceiling);
+        self
     }
 
-    /// Delete cards.
+    /// The account's current grants, before any restriction.
     #[must_use]
-    pub const fn card_delete() -> Self {
-        Self {
-            resource: Resource::Cards,
-            action: Action::Delete,
-            scope: PermissionScope::All,
-        }
+    pub fn grants(&self) -> &PermissionSet {
+        &self.grants
     }
 
-    /// Read artifacts.
+    /// Every restriction layer, in the order it was attached.
     #[must_use]
-    pub const fn artifact_read() -> Self {
-        Self {
-            resource: Resource::Artifacts,
-            action: Action::Read,
-            scope: PermissionScope::All,
-        }
+    pub fn ceilings(&self) -> &[Arc<PermissionSet>] {
+        &self.ceilings
     }
 
-    /// Write artifacts.
-    #[must_use]
-    pub const fn artifact_write() -> Self {
-        Self {
-            resource: Resource::Artifacts,
-            action: Action::Write,
-            scope: PermissionScope::All,
-        }
-    }
-
-    /// Install services.
-    #[must_use]
-    pub const fn service_install() -> Self {
-        Self {
-            resource: Resource::Services,
-            action: Action::Install,
-            scope: PermissionScope::All,
-        }
-    }
-
-    /// Write service accounts.
-    #[must_use]
-    pub const fn service_accounts_write() -> Self {
-        Self {
-            resource: Resource::ServiceAccounts,
-            action: Action::Write,
-            scope: PermissionScope::All,
-        }
-    }
-
-    /// Administer the tenant's human OIDC login connection.
-    #[must_use]
-    pub const fn identity_connections_write() -> Self {
-        Self {
-            resource: Resource::IdentityConnections,
-            action: Action::Write,
-            scope: PermissionScope::All,
-        }
-    }
-
-    /// Read the tenant's redacted Operator connections.
-    #[must_use]
-    pub const fn operators_read() -> Self {
-        Self {
-            resource: Resource::Operators,
-            action: Action::Read,
-            scope: PermissionScope::All,
-        }
-    }
-
-    /// Create, update, rotate, and disable the tenant's Operator connections.
-    #[must_use]
-    pub const fn operators_write() -> Self {
-        Self {
-            resource: Resource::Operators,
-            action: Action::Write,
-            scope: PermissionScope::All,
-        }
-    }
-
-    /// Invoke operators.
-    #[must_use]
-    pub const fn operator_invoke() -> Self {
-        Self {
-            resource: Resource::Operators,
-            action: Action::Invoke,
-            scope: PermissionScope::All,
-        }
-    }
-
-    /// Invoke the one Verifier Card `verifier`, directly or as a manual run.
-    ///
-    /// The permission an explicit invocation requires: only a grant of this
-    /// exact UID or [`Self::verifier_run_any`] covers it.
-    #[must_use]
-    pub const fn verifier_run(verifier: CardUid) -> Self {
-        Self {
-            resource: Resource::Verifier,
-            action: Action::Run,
-            scope: PermissionScope::Verifier(verifier),
-        }
-    }
-
-    /// Invoke every Verifier Card in the tenant.
-    ///
-    /// The unscoped grant the built-in `workload` and `editor` Roles carry; a
-    /// narrower custom Role grants [`Self::verifier_run`] for one UID.
-    #[must_use]
-    pub const fn verifier_run_any() -> Self {
-        Self {
-            resource: Resource::Verifier,
-            action: Action::Run,
-            scope: PermissionScope::All,
-        }
-    }
-
-    /// Inspect executions of the one Verifier Card `verifier`: their status,
-    /// invocation progress, publications, and publication downloads.
-    ///
-    /// Only a grant of this exact UID or [`Self::verifier_read_any`] covers
-    /// it; `cards:read` does not, and it grants no Card, Artifact, or Bifrost
-    /// table access of its own.
-    #[must_use]
-    pub const fn verifier_read(verifier: CardUid) -> Self {
-        Self {
-            resource: Resource::Verifier,
-            action: Action::Read,
-            scope: PermissionScope::Verifier(verifier),
-        }
-    }
-
-    /// Inspect executions of every Verifier Card in the tenant.
-    ///
-    /// The unscoped grant every built-in Role carries; a narrower custom Role
-    /// grants [`Self::verifier_read`] for one UID.
-    #[must_use]
-    pub const fn verifier_read_any() -> Self {
-        Self {
-            resource: Resource::Verifier,
-            action: Action::Read,
-            scope: PermissionScope::All,
-        }
-    }
-
-    /// Decide pending approvals of executions of the one Verifier Card
-    /// `verifier`.
-    ///
-    /// Only a grant of this exact UID or [`Self::verifier_approve_any`]
-    /// covers it; neither `verifier:run` nor `verifier:read` does.
-    #[must_use]
-    pub const fn verifier_approve(verifier: CardUid) -> Self {
-        Self {
-            resource: Resource::Verifier,
-            action: Action::Approve,
-            scope: PermissionScope::Verifier(verifier),
-        }
-    }
-
-    /// Decide pending approvals of executions of every Verifier Card in the
-    /// tenant.
-    ///
-    /// The unscoped grant the built-in `editor` Role carries: approvals
-    /// belong to people, not to the workload being verified.
-    #[must_use]
-    pub const fn verifier_approve_any() -> Self {
-        Self {
-            resource: Resource::Verifier,
-            action: Action::Approve,
-            scope: PermissionScope::All,
-        }
-    }
-
-    /// Write triggers.
-    #[must_use]
-    pub const fn trigger_write() -> Self {
-        Self {
-            resource: Resource::Triggers,
-            action: Action::Write,
-            scope: PermissionScope::All,
-        }
-    }
-
-    /// Read audit.
-    #[must_use]
-    pub const fn audit_read() -> Self {
-        Self {
-            resource: Resource::Audit,
-            action: Action::Read,
-            scope: PermissionScope::All,
-        }
-    }
-
-    /// Lock policy.
-    #[must_use]
-    pub const fn policy_lock() -> Self {
-        Self {
-            resource: Resource::Policy,
-            action: Action::Lock,
-            scope: PermissionScope::All,
-        }
-    }
-
-    /// Create a tenant on the platform control plane.
-    #[must_use]
-    pub const fn tenant_create() -> Self {
-        Self {
-            resource: Resource::Tenants,
-            action: Action::Write,
-            scope: PermissionScope::All,
-        }
-    }
-
-    /// List tenants and inspect one tenant's lifecycle state.
-    #[must_use]
-    pub const fn tenant_read() -> Self {
-        Self {
-            resource: Resource::Tenants,
-            action: Action::Read,
-            scope: PermissionScope::All,
-        }
-    }
-
-    /// Suspend and resume a tenant without destroying its state.
-    #[must_use]
-    pub const fn tenant_suspend() -> Self {
-        Self {
-            resource: Resource::Tenants,
-            action: Action::Suspend,
-            scope: PermissionScope::All,
-        }
-    }
-
-    /// Restore administrative access to a tenant that has lost its own.
-    ///
-    /// The single named capability by which the platform plane reaches a
-    /// tenant, kept distinct so it is visible in a grant and in audit rather
-    /// than hidden inside a general write.
-    #[must_use]
-    pub const fn tenant_recover_admin() -> Self {
-        Self {
-            resource: Resource::Tenants,
-            action: Action::Recover,
-            scope: PermissionScope::All,
-        }
-    }
-
-    /// Read the platform-scope identity configuration.
-    ///
-    /// Reading never yields provider secrets; the connection view is redacted
-    /// at the boundary regardless of who holds this.
-    #[must_use]
-    pub const fn platform_identity_read() -> Self {
-        Self {
-            resource: Resource::PlatformIdentity,
-            action: Action::Read,
-            scope: PermissionScope::All,
-        }
-    }
-
-    /// Configure the platform OIDC connection and register human platform
-    /// principals.
-    ///
-    /// Deliberately the same permission for both: registering a principal
-    /// against a connection you also control is one capability, and splitting
-    /// it would suggest a separation the plane does not actually have.
-    #[must_use]
-    pub const fn platform_identity_write() -> Self {
-        Self {
-            resource: Resource::PlatformIdentity,
-            action: Action::Write,
-            scope: PermissionScope::All,
-        }
-    }
-
-    /// List the non-secret metadata of a platform principal's credentials.
-    ///
-    /// Listing never yields credential material; it exists so an operator can
-    /// see what is live, expired, or already retired before rotating.
-    #[must_use]
-    pub const fn platform_credential_read() -> Self {
-        Self {
-            resource: Resource::PlatformCredentials,
-            action: Action::Read,
-            scope: PermissionScope::All,
-        }
-    }
-
-    /// Issue and revoke platform credentials.
-    ///
-    /// One permission for both halves of rotation: an operator who can mint a
-    /// replacement must be able to retire what it replaces, and splitting them
-    /// would leave a superseded credential live because the second half was
-    /// separately granted.
-    #[must_use]
-    pub const fn platform_credential_write() -> Self {
-        Self {
-            resource: Resource::PlatformCredentials,
-            action: Action::Write,
-            scope: PermissionScope::All,
-        }
-    }
-
-    /// List the calling User's own personal keys.
-    #[must_use]
-    pub const fn personal_credentials_read() -> Self {
-        Self {
-            resource: Resource::PersonalCredentials,
-            action: Action::Read,
-            scope: PermissionScope::All,
-        }
-    }
-
-    /// Revoke and create the calling User's own personal keys.
-    #[must_use]
-    pub const fn personal_credentials_write() -> Self {
-        Self {
-            resource: Resource::PersonalCredentials,
-            action: Action::Write,
-            scope: PermissionScope::All,
-        }
-    }
-
-    /// Manage users.
-    #[must_use]
-    pub const fn users_manage() -> Self {
-        Self {
-            resource: Resource::Users,
-            action: Action::Write,
-            scope: PermissionScope::All,
-        }
-    }
-
-    /// Write Bifrost records (the ingest surface).
-    #[must_use]
-    pub const fn bifrost_record_write() -> Self {
-        Self {
-            resource: Resource::BifrostRecord,
-            action: Action::Write,
-            scope: PermissionScope::All,
-        }
-    }
-
-    /// Invoke the private Bifrost peer protocol.
-    #[must_use]
-    pub const fn bifrost_peer_invoke() -> Self {
-        Self {
-            resource: Resource::BifrostPeer,
-            action: Action::Invoke,
-            scope: PermissionScope::All,
-        }
-    }
-
-    /// Read Bifrost table definitions.
-    #[must_use]
-    pub const fn bifrost_table_read() -> Self {
-        Self {
-            resource: Resource::BifrostTable,
-            action: Action::Read,
-            scope: PermissionScope::All,
-        }
-    }
-
-    /// Write Bifrost table definitions (DDL).
-    #[must_use]
-    pub const fn bifrost_table_write() -> Self {
-        Self {
-            resource: Resource::BifrostTable,
-            action: Action::Write,
-            scope: PermissionScope::All,
-        }
-    }
-
-    /// Install a `SystemShared` Bifrost table (cross-tenant DDL).
-    #[must_use]
-    pub const fn bifrost_table_install() -> Self {
-        Self {
-            resource: Resource::BifrostTable,
-            action: Action::Install,
-            scope: PermissionScope::All,
-        }
-    }
-
-    /// Read Bifrost tables (SQL/scan).
-    #[must_use]
-    pub const fn bifrost_query_read() -> Self {
-        Self {
-            resource: Resource::BifrostQuery,
-            action: Action::Read,
-            scope: PermissionScope::All,
-        }
-    }
-
-    /// Read gateway deployments, redacted credential metadata, and policies.
-    #[must_use]
-    pub const fn gateway_read() -> Self {
-        Self {
-            resource: Resource::Gateway,
-            action: Action::Read,
-            scope: PermissionScope::All,
-        }
-    }
-
-    /// Create, replace, rotate, or revoke gateway configuration and policies.
-    #[must_use]
-    pub const fn gateway_write() -> Self {
-        Self {
-            resource: Resource::Gateway,
-            action: Action::Write,
-            scope: PermissionScope::All,
-        }
-    }
-
-    /// Delete gateway credentials, deployments, and policies.
-    #[must_use]
-    pub const fn gateway_delete() -> Self {
-        Self {
-            resource: Resource::Gateway,
-            action: Action::Delete,
-            scope: PermissionScope::All,
-        }
-    }
-
-    /// Invoke the gateway for the deployment or model named by `access`.
-    #[must_use]
-    pub const fn gateway_invoke(access: GatewayAccess) -> Self {
-        Self {
-            resource: Resource::Gateway,
-            action: Action::Invoke,
-            scope: PermissionScope::Gateway(access),
-        }
-    }
-
-    /// Invoke the gateway for every `open` deployment and its models.
-    ///
-    /// The unscoped grant the built-in `workload` Role carries; a narrower
-    /// custom Role uses [`Self::gateway_invoke`] with one deployment or model,
-    /// which is also the only grant reaching a `granted` deployment.
-    #[must_use]
-    pub const fn gateway_invoke_any() -> Self {
-        Self {
-            resource: Resource::Gateway,
-            action: Action::Invoke,
-            scope: PermissionScope::All,
-        }
-    }
-
-    /// Read captured gateway payload fields.
-    #[must_use]
-    pub const fn gateway_payload_read() -> Self {
-        Self {
-            resource: Resource::GatewayPayload,
-            action: Action::Read,
-            scope: PermissionScope::All,
-        }
-    }
-
-    /// Invoke the one built-in Agent tool `tool`.
-    ///
-    /// The permission each tool call requires before it runs: only a grant of
-    /// this exact tool, [`Self::tool_invoke_any`], or a covering wildcard
-    /// covers it. It grants none of the tool's underlying data access.
-    #[must_use]
-    pub const fn tool_invoke(tool: BuiltinTool) -> Self {
-        Self {
-            resource: Resource::Tool,
-            action: Action::Invoke,
-            scope: PermissionScope::Tool(tool),
-        }
-    }
-
-    /// Invoke every built-in Agent tool.
-    #[must_use]
-    pub const fn tool_invoke_any() -> Self {
-        Self {
-            resource: Resource::Tool,
-            action: Action::Invoke,
-            scope: PermissionScope::All,
-        }
-    }
-
-    /// All permissions.
-    #[must_use]
-    pub const fn wildcard() -> Self {
-        Self {
-            resource: Resource::Wildcard,
-            action: Action::Wildcard,
-            scope: PermissionScope::All,
-        }
-    }
-}
-
-/// Renders the permission's *operation* as `resource:action`.
-///
-/// The object axis is deliberately absent: this string names which operation
-/// was exercised for audit text and diagnostics, and is never the authorization
-/// decision. Scoped authority travels as the typed [`Permission`] and, for
-/// distributed execution, inside the scoped permission digest.
-impl fmt::Display for Permission {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let resource = self.resource.as_str().ok_or(fmt::Error)?;
-        let action = self.action.as_str().ok_or(fmt::Error)?;
-        write!(f, "{resource}:{action}")
-    }
-}
-
-/// Permission parse failure.
-#[derive(Debug, thiserror::Error)]
-#[error("permission must be formatted as resource:action")]
-pub struct PermissionParseError;
-
-/// Parses one `resource:action` operation token into an [`PermissionScope::All`]
-/// permission.
-///
-/// The token language carries no object, so a parsed permission is the
-/// object-wide form. Scoped grants are expressed only through the typed JSON
-/// projection; there is no second string spelling for an object.
-impl FromStr for Permission {
-    type Err = PermissionParseError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let Some((resource, action)) = value.split_once(':') else {
-            return Err(PermissionParseError);
-        };
-        Ok(Self {
-            resource: parse_resource(resource)?,
-            action: parse_action(action)?,
-            scope: PermissionScope::All,
-        })
-    }
-}
-
-fn parse_resource(value: &str) -> Result<Resource, PermissionParseError> {
-    Ok(match value {
-        "cards" => Resource::Cards,
-        "services" => Resource::Services,
-        "operators" => Resource::Operators,
-        "verifier" => Resource::Verifier,
-        "drift" => Resource::Drift,
-        "artifacts" => Resource::Artifacts,
-        "audit" => Resource::Audit,
-        "policy" => Resource::Policy,
-        "triggers" => Resource::Triggers,
-        "service_accounts" => Resource::ServiceAccounts,
-        "users" => Resource::Users,
-        "identity_connections" => Resource::IdentityConnections,
-        "personal_credentials" => Resource::PersonalCredentials,
-        "bifrost_table" => Resource::BifrostTable,
-        "bifrost_record" => Resource::BifrostRecord,
-        "bifrost_peer" => Resource::BifrostPeer,
-        "bifrost_query" => Resource::BifrostQuery,
-        "gateway" => Resource::Gateway,
-        "gateway_payload" => Resource::GatewayPayload,
-        "tool" => Resource::Tool,
-        "wildcard" => Resource::Wildcard,
-        _ => return Err(PermissionParseError),
-    })
-}
-
-fn parse_action(value: &str) -> Result<Action, PermissionParseError> {
-    Ok(match value {
-        "read" => Action::Read,
-        "write" => Action::Write,
-        "delete" => Action::Delete,
-        "invoke" => Action::Invoke,
-        "install" => Action::Install,
-        "lock" => Action::Lock,
-        "run" => Action::Run,
-        "approve" => Action::Approve,
-        "wildcard" => Action::Wildcard,
-        _ => return Err(PermissionParseError),
-    })
-}
-
-/// Two permission sets whose exact shared authority no permission can state.
-///
-/// Delegation refuses on this rather than signing a token that widens either
-/// party or drops authority both hold.
-#[derive(Debug, thiserror::Error)]
-#[error("shared authority for {permission} depends on deployment access and cannot be represented")]
-pub struct UnrepresentableIntersection {
-    /// The gateway grant one side holds only through `all`.
-    pub permission: Permission,
-}
-
-/// Subsumption-aware permission collection.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct PermissionSet(Vec<Permission>);
-
-impl PermissionSet {
-    /// Construct an empty set.
-    #[must_use]
-    pub fn new() -> Self {
-        Self(Vec::new())
-    }
-
-    /// Insert one permission while keeping the set minimal.
-    ///
-    /// A grant is dropped only when another grant [`Permission::subsumes`] it,
-    /// so an explicit gateway grant survives beside `all` in either order.
-    pub fn insert(&mut self, permission: Permission) {
-        if self.0.iter().any(|existing| existing.subsumes(&permission)) {
-            return;
-        }
-        self.0.retain(|existing| !permission.subsumes(existing));
-        self.0.push(permission);
-    }
-
-    /// True if the set covers `required`.
+    /// True when the grants and every ceiling cover `required`.
     #[must_use]
     pub fn contains(&self, required: &Permission) -> bool {
-        self.0.iter().any(|permission| permission.covers(required))
+        self.grants.contains(required) && self.ceilings.iter().all(|set| set.contains(required))
     }
 
-    /// True if a grant naming specific objects, not [`PermissionScope::All`],
-    /// covers `required`.
-    ///
-    /// A `granted` gateway deployment admits only such a grant, so the
-    /// unscoped invoke grant of the built-in Roles never reaches it.
+    /// True when a grant naming specific objects covers `required` and every
+    /// ceiling allows it. See [`PermissionSet::contains_object_scoped`].
     #[must_use]
     pub fn contains_object_scoped(&self, required: &Permission) -> bool {
-        self.0.iter().any(|permission| {
-            permission.scope != PermissionScope::All && permission.covers(required)
-        })
+        self.grants.contains_object_scoped(required)
+            && self
+                .ceilings
+                .iter()
+                .all(|ceiling| ceiling.contains(required))
     }
 
-    /// True when the set grants `action` on `resource` under *any* object scope.
-    ///
-    /// This is coarse admission, not authorization: it answers "does this
-    /// principal hold this capability at all", which is what a public route
-    /// needs before it can resolve the objects a request actually touches. The
-    /// authoritative decision is [`Self::contains`] against the resolved
-    /// object, and no caller may substitute this for it.
+    /// True when every layer admits the operation on some object; coarse
+    /// admission only, never an object decision. See
+    /// [`PermissionSet::covers_operation`].
     #[must_use]
     pub fn covers_operation(&self, resource: &Resource, action: &Action) -> bool {
-        self.0.iter().any(|permission| {
-            permission.resource.covers(resource) && permission.action.covers(action)
-        })
+        self.grants.covers_operation(resource, action)
+            && self
+                .ceilings
+                .iter()
+                .all(|set| set.covers_operation(resource, action))
     }
 
-    /// The authority both sets grant: every permission covered by `self` and by
-    /// `other`, and nothing else.
-    ///
-    /// Delegation mints with this so a delegated token can never carry more
-    /// than its caller holds. Each pair of grants meets axis by axis through the
-    /// same `covers` relations authorization uses: an `AnyOf` is split into its
-    /// members, each axis keeps the narrower side when one covers the other, and
-    /// a pair with a disjoint axis contributes nothing. A wildcard therefore
-    /// yields the other grant, and a schema grant meeting a table grant in that
-    /// schema yields the table grant.
-    ///
-    /// The one meet no scope can state is `all` against an explicit gateway
-    /// grant: `all` reaches only `open` deployments, so their shared authority
-    /// is "that deployment, only while it is open". Such a meet is accepted only
-    /// when the rest of the result already covers it — both sides also hold
-    /// `all`, or both grant the deployment explicitly; otherwise the complete
-    /// intersection is unrepresentable.
+    /// True when no layer combination could allow anything.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.grants.is_empty() || self.ceilings.iter().any(|set| set.is_empty())
+    }
+
+    /// The single permission set this authority equals, for freezing it as a
+    /// durable ceiling or signing it into a restricted token.
     ///
     /// # Errors
     ///
-    /// Returns [`UnrepresentableIntersection`] naming the first gateway grant
-    /// whose shared authority depends on deployment access, so delegation can
-    /// refuse instead of widening or silently dropping it.
-    pub fn intersection(&self, other: &Self) -> Result<Self, UnrepresentableIntersection> {
-        let mut meet = Self::new();
-        let mut open_only = Vec::new();
-        for left in &self.0 {
-            for right in &other.0 {
-                let Some(scope) = narrower(&left.scope, &right.scope, PermissionScope::covers)
-                else {
-                    continue;
-                };
-                let conditional = scope.is_gateway()
-                    && (left.scope == PermissionScope::All || right.scope == PermissionScope::All);
-                for resource in meets(
-                    &left.resource.members(),
-                    &right.resource.members(),
-                    Resource::covers,
-                ) {
-                    for action in meets(
-                        &left.action.members(),
-                        &right.action.members(),
-                        Action::covers,
-                    ) {
-                        let permission = Permission {
-                            resource: resource.clone(),
-                            action: action.clone(),
-                            scope: scope.clone(),
-                        };
-                        if permission.validate().is_err() {
-                            continue;
-                        }
-                        if conditional {
-                            open_only.push(permission);
-                        } else {
-                            meet.insert(permission);
-                        }
-                    }
-                }
-            }
+    /// Returns [`UnrepresentableIntersection`] when two layers share
+    /// authority that no single set can express, so the caller refuses
+    /// instead of widening.
+    pub fn flatten(&self) -> Result<PermissionSet, UnrepresentableIntersection> {
+        let mut flat = PermissionSet::clone(&self.grants);
+        for ceiling in &self.ceilings {
+            flat = flat.intersection(ceiling)?;
         }
-        match open_only
-            .into_iter()
-            .find(|permission| !meet.contains(permission))
-        {
-            Some(permission) => Err(UnrepresentableIntersection { permission }),
-            None => Ok(meet),
-        }
-    }
-
-    /// Iterate over stored permissions.
-    pub fn iter(&self) -> impl Iterator<Item = &Permission> {
-        self.0.iter()
-    }
-
-    /// Number of stored permissions.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    /// True when empty.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        Ok(flat)
     }
 }
 
-/// The narrower of two values on one axis, or `None` when neither covers the
-/// other and the axis is disjoint.
-///
-/// Exact for the resource, action, and scope axes because each is a tree under
-/// its `covers` relation once `AnyOf` is split into members.
-fn narrower<'a, T>(left: &'a T, right: &'a T, covers: fn(&T, &T) -> bool) -> Option<&'a T> {
-    if covers(left, right) {
-        Some(right)
-    } else if covers(right, left) {
-        Some(left)
-    } else {
-        None
+impl From<PermissionSet> for EffectivePermissions {
+    fn from(grants: PermissionSet) -> Self {
+        Self::new(Arc::new(grants))
     }
 }
 
-/// Every non-empty [`narrower`] meet between two lists of axis members.
-fn meets<'a, T>(left: &[&'a T], right: &[&'a T], covers: fn(&T, &T) -> bool) -> Vec<&'a T> {
-    left.iter()
-        .flat_map(|l| right.iter().filter_map(move |r| narrower(*l, *r, covers)))
-        .collect()
+/// Serialized layers of an [`EffectivePermissions`]: plain sets, never cache
+/// handles.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EffectivePermissionsWire {
+    grants: PermissionSet,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ceilings: Vec<PermissionSet>,
 }
 
-impl FromIterator<Permission> for PermissionSet {
-    fn from_iter<T: IntoIterator<Item = Permission>>(iter: T) -> Self {
-        let mut set = Self::new();
-        for permission in iter {
-            set.insert(permission);
+impl Serialize for EffectivePermissions {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        EffectivePermissionsWire {
+            grants: PermissionSet::clone(&self.grants),
+            ceilings: self
+                .ceilings
+                .iter()
+                .map(|set| PermissionSet::clone(set))
+                .collect(),
         }
-        set
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for EffectivePermissions {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = EffectivePermissionsWire::deserialize(deserializer)?;
+        Ok(Self {
+            grants: Arc::new(wire.grants),
+            ceilings: wire.ceilings.into_iter().map(Arc::new).collect(),
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Action, Permission, PermissionScope, PermissionSet, Resource};
-    use serde_json::json;
-    use wyrd_spec::auth::{BifrostPermissionScope, BifrostSchemaScope, BifrostTableScope};
+    use std::sync::Arc;
 
-    #[test]
-    fn serde_round_trip_every_variant() {
-        let resources = [
-            Resource::Cards,
-            Resource::Services,
-            Resource::Operators,
-            Resource::Verifier,
-            Resource::Drift,
-            Resource::Artifacts,
-            Resource::Audit,
-            Resource::Policy,
-            Resource::Triggers,
-            Resource::ServiceAccounts,
-            Resource::Users,
-            Resource::IdentityConnections,
-            Resource::PersonalCredentials,
-            Resource::AnyOf(vec![Resource::Operators, Resource::Triggers]),
-            Resource::Wildcard,
-        ];
-        for resource in resources {
-            let value = serde_json::to_value(&resource).expect("resource serializes");
-            let round_trip: Resource =
-                serde_json::from_value(value).expect("resource deserializes");
-            assert_eq!(round_trip, resource);
-        }
+    use wyrd_spec::auth::{CardPermissionScope, PermissionScope};
+    use wyrd_spec::envelope::CardKind;
+    use wyrd_spec::ids::{CardName, CardUid};
 
-        let actions = [
-            Action::Read,
-            Action::Write,
-            Action::Delete,
-            Action::Invoke,
-            Action::Install,
-            Action::Lock,
-            Action::Run,
-            Action::Approve,
-            Action::AnyOf(vec![Action::Read, Action::Write]),
-            Action::Wildcard,
-        ];
-        for action in actions {
-            let value = serde_json::to_value(&action).expect("action serializes");
-            let round_trip: Action = serde_json::from_value(value).expect("action deserializes");
-            assert_eq!(round_trip, action);
-        }
+    use super::{EffectivePermissions, Permission, PermissionSet};
+
+    fn payments() -> PermissionScope {
+        PermissionScope::Card(CardPermissionScope::family(
+            CardKind::Repository,
+            CardName::new("payments").expect("name"),
+        ))
     }
 
-    #[test]
-    fn bifrost_permissions_round_trip_through_wire_strings() {
-        for (permission, wire) in [
-            (Permission::bifrost_record_write(), "bifrost_record:write"),
-            (Permission::bifrost_table_read(), "bifrost_table:read"),
-            (Permission::bifrost_table_write(), "bifrost_table:write"),
-            (Permission::bifrost_query_read(), "bifrost_query:read"),
-            (Permission::bifrost_peer_invoke(), "bifrost_peer:invoke"),
-        ] {
-            assert_eq!(permission.to_string(), wire);
-            assert_eq!(wire.parse::<Permission>().expect("wire parses"), permission);
-            let json = serde_json::to_value(&permission).expect("serializes");
-            assert_eq!(
-                serde_json::from_value::<Permission>(json).expect("deserializes"),
-                permission
-            );
-        }
+    fn payments_v1() -> PermissionScope {
+        PermissionScope::Card(CardPermissionScope::version(
+            CardKind::Repository,
+            CardName::new("payments").expect("name"),
+            CardUid::new("01927b4c-0000-7000-8000-000000000001").expect("uid"),
+        ))
     }
 
-    #[test]
-    fn bifrost_record_write_is_distinct_from_table_write() {
-        assert!(!Permission::bifrost_table_write().covers(&Permission::bifrost_record_write()));
-        assert!(!Permission::bifrost_record_write().covers(&Permission::bifrost_table_write()));
-        assert!(Permission::wildcard().covers(&Permission::bifrost_record_write()));
-    }
-
-    #[test]
-    fn covers_wildcard_resource() {
-        let permission = Permission {
-            resource: Resource::Wildcard,
-            action: Action::Read,
-            scope: PermissionScope::All,
-        };
-
-        assert!(permission.covers(&Permission::card_read()));
-        assert!(!permission.covers(&Permission::card_write()));
-    }
-
-    #[test]
-    fn covers_wildcard_action() {
-        let permission = Permission {
-            resource: Resource::Cards,
-            action: Action::Wildcard,
-            scope: PermissionScope::All,
-        };
-
-        assert!(permission.covers(&Permission::card_read()));
-        assert!(permission.covers(&Permission::card_write()));
-        assert!(!permission.covers(&Permission::artifact_write()));
-    }
-
-    /// The resource-and-action wildcard covers every concrete grant, including
-    /// Bifrost record writes outside the Card family.
+    /// Proves layers are conjunctive: a ceiling narrows a family grant to an
+    /// exact version, an empty ceiling permits nothing, a ceiling never adds
+    /// what grants lack, and flattening yields the same narrowed set.
     ///
     /// # Panics
-    /// Panics when the wildcard fails to cover any probed permission.
+    /// Panics when a layer widens or fails to narrow authority.
     #[test]
-    fn covers_double_wildcard() {
-        let permission = Permission::wildcard();
+    fn ceilings_only_restrict_current_grants() {
+        let grants: PermissionSet = [
+            Permission::card_read().at(payments()),
+            Permission::card_write().at(payments()),
+        ]
+        .into_iter()
+        .collect();
+        let unrestricted = EffectivePermissions::from(grants);
+        assert!(unrestricted.contains(&Permission::card_write().at(payments_v1())));
 
-        assert!(permission.covers(&Permission::card_read()));
-        assert!(permission.covers(&Permission::card_write()));
-        assert!(permission.covers(&Permission::bifrost_record_write()));
-    }
+        let read_v1: PermissionSet = [Permission::card_read().at(payments_v1())]
+            .into_iter()
+            .collect();
+        let restricted = unrestricted.clone().restricted_by(Arc::new(read_v1));
+        assert!(restricted.contains(&Permission::card_read().at(payments_v1())));
+        assert!(!restricted.contains(&Permission::card_write().at(payments_v1())));
+        assert!(!restricted.contains(&Permission::card_read().at(payments())));
 
-    #[test]
-    fn covers_anyof_resource() {
-        let permission = Permission {
-            resource: Resource::AnyOf(vec![Resource::Operators, Resource::Triggers]),
-            action: Action::Invoke,
-            scope: PermissionScope::All,
-        };
+        let empty = unrestricted
+            .clone()
+            .restricted_by(Arc::new(PermissionSet::new()));
+        assert!(empty.is_empty());
+        assert!(!empty.contains(&Permission::card_read().at(payments_v1())));
 
-        assert!(permission.covers(&Permission::operator_invoke()));
-        assert!(permission.covers(&Permission {
-            resource: Resource::Triggers,
-            action: Action::Invoke,
-            scope: PermissionScope::All,
-        }));
-        assert!(!permission.covers(&Permission {
-            resource: Resource::Cards,
-            action: Action::Invoke,
-            scope: PermissionScope::All,
-        }));
-    }
-
-    #[test]
-    fn permission_set_subsumption_drops_redundant() {
-        let mut set = PermissionSet::from_iter([Permission::card_read()]);
-        set.insert(Permission::wildcard());
-
-        assert_eq!(set.len(), 1);
-        assert_eq!(set.iter().next(), Some(&Permission::wildcard()));
-    }
-
-    #[test]
-    fn permission_set_subsumption_skips_covered() {
-        let mut set = PermissionSet::from_iter([Permission::wildcard()]);
-        set.insert(Permission::card_read());
-
-        assert_eq!(set.len(), 1);
-        assert_eq!(set.iter().next(), Some(&Permission::wildcard()));
-    }
-
-    /// Set membership resolves through coverage, so a set holding only the
-    /// wildcard contains every concrete permission.
-    ///
-    /// # Panics
-    /// Panics when the wildcard-only set does not contain a probed permission.
-    #[test]
-    fn permission_set_contains_resolves_through_wildcard() {
-        let set = PermissionSet::from_iter([Permission::wildcard()]);
-
-        assert!(set.contains(&Permission::card_read()));
-        assert!(set.contains(&Permission::bifrost_record_write()));
-    }
-
-    #[test]
-    fn permission_set_jsonb_round_trip() {
-        let permissions = vec![
-            Permission::card_write(),
-            Permission::card_read(),
-            Permission {
-                resource: Resource::AnyOf(vec![Resource::Operators, Resource::Triggers]),
-                action: Action::Invoke,
-                scope: PermissionScope::All,
-            },
-            Permission::wildcard(),
-        ];
-        let value = serde_json::to_value(&permissions).expect("permissions serialize");
-
-        assert_eq!(
-            value,
-            json!([
-                {"resource": "cards", "action": "write", "scope": "all"},
-                {"resource": "cards", "action": "read", "scope": "all"},
-                {"resource": {"any_of": ["operators", "triggers"]}, "action": "invoke", "scope": "all"},
-                {"resource": "wildcard", "action": "wildcard", "scope": "all"}
-            ])
-        );
-
-        let round_trip: Vec<Permission> =
-            serde_json::from_value(value).expect("permissions deserialize");
-        assert_eq!(round_trip, permissions);
-    }
-
-    /// Proves gateway grants round-trip their approved wire names, a
-    /// deployment invoke grant covers that deployment's models only, only an
-    /// object-scoped grant counts as scoped, and a gateway object scope is
-    /// refused anywhere but gateway invoke.
-    ///
-    /// # Panics
-    /// Panics when a fixture fails to build or an assertion fails.
-    #[test]
-    fn gateway_permissions_are_typed_and_scope_checked() {
-        use super::GatewayAccess;
-        use wyrd_spec::ids::{ModelId, ProviderDeploymentName};
-        let openai = ProviderDeploymentName::new("openai").expect("valid deployment");
-        let provider = GatewayAccess::Deployment {
-            deployment: openai.clone(),
-        };
-        let model = |name: &str| GatewayAccess::Model {
-            deployment: openai.clone(),
-            model: ModelId::new(name).expect("valid model"),
-        };
-        let required = Permission::gateway_invoke(model("gpt-4o"));
-        assert!(PermissionSet::from_iter([Permission::gateway_invoke_any()]).contains(&required));
+        let wide: PermissionSet = [Permission::wildcard()].into_iter().collect();
+        let capped = EffectivePermissions::from(PermissionSet::new()).restricted_by(Arc::new(wide));
         assert!(
-            !PermissionSet::from_iter([Permission::gateway_invoke_any()])
-                .contains_object_scoped(&required),
-            "the unscoped grant is not a grant of the deployment"
-        );
-        assert!(
-            PermissionSet::from_iter([Permission::gateway_invoke(provider.clone())])
-                .contains_object_scoped(&required)
+            !capped.contains(&Permission::card_read()),
+            "a ceiling grants nothing"
         );
 
         assert_eq!(
-            Permission::gateway_payload_read().to_string(),
-            "gateway_payload:read"
+            restricted.flatten().expect("representable"),
+            [Permission::card_read().at(payments_v1())]
+                .into_iter()
+                .collect()
         );
-        assert_eq!(
-            "gateway:write".parse::<Permission>().expect("parses"),
-            Permission::gateway_write()
-        );
-        assert!(
-            Permission::gateway_invoke(provider.clone())
-                .covers(&Permission::gateway_invoke(model("gpt-4o")))
-        );
-        assert!(
-            !Permission::gateway_invoke(model("gpt-4o"))
-                .covers(&Permission::gateway_invoke(model("gpt-4.1")))
-        );
-        assert!(
-            !Permission::gateway_invoke(provider.clone()).covers(&Permission::gateway_read()),
-            "invoke never grants admin metadata reads"
-        );
-        assert_eq!(
-            serde_json::to_value(Permission::gateway_invoke(model("gpt-4o"))).expect("serializes"),
-            json!({
-                "resource": "gateway",
-                "action": "invoke",
-                "scope": {"gateway": {"model": {"deployment": "openai", "model": "gpt-4o"}}}
-            })
-        );
-        for (resource, action) in [("gateway", "read"), ("cards", "invoke")] {
-            assert!(
-                serde_json::from_value::<Permission>(json!({
-                    "resource": resource,
-                    "action": action,
-                    "scope": {"gateway": {"deployment": {"deployment": "openai"}}}
-                }))
-                .is_err(),
-                "{resource}:{action}"
-            );
-        }
-    }
-
-    /// Proves `verifier:run`, `verifier:read`, and `verifier:approve` parse,
-    /// cover only their exact
-    /// Verifier UID or their unscoped grant, never each other, and refuse a
-    /// Verifier scope on any other operation.
-    ///
-    /// # Panics
-    /// Panics when a grant fails to parse or covers the wrong operation or
-    /// Verifier.
-    #[test]
-    fn verifier_run_is_uid_scoped() {
-        use wyrd_spec::ids::CardUid;
-        let uid = |value: &str| CardUid::new(value).expect("valid uuid7");
-        let bound = uid("01927b4c-0000-7000-8000-000000000001");
-        let other = uid("01927b4c-0000-7000-8000-000000000002");
-
-        assert_eq!(
-            "verifier:run".parse::<Permission>().expect("parses"),
-            Permission::verifier_run_any()
-        );
-        assert!(Permission::verifier_run_any().covers(&Permission::verifier_run(bound.clone())));
-        assert!(
-            Permission::verifier_run(bound.clone())
-                .covers(&Permission::verifier_run(bound.clone()))
-        );
-        assert!(
-            !Permission::verifier_run(other.clone())
-                .covers(&Permission::verifier_run(bound.clone())),
-            "an unrelated UID grant does not cover"
-        );
-        assert_eq!(
-            "verifier:read".parse::<Permission>().expect("parses"),
-            Permission::verifier_read_any()
-        );
-        assert!(Permission::verifier_read_any().covers(&Permission::verifier_read(bound.clone())));
-        assert!(
-            Permission::verifier_read(bound.clone())
-                .covers(&Permission::verifier_read(bound.clone()))
-        );
-        assert!(
-            !Permission::verifier_read(other).covers(&Permission::verifier_read(bound.clone()))
-        );
-        assert!(!Permission::verifier_run_any().covers(&Permission::verifier_read(bound.clone())));
-        assert!(!Permission::verifier_read_any().covers(&Permission::verifier_run(bound.clone())));
-        assert!(!Permission::card_read().covers(&Permission::verifier_read(bound.clone())));
-        assert_eq!(
-            "verifier:approve".parse::<Permission>().expect("parses"),
-            Permission::verifier_approve_any()
-        );
-        assert!(
-            Permission::verifier_approve_any().covers(&Permission::verifier_approve(bound.clone()))
-        );
-        assert!(
-            !Permission::verifier_approve(uid("01927b4c-0000-7000-8000-000000000003"))
-                .covers(&Permission::verifier_approve(bound.clone())),
-            "an unrelated UID approve grant does not cover"
-        );
-        for broader in [
-            Permission::verifier_run_any(),
-            Permission::verifier_read_any(),
-        ] {
-            assert!(
-                !broader.covers(&Permission::verifier_approve(bound.clone())),
-                "{broader} does not decide approvals"
-            );
-        }
-        assert_eq!(
-            serde_json::from_value::<Permission>(json!({
-                "resource": "verifier", "action": "approve", "scope": {"verifier": bound.as_str()}
-            }))
-            .expect("a scoped approve decodes"),
-            Permission::verifier_approve(bound.clone())
-        );
-        assert_eq!(
-            serde_json::from_value::<Permission>(json!({
-                "resource": "verifier", "action": "read", "scope": {"verifier": bound.as_str()}
-            }))
-            .expect("a scoped read decodes"),
-            Permission::verifier_read(bound.clone())
-        );
-        assert_eq!(
-            serde_json::to_value(Permission::verifier_run(bound.clone())).expect("serializes"),
-            json!({"resource": "verifier", "action": "run", "scope": {"verifier": bound.as_str()}})
-        );
-        for (resource, action) in [("verifier", "invoke"), ("cards", "run")] {
-            assert!(
-                serde_json::from_value::<Permission>(json!({
-                    "resource": resource,
-                    "action": action,
-                    "scope": {"verifier": bound.as_str()}
-                }))
-                .is_err(),
-                "{resource}:{action}"
-            );
-        }
-    }
-
-    /// Proves `tool:invoke` decodes in both approved wire forms, refuses
-    /// non-built-in names and misplaced tool scopes, covers and intersects by
-    /// exact name, and is neither implied by domain grants nor implies them.
-    ///
-    /// # Panics
-    /// Panics when a tool grant decodes, covers, or intersects incorrectly.
-    #[test]
-    fn tool_invoke_is_exact_name_scoped_and_independent() {
-        use wyrd_spec::card::agent::BuiltinTool;
-        let query = Permission::tool_invoke(BuiltinTool::BifrostQuery);
-        let read = Permission::tool_invoke(BuiltinTool::FsRead);
-        let global = Permission::tool_invoke_any();
-
-        let decode = |value: serde_json::Value| serde_json::from_value::<Permission>(value);
-        let global_json = json!({"resource": "tool", "action": "invoke", "scope": "all"});
-        let exact_json =
-            json!({"resource": "tool", "action": "invoke", "scope": {"tool": "bifrost.query"}});
-        assert_eq!(decode(global_json.clone()).expect("global"), global);
-        assert_eq!(decode(exact_json.clone()).expect("exact"), query);
-        assert_eq!(
-            serde_json::to_value(&global).expect("serialize"),
-            global_json
-        );
-        assert_eq!(serde_json::to_value(&query).expect("serialize"), exact_json);
-        assert_eq!("tool:invoke".parse::<Permission>().expect("parses"), global);
-        for tool in BuiltinTool::ALL {
-            let value =
-                json!({"resource": "tool", "action": "invoke", "scope": {"tool": tool.as_str()}});
-            assert_eq!(
-                decode(value).expect("built-in"),
-                Permission::tool_invoke(tool)
-            );
-        }
-        for name in [
-            "bifrost",
-            "bifrost.*",
-            "fs.read/etc",
-            "/usr/bin/python",
-            "FS.READ",
-            "http.fetch",
-        ] {
-            let value = json!({"resource": "tool", "action": "invoke", "scope": {"tool": name}});
-            assert!(decode(value).is_err(), "{name}");
-        }
-        for (resource, action) in [
-            ("tool", "read"),
-            ("tool", "run"),
-            ("cards", "invoke"),
-            ("bifrost_query", "read"),
-            ("wildcard", "invoke"),
-        ] {
-            let value =
-                json!({"resource": resource, "action": action, "scope": {"tool": "fs.read"}});
-            assert!(decode(value).is_err(), "{resource}:{action}");
-        }
-
-        assert!(global.covers(&query));
-        assert!(query.covers(&query));
-        assert!(!query.covers(&read));
-        assert!(!query.covers(&global));
-        assert!(Permission::wildcard().covers(&query));
-        for domain in [
-            Permission::card_read(),
-            Permission::bifrost_query_read(),
-            Permission::verifier_run_any(),
-        ] {
-            assert!(!domain.covers(&query), "{domain}");
-            assert!(!global.covers(&domain), "{domain}");
-        }
-
-        let set = |grants: &[Permission]| grants.iter().cloned().collect::<PermissionSet>();
-        let meet = |left: &[Permission], right: &[Permission]| {
-            set(left).intersection(&set(right)).expect("representable")
-        };
-        assert!(meet(std::slice::from_ref(&query), std::slice::from_ref(&read)).is_empty());
-        for (left, right) in [(&global, &query), (&query, &global)] {
-            let shared = meet(std::slice::from_ref(left), std::slice::from_ref(right));
-            assert_eq!(shared.iter().collect::<Vec<_>>(), vec![&query]);
-        }
-        let attenuated = meet(&[Permission::wildcard()], std::slice::from_ref(&query));
-        assert!(attenuated.contains(&query) && !attenuated.contains(&read));
-
-        let role: Vec<Permission> =
-            serde_json::from_value(json!([global_json, exact_json, {"resource": "bifrost_query", "action": "read", "scope": "all"}]))
-                .expect("role permissions decode");
-        let role = role.into_iter().collect::<PermissionSet>();
-        assert!(role.contains(&query) && role.contains(&read));
-    }
-
-    /// Proves an explicit gateway grant survives merging beside `all` in either
-    /// order and under wildcard or `AnyOf` axes, and that delegation meets
-    /// gateway grants exactly: `all` with `all` stays `all`, explicit grants
-    /// meet to the narrower grant, a mixed pair whose explicit result the other
-    /// side also holds explicitly is representable, and `all` meeting an
-    /// explicit grant alone — "that deployment, only if open" — is refused in
-    /// both directions instead of minting the explicit grant.
-    ///
-    /// # Panics
-    /// Panics when a merge drops an explicit grant, a representable meet
-    /// differs from the exact shared authority, or an unrepresentable meet
-    /// succeeds.
-    #[test]
-    fn gateway_grants_survive_merge_and_intersect_exactly() {
-        use super::GatewayAccess;
-        use wyrd_spec::ids::{ModelId, ProviderDeploymentName};
-        let restricted = ProviderDeploymentName::new("restricted").expect("valid deployment");
-        let deployment = Permission::gateway_invoke(GatewayAccess::Deployment {
-            deployment: restricted.clone(),
-        });
-        let model = Permission::gateway_invoke(GatewayAccess::Model {
-            deployment: restricted,
-            model: ModelId::new("gpt-4o").expect("valid model"),
-        });
-        let any_resource_invoke = Permission {
-            resource: Resource::AnyOf(vec![Resource::Gateway, Resource::Cards]),
-            action: Action::Wildcard,
-            scope: PermissionScope::All,
-        };
-        for broad in [
-            Permission::gateway_invoke_any(),
-            Permission::wildcard(),
-            any_resource_invoke,
-        ] {
-            for set in [
-                PermissionSet::from_iter([broad.clone(), deployment.clone()]),
-                PermissionSet::from_iter([deployment.clone(), broad.clone()]),
-            ] {
-                assert!(set.contains_object_scoped(&model), "{broad} kept explicit");
-                assert!(set.contains(&Permission::gateway_invoke_any()));
-            }
-        }
-
-        let all = PermissionSet::from_iter([Permission::gateway_invoke_any()]);
-        let explicit = PermissionSet::from_iter([deployment.clone()]);
-        let narrow = PermissionSet::from_iter([model.clone()]);
-        assert_eq!(all.intersection(&all).expect("representable"), all);
-        assert_eq!(
-            explicit.intersection(&narrow).expect("representable"),
-            narrow
-        );
-        assert!(all.intersection(&explicit).is_err());
-        assert!(explicit.intersection(&all).is_err());
-        let wildcard = PermissionSet::from_iter([Permission::wildcard()]);
-        assert!(wildcard.intersection(&narrow).is_err());
-
-        let mixed = PermissionSet::from_iter([Permission::gateway_invoke_any(), deployment]);
-        assert_eq!(mixed.intersection(&narrow).expect("representable"), narrow);
-        assert_eq!(narrow.intersection(&mixed).expect("representable"), narrow);
-        assert_eq!(
-            mixed.intersection(&all).expect("representable"),
-            all,
-            "both hold all; only one holds the explicit grant"
-        );
-        assert!(
-            PermissionSet::from_iter([Permission::card_read()])
-                .intersection(&explicit)
-                .expect("no overlap is the representable empty result")
-                .is_empty()
-        );
-    }
-
-    /// Builds the schema-scoped Bifrost query-read grant the journey seeds.
-    fn logs_schema_grant() -> Permission {
-        Permission {
-            resource: Resource::BifrostQuery,
-            action: Action::Read,
-            scope: PermissionScope::Bifrost(BifrostPermissionScope::Schema(BifrostSchemaScope {
-                catalog: "bifrost".to_owned(),
-                schema: "logs".to_owned(),
-            })),
-        }
-    }
-
-    /// Builds the exact table-scoped Bifrost query-read requirement for one UID.
-    fn table_requirement(schema: &str, uid: uuid::Uuid) -> Permission {
-        Permission {
-            resource: Resource::BifrostQuery,
-            action: Action::Read,
-            scope: PermissionScope::Bifrost(BifrostPermissionScope::Table(BifrostTableScope {
-                catalog: "bifrost".to_owned(),
-                schema: schema.to_owned(),
-                table_uid: uid,
-            })),
-        }
-    }
-
-    /// Proves the intersection keeps only authority both sides grant, at the
-    /// narrower scope: wildcard, schema, exact-object, and disjoint grants.
-    ///
-    /// # Panics
-    /// Panics when an intersection keeps broader, one-sided, or disjoint
-    /// authority, or drops authority both sides grant.
-    #[test]
-    fn intersection_keeps_only_the_narrower_shared_authority() {
-        let uid = uuid::Uuid::from_u128(0x77);
-        let set = |permissions: Vec<Permission>| permissions.into_iter().collect::<PermissionSet>();
-
-        let wildcard = set(vec![Permission::wildcard()]);
-        let target = set(vec![Permission::card_read(), logs_schema_grant()]);
-        assert_eq!(
-            wildcard.intersection(&target).expect("representable"),
-            target
-        );
-        assert_eq!(
-            target.intersection(&wildcard).expect("representable"),
-            target
-        );
-
-        let schema = set(vec![logs_schema_grant()]);
-        let table = set(vec![table_requirement("logs", uid)]);
-        assert_eq!(schema.intersection(&table).expect("representable"), table);
-        assert_eq!(table.intersection(&schema).expect("representable"), table);
-
-        let other_table = set(vec![table_requirement("logs", uuid::Uuid::from_u128(0x78))]);
-        assert!(
-            table
-                .intersection(&other_table)
-                .expect("representable")
-                .is_empty()
-        );
-        assert!(
-            set(vec![table_requirement("traces", uid)])
-                .intersection(&schema)
-                .expect("representable")
-                .is_empty()
-        );
-
-        let all_reads = set(vec![Permission {
-            resource: Resource::Wildcard,
-            action: Action::Read,
-            scope: PermissionScope::All,
-        }]);
-        let cards_any = set(vec![Permission {
-            resource: Resource::AnyOf(vec![Resource::Cards, Resource::Audit]),
-            action: Action::Wildcard,
-            scope: PermissionScope::All,
-        }]);
-        assert_eq!(
-            all_reads.intersection(&cards_any).expect("representable"),
-            set(vec![Permission::card_read(), Permission::audit_read()])
-        );
-
-        assert!(
-            set(vec![Permission::card_write()])
-                .intersection(&set(vec![
-                    Permission::card_read(),
-                    Permission::bifrost_record_write()
-                ]))
-                .expect("representable")
-                .is_empty()
-        );
-    }
-
-    /// Proves the persisted permission JSON is exactly the approved three-field
-    /// projection for `all`, schema, and table scope, in both directions.
-    ///
-    /// # Panics
-    /// Panics when a permission fails to serialize or deserialize, or its
-    /// JSON or decoded value differs from the approved projection.
-    #[test]
-    fn scoped_permission_json_matches_the_approved_projection() {
-        let uid = uuid::Uuid::from_u128(0x99);
-        let cases = [
-            (
-                Permission::bifrost_query_read(),
-                json!({"resource": "bifrost_query", "action": "read", "scope": "all"}),
-            ),
-            (
-                logs_schema_grant(),
-                json!({
-                    "resource": "bifrost_query",
-                    "action": "read",
-                    "scope": {"bifrost": {"schema": {"catalog": "bifrost", "schema": "logs"}}}
-                }),
-            ),
-            (
-                table_requirement("traces", uid),
-                json!({
-                    "resource": "bifrost_query",
-                    "action": "read",
-                    "scope": {"bifrost": {"table": {
-                        "catalog": "bifrost",
-                        "schema": "traces",
-                        "table_uid": uid.to_string(),
-                    }}}
-                }),
-            ),
-        ];
-
-        for (permission, wire) in cases {
-            assert_eq!(
-                serde_json::to_value(&permission).expect("permission serializes"),
-                wire
-            );
-            assert_eq!(
-                serde_json::from_value::<Permission>(wire).expect("permission deserializes"),
-                permission
-            );
-        }
-    }
-
-    /// Proves Bifrost object scope applies to record writes as well as query
-    /// reads, a table-scoped write covers only its own table, and the scope is
-    /// still refused on any other resource or action pairing.
-    ///
-    /// # Panics
-    /// Panics when the table-scoped record write fails validation or its
-    /// round trip, covers another table or the unscoped requirement, is not
-    /// covered by the unscoped write, or validates on record read, query
-    /// write, or table write.
-    #[test]
-    fn bifrost_scope_applies_to_record_write_and_query_read_only() {
-        let calls = uuid::Uuid::from_u128(0xca11);
-        let spans = uuid::Uuid::from_u128(0x5a45);
-        let table_write = |uid| Permission {
-            resource: Resource::BifrostRecord,
-            action: Action::Write,
-            scope: PermissionScope::Bifrost(BifrostPermissionScope::Table(BifrostTableScope {
-                catalog: "bifrost".to_owned(),
-                schema: "gateway".to_owned(),
-                table_uid: uid,
-            })),
-        };
-        table_write(calls)
-            .validate()
-            .expect("scoped record write is valid");
-        assert!(table_write(calls).covers(&table_write(calls)));
-        assert!(!table_write(calls).covers(&table_write(spans)));
-        assert!(
-            !table_write(calls).covers(&Permission::bifrost_record_write()),
-            "a table-scoped write never covers the unscoped requirement"
-        );
-        assert!(Permission::bifrost_record_write().covers(&table_write(spans)));
-        let wire = serde_json::to_value(table_write(calls)).expect("serializes");
-        assert_eq!(
-            serde_json::from_value::<Permission>(wire).expect("round-trips"),
-            table_write(calls)
-        );
-        for (resource, action) in [
-            (Resource::BifrostRecord, Action::Read),
-            (Resource::BifrostQuery, Action::Write),
-            (Resource::BifrostTable, Action::Write),
-        ] {
-            let permission = Permission {
-                resource,
-                action,
-                ..table_write(calls)
-            };
-            assert!(permission.validate().is_err(), "{permission}");
-        }
-    }
-
-    /// Proves `scope` is mandatory: the pre-scope two-field form is rejected
-    /// rather than defaulted, so no compatibility decoder exists.
-    #[test]
-    fn scope_is_required_and_has_no_compatibility_decoder() {
-        let error = serde_json::from_value::<Permission>(json!({
-            "resource": "bifrost_query",
-            "action": "read"
-        }))
-        .expect_err("the unscoped two-field form is not accepted");
-
-        assert!(error.to_string().contains("scope"), "{error}");
-    }
-
-    /// Proves a Bifrost object scope only attaches to a resource that owns a
-    /// Bifrost object; `cards` and `wildcard` both fail closed at decode.
-    ///
-    /// # Panics
-    /// Panics when a schema scope decodes on `cards` or `wildcard`, or the
-    /// decode error does not name the resource.
-    #[test]
-    fn bifrost_scope_is_rejected_on_an_unrelated_resource() {
-        for resource in ["cards", "wildcard"] {
-            let error = serde_json::from_value::<Permission>(json!({
-                "resource": resource,
-                "action": "read",
-                "scope": {"bifrost": {"schema": {"catalog": "bifrost", "schema": "logs"}}}
-            }))
-            .expect_err("a Bifrost object scope needs a Bifrost object resource");
-
-            assert!(error.to_string().contains("resource"), "{error}");
-        }
-    }
-
-    /// Proves Bifrost object scope is valid only for the exact `read` action.
-    ///
-    /// Without this, persisted or signed JSON could carry a Bifrost scope on
-    /// `wildcard`, which then covers the required read and turns corrupt role
-    /// JSON into effective read authority instead of a decode failure.
-    ///
-    /// # Panics
-    /// Panics when a schema scope decodes on `write`, `wildcard`, or an
-    /// `any_of` action, a refusal does not name the action, or the exact
-    /// query read is refused.
-    #[test]
-    fn bifrost_scope_is_rejected_on_a_non_read_action() {
-        for action in [
-            json!("write"),
-            json!("wildcard"),
-            json!({"any_of": ["read", "write"]}),
-        ] {
-            let error = serde_json::from_value::<Permission>(json!({
-                "resource": "bifrost_query",
-                "action": action,
-                "scope": {"bifrost": {"schema": {"catalog": "bifrost", "schema": "logs"}}}
-            }))
-            .expect_err("a Bifrost object scope only applies to an exact read");
-
-            assert!(error.to_string().contains("action"), "{error}");
-        }
-
-        serde_json::from_value::<Permission>(json!({
-            "resource": "bifrost_query",
-            "action": "read",
-            "scope": {"bifrost": {"schema": {"catalog": "bifrost", "schema": "logs"}}}
-        }))
-        .expect("exact query read stays valid for Bifrost scope");
-    }
-
-    /// Proves a structurally valid but empty object identity is not an object:
-    /// malformed identities fail at decode, never at check time.
-    ///
-    /// # Panics
-    /// Panics when a schema scope with an empty schema segment decodes.
-    #[test]
-    fn malformed_scope_identity_is_rejected_at_decode() {
-        assert!(
-            serde_json::from_value::<Permission>(json!({
-                "resource": "bifrost_query",
-                "action": "read",
-                "scope": {"bifrost": {"schema": {"catalog": "bifrost", "schema": ""}}}
-            }))
-            .is_err(),
-            "an empty schema segment is not an object identity"
-        );
-    }
-
-    /// Proves coverage requires resource, action, and scope together, and that
-    /// wildcard authority stays object-wide only because its scope is `All`.
-    #[test]
-    fn coverage_is_three_axis() {
-        let logs = uuid::Uuid::from_u128(1);
-        let traces = uuid::Uuid::from_u128(2);
-
-        // Schema scope reaches current and future tables in that exact schema.
-        assert!(logs_schema_grant().covers(&table_requirement("logs", logs)));
-        assert!(logs_schema_grant().covers(&table_requirement("logs", traces)));
-        assert!(!logs_schema_grant().covers(&table_requirement("traces", traces)));
-
-        // Exact table scope reaches only its own UID.
-        let exact = table_requirement("traces", traces);
-        assert!(exact.covers(&table_requirement("traces", traces)));
-        assert!(!exact.covers(&table_requirement("traces", logs)));
-
-        // `All` reaches every object, but only for its own resource and action.
-        assert!(Permission::bifrost_query_read().covers(&table_requirement("logs", logs)));
-        assert!(!Permission::bifrost_table_read().covers(&table_requirement("logs", logs)));
-
-        // A wildcard grant is object-wide only because its scope is `All`.
-        assert!(Permission::wildcard().covers(&table_requirement("logs", logs)));
-
-        // A scoped grant never satisfies an object-wide requirement.
-        assert!(!logs_schema_grant().covers(&Permission::bifrost_query_read()));
-    }
-
-    /// Proves coarse operation admission and authoritative object coverage are
-    /// distinct: a scoped grant admits the operation but authorizes only its object.
-    #[test]
-    fn covers_operation_admits_a_scoped_grant_without_authorizing_an_object() {
-        let set = PermissionSet::from_iter([logs_schema_grant()]);
-
-        assert!(set.covers_operation(&Resource::BifrostQuery, &Action::Read));
-        assert!(!set.covers_operation(&Resource::BifrostTable, &Action::Read));
-        assert!(!set.contains(&Permission::bifrost_query_read()));
-        assert!(set.contains(&table_requirement("logs", uuid::Uuid::from_u128(7))));
-        assert!(!set.contains(&table_requirement("traces", uuid::Uuid::from_u128(7))));
-    }
-
-    /// Proves set subsumption runs on all three axes: disjoint scopes are both
-    /// retained, and an `All`-scoped grant absorbs every narrower scope.
-    #[test]
-    fn permission_set_keeps_scopes_that_do_not_subsume_each_other() {
-        let mut set = PermissionSet::from_iter([logs_schema_grant()]);
-        set.insert(table_requirement("traces", uuid::Uuid::from_u128(3)));
-
-        assert_eq!(set.len(), 2);
-
-        set.insert(Permission::bifrost_query_read());
-
-        assert_eq!(set.len(), 1);
-        assert_eq!(set.iter().next(), Some(&Permission::bifrost_query_read()));
-    }
-
-    #[test]
-    fn permission_wire_token_roundtrips() {
-        let parsed = "cards:write"
-            .parse::<Permission>()
-            .expect("permission parses");
-
-        assert_eq!(parsed, Permission::card_write());
-        assert_eq!(parsed.to_string(), "cards:write");
-    }
-
-    /// Proves the retired `evals` resource is an ordinary unknown resource in
-    /// every wire form — string grants, structured grants and `any_of`
-    /// members, for `run` and `invoke` — while `verifier:run` and unrelated
-    /// grants keep parsing and covering exactly as before.
-    ///
-    /// # Panics
-    /// Panics when a retired form parses or a retained grant stops parsing or
-    /// covering.
-    #[test]
-    fn retired_permission_is_unknown() {
-        for action in ["run", "invoke"] {
-            assert!(
-                format!("evals:{action}").parse::<Permission>().is_err(),
-                "evals:{action}"
-            );
-            assert!(
-                serde_json::from_value::<Permission>(
-                    json!({"resource": "evals", "action": action, "scope": "all"})
-                )
-                .is_err(),
-                "structured evals:{action}"
-            );
-            assert!(
-                serde_json::from_value::<Permission>(json!({
-                    "resource": {"any_of": ["operators", "evals"]},
-                    "action": action,
-                    "scope": "all"
-                }))
-                .is_err(),
-                "any_of evals:{action}"
-            );
-        }
-        let verifier = "verifier:run"
-            .parse::<Permission>()
-            .expect("verifier:run parses");
-        assert_eq!(verifier, Permission::verifier_run_any());
-        assert!(verifier.covers(&Permission::verifier_run(
-            wyrd_spec::ids::CardUid::new("01927b4c-0000-7000-8000-000000000001").expect("uid")
-        )));
-        assert_eq!(
-            "operators:invoke"
-                .parse::<Permission>()
-                .expect("unrelated grant parses"),
-            Permission::operator_invoke()
-        );
+        let json = serde_json::to_value(&restricted).expect("serializes");
+        let back: EffectivePermissions = serde_json::from_value(json).expect("decodes");
+        assert_eq!(back, restricted);
     }
 }

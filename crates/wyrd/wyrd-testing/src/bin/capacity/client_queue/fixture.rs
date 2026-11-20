@@ -86,7 +86,7 @@ impl Tenant {
             .await?
             .create_service_principal(&CreateServicePrincipalRequest {
                 name: "bifrost-client-queue".to_owned(),
-                roles: vec!["workload".to_owned()],
+                assignments: vec![wyrd_spec::auth::ScopedRoleAssignment::tenant("workload")],
                 description: None,
                 workload_restriction: Some(WorkloadRestriction::Family(WorkloadFamily {
                     kind: WorkloadKind::Service,

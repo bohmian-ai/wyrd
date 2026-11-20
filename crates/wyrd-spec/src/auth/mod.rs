@@ -1,11 +1,13 @@
 //! Authentication request and response contracts.
 
+mod access;
 mod admin;
 mod attribution;
 mod browser;
 mod device;
 mod human_connection;
 mod oidc;
+mod permission;
 mod permission_scope;
 mod platform_identity;
 mod principal_id;
@@ -17,6 +19,12 @@ mod tenant_principals;
 mod token;
 mod workload;
 
+pub use access::{
+    AccessGrant, AccessSummary, BindingSubject, CreateGroupRequest, CreateRoleBindingRequest,
+    GrantSource, GroupList, GroupMember, GroupView, NoApplicableOperation, Operation,
+    PutRoleRequest, RoleBindingList, RoleBindingQuery, RoleBindingView, RoleList, RoleView,
+    ScopedRoleAssignment, compile_binding,
+};
 pub use admin::{
     ClaimMappingPayload, ClientAuthKind, CreateTrustedIssuerRequest, CreateWorkloadBindingRequest,
     IssuerTokenPolicy, TrustedIssuerView, WorkloadBindingView,
@@ -37,9 +45,12 @@ pub use oidc::{
     AbsoluteUrl, CallbackQuery, ConnectionTester, IssuerUrl, LoginInitResponse, LoginInitiation,
     ProviderResponse, Sha256Hex, Sha256HexError, UrlParseError,
 };
+pub use permission::{
+    Action, Permission, PermissionParseError, PermissionSet, Resource, UnrepresentableIntersection,
+};
 pub use permission_scope::{
-    BifrostPermissionScope, BifrostSchemaScope, BifrostTableScope, GatewayAccess, PermissionScope,
-    PermissionScopeError,
+    BifrostPermissionScope, BifrostSchemaScope, BifrostTableScope, CardPermissionScope,
+    GatewayAccess, PermissionScope, PermissionScopeError,
 };
 pub use platform_identity::{
     ConfigurePlatformOidcRequest, IssuePlatformCredentialRequest, PlatformCallbackRequest,
@@ -61,10 +72,10 @@ pub use tenant_principals::{
     CreateUserCredentialRequest, CreateUserInvitationRequest, CreateUserRequest, CreatedUser,
     CredentialListQuery, CredentialListResponse, CredentialMetadata, CredentialRevoked,
     CurrentUserArgs, CurrentUserProfile, IssuedCredential, IssuedUserInvitation,
-    IssuedUserPasswordReset, ListCredentialsArgs, PrincipalPage, PrincipalQuery, PrincipalRoles,
-    PrincipalStatus, PrincipalSummary, RevokeCredentialArgs, RoleAssignment, RoleAssignmentChange,
-    RoleSource, SetWorkloadRestrictionArgs, USER_CREDENTIAL_MAX_LIFETIME_SECONDS,
-    USER_CREDENTIAL_NAME_MAX_CHARS, UserInvitationView, UserPasswordResetView,
+    IssuedUserPasswordReset, ListCredentialsArgs, PrincipalPage, PrincipalQuery, PrincipalStatus,
+    PrincipalSummary, RevokeCredentialArgs, RoleSource, SetWorkloadRestrictionArgs,
+    USER_CREDENTIAL_MAX_LIFETIME_SECONDS, USER_CREDENTIAL_NAME_MAX_CHARS, UserInvitationView,
+    UserPasswordResetView,
 };
 pub use token::{
     AuthorizationServerMetadata, ExchangeTokenType, OAuthClientId, OAuthErrorCode,

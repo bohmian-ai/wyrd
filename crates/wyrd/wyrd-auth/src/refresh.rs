@@ -211,9 +211,9 @@ impl RefreshTokens {
             )));
         }
 
-        // A human family belongs to the exact connection revision it
-        // logged in through; a row carrying no binding predates that
-        // provenance and has no connection that could still admit it.
+        // A human family belongs to the exact login anchor — provider
+        // connection revision or local password revision — it signed in
+        // through; a row carrying no anchor has nothing that could admit it.
         let Some(session) = active.human_session() else {
             tracing::warn!(
                 principal_id = %principal_id,
@@ -223,10 +223,10 @@ impl RefreshTokens {
         };
 
         // The successor is minted from the user's current status and
-        // grants, not the consumed token's, so a suspension or revoked
-        // role does not survive a renewal, and it inherits the family's
-        // connection binding, so a replaced, deactivated, or removed
-        // connection ends the family at its next rotation.
+        // bindings, not the consumed token's, so a suspension or revoked
+        // binding does not survive a renewal, and it inherits the family's
+        // anchor, so a replaced connection or a changed password ends the
+        // family at its next rotation.
         let exchanged = self
             .issuer
             .issue_human_session(conn, principal_id, Some(active.id), session, request_id)
@@ -286,12 +286,11 @@ mod pg_tests {
     use wyrd_runtime::PrincipalId;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::{OAuthClientId, PrincipalKindTag};
-    use wyrd_sql::row_types::auth::HumanSessionBinding;
+    use wyrd_sql::row_types::auth::{HumanLoginAnchor, HumanSessionBinding};
 
     use wyrd_sql::TenantConn;
     use wyrd_sql::queries::auth::{
-        insert_human_refresh_token, insert_refresh_token, insert_role, list_user_roles,
-        refresh_by_hash, replace_idp_user_roles,
+        insert_human_refresh_token, insert_refresh_token, refresh_by_hash,
     };
 
     use wyrd_auth_oidc::ScreenedHttp;
@@ -414,7 +413,7 @@ mod pg_tests {
                 expires_at,
                 None,
                 HumanSessionBinding {
-                    connection: binding,
+                    anchor: HumanLoginAnchor::Connection(binding),
                     client: OAuthClientId::WyrdCli,
                 },
             )
@@ -678,7 +677,7 @@ mod pg_tests {
                 expires_at,
                 rotated_from,
                 HumanSessionBinding {
-                    connection: binding,
+                    anchor: HumanLoginAnchor::Connection(binding),
                     client,
                 },
             )
@@ -917,14 +916,11 @@ mod pg_tests {
 
     /// A rotated human session keeps the authority its login established.
     ///
-    /// Rotation re-reads the grant table rather than trusting the consumed
-    /// token, so the federated login path has to have persisted what the
-    /// provider asserted. This seeds that state the way login writes it —
-    /// including a name with no local role row, which resolves to no
-    /// permission anywhere and is therefore not stored — and proves the
-    /// successor access token is signed with the roles that survived.
+    /// Rotation signs identity, never grants: the successor names the User
+    /// at the current token version and carries no ceiling, so its authority
+    /// is always the server's current bindings.
     #[tokio::test]
-    async fn rotation_carries_the_roles_login_persisted() {
+    async fn rotation_signs_identity_without_grants() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let audit = RecordedAudit::new();
         let tenant = fixture.data_tenant_id();
@@ -932,26 +928,6 @@ mod pg_tests {
 
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let user_id = insert_test_user(&mut conn, tenant).await;
-        insert_role(
-            &mut conn,
-            Uuid::new_v4(),
-            "credential_admin",
-            &serde_json::json!([]),
-            false,
-        )
-        .await
-        .expect("role seeds");
-        replace_idp_user_roles(&mut conn, user_id, &["credential_admin", "only-at-the-idp"])
-            .await
-            .expect("login persists the asserted roles");
-        assert_eq!(
-            list_user_roles(&mut conn, user_id)
-                .await
-                .expect("roles list"),
-            vec!["credential_admin".to_owned()],
-            "a name with no local role row is not recorded as authority"
-        );
-
         let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::User, user_id, tenant);
         let hash = wyrd_auth_issue::hash_secret(refresh_jwt.expose_secret());
         seed_active_refresh(&mut conn, "user", user_id, &hash).await;
@@ -961,7 +937,7 @@ mod pg_tests {
                 &mut conn,
                 refresh_jwt,
                 OAuthClientId::WyrdCli,
-                "req-rotation-roles",
+                "req-rotation-identity",
             )
             .await
             .expect("rotation succeeds");
@@ -975,15 +951,11 @@ mod pg_tests {
             Some("wyrd"),
         )
         .expect("successor access token verifies");
-
-        assert_eq!(
-            claims
-                .roles
-                .iter()
-                .map(|role| role.as_str().to_owned())
-                .collect::<Vec<_>>(),
-            vec!["credential_admin".to_owned()],
-            "the successor carries the session's authority"
+        assert_eq!(claims.version, wyrd_auth_verify::ACCESS_TOKEN_VERSION);
+        assert_eq!(claims.principal.id.as_uuid(), user_id);
+        assert!(
+            claims.permission_ceiling.is_none(),
+            "no grant snapshot is signed"
         );
     }
 

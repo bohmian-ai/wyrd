@@ -102,7 +102,7 @@ export async function runtimeAccount(
   }
   const created = await principals.createServicePrincipal({
     name,
-    roles: ["workload"],
+    assignments: [{ role: "workload", scope: "all" }],
     workload_restriction: { mode: "family", kind: card.kind, name: card.name },
   });
   return { principalId: created.principal_id, key: created.credential };

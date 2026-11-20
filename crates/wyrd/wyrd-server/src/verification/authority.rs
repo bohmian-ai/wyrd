@@ -115,7 +115,6 @@ impl SystemReadAuthority {
             principal,
             PrincipalKind::System,
             tenant,
-            Vec::new(),
             PermissionSet::from_iter(grants),
         );
         let context = AuthorizedQueryContext::try_new(
@@ -324,10 +323,12 @@ impl BackgroundAuthority {
         resolved: Result<wyrd_auth_verify::VerifiedToken, IssuanceError>,
     ) -> Result<Result<ExecutionAuthority, AuthorityRefusal>, SqlError> {
         match resolved {
-            Ok(verified) => Ok(Ok(ExecutionAuthority::background(
-                AcceptedAuthority::new(&verified.principal, &verified.delegation_chain),
-                system,
-            ))),
+            Ok(verified) => Ok(AcceptedAuthority::new(
+                &verified.principal,
+                &verified.delegation_chain,
+            )
+            .map(|accepted| ExecutionAuthority::background(accepted, system))
+            .map_err(|error| AuthorityRefusal::Rejected(WyrdError::from(error)))),
             Err(IssuanceError::Store(error)) => Err(error),
             Err(IssuanceError::Database(error)) => Err(SqlError::Query(error)),
             Err(
@@ -373,7 +374,6 @@ mod tests {
                 PrincipalId::new(uuid::Uuid::now_v7()),
                 kind,
                 tenant,
-                Vec::new(),
                 PermissionSet::default(),
             )
         };
@@ -390,7 +390,6 @@ mod tests {
             PrincipalId::new(uuid::Uuid::now_v7()),
             PrincipalKind::System,
             tenant,
-            Vec::new(),
             PermissionSet::from_iter([grant]),
         );
         let context = AuthorizedQueryContext::try_new(
@@ -409,7 +408,7 @@ mod tests {
         let chain = vec![DelegationStep {
             principal: PrincipalRef::from_principal(&b),
         }];
-        let accepted = AcceptedAuthority::new(&a, &chain);
+        let accepted = AcceptedAuthority::new(&a, &chain).expect("representable");
 
         let served = SystemReadAuthority { context }
             .serving(&accepted)

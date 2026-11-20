@@ -24,7 +24,7 @@ from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer
 
 if TYPE_CHECKING:
-    from wyrd.auth import FamilyRestriction
+    from wyrd.auth import AccessSummary, CreateRoleBindingRequest, FamilyRestriction, PrincipalKind
 
 from .support import FIXTURES, Count, client_of, declare, hydrated, runtime_account
 
@@ -41,7 +41,7 @@ DENIED = "WYRD_PERMISSION_403_DENIED_RBAC"
 
 @pytest.fixture
 def server(wyrd_server: WyrdTestServer) -> Iterator[WyrdTestServer]:
-    """A server of this test's own, so no other test sees a Role granted here."""
+    """A server of this test's own, so no other test sees a role bound here."""
     with WyrdTestServer(mutate_env=False) as server:
         yield server
 
@@ -52,9 +52,19 @@ ACCOUNT = "observed-service-runtime"
 def issue(server: WyrdTestServer) -> tuple[str, str]:
     """Create the unrestricted ``ACCOUNT`` holding only ``workload``; return its principal id and key."""
     created = Principals(client_of(server)).create_service_principal(
-        {"name": ACCOUNT, "roles": ["workload"]}
+        {"name": ACCOUNT, "assignments": [{"role": "workload", "scope": "all"}]}
     )
     return created["principal_id"], created["credential"]
+
+
+def bind_all(principal: str, kind: PrincipalKind, role: str) -> CreateRoleBindingRequest:
+    """A request binding ``role`` tenant-wide to one account."""
+    return {"subject": {"principal": {"id": principal, "kind": kind}}, "role": role, "scope": "all"}
+
+
+def grants(access: AccessSummary) -> list[tuple[str, str]]:
+    """Each grant's role and source kind, in the summary's order."""
+    return [(grant["role"], grant["source"]["kind"]) for grant in access["grants"]]
 
 
 def author(server: WyrdTestServer, key: str) -> None:
@@ -62,30 +72,27 @@ def author(server: WyrdTestServer, key: str) -> None:
     Cards(client_of(server, key)).declare_from_path(AUTHORED)
 
 
-def test_granted_editor_reaches_the_next_token_until_revoked(server: WyrdTestServer) -> None:
+def test_bound_editor_reaches_the_next_request_until_unbound(server: WyrdTestServer) -> None:
     principal, key = issue(server)
     principals = Principals(client_of(server))
 
     (found,) = principals.list(kind="service", name=ACCOUNT)["principals"]
     assert found["principal_id"] == principal
     assert found["workload_restriction"] == {"mode": "unrestricted"}
-    assert principals.roles(principal)["roles"] == [{"role": "workload", "source": "direct"}]
+    assert grants(principals.access(principal)) == [("workload", "direct")]
     assert len(Bifrost(client=client_of(server, key)).sql(TENANT_WIDE, model=Count)) == 1
     with pytest.raises(WyrdError) as refused:
         author(server, key)
     assert refused.value.code == DENIED
 
-    granted = principals.grant_role(principal, "editor")
-    assert granted["changed"]
-    assert granted["roles"] == [
-        {"role": "editor", "source": "direct"},
-        {"role": "workload", "source": "direct"},
-    ]
-    assert not principals.grant_role(principal, "editor")["changed"]
+    granted = principals.bind(bind_all(principal, "service", "editor"))
+    assert granted["scope"] == "all"
+    assert principals.bind(bind_all(principal, "service", "editor"))["id"] == granted["id"]
+    assert grants(principals.access(principal)) == [("editor", "direct"), ("workload", "direct")]
     author(server, key)
 
-    revoked = principals.revoke_role(principal, "editor")
-    assert revoked["changed"]
+    principals.unbind(granted["id"])
+    assert grants(principals.access(principal)) == [("workload", "direct")]
     with pytest.raises(WyrdError) as refused:
         author(server, key)
     assert refused.value.code == DENIED
@@ -93,12 +100,13 @@ def test_granted_editor_reaches_the_next_token_until_revoked(server: WyrdTestSer
 
 def test_only_a_tenant_admin_assigns_roles(server: WyrdTestServer) -> None:
     principal, key = issue(server)
+    (workload,) = Principals(client_of(server)).access(principal)["grants"]
     own = Principals(client_of(server, key))
 
     with pytest.raises(WyrdError) as granted:
-        own.grant_role(principal, "editor")
+        own.bind(bind_all(principal, "service", "editor"))
     with pytest.raises(WyrdError) as revoked:
-        own.revoke_role(principal, "workload")
+        own.unbind(workload["binding_id"])
 
     assert granted.value.code == DENIED
     assert revoked.value.code == DENIED
@@ -115,15 +123,10 @@ def test_direct_and_idp_user_assignments_coexist(server: WyrdTestServer) -> None
     assert page["principals"][0]["workload_restriction"] is None
     assert page["next"] is None
 
-    granted = principals.grant_role(user, "viewer")
-    assert granted["changed"]
-    assert granted["roles"] == [
-        {"role": "viewer", "source": "direct"},
-        {"role": "viewer", "source": "idp"},
-    ]
-    revoked = principals.revoke_role(user, "viewer")
-    assert revoked["changed"]
-    assert revoked["roles"] == [{"role": "viewer", "source": "idp"}]
+    granted = principals.bind(bind_all(user, "user", "viewer"))
+    assert grants(principals.access(user)) == [("viewer", "direct"), ("viewer", "provider")]
+    principals.unbind(granted["id"])
+    assert grants(principals.access(user)) == [("viewer", "provider")]
 
 
 def test_users_manage_personal_keys(server: WyrdTestServer) -> None:
@@ -256,7 +259,9 @@ def test_a_family_has_one_runtime_account_until_released(server: WyrdTestServer)
     principals = Principals(client_of(server))
     family: FamilyRestriction = {"mode": "family", "kind": "Service", "name": FAMILY}
     first, _ = runtime_account(FAMILY, client=client_of(server))
-    second = principals.create_service_principal({"name": "second", "roles": ["workload"]})
+    second = principals.create_service_principal(
+        {"name": "second", "assignments": [{"role": "workload", "scope": "all"}]}
+    )
 
     (found,) = principals.list(kind="service", name=f"{FAMILY}-runtime")["principals"]
     assert found["workload_restriction"] == family
@@ -306,7 +311,7 @@ def test_a_delegate_acts_for_its_subject_from_its_own_root(
     root, bundle = next(iter(releases(server, tmp_path).items()))
     account, key = runtime_account(FAMILY, client=client_of(server))
     owner = Principals(client_of(server)).create_service_principal(
-        {"name": "delegating-subject", "roles": ["workload"]}
+        {"name": "delegating-subject", "assignments": [{"role": "workload", "scope": "all"}]}
     )
     subject = client_of(server, owner["credential"]).access_token()
 

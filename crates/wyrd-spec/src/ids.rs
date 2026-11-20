@@ -418,6 +418,25 @@ uuid7_id_type!(
     OperatorConnectionId
 );
 
+uuid7_id_type!(
+    /// Stable identity of a tenant's GitHub connection slot.
+    ///
+    /// Minted when the tenant first associates an installation and kept
+    /// across disconnects and reconnects, so a GitHub-configuration grant
+    /// names the same connection for the tenant's lifetime.
+    GithubConnectionId
+);
+
+uuid7_id_type!(
+    /// Durable identity of one scoped role binding.
+    RoleBindingId
+);
+
+uuid7_id_type!(
+    /// Durable identity of one optional local access group.
+    AccessGroupId
+);
+
 /// Generate a UUIDv7 string for Wyrd-owned identifiers.
 #[must_use]
 pub fn uuid7() -> String {

@@ -5,6 +5,7 @@ use wyrd_auth_issue::IssuingKey;
 use wyrd_crypt::SealingKeyring;
 use wyrd_runtime::{PermissionCheck, RbacCheck};
 
+use wyrd_auth::authority::AuthorityCache;
 use wyrd_auth::connections::HumanConnections;
 use wyrd_auth::issuance::{TenantTokenIssuer, TokenExchangeSettings};
 use wyrd_auth::platform_login::PlatformLogin;
@@ -48,6 +49,9 @@ pub struct ServerAuth {
     /// RBAC permission evaluator; an embedding deployment may supply its own
     /// at startup.
     pub permission_check: Arc<dyn PermissionCheck>,
+    /// Process-local current authority, one snapshot per tenant. Every
+    /// request's verified identity resolves its grants here from memory.
+    pub authority: Arc<AuthorityCache>,
 }
 
 impl Default for ServerAuth {
@@ -65,6 +69,7 @@ impl Default for ServerAuth {
             platform_login: None,
             token_exchange_settings: TokenExchangeSettings::default(),
             permission_check: Arc::new(RbacCheck),
+            authority: Arc::default(),
         }
     }
 }

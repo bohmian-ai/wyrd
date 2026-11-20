@@ -287,7 +287,7 @@ test("revoked api key is refused by the token exchange, before the gateway", asy
   const principals = await Principals.connect();
   const { principal_id, credential } = await principals.createServicePrincipal({
     name: "revoked-gateway-caller",
-    roles: [],
+    assignments: [],
   });
   await principals.revokePrincipal(principal_id, { principal_kind: "service", reason: "journey revokes this key" });
   vi.stubEnv("WYRD_API_KEY", credential);

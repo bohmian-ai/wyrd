@@ -168,3 +168,35 @@ pub async fn find_card_by_ref(
         WyrdError::registry_invalid_card_spec(format!("stored card failed to parse: {e}"))
     })
 }
+
+/// The exact registered scope of each of `uids` that names a Card, in one
+/// statement: the trusted family an authorization check needs when the
+/// caller holds only a UID. A UID naming no Card is absent from the map.
+///
+/// # Errors
+///
+/// Returns the registry error when the read or decode fails.
+pub async fn card_scopes(
+    conn: &mut TenantConn<'_>,
+    uids: &[CardUid],
+) -> Result<std::collections::HashMap<CardUid, wyrd_spec::auth::CardPermissionScope>, WyrdError> {
+    let ids: Vec<uuid::Uuid> = uids.iter().map(CardUid::as_uuid).collect();
+    let rows: Vec<(uuid::Uuid, String, String)> =
+        sqlx::query_as("SELECT card_uid, kind, name FROM wyrd.cards WHERE card_uid = ANY($1)")
+            .bind(&ids)
+            .fetch_all(&mut **conn.transaction())
+            .await
+            .map_err(super::registry_db_error)?;
+    rows.into_iter()
+        .map(|(uid, kind, name)| {
+            let uid = CardUid::from_uuid(uid).map_err(super::registry_db_error)?;
+            let kind: CardKind = serde_json::from_value(serde_json::Value::String(kind))
+                .map_err(super::registry_db_error)?;
+            let name = CardName::new(name).map_err(super::registry_db_error)?;
+            Ok((
+                uid.clone(),
+                wyrd_spec::auth::CardPermissionScope::version(kind, name, uid),
+            ))
+        })
+        .collect()
+}

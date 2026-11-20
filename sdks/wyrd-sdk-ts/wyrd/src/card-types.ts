@@ -15,6 +15,71 @@ export type JsonValue =
 export type AbsoluteUrl = string;
 
 /**
+ * One binding contributing to an account's access.
+ */
+export interface AccessGrant {
+  /**
+   * Binding id; remove it at its source to remove this grant.
+   */
+  readonly binding_id: RoleBindingId;
+  /**
+   * The scoped permissions it contributes.
+   */
+  readonly permissions: readonly Permission[];
+  /**
+   * Role name.
+   */
+  readonly role: string;
+  /**
+   * Objects the role's operations reach.
+   */
+  readonly scope: PermissionScope;
+  /**
+   * Where the binding comes from.
+   */
+  readonly source: GrantSource;
+}
+
+/**
+ * Durable identity of one optional local access group.
+ */
+export type AccessGroupId = string;
+
+/**
+ * One account's current access, as the server enforces it.
+ *
+ * Grants are additive: removing one binding does not remove authority that
+ * another binding still grants.
+ */
+export interface AccessSummary {
+  /**
+   * Every contributing binding with its source.
+   */
+  readonly grants: readonly AccessGrant[];
+  /**
+   * Account kind.
+   */
+  readonly kind: PrincipalKindTag;
+  /**
+   * The combined scoped permissions.
+   */
+  readonly permissions: readonly Permission[];
+  /**
+   * Account id.
+   */
+  readonly principal_id: PrincipalId;
+  /**
+   * Account status.
+   */
+  readonly status: PrincipalStatus;
+  /**
+   * The Service family a runtime account may run as, separate from its
+   * operation grants; absent for Users and unrestricted automation.
+   */
+  readonly workload_restriction?: WorkloadRestriction;
+}
+
+/**
  * How a User account authenticates.
  */
 export type AccountAuthentication = "password" | "sso";
@@ -23,6 +88,18 @@ export type AccountAuthentication = "password" | "sso";
  * A data-producing step action. Actions read and compute only.
  */
 export type Action = ActionExtract | ActionAgent | ActionCode | ActionApproval;
+
+/**
+ * Action performed against a resource.
+ */
+export type Action2 = "read" | "write" | "delete" | "invoke" | "install" | "lock" | "run" | "approve" | "suspend" | "recover" | Action2AnyOf | "wildcard";
+
+/**
+ * One of several actions.
+ */
+export interface Action2AnyOf {
+  readonly any_of: readonly Action2[];
+}
 
 /**
  * Invoke an Agent; its output follows the Prompt's response schema.
@@ -418,6 +495,25 @@ export interface AuditSpec {
 }
 
 /**
+ * The Bifrost objects one grant reaches.
+ */
+export type BifrostPermissionScope = BifrostPermissionScopeSchema | BifrostPermissionScopeTable;
+
+/**
+ * Every table currently or later resolved beneath one catalog/schema pair.
+ */
+export interface BifrostPermissionScopeSchema {
+  readonly schema: BifrostSchemaScope;
+}
+
+/**
+ * Exactly one registered table, identified by its stable server-managed UID.
+ */
+export interface BifrostPermissionScopeTable {
+  readonly table: BifrostTableScope;
+}
+
+/**
  * Public synchronous Oracle query request.
  *
  * Every query reads the same sources: its pinned published cut plus
@@ -446,6 +542,24 @@ export interface BifrostQueryRequest {
    * One SELECT statement, or one `EXPLAIN [ANALYZE]` of it.
    */
   readonly sql: string;
+}
+
+/**
+ * One canonical Bifrost catalog and schema pair.
+ *
+ * These are the *logical* names a caller writes in SQL — catalog `bifrost`,
+ * schema `logs` — not the flattened internal namespace (`bifrost.logs`) and not
+ * the physical Iceberg catalog name.
+ */
+export interface BifrostSchemaScope {
+  /**
+   * Logical catalog, `vala` for every table Bifrost serves today.
+   */
+  readonly catalog: string;
+  /**
+   * Logical schema beneath the catalog, such as `logs` or `traces`.
+   */
+  readonly schema: string;
 }
 
 /**
@@ -554,6 +668,29 @@ export interface BifrostTableEntry {
 }
 
 /**
+ * One exact registered Bifrost table.
+ *
+ * The UID is the authority: it is assigned at registration and never reused,
+ * so a grant does not follow a dropped-and-recreated table of the same name.
+ * The catalog and schema ride alongside it so the synchronous checker can
+ * evaluate schema containment without a catalog lookup.
+ */
+export interface BifrostTableScope {
+  /**
+   * Logical catalog the table resolves under.
+   */
+  readonly catalog: string;
+  /**
+   * Logical schema the table resolves under.
+   */
+  readonly schema: string;
+  /**
+   * Stable server-managed table UID.
+   */
+  readonly table_uid: string;
+}
+
+/**
  * Durable identity of one projected verification binding.
  *
  * A binding is an inline `verified_by` entry on a Service, one of its
@@ -565,6 +702,46 @@ export interface BifrostTableEntry {
  * address the binding stably.
  */
 export type BindingId = string;
+
+/**
+ * The account or optional local group a role binding assigns to.
+ *
+ * Users and Services are the managed principals; a group is a roster, never
+ * a principal, and never logs in.
+ */
+export type BindingSubject = BindingSubjectPrincipal | BindingSubjectGroup;
+
+/**
+ * One local access group.
+ */
+export interface BindingSubjectGroup {
+  readonly group: BindingSubjectGroupGroup;
+}
+
+export interface BindingSubjectGroupGroup {
+  /**
+   * Group id.
+   */
+  readonly id: AccessGroupId;
+}
+
+/**
+ * One tenant account, with the kind its id resolves under.
+ */
+export interface BindingSubjectPrincipal {
+  readonly principal: BindingSubjectPrincipalPrincipal;
+}
+
+export interface BindingSubjectPrincipalPrincipal {
+  /**
+   * Account id.
+   */
+  readonly id: PrincipalId;
+  /**
+   * Account kind: `user` or `service`.
+   */
+  readonly kind: PrincipalKindTag;
+}
 
 /**
  * Where an image or document block's media comes from.
@@ -715,6 +892,58 @@ export type CardLifecycleStatus = "pending" | "active" | "deprecated" | "failed"
  * Human-visible Card name.
  */
 export type CardName = string;
+
+/**
+ * The Card objects one grant reaches.
+ *
+ * Family identity is tenant + kind + name, so a family grant covers every
+ * existing and future version and the retained history of deleted ones. An
+ * exact version follows its UID and never a replacement version. The exact
+ * variant carries its trusted family so family coverage is a pure
+ * comparison; the server derives that family from its own Card state or
+ * retained admission metadata, never from a caller's assertion.
+ */
+export type CardPermissionScope = CardPermissionScopeFamily | CardPermissionScopeVersion;
+
+/**
+ * Every version of one Card family.
+ */
+export interface CardPermissionScopeFamily {
+  readonly family: CardPermissionScopeFamilyFamily;
+}
+
+export interface CardPermissionScopeFamilyFamily {
+  /**
+   * Card kind of the family.
+   */
+  readonly kind: CardKind;
+  /**
+   * Card name of the family.
+   */
+  readonly name: CardName;
+}
+
+/**
+ * One exact Card version, with its trusted family.
+ */
+export interface CardPermissionScopeVersion {
+  readonly version: CardPermissionScopeVersionVersion;
+}
+
+export interface CardPermissionScopeVersionVersion {
+  /**
+   * Card kind of the version's family.
+   */
+  readonly kind: CardKind;
+  /**
+   * Card name of the version's family.
+   */
+  readonly name: CardName;
+  /**
+   * Exact immutable version UID.
+   */
+  readonly uid: CardUid;
+}
 
 /**
  * Reference to a registered Card by kind, name, one version, and optional UID.
@@ -1135,6 +1364,16 @@ export interface ContentBlockText {
 export type ContextCapture = "full" | "hash" | "redact";
 
 /**
+ * Request to create a group.
+ */
+export interface CreateGroupRequest {
+  /**
+   * Tenant-unique group name.
+   */
+  readonly name: string;
+}
+
+/**
  * `POST /v1/operator-connections` body.
  */
 export type CreateOperatorConnectionRequest = CreateOperatorConnectionRequestSlack | CreateOperatorConnectionRequestPagerDuty | CreateOperatorConnectionRequestHttp;
@@ -1193,6 +1432,24 @@ export interface CreateOperatorConnectionRequestSlack {
 }
 
 /**
+ * Request to bind one role to one account or group at one scope.
+ */
+export interface CreateRoleBindingRequest {
+  /**
+   * Role name.
+   */
+  readonly role: string;
+  /**
+   * Objects the role's operations reach.
+   */
+  readonly scope: PermissionScope;
+  /**
+   * Account or group receiving the grant.
+   */
+  readonly subject: BindingSubject;
+}
+
+/**
  * Request to create a stable tenant Service account.
  *
  * The account outlives every release: it is never a Card version. The exact
@@ -1201,6 +1458,12 @@ export interface CreateOperatorConnectionRequestSlack {
  */
 export interface CreateServicePrincipalRequest {
   /**
+   * Roles to bind, each at an explicit scope. Narrower than tenant
+   * administration, so automation never needs the tenant administrative
+   * credential. Empty creates an account with no operation grants.
+   */
+  readonly assignments?: readonly ScopedRoleAssignment[];
+  /**
    * Optional description.
    */
   readonly description?: string | null;
@@ -1208,11 +1471,6 @@ export interface CreateServicePrincipalRequest {
    * Operator-facing name, unique within the tenant.
    */
   readonly name: string;
-  /**
-   * Roles to grant. Narrower than tenant administration, so automation never
-   * needs the tenant administrative credential.
-   */
-  readonly roles: readonly string[];
   /**
    * Workload-family limit; omitted means unrestricted. A family restriction
    * is that family's unique scheduled runtime account and additionally
@@ -2712,6 +2970,48 @@ export interface FrozenTargetUid {
 }
 
 /**
+ * The gateway deployment objects one invoke grant reaches.
+ *
+ * A deployment grant covers every model that deployment permits; a model
+ * grant covers only the exact deployment/model pair. Identities are the same
+ * typed values call addressing uses. Unlike the unscoped `all` grant, either
+ * variant also reaches a `granted` deployment.
+ */
+export type GatewayAccess = GatewayAccessDeployment | GatewayAccessModel;
+
+/**
+ * Every model one deployment permits.
+ */
+export interface GatewayAccessDeployment {
+  readonly deployment: GatewayAccessDeploymentDeployment;
+}
+
+export interface GatewayAccessDeploymentDeployment {
+  /**
+   * Covered deployment.
+   */
+  readonly deployment: ProviderDeploymentName;
+}
+
+/**
+ * One exact model addressed through one deployment.
+ */
+export interface GatewayAccessModel {
+  readonly model: GatewayAccessModelModel;
+}
+
+export interface GatewayAccessModelModel {
+  /**
+   * Deployment serving the model.
+   */
+  readonly deployment: ProviderDeploymentName;
+  /**
+   * Provider-native model identifier.
+   */
+  readonly model: ModelId;
+}
+
+/**
  * Spending budget for one subject and period.
  */
 export interface GatewayBudget {
@@ -3025,6 +3325,15 @@ export interface GithubConnectResponse {
 }
 
 /**
+ * Stable identity of a tenant's GitHub connection slot.
+ *
+ * Minted when the tenant first associates an installation and kept
+ * across disconnects and reconnects, so a GitHub-configuration grant
+ * names the same connection for the tenant's lifetime.
+ */
+export type GithubConnectionId = string;
+
+/**
  * Lifecycle state of a tenant's GitHub connection.
  */
 export type GithubConnectionState = "not_connected" | "active" | "suspended";
@@ -3159,9 +3468,67 @@ export interface GithubRepositoryAccess {
 }
 
 /**
+ * Where one of an account's grants comes from.
+ */
+export type GrantSource = GrantSourceDirect | GrantSourceGroup | GrantSourceProvider;
+
+/**
+ * A binding on the account itself, administered in Wyrd.
+ */
+export interface GrantSourceDirect {
+  readonly kind: "direct";
+}
+
+/**
+ * A binding on a group the account belongs to.
+ */
+export interface GrantSourceGroup {
+  /**
+   * Group id.
+   */
+  readonly id: AccessGroupId;
+  readonly kind: "group";
+  /**
+   * Group name.
+   */
+  readonly name: string;
+}
+
+/**
+ * A binding an identity provider's login projected onto the account.
+ */
+export interface GrantSourceProvider {
+  readonly kind: "provider";
+}
+
+/**
  * Caller-chosen opaque group identity, such as a conversation or order ID, scoped to the tenant and owner Service.
  */
 export type GroupId = string;
+
+/**
+ * Every group of the tenant.
+ */
+export interface GroupList {
+  /**
+   * Groups, ordered by name.
+   */
+  readonly groups: readonly GroupView[];
+}
+
+/**
+ * One account in a group's roster.
+ */
+export interface GroupMember {
+  /**
+   * Account kind: `user` or `service`.
+   */
+  readonly kind: PrincipalKindTag;
+  /**
+   * Account id.
+   */
+  readonly principal_id: PrincipalId;
+}
 
 /**
  * The source evidence one group execution pinned when it was enqueued.
@@ -3190,6 +3557,24 @@ export interface GroupSourceSnapshot {
    * The authored source declaration.
    */
   readonly reference: SourceText;
+}
+
+/**
+ * One optional local access group.
+ */
+export interface GroupView {
+  /**
+   * Group id.
+   */
+  readonly id: AccessGroupId;
+  /**
+   * Member accounts.
+   */
+  readonly members: readonly GroupMember[];
+  /**
+   * Tenant-unique group name.
+   */
+  readonly name: string;
 }
 
 /**
@@ -4302,6 +4687,20 @@ export interface NumpyMeta {
 }
 
 /**
+ * One operation a reusable role grants, without an object selection.
+ */
+export interface Operation {
+  /**
+   * Action the operation performs.
+   */
+  readonly action: Action2;
+  /**
+   * Resource the operation acts on.
+   */
+  readonly resource: Resource;
+}
+
+/**
  * Operator execution limits.
  */
 export interface OperatorBudget {
@@ -4804,6 +5203,73 @@ export interface PartitionFieldWire {
 export type PartitionTransformWire = "hour" | "day" | "identity" | "bucket" | "truncate";
 
 /**
+ * One operation/object authorization triple.
+ *
+ * Wyrd RBAC is `(resource, action, scope)`: the first two axes name the
+ * operation and the third names the objects it reaches. Scope is required, so
+ * a grant that targets no particular object states [`PermissionScope::All`]
+ * explicitly rather than leaving the object axis unsaid.
+ */
+export interface Permission {
+  /**
+   * Action allowed on the resource.
+   */
+  readonly action: Action2;
+  /**
+   * Resource the permission applies to.
+   */
+  readonly resource: Resource;
+  /**
+   * Objects of that resource the permission reaches.
+   */
+  readonly scope: PermissionScope;
+}
+
+/**
+ * Objects one permission grant reaches.
+ *
+ * Domain-tagged rather than a shared string object language: a future Wyrd
+ * domain that needs object scope adds its own typed variant instead of
+ * overloading someone else's identity spelling.
+ */
+export type PermissionScope = "all" | PermissionScopeBifrost | PermissionScopeGateway | PermissionScopeCard | PermissionScopeGithubConnection | PermissionScopeTool;
+
+/**
+ * One Bifrost schema or table.
+ */
+export interface PermissionScopeBifrost {
+  readonly bifrost: BifrostPermissionScope;
+}
+
+/**
+ * One Card family, or one exact version of it.
+ */
+export interface PermissionScopeCard {
+  readonly card: CardPermissionScope;
+}
+
+/**
+ * One gateway deployment or exact deployment/model pair.
+ */
+export interface PermissionScopeGateway {
+  readonly gateway: GatewayAccess;
+}
+
+/**
+ * The tenant's GitHub connection, by its stable connection id.
+ */
+export interface PermissionScopeGithubConnection {
+  readonly github_connection: GithubConnectionId;
+}
+
+/**
+ * One exact built-in Agent tool, never a prefix or path.
+ */
+export interface PermissionScopeTool {
+  readonly tool: BuiltinTool;
+}
+
+/**
  * The layout lists one [`AlterTableRequest`] replaces.
  *
  * Each supplied list replaces the table's complete current list and an
@@ -5010,26 +5476,6 @@ export interface PrincipalQuery {
    * Exact account name; matches services only.
    */
   readonly name?: string | null;
-}
-
-/**
- * Response of `GET /v1/principals/{principal_id}/roles`.
- *
- * The principal's effective Roles are the distinct names across every source.
- */
-export interface PrincipalRoles {
-  /**
-   * Principal kind the server resolved from the id: `user` or `service`.
-   */
-  readonly kind: PrincipalKindTag;
-  /**
-   * Principal the assignments belong to.
-   */
-  readonly principal_id: PrincipalId;
-  /**
-   * Assignments ordered by Role name, then source.
-   */
-  readonly roles: readonly RoleAssignment[];
 }
 
 /**
@@ -5786,6 +6232,16 @@ export interface PullRequestRef {
    * Exact commit SHA the execution reviews.
    */
   readonly sha: string;
+}
+
+/**
+ * Request to create or replace a custom role's operations.
+ */
+export interface PutRoleRequest {
+  /**
+   * Operations from the closed catalog; never empty.
+   */
+  readonly operations: readonly Operation[];
 }
 
 /**
@@ -6654,6 +7110,11 @@ export interface RequirementResult {
 }
 
 /**
+ * Resource the permission applies to.
+ */
+export type Resource = "cards" | "services" | "operators" | "verifier" | "executions" | "drift" | "artifacts" | "audit" | "policy" | "triggers" | "service_accounts" | "users" | "identity_connections" | "github_connections" | "personal_credentials" | "tenants" | "platform_identity" | "platform_credentials" | "bifrost_table" | "bifrost_record" | "bifrost_query" | "bifrost_peer" | "gateway" | "gateway_payload" | "tool" | ResourceAnyOf | "wildcard";
+
+/**
  * OTel-canonical resource projection.
  *
  * Fields:
@@ -6668,7 +7129,7 @@ export interface RequirementResult {
  *   such as `host.name`, `k8s.pod.uid`, `telemetry.sdk.name`, or
  *   `process.pid`.
  */
-export interface Resource {
+export interface Resource2 {
   /**
    * Remaining OTel resource attributes, such as `host.*`, `k8s.*`, and
    * `cloud.*`.
@@ -6690,6 +7151,13 @@ export interface Resource {
    * `service.version`, when emitted by the producer.
    */
   readonly service_version?: string | null;
+}
+
+/**
+ * One of several resources.
+ */
+export interface ResourceAnyOf {
+  readonly any_of: readonly Resource[];
 }
 
 /**
@@ -6715,47 +7183,77 @@ export interface RevokePrincipalRequest {
 }
 
 /**
- * One Role a principal holds, and where that assignment came from.
+ * Durable identity of one scoped role binding.
  */
-export interface RoleAssignment {
+export type RoleBindingId = string;
+
+/**
+ * One page of role bindings.
+ */
+export interface RoleBindingList {
+  /**
+   * Bindings, ordered by id.
+   */
+  readonly bindings: readonly RoleBindingView[];
+}
+
+/**
+ * Filter for listing role bindings.
+ */
+export interface RoleBindingQuery {
+  /**
+   * Only bindings of this group.
+   */
+  readonly group_id?: AccessGroupId | null;
+  /**
+   * Only bindings of this account.
+   */
+  readonly principal_id?: PrincipalId | null;
+  /**
+   * Only bindings of this role.
+   */
+  readonly role?: string | null;
+}
+
+/**
+ * One stored role binding.
+ */
+export interface RoleBindingView {
+  /**
+   * Binding id.
+   */
+  readonly id: RoleBindingId;
+  /**
+   * The scoped permissions this binding compiles to.
+   */
+  readonly permissions: readonly Permission[];
   /**
    * Role name.
    */
   readonly role: string;
   /**
-   * Assignment source.
+   * Objects the role's operations reach.
+   */
+  readonly scope: PermissionScope;
+  /**
+   * Who administers the binding: a tenant administrator or an identity
+   * provider's login projection.
    */
   readonly source: RoleSource;
+  /**
+   * Account or group the binding assigns to.
+   */
+  readonly subject: BindingSubject;
 }
 
 /**
- * Response of `PUT` and `DELETE /v1/principals/{principal_id}/roles/{role}`.
- *
- * Both writes are idempotent. A change takes effect at the principal's next
- * token; tokens already issued keep their bounded lifetime.
+ * Every role of the tenant.
  */
-export interface RoleAssignmentChange {
+export interface RoleList {
   /**
-   * `true` when this call added or removed the direct assignment, `false`
-   * when it already held the requested state.
+   * Roles, ordered by name.
    */
-  readonly changed: boolean;
-  /**
-   * Principal kind the server resolved from the id.
-   */
-  readonly kind: PrincipalKindTag;
-  /**
-   * Principal the assignment belongs to.
-   */
-  readonly principal_id: PrincipalId;
-  /**
-   * Role the call granted or revoked.
-   */
-  readonly role: string;
-  /**
-   * Every assignment after the change, ordered by Role name, then source.
-   */
-  readonly roles: readonly RoleAssignment[];
+  readonly roles: readonly RoleView[];
 }
 
 /**
@@ -6771,6 +7269,28 @@ export type RoleName = string;
  * only `direct` rows. Service assignments are always `direct`.
  */
 export type RoleSource = "idp" | "direct";
+
+/**
+ * One role: a reusable operation bundle.
+ */
+export interface RoleView {
+  /**
+   * Built-in roles are read-only.
+   */
+  readonly builtin: boolean;
+  /**
+   * Role id.
+   */
+  readonly id: string;
+  /**
+   * Role name.
+   */
+  readonly name: string;
+  /**
+   * Operations the role grants at a binding's scope.
+   */
+  readonly operations: readonly Operation[];
+}
 
 /**
  * Run identifier carried by every observation from one agent invocation.
@@ -6934,6 +7454,23 @@ export interface SampleInput {
  * Closed set of sample input shapes supported by Wyrd at the contract layer.
  */
 export type SampleInputKind = "Pandas" | "Polars" | "Arrow" | "Numpy" | "Torch" | "Tf" | "Dict" | "List" | "Tuple" | "Str" | "None";
+
+/**
+ * One role assigned at one explicit scope, before it has a subject.
+ *
+ * Used by invitations, account creation, and binding creation. The scope is
+ * required: a missing scope is refused, never read as tenant-wide.
+ */
+export interface ScopedRoleAssignment {
+  /**
+   * Role name.
+   */
+  readonly role: string;
+  /**
+   * Objects the role's operations reach.
+   */
+  readonly scope: PermissionScope;
+}
 
 /**
  * Operator-configured external secret backend identity.
@@ -7350,7 +7887,7 @@ export interface SpanRecord {
   /**
    * Resource of the producer.
    */
-  readonly resource: Resource;
+  readonly resource: Resource2;
   /**
    * Instrumentation scope of the producer.
    */

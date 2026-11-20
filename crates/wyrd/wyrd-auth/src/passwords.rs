@@ -29,16 +29,15 @@ use uuid::Uuid;
 use wyrd_runtime::Permission;
 use wyrd_spec::auth::{
     BrowserCredential, PasswordChangeRequest, PasswordLoginRequest, PasswordResetRequest,
-    PasswordSignupRequest, RoleSource, SecretBearer, Sha256Hex,
+    PasswordSignupRequest, ScopedRoleAssignment, SecretBearer, Sha256Hex,
 };
 use wyrd_spec::error::WyrdError;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
-    AttemptScope, BrowserSessionAuthority, InvitationRow, PasswordResetRow, attempt_refusal,
-    consume_invitation, consume_password_reset, grant_role_to_user, insert_invitation,
+    AttemptScope, BrowserSessionAuthority, InvitationRow, PasswordResetRow, SubjectColumns,
+    attempt_refusal, consume_invitation, consume_password_reset, insert_invitation,
     insert_local_user, insert_password_reset, local_credential_by_username,
-    local_credential_for_update, record_attempt_failure, role_by_id, role_by_name,
-    set_password_hash,
+    local_credential_for_update, record_attempt_failure, set_password_hash,
 };
 
 use crate::browser_sessions::{
@@ -47,6 +46,7 @@ use crate::browser_sessions::{
 };
 use crate::error::store_error;
 use crate::issuance::TenantGrant;
+use crate::roles::{bind_assignments, validate_assignments};
 
 /// Largest raw password or code input accepted, in bytes, before any costly
 /// processing.
@@ -344,111 +344,62 @@ fn enrollment_error(error: sqlx::Error) -> WyrdError {
 }
 
 /// Create an active local User named by the canonical `username` with the
-/// verifier of `password`, holding the direct Roles named `roles`, on `conn`;
-/// returns the new User id.
+/// verifier of `password`, holding direct bindings for `assignments`, on
+/// `conn`; returns the new User id.
 ///
 /// The administrator's direct creation path. The caller owns authority for
 /// the grants and commits `conn`.
 ///
 /// # Errors
 /// Returns [`WyrdError::Validation`] for a taken username or an empty,
-/// repeated or missing Role, and [`WyrdError::AuthVerifyUnavailable`] when
-/// the store fails.
+/// missing, invalid or inapplicable assignment, and
+/// [`WyrdError::AuthVerifyUnavailable`] when the store fails.
 pub async fn create_local_user(
     conn: &mut TenantConn<'_>,
     username: &str,
     verifier: &str,
-    roles: &[String],
+    assignments: &[ScopedRoleAssignment],
 ) -> Result<Uuid, WyrdError> {
-    let role_ids = role_ids(conn, roles).await?;
     let user_id = Uuid::now_v7();
     insert_local_user(conn, user_id, username, verifier)
         .await
         .map_err(enrollment_error)?;
-    grant_roles(conn, user_id, &role_ids).await?;
+    bind_assignments(conn, user_subject(user_id), assignments).await?;
     Ok(user_id)
 }
 
-/// The ids of the existing tenant Roles named `roles`, in order.
-///
-/// # Errors
-/// Returns [`WyrdError::Validation`] for an empty or repeated list or a name
-/// that is no Role in this tenant, and [`WyrdError::AuthVerifyUnavailable`]
-/// when the store fails.
-async fn role_ids(conn: &mut TenantConn<'_>, roles: &[String]) -> Result<Vec<Uuid>, WyrdError> {
-    let mut distinct = roles.to_vec();
-    distinct.sort_unstable();
-    distinct.dedup();
-    if roles.is_empty() || distinct.len() != roles.len() {
-        return Err(WyrdError::Validation {
-            message: "roles must be a nonempty list of distinct Role names".to_owned(),
-            details: json!({ "field": "roles" }),
-        });
+/// The binding subject columns of User `id`.
+fn user_subject(id: Uuid) -> SubjectColumns {
+    SubjectColumns {
+        user_id: Some(id),
+        ..SubjectColumns::default()
     }
-    let mut ids = Vec::with_capacity(roles.len());
-    for role in roles {
-        let Some(row) = role_by_name(conn, role).await.map_err(store_error)? else {
-            return Err(WyrdError::Validation {
-                message: "a Role does not exist in this tenant".to_owned(),
-                details: json!({ "role": role }),
-            });
-        };
-        ids.push(row.id);
-    }
-    Ok(ids)
 }
 
-/// Grant `user_id` each existing Role in `role_ids` directly.
+/// Record a one-use enrollment invitation for the scoped `assignments`,
+/// issued by `issuer`, on `conn`; returns it with its code, shown once.
+///
+/// Every assignment is validated as enrollment will bind it, and enrollment
+/// revalidates them against current roles and the issuer's current
+/// authority. The caller has authorized the issuer and commits.
 ///
 /// # Errors
-/// Returns [`WyrdError::Validation`] for a Role id that names no Role, and
+/// Returns [`WyrdError::Validation`] for an empty list or a missing,
+/// invalid or inapplicable assignment, and
 /// [`WyrdError::AuthVerifyUnavailable`] when the store fails.
-async fn grant_roles(
-    conn: &mut TenantConn<'_>,
-    user_id: Uuid,
-    role_ids: &[Uuid],
-) -> Result<(), WyrdError> {
-    for role_id in role_ids {
-        if role_by_id(conn, *role_id)
-            .await
-            .map_err(store_error)?
-            .is_none()
-        {
-            return Err(WyrdError::Validation {
-                message: "a Role does not exist in this tenant".to_owned(),
-                details: json!({ "role_id": role_id }),
-            });
-        }
-        grant_role_to_user(conn, user_id, *role_id, RoleSource::Direct)
-            .await
-            .map_err(store_error)?;
-    }
-    Ok(())
-}
-
-/// Record a one-use enrollment invitation for the existing Roles named
-/// `roles`, issued by `issuer`, on `conn`; returns it with its code, shown
-/// once.
-///
-/// The caller has authorized the issuer to grant those Roles and commits.
-///
-/// # Errors
-/// Returns [`WyrdError::Validation`] for an empty, repeated or missing Role,
-/// and [`WyrdError::AuthVerifyUnavailable`] when the store fails.
 pub async fn issue_invitation(
     conn: &mut TenantConn<'_>,
     issuer: Uuid,
-    roles: &[String],
+    assignments: &[ScopedRoleAssignment],
 ) -> Result<(InvitationRow, SecretBearer), WyrdError> {
-    let mut distinct = role_ids(conn, roles).await?;
-    distinct.sort_unstable();
+    validate_assignments(conn, assignments).await?;
     let code = SecretBearer::new(random_secret());
     let row = insert_invitation(
         conn,
         Uuid::now_v7(),
         &Sha256Hex::digest(code.expose().as_bytes()),
         issuer,
-        &distinct,
+        assignments,
     )
     .await
     .map_err(store_error)?;
@@ -534,7 +485,7 @@ impl BrowserSessions {
             tracing::info!("invitation issuer no longer holds tenant administration");
             return Err(one_time_code_invalid());
         }
-        grant_roles(&mut conn, user_id, &invitation.role_ids)
+        bind_assignments(&mut conn, user_subject(user_id), &invitation.assignments.0)
             .await
             .map_err(|_| one_time_code_invalid())?;
         let created = self.password_session(&mut conn, user_id, 0).await?;
@@ -1000,9 +951,17 @@ mod pg_tests {
         crate::seed::seed_builtin_roles_for_tenant(&mut conn, fixture.data_tenant_id())
             .await
             .expect("builtin roles seed");
-        create_local_user(&mut conn, "queued", &verifier, &["viewer".to_owned()])
-            .await
-            .expect("user creates");
+        create_local_user(
+            &mut conn,
+            "queued",
+            &verifier,
+            &[wyrd_spec::auth::ScopedRoleAssignment {
+                role: "viewer".to_owned(),
+                scope: wyrd_spec::auth::PermissionScope::All,
+            }],
+        )
+        .await
+        .expect("user creates");
         conn.commit().await.expect("user commits");
         let audit = RecordedAudit::new();
         let sessions = BrowserSessions::new(

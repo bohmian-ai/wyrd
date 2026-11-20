@@ -718,7 +718,11 @@ test("grouped coding uses declared sources", async ({ server, provider, assistan
   );
   server.scopedApiKey("ts_live_reader", ["tool:invoke", "bifrost_query:read"]);
   const principals = await Principals.connect();
-  await principals.grantRole(principal, "ts_live_reader");
+  const liveReader = await principals.bind({
+    subject: { principal: { id: principal, kind: "service" } },
+    role: "ts_live_reader",
+    scope: "all",
+  });
   const spans = new BasicTracerProvider({
     spanProcessors: [new SimpleSpanProcessor(spanExporter(client))],
   });
@@ -775,7 +779,7 @@ test("grouped coding uses declared sources", async ({ server, provider, assistan
   expect(read, "the check reads the spans live").toContain("edit-file");
   expect(read).toContain("late-test-run");
 
-  await principals.revokeRole(principal, "ts_live_reader");
+  await principals.unbind(liveReader.id);
   await run.observe.verify("coding-turn", { call: calls[0], trace: traceId }, { group_id: "session-2" });
   const revoked = await groupExecution(server, bindingId, WAIT_MS, judged.execution_id);
   expect(revoked.group_id).toBe("session-2");

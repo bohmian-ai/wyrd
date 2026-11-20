@@ -1,10 +1,10 @@
-//! Principal discovery and Role assignment through the authenticated HTTP
-//! surface.
+//! Principal discovery and scoped access administration through the
+//! authenticated HTTP surface.
 //!
-//! Drives `GET /v1/principals`, `GET /v1/principals/{id}/roles`, and
-//! `PUT`/`DELETE /v1/principals/{id}/roles/{role}` against the in-process
-//! server and the repository-managed Postgres: keyset discovery, idempotent
-//! direct grants and revokes, `idp`/`direct` coexistence across a login,
+//! Drives `GET /v1/principals`, `GET /v1/principals/{id}/access`, and
+//! `POST /v1/access/bindings` / `DELETE /v1/access/bindings/{id}` against the
+//! in-process server and the repository-managed Postgres: keyset discovery,
+//! idempotent direct bindings, provider/direct coexistence across a login,
 //! administration gates and their audited decisions, and the one
 //! non-enumerating refusal for every principal that is not assignable here.
 //! Stable Service accounts are created and restricted explicitly, and keep
@@ -18,7 +18,7 @@ use uuid::Uuid;
 use wyrd_spec::auth::{Attribution, PrincipalId};
 use wyrd_spec::ids::CardUid;
 use wyrd_sql::queries::auth::{
-    delete_service_account, insert_service_account, replace_idp_user_roles,
+    delete_service_account, insert_service_account, replace_idp_user_bindings,
 };
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
@@ -106,19 +106,21 @@ async fn service(server: &WyrdTestServer, name: &str, roles: &[&str]) -> (Uuid, 
     (machine.id().as_uuid(), jwt)
 }
 
-/// The `(role, source)` pairs of an assignment response, in response order.
+/// The `(role, source)` pairs of an access summary's grants, sorted.
 fn assignments(body: &Value) -> Vec<(String, String)> {
-    body["roles"]
+    let mut pairs: Vec<(String, String)> = body["grants"]
         .as_array()
-        .expect("roles is an array")
+        .expect("grants is an array")
         .iter()
-        .map(|assignment| {
+        .map(|grant| {
             (
-                assignment["role"].as_str().expect("role").to_owned(),
-                assignment["source"].as_str().expect("source").to_owned(),
+                grant["role"].as_str().expect("role").to_owned(),
+                grant["source"]["kind"].as_str().expect("source").to_owned(),
             )
         })
-        .collect()
+        .collect();
+    pairs.sort();
+    pairs
 }
 
 /// Owned `(role, source)` pairs for comparison.
@@ -127,6 +129,31 @@ fn pairs(expected: &[(&str, &str)]) -> Vec<(String, String)> {
         .iter()
         .map(|(role, source)| ((*role).to_owned(), (*source).to_owned()))
         .collect()
+}
+
+/// `principal`'s current access summary as `jwt` reads it.
+///
+/// # Panics
+/// Panics when the route does not answer `200`.
+async fn access(server: &WyrdTestServer, jwt: &str, principal: Uuid) -> Value {
+    let (status, body) = call(
+        server,
+        jwt,
+        Method::GET,
+        &format!("/v1/principals/{principal}/access"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body
+}
+
+/// A binding request granting `role` tenant-wide to account `id` of `kind`.
+fn binding(id: Uuid, kind: &str, role: &str) -> Value {
+    json!({
+        "subject": { "principal": { "id": id, "kind": kind } },
+        "role": role,
+        "scope": "all",
+    })
 }
 
 /// `principal`'s retained `operation` decisions as (permission, outcome),
@@ -163,155 +190,176 @@ async fn decisions(
     rows
 }
 
-/// A Service's direct grant is idempotent and reported with the complete
-/// resulting set; revoke is idempotent too; both allowed decisions are audited
-/// under tenant administration.
+/// A Service's direct binding is idempotent: granting it twice answers the
+/// same binding, and the account's access lists it beside its existing
+/// grant. Removing it leaves the existing grant; removing it again is refused
+/// as unknown. Every check is audited under tenant administration.
 ///
 /// # Panics
 /// Panics when the server fails to start, a route answers unexpectedly, or
 /// the audit expectations fail.
 #[tokio::test(flavor = "current_thread")]
-async fn direct_service_grants_and_revokes_are_idempotent() {
+async fn direct_service_bindings_are_idempotent() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
     let (admin, admin_jwt) = user(&server, "pr-admin", &["admin"]).await;
     let (target, _) = service(&server, "pr-target", &["workload"]).await;
-    let uri = format!("/v1/principals/{target}/roles/editor");
+    let request = binding(target, "service", "editor");
 
-    let (status, first) = call(&server, &admin_jwt, Method::PUT, &uri).await;
-    assert_eq!(status, StatusCode::OK, "{first}");
-    assert_eq!(first["changed"], json!(true));
-    assert_eq!(first["kind"], json!("service"));
-    assert_eq!(first["role"], json!("editor"));
-    assert_eq!(first["principal_id"], json!(target.to_string()));
-    assert_eq!(
-        assignments(&first),
-        pairs(&[("editor", "direct"), ("workload", "direct")])
-    );
-    let (status, repeat) = call(&server, &admin_jwt, Method::PUT, &uri).await;
-    assert_eq!(status, StatusCode::OK, "{repeat}");
-    assert_eq!(repeat["changed"], json!(false));
-    assert_eq!(assignments(&repeat), assignments(&first));
-
-    let (status, revoked) = call(&server, &admin_jwt, Method::DELETE, &uri).await;
-    assert_eq!(status, StatusCode::OK, "{revoked}");
-    assert_eq!(revoked["changed"], json!(true));
-    assert_eq!(assignments(&revoked), pairs(&[("workload", "direct")]));
-    let (status, again) = call(&server, &admin_jwt, Method::DELETE, &uri).await;
-    assert_eq!(status, StatusCode::OK, "{again}");
-    assert_eq!(again["changed"], json!(false));
-
-    let (status, listed) = call(
+    let (status, first) = send(
         &server,
         &admin_jwt,
-        Method::GET,
-        &format!("/v1/principals/{target}/roles"),
+        Method::POST,
+        "/v1/access/bindings",
+        Some(request.clone()),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{listed}");
-    assert_eq!(assignments(&listed), pairs(&[("workload", "direct")]));
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["role"], json!("editor"));
+    assert_eq!(first["scope"], json!("all"));
+    assert_eq!(first["source"], json!("direct"));
+    assert_eq!(
+        first["subject"],
+        json!({ "principal": { "id": target, "kind": "service" } })
+    );
+    let (status, repeat) = send(
+        &server,
+        &admin_jwt,
+        Method::POST,
+        "/v1/access/bindings",
+        Some(request),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{repeat}");
+    assert_eq!(repeat, first, "a repeated grant answers the same binding");
+    assert_eq!(
+        assignments(&access(&server, &admin_jwt, target).await),
+        pairs(&[("editor", "direct"), ("workload", "direct")])
+    );
+
+    let removal = format!(
+        "/v1/access/bindings/{}",
+        first["id"].as_str().expect("binding id")
+    );
+    let (status, removed) = call(&server, &admin_jwt, Method::DELETE, &removal).await;
+    assert_eq!(status, StatusCode::OK, "{removed}");
+    assert_eq!(removed, first);
+    let (status, again) = call(&server, &admin_jwt, Method::DELETE, &removal).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{again}");
+    assert_eq!(again["code"], json!("WYRD_SPEC_400_VALIDATION"));
+    assert_eq!(
+        assignments(&access(&server, &admin_jwt, target).await),
+        pairs(&[("workload", "direct")])
+    );
 
     let allowed = |count| vec![("wildcard:wildcard".to_owned(), "allowed".to_owned()); count];
     assert_eq!(
-        decisions(&server, "auth.principal.role.grant", admin).await,
+        decisions(&server, "auth.binding.create", admin).await,
         allowed(2)
     );
     assert_eq!(
-        decisions(&server, "auth.principal.role.revoke", admin).await,
+        decisions(&server, "auth.binding.delete", admin).await,
         allowed(2)
     );
     assert_eq!(
-        decisions(&server, "auth.principal.role.list", admin).await,
-        vec![("service_accounts:write".to_owned(), "allowed".to_owned())]
+        decisions(&server, "auth.principal.access.read", admin).await,
+        vec![("service_accounts:write".to_owned(), "allowed".to_owned()); 2]
     );
 }
 
-/// A user's direct and IdP assignments of one Role coexist: login replaces
-/// only the IdP set, revoke removes only the direct one, and the effective
-/// Roles a new token carries are their union.
+/// A user's direct and provider bindings of one role coexist: login replaces
+/// only the provider set, and removing the direct binding leaves the rest.
 ///
 /// # Panics
 /// Panics when the server fails to start, a route answers unexpectedly, or a
 /// fixture write fails.
 #[tokio::test(flavor = "current_thread")]
-async fn direct_user_assignments_survive_login_and_revoke_only_direct() {
+async fn direct_user_bindings_survive_login_and_removal_is_direct_only() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
     let (_, admin_jwt) = user(&server, "pr-admin", &["admin"]).await;
-    let (target, _) = user(&server, "pr-person", &["viewer"]).await;
-
-    let (status, granted) = call(
-        &server,
-        &admin_jwt,
-        Method::PUT,
-        &format!("/v1/principals/{target}/roles/viewer"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{granted}");
-    assert_eq!(granted["kind"], json!("user"));
-    assert_eq!(
-        assignments(&granted),
-        pairs(&[("viewer", "direct"), ("viewer", "idp")])
-    );
-    let (status, granted) = call(
-        &server,
-        &admin_jwt,
-        Method::PUT,
-        &format!("/v1/principals/{target}/roles/editor"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{granted}");
-
-    // The identity provider now asserts no Role: the next login replaces only
-    // the IdP set.
+    let (target, _) = user(&server, "pr-person", &[]).await;
     let mut conn = server
         .tenant_conn_for(server.data_tenant_id())
         .await
         .expect("tenant connection opens");
     assert!(
-        replace_idp_user_roles(&mut conn, target, &[])
+        replace_idp_user_bindings(&mut conn, target, &["viewer"])
             .await
-            .expect("login replaces the IdP set")
+            .expect("login projects the provider set")
     );
     conn.commit().await.expect("login commits");
 
-    let (status, listed) = call(
-        &server,
-        &admin_jwt,
-        Method::GET,
-        &format!("/v1/principals/{target}/roles"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{listed}");
+    let mut granted = Vec::new();
+    for role in ["viewer", "editor"] {
+        let (status, body) = send(
+            &server,
+            &admin_jwt,
+            Method::POST,
+            "/v1/access/bindings",
+            Some(binding(target, "user", role)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        granted.push(body);
+    }
     assert_eq!(
-        assignments(&listed),
+        assignments(&access(&server, &admin_jwt, target).await),
+        pairs(&[
+            ("editor", "direct"),
+            ("viewer", "direct"),
+            ("viewer", "provider")
+        ])
+    );
+
+    // The identity provider now asserts no role: the next login replaces only
+    // the provider set.
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    assert!(
+        replace_idp_user_bindings(&mut conn, target, &[])
+            .await
+            .expect("login replaces the provider set")
+    );
+    conn.commit().await.expect("login commits");
+    assert_eq!(
+        assignments(&access(&server, &admin_jwt, target).await),
         pairs(&[("editor", "direct"), ("viewer", "direct")])
     );
 
-    let (status, revoked) = call(
+    let (status, removed) = call(
         &server,
         &admin_jwt,
         Method::DELETE,
-        &format!("/v1/principals/{target}/roles/viewer"),
+        &format!(
+            "/v1/access/bindings/{}",
+            granted[0]["id"].as_str().expect("binding id")
+        ),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{revoked}");
-    assert_eq!(assignments(&revoked), pairs(&[("editor", "direct")]));
+    assert_eq!(status, StatusCode::OK, "{removed}");
+    assert_eq!(
+        assignments(&access(&server, &admin_jwt, target).await),
+        pairs(&[("editor", "direct")])
+    );
 }
 
-/// Role writes need tenant administration and discovery needs principal
+/// Binding writes need tenant administration and access reads need principal
 /// administration; every refusal is audited and writes nothing.
 ///
 /// # Panics
 /// Panics when the server fails to start, a caller is not refused, or the
 /// audit expectations fail.
 #[tokio::test(flavor = "current_thread")]
-async fn role_writes_require_tenant_administration() {
+async fn binding_writes_require_tenant_administration() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
+    let (_, admin_jwt) = user(&server, "pr-admin", &["admin"]).await;
     let (target, _) = service(&server, "pr-target", &["workload"]).await;
     let (editor, editor_jwt) = user(&server, "pr-editor", &["editor"]).await;
     server
@@ -325,35 +373,47 @@ async fn role_writes_require_tenant_administration() {
         .expect("role seeds");
     let (credential_admin, credential_jwt) =
         user(&server, "pr-credentials", &["credential_admin"]).await;
-    let uri = format!("/v1/principals/{target}/roles/editor");
+    let workload = access(&server, &admin_jwt, target).await["grants"][0]["binding_id"]
+        .as_str()
+        .expect("binding id")
+        .to_owned();
 
     for jwt in [&editor_jwt, &credential_jwt] {
-        let (status, body) = call(&server, jwt, Method::PUT, &uri).await;
+        let (status, body) = send(
+            &server,
+            jwt,
+            Method::POST,
+            "/v1/access/bindings",
+            Some(binding(target, "service", "editor")),
+        )
+        .await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
         assert_eq!(body["code"], json!("WYRD_PERMISSION_403_DENIED_RBAC"));
-        let (status, body) = call(&server, jwt, Method::DELETE, &uri).await;
+        let (status, body) = call(
+            &server,
+            jwt,
+            Method::DELETE,
+            &format!("/v1/access/bindings/{workload}"),
+        )
+        .await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     }
     let (status, body) = call(&server, &editor_jwt, Method::GET, "/v1/principals").await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-    let (status, listed) = call(
-        &server,
-        &credential_jwt,
-        Method::GET,
-        &format!("/v1/principals/{target}/roles"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{listed}");
-    assert_eq!(assignments(&listed), pairs(&[("workload", "direct")]));
+    assert_eq!(
+        assignments(&access(&server, &credential_jwt, target).await),
+        pairs(&[("workload", "direct")]),
+        "the refused writes changed nothing"
+    );
 
     let denied = vec![("wildcard:wildcard".to_owned(), "denied".to_owned())];
     for principal in [editor, credential_admin] {
         assert_eq!(
-            decisions(&server, "auth.principal.role.grant", principal).await,
+            decisions(&server, "auth.binding.create", principal).await,
             denied
         );
         assert_eq!(
-            decisions(&server, "auth.principal.role.revoke", principal).await,
+            decisions(&server, "auth.binding.delete", principal).await,
             denied
         );
     }
@@ -408,15 +468,20 @@ async fn unassignable_principals_are_not_enumerable() {
         .as_uuid();
 
     for id in [Uuid::now_v7(), deleted, tenant_admin, foreign] {
-        for (method, uri) in [
-            (Method::GET, format!("/v1/principals/{id}/roles")),
-            (Method::PUT, format!("/v1/principals/{id}/roles/viewer")),
-            (Method::DELETE, format!("/v1/principals/{id}/roles/viewer")),
-        ] {
-            let (status, body) = call(&server, &admin_jwt, method, &uri).await;
-            assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {body}");
-            assert_eq!(body["code"], json!("WYRD_AUTH_404_PRINCIPAL_NOT_FOUND"));
-        }
+        let uri = format!("/v1/principals/{id}/access");
+        let (status, body) = call(&server, &admin_jwt, Method::GET, &uri).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {body}");
+        assert_eq!(body["code"], json!("WYRD_AUTH_404_PRINCIPAL_NOT_FOUND"));
+        let (status, body) = send(
+            &server,
+            &admin_jwt,
+            Method::POST,
+            "/v1/access/bindings",
+            Some(binding(id, "service", "viewer")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{id}: {body}");
+        assert_eq!(body["code"], json!("WYRD_AUTH_404_PRINCIPAL_NOT_FOUND"));
     }
 
     let (status, page) = call(&server, &admin_jwt, Method::GET, "/v1/principals?limit=200").await;
@@ -432,22 +497,26 @@ async fn unassignable_principals_are_not_enumerable() {
     }
 
     for uri in [
-        "/v1/principals/not-a-uuid/roles".to_owned(),
-        format!("/v1/principals/{admin}/roles/no_such_role"),
-        "/v1/principals?limit=0".to_owned(),
-        "/v1/principals?limit=201".to_owned(),
-        "/v1/principals?kind=tenant_admin".to_owned(),
-        "/v1/principals?colour=blue".to_owned(),
+        "/v1/principals/not-a-uuid/access",
+        "/v1/principals?limit=0",
+        "/v1/principals?limit=201",
+        "/v1/principals?kind=tenant_admin",
+        "/v1/principals?colour=blue",
     ] {
-        let method = if uri.contains("no_such_role") {
-            Method::PUT
-        } else {
-            Method::GET
-        };
-        let (status, body) = call(&server, &admin_jwt, method, &uri).await;
+        let (status, body) = call(&server, &admin_jwt, Method::GET, uri).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
         assert_eq!(body["code"], json!("WYRD_SPEC_400_VALIDATION"), "{uri}");
     }
+    let (status, body) = send(
+        &server,
+        &admin_jwt,
+        Method::POST,
+        "/v1/access/bindings",
+        Some(binding(admin, "user", "no_such_role")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], json!("WYRD_SPEC_400_VALIDATION"));
 }
 
 /// Discovery filters by exact kind, email, and name and pages by id without
@@ -699,7 +768,10 @@ async fn stable_account_restrictions_and_credentials() {
 
     let family = json!({ "mode": "family", "kind": "Service", "name": "sa-checkout" });
     let create = |name: &str, restriction: Option<Value>| {
-        let mut body = json!({ "name": name, "roles": ["workload"] });
+        let mut body = json!({
+            "name": name,
+            "assignments": [{ "role": "workload", "scope": "all" }],
+        });
         if let Some(restriction) = restriction {
             body["workload_restriction"] = restriction;
         }
@@ -819,14 +891,8 @@ async fn stable_account_restrictions_and_credentials() {
             .await
             .expect("rooted exchange succeeds");
     }
-    let (status, roles) = call(
-        &server,
-        &admin_jwt,
-        Method::GET,
-        &format!("/v1/principals/{runtime}/roles"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{roles}");
+    let runtime_id: Uuid = runtime.parse().expect("runtime id");
+    let roles = access(&server, &admin_jwt, runtime_id).await;
     assert_eq!(assignments(&roles), pairs(&[("workload", "direct")]));
 
     let (status, lifted) = send(
@@ -847,13 +913,7 @@ async fn stable_account_restrictions_and_credentials() {
         lifted["workload_restriction"],
         json!({ "mode": "unrestricted" })
     );
-    let (_, roles_after) = call(
-        &server,
-        &admin_jwt,
-        Method::GET,
-        &format!("/v1/principals/{runtime}/roles"),
-    )
-    .await;
+    let roles_after = access(&server, &admin_jwt, runtime_id).await;
     assert_eq!(assignments(&roles_after), assignments(&roles));
     let (status, credentials) = call(
         &server,
@@ -915,7 +975,7 @@ async fn workload_roots_and_families_are_services_only() {
         "/v1/principals",
         Some(json!({
             "name": "so-checkout-runtime",
-            "roles": ["workload"],
+            "assignments": [{ "role": "workload", "scope": "all" }],
             "workload_restriction": { "mode": "family", "kind": "Service", "name": "so-checkout" }
         })),
     )
@@ -991,7 +1051,7 @@ async fn workload_roots_and_families_are_services_only() {
         "/v1/principals",
         Some(json!({
             "name": "so-agent-runtime",
-            "roles": ["workload"],
+            "assignments": [{ "role": "workload", "scope": "all" }],
             "workload_restriction": agent_family
         })),
     )

@@ -93,7 +93,7 @@ impl Tenant {
             let created = principals
                 .create_service_principal(&CreateServicePrincipalRequest {
                     name: format!("bench-caller-{index}"),
-                    roles: vec![INVOKER_ROLE.to_owned()],
+                    assignments: vec![wyrd_spec::auth::ScopedRoleAssignment::tenant(INVOKER_ROLE)],
                     description: None,
                     workload_restriction: None,
                 })

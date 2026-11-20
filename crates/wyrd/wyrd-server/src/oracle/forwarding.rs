@@ -925,7 +925,6 @@ mod tests {
             PrincipalId::new(uuid::Uuid::now_v7()),
             PrincipalKind::User,
             tenant,
-            Vec::new(),
             PermissionSet::from_iter([permission.clone()]),
         );
         let context = AuthorizedQueryContext::try_new(

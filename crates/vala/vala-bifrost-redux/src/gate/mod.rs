@@ -1907,13 +1907,7 @@ mod tests {
     ) -> AuthContext {
         let tenant = DataTenantId::new_v7();
         AuthContext {
-            principal: Principal::new(
-                id,
-                kind,
-                tenant,
-                Vec::new(),
-                PermissionSet::from_iter(permissions),
-            ),
+            principal: Principal::new(id, kind, tenant, PermissionSet::from_iter(permissions)),
             tenant,
             request_id: RequestId::now_v7(),
             delegation_chain: Vec::new(),
@@ -1940,7 +1934,6 @@ mod tests {
             PrincipalId::new(uuid::Uuid::now_v7()),
             PrincipalKind::User,
             tenant,
-            Vec::new(),
             permissions,
         );
         AuthContext {
@@ -2704,7 +2697,6 @@ mod tests {
                 PrincipalId::new(uuid::Uuid::now_v7()),
                 kind,
                 tenant,
-                Vec::new(),
                 permissions,
             ),
             tenant,
@@ -3031,6 +3023,7 @@ mod tests {
                 wyrd_auth_verify::VerifiedToken {
                     principal: caller.principal.clone(),
                     delegation_chain: Vec::new(),
+                    permission_ceiling: None,
                     exp: chrono::Utc::now() + chrono::Duration::hours(1),
                 },
             ));

@@ -72,9 +72,16 @@ WIRE_ROOTS = [
     "IssuedCredential",
     "PrincipalPage",
     "PrincipalQuery",
-    "PrincipalRoles",
     "RevokePrincipalRequest",
-    "RoleAssignmentChange",
+    # Scoped access administration.
+    "AccessSummary",
+    "CreateGroupRequest",
+    "CreateRoleBindingRequest",
+    "GroupList",
+    "PutRoleRequest",
+    "RoleBindingList",
+    "RoleBindingQuery",
+    "RoleList",
     "TokenAudience",
     # Gateway.
     "GatewayCapturePolicy",

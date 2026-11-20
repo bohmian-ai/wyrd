@@ -48,7 +48,6 @@ pub(super) fn scheduled_context(
         PrincipalId::new(uuid::Uuid::now_v7()),
         PrincipalKind::User,
         tenant,
-        Vec::new(),
         PermissionSet::from_iter([permission.clone()]),
     );
     Ok(AuthorizedQueryContext::try_new(

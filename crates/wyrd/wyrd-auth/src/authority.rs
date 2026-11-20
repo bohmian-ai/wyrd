@@ -1,0 +1,615 @@
+//! Current tenant authority: compiled grants shared by issuance and every
+//! request.
+//!
+//! [`TenantAuthority`] compiles one tenant's bindings, groups, live accounts
+//! and credentials at one authorization revision into per-account grant sets.
+//! [`AuthorityCache`] keeps one per tenant in process memory, so a warm
+//! request authorizes with a map lookup and no statement. A miss, a known
+//! newer revision, or expired freshness triggers the sanctioned one-statement
+//! reload; when that fails the request is refused as unavailable, never
+//! allowed from token claims.
+//!
+//! Freshness is renewed only by background confirmation that reads the
+//! committed revision. An unchanged revision renews the snapshot without
+//! recompiling it; a changed one recompiles. Without confirmation a snapshot
+//! serves for at most [`FRESHNESS_BOUND`] after its last successful
+//! confirmation. Requests never renew it.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+
+use uuid::Uuid;
+use wyrd_auth_verify::VerifiedToken;
+use wyrd_runtime::{
+    EffectivePermissions, Permission, PermissionSet, Principal, PrincipalId, RoleRef,
+};
+use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::{
+    Operation, PermissionScope, PrincipalKindTag, WorkloadFamily, compile_binding,
+};
+use wyrd_spec::error::WyrdError;
+use wyrd_sql::queries::auth::{
+    AuthorityState, authority_state, current_authorization_revision, workload_family,
+};
+use wyrd_sql::{TenantConn, WyrdPostgres};
+
+/// How long a snapshot may keep serving after its last successful database
+/// confirmation when no newer revision is known.
+pub const FRESHNESS_BOUND: Duration = Duration::from_secs(300);
+
+/// How often background confirmation reads each cached tenant's committed
+/// revision; bounds propagation when a notification is missed.
+pub const CONFIRM_INTERVAL: Duration = Duration::from_secs(2);
+
+/// One live account's current authority.
+#[derive(Clone, Debug)]
+pub struct AccountAuthority {
+    /// Account kind.
+    pub kind: PrincipalKindTag,
+    /// Union of every applicable direct, provider and group binding.
+    pub grants: Arc<PermissionSet>,
+    /// Names of every role bound to the account directly or through a group.
+    pub roles: Arc<[RoleRef]>,
+    /// Durable runtime-family restriction of a Service account.
+    pub restriction: Option<WorkloadFamily>,
+}
+
+/// One stored credential's current state.
+#[derive(Clone, Debug)]
+enum KeyState {
+    /// Usable, with its restrictive ceiling when it carries one.
+    Active(Option<Arc<PermissionSet>>),
+    /// Revoked or expired.
+    Inactive,
+}
+
+/// A tenant's compiled authority at one authorization revision.
+#[derive(Debug, Default)]
+pub struct TenantAuthority {
+    revision: i64,
+    accounts: HashMap<Uuid, AccountAuthority>,
+    keys: HashMap<Uuid, KeyState>,
+}
+
+/// Why a stored authorization row cannot be compiled.
+#[derive(Debug, thiserror::Error)]
+pub enum AuthorityError {
+    /// The load statement failed.
+    #[error("authority load failed: {0}")]
+    Database(#[from] sqlx::Error),
+    /// A stored role, scope, or ceiling does not decode.
+    #[error("stored authorization for role {role:?} is corrupt")]
+    Corrupt {
+        /// Role or credential naming the corrupt row.
+        role: String,
+    },
+}
+
+impl From<AuthorityError> for WyrdError {
+    fn from(error: AuthorityError) -> Self {
+        match error {
+            AuthorityError::Database(error) => crate::error::store_error(error),
+            AuthorityError::Corrupt { role } => Self::RoleCorrupt {
+                message: format!("stored authorization for {role} is corrupt"),
+                details: serde_json::json!({ "role": role }),
+            },
+        }
+    }
+}
+
+impl TenantAuthority {
+    /// Loads and compiles the tenant's current authority in one statement on
+    /// the caller's transaction.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthorityError`] when the load fails or a stored row is corrupt.
+    pub async fn load(conn: &mut TenantConn<'_>) -> Result<Self, AuthorityError> {
+        Self::compile(authority_state(conn).await?)
+    }
+
+    /// Compiles one loaded state. Bindings of inactive or unknown subjects
+    /// contribute nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthorityError::Corrupt`] for a stored role, scope or ceiling that
+    /// does not decode.
+    pub fn compile(state: AuthorityState) -> Result<Self, AuthorityError> {
+        let mut direct: HashMap<Uuid, Vec<Permission>> = HashMap::new();
+        let mut groups: HashMap<Uuid, Vec<Permission>> = HashMap::new();
+        let mut direct_roles: HashMap<Uuid, Vec<RoleRef>> = HashMap::new();
+        let mut group_roles: HashMap<Uuid, Vec<RoleRef>> = HashMap::new();
+        for binding in state.bindings.0 {
+            let corrupt = || AuthorityError::Corrupt {
+                role: binding.role.clone(),
+            };
+            let operations: Vec<Operation> =
+                serde_json::from_value(binding.operations.clone()).map_err(|_| corrupt())?;
+            let scope: PermissionScope =
+                serde_json::from_value(binding.scope.clone()).map_err(|_| corrupt())?;
+            let Ok(permissions) = compile_binding(&operations, &scope) else {
+                continue;
+            };
+            let role = RoleRef::new(&binding.role).map_err(|_| corrupt())?;
+            let (target, names) = match (
+                binding.user_id,
+                binding.service_account_id,
+                binding.group_id,
+            ) {
+                (Some(id), None, None) | (None, Some(id), None) => {
+                    (direct.entry(id), direct_roles.entry(id))
+                }
+                (None, None, Some(group)) => (groups.entry(group), group_roles.entry(group)),
+                _ => return Err(corrupt()),
+            };
+            target.or_default().extend(permissions);
+            names.or_default().push(role);
+        }
+        for membership in state.memberships.0 {
+            let Some(member) = membership.user_id.or(membership.service_account_id) else {
+                continue;
+            };
+            if let Some(granted) = groups.get(&membership.group_id) {
+                direct
+                    .entry(member)
+                    .or_default()
+                    .extend(granted.iter().cloned());
+            }
+            if let Some(names) = group_roles.get(&membership.group_id) {
+                direct_roles
+                    .entry(member)
+                    .or_default()
+                    .extend(names.iter().cloned());
+            }
+        }
+        let mut accounts = HashMap::new();
+        for user in state.users.0 {
+            let mut grants: PermissionSet = direct
+                .remove(&user)
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            // Every real User may read and manage its own credentials;
+            // ownership is enforced where the capability is checked.
+            grants.insert(Permission::personal_credentials_read());
+            grants.insert(Permission::personal_credentials_write());
+            accounts.insert(
+                user,
+                AccountAuthority {
+                    kind: PrincipalKindTag::User,
+                    grants: Arc::new(grants),
+                    roles: role_names(direct_roles.remove(&user)),
+                    restriction: None,
+                },
+            );
+        }
+        for account in state.service_accounts.0 {
+            let corrupt = || AuthorityError::Corrupt {
+                role: format!("account {}", account.id),
+            };
+            let kind = match account.principal_kind.as_str() {
+                "service" => PrincipalKindTag::Service,
+                "tenant_admin" => PrincipalKindTag::TenantAdmin,
+                _ => return Err(corrupt()),
+            };
+            let restriction = workload_family(
+                account.restriction_kind.as_deref(),
+                account.restriction_name.as_deref(),
+            )
+            .map_err(|_| corrupt())?;
+            let grants = direct
+                .remove(&account.id)
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            accounts.insert(
+                account.id,
+                AccountAuthority {
+                    kind,
+                    grants: Arc::new(grants),
+                    roles: role_names(direct_roles.remove(&account.id)),
+                    restriction,
+                },
+            );
+        }
+        let mut keys = HashMap::new();
+        for key in state.api_keys.0 {
+            let stateful = if key.active {
+                let ceiling = key
+                    .permission_ceiling
+                    .map(|expressions| {
+                        expressions
+                            .iter()
+                            .map(|expression| expression.parse::<Permission>())
+                            .collect::<Result<PermissionSet, _>>()
+                            .map(Arc::new)
+                    })
+                    .transpose()
+                    .map_err(|_| AuthorityError::Corrupt {
+                        role: format!("credential {}", key.id),
+                    })?;
+                KeyState::Active(ceiling)
+            } else {
+                KeyState::Inactive
+            };
+            keys.insert(key.id, stateful);
+        }
+        Ok(Self {
+            revision: state.revision,
+            accounts,
+            keys,
+        })
+    }
+
+    /// The current grants of live account `id` of `kind`, loaded on the
+    /// caller's transaction; `None` when it is missing, inactive or of another
+    /// kind.
+    ///
+    /// # Errors
+    ///
+    /// [`WyrdError`] when the load fails or a stored row is corrupt.
+    pub async fn current_grants(
+        conn: &mut TenantConn<'_>,
+        id: PrincipalId,
+        kind: PrincipalKindTag,
+    ) -> Result<Option<Arc<PermissionSet>>, WyrdError> {
+        let authority = Self::load(conn).await?;
+        Ok(authority
+            .account(id)
+            .filter(|account| account.kind == kind)
+            .map(|account| Arc::clone(&account.grants)))
+    }
+
+    /// The authorization revision this snapshot was compiled at.
+    #[must_use]
+    pub const fn revision(&self) -> i64 {
+        self.revision
+    }
+
+    /// The live account `id`, or `None` when it is missing or inactive.
+    #[must_use]
+    pub fn account(&self, id: PrincipalId) -> Option<&AccountAuthority> {
+        self.accounts.get(&id.as_uuid())
+    }
+
+    /// The current authority of the verified token's caller, or `None` when
+    /// its subject, any delegation actor, or its API-key credential is no
+    /// longer live.
+    ///
+    /// The subject's current grants are bounded by the signed ceiling, the
+    /// presented key's current ceiling, and every delegation actor's current
+    /// grants; actor identity alone is attribution, never authority.
+    #[must_use]
+    pub fn authorize(&self, verified: &VerifiedToken) -> Option<Principal> {
+        let subject = &verified.principal;
+        let account = self
+            .account(subject.id)
+            .filter(|a| a.kind == subject.kind.tag())?;
+        let mut authority = EffectivePermissions::new(Arc::clone(&account.grants));
+        if let Some(ceiling) = &verified.permission_ceiling {
+            authority = authority.restricted_by(Arc::new(ceiling.clone()));
+        }
+        if let Some(credential) = subject.credential_id {
+            match self.keys.get(&credential) {
+                Some(KeyState::Inactive) => return None,
+                Some(KeyState::Active(Some(ceiling))) => {
+                    authority = authority.restricted_by(Arc::clone(ceiling));
+                }
+                Some(KeyState::Active(None)) | None => {}
+            }
+        }
+        for step in &verified.delegation_chain {
+            let actor = self
+                .account(step.principal.id)
+                .filter(|a| a.kind == step.principal.kind.tag())?;
+            authority = authority.restricted_by(Arc::clone(&actor.grants));
+        }
+        let mut principal = subject.clone();
+        principal.effective_permissions = authority;
+        principal.roles = account.roles.to_vec();
+        Some(principal)
+    }
+}
+
+/// An account's distinct bound role names, in name order.
+fn role_names(names: Option<Vec<RoleRef>>) -> Arc<[RoleRef]> {
+    let mut names = names.unwrap_or_default();
+    names.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    names.dedup();
+    names.into()
+}
+
+/// One tenant's cached snapshot and its freshness.
+struct Entry {
+    snapshot: Arc<TenantAuthority>,
+    confirmed_at: Instant,
+    known_newer: bool,
+}
+
+/// Process-local current authority, one snapshot per tenant.
+#[derive(Default)]
+pub struct AuthorityCache {
+    entries: Mutex<HashMap<DataTenantId, Entry>>,
+    compiles: AtomicU64,
+}
+
+impl std::fmt::Debug for AuthorityCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthorityCache")
+            .field("compiles", &self.compiles())
+            .finish_non_exhaustive()
+    }
+}
+
+impl AuthorityCache {
+    fn entries(&self) -> MutexGuard<'_, HashMap<DataTenantId, Entry>> {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// How many snapshots this cache has compiled, so tests can prove warm
+    /// requests and unchanged confirmations never recompile.
+    pub fn compiles(&self) -> u64 {
+        self.compiles.load(Ordering::Relaxed)
+    }
+
+    /// The tenant's usable snapshot from memory, or `None` when it must be
+    /// reloaded: absent, a newer revision is known, or freshness expired.
+    #[must_use]
+    pub fn cached(&self, tenant: DataTenantId) -> Option<Arc<TenantAuthority>> {
+        let entries = self.entries();
+        let entry = entries.get(&tenant)?;
+        (!entry.known_newer && entry.confirmed_at.elapsed() <= FRESHNESS_BOUND)
+            .then(|| Arc::clone(&entry.snapshot))
+    }
+
+    /// The tenant's usable snapshot, reloading it with one statement when
+    /// [`Self::cached`] has none.
+    ///
+    /// # Errors
+    ///
+    /// [`WyrdError::AuthorizationUnavailable`] when the reload fails.
+    pub async fn acquire(
+        &self,
+        postgres: &WyrdPostgres,
+        tenant: DataTenantId,
+    ) -> Result<Arc<TenantAuthority>, WyrdError> {
+        if let Some(snapshot) = self.cached(tenant) {
+            return Ok(snapshot);
+        }
+        let loaded = async {
+            let mut conn = postgres.tenant_conn(tenant).await.ok()?;
+            let snapshot = TenantAuthority::load(&mut conn).await;
+            drop(conn.commit().await);
+            snapshot
+                .inspect_err(|error| tracing::warn!(%tenant, %error, "authority reload failed"))
+                .ok()
+        }
+        .await
+        .ok_or_else(|| WyrdError::authorization_unavailable("reload_failed"))?;
+        Ok(self.install(tenant, loaded))
+    }
+
+    /// Authorizes a verified token against the tenant's current authority.
+    ///
+    /// # Errors
+    ///
+    /// [`WyrdError::AuthorizationUnavailable`] when no usable snapshot can be
+    /// acquired, and [`WyrdError::PermissionUnauthenticated`] when the
+    /// caller, an actor or its credential is no longer live.
+    pub async fn authorize(
+        &self,
+        postgres: &WyrdPostgres,
+        verified: &VerifiedToken,
+    ) -> Result<Principal, WyrdError> {
+        let snapshot = self.acquire(postgres, verified.principal.tenant_id).await?;
+        snapshot
+            .authorize(verified)
+            .ok_or_else(|| WyrdError::PermissionUnauthenticated {
+                message: "the token's account or credential is no longer active".to_owned(),
+                details: serde_json::json!({ "reason": "inactive" }),
+            })
+    }
+
+    /// Installs a freshly loaded snapshot, confirmed now, unless a newer one
+    /// is already cached; returns the snapshot now serving.
+    pub fn install(&self, tenant: DataTenantId, loaded: TenantAuthority) -> Arc<TenantAuthority> {
+        self.compiles.fetch_add(1, Ordering::Relaxed);
+        let mut entries = self.entries();
+        match entries.get_mut(&tenant) {
+            Some(entry) if entry.snapshot.revision > loaded.revision => Arc::clone(&entry.snapshot),
+            slot => {
+                let snapshot = Arc::new(loaded);
+                let entry = Entry {
+                    snapshot: Arc::clone(&snapshot),
+                    confirmed_at: Instant::now(),
+                    known_newer: false,
+                };
+                match slot {
+                    Some(existing) => *existing = entry,
+                    None => {
+                        entries.insert(tenant, entry);
+                    }
+                }
+                snapshot
+            }
+        }
+    }
+
+    /// Applies a committed-revision notification `<tenant>:<revision>`: a
+    /// newer revision stops the cached snapshot from serving until reloaded.
+    pub fn notify(&self, payload: &str) {
+        let parsed = payload.split_once(':').and_then(|(tenant, revision)| {
+            Some((
+                DataTenantId::new(tenant.parse().ok()?).ok()?,
+                revision.parse::<i64>().ok()?,
+            ))
+        });
+        let mut entries = self.entries();
+        if let Some((tenant, revision)) = parsed {
+            if let Some(entry) = entries.get_mut(&tenant)
+                && entry.snapshot.revision < revision
+            {
+                entry.known_newer = true;
+            }
+        } else {
+            tracing::warn!(payload, "malformed authorization notification");
+            for entry in entries.values_mut() {
+                entry.known_newer = true;
+            }
+        }
+    }
+
+    /// Confirms every cached tenant against its committed revision: an
+    /// unchanged revision renews freshness without recompiling, a changed one
+    /// reloads. A failed read leaves the entry to age toward
+    /// [`FRESHNESS_BOUND`].
+    pub async fn confirm(&self, postgres: &WyrdPostgres) {
+        let tenants: Vec<(DataTenantId, i64)> = self
+            .entries()
+            .iter()
+            .map(|(tenant, entry)| (*tenant, entry.snapshot.revision))
+            .collect();
+        for (tenant, cached) in tenants {
+            let Ok(mut conn) = postgres.tenant_conn(tenant).await else {
+                continue;
+            };
+            let committed = current_authorization_revision(&mut conn).await;
+            match committed {
+                Ok(revision) if revision == cached => {
+                    drop(conn.commit().await);
+                    if let Some(entry) = self.entries().get_mut(&tenant)
+                        && entry.snapshot.revision == revision
+                    {
+                        entry.confirmed_at = Instant::now();
+                    }
+                }
+                Ok(_) => {
+                    let loaded = TenantAuthority::load(&mut conn).await;
+                    drop(conn.commit().await);
+                    match loaded {
+                        Ok(loaded) => {
+                            self.install(tenant, loaded);
+                        }
+                        Err(error) => tracing::warn!(%tenant, %error, "authority reload failed"),
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%tenant, %error, "authority confirmation failed");
+                }
+            }
+        }
+    }
+
+    /// Ages a tenant's confirmation by `age`, so a test can observe the
+    /// freshness bound without waiting it out.
+    #[cfg(test)]
+    fn age(&self, tenant: DataTenantId, age: Duration) {
+        if let Some(entry) = self.entries().get_mut(&tenant) {
+            entry.confirmed_at -= age;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use serde_json::json;
+    use sqlx::types::Json;
+    use uuid::Uuid;
+    use wyrd_spec::DataTenantId;
+    use wyrd_sql::queries::auth::{AuthorityBinding, AuthorityState};
+
+    use super::{AuthorityCache, AuthorityError, FRESHNESS_BOUND, TenantAuthority};
+
+    fn state(revision: i64, user: Uuid) -> AuthorityState {
+        AuthorityState {
+            revision,
+            bindings: Json(vec![AuthorityBinding {
+                role: "viewer".to_owned(),
+                operations: json!([{"resource": "cards", "action": "read"}]),
+                scope: json!({"card": {"family": {"kind": "Repository", "name": "payments"}}}),
+                user_id: Some(user),
+                service_account_id: None,
+                group_id: None,
+            }]),
+            memberships: Json(Vec::new()),
+            users: Json(vec![user]),
+            service_accounts: Json(Vec::new()),
+            api_keys: Json(Vec::new()),
+        }
+    }
+
+    /// Proves a snapshot stops serving on a known newer revision and after
+    /// the freshness bound, and serves again only when reinstalled.
+    ///
+    /// # Panics
+    /// Panics when stale or invalidated state keeps serving.
+    #[test]
+    fn snapshots_serve_only_while_fresh_and_current() {
+        let tenant = DataTenantId::new_v7();
+        let user = Uuid::now_v7();
+        let cache = AuthorityCache::default();
+        assert!(cache.cached(tenant).is_none(), "cold state is unavailable");
+
+        cache.install(
+            tenant,
+            TenantAuthority::compile(state(3, user)).expect("compiles"),
+        );
+        assert!(cache.cached(tenant).is_some());
+        assert_eq!(cache.compiles(), 1);
+
+        cache.notify(&format!("{tenant}:3"));
+        assert!(
+            cache.cached(tenant).is_some(),
+            "an equal revision changes nothing"
+        );
+        cache.notify(&format!("{tenant}:4"));
+        assert!(
+            cache.cached(tenant).is_none(),
+            "a known newer revision refuses"
+        );
+
+        cache.install(
+            tenant,
+            TenantAuthority::compile(state(4, user)).expect("compiles"),
+        );
+        assert!(cache.cached(tenant).is_some());
+        cache.age(tenant, FRESHNESS_BOUND + Duration::from_secs(1));
+        assert!(cache.cached(tenant).is_none(), "expired freshness refuses");
+    }
+
+    /// A binding whose role operations or scope do not decode fails the
+    /// whole snapshot naming the role, never compiling partial authority.
+    ///
+    /// # Panics
+    /// Panics when a corrupt row compiles or names another role.
+    #[test]
+    fn corrupt_bindings_name_their_role() {
+        let user = Uuid::now_v7();
+        for (operations, scope) in [
+            (
+                json!([{"resource": "cards", "action": "unknown"}]),
+                json!("all"),
+            ),
+            (
+                json!([{"resource": "cards", "action": "read"}]),
+                json!({"nowhere": {}}),
+            ),
+        ] {
+            let mut state = state(1, user);
+            state.bindings.0[0].role = "bad_role".to_owned();
+            state.bindings.0[0].operations = operations;
+            state.bindings.0[0].scope = scope;
+            match TenantAuthority::compile(state) {
+                Err(AuthorityError::Corrupt { role }) => assert_eq!(role, "bad_role"),
+                other => panic!("expected a corrupt role, got {:?}", other.map(|_| ())),
+            }
+        }
+    }
+}

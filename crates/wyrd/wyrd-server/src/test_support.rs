@@ -288,7 +288,6 @@ pub(crate) fn test_caller(
             wyrd_spec::auth::PrincipalId::new(uuid::Uuid::now_v7()),
             wyrd_runtime::PrincipalKind::User,
             tenant,
-            Vec::new(),
             wyrd_runtime::permission::PermissionSet::from_iter(permissions),
         ),
         request_id: wyrd_spec::request_id::RequestId::now_v7(),

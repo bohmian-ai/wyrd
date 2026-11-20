@@ -9,6 +9,7 @@ use wyrd_spec::ids::{CardUid, IdempotencyKey};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::AuditDelegationStep;
 
+use crate::permission::{PermissionSet, UnrepresentableIntersection};
 use crate::principal::{Principal, PrincipalRef};
 
 /// One flattened RFC 8693 actor-chain step.
@@ -107,10 +108,13 @@ pub fn needs_root_resolution(
 /// what was accepted: the effective principal (for a delegated request, the
 /// subject/actor intersection authentication already produced, with its
 /// signed Card limit and root) and the initiator-first delegation chain with
-/// each participant's root and non-secret credential provenance. It is never
-/// re-derived from a bare principal ID or the account's current roles, holds
-/// no bearer token or secret, and is server-only state that no run view
-/// exposes.
+/// each participant's root and non-secret credential provenance.
+///
+/// The principal's authority is frozen as one plain permission set: the
+/// accepted ceiling. Retry and restart restrict the subject's and actors'
+/// then-current grants by it, so newer grants never expand accepted work and
+/// removed grants still stop it. It holds no bearer token or secret and is
+/// server-only state that no run view exposes.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AcceptedAuthority {
@@ -121,16 +125,35 @@ pub struct AcceptedAuthority {
 }
 
 impl AcceptedAuthority {
-    /// Capture `principal` and its verified `chain` as accepted authority.
+    /// Capture `principal` and its verified `chain` as accepted authority,
+    /// freezing the principal's effective authority as the accepted ceiling.
     ///
     /// Keeps the non-secret credential ID as provenance; it never
     /// authorizes later work.
-    #[must_use]
-    pub fn new(principal: &Principal, chain: &[DelegationStep]) -> Self {
-        Self {
-            principal: principal.clone(),
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UnrepresentableIntersection`] when the request's authority
+    /// layers cannot be frozen into one set; the work is refused rather than
+    /// accepted under a wider ceiling.
+    pub fn new(
+        principal: &Principal,
+        chain: &[DelegationStep],
+    ) -> Result<Self, UnrepresentableIntersection> {
+        let ceiling = principal.effective_permissions.flatten()?;
+        let mut principal = principal.clone();
+        principal.effective_permissions = ceiling.into();
+        Ok(Self {
+            principal,
             delegation_chain: chain.to_vec(),
-        }
+        })
+    }
+
+    /// The frozen authority the work was accepted under; every later check
+    /// restricts current grants by it.
+    #[must_use]
+    pub fn ceiling(&self) -> &PermissionSet {
+        self.principal.effective_permissions.grants()
     }
 
     /// The exact root that owns the accepted work.
@@ -251,7 +274,6 @@ mod tests {
             PrincipalId::new(uuid::Uuid::now_v7()),
             PrincipalKind::Service,
             wyrd_spec::DataTenantId::new_v7(),
-            Vec::new(),
             PermissionSet::new(),
         )
         .with_card_access(
@@ -285,7 +307,6 @@ mod tests {
             PrincipalId::new(uuid::Uuid::now_v7()),
             PrincipalKind::User,
             wyrd_spec::DataTenantId::new_v7(),
-            Vec::new(),
             PermissionSet::new(),
         );
         assert!(needs_root_resolution(&rootless, &[], &other).expect("rootless"));
@@ -394,7 +415,7 @@ mod tests {
             principal: PrincipalRef::from_principal(&actor),
         }];
 
-        let accepted = AcceptedAuthority::new(&subject, &chain);
+        let accepted = AcceptedAuthority::new(&subject, &chain).expect("representable");
         let json = serde_json::to_value(&accepted).expect("serialize accepted authority");
         let parsed: AcceptedAuthority =
             serde_json::from_value(json).expect("deserialize accepted authority");
@@ -405,13 +426,16 @@ mod tests {
         assert_eq!(parsed.delegation_chain, chain);
         assert_eq!(parsed.owning_root(), actor.workload_uid.as_ref());
         assert_eq!(
-            AcceptedAuthority::new(&subject, &[]).owning_root(),
+            AcceptedAuthority::new(&subject, &[])
+                .expect("representable")
+                .owning_root(),
             subject.workload_uid.as_ref()
         );
         assert_eq!(parsed.attribution().sub_principal_id, subject.id);
         assert_eq!(parsed.attribution().act_principal_id, actor.id);
         assert_eq!(
             AcceptedAuthority::new(&subject, &[])
+                .expect("representable")
                 .attribution()
                 .act_principal_id,
             subject.id
@@ -431,17 +455,17 @@ mod tests {
         use wyrd_spec::card::agent::BuiltinTool;
         let query = Permission::tool_invoke(BuiltinTool::BifrostQuery);
         let mut subject = service_principal("subject");
-        subject.effective_permissions = [Permission::tool_invoke_any()].into_iter().collect();
         let actor_grants: PermissionSet = [query.clone()].into_iter().collect();
-        subject.effective_permissions = subject
-            .effective_permissions
-            .intersection(&actor_grants)
-            .expect("representable meet");
+        subject.effective_permissions =
+            crate::EffectivePermissions::from(PermissionSet::from_iter([
+                Permission::tool_invoke_any(),
+            ]))
+            .restricted_by(std::sync::Arc::new(actor_grants));
         let chain = vec![DelegationStep {
             principal: PrincipalRef::from_principal(&service_principal("actor")),
         }];
 
-        let accepted = AcceptedAuthority::new(&subject, &chain);
+        let accepted = AcceptedAuthority::new(&subject, &chain).expect("representable");
         let json = serde_json::to_value(&accepted).expect("serialize accepted authority");
         let parsed: AcceptedAuthority =
             serde_json::from_value(json).expect("deserialize accepted authority");
@@ -449,7 +473,7 @@ mod tests {
         assert_eq!(parsed, accepted);
         assert_eq!(parsed.principal.id, subject.id);
         assert_eq!(parsed.delegation_chain, chain);
-        let grants = &parsed.principal.effective_permissions;
+        let grants = parsed.ceiling();
         assert_eq!(grants.iter().collect::<Vec<_>>(), vec![&query]);
         assert!(!grants.contains(&Permission::tool_invoke(BuiltinTool::FsRead)));
         assert!(!grants.contains(&Permission::bifrost_query_read()));

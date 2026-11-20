@@ -365,7 +365,13 @@ pub(crate) async fn current_user_profile(
             AccountAuthentication::Sso
         },
         username,
-        permissions: permission_names(&caller.principal.effective_permissions),
+        permissions: permission_names(
+            &caller
+                .principal
+                .effective_permissions
+                .flatten()
+                .unwrap_or_default(),
+        ),
     })
 }
 
@@ -410,7 +416,7 @@ pub(crate) async fn create_user(
     let password = new_password(&request.password.into_secret_string(), "password")?;
     let verifier = hash_password(password).await?;
     let mut conn = tenant_conn(&state, &caller).await?;
-    let user_id = create_local_user(&mut conn, &username, &verifier, &request.roles).await?;
+    let user_id = create_local_user(&mut conn, &username, &verifier, &request.assignments).await?;
     conn.commit().await.map_err(internal)?;
     Ok((
         StatusCode::CREATED,
@@ -457,15 +463,19 @@ pub(crate) async fn create_user_invitation(
     authorize_user_admin(&state, &caller, "auth.user.invite", "users")?;
     let tenant = tenant_slug(&state, &caller).await?;
     let mut conn = tenant_conn(&state, &caller).await?;
-    let (row, code) =
-        issue_invitation(&mut conn, caller.principal.id.as_uuid(), &request.roles).await?;
+    let (row, code) = issue_invitation(
+        &mut conn,
+        caller.principal.id.as_uuid(),
+        &request.assignments,
+    )
+    .await?;
     conn.commit().await.map_err(internal)?;
     let issued = IssuedUserInvitation {
         signup_url: tenant_page(&origin, &tenant, "signup")?,
         invitation: UserInvitationView {
             id: row.id,
             tenant,
-            role_ids: row.role_ids,
+            assignments: row.assignments.0,
             created_at: row.created_at,
             expires_at: row.expires_at,
         },

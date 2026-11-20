@@ -20,6 +20,7 @@ use wyrd_runtime::permission::{Action, Resource};
 use wyrd_runtime::principal::PrincipalId;
 use wyrd_runtime::{AcceptedAuthority, Permission};
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::CardPermissionScope;
 use wyrd_spec::card::verifier::VerifierSpec;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, IdempotencyKey};
@@ -53,7 +54,7 @@ use crate::query::scheduled::ScheduledQueryCaller;
 use crate::scribe_outbox::{ScribeSink, ScribeWrite};
 use crate::state::{AppState, registry_db_error};
 use crate::verification::authority::SystemReadAuthority;
-use crate::verification::cache::Target;
+use crate::verification::cache::{Db, Target};
 use crate::verification::hosted::blocks::{Execution, HostedBlocks};
 use crate::verification::inputs::InputResolver;
 use crate::verification::results::{
@@ -566,25 +567,11 @@ impl<'a> VerificationControl<'a> {
             "verifier:{}/subject:{}/execution:{execution_id}",
             request.verifier_card_uid, request.card_uid
         );
-        let admitted = telemetry.time(Phase::Admit, || {
-            environment_tag(&request)?;
-            self.authorize_verifier(
-                caller,
-                Permission::verifier_run(request.verifier_card_uid.clone()),
-                EXECUTE,
-                &resource,
-            )?;
-            // The inputs and result rows, reserved before any work is done.
-            self.state
-                .bifrost
-                .scribe_outbox()
-                .reserve(2)
-                .map_err(staging_full)
-        });
-        let staged = match admitted {
-            Ok(staged) => staged,
-            Err(error) => return ("refused", Err(error)),
-        };
+        if let Err(error) = environment_tag(&request) {
+            return ("refused", Err(error));
+        }
+        // The exact Verifier's family scopes `verifier:run`, so the target
+        // resolves first: a warm hit is memory only, a miss one statement.
         let target = match tokio::time::timeout_at(
             deadline,
             telemetry.phase(
@@ -598,6 +585,26 @@ impl<'a> VerificationControl<'a> {
             Ok(Ok(target)) => target,
             Ok(Err(error)) => return ("refused", Err(error)),
             Err(_) => return timed_out(),
+        };
+        let verifier_scope =
+            CardPermissionScope::exact(&target.verifier, request.verifier_card_uid.clone());
+        let admitted = telemetry.time(Phase::Admit, || {
+            self.authorize_verifier(
+                caller,
+                Permission::verifier_run(verifier_scope.clone()),
+                EXECUTE,
+                &resource,
+            )?;
+            // The inputs and result rows, reserved before any work is done.
+            self.state
+                .bifrost
+                .scribe_outbox()
+                .reserve(2)
+                .map_err(staging_full)
+        });
+        let staged = match admitted {
+            Ok(staged) => staged,
+            Err(error) => return ("refused", Err(error)),
         };
         let Some(_admitted) = blocks.admit_direct() else {
             return (
@@ -636,7 +643,7 @@ impl<'a> VerificationControl<'a> {
                 self.state,
                 Execution {
                     caller: &executor,
-                    verifier: &request.verifier_card_uid,
+                    verifier: &verifier_scope,
                     routes: &request.execution_route_overrides,
                     subject: GatewayCallContext {
                         workload_card_uid: owner.cloned(),
@@ -798,12 +805,30 @@ impl<'a> VerificationControl<'a> {
             "verifier:{}/subject:{}",
             request.verifier_card_uid, request.card_uid
         );
-        self.authorize_verifier(
-            caller,
-            Permission::verifier_run(request.verifier_card_uid.clone()),
-            ENQUEUE,
-            &resource,
-        )?;
+        // The exact Verifier's family scopes `verifier:run`; a warm target is
+        // memory only. A target that does not resolve is refused by
+        // acceptance with its own reason, so only an operation-level grant is
+        // required to learn it.
+        let required = match self
+            .state
+            .verification
+            .verifier_cards()
+            .resolve(
+                Db::Pool(self.state.postgres.wyrd()),
+                caller.data_tenant_id,
+                &request.verifier_card_uid,
+                &request.card_uid,
+            )
+            .await
+            .map_err(registry_db_error)?
+        {
+            Ok(target) => Permission::verifier_run(CardPermissionScope::exact(
+                &target.verifier,
+                request.verifier_card_uid.clone(),
+            )),
+            Err(_) => Permission::verifier_run_any(),
+        };
+        self.authorize_verifier(caller, required, ENQUEUE, &resource)?;
         environment_tag(&request)?;
         let cause = wyrd_telemetry::current_context().and_then(|context| {
             Some(Cause {
@@ -814,7 +839,7 @@ impl<'a> VerificationControl<'a> {
         });
         let submission = Submission::new(
             caller.data_tenant_id,
-            AcceptedAuthority::new(&caller.principal, &caller.delegation_chain),
+            AcceptedAuthority::new(&caller.principal, &caller.delegation_chain)?,
             request,
             cause,
             key.map(|key| key.as_str().to_owned()),
@@ -1159,7 +1184,7 @@ impl<'a> VerificationControl<'a> {
             read = read.serving(&AcceptedAuthority::new(
                 &caller.principal,
                 &caller.delegation_chain,
-            ));
+            )?);
         }
         Ok(ScheduledQueryCaller::new(
             self.state.clone(),

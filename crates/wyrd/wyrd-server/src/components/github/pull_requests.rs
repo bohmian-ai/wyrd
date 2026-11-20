@@ -40,7 +40,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use wyrd_runtime::Permission;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::Attribution;
+use wyrd_spec::auth::{Attribution, CardPermissionScope};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::github_connection::{
     GithubPullRequestReviewRequest, GithubPullRequestReviewResponse,
@@ -49,7 +49,7 @@ use wyrd_spec::ids::{CardName, CardUid, ExecutionId, IdempotencyKey, RepositoryI
 use wyrd_spec::verification::VerificationError;
 use wyrd_spec::verification::VerificationExecutionStatus;
 use wyrd_spec::verification::execution::{PullRequestActivation, PullRequestRef};
-use wyrd_sql::queries::cards::{repository_family_name, selected_repository};
+use wyrd_sql::queries::cards::{card_scopes, repository_family_name, selected_repository};
 use wyrd_sql::queries::verifier_executions::{
     Admission, Admitted, PullRequestAdmission, PullRequestEnd, PullRequestExecution,
     PullRequestGeneration, PullRequestKey, PullRequestTarget, VerifierExecutionQueue,
@@ -396,9 +396,15 @@ impl GithubConnections<'_> {
                 .await
                 .map_err(registry_db_error)?
         {
+            let uids: Vec<CardUid> = generation
+                .executions
+                .iter()
+                .map(|execution| execution.verifier_card_uid.clone())
+                .collect();
+            let scopes = card_scopes(&mut conn, &uids).await?;
             conn.commit().await.map_err(registry_db_error)?;
-            for execution in &generation.executions {
-                self.may_request(caller, &execution.verifier_card_uid, key)?;
+            for uid in &uids {
+                self.may_request(caller, scopes.get(uid), key)?;
             }
             tracing::info!("the review request replays the generation its key admitted");
             let executions = self.hand_off(tenant, &generation).await?;
@@ -564,31 +570,26 @@ impl GithubConnections<'_> {
     }
 
     /// Decide, and audit, that `caller` may request a review run by
-    /// Verifier `verifier` of PR `key`: `verifier:read` then
-    /// `verifier:run`.
+    /// Verifier `verifier` of PR `key`: `verifier:run` on the Verifier's
+    /// exact registered scope.
     ///
     /// # Errors
-    /// Returns [`WyrdError::PermissionDeniedRbac`] for either denial.
+    /// Returns [`WyrdError::VerificationTargetNotFound`] for a Verifier with
+    /// no registered Card, and [`WyrdError::PermissionDeniedRbac`] for the
+    /// denial.
     fn may_request(
         &self,
         caller: &Caller,
-        verifier: &CardUid,
+        verifier: Option<&CardPermissionScope>,
         key: PullRequestKey<'_>,
     ) -> Result<(), WyrdError> {
-        let resource = review_resource(key.repository_id, key.number);
-        audit::authorize(
-            self.state,
-            caller,
-            &Permission::verifier_read(verifier.clone()),
-            REVIEW,
-            &resource,
-        )?;
+        let verifier = verifier.ok_or_else(unregistered_verifier)?;
         audit::authorize(
             self.state,
             caller,
             &Permission::verifier_run(verifier.clone()),
             REVIEW,
-            &resource,
+            &review_resource(key.repository_id, key.number),
         )
     }
 
@@ -627,9 +628,14 @@ impl GithubConnections<'_> {
         if bindings.is_empty() {
             return Ok(None);
         }
+        let uids: Vec<CardUid> = bindings
+            .iter()
+            .map(|binding| binding.verifier_card_uid.clone())
+            .collect();
+        let scopes = card_scopes(conn, &uids).await?;
         if let Some(caller) = requester {
-            for binding in &bindings {
-                self.may_request(caller, &binding.verifier_card_uid, key)?;
+            for uid in &uids {
+                self.may_request(caller, scopes.get(uid), key)?;
             }
         }
         let principal = wyrd_runtime::principal::PrincipalId::new(selected.principal);
@@ -666,15 +672,20 @@ impl GithubConnections<'_> {
                                 authority.authority(),
                                 authority.attribution().act_principal_id,
                             );
-                            audit::authorize(
-                                self.state,
-                                &caller,
-                                &Permission::verifier_run(binding.verifier_card_uid.clone()),
-                                ADMIT,
-                                &format!("binding:{}", binding.binding_id),
-                            )
-                            .map(|()| authority.clone())
-                            .map_err(|error| (authority.attribution(), refused(&error)))
+                            scopes
+                                .get(&binding.verifier_card_uid)
+                                .ok_or_else(unregistered_verifier)
+                                .and_then(|scope| {
+                                    audit::authorize(
+                                        self.state,
+                                        &caller,
+                                        &Permission::verifier_run(scope.clone()),
+                                        ADMIT,
+                                        &format!("binding:{}", binding.binding_id),
+                                    )
+                                })
+                                .map(|()| authority.clone())
+                                .map_err(|error| (authority.attribution(), refused(&error)))
                         }
                         Err(error) => Err((Attribution::direct(principal), refused(error))),
                     };
@@ -877,6 +888,15 @@ impl GithubConnections<'_> {
                 },
             }
         }
+    }
+}
+
+/// The refusal of a binding or review whose Verifier has no registered Card,
+/// so no exact scope can authorize running it.
+fn unregistered_verifier() -> WyrdError {
+    WyrdError::VerificationTargetNotFound {
+        message: "the bound Verifier has no registered Card in this tenant".to_owned(),
+        details: serde_json::json!({}),
     }
 }
 

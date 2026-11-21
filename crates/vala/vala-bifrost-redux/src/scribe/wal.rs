@@ -3715,10 +3715,16 @@ impl WalReader {
 
     /// Opens, sorts, and validates already-discovered WAL paths.
     ///
+    /// A segment at or below its shard manifest's safe frontier holds nothing
+    /// replay may restore, and a crash can leave it behind with an earlier
+    /// part of one of its batches already deleted, so it is removed instead of
+    /// read.
+    ///
     /// # Errors
     ///
     /// Returns [`ScribeError`] when a segment cannot be opened, belongs to a
-    /// different node, or duplicates an existing stream/shard/sequence key.
+    /// different node, or duplicates an existing stream/shard/sequence key, a
+    /// shard manifest cannot be read, or a covered segment cannot be removed.
     fn open_paths(paths: Vec<PathBuf>, node_filter: Option<[u8; 16]>) -> Result<Self, ScribeError> {
         let mut segments = Vec::new();
         for path in paths {
@@ -3762,7 +3768,34 @@ impl WalReader {
             }
         }
 
-        Ok(Self { segments })
+        let mut frontiers = HashMap::<PathBuf, Option<u64>>::new();
+        let mut uncovered = Vec::with_capacity(segments.len());
+        for segment in segments {
+            let directory = segment.path().parent().map(Path::to_path_buf);
+            let safe = match directory {
+                None => None,
+                Some(directory) => match frontiers.entry(directory) {
+                    std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let safe =
+                            crate::scribe::manifest::read_manifest(entry.key().join("manifest"))?
+                                .and_then(|manifest| manifest.safe_segment);
+                        *entry.insert(safe)
+                    }
+                },
+            };
+            if safe.is_some_and(|safe| segment.header().seg_seq <= safe) {
+                let path = segment.path().to_path_buf();
+                drop(segment);
+                WalWriter::delete_segment_file(&path)?;
+            } else {
+                uncovered.push(segment);
+            }
+        }
+
+        Ok(Self {
+            segments: uncovered,
+        })
     }
 
     /// Read all records from all segments.

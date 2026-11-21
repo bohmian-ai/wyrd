@@ -2115,6 +2115,96 @@ mod tests {
         complete_batches.len()
     }
 
+    /// Replay skips segments the shard's safe frontier covers, so a crash
+    /// that deleted only the first of a covered batch's segments still
+    /// recovers.
+    ///
+    /// One batch's three slices span two segments, its COMMIT in the second.
+    /// The frontier covers both, the first is gone and the second remains, as
+    /// after a crash between the two deletions. Replay succeeds, restores
+    /// nothing from either segment and removes the covered one left behind.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the fixture cannot be written, the batch does not span two
+    /// segments, replay fails or restores the covered batch, or the covered
+    /// segment remains.
+    #[test]
+    fn replay_skips_segments_its_frontier_covers() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let node_id = NodeId::generate();
+        let tenant = crate::test_support::tenant();
+        let wal = WalWriter::new(
+            temp_dir.path(),
+            *node_id.as_bytes(),
+            1,
+            WalConfig::new(16 * 1024).expect("small rotating WAL config"),
+        )
+        .expect("writer");
+        let seal_key = replay_key(tenant);
+        let batch_id = [5_u8; 16];
+        let payload = vec![9_u8; 6 * 1024];
+        let mut touched = Vec::new();
+        let mut logical = Vec::new();
+        let mut wal_digest = Sha256::new();
+        for slice_index in 0_u32..3 {
+            let mut append =
+                PreparedWalAppend::new(WalLsn::ZERO, batch_id, Bytes::copy_from_slice(&payload))
+                    .for_slice(seal_key.clone(), [3; 32]);
+            append.assign_slice_ordinal(slice_index, 3);
+            let result = wal.append_prepared(append).expect("slice");
+            wal_digest.update(slice_index.to_le_bytes());
+            wal_digest.update(result.payload_len.to_le_bytes());
+            wal_digest.update(result.payload_digest);
+            logical.push((slice_index, [3_u8; 32], payload.as_slice()));
+            touched.extend(result.touched_segments);
+        }
+        let commit = PreparedWalAppend::commit(
+            batch_id,
+            *tenant.as_uuid().as_bytes(),
+            3,
+            WalCommitIdentity {
+                wal_digest: wal_digest.finalize().into(),
+                logical_digest: fixture_logical_digest(&logical),
+                request_id: *uuid::Uuid::now_v7().as_bytes(),
+            },
+        );
+        touched.extend(
+            wal.append_prepared(commit)
+                .expect("commit")
+                .touched_segments,
+        );
+        WalWriter::sync_segments(&touched).expect("sync");
+        let mut segments = touched
+            .iter()
+            .map(|segment| (segment.header().seg_seq, segment.path().to_path_buf()))
+            .collect::<Vec<_>>();
+        segments.sort();
+        segments.dedup();
+        drop((touched, wal));
+        let [(_, first), (last, second)] = segments.as_slice() else {
+            panic!("the batch spans two segments: {segments:?}");
+        };
+        let stream = crate::scribe::stream_identity::StreamIdentity::new(
+            node_id,
+            crate::scribe::stream_identity::WriterEpoch::new(1),
+        );
+        crate::scribe::manifest::advance_safe_segment(
+            &second.with_file_name("manifest"),
+            stream,
+            *last,
+        )
+        .expect("frontier");
+        std::fs::remove_file(first).expect("the first covered segment is deleted");
+
+        let replayed = replay_wal_directory(temp_dir.path()).expect("replay");
+        assert!(replayed.is_empty(), "a covered batch restores nothing");
+        assert!(
+            !second.exists(),
+            "the covered segment left behind is removed"
+        );
+    }
+
     /// Builds the logical half of a terminal identity for a framing fixture.
     ///
     /// WAL framing is indifferent to how the logical identity was derived, so a

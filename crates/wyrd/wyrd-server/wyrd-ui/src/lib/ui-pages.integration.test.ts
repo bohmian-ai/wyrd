@@ -2940,6 +2940,105 @@ test('an administrator manages direct, group and custom-role grants in Access, a
   }
 });
 
+test('an administrator suspends a User and a Service account in Access, and their sessions and keys stop working', async ({ server, ui }) => {
+  const tenantKey = 'ui-suspend';
+  const tenant = server.seedTenant(tenantKey);
+  const adminKey = server.bootstrapServiceInTenant(tenant, ['admin'], 'ui-suspend-admin');
+  const principals = await Principals.connect({ client: WyrdClient.connect({ serverUrl: ui.serverUrl, credential: adminKey }) });
+  const base = `${ui.base}/t/${tenantKey}`;
+  // A User signed in with her own password, and a Service account holding one key: both read Cards as viewers.
+  const person = await humanSignIn(ui.browser, ui.base, tenantKey, await invitation(ui.serverUrl, adminKey, 'viewer'));
+  const serviceKey = server.bootstrapServiceInTenant(tenant, ['viewer'], 'ui-suspend-runner');
+  const asService = () => Cards.connect({ client: WyrdClient.connect({ serverUrl: ui.serverUrl, credential: serviceKey }) }).then((cards) => cards.list({ kind: 'Prompt' }));
+  const bystander = await signIn(ui.browser, ui.base, tenantKey, server.bootstrapServiceInTenant(tenant, ['viewer'], 'ui-suspend-bystander'));
+  const page = await signIn(ui.browser, ui.base, tenantKey, adminKey);
+  try {
+    const accounts = async () => (await principals.list({})).principals;
+    // The tenant also holds its seeded administrator User; the person is the one who signed up with the invitation.
+    const user = (await accounts()).find((account) => account.kind === 'user' && account.name?.startsWith('person-'))!;
+    const service = (await accounts()).find((account) => account.name === 'ui-suspend-runner')!;
+    const state = async (id: string) => ({
+      status: (await accounts()).find((account) => account.principal_id === id)?.status,
+      bindings: (await principals.bindings({ principal_id: id })).bindings.map((binding) => binding.id)
+    });
+    const before = { user: await state(user.principal_id), service: await state(service.principal_id) };
+    expect([before.user.status, before.service.status]).toEqual(['active', 'active']);
+    await person.goto(`${base}/cards`);
+    expect(new URL(person.url()).pathname).toBe(`/t/${tenantKey}/cards`);
+    await asService();
+
+    // A signed-in viewer posts the action directly: the server refuses it and the account stays active.
+    const direct = await bystander.request.post(`${base}/settings/access?/suspend`, {
+      form: { principalId: service.principal_id, principalKind: 'service', reason: 'not mine to stop' },
+      headers: { origin: ui.base }
+    });
+    const refusal = (await direct.json()) as { type: string; status: number; data: string };
+    expect(refusal).toMatchObject({ type: 'failure', status: 403 });
+    expect(refusal.data).toContain('WYRD_PERMISSION_403_DENIED_RBAC');
+    expect(await state(service.principal_id)).toEqual(before.service);
+
+    // The administrator opens the Service account. A reason the server will not record is refused: the page shows the server's problem and the account stays active.
+    await page.goto(`${base}/settings/access?tab=services`);
+    await page.getByRole('link', { name: 'Access for ui-suspend-runner' }).click();
+    const account = page.getByRole('region', { name: 'Access for ui-suspend-runner' });
+    const suspend = page.getByRole('form', { name: 'Suspend ui-suspend-runner' });
+    await suspend.getByLabel('Reason').fill('password=hunter2 was pasted in chat');
+    await suspend.getByRole('button', { name: 'Suspend account' }).click();
+    await expect.poll(() => page.getByRole('alert').textContent()).toContain('Nothing was changed');
+    expect(await page.getByRole('alert').textContent()).toContain('WYRD_SPEC_400_VALIDATION');
+    expect(await account.textContent()).toContain('✓ active');
+    expect(await state(service.principal_id)).toEqual(before.service);
+
+    // The control fits a phone in dark mode, and the keyboard alone reaches it with a visible focus ring and submits it.
+    await page.setViewportSize({ width: 390, height: 900 });
+    await page.evaluate(() => ((document.querySelector('.app-root') as HTMLElement).dataset.mode = 'dark'));
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+    await suspend.getByLabel('Reason').focus();
+    await page.keyboard.press('Tab');
+    const ring = await page.evaluate(() => {
+      const style = getComputedStyle(document.activeElement as Element);
+      return { text: document.activeElement?.textContent, style: style.outlineStyle, width: parseFloat(style.outlineWidth) };
+    });
+    expect(ring.text).toBe('Suspend account');
+    expect(ring.style).not.toBe('none');
+    expect(ring.width).toBeGreaterThan(0);
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await page.evaluate(() => ((document.querySelector('.app-root') as HTMLElement).dataset.mode = 'light'));
+
+    // Suspended from the keyboard: the page reads the server's state back, the account and its bindings stay, and its key is refused.
+    await suspend.getByLabel('Reason').fill('runner host decommissioned');
+    await page.keyboard.press('Enter');
+    await expect.poll(() => account.textContent()).toContain('⊘ suspended');
+    expect(await page.getByRole('status').textContent()).toContain('Account suspended');
+    expect(await suspend.count()).toBe(0);
+    // A suspended Service account has no usable key: the page says so instead of listing keys the server no longer answers for.
+    expect(await account.textContent()).toContain('Its keys are refused');
+    expect(await page.getByRole('button', { name: 'Issue key' }).count()).toBe(0);
+    expect(await state(service.principal_id)).toEqual({ ...before.service, status: 'suspended' });
+    await expect.poll(() => asService().then(() => 'read', (error: { code?: string }) => error.code), { timeout: 30_000 }).toBe('WYRD_AUTH_401_API_KEY_INVALID');
+
+    // The User is suspended the same way: her signed-in browser is sent back to sign in, and her account and binding stay.
+    const name = user.name!;
+    await page.goto(`${base}/settings/access`);
+    await page.getByRole('link', { name: `Access for ${name}` }).click();
+    await page.getByRole('form', { name: `Suspend ${name}` }).getByLabel('Reason').fill('left the team');
+    await page.getByRole('form', { name: `Suspend ${name}` }).getByRole('button', { name: 'Suspend account' }).click();
+    await expect.poll(() => page.getByRole('region', { name: `Access for ${name}` }).textContent()).toContain('⊘ suspended');
+    expect(await state(user.principal_id)).toEqual({ ...before.user, status: 'suspended' });
+    await expect
+      .poll(
+        async () => {
+          await person.goto(`${base}/cards`);
+          return new URL(person.url()).pathname;
+        },
+        { timeout: 30_000 }
+      )
+      .toBe(`/t/${tenantKey}/login`);
+  } finally {
+    for (const opened of [page, bystander, person]) await opened.context().close();
+  }
+});
+
 test('an administrator creates a runtime Service account in Access, and its one key runs two releases of the family', async ({ server, ui }) => {
   const tenantKey = 'ui-runtime';
   const tenant = server.seedTenant(tenantKey);

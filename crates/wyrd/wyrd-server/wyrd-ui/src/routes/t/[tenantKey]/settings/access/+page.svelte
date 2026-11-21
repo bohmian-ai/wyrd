@@ -177,6 +177,20 @@
               The runtime family grants no operation and no access to the Service's dependencies: every grant is a binding below.
             </p>
           {/if}
+          {#if selected.status === 'active'}
+            <form class="stack" method="POST" action={action('suspend')} aria-label="Suspend {name}" use:enhance>
+              <h3>Suspend account</h3>
+              <p>
+                Suspending stops this account: it can no longer sign in or use a key, what it already holds stops working within seconds, and its unfinished Verifier executions are cancelled. The account
+                and its bindings are kept. Access cannot resume a suspended account.
+              </p>
+              <input type="hidden" name="principalId" value={selected.principal_id} />
+              <input type="hidden" name="principalKind" value={selected.kind} />
+              <label>Reason <input class="app-input" name="reason" required maxlength="1024" autocomplete="off" /></label>
+              <p>Recorded in the audit log. Say why, without pasting a credential.</p>
+              <button class="app-control" type="submit">Suspend account</button>
+            </form>
+          {/if}
           <h3>Bindings</h3>
           {#if selected.grants.length}
             <!-- svelte-ignore a11y_no_noninteractive_tabindex -- a scrolling table must be reachable by keyboard -->
@@ -238,6 +252,9 @@
               <p>To rotate, issue a new key, deploy it, then revoke the old one. Keys carry the account's bindings; they add none.</p>
               <button class="app-control" type="submit">Issue key</button>
             </form>
+          {:else if selected.kind === 'service'}
+            <h3>API keys</h3>
+            <p>This account is suspended. Its keys are refused, and none can be issued.</p>
           {/if}
         </section>
       {/if}

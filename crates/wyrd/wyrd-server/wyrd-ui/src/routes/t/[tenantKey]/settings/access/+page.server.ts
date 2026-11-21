@@ -21,7 +21,7 @@ const id = (value: string) => encodeURIComponent(value);
 /**
  * Tenant access administration as the server answers it to this session: the
  * accounts, roles, groups and bindings, and for `?account=` that account's
- * access summary and, for a Service account, its key metadata. The server
+ * access summary and, for an active Service account, its key metadata. The server
  * authorizes every read; a refusal is the page's whole content.
  */
 export const load: PageServerLoad = async ({ locals, url }) => {
@@ -38,7 +38,8 @@ export const load: PageServerLoad = async ({ locals, url }) => {
       read<{ bindings: CardTypes.RoleBindingView[] }>(session, '/access/bindings'),
       account ? read<CardTypes.AccessSummary>(session, `/principals/${id(account)}/access`) : null
     ]);
-    const keys = selected?.kind === 'service' ? await read<CredentialList>(session, `/principals/${id(selected.principal_id)}/credentials?limit=50`) : null;
+    // The server answers for the keys of an active account only; a suspended account's keys are all refused.
+    const keys = selected?.kind === 'service' && selected.status === 'active' ? await read<CredentialList>(session, `/principals/${id(selected.principal_id)}/credentials?limit=50`) : null;
     return { access: { ...principals, roles: roles.roles, groups: groups.groups, bindings: bindings.bindings, selected, keys }, problem: null };
   } catch (cause) {
     if (!isHttpError(cause)) throw cause;
@@ -173,6 +174,20 @@ export const actions: Actions = {
     act(event, async (form, session) => {
       await call(session, 'DELETE', `/access/groups/${id(field(form, 'groupId', 64))}/members/${id(field(form, 'principalId', 64))}`);
       return { done: 'Member removed. They no longer inherit this group’s access.' };
+    }),
+  /**
+   * Suspend one account through the server's principal revocation: it signs in
+   * and mints no new token, tokens it holds stop within seconds and its
+   * unfinished Verifier executions are cancelled. The account and its bindings
+   * stay; the server records the reason and refuses one that reads as a secret.
+   */
+  suspend: (event) =>
+    act(event, async (form, session) => {
+      await call(session, 'POST', `/principals/${id(field(form, 'principalId', 64))}/revoke`, {
+        principal_kind: field(form, 'principalKind', 16),
+        reason: field(form, 'reason', 1024).trim()
+      });
+      return { done: 'Account suspended. Its bindings are kept.' };
     }),
   /** Issue one more key for a Service account; the secret is shown in this result only. */
   issueKey: (event) =>

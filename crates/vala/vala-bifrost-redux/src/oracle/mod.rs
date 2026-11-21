@@ -3920,7 +3920,8 @@ pub(super) fn authorize_resolved_tables(
 ///
 /// For a restricted reader each scan, including scans inside views, joins
 /// and subqueries, becomes a filter on the visible parents under a
-/// projection that replaces every column of a row outside them with null.
+/// projection that replaces every column of a row outside them with null,
+/// each masked column keeping its own field, extension type included.
 /// The optimizer may push or reorder user predicates below that filter, but
 /// every user expression still reads the masked columns, so no predicate,
 /// projection or aggregate can evaluate, or fail on, a hidden row's values.
@@ -3936,7 +3937,7 @@ pub(super) fn restrict_verification_rows(
     use crate::tables::DomainTable;
     use datafusion::common::Column;
     use datafusion::common::tree_node::Transformed;
-    use datafusion::logical_expr::{Expr, LogicalPlanBuilder, lit, when};
+    use datafusion::logical_expr::{Cast, Expr, LogicalPlanBuilder, lit, when};
     use wyrd_spec::vala::managed_columns::{SUBJECT_CARD_UID, SUBJECT_KIND, SUBJECT_NAME};
 
     let objects = context.principal.effective_permissions.card_objects(
@@ -3984,16 +3985,21 @@ pub(super) fn restrict_verification_rows(
             .fields()
             .iter()
             .map(|field| {
-                // The alias carries the field's metadata, which a CASE
-                // drops, so extension-typed columns such as Variants decode.
+                // A CASE drops its column's field metadata. The cast to the
+                // column's own field restores it on the expression itself, so
+                // an extension-typed column such as a Variant still resolves
+                // its functions once the optimizer and the physical planner
+                // discard the alias; the alias keeps it on the output schema.
                 when(visible.clone(), column(field.name()))
                     .end()
                     .map(|expr| {
-                        expr.alias_qualified_with_metadata(
-                            Some(table.clone()),
-                            field.name(),
-                            Some(field.metadata().into()),
-                        )
+                        let masked = Arc::new(field.as_ref().clone().with_nullable(true));
+                        Expr::Cast(Cast::new_from_field(Box::new(expr), masked))
+                            .alias_qualified_with_metadata(
+                                Some(table.clone()),
+                                field.name(),
+                                Some(field.metadata().into()),
+                            )
                     })
             })
             .collect::<datafusion::common::Result<Vec<_>>>()?;
@@ -5151,7 +5157,8 @@ mod tests {
 
     /// A session whose `bifrost.verification.results` and `.evidence` hold
     /// one row under each of two Repository families, `payments` and
-    /// `other`, plus one row with no trusted parent.
+    /// `other`, plus one row with no trusted parent. Each row's `detail` is a
+    /// Variant document naming its own head commit.
     ///
     /// # Panics
     ///
@@ -5206,6 +5213,15 @@ mod tests {
         };
         use wyrd_spec::vala::managed_columns::{SUBJECT_CARD_UID, SUBJECT_KIND, SUBJECT_NAME};
 
+        let documents: datafusion::arrow::array::ArrayRef = Arc::new(StringArray::from(vec![
+            r#"{"head":{"sha":"a1"}}"#,
+            r#"{"head":{"sha":"a2"}}"#,
+            r#"{"head":{"sha":"a3"}}"#,
+        ]));
+        let detail: datafusion::arrow::array::ArrayRef =
+            parquet_variant_compute::json_to_variant(&documents)
+                .expect("fixture documents encode")
+                .into();
         let schema = Arc::new(Schema::new(vec![
             Field::new("result_id", DataType::Utf8, false).with_metadata(
                 std::collections::HashMap::from([(
@@ -5216,6 +5232,11 @@ mod tests {
             Field::new(SUBJECT_KIND, DataType::Utf8, true),
             Field::new(SUBJECT_NAME, DataType::Utf8, true),
             Field::new(SUBJECT_CARD_UID, DataType::Utf8, true),
+            Field::new("detail", detail.data_type().clone(), true).with_metadata(
+                wyrd_types::variant::variant_field("detail", true)
+                    .metadata()
+                    .clone(),
+            ),
         ]));
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
@@ -5236,6 +5257,7 @@ mod tests {
                     Some("01927b4c-0000-7000-8000-000000000002"),
                     None,
                 ])),
+                detail,
             ],
         )
         .expect("fixture batch builds");
@@ -5367,6 +5389,18 @@ mod tests {
             ),
         ] {
             assert_eq!(rows(family.clone(), sql).await, expected, "{sql}");
+        }
+        // A Variant read by key plans and executes over the masked column,
+        // directly, under a table alias and inside a joined subquery.
+        for sql in [
+            "SELECT detail -> 'head' ->> 'sha' FROM bifrost.verification.results",
+            "SELECT r.detail -> 'head' ->> 'sha' FROM bifrost.verification.results r",
+            "SELECT variant_get_text(detail -> 'head', 'sha') FROM bifrost.verification.results",
+            "SELECT s.sha FROM bifrost.verification.results r LEFT JOIN \
+             (SELECT e.result_id, e.detail -> 'head' ->> 'sha' AS sha \
+             FROM bifrost.verification.evidence e) s ON s.result_id = r.result_id",
+        ] {
+            assert_eq!(rows(family.clone(), sql).await, vec!["a1"], "{sql}");
         }
         assert_eq!(
             rows(exact, "SELECT result_id FROM bifrost.verification.results").await,

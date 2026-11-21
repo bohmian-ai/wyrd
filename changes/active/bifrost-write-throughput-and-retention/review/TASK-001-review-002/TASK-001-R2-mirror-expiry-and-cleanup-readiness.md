@@ -1,7 +1,7 @@
 ---
 id: TASK-001-R2
 kind: remediation
-status: proposed
+status: implemented
 spec: SPEC-bifrost-write-throughput-and-retention
 spec_revision: 2
 original_task: TASK-001
@@ -192,3 +192,41 @@ No CPU throughput implementation, extra worker, public test control, migration,
 receipt quota, domain contract redesign, full journey aggregate, commit, or push
 is part of this remediation task. Preserve recorded TDD violations; new
 closure tests follow current test-first discipline without claiming to repair history.
+
+## Evidence
+
+Runtime commits: `6af4ffe0d` (mirror population), `da6f9d150` (live second-pod
+journey), `745a25f80` (replay no longer awaits a sweep). All three closure tests
+were run RED before their production change and GREEN after it. TDD: PASS.
+
+Commands (Cargo serial):
+
+- `J`: `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-testing --test scribe -P journey --run-ignored=all --test-threads=1 -E "<selector>"'`
+- `U`: `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=scribe::shards::tests::record_committed_skips_spent_retries_and_keeps_cached_acceptances)'`
+
+| Action | Assertion | RED | GREEN |
+|---|---|---|---|
+| 1. Mirror population | `scribe/shards.rs` `record_committed_skips_spent_retries_and_keeps_cached_acceptances`: a locally committed batch is matched exactly; a spent `AlreadyCommitted` retry is not known; an earlier cached local identity stays matched after its later attempt is spent. Calls the real `ShardOwner::record_committed`. | `U` failed at "a spent retry never creates an index entry". | `U` passed, with `committed_batches::tests::matches_exact_identity_and_evicts_oldest`. |
+| 2. Live second pod (FIND-TASK-001-1, REQ-002) | `lifecycle::a_running_duplicate_pod_accepts_anew_after_the_winning_receipt_is_deleted`: B's duplicate adds no copy; A's own cleaner deletes the aged receipt; B, never restarted, accepts the retry under a new receipt whose `wal_node_id` differs from A's; the table then holds the rows twice. | `J` with the pre-fix predicate restored for that run only: failed at "the second pod accepts the retry anew under a receipt" (B acknowledged from its mirror, no receipt). | `J` passed, together with the preserved `a_losing_duplicate_restores_nothing_after_the_winning_receipt_is_deleted`. |
+| 3. Blocked initial sweep (FIND-TASK-001-2, REQ-008–009) | `lifecycle::a_restart_serves_reads_while_its_first_receipt_sweep_is_blocked`: receipt handed off, node terminated while recent, receipt aged, row lock held (`FOR UPDATE`); restart completes within 60 s; `pg_stat_activity` shows the cleaner's DELETE waiting on the lock; retained rows read back; fresh append returns `WYRD_VALA_429_INGEST_BUSY`; after release the receipt is deleted and a fresh append is admitted and read back without restart. | `J` with `WYRD_LOG=info,vala_bifrost_redux::scribe=debug` failed at "the restart never completed while 1 receipt DELETE waited on the held lock"; the trace shows `Scribe WAL recovery completed ... stream=…:2` and no later sweep completion. | `J` with `test(/^lifecycle::/)`: 17 passed, including the new cases and `receipt_cleanup_failure_pauses_fresh_writes_until_it_recovers`. |
+
+Closing lanes: `mise run test:bifrost:integration:redux` (1059 passed, including
+the cleaner-health unit tests), `mise run test:bifrost:journey:scribe` (53 passed,
+1 skipped by the lane's own filter), `mise run fmt`, `mise run lints`,
+`mise run check:tenant-isolation`, and `mise exec -- git diff --check` all passed.
+
+Mechanics recorded:
+
+- `record_committed` now skips on `spent_batch_ids` alone. `accepted_under` and
+  `conflicted` batches are always inserted into that set, so their existing
+  exclusions still hold.
+- The lifecycle helper `delete_handed_off_receipt` was split so its frontier
+  wait (`await_handed_off`) serves the blocked-sweep journey. Its behaviour is
+  unchanged.
+- `ReceiptCleaner::start` in `ScribeImpl::build` remains the only sweep driver.
+  `receipt_cleaner` still stops on shutdown.
+
+Non-goals: no SQL, schema, ingress, admission, boot, health-deadline,
+configuration or public API change; no TASK-002 work. No benchmark ran. The
+writes, hot and Parquet checkpoint is still owed and runs when the maintainer
+directs it. The cross-pod duplicate-path cost has no measurement of its own.

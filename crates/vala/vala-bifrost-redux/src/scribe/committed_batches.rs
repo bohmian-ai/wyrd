@@ -105,13 +105,20 @@ impl CommittedBatches {
         self.lock().batches.contains_key(&(tenant, batch_id))
     }
 
-    /// Forgets `(tenant, batch_id)` once its receipt is deleted, so a later
-    /// batch with that id is decided by the durable fence, never by the
-    /// former acceptance.
-    pub(crate) fn forget(&self, tenant: DataTenantId, batch_id: Uuid) {
+    /// Forgets `tenant`'s `batch_ids` once their receipts are deleted, so a
+    /// later batch with one of those ids is decided by the durable fence,
+    /// never by the former acceptance.
+    ///
+    /// One pass over the recording order covers the whole set.
+    pub(crate) fn forget(&self, tenant: DataTenantId, batch_ids: &[Uuid]) {
         let mut inner = self.lock();
-        if inner.batches.remove(&(tenant, batch_id)).is_some() {
-            inner.order.retain(|key| *key != (tenant, batch_id));
+        let before = inner.batches.len();
+        for batch_id in batch_ids {
+            inner.batches.remove(&(tenant, *batch_id));
+        }
+        if inner.batches.len() != before {
+            let Inner { batches, order } = &mut *inner;
+            order.retain(|key| batches.contains_key(key));
         }
     }
 

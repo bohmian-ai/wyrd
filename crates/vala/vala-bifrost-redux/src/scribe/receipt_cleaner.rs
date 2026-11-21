@@ -207,9 +207,7 @@ impl ReceiptCleaner {
                 let mut conn = self.postgres.tenant_conn(stream.tenant).await?;
                 let batch_ids =
                     delete_handed_off(&mut conn, &shard, &history, cutoff, self.batch).await?;
-                for batch_id in &batch_ids {
-                    self.committed.forget(stream.tenant, *batch_id);
-                }
+                self.committed.forget(stream.tenant, &batch_ids);
                 conn.commit().await?;
                 deleted += batch_ids.len();
                 if i64::try_from(batch_ids.len()).unwrap_or(i64::MAX) < self.batch {

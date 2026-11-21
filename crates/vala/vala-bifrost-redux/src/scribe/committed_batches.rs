@@ -1,8 +1,10 @@
 //! Recently fenced batch identities, so an honest retry of a batch that is
 //! already durable and visible is answered without re-entering a shard.
 //!
-//! A shard records each batch once its group has synced the WAL, committed
-//! the batch fence, and inserted (or deliberately suppressed) its rows. The
+//! A shard records each batch its own group accepted, once that group has
+//! synced the WAL, committed the batch fence, and inserted its rows. A retry
+//! the fence finds already held is never recorded: the receipt it matched may
+//! belong to another pod, whose cleaner forgets only its own index. The
 //! ingress consults the index after preprocessing: a resend whose tenant,
 //! table, batch id, and logical identity all match a recorded batch is
 //! acknowledged at once with no first commit, instead of waiting behind every
@@ -53,7 +55,7 @@ struct Inner {
 }
 
 impl CommittedBatches {
-    /// Records a batch whose fence is committed and whose rows are visible,
+    /// Records a batch this pod committed and made visible,
     /// evicting the oldest identity once the bound is reached.
     ///
     /// A batch already recorded keeps its first identity and position.

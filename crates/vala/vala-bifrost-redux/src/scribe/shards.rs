@@ -880,7 +880,7 @@ struct ShardOwner {
     pending: Arc<AtomicUsize>,
     /// Notification used by runtime drains to await accepted work.
     drained: Arc<Notify>,
-    /// Pod-wide index of fenced, visible batches this owner records into.
+    /// Pod-wide index this owner records its own committed, visible batches into.
     committed: Arc<crate::scribe::committed_batches::CommittedBatches>,
     /// One-shot retirement release fault used only by deterministic owner tests.
     #[cfg(test)]
@@ -922,7 +922,7 @@ pub(crate) struct ScribeShardRuntime {
     drained: Arc<Notify>,
     /// Whether external shard admission has closed.
     closed: AtomicBool,
-    /// Batches every owner fenced and made visible, consulted by the ingress
+    /// Batches this pod's owners committed and made visible, consulted by the ingress
     /// to answer an honest retry without re-entering a shard.
     committed: Arc<crate::scribe::committed_batches::CommittedBatches>,
     /// Owner acknowledgements received through the graceful flush path.
@@ -3697,19 +3697,23 @@ impl ShardOwner {
         record_group_size("wal_bytes", total(|slice| slice.payload_len as usize));
     }
 
-    /// Records every batch this group fenced into the pod-wide index, once its
-    /// rows are query-visible, so a later honest retry is answered at ingress.
+    /// Records every batch this group committed into the pod-wide index, once
+    /// its rows are query-visible, so a later honest retry is answered at
+    /// ingress.
+    ///
+    /// Only acceptances this group made are recorded. A spent batch, whose
+    /// fence another attempt already holds (already committed, accepted under
+    /// another version, or conflicted), is skipped: its receipt may belong to
+    /// another pod, whose cleaner forgets only its own index, so recording it
+    /// here could acknowledge the identity after that receipt is deleted. An
+    /// entry this pod recorded earlier is left as it is.
     ///
     /// Only the successful path records: a group that failed after its sync
     /// stays retained for serial retry and records nothing until it settles.
     fn record_committed(&self, state: &GroupWalState) {
         for &(index, logical_digest, slice_count, table_version) in &state.fenced {
             let append = &state.prepared[index];
-            if state
-                .accepted_under
-                .contains_key(append.batch_id.as_bytes())
-                || state.conflicted.contains(append.batch_id.as_bytes())
-            {
+            if state.spent_batch_ids.contains(append.batch_id.as_bytes()) {
                 continue;
             }
             self.committed.record(
@@ -7519,6 +7523,90 @@ mod tests {
             fail_next_retirement_release: false,
         };
         (owner, budget, command_tx, completion_tx, pressure_tx)
+    }
+
+    /// Proves the pod-wide index records only batches this group committed:
+    /// a retry the durable fence already held under another attempt, which
+    /// another pod may own and delete, never enters it, and a batch this pod
+    /// cached earlier stays matched when a later attempt of it is spent.
+    #[test]
+    fn record_committed_skips_spent_retries_and_keeps_cached_acceptances() {
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+        let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+        let (owner, budget) =
+            owner_for_completion_test_with_budget(Memtable::new(), &wal, wal_handle, stream);
+        let key = owner_key();
+        let committed = prepared_append_for_key(&budget, key.clone(), uuid::Uuid::now_v7());
+        let retried = prepared_append_for_key(&budget, key.clone(), uuid::Uuid::now_v7());
+        let cached = prepared_append_for_key(&budget, key.clone(), uuid::Uuid::now_v7());
+        let fence = |index: usize, append: &PreparedAppend| {
+            let (digest, slices, _) = append.logical_identity().expect("logical identity");
+            (
+                index,
+                digest,
+                slices,
+                append.table_version().expect("table version"),
+            )
+        };
+        let identity = |append: &PreparedAppend| {
+            let (_, digest, slices, version) = fence(0, append);
+            crate::scribe::committed_batches::CommittedBatch {
+                table_fqn: append.table.fqn(),
+                table_version: version,
+                logical_digest: digest,
+                slice_count: slices,
+            }
+        };
+        owner
+            .committed
+            .record(cached.tenant, cached.batch_id, identity(&cached));
+        let state = GroupWalState {
+            fenced: vec![fence(0, &committed), fence(1, &retried), fence(2, &cached)],
+            spent_batch_ids: HashSet::from([
+                *retried.batch_id.as_bytes(),
+                *cached.batch_id.as_bytes(),
+            ]),
+            prepared: vec![committed, retried, cached],
+            durable: Vec::new(),
+            touched: HashMap::new(),
+            rows_by_append: HashMap::new(),
+            accepted_under: HashMap::new(),
+            conflicted: HashSet::new(),
+            inserted_batch_ids: HashSet::new(),
+        };
+
+        owner.record_committed(&state);
+
+        let [committed, retried, cached] = &state.prepared[..] else {
+            panic!("three prepared appends");
+        };
+        assert!(
+            owner
+                .committed
+                .contains(committed.tenant, committed.batch_id, &identity(committed)),
+            "a locally committed batch is matched exactly"
+        );
+        assert!(
+            !owner.committed.knows(retried.tenant, retried.batch_id),
+            "a spent retry never creates an index entry"
+        );
+        assert!(
+            owner
+                .committed
+                .contains(cached.tenant, cached.batch_id, &identity(cached)),
+            "an earlier local acceptance stays matched after a spent attempt"
+        );
     }
 
     /// Proves shard insertion seals a full bucket before a crossing append lands.

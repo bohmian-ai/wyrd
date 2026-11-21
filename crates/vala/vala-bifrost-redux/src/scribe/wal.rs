@@ -2003,6 +2003,9 @@ pub struct WalWriter {
     /// failed; every later deletion pass retries it, so releasing the last
     /// reference never loses the only record that the file must be removed.
     deferred_deletes: Arc<Mutex<BTreeSet<PathBuf>>>,
+    /// Released-segment prefixes by shard directory, loaded from each shard
+    /// manifest on first release.
+    frontiers: Arc<Mutex<HashMap<PathBuf, ShardFrontier>>>,
     /// Retired segment files of this stream kept for reuse, by shard directory.
     ///
     /// They exist only while this writer lives: construction deletes every
@@ -2011,6 +2014,19 @@ pub struct WalWriter {
     /// Scribe-local fault raised when the WAL no longer matches what the
     /// writer reported; shared by every handle and never reset in process.
     fault: tokio_util::sync::CancellationToken,
+}
+
+/// One shard directory's contiguous prefix of released closed segments.
+///
+/// A segment joins `released` once its last owner let it go while it was no
+/// longer current; `safe` then advances only through consecutive sequences,
+/// so an earlier segment still held blocks every later one.
+#[derive(Debug, Default)]
+struct ShardFrontier {
+    /// Highest persisted sequence of the prefix, `None` before the first.
+    safe: Option<u64>,
+    /// Released sequences above `safe`, waiting for the gap below them.
+    released: BTreeSet<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -2289,6 +2305,7 @@ impl WalWriter {
             faults: Arc::default(),
             retirement_refs: Arc::new(Mutex::new(HashMap::new())),
             deferred_deletes: Arc::new(Mutex::new(BTreeSet::new())),
+            frontiers: Arc::new(Mutex::new(HashMap::new())),
             free_segments: Arc::new(Mutex::new(HashMap::new())),
             fault: tokio_util::sync::CancellationToken::new(),
         };
@@ -2420,6 +2437,7 @@ impl WalWriter {
             faults: Arc::clone(&self.faults),
             retirement_refs: Arc::clone(&self.retirement_refs),
             deferred_deletes: Arc::clone(&self.deferred_deletes),
+            frontiers: Arc::clone(&self.frontiers),
             free_segments: Arc::clone(&self.free_segments),
             fault: self.fault.clone(),
         }
@@ -2977,11 +2995,12 @@ impl WalWriter {
                 active.push(segment.path().to_path_buf());
             }
         }
+        let closed = pending
+            .into_iter()
+            .filter(|path| !active.contains(path))
+            .collect::<Vec<_>>();
         let mut first_error = None;
-        for path in pending {
-            if active.iter().any(|active_path| active_path == &path) {
-                continue;
-            }
+        for path in self.cover_released(&closed)? {
             match self.retire_segment_file(&path) {
                 Ok(()) => {
                     self.deferred_deletes
@@ -2998,6 +3017,101 @@ impl WalWriter {
             }
         }
         first_error.map_or(Ok(()), Err)
+    }
+
+    /// Records released closed segments in their shard frontiers and returns
+    /// the ones the persisted frontier now covers.
+    ///
+    /// Each touched frontier advances through consecutive released sequences
+    /// and is written to its shard manifest before any covered path is
+    /// returned, so a deleted segment is always inside a durable prefix. A
+    /// path already gone was covered by an earlier pass and is returned for
+    /// its deferral to clear. Uncovered paths stay deferred by the caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the frontier lock is poisoned, a
+    /// segment header or manifest cannot be read, or a manifest cannot be
+    /// written; a frontier that failed to persist is left unchanged.
+    fn cover_released(&self, paths: &[PathBuf]) -> Result<Vec<PathBuf>, ScribeError> {
+        let mut frontiers = self.frontiers.lock().map_err(|_| ScribeError::Internal {
+            detail: "WAL frontier lock poisoned".to_owned(),
+        })?;
+        let mut covered = Vec::new();
+        let mut held = Vec::new();
+        let mut touched = HashMap::new();
+        for path in paths {
+            let header = match File::open(path) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    covered.push(path.clone());
+                    continue;
+                }
+                opened => {
+                    let mut buf = [0_u8; SEGMENT_HEADER_SIZE];
+                    opened
+                        .and_then(|mut file| file.read_exact(&mut buf))
+                        .map_err(|error| ScribeError::Internal {
+                            detail: format!(
+                                "WAL segment retirement failed: unreadable header: {error}"
+                            ),
+                        })?;
+                    SegmentHeader::decode(&buf)?
+                }
+            };
+            let Some(directory) = path.parent() else {
+                continue;
+            };
+            let frontier = match frontiers.entry(directory.to_path_buf()) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let safe = crate::scribe::manifest::read_manifest(directory.join("manifest"))?
+                        .and_then(|manifest| manifest.safe_segment);
+                    entry.insert(ShardFrontier {
+                        safe,
+                        released: BTreeSet::new(),
+                    })
+                }
+            };
+            if frontier.safe.is_none_or(|safe| header.seg_seq > safe) {
+                frontier.released.insert(header.seg_seq);
+            }
+            let stream = StreamIdentity::new(
+                crate::scribe::stream_identity::NodeId::new(Uuid::from_bytes(header.node_id)),
+                crate::scribe::stream_identity::WriterEpoch::new(header.writer_epoch),
+            );
+            touched.insert(directory.to_path_buf(), stream);
+            held.push((directory.to_path_buf(), header.seg_seq, path.clone()));
+        }
+        for (directory, stream) in touched {
+            let Some(frontier) = frontiers.get_mut(&directory) else {
+                continue;
+            };
+            let mut advanced = frontier.safe;
+            while let Some(next) = advanced
+                .map_or(Some(0), |safe| safe.checked_add(1))
+                .filter(|next| frontier.released.contains(next))
+            {
+                advanced = Some(next);
+            }
+            let Some(safe) = advanced.filter(|_| advanced != frontier.safe) else {
+                continue;
+            };
+            crate::scribe::manifest::advance_safe_segment(
+                &directory.join("manifest"),
+                stream,
+                safe,
+            )?;
+            frontier.released.retain(|sequence| *sequence > safe);
+            frontier.safe = Some(safe);
+        }
+        covered.extend(held.into_iter().filter_map(|(directory, sequence, path)| {
+            frontiers
+                .get(&directory)
+                .and_then(|frontier| frontier.safe)
+                .is_some_and(|safe| sequence <= safe)
+                .then_some(path)
+        }));
+        Ok(covered)
     }
 
     /// Keeps one closed segment of this stream for reuse, or deletes it.
@@ -4791,6 +4905,99 @@ mod tests {
             .expect("retire closed segment");
         assert!(!first.path.exists());
         assert!(current.path.exists());
+    }
+
+    /// A released segment becomes deletable only once every earlier segment of
+    /// its shard is released too, and the shard manifest records that prefix
+    /// before any file in it goes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the writer cannot append, a segment is deleted ahead of the
+    /// persisted prefix, or the manifest frontier diverges from the released
+    /// contiguous prefix.
+    #[test]
+    fn released_segments_advance_a_persisted_contiguous_frontier() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let writer = WalWriter::new(
+            temp_dir.path(),
+            [11_u8; 16],
+            1,
+            WalConfig {
+                segment_bytes: 1200,
+            },
+        )
+        .expect("writer");
+        let key = test_seal_key(crate::test_support::tenant());
+        // Two records fill a segment, so eight records close segments 0, 1, 2.
+        for fill in 0..8 {
+            writer
+                .append_and_fsync_for_test(&key, [1_u8; 16], &[fill; 300])
+                .expect("append");
+        }
+        let reader = WalReader::open_directory_unfiltered(temp_dir.path()).expect("reader");
+        let [zero, one, two] = [0, 1, 2].map(|index| reader.segments[index].reference());
+        writer
+            .retain_segments(&[zero.clone(), one.clone(), two.clone()])
+            .expect("retain");
+        let manifest = zero.path.with_file_name("manifest");
+        let frontier = || {
+            crate::scribe::manifest::read_manifest(&manifest)
+                .expect("read manifest")
+                .and_then(|manifest| manifest.safe_segment)
+        };
+
+        writer
+            .retire_segments(std::slice::from_ref(&one))
+            .expect("release 1");
+        assert!(one.path.exists(), "segment 1 waits for segment 0");
+        assert_eq!(frontier(), None);
+
+        writer
+            .retire_segments(std::slice::from_ref(&zero))
+            .expect("release 0");
+        assert_eq!(frontier(), Some(1));
+        assert!(!zero.path.exists() && !one.path.exists());
+        assert!(two.path.exists());
+
+        writer
+            .retire_segments(std::slice::from_ref(&two))
+            .expect("release 2");
+        assert_eq!(frontier(), Some(2));
+        assert!(!two.path.exists());
+    }
+
+    /// A frontier that cannot be persisted keeps every segment it would cover.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the writer cannot append, the release succeeds, or the
+    /// segment is deleted without a persisted frontier.
+    #[test]
+    fn an_unpersisted_frontier_keeps_its_segments() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let writer = WalWriter::new(
+            temp_dir.path(),
+            [12_u8; 16],
+            1,
+            WalConfig {
+                segment_bytes: 1200,
+            },
+        )
+        .expect("writer");
+        let key = test_seal_key(crate::test_support::tenant());
+        for fill in 0..4 {
+            writer
+                .append_and_fsync_for_test(&key, [1_u8; 16], &[fill; 300])
+                .expect("append");
+        }
+        let reader = WalReader::open_directory_unfiltered(temp_dir.path()).expect("reader");
+        let zero = reader.segments[0].reference();
+        // A directory where the manifest's temporary file goes fails the write.
+        std::fs::create_dir(zero.path.with_file_name("manifest.tmp")).expect("block manifest");
+
+        assert!(writer.retire_segments(std::slice::from_ref(&zero)).is_err());
+        assert!(zero.path.exists(), "no persisted frontier, no deletion");
     }
 
     /// A retired segment is recycled into the next one; its stale records end

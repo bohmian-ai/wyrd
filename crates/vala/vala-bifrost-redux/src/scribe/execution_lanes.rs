@@ -4120,8 +4120,12 @@ mod tests {
         let seal_key = idle_seal_key();
         let mut settlement = ReplayRetirementSettlement::new(root.path());
         for index in 1_u64..=2 {
-            let path = shard_dir.join(format!("retirement-{index}.wal"));
-            std::fs::write(&path, index.to_le_bytes()).expect("retirement fixture");
+            let path = shard_dir.join(format!("{}.wal", index - 1));
+            crate::scribe::wal::WalSegment::create(
+                &path,
+                crate::scribe::wal::SegmentHeader::new(*node.as_bytes(), 1, index - 1, 0),
+            )
+            .expect("retirement fixture");
             let segment = crate::scribe::wal::WalSegmentRef { path };
             wal.retain_segments(std::slice::from_ref(&segment))
                 .expect("generation reference");

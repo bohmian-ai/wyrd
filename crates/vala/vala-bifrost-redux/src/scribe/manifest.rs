@@ -31,6 +31,15 @@ pub struct Manifest {
     /// Key is the seal-key path component string; value is the highest LSN
     /// fully committed to `file_list` for that key.
     pub sealed_lsn: HashMap<String, u64>,
+    /// Highest segment sequence of a contiguous closed-segment prefix whose
+    /// every record is staged or published, or `None` before the first.
+    ///
+    /// Only the WAL writer raises it, after the last owner of each segment in
+    /// the prefix released it and before any of those files is deleted, so a
+    /// batch receipt whose COMMIT segment is at or below it no longer guards
+    /// WAL-dependent data.
+    #[serde(default)]
+    pub safe_segment: Option<u64>,
 }
 
 /// Serializable stream identity (manifest carries `node_id` as hex UUID string).
@@ -58,6 +67,7 @@ impl Manifest {
         Self {
             stream_identity: stream_identity.into(),
             sealed_lsn: HashMap::new(),
+            safe_segment: None,
         }
     }
 
@@ -174,6 +184,32 @@ pub fn advance(
     for (seal_key, lsn) in watermarks {
         manifest.update_sealed_lsn(&seal_key, lsn);
     }
+    write_atomic(path, &manifest)
+}
+
+/// Raises one shard manifest's safe segment frontier, never lowering it, and
+/// writes it atomically.
+///
+/// The WAL writer calls this before deleting any segment the new frontier
+/// covers, so a missing segment at or below it is never an unexplained gap.
+///
+/// # Errors
+/// Returns [`ScribeError::Internal`] when the manifest cannot be read, parsed,
+/// or atomically replaced.
+pub fn advance_safe_segment(
+    path: &Path,
+    stream: StreamIdentity,
+    segment: u64,
+) -> Result<(), ScribeError> {
+    let _guard = ADVANCE_GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut manifest = read_manifest(path)?.unwrap_or_else(|| Manifest::new(stream));
+    manifest.safe_segment = Some(
+        manifest
+            .safe_segment
+            .map_or(segment, |safe| safe.max(segment)),
+    );
     write_atomic(path, &manifest)
 }
 

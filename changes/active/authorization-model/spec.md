@@ -1,17 +1,18 @@
 ---
 id: SPEC-authorization-model
-revision: 2
+revision: 3
 status: approved
 ---
 
-# Scoped authorization with preserved workload attribution
+# Scoped authorization and tenant-local social signup
 
 ## Problem and outcome
 
 An administrator must be able to give a User or Service access to one Repository,
 Model or other supported resource without granting access to the whole tenant.
 The UI, HTTP, CLI, MCP, SDKs and raw Bifrost queries must agree about that access.
-Today, broad Card grants and table-only queries cannot express that boundary.
+The original change replaces broad Card grants and table-only queries that
+cannot express that boundary. Tasks 001 and 002 implement that approved scope.
 
 This revises Wyrd's authorization system while retaining existing account,
 credential and workload-attribution flows. Roles describe operations; bindings
@@ -26,8 +27,16 @@ request retains its exact workload_uid attribution.
 Nothing has shipped. This specifies the revised system directly; there is no
 upgrade, existing-data conversion, token-reissue campaign or mixed-version rollout.
 
-Agreement: [design notes](design/notes.md), including the three system scenarios
-and two-task split; [Rust responsibilities and token flow](design/rust-model.md).
+Revision 3 adds social signup and sign-in. An operator enables Google/GitHub;
+Sam accepts an addressed invitation and receives its scoped access, or creates
+a new workspace and becomes its administrator. Sam can explicitly connect
+another sign-in method to that same User. A tenant can require company SSO.
+Bulk invitations use an operator-configured SMTP service; no particular email
+provider is required.
+
+Agreement: [design notes](design/notes.md), the original three system scenarios
+and two-task split, [Rust responsibilities and token flow](design/rust-model.md),
+and [finalized social-login design](design/social-login.md), locked 2026-11-21.
 The Rust snippets illustrate the agreed responsibilities, not required private
 function signatures, cache containers or module layouts.
 
@@ -56,7 +65,7 @@ own assignments. A group is not required for any ordinary installation.
 
 ### REQ-002 — Preserve authentication and enable local CLI login
 
-Local users, existing invitations/password recovery, browser sessions, API-key
+Local users, invitations/password recovery, browser sessions, API-key
 exchange and Service accounts work without an IdP. Preserve existing optional
 OIDC, workload federation and delegation, their trust validation and the separate
 platform plane. Registering or declaring a Card creates no principal or grant.
@@ -67,7 +76,8 @@ explicitly approves the CLI's user code. The CLI receives the existing short-liv
 access and rotating refresh tokens through one-use device-code redemption.
 
 Store exactly one human authentication anchor in the approved device record and
-its refresh family: local User/password revision, or OIDC connection ID/revision.
+its refresh family: local User/password revision, company OIDC connection
+ID/revision, or the social provider/identity anchor specified in REQ-012.
 Both retain the CLI client binding. Local login requires no OIDC connection; do
 not create a synthetic one. Refresh verifies the original anchor and current User
 state, then rotates normally. A changed password revision or no-longer-valid
@@ -196,9 +206,11 @@ revalidate the issuer's current authority to assign those grants, the referenced
 roles, scopes and tenant. Create the User and those bindings atomically. An invalid
 invitation creates neither; a missing scope is refused, never interpreted as All.
 Enrollment creates the recorded assignments, not a tenant-wide role assignment.
-Keep existing one-use, expiry and password-setup behavior.
+Keep existing one-use, expiry and password-setup behavior. Revision 3 adds the
+recipient-proof and bulk-delivery requirements in REQ-013 and REQ-017.
 
-User creation uses existing local account/invitation flows. Runtime Service creation
+Local User creation keeps its existing account/invitation flows; social admission
+and public signup follow REQ-012 through REQ-014. Runtime Service creation
 selects a Service family name, not an exact version; display runtime family and
 operation grants separately. The grant form selects account/group, role and explicit
 scope, showing applicable operations and family inclusion of future versions.
@@ -248,13 +260,195 @@ behavior: serialize accepted ceilings and trusted read parents correctly from
 acceptance, without changing owning Cards or principal/actor attribution.
 Unprovable parent identity never authorizes ordinary disclosure.
 
+### REQ-011 — Operators onboard shared providers; tenants manage company SSO
+
+All deployment types use the same open-source implementation. An authenticated
+operator administrator configures shared Google and GitHub.com sign-in through
+platform UI and Rust management APIs. Setup shows provider registration
+instructions and the exact callback URL, accepts client ID/secret, tests sign-in,
+and enables the tested configuration. Provider-side registration remains the
+operator's action. Store one authoritative platform configuration, with encrypted
+secrets omitted from read responses; UI and programmatic management share it.
+
+Social providers sit beside the tenant's existing single Active company OIDC
+connection, preserving its Candidate/test/activate lifecycle. Tenant admins
+manage only their own company SSO and login policy. Platform SSO authenticates
+platform administrators; it is not inherited tenant SSO, and platform authority
+does not implicitly authorize tenant settings changes.
+
+Password is enabled by default and can be disabled by the operator. Public
+social signup is separately disabled by default; SaaS enables it through the
+same setting. Rust returns and enforces allowed login methods from configured
+providers and tenant policy, regardless of UI state. Absent/disabled providers
+are not offered. Users remain tenant-local; no cross-tenant person account is added.
+
+### REQ-012 — Provider proof authenticates a bound purpose, never tenant access
+
+Rust owns provider exchange and completion for returning login, invitation
+acceptance, new-tenant signup and linking. Before redirecting, bind the purpose,
+provider identity/revision, browser, trusted origin, target tenant when present,
+and invitation or current User where applicable. Callback parameters cannot
+replace these. Retain five-minute transactions, one-use completion, server-held
+state/PKCE and OIDC nonce, issuer/audience/signature/expiry validation, and fixed
+post-login destinations. Use provider-specific social callbacks to separate
+operator providers from tenant-configured provider endpoints.
+
+Google reuses the OIDC relying party with `openid email profile`. GitHub.com
+uses authorization code/S256 PKCE and an authenticated user lookup; its numeric
+user ID is the subject under a fixed GitHub.com namespace. Do not use the mutable
+username or treat its OAuth access token as an OIDC ID token. Request no
+repository/organization access; retrieve verified email with minimal email
+permission when recipient proof requires it. Drop provider access tokens after
+identity resolution; retain no provider refresh-token vault.
+
+Resolve returning social login only by tenant + issuer/provider namespace +
+subject through the existing identity store. Missing identity refuses login
+without creating a User; inactive tenant/User remains refused. Emails may repeat
+and never select or merge accounts. Social login grants no role, replaces no
+direct/local-group binding, and must not clear company-derived bindings. Existing
+company-SSO first-login provisioning and group mapping remain distinct.
+
+Browser sessions, device approvals and human refresh families retain the actual
+social provider revision and linked-identity association as their original
+authentication anchor. Disabled/replaced provider configuration or removal of
+the identity refuses anchored session use/renewal without switching methods.
+Recheck these bindings and tenant policy at completion; racing changes cannot
+create a session from a no-longer-valid provider or method. All replicas enforce
+the same provider revision. No synthetic company connection or merged
+cross-tenant session is introduced.
+
+### REQ-013 — Addressed individual and bulk invitations grant intended access
+
+A tenant administrator invites one recipient email or pastes multiple addresses
+and selects explicit role/scope assignments. Create a separate expiring,
+single-use invitation per recipient, expose pending/resend/revoke operations,
+and report per-recipient results. Ten or more recipients require no different
+identity/provisioning model. SMTP delivery follows REQ-017.
+
+Acceptance requires a live invitation and proof of control of its recipient
+address, through an appropriate verified provider claim or separate mailbox
+challenge. Apply this to password and provider enrollment. Merely forwarding
+the original invitation does not let another recipient redeem it. Email proves
+invitation eligibility only; it never links or identifies an existing User.
+Do not fall back to bearer-only or shared-link admission.
+
+Preserve REQ-008's issuer-authority and scoped-assignment checks. In one tenant
+transaction, revalidate invitation, recipient proof, tenant policy and provider
+binding where applicable; create the User/identity and intended bindings,
+consume the invitation and create the session, or commit none of them.
+Concurrent redemption cannot spend an invitation twice or create duplicate
+Users. Invalid, expired, revoked or mismatched invitations create no active User
+or grants. If the provider identity already belongs to a User, refuse new-User
+enrollment and direct them to sign in and request access; do not transfer the
+identity or silently merge accounts.
+
+### REQ-014 — Public signup reuses tenant creation and makes its creator admin
+
+When public signup is enabled, a visitor proves Google/GitHub identity, enters
+a workspace name with existing slug validation, and confirms creation. Wyrd
+creates a new tenant with that tenant-local User bound to the tenant admin role,
+then signs the User into it. Creating the tenant grants this role; being the
+first visitor to an existing tenant does not. Email/domain/provider organization
+or an existing slug grants no membership elsewhere. Operator-created tenants
+and administrator invitation flows remain available.
+
+Extend the existing provisioner with human-owner initialization. Reuse builtin
+roles, SYSTEM, table initialization, provisioning states and activation/failure
+handling; activate only a usable tenant with its administrator. Keep platform
+and tenant transaction boundaries. Public signup confers only authority to create
+this new tenant, never platform administrative authority, a platform principal,
+or the existing administrative bootstrap key in the response.
+
+Recheck signup enablement and provider validity at completion. Apply shared
+source/provider-identity rate limiting before expensive creation, so replicas
+cannot bypass the limit; unavailable shared admission state refuses creation.
+Bind retry/resumption to the original attempt and proven identity. Callback
+replay creates no second tenant, another identity cannot adopt a failed claim,
+and failure leaves no active ownerless tenant. A completed tenant remains
+accessible through returning login if its session response is lost. The same
+provider account can independently create or join another tenant without sharing
+that tenant's User, grants or credentials.
+
+### REQ-015 — Explicit linking preserves the User and its access
+
+In account settings, a User freshly proves their existing allowed method within
+five minutes, then proves the additional provider in a purpose-bound linking
+transaction. A stale cookie or API-key recovery session alone is insufficient.
+Attach the identity to that tenant's same User atomically. An identity owned by
+another User refuses linking; concurrent claims have one winner. Linking an
+identity already attached to the same User creates no duplicate.
+
+Keep principal ID, direct grants, local memberships, keys and attribution intact.
+Company-SSO linking applies only that connection's verified group mappings.
+Linking prevents future duplicates; it does not merge existing Users. A
+social-only User may add a password after fresh proof of an existing allowed
+method, using existing username uniqueness/password validation; matching email
+or a reset request alone cannot add a method.
+
+Removing a method requires fresh proof through a remaining allowed method;
+refuse removal of the last usable method. Removing an identity invalidates its
+anchored sessions/refresh without revoking unrelated methods or changing the
+existing API-key policy. Preserve last-usable-admin protection and operator recovery.
+
+The last-method check applies to a User removing their method; it does not
+prevent an operator disabling/replacing a shared provider or disabling password.
+Those changes invalidate the affected login paths even if a User has no other
+usable method. Operator recovery remains available; no automatic fallback or
+new grant is created.
+
+### REQ-016 — Company-SSO enforcement applies to existing human login paths
+
+A tenant administrator freshly authenticated through its tested Active company
+connection can require company SSO. Warn about Users without usable linked
+company identities before enabling policy. Rust enforces it: password/social
+starts and completions refuse, invitation acceptance uses company SSO, and
+existing password/social browser sessions and CLI renewal become unusable under
+the established freshness rules. Disabling policy does not resurrect revoked
+sessions. Existing grants and token lifetime/revocation rules remain applicable;
+no instantaneous global revocation guarantee is added.
+
+Preserve existing personal/Service API-key policy and independent operator-assisted
+recovery. Ordinary password/social login cannot bypass tenant policy. Company
+SSO is not continuous offboarding: upstream removal alone is not a Wyrd
+revocation signal. Local suspension remains the existing administrative control,
+subject to documented propagation/freshness.
+
+Requiring company SSO remains enabled when its connection is replaced,
+deactivated or unavailable. Human sign-in requires the current Active company
+connection; without a usable one it refuses rather than falling back to
+password/social. Replacement retains existing connection-revision invalidation
+and issuer/subject identity rules; it never moves identities between Users.
+
+### REQ-017 — Generic operator SMTP delivers invitations with honest outcomes
+
+An operator administrator configures one deployment SMTP service: host, port,
+TLS mode, optional credentials and sender address, with a test-send action.
+Store credentials through existing encrypted-secret handling; reads omit them.
+Tenant administrators use delivery but cannot read/change its credentials.
+Self-hosted and SaaS use the same path. Provider account/sender-domain setup
+remain external operator work. Resend is an example, not a dedicated integration,
+preset, SDK dependency or required test provider.
+
+Send each invitation separately after its transaction commits; do not hold a
+tenant transaction open during SMTP IO. Report relay acceptance or failure per
+recipient, never claim inbox delivery from SMTP acceptance. A send failure leaves
+the invitation pending, creates no active User and permits explicit resend.
+Wyrd runs without SMTP, but the UI explains that emailed invitations require
+operator configuration; missing SMTP does not weaken recipient proof. No new
+mail queue, automatic retry subsystem or provider-specific API is required.
+
 ## Persistence and authority changes
 
 This revision names the schema definitions the revised system needs. These are
 implementation changes, not an upgrade/data-migration project. This document
 authorizes no editing of an applied migration or resetting an existing database.
-New tables lead with data_tenant_id, force RLS and use tenant-qualified references. Coordination time
-remains PostgreSQL-owned. No new family-ownership or principal store is introduced.
+Tenant-scoped PostgreSQL tables lead with data_tenant_id and tenant references
+remain tenant-qualified. Genuine deployment-wide and pre-tenant platform tables
+may omit that key under narrowly authorized platform operations. Every
+PostgreSQL table enables and forces RLS, including platform tables. This is the
+maintainer-approved platform distinction, not permission to fabricate a tenant
+or grant a signup visitor platform authority. Coordination time remains
+PostgreSQL-owned. No new family-ownership or principal store is introduced.
 
 | Owner/table | Required change |
 |---|---|
@@ -269,26 +463,66 @@ remains PostgreSQL-owned. No new family-ownership or principal store is introduc
 | Existing verifier execution authority JSON and Bifrost accepted records | Define serializable accepted ceilings and trusted parent metadata for newly accepted work and normal retry/recovery; do not add evidence or analytical payloads to PostgreSQL |
 | Bifrost verification tables | Preserve a trusted family/exact parent in execution_inputs, execution_outputs, execution_events, results, evidence and approvals through their existing schema/writer owners; no historical-record conversion |
 
+Revision 3 adds these bounded persistence purposes. Physical record/table names
+remain implementation-owned; no applied migration may be edited. Platform-only
+records belong to the existing platform control plane, not a fabricated tenant
+or visitor principal. Their storage placement and policies follow the owning
+[Postgres tenant-binding authority](../../../architecture/wyrd-security-posture.md#postgres-tenant-binding):
+platform records may omit the tenant key; every table still forces RLS. No
+additional isolation or authority exception is approved.
+
+| Owner/store | Required change |
+|---|---|
+| New platform social-provider configuration records | Provider kind, client metadata, sealed secret, tested/enabled state and revision; existing platform management authority; shared by replicas |
+| New platform application-mail/signup settings records | SMTP host/port/TLS/sender and sealed credentials, password availability and signup-enable setting; no tenant-visible secrets or implicit tenant administration rights |
+| Existing tenant identity store and local User credentials | Reuse tenant/issuer/subject ownership uniqueness; explicit attachment/removal and lookup validity for anchors; no platform-person identity store |
+| wyrd.auth_login_state | Purpose-bound returning login, invitation and linking context, exact provider revision, browser binding and linked User/invitation where needed; preserve company/test/device flows |
+| New platform pre-tenant signup records and admission counters | Expiring browser/provider-bound signup proof and completion/retry ownership, reference to the provisioned tenant, and shared trusted-source/provider-identity rate-limit state; no provider token vault |
+| platform.tenants and existing provisioning state | Associate signup-created tenant/claim with its proven creation attempt so another caller cannot adopt a failed claim; retain the directory lifecycle |
+| wyrd.auth_browser_sessions, wyrd.auth_device_authorizations, wyrd.auth_refresh_tokens | Complete social provider/revision and linked-identity anchors, invalidation/renewal constraints; preserve password/company/recovery anchors and client binding |
+| New tenant login-policy metadata | Require-company-SSO state and revision tied to current Active company connection; integrate existing freshness/invalidation owners |
+| wyrd.auth_user_invitations | Recipient address, scoped intents, pending/revoke/expiry/consumption and safe per-recipient send outcome; no raw invitation secret in storage |
+| New tenant recipient-proof records | Expiring, one-use mailbox challenge verifiers bound to recipient, invitation, browser/enrollment purpose and tenant when provider proof is insufficient; never email-based User lookup |
+
+Support constraints/indexes/policies are limited to provider/method validity,
+unique identity ownership, bound one-use completion, shared admission accounting,
+recipient proof, per-recipient lookup/state and tenant isolation. Invitation
+contents/raw codes are not a PostgreSQL mail spool; construct message content
+for sending, persisting only coordination metadata. Any additional persistence
+purpose or SQL function needs a specification revision. Rate-limit windows/counts
+and private representations remain implementation-owned within the bounded
+shared-admission requirement.
+
 Within those named changes, support columns, constraints, indexes and policies
 are limited to the described subject/role/scope records, membership uniqueness,
 tenant isolation and references, revision confirmation, login-anchor validity,
 invitation scopes, credential ceilings and their lookup paths. Physical names,
 JSON layout and cache representation remain implementation-owned. Naming a table
-does not authorize an unrelated change to it. Any additional table, persistence
-purpose, index/policy outside those properties, or new SQL function requires a
-specification revision before schema implementation. No new SQL function is
-proposed.
+does not authorize an unrelated change to it. Tables/records implementing the
+named revision-3 purposes above are permitted; splitting a purpose across
+physical tables does not authorize another purpose. Tables, persistence purposes
+or indexes/policies outside the named purposes/properties, and any new SQL
+function, require a specification revision before schema implementation.
+No new SQL function is proposed.
 
 The owning [security posture](../../../architecture/wyrd-security-posture.md#authorization-and-policy),
 [runtime identity](../../../architecture/wyrd-design.md#runtime-identity),
 [Repository](../../../architecture/wyrd-design.md#repository) and
 [Bifrost public authorization](../../../architecture/bifrost-design.md#public-surface)
-sections are reconciled with these agreed replacements. Platform separation,
+sections were reconciled for revision 2. Platform separation,
 tenant isolation, nonblocking audit, workload ownership and credential security
-remain required. This records the authority prerequisite as satisfied, not
-implementation completion or runtime verification.
+remain required. Revision 3's authority reconciliation is recorded on
+2026-11-21 in the owning
+[social admission, linking and mail](../../../architecture/wyrd-security-posture.md#social-admission-account-linking-and-application-mail),
+[browser sessions](../../../architecture/wyrd-security-posture.md#first-party-browser-sessions),
+[Postgres tenant binding](../../../architecture/wyrd-security-posture.md#postgres-tenant-binding)
+and [human sign-in](../../../architecture/wyrd-design.md#human-sign-in) sections.
+They now cover shared operator providers, public signup through the existing
+provisioner, social/identity anchors, addressed invitations, SMTP, company-SSO
+policy and the approved PostgreSQL platform-key distinction. This records the
+approved design boundary; it does not claim implementation or verification.
 
-## Acceptance: three connected system scenarios
+## Acceptance: connected system scenarios
 
 These are system observations, not one scenario per implementation feature.
 Plans derive focused success/refusal cases inside them. Use production UI,
@@ -301,12 +535,15 @@ absence of forbidden side effects, not only UI success messages.
 | AC-001: An administrator gives a user access, and every surface respects it | Create Alice and payments access through the UI, including direct/group variants. Alice completes local login and CLI approval. UI, HTTP/CLI, SDK/MCP and raw SQL expose the same Repository/review membership; another Repository contributes no data/counts. GitHub configuration and access administration remain denied. Programmatic creation/grants exercise the same contracts. | REQ-001, REQ-002, REQ-006, REQ-007, REQ-008 |
 | AC-002: A provisioned Service operates across releases with correct attribution | Create checkout-runtime through HTTP/CLI and the UI variant; inspect the same family/grants. Run two checkout releases with the same account/key. Retained results preserve exact release, owning Card, subject, Verifier and actor attribution. Another runtime family's UID and an ungranted operation are refused without unauthorized work. | REQ-001, REQ-003, REQ-005, REQ-006, REQ-008 |
 | AC-003: Access changes affect existing sessions and credentials predictably | Copy a safe request, grant through HTTP/CLI, use the existing session, then remove/change through the UI. Observe healthy propagation, warm cache reuse, restricted/delegated limits and agreement across callers. Interrupt confirmation to prove known-invalidated refusal and the five-minute maximum with bearer requests independent of browser-store availability. | REQ-001, REQ-004, REQ-005, REQ-008, REQ-009, REQ-010 |
+| AC-004: An operator enables social login and an administrator invites a team | Set up/test/enable Google and GitHub through operator UI/APIs beside company SSO; tenant-admin changes to shared settings fail. Configure a local SMTP test server, paste 10+ recipients with scoped access, inspect separate send outcomes and pending/resend/revoke state. Accept using allowed password/provider methods with recipient proof; stranger login, wrong recipients, forwarding, expired/revoked/replayed codes and concurrent redemption gain no unauthorized User/grant. SMTP failure/absence is visible without creating an active User. Returning social login preserves access and company/direct bindings; another tenant remains separate. | REQ-011, REQ-012, REQ-013, REQ-017; preserves REQ-001, REQ-008 |
+| AC-005: A visitor creates a workspace and becomes its administrator | With signup enabled, prove Google/GitHub identity, choose a new workspace and observe a usable tenant, creator's admin binding and ordinary session. Disabled signup, rate-limit refusal, unavailable admission state and invalidated provider create no active tenant. Exercise replay, concurrent/retried creation, failed initialization and lost session response: no duplicate/ownerless active tenant or takeover of another attempt. An existing tenant's slug/domain grants no entry; no platform principal/privilege or bootstrap key is returned. | REQ-011, REQ-012, REQ-014 |
+| AC-006: A User connects a method and the tenant adopts company SSO | Freshly prove a password User's existing method and connect Google/GitHub/company SSO; principal/access/keys remain. Stale/recovery-only proof, conflicts and races cannot transfer identities. Add a password from a social-only User, remove a method and inspect anchor invalidation; last-method removal is refused. Enable company-SSO policy after admin proof and observe refusal of password/social starts, racing callbacks, existing browser sessions and CLI renewals. Provider replacement/removal and policy apply across replicas; API keys and operator recovery retain existing policy. | REQ-012, REQ-015, REQ-016; preserves REQ-002, REQ-004, REQ-005 |
 
 Existing safeguards remain required as cases/regressions within these journeys:
 cross-tenant refusal, exact versus family scopes, direct/provider/group provenance,
 root mismatch, key/delegation narrowing, optional federation, accepted-work recovery,
 safe role changes and retained-source/peer reads. They do not create additional
-top-level system scenarios. Rust/Python/TypeScript and MCP exercise their shipped
+top-level system scenarios beyond those above. Rust/Python/TypeScript and MCP exercise their shipped
 boundaries, with language-lifetime behavior tested in its owning language.
 
 Hot-path verification must list every added/moved PostgreSQL, Scribe, object-store
@@ -315,21 +552,41 @@ checks add no wait; cold/invalidation acquisition is a permission-state reload;
 audit stages on the existing Scribe outbox and never blocks the operation.
 Apply owner format, lint, codegen, tenant-boundary and journey lanes.
 
+New provider/mail journeys use controlled OIDC/OAuth and SMTP servers with real
+Rust endpoints, production UI, repository PostgreSQL and real CLI/SDK credentials.
+Exercise explicit device-code approval under social login as well as existing
+methods. Google/GitHub operator smoke tests establish actual registration,
+consent and callback compatibility without replacing negative/concurrency
+journeys. No hosted email provider is required for verification. Preserve the
+finalized design's hot-path review conditions if new enforcement changes a hot
+path; this draft claims no benchmark or runtime result.
+
 ## Scope and delivery
 
-Two implementation tasks are agreed: complete backend authorization/enforcement
-first, then admin UI and its connected journeys consuming those contracts.
-Each owns proof against the same three scenarios; testing is not deferred to the
-UI task. Existing consumers remain correct after backend integration, and the
-split does not permit an alternate authorization path or bypass.
+The original two tasks cover backend authorization/enforcement and its admin
+UI/journeys against AC-001 through AC-003. Their completed work and evidence
+remain under approved revision 2; do not rewrite their task records. Revision 3
+adds the finalized social-login/invitation/SMTP outcome as intended task 003,
+with AC-004 through AC-006 and applicable regression coverage. Planning follows
+approval; this spec creates no task. Existing consumers and original
+authorization/attribution guarantees remain required.
 
 Excluded: mandatory teams/ownership metadata, SCIM/group synchronization, new
 principal kinds, a policy language/service, general user-table row policies,
 per-release accounts/credentials, a UI-only workflow and an access-request inbox.
+The addition also excludes cross-tenant person accounts, automatic account
+merging, public password signup, generic operator OIDC/provider plugin frameworks,
+continuous IdP offboarding, new mail queues, provider-token vaults, CAPTCHA,
+operator-wide signup creation caps and provider-specific mail integrations/tests.
+Email invitations do not add delivery/notifications to REQ-009's access-request
+copy flow.
 
 Revision 2 makes local device-login anchors and scoped invitation consumption
 explicit, and removes shipped-system transition requirements because nothing has
-shipped. The three acceptance scenarios and two-task split are unchanged.
-The maintainer explicitly approved revision 2 on 2026-11-19. Architecture reconciliation was recorded on 2026-11-19; planning may proceed.
-Recording approval and authority alignment creates no tasks, schema implementation,
-production changes or Git actions.
+shipped. The maintainer approved revision 2 on 2026-11-19; its architecture
+reconciliation was recorded that day. Revision 3 records the design locked on
+2026-11-21 and the clarification that generic SMTP, not a Resend-specific
+integration, is the contract. It includes the approved PostgreSQL platform-key
+distinction and completed authority reconciliation. The maintainer explicitly
+approved revision 3 on 2026-11-21. Planning may now derive task 003 from this
+contract. Specification approval does not authorize Git staging, commits or pushes.

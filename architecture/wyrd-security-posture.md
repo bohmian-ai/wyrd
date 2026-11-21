@@ -355,10 +355,11 @@ credential.
   OAuth grant, client identification, redirect and refresh rules remain
   explicit for their actual machine-client consumers; browser login does not
   introduce a replacement OAuth client or relax exact provider callbacks.
-- Device approval accepts a local password or configured OIDC human login with
+- Device approval accepts an allowed password, company OIDC or social login with
   explicit user-code approval. Approved device records and their refresh families
-  retain exactly one anchor: local User/password revision, or complete OIDC
-  connection ID/revision, together with the CLI client binding. Unapproved records
+  retain exactly one anchor: local User/password revision, complete company OIDC
+  connection ID/revision, or social provider ID/revision and linked-identity
+  reference, together with the CLI client binding. Unapproved records
   carry no authenticated principal or anchor. Refresh checks the original anchor
   and current User, then rotates; an invalid anchor refuses renewal rather than
   switching methods. Local CLI login needs no IdP or synthetic connection. Tokens
@@ -381,7 +382,8 @@ credential.
   rate-limit `POST /auth/device`, the user-code entry form, per client address
   (RFC 8628 §5.1).
 - The deployment sealing keyring protects only stored provider and
-  workload-issuer client secrets and gateway `managed_secret` provider keys.
+  workload-issuer client secrets, application SMTP credentials and gateway
+  `managed_secret` provider keys.
   A gateway managed secret is sealed with its tenant, name, and provider
   inside the authenticated payload, so an envelope copied into another
   tenant's or credential's row does not open. Wyrd stores no recoverable access token,
@@ -391,6 +393,108 @@ credential.
   settings. Gateway documents name provider keys as `local_env` sources the
   CLI resolves at apply time, and the server applies a composite document
   atomically, so a refused document commits nothing.
+
+### Social admission, account linking and application mail
+
+These capabilities ship in open source through one self-hosted/SaaS code path.
+Users remain tenant-local: the same person in two tenants has two independent
+Users. Platform administrators manage deployment-wide Google and GitHub.com
+clients, password availability, public social signup and application SMTP through
+Rust management APIs and their UI projections. Tenant administrators manage only
+their own company SSO connection and tenant login policy. Shared social providers
+sit beside the single Active company connection, not in its slot; platform SSO
+continues to authenticate platform administrators only. Platform authority grants
+no implicit tenant administration.
+
+Operator onboarding shows provider registration instructions and the exact callback
+URL, accepts sealed client credentials, tests sign-in and enables the tested
+configuration. Stored secrets are omitted from read responses. Password is enabled
+by default; public social signup is disabled by default. SaaS enables signup via
+the same operator setting. Rust offers and enforces current allowed methods.
+
+Rust binds each provider transaction to its purpose (returning login, invitation,
+new-tenant signup or linking), exact provider revision, browser, trusted origin,
+target tenant where present and relevant invitation/User. Retain five-minute
+expiry, one-use completion, server-held state/PKCE, OIDC nonce and fixed completion
+destinations. Social callbacks are provider-specific, separate from the shared
+company callback. Disablement or revision change refuses in-flight completion
+and invalidates credentials anchored to that provider revision.
+
+Google uses OIDC with `openid email profile` and validated issuer, subject,
+audience, signature, nonce and expiry. GitHub.com uses authorization code with
+S256 PKCE and an authenticated user lookup, with numeric user ID under a fixed
+GitHub.com namespace. It supplies no OIDC ID token. Request no repository or
+organization access; fetch verified email with minimal email permission only
+when recipient proof needs it. Provider tokens are transient identity-resolution
+inputs; retain no provider refresh-token vault.
+
+Returning social login resolves only tenant + issuer/provider namespace + subject.
+An unknown identity, inactive User or inactive tenant refuses without User
+creation. Email never selects, links or merges accounts and may repeat. Social
+login grants no role and does not clear company, direct or local-group bindings.
+Company SSO retains its existing provisioning and source-qualified group mapping.
+
+Invitations name a recipient and explicit scoped assignments. Individual and bulk
+entry create separate expiring, one-use invitations with per-recipient outcomes
+and pending/resend/revoke operations. Redemption requires the live invitation and
+proof of the addressed mailbox through an appropriate verified provider claim or
+a separate fresh, one-use mailbox challenge bound to recipient, invitation,
+browser and enrollment purpose. This applies to password and social enrollment;
+a forwarded invitation alone is insufficient. Mailbox proof establishes invitation
+eligibility, never account ownership. Consumption revalidates issuer authority,
+roles/scopes, tenant policy and provider revision, then atomically creates the
+User, identity/credentials, bindings and session and consumes the invitation, or
+commits none. Concurrent redemption has one winner. An identity already owned by
+a User refuses new-User enrollment and directs the person to sign in and request
+access through ordinary binding administration.
+
+Enabled public social signup proves identity, takes a new workspace name/slug
+and invokes the existing tenant provisioner with a human-owner initialization
+path. It creates a new tenant and a tenant-local User with tenant-wide admin
+binding. It never joins an existing tenant by email, domain or slug, grants the
+visitor platform authority, fabricates a platform caller or returns a bootstrap
+administrative key. Preserve claim/initialize/promote lifecycle across platform
+and tenant transactions; promote only when the tenant and administrator are usable.
+Bind retry ownership to the creation attempt and proven identity; another caller
+cannot adopt a failed claim, replay cannot create a second tenant and failure
+leaves no active ownerless tenant. A lost session response permits ordinary login
+to the completed tenant. Signup remains enabled at completion. Shared admission
+limits trusted source and verified provider identity before expensive creation;
+unavailable admission state refuses creation.
+
+Linking requires fresh proof of the User's current allowed method within five
+minutes plus proof of the new identity in the same bound transaction. An old
+cookie or recovery session alone is insufficient. Attach only to that same User;
+refuse another User's identity, with one winner under concurrency. Same-User
+repeat linking may succeed idempotently. Preserve principal ID, grants, groups
+and keys; never merge existing duplicates. Linking company SSO applies only that
+connection's validated group assignments. Adding a password to a social-only
+User requires fresh current-method proof and existing password validation.
+Removing a method requires fresh proof through a remaining allowed method,
+refuses the last usable method and invalidates credentials anchored to the
+removed identity. This does not prevent operator-wide provider/password disablement;
+existing administrative recovery and last-admin safeguards remain applicable.
+
+A freshly company-SSO-authenticated tenant administrator may require company SSO
+only with a tested Active connection, after warning about unlinked accounts.
+Then password/social starts, callbacks, existing browser sessions and CLI renewal
+refuse under established freshness rules. Policy remains enabled across company
+connection replacement, disablement or outage: no password/social fallback.
+Replacement retains connection-revision invalidation and issuer/subject rules.
+Disabling policy does not resurrect revoked sessions. Preserve personal/Service
+API-key policy and independent operator-assisted recovery. This is not continuous
+IdP offboarding; upstream removal alone does not revoke Wyrd grants or sessions.
+
+One operator-configured SMTP relay supplies host, port, TLS mode, optional sealed
+credentials and sender address, with test-send. Tenant administrators use it but
+cannot read/change its credentials. Wyrd runs without SMTP and explains emailed
+invitation unavailability without weakening recipient proof. Send separately after
+each invitation commits, outside the tenant transaction. Report relay acceptance
+or failure per recipient, never inbox delivery; failure leaves a pending invitation
+and no active User, with explicit resend available. Raw invitation secrets are not
+stored as a PostgreSQL mail spool. No new mail queue, automatic retry subsystem or
+provider-specific integration is required; Resend is simply a compatible-provider
+example. Provider account and sending-domain setup remain external operator work.
 
 ### First-party browser sessions
 
@@ -416,7 +520,8 @@ credential.
   HTTP exception is permitted. Raw identifiers never enter database rows,
   metadata, URLs, logs or traces. The record stores a one-way digest, tenant,
   principal, twelve-hour absolute expiry, revocation and exactly one anchor:
-  the exact human-connection revision of an SSO session, the originating
+  the exact company-connection revision of an SSO session, the social
+  provider ID/revision and linked-identity reference of a social session, the originating
   credential reference of a recovery session, or the local User's password
   revision of a password session. There is
   no sliding renewal and no recoverable credential vault. Database-owned
@@ -449,9 +554,10 @@ credential.
   and tenant, and atomically creates the User and bindings or neither. Missing
   scope is refused, never promoted to All.
 - Every browser-session request checks current tenant/principal authority.
-  SSO sessions require the exact Active connection revision; password
-  sessions require the User's current password revision and never consult a
-  connection. API-key-backed
+  Company SSO sessions require the exact Active connection revision; social
+  sessions require the enabled provider revision and live linked identity.
+  Password sessions require the User's current password revision. These human
+  method sessions obey current login policy and operator method availability. API-key-backed
   sessions require a still-valid originating credential and preserve all its
   effective-permission restrictions. Existing grant resolution, credential
   attribution, permission checks and non-blocking audit are reused; no Node
@@ -524,8 +630,10 @@ credential.
   rootless semantics, all under the account's restriction. Assertion claims
   never select a principal and the `tenant` selector only routes.
 - A connection is selected by the login entry point, never by a token, header,
-  hostname, or post-login chooser. A tenant entry resolves only that tenant's
-  connection; the deployment's single platform-scope connection resolves only
+  hostname, or post-login chooser. A company-SSO entry resolves only that tenant's
+  connection; social entries select the operator provider through the bound
+  transaction described in social admission above. The deployment's single
+  platform-scope connection resolves only
   platform principals pre-registered against an expected issuer and claim and
   pinned on `(issuer, subject)` at first login. An unknown platform subject is
   denied and never provisioned just in time, and the platform connection's
@@ -533,7 +641,7 @@ credential.
   administrative credential.
 - Unknown issuers, unknown keys after one bounded refresh, unavailable JWKS,
   invalid claims, and ambiguous claim mappings fail authentication.
-- Every tenant shares one human-login callback, so authorization responses are
+- Tenant-configured company connections share one human-login callback, so authorization responses are
   bound to their issuer (RFC 9207) after the login state is consumed and
   before any token-endpoint request: a present `iss` must equal the issuer the
   login state recorded, byte for byte, and an absent `iss` is refused when the
@@ -897,7 +1005,13 @@ references, carry the tenant key in their foreign keys. `platform.*` is the
 privileged plane above tenant scope.
 
 Row-level security is the authoritative tenant boundary, and the pool decides
-scope. Every table enables and forces RLS. Tenant tables carry a
+scope. Every PostgreSQL table enables and forces RLS, including platform
+tables. Genuine deployment-wide and pre-tenant records belong to the existing
+platform plane and may omit `data_tenant_id`; they remain protected by narrowly
+authorized platform operations and platform RLS policies. Do not fabricate a
+tenant or give a signup visitor platform authority to store those records.
+This exception is to the tenant-key requirement only, not forced RLS. Tenant
+tables carry a
 `tenant_isolation` policy with both predicates:
 
 ```sql

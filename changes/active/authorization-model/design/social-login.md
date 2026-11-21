@@ -340,42 +340,44 @@ the existing tenant company-OIDC connection remains available independently.
 
 ## Standards conflicts
 
-[Security authority](../../../../architecture/wyrd-security-posture.md#first-party-browser-sessions)
-currently defines one tenant connection as the source of human provider trust
-and enumerates session/device/refresh anchors without operator social identity.
-Its platform-plane model reserves tenant creation for authorized platform
-operations. The new public signup entry, operator providers, method/identity
-anchors and SSO policy therefore need an explicit authority reconciliation and
-specification revision before implementation. No authority file was changed.
-
-The revised spec must name necessary persistence changes: purpose-bound login
-state including pre-tenant signup, social and identity session/refresh/device
-anchors, tenant login policy/revision, signup ownership/retry state and shared
-admission counters, recipient-addressed invitations and SMTP configuration.
-Mailbox-challenge state, if required, must also be named. Reuse existing
-columns/tables where sufficient; identify
-actual additions before approval. Identity ownership uniqueness already exists.
-New tables follow tenant-first forced RLS; pre-tenant signup belongs to the
-platform control plane, without creating a platform principal for the visitor.
-No applied migration may be edited. Login/provisioning are control-plane work;
-do not add PostgreSQL or provider lookups to verification/query/append paths.
+The maintainer approved the PostgreSQL platform-storage distinction on
+2026-11-21. The owning security posture now records shared operator providers,
+purpose-bound social admission, public signup through the existing provisioner,
+identity anchors, recipient proof, SMTP and tenant SSO policy. Its Postgres
+section permits genuine platform/pre-tenant tables without `data_tenant_id`
+while requiring forced RLS on every table. The human-sign-in architecture agrees.
+No unresolved authority conflict remains for this design. Production code and
+applied migrations were not changed; implementation must follow these owners.
 
 ## Open questions
 
-No material product decisions remain open. The maintainer locked the proposal,
-including generic operator-configured SMTP, on 2026-11-21.
+No product or storage-boundary decision remains open. The maintainer approved
+this PostgreSQL-specific distinction on 2026-11-21:
 
-API-key policy is settled and preserved. Operator-assisted recovery is approved.
-The design covers Google followed by GitHub in task 003; rate-limit values
-and ordinary private mechanics can be resolved in specification/implementation
-without another product decision round.
+- Tenant-scoped PostgreSQL tables lead with `data_tenant_id` and retain
+  tenant-qualified references.
+- Genuine deployment-wide and pre-tenant PostgreSQL records may live in the
+  existing platform plane without a tenant key, under narrowly authorized
+  platform operations. No fabricated tenant is needed.
+- Every PostgreSQL table enables and forces RLS, including platform tables.
+
+This revises the broader every-new-table tenant-key rule for platform records;
+it does not relax tenant isolation or grant signup visitors platform authority.
+It does not define Bifrost or object-storage layout. Reuse existing owners before
+adding physical tables.
+
+Previously agreed shared providers, public signup, identity anchors, invitation
+recipient proof, SMTP and company-SSO policy remain unchanged. The owning architecture and approved revision 3 now record the approved storage
+distinction and behavior. The maintainer explicitly approved revision 3 on
+2026-11-21.
 
 ## Handoff
 
-Finalized for specification. Next, reconcile the owning authority and revise the
-specification through wyrd-spec when requested, then derive task 003 through
-wyrd-plan after spec approval. No task or approved-spec revision is created by
-this design finalization. Existing tasks and their recorded evidence are preserved.
+Finalized design is recorded in [approved specification revision 3](../spec.md).
+Authority reconciliation and explicit specification approval are recorded on
+2026-11-21. [Task 003](../tasks/TASK-003-social-login.md) carries this agreement
+into an implementation proposal and ordered acceptance scenarios. Design
+finalization alone did not approve the spec. Existing tasks and evidence are preserved.
 
 Implementation reaches server auth/config/callback/provisioning, SQL metadata,
 wire contracts and stable errors, client projections where exposed, login,

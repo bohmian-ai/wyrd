@@ -5,17 +5,23 @@ Status: finalized
 The maintainer resumed this packet on 2026-11-21 to design social sign-in and
 signup as task 003, after reporting tasks 001 and 002 complete. The original
 finalized agreement below remains the basis of approved specification revision 2;
-its two-task limit applies to that original scope. The proposed addition and
-agreed addition is in [social sign-in and signup](social-login.md), finalized by
+its two-task limit applies to that original scope. The agreed addition is in
+[social sign-in and signup](social-login.md), finalized by
 the maintainer on 2026-11-21. It covers social signup/login, explicit linking,
 operator UI onboarding, addressed bulk invitations and generic SMTP delivery.
-It is ready for specification and does not revise the approved spec or
-create a task.
+It is recorded in [approved specification revision 3](../spec.md), with authority
+reconciliation and explicit maintainer approval recorded on 2026-11-21.
+[Task 003](../tasks/TASK-003-social-login.md) now proposes the implementation
+and ordered acceptance scenarios for that approved addition. The maintainer approved
+the PostgreSQL platform-storage distinction in the
+supplement on 2026-11-21; authority/spec reconciliation is recorded on that date.
+Locked product decisions remain intact.
 
 The maintainer has locked the authorization model and preservation of existing
 identity, ownership and attribution semantics, the three scenarios and two-task
-split, and requested specification. The finalized agreement is carried into
-[specification revision 2](../spec.md), approved by the maintainer on 2026-11-19.
+split, and requested specification. The original agreement was carried into
+specification revision 2, approved by the maintainer on 2026-11-19; its scope
+remains preserved in the current draft.
 
 ## Problem
 

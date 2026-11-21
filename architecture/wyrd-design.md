@@ -907,24 +907,33 @@ Env vars in deployed services:
 
 #### Human sign-in
 
-Human federation is optional per tenant. A tenant has at most one active OIDC
+Company SSO is optional per tenant. A tenant has at most one active OIDC
 connection, administered through `/v1/identity/oidc/*`; Wyrd is an OpenID
 Connect relying party of that provider (`openidconnect`) and the OAuth 2.0
 authorization server for its own clients. The provider authenticates the
 person; Wyrd resolves the tenant `User` by verified `(issuer, subject)`, maps
 provider groups only to source-qualified scoped bindings in that tenant, and
 issues Wyrd tokens. Local User/password login works without any IdP. Provider
-tokens are never Wyrd authority.
+tokens are never Wyrd authority. Operator-configured Google/GitHub social
+providers sit beside the tenant company connection. Social login only resolves
+a previously attached tenant-local identity; admission requires an addressed
+invitation or enabled signup that creates a new tenant with its creator as admin.
+Explicit fresh-proof linking attaches methods to the same User without merging
+accounts. The [security posture](wyrd-security-posture.md#social-admission-account-linking-and-application-mail)
+owns provider onboarding, purpose binding, signup, linking, company-SSO policy
+and application-mail safeguards.
 
 | Client | OAuth client | Grant | Session holder |
 |---|---|---|---|
-| Web app | First-party browser session, not a separate OAuth client | Rust-owned OIDC login, local password login or API-key recovery under `/auth/browser` | Opaque HttpOnly session cookie; only its digest and bound authority persist in Postgres; fixed 12-hour absolute lifetime |
+| Web app | First-party browser session, not a separate OAuth client | Rust-owned company OIDC/social login, local password login or API-key recovery under `/auth/browser` | Opaque HttpOnly session cookie; only its digest and bound authority persist in Postgres; fixed 12-hour absolute lifetime |
 | CLI and SDKs | `wyrd-cli`, public | Device authorization (RFC 8628) | `credentials.toml`, owned by `wyrd-client`; refresh token rotates on every use |
 
-CLI device approval accepts a human signed in by local password or configured
-OIDC and requires explicit user-code approval. Device approval and its rotating
+CLI device approval accepts a human signed in through an allowed password, company
+OIDC or social method and requires explicit user-code approval. Device approval
+and its rotating
 refresh family retain exactly one original authentication anchor: local User and
-password revision, or OIDC connection ID and revision, plus CLI client binding.
+password revision, company OIDC connection ID and revision, or social provider
+ID/revision and linked identity, plus CLI client binding.
 Invalidated anchors refuse renewal without switching methods; local login creates
 no synthetic provider connection. Unapproved device records carry no principal
 or anchor; expiry, one-use, replay, polling and browser-origin controls remain.
@@ -948,29 +957,40 @@ tokens, the RFC 8628 §3.2 device response, an empty RFC 7009 revocation
 `GET /auth/browser/session` returns only live browser-safe session metadata,
 optionally filtered by tenant route key; and `POST /auth/browser/logout`
 revokes the selected session. They use typed Rust contracts and Wyrd errors.
-The shared `GET /auth/callback` completes a bound provider login; browser
+The shared `GET /auth/callback` completes a bound company-provider login; browser
 completion creates the session and redirects to the fixed tenant page, while
 device and provider-test completions retain their own behavior. There is no
 separate Node `/login/callback` OAuth-code exchange or UI refresh-token flow.
+Operator social providers use provider-specific Rust callbacks and the same
+transaction/session ownership.
 Deployed Services and Agents keep their own API keys or workload assertions;
 human SSO never replaces or disables them.
 
 Local password sign-in is the provider-free human path. An administrator
 holding User management and tenant administration creates a User directly
-(`POST /v1/principals/users`: username, password and Role names; `wyrd
-principal user create`), provisions an invitation by Role names (`POST
+(`POST /v1/principals/users`: username, password and explicit role/scope
+assignments; `wyrd principal user create`), provisions a recipient-addressed
+invitation with explicit role/scope
+assignments (`POST
 /v1/principals/users/invitations`, 24-hour single-use code returned once;
 `wyrd principal user invite`) and, for recovery, a reset code (`POST
-/v1/principals/users/{principal_id}/password-reset`, 15 minutes); codes are
-delivered out of band and never appear in URLs. `POST
+/v1/principals/users/{principal_id}/password-reset`, 15 minutes). Reset codes
+are delivered out of band and never appear in URLs. Invitations
+use the operator-configured SMTP relay, with recipient proof and pending/resend/
+revoke handling under the security posture. Send only after invitation commit;
+report per-recipient relay acceptance/failure. No SMTP configuration means emailed
+invitations are unavailable, not a bearer-only enrollment fallback. `POST
 /auth/browser/password/signup` redeems an invitation into a tenant User with
 a canonical tenant-local username; `/login`, `/change` and `/reset` verify,
 replace or reset the password. Rust stores only an Argon2id verifier,
 bounds failures per account and per source, and ends every local session of
 the User on change or reset; reset never signs in. `wyrd-server setup`
-creates no User. SSO-only Users have no password and are never linked to a
-local account by email or username. There is no OAuth password grant and no
-email delivery.
+creates no User. Provider-only Users initially have no password; adding one
+requires fresh current-method proof. Accounts are never linked by email or username. There is
+no OAuth password grant or public password signup. Google/GitHub public signup,
+when enabled, reuses tenant provisioning with a human administrator instead of
+a platform principal or bootstrap key. Shared provider and SMTP setup is
+operator administration; tenant admins manage company SSO and tenant login policy.
 
 `GET /v1/principals/me` returns the calling User's safe profile: principal,
 tenant, username, authentication method and effective permissions. Users
@@ -984,13 +1004,16 @@ exposes own-key metadata and revoke but never issues a secret.
 
 Browser session cookies contain only random identifiers. Records store their
 digests, tenant/principal, absolute expiry/revocation and exactly one anchor,
-not recoverable credentials: the exact human-connection revision of an SSO
-session, the recovery-credential reference of a recovery session, or the
-local User's password revision of a password session. Recovery logout revokes
+not recoverable credentials: the exact company-connection revision of an SSO
+session, social provider ID/revision and linked identity, the recovery-credential
+reference of a recovery session, or the local User's password revision of a password session. Recovery logout revokes
 only its browser session. Rust checks current authority on browser requests
-against that anchor; only SSO sessions check the connection. Existing tenant
-access-token snapshot semantics remain unchanged. Login transactions expire in five minutes and
-sessions in twelve hours, with no sliding renewal. Protected tenant `/v1`
+against that anchor and current allowed-method policy. Social sessions require
+an enabled exact provider revision and live identity; company SSO requires the
+exact Active connection. Requiring company SSO also refuses password/social
+browser sessions and CLI renewal; existing API-key and recovery policy remains.
+Current grant and token-ceiling semantics remain unchanged. Login transactions
+expire in five minutes and sessions in twelve hours, with no sliding renewal. Protected tenant `/v1`
 HTTP APIs accept exactly one selected browser cookie through the existing
 principal/permission/audit boundary; ambiguous multiple session cookies are
 refused. Only metadata enumeration accepts multiple tenant sessions. Other

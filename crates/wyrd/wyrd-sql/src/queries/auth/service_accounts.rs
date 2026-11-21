@@ -256,12 +256,14 @@ pub async fn delete_service_account(
     Ok(result.rows_affected() > 0)
 }
 
-/// Find an active public tenant machine principal by id.
+/// Find a public tenant machine principal by id, whatever its status.
 ///
 /// Every public surface that names a principal by id — credential issuance,
 /// listing, and revocation, principal revocation, and token exchange — resolves
 /// it here, so the internal SYSTEM writer is excluded at this one owner and is
-/// indistinguishable from an absent principal on all of them.
+/// indistinguishable from an absent principal on all of them. A suspended
+/// account still exists, as a suspended User does through `user_by_id`: a
+/// caller that needs a usable account checks the returned `status`.
 ///
 /// # Errors
 /// Returns the database error when the read fails.
@@ -275,7 +277,6 @@ pub async fn service_account_by_id(
           FROM wyrd.auth_service_accounts
          WHERE data_tenant_id = $1
            AND id = $2
-           AND status = 'active'
            AND principal_kind <> 'system'
         ",
     )

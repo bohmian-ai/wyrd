@@ -293,12 +293,13 @@ pub(crate) mod pg_tests {
         .await
         .expect("revocation succeeds");
 
-        assert!(
+        assert_eq!(
             service_account_by_id(&mut conn, sa_id)
                 .await
                 .expect("service account lookup runs")
-                .is_none(),
-            "revocation suspends the service account, so no active row remains"
+                .map(|row| row.status),
+            Some("suspended".to_owned()),
+            "revocation suspends the service account and keeps its row"
         );
     }
 

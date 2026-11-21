@@ -21,7 +21,7 @@ const id = (value: string) => encodeURIComponent(value);
 /**
  * Tenant access administration as the server answers it to this session: the
  * accounts, roles, groups and bindings, and for `?account=` that account's
- * access summary and, for an active Service account, its key metadata. The server
+ * access summary and, for a Service account, its key metadata. The server
  * authorizes every read; a refusal is the page's whole content.
  */
 export const load: PageServerLoad = async ({ locals, url }) => {
@@ -38,8 +38,7 @@ export const load: PageServerLoad = async ({ locals, url }) => {
       read<{ bindings: CardTypes.RoleBindingView[] }>(session, '/access/bindings'),
       account ? read<CardTypes.AccessSummary>(session, `/principals/${id(account)}/access`) : null
     ]);
-    // The server answers for the keys of an active account only; a suspended account's keys are all refused.
-    const keys = selected?.kind === 'service' && selected.status === 'active' ? await read<CredentialList>(session, `/principals/${id(selected.principal_id)}/credentials?limit=50`) : null;
+    const keys = selected?.kind === 'service' ? await read<CredentialList>(session, `/principals/${id(selected.principal_id)}/credentials?limit=50`) : null;
     return { access: { ...principals, roles: roles.roles, groups: groups.groups, bindings: bindings.bindings, selected, keys }, problem: null };
   } catch (cause) {
     if (!isHttpError(cause)) throw cause;

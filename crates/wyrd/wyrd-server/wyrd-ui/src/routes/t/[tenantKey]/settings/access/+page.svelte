@@ -247,14 +247,15 @@
                 </tbody>
               </table>
             </div>
-            <form method="POST" action={action('issueKey')} use:enhance>
-              <input type="hidden" name="principalId" value={selected.principal_id} />
-              <p>To rotate, issue a new key, deploy it, then revoke the old one. Keys carry the account's bindings; they add none.</p>
-              <button class="app-control" type="submit">Issue key</button>
-            </form>
-          {:else if selected.kind === 'service'}
-            <h3>API keys</h3>
-            <p>This account is suspended. Its keys are refused, and none can be issued.</p>
+            {#if selected.status === 'active'}
+              <form method="POST" action={action('issueKey')} use:enhance>
+                <input type="hidden" name="principalId" value={selected.principal_id} />
+                <p>To rotate, issue a new key, deploy it, then revoke the old one. Keys carry the account's bindings; they add none.</p>
+                <button class="app-control" type="submit">Issue key</button>
+              </form>
+            {:else}
+              <p>This account is suspended. Its keys are refused, and none can be issued.</p>
+            {/if}
           {/if}
         </section>
       {/if}

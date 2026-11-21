@@ -921,6 +921,7 @@ impl TenantTokenIssuer {
         } else {
             let row = service_account_by_id(conn, principal_id)
                 .await?
+                .filter(|row| row.status == "active")
                 .ok_or(IssuanceError::PrincipalInactive)?;
             let kind =
                 principal_kind_wire(&row.principal_kind).ok_or(IssuanceError::PrincipalInactive)?;

@@ -168,7 +168,8 @@ pub(super) async fn tenant_conn<'a>(
         })
 }
 
-/// Refuse a principal id that names nothing in this caller's tenant.
+/// Refuse a principal id that names nothing in this caller's tenant, and
+/// report whether the principal it names is active.
 ///
 /// Row-level security already keeps a foreign principal's rows unreachable, but
 /// unreachable is not the same as refused: without this, listing a foreign
@@ -176,6 +177,9 @@ pub(super) async fn tenant_conn<'a>(
 /// against an id the tenant does not own. Both surfaces route through here so
 /// they give one answer, and it is the same non-enumerating `404` a genuinely
 /// unknown id gets — a caller cannot tell the two apart, which is the point.
+///
+/// A suspended principal exists: its credentials stay listable, and the
+/// returned flag is `false` so issuance can refuse it a new one.
 ///
 /// Takes the caller's decision transaction by value. When the principal is
 /// absent the allowance already appended to it still records an evaluated
@@ -189,17 +193,19 @@ pub(super) async fn tenant_conn<'a>(
 async fn require_principal(
     mut conn: TenantConn<'_>,
     principal_id: Uuid,
-) -> Result<TenantConn<'_>, WyrdError> {
-    let exists = service_account_by_id(&mut conn, principal_id)
+) -> Result<(TenantConn<'_>, bool), WyrdError> {
+    let status = match service_account_by_id(&mut conn, principal_id)
         .await
         .map_err(|error| WyrdError::from(internal(error)))?
-        .is_some()
-        || user_by_id(&mut conn, principal_id)
+    {
+        Some(account) => Some(account.status),
+        None => user_by_id(&mut conn, principal_id)
             .await
             .map_err(|error| WyrdError::from(internal(error)))?
-            .is_some();
-    if exists {
-        return Ok(conn);
+            .map(|user| user.status),
+    };
+    if let Some(status) = status {
+        return Ok((conn, status == "active"));
     }
     conn.commit()
         .await
@@ -383,8 +389,12 @@ async fn create_service_principal(
 /// a password or provider browser session at most five minutes old, and
 /// issuing for another User needs principal and tenant administration.
 ///
+/// A suspended principal is refused a new credential; the ones it holds stay
+/// listed and unusable.
+///
 /// # Errors
-/// Returns a stable Wyrd error when the caller is unauthorized, the body is
+/// Returns a stable Wyrd error when the caller is unauthorized, the principal
+/// is suspended, the body is
 /// absent for a User or present for an account, the request is outside its
 /// bounds, or a write fails.
 #[utoipa::path(
@@ -407,6 +417,8 @@ async fn create_service_principal(
           WYRD_AUTH_403_RECENT_LOGIN_REQUIRED)", body = WyrdProblem),
         (status = 404, description = "No such principal in the caller's tenant \
           (WYRD_AUTH_404_PRINCIPAL_NOT_FOUND)", body = WyrdProblem),
+        (status = 409, description = "The principal is suspended (WYRD_SPEC_409_CONFLICT)",
+         body = WyrdProblem),
         (status = 500, description = "A tenant store read or write failed \
           (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
         (status = 503, description = "No verifier is configured for the access token (\
@@ -444,7 +456,14 @@ async fn issue_credential(
         )
         .await?
     };
-    let mut conn = require_principal(conn, principal_id).await?;
+    let (mut conn, active) = require_principal(conn, principal_id).await?;
+    if !active {
+        conn.commit().await.map_err(internal)?;
+        return Err(WyrdErrorResponse::from(WyrdError::Conflict {
+            message: "the account is suspended and cannot be issued a credential".to_owned(),
+            details: serde_json::json!({ "id": principal_id.to_string() }),
+        }));
+    }
     let user_target = user_by_id(&mut conn, principal_id)
         .await
         .map_err(internal)?
@@ -590,7 +609,7 @@ pub(crate) async fn list_credentials_for(
         .await
         .map_err(WyrdError::from)?
     };
-    let mut conn = require_principal(conn, principal_id).await?;
+    let (mut conn, _) = require_principal(conn, principal_id).await?;
     let listing = if query.is_paged() {
         credential_page(&mut conn, principal_id, query).await?
     } else {

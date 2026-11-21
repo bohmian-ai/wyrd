@@ -2084,4 +2084,30 @@ async fn user_keys_preserve_owner_scope_and_credential_lifecycle() {
     )
     .await;
     assert!(server.exchange_api_key(&live).await.is_err());
+
+    // A suspended account still exists: an administrator reads its keys,
+    // unchanged, and is refused a new one, for a User and a Service alike.
+    let kept = as_bearer(&server, Method::GET, &keys, &admin, None).await;
+    assert_eq!(kept.status, StatusCode::OK, "{}", kept.body);
+    let refused = as_bearer(&server, Method::POST, &keys, &admin, body).await;
+    assert_eq!(refused.status, StatusCode::CONFLICT, "{}", refused.body);
+    let before = as_bearer(&server, Method::GET, &account_keys, &admin, None).await;
+    let suspended = as_bearer(
+        &server,
+        Method::POST,
+        &format!("/v1/principals/{service_id}/revoke"),
+        &admin,
+        Some(json!({ "principal_kind": "service", "reason": "retired" })),
+    )
+    .await;
+    assert!(suspended.status.is_success(), "{}", suspended.body);
+    let service_key =
+        SecretString::from(plain.body["credential"].as_str().expect("key").to_owned());
+    assert!(server.exchange_api_key(&service_key).await.is_err());
+    let after = as_bearer(&server, Method::GET, &account_keys, &admin, None).await;
+    assert_eq!(after.status, StatusCode::OK, "{}", after.body);
+    assert_eq!(after.body["credentials"], before.body["credentials"]);
+    let refused = as_bearer(&server, Method::POST, &account_keys, &admin, None).await;
+    assert_eq!(refused.status, StatusCode::CONFLICT, "{}", refused.body);
+    assert_eq!(refused.body["code"], "WYRD_SPEC_409_CONFLICT");
 }

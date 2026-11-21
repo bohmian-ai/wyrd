@@ -79,11 +79,12 @@ pub use tenant_principals::{
     CREDENTIAL_PAGE_MAX, CreateServicePrincipalRequest, CreateServicePrincipalResponse,
     CreateUserCredentialRequest, CreateUserInvitationRequest, CreateUserRequest, CreatedUser,
     CredentialListQuery, CredentialListResponse, CredentialMetadata, CredentialRevoked,
-    CurrentUserArgs, CurrentUserProfile, IssuedCredential, IssuedUserInvitation,
-    IssuedUserPasswordReset, ListCredentialsArgs, PrincipalPage, PrincipalQuery, PrincipalStatus,
-    PrincipalSummary, RevokeCredentialArgs, RoleSource, SetWorkloadRestrictionArgs,
-    USER_CREDENTIAL_MAX_LIFETIME_SECONDS, USER_CREDENTIAL_NAME_MAX_CHARS, UserInvitationView,
-    UserPasswordResetView,
+    CurrentUserArgs, CurrentUserProfile, INVITATION_RECIPIENTS_MAX, InvitationDelivery,
+    IssuedCredential, IssuedUserInvitation, IssuedUserInvitations, IssuedUserPasswordReset,
+    ListCredentialsArgs, PrincipalPage, PrincipalQuery, PrincipalStatus, PrincipalSummary,
+    RevokeCredentialArgs, RoleSource, SetWorkloadRestrictionArgs,
+    USER_CREDENTIAL_MAX_LIFETIME_SECONDS, USER_CREDENTIAL_NAME_MAX_CHARS, UserInvitationList,
+    UserInvitationView, UserPasswordResetView,
 };
 pub use token::{
     AuthorizationServerMetadata, ExchangeTokenType, OAuthClientId, OAuthErrorCode,

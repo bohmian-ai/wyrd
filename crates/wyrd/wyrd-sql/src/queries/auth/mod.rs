@@ -53,8 +53,8 @@ pub use human_connections::{
 };
 pub use local_passwords::{
     AttemptScope, InvitationRow, PasswordResetRow, attempt_refusal, consume_invitation,
-    consume_password_reset, insert_invitation, insert_password_reset, record_attempt_failure,
-    revoke_invitation,
+    consume_password_reset, insert_invitation, insert_password_reset, pending_invitations,
+    record_attempt_failure, record_invitation_delivery, reissue_invitation, revoke_invitation,
 };
 pub use login_state::{
     GithubLoginState, LoginState, SocialLoginState, bind_github_login_state,

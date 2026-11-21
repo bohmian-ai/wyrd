@@ -95,8 +95,12 @@ pub fn principals_router() -> OpenApiRouter<AppState> {
         ))
         .routes(routes!(super::accounts::current_user))
         .routes(routes!(super::accounts::create_user))
-        .routes(routes!(super::accounts::create_user_invitation))
+        .routes(routes!(
+            super::accounts::create_user_invitation,
+            super::accounts::list_user_invitations
+        ))
         .routes(routes!(super::accounts::revoke_user_invitation))
+        .routes(routes!(super::accounts::resend_user_invitation))
         .routes(routes!(super::accounts::create_password_reset))
         .routes(routes!(list_credentials, issue_credential))
         .routes(routes!(revoke_credential))

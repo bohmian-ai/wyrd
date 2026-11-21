@@ -158,10 +158,11 @@ async function invitation(serverUrl: string, adminKey: string, role: string): Pr
       'x-wyrd-access-token': `Bearer ${await WyrdClient.connect({ serverUrl, credential: adminKey }).accessToken()}`,
       'content-type': 'application/json'
     },
-    body: JSON.stringify({ assignments: [{ role, scope: 'all' }] })
+    body: JSON.stringify({ recipients: ['person@example.test'], assignments: [{ role, scope: 'all' }] })
   });
   expect(issued.status).toBe(201);
-  return ((await issued.json()) as { invitation_code: string }).invitation_code;
+  const { invitations } = (await issued.json()) as { invitations: { invitation_link: string }[] };
+  return new URL(invitations[0].invitation_link).hash.replace('#invitation=', '');
 }
 
 /** A new browser signed in to `tenantKey` the normal human way: invitation signup, then the username and password form. */
@@ -2688,18 +2689,23 @@ reviewing('Alice is given payments in Settings and sees only payments in her bro
     await page.goto(`${base}/settings`);
     await page.getByRole('link', { name: 'Access', exact: true }).click();
     await page.waitForURL(`${base}/settings/access`);
-    const invite = page.getByRole('form', { name: 'Invite a user' });
+    const invite = page.getByRole('form', { name: 'Invite users' });
+    await invite.getByLabel('Email addresses').fill('alice@example.test\ncarol@example.test');
     await chooseFamilyGrant(invite, 'viewer', 'Repository', 'payments');
-    await invite.getByRole('button', { name: 'Create invitation' }).click();
-    const code = page.locator('[data-secret]');
-    await expect.poll(() => code.count()).toBe(1);
-    const invitationCode = (await code.textContent()) ?? '';
+    await invite.getByRole('button', { name: 'Create invitations' }).click();
+    const links = page.locator('[data-secret]');
+    await expect.poll(() => links.count()).toBe(2);
+    await expect.poll(() => page.getByText('Wyrd does not email invitations until an operator configures a mail relay.').count()).toBe(1);
+    const aliceLink = (await links.first().textContent()) ?? '';
+    expect(aliceLink.startsWith(`${base}/signup#invitation=`)).toBe(true);
+    const pending = page.getByRole('region', { name: 'Pending invitations' });
+    await expect.poll(() => pending.getByRole('row', { name: /carol@example\.test/ }).textContent()).toContain('not emailed');
 
-    // Alice sets her own password with the invitation; the server created her account and exactly the invited binding.
+    // Alice opens her copied link and sets her own password; the server created her account and exactly the invited binding.
     const password = strongPassword();
     const alice = await (await browser.newContext()).newPage();
-    await alice.goto(`${base}/signup`);
-    await alice.getByLabel('Invitation code').fill(invitationCode);
+    await alice.goto(aliceLink);
+    await expect.poll(() => alice.getByLabel('Invitation code').inputValue()).toHaveLength(43);
     await alice.getByLabel('Username').fill('alice');
     await alice.getByLabel('Password').fill(password);
     await alice.getByRole('button', { name: 'Create account' }).click();
@@ -2965,17 +2971,17 @@ test('an administrator manages direct, group and custom-role grants in Access, a
     await page.goto(`${base}/settings/access`);
 
     // An invitation that names no scope is refused: nobody is enrolled with a tenant-wide default.
-    expect(await post('invite', { role: 'viewer' })).toMatchObject({ type: 'failure', status: 400 });
+    expect(await post('invite', { recipients: 'bob@example.test', role: 'viewer' })).toMatchObject({ type: 'failure', status: 400 });
 
     // Bob is invited as viewer of the ask-prompt family and sets his own password.
-    const invite = page.getByRole('form', { name: 'Invite a user' });
+    const invite = page.getByRole('form', { name: 'Invite users' });
+    await invite.getByLabel('Email addresses').fill('bob@example.test');
     await chooseFamilyGrant(invite, 'viewer', 'Prompt', 'ask-prompt');
-    await invite.getByRole('button', { name: 'Create invitation' }).click();
-    const code = page.locator('[data-secret]');
-    await expect.poll(() => code.count()).toBe(1);
+    await invite.getByRole('button', { name: 'Create invitations' }).click();
+    const link = page.locator('[data-secret]');
+    await expect.poll(() => link.count()).toBe(1);
     const signup = await context.newPage();
-    await signup.goto(`${base}/signup`);
-    await signup.getByLabel('Invitation code').fill((await code.textContent()) ?? '');
+    await signup.goto((await link.textContent()) ?? '');
     await signup.getByLabel('Username').fill('bob');
     await signup.getByLabel('Password').fill(strongPassword());
     await signup.getByRole('button', { name: 'Create account' }).click();
@@ -3331,7 +3337,7 @@ test('Access tells an unavailable server apart from a refusal', async ({ ui }) =
     // Once it answers again the same session administers access.
     down = false;
     await admin.reload();
-    expect(await admin.getByRole('form', { name: 'Invite a user' }).count()).toBe(1);
+    expect(await admin.getByRole('form', { name: 'Invite users' }).count()).toBe(1);
   } finally {
     for (const page of contexts) await page.context().close();
     bff.stop();

@@ -8,7 +8,7 @@ use wyrd_spec::auth::{
     AccessSummary, CreateGroupRequest, CreateRoleBindingRequest, CreateServicePrincipalRequest,
     CreateServicePrincipalResponse, CreateUserInvitationRequest, CreateUserRequest, CreatedUser,
     CredentialListQuery, CredentialListResponse, CurrentUserProfile, GroupList, GroupView,
-    IssuedCredential, IssuedUserInvitation, PrincipalId, PrincipalPage, PrincipalQuery,
+    IssuedCredential, IssuedUserInvitations, PrincipalId, PrincipalPage, PrincipalQuery,
     PrincipalSummary, PutRoleRequest, RevokePrincipalRequest, RoleBindingList, RoleBindingQuery,
     RoleBindingView, RoleList, RoleView, WorkloadRestriction,
 };
@@ -115,11 +115,11 @@ impl Principals {
             .await
     }
 
-    /// Invite a person to sign up as a local User holding the named Roles;
-    /// the one-time code is returned once.
+    /// Invite each recipient to sign up as a User holding the scoped
+    /// assignments; each one-time link is returned once.
     ///
     /// # Arguments
-    /// * `request` - The Role names the enrolled User receives.
+    /// * `request` - The recipients and the assignments each enrolled User receives.
     ///
     /// # Errors
     /// Returns a Wyrd error when the caller lacks User management and tenant
@@ -127,7 +127,7 @@ impl Principals {
     pub async fn invite_user(
         &self,
         request: &CreateUserInvitationRequest,
-    ) -> Result<IssuedUserInvitation, WyrdError> {
+    ) -> Result<IssuedUserInvitations, WyrdError> {
         self.client
             .http
             .request_json(

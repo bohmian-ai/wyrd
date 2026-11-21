@@ -26,7 +26,8 @@
   let dismissed = $state<string | null>(null);
   let copied = $state(false);
   const issued = $derived(form?.issued && form.issued.id !== dismissed ? form.issued : null);
-  const invitation = $derived(form?.invitation && form.invitation.code !== dismissed ? form.invitation : null);
+  const invitations = $derived(form?.invitations && form.invitations[0]?.link !== dismissed ? form.invitations : null);
+  const DELIVERY = { not_emailed: '– not emailed', accepted: '✓ accepted by the mail relay', failed: '✕ email failed' } as const;
 
   const label = (principal: CardTypes.PrincipalSummary) => principal.name ?? principal.email ?? principal.principal_id;
   const nameOf = (principalId: string) => {
@@ -135,14 +136,31 @@
       {/each}
     </nav>
 
-    {#if invitation}
-      <div class="secret" role="status">
-        <strong>✓ Invitation created. Send the code to the person now; it is not shown again.</strong>
-        <code data-secret>{invitation.code}</code>
-        <p>They sign up at <a href={invitation.url}>{invitation.url}</a> before {when(invitation.expiresAt)} UTC and receive exactly the access chosen here.</p>
+    {#if invitations}
+      <div class="secret" role="status" aria-label="Invitation links">
+        <strong>✓ {invitations.length === 1 ? 'Invitation link' : `${invitations.length} invitation links`} created. Copy them now; they are not shown again.</strong>
+        {#if invitations.some((sent) => sent.delivery === 'not_emailed')}
+          <p>Wyrd does not email invitations until an operator configures a mail relay. Send each person their link yourself.</p>
+        {/if}
+        <!-- svelte-ignore a11y_no_noninteractive_tabindex -- a scrolling table must be reachable by keyboard -->
+        <div class="scroll" role="region" aria-label="Issued invitation links" tabindex="0">
+          <table>
+            <thead><tr><th>Recipient</th><th>Email</th><th>Link</th></tr></thead>
+            <tbody>
+              {#each invitations as sent (sent.link)}
+                <tr>
+                  <td>{sent.recipient}</td>
+                  <td>{DELIVERY[sent.delivery]}</td>
+                  <td><code data-secret>{sent.link}</code></td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+        <p>Anyone holding a link can sign up once before {when(invitations[0].expiresAt)} UTC and receives exactly the access chosen here. Revoke a link that reached the wrong person.</p>
         <div class="row">
-          <button class="app-control" type="button" onclick={() => copy(invitation.code)}>{copied ? 'Copied' : 'Copy'}</button>
-          <button class="app-control" type="button" onclick={() => ((dismissed = invitation.code), (copied = false))}>Dismiss</button>
+          <button class="app-control" type="button" onclick={() => copy(invitations.map((sent) => `${sent.recipient}\t${sent.link}`).join('\n'))}>{copied ? 'Copied' : 'Copy all'}</button>
+          <button class="app-control" type="button" onclick={() => ((dismissed = invitations[0].link), (copied = false))}>Dismiss</button>
         </div>
       </div>
     {/if}
@@ -290,12 +308,47 @@
 
       {#if tab === 'users'}
         <section>
-          <h2>Invite a user</h2>
-          <form class="stack" method="POST" action={action('invite')} aria-label="Invite a user" use:enhance>
-            <p>The person sets their own username and password with a one-time code. Their account is created holding exactly this binding; add more from their Access page afterwards.</p>
+          <h2>Invite users</h2>
+          <form class="stack" method="POST" action={action('invite')} aria-label="Invite users" use:enhance>
+            <p>Each address gets its own single-use link, valid for 24 hours. The person signs up with it and their account is created holding exactly this binding; add more from their Access page afterwards.</p>
+            <label>Email addresses <textarea class="app-input mono" name="recipients" required rows="4" autocomplete="off" placeholder="one per line"></textarea></label>
             <GrantFields roles={access.roles} />
-            <button class="app-control primary" type="submit">Create invitation</button>
+            <button class="app-control primary" type="submit">Create invitations</button>
           </form>
+          <h3>Pending invitations</h3>
+          {#if access.invitations.length}
+            <!-- svelte-ignore a11y_no_noninteractive_tabindex -- a scrolling table must be reachable by keyboard -->
+            <div class="scroll" role="region" aria-label="Pending invitations" tabindex="0">
+              <table>
+                <thead><tr><th>Recipient</th><th>Access</th><th>Email</th><th>Expires</th><th></th></tr></thead>
+                <tbody>
+                  {#each access.invitations as pending (pending.id)}
+                    <tr>
+                      <td>{pending.recipient}</td>
+                      <td>{pending.assignments.map((grant) => `${grant.role} at ${scopeLabel(grant.scope)}`).join(', ')}</td>
+                      <td>{DELIVERY[pending.delivery]}</td>
+                      <td>{when(pending.expires_at)}</td>
+                      <td>
+                        <div class="row">
+                          <form method="POST" action={action('resendInvitation')} use:enhance>
+                            <input type="hidden" name="invitationId" value={pending.id} />
+                            <button class="app-control" type="submit" aria-label="Resend invitation to {pending.recipient}">Resend</button>
+                          </form>
+                          <form method="POST" action={action('revokeInvitation')} use:enhance>
+                            <input type="hidden" name="invitationId" value={pending.id} />
+                            <button class="app-control" type="submit" aria-label="Revoke invitation to {pending.recipient}">Revoke</button>
+                          </form>
+                        </div>
+                      </td>
+                    </tr>
+                  {/each}
+                </tbody>
+              </table>
+            </div>
+            <p>Resend replaces the link; the old one stops working.</p>
+          {:else}
+            <div class="app-problem" data-state="absent"><strong>– No pending invitations</strong></div>
+          {/if}
         </section>
       {:else if tab === 'services'}
         <section>

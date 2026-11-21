@@ -271,14 +271,23 @@ pub struct CredentialRevoked {
     pub credential_id: Uuid,
 }
 
+/// Most recipients one `POST /v1/principals/users/invitations` accepts.
+pub const INVITATION_RECIPIENTS_MAX: usize = 100;
+
 /// Body of `POST /v1/principals/users/invitations`.
 ///
+/// Each recipient receives a separate invitation with the same assignments.
 /// The issuer's tenant is the invitation's tenant, and its lifetime is a fixed
 /// twenty-four hours; neither is caller-selected.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct CreateUserInvitationRequest {
+    /// Email addresses to invite, one invitation each; 1 to
+    /// [`INVITATION_RECIPIENTS_MAX`], without repeats. An address names whom
+    /// the invitation is for and where it is emailed; it never selects or
+    /// links an existing User.
+    pub recipients: Vec<String>,
     /// Roles the enrolled User receives, each at an explicit scope;
     /// nonempty. Revalidated against the issuer's current authority when
     /// the invitation is accepted.
@@ -311,36 +320,97 @@ pub struct CreatedUser {
     pub username: String,
 }
 
+/// What became of an invitation's most recent link when Wyrd tried to email it.
+///
+/// `accepted` means the SMTP relay accepted the message, not that it reached
+/// an inbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum InvitationDelivery {
+    /// Wyrd did not email it: no SMTP relay is configured. The administrator
+    /// delivers the copied link.
+    NotEmailed,
+    /// The SMTP relay accepted the message.
+    Accepted,
+    /// The SMTP relay refused or could not be reached; resend after recovery.
+    Failed,
+}
+
+impl InvitationDelivery {
+    /// The stored and wire label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotEmailed => "not_emailed",
+            Self::Accepted => "accepted",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// Parse a stored label; `None` for any other text.
+    #[must_use]
+    pub fn parse(label: &str) -> Option<Self> {
+        [Self::NotEmailed, Self::Accepted, Self::Failed]
+            .into_iter()
+            .find(|delivery| delivery.as_str() == label)
+    }
+}
+
 /// Safe metadata of one enrollment invitation; never its code.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct UserInvitationView {
-    /// Invitation id, used to revoke it.
+    /// Invitation id, used to resend or revoke it.
     pub id: Uuid,
     /// The tenant's route key.
     pub tenant: crate::ids::TenantSlug,
+    /// The email address the invitation is for.
+    pub recipient: String,
+    /// What became of its most recent link when Wyrd tried to email it.
+    pub delivery: InvitationDelivery,
     /// Scoped role assignments created at enrollment.
     pub assignments: Vec<crate::auth::ScopedRoleAssignment>,
     /// Creation time.
     pub created_at: chrono::DateTime<chrono::Utc>,
-    /// Absolute expiry, twenty-four hours after creation.
+    /// Absolute expiry, twenty-four hours after the current link was issued.
     pub expires_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// A newly issued invitation and its one-time code, returned once.
+/// A newly issued or resent invitation and its link, returned once.
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct IssuedUserInvitation {
-    /// Invitation metadata.
+    /// Invitation metadata, including what became of emailing this link.
     pub invitation: UserInvitationView,
-    /// The 43-character base64url enrollment code; delivered separately from
-    /// the URL and never recoverable.
+    /// The tenant signup page with the one-time code in its fragment
+    /// (`#invitation=<code>`), so the code reaches no server log or referrer.
+    /// Anyone holding it can enroll once until it expires, is resent or is
+    /// revoked; it is never recoverable.
     #[schemars(with = "String")]
-    pub invitation_code: SecretBearer,
-    /// The fixed tenant signup page; it contains no code.
-    pub signup_url: crate::auth::AbsoluteUrl,
+    pub invitation_link: SecretBearer,
+}
+
+/// Response of `POST /v1/principals/users/invitations`: one entry per
+/// recipient, in request order.
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct IssuedUserInvitations {
+    /// The issued invitations.
+    pub invitations: Vec<IssuedUserInvitation>,
+}
+
+/// Response of `GET /v1/principals/users/invitations`: the tenant's pending
+/// invitations, oldest first, never their codes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct UserInvitationList {
+    /// Unexpired, unrevoked and unconsumed invitations.
+    pub invitations: Vec<UserInvitationView>,
 }
 
 /// Safe metadata of one operator-issued password reset; never its code.

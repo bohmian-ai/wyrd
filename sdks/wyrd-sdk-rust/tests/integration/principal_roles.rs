@@ -315,16 +315,26 @@ async fn administrators_create_and_invite_users() {
 
     let invited = admin
         .invite_user(&CreateUserInvitationRequest {
+            recipients: vec!["ada@example.test".to_owned()],
             assignments: vec![ScopedRoleAssignment::tenant("editor")],
         })
         .await
         .expect("an administrator invites");
-    assert_eq!(invited.invitation_code.expose().len(), 43);
+    let [invited] = invited.invitations.as_slice() else {
+        panic!("one recipient yields one invitation");
+    };
+    assert_eq!(invited.invitation.recipient, "ada@example.test");
     assert_eq!(
         invited.invitation.assignments,
         [ScopedRoleAssignment::tenant("editor")]
     );
-    assert!(invited.signup_url.as_str().ends_with("/signup"));
+    let (page, code) = invited
+        .invitation_link
+        .expose()
+        .split_once("#invitation=")
+        .expect("the code rides in the link fragment");
+    assert!(page.ends_with("/signup"), "{page}");
+    assert_eq!(code.len(), 43);
 
     let workload = Principals::connect_with(&deployment.client(&key))
         .await
@@ -335,6 +345,7 @@ async fn administrators_create_and_invite_users() {
         .expect_err("a workload cannot create Users");
     let invite = workload
         .invite_user(&CreateUserInvitationRequest {
+            recipients: vec!["mallory@example.test".to_owned()],
             assignments: vec![ScopedRoleAssignment::tenant("admin")],
         })
         .await

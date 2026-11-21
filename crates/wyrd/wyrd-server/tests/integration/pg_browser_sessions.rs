@@ -947,7 +947,7 @@ async fn invite(server: &WyrdTestServer, bearer: &str, role: &str) -> BrowserRes
         Method::POST,
         "/v1/principals/users/invitations",
         bearer,
-        Some(json!({ "assignments": [{ "role": role, "scope": "all" }] })),
+        Some(json!({ "recipients": ["invitee@example.test"], "assignments": [{ "role": role, "scope": "all" }] })),
     )
     .await
 }
@@ -971,7 +971,7 @@ async fn enroll(
         "signup",
         json!({
             "tenant": server.pg_fixture().tenant_slug(),
-            "invitation_code": issued.body["invitation_code"],
+            "invitation_code": json!(link_code(&issued.body["invitations"][0])),
             "username": username,
             "password": secret,
         }),
@@ -1022,14 +1022,11 @@ async fn local_signup_login_and_password_lifecycle() {
             .map(axum::http::HeaderValue::as_bytes),
         Some(b"no-store".as_slice())
     );
-    let code = issued.body["invitation_code"]
-        .as_str()
-        .expect("code")
-        .to_owned();
+    let code = link_code(&issued.body["invitations"][0]);
     assert_eq!(code.len(), 43);
     assert_eq!(
-        issued.body["signup_url"],
-        json!(format!("{ORIGIN}/t/{acme}/signup"))
+        issued.body["invitations"][0]["invitation_link"],
+        json!(format!("{ORIGIN}/t/{acme}/signup#invitation={code}"))
     );
     let signup = |username: &str, secret: &str| json!({ "tenant": acme, "invitation_code": code, "username": username, "password": secret });
 
@@ -1343,7 +1340,7 @@ async fn scoped_invitations_enroll_exactly_their_assignments() {
                 Method::POST,
                 "/v1/principals/users/invitations",
                 &bearer,
-                Some(json!({ "assignments": assignments })),
+                Some(json!({ "recipients": ["invitee@example.test"], "assignments": assignments })),
             )
             .await
         }
@@ -1357,7 +1354,7 @@ async fn scoped_invitations_enroll_exactly_their_assignments() {
                 "signup",
                 json!({
                     "tenant": server.pg_fixture().tenant_slug(),
-                    "invitation_code": issued.body["invitation_code"],
+                    "invitation_code": json!(link_code(&issued.body["invitations"][0])),
                     "username": username,
                     "password": strong(7),
                 }),
@@ -1521,7 +1518,7 @@ async fn local_signup_is_tenant_bound_and_rate_limited() {
 
     // An invitation names its own tenant only.
     let issued = invite(&server, &admin, "viewer").await;
-    let code = issued.body["invitation_code"].clone();
+    let code = json!(link_code(&issued.body["invitations"][0]));
     let elsewhere = password(
         &server,
         "signup",
@@ -1550,7 +1547,9 @@ async fn local_signup_is_tenant_bound_and_rate_limited() {
     let revocable = invite(&server, &admin, "viewer").await;
     let revoke_uri = format!(
         "/v1/principals/users/invitations/{}",
-        revocable.body["invitation"]["id"].as_str().expect("id")
+        revocable.body["invitations"][0]["invitation"]["id"]
+            .as_str()
+            .expect("id")
     );
     assert_eq!(
         as_bearer(&server, Method::DELETE, &revoke_uri, &admin, None)
@@ -1564,7 +1563,14 @@ async fn local_signup_is_tenant_bound_and_rate_limited() {
             SET created_at = created_at - interval '25 hours', \
                 expires_at = expires_at - interval '25 hours' WHERE id = $1",
     )
-    .bind(Uuid::parse_str(expiring.body["invitation"]["id"].as_str().expect("id")).expect("uuid"))
+    .bind(
+        Uuid::parse_str(
+            expiring.body["invitations"][0]["invitation"]["id"]
+                .as_str()
+                .expect("id"),
+        )
+        .expect("uuid"),
+    )
     .execute(&pool)
     .await
     .expect("invitation ages");
@@ -1572,7 +1578,7 @@ async fn local_signup_is_tenant_bound_and_rate_limited() {
         let refused = password(
             &server,
             "signup",
-            json!({ "tenant": acme, "invitation_code": dead.body["invitation_code"], "username": "mallory", "password": strong(1) }),
+            json!({ "tenant": acme, "invitation_code": json!(link_code(&dead.body["invitations"][0])), "username": "mallory", "password": strong(1) }),
         )
         .await;
         assert_eq!(refused.status, StatusCode::UNAUTHORIZED, "{}", refused.body);
@@ -1605,14 +1611,14 @@ async fn local_signup_is_tenant_bound_and_rate_limited() {
     let taken = password(
         &server,
         "signup",
-        json!({ "tenant": acme, "invitation_code": fresh.body["invitation_code"], "username": winner, "password": strong(2) }),
+        json!({ "tenant": acme, "invitation_code": json!(link_code(&fresh.body["invitations"][0])), "username": winner, "password": strong(2) }),
     )
     .await;
     assert_eq!(taken.status, StatusCode::BAD_REQUEST, "{}", taken.body);
     let reused = password(
         &server,
         "signup",
-        json!({ "tenant": acme, "invitation_code": fresh.body["invitation_code"], "username": "late", "password": strong(2) }),
+        json!({ "tenant": acme, "invitation_code": json!(link_code(&fresh.body["invitations"][0])), "username": "late", "password": strong(2) }),
     )
     .await;
     assert_eq!(reused.status, StatusCode::CREATED, "{}", reused.body);
@@ -1632,7 +1638,7 @@ async fn local_signup_is_tenant_bound_and_rate_limited() {
         "/v1/principals/users/invitations",
         &acme,
         &viewer,
-        Some(json!({ "assignments": [{ "role": "viewer", "scope": "all" }] })),
+        Some(json!({ "recipients": ["invitee@example.test"], "assignments": [{ "role": "viewer", "scope": "all" }] })),
     )
     .await;
     assert_eq!(
@@ -2110,4 +2116,205 @@ async fn user_keys_preserve_owner_scope_and_credential_lifecycle() {
     let refused = as_bearer(&server, Method::POST, &account_keys, &admin, None).await;
     assert_eq!(refused.status, StatusCode::CONFLICT, "{}", refused.body);
     assert_eq!(refused.body["code"], "WYRD_SPEC_409_CONFLICT");
+}
+
+/// The one-time code a returned invitation link carries in its fragment.
+///
+/// # Panics
+/// Panics when `issued` holds no invitation link.
+fn link_code(issued: &Value) -> String {
+    let link = issued["invitation_link"].as_str().expect("invitation link");
+    link.split_once("#invitation=")
+        .map(|(_, code)| code.to_owned())
+        .expect("the code rides in the link fragment")
+}
+
+/// Without SMTP, a tenant administrator pastes a team's addresses and gets one
+/// copyable single-use link per person, marked as not emailed. Pending
+/// invitations list their recipients without codes; resend replaces a link and
+/// voids the old one; revoke voids one; storage keeps only code verifiers.
+///
+/// # Panics
+/// Panics when the server fails to start or any expectation fails.
+#[tokio::test(flavor = "current_thread")]
+async fn an_administrator_invites_a_team_by_copied_links() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let acme = server.pg_fixture().tenant_slug().to_owned();
+    let admin = admin_bearer(&server, server.data_tenant_id()).await;
+    let pool = server
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    let team: Vec<String> = (0..10).map(|n| format!("person{n}@example.test")).collect();
+    let viewer = json!([{ "role": "viewer", "scope": "all" }]);
+
+    let issued = as_bearer(
+        &server,
+        Method::POST,
+        "/v1/principals/users/invitations",
+        &admin,
+        Some(json!({ "recipients": team, "assignments": viewer })),
+    )
+    .await;
+    assert_eq!(issued.status, StatusCode::CREATED, "{}", issued.body);
+    assert_no_store(&issued);
+    let entries = issued.body["invitations"]
+        .as_array()
+        .expect("one entry per recipient");
+    assert_eq!(entries.len(), 10);
+    let mut codes = BTreeSet::new();
+    for (entry, recipient) in entries.iter().zip(&team) {
+        assert_eq!(entry["invitation"]["recipient"], json!(recipient));
+        assert_eq!(entry["invitation"]["assignments"], viewer);
+        assert_eq!(entry["invitation"]["delivery"], json!("not_emailed"));
+        let link = entry["invitation_link"].as_str().expect("link");
+        assert!(
+            link.starts_with(&format!("{ORIGIN}/t/{acme}/signup#invitation=")),
+            "{link}"
+        );
+        assert!(codes.insert(link_code(entry)));
+    }
+
+    // Pending invitations show whom and what, never a code.
+    let listed = as_bearer(
+        &server,
+        Method::GET,
+        "/v1/principals/users/invitations",
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(listed.status, StatusCode::OK, "{}", listed.body);
+    assert_eq!(
+        listed.body["invitations"].as_array().expect("list").len(),
+        10
+    );
+    assert_eq!(listed.body["invitations"][0]["recipient"], json!(team[0]));
+    assert!(
+        codes
+            .iter()
+            .all(|code| !listed.body.to_string().contains(code.as_str()))
+    );
+    let stored: Vec<String> =
+        sqlx::query_scalar("SELECT row_to_json(i)::text FROM wyrd.auth_user_invitations i")
+            .fetch_all(&pool)
+            .await
+            .expect("invitations read");
+    assert!(
+        codes
+            .iter()
+            .all(|code| stored.iter().all(|row| !row.contains(code.as_str())))
+    );
+
+    // A copied link enrolls its holder once.
+    let signup = |code: &str, username: &str| json!({ "tenant": acme, "invitation_code": code, "username": username, "password": strong(3) });
+    let first = link_code(&entries[0]);
+    let enrolled = password(&server, "signup", signup(&first, "person0")).await;
+    assert_eq!(enrolled.status, StatusCode::CREATED, "{}", enrolled.body);
+    let replayed = password(&server, "signup", signup(&first, "again")).await;
+    assert_eq!(
+        replayed.status,
+        StatusCode::UNAUTHORIZED,
+        "{}",
+        replayed.body
+    );
+
+    // Resend replaces the link; the old one no longer enrolls.
+    let second = entries[1]["invitation"]["id"].as_str().expect("id");
+    let resent = as_bearer(
+        &server,
+        Method::POST,
+        &format!("/v1/principals/users/invitations/{second}/resend"),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resent.status, StatusCode::OK, "{}", resent.body);
+    assert_no_store(&resent);
+    assert_eq!(resent.body["invitation"]["recipient"], json!(team[1]));
+    assert_eq!(resent.body["invitation"]["delivery"], json!("not_emailed"));
+    let fresh = link_code(&resent.body);
+    assert_ne!(fresh, link_code(&entries[1]));
+    let stale = password(&server, "signup", signup(&link_code(&entries[1]), "stale")).await;
+    assert_eq!(stale.status, StatusCode::UNAUTHORIZED, "{}", stale.body);
+    let renewed = password(&server, "signup", signup(&fresh, "person1")).await;
+    assert_eq!(renewed.status, StatusCode::CREATED, "{}", renewed.body);
+
+    // Revoke voids a link; consumed and revoked invitations leave the list.
+    let third = entries[2]["invitation"]["id"].as_str().expect("id");
+    let revoked = as_bearer(
+        &server,
+        Method::DELETE,
+        &format!("/v1/principals/users/invitations/{third}"),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(revoked.status, StatusCode::NO_CONTENT);
+    let voided = password(&server, "signup", signup(&link_code(&entries[2]), "voided")).await;
+    assert_eq!(voided.status, StatusCode::UNAUTHORIZED, "{}", voided.body);
+    let remaining = as_bearer(
+        &server,
+        Method::GET,
+        "/v1/principals/users/invitations",
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(
+        remaining.body["invitations"]
+            .as_array()
+            .expect("list")
+            .len(),
+        7
+    );
+    let gone = as_bearer(
+        &server,
+        Method::POST,
+        &format!("/v1/principals/users/invitations/{third}/resend"),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(gone.status, StatusCode::NOT_FOUND, "{}", gone.body);
+
+    // Recipient lists are validated as a whole before anything is issued.
+    for recipients in [
+        json!([]),
+        json!(["not-an-address"]),
+        json!(["same@example.test", "same@example.test"]),
+    ] {
+        let refused = as_bearer(
+            &server,
+            Method::POST,
+            "/v1/principals/users/invitations",
+            &admin,
+            Some(json!({ "recipients": recipients, "assignments": viewer })),
+        )
+        .await;
+        assert_eq!(
+            refused.status,
+            StatusCode::BAD_REQUEST,
+            "{recipients}: {}",
+            refused.body
+        );
+        assert_eq!(refused.body["code"], json!("WYRD_SPEC_400_VALIDATION"));
+    }
+    assert_eq!(
+        as_bearer(
+            &server,
+            Method::GET,
+            "/v1/principals/users/invitations",
+            &admin,
+            None
+        )
+        .await
+        .body["invitations"]
+            .as_array()
+            .expect("list")
+            .len(),
+        7
+    );
 }

@@ -579,6 +579,10 @@ async fn principal_user_cli_journey() {
                 "principal".to_owned(),
                 "user".to_owned(),
                 "invite".to_owned(),
+                "--recipient".to_owned(),
+                "ada@example.test".to_owned(),
+                "--recipient".to_owned(),
+                "grace@example.test".to_owned(),
                 "--grant".to_owned(),
                 "editor:all".to_owned(),
                 "--server".to_owned(),
@@ -594,12 +598,19 @@ async fn principal_user_cli_journey() {
         "{}",
         String::from_utf8_lossy(&invited.stderr)
     );
-    let code = stdout
+    let links: Vec<&str> = stdout
         .lines()
-        .find_map(|line| line.strip_prefix("invitation_code: "))
-        .expect("the code is printed");
-    assert_eq!(code.len(), 43);
-    assert!(stdout.contains("/signup"), "{stdout}");
+        .filter_map(|line| line.strip_prefix("invitation_link: "))
+        .collect();
+    assert_eq!(links.len(), 2, "one link per recipient: {stdout}");
+    assert!(links[0] != links[1], "{stdout}");
+    for link in links {
+        let (page, code) = link.split_once("#invitation=").expect("code in fragment");
+        assert!(page.ends_with("/signup"), "{link}");
+        assert_eq!(code.len(), 43);
+    }
+    assert!(stdout.contains("recipient: grace@example.test"), "{stdout}");
+    assert!(stdout.contains("delivery: not_emailed"), "{stdout}");
 
     for refused in [
         create(viewer_token.clone())

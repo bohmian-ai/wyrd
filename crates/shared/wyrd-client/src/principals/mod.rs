@@ -22,11 +22,12 @@ pub use wyrd_spec::auth::{
     CreateRoleBindingRequest, CreateServicePrincipalRequest, CreateServicePrincipalResponse,
     CreateUserInvitationRequest, CreateUserRequest, CreatedUser, CredentialListQuery,
     CredentialListResponse, CredentialMetadata, CurrentUserProfile, GrantSource, GroupList,
-    GroupMember, GroupView, IssuedCredential, IssuedUserInvitation, Operation, PermissionScope,
-    PrincipalId, PrincipalKindTag, PrincipalPage, PrincipalQuery, PrincipalStatus,
-    PrincipalSummary, PutRoleRequest, RevokePrincipalRequest, RoleBindingList, RoleBindingQuery,
-    RoleBindingView, RoleList, RoleSource, RoleView, ScopedRoleAssignment, SecretBearer,
-    WorkloadFamily, WorkloadKind, WorkloadRestriction,
+    GroupMember, GroupView, InvitationDelivery, IssuedCredential, IssuedUserInvitation,
+    IssuedUserInvitations, Operation, PermissionScope, PrincipalId, PrincipalKindTag,
+    PrincipalPage, PrincipalQuery, PrincipalStatus, PrincipalSummary, PutRoleRequest,
+    RevokePrincipalRequest, RoleBindingList, RoleBindingQuery, RoleBindingView, RoleList,
+    RoleSource, RoleView, ScopedRoleAssignment, SecretBearer, WorkloadFamily, WorkloadKind,
+    WorkloadRestriction,
 };
 pub use wyrd_spec::error::WyrdError;
 pub use wyrd_spec::ids::{AccessGroupId, RoleBindingId};

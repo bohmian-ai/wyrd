@@ -28,8 +28,8 @@ use unicode_normalization::UnicodeNormalization as _;
 use uuid::Uuid;
 use wyrd_runtime::Permission;
 use wyrd_spec::auth::{
-    BrowserCredential, PasswordChangeRequest, PasswordLoginRequest, PasswordResetRequest,
-    PasswordSignupRequest, ScopedRoleAssignment, SecretBearer, Sha256Hex,
+    BrowserCredential, INVITATION_RECIPIENTS_MAX, PasswordChangeRequest, PasswordLoginRequest,
+    PasswordResetRequest, PasswordSignupRequest, ScopedRoleAssignment, SecretBearer, Sha256Hex,
 };
 use wyrd_spec::error::WyrdError;
 use wyrd_sql::TenantConn;
@@ -37,7 +37,7 @@ use wyrd_sql::queries::auth::{
     AttemptScope, BrowserSessionAuthority, InvitationRow, PasswordResetRow, SubjectColumns,
     attempt_refusal, consume_invitation, consume_password_reset, insert_invitation,
     insert_local_user, insert_password_reset, local_credential_by_username,
-    local_credential_for_update, record_attempt_failure, set_password_hash,
+    local_credential_for_update, record_attempt_failure, reissue_invitation, set_password_hash,
 };
 
 use crate::browser_sessions::{
@@ -376,34 +376,106 @@ fn user_subject(id: Uuid) -> SubjectColumns {
     }
 }
 
-/// Record a one-use enrollment invitation for the scoped `assignments`,
-/// issued by `issuer`, on `conn`; returns it with its code, shown once.
+/// The trimmed invitation `recipients`, refused as a whole unless there are 1
+/// to [`INVITATION_RECIPIENTS_MAX`] distinct plausible email addresses.
 ///
-/// Every assignment is validated as enrollment will bind it, and enrollment
-/// revalidates them against current roles and the issuer's current
-/// authority. The caller has authorized the issuer and commits.
+/// An address only names whom an invitation is for and where it is emailed,
+/// so the check is a shape check: one `@` between a nonempty local part and a
+/// dotted domain, at most 254 characters, with no whitespace, control
+/// characters or SMTP-header punctuation. Repeats compare case-insensitively.
+///
+/// # Errors
+/// Returns [`WyrdError::Validation`] naming the first unusable entry.
+pub fn invitation_recipients(recipients: &[String]) -> Result<Vec<String>, WyrdError> {
+    let refuse = |message: String| WyrdError::Validation {
+        message,
+        details: json!({ "field": "recipients" }),
+    };
+    if recipients.is_empty() || recipients.len() > INVITATION_RECIPIENTS_MAX {
+        return Err(refuse(format!(
+            "invite 1 to {INVITATION_RECIPIENTS_MAX} recipients per request"
+        )));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    recipients
+        .iter()
+        .map(|raw| {
+            let address = raw.trim();
+            let plausible = address.len() <= 254
+                && address.split_once('@').is_some_and(|(local, domain)| {
+                    !local.is_empty()
+                        && !domain.contains('@')
+                        && domain.split('.').count() > 1
+                        && domain.split('.').all(|label| !label.is_empty())
+                })
+                && !address
+                    .chars()
+                    .any(|c| c.is_whitespace() || c.is_control() || "<>,;:\\\"()[]".contains(c));
+            if !plausible {
+                return Err(refuse(format!("{address:?} is not an email address")));
+            }
+            if !seen.insert(address.to_ascii_lowercase()) {
+                return Err(refuse(format!("{address:?} is listed more than once")));
+            }
+            Ok(address.to_owned())
+        })
+        .collect()
+}
+
+/// Record one one-use enrollment invitation per recipient for the scoped
+/// `assignments`, issued by `issuer`, on `conn`; returns each with its code,
+/// shown once, in recipient order.
+///
+/// Recipients come from [`invitation_recipients`]. Every assignment is
+/// validated as enrollment will bind it, and enrollment revalidates them
+/// against current roles and the issuer's current authority. The caller has
+/// authorized the issuer and commits.
 ///
 /// # Errors
 /// Returns [`WyrdError::Validation`] for an empty list or a missing,
 /// invalid or inapplicable assignment, and
 /// [`WyrdError::AuthVerifyUnavailable`] when the store fails.
-pub async fn issue_invitation(
+pub async fn issue_invitations(
     conn: &mut TenantConn<'_>,
     issuer: Uuid,
+    recipients: &[String],
     assignments: &[ScopedRoleAssignment],
-) -> Result<(InvitationRow, SecretBearer), WyrdError> {
+) -> Result<Vec<(InvitationRow, SecretBearer)>, WyrdError> {
     validate_assignments(conn, assignments).await?;
+    let mut issued = Vec::with_capacity(recipients.len());
+    for recipient in recipients {
+        let code = SecretBearer::new(random_secret());
+        let row = insert_invitation(
+            conn,
+            Uuid::now_v7(),
+            &Sha256Hex::digest(code.expose().as_bytes()),
+            issuer,
+            recipient,
+            assignments,
+        )
+        .await
+        .map_err(store_error)?;
+        issued.push((row, code));
+    }
+    Ok(issued)
+}
+
+/// Replace the code of the pending invitation `id` on `conn`, voiding its
+/// previous link; returns it with the new code, shown once. `None` when it
+/// was consumed, revoked, purged or never existed. The caller has authorized
+/// the issuer and commits.
+///
+/// # Errors
+/// Returns [`WyrdError::AuthVerifyUnavailable`] when the store fails.
+pub async fn reissue(
+    conn: &mut TenantConn<'_>,
+    id: Uuid,
+) -> Result<Option<(InvitationRow, SecretBearer)>, WyrdError> {
     let code = SecretBearer::new(random_secret());
-    let row = insert_invitation(
-        conn,
-        Uuid::now_v7(),
-        &Sha256Hex::digest(code.expose().as_bytes()),
-        issuer,
-        assignments,
-    )
-    .await
-    .map_err(store_error)?;
-    Ok((row, code))
+    let row = reissue_invitation(conn, id, &Sha256Hex::digest(code.expose().as_bytes()))
+        .await
+        .map_err(store_error)?;
+    Ok(row.map(|row| (row, code)))
 }
 
 /// Record a one-use password reset for the local User `user_id`, issued by
@@ -779,8 +851,46 @@ mod tests {
 
     use super::{
         KDF, KDF_PERMITS, PasswordCheck, bounded, canonical_username, capacity, check_password,
-        hash_password, new_password,
+        hash_password, invitation_recipients, new_password,
     };
+
+    /// Recipient lists are trimmed and refused as a whole for an empty or
+    /// oversized list, a repeat in any case, or an entry that cannot be an
+    /// email address or would break an SMTP header.
+    ///
+    /// # Panics
+    /// Panics when a list is accepted or refused wrongly.
+    #[test]
+    fn invitation_recipients_are_distinct_addresses() {
+        let list = |items: &[&str]| items.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            invitation_recipients(&list(&[" ada@example.test ", "b.c+d@mail.example.org"]))
+                .expect("valid"),
+            list(&["ada@example.test", "b.c+d@mail.example.org"])
+        );
+        let too_many: Vec<String> = (0..=100).map(|n| format!("p{n}@example.test")).collect();
+        for refused in [
+            list(&[]),
+            too_many,
+            list(&["ada@example.test", "ADA@example.test"]),
+            list(&["no-at-sign"]),
+            list(&["@example.test"]),
+            list(&["ada@localhost"]),
+            list(&["ada@example..test"]),
+            list(&["a@b@example.test"]),
+            list(&["ada lovelace@example.test"]),
+            list(&["ada@example.test\r\nBcc: x@example.test"]),
+            list(&["Ada <ada@example.test>"]),
+        ] {
+            assert!(
+                matches!(
+                    invitation_recipients(&refused),
+                    Err(WyrdError::Validation { .. })
+                ),
+                "{refused:?}"
+            );
+        }
+    }
 
     /// Cancelling the callers of running derivations keeps their capacity held
     /// until the derivations themselves finish.

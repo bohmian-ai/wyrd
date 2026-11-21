@@ -26,23 +26,25 @@ use uuid::Uuid;
 use wyrd_auth::browser_sessions::permission_names;
 use wyrd_auth::issue_api_key::WyrdApiKey;
 use wyrd_auth::passwords::{
-    canonical_username, create_local_user, hash_password, issue_invitation, issue_password_reset,
-    new_password,
+    canonical_username, create_local_user, hash_password, invitation_recipients, issue_invitations,
+    issue_password_reset, new_password, reissue,
 };
 use wyrd_runtime::{Permission, PrincipalKind};
 use wyrd_spec::auth::{
     AbsoluteUrl, AccountAuthentication, CREDENTIAL_CURSOR_MAX_BYTES, CREDENTIAL_PAGE_DEFAULT,
     CREDENTIAL_PAGE_MAX, CreateUserCredentialRequest, CreateUserInvitationRequest,
     CreateUserRequest, CreatedUser, CredentialListQuery, CredentialListResponse,
-    CurrentUserProfile, IssuedCredential, IssuedUserInvitation, IssuedUserPasswordReset,
-    PrincipalId, PrincipalKindTag, SecretBearer, USER_CREDENTIAL_MAX_LIFETIME_SECONDS,
-    USER_CREDENTIAL_NAME_MAX_CHARS, UserInvitationView, UserPasswordResetView,
+    CurrentUserProfile, IssuedCredential, IssuedUserInvitation, IssuedUserInvitations,
+    IssuedUserPasswordReset, PrincipalId, PrincipalKindTag, SecretBearer,
+    USER_CREDENTIAL_MAX_LIFETIME_SECONDS, USER_CREDENTIAL_NAME_MAX_CHARS, UserInvitationList,
+    UserInvitationView, UserPasswordResetView,
 };
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::ids::TenantSlug;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
-    insert_user_api_key, local_username, page_api_key_metadata, revoke_invitation,
+    insert_user_api_key, local_username, page_api_key_metadata, pending_invitations,
+    revoke_invitation,
 };
 
 use crate::audit;
@@ -427,21 +429,56 @@ pub(crate) async fn create_user(
     ))
 }
 
-/// Issue a one-use, twenty-four-hour local enrollment invitation.
+/// The metadata of `row` in `tenant`.
+fn invitation_view(
+    row: wyrd_sql::queries::auth::InvitationRow,
+    tenant: &TenantSlug,
+) -> UserInvitationView {
+    UserInvitationView {
+        id: row.id,
+        tenant: tenant.clone(),
+        delivery: row.delivery(),
+        recipient: row.recipient,
+        assignments: row.assignments.0,
+        created_at: row.created_at,
+        expires_at: row.expires_at,
+    }
+}
+
+/// `row` with its link: the tenant signup page carrying `code` in the fragment.
+///
+/// # Errors
+/// Returns `WYRD_SPEC_500_INTERNAL` when the trusted origin cannot form a URL.
+fn issued_invitation(
+    origin: &url::Url,
+    tenant: &TenantSlug,
+    row: wyrd_sql::queries::auth::InvitationRow,
+    code: &SecretBearer,
+) -> Result<IssuedUserInvitation, WyrdError> {
+    let mut link =
+        url::Url::parse(tenant_page(origin, tenant, "signup")?.as_str()).map_err(internal)?;
+    link.set_fragment(Some(&format!("invitation={}", code.expose())));
+    Ok(IssuedUserInvitation {
+        invitation: invitation_view(row, tenant),
+        invitation_link: SecretBearer::new(link.to_string()),
+    })
+}
+
+/// Issue one one-use, twenty-four-hour enrollment link per recipient.
 ///
 /// # Errors
 /// Returns a stable Wyrd error when the caller lacks User management and
-/// tenant administration, the Role names are empty, repeated or unknown, or
-/// a write fails.
+/// tenant administration, a recipient or assignment is unusable, or a write
+/// fails; then no invitation is issued.
 #[utoipa::path(
     post,
     path = "/principals/users/invitations",
     request_body = CreateUserInvitationRequest,
     responses(
-        (status = 201, description = "Invitation issued; its code is returned once",
-          body = IssuedUserInvitation),
-        (status = 400, description = "The Role names are empty, repeated or unknown \
-          (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 201, description = "One invitation per recipient; each link is returned once",
+          body = IssuedUserInvitations),
+        (status = 400, description = "A recipient is unusable or repeated, or an assignment is \
+          empty, repeated or unknown (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable credential \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
           WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
@@ -461,29 +498,114 @@ pub(crate) async fn create_user_invitation(
 ) -> Result<Response, WyrdErrorResponse> {
     let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
     authorize_user_admin(&state, &caller, "auth.user.invite", "users")?;
+    let recipients = invitation_recipients(&request.recipients)?;
     let tenant = tenant_slug(&state, &caller).await?;
     let mut conn = tenant_conn(&state, &caller).await?;
-    let (row, code) = issue_invitation(
+    let rows = issue_invitations(
         &mut conn,
         caller.principal.id.as_uuid(),
+        &recipients,
         &request.assignments,
     )
     .await?;
     conn.commit().await.map_err(internal)?;
-    let issued = IssuedUserInvitation {
-        signup_url: tenant_page(&origin, &tenant, "signup")?,
-        invitation: UserInvitationView {
-            id: row.id,
-            tenant,
-            assignments: row.assignments.0,
-            created_at: row.created_at,
-            expires_at: row.expires_at,
-        },
-        invitation_code: code,
-    };
+    let invitations = rows
+        .into_iter()
+        .map(|(row, code)| issued_invitation(&origin, &tenant, row, &code))
+        .collect::<Result<_, _>>()?;
     Ok(crate::auth::oauth::no_store(
         StatusCode::CREATED,
-        Json(issued),
+        Json(IssuedUserInvitations { invitations }),
+    ))
+}
+
+/// List the tenant's pending enrollment invitations, never their codes.
+///
+/// # Errors
+/// Returns a stable Wyrd error when the caller lacks User management and
+/// tenant administration or the read fails.
+#[utoipa::path(
+    get,
+    path = "/principals/users/invitations",
+    responses(
+        (status = 200, description = "Unexpired, unrevoked and unconsumed invitations, oldest first",
+          body = UserInvitationList),
+        (status = 403, description = "User management and tenant administration required \
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 500, description = "A tenant store read failed \
+          (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
+    ),
+    tag = "Principals"
+)]
+#[tracing::instrument(level = "info", skip(state, caller))]
+pub(crate) async fn list_user_invitations(
+    State(state): State<AppState>,
+    caller: Caller,
+) -> Result<Json<UserInvitationList>, WyrdErrorResponse> {
+    authorize_user_admin(&state, &caller, "auth.user.invite.list", "users")?;
+    let tenant = tenant_slug(&state, &caller).await?;
+    let mut conn = tenant_conn(&state, &caller).await?;
+    let rows = pending_invitations(&mut conn).await.map_err(internal)?;
+    conn.commit().await.map_err(internal)?;
+    Ok(Json(UserInvitationList {
+        invitations: rows
+            .into_iter()
+            .map(|row| invitation_view(row, &tenant))
+            .collect(),
+    }))
+}
+
+/// Replace a pending invitation's link, voiding the previous one, and return
+/// the new link once.
+///
+/// # Errors
+/// Returns a stable Wyrd error when the caller lacks User management and
+/// tenant administration, no unconsumed, unrevoked invitation has the id, or
+/// a write fails.
+#[utoipa::path(
+    post,
+    path = "/principals/users/invitations/{invitation_id}/resend",
+    params(("invitation_id" = Uuid, Path, description = "Invitation to resend")),
+    responses(
+        (status = 200, description = "The invitation's new link, returned once", body = IssuedUserInvitation),
+        (status = 400, description = "The id is not a UUID (WYRD_SPEC_400_VALIDATION)",
+          body = WyrdProblem),
+        (status = 403, description = "User management and tenant administration required \
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 404, description = "No unconsumed, unrevoked invitation has this id \
+          (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem),
+        (status = 500, description = "A tenant store write failed \
+          (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
+    ),
+    tag = "Principals"
+)]
+#[tracing::instrument(level = "info", skip(state, caller))]
+pub(crate) async fn resend_user_invitation(
+    State(state): State<AppState>,
+    caller: Caller,
+    RequestOrigin(origin): RequestOrigin,
+    id: Result<Path<Uuid>, PathRejection>,
+) -> Result<Response, WyrdErrorResponse> {
+    let Path(id) = id.map_err(|rejection| path_rejection(&rejection))?;
+    authorize_user_admin(
+        &state,
+        &caller,
+        "auth.user.invite.resend",
+        &format!("invitation:{id}"),
+    )?;
+    let tenant = tenant_slug(&state, &caller).await?;
+    let mut conn = tenant_conn(&state, &caller).await?;
+    let reissued = reissue(&mut conn, id).await?;
+    conn.commit().await.map_err(internal)?;
+    let Some((row, code)) = reissued else {
+        return Err(WyrdErrorResponse::from(WyrdError::NotFound {
+            message: "no unconsumed, unrevoked invitation has this id".to_owned(),
+            details: serde_json::json!({}),
+        }));
+    };
+    Ok(crate::auth::oauth::no_store(
+        StatusCode::OK,
+        Json(issued_invitation(&origin, &tenant, row, &code)?),
     ))
 }
 

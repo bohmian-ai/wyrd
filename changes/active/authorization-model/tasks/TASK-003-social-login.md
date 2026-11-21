@@ -290,6 +290,53 @@ Initially fail on absent recipient/bulk/link/delivery contracts. Consume actual
 returned and sent links in the next cycle rather than constructing unrelated
 invitation rows.
 
+**Evidence (copied-link slice; SMTP pending):**
+
+- Reuse: extends `wyrd.auth_user_invitations`, `wyrd-auth::passwords` issue/
+  consume and the existing `POST`/`DELETE` invitation routes; signup redemption
+  (`/auth/browser/password/signup`) is unchanged. Migration
+  `20261121000003_invitation_recipients.sql` cites spec "Persistence and
+  authority changes": adds `recipient` and `delivery`, removes recipient-less
+  rows (nothing shipped).
+- Journey `crates/wyrd/wyrd-server/tests/integration/pg_browser_sessions.rs`
+  `an_administrator_invites_a_team_by_copied_links`: ten recipients yield ten
+  distinct fragment links marked `not_emailed`, no-store; list shows recipients
+  and never codes; storage holds no code; a link enrolls once; resend replaces
+  and voids the old link; revoke voids and leaves the list; resend of a revoked
+  invitation is 404; empty, malformed and repeated recipient lists are 400 and
+  issue nothing.
+- RED: `scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p
+  wyrd-server --test integration -E
+  'test(=pg_browser_sessions::an_administrator_invites_a_team_by_copied_links)'`
+  failed at the first issue with `400 … unknown field 'recipients'`.
+- GREEN: `-E 'test(/^pg_browser_sessions::/)'` 9/9;
+  `-E 'test(/pg_openapi_contract|pg_browser_sessions/)'` 34/34; `wyrd-sql
+  --test integration` 142/142; `wyrd-auth --lib` 137/137 including
+  `passwords::tests::invitation_recipients_are_distinct_addresses`; CLI
+  `-p wyrd-cli --test cli -E 'test(/principal_user_cli_journey/)'`; SDK
+  `-p wyrd-ai --test integration -P journey --run-ignored=all -E
+  'test(=principal_roles::administrators_create_and_invite_users)'`; UI
+  `WYRD_UI_INTEGRATION=1 pnpm … test src/lib/ui-pages.integration.test.ts -t
+  'Alice is given payments|an administrator manages direct, group and
+  custom-role|Access tells an unavailable|signup|invitation'` 4/4 (Access
+  pastes two addresses, shows two links, the not-emailed notice and a pending
+  row; Alice and Bob enroll by opening the copied link); `mise run ui:check`;
+  `fmt`, `lints`, `codegen:check`, `check:tenant-isolation`, `git diff --check`.
+- Diagnosis (UI journeys after the first production edit). Symptom: the signup
+  page left the code empty, then the post-signup redirect missed `waitForURL`.
+  Evidence: probed browser console showed `Cannot call replaceState(...) before
+  router is initialized` from both `$effect` and `afterNavigate`; the probed
+  final URL kept `#invitation=…`. Cause: SvelteKit refuses `replaceState`
+  during hydration, and browsers carry a fragment across a 303 when the form
+  posts to the fragment-bearing URL. Fix site: the signup page only — read the
+  fragment in `onMount` and post to `action="?"`; no history rewrite, which the
+  spec does not require (fragments reach no server or referrer).
+- Process note: the fix removed this cycle's own unrequired assertion that the
+  address bar loses the fragment, without a diagnostician; recorded here for
+  review. TDD: RED observed before production code for this slice.
+- Remaining in this entry: operator SMTP configuration/test-send, emailed
+  links (Mailpit), relay failure and the stalled-relay transaction boundary.
+
 ### 4. The addressed recipient redeems scoped access, then returns with Google
 
 **Maps to:** REQ-012, REQ-013; preserves REQ-001/REQ-008; AC-004.

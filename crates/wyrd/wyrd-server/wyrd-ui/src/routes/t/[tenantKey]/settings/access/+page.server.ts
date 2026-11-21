@@ -7,6 +7,17 @@ import { problem, safeProblem, upstreamProblem } from '$lib/server/problem';
 import type { Actions, PageServerLoad, RequestEvent } from './$types';
 
 type Scope = CardTypes.PermissionScope;
+type Invitation = { id: string; recipient: string; delivery: 'not_emailed' | 'accepted' | 'failed'; assignments: CardTypes.ScopedRoleAssignment[]; expires_at: string };
+type IssuedInvitation = { invitation: Invitation; invitation_link: string };
+
+/** The page's view of issued links: shown in this result only. */
+const links = (issued: IssuedInvitation[]) =>
+  issued.map(({ invitation, invitation_link }) => ({
+    recipient: invitation.recipient,
+    link: invitation_link,
+    delivery: invitation.delivery,
+    expiresAt: invitation.expires_at
+  }));
 
 /** Call `/v1` as the signed-in principal; a non-2xx answer becomes its safe problem. */
 async function call(session: BrowserSession, method: string, path: string, body?: unknown): Promise<Response> {
@@ -31,15 +42,16 @@ export const load: PageServerLoad = async ({ locals, url }) => {
   const after = url.searchParams.get('after');
   const account = url.searchParams.get('account');
   try {
-    const [principals, roles, groups, bindings, selected] = await Promise.all([
+    const [principals, roles, groups, bindings, selected, invitations] = await Promise.all([
       read<CardTypes.PrincipalPage>(session, `/principals?limit=100${after ? `&after=${id(after)}` : ''}`),
       read<{ roles: CardTypes.RoleView[] }>(session, '/access/roles'),
       read<{ groups: CardTypes.GroupView[] }>(session, '/access/groups'),
       read<{ bindings: CardTypes.RoleBindingView[] }>(session, '/access/bindings'),
-      account ? read<CardTypes.AccessSummary>(session, `/principals/${id(account)}/access`) : null
+      account ? read<CardTypes.AccessSummary>(session, `/principals/${id(account)}/access`) : null,
+      read<{ invitations: Invitation[] }>(session, '/principals/users/invitations')
     ]);
     const keys = selected?.kind === 'service' ? await read<CredentialList>(session, `/principals/${id(selected.principal_id)}/credentials?limit=50`) : null;
-    return { access: { ...principals, roles: roles.roles, groups: groups.groups, bindings: bindings.bindings, selected, keys }, problem: null };
+    return { access: { ...principals, roles: roles.roles, groups: groups.groups, bindings: bindings.bindings, selected, keys, invitations: invitations.invitations }, problem: null };
   } catch (cause) {
     if (!isHttpError(cause)) throw cause;
     return { access: null, problem: safeProblem(cause) };
@@ -106,14 +118,32 @@ function operations(form: FormData) {
 }
 
 export const actions: Actions = {
-  /** Issue one invitation carrying one explicit role-and-scope assignment; the code is shown in this result only. */
+  /**
+   * Issue one invitation per pasted address, each carrying the same explicit
+   * role-and-scope assignment. Addresses may be separated by lines, spaces,
+   * commas or semicolons; the server validates them. Links are shown in this
+   * result only.
+   */
   invite: (event) =>
     act(event, async (form, session) => {
+      const recipients = field(form, 'recipients', 32768).split(/[\s,;]+/).filter(Boolean);
       const response = await call(session, 'POST', '/principals/users/invitations', {
+        recipients,
         assignments: [{ role: field(form, 'role', 64), scope: scope(form) }]
       });
-      const issued = (await response.json()) as { invitation_code: string; signup_url: string; invitation: { expires_at: string } };
-      return { invitation: { code: issued.invitation_code, url: issued.signup_url, expiresAt: issued.invitation.expires_at } };
+      const issued = (await response.json()) as { invitations: IssuedInvitation[] };
+      return { invitations: links(issued.invitations) };
+    }),
+  /** Replace a pending invitation's link; the old link stops working and the new one is shown in this result only. */
+  resendInvitation: (event) =>
+    act(event, async (form, session) => {
+      const response = await call(session, 'POST', `/principals/users/invitations/${id(field(form, 'invitationId', 64))}/resend`);
+      return { invitations: links([(await response.json()) as IssuedInvitation]) };
+    }),
+  revokeInvitation: (event) =>
+    act(event, async (form, session) => {
+      await call(session, 'DELETE', `/principals/users/invitations/${id(field(form, 'invitationId', 64))}`);
+      return { done: 'Invitation revoked. Its link no longer works.' };
     }),
   /**
    * Create a Service account. A runtime family names a Service Card family,

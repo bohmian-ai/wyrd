@@ -34,9 +34,12 @@ pub struct CreateUserArgs {
     pub endpoint: TenantEndpoint,
 }
 
-/// The invitation to issue.
+/// The invitations to issue.
 #[derive(Debug, Args)]
 pub struct InviteArgs {
+    /// Email address to invite; repeat for several. Each gets its own link.
+    #[arg(long = "recipient", value_name = "EMAIL", required = true)]
+    pub recipients: Vec<String>,
     /// `ROLE:SCOPE` the enrolled User receives, such as
     /// `viewer:Repository/payments`; repeat for several.
     #[arg(long = "grant", value_name = "ROLE:SCOPE", required = true, value_parser = crate::principal::access::parse_assignment)]
@@ -85,7 +88,8 @@ async fn create(args: CreateUserArgs) -> Result<ExitCode, WyrdCliError> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Issue the invitation and print its code, which is shown only once.
+/// Issue one invitation per recipient and print each link, which is shown
+/// only once.
 ///
 /// # Errors
 /// Returns the errors documented on [`dispatch`].
@@ -93,14 +97,18 @@ async fn invite(args: InviteArgs) -> Result<ExitCode, WyrdCliError> {
     let issued = crate::client::principals(args.endpoint.server.as_str())
         .await?
         .invite_user(&CreateUserInvitationRequest {
+            recipients: args.recipients,
             assignments: args.grants,
         })
         .await
         .map_err(|source| WyrdCliError::Server { source })?;
-    println!("invitation_id: {}", issued.invitation.id);
-    println!("invitation_code: {}", issued.invitation_code.expose());
-    println!("signup_url: {}", issued.signup_url);
-    println!("expires_at: {}", issued.invitation.expires_at.to_rfc3339());
-    println!("This is the only time the invitation code is shown. Deliver it separately.");
+    for issued in &issued.invitations {
+        println!("recipient: {}", issued.invitation.recipient);
+        println!("invitation_id: {}", issued.invitation.id);
+        println!("invitation_link: {}", issued.invitation_link.expose());
+        println!("delivery: {}", issued.invitation.delivery.as_str());
+        println!("expires_at: {}", issued.invitation.expires_at.to_rfc3339());
+    }
+    println!("This is the only time these links are shown. Anyone holding one can enroll once.");
     Ok(ExitCode::SUCCESS)
 }

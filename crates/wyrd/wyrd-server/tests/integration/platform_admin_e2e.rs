@@ -6209,3 +6209,386 @@ async fn google_proves_a_bound_login_without_admitting_a_stranger() {
     .expect("retention check runs");
     assert_eq!(retained, 0, "no provider token is retained");
 }
+
+/// The repository-managed Mailpit relay: its SMTP `host:port` and HTTP API.
+///
+/// # Panics
+/// Panics when `scripts/postgres/with-test-postgres.sh` did not start it.
+fn mailpit() -> (String, u16, String) {
+    let smtp = env::var("WYRD_TEST_MAILPIT_SMTP")
+        .expect("WYRD_TEST_MAILPIT_SMTP is set by scripts/postgres/with-test-postgres.sh");
+    let api = env::var("WYRD_TEST_MAILPIT_API").expect("WYRD_TEST_MAILPIT_API is set");
+    let (host, port) = smtp.rsplit_once(':').expect("host:port");
+    (host.to_owned(), port.parse().expect("port"), api)
+}
+
+/// Every message Mailpit holds for `recipient`, newest first, as
+/// `(to, from, subject, text)`.
+async fn mail_to(api: &str, recipient: &str) -> Vec<(Vec<String>, String, String, String)> {
+    let http = reqwest::Client::new();
+    let found: Value = http
+        .get(format!("{api}/api/v1/search"))
+        .query(&[("query", format!("to:\"{recipient}\""))])
+        .send()
+        .await
+        .expect("mailpit search")
+        .json()
+        .await
+        .expect("search json");
+    let mut messages = Vec::new();
+    for summary in found["messages"].as_array().expect("messages") {
+        let id = summary["ID"].as_str().expect("message id");
+        let message: Value = http
+            .get(format!("{api}/api/v1/message/{id}"))
+            .send()
+            .await
+            .expect("mailpit message")
+            .json()
+            .await
+            .expect("message json");
+        let to = message["To"]
+            .as_array()
+            .expect("to")
+            .iter()
+            .map(|to| to["Address"].as_str().expect("address").to_owned())
+            .collect();
+        messages.push((
+            to,
+            message["From"]["Address"]
+                .as_str()
+                .expect("from")
+                .to_owned(),
+            message["Subject"].as_str().expect("subject").to_owned(),
+            message["Text"].as_str().expect("text").to_owned(),
+        ));
+    }
+    messages
+}
+
+/// An operator points the deployment at an SMTP relay, and invitations are
+/// emailed after they commit:
+///   1. a tenant administrator can neither read nor change the relay, and
+///      reads never return its password, which is sealed at rest;
+///   2. a test send reaches the relay;
+///   3. each new invitation is emailed separately to its own recipient, from
+///      the configured sender, carrying exactly the returned link, and its
+///      outcome reads `accepted`: relay acceptance, not inbox delivery;
+///   4. a resend emails the replacement link;
+///   5. with the relay down, the link is still returned beside a `failed`
+///      outcome, the invitation stays pending, no User appears, and a resend
+///      after recovery is emailed;
+///   6. a stalled relay holds no tenant transaction: the invitation is
+///      committed and listed while the send is still waiting.
+///
+/// # Panics
+/// Panics when any step's response or the relay's mailbox differs.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_relays_invitations_through_smtp() {
+    let (host, port, api) = mailpit();
+    let srv = WyrdTestServer::builder()
+        .start_in_process()
+        .await
+        .expect("server starts");
+    let root = initialize_platform_root(&srv)
+        .await
+        .expect("deployment initializes");
+    let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
+    let tenant = srv.data_tenant_id();
+    let slug = srv.pg_fixture().tenant_slug().to_owned();
+    let admin = srv
+        .bootstrap_service_in_tenant(tenant, "mail-tenant-admin", &["admin"])
+        .await
+        .expect("tenant admin bootstraps");
+    let admin = srv
+        .exchange_api_key(admin.api_key().expect("admin has an api key"))
+        .await
+        .expect("admin key exchanges");
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    let relay = |host: &str, port: u16| {
+        json!({
+            "host": host,
+            "port": port,
+            "tls": "none",
+            "username": "relay-user",
+            "password": "relay-password-plaintext",
+            "sender": "invites@wyrd.test",
+        })
+    };
+    let addressed = |name: &str| format!("{name}-{slug}@example.test");
+    let invite = |recipients: Vec<String>| {
+        social_request(
+            Method::POST,
+            "/v1/principals/users/invitations",
+            Some(&admin),
+            Some(json!({
+                "recipients": recipients,
+                "assignments": [{ "role": "viewer", "scope": "all" }],
+            })),
+        )
+    };
+
+    // 1. The relay is operator-only, and reads never return its password.
+    let (status, unconfigured) = social_call(
+        &srv,
+        social_request(Method::GET, "/platform/mail", Some(&session), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "mail read: {unconfigured}");
+    assert_eq!(unconfigured, json!({ "relay": null }), "no relay yet");
+    for (method, body) in [(Method::GET, None), (Method::PUT, Some(relay(&host, port)))] {
+        let (status, refused) = social_call(
+            &srv,
+            social_request(method, "/platform/mail", Some(&admin), body),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a tenant administrator cannot reach the relay: {refused}"
+        );
+    }
+    let (status, configured) = social_call(
+        &srv,
+        social_request(
+            Method::PUT,
+            "/platform/mail",
+            Some(&session),
+            Some(relay(&host, port)),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "mail configure: {configured}");
+    assert_eq!(
+        configured,
+        json!({ "relay": {
+            "host": host, "port": port, "tls": "none", "username": "relay-user",
+            "password_set": true, "sender": "invites@wyrd.test",
+        } }),
+        "the stored relay reads back without its password"
+    );
+    let sealed: Vec<u8> =
+        sqlx::query_scalar("SELECT smtp_password_enc FROM platform.login_settings")
+            .fetch_one(&superuser)
+            .await
+            .expect("sealed password reads");
+    assert!(
+        !sealed
+            .windows(b"relay-password-plaintext".len())
+            .any(|w| w == b"relay-password-plaintext"),
+        "the relay password is sealed at rest"
+    );
+
+    // 2. A test send reaches the relay.
+    let probe = addressed("probe");
+    let (status, tested) = social_call(
+        &srv,
+        social_request(
+            Method::POST,
+            "/platform/mail/test",
+            Some(&session),
+            Some(json!({ "recipient": probe })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "test send: {tested}");
+    assert_eq!(tested, json!({ "accepted": true, "error": null }));
+    assert_eq!(
+        mail_to(&api, &probe).await.len(),
+        1,
+        "the test message arrived"
+    );
+
+    // 3. Each invitation is emailed separately with exactly its returned link.
+    let team: Vec<String> = ["ana", "ben", "cy"].iter().map(|n| addressed(n)).collect();
+    let (status, issued) = social_call(&srv, invite(team.clone())).await;
+    assert_eq!(status, StatusCode::CREATED, "invite: {issued}");
+    for (invitation, recipient) in issued["invitations"]
+        .as_array()
+        .expect("invitations")
+        .iter()
+        .zip(&team)
+    {
+        assert_eq!(invitation["invitation"]["recipient"], recipient.as_str());
+        assert_eq!(
+            invitation["invitation"]["delivery"], "accepted",
+            "the relay accepted it: {invitation}"
+        );
+        let link = invitation["invitation_link"].as_str().expect("link");
+        let mail = mail_to(&api, recipient).await;
+        assert_eq!(mail.len(), 1, "one message per recipient");
+        let (to, from, subject, text) = &mail[0];
+        assert_eq!(
+            to,
+            &vec![recipient.clone()],
+            "addressed to its recipient only"
+        );
+        assert_eq!(from, "invites@wyrd.test");
+        assert!(subject.contains(&slug), "names the workspace: {subject}");
+        assert!(text.contains(link), "carries the returned link: {text}");
+        for other in team.iter().filter(|other| *other != recipient) {
+            assert!(!text.contains(other.as_str()), "names no other recipient");
+        }
+    }
+
+    // 4. A resend emails the replacement link.
+    let first = &issued["invitations"][0];
+    let resend_path = format!(
+        "/v1/principals/users/invitations/{}/resend",
+        first["invitation"]["id"].as_str().expect("id")
+    );
+    let (status, resent) = social_call(
+        &srv,
+        social_request(Method::POST, &resend_path, Some(&admin), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "resend: {resent}");
+    assert_eq!(resent["invitation"]["delivery"], "accepted");
+    let replacement = resent["invitation_link"].as_str().expect("link");
+    assert_ne!(
+        replacement,
+        first["invitation_link"].as_str().expect("link")
+    );
+    let mail = mail_to(&api, &team[0]).await;
+    assert_eq!(mail.len(), 2, "the resend is a second message");
+    assert!(
+        mail.iter()
+            .any(|(_, _, _, text)| text.contains(replacement))
+    );
+
+    // 5. With the relay down the link still returns, marked failed.
+    let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("port reserves");
+    let closed_port = closed.local_addr().expect("addr").port();
+    drop(closed);
+    let (status, _) = social_call(
+        &srv,
+        social_request(
+            Method::PUT,
+            "/platform/mail",
+            Some(&session),
+            Some(relay("127.0.0.1", closed_port)),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "relay repoints");
+    let users_before: i64 = sqlx::query_scalar("SELECT count(*) FROM wyrd.auth_users")
+        .fetch_one(&superuser)
+        .await
+        .expect("users count");
+    let dana = addressed("dana");
+    let (status, failed) = social_call(&srv, invite(vec![dana.clone()])).await;
+    assert_eq!(status, StatusCode::CREATED, "invite: {failed}");
+    let failed = &failed["invitations"][0];
+    assert_eq!(failed["invitation"]["delivery"], "failed", "{failed}");
+    assert!(
+        failed["invitation_link"]
+            .as_str()
+            .is_some_and(|link| link.contains("#invitation=")),
+        "the link is still returned to copy"
+    );
+    let (_, pending) = social_call(
+        &srv,
+        social_request(
+            Method::GET,
+            "/v1/principals/users/invitations",
+            Some(&admin),
+            None,
+        ),
+    )
+    .await;
+    let listed = pending["invitations"]
+        .as_array()
+        .expect("invitations")
+        .iter()
+        .find(|row| row["recipient"] == dana.as_str())
+        .expect("the failed invitation stays pending");
+    assert_eq!(listed["delivery"], "failed", "its last outcome is listed");
+    let users_after: i64 = sqlx::query_scalar("SELECT count(*) FROM wyrd.auth_users")
+        .fetch_one(&superuser)
+        .await
+        .expect("users count");
+    assert_eq!(users_after, users_before, "a failed send creates no User");
+    let (status, _) = social_call(
+        &srv,
+        social_request(
+            Method::PUT,
+            "/platform/mail",
+            Some(&session),
+            Some(relay(&host, port)),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "relay recovers");
+    let (status, recovered) = social_call(
+        &srv,
+        social_request(
+            Method::POST,
+            &format!(
+                "/v1/principals/users/invitations/{}/resend",
+                failed["invitation"]["id"].as_str().expect("id")
+            ),
+            Some(&admin),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "resend after recovery: {recovered}");
+    assert_eq!(recovered["invitation"]["delivery"], "accepted");
+    let mail = mail_to(&api, &dana).await;
+    assert_eq!(mail.len(), 1, "only the recovered resend reached the relay");
+    assert!(
+        mail[0]
+            .3
+            .contains(recovered["invitation_link"].as_str().expect("link"))
+    );
+
+    // 6. A stalled relay holds no tenant transaction.
+    let stalled = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("stalled relay binds");
+    let stalled_port = stalled.local_addr().expect("addr").port();
+    let (status, _) = social_call(
+        &srv,
+        social_request(
+            Method::PUT,
+            "/platform/mail",
+            Some(&session),
+            Some(relay("127.0.0.1", stalled_port)),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "relay repoints to the stall");
+    let eve = addressed("eve");
+    let ((status, stalled_issue), ()) =
+        tokio::join!(social_call(&srv, invite(vec![eve.clone()])), async {
+            let (socket, _) = stalled.accept().await.expect("the server dials the relay");
+            let (_, pending) = social_call(
+                &srv,
+                social_request(
+                    Method::GET,
+                    "/v1/principals/users/invitations",
+                    Some(&admin),
+                    None,
+                ),
+            )
+            .await;
+            assert!(
+                pending["invitations"]
+                    .as_array()
+                    .expect("invitations")
+                    .iter()
+                    .any(|row| row["recipient"] == eve.as_str()),
+                "the invitation committed before the relay answered"
+            );
+            drop(socket);
+        });
+    assert_eq!(status, StatusCode::CREATED, "invite: {stalled_issue}");
+    assert_eq!(
+        stalled_issue["invitations"][0]["invitation"]["delivery"],
+        "failed"
+    );
+}

@@ -32,6 +32,22 @@ services:
       timeout: 3s
       retries: 20
 
+  # Local SMTP relay for invitation-mail journeys. It accepts any credentials
+  # over plain SMTP and exposes received messages through its HTTP API.
+  mailpit:
+    image: axllent/mailpit:v1.27@sha256:e22dce5b36f93c77082e204a3942fb6b283b7896e057458400a4c88344c3df68
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: "1"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "1"
+    ports:
+      - "127.0.0.1::1025"
+      - "127.0.0.1::8025"
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
   keycloak:
     image: quay.io/keycloak/keycloak:24.0.1
     command: ["start-dev", "--import-realm"]

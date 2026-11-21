@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use wyrd_auth::browser_sessions::permission_names;
 use wyrd_auth::issue_api_key::WyrdApiKey;
+use wyrd_auth::mail::InvitationMail;
 use wyrd_auth::passwords::{
     canonical_username, create_local_user, hash_password, invitation_recipients, issue_invitations,
     issue_password_reset, new_password, reissue,
@@ -34,17 +35,17 @@ use wyrd_spec::auth::{
     AbsoluteUrl, AccountAuthentication, CREDENTIAL_CURSOR_MAX_BYTES, CREDENTIAL_PAGE_DEFAULT,
     CREDENTIAL_PAGE_MAX, CreateUserCredentialRequest, CreateUserInvitationRequest,
     CreateUserRequest, CreatedUser, CredentialListQuery, CredentialListResponse,
-    CurrentUserProfile, IssuedCredential, IssuedUserInvitation, IssuedUserInvitations,
-    IssuedUserPasswordReset, PrincipalId, PrincipalKindTag, SecretBearer,
-    USER_CREDENTIAL_MAX_LIFETIME_SECONDS, USER_CREDENTIAL_NAME_MAX_CHARS, UserInvitationList,
-    UserInvitationView, UserPasswordResetView,
+    CurrentUserProfile, InvitationDelivery, IssuedCredential, IssuedUserInvitation,
+    IssuedUserInvitations, IssuedUserPasswordReset, PrincipalId, PrincipalKindTag, SecretBearer,
+    Sha256Hex, USER_CREDENTIAL_MAX_LIFETIME_SECONDS, USER_CREDENTIAL_NAME_MAX_CHARS,
+    UserInvitationList, UserInvitationView, UserPasswordResetView,
 };
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::ids::TenantSlug;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
     insert_user_api_key, local_username, page_api_key_metadata, pending_invitations,
-    revoke_invitation,
+    record_invitation_delivery, revoke_invitation,
 };
 
 use crate::audit;
@@ -464,6 +465,54 @@ fn issued_invitation(
     })
 }
 
+/// Email each freshly committed invitation through the deployment relay and
+/// record its outcome beside it; `codes` pairs with `invitations`. Runs after
+/// the issuing transaction commits, so no tenant transaction waits on SMTP.
+/// Without a relay every outcome stays `not_emailed`. A failure to record an
+/// outcome is logged; the response still reports it.
+async fn email_invitations(
+    state: &AppState,
+    caller: &Caller,
+    tenant: &TenantSlug,
+    invitations: &mut [IssuedUserInvitation],
+    codes: &[SecretBearer],
+) {
+    let Some(mail) = state.auth.application_mail.as_ref() else {
+        return;
+    };
+    let outgoing: Vec<_> = invitations
+        .iter()
+        .map(|issued| InvitationMail {
+            recipient: &issued.invitation.recipient,
+            link: issued.invitation_link.expose(),
+            expires_at: issued.invitation.expires_at,
+        })
+        .collect();
+    let outcomes = mail.send_invitations(tenant.as_str(), &outgoing).await;
+    let mut sent = Vec::new();
+    for ((issued, code), outcome) in invitations.iter_mut().zip(codes).zip(outcomes) {
+        issued.invitation.delivery = outcome;
+        if outcome != InvitationDelivery::NotEmailed {
+            sent.push((Sha256Hex::digest(code.expose().as_bytes()), outcome));
+        }
+    }
+    if sent.is_empty() {
+        return;
+    }
+    let recorded = async {
+        let mut conn = tenant_conn(state, caller).await?;
+        for (code_hash, outcome) in &sent {
+            record_invitation_delivery(&mut conn, code_hash, *outcome)
+                .await
+                .map_err(internal)?;
+        }
+        conn.commit().await.map_err(internal)
+    };
+    if let Err(error) = recorded.await {
+        tracing::error!(error = %error, "invitation send outcomes were not recorded");
+    }
+}
+
 /// Issue one one-use, twenty-four-hour enrollment link per recipient.
 ///
 /// # Errors
@@ -475,7 +524,8 @@ fn issued_invitation(
     path = "/principals/users/invitations",
     request_body = CreateUserInvitationRequest,
     responses(
-        (status = 201, description = "One invitation per recipient; each link is returned once",
+        (status = 201, description = "One invitation per recipient; each link is returned once, \
+          beside what became of emailing it",
           body = IssuedUserInvitations),
         (status = 400, description = "A recipient is unusable or repeated, or an assignment is \
           empty, repeated or unknown (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
@@ -509,10 +559,11 @@ pub(crate) async fn create_user_invitation(
     )
     .await?;
     conn.commit().await.map_err(internal)?;
-    let invitations = rows
+    let (mut invitations, codes) = rows
         .into_iter()
-        .map(|(row, code)| issued_invitation(&origin, &tenant, row, &code))
-        .collect::<Result<_, _>>()?;
+        .map(|(row, code)| Ok((issued_invitation(&origin, &tenant, row, &code)?, code)))
+        .collect::<Result<(Vec<_>, Vec<_>), WyrdError>>()?;
+    email_invitations(&state, &caller, &tenant, &mut invitations, &codes).await;
     Ok(crate::auth::oauth::no_store(
         StatusCode::CREATED,
         Json(IssuedUserInvitations { invitations }),
@@ -567,7 +618,8 @@ pub(crate) async fn list_user_invitations(
     path = "/principals/users/invitations/{invitation_id}/resend",
     params(("invitation_id" = Uuid, Path, description = "Invitation to resend")),
     responses(
-        (status = 200, description = "The invitation's new link, returned once", body = IssuedUserInvitation),
+        (status = 200, description = "The invitation's new link, returned once, beside what \
+          became of emailing it", body = IssuedUserInvitation),
         (status = 400, description = "The id is not a UUID (WYRD_SPEC_400_VALIDATION)",
           body = WyrdProblem),
         (status = 403, description = "User management and tenant administration required \
@@ -603,10 +655,10 @@ pub(crate) async fn resend_user_invitation(
             details: serde_json::json!({}),
         }));
     };
-    Ok(crate::auth::oauth::no_store(
-        StatusCode::OK,
-        Json(issued_invitation(&origin, &tenant, row, &code)?),
-    ))
+    let mut issued = [issued_invitation(&origin, &tenant, row, &code)?];
+    email_invitations(&state, &caller, &tenant, &mut issued, &[code]).await;
+    let [issued] = issued;
+    Ok(crate::auth::oauth::no_store(StatusCode::OK, Json(issued)))
 }
 
 /// Revoke an unconsumed enrollment invitation.

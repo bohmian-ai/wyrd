@@ -55,7 +55,7 @@ start_postgres() {
   # This function is called from an `if !` condition, which disables errexit for
   # everything it runs. Both commands must therefore report their own failure,
   # or a Compose that never came up would fall through to the endpoint probe.
-  "${compose[@]}" up --detach --wait postgres || return 1
+  "${compose[@]}" up --detach --wait postgres mailpit || return 1
   endpoint="$("${compose[@]}" port --protocol tcp postgres 5432)" || return 1
   if [[ ! $endpoint =~ ^(127\.0\.0\.1|localhost|0\.0\.0\.0):([1-9][0-9]*)$ ]]; then
     echo "Docker returned an invalid loopback Postgres endpoint: '$endpoint'" >&2
@@ -116,6 +116,10 @@ export WYRD_PLATFORM_DATABASE_URL="postgres://wyrd_platform:${platform_password}
 # already 2 and read their own suffixed vars.
 export WYRD_DB_MAX_CONNECTIONS="${WYRD_DB_MAX_CONNECTIONS:-8}"
 export WYRD_DB_MAX_CONNECTIONS_VALA="${WYRD_DB_MAX_CONNECTIONS_VALA:-8}"
+
+# The local SMTP relay invitation-mail journeys send through, and its API.
+export WYRD_TEST_MAILPIT_SMTP="$("${compose[@]}" port --protocol tcp mailpit 1025)"
+export WYRD_TEST_MAILPIT_API="http://$("${compose[@]}" port --protocol tcp mailpit 8025)"
 
 # Use the container's own psql so the client always matches the server.
 {

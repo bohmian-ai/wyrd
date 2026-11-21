@@ -334,8 +334,50 @@ invitation rows.
 - Process note: the fix removed this cycle's own unrequired assertion that the
   address bar loses the fragment, without a diagnostician; recorded here for
   review. TDD: RED observed before production code for this slice.
-- Remaining in this entry: operator SMTP configuration/test-send, emailed
-  links (Mailpit), relay failure and the stalled-relay transaction boundary.
+
+**Evidence (SMTP slice):**
+
+- Reuse: the relay joins the existing operator-only `platform.login_settings`
+  record (migration `20261121000004_application_mail.sql`, citing spec
+  "Persistence and authority changes": platform application-mail/signup
+  settings records), its password sealed with the deployment keyring as
+  provider secrets are. Platform `authorize`/`commit_decision` govern
+  `GET`/`PUT /platform/mail` and `POST /platform/mail/test`
+  (`components/platform/social.rs`). New: `wyrd-auth/src/mail.rs::ApplicationMail`
+  over `lettre` (rustls/aws-lc with the platform verifier, as reqwest uses);
+  no SMTP code existed. Invitation create/resend commit, then send
+  (`accounts.rs::email_invitations`) and record each outcome in a second short
+  transaction keyed by code verifier. No queue, retry, spool or message log.
+- Test relay: Mailpit (`docker-compose.yml`, pinned digest) starts beside
+  Postgres in `scripts/postgres/with-test-postgres.sh`, which exports
+  `WYRD_TEST_MAILPIT_SMTP`/`WYRD_TEST_MAILPIT_API`; the test panics, never
+  skips, without them.
+- Journey `platform_admin_e2e::an_operator_relays_invitations_through_smtp`:
+  tenant admin GET/PUT of the relay is 401; reads return `password_set`, never
+  the password, and the stored envelope lacks the plaintext; test-send arrives;
+  three invitations each produce exactly one Mailpit message to only that
+  recipient, from the sender, naming the workspace and carrying the returned
+  link, marked `accepted`; resend mails the replacement link; with the relay
+  down the link is still returned beside `failed`, listed pending as `failed`,
+  no User is created, and resend after recovery is mailed; with a relay that
+  accepts TCP and never answers, the invitation is listed (committed) while the
+  send is still waiting, then reports `failed`.
+- RED: `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run
+  db:migrate:all:inner && cargo nextest run --locked -p wyrd-server --test
+  integration -E
+  "test(=platform_admin_e2e::an_operator_relays_invitations_through_smtp)"'`
+  failed at the first relay read: `401 … token is not a tenant access token`
+  (no `/platform/mail` route).
+- GREEN: same selector; `-E 'test(/^pg_openapi_contract::/) |
+  test(/^platform_admin_e2e::/) | test(/^pg_browser_sessions::/)'` 77/77;
+  `wyrd-sql --test integration` 142/142 (migration idempotence); `fmt`,
+  `lints`, `codegen:check`, `check:deps`, `check:tenant-isolation`,
+  `docs:check`, `git diff --check`.
+- Limitation: the production UI has no operator relay page (same open
+  operator-UI decision as entry 1); the tenant Access page already labels
+  `accepted` as "accepted by the mail relay" and `failed` as "email failed".
+  The relay is managed over platform HTTP only, as are social providers.
+- TDD: PASS for this slice.
 
 ### 4. The addressed recipient redeems scoped access, then returns with Google
 

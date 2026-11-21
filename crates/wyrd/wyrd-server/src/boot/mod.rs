@@ -41,6 +41,7 @@ use vala_bifrost_redux::scribe::{
 };
 use wyrd_auth::connections::HumanConnections;
 use wyrd_auth::issuance::TokenExchangeSettings;
+use wyrd_auth::mail::ApplicationMail;
 use wyrd_auth::platform_login::PlatformLogin;
 use wyrd_auth::platform_sessions::PlatformSessions;
 use wyrd_auth::sealing::SealedSecretRewrap;
@@ -1709,6 +1710,9 @@ fn attach_human_logins(
         config.deployment_profile.screened_http(),
         Arc::clone(bifrost.scribe_outbox()) as _,
     ));
+    auth.application_mail = postgres
+        .operator_pool()
+        .map(|pool| ApplicationMail::new(pool, sealing_key.clone()));
     auth.social_sign_in = postgres.operator_pool().map(|pool| {
         SocialSignIn::new(
             pool,

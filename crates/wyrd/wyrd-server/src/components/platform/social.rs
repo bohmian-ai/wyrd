@@ -1,11 +1,14 @@
-//! Platform management of shared social sign-in and deployment login settings.
+//! Platform management of shared social sign-in, deployment login settings
+//! and the application-mail relay.
 //!
 //! A platform administrator registers the deployment's one Google client and
 //! one GitHub.com client, proves each stored revision with a real provider
 //! sign-in, and only then enables it. The same platform identity permissions
 //! that govern the deployment's own OIDC connection govern these routes, and
 //! every decision is staged on the process audit outbox. Tenant company SSO
-//! keeps its own connection slot; nothing here reads or writes it.
+//! keeps its own connection slot; nothing here reads or writes it. The SMTP
+//! relay is governed the same way; tenant administrators send invitations
+//! through it but can neither read nor change it.
 //!
 //! Behavior lives in [`wyrd_auth::social::SocialSignIn`]; these handlers only
 //! authorize, derive the public origin and project the result.
@@ -13,11 +16,13 @@
 use axum::Json;
 use axum::extract::{Path, State};
 use std::sync::Arc;
+use wyrd_auth::mail::ApplicationMail;
 use wyrd_auth::platform_authz::PlatformAuthorization;
 use wyrd_auth::social::SocialSignIn;
 use wyrd_runtime::Permission;
 use wyrd_spec::auth::{
-    ConfigureSocialProviderRequest, EnableSocialProviderRequest, LoginSettings, SocialProvider,
+    ConfigureMailRelayRequest, ConfigureSocialProviderRequest, EnableSocialProviderRequest,
+    LoginSettings, MailSettings, MailTestRequest, MailTestResponse, SocialProvider,
     SocialProviderTestRequest, SocialProviderTestResponse, SocialProviderView,
     SocialProvidersResponse,
 };
@@ -37,6 +42,9 @@ const SOCIAL_PROVIDERS_RESOURCE: &str = "platform:social_providers";
 /// Audited resource for a decision about the deployment login settings.
 const LOGIN_SETTINGS_RESOURCE: &str = "platform:login_settings";
 
+/// Audited resource for a decision about the application-mail relay.
+const MAIL_RESOURCE: &str = "platform:mail";
+
 /// Build the authenticated platform social sign-in routes.
 pub fn platform_social_router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
@@ -45,6 +53,8 @@ pub fn platform_social_router() -> OpenApiRouter<AppState> {
         .routes(routes!(test_provider))
         .routes(routes!(enable_provider))
         .routes(routes!(read_login_settings, write_login_settings))
+        .routes(routes!(read_mail, write_mail))
+        .routes(routes!(test_mail))
 }
 
 /// The process social sign-in owner.
@@ -53,6 +63,19 @@ pub fn platform_social_router() -> OpenApiRouter<AppState> {
 /// Returns an internal error when the platform plane is not configured.
 pub(crate) fn social(state: &AppState) -> Result<&SocialSignIn, WyrdErrorResponse> {
     state.auth.social_sign_in.as_ref().ok_or_else(|| {
+        WyrdErrorResponse::from(WyrdError::Internal {
+            message: "platform control plane is not configured".to_owned(),
+            details: serde_json::json!({ "plane": "platform" }),
+        })
+    })
+}
+
+/// The process application-mail owner.
+///
+/// # Errors
+/// Returns an internal error when the platform plane is not configured.
+fn mail(state: &AppState) -> Result<&ApplicationMail, WyrdErrorResponse> {
+    state.auth.application_mail.as_ref().ok_or_else(|| {
         WyrdErrorResponse::from(WyrdError::Internal {
             message: "platform control plane is not configured".to_owned(),
             details: serde_json::json!({ "plane": "platform" }),
@@ -341,4 +364,124 @@ async fn write_login_settings(
         .await?;
     commit_decision(decision).await?;
     Ok(Json(settings))
+}
+
+/// Read the application-mail relay, never its password.
+///
+/// # Errors
+/// Returns a stable Wyrd error when the caller is unauthorized or the read
+/// fails.
+#[utoipa::path(
+    get,
+    path = "/platform/mail",
+    responses(
+        (status = 200, description = "The SMTP relay, or `null` when Wyrd emails nothing", body = MailSettings),
+        (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
+        (status = 403, description = "Platform identity read required \
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 503, description = "The platform store is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Platform"
+)]
+#[tracing::instrument(level = "info", skip(state, caller))]
+async fn read_mail(
+    State(state): State<AppState>,
+    caller: PlatformCaller,
+) -> Result<Json<MailSettings>, WyrdErrorResponse> {
+    let pool = operator(&state)?;
+    authorize_read(
+        &pool,
+        state.bifrost.scribe_outbox(),
+        &caller,
+        &Permission::platform_identity_read(),
+        MAIL_RESOURCE,
+    )
+    .await?;
+    Ok(Json(mail(&state)?.settings().await?))
+}
+
+/// Replace the application-mail relay; the password is sealed and never
+/// returned.
+///
+/// # Errors
+/// Returns `400` for an invalid relay and a stable Wyrd error when the caller
+/// is unauthorized or the write fails.
+#[utoipa::path(
+    put,
+    path = "/platform/mail",
+    request_body = ConfigureMailRelayRequest,
+    responses(
+        (status = 200, description = "The stored relay, without its password", body = MailSettings),
+        (status = 400, description = "Empty host, zero port, invalid sender, a password without \
+          a username, or no sealing key (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
+        (status = 403, description = "Platform identity administration required \
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 503, description = "The platform store is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Platform"
+)]
+#[tracing::instrument(level = "info", skip(state, caller, request))]
+async fn write_mail(
+    State(state): State<AppState>,
+    caller: PlatformCaller,
+    Json(request): Json<ConfigureMailRelayRequest>,
+) -> Result<Json<MailSettings>, WyrdErrorResponse> {
+    let pool = operator(&state)?;
+    let authz =
+        PlatformAuthorization::new(pool.clone(), Arc::clone(state.bifrost.scribe_outbox()) as _);
+    let mut decision = authorize(
+        &authz,
+        &caller,
+        &Permission::platform_identity_write(),
+        MAIL_RESOURCE,
+    )
+    .await?;
+    let settings = mail(&state)?.configure(&mut decision, &request).await?;
+    commit_decision(decision).await?;
+    Ok(Json(settings))
+}
+
+/// Send one test message through the relay. Acceptance means the relay took
+/// it, not that it reached an inbox.
+///
+/// # Errors
+/// Returns `400` for an invalid recipient, `409` when no relay is configured,
+/// and a stable Wyrd error when the caller is unauthorized.
+#[utoipa::path(
+    post,
+    path = "/platform/mail/test",
+    request_body = MailTestRequest,
+    responses(
+        (status = 200, description = "Whether the relay accepted the message", body = MailTestResponse),
+        (status = 400, description = "Not an email address (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
+        (status = 403, description = "Platform identity administration required \
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 409, description = "No relay is configured (WYRD_SPEC_409_CONFLICT)", body = WyrdProblem),
+        (status = 503, description = "The platform store is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Platform"
+)]
+#[tracing::instrument(level = "info", skip(state, caller, request))]
+async fn test_mail(
+    State(state): State<AppState>,
+    caller: PlatformCaller,
+    Json(request): Json<MailTestRequest>,
+) -> Result<Json<MailTestResponse>, WyrdErrorResponse> {
+    let pool = operator(&state)?;
+    let authz =
+        PlatformAuthorization::new(pool.clone(), Arc::clone(state.bifrost.scribe_outbox()) as _);
+    let decision = authorize(
+        &authz,
+        &caller,
+        &Permission::platform_identity_write(),
+        MAIL_RESOURCE,
+    )
+    .await?;
+    commit_decision(decision).await?;
+    Ok(Json(mail(&state)?.test(&request.recipient).await?))
 }

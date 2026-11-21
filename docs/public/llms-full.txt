@@ -3965,7 +3965,7 @@ wyrd principal user invite --recipient alice@example.com --recipient bob@example
   --grant viewer:Repository/payments
 ```
 
-Each recipient gets a separate `invitation_link`, printed only this once. Send each person their link. Until an operator configures a mail relay, Wyrd does not email links, and `delivery` reads `not_emailed`. The person opens the link and chooses a username and password. Each link works once, for 24 hours. Anyone holding a live link can use it, so revoke one that reached the wrong person. `GET /v1/principals/users/invitations` lists pending invitations without their links. `POST /v1/principals/users/invitations/{id}/resend` replaces a link, and the old one stops working. `DELETE /v1/principals/users/invitations/{id}` revokes it.
+Each recipient gets a separate `invitation_link`, printed only this once. Send each person their link. Until an operator configures a mail relay (see [Email invitations](#email-invitations)), Wyrd does not email links, and `delivery` reads `not_emailed`. The person opens the link and chooses a username and password. Each link works once, for 24 hours. Anyone holding a live link can use it, so revoke one that reached the wrong person. `GET /v1/principals/users/invitations` lists pending invitations without their links. `POST /v1/principals/users/invitations/{id}/resend` replaces a link, and the old one stops working. `DELETE /v1/principals/users/invitations/{id}` revokes it.
 
 You can also create the User yourself. The password is read from standard input, so it never enters the command line or your shell history:
 
@@ -3976,6 +3976,20 @@ wyrd principal user create --username alice --grant editor:all < alice-password.
 In the UI, go to **Settings**, then **Access**, then **Users**. Paste the email addresses and choose a role and a scope, and the page shows each link once. **Pending invitations** lists every live invitation, with **Resend** and **Revoke**.
 
 Either way, the account holds exactly the grants you named, and each `--grant` names its scope. The person then signs in from a terminal with `wyrd auth login --server https://wyrd.example.com --tenant acme`, signs in with their password in the browser, and approves the code the CLI shows. The approval page opens at the address they use for the Wyrd UI when the server runs behind it. Revoke the account with `wyrd principal revoke` when they leave.
+
+## Email invitations
+
+Wyrd can also email each invitation link through an SMTP relay you already use: your company's mail server or a transactional mail service such as Resend. Set up the sending account and domain with that service first. As a platform administrator, store the relay. The password is sealed and never returned, and tenant administrators can neither read nor change it:
+
+```bash
+curl -X PUT https://wyrd.example.com/platform/mail \
+  -H "X-Wyrd-Access-Token: Bearer $PLATFORM_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"host":"smtp.example.com","port":587,"tls":"starttls","username":"wyrd","password":"…","sender":"invites@example.com"}'
+```
+
+`tls` is `starttls` (usually port 587), `tls` (usually 465) or `none` for a relay on a trusted local network. Leave out `username` and `password` for a relay that does not authenticate. Check it with `POST /platform/mail/test` and `{"recipient":"you@example.com"}`, which answers `accepted` or the relay's error.
+
+From then on, Wyrd emails each new or resent link separately to its recipient and still returns it to you. `delivery` reads `accepted` when the relay took the message. That is not proof it reached an inbox. It reads `failed` when the relay refused it or could not be reached. The invitation stays pending, so copy the link or resend once the relay works. Wyrd does not queue or retry mail.
 
 ## If it fails
 

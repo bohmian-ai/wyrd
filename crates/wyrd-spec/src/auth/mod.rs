@@ -65,8 +65,9 @@ pub use principal_kind::PrincipalKindTag;
 pub use revoke::{REASON_MAX_BYTES, RevokePrincipalRequest};
 pub use secret_bearer::SecretBearer;
 pub use social::{
-    ConfigureSocialProviderRequest, EnableSocialProviderRequest, LoginMethodsQuery,
-    LoginMethodsResponse, LoginSettings, SocialProvider, SocialProviderState,
+    ConfigureMailRelayRequest, ConfigureSocialProviderRequest, EnableSocialProviderRequest,
+    LoginMethodsQuery, LoginMethodsResponse, LoginSettings, MailRelayView, MailSettings,
+    MailTestRequest, MailTestResponse, SmtpTls, SocialProvider, SocialProviderState,
     SocialProviderTestRequest, SocialProviderTestResponse, SocialProviderView,
     SocialProvidersResponse,
 };

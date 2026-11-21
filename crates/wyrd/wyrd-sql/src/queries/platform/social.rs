@@ -7,7 +7,7 @@
 //! current one. A provider test is a one-use row in
 //! `platform.social_login_state`, consumed before any provider IO. The single
 //! `platform.login_settings` row carries the deployment's password and signup
-//! switches.
+//! switches and, once an operator configures one, its SMTP relay.
 //!
 //! Every statement runs on the [`OperatorPool`] or an audited operator
 //! [`TenantConn`], because `platform.*` admits only operator sessions.
@@ -299,6 +299,69 @@ pub async fn put_login_settings(
     )
     .bind(settings.password_enabled)
     .bind(settings.signup_enabled)
+    .execute(&mut **conn.transaction())
+    .await
+    .map(|_| ())
+    .map_err(SqlError::from)
+}
+
+/// The deployment's SMTP relay, as stored on the login settings row.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct MailRelayRow {
+    /// Relay host name or address.
+    #[sqlx(rename = "smtp_host")]
+    pub host: String,
+    /// Relay TCP port.
+    #[sqlx(rename = "smtp_port")]
+    pub port: i32,
+    /// TLS mode label: `none`, `starttls` or `tls`.
+    #[sqlx(rename = "smtp_tls")]
+    pub tls: String,
+    /// Relay username, when the relay authenticates.
+    #[sqlx(rename = "smtp_username")]
+    pub username: Option<String>,
+    /// Sealing-keyring envelope of the relay password.
+    #[sqlx(rename = "smtp_password_enc")]
+    pub password_enc: Option<Vec<u8>>,
+    /// Envelope and header sender address.
+    #[sqlx(rename = "smtp_sender")]
+    pub sender: String,
+}
+
+/// Read the configured SMTP relay; `None` when no operator configured one.
+///
+/// # Errors
+/// Returns [`SqlError::Query`] when the read fails, including a missing row.
+pub async fn mail_relay(pool: &OperatorPool) -> Result<Option<MailRelayRow>, SqlError> {
+    sqlx::query_as::<_, MailRelayRow>(
+        "SELECT smtp_host, smtp_port, smtp_tls, smtp_username, smtp_password_enc, smtp_sender
+           FROM platform.login_settings WHERE smtp_host IS NOT NULL",
+    )
+    .fetch_optional(pool.pool())
+    .await
+    .map_err(SqlError::from)
+}
+
+/// Replace the SMTP relay on the audited operator `conn`.
+///
+/// # Errors
+/// Returns [`SqlError::Query`] when the write fails, and a `409` constraint
+/// error for an incomplete relay.
+pub async fn put_mail_relay(
+    conn: &mut TenantConn<'_>,
+    relay: &MailRelayRow,
+) -> Result<(), SqlError> {
+    sqlx::query(
+        "UPDATE platform.login_settings
+            SET smtp_host = $1, smtp_port = $2, smtp_tls = $3, smtp_username = $4,
+                smtp_password_enc = $5, smtp_sender = $6, updated_at = now()",
+    )
+    .bind(&relay.host)
+    .bind(relay.port)
+    .bind(&relay.tls)
+    .bind(relay.username.as_deref())
+    .bind(relay.password_enc.as_deref())
+    .bind(&relay.sender)
     .execute(&mut **conn.transaction())
     .await
     .map(|_| ())

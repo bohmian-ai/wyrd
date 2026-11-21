@@ -12,6 +12,10 @@
 //! The login-method listing is the safe projection a sign-in page renders:
 //! Rust computes it from these settings, the enabled providers and the tenant's
 //! company connection, and enforces the same answer on every login path.
+//!
+//! The optional SMTP relay is the deployment's application mail: with one
+//! configured, invitations are also emailed; its password, like a client
+//! secret, travels inbound only.
 
 use serde::{Deserialize, Serialize};
 
@@ -177,6 +181,116 @@ pub struct LoginSettings {
     pub password_enabled: bool,
     /// Whether a visitor may create a new workspace with an enabled provider.
     pub signup_enabled: bool,
+}
+
+/// How Wyrd secures its connection to the SMTP relay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SmtpTls {
+    /// Plain SMTP; only for a relay on a trusted local network.
+    None,
+    /// Plain connection upgraded with `STARTTLS`, usually port 587.
+    Starttls,
+    /// TLS from the first byte (SMTPS), usually port 465.
+    Tls,
+}
+
+impl SmtpTls {
+    /// The stable label stored and sent on the wire.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Starttls => "starttls",
+            Self::Tls => "tls",
+        }
+    }
+
+    /// Parse a stored label.
+    #[must_use]
+    pub fn parse(label: &str) -> Option<Self> {
+        match label {
+            "none" => Some(Self::None),
+            "starttls" => Some(Self::Starttls),
+            "tls" => Some(Self::Tls),
+            _ => None,
+        }
+    }
+}
+
+/// Body of `PUT /platform/mail`: the deployment's one SMTP relay, replacing
+/// any earlier one. Provider accounts and sending domains are set up outside
+/// Wyrd; any standard SMTP relay works.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ConfigureMailRelayRequest {
+    /// Relay host name or address.
+    pub host: String,
+    /// Relay TCP port.
+    pub port: u16,
+    /// How the connection is secured.
+    pub tls: SmtpTls,
+    /// Username, when the relay requires authentication.
+    #[serde(default)]
+    pub username: Option<String>,
+    /// Password for `username`; sealed before storage and never returned.
+    #[serde(default)]
+    #[schemars(with = "Option<String>")]
+    pub password: Option<SecretBearer>,
+    /// Sender address invitations are sent from, such as `invites@example.com`.
+    pub sender: String,
+}
+
+/// The configured SMTP relay as management reads it, never its password.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct MailRelayView {
+    /// Relay host name or address.
+    pub host: String,
+    /// Relay TCP port.
+    pub port: u16,
+    /// How the connection is secured.
+    pub tls: SmtpTls,
+    /// Username, when the relay authenticates.
+    pub username: Option<String>,
+    /// Whether a password is stored.
+    pub password_set: bool,
+    /// Sender address.
+    pub sender: String,
+}
+
+/// Response of `GET`/`PUT /platform/mail`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct MailSettings {
+    /// The relay; `null` when Wyrd emails nothing and invitations are only
+    /// copied.
+    pub relay: Option<MailRelayView>,
+}
+
+/// Body of `POST /platform/mail/test`.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct MailTestRequest {
+    /// Address to send the test message to.
+    pub recipient: String,
+}
+
+/// Response of `POST /platform/mail/test`. Acceptance means the relay took
+/// the message, not that it reached an inbox.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct MailTestResponse {
+    /// Whether the relay accepted the message.
+    pub accepted: bool,
+    /// The relay or connection error when it did not.
+    pub error: Option<String>,
 }
 
 /// Query of `GET /auth/browser/methods`.

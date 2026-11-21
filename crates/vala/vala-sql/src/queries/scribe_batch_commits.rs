@@ -432,14 +432,63 @@ impl Default for RetryHistory {
     }
 }
 
-/// Deletes at most `limit` of the tenant's receipts that `shard` handed off
-/// and that left recent retry history, returning how many went.
+/// One tenant's receipts in one WAL shard stream of a node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReceiptStream {
+    /// Tenant owning the receipts.
+    pub tenant: DataTenantId,
+    /// Writer epoch of the WAL stream.
+    pub writer_epoch: i64,
+    /// Shard of the WAL stream.
+    pub shard_id: i16,
+}
+
+/// Lists every tenant, writer epoch and shard holding receipts written by
+/// `node_id`, so its cleaner can reach receipts of earlier epochs too.
 ///
-/// The one statement ranks the tenant's receipts by acceptance per table,
-/// then deletes only rows whose current coordinates still name `shard` at or
-/// below its safe segment, so a candidate replaced by a later acceptance of
-/// the same identity elsewhere is never removed. Deleting a receipt removes
-/// no accepted row and no other custody.
+/// # Errors
+///
+/// Returns [`SqlError`] when PostgreSQL cannot execute the read.
+// tenant-isolation: cross-tenant OperatorPool read of WAL stream coordinates, never rows.
+pub async fn receipt_streams(
+    operator: &OperatorPool,
+    node_id: uuid::Uuid,
+) -> Result<Vec<ReceiptStream>, SqlError> {
+    // ponytail: scans the node's receipts on the stream index each sweep;
+    // bounded by retry history, which is what the cleaner keeps small.
+    let rows: Vec<(uuid::Uuid, i64, i16)> = sqlx::query_as(
+        "SELECT DISTINCT data_tenant_id, wal_writer_epoch, wal_shard_id \
+           FROM vala.scribe_batch_commits WHERE wal_node_id = $1",
+    )
+    .bind(node_id)
+    .fetch_all(operator.pool())
+    .await
+    .map_err(SqlError::from)?;
+    rows.into_iter()
+        .map(|(tenant, writer_epoch, shard_id)| {
+            Ok(ReceiptStream {
+                tenant: DataTenantId::new(tenant).map_err(|error| {
+                    SqlError::InvariantViolation {
+                        detail: format!("receipt tenant {tenant} is invalid: {error}"),
+                    }
+                })?,
+                writer_epoch,
+                shard_id,
+            })
+        })
+        .collect()
+}
+
+/// Deletes at most `limit` of the tenant's receipts that `shard` handed off
+/// and that left recent retry history at `cutoff`, returning their batch ids.
+///
+/// Only receipts accepted at or before `cutoff` are candidates and age is
+/// measured from it, so one sweep's work is finite however many receipts
+/// arrive meanwhile. The one statement ranks the tenant's receipts by
+/// acceptance per table, then deletes only rows whose current coordinates
+/// still name `shard` at or below its safe segment, so a candidate replaced by
+/// a later acceptance of the same identity elsewhere is never removed.
+/// Deleting a receipt removes no accepted row and no other custody.
 ///
 /// # Errors
 ///
@@ -449,11 +498,12 @@ pub async fn delete_handed_off(
     conn: &mut TenantConn<'_>,
     shard: &HandedOffShard,
     history: &RetryHistory,
+    cutoff: DateTime<Utc>,
     limit: i64,
-) -> Result<u64, SqlError> {
+) -> Result<Vec<uuid::Uuid>, SqlError> {
     // ponytail: ranks every receipt of the tenant per call; add a
     // (tenant, table, ingested_at) index if the cleaner's sweeps show it.
-    let deleted = sqlx::query(
+    sqlx::query_scalar(
         "DELETE FROM vala.scribe_batch_commits AS receipt \
           USING ( \
             SELECT logical_table_fqn, batch_id FROM ( \
@@ -464,13 +514,14 @@ pub async fn delete_handed_off(
                        ORDER BY ingested_at DESC, batch_id DESC) AS newest \
                 FROM vala.scribe_batch_commits) AS ranked \
              WHERE wal_node_id = $1 AND wal_writer_epoch = $2 AND wal_shard_id = $3 \
-               AND wal_segment_sequence <= $4 \
-               AND (ingested_at < statement_timestamp() - ($5 * interval '1 second') OR newest > $6) \
+               AND wal_segment_sequence <= $4 AND ingested_at <= $8 \
+               AND (ingested_at < $8 - ($5 * interval '1 second') OR newest > $6) \
              LIMIT $7) AS eligible \
           WHERE receipt.logical_table_fqn = eligible.logical_table_fqn \
             AND receipt.batch_id = eligible.batch_id \
             AND receipt.wal_node_id = $1 AND receipt.wal_writer_epoch = $2 \
-            AND receipt.wal_shard_id = $3 AND receipt.wal_segment_sequence <= $4",
+            AND receipt.wal_shard_id = $3 AND receipt.wal_segment_sequence <= $4 \
+          RETURNING receipt.batch_id",
     )
     .bind(shard.node_id)
     .bind(shard.writer_epoch)
@@ -479,10 +530,10 @@ pub async fn delete_handed_off(
     .bind(history.max_age.as_secs_f64())
     .bind(history.newest)
     .bind(limit)
-    .execute(&mut **conn.transaction())
+    .bind(cutoff)
+    .fetch_all(&mut **conn.transaction())
     .await
-    .map_err(SqlError::from)?;
-    Ok(deleted.rows_affected())
+    .map_err(SqlError::from)
 }
 
 /// Reads the `PostgreSQL` instant Scribe anchors its admission clock on.

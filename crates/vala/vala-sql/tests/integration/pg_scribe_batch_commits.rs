@@ -13,6 +13,8 @@
 //!   fence on their table
 //! - receipt deletion removes only receipts of the named stream shard at or
 //!   below its safe segment and outside the age/count retry history
+//! - a sweep's cutoff bounds deletion to receipts accepted before it
+//! - a node's receipt streams are discovered across tenants and epochs
 
 mod pg_tests {
     use std::sync::{Mutex, OnceLock};
@@ -24,8 +26,9 @@ mod pg_tests {
     use uuid::Uuid;
     use vala_sql::TenantConn;
     use vala_sql::queries::scribe_batch_commits::{
-        HandedOffShard, RetryHistory, ScribeBatchCommit, ScribeBatchCommitResolution,
-        accepted_version, committed_batches, delete_handed_off, record, resolve,
+        HandedOffShard, ReceiptStream, RetryHistory, ScribeBatchCommit,
+        ScribeBatchCommitResolution, accepted_version, committed_batches, delete_handed_off,
+        receipt_streams, record, resolve,
     };
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::DataTenantId;
@@ -497,9 +500,10 @@ mod pg_tests {
             let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
                 .await
                 .expect("tenant connection");
-            let deleted = delete_handed_off(&mut conn, &shard, &history, 100)
+            let deleted = delete_handed_off(&mut conn, &shard, &history, Utc::now(), 100)
                 .await
-                .expect("the delete runs");
+                .expect("the delete runs")
+                .len();
             let mut left = committed_batches(
                 &mut conn,
                 "bifrost.a",
@@ -559,5 +563,126 @@ mod pg_tests {
         let (deleted, left) = remaining(RetryHistory::default()).await;
         assert_eq!(deleted, 0, "the replacement acceptance stays");
         assert!(left.contains(&handed_off.batch_id));
+    }
+
+    /// A sweep deletes only receipts accepted at or before its cutoff, so
+    /// receipts arriving during the sweep cannot keep it running.
+    ///
+    /// Two covered receipts leave a one-identity count history: one accepted
+    /// before the cutoff, one after. Only the first goes, and its batch id is
+    /// returned so the caller can forget it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot start, a statement fails, or the
+    /// deletion crosses the cutoff.
+    #[tokio::test]
+    async fn a_sweep_cutoff_bounds_deletion_to_receipts_accepted_before_it() {
+        let fixture = PgFixture::start().await.expect("fixture");
+        let tenant = fixture.data_tenant_id();
+        let cutoff = Utc::now();
+        let before = fence(tenant, "bifrost.a", Uuid::now_v7(), 10);
+        let shard = HandedOffShard {
+            node_id: before.wal_node_id,
+            writer_epoch: 1,
+            shard_id: 0,
+            safe_segment: 1,
+        };
+        let after = ScribeBatchCommit {
+            wal_node_id: shard.node_id,
+            ..fence(tenant, "bifrost.a", Uuid::now_v7(), 20)
+        };
+        let newest = fence(tenant, "bifrost.a", Uuid::now_v7(), 30);
+        commit_group(
+            &fixture,
+            &[
+                (before.clone(), cutoff - chrono::Duration::minutes(1)),
+                (after.clone(), cutoff + chrono::Duration::minutes(1)),
+                (newest, cutoff + chrono::Duration::minutes(2)),
+            ],
+        )
+        .await;
+
+        let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
+            .await
+            .expect("tenant connection");
+        let deleted = delete_handed_off(
+            &mut conn,
+            &shard,
+            &RetryHistory {
+                newest: 1,
+                ..RetryHistory::default()
+            },
+            cutoff,
+            100,
+        )
+        .await
+        .expect("the delete runs");
+        conn.commit().await.expect("commit");
+
+        assert_eq!(
+            deleted,
+            [before.batch_id],
+            "only the receipt before the cutoff goes"
+        );
+    }
+
+    /// A node's receipt streams are listed across every tenant and writer
+    /// epoch, and another node's are not.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot start, a statement fails, or the
+    /// discovered streams differ from the recorded ones.
+    #[tokio::test]
+    async fn receipt_streams_of_a_node_span_tenants_and_epochs() {
+        let fixture = PgFixture::start().await.expect("fixture");
+        let tenant = fixture.data_tenant_id();
+        let other_tenant = fixture
+            .seed_additional_tenant("receipt-streams-other")
+            .await
+            .expect("second tenant");
+        let node = Uuid::now_v7();
+        let on = |tenant, epoch, shard, lsn| ScribeBatchCommit {
+            wal_node_id: node,
+            wal_writer_epoch: epoch,
+            wal_shard_id: shard,
+            ..fence(tenant, "bifrost.a", Uuid::now_v7(), lsn)
+        };
+        commit_group(
+            &fixture,
+            &[
+                (on(tenant, 1, 0, 10), Utc::now()),
+                (on(tenant, 1, 0, 12), Utc::now()),
+                (on(tenant, 2, 3, 20), Utc::now()),
+                (fence(tenant, "bifrost.a", Uuid::now_v7(), 30), Utc::now()),
+            ],
+        )
+        .await;
+        commit_group(&fixture, &[(on(other_tenant, 2, 3, 40), Utc::now())]).await;
+
+        let mut streams = receipt_streams(fixture.operator_pool(), node)
+            .await
+            .expect("the discovery runs");
+        streams.sort_by_key(|stream| (stream.writer_epoch, stream.shard_id, stream.tenant));
+        let mut expected = vec![
+            ReceiptStream {
+                tenant,
+                writer_epoch: 1,
+                shard_id: 0,
+            },
+            ReceiptStream {
+                tenant,
+                writer_epoch: 2,
+                shard_id: 3,
+            },
+            ReceiptStream {
+                tenant: other_tenant,
+                writer_epoch: 2,
+                shard_id: 3,
+            },
+        ];
+        expected.sort_by_key(|stream| (stream.writer_epoch, stream.shard_id, stream.tenant));
+        assert_eq!(streams, expected);
     }
 }

@@ -1041,12 +1041,13 @@ async fn delete_handed_off_receipt(
             max_age: Duration::ZERO,
             ..Default::default()
         },
+        chrono::Utc::now(),
         100,
     )
     .await
     .expect("the handed-off receipts are deleted");
     conn.commit().await.expect("the deletion commits");
-    assert!(deleted >= 1, "the handed-off receipt is deleted");
+    assert!(!deleted.is_empty(), "the handed-off receipt is deleted");
 }
 
 /// Finds the file under `root` whose path ends with `suffix`.

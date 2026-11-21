@@ -295,6 +295,54 @@ fn assert_ingress_owners_settled(scribe: &crate::scribe::ScribeImpl) {
     assert_eq!(ingress_bytes(&memory), 0);
 }
 
+/// Warm one ingress worker's encoder context through a real durable append.
+///
+/// Returns the retained encoder bytes and the Metadata category total that
+/// includes them.
+///
+/// # Panics
+/// Panics if the append fails or the lane retains no encoder context.
+async fn warm_encoder(scribe: &crate::scribe::ScribeImpl) -> (usize, usize) {
+    ingest(
+        scribe,
+        DataTenantId::new_v7(),
+        "warm_encoder",
+        Uuid::now_v7(),
+    )
+    .await
+    .expect("durable append");
+    let snapshot = scribe.inspection_snapshot().expect("warm inspection");
+    assert!(
+        snapshot.encoder_memory > 0,
+        "the append retained no encoder context"
+    );
+    (
+        snapshot.encoder_memory,
+        snapshot.memory_by_category[MemoryCategory::Metadata as usize],
+    )
+}
+
+/// Assert a stopped Scribe released its warmed encoder contexts and their
+/// Metadata charge while the caller still holds the handle.
+///
+/// # Panics
+/// Panics if any encoder memory remains retained or charged.
+fn assert_encoders_released(
+    scribe: &crate::scribe::ScribeImpl,
+    (warmed, metadata): (usize, usize),
+) {
+    let snapshot = scribe.inspection_snapshot().expect("stopped inspection");
+    assert_eq!(
+        snapshot.encoder_memory, 0,
+        "a stopped Scribe retains encoder contexts"
+    );
+    assert_eq!(
+        snapshot.memory_by_category[MemoryCategory::Metadata as usize],
+        metadata - warmed,
+        "a stopped Scribe still charges its encoder contexts"
+    );
+}
+
 /// Sum the pre-insertion ingress memory categories of one inspection.
 fn ingress_bytes(memory: &[usize; MEMORY_CATEGORY_COUNT]) -> usize {
     [
@@ -447,12 +495,36 @@ async fn duplicate_shutdown_is_idempotent_and_closes_owners() {
     assert_ingress_owners_settled(&scribe);
 }
 
+/// Direct abort releases warmed encoder contexts without dropping the handle.
+///
+/// # Panics
+///
+/// Panics if the append fails, abort leaves encoder memory charged, or a
+/// later shutdown or abort retains it again.
+#[tokio::test]
+async fn aborted_scribe_releases_warm_encoder_contexts() {
+    let wal_root = tempfile::tempdir().expect("WAL directory");
+    let node = NodeId::new(Uuid::now_v7());
+    let (_wal, scribe) = scribe(&wal_root, node);
+    let warm = warm_encoder(&scribe).await;
+
+    scribe.abort_shutdown();
+    assert_encoders_released(&scribe, warm);
+    scribe
+        .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
+        .await;
+    scribe.abort_shutdown();
+    assert_encoders_released(&scribe, warm);
+    assert_ingress_owners_settled(&scribe);
+}
+
 /// Cancelling the graceful owner cannot strand Scribe in its draining state.
 ///
 /// # Panics
 ///
 /// Panics if the fixture cannot start, draining is not observed, cancellation
-/// fails to run the synchronous finalizer, or later shutdown paths exceed their
+/// fails to run the synchronous finalizer, the finalizer leaves a warmed
+/// encoder context charged, or later shutdown paths exceed their
 /// bounded deadlines or retain a worker owner.
 #[tokio::test]
 async fn cancelled_shutdown_owner_is_recovered_by_abort_finalizer() {
@@ -460,6 +532,7 @@ async fn cancelled_shutdown_owner_is_recovered_by_abort_finalizer() {
     let node = NodeId::new(Uuid::now_v7());
     let (_wal, scribe) = scribe(&wal_root, node);
     let scribe = Arc::new(scribe);
+    let warm = warm_encoder(&scribe).await;
     let stalled = scribe.install_shutdown_stall_for_test().await;
     let first = {
         let scribe = Arc::clone(&scribe);
@@ -478,6 +551,7 @@ async fn cancelled_shutdown_owner_is_recovered_by_abort_finalizer() {
     .expect("shutdown reaches draining");
     first.abort();
     first.await.expect_err("first shutdown future is cancelled");
+    assert_encoders_released(&scribe, warm);
 
     tokio::time::timeout(
         std::time::Duration::from_secs(1),

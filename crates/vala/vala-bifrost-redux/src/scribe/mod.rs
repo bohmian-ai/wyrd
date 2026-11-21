@@ -1449,8 +1449,6 @@ impl ScribeImpl {
         if graceful {
             graceful = await_shutdown_phase(deadline, self.ingress_cpu.drain()).await;
         }
-        // Retained encoder contexts stay charged until the drained lane drops them.
-        self.ingress_cpu.encoders().clear();
         if self
             .shutdown_state
             .compare_exchange(
@@ -1509,8 +1507,15 @@ impl ScribeImpl {
         self.finalize_shutdown_owners();
     }
 
-    /// Abort retained async owners and publish the terminal stopped state.
+    /// Abort retained async owners, release idle encoder contexts, and publish
+    /// the terminal stopped state.
+    ///
+    /// Every terminal path ends here, so a stopped Scribe whose handle is
+    /// still held keeps no encoder memory. An encode already running keeps its
+    /// context's lease until it settles and cannot restore it into the closed
+    /// set.
     fn finalize_shutdown_owners(&self) {
+        self.ingress_cpu.encoders().clear();
         let aborted_shards = self.shards.abort_retained();
         self.shards.clear_retained_join_handles();
         let aborted_persistence = self

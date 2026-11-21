@@ -197,8 +197,65 @@ do not prove it. SQL eligibility/concurrency checks live in `vala-sql` integrati
 and existing per-seal-key manifests cannot establish the required whole-shard
 frontier. Tests must expose those missing behaviors before the respective changes.
 
-**Evidence:** Pending. Append focused RED/GREEN, connected restart proof and the
-three benchmark checkpoint reports/comparisons here before scenario 3.
+**Evidence:** In progress; open items are marked FAIL.
+
+- Accepted-only replay (REQ-004) — `wyrd-testing`
+  `lifecycle::replay_restores_only_accepted_batches`: an accepted batch and an
+  attempt refused because its receipt could not be written; after an abrupt
+  restart only the accepted rows read back. RED: `lifecycle.rs:640`, rows
+  100–123 reappeared. GREEN. Replay now suppresses `Unfenced` on every table
+  (`scribe/shards.rs` `resolve_replay_fence`); the unused `FENCED_ONLY` table
+  flag is removed. Expected consequence:
+  `shards::tests::group_commit_crash_between_sync_and_fence_restores_nothing`
+  previously asserted the crashed, never-fenced group restored its rows; it now
+  asserts none restore and the same-ID retry holds each row once.
+- Safe frontier (REQ-005) — `scribe/wal.rs` `cover_released`, called from the
+  one deletion path `delete_closed_segments` (both `retire_segments` and replay
+  pin release route there). A segment joins its shard's frontier only once its
+  last owner released it and it is no longer current; the frontier advances
+  through consecutive sequences only, is written to the shard manifest
+  (`manifest.rs` `safe_segment`, `advance_safe_segment`, atomic write) and only
+  then are covered files deleted. Inline:
+  `wal::tests::released_segments_advance_a_persisted_contiguous_frontier`
+  (segment 1 released before 0 waits; frontier 1 after 0; then 2) and
+  `wal::tests::an_unpersisted_frontier_keeps_its_segments` (blocked manifest
+  write → error, segment kept). RED: `wal.rs:4837` segment 1 deleted ahead of
+  0, and the release succeeded without a manifest. GREEN. An earlier gap, a
+  crossing batch (its receipt names its COMMIT segment, above the frontier
+  until every slice's segment is released) and failed staging (its generation
+  never releases its segments) all hold the frontier back by construction.
+- Fixture diagnosis (Codex, read-only):
+  `execution_lanes::tests::replay_retirement_settlement_has_one_pending_group`
+  wrote 8-byte fake `.wal` files; retirement now reads the segment header to
+  place it in the frontier. Fix site: the fixture, now real segments 0 and 1.
+  `wal::tests::segment_retirement_failure_preserves_retryable_source` now fails
+  at the header read rather than at removal; its retryable-path assertion holds.
+- Safe deletion (REQ-006) — `vala-sql` `delete_handed_off` with
+  `HandedOffShard`/`RetryHistory` (default one hour, 10,000 per table), one
+  tenant-scoped statement that rechecks the current row's stream, shard and
+  COMMIT segment. `pg_scribe_batch_commits::only_handed_off_receipts_outside_retry_history_are_deleted`:
+  only the old covered receipt of the named shard goes; shrinking count history
+  removes a recent covered one; uncovered, other-stream and replacement
+  acceptances stay. RED: `pg_scribe_batch_commits.rs:525` deleted 0, expected
+  1 (empty function). GREEN, 7/7 in the file.
+- Connected journey — `lifecycle::restart_restores_accepted_rows_after_handed_off_receipts_are_deleted`:
+  published batch → manifest frontier ≥ its receipt's COMMIT segment → real
+  deletion query removes it and keeps the WAL-only batch's receipt → abrupt
+  restart → exactly rows 0–47, never-accepted 100–123 absent. Written after the
+  units it connects, so not test-first; 5/5 runs passed.
+- FAIL: replay does not read the frontier. Under accepted-only replay a missing
+  receipt already restores nothing from the WAL, so a frontier branch would not
+  change any outcome; awaiting maintainer decision.
+- FAIL: no dedicated proof yet for another pod's losing duplicate after the
+  winning receipt is deleted (same `Unfenced` branch as the refused attempt
+  above), torn tail or stage-record retirement after old fences disappear.
+- Limitation: `delete_handed_off` ranks all of a tenant's receipts per call
+  (`ponytail:` note); its cost is qualified with the cleaner in scenario 3.
+- Commands: `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo nextest run --locked -p vala-bifrost-redux --features test-support --run-ignored=all --no-fail-fast -E "test(/scribe|replay|wal|fence|staging/)"; cargo nextest run --locked -p wyrd-testing --test scribe -P journey --run-ignored=all --no-fail-fast'`
+  → 477/477 and 48/48 before the journey was added;
+  `cargo nextest run --locked -p vala-sql --test integration -E "test(/pg_scribe_batch_commits/)"`
+  → 7/7; `mise run lints`, `check:tenant-isolation`, `git diff --check` clean.
+- Benchmark checkpoint: skipped by maintainer direction.
 
 ### 3. Background deletion keeps up or pauses fresh admission safely
 

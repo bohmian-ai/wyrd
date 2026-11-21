@@ -36,8 +36,8 @@ pub use authority::{
     AuthorityState, authority_state,
 };
 pub use browser_sessions::{
-    BrowserSessionAuthority, LiveBrowserSession, insert_browser_session, live_browser_session,
-    revoke_browser_session,
+    BrowserSessionAuthority, LiveBrowserSession, SocialAnchor, insert_browser_session,
+    live_browser_session, revoke_browser_session,
 };
 pub use device_authorizations::{
     DevicePoll, approve_device_authorization, delete_device_authorization,
@@ -90,7 +90,10 @@ pub use trusted_issuers::{
     TrustedIssuerWrite, delete_trusted_issuer, insert_trusted_issuer, trusted_issuer_by_url,
     trusted_issuer_exists, trusted_issuers_for_tenant, upsert_trusted_issuer,
 };
-pub use user_identities::{upsert_user_identity, user_id_by_identity};
+pub use user_identities::{
+    LinkedIdentity, insert_user_identity, linked_identity, upsert_user_identity,
+    user_id_by_identity,
+};
 pub use users::{
     LocalCredentialRow, UserRow, delete_user, insert_local_user, insert_user,
     local_credential_by_username, local_credential_for_update, local_username, set_password_hash,

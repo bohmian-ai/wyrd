@@ -1444,6 +1444,29 @@ fn platform_token_reply(
     audience: &str,
     kid: &str,
 ) -> wiremock::ResponseTemplate {
+    identity_token_reply(
+        issuer,
+        nonce,
+        audience,
+        kid,
+        "provider-subject-1",
+        "ops@example.com",
+    )
+}
+
+/// A token-endpoint reply as [`platform_token_reply`], for the provider
+/// identity `subject` asserting `email`.
+///
+/// # Panics
+/// Panics when the test key does not load or the token does not sign.
+fn identity_token_reply(
+    issuer: &str,
+    nonce: &str,
+    audience: &str,
+    kid: &str,
+    subject: &str,
+    email: &str,
+) -> wiremock::ResponseTemplate {
     let now = chrono::Utc::now().timestamp();
     let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::EdDSA);
     header.kid = Some(kid.to_owned());
@@ -1453,12 +1476,12 @@ fn platform_token_reply(
         &header,
         &json!({
             "iss": issuer,
-            "sub": "provider-subject-1",
+            "sub": subject,
             "aud": audience,
             "exp": now + 3600,
             "iat": now,
             "nonce": nonce,
-            "email": "ops@example.com",
+            "email": email,
             "email_verified": true,
         }),
         &key,
@@ -5872,16 +5895,21 @@ struct BegunSocialLogin {
 /// # Panics
 /// Panics when sign-in does not begin or sets no `wyrd_login` cookie.
 async fn begin_google_login(srv: &WyrdTestServer, slug: &str) -> BegunSocialLogin {
+    begin_google(srv, json!({ "tenant": slug, "provider": "google" })).await
+}
+
+/// Begin a Google sign-in with the login request `body`.
+///
+/// # Panics
+/// Panics when sign-in does not begin or sets no `wyrd_login` cookie.
+async fn begin_google(srv: &WyrdTestServer, body: Value) -> BegunSocialLogin {
     let request = Request::builder()
         .method(Method::POST)
         .uri("/auth/browser/login")
         .header(header::HOST, SOCIAL_HOST)
         .header(header::ORIGIN, format!("http://{SOCIAL_HOST}"))
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&json!({ "tenant": slug, "provider": "google" }))
-                .expect("serializes"),
-        ))
+        .body(Body::from(serde_json::to_vec(&body).expect("serializes")))
         .expect("request builds");
     let resp = srv.oneshot(request).await.expect("login route responds");
     let status = resp.status();
@@ -6591,4 +6619,483 @@ async fn an_operator_relays_invitations_through_smtp() {
         stalled_issue["invitations"][0]["invitation"]["delivery"],
         "failed"
     );
+}
+
+/// The session cookie a successful sign-in set for tenant `slug`.
+fn session_cookie(location_and_cookies: &Response<Body>, slug: &str) -> Option<String> {
+    let name = format!("wyrd_session_{slug}=");
+    location_and_cookies
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find(|value| value.starts_with(&name))
+        .and_then(|value| value.split(';').next())
+        .map(str::to_owned)
+}
+
+/// Finish `begun` at the Google callback from its own browser; returns the
+/// status, `Location` and the tenant session cookie pair, when one was set.
+async fn finish_google_session(
+    srv: &WyrdTestServer,
+    begun: &BegunSocialLogin,
+    issuer: &str,
+    slug: &str,
+) -> (StatusCode, Option<String>, Option<String>) {
+    let resp = srv
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(social_callback(&begun.query["state"], issuer))
+                .header(header::HOST, SOCIAL_HOST)
+                .header(header::COOKIE, &begun.cookie)
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("callback responds");
+    let location = resp
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    (resp.status(), location, session_cookie(&resp, slug))
+}
+
+/// Call tenant route `uri` as a browser holding the session `cookie`.
+async fn browser_get(srv: &WyrdTestServer, uri: &str, cookie: &str) -> (StatusCode, Value) {
+    social_call(
+        srv,
+        Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .header(header::HOST, SOCIAL_HOST)
+            .header(header::ORIGIN, format!("http://{SOCIAL_HOST}"))
+            .header(header::COOKIE, cookie)
+            .body(Body::empty())
+            .expect("request builds"),
+    )
+    .await
+}
+
+/// An invited person opens their link, proves Google and enters with
+/// exactly the invited access, then returns with Google as the same User:
+///   1. beginning Google from the link spends nothing;
+///   2. a Google identity whose email differs from the invited address
+///      enrolls one User, one identity and exactly the invited binding, and
+///      consumes the invitation;
+///   3. the session reaches the invited scope and nothing outside it;
+///   4. after logout the same Google identity signs back in to the same User
+///      and access, adding no record;
+///   5. a spent, revoked, superseded or expired link admits no one and
+///      creates no User, and an identity that already has a User cannot
+///      enroll a second one and spends no link;
+///   6. the identity is a stranger in another tenant until invited there,
+///      then a distinct User, and no session crosses tenants;
+///   7. a suspended User cannot return.
+///
+/// # Panics
+/// Panics when any step's response or stored records differ.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invited_person_enrolls_with_google_and_returns() {
+    let google = wiremock::MockServer::start().await;
+    let srv = WyrdTestServer::builder()
+        .with_social_endpoints_for_test(wyrd_server::config::SocialConfig {
+            google_issuer: Some(google.uri()),
+        })
+        .start_in_process()
+        .await
+        .expect("server starts");
+    let root = initialize_platform_root(&srv)
+        .await
+        .expect("deployment initializes");
+    let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
+    let tenant = srv.data_tenant_id();
+    let slug = srv.pg_fixture().tenant_slug().to_owned();
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    mount_platform_provider(
+        &google,
+        platform_key_set("google-key"),
+        wiremock::ResponseTemplate::new(500),
+    )
+    .await;
+    enable_google(&srv, &session, &google).await;
+    let issuer = google.uri();
+    let admin = srv
+        .bootstrap_service_in_tenant(tenant, "google-invite-admin", &["admin"])
+        .await
+        .expect("tenant admin bootstraps");
+    let admin = srv
+        .exchange_api_key(admin.api_key().expect("admin has an api key"))
+        .await
+        .expect("admin key exchanges");
+    let payments = json!({ "card": { "family": { "kind": "Prompt", "name": "payments" } } });
+    let invite = |recipient: &str| {
+        social_request(
+            Method::POST,
+            "/v1/principals/users/invitations",
+            Some(&admin),
+            Some(json!({
+                "recipients": [recipient],
+                "assignments": [{ "role": "viewer", "scope": payments }],
+            })),
+        )
+    };
+    let code_of = |issued: &Value| {
+        issued["invitations"][0]["invitation_link"]
+            .as_str()
+            .and_then(|link| link.split_once("#invitation="))
+            .map(|(_, code)| code.to_owned())
+            .expect("the link carries its code")
+    };
+    let pending = || async {
+        let (_, listed) = social_call(
+            &srv,
+            social_request(
+                Method::GET,
+                "/v1/principals/users/invitations",
+                Some(&admin),
+                None,
+            ),
+        )
+        .await;
+        listed["invitations"].as_array().expect("invitations").len()
+    };
+    let answer = |begun: &BegunSocialLogin, subject: &str, email: &str| {
+        identity_token_reply(
+            &issuer,
+            &begun.query["nonce"],
+            "wyrd-google",
+            "google-key",
+            subject,
+            email,
+        )
+    };
+
+    // 1. Beginning Google from the link spends nothing.
+    let (status, issued) = social_call(&srv, invite("ana@example.test")).await;
+    assert_eq!(status, StatusCode::CREATED, "invite: {issued}");
+    let code = code_of(&issued);
+    let before = local_records(&superuser).await;
+    let begun = begin_google(
+        &srv,
+        json!({ "tenant": slug, "provider": "google", "invitation_code": code }),
+    )
+    .await;
+    assert_eq!(pending().await, 1, "opening the link spends nothing");
+
+    // 2. A differing Google email enrolls exactly the invited access.
+    mount_platform_provider(
+        &google,
+        platform_key_set("google-key"),
+        answer(&begun, "google-ana", "ana.personal@gmail.com"),
+    )
+    .await;
+    let (status, location, cookie) = finish_google_session(&srv, &begun, &issuer, &slug).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "enrollment: {location:?}");
+    assert_eq!(location.as_deref(), Some(format!("/t/{slug}").as_str()));
+    let cookie = cookie.expect("a tenant session is set");
+    let after = local_records(&superuser).await;
+    assert_eq!(
+        (after.0 - before.0, after.1 - before.1),
+        (1, 1),
+        "one User and one identity"
+    );
+    let (user,): (uuid::Uuid,) = sqlx::query_as(
+        "SELECT user_id FROM wyrd.auth_user_identities WHERE issuer = $1 AND subject = 'google-ana'",
+    )
+    .bind(&issuer)
+    .fetch_one(&superuser)
+    .await
+    .expect("the identity links its User");
+    let bindings: Vec<(String, Value)> = sqlx::query_as(
+        "SELECT r.name, b.scope FROM wyrd.auth_role_bindings b \
+           JOIN wyrd.auth_roles r ON r.id = b.role_id WHERE b.user_id = $1",
+    )
+    .bind(user)
+    .fetch_all(&superuser)
+    .await
+    .expect("bindings read");
+    assert_eq!(bindings, vec![("viewer".to_owned(), payments.clone())]);
+    assert_eq!(pending().await, 0, "the invitation is consumed");
+
+    // 3. The session reaches the invited scope only.
+    let (status, viewed) = browser_get(&srv, "/auth/browser/session", &cookie).await;
+    assert_eq!(status, StatusCode::OK, "session view: {viewed}");
+    assert_eq!(viewed["sessions"][0]["principal_id"], user.to_string());
+    assert_eq!(viewed["sessions"][0]["credential"], "social");
+    for name in ["payments", "ledger"] {
+        let mut declare = social_request(
+            Method::POST,
+            "/v1/cards",
+            Some(&admin),
+            Some(json!({ "submissions": [{
+                "apiVersion": "wyrd/v1",
+                "kind": "Prompt",
+                "metadata": { "name": name, "version": "1.0.0" },
+                "spec": {
+                    "provider": "openai",
+                    "model": "gpt-4o",
+                    "messages": [{ "role": "user", "content": "hello" }]
+                },
+                "artifacts": []
+            }] })),
+        );
+        declare.headers_mut().insert(
+            "idempotency-key",
+            header::HeaderValue::from_static(if name == "payments" {
+                "declare-p"
+            } else {
+                "declare-l"
+            }),
+        );
+        let (status, body) = social_call(&srv, declare).await;
+        assert_eq!(status, StatusCode::CREATED, "declare {name}: {body}");
+    }
+    let (status, body) = browser_get(&srv, "/v1/cards/Prompt/payments/latest", &cookie).await;
+    assert_eq!(status, StatusCode::OK, "the invited scope: {body}");
+    let (status, body) = browser_get(&srv, "/v1/cards/Prompt/ledger/latest", &cookie).await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (
+            StatusCode::NOT_FOUND,
+            Some("WYRD_REGISTRY_404_CARD_NOT_FOUND")
+        ),
+        "outside the invited scope a Card is not visible: {body}"
+    );
+
+    // 4. Returning with Google signs in the same User, adding nothing.
+    let begun = begin_google_login(&srv, &slug).await;
+    mount_platform_provider(
+        &google,
+        platform_key_set("google-key"),
+        answer(&begun, "google-ana", "ana.renamed@gmail.com"),
+    )
+    .await;
+    let records = local_records(&superuser).await;
+    let (status, location, returned) = finish_google_session(&srv, &begun, &issuer, &slug).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "return: {location:?}");
+    let returned = returned.expect("the returning sign-in sets a session");
+    let (_, viewed) = browser_get(&srv, "/auth/browser/session", &returned).await;
+    assert_eq!(viewed["sessions"][0]["principal_id"], user.to_string());
+    let after = local_records(&superuser).await;
+    assert_eq!(
+        (after.0, after.1, after.3),
+        (records.0, records.1, records.3),
+        "a return adds no User, identity or grant"
+    );
+
+    // 5. Spent, revoked and superseded links, and an owned identity, admit no one.
+    let refused = format!("/t/{slug}/login?login=failed");
+    let enroll_with = |code: String, subject: &'static str| {
+        let srv = &srv;
+        let slug = &slug;
+        let google = &google;
+        let issuer = &issuer;
+        async move {
+            let begun = begin_google(
+                srv,
+                json!({ "tenant": slug, "provider": "google", "invitation_code": code }),
+            )
+            .await;
+            mount_platform_provider(
+                google,
+                platform_key_set("google-key"),
+                identity_token_reply(
+                    issuer,
+                    &begun.query["nonce"],
+                    "wyrd-google",
+                    "google-key",
+                    subject,
+                    "someone@example.test",
+                ),
+            )
+            .await;
+            finish_google_session(srv, &begun, issuer, slug).await
+        }
+    };
+    let before = local_records(&superuser).await;
+    let (_, location, cookie) = enroll_with(code, "google-replay").await;
+    assert_eq!(location.as_deref(), Some(refused.as_str()), "a spent link");
+    assert!(cookie.is_none());
+    let (_, revoked) = social_call(&srv, invite("rev@example.test")).await;
+    let (status, _) = social_call(
+        &srv,
+        social_request(
+            Method::DELETE,
+            &format!(
+                "/v1/principals/users/invitations/{}",
+                revoked["invitations"][0]["invitation"]["id"]
+                    .as_str()
+                    .expect("id")
+            ),
+            Some(&admin),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, location, _) = enroll_with(code_of(&revoked), "google-revoked").await;
+    assert_eq!(
+        location.as_deref(),
+        Some(refused.as_str()),
+        "a revoked link"
+    );
+    let (_, superseded) = social_call(&srv, invite("sup@example.test")).await;
+    let (status, _) = social_call(
+        &srv,
+        social_request(
+            Method::POST,
+            &format!(
+                "/v1/principals/users/invitations/{}/resend",
+                superseded["invitations"][0]["invitation"]["id"]
+                    .as_str()
+                    .expect("id")
+            ),
+            Some(&admin),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, location, _) = enroll_with(code_of(&superseded), "google-superseded").await;
+    assert_eq!(
+        location.as_deref(),
+        Some(refused.as_str()),
+        "a superseded link"
+    );
+    assert_eq!(
+        local_records(&superuser).await.0,
+        before.0,
+        "no User was created"
+    );
+    let (_, owned) = social_call(&srv, invite("owned@example.test")).await;
+    let live = pending().await;
+    let (_, location, cookie) = enroll_with(code_of(&owned), "google-ana").await;
+    assert_eq!(
+        location.as_deref(),
+        Some(format!("/t/{slug}/login?login=account_exists").as_str()),
+        "an identity with a User is told to sign in"
+    );
+    assert!(cookie.is_none());
+    assert_eq!(
+        pending().await,
+        live,
+        "the owned-identity refusal spends no link"
+    );
+    assert_eq!(local_records(&superuser).await.0, before.0);
+    let (_, expired) = social_call(&srv, invite("late@example.test")).await;
+    sqlx::query(
+        "UPDATE wyrd.auth_user_invitations SET created_at = created_at - interval '25 hours', \
+            expires_at = expires_at - interval '25 hours' WHERE id = $1",
+    )
+    .bind(
+        uuid::Uuid::parse_str(
+            expired["invitations"][0]["invitation"]["id"]
+                .as_str()
+                .expect("id"),
+        )
+        .expect("uuid"),
+    )
+    .execute(&superuser)
+    .await
+    .expect("invitation ages");
+    let (_, location, _) = enroll_with(code_of(&expired), "google-late").await;
+    assert_eq!(
+        location.as_deref(),
+        Some(refused.as_str()),
+        "an expired link"
+    );
+    assert_eq!(
+        local_records(&superuser).await.0,
+        before.0,
+        "no User was created"
+    );
+
+    // 6. The same Google identity is a stranger in another tenant until that
+    //    tenant invites it, and then it is a distinct User there.
+    let beta = srv.seed_tenant("beta").await.expect("tenant seeds");
+    let begun = begin_google_login(&srv, "beta").await;
+    mount_platform_provider(
+        &google,
+        platform_key_set("google-key"),
+        answer(&begun, "google-ana", "ana.personal@gmail.com"),
+    )
+    .await;
+    let (_, location, cookie) = finish_google_session(&srv, &begun, &issuer, "beta").await;
+    assert_eq!(location.as_deref(), Some("/t/beta/login?login=no_account"));
+    assert!(cookie.is_none(), "an identity is tenant-local");
+    let beta_admin = srv
+        .bootstrap_service_in_tenant(beta, "beta-invite-admin", &["admin"])
+        .await
+        .expect("beta admin bootstraps");
+    let beta_admin = srv
+        .exchange_api_key(beta_admin.api_key().expect("admin has an api key"))
+        .await
+        .expect("beta admin key exchanges");
+    let (status, beta_issued) = social_call(
+        &srv,
+        social_request(
+            Method::POST,
+            "/v1/principals/users/invitations",
+            Some(&beta_admin),
+            Some(json!({
+                "recipients": ["ana@example.test"],
+                "assignments": [{ "role": "viewer", "scope": "all" }],
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "beta invite: {beta_issued}");
+    let begun = begin_google(
+        &srv,
+        json!({ "tenant": "beta", "provider": "google", "invitation_code": code_of(&beta_issued) }),
+    )
+    .await;
+    mount_platform_provider(
+        &google,
+        platform_key_set("google-key"),
+        answer(&begun, "google-ana", "ana.personal@gmail.com"),
+    )
+    .await;
+    let (_, location, beta_cookie) = finish_google_session(&srv, &begun, &issuer, "beta").await;
+    assert_eq!(location.as_deref(), Some("/t/beta"));
+    let beta_cookie = beta_cookie.expect("a beta session is set");
+    let (_, viewed) = browser_get(&srv, "/auth/browser/session", &beta_cookie).await;
+    let beta_user = viewed["sessions"][0]["principal_id"]
+        .as_str()
+        .expect("principal")
+        .to_owned();
+    assert_ne!(beta_user, user.to_string(), "a distinct User per tenant");
+    let relabeled = returned.replacen(&format!("wyrd_session_{slug}="), "wyrd_session_beta=", 1);
+    let (status, _) = browser_get(&srv, "/auth/browser/session", &relabeled).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "no cross-tenant session use"
+    );
+
+    // 7. A suspended User cannot return.
+    sqlx::query("UPDATE wyrd.auth_users SET status = 'suspended' WHERE id = $1")
+        .bind(user)
+        .execute(&superuser)
+        .await
+        .expect("User suspends");
+    let begun = begin_google_login(&srv, &slug).await;
+    mount_platform_provider(
+        &google,
+        platform_key_set("google-key"),
+        answer(&begun, "google-ana", "ana.personal@gmail.com"),
+    )
+    .await;
+    let (_, location, cookie) = finish_google_session(&srv, &begun, &issuer, &slug).await;
+    assert_eq!(
+        location.as_deref(),
+        Some(refused.as_str()),
+        "a suspended User"
+    );
+    assert!(cookie.is_none());
 }

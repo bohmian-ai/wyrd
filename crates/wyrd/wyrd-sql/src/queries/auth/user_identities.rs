@@ -25,6 +25,66 @@ const USER_ID_BY_IDENTITY_SQL: &str = r"
        AND subject = $2
 ";
 
+const LINKED_IDENTITY_SQL: &str = r"
+    SELECT id, user_id
+      FROM wyrd.auth_user_identities
+     WHERE issuer = $1
+       AND subject = $2
+";
+
+const INSERT_USER_IDENTITY_SQL: &str = r"
+    INSERT INTO wyrd.auth_user_identities (data_tenant_id, issuer, subject, user_id)
+    VALUES ($1, $2, $3, $4)
+    RETURNING id
+";
+
+/// A provider identity linked to a tenant User.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow)]
+pub struct LinkedIdentity {
+    /// The identity's stable id, which credentials anchor to.
+    pub id: Uuid,
+    /// The User it belongs to.
+    pub user_id: Uuid,
+}
+
+/// The tenant User linked to provider identity (`issuer`, `subject`), when
+/// one is.
+///
+/// # Errors
+/// Returns a SQLx error when Postgres rejects the read.
+pub async fn linked_identity(
+    conn: &mut TenantConn<'_>,
+    issuer: &str,
+    subject: &str,
+) -> Result<Option<LinkedIdentity>, sqlx::Error> {
+    sqlx::query_as(LINKED_IDENTITY_SQL)
+        .bind(issuer)
+        .bind(subject)
+        .fetch_optional(&mut **conn.transaction())
+        .await
+}
+
+/// Link provider identity (`issuer`, `subject`) to `user_id` and return the
+/// new identity id.
+///
+/// # Errors
+/// Returns a SQLx error when Postgres rejects the insert, including a unique
+/// violation (`23505`) when the identity is already linked in this tenant.
+pub async fn insert_user_identity(
+    conn: &mut TenantConn<'_>,
+    issuer: &str,
+    subject: &str,
+    user_id: Uuid,
+) -> Result<Uuid, sqlx::Error> {
+    sqlx::query_scalar(INSERT_USER_IDENTITY_SQL)
+        .bind(conn.data_tenant_id().as_uuid())
+        .bind(issuer)
+        .bind(subject)
+        .bind(user_id)
+        .fetch_one(&mut **conn.transaction())
+        .await
+}
+
 /// Insert or retain a federated identity mapping.
 ///
 /// Returns the canonical `user_id` linked to `(issuer, subject)` after the

@@ -27,13 +27,14 @@ use wyrd_crypt::SealingKeyring;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
     AbsoluteUrl, CallbackQuery, ConfigureSocialProviderRequest, EnableSocialProviderRequest,
-    IssuerUrl, LoginMethodsResponse, LoginSettings, ProviderResponse, Sha256Hex, SocialProvider,
-    SocialProviderState, SocialProviderView, SocialProvidersResponse,
+    IssuerUrl, LoginMethodsResponse, LoginSettings, ProviderResponse, SecretBearer, Sha256Hex,
+    SocialProvider, SocialProviderState, SocialProviderView, SocialProvidersResponse,
 };
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::TenantSlug;
 use wyrd_sql::queries::auth::{
-    SocialLoginState, consume_social_login_state, insert_social_login_state, user_id_by_identity,
+    BrowserSessionAuthority, SocialAnchor, SocialLoginState, consume_social_login_state,
+    insert_social_login_state, insert_user, insert_user_identity, linked_identity,
 };
 use wyrd_sql::queries::platform::social::{
     LoginSettingsRow, ProviderEnablement, SocialProviderRow, SocialTestState,
@@ -43,12 +44,16 @@ use wyrd_sql::queries::platform::social::{
 };
 use wyrd_sql::{OperatorPool, TenantConn};
 
-use crate::browser_sessions::{BegunBrowserLogin, BrowserSessions, random_secret};
+use crate::browser_sessions::{
+    BegunBrowserLogin, BrowserSessions, CreatedBrowserSession, create_session, random_secret,
+};
 use crate::callback::{
     LoginCompletion, audit_authorization_code_failure, provider_refusal, verify_response_issuer,
 };
 use crate::error::{relying_party_error, store_error};
+use crate::issuance::TenantGrant;
 use crate::login::{LOGIN_STATE_TTL, login_unavailable};
+use crate::passwords::code_hash;
 
 /// Google's OpenID Connect issuer.
 pub const GOOGLE_ISSUER: &str = "https://accounts.google.com";
@@ -611,17 +616,21 @@ fn instructions(provider: SocialProvider, callback: &Url) -> String {
 }
 
 impl BrowserSessions {
-    /// Begin a returning sign-in for `tenant_route_key` through the enabled
-    /// shared `provider`, from the browser that will hold the returned
-    /// login-transaction binding.
+    /// Begin a sign-in for `tenant_route_key` through the enabled shared
+    /// `provider`, from the browser that will hold the returned
+    /// login-transaction binding: a returning sign-in, or with `invitation`
+    /// the enrollment that redeems that invitation link's code. Beginning
+    /// spends no invitation.
     ///
-    /// The tenant transaction binds the purpose, the exact provider revision
+    /// The tenant transaction binds the purpose, the invitation code's
+    /// SHA-256 when there is one, the exact provider revision
     /// and client, the provider's social callback on `origin`, server-held
     /// PKCE and nonce, and only the SHA-256 of the browser binding and state.
     /// Nothing is audited: initiation evaluates no principal permission.
     ///
     /// # Errors
-    /// Returns [`WyrdError::InvalidToken`] for an unknown tenant or a provider
+    /// Returns [`WyrdError::OneTimeCodeInvalid`] for a malformed invitation
+    /// code, [`WyrdError::InvalidToken`] for an unknown tenant or a provider
     /// that is not enabled, [`WyrdError::InvalidState`] for a reused state,
     /// and the provider and store availability errors.
     pub async fn begin_social(
@@ -629,8 +638,10 @@ impl BrowserSessions {
         social: &SocialSignIn,
         tenant_route_key: &TenantSlug,
         provider: SocialProvider,
+        invitation: Option<&SecretBearer>,
         origin: &Url,
     ) -> Result<BegunBrowserLogin, WyrdError> {
+        let invitation = invitation.map(code_hash).transpose()?;
         let postgres = self.connections.postgres();
         let tenant = postgres
             .resolve_tenant_slug(tenant_route_key)
@@ -652,6 +663,7 @@ impl BrowserSessions {
             code_verifier: authorization.code_verifier,
             nonce: authorization.nonce,
             browser_binding: Sha256Hex::digest(binding.expose_secret().as_bytes()),
+            invitation,
         };
         let mut conn = postgres.tenant_conn(tenant).await.map_err(store_error)?;
         if !insert_social_login_state(
@@ -682,11 +694,15 @@ impl BrowserSessions {
     /// Returns `Ok(None)` when `state_key` names no pending tenant sign-in.
     /// Otherwise the transaction is consumed and committed before any provider
     /// IO, the browser binding must match, the bound revision must still be
-    /// current and enabled, and the provider identity is verified. Only an
-    /// identity already linked to a tenant User under (issuer, subject) may
-    /// sign in; an email never selects a User. A stranger is refused with
-    /// account guidance and nothing is created. Every refusal is audited
-    /// without blocking and returned as [`LoginCompletion::Refused`].
+    /// current and enabled, and the provider identity is verified. A
+    /// returning sign-in admits only an identity already linked to a tenant
+    /// User under (issuer, subject); an email never selects a User, and a
+    /// stranger is refused with account guidance. An enrollment refuses an
+    /// identity that already has a User with sign-in guidance; otherwise one
+    /// tenant transaction creates the User, redeems the bound invitation,
+    /// links the identity and creates the session, so a refusal leaves none
+    /// of them. Every refusal is audited without blocking and returned as
+    /// [`LoginCompletion::Refused`]; a sign-in is audited as a login.
     ///
     /// # Errors
     /// Returns [`WyrdError::AuthVerifyUnavailable`] when the tenant lookup
@@ -720,14 +736,17 @@ impl BrowserSessions {
             )
             .await
         {
-            Ok(completion) => return Ok(Some(completion)),
+            Ok(created) => {
+                self.stage_login(&created.session, request_id);
+                return Ok(Some(LoginCompletion::SignedIn(created)));
+            }
             Err(error) => error,
         };
         audit_authorization_code_failure(self.issuer.audit(), tenant_id, request_id, &error);
         Ok(Some(LoginCompletion::Refused { tenant_id, error }))
     }
 
-    /// The tenant part of [`Self::complete_social`].
+    /// The tenant part of [`Self::complete_social`]: the committed session.
     ///
     /// # Errors
     /// Returns every refusal [`Self::complete_social`] reports as
@@ -740,7 +759,7 @@ impl BrowserSessions {
         state_hash: &Sha256Hex,
         query: &CallbackQuery,
         browser_binding: Option<&str>,
-    ) -> Result<LoginCompletion, WyrdError> {
+    ) -> Result<CreatedBrowserSession, WyrdError> {
         let response_issuer = query.iss.as_deref();
         let postgres = self.connections.postgres();
         let mut conn = postgres.tenant_conn(tenant_id).await.map_err(store_error)?;
@@ -770,22 +789,55 @@ impl BrowserSessions {
             .verify_login(provider, &state, code, response_issuer)
             .await?;
         let mut conn = postgres.tenant_conn(tenant_id).await.map_err(store_error)?;
-        let user = user_id_by_identity(&mut conn, &state.issuer, &identity.subject)
+        let linked = linked_identity(&mut conn, &state.issuer, &identity.subject)
             .await
             .map_err(store_error)?;
-        drop(conn);
-        match user {
-            None => Err(WyrdError::InvalidToken {
-                message: format!(
-                    "no account in this workspace uses this {provider} sign-in; \
-                     accept an invitation or create a workspace"
-                ),
-                details: json!({ "reason": "no_account" }),
+        let (user_id, identity_id) = match (state.invitation, linked) {
+            (None, Some(linked)) => (linked.user_id, linked.id),
+            (None, None) => {
+                return Err(WyrdError::InvalidToken {
+                    message: format!(
+                        "no account in this workspace uses this {provider} sign-in; \
+                         accept an invitation or create a workspace"
+                    ),
+                    details: json!({ "reason": "no_account" }),
+                });
+            }
+            (Some(_), Some(_)) => return Err(account_exists(provider)),
+            (Some(code), None) => {
+                let user_id = Uuid::now_v7();
+                insert_user(&mut conn, user_id, identity.email.as_deref(), "oidc", None)
+                    .await
+                    .map_err(store_error)?;
+                self.redeem_invitation(&mut conn, &code, user_id).await?;
+                let identity_id =
+                    insert_user_identity(&mut conn, &state.issuer, &identity.subject, user_id)
+                        .await
+                        .map_err(|error| match &error {
+                            sqlx::Error::Database(db) if db.code().as_deref() == Some("23505") => {
+                                account_exists(provider)
+                            }
+                            _ => store_error(error),
+                        })?;
+                (user_id, identity_id)
+            }
+        };
+        let verified = self
+            .issuer
+            .verify(&mut conn, user_id, TenantGrant::OidcLogin)
+            .await?;
+        let created = create_session(
+            &mut conn,
+            verified,
+            BrowserSessionAuthority::Social(SocialAnchor {
+                provider,
+                provider_revision: state.provider_revision,
+                identity_id,
             }),
-            Some(_) => Err(invalid_token(&format!(
-                "{provider} sign-in is not available for this account"
-            ))),
-        }
+        )
+        .await?;
+        conn.commit().await.map_err(store_error)?;
+        Ok(created)
     }
 }
 
@@ -810,6 +862,17 @@ fn oidc_claims() -> ClaimMapping {
         subject: ClaimPath::new("sub"),
         email: Some(ClaimPath::new("email")),
         groups: None,
+    }
+}
+
+/// An enrollment whose provider identity already has a User here.
+fn account_exists(provider: SocialProvider) -> WyrdError {
+    WyrdError::InvalidToken {
+        message: format!(
+            "this {provider} sign-in already has an account in this workspace; \
+             sign in with it, or ask an administrator for more access"
+        ),
+        details: json!({ "reason": "account_exists" }),
     }
 }
 

@@ -607,9 +607,11 @@ mod tests {
 const INSERT_SOCIAL_LOGIN_STATE_SQL: &str = r"
     INSERT INTO wyrd.auth_login_state (
         state_hash, data_tenant_id, flow, social_provider, social_provider_revision,
-        social_purpose, issuer, client_id, redirect_uri, code_verifier, nonce,
-        browser_binding_hash, expires_at
-    ) VALUES ($1, $2, 'social', $3, $4, 'login', $5, $6, $7, $8, $9, $10,
+        social_purpose, social_invitation_hash, issuer, client_id, redirect_uri,
+        code_verifier, nonce, browser_binding_hash, expires_at
+    ) VALUES ($1, $2, 'social', $3, $4,
+              CASE WHEN $12::bytea IS NULL THEN 'login' ELSE 'invitation' END, $12,
+              $5, $6, $7, $8, $9, $10,
               statement_timestamp() + ($11 * interval '1 second'))
     ON CONFLICT DO NOTHING
 ";
@@ -626,7 +628,7 @@ const CONSUME_SOCIAL_LOGIN_STATE_SQL: &str = r"
        AND consumed_at IS NULL
        AND expires_at > statement_timestamp()
     RETURNING social_provider_revision, issuer, client_id, redirect_uri, code_verifier,
-              nonce, browser_binding_hash
+              nonce, browser_binding_hash, social_invitation_hash
 ";
 
 /// One shared social sign-in transaction: written when a tenant sign-in page
@@ -649,6 +651,9 @@ pub struct SocialLoginState {
     pub nonce: String,
     /// Digest of the beginning browser's login-transaction secret.
     pub browser_binding: Sha256Hex,
+    /// Digest of the invitation code an enrollment sign-in redeems; `None`
+    /// for a returning sign-in.
+    pub invitation: Option<Sha256Hex>,
 }
 
 /// Raw consumed social row.
@@ -668,6 +673,8 @@ struct SocialLoginRow {
     nonce: String,
     /// Browser binding digest.
     browser_binding_hash: Vec<u8>,
+    /// Invitation code digest, for an enrollment sign-in.
+    social_invitation_hash: Option<Vec<u8>>,
 }
 
 /// Insert a social sign-in for `provider` keyed by `state_hash` whose expiry
@@ -701,6 +708,7 @@ pub async fn insert_social_login_state(
         .bind(&row.nonce)
         .bind(row.browser_binding.as_bytes().as_slice())
         .bind(ttl.as_secs_f64())
+        .bind(row.invitation.as_ref().map(|hash| hash.as_bytes().to_vec()))
         .execute(&mut **conn.transaction())
         .await?;
     Ok(inserted.rows_affected() == 1)
@@ -723,8 +731,16 @@ pub async fn consume_social_login_state(
         .fetch_optional(&mut **conn.transaction())
         .await?;
     row.map(|row| {
-        let digest = <[u8; 32]>::try_from(row.browser_binding_hash.as_slice())
-            .map_err(|_| sqlx::Error::Decode("social login state is corrupt".into()))?;
+        let digest = |bytes: &[u8]| {
+            <[u8; 32]>::try_from(bytes)
+                .map(Sha256Hex::from)
+                .map_err(|_| sqlx::Error::Decode("social login state is corrupt".into()))
+        };
+        let invitation = row
+            .social_invitation_hash
+            .as_deref()
+            .map(digest)
+            .transpose()?;
         Ok(SocialLoginState {
             provider_revision: row.social_provider_revision,
             issuer: row.issuer,
@@ -732,7 +748,8 @@ pub async fn consume_social_login_state(
             redirect_uri: row.redirect_uri,
             code_verifier: SecretString::from(row.code_verifier),
             nonce: row.nonce,
-            browser_binding: Sha256Hex::from(digest),
+            browser_binding: digest(&row.browser_binding_hash)?,
+            invitation,
         })
     })
     .transpose()

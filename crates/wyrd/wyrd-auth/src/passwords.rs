@@ -309,7 +309,7 @@ const ONE_TIME_CODE_CHARS: usize = 43;
 /// # Errors
 /// Returns [`WyrdError::OneTimeCodeInvalid`] for any value that is not 43
 /// base64url characters, before any lookup or derivation.
-fn code_hash(code: &SecretBearer) -> Result<Sha256Hex, WyrdError> {
+pub(crate) fn code_hash(code: &SecretBearer) -> Result<Sha256Hex, WyrdError> {
     let code = code.expose();
     let well_formed = code.len() == ONE_TIME_CODE_CHARS
         && code
@@ -545,25 +545,47 @@ impl BrowserSessions {
         insert_local_user(&mut conn, user_id, &username, &verifier)
             .await
             .map_err(enrollment_error)?;
-        let invitation = consume_invitation(&mut conn, &code, user_id)
+        self.redeem_invitation(&mut conn, &code, user_id).await?;
+        let created = self.password_session(&mut conn, user_id, 0).await?;
+        conn.commit().await.map_err(store_error)?;
+        self.stage_login(&created.session, request_id);
+        Ok(created)
+    }
+
+    /// Consume the invitation whose code digest is `code` for the new User
+    /// `user_id` on `conn` and grant that User its assignments.
+    ///
+    /// Exactly one of two concurrent redemptions of a code consumes it. The
+    /// invitation's issuer must still hold tenant administration and every
+    /// assignment must still apply; otherwise nothing is granted and the
+    /// caller must drop `conn` uncommitted, which also discards the User.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::OneTimeCodeInvalid`] for an unknown, spent,
+    /// revoked, superseded or expired invitation, a former issuer, or an
+    /// inapplicable assignment, and [`WyrdError::AuthVerifyUnavailable`] when
+    /// the store fails.
+    pub(crate) async fn redeem_invitation(
+        &self,
+        conn: &mut TenantConn<'_>,
+        code: &Sha256Hex,
+        user_id: Uuid,
+    ) -> Result<(), WyrdError> {
+        let invitation = consume_invitation(conn, code, user_id)
             .await
             .map_err(store_error)?
             .ok_or_else(one_time_code_invalid)?;
         let issuer_permissions = self
             .issuer
-            .current_permissions(&mut conn, invitation.issuer_principal_id)
+            .current_permissions(conn, invitation.issuer_principal_id)
             .await?;
         if !issuer_permissions.is_some_and(|held| held.contains(&Permission::wildcard())) {
             tracing::info!("invitation issuer no longer holds tenant administration");
             return Err(one_time_code_invalid());
         }
-        bind_assignments(&mut conn, user_subject(user_id), &invitation.assignments.0)
+        bind_assignments(conn, user_subject(user_id), &invitation.assignments.0)
             .await
-            .map_err(|_| one_time_code_invalid())?;
-        let created = self.password_session(&mut conn, user_id, 0).await?;
-        conn.commit().await.map_err(store_error)?;
-        self.stage_login(&created.session, request_id);
-        Ok(created)
+            .map_err(|_| one_time_code_invalid())
     }
 
     /// Sign a local User in with username and password.

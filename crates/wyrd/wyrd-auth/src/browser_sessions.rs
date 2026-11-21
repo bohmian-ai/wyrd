@@ -428,6 +428,9 @@ impl BrowserSessions {
             BrowserSessionAuthority::Password(_) => {
                 (TenantGrant::PasswordLogin, BrowserCredential::Password)
             }
+            BrowserSessionAuthority::Social(_) => {
+                (TenantGrant::OidcLogin, BrowserCredential::Social)
+            }
         };
         let verified = self.issuer.verify(conn, live.principal_id, grant).await?;
         Ok(BrowserSession {
@@ -483,6 +486,7 @@ pub(crate) async fn create_session(
         BrowserSessionAuthority::Connection(_) => BrowserCredential::Sso,
         BrowserSessionAuthority::ApiKey(_) => BrowserCredential::ApiKey,
         BrowserSessionAuthority::Password(_) => BrowserCredential::Password,
+        BrowserSessionAuthority::Social(_) => BrowserCredential::Social,
     };
     Ok(CreatedBrowserSession {
         cookie,

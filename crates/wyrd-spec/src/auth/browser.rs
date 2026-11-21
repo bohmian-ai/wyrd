@@ -27,6 +27,12 @@ pub struct BrowserLoginRequest {
     /// company SSO.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<SocialProvider>,
+    /// The code of the invitation link being redeemed: the provider identity
+    /// becomes a new User holding exactly the invitation's assignments.
+    /// Absent for a returning sign-in; requires `provider`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<String>")]
+    pub invitation_code: Option<SecretBearer>,
 }
 
 /// Response of `POST /auth/browser/login`.
@@ -157,6 +163,8 @@ pub enum BrowserCredential {
     ApiKey,
     /// A Wyrd-owned local username and password signed the person in.
     Password,
+    /// A shared social provider, such as Google, signed the person in.
+    Social,
 }
 
 /// Safe metadata of one live tenant browser session.

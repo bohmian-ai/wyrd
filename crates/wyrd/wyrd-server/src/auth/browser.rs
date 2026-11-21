@@ -241,7 +241,13 @@ pub async fn login(
         ),
         Some(provider) => (
             sessions
-                .begin_social(social(&state)?, &request.tenant, provider, &origin)
+                .begin_social(
+                    social(&state)?,
+                    &request.tenant,
+                    provider,
+                    request.invitation_code.as_ref(),
+                    &origin,
+                )
                 .await?,
             SOCIAL_LOGIN_COOKIE_PATH,
         ),
@@ -314,8 +320,9 @@ pub(crate) async fn signed_in(
 /// provider) is answered as that error itself, `no-store`, so the browser sees
 /// an outage rather than a credential refusal and can begin a new sign-in. A
 /// refusal redirects (`303`) to the tenant's sign-in page with
-/// `login=failed`, or `login=no_account` when a verified provider identity
-/// belongs to no User there. The exchange already audited the failure; it is
+/// `login=failed`, `login=no_account` when a verified provider identity
+/// belongs to no User there, or `login=account_exists` when an invitation
+/// enrollment's identity already has one. The exchange already audited the failure; it is
 /// only logged here.
 ///
 /// # Errors
@@ -339,9 +346,11 @@ pub(crate) async fn login_refused(
     }
     tracing::info!(code = error.code(), "browser sign-in refused");
     let reason = match &error {
-        WyrdError::InvalidToken { details, .. } if details["reason"] == "no_account" => {
-            "no_account"
-        }
+        WyrdError::InvalidToken { details, .. } => match details["reason"].as_str() {
+            Some("no_account") => "no_account",
+            Some("account_exists") => "account_exists",
+            _ => "failed",
+        },
         _ => "failed",
     };
     let (tenant, _) = state

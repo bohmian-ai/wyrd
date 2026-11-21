@@ -405,6 +405,56 @@ calls, including production UI; SQL integration fault/concurrency assertions
 support atomicity. Initially fail on missing link-based social/password enrollment
 and social returning login. Matching email alone must never resolve an existing User.
 
+**Evidence (server slice; UI slice below):**
+
+- Reuse: invitation consumption, issuer revalidation and binding moved from
+  `password_signup` into one `BrowserSessions::redeem_invitation`
+  (`wyrd-auth/src/passwords.rs`), which password and Google enrollment both
+  call, so every refusal and the single-winner `UPDATE … RETURNING` apply to
+  both. Sessions reuse `create_session`/`TenantGrant::OidcLogin`; identities
+  reuse `wyrd.auth_user_identities` (tenant/issuer/subject primary key).
+- Migration `20261121000005_social_identity_anchors.sql` (spec "Persistence and
+  authority changes": tenant identity store, `wyrd.auth_login_state`,
+  `wyrd.auth_browser_sessions`): identity `id`; `social_invitation_hash`
+  required exactly for purpose `invitation`; session `social_provider`,
+  `social_provider_revision`, `social_identity_id` (FK `ON DELETE CASCADE`),
+  counted in the one-authority constraint. Device and refresh anchors stay
+  with entry 8 (`human_anchor()` is `None` for a social session).
+- Contract: `BrowserLoginRequest.invitation_code` (optional, needs `provider`);
+  `BrowserCredential::Social`; callback reason `login=account_exists`.
+- Test `platform_admin_e2e::an_invited_person_enrolls_with_google_and_returns`:
+  1. beginning Google from the link spends nothing;
+  2. a differing Google email enrolls one User, one identity and exactly
+     `viewer` on `Prompt/payments`, and consumes the invitation;
+  3. the session (`credential: social`) reads `Prompt/payments` (200) and
+     not `Prompt/ledger` (404 `WYRD_REGISTRY_404_CARD_NOT_FOUND`);
+  4. after a new sign-in with a changed email, the same User returns and no
+     User, identity or grant is added;
+  5. spent, revoked, superseded and expired links give `login=failed` and
+     create no User; an owned identity gives `login=account_exists`, sets no
+     cookie and spends no link;
+  6. in a second tenant the identity is `no_account` until invited, then a
+     distinct User; a session relabeled to the other tenant gets 401;
+  7. a suspended User cannot return.
+- RED: `unknown field invitation_code, expected tenant or provider` (400 at
+  begin). GREEN: `cargo nextest run --locked -p wyrd-server --test integration
+  -E 'test(=platform_admin_e2e::an_invited_person_enrolls_with_google_and_returns)'`
+  passed under `scripts/postgres/with-test-postgres.sh`.
+- Shared-owner proof (password path, same `redeem_invitation`):
+  `pg_browser_sessions::local_signup_is_tenant_bound_and_rate_limited`
+  (concurrent redemption has one winner with no partial User, expiry, other
+  tenant), `pg_browser_sessions::scoped_invitations_enroll_exactly_their_assignments`
+  (inapplicable scope, deleted role, former issuer), and
+  `pg_browser_sessions::an_administrator_invites_a_team_by_copied_links`
+  (password enrollment from a copied link). Atomicity: every Google refusal
+  above happens before commit on one `TenantConn`, and step 5 asserts no User
+  remains. Inactive tenant: the shared `TenantTokenIssuer::verify` status check.
+- Lanes: `mise run fmt`, `mise run lints`; wyrd-server integration 463/463
+  (one earlier full run failed
+  `pg_github_pull_request_extraction::an_extracted_review_that_fails_is_the_next_baseline`
+  once under load; it passed alone 3 times and in the rerun; diagnosis below);
+  wyrd-sql integration 142, wyrd-auth lib 137, wyrd-spec lib 813.
+
 ### 5. GitHub follows the same admission flow using its stable account ID
 
 **Maps to:** REQ-011, REQ-012, REQ-013; AC-004.

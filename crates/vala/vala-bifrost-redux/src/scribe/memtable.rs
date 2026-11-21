@@ -2219,6 +2219,97 @@ impl AppendTail {
 /// Capturing shares each [`AppendRun`] by reference and copies only a
 /// writable bucket's tail, never row data, so the locks are held for a few
 /// pointer copies per run.
+/// A capture's recorded batch bounds, read through one projection.
+///
+/// A pruning predicate planned over the projected fields asks for a projected
+/// column; it is answered from the source column the projection reads
+/// unchanged (`kept`), and a cast or null-filled column is unknown, exactly as
+/// the projected bounds [`ReadableSource::prepare`] builds would answer.
+struct RecordedBounds<'a> {
+    /// Every captured batch's recorded bounds under the source schema.
+    recorded: datafusion::common::pruning::PrunableStatistics,
+    /// The schema the predicate was planned over.
+    projected: &'a Schema,
+    /// The schema the bounds were recorded under.
+    source: &'a Schema,
+    /// Per projected column, the source column it reads unchanged.
+    kept: &'a [Option<usize>],
+}
+
+impl RecordedBounds<'_> {
+    /// Returns the source column answering projected `column`, if any.
+    fn source(&self, column: &datafusion::common::Column) -> Option<datafusion::common::Column> {
+        let at = self.projected.index_of(column.name()).ok()?;
+        let source = (*self.kept.get(at)?)?;
+        Some(datafusion::common::Column::new_unqualified(
+            self.source.field(source).name(),
+        ))
+    }
+}
+
+impl datafusion::common::pruning::PruningStatistics for RecordedBounds<'_> {
+    fn min_values(&self, column: &datafusion::common::Column) -> Option<arrow::array::ArrayRef> {
+        self.recorded.min_values(&self.source(column)?)
+    }
+
+    fn max_values(&self, column: &datafusion::common::Column) -> Option<arrow::array::ArrayRef> {
+        self.recorded.max_values(&self.source(column)?)
+    }
+
+    fn min_values_for_path(
+        &self,
+        column: &datafusion::common::Column,
+        field_path: &[String],
+    ) -> Option<arrow::array::ArrayRef> {
+        self.recorded
+            .min_values_for_path(&self.source(column)?, field_path)
+    }
+
+    fn max_values_for_path(
+        &self,
+        column: &datafusion::common::Column,
+        field_path: &[String],
+    ) -> Option<arrow::array::ArrayRef> {
+        self.recorded
+            .max_values_for_path(&self.source(column)?, field_path)
+    }
+
+    fn null_counts_for_path(
+        &self,
+        column: &datafusion::common::Column,
+        field_path: &[String],
+    ) -> Option<arrow::array::ArrayRef> {
+        self.recorded
+            .null_counts_for_path(&self.source(column)?, field_path)
+    }
+
+    fn num_containers(&self) -> usize {
+        self.recorded.num_containers()
+    }
+
+    fn null_counts(&self, column: &datafusion::common::Column) -> Option<arrow::array::ArrayRef> {
+        self.recorded.null_counts(&self.source(column)?)
+    }
+
+    fn row_counts(&self) -> Option<arrow::array::ArrayRef> {
+        self.recorded.row_counts()
+    }
+
+    fn contained(
+        &self,
+        column: &datafusion::common::Column,
+        values: &std::collections::HashSet<ScalarValue>,
+    ) -> Option<arrow::array::BooleanArray> {
+        self.recorded.contained(&self.source(column)?, values)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    // Projected batch bounds `ReadableSource::prepare` built on this thread.
+    static PROJECTED_BOUNDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Debug, Clone)]
 struct ReadableSource {
     /// Arrow schema shared by every batch.
@@ -2327,31 +2418,68 @@ impl ReadableSource {
                 .iter()
                 .enumerate()
                 .all(|(at, column)| *column == Some(at));
+        let batches = self.batch_count();
+        // Prune first on each batch's recorded bounds, read through the
+        // projection, so only a batch the predicate may match pays for its
+        // projected bounds below.
+        let recorded = pruning.map(|pruning| {
+            let unknown = Arc::new(Statistics::new_unknown(&self.schema));
+            let recorded = self
+                .runs
+                .iter()
+                .flat_map(|run| (0..run.batches.len()).map(|index| run.statistics.get(index)))
+                .map(|bounds| Arc::clone(bounds.unwrap_or(&unknown)))
+                .collect();
+            pruning.keep_with(&RecordedBounds {
+                recorded: datafusion::common::pruning::PrunableStatistics::new(
+                    recorded,
+                    Arc::clone(&self.schema),
+                ),
+                projected: &schema,
+                source: &self.schema,
+                kept: &kept,
+            })
+        });
+        let pruned = Arc::new(Statistics::new_unknown(&schema));
         let mut statistics: Vec<Arc<Statistics>> = self
             .runs
             .iter()
             .flat_map(|run| (0..run.batches.len()).map(|index| run.statistics.get(index)))
-            .map(|recorded| match recorded {
-                Some(bounds) if whole => Arc::clone(bounds),
-                Some(bounds) => Arc::new(Statistics {
-                    num_rows: bounds.num_rows,
-                    total_byte_size: Precision::Absent,
-                    column_statistics: kept
-                        .iter()
-                        .map(|column| {
-                            column.map_or_else(ColumnStatistics::new_unknown, |column| {
-                                bounds.column_statistics[column].clone()
-                            })
+            .enumerate()
+            .map(|(index, bounds)| {
+                if recorded.as_ref().is_some_and(|keep| !keep[index]) {
+                    return Arc::clone(&pruned);
+                }
+                match bounds {
+                    Some(bounds) if whole => Arc::clone(bounds),
+                    Some(bounds) => {
+                        #[cfg(test)]
+                        PROJECTED_BOUNDS.with(|built| built.set(built.get() + 1));
+                        Arc::new(Statistics {
+                            num_rows: bounds.num_rows,
+                            total_byte_size: Precision::Absent,
+                            column_statistics: kept
+                                .iter()
+                                .map(|column| {
+                                    column.map_or_else(ColumnStatistics::new_unknown, |column| {
+                                        bounds.column_statistics[column].clone()
+                                    })
+                                })
+                                .collect(),
                         })
-                        .collect(),
-                }),
-                None => Arc::new(Statistics::new_unknown(&schema)),
+                    }
+                    None => Arc::new(Statistics::new_unknown(&schema)),
+                }
             })
             .collect();
-        let keep = pruning.map(|pruning| {
-            let keep = pruning.keep(&statistics, statistics.len());
+        let keep = pruning.zip(recorded).map(|(pruning, keep)| {
             if self.bound_identities(pruning, &schema, &kept, &keep, &mut statistics) {
-                pruning.keep(&statistics, statistics.len())
+                pruning
+                    .keep(&statistics, batches)
+                    .into_iter()
+                    .zip(&keep)
+                    .map(|(identity, recorded)| identity && *recorded)
+                    .collect()
             } else {
                 keep
             }
@@ -3809,6 +3937,71 @@ pub(crate) mod tests {
 
         assert_eq!(lsns(Some(&pruning)), vec![2]);
         assert_eq!(lsns(None), vec![1, 2]);
+    }
+
+    /// A capture read prunes on each batch's recorded bounds before building
+    /// projected bounds, so only the batch the predicate may match pays for
+    /// its projected statistics, and the read returns exactly that batch.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the capture cannot be taken or read, the wrong batches are
+    /// returned, or projected bounds are built for a pruned batch.
+    #[test]
+    fn capture_read_projects_bounds_only_for_batches_recorded_bounds_keep() {
+        let memtable = Memtable::new();
+        let key = make_test_seal_key();
+        let written = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("payload", DataType::Int64, false),
+        ]));
+        for (lsn, id) in [(1, 10_i64), (2, 50), (3, 90)] {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&written),
+                vec![
+                    Arc::new(Int64Array::from(vec![id])),
+                    Arc::new(Int64Array::from(vec![id])),
+                ],
+            )
+            .expect("batch");
+            memtable
+                .insert(&key, make_test_meta(lsn), batch)
+                .expect("insert");
+        }
+        let required = Arc::new(Schema::new(vec![written.field(0).clone()]));
+        let pruning = crate::scan_sizing::BatchPruning::try_new(
+            &required,
+            Arc::new(datafusion::physical_expr::expressions::BinaryExpr::new(
+                datafusion::physical_expr::expressions::col("id", &required).expect("id column"),
+                datafusion::logical_expr::Operator::Eq,
+                datafusion::physical_expr::expressions::lit(50_i64),
+            )),
+        )
+        .expect("pruning plans");
+        let capture = LiveCapture::take([&memtable], key.tenant, &key.table, None)
+            .expect("locks")
+            .expect("no registry to wait on");
+        let partitions = key.partition.time()..=key.partition.time();
+        PROJECTED_BOUNDS.with(|built| built.set(0));
+
+        let batches = capture
+            .read(
+                &partitions,
+                required.fields(),
+                Some(&pruning),
+                None,
+                &unbounded_pool(),
+            )
+            .expect("capture read")
+            .evaluated()
+            .expect("batches evaluate");
+
+        let lsns: Vec<u64> = batches
+            .iter()
+            .map(|batch| batch.wal_lsn_max.as_u64())
+            .collect();
+        assert_eq!(lsns, vec![2]);
+        assert_eq!(PROJECTED_BOUNDS.with(std::cell::Cell::get), 1);
     }
 
     /// A batch storing its projected columns as the first batch did reuses

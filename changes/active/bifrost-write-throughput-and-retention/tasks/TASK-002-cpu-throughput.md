@@ -213,10 +213,28 @@ unproven until measured; no fabricated failing test substitutes for 80 qualifica
   optimizer runs once per planned query. Both fail on current code. Row and
   plan parity tests may already pass and serve as regression proof.
 
-**Evidence:** In progress.
+**Evidence:** Behavior implemented and verified; CPU qualification is FAIL (unmeasured, deferred by the maintainer).
 - Read side: `scribe::memtable::tests::capture_read_projects_bounds_only_for_batches_recorded_bounds_keep`. RED: projected bounds built left 3, right 1. GREEN: `RecordedBounds` prunes on recorded bounds through the projection's `kept` source mapping, with cast/null-filled columns unknown, before building projected statistics, and keeps the identity second pass. `oracle::tests::physical_planning_reuses_the_optimized_logical_plan`. RED: optimizer passes left 3, right 2. GREEN: `Oracle::plan_physical` calls `state.query_planner().create_physical_plan`. The named existing tests `capture_read_prunes_batches_before_projecting` and `physical_root_alone_selects_query_class` pass, along with all `scribe::memtable::`/`oracle::` tests. Commit `ea67f2f1f`.
-- Arrow fork extension (local branch `wyrd-stream-context`, commit `f349772`, **not pushed**): `StreamEncoder::try_new_with_context` / `finish_with_context`, `IpcWriteContext::retained_bytes`, and a zstd compressor that is recreated when the level changes. Dependency-owner tests, run from the fork checkout with `cargo test -p arrow-ipc --features zstd,lz4 --lib` (140 pass; 132 without features). `test_stream_encoder_reused_context_matches_independent_streams` RED: "the compressor was not retained". `test_stream_encoder_reused_context_follows_the_stream_level` RED: a level-1 compressor reused for a level-19 stream produced the wrong bytes.
-- Pending: Wyrd-side bounded, charged context reuse on ingress workers; oversized release; failure cleanup; and the rev bump across the Arrow stack once the fork commit is pushed. CPU qualification is deferred by the maintainer.
+- Arrow fork extension (pushed to `wyrd-production` at `f349772`; the Arrow stack and workspace-hack are pinned to it in `df7dc78e3`): `StreamEncoder::try_new_with_context` / `finish_with_context`, `IpcWriteContext::retained_bytes`, and a zstd compressor that is recreated when the level changes. Dependency-owner tests, run from the fork checkout with `cargo test -p arrow-ipc --features zstd,lz4 --lib` (140 pass; 132 without features). `test_stream_encoder_reused_context_matches_independent_streams` RED: "the compressor was not retained". `test_stream_encoder_reused_context_follows_the_stream_level` RED: a level-1 compressor reused for a level-19 stream produced the wrong bytes.
+- Wyrd-side reuse, commit `3aa9b67b1`: this is the revertible range for REQ-012 if the benchmark gain turns out to be small. Reuse owner: no persistent per-worker owner existed, since `IngressSlot` is a disposable permit. `preprocess::EncoderContexts` therefore lives on `ScribeIngressCpuPool` with one slot per worker. A thread gets a slot only after the ingress pool's start handler (`mark_ingress_worker`) marks it as a worker; threads of other Rayon pools get none. The slot's context is taken out for one encode and restored after `finish_with_context`, charged as `Metadata` at `retained_bytes()` through `resize_ingress`/`try_reserve_ingress`. A context over `max_frame_bytes` is dropped. A context refused with `IngestBusy` is dropped and the append still succeeds. Poisoned accounting propagates. A failed or panicking encode drops the context and its lease along with the encoder. Shutdown clears every slot after the ingress drain. A closed set keeps nothing, including a restore that raced the clear.
+  - `scribe::preprocess::tests::lane_workers_reuse_charged_encoder_contexts`:
+    - Setup: six streams alternating dictionary, integer and text schemas, with every earlier output held live.
+    - Parity: each stream's bytes equal `reference_ipc`.
+    - Charging: the root charge equals the slot lease, which equals the `Metadata` category.
+    - Drop cases leave nothing charged and the encode still succeeds: an oversized context (cap of 1), a refused one (ingress budget held), a failed encode of a dictionary-of-dictionary schema, a cleared set, a caller off the lane, and an unrelated pool.
+    - RED: "the worker kept no context" with `restore` stubbed. RED: a thread from an unrelated pool kept 49,688 bytes when slots were keyed by `rayon::current_thread_index`.
+    - Cancellation: the encode is synchronous on the worker, so a cancelled request cannot interrupt it. It finishes and restores, or drops on error.
+  - Diagnosis: once contexts were retained, 5 existing lib tests failed.
+    - Symptom: `Prepared` was non-zero after the ACK, and shard ownership no longer equalled the total.
+    - Cause: worker-lifetime scratch was charged as `Prepared` and owned by no shard.
+    - Codex diagnostician: change the category to `Metadata` and report the worker-owned bytes. `ScribeInspectionSnapshot` gains `encoder_memory`; the inspection coherence loop and `scribe_persistence_path`'s ownership identity include it, and the latter asserts it is above zero.
+    - `decode_to_memtable_transfers_one_charge` keeps its zero-`Prepared` assertion. Its exact total now adds the measured encoder bytes, and it asserts those bytes are the `Metadata` charge. This is not a weakening: the identity stays exact.
+  - Commands, all green:
+    - `cargo clippy --locked -p vala-bifrost-redux --all-targets --all-features -- -D warnings` passes clean.
+    - Under `scripts/postgres/with-test-postgres.sh` with migrations, `cargo nextest run --locked -p vala-bifrost-redux --lib --features test-support` passes 993/993.
+    - After `mise run build:server`, `cargo nextest run --locked -p wyrd-testing --test scribe --test otlp --run-ignored all --test-threads 3` passes 75/75. An unthrottled run timed out on the Postgres pool.
+    - `git diff --check` is clean.
+- FAIL, deferred by the maintainer: the 80 input MiB per server CPU-second result on logs-c64, the full write matrix, read and mixed-load qualification, and `point-memtable-c64` CPU per query. No benchmark ran, so REQ-013's CPU and tail claims and REQ-012's throughput benefit are unproven.
 
 ## Verification and final qualification
 

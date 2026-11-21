@@ -108,8 +108,11 @@ Semantic parity assertions may already pass and then serve as regression proof;
 do not invent a public performance counter or mirror implementation just to force
 RED. Static work-removal claims require a focused source/diff check and the benchmark.
 
-**Evidence:** Pending. Append actual RED/GREEN or justified verification-only/static
-proof, then the three benchmark checkpoint reports/comparisons before scenario 2.
+**Evidence:** Focused selector (C1): `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=tables::logs::tests::log_projection_reserves_columns_from_the_record_count) | test(=scribe::shards::tests::mailbox_drain_publishes_inspection_only_for_control_commands)'`.
+- Projector capacity: `tables::logs::tests::log_projection_reserves_columns_from_the_record_count`. RED: `time_unix_nano` buffer capacity left 1024, right 800. GREEN after `LogColumns::with_capacity` / `RowEnvelopes::with_capacity` (`tables/logs/projection.rs`, `tables/signal.rs`) reserve from the flattened export's checked record/resource/scope counts. Decoder capacity (`otlp_logs_decode.rs` `LogPoolCounts`) is existing behavior with no change; its existing tests are regression proof.
+- Coalesced inspection: `scribe::shards::tests::mailbox_drain_publishes_inspection_only_for_control_commands`. RED: after two drained appends the sentinel snapshot was overwritten (left 1, right `usize::MAX`). GREEN: `ShardOwner::apply_command` publishes only after non-`Append` commands. `FlushAll` still publishes accurate state, and the group's publication before its ACK is unchanged; the existing `scribe::shards::tests` before-ACK tests pass.
+- Regression: all 992 `vala-bifrost-redux` lib tests pass under `scripts/postgres/with-test-postgres.sh` (C2: `cargo nextest run --locked -p vala-bifrost-redux --lib --features test-support`), and `mise run test:bifrost:integration:redux` passes (1067/1067). Commit `ff1fac1ec`.
+- Benchmark checkpoints: **deferred by the maintainer**. They are not run, so this scenario's CPU claim is unproven.
 
 ### 2. Independent IPC chunks reach WAL without copying into one stream buffer
 
@@ -141,8 +144,12 @@ descriptor assumptions do not provide arbitrary owned IPC chunks. New owner test
 must expose the unsupported chunk ownership/window behavior before changing it;
 existing exact-byte/identity behavior remains the reference, not a newly chosen codec.
 
-**Evidence:** Pending. Append focused RED/GREEN, parity and connected replay proof,
-then the three benchmark checkpoint reports/comparisons before scenario 3.
+**Evidence:**
+- Many-chunk WAL record: `scribe::wal::tests::a_many_chunk_slice_round_trips_byte_for_byte` (200 chunks, more than one window). RED: `Internal { "WAL record has more payload parts than one vectored write holds" }`. GREEN: `write_pieces` writes through fixed 64-slice `IoSlice` windows over the existing `write_all_vectored`. Reads back byte for byte, and the payload is identical to the one-chunk record. `pieces_beyond_one_window_write_in_order` covers short writes at limits 1/2/7/unbounded across window edges. The existing interrupted / `WriteZero` / error-unchanged / partial-write rollback tests pass unchanged.
+- Chunk ownership and byte parity: `scribe::preprocess::tests::prepared_slices_carry_unjoined_chunks_with_reference_bytes`, covering nested list, nulls, dictionary, offset slice (`slice(3, 50)`), and two tenants. RED: "the stream was joined into one chunk". GREEN: `encode_ipc` uses the pinned `StreamEncoder`, and `PreparedWalAppend::chunked` carries `Vec<Buffer>`. The joined chunks equal the `StreamWriter` reference bytes at the WAL compression settings. `data_len` is checked as a `u32` sum, CRC and digest stream over the chunks, and `retained_data_bytes` (summed `Buffer::capacity`, backing allocations included) is what `prepared_slice_bytes` charges.
+- Leases until IO settles: `scribe::execution_lanes::tests::ingress_slice_io_retains_leases_until_the_write_settles` is regression proof of existing ownership. The lease stays charged through a many-chunk `WriteIngressSlices` and comes back in the result. A refused write (device full) releases it only after the operation returns.
+- Replay and journeys: the redux integration lane (encode → WAL → actual replay) passes in C2. The `wyrd-testing` Scribe recovery journeys are not yet run.
+- No WAL format or compression change. Commit `93be7ede3`. Benchmark checkpoints: **deferred by the maintainer**.
 
 ### 3. Bounded context reuse preserves independent streams and meets the target
 
@@ -206,9 +213,10 @@ unproven until measured; no fabricated failing test substitutes for 80 qualifica
   optimizer runs once per planned query. Both fail on current code. Row and
   plan parity tests may already pass and serve as regression proof.
 
-**Evidence:** Pending. Append focused RED/GREEN, context/memory proof, the read-side
-proof above, the three checkpoint reports/comparisons and final qualification
-records here.
+**Evidence:** In progress.
+- Read side: `scribe::memtable::tests::capture_read_projects_bounds_only_for_batches_recorded_bounds_keep`. RED: projected bounds built left 3, right 1. GREEN: `RecordedBounds` prunes on recorded bounds through the projection's `kept` source mapping, with cast/null-filled columns unknown, before building projected statistics, and keeps the identity second pass. `oracle::tests::physical_planning_reuses_the_optimized_logical_plan`. RED: optimizer passes left 3, right 2. GREEN: `Oracle::plan_physical` calls `state.query_planner().create_physical_plan`. The named existing tests `capture_read_prunes_batches_before_projecting` and `physical_root_alone_selects_query_class` pass, along with all `scribe::memtable::`/`oracle::` tests. Commit `ea67f2f1f`.
+- Arrow fork extension (local branch `wyrd-stream-context`, commit `f349772`, **not pushed**): `StreamEncoder::try_new_with_context` / `finish_with_context`, `IpcWriteContext::retained_bytes`, and a zstd compressor that is recreated when the level changes. Dependency-owner tests, run from the fork checkout with `cargo test -p arrow-ipc --features zstd,lz4 --lib` (140 pass; 132 without features). `test_stream_encoder_reused_context_matches_independent_streams` RED: "the compressor was not retained". `test_stream_encoder_reused_context_follows_the_stream_level` RED: a level-1 compressor reused for a level-19 stream produced the wrong bytes.
+- Pending: Wyrd-side bounded, charged context reuse on ingress workers; oversized release; failure cleanup; and the rev bump across the Arrow stack once the fork commit is pushed. CPU qualification is deferred by the maintainer.
 
 ## Verification and final qualification
 

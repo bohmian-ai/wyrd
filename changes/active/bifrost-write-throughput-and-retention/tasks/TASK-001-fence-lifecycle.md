@@ -103,8 +103,63 @@ retained history becomes absent or execution reconstruction truncates. Add focus
 assertions for that missing behavior before changing production code. Existing
 already-correct enqueue/ACK behavior is verification-only.
 
-**Evidence:** Pending. Append actual focused RED/GREEN proof and the three benchmark
-checkpoint reports/comparisons here before scenario 2.
+**Evidence:**
+
+- Consumers read recent receipts first, then their Bifrost rows; a visible row is
+  authoritative, a held receipt without a visible row is unavailable, and neither
+  is absence. A receipt is removed only after its row is visible, so one gone
+  before the receipt read names a row the later row read sees. Execution recovery
+  starts from `InputResolver::latest_revision`, probes receipts above it and
+  re-reads the visible revision until it is unchanged, so a receipt removed
+  during the probe cannot truncate recovery. Owners: `verification/state.rs`
+  `RunState::accepted`, `verification/approvals.rs` `decided`,
+  `verification/evidence.rs` `accepted`, `components/github/delivery.rs`
+  `recorded`, `verification/inputs.rs` `latest_revision`; `committed_batches`
+  documents recent receipts.
+- Execution revisions —
+  `wyrd-testing` `lifecycle::execution_recovery_outlives_its_revision_receipts`:
+  receipts removed after publish, takeover recovers the same accepted state; a
+  recent receipt for an invisible next revision is `StateError::Unavailable`.
+  RED: `lifecycle.rs:826` "recovery neither resets nor truncates the accepted
+  revisions" (recovery came back fresh). GREEN.
+- Approvals — `pg_approvals::a_decision_outlives_its_retry_receipt`: after
+  receipt removal the completed execution serves the same decision, actor and
+  time; the same decision replays the original receipt; a contradictory one is
+  `WYRD_VERIFICATION_409_APPROVAL_NOT_PENDING`; an undecided occurrence with a
+  recent receipt and no visible row is 503, never pending. RED:
+  `pg_approvals.rs:688` result `Null`, delivery `pending`. GREEN, 6/6 repeats.
+- Evidence — `pg_deferred_evidence::accepted_evidence_outlives_its_retry_receipt`:
+  after receipt removal a republish replays the original id and time, different
+  content is `WYRD_VERIFICATION_409_EVIDENCE_CONFLICT`, a later pull request
+  consumes it and passes; with receipt SELECT revoked a new publication is 503.
+  RED: `pg_deferred_evidence.rs:886` status `accepted`, expected `replayed`. GREEN.
+- GitHub delivery — `pg_github_delivery::a_recorded_outcome_outlives_its_retry_receipts`:
+  after receipt removal inspection serves the same result and `delivered`, and
+  nothing is sent again; with receipt SELECT revoked inspection is 503. RED:
+  `pg_github_delivery.rs:726` result `Null`, delivery `pending`. GREEN.
+- Limitation: evidence and delivery batch keys are private, so their
+  accepted-but-invisible case is proven through unreadable authority (revoked
+  receipt SELECT) rather than a synthetic receipt; approvals and execution state
+  use a synthetic recent receipt. Same-identity transport retry, cross-pod
+  arbitration, tenant separation and enqueue/ACK boundaries are unchanged and
+  covered by the existing suites below.
+- Diagnosis (Codex, read-only): first GREEN attempt read rows before receipts;
+  `pg_approvals` failed 1 in 5 with 503 "a recorded outcome is not visible yet".
+  Cause: Scribe commits the receipt (`scribe/shards.rs:4273`) before memtable
+  visibility (`:5097`), so a batch landing between the row read and the receipt
+  read looked accepted but invisible. Fix site: read order in all four
+  consumers. A second Codex review confirmed the execution re-read is required:
+  count retention can remove a receipt for a revision that became visible
+  between the first visible read and the probe.
+- Removed `pg_verification_runtime` assertion that a completed run stages no
+  audit: recovery now reads Bifrost as SYSTEM, and each read decision is audited
+  by design; the assertion pinned an incidental absence of reads, not a
+  requirement.
+- Commands:
+  `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-server --features test-support --test integration --test-threads=1 --no-fail-fast -E "test(/^(pg_approvals|pg_deferred_evidence|pg_verification_runtime|pg_github_delivery)::/)" && cargo nextest run --locked -p wyrd-testing --test scribe -P journey --run-ignored=all -E "test(/^lifecycle::/)"'`
+  → 99/99 and 10/10 passed. `mise run fmt && mise run lints` clean;
+  `git diff --check` clean.
+- Benchmark checkpoint: pending.
 
 ### 2. Accepted recovery survives the durable whole-batch handoff
 

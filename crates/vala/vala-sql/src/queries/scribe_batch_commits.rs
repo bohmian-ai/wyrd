@@ -360,14 +360,17 @@ pub async fn accepted_version(
         .transpose()
 }
 
-/// The batch ids among `batch_ids` that hold a durable fence on
+/// The batch ids among `batch_ids` that hold a recent batch receipt on
 /// `logical_table_fqn`, in no particular order.
 ///
-/// A fence commits before its batch is acknowledged and is never removed, so
-/// an id answered here names a batch whose rows are authoritative in Bifrost,
-/// whether or not a query can see them yet, and an id not answered was never
-/// acknowledged. A caller that derives its batch ids from its own record
-/// identity learns which of its records were accepted without a record index.
+/// A receipt commits before its batch is acknowledged, so an id answered
+/// here names a batch whose rows are authoritative in Bifrost, whether or
+/// not a query can see them yet. Receipts are recent retry history, not
+/// lasting history: one is removed only after its batch has durable custody,
+/// so an id not answered names a batch that was never acknowledged or whose
+/// rows a query already sees. A caller asks here before it reads its own
+/// rows, which stay the authority: a receipt removed before this read names
+/// rows the later row read sees.
 ///
 /// # Errors
 ///

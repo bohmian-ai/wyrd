@@ -345,8 +345,14 @@ impl<'a> GithubDeliveries<'a> {
     /// read through `records`: a cancelled execution's own outcome, else its
     /// revision's; `None` while none is recorded.
     ///
+    /// The outcome row is the lasting record. Without a visible row, a
+    /// recent batch receipt bridges an outcome Scribe accepted that no query
+    /// sees yet. The receipt is read before the row: a receipt is removed
+    /// only after its row is visible, so one gone before the receipt read
+    /// names a row the later row read sees.
+    ///
     /// # Errors
-    /// Returns `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` when the fence
+    /// Returns `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` when the receipt
     /// cannot be read or a recorded outcome is not visible yet, so an
     /// outcome is never mistaken for absence; the query error or an internal
     /// error when its row cannot be read or is malformed.
@@ -374,14 +380,13 @@ impl<'a> GithubDeliveries<'a> {
             .await
             .map_err(|error| unavailable(&error))?;
         drop(conn);
-        if !fenced.contains(&fence) {
-            return Ok(None);
+        match records.delivery(execution_id, revision, event).await? {
+            Some(delivery) => Ok(Some(delivery)),
+            None if fenced.contains(&fence) => {
+                Err(unavailable(&"a recorded outcome is not visible yet"))
+            }
+            None => Ok(None),
         }
-        records
-            .delivery(execution_id, revision, event)
-            .await?
-            .ok_or_else(|| unavailable(&"a recorded outcome is not visible yet"))
-            .map(Some)
     }
 
     /// What `presented` shows on GitHub: a completed execution's report is

@@ -101,8 +101,6 @@ struct Harness {
     assertion: PgPool,
     /// Faults and the submitted-batch record every runtime writes through.
     fault: PublicationFault,
-    /// Number of retained audit decisions before the test acted.
-    audit_floor: usize,
 }
 
 impl Harness {
@@ -132,17 +130,14 @@ impl Harness {
             .pg_fixture()
             .superuser_pool()
             .expect("fixture exposes a superuser pool");
-        let mut harness = Self {
+        Self {
             server,
             seed,
             subject,
             verifier,
             assertion,
             fault: PublicationFault::default(),
-            audit_floor: 0,
-        };
-        harness.audit_floor = harness.retained_audit_operations().await.len();
-        harness
+        }
     }
 
     /// Runtime bounds fast enough for tests: short polls and backoff, and a
@@ -290,17 +285,6 @@ impl Harness {
             .map(|sent| sent.table)
             .filter(|table| table != EVENTS)
             .collect()
-    }
-
-    /// Every retained audit operation for the tenant since the floor, in
-    /// decision order.
-    ///
-    /// # Panics
-    /// Panics when the retained audit read fails.
-    async fn audit_operations(&self) -> Vec<String> {
-        self.retained_audit_operations()
-            .await
-            .split_off(self.audit_floor)
     }
 
     /// Settle the runtime's result outbox, flush the server's Scribe, and
@@ -579,26 +563,6 @@ impl Harness {
                 .collect(),
         )
     }
-
-    /// Every retained audit operation of the tenant in decision order, once
-    /// the Scribe outbox has settled.
-    ///
-    /// # Panics
-    /// Panics when the outbox does not settle or the retained read fails.
-    async fn retained_audit_operations(&self) -> Vec<String> {
-        self.server
-            .await_audit_retained()
-            .await
-            .expect("audit is retained");
-        self.server
-            .retained_audit_records(self.seed.tenant(), "operation", "true")
-            .await
-            .expect("retained audit operations")
-            .into_iter()
-            .flatten()
-            .flatten()
-            .collect()
-    }
 }
 
 /// A spawned runtime and the token that stops it.
@@ -814,12 +778,12 @@ async fn sent_to(fault: &PublicationFault, table: &str) -> Vec<SentBatch> {
 }
 
 /// A completed Drift run writes its output and then its summary
-/// through the internal result writer, completes with a result, stages no
-/// audit, and records the runtime metrics.
+/// through the internal result writer, completes with a result, and
+/// records the runtime metrics.
 ///
 /// # Panics
 /// Panics when the run does not complete, the writes differ in order, kind,
-/// or count, any other audit row is staged, or a metric is missing.
+/// or count, or a metric is missing.
 #[tokio::test]
 async fn completed_run_publishes_details_then_summary_and_records_metrics() {
     let metrics = wyrd_server::app::metrics::install_recorder().expect("recorder installs");
@@ -839,11 +803,6 @@ async fn completed_run_publishes_details_then_summary_and_records_metrics() {
     assert_eq!(
         harness.writes().await,
         vec![OUTPUTS.to_owned(), RESULTS.to_owned()]
-    );
-    assert_eq!(
-        harness.audit_operations().await,
-        Vec::<String>::new(),
-        "claims, settlements, and internal result writes evaluate no permission and stage no audit"
     );
     runtime.stop().await;
 

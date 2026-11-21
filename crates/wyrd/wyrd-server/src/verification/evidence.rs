@@ -4,10 +4,10 @@
 //!
 //! One acceptance is one `bifrost.verification.evidence` row, written through
 //! Scribe as its own batch under a batch id its source, input, and
-//! subscriber derive. The batch fence, committed before Scribe acknowledges,
-//! is the authoritative record that the subscriber accepted evidence for
-//! that source and input: an unfenced acceptance is absent, and a fenced one
-//! whose row a query cannot see yet is unavailable, never absent. Nothing is
+//! subscriber derive. The row is the lasting record that the subscriber
+//! accepted evidence for that source and input; the batch receipt, committed
+//! before Scribe acknowledges and kept for recent retry history, bridges an
+//! acceptance no query can see yet, which is unavailable, never absent. Nothing is
 //! mirrored in PostgreSQL; the queue only learns that a consumer is due.
 
 use std::collections::BTreeMap;
@@ -137,8 +137,15 @@ impl<'a> DeferredEvidence<'a> {
     /// Every acceptance `subscribers` hold for `input` of `source`, read
     /// through `records`. A subscriber without one is absent from the map.
     ///
+    /// The acceptance rows are the lasting history. A subscriber with no
+    /// visible acceptance is absent only when it held no recent batch
+    /// receipt either: a receipt bridges an acceptance Scribe accepted that
+    /// no query sees yet. The receipts are read before the rows: a receipt
+    /// is removed only after its row is visible, so one gone before the
+    /// receipt read names a row the later row read sees.
+    ///
     /// # Errors
-    /// Returns [`WyrdError::ServiceUnavailable`] when the fences cannot be
+    /// Returns [`WyrdError::ServiceUnavailable`] when the receipts cannot be
     /// read, or an accepted row is not visible yet, so an acceptance is never
     /// mistaken for absence; the query error or an internal error when a
     /// row cannot be read or is malformed.
@@ -163,24 +170,17 @@ impl<'a> DeferredEvidence<'a> {
         let fenced = committed_batches(&mut conn, EVIDENCE_TABLE, &fences)
             .await
             .map_err(|error| unavailable(&error))?;
-        let held: Vec<&CardUid> = subscribers
-            .iter()
-            .zip(&fences)
-            .filter(|(_, fence)| fenced.contains(fence))
-            .map(|(verifier, _)| verifier)
-            .collect();
-        if held.is_empty() {
-            return Ok(BTreeMap::new());
-        }
+        drop(conn);
         let mut rows = records.published(source, input).await?;
-        held.into_iter()
-            .map(|verifier| {
-                let accepted = rows
-                    .remove(verifier)
-                    .ok_or_else(|| unavailable(&"accepted evidence is not visible yet"))?;
-                Ok((verifier.clone(), accepted))
-            })
-            .collect()
+        if subscribers.iter().any(|verifier| {
+            !rows.contains_key(verifier) && fenced.contains(&self.fence(source, input, verifier))
+        }) {
+            return Err(unavailable(&"accepted evidence is not visible yet"));
+        }
+        Ok(subscribers
+            .iter()
+            .filter_map(|verifier| rows.remove_entry(verifier))
+            .collect())
     }
 
     /// Accept `published` for `input` of `source` for each of `subscribers`,

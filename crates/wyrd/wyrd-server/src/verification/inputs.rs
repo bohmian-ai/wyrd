@@ -295,6 +295,32 @@ impl<'q> InputResolver<'q> {
             .transpose()
     }
 
+    /// The newest revision of `execution`'s state a query can see; `None`
+    /// while none is visible.
+    ///
+    /// # Errors
+    /// Returns the query refusal or failure, and an internal error when the
+    /// stored revision is malformed.
+    pub async fn latest_revision(&self, execution: ExecutionId) -> Result<Option<i64>, WyrdError> {
+        let batches = self
+            .rows(&format!(
+                "SELECT max(sequence) AS revision FROM bifrost.verification.execution_events \
+                 WHERE execution_id = {} AND event = 'checkpoint'",
+                quote(&execution.to_string())
+            ))
+            .await?;
+        let Some(batch) = batches.iter().find(|batch| batch.num_rows() > 0) else {
+            return Ok(None);
+        };
+        if column(batch, "revision")?.is_null(0) {
+            return Ok(None);
+        }
+        text(batch, "revision", 0)?
+            .parse()
+            .map(Some)
+            .map_err(|error: std::num::ParseIntError| invalid(error.to_string()))
+    }
+
     /// The GitHub delivery outcome `event` recorded for `execution`'s state
     /// at exactly `revision`; `None` while no such row is visible.
     ///

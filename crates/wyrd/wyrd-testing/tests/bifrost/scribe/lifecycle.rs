@@ -756,6 +756,114 @@ async fn execution_recovery_requires_exact_accepted_state() {
     server.shutdown().await.expect("the server drains cleanly");
 }
 
+/// An execution's accepted revisions outlive their retry receipts.
+///
+/// A writer accepts two invocations and the pod publishes them, so their
+/// rows have custody of their own. Every revision receipt is then removed,
+/// as cleanup removes receipts outside recent history: a takeover still
+/// recovers the exact accepted state from its Bifrost records instead of
+/// starting fresh. A receipt for the revision after the newest visible one
+/// still bridges an accepted row no read can see yet, so a takeover is
+/// refused as unavailable rather than recovering the older revision.
+///
+/// # Panics
+///
+/// Panics when the pod cannot start or publish, a revision is not accepted,
+/// recovery starts fresh or falls back to an older state, or a recovered
+/// state differs from the accepted one.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn execution_recovery_outlives_its_revision_receipts() {
+    let root = tempfile::tempdir().expect("durable Bifrost data root");
+    let (server, fixture, execution) = execution_pod(root.path()).await;
+    let (_, first) = fixture
+        .claim_state(server.state())
+        .await
+        .expect("the execution is claimable");
+    let first = first.expect("a fresh execution's state claims");
+    for step in ["review", "judge"] {
+        first
+            .begin(&Producer::plain(&TaskId::new(step).expect("task"), 1))
+            .await
+            .expect("the revision is accepted");
+    }
+    first.persisted().await.expect("the revisions are accepted");
+    let accepted = first.snapshot();
+    drop(first);
+    server
+        .flush_bifrost()
+        .await
+        .expect("the accepted revisions publish");
+
+    let pool = server
+        .pg_fixture()
+        .superuser_pool()
+        .expect("fixture exposes a superuser pool");
+    let tenant = server.data_tenant_id();
+    let fences: Vec<Uuid> = (1..=2)
+        .map(|revision| revision_fence(tenant, execution, revision))
+        .collect();
+    let (last,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM vala.scribe_batch_commits WHERE batch_id = ANY($1)")
+            .bind(&fences)
+            .fetch_one(&pool)
+            .await
+            .expect("the accepted fences read");
+    assert!(last >= 1, "the accepted invocations are fenced");
+    let expired = sqlx::query("DELETE FROM vala.scribe_batch_commits WHERE batch_id = ANY($1)")
+        .bind(&fences)
+        .execute(&pool)
+        .await
+        .expect("the revision receipts are removed");
+    assert_eq!(
+        expired.rows_affected(),
+        u64::try_from(last).expect("count"),
+        "every receipt is gone"
+    );
+    let recovered = take_over(&fixture, &server, execution)
+        .await
+        .expect("the accepted revision recovers without its receipts");
+    assert_eq!(
+        recovered.snapshot(),
+        accepted,
+        "recovery neither resets nor truncates the accepted revisions"
+    );
+    drop(recovered);
+
+    let unseen = revision_fence(tenant, execution, last + 1);
+    sqlx::query(
+        "INSERT INTO vala.scribe_batch_commits \
+         (data_tenant_id, logical_table_fqn, batch_id, slice_set_digest, slice_count, \
+          wal_node_id, wal_writer_epoch, wal_shard_id, wal_segment_sequence, wal_lsn_min, \
+          wal_lsn_max, request_id, ingested_at, table_version) \
+         VALUES ($1, 'bifrost.verification.execution_events', $2, \
+                 decode(repeat('00', 32), 'hex'), 1, gen_random_uuid(), 1, 0, 0, 0, 0, \
+                 gen_random_uuid(), statement_timestamp(), 1)",
+    )
+    .bind(tenant.as_uuid())
+    .bind(unseen)
+    .execute(&pool)
+    .await
+    .expect("the next revision's receipt is recent");
+    let refused = take_over(&fixture, &server, execution).await;
+    assert!(
+        matches!(refused, Err(StateError::Unavailable(_))),
+        "a recent receipt past the newest visible revision fails closed: {:?}",
+        refused.as_ref().err()
+    );
+    sqlx::query("DELETE FROM vala.scribe_batch_commits WHERE batch_id = $1")
+        .bind(unseen)
+        .execute(&pool)
+        .await
+        .expect("the unseen receipt is withdrawn");
+    let recovered = take_over(&fixture, &server, execution)
+        .await
+        .expect("the accepted revision recovers again");
+    assert_eq!(recovered.snapshot(), accepted);
+    drop(recovered);
+    server.shutdown().await.expect("the server drains cleanly");
+}
+
 /// A restarted pod keeps its own Bifrost data root, so a checkpoint
 /// acknowledged into its WAL but never published survives a shutdown that
 /// aborts at its budget and recovers exactly.

@@ -3,10 +3,10 @@
 //!
 //! One decision is one `bifrost.verification.approvals` row, written through
 //! Scribe as its own batch under a batch id its approval id derives. The
-//! batch fence, committed before Scribe acknowledges, is the authoritative
-//! record that the occurrence was decided: an unfenced decision is absent,
-//! and a fenced one whose row a query cannot see yet is unavailable, never
-//! absent. The first accepted decision is final. Nothing is mirrored in
+//! row is the lasting record that the occurrence was decided; the batch
+//! receipt, committed before Scribe acknowledges and kept for recent retry
+//! history, bridges a decision no query can see yet, which is unavailable,
+//! never absent. The first accepted decision is final. Nothing is mirrored in
 //! PostgreSQL; the queue only learns that the execution is due.
 
 use std::collections::BTreeMap;
@@ -64,8 +64,15 @@ impl<'a> ApprovalDecisions<'a> {
     /// The accepted decision of each of `execution_id`'s `approvals` that
     /// has one, read through `records`; an undecided occurrence is absent.
     ///
+    /// The decision rows are the lasting history. An occurrence with no
+    /// visible decision is absent only when it held no recent batch receipt
+    /// either: a receipt bridges a decision Scribe accepted that no query
+    /// sees yet. The receipts are read before the rows: a receipt is removed
+    /// only after its row is visible, so one gone before the receipt read
+    /// names a row the later row read sees.
+    ///
     /// # Errors
-    /// Returns [`WyrdError::ServiceUnavailable`] when the fences cannot be
+    /// Returns [`WyrdError::ServiceUnavailable`] when the receipts cannot be
     /// read, or an accepted decision is not visible yet, so a decision is
     /// never mistaken for absence; the query error or an internal error when
     /// a row cannot be read or is malformed.
@@ -90,24 +97,17 @@ impl<'a> ApprovalDecisions<'a> {
             .await
             .map_err(|error| unavailable(&error))?;
         drop(conn);
-        let held: Vec<ApprovalId> = approvals
-            .iter()
-            .zip(&fences)
-            .filter(|(_, fence)| fenced.contains(fence))
-            .map(|(id, _)| *id)
-            .collect();
-        if held.is_empty() {
-            return Ok(BTreeMap::new());
-        }
         let mut rows = records.decisions(execution_id).await?;
-        held.into_iter()
-            .map(|id| {
-                let decided = rows
-                    .remove(&id)
-                    .ok_or_else(|| unavailable(&"an accepted decision is not visible yet"))?;
-                Ok((id, decided))
-            })
-            .collect()
+        if approvals
+            .iter()
+            .any(|id| !rows.contains_key(id) && fenced.contains(&self.fence(*id)))
+        {
+            return Err(unavailable(&"an accepted decision is not visible yet"));
+        }
+        Ok(approvals
+            .iter()
+            .filter_map(|id| rows.remove_entry(id))
+            .collect())
     }
 
     /// Accept `receipt`, a decision of `execution_id`'s approval occurrence

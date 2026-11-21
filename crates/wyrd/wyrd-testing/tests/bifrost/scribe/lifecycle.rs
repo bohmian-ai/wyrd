@@ -12,6 +12,7 @@ use vala_bifrost_redux::scribe::geometry::{
 use vala_bifrost_redux::scribe::persistence::PersistenceFaults;
 use vala_verify::blocks::Checkpoints as _;
 use wyrd_server::verification::state::{RunState, StateError, revision_fence};
+use wyrd_spec::DataTenantId;
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::Producer;
 use wyrd_spec::verification::state::ExecutionState;
@@ -20,8 +21,8 @@ use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
 use wyrd_testing::verification::VerificationFixture;
 
 use super::support::{
-    append_values, await_persistence_drained, published_rows, read_sql, register_table,
-    sorted_values, tenant_client, unique_table,
+    append_values, await_persistence_drained, endpoint_client, published_rows, read_sql,
+    register_table, sorted_values, tenant_client, tenant_key, unique_table,
 };
 
 /// Retention the idle-publication case configures.
@@ -730,53 +731,10 @@ async fn restart_restores_accepted_rows_after_handed_off_receipts_are_deleted() 
         );
     }
 
-    let (stream_node, epoch, shard, segment): (Uuid, i64, i16, i64) = sqlx::query_as(
-        "SELECT wal_node_id, wal_writer_epoch, wal_shard_id, wal_segment_sequence \
-           FROM vala.scribe_batch_commits WHERE data_tenant_id = $1 AND batch_id = $2",
-    )
-    .bind(tenant.as_uuid())
-    .bind(published_batch)
-    .fetch_one(&pool)
-    .await
-    .expect("the published batch holds a receipt");
-    let manifest_suffix = std::path::PathBuf::from(stream_node.simple().to_string())
-        .join(epoch.to_string())
-        .join(format!("shard-{shard:02}"))
-        .join("manifest");
-    let manifest = cluster
-        .wal_dirs()
-        .find_map(|root| find_file(root, &manifest_suffix))
-        .expect("the shard manifest exists");
-    let safe_segment = serde_json::from_slice::<serde_json::Value>(
-        &std::fs::read(&manifest).expect("the manifest reads"),
-    )
-    .expect("the manifest parses")["safe_segment"]
-        .as_i64()
-        .expect("the manifest records a safe frontier");
-    assert!(
-        safe_segment >= segment,
-        "the frontier covers the published receipt's COMMIT segment"
-    );
-
+    delete_handed_off_receipt(&cluster, tenant, published_batch).await;
     let mut conn = vala_sql::TenantConn::acquire(cluster.pg_fixture().app_pool(), tenant)
         .await
         .expect("tenant connection");
-    let deleted = vala_sql::queries::scribe_batch_commits::delete_handed_off(
-        &mut conn,
-        &vala_sql::queries::scribe_batch_commits::HandedOffShard {
-            node_id: stream_node,
-            writer_epoch: epoch,
-            shard_id: shard,
-            safe_segment,
-        },
-        &vala_sql::queries::scribe_batch_commits::RetryHistory {
-            max_age: Duration::ZERO,
-            ..Default::default()
-        },
-        100,
-    )
-    .await
-    .expect("the handed-off receipts are deleted");
     let kept = vala_sql::queries::scribe_batch_commits::committed_batches(
         &mut conn,
         &table,
@@ -784,8 +742,7 @@ async fn restart_restores_accepted_rows_after_handed_off_receipts_are_deleted() 
     )
     .await
     .expect("the receipts read");
-    conn.commit().await.expect("the deletion commits");
-    assert!(deleted >= 1, "the handed-off receipt is deleted");
+    conn.commit().await.expect("the read commits");
     assert_eq!(
         kept,
         [wal_only_batch],
@@ -812,6 +769,156 @@ async fn restart_restores_accepted_rows_after_handed_off_receipts_are_deleted() 
         .shutdown()
         .await
         .expect("the cluster drains cleanly");
+}
+
+/// Another pod's losing copy of a batch restores nothing after the winning
+/// receipt is deleted.
+///
+/// The first pod accepts and publishes the batch. The second pod is then sent
+/// the same batch: it writes its own WAL attempt, loses the receipt to the
+/// first pod's and acknowledges it as already accepted. Once the first pod's
+/// frontier covers its receipt, the receipt is deleted, so the second pod's
+/// attempt has no receipt at all. That pod restarts abruptly and flushes, and
+/// the table still holds the batch exactly once.
+///
+/// # Panics
+///
+/// Panics when the cluster cannot start, either append is refused, the
+/// receipt cannot be deleted, or the batch is read back other than once.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn a_losing_duplicate_restores_nothing_after_the_winning_receipt_is_deleted() {
+    let mut cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::two_mixed())
+        .await
+        .expect("the two-pod mixed cluster starts");
+    let tenant = cluster.data_tenant_id();
+    let name = unique_table("losing_duplicate");
+    let (winner, loser) = {
+        let winner = cluster.server(0).expect("the first pod is running");
+        register_table(winner, tenant, BifrostNamespace::Datasets, &name).await;
+        let loser = cluster.server(1).expect("the second pod is running");
+        (winner.node_id(), loser.node_id())
+    };
+    let table = format!("{}.{name}", BifrostNamespace::Datasets.as_str());
+    let batch_id = Uuid::now_v7();
+    let values: Vec<i64> = (0..24).collect();
+    {
+        let winner = cluster
+            .server_by_node(winner)
+            .expect("the first pod is running");
+        let key = tenant_key(winner, tenant).await;
+        let client = endpoint_client(winner, &key);
+        append_values(&client, &table, batch_id, &values)
+            .await
+            .expect("the first pod accepts the batch");
+        winner.flush_bifrost().await.expect("the batch publishes");
+        let loser = cluster
+            .server_by_node(loser)
+            .expect("the second pod is running");
+        let client = endpoint_client(loser, &key);
+        append_values(&client, &table, batch_id, &values)
+            .await
+            .expect("the second pod acknowledges the batch as already accepted");
+    }
+    delete_handed_off_receipt(&cluster, tenant, batch_id).await;
+
+    let roots = cluster
+        .terminate_node_abruptly_for_test(loser)
+        .await
+        .expect("the losing pod is terminated without a drain");
+    cluster
+        .restart_terminated_node_at_new_address(loser, roots)
+        .await
+        .expect("a replacement pod restarts on the retained roots");
+    let restarted = cluster
+        .server_by_node(loser)
+        .expect("the replacement pod is running");
+    restarted
+        .flush_bifrost()
+        .await
+        .expect("anything the replacement restored publishes");
+    let client = tenant_client(restarted, tenant).await;
+    assert_eq!(
+        sorted_values(&client, &table).await,
+        values,
+        "the losing WAL attempt restores no second copy"
+    );
+
+    cluster
+        .shutdown()
+        .await
+        .expect("the cluster drains cleanly");
+}
+
+/// Deletes `batch_id`'s receipt through the real deletion query once its
+/// shard's persisted safe frontier covers the receipt's COMMIT segment.
+///
+/// History is shrunk to zero age so only the frontier decides; other covered
+/// receipts of the same shard may go with it.
+///
+/// # Panics
+///
+/// Panics when the batch holds no receipt, its shard manifest is missing or
+/// records no frontier, the frontier does not cover the receipt, or the
+/// deletion fails or removes nothing.
+async fn delete_handed_off_receipt(
+    cluster: &WyrdTestCluster,
+    tenant: DataTenantId,
+    batch_id: Uuid,
+) {
+    let pool = cluster
+        .pg_fixture()
+        .superuser_pool()
+        .expect("fixture exposes a superuser pool");
+    let (stream_node, epoch, shard, segment): (Uuid, i64, i16, i64) = sqlx::query_as(
+        "SELECT wal_node_id, wal_writer_epoch, wal_shard_id, wal_segment_sequence \
+           FROM vala.scribe_batch_commits WHERE data_tenant_id = $1 AND batch_id = $2",
+    )
+    .bind(tenant.as_uuid())
+    .bind(batch_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the batch holds a receipt");
+    let manifest_suffix = std::path::PathBuf::from(stream_node.simple().to_string())
+        .join(epoch.to_string())
+        .join(format!("shard-{shard:02}"))
+        .join("manifest");
+    let manifest = cluster
+        .wal_dirs()
+        .find_map(|root| find_file(root, &manifest_suffix))
+        .expect("the shard manifest exists");
+    let safe_segment = serde_json::from_slice::<serde_json::Value>(
+        &std::fs::read(&manifest).expect("the manifest reads"),
+    )
+    .expect("the manifest parses")["safe_segment"]
+        .as_i64()
+        .expect("the manifest records a safe frontier");
+    assert!(
+        safe_segment >= segment,
+        "the frontier covers the receipt's COMMIT segment"
+    );
+
+    let mut conn = vala_sql::TenantConn::acquire(cluster.pg_fixture().app_pool(), tenant)
+        .await
+        .expect("tenant connection");
+    let deleted = vala_sql::queries::scribe_batch_commits::delete_handed_off(
+        &mut conn,
+        &vala_sql::queries::scribe_batch_commits::HandedOffShard {
+            node_id: stream_node,
+            writer_epoch: epoch,
+            shard_id: shard,
+            safe_segment,
+        },
+        &vala_sql::queries::scribe_batch_commits::RetryHistory {
+            max_age: Duration::ZERO,
+            ..Default::default()
+        },
+        100,
+    )
+    .await
+    .expect("the handed-off receipts are deleted");
+    conn.commit().await.expect("the deletion commits");
+    assert!(deleted >= 1, "the handed-off receipt is deleted");
 }
 
 /// Finds the file under `root` whose path ends with `suffix`.

@@ -2462,6 +2462,15 @@ pub struct SocialConfig {
     /// unset, and only that in production.
     #[serde(default)]
     pub google_issuer: Option<String>,
+    /// GitHub's web root, serving `login/oauth/authorize` and
+    /// `login/oauth/access_token`; `https://github.com` when unset, and only
+    /// that in production.
+    #[serde(default)]
+    pub github_url: Option<String>,
+    /// GitHub's API root, serving `user`; `https://api.github.com` when
+    /// unset, and only that in production.
+    #[serde(default)]
+    pub github_api_url: Option<String>,
 }
 
 impl SocialConfig {
@@ -2469,7 +2478,7 @@ impl SocialConfig {
     ///
     /// # Errors
     /// Returns [`ConfigError::Invalid`] when an override is not an issuer URL
-    /// or is set in production.
+    /// or URL, or is set in production.
     pub fn resolve(
         &self,
         production: bool,
@@ -2484,6 +2493,26 @@ impl SocialConfig {
             }
             endpoints.google_issuer = wyrd_spec::auth::IssuerUrl::new(issuer)
                 .map_err(|_| invalid("google_issuer is not an issuer URL"))?;
+        }
+        if self.github_url.is_some() || self.github_api_url.is_some() {
+            if production {
+                return Err(invalid(
+                    "GitHub endpoints cannot be overridden in production",
+                ));
+            }
+            let root = |configured: &Option<String>, default: &str, field: &str| {
+                url::Url::parse(configured.as_deref().unwrap_or(default))
+                    .map_err(|_| invalid(&format!("{field} is not a URL")))
+            };
+            endpoints.github = wyrd_auth::social::GithubEndpoints::at(
+                &root(&self.github_url, "https://github.com/", "github_url")?,
+                &root(
+                    &self.github_api_url,
+                    "https://api.github.com/",
+                    "github_api_url",
+                )?,
+            )
+            .map_err(|_| invalid("GitHub endpoints do not form URLs"))?;
         }
         Ok(endpoints)
     }

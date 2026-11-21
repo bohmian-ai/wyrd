@@ -813,8 +813,10 @@ async fn start_test_server_async(
 ) -> napi::Result<NativeWyrdTestServer> {
     let mut builder = WyrdTestServer::builder();
     if google_issuer.is_some() {
-        builder =
-            builder.with_social_endpoints_for_test(wyrd_testing::SocialConfig { google_issuer });
+        builder = builder.with_social_endpoints_for_test(wyrd_testing::SocialConfig {
+            google_issuer,
+            ..Default::default()
+        });
     }
     let github = github_app
         .then(GithubAppMock::start)

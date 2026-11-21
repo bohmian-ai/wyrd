@@ -525,6 +525,54 @@ and transient-token handling: no repository/organization access, fabricated ID
 token, retained provider token or social role mapping. Reuse common flow proof
 where it exercises both adapters; do not substitute Google-only proof for GitHub.
 
+**Evidence:**
+
+- Reuse: GitHub joins the existing `SocialSignIn` branches (`authorize`,
+  `issuer`, `verify_code`), so begin, login-state binding, invitation
+  redemption, returning sign-in, refusals and session creation are the code
+  Google runs. The gap was the OAuth exchange itself, which the OIDC relying
+  party cannot do (GitHub issues no ID token). `GithubOAuth`
+  (`wyrd-auth-oidc/src/github.rs`) sits beside `RelyingParty` and sends both
+  requests through its screened, redirect-free, bounded `ScreenedHttp::send`
+  (now `pub(crate)`), with `openidconnect`'s PKCE and state generators. No
+  migration: the login state keeps a random nonce nothing checks.
+- Config: `[social] github_url` / `github_api_url` (refused in production)
+  feed `SocialEndpoints.github`; identities always use the fixed
+  `GITHUB_NAMESPACE` (`https://github.com`). The operator's registration
+  instructions no longer mention `user:email`.
+- Test `platform_admin_e2e::an_invited_person_enrolls_with_github_and_returns`:
+  1. the operator configures, tests (a real callback through the mock) and
+     enables GitHub;
+  2. the authorization URL carries `client_id`, `state`, `code_challenge`,
+     `code_challenge_method=S256` and the GitHub callback, and no `scope`;
+     the mock token endpoint only answers a form carrying `code_verifier`
+     and the client secret, and the user API only answers that token;
+  3. enrollment creates one User and one identity under `https://github.com`
+     with subject `4242`, exactly `viewer` on `Prompt/payments`, and a
+     `social` session that reads `Prompt/payments`;
+  4. a renamed login with the same ID returns to the same User, adding no
+     User, identity or grant;
+  5. ID `9999` with the same login and email gets `login=no_account`;
+  6. a spent link (`failed`), an owned identity (`account_exists`) and a
+     revision replaced mid-sign-in (`failed`) admit no one;
+  7. a `502` from GitHub's token endpoint answers a server error, sets no
+     session and creates no User.
+- Unit `wyrd-auth-oidc github::tests::a_refused_code_reads_no_user`: a
+  `200 {"error": …}` token answer is rejected and the user API is never
+  called.
+- Inspection: no scope is requested; the access token lives only inside
+  `GithubOAuth::identity` and is dropped on return (no column stores it, no
+  refresh-token vault); no JWT is built from GitHub data; `groups` is empty
+  and enrollment grants only the invitation's assignments.
+- RED: the test failed at `test begins` with `404 WYRD_SPEC_404_NOT_FOUND`
+  "github sign-in is not configured". GREEN: same selector passed (1.7 s)
+  under `scripts/postgres/with-test-postgres.sh`. The unit test was written
+  after the adapter (supplementary to the journey's RED).
+- Lanes: `mise run fmt`, `lints`, `codegen:check`, `check:deps`,
+  `check:tenant-isolation`; `wyrd-auth` + `wyrd-auth-oidc` lib 185/185;
+  wyrd-server integration `platform_admin_e2e::*` and `pg_browser_sessions::*`
+  54/54; native-testing `cargo check`.
+
 ### 6. A visitor creates a workspace and becomes its administrator
 
 **Maps to:** REQ-011, REQ-012, REQ-014; AC-005.

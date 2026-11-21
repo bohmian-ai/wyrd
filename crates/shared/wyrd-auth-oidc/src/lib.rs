@@ -16,6 +16,7 @@
 pub mod claims;
 pub mod config;
 pub mod error;
+pub mod github;
 pub mod jwks;
 pub mod registry;
 pub mod relying_party;
@@ -24,6 +25,7 @@ pub mod screening;
 pub use claims::{MappedClaims, map_claims};
 pub use config::IssuerConfigResolver;
 pub use error::OidcError;
+pub use github::{GITHUB_NAMESPACE, GithubEndpoints, GithubOAuth};
 pub use jwks::{JwksCache, OidcKid};
 pub use registry::{
     ClaimMapping, ClaimPath, ClientAuth, IssuerVerification, TrustedIssuer, TrustedIssuerRegistry,

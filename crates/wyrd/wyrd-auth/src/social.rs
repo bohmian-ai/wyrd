@@ -13,6 +13,9 @@
 //! Google is an OpenID Connect provider at a fixed issuer, verified by the
 //! same relying party company SSO uses. Provider and key-set metadata are
 //! cached process-wide by that relying party, never rebuilt per request.
+//! GitHub.com is an OAuth provider: [`GithubOAuth`] redeems the code and reads
+//! the authenticated user's numeric ID, recorded under the fixed
+//! [`GITHUB_NAMESPACE`].
 
 use std::sync::Arc;
 
@@ -20,8 +23,10 @@ use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::json;
 use url::Url;
 use uuid::Uuid;
+pub use wyrd_auth_oidc::GithubEndpoints;
 use wyrd_auth_oidc::{
-    ClaimMapping, ClaimPath, ClientAuth, CodeRedemption, MappedClaims, RelyingParty, ScreenedHttp,
+    ClaimMapping, ClaimPath, ClientAuth, CodeRedemption, GITHUB_NAMESPACE, GithubOAuth,
+    MappedClaims, RelyingParty, ScreenedHttp,
 };
 use wyrd_crypt::SealingKeyring;
 use wyrd_spec::DataTenantId;
@@ -66,6 +71,8 @@ pub const GOOGLE_ISSUER: &str = "https://accounts.google.com";
 pub struct SocialEndpoints {
     /// Google's OIDC issuer.
     pub google_issuer: IssuerUrl,
+    /// GitHub's OAuth and API endpoints.
+    pub github: GithubEndpoints,
 }
 
 impl Default for SocialEndpoints {
@@ -73,6 +80,7 @@ impl Default for SocialEndpoints {
         Self {
             google_issuer: IssuerUrl::new(GOOGLE_ISSUER)
                 .expect("invariant: Google's issuer is a valid issuer URL"),
+            github: GithubEndpoints::default(),
         }
     }
 }
@@ -88,6 +96,8 @@ pub struct SocialSignIn {
     keyring: Option<Arc<SealingKeyring>>,
     /// Screened relying party for OIDC providers.
     relying_party: RelyingParty,
+    /// Screened GitHub.com OAuth client.
+    github: GithubOAuth,
     /// Provider endpoints.
     endpoints: SocialEndpoints,
 }
@@ -128,6 +138,7 @@ impl SocialSignIn {
             operator,
             keyring,
             relying_party: RelyingParty::new(http),
+            github: GithubOAuth::new(http, endpoints.github.clone()),
             endpoints,
         }
     }
@@ -301,18 +312,28 @@ impl SocialSignIn {
                     redirect_uri,
                 })
             }
-            SocialProvider::Github => Err(unconfigured(provider)),
+            SocialProvider::Github => {
+                let authorization = self
+                    .github
+                    .authorize(client_id, redirect_uri.as_str())
+                    .map_err(relying_party_error)?;
+                Ok(SocialAuthorization {
+                    url: AbsoluteUrl::new(authorization.url.as_str().to_owned())
+                        .map_err(|_| invalid_state("the provider authorization URL is invalid"))?,
+                    state: authorization.state,
+                    code_verifier: authorization.code_verifier,
+                    nonce: authorization.nonce,
+                    redirect_uri,
+                })
+            }
         }
     }
 
     /// The issuer namespace `provider`'s identities are recorded under.
-    ///
-    /// # Errors
-    /// Returns [`WyrdError::NotFound`] for a provider without an adapter.
-    fn issuer(&self, provider: SocialProvider) -> Result<&str, WyrdError> {
+    fn issuer(&self, provider: SocialProvider) -> &str {
         match provider {
-            SocialProvider::Google => Ok(self.endpoints.google_issuer.as_str()),
-            SocialProvider::Github => Err(unconfigured(provider)),
+            SocialProvider::Google => self.endpoints.google_issuer.as_str(),
+            SocialProvider::Github => GITHUB_NAMESPACE,
         }
     }
 
@@ -453,7 +474,17 @@ impl SocialSignIn {
                     .map_err(relying_party_error)?;
                 Ok(verified.identity)
             }
-            SocialProvider::Github => Err(unconfigured(provider.provider)),
+            SocialProvider::Github => self
+                .github
+                .identity(
+                    &provider.client_id,
+                    &provider.client_secret,
+                    &code,
+                    redirect_uri,
+                    code_verifier,
+                )
+                .await
+                .map_err(relying_party_error),
         }
     }
 
@@ -610,7 +641,7 @@ fn instructions(provider: SocialProvider, callback: &Url) -> String {
             "In GitHub, open Settings > Developer settings > OAuth Apps, register a new \
              OAuth App (not a GitHub App) and set its authorization callback URL to \
              {callback}. Generate a client secret, paste the client ID and secret here, \
-             then test. Wyrd requests only the user:email scope."
+             then test. Wyrd requests no scope, so it reads only the public profile."
         ),
     }
 }
@@ -657,7 +688,7 @@ impl BrowserSessions {
         let binding = SecretString::from(random_secret());
         let state = SocialLoginState {
             provider_revision: row.revision,
-            issuer: social.issuer(provider)?.to_owned(),
+            issuer: social.issuer(provider).to_owned(),
             client_id: row.client_id,
             redirect_uri: authorization.redirect_uri.to_string(),
             code_verifier: authorization.code_verifier,

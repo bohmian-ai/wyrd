@@ -5498,6 +5498,7 @@ async fn an_operator_configures_and_tests_google_beside_company_sso() {
     let srv = WyrdTestServer::builder()
         .with_social_endpoints_for_test(wyrd_server::config::SocialConfig {
             google_issuer: Some(google.uri()),
+            ..Default::default()
         })
         .start_in_process()
         .await
@@ -5903,6 +5904,14 @@ async fn begin_google_login(srv: &WyrdTestServer, slug: &str) -> BegunSocialLogi
 /// # Panics
 /// Panics when sign-in does not begin or sets no `wyrd_login` cookie.
 async fn begin_google(srv: &WyrdTestServer, body: Value) -> BegunSocialLogin {
+    begin_social(srv, body).await
+}
+
+/// Begin a social sign-in with the login request `body`.
+///
+/// # Panics
+/// Panics when sign-in does not begin or sets no `wyrd_login` cookie.
+async fn begin_social(srv: &WyrdTestServer, body: Value) -> BegunSocialLogin {
     let request = Request::builder()
         .method(Method::POST)
         .uri("/auth/browser/login")
@@ -6001,6 +6010,7 @@ async fn google_proves_a_bound_login_without_admitting_a_stranger() {
     let srv = WyrdTestServer::builder()
         .with_social_endpoints_for_test(wyrd_server::config::SocialConfig {
             google_issuer: Some(google.uri()),
+            ..Default::default()
         })
         .start_in_process()
         .await
@@ -6169,6 +6179,7 @@ async fn google_proves_a_bound_login_without_admitting_a_stranger() {
         .start_replica(WyrdTestServer::builder().with_social_endpoints_for_test(
             wyrd_server::config::SocialConfig {
                 google_issuer: Some(google.uri()),
+                ..Default::default()
             },
         ))
         .await
@@ -6642,11 +6653,29 @@ async fn finish_google_session(
     issuer: &str,
     slug: &str,
 ) -> (StatusCode, Option<String>, Option<String>) {
+    finish_social_session(
+        srv,
+        begun,
+        &social_callback(&begun.query["state"], issuer),
+        slug,
+    )
+    .await
+}
+
+/// Return to the social callback `uri` from `begun`'s own browser; returns
+/// the status, `Location` and the tenant session cookie pair, when one was
+/// set.
+async fn finish_social_session(
+    srv: &WyrdTestServer,
+    begun: &BegunSocialLogin,
+    uri: &str,
+    slug: &str,
+) -> (StatusCode, Option<String>, Option<String>) {
     let resp = srv
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri(social_callback(&begun.query["state"], issuer))
+                .uri(uri)
                 .header(header::HOST, SOCIAL_HOST)
                 .header(header::COOKIE, &begun.cookie)
                 .body(Body::empty())
@@ -6702,6 +6731,7 @@ async fn an_invited_person_enrolls_with_google_and_returns() {
     let srv = WyrdTestServer::builder()
         .with_social_endpoints_for_test(wyrd_server::config::SocialConfig {
             google_issuer: Some(google.uri()),
+            ..Default::default()
         })
         .start_in_process()
         .await
@@ -7098,4 +7128,357 @@ async fn an_invited_person_enrolls_with_google_and_returns() {
         "a suspended User"
     );
     assert!(cookie.is_none());
+}
+
+/// GitHub.com's identity namespace, fixed whatever endpoints a test uses.
+const GITHUB_NAMESPACE: &str = "https://github.com";
+
+/// Reset `github` to a GitHub.com stand-in: its token endpoint redeems any
+/// code for `token`, and its user API answers `user` only to that token.
+async fn mount_github(github: &wiremock::MockServer, token: &str, user: Value) {
+    github.reset().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/login/oauth/access_token"))
+        .and(wiremock::matchers::header("accept", "application/json"))
+        .and(wiremock::matchers::body_string_contains("code_verifier="))
+        .and(wiremock::matchers::body_string_contains(
+            "client_secret=github-secret",
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": token, "token_type": "bearer", "scope": ""
+        })))
+        .mount(github)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/user"))
+        .and(wiremock::matchers::header(
+            "authorization",
+            format!("Bearer {token}").as_str(),
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(user))
+        .mount(github)
+        .await;
+}
+
+/// The GitHub callback for provider `state`, as GitHub redirects to it.
+fn github_callback(state: &str) -> String {
+    format!("/auth/social/github/callback?code=github-code&state={state}")
+}
+
+/// Configure, test and enable the deployment's GitHub client `wyrd-github`
+/// against the mock `github` through the platform API; returns the enabled
+/// revision.
+///
+/// # Panics
+/// Panics when any platform step is refused.
+async fn enable_github(srv: &WyrdTestServer, session: &str, github: &wiremock::MockServer) -> u64 {
+    let (status, stored) = social_call(
+        srv,
+        social_request(
+            Method::PUT,
+            "/platform/social/providers/github",
+            Some(session),
+            Some(json!({ "client_id": "wyrd-github", "client_secret": "github-secret" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "GitHub configures: {stored}");
+    let revision = stored["revision"].as_u64().expect("revision");
+    let (status, begun) = social_call(
+        srv,
+        social_request(
+            Method::POST,
+            "/platform/social/providers/github/test",
+            Some(session),
+            Some(json!({ "expected_revision": revision })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "test begins: {begun}");
+    let query = authorization_query(begun["authorization_url"].as_str().expect("url"));
+    mount_github(
+        github,
+        "gho_operator",
+        json!({ "id": 1, "login": "operator" }),
+    )
+    .await;
+    let (status, tested) = social_call(
+        srv,
+        social_request(Method::GET, &github_callback(&query["state"]), None, None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the provider test passes: {tested}");
+    let (status, enabled) = social_call(
+        srv,
+        social_request(
+            Method::PUT,
+            "/platform/social/providers/github/enabled",
+            Some(session),
+            Some(json!({ "enabled": true, "expected_revision": revision })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "GitHub enables: {enabled}");
+    revision
+}
+
+/// GitHub.com admits an invited person through the same flow as Google,
+/// keyed by GitHub's numeric account ID:
+///   1. the operator configures, tests and enables GitHub;
+///   2. GitHub begins with S256 PKCE and state and requests no scope at all;
+///   3. the invited person enrolls one User under the fixed GitHub.com
+///      namespace and their numeric ID, with exactly the invited binding,
+///      and the session reads the invited Card and not another;
+///   4. after renaming their GitHub login they return to the same User;
+///   5. another account ID with the same login and email is a stranger;
+///   6. a spent link, an owned identity and a provider revision replaced
+///      mid-sign-in admit no one;
+///   7. a failing GitHub token endpoint creates nothing and sets no session.
+///
+/// # Panics
+/// Panics when any step's response or stored records differ.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invited_person_enrolls_with_github_and_returns() {
+    let github = wiremock::MockServer::start().await;
+    let srv = WyrdTestServer::builder()
+        .with_social_endpoints_for_test(wyrd_server::config::SocialConfig {
+            google_issuer: None,
+            github_url: Some(github.uri()),
+            github_api_url: Some(github.uri()),
+        })
+        .start_in_process()
+        .await
+        .expect("server starts");
+    let root = initialize_platform_root(&srv)
+        .await
+        .expect("deployment initializes");
+    let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
+    let tenant = srv.data_tenant_id();
+    let slug = srv.pg_fixture().tenant_slug().to_owned();
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+
+    // 1. The operator enables GitHub through the management journey.
+    let revision = enable_github(&srv, &session, &github).await;
+    let admin = srv
+        .bootstrap_service_in_tenant(tenant, "github-invite-admin", &["admin"])
+        .await
+        .expect("tenant admin bootstraps");
+    let admin = srv
+        .exchange_api_key(admin.api_key().expect("admin has an api key"))
+        .await
+        .expect("admin key exchanges");
+    let payments = json!({ "card": { "family": { "kind": "Prompt", "name": "payments" } } });
+    let invite = |recipient: &str| {
+        social_request(
+            Method::POST,
+            "/v1/principals/users/invitations",
+            Some(&admin),
+            Some(json!({
+                "recipients": [recipient],
+                "assignments": [{ "role": "viewer", "scope": payments }],
+            })),
+        )
+    };
+    let code_of = |issued: &Value| {
+        issued["invitations"][0]["invitation_link"]
+            .as_str()
+            .and_then(|link| link.split_once("#invitation="))
+            .map(|(_, code)| code.to_owned())
+            .expect("the link carries its code")
+    };
+    let sign_in = |code: Option<String>, user: Value| {
+        let srv = &srv;
+        let slug = &slug;
+        let github = &github;
+        async move {
+            let begun = begin_social(
+                srv,
+                json!({ "tenant": slug, "provider": "github", "invitation_code": code }),
+            )
+            .await;
+            mount_github(github, "gho_person", user).await;
+            let finished =
+                finish_social_session(srv, &begun, &github_callback(&begun.query["state"]), slug)
+                    .await;
+            (begun, finished)
+        }
+    };
+
+    // 2 and 3. The invited person enrolls with GitHub.
+    let (status, issued) = social_call(&srv, invite("ana@example.test")).await;
+    assert_eq!(status, StatusCode::CREATED, "invite: {issued}");
+    let before = local_records(&superuser).await;
+    let (begun, (status, location, cookie)) = sign_in(
+        Some(code_of(&issued)),
+        json!({ "id": 4242, "login": "ana-gh", "email": "ana@users.example" }),
+    )
+    .await;
+    assert_eq!(begun.query["client_id"], "wyrd-github");
+    assert_eq!(begun.query["code_challenge_method"], "S256");
+    assert!(begun.query.contains_key("code_challenge") && begun.query.contains_key("state"));
+    assert!(
+        !begun.query.contains_key("scope"),
+        "GitHub is asked for no scope: {:?}",
+        begun.query
+    );
+    assert!(begun.query["redirect_uri"].ends_with("/auth/social/github/callback"));
+    assert_eq!(status, StatusCode::SEE_OTHER, "enrollment: {location:?}");
+    assert_eq!(location.as_deref(), Some(format!("/t/{slug}").as_str()));
+    let cookie = cookie.expect("a tenant session is set");
+    let after = local_records(&superuser).await;
+    assert_eq!(
+        (after.0 - before.0, after.1 - before.1),
+        (1, 1),
+        "one User and one identity"
+    );
+    let (user,): (uuid::Uuid,) = sqlx::query_as(
+        "SELECT user_id FROM wyrd.auth_user_identities WHERE issuer = $1 AND subject = '4242'",
+    )
+    .bind(GITHUB_NAMESPACE)
+    .fetch_one(&superuser)
+    .await
+    .expect("the numeric ID under the GitHub.com namespace links the User");
+    let bindings: Vec<(String, Value)> = sqlx::query_as(
+        "SELECT r.name, b.scope FROM wyrd.auth_role_bindings b \
+           JOIN wyrd.auth_roles r ON r.id = b.role_id WHERE b.user_id = $1",
+    )
+    .bind(user)
+    .fetch_all(&superuser)
+    .await
+    .expect("bindings read");
+    assert_eq!(bindings, vec![("viewer".to_owned(), payments.clone())]);
+    let mut declare = social_request(
+        Method::POST,
+        "/v1/cards",
+        Some(&admin),
+        Some(json!({ "submissions": [{
+            "apiVersion": "wyrd/v1",
+            "kind": "Prompt",
+            "metadata": { "name": "payments", "version": "1.0.0" },
+            "spec": {
+                "provider": "openai",
+                "model": "gpt-4o",
+                "messages": [{ "role": "user", "content": "hello" }]
+            },
+            "artifacts": []
+        }] })),
+    );
+    declare.headers_mut().insert(
+        "idempotency-key",
+        header::HeaderValue::from_static("declare-github-payments"),
+    );
+    let (status, body) = social_call(&srv, declare).await;
+    assert_eq!(status, StatusCode::CREATED, "declare: {body}");
+    let (status, body) = browser_get(&srv, "/v1/cards/Prompt/payments/latest", &cookie).await;
+    assert_eq!(status, StatusCode::OK, "the invited scope: {body}");
+    let (_, viewed) = browser_get(&srv, "/auth/browser/session", &cookie).await;
+    assert_eq!(viewed["sessions"][0]["credential"], "social");
+
+    // 4. A renamed login with the same numeric ID returns to the same User.
+    let records = local_records(&superuser).await;
+    let (_, (status, _, returned)) = sign_in(
+        None,
+        json!({ "id": 4242, "login": "ana-renamed", "email": null }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let returned = returned.expect("the returning sign-in sets a session");
+    let (_, viewed) = browser_get(&srv, "/auth/browser/session", &returned).await;
+    assert_eq!(viewed["sessions"][0]["principal_id"], user.to_string());
+    let after = local_records(&superuser).await;
+    assert_eq!(
+        (after.0, after.1, after.3),
+        (records.0, records.1, records.3),
+        "a return adds no User, identity or grant"
+    );
+
+    // 5. Another numeric ID with the same login and email inherits nothing.
+    let (_, (_, location, cookie)) = sign_in(
+        None,
+        json!({ "id": 9999, "login": "ana-renamed", "email": "ana@users.example" }),
+    )
+    .await;
+    assert_eq!(
+        location.as_deref(),
+        Some(format!("/t/{slug}/login?login=no_account").as_str())
+    );
+    assert!(cookie.is_none());
+
+    // 6. A spent link, an owned identity and a replaced revision admit no one.
+    let refused = format!("/t/{slug}/login?login=failed");
+    let (_, (_, location, _)) = sign_in(
+        Some(code_of(&issued)),
+        json!({ "id": 5150, "login": "replayer" }),
+    )
+    .await;
+    assert_eq!(location.as_deref(), Some(refused.as_str()), "a spent link");
+    let (_, owned) = social_call(&srv, invite("owned@example.test")).await;
+    let (_, (_, location, _)) = sign_in(
+        Some(code_of(&owned)),
+        json!({ "id": 4242, "login": "ana-renamed" }),
+    )
+    .await;
+    assert_eq!(
+        location.as_deref(),
+        Some(format!("/t/{slug}/login?login=account_exists").as_str()),
+        "an owned identity is told to sign in"
+    );
+    let begun = begin_social(
+        &srv,
+        json!({ "tenant": slug, "provider": "github", "invitation_code": code_of(&owned) }),
+    )
+    .await;
+    let (status, replaced) = social_call(
+        &srv,
+        social_request(
+            Method::PUT,
+            "/platform/social/providers/github",
+            Some(&session),
+            Some(json!({ "client_id": "wyrd-github", "client_secret": "github-secret" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "GitHub reconfigures: {replaced}");
+    assert!(replaced["revision"].as_u64() > Some(revision));
+    mount_github(
+        &github,
+        "gho_person",
+        json!({ "id": 6060, "login": "late" }),
+    )
+    .await;
+    let (_, location, cookie) =
+        finish_social_session(&srv, &begun, &github_callback(&begun.query["state"]), &slug).await;
+    assert_eq!(
+        location.as_deref(),
+        Some(refused.as_str()),
+        "a replaced revision"
+    );
+    assert!(cookie.is_none());
+    assert_eq!(
+        local_records(&superuser).await.0,
+        records.0,
+        "no User was created"
+    );
+
+    // 7. A failing GitHub creates nothing and falls back to nothing.
+    let current = enable_github(&srv, &session, &github).await;
+    assert!(current > revision);
+    let begun = begin_social(
+        &srv,
+        json!({ "tenant": slug, "provider": "github", "invitation_code": code_of(&owned) }),
+    )
+    .await;
+    github.reset().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(502))
+        .mount(&github)
+        .await;
+    let (status, _, cookie) =
+        finish_social_session(&srv, &begun, &github_callback(&begun.query["state"]), &slug).await;
+    assert!(status.is_server_error(), "a provider outage: {status}");
+    assert!(cookie.is_none());
+    assert_eq!(local_records(&superuser).await.0, records.0);
 }

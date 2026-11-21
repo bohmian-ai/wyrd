@@ -852,6 +852,127 @@ async fn a_losing_duplicate_restores_nothing_after_the_winning_receipt_is_delete
         .expect("the cluster drains cleanly");
 }
 
+/// A running pod that acknowledged another pod's batch as a duplicate accepts
+/// that batch id anew once the accepting pod's cleaner deletes its receipt.
+///
+/// The first pod accepts and publishes the batch. The second pod is sent the
+/// same batch and acknowledges it as already accepted, adding no copy. The
+/// first pod's receipt is aged past retry history and that pod's own cleaner
+/// deletes it. The second pod, still running, is sent the batch again: with
+/// no receipt left it accepts the batch as new under its own receipt, and the
+/// table holds the rows twice.
+///
+/// # Panics
+///
+/// Panics when the cluster cannot start, an append or publication fails, the
+/// duplicate adds a copy, the first pod's cleaner does not delete the receipt
+/// within [`CLEANUP_DEADLINE`], or the second pod acknowledges the last retry
+/// without accepting it under its own receipt.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn a_running_duplicate_pod_accepts_anew_after_the_winning_receipt_is_deleted() {
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::two_mixed())
+        .await
+        .expect("the two-pod mixed cluster starts");
+    let tenant = cluster.data_tenant_id();
+    let name = unique_table("running_duplicate");
+    let accepting = cluster.server(0).expect("the first pod is running");
+    let duplicate = cluster.server(1).expect("the second pod is running");
+    register_table(accepting, tenant, BifrostNamespace::Datasets, &name).await;
+    let table = format!("{}.{name}", BifrostNamespace::Datasets.as_str());
+    let key = tenant_key(accepting, tenant).await;
+    let first = endpoint_client(accepting, &key);
+    let second = endpoint_client(duplicate, &key);
+    let pool = cluster
+        .pg_fixture()
+        .superuser_pool()
+        .expect("fixture exposes a superuser pool");
+    let batch_id = Uuid::now_v7();
+    let values: Vec<i64> = (0..24).collect();
+    append_values(&first, &table, batch_id, &values)
+        .await
+        .expect("the first pod accepts the batch");
+    accepting
+        .flush_bifrost()
+        .await
+        .expect("the batch publishes");
+    append_values(&second, &table, batch_id, &values)
+        .await
+        .expect("the second pod acknowledges the batch as already accepted");
+    duplicate
+        .flush_bifrost()
+        .await
+        .expect("the second pod publishes anything it holds");
+    assert_eq!(
+        sorted_values(&second, &table).await,
+        values,
+        "the duplicate adds no copy"
+    );
+    let receipt = "SELECT wal_node_id FROM vala.scribe_batch_commits \
+                    WHERE data_tenant_id = $1 AND batch_id = $2";
+    let (winner,): (Uuid,) = sqlx::query_as(receipt)
+        .bind(tenant.as_uuid())
+        .bind(batch_id)
+        .fetch_one(&pool)
+        .await
+        .expect("the first pod's receipt holds the batch");
+
+    sqlx::query(
+        "UPDATE vala.scribe_batch_commits SET ingested_at = ingested_at - interval '2 hours' \
+          WHERE data_tenant_id = $1 AND batch_id = $2",
+    )
+    .bind(tenant.as_uuid())
+    .bind(batch_id)
+    .execute(&pool)
+    .await
+    .expect("the receipt ages past retry history");
+    let deadline = tokio::time::Instant::now() + CLEANUP_DEADLINE;
+    loop {
+        let left: Option<(Uuid,)> = sqlx::query_as(receipt)
+            .bind(tenant.as_uuid())
+            .bind(batch_id)
+            .fetch_optional(&pool)
+            .await
+            .expect("receipts read");
+        if left.is_none() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the first pod's cleaner never deleted its aged, handed-off receipt"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    append_values(&second, &table, batch_id, &values)
+        .await
+        .expect("the second pod answers the retry");
+    let renewed: Option<(Uuid,)> = sqlx::query_as(receipt)
+        .bind(tenant.as_uuid())
+        .bind(batch_id)
+        .fetch_optional(&pool)
+        .await
+        .expect("receipts read");
+    let (owner,) = renewed.expect("the second pod accepts the retry anew under a receipt");
+    assert_ne!(owner, winner, "the new receipt is the second pod's");
+    duplicate
+        .flush_bifrost()
+        .await
+        .expect("the second acceptance publishes");
+    let mut twice = [values.clone(), values].concat();
+    twice.sort_unstable();
+    assert_eq!(
+        sorted_values(&second, &table).await,
+        twice,
+        "the batch id accepted anew adds its rows a second time"
+    );
+
+    cluster
+        .shutdown()
+        .await
+        .expect("the cluster drains cleanly");
+}
+
 /// Staged rows restore and retire exactly once after their receipt is deleted.
 ///
 /// The batch is staged locally but not published, so its stage records are

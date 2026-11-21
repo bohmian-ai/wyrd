@@ -1182,6 +1182,7 @@ impl ScribeImpl {
             wal_io,
         } = execution_pools;
         ingress_cpu.join_lanes(memory.workloads());
+        ingress_cpu.retain_encoders(memory.clone(), ingest_limits.max_frame_bytes);
         persistence_cpu.join_lanes(memory.workloads());
         let control_postgres = persistence_config
             .as_ref()
@@ -1448,6 +1449,8 @@ impl ScribeImpl {
         if graceful {
             graceful = await_shutdown_phase(deadline, self.ingress_cpu.drain()).await;
         }
+        // Retained encoder contexts stay charged until the drained lane drops them.
+        self.ingress_cpu.encoders().clear();
         if self
             .shutdown_state
             .compare_exchange(
@@ -2452,6 +2455,7 @@ impl ScribeImpl {
             let before = self.memory.memory_snapshot();
             let owner_snapshots = self.shards.memtable_snapshots()?;
             let transient_by_shard = self.memory.shard_snapshot(self.shards.shard_count());
+            let encoder_memory = self.ingress_cpu.encoders().charged_bytes();
             let memory = self.memory.memory_snapshot().with_ingress_watermarks(
                 self.pressure_config.ingress_high_water_percent,
                 self.pressure_config.ingress_low_water_percent,
@@ -2462,16 +2466,24 @@ impl ScribeImpl {
                 .map(|bucket| bucket.writable_bytes.saturating_add(bucket.immutable_bytes))
                 .sum::<usize>();
             let transient_total = transient_by_shard.iter().sum::<usize>();
-            latest = Some((memory, owner_snapshots.clone(), transient_by_shard.clone()));
+            latest = Some((
+                memory,
+                owner_snapshots.clone(),
+                transient_by_shard.clone(),
+                encoder_memory,
+            ));
             if before.total_bytes() == memory.total_bytes()
-                && bucket_total.saturating_add(transient_total) == memory.total_bytes()
+                && bucket_total
+                    .saturating_add(transient_total)
+                    .saturating_add(encoder_memory)
+                    == memory.total_bytes()
             {
-                coherent = Some((memory, owner_snapshots, transient_by_shard));
+                coherent = Some((memory, owner_snapshots, transient_by_shard, encoder_memory));
                 break;
             }
             std::hint::spin_loop();
         }
-        let (memory, owner_snapshots, transient_by_shard) =
+        let (memory, owner_snapshots, transient_by_shard, encoder_memory) =
             coherent.or(latest).ok_or_else(|| ScribeError::Internal {
                 detail: "inspection could not read bucket and shard ownership".to_owned(),
             })?;
@@ -2501,6 +2513,7 @@ impl ScribeImpl {
             memory_by_category: memory.categories,
             memory_by_shard,
             transient_memory_by_shard: transient_by_shard,
+            encoder_memory,
             memory_by_bucket,
             total_accounted_memory: memory.total_bytes(),
             parent_used_memory: memory.bifrost_total_bytes,

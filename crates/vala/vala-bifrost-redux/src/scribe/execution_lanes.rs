@@ -177,12 +177,34 @@ pub struct ScribeIngressCpuPool {
     capacity: usize,
     /// Conform plans shared by every decode this lane runs.
     conform: Arc<ConformPlans>,
+    /// IPC encoder contexts this lane's workers reuse, once Scribe build
+    /// charges them; empty until then.
+    encoders: Arc<crate::scribe::preprocess::EncoderContexts>,
     /// The process workload manager whose CPU lanes every job runs on, once
     /// the pool joins them at Scribe build.
     workloads: Option<WorkloadManager>,
 }
 
 impl ScribeIngressCpuPool {
+    /// Lets each of this lane's workers keep one IPC encoder context of at
+    /// most `cap` retained bytes, charged to `resources`.
+    pub(crate) fn retain_encoders(
+        &mut self,
+        resources: crate::resources::ScribeResources,
+        cap: usize,
+    ) {
+        self.encoders = Arc::new(crate::scribe::preprocess::EncoderContexts::new(
+            self.pool.current_num_threads(),
+            resources,
+            cap,
+        ));
+    }
+
+    /// The IPC encoder contexts this lane's workers reuse.
+    pub(crate) const fn encoders(&self) -> &Arc<crate::scribe::preprocess::EncoderContexts> {
+        &self.encoders
+    }
+
     /// Runs every later job on the process CPU lanes as Bifrost work.
     pub(crate) fn join_lanes(&mut self, workloads: &WorkloadManager) {
         self.workloads = Some(workloads.clone());
@@ -222,6 +244,7 @@ impl ScribeIngressCpuPool {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(worker_count.max(1))
             .thread_name(|index| format!("wyrd-scribe-ingress-cpu-{index}"))
+            .start_handler(crate::scribe::preprocess::mark_ingress_worker)
             .build()?;
         register_lane_gauges("ingress");
         Ok(Self {
@@ -236,6 +259,7 @@ impl ScribeIngressCpuPool {
             drained: Arc::new(Notify::new()),
             capacity,
             conform: Arc::default(),
+            encoders: Arc::default(),
             workloads: None,
         })
     }

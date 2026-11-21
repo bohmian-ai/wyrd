@@ -663,8 +663,12 @@ async fn production_shard_snapshot_serves_exact_projection_and_lsn_range() {
         .expect("exact ownership inspection");
     assert_eq!(inspection.shard_task_count, DEFAULT_SHARD_COUNT);
     assert_eq!(inspection.shard_channel_count, DEFAULT_SHARD_COUNT);
+    assert!(
+        inspection.encoder_memory > 0,
+        "the ingress worker keeps its encoder context"
+    );
     assert_eq!(
-        inspection.memory_by_shard.iter().sum::<usize>(),
+        inspection.memory_by_shard.iter().sum::<usize>() + inspection.encoder_memory,
         inspection.total_accounted_memory
     );
     assert_eq!(

@@ -7938,8 +7938,8 @@ mod tests {
         let memory = budget
             .try_reserve_ingress(MemoryCategory::Raw, initial_bytes)
             .expect("ingress memory");
-        let mut prepared =
-            crate::scribe::preprocess::prepare_append(crate::scribe::preprocess::AdmittedAppend {
+        let mut prepared = crate::scribe::preprocess::prepare_append(
+            crate::scribe::preprocess::AdmittedAppend {
                 batch_id,
                 request_id: uuid::Uuid::now_v7(),
                 ingested_at_micros: 0,
@@ -7955,8 +7955,10 @@ mod tests {
                 queued_at: std::time::Instant::now(),
                 durable_ack: None,
                 profile: Arc::default(),
-            })
-            .expect("prepared append");
+            },
+            &crate::scribe::preprocess::EncoderContexts::default(),
+        )
+        .expect("prepared append");
         let prepared_bytes = prepared.prepared_bytes;
         prepared
             .memory

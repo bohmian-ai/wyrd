@@ -22,7 +22,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, IoSlice, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -703,6 +703,35 @@ impl PreparedWalAppend {
             .saturating_add(usize::try_from(data_len).expect("invariant: u32 fits usize"));
         Ok(payload_len)
     }
+}
+
+/// Most pieces one WAL record writes: its header, at most 12 SLICE payload
+/// parts, and its CRC.
+const MAX_RECORD_PIECES: usize = 14;
+
+/// Writes every byte of `slices` to `writer` in as few vectored writes as it
+/// accepts, so one WAL record normally costs one write call.
+///
+/// Empty slices are skipped, `Interrupted` is retried, and each call's
+/// progress advances exactly the bytes it reports, including a write that
+/// ends inside a slice.
+///
+/// # Errors
+///
+/// Returns `WriteZero` when the writer accepts nothing while bytes remain,
+/// and any other write error unchanged; bytes already written stay written,
+/// so the caller owns rollback.
+fn write_all_vectored(writer: &mut impl Write, mut slices: &mut [IoSlice<'_>]) -> io::Result<()> {
+    IoSlice::advance_slices(&mut slices, 0);
+    while !slices.is_empty() {
+        match writer.write_vectored(slices) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(written) => IoSlice::advance_slices(&mut slices, written),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 /// Streams one prepared record from borrowed payload owners into its segment.
@@ -1734,14 +1763,21 @@ impl WalSegment {
         }
         let started = Instant::now();
         let result = (|| -> Result<(), ScribeError> {
-            file.write_all(header)
-                .map_err(|error| wal_io_error("WAL record header write failed", &error))?;
-            for part in payload_parts {
-                file.write_all(part)
-                    .map_err(|error| wal_io_error("WAL record payload write failed", &error))?;
+            let pieces = payload_parts.len() + 2;
+            if pieces > MAX_RECORD_PIECES {
+                return Err(ScribeError::Internal {
+                    detail: "WAL record has more payload parts than one vectored write holds"
+                        .to_owned(),
+                });
             }
-            file.write_all(&crc)
-                .map_err(|error| wal_io_error("WAL record CRC write failed", &error))
+            let mut slices = [IoSlice::new(&[]); MAX_RECORD_PIECES];
+            slices[0] = IoSlice::new(header);
+            for (slot, part) in slices[1..].iter_mut().zip(payload_parts) {
+                *slot = IoSlice::new(part);
+            }
+            slices[pieces - 1] = IoSlice::new(&crc);
+            write_all_vectored(&mut *file, &mut slices[..pieces])
+                .map_err(|error| wal_io_error("WAL record write failed", &error))
         })();
         self.appended.fetch_add(1, Ordering::Release);
         record_wal_append(&result, encoded_len, started);
@@ -3939,6 +3975,122 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::namespaces::BifrostNamespace;
+
+    /// A writer that accepts at most `limit` bytes per call and first plays
+    /// back `script`, recording what it received and how many calls it took.
+    struct ScriptedWriter {
+        limit: usize,
+        script: Vec<io::Result<()>>,
+        written: Vec<u8>,
+        calls: usize,
+    }
+
+    impl ScriptedWriter {
+        fn new(limit: usize, script: Vec<io::Result<()>>) -> Self {
+            Self {
+                limit,
+                script,
+                written: Vec::new(),
+                calls: 0,
+            }
+        }
+    }
+
+    impl Write for ScriptedWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.write_vectored(&[IoSlice::new(buf)])
+        }
+
+        fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+            self.calls += 1;
+            if !self.script.is_empty() {
+                self.script.remove(0)?;
+                return Ok(0);
+            }
+            let mut taken = 0;
+            for buf in bufs {
+                let take = buf.len().min(self.limit - taken);
+                self.written.extend_from_slice(&buf[..take]);
+                taken += take;
+                if taken == self.limit {
+                    break;
+                }
+            }
+            Ok(taken)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn pieces() -> [&'static [u8]; 4] {
+        [b"head", b"", b"payload", b"crc!"]
+    }
+
+    /// A writer that takes everything receives the whole record in one call,
+    /// in order.
+    #[test]
+    fn a_record_is_one_vectored_write() {
+        let mut writer = ScriptedWriter::new(usize::MAX, Vec::new());
+        let mut slices = pieces().map(IoSlice::new);
+        write_all_vectored(&mut writer, &mut slices).expect("write");
+        assert_eq!(writer.written, b"headpayloadcrc!");
+        assert_eq!(writer.calls, 1);
+    }
+
+    /// Short writes that end inside and between pieces still produce the
+    /// exact record bytes.
+    #[test]
+    fn short_writes_resume_exactly_where_they_stopped() {
+        for limit in [1, 3, 4, 6, 11] {
+            let mut writer = ScriptedWriter::new(limit, Vec::new());
+            let mut slices = pieces().map(IoSlice::new);
+            write_all_vectored(&mut writer, &mut slices).expect("write");
+            assert_eq!(writer.written, b"headpayloadcrc!", "limit {limit}");
+        }
+    }
+
+    /// Only empty pieces never reach the writer.
+    #[test]
+    fn empty_pieces_write_nothing() {
+        let mut writer = ScriptedWriter::new(usize::MAX, Vec::new());
+        let mut slices = [IoSlice::new(&[]), IoSlice::new(&[])];
+        write_all_vectored(&mut writer, &mut slices).expect("write");
+        assert_eq!(writer.calls, 0);
+    }
+
+    /// An interrupted write is retried and completes the record.
+    #[test]
+    fn an_interrupted_write_is_retried() {
+        let mut writer =
+            ScriptedWriter::new(usize::MAX, vec![Err(io::ErrorKind::Interrupted.into())]);
+        let mut slices = pieces().map(IoSlice::new);
+        write_all_vectored(&mut writer, &mut slices).expect("write");
+        assert_eq!(writer.written, b"headpayloadcrc!");
+        assert_eq!(writer.calls, 2);
+    }
+
+    /// A writer that accepts nothing while bytes remain is `WriteZero`,
+    /// never a silent success.
+    #[test]
+    fn zero_progress_is_write_zero() {
+        let mut writer = ScriptedWriter::new(usize::MAX, vec![Ok(())]);
+        let mut slices = pieces().map(IoSlice::new);
+        let error = write_all_vectored(&mut writer, &mut slices).expect_err("zero progress");
+        assert_eq!(error.kind(), io::ErrorKind::WriteZero);
+    }
+
+    /// Any other error is returned at once, without a retry.
+    #[test]
+    fn a_write_error_is_returned_unchanged() {
+        let mut writer =
+            ScriptedWriter::new(usize::MAX, vec![Err(io::Error::other("disk gone")), Ok(())]);
+        let mut slices = pieces().map(IoSlice::new);
+        let error = write_all_vectored(&mut writer, &mut slices).expect_err("failure");
+        assert_eq!(error.to_string(), "disk gone");
+        assert_eq!(writer.calls, 1);
+    }
 
     fn test_seal_key(tenant: DataTenantId) -> SealKey {
         SealKey::new(

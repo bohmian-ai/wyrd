@@ -143,8 +143,8 @@ impl ReceiptCleaner {
 
     /// Runs one sweep and publishes its outcome to cleanup health.
     ///
-    /// The startup sweep and the background loop share this entry point and
-    /// never overlap.
+    /// The background loop is the only production caller; sweeps never
+    /// overlap.
     ///
     /// # Errors
     ///

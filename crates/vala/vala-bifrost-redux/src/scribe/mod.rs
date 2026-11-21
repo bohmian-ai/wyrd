@@ -2622,8 +2622,9 @@ impl ScribeImpl {
     /// Replays eligible WAL sequentially through the bounded filesystem lane.
     ///
     /// Readiness remains false until every restored shard result, manifest
-    /// advance, and WAL retirement settles, and one receipt sweep has run so a
-    /// restarted pod admits fresh writes as soon as it is ready.
+    /// advance, and WAL retirement settles. Receipt cleanup does not gate it:
+    /// the background cleaner's first completed sweep admits fresh writes, so
+    /// a blocked sweep leaves writes busy while recovered rows are served.
     /// Shutdown requests cancellation
     /// between records; an already-started shard settlement completes first.
     ///
@@ -2713,11 +2714,6 @@ impl ScribeImpl {
             }
         };
         if result.is_ok() {
-            if let Some(cleaner) = &self.receipt_cleaner {
-                // A failed sweep leaves admission busy, not Scribe unready:
-                // reads and admitted work continue while the cleaner retries.
-                let _ = cleaner.sweep_and_report().await;
-            }
             self.recovery_ready.store(true, Ordering::Release);
             metrics::histogram!("bifrost_scribe_replay_seconds")
                 .record(started.elapsed().as_secs_f64());

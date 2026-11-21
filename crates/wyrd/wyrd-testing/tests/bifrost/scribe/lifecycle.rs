@@ -1095,19 +1095,52 @@ async fn tear_wal_tail(cluster: &WyrdTestCluster, tenant: DataTenantId, batch_id
 /// Deletes `batch_id`'s receipt through the real deletion query once its
 /// shard's persisted safe frontier covers the receipt's COMMIT segment.
 ///
-/// Waits for Scribe's own retirement pass to persist that frontier. History
-/// is shrunk to zero age so only the frontier decides; other covered receipts
-/// of the same shard may go with it.
+/// History is shrunk to zero age so only the frontier decides; other covered
+/// receipts of the same shard may go with it.
 ///
 /// # Panics
 ///
-/// Panics when the batch holds no receipt, no persisted frontier covers it
-/// within the case deadline, or the deletion fails or removes nothing.
+/// Panics under the same conditions as [`await_handed_off`], or when the
+/// deletion fails or removes nothing.
 async fn delete_handed_off_receipt(
     cluster: &WyrdTestCluster,
     tenant: DataTenantId,
     batch_id: Uuid,
 ) {
+    let shard = await_handed_off(cluster, tenant, batch_id).await;
+    let mut conn = vala_sql::TenantConn::acquire(cluster.pg_fixture().app_pool(), tenant)
+        .await
+        .expect("tenant connection");
+    let deleted = vala_sql::queries::scribe_batch_commits::delete_handed_off(
+        &mut conn,
+        &shard,
+        &vala_sql::queries::scribe_batch_commits::RetryHistory {
+            max_age: Duration::ZERO,
+            ..Default::default()
+        },
+        chrono::Utc::now(),
+        100,
+    )
+    .await
+    .expect("the handed-off receipts are deleted");
+    conn.commit().await.expect("the deletion commits");
+    assert!(!deleted.is_empty(), "the handed-off receipt is deleted");
+}
+
+/// Waits until the shard's persisted safe frontier covers `batch_id`'s
+/// receipt COMMIT segment, returning that shard as the deletion query names it.
+///
+/// Waits for Scribe's own retirement pass to persist that frontier.
+///
+/// # Panics
+///
+/// Panics when the batch holds no receipt or no persisted frontier covers it
+/// within the case deadline.
+async fn await_handed_off(
+    cluster: &WyrdTestCluster,
+    tenant: DataTenantId,
+    batch_id: Uuid,
+) -> vala_sql::queries::scribe_batch_commits::HandedOffShard {
     let pool = cluster
         .pg_fixture()
         .superuser_pool()
@@ -1147,28 +1180,12 @@ async fn delete_handed_off_receipt(
         }
     };
 
-    let mut conn = vala_sql::TenantConn::acquire(cluster.pg_fixture().app_pool(), tenant)
-        .await
-        .expect("tenant connection");
-    let deleted = vala_sql::queries::scribe_batch_commits::delete_handed_off(
-        &mut conn,
-        &vala_sql::queries::scribe_batch_commits::HandedOffShard {
-            node_id: stream_node,
-            writer_epoch: epoch,
-            shard_id: shard,
-            safe_segment,
-        },
-        &vala_sql::queries::scribe_batch_commits::RetryHistory {
-            max_age: Duration::ZERO,
-            ..Default::default()
-        },
-        chrono::Utc::now(),
-        100,
-    )
-    .await
-    .expect("the handed-off receipts are deleted");
-    conn.commit().await.expect("the deletion commits");
-    assert!(!deleted.is_empty(), "the handed-off receipt is deleted");
+    vala_sql::queries::scribe_batch_commits::HandedOffShard {
+        node_id: stream_node,
+        writer_epoch: epoch,
+        shard_id: shard,
+        safe_segment,
+    }
 }
 
 /// Longest a receipt-cleanup case waits for the pod's own cleaner.
@@ -1302,6 +1319,174 @@ async fn receipt_cleanup_failure_pauses_fresh_writes_until_it_recovers() {
             Err(error) => panic!("a recovered pod admits the write: {error:?}"),
         }
     }
+
+    cluster
+        .shutdown()
+        .await
+        .expect("the cluster drains cleanly");
+}
+
+/// Longest a restart may take while its first receipt sweep is blocked.
+const RESTART_DEADLINE: Duration = Duration::from_secs(60);
+
+/// A restarted pod serves its accepted rows while its first receipt sweep is
+/// blocked, refuses fresh writes as retryable busy, and admits them once the
+/// sweep completes, without another restart.
+///
+/// An accepted, published batch's receipt is handed off and the pod stops
+/// while the receipt is still recent, so its cleaner keeps it. The receipt is
+/// then aged past retry history and a transaction holds its row lock. The pod
+/// restarts on its retained roots: its cleaner reaches the receipt's DELETE
+/// and waits on the lock, yet the restart completes, the rows are read back
+/// and a fresh write is refused as busy. Releasing the lock lets the sweep
+/// delete the receipt, and the same pod then admits the fresh write.
+///
+/// # Panics
+///
+/// Panics when the cluster cannot start or restart within
+/// [`RESTART_DEADLINE`], an accepted append or a read fails, the cleaner never
+/// waits on the held lock, a refusal carries another code, or the receipt is
+/// not deleted and the write admitted within [`CLEANUP_DEADLINE`].
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn a_restart_serves_reads_while_its_first_receipt_sweep_is_blocked() {
+    let mut cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed())
+        .await
+        .expect("the one-pod mixed cluster starts");
+    let tenant = cluster.data_tenant_id();
+    let name = unique_table("blocked_sweep");
+    let table = format!("{}.{name}", BifrostNamespace::Datasets.as_str());
+    let probe_name = unique_table("blocked_sweep_probe");
+    let probe = format!("{}.{probe_name}", BifrostNamespace::Datasets.as_str());
+    let batch_id = Uuid::now_v7();
+    let values: Vec<i64> = (0..24).collect();
+    let (node, key) = {
+        let server = cluster.server(0).expect("the mixed pod is running");
+        register_table(server, tenant, BifrostNamespace::Datasets, &name).await;
+        register_table(server, tenant, BifrostNamespace::Datasets, &probe_name).await;
+        let key = tenant_key(server, tenant).await;
+        append_values(&endpoint_client(server, &key), &table, batch_id, &values)
+            .await
+            .expect("the batch is accepted");
+        server.flush_bifrost().await.expect("the batch publishes");
+        (server.node_id(), key)
+    };
+    await_handed_off(&cluster, tenant, batch_id).await;
+    let roots = cluster
+        .terminate_node_abruptly_for_test(node)
+        .await
+        .expect("the pod is terminated without a drain");
+
+    let pool = cluster
+        .pg_fixture()
+        .superuser_pool()
+        .expect("fixture exposes a superuser pool");
+    sqlx::query(
+        "UPDATE vala.scribe_batch_commits SET ingested_at = ingested_at - interval '2 hours' \
+          WHERE data_tenant_id = $1 AND batch_id = $2",
+    )
+    .bind(tenant.as_uuid())
+    .bind(batch_id)
+    .execute(&pool)
+    .await
+    .expect("the receipt ages past retry history");
+    let mut lock = pool.begin().await.expect("the lock transaction begins");
+    sqlx::query(
+        "SELECT 1 FROM vala.scribe_batch_commits \
+          WHERE data_tenant_id = $1 AND batch_id = $2 FOR UPDATE",
+    )
+    .bind(tenant.as_uuid())
+    .bind(batch_id)
+    .fetch_one(&mut *lock)
+    .await
+    .expect("the receipt's row lock is held");
+    let blocked_deletes = || async {
+        let (waiting,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM pg_stat_activity \
+              WHERE wait_event_type = 'Lock' \
+                AND query LIKE 'DELETE FROM vala.scribe_batch_commits%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("server activity reads");
+        waiting
+    };
+
+    let restarted = tokio::time::timeout(
+        RESTART_DEADLINE,
+        cluster.restart_terminated_node_at_new_address(node, roots),
+    )
+    .await;
+    let Ok(restarted) = restarted else {
+        panic!(
+            "the restart never completed while {} receipt DELETE waited on the held lock",
+            blocked_deletes().await
+        );
+    };
+    restarted.expect("a replacement pod restarts on the retained roots");
+    let deadline = tokio::time::Instant::now() + CLEANUP_DEADLINE;
+    while blocked_deletes().await == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the restarted pod's cleaner never waited on the held receipt lock"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let server = cluster.server(0).expect("the replacement pod is running");
+    let client = endpoint_client(server, &key);
+    assert_eq!(
+        sorted_values(&client, &table).await,
+        values,
+        "accepted rows are served while the sweep is blocked"
+    );
+    let refusal = append_values(&client, &probe, Uuid::now_v7(), &[100])
+        .await
+        .expect_err("a fresh write is refused while the sweep is blocked");
+    assert_eq!(
+        refusal.code(),
+        INGEST_BUSY,
+        "a blocked sweep refuses as retryable busy"
+    );
+
+    lock.rollback().await.expect("the receipt lock is released");
+    let deadline = tokio::time::Instant::now() + CLEANUP_DEADLINE;
+    loop {
+        let (left,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM vala.scribe_batch_commits \
+              WHERE data_tenant_id = $1 AND batch_id = $2",
+        )
+        .bind(tenant.as_uuid())
+        .bind(batch_id)
+        .fetch_one(&pool)
+        .await
+        .expect("receipts read");
+        if left == 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the released sweep never deleted the aged receipt"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    loop {
+        match append_values(&client, &probe, Uuid::now_v7(), &[100]).await {
+            Ok(()) => break,
+            Err(error) if error.code() == INGEST_BUSY => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the pod never admitted again after its sweep completed"
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(error) => panic!("the pod admits the write once its sweep completes: {error:?}"),
+        }
+    }
+    assert_eq!(
+        sorted_values(&client, &probe).await,
+        vec![100],
+        "the admitted write's rows are read back"
+    );
 
     cluster
         .shutdown()

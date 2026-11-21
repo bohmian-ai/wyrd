@@ -159,7 +159,7 @@ already-correct enqueue/ACK behavior is verification-only.
   `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-server --features test-support --test integration --test-threads=1 --no-fail-fast -E "test(/^(pg_approvals|pg_deferred_evidence|pg_verification_runtime|pg_github_delivery)::/)" && cargo nextest run --locked -p wyrd-testing --test scribe -P journey --run-ignored=all -E "test(/^lifecycle::/)"'`
   → 99/99 and 10/10 passed. `mise run fmt && mise run lints` clean;
   `git diff --check` clean.
-- Benchmark checkpoint: pending.
+- Benchmark checkpoint: skipped by maintainer direction; not run for scenario 1.
 
 ### 2. Accepted recovery survives the durable whole-batch handoff
 

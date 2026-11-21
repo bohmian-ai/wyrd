@@ -15,7 +15,7 @@ import { chromium, type Browser, type Page } from 'playwright';
 import { test as base, expect, vi } from 'vitest';
 import { AGREES, assistantTest, judgeReply } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/assistant';
 import { declared, fixture, groupExecution, runtimeAccount, scheduledResult, serverTest } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/server';
-import { Bifrost, Cards, Principals, WyrdClient, WyrdState } from 'wyrd-ai';
+import { Bifrost, Cards, Principals, WyrdClient, WyrdState, verify } from 'wyrd-ai';
 import { z } from 'zod';
 import { loadExecution } from 'wyrd-ai-ui/loaders';
 import { nodeExecutor } from 'wyrd-ai-ui/node';
@@ -2373,6 +2373,8 @@ base('development environment lifecycle', { timeout: 2_400_000 }, async () => {
 
 /** A fresh deployment whose GitHub App is the backend test owner's loopback GitHub. */
 const connected = serverTest({ githubApp: true, perTest: true });
+/** The same deployment, which also runs Verifiers. */
+const reviewing = serverTest({ githubApp: true, perTest: true, verificationRuntime: true });
 
 /** Draw a page in both themes at desktop and phone width and, when a capture directory is set, keep a full-page screenshot of each. */
 async function captureRepositories(page: Page, name: string) {
@@ -2648,8 +2650,11 @@ async function chooseFamilyGrant(form: ReturnType<Page['locator']>, role: string
   await form.getByLabel('Card name').fill(name);
 }
 
-connected('Alice is given payments in Settings and sees only payments in her browser, CLI and SDK, then gains and loses ledger without signing in again', async ({ server }) => {
+reviewing('Alice is given payments in Settings and sees only payments in her browser, CLI and SDK, then gains and loses ledger without signing in again', async ({ server }) => {
   const github = server.githubApp;
+  /** The head commits of the payments and ledger pull requests. */
+  const HEAD = 'a1'.repeat(20);
+  const LEDGER_HEAD = 'a2'.repeat(20);
   github.addInstallation(101, [
     { id: 1, fullName: 'acme/payments' },
     { id: 2, fullName: 'acme/ledger' }
@@ -2670,10 +2675,12 @@ connected('Alice is given payments in Settings and sees only payments in her bro
     const page = await signIn(browser, bff.url, tenant, adminKey);
     await connectGithub(page, base);
     await cards.declareFromPath(fixture('cards/verify_in_real_time/answer-check.yaml'));
-    const paymentsCard = await declarePolicy(cards, github.host, 'acme/payments', 'minimal');
-    const ledger = await declarePolicy(cards, github.host, 'acme/ledger', 'minimal');
-    github.setPullRequest(1, 7, 'b1', 'a1');
-    github.setPullRequest(2, 9, 'b2', 'a2');
+    // Each Repository is gated on CI results published after its review starts, so its review retains evidence and produces a result.
+    await cards.declareFromPath(fixture('cards/deferred_evidence/ci-gate.yaml'));
+    const paymentsCard = await declarePolicy(cards, github.host, 'acme/payments', 'gated');
+    const ledger = await declarePolicy(cards, github.host, 'acme/ledger', 'gated');
+    github.setPullRequest(1, 7, 'b1'.repeat(20), HEAD);
+    github.setPullRequest(2, 9, 'b2'.repeat(20), LEDGER_HEAD);
     expect(github.deliverPullRequest(server.baseUrl, 101, 1, 7, 'opened')).toBe(202);
     expect(github.deliverPullRequest(server.baseUrl, 101, 2, 9, 'opened')).toBe(202);
 
@@ -2787,33 +2794,65 @@ connected('Alice is given payments in Settings and sees only payments in her bro
       .toEqual([7, 9]);
     const review = reviews.find((found) => found.inputs.number === 7)!;
     const hidden = reviews.find((found) => found.inputs.number === 9)!;
-    expect(review.inputs).toMatchObject({ repository_id: '1', members: [review.execution_id], head: { sha: 'a1' } });
+    expect(review.inputs).toMatchObject({ repository_id: '1', members: [review.execution_id], head: { sha: HEAD } });
     expect(await everything.sql(MEMBERS, [], Members)).toEqual([{ members: 2 }]);
     /** What a reader of payments alone is answered for one member execution: its review set, or no such execution. */
-    const member = { execution_id: review.execution_id, status: 'pending', pull_request: { number: 7, generation: review.inputs.generation, members: [review.execution_id] } };
+    const member = { execution_id: review.execution_id, status: 'pending' as string, pull_request: { number: 7, generation: review.inputs.generation, members: [review.execution_id] } };
     const absent = 'WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND';
+
+    // CI publishes each pull request's results; both reviews resume, pass and retain that evidence, their result and its requirement outcomes.
+    const evidence = await verify.Evidence.connect({ client: admin });
+    const published = { payments: await evidence.publish('ci', { status: 'green', for: 'acme/payments' }, { repository: 'acme/payments', commit: HEAD }), ledger: await evidence.publish('ci', { status: 'green', for: 'acme/ledger' }, { repository: 'acme/ledger', commit: LEDGER_HEAD }) };
+    const RESULTS = 'SELECT execution_id, verdict FROM bifrost.verification.results';
+    const EVIDENCE = `SELECT evidence_id, value -> 'value' ->> 'for' AS repository FROM bifrost.verification.evidence`;
+    const OUTCOMES = 'SELECT execution_id, output FROM bifrost.verification.execution_outputs';
+    const Result = z.object({ execution_id: z.string(), verdict: z.string() });
+    const Evidence = z.object({ evidence_id: z.string(), repository: z.string() });
+    const Outcome = z.object({ execution_id: z.string(), output: z.object({ requirements: z.array(z.object({ id: z.string(), outcome: z.string(), actual: z.unknown() })) }) });
+    const produced = ['results', 'evidence', 'execution_outputs'];
+    const counted = (reader: Bifrost) => Promise.all(produced.map(async (table) => (await reader.sql(`SELECT count(*) AS members FROM bifrost.verification.${table}`, [], Members))[0].members));
+    await expect
+      .poll(
+        async () => {
+          server.flushBifrost();
+          return counted(everything);
+        },
+        { timeout: 30_000, interval: 500 }
+      )
+      .toEqual([2, 2, 2]);
+    expect((await everything.sql(EVIDENCE, [], Evidence)).map((row) => row.repository).sort()).toEqual(['acme/ledger', 'acme/payments']);
+    member.status = 'completed';
 
     // Her SDK reads the payments review set and its evidence, counts one member, and finds nothing on a later page: ledger adds no row, count or page.
     const herData = await Bifrost.connect({ client: WyrdClient.connect() });
     expect(await herData.sql(REVIEWS, [], Review)).toEqual([review]);
     expect(await herData.sql(MEMBERS, [], Members)).toEqual([{ members: 1 }]);
     expect(await herData.sql(`${REVIEWS} LIMIT 10 OFFSET 1`, [], Review)).toEqual([]);
-    expect(await herData.sql("SELECT inputs -> 'head' ->> 'sha' AS head FROM bifrost.verification.execution_inputs", [], z.object({ head: z.string() }))).toEqual([{ head: 'a1' }]);
+    expect(await herData.sql("SELECT inputs -> 'head' ->> 'sha' AS head FROM bifrost.verification.execution_inputs", [], z.object({ head: z.string() }))).toEqual([{ head: HEAD }]);
+    // The produced review is hers to read too: the payments result, the evidence CI published for it and its requirement outcome. Ledger's are in no row, count or page, nor found by their ids.
+    expect(await herData.sql(RESULTS, [], Result)).toEqual([{ execution_id: review.execution_id, verdict: 'passed' }]);
+    expect(await herData.sql(EVIDENCE, [], Evidence)).toEqual([{ evidence_id: published.payments.evidence_id, repository: 'acme/payments' }]);
+    expect(await herData.sql(OUTCOMES, [], Outcome)).toEqual([{ execution_id: review.execution_id, output: { requirements: [{ id: 'green', outcome: 'passed', actual: 'green' }] } }]);
+    expect(await counted(herData)).toEqual([1, 1, 1]);
+    for (const hiddenRead of [`${RESULTS} LIMIT 10 OFFSET 1`, `${EVIDENCE} LIMIT 10 OFFSET 1`, `${RESULTS} WHERE execution_id = '${hidden.execution_id}'`, `${OUTCOMES} WHERE execution_id = '${hidden.execution_id}'`, `${EVIDENCE} WHERE evidence_id = '${published.ledger.evidence_id}'`]) {
+      expect(await herData.sql(hiddenRead, [], z.unknown()), hiddenRead).toEqual([]);
+    }
 
     // Her terminal reads the same set, opens its member, and is told ledger's execution does not exist.
     const terminalRun = (args: string[]) => execFileSync(join(REPO, 'target/debug/wyrd'), args, { env: cliEnv, stdio: ['ignore', 'pipe', 'pipe'] }).toString();
     expect(terminalRun(['query', '--sql', REVIEWS]).trim().split('\n').map((line) => Review.parse(JSON.parse(line)))).toEqual([review]);
     expect(JSON.parse(terminalRun(['query', '--sql', MEMBERS]))).toEqual({ members: 1 });
+    expect(terminalRun(['query', '--sql', EVIDENCE]).trim().split('\n').map((line) => JSON.parse(line))).toEqual([{ evidence_id: published.payments.evidence_id, repository: 'acme/payments' }]);
     expect(JSON.parse(terminalRun(['execution', 'status', '--execution-id', review.execution_id]))).toMatchObject(member);
     expect(() => terminalRun(['execution', 'status', '--execution-id', hidden.execution_id])).toThrow(absent);
 
     // The Python SDK reading her saved login is answered the same member and count.
     const python = execFileSync(
       join(REPO, 'sdks/wyrd-sdk-python/.venv/bin/python'),
-      ['-c', 'import json, sys\nfrom wyrd.bifrost import Bifrost\nreader = Bifrost.connect()\nprint(json.dumps([reader.sql(query).to_arrow().to_pylist() for query in sys.argv[1:]]))', "SELECT execution_id FROM bifrost.verification.execution_inputs WHERE origin = 'pull_request'", MEMBERS],
+      ['-c', 'import json, sys\nfrom wyrd.bifrost import Bifrost\nreader = Bifrost.connect()\nprint(json.dumps([reader.sql(query).to_arrow().to_pylist() for query in sys.argv[1:]]))', "SELECT execution_id FROM bifrost.verification.execution_inputs WHERE origin = 'pull_request'", MEMBERS, RESULTS],
       { env: cliEnv }
     ).toString();
-    expect(JSON.parse(python)).toEqual([[{ execution_id: review.execution_id }], [{ members: 1 }]]);
+    expect(JSON.parse(python)).toEqual([[{ execution_id: review.execution_id }], [{ members: 1 }], [{ execution_id: review.execution_id, verdict: 'passed' }]]);
 
     // An MCP host signed in as her reads the same set and member, and is refused ledger's execution.
     const mcp = new Client({ name: 'wyrd-ui-journey', version: '1.0.0' }, { versionNegotiation: { mode: 'auto' } });
@@ -2821,22 +2860,23 @@ connected('Alice is given payments in Settings and sees only payments in her bro
     const tool = async (name: string, args: Record<string, unknown>) => (await mcp.callTool({ name, arguments: args })).structuredContent;
     expect(await tool('bifrost.query', { sql: REVIEWS })).toMatchObject({ rows: [[review.execution_id, review.inputs]], terminal: { row_count: 1 } });
     expect(await tool('bifrost.query', { sql: MEMBERS })).toMatchObject({ rows: [[1]] });
+    expect(await tool('bifrost.query', { sql: RESULTS })).toMatchObject({ rows: [[review.execution_id, 'passed']], terminal: { row_count: 1 } });
     expect(await tool('verification.get_execution', { execution_id: review.execution_id })).toMatchObject(member);
     await expect(tool('verification.get_execution', { execution_id: hidden.execution_id })).rejects.toThrow(absent);
     await mcp.close();
 
-    // In her browser the payments Repository lists that one execution, and its row opens the member: pending, owned by payments.
+    // In her browser the payments Repository lists that one execution, and its row opens the member: completed, owned by payments.
     await her.goto(`${base}/repositories/payments?version=${paymentsCard.version}`);
     const activity = her.getByRole('region', { name: 'Verification activity', exact: true }).locator('tbody tr');
     await expect.poll(() => activity.count(), { timeout: 30_000 }).toBe(1);
     await activity.first().click();
     await her.waitForURL(`${base}/verify/executions/${review.execution_id}`);
-    await expect.poll(() => her.locator('[data-execution-status]').getAttribute('data-execution-status')).toBe('pending');
+    await expect.poll(() => her.locator('[data-execution-status]').getAttribute('data-execution-status')).toBe('completed');
     // The Verifier that review ran is a Card she was not granted: its definition is refused on the member's page, by its own link and to her SDK, while the administrator reads it.
-    const verifier = { kind: 'Verifier', name: 'code-review', version: '1.0.0' } as const;
+    const verifier = { kind: 'Verifier', name: 'ci-gate', version: '1.0.0' } as const;
     await cards.get(verifier);
     await expect.poll(() => her.locator('main').textContent()).toContain('Verifier definition: No card matches the supplied identity');
-    await her.goto(`${base}/cards/detail?kind=Verifier&name=code-review&version=1.0.0`);
+    await her.goto(`${base}/cards/detail?kind=Verifier&name=ci-gate&version=1.0.0`);
     await expect.poll(() => her.locator('main').textContent()).toContain('WYRD_REGISTRY_404_CARD_NOT_FOUND');
     await expect(hers.get(verifier)).rejects.toMatchObject({ code: 'WYRD_REGISTRY_404_CARD_NOT_FOUND' });
     // Verify lists the payments execution alone, and ledger's execution opened by its link reads exactly as one that never existed.

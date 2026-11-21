@@ -8941,21 +8941,24 @@ mod tests {
         );
     }
 
-    /// A crash after the group COMMIT sync but before the last fence replays once.
+    /// A crash after the group COMMIT sync but before the last fence restores
+    /// nothing, and the producer's retry writes every batch once.
     ///
     /// An uncommitted row holds the third batch's fence key, so the real owner
     /// syncs all three COMMIT records and blocks inside the group's one fence
     /// transaction. Dropping the owner there is the crash: no ACK was delivered
     /// and, because the group's fences commit together, none is durable. A
-    /// next-epoch owner replays the same WAL against `PostgreSQL`, and a retry
-    /// of the same IDs acknowledges every batch without a second row.
+    /// next-epoch owner replays the same WAL against `PostgreSQL` and restores
+    /// none of the never-accepted attempts; a retry of the same IDs
+    /// acknowledges every batch and holds each row once.
     ///
     /// # Panics
     ///
     /// Panics if the fixture cannot start, the group does not block on the last
-    /// fence, any ACK precedes the crash, replay fails, or row counts diverge.
+    /// fence, any ACK precedes the crash, replay fails, replay restores a row,
+    /// or the retry does not hold each row once.
     #[tokio::test]
-    async fn group_commit_crash_between_sync_and_fence_replays() {
+    async fn group_commit_crash_between_sync_and_fence_restores_nothing() {
         let database = wyrd_dev_fixtures::pg::PgFixture::start()
             .await
             .expect("Postgres fixture");
@@ -9048,7 +9051,7 @@ mod tests {
             let stats = owner.memtable.stats().expect("memtable stats");
             stats.writable_rows + stats.immutable_rows
         };
-        assert_eq!(rows(&owner), batch_ids.len());
+        assert_eq!(rows(&owner), 0, "a never-accepted attempt restores no rows");
 
         let (retry, acks) = acked_group_for_key(&budget, &key, &batch_ids);
         owner.process_group(retry).await.expect("same-ID retry");

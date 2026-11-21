@@ -11,6 +11,8 @@
 //! - a fence offered for another tenant is refused
 //! - a durable-fence lookup names exactly the offered batch ids that hold a
 //!   fence on their table
+//! - receipt deletion removes only receipts of the named stream shard at or
+//!   below its safe segment and outside the age/count retry history
 
 mod pg_tests {
     use std::sync::{Mutex, OnceLock};
@@ -22,8 +24,8 @@ mod pg_tests {
     use uuid::Uuid;
     use vala_sql::TenantConn;
     use vala_sql::queries::scribe_batch_commits::{
-        ScribeBatchCommit, ScribeBatchCommitResolution, accepted_version, committed_batches,
-        record, resolve,
+        HandedOffShard, RetryHistory, ScribeBatchCommit, ScribeBatchCommitResolution,
+        accepted_version, committed_batches, delete_handed_off, record, resolve,
     };
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::DataTenantId;
@@ -440,5 +442,122 @@ mod pg_tests {
         .await
         .expect("the lookup runs");
         assert_eq!(found, [fenced.batch_id]);
+    }
+
+    /// Deletes only receipts the named shard handed off that left recent
+    /// retry history, by age or by count, and leaves every other receipt.
+    ///
+    /// One shard stream holds an old receipt at the safe segment, an old one
+    /// above it, and a recent one below it; another stream holds an old and
+    /// the newest. Only the first goes. Shrinking the count history to one
+    /// identity then removes the recent one too, since another stream's
+    /// receipt is newer, while every uncovered or foreign receipt stays. A
+    /// deleted identity accepted again above the frontier is not removed.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot start, a statement fails, or the
+    /// remaining receipts diverge from the eligibility rule.
+    #[tokio::test]
+    async fn only_handed_off_receipts_outside_retry_history_are_deleted() {
+        let fixture = PgFixture::start().await.expect("fixture");
+        let tenant = fixture.data_tenant_id();
+        let old = Utc::now() - chrono::Duration::hours(2);
+        let at = |lsn, segment| ScribeBatchCommit {
+            wal_segment_sequence: segment,
+            ..fence(tenant, "bifrost.a", Uuid::now_v7(), lsn)
+        };
+        let handed_off = at(10, 3);
+        let shard = HandedOffShard {
+            node_id: handed_off.wal_node_id,
+            writer_epoch: 1,
+            shard_id: 0,
+            safe_segment: 3,
+        };
+        let same_stream = |commit: ScribeBatchCommit| ScribeBatchCommit {
+            wal_node_id: shard.node_id,
+            ..commit
+        };
+        let uncovered = same_stream(at(20, 4));
+        let recent = same_stream(at(30, 2));
+        let other_stream = at(40, 1);
+        let newest = at(50, 1);
+        commit_group(
+            &fixture,
+            &[
+                (handed_off.clone(), old),
+                (uncovered.clone(), old),
+                (other_stream.clone(), old),
+                (recent.clone(), Utc::now()),
+                (newest.clone(), Utc::now() + chrono::Duration::minutes(1)),
+            ],
+        )
+        .await;
+        let remaining = async |history: RetryHistory| {
+            let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
+                .await
+                .expect("tenant connection");
+            let deleted = delete_handed_off(&mut conn, &shard, &history, 100)
+                .await
+                .expect("the delete runs");
+            let mut left = committed_batches(
+                &mut conn,
+                "bifrost.a",
+                &[
+                    handed_off.batch_id,
+                    uncovered.batch_id,
+                    recent.batch_id,
+                    other_stream.batch_id,
+                    newest.batch_id,
+                ],
+            )
+            .await
+            .expect("the lookup runs");
+            conn.commit().await.expect("commit");
+            left.sort();
+            (deleted, left)
+        };
+        let sorted = |mut ids: Vec<Uuid>| {
+            ids.sort();
+            ids
+        };
+
+        let (deleted, left) = remaining(RetryHistory::default()).await;
+        assert_eq!(deleted, 1);
+        assert_eq!(
+            left,
+            sorted(vec![
+                uncovered.batch_id,
+                recent.batch_id,
+                other_stream.batch_id,
+                newest.batch_id
+            ])
+        );
+
+        let (deleted, left) = remaining(RetryHistory {
+            newest: 1,
+            ..RetryHistory::default()
+        })
+        .await;
+        assert_eq!(deleted, 1, "the recent receipt is outside the newest one");
+        assert_eq!(
+            left,
+            sorted(vec![
+                uncovered.batch_id,
+                other_stream.batch_id,
+                newest.batch_id
+            ])
+        );
+
+        // A deleted identity accepted again above the frontier is a fresh
+        // receipt; the same handed-off shard cannot remove it.
+        let replacement = ScribeBatchCommit {
+            batch_id: handed_off.batch_id,
+            ..same_stream(at(60, 4))
+        };
+        commit_group(&fixture, &[(replacement, old)]).await;
+        let (deleted, left) = remaining(RetryHistory::default()).await;
+        assert_eq!(deleted, 0, "the replacement acceptance stays");
+        assert!(left.contains(&handed_off.batch_id));
     }
 }

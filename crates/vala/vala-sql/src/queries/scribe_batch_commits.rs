@@ -391,6 +391,100 @@ pub async fn committed_batches(
     .map_err(SqlError::from)
 }
 
+/// One WAL shard stream and the highest segment its persisted safe frontier
+/// covers.
+///
+/// Every receipt whose terminal COMMIT segment is at or below
+/// `safe_segment` names a batch whose slices are all in staged or published
+/// custody, so it no longer guards WAL-dependent data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HandedOffShard {
+    /// Node of the WAL stream.
+    pub node_id: uuid::Uuid,
+    /// Writer epoch of the WAL stream.
+    pub writer_epoch: i64,
+    /// Shard of the WAL stream.
+    pub shard_id: i16,
+    /// Highest segment sequence of the shard's persisted safe frontier.
+    pub safe_segment: i64,
+}
+
+/// Recent retry history a receipt stays in, per tenant-qualified table.
+///
+/// A receipt leaves it when either its age passes `max_age` from its
+/// acceptance, measured on PostgreSQL time, or it falls outside the
+/// `newest` identities of its table across every client and pod.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryHistory {
+    /// Age after which a receipt leaves recent history.
+    pub max_age: std::time::Duration,
+    /// Newest accepted identities per table that stay in recent history.
+    pub newest: i64,
+}
+
+impl Default for RetryHistory {
+    /// One hour and 10,000 identities per tenant-qualified table.
+    fn default() -> Self {
+        Self {
+            max_age: std::time::Duration::from_hours(1),
+            newest: 10_000,
+        }
+    }
+}
+
+/// Deletes at most `limit` of the tenant's receipts that `shard` handed off
+/// and that left recent retry history, returning how many went.
+///
+/// The one statement ranks the tenant's receipts by acceptance per table,
+/// then deletes only rows whose current coordinates still name `shard` at or
+/// below its safe segment, so a candidate replaced by a later acceptance of
+/// the same identity elsewhere is never removed. Deleting a receipt removes
+/// no accepted row and no other custody.
+///
+/// # Errors
+///
+/// Returns [`SqlError`] when PostgreSQL cannot execute the tenant-scoped
+/// delete.
+pub async fn delete_handed_off(
+    conn: &mut TenantConn<'_>,
+    shard: &HandedOffShard,
+    history: &RetryHistory,
+    limit: i64,
+) -> Result<u64, SqlError> {
+    // ponytail: ranks every receipt of the tenant per call; add a
+    // (tenant, table, ingested_at) index if the cleaner's sweeps show it.
+    let deleted = sqlx::query(
+        "DELETE FROM vala.scribe_batch_commits AS receipt \
+          USING ( \
+            SELECT logical_table_fqn, batch_id FROM ( \
+              SELECT logical_table_fqn, batch_id, wal_node_id, wal_writer_epoch, \
+                     wal_shard_id, wal_segment_sequence, ingested_at, \
+                     row_number() OVER ( \
+                       PARTITION BY logical_table_fqn \
+                       ORDER BY ingested_at DESC, batch_id DESC) AS newest \
+                FROM vala.scribe_batch_commits) AS ranked \
+             WHERE wal_node_id = $1 AND wal_writer_epoch = $2 AND wal_shard_id = $3 \
+               AND wal_segment_sequence <= $4 \
+               AND (ingested_at < statement_timestamp() - ($5 * interval '1 second') OR newest > $6) \
+             LIMIT $7) AS eligible \
+          WHERE receipt.logical_table_fqn = eligible.logical_table_fqn \
+            AND receipt.batch_id = eligible.batch_id \
+            AND receipt.wal_node_id = $1 AND receipt.wal_writer_epoch = $2 \
+            AND receipt.wal_shard_id = $3 AND receipt.wal_segment_sequence <= $4",
+    )
+    .bind(shard.node_id)
+    .bind(shard.writer_epoch)
+    .bind(shard.shard_id)
+    .bind(shard.safe_segment)
+    .bind(history.max_age.as_secs_f64())
+    .bind(history.newest)
+    .bind(limit)
+    .execute(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)?;
+    Ok(deleted.rows_affected())
+}
+
 /// Reads the `PostgreSQL` instant Scribe anchors its admission clock on.
 ///
 /// PostgreSQL is the clock of record for `wyrd_ingested_at`: the value is

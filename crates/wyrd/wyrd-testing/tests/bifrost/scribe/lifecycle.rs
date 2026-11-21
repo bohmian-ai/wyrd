@@ -666,16 +666,17 @@ async fn replay_restores_only_accepted_batches() {
 /// segment. The second is accepted but still WAL-dependent, and the third is
 /// never accepted. Of the table's receipts the real deletion query removes
 /// only the first.
-/// After an abrupt restart the published rows come from their own files, the
-/// WAL-dependent rows from the WAL under their kept receipt, and the
-/// never-accepted rows not at all.
+/// The abrupt stop leaves a torn record after the last write. After the
+/// restart the published rows come from their own files, the WAL-dependent
+/// rows from the WAL under their kept receipt, the torn record is cut off and
+/// the never-accepted rows do not appear.
 ///
 /// # Panics
 ///
 /// Panics when the cluster cannot start, an accepted append fails, the
 /// unrecorded append is acknowledged, no frontier covers the published
-/// receipt, the deletion keeps it or removes the WAL-dependent one, or the restored rows
-/// differ from the accepted ones.
+/// receipt, the deletion keeps it or removes the WAL-dependent one, the restart
+/// refuses the torn tail, or the restored rows differ from the accepted ones.
 #[tokio::test]
 #[ignore = "requires Postgres and object storage"]
 async fn restart_restores_accepted_rows_after_handed_off_receipts_are_deleted() {
@@ -753,6 +754,7 @@ async fn restart_restores_accepted_rows_after_handed_off_receipts_are_deleted() 
         .terminate_node_abruptly_for_test(node)
         .await
         .expect("the pod is terminated without a drain");
+    tear_wal_tail(&cluster, tenant, wal_only_batch).await;
     cluster
         .restart_terminated_node_at_new_address(node, roots)
         .await
@@ -850,17 +852,136 @@ async fn a_losing_duplicate_restores_nothing_after_the_winning_receipt_is_delete
         .expect("the cluster drains cleanly");
 }
 
-/// Deletes `batch_id`'s receipt through the real deletion query once its
-/// shard's persisted safe frontier covers the receipt's COMMIT segment.
+/// Staged rows restore and retire exactly once after their receipt is deleted.
 ///
-/// History is shrunk to zero age so only the frontier decides; other covered
-/// receipts of the same shard may go with it.
+/// The batch is staged locally but not published, so its stage records are
+/// its only copy once its WAL is handed off and its receipt deleted. An abrupt
+/// restart serves the rows from those records. Publishing then retires the
+/// records, and a second abrupt restart serves the published rows once, with
+/// no stage record or WAL left to restore a second copy.
 ///
 /// # Panics
 ///
-/// Panics when the batch holds no receipt, its shard manifest is missing or
-/// records no frontier, the frontier does not cover the receipt, or the
-/// deletion fails or removes nothing.
+/// Panics when the cluster cannot start or restart, the append or a
+/// publication fails, the rows publish before the restart, the receipt cannot
+/// be deleted, or any read differs from the batch.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn staged_rows_restore_and_retire_once_after_their_receipt_is_deleted() {
+    let mut cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed())
+        .await
+        .expect("the one-pod mixed cluster starts");
+    let tenant = cluster.data_tenant_id();
+    let name = unique_table("staged_after_receipt");
+    let table = format!("{}.{name}", BifrostNamespace::Datasets.as_str());
+    let rows: Vec<i64> = (0..48).collect();
+    let batch_id = Uuid::now_v7();
+    let (node, key) = {
+        let server = cluster.server(0).expect("the mixed pod is running");
+        register_table(server, tenant, BifrostNamespace::Datasets, &name).await;
+        let key = tenant_key(server, tenant).await;
+        let client = endpoint_client(server, &key);
+        append_values(&client, &table, batch_id, &rows)
+            .await
+            .expect("the batch is acknowledged");
+        let scribe = server.bifrost_scribe().expect("the pod owns a Scribe");
+        scribe
+            .flush_writable_for_test()
+            .await
+            .expect("every writable bucket freezes");
+        await_persistence_drained(&scribe).await;
+        assert_eq!(
+            published_rows(server, tenant, &name).await,
+            0,
+            "the rows are staged, not published"
+        );
+        (server.node_id(), key)
+    };
+    delete_handed_off_receipt(&cluster, tenant, batch_id).await;
+
+    for phase in ["staged", "published"] {
+        let roots = cluster
+            .terminate_node_abruptly_for_test(node)
+            .await
+            .expect("the pod is terminated without a drain");
+        cluster
+            .restart_terminated_node_at_new_address(node, roots)
+            .await
+            .expect("a replacement pod restarts on the retained roots");
+        let server = cluster.server(0).expect("the replacement pod is running");
+        let client = endpoint_client(server, &key);
+        assert_eq!(
+            sorted_values(&client, &table).await,
+            rows,
+            "the {phase} rows restore exactly once"
+        );
+        if phase == "staged" {
+            server
+                .flush_bifrost()
+                .await
+                .expect("the restored rows publish");
+            assert_eq!(
+                published_rows(server, tenant, &name).await,
+                rows.len() as u64,
+                "the committed files hold the batch once"
+            );
+        }
+    }
+
+    cluster
+        .shutdown()
+        .await
+        .expect("the cluster drains cleanly");
+}
+
+/// Appends a torn record to the WAL segment holding `batch_id`'s COMMIT, as an
+/// abrupt stop in the middle of a write leaves it.
+///
+/// # Panics
+///
+/// Panics when the batch holds no receipt or its segment cannot be found or
+/// written.
+async fn tear_wal_tail(cluster: &WyrdTestCluster, tenant: DataTenantId, batch_id: Uuid) {
+    let pool = cluster
+        .pg_fixture()
+        .superuser_pool()
+        .expect("fixture exposes a superuser pool");
+    let (node, epoch, shard, segment): (Uuid, i64, i16, i64) = sqlx::query_as(
+        "SELECT wal_node_id, wal_writer_epoch, wal_shard_id, wal_segment_sequence \
+           FROM vala.scribe_batch_commits WHERE data_tenant_id = $1 AND batch_id = $2",
+    )
+    .bind(tenant.as_uuid())
+    .bind(batch_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the batch holds a receipt");
+    let suffix = std::path::PathBuf::from(node.simple().to_string())
+        .join(epoch.to_string())
+        .join(format!("shard-{shard:02}"))
+        .join(format!("{segment}.wal"));
+    let path = cluster
+        .wal_dirs()
+        .find_map(|root| find_file(root, &suffix))
+        .expect("the batch's WAL segment exists");
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .expect("the WAL segment opens");
+    std::io::Write::write_all(&mut file, &[0xff; 13]).expect("the torn bytes are written");
+    file.sync_all().expect("the torn bytes sync");
+}
+
+/// Deletes `batch_id`'s receipt through the real deletion query once its
+/// shard's persisted safe frontier covers the receipt's COMMIT segment.
+///
+/// Waits for Scribe's own retirement pass to persist that frontier. History
+/// is shrunk to zero age so only the frontier decides; other covered receipts
+/// of the same shard may go with it.
+///
+/// # Panics
+///
+/// Panics when the batch holds no receipt, no persisted frontier covers it
+/// within the case deadline, or the deletion fails or removes nothing.
 async fn delete_handed_off_receipt(
     cluster: &WyrdTestCluster,
     tenant: DataTenantId,
@@ -883,20 +1004,27 @@ async fn delete_handed_off_receipt(
         .join(epoch.to_string())
         .join(format!("shard-{shard:02}"))
         .join("manifest");
-    let manifest = cluster
-        .wal_dirs()
-        .find_map(|root| find_file(root, &manifest_suffix))
-        .expect("the shard manifest exists");
-    let safe_segment = serde_json::from_slice::<serde_json::Value>(
-        &std::fs::read(&manifest).expect("the manifest reads"),
-    )
-    .expect("the manifest parses")["safe_segment"]
-        .as_i64()
-        .expect("the manifest records a safe frontier");
-    assert!(
-        safe_segment >= segment,
-        "the frontier covers the receipt's COMMIT segment"
-    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let safe_segment = loop {
+        let safe_segment = cluster
+            .wal_dirs()
+            .find_map(|root| find_file(root, &manifest_suffix))
+            .and_then(|manifest| {
+                serde_json::from_slice::<serde_json::Value>(&std::fs::read(manifest).ok()?).ok()?
+                    ["safe_segment"]
+                    .as_i64()
+            });
+        match safe_segment {
+            Some(safe_segment) if safe_segment >= segment => break safe_segment,
+            _ => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the shard's persisted frontier never covered the receipt's COMMIT segment"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    };
 
     let mut conn = vala_sql::TenantConn::acquire(cluster.pg_fixture().app_pool(), tenant)
         .await

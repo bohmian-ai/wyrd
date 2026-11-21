@@ -197,7 +197,9 @@ do not prove it. SQL eligibility/concurrency checks live in `vala-sql` integrati
 and existing per-seal-key manifests cannot establish the required whole-shard
 frontier. Tests must expose those missing behaviors before the respective changes.
 
-**Evidence:** In progress; open items are marked FAIL.
+**Evidence:** Complete. TDD: the safe frontier, SQL deletion, replay skip and
+crossing-batch fixes were test-first; the journeys noted below were written
+after the behavior they connect.
 
 - Accepted-only replay (REQ-004) — `wyrd-testing`
   `lifecycle::replay_restores_only_accepted_batches`: an accepted batch and an
@@ -258,13 +260,33 @@ frontier. Tests must expose those missing behaviors before the respective change
   `shards::tests::every_partition_of_a_batch_keeps_all_its_segments`. RED:
   `shards.rs:10407` second partition held only `1.wal` of `{0.wal, 1.wal}`.
   GREEN. Regression after both: 479/479 redux, 49/49 journeys.
-- FAIL: no dedicated proof yet for another pod's losing duplicate after the
-  winning receipt is deleted (same `Unfenced` branch as the refused attempt
-  above), torn tail or stage-record retirement after old fences disappear.
+- Losing duplicate — `lifecycle::a_losing_duplicate_restores_nothing_after_the_winning_receipt_is_deleted`
+  (two pods, one credential): pod A accepts and publishes; pod B writes its own
+  WAL attempt of the same batch and acknowledges it as already accepted; A's
+  receipt is deleted under its frontier; B restarts abruptly and flushes; the
+  batch reads back once. Written after accepted-only replay, so not test-first;
+  mutation (replay restores `Unfenced` again) fails at `lifecycle.rs:835` with
+  every row twice. A first run used a second principal, which is a different
+  batch, and was correctly refused with `BatchConflict`
+  (`sub_principal_id` digest differed in the trace).
+- Torn tail — the connected journey above now tears the WAL tail after the
+  abrupt stop (13 `0xff` bytes after the WAL-only batch's COMMIT), after the
+  published receipt is deleted. Restart cuts the tail and restores exactly rows
+  0–47. Torn-tail validation reads the newest remaining receipt per stream and
+  shard. Deleted receipts all sit at or below the frontier, and replay never
+  reads those segments, so the newest receipt in any segment it reads is never
+  deleted. Not test-first: this is existing behavior under the new deletion.
+- Stage-record retirement — `lifecycle::staged_rows_restore_and_retire_once_after_their_receipt_is_deleted`:
+  batch staged, not published; Scribe's own retirement pass persists a frontier
+  covering it; receipt deleted; abrupt restart serves the rows from stage
+  records; publish retires them (committed files hold the batch once); a second
+  abrupt restart reads the batch once. Not test-first (existing behavior). The
+  shared helper `delete_handed_off_receipt` waits up to 30 s for the persisted
+  frontier, since retirement runs on Scribe's lifecycle tick.
 - Limitation: `delete_handed_off` ranks all of a tenant's receipts per call
   (`ponytail:` note); its cost is qualified with the cleaner in scenario 3.
 - Commands: `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo nextest run --locked -p vala-bifrost-redux --features test-support --run-ignored=all --no-fail-fast -E "test(/scribe|replay|wal|fence|staging/)"; cargo nextest run --locked -p wyrd-testing --test scribe -P journey --run-ignored=all --no-fail-fast'`
-  → 477/477 and 48/48 before the journey was added;
+  → 479/479 and 51/51 at the end of the scenario;
   `cargo nextest run --locked -p vala-sql --test integration -E "test(/pg_scribe_batch_commits/)"`
   → 7/7; `mise run lints`, `check:tenant-isolation`, `git diff --check` clean.
 - Benchmark checkpoint: skipped by maintainer direction.

@@ -243,9 +243,21 @@ frontier. Tests must expose those missing behaviors before the respective change
   deletion query removes it and keeps the WAL-only batch's receipt → abrupt
   restart → exactly rows 0–47, never-accepted 100–123 absent. Written after the
   units it connects, so not test-first; 5/5 runs passed.
-- FAIL: replay does not read the frontier. Under accepted-only replay a missing
-  receipt already restores nothing from the WAL, so a frontier branch would not
-  change any outcome; awaiting maintainer decision.
+- Replay reads the frontier — Codex (read-only) showed a crash between
+  deleting two covered segments leaves a COMMIT whose slices are gone, and
+  replay then refuses recovery. `WalReader::open_paths` now removes segments
+  at or below their shard manifest's `safe_segment` instead of reading them.
+  `replay::tests::replay_skips_segments_its_frontier_covers`. RED:
+  `replay.rs:2196` "WAL v8 COMMIT closes an incomplete or unordered slice set".
+  GREEN.
+- Crossing batch — Codex (read-only) showed a batch whose partitions straddle a
+  WAL roll let one partition's selective seal free the segment holding the
+  other's slice, so the frontier could pass a batch not wholly staged. Each
+  partition in a group now retains every segment the group wrote
+  (`append_and_sync_batch_commits`).
+  `shards::tests::every_partition_of_a_batch_keeps_all_its_segments`. RED:
+  `shards.rs:10407` second partition held only `1.wal` of `{0.wal, 1.wal}`.
+  GREEN. Regression after both: 479/479 redux, 49/49 journeys.
 - FAIL: no dedicated proof yet for another pod's losing duplicate after the
   winning receipt is deleted (same `Unfenced` branch as the refused attempt
   above), torn tail or stage-record retirement after old fences disappear.

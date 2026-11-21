@@ -6,9 +6,16 @@ import { field } from '$lib/server/form';
 import { safeProblem } from '$lib/server/problem';
 import type { Actions, PageServerLoad } from './$types';
 
-export const load: PageServerLoad = ({ params }) => {
+export const load: PageServerLoad = async ({ params, url }) => {
   if (localAuthEnabled()) redirect(303, '/');
-  return { tenant: { key: params.tenantKey }, problem: null };
+  const tenant = { key: params.tenantKey };
+  try {
+    const { providers } = await browserSessions.methods(params.tenantKey, url);
+    return { tenant, providers, problem: null };
+  } catch (cause) {
+    if (!isHttpError(cause)) throw cause;
+    return { tenant, providers: [], problem: safeProblem(cause) };
+  }
 };
 
 /**

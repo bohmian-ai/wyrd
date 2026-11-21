@@ -4,6 +4,17 @@ import { serverUrl } from '../upstream';
 import { upstreamProblem } from '../problem';
 import { reject, type SessionMetadata, type TenantContext } from './session';
 
+/** A shared social sign-in provider. */
+export type SocialProvider = 'google' | 'github';
+
+/** The sign-in methods `GET /auth/browser/methods` allows. */
+export type LoginMethods = {
+  password: boolean;
+  company_sso: boolean;
+  providers: SocialProvider[];
+  signup: boolean;
+};
+
 const sessionPrefix = 'wyrd_session_';
 const tenantKeyPattern = /^[a-z0-9][a-z0-9_-]{0,62}$/;
 
@@ -178,17 +189,37 @@ export class BrowserSessions {
     return sessionPrefix + tenantKey;
   }
 
-  /** Begin SSO sign-in: the server sets the login cookie and returns the provider URL. */
-  async begin(tenantKey: string, url: URL, cookies: Cookies): Promise<string> {
+  /**
+   * Begin a provider sign-in: company SSO, or the shared `provider`, which
+   * with `invitationCode` redeems that invitation link. The server sets the
+   * login cookie and returns the provider URL.
+   */
+  async begin(
+    tenantKey: string,
+    url: URL,
+    cookies: Cookies,
+    provider?: SocialProvider,
+    invitationCode?: string
+  ): Promise<string> {
     this.cookieName(tenantKey);
     const response = await call('/auth/browser/login', url, {
       method: 'POST',
-      body: { tenant: tenantKey }
+      body: { tenant: tenantKey, provider, invitation_code: invitationCode }
     });
     if (!response.ok) await refuse(response);
     relayCookies(response, cookies);
     const begun = (await response.json()) as { authorization_url: string };
     return begun.authorization_url;
+  }
+
+  /** The sign-in methods Rust allows on this tenant's pages; rendering only, never enforcement. */
+  async methods(tenantKey: string, url: URL): Promise<LoginMethods> {
+    this.cookieName(tenantKey);
+    const response = await call(`/auth/browser/methods?tenant=${encodeURIComponent(tenantKey)}`, url, {
+      method: 'GET'
+    });
+    if (!response.ok) await refuse(response);
+    return (await response.json()) as LoginMethods;
   }
 
   /** Recovery sign-in: the server verifies the API key and sets the tenant session cookie. */

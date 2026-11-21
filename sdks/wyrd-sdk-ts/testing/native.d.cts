@@ -166,6 +166,16 @@ export declare class NativeWyrdTestServer {
    */
   get tenantSlug(): string
   /**
+   * Initialize this deployment's platform and return its one root platform
+   * credential, as `wyrd-server init` discloses it to an operator.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the harness is closed or the deployment is
+   * already initialized.
+   */
+  initializePlatformRoot(): string
+  /**
    * The loopback GitHub App this server is configured against.
    *
    * # Errors
@@ -554,6 +564,11 @@ export interface NativeTestServerOptions {
    * journey reaches it quickly; omitted keeps the production deadline.
    */
   verifyTimeoutMs?: number
+  /**
+   * Google's OpenID Connect issuer, so a journey signs in at a local fake
+   * Google; omitted keeps the real provider.
+   */
+  googleIssuer?: string
 }
 
 /**

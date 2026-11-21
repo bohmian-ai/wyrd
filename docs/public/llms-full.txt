@@ -3973,6 +3973,8 @@ You can also create the User yourself. The password is read from standard input,
 wyrd principal user create --username alice --grant editor:all < alice-password.txt
 ```
 
+When a platform operator has enabled Google sign-in for the deployment, the invitation page also offers **Join with Google**. The person's account is then tied to that Google account, whatever its email address, and they return with **Continue with Google** on the sign-in page. A Google account that already has an account in the tenant cannot use a second link; the sign-in page tells them to sign in instead.
+
 In the UI, go to **Settings**, then **Access**, then **Users**. Paste the email addresses and choose a role and a scope, and the page shows each link once. **Pending invitations** lists every live invitation, with **Resend** and **Revoke**.
 
 Either way, the account holds exactly the grants you named, and each `--grant` names its scope. The person then signs in from a terminal with `wyrd auth login --server https://wyrd.example.com --tenant acme`, signs in with their password in the browser, and approves the code the CLI shows. The approval page opens at the address they use for the Wyrd UI when the server runs behind it. Revoke the account with `wyrd principal revoke` when they leave.

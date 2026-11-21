@@ -708,7 +708,11 @@ pub async fn insert_social_login_state(
         .bind(&row.nonce)
         .bind(row.browser_binding.as_bytes().as_slice())
         .bind(ttl.as_secs_f64())
-        .bind(row.invitation.as_ref().map(|hash| hash.as_bytes().to_vec()))
+        .bind(
+            row.invitation
+                .as_ref()
+                .map(|hash| hash.as_bytes().as_slice()),
+        )
         .execute(&mut **conn.transaction())
         .await?;
     Ok(inserted.rows_affected() == 1)

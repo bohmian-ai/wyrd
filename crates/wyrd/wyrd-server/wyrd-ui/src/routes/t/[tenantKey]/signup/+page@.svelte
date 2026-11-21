@@ -11,6 +11,7 @@
   onMount(() => {
     code = new URLSearchParams(window.location.hash.slice(1)).get('invitation') ?? '';
   });
+  const names = { google: 'Google', github: 'GitHub' } as const;
 </script>
 
 <svelte:head><title>Sign up · {data.tenant.key} · Wyrd</title></svelte:head>
@@ -26,5 +27,12 @@
     <p>8–128 characters. A passphrase works well; common passwords are refused.</p>
     <button class="app-control primary wide" type="submit">Create account</button>
   </form>
+  {#each data.providers as provider (provider)}
+    <form method="POST" action="/t/{encodeURIComponent(data.tenant.key)}/login?/social">
+      <input type="hidden" name="provider" value={provider} />
+      <input type="hidden" name="invitationCode" value={code} />
+      <button class="app-control wide" type="submit" disabled={!code}>Join with {names[provider]}</button>
+    </form>
+  {/each}
   <nav class="links"><a href="/t/{encodeURIComponent(data.tenant.key)}/login">Back to sign-in</a></nav>
 </Entry>

@@ -5,6 +5,7 @@
  * evidence exported over stock OTLP. Nothing here mocks the server or the BFF.
  */
 import { execFileSync, spawn } from 'node:child_process';
+import { generateKeyPairSync, randomUUID, sign } from 'node:crypto';
 import { closeSync, mkdtempSync, openSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { createServer as createHttpServer, request as httpRequest } from 'node:http';
 import { createServer } from 'node:net';
@@ -3374,5 +3375,189 @@ test('Access works from the keyboard and fits a phone and a desktop in light and
     expect(ring.width).toBeGreaterThan(0);
   } finally {
     await page.context().close();
+  }
+});
+
+/** The Google account the fake Google signs in next. */
+type GoogleAccount = { sub: string; email: string };
+
+/**
+ * A loopback stand-in for Google's OpenID provider, as Wyrd's controlled
+ * test endpoints allow: `/authorize` signs `account` in at once and returns to
+ * the caller's redirect URI, and `/token` answers an EdDSA-signed ID token
+ * echoing that request's client and nonce.
+ */
+async function startFakeGoogle(): Promise<{ issuer: string; account: GoogleAccount }> {
+  const { privateKey, publicKey } = generateKeyPairSync('ed25519');
+  const pending = new Map<string, { aud: string; nonce: string; account: GoogleAccount }>();
+  const google = { issuer: '', account: { sub: 'google-user', email: 'user@gmail.test' } };
+  const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString('base64url');
+  const server = createHttpServer((request, response) => {
+    const url = new URL(request.url ?? '/', google.issuer);
+    const json = (body: unknown) => {
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify(body));
+    };
+    if (url.pathname === '/.well-known/openid-configuration') {
+      return json({
+        issuer: google.issuer,
+        authorization_endpoint: `${google.issuer}/authorize`,
+        token_endpoint: `${google.issuer}/token`,
+        jwks_uri: `${google.issuer}/jwks`,
+        response_types_supported: ['code'],
+        subject_types_supported: ['public'],
+        id_token_signing_alg_values_supported: ['EdDSA'],
+        authorization_response_iss_parameter_supported: true
+      });
+    }
+    if (url.pathname === '/jwks') return json({ keys: [{ ...publicKey.export({ format: 'jwk' }), kid: 'fake-google' }] });
+    if (url.pathname === '/authorize') {
+      const code = randomUUID();
+      pending.set(code, { aud: url.searchParams.get('client_id') ?? '', nonce: url.searchParams.get('nonce') ?? '', account: { ...google.account } });
+      const back = new URL(url.searchParams.get('redirect_uri') ?? '');
+      back.searchParams.set('code', code);
+      back.searchParams.set('state', url.searchParams.get('state') ?? '');
+      back.searchParams.set('iss', google.issuer);
+      response.writeHead(302, { location: back.toString() });
+      return response.end();
+    }
+    if (url.pathname === '/token') {
+      let form = '';
+      request.on('data', (chunk: Buffer) => (form += chunk.toString()));
+      request.on('end', () => {
+        const grant = pending.get(new URLSearchParams(form).get('code') ?? '');
+        if (!grant) {
+          response.writeHead(400, { 'content-type': 'application/json' });
+          return response.end(JSON.stringify({ error: 'invalid_grant' }));
+        }
+        const now = Math.floor(Date.now() / 1000);
+        const signed = `${encode({ alg: 'EdDSA', typ: 'JWT', kid: 'fake-google' })}.${encode({
+          iss: google.issuer, aud: grant.aud, sub: grant.account.sub, email: grant.account.email,
+          email_verified: true, nonce: grant.nonce, iat: now, exp: now + 300
+        })}`;
+        json({
+          access_token: randomUUID(), token_type: 'Bearer', expires_in: 300,
+          id_token: `${signed}.${sign(null, Buffer.from(signed), privateKey).toString('base64url')}`
+        });
+      });
+      return;
+    }
+    response.writeHead(404);
+    response.end();
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('the fake Google has no port');
+  google.issuer = `http://127.0.0.1:${address.port}`;
+  server.unref();
+  return google;
+}
+
+const google = process.env.WYRD_UI_INTEGRATION ? await startFakeGoogle() : { issuer: 'http://127.0.0.1:9', account: { sub: '', email: '' } };
+/** A deployment whose shared Google sign-in is the fake Google. */
+const withGoogle = serverTest({ googleIssuer: google.issuer, perTest: true });
+
+/** As the platform operator, configure, test and enable Google with the deployment's root credential. */
+async function enableGoogle(serverUrl: string, rootCredential: string): Promise<void> {
+  const exchanged = await fetch(`${serverUrl}/auth/platform/token`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'urn:ietf:params:oauth:grant-type:token-exchange',
+      subject_token: rootCredential,
+      subject_token_type: 'urn:wyrd:oauth:token-type:api_key'
+    })
+  });
+  expect(exchanged.status).toBe(200);
+  const { access_token: token } = (await exchanged.json()) as { access_token: string };
+  const call = async (method: string, path: string, body: unknown) => {
+    const response = await fetch(`${serverUrl}${path}`, {
+      method,
+      headers: { 'x-wyrd-access-token': `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    expect(response.status, `${method} ${path}`).toBe(200);
+    return (await response.json()) as Record<string, unknown>;
+  };
+  const { revision } = await call('PUT', '/platform/social/providers/google', { client_id: 'wyrd-google', client_secret: 'google-secret' });
+  const { authorization_url: authorize } = await call('POST', '/platform/social/providers/google/test', { expected_revision: revision });
+  const signedIn = await fetch(String(authorize), { redirect: 'manual' });
+  const tested = await fetch(signedIn.headers.get('location') ?? '');
+  expect(tested.status, 'the provider test passes').toBe(200);
+  await call('PUT', '/platform/social/providers/google/enabled', { enabled: true, expected_revision: revision });
+}
+
+/**
+ * An invited person opens their copied link, joins with Google (whose email
+ * differs from the invited address) and lands in the tenant holding exactly
+ * the invited access; after signing out they continue with Google to the
+ * same account; a second link opened with the same Google account is told
+ * to sign in instead; and a Google account with no invitation is told it has
+ * no account.
+ */
+withGoogle('an invited person joins with Google and returns with Google', async ({ server }) => {
+  await enableGoogle(server.baseUrl, server.initializePlatformRoot());
+  const tenant = server.tenantSlug;
+  const adminKey = server.bootstrapService(['admin'], 'google_ui_admin');
+  const principals = await Principals.connect({ client: WyrdClient.connect({ credential: adminKey }) });
+  buildUi();
+  const bff = await startBff(server.baseUrl);
+  const browser = await chromium.launch();
+  try {
+    const base = `${bff.url}/t/${tenant}`;
+    const page = await signIn(browser, bff.url, tenant, adminKey);
+    const inviteOne = async (address: string) => {
+      await page.goto(`${base}/settings/access`);
+      const invite = page.getByRole('form', { name: 'Invite users' });
+      await invite.getByLabel('Email addresses').fill(address);
+      await chooseFamilyGrant(invite, 'viewer', 'Prompt', 'payments');
+      await invite.getByRole('button', { name: 'Create invitations' }).click();
+      const links = page.locator('[data-secret]');
+      await expect.poll(() => links.count()).toBe(1);
+      return (await links.first().textContent()) ?? '';
+    };
+
+    // Ana opens her link and joins with a Google account whose email is not the invited one.
+    const link = await inviteOne('ana@example.test');
+    google.account = { sub: 'google-ana', email: 'ana.personal@gmail.test' };
+    const ana = await (await browser.newContext()).newPage();
+    await ana.goto(link);
+    await ana.getByRole('button', { name: 'Join with Google' }).click();
+    await ana.waitForURL(base);
+    const account = (await principals.list({ kind: 'user' })).principals.find((principal) => principal.email === 'ana.personal@gmail.test');
+    if (!account) throw new Error('the server lists no Google-enrolled User');
+    const payments = { card: { family: { kind: 'Prompt', name: 'payments' } } };
+    expect((await principals.bindings({ principal_id: account.principal_id })).bindings).toMatchObject([
+      { role: 'viewer', scope: payments, source: 'direct' }
+    ]);
+
+    // She signs out and continues with Google to the same account.
+    await ana.locator('details.identity summary').click();
+    await ana.getByRole('button', { name: 'Sign out' }).click();
+    await ana.waitForURL(/\/login$/);
+    await ana.getByRole('button', { name: 'Continue with Google' }).click();
+    await ana.waitForURL(base);
+    const users = (await principals.list({ kind: 'user' })).principals;
+    expect(users.filter((principal) => principal.email === 'ana.personal@gmail.test')).toHaveLength(1);
+
+    // A second link opened with the same Google account is told to sign in, and the link stays live.
+    const second = await inviteOne('ana.again@example.test');
+    const again = await (await browser.newContext()).newPage();
+    await again.goto(second);
+    await again.getByRole('button', { name: 'Join with Google' }).click();
+    await again.waitForURL(`${base}/login?login=account_exists`);
+    await expect.poll(() => again.getByText(`That sign-in already has an account in ${tenant}.`, { exact: false }).count()).toBe(1);
+
+    // A Google account nobody invited is told it has no account here.
+    google.account = { sub: 'google-stranger', email: 'stranger@gmail.test' };
+    const stranger = await (await browser.newContext()).newPage();
+    await stranger.goto(`${base}/login`);
+    await stranger.getByRole('button', { name: 'Continue with Google' }).click();
+    await stranger.waitForURL(`${base}/login?login=no_account`);
+    await expect.poll(() => stranger.getByText(`No account in ${tenant} uses that sign-in.`, { exact: false }).count()).toBe(1);
+    expect((await principals.list({ kind: 'user' })).principals).toHaveLength(users.length);
+  } finally {
+    await browser.close();
+    bff.stop();
   }
 });

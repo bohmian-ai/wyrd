@@ -454,6 +454,58 @@ and social returning login. Matching email alone must never resolve an existing 
   `pg_github_pull_request_extraction::an_extracted_review_that_fails_is_the_next_baseline`
   once under load; it passed alone 3 times and in the rerun; diagnosis below);
   wyrd-sql integration 142, wyrd-auth lib 137, wyrd-spec lib 813.
+- Diagnosis of the one-off full-lane failure:
+  - **Symptom:** `pg_github_pull_request_extraction::an_extracted_review_that_fails_is_the_next_baseline`
+    failed once (9.65 s, 206/463) in a full `wyrd-server` integration run; no
+    panic was captured. It passed alone three times and in a full rerun.
+  - **Evidence:** a read-only Codex diagnostician was given the command and
+    the diff. It found `Deployment::settled()`
+    (`pg_github_pull_request_extraction.rs:441`) returns when the result is
+    visible. The runner stores the result (`verification/runner.rs:1713`)
+    before settling the queue row (`:1620`). The next head submission
+    (`pg_github_pull_request_extraction.rs:1071`) cancels a still-`running` row
+    as superseded (`verifier_executions/pull_requests.rs:148`), and baseline
+    selection (`:284`) needs `status = 'completed'`.
+  - **Cause (unconfirmed without the original output):** the test helper
+    races queue settlement under load. This diff does not touch that sequence.
+  - **Fix site:** `Deployment::settled()` should also wait for the committed
+    `completed` queue row; callers in `pg_github_pull_request_extraction.rs`
+    and `pg_github_pull_requests.rs`. Outside this task's write set, so it is
+    reported, not changed.
+
+**Evidence (UI slice):**
+
+- Reuse: the login and signup pages render the providers Rust's
+  `GET /auth/browser/methods` returns, and begin through the existing BFF
+  `browserSessions.begin`, which now forwards `provider` and
+  `invitation_code`; the callback stays Rust's `/auth/social/google/callback`
+  behind the BFF hook. The journey's server uses the existing
+  `with_social_endpoints_for_test` (exposed to the TS harness as
+  `googleIssuer`, with `SocialConfig` re-exported from `wyrd-testing`) and
+  `initialize_platform_root` (exposed as `initializePlatformRoot`). Google is a
+  loopback fake inside the test file that serves discovery, an Ed25519 key
+  set, an authorize step that returns at once, and an EdDSA-signed ID token,
+  as `platform_admin_e2e` mounts with wiremock.
+- Test `ui-pages.integration.test.ts` "an invited person joins with Google
+  and returns with Google": the operator configures, tests and enables Google
+  over HTTP; the administrator invites through Access with `viewer` on
+  `Prompt/payments`; the recipient opens the link and uses **Join with
+  Google** with a differing email, and lands in the tenant holding exactly
+  that binding; after **Sign out**, **Continue with Google** returns to the
+  same single User; a second link opened with that Google account ends at
+  `login=account_exists` with its notice; an uninvited Google account ends at
+  `login=no_account` with its notice and adds no User.
+- TDD: `VIOLATED` for this slice. The page edits were written before the
+  journey; the journey's first run failed only on a test locator (sign-out
+  lives in the identity menu) after enrollment had already succeeded.
+- GREEN: `mise exec -- scripts/postgres/with-test-postgres.sh -- env
+  WYRD_UI_INTEGRATION=1 pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test
+  src/lib/ui-pages.integration.test.ts -t 'joins with Google'` (1 passed).
+- Docs: `docs/src/content/docs/operate/add-people.md` describes **Join with
+  Google**, returning with **Continue with Google**, and the second-link
+  refusal; `llms-full.txt` regenerated.
+- Lanes: `mise run ui:check`, `ts:format`, `ts:lints`, `ts:typecheck`,
+  `ts:build:testing`, `fmt`, `lints`, `docs:check`, `git diff --check`.
 
 ### 5. GitHub follows the same admission flow using its stable account ID
 

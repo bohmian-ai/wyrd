@@ -230,6 +230,23 @@ impl NativeWyrdTestServer {
         self.with_server(|server| Ok(server.pg_fixture().tenant_slug().to_owned()))
     }
 
+    /// Initialize this deployment's platform and return its one root platform
+    /// credential, as `wyrd-server init` discloses it to an operator.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the harness is closed or the deployment is
+    /// already initialized.
+    #[napi]
+    pub fn initialize_platform_root(&self) -> Result<String> {
+        self.with_server(|server| {
+            wyrd_runtime::runtime().block_on(async {
+                let root = server.initialize_platform_root().await.map_err(reason)?;
+                Ok(secrecy::ExposeSecret::expose_secret(&root).to_owned())
+            })
+        })
+    }
+
     /// The loopback GitHub App this server is configured against.
     ///
     /// # Errors
@@ -729,6 +746,9 @@ pub struct NativeTestServerOptions {
     /// Direct verification deadline from arrival in milliseconds, so a
     /// journey reaches it quickly; omitted keeps the production deadline.
     pub verify_timeout_ms: Option<u32>,
+    /// Google's OpenID Connect issuer, so a journey signs in at a local fake
+    /// Google; omitted keeps the real provider.
+    pub google_issuer: Option<String>,
 }
 
 /// Starts a real bound Wyrd test server and mints an admin access token.
@@ -750,6 +770,7 @@ pub fn start_test_server(
         scribe_outbox_capacity: None,
         github_app: None,
         verify_timeout_ms: None,
+        google_issuer: None,
     });
     let provider_root = options
         .provider_base_url
@@ -767,6 +788,7 @@ pub fn start_test_server(
         options.scribe_outbox_capacity,
         options.github_app.unwrap_or(false),
         options.verify_timeout_ms,
+        options.google_issuer,
     )))
 }
 
@@ -774,7 +796,8 @@ pub fn start_test_server(
 ///
 /// `scribe_outbox_capacity` replaces the Scribe outbox capacity and
 /// `verify_timeout_ms` the direct verification deadline when set;
-/// `github_app` configures the GitHub App against a fresh loopback mock.
+/// `github_app` configures the GitHub App against a fresh loopback mock, and
+/// `google_issuer` points shared Google sign-in at that issuer.
 ///
 /// # Errors
 ///
@@ -786,8 +809,13 @@ async fn start_test_server_async(
     scribe_outbox_capacity: Option<u32>,
     github_app: bool,
     verify_timeout_ms: Option<u32>,
+    google_issuer: Option<String>,
 ) -> napi::Result<NativeWyrdTestServer> {
     let mut builder = WyrdTestServer::builder();
+    if google_issuer.is_some() {
+        builder =
+            builder.with_social_endpoints_for_test(wyrd_testing::SocialConfig { google_issuer });
+    }
     let github = github_app
         .then(GithubAppMock::start)
         .transpose()

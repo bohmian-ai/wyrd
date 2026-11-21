@@ -1664,6 +1664,75 @@ mod tests {
         );
     }
 
+    /// A closure that runs while an encode holds its worker's context keeps
+    /// that context charged until the encode settles, then never restores it.
+    ///
+    /// The in-flight state is the one [`EncoderContexts::encode`] creates: the
+    /// slot's context and lease taken out for the stream. Completion restores
+    /// through [`EncoderContexts::restore`]; failure drops both.
+    ///
+    /// # Panics
+    /// Panics when encoding fails, the in-flight lease is released before it
+    /// settles, or a settled encode refills or stays charged in a closed set.
+    #[test]
+    fn closure_during_encode_keeps_its_lease_until_settlement() {
+        use crate::resources::{BifrostRole, BifrostRuntimeResources};
+
+        let roles =
+            BifrostRuntimeResources::composed_for_test(1 << 30, 1 << 30, [BifrostRole::Scribe]);
+        let scribe = roles.scribe().expect("Scribe role").clone();
+        let charged = || {
+            scribe
+                .snapshot()
+                .expect("snapshot")
+                .scribe_memory_used_bytes
+        };
+        let worker = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .start_handler(super::mark_ingress_worker)
+            .build()
+            .expect("one worker");
+        let rows = RecordBatch::try_from_iter(vec![(
+            "value",
+            Arc::new(Int64Array::from_iter_values(0..2048)) as ArrayRef,
+        )])
+        .expect("integer rows");
+
+        for completes in [true, false] {
+            let encoders = EncoderContexts::new(1, scribe.clone(), usize::MAX);
+            let chunks = worker.install(|| encoders.encode(&rows)).expect("encodes");
+            assert_eq!(joined(chunks), reference_ipc(&rows));
+            let warmed = encoders.charged_bytes();
+            assert!(warmed > 0, "the worker kept no context");
+
+            let in_flight = encoders.slots[0]
+                .lock()
+                .expect("slot")
+                .take()
+                .expect("retained context");
+            encoders.clear();
+            assert_eq!(
+                charged(),
+                warmed,
+                "closure released a lease an encode still holds"
+            );
+
+            if completes {
+                encoders
+                    .restore(&encoders.slots[0], in_flight.context, Some(in_flight.lease))
+                    .expect("restore settles");
+            } else {
+                drop(in_flight);
+            }
+            assert_eq!(
+                (encoders.charged_bytes(), charged()),
+                (0, 0),
+                "a settled encode refilled or stayed charged in a closed set"
+            );
+            assert!(encoders.slots[0].lock().expect("slot").is_none());
+        }
+    }
+
     /// Incompressible buffers stay within the reserved bound; compressible
     /// ones shrink.
     ///

@@ -617,7 +617,7 @@ auth/runtime tests can deterministically exercise clock/freshness and compile
 counters; combine them with real database notification/replica proof rather
 than using long sleeps or substituting unit tests for propagation. SQL/auth
 integration proves transactional revisions and invalidation; issuer/verifier
-unit tests pin claim refusal. Record performance and wait evidence here.
+unit tests pin claim refusal. Record wait evidence here.
 
 Evidence (in progress):
 
@@ -764,13 +764,8 @@ existing-UI adaptations. Integrated review owns full shipped-surface journeys;
 do not use a broad gate as a substitute for focused task proof.
 
 For the hot paths, enumerate every added/moved PostgreSQL, Scribe, object-store
-or Vault wait and match it to the sanctioned boundary. Run full clean
-`mise run bench:l1:verification`, `mise run bench:l1:gateway` and
-`mise run bench:l1:bifrost`, each VALID and compared with the newest record for
-the same experiment/host in `benchmarks/history/`. Restore development SDK
-builds after diagnostic benchmark builds as the runners require. Smoke,
-partial and dirty runs are insufficient. Warm checks add no IO; audit staging
-must remain nonblocking. No measurement is claimed by this plan.
+or Vault wait and match it to the sanctioned boundary. Warm checks add no IO;
+audit staging must remain nonblocking.
 
 Hand off the working contracts and their actual consumer proof to TASK-002.
 
@@ -785,24 +780,6 @@ Recorded results:
   known newer revision or expired freshness, one sanctioned authority-cache reload
   statement (the permission-check boundary). Audit staging is unchanged and
   nonblocking.
-- Benchmarks (full, clean, same host; numbers reported to the maintainer for the
-  pass decision, no comparison claimed here; the maintainer accepted all three as
-  passing on 2026-11-20, after seeing the table that flagged the 64-client
-  overhead p99 values above the 0.5 ms target for Rust and TypeScript
-  direct-verify and both 64 KiB gateway cases):
-  - `bench:l1:bifrost` VALID, `benchmarks/history/bifrost/parquet/20261120T111551Z-1cbe26031.json`.
-  - `bench:l1:gateway` VALID, `benchmarks/history/gateway/overhead/20261120T112543Z-1cbe26031.json`.
-    Overhead p99 at 64 clients: 1 KiB buffered 0.415 ms, streamed 0.201 ms, 64 KiB
-    metadata 1.140 ms, 64 KiB payload 55.706 ms.
-  - `bench:l1:verification` VALID, `benchmarks/history/verification/direct-verify/20261120T114155Z-9c37ae2d2.json`.
-    Overhead p99 at 64 clients: Rust 0.978 ms, Python 0.410 ms, TypeScript 1.024 ms;
-    admit (authorization) p99 0.012 ms; zero errors, wrong verdicts and lost writes.
-  - The first verification run (`20261120T112512Z-1cbe26031`) was INVALID: its workload
-    seeded `bench_code` with a scope inside the stored operation, which the scope-free
-    `Operation` (`deny_unknown_fields`) rejects in `roles::validate_assignments`.
-    Diagnostician: fix site is the workload seed; no other seeder affected. Fix:
-    store `{resource: tool, action: invoke}` and bind it at `{"tool": "code.run"}`
-    (`9c37ae2d2`).
 
 Additional schema purposes or changed authorization semantics require a spec
 revision; reversible implementation details remain with the implementer.

@@ -89,6 +89,122 @@ public Rust/Python/TypeScript/MCP consumers of those created grants. Extend the
 existing server integration UI host and production UI test owners. Component
 tests cover form validation/presentation, not authorization substitutes.
 
+**Evidence.** Behavioral verification: PASS for the cases listed; limitations
+below. Commands, recorded once and referred to by the other entries:
+
+- C1 (pages): `mise exec -- scripts/postgres/with-test-postgres.sh -- env
+  WYRD_UI_INTEGRATION=1 pnpm --dir crates/wyrd/wyrd-server/wyrd-ui exec vitest
+  run src/lib/ui-pages.integration.test.ts`, after `mise run ts:build`,
+  `mise run ts:build:testing` and `pnpm --filter wyrd-ai-ui build`. Final run
+  at `6a11468a8`: 19 passed of 19, default stack and runtime settings.
+- C2 (library): the same with `src/lib/ui-library.integration.test.ts`:
+  17 passed of 17.
+- C3: `mise run ui:check`, `mise run codegen:check`, `mise run docs:check`,
+  `mise run lints`, `cargo fmt --all --check`, `git diff --check`: all exit 0.
+
+Assertions, all in `crates/wyrd/wyrd-server/wyrd-ui/src/lib/ui-pages.integration.test.ts`:
+
+- `Alice is given payments in Settings and sees only payments in her browser,
+  CLI and SDK, then gains and loses ledger without signing in again` (line
+  2650): invitation with viewer at the payments family and no IdP; the saved
+  binding and the page's account, role, scope and source; removal of the
+  tenant administrator's own admin binding refused; Alice's index holds
+  payments only; ledger reads as no such Card; GitHub setup and Access
+  administration refused; CLI code approved in her browser; CLI login and SDK
+  client read payments only.
+- `an administrator manages direct, group and custom-role grants in Access,
+  and a refused grant saves nothing` (line 2824): invitation without a scope
+  enrolls nobody; family versus exact version told apart; inapplicable role,
+  unknown Card and malformed name save nothing; built-in roles not editable;
+  custom role from operations; group as source; the group's grant stays
+  shown and effective after the direct binding is removed.
+- `Access tells an unavailable server apart from a refusal` (line 3068).
+- `Access works from the keyboard and fits a phone and a desktop in light and
+  dark` (line 3117): 1280 and 390 px, both modes.
+
+Limitations. The RED observations of the original cycles were not written
+here when they were made and are not reconstructed: TDD compliance for this
+entry is unverified. Python and MCP consumers of grants created in the UI
+are not driven by this journey; TASK-001's SDK, CLI and MCP journeys prove
+those consumers against the same server contract. Provider login:
+`mise run test:identity:ui` against real Keycloak and Dex passes at
+`29a9d276f` (`identity_ui_e2e::production_ui_bff_journey` and its 5 UI
+tests).
+
+Remediation diagnoses (review findings; each fix site is the shared owner):
+
+- Symptom: C1's worker died with SIGSEGV. Evidence: native stack through
+  `OraclePlanner::validate_statement` into `sqlparser::Parser::parse_joins`.
+  Cause: `parse_joins` recurses without the crate's stack guard, so a nested
+  derived-table query exhausts the stack before the recursion limit refuses
+  it. Fix site: the parser, pinned through `[patch.crates-io]` (`d2f507ee9`);
+  the UI query no longer nests (`2a7d70c72`). See the shared prerequisite
+  below.
+- Symptom: three Access journeys refused connection. Evidence: the shared
+  host exited on `ENOENT` for an asset of the first build after a later
+  journey rebuilt `build/`. Cause: each journey rebuilt the UI under a
+  file-scoped running host. Fix site: `buildUi` builds once per file
+  (`6a11468a8`). Ceiling: another process rebuilding `build/` mid-run can
+  still break a host.
+- Symptom: `development environment lifecycle` never reported its batch.
+  Cause: `scripts/postgres/dev-server.sh` passed the removed `--role admin`.
+  Fix: `--grant admin:all`; `dev:backend`, `dev:both` and `dev:full` share it.
+- Symptom: stale expectations after scoped authorization. Cause and fix: three
+  ordinary-table query sites and the trace refusal answer
+  `WYRD_VALA_403_QUERY_FORBIDDEN`; judged, traced and drift fixtures hold
+  `executions:read`, see judgments, inputs and drift windows, and are refused
+  the separate Verifier definition; the GitHub settings refusal offers only
+  `Copy access request`.
+
+Shared backend prerequisite (not UI evidence), required for C1 and C2 to run:
+
+- Parser: sqlparser 0.63.0 plus one guard on `parse_joins`, pinned by rev.
+  Tests `oracle::tests::nested_verify_discovery_query_validates_on_constrained_stacks`,
+  `nested_derived_tables_and_joins_validate_on_constrained_stacks` and
+  `over_nested_and_malformed_sql_are_refused_on_constrained_stacks` in
+  `vala-bifrost-redux` pass (`cargo nextest run --locked -p vala-bifrost-redux
+  --lib -E 'test(/constrained_stacks/)'`); they failed by stack overflow
+  before the pin. Byte ceiling and recursion limit unchanged.
+- Oracle parse boundary (`075be2429`): the deadline is taken before parsing
+  and CPU admission; parsing runs through `CpuLanes::dispatch_blocking` under
+  `Workload::Bifrost` with tenant attribution; the same-process path reuses
+  the parsed statement; a remote Oracle validates independently and the wire
+  request is unchanged; the lane is released before IO. Tests
+  `parse_takes_one_lane_inside_the_deadline_and_returns_it` and the lanes
+  dispatch test pass. TDD: no RED was observed for the dispatch helper.
+  Wait inventory: no PostgreSQL, Scribe, object-storage or Vault wait is
+  added or moved; the one new wait is CPU-lane admission, inside the existing
+  CPU-resource boundary. No benchmark was run, by maintainer decision.
+- Discovery query (`2a7d70c72`): result equivalence is asserted by
+  `consolidated Observe bundles return the original results; EXPLAIN ANALYZE
+  compares their work` in C2. Executed work for Verify with
+  `WYRD_QUERY_DIAGNOSTICS`: 1 statement and 5 scans over 40 rows, against 9
+  statements and 37 scans over 288 rows for the original reads. The
+  population names five table scans, so it is read once.
+- Card not-found concealment (`93b0f4470`) is TASK-001 remediation: exact
+  reference, UID, absent name, kind mismatch and another tenant all answer
+  `WYRD_REGISTRY_404_CARD_NOT_FOUND` with one message
+  (`principal_roles::group_custom_and_exact_version_bindings_scope_reads`,
+  RED observed with seven distinct messages); a readable reference with a
+  hidden UID over MCP
+  (`a_family_bound_agent_reads_only_that_family`, written after the fix, no
+  RED); operational errors keep their code (unit test in `cards/service.rs`).
+- Bifrost server journeys (`29a9d276f`), TASK-001 fixtures: `mise run
+  test:bifrost:journey:server:inner` under `with-test-postgres.sh`: 63 of 66,
+  then `visible_trace_spans_preserve_binding_ownership` fixed and passing
+  alone. Causes: inspection contexts lacked `executions:read`; the
+  result-layout fixture published without a registry, leaving subject kind
+  and name unstamped; status was read through a revoked submitter; a
+  cancelled status row now names its subject; tokens carry no `permissions`
+  claim; a trace read without a table grant answers `query forbidden`.
+  Open: `isolated_capacity::connected_work_waits_out_pressure_with_its_own_attribution`
+  and `isolated_capacity::standalone_call_bodies_count_as_gateway_work_while_the_call_runs`
+  fail asserting zero Bifrost workload bytes. Independent of this change:
+  since `6e7db5c25` the Scribe memtable is charged to Bifrost by design.
+  Commit `5290a7c14` on `task/github-verifier-pipelines/TASK-012-integrate-code-mode`
+  already corrects both tests to assert only the request workloads; it is
+  not in this branch, and the two tests pass once it is merged.
+
 ### 2. Create a runtime Service in the UI and reuse it for two releases
 
 Maps AC-002 to REQ-003 and REQ-008.
@@ -112,6 +228,16 @@ Proof: production browser form → TASK-001 provisioning contract → actual CLI
 credential consumer → retained attribution query. Reuse the backend Service
 journey fixtures and production UI host; disconnected UI mocks cannot prove
 that the saved credential and grants are usable.
+
+**Evidence.** Behavioral verification: PASS (C1). `an administrator creates a
+runtime Service account in Access, and its one key runs two releases of the
+family` (`crates/wyrd/wyrd-server/wyrd-ui/src/lib/ui-pages.integration.test.ts`, line 2943) asserts the Service family and separate operation
+bindings, the one-time key, and that key running both releases with the
+retained workload attribution; an ungranted operation and a Card outside the
+family are refused; a second key is shown once and the first revoked by its
+prefix; an account created through the SDK reads the same way in Access. The
+form asks for no release version or UID. TDD: RED not recorded when made;
+unverified.
 
 ### 3. Request and change access without replacing the existing session
 
@@ -144,6 +270,17 @@ returned data and refused operations, not only changed labels. Component tests
 pin safe copy contents and form states; backend outage/replica and recovery
 proof remains in TASK-001's third entry.
 
+**Evidence.** Behavioral verification: PASS (C1). In the Alice journey
+(`crates/wyrd/wyrd-server/wyrd-ui/src/lib/ui-pages.integration.test.ts`, lines 2771 to 2823): the copied request read back from the clipboard
+names her account, the tenant, the action and the link, and sends nothing; a
+Repository that does not exist gives the same problem code and request; a
+grant made over HTTP reaches her same browser session, CLI login and SDK
+client without signing in again; removal in Access takes ledger away and
+keeps payments; her browser holds no script-readable credential. Copy
+guidance is present for a reader and absent for an administrator at lines
+3094 and 3103; its text is pinned in `src/lib/access.test.ts`. TDD: RED not
+recorded when made; unverified.
+
 ## Verification and handoff
 
 Reuse `wyrd-server/tests/integration/identity_ui_e2e.rs` production BFF host,
@@ -170,7 +307,6 @@ generated-contract source, required format/lints for touched languages and
 their existing catalog rather than hand-edit generated files.
 
 No backend hot-path change is expected in this task. If one is necessary within
-approved behavior, apply the spec's wait inventory and full clean VALID
-benchmark evidence requirement to that change; presentation proof cannot replace
-it. Integrated change review owns the full combined surface journeys. Neither
-task implementation nor this plan initiates review or claims approval.
+approved behavior, apply the spec's wait inventory. Integrated change review
+owns the full combined surface journeys. Neither task implementation nor this
+plan initiates review or claims approval.

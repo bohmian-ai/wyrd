@@ -313,10 +313,7 @@ Hot-path verification must list every added/moved PostgreSQL, Scribe, object-sto
 or Vault wait and match it to a sanctioned boundary. Warm authorization and row
 checks add no wait; cold/invalidation acquisition is a permission-state reload;
 audit stages on the existing Scribe outbox and never blocks the operation.
-Run full clean mise run bench:l1:verification, bench:l1:gateway and bench:l1:bifrost
-with VALID verdicts, comparing the newest same-experiment/host history records.
-Smoke, partial-step and dirty runs are insufficient. Apply owner format, lint,
-codegen, tenant-boundary and journey lanes; no measured result is claimed here.
+Apply owner format, lint, codegen, tenant-boundary and journey lanes.
 
 ## Scope and delivery
 

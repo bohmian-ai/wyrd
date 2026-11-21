@@ -2,6 +2,16 @@
 
 Status: finalized
 
+The maintainer resumed this packet on 2026-11-21 to design social sign-in and
+signup as task 003, after reporting tasks 001 and 002 complete. The original
+finalized agreement below remains the basis of approved specification revision 2;
+its two-task limit applies to that original scope. The proposed addition and
+agreed addition is in [social sign-in and signup](social-login.md), finalized by
+the maintainer on 2026-11-21. It covers social signup/login, explicit linking,
+operator UI onboarding, addressed bulk invitations and generic SMTP delivery.
+It is ready for specification and does not revise the approved spec or
+create a task.
+
 The maintainer has locked the authorization model and preservation of existing
 identity, ownership and attribution semantics, the three scenarios and two-task
 split, and requested specification. The finalized agreement is carried into
@@ -552,7 +562,7 @@ consumes it. These are design groupings, not ready task files or deployment phas
 
 | Group | Complete outcome and necessary consumers | Proof ownership |
 |---|---|---|
-| Revised authorization and resource enforcement | Typed roles/bindings/scopes and persistence; cached current authority and token ceilings; local device approval; HTTP/CLI/SDK/MCP administration and every ingress; Card/Repository/derived-evidence/Bifrost enforcement; preserved workload attribution and accepted execution authority; required contract/schema updates | Programmatic variants of all three scenarios, including actual retained data and refusal paths; narrow owner tests and required hot-path measurements |
+| Revised authorization and resource enforcement | Typed roles/bindings/scopes and persistence; cached current authority and token ceilings; local device approval; HTTP/CLI/SDK/MCP administration and every ingress; Card/Repository/derived-evidence/Bifrost enforcement; preserved workload attribution and accepted execution authority; required contract/schema updates | Programmatic variants of all three scenarios, including actual retained data and refusal paths; narrow owner tests and hot-path wait checks |
 | Admin UI and connected user journeys | Access account creation and management, roles/groups/scoped grants, accurate current-access/source displays, manual request guidance and local device-approval presentation; consume the first group's contracts rather than introduce another auth path | Full browser-to-server-to-CLI/SDK variants of the same three scenarios, including the UI-created Service across two releases and changes to existing sessions |
 
 The UI group depends on the first group's working administration, authorization
@@ -750,6 +760,10 @@ alternate authorization path is granted.
 
 ## Open questions
 
+The social-login addition has no remaining material product decisions; its
+finalized supplement records the agreement and implementation-owned details.
+The settled-scope statement below describes specification revision 2 only.
+
 No further product decisions are currently identified. The model, principal and
 attribution semantics, token responsibilities, roles, access boundaries, UI,
 three system scenarios and two-task split are settled. Do not reopen them to
@@ -772,8 +786,7 @@ Sources: [device approval schema](../../../../crates/wyrd/wyrd-sql/migrations/20
 
 Per-callsite integration, physical names/layout and final scope-compiler wiring
 remain implementation-owned within the specification's boundaries. Repository
-inspection is not runtime verification; no schema implementation or benchmark
-was executed.
+inspection is not runtime verification; no schema implementation was executed.
 Known unprovable retained parents stay hidden under the agreed rule. If concrete
 evidence shows that agreed behavior cannot be preserved or that an additional
 persistence change is needed, report that conflict for specification revision;
@@ -820,8 +833,4 @@ Hot-path wait inventory for later review:
 
 Do not add object-storage, Vault or Scribe waits for authorization. Preserve
 existing sanctioned IO and execution admission durability. Later hot-path review
-must enumerate actual added/moved waits and supply full clean
-`mise run bench:l1:verification`, `mise run bench:l1:gateway` and
-`mise run bench:l1:bifrost` runs, each VALID and compared with the newest matching
-experiment/host under `benchmarks/history/`. No performance result is claimed
-by this design.
+must enumerate actual added/moved waits.

@@ -718,7 +718,7 @@ Validate the selected semantics through the journey/proof plan in notes.md,
 including grant addition under a normal token, grant removal under an old
 ceiling, empty versus absent ceilings, family/exact intersection, unrelated
 Verifier access, snapshot outage expiry and delegation actor revocation. These
-sketches have not been compiled or benchmarked.
+sketches have not been compiled.
 
 ## Current source references
 

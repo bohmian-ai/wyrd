@@ -703,13 +703,12 @@ async fn a_restart_before_the_outcome_finds_what_already_landed() {
 /// row is published, the execution's revision and outcome receipts are
 /// removed: inspection still serves the same completed result and the
 /// delivered outcome, never pending, and GitHub receives nothing more.
-/// While the receipts cannot be read, inspection is unavailable rather than
-/// reporting the outcome absent.
+/// Inspection never reads receipts: while they cannot be read at all, it
+/// still serves the delivered outcome.
 ///
 /// # Panics
 /// Panics when the outcome or result changes after the receipts are
-/// removed, anything is sent again, or unreadable authority reads as
-/// absence.
+/// removed, anything is sent again, or inspection depends on the receipts.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_recorded_outcome_outlives_its_retry_receipts() {
     let deployment = bound(&[("review", located())], &[]).await;
@@ -768,8 +767,17 @@ async fn a_recorded_outcome_outlives_its_retry_receipts() {
     grant("GRANT SELECT ON vala.scribe_batch_commits TO wyrd_tenant").await;
     assert_eq!(
         response.status(),
-        StatusCode::SERVICE_UNAVAILABLE,
-        "unreadable authority is never absence"
+        StatusCode::OK,
+        "inspection reads no receipt"
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("status body reads");
+    let served: Value = serde_json::from_slice(&body).expect("status is JSON");
+    assert_eq!(
+        served["github_delivery"],
+        json!({"status": "delivered"}),
+        "the outcome reads from Bifrost alone: {served}"
     );
 }
 

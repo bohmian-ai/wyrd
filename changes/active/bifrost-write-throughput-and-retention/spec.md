@@ -74,9 +74,10 @@ Execution revisions, approvals, evidence and GitHub delivery outcomes use their
 actual Bifrost records for lasting history, including retry/conflict decisions.
 After receipt deletion, the same retained decision must still be found and applied;
 an execution's recovered revision sequence must not reset or truncate merely
-because receipts expired. Recent acceptance receipts bridge accepted records that
-are not yet query-visible: unavailable authority or an accepted-but-invisible row
-must produce the existing unavailable/retry behavior, never historical absence.
+because receipts expired. Consumers read only their Bifrost records. A record accepted
+but not yet visible reads as absent; its fixed batch id makes any second write for
+it a retry or a refused conflict, never an overwrite, and the consumer's next read
+finds it. A failed read is unavailable and retries.
 Domain conflict rules remain in force after transport retry protection expires.
 
 ### Recovery and safe deletion

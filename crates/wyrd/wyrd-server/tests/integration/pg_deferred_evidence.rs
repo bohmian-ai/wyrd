@@ -865,13 +865,13 @@ async fn unacknowledged_publication_is_unavailable_and_its_retry_resumes() {
 /// Evidence is accepted before any pull request and published, then its
 /// receipt is removed. Publishing it again still replays the original
 /// evidence and time, different content is still a conflict, and a pull
-/// request opened later consumes it and passes. While the receipts cannot
-/// be read, a publication whose acceptance no query sees is unavailable
-/// rather than accepted again.
+/// request opened later consumes it and passes. Reading acceptances never
+/// touches receipts: while they cannot be read at all, a republication,
+/// which only reads, still replays.
 ///
 /// # Panics
 /// Panics when the replay, conflict or consumption changes after the
-/// receipt is removed, or unreadable authority reads as absence.
+/// receipt is removed, or publication depends on the receipts.
 #[tokio::test(flavor = "multi_thread")]
 async fn accepted_evidence_outlives_its_retry_receipt() {
     let deployment = Deployment::start_limited(limits(Duration::from_mins(5))).await;
@@ -908,13 +908,14 @@ async fn accepted_evidence_outlives_its_retry_receipt() {
         }
     };
     grant("REVOKE SELECT ON vala.scribe_batch_commits FROM wyrd_tenant").await;
-    let (status, unavailable) = deployment.publish_ci(C1, json!({"status": "green"})).await;
+    let (status, replay) = deployment.publish_ci(C0, json!({"status": "green"})).await;
     grant("GRANT SELECT ON vala.scribe_batch_commits TO wyrd_tenant").await;
     assert_eq!(
         status,
-        StatusCode::SERVICE_UNAVAILABLE,
-        "unreadable authority is never absence: {unavailable}"
+        StatusCode::OK,
+        "the replay reads no receipt: {replay}"
     );
+    assert_eq!(replay["status"], "replayed", "{replay}");
 }
 
 /// A registered Artifact is admitted against the subscriber's slot before

@@ -599,7 +599,8 @@ async fn direct_verification_runs_while_queued_capacity_is_held() {
 /// share process pressure: while pressure is critical a standalone chat
 /// completion and a public query each reach admission and wait there, as
 /// gateway and Bifrost work, a queued Agent run is deferred before it reads
-/// its input, and once it recovers all three complete. The Agent's nested model call is recorded
+/// its input, and the deferred run's status read waits for memory as
+/// Bifrost work; once pressure recovers all four complete. The Agent's nested model call is recorded
 /// against the verified Service and the standalone call against no subject,
 /// and no request workload keeps bytes once everything settles. Bifrost's
 /// governed memory, the rows its memtable retains until a flush, counts as
@@ -660,22 +661,25 @@ async fn connected_work_waits_out_pressure_with_its_own_attribution() {
     logged(&logs, &[DEFERRED, &queued.id().to_string()]).await;
     assert!(!standalone.is_finished(), "the standalone call waits");
     assert!(!query.is_finished(), "the query waits");
-    let status = queued.status().await.expect("the status reads").status;
-    assert!(
-        matches!(
-            status,
-            VerificationExecutionStatus::Pending
-                | VerificationExecutionStatus::Running
-                | VerificationExecutionStatus::Retrying
-        ),
-        "the queued Agent waits unsettled: {status:?}"
-    );
+    // The deferred run was claimed, so its status reads its state from
+    // Bifrost, which waits for memory like the query above.
+    let reads = pressure_waits(&logs, "Bifrost");
+    let status = tokio::spawn({
+        let queued = queued.clone();
+        async move { queued.status().await }
+    });
+    waited(&logs, "Bifrost", reads + 1).await;
+    assert!(!status.is_finished(), "the status read waits");
 
     overcommitted.set(0);
     workloads.sample(0);
     workloads.sample(0);
     assert_eq!(standalone.await.expect("the standalone call"), 200);
     assert_eq!(query.await.expect("the query").len(), 1);
+    status
+        .await
+        .expect("the status read")
+        .expect("the status reads once pressure recovers");
     passed(&settled(&queued).await, "answered");
 
     let subjects = desk.call_subjects().await;

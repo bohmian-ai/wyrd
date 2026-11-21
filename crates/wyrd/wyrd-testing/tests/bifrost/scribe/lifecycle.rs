@@ -1276,21 +1276,22 @@ fn invocations(state: &ExecutionState) -> Vec<(String, u32)> {
         .collect()
 }
 
-/// Recovery loads exactly the accepted revision or fails closed.
+/// Recovery loads the newest readable revision and never overwrites a newer one.
 ///
 /// A writer accepts two invocations, which background persistence may
 /// coalesce into one revision or write as two. When the next revision's
-/// batch fence is durable but its row is not visible, as when the Scribe holding
-/// it was unavailable before the read discovered it, a takeover is refused
-/// as unavailable instead of starting fresh or loading the older revision,
-/// and changes nothing. Once every fenced revision is readable, a takeover
-/// loads the accepted revision exactly, and the same revision reads back
-/// after the pod restarts on its retained data root and replays its WAL.
+/// batch is held but its row is not visible, as when the Scribe holding it
+/// was unavailable before the read discovered it, a takeover recovers the
+/// newest readable revision, and its own write of the next revision is
+/// refused, so it never overwrites the held one. Once nothing else holds
+/// the revision, a takeover loads the accepted revision exactly, and the
+/// same revision reads back after the pod restarts on its retained data
+/// root and replays its WAL.
 ///
 /// # Panics
 ///
 /// Panics when the pod cannot start or restart, a revision is not accepted,
-/// recovery falls back to an older or fresh state, or a recovered state
+/// recovery starts fresh, a takeover overwrites a held revision, or a recovered state
 /// differs from the accepted one.
 #[tokio::test]
 #[ignore = "requires Postgres and object storage"]
@@ -1343,12 +1344,19 @@ async fn execution_recovery_requires_exact_accepted_state() {
         1,
         "exactly the next fence is copied"
     );
-    let refused = take_over(&fixture, &server, execution).await;
+    let behind = take_over(&fixture, &server, execution)
+        .await
+        .expect("the newest readable revision recovers");
+    assert_eq!(behind.snapshot(), accepted);
+    behind
+        .begin(&Producer::plain(&TaskId::new("verdict").expect("task"), 1))
+        .await
+        .expect("the change is recorded in memory");
     assert!(
-        matches!(refused, Err(StateError::Unavailable(_))),
-        "a fenced revision no read can see fails closed: {:?}",
-        refused.as_ref().err()
+        matches!(behind.persisted().await, Err(StateError::Stale)),
+        "a revision another batch holds is never overwritten"
     );
+    drop(behind);
     sqlx::query("DELETE FROM vala.scribe_batch_commits WHERE batch_id = $1")
         .bind(unseen)
         .execute(&pool)
@@ -1386,13 +1394,13 @@ async fn execution_recovery_requires_exact_accepted_state() {
 /// as cleanup removes receipts outside recent history: a takeover still
 /// recovers the exact accepted state from its Bifrost records instead of
 /// starting fresh. A receipt for the revision after the newest visible one
-/// still bridges an accepted row no read can see yet, so a takeover is
-/// refused as unavailable rather than recovering the older revision.
+/// stands for an accepted row no read can see yet: a takeover recovers the
+/// newest readable revision, and its write of the held revision is refused.
 ///
 /// # Panics
 ///
 /// Panics when the pod cannot start or publish, a revision is not accepted,
-/// recovery starts fresh or falls back to an older state, or a recovered
+/// recovery starts fresh, a takeover overwrites a held revision, or a recovered
 /// state differs from the accepted one.
 #[tokio::test]
 #[ignore = "requires Postgres and object storage"]
@@ -1468,12 +1476,19 @@ async fn execution_recovery_outlives_its_revision_receipts() {
     .execute(&pool)
     .await
     .expect("the next revision's receipt is recent");
-    let refused = take_over(&fixture, &server, execution).await;
+    let behind = take_over(&fixture, &server, execution)
+        .await
+        .expect("the newest readable revision recovers");
+    assert_eq!(behind.snapshot(), accepted);
+    behind
+        .begin(&Producer::plain(&TaskId::new("verdict").expect("task"), 1))
+        .await
+        .expect("the change is recorded in memory");
     assert!(
-        matches!(refused, Err(StateError::Unavailable(_))),
-        "a recent receipt past the newest visible revision fails closed: {:?}",
-        refused.as_ref().err()
+        matches!(behind.persisted().await, Err(StateError::Stale)),
+        "a revision another batch holds is never overwritten"
     );
+    drop(behind);
     sqlx::query("DELETE FROM vala.scribe_batch_commits WHERE batch_id = $1")
         .bind(unseen)
         .execute(&pool)

@@ -10,14 +10,14 @@
 //! revision is one `bifrost.verification.execution_events` row written under
 //! a batch id derived from its execution and revision, so the first batch
 //! Scribe fences keeps the revision and another writer's different rows for
-//! it are refused as a batch conflict. Recovery starts from the newest
-//! revision a query sees, the lasting history, and extends it with the
-//! recent batch receipts, which commit before any acknowledgement and are
-//! removed only after their rows have durable custody; it then reads
-//! exactly that revision's row. A receipted revision not visible yet, such
-//! as one a Scribe unavailable to the read still holds, is
-//! [`StateError::Unavailable`], never older or empty state. Live progress not
-//! yet accepted is lost with its process.
+//! it are refused as a batch conflict. Recovery reads only Bifrost: the
+//! newest revision a query sees. A revision accepted but not visible yet,
+//! such as one a Scribe unavailable to the read still holds, is missed, so
+//! recovery resumes from the older one; the resumed writer's next revision
+//! then reuses the held revision's batch id with different rows, is
+//! refused, and breaks the writer, so stale progress never overwrites
+//! accepted progress and the run retries. Live progress not yet accepted is
+//! lost with its process.
 //!
 //! A writer stages each revision on a reserved outbox slot, waiting for
 //! capacity in background, and retries until it is accepted or its lease is
@@ -34,7 +34,6 @@ use chrono::{DateTime, Utc};
 use sha2::{Digest as _, Sha256};
 use tokio::sync::{Notify, oneshot};
 use tokio_util::sync::CancellationToken;
-use vala_bifrost_redux::contracts::committed_batches;
 use vala_bifrost_redux::tables::staged::StagedRow;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{Attribution, Sha256Hex};
@@ -64,11 +63,6 @@ use wyrd_runtime::resources::{Workload, WorkloadManager};
 /// The table every revision is a row of, and the logical table of every
 /// revision's batch fence.
 pub(crate) const STATE_TABLE: &str = "bifrost.verification.execution_events";
-
-/// How many revisions one fence lookup asks about while recovery finds the
-/// accepted revision.
-// ponytail: a linear walk of PROBE revisions per statement; gallop if executions grow far past it.
-const PROBE: i64 = 256;
 
 /// The batch identity of `revision` of `execution`'s state, which the
 /// outbox writes under its [`revision_fence`].
@@ -118,7 +112,7 @@ pub fn approval_id(execution: ExecutionId, occurrence: &ApprovalOccurrence) -> A
 }
 
 /// The Scribe batch id `tenant`'s `revision` of `execution` is written
-/// under, whose batch fence is exactly whether the revision was accepted.
+/// under, which Scribe's retry dedupe keys the revision's receipt by.
 #[must_use]
 pub fn revision_fence(tenant: DataTenantId, execution: ExecutionId, revision: i64) -> uuid::Uuid {
     revision_batch_id(tenant, revision_batch(execution, revision))
@@ -127,9 +121,8 @@ pub fn revision_fence(tenant: DataTenantId, execution: ExecutionId, revision: i6
 /// Why an execution's state cannot be used.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum StateError {
-    /// The accepted revision cannot be read or written now: its fence or
-    /// row is not reachable or not visible yet, or Scribe has no capacity.
-    /// Nothing was assumed absent; recovery is retried.
+    /// The state cannot be read or written now: its query failed or Scribe
+    /// has no capacity. Recovery is retried.
     #[error("the execution state is unavailable: {0}")]
     Unavailable(String),
     /// The accepted revision is in a format this worker does not run.
@@ -564,9 +557,8 @@ impl RunState {
     /// token.
     ///
     /// # Errors
-    /// Returns [`StateError::Unavailable`] when the accepted revision cannot
-    /// be found or read, and [`StateError::Incompatible`] for a revision in
-    /// another format.
+    /// Returns [`StateError::Unavailable`] when the state cannot be read,
+    /// and [`StateError::Incompatible`] for a revision in another format.
     pub async fn recover(
         app: &AppState,
         outbox: Arc<ScribeOutbox>,
@@ -576,7 +568,7 @@ impl RunState {
         lost: CancellationToken,
         records: &InputResolver<'_>,
     ) -> Result<Self, StateError> {
-        let (revision, state) = Self::accepted(app, tenant, row.execution_id, records).await?;
+        let (revision, state) = Self::accepted(row.execution_id, records).await?;
         Ok(Self::at(
             app.resources.workloads().clone(),
             outbox,
@@ -626,93 +618,24 @@ impl RunState {
         self.deadline
     }
 
-    /// The accepted revision and state of `execution`, without writing it,
-    /// so inspecting a running execution never shuts out its writer; fresh
-    /// at revision 0 when no revision was ever accepted.
+    /// The newest readable revision and state of `execution`, without
+    /// writing it, so inspecting a running execution never shuts out its
+    /// writer; fresh at revision 0 when no revision is readable.
     ///
     /// # Errors
-    /// As [`Self::recover`].
+    /// Returns [`StateError::Unavailable`] when the state cannot be read, and
+    /// [`StateError::Incompatible`] when it is in another format.
     pub async fn accepted(
-        app: &AppState,
-        tenant: DataTenantId,
         execution: ExecutionId,
         records: &InputResolver<'_>,
     ) -> Result<(i64, ExecutionState), StateError> {
-        let unavailable =
-            |error: &dyn std::fmt::Display| StateError::Unavailable(error.to_string());
-        let latest = async || {
-            records
-                .latest_revision(execution)
-                .await
-                .map(|visible| visible.unwrap_or(0))
-                .map_err(|error| unavailable(&error))
-        };
-        let mut visible = latest().await?;
-        let revision = loop {
-            let revision = Self::accepted_revision(app, tenant, execution, visible).await?;
-            let now = latest().await?;
-            if now <= visible {
-                break revision;
-            }
-            visible = now;
-        };
-        if revision == 0 {
-            return Ok((0, ExecutionState::fresh()));
-        }
-        let value = records
-            .state(execution, revision)
+        match records
+            .latest_state(execution)
             .await
-            .map_err(|error| unavailable(&error))?
-            .ok_or_else(|| {
-                StateError::Unavailable(format!("revision {revision} is not visible yet"))
-            })?;
-        Ok((revision, ExecutionState::decode(value)?))
-    }
-
-    /// The last accepted revision of `execution`, given that revision
-    /// `visible` is the newest one a query sees; 0 when none was accepted.
-    ///
-    /// The Bifrost rows are the lasting history: a revision is frozen only
-    /// after the one before it was accepted, so the accepted revisions are a
-    /// prefix from revision 1, and every visible one was accepted. Recent
-    /// batch receipts bridge the accepted revisions after `visible` that no
-    /// query sees yet. A receipt is removed only after its row has durable
-    /// custody, which it gains only after it became visible, so the caller
-    /// reads the newest visible revision again after probing: unchanged, no
-    /// receipt past `visible` was removed during the probe.
-    ///
-    /// # Errors
-    /// Returns [`StateError::Unavailable`] when the receipts cannot be read.
-    async fn accepted_revision(
-        app: &AppState,
-        tenant: DataTenantId,
-        execution: ExecutionId,
-        visible: i64,
-    ) -> Result<i64, StateError> {
-        let unavailable =
-            |error: &dyn std::fmt::Display| StateError::Unavailable(error.to_string());
-        let mut conn = app
-            .postgres
-            .vala()
-            .tenant_conn(tenant)
-            .await
-            .map_err(|error| unavailable(&error))?;
-        let mut revision = visible;
-        loop {
-            let probed: Vec<_> = (revision + 1..=revision + PROBE)
-                .map(|next| revision_fence(tenant, execution, next))
-                .collect();
-            let fenced = committed_batches(&mut conn, STATE_TABLE, &probed)
-                .await
-                .map_err(|error| unavailable(&error))?;
-            let accepted = probed
-                .iter()
-                .take_while(|batch| fenced.contains(batch))
-                .count();
-            revision += i64::try_from(accepted).unwrap_or(PROBE);
-            if accepted < probed.len() {
-                return Ok(revision);
-            }
+            .map_err(|error| StateError::Unavailable(error.to_string()))?
+        {
+            Some((revision, value)) => Ok((revision, ExecutionState::decode(value)?)),
+            None => Ok((0, ExecutionState::fresh())),
         }
     }
 

@@ -56,7 +56,7 @@ use crate::verification::approvals::ApprovalDecisions;
 use crate::verification::cache::exact_ref;
 use crate::verification::hosted::publications::published_object;
 use crate::verification::inputs::{DirectResult, InputOrigin, InputResolver};
-use crate::verification::state::RunState;
+use crate::verification::state::{RunState, StateError};
 
 /// Audit operation of an invocation page read.
 const LIST_INVOCATIONS: &str = "verification.execution.invocations";
@@ -516,10 +516,9 @@ impl<'a> VerificationControl<'a> {
             .records(&mut conn, caller.data_tenant_id, Some(caller))
             .await?;
         conn.commit().await.map_err(registry_db_error)?;
-        let (revision, state) = RunState::accepted(
-            self.state,
-            caller.data_tenant_id,
+        let (revision, state) = accepted(
             execution_id,
+            queued.as_ref(),
             &InputResolver::new(&query, None),
         )
         .await?;
@@ -625,8 +624,7 @@ impl<'a> VerificationControl<'a> {
         let query = self.records(&mut conn, tenant, None).await?;
         conn.commit().await.map_err(registry_db_error)?;
         let records = InputResolver::new(&query, None);
-        let (revision, state) =
-            RunState::accepted(self.state, tenant, execution_id, &records).await?;
+        let (revision, state) = accepted(execution_id, queued.as_ref(), &records).await?;
         let approvals: Vec<ApprovalId> = state
             .approvals
             .iter()
@@ -1097,6 +1095,24 @@ fn content_url(
         name.as_str(),
         query.finish()
     )
+}
+
+/// The accepted revision and state of `execution_id`, fresh at revision 0
+/// with no read when its queue row `queued` proves no claim ever leased it,
+/// since only a lease holder writes execution state. Without a queue row
+/// the state is recovered: retained history may outlive the row.
+///
+/// # Errors
+/// As [`RunState::accepted`].
+async fn accepted(
+    execution_id: ExecutionId,
+    queued: Option<&ExecutionStatus>,
+    records: &InputResolver<'_>,
+) -> Result<(i64, ExecutionState), StateError> {
+    if queued.is_some_and(|queued| !queued.claimed) {
+        return Ok((0, ExecutionState::fresh()));
+    }
+    RunState::accepted(execution_id, records).await
 }
 
 #[cfg(test)]

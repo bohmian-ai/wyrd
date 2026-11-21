@@ -647,13 +647,14 @@ async fn an_unacknowledged_decision_is_unavailable_and_its_retry_replays() {
 /// are removed. Inspection still serves the completed execution with the
 /// same decision, actor and time; the same decision replays the original
 /// receipt, and a contradictory one is still refused as not pending. A
-/// second execution's undecided occurrence whose decision has a recent
-/// receipt but no visible row is unavailable, never pending.
+/// second execution's occurrence whose decision Scribe holds but no query
+/// sees reads as pending, and a new decision for it is refused, so the held
+/// decision is never overwritten.
 ///
 /// # Panics
 /// Panics when the decision, its replay or its conflict changes after the
-/// receipts are removed, or an accepted but invisible decision reads as
-/// pending.
+/// receipts are removed, inspection depends on the receipts, or a held
+/// decision is overwritten.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_decision_outlives_its_retry_receipt() {
     let deployment = Deployment::start_limited(limits(Duration::from_mins(5))).await;
@@ -744,8 +745,18 @@ async fn a_decision_outlives_its_retry_receipt() {
         .expect("status responds");
     assert_eq!(
         response.status(),
+        StatusCode::OK,
+        "inspection reads no receipt"
+    );
+    let served = deployment.status(waiting).await;
+    assert_eq!(occurrence(&served)["status"], "pending", "{served}");
+    let (status, refused) = deployment
+        .decide(&approver_jwt, waiting, &pending.to_string(), &approve)
+        .await;
+    assert_eq!(
+        status,
         StatusCode::SERVICE_UNAVAILABLE,
-        "an accepted decision no query sees yet is unavailable, never pending"
+        "a decision Scribe already holds is never overwritten: {refused}"
     );
 }
 

@@ -32,17 +32,17 @@ its description consistent with the delivered behavior, rather than reopening it
 ## Existing owners and connected implementation
 
 - `vala-sql/src/queries/scribe_batch_commits.rs` owns tenant-scoped acceptance,
-  replay resolution and recent receipts. Its `committed_batches` consumers currently
-  assume fences never disappear. Keep the ordinary batched transaction and conflict
+  replay resolution and recent receipts. Only Scribe's retry, recovery and cleanup
+  paths read receipts; `committed_batches` is no longer re-exported to application
+  code ([TASK-001-R1](../review/TASK-001-maintainer-001/TASK-001-R1-bifrost-only-readers.md)). Keep the ordinary batched transaction and conflict
   resolution; extend this owner for bounded eligible deletion and durable ownership
   discovery. Retention is one hour / 10,000 identities per tenant-qualified logical
   table across clients/pods, with PostgreSQL time and canonical-coordinate rechecks.
 - `wyrd-server/src/verification/{state,approvals,evidence}.rs` and
-  `components/github/delivery.rs` consume permanent acceptance history.
-  `verification/inputs.rs` already owns Bifrost domain reads. Extend the existing
-  domain read/retry paths so actual retained records establish history and conflicts;
-  recent receipts bridge accepted-but-invisible records. Do not add a parallel
-  PostgreSQL history store or read only through the receipt list.
+  `components/github/delivery.rs` read only their Bifrost records through
+  `verification/inputs.rs`. A record accepted but not yet visible reads as absent;
+  its fixed batch id refuses any different second write, so it is never
+  overwritten. Do not add a parallel PostgreSQL history store.
 - `vala-bifrost-redux/src/scribe/{shards,wal,staging_runtime}.rs` and the existing
   rotation-cohort/manifest owners know canonical WAL coordinates and durable slices.
   Extend the local manifest with the agreed contiguous closed-segment frontier.
@@ -105,17 +105,11 @@ already-correct enqueue/ACK behavior is verification-only.
 
 **Evidence:**
 
-- Consumers read recent receipts first, then their Bifrost rows; a visible row is
-  authoritative, a held receipt without a visible row is unavailable, and neither
-  is absence. A receipt is removed only after its row is visible, so one gone
-  before the receipt read names a row the later row read sees. Execution recovery
-  starts from `InputResolver::latest_revision`, probes receipts above it and
-  re-reads the visible revision until it is unchanged, so a receipt removed
-  during the probe cannot truncate recovery. Owners: `verification/state.rs`
-  `RunState::accepted`, `verification/approvals.rs` `decided`,
-  `verification/evidence.rs` `accepted`, `components/github/delivery.rs`
-  `recorded`, `verification/inputs.rs` `latest_revision`; `committed_batches`
-  documents recent receipts.
+- Superseded by [TASK-001-R1](../review/TASK-001-maintainer-001/TASK-001-R1-bifrost-only-readers.md):
+  consumers read only their Bifrost rows; execution recovery reads the newest
+  readable revision with `InputResolver::latest_state`. The receipt-bridging
+  evidence below records the earlier implementation; R1 changes the
+  accepted-but-invisible assertions and records its own evidence.
 - Execution revisions —
   `wyrd-testing` `lifecycle::execution_recovery_outlives_its_revision_receipts`:
   receipts removed after publish, takeover recovers the same accepted state; a

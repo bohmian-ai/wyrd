@@ -368,9 +368,8 @@ pub async fn accepted_version(
 /// not a query can see them yet. Receipts are recent retry history, not
 /// lasting history: one is removed only after its batch has durable custody,
 /// so an id not answered names a batch that was never acknowledged or whose
-/// rows a query already sees. A caller asks here before it reads its own
-/// rows, which stay the authority: a receipt removed before this read names
-/// rows the later row read sees.
+/// rows a query already sees. Only Scribe's own retry, recovery and cleanup
+/// paths ask here; record readers outside Scribe read their Bifrost rows.
 ///
 /// # Errors
 ///

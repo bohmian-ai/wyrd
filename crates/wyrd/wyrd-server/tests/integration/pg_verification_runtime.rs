@@ -2325,16 +2325,15 @@ async fn redelivers_the_selected_result(final_attempt: bool) {
 /// waits for capacity in background, then completes the execution with the
 /// selected result instead of erroring.
 ///
-/// The source outage revokes the tenant role's read of the Scribe batch
-/// fences the accepted revision is recovered from; it is restored once the
-/// reclaim has reported the state unusable. The capacity outage holds the
+/// The source outage fails the next Bifrost query, the reclaim's read of its
+/// accepted revision, so the reclaim reports the state unusable. The
+/// capacity outage holds the
 /// whole reservable item share of the server's shared Scribe outbox, which
 /// the recovery runtime stages through; it is released once the reclaim has
 /// committed its claim.
 ///
 /// # Panics
-/// Panics as [`stage_unsettled_result`] does, when the grant cannot change,
-/// the share cannot be held, a reclaim never meets its outage or settles or
+/// Panics as [`stage_unsettled_result`] does, when the share cannot be held, a reclaim never meets its outage or settles or
 /// computes while blocked, or the execution does not complete on its first
 /// attempt with the selected result.
 #[tokio::test]
@@ -2343,17 +2342,8 @@ async fn exhausted_reconciliation_survives_source_and_capacity_outage() {
     let harness = Harness::start().await;
     harness.log_commits().await;
     let (run, stale) = stage_unsettled_result(&harness, true).await;
-    let grant = |statement: &'static str| {
-        let pool = harness.assertion.clone();
-        async move {
-            sqlx::query(statement)
-                .execute(&pool)
-                .await
-                .expect("the fence grant changes");
-        }
-    };
-    grant("REVOKE SELECT ON vala.scribe_batch_commits FROM wyrd_tenant").await;
     harness.expire(run).await;
+    harness.server.fail_next_query_after_schema();
     let winner = EngineScript::default();
     winner.push(EngineOutcome::Completed(unscored_report()));
     let fresh = harness.spawn(&Harness::limits(), &winner);
@@ -2367,7 +2357,6 @@ async fn exhausted_reconciliation_survives_source_and_capacity_outage() {
     }
     fresh.stop().await;
     stale.stop().await;
-    grant("GRANT SELECT ON vala.scribe_batch_commits TO wyrd_tenant").await;
 
     let outbox = harness.server.state().bifrost.scribe_outbox();
     let full = outbox

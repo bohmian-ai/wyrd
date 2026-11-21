@@ -243,14 +243,9 @@ impl Leased {
     /// Panics when the state is unreadable.
     async fn revision(&self) -> (i64, ExecutionState) {
         let query = Self::query(&self.server, self.system).await;
-        RunState::accepted(
-            self.server.state(),
-            self.server.data_tenant_id(),
-            self.lease.execution_id,
-            &InputResolver::new(&query, None),
-        )
-        .await
-        .expect("the state reads")
+        RunState::accepted(self.lease.execution_id, &InputResolver::new(&query, None))
+            .await
+            .expect("the state reads")
     }
 
     /// The publication `name` of `producer`, if accepted.
@@ -2871,13 +2866,8 @@ async fn state_format_changes_preserve_existing_custody() {
         refused.as_ref().err()
     );
     let query = Leased::query(&leased.server, leased.system).await;
-    let kept = RunState::accepted(
-        state,
-        tenant,
-        leased.lease.execution_id,
-        &InputResolver::new(&query, None),
-    )
-    .await;
+    let kept =
+        RunState::accepted(leased.lease.execution_id, &InputResolver::new(&query, None)).await;
     assert!(
         matches!(kept, Err(StateError::Incompatible(_))),
         "the accepted revision is unchanged and still refused: {:?}",

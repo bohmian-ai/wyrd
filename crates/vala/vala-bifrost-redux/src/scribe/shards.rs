@@ -4201,6 +4201,18 @@ impl ShardOwner {
             }
         }
         commit.done();
+        // A batch's partitions seal and retire independently, so each keeps
+        // every segment the group wrote: otherwise retiring one partition
+        // could free a segment still holding another's slice or the COMMIT.
+        // ponytail: group-wide rather than per batch; narrow it if retained
+        // WAL grows.
+        for slice in &state.durable {
+            let held = self.wal_segments.entry(slice.seal_key.clone()).or_default();
+            for (path, segment) in &group_segments {
+                held.entry(path.clone())
+                    .or_insert_with(|| Arc::clone(segment));
+            }
+        }
         let sync = stages.sync.timer();
         self.sync_group(&group_segments).await?;
         sync.done();
@@ -10335,6 +10347,80 @@ mod tests {
         assert_eq!(token_after.seal_id, token_before.seal_id);
         assert_eq!(token_after.arrow_bytes, token_before.arrow_bytes);
         assert!(owner.memory_ownership.is_poisoned());
+    }
+
+    /// Every partition of a batch keeps every WAL segment the batch wrote.
+    ///
+    /// One batch spans two day partitions, and its records are large enough
+    /// that the WAL rolls between them. Each partition's active bucket must
+    /// hold both segments, so sealing and retiring either partition alone
+    /// never frees a segment the other partition's slice or the COMMIT still
+    /// needs for recovery.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the owner cannot append the batch, the batch does not span
+    /// two segments, or a partition holds fewer segments than the batch wrote.
+    #[tokio::test]
+    async fn every_partition_of_a_batch_keeps_all_its_segments() {
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::new(16 * 1024).expect("small WAL segments"),
+            )
+            .expect("WAL writer"),
+        );
+        let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+        let (mut owner, budget, _command_tx, _completion_tx, _pressure_tx) =
+            owner_for_completion_test_with_channels(Memtable::new(), &wal, wal_handle, stream);
+        let rows_per_day = 2_000_usize;
+        let day = |day: u32| {
+            NaiveDate::from_ymd_opt(2026, 7, day)
+                .and_then(|date| date.and_hms_opt(12, 0, 0))
+                .expect("valid event timestamp")
+                .and_utc()
+                .timestamp_micros()
+        };
+        let values = (0..2 * rows_per_day)
+            .map(|index| {
+                i64::try_from(index)
+                    .expect("row index fits i64")
+                    .wrapping_mul(0x1E37_79B9_7F4A_7C15)
+            })
+            .collect::<Vec<_>>();
+        let times = (0..2 * rows_per_day)
+            .map(|index| day(if index < rows_per_day { 24 } else { 25 }))
+            .collect::<Vec<_>>();
+        let rows = RecordBatch::try_new(
+            owner_prepared_batch().schema(),
+            vec![
+                Arc::new(Int64Array::from(values)),
+                Arc::new(TimestampMicrosecondArray::from(times).with_timezone("UTC")),
+            ],
+        )
+        .expect("two-day rows");
+        let append = prepared_append_with_rows(&budget, owner_key(), uuid::Uuid::now_v7(), rows);
+        owner.process_group(vec![append]).await.expect("append");
+
+        let segments = owner.wal_segments.values().collect::<Vec<_>>();
+        assert_eq!(segments.len(), 2, "the batch spans two partitions");
+        let written = segments
+            .iter()
+            .flat_map(|held| held.keys())
+            .collect::<HashSet<_>>();
+        assert!(written.len() > 1, "the WAL rolled inside the batch");
+        for held in segments {
+            assert_eq!(
+                held.keys().collect::<HashSet<_>>(),
+                written,
+                "a partition holds every segment of its batch"
+            );
+        }
     }
 
     /// A segment shared by selective members retires with the last of them.

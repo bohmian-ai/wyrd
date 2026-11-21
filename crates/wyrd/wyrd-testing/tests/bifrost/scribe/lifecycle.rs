@@ -657,6 +657,175 @@ async fn replay_restores_only_accepted_batches() {
         .expect("the cluster drains cleanly");
 }
 
+/// A published batch's receipt is deleted once its shard's persisted safe
+/// frontier covers it, and a restart still restores exactly the accepted rows.
+///
+/// The first batch is published, which hands its WAL segment off and lets
+/// the shard manifest record a frontier at or past its receipt's COMMIT
+/// segment. The second is accepted but still WAL-dependent, and the third is
+/// never accepted. Of the table's receipts the real deletion query removes
+/// only the first.
+/// After an abrupt restart the published rows come from their own files, the
+/// WAL-dependent rows from the WAL under their kept receipt, and the
+/// never-accepted rows not at all.
+///
+/// # Panics
+///
+/// Panics when the cluster cannot start, an accepted append fails, the
+/// unrecorded append is acknowledged, no frontier covers the published
+/// receipt, the deletion keeps it or removes the WAL-dependent one, or the restored rows
+/// differ from the accepted ones.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn restart_restores_accepted_rows_after_handed_off_receipts_are_deleted() {
+    let mut cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed())
+        .await
+        .expect("the one-pod mixed cluster starts");
+    let tenant = cluster.data_tenant_id();
+    let name = unique_table("handed_off_receipts");
+    let node = {
+        let server = cluster.server(0).expect("the mixed pod is running");
+        register_table(server, tenant, BifrostNamespace::Datasets, &name).await;
+        server.node_id()
+    };
+    let table = format!("{}.{name}", BifrostNamespace::Datasets.as_str());
+    let published: Vec<i64> = (0..24).collect();
+    let wal_only: Vec<i64> = (24..48).collect();
+    let (published_batch, wal_only_batch) = (Uuid::now_v7(), Uuid::now_v7());
+    let pool = cluster
+        .pg_fixture()
+        .superuser_pool()
+        .expect("fixture exposes a superuser pool");
+    {
+        let server = cluster.server(0).expect("the mixed pod is running");
+        let client = tenant_client(server, tenant).await;
+        append_values(&client, &table, published_batch, &published)
+            .await
+            .expect("the published append is acknowledged");
+        server
+            .flush_bifrost()
+            .await
+            .expect("the first batch publishes");
+        append_values(&client, &table, wal_only_batch, &wal_only)
+            .await
+            .expect("the WAL-only append is acknowledged");
+        sqlx::query("REVOKE INSERT ON vala.scribe_batch_commits FROM wyrd_tenant")
+            .execute(&pool)
+            .await
+            .expect("receipt recording is revoked");
+        let refused = append_values(
+            &client,
+            &table,
+            Uuid::now_v7(),
+            &(100..124).collect::<Vec<_>>(),
+        )
+        .await;
+        sqlx::query("GRANT INSERT ON vala.scribe_batch_commits TO wyrd_tenant")
+            .execute(&pool)
+            .await
+            .expect("receipt recording is granted again");
+        assert!(
+            refused.is_err(),
+            "an unrecorded batch is never acknowledged"
+        );
+    }
+
+    let (stream_node, epoch, shard, segment): (Uuid, i64, i16, i64) = sqlx::query_as(
+        "SELECT wal_node_id, wal_writer_epoch, wal_shard_id, wal_segment_sequence \
+           FROM vala.scribe_batch_commits WHERE data_tenant_id = $1 AND batch_id = $2",
+    )
+    .bind(tenant.as_uuid())
+    .bind(published_batch)
+    .fetch_one(&pool)
+    .await
+    .expect("the published batch holds a receipt");
+    let manifest_suffix = std::path::PathBuf::from(stream_node.simple().to_string())
+        .join(epoch.to_string())
+        .join(format!("shard-{shard:02}"))
+        .join("manifest");
+    let manifest = cluster
+        .wal_dirs()
+        .find_map(|root| find_file(root, &manifest_suffix))
+        .expect("the shard manifest exists");
+    let safe_segment = serde_json::from_slice::<serde_json::Value>(
+        &std::fs::read(&manifest).expect("the manifest reads"),
+    )
+    .expect("the manifest parses")["safe_segment"]
+        .as_i64()
+        .expect("the manifest records a safe frontier");
+    assert!(
+        safe_segment >= segment,
+        "the frontier covers the published receipt's COMMIT segment"
+    );
+
+    let mut conn = vala_sql::TenantConn::acquire(cluster.pg_fixture().app_pool(), tenant)
+        .await
+        .expect("tenant connection");
+    let deleted = vala_sql::queries::scribe_batch_commits::delete_handed_off(
+        &mut conn,
+        &vala_sql::queries::scribe_batch_commits::HandedOffShard {
+            node_id: stream_node,
+            writer_epoch: epoch,
+            shard_id: shard,
+            safe_segment,
+        },
+        &vala_sql::queries::scribe_batch_commits::RetryHistory {
+            max_age: Duration::ZERO,
+            ..Default::default()
+        },
+        100,
+    )
+    .await
+    .expect("the handed-off receipts are deleted");
+    let kept = vala_sql::queries::scribe_batch_commits::committed_batches(
+        &mut conn,
+        &table,
+        &[published_batch, wal_only_batch],
+    )
+    .await
+    .expect("the receipts read");
+    conn.commit().await.expect("the deletion commits");
+    assert!(deleted >= 1, "the handed-off receipt is deleted");
+    assert_eq!(
+        kept,
+        [wal_only_batch],
+        "only the WAL-dependent receipt of the table is kept"
+    );
+
+    let roots = cluster
+        .terminate_node_abruptly_for_test(node)
+        .await
+        .expect("the pod is terminated without a drain");
+    cluster
+        .restart_terminated_node_at_new_address(node, roots)
+        .await
+        .expect("a replacement pod restarts on the retained roots");
+    let server = cluster.server(0).expect("the replacement pod is running");
+    let client = tenant_client(server, tenant).await;
+    assert_eq!(
+        sorted_values(&client, &table).await,
+        (0..48).collect::<Vec<_>>(),
+        "exactly the accepted rows restore"
+    );
+
+    cluster
+        .shutdown()
+        .await
+        .expect("the cluster drains cleanly");
+}
+
+/// Finds the file under `root` whose path ends with `suffix`.
+fn find_file(root: &std::path::Path, suffix: &std::path::Path) -> Option<std::path::PathBuf> {
+    std::fs::read_dir(root).ok()?.flatten().find_map(|entry| {
+        let path = entry.path();
+        if path.is_dir() {
+            find_file(&path, suffix)
+        } else {
+            path.ends_with(suffix).then_some(path)
+        }
+    })
+}
+
 /// Starts one bound pod over a durable Bifrost data root and provisions one
 /// queued Verifier execution in its tenant.
 ///

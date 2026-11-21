@@ -392,6 +392,12 @@ debt; do not claim a fixed row ceiling as the assertion.
 - Commands: the scenario 2 command with `receipt` added to the redux filter
   → 483/483 and 52/52; `vala-sql` `pg_scribe_batch_commits` → 9/9;
   `mise run fmt`, `mise run lints`, `check:tenant-isolation` clean.
+- History index: `scribe_batch_commits_history_idx` (tenant, table,
+  `ingested_at DESC`, `batch_id DESC`) added to the unreleased receipts
+  migration. EXPLAIN of the ranking over 200,000 synthetic receipts shows
+  `WindowAgg` over `Index Scan using scribe_batch_commits_history_idx`, with
+  no sort. `vala-sql` lib 21/21, `pg_scribe_batch_commits|pg_migration` 12/12,
+  cleaner tests 3/3.
 - Benchmark checkpoints: skipped by maintainer direction.
 
 ## Verification and boundaries

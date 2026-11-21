@@ -501,8 +501,10 @@ pub async fn delete_handed_off(
     cutoff: DateTime<Utc>,
     limit: i64,
 ) -> Result<Vec<uuid::Uuid>, SqlError> {
-    // ponytail: ranks every receipt of the tenant per call; add a
-    // (tenant, table, ingested_at) index if the cleaner's sweeps show it.
+    // ponytail: ranks every receipt of the tenant per call, in
+    // `scribe_batch_commits_history_idx` order so no sort runs; the cleaner
+    // keeps that set near retry history. Rank per table if tenants hold
+    // receipt backlogs far beyond it.
     sqlx::query_scalar(
         "DELETE FROM vala.scribe_batch_commits AS receipt \
           USING ( \

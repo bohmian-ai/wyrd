@@ -3961,10 +3961,11 @@ Wyrd recomputes a person's group roles at every sign-in. Remove someone from `wy
 Wyrd keeps local Users of its own, so a team can sign in before or without connecting a provider. As the administrator, invite a person with the grants their account receives:
 
 ```bash
-wyrd principal user invite --grant viewer:Repository/payments
+wyrd principal user invite --recipient alice@example.com --recipient bob@example.com \
+  --grant viewer:Repository/payments
 ```
 
-The command prints an `invitation_code` and a `signup_url`, and shows the code only this once. Deliver the code separately. The person opens the signup URL, enters the code, and chooses a username and password. Each code works once and expires.
+Each recipient gets a separate `invitation_link`, printed only this once. Send each person their link. Until an operator configures a mail relay, Wyrd does not email links, and `delivery` reads `not_emailed`. The person opens the link and chooses a username and password. Each link works once, for 24 hours. Anyone holding a live link can use it, so revoke one that reached the wrong person. `GET /v1/principals/users/invitations` lists pending invitations without their links. `POST /v1/principals/users/invitations/{id}/resend` replaces a link, and the old one stops working. `DELETE /v1/principals/users/invitations/{id}` revokes it.
 
 You can also create the User yourself. The password is read from standard input, so it never enters the command line or your shell history:
 
@@ -3972,7 +3973,7 @@ You can also create the User yourself. The password is read from standard input,
 wyrd principal user create --username alice --grant editor:all < alice-password.txt
 ```
 
-In the UI, **Settings**, then **Access**, then **Users** issues the same invitation: choose a role and a scope, and the page shows the code and signup URL once.
+In the UI, go to **Settings**, then **Access**, then **Users**. Paste the email addresses and choose a role and a scope, and the page shows each link once. **Pending invitations** lists every live invitation, with **Resend** and **Revoke**.
 
 Either way, the account holds exactly the grants you named, and each `--grant` names its scope. The person then signs in from a terminal with `wyrd auth login --server https://wyrd.example.com --tenant acme`, signs in with their password in the browser, and approves the code the CLI shows. The approval page opens at the address they use for the Wyrd UI when the server runs behind it. Revoke the account with `wyrd principal revoke` when they leave.
 

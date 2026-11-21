@@ -162,6 +162,14 @@ const CONNECTION_WINDOW_BYTES: u32 = 16 * 1024 * 1024;
 /// connection's whole window.
 const STREAM_WINDOW_BYTES: u32 = 4 * 1024 * 1024;
 
+/// Largest HTTP/2 frame payload the server accepts, in bytes.
+///
+/// A peer may send frames no larger than this, and hyper's 16 KiB default
+/// splits one several-hundred-KiB OTLP export into dozens of DATA frames,
+/// each handled on its connection's single task. One MiB carries a typical
+/// export in one frame and stays within [`STREAM_WINDOW_BYTES`].
+const MAX_FRAME_BYTES: u32 = 1024 * 1024;
+
 /// Build and return the configured tonic router.
 ///
 /// `tonic_health 0.12.x` does **not** expose `Health::from_reporter`.
@@ -197,6 +205,7 @@ where
     let mut server = Server::builder()
         .initial_connection_window_size(CONNECTION_WINDOW_BYTES)
         .initial_stream_window_size(STREAM_WINDOW_BYTES)
+        .max_frame_size(MAX_FRAME_BYTES)
         .trace_fn(move |request| request_span(request, tenant_spans.as_ref()));
     if let Some(identity) = cfg.tls_identity {
         server = server

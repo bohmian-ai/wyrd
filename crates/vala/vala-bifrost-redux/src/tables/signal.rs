@@ -1052,6 +1052,18 @@ pub struct RowEnvelopes {
 }
 
 impl RowEnvelopes {
+    /// Start empty, with room for the envelopes of `rows` accepted rows and
+    /// of `resources` and `scopes` groups, so a projector that knows its
+    /// export's checked counts grows none of them.
+    #[must_use]
+    pub fn with_capacity(rows: usize, resources: usize, scopes: usize) -> Self {
+        Self {
+            resources: Vec::with_capacity(resources),
+            scopes: Vec::with_capacity(scopes),
+            rows: Vec::with_capacity(rows),
+        }
+    }
+
     /// Retain one projected resource envelope for the rows beneath it.
     ///
     /// Returns its position and the payload bytes it adds to each row.

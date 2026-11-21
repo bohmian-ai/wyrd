@@ -1468,12 +1468,7 @@ impl ShardOwner {
                     self.publish_snapshot();
                 }
             }
-            while let Ok(command) = self.receiver.try_recv() {
-                if self.handle_command(command).await {
-                    self.shutting_down = true;
-                }
-                self.publish_snapshot();
-            }
+            self.drain_mailbox().await;
             let group = self.scheduler.pop_group();
             self.scheduler.record_closed(&group);
             if !group.is_empty() {
@@ -1499,12 +1494,7 @@ impl ShardOwner {
             tokio::select! {
                 command = self.receiver.recv() => {
                     match command {
-                        Some(command) => {
-                            if self.handle_command(command).await {
-                                self.shutting_down = true;
-                            }
-                            self.publish_snapshot();
-                        }
+                        Some(command) => self.apply_command(command).await,
                         None => break,
                     }
                 }
@@ -1514,6 +1504,29 @@ impl ShardOwner {
                     }
                 }
             }
+        }
+    }
+
+    /// Applies every command already queued in the mailbox.
+    ///
+    /// Queuing an append changes no memtable state, so it publishes nothing;
+    /// its rows reach inspection in the group's publication before its ACK.
+    /// Every control command still publishes right after it applies.
+    async fn drain_mailbox(&mut self) {
+        while let Ok(command) = self.receiver.try_recv() {
+            self.apply_command(command).await;
+        }
+    }
+
+    /// Applies one mailbox command, publishing inspection after a control
+    /// command; see [`Self::drain_mailbox`].
+    async fn apply_command(&mut self, command: ShardCommand) {
+        let control = !matches!(command, ShardCommand::Append(_));
+        if self.handle_command(command).await {
+            self.shutting_down = true;
+        }
+        if control {
+            self.publish_snapshot();
         }
     }
 
@@ -7523,6 +7536,95 @@ mod tests {
             fail_next_retirement_release: false,
         };
         (owner, budget, command_tx, completion_tx, pressure_tx)
+    }
+
+    /// A mailbox drain of append-only commands leaves the published inspection
+    /// snapshot alone, because queuing an append changes no memtable state; a
+    /// control command in the same mailbox still publishes the current state.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an append-only drain republishes the snapshot, the appends are
+    /// not queued, or a drained control command does not publish.
+    #[tokio::test]
+    async fn mailbox_drain_publishes_inspection_only_for_control_commands() {
+        let key = owner_key();
+        let memtable = Memtable::new();
+        memtable
+            .insert(&key, owner_meta(&key), owner_batch())
+            .expect("owner insert");
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+        let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+        let (mut owner, budget) =
+            owner_for_completion_test_with_budget(memtable, &wal, wal_handle, stream);
+        let (commands, receiver) = mpsc::channel(4);
+        owner.receiver = receiver;
+        let stale = || ShardMemtableSnapshot {
+            stats: MemtableStats {
+                writable_rows: usize::MAX,
+                ..MemtableStats::default()
+            },
+            ..ShardMemtableSnapshot::default()
+        };
+        let published_rows = |owner: &ShardOwner| {
+            owner
+                .snapshot
+                .lock()
+                .expect("snapshot lock")
+                .stats
+                .writable_rows
+        };
+        *owner.snapshot.lock().expect("snapshot lock") = stale();
+
+        for _ in 0..2 {
+            commands
+                .try_send(ShardCommand::Append(Box::new(
+                    prepared_append_for_group_test(&budget),
+                )))
+                .expect("queue append");
+        }
+        owner.drain_mailbox().await;
+
+        assert_eq!(
+            owner.scheduler.pop_group().len(),
+            2,
+            "both appends are queued"
+        );
+        assert_eq!(
+            published_rows(&owner),
+            usize::MAX,
+            "appends do not republish"
+        );
+
+        let (response, flushed) = tokio::sync::oneshot::channel();
+        commands
+            .try_send(ShardCommand::FlushAll { response })
+            .expect("queue flush");
+        owner.drain_mailbox().await;
+
+        let _ = flushed.await.expect("flush response");
+        let current = owner
+            .memtable
+            .stats()
+            .expect("memtable stats")
+            .writable_rows;
+        assert_ne!(current, usize::MAX);
+        assert_eq!(
+            published_rows(&owner),
+            current,
+            "the flush publishes current state"
+        );
     }
 
     /// Proves the pod-wide index records only batches this group committed:

@@ -780,4 +780,32 @@ mod tests {
 
         correlation_fixture::assert_attribute_rows(&batch, &[&missing, &valid, &duplicate]);
     }
+
+    /// The projector reserves each fixed-width column once from the export's
+    /// checked record count, so a column's backing allocation holds exactly
+    /// its rows instead of a grown power-of-two capacity.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any record is refused or a fixed-width column retains more
+    /// capacity than its accepted rows.
+    #[test]
+    fn log_projection_reserves_columns_from_the_record_count() {
+        const RECORDS: usize = 100;
+        let request = logs_with_attribute_sets(vec![Vec::new(); RECORDS]);
+
+        let (batch, outcome) = project_resource_logs(&request, None, usize::MAX).expect("projects");
+
+        assert_eq!(outcome.accepted_records, 100);
+        assert_eq!(outcome.rejected_records, 0);
+        for name in [
+            "time_unix_nano",
+            "observed_time_unix_nano",
+            "severity_number",
+        ] {
+            let data = column(&batch, name).to_data();
+            let width = data.data_type().primitive_width().expect("fixed width");
+            assert_eq!(data.buffers()[0].capacity(), RECORDS * width, "{name}");
+        }
+    }
 }

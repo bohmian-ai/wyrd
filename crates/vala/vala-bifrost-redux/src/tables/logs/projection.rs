@@ -143,7 +143,11 @@ pub fn project_log_input(
     card_scope: Option<&[CardUid]>,
     output_limit_bytes: usize,
 ) -> Result<(RecordBatch, LogsOutcome), TableError> {
-    let mut columns = LogColumns::default();
+    let mut columns = LogColumns::with_capacity(
+        input.records.len(),
+        input.resources.len(),
+        input.scopes.len(),
+    );
     let mut budget = OutputBudget::new(output_limit_bytes);
     let row_bytes = log_row_output_bytes();
     let mut rejected: i64 = 0;
@@ -228,7 +232,7 @@ pub fn canonical_log_schema() -> Arc<Schema> {
 /// straight into their Variant columns, and each resource and scope envelope
 /// is retained once and referenced per row, so no value is copied before its
 /// final Arrow column. A rejected record leaves no row behind.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct LogColumns<'a> {
     rows: usize,
     /// Each resource and scope envelope, and the ones every row repeats.
@@ -264,6 +268,38 @@ struct LogColumns<'a> {
 }
 
 impl<'a> LogColumns<'a> {
+    /// Start empty, with every per-row column sized for `records` rows and
+    /// the envelopes for `resources` and `scopes` groups.
+    ///
+    /// The counts are the flattened export's, already bounded by the
+    /// admission preflight, so each column allocates once instead of growing
+    /// and copying; refused records only leave that bounded room unused.
+    fn with_capacity(records: usize, resources: usize, scopes: usize) -> Self {
+        Self {
+            rows: 0,
+            envelopes: RowEnvelopes::with_capacity(records, resources, scopes),
+            time_unix_nano: Vec::with_capacity(records),
+            observed_time_unix_nano: Vec::with_capacity(records),
+            severity_number: Vec::with_capacity(records),
+            severity_text: Vec::with_capacity(records),
+            event_name: Vec::with_capacity(records),
+            body: VariantColumnEncoder::with_capacity(records),
+            trace_id: Vec::with_capacity(records),
+            span_id: Vec::with_capacity(records),
+            flags: Vec::with_capacity(records),
+            attributes: VariantColumnEncoder::with_capacity(records),
+            variant_scratch: Vec::new(),
+            dropped_attributes_count: Vec::with_capacity(records),
+            exception_type: Vec::with_capacity(records),
+            exception_message: Vec::with_capacity(records),
+            exception_stacktrace: Vec::with_capacity(records),
+            body_text: Vec::with_capacity(records),
+            is_exception: Vec::with_capacity(records),
+            card_uid: Vec::with_capacity(records),
+            run_id: Vec::with_capacity(records),
+        }
+    }
+
     /// Validate one log record completely, then append its canonical row.
     ///
     /// # Errors

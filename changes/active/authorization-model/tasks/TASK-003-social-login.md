@@ -3,7 +3,7 @@ id: TASK-003
 kind: implementation
 status: proposed
 spec: SPEC-authorization-model
-spec_revision: 3
+spec_revision: 4
 requirements: [REQ-011, REQ-012, REQ-013, REQ-014, REQ-015, REQ-016, REQ-017]
 depends_on: [TASK-001, TASK-002]
 ---
@@ -11,9 +11,9 @@ depends_on: [TASK-001, TASK-002]
 # Social sign-in, workspace signup and team invitations
 
 An operator enables Google and GitHub sign-in and configures application email.
-A tenant administrator invites a team with scoped access. Each recipient proves
-their identity and invited address, then enters that tenant with the intended
-access. A public visitor may instead create a new workspace, when enabled, and
+A tenant administrator invites a team with scoped access through single-use
+links, copied or emailed. Each recipient opens their link, proves an allowed
+sign-in method and enters that tenant with the intended access. A public visitor may instead create a new workspace, when enabled, and
 becomes its administrator. Existing Users can connect another sign-in method
 without losing their access or keys, and tenants can require company SSO.
 
@@ -44,7 +44,7 @@ system:
 | `wyrd-server/src/components/platform/identity.rs`, platform routes and configuration | Reuse platform authorization, sealed secrets and provider test management for shared social clients and SMTP/signup/password settings. Add their operator UI projections. Tenant company SSO retains its own single connection slot and lifecycle. |
 | `wyrd-auth/src/connections.rs`, `callback.rs`, `passwords.rs`; server `src/auth/` routes | Reuse provider verification and login completion. Bind the social purpose before the existing unknown-identity provisioning/group-sync branch: returning social login must not create a User or replace company bindings. Google uses OIDC first; GitHub then needs a concrete OAuth user-lookup adapter because it supplies no ID token. |
 | `wyrd-auth/src/browser_sessions.rs`, `cli_logins.rs`, `refresh.rs` and SQL login/session owners | Carry exact provider revision and linked identity through browser login, explicit device approval and refresh. Enforce current method availability and tenant SSO policy through these existing lifecycle owners. |
-| Existing identity store and `wyrd-sql/src/queries/auth/local_passwords.rs` | Multiple identities per User already exist. Add explicit attachment/removal, addressed invitation coordination and recipient proof without email-based User resolution. Extend existing scoped consumption and issuer-authority checks. |
+| Existing identity store and `wyrd-sql/src/queries/auth/local_passwords.rs` | Multiple identities per User already exist. Add explicit attachment/removal and addressed invitation links, resend and send outcomes without email-based User resolution. Extend existing scoped consumption and issuer-authority checks. |
 | `wyrd-server/src/components/platform/provisioning.rs::TenantProvisioning` and SQL platform provisioning | Extend its directory claim, builtin/SYSTEM/table initialization and promotion/failure workflow with human-owner initialization. The existing privileged flow returns a bootstrap credential; public signup instead initializes its proven User/admin binding and returns an ordinary tenant session. Do not duplicate orchestration or fabricate a platform caller. |
 | UI login/signup, Settings → Access and account routes; `src/lib/server/auth/` | Render Rust's allowed methods, addressed bulk invitation results, account linking and SSO policy. Node forwards browser context; Rust owns exchange, proof, secrets and durable behavior. |
 
@@ -52,7 +52,7 @@ Operator clients/settings, tenant administrator recipient/access selections,
 provider responses and the browser-bound signup/linking attempts are the real
 inputs. Persist approved coordination metadata through `wyrd-sql`; return safe
 management results, per-recipient outcomes and ordinary tenant credentials to
-the UI and existing CLI/SDK consumers. SMTP is the one new delivery capability:
+the UI and existing CLI/SDK consumers. SMTP is the one new, optional delivery capability:
 use the existing secret handling and a minimal generic SMTP implementation;
 there is no existing mail workflow to reuse. Send after commit, outside the
 tenant transaction. No provider-specific email implementation is needed.
@@ -261,46 +261,50 @@ or provider-token retention, while retaining company test/device behavior.
 - Limitation: a linked social identity cannot sign in yet. It is refused with
   `login=failed` until the invitation/identity anchor in entry 4 exists.
 
-### 3. An administrator emails separate invitations to a team
+### 3. An administrator invites a team by copied and emailed links
 
 **Maps to:** REQ-013, REQ-017; preserves REQ-001/REQ-008; AC-004.
 
-The operator configures the local SMTP test server through generic host/port/TLS,
-optional credentials and sender settings, then performs test-send. A tenant admin
-pastes at least ten recipient addresses into Access and chooses the predecessor's
-explicit role/scope assignments. The UI/API returns separate invitation and send
-results; the SMTP server receives separate correctly addressed messages tied to
-the committed invitations. Pending entries can be inspected, resent and revoked.
-The tenant admin cannot read/change relay credentials, and reads omit secrets.
+Without SMTP, a tenant admin pastes at least ten recipient addresses into
+Access/API and chooses the predecessor's explicit role/scope assignments. The
+response returns one link per recipient (tenant invitation page, code in the URL
+fragment) with "not emailed" outcomes, and the UI explains that Wyrd does not
+email them. Pending entries list recipient, assignments, expiry and last
+outcome, never a code; resend returns a new link and voids the old one; revoke
+voids it. Storage holds only code verifiers.
 
-With missing SMTP, the UI explains emailed invitation unavailability. With relay
-failure, report failure rather than delivery, retain pending state, create no
-active User and allow explicit resend after recovery. Relay acceptance is shown
-as acceptance, never inbox delivery. A stalled SMTP exchange must not hold the
-tenant transaction; no raw code is stored as a mail spool or logged.
+The operator then configures the local SMTP test server (Mailpit) through
+generic host/port/TLS, optional credentials and sender settings, and performs
+test-send. New invitations and resends are emailed separately after commit; the
+server receives one correctly addressed message per recipient whose link matches
+the returned link. The tenant admin cannot read/change relay credentials, and
+reads omit secrets. With relay failure, report failure rather than delivery
+beside the returned link, retain pending state, create no active User and allow
+resend after recovery. Relay acceptance is shown as acceptance, never inbox
+delivery. A stalled SMTP exchange must not hold the tenant transaction; no raw
+code is stored as a mail spool or logged.
 
-**Proof:** Tier-1 management/UI → Rust → Postgres → controlled SMTP journey;
-SQL integration proof for coordination and transaction boundaries as needed.
-Initially fail on absent recipient/bulk/delivery contracts. Consume actual sent
-messages in the next cycle rather than constructing unrelated invitation rows.
+**Proof:** Tier-1 management/UI → Rust → Postgres → Mailpit journey; SQL
+integration proof for coordination and transaction boundaries as needed.
+Initially fail on absent recipient/bulk/link/delivery contracts. Consume actual
+returned and sent links in the next cycle rather than constructing unrelated
+invitation rows.
 
 ### 4. The addressed recipient redeems scoped access, then returns with Google
 
 **Maps to:** REQ-012, REQ-013; preserves REQ-001/REQ-008; AC-004.
 
-Use a message produced by cycle 3. Its recipient completes Google enrollment
-with appropriate verified recipient email, receives one tenant-local User,
+Use a link produced by cycle 3. Its holder completes Google enrollment
+(a differing Google email does not refuse), receives one tenant-local User,
 identity, exactly the invited assignments and session, and consumes the invitation
 atomically. Use that session against an allowed resource and a second resource
 outside the invited scope. Log out and return with the same tenant/issuer/subject:
 the same User and access return. Social sign-in must leave direct, local-group
 and company-derived assignments intact; no provider groups are needed.
 
-Also redeem through invited password enrollment, and use a separate mailbox
-challenge when provider proof cannot establish the recipient. A forwarded
-invitation alone, wrong/unverified recipient, expired/replayed/wrong-browser
-mailbox proof, invalid/expired/revoked invitation, changed issuer assignment
-authority or invalid role/scope cannot grant access. An already-owned provider
+Also redeem a copied link through invited password enrollment. Opening a link
+spends nothing. An invalid, expired, revoked, superseded or replayed link,
+changed issuer assignment authority or invalid role/scope cannot grant access. An already-owned provider
 identity refuses new-User enrollment with sign-in/access-request guidance.
 Concurrent redemption has one winner; failed consumption leaves none of the
 User/identity/bindings/session writes committed. Inactive Users/tenants cannot
@@ -309,8 +313,8 @@ Users/grants/credentials, with no cross-tenant credential use.
 
 **Proof:** Tier-1 invitation email → enrollment → real authenticated resource
 calls, including production UI; SQL integration fault/concurrency assertions
-support atomicity. Initially fail on missing addressed social/password proof and
-social returning login. Matching email alone must never resolve an existing User.
+support atomicity. Initially fail on missing link-based social/password enrollment
+and social returning login. Matching email alone must never resolve an existing User.
 
 ### 5. GitHub follows the same admission flow using its stable account ID
 
@@ -318,8 +322,7 @@ social returning login. Matching email alone must never resolve an existing User
 
 The operator registers/tests/enables GitHub through the same management journey.
 Invite a recipient and complete code/S256-PKCE/state exchange, authenticated user
-lookup and, when needed, verified mailbox lookup through controlled GitHub
-responses. Redeem and return through real endpoints. Rename the GitHub login
+lookup through controlled GitHub responses (no email API access). Redeem and return through real endpoints. Rename the GitHub login
 while retaining its numeric ID: Wyrd returns the same User. Another numeric ID
 with a matching email/login does not inherit it. Repeat the common invitation,
 purpose, revision and stranger refusals through this adapter. Provider failure

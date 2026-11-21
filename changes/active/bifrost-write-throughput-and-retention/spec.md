@@ -1,6 +1,6 @@
 ---
 id: SPEC-bifrost-write-throughput-and-retention
-revision: 2
+revision: 3
 status: approved
 ---
 
@@ -204,6 +204,10 @@ to queries or bypass claim assembly with general staged-file passthrough.
 
 This standalone packet covers the shared Scribe write path, its PostgreSQL receipt
 owner, the four affected domain consumers and the narrow pinned Arrow extension.
+To keep REQ-013's hot-read criteria under improved ingest, it also covers two
+read-side CPU reductions with unchanged results: pruning captured memtable batches
+before building their projected statistics, and physically planning Oracle's
+already-optimized logical plan without a second optimization pass.
 Tenant isolation and existing permission/content checks apply on every retry path.
 Necessary unreleased SQL/index changes edit existing migrations; no new migration
 file, database table, receipt archive, per-fence UPDATE or per-batch retirement ledger.
@@ -264,3 +268,8 @@ spec and rerun review. It records the R1 Bifrost-only readers: newest-readable
 recovery, temporary absence for unreadable accepted rows, fixed-identity conflict
 protection and retry on query failure. The owning architecture and acceptance
 wording are reconciled with that decision; other requirements are unchanged.
+
+Revision 3 is approved by the maintainer on 2026-11-21. It adds to scope two
+read-side CPU reductions that keep REQ-013's hot-read criteria under improved
+ingest, with unchanged results: memtable pruning before projected statistics, and
+a single logical optimization pass per Oracle query. Other requirements are unchanged.

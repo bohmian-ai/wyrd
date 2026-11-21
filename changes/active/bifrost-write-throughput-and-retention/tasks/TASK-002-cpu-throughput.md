@@ -3,7 +3,7 @@ id: TASK-002
 kind: implementation
 status: proposed
 spec: SPEC-bifrost-write-throughput-and-retention
-spec_revision: 2
+spec_revision: 3
 requirements: [REQ-001, REQ-004, REQ-010, REQ-011, REQ-012, REQ-013]
 depends_on: [TASK-001]
 ---
@@ -16,7 +16,7 @@ Deliver the approved CPU reduction on the fixed OTLP logs-c64 population while
 preserving accepted input, byte/identity compatibility, bounded ownership and read
 latency under sustainable ingestion. Faster ACK alone does not satisfy the target.
 
-Implement [spec revision 2](../spec.md) using the selected
+Implement [spec revision 3](../spec.md) using the selected
 [CPU flow and protections](../design/throughput.md). Task 1 must first supply
 domain-history independence, accepted-only replay, durable handoff/cleanup behavior,
 their regression tests and the previous accepted benchmark checkpoint. This task
@@ -57,6 +57,21 @@ but no additional diagnostic/profile experiment is required by this task.
 - Reuse bounded encoder scratch on existing workers through existing memory owners.
   Charge retained capacity and backing allocations, cap reuse/release oversized
   scratch, reset dictionary/schema/EOS between streams and keep failure cleanup safe.
+
+- Read-side CPU, so reads keep REQ-013's hot-read criteria while sharing the host
+  with improved ingest. The `point-memtable-c64` server profile attributes 8.7% of
+  CPU to `scribe/memtable.rs::ReadableSource::prepare`, of which ~4.9% builds a
+  projected `Statistics` for every captured batch before `BatchPruning::keep`
+  runs. It also attributes 3.0% to a second logical optimization pass:
+  `oracle/mod.rs` plans through `into_optimized_plan()`, then
+  `create_physical_plan` optimizes the same logical plan again. Prune captured
+  batches against their recorded statistics through the projected-to-source
+  column mapping first, and build projected statistics only for batches that
+  pass. Keep cast/null-filled columns unknown and keep the identity-bound second
+  pass. Physically plan the already optimized, already authorized logical plan
+  through the session's registered query planner without re-optimizing it.
+  `authorize_payload_columns` still inspects the plan that executes. No plan or
+  statistics cache, pruning rule, query result, or Oracle routing changes.
 
 Output canonical arrays still feed the current memtable and staged/sorted Parquet
 path. IPC output still feeds the existing WAL format and task 1's accepted recovery.
@@ -165,8 +180,35 @@ independent streams and Wyrd does not charge/bound that retained scratch. Add th
 focused lifecycle/ownership assertion before the extension. Performance remains
 unproven until measured; no fabricated failing test substitutes for 80 qualification.
 
-**Evidence:** Pending. Append focused RED/GREEN, context/memory proof, the three
-checkpoint reports/comparisons and final qualification records here.
+**Read-side protection (REQ-013), within this scenario:**
+
+- *Start/input:* existing memtable capture fixtures, with filtered and
+  unfiltered projections, cast and null-filled columns, batches without
+  recorded statistics, and identity predicates. Existing Oracle SQL over memtable
+  and Parquet sources, including column-restricted (payload-authorized) tables
+  and parameterized queries.
+- *Action/result:* a capture read returns exactly the same batches and rows as
+  before. Projected statistics are built only for batches that survive pruning
+  on their recorded bounds. A query's executed physical plan and its rows are
+  unchanged, the logical optimizer runs once per query, and payload authorization
+  still refuses unauthorized columns. `point-memtable-c64` server CPU per query
+  falls outside repetition spread, against both the TASK-001 checkpoint and the
+  original baseline, with read tails no worse.
+- *Proof owner/tier:* inline `scribe/memtable.rs` tests for pruning parity and
+  for statistics built only for kept batches, starting from
+  `scribe::memtable::tests::capture_read_prunes_batches_before_projecting`. Inline
+  `oracle` tests for single-pass optimization and unchanged plans, starting from
+  `oracle::exec::tests::physical_root_alone_selects_query_class`. The existing
+  Oracle journey lane covers end-to-end rows, refusals and publication
+  transitions. `bench:l1:bifrost:hot` measures the outcome.
+- *Expected RED:* an owner-level assertion that projected statistics are built
+  for a batch pruned by recorded bounds, and an assertion that the logical
+  optimizer runs once per planned query. Both fail on current code. Row and
+  plan parity tests may already pass and serve as regression proof.
+
+**Evidence:** Pending. Append focused RED/GREEN, context/memory proof, the read-side
+proof above, the three checkpoint reports/comparisons and final qualification
+records here.
 
 ## Verification and final qualification
 
@@ -175,9 +217,16 @@ runners, confirmed in `mise.toml`, are:
 
 ```bash
 mise run test:bifrost:integration:redux
+mise run test:bifrost:journey:oracle
 mise run test:bifrost:journey:otlp
 mise run test:bifrost:journey:scribe
 mise run test:bifrost:journey:server
+```
+
+Read-side focused tests (existing names; add new ones beside them):
+
+```bash
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=scribe::memtable::tests::capture_read_prunes_batches_before_projecting) | test(=oracle::exec::tests::physical_root_alone_selects_query_class)'
 ```
 
 Retain focused task-1 regression checks and run affected owners once at task

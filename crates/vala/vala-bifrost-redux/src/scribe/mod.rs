@@ -25,6 +25,7 @@ pub mod persistence;
 pub mod preprocess;
 pub(crate) mod profile;
 pub mod promotion;
+pub(crate) mod receipt_cleaner;
 pub mod registry;
 pub mod replay;
 pub mod routing;
@@ -326,6 +327,9 @@ pub struct ScribeImpl {
     /// Vala SQL pool holding the batch-control fence, read by ingress only to
     /// recover an accepted retry the committed index no longer holds.
     control_postgres: Option<Arc<vala_sql::ValaPostgres>>,
+    /// Background deleter of this node's retry receipts, present when
+    /// receipts are written.
+    receipt_cleaner: Option<Arc<receipt_cleaner::ReceiptCleaner>>,
     /// The `bifrost.metrics.series` rows this process has made durable, so a
     /// points batch admits only the series rows it adds.
     series_seen: series_index::SeriesSeen,
@@ -1151,8 +1155,13 @@ impl ScribeImpl {
         let memory = config.resources.clone();
         let memory_ownership =
             memory::ScribeOwnership::new(&memory).expect("zero-sized root ownership must be valid");
+        let cleanup = config
+            .persistence
+            .as_ref()
+            .is_some_and(|persistence| persistence.operator_pool.is_some())
+            .then(|| Arc::new(receipt_cleaner::CleanupHealth::default()));
         let admission =
-            AdmissionController::with_config_and_memory(config.admission, memory.clone());
+            AdmissionController::with_cleanup(config.admission, memory.clone(), cleanup.clone());
         let ScribeBuildConfig {
             catalog,
             operator,
@@ -1215,6 +1224,21 @@ impl ScribeImpl {
             },
             &coordination_runtime,
         );
+        let receipt_cleaner = cleanup.and_then(|health| {
+            let operator = fence_operator.clone()?;
+            let postgres = control_postgres.clone()?;
+            let cleaner = Arc::new(receipt_cleaner::ReceiptCleaner::new(
+                operator,
+                postgres,
+                wal.base_dir().to_path_buf(),
+                stream.node_id,
+                shards.committed(),
+                health,
+                wal.frontier_advanced(),
+            ));
+            cleaner.start(&coordination_runtime);
+            Some(cleaner)
+        });
         Self::install_boot_metrics();
         Self {
             catalog,
@@ -1245,6 +1269,7 @@ impl ScribeImpl {
             admission_clock: ingress::AdmissionClock::new(control_postgres.clone()),
             control_postgres,
             fence_operator,
+            receipt_cleaner,
             series_seen: series_index::SeriesSeen::default(),
             #[cfg(any(test, feature = "test-support"))]
             ingest_stall: Arc::new(std::sync::Mutex::new(None)),
@@ -1263,7 +1288,15 @@ impl ScribeImpl {
     /// bytes are the volume governor's `bifrost_resource_current_bytes` series.
     fn install_boot_metrics() {
         metrics::gauge!("bifrost_scribe_ingress_active").set(0.0);
-        for reason in ["in_flight", "memory", "wal", "queue", "closed", "invalid"] {
+        for reason in [
+            "in_flight",
+            "memory",
+            "wal",
+            "queue",
+            "closed",
+            "invalid",
+            "cleanup",
+        ] {
             metrics::counter!("bifrost_scribe_rejections_total", "reason" => reason).increment(0);
         }
     }
@@ -1527,6 +1560,9 @@ impl ScribeImpl {
         self.closed.store(true, Ordering::Release);
         self.recovery_cancelled.store(true, Ordering::Release);
         self.shards.close();
+        if let Some(cleaner) = &self.receipt_cleaner {
+            cleaner.stop();
+        }
     }
 
     /// Closes internal execution lanes after graceful flush has completed or timed out.
@@ -2586,7 +2622,9 @@ impl ScribeImpl {
     /// Replays eligible WAL sequentially through the bounded filesystem lane.
     ///
     /// Readiness remains false until every restored shard result, manifest
-    /// advance, and WAL retirement settles. Shutdown requests cancellation
+    /// advance, and WAL retirement settles, and one receipt sweep has run so a
+    /// restarted pod admits fresh writes as soon as it is ready.
+    /// Shutdown requests cancellation
     /// between records; an already-started shard settlement completes first.
     ///
     /// # Errors
@@ -2675,6 +2713,11 @@ impl ScribeImpl {
             }
         };
         if result.is_ok() {
+            if let Some(cleaner) = &self.receipt_cleaner {
+                // A failed sweep leaves admission busy, not Scribe unready:
+                // reads and admitted work continue while the cleaner retries.
+                let _ = cleaner.sweep_and_report().await;
+            }
             self.recovery_ready.store(true, Ordering::Release);
             metrics::histogram!("bifrost_scribe_replay_seconds")
                 .record(started.elapsed().as_secs_f64());

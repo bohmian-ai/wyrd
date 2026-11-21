@@ -2006,6 +2006,9 @@ pub struct WalWriter {
     /// Released-segment prefixes by shard directory, loaded from each shard
     /// manifest on first release.
     frontiers: Arc<Mutex<HashMap<PathBuf, ShardFrontier>>>,
+    /// Signalled after a persisted frontier advances, so receipt cleanup can
+    /// delete the receipts it now covers without waiting for its cadence.
+    frontier_advanced: Arc<tokio::sync::Notify>,
     /// Retired segment files of this stream kept for reuse, by shard directory.
     ///
     /// They exist only while this writer lives: construction deletes every
@@ -2306,6 +2309,7 @@ impl WalWriter {
             retirement_refs: Arc::new(Mutex::new(HashMap::new())),
             deferred_deletes: Arc::new(Mutex::new(BTreeSet::new())),
             frontiers: Arc::new(Mutex::new(HashMap::new())),
+            frontier_advanced: Arc::new(tokio::sync::Notify::new()),
             free_segments: Arc::new(Mutex::new(HashMap::new())),
             fault: tokio_util::sync::CancellationToken::new(),
         };
@@ -2366,6 +2370,14 @@ impl WalWriter {
         }
         self.next_lsn.store(next_lsn, Ordering::Release);
         Ok(())
+    }
+
+    /// Signal raised after any shard's persisted safe frontier advances.
+    ///
+    /// Wakes are coalesced: several advances before the waiter runs wake it
+    /// once.
+    pub(crate) fn frontier_advanced(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.frontier_advanced)
     }
 
     /// Return the pod-local WAL root used for replay and diagnostics.
@@ -2438,6 +2450,7 @@ impl WalWriter {
             retirement_refs: Arc::clone(&self.retirement_refs),
             deferred_deletes: Arc::clone(&self.deferred_deletes),
             frontiers: Arc::clone(&self.frontiers),
+            frontier_advanced: Arc::clone(&self.frontier_advanced),
             free_segments: Arc::clone(&self.free_segments),
             fault: self.fault.clone(),
         }
@@ -3103,6 +3116,7 @@ impl WalWriter {
             )?;
             frontier.released.retain(|sequence| *sequence > safe);
             frontier.safe = Some(safe);
+            self.frontier_advanced.notify_one();
         }
         covered.extend(held.into_iter().filter_map(|(directory, sequence, path)| {
             frontiers

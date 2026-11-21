@@ -1191,6 +1191,11 @@ impl ScribeShardRuntime {
         self.senders.len()
     }
 
+    /// This pod's committed-batch mirror, shared with receipt cleanup.
+    pub(crate) fn committed(&self) -> Arc<crate::scribe::committed_batches::CommittedBatches> {
+        Arc::clone(&self.committed)
+    }
+
     /// Rows of `append` when it is an honest retry of a batch some owner
     /// already fenced and made visible, so the ingress can acknowledge it with
     /// no first commit instead of queueing it behind fresh writes.

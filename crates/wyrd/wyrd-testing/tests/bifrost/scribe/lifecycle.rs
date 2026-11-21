@@ -21,8 +21,8 @@ use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
 use wyrd_testing::verification::VerificationFixture;
 
 use super::support::{
-    append_values, await_persistence_drained, endpoint_client, published_rows, read_sql,
-    register_table, sorted_values, tenant_client, tenant_key, unique_table,
+    INGEST_BUSY, append_values, await_persistence_drained, endpoint_client, published_rows,
+    read_sql, register_table, sorted_values, tenant_client, tenant_key, unique_table,
 };
 
 /// Retention the idle-publication case configures.
@@ -1048,6 +1048,144 @@ async fn delete_handed_off_receipt(
     .expect("the handed-off receipts are deleted");
     conn.commit().await.expect("the deletion commits");
     assert!(!deleted.is_empty(), "the handed-off receipt is deleted");
+}
+
+/// Longest a receipt-cleanup case waits for the pod's own cleaner.
+///
+/// Its scheduled cadence, with headroom for the sweep itself.
+const CLEANUP_DEADLINE: Duration = Duration::from_secs(60);
+
+/// The pod deletes its own aged receipts, and refuses fresh writes as
+/// retryable busy while it cannot, without losing reads or accepted rows.
+///
+/// An accepted, published batch's receipt is aged past recent retry history.
+/// The pod's background cleaner deletes it without any test-driven deletion,
+/// and the same batch id is then accepted again as a new batch. With receipt
+/// deletion revoked the cleaner fails: fresh appends are refused with the
+/// retryable busy code while the accepted rows stay readable. Granting
+/// deletion again lets the cleaner recover and the pod admit again.
+///
+/// # Panics
+///
+/// Panics when the cluster cannot start, an accepted append or a read fails,
+/// the cleaner does not delete the aged receipt, a refusal carries another
+/// code, or admission does not stop and resume within [`CLEANUP_DEADLINE`].
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn receipt_cleanup_failure_pauses_fresh_writes_until_it_recovers() {
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed())
+        .await
+        .expect("the one-pod mixed cluster starts");
+    let tenant = cluster.data_tenant_id();
+    let name = unique_table("receipt_cleanup");
+    let server = cluster.server(0).expect("the mixed pod is running");
+    register_table(server, tenant, BifrostNamespace::Datasets, &name).await;
+    let table = format!("{}.{name}", BifrostNamespace::Datasets.as_str());
+    let probe_name = unique_table("receipt_cleanup_probe");
+    register_table(server, tenant, BifrostNamespace::Datasets, &probe_name).await;
+    let probe = format!("{}.{probe_name}", BifrostNamespace::Datasets.as_str());
+    let pool = cluster
+        .pg_fixture()
+        .superuser_pool()
+        .expect("fixture exposes a superuser pool");
+    let client = tenant_client(server, tenant).await;
+    let batch_id = Uuid::now_v7();
+    let values: Vec<i64> = (0..24).collect();
+    append_values(&client, &table, batch_id, &values)
+        .await
+        .expect("the batch is accepted");
+    server.flush_bifrost().await.expect("the batch publishes");
+    sqlx::query(
+        "UPDATE vala.scribe_batch_commits SET ingested_at = ingested_at - interval '2 hours' \
+          WHERE data_tenant_id = $1 AND batch_id = $2",
+    )
+    .bind(tenant.as_uuid())
+    .bind(batch_id)
+    .execute(&pool)
+    .await
+    .expect("the receipt ages past retry history");
+
+    let deadline = tokio::time::Instant::now() + CLEANUP_DEADLINE;
+    loop {
+        let (left,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM vala.scribe_batch_commits \
+              WHERE data_tenant_id = $1 AND batch_id = $2",
+        )
+        .bind(tenant.as_uuid())
+        .bind(batch_id)
+        .fetch_one(&pool)
+        .await
+        .expect("receipts read");
+        if left == 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the pod's cleaner never deleted the aged, handed-off receipt"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    append_values(&client, &table, batch_id, &values)
+        .await
+        .expect("a batch id whose receipt is gone is accepted as a new batch");
+    server
+        .flush_bifrost()
+        .await
+        .expect("the second batch publishes");
+    let twice = [values.clone(), values.clone()].concat();
+    let mut twice_sorted = twice.clone();
+    twice_sorted.sort_unstable();
+    assert_eq!(sorted_values(&client, &table).await, twice_sorted);
+
+    sqlx::query("REVOKE DELETE ON vala.scribe_batch_commits FROM wyrd_tenant")
+        .execute(&pool)
+        .await
+        .expect("receipt deletion is revoked");
+    let deadline = tokio::time::Instant::now() + CLEANUP_DEADLINE;
+    let refusal = loop {
+        if let Err(error) = append_values(&client, &probe, Uuid::now_v7(), &[100]).await {
+            break error;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "fresh writes were still admitted after cleanup could not delete"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(
+        refusal.code(),
+        INGEST_BUSY,
+        "cleanup failure refuses as retryable busy"
+    );
+    assert_eq!(
+        sorted_values(&client, &table).await,
+        twice_sorted,
+        "accepted rows stay readable while writes are refused"
+    );
+
+    sqlx::query("GRANT DELETE ON vala.scribe_batch_commits TO wyrd_tenant")
+        .execute(&pool)
+        .await
+        .expect("receipt deletion is granted again");
+    let deadline = tokio::time::Instant::now() + CLEANUP_DEADLINE;
+    loop {
+        match append_values(&client, &probe, Uuid::now_v7(), &[100]).await {
+            Ok(()) => break,
+            Err(error) if error.code() == INGEST_BUSY => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the pod never admitted again after cleanup recovered"
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(error) => panic!("a recovered pod admits the write: {error:?}"),
+        }
+    }
+
+    cluster
+        .shutdown()
+        .await
+        .expect("the cluster drains cleanly");
 }
 
 /// Finds the file under `root` whose path ends with `suffix`.

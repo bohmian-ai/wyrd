@@ -337,8 +337,62 @@ admission. Eligible rows remain indefinitely, or writes remain admitted when the
 new cleanup obligations are failed/stale. Separately expose cache expiry and startup
 debt; do not claim a fixed row ceiling as the assertion.
 
-**Evidence:** Pending. Append focused RED/GREEN and the three benchmark checkpoint
-reports/comparisons here. Supply this accepted checkpoint to task 2.
+**Evidence:**
+
+- Reuse: deletion stays in `vala_sql::queries::scribe_batch_commits::delete_handed_off`
+  (age/count history and frontier rule unchanged). The gaps were a finite sweep
+  scope, discovery of earlier epochs' streams, and a driver, so the change adds
+  a PG-time `cutoff` with `RETURNING batch_id`, `receipt_streams` (operator pool,
+  one node, every tenant and epoch), and one `ReceiptCleaner` per Scribe
+  (`scribe/receipt_cleaner.rs`). Admission reads its `CleanupHealth`.
+- SQL cutoff and discovery — `pg_scribe_batch_commits::a_sweep_cutoff_bounds_deletion_to_receipts_accepted_before_it`
+  (RED: 2 ids deleted, expected only the one before the cutoff) and
+  `receipt_streams_of_a_node_span_tenants_and_epochs` (RED: `left: []`). GREEN 9/9.
+- Health rule — `receipt_cleaner::tests::cleanup_health_admits_only_a_fresh_completed_sweep`:
+  unverified at start; a completed sweep admits for 120 s from its *start*; an
+  older sweep finishing late renews nothing; failure refuses at once. A hung or
+  exited worker goes stale through the same aging. Passed first run (written
+  with the type, no RED).
+- Admission — `admission::tests::unhealthy_receipt_cleanup_refuses_fresh_admission`
+  (RED: the unverified start still admitted). The check is a local mutex read
+  in `try_reserve`, before any item moves; no request SQL, fsync or wait. It
+  records rejection reason `cleanup`. Already admitted work is unaffected since
+  the check exists only at reservation (structural). Existing unstaged and
+  in-flight tests still pass.
+- Sweep — `receipt_cleaner::pg_tests::a_sweep_deletes_every_due_receipt_of_the_node_and_reports_healthy`:
+  two tenants, two epochs (old-epoch debt), DELETE batches of 2 over 5 due
+  rows; receipts above the frontier, in a shard without a frontier (pinned)
+  and of another node stay; deleted batches leave the mirror (`forget`) and
+  kept ones stay; health admits after. `a_failed_sweep_is_unhealthy_until_a_later_sweep_completes`:
+  empty scope succeeds; revoked DELETE fails the sweep and refuses; re-grant
+  and the next sweep deletes and admits. Mirror entries are forgotten before
+  the DELETE commits, so an ambiguous commit only forgets too much and the
+  next sweep reconciles.
+- Wakes and restart: `WalWriter` notifies after any persisted frontier
+  advance (coalesced `Notify`); the loop also sweeps every 30 s and retries
+  1 s after a failure, rebuilding scope from Postgres and manifests each time.
+  `replay_wal_async` runs one sweep before readiness so a restarted pod admits
+  as soon as it is ready; a failed sweep leaves it ready but busy. Sweeps are
+  serialized, so outcomes publish in boundary order. Manifests are read in one
+  `spawn_blocking` call per sweep. Shutdown stops the loop.
+- Journey — `lifecycle::receipt_cleanup_failure_pauses_fresh_writes_until_it_recovers`:
+  a published batch's receipt aged past history is deleted by the pod's own
+  cleaner with no new write (trace: `receipt sweep completed deleted=1`); the
+  same batch id is accepted again as a new batch (rows read twice); with
+  DELETE revoked fresh appends return `WYRD_VALA_429_INGEST_BUSY` while
+  accepted rows read unchanged; after GRANT the pod admits again. Mutation:
+  passing `None` health to admission fails it with "fresh writes were still
+  admitted after cleanup could not delete".
+- TDD: SQL and admission scenarios had RED first. The health unit test, the
+  cleaner pg tests and the journey were written after their code: TDD
+  violation for those; the journey's strength is shown by the mutation above.
+- Not separately tested: a crash between DELETE commit and health
+  publication (health is in-memory and starts unverified, so a restart only
+  delays admission).
+- Commands: the scenario 2 command with `receipt` added to the redux filter
+  → 483/483 and 52/52; `vala-sql` `pg_scribe_batch_commits` → 9/9;
+  `mise run fmt`, `mise run lints`, `check:tenant-isolation` clean.
+- Benchmark checkpoints: skipped by maintainer direction.
 
 ## Verification and boundaries
 

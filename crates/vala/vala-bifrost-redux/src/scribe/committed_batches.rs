@@ -105,6 +105,16 @@ impl CommittedBatches {
         self.lock().batches.contains_key(&(tenant, batch_id))
     }
 
+    /// Forgets `(tenant, batch_id)` once its receipt is deleted, so a later
+    /// batch with that id is decided by the durable fence, never by the
+    /// former acceptance.
+    pub(crate) fn forget(&self, tenant: DataTenantId, batch_id: Uuid) {
+        let mut inner = self.lock();
+        if inner.batches.remove(&(tenant, batch_id)).is_some() {
+            inner.order.retain(|key| *key != (tenant, batch_id));
+        }
+    }
+
     /// Takes the lock, recovering the map if a holder panicked; every update
     /// leaves it consistent, and a stale entry only routes a resend to the
     /// shard path.

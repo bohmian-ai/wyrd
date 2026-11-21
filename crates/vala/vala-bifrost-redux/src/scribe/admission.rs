@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::contracts::ScribeError;
 use crate::resources::ScribeResources;
+use crate::scribe::receipt_cleaner::CleanupHealth;
 
 /// Fixed request overhead charged to every accepted append.
 pub const REQUEST_OVERHEAD_BYTES: usize = 4 * 1024;
@@ -56,6 +57,8 @@ struct AdmissionInner {
     items: Mutex<usize>,
     /// Shared memory root whose poison refuses new work.
     memory: ScribeResources,
+    /// Receipt cleanup health; `None` where no receipts are written.
+    cleanup: Option<Arc<CleanupHealth>>,
 }
 
 /// Pod-global admission controller.
@@ -87,11 +90,23 @@ impl AdmissionController {
     /// Construct admission with the already-resolved process-wide governor.
     #[must_use]
     pub fn with_config_and_memory(config: AdmissionConfig, memory: ScribeResources) -> Self {
+        Self::with_cleanup(config, memory, None)
+    }
+
+    /// Construct admission that also refuses fresh writes while `cleanup` is
+    /// not current; `None` checks no cleanup health.
+    #[must_use]
+    pub(crate) fn with_cleanup(
+        config: AdmissionConfig,
+        memory: ScribeResources,
+        cleanup: Option<Arc<CleanupHealth>>,
+    ) -> Self {
         Self {
             inner: Arc::new(AdmissionInner {
                 config,
                 items: Mutex::new(0),
                 memory,
+                cleanup,
             }),
         }
     }
@@ -101,8 +116,9 @@ impl AdmissionController {
     /// # Errors
     ///
     /// Returns [`ScribeError::IngestBusy`] naming `table` when the pod already
-    /// holds [`GLOBAL_INFLIGHT_ITEMS`] requests or the unstaged backlog has
-    /// reached [`AdmissionConfig::immutable_limit_bytes`], and
+    /// holds [`GLOBAL_INFLIGHT_ITEMS`] requests, the unstaged backlog has
+    /// reached [`AdmissionConfig::immutable_limit_bytes`], or receipt cleanup
+    /// has no current completed sweep, and
     /// [`ScribeError::Internal`] when the shared memory root is poisoned or
     /// the item lock is poisoned.
     pub fn try_reserve(
@@ -112,6 +128,17 @@ impl AdmissionController {
         if self.inner.memory.is_poisoned() {
             return Err(ScribeError::Internal {
                 detail: "memory accounting poisoned; restart required".to_owned(),
+            });
+        }
+        if self
+            .inner
+            .cleanup
+            .as_ref()
+            .is_some_and(|cleanup| !cleanup.admits(std::time::Instant::now()))
+        {
+            super::record_scribe_rejection("cleanup");
+            return Err(ScribeError::IngestBusy {
+                table: table.into(),
             });
         }
         if self
@@ -249,6 +276,8 @@ mod tests {
     use super::{AdmissionController, GLOBAL_INFLIGHT_ITEMS};
     use crate::contracts::ScribeError;
     use crate::resources::ScribeMemoryCategory;
+    use crate::scribe::receipt_cleaner::CleanupHealth;
+    use std::sync::Arc;
 
     /// Admission bounds only in-flight items; the shared root alone owns
     /// bytes. A request as large as the shared cap is charged once at the root
@@ -332,6 +361,37 @@ mod tests {
         admission
             .try_reserve("wyrd.unstaged")
             .expect("a staged backlog admits again");
+    }
+
+    /// Fresh writes are refused as retryable busy until a receipt sweep
+    /// completes, and again once cleanup fails, before any item moves.
+    #[test]
+    fn unhealthy_receipt_cleanup_refuses_fresh_admission() {
+        let health = Arc::new(CleanupHealth::default());
+        let config = super::AdmissionConfig::default();
+        let admission = AdmissionController::with_cleanup(
+            config,
+            super::super::embedded_scribe_resources(config),
+            Some(Arc::clone(&health)),
+        );
+        assert!(matches!(
+            admission.try_reserve("wyrd.cleanup"),
+            Err(ScribeError::IngestBusy { .. })
+        ));
+        assert_eq!(admission.snapshot().items, 0);
+
+        health.covered(std::time::Instant::now());
+        drop(
+            admission
+                .try_reserve("wyrd.cleanup")
+                .expect("a completed sweep admits"),
+        );
+
+        health.failed();
+        assert!(matches!(
+            admission.try_reserve("wyrd.cleanup"),
+            Err(ScribeError::IngestBusy { .. })
+        ));
     }
 
     /// A poisoned shared root refuses new admission before any item moves.

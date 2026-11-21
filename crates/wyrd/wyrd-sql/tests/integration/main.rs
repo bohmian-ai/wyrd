@@ -16,6 +16,7 @@ mod pg_login_state;
 mod pg_migration;
 mod pg_operator_connections;
 mod pg_platform_identity;
+mod pg_platform_social;
 mod pg_query_compile;
 mod pg_tenant_slug;
 mod pg_verification_bindings;

@@ -9,6 +9,7 @@ use wyrd_auth::authority::AuthorityCache;
 use wyrd_auth::connections::HumanConnections;
 use wyrd_auth::issuance::{TenantTokenIssuer, TokenExchangeSettings};
 use wyrd_auth::platform_login::PlatformLogin;
+use wyrd_auth::social::SocialSignIn;
 use wyrd_auth_verify::{ExternalVerifier, TokenVerifier};
 
 use crate::auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
@@ -44,6 +45,10 @@ pub struct ServerAuth {
     /// platform plane and a signing key exist. The begin and callback routes
     /// share it, and with it one relying-party provider cache.
     pub platform_login: Option<PlatformLogin>,
+    /// The shared social sign-in owner, built once at boot when the platform
+    /// plane exists. Operator provider management, the social callbacks and
+    /// the login-method listing share it and its provider cache.
+    pub social_sign_in: Option<SocialSignIn>,
     /// TTL and delegation settings for token exchange responses.
     pub token_exchange_settings: TokenExchangeSettings,
     /// RBAC permission evaluator; an embedding deployment may supply its own
@@ -67,6 +72,7 @@ impl Default for ServerAuth {
             sealing_key: None,
             human_connections: None,
             platform_login: None,
+            social_sign_in: None,
             token_exchange_settings: TokenExchangeSettings::default(),
             permission_check: Arc::new(RbacCheck),
             authority: Arc::default(),

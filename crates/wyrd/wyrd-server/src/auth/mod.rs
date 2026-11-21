@@ -7,6 +7,7 @@ pub mod jwt_bearer;
 pub mod metadata;
 pub mod oauth;
 pub mod revoke;
+pub mod social;
 
 pub(crate) use wyrd_auth::card_scope;
 pub use wyrd_auth::seed;

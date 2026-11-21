@@ -44,6 +44,7 @@ use wyrd_auth::issuance::TokenExchangeSettings;
 use wyrd_auth::platform_login::PlatformLogin;
 use wyrd_auth::platform_sessions::PlatformSessions;
 use wyrd_auth::sealing::SealedSecretRewrap;
+use wyrd_auth::social::SocialSignIn;
 use wyrd_auth_oidc::WorkloadBinding;
 use wyrd_auth_verify::WyrdAuthVerifySettings;
 use wyrd_crypt::{SealingKeyring, SecretKey};
@@ -1690,6 +1691,11 @@ fn install_auth(
 /// here rather than in [`install_auth`]. One owner of each serves every
 /// login, so its provider cache outlives a request. Platform login needs the
 /// cross-tenant boundary and an issuing key; without either it stays unset.
+/// Shared social sign-in needs only the cross-tenant boundary.
+///
+/// # Panics
+/// Panics when `[social]` does not resolve, which configuration validation
+/// already refused before boot.
 fn attach_human_logins(
     auth: &mut ServerAuth,
     postgres: &ServerPostgres,
@@ -1703,6 +1709,17 @@ fn attach_human_logins(
         config.deployment_profile.screened_http(),
         Arc::clone(bifrost.scribe_outbox()) as _,
     ));
+    auth.social_sign_in = postgres.operator_pool().map(|pool| {
+        SocialSignIn::new(
+            pool,
+            sealing_key.clone(),
+            config.deployment_profile.screened_http(),
+            config
+                .social
+                .resolve(config.deployment_profile.is_production())
+                .expect("invariant: configuration validation resolved [social]"),
+        )
+    });
     auth.platform_login =
         postgres
             .operator_pool()

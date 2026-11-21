@@ -534,6 +534,7 @@ pub struct WyrdTestServerBuilder {
     bind_addrs: Option<(std::net::SocketAddr, std::net::SocketAddr)>,
     /// The loopback GitHub this server's App is configured against.
     github: Option<crate::github::GithubAppMock>,
+    social: Option<wyrd_server::config::SocialConfig>,
     /// Optional production-shaped Oracle server identity and peer trust paths.
     /// Peer identity for this server; provisioned by the builder when absent.
     peer_tls: Option<TestBifrostPeerTls>,
@@ -698,6 +699,7 @@ impl Default for WyrdTestServerBuilder {
             telemetry: None,
             bind_addrs: None,
             github: None,
+            social: None,
             peer_tls: None,
             peer_tls_root: None,
             peer_bind: None,
@@ -4802,6 +4804,18 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Point the server's shared social sign-in at controlled local providers.
+    ///
+    /// Without it the server talks to the real providers, as in production.
+    #[must_use]
+    pub fn with_social_endpoints_for_test(
+        mut self,
+        social: wyrd_server::config::SocialConfig,
+    ) -> Self {
+        self.social = Some(social);
+        self
+    }
+
     /// Register the test-support MCP context probe in this server's `/mcp`
     /// tool catalog.
     ///
@@ -5602,6 +5616,9 @@ impl WyrdTestServerBuilder {
         }
         if let Some(endpoints) = self.gateway_endpoints {
             config.gateway.endpoints = endpoints;
+        }
+        if let Some(social) = &self.social {
+            config.social = social.clone();
         }
         if let Some(limits) = self.limits {
             config.limits = wyrd_server::config::LimitsConfig {

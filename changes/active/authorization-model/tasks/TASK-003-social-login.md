@@ -109,6 +109,57 @@ identity and UI test owners below. Initially fail on absent shared provider
 management/method projection. Inspect sealed storage and secret-free responses;
 provider setup must not replace the tenant connection or create tenant grants.
 
+**Evidence (HTTP, SQL):**
+
+- Owners extended: platform authorization/audit helpers in
+  `components/platform/identity.rs` (`authorize`, `authorize_read`,
+  `commit_decision`), the sealing keyring, and the relying party already used
+  for company and platform OIDC. The new pieces are the `SocialSignIn` owner in
+  `wyrd-auth/src/social.rs`, the platform routes in `components/platform/social.rs`,
+  and the anonymous `/auth/social/{provider}/callback` and `/auth/browser/methods`
+  in `wyrd-server/src/auth/social.rs`. Contracts live in
+  `wyrd-spec/src/auth/social.rs`, and `[social]` endpoint overrides are refused
+  in production (`config.rs::SocialConfig`). The migration is
+  `20261121000000_social_providers.sql` and cites spec "Persistence and
+  authority changes". It adds platform provider records, operator test state and
+  login settings, each with ENABLE+FORCE RLS and an `operator_access` policy. It
+  adds no SQL function.
+- Journey: `platform_admin_e2e::an_operator_configures_and_tests_google_beside_company_sso`
+  (`tests/integration/platform_admin_e2e.rs`, end of file). It asserts:
+  - Before configuration, methods are `{password:true, company_sso:true, providers:[], signup:false}`.
+  - Every provider is unconfigured, and the defaults are password enabled and signup disabled.
+  - Configuring returns the exact callback `http://wyrd.test/auth/social/google/callback`
+    with revision 1, untested, and no secret.
+  - The stored envelope does not contain the plaintext.
+  - Enabling an untested revision returns 409, and testing a stale revision returns 409.
+  - The authorization URL has the configured client and callback, and scope `openid profile email`.
+  - The controlled-OIDC callback passes, and a replay returns 401.
+  - After enabling, a second replica lists revision 1 as enabled with no secret, and methods list
+    `["google"]` beside company SSO.
+  - A tenant admin's shared write returns 401, while their `/v1/identity/oidc/connections`
+    read still returns 200 with the Active connection.
+  - A platform session's tenant candidate write returns 401.
+  - The `wyrd.auth_role_bindings` count is unchanged.
+- SQL: `pg_platform_social::pg_tests::{a_test_of_a_replaced_revision_certifies_nothing,
+  the_tenant_role_cannot_reach_shared_providers}` (`wyrd-sql/tests/integration/pg_platform_social.rs`).
+  They show that a replaced client gets a new untested revision and that a stale stamp
+  is refused. A tenant session sees no provider and changes no login setting.
+- Commands:
+  - `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-server --test integration -E "test(/^pg_openapi_contract::/) | test(/^platform_admin_e2e::/)" --no-fail-fast'`:
+    GREEN, 66 passed. Migration idempotence also passed.
+  - `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-sql --test integration -E "test(/^pg_platform_social::/)"'`:
+    GREEN, 2 passed.
+  - `mise run fmt`, `mise run lints`, `mise run codegen:check`,
+    `mise run check:tenant-isolation` and `git diff --check`: clean.
+- RED: not observed. Production code was written before this test, so cycle 1
+  is a **TDD process violation**. The journey was GREEN on its first run.
+- **Open, operator UI:** no platform administration UI exists, and approved
+  browser sessions are tenant-only ("First-party browser sessions"; Node owns
+  no credential). The spec requires a "platform UI" (REQ-011), but a browser-held
+  operator credential would be a new credential purpose. The operator-UI half
+  of this entry and its UI journey therefore remain **FAIL** pending a maintainer
+  decision.
+
 ### 2. Google proves a bound login without admitting a stranger
 
 **Maps to:** REQ-012; AC-004.

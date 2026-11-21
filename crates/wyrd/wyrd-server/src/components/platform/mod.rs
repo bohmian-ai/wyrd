@@ -27,7 +27,9 @@ pub mod identity;
 pub mod provisioning;
 pub mod recovery;
 pub mod routes;
+pub mod social;
 
 pub use credentials::platform_credentials_router;
 pub use identity::{platform_identity_router, platform_login_router};
 pub use routes::{platform_auth_router, platform_router};
+pub use social::platform_social_router;

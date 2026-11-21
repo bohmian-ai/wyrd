@@ -66,6 +66,8 @@ pub fn auth_router() -> OpenApiRouter<AppState> {
         .routes(routes!(crate::auth::browser::password_login))
         .routes(routes!(crate::auth::browser::password_change))
         .routes(routes!(crate::auth::browser::password_reset))
+        .routes(routes!(crate::auth::social::methods))
+        .routes(routes!(crate::auth::social::callback))
         .routes(routes!(callback))
         .routes(routes!(token))
 }

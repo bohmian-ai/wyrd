@@ -30,6 +30,7 @@ pub mod roles;
 pub mod sealing;
 pub mod seed;
 pub mod service_accounts;
+pub mod social;
 
 pub use callback::AuthorizationCodeExchange;
 pub use exchange_api_key::{DelegateToken, ExchangeApiKey};

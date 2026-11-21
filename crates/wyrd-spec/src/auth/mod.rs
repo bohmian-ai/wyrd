@@ -14,6 +14,7 @@ mod principal_id;
 mod principal_kind;
 mod revoke;
 mod secret_bearer;
+mod social;
 mod tenant_admin;
 mod tenant_principals;
 mod token;
@@ -63,6 +64,12 @@ pub use principal_id::{PLATFORM_AUDIT_PRINCIPAL, PrincipalId};
 pub use principal_kind::PrincipalKindTag;
 pub use revoke::{REASON_MAX_BYTES, RevokePrincipalRequest};
 pub use secret_bearer::SecretBearer;
+pub use social::{
+    ConfigureSocialProviderRequest, EnableSocialProviderRequest, LoginMethodsQuery,
+    LoginMethodsResponse, LoginSettings, SocialProvider, SocialProviderState,
+    SocialProviderTestRequest, SocialProviderTestResponse, SocialProviderView,
+    SocialProvidersResponse,
+};
 pub use tenant_admin::{
     CreateTenantRequest, CreateTenantResponse, ProvisionedTenant, ProvisionedTenantAdmin,
     RecoverTenantAdminRequest, SetTenantStatusRequest, TenantListResponse,

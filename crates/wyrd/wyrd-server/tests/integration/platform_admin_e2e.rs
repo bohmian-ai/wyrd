@@ -5412,3 +5412,354 @@ async fn the_benchmark_control_exists_only_in_a_bench_build() {
         }
     }
 }
+
+/// Host every shared social sign-in request names, so callbacks derive from
+/// one public origin.
+const SOCIAL_HOST: &str = "wyrd.test";
+
+/// Build a request at [`SOCIAL_HOST`] carrying `token`, when given.
+fn social_request(
+    method: Method,
+    uri: &str,
+    token: Option<&str>,
+    body: Option<Value>,
+) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::HOST, SOCIAL_HOST);
+    if let Some(token) = token {
+        builder = builder.header(WYRD_ACCESS_TOKEN_HEADER, format!("Bearer {token}"));
+    }
+    match body {
+        Some(body) => builder
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&body).expect("serializes")))
+            .expect("request builds"),
+        None => builder.body(Body::empty()).expect("request builds"),
+    }
+}
+
+/// Send `request` and read its status and JSON body (`Null` when not JSON).
+async fn social_call(srv: &WyrdTestServer, request: Request<Body>) -> (StatusCode, Value) {
+    let resp = srv.oneshot(request).await.expect("route responds");
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .expect("read body");
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// An operator configures Google beside a tenant's company SSO, tests the
+/// exact stored revision through a real provider sign-in and only then
+/// enables it:
+///   1. with no social configuration the tenant page offers company SSO and
+///      password, no provider and no signup; every provider is unconfigured;
+///   2. storing the client returns the exact registration callback and an
+///      untested revision, never the secret, and the secret is sealed at rest;
+///   3. an untested revision cannot be enabled, and a test of a stale
+///      revision is refused;
+///   4. the test sign-in at the provider marks exactly that revision tested,
+///      and a replayed test return is refused;
+///   5. once enabled, another replica reads the same tested revision and the
+///      tenant page offers Google beside company SSO;
+///   6. a tenant administrator cannot write the shared configuration but
+///      still manages their own connection, a platform session cannot change
+///      tenant settings, and provider setup created no tenant grant.
+#[tokio::test]
+async fn an_operator_configures_and_tests_google_beside_company_sso() {
+    let google = wiremock::MockServer::start().await;
+    let srv = WyrdTestServer::builder()
+        .with_social_endpoints_for_test(wyrd_server::config::SocialConfig {
+            google_issuer: Some(google.uri()),
+        })
+        .start_in_process()
+        .await
+        .expect("server starts");
+    mount_platform_provider(
+        &google,
+        platform_key_set("google-key"),
+        wiremock::ResponseTemplate::new(500),
+    )
+    .await;
+    let root = initialize_platform_root(&srv)
+        .await
+        .expect("deployment initializes");
+    let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
+    let tenant = srv.data_tenant_id();
+    let slug = srv.pg_fixture().tenant_slug().to_owned();
+    let mut conn = srv
+        .tenant_conn_for(tenant)
+        .await
+        .expect("tenant conn opens");
+    wyrd_dev_fixtures::pg::seed_active_human_connection(&mut conn)
+        .await
+        .expect("company connection seeds");
+    conn.commit().await.expect("seed commits");
+    let admin = srv
+        .bootstrap_service_in_tenant(tenant, "social-tenant-admin", &["admin"])
+        .await
+        .expect("tenant admin bootstraps");
+    let admin = srv
+        .exchange_api_key(admin.api_key().expect("admin has an api key"))
+        .await
+        .expect("admin key exchanges");
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    let grants_before: i64 = sqlx::query_scalar("SELECT count(*) FROM wyrd.auth_role_bindings")
+        .fetch_one(&superuser)
+        .await
+        .expect("grants count");
+    let methods = format!("/auth/browser/methods?tenant={slug}");
+
+    // 1. Nothing social is offered before configuration.
+    let (status, offered) =
+        social_call(&srv, social_request(Method::GET, &methods, None, None)).await;
+    assert_eq!(status, StatusCode::OK, "methods list: {offered}");
+    assert_eq!(
+        offered,
+        json!({ "password": true, "company_sso": true, "providers": [], "signup": false }),
+        "password starts enabled, signup disabled, and no social button appears"
+    );
+    let (status, listed) = social_call(
+        &srv,
+        social_request(
+            Method::GET,
+            "/platform/social/providers",
+            Some(&session),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "providers list: {listed}");
+    assert_eq!(listed["providers"][0]["provider"], "google");
+    assert_eq!(
+        listed["providers"][0]["state"],
+        Value::Null,
+        "Google is unconfigured"
+    );
+    assert_eq!(listed["providers"][1]["provider"], "github");
+    let (status, settings) = social_call(
+        &srv,
+        social_request(
+            Method::GET,
+            "/platform/login-settings",
+            Some(&session),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        settings,
+        json!({ "password_enabled": true, "signup_enabled": false })
+    );
+
+    // 2. Storing the client discloses the callback and never the secret.
+    let secret = "google-client-secret-value";
+    let (status, stored) = social_call(
+        &srv,
+        social_request(
+            Method::PUT,
+            "/platform/social/providers/google",
+            Some(&session),
+            Some(json!({ "client_id": "wyrd-google", "client_secret": secret })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "Google configures: {stored}");
+    assert_eq!(
+        stored["callback_url"],
+        "http://wyrd.test/auth/social/google/callback"
+    );
+    assert_eq!(stored["revision"], 1);
+    assert_eq!(stored["state"], "untested");
+    assert!(
+        !stored.to_string().contains(secret),
+        "no secret in a response: {stored}"
+    );
+    let sealed: Vec<u8> = sqlx::query_scalar(
+        "SELECT client_secret_enc FROM platform.social_providers WHERE provider = 'google'",
+    )
+    .fetch_one(&superuser)
+    .await
+    .expect("sealed secret reads");
+    assert!(
+        !sealed
+            .windows(secret.len())
+            .any(|window| window == secret.as_bytes()),
+        "the client secret is sealed at rest"
+    );
+
+    // 3. Untested and stale revisions are refused.
+    let enable = |revision: u64| {
+        social_request(
+            Method::PUT,
+            "/platform/social/providers/google/enabled",
+            Some(&session),
+            Some(json!({ "enabled": true, "expected_revision": revision })),
+        )
+    };
+    let (status, refused) = social_call(&srv, enable(1)).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "untested Google cannot be enabled: {refused}"
+    );
+    let (status, _) = social_call(
+        &srv,
+        social_request(
+            Method::POST,
+            "/platform/social/providers/google/test",
+            Some(&session),
+            Some(json!({ "expected_revision": 2 })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a revision that is not current is not tested"
+    );
+
+    // 4. A real provider sign-in tests exactly revision 1.
+    let (status, begun) = social_call(
+        &srv,
+        social_request(
+            Method::POST,
+            "/platform/social/providers/google/test",
+            Some(&session),
+            Some(json!({ "expected_revision": 1 })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "test begins: {begun}");
+    let authorization = url::Url::parse(begun["authorization_url"].as_str().expect("url"))
+        .expect("authorization url parses");
+    let query: std::collections::HashMap<_, _> = authorization.query_pairs().into_owned().collect();
+    assert_eq!(query["client_id"], "wyrd-google");
+    assert_eq!(
+        query["redirect_uri"],
+        "http://wyrd.test/auth/social/google/callback"
+    );
+    assert_eq!(
+        query["scope"], "openid profile email",
+        "only the agreed Google scopes"
+    );
+    mount_platform_provider(
+        &google,
+        platform_key_set("google-key"),
+        platform_token_reply(&google.uri(), &query["nonce"], "wyrd-google", "google-key"),
+    )
+    .await;
+    let callback = format!(
+        "/auth/social/google/callback?code=provider-code&state={}&iss={}",
+        query["state"],
+        url::form_urlencoded::byte_serialize(google.uri().as_bytes()).collect::<String>()
+    );
+    let (status, _) = social_call(&srv, social_request(Method::GET, &callback, None, None)).await;
+    assert_eq!(status, StatusCode::OK, "the provider test passes");
+    let (status, _) = social_call(&srv, social_request(Method::GET, &callback, None, None)).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a replayed test return is refused"
+    );
+
+    // 5. The tested revision enables and every replica serves it.
+    let (status, enabled) = social_call(&srv, enable(1)).await;
+    assert_eq!(status, StatusCode::OK, "tested Google enables: {enabled}");
+    assert_eq!(enabled["state"], "enabled");
+    let replica = srv
+        .start_replica(WyrdTestServer::builder())
+        .await
+        .expect("replica starts");
+    let (status, listed) = social_call(
+        &replica,
+        social_request(
+            Method::GET,
+            "/platform/social/providers",
+            Some(&session),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "replica lists providers: {listed}");
+    assert_eq!(listed["providers"][0]["revision"], 1);
+    assert_eq!(listed["providers"][0]["state"], "enabled");
+    assert!(
+        !listed.to_string().contains(secret),
+        "no secret in a read: {listed}"
+    );
+    let (_, offered) =
+        social_call(&replica, social_request(Method::GET, &methods, None, None)).await;
+    assert_eq!(
+        offered,
+        json!({ "password": true, "company_sso": true, "providers": ["google"], "signup": false }),
+        "Google is offered beside company SSO"
+    );
+
+    // 6. Each control plane stays on its own side.
+    let (status, _) = social_call(
+        &srv,
+        social_request(
+            Method::PUT,
+            "/platform/social/providers/google",
+            Some(&admin),
+            Some(json!({ "client_id": "attacker", "client_secret": "attacker" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a tenant admin cannot write shared config"
+    );
+    let (status, connections) = social_call(
+        &srv,
+        social_request(
+            Method::GET,
+            "/v1/identity/oidc/connections",
+            Some(&admin),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the tenant admin manages their connection: {connections}"
+    );
+    assert!(
+        connections.to_string().contains("Active"),
+        "the company connection is untouched: {connections}"
+    );
+    let (status, _) = social_call(
+        &srv,
+        social_request(
+            Method::PUT,
+            "/v1/identity/oidc/candidate",
+            Some(&session),
+            Some(json!({ "issuer_url": "https://idp.example", "client_id": "x" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a platform session cannot change tenant settings"
+    );
+    let grants_after: i64 = sqlx::query_scalar("SELECT count(*) FROM wyrd.auth_role_bindings")
+        .fetch_one(&superuser)
+        .await
+        .expect("grants count");
+    assert_eq!(
+        grants_after, grants_before,
+        "provider setup creates no tenant grant"
+    );
+}

@@ -2450,6 +2450,45 @@ impl OperatorKeysConfig {
     }
 }
 
+/// Shared social sign-in provider endpoints (`[social]`).
+///
+/// Every field is optional and defaults to the real provider. Development and
+/// tests name controlled local providers; production refuses any override, so
+/// a shared social client is only ever redeemed at the real provider.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SocialConfig {
+    /// Google's OpenID Connect issuer; `https://accounts.google.com` when
+    /// unset, and only that in production.
+    #[serde(default)]
+    pub google_issuer: Option<String>,
+}
+
+impl SocialConfig {
+    /// Resolve the provider endpoints this deployment talks to.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::Invalid`] when an override is not an issuer URL
+    /// or is set in production.
+    pub fn resolve(
+        &self,
+        production: bool,
+    ) -> Result<wyrd_auth::social::SocialEndpoints, ConfigError> {
+        let invalid = |message: &str| ConfigError::Invalid {
+            message: format!("social: {message}"),
+        };
+        let mut endpoints = wyrd_auth::social::SocialEndpoints::default();
+        if let Some(issuer) = &self.google_issuer {
+            if production {
+                return Err(invalid("google_issuer cannot be overridden in production"));
+            }
+            endpoints.google_issuer = wyrd_spec::auth::IssuerUrl::new(issuer)
+                .map_err(|_| invalid("google_issuer is not an issuer URL"))?;
+        }
+        Ok(endpoints)
+    }
+}
+
 /// The deployment's GitHub App (`[github]`, `WYRD_GITHUB_*`).
 ///
 /// Optional: when every field is unset the GitHub integration is unavailable
@@ -2888,6 +2927,9 @@ pub struct WyrdServerConfig {
     /// The deployment's optional GitHub App.
     #[serde(default)]
     pub github: GithubConfig,
+    /// Shared social sign-in provider endpoints.
+    #[serde(default)]
+    pub social: SocialConfig,
 }
 
 impl WyrdServerConfig {
@@ -3908,6 +3950,8 @@ impl WyrdServerConfig {
         self.gateway
             .validate(self.deployment_profile.is_production())?;
         self.github
+            .resolve(self.deployment_profile.is_production())?;
+        self.social
             .resolve(self.deployment_profile.is_production())?;
         let serves_api = self.role.serves_api();
         if serves_api {

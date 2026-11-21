@@ -11,12 +11,18 @@
 //! tenant without company SSO.
 
 use axum::Json;
-use axum::extract::{Path, Query, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::extract::{Extension, Path, Query, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
+use wyrd_auth::callback::LoginCompletion;
 use wyrd_spec::auth::{CallbackQuery, LoginMethodsQuery, LoginMethodsResponse, SocialProvider};
 use wyrd_spec::error::{WyrdError, WyrdProblem};
+use wyrd_spec::request_id::RequestId;
 
+use crate::auth::RequestOrigin;
+use crate::auth::browser::{
+    SOCIAL_LOGIN_COOKIE_PATH, browser_sessions, login_binding, login_refused, signed_in,
+};
 use crate::components::platform::social::social;
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
@@ -64,12 +70,16 @@ pub async fn methods(
 /// Finish a sign-in the shared provider returned to its fixed callback.
 ///
 /// An operator provider test marks its exact revision tested and answers a
-/// short page the operator can close.
+/// short page the operator can close. A tenant sign-in completes only for the
+/// browser that began it
+/// ([`wyrd_auth::browser_sessions::BrowserSessions::complete_social`]); a refusal
+/// sends the browser back to the tenant's sign-in page, with account guidance
+/// when the provider identity belongs to no User there.
 ///
 /// # Errors
-/// Returns `401` when the transaction is unknown, expired, replayed or fails
-/// verification, `404` for an unknown provider, and `503` when the provider
-/// or store is unavailable.
+/// Returns `400` when the state names no pending sign-in, `401` when a
+/// provider test fails verification, `404` for an unknown provider, and
+/// `503` when the provider or store is unavailable.
 #[utoipa::path(
     get,
     path = "/auth/social/{provider}/callback",
@@ -83,8 +93,10 @@ pub async fn methods(
     ),
     responses(
         (status = 200, description = "The provider test passed", content_type = "text/html", body = String),
-        (status = 400, description = "Malformed provider return (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
-        (status = 401, description = "Unknown, expired, replayed or unverifiable sign-in \
+        (status = 303, description = "A tenant sign-in was refused; back to its sign-in page"),
+        (status = 400, description = "Malformed return, or a state naming no pending sign-in \
+          (WYRD_SPEC_400_VALIDATION, WYRD_AUTH_400_INVALID_STATE)", body = WyrdProblem),
+        (status = 401, description = "A provider test failed verification \
           (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
         (status = 404, description = "Not a shared provider (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem),
         (status = 503, description = "The provider or store is unavailable \
@@ -93,10 +105,13 @@ pub async fn methods(
     security(()),
     tag = "Auth"
 )]
-#[tracing::instrument(level = "info", skip(state, query))]
+#[tracing::instrument(level = "info", skip(state, origin, headers, query, id))]
 pub async fn callback(
     State(state): State<AppState>,
+    RequestOrigin(origin): RequestOrigin,
     Path(name): Path<String>,
+    headers: HeaderMap,
+    id: Option<Extension<RequestId>>,
     Query(query): Query<CallbackQuery>,
 ) -> Result<Response, WyrdErrorResponse> {
     let provider = SocialProvider::parse(&name).ok_or_else(|| {
@@ -106,7 +121,8 @@ pub async fn callback(
         })
     })?;
     let response = query.response()?;
-    if social(&state)?
+    let social = social(&state)?;
+    if social
         .complete_test(provider, response, &query.state, query.iss.as_deref())
         .await?
     {
@@ -120,8 +136,28 @@ pub async fn callback(
         *page.status_mut() = StatusCode::OK;
         return Ok(page);
     }
-    Err(WyrdErrorResponse::from(WyrdError::InvalidToken {
-        message: "this sign-in has expired or was already used; start again".to_owned(),
-        details: serde_json::json!({}),
-    }))
+    let request_id = id.map_or_else(RequestId::now_v7, |Extension(id)| id);
+    match browser_sessions(&state)?
+        .complete_social(
+            social,
+            provider,
+            &query,
+            login_binding(&headers).as_deref(),
+            &request_id.to_string(),
+        )
+        .await?
+    {
+        Some(LoginCompletion::SignedIn(created)) => {
+            signed_in(&state, &origin, &created, SOCIAL_LOGIN_COOKIE_PATH).await
+        }
+        Some(LoginCompletion::Refused { tenant_id, error }) => {
+            login_refused(&state, &origin, tenant_id, error, SOCIAL_LOGIN_COOKIE_PATH).await
+        }
+        Some(LoginCompletion::DeviceApproved | LoginCompletion::ConnectionTested) | None => {
+            Err(WyrdErrorResponse::from(WyrdError::InvalidState {
+                message: "this sign-in has expired or was already used; start again".to_owned(),
+                details: serde_json::json!({}),
+            }))
+        }
+    }
 }

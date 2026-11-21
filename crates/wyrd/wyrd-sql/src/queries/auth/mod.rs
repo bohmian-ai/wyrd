@@ -57,8 +57,9 @@ pub use local_passwords::{
     revoke_invitation,
 };
 pub use login_state::{
-    GithubLoginState, LoginState, bind_github_login_state, consume_github_login_state,
-    consume_login_state, insert_github_login_state, insert_login_state,
+    GithubLoginState, LoginState, SocialLoginState, bind_github_login_state,
+    consume_github_login_state, consume_login_state, consume_social_login_state,
+    insert_github_login_state, insert_login_state, insert_social_login_state,
 };
 pub use principal_directory::{
     AssignablePrincipalRow, PrincipalFilter, assignable_principal, list_assignable_principals,

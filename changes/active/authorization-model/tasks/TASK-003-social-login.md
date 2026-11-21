@@ -178,6 +178,89 @@ Initially fail because shared purpose-bound social login is absent; the existing
 company JIT path must not be used to make this pass. Assert no local side effects
 or provider-token retention, while retaining company test/device behavior.
 
+**Evidence (HTTP, SQL):**
+
+- Owners extended:
+  - `POST /auth/browser/login` gains an optional `provider`
+    (`wyrd-spec/src/auth/browser.rs::BrowserLoginRequest`). Absent, it keeps
+    company SSO.
+  - `wyrd.auth_login_state` gains `flow = 'social'` rows. They bind the purpose,
+    the exact platform provider revision and client, the browser digest, PKCE
+    and the nonce. The migration is `20261121000001_social_login_state.sql` and
+    cites "Persistence and authority changes: wyrd.auth_login_state". It adds
+    no SQL function and reuses `wyrd.auth_login_state_tenant`.
+  - `insert_social_login_state` and `consume_social_login_state` sit beside the
+    GitHub flow in `queries/auth/login_state.rs`.
+  - `BrowserSessions::{begin_social, complete_social}` live in
+    `wyrd-auth/src/social.rs`. They reuse `verify_response_issuer`,
+    `provider_refusal`, `audit_authorization_code_failure`, `user_id_by_identity`
+    and the server's `login_refused`. The company `/auth/callback` path, with its
+    `ensure_user_identity` JIT and group sync, is not called.
+  - `/auth/social/{provider}/callback` tries the operator test first, then a
+    tenant sign-in.
+  - Each callback clears only its own `wyrd_login` cookie path: `/auth/callback`
+    or `/auth/social`.
+- Journey: `platform_admin_e2e::google_proves_a_bound_login_without_admitting_a_stranger`
+  (`tests/integration/platform_admin_e2e.rs`, end of file). It asserts:
+  1. The begin request has the configured client, the social callback and scope
+     `openid profile email`, with no `access_type`. The cookie has `Path=/auth/social`.
+  2. A stranger with valid claims gets a 303 to `/t/{slug}/login?login=no_account`.
+     User, identity, session and role-binding counts are unchanged, and a replay
+     returns 400.
+  3. A pre-seeded User with the same email (`ops@example.com`) still gets
+     `no_account`.
+  4. These are each refused with `login=failed`: no cookie, another browser's
+     cookie, a foreign `iss`, a wrong nonce, a wrong audience, and an unknown
+     signing key.
+  5. A Google state presented at `/auth/callback` returns 400.
+  6. Google disabled between start and callback, completed on a second replica,
+     is refused. So is a client replaced between start and callback.
+  7. A provider outage returns 503. No row in `wyrd.auth_login_state` or
+     `platform.social_login_state` contains the provider access token.
+
+  A temporary local probe panic (reverted, not committed) read the trace. It
+  confirmed each refusal's cause in order: `INVALID_TOKEN` for no_account and
+  email, "did not begin it" twice, `INVALID_TOKEN` for the issuer,
+  `INVALID_NONCE`, the audience mismatch, the unmatched key,
+  `INVALID_TOKEN` for disabled and replaced, and `503 VERIFY_UNAVAILABLE`.
+- RED: `scripts/postgres/with-test-postgres.sh -- bash -lc 'cargo nextest run --locked -p wyrd-server --test integration -E "test(=platform_admin_e2e::google_proves_a_bound_login_without_admitting_a_stranger)"'`.
+  Provider setup passed, then begin failed with
+  `400 WYRD_SPEC_400_VALIDATION ... unknown field \`provider\``. Social login
+  was absent.
+- Diagnosis of a failure during GREEN work:
+  - **Symptom:** the stranger got `login=failed`, not `no_account`.
+  - **Evidence:** trace `browser sign-in refused code="WYRD_AUTH_400_INVALID_NONCE"`.
+  - **Cause:** wiremock answers with the first mounted matching mock. The
+    test's `mount_platform_token` appended a `/token` reply behind
+    `enable_google`'s reply, which carried the provider-test nonce.
+  - **Fix site:** the test fixture. Both appending calls now reset through
+    `mount_platform_provider`. An independent read-only diagnostician
+    confirmed the cause and found the second site, at step 6. Production
+    verification was correct.
+- Cycle-1 journey replay expectation changed from 401 to
+  `400 WYRD_AUTH_400_INVALID_STATE`. The replay is now refused as the company
+  callback refuses an unknown state; the assertion is equally strict.
+- GREEN: the RED selector plus
+  `test(=platform_admin_e2e::an_operator_configures_and_tests_google_beside_company_sso) | test(/^pg_browser_sessions::/) | test(/^pg_openapi_contract::/) | test(/callback|github/)`:
+  passed. `cargo nextest run --locked -p wyrd-auth --lib`: 136 passed.
+  `-p wyrd-server --lib -E "test(/^auth::/) | test(/^components::auth::/) | test(/^components::platform::/)"`:
+  62 passed. These keep company browser, device and test-callback behavior.
+- Diagnosis of a lane failure:
+  - **Symptom:** in the `wyrd-sql` integration lane,
+    `pg_migration::pg_tests::{federated_identity_roundtrips_and_rejects_cross_tenant_user_id,
+    nullable_oidc_user_email_roundtrips}` failed at cleanup with `23503` on
+    `auth_authorization_revisions_data_tenant_id_fkey`.
+  - **Cause:** `insert_user` advances the tenant authorization revision
+    (`queries/auth/users.rs`), and the test cleanup helpers deleted tenants
+    without deleting that row.
+  - **Fix site:** `cleanup_auth_test_rows` and `cleanup_refresh_token_test_rows`
+    in `pg_migration.rs`, the second as a latent instance of the same defect.
+    An independent read-only diagnostician confirmed the cause; this diff does
+    not cause the failure. `cargo nextest run --locked -p wyrd-sql --test integration`:
+    142 passed.
+- Limitation: a linked social identity cannot sign in yet. It is refused with
+  `login=failed` until the invitation/identity anchor in entry 4 exists.
+
 ### 3. An administrator emails separate invitations to a team
 
 **Maps to:** REQ-013, REQ-017; preserves REQ-001/REQ-008; AC-004.

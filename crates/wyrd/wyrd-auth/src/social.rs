@@ -24,12 +24,17 @@ use wyrd_auth_oidc::{
     ClaimMapping, ClaimPath, ClientAuth, CodeRedemption, MappedClaims, RelyingParty, ScreenedHttp,
 };
 use wyrd_crypt::SealingKeyring;
+use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
-    AbsoluteUrl, ConfigureSocialProviderRequest, EnableSocialProviderRequest, IssuerUrl,
-    LoginMethodsResponse, LoginSettings, ProviderResponse, Sha256Hex, SocialProvider,
+    AbsoluteUrl, CallbackQuery, ConfigureSocialProviderRequest, EnableSocialProviderRequest,
+    IssuerUrl, LoginMethodsResponse, LoginSettings, ProviderResponse, Sha256Hex, SocialProvider,
     SocialProviderState, SocialProviderView, SocialProvidersResponse,
 };
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::ids::TenantSlug;
+use wyrd_sql::queries::auth::{
+    SocialLoginState, consume_social_login_state, insert_social_login_state, user_id_by_identity,
+};
 use wyrd_sql::queries::platform::social::{
     LoginSettingsRow, ProviderEnablement, SocialProviderRow, SocialTestState,
     insert_social_test_state, login_settings, put_login_settings, put_social_provider,
@@ -38,9 +43,12 @@ use wyrd_sql::queries::platform::social::{
 };
 use wyrd_sql::{OperatorPool, TenantConn};
 
-use crate::callback::verify_response_issuer;
+use crate::browser_sessions::{BegunBrowserLogin, BrowserSessions, random_secret};
+use crate::callback::{
+    LoginCompletion, audit_authorization_code_failure, provider_refusal, verify_response_issuer,
+};
 use crate::error::{relying_party_error, store_error};
-use crate::login::LOGIN_STATE_TTL;
+use crate::login::{LOGIN_STATE_TTL, login_unavailable};
 
 /// Google's OpenID Connect issuer.
 pub const GOOGLE_ISSUER: &str = "https://accounts.google.com";
@@ -234,8 +242,41 @@ impl SocialSignIn {
                 "revision_stale",
             ));
         }
+        let authorization = self.authorize(provider, &row.client_id, origin).await?;
+        insert_social_test_state(
+            &self.operator,
+            Sha256Hex::digest(authorization.state.as_bytes()).as_bytes(),
+            &SocialTestState {
+                provider: provider.as_str().to_owned(),
+                provider_revision: row.revision,
+                redirect_uri: authorization.redirect_uri.to_string(),
+                code_verifier: authorization.code_verifier.expose_secret().to_owned(),
+                nonce: Some(authorization.nonce),
+                tester_principal_id: tester,
+            },
+            LOGIN_STATE_TTL,
+        )
+        .await
+        .map_err(store_error)?;
+        Ok(authorization.url)
+    }
+
+    /// Build `provider`'s authorization redirect for `client_id`, returning to
+    /// its social callback on `origin`, with fresh state, nonce and PKCE.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::Validation`] when `origin` cannot form a callback,
+    /// [`WyrdError::DiscoveryUnavailable`] when the provider cannot be
+    /// discovered, and [`WyrdError::NotFound`] for a provider without an
+    /// adapter.
+    async fn authorize(
+        &self,
+        provider: SocialProvider,
+        client_id: &str,
+        origin: &Url,
+    ) -> Result<SocialAuthorization, WyrdError> {
         let redirect_uri = social_callback(provider, origin)?;
-        let (url, state, verifier, nonce) = match provider {
+        match provider {
             SocialProvider::Google => {
                 let metadata = self
                     .relying_party
@@ -244,35 +285,62 @@ impl SocialSignIn {
                     .map_err(relying_party_error)?;
                 let authorization = self
                     .relying_party
-                    .authorize(&metadata, &row.client_id, redirect_uri.as_str())
+                    .authorize(&metadata, client_id, redirect_uri.as_str())
                     .map_err(relying_party_error)?;
-                (
-                    authorization.url,
-                    authorization.state,
-                    authorization.code_verifier,
-                    Some(authorization.nonce),
-                )
+                Ok(SocialAuthorization {
+                    url: AbsoluteUrl::new(authorization.url.as_str().to_owned())
+                        .map_err(|_| invalid_state("the provider authorization URL is invalid"))?,
+                    state: authorization.state,
+                    code_verifier: authorization.code_verifier,
+                    nonce: authorization.nonce,
+                    redirect_uri,
+                })
             }
-            SocialProvider::Github => return Err(unconfigured(provider)),
-        };
-        let authorization_url = AbsoluteUrl::new(url.as_str().to_owned())
-            .map_err(|_| invalid_state("the provider authorization URL is invalid"))?;
-        insert_social_test_state(
-            &self.operator,
-            Sha256Hex::digest(state.as_bytes()).as_bytes(),
-            &SocialTestState {
-                provider: provider.as_str().to_owned(),
-                provider_revision: row.revision,
-                redirect_uri: redirect_uri.to_string(),
-                code_verifier: verifier.expose_secret().to_owned(),
-                nonce,
-                tester_principal_id: tester,
-            },
-            LOGIN_STATE_TTL,
+            SocialProvider::Github => Err(unconfigured(provider)),
+        }
+    }
+
+    /// The issuer namespace `provider`'s identities are recorded under.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::NotFound`] for a provider without an adapter.
+    fn issuer(&self, provider: SocialProvider) -> Result<&str, WyrdError> {
+        match provider {
+            SocialProvider::Google => Ok(self.endpoints.google_issuer.as_str()),
+            SocialProvider::Github => Err(unconfigured(provider)),
+        }
+    }
+
+    /// Verify a tenant sign-in's provider return against the exact revision
+    /// its transaction bound, which must still be current and enabled.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::InvalidToken`] when the provider was disabled or
+    /// replaced meanwhile or the return fails verification,
+    /// [`WyrdError::InvalidNonce`] for a wrong nonce, and the provider and
+    /// store availability errors.
+    async fn verify_login(
+        &self,
+        provider: SocialProvider,
+        state: &SocialLoginState,
+        code: SecretString,
+        response_issuer: Option<&str>,
+    ) -> Result<MappedClaims, WyrdError> {
+        let row = social_provider(&self.operator, provider.as_str())
+            .await
+            .map_err(store_error)?
+            .filter(|row| row.revision == state.provider_revision && row.enabled)
+            .ok_or_else(revision_changed)?;
+        let enabled = self.open(provider, row)?;
+        self.verify_code(
+            &enabled,
+            code,
+            &state.redirect_uri,
+            &state.code_verifier,
+            Some(&state.nonce),
+            response_issuer,
         )
         .await
-        .map_err(store_error)?;
-        Ok(authorization_url)
     }
 
     /// Finish an operator provider test for `provider` whose provider return
@@ -540,6 +608,199 @@ fn instructions(provider: SocialProvider, callback: &Url) -> String {
              then test. Wyrd requests only the user:email scope."
         ),
     }
+}
+
+impl BrowserSessions {
+    /// Begin a returning sign-in for `tenant_route_key` through the enabled
+    /// shared `provider`, from the browser that will hold the returned
+    /// login-transaction binding.
+    ///
+    /// The tenant transaction binds the purpose, the exact provider revision
+    /// and client, the provider's social callback on `origin`, server-held
+    /// PKCE and nonce, and only the SHA-256 of the browser binding and state.
+    /// Nothing is audited: initiation evaluates no principal permission.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::InvalidToken`] for an unknown tenant or a provider
+    /// that is not enabled, [`WyrdError::InvalidState`] for a reused state,
+    /// and the provider and store availability errors.
+    pub async fn begin_social(
+        &self,
+        social: &SocialSignIn,
+        tenant_route_key: &TenantSlug,
+        provider: SocialProvider,
+        origin: &Url,
+    ) -> Result<BegunBrowserLogin, WyrdError> {
+        let postgres = self.connections.postgres();
+        let tenant = postgres
+            .resolve_tenant_slug(tenant_route_key)
+            .await
+            .map_err(store_error)?
+            .ok_or_else(login_unavailable)?;
+        let row = social_provider(&social.operator, provider.as_str())
+            .await
+            .map_err(store_error)?
+            .filter(|row| row.enabled)
+            .ok_or_else(|| invalid_token(&format!("{provider} sign-in is not available")))?;
+        let authorization = social.authorize(provider, &row.client_id, origin).await?;
+        let binding = SecretString::from(random_secret());
+        let state = SocialLoginState {
+            provider_revision: row.revision,
+            issuer: social.issuer(provider)?.to_owned(),
+            client_id: row.client_id,
+            redirect_uri: authorization.redirect_uri.to_string(),
+            code_verifier: authorization.code_verifier,
+            nonce: authorization.nonce,
+            browser_binding: Sha256Hex::digest(binding.expose_secret().as_bytes()),
+        };
+        let mut conn = postgres.tenant_conn(tenant).await.map_err(store_error)?;
+        if !insert_social_login_state(
+            &mut conn,
+            &Sha256Hex::digest(authorization.state.as_bytes()),
+            provider.as_str(),
+            &state,
+            LOGIN_STATE_TTL,
+        )
+        .await
+        .map_err(store_error)?
+        {
+            return Err(invalid_state(
+                "this sign-in state was already used; start again",
+            ));
+        }
+        conn.commit().await.map_err(store_error)?;
+        Ok(BegunBrowserLogin {
+            authorization_url: authorization.url,
+            binding,
+        })
+    }
+
+    /// Finish a tenant sign-in `provider` returned to its social callback with
+    /// `query` (its code or error, state and optional RFC 9207 `iss`) and the
+    /// binding the calling browser presented.
+    ///
+    /// Returns `Ok(None)` when `state_key` names no pending tenant sign-in.
+    /// Otherwise the transaction is consumed and committed before any provider
+    /// IO, the browser binding must match, the bound revision must still be
+    /// current and enabled, and the provider identity is verified. Only an
+    /// identity already linked to a tenant User under (issuer, subject) may
+    /// sign in; an email never selects a User. A stranger is refused with
+    /// account guidance and nothing is created. Every refusal is audited
+    /// without blocking and returned as [`LoginCompletion::Refused`].
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::AuthVerifyUnavailable`] when the tenant lookup
+    /// fails.
+    pub async fn complete_social(
+        &self,
+        social: &SocialSignIn,
+        provider: SocialProvider,
+        query: &CallbackQuery,
+        browser_binding: Option<&str>,
+        request_id: &str,
+    ) -> Result<Option<LoginCompletion>, WyrdError> {
+        let state_hash = Sha256Hex::digest(query.state.as_bytes());
+        let Some(tenant_id) = self
+            .connections
+            .postgres()
+            .login_state_tenant(&state_hash)
+            .await
+            .map_err(store_error)?
+        else {
+            return Ok(None);
+        };
+        let error = match self
+            .finish_social(
+                social,
+                tenant_id,
+                provider,
+                &state_hash,
+                query,
+                browser_binding,
+            )
+            .await
+        {
+            Ok(completion) => return Ok(Some(completion)),
+            Err(error) => error,
+        };
+        audit_authorization_code_failure(self.issuer.audit(), tenant_id, request_id, &error);
+        Ok(Some(LoginCompletion::Refused { tenant_id, error }))
+    }
+
+    /// The tenant part of [`Self::complete_social`].
+    ///
+    /// # Errors
+    /// Returns every refusal [`Self::complete_social`] reports as
+    /// [`LoginCompletion::Refused`].
+    async fn finish_social(
+        &self,
+        social: &SocialSignIn,
+        tenant_id: DataTenantId,
+        provider: SocialProvider,
+        state_hash: &Sha256Hex,
+        query: &CallbackQuery,
+        browser_binding: Option<&str>,
+    ) -> Result<LoginCompletion, WyrdError> {
+        let response_issuer = query.iss.as_deref();
+        let postgres = self.connections.postgres();
+        let mut conn = postgres.tenant_conn(tenant_id).await.map_err(store_error)?;
+        let state = consume_social_login_state(&mut conn, state_hash, provider.as_str())
+            .await
+            .map_err(store_error)?;
+        conn.commit().await.map_err(store_error)?;
+        let state = state.ok_or_else(|| {
+            invalid_state("this sign-in has expired or was already used; start again")
+        })?;
+        if !browser_binding
+            .is_some_and(|binding| Sha256Hex::digest(binding.as_bytes()) == state.browser_binding)
+        {
+            tracing::info!(%provider, "social callback reached a browser that did not begin it");
+            return Err(invalid_state(
+                "this browser did not begin the sign-in; start a new sign-in",
+            ));
+        }
+        let code = match query.response()? {
+            ProviderResponse::Code(code) => code.into_secret_string(),
+            ProviderResponse::Error(error) => {
+                verify_response_issuer(response_issuer, &state.issuer, false)?;
+                return Err(provider_refusal(&error));
+            }
+        };
+        let identity = social
+            .verify_login(provider, &state, code, response_issuer)
+            .await?;
+        let mut conn = postgres.tenant_conn(tenant_id).await.map_err(store_error)?;
+        let user = user_id_by_identity(&mut conn, &state.issuer, &identity.subject)
+            .await
+            .map_err(store_error)?;
+        drop(conn);
+        match user {
+            None => Err(WyrdError::InvalidToken {
+                message: format!(
+                    "no account in this workspace uses this {provider} sign-in; \
+                     accept an invitation or create a workspace"
+                ),
+                details: json!({ "reason": "no_account" }),
+            }),
+            Some(_) => Err(invalid_token(&format!(
+                "{provider} sign-in is not available for this account"
+            ))),
+        }
+    }
+}
+
+/// A provider redirect issued for one stored client.
+struct SocialAuthorization {
+    /// The provider authorization URL.
+    url: AbsoluteUrl,
+    /// Raw state; only its SHA-256 is stored.
+    state: String,
+    /// Server-held PKCE verifier.
+    code_verifier: SecretString,
+    /// Server-held nonce.
+    nonce: String,
+    /// The provider's social callback.
+    redirect_uri: Url,
 }
 
 /// Claim mapping of an OIDC social provider: the standard subject and email,

@@ -508,9 +508,24 @@ async fn callback(
     )
     .await?;
     match completed {
-        LoginCompletion::SignedIn(created) => signed_in(&state, &origin, &created).await,
+        LoginCompletion::SignedIn(created) => {
+            signed_in(
+                &state,
+                &origin,
+                &created,
+                crate::auth::browser::LOGIN_COOKIE_PATH,
+            )
+            .await
+        }
         LoginCompletion::Refused { tenant_id, error } => {
-            login_refused(&state, &origin, tenant_id, error).await
+            login_refused(
+                &state,
+                &origin,
+                tenant_id,
+                error,
+                crate::auth::browser::LOGIN_COOKIE_PATH,
+            )
+            .await
         }
         LoginCompletion::DeviceApproved => Ok(Html(CLI_LOGIN_COMPLETE_PAGE).into_response()),
         LoginCompletion::ConnectionTested => {

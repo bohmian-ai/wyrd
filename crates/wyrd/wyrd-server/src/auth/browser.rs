@@ -40,6 +40,7 @@ use wyrd_spec::ids::TenantSlug;
 use wyrd_spec::request_id::RequestId;
 
 use crate::auth::{RequestOrigin, auth_not_configured};
+use crate::components::platform::social::social;
 use crate::http::error::{WyrdErrorResponse, body_rejection};
 use crate::state::AppState;
 
@@ -190,8 +191,10 @@ fn request_id(request_id: Option<Extension<RequestId>>) -> RequestId {
 
 /// `POST /auth/browser/login` — begin a provider sign-in for one tenant.
 ///
-/// Begins a login transaction ([`BrowserSessions::begin`]) and sets its
-/// random binding in the `wyrd_login` cookie, scoped to `/auth/callback` and
+/// Begins a login transaction through the tenant's company SSO
+/// ([`BrowserSessions::begin`]) or, when the body names one, the shared
+/// social provider ([`BrowserSessions::begin_social`]), and sets its random
+/// binding in the `wyrd_login` cookie, scoped to that flow's callback and
 /// living as long as the login state. The provider callback completes the
 /// sign-in only for the browser presenting that binding. The response
 /// carries the provider authorization URL the browser navigates to.
@@ -230,16 +233,26 @@ pub async fn login(
 ) -> Result<Response, WyrdErrorResponse> {
     let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
     require_same_origin(&headers, &origin)?;
-    let begun = browser_sessions(&state)?
-        .begin(&request.tenant, &origin)
-        .await?;
+    let sessions = browser_sessions(&state)?;
+    let (begun, path) = match request.provider {
+        None => (
+            sessions.begin(&request.tenant, &origin).await?,
+            LOGIN_COOKIE_PATH,
+        ),
+        Some(provider) => (
+            sessions
+                .begin_social(social(&state)?, &request.tenant, provider, &origin)
+                .await?,
+            SOCIAL_LOGIN_COOKIE_PATH,
+        ),
+    };
     Ok(with_cookies(
         StatusCode::OK,
         vec![cookie_header(
             &origin,
             LOGIN_COOKIE,
             begun.binding.expose_secret(),
-            LOGIN_COOKIE_PATH,
+            path,
             LOGIN_COOKIE_MAX_AGE_SECONDS,
         )],
         Json(BrowserLoginResponse {
@@ -251,8 +264,12 @@ pub async fn login(
 /// Name of the cookie holding a browser sign-in's login-transaction binding.
 const LOGIN_COOKIE: &str = "wyrd_login";
 
-/// The only path the login-transaction cookie is sent to.
-const LOGIN_COOKIE_PATH: &str = "/auth/callback";
+/// The only path a company sign-in's login-transaction cookie is sent to.
+pub(crate) const LOGIN_COOKIE_PATH: &str = "/auth/callback";
+
+/// The only paths a social sign-in's login-transaction cookie is sent to: the
+/// provider-specific social callbacks.
+pub(crate) const SOCIAL_LOGIN_COOKIE_PATH: &str = "/auth/social";
 
 /// Lifetime of the login-transaction cookie: the five-minute login state.
 const LOGIN_COOKIE_MAX_AGE_SECONDS: u64 = 300;
@@ -268,8 +285,9 @@ pub(crate) fn login_binding(headers: &HeaderMap) -> Option<String> {
 }
 
 /// The callback response for a completed browser sign-in: the tenant's
-/// session cookie is set, the login-transaction cookie cleared, and the
-/// browser redirected (`303`) to the tenant home.
+/// session cookie is set, the login-transaction cookie scoped to the
+/// callback `login_path` cleared, and the browser redirected (`303`) to the
+/// tenant home.
 ///
 /// # Errors
 /// Returns the refusals of [`BrowserSessions::view`].
@@ -277,25 +295,28 @@ pub(crate) async fn signed_in(
     state: &AppState,
     origin: &Url,
     created: &CreatedBrowserSession,
+    login_path: &str,
 ) -> Result<Response, WyrdErrorResponse> {
     let view = browser_sessions(state)?.view(&created.session).await?;
     Ok(see_other(
         &format!("/t/{}", view.tenant),
         vec![
             set_session_cookie(origin, &view.tenant, &created.cookie),
-            clear_login_cookie(origin),
+            clear_login_cookie(origin, login_path),
         ],
     ))
 }
 
 /// The callback response for a browser sign-in that failed after its login
-/// state was consumed. The login-transaction cookie is always cleared. A
+/// state was consumed. The login-transaction cookie scoped to the callback
+/// `login_path` is always cleared. A
 /// server-side failure (a `5xx` catalog error such as an unavailable store or
 /// provider) is answered as that error itself, `no-store`, so the browser sees
 /// an outage rather than a credential refusal and can begin a new sign-in. A
 /// refusal redirects (`303`) to the tenant's sign-in page with
-/// `login=failed`. The exchange already audited the failure; it is only
-/// logged here.
+/// `login=failed`, or `login=no_account` when a verified provider identity
+/// belongs to no User there. The exchange already audited the failure; it is
+/// only logged here.
 ///
 /// # Errors
 /// Returns `error` itself when the tenant has left the directory, and
@@ -305,17 +326,24 @@ pub(crate) async fn login_refused(
     origin: &Url,
     tenant_id: DataTenantId,
     error: WyrdError,
+    login_path: &str,
 ) -> Result<Response, WyrdErrorResponse> {
     let status = StatusCode::from_u16(error.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     if status.is_server_error() {
         tracing::warn!(code = error.code(), "browser sign-in failed on the server");
         return Ok(with_cookies(
             status,
-            vec![clear_login_cookie(origin)],
+            vec![clear_login_cookie(origin, login_path)],
             WyrdErrorResponse::from(error),
         ));
     }
     tracing::info!(code = error.code(), "browser sign-in refused");
+    let reason = match &error {
+        WyrdError::InvalidToken { details, .. } if details["reason"] == "no_account" => {
+            "no_account"
+        }
+        _ => "failed",
+    };
     let (tenant, _) = state
         .postgres
         .wyrd()
@@ -330,14 +358,15 @@ pub(crate) async fn login_refused(
         })?
         .ok_or(error)?;
     Ok(see_other(
-        &format!("/t/{tenant}/login?login=failed"),
-        vec![clear_login_cookie(origin)],
+        &format!("/t/{tenant}/login?login={reason}"),
+        vec![clear_login_cookie(origin, login_path)],
     ))
 }
 
-/// `Set-Cookie` that removes the login-transaction cookie.
-fn clear_login_cookie(origin: &Url) -> HeaderValue {
-    cookie_header(origin, LOGIN_COOKIE, "", LOGIN_COOKIE_PATH, 0)
+/// `Set-Cookie` that removes the login-transaction cookie scoped to the
+/// callback `login_path`.
+fn clear_login_cookie(origin: &Url, login_path: &str) -> HeaderValue {
+    cookie_header(origin, LOGIN_COOKIE, "", login_path, 0)
 }
 
 /// A `no-store` `303 See Other` to the same-origin `location`, carrying
@@ -1098,7 +1127,15 @@ mod pg_tests {
         let provider = MockServer::start().await;
         let state = login_state(&fixture, &provider).await;
         let origin = Url::parse("https://wyrd.example.com").expect("origin parses");
-        let refuse = |error| super::login_refused(&state, &origin, fixture.data_tenant_id(), error);
+        let refuse = |error| {
+            super::login_refused(
+                &state,
+                &origin,
+                fixture.data_tenant_id(),
+                error,
+                super::LOGIN_COOKIE_PATH,
+            )
+        };
         let unavailable = [
             WyrdError::AuthVerifyUnavailable {
                 message: "auth backend unavailable".to_owned(),

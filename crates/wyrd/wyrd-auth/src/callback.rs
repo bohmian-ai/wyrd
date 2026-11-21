@@ -608,7 +608,7 @@ pub fn verify_response_issuer(
 /// is a refused sign-in, which the client sees as `access_denied`. Neither
 /// the provider's code nor its `error_description` is copied into the
 /// refusal, so none of its text is reflected or logged.
-fn provider_refusal(error: &str) -> WyrdError {
+pub(crate) fn provider_refusal(error: &str) -> WyrdError {
     let message = "the identity provider refused the sign-in".to_owned();
     let details = serde_json::json!({});
     match error {

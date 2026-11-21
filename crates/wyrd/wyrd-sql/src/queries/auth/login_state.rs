@@ -18,6 +18,11 @@
 //! reaches the beginning principal's browser, and
 //! [`consume_github_login_state`] at the GitHub OAuth callback. Neither
 //! callback consumes the other flow's rows.
+//!
+//! A tenant sign-in through the deployment's shared social provider is a
+//! third `flow`: [`insert_social_login_state`] when a sign-in page begins it
+//! and [`consume_social_login_state`] at that provider's social callback. It
+//! binds the platform provider revision instead of a tenant connection.
 // raw-query grep allowlist: auth tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use std::time::Duration;
@@ -592,4 +597,143 @@ mod tests {
 
         assert!(!printed.contains(sentinel), "{printed}");
     }
+}
+
+/// Begin a shared social sign-in owned by the RLS tenant.
+///
+/// The connection columns stay empty; `flow = 'social'` keeps the company
+/// OIDC and GitHub App callbacks from consuming the row. `ON CONFLICT DO
+/// NOTHING` never overwrites a reused state hash.
+const INSERT_SOCIAL_LOGIN_STATE_SQL: &str = r"
+    INSERT INTO wyrd.auth_login_state (
+        state_hash, data_tenant_id, flow, social_provider, social_provider_revision,
+        social_purpose, issuer, client_id, redirect_uri, code_verifier, nonce,
+        browser_binding_hash, expires_at
+    ) VALUES ($1, $2, 'social', $3, $4, 'login', $5, $6, $7, $8, $9, $10,
+              statement_timestamp() + ($11 * interval '1 second'))
+    ON CONFLICT DO NOTHING
+";
+
+/// Consume a social sign-in exactly once at `provider`'s callback, before
+/// provider IO. Another provider's, another flow's, consumed or expired rows
+/// match nothing.
+const CONSUME_SOCIAL_LOGIN_STATE_SQL: &str = r"
+    UPDATE wyrd.auth_login_state
+       SET consumed_at = statement_timestamp()
+     WHERE state_hash = $1
+       AND flow = 'social'
+       AND social_provider = $2
+       AND consumed_at IS NULL
+       AND expires_at > statement_timestamp()
+    RETURNING social_provider_revision, issuer, client_id, redirect_uri, code_verifier,
+              nonce, browser_binding_hash
+";
+
+/// One shared social sign-in transaction: written when a tenant sign-in page
+/// begins it and returned when the provider's social callback consumes it.
+///
+/// `Debug` is safe to print: the PKCE verifier is a [`SecretString`].
+#[derive(Debug, Clone)]
+pub struct SocialLoginState {
+    /// The exact platform provider revision the redirect was issued for.
+    pub provider_revision: i64,
+    /// The provider issuer the identity must come from.
+    pub issuer: String,
+    /// That revision's OAuth client id.
+    pub client_id: String,
+    /// The provider-specific social callback.
+    pub redirect_uri: String,
+    /// Server-generated PKCE verifier.
+    pub code_verifier: SecretString,
+    /// Server-generated nonce the ID token must echo.
+    pub nonce: String,
+    /// Digest of the beginning browser's login-transaction secret.
+    pub browser_binding: Sha256Hex,
+}
+
+/// Raw consumed social row.
+#[derive(sqlx::FromRow)]
+struct SocialLoginRow {
+    /// Provider revision.
+    social_provider_revision: i64,
+    /// Issuer.
+    issuer: String,
+    /// Client id.
+    client_id: String,
+    /// Callback URI.
+    redirect_uri: String,
+    /// PKCE verifier; wrapped in a [`SecretString`] as soon as it is decoded.
+    code_verifier: String,
+    /// Nonce.
+    nonce: String,
+    /// Browser binding digest.
+    browser_binding_hash: Vec<u8>,
+}
+
+/// Insert a social sign-in for `provider` keyed by `state_hash` whose expiry
+/// `PostgreSQL` derives from `ttl`.
+///
+/// First purges this tenant's expired login rows, as [`insert_login_state`]
+/// does. Returns `false` without writing when the state hash is recorded.
+///
+/// # Errors
+/// Returns a SQLx error when Postgres rejects the purge or the insert.
+pub async fn insert_social_login_state(
+    conn: &mut TenantConn<'_>,
+    state_hash: &Sha256Hex,
+    provider: &str,
+    row: &SocialLoginState,
+    ttl: Duration,
+) -> Result<bool, sqlx::Error> {
+    let tenant = conn.data_tenant_id().as_uuid();
+    sqlx::query(PURGE_EXPIRED_LOGIN_STATE_SQL)
+        .execute(&mut **conn.transaction())
+        .await?;
+    let inserted = sqlx::query(INSERT_SOCIAL_LOGIN_STATE_SQL)
+        .bind(state_hash.as_bytes().as_slice())
+        .bind(tenant)
+        .bind(provider)
+        .bind(row.provider_revision)
+        .bind(&row.issuer)
+        .bind(&row.client_id)
+        .bind(&row.redirect_uri)
+        .bind(row.code_verifier.expose_secret())
+        .bind(&row.nonce)
+        .bind(row.browser_binding.as_bytes().as_slice())
+        .bind(ttl.as_secs_f64())
+        .execute(&mut **conn.transaction())
+        .await?;
+    Ok(inserted.rows_affected() == 1)
+}
+
+/// Consume an unconsumed, unexpired social sign-in for `provider` exactly
+/// once; `None` for any other row.
+///
+/// # Errors
+/// Returns a SQLx error when Postgres rejects the update or the stored
+/// browser digest is not 32 bytes.
+pub async fn consume_social_login_state(
+    conn: &mut TenantConn<'_>,
+    state_hash: &Sha256Hex,
+    provider: &str,
+) -> Result<Option<SocialLoginState>, sqlx::Error> {
+    let row = sqlx::query_as::<_, SocialLoginRow>(CONSUME_SOCIAL_LOGIN_STATE_SQL)
+        .bind(state_hash.as_bytes().as_slice())
+        .bind(provider)
+        .fetch_optional(&mut **conn.transaction())
+        .await?;
+    row.map(|row| {
+        let digest = <[u8; 32]>::try_from(row.browser_binding_hash.as_slice())
+            .map_err(|_| sqlx::Error::Decode("social login state is corrupt".into()))?;
+        Ok(SocialLoginState {
+            provider_revision: row.social_provider_revision,
+            issuer: row.issuer,
+            client_id: row.client_id,
+            redirect_uri: row.redirect_uri,
+            code_verifier: SecretString::from(row.code_verifier),
+            nonce: row.nonce,
+            browser_binding: Sha256Hex::from(digest),
+        })
+    })
+    .transpose()
 }

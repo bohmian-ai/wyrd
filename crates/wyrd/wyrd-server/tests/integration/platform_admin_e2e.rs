@@ -5667,7 +5667,7 @@ async fn an_operator_configures_and_tests_google_beside_company_sso() {
     let (status, _) = social_call(&srv, social_request(Method::GET, &callback, None, None)).await;
     assert_eq!(
         status,
-        StatusCode::UNAUTHORIZED,
+        StatusCode::BAD_REQUEST,
         "a replayed test return is refused"
     );
 
@@ -5762,4 +5762,450 @@ async fn an_operator_configures_and_tests_google_beside_company_sso() {
         grants_after, grants_before,
         "provider setup creates no tenant grant"
     );
+}
+
+/// Configure, test and enable the deployment's Google client `wyrd-google`
+/// against the mock `google` through the platform API, leaving `google`
+/// with a working key set.
+///
+/// # Panics
+/// Panics when any platform step is refused.
+async fn enable_google(srv: &WyrdTestServer, session: &str, google: &wiremock::MockServer) {
+    let (status, stored) = social_call(
+        srv,
+        social_request(
+            Method::PUT,
+            "/platform/social/providers/google",
+            Some(session),
+            Some(json!({ "client_id": "wyrd-google", "client_secret": "google-secret" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "Google configures: {stored}");
+    let revision = stored["revision"].as_u64().expect("revision");
+    let (status, begun) = social_call(
+        srv,
+        social_request(
+            Method::POST,
+            "/platform/social/providers/google/test",
+            Some(session),
+            Some(json!({ "expected_revision": revision })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "test begins: {begun}");
+    let query = authorization_query(begun["authorization_url"].as_str().expect("url"));
+    mount_platform_provider(
+        google,
+        platform_key_set("google-key"),
+        platform_token_reply(&google.uri(), &query["nonce"], "wyrd-google", "google-key"),
+    )
+    .await;
+    let (status, _) = social_call(
+        srv,
+        social_request(
+            Method::GET,
+            &social_callback(&query["state"], &google.uri()),
+            None,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the provider test passes");
+    set_google_enabled(srv, session, revision, true).await;
+}
+
+/// Enable or disable Google revision `revision` through the platform API.
+///
+/// # Panics
+/// Panics when the change is refused.
+async fn set_google_enabled(srv: &WyrdTestServer, session: &str, revision: u64, enabled: bool) {
+    let (status, changed) = social_call(
+        srv,
+        social_request(
+            Method::PUT,
+            "/platform/social/providers/google/enabled",
+            Some(session),
+            Some(json!({ "enabled": enabled, "expected_revision": revision })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "Google enablement changes: {changed}"
+    );
+}
+
+/// The query parameters of a provider authorization URL.
+///
+/// # Panics
+/// Panics when `url` does not parse.
+fn authorization_query(url: &str) -> std::collections::HashMap<String, String> {
+    url::Url::parse(url)
+        .expect("authorization url parses")
+        .query_pairs()
+        .into_owned()
+        .collect()
+}
+
+/// The Google social callback for `state`, naming `issuer` as RFC 9207 `iss`.
+fn social_callback(state: &str, issuer: &str) -> String {
+    format!(
+        "/auth/social/google/callback?code=provider-code&state={state}&iss={}",
+        url::form_urlencoded::byte_serialize(issuer.as_bytes()).collect::<String>()
+    )
+}
+
+/// One Google sign-in begun from a tenant sign-in page.
+struct BegunSocialLogin {
+    /// The provider state and nonce from the authorization URL.
+    query: std::collections::HashMap<String, String>,
+    /// The `wyrd_login` cookie pair the beginning browser holds.
+    cookie: String,
+    /// That cookie's `Set-Cookie` attributes.
+    set_cookie: String,
+}
+
+/// Begin a Google sign-in for tenant `slug` the way its sign-in page does.
+///
+/// # Panics
+/// Panics when sign-in does not begin or sets no `wyrd_login` cookie.
+async fn begin_google_login(srv: &WyrdTestServer, slug: &str) -> BegunSocialLogin {
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/auth/browser/login")
+        .header(header::HOST, SOCIAL_HOST)
+        .header(header::ORIGIN, format!("http://{SOCIAL_HOST}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "tenant": slug, "provider": "google" }))
+                .expect("serializes"),
+        ))
+        .expect("request builds");
+    let resp = srv.oneshot(request).await.expect("login route responds");
+    let status = resp.status();
+    let set_cookie = resp
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find(|value| value.starts_with("wyrd_login="))
+        .map(str::to_owned);
+    let body = body_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "Google sign-in begins: {body}");
+    let set_cookie = set_cookie.expect("the login-transaction cookie is set");
+    BegunSocialLogin {
+        query: authorization_query(body["authorization_url"].as_str().expect("url")),
+        cookie: set_cookie
+            .split(';')
+            .next()
+            .expect("cookie pair")
+            .to_owned(),
+        set_cookie,
+    }
+}
+
+/// Return to the Google callback for `begun` from a browser holding
+/// `cookie`, naming `issuer`; returns the status and `Location`.
+///
+/// # Panics
+/// Panics when the route does not respond.
+async fn finish_google_login(
+    srv: &WyrdTestServer,
+    begun: &BegunSocialLogin,
+    cookie: Option<&str>,
+    issuer: &str,
+) -> (StatusCode, Option<String>) {
+    let mut builder = Request::builder()
+        .method(Method::GET)
+        .uri(social_callback(&begun.query["state"], issuer))
+        .header(header::HOST, SOCIAL_HOST);
+    if let Some(cookie) = cookie {
+        builder = builder.header(header::COOKIE, cookie);
+    }
+    let resp = srv
+        .oneshot(builder.body(Body::empty()).expect("request builds"))
+        .await
+        .expect("callback responds");
+    let location = resp
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    (resp.status(), location)
+}
+
+/// Counts of every local record a sign-in could create: Users, linked
+/// identities, browser sessions and role bindings.
+///
+/// # Panics
+/// Panics when a count query fails.
+async fn local_records(pool: &PgPool) -> (i64, i64, i64, i64) {
+    sqlx::query_as(
+        "SELECT (SELECT count(*) FROM wyrd.auth_users), \
+                (SELECT count(*) FROM wyrd.auth_user_identities), \
+                (SELECT count(*) FROM wyrd.auth_browser_sessions), \
+                (SELECT count(*) FROM wyrd.auth_role_bindings)",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("counts run")
+}
+
+/// Google proves only the sign-in purpose bound before redirecting and
+/// never admits a stranger:
+///   1. a tenant page begins Google with only the agreed scopes and a
+///      login-transaction cookie scoped to the social callbacks;
+///   2. a valid Google identity no tenant User has linked is refused with
+///      account guidance and creates no User, identity, session or grant,
+///      and a replay of the return is refused;
+///   3. an email matching an existing User still selects nothing;
+///   4. a return reaching another browser, naming another issuer, or
+///      carrying a wrong nonce, audience or signature is refused;
+///   5. a Google transaction cannot complete a company sign-in;
+///   6. disabling Google between start and return refuses completion on
+///      every replica, and so does replacing its client;
+///   7. a provider outage refuses; no provider token is retained.
+#[tokio::test]
+async fn google_proves_a_bound_login_without_admitting_a_stranger() {
+    let google = wiremock::MockServer::start().await;
+    let srv = WyrdTestServer::builder()
+        .with_social_endpoints_for_test(wyrd_server::config::SocialConfig {
+            google_issuer: Some(google.uri()),
+        })
+        .start_in_process()
+        .await
+        .expect("server starts");
+    let root = initialize_platform_root(&srv)
+        .await
+        .expect("deployment initializes");
+    let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
+    let tenant = srv.data_tenant_id();
+    let slug = srv.pg_fixture().tenant_slug().to_owned();
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    mount_platform_provider(
+        &google,
+        platform_key_set("google-key"),
+        wiremock::ResponseTemplate::new(500),
+    )
+    .await;
+    enable_google(&srv, &session, &google).await;
+    let issuer = google.uri();
+    let answer = |nonce: &str, audience: &str, kid: &str| {
+        platform_token_reply(&issuer, nonce, audience, kid)
+    };
+    let before = local_records(&superuser).await;
+    let no_account = format!("/t/{slug}/login?login=no_account");
+    let failed = format!("/t/{slug}/login?login=failed");
+
+    // 1. Only the agreed scopes; the cookie reaches only the social callbacks.
+    let begun = begin_google_login(&srv, &slug).await;
+    assert_eq!(begun.query["client_id"], "wyrd-google");
+    assert_eq!(
+        begun.query["redirect_uri"],
+        "http://wyrd.test/auth/social/google/callback"
+    );
+    assert_eq!(begun.query["scope"], "openid profile email");
+    assert!(
+        !begun.query.contains_key("access_type"),
+        "no offline Google access is requested"
+    );
+    assert!(
+        begun.set_cookie.contains("Path=/auth/social"),
+        "the transaction cookie is scoped to the social callbacks: {}",
+        begun.set_cookie
+    );
+
+    // 2. A stranger is refused with guidance and creates nothing.
+    mount_platform_provider(
+        &google,
+        platform_key_set("google-key"),
+        answer(&begun.query["nonce"], "wyrd-google", "google-key"),
+    )
+    .await;
+    let (status, location) = finish_google_login(&srv, &begun, Some(&begun.cookie), &issuer).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        location.as_deref(),
+        Some(no_account.as_str()),
+        "account guidance"
+    );
+    assert_eq!(
+        local_records(&superuser).await,
+        before,
+        "a stranger creates nothing"
+    );
+    let (status, _) = finish_google_login(&srv, &begun, Some(&begun.cookie), &issuer).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a replayed return is refused"
+    );
+
+    // 3. A matching email selects no account.
+    sqlx::query(
+        "INSERT INTO wyrd.auth_users (id, data_tenant_id, email, auth_type, status) \
+         VALUES ($1, $2, 'ops@example.com', 'oidc', 'active')",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .bind(tenant.as_uuid())
+    .execute(&superuser)
+    .await
+    .expect("same-email User seeds");
+    let before = local_records(&superuser).await;
+    let begun = begin_google_login(&srv, &slug).await;
+    mount_platform_provider(
+        &google,
+        platform_key_set("google-key"),
+        answer(&begun.query["nonce"], "wyrd-google", "google-key"),
+    )
+    .await;
+    let (_, location) = finish_google_login(&srv, &begun, Some(&begun.cookie), &issuer).await;
+    assert_eq!(
+        location.as_deref(),
+        Some(no_account.as_str()),
+        "email never selects a User"
+    );
+    assert_eq!(local_records(&superuser).await, before);
+
+    // 4. Wrong browser, issuer, nonce, audience and signature are refused.
+    let begun = begin_google_login(&srv, &slug).await;
+    let (_, location) = finish_google_login(&srv, &begun, None, &issuer).await;
+    assert_eq!(
+        location.as_deref(),
+        Some(failed.as_str()),
+        "no transaction cookie"
+    );
+    let begun = begin_google_login(&srv, &slug).await;
+    let other = begin_google_login(&srv, &slug).await;
+    let (_, location) = finish_google_login(&srv, &begun, Some(&other.cookie), &issuer).await;
+    assert_eq!(
+        location.as_deref(),
+        Some(failed.as_str()),
+        "another browser's cookie"
+    );
+    let (_, location) =
+        finish_google_login(&srv, &other, Some(&other.cookie), "https://evil.example").await;
+    assert_eq!(location.as_deref(), Some(failed.as_str()), "another issuer");
+    for (nonce, audience, kid, case) in [
+        (None, "wyrd-google", "google-key", "a wrong nonce"),
+        (Some(()), "someone-else", "google-key", "a wrong audience"),
+        (
+            Some(()),
+            "wyrd-google",
+            "unknown-key",
+            "an unknown signing key",
+        ),
+    ] {
+        let begun = begin_google_login(&srv, &slug).await;
+        let nonce = nonce.map_or("other-nonce", |()| begun.query["nonce"].as_str());
+        mount_platform_provider(
+            &google,
+            platform_key_set("google-key"),
+            answer(nonce, audience, kid),
+        )
+        .await;
+        let (_, location) = finish_google_login(&srv, &begun, Some(&begun.cookie), &issuer).await;
+        assert_eq!(
+            location.as_deref(),
+            Some(failed.as_str()),
+            "{case} is refused"
+        );
+    }
+
+    // 5. A Google transaction cannot complete a company sign-in.
+    let begun = begin_google_login(&srv, &slug).await;
+    let company = Request::builder()
+        .method(Method::GET)
+        .uri(format!(
+            "/auth/callback?code=provider-code&state={}",
+            begun.query["state"]
+        ))
+        .header(header::HOST, SOCIAL_HOST)
+        .header(header::COOKIE, &begun.cookie)
+        .body(Body::empty())
+        .expect("request builds");
+    let (status, _) = social_call(&srv, company).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "purpose substitution is refused"
+    );
+
+    // 6. Disabled or replaced between start and return, Google refuses everywhere.
+    let replica = srv
+        .start_replica(WyrdTestServer::builder().with_social_endpoints_for_test(
+            wyrd_server::config::SocialConfig {
+                google_issuer: Some(google.uri()),
+            },
+        ))
+        .await
+        .expect("replica starts");
+    let begun = begin_google_login(&srv, &slug).await;
+    mount_platform_provider(
+        &google,
+        platform_key_set("google-key"),
+        answer(&begun.query["nonce"], "wyrd-google", "google-key"),
+    )
+    .await;
+    set_google_enabled(&srv, &session, 1, false).await;
+    let (_, location) = finish_google_login(&replica, &begun, Some(&begun.cookie), &issuer).await;
+    assert_eq!(
+        location.as_deref(),
+        Some(failed.as_str()),
+        "disabled Google refuses on a replica"
+    );
+    set_google_enabled(&srv, &session, 1, true).await;
+    let begun = begin_google_login(&srv, &slug).await;
+    mount_platform_provider(
+        &google,
+        platform_key_set("google-key"),
+        answer(&begun.query["nonce"], "wyrd-google", "google-key"),
+    )
+    .await;
+    let (status, _) = social_call(
+        &srv,
+        social_request(
+            Method::PUT,
+            "/platform/social/providers/google",
+            Some(&session),
+            Some(json!({ "client_id": "wyrd-google", "client_secret": "rotated" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the client is replaced");
+    let (_, location) = finish_google_login(&srv, &begun, Some(&begun.cookie), &issuer).await;
+    assert_eq!(
+        location.as_deref(),
+        Some(failed.as_str()),
+        "a replaced client refuses"
+    );
+
+    // 7. Outage refuses, and no provider token is kept anywhere.
+    enable_google(&srv, &session, &google).await;
+    let begun = begin_google_login(&srv, &slug).await;
+    mount_platform_outage(&google, wiremock::ResponseTemplate::new(503)).await;
+    let (status, location) = finish_google_login(&srv, &begun, Some(&begun.cookie), &issuer).await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "an outage refuses as retryable: {location:?}"
+    );
+    assert_eq!(
+        local_records(&superuser).await,
+        before,
+        "no refusal created anything"
+    );
+    let retained: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM wyrd.auth_login_state s WHERE s::text LIKE '%provider-access%') \
+              + (SELECT count(*) FROM platform.social_login_state s WHERE s::text LIKE '%provider-access%')",
+    )
+    .fetch_one(&superuser)
+    .await
+    .expect("retention check runs");
+    assert_eq!(retained, 0, "no provider token is retained");
 }

@@ -11,16 +11,22 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::DataTenantId;
-use crate::auth::{AbsoluteUrl, PrincipalId, PrincipalKindTag, SecretBearer};
+use crate::auth::{AbsoluteUrl, PrincipalId, PrincipalKindTag, SecretBearer, SocialProvider};
 use crate::ids::TenantSlug;
 
-/// Body of `POST /auth/browser/login`: begin tenant SSO in this browser.
+/// Body of `POST /auth/browser/login`: begin a tenant provider sign-in in
+/// this browser, through the tenant's company SSO or, when `provider` names
+/// one, the deployment's shared social provider.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct BrowserLoginRequest {
     /// The tenant's route key; pre-login routing context only.
     pub tenant: TenantSlug,
+    /// The enabled shared social provider to sign in with; absent for
+    /// company SSO.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<SocialProvider>,
 }
 
 /// Response of `POST /auth/browser/login`.

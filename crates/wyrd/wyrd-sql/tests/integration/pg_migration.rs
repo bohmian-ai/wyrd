@@ -2563,6 +2563,13 @@ mod pg_tests {
             .bind(tenant_b.as_uuid())
             .execute(pool)
             .await?;
+        sqlx::query(
+            "DELETE FROM wyrd.auth_authorization_revisions WHERE data_tenant_id IN ($1, $2)",
+        )
+        .bind(tenant_a.as_uuid())
+        .bind(tenant_b.as_uuid())
+        .execute(pool)
+        .await?;
         sqlx::query("DELETE FROM platform.tenants WHERE data_tenant_id IN ($1, $2)")
             .bind(tenant_a.as_uuid())
             .bind(tenant_b.as_uuid())
@@ -2586,6 +2593,10 @@ mod pg_tests {
             .execute(pool)
             .await?;
         sqlx::query("DELETE FROM wyrd.auth_users WHERE data_tenant_id = ANY($1)")
+            .bind(&tenant_ids)
+            .execute(pool)
+            .await?;
+        sqlx::query("DELETE FROM wyrd.auth_authorization_revisions WHERE data_tenant_id = ANY($1)")
             .bind(&tenant_ids)
             .execute(pool)
             .await?;

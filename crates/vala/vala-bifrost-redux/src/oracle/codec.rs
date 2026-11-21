@@ -29,7 +29,7 @@ pub const ORACLE_REMOTE_SCAN_TAG: &str = "wyrd.oracle.remote_scan";
 /// this revision, so a worker built from another revision refuses the plan at
 /// preflight instead of decoding it differently. It must equal the
 /// `datafusion` revision in the workspace `[patch.crates-io]`.
-pub const ORACLE_DATAFUSION_REVISION: &str = "5f4b1713af4f0394c7c564b6bc6de42e92640186";
+pub const ORACLE_DATAFUSION_REVISION: &str = "1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a";
 
 /// Commits `revision`, length-prefixed, to a peer digest.
 ///
@@ -744,12 +744,13 @@ mod tests {
     }
 
     /// A family reader's masked verification plan, encoded for a peer and
-    /// decoded there, returns exactly the rows it returns locally: the row
-    /// filter and column masking travel inside the native plan.
+    /// decoded there, returns exactly what it returns locally: the row filter
+    /// and column masking travel inside the native plan, and a masked Variant
+    /// keeps its values and its extension type, whole or read by key.
     ///
     /// # Panics
     /// Panics if planning, the codec round trip or execution fails, or the
-    /// peer's rows differ from the local rows.
+    /// peer's rows or output fields differ from the local ones.
     #[tokio::test]
     async fn a_masked_verification_plan_executes_identically_on_a_peer() {
         use super::super::tests::{payload_context, statement, verification_session};
@@ -767,61 +768,92 @@ mod tests {
             )),
         ]);
         let session = verification_session();
-        let plan = super::super::Oracle::plan_logical(
-            &session,
-            &family,
-            &statement("SELECT result_id FROM bifrost.verification.results"),
-            &[],
-        )
-        .await
-        .expect("plan builds");
-        let native = session
-            .state()
-            .create_physical_plan(&plan)
-            .await
-            .expect("physical planning succeeds");
-        let ids = |batches: &[RecordBatch]| {
-            let mut ids: Vec<Option<String>> = batches
-                .iter()
-                .flat_map(|batch| {
-                    let column = batch
-                        .column(0)
-                        .as_any()
-                        .downcast_ref::<StringArray>()
-                        .expect("result_id is utf8");
-                    column
-                        .iter()
-                        .map(|id| id.map(str::to_owned))
-                        .collect::<Vec<_>>()
-                })
-                .collect();
-            ids.sort();
-            ids
+        // One query's single output column, locally and through the peer codec.
+        let both = async |sql: &str| {
+            let plan = super::super::Oracle::plan_logical(&session, &family, &statement(sql), &[])
+                .await
+                .expect("plan builds");
+            let native = session
+                .state()
+                .create_physical_plan(&plan)
+                .await
+                .expect("physical planning succeeds");
+            let local = collect(Arc::clone(&native), session.task_ctx())
+                .await
+                .expect("local plan executes");
+            let mut source = None;
+            let outbound =
+                replace_source(native, &mut source).expect("source replacement succeeds");
+            let bytes = physical_plan_to_bytes_with_extension_codec(
+                outbound,
+                &OraclePhysicalExtensionCodec::encoder(),
+            )
+            .expect("masked plan encodes");
+            let codec = OraclePhysicalExtensionCodec::decoder(HashMap::from([(
+                "scan".to_owned(),
+                source.expect("one source leaf was captured"),
+            )]));
+            let task = session.task_ctx();
+            let decoded = physical_plan_from_bytes_with_extension_codec(&bytes, &task, &codec)
+                .expect("masked plan decodes");
+            codec
+                .require_complete_consumption()
+                .expect("provider is consumed once");
+            let peer = collect(decoded, task).await.expect("peer plan executes");
+            let column = |batches: Vec<RecordBatch>| {
+                let schema = batches[0].schema();
+                let batch = datafusion::arrow::compute::concat_batches(&schema, &batches)
+                    .expect("batches concatenate");
+                (schema.field(0).clone(), Arc::clone(batch.column(0)))
+            };
+            (column(local), column(peer))
         };
-        let local = ids(&collect(Arc::clone(&native), session.task_ctx())
-            .await
-            .expect("local plan executes"));
-        assert_eq!(local, [Some("p1".to_owned())]);
+        let text = |column: &datafusion::arrow::array::ArrayRef| {
+            datafusion::arrow::compute::cast(column, &datafusion::arrow::datatypes::DataType::Utf8)
+                .expect("text column")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("utf8")
+                .iter()
+                .map(|value| value.map(str::to_owned))
+                .collect::<Vec<_>>()
+        };
 
-        let mut source = None;
-        let outbound = replace_source(native, &mut source).expect("source replacement succeeds");
-        let bytes = physical_plan_to_bytes_with_extension_codec(
-            outbound,
-            &OraclePhysicalExtensionCodec::encoder(),
+        let (local, peer) = both("SELECT result_id FROM bifrost.verification.results").await;
+        assert_eq!(text(&local.1), [Some("p1".to_owned())]);
+        assert_eq!(text(&peer.1), text(&local.1));
+
+        // A key read of the masked Variant.
+        let (local, peer) =
+            both("SELECT detail -> 'head' ->> 'sha' FROM bifrost.verification.results").await;
+        assert_eq!(text(&local.1), [Some("a1".to_owned())]);
+        assert_eq!(text(&peer.1), text(&local.1));
+
+        // A filter on a key of the masked Variant.
+        let (local, peer) = both(
+            "SELECT result_id FROM bifrost.verification.results \
+             WHERE detail -> 'head' ->> 'sha' = 'a1'",
         )
-        .expect("masked plan encodes");
-        let codec = OraclePhysicalExtensionCodec::decoder(HashMap::from([(
-            "scan".to_owned(),
-            source.expect("one source leaf was captured"),
-        )]));
-        let task = session.task_ctx();
-        let decoded = physical_plan_from_bytes_with_extension_codec(&bytes, &task, &codec)
-            .expect("masked plan decodes");
-        codec
-            .require_complete_consumption()
-            .expect("provider is consumed once");
-        let peer = ids(&collect(decoded, task).await.expect("peer plan executes"));
-        assert_eq!(peer, local);
+        .await;
+        assert_eq!(text(&local.1), [Some("p1".to_owned())]);
+        assert_eq!(text(&peer.1), text(&local.1));
+
+        // The whole Variant: one visible row, the same bytes, the same
+        // extension-typed field on both sides.
+        let (local, peer) = both("SELECT detail FROM bifrost.verification.results").await;
+        assert_eq!(local.1.len(), 1);
+        assert_eq!(
+            local
+                .0
+                .metadata()
+                .get("ARROW:extension:name")
+                .map(String::as_str),
+            Some("arrow.parquet.variant"),
+            "{:?}",
+            local.0
+        );
+        assert_eq!(peer.0, local.0);
+        assert_eq!(peer.1.to_data(), local.1.to_data());
     }
 
     /// Every malformed tree or request-component contradiction fails before effects.

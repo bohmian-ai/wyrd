@@ -297,17 +297,17 @@ monty-macros = { git = "https://github.com/bohmian-ai/monty", rev = "e54ecafaad8
 monty-pool = { git = "https://github.com/bohmian-ai/monty", rev = "e54ecafaad8323d88ded7ca2a73ede62d30cf441" }
 monty-proto = { git = "https://github.com/bohmian-ai/monty", rev = "e54ecafaad8323d88ded7ca2a73ede62d30cf441" }
 monty-types = { git = "https://github.com/bohmian-ai/monty", rev = "e54ecafaad8323d88ded7ca2a73ede62d30cf441" }
-datafusion = { git = "https://github.com/bohmian-ai/datafusion", rev = "5f4b1713af4f0394c7c564b6bc6de42e92640186" }
-datafusion-common = { git = "https://github.com/bohmian-ai/datafusion", rev = "5f4b1713af4f0394c7c564b6bc6de42e92640186" }
-datafusion-datasource = { git = "https://github.com/bohmian-ai/datafusion", rev = "5f4b1713af4f0394c7c564b6bc6de42e92640186" }
-datafusion-datasource-parquet = { git = "https://github.com/bohmian-ai/datafusion", rev = "5f4b1713af4f0394c7c564b6bc6de42e92640186" }
-datafusion-expr = { git = "https://github.com/bohmian-ai/datafusion", rev = "5f4b1713af4f0394c7c564b6bc6de42e92640186" }
-datafusion-functions = { git = "https://github.com/bohmian-ai/datafusion", rev = "5f4b1713af4f0394c7c564b6bc6de42e92640186" }
-datafusion-functions-variant = { git = "https://github.com/bohmian-ai/datafusion", rev = "5f4b1713af4f0394c7c564b6bc6de42e92640186" }
-datafusion-physical-expr = { git = "https://github.com/bohmian-ai/datafusion", rev = "5f4b1713af4f0394c7c564b6bc6de42e92640186" }
-datafusion-physical-expr-adapter = { git = "https://github.com/bohmian-ai/datafusion", rev = "5f4b1713af4f0394c7c564b6bc6de42e92640186" }
-datafusion-proto = { git = "https://github.com/bohmian-ai/datafusion", rev = "5f4b1713af4f0394c7c564b6bc6de42e92640186" }
-datafusion-pruning = { git = "https://github.com/bohmian-ai/datafusion", rev = "5f4b1713af4f0394c7c564b6bc6de42e92640186" }
+datafusion = { git = "https://github.com/bohmian-ai/datafusion", rev = "1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a" }
+datafusion-common = { git = "https://github.com/bohmian-ai/datafusion", rev = "1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a" }
+datafusion-datasource = { git = "https://github.com/bohmian-ai/datafusion", rev = "1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a" }
+datafusion-datasource-parquet = { git = "https://github.com/bohmian-ai/datafusion", rev = "1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a" }
+datafusion-expr = { git = "https://github.com/bohmian-ai/datafusion", rev = "1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a" }
+datafusion-functions = { git = "https://github.com/bohmian-ai/datafusion", rev = "1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a" }
+datafusion-functions-variant = { git = "https://github.com/bohmian-ai/datafusion", rev = "1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a" }
+datafusion-physical-expr = { git = "https://github.com/bohmian-ai/datafusion", rev = "1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a" }
+datafusion-physical-expr-adapter = { git = "https://github.com/bohmian-ai/datafusion", rev = "1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a" }
+datafusion-proto = { git = "https://github.com/bohmian-ai/datafusion", rev = "1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a" }
+datafusion-pruning = { git = "https://github.com/bohmian-ai/datafusion", rev = "1a0f1af0bc6ce686e5fd25aaee000bd88f6ca17a" }
 # Arrow-rs 60.0.0 with the unshred_variant buffer pre-size fix, path-only Variant
 # validation in variant_get, and shred_variant residuals reserved from their input
 # rows and referencing untouched input values; it replaces the DataFusion fork's

@@ -3,7 +3,7 @@ id: TASK-001
 kind: implementation
 status: proposed
 spec: SPEC-bifrost-write-throughput-and-retention
-spec_revision: 1
+spec_revision: 2
 requirements: [REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, REQ-006, REQ-007, REQ-008, REQ-009]
 depends_on: []
 ---
@@ -19,7 +19,7 @@ cleanup pauses fresh writes through existing admission while reads and recovery
 remain usable. This establishes finite recent retry history without promising a
 strict instantaneous receipt-row or physical PostgreSQL-byte ceiling.
 
-Implement [spec revision 1](../spec.md) using the
+Implement [spec revision 2](../spec.md) using the
 [selected implementation and deletion proof](../design/notes.md#locked-deletion-proof-and-backlog-enforcement)
 and [final cleanup-health amendment](../design/cleanup-health-proposal.md).
 The [shared execution/checkpoint recipe](README.md) applies after each scenario.
@@ -85,8 +85,8 @@ also exercise the existing stable-identity retry/conflict boundary.
 **Action/result:** Reconstruct the execution and read/retry each domain operation
 through its real consumer. The revision sequence and exact decisions survive;
 matching domain retries preserve their result and contradictory decisions still
-conflict. Recent accepted-but-invisible rows and unavailable authority produce
-unavailable/retry results rather than absence. Same-identity transport retries
+conflict. Accepted-but-unreadable rows can appear absent; fixed batch identities
+refuse conflicting saves and trigger retry. Failed Bifrost queries remain unavailable. Same-identity transport retries
 while a receipt remains authoritative retain original version/content semantics,
 including cross-pod arbitration and tenant separation. Buffered enqueue and durable
 completion keep their existing boundaries.

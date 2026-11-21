@@ -1,6 +1,6 @@
 # Bifrost write throughput and bounded retry history: execution
 
-Contract: [approved spec revision 1](../spec.md). Selected solution:
+Contract: [approved spec revision 2](../spec.md). Selected solution:
 [design notes](../design/notes.md), [CPU design](../design/throughput.md), and
 [cleanup health](../design/cleanup-health-proposal.md).
 

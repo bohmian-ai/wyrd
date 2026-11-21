@@ -19,8 +19,9 @@ against the [approved spec](../../spec.md); no `$wyrd-task-review` produced it.
 Implement it through `$wyrd-implement`. The candidate is `31af0fe55` plus the
 uncommitted work in progress kept by step 5.
 
-Pending maintainer approval: the changed lifecycle assertions in step 1 and the
-REQ-003 rewording in step 7.
+The maintainer approved the changed lifecycle assertions and REQ-003 behavior
+on 2026-11-21 by instructing the spec correction and renewed review. Spec revision
+2 and the owning architecture now record that agreement.
 
 ## Outcome
 Verification stops reading `vala.scribe_batch_commits`. A run in progress keeps

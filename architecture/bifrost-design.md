@@ -730,9 +730,11 @@ and a republish of the same content replays. `bifrost.verification.evidence` is
 accepted-only: the committed batch fence arbitrates initial acceptance. Permanent
 evidence, approval, execution-revision and GitHub-delivery history and domain
 retry/conflict decisions come from their Bifrost records after receipt expiry.
-A recent fenced acceptance whose row no query can see yet is unavailable,
-never absent; unavailable authority is never evidence of absence. Missing
-expired fences cannot establish that a retained domain record was never written.
+Consumers read only their Bifrost records, never retry receipts. An accepted
+record that is not yet readable can appear absent. Its fixed batch identity makes
+a second write a matching retry or a refused conflict, never an overwrite.
+Consumers re-read on retry; a failed query is unavailable. Receipt expiry does
+not remove retained domain history or its conflict rules.
 An approval decision follows the same contract: its receipt is
 returned only after Scribe acknowledges the decision within half the request
 timeout, `bifrost.verification.approvals` is accepted-only, and without the

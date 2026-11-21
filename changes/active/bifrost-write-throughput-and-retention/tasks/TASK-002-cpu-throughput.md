@@ -3,7 +3,7 @@ id: TASK-002
 kind: implementation
 status: proposed
 spec: SPEC-bifrost-write-throughput-and-retention
-spec_revision: 1
+spec_revision: 2
 requirements: [REQ-001, REQ-004, REQ-010, REQ-011, REQ-012, REQ-013]
 depends_on: [TASK-001]
 ---
@@ -16,7 +16,7 @@ Deliver the approved CPU reduction on the fixed OTLP logs-c64 population while
 preserving accepted input, byte/identity compatibility, bounded ownership and read
 latency under sustainable ingestion. Faster ACK alone does not satisfy the target.
 
-Implement [spec revision 1](../spec.md) using the selected
+Implement [spec revision 2](../spec.md) using the selected
 [CPU flow and protections](../design/throughput.md). Task 1 must first supply
 domain-history independence, accepted-only replay, durable handoff/cleanup behavior,
 their regression tests and the previous accepted benchmark checkpoint. This task

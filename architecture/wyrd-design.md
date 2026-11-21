@@ -2062,7 +2062,7 @@ prepares a live in-memory `RunState` for recovery checkpoints; direct verify
 runs the same engine without that state or the checkpoint adapter.
 Preparation (input validation, authorization, exact target
 resolution including cold loads, and for queued work the batched claim, pinned
-input/source/policy, accepted authority, original deadline and exact accepted
+input/source/policy, original deadline and newest readable compatible
 recovery) completes before the engine starts. Engine transitions (begin, forget,
 settle, control, publication acceptance and replay, terminal selection and
 failure) validate and mutate live memory and return at once; they never wait for
@@ -2114,13 +2114,15 @@ finalizer or owed-delivery queue exists. Scheduled/group activation retains the
 same queue path.
 
 A crash loses live and unaccepted progress, including an unaccepted terminal
-decision. Direct work never resumes. Queued redelivery recovers the exact
-accepted revision (the fenced prefix) with the same execution ID, input, source,
+decision. Direct work never resumes. Queued redelivery recovers the newest
+readable compatible revision from Bifrost with the same execution ID, input, source,
 policy and original deadline, and may repeat later work, effects and spend; lost
-spend is not reconstructed. A recovered accepted terminal decision is delivered
-without recomputation. Recovery returns the exact accepted compatible state,
-authoritative absence, or explicit unavailability; unavailability defers
-preparation and is never treated as absence. A snapshot that does not decode
+spend is not reconstructed. A recovered terminal decision is delivered without
+recomputation. If no checkpoint is readable, recovery starts from fresh state.
+A newer accepted revision can temporarily be unreadable. Fixed revision batch
+identities prevent overwriting it: a conflicting save makes the writer stale and
+retries recovery, and settlement waits for its own saves to be acknowledged.
+A failed recovery query defers preparation as unavailable. A snapshot that does not decode
 as a supported `ExecutionState` format defers with `execution_state_incompatible`.
 A revision the old owner froze just before takeover may still be accepted ahead
 of the replacement's and is then inherited; this rare interval is accepted and no

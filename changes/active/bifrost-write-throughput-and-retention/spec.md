@@ -1,6 +1,6 @@
 ---
 id: SPEC-bifrost-write-throughput-and-retention
-revision: 1
+revision: 2
 status: approved
 ---
 
@@ -228,7 +228,7 @@ tenancy, concurrency and failure variants stay inside these six scenarios.
 
 | Task / scenario | Required observation | Obligations |
 |---|---|---|
-| Fence / lasting history | Accept decisions through their real consumer paths, expire receipts, and recover/query/retry the four domain records. History and conflicts remain correct; accepted-but-invisible/unavailable state is not absent. | REQ-001–003 |
+| Fence / lasting history | Accept decisions through their real consumer paths, expire receipts, and recover/query/retry the four domain records. History and conflicts remain correct; unreadable accepted rows can appear absent, conflicting saves are refused, and failed queries retry. | REQ-001–003 |
 | Fence / recovery handoff | Accept, stage, persist the frontier, delete eligible receipts, restart and query exact rows. Repeat with lost responses, crossing batches, earlier gaps, failed stage/manifest persistence and another pod's losing WAL attempt. No accepted data is lost and no losing/unaccepted attempt reappears. | REQ-004–006 |
 | Fence / cleanup and pressure | Exercise age/count eviction, missed/coalesced wakes, SQL failure/ambiguity, hung worker, slow partial progress, restart debt, entirely recovery-pinned scope and catch-up. Assert safe deletion, retryable refusal/resumption, completion of admitted work and continued reads/staging. | REQ-002, REQ-006–009 |
 | CPU / preparation | Pass equivalent valid and invalid inputs through checked preparation/projection; observe identical canonical rows, refusals and required inspection visibility. | REQ-001, REQ-010 |
@@ -258,3 +258,9 @@ the unmet outcome to design; do not lower the target or begin another redesign.
 Revision 1 records the finalized agreement. The maintainer authorized proceeding
 with this revision by requesting its decomposition into implementation-ready tasks
 on 2026-11-20. Status is **approved**. Planning does not start implementation.
+
+Revision 2 is approved by the maintainer’s instruction on 2026-11-21 to fix the
+spec and rerun review. It records the R1 Bifrost-only readers: newest-readable
+recovery, temporary absence for unreadable accepted rows, fixed-identity conflict
+protection and retry on query failure. The owning architecture and acceptance
+wording are reconciled with that decision; other requirements are unchanged.

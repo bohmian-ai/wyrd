@@ -5,10 +5,10 @@
 //! One acceptance is one `bifrost.verification.evidence` row, written through
 //! Scribe as its own batch under a batch id its source, input, and
 //! subscriber derive. The row is the lasting record that the subscriber
-//! accepted evidence for that source and input; the batch receipt, committed
-//! before Scribe acknowledges and kept for recent retry history, bridges an
-//! acceptance no query can see yet, which is unavailable, never absent. Nothing is
-//! mirrored in PostgreSQL; the queue only learns that a consumer is due.
+//! accepted evidence for that source and input. Consumers read Bifrost alone;
+//! an unreadable acceptance can appear absent, while its fixed batch identity
+//! refuses conflicting writes. Failed reads are unavailable and retry. Nothing
+//! is mirrored in PostgreSQL; the queue only learns that a consumer is due.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock, Mutex};

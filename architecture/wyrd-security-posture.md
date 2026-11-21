@@ -424,8 +424,7 @@ Google uses OIDC with `openid email profile` and validated issuer, subject,
 audience, signature, nonce and expiry. GitHub.com uses authorization code with
 S256 PKCE and an authenticated user lookup, with numeric user ID under a fixed
 GitHub.com namespace. It supplies no OIDC ID token. Request no repository or
-organization access; fetch verified email with minimal email permission only
-when recipient proof needs it. Provider tokens are transient identity-resolution
+organization or email API access. Provider tokens are transient identity-resolution
 inputs; retain no provider refresh-token vault.
 
 Returning social login resolves only tenant + issuer/provider namespace + subject.
@@ -436,12 +435,12 @@ Company SSO retains its existing provisioning and source-qualified group mapping
 
 Invitations name a recipient and explicit scoped assignments. Individual and bulk
 entry create separate expiring, one-use invitations with per-recipient outcomes
-and pending/resend/revoke operations. Redemption requires the live invitation and
-proof of the addressed mailbox through an appropriate verified provider claim or
-a separate fresh, one-use mailbox challenge bound to recipient, invitation,
-browser and enrollment purpose. This applies to password and social enrollment;
-a forwarded invitation alone is insufficient. Mailbox proof establishes invitation
-eligibility, never account ownership. Consumption revalidates issuer authority,
+and pending/resend/revoke operations. Each invitation is a link carrying its
+one-time code in the URL fragment, returned once to the administrator and, with SMTP, emailed; Wyrd
+stores only a verifier. Resend replaces the code. Possession of the live link
+admits one enrollment by any allowed method; the address never selects, links or
+identifies an existing User. Opening the link consumes nothing. A forwarded
+live link admits its holder; single use, expiry and revoke bound that risk. Consumption revalidates issuer authority,
 roles/scopes, tenant policy and provider revision, then atomically creates the
 User, identity/credentials, bindings and session and consumes the invitation, or
 commits none. Concurrent redemption has one winner. An identity already owned by
@@ -487,8 +486,8 @@ IdP offboarding; upstream removal alone does not revoke Wyrd grants or sessions.
 
 One operator-configured SMTP relay supplies host, port, TLS mode, optional sealed
 credentials and sender address, with test-send. Tenant administrators use it but
-cannot read/change its credentials. Wyrd runs without SMTP and explains emailed
-invitation unavailability without weakening recipient proof. Send separately after
+cannot read/change its credentials. Wyrd runs without SMTP; administrators
+then copy invitation links and the UI says they are not emailed. Send separately after
 each invitation commits, outside the tenant transaction. Report relay acceptance
 or failure per recipient, never inbox delivery; failure leaves a pending invitation
 and no active User, with explicit resend available. Raw invitation secrets are not

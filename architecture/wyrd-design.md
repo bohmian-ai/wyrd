@@ -969,17 +969,16 @@ human SSO never replaces or disables them.
 Local password sign-in is the provider-free human path. An administrator
 holding User management and tenant administration creates a User directly
 (`POST /v1/principals/users`: username, password and explicit role/scope
-assignments; `wyrd principal user create`), provisions a recipient-addressed
-invitation with explicit role/scope
+assignments; `wyrd principal user create`), provisions recipient-addressed
+invitations with explicit role/scope
 assignments (`POST
-/v1/principals/users/invitations`, 24-hour single-use code returned once;
-`wyrd principal user invite`) and, for recovery, a reset code (`POST
+/v1/principals/users/invitations`, one 24-hour single-use link per recipient,
+returned once for copying; `wyrd principal user invite`) and, for recovery, a reset code (`POST
 /v1/principals/users/{principal_id}/password-reset`, 15 minutes). Reset codes
-are delivered out of band and never appear in URLs. Invitations
-use the operator-configured SMTP relay, with recipient proof and pending/resend/
-revoke handling under the security posture. Send only after invitation commit;
-report per-recipient relay acceptance/failure. No SMTP configuration means emailed
-invitations are unavailable, not a bearer-only enrollment fallback. `POST
+are delivered out of band and never appear in URLs. When the operator configures SMTP, Wyrd
+also emails each link after the invitation commits and reports per-recipient
+relay acceptance/failure; pending/resend/revoke handling follows the security
+posture. Without SMTP, administrators deliver the copied links themselves. `POST
 /auth/browser/password/signup` redeems an invitation into a tenant User with
 a canonical tenant-local username; `/login`, `/change` and `/reset` verify,
 replace or reset the password. Rust stores only an Argon2id verifier,

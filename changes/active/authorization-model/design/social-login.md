@@ -7,6 +7,14 @@ intended as task 003. Tasks 001 and 002 are complete according to the maintainer
 This is the agreed design for specification, not implementation authority; it
 does not alter approved specification revision 2.
 
+
+Revision note (2026-11-21, maintainer decision): follow the conventional
+invitation model of GitLab, Grafana and Slack. Each invitation is a single-use
+link the administrator can copy; SMTP, when configured, also emails it.
+Possession of the live link admits enrollment; every recipient-proof, mailbox-challenge,
+provider-email-match and no-bearer-link statement in this document is withdrawn, because it made
+deployments without SMTP unable to invite password Users.
+
 ## Problem
 
 A person cannot use Google or GitHub to accept a Wyrd invitation or create a

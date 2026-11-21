@@ -1,6 +1,6 @@
 ---
 id: SPEC-authorization-model
-revision: 3
+revision: 4
 status: approved
 ---
 
@@ -31,8 +31,9 @@ Revision 3 adds social signup and sign-in. An operator enables Google/GitHub;
 Sam accepts an addressed invitation and receives its scoped access, or creates
 a new workspace and becomes its administrator. Sam can explicitly connect
 another sign-in method to that same User. A tenant can require company SSO.
-Bulk invitations use an operator-configured SMTP service; no particular email
-provider is required.
+Each invitation is a single-use link the administrator can copy; when an
+operator configures SMTP, Wyrd also emails it. No particular email provider is
+required.
 
 Agreement: [design notes](design/notes.md), the original three system scenarios
 and two-task split, [Rust responsibilities and token flow](design/rust-model.md),
@@ -206,8 +207,8 @@ revalidate the issuer's current authority to assign those grants, the referenced
 roles, scopes and tenant. Create the User and those bindings atomically. An invalid
 invitation creates neither; a missing scope is refused, never interpreted as All.
 Enrollment creates the recorded assignments, not a tenant-wide role assignment.
-Keep existing one-use, expiry and password-setup behavior. Revision 3 adds the
-recipient-proof and bulk-delivery requirements in REQ-013 and REQ-017.
+Keep existing one-use, expiry and password-setup behavior. REQ-013 and REQ-017
+add addressed links, bulk entry and optional email delivery.
 
 Local User creation keeps its existing account/invitation flows; social admission
 and public signup follow REQ-012 through REQ-014. Runtime Service creation
@@ -297,8 +298,7 @@ Google reuses the OIDC relying party with `openid email profile`. GitHub.com
 uses authorization code/S256 PKCE and an authenticated user lookup; its numeric
 user ID is the subject under a fixed GitHub.com namespace. Do not use the mutable
 username or treat its OAuth access token as an OIDC ID token. Request no
-repository/organization access; retrieve verified email with minimal email
-permission when recipient proof requires it. Drop provider access tokens after
+repository/organization or email API access. Drop provider access tokens after
 identity resolution; retain no provider refresh-token vault.
 
 Resolve returning social login only by tenant + issuer/provider namespace +
@@ -321,26 +321,36 @@ cross-tenant session is introduced.
 
 A tenant administrator invites one recipient email or pastes multiple addresses
 and selects explicit role/scope assignments. Create a separate expiring,
-single-use invitation per recipient, expose pending/resend/revoke operations,
-and report per-recipient results. Ten or more recipients require no different
-identity/provisioning model. SMTP delivery follows REQ-017.
+single-use invitation per recipient and report per-recipient results. Ten or
+more recipients require no different identity/provisioning model.
 
-Acceptance requires a live invitation and proof of control of its recipient
-address, through an appropriate verified provider claim or separate mailbox
-challenge. Apply this to password and provider enrollment. Merely forwarding
-the original invitation does not let another recipient redeem it. Email proves
-invitation eligibility only; it never links or identifies an existing User.
-Do not fall back to bearer-only or shared-link admission.
+Each invitation is a link: a fixed tenant invitation page with its one-time
+code in the URL fragment, so the code reaches no server, proxy log or referrer. Create and resend return each link once so the administrator can copy and
+deliver it through any channel; when SMTP is configured, Wyrd also emails it
+under REQ-017. Pending invitations can be listed (recipient, assignments,
+expiry, last send outcome; never the code), resent and revoked. Resend issues a
+fresh code and expiry and voids the previous link. Store only a verifier of the
+code. Opening the link spends nothing; the code is consumed only when the
+recipient completes enrollment.
+
+Possession of the live link admits enrollment with any allowed password or
+provider method, as in comparable products; the addressed email identifies whom
+the administrator intended and where Wyrd sends it. It never selects, links or
+identifies an existing User, and a differing provider email does not refuse
+enrollment. There is no shared multi-use link: one invitation admits one User.
+Whoever holds a forwarded live link can enroll; this is the accepted cost of the
+conventional model, bounded by single use, the 24-hour expiry, revoke and the
+administrator's review of pending invitations.
 
 Preserve REQ-008's issuer-authority and scoped-assignment checks. In one tenant
-transaction, revalidate invitation, recipient proof, tenant policy and provider
-binding where applicable; create the User/identity and intended bindings,
-consume the invitation and create the session, or commit none of them.
-Concurrent redemption cannot spend an invitation twice or create duplicate
-Users. Invalid, expired, revoked or mismatched invitations create no active User
-or grants. If the provider identity already belongs to a User, refuse new-User
-enrollment and direct them to sign in and request access; do not transfer the
-identity or silently merge accounts.
+transaction, revalidate the invitation, tenant policy and provider binding where
+applicable; create the User/identity and intended bindings, consume the
+invitation and create the session, or commit none of them. Concurrent
+redemption cannot spend an invitation twice or create duplicate Users. Invalid,
+expired, revoked or superseded links create no active User or grants. If the
+provider identity already belongs to a User, refuse new-User enrollment and
+direct them to sign in and request access; do not transfer the identity or
+silently merge accounts.
 
 ### REQ-014 — Public signup reuses tenant creation and makes its creator admin
 
@@ -419,23 +429,24 @@ connection; without a usable one it refuses rather than falling back to
 password/social. Replacement retains existing connection-revision invalidation
 and issuer/subject identity rules; it never moves identities between Users.
 
-### REQ-017 — Generic operator SMTP delivers invitations with honest outcomes
+### REQ-017 — Optional operator SMTP emails invitations with honest outcomes
 
-An operator administrator configures one deployment SMTP service: host, port,
-TLS mode, optional credentials and sender address, with a test-send action.
-Store credentials through existing encrypted-secret handling; reads omit them.
-Tenant administrators use delivery but cannot read/change its credentials.
+An operator administrator may configure one deployment SMTP service: host,
+port, TLS mode, optional credentials and sender address, with a test-send
+action. Store credentials through existing encrypted-secret handling; reads omit
+them. Tenant administrators use delivery but cannot read/change its credentials.
 Self-hosted and SaaS use the same path. Provider account/sender-domain setup
 remain external operator work. Resend is an example, not a dedicated integration,
 preset, SDK dependency or required test provider.
 
-Send each invitation separately after its transaction commits; do not hold a
-tenant transaction open during SMTP IO. Report relay acceptance or failure per
-recipient, never claim inbox delivery from SMTP acceptance. A send failure leaves
-the invitation pending, creates no active User and permits explicit resend.
-Wyrd runs without SMTP, but the UI explains that emailed invitations require
-operator configuration; missing SMTP does not weaken recipient proof. No new
-mail queue, automatic retry subsystem or provider-specific API is required.
+With SMTP configured, send each invitation link separately after its transaction
+commits; do not hold a tenant transaction open during SMTP IO. Report relay
+acceptance or failure per recipient, never claim inbox delivery from SMTP
+acceptance. The create/resend response carries each link and its send outcome
+after sending finishes. A send failure leaves the invitation pending, creates no
+active User and permits explicit resend, which returns a new link to copy. Without SMTP, invitations
+work through copied links and the UI says Wyrd will not email them. No new mail
+queue, automatic retry subsystem or provider-specific API is required.
 
 ## Persistence and authority changes
 
@@ -481,12 +492,11 @@ additional isolation or authority exception is approved.
 | platform.tenants and existing provisioning state | Associate signup-created tenant/claim with its proven creation attempt so another caller cannot adopt a failed claim; retain the directory lifecycle |
 | wyrd.auth_browser_sessions, wyrd.auth_device_authorizations, wyrd.auth_refresh_tokens | Complete social provider/revision and linked-identity anchors, invalidation/renewal constraints; preserve password/company/recovery anchors and client binding |
 | New tenant login-policy metadata | Require-company-SSO state and revision tied to current Active company connection; integrate existing freshness/invalidation owners |
-| wyrd.auth_user_invitations | Recipient address, scoped intents, pending/revoke/expiry/consumption and safe per-recipient send outcome; no raw invitation secret in storage |
-| New tenant recipient-proof records | Expiring, one-use mailbox challenge verifiers bound to recipient, invitation, browser/enrollment purpose and tenant when provider proof is insufficient; never email-based User lookup |
+| wyrd.auth_user_invitations | Recipient address, scoped intents, pending/revoke/expiry/consumption/resend and safe per-recipient send outcome; no raw invitation secret in storage |
 
 Support constraints/indexes/policies are limited to provider/method validity,
 unique identity ownership, bound one-use completion, shared admission accounting,
-recipient proof, per-recipient lookup/state and tenant isolation. Invitation
+per-recipient lookup/state and tenant isolation. Invitation
 contents/raw codes are not a PostgreSQL mail spool; construct message content
 for sending, persisting only coordination metadata. Any additional persistence
 purpose or SQL function needs a specification revision. Rate-limit windows/counts
@@ -535,7 +545,7 @@ absence of forbidden side effects, not only UI success messages.
 | AC-001: An administrator gives a user access, and every surface respects it | Create Alice and payments access through the UI, including direct/group variants. Alice completes local login and CLI approval. UI, HTTP/CLI, SDK/MCP and raw SQL expose the same Repository/review membership; another Repository contributes no data/counts. GitHub configuration and access administration remain denied. Programmatic creation/grants exercise the same contracts. | REQ-001, REQ-002, REQ-006, REQ-007, REQ-008 |
 | AC-002: A provisioned Service operates across releases with correct attribution | Create checkout-runtime through HTTP/CLI and the UI variant; inspect the same family/grants. Run two checkout releases with the same account/key. Retained results preserve exact release, owning Card, subject, Verifier and actor attribution. Another runtime family's UID and an ungranted operation are refused without unauthorized work. | REQ-001, REQ-003, REQ-005, REQ-006, REQ-008 |
 | AC-003: Access changes affect existing sessions and credentials predictably | Copy a safe request, grant through HTTP/CLI, use the existing session, then remove/change through the UI. Observe healthy propagation, warm cache reuse, restricted/delegated limits and agreement across callers. Interrupt confirmation to prove known-invalidated refusal and the five-minute maximum with bearer requests independent of browser-store availability. | REQ-001, REQ-004, REQ-005, REQ-008, REQ-009, REQ-010 |
-| AC-004: An operator enables social login and an administrator invites a team | Set up/test/enable Google and GitHub through operator UI/APIs beside company SSO; tenant-admin changes to shared settings fail. Configure a local SMTP test server, paste 10+ recipients with scoped access, inspect separate send outcomes and pending/resend/revoke state. Accept using allowed password/provider methods with recipient proof; stranger login, wrong recipients, forwarding, expired/revoked/replayed codes and concurrent redemption gain no unauthorized User/grant. SMTP failure/absence is visible without creating an active User. Returning social login preserves access and company/direct bindings; another tenant remains separate. | REQ-011, REQ-012, REQ-013, REQ-017; preserves REQ-001, REQ-008 |
+| AC-004: An operator enables social login and an administrator invites a team | Set up/test/enable Google and GitHub through operator UI/APIs beside company SSO; tenant-admin changes to shared settings fail. Without SMTP, paste 10+ recipients with scoped access and copy each returned link; configure a local SMTP test server and observe separate emailed links, send outcomes and pending/resend/revoke state. Accept links using allowed password/provider methods; stranger login, expired/revoked/superseded/replayed links, an already-owned provider identity and concurrent redemption gain no unauthorized User/grant. SMTP failure is visible beside the returned link and creates no active User. Returning social login preserves access and company/direct bindings; another tenant remains separate. | REQ-011, REQ-012, REQ-013, REQ-017; preserves REQ-001, REQ-008 |
 | AC-005: A visitor creates a workspace and becomes its administrator | With signup enabled, prove Google/GitHub identity, choose a new workspace and observe a usable tenant, creator's admin binding and ordinary session. Disabled signup, rate-limit refusal, unavailable admission state and invalidated provider create no active tenant. Exercise replay, concurrent/retried creation, failed initialization and lost session response: no duplicate/ownerless active tenant or takeover of another attempt. An existing tenant's slug/domain grants no entry; no platform principal/privilege or bootstrap key is returned. | REQ-011, REQ-012, REQ-014 |
 | AC-006: A User connects a method and the tenant adopts company SSO | Freshly prove a password User's existing method and connect Google/GitHub/company SSO; principal/access/keys remain. Stale/recovery-only proof, conflicts and races cannot transfer identities. Add a password from a social-only User, remove a method and inspect anchor invalidation; last-method removal is refused. Enable company-SSO policy after admin proof and observe refusal of password/social starts, racing callbacks, existing browser sessions and CLI renewals. Provider replacement/removal and policy apply across replicas; API keys and operator recovery retain existing policy. | REQ-012, REQ-015, REQ-016; preserves REQ-002, REQ-004, REQ-005 |
 
@@ -588,5 +598,9 @@ reconciliation was recorded that day. Revision 3 records the design locked on
 2026-11-21 and the clarification that generic SMTP, not a Resend-specific
 integration, is the contract. It includes the approved PostgreSQL platform-key
 distinction and completed authority reconciliation. The maintainer explicitly
-approved revision 3 on 2026-11-21. Planning may now derive task 003 from this
-contract. Specification approval does not authorize Git staging, commits or pushes.
+approved revision 3 on 2026-11-21. Revision 4 (approved by the maintainer, 2026-11-21) follows the
+conventional invitation model at the maintainer's direction: each invitation is
+a single-use link the administrator can copy, SMTP is optional delivery, and
+mailbox-challenge recipient proof and its records are removed. Task 003 is
+replanned against it.
+Specification approval does not authorize Git staging, commits or pushes.

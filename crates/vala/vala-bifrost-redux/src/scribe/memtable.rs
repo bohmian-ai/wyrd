@@ -2213,12 +2213,6 @@ impl AppendTail {
     }
 }
 
-/// One bucket's or generation's batches, captured under the memtable read
-/// locks and projected only after they are released.
-///
-/// Capturing shares each [`AppendRun`] by reference and copies only a
-/// writable bucket's tail, never row data, so the locks are held for a few
-/// pointer copies per run.
 /// A capture's recorded batch bounds, read through one projection.
 ///
 /// A pruning predicate planned over the projected fields asks for a projected
@@ -2310,6 +2304,12 @@ thread_local! {
     static PROJECTED_BOUNDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// One bucket's or generation's batches, captured under the memtable read
+/// locks and projected only after they are released.
+///
+/// Capturing shares each [`AppendRun`] by reference and copies only a
+/// writable bucket's tail, never row data, so the locks are held for a few
+/// pointer copies per run.
 #[derive(Debug, Clone)]
 struct ReadableSource {
     /// Arrow schema shared by every batch.

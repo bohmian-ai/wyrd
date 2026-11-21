@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -508,6 +509,10 @@ pub(crate) struct WalAppendResult {
 }
 
 impl PreparedWalAppend {
+    /// Prepares a slice from one contiguous payload, for test and benchmark
+    /// fixtures that frame opaque bytes; production preparation passes the
+    /// encoder's ordered chunks to [`Self::chunked`].
+    #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
     pub(crate) fn new(lsn: WalLsn, batch_id: [u8; 16], data: Bytes) -> Self {
         Self::chunked(lsn, batch_id, vec![arrow::buffer::Buffer::from(data)])
     }

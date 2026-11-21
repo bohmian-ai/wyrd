@@ -88,7 +88,10 @@ impl PreparedWalAppendFixture {
     /// Compute the data payload checksum without touching the filesystem.
     #[must_use]
     pub fn crc32(&self) -> u32 {
-        crc32c::crc32c(&self.append.data)
+        self.append
+            .data
+            .iter()
+            .fold(0, |crc, chunk| crc32c::crc32c_append(crc, chunk))
     }
 }
 

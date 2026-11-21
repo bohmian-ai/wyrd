@@ -735,7 +735,7 @@ fn prepared_slice_bytes(slices: &[PreparedSlice], limit: usize) -> Result<usize,
         |total, slice| -> Result<usize, ScribeError> {
             total
                 .checked_add(slice.memtable_bytes)
-                .and_then(|value| value.checked_add(slice.wal_append.data.len()))
+                .and_then(|value| value.checked_add(slice.wal_append.retained_data_bytes()))
                 .ok_or(ScribeError::DecodedPayloadTooLarge {
                     bytes: usize::MAX,
                     limit,
@@ -794,7 +794,7 @@ fn prepare_slice(
     let seal_key = SealKey::new(context.tenant, context.table.clone(), partition)
         .with_table_version(context.table_version);
     let memtable_bytes = crate::scribe::memory::retained_arrow_bytes(&rows);
-    let data_payload = encode_ipc(&rows, memtable_bytes)?;
+    let data_payload = encode_ipc(&rows)?;
     let identity_span = tracing::debug_span!(
         "scribe_logical_batch_identity",
         batch_id = %context.batch_id,
@@ -802,7 +802,7 @@ fn prepare_slice(
     );
     let (logical_data_digest, logical_data_len) =
         identity_span.in_scope(|| logical_data_identity(&rows))?;
-    let wal_append = PreparedWalAppend::new(
+    let wal_append = PreparedWalAppend::chunked(
         crate::scribe::wal::WalLsn::ZERO,
         *context.batch_id.as_bytes(),
         data_payload,
@@ -825,21 +825,21 @@ fn prepare_slice(
         memtable_bytes,
     })
 }
-
-/// Encodes one current day as a ZSTD level-1 Arrow IPC stream, in one pass.
+/// Encodes one slice as a standalone compressed Arrow IPC stream, returned
+/// as the encoder's ordered chunks so the WAL writes them without joining.
 ///
-/// The payload is written into one allocation of `capacity` bytes, the
-/// rows' retained Arrow bytes, which compression keeps it under in the common
-/// case, then shrunk to its compressed length so the WAL does not retain the
-/// spare capacity. The stream stays within
+/// The concatenated chunks are byte for byte the stream Arrow's
+/// `StreamWriter` writes with the same options, so every WAL reader still
+/// decodes it with Arrow's standard `StreamReader`. The stream stays within
 /// [`crate::scribe::material_plan::wal_payload_bound`], which canonical
-/// admission reserved, so it is not counted again here. Every WAL reader
-/// decodes it with Arrow's standard `StreamReader`.
+/// admission reserved; the chunks' retained capacity is charged with the
+/// slice through [`PreparedWalAppend::retained_data_bytes`].
 ///
 /// # Errors
 ///
-/// Returns [`ScribeError::Internal`] when either Arrow step fails.
-fn encode_ipc(rows: &RecordBatch, capacity: usize) -> Result<Bytes, ScribeError> {
+/// Returns [`ScribeError::Internal`] when compression is unavailable or
+/// either Arrow step fails.
+fn encode_ipc(rows: &RecordBatch) -> Result<Vec<arrow::buffer::Buffer>, ScribeError> {
     let options = arrow::ipc::writer::IpcWriteOptions::default()
         .try_with_compression(Some(crate::scribe::material_plan::WAL_IPC_COMPRESSION))
         .and_then(|options| {
@@ -850,24 +850,21 @@ fn encode_ipc(rows: &RecordBatch, capacity: usize) -> Result<Bytes, ScribeError>
         .map_err(|error| ScribeError::Internal {
             detail: format!("Arrow IPC compression unavailable: {error}"),
         })?;
-    let mut payload = Vec::with_capacity(capacity);
-    let mut writer = arrow::ipc::writer::StreamWriter::try_new_with_options(
-        &mut payload,
-        &rows.schema(),
-        options,
-    )
-    .map_err(|error| ScribeError::Internal {
-        detail: format!("Arrow IPC encode init failed: {error}"),
-    })?;
-    writer.write(rows).map_err(|error| ScribeError::Internal {
-        detail: format!("Arrow IPC encode failed: {error}"),
-    })?;
-    writer.finish().map_err(|error| ScribeError::Internal {
+    let mut encoder =
+        arrow::ipc::writer::StreamEncoder::try_new_with_options(&rows.schema(), options).map_err(
+            |error| ScribeError::Internal {
+                detail: format!("Arrow IPC encode init failed: {error}"),
+            },
+        )?;
+    let mut chunks = encoder
+        .encode(rows)
+        .map_err(|error| ScribeError::Internal {
+            detail: format!("Arrow IPC encode failed: {error}"),
+        })?;
+    chunks.extend(encoder.finish().map_err(|error| ScribeError::Internal {
         detail: format!("Arrow IPC encode finish failed: {error}"),
-    })?;
-    drop(writer);
-    payload.shrink_to_fit();
-    Ok(Bytes::from(payload))
+    })?);
+    Ok(chunks)
 }
 
 fn notify_completion(
@@ -1283,7 +1280,7 @@ mod tests {
         )]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(map) as _]).expect("map batch");
 
-        let payload = encode_ipc(&batch, 0).expect("encodes");
+        let payload = joined(encode_ipc(&batch).expect("encodes"));
 
         assert!(
             payload.len()
@@ -1294,6 +1291,88 @@ mod tests {
                 .expect("valid stream");
         assert_eq!(reader.next().expect("one batch").expect("decodes"), batch);
         assert!(reader.next().is_none());
+    }
+
+    /// Joins encoded chunks into the one stream a reader decodes.
+    fn joined(chunks: Vec<arrow::buffer::Buffer>) -> Vec<u8> {
+        chunks
+            .iter()
+            .flat_map(arrow::buffer::Buffer::as_slice)
+            .copied()
+            .collect()
+    }
+
+    /// Encodes `rows` through the contiguous `StreamWriter` path, the exact
+    /// byte reference for a slice's chunked WAL payload.
+    fn reference_ipc(rows: &RecordBatch) -> Vec<u8> {
+        let options = arrow::ipc::writer::IpcWriteOptions::default()
+            .try_with_compression(Some(crate::scribe::material_plan::WAL_IPC_COMPRESSION))
+            .and_then(|options| {
+                options.try_with_compression_level(Some(
+                    crate::scribe::material_plan::WAL_IPC_COMPRESSION_LEVEL,
+                ))
+            })
+            .expect("WAL compression");
+        let mut bytes = Vec::new();
+        let mut writer = StreamWriter::try_new_with_options(&mut bytes, &rows.schema(), options)
+            .expect("reference writer");
+        writer.write(rows).expect("reference batch");
+        writer.finish().expect("reference finish");
+        drop(writer);
+        bytes
+    }
+
+    /// A prepared slice carries its IPC stream as the encoder's ordered
+    /// chunks, unjoined, and those chunks are byte for byte the stream the
+    /// contiguous writer produces, for nested, null, dictionary and
+    /// offset-sliced columns and for each tenant's independent slice.
+    #[test]
+    fn prepared_slices_carry_unjoined_chunks_with_reference_bytes() {
+        use arrow::array::{DictionaryArray, ListArray, StringArray};
+        use arrow::datatypes::Int32Type;
+
+        let list = ListArray::from_iter_primitive::<arrow::datatypes::Int64Type, _, _>(
+            (0..64_i64)
+                .map(|row| (row % 5 != 0).then(|| (0..row % 4).map(Some).collect::<Vec<_>>())),
+        );
+        let dictionary: DictionaryArray<Int32Type> = (0..64)
+            .map(|row| (row % 3 != 0).then_some(["x", "y", "z"][row % 3]))
+            .collect();
+        let text =
+            StringArray::from_iter((0..64).map(|row| (row % 7 != 0).then(|| format!("v{row}"))));
+        let rows = RecordBatch::try_from_iter(vec![
+            ("list", Arc::new(list) as ArrayRef),
+            ("dictionary", Arc::new(dictionary) as ArrayRef),
+            ("text", Arc::new(text) as ArrayRef),
+        ])
+        .expect("mixed batch")
+        .slice(3, 50);
+        let table = TableRef::new(BifrostNamespace::Bifrost, "chunked");
+        for tenant in [DataTenantId::new_v7(), DataTenantId::new_v7()] {
+            let slice = super::prepare_slice(
+                super::SliceContext {
+                    batch_id: uuid::Uuid::new_v4(),
+                    request_id: uuid::Uuid::new_v4(),
+                    tenant,
+                    table: &table,
+                    table_version: wyrd_spec::vala::ids::TableVersion::INITIAL,
+                },
+                crate::catalog::PhysicalPartition::time_only(crate::test_support::day_partition(
+                    2026, 1, 1,
+                )),
+                rows.clone(),
+            )
+            .expect("prepares slice");
+            let chunks = &slice.wal_append.data;
+            assert!(chunks.len() > 1, "the stream was joined into one chunk");
+            let joined = joined(chunks.clone());
+            assert_eq!(joined, reference_ipc(&rows));
+            assert_eq!(
+                usize::try_from(slice.wal_append.data_len().expect("length")).expect("fits"),
+                joined.len()
+            );
+            assert!(slice.wal_append.retained_data_bytes() >= joined.len());
+        }
     }
 
     /// Incompressible buffers stay within the reserved bound; compressible
@@ -1332,7 +1411,7 @@ mod tests {
         ])
         .expect("incompressible batch");
 
-        let payload = encode_ipc(&batch, 0).expect("encodes");
+        let payload = joined(encode_ipc(&batch).expect("encodes"));
         assert!(
             payload.len()
                 <= crate::scribe::material_plan::wal_payload_bound(&batch).expect("bounds")
@@ -1353,6 +1432,6 @@ mod tests {
         writer.write(&constant).expect("writes");
         writer.finish().expect("finishes");
         drop(writer);
-        assert!(encode_ipc(&constant, 0).expect("encodes").len() < uncompressed.len());
+        assert!(joined(encode_ipc(&constant).expect("encodes")).len() < uncompressed.len());
     }
 }

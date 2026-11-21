@@ -386,9 +386,9 @@ debt; do not claim a fixed row ceiling as the assertion.
 - TDD: SQL and admission scenarios had RED first. The health unit test, the
   cleaner pg tests and the journey were written after their code: TDD
   violation for those; the journey's strength is shown by the mutation above.
-- Not separately tested: a crash between DELETE commit and health
-  publication (health is in-memory and starts unverified, so a restart only
-  delays admission).
+- Crash during a sweep: health and the mirror are process memory only, so
+  a crash at any point is an ordinary restart (unverified until recovery's
+  sweep), covered by the restart journeys.
 - Commands: the scenario 2 command with `receipt` added to the redux filter
   → 483/483 and 52/52; `vala-sql` `pg_scribe_batch_commits` → 9/9;
   `mise run fmt`, `mise run lints`, `check:tenant-isolation` clean.

@@ -39,8 +39,6 @@ impl DomainTable for ApprovalsTable {
     const PAYLOAD_CLASS: PayloadClass = PayloadClass::Sensitive;
     /// The reason column gated behind the elevated payload permission.
     const SENSITIVE_PAYLOAD_COLUMNS: &'static [&'static str] = &[REASON];
-    /// A decision exists only once its batch fence commits.
-    const FENCED_ONLY: bool = true;
 
     /// Authored columns in order; managed correlation and system columns are appended by the catalog.
     fn arrow_fields() -> Vec<Field> {

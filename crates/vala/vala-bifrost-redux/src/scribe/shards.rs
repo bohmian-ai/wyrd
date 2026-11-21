@@ -1920,47 +1920,20 @@ impl ShardOwner {
             });
         }
         let commits = replayed.commits.clone();
-        let fenced_only = crate::tables::builtin_table(
-            replayed
-                .seal_key
-                .table
-                .namespace
-                .as_str()
-                .strip_prefix("bifrost.")
-                .unwrap_or_default(),
-            &replayed.seal_key.table.name,
-        )
-        .is_some_and(|definition| definition.fenced_only);
         let mut suppressed = Vec::new();
         for commit in &commits {
             match self.resolve_replayed_commit(replayed, commit).await? {
-                // A fenced-only table's batch is accepted only with its
-                // fence, so an unfenced one was never accepted or ACKed.
+                // Only an accepted batch was ever acknowledged, so an
+                // unfenced attempt restores nothing, and neither does a
+                // later attempt of an accepted batch.
                 vala_sql::queries::scribe_batch_commits::ScribeBatchReplayResolution::Unfenced
-                    if fenced_only =>
-                {
+                | vala_sql::queries::scribe_batch_commits::ScribeBatchReplayResolution::Suppress => {
                     suppressed.push((
                         commit.batch_id,
                         commit.wal_lsn_min.as_u64()..=commit.wal_lsn_max.as_u64(),
                     ));
                 }
-                vala_sql::queries::scribe_batch_commits::ScribeBatchReplayResolution::Suppress => {
-                    suppressed.push((
-                        commit.batch_id,
-                        commit.wal_lsn_min.as_u64()..=commit.wal_lsn_max.as_u64(),
-                    ));
-                }
-                vala_sql::queries::scribe_batch_commits::ScribeBatchReplayResolution::Unfenced
-                    if commit.contested =>
-                {
-                    return Err(ScribeError::Internal {
-                        detail: "WAL replay holds differing attempts at an unfenced batch id"
-                            .to_owned(),
-                    });
-                }
-                vala_sql::queries::scribe_batch_commits::ScribeBatchReplayResolution::Unfenced
-                | vala_sql::queries::scribe_batch_commits::ScribeBatchReplayResolution::Restore => {
-                }
+                vala_sql::queries::scribe_batch_commits::ScribeBatchReplayResolution::Restore => {}
             }
         }
         suppressed.extend(

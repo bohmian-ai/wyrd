@@ -337,9 +337,6 @@ pub struct BuiltinTableDefinition {
     /// row, the Parquet Bloom recipe, and every partition identity — is derived
     /// from that one canonical layout.
     pub physical_layout: fn() -> PhysicalLayoutWire,
-    /// Whether only fenced batches hold the table's records; see
-    /// [`DomainTable::FENCED_ONLY`].
-    pub fenced_only: bool,
 }
 
 /// Enforce the Variant contract over one supplied batch at the trust boundary.
@@ -609,14 +606,6 @@ pub trait DomainTable: Send + Sync + 'static {
     /// The pre-declared validator refuses a row that sets only some children
     /// of one of these columns; see [`refuse_partial_structs`].
     const WHOLE_STRUCTS: &'static [&'static str] = &[];
-
-    /// Whether only a batch with a durable fence holds the table's records.
-    ///
-    /// A writer of such a table treats a batch as accepted only once its
-    /// fence commits, so WAL replay never restores a batch the fence never
-    /// accepted: it was never acknowledged, and a later batch may already
-    /// hold its batch id.
-    const FENCED_ONLY: bool = false;
 
     /// User-owned fields, excluding correlation and system fields.
     fn arrow_fields() -> Vec<Field>;
@@ -1279,7 +1268,6 @@ const fn definition<T: DomainTable>() -> BuiltinTableDefinition {
         canonical_validator: T::CANONICAL_VALIDATOR,
         derived_columns: T::DERIVED_COLUMNS,
         physical_layout: T::physical_layout,
-        fenced_only: T::FENCED_ONLY,
     }
 }
 

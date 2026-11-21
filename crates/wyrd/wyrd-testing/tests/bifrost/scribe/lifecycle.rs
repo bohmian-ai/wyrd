@@ -577,6 +577,86 @@ async fn scribe_shutdown_drains_or_preserves_replay() {
         .expect("the cluster drains cleanly");
 }
 
+/// A complete WAL attempt whose batch was never accepted restores no rows
+/// after an abrupt restart, on an ordinary table as on a domain table.
+///
+/// One batch is accepted. While the tenant role cannot record batch
+/// receipts, a second batch is written to the WAL and refused, so its
+/// producer never sees an acknowledgement. After the pod is terminated and
+/// replaced on its retained roots, only the accepted rows read back.
+///
+/// # Panics
+///
+/// Panics when the cluster cannot start, the accepted append fails, the
+/// unrecorded append is acknowledged, or the never-accepted rows reappear.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn replay_restores_only_accepted_batches() {
+    let mut cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed())
+        .await
+        .expect("the one-pod mixed cluster starts");
+    let tenant = cluster.data_tenant_id();
+    let name = unique_table("accepted_only_replay");
+    let node = {
+        let server = cluster.server(0).expect("the mixed pod is running");
+        register_table(server, tenant, BifrostNamespace::Datasets, &name).await;
+        server.node_id()
+    };
+    let table = format!("{}.{name}", BifrostNamespace::Datasets.as_str());
+    let accepted: Vec<i64> = (0..24).collect();
+    let pool = cluster
+        .pg_fixture()
+        .superuser_pool()
+        .expect("fixture exposes a superuser pool");
+    {
+        let server = cluster.server(0).expect("the mixed pod is running");
+        let client = tenant_client(server, tenant).await;
+        append_values(&client, &table, Uuid::now_v7(), &accepted)
+            .await
+            .expect("the first append is acknowledged");
+        sqlx::query("REVOKE INSERT ON vala.scribe_batch_commits FROM wyrd_tenant")
+            .execute(&pool)
+            .await
+            .expect("receipt recording is revoked");
+        let refused = append_values(
+            &client,
+            &table,
+            Uuid::now_v7(),
+            &(100..124).collect::<Vec<_>>(),
+        )
+        .await;
+        sqlx::query("GRANT INSERT ON vala.scribe_batch_commits TO wyrd_tenant")
+            .execute(&pool)
+            .await
+            .expect("receipt recording is granted again");
+        assert!(
+            refused.is_err(),
+            "an unrecorded batch is never acknowledged"
+        );
+    }
+
+    let roots = cluster
+        .terminate_node_abruptly_for_test(node)
+        .await
+        .expect("the pod is terminated without a drain");
+    cluster
+        .restart_terminated_node_at_new_address(node, roots)
+        .await
+        .expect("a replacement pod restarts on the retained roots");
+    let server = cluster.server(0).expect("the replacement pod is running");
+    let client = tenant_client(server, tenant).await;
+    assert_eq!(
+        sorted_values(&client, &table).await,
+        accepted,
+        "a never-accepted WAL attempt restores no rows"
+    );
+
+    cluster
+        .shutdown()
+        .await
+        .expect("the cluster drains cleanly");
+}
+
 /// Starts one bound pod over a durable Bifrost data root and provisions one
 /// queued Verifier execution in its tenant.
 ///

@@ -119,6 +119,35 @@ pub async fn insert_proven_signup(
     .map_err(SqlError::from)
 }
 
+/// Record `address`, proven by email, as the verified contact of the live,
+/// still-`proven` provider attempt `attempt` whose provider verified none,
+/// and hold it under a new `completion_hash`; the same address again, as
+/// after a lost response, only rotates the completion. `false` otherwise.
+///
+/// # Errors
+/// Returns [`SqlError::Query`] when the update fails.
+pub async fn attach_signup_contact(
+    pool: &OperatorPool,
+    attempt: Uuid,
+    address: &str,
+    completion_hash: &[u8],
+) -> Result<bool, SqlError> {
+    sqlx::query(
+        "UPDATE platform.signup_attempts
+            SET email = $2, completion_hash = $3, updated_at = statement_timestamp()
+          WHERE id = $1 AND proof_kind = 'social' AND status = 'proven'
+            AND (email IS NULL OR email = $2)
+            AND expires_at > statement_timestamp()",
+    )
+    .bind(attempt)
+    .bind(address)
+    .bind(completion_hash)
+    .execute(pool.pool())
+    .await
+    .map(|done| done.rows_affected() == 1)
+    .map_err(SqlError::from)
+}
+
 /// Hold the live, still-`proven` proof with `proof_hash` under a new
 /// `completion_hash`, when the same browser (`browser_binding_hash`) proved
 /// it: the recovery of a lost verification response. `false` otherwise.

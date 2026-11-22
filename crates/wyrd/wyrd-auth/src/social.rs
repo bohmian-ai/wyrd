@@ -46,9 +46,9 @@ use wyrd_sql::queries::auth::{
     local_credential_for_update,
 };
 use wyrd_sql::queries::platform::signup::{
-    SignupAdmissionScope, SignupProof, admit_signup, finish_signup_creation, insert_proven_signup,
-    proven_signup, purge_expired_signup_state, renew_signup_completion, signup_clock,
-    start_signup_creation,
+    SignupAdmissionScope, SignupProof, admit_signup, attach_signup_contact, finish_signup_creation,
+    insert_proven_signup, proven_signup, purge_expired_signup_state, renew_signup_completion,
+    signup_clock, start_signup_creation,
 };
 use wyrd_sql::queries::platform::social::{
     LoginSettingsRow, ProviderEnablement, SocialProviderRow, SocialTestState,
@@ -274,7 +274,9 @@ impl SocialSignIn {
                 "revision_stale",
             ));
         }
-        let authorization = self.authorize(provider, &row.client_id, origin).await?;
+        let authorization = self
+            .authorize(provider, &row.client_id, origin, false)
+            .await?;
         insert_social_test_state(
             &self.operator,
             Sha256Hex::digest(authorization.state.as_bytes()).as_bytes(),
@@ -295,6 +297,7 @@ impl SocialSignIn {
 
     /// Build `provider`'s authorization redirect for `client_id`, returning to
     /// its social callback on `origin`, with fresh state, nonce and PKCE.
+    /// Workspace `acquisition` alone asks GitHub for `user:email`.
     ///
     /// # Errors
     /// Returns [`WyrdError::Validation`] when `origin` cannot form a callback,
@@ -306,6 +309,7 @@ impl SocialSignIn {
         provider: SocialProvider,
         client_id: &str,
         origin: &Url,
+        acquisition: bool,
     ) -> Result<SocialAuthorization, WyrdError> {
         let redirect_uri = social_callback(provider, origin)?;
         match provider {
@@ -331,7 +335,7 @@ impl SocialSignIn {
             SocialProvider::Github => {
                 let authorization = self
                     .github
-                    .authorize(client_id, redirect_uri.as_str())
+                    .authorize(client_id, redirect_uri.as_str(), acquisition)
                     .map_err(relying_party_error)?;
                 Ok(SocialAuthorization {
                     url: AbsoluteUrl::new(authorization.url.as_str().to_owned())
@@ -376,11 +380,14 @@ impl SocialSignIn {
         let enabled = self.open(provider, row)?;
         self.verify_code(
             &enabled,
-            code,
-            &state.redirect_uri,
-            &state.code_verifier,
-            Some(&state.nonce),
-            response_issuer,
+            ProviderReturn {
+                code,
+                redirect_uri: &state.redirect_uri,
+                code_verifier: &state.code_verifier,
+                nonce: Some(&state.nonce),
+                response_issuer,
+            },
+            false,
         )
         .await
     }
@@ -423,11 +430,14 @@ impl SocialSignIn {
         let enabled = self.revision(provider, state.provider_revision).await?;
         self.verify_code(
             &enabled,
-            code.into_secret_string(),
-            &state.redirect_uri,
-            &SecretString::from(state.code_verifier),
-            state.nonce.as_deref(),
-            response_issuer,
+            ProviderReturn {
+                code: code.into_secret_string(),
+                redirect_uri: &state.redirect_uri,
+                code_verifier: &SecretString::from(state.code_verifier),
+                nonce: state.nonce.as_deref(),
+                response_issuer,
+            },
+            false,
         )
         .await?;
         if !stamp_social_provider_tested(&self.operator, provider.as_str(), state.provider_revision)
@@ -440,7 +450,9 @@ impl SocialSignIn {
     }
 
     /// Redeem `code` at `provider`'s token endpoint and verify the identity
-    /// it returns.
+    /// it returns. For workspace `acquisition` the identity's email is its
+    /// provider-verified address only: Google's under a validated
+    /// `email_verified`, GitHub's from its email API; `None` without one.
     ///
     /// # Errors
     /// Returns [`WyrdError::InvalidToken`] or [`WyrdError::InvalidNonce`] when
@@ -449,12 +461,16 @@ impl SocialSignIn {
     async fn verify_code(
         &self,
         provider: &EnabledProvider,
-        code: SecretString,
-        redirect_uri: &str,
-        code_verifier: &SecretString,
-        nonce: Option<&str>,
-        response_issuer: Option<&str>,
+        returned: ProviderReturn<'_>,
+        acquisition: bool,
     ) -> Result<MappedClaims, WyrdError> {
+        let ProviderReturn {
+            code,
+            redirect_uri,
+            code_verifier,
+            nonce,
+            response_issuer,
+        } = returned;
         match provider.provider {
             SocialProvider::Google => {
                 let issuer = &self.endpoints.google_issuer;
@@ -488,7 +504,11 @@ impl SocialSignIn {
                     )
                     .await
                     .map_err(relying_party_error)?;
-                Ok(verified.identity)
+                let mut identity = verified.identity;
+                if acquisition && verified.claims["email_verified"] != json!(true) {
+                    identity.email = None;
+                }
+                Ok(identity)
             }
             SocialProvider::Github => self
                 .github
@@ -498,6 +518,7 @@ impl SocialSignIn {
                     &code,
                     redirect_uri,
                     code_verifier,
+                    acquisition,
                 )
                 .await
                 .map_err(relying_party_error),
@@ -821,7 +842,9 @@ impl BrowserSessions {
             .map_err(store_error)?
             .filter(|row| row.enabled)
             .ok_or_else(|| invalid_token(&format!("{provider} sign-in is not available")))?;
-        let authorization = social.authorize(provider, &row.client_id, origin).await?;
+        let authorization = social
+            .authorize(provider, &row.client_id, origin, false)
+            .await?;
         let binding = SecretString::from(random_secret());
         let state = SocialLoginState {
             provider_revision: row.revision,
@@ -1190,6 +1213,11 @@ enum SignupEnvelope {
         binding: String,
         /// Database-clock deadline, in Unix seconds.
         expires_at: i64,
+        /// The provider attempt this mailbox becomes the verified contact
+        /// of, when its provider verified none; otherwise the proof is its
+        /// own email signup.
+        #[serde(default)]
+        attempt: Option<Uuid>,
     },
 }
 
@@ -1207,6 +1235,21 @@ fn sealing_key_missing() -> WyrdError {
         message: "signup needs the deployment sealing keyring".to_owned(),
         details: json!({ "reason": "sealing_key_missing" }),
     }
+}
+
+/// One provider return to redeem: its code and the round-trip values the
+/// redemption must match.
+struct ProviderReturn<'a> {
+    /// The authorization code.
+    code: SecretString,
+    /// The callback the authorization named.
+    redirect_uri: &'a str,
+    /// The PKCE verifier.
+    code_verifier: &'a SecretString,
+    /// The OIDC nonce, for providers that echo one.
+    nonce: Option<&'a str>,
+    /// The RFC 9207 `iss` the return carried.
+    response_issuer: Option<&'a str>,
 }
 
 /// A proven signup this completion now holds for creating its workspace.
@@ -1237,8 +1280,9 @@ pub enum SignupCredential {
         issuer: String,
         /// The identity's subject.
         subject: String,
-        /// The provider's email, when it gave one.
-        email: Option<String>,
+        /// The verified contact: the provider's verified email, or a
+        /// mailbox proven to Wyrd for this attempt.
+        email: String,
     },
     /// A tenant-local password, chosen at completion after an email proof.
     Local {
@@ -1246,7 +1290,19 @@ pub enum SignupCredential {
         username: String,
         /// The password's PHC verifier.
         verifier: String,
+        /// The proven address, the creator's verified contact.
+        email: String,
     },
+}
+
+impl SignupCredential {
+    /// The creator's verified contact address.
+    #[must_use]
+    pub fn contact(&self) -> &str {
+        match self {
+            Self::Social { email, .. } | Self::Local { email, .. } => email,
+        }
+    }
 }
 
 impl SocialSignIn {
@@ -1282,7 +1338,9 @@ impl SocialSignIn {
             .map_err(store_error)?
             .filter(|row| row.enabled)
             .ok_or_else(|| invalid_token(&format!("{provider} sign-in is not available")))?;
-        let authorization = self.authorize(provider, &row.client_id, origin).await?;
+        let authorization = self
+            .authorize(provider, &row.client_id, origin, true)
+            .await?;
         let binding = self.seal_envelope(&SignupEnvelope::SignupSocial {
             state: authorization.state,
             provider,
@@ -1309,6 +1367,11 @@ impl SocialSignIn {
     /// proof's digest, the canonical address, a browser binding and a
     /// fifteen-minute database-clock deadline. Nothing is stored.
     ///
+    /// When this browser's `completion` holds a live provider attempt whose
+    /// provider verified no email, the proof instead becomes that attempt's
+    /// verified contact; then signup and a mail relay must be available, but
+    /// not password sign-in.
+    ///
     /// # Errors
     /// Returns [`WyrdError::Validation`] for an unparsable address,
     /// [`WyrdError::SignupAttempts`] while a window is exhausted,
@@ -1321,6 +1384,7 @@ impl SocialSignIn {
         typed: &str,
         origin: &Url,
         source: Option<std::net::IpAddr>,
+        completion: Option<&str>,
     ) -> Result<SecretString, WyrdError> {
         let source = source.ok_or_else(source_unknown)?;
         let address = crate::mail::EmailAddress::parse(typed, "email")?;
@@ -1335,7 +1399,29 @@ impl SocialSignIn {
             ),
         ])
         .await?;
-        if !self.login_methods(None).await?.creation.local_signup {
+        let attempt = match completion {
+            Some(completion) => proven_signup(
+                &self.operator,
+                Sha256Hex::digest(completion.as_bytes()).as_bytes(),
+            )
+            .await
+            .map_err(store_error)?
+            .filter(|proven| {
+                proven.proof_kind == "social" && proven.status == "proven" && proven.email.is_none()
+            })
+            .map(|proven| proven.id),
+            None => None,
+        };
+        let offered = if attempt.is_some() {
+            self.settings().await?.signup_enabled
+                && mail_relay(&self.operator)
+                    .await
+                    .map_err(store_error)?
+                    .is_some()
+        } else {
+            self.login_methods(None).await?.creation.local_signup
+        };
+        if !offered {
             return Err(signup_unavailable());
         }
         let proof = random_secret();
@@ -1344,6 +1430,7 @@ impl SocialSignIn {
             address: address.canonical.clone(),
             binding: random_secret(),
             expires_at: self.envelope_deadline(SIGNUP_EMAIL_TTL).await?,
+            attempt,
         })?;
         let mut link = origin
             .join("/signup/verify")
@@ -1362,6 +1449,9 @@ impl SocialSignIn {
     /// local signup must still be offered. It is recorded once; the same
     /// browser presenting it again, as after a lost response, gets a fresh
     /// completion secret for the same proof, and any other flow is refused.
+    /// A proof begun for a provider attempt instead records the address as
+    /// that still-proven attempt's contact, once, and rotates its completion
+    /// secret.
     ///
     /// # Errors
     /// Returns [`WyrdError::OneTimeCodeInvalid`] for a missing or foreign
@@ -1382,6 +1472,7 @@ impl SocialSignIn {
             address,
             binding,
             expires_at,
+            attempt,
         }) = cookie.and_then(|cookie| self.open_envelope(cookie))
         else {
             return Err(refused());
@@ -1390,6 +1481,22 @@ impl SocialSignIn {
             return Err(refused());
         }
         self.require_live(expires_at).await?;
+        if let Some(attempt) = attempt {
+            let completion = SecretString::from(random_secret());
+            let attached = attach_signup_contact(
+                &self.operator,
+                attempt,
+                &address,
+                Sha256Hex::digest(completion.expose_secret().as_bytes()).as_bytes(),
+            )
+            .await
+            .map_err(store_error)?;
+            return if attached {
+                Ok(completion)
+            } else {
+                Err(refused())
+            };
+        }
         if !self.login_methods(None).await?.creation.local_signup {
             return Err(signup_unavailable());
         }
@@ -1476,11 +1583,14 @@ impl SocialSignIn {
         let identity = self
             .verify_code(
                 &enabled,
-                code,
-                &redirect_uri,
-                &SecretString::from(code_verifier),
-                Some(nonce.as_str()),
-                query.iss.as_deref(),
+                ProviderReturn {
+                    code,
+                    redirect_uri: &redirect_uri,
+                    code_verifier: &SecretString::from(code_verifier),
+                    nonce: Some(nonce.as_str()),
+                    response_issuer: query.iss.as_deref(),
+                },
+                true,
             )
             .await?;
         let completion = SecretString::from(random_secret());
@@ -1561,9 +1671,14 @@ impl SocialSignIn {
                     return Err(signup_unavailable());
                 }
                 let verifier = hash_password(password).await?;
+                let identity = identity_value("mailto", &address);
                 (
-                    SignupCredential::Local { username, verifier },
-                    identity_value("mailto", &address),
+                    SignupCredential::Local {
+                        username,
+                        verifier,
+                        email: address,
+                    },
+                    identity,
                 )
             }
             ("email", None) => {
@@ -1587,6 +1702,12 @@ impl SocialSignIn {
                         "this signup's proof cannot create a workspace; start again",
                     ));
                 };
+                let email = proven.email.ok_or_else(|| WyrdError::Conflict {
+                    message: "your provider did not verify an email address; verify one by \
+                              email to create the workspace"
+                        .to_owned(),
+                    details: json!({ "reason": "contact_required" }),
+                })?;
                 self.recheck_signup(provider, provider_revision).await?;
                 let identity = identity_value(&issuer, &subject);
                 (
@@ -1595,7 +1716,7 @@ impl SocialSignIn {
                         provider_revision,
                         issuer,
                         subject,
-                        email: proven.email,
+                        email,
                     },
                     identity,
                 )

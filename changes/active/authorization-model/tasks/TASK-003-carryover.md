@@ -637,6 +637,50 @@ and retention. RED here is missing contact/acquisition integration or delivered
 mail/provider variants, not a reason to rebuild earlier proven mechanisms;
 staged provider-only signup is not proof of this outcome.
 
+**Evidence (cycle 10):** RED: `platform_admin_e2e::signup::every_signup_creator_gets_a_verified_contact`
+failed at its first contact read because `wyrd.auth_user_contacts` did not exist. GREEN after
+these changes:
+
+- Migration `20261121000008_verified_contacts.sql` adds the revision-6 "tenant-local verified
+  recovery contact" table. It leads with `data_tenant_id`, has a tenant-qualified FK to
+  `auth_users`, forced RLS, and the tenant and operator policies. It has no address uniqueness,
+  because duplicates are allowed.
+- `SignupCredential` now carries the verified contact. Provisioning writes it in the
+  User-creation transaction, so a resumed creation finds it already committed.
+- At acquisition, Google keeps its email only under a validated `email_verified: true`.
+- GitHub signup alone requests `user:email` and takes a verified address from `/user/emails`,
+  primary first. Sign-in and invitations still request no scope; the existing GitHub
+  invitation journey still passes.
+- A provider attempt without a verified email refuses completion with `409 contact_required`
+  and creates nothing.
+- The same browser can start the email branch while holding its completion cookie. This needs
+  signup and a relay, not password. Verification records the mailed address on that
+  still-`proven` attempt once (`attach_signup_contact`) and rotates its completion.
+
+The journey asserts:
+- Google-verified contact without SMTP;
+- an unverified Google email is refused with no tenant, and there is no email branch without a
+  relay;
+- with a relay, the bound branch creates the workspace with the canonical mailed address as
+  contact, no password and the Google identity;
+- the local admin's contact is its proven address, and its password session invites a teammate
+  (`201`);
+- GitHub takes the verified non-primary address over an unverified primary, and an account
+  with no verified address gets `contact_required`.
+
+Reused, not rebuilt: default-off advertisement and anonymous refusal, no pre-proof row,
+password after proof, slug conflict, replay/race/lost-response single creation, and no foreign
+claim adoption (cycles 6–8 journeys, still green in the lane). Returning and invited social
+login gained no verification prerequisite (`an_invited_person_enrolls_with_github_and_returns`
+and the Google login journeys, green).
+
+Limitation: the Rust-client consumer for signup is not added. The journeys drive HTTP
+directly. That is the same MCP/client projection gap cycle 7 recorded.
+
+**TDD: PASS**. Commands: the cycle 9 lane command plus `github` (1138/1138; one earlier run
+failed only because the test Postgres container ran out of storage and was restarted), clippy
+`-D warnings`, `codegen:check`, `docs:check`, `check:tenant-isolation`.
+
 ### 11. Setup creates a named human admin without SMTP or an IdP
 
 **Reuses:** Cycle 7 generalized human-owner provisioning, cycle 10 contact integration and cycle 4 password validator; reuse existing operator setup/device flows.

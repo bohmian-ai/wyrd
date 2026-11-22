@@ -11,7 +11,8 @@ use wyrd_testing::WyrdTestServer;
 use super::{
     SOCIAL_HOST, begin_social_at, body_json, complete_signup, enable_google, identity_token_reply,
     initialize_platform_root, mail_to, mailpit, mount_platform_provider, platform_key_set,
-    platform_session, prove_signup, social_call, social_callback, social_request,
+    platform_session, prove_signup, prove_signup_with, social_call, social_callback,
+    social_request,
 };
 
 /// The trusted ingress every journey here sits behind.
@@ -1728,4 +1729,290 @@ async fn a_configured_challenge_gates_browser_creation() {
     assert_eq!(cleared["signup_challenge"], Value::Null);
     let (status, _, body) = attempt("chal-cleared", None, "198.51.100.127").await;
     assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// The verified contact of every User of workspace `slug`: username or
+/// external subject, address, and whether the User has a password.
+async fn contacts(superuser: &sqlx::PgPool, slug: &str) -> Vec<(String, bool)> {
+    sqlx::query_as(
+        "SELECT c.address, u.password_hash IS NOT NULL
+           FROM wyrd.auth_user_contacts c
+           JOIN wyrd.auth_users u ON u.data_tenant_id = c.data_tenant_id AND u.id = c.user_id
+           JOIN platform.tenants t ON t.data_tenant_id = c.data_tenant_id
+          WHERE t.slug = $1 AND c.verified_at IS NOT NULL",
+    )
+    .bind(slug)
+    .fetch_all(superuser)
+    .await
+    .expect("contacts read")
+}
+
+/// Return from GitHub for a signup begun from a fresh browser, GitHub
+/// reporting `emails`; returns the authorization query and the completion
+/// cookie pair, if the return set one.
+async fn github_signup(
+    srv: &WyrdTestServer,
+    github: &wiremock::MockServer,
+    subject: u64,
+    emails: Value,
+) -> (std::collections::HashMap<String, String>, Option<String>) {
+    let begun = super::begin_social_at(
+        srv,
+        "/auth/signup",
+        json!({ "method": "social", "provider": "github" }),
+    )
+    .await;
+    super::mount_github(
+        github,
+        "gho_signup",
+        json!({ "id": subject, "login": "octo" }),
+    )
+    .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/user/emails"))
+        .and(wiremock::matchers::header(
+            "authorization",
+            "Bearer gho_signup",
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(emails))
+        .mount(github)
+        .await;
+    let resp = srv
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(super::github_callback(&begun.query["state"]))
+                .header(header::HOST, SOCIAL_HOST)
+                .header(header::COOKIE, &begun.cookie)
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("callback responds");
+    let cookie = resp
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find(|value| value.starts_with("wyrd_signup="))
+        .map(|value| value.split(';').next().expect("pair").to_owned());
+    (begun.query, cookie)
+}
+
+/// Every signup creator gets exactly one verified contact, proven by the
+/// provider or by Wyrd's own email challenge:
+///   1. without a mail relay, a Google email `email_verified` proves the
+///      contact, and the password-free social admin records it;
+///   2. a Google email not `email_verified` creates nothing: completion
+///      answers `contact_required`, and without a relay the email branch is
+///      not offered;
+///   3. with a relay, that same browser proves a mailbox bound to its
+///      provider attempt, then creates the workspace with the mailed
+///      address as contact and still no password;
+///   4. an email proof's local administrator gets the proven address as
+///      contact and a password session that invites a teammate;
+///   5. a GitHub signup asks for `user:email` only and takes a verified
+///      address from the email API, never an unverified primary; with none
+///      verified it is `contact_required`.
+///
+/// # Panics
+/// Panics when a creator's contact, password or creation differs.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_signup_creator_gets_a_verified_contact() {
+    let google = wiremock::MockServer::start().await;
+    let github = wiremock::MockServer::start().await;
+    let (srv, session) = signup_server_with(
+        &google,
+        wyrd_server::config::SocialConfig {
+            google_issuer: Some(google.uri()),
+            github_url: Some(github.uri()),
+            github_api_url: Some(github.uri()),
+            turnstile_siteverify_url: None,
+        },
+    )
+    .await;
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+
+    // 1. Provider-verified contact needs no relay.
+    let proof = prove_signup_with(&srv, &google, "verified-contact", true).await;
+    let (status, _, created) = complete_with(
+        &srv,
+        &proof,
+        "203.0.113.70",
+        &json!({ "slug": "verified-contact", "display_name": "Verified" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    assert_eq!(
+        contacts(&superuser, "verified-contact").await,
+        vec![("verified-contact@example.test".to_owned(), false)]
+    );
+
+    // 2. An unverified provider email is no contact.
+    let proof = prove_signup_with(&srv, &google, "unverified-contact", false).await;
+    let (status, _, refused) = complete_with(
+        &srv,
+        &proof,
+        "203.0.113.71",
+        &json!({ "slug": "unverified-contact", "display_name": "Unverified" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(
+        refused["details"]["reason"], "contact_required",
+        "{refused}"
+    );
+    assert!(statuses(&superuser, "unverified-contact").await.is_empty());
+    let (status, _, refused) = email_step(
+        &srv,
+        "/auth/signup",
+        "203.0.113.71",
+        Some(&proof),
+        "wyrd_signup_email",
+        &json!({ "method": "email", "email": "owner@example.test" }),
+    )
+    .await;
+    assert!(
+        status.is_client_error(),
+        "no relay, no email branch: {refused}"
+    );
+
+    // 3. The same browser proves a mailbox bound to its provider attempt.
+    let api = relay_to_mailpit(&srv, &session).await;
+    let (status, flow, body) = email_step(
+        &srv,
+        "/auth/signup",
+        "203.0.113.71",
+        Some(&proof),
+        "wyrd_signup_email",
+        &json!({ "method": "email", "email": "Owner@Example.test" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let flow = flow.expect("flow cookie");
+    let flow = flow.split(';').next().expect("pair");
+    let (mailed, _) = mailed_proof(&api, "owner@example.test").await;
+    let (status, completion, body) = email_step(
+        &srv,
+        "/auth/signup/verify",
+        "203.0.113.71",
+        Some(&format!("{flow}; {proof}")),
+        "wyrd_signup",
+        &json!({ "proof": mailed }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let completion = completion.expect("completion cookie");
+    let completion = completion.split(';').next().expect("pair");
+    let (status, _, created) = complete_with(
+        &srv,
+        completion,
+        "203.0.113.71",
+        &json!({ "slug": "unverified-contact", "display_name": "Unverified" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    assert_eq!(
+        contacts(&superuser, "unverified-contact").await,
+        vec![("Owner@example.test".to_owned(), false)],
+        "the canonical address keeps its local part"
+    );
+    let identities: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM wyrd.auth_user_identities i
+           JOIN platform.tenants t ON t.data_tenant_id = i.data_tenant_id
+          WHERE t.slug = 'unverified-contact' AND i.subject = 'unverified-contact'",
+    )
+    .fetch_one(&superuser)
+    .await
+    .expect("identities read");
+    assert_eq!(identities, 1, "the creator signs in with Google");
+
+    // 4. A local administrator's contact is its proven address.
+    let (proof, _) = email_proof(&srv, &api, "local@example.test", "203.0.113.72").await;
+    let (status, session_cookie, created) = complete_with(
+        &srv,
+        &proof,
+        "203.0.113.72",
+        &json!({
+            "slug": "local-contact",
+            "display_name": "Local",
+            "local_credentials": { "username": "founder", "password": "amber kestrel lantern" },
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    assert_eq!(
+        contacts(&superuser, "local-contact").await,
+        vec![("local@example.test".to_owned(), true)]
+    );
+    let session_cookie = session_cookie.expect("password session");
+    let session_cookie = session_cookie.split(';').next().expect("pair");
+    let resp = srv
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/principals/users/invitations")
+                .header(header::HOST, SOCIAL_HOST)
+                .header(header::ORIGIN, format!("http://{SOCIAL_HOST}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, session_cookie)
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "recipients": ["teammate@example.test"],
+                        "assignments": [{ "role": "viewer", "scope": "all" }],
+                    }))
+                    .expect("serializes"),
+                ))
+                .expect("request builds"),
+        )
+        .await
+        .expect("invitation responds");
+    let status = resp.status();
+    assert_eq!(status, StatusCode::CREATED, "{}", body_json(resp).await);
+
+    // 5. GitHub's verified address, never its unverified primary.
+    super::enable_github(&srv, &session, &github).await;
+    let (query, proof) = github_signup(
+        &srv,
+        &github,
+        4242,
+        json!([
+            { "email": "primary@example.test", "primary": true, "verified": false },
+            { "email": "octo@example.test", "primary": false, "verified": true },
+        ]),
+    )
+    .await;
+    assert_eq!(query.get("scope").map(String::as_str), Some("user:email"));
+    let proof = proof.expect("completion cookie");
+    let (status, _, created) = complete_with(
+        &srv,
+        &proof,
+        "203.0.113.73",
+        &json!({ "slug": "github-contact", "display_name": "GitHub" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    assert_eq!(
+        contacts(&superuser, "github-contact").await,
+        vec![("octo@example.test".to_owned(), false)]
+    );
+    let (_, proof) = github_signup(
+        &srv,
+        &github,
+        4343,
+        json!([{ "email": "primary@example.test", "primary": true, "verified": false }]),
+    )
+    .await;
+    let (status, _, refused) = complete_with(
+        &srv,
+        &proof.expect("completion cookie"),
+        "203.0.113.74",
+        &json!({ "slug": "github-unverified", "display_name": "GitHub" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["details"]["reason"], "contact_required");
 }

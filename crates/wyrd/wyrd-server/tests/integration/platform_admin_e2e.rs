@@ -1470,6 +1470,19 @@ fn identity_token_reply(
     subject: &str,
     email: &str,
 ) -> wiremock::ResponseTemplate {
+    identity_token_reply_with(issuer, nonce, audience, kid, subject, email, true)
+}
+
+/// [`identity_token_reply`] whose `email_verified` claim is `email_verified`.
+fn identity_token_reply_with(
+    issuer: &str,
+    nonce: &str,
+    audience: &str,
+    kid: &str,
+    subject: &str,
+    email: &str,
+    email_verified: bool,
+) -> wiremock::ResponseTemplate {
     let now = chrono::Utc::now().timestamp();
     let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::EdDSA);
     header.kid = Some(kid.to_owned());
@@ -1485,7 +1498,7 @@ fn identity_token_reply(
             "iat": now,
             "nonce": nonce,
             "email": email,
-            "email_verified": true,
+            "email_verified": email_verified,
         }),
         &key,
     )
@@ -7507,6 +7520,19 @@ async fn prove_signup(
     google: &wiremock::MockServer,
     subject: &str,
 ) -> String {
+    prove_signup_with(srv, google, subject, true).await
+}
+
+/// [`prove_signup`] where Google reports the email `email_verified`.
+///
+/// # Panics
+/// As [`prove_signup`].
+async fn prove_signup_with(
+    srv: &WyrdTestServer,
+    google: &wiremock::MockServer,
+    subject: &str,
+    email_verified: bool,
+) -> String {
     let begun = begin_social_at(
         srv,
         "/auth/signup",
@@ -7521,13 +7547,14 @@ async fn prove_signup(
     mount_platform_provider(
         google,
         platform_key_set("google-key"),
-        identity_token_reply(
+        identity_token_reply_with(
             &google.uri(),
             &begun.query["nonce"],
             "wyrd-google",
             "google-key",
             subject,
             &format!("{subject}@example.test"),
+            email_verified,
         ),
     )
     .await;

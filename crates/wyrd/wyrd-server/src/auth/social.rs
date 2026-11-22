@@ -291,8 +291,15 @@ pub async fn signup(
                     details: serde_json::json!({ "plane": "platform" }),
                 })
             })?;
+            // A provider attempt this browser holds may need this mailbox
+            // as its verified contact.
+            let mut completions = cookie_pairs(&headers).filter(|(name, _)| *name == SIGNUP_COOKIE);
+            let completion = match (completions.next(), completions.next()) {
+                (Some((_, value)), None) => Some(value),
+                _ => None,
+            };
             let flow = social(&state)?
-                .begin_email_signup(mail, &email, &origin, source)
+                .begin_email_signup(mail, &email, &origin, source, completion)
                 .await?;
             return Ok(with_cookies(
                 StatusCode::ACCEPTED,

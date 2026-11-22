@@ -10,6 +10,7 @@
 pub mod api_keys;
 pub mod authority;
 pub mod browser_sessions;
+pub mod contacts;
 pub mod device_authorizations;
 pub mod human_connections;
 pub mod local_passwords;
@@ -40,6 +41,7 @@ pub use browser_sessions::{
     BrowserSessionAuthority, LiveBrowserSession, SocialAnchor, insert_browser_session,
     live_browser_session, revoke_browser_session,
 };
+pub use contacts::insert_verified_contact;
 pub use device_authorizations::{
     DevicePoll, approve_device_authorization, delete_device_authorization,
     deny_device_authorization, insert_device_authorization, pending_device_authorization,

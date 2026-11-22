@@ -33,8 +33,8 @@ use wyrd_sql::queries::auth::{
     role_by_name, tenant_admin_principal_id,
 };
 use wyrd_sql::queries::auth::{
-    first_local_user, insert_local_user, insert_user, insert_user_identity, linked_identity,
-    set_password_hash,
+    first_local_user, insert_local_user, insert_user, insert_user_identity,
+    insert_verified_contact, linked_identity, set_password_hash,
 };
 use wyrd_sql::queries::platform::provisioning::{
     claim_signup_tenant, insert_provisioning_tenant, mark_tenant_active, mark_tenant_failed,
@@ -647,7 +647,7 @@ impl TenantProvisioning {
                 email,
                 ..
             } => {
-                insert_user(&mut conn, user_id, email.as_deref(), "oidc", None)
+                insert_user(&mut conn, user_id, Some(email), "oidc", None)
                     .await
                     .map_err(store)?;
                 Some(
@@ -656,13 +656,18 @@ impl TenantProvisioning {
                         .map_err(store)?,
                 )
             }
-            SignupCredential::Local { username, verifier } => {
+            SignupCredential::Local {
+                username, verifier, ..
+            } => {
                 insert_local_user(&mut conn, user_id, username, verifier)
                     .await
                     .map_err(store)?;
                 None
             }
         };
+        insert_verified_contact(&mut conn, user_id, owner.credential.contact())
+            .await
+            .map_err(store)?;
         self.grant_admin(
             &mut conn,
             SubjectColumns {

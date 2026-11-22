@@ -4,8 +4,9 @@
 //! runs the authorization code flow with S256 PKCE and state, redeems the code
 //! for an access token, reads the authenticated user once, and drops the
 //! token. The identity is GitHub's numeric account ID, never the mutable
-//! login. No scope is requested, so the token reaches only public profile
-//! data: no repository, organization or email API access.
+//! login. Sign-in requests no scope, so the token reaches only public profile
+//! data; workspace acquisition alone adds `user:email` to read the account's
+//! verified addresses. No repository or organization access is ever asked.
 
 use openidconnect::http::{HeaderValue, Method, StatusCode, header};
 use openidconnect::{CsrfToken, PkceCodeChallenge};
@@ -33,6 +34,8 @@ pub struct GithubEndpoints {
     pub token: Url,
     /// Authenticated-user endpoint.
     pub user: Url,
+    /// The authenticated user's email addresses, readable under `user:email`.
+    pub emails: Url,
 }
 
 impl GithubEndpoints {
@@ -46,6 +49,7 @@ impl GithubEndpoints {
             authorize: web.join("login/oauth/authorize")?,
             token: web.join("login/oauth/access_token")?,
             user: api.join("user")?,
+            emails: api.join("user/emails")?,
         })
     }
 }
@@ -79,6 +83,17 @@ struct TokenAnswer {
     error: Option<String>,
 }
 
+/// One address of the authenticated user's email API.
+#[derive(Deserialize)]
+struct GithubEmail {
+    /// The address.
+    email: String,
+    /// Whether it is the account's primary address.
+    primary: bool,
+    /// Whether GitHub verified it.
+    verified: bool,
+}
+
 /// The part of the authenticated user Wyrd reads.
 #[derive(Deserialize)]
 struct GithubUser {
@@ -96,7 +111,8 @@ impl GithubOAuth {
     }
 
     /// Build one sign-in's authorization redirect for `client_id`, returning
-    /// to `redirect_uri`, with fresh state and S256 PKCE and no scope.
+    /// to `redirect_uri`, with fresh state and S256 PKCE, requesting
+    /// `user:email` only when `read_email` and otherwise no scope.
     ///
     /// GitHub echoes no nonce; the returned one is random and nothing checks
     /// it.
@@ -108,6 +124,7 @@ impl GithubOAuth {
         &self,
         client_id: &str,
         redirect_uri: &str,
+        read_email: bool,
     ) -> Result<Authorization, RelyingPartyError> {
         self.http
             .screen_scheme(&self.endpoints.authorize)
@@ -121,6 +138,9 @@ impl GithubOAuth {
             .append_pair("state", &state)
             .append_pair("code_challenge", challenge.as_str())
             .append_pair("code_challenge_method", "S256");
+        if read_email {
+            url.query_pairs_mut().append_pair("scope", "user:email");
+        }
         Ok(Authorization {
             url,
             state,
@@ -131,8 +151,10 @@ impl GithubOAuth {
 
     /// Redeem `code` and read the GitHub account it signed in.
     ///
-    /// The access token lives only for the user lookup and is dropped on
-    /// return.
+    /// With `read_email`, the returned email is the account's verified
+    /// address from the email API, primary first, or `None` when none is
+    /// verified; otherwise it is the unverified public profile email. The
+    /// access token lives only for these lookups and is dropped on return.
     ///
     /// # Errors
     /// Returns [`RelyingPartyError::Screened`] when an endpoint is refused,
@@ -147,6 +169,7 @@ impl GithubOAuth {
         code: &SecretString,
         redirect_uri: &str,
         code_verifier: &SecretString,
+        read_email: bool,
     ) -> Result<MappedClaims, RelyingPartyError> {
         let form = url::form_urlencoded::Serializer::new(String::new())
             .append_pair("client_id", client_id)
@@ -176,23 +199,46 @@ impl GithubOAuth {
         };
         let bearer = HeaderValue::from_str(&format!("Bearer {}", token.expose_secret()))
             .map_err(|_| RelyingPartyError::TokenRejected("unusable access token".to_owned()))?;
-        let request = openidconnect::http::Request::builder()
+        let user: GithubUser = self
+            .json(Self::api_get(&self.endpoints.user, &bearer)?)
+            .await?;
+        let email = if read_email {
+            let mut emails: Vec<GithubEmail> = self
+                .json(Self::api_get(&self.endpoints.emails, &bearer)?)
+                .await?;
+            emails.retain(|email| email.verified);
+            emails.sort_by_key(|email| !email.primary);
+            emails.into_iter().next().map(|email| email.email)
+        } else {
+            user.email
+        };
+        Ok(MappedClaims {
+            subject: user.id.to_string(),
+            email,
+            groups: Vec::new(),
+        })
+    }
+
+    /// An authenticated GitHub API `GET` of `url`.
+    ///
+    /// # Errors
+    /// Returns [`RelyingPartyError::Configuration`] when the request cannot
+    /// be built.
+    fn api_get(
+        url: &Url,
+        bearer: &HeaderValue,
+    ) -> Result<openidconnect::http::Request<Vec<u8>>, RelyingPartyError> {
+        openidconnect::http::Request::builder()
             .method(Method::GET)
-            .uri(self.endpoints.user.as_str())
-            .header(header::AUTHORIZATION, bearer)
+            .uri(url.as_str())
+            .header(header::AUTHORIZATION, bearer.clone())
             .header(
                 header::ACCEPT,
                 HeaderValue::from_static("application/vnd.github+json"),
             )
             .header(header::USER_AGENT, HeaderValue::from_static("wyrd"))
             .body(Vec::new())
-            .map_err(|error| RelyingPartyError::Configuration(error.to_string()))?;
-        let user: GithubUser = self.json(request).await?;
-        Ok(MappedClaims {
-            subject: user.id.to_string(),
-            email: user.email,
-            groups: Vec::new(),
-        })
+            .map_err(|error| RelyingPartyError::Configuration(error.to_string()))
     }
 
     /// Send `request` through the screened transport and decode a `200` JSON
@@ -247,7 +293,14 @@ mod tests {
         );
         let secret = SecretString::from("secret");
         let refused = oauth
-            .identity("client", &secret, &secret, "http://wyrd.test/cb", &secret)
+            .identity(
+                "client",
+                &secret,
+                &secret,
+                "http://wyrd.test/cb",
+                &secret,
+                false,
+            )
             .await;
         assert!(
             matches!(&refused, Err(RelyingPartyError::TokenRejected(reason)) if reason == "bad_verification_code"),

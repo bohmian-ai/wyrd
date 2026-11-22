@@ -1,14 +1,17 @@
 //! Wyrd's opt-in benchmark experiments, run through `mise`:
 //!
-//! - `l1 <engine>`: isolated closed-loop work for `bifrost` ([`query`]),
-//!   `verification` ([`verification`]), or `gateway` ([`gateway`]), through
-//!   `mise run bench:l1:<engine>`; `l1` alone runs all three in order,
-//!   through `mise run bench:l1`. `l1 bifrost
-//!   <writes-parquet|hot|parquet>` runs one Bifrost experiment and `l1
-//!   bifrost` alone all three in order.
+//! - `l1 <verification|gateway|bifrost>`: the category's L1 sweep, through
+//!   `mise run benchmark:l1:<category>` ([`sweep`]): the routine cases in
+//!   declared order, or exactly `--cases a,b` in that order, each its own
+//!   process with fresh server, PostgreSQL, storage and clients on the case
+//!   clock, ending with the category table; `--list-cases` lists every
+//!   selector ([`cases`]) and runs nothing. `case ...` is the per-case
+//!   process the sweep starts.
 //! - `l2 <engine>`: competing open-loop work through capacity, overload, and
 //!   recovery, through `mise run bench:l2:<engine>`.
-//! - `report <record.json>`: regenerates a persisted record's report.
+//! - `report <record.json>`: regenerates a sweep's table from its saved
+//!   sweep record, a case's full report from its case record, or an earlier
+//!   experiment record's report.
 //! - `profile <cpu-capture.json.gz> [thread-name]`: lists the functions each
 //!   sampled thread group of a CPU capture spends its samples in, from its
 //!   Samply symbol sidecar.
@@ -16,25 +19,28 @@
 //!   page at `target/benchmarks/results.html`, through
 //!   `mise run bench:results`.
 //!
-//! Every experiment shares one lifecycle ([`levels`] over
-//! `wyrd_testing::experiment`): a sealed declaration, quiet-host checks,
-//! warmup and three repetitions, judgment, an append-only record under
-//! `benchmarks/history/<engine>/<experiment>/` (a `--steps`, `--profile`,
-//! or `--allow-dirty` run's under `target/benchmarks/`), and exit 0 (VALID)
-//! or 2 (INVALID);
-//! a missed performance target is reported and never changes the exit.
-//! `--profile [cpu|heap|both]` adds optional per-step CPU captures and heap
-//! profiles of both the server and this driver (bare `--profile` is `both`),
-//! `--allow-dirty` records a dirty source, `--steps` selects declared steps,
-//! and `--smoke` runs the same plan at smoke scale under
-//! `target/benchmarks/smoke/`. A full run never runs a smoke first;
-//! `mise run bench:smoke` runs every level's smoke.
+//! Every experiment shares one runner (`wyrd_testing::experiment`): a sealed
+//! declaration, quiet-host checks, warmup and three windows, judgment, a
+//! record, and exit 0 (VALID) or 2 (INVALID); a missed performance target is
+//! reported and never changes the exit. An L1 case runs on the case clock
+//! with its phase allowances and keeps its case record under
+//! `target/benchmarks/l1/<category>/<sweep>/`; an L2 experiment appends a
+//! schema-3 record under `benchmarks/history/<engine>/<experiment>/` (a
+//! `--steps`, `--profile`, or `--allow-dirty` run's under
+//! `target/benchmarks/`). `--profile [cpu|heap|both]` adds optional CPU
+//! captures and heap profiles of both the server and this driver (bare
+//! `--profile` is `both`), and `--allow-dirty` records a dirty source. L2
+//! `--smoke` runs the same plan at smoke scale under
+//! `target/benchmarks/smoke/`; the L1 smoke is the harness test lane's.
 
+mod cases;
 mod client_queue;
 mod flags;
 mod gateway;
 mod levels;
 mod query;
+mod summary;
+mod sweep;
 mod verification;
 
 use std::path::{Path, PathBuf};
@@ -94,42 +100,17 @@ async fn dispatch(arguments: &[String], root: &Path) -> u8 {
             .cloned()
             .collect()
     };
-    let bare = |index: usize| {
-        arguments
-            .get(index)
-            .is_none_or(|next| next.starts_with("--"))
-    };
-    let group = match arguments.get(3).map(String::as_str) {
-        _ if bare(3) => Some((3, query::Experiment::ALL.to_vec())),
-        _ => None,
-    };
-    match (command, engine, group) {
-        (Some("l1"), Some(Engine::Bifrost), Some((skip, experiments))) => {
-            let shared = rest(skip);
-            if let Err(message) = levels::known(&shared, &levels::VALUED[..0], &[]) {
-                eprintln!(
-                    "capacity l1 bifrost: {message}; running several experiments takes only --profile, --allow-dirty and --smoke"
-                );
-                return 2;
-            }
-            let forwarded: Vec<String> = shared.into_iter().skip(1).collect();
-            levels::spawn_experiments(root, &experiments, &forwarded)
-        }
-        (Some("l1"), Some(engine), _) => Box::pin(level(Level::One, engine, &rest(3), root)).await,
-        (Some("l2"), Some(engine), _) => Box::pin(level(Level::Two, engine, &rest(3), root)).await,
-        (Some("l1"), None, _) if bare(2) => {
-            let shared = rest(2);
-            if let Err(message) = levels::known(&shared, &levels::VALUED[..0], &[]) {
-                eprintln!(
-                    "capacity l1: {message}; the aggregate takes only --profile, --allow-dirty and --smoke"
-                );
-                return 2;
-            }
-            levels::aggregate(&shared, |engine, forwarded| {
-                levels::spawn_engine(root, engine, forwarded)
-            })
-        }
-        (Some("report"), _, _) if arguments.len() == 3 => {
+    let category = arguments
+        .get(2)
+        .and_then(|name| cases::Category::parse(name));
+    match (command, engine) {
+        (Some("l1"), _) if category.is_some() => match category {
+            Some(category) => Box::pin(sweep::command(category, &rest(3), root)).await,
+            None => 2,
+        },
+        (Some("case"), _) => Box::pin(sweep::case(arguments, root)).await,
+        (Some("l2"), Some(engine)) => Box::pin(level(Level::Two, engine, &rest(3), root)).await,
+        (Some("report"), _) if arguments.len() == 3 => {
             match levels::report(Path::new(&arguments[2])) {
                 Ok(report) => {
                     println!("{report}");
@@ -141,7 +122,7 @@ async fn dispatch(arguments: &[String], root: &Path) -> u8 {
                 }
             }
         }
-        (Some("compare"), _, _) if arguments.len() == 4 => {
+        (Some("compare"), _) if arguments.len() == 4 => {
             match levels::compare(Path::new(&arguments[2]), Path::new(&arguments[3])) {
                 Ok(comparison) => {
                     print!("{comparison}");
@@ -153,7 +134,7 @@ async fn dispatch(arguments: &[String], root: &Path) -> u8 {
                 }
             }
         }
-        (Some("profile"), _, _) if (3..=4).contains(&arguments.len()) => {
+        (Some("profile"), _) if (3..=4).contains(&arguments.len()) => {
             let threads = arguments.get(3).map_or("", String::as_str);
             match levels::cpu_report(Path::new(&arguments[2]), threads) {
                 Ok(report) => {
@@ -166,7 +147,7 @@ async fn dispatch(arguments: &[String], root: &Path) -> u8 {
                 }
             }
         }
-        (Some("results"), _, _) if arguments.len() == 2 => {
+        (Some("results"), _) if arguments.len() == 2 => {
             let out = root.join(RESULTS);
             match levels::results(root, &out) {
                 Ok(records) => {
@@ -181,7 +162,7 @@ async fn dispatch(arguments: &[String], root: &Path) -> u8 {
         }
         _ => {
             eprintln!(
-                "capacity: expected `l1 [bifrost [writes-parquet|hot|parquet]|verification|gateway]`, `l2 <bifrost|verification|gateway>`, `report <record.json>`, `compare <before.json> <after.json>`, `profile <cpu-capture.json.gz> [thread-name]`, or `results`, got {:?}",
+                "capacity: expected `l1 <verification|gateway|bifrost>`, `l2 <bifrost|verification|gateway>`, `report <record.json>`, `compare <before.json> <after.json>`, `profile <cpu-capture.json.gz> [thread-name]`, or `results`, got {:?}",
                 &arguments[1.min(arguments.len())..]
             );
             2
@@ -452,6 +433,7 @@ mod tests {
             artifacts: artifacts.path().to_path_buf(),
             profile: None,
             interrupt: CancellationToken::new(),
+            setup_spent: Duration::ZERO,
         };
         let quiet = |_| {
             std::future::ready(Some(HostLoad {
@@ -1711,10 +1693,7 @@ mod tests {
         );
     }
 
-    /// V12: the aggregate runs every engine in order with the forwarded
-    /// shared flags, keeps going after an invalid run, and combines exits
-    /// to 0 only when every engine exits 0, else 2; usage errors exit 2
-    /// before any work;
+    /// V12: profile and shared flags parse, usage errors are refused;
     /// `report` regenerates a persisted record; and `results` writes every
     /// history file into one page, marking one that is not a current record
     /// and escaping embedded text.
@@ -1725,20 +1704,6 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn level_commands_preserve_records_and_exit_precedence() {
         let root = tempfile::tempdir().expect("root");
-        let mut seen = Vec::new();
-        let code = levels::aggregate(&line(&["--profile"]), |engine, forwarded| {
-            seen.push((engine, forwarded.to_vec()));
-            match engine {
-                Engine::Bifrost => 1,
-                Engine::Verification => 2,
-                Engine::Gateway => 0,
-            }
-        });
-        assert_eq!(code, 2);
-        assert_eq!(
-            seen,
-            levels::ENGINES.map(|engine| (engine, vec!["--profile".to_owned()]))
-        );
         for (arguments, mode) in [
             (&[][..], None),
             (&["--profile"], Some(ProfileMode::Both)),
@@ -1750,12 +1715,6 @@ mod tests {
             let arguments = line(arguments);
             assert_eq!(levels::profile(&arguments), Ok(mode), "{arguments:?}");
             assert_eq!(levels::known(&arguments, &[], &[]), Ok(()), "{arguments:?}");
-            let mut seen = Vec::new();
-            levels::aggregate(&arguments, |_, forwarded| {
-                seen.push(forwarded.to_vec());
-                0
-            });
-            assert!(seen.iter().all(|forwarded| forwarded[..] == arguments[1..]));
         }
         for invalid in [
             &["--profile", "memory"][..],
@@ -1767,14 +1726,6 @@ mod tests {
                 "{invalid:?}"
             );
         }
-        for (codes, expected) in [([0, 0, 0], 0), ([0, 1, 0], 2), ([2, 0, 1], 2)] {
-            let mut next = codes.into_iter();
-            assert_eq!(
-                levels::aggregate(&line(&[]), |_, _| next.next().expect("engine")),
-                expected
-            );
-        }
-
         let mut records = Vec::new();
         for engine in levels::ENGINES {
             let rest: &[&str] = if engine == Engine::Bifrost {
@@ -1790,22 +1741,14 @@ mod tests {
             };
             records.push(execute(declaration, script).await.0);
         }
-        let mut published = Vec::new();
-        let mut pending = records.iter();
-        let code = levels::aggregate(&line(&[]), |engine, _| {
-            let record = pending.next().expect("engine record");
-            assert_eq!(record.engine, engine);
-            published.push(record.publish(root.path()).expect("publish"));
-            record.exit_code()
-        });
+        let published: Vec<PathBuf> = records
+            .iter()
+            .map(|record| record.publish(root.path()).expect("publish"))
+            .collect();
         assert_eq!(
-            published.len(),
-            3,
-            "an invalid engine never stops the later ones"
-        );
-        assert_eq!(
-            code, 2,
-            "the invalid Verification run decides the aggregate"
+            records.iter().map(Record::exit_code).collect::<Vec<_>>(),
+            [0, 2, 0],
+            "the invalid Verification record exits 2"
         );
         for path in &published {
             assert!(path.starts_with(root.path().join("benchmarks/history")));

@@ -305,6 +305,7 @@ async fn measured(
             repetitions: 3,
             budget_seconds: 1_200,
             minimum_seconds: 0,
+            phases: None,
         };
     }
     let observed = Arc::new(Mutex::new(Vec::new()));
@@ -317,6 +318,7 @@ async fn measured(
         artifacts: artifacts.clone(),
         profile: None,
         interrupt: CancellationToken::new(),
+        setup_spent: Duration::ZERO,
     };
     let record = run(
         declaration.seal(),

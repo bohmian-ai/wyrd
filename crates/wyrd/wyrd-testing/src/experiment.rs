@@ -174,6 +174,7 @@ impl Level {
                 repetitions: REPETITIONS,
                 budget_seconds: 5 * 60,
                 minimum_seconds: 0,
+                phases: None,
             },
             Self::Two => Timing {
                 warmup_seconds: 120,
@@ -181,6 +182,7 @@ impl Level {
                 repetitions: REPETITIONS,
                 budget_seconds: 30 * 60,
                 minimum_seconds: 20 * 60,
+                phases: None,
             },
         }
     }
@@ -198,6 +200,7 @@ impl Level {
                 repetitions: 1,
                 budget_seconds: 10 * 60,
                 minimum_seconds: 0,
+                phases: None,
             },
             Self::Two => Timing {
                 warmup_seconds: 3,
@@ -205,8 +208,83 @@ impl Level {
                 repetitions: 1,
                 budget_seconds: 15 * 60,
                 minimum_seconds: 0,
+                phases: None,
             },
         }
+    }
+
+    /// The standardized L1 case clock: one 30 s warmup and three 30 s
+    /// measured windows inside the [`Allowances::L1`] phase envelope, whose
+    /// total is the case budget.
+    #[must_use]
+    pub const fn case_timing() -> Timing {
+        Timing {
+            warmup_seconds: 30,
+            repetition_seconds: 30,
+            repetitions: REPETITIONS,
+            budget_seconds: Allowances::L1.total(),
+            minimum_seconds: 0,
+            phases: Some(Allowances::L1),
+        }
+    }
+
+    /// The harness smoke of [`Self::case_timing`]: the same lifecycle,
+    /// envelope and three windows, each 2 s after a 1 s warmup, so the
+    /// harness lane exercises aggregation and drains without the
+    /// performance clock.
+    #[must_use]
+    pub const fn case_smoke_timing() -> Timing {
+        Timing {
+            warmup_seconds: 1,
+            repetition_seconds: 2,
+            ..Self::case_timing()
+        }
+    }
+}
+
+/// The accepted per-case maximum allowance of each L1 lifecycle phase,
+/// seconds. They are maxima, never sleeps, and each is shared by every
+/// occurrence of its phase: the drain allowance covers every inter-window
+/// drain and the final drain together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Allowances {
+    /// Host preflight, PostgreSQL creation, migrations, the fresh server
+    /// and clients, fixture loading and exact fixture checks.
+    pub setup_seconds: u64,
+    /// The case's own discarded warmup.
+    pub warmup_seconds: u64,
+    /// The measured windows.
+    pub measurement_seconds: u64,
+    /// Every request drain, final reconciliation, storage settlement and
+    /// evidence capture.
+    pub drain_seconds: u64,
+    /// Stopping and reaping owned processes and disposing of PostgreSQL,
+    /// WAL and object storage.
+    pub teardown_seconds: u64,
+    /// Finalizing and atomically keeping the case record.
+    pub persist_seconds: u64,
+}
+
+impl Allowances {
+    /// The accepted L1 envelope: 240 + 30 + 90 + 150 + 60 + 20 = 590 s.
+    pub const L1: Self = Self {
+        setup_seconds: 240,
+        warmup_seconds: 30,
+        measurement_seconds: 90,
+        drain_seconds: 150,
+        teardown_seconds: 60,
+        persist_seconds: 20,
+    };
+
+    /// The whole envelope, seconds.
+    #[must_use]
+    pub const fn total(self) -> u64 {
+        self.setup_seconds
+            + self.warmup_seconds
+            + self.measurement_seconds
+            + self.drain_seconds
+            + self.teardown_seconds
+            + self.persist_seconds
     }
 }
 
@@ -246,6 +324,11 @@ pub struct Timing {
     pub budget_seconds: u64,
     /// Least elapsed time a complete run must take; zero when unbounded.
     pub minimum_seconds: u64,
+    /// The L1 case protocol's phase allowances, which [`run`] enforces as
+    /// absolute phase deadlines; `None` for a run outside the protocol,
+    /// which only its budget bounds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phases: Option<Allowances>,
 }
 
 /// The driver's declared CPU budget in cores: the [`Validity::driver_cores`]
@@ -939,6 +1022,27 @@ impl Declaration {
                 "the measured source commit is unknown".to_owned(),
             );
         }
+        if let Some(phases) = self.timing.phases {
+            let windows = u64::from(self.timing.repetitions) * self.timing.repetition_seconds;
+            if self.timing.warmup_seconds > phases.warmup_seconds
+                || windows > phases.measurement_seconds
+                || self.timing.budget_seconds != phases.total()
+            {
+                refuse(
+                    "declaration.timing",
+                    format!(
+                        "the case clock ({} s warmup, {} x {} s windows, {} s budget) does not fit its phase allowances ({} s warmup, {} s measurement, {} s total)",
+                        self.timing.warmup_seconds,
+                        self.timing.repetitions,
+                        self.timing.repetition_seconds,
+                        self.timing.budget_seconds,
+                        phases.warmup_seconds,
+                        phases.measurement_seconds,
+                        phases.total()
+                    ),
+                );
+            }
+        }
         if self.source.dirty && !self.source.dirty_override {
             refuse(
                 "source.dirty",
@@ -964,12 +1068,13 @@ impl Declaration {
     /// a full run's repetitions lengthened to the step's declared
     /// [`WINDOW_SECONDS`] parameter when it has one. A step declares a
     /// longer window when the run's default cannot meet its sample floor;
-    /// a smoke keeps its short windows.
+    /// a smoke keeps its short windows, and a case under the L1 protocol
+    /// ([`Timing::phases`]) its fixed windows.
     #[must_use]
     pub fn step_timing(&self, step: &Step) -> Timing {
         let declared = step.params.get(WINDOW_SECONDS).and_then(Value::as_u64);
         match declared {
-            Some(seconds) if self.mode == Mode::Full => Timing {
+            Some(seconds) if self.mode == Mode::Full && self.timing.phases.is_none() => Timing {
                 repetition_seconds: seconds,
                 ..self.timing
             },
@@ -1143,6 +1248,38 @@ pub struct Reading {
     pub rank: Option<u64>,
     /// Why the value is missing or inapplicable.
     pub reason: Option<String>,
+    /// The window histogram a percentile was read from, kept so a case's
+    /// windows pool into its aggregate percentile ([`Self::pooled`]);
+    /// `None` for any other reading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<Pool>,
+}
+
+/// One window's histogram behind a percentile [`Reading`]: the percentile,
+/// its unit divisor, and the histogram's parameters and nonzero buckets.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Pool {
+    /// The percentile, `0.0..=1.0`.
+    pub q: f64,
+    /// The divisor from recorded values to the reading's unit.
+    pub per: f64,
+    /// The histogram's lowest and highest trackable values and significant
+    /// digits, as [`wyrd_benchmark::Distribution::bounds`].
+    pub bounds: [u64; 3],
+    /// The window's nonzero buckets.
+    pub buckets: wyrd_benchmark::Buckets,
+}
+
+impl Pool {
+    /// The pool of `distribution` read at `q` and divided by `per`.
+    fn of(distribution: &wyrd_benchmark::Distribution, q: f64, per: f64) -> Self {
+        Self {
+            q,
+            per,
+            bounds: distribution.bounds(),
+            buckets: distribution.buckets(),
+        }
+    }
 }
 
 impl Reading {
@@ -1228,9 +1365,50 @@ impl Reading {
             || Self::missing("no successful sample"),
             |bucket| Self {
                 rank: Some(bucket.rank),
+                pool: Some(Pool::of(distribution, q, per)),
                 ..Self::bounded(bucket.lowest as f64, bucket.highest as f64, per)
                     .with_samples(distribution.len())
             },
+        )
+    }
+
+    /// The case-level percentile of window readings that each kept their
+    /// histogram: the windows' bucket counts pooled and read again at the
+    /// shared percentile, as the [`Self::quantile`] bucket interval with the
+    /// pooled sample count; never an average of window percentiles. A
+    /// window without a kept histogram, or windows kept at a different
+    /// percentile, unit or histogram shape, leave the aggregate missing.
+    #[must_use]
+    pub fn pooled(readings: &[Self]) -> Self {
+        let mut pooled: Option<(f64, f64, [u64; 3], wyrd_benchmark::Distribution)> = None;
+        for (index, reading) in readings.iter().enumerate() {
+            let Some(pool) = &reading.pool else {
+                return Self::missing(format!("window {} kept no histogram to pool", index + 1));
+            };
+            let window = match wyrd_benchmark::Distribution::restore(pool.bounds, &pool.buckets) {
+                Ok(window) => window,
+                Err(error) => {
+                    return Self::missing(format!("window {}: {error}", index + 1));
+                }
+            };
+            match &mut pooled {
+                None => pooled = Some((pool.q, pool.per, pool.bounds, window)),
+                Some((q, per, bounds, distribution)) => {
+                    if (*q, *per, *bounds) != (pool.q, pool.per, pool.bounds) {
+                        return Self::missing(format!(
+                            "window {} kept another percentile, unit or histogram",
+                            index + 1
+                        ));
+                    }
+                    if let Err(error) = distribution.add(&window) {
+                        return Self::missing(format!("window {}: {error}", index + 1));
+                    }
+                }
+            }
+        }
+        pooled.map_or_else(
+            || Self::missing("no window was measured"),
+            |(q, per, _, distribution)| Self::quantile(&distribution, q, per),
         )
     }
 
@@ -1238,11 +1416,18 @@ impl Reading {
     /// `per` (1e6 for nanoseconds to milliseconds), with the sample count;
     /// missing without samples. Dividing keeps a boundary exact: 500,000 ns
     /// is exactly 0.5 ms.
+    /// The samples are also kept as a duration-shaped histogram so the
+    /// case aggregate can pool them ([`Self::pooled`]).
     #[must_use]
     pub fn percentile(samples: &[u64], q: f64, per: f64) -> Self {
         crate::capacity::nearest_rank(samples, q, per).map_or_else(
             || Self::missing("no successful sample"),
-            |value| Self::exact(value).with_samples(samples.len() as u64),
+            |value| Self {
+                pool: wyrd_benchmark::Distribution::of_durations(samples)
+                    .ok()
+                    .map(|distribution| Pool::of(&distribution, q, per)),
+                ..Self::exact(value).with_samples(samples.len() as u64)
+            },
         )
     }
 
@@ -1253,6 +1438,15 @@ impl Reading {
             (Some(above), value) => Some((above, true, value)),
             (None, Some(value)) => Some((value, false, Some(value))),
             (None, None) => None,
+        }
+    }
+
+    /// The same reading without its kept histogram, for a judgment or
+    /// summary that repeats a window reading.
+    fn bare(&self) -> Self {
+        Self {
+            pool: None,
+            ..self.clone()
         }
     }
 
@@ -1545,6 +1739,112 @@ impl Repetition {
             .unwrap_or_else(|| Reading::missing(format!("`{id}` was not read")))
     }
 
+    /// The case aggregate of measured `windows` under `metrics`: summed
+    /// wall seconds, server and driver CPU, and the raw work every derived
+    /// metric divides, so each rate and efficiency is a ratio of sums and
+    /// never an average of window ratios; every percentile pooled from the
+    /// windows' kept histograms ([`Reading::pooled`]); the largest peak
+    /// memory; summed arrivals with the worst lateness. A window missing a
+    /// summed reading leaves that aggregate reading, and every metric
+    /// derived from it, missing with the reason, never zero. Other window
+    /// readings stay per window.
+    #[must_use]
+    pub fn aggregate(metrics: &[Metric], windows: &[Self]) -> Self {
+        let summed = |read: &dyn Fn(&Self) -> Option<f64>| -> Option<f64> {
+            windows.iter().map(read).sum::<Option<f64>>()
+        };
+        let work: BTreeSet<&str> = metrics
+            .iter()
+            .filter_map(|metric| match &metric.derive {
+                Some(
+                    Derive::PerCpu { work, .. }
+                    | Derive::CpuPer { work, .. }
+                    | Derive::PerVcpu { work, .. }
+                    | Derive::Rate { work, .. }
+                    | Derive::MemoryPer { work },
+                ) => Some(work.as_str()),
+                Some(Derive::Cores) | None => None,
+            })
+            .collect();
+        let vcpus: BTreeSet<Option<u64>> = windows
+            .iter()
+            .map(|window| window.provisioned_vcpus)
+            .collect();
+        let mut aggregate = Self {
+            seconds: windows.iter().map(|window| window.seconds).sum(),
+            processes: windows
+                .first()
+                .map(|window| window.processes.clone())
+                .unwrap_or_default(),
+            server_cpu_seconds: summed(&|window| window.server_cpu_seconds),
+            peak_memory_bytes: windows
+                .iter()
+                .map(|window| window.peak_memory_bytes)
+                .collect::<Option<Vec<u64>>>()
+                .and_then(|peaks| peaks.into_iter().max()),
+            opening_memory_bytes: windows
+                .first()
+                .and_then(|window| window.opening_memory_bytes),
+            memory_interval_ms: windows
+                .first()
+                .map_or(0, |window| window.memory_interval_ms),
+            driver_cpu_seconds: summed(&|window| window.driver_cpu_seconds),
+            provisioned_vcpus: if vcpus.len() == 1 {
+                vcpus.into_iter().next().flatten()
+            } else {
+                None
+            },
+            arrivals: windows
+                .iter()
+                .map(|window| window.arrivals)
+                .collect::<Option<Vec<Arrivals>>>()
+                .map(|arrivals| Arrivals {
+                    scheduled: arrivals.iter().map(|a| a.scheduled).sum(),
+                    sent: arrivals.iter().map(|a| a.sent).sum(),
+                    completed: arrivals.iter().map(|a| a.completed).sum(),
+                    missed: arrivals.iter().map(|a| a.missed).sum(),
+                    lateness_p99_us: arrivals
+                        .iter()
+                        .map(|a| a.lateness_p99_us)
+                        .collect::<Option<Vec<f64>>>()
+                        .and_then(|late| late.into_iter().reduce(f64::max)),
+                }),
+            ..Self::default()
+        };
+        let ids: BTreeSet<&String> = windows
+            .iter()
+            .flat_map(|window| window.metrics.keys())
+            .collect();
+        for id in ids {
+            let readings: Vec<Reading> = windows.iter().map(|window| window.reading(id)).collect();
+            if readings.iter().any(|reading| reading.pool.is_some()) {
+                aggregate
+                    .metrics
+                    .insert(id.clone(), Reading::pooled(&readings));
+            } else if work.contains(id.as_str()) {
+                let total = readings
+                    .iter()
+                    .enumerate()
+                    .map(|(index, reading)| {
+                        reading.exact_value().ok_or_else(|| {
+                            format!(
+                                "window {} has no exact `{id}`: {}",
+                                index + 1,
+                                reading.reason.as_deref().unwrap_or("not read")
+                            )
+                        })
+                    })
+                    .sum::<Result<f64, String>>();
+                aggregate.metrics.insert(
+                    id.clone(),
+                    total.map_or_else(Reading::missing, Reading::exact),
+                );
+            }
+        }
+        aggregate.derive(metrics);
+        aggregate
+    }
+
     /// Adds every metric `metrics` derive from this repetition's raw
     /// readings and server CPU. A missing CPU or work reading, or a zero
     /// denominator, leaves the derived metric missing with its reason.
@@ -1733,6 +2033,19 @@ pub trait Workload: Send {
     /// record is then INVALID. Servers are released either way; one that
     /// outlived its stop grace was killed.
     async fn finish(&mut self) -> Result<(), ExperimentError>;
+
+    /// The outstanding publication and maintenance work the server still
+    /// holds, read after the last window drained and before
+    /// [`Self::finish`]; the runner keeps it in an L1 case's [`Lifecycle`].
+    /// `None`, the default, when the workload reads none.
+    ///
+    /// # Errors
+    ///
+    /// Returns a workload error when the read failed; the case is then
+    /// INVALID, since its required evidence is missing.
+    async fn outstanding(&mut self) -> Result<Option<Value>, ExperimentError> {
+        Ok(None)
+    }
 }
 
 /// What a `--profile` run collects and the CPU profiler it invokes.
@@ -1756,6 +2069,181 @@ pub struct Options {
     pub profile: Option<Profiling>,
     /// Cancelled when the run is interrupted.
     pub interrupt: CancellationToken,
+    /// Setup time the case already spent before [`run`] started, such as
+    /// creating its PostgreSQL; charged to the L1 setup allowance. Zero
+    /// outside the case protocol.
+    pub setup_spent: Duration,
+}
+
+/// One process a case owned while it ran, identified by PID and start
+/// time, since a PID alone may be reused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Owned {
+    /// What the process is.
+    pub role: Role,
+    /// Its PID.
+    pub pid: u32,
+    /// Its start, seconds since the Unix epoch, when readable.
+    pub started_unix: Option<u64>,
+}
+
+impl Owned {
+    /// The process `pid` as it runs now, in `role`.
+    #[must_use]
+    pub fn read(role: Role, pid: u32) -> Self {
+        Self {
+            role,
+            pid,
+            started_unix: crate::release_server::os::process_started(pid),
+        }
+    }
+
+    /// Whether this same process, its PID with the same start, still runs.
+    #[must_use]
+    pub fn alive(&self) -> bool {
+        let now = Self::read(self.role, self.pid);
+        now.started_unix.is_some() && now.started_unix == self.started_unix
+    }
+}
+
+/// One warmup or window of a case: how long it admitted work and how long
+/// its in-flight requests took to drain after the stop.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PhaseWindow {
+    /// The phase label, such as `warmup` or `repetition-2`.
+    pub phase: String,
+    /// Seconds of admission, at most the declared length.
+    pub admitted_seconds: f64,
+    /// Seconds after the stop until the call returned.
+    pub drained_seconds: f64,
+}
+
+/// The L1 case lifecycle a record keeps: each phase's measured seconds
+/// against its allowance, every window's admission and drain, the processes
+/// the case owned, and the outstanding publication and maintenance work it
+/// captured before teardown. The supervisor completes teardown and persist
+/// after the case process exits.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Lifecycle {
+    /// The allowances judged.
+    pub allowances: Allowances,
+    /// Setup seconds, including any spent before the runner started.
+    pub setup_seconds: f64,
+    /// Warmup admission seconds.
+    pub warmup_seconds: f64,
+    /// Measured admission seconds.
+    pub measurement_seconds: f64,
+    /// Every drain and evidence capture, inter-window and final.
+    pub drain_seconds: f64,
+    /// Stopping, reaping and disposing of owned resources.
+    pub teardown_seconds: f64,
+    /// Finalizing and keeping the case record, once the supervisor kept it.
+    pub persist_seconds: Option<f64>,
+    /// Each warmup and window, in order.
+    pub windows: Vec<PhaseWindow>,
+    /// The processes the case owned once prepared.
+    pub owned: Vec<Owned>,
+    /// Outstanding publication and maintenance work before teardown, as
+    /// the workload read it; `None` when it read none.
+    pub outstanding: Option<Value>,
+}
+
+impl Lifecycle {
+    /// A ledger under `allowances` that already spent `setup` seconds.
+    fn new(allowances: Allowances, setup: Duration) -> Self {
+        Self {
+            allowances,
+            setup_seconds: setup.as_secs_f64(),
+            warmup_seconds: 0.0,
+            measurement_seconds: 0.0,
+            drain_seconds: 0.0,
+            teardown_seconds: 0.0,
+            persist_seconds: None,
+            windows: Vec::new(),
+            owned: Vec::new(),
+            outstanding: None,
+        }
+    }
+
+    /// What remains of an allowance of `allowed` seconds after `used`.
+    fn left(allowed: u64, used: f64) -> Duration {
+        Duration::from_secs_f64((allowed as f64 - used).max(0.0))
+    }
+
+    /// What remains of the setup allowance.
+    #[must_use]
+    pub fn setup_left(&self) -> Duration {
+        Self::left(self.allowances.setup_seconds, self.setup_seconds)
+    }
+
+    /// What remains of the shared drain allowance.
+    #[must_use]
+    pub fn drain_left(&self) -> Duration {
+        Self::left(self.allowances.drain_seconds, self.drain_seconds)
+    }
+
+    /// What remains of the teardown allowance.
+    #[must_use]
+    pub fn teardown_left(&self) -> Duration {
+        Self::left(self.allowances.teardown_seconds, self.teardown_seconds)
+    }
+
+    /// Charges one `phase` call of declared `length` that returned after
+    /// `elapsed`: admission up to `length`, the rest to the drain.
+    fn window(&mut self, phase: Phase, length: Duration, elapsed: Duration) {
+        let admitted = elapsed.min(length).as_secs_f64();
+        let drained = elapsed.saturating_sub(length).as_secs_f64();
+        if phase == Phase::Warmup {
+            self.warmup_seconds += admitted;
+        } else {
+            self.measurement_seconds += admitted;
+        }
+        self.drain_seconds += drained;
+        self.windows.push(PhaseWindow {
+            phase: phase.label().to_owned(),
+            admitted_seconds: admitted,
+            drained_seconds: drained,
+        });
+    }
+
+    /// Charges `elapsed` of the final drain and stop: to what remains of
+    /// the drain allowance first, then to teardown.
+    pub fn finish(&mut self, elapsed: Duration) {
+        let drain = elapsed.min(self.drain_left());
+        self.drain_seconds += drain.as_secs_f64();
+        self.teardown_seconds += elapsed.saturating_sub(drain).as_secs_f64();
+    }
+
+    /// Every phase over its allowance, as an INVALID reason naming it.
+    #[must_use]
+    pub fn overruns(&self) -> Vec<Reason> {
+        let a = self.allowances;
+        [
+            ("setup", self.setup_seconds, a.setup_seconds),
+            ("warmup", self.warmup_seconds, a.warmup_seconds),
+            (
+                "measurement",
+                self.measurement_seconds,
+                a.measurement_seconds,
+            ),
+            ("drain and capture", self.drain_seconds, a.drain_seconds),
+            ("teardown", self.teardown_seconds, a.teardown_seconds),
+            (
+                "persist and report",
+                self.persist_seconds.unwrap_or(0.0),
+                a.persist_seconds,
+            ),
+        ]
+        .into_iter()
+        .filter(|(_, used, allowed)| *used > *allowed as f64)
+        .map(|(phase, used, allowed)| {
+            Reason::new(
+                "phase.overrun",
+                format!("{phase} took {used:.1}s, over its {allowed}s allowance"),
+            )
+        })
+        .collect()
+    }
 }
 
 /// One criterion's outcome on one step.
@@ -1846,6 +2334,11 @@ pub struct StepRecord {
     pub timing: Timing,
     /// Every measured repetition, in order.
     pub repetitions: Vec<Repetition>,
+    /// The case aggregate of the measured windows under the L1 case
+    /// protocol ([`Repetition::aggregate`]), which its targets judge;
+    /// `None` outside it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregate: Option<Repetition>,
     /// Each metric's median, minimum, maximum, and spread.
     pub summary: BTreeMap<String, Summary>,
     /// Each applicable criterion's outcome.
@@ -1959,6 +2452,10 @@ pub struct Record {
     /// Full or smoke; a record without one is a full run.
     #[serde(default)]
     pub mode: Mode,
+    /// The L1 case lifecycle, for a run under the case protocol; absent
+    /// from every other record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<Lifecycle>,
 }
 
 /// Runs a sealed declaration's workload and returns its record.
@@ -1998,6 +2495,13 @@ where
     let interrupt = options.interrupt.clone();
     let mut stopped: Option<Reason> = None;
     let mut worked = None;
+    let mut lifecycle = timing
+        .phases
+        .map(|allowances| Lifecycle::new(allowances, options.setup_spent));
+    let deadline = deadline
+        - options
+            .setup_spent
+            .min(Duration::from_secs(timing.budget_seconds));
 
     if validity.is_empty() {
         host_before = host(sample).await;
@@ -2009,7 +2513,21 @@ where
     }
     let admitted = validity.is_empty();
     if admitted {
-        match bounded(deadline, &interrupt, workload.prepare()).await {
+        let setup_deadline = lifecycle
+            .as_ref()
+            .map_or(deadline, |ledger| deadline.min(clock + ledger.setup_left()));
+        let preparing = bounded(setup_deadline, &interrupt, workload.prepare()).await;
+        if let Some(ledger) = &mut lifecycle {
+            ledger.setup_seconds += clock.elapsed().as_secs_f64();
+            ledger.owned = workload
+                .processes()
+                .into_iter()
+                .map(|pid| (Role::Server, pid))
+                .chain(workload.clients())
+                .map(|(role, pid)| Owned::read(role, pid))
+                .collect();
+        }
+        match phase_bounded(preparing, lifecycle.as_ref(), "setup") {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 stopped = Some(Reason::new(
@@ -2078,7 +2596,20 @@ where
                     window
                 };
                 let available = provisioned_vcpus();
-                match bounded(deadline, &interrupt, workload.measure(step, phase, length)).await {
+                let opened = Instant::now();
+                let call_deadline = lifecycle.as_ref().map_or(deadline, |ledger| {
+                    deadline.min(opened + length + ledger.drain_left())
+                });
+                let called = bounded(
+                    call_deadline,
+                    &interrupt,
+                    workload.measure(step, phase, length),
+                )
+                .await;
+                if let Some(ledger) = &mut lifecycle {
+                    ledger.window(phase, length, opened.elapsed());
+                }
+                match phase_bounded(called, lifecycle.as_ref(), "drain and capture") {
                     Ok(Ok(mut repetition)) => {
                         if let Err(error) =
                             keep_timings(&options.artifacts, &step.id, phase, &repetition.timings)
@@ -2118,7 +2649,33 @@ where
             }
             saving = Some(tokio::task::spawn_blocking(move || profiler.finish()));
         }
-        match tokio::time::timeout(FINISH_GRACE, workload.finish()).await {
+        if let Some(ledger) = &mut lifecycle {
+            let reading = Instant::now();
+            let left = ledger.drain_left();
+            match tokio::time::timeout(left, workload.outstanding()).await {
+                Ok(Ok(outstanding)) => ledger.outstanding = outstanding,
+                Ok(Err(error)) => validity.push(Reason::new(
+                    "evidence.missing",
+                    format!(
+                        "outstanding publication and maintenance work could not be read: {error}"
+                    ),
+                )),
+                Err(_) => validity.push(Reason::new(
+                    "phase.deadline",
+                    "the drain and capture allowance ran out reading outstanding work",
+                )),
+            }
+            ledger.drain_seconds += reading.elapsed().as_secs_f64();
+        }
+        let grace = lifecycle.as_ref().map_or(FINISH_GRACE, |ledger| {
+            ledger.drain_left() + ledger.teardown_left()
+        });
+        let finishing = Instant::now();
+        let finished = tokio::time::timeout(grace, workload.finish()).await;
+        if let Some(ledger) = &mut lifecycle {
+            ledger.finish(finishing.elapsed());
+        }
+        match finished {
             Ok(Ok(())) => {}
             Ok(Err(error)) => validity.push(Reason::new(
                 "workload.failed",
@@ -2127,15 +2684,19 @@ where
             Err(_) => validity.push(Reason::new(
                 "budget.exceeded",
                 format!(
-                    "drain and stop did not finish within {}s",
-                    FINISH_GRACE.as_secs()
+                    "drain and stop did not finish within {:.0}s",
+                    grace.as_secs_f64()
                 ),
             )),
         }
         if let Some(reason) = stopped.take() {
             validity.push(reason);
         }
+        let sampling = Instant::now();
         host_after = host(sample).await;
+        if let Some(ledger) = &mut lifecycle {
+            ledger.drain_seconds += sampling.elapsed().as_secs_f64();
+        }
         validity.extend(host_reasons(
             host_after.as_ref(),
             &declaration.validity,
@@ -2153,7 +2714,10 @@ where
             });
         }
     }
-    let elapsed = worked.unwrap_or_else(|| clock.elapsed());
+    let elapsed = worked.unwrap_or_else(|| clock.elapsed()) + options.setup_spent;
+    if let Some(ledger) = &lifecycle {
+        validity.extend(ledger.overruns());
+    }
     if elapsed > Duration::from_secs(timing.budget_seconds) {
         validity.push(Reason::new(
             "budget.exceeded",
@@ -2186,7 +2750,17 @@ where
         ));
     }
     let finished_at = Utc::now();
-    let steps = judge(&declaration, measured, admitted);
+    let mut steps = judge(&declaration, measured, admitted);
+    if timing.phases.is_none() {
+        for repetition in steps
+            .iter_mut()
+            .flat_map(|step| step.repetitions.iter_mut())
+        {
+            for reading in repetition.metrics.values_mut() {
+                reading.pool = None;
+            }
+        }
+    }
     let validity_record = ValidityRecord {
         thresholds: declaration.validity,
         host_before,
@@ -2235,6 +2809,7 @@ where
             profile,
         },
         mode: declaration.mode,
+        lifecycle,
     }
 }
 
@@ -2261,6 +2836,23 @@ async fn bounded<T>(
             Reason::new("budget.exceeded", "the budget ran out; admission stopped")
         }),
     }
+}
+
+/// `outcome` of a [`bounded`] call under the case `lifecycle`: a budget
+/// stop of a case is the named `phase`'s allowance running out, since every
+/// case call is bounded by its phase before the budget.
+fn phase_bounded<T>(
+    outcome: Result<T, Reason>,
+    lifecycle: Option<&Lifecycle>,
+    phase: &str,
+) -> Result<T, Reason> {
+    outcome.map_err(|reason| match lifecycle {
+        Some(_) if reason.code == "budget.exceeded" => Reason::new(
+            "phase.deadline",
+            format!("the {phase} allowance ran out; admission stopped"),
+        ),
+        _ => reason,
+    })
 }
 
 /// Why a host sample taken `when` makes the run invalid.
@@ -2372,6 +2964,8 @@ fn judge(
             }
         }
         let summary = summarize(declaration, &repetitions);
+        let aggregate = (status == Status::Measured && declaration.timing.phases.is_some())
+            .then(|| Repetition::aggregate(&declaration.metrics, &repetitions));
         let mut criteria = Vec::new();
         if matches!(status, Status::Measured | Status::Derived) {
             for criterion in declaration
@@ -2382,6 +2976,7 @@ fn judge(
                 let judgment = judge_criterion(
                     criterion,
                     &repetitions,
+                    aggregate.as_ref(),
                     &declaration.validity,
                     timing.repetitions,
                     declaration.mode,
@@ -2406,6 +3001,7 @@ fn judge(
             status,
             timing,
             repetitions,
+            aggregate,
             summary,
             criteria,
             verdict,
@@ -2632,21 +3228,30 @@ fn summarize(declaration: &Declaration, repetitions: &[Repetition]) -> BTreeMap<
 /// otherwise [`Outcome::Invalid`]. A smoke judges no criterion: once its
 /// evidence is present, every criterion is inapplicable, so a smoke is only
 /// VALID or INVALID; a missing reading or an empty percentile population is
-/// [`Outcome::Invalid`] in both modes.
+/// [`Outcome::Invalid`] in both modes. Under the L1 case protocol a target
+/// judges the case `aggregate` the summary displays instead of the median
+/// repetition, at its recorded precision and bucket bounds and before any
+/// display rounding; sample floors and correctness criteria still hold per
+/// window.
 fn judge_criterion(
     criterion: &Criterion,
     repetitions: &[Repetition],
+    aggregate: Option<&Repetition>,
     validity: &Validity,
     expected: u8,
     mode: Mode,
 ) -> Judgment {
     let values: Vec<Reading> = repetitions
         .iter()
-        .map(|rep| rep.reading(&criterion.metric))
+        .map(|rep| rep.reading(&criterion.metric).bare())
         .collect();
+    let observed = aggregate.map_or_else(
+        || Reading::median(&values),
+        |aggregate| aggregate.reading(&criterion.metric).bare(),
+    );
     let mut judgment = Judgment {
         criterion: criterion.id.clone(),
-        observed: Reading::median(&values),
+        observed,
         values: values.clone(),
         outcome: Some(Outcome::Invalid),
         reason: None,
@@ -2713,6 +3318,14 @@ fn judge_criterion(
         );
     }
     let Rule { op, limit, over } = criterion.rule;
+    if over == Over::Median && !judgment.observed.is_present() {
+        judgment.reason = Some(format!(
+            "the case aggregate of `{}` is missing: {}",
+            criterion.metric,
+            judgment.observed.reason.as_deref().unwrap_or("not read")
+        ));
+        return judgment;
+    }
     let median = judgment.observed.clone();
     let judged: Vec<&Reading> = match over {
         Over::Median => vec![&median],
@@ -2756,7 +3369,12 @@ fn judge_criterion(
         (Some(true), _) => Outcome::Met,
         (Some(false), Over::Median) => {
             judgment.reason = Some(format!(
-                "median {} misses {} {}",
+                "{} {} misses {} {}",
+                if aggregate.is_some() {
+                    "aggregate"
+                } else {
+                    "median"
+                },
                 judgment.observed.cell(""),
                 op.symbol(),
                 number(limit)
@@ -3964,6 +4582,7 @@ mod tests {
             artifacts: directory.to_path_buf(),
             profile: None,
             interrupt: CancellationToken::new(),
+            setup_spent: Duration::ZERO,
         }
     }
 
@@ -6246,6 +6865,7 @@ Overloaded: do not compare languages here.
                 symbols: root.path().join("symbols"),
             }),
             interrupt: CancellationToken::new(),
+            setup_spent: Duration::ZERO,
         };
         let run_with = |options: Options, repetition: Repetition| async move {
             let mut workload = Scripted::always(&repetition);
@@ -6334,6 +6954,7 @@ Overloaded: do not compare languages here.
                         symbols: symbols.clone(),
                     }),
                     interrupt: CancellationToken::new(),
+                    setup_spent: Duration::ZERO,
                 };
                 let record = execute(
                     declaration(),
@@ -6381,6 +7002,7 @@ Overloaded: do not compare languages here.
                 symbols: artifacts.join("symbols"),
             }),
             interrupt: CancellationToken::new(),
+            setup_spent: Duration::ZERO,
         };
         execute(
             declaration(),

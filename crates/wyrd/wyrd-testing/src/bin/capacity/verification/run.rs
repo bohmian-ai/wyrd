@@ -3712,11 +3712,13 @@ mod tests {
                 repetitions: 2,
                 budget_seconds: 600,
                 minimum_seconds: 0,
+                phases: None,
             };
             let options = Options {
                 artifacts: directory.path().join("artifacts"),
                 profile: None,
                 interrupt: CancellationToken::new(),
+                setup_spent: Duration::ZERO,
             };
             let mut workload = Calibration {
                 bench: Bench::new(Level::One, directory.path().join("logs"), false, None),

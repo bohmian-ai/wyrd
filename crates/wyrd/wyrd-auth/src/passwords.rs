@@ -53,7 +53,7 @@ use crate::roles::{bind_assignments, validate_assignments};
 pub const PASSWORD_INPUT_MAX_BYTES: usize = 1024;
 
 /// Fewest characters in a new password, after NFC normalization.
-pub const PASSWORD_MIN_CHARS: usize = 8;
+pub const PASSWORD_MIN_CHARS: usize = 15;
 
 /// Most characters in a new password, after NFC normalization.
 pub const PASSWORD_MAX_CHARS: usize = 128;
@@ -141,7 +141,7 @@ pub fn new_password(raw: &SecretString, field: &str) -> Result<SecretString, Wyr
     let text = password.expose_secret();
     let chars = text.chars().count();
     if !(PASSWORD_MIN_CHARS..=PASSWORD_MAX_CHARS).contains(&chars) {
-        return Err(refuse("password must be 8-128 characters"));
+        return Err(refuse("password must be 15-128 characters"));
     }
     if text.chars().any(char::is_control) {
         return Err(refuse("password must not contain control characters"));
@@ -994,8 +994,12 @@ mod tests {
         let composed = ok("Tr0ub4dor & e\u{301}xtra").unwrap();
         assert!(composed.expose_secret().contains('\u{e9}'));
         assert!(ok("Correct Horse Battery").is_ok());
+        assert!(ok("amber kestrel94").is_ok());
+        assert!(ok(&"\u{436}".repeat(128)).is_ok());
         for bad in [
             "short",
+            "amber kestrel9",
+            "amber kestrel\u{65}\u{301}",
             &"x".repeat(129),
             "fifteen chars\u{7}ok",
             "Password123456789",

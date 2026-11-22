@@ -227,6 +227,28 @@ for existing consumers. Later consumer cycles own their shipped-surface
 assertions. RED is the current eight-character acceptance;
 no implementation-mirroring test or disconnected validator substitutes for callers.
 
+**Evidence (cycle 4):** RED — `pg_browser_sessions::every_password_path_holds_the_fifteen_character_minimum`
+first failed when direct creation (`POST /v1/principals/users`) answered `201` for the
+fourteen-character `amber kestrel9`. GREEN after `wyrd_auth::passwords::PASSWORD_MIN_CHARS`
+became 15. One journey drives every existing consumer, all of which already route through
+`new_password`: direct creation, invited enrollment
+(`/auth/browser/password/signup`), change, and administrator-reset redemption. On each
+it refuses fourteen characters, fourteen after NFC (fifteen raw code points), 129
+characters and 1026-byte input, each with `400 WYRD_SPEC_400_VALIDATION` naming the
+field and never echoing the input. It admits fifteen characters and 128 non-ASCII
+characters, and a reset password then signs in. Unit boundaries:
+`passwords::tests::new_passwords_follow_the_policy`. NFC, Argon2id, the blocklist and
+bounded derivation are unchanged and were already covered by
+`local_signup_login_and_password_lifecycle`, which still passes along with the rest
+of `pg_browser_sessions` (10/10). Callers' fixtures were updated: the Rust SDK
+`principal_roles` journeys (11/11) and the existing tenant signup page copy (now
+"15–128 characters"; its UI proof joins cycle 16). Logs are source-cited, not
+runtime-captured: every password handler's `#[tracing::instrument]` skips the
+request, and `SecretBearer`/`SecretString` redact. **TDD: PASS.** Commands:
+`cargo nextest run --locked -p wyrd-server --features test-support --test integration
+-E 'test(/^pg_browser_sessions::/)'`; `cargo nextest run --locked -p wyrd-ai -P journey
+--run-ignored=all -E 'test(/principal_roles::/)'`.
+
 ### 5. Complete advertised methods govern every consumer
 
 **Reuses:** Cycles 1–4 shared errors, admission and password policy plus completed TASK-003 settings; later methods consume one final contract.

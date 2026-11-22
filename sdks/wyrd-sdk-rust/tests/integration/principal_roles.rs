@@ -286,7 +286,7 @@ async fn administrators_create_and_invite_users() {
     };
 
     let created = admin
-        .create_user(&request("Development", "development", "admin"))
+        .create_user(&request("Development", "development harbor", "admin"))
         .await
         .expect("an administrator creates a User");
     assert_eq!(created.username, "development");
@@ -297,15 +297,15 @@ async fn administrators_create_and_invite_users() {
     assert_eq!(grants(&access), [("admin", &GrantSource::Direct)]);
     for (refused, why) in [
         (
-            request("development", "development", "admin"),
+            request("development", "development harbor", "admin"),
             "a taken username",
         ),
         (
-            request("short", "seven77", "admin"),
-            "a password under eight characters",
+            request("short", "amber kestrel9", "admin"),
+            "a password under fifteen characters",
         ),
         (
-            request("unknown", "development", "no-such-role"),
+            request("unknown", "development harbor", "no-such-role"),
             "an unknown role",
         ),
     ] {
@@ -340,7 +340,7 @@ async fn administrators_create_and_invite_users() {
         .await
         .expect("handle connects");
     let create = workload
-        .create_user(&request("intruder", "development", "admin"))
+        .create_user(&request("intruder", "development harbor", "admin"))
         .await
         .expect_err("a workload cannot create Users");
     let invite = workload

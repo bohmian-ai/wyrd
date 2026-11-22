@@ -2318,3 +2318,186 @@ async fn an_administrator_invites_a_team_by_copied_links() {
         7
     );
 }
+
+/// New passwords the policy must refuse, as `(case, raw input)`: one short
+/// of fifteen normalized characters (raw and after NFC folds a combining
+/// accent), one past 128, and raw input past 1024 bytes, which is refused
+/// rather than truncated.
+fn refused_passwords() -> Vec<(&'static str, String)> {
+    vec![
+        ("fourteen", "amber kestrel9".to_owned()),
+        (
+            "fourteen after NFC",
+            "amber kestrel\u{0065}\u{0301}".to_owned(),
+        ),
+        ("129 characters", "\u{0436}".repeat(129)),
+        ("over 1024 bytes", "\u{0436}".repeat(513)),
+    ]
+}
+
+/// New passwords the policy must admit, as `(case, raw input)`: exactly
+/// fifteen characters, and 128 non-ASCII characters.
+fn admitted_passwords() -> Vec<(&'static str, String)> {
+    vec![
+        ("fifteen", "amber kestrel94".to_owned()),
+        ("128 Unicode", "\u{0436}".repeat(127) + "\u{00e9}"),
+    ]
+}
+
+/// Assert `response` refuses `secret` as invalid `field` without echoing it.
+///
+/// # Panics
+/// Panics when the refusal differs or carries the secret.
+fn assert_refused(response: &BrowserResponse, case: &str, field: &str, secret: &str) {
+    assert_eq!(
+        response.status,
+        StatusCode::BAD_REQUEST,
+        "{case}: {}",
+        response.body
+    );
+    assert_eq!(
+        response.body["code"],
+        json!("WYRD_SPEC_400_VALIDATION"),
+        "{case}"
+    );
+    assert_eq!(response.body["details"]["field"], json!(field), "{case}");
+    assert!(
+        !response.body.to_string().contains(secret),
+        "{case}: the refusal echoes the password"
+    );
+}
+
+/// Every existing local password path — direct creation, invited
+/// enrollment, change and administrator reset — refuses fewer than fifteen
+/// normalized characters, more than 128, and oversized input, and admits
+/// fifteen characters and 128 Unicode characters, never echoing a password.
+///
+/// # Panics
+/// Panics when the server fails to start or a path applies another policy.
+#[tokio::test(flavor = "current_thread")]
+async fn every_password_path_holds_the_fifteen_character_minimum() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let acme = server.pg_fixture().tenant_slug().to_owned();
+    let admin = admin_bearer(&server, server.data_tenant_id()).await;
+    let create = |username: &str, secret: &str| {
+        json!({
+            "username": username,
+            "password": secret,
+            "assignments": [{ "role": "viewer", "scope": "all" }],
+        })
+    };
+
+    // Direct creation.
+    for (case, secret) in refused_passwords() {
+        let refused = as_bearer(
+            &server,
+            Method::POST,
+            "/v1/principals/users",
+            &admin,
+            Some(create("direct", &secret)),
+        )
+        .await;
+        assert_refused(&refused, case, "password", &secret);
+    }
+    for (n, (case, secret)) in admitted_passwords().into_iter().enumerate() {
+        let created = as_bearer(
+            &server,
+            Method::POST,
+            "/v1/principals/users",
+            &admin,
+            Some(create(&format!("direct{n}"), &secret)),
+        )
+        .await;
+        assert_eq!(
+            created.status,
+            StatusCode::CREATED,
+            "{case}: {}",
+            created.body
+        );
+        assert!(!created.body.to_string().contains(&secret), "{case}");
+    }
+
+    // Invited enrollment.
+    for (case, secret) in refused_passwords() {
+        let refused = enroll(&server, &admin, "viewer", "invited", &secret).await;
+        assert_refused(&refused, case, "password", &secret);
+    }
+    for (n, (case, secret)) in admitted_passwords().into_iter().enumerate() {
+        let created = enroll(&server, &admin, "viewer", &format!("invited{n}"), &secret).await;
+        assert_eq!(
+            created.status,
+            StatusCode::CREATED,
+            "{case}: {}",
+            created.body
+        );
+        assert!(!created.body.to_string().contains(&secret), "{case}");
+    }
+
+    // Change, from a live password session.
+    let enrolled = enroll(&server, &admin, "viewer", "changer", &strong(1)).await;
+    assert_eq!(enrolled.status, StatusCode::CREATED, "{}", enrolled.body);
+    let user = enrolled.body["principal_id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    let mut current = strong(1);
+    for (case, secret) in refused_passwords() {
+        let session = login(&server, "changer", &current).await;
+        let refused = as_browser(
+            &server,
+            Method::POST,
+            "/auth/browser/password/change",
+            &acme,
+            &session.cookie_value(&cookie_name(&acme)),
+            Some(json!({ "tenant": acme, "current_password": current, "new_password": secret })),
+        )
+        .await;
+        assert_refused(&refused, case, "new_password", &secret);
+    }
+    for (case, secret) in admitted_passwords() {
+        let session = login(&server, "changer", &current).await;
+        let changed = as_browser(
+            &server,
+            Method::POST,
+            "/auth/browser/password/change",
+            &acme,
+            &session.cookie_value(&cookie_name(&acme)),
+            Some(json!({ "tenant": acme, "current_password": current, "new_password": secret })),
+        )
+        .await;
+        assert_eq!(
+            changed.status,
+            StatusCode::NO_CONTENT,
+            "{case}: {}",
+            changed.body
+        );
+        current = secret;
+    }
+
+    // Administrator reset redemption.
+    let reset_uri = format!("/v1/principals/users/{user}/password-reset");
+    let issued = as_bearer(&server, Method::POST, &reset_uri, &admin, None).await;
+    assert_eq!(issued.status, StatusCode::CREATED, "{}", issued.body);
+    let reset = |secret: &str| json!({ "tenant": acme, "reset_code": issued.body["reset_code"], "new_password": secret });
+    for (case, secret) in refused_passwords() {
+        let refused = password(&server, "reset", reset(&secret)).await;
+        assert_refused(&refused, case, "new_password", &secret);
+    }
+    for (case, secret) in admitted_passwords() {
+        let issued = as_bearer(&server, Method::POST, &reset_uri, &admin, None).await;
+        let done = password(
+            &server,
+            "reset",
+            json!({ "tenant": acme, "reset_code": issued.body["reset_code"], "new_password": secret }),
+        )
+        .await;
+        assert_eq!(done.status, StatusCode::NO_CONTENT, "{case}: {}", done.body);
+        assert_eq!(
+            login(&server, "changer", &secret).await.status,
+            StatusCode::OK,
+            "{case}: the reset password signs in"
+        );
+    }
+}

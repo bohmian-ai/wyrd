@@ -68,6 +68,21 @@ entries.
    case launch. Check the migrated mise help and benchmark guidance against
    the category invocations and selection terminology.
 
+   **Evidence (GREEN; TDD VIOLATED).** Assertions:
+   `crates/wyrd/wyrd-testing/src/bin/capacity/cases.rs:428` (routine order and 5/5/18 memberships),
+   `:483` (listing every selector and status), `:526` (explicit order),
+   `:559` (bad, repeated, ambiguous and `--smoke` selectors fail before
+   launch), `:597` (CPU, heap and both profiles with and without selection),
+   `:621` (a shared case plans identically alone and reordered);
+   `crates/wyrd/wyrd-testing/src/bin/capacity/main.rs:998` (every registered case narrows to its
+   engine declaration) and `:959` (category commands list and refuse with
+   no launch or build preparation). Fast-lane command C1. Migrated callers
+   and guidance (`mise.toml` `benchmark:l1:*`, `scripts/benchmarks/l1.sh`,
+   `TESTING.md`, `benchmarks/README.md`, `benchmarks/AGENTS.md`) checked by
+   content review against the category invocations. Limitation: with no
+   release `capacity` binary present, listing compiles the debug driver
+   via `cargo run`; it still starts no build tasks or cases.
+
 2. **Measure within the case clock** (REQ-003, REQ-004, AC-003). At the shared
    runner, window accounting and record owners, drive the existing timing
    boundaries with a controlled clock and unequal work, CPU and latency
@@ -80,6 +95,20 @@ entries.
    per-window sample and integrity failures and distinguish a valid target
    miss from an invalid case. RED is an overrun accepted as valid, mixed
    evidence populations, a wrong aggregate or a conflated verdict.
+
+   **Evidence (GREEN; TDD VIOLATED).** Assertions:
+   `crates/wyrd/wyrd-testing/src/experiment.rs:7190` (ratios of sums over unequal windows, pooled
+   histogram bounds and counts), `:7337` (setup, warmup, measurement,
+   shared drain, teardown and persist allowances under a paused clock; a
+   forced overrun yields `phase.overrun` and an invalid case), `:7473`
+   (targets judged on the unrounded aggregate; per-window sample and
+   integrity failures make the case invalid, distinct from a valid target
+   miss), `:6228` (completions after the window stop are drain-cohort late
+   evidence), `:6293` (kept timing evidence rebuilds judged readings);
+   `crates/wyrd/wyrd-testing/src/capacity.rs:1386` (work in flight across the stop drains only after
+   the measurement froze at the stop; server counters use the stop
+   snapshot); `crates/shared/wyrd-benchmark/src/registry.rs:1239`
+   (distributions restore and pool). Commands C1 and C2.
 
 3. **Run isolated cases through the harness** (REQ-002, REQ-007, AC-002).
    In the Postgres-backed `capacity` harness, send two sequential cases
@@ -94,6 +123,21 @@ entries.
    permits the next case to start, and the latter records later cases as
    unstarted. RED is shared state, missing cleanup evidence, or a case
    launched after cleanup could not be confirmed.
+
+   **Evidence (GREEN; TDD VIOLATED).** Assertions:
+   `crates/wyrd/wyrd-testing/src/bin/capacity/tests/pg_tests.rs:720`
+   `l1_sweeps_isolate_and_record_cases`. Sweep A runs Bifrost
+   `native-write-c1` (durable write) and `point-memtable-c1` through
+   `Sweep::supervise` with the release server, the real driver clients and
+   `with-test-postgres.sh` per case; asserts VALID rows, confirmed cleanup,
+   distinct Compose projects, storage roots and server/client process
+   identities, verified fixtures, recorded drain and teardown, outstanding
+   publication/maintenance keys captured before teardown, and case and
+   sweep outputs. Sweep B forces a failed case with confirmed cleanup
+   (next case starts) and a planted Compose volume that leaves cleanup
+   unconfirmed (later case recorded NOT RUN).
+   `crates/wyrd/wyrd-testing/src/bin/capacity/sweep.rs:829` and `:893` cover unconfirmed cleanup and
+   interrupts in-process. Command C3, GREEN: `1 passed` in 152 s.
 
 4. **Read what the sweep saved** (REQ-005, REQ-006, AC-004). Take the saved
    sweep and case outputs from the connected harness path and render them
@@ -115,6 +159,20 @@ entries.
    different or incomplete regenerated summary, missing failure or profiling
    evidence, or protocol mixing.
 
+   **Evidence (GREEN; TDD VIOLATED).** Assertions:
+   `crates/wyrd/wyrd-testing/src/bin/capacity/main.rs:655` (saved Bifrost sweep regenerates the same
+   Markdown after temporary artifacts are removed; fixed order and units;
+   OTLP input units, durable ACK p99, scan p95, UI page p99; invalid and
+   unstarted rows; derived readings name missing inputs without starting
+   unselected cases; full case reports; historical records still compare
+   and calibrate while case-protocol records are refused by both),
+   `:869` (profiled sweeps keep the target predicate, mark diagnostic
+   mode and keep capture notes); `crates/wyrd/wyrd-testing/src/bin/capacity/sweep.rs:915` (unsaved
+   record invalid with no reference; late save invalid with its
+   reference); `crates/wyrd/wyrd-testing/src/experiment.rs:7567` (engine-level comparison boundary
+   and historical round trip). Sweep A in C3 regenerates its report from
+   saved records against the real harness. Commands C1 and C3.
+
 5. **Establish full-size feasibility when execution resumes** (AC-005).
    On supported benchmark hosts, use the category commands to exercise the
    full fixtures and retain the recorded phase times and verdicts. Check
@@ -122,6 +180,24 @@ entries.
    Record feasibility as unverified until performance execution resumes.
    The controlled-clock and short harness checks establish behavior while
    the hold is in effect.
+
+   **Evidence: UNVERIFIED.** Performance execution is on hold; no
+   full-size category run was made. Behavior is established by scenarios
+   2 and 3 only.
+
+**Commands.**
+- C1: `scripts/postgres/with-test-postgres.sh -- mise exec -- cargo nextest run --locked -p wyrd-testing --lib --bin capacity`
+  — GREEN, 181 passed, 3 skipped. Without the wrapper, four existing
+  cluster and teardown library tests need Postgres and fail.
+- C2: `mise exec -- cargo nextest run --locked -p wyrd-benchmark --all-features` — GREEN.
+- C3: `mise run test:benchmark:l1` (runs the focused selector
+  `tests::pg_tests::l1_sweeps_isolate_and_record_cases`) — GREEN.
+- `mise run fmt:check`, `mise run lints` and `git diff --check` — see results below.
+
+**TDD compliance: VIOLATED** for scenarios 1–4: production code preceded
+the focused tests, so no RED failures were recorded. Mechanical deviation:
+early focused runs used `cargo nextest` without `mise exec`; all recorded
+GREEN results were re-run through mise.
 
 Use Cargo nextest through mise. Confirm the actual selectors and record each
 focused command before RED. After the focused checks, run the affected fast

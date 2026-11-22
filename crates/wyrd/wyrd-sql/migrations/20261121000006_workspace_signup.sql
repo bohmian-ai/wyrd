@@ -1,6 +1,9 @@
--- Public workspace signup (authorization-model spec revision 4, "Persistence
+-- Public workspace signup (authorization-model spec revision 7, "Persistence
 -- and authority changes": new platform pre-tenant signup records and
 -- admission counters; platform.tenants and existing provisioning state).
+-- The admission scopes are the windows REQ-014 names: signup start in its
+-- own shared source window ("Admission before work"), and completion's
+-- separate source and proven-identity windows.
 --
 -- A signup attempt is one visitor's social proof and the creation it may
 -- complete. The provider round-trip is keyed by the SHA-256 of its `state`
@@ -42,7 +45,7 @@ CREATE INDEX platform_signup_attempts_expires_at
     ON platform.signup_attempts (expires_at);
 
 CREATE TABLE platform.signup_admissions (
-    scope         TEXT        NOT NULL CHECK (scope IN ('source', 'identity')),
+    scope         TEXT        NOT NULL CHECK (scope IN ('start', 'source', 'identity')),
     key           TEXT        NOT NULL,
     window_start  TIMESTAMPTZ NOT NULL,
     attempts      INTEGER     NOT NULL CHECK (attempts > 0),

@@ -62,6 +62,9 @@ pub struct ServerAuth {
     /// Process-local current authority, one snapshot per tenant. Every
     /// request's verified identity resolves its grants here from memory.
     pub authority: Arc<AuthorityCache>,
+    /// The deployment's trusted ingress, through which every per-source
+    /// admission window derives a request's source.
+    pub trusted_ingress: crate::auth::source::TrustedIngress,
 }
 
 impl Default for ServerAuth {
@@ -82,6 +85,7 @@ impl Default for ServerAuth {
             token_exchange_settings: TokenExchangeSettings::default(),
             permission_check: Arc::new(RbacCheck),
             authority: Arc::default(),
+            trusted_ingress: crate::auth::source::TrustedIngress::default(),
         }
     }
 }

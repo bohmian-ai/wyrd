@@ -1681,6 +1681,10 @@ fn install_auth(
         human_connections: None,
         platform_login: None,
         sealing_key,
+        trusted_ingress: config
+            .http
+            .trusted_ingress()
+            .expect("invariant: configuration validation resolved [http] trusted ingress"),
         ..ServerAuth::default()
     })
 }

@@ -4,6 +4,7 @@
 //! HTTP extractors, handlers, middleware, and response mapping stay in
 //! `wyrd-server`.
 
+pub mod admission;
 pub mod audit;
 pub mod authority;
 pub mod browser_sessions;

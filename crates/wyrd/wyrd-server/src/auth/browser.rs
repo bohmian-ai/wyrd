@@ -19,11 +19,9 @@
 //! ([`BrowserSessions::recover`]); and a repeated logout is safe
 //! ([`BrowserSessions::logout`]).
 
-use std::net::{IpAddr, SocketAddr};
-
 use axum::Json;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{ConnectInfo, Extension, Query, State};
+use axum::extract::{Extension, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use secrecy::{ExposeSecret as _, SecretString};
@@ -39,6 +37,7 @@ use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::ids::TenantSlug;
 use wyrd_spec::request_id::RequestId;
 
+use crate::auth::source::RequestSource;
 use crate::auth::{RequestOrigin, auth_not_configured};
 use crate::components::platform::social::social;
 use crate::http::error::{WyrdErrorResponse, body_rejection};
@@ -581,12 +580,6 @@ pub async fn logout(
     ))
 }
 
-/// The TCP peer the password failure source window is keyed by, when the
-/// listener recorded one.
-pub(crate) fn peer(connect: Option<Extension<ConnectInfo<SocketAddr>>>) -> Option<IpAddr> {
-    connect.map(|Extension(ConnectInfo(addr))| addr.ip())
-}
-
 /// `POST /auth/browser/password/signup` — enroll a local User with a one-use
 /// invitation and sign the browser in.
 ///
@@ -668,14 +661,14 @@ pub async fn password_login(
     RequestOrigin(origin): RequestOrigin,
     headers: HeaderMap,
     id: Option<Extension<RequestId>>,
-    connect: Option<Extension<ConnectInfo<SocketAddr>>>,
+    RequestSource(source): RequestSource,
     request: Result<Json<PasswordLoginRequest>, JsonRejection>,
 ) -> Result<Response, WyrdErrorResponse> {
     let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
     require_same_origin(&headers, &origin)?;
     let sessions = browser_sessions(&state)?;
     let created = sessions
-        .password_login(request, peer(connect), request_id(id).as_str())
+        .password_login(request, source, request_id(id).as_str())
         .await?;
     signed_in_view(&sessions, &origin, StatusCode::OK, &created).await
 }
@@ -719,7 +712,7 @@ pub async fn password_change(
     State(state): State<AppState>,
     RequestOrigin(origin): RequestOrigin,
     headers: HeaderMap,
-    connect: Option<Extension<ConnectInfo<SocketAddr>>>,
+    RequestSource(source): RequestSource,
     request: Result<Json<PasswordChangeRequest>, JsonRejection>,
 ) -> Result<Response, WyrdErrorResponse> {
     let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
@@ -734,9 +727,7 @@ pub async fn password_change(
             details: serde_json::json!({ "reason": "browser_session_invalid" }),
         })?;
     let session = sessions.resolve(&cookie).await?;
-    sessions
-        .password_change(&session, request, peer(connect))
-        .await?;
+    sessions.password_change(&session, request, source).await?;
     Ok(with_cookies(
         StatusCode::NO_CONTENT,
         vec![clear_session_cookie(&origin, tenant.as_str())],

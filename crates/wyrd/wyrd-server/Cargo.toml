@@ -54,6 +54,7 @@ tokio-util = { workspace = true }
 bytes = { workspace = true }
 url = { workspace = true }
 axum = { workspace = true }
+ipnet = { workspace = true }
 # Streamable HTTP MCP server only: `wyrd-server` serves the protocol, it never
 # connects as an MCP client.
 rmcp = { workspace = true, features = [

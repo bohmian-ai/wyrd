@@ -115,6 +115,27 @@ context and shared Postgres across replicas.
 **Proof:** tier-1 HTTP requests plus admission integration; RED is unsafe source
 derivation/grouping/missing-source admission in the staged slice.
 
+**Evidence (cycle 1):** GREEN — `platform_admin_e2e::signup::admission_keys_the_trusted_source`
+(`tests/integration/platform_admin_e2e/signup.rs`) drives real `/auth/signup` starts,
+completions and `/auth/browser/password/login` failures through `RequestSource` behind
+`with_trusted_ingress_for_test(["10.0.0.0/8"], "CF-Connecting-IP")`: separate visitor
+windows, untrusted-peer header ignored (peer spends only its own window), mapped IPv4,
+shared/distinct IPv6 `/64`, `503 source_unknown` for start and completion with no
+tenant row, and `wyrd.auth_password_attempts` source subjects keyed by the same
+derivation. Unit: `auth::source::tests::only_a_trusted_peer_names_the_client`,
+`admission::tests::ipv6_sources_share_their_64`,
+`config::tests::trusted_ingress_needs_a_header_and_valid_entries`. Regression:
+`platform_admin_e2e::a_visitor_creates_a_workspace_with_google` passes. Owner reuse:
+`TrustedIngress` (deployment config `http.trusted_ingress`/`client_address_header`,
+`WYRD_TRUSTED_INGRESS`/`WYRD_CLIENT_ADDRESS_HEADER`) is the one derivation; password
+`Windows` and signup `admit` key through `wyrd_auth::admission::source_key`; the staged
+`peer()` helper is deleted. Start admission (`start` scope in the revised staged
+migration) runs before settings/provider work. **TDD: VIOLATED** — production code
+was written before the journey's first run, so no RED was observed for this cycle.
+Command: `cargo nextest run --locked -p wyrd-server --features test-support --test
+integration -E 'test(/^platform_admin_e2e::signup::/)'` with the repository Postgres
+lifecycle env.
+
 ### 2. Every signup throttle carries Retry-After
 
 **Reuses:** Cycle 1 source derivation and existing shared counters; later consumers retain the same Retry-After projection.

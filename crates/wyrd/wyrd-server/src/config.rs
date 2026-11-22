@@ -2983,6 +2983,68 @@ pub struct HttpConfig {
     /// set a routable or wildcard address through `WYRD_SERVER_BIND`.
     #[serde(default = "default_http_bind")]
     pub bind: SocketAddr,
+    /// Ingress proxies, as IP addresses or CIDR blocks, whose
+    /// [`Self::client_address_header`] names the request's source
+    /// (`WYRD_TRUSTED_INGRESS`, comma-separated). Empty trusts no forwarding
+    /// header, so every source is the TCP peer.
+    #[serde(default)]
+    pub trusted_ingress: Vec<String>,
+    /// The header a trusted ingress supplies the client address in, such as
+    /// `CF-Connecting-IP` (`WYRD_CLIENT_ADDRESS_HEADER`). Required exactly when
+    /// [`Self::trusted_ingress`] is not empty.
+    #[serde(default)]
+    pub client_address_header: Option<String>,
+}
+
+impl HttpConfig {
+    /// Resolve the trusted ingress a request's source is derived through.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::Invalid`] for an entry that is not an IP address
+    /// or CIDR block, an invalid header name, or a header without ingress or
+    /// ingress without a header.
+    pub fn trusted_ingress(&self) -> Result<crate::auth::source::TrustedIngress, ConfigError> {
+        let invalid = |message: String| ConfigError::Invalid {
+            message: format!("http: {message}"),
+        };
+        let proxies = self
+            .trusted_ingress
+            .iter()
+            .map(|entry| {
+                let entry = entry.trim();
+                entry
+                    .parse::<ipnet::IpNet>()
+                    .or_else(|_| entry.parse::<std::net::IpAddr>().map(ipnet::IpNet::from))
+                    .map_err(|_| {
+                        invalid(format!(
+                            "trusted_ingress entry {entry:?} is not an IP or CIDR"
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let header = self
+            .client_address_header
+            .as_deref()
+            .map(|name| {
+                axum::http::HeaderName::from_bytes(name.trim().as_bytes()).map_err(|_| {
+                    invalid(format!(
+                        "client_address_header {name:?} is not a header name"
+                    ))
+                })
+            })
+            .transpose()?;
+        match (proxies.is_empty(), header) {
+            (true, None) => Ok(crate::auth::source::TrustedIngress::default()),
+            (false, Some(header)) => Ok(crate::auth::source::TrustedIngress::new(proxies, header)),
+            (true, Some(_)) => Err(invalid(
+                "client_address_header needs trusted_ingress to name the proxies that set it"
+                    .to_owned(),
+            )),
+            (false, None) => Err(invalid(
+                "trusted_ingress needs client_address_header to name the client address".to_owned(),
+            )),
+        }
+    }
 }
 
 /// gRPC server bind configuration.
@@ -3508,6 +3570,8 @@ impl Default for HttpConfig {
     fn default() -> Self {
         Self {
             bind: default_http_bind(),
+            trusted_ingress: Vec::new(),
+            client_address_header: None,
         }
     }
 }
@@ -3743,6 +3807,18 @@ impl WyrdServerConfig {
                     key: "WYRD_SERVER_BIND".to_string(),
                     message: e.to_string(),
                 })?;
+        }
+
+        if let Some(val) = env_opt("WYRD_TRUSTED_INGRESS")? {
+            self.http.trusted_ingress = val
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(str::to_owned)
+                .collect();
+        }
+        if let Some(val) = env_opt("WYRD_CLIENT_ADDRESS_HEADER")? {
+            self.http.client_address_header = Some(val);
         }
 
         // grpc.bind
@@ -3982,6 +4058,7 @@ impl WyrdServerConfig {
             .resolve(self.deployment_profile.is_production())?;
         self.social
             .resolve(self.deployment_profile.is_production())?;
+        self.http.trusted_ingress()?;
         let serves_api = self.role.serves_api();
         if serves_api {
             self.verification.operator_keys.validate(
@@ -6186,6 +6263,38 @@ minimum_slots = 2
             matches!(err, ConfigError::ParseToml { .. }),
             "expected ParseToml, got {err:?}"
         );
+    }
+
+    /// Trusted ingress comes from the environment as IPs or CIDRs and needs
+    /// exactly one client-address header; anything else fails validation.
+    ///
+    /// # Panics
+    /// Panics when a valid ingress is refused or an invalid one accepted.
+    #[test]
+    fn trusted_ingress_needs_a_header_and_valid_entries() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        temp_env::with_vars(
+            [
+                ("WYRD_TRUSTED_INGRESS", Some("10.0.0.0/8, 192.0.2.1")),
+                ("WYRD_CLIENT_ADDRESS_HEADER", Some("CF-Connecting-IP")),
+            ],
+            || {
+                let mut cfg = WyrdServerConfig::default();
+                cfg.apply_env_overrides().expect("apply succeeds");
+                assert_eq!(cfg.http.trusted_ingress, ["10.0.0.0/8", "192.0.2.1"]);
+                cfg.http.trusted_ingress().expect("valid ingress resolves");
+            },
+        );
+        let mut http = HttpConfig {
+            trusted_ingress: vec!["10.0.0.0/8".to_owned()],
+            ..HttpConfig::default()
+        };
+        assert!(http.trusted_ingress().is_err(), "ingress without a header");
+        http.client_address_header = Some("CF-Connecting-IP".to_owned());
+        http.trusted_ingress = vec!["not-a-network".to_owned()];
+        assert!(http.trusted_ingress().is_err(), "an invalid entry");
+        http.trusted_ingress.clear();
+        assert!(http.trusted_ingress().is_err(), "a header without ingress");
     }
 
     // ── 3. WYRD_SERVER_BIND overrides HTTP bind ───────────────────────────────

@@ -25,6 +25,8 @@ use wyrd_spec::DataTenantId;
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::principal::within_propagation;
 
+mod signup;
+
 /// The one header every Wyrd plane authenticates on.
 ///
 /// Spelled here rather than imported because the server keeps it private: a test
@@ -7502,7 +7504,12 @@ async fn prove_signup(
     google: &wiremock::MockServer,
     subject: &str,
 ) -> String {
-    let begun = begin_social_at(srv, "/auth/signup", json!({ "provider": "google" })).await;
+    let begun = begin_social_at(
+        srv,
+        "/auth/signup",
+        json!({ "method": "social", "provider": "google" }),
+    )
+    .await;
     assert!(
         begun.set_cookie.contains("Path=/auth/social"),
         "{}",
@@ -7669,7 +7676,7 @@ async fn a_visitor_creates_a_workspace_with_google() {
         .header(header::HOST, SOCIAL_HOST)
         .header(header::ORIGIN, format!("http://{SOCIAL_HOST}"))
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(r#"{"provider":"google"}"#))
+        .body(Body::from(r#"{"method":"social","provider":"google"}"#))
         .expect("request builds");
     let (status, refused) = social_call(&srv, request).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{refused}");

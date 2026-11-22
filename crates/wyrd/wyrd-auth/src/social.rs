@@ -960,6 +960,9 @@ fn validation(message: &str, field: &str) -> WyrdError {
 /// How long a proven signup stays completable after its provider return.
 const SIGNUP_COMPLETION_TTL: std::time::Duration = std::time::Duration::from_mins(30);
 
+/// Signup starts admitted per trusted source in one window.
+const SIGNUP_START_ATTEMPTS: i32 = 20;
+
 /// Workspace creations admitted per trusted source in one window.
 const SIGNUP_SOURCE_ATTEMPTS: i32 = 20;
 
@@ -993,19 +996,31 @@ impl SocialSignIn {
     /// Begin a public workspace signup through the enabled shared
     /// `provider`, from the browser that will hold the returned binding.
     ///
-    /// Signup must be enabled. The attempt binds the exact provider revision,
-    /// the provider's social callback on `origin`, server-held PKCE and
-    /// nonce, and only the SHA-256 of the browser binding and state. Nothing
-    /// is created or audited.
+    /// The start is first admitted in the shared start window of its trusted
+    /// `source`, before any other work. Signup must be enabled. The attempt
+    /// binds the exact provider revision, the provider's social callback on
+    /// `origin`, server-held PKCE and nonce, and only the SHA-256 of the
+    /// browser binding and state. Nothing is created or audited.
     ///
     /// # Errors
-    /// Returns [`WyrdError::InvalidToken`] when signup or the provider is not
-    /// available, and the provider and store availability errors.
+    /// Returns [`WyrdError::AuthVerifyUnavailable`] when `source` is unknown
+    /// or admission state is unavailable, [`WyrdError::SignupAttempts`] while
+    /// the start window is exhausted, [`WyrdError::InvalidToken`] when signup
+    /// or the provider is not available, and the provider and store
+    /// availability errors.
     pub async fn begin_signup(
         &self,
         provider: SocialProvider,
         origin: &Url,
+        source: Option<std::net::IpAddr>,
     ) -> Result<BegunBrowserLogin, WyrdError> {
+        let source = source.ok_or_else(source_unknown)?;
+        self.admit(&[(
+            SignupAdmissionScope::Start,
+            crate::admission::source_key(source),
+            SIGNUP_START_ATTEMPTS,
+        )])
+        .await?;
         if !self.settings().await?.signup_enabled {
             return Err(signup_unavailable());
         }
@@ -1130,6 +1145,7 @@ impl SocialSignIn {
         completion: &str,
         source: Option<std::net::IpAddr>,
     ) -> Result<SignupCreation, WyrdError> {
+        let source = source.ok_or_else(source_unknown)?;
         let proven = proven_signup(
             &self.operator,
             Sha256Hex::digest(completion.as_bytes()).as_bytes(),
@@ -1152,31 +1168,19 @@ impl SocialSignIn {
         self.recheck_signup(provider, proven.provider_revision)
             .await?;
         let identity = format!("{} {}", proven.issuer, proven.subject);
-        let mut windows = vec![(
-            SignupAdmissionScope::Identity,
-            identity,
-            SIGNUP_IDENTITY_ATTEMPTS,
-        )];
-        if let Some(source) = source {
-            windows.push((
+        self.admit(&[
+            (
+                SignupAdmissionScope::Identity,
+                identity,
+                SIGNUP_IDENTITY_ATTEMPTS,
+            ),
+            (
                 SignupAdmissionScope::Source,
-                source.to_string(),
+                crate::admission::source_key(source),
                 SIGNUP_SOURCE_ATTEMPTS,
-            ));
-        }
-        let mut wait = None;
-        for (scope, key, limit) in &windows {
-            let refused = admit_signup(&self.operator, *scope, key, *limit, SIGNUP_WINDOW)
-                .await
-                .map_err(store_error)?;
-            wait = wait.max(refused);
-        }
-        if let Some(wait) = wait {
-            return Err(WyrdError::SignupAttempts {
-                message: "too many workspace signups; wait before retrying".to_owned(),
-                details: json!({ "retry_after_seconds": wait.as_secs() }),
-            });
-        }
+            ),
+        ])
+        .await?;
         if !start_signup_creation(&self.operator, proven.id)
             .await
             .map_err(store_error)?
@@ -1200,6 +1204,33 @@ impl SocialSignIn {
             email: proven.email,
             claimed,
         })
+    }
+
+    /// Count one attempt in every `(scope, key, limit)` window and refuse with
+    /// the longest wait when any is exhausted.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::SignupAttempts`] with `retry_after_seconds`, and
+    /// [`WyrdError::AuthVerifyUnavailable`] when admission state is
+    /// unavailable, which refuses rather than admits.
+    async fn admit(
+        &self,
+        windows: &[(SignupAdmissionScope, String, i32)],
+    ) -> Result<(), WyrdError> {
+        let mut wait = None;
+        for (scope, key, limit) in windows {
+            let refused = admit_signup(&self.operator, *scope, key, *limit, SIGNUP_WINDOW)
+                .await
+                .map_err(store_error)?;
+            wait = wait.max(refused);
+        }
+        match wait {
+            None => Ok(()),
+            Some(wait) => Err(WyrdError::SignupAttempts {
+                message: "too many workspace signups; wait before retrying".to_owned(),
+                details: json!({ "retry_after_seconds": wait.as_secs() }),
+            }),
+        }
     }
 
     /// Record the end of `attempt`'s creation: `completed`, or `failed` so
@@ -1272,6 +1303,15 @@ impl BrowserSessions {
         conn.commit().await.map_err(store_error)?;
         self.stage_login(&created.session, request_id);
         Ok(created)
+    }
+}
+
+/// A signup request whose trusted source cannot be determined, which no
+/// per-source window could count.
+fn source_unknown() -> WyrdError {
+    WyrdError::AuthVerifyUnavailable {
+        message: "this request's source cannot be determined, so signup cannot admit it".to_owned(),
+        details: json!({ "reason": "source_unknown" }),
     }
 }
 

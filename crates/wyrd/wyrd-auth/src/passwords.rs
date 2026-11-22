@@ -808,10 +808,8 @@ struct Windows {
 
 impl Windows {
     /// The windows for `username` from `source`.
-    ///
-    /// ponytail: the source is the TCP peer, so behind the UI's server it
-    /// aggregates every browser that server forwards; a trusted-proxy
-    /// setting would key it by the forwarded client.
+    /// `source` is the request's trusted source, keyed as every per-source
+    /// window keys it.
     fn new(username: &str, source: Option<IpAddr>) -> Self {
         Self {
             account: if username.is_empty() {
@@ -819,7 +817,7 @@ impl Windows {
             } else {
                 username.to_owned()
             },
-            source: source.map(|ip| ip.to_string()),
+            source: source.map(crate::admission::source_key),
         }
     }
 

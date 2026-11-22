@@ -10,11 +10,9 @@
 //! only what a visitor may already try; an unknown tenant reads exactly like a
 //! tenant without company SSO.
 
-use std::net::SocketAddr;
-
 use axum::Json;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{ConnectInfo, Extension, Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use secrecy::ExposeSecret as _;
@@ -30,9 +28,10 @@ use wyrd_spec::request_id::RequestId;
 use crate::auth::RequestOrigin;
 use crate::auth::browser::{
     LOGIN_COOKIE, LOGIN_COOKIE_MAX_AGE_SECONDS, SOCIAL_LOGIN_COOKIE_PATH, browser_sessions,
-    clear_login_cookie, cookie_header, cookie_pairs, login_binding, login_refused, peer,
-    request_id, require_same_origin, see_other, set_session_cookie, signed_in, with_cookies,
+    clear_login_cookie, cookie_header, cookie_pairs, login_binding, login_refused, request_id,
+    require_same_origin, see_other, set_session_cookie, signed_in, with_cookies,
 };
+use crate::auth::source::RequestSource;
 use crate::components::platform::provisioning::HumanOwner;
 use crate::components::platform::routes::{directory, provision_error};
 use crate::components::platform::social::social;
@@ -249,12 +248,22 @@ pub async fn signup(
     State(state): State<AppState>,
     RequestOrigin(origin): RequestOrigin,
     headers: HeaderMap,
+    RequestSource(source): RequestSource,
     request: Result<Json<SignupBeginRequest>, JsonRejection>,
 ) -> Result<Response, WyrdErrorResponse> {
     let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
     require_same_origin(&headers, &origin)?;
+    let provider = match request {
+        SignupBeginRequest::Social { provider } => provider,
+        SignupBeginRequest::Email { .. } => {
+            return Err(WyrdErrorResponse::from(WyrdError::InvalidToken {
+                message: "email signup is not available".to_owned(),
+                details: serde_json::json!({}),
+            }));
+        }
+    };
     let begun = social(&state)?
-        .begin_signup(request.provider, &origin)
+        .begin_signup(provider, &origin, source)
         .await?;
     Ok(with_cookies(
         StatusCode::OK,
@@ -320,7 +329,7 @@ pub async fn signup_complete(
     State(state): State<AppState>,
     RequestOrigin(origin): RequestOrigin,
     headers: HeaderMap,
-    connect: Option<Extension<ConnectInfo<SocketAddr>>>,
+    RequestSource(source): RequestSource,
     id: Option<Extension<RequestId>>,
     request: Result<Json<SignupCompleteRequest>, JsonRejection>,
 ) -> Result<Response, WyrdErrorResponse> {
@@ -340,7 +349,7 @@ pub async fn signup_complete(
     let social = social(&state)?;
     let sessions = browser_sessions(&state)?;
     let provisioning = directory(&state)?;
-    let creation = social.admit_signup(&completion, peer(connect)).await?;
+    let creation = social.admit_signup(&completion, source).await?;
     if let Some((_, claimed)) = &creation.claimed
         && claimed != request.slug.as_str()
     {

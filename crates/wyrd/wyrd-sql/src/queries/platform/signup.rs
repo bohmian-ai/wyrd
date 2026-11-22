@@ -58,7 +58,9 @@ pub struct ProvenSignup {
 /// Which admission window a creation attempt counts in.
 #[derive(Debug, Clone, Copy)]
 pub enum SignupAdmissionScope {
-    /// The trusted request source.
+    /// The trusted source of a signup start.
+    Start,
+    /// The trusted source of a workspace creation.
     Source,
     /// The proven provider identity.
     Identity,
@@ -68,6 +70,7 @@ impl SignupAdmissionScope {
     /// The stored scope name.
     const fn as_str(self) -> &'static str {
         match self {
+            Self::Start => "start",
             Self::Source => "source",
             Self::Identity => "identity",
         }

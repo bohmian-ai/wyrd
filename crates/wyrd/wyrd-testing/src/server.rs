@@ -535,6 +535,7 @@ pub struct WyrdTestServerBuilder {
     /// The loopback GitHub this server's App is configured against.
     github: Option<crate::github::GithubAppMock>,
     social: Option<wyrd_server::config::SocialConfig>,
+    trusted_ingress: Option<(Vec<String>, String)>,
     /// Optional production-shaped Oracle server identity and peer trust paths.
     /// Peer identity for this server; provisioned by the builder when absent.
     peer_tls: Option<TestBifrostPeerTls>,
@@ -700,6 +701,7 @@ impl Default for WyrdTestServerBuilder {
             bind_addrs: None,
             github: None,
             social: None,
+            trusted_ingress: None,
             peer_tls: None,
             peer_tls_root: None,
             peer_bind: None,
@@ -4824,6 +4826,18 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Trust `header` as the client address of requests whose peer is inside
+    /// `proxies` (IP addresses or CIDR blocks), as a deployment behind a
+    /// trusted ingress does.
+    #[must_use]
+    pub fn with_trusted_ingress_for_test(mut self, proxies: &[&str], header: &str) -> Self {
+        self.trusted_ingress = Some((
+            proxies.iter().map(|proxy| (*proxy).to_owned()).collect(),
+            header.to_owned(),
+        ));
+        self
+    }
+
     /// Register the test-support MCP context probe in this server's `/mcp`
     /// tool catalog.
     ///
@@ -5627,6 +5641,10 @@ impl WyrdTestServerBuilder {
         }
         if let Some(social) = &self.social {
             config.social = social.clone();
+        }
+        if let Some((proxies, header)) = &self.trusted_ingress {
+            config.http.trusted_ingress.clone_from(proxies);
+            config.http.client_address_header = Some(header.clone());
         }
         if let Some(limits) = self.limits {
             config.limits = wyrd_server::config::LimitsConfig {

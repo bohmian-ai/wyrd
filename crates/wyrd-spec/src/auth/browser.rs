@@ -47,14 +47,25 @@ pub struct BrowserLoginResponse {
     pub authorization_url: AbsoluteUrl,
 }
 
-/// Body of `POST /auth/signup`: begin creating a workspace by proving a
-/// shared social provider identity in this browser.
+/// Body of `POST /auth/signup`: begin creating a workspace by proving, in
+/// this browser, a mailbox through Wyrd email or a shared social provider
+/// identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(deny_unknown_fields)]
-pub struct SignupBeginRequest {
-    /// The enabled shared social provider to prove an identity with.
-    pub provider: SocialProvider,
+#[serde(tag = "method", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SignupBeginRequest {
+    /// Prove the mailbox `email` with a Wyrd email link; the creator then
+    /// chooses a tenant-local username and password.
+    Email {
+        /// The address to prove, as typed.
+        email: String,
+    },
+    /// Prove an identity at an enabled shared provider; the creator signs in
+    /// with it and holds no password.
+    Social {
+        /// The enabled shared social provider.
+        provider: SocialProvider,
+    },
 }
 
 /// Body of `POST /auth/signup/complete`: create the workspace the proven

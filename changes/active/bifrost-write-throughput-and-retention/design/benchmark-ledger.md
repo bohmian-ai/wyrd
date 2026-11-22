@@ -42,3 +42,20 @@ Reading rules learned from this ledger:
 | 20261122T044549Z-16047deec | VALID | 3 | 1184.437 | 20.162 | 599.847 | 29.887 | 77.274 | 4.577 | 0 |
 | 20261122T051556Z-a08a0feb3 | INVALID | 3 | 1248.637 | 18.816 | 760.386 | 40.077 | 88.978 | 4.626 | 0 |
 | 20261122T115951Z-cb464d5ba | VALID | 3 | 1481.428 | 18.273 | 882.955 | 36.069 | 132.941 | 5.088 | 0 |
+
+## A-B-B-A check of the WAL commits (9d1451691, cb464d5ba)
+
+Three-step runs, A = `16047deec`, B = `68521c22d` (code identical to
+`cb464d5ba`), run in order A1 B1 B2 A2 on a quiet host, all VALID.
+
+| run | record | spans-c64 req/s | spans-c64 in MiB/cpu-s | spans-c64 µs/row | logs-c64 req/s | logs-c64 in MiB/cpu-s |
+|---|---|---|---|---|---|---|
+| A1 | 20261122T123302Z-16047deec | 1594.699 | 20.474 | 15.767 | 756.353 | 29.992 |
+| B1 | 20261122T123453Z-68521c22d | 1320.159 | 21.368 | 15.108 | 712.492 | 33.357 |
+| B2 | 20261122T123647Z-68521c22d | 1442.245 | 20.965 | 15.400 | 738.417 | 28.333 |
+| A2 | 20261122T123839Z-16047deec | 1143.082 | 21.012 | 15.361 | 623.445 | 28.678 |
+
+Result: no CPU-efficiency regression. spans-c64 input MiB/cpu-s moved +4.4%
+(A1→B1) and −0.2% (A2→B2), against 2.6% (A) and 1.9% (B) between runs of the same
+build. The earlier −9% to −14% came from comparing single noisy runs.
+Throughput is not decided: the same build varied 28% (A1→A2).

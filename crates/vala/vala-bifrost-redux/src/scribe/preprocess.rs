@@ -745,7 +745,7 @@ fn prepared_slice_bytes(slices: &[PreparedSlice], limit: usize) -> Result<usize,
         |total, slice| -> Result<usize, ScribeError> {
             total
                 .checked_add(slice.memtable_bytes)
-                .and_then(|value| value.checked_add(slice.wal_append.retained_data_bytes()))
+                .and_then(|value| value.checked_add(slice.wal_append.data.len()))
                 .ok_or(ScribeError::DecodedPayloadTooLarge {
                     bytes: usize::MAX,
                     limit,
@@ -814,7 +814,7 @@ fn prepare_slice(
     );
     let (logical_data_digest, logical_data_len) =
         identity_span.in_scope(|| logical_data_identity(&rows))?;
-    let wal_append = PreparedWalAppend::chunked(
+    let wal_append = PreparedWalAppend::new(
         crate::scribe::wal::WalLsn::ZERO,
         *context.batch_id.as_bytes(),
         data_payload,
@@ -902,26 +902,22 @@ impl EncoderContexts {
     }
 
     /// Encodes one slice as a standalone compressed Arrow IPC stream,
-    /// returned as the encoder's ordered chunks so the WAL writes them
-    /// without joining.
+    /// joined into one exact-length payload the WAL writes in a single
+    /// vectored write.
     ///
-    /// The concatenated chunks are byte for byte the stream Arrow's
-    /// `StreamWriter` writes with the same options, whether or not the
-    /// worker's context was reused, so every WAL reader still decodes it with
-    /// Arrow's standard `StreamReader`. The stream stays within
+    /// The payload is byte for byte the stream Arrow's `StreamWriter` writes
+    /// with the same options, whether or not the worker's context was reused,
+    /// so every WAL reader still decodes it with Arrow's standard
+    /// `StreamReader`. The stream stays within
     /// [`crate::scribe::material_plan::wal_payload_bound`], which canonical
-    /// admission reserved; the chunks' retained capacity is charged with the
-    /// slice through [`PreparedWalAppend::retained_data_bytes`].
+    /// admission reserved; its length is charged with the slice.
     ///
     /// # Errors
     ///
     /// Returns [`ScribeError::Internal`] when compression is unavailable,
     /// either Arrow step fails, or memory accounting is poisoned while the
     /// context is re-charged. A busy memory root only drops the context.
-    pub(crate) fn encode(
-        &self,
-        rows: &RecordBatch,
-    ) -> Result<Vec<arrow::buffer::Buffer>, ScribeError> {
+    pub(crate) fn encode(&self, rows: &RecordBatch) -> Result<Bytes, ScribeError> {
         let slot = INGRESS_WORKER.get().and_then(|index| self.slots.get(index));
         let retained = slot.and_then(|slot| slot.lock().ok()?.take());
         let (context, lease) = retained.map_or_else(
@@ -961,7 +957,11 @@ impl EncoderContexts {
         if let Some(slot) = slot {
             self.restore(slot, context, lease)?;
         }
-        Ok(chunks)
+        let mut payload = Vec::with_capacity(chunks.iter().map(arrow::buffer::Buffer::len).sum());
+        for chunk in &chunks {
+            payload.extend_from_slice(chunk.as_slice());
+        }
+        Ok(Bytes::from(payload))
     }
 
     /// Keeps `context` in `slot`, charged at its measured size.
@@ -1459,17 +1459,13 @@ mod tests {
         assert!(reader.next().is_none());
     }
 
-    /// Joins encoded chunks into the one stream a reader decodes.
-    fn joined(chunks: Vec<arrow::buffer::Buffer>) -> Vec<u8> {
-        chunks
-            .iter()
-            .flat_map(arrow::buffer::Buffer::as_slice)
-            .copied()
-            .collect()
+    /// Copies an encoded payload into the bytes a reader decodes.
+    fn joined(payload: Bytes) -> Vec<u8> {
+        payload.to_vec()
     }
 
-    /// Encodes `rows` through the contiguous `StreamWriter` path, the exact
-    /// byte reference for a slice's chunked WAL payload.
+    /// Encodes `rows` through Arrow's `StreamWriter`, the exact byte
+    /// reference for a slice's WAL payload.
     fn reference_ipc(rows: &RecordBatch) -> Vec<u8> {
         let options = arrow::ipc::writer::IpcWriteOptions::default()
             .try_with_compression(Some(crate::scribe::material_plan::WAL_IPC_COMPRESSION))
@@ -1488,12 +1484,11 @@ mod tests {
         bytes
     }
 
-    /// A prepared slice carries its IPC stream as the encoder's ordered
-    /// chunks, unjoined, and those chunks are byte for byte the stream the
-    /// contiguous writer produces, for nested, null, dictionary and
-    /// offset-sliced columns and for each tenant's independent slice.
+    /// A prepared slice's WAL payload is byte for byte the stream Arrow's
+    /// `StreamWriter` produces, for nested, null, dictionary and offset-sliced
+    /// columns and for each tenant's independent slice.
     #[test]
-    fn prepared_slices_carry_unjoined_chunks_with_reference_bytes() {
+    fn prepared_slices_carry_reference_ipc_bytes() {
         use arrow::array::{DictionaryArray, ListArray, StringArray};
         use arrow::datatypes::Int32Type;
 
@@ -1513,7 +1508,7 @@ mod tests {
         ])
         .expect("mixed batch")
         .slice(3, 50);
-        let table = TableRef::new(BifrostNamespace::Bifrost, "chunked");
+        let table = TableRef::new(BifrostNamespace::Bifrost, "mixed");
         for tenant in [DataTenantId::new_v7(), DataTenantId::new_v7()] {
             let slice = super::prepare_slice(
                 super::SliceContext {
@@ -1530,15 +1525,7 @@ mod tests {
                 rows.clone(),
             )
             .expect("prepares slice");
-            let chunks = &slice.wal_append.data;
-            assert!(chunks.len() > 1, "the stream was joined into one chunk");
-            let joined = joined(chunks.clone());
-            assert_eq!(joined, reference_ipc(&rows));
-            assert_eq!(
-                usize::try_from(slice.wal_append.data_len().expect("length")).expect("fits"),
-                joined.len()
-            );
-            assert!(slice.wal_append.retained_data_bytes() >= joined.len());
+            assert_eq!(slice.wal_append.data.as_ref(), reference_ipc(&rows));
         }
     }
 

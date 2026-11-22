@@ -28,7 +28,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -475,9 +474,7 @@ impl Default for WalConfig {
 pub(crate) struct PreparedWalAppend {
     pub(crate) lsn: WalLsn,
     pub(crate) batch_id: [u8; 16],
-    /// The slice's Arrow IPC stream, as ordered chunks the WAL writes in
-    /// order without joining them. Owned until the append settles.
-    pub(crate) data: Vec<arrow::buffer::Buffer>,
+    pub(crate) data: Bytes,
     pub(crate) seal_key: Option<SealKey>,
     pub(crate) schema_fingerprint: [u8; 32],
     /// Stable logical Arrow digest excluding volatile managed correlation columns.
@@ -509,25 +506,13 @@ pub(crate) struct WalAppendResult {
 }
 
 impl PreparedWalAppend {
-    /// Prepares a slice from one contiguous payload, for test and benchmark
-    /// fixtures that frame opaque bytes; production preparation passes the
-    /// encoder's ordered chunks to [`Self::chunked`].
-    #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
+    /// Prepares one slice record whose payload is `data`, one contiguous
+    /// Arrow IPC stream the WAL writes in a single vectored write.
     pub(crate) fn new(lsn: WalLsn, batch_id: [u8; 16], data: Bytes) -> Self {
-        Self::chunked(lsn, batch_id, vec![arrow::buffer::Buffer::from(data)])
-    }
-
-    /// Prepares a slice whose Arrow IPC stream is the concatenation of
-    /// `chunks`, in order.
-    pub(crate) fn chunked(
-        lsn: WalLsn,
-        batch_id: [u8; 16],
-        chunks: Vec<arrow::buffer::Buffer>,
-    ) -> Self {
         Self {
             lsn,
             batch_id,
-            data: chunks,
+            data,
             seal_key: None,
             schema_fingerprint: [0; 32],
             logical_data_digest: [0; 32],
@@ -554,7 +539,7 @@ impl PreparedWalAppend {
         Self {
             lsn: WalLsn::ZERO,
             batch_id,
-            data: Vec::new(),
+            data: Bytes::new(),
             seal_key: None,
             schema_fingerprint: [0; 32],
             logical_data_digest: [0; 32],
@@ -614,35 +599,6 @@ impl PreparedWalAppend {
         })
     }
 
-    /// Returns the exact Arrow IPC stream length across every chunk.
-    ///
-    /// # Errors
-    ///
-    /// Returns an internal error when the stream exceeds the WAL v8 `u32`
-    /// payload bound.
-    pub(crate) fn data_len(&self) -> Result<u32, ScribeError> {
-        self.data
-            .iter()
-            .try_fold(0_u32, |total, chunk| {
-                u32::try_from(chunk.len())
-                    .ok()
-                    .and_then(|len| total.checked_add(len))
-            })
-            .ok_or_else(|| ScribeError::Internal {
-                detail: "WAL Arrow payload exceeds v8 payload limits".to_owned(),
-            })
-    }
-
-    /// Returns the allocation bytes the chunks retain until the append
-    /// settles: each chunk's whole backing capacity, so a chunk sliced from
-    /// a larger allocation is charged for all of it.
-    pub(crate) fn retained_data_bytes(&self) -> usize {
-        self.data
-            .iter()
-            .map(arrow::buffer::Buffer::capacity)
-            .fold(0, usize::saturating_add)
-    }
-
     fn assign_lsn(&mut self, lsn: WalLsn) {
         self.lsn = lsn;
     }
@@ -677,13 +633,7 @@ impl PreparedWalAppend {
             .ok_or_else(|| ScribeError::Internal {
                 detail: "prepared WAL append is missing its self-describing seal key".to_owned(),
             })?;
-        let data: Vec<u8> = self
-            .data
-            .iter()
-            .flat_map(arrow::buffer::Buffer::as_slice)
-            .copied()
-            .collect();
-        let payload = encode_slice_payload(seal_key, self.schema_fingerprint, &data)?;
+        let payload = encode_slice_payload(seal_key, self.schema_fingerprint, &self.data)?;
         Ok(WalRecord::slice(
             self.lsn,
             *seal_key.tenant.as_uuid().as_bytes(),
@@ -744,7 +694,9 @@ impl PreparedWalAppend {
                 .map_err(|_| ScribeError::Internal {
                     detail: "WAL table FQN exceeds v8 payload limits".to_owned(),
                 })?;
-        let data_len = self.data_len()?;
+        let data_len = u32::try_from(self.data.len()).map_err(|_| ScribeError::Internal {
+            detail: "WAL Arrow payload exceeds v8 payload limits".to_owned(),
+        })?;
         let payload_len = 58usize
             .saturating_add(usize::from(table_len))
             .saturating_add(2)
@@ -755,34 +707,9 @@ impl PreparedWalAppend {
     }
 }
 
-/// Most pieces one vectored write carries; a record with more, such as a
-/// slice whose Arrow stream is many chunks, is written in successive windows.
-/// Well under every supported platform's `IOV_MAX`.
-const WAL_WRITE_WINDOW: usize = 64;
-
-/// Writes `pieces` to `writer` in order, through windows of at most
-/// [`WAL_WRITE_WINDOW`] slices, without joining them.
-///
-/// # Errors
-///
-/// Returns the first [`write_all_vectored`] error; bytes already written stay
-/// written, so the caller owns rollback.
-fn write_pieces<'a>(
-    writer: &mut impl Write,
-    pieces: impl IntoIterator<Item = &'a [u8]>,
-) -> io::Result<()> {
-    let mut window = [IoSlice::new(&[]); WAL_WRITE_WINDOW];
-    let mut pieces = pieces.into_iter().peekable();
-    while pieces.peek().is_some() {
-        let mut filled = 0;
-        for (slot, piece) in window.iter_mut().zip(pieces.by_ref()) {
-            *slot = IoSlice::new(piece);
-            filled += 1;
-        }
-        write_all_vectored(writer, &mut window[..filled])?;
-    }
-    Ok(())
-}
+/// Most pieces one WAL record writes: its header, at most 12 SLICE payload
+/// parts, and its CRC.
+const MAX_RECORD_PIECES: usize = 14;
 
 /// Writes every byte of `slices` to `writer` in as few vectored writes as it
 /// accepts, so one WAL record normally costs one write call.
@@ -886,11 +813,14 @@ fn append_prepared_borrowed(
                 detail: "WAL partition identity exceeds v8 payload limits".to_owned(),
             })?
             .to_le_bytes();
-        let data_len = prepared.data_len()?.to_le_bytes();
+        let data_len = u32::try_from(prepared.data.len())
+            .map_err(|_| ScribeError::Internal {
+                detail: "WAL Arrow payload exceeds v8 payload limits".to_owned(),
+            })?
+            .to_le_bytes();
         let table_version = seal_key.table_version.get().to_be_bytes();
-        let mut parts: Vec<&[u8]> = Vec::with_capacity(11 + prepared.data.len());
-        parts.extend([
-            SLICE_PAYLOAD_MAGIC.as_slice(),
+        let parts: [&[u8]; 12] = [
+            &SLICE_PAYLOAD_MAGIC,
             &tenant_id,
             &table_len,
             namespace,
@@ -901,8 +831,8 @@ fn append_prepared_borrowed(
             &table_version,
             &prepared.schema_fingerprint,
             &data_len,
-        ]);
-        parts.extend(prepared.data.iter().map(arrow::buffer::Buffer::as_slice));
+            &prepared.data,
+        ];
         write_parts(&parts)?
     };
     Ok((payload_digest, payload_len))
@@ -1834,13 +1764,23 @@ impl WalSegment {
             return result;
         }
         let started = Instant::now();
-        let result = write_pieces(
-            &mut *file,
-            std::iter::once(header.as_slice())
-                .chain(payload_parts.iter().copied())
-                .chain(std::iter::once(crc.as_slice())),
-        )
-        .map_err(|error| wal_io_error("WAL record write failed", &error));
+        let result = (|| -> Result<(), ScribeError> {
+            let pieces = payload_parts.len() + 2;
+            if pieces > MAX_RECORD_PIECES {
+                return Err(ScribeError::Internal {
+                    detail: "WAL record has more payload parts than one vectored write holds"
+                        .to_owned(),
+                });
+            }
+            let mut slices = [IoSlice::new(&[]); MAX_RECORD_PIECES];
+            slices[0] = IoSlice::new(header);
+            for (slot, part) in slices[1..].iter_mut().zip(payload_parts) {
+                *slot = IoSlice::new(part);
+            }
+            slices[pieces - 1] = IoSlice::new(&crc);
+            write_all_vectored(&mut *file, &mut slices[..pieces])
+                .map_err(|error| wal_io_error("WAL record write failed", &error))
+        })();
         self.appended.fetch_add(1, Ordering::Release);
         record_wal_append(&result, encoded_len, started);
         span.record("outcome", if result.is_ok() { "success" } else { "failed" });
@@ -4304,21 +4244,6 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::WriteZero);
     }
 
-    /// More pieces than one window holds are written in order across
-    /// windows, including short writes that end at and inside window edges.
-    #[test]
-    fn pieces_beyond_one_window_write_in_order() {
-        let pieces: Vec<Vec<u8>> = (0..(WAL_WRITE_WINDOW * 2 + 5))
-            .map(|piece| vec![u8::try_from(piece % 256).expect("fits"); piece % 3])
-            .collect();
-        let expected: Vec<u8> = pieces.concat();
-        for limit in [1, 2, 7, usize::MAX] {
-            let mut writer = ScriptedWriter::new(limit, Vec::new());
-            write_pieces(&mut writer, pieces.iter().map(Vec::as_slice)).expect("write");
-            assert_eq!(writer.written, expected, "limit {limit}");
-        }
-    }
-
     /// Any other error is returned at once, without a retry.
     #[test]
     fn a_write_error_is_returned_unchanged() {
@@ -4458,53 +4383,6 @@ mod tests {
             .map(|record| record.lsn.as_u64())
             .collect::<Vec<_>>();
         assert_eq!(lsns, vec![0, 1, 2]);
-    }
-
-    /// A slice whose Arrow stream arrives as more chunks than one vectored
-    /// write holds is written in order and reads back byte for byte, with
-    /// the same record bytes as the stream in one chunk.
-    #[test]
-    fn a_many_chunk_slice_round_trips_byte_for_byte() {
-        let seal_key = test_seal_key(crate::test_support::tenant());
-        let chunks: Vec<arrow::buffer::Buffer> = (0..200_u16)
-            .map(|chunk| {
-                let len = usize::from(chunk % 7);
-                arrow::buffer::Buffer::from_vec(vec![u8::try_from(chunk % 251).unwrap_or(0); len])
-            })
-            .collect();
-        let joined: Vec<u8> = chunks
-            .iter()
-            .flat_map(arrow::buffer::Buffer::as_slice)
-            .copied()
-            .collect();
-        let mut segments = Vec::new();
-        for append in [
-            PreparedWalAppend::chunked(WalLsn::ZERO, [4_u8; 16], chunks),
-            PreparedWalAppend::new(WalLsn::ZERO, [4_u8; 16], Bytes::from(joined.clone())),
-        ] {
-            let directory = TempDir::new().expect("temporary WAL directory");
-            let writer = WalWriter::new(directory.path(), [33_u8; 16], 1, WalConfig::default())
-                .expect("WAL writer");
-            let handle = writer.handle_for_shard(0).expect("shard zero");
-            let result = handle
-                .append_prepared(append.for_slice(seal_key.clone(), [7_u8; 32]))
-                .expect("append many-chunk slice");
-            handle
-                .sync_segments(&result.touched_segments)
-                .expect("sync slice");
-            let records = WalReader::open_directory_unfiltered(directory.path())
-                .expect("WAL reader")
-                .read_all_records()
-                .expect("read slice");
-            assert_eq!(records.len(), 1);
-            let decoded = decode_slice_payload(&records[0].payload).expect("decode slice");
-            assert_eq!(decoded.data, joined);
-            segments.push(records[0].payload.clone());
-        }
-        assert_eq!(
-            segments[0], segments[1],
-            "chunked and joined records differ"
-        );
     }
 
     /// Proves duplicate LSNs in different shard segments fail the stream.

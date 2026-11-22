@@ -1,0 +1,44 @@
+# writes-parquet benchmark ledger
+
+Every `bench:l1:bifrost:writes` record produced during this change, oldest
+first, read with `capacity report` (medians of each step's repetitions). Records
+sit under `target/benchmarks/bifrost/writes-parquet/` in the worktree that ran
+them, or `benchmarks/history/` for full unselected runs. "steps" counts measured
+steps; 12 is a full run. "in MiB/cpu-s" is `input_mib_per_cpu_s`; the throughput
+mandate is 80 on otlp-logs-c64.
+
+Reading rules learned from this ledger:
+
+- One commit's runs vary more than the changes measured so far (`193b5ea52`:
+  992–1,514 spans-c64 requests/s, 18.7–21.3 input MiB/cpu-s). A single run per
+  side cannot decide a 10% change; `capacity compare` intervals cover the
+  repetitions inside each run, not variation between runs.
+- otlp-logs-c64 reads 55–62 input MiB/cpu-s alone or in a full run but 27–40 in
+  the three-step `otlp-spans-c64,otlp-logs-c64,native-write-c64` subset, where it
+  follows spans-c64. Judge the mandate only alone or in a full run.
+- A change counts only when throughput and input MiB/cpu-s both improve.
+
+| record (time-commit) | verdict | steps | spans-c64 req/s | spans-c64 in MiB/cpu-s | logs-c64 req/s | logs-c64 in MiB/cpu-s | native-c64 req/s | native-c64 µs/row | errors |
+|---|---|---|---|---|---|---|---|---|---|
+| 20261121T180126Z-31af0fe55 | VALID | 1 |  |  | 1136.861 | 58.21 |  |  | 0 |
+| 20261121T235858Z-27ec04c40 | VALID | 12 | 614.793 | 13.192 | 611.427 | 55.644 | 105.763 | 2.619 | 0 |
+| 20261122T001549Z-27ec04c40 | VALID | 1 |  |  | 631.175 | 62.002 |  |  | 0 |
+| 20261122T003824Z-5a057524f | VALID | 1 |  |  | 1009.736 | 59.909 |  |  | 0 |
+| 20261122T003915Z-27ec04c40 | VALID | 1 |  |  | 1000.378 | 59.714 |  |  | 0 |
+| 20261122T004708Z-27ec04c40 | VALID | 2 |  |  | 654.765 | 54.509 |  |  | 0 |
+| 20261122T010737Z-27ec04c40 | VALID | 1 |  |  | 1006.026 | 60.743 |  |  | 0 |
+| 20261122T010854Z-6db7d71af | VALID | 2 |  |  | 774.044 | 51.88 |  |  | 0 |
+| 20261122T011912Z-6db7d71af | INVALID | 2 |  |  | 622.283 | 76.972 |  |  | 0 |
+| 20261122T012501Z-6db7d71af | VALID | 2 |  |  | 753.198 | 60.06 |  |  | 0 |
+| 20261122T024344Z-193b5ea52 | INVALID | 12 | 696.255 | 16.058 | 798.515 | 61.922 | 129.781 | — | native-write-c64= 64 total (median 0) ; |
+| 20261122T030957Z-193b5ea52 | VALID | 3 | 992.272 | 20.906 | 615.29 | 29.903 | 102.98 | 4.403 | 0 |
+| 20261122T032347Z-fc32c2b99 | VALID | 3 | 1226.215 | 19.976 | 604.872 | 28.677 | 101.375 | 4.485 | 0 |
+| 20261122T033722Z-27ec04c40 | VALID | 3 | 986.07 | 19.224 | 488.607 | 26.542 | 71.341 | 5.043 | 0 |
+| 20261122T034552Z-193b5ea52 | VALID | 3 | 1184.79 | 18.736 | 533.83 | 29.267 | 83.937 | 4.849 | 0 |
+| 20261122T034956Z-193b5ea52 | VALID | 3 | 1222.655 | 21.261 | 564.574 | 30.792 | 84.26 | 4.204 | 0 |
+| 20261122T043916Z-193b5ea52 | INVALID | 3 |  |  |  |  |  |  | 0 |
+| 20261122T043950Z-193b5ea52 | VALID | 3 | 1513.985 | 19.097 | 838.314 | 32.38 | 105.509 | 4.513 | 0 |
+| 20261122T044326Z-16047deec | VALID | 3 | 1085.478 | 21.186 | 585.505 | 28.311 | 73.97 | 5.026 | 0 |
+| 20261122T044549Z-16047deec | VALID | 3 | 1184.437 | 20.162 | 599.847 | 29.887 | 77.274 | 4.577 | 0 |
+| 20261122T051556Z-a08a0feb3 | INVALID | 3 | 1248.637 | 18.816 | 760.386 | 40.077 | 88.978 | 4.626 | 0 |
+| 20261122T115951Z-cb464d5ba | VALID | 3 | 1481.428 | 18.273 | 882.955 | 36.069 | 132.941 | 5.088 | 0 |

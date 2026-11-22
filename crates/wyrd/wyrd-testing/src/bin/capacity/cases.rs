@@ -11,6 +11,7 @@
 //! launched.
 
 use std::fmt::Write as _;
+use std::sync::LazyLock;
 
 use wyrd_testing::experiment::Engine;
 use wyrd_testing::profile::ProfileMode;
@@ -42,93 +43,34 @@ pub struct Case {
     pub routine: bool,
 }
 
-/// The Verification family every case belongs to.
-const DIRECT_VERIFY: &str = "direct-verify";
+/// The registry: `category, family, id, routine|targeted` lines, which
+/// `scripts/benchmarks/l1.sh` also reads to list cases without a build.
+const REGISTRY: &str = include_str!("cases.tsv");
 
-/// The Gateway family every case belongs to.
-const OVERHEAD: &str = "overhead";
-
-/// Verification cases in registry order: the routine five first, in sweep
-/// order, then the targeted SDK closed-loop, Rust concurrency and Agent-only
-/// model cases.
-const VERIFICATION: [(&str, &str, bool); 14] = [
-    (DIRECT_VERIFY, "direct-verify-c1", true),
-    (DIRECT_VERIFY, "direct-verify-c64", true),
-    (DIRECT_VERIFY, "direct-verify-r3000", true),
-    (DIRECT_VERIFY, "direct-verify-python-r3000", true),
-    (DIRECT_VERIFY, "direct-verify-typescript-r3000", true),
-    (DIRECT_VERIFY, "direct-verify-python-c1", false),
-    (DIRECT_VERIFY, "direct-verify-python-c64", false),
-    (DIRECT_VERIFY, "direct-verify-typescript-c1", false),
-    (DIRECT_VERIFY, "direct-verify-typescript-c64", false),
-    (DIRECT_VERIFY, "direct-verify-c4", false),
-    (DIRECT_VERIFY, "direct-verify-c16", false),
-    (DIRECT_VERIFY, "direct-verify-c32", false),
-    (DIRECT_VERIFY, "direct-verify-model-c1", false),
-    (DIRECT_VERIFY, "direct-verify-model-c64", false),
-];
-
-/// Gateway cases in registry order: the routine five, then the three
-/// targeted single-client controls.
-const GATEWAY: [(&str, &str, bool); 8] = [
-    (OVERHEAD, "buffered-1kib-capture-metadata.c1", true),
-    (OVERHEAD, "buffered-1kib-capture-metadata.c64", true),
-    (OVERHEAD, "streamed-1kib-capture-metadata.c64", true),
-    (OVERHEAD, "buffered-64kib-capture-metadata.c64", true),
-    (OVERHEAD, "buffered-64kib-capture-payload.c64", true),
-    (OVERHEAD, "streamed-1kib-capture-metadata.c1", false),
-    (OVERHEAD, "buffered-64kib-capture-metadata.c1", false),
-    (OVERHEAD, "buffered-64kib-capture-payload.c1", false),
-];
-
-/// Bifrost cases in registry order: the routine eighteen in sweep order
-/// (writes, hot, Parquet, UI SQL), then the targeted read shapes, the
-/// single-client UI arms, and the 10x-volume and learned-layout UI families.
-const BIFROST: [(&str, &str, bool); 43] = [
-    ("writes-parquet", "otlp-spans-c1", true),
-    ("writes-parquet", "otlp-spans-c64", true),
-    ("writes-parquet", "otlp-spans-1k-c1", true),
-    ("writes-parquet", "otlp-spans-1k-c64", true),
-    ("writes-parquet", "otlp-logs-c1", true),
-    ("writes-parquet", "otlp-logs-c64", true),
-    ("writes-parquet", "native-write-c1", true),
-    ("writes-parquet", "native-write-c64", true),
-    ("hot", "point-memtable-c1", true),
-    ("hot", "point-memtable-c64", true),
-    ("hot", "point-staged-c1", true),
-    ("parquet", "point-c1", true),
-    ("parquet", "point-c64", true),
-    ("parquet", "full-scan-c1", true),
-    ("parquet", "span-trace-c64", true),
-    ("ui-sql", "memtable-ui-c8", true),
-    ("ui-sql", "staged-ui-c8", true),
-    ("ui-sql", "published-ui-c8", true),
-    ("hot", "small-aggregate-memtable-c1", false),
-    ("hot", "small-aggregate-staged-c1", false),
-    ("hot", "span-shredded-memtable-c1", false),
-    ("hot", "span-shredded-staged-c1", false),
-    ("hot", "span-long-tail-memtable-c1", false),
-    ("hot", "span-long-tail-staged-c1", false),
-    ("parquet", "small-aggregate-c1", false),
-    ("parquet", "span-trace-c1", false),
-    ("parquet", "span-shredded-c1", false),
-    ("parquet", "span-long-tail-c1", false),
-    ("ui-sql", "memtable-ui-c1", false),
-    ("ui-sql", "staged-ui-c1", false),
-    ("ui-sql", "published-ui-c1", false),
-    ("ui-sql-10x", "memtable-ui-c1", false),
-    ("ui-sql-10x", "memtable-ui-c8", false),
-    ("ui-sql-10x", "staged-ui-c1", false),
-    ("ui-sql-10x", "staged-ui-c8", false),
-    ("ui-sql-10x", "published-ui-c1", false),
-    ("ui-sql-10x", "published-ui-c8", false),
-    ("ui-sql-learned", "memtable-ui-c1", false),
-    ("ui-sql-learned", "memtable-ui-c8", false),
-    ("ui-sql-learned", "staged-ui-c1", false),
-    ("ui-sql-learned", "staged-ui-c8", false),
-    ("ui-sql-learned", "published-ui-c1", false),
-    ("ui-sql-learned", "published-ui-c8", false),
-];
+/// Every registered case of every category, in registry order.
+static CASES: LazyLock<Vec<Case>> = LazyLock::new(|| {
+    REGISTRY
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| {
+            let fields: Vec<&'static str> = line.split('\t').collect();
+            let [category, family, id, sweep] = fields[..] else {
+                panic!("cases.tsv line `{line}` has not four fields");
+            };
+            Case {
+                category: Category::parse(category)
+                    .unwrap_or_else(|| panic!("cases.tsv names no category `{category}`")),
+                family,
+                id,
+                routine: match sweep {
+                    "routine" => true,
+                    "targeted" => false,
+                    other => panic!("cases.tsv status `{other}` is not routine or targeted"),
+                },
+            }
+        })
+        .collect()
+});
 
 /// Flags a category command accepts beside `--cases` and `--profile`.
 const SWITCHES: [&str; 2] = ["--list-cases", "--allow-dirty"];
@@ -177,21 +119,17 @@ impl Category {
 
     /// Every registered case of the category, in registry order: routine
     /// cases first, in the order the routine sweep runs them.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the compiled-in `cases.tsv` is malformed, an invariant
+    /// the registry tests hold.
     #[must_use]
     pub fn cases(self) -> Vec<Case> {
-        let table: &[(&str, &str, bool)] = match self {
-            Self::Verification => &VERIFICATION,
-            Self::Gateway => &GATEWAY,
-            Self::Bifrost => &BIFROST,
-        };
-        table
+        CASES
             .iter()
-            .map(|(family, id, routine)| Case {
-                category: self,
-                family,
-                id,
-                routine: *routine,
-            })
+            .filter(|case| case.category == self)
+            .copied()
             .collect()
     }
 

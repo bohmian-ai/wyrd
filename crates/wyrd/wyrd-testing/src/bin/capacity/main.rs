@@ -985,6 +985,73 @@ mod tests {
         );
     }
 
+    /// Each category's `benchmark:l1:<category> -- --list-cases` script
+    /// lists from the registry without a prepared driver and without
+    /// building: in a checkout holding only the script and the registry,
+    /// with `cargo` and `mise` replaced by stubs that record any call, it
+    /// prints exactly the driver's listing, and `--list-cases` with another
+    /// flag is refused; neither calls a stub.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a listing differs or a build tool is called.
+    #[test]
+    fn category_listing_scripts_build_nothing() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let checkout = tempfile::tempdir().expect("checkout");
+        for path in [
+            "scripts/benchmarks/l1.sh",
+            "crates/wyrd/wyrd-testing/src/bin/capacity/cases.tsv",
+        ] {
+            let target = checkout.path().join(path);
+            std::fs::create_dir_all(target.parent().expect("parent")).expect("directory");
+            std::fs::copy(repository().join(path), &target).expect("copied");
+        }
+        let stubs = tempfile::tempdir().expect("stubs");
+        let calls = stubs.path().join("calls");
+        for tool in ["cargo", "mise"] {
+            let stub = stubs.path().join(tool);
+            std::fs::write(
+                &stub,
+                format!("#!/bin/sh\necho {tool} >> '{}'\nexit 1\n", calls.display()),
+            )
+            .expect("stub");
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+                .expect("executable");
+        }
+        let path = format!("{}:/usr/bin:/bin", stubs.path().display());
+        let script = checkout.path().join("scripts/benchmarks/l1.sh");
+        let listing = |arguments: &[&str]| {
+            std::process::Command::new("/bin/bash")
+                .arg(&script)
+                .args(arguments)
+                .env("PATH", &path)
+                .output()
+                .expect("the script runs")
+        };
+        for category in Category::ALL {
+            let listed = listing(&[category.name(), "--list-cases"]);
+            assert!(
+                listed.status.success(),
+                "{}",
+                String::from_utf8_lossy(&listed.stderr)
+            );
+            assert_eq!(String::from_utf8_lossy(&listed.stdout), category.list());
+        }
+        let refused = listing(&["bifrost", "--list-cases", "--cases", "point-c1"]);
+        assert_eq!(refused.status.code(), Some(2));
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains("takes no other flag"),
+            "{}",
+            String::from_utf8_lossy(&refused.stderr)
+        );
+        assert!(
+            !calls.exists(),
+            "a build tool was called: {}",
+            std::fs::read_to_string(&calls).unwrap_or_default()
+        );
+    }
+
     /// Every registered L1 case is a measured step its engine declares when
     /// the case's own plan arguments select it; narrowing keeps exactly that
     /// step and the criteria judging it on the case clock, the declaration

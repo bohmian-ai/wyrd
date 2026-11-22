@@ -3603,7 +3603,7 @@ impl ShardOwner {
         record_group_size("requests", group.len());
         let rotating = Instant::now();
         self.retry_retained_post_commit()?;
-        self.rotate_before_append_if_needed(&group)?;
+        self.rotate_before_append_if_needed(&group).await?;
         record_group_stage("rotate", rotating.elapsed());
         let stages = GroupStages::default();
         let write = stages.write.timer();
@@ -3810,7 +3810,7 @@ impl ShardOwner {
     ///
     /// Returns a sizing, WAL close/retention, memtable, binding, or accounting
     /// error before the incoming group mutates WAL.
-    fn rotate_before_append_if_needed(
+    async fn rotate_before_append_if_needed(
         &mut self,
         group: &[PreparedAppend],
     ) -> Result<(), ScribeError> {
@@ -3878,7 +3878,7 @@ impl ShardOwner {
         } else {
             "memtable_arrow"
         };
-        let rotation_result = self.rotate_active_generation();
+        let rotation_result = self.rotate_active_generation().await;
         if let Err(error) = &rotation_result {
             tracing::warn!(
                 shard_id = self.id,
@@ -3897,7 +3897,7 @@ impl ShardOwner {
     /// Returns when WAL retention, atomic all-key freeze, accounting transfer,
     /// binding resolution, or queue construction fails. The incoming append has
     /// not started when this method is called.
-    fn rotate_active_generation(&mut self) -> Result<(), ScribeError> {
+    async fn rotate_active_generation(&mut self) -> Result<(), ScribeError> {
         // Resolve every member and prove the complete accounting transfer
         // before closing the only active WAL. Nothing below this point may
         // discover an ordinary retryable preparation failure after durable
@@ -3919,7 +3919,7 @@ impl ShardOwner {
         self.memory_ownership
             .preflight_move_active_to_immutable(active_bytes)?;
 
-        let result = self.rotate_active_generation_after_preflight();
+        let result = self.rotate_active_generation_after_preflight().await;
         if result.is_err() {
             // Once WAL close begins, retrying as a normal active generation
             // could duplicate cohort ownership. Preserve every durable file
@@ -3932,18 +3932,34 @@ impl ShardOwner {
 
     /// Completes an automatic rotation after all retryable preparation passed.
     ///
+    /// The active WAL generation closes, and an unread closed cohort retires,
+    /// on the WAL IO lane: both fsync, and this owner runs on an async worker.
+    /// The owner awaits each before freezing, so no append reaches the closing
+    /// generation.
+    ///
     /// # Errors
     ///
     /// Returns a fail-stop error for WAL close/retention, all-key freeze,
     /// accounting transfer, or queue installation. The caller poisons
     /// readiness and leaves WAL/staged state intact for deterministic replay.
-    fn rotate_active_generation_after_preflight(&mut self) -> Result<(), ScribeError> {
+    async fn rotate_active_generation_after_preflight(&mut self) -> Result<(), ScribeError> {
         let mut segment_refs = self
             .wal_segments
             .values()
             .flat_map(|segments| segments.values().map(|segment| segment.reference()))
             .collect::<Vec<_>>();
-        if let Some(closed) = self.wal_handle.close_active_generation()?
+        let ScribeWalIoResult::GenerationClosed(closed) = self
+            .wal_io
+            .submit(ScribeWalIoOp::CloseActiveGeneration {
+                wal: self.wal_handle.clone(),
+            })
+            .await?
+        else {
+            return Err(ScribeError::Internal {
+                detail: "WAL IO lane returned the wrong generation close result".to_owned(),
+            });
+        };
+        if let Some(closed) = closed
             && !segment_refs
                 .iter()
                 .any(|segment| segment.path == closed.path)
@@ -3998,7 +4014,12 @@ impl ShardOwner {
             // above forever: the closed bytes would never become deletable and
             // WAL disk pressure could never clear. Release the reference
             // instead, which is exactly what a terminal cohort would have done.
-            self.wal_handle.retire_segments(&segment_refs)?;
+            self.wal_io
+                .submit(ScribeWalIoOp::RetireWal {
+                    wal: self.wal_handle.clone(),
+                    segments: segment_refs.clone(),
+                })
+                .await?;
         } else {
             self.rotation_cohorts.push_back(ShardRotationCohort {
                 shard_id: self.id,
@@ -5421,8 +5442,8 @@ mod tests {
     ///
     /// Panics if the isolated WAL, memtable, root ownership, or owner rotation
     /// cannot be constructed and settled for either threshold case.
-    #[test]
-    fn distinct_wal_and_memtable_thresholds_drive_owner_rotation() {
+    #[tokio::test]
+    async fn distinct_wal_and_memtable_thresholds_drive_owner_rotation() {
         for (wal_target, memtable_target) in [(1, usize::MAX), (u64::MAX, 1)] {
             let key = owner_key();
             let memtable = Memtable::new();
@@ -5458,6 +5479,7 @@ mod tests {
 
             owner
                 .rotate_before_append_if_needed(&[])
+                .await
                 .expect("threshold rotates owner");
 
             assert_eq!(owner.rotation_cohorts.len(), 1);
@@ -5609,8 +5631,8 @@ mod tests {
     ///
     /// Panics when isolated owners cannot be built or the all-key rotation does
     /// not preserve one complete cohort before admitting a fresh generation.
-    #[test]
-    fn shard_owner_rotation_swaps_complete_generation_before_fresh_append() {
+    #[tokio::test]
+    async fn shard_owner_rotation_swaps_complete_generation_before_fresh_append() {
         let first = owner_key();
         let second = SealKey::new(
             first.tenant,
@@ -5643,11 +5665,18 @@ mod tests {
             .memory_ownership
             .reserve_active(active_bytes)
             .expect("active memory ownership");
+        let closes_before = owner.wal_io.close_submissions_for_test();
 
         owner
             .rotate_active_generation()
+            .await
             .expect("automatic all-key rotation");
 
+        assert_eq!(
+            owner.wal_io.close_submissions_for_test(),
+            closes_before + 1,
+            "the WAL generation closes on the WAL IO lane, not the owner's async worker"
+        );
         let stats = owner.memtable.stats().expect("rotated statistics");
         assert_eq!(stats.writable_buckets, 0);
         assert_eq!(stats.immutable_generations, 2);
@@ -5696,8 +5725,8 @@ mod tests {
     ///
     /// Panics when the isolated owner cannot append its WAL records, transfer
     /// active ownership, rotate all keys, reset its clock, or admit fresh state.
-    #[test]
-    fn automatic_age_rotation_is_whole_shard_below_high_water() {
+    #[tokio::test]
+    async fn automatic_age_rotation_is_whole_shard_below_high_water() {
         let first = owner_key();
         let second = SealKey::new(
             first.tenant,
@@ -5742,6 +5771,7 @@ mod tests {
 
         owner
             .rotate_before_append_if_needed(&[])
+            .await
             .expect("automatic age owner rotation");
 
         assert_eq!(owner.rotation_cohorts.len(), 1);

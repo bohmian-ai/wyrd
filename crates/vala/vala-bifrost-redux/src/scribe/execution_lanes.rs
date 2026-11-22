@@ -2211,6 +2211,12 @@ pub(crate) enum ScribeWalIoOp {
         wal: WalHandle,
         segments: Vec<WalSegmentRef>,
     },
+    /// Trims, fsyncs and detaches one shard's non-empty active WAL generation,
+    /// so the shard owner's rotation never fsyncs on an async worker.
+    CloseActiveGeneration {
+        /// Fixed shard WAL handle whose active generation closes.
+        wal: WalHandle,
+    },
 }
 
 /// Results produced by [`ScribeWalIoPool`].
@@ -2230,6 +2236,9 @@ pub(crate) enum ScribeWalIoResult {
     },
     WalSynced,
     Completed,
+    /// The closed generation's segment, or `None` when the stream held no
+    /// accepted record and nothing closed.
+    GenerationClosed(Option<WalSegmentRef>),
     /// Reports a fully settled in-worker replay after each manifest was durably
     /// advanced before generation retirement and all safe reader pins closed.
     ReplayStreamCompleted {
@@ -2268,6 +2277,9 @@ pub struct ScribeWalIoPool {
     /// Retire operations submitted through the production lane in unit tests.
     #[cfg(test)]
     retire_submissions: Arc<AtomicU64>,
+    /// Generation closes submitted through the production lane in unit tests.
+    #[cfg(test)]
+    close_submissions: Arc<AtomicU64>,
     /// Sync operations submitted through the production lane in unit tests.
     #[cfg(test)]
     sync_submissions: Arc<AtomicU64>,
@@ -2333,6 +2345,8 @@ impl ScribeWalIoPool {
             #[cfg(test)]
             retire_submissions: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
+            close_submissions: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
             sync_submissions: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             write_submissions: Arc::new(AtomicU64::new(0)),
@@ -2350,6 +2364,10 @@ impl ScribeWalIoPool {
         #[cfg(test)]
         if matches!(&operation, ScribeWalIoOp::SyncWal { .. }) {
             self.sync_submissions.fetch_add(1, Ordering::AcqRel);
+        }
+        #[cfg(test)]
+        if matches!(&operation, ScribeWalIoOp::CloseActiveGeneration { .. }) {
+            self.close_submissions.fetch_add(1, Ordering::AcqRel);
         }
         #[cfg(test)]
         if matches!(
@@ -2455,6 +2473,12 @@ impl ScribeWalIoPool {
         self.retire_submissions.load(Ordering::Acquire)
     }
 
+    /// Returns generation closes observed at the production WAL lane boundary.
+    #[cfg(test)]
+    pub(crate) fn close_submissions_for_test(&self) -> u64 {
+        self.close_submissions.load(Ordering::Acquire)
+    }
+
     /// Returns sync submissions observed at the production WAL lane boundary.
     #[cfg(test)]
     pub(crate) fn sync_submissions_for_test(&self) -> u64 {
@@ -2525,6 +2549,9 @@ fn execute_wal_io(
             wal.retire_segments(&segments)?;
             Ok(ScribeWalIoResult::Completed)
         }
+        ScribeWalIoOp::CloseActiveGeneration { wal } => wal
+            .close_active_generation()
+            .map(ScribeWalIoResult::GenerationClosed),
     }
 }
 

@@ -192,7 +192,7 @@ entries.
 - C2: `mise exec -- cargo nextest run --locked -p wyrd-benchmark --all-features` — GREEN.
 - C3: `mise run test:benchmark:l1` (runs the focused selector
   `tests::pg_tests::l1_sweeps_isolate_and_record_cases`) — GREEN.
-- `mise run fmt:check`, `mise run lints` and `git diff --check` — see results below.
+- `mise run fmt:check`, `mise run lints` and `git diff --check` — GREEN.
 
 **TDD compliance: VIOLATED** for scenarios 1–4: production code preceded
 the focused tests, so no RED failures were recorded. Mechanical deviation:

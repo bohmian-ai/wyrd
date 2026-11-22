@@ -312,7 +312,7 @@ impl EncodedVariant {
     /// depth limit.
     pub fn from_builder(builder: VariantBuilder) -> Result<Self, VariantViolation> {
         let (metadata, value) = builder.finish();
-        Self::check_built(&metadata, &value)?;
+        Self::check_built(&metadata, &value, &mut ScanScratch::default())?;
         Ok(Self { metadata, value })
     }
 
@@ -321,17 +321,23 @@ impl EncodedVariant {
     ///
     /// The builder is the encoding authority, so only the size limit and the
     /// explicit-stack scan run; upstream's recursive validation is reserved
-    /// for raw input ([`Self::validate_bytes`]).
+    /// for raw input ([`Self::validate_bytes`]). The scan reuses `scratch`,
+    /// so a column validating row after row stops allocating once the
+    /// buffers fit its largest row.
     ///
     /// # Errors
     ///
     /// Returns [`VariantViolation::TooLarge`] past the size limit, and the
     /// scan's violation, such as [`VariantViolation::TooDeep`], otherwise.
-    fn check_built(metadata: &[u8], value: &[u8]) -> Result<(), VariantViolation> {
+    fn check_built(
+        metadata: &[u8],
+        value: &[u8],
+        scratch: &mut ScanScratch,
+    ) -> Result<(), VariantViolation> {
         Self::within_size_limit(metadata.len() + value.len())?;
         let parsed =
             VariantMetadata::try_new(metadata).map_err(|_| invalid(&JsonPointer::default()))?;
-        scan_encoded(parsed, value).finish()
+        scan_encoded_with(parsed, value, scratch).finish()
     }
 
     /// Check already-encoded Variant bytes after full validation, keeping no
@@ -773,6 +779,8 @@ impl VariantColumnBuilder {
 pub struct VariantColumnEncoder {
     /// The column under construction.
     rows: parquet_variant_compute::VariantArrayBuilder,
+    /// Buffers reused by every row's validation scan.
+    scratch: ScanScratch,
 }
 
 impl Default for VariantColumnEncoder {
@@ -788,6 +796,7 @@ impl VariantColumnEncoder {
     pub fn with_capacity(rows: usize) -> Self {
         Self {
             rows: parquet_variant_compute::VariantArrayBuilder::new(rows),
+            scratch: ScanScratch::default(),
         }
     }
 
@@ -821,7 +830,7 @@ impl VariantColumnEncoder {
             .last_value_bytes()
             .expect("a built row is a present value");
         let encoded = metadata.len() + value.len();
-        match EncodedVariant::check_built(metadata, value) {
+        match EncodedVariant::check_built(metadata, value, &mut self.scratch) {
             Ok(()) => Ok(encoded),
             Err(violation) => {
                 self.rows.rollback(before);
@@ -1337,12 +1346,62 @@ pub fn narrow_integer(integer: i64) -> Variant<'static, 'static> {
 /// Panics when a node's bytes are malformed; [`EncodedVariant::validate`]
 /// contains it.
 fn scan_encoded(metadata: VariantMetadata<'_>, value: &[u8]) -> VariantViolations {
+    scan_encoded_with(metadata, value, &mut ScanScratch::default())
+}
+
+/// Buffers [`scan_encoded_with`] reuses between scans.
+///
+/// The scan's stacks borrow the bytes of the value being scanned, so they are
+/// stored empty and re-typed to each scan's lifetimes with [`recycle`].
+#[derive(Debug, Default)]
+struct ScanScratch {
+    /// The pending-node stack.
+    pending: Vec<PendingNode<'static, 'static>>,
+    /// The pointer tokens of the node being visited.
+    tokens: Vec<PointerToken<'static>>,
+    /// One object's field start offsets, in field order.
+    starts: Vec<usize>,
+    /// The same starts, sorted, to find each field's slot end.
+    sorted: Vec<usize>,
+    /// One object's field byte slots.
+    slots: Vec<&'static [u8]>,
+}
+
+/// One node awaiting a visit: its parent's pointer depth, its token, the
+/// number of containers open above it, and the node.
+type PendingNode<'m, 'v> = (usize, Option<PointerToken<'m>>, u32, Variant<'m, 'v>);
+
+/// Empty `buffer` and keep its allocation for elements of another lifetime.
+///
+/// Callers only change lifetimes, so the layouts match and std collects the
+/// empty iterator in place; were that ever not applied, this would allocate
+/// a fresh buffer and stay correct.
+fn recycle<A, B>(mut buffer: Vec<A>) -> Vec<B> {
+    buffer.clear();
+    buffer
+        .into_iter()
+        .map(|_| unreachable!("the buffer is empty"))
+        .collect()
+}
+
+/// [`scan_encoded`] with its stacks and object slot buffers taken from, and
+/// returned to, `scratch`.
+///
+/// A scan that panics on malformed bytes leaves `scratch` empty, which only
+/// costs the next scan its allocations.
+fn scan_encoded_with<'m, 'v>(
+    metadata: VariantMetadata<'m>,
+    value: &'v [u8],
+    scratch: &mut ScanScratch,
+) -> VariantViolations {
     let mut found = VariantViolations::default();
-    let mut path = JsonPointer::default();
+    let mut path = JsonPointer {
+        tokens: recycle(std::mem::take(&mut scratch.tokens)),
+    };
+    let mut slots: Vec<&'v [u8]> = recycle(std::mem::take(&mut scratch.slots));
     let exact_unsigned = i128::from(i64::MAX) + 1..=i128::from(u64::MAX);
-    // Each pending node carries its parent's pointer depth, its token, and
-    // the number of containers open above it.
-    let mut pending = vec![(0, None, 0, Variant::new_with_metadata(metadata, value))];
+    let mut pending: Vec<PendingNode<'m, 'v>> = recycle(std::mem::take(&mut scratch.pending));
+    pending.push((0, None, 0, Variant::new_with_metadata(metadata, value)));
     while let Some((parent, token, depth, node)) = pending.pop() {
         path.truncate(parent);
         if let Some(token) = token {
@@ -1353,12 +1412,19 @@ fn scan_encoded(metadata: VariantMetadata<'_>, value: &[u8]) -> VariantViolation
         match node {
             Variant::Object(object) => {
                 let (depth, _) = enter_container(depth, &path, &mut found);
-                let Some(slots) = object_field_slots(&object) else {
+                if object_field_slots(
+                    &object,
+                    &mut scratch.starts,
+                    &mut scratch.sorted,
+                    &mut slots,
+                )
+                .is_none()
+                {
                     found.record(invalid(&path));
                     break;
-                };
+                }
                 let mut previous: Option<&str> = None;
-                for (index, slot) in slots.into_iter().enumerate() {
+                for (index, slot) in slots.drain(..).enumerate() {
                     let name = object
                         .field_name(index)
                         .expect("index is below the field count");
@@ -1402,6 +1468,9 @@ fn scan_encoded(metadata: VariantMetadata<'_>, value: &[u8]) -> VariantViolation
             break;
         }
     }
+    scratch.pending = recycle(pending);
+    scratch.tokens = recycle(path.tokens);
+    scratch.slots = recycle(slots);
     found
 }
 
@@ -1417,7 +1486,18 @@ fn scan_encoded(metadata: VariantMetadata<'_>, value: &[u8]) -> VariantViolation
 /// value runs past its slot then fails to decode inside it. Upstream's
 /// shallow object check has already bounded the header, field ids, and
 /// offsets inside `object.value`, which ends at the end offset.
-fn object_field_slots<'v>(object: &VariantObject<'_, 'v>) -> Option<Vec<&'v [u8]>> {
+///
+/// The slots are written to `slots`, and `starts` and `sorted` are working
+/// buffers; all three are cleared first so a scan reuses them per object.
+fn object_field_slots<'v>(
+    object: &VariantObject<'_, 'v>,
+    starts: &mut Vec<usize>,
+    sorted: &mut Vec<usize>,
+    slots: &mut Vec<&'v [u8]>,
+) -> Option<()> {
+    starts.clear();
+    sorted.clear();
+    slots.clear();
     let bytes = object.value;
     // Header bits above the two basic-type bits: offset width minus one,
     // field-id width minus one, then the large-count flag.
@@ -1428,31 +1508,27 @@ fn object_field_slots<'v>(object: &VariantObject<'_, 'v>) -> Option<Vec<&'v [u8]
     let fields = object.len();
     let offsets_start = 1 + count_size + fields * id_size;
     let values = bytes.get(offsets_start + (fields + 1) * offset_size..)?;
-    let offsets = (0..=fields)
-        .map(|index| {
-            let at = offsets_start + index * offset_size;
-            let little_endian = bytes.get(at..at + offset_size)?;
-            Some(
-                little_endian
-                    .iter()
-                    .rev()
-                    .fold(0, |offset, byte| offset << 8 | usize::from(*byte)),
-            )
-        })
-        .collect::<Option<Vec<_>>>()?;
-    let (&end, starts) = offsets.split_last()?;
-    let mut sorted = starts.to_vec();
+    for index in 0..=fields {
+        let at = offsets_start + index * offset_size;
+        let little_endian = bytes.get(at..at + offset_size)?;
+        starts.push(
+            little_endian
+                .iter()
+                .rev()
+                .fold(0, |offset, byte| offset << 8 | usize::from(*byte)),
+        );
+    }
+    let end = starts.pop()?;
+    sorted.extend_from_slice(starts);
     sorted.sort_unstable();
     if sorted.windows(2).any(|pair| pair[0] == pair[1]) {
         return None;
     }
-    starts
-        .iter()
-        .map(|&start| {
-            let next = sorted.partition_point(|&other| other <= start);
-            values.get(start..sorted.get(next).copied().unwrap_or(end))
-        })
-        .collect()
+    for &start in starts.iter() {
+        let next = sorted.partition_point(|&other| other <= start);
+        slots.push(values.get(start..sorted.get(next).copied().unwrap_or(end))?);
+    }
+    Some(())
 }
 
 /// Report whether a JSON value nests a container past [`VARIANT_MAX_DEPTH`].
@@ -2697,7 +2773,31 @@ mod tests {
         encoder
             .append(|row| attribute_object(row, 3))
             .expect("last row");
+        assert!(
+            encoder.scratch.pending.capacity() > 0 && encoder.scratch.slots.capacity() > 0,
+            "the column keeps its scan buffers for the next row"
+        );
         let column = encoder.finish().expect("finishes");
         assert_eq!(column.to_data(), expected.to_data());
+    }
+
+    /// Re-typing an emptied scan buffer keeps its allocation, so a reused
+    /// [`ScanScratch`] really avoids reallocating.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the recycled buffer is a fresh allocation.
+    #[test]
+    fn recycled_scan_buffer_keeps_its_allocation() {
+        let value = [1_u8, 2, 3];
+        let mut borrowed: Vec<&[u8]> = Vec::with_capacity(8);
+        borrowed.push(&value);
+        let allocation = borrowed.as_ptr().cast::<u8>();
+
+        let recycled: Vec<&'static [u8]> = recycle(borrowed);
+
+        assert!(recycled.is_empty());
+        assert_eq!(recycled.capacity(), 8);
+        assert_eq!(recycled.as_ptr().cast::<u8>(), allocation);
     }
 }

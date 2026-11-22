@@ -17,10 +17,10 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use secrecy::ExposeSecret as _;
 use wyrd_auth::callback::LoginCompletion;
-use wyrd_auth::social::TenantLogin;
+use wyrd_auth::social::{SIGNUP_EMAIL_TTL, TenantLogin};
 use wyrd_spec::auth::{
-    BrowserLoginResponse, CreateTenantRequest, SignupBeginRequest, SignupCompleteRequest,
-    SignupCompleteResponse,
+    BrowserLoginResponse, CreateTenantRequest, ProofStatus, ProofStatusResponse,
+    SignupBeginRequest, SignupCompleteRequest, SignupCompleteResponse, SignupVerifyRequest,
 };
 use wyrd_spec::auth::{CallbackQuery, LoginMethodsQuery, LoginMethodsResponse, SocialProvider};
 use wyrd_spec::error::{WyrdError, WyrdProblem};
@@ -232,11 +232,14 @@ const SIGNUP_COOKIE_PATH: &str = "/auth/signup";
 /// Lifetime of the completion cookie: the proof's completion window.
 const SIGNUP_COOKIE_MAX_AGE_SECONDS: u64 = 1800;
 
-/// `POST /auth/signup` — begin creating a workspace by proving a shared
-/// social provider identity in this browser.
+/// `POST /auth/signup` — begin creating a workspace by proving, in this
+/// browser, a mailbox or a shared social provider identity.
 ///
-/// Sets the `wyrd_login` transaction cookie the provider callback requires
-/// and returns the provider authorization URL. Nothing is created.
+/// A social start sets the sealed `wyrd_login` round-trip cookie the
+/// provider callback requires and returns the provider authorization URL. An
+/// email start mails the address a one-use link, sets the sealed
+/// `wyrd_signup_email` flow cookie, and answers `202 check_email`. Nothing is
+/// stored or created.
 ///
 /// # Errors
 /// `403 WYRD_AUTH_403_ORIGIN_REFUSED` without this deployment's exact
@@ -247,9 +250,14 @@ const SIGNUP_COOKIE_MAX_AGE_SECONDS: u64 = 1800;
     path = "/auth/signup",
     request_body = SignupBeginRequest,
     responses(
-        (status = 200, description = "Signup begun; the login-transaction cookie is set",
+        (status = 200, description = "Social signup begun; the login-transaction cookie is set",
           body = BrowserLoginResponse,
           headers(("Set-Cookie" = String, description = "The `wyrd_login` transaction cookie"))),
+        (status = 202, description = "Email signup begun; the proof was mailed and the flow \
+          cookie is set", body = ProofStatusResponse,
+          headers(("Set-Cookie" = String, description = "The `wyrd_signup_email` flow cookie"))),
+        (status = 400, description = "The address is not an email address \
+          (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "Signup or the provider is not available \
           (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
         (status = 403, description = "Origin absent or foreign \
@@ -276,11 +284,29 @@ pub async fn signup(
     require_same_origin(&headers, &origin)?;
     let provider = match request {
         SignupBeginRequest::Social { provider } => provider,
-        SignupBeginRequest::Email { .. } => {
-            return Err(WyrdErrorResponse::from(WyrdError::InvalidToken {
-                message: "email signup is not available".to_owned(),
-                details: serde_json::json!({}),
-            }));
+        SignupBeginRequest::Email { email } => {
+            let mail = state.auth.application_mail.as_ref().ok_or_else(|| {
+                WyrdErrorResponse::from(WyrdError::Internal {
+                    message: "platform control plane is not configured".to_owned(),
+                    details: serde_json::json!({ "plane": "platform" }),
+                })
+            })?;
+            let flow = social(&state)?
+                .begin_email_signup(mail, &email, &origin, source)
+                .await?;
+            return Ok(with_cookies(
+                StatusCode::ACCEPTED,
+                vec![cookie_header(
+                    &origin,
+                    SIGNUP_EMAIL_COOKIE,
+                    flow.expose_secret(),
+                    SIGNUP_COOKIE_PATH,
+                    SIGNUP_EMAIL_TTL.as_secs(),
+                )],
+                Json(ProofStatusResponse {
+                    status: ProofStatus::CheckEmail,
+                }),
+            ));
         }
     };
     let begun = social(&state)?
@@ -297,6 +323,77 @@ pub async fn signup(
         )],
         Json(BrowserLoginResponse {
             authorization_url: begun.authorization_url,
+        }),
+    ))
+}
+
+/// Name of the cookie holding an email signup's sealed flow.
+const SIGNUP_EMAIL_COOKIE: &str = "wyrd_signup_email";
+
+/// `POST /auth/signup/verify` — prove the mailbox an email signup message
+/// was sent to, in the browser that began it.
+///
+/// The browser presents its `wyrd_signup_email` flow cookie and the proof
+/// from the message. The proof is recorded once and the response sets the
+/// `wyrd_signup` completion cookie; the same browser repeating the request
+/// after a lost response gets a fresh completion cookie for the same proof.
+///
+/// # Errors
+/// `401 WYRD_AUTH_401_ONE_TIME_CODE_INVALID` for a missing flow cookie or a
+/// wrong or spent proof; `400` once expired; `401
+/// WYRD_AUTH_401_INVALID_TOKEN` when local signup is no longer offered.
+#[utoipa::path(
+    post,
+    path = "/auth/signup/verify",
+    request_body = SignupVerifyRequest,
+    responses(
+        (status = 200, description = "The mailbox is proven; the completion cookie is set",
+          body = ProofStatusResponse,
+          headers(("Set-Cookie" = String, description = "The `wyrd_signup` completion cookie"))),
+        (status = 400, description = "Invalid body, or the proof expired \
+          (WYRD_SPEC_400_VALIDATION, WYRD_AUTH_400_INVALID_STATE)", body = WyrdProblem),
+        (status = 401, description = "No flow in this browser, a wrong or spent proof, or local \
+          signup is no longer offered (WYRD_AUTH_401_ONE_TIME_CODE_INVALID, \
+          WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
+        (status = 403, description = "Origin absent or foreign \
+          (WYRD_AUTH_403_ORIGIN_REFUSED)", body = WyrdProblem),
+        (status = 503, description = "The store is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    security(()),
+    tag = "Auth"
+)]
+#[tracing::instrument(level = "debug", skip_all)]
+pub async fn signup_verify(
+    State(state): State<AppState>,
+    RequestOrigin(origin): RequestOrigin,
+    headers: HeaderMap,
+    request: Result<Json<SignupVerifyRequest>, JsonRejection>,
+) -> Result<Response, WyrdErrorResponse> {
+    let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
+    require_same_origin(&headers, &origin)?;
+    let mut flows = cookie_pairs(&headers).filter(|(name, _)| *name == SIGNUP_EMAIL_COOKIE);
+    let flow = match (flows.next(), flows.next()) {
+        (Some((_, value)), None) => Some(value),
+        _ => None,
+    };
+    let completion = social(&state)?
+        .verify_email_signup(flow, &request.proof)
+        .await?;
+    Ok(with_cookies(
+        StatusCode::OK,
+        vec![
+            cookie_header(
+                &origin,
+                SIGNUP_COOKIE,
+                completion.expose_secret(),
+                SIGNUP_COOKIE_PATH,
+                SIGNUP_COOKIE_MAX_AGE_SECONDS,
+            ),
+            cookie_header(&origin, SIGNUP_EMAIL_COOKIE, "", SIGNUP_COOKIE_PATH, 0),
+        ],
+        Json(ProofStatusResponse {
+            status: ProofStatus::Proven,
         }),
     ))
 }

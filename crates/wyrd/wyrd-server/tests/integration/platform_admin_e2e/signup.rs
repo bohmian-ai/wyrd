@@ -10,8 +10,8 @@ use wyrd_testing::WyrdTestServer;
 
 use super::{
     SOCIAL_HOST, begin_social_at, body_json, complete_signup, enable_google, identity_token_reply,
-    initialize_platform_root, mount_platform_provider, platform_key_set, platform_session,
-    prove_signup, social_call, social_callback, social_request,
+    initialize_platform_root, mail_to, mailpit, mount_platform_provider, platform_key_set,
+    platform_session, prove_signup, social_call, social_callback, social_request,
 };
 
 /// The trusted ingress every journey here sits behind.
@@ -703,4 +703,271 @@ async fn signup_start_keeps_its_round_trip_in_a_sealed_cookie() {
         "refused before discovery"
     );
     assert_eq!(count(&superuser, attempts).await, 1);
+}
+
+/// A browser request from `peer` carrying `cookie`; returns the status, the
+/// `name` cookie it set and the body.
+async fn email_step(
+    srv: &WyrdTestServer,
+    uri: &str,
+    peer: &str,
+    cookie: Option<&str>,
+    name: &str,
+    body: &Value,
+) -> (StatusCode, Option<String>, Value) {
+    let mut request = from_peer(Method::POST, uri, "10.7.0.1", Some(peer), body);
+    if let Some(cookie) = cookie {
+        request
+            .headers_mut()
+            .insert(header::COOKIE, cookie.parse().expect("cookie header"));
+    }
+    let resp = srv.oneshot(request).await.expect("signup step responds");
+    let status = resp.status();
+    let prefix = format!("{name}=");
+    let set = resp
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find(|value| value.starts_with(&prefix))
+        .map(str::to_owned);
+    (status, set, body_json(resp).await)
+}
+
+/// The proof the newest signup message to `address` carries in its link
+/// fragment, and that message's text.
+async fn mailed_proof(api: &str, address: &str) -> (String, String) {
+    let mail = mail_to(api, address).await;
+    let (_, _, _, text) = mail.first().expect("a signup message arrived");
+    let proof = text
+        .split("#proof=")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("the message links its proof in a fragment")
+        .to_owned();
+    (proof, text.clone())
+}
+
+/// A visitor proves a mailbox in the browser that asked, and nowhere else:
+///   1. without a mail relay, email signup is not offered and nothing is
+///      sent;
+///   2. a start answers `check_email`, stores nothing, sets a sealed
+///      HttpOnly flow cookie for `/auth/signup`, and mails the trimmed
+///      address a fragment link holding a proof the cookie does not hold;
+///   3. a wrong proof, or the right proof without the flow cookie, proves
+///      nothing;
+///   4. the right proof in the asking browser records one email proof under
+///      the canonical address and sets the completion cookie;
+///   5. the same browser repeating it, as after a lost response, gets a
+///      fresh completion cookie and no second proof; a later flow for the
+///      address cannot use the spent proof;
+///   6. an address's own budget refuses further starts from fresh sources
+///      before any mail is sent.
+///
+/// # Panics
+/// Panics when a step proves, stores or mails differently.
+#[tokio::test(flavor = "multi_thread")]
+async fn email_signup_proves_a_mailbox_in_the_browser_that_asked() {
+    let google = wiremock::MockServer::start().await;
+    let (srv, session) = signup_server(&google).await;
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    let attempts = "SELECT count(*) FROM platform.signup_attempts";
+    let local = format!("Ada.Lovelace+{}", uuid::Uuid::new_v4().simple());
+    let typed = format!("  {local}@Example.TEST ");
+    let canonical = format!("{local}@example.test");
+    let start = json!({ "method": "email", "email": typed });
+    let (host, port, api) = mailpit();
+
+    // 1. No relay, no email signup.
+    let (status, cookie, body) = email_step(
+        &srv,
+        "/auth/signup",
+        "198.51.100.70",
+        None,
+        "wyrd_signup_email",
+        &start,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert!(cookie.is_none());
+    assert!(
+        mail_to(&api, &canonical).await.is_empty(),
+        "nothing is sent"
+    );
+    let (status, relay) = social_call(
+        &srv,
+        social_request(
+            Method::PUT,
+            "/platform/mail",
+            Some(&session),
+            Some(
+                json!({ "host": host, "port": port, "tls": "none", "sender": "signup@wyrd.test" }),
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{relay}");
+
+    // 2. A start stores nothing and mails a fragment-linked proof.
+    let (status, flow, body) = email_step(
+        &srv,
+        "/auth/signup",
+        "198.51.100.70",
+        None,
+        "wyrd_signup_email",
+        &start,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body, json!({ "status": "check_email" }));
+    let flow = flow.expect("the flow cookie is set");
+    for attribute in [
+        "HttpOnly",
+        "Path=/auth/signup",
+        "Max-Age=900",
+        "SameSite=Lax",
+    ] {
+        assert!(flow.contains(attribute), "{flow}");
+    }
+    let flow = flow.split(';').next().expect("cookie pair").to_owned();
+    assert_eq!(
+        count(&superuser, attempts).await,
+        0,
+        "a start writes no row"
+    );
+    let (proof, text) = mailed_proof(&api, &canonical).await;
+    assert_eq!(
+        mail_to(&api, &canonical).await[0].0,
+        [format!("{local}@Example.TEST")],
+        "delivery keeps the address as typed, trimmed"
+    );
+    assert!(
+        text.contains("http://wyrd.test/signup/verify#proof="),
+        "{text}"
+    );
+    assert!(!flow.contains(&proof), "the cookie does not hold the proof");
+
+    // 3. A wrong proof, or no flow cookie, proves nothing.
+    let verify = |proof: &str| json!({ "proof": proof });
+    for (cookie, sent) in [
+        (Some(flow.as_str()), "not-the-proof"),
+        (None, proof.as_str()),
+    ] {
+        let (status, completion, body) = email_step(
+            &srv,
+            "/auth/signup/verify",
+            "198.51.100.70",
+            cookie,
+            "wyrd_signup",
+            &verify(sent),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        assert_eq!(
+            body["code"], "WYRD_AUTH_401_ONE_TIME_CODE_INVALID",
+            "{body}"
+        );
+        assert!(completion.is_none());
+    }
+    assert_eq!(count(&superuser, attempts).await, 0);
+
+    // 4. The asking browser proves the mailbox once.
+    let (status, completion, body) = email_step(
+        &srv,
+        "/auth/signup/verify",
+        "198.51.100.70",
+        Some(&flow),
+        "wyrd_signup",
+        &verify(&proof),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, json!({ "status": "proven" }));
+    let completion = completion.expect("the completion cookie is set");
+    assert!(
+        completion.contains("Path=/auth/signup") && completion.contains("HttpOnly"),
+        "{completion}"
+    );
+    let proven: Vec<(String, Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT proof_kind, email, provider FROM platform.signup_attempts")
+            .fetch_all(&superuser)
+            .await
+            .expect("attempts read");
+    assert_eq!(
+        proven,
+        [("email".to_owned(), Some(canonical.clone()), None)]
+    );
+
+    // 5. A lost response resumes in the same browser; the spent proof is
+    // useless to a later flow.
+    let (status, again, body) = email_step(
+        &srv,
+        "/auth/signup/verify",
+        "198.51.100.70",
+        Some(&flow),
+        "wyrd_signup",
+        &verify(&proof),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_ne!(again.expect("a fresh completion cookie"), completion);
+    assert_eq!(count(&superuser, attempts).await, 1, "no second proof");
+    let (status, later, body) = email_step(
+        &srv,
+        "/auth/signup",
+        "198.51.100.71",
+        None,
+        "wyrd_signup_email",
+        &start,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let later = later
+        .expect("flow cookie")
+        .split(';')
+        .next()
+        .expect("pair")
+        .to_owned();
+    let (status, _, body) = email_step(
+        &srv,
+        "/auth/signup/verify",
+        "198.51.100.71",
+        Some(&later),
+        "wyrd_signup",
+        &verify(&proof),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+
+    // 6. The address's budget holds across sources, before SMTP.
+    let mut admitted = 2;
+    let throttled = loop {
+        let (status, _, body) = email_step(
+            &srv,
+            "/auth/signup",
+            &format!("198.51.100.{}", 80 + admitted),
+            None,
+            "wyrd_signup_email",
+            &start,
+        )
+        .await;
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            break body;
+        }
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        admitted += 1;
+        assert!(admitted < 50, "the address is never throttled");
+    };
+    assert_eq!(
+        throttled["code"], "WYRD_AUTH_429_SIGNUP_ATTEMPTS",
+        "{throttled}"
+    );
+    assert_eq!(
+        mail_to(&api, &canonical).await.len(),
+        admitted,
+        "every admitted start mailed once, the refused one not at all"
+    );
 }

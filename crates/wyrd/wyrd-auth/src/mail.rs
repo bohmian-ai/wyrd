@@ -231,6 +231,47 @@ impl ApplicationMail {
         .await
     }
 
+    /// Email `to` the link that proves its mailbox for a workspace signup.
+    /// The link carries its proof in the fragment, so it never reaches a
+    /// server log; the proof is also shown to paste.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::AuthVerifyUnavailable`] when no relay is
+    /// configured, it cannot be opened, or it refuses the message: one
+    /// deployment-wide refusal that says nothing about the address.
+    pub async fn send_signup_proof(
+        &self,
+        to: &EmailAddress,
+        link: &str,
+        proof: &str,
+    ) -> Result<(), WyrdError> {
+        let unavailable = || WyrdError::AuthVerifyUnavailable {
+            message: "email could not be sent; try again later".to_owned(),
+            details: json!({ "retry_after_seconds": 60 }),
+        };
+        let relay = match self.relay().await {
+            Ok(Some(relay)) => relay,
+            Ok(None) => return Err(unavailable()),
+            Err(error) => {
+                tracing::error!(error = %error, "the mail relay could not be opened");
+                return Err(unavailable());
+            }
+        };
+        let body = format!(
+            "Open this link in the browser where you started creating your Wyrd \
+             workspace:\n\n{link}\n\nOr paste this code there:\n\n{proof}\n\n\
+             It works once and expires in fifteen minutes. If you did not ask to \
+             create a workspace, ignore this message.\n"
+        );
+        relay
+            .send(relay.message(to.delivery.clone(), "Confirm your email for Wyrd", body))
+            .await
+            .map_err(|error| {
+                tracing::warn!(error = %error, "the mail relay refused a signup proof");
+                unavailable()
+            })
+    }
+
     /// Open the configured relay; `None` when none is configured.
     ///
     /// # Errors
@@ -311,9 +352,62 @@ fn view(row: &MailRelayRow) -> MailRelayView {
 }
 
 /// A field validation refusal.
+/// An email address as typed and as compared.
+#[derive(Debug, Clone)]
+pub struct EmailAddress {
+    /// The trimmed address as typed, which mail is delivered to.
+    pub delivery: Address,
+    /// The comparison form: the local part unchanged, the domain lowercased.
+    /// Dots, plus tags and provider aliases are never collapsed, so
+    /// differently written addresses stay distinct rather than merge.
+    pub canonical: String,
+}
+
+impl EmailAddress {
+    /// Parse a typed address.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::Validation`] naming `field` when the trimmed
+    /// value is not an email address.
+    pub fn parse(typed: &str, field: &str) -> Result<Self, WyrdError> {
+        let delivery = typed
+            .trim()
+            .parse::<Address>()
+            .map_err(|_| validation(&format!("{field} must be an email address"), field))?;
+        let canonical = format!(
+            "{}@{}",
+            delivery.user(),
+            delivery.domain().to_ascii_lowercase()
+        );
+        Ok(Self {
+            delivery,
+            canonical,
+        })
+    }
+}
+
 fn validation(message: &str, field: &str) -> WyrdError {
     WyrdError::Validation {
         message: message.to_owned(),
         details: json!({ "field": field }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EmailAddress;
+
+    /// Trimming and the domain's case are the only normalization.
+    #[test]
+    fn addresses_compare_by_local_part_and_lowercase_domain() {
+        let address = EmailAddress::parse("  Ada.Lovelace+wyrd@Example.TEST ", "email")
+            .expect("valid address");
+        assert_eq!(address.canonical, "Ada.Lovelace+wyrd@example.test");
+        assert_eq!(
+            address.delivery.to_string(),
+            "Ada.Lovelace+wyrd@Example.TEST"
+        );
+        assert!(EmailAddress::parse("not an address", "email").is_err());
+        assert!(EmailAddress::parse("", "email").is_err());
     }
 }

@@ -362,6 +362,68 @@ prevents replay across replicas and preserves same-browser lost-response recover
 **Proof:** tier-1 HTTP/provider/mail and SQL integration assertions for absence,
 uniqueness and pre-work refusal. RED is staged pending-row/start-admission behavior.
 
+**Evidence (cycle 6):** RED: `platform_admin_e2e::signup::signup_start_keeps_its_round_trip_in_a_sealed_cookie`
+first failed because a social start left one `platform.signup_attempts` row
+("a start writes no row", left 1). The second RED,
+`platform_admin_e2e::signup::email_signup_proves_a_mailbox_in_the_browser_that_asked`,
+failed because an email start answered `401 "email signup is not available"`.
+
+GREEN came after these changes:
+- Unapplied migration 000006 was revised in place. `platform.signup_attempts`
+  now holds only proven attempts: `proof_kind` is `email` or `social`, and the
+  table is unique on `proof_hash` (the state or identifier digest). A social
+  proof requires provider, revision and identity; an email proof requires its
+  address. Admissions gain an `address` scope.
+- `SocialSignIn` seals a `SignupEnvelope` (`signup_social` or `signup_email`)
+  under the deployment keyring into the cookie. The deadline comes from the
+  database clock (`signup_clock`) and is checked before provider IO.
+- Social: `wyrd_login`, path `/auth/social`, five minutes, carrying state, PKCE
+  verifier, nonce, revision, redirect and binding.
+- Email: `wyrd_signup_email`, path `/auth/signup`, fifteen minutes, carrying the
+  proof's digest, canonical address and binding, never the proof.
+- `insert_proven_signup` uses `ON CONFLICT (proof_hash) DO NOTHING`, so a replay
+  or a concurrent return records nothing more. `renew_signup_completion` lets
+  only the proving browser recover a lost response.
+- `ApplicationMail::send_signup_proof` mails a fragment link
+  (`/signup/verify#proof=…`) plus a code to paste.
+- `EmailAddress::parse` trims and lowercases the domain only. Unit test:
+  `mail::tests::addresses_compare_by_local_part_and_lowercase_domain`.
+- New route `POST /auth/signup/verify` returns `{status:"proven"}`; an email
+  start returns `202 {status:"check_email"}`.
+
+The social journey proves these cases:
+- no row after a start, and the cookie hides state and nonce
+- a tampered cookie proves nothing
+- two concurrent callbacks with one cookie record exactly one proof, and a
+  replay records none
+- a throttled start makes no provider discovery request
+- admission state that cannot be read (table renamed) refuses with `503`,
+  before discovery
+
+The email journey proves these cases:
+- without a relay, email signup is not offered and nothing is mailed
+- a start stores nothing; delivery goes to the trimmed address as typed
+- a wrong proof, or the proof without the flow cookie, gets
+  `401 WYRD_AUTH_401_ONE_TIME_CODE_INVALID`
+- the asking browser records one `email` proof under the canonical address
+- a repeat from the same browser gets a fresh completion cookie and no second
+  proof
+- a later flow for the same address cannot use the spent proof
+- the address budget refuses a start from fresh sources before SMTP: mail
+  count equals admitted starts
+
+`signup_state_is_pseudonymous_and_purged_in_batches` now seeds the
+proven-attempt shape. Its assertion "both live pending starts remain" becomes
+"starts stored no attempt to keep" (0), because starts no longer write rows.
+
+The replica claim rests on shared PostgreSQL. The one-use digest is a database
+unique constraint, and the concurrent-callback race ran on one server.
+
+Completing an email proof is refused (`InvalidState`) until cycles 7 and 10
+consume it. **TDD: PASS.** Commands:
+- `cargo nextest run --locked -p wyrd-server --features test-support --test integration -E 'test(/^platform_admin_e2e::signup::/)'`
+- `cargo nextest run --locked -p wyrd-auth -p wyrd-sql -p wyrd-server --features wyrd-server/test-support --lib --test integration -E 'kind(lib) | test(/^platform_admin_e2e::/) | test(/^pg_browser_sessions::/) | test(/social|login|openapi|signup/)'` (1010/1010)
+
 ### 7. Final signup completion and interrupted-claim recovery
 
 **Reuses:** Cycle 6 bound proof and cycles 1–5 foundations; extend the existing TenantProvisioning and tenant session owners once.

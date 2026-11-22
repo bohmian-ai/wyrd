@@ -45,7 +45,8 @@ use wyrd_sql::queries::auth::{
 };
 use wyrd_sql::queries::platform::signup::{
     SignupAdmissionScope, SignupProof, admit_signup, finish_signup_creation, insert_proven_signup,
-    proven_signup, purge_expired_signup_state, signup_clock, start_signup_creation,
+    proven_signup, purge_expired_signup_state, renew_signup_completion, signup_clock,
+    start_signup_creation,
 };
 use wyrd_sql::queries::platform::social::{
     LoginSettingsRow, ProviderEnablement, SocialProviderRow, SocialTestState,
@@ -1049,7 +1050,26 @@ enum SignupEnvelope {
         /// Database-clock deadline, in Unix seconds.
         expires_at: i64,
     },
+    /// A mailbox proof sent for workspace creation.
+    SignupEmail {
+        /// SHA-256 of the proof the message carries; the cookie never holds
+        /// the proof itself.
+        proof_hash: Sha256Hex,
+        /// The address in comparison form.
+        address: String,
+        /// Random browser binding; its digest marks the proof.
+        binding: String,
+        /// Database-clock deadline, in Unix seconds.
+        expires_at: i64,
+    },
 }
+
+/// How long an email signup proof stays usable.
+pub const SIGNUP_EMAIL_TTL: std::time::Duration = std::time::Duration::from_mins(15);
+
+/// Email signup starts admitted per address in one window, whatever their
+/// source.
+const SIGNUP_ADDRESS_ATTEMPTS: i32 = 5;
 
 /// Signup without the deployment sealing keyring, which refuses rather than
 /// store or send plain state.
@@ -1130,6 +1150,135 @@ impl SocialSignIn {
             authorization_url: authorization.url,
             binding,
         })
+    }
+
+    /// Begin a public workspace signup by proving the mailbox `typed`, from
+    /// the browser that will hold the returned flow cookie.
+    ///
+    /// The start is admitted in the shared start window of its trusted
+    /// `source` and its address's own window before any other work; then
+    /// local signup must be offered. The address is mailed a link whose
+    /// fragment carries a one-use proof; the returned sealed cookie holds the
+    /// proof's digest, the canonical address, a browser binding and a
+    /// fifteen-minute database-clock deadline. Nothing is stored.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::Validation`] for an unparsable address,
+    /// [`WyrdError::SignupAttempts`] while a window is exhausted,
+    /// [`WyrdError::InvalidToken`] when local signup is not offered, and
+    /// [`WyrdError::AuthVerifyUnavailable`] when the source is unknown or
+    /// admission state, the clock or mail is unavailable.
+    pub async fn begin_email_signup(
+        &self,
+        mail: &crate::mail::ApplicationMail,
+        typed: &str,
+        origin: &Url,
+        source: Option<std::net::IpAddr>,
+    ) -> Result<SecretString, WyrdError> {
+        let source = source.ok_or_else(source_unknown)?;
+        let address = crate::mail::EmailAddress::parse(typed, "email")?;
+        let start = self.pseudonym("start", crate::admission::source_key(source).as_bytes())?;
+        let mailbox = self.pseudonym("address", address.canonical.as_bytes())?;
+        self.admit(&[
+            (SignupAdmissionScope::Start, start, SIGNUP_START_ATTEMPTS),
+            (
+                SignupAdmissionScope::Address,
+                mailbox,
+                SIGNUP_ADDRESS_ATTEMPTS,
+            ),
+        ])
+        .await?;
+        if !self.login_methods(None).await?.creation.local_signup {
+            return Err(signup_unavailable());
+        }
+        let proof = random_secret();
+        let cookie = self.seal_envelope(&SignupEnvelope::SignupEmail {
+            proof_hash: Sha256Hex::digest(proof.as_bytes()),
+            address: address.canonical.clone(),
+            binding: random_secret(),
+            expires_at: self.envelope_deadline(SIGNUP_EMAIL_TTL).await?,
+        })?;
+        let mut link = origin
+            .join("/signup/verify")
+            .map_err(|_| invalid_state("the deployment origin is invalid"))?;
+        link.set_fragment(Some(&format!("proof={proof}")));
+        mail.send_signup_proof(&address, link.as_str(), &proof)
+            .await?;
+        Ok(cookie)
+    }
+
+    /// Record the mailbox proof `proof` for the browser presenting the flow
+    /// `cookie`, and return the completion secret that browser must present
+    /// to create its workspace.
+    ///
+    /// The proof must match the cookie's digest before its deadline, and
+    /// local signup must still be offered. It is recorded once; the same
+    /// browser presenting it again, as after a lost response, gets a fresh
+    /// completion secret for the same proof, and any other flow is refused.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::OneTimeCodeInvalid`] for a missing or foreign
+    /// cookie, a wrong or spent proof, [`WyrdError::InvalidState`] once
+    /// expired, [`WyrdError::InvalidToken`] when local signup is no longer
+    /// offered, and the store availability errors.
+    pub async fn verify_email_signup(
+        &self,
+        cookie: Option<&str>,
+        proof: &SecretBearer,
+    ) -> Result<SecretString, WyrdError> {
+        let refused = || WyrdError::OneTimeCodeInvalid {
+            message: "this email link is not valid in this browser; start again".to_owned(),
+            details: json!({}),
+        };
+        let Some(SignupEnvelope::SignupEmail {
+            proof_hash,
+            address,
+            binding,
+            expires_at,
+        }) = cookie.and_then(|cookie| self.open_envelope(cookie))
+        else {
+            return Err(refused());
+        };
+        if code_hash(proof).ok() != Some(proof_hash) {
+            return Err(refused());
+        }
+        self.require_live(expires_at).await?;
+        if !self.login_methods(None).await?.creation.local_signup {
+            return Err(signup_unavailable());
+        }
+        let completion = SecretString::from(random_secret());
+        let completion_hash = Sha256Hex::digest(completion.expose_secret().as_bytes());
+        let binding_hash = Sha256Hex::digest(binding.as_bytes());
+        let recorded = insert_proven_signup(
+            &self.operator,
+            &SignupProof {
+                id: Uuid::now_v7(),
+                kind: "email",
+                proof_hash: proof_hash.as_bytes(),
+                provider: None,
+                browser_binding_hash: binding_hash.as_bytes(),
+                completion_hash: completion_hash.as_bytes(),
+                identity: None,
+                email: Some(&address),
+            },
+            SIGNUP_COMPLETION_TTL,
+        )
+        .await
+        .map_err(store_error)?;
+        if recorded
+            || renew_signup_completion(
+                &self.operator,
+                proof_hash.as_bytes(),
+                binding_hash.as_bytes(),
+                completion_hash.as_bytes(),
+            )
+            .await
+            .map_err(store_error)?
+        {
+            Ok(completion)
+        } else {
+            Err(refused())
+        }
     }
 
     /// Finish the provider return of a signup `provider` sent to its social

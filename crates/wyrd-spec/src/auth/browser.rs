@@ -90,6 +90,38 @@ pub struct SignupCompleteResponse {
     pub tenant: TenantSlug,
 }
 
+/// Where an email proof stands, as `POST /auth/signup` and
+/// `POST /auth/signup/verify` report it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ProofStatus {
+    /// A message was sent; open its link, or paste its proof, in this
+    /// browser.
+    CheckEmail,
+    /// The mailbox is proven; this browser holds the completion cookie.
+    Proven,
+}
+
+/// Response of an email proof step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ProofStatusResponse {
+    /// Where the proof stands.
+    pub status: ProofStatus,
+}
+
+/// Body of `POST /auth/signup/verify`: the proof an email signup message
+/// carried, presented by the browser that began it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct SignupVerifyRequest {
+    /// The proof from the message's link fragment, or pasted.
+    pub proof: SecretBearer,
+}
+
 /// Body of `POST /auth/browser/api-key`: recover tenant access with an API
 /// key.
 ///

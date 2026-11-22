@@ -1,81 +1,54 @@
 # Independent L1 benchmark protocol
 
-Status: exploring — awaiting maintainer approval
+Status: finalized
 
-Repository inspected: `d2f37d07b4c6e595ecdc9f59bb27cfa467be16b0`, 2026-11-22.
-This is a new design packet. Benchmark execution remains on hold. No builds,
-benchmarks, specification, tasks, or changes outside this packet were made.
+Repository evidence was originally inspected at
+`d2f37d07b4c6e595ecdc9f59bb27cfa467be16b0`. The current proposal incorporates
+the maintainer review at the end of these notes. Benchmark execution is on hold.
 
 ## Problem
 
-A maintainer comparing a change needs to know whether the operation improved.
-Today, a named L1 step can inherit data, caches, clients and background work
-from earlier steps. Selecting fewer steps can change the work being measured.
-Three windows in that same environment do not measure variation between fresh
-executions. A comparison of their ranges cannot establish repeatability.
-
-This affects **all L1 families**, not just writes. The shared runner prepares
-one workload before iterating over its steps. Bifrost UI SQL moves one fixture
-forward through residences; Gateway changes capture policy in one server;
-Verification retains its server and SDK drivers. The current reporting contract
-also depends on implementors assembling the answer correctly. Relevant source
-locations are collected under Evidence below.
+The current L1 runner prepares one workload environment and reuses it across
+measured steps. Earlier steps can leave data, caches, clients and background
+work behind. Selecting a different set of steps can therefore change the
+workload a named case actually measures. The reports also depend on
+implementors assembling the same readings consistently.
 
 ## Desired outcome
 
-Running one named benchmark alone, in a subset, or inside a suite executes the
-same declared workload and lifecycle. For example, `otlp-logs-c64` gets its own
-fresh environment whether or not spans or `otlp-logs-c1` were selected. Its
-result identifies exactly what completed, what CPU was charged, and what work
-remained afterward. `capacity` computes and prints the report and comparison;
-the implementor pastes the output unchanged.
-
-An experiment name such as `writes-parquet` becomes a **collection of independent
-benchmarks**. One benchmark is one measured operation/fixture/client-count/load
-combination, formerly a measured step. A suite is just a selection of those
-benchmarks. Collection and suite elapsed times are sums, not ten-minute budgets.
+Every named L1 case runs the same declared workload when selected alone, in a
+subset, or in a suite. Each execution produces a self-contained result that
+`capacity` renders from its saved record. A collection groups benchmarks for
+selection. A benchmark is one measured operation, fixture, client count and load
+combination. The time limit applies to each benchmark.
 
 ## Constraints and non-goals
 
-### Binding maintainer decisions
+### Agreed
 
-- "each step is in and of itself a benchmark." Every measured L1 step gets
-  fresh server process, PostgreSQL data and processes, WAL, object storage and
-  client state. Nothing from another benchmark carries over. Selection and
-  order must not determine its result. A subset is fewer benchmarks, not a
-  diagnostic mode.
-- "Warmup should be 30 seconds"; measurement is "3x30". "Drain, capture,
-  teardown can be longer if they need".
-- "L1 benchmarks should be under 10 minutes" applies to **each benchmark**.
-- "it should be simple and standardized". The proposed twenty-run comparison
-  and 300-second warmup were rejected.
-- "we should never rely on an agent to create a summary table. it should be
-  standardized so its calculated the same each time with no hallucinations".
-- "number change based on sequence of steps or what is run (red flag)" and
-  "implementing agent never follows benchmark/AGENTS.md": move enforceable
-  rules into the tool.
-- Existing history is in question; benchmarking stays on hold until the rebuild.
-  Preserve measurable writes-parquet throughput **and** input MiB/server
-  CPU-second improvement, and the **80** target on `otlp-logs-c64`.
+- Every measured L1 step is its own benchmark. Start it with a fresh server,
+  PostgreSQL data and processes, WAL, object storage, and client state.
+- Use 30 seconds of warmup followed by three 30-second measurement windows.
+  Setup, drains, evidence capture, cleanup and reporting follow the accepted
+  590-second total phase envelope below.
+- Selection and order change which benchmarks run. Each selected benchmark
+  follows the same lifecycle and evidence rules.
+- Each category command runs its agreed routine sweep of 5 Verification,
+  5 Gateway, or 18 Bifrost cases. Targeted selections use the same protocol.
+- `capacity` renders a deterministic category summary table for direct review
+  and preserves full per-case evidence. Agents use the emitted table verbatim.
 
-Everything below that is not one of these decisions or an existing authority
-is a proposal for approval. In particular, the number of independent comparison
-executions, phase allowances and statistical policy are not already approved.
+### Scope
 
-### Limits
+The design covers single-execution L1 measurement, reporting and lifecycle
+validation. Comparison methodology, baseline selection, performance-change
+qualification and L2 calibration policy are deferred. Production
+workload semantics and resource controls stay governed by their existing owners.
 
-This changes the benchmark harness and its evidence contract, not server
-durability, production rotation, compression, concurrency or workload semantics.
-It does not turn L1 into a sustained-load experiment or replace L2. No automatic
-steady-state search, adaptive warmup, favorable-run retry loop, new telemetry
-pipeline, or general experiment service is proposed.
-
-Fresh application environments cannot reset host device caches, Docker's VM,
-temperature or unrelated host activity. The enforceable guarantee is no inherited
-application work plus identical setup. Numerical repeatability and absence of
-systematic order effects need measured evidence. Unexplained order effects remain
-a qualification blocker; ordinary random variation is not bitwise inequality
-of results. No OS cache flushing or platform-specific isolation is proposed.
+Fresh application state is within the harness's control. Host device caches,
+temperature, Docker VM state and unrelated host activity can still vary. The
+protocol establishes structural independence and records host observations.
+Numerical order-equivalence criteria belong to the deferred comparison design.
 
 ## Proposed implementation
 
@@ -118,7 +91,7 @@ the server, before transport framing, counted from the actual request. Retained
 Arrow, WAL, staging and published Parquet bytes are distinct diagnostics. Native
 currently has **no input-byte measurement**; its row throughput/efficiency remains
 meaningful. Do not relabel retained Arrow as native input or print zero input
-efficiency. The native mandate question is explicit below.
+efficiency.
 
 Keep server latency and per-request overhead boundaries. Overhead subtracts the
 union of that request's provider/Verifier waits, never differences of aggregate
@@ -128,12 +101,14 @@ bucket bounds. Existing p99/p95 floors (1,000/200 per window when judged) remain
 insufficient samples make the affected benchmark INVALID, without extending its
 window. A purely diagnostic percentile below its floor says unavailable.
 
-Proposed per-run performance targets use these combined totals or pooled
-histograms, with unchanged threshold values and strict/non-strict operators.
-This deliberately replaces the current median-of-three target aggregation;
-it is part of the new protocol and baseline, not an assertion that the old
-and new judgments are interchangeable. Correctness and sample-floor checks
-still apply to every window.
+Judge existing case-level performance thresholds using the same aggregates the
+summary shows. Use ratios of totals for rates and pool histogram counts across
+the three windows for latency percentiles. Apply thresholds to the underlying
+reading with its recorded precision and bucket bounds. Preserve the existing
+threshold values and operators. Record the aggregation as part of the new
+protocol because pooling can change judgments compared with the old median of
+window results. Retain each window's readings, correctness checks and sample
+floors in the full case record.
 
 **Boundary separation:** at each stop, freeze successful work, CPU and interval
 counters against timestamped boundaries. Then drain in-flight requests before
@@ -177,13 +152,11 @@ processes when required. It receives one complete declaration, never the
 previous child's mutable state. Public commands continue to enter through mise.
 
 Build the server, driver and required SDK modules **before** starting a timed
-benchmark, as today. Prepare both comparison builds before executing either;
-never compile between paired measurements. Print build preparation time
-separately. Missing/stale binaries refuse execution; compilation is not hidden
-inside setup. The ten-minute clock starts before PostgreSQL creation and ends
-after teardown and durable result capture, not at the first request.
+benchmark, as today. Print build preparation time separately and refuse to run
+with missing or stale binaries. The ten-minute clock starts before PostgreSQL
+creation and ends after teardown, durable result capture and rendering.
 
-Proposed uniform maximum allowances:
+Accepted uniform maximum allowances:
 
 | Phase | Allowance per benchmark | Work included |
 |---|---:|---|
@@ -263,20 +236,23 @@ This corrects stale prose describing only three Bifrost families and three
 Gateway cases. Braces below expand to each listed value; no combination is implied
 unless explicitly stated. Every measured entry uses the lifecycle above.
 
+The agreed [case audit](case-audit.md) defines the 28 routine cases. The
+inventory below records current registrations, including targeted workloads.
+
 | Existing command/family | Exact measured IDs and count | Fresh preparation for **each** ID | Result and byte source |
 |---|---|---|---|
 | `bench:l1:bifrost:writes` / `capacity l1 bifrost writes-parquet` | `otlp-spans-c{1,64}`, `otlp-spans-1k-c{1,64}`, `otlp-logs-c{1,64}`, `native-write-c{1,64}` — 8 | Only the chosen sender, its existing generator, batch size, production rotation and 30 s retention. Recreate 2M-row span identity population; retain existing logs/native definitions. No previous path or c1 backlog. | OTLP input MiB/s, input MiB/server CPU-s; all paths rows/s, rows/CPU-s, CPU/row, ACK latency, memory, errors, publication/backlog. OTLP actual uncompressed protobuf length. Native input bytes unavailable today; retained Arrow and Parquet never substitutes. [I1] |
 | `bench:l1:bifrost:hot` / `l1 bifrost hot` | `point-memtable-c{1,64}`; `point-staged-c1`; `small-aggregate-{memtable,staged}-c1`; `span-shredded-{memtable,staged}-c1`; `span-long-tail-{memtable,staged}-c1` — 9 | Rebuild the **whole declared** 10M-event/1M-span fixture, half staged/half memtable, after the separate published 500k-span learning sample. Existing large rotation/24 h retention pins residence; check it through the run. Do not load just the half queried. | Queries/s, queries/CPU-s, CPU/query, server/client latency, exact answers; memtable point c64 p99 <5 ms. Physical scan bytes only when there is a physical scan; live decoded Arrow bytes labelled separately. No ingest input MiB rate. [I1, D1] |
 | `bench:l1:bifrost:parquet` / `l1 bifrost parquet` | `point-c{1,64}`, `small-aggregate-c1`, `full-scan-c1`, `span-trace-c{1,64}`, `span-shredded-c1`, `span-long-tail-c1` — 8 | Rebuild 10M events, 1M spans, 200k-row native/log storage samples and settle; perform existing layout/pruning checks before warmup. Recreate the same fixture even for one selected query. | Queries/s, queries/CPU-s, CPU/query, latency (full scan p95), exact answers; point c64 p99 <5 ms. Executed-plan scanned rows/bytes/query are physical facts. Compression and storage ratios are setup facts, described below. [I1, I2] |
 | `bench:l1:bifrost:ui` / `l1 bifrost ui-sql` | `{memtable,staged,published}-ui-c{1,8}` — 6 | Rebuild default 500-request journey and seeded gateway/verifications. Establish its own memtable reference answers, then place directly into the requested residence before warmup. No dependence on a previous residence benchmark. | Query rate/CPU cost and server latency; page/statement client latency and counts for traces, verification, logs and metrics. Frozen SQL corpus digest and exact typed answers. Physical Parquet scan bytes distinct from live examined rows/decoded-column Arrow bytes; fixture payload volume is not input throughput. [I3] |
-| `bench:l1:bifrost:ui:10x` / `l1 bifrost ui-sql-10x` | Same six IDs under the distinct family — 6 | Same procedure with 5,000-request journey and declared seeding. Fresh preparation for every residence/count. | Same metrics/sources as default UI; workload size is part of identity. Cross-arm volume comparison is a labelled workload comparison, not a before/after optimization verdict. [I3] |
-| `bench:l1:bifrost:ui:learned` / `l1 bifrost ui-sql-learned` | Same six IDs under the distinct family — 6 | Publish its own 10,000-span learning sample and verify a learned layout, then load the default journey and place it. The learning sample is declared fixture data, not contamination. | Same UI metrics/sources, with layout fingerprint and learning evidence. Canonical versus learned is an explicitly different treatment, never silently a matching baseline. [I3] |
-| `bench:l1:verification` / `l1 verification`, `direct-verify` | `direct-verify-c{1,64}`, `direct-verify-python-c{1,64}`, `direct-verify-typescript-c{1,64}` — 6 | Fresh canonical Verifier (one Assert/two Agent checks), applications, local provider and only the selected SDK driver. Each Agent makes two exchanges and one `code.run`. Fresh credentials, provider ledger and SDK process per benchmark. | Verifications/s and /CPU-s, CPU/verification, server overhead and total latency, client call-return/result-ready/materialization latency, server concurrency and phases. c64 overhead p99 <500 µs. The 2 KiB context is a fixture size, not measured wire/input MiB. Compare closed-loop results within the same SDK. [I4] |
-| Same Verification command, declared paced cases | `direct-verify-r3000`, `direct-verify-python-r3000`, `direct-verify-typescript-r3000` — 3 | Same fresh fixture; 64 clients offer 3,000/s with the existing scheduled-arrival rule in every window. | Same readings plus offered/sent/missed/late arrivals; misses or start-lateness p99 >5 ms invalidate. Matched-rate language comparison allowed; no c64 overhead target on these rows. These **fit** the lifecycle: standardized timing does not require closed-loop load. [I4, D1] |
-| Same Verification command, explicit `--steps` concurrency choices | `direct-verify-c4`, `direct-verify-c16`, `direct-verify-c32` — 3 | Same canonical Rust fixture, recreated for chosen count. Register these as explicit available benchmarks, without selector-dependent workload construction. | Same Verification metrics, no invented c64 target. Eligible for their own comparisons despite being optional. [I4] |
+| `bench:l1:bifrost:ui:10x` / `l1 bifrost ui-sql-10x` | Same six IDs under the distinct family — 6 | Same procedure with 5,000-request journey and declared seeding. Fresh preparation for every residence/count. | Same metrics/sources as default UI; workload size is part of identity. Record the arm and workload size with its result. [I3] |
+| `bench:l1:bifrost:ui:learned` / `l1 bifrost ui-sql-learned` | Same six IDs under the distinct family — 6 | Publish its own 10,000-span learning sample and verify a learned layout, then load the default journey and place it. The learning sample is declared fixture data, not contamination. | Same UI metrics/sources, with layout fingerprint and learning evidence. Record the layout treatment with its result. [I3] |
+| `bench:l1:verification` / `l1 verification`, `direct-verify` | `direct-verify-c{1,64}`, `direct-verify-python-c{1,64}`, `direct-verify-typescript-c{1,64}` — 6 | Fresh canonical Verifier (one Assert/two Agent checks), applications, local provider and only the selected SDK driver. Each Agent makes two exchanges and one `code.run`. Fresh credentials, provider ledger and SDK process per benchmark. | Verifications/s and /CPU-s, CPU/verification, server overhead and total latency, client call-return/result-ready/materialization latency, server concurrency and phases. c64 overhead p99 <500 µs. The 2 KiB context is a fixture size, not measured wire/input MiB. [I4] |
+| Same Verification command, declared paced cases | `direct-verify-r3000`, `direct-verify-python-r3000`, `direct-verify-typescript-r3000` — 3 | Same fresh fixture; 64 clients offer 3,000/s with the existing scheduled-arrival rule in every window. | Same readings plus offered/sent/missed/late arrivals; misses or start-lateness p99 >5 ms invalidate. Preserve scheduled-arrival evidence; no c64 overhead target on these rows. These **fit** the lifecycle: standardized timing does not require closed-loop load. [I4, D1] |
+| Same Verification command, explicit `--steps` concurrency choices | `direct-verify-c4`, `direct-verify-c16`, `direct-verify-c32` — 3 | Same canonical Rust fixture, recreated for chosen count. Register these as explicit available benchmarks, without selector-dependent workload construction. | Same Verification metrics, no invented c64 target. [I4] |
 | Same Verification command, explicit model choices | `direct-verify-model-c{1,64}` — 2 | Fresh Rust Agent-only model fixture: one iteration through local Gateway to immediate OpenAI-compatible provider with fixed usage and cited verdict. Do not use the canonical two-Agent fixture. | Verification/overhead/client/CPU readings, model exchange accounting; no remote-provider/TLS/retry/fallback/stream/tool performance claim. Context/token constants are fixture facts, not byte throughput. Selecting these must not alter another benchmark's fixture. [I4] |
 | `bench:l1:gateway` / `l1 gateway`, `overhead` | `buffered-1kib-capture-metadata.c{1,64}`, `streamed-1kib-capture-metadata.c{1,64}`, `buffered-64kib-capture-metadata.c{1,64}`, `buffered-64kib-capture-payload.c{1,64}` — 8 | Fresh tenant, per-client key/connections, local upstream and chosen capture policy. Preserve 1 KiB/64 KiB buffered bodies and 32-event stream. | Requests/s and /CPU-s, CPU/request, overhead p99 (<500 µs at c64, including end handoff for streaming), completion/first-token/end timings, capture reconciliation and memory. Payload sizes are generator body sizes, not full serialized input traffic; captured/stored bytes remain storage diagnostics. [I5] |
-| Gateway `--pace <requests/s>` | Any of the eight IDs, with offered rate in identity | Same isolated setup and fixed timing; use declared offered rate and existing missed/capped-arrival checks. | Same readings plus pacing evidence. A paced run is a changed-load diagnostic, not evidence for the unpaced benchmark's mandate. It can compare with exactly the same paced declaration. [I5] |
+| Gateway `--pace <requests/s>` | Any of the eight IDs, with offered rate in identity | Same isolated setup and fixed timing; use declared offered rate and existing missed/capped-arrival checks. | Same readings plus pacing evidence. The report identifies the actual offered rate and labels the run as paced. [I5] |
 
 `bench:l1`, `bench:l1:bifrost`, and bare `capacity l1` / `l1 bifrost`
 are selectors over the default entries, not additional workloads. Extended UI,
@@ -291,7 +267,7 @@ only membership/order and the coverage list, never fixture/timing/eligibility.
 | `point-memtable-scaling`, Parquet `point-scaling` and `span-trace-scaling` | Derived c1/c64 rate scaling, preserving the declared formula. Both inputs must be compatible independent benchmark records. Missing c1 never triggers hidden execution or degrades the c64 benchmark's validity. [I1] |
 | Parquet shredding, time-window pruning, `compression.otlp-{spans,logs}`, `storage_ratio.{otlp-spans,otlp-logs,native-write}` | One-time fixture checks/diagnostics, not three repeated observations. Compression is sample input protobuf bytes / table's published Parquet growth; storage ratio is Parquet growth / retained Arrow bytes and currently includes internal inserted rows. Label that scope. Keep them attached to their existing semantic owners, but recompute inside each owner's fresh setup and never copy across windows as independent measurements. [I2] |
 | UI `first_request_ms`, page/statement diagnostics and standalone catalog checks | First request is a setup diagnostic; pages/statements are components of one mixed-page benchmark. Do not split them into newly invented benchmarks or imply the first request is cold-disk latency. Every fresh residence benchmark regenerates/checks its own references. [I3] |
-| `--profile`, `--allow-dirty`, `--smoke` variants | Same per-benchmark isolation. Proposed L1 rule keeps 30 s + 3×30 s even for these flags; smoke changes fixture scale and judgment eligibility, not the fixed L1 clock. Profiles/dirty/smoke remain labelled and excluded from clean performance qualification. The current 1 s + 1×3 s L1 smoke timing cannot satisfy the binding timing; it must be removed from L1 or moved to separately named harness tests by a later approved decision. L2 smoke is unchanged. [D1, D2] |
+| `--profile` and `--allow-dirty` variants | Apply per-case isolation and the fixed L1 clock. Label the execution mode in the record and summary. [D1, D2] |
 
 No measured workload is inherently excluded by its shape. Paced Verification,
 streaming Gateway, learned fixtures and multi-statement UI work fit the same
@@ -299,270 +275,134 @@ lifecycle. Full-size setup/drain feasibility is unverified, not an authorized
 exception. Peak/scaling rows and setup facts cannot honestly fit a timed-window
 protocol because they are calculations or checks, not independently driven work.
 
-### 5. Repeatability and comparison
+### 5. Category sweeps and deterministic summaries
 
-**Recommendation for approval:** a single benchmark invocation produces one
-result. A qualification comparison executes **three fresh baseline/candidate
-pairs** for that benchmark: three independent executions per build, six total.
-Its three windows are internal diagnostics, not three independent experiments.
-There is no mandatory full-suite campaign to compare one selected benchmark.
-
-Extend existing `capacity` orchestration to record a fixed three-pair schedule
-before starting. Randomize the first pair's build order and alternate thereafter
-(AB, BA, AB or BA, AB, BA); record the seed and order. Pair adjacent executions
-on the same host and controls. Every execution still has a separate environment.
-Run only prebuilt worktrees/binaries and SDK artifacts bound to their source;
-the parent never copies binaries or asks an implementor to write loops. Store
-the schedule, attempted record IDs and results in a small tool-produced record
-set. `compare` remains a reader, never unexpectedly launches work.
-
-The execution entry accepts two prepared worktree/build identities and a
-selection of benchmark keys. It validates their declarations before launching
-either arm, then produces the two arm record sets and their shared schedule.
-`capacity report <set.json>` prints every member; `capacity compare <before-set.json>
-<after-set.json>` checks their shared pairing and prints the comparison. Existing
-single-record reader inputs remain useful for descriptive readings. Exact names
-of the mise execution task and its flags are implementation-owned; the six-run
-schedule and immutable input/output identities are the proposed behavior.
-
-Use the standard **paired Student t confidence interval of the run-level
-differences** for exact-valued metrics. For three pairs, `di = candidate_i −
-baseline_i`; print the mean difference and
-`mean(d) ± t(0.975, 2) × sample_sd(d) / sqrt(3)`. Also print baseline/candidate
-means, all six results, min–max and SD, and
-`100 × (candidate_mean / baseline_mean − 1)` when the denominator is nonzero.
-Give equal weight to independent executions; each execution's rate is already a
-ratio of its raw totals. [R4]
-
-- Higher is better: interval entirely above zero → **IMPROVED**; entirely below
-  zero → **REGRESSED**; otherwise → **INCONCLUSIVE**. Reverse the rule for lower
-  is better. A metric without a declared direction is diagnostic only.
-- A single before/after pair may show raw changes, but the tool prints
-  INCONCLUSIVE for qualification: independent repeat count not met.
-- Candidate logs target: a separate 95% one-sample t interval for the mean of
-  its three run-level `input_MiB/server_CPU-s` results. Lower bound ≥80 → **MET**;
-  upper bound <80 → **MISSED**; otherwise → **INCONCLUSIVE**. A one-run point
-  reading above 80 is labelled an observed reading, not target qualification.
-- Preserve histogram bucket uncertainty for latency criteria. Print pooled
-  percentile bounds per execution and conservative between-build bounds; do
-  not insert bucket endpoints into an exact-value t test and invent precision.
-  For the first implementation, give a latency direction only if all candidate
-  run buckets are strictly beyond all baseline run buckets in that direction;
-  otherwise INCONCLUSIVE, explicitly a descriptive range rule, not a 95% test.
-  Existing strict per-run SLO judgments retain their declared bucket semantics.
-
-Three pairs are an economical **proposal**, not a statistically guaranteed
-sample size. The t interval assumes independent pairs and approximately normal
-differences; with n=3 those assumptions cannot be established from the sample.
-Small or noisy changes will often remain inconclusive. Show drift and raw
-values, never discard outliers or automatically add runs until the interval
-passes. All failed/invalid attempts remain in the set; an incomplete pair blocks
-qualification rather than being silently replaced. A new set is a new recorded
-decision, not a repair of the old evidence.
-
-Before establishing the new baseline, use the same comparison mechanism for
-same-build normal/reversed and standalone/subset checks after resume. Structural
-tests cover all 65 registrations; physical checks prioritize logs-c64, native
-c64, hot/Parquet setup, UI residences, Verification SDKs and Gateway capture.
-Compare phase timings and background evidence as well as headline numbers.
-Do not infer equivalence merely because a difference interval crosses zero.
-The acceptable order-effect/equivalence tolerance remains a maintainer decision;
-unresolved systematic effects prevent qualification. There is no proposed
-arbitrary 3% improvement gate or 5% CV cutoff.
-
-Illustrative output only, **not repository measurements**:
-
-```text
-otlp-logs-c64 | throughput | before 100 | after 120 input MiB/s
-  95% paired difference interval [+12, +28] input MiB/s | IMPROVED
-otlp-logs-c64 | efficiency | before 70 | after 84 input MiB/server_CPU-s
-  95% paired difference interval [+8, +20] input MiB/server_CPU-s | IMPROVED
-target | candidate mean interval [81, 87] input MiB/server_CPU-s
-  threshold >=80 | MET
-L1 mandate components | PASS
-REQ-013 overall | NOT ESTABLISHED: competing-load/read/recovery evidence required
-```
-
-Plain meaning: both L1 readings improved beyond the estimated run-to-run
-uncertainty, and the candidate mean clears 80 under this short-window protocol.
-If the efficiency difference interval crosses zero, the combined L1 improvement
-is INCONCLUSIVE even when throughput improves. If either required metric
-regresses or the target is demonstrably missed, the L1 mandate fails. These are
-performance decisions, separate from VALID/INVALID measurement integrity.
-Per-metric intervals are not simultaneous confidence coverage for all 65
-benchmarks; do not market a collection of exploratory results as a suite-wide
-95% guarantee. Only explicitly declared mandate components determine its result.
-
-### 6. One fixed tool-owned output
-
-Extend `Record::render`, `Record::compare` and their existing CLI readers. Live
-output and a regenerated report use the same persisted input, arithmetic,
-sorting, units and renderer. The record must contain all evidence needed after
-`target/` is deleted. Do not build another record parser or agent-generated
-summary path. History HTML consumes the same calculated values and eligibility.
-
-Both readers use the existing six-section reporting order. `report` fills
-Comparison with “not supplied” when appropriate; `compare` prints both arms and
-their comparison through this same format:
-
-```text
-Question
-  declared question; benchmark key; intended comparison/mandate
-Run
-  VALID / INVALID first, reasons; protocol and record schema
-  exact mise command; record/set paths; source and artifact identities
-  host/storage/config/fixture digest; selected and omitted keys; schedule
-  eligibility and reason; isolation and teardown evidence; phase elapsed times
-Report
-  each execution and each measured window, in fixed order:
-  duration | successful work/rows | input bytes and source or N/A |
-  server CPU-s | driver/client/provider CPU | rates and CPU/work |
-  latency buckets/counts | errors/refusals/retries | late work |
-  opening/peak memory | publication | backlog start/end | window validity
-  benchmark aggregate from raw totals
-  request-drain and final-drain time/CPU, durable reconciliation, remaining work
-  setup facts once; all recorded series and diagnostics with boundary/population
-Comparison
-  compatibility checks and all excluded/invalid attempts
-  metric [unit/direction] | every baseline/candidate run | mean [min,max; SD] |
-  absolute/percent change | interval or bucket-range method | decision/reason
-  derived peak/scaling with source keys; missing inputs explicitly listed
-  throughput improvement | input efficiency improvement | logs >=80
-Answer
-  deterministic verdict sentence for the declared question/mandate
-Unproven
-  missing coverage, sustained delivery, downstream costs, other hosts,
-  insufficient repetition, unresolved order effects, REQ-013 evidence gaps
-```
-
-Units and byte sources are printed in each relevant row. Use unrounded values
-for decisions. Missing, inapplicable and zero are distinct. Lifetime gauge
-high-water marks must say “since process start”; interval memory peaks must be
-measured as such. Never truncate retained diagnostics to make a summary look
-complete. An INVALID record still prints its evidence for diagnosis, but no
-performance conclusion is calculated from it.
-
-An eligibility check is shared by comparison, baseline lookup, history admission
-classification and L2 calibration. Match benchmark identity, protocol, fixture,
-load, SDK/language, host/storage, server controls, measurement boundaries and
-build recipe. The code/artifact digest is intentionally different across the
-before/after arms; within each arm it must be identical. Selection membership
-and order are metadata, not compatibility fields. Optional workload comparisons
-(UI volume/layout, languages at matched rate, Gateway capture policy) are labelled
-as different treatments and never qualify an unchanged-population mandate.
-
-### 7. Enforceable benchmark rules
-
-| Current rule | Tool ownership in the proposal |
+| Mise command | Default selection |
 |---|---|
-| Mise entry, declared timing/order, no ad hoc loops [D2:10–20] | Mise tasks call one supervisor which enumerates benchmarks, owns children, timing and comparison schedules. Direct entry cannot bypass those checks. Record the invocation. Do not invent an environment-variable token claiming to prove that a human typed mise. |
-| Quiet host, no concurrent work [D2:21] | One cross-worktree benchmark lock plus existing portable process/host sampling; record owned processes and refuse observed competing build/test/benchmark work. Retain before/after samples and observe during measured windows, since endpoint samples alone miss overlap. Missing required observation invalidates. A lock cannot prevent arbitrary external work. |
-| Same task/flags/host for comparison [D2:60] | Compare normalized benchmark controls, not literal selection lists. Reject mismatched workload, protocol, host/storage, SDK or measurement settings. Hash server/driver and required SDK artifacts and bind them to clean source/build metadata; current name/size/mtime is insufficient. |
-| Correctness, floors, CPU validity, driver budget [D1:333] | Retain exact answers/custody, error and sample checks, positive/nonreset CPU and current driver ≤80% of eight cores; extend to isolation, timing and final cleanup. Preserve paced arrival checks. Performance target misses do not turn a valid measurement INVALID. |
-| Always paste the standard report; no private arithmetic [D2:28–46,50–74] | `capacity` prints the whole six-section result, all retained readings, computed differences, verdicts and limitations. Golden-output tests ensure record → report regeneration. Software cannot force an agent to paste honestly, but no computation is left to it. |
-| Selected steps are diagnostic [D2:72] | **Replace**, as explicitly directed: subset selection has no eligibility penalty. A partial suite cannot claim missing coverage, but each selected benchmark can qualify independently. |
-| Smoke/profile/pace/dirty and history rules [D2:72,100] | Retain mode/provenance exclusions for changed instrumentation, smoke fixture and dirty source. Gateway `--pace` changes load and cannot qualify unpaced results; declared Verification r3000 is its own regular benchmark. Selection alone never excludes history. |
-| One recorder; declared metric boundary/direction [D2:81–95] | Reuse `wyrd-benchmark`, `Metric`, `Population`, typed records. Require registered units/population and direction for judged metrics, and report coverage for every stored reading. Bench-only observations remain behind `bench`; no sidecar/exporter. |
+| `mise run benchmark:l1:verification` | All 5 routine Verification cases |
+| `mise run benchmark:l1:gateway` | All 5 routine Gateway cases |
+| `mise run benchmark:l1:bifrost` | All 18 routine Bifrost cases |
 
-“Read existing records first”, reasoning from diagnostics before profiling, no
-synthetic host load, and truthful interpretation remain contributor obligations.
-Do not claim the harness can enforce a person's narrative or every action on a
-shared host. Thresholds and missing-evidence rules are fixed before execution,
-never chosen after seeing a favorable result.
+Use the `benchmark:l1:<category>` public spelling for the redesign. The
+current tasks use `bench:l1:<category>`; Bifrost also has separate family
+tasks. Migrate the L1 task definitions and their live callers and documentation
+together so each category has one public execution command. Use the
+`verify:bifrost` convention of a discoverable scoped task with one default
+selection. L1 runs are opt-in.
 
-### 8. History and the new baseline
+Use the same invocation rules for all three tasks:
 
-Preserve every old record and ledger unchanged. The new reader identifies them
-as **legacy L1 protocol / not eligible for rebuilt qualification**, without
-retroactively declaring every measurement false. Exclude **all old L1 families**,
-not just writes, from new before/after qualification and L2 calibration. Old
-records can still explain the original incidents within their recorded scope.
+- No arguments runs the agreed routine sweep.
+- `-- --cases <id>[,<id>...]` runs exactly the requested cases. Use **case**
+  for the independently executed workload, **sweep** for its category
+  invocation, **phase** for lifecycle work, and **window** for a timed sample.
+  The redesigned L1 selector replaces the current `--steps` flag.
+- `-- --profile cpu|heap|both` uses the existing profiler options. It applies
+  to the routine sweep or combines with `--cases` for targeted profiling.
+- `-- --list-cases` shows the exact selectors and their routine or
+  targeted status without building or executing. Generate the list, the
+  default suite and argument validation from the same registry. List
+  family-qualified selectors when IDs recur across Bifrost variants.
+  Refuse unknown or ambiguous selectors before starting a case.
 
-Use a new protocol identity and record schema for per-benchmark lifecycle and
-comparison evidence. Recognize schema-3 history for labelled historical display
-inside the existing reader; unsupported older schemas remain visibly unsupported.
-This is an archival reader path, not a production compatibility API or a conversion
-of old measurements. Separate history chart series at the protocol boundary.
+For example, a targeted CPU profile uses the category task:
 
-Clean, unprofiled, non-smoke benchmark attempts go to the existing
-`benchmark-records` history, including valid independent selections and retained
-INVALID attempts. Ineligible diagnostic modes stay under `target/benchmarks`.
-Publication/commit rules remain unchanged. A tool-produced collection/set records
-coverage and references; an implementor never hand-selects successful records into
-a supposedly complete result. Artifact identity and teardown completion must be
-known before admitting a successful record.
+```bash
+mise run benchmark:l1:verification -- --cases direct-verify-c64 --profile cpu
+```
 
-After explicit authorization to resume, verify the rebuilt protocol and
-same-build repeatability, then name the clean baseline commit, artifacts, host
-and controls. Measure both baseline and candidate with that same rebuilt harness
-contract; never compare old five-second/shared-state scores with new scores or
-apply a conversion factor. An older product revision needs a reproducible way to
-build the same harness and observation contract without including candidate
-performance changes. Choose and record that baseline preparation before running.
+Execution prepares the required build artifacts once, then the supervisor
+runs the resolved cases sequentially, completing cleanup before starting the
+next fresh environment. Each attempted case gets a full record, with profile
+references and capture notes when requested. Update the benchmark README and
+contributor instructions with these exact commands. Agents and developers use
+the documented mise tasks for execution and the existing `capacity report`
+reader for saved records.
 
-L2's existing mixed-rate formula remains `0.70 × 1 / sum(fi / ri) × cores`, with
-spans/logs/native shares unchanged. Replace its permissive history lookup with a
-complete compatible set of the needed new independent c1/c64 benchmarks, same
-server build and host. Compute each path's peak from the declared complete sweep
-using run aggregates (the mean across independent executions when a repeated set
-is supplied), retain all contributing IDs, and never substitute a legacy or mixed
-build record. Wide spans remain outside the existing L2 mix. A subset missing a
-calibration input is insufficient for **that consumer**, not intrinsically an
-invalid benchmark. [I6]
+Today the harness writes a full schema-3 JSON record per experiment, with
+per-step and per-window evidence. With isolation the record boundary moves to
+one benchmark execution. Keep the existing full report reader and profiling
+mechanisms. A sweep record lists each selected case in declared order, its
+execution outcome, and its individual record reference. It also carries the
+invocation and sweep mode. Preserve the referenced records with the sweep so
+the summary can be regenerated after temporary profiling artifacts are removed.
 
-### 9. Interaction with bifrost-write-throughput-and-retention
+**Default sweep output.** End the command with one compact Markdown table. The
+same renderer regenerates that summary from a saved sweep through the existing
+`capacity report` command. Individual records still open the full report.
+Print coverage, mode, and the saved sweep path with the table. Agents paste
+the emitted table verbatim and put interpretation in prose below it.
 
-The active packet is approved revision 3. Its
-[REQ-013](../../bifrost-write-throughput-and-retention/spec.md#required-behavior)
-at `spec.md:191` requires 80 on unchanged logs-c64 input, whole-server CPU,
-improvement beyond normal variation, separate full-matrix reporting, no material
-regression elsewhere, preserved hot/Parquet reads, bounded memory, sustainable
-publication, and drain/recovery under competing load calibrated to improved
-capacity. It explicitly rejects short ACK-only evidence as sufficient.
+**Table fields.** The fixed columns are Case, Status, Throughput, CPU
+per unit, Headline latency, Target, and Record. Bifrost OTLP rows also show
+input MiB/s and input MiB/server CPU-second in a fixed Input column. Use the
+registered case's unit and latency label explicitly:
 
-This proposal preserves the 80 units and logs input population. It replaces the
-measurement protocol and baseline, so the old 58.589 value in that spec and its
-handwritten ledger cannot qualify the new result. This packet does not amend
-that approved spec. Before affected qualification resumes, the maintainer must
-approve the corresponding evidence/baseline revision in its owning packet;
-no numerical target or durability/read protection is silently weakened.
-
-The fixed output separates three questions:
-
-1. Were the selected L1 measurements valid and repeatable?
-2. Did both declared throughput and input-CPU-efficiency comparisons improve,
-   and did logs-c64 clear 80? These components form the **L1 mandate result**.
-3. Is REQ-013 as a whole established? L1 alone prints **NOT ESTABLISHED**.
-   Matching full write-matrix, hot/Parquet and competing-load evidence is still
-   required; L2 and the active packet retain ownership of that proof.
-
-The user has not specified whether both-improve applies to logs-c64 alone or
-every write step. Recommendation: make logs-c64 throughput and input efficiency
-co-primary, preserve all eight write results separately and require the active
-packet's no-material-regression protection elsewhere. Do not average different
-payloads into a pass. If both-improve is intended for all OTLP populations,
-declare each of the six comparisons explicitly before execution. Native currently
-supports rows/s and rows/CPU-s, not input MiB; see the open decision below.
-
-### 10. Smallest implementation outline and observable proof
-
-This is sequencing for design comprehension, not a task packet.
-
-| Existing owner | Proposed work and why reuse fits | Observable proof after approval |
+| Workload | Throughput and CPU unit | Headline latency |
 |---|---|---|
-| `experiment.rs`, `bin/capacity/{main,levels}.rs`, `mise.toml` | Keep the declarations/readers; make measured benchmarks the execution unit, give every ID discoverable registration, normalize selection, own six-execution comparison schedules. Reuse spawning rather than add a campaign service. | Enumerate all 65 IDs and paced variants. Normal, reversed, subset and standalone selections yield identical declarations/setup for a given key. Missing derived inputs stay missing. |
-| `levels.rs`, `release_server.rs`, `scripts/postgres/with-test-postgres.sh` | Move existing process/DB/storage ownership under the benchmark deadline and parent completion record. A fresh server alone cannot reset PostgreSQL or SDK globals, hence a fresh child and database lifecycle are necessary. | Real-dependency tests run two different selected cases; distinct state/resources, no foreign rows, all children/volumes gone. Inject reused storage, server replacement, timeout and cleanup failure; expect INVALID and no following launch after failed cleanup. |
-| `query/isolated.rs`, `query/ui/workload.rs`, `verification/{run,driver}.rs`, `gateway/run.rs` | Make existing preparation consume one chosen benchmark. Rebuild full fixtures and own providers/SDK children per execution. Preserve workload generators, exact-answer checks and load semantics. | All residence/layout and language paths work alone and in reversed order. Canonical Verification is unchanged by selecting model cases elsewhere. Gateway policy and durable capture evidence belong only to its own benchmark. |
-| `capacity.rs`, `experiment.rs`, existing `wyrd-benchmark` recorder and benchmark snapshot owner | Retain accounting/populations; persist boundary timestamps, raw totals, late work, phase CPU, setup facts and durable reconciliation. Extend existing inspection only if necessary facts cannot be obtained from current owned rows/files. | Controlled-clock cases cover late completions, counter reset, missing CPU, invalid populations, deferred publication and unequal window work. Totals/ratios agree with independent arithmetic fixtures; no post-drain counter is labelled as stop-time evidence. |
-| `Record::render/compare`, `levels.rs`, `results.html`, query calibration | One eligibility/calculation contract, paired comparison and fixed output, versioned historical display; complete-set calibration. | Golden reports reproduce after raw artifact removal; refuse mismatched host/fixture/protocol, diagnostic qualification, incomplete pairs and legacy calibration. Cases include throughput gain with efficiency loss, target interval crossing 80 and missing native input. |
-| `benchmarks/README.md`, `benchmarks/AGENTS.md`, owning active spec where approved | Update terminology, timing, selected-benchmark eligibility, command descriptions, report semantics and baseline policy once approved. | Documentation and registrations agree; selection has no hidden diagnostic flag; benchmark execution remains opt-in. |
+| Verification | Verifications/s and server CPU per verification | Server overhead p99 |
+| Gateway | Requests/s and server CPU per request | Added Gateway overhead p99 |
+| Bifrost writes | Acknowledged rows/s and server CPU per row | Durable ACK p99 |
+| Bifrost point and trace reads | Queries/s and server CPU per query | Server query p99 |
+| Bifrost full scan | Queries/s and server CPU per query | Server query p95 |
+| Bifrost UI SQL | Pages/s and server CPU per page where accounted | Overall client page p99, with per-page-family readings in the full report |
 
-Keep tests at the existing pure arithmetic/declaration owners, real PostgreSQL
-lifecycle seam and `capacity` CLI journey. No benchmark execution is part of a
-unit/CI test. Later tasks select exact focused commands under
-[TESTING.md:91](../../../../TESTING.md#named-tests); this design names proof
-observations, not invented test selectors. Full runtime/order validation is
-separate, explicitly authorized performance work after the hold is lifted.
+For UI SQL, expose only a CPU/page reading that uses matching server CPU and
+completed-page boundaries. Report unavailable where the record lacks a
+supported reading. Preserve percentile bucket bounds and use fixed precision
+and explicit units. Derive targets, statuses and displayed aggregates from
+recorded evidence through the existing report calculations. Show unavailable
+and inapplicable separately from zero. Render invalid attempts with the reason
+and record reference, and render selected cases that could not start as
+`NOT RUN` with the reason. Withhold performance cells for both. Continue
+after an invalid case if cleanup succeeded. Stop and mark remaining cases
+unstarted if cleanup cannot be confirmed. A threshold miss remains distinct
+from an invalid measurement. Profiled sweeps are visibly marked as diagnostic.
+
+### 6. Full per-case report
+
+For each execution, render:
+
+- The benchmark key, command, protocol version, fixture and load declaration,
+  build and host identity, and mode.
+- VALID or INVALID with reasons, phase timings, isolation and teardown evidence.
+  A missed performance threshold is a separate judgment from measurement validity.
+- The three windows and their aggregate, with successful work and elapsed time,
+  whole-server CPU, rates and latency population, and registered criteria.
+  Show units and distinguish zero, unavailable and inapplicable readings.
+- Setup facts once, plus drain and reconciliation evidence, errors and late
+  work, and all retained diagnostics with their boundary and population.
+- Derived rows with their source record IDs. If a required input was omitted or
+  invalid, show the missing input and keep each measured result's own verdict.
+
+Persist raw inputs for the report, so it can be regenerated without temporary
+logs, profiles or live services. Retain invalid-attempt evidence for diagnosis.
+Version the new L1 records and preserve earlier records with their original
+protocol identity. Existing comparison and L2 readers must keep their current
+interpretation of existing records. New records must not silently enter readers
+that assume the old protocol.
+
+### 7. Implementation flow and proof
+
+| Existing owner | Proposed work | Observable proof |
+|---|---|---|
+| `experiment.rs`, `bin/capacity/{main,levels}.rs`, `mise.toml` | Resolve the selection into complete benchmark declarations before starting children. The supervisor owns phase deadlines and result capture. Use the same declaration and lifecycle for a given key regardless of how it was selected. | Category commands resolve exactly 5, 5 and 18 agreed routine cases. Targeted workloads remain discoverable. Standalone, subset and reversed selection produce the same per-key declarations. Missing derived inputs stay missing. |
+| `levels.rs`, `release_server.rs`, `scripts/postgres/with-test-postgres.sh` | Use the existing process and storage owners for each child. Record resource ownership and cleanup before issuing the final verdict. Reuse portable quiet-host checks and serialize cooperating runs across worktrees. | Real lifecycle tests verify distinct state and removal of owned children, volumes and storage. Server replacement, timeout, missing evidence and incomplete teardown yield INVALID attempts. Failed cleanup prevents the next launch. |
+| Bifrost, Verification and Gateway workload owners | Prepare the full declared fixture and only the selected case's clients, workload and dependencies. Keep existing correctness, custody, load and sample checks. | Setup and exact-answer checks cover UI placement and learning, SDK/provider isolation, Gateway capture, and write and read fixtures. Selecting another case cannot mutate a declaration. |
+| `capacity.rs`, `experiment.rs`, `wyrd-benchmark` and `Record::render` | Reuse accounting, metric populations and typed records. Persist stop-time inputs and separate post-stop evidence. Calculate the report at the existing reader. | Controlled-clock and arithmetic tests cover late completions, counter resets, missing CPU, unequal window totals and unavailable metrics. CLI tests regenerate the same table from a saved sweep and check row order, profiled mode, invalid attempts and unstarted cases. Individual records still produce the full report. |
+| `benchmarks/README.md`, `benchmarks/AGENTS.md` | Document the new case, selection, timing and report contract after design approval. Encode executable requirements in the harness. | Controls and labels agree across registrations, commands and reports. The tool reports coverage without treating a selection as a diagnostic mode. |
+
+**Harness smoke.** Move the short L1 workflow check into the harness test
+lane. Use small fixtures and short windows, exercising the production sweep
+path through selection, service startup, workload execution, drain,
+reconciliation, cleanup, record capture and summary regeneration. Run at
+least two cases in sequence and verify isolation across the boundary.
+Pass or fail on workflow and evidence integrity. The L1 performance commands
+use the fixed warmup and measurement clock.
+
+Full-size wall-clock feasibility requires opt-in runs on supported benchmark
+hosts after the execution hold is lifted. Structural tests and lifecycle
+integration tests can establish the harness contract before those runs.
 
 ## Evidence and rationale
 
@@ -608,16 +448,10 @@ inspected commit. Table references above refer to these entries.
   (four exact case IDs and shapes), `:257` (pace and eight measured steps);
   [gateway/run.rs:641](../../../../crates/wyrd/wyrd-testing/src/bin/capacity/gateway/run.rs#L641)
   changes capture policy in the existing server and settles after windows.
-- **I6 — L2 consumer:**
-  [query/mod.rs:1188](../../../../crates/wyrd/wyrd-testing/src/bin/capacity/query/mod.rs#L1188)
-  defines the mixed rate; `:1219` checks host/build recipe/fixture/limits but
-  selects each path's highest median from whatever measured sweep steps exist.
-  It needs the new protocol/identity/completeness check.
 - **L1 — Shared lifecycle:**
   [experiment.rs:169](../../../../crates/wyrd/wyrd-testing/src/experiment.rs#L169)
   defines old timing; `:2012` prepares once, `:2051` loops steps, `:2121`
-  finishes with a separate grace, `:2954` compares identity and VALID before
-  testing overlapping repetition ranges. [levels.rs:385](../../../../crates/wyrd/wyrd-testing/src/bin/capacity/levels.rs#L385)
+  finishes with a separate grace. [levels.rs:385](../../../../crates/wyrd/wyrd-testing/src/bin/capacity/levels.rs#L385)
   wraps whole experiments in fresh PostgreSQL today.
 - **L2 — Isolation defect:**
   [isolated.rs:229](../../../../crates/wyrd/wyrd-testing/src/bin/capacity/query/isolated.rs#L229)
@@ -658,101 +492,28 @@ inspected commit. Table references above refer to these entries.
   demonstrates profile pollution when cases share a JVM and motivates separate
   forks. Its JVM-specific mechanism is not evidence about Rust; applying fresh
   processes here is an inference supported by Wyrd's observed shared lifecycle.
-- **R3 — Repeat at the level where variation arises.**
-  [Kalibera and Jones, Rigorous Benchmarking in Reasonable Time (2013)](https://kar.kent.ac.uk/33611/)
-  distinguishes iteration, execution and build variation, recommending repetition
-  where uncertainty occurs. That supports independent executions rather than
-  treating three correlated windows as independent runs. It does not prescribe
-  three executions or guarantee power for this workload.
-- **R4 — Difference intervals.**
-  [NIST, Confidence intervals for differences between means](https://www.itl.nist.gov/div898/handbook/prc/section3/prc312.htm)
-  gives the paired t interval used above. The proposal uses adjacent paired
-  executions to control slow host drift. An interval crossing zero is inconclusive,
-  not proof of equality. The target uses the corresponding one-sample mean
-  interval; [NIST's confidence-limit explanation](https://www.itl.nist.gov/div898/handbook/eda/section3/eda352.htm)
-  describes its normality assumption and interpretation.
-- **R5 — Order control.**
-  [Google Benchmark random interleaving](https://github.com/google/benchmark/blob/main/docs/random_interleaving.md)
-  provides an established mechanism to reduce effects of changing system state.
-  Alternating baseline/candidate execution is the simpler proposal here; its
-  effectiveness for Wyrd still needs same-build validation. Randomization does
-  not repair inherited application state.
-
 ## Decisions and alternatives
 
-Use one isolated execution per measured step and extend existing owners. Merely
-fixing the c1 publication barrier would preserve shared PostgreSQL/client/cache
-state and would not cover Verification, UI or Gateway. Resetting only counters
-cannot establish isolation. Resetting before every 30-second window would change
-the agreed benchmark into three cold starts; retain one environment across its
-warmup and windows instead.
-
-Use fixed small independent comparisons and admit uncertainty. One execution
-per build is faster but supplies no execution-level variance estimate. Twenty
-runs, adaptive stopping and long “until stable” warmups conflict with the desired
-simple bounded procedure. Three pairs may be inconclusive; that is a result,
-not permission to tune the method afterward.
-
-Retain short ACK semantics and explicit L2 proof. Requiring publication to keep
-pace inside every L1 window would invent a sustained-throughput promise that
-the fixed 30-second design cannot establish for every case. Capturing deferred
-work makes the limitation visible without changing the production ACK boundary.
+Reuse the existing benchmark runner, recorder and reader. Resetting counters or
+fixing an individual publication barrier leaves shared state in place. A fresh
+server alone leaves PostgreSQL and other clients in place. Give each case its
+own full environment and retain it through that case's warmup and three windows.
 
 ## Standards conflicts
 
-| Existing owner/rule | Proposed disposition |
+| Existing rule | Design disposition |
 |---|---|
-| README:135 and `Level::timing`: 5-second warmup/windows and collection budgets | Replace with the binding 30 + 3×30 per-benchmark protocol and under-ten-minute lifecycle. User decision settled; detailed allowances remain proposed. |
-| AGENTS:72/100: selected steps diagnostic, only full plan in history; shared-memory hot-path review preference also requires a full run | Selection exclusion is superseded by the explicit current instruction. Update owners in implementation; preserve complete coverage only where a consumer actually needs all inputs. |
-| README:146 and `isolated.rs:229`: intentional cross-step state | Replace with fresh per-benchmark state. No c1 or path-order dependency survives. |
-| AGENTS:71 / README:431: repetition-range overlap means “no measured change” | Propose independent-run paired uncertainty, with INCONCLUSIVE instead of equality claims. Histogram descriptive bounds remain explicitly distinguished. |
-| Existing short L1 smoke timing | Cannot satisfy the uniform timing decision. Proposed reduced fixtures keep the same L1 clock; faster lifecycle checks belong to tests. Maintainer disposition still needed. |
-| `architecture/bifrost-design.md:2071`: retained Arrow bytes described as ingest-throughput units, versus README:103 and REQ-013 input-byte mandate | Preserve the retained-Arrow counter meaning, but clarify that it is a storage diagnostic; input-throughput qualification uses actual OTLP protobuf bytes. This is an owner-wording correction to approve, not a server metric rename. |
-| Active approved REQ-013's old baseline/repetition protocol | Requires an approved evidence/baseline revision in that packet before resumed qualification. The 80 target and all read/durability/competing-load protections remain. |
-
-No authority file was changed by these notes. Standards updates follow approved
-design/spec work, not an exception silently implemented here.
-
-## Open questions
-
-The lifecycle unit, fresh state, subset equivalence, 30 + 3×30 timing, per-benchmark
-ten-minute limit and tool-owned reporting are settled. Remaining material decisions:
-
-1. **Comparison cost and inference:** approve three fresh paired executions per
-   build, approximate 95% paired t intervals for exact metrics, and conservative
-   descriptive latency comparisons. Six executions can take nearly 59 minutes
-   for one before/after benchmark comparison; each execution remains below ten
-   minutes. A full suite is correspondingly longer. Choose the tolerance for
-   same-build order equivalence before qualification; failing to detect a
-   difference is insufficient proof.
-2. **Mandate coverage and native units:** confirm which write steps must improve
-   both throughput and input efficiency. Recommend logs-c64 co-primary plus full
-   matrix/read protection as REQ-013 says. Native has no input-byte counter;
-   recommend rows/s and rows/CPU-s for its unchanged population. If native must
-   meet an input-MiB improvement mandate too, agree the serialized IPC byte
-   definition and add a counter at its existing encoder (without second
-   serialization), as additional design scope. Also define “material regression”
-   for the active packet's other populations; INCONCLUSIVE is not non-regression.
-3. **Runtime feasibility and diagnostics:** approve the proposed 590-second phase
-   envelope, build prerequisites outside it, and uniform L1 timing for smoke.
-   Successful full-size setup/drain remains to be demonstrated after the hold.
-   A case that cannot fit returns for a decision; there is no implicit exception.
-4. **Baseline/authority handoff:** choose the clean baseline build and matching
-   rebuilt harness, approve the active REQ-013 evidence revision and the narrow
-   byte-unit wording correction. Benchmark execution needs separate authorization
-   to resume; approving these notes alone does not lift the hold.
+| Shared environment, 5-second defaults and collection budgets in the benchmark README and runner | Replace with the agreed per-case lifecycle, fixed windows and accepted phase envelope. |
+| Selected steps are diagnostic in `benchmarks/AGENTS.md` | Replace for L1. Selection identifies coverage. Mode and workload declaration carry their own labels. |
+| Existing short L1 smoke timing | Move the short workflow check to the harness test lane. |
+| Existing report format includes comparison | Use a self-contained single-execution report for the standardized protocol. Existing comparison methodology is deferred. |
 
 ## Handoff
 
-This proposal covers every registered L1 family, optional measured case, derived
-row and existing mode. It is ready for maintainer design discussion, **not** for
-specification or implementation. After the material decisions are settled and
-the maintainer agrees the design, finalize these notes; only then use `wyrd-spec`
-and later `wyrd-plan`. Private struct names, file splits and helper choices remain
-implementation-owned within the existing owners.
-
-Research and static inventory are complete for this draft. Budget feasibility,
-repeatability, order equivalence and the 80 mandate have **not** been measured.
+The maintainer agreed to short smoke checks in the harness test lane and to
+judging existing thresholds on the same aggregates displayed in the summary.
+Full-size timing feasibility remains unverified and requires opt-in runs after
+the execution hold is lifted. The finalized design feeds the [draft specification](../spec.md).
 
 ## Maintainer review — 2026-11-22
 

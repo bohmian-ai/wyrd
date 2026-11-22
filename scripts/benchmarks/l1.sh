@@ -23,7 +23,7 @@ for argument in "$@"; do
     case $category in
       verification | gateway | bifrost) ;;
       *)
-        echo "capacity l1: `$category` is not a category: verification, gateway or bifrost" >&2
+        echo "capacity l1: '$category' is not a category: verification, gateway or bifrost" >&2
         exit 2
         ;;
     esac

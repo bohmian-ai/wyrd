@@ -262,3 +262,120 @@ async fn admission_keys_the_trusted_source() {
         "password source windows follow the trusted source and /64"
     );
 }
+
+/// The whole-second wait a throttled response states, asserted equal in its
+/// `Retry-After` header and its problem details.
+///
+/// # Panics
+/// Panics when either is missing or they differ.
+fn stated_wait(headers: &HeaderMap, body: &Value) -> u64 {
+    let header = headers
+        .get(header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or_else(|| panic!("a throttle carries a whole-second Retry-After: {body}"));
+    assert_eq!(
+        Some(header),
+        body["details"]["retry_after_seconds"].as_u64(),
+        "Retry-After equals details.retry_after_seconds: {body}"
+    );
+    assert!(header > 0);
+    header
+}
+
+/// Complete `proof` as `slug` from visitor `client` behind the ingress;
+/// returns the status, headers and body.
+async fn complete_from(
+    srv: &WyrdTestServer,
+    proof: &str,
+    slug: &str,
+    client: &str,
+) -> (StatusCode, HeaderMap, Value) {
+    let mut request = from_peer(
+        Method::POST,
+        "/auth/signup/complete",
+        "10.1.0.1",
+        Some(client),
+        &json!({ "slug": slug, "display_name": "Throttled" }),
+    );
+    request.headers_mut().insert(
+        header::COOKIE,
+        axum::http::HeaderValue::from_str(proof).expect("cookie value"),
+    );
+    let resp = srv.oneshot(request).await.expect("completion responds");
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    (status, headers, body_json(resp).await)
+}
+
+/// Every signup throttle answers `429` with a whole-second `Retry-After`
+/// equal to `details.retry_after_seconds`:
+///   1. the start source window;
+///   2. the completion identity window;
+///   3. the completion source window;
+///   4. unavailable admission state refuses start rather than admitting it.
+///
+/// # Panics
+/// Panics when a throttle lacks or misstates its wait, or unavailable state
+/// admits.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_signup_throttle_carries_retry_after() {
+    let google = wiremock::MockServer::start().await;
+    let (srv, _session) = signup_server(&google).await;
+    let taken = srv.pg_fixture().tenant_slug().to_owned();
+
+    // 1. Start.
+    starts_until_throttled(&srv, "10.1.0.1", Some("198.51.100.20")).await;
+    let (status, headers, body) = start_signup(&srv, "10.1.0.1", Some("198.51.100.20")).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    stated_wait(&headers, &body);
+
+    // 2. One proven identity retrying a taken slug exhausts its window.
+    let proof = prove_signup(&srv, &google, "google-retrier").await;
+    let throttled = loop {
+        let (status, headers, body) = complete_from(&srv, &proof, &taken, "198.51.100.21").await;
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            break (headers, body);
+        }
+        assert_eq!(status, StatusCode::CONFLICT, "a taken slug: {body}");
+    };
+    assert_eq!(throttled.1["code"], "WYRD_AUTH_429_SIGNUP_ATTEMPTS");
+    stated_wait(&throttled.0, &throttled.1);
+
+    // 3. Many identities from one visitor exhaust its source window.
+    let mut source_throttle = None;
+    for subject in 0..10 {
+        let proof = prove_signup(&srv, &google, &format!("google-flood-{subject}")).await;
+        for _ in 0..4 {
+            let (status, headers, body) =
+                complete_from(&srv, &proof, &taken, "198.51.100.22").await;
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                source_throttle = Some((headers, body));
+                break;
+            }
+            assert_eq!(status, StatusCode::CONFLICT, "a taken slug: {body}");
+        }
+        if source_throttle.is_some() {
+            break;
+        }
+    }
+    let (headers, body) = source_throttle.expect("the source window is exhausted");
+    stated_wait(&headers, &body);
+
+    // 4. Unavailable admission state refuses start.
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    sqlx::query("ALTER TABLE platform.signup_admissions RENAME TO signup_admissions_down")
+        .execute(&superuser)
+        .await
+        .expect("admission state goes away");
+    let (status, _, body) = start_signup(&srv, "10.1.0.1", Some("198.51.100.23")).await;
+    sqlx::query("ALTER TABLE platform.signup_admissions_down RENAME TO signup_admissions")
+        .execute(&superuser)
+        .await
+        .expect("admission state returns");
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["code"], "WYRD_AUTH_503_VERIFY_UNAVAILABLE", "{body}");
+}

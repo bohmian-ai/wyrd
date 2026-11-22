@@ -236,9 +236,12 @@ const SIGNUP_COOKIE_MAX_AGE_SECONDS: u64 = 1800;
           (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
         (status = 403, description = "Origin absent or foreign \
           (WYRD_AUTH_403_ORIGIN_REFUSED)", body = WyrdProblem),
-        (status = 503, description = "The identity provider or store is unavailable \
-          (WYRD_AUTH_503_DISCOVERY_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)",
-          body = WyrdProblem)
+        (status = 429, description = "Too many signup starts from this source \
+          (WYRD_AUTH_429_SIGNUP_ATTEMPTS)", body = WyrdProblem,
+          headers(("Retry-After" = u64, description = "Seconds until the window ends"))),
+        (status = 503, description = "The identity provider or store is unavailable, or the \
+          request's source cannot be determined (WYRD_AUTH_503_DISCOVERY_UNAVAILABLE, \
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
     security(()),
     tag = "Auth"
@@ -315,7 +318,8 @@ pub async fn signup(
         (status = 409, description = "Slug taken, workspace already created, or creation \
           in progress (WYRD_SPEC_409_CONFLICT)", body = WyrdProblem),
         (status = 429, description = "Too many workspace signups \
-          (WYRD_AUTH_429_SIGNUP_ATTEMPTS)", body = WyrdProblem),
+          (WYRD_AUTH_429_SIGNUP_ATTEMPTS)", body = WyrdProblem,
+          headers(("Retry-After" = u64, description = "Seconds until the window ends"))),
         (status = 500, description = "Provisioning failed (WYRD_SPEC_500_INTERNAL)",
           body = WyrdProblem),
         (status = 503, description = "Admission state is unavailable \

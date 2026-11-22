@@ -150,6 +150,16 @@ Unavailable shared admission refuses rather than admitting.
 **Proof:** tier-1 HTTP header/problem assertions against real counters; RED is the
 missing/mismatched header, not a private error-construction fixture.
 
+**Evidence (cycle 2):** RED — `platform_admin_e2e::signup::every_signup_throttle_carries_retry_after`
+failed first at `stated_wait`: the start 429 carried `details.retry_after_seconds: 3600`
+and no `Retry-After` header. GREEN after the shared renderer
+(`http/error.rs::wyrd_error_response_from_parts`) projects `SignupAttempts` exactly as
+`PasswordAttempts`: start, completion identity and completion source throttles each
+assert the header equals the problem field; renamed admission state refuses start with
+`503 WYRD_AUTH_503_VERIFY_UNAVAILABLE` (completion's equivalent remains in
+`a_visitor_creates_a_workspace_with_google`). OpenAPI annotations document start 429/503
+and both `Retry-After` headers. **TDD: PASS.** Same selector as cycle 1.
+
 ### 3. HMAC keys and bounded purge
 
 **Reuses:** Cycles 1–2 admission and existing keyring/auth maintenance; define final retention before proof consumers.

@@ -627,66 +627,96 @@ mod pg_tests {
         );
     }
 
-    /// A sweep DELETE stays linear in the receipts it reads when the table
-    /// grew faster than its planner statistics.
+    /// A sweep DELETE grows linearly with the receipts it reads, never
+    /// quadratically, when the table grew faster than its planner statistics.
     ///
     /// A write load inserts receipts faster than autovacuum analyzes them, so
-    /// the planner believes the shard holds about one row. 30,000 fresh
-    /// receipts of one shard over four tables, none yet due, are recorded and
-    /// never analyzed; one DELETE must still finish within seconds and delete
-    /// nothing. A plan that re-ranks the table once per shard row takes tens
-    /// of seconds here.
+    /// the planner believes the shard holds about one row. One shard's fresh
+    /// receipts over four tables, none yet due, are recorded with autovacuum
+    /// off so they are never analyzed, and the DELETE is timed at 10,000, 20,000 and 40,000 of them
+    /// (the median of three runs each, since none deletes anything). Linear
+    /// cost grows about 4x from the smallest to the largest size and quadratic
+    /// cost about 16x, so growth must stay under 8x; the largest size must
+    /// also finish within 3 s. A plan that re-ranks the table once per shard
+    /// row took 103 s at 30,000.
     ///
     /// # Panics
     ///
     /// Panics when the fixture cannot start, a statement fails, a receipt is
-    /// deleted, or the DELETE takes 3 s or longer.
+    /// deleted, the cost grows 8x or more from 10,000 to 40,000 receipts, or
+    /// the largest DELETE takes 3 s or longer.
     #[tokio::test]
-    async fn a_sweep_delete_stays_linear_over_unanalyzed_receipts() {
+    async fn a_sweep_delete_grows_linearly_over_unanalyzed_receipts() {
         let fixture = PgFixture::start().await.expect("fixture");
         let tenant = fixture.data_tenant_id();
         let node_id = Uuid::now_v7();
         let accepted = Utc::now();
-        let receipts: Vec<_> = (0..30_000_i64)
-            .map(|lsn| {
-                let table = format!("bifrost.t{}", lsn % 4);
-                let receipt = ScribeBatchCommit {
-                    wal_node_id: node_id,
-                    ..fence(tenant, &table, Uuid::now_v7(), lsn * 2)
-                };
-                (receipt, accepted)
-            })
-            .collect();
-        for group in receipts.chunks(5_000) {
-            commit_group(&fixture, group).await;
-        }
+        // Autovacuum would analyze the table during a slow DELETE and hand the
+        // larger sizes a plan the write load never gets.
+        sqlx::query("ALTER TABLE vala.scribe_batch_commits SET (autovacuum_enabled = false)")
+            .execute(&fixture.superuser_pool().expect("superuser pool"))
+            .await
+            .expect("statistics stay as the write load leaves them");
         let shard = HandedOffShard {
             node_id,
             writer_epoch: 1,
             shard_id: 0,
             safe_segment: 1,
         };
+        let median_delete = async || {
+            let mut runs = Vec::new();
+            for _ in 0..3 {
+                let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
+                    .await
+                    .expect("tenant connection");
+                let started = std::time::Instant::now();
+                let deleted = delete_handed_off(
+                    &mut conn,
+                    &shard,
+                    &RetryHistory::default(),
+                    accepted + chrono::Duration::seconds(1),
+                    1_000,
+                )
+                .await
+                .expect("the delete runs");
+                runs.push(started.elapsed());
+                conn.commit().await.expect("commit");
+                assert!(deleted.is_empty(), "no receipt is due yet");
+            }
+            runs.sort();
+            runs[1]
+        };
 
-        let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
-            .await
-            .expect("tenant connection");
-        let started = std::time::Instant::now();
-        let deleted = delete_handed_off(
-            &mut conn,
-            &shard,
-            &RetryHistory::default(),
-            accepted + chrono::Duration::seconds(1),
-            1_000,
-        )
-        .await
-        .expect("the delete runs");
-        let elapsed = started.elapsed();
-        conn.commit().await.expect("commit");
+        let mut held = 0_i64;
+        let mut timings = Vec::new();
+        for size in [10_000_i64, 20_000, 40_000] {
+            let receipts: Vec<_> = (held..size)
+                .map(|lsn| {
+                    let table = format!("bifrost.t{}", lsn % 4);
+                    let receipt = ScribeBatchCommit {
+                        wal_node_id: node_id,
+                        ..fence(tenant, &table, Uuid::now_v7(), lsn * 2)
+                    };
+                    (receipt, accepted)
+                })
+                .collect();
+            for group in receipts.chunks(5_000) {
+                commit_group(&fixture, group).await;
+            }
+            held = size;
+            timings.push((size, median_delete().await));
+        }
 
-        assert!(deleted.is_empty(), "no receipt is due yet");
+        let (_, smallest) = timings[0];
+        let (_, largest) = timings[2];
         assert!(
-            elapsed < std::time::Duration::from_secs(3),
-            "one sweep DELETE took {elapsed:?} over 30,000 unanalyzed receipts"
+            largest < smallest * 8,
+            "4x the receipts cost {:.1}x the time: {timings:?}",
+            largest.as_secs_f64() / smallest.as_secs_f64()
+        );
+        assert!(
+            largest < std::time::Duration::from_secs(3),
+            "one sweep DELETE took {largest:?} over 40,000 unanalyzed receipts"
         );
     }
 

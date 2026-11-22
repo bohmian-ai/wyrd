@@ -19,6 +19,7 @@
 
 use std::sync::Arc;
 
+use base64::Engine as _;
 use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::json;
 use url::Url;
@@ -43,9 +44,8 @@ use wyrd_sql::queries::auth::{
     insert_social_login_state, insert_user, insert_user_identity, linked_identity,
 };
 use wyrd_sql::queries::platform::signup::{
-    PendingSignup, SignupAdmissionScope, SignupProof, admit_signup, finish_signup_creation,
-    insert_proven_signup, insert_signup_attempt, proven_signup, purge_expired_signup_state,
-    start_signup_creation, take_signup_attempt,
+    SignupAdmissionScope, SignupProof, admit_signup, finish_signup_creation, insert_proven_signup,
+    proven_signup, purge_expired_signup_state, signup_clock, start_signup_creation,
 };
 use wyrd_sql::queries::platform::social::{
     LoginSettingsRow, ProviderEnablement, SocialProviderRow, SocialTestState,
@@ -1025,6 +1025,41 @@ const SIGNUP_WINDOW: std::time::Duration = std::time::Duration::from_hours(1);
 /// Most expired windows, and most expired attempts, one purge batch removes.
 const SIGNUP_PURGE_BATCH: i64 = 500;
 
+/// A pre-proof signup flow, sealed into its browser's cookie instead of
+/// stored: nothing about an unproven visitor is written to PostgreSQL.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(tag = "purpose", rename_all = "snake_case")]
+enum SignupEnvelope {
+    /// A provider round-trip begun for workspace creation.
+    SignupSocial {
+        /// The OAuth `state` the callback must return.
+        state: String,
+        /// The provider it was begun with.
+        provider: SocialProvider,
+        /// The exact provider revision it was begun under.
+        revision: i64,
+        /// The provider's social callback.
+        redirect_uri: String,
+        /// PKCE verifier.
+        code_verifier: String,
+        /// OpenID nonce.
+        nonce: String,
+        /// Random browser binding; its digest marks the proof.
+        binding: String,
+        /// Database-clock deadline, in Unix seconds.
+        expires_at: i64,
+    },
+}
+
+/// Signup without the deployment sealing keyring, which refuses rather than
+/// store or send plain state.
+fn sealing_key_missing() -> WyrdError {
+    WyrdError::AuthVerifyUnavailable {
+        message: "signup needs the deployment sealing keyring".to_owned(),
+        details: json!({ "reason": "sealing_key_missing" }),
+    }
+}
+
 /// A proven signup this completion now holds for creating its workspace.
 #[derive(Debug, Clone)]
 pub struct SignupCreation {
@@ -1052,10 +1087,11 @@ impl SocialSignIn {
     /// `provider`, from the browser that will hold the returned binding.
     ///
     /// The start is first admitted in the shared start window of its trusted
-    /// `source`, before any other work. Signup must be enabled. The attempt
-    /// binds the exact provider revision, the provider's social callback on
-    /// `origin`, server-held PKCE and nonce, and only the SHA-256 of the
-    /// browser binding and state. Nothing is created or audited.
+    /// `source`, before any other work. Signup must offer the provider. The
+    /// returned binding is the sealed round-trip: state, PKCE verifier,
+    /// nonce, the exact provider revision, the provider's social callback on
+    /// `origin`, a browser binding and a five-minute deadline. Nothing is
+    /// stored, created or audited.
     ///
     /// # Errors
     /// Returns [`WyrdError::AuthVerifyUnavailable`] when `source` is unknown
@@ -1080,25 +1116,16 @@ impl SocialSignIn {
             .filter(|row| row.enabled)
             .ok_or_else(|| invalid_token(&format!("{provider} sign-in is not available")))?;
         let authorization = self.authorize(provider, &row.client_id, origin).await?;
-        let binding = SecretString::from(random_secret());
-        insert_signup_attempt(
-            &self.operator,
-            Sha256Hex::digest(authorization.state.as_bytes()).as_bytes(),
-            &PendingSignup {
-                id: Uuid::now_v7(),
-                provider: provider.as_str().to_owned(),
-                provider_revision: row.revision,
-                redirect_uri: authorization.redirect_uri.to_string(),
-                code_verifier: authorization.code_verifier.expose_secret().to_owned(),
-                nonce: Some(authorization.nonce),
-                browser_binding_hash: Sha256Hex::digest(binding.expose_secret().as_bytes())
-                    .as_bytes()
-                    .to_vec(),
-            },
-            LOGIN_STATE_TTL,
-        )
-        .await
-        .map_err(store_error)?;
+        let binding = self.seal_envelope(&SignupEnvelope::SignupSocial {
+            state: authorization.state,
+            provider,
+            revision: row.revision,
+            redirect_uri: authorization.redirect_uri.to_string(),
+            code_verifier: authorization.code_verifier.expose_secret().to_owned(),
+            nonce: authorization.nonce,
+            binding: random_secret(),
+            expires_at: self.envelope_deadline(LOGIN_STATE_TTL).await?,
+        })?;
         Ok(BegunBrowserLogin {
             authorization_url: authorization.url,
             binding,
@@ -1109,15 +1136,17 @@ impl SocialSignIn {
     /// callback, for the browser presenting `browser_binding`, and return the
     /// completion secret that browser must present to create its workspace.
     ///
-    /// Returns `Ok(None)` when the state names no pending signup. Otherwise
-    /// the round-trip is consumed before any provider IO, the binding must
-    /// match, signup and the exact provider revision must still be enabled,
-    /// and the identity is verified. Only the identity and the secret's
-    /// SHA-256 are kept; the provider's tokens are not.
+    /// Returns `Ok(None)` unless `browser_binding` is this provider's sealed
+    /// signup round-trip for the returned state. The deadline is checked
+    /// against the database clock before any provider IO, signup and the
+    /// exact provider revision must still be offered, and the identity is
+    /// verified. The proof is recorded once per state: of concurrent or
+    /// replayed returns, one records it and the others are refused. Only the
+    /// identity and digests are kept; the provider's tokens are not.
     ///
     /// # Errors
-    /// Returns [`WyrdError::InvalidState`] for another browser,
-    /// [`WyrdError::InvalidToken`] when signup or the provider changed or
+    /// Returns [`WyrdError::InvalidState`] for an expired or already used
+    /// round-trip, [`WyrdError::InvalidToken`] when signup or the provider changed or
     /// verification fails, and the provider and store availability errors.
     pub async fn prove_signup(
         &self,
@@ -1125,53 +1154,60 @@ impl SocialSignIn {
         query: &CallbackQuery,
         browser_binding: Option<&str>,
     ) -> Result<Option<SecretString>, WyrdError> {
-        let state_hash = Sha256Hex::digest(query.state.as_bytes());
-        let Some(attempt) =
-            take_signup_attempt(&self.operator, provider.as_str(), state_hash.as_bytes())
-                .await
-                .map_err(store_error)?
+        let Some(SignupEnvelope::SignupSocial {
+            state,
+            provider: began,
+            revision,
+            redirect_uri,
+            code_verifier,
+            nonce,
+            binding,
+            expires_at,
+        }) = browser_binding.and_then(|cookie| self.open_envelope(cookie))
         else {
             return Ok(None);
         };
-        if !browser_binding.is_some_and(|binding| {
-            attempt.browser_binding_hash == Sha256Hex::digest(binding.as_bytes()).as_bytes()
-        }) {
-            return Err(invalid_state(
-                "this browser did not begin the signup; start again",
-            ));
+        if began != provider || state != query.state {
+            return Ok(None);
         }
+        self.require_live(expires_at).await?;
         let code = match query.response()? {
             ProviderResponse::Code(code) => code.into_secret_string(),
             ProviderResponse::Error(error) => return Err(provider_refusal(&error)),
         };
-        self.recheck_signup(provider, attempt.provider_revision)
-            .await?;
-        let enabled = self.revision(provider, attempt.provider_revision).await?;
+        self.recheck_signup(provider, revision).await?;
+        let enabled = self.revision(provider, revision).await?;
         let identity = self
             .verify_code(
                 &enabled,
                 code,
-                &attempt.redirect_uri,
-                &SecretString::from(attempt.code_verifier.clone()),
-                attempt.nonce.as_deref(),
+                &redirect_uri,
+                &SecretString::from(code_verifier),
+                Some(nonce.as_str()),
                 query.iss.as_deref(),
             )
             .await?;
         let completion = SecretString::from(random_secret());
-        insert_proven_signup(
+        let recorded = insert_proven_signup(
             &self.operator,
-            &attempt,
-            state_hash.as_bytes(),
-            Sha256Hex::digest(completion.expose_secret().as_bytes()).as_bytes(),
             &SignupProof {
-                issuer: self.issuer(provider),
-                subject: &identity.subject,
+                id: Uuid::now_v7(),
+                kind: "social",
+                proof_hash: Sha256Hex::digest(state.as_bytes()).as_bytes(),
+                provider: Some((provider.as_str(), revision)),
+                browser_binding_hash: Sha256Hex::digest(binding.as_bytes()).as_bytes(),
+                completion_hash: Sha256Hex::digest(completion.expose_secret().as_bytes())
+                    .as_bytes(),
+                identity: Some((self.issuer(provider), &identity.subject)),
                 email: identity.email.as_deref(),
             },
             SIGNUP_COMPLETION_TTL,
         )
         .await
         .map_err(store_error)?;
+        if !recorded {
+            return Err(invalid_state("this signup was already used; start again"));
+        }
         Ok(Some(completion))
     }
 
@@ -1213,11 +1249,18 @@ impl SocialSignIn {
             "creating" => return Err(signup_busy()),
             _ => {}
         }
-        let provider = SocialProvider::parse(&proven.provider)
-            .ok_or_else(|| invalid_state("this signup names an unknown provider"))?;
-        self.recheck_signup(provider, proven.provider_revision)
-            .await?;
-        let identity = identity_value(&proven.issuer, &proven.subject);
+        let (Some(provider), Some(provider_revision), Some(issuer), Some(subject)) = (
+            proven.provider.as_deref().and_then(SocialProvider::parse),
+            proven.provider_revision,
+            proven.issuer,
+            proven.subject,
+        ) else {
+            return Err(invalid_state(
+                "this signup's proof cannot create a workspace yet; start again",
+            ));
+        };
+        self.recheck_signup(provider, provider_revision).await?;
+        let identity = identity_value(&issuer, &subject);
         let creator_key = self.pseudonym("creator", &identity)?;
         self.admit(&[
             (
@@ -1249,9 +1292,9 @@ impl SocialSignIn {
         Ok(SignupCreation {
             attempt: proven.id,
             provider,
-            provider_revision: proven.provider_revision,
-            issuer: proven.issuer,
-            subject: proven.subject,
+            provider_revision,
+            issuer,
+            subject,
             email: proven.email,
             creator_key,
             claimed,
@@ -1271,6 +1314,60 @@ impl SocialSignIn {
             .map_err(store_error)
     }
 
+    /// `envelope` sealed under the deployment keyring, as a cookie value.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::AuthVerifyUnavailable`] without a keyring and
+    /// [`WyrdError::Internal`] when sealing fails.
+    fn seal_envelope(&self, envelope: &SignupEnvelope) -> Result<SecretString, WyrdError> {
+        let keyring = self.keyring.as_ref().ok_or_else(sealing_key_missing)?;
+        let plain = serde_json::to_vec(envelope).map_err(|error| WyrdError::Internal {
+            message: format!("signup envelope encoding failed: {error}"),
+            details: json!({}),
+        })?;
+        let sealed = keyring.seal(&plain).map_err(|error| WyrdError::Internal {
+            message: format!("signup envelope sealing failed: {error}"),
+            details: json!({}),
+        })?;
+        Ok(SecretString::from(
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sealed),
+        ))
+    }
+
+    /// The envelope sealed in `cookie`; `None` for any value this keyring did
+    /// not seal as an envelope, so a tampered or foreign cookie proves
+    /// nothing.
+    fn open_envelope(&self, cookie: &str) -> Option<SignupEnvelope> {
+        let sealed = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(cookie)
+            .ok()?;
+        let plain = self.keyring.as_ref()?.open(&sealed).ok()?;
+        serde_json::from_slice(&plain).ok()
+    }
+
+    /// The database-clock deadline, in Unix seconds, `ttl` from now.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::AuthVerifyUnavailable`] when the clock read fails.
+    async fn envelope_deadline(&self, ttl: std::time::Duration) -> Result<i64, WyrdError> {
+        let now = signup_clock(&self.operator).await.map_err(store_error)?;
+        Ok(now.timestamp().saturating_add_unsigned(ttl.as_secs()))
+    }
+
+    /// Refuse an envelope whose `deadline` the database clock has passed.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::InvalidState`] once expired and
+    /// [`WyrdError::AuthVerifyUnavailable`] when the clock read fails.
+    async fn require_live(&self, deadline: i64) -> Result<(), WyrdError> {
+        let now = signup_clock(&self.operator).await.map_err(store_error)?;
+        if now.timestamp() < deadline {
+            Ok(())
+        } else {
+            Err(invalid_state("this signup has expired; start again"))
+        }
+    }
+
     /// The keyring pseudonym of `value` in `scope`, which signup admission
     /// and creator accounting store instead of the value.
     ///
@@ -1281,10 +1378,7 @@ impl SocialSignIn {
         self.keyring
             .as_ref()
             .map(|keyring| keyring.pseudonym(scope, value))
-            .ok_or_else(|| WyrdError::AuthVerifyUnavailable {
-                message: "signup needs the deployment sealing keyring".to_owned(),
-                details: json!({ "reason": "sealing_key_missing" }),
-            })
+            .ok_or_else(sealing_key_missing)
     }
 
     /// Count one attempt in every `(scope, key, limit)` window and refuse with

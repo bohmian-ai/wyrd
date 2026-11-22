@@ -1,10 +1,10 @@
 //! Public workspace signup records: one visitor's social proof, the creation
 //! it may complete, and the shared admission windows creation is counted in.
 //!
-//! The provider round-trip row is deleted when its callback consumes it; a
-//! verified proof is then written back under the same id as `proven`, held by
-//! the SHA-256 of a completion secret only the proving browser holds. Every
-//! timestamp is PostgreSQL's.
+//! Nothing is stored before proof: the round-trip rides a sealed browser
+//! cookie. A verified proof is recorded once per state or email identifier
+//! digest as `proven`, held by the SHA-256 of a completion secret only the
+//! proving browser holds. Every timestamp is PostgreSQL's.
 // raw-query grep allowlist: platform administrative tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use std::time::Duration;
@@ -13,39 +13,22 @@ use uuid::Uuid;
 
 use crate::{OperatorPool, SqlError};
 
-/// A signup's provider round-trip as begun.
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct PendingSignup {
-    /// Attempt id, kept when the proof is recorded.
-    pub id: Uuid,
-    /// Provider kind.
-    pub provider: String,
-    /// The exact provider revision the redirect was issued for.
-    pub provider_revision: i64,
-    /// The provider's social callback.
-    pub redirect_uri: String,
-    /// Server-held PKCE verifier.
-    pub code_verifier: String,
-    /// Server-held nonce, for an OpenID provider.
-    pub nonce: Option<String>,
-    /// SHA-256 of the beginning browser's login-transaction secret.
-    pub browser_binding_hash: Vec<u8>,
-}
-
 /// A verified signup proof as its completion reads it.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ProvenSignup {
     /// Attempt id.
     pub id: Uuid,
-    /// Provider kind.
-    pub provider: String,
-    /// The provider revision the proof was made through.
-    pub provider_revision: i64,
-    /// The proven identity's issuer namespace.
-    pub issuer: String,
-    /// The proven identity's subject.
-    pub subject: String,
-    /// The provider's email, when it gave one.
+    /// `email` or `social`.
+    pub proof_kind: String,
+    /// Provider kind of a social proof.
+    pub provider: Option<String>,
+    /// The provider revision a social proof was made through.
+    pub provider_revision: Option<i64>,
+    /// A social proof's issuer namespace.
+    pub issuer: Option<String>,
+    /// A social proof's subject.
+    pub subject: Option<String>,
+    /// The verified address of an email proof, or a provider's email.
     pub email: Option<String>,
     /// `proven`, `creating`, `failed` or `completed`.
     pub status: String,
@@ -55,14 +38,16 @@ pub struct ProvenSignup {
     pub tenant_slug: Option<String>,
 }
 
-/// Which admission window a creation attempt counts in.
+/// Which admission window an attempt counts in.
 #[derive(Debug, Clone, Copy)]
 pub enum SignupAdmissionScope {
     /// The trusted source of a signup start.
     Start,
+    /// The address an email signup start mails.
+    Address,
     /// The trusted source of a workspace creation.
     Source,
-    /// The proven provider identity.
+    /// The proven identity.
     Identity,
 }
 
@@ -71,117 +56,106 @@ impl SignupAdmissionScope {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Start => "start",
+            Self::Address => "address",
             Self::Source => "source",
             Self::Identity => "identity",
         }
     }
 }
 
-/// Record a begun signup round-trip keyed by `state_hash`, expiring after
-/// `ttl`. Expired attempts leave only through
-/// [`purge_expired_signup_state`].
-///
-/// # Errors
-/// Returns [`SqlError::Query`] when a statement fails.
-pub async fn insert_signup_attempt(
-    pool: &OperatorPool,
-    state_hash: &[u8],
-    attempt: &PendingSignup,
-    ttl: Duration,
-) -> Result<(), SqlError> {
-    sqlx::query(
-        "INSERT INTO platform.signup_attempts
-             (id, state_hash, provider, provider_revision, redirect_uri, code_verifier,
-              nonce, browser_binding_hash, expires_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
-                 statement_timestamp() + ($9 * interval '1 second'))",
-    )
-    .bind(attempt.id)
-    .bind(state_hash)
-    .bind(&attempt.provider)
-    .bind(attempt.provider_revision)
-    .bind(&attempt.redirect_uri)
-    .bind(&attempt.code_verifier)
-    .bind(&attempt.nonce)
-    .bind(&attempt.browser_binding_hash)
-    .bind(ttl.as_secs_f64())
-    .execute(pool.pool())
-    .await
-    .map(|_| ())
-    .map_err(SqlError::from)
-}
-
-/// Consume the live pending round-trip of `provider` keyed by `state_hash`,
-/// whatever happens next; `None` when there is none.
-///
-/// # Errors
-/// Returns [`SqlError::Query`] when the statement fails.
-pub async fn take_signup_attempt(
-    pool: &OperatorPool,
-    provider: &str,
-    state_hash: &[u8],
-) -> Result<Option<PendingSignup>, SqlError> {
-    sqlx::query_as(
-        "DELETE FROM platform.signup_attempts
-          WHERE state_hash = $1 AND provider = $2 AND status = 'pending'
-            AND expires_at > statement_timestamp()
-          RETURNING id, provider, provider_revision, redirect_uri, code_verifier,
-                    nonce, browser_binding_hash",
-    )
-    .bind(state_hash)
-    .bind(provider)
-    .fetch_optional(pool.pool())
-    .await
-    .map_err(SqlError::from)
-}
-
-/// The proven identity a consumed round-trip established.
+/// A verified proof to record.
 #[derive(Debug, Clone)]
 pub struct SignupProof<'a> {
-    /// Issuer namespace.
-    pub issuer: &'a str,
-    /// Subject within it.
-    pub subject: &'a str,
-    /// Email, when the provider gave one.
+    /// Attempt id.
+    pub id: Uuid,
+    /// `email` or `social`.
+    pub kind: &'a str,
+    /// SHA-256 of the provider state or email identifier, unique per proof.
+    pub proof_hash: &'a [u8],
+    /// A social proof's provider and exact revision.
+    pub provider: Option<(&'a str, i64)>,
+    /// SHA-256 of the proving browser's binding.
+    pub browser_binding_hash: &'a [u8],
+    /// SHA-256 of the completion secret.
+    pub completion_hash: &'a [u8],
+    /// A social proof's issuer and subject.
+    pub identity: Option<(&'a str, &'a str)>,
+    /// The verified address, or a provider's email.
     pub email: Option<&'a str>,
 }
 
-/// Record `attempt`'s verified `proof`, held by `completion_hash` and
-/// completable for `ttl`.
+/// Record `proof`, completable for `ttl`; `false` when a proof with its
+/// digest already exists, live or spent, so a replay records nothing.
 ///
 /// # Errors
 /// Returns [`SqlError::Query`] when the insert fails.
 pub async fn insert_proven_signup(
     pool: &OperatorPool,
-    attempt: &PendingSignup,
-    state_hash: &[u8],
-    completion_hash: &[u8],
     proof: &SignupProof<'_>,
     ttl: Duration,
-) -> Result<(), SqlError> {
+) -> Result<bool, SqlError> {
     sqlx::query(
         "INSERT INTO platform.signup_attempts
-             (id, state_hash, provider, provider_revision, redirect_uri, nonce,
-              browser_binding_hash, completion_hash, issuer, subject, email, status,
-              expires_at)
-         VALUES ($1, $2, $3, $4, $5, NULL, $6, $7, $8, $9, $10, 'proven',
-                 statement_timestamp() + ($11 * interval '1 second'))",
+             (id, proof_kind, proof_hash, provider, provider_revision, browser_binding_hash,
+              completion_hash, issuer, subject, email, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                 statement_timestamp() + ($11 * interval '1 second'))
+         ON CONFLICT (proof_hash) DO NOTHING",
     )
-    .bind(attempt.id)
-    .bind(state_hash)
-    .bind(&attempt.provider)
-    .bind(attempt.provider_revision)
-    .bind(&attempt.redirect_uri)
-    .bind(&attempt.browser_binding_hash)
-    .bind(completion_hash)
-    .bind(proof.issuer)
-    .bind(proof.subject)
+    .bind(proof.id)
+    .bind(proof.kind)
+    .bind(proof.proof_hash)
+    .bind(proof.provider.map(|(provider, _)| provider))
+    .bind(proof.provider.map(|(_, revision)| revision))
+    .bind(proof.browser_binding_hash)
+    .bind(proof.completion_hash)
+    .bind(proof.identity.map(|(issuer, _)| issuer))
+    .bind(proof.identity.map(|(_, subject)| subject))
     .bind(proof.email)
     .bind(ttl.as_secs_f64())
     .execute(pool.pool())
     .await
-    .map(|_| ())
+    .map(|done| done.rows_affected() == 1)
     .map_err(SqlError::from)
+}
+
+/// Hold the live, still-`proven` proof with `proof_hash` under a new
+/// `completion_hash`, when the same browser (`browser_binding_hash`) proved
+/// it: the recovery of a lost verification response. `false` otherwise.
+///
+/// # Errors
+/// Returns [`SqlError::Query`] when the update fails.
+pub async fn renew_signup_completion(
+    pool: &OperatorPool,
+    proof_hash: &[u8],
+    browser_binding_hash: &[u8],
+    completion_hash: &[u8],
+) -> Result<bool, SqlError> {
+    sqlx::query(
+        "UPDATE platform.signup_attempts
+            SET completion_hash = $3, updated_at = statement_timestamp()
+          WHERE proof_hash = $1 AND browser_binding_hash = $2 AND status = 'proven'
+            AND expires_at > statement_timestamp()",
+    )
+    .bind(proof_hash)
+    .bind(browser_binding_hash)
+    .bind(completion_hash)
+    .execute(pool.pool())
+    .await
+    .map(|done| done.rows_affected() == 1)
+    .map_err(SqlError::from)
+}
+
+/// The database's current statement time, the clock pre-proof envelopes are
+/// stamped and checked against.
+///
+/// # Errors
+/// Returns [`SqlError::Query`] when the read fails.
+pub async fn signup_clock(pool: &OperatorPool) -> Result<chrono::DateTime<chrono::Utc>, SqlError> {
+    sqlx::query_scalar("SELECT statement_timestamp()")
+        .fetch_one(pool.pool())
+        .await
+        .map_err(SqlError::from)
 }
 
 /// The live proven attempt held by `completion_hash`, with the tenant it
@@ -194,8 +168,8 @@ pub async fn proven_signup(
     completion_hash: &[u8],
 ) -> Result<Option<ProvenSignup>, SqlError> {
     sqlx::query_as(
-        "SELECT a.id, a.provider, a.provider_revision, a.issuer, a.subject, a.email,
-                a.status, t.data_tenant_id AS tenant_id, t.slug AS tenant_slug
+        "SELECT a.id, a.proof_kind, a.provider, a.provider_revision, a.issuer, a.subject,
+                a.email, a.status, t.data_tenant_id AS tenant_id, t.slug AS tenant_slug
            FROM platform.signup_attempts a
            LEFT JOIN platform.tenants t ON t.signup_attempt_id = a.id
           WHERE a.completion_hash = $1 AND a.expires_at > statement_timestamp()",

@@ -8,40 +8,49 @@
 -- address in admission keys"; the creating identity's keyed pseudonym, so the
 -- owned-workspace cap survives attempt purge). The expiry indexes serve the
 -- bounded background purge ("Pseudonymous, bounded counters", REQ-014).
+-- Email proofs follow "Proven email signup/discovery/contact proof and
+-- one-use redemption": no pre-proof row, one-use identifier digests.
 --
--- A signup attempt is one visitor's social proof and the creation it may
--- complete. The provider round-trip is keyed by the SHA-256 of its `state`
--- and consumed once; a proven attempt is then held by the SHA-256 of a
--- completion secret only its browser holds, and records the proven identity.
--- A tenant a signup creates names its attempt, so only that attempt can resume
--- the claim after a failure. Admission windows count creation attempts per
--- trusted source and per provider identity, shared by every replica.
+-- A signup attempt is one visitor's verified proof and the creation it may
+-- complete; nothing is stored before proof ("No pending row before proof",
+-- revision 5): the provider round-trip, and an email proof's envelope, ride a
+-- sealed browser cookie. A proof is unique on the SHA-256 of its provider
+-- state or email identifier, so a replayed or concurrent callback records at
+-- most one, and the spent digest stays until expiry. A proof is held by the
+-- SHA-256 of a completion secret only its browser holds, and the browser
+-- binding's digest lets that browser alone recover a lost response. A social
+-- proof records the provider identity; an email proof records only its
+-- verified address. A tenant a signup creates names its attempt, so only
+-- that attempt can resume the claim after a failure. Admission windows count
+-- starts per trusted source and per address, and completions per source and
+-- proven identity, shared by every replica ("Apply separate shared source and
+-- address/account budgets").
 --
 -- Platform records carry no tenant key and admit only operator sessions; every
 -- table still enables and forces row-level security.
 CREATE TABLE platform.signup_attempts (
     id                    UUID        PRIMARY KEY,
-    state_hash            BYTEA       NOT NULL UNIQUE CHECK (length(state_hash) = 32),
-    provider              TEXT        NOT NULL REFERENCES platform.social_providers(provider),
-    provider_revision     BIGINT      NOT NULL CHECK (provider_revision > 0),
-    redirect_uri          TEXT        NOT NULL,
-    code_verifier         TEXT,
-    nonce                 TEXT,
+    proof_kind            TEXT        NOT NULL CHECK (proof_kind IN ('email', 'social')),
+    proof_hash            BYTEA       NOT NULL UNIQUE CHECK (length(proof_hash) = 32),
+    provider              TEXT        REFERENCES platform.social_providers(provider),
+    provider_revision     BIGINT      CHECK (provider_revision > 0),
     browser_binding_hash  BYTEA       NOT NULL CHECK (length(browser_binding_hash) = 32),
-    completion_hash       BYTEA       UNIQUE CHECK (length(completion_hash) = 32),
+    completion_hash       BYTEA       NOT NULL UNIQUE CHECK (length(completion_hash) = 32),
     issuer                TEXT,
     subject               TEXT,
     email                 TEXT,
-    status                TEXT        NOT NULL DEFAULT 'pending'
-        CHECK (status IN ('pending', 'proven', 'creating', 'failed', 'completed')),
+    status                TEXT        NOT NULL DEFAULT 'proven'
+        CHECK (status IN ('proven', 'creating', 'failed', 'completed')),
     expires_at            TIMESTAMPTZ NOT NULL,
     updated_at            TIMESTAMPTZ NOT NULL DEFAULT statement_timestamp(),
-    -- A pending attempt still holds its PKCE verifier; a proven one holds the
-    -- identity and completion secret instead.
+    -- A social proof names its provider revision and identity; an email
+    -- proof names only its verified address.
     CONSTRAINT signup_attempts_proof CHECK (
-        (status = 'pending') = (code_verifier IS NOT NULL)
-        AND (status = 'pending') = (completion_hash IS NULL)
-        AND num_nonnulls(issuer, subject) = CASE WHEN status = 'pending' THEN 0 ELSE 2 END
+        CASE proof_kind
+            WHEN 'social' THEN num_nonnulls(provider, provider_revision, issuer, subject) = 4
+            ELSE num_nonnulls(provider, provider_revision, issuer, subject) = 0
+                 AND email IS NOT NULL
+        END
     )
 );
 
@@ -49,7 +58,7 @@ CREATE INDEX platform_signup_attempts_expires_at
     ON platform.signup_attempts (expires_at);
 
 CREATE TABLE platform.signup_admissions (
-    scope         TEXT        NOT NULL CHECK (scope IN ('start', 'source', 'identity')),
+    scope         TEXT        NOT NULL CHECK (scope IN ('start', 'address', 'source', 'identity')),
     key           BYTEA       NOT NULL CHECK (length(key) = 32),
     window_start  TIMESTAMPTZ NOT NULL,
     attempts      INTEGER     NOT NULL CHECK (attempts > 0),

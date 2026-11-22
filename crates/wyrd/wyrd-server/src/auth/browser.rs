@@ -789,11 +789,6 @@ pub async fn password_reset(
     Ok(with_cookies(StatusCode::NO_CONTENT, Vec::new(), ()))
 }
 
-/// The response for a session just created: its metadata at `status` with
-/// its cookie set.
-///
-/// # Errors
-/// Returns the refusals of [`BrowserSessions::view`].
 /// Refuse unless `tenant`'s current methods report offers password sign-in.
 ///
 /// # Errors
@@ -820,6 +815,11 @@ pub(crate) fn method_unavailable(method: &str) -> WyrdErrorResponse {
     })
 }
 
+/// The response for a session just created: its metadata at `status` with
+/// its cookie set.
+///
+/// # Errors
+/// Returns the refusals of [`BrowserSessions::view`].
 async fn signed_in_view(
     sessions: &BrowserSessions,
     origin: &Url,

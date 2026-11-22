@@ -9,9 +9,9 @@ use serde_json::{Value, json};
 use wyrd_testing::WyrdTestServer;
 
 use super::{
-    SOCIAL_HOST, body_json, complete_signup, enable_google, initialize_platform_root,
-    mount_platform_provider, platform_key_set, platform_session, prove_signup, social_call,
-    social_request,
+    SOCIAL_HOST, begin_social_at, body_json, complete_signup, enable_google, identity_token_reply,
+    initialize_platform_root, mount_platform_provider, platform_key_set, platform_session,
+    prove_signup, social_call, social_callback, social_request,
 };
 
 /// The trusted ingress every journey here sits behind.
@@ -404,7 +404,7 @@ async fn count(superuser: &sqlx::PgPool, sql: &'static str) -> i64 {
 ///   2. the created tenant records a 32-byte creator pseudonym;
 ///   3. a public start purges nothing;
 ///   4. each maintenance batch removes at most 500 windows and 500 attempts,
-///      expired ones only, leaving live windows and pending starts;
+///      expired ones only, leaving live windows;
 ///   5. the creator pseudonym survives its attempt's purge.
 ///
 /// # Panics
@@ -471,11 +471,11 @@ async fn signup_state_is_pseudonymous_and_purged_in_batches() {
     .expect("expired windows insert");
     sqlx::query(
         "INSERT INTO platform.signup_attempts
-             (id, state_hash, provider, provider_revision, redirect_uri, code_verifier,
-              browser_binding_hash, expires_at)
-         SELECT gen_random_uuid(), sha256(convert_to('state' || n, 'UTF8')), 'google', 1,
-                'http://wyrd.test/auth/social/google/callback', 'verifier',
+             (id, proof_kind, proof_hash, browser_binding_hash, completion_hash, email,
+              expires_at)
+         SELECT gen_random_uuid(), 'email', sha256(convert_to('proof' || n, 'UTF8')),
                 sha256(convert_to('binding' || n, 'UTF8')),
+                sha256(convert_to('completion' || n, 'UTF8')), n || '@example.test',
                 statement_timestamp() - interval '1 hour'
            FROM generate_series(1, 600) AS n",
     )
@@ -538,8 +538,8 @@ async fn signup_state_is_pseudonymous_and_purged_in_batches() {
               WHERE expires_at > statement_timestamp()"
         )
         .await,
-        2,
-        "both live pending starts remain"
+        0,
+        "starts stored no attempt to keep"
     );
 
     // 5. Creator accounting outlives the attempt.
@@ -551,4 +551,156 @@ async fn signup_state_is_pseudonymous_and_purged_in_batches() {
     .await
     .expect("tenant reads");
     assert_eq!((attempt, creator), (None, Some(32)));
+}
+
+/// The provider discovery requests `google` has received.
+async fn discoveries(google: &wiremock::MockServer) -> usize {
+    google
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|request| request.url.path().ends_with("/openid-configuration"))
+        .count()
+}
+
+/// A signup start keeps its whole provider round-trip in the browser:
+///   1. a start writes no signup row; state, verifier and nonce ride a
+///      sealed, HttpOnly cookie scoped to the social callbacks;
+///   2. a tampered cookie proves nothing;
+///   3. of two concurrent callbacks with one cookie exactly one records a
+///      proof, and a replay afterwards records none;
+///   4. a throttled start is refused before provider discovery;
+///   5. unavailable admission state refuses a start before any work.
+///
+/// # Panics
+/// Panics when a start writes a row, the cookie is readable, a callback
+/// proves twice or a refused start reaches the provider.
+#[tokio::test(flavor = "multi_thread")]
+async fn signup_start_keeps_its_round_trip_in_a_sealed_cookie() {
+    let google = wiremock::MockServer::start().await;
+    let (srv, _session) = signup_server(&google).await;
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    let attempts = "SELECT count(*) FROM platform.signup_attempts";
+    let start = json!({ "method": "social", "provider": "google" });
+
+    // 1. Nothing is stored; the cookie is sealed.
+    let begun = begin_social_at(&srv, "/auth/signup", start.clone()).await;
+    assert_eq!(
+        count(&superuser, attempts).await,
+        0,
+        "a start writes no row"
+    );
+    for attribute in [
+        "HttpOnly",
+        "Path=/auth/social",
+        "Max-Age=300",
+        "SameSite=Lax",
+    ] {
+        assert!(begun.set_cookie.contains(attribute), "{}", begun.set_cookie);
+    }
+    let (_, sealed) = begun.cookie.split_once('=').expect("cookie pair");
+    for plain in [&begun.query["state"], &begun.query["nonce"]] {
+        assert!(!sealed.contains(plain.as_str()), "the cookie hides {plain}");
+    }
+
+    // 2. A tampered cookie proves nothing.
+    mount_platform_provider(
+        &google,
+        platform_key_set("google-key"),
+        identity_token_reply(
+            &google.uri(),
+            &begun.query["nonce"],
+            "wyrd-google",
+            "google-key",
+            "google-sealed",
+            "sealed@example.test",
+        ),
+    )
+    .await;
+    let callback = |cookie: String| {
+        let srv = &srv;
+        let uri = social_callback(&begun.query["state"], &google.uri());
+        async move {
+            let resp = srv
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(uri)
+                        .header(header::HOST, SOCIAL_HOST)
+                        .header(header::COOKIE, cookie)
+                        .body(Body::empty())
+                        .expect("request builds"),
+                )
+                .await
+                .expect("callback responds");
+            resp.headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .any(|value| {
+                    value.starts_with("wyrd_signup=") && !value.starts_with("wyrd_signup=;")
+                })
+        }
+    };
+    let mut tampered = sealed.to_owned();
+    let flipped = if tampered.ends_with('A') { 'B' } else { 'A' };
+    tampered.pop();
+    tampered.push(flipped);
+    assert!(
+        !callback(format!("wyrd_login={tampered}")).await,
+        "tampered"
+    );
+    assert_eq!(
+        count(&superuser, attempts).await,
+        0,
+        "a tampered cookie proves nothing"
+    );
+
+    // 3. One cookie proves once, however its callbacks race or replay.
+    let (first, second) = tokio::join!(
+        callback(begun.cookie.clone()),
+        callback(begun.cookie.clone())
+    );
+    assert!(
+        first ^ second,
+        "exactly one concurrent callback proves: {first} {second}"
+    );
+    assert!(
+        !callback(begun.cookie.clone()).await,
+        "a replay proves nothing"
+    );
+    assert_eq!(count(&superuser, attempts).await, 1, "one proof per state");
+
+    // 4. A throttled start does no provider work.
+    starts_until_throttled(&srv, "10.6.0.1", Some("198.51.100.60")).await;
+    let before = discoveries(&google).await;
+    let (status, _, body) = start_signup(&srv, "10.6.0.1", Some("198.51.100.60")).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(
+        discoveries(&google).await,
+        before,
+        "refused before discovery"
+    );
+
+    // 5. Admission state that cannot be read refuses before any work.
+    sqlx::query("ALTER TABLE platform.signup_admissions RENAME TO signup_admissions_away")
+        .execute(&superuser)
+        .await
+        .expect("admission state goes away");
+    let (status, _, body) = start_signup(&srv, "10.6.0.2", Some("198.51.100.61")).await;
+    sqlx::query("ALTER TABLE platform.signup_admissions_away RENAME TO signup_admissions")
+        .execute(&superuser)
+        .await
+        .expect("admission state returns");
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(
+        discoveries(&google).await,
+        before,
+        "refused before discovery"
+    );
+    assert_eq!(count(&superuser, attempts).await, 1);
 }

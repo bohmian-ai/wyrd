@@ -18,11 +18,12 @@ use datafusion::common::stats::Precision;
 use datafusion::common::{ColumnStatistics, ScalarValue, Statistics};
 use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
 use datafusion::logical_expr::Accumulator as _;
+use uuid::Uuid;
 use wyrd_spec::DataTenantId;
 
 use crate::contracts::ScribeError;
 use crate::scribe::seal_key::SealKey;
-use crate::scribe::wal::ScribeAppendMeta;
+use crate::scribe::wal::{ContentDigest, ScribeAppendMeta};
 use crate::tables::fields::PARQUET_FIELD_ID;
 
 /// Estimated Arrow bytes at which the active generation rotates.
@@ -541,7 +542,13 @@ impl Memtable {
                 }
             })?;
             let rows_accepted = batch.num_rows();
-            let (data_digest, data_len) = crate::scribe::preprocess::logical_data_identity(&batch)?;
+            let (data_digest, data_len) = if crate::scribe::preprocess::is_content_derived(
+                Uuid::from_bytes(replayed_meta.batch_id),
+            ) {
+                (ContentDigest::default(), 0)
+            } else {
+                crate::scribe::preprocess::logical_data_identity(&batch)?
+            };
             statistics.push(batch_statistics(&batch));
             batches.push(batch);
             metas.push(ScribeAppendMeta {
@@ -4966,9 +4973,9 @@ pub(crate) mod tests {
         ScribeAppendMeta {
             batch_id: [0u8; 16],
             schema_fingerprint: [0; 32],
-            data_digest: [0; 32],
+            data_digest: [0; 16],
             data_len: 0,
-            payload_digest: [0; 32],
+            payload_digest: [0; 16],
             payload_len: 0,
             slice_index: 0,
             slice_count: 1,
@@ -5207,7 +5214,7 @@ pub(crate) mod tests {
                     crate::scribe::wal::ScribeAppendPayloadIdentity {
                         batch_id: [8u8; 16],
                         schema_fingerprint: [0; 32],
-                        data_digest: [0; 32],
+                        data_digest: [0; 16],
                         data_len: 0,
                         slice_index: 0,
                         slice_count: 1,

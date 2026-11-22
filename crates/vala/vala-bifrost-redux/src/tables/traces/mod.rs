@@ -853,10 +853,7 @@ mod tests {
         let hex = crate::scribe::preprocess::hex_digest(&digest);
         assert_eq!(
             (hex.as_str(), bytes),
-            (
-                "d23a93b53e6bc545628331400cb7396dff5d03bdc66e4cc8275fc5364cff6876",
-                5407
-            )
+            ("3401fb61dd036cf7256fae99903a6d96", 5407)
         );
     }
 

@@ -33,7 +33,7 @@ pub(crate) struct CommittedBatch {
     /// any other version is not this batch.
     pub(crate) table_version: wyrd_spec::vala::ids::TableVersion,
     /// Ordered logical slice-set digest the fence stores.
-    pub(crate) logical_digest: [u8; 32],
+    pub(crate) logical_digest: crate::scribe::wal::ContentDigest,
     /// Closed slice-set cardinality the fence stores.
     pub(crate) slice_count: u32,
 }
@@ -143,7 +143,7 @@ mod tests {
         CommittedBatch {
             table_fqn: table.to_owned(),
             table_version: wyrd_spec::vala::ids::TableVersion::INITIAL,
-            logical_digest: [digest; 32],
+            logical_digest: [digest; 16],
             slice_count: 1,
         }
     }

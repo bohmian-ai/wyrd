@@ -10,9 +10,9 @@ use std::io::Cursor;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::scribe::wal::ContentHasher;
 #[cfg(test)]
 use bytes::Bytes;
-use sha2::{Digest, Sha256};
 
 use crate::contracts::ScribeError;
 use crate::resources::{ScribeMemoryLease, ScribeResources};
@@ -65,7 +65,7 @@ pub struct ReplayedCommitIdentity {
     /// Stable client batch identity.
     pub batch_id: [u8; 16],
     /// Digest authenticating the ordered slice set.
-    pub slice_set_digest: [u8; 32],
+    pub slice_set_digest: crate::scribe::wal::ContentDigest,
     /// Number of slices authenticated by the commit.
     pub slice_count: u32,
     /// Segment sequence containing the terminal commit.
@@ -127,8 +127,8 @@ pub(crate) struct ReplayChunkResponse {
 pub struct ReplayedAppendMeta {
     /// Batch ID for dedup.
     pub batch_id: [u8; 16],
-    /// SHA-256 digest of the exact WAL-v8 slice payload.
-    pub payload_digest: [u8; 32],
+    /// XXH3-128 digest of the exact WAL-v8 slice payload.
+    pub payload_digest: crate::scribe::wal::ContentDigest,
     /// Exact WAL-v8 slice payload length.
     pub payload_len: u32,
     /// Complete committed batch slice count.
@@ -835,7 +835,7 @@ impl<'a> ReplayAccumulator<'a> {
         state.data_records.push(slice.decoded.data);
         state.append_metas.push(ReplayedAppendMeta {
             batch_id: slice.record.batch_id,
-            payload_digest: Sha256::digest(&slice.record.payload).into(),
+            payload_digest: ContentHasher::digest(&slice.record.payload),
             payload_len: u32::try_from(slice.record.payload.len()).map_err(|_| {
                 ScribeError::Internal {
                     detail: "replayed WAL payload exceeds its u32 record bound".to_owned(),
@@ -944,7 +944,7 @@ struct CommittedBatchIdentity {
     /// managed correlation columns, so a second honest attempt at the same
     /// batch legitimately carries a different WAL digest. Only the logical
     /// identity can answer whether two terminal records closed the same rows.
-    logical_digest: [u8; 32],
+    logical_digest: crate::scribe::wal::ContentDigest,
 }
 
 /// Fixed-layout lookup entry retained for exact retry validation during replay.
@@ -964,7 +964,7 @@ impl CommittedBatchIdentity {
     /// Never panics; `logical_digest` is supplied by the caller after decoding
     /// the terminal record's [`WalCommitIdentity`].
     #[must_use]
-    fn from_commit(record: &WalRecord, logical_digest: [u8; 32]) -> Self {
+    fn from_commit(record: &WalRecord, logical_digest: crate::scribe::wal::ContentDigest) -> Self {
         Self {
             tenant_id: record.tenant_id,
             slice_count: record.slice_count,
@@ -987,7 +987,7 @@ impl CommittedBatchIdentity {
 
     /// Returns whether a duplicate COMMIT closed this batch's same logical rows.
     #[must_use]
-    fn matches_rows(&self, logical_digest: &[u8; 32]) -> bool {
+    fn matches_rows(&self, logical_digest: &crate::scribe::wal::ContentDigest) -> bool {
         self.logical_digest == *logical_digest
     }
 }
@@ -1047,11 +1047,13 @@ struct PendingSlice {
 /// Computes the v8 COMMIT `wal_digest` over one ordered slice set.
 ///
 /// The write path and replay both bind the ordinal, exact payload length, and
-/// SHA-256 payload digest, so a reordered or substituted slice cannot be
+/// XXH3-128 payload digest, so a reordered or substituted slice cannot be
 /// authorized by a valid terminal record.
 #[must_use]
-fn slice_set_digest<'a>(slices: impl Iterator<Item = &'a PendingSlice>) -> [u8; 32] {
-    let mut digest = Sha256::new();
+fn slice_set_digest<'a>(
+    slices: impl Iterator<Item = &'a PendingSlice>,
+) -> crate::scribe::wal::ContentDigest {
+    let mut digest = ContentHasher::new();
     for slice in slices {
         digest.update(slice.record.slice_index.to_le_bytes());
         digest.update(
@@ -1059,9 +1061,9 @@ fn slice_set_digest<'a>(slices: impl Iterator<Item = &'a PendingSlice>) -> [u8; 
                 .expect("invariant: decoded WAL payload length is bounded by its u32 header")
                 .to_le_bytes(),
         );
-        digest.update(Sha256::digest(&slice.record.payload));
+        digest.update(ContentHasher::digest(&slice.record.payload));
     }
-    digest.finalize().into()
+    digest.finish()
 }
 
 /// Reconstructs the durable SQL-fence identity from a validated pending batch.
@@ -1073,7 +1075,7 @@ fn slice_set_digest<'a>(slices: impl Iterator<Item = &'a PendingSlice>) -> [u8; 
 fn replayed_commit_identity(
     segment_path: &Path,
     pending: &PendingBatch,
-    slice_set_digest: [u8; 32],
+    slice_set_digest: crate::scribe::wal::ContentDigest,
     commit: &WalRecord,
 ) -> Result<ReplayedCommitIdentity, ScribeError> {
     let first = pending
@@ -1997,7 +1999,7 @@ mod tests {
         let seal_key = replay_key(tenant_id);
         let batch_id = [44_u8; 16];
         let mut touched = Vec::new();
-        let mut slice_set_digest = Sha256::new();
+        let mut slice_set_digest = ContentHasher::new();
         for (slice_index, data) in [b"first".as_slice(), b"second".as_slice()]
             .into_iter()
             .enumerate()
@@ -2017,7 +2019,7 @@ mod tests {
             *seal_key.tenant.as_uuid().as_bytes(),
             2,
             WalCommitIdentity {
-                wal_digest: slice_set_digest.finalize().into(),
+                wal_digest: slice_set_digest.finish(),
                 logical_digest: fixture_logical_digest(&[
                     (0, [7_u8; 32], b"first"),
                     (1, [7_u8; 32], b"second"),
@@ -2073,12 +2075,12 @@ mod tests {
                     .for_slice(seal_key.clone(), [3; 32]);
             append.shard_id = Some(shard_id);
             let result = wal.append_prepared(append).expect("writer slice");
-            let mut digest = Sha256::new();
+            let mut digest = ContentHasher::new();
             digest.update(0_u32.to_le_bytes());
             digest.update(result.payload_len.to_le_bytes());
             digest.update(result.payload_digest);
             digests.push(WalCommitIdentity {
-                wal_digest: digest.finalize().into(),
+                wal_digest: digest.finish(),
                 logical_digest: fixture_logical_digest(&[(0, [3_u8; 32], &payload)]),
                 request_id: *uuid::Uuid::now_v7().as_bytes(),
             });
@@ -2146,7 +2148,7 @@ mod tests {
         let payload = vec![9_u8; 6 * 1024];
         let mut touched = Vec::new();
         let mut logical = Vec::new();
-        let mut wal_digest = Sha256::new();
+        let mut wal_digest = ContentHasher::new();
         for slice_index in 0_u32..3 {
             let mut append =
                 PreparedWalAppend::new(WalLsn::ZERO, batch_id, Bytes::copy_from_slice(&payload))
@@ -2164,7 +2166,7 @@ mod tests {
             *tenant.as_uuid().as_bytes(),
             3,
             WalCommitIdentity {
-                wal_digest: wal_digest.finalize().into(),
+                wal_digest: wal_digest.finish(),
                 logical_digest: fixture_logical_digest(&logical),
                 request_id: *uuid::Uuid::now_v7().as_bytes(),
             },
@@ -2211,13 +2213,15 @@ mod tests {
     /// fixture that writes opaque payloads binds them the way the production
     /// preprocessor binds Arrow rows: one ordinal-scoped entry per slice over a
     /// digest and length of that slice's data.
-    fn fixture_logical_digest(slices: &[(u32, [u8; 32], &[u8])]) -> [u8; 32] {
+    fn fixture_logical_digest(
+        slices: &[(u32, [u8; 32], &[u8])],
+    ) -> crate::scribe::wal::ContentDigest {
         let mut logical = crate::scribe::preprocess::LogicalBatchDigest::new();
         for (slice_index, schema_fingerprint, data) in slices {
             logical.push_slice(
                 *slice_index,
                 schema_fingerprint,
-                &Sha256::digest(data).into(),
+                &ContentHasher::digest(data),
                 u32::try_from(data.len()).expect("fixture payload fits u32"),
             );
         }
@@ -2374,7 +2378,7 @@ mod tests {
         assert_eq!(meta.rows_accepted, 2);
 
         assert_ne!(
-            commit.slice_set_digest, [0_u8; 32],
+            commit.slice_set_digest, [0_u8; 16],
             "the fence authenticates its one recovered slice"
         );
         assert_eq!(
@@ -2395,7 +2399,8 @@ mod tests {
     ///
     /// The fixture under `fixtures/tagged-spans-wal` was written by the
     /// pre-change Scribe: one two-span `traces.spans` batch whose Arrow schema
-    /// carries `wyrd:sensitive` on every field. Replay must keep that schema as
+    /// carries `wyrd:sensitive` on every field. Its slice bytes are original;
+    /// its COMMIT record was re-encoded when digests became XXH3-128. Replay must keep that schema as
     /// inert metadata, restore the original batch and request identity, accept
     /// the fence because its digest still authenticates the recovered slice,
     /// and leave the WAL bytes untouched.

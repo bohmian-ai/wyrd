@@ -2064,7 +2064,7 @@ pub(crate) async fn invisible_receipt(server: &WyrdTestServer, table: &str, batc
          (data_tenant_id, logical_table_fqn, batch_id, slice_set_digest, slice_count, \
           wal_node_id, wal_writer_epoch, wal_shard_id, wal_segment_sequence, wal_lsn_min, \
           wal_lsn_max, request_id, ingested_at, table_version) \
-         VALUES ($1, $2, $3, decode(repeat('00', 32), 'hex'), 1, gen_random_uuid(), 1, 0, \
+         VALUES ($1, $2, $3, decode(repeat('00', 16), 'hex'), 1, gen_random_uuid(), 1, 0, \
                  0, 0, 0, gen_random_uuid(), statement_timestamp(), 1)",
     )
     .bind(server.data_tenant_id().as_uuid())

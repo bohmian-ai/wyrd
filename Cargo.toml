@@ -154,6 +154,7 @@ zip = { version = "8.6", default-features = false, features = ["deflate-flate2"]
 zstd = "0.13"
 walkdir = "2.*"
 sha2 = "0.10"
+twox-hash = { version = "2.1", default-features = false, features = ["std", "xxhash3_128"] }
 # Git blob ids in code-review pipeline fixtures.
 sha1 = "0.10"
 uuid = { version = "1", default-features = false, features = ["serde"] }

@@ -714,6 +714,62 @@ async fn contradictory_batch_retry_is_rejected_before_second_wal_append() {
     assert_eq!(state.commits.len(), 1);
 }
 
+#[tokio::test]
+/// A content-derived (UUIDv8) batch ID is its rows' identity, so a reuse is
+/// recognised as a retry by ID alone, and live and replayed slices agree on
+/// the empty logical identity that makes that so; a client ID keeps it.
+async fn content_derived_retry_is_recognised_by_id_alone_live_and_replayed() {
+    let wal_root = tempfile::tempdir().expect("WAL directory");
+    let node = NodeId::new(Uuid::now_v7());
+    let (wal, scribe) = scribe(&wal_root, node);
+    let tenant = DataTenantId::new_v7();
+    let derived = uuid::Builder::from_custom_bytes([0x5a; 16]).into_uuid();
+    let client = Uuid::now_v7();
+
+    ingest_value(&scribe, tenant, "derived_retry", derived, 7)
+        .await
+        .expect("first append");
+    ingest_value(&scribe, tenant, "derived_retry", client, 7)
+        .await
+        .expect("client append");
+    let wal_bytes_before = crate::scribe::wal::wal_file_bytes_for_test(wal.base_dir());
+    ingest_value(&scribe, tenant, "derived_retry", derived, 8)
+        .await
+        .expect("a derived ID is recognised by ID alone");
+    assert_eq!(
+        crate::scribe::wal::wal_file_bytes_for_test(wal.base_dir()),
+        wal_bytes_before,
+        "the recognised retry appends nothing"
+    );
+    assert_eq!(scribe.memtable_stats().expect("stats").writable_rows, 2);
+    assert_ingress_owners_settled(&scribe);
+    scribe
+        .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
+        .await;
+
+    let replayed = replay_wal_directory(wal_root.path()).expect("replay");
+    let state = replayed
+        .values()
+        .find(|state| state.seal_key.table.name == "derived_retry")
+        .expect("both appends are durable");
+    let frozen = crate::scribe::memtable::Memtable::decode_replayed(state).expect("decode");
+    let meta = |batch_id: Uuid| {
+        frozen
+            .metas
+            .iter()
+            .find(|meta| meta.batch_id == *batch_id.as_bytes())
+            .expect("replayed meta")
+    };
+    assert_eq!(
+        (meta(derived).data_digest, meta(derived).data_len),
+        ([0; 16], 0)
+    );
+    assert!(
+        meta(client).data_digest != [0; 16] && meta(client).data_len > 0,
+        "a client ID keeps its rows' logical identity for conflict checks"
+    );
+}
+
 #[test]
 /// Multi-segment replay preserves order while deduplicating stable batches.
 fn multi_segment_replay_preserves_order_and_deduplicates() {

@@ -254,7 +254,8 @@ digest alike, is XXH3-128: these detect accidental mismatch within one tenant's
 own table, never adversarial collision, and CRC32C still frames each WAL
 record. An OTLP request carries no batch ID, so Gate derives it from the
 XXH3-128 logical identity of the accepted user columns and authenticated
-context; for these derived IDs the ID is the content, so a retry is recognised
+context and marks it UUIDv8, which no client may supply (client batch IDs are
+UUIDv7); for these derived IDs the ID is the content, so a retry is recognised
 by ID alone and Scribe computes no separate slice identity for it.
 Resolve accepted retries under the fence's original `table_version`, even
 when current partitioning or schema would prepare different slices or reject

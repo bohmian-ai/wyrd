@@ -122,7 +122,7 @@ mod pg_tests {
             logical_table_fqn: table.to_owned(),
             batch_id,
             table_version: wyrd_spec::vala::ids::TableVersion::INITIAL,
-            slice_set_digest: [u8::try_from(lsn % 251).expect("digest byte"); 32],
+            slice_set_digest: [u8::try_from(lsn % 251).expect("digest byte"); 16],
             slice_count: 1,
             wal_node_id: Uuid::now_v7(),
             wal_writer_epoch: 1,
@@ -267,7 +267,7 @@ mod pg_tests {
 
         let fresh = fence(tenant, "bifrost.a", Uuid::now_v7(), 20);
         let conflicting = ScribeBatchCommit {
-            slice_set_digest: [0xEE; 32],
+            slice_set_digest: [0xEE; 16],
             ..accepted
         };
         let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
@@ -337,7 +337,7 @@ mod pg_tests {
         let next = wyrd_spec::vala::ids::TableVersion::new(2).expect("positive version");
         let changed = ScribeBatchCommit {
             table_version: next,
-            slice_set_digest: [0xEE; 32],
+            slice_set_digest: [0xEE; 16],
             wal_lsn_min: 90,
             wal_lsn_max: 91,
             request_id: Uuid::now_v7(),

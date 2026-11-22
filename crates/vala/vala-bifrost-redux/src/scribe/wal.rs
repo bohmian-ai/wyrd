@@ -29,7 +29,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use bytes::Bytes;
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use wyrd_spec::ids::DataTenantId;
 
@@ -163,6 +162,47 @@ const RECORD_HEADER_SIZE: usize = 72;
 const RECORD_HEADER_SIZE_U16: u16 = 72;
 /// Exact v8 record magic.
 const RECORD_MAGIC: [u8; 8] = *b"WYRDWAL8";
+/// Byte width of every Scribe content digest.
+pub(crate) const DIGEST_BYTES: usize = 16;
+
+/// An XXH3-128 content digest: a logical batch or slice identity, or a WAL
+/// payload digest.
+///
+/// These digests detect accidental mismatch inside one tenant's own table,
+/// never adversarial collision; CRC32C still frames every WAL record.
+pub(crate) type ContentDigest = [u8; DIGEST_BYTES];
+
+/// Streaming XXH3-128 over the parts of one digested value, in order.
+///
+/// It is the one place Scribe fixes its digest algorithm and byte order, so
+/// the live path, the COMMIT binding, and replay cannot disagree.
+pub(crate) struct ContentHasher(twox_hash::XxHash3_128);
+
+impl ContentHasher {
+    /// Starts an empty digest.
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self(twox_hash::XxHash3_128::new())
+    }
+
+    /// Folds `bytes` in after everything already written.
+    pub(crate) fn update(&mut self, bytes: impl AsRef<[u8]>) {
+        self.0.write(bytes.as_ref());
+    }
+
+    /// Returns the digest of everything written, little-endian.
+    #[must_use]
+    pub(crate) fn finish(&self) -> ContentDigest {
+        self.0.finish_128().to_le_bytes()
+    }
+
+    /// Digests one contiguous value.
+    #[must_use]
+    pub(crate) fn digest(bytes: impl AsRef<[u8]>) -> ContentDigest {
+        twox_hash::XxHash3_128::oneshot(bytes.as_ref()).to_le_bytes()
+    }
+}
+
 /// Exact magic prefixing every v8 COMMIT payload.
 const COMMIT_PAYLOAD_MAGIC: [u8; 4] = *b"S7CM";
 /// Exact encoded width of a v8 COMMIT payload.
@@ -171,7 +211,7 @@ const COMMIT_PAYLOAD_MAGIC: [u8; 4] = *b"S7CM";
 /// identity. A COMMIT record whose declared payload is any other length is
 /// refused rather than interpreted, so a record written by a different format
 /// can never be read as a truncated or extended identity.
-const COMMIT_PAYLOAD_BYTES: usize = COMMIT_PAYLOAD_MAGIC.len() + 32 + 32 + 16;
+const COMMIT_PAYLOAD_BYTES: usize = COMMIT_PAYLOAD_MAGIC.len() + 2 * DIGEST_BYTES + 16;
 
 /// Complete batch identity carried by one terminal v8 COMMIT record.
 ///
@@ -195,10 +235,10 @@ const COMMIT_PAYLOAD_BYTES: usize = COMMIT_PAYLOAD_MAGIC.len() + 32 + 32 + 16;
 /// verbatim without consulting any other durable state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WalCommitIdentity {
-    /// SHA-256 over this attempt's ordered slice frames.
-    pub wal_digest: [u8; 32],
-    /// SHA-256 over the batch's attempt-independent logical row identity.
-    pub logical_digest: [u8; 32],
+    /// XXH3-128 over this attempt's ordered slice frames.
+    pub wal_digest: ContentDigest,
+    /// XXH3-128 over the batch's attempt-independent logical row identity.
+    pub logical_digest: ContentDigest,
     /// Request correlation recorded by the durable batch-commit fence.
     pub request_id: [u8; 16],
 }
@@ -209,9 +249,11 @@ impl WalCommitIdentity {
     pub fn encode(&self) -> [u8; COMMIT_PAYLOAD_BYTES] {
         let mut encoded = [0_u8; COMMIT_PAYLOAD_BYTES];
         encoded[0..4].copy_from_slice(&COMMIT_PAYLOAD_MAGIC);
-        encoded[4..36].copy_from_slice(&self.wal_digest);
-        encoded[36..68].copy_from_slice(&self.logical_digest);
-        encoded[68..84].copy_from_slice(&self.request_id);
+        let logical = 4 + DIGEST_BYTES;
+        let request = logical + DIGEST_BYTES;
+        encoded[4..logical].copy_from_slice(&self.wal_digest);
+        encoded[logical..request].copy_from_slice(&self.logical_digest);
+        encoded[request..].copy_from_slice(&self.request_id);
         encoded
     }
 
@@ -235,12 +277,14 @@ impl WalCommitIdentity {
                 detail: "WAL v8 COMMIT payload magic mismatch".to_owned(),
             });
         }
-        let mut wal_digest = [0_u8; 32];
-        wal_digest.copy_from_slice(&payload[4..36]);
-        let mut logical_digest = [0_u8; 32];
-        logical_digest.copy_from_slice(&payload[36..68]);
+        let logical = 4 + DIGEST_BYTES;
+        let request = logical + DIGEST_BYTES;
+        let mut wal_digest = [0_u8; DIGEST_BYTES];
+        wal_digest.copy_from_slice(&payload[4..logical]);
+        let mut logical_digest = [0_u8; DIGEST_BYTES];
+        logical_digest.copy_from_slice(&payload[logical..request]);
         let mut request_id = [0_u8; 16];
-        request_id.copy_from_slice(&payload[68..84]);
+        request_id.copy_from_slice(&payload[request..]);
         Ok(Self {
             wal_digest,
             logical_digest,
@@ -478,7 +522,7 @@ pub(crate) struct PreparedWalAppend {
     pub(crate) seal_key: Option<SealKey>,
     pub(crate) schema_fingerprint: [u8; 32],
     /// Stable logical Arrow digest excluding volatile managed correlation columns.
-    pub(crate) logical_data_digest: [u8; 32],
+    pub(crate) logical_data_digest: ContentDigest,
     /// Stable logical Arrow buffer length covered by `logical_data_digest`.
     pub(crate) logical_data_len: u32,
     pub(crate) shard_id: Option<u8>,
@@ -500,7 +544,7 @@ pub(crate) struct WalAppendResult {
     pub(crate) encoded_bytes: u64,
     pub(crate) touched_segments: Vec<Arc<WalSegment>>,
     /// Digest of the exact payload protected by this record's CRC.
-    pub(crate) payload_digest: [u8; 32],
+    pub(crate) payload_digest: ContentDigest,
     /// Exact payload length represented by the digest.
     pub(crate) payload_len: u32,
 }
@@ -515,7 +559,7 @@ impl PreparedWalAppend {
             data,
             seal_key: None,
             schema_fingerprint: [0; 32],
-            logical_data_digest: [0; 32],
+            logical_data_digest: [0; DIGEST_BYTES],
             logical_data_len: 0,
             shard_id: None,
             slice_index: 0,
@@ -542,7 +586,7 @@ impl PreparedWalAppend {
             data: Bytes::new(),
             seal_key: None,
             schema_fingerprint: [0; 32],
-            logical_data_digest: [0; 32],
+            logical_data_digest: [0; DIGEST_BYTES],
             logical_data_len: 0,
             shard_id: None,
             slice_index: slice_count,
@@ -559,7 +603,7 @@ impl PreparedWalAppend {
     }
 
     /// Attaches the stable logical Arrow identity computed before WAL append.
-    pub(crate) fn with_logical_data_identity(mut self, digest: [u8; 32], len: u32) -> Self {
+    pub(crate) fn with_logical_data_identity(mut self, digest: ContentDigest, len: u32) -> Self {
         self.logical_data_digest = digest;
         self.logical_data_len = len;
         self
@@ -747,7 +791,7 @@ fn append_prepared_borrowed(
     prepared: &PreparedWalAppend,
     encoded_len: usize,
     offset: u64,
-) -> Result<([u8; 32], u32), ScribeError> {
+) -> Result<(ContentDigest, u32), ScribeError> {
     let payload_len =
         u32::try_from(prepared.payload_len()?).map_err(|_| ScribeError::Internal {
             detail: "WAL v8 payload exceeds its u32 record bound".to_owned(),
@@ -780,15 +824,15 @@ fn append_prepared_borrowed(
         payload_len,
     );
     header[68..72].copy_from_slice(&segment.header.record_tag().to_le_bytes());
-    let write_parts = |parts: &[&[u8]]| -> Result<[u8; 32], ScribeError> {
-        let mut digest = Sha256::new();
+    let write_parts = |parts: &[&[u8]]| -> Result<ContentDigest, ScribeError> {
+        let mut digest = ContentHasher::new();
         let mut crc = crc32c::crc32c(&header);
         for part in parts {
             digest.update(part);
             crc = crc32c::crc32c_append(crc, part);
         }
         segment.append_borrowed(&header, parts, crc.to_le_bytes(), encoded_len, offset)?;
-        Ok(digest.finalize().into())
+        Ok(digest.finish())
     };
     let payload_digest = if let Some(identity) = prepared.commit_identity.as_ref() {
         write_parts(&[identity.encode().as_slice()])?
@@ -2501,7 +2545,7 @@ impl WalWriter {
                 detail: "test WAL payload exceeds its u32 logical length bound".to_owned(),
             })?;
         prepared = prepared
-            .with_logical_data_identity(Sha256::digest(data_payload).into(), logical_data_len);
+            .with_logical_data_identity(ContentHasher::digest(data_payload), logical_data_len);
         prepared.shard_id = Some(
             u8::try_from(crate::scribe::routing::shard_for(
                 seal_key.tenant,
@@ -2521,7 +2565,7 @@ impl WalWriter {
         );
         let logical_digest = logical.finish();
         let slice = self.append_prepared(prepared)?;
-        let mut digest = Sha256::new();
+        let mut digest = ContentHasher::new();
         digest.update(0_u32.to_le_bytes());
         digest.update(slice.payload_len.to_le_bytes());
         digest.update(slice.payload_digest);
@@ -2530,7 +2574,7 @@ impl WalWriter {
             *seal_key.tenant.as_uuid().as_bytes(),
             1,
             WalCommitIdentity {
-                wal_digest: digest.finalize().into(),
+                wal_digest: digest.finish(),
                 logical_digest,
                 request_id: *uuid::Uuid::now_v7().as_bytes(),
             },
@@ -4051,12 +4095,12 @@ pub struct ScribeAppendMeta {
     pub batch_id: [u8; 16],
     /// Stable Arrow schema identity for logical retry comparison.
     pub schema_fingerprint: [u8; 32],
-    /// SHA-256 digest of canonical Arrow data, excluding managed correlation columns.
-    pub data_digest: [u8; 32],
+    /// XXH3-128 digest of canonical Arrow data, excluding managed correlation columns.
+    pub data_digest: ContentDigest,
     /// Canonical Arrow data length, excluding managed correlation columns.
     pub data_len: u32,
-    /// SHA-256 digest of the exact WAL-v8 slice payload.
-    pub payload_digest: [u8; 32],
+    /// XXH3-128 digest of the exact WAL-v8 slice payload.
+    pub payload_digest: ContentDigest,
     /// Exact WAL-v8 slice payload length.
     pub payload_len: u32,
     /// Zero-based ordinal in the committed batch slice set.
@@ -4080,8 +4124,8 @@ pub(crate) struct ScribeAppendPayloadIdentity {
     pub(crate) batch_id: [u8; 16],
     /// Stable Arrow schema identity.
     pub(crate) schema_fingerprint: [u8; 32],
-    /// SHA-256 digest of canonical Arrow data.
-    pub(crate) data_digest: [u8; 32],
+    /// XXH3-128 digest of canonical Arrow data.
+    pub(crate) data_digest: ContentDigest,
     /// Canonical Arrow data length.
     pub(crate) data_len: u32,
     /// Zero-based ordinal in the committed batch slice set.
@@ -4253,6 +4297,59 @@ mod tests {
         let error = write_all_vectored(&mut writer, &mut slices).expect_err("failure");
         assert_eq!(error.to_string(), "disk gone");
         assert_eq!(writer.calls, 1);
+    }
+
+    /// A CRC-valid slice whose payload was substituted fails its COMMIT binding.
+    ///
+    /// The slice frame is rewritten with different bytes of the same length
+    /// and a recomputed CRC32C, so only the COMMIT's XXH3-128 payload binding
+    /// can tell it from the slice the commit closed.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot be written or replay accepts the slice.
+    #[test]
+    fn a_crc_valid_substituted_slice_fails_its_commit_binding() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let wal =
+            WalWriter::new(temp_dir.path(), [7; 16], 1, WalConfig::default()).expect("writer");
+        let seal_key = test_seal_key(DataTenantId::new_v7());
+        wal.append_and_commit_for_replay_test(&seal_key, [42; 16], b"original")
+            .expect("append");
+        wal.sync_data_for_test(&seal_key).expect("sync");
+        drop(wal);
+
+        let mut segments = Vec::new();
+        collect_segment_paths(temp_dir.path(), &mut segments).expect("segments");
+        let [segment] = segments.as_slice() else {
+            panic!("one segment, found {segments:?}");
+        };
+        let mut bytes = std::fs::read(segment).expect("segment bytes");
+        let header = 64;
+        let payload_len = usize::try_from(u32::from_le_bytes(
+            bytes[header + 64..header + 68]
+                .try_into()
+                .expect("length field"),
+        ))
+        .expect("length");
+        let payload = header + 72..header + 72 + payload_len;
+        let original_end = payload.end - b"original".len();
+        bytes[original_end..payload.end].copy_from_slice(b"replaced");
+        let crc = crc32c::crc32c_append(
+            crc32c::crc32c(&bytes[header..header + 72]),
+            &bytes[payload.clone()],
+        );
+        bytes[payload.end..payload.end + 4].copy_from_slice(&crc.to_le_bytes());
+        std::fs::write(segment, bytes).expect("rewrite segment");
+
+        let error = crate::scribe::replay::replay_wal_directory(temp_dir.path())
+            .expect_err("substituted slice");
+        assert!(
+            error
+                .to_string()
+                .contains("COMMIT digest does not match its slice set"),
+            "{error}"
+        );
     }
 
     fn test_seal_key(tenant: DataTenantId) -> SealKey {
@@ -4562,8 +4659,8 @@ mod tests {
     #[test]
     fn wal_commit_record_uses_the_terminal_slice_identity() {
         let identity = WalCommitIdentity {
-            wal_digest: [9; 32],
-            logical_digest: [11; 32],
+            wal_digest: [9; 16],
+            logical_digest: [11; 16],
             request_id: [13; 16],
         };
         let record = WalRecord::commit(WalLsn::new(9), [7; 16], [8; 16], 3, identity);
@@ -4593,8 +4690,8 @@ mod tests {
     #[test]
     fn wal_commit_identity_rejects_a_foreign_payload() {
         let identity = WalCommitIdentity {
-            wal_digest: [1; 32],
-            logical_digest: [2; 32],
+            wal_digest: [1; 16],
+            logical_digest: [2; 16],
             request_id: [3; 16],
         };
         let encoded = identity.encode();

@@ -1,11 +1,11 @@
 //! Blocking preprocessing for admitted appends.
 
+use crate::scribe::wal::{ContentDigest, ContentHasher};
 use arrow::array::{Array, ArrayData};
 use arrow::buffer::Buffer;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use iceberg::spec::Schema;
-use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::oneshot;
@@ -182,7 +182,7 @@ impl PreparedAppend {
     /// an honest retry reproduces the digest its first attempt fenced.
     /// Returns `None` when the set is not exactly the ordinals `0..count` or a
     /// count does not fit its field.
-    pub(crate) fn logical_identity(&self) -> Option<([u8; 32], u32, u64)> {
+    pub(crate) fn logical_identity(&self) -> Option<(ContentDigest, u32, u64)> {
         let PreparedSliceSet::Materialized(slices) = &self.slices;
         let mut ordered: Vec<&PreparedSlice> = slices.iter().collect();
         ordered.sort_unstable_by_key(|slice| slice.id.slice_index);
@@ -458,7 +458,7 @@ pub(crate) struct PreparedSlice {
 /// overflows its `usize` accumulator.
 fn digest_array_data(
     data: &ArrayData,
-    digest: &mut Sha256,
+    digest: &mut ContentHasher,
     bytes: &mut usize,
 ) -> Result<(), ScribeError> {
     digest.update(data.len().to_le_bytes());
@@ -498,6 +498,17 @@ fn is_volatile_column(name: &str) -> bool {
         && !crate::tables::managed_columns::is_correlation_column(name)
 }
 
+/// Reports whether `batch_id` was derived from its rows' content.
+///
+/// Gate derives each OTLP batch id from the XXH3-128 logical identity of the
+/// accepted rows and marks it UUID version 8; client ids must be version 7.
+/// Such an id is the content, so its slices carry an empty logical identity
+/// (zero digest and length) on the live path and in replay alike, and a retry
+/// is recognised by id alone.
+pub(crate) fn is_content_derived(batch_id: Uuid) -> bool {
+    batch_id.get_version() == Some(uuid::Version::Custom)
+}
+
 /// Computes the stable logical Arrow identity used only for retained retries.
 ///
 /// Server-generated request and time columns change across a legitimate client
@@ -511,8 +522,10 @@ fn is_volatile_column(name: &str) -> bool {
 ///
 /// Returns an internal error when the stable buffer length exceeds its WAL-v8
 /// metadata representation.
-pub(crate) fn logical_data_identity(rows: &RecordBatch) -> Result<([u8; 32], u32), ScribeError> {
-    let mut digest = Sha256::new();
+pub(crate) fn logical_data_identity(
+    rows: &RecordBatch,
+) -> Result<(ContentDigest, u32), ScribeError> {
+    let mut digest = ContentHasher::new();
     let mut bytes = 0_usize;
     for (field, column) in rows.schema().fields().iter().zip(rows.columns()) {
         // The request and time columns describe *which* attempt carried the
@@ -528,12 +541,12 @@ pub(crate) fn logical_data_identity(rows: &RecordBatch) -> Result<([u8; 32], u32
         let before = bytes;
         digest_array_data(&column.to_data(), &mut digest, &mut bytes)?;
         if tracing::enabled!(tracing::Level::DEBUG) {
-            let mut column_digest = Sha256::new();
+            let mut column_digest = ContentHasher::new();
             let mut column_bytes = 0_usize;
             digest_array_data(&column.to_data(), &mut column_digest, &mut column_bytes)?;
             tracing::debug!(
                 column = field.name().as_str(),
-                digest = %hex_digest(&column_digest.finalize().into()),
+                digest = %hex_digest(&column_digest.finish()),
                 bytes = bytes.saturating_sub(before),
                 "logical batch identity column contribution"
             );
@@ -542,7 +555,7 @@ pub(crate) fn logical_data_identity(rows: &RecordBatch) -> Result<([u8; 32], u32
     let bytes = u32::try_from(bytes).map_err(|_| ScribeError::Internal {
         detail: "logical Arrow identity exceeds its u32 bound".to_owned(),
     })?;
-    Ok((digest.finalize().into(), bytes))
+    Ok((digest.finish(), bytes))
 }
 
 /// Idempotency identity for one logical slice within a routed batch.
@@ -812,8 +825,11 @@ fn prepare_slice(
         batch_id = %context.batch_id,
         table = %context.table.fqn(),
     );
-    let (logical_data_digest, logical_data_len) =
-        identity_span.in_scope(|| logical_data_identity(&rows))?;
+    let (logical_data_digest, logical_data_len) = if is_content_derived(context.batch_id) {
+        (ContentDigest::default(), 0)
+    } else {
+        identity_span.in_scope(|| logical_data_identity(&rows))?
+    };
     let wal_append = PreparedWalAppend::new(
         crate::scribe::wal::WalLsn::ZERO,
         *context.batch_id.as_bytes(),
@@ -1045,7 +1061,7 @@ fn notify_completion(
 ///
 /// Only diagnostics use this: the durable identity always compares raw bytes.
 #[must_use]
-pub(crate) fn hex_digest(digest: &[u8; 32]) -> String {
+pub(crate) fn hex_digest(digest: &ContentDigest) -> String {
     use std::fmt::Write as _;
     digest
         .iter()
@@ -1076,8 +1092,8 @@ pub(crate) fn hex_digest(digest: &[u8; 32]) -> String {
 /// carries the result; replay reads that durable field rather than recomputing
 /// it, so the two paths cannot drift.
 pub(crate) struct LogicalBatchDigest {
-    /// Running SHA-256 over every slice pushed so far, in ordinal order.
-    inner: Sha256,
+    /// Running XXH3-128 over every slice pushed so far, in ordinal order.
+    inner: ContentHasher,
 }
 
 impl LogicalBatchDigest {
@@ -1085,7 +1101,7 @@ impl LogicalBatchDigest {
     #[must_use]
     pub(crate) fn new() -> Self {
         Self {
-            inner: Sha256::new(),
+            inner: ContentHasher::new(),
         }
     }
 
@@ -1097,7 +1113,7 @@ impl LogicalBatchDigest {
         &mut self,
         slice_index: u32,
         schema_fingerprint: &[u8; 32],
-        data_digest: &[u8; 32],
+        data_digest: &ContentDigest,
         data_len: u32,
     ) {
         self.inner.update(slice_index.to_le_bytes());
@@ -1108,8 +1124,8 @@ impl LogicalBatchDigest {
 
     /// Returns the canonical digest over every pushed slice.
     #[must_use]
-    pub(crate) fn finish(self) -> [u8; 32] {
-        self.inner.finalize().into()
+    pub(crate) fn finish(self) -> ContentDigest {
+        self.inner.finish()
     }
 }
 

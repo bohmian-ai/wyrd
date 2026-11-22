@@ -4,7 +4,7 @@ CREATE TABLE vala.scribe_batch_commits (
     data_tenant_id uuid NOT NULL REFERENCES platform.tenants(data_tenant_id),
     logical_table_fqn text NOT NULL,
     batch_id uuid NOT NULL,
-    slice_set_digest bytea NOT NULL CHECK (octet_length(slice_set_digest) = 32),
+    slice_set_digest bytea NOT NULL CHECK (octet_length(slice_set_digest) = 16),
     slice_count integer NOT NULL CHECK (slice_count > 0),
     wal_node_id uuid NOT NULL,
     wal_writer_epoch bigint NOT NULL,

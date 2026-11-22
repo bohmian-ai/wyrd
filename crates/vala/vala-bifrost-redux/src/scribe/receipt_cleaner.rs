@@ -344,7 +344,7 @@ mod pg_tests {
             logical_table_fqn: "bifrost.cleaner".to_owned(),
             batch_id: Uuid::now_v7(),
             table_version: wyrd_spec::vala::ids::TableVersion::INITIAL,
-            slice_set_digest: [1; 32],
+            slice_set_digest: [1; 16],
             slice_count: 1,
             wal_node_id: node.as_uuid(),
             wal_writer_epoch: epoch,
@@ -472,7 +472,7 @@ mod pg_tests {
         let mirrored = crate::scribe::committed_batches::CommittedBatch {
             table_fqn: "bifrost.cleaner".to_owned(),
             table_version: wyrd_spec::vala::ids::TableVersion::INITIAL,
-            logical_digest: [1; 32],
+            logical_digest: [1; 16],
             slice_count: 1,
         };
         committed.record(tenant_a, a_covered[0].batch_id, mirrored.clone());

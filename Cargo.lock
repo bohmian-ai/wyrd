@@ -9472,6 +9472,7 @@ dependencies = [
  "tokio-util",
  "tower",
  "tracing",
+ "twox-hash",
  "typetag",
  "ulid",
  "url",

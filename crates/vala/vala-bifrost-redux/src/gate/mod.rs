@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use crate::scribe::wal::ContentHasher;
 use arrow::record_batch::RecordBatch;
-use sha2::{Digest as _, Sha256};
 use tracing::Instrument;
 use uuid::Uuid;
 use wyrd_auth_verify::VerifiedToken;
@@ -137,7 +137,7 @@ fn record_write_rejection(error: &IngestError) {
 ///
 /// OTLP is at-least-once and carries no request idempotency key, so a retried
 /// export must be recognized by what it accepted rather than by transport
-/// metadata. The identity is the SHA-256 of a domain separator, the
+/// metadata. The identity is the XXH3-128 of a domain separator, the
 /// authenticated tenant, the verified publisher's subject and current actor
 /// (the pair Scribe stamps on the rows), the logical table FQN,
 /// the accepted `context` — workload root and deployment environment — that
@@ -152,25 +152,22 @@ fn record_write_rejection(error: &IngestError) {
 /// publisher's attribution. Scoping by tenant and
 /// table keeps identity from correlating across either boundary.
 ///
-/// The first sixteen digest bytes are stamped with the RFC 4122 variant and
-/// UUID version 7 so the value satisfies the same `wyrd_batch_id` contract the
-/// native ingest path enforces. Scribe's WAL and Postgres commit fence then own
-/// the actual duplicate decision: a repeat returns `AlreadyCommitted` and a
-/// digest collision carrying a different durable identity stays fail-closed.
-///
-/// # Panics
-///
-/// Never panics: the sixteen-byte slice of a SHA-256 digest is infallible and
-/// its `expect` names that invariant.
+/// The XXH3-128 digest is stamped with the RFC 9562 variant and UUID version
+/// 8, the version for custom layouts: the id has no timestamp, and version 8
+/// marks it as content-derived. Native ingest accepts only version 7 client
+/// ids, so a version 8 id can only come from here, and Scribe recognises its
+/// retries by id alone ([`crate::scribe::preprocess::is_content_derived`]).
+/// Scribe's WAL and Postgres commit fence then own the duplicate decision: a
+/// repeat returns `AlreadyCommitted`.
 #[must_use]
 fn otlp_batch_id(
     tenant: DataTenantId,
     publisher: Attribution,
     context: [Option<&str>; 2],
     table: &TableRef,
-    logical_digest: &[u8; 32],
+    logical_digest: &crate::scribe::wal::ContentDigest,
 ) -> Uuid {
-    let mut digest = Sha256::new();
+    let mut digest = ContentHasher::new();
     digest.update(b"wyrd.otlp.batch-id.v1");
     digest.update(tenant.as_uuid().as_bytes());
     digest.update(publisher.sub_principal_id.as_uuid().as_bytes());
@@ -185,9 +182,8 @@ fn otlp_batch_id(
     }
     digest.update(table.fqn().as_bytes());
     digest.update(logical_digest);
-    let digest: [u8; 32] = digest.finalize().into();
-    let mut bytes: [u8; 16] = digest[..16].try_into().expect("sixteen digest bytes");
-    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    let mut bytes = digest.finish();
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     Uuid::from_bytes(bytes)
 }
@@ -3317,9 +3313,13 @@ mod otlp_batch_id_tests {
         );
         assert_eq!(
             baseline.get_version(),
-            Some(uuid::Version::SortRand),
-            "the derived identity satisfies the UUIDv7 batch contract"
+            Some(uuid::Version::Custom),
+            "the derived identity is marked UUIDv8, content-derived"
         );
+        assert!(crate::scribe::preprocess::is_content_derived(baseline));
+        assert!(!crate::scribe::preprocess::is_content_derived(
+            uuid::Uuid::now_v7()
+        ));
         for divergent in [
             id(other_tenant, principal, &spans, &[1, 2, 3], Some("run-a")),
             id(tenant, other_principal, &spans, &[1, 2, 3], Some("run-a")),

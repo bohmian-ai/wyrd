@@ -1774,7 +1774,7 @@ async fn execution_recovery_outlives_its_revision_receipts() {
           wal_node_id, wal_writer_epoch, wal_shard_id, wal_segment_sequence, wal_lsn_min, \
           wal_lsn_max, request_id, ingested_at, table_version) \
          VALUES ($1, 'bifrost.verification.execution_events', $2, \
-                 decode(repeat('00', 32), 'hex'), 1, gen_random_uuid(), 1, 0, 0, 0, 0, \
+                 decode(repeat('00', 16), 'hex'), 1, gen_random_uuid(), 1, 0, 0, 0, 0, \
                  gen_random_uuid(), statement_timestamp(), 1)",
     )
     .bind(tenant.as_uuid())

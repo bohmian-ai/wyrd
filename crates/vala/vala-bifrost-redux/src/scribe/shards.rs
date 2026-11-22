@@ -5,9 +5,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::scribe::wal::ContentHasher;
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Utc};
-use sha2::{Digest, Sha256};
 
 use tokio::runtime::Handle;
 use tokio::sync::Notify;
@@ -3168,13 +3168,13 @@ struct DurableSlice {
     /// Stable Arrow schema identity for logical retry comparison.
     schema_fingerprint: [u8; 32],
     /// Stable Arrow data digest for logical retry comparison.
-    data_digest: [u8; 32],
+    data_digest: crate::scribe::wal::ContentDigest,
     /// Stable Arrow data length for logical retry comparison.
     data_len: u32,
     /// WAL sequence number assigned to the durable append.
     lsn: crate::scribe::wal::WalLsn,
-    /// SHA-256 digest of this exact WAL slice payload.
-    payload_digest: [u8; 32],
+    /// XXH3-128 digest of this exact WAL slice payload.
+    payload_digest: crate::scribe::wal::ContentDigest,
     /// Exact WAL slice payload length.
     payload_len: u32,
     /// Zero-based ordinal in the closed batch slice set.
@@ -3192,8 +3192,8 @@ struct DurableSlice {
 struct WalSliceState {
     /// WAL sequence number that can be reused without another append.
     lsn: crate::scribe::wal::WalLsn,
-    /// SHA-256 digest of the exact durable slice payload.
-    payload_digest: [u8; 32],
+    /// XXH3-128 digest of the exact durable slice payload.
+    payload_digest: crate::scribe::wal::ContentDigest,
     /// Exact durable slice payload length.
     payload_len: u32,
     /// Stable ordinal in the committed batch slice set.
@@ -3217,13 +3217,13 @@ struct BatchCommitIdentity {
     /// This is a WAL integrity fact: it authorizes exactly the slices that were
     /// fsynced, so a substituted or reordered slice cannot be closed by a valid
     /// terminal record.
-    wal_digest: [u8; 32],
+    wal_digest: crate::scribe::wal::ContentDigest,
     /// Digest over stable logical row identity, stored in the durable SQL fence.
     ///
     /// This is a client-visible idempotency fact: it must be reproducible by an
     /// honest retry of the same batch, so it binds only the rows and their
     /// schema and never the per-attempt managed columns or WAL coordinates.
-    logical_digest: [u8; 32],
+    logical_digest: crate::scribe::wal::ContentDigest,
 }
 
 /// Most Variant conversions of one group that run on the ingress lane at once.
@@ -3550,7 +3550,12 @@ struct GroupWalState {
     /// `prepared`; recorded into the pod-wide index once the group's rows are
     /// visible. The version is captured at fence time because insertion
     /// moves the slices that carry it.
-    fenced: Vec<(usize, [u8; 32], u32, wyrd_spec::vala::ids::TableVersion)>,
+    fenced: Vec<(
+        usize,
+        crate::scribe::wal::ContentDigest,
+        u32,
+        wyrd_spec::vala::ids::TableVersion,
+    )>,
 }
 
 /// Owns one WAL/SQL-committed group until every retained batch is query-visible.
@@ -4106,7 +4111,7 @@ impl ShardOwner {
                 detail: "cannot commit an incomplete or unordered WAL slice set".to_owned(),
             });
         }
-        let mut wal_digest = Sha256::new();
+        let mut wal_digest = ContentHasher::new();
         let mut logical = crate::scribe::preprocess::LogicalBatchDigest::new();
         for slice_index in 0..slice_count {
             let slice = state
@@ -4134,7 +4139,7 @@ impl ShardOwner {
         Ok(Some(BatchCommitIdentity {
             first_index,
             slice_count,
-            wal_digest: wal_digest.finalize().into(),
+            wal_digest: wal_digest.finish(),
             logical_digest: logical.finish(),
         }))
     }
@@ -4917,7 +4922,7 @@ impl ShardOwner {
                 data_digest: wal_append.logical_data_digest,
                 data_len: wal_append.logical_data_len,
                 lsn: crate::scribe::wal::WalLsn::ZERO,
-                payload_digest: [0; 32],
+                payload_digest: [0; crate::scribe::wal::DIGEST_BYTES],
                 payload_len: 0,
                 slice_index: wal_append.slice_index,
                 slice_count: wal_append.slice_count,
@@ -7186,7 +7191,7 @@ mod tests {
         let retry = [2_u8; 16];
         let commit = |batch_id, lsn: u64| crate::scribe::replay::ReplayedCommitIdentity {
             batch_id,
-            slice_set_digest: [3; 32],
+            slice_set_digest: [3; 16],
             slice_count: 1,
             segment_sequence: 1,
             wal_lsn_min: WalLsn::new(lsn),
@@ -7196,7 +7201,7 @@ mod tests {
         };
         let meta = |batch_id, lsn| crate::scribe::replay::ReplayedAppendMeta {
             batch_id,
-            payload_digest: [0; 32],
+            payload_digest: [0; 16],
             payload_len: 0,
             slice_count: 1,
             wal_lsn: WalLsn::new(lsn),
@@ -7236,7 +7241,7 @@ mod tests {
         let key = owner_key();
         let meta = |marker, lsn| crate::scribe::replay::ReplayedAppendMeta {
             batch_id: [marker; 16],
-            payload_digest: [0; 32],
+            payload_digest: [0; 16],
             payload_len: 0,
             slice_count: 1,
             wal_lsn: WalLsn::new(lsn),
@@ -7349,7 +7354,7 @@ mod tests {
         let key = SealKey::new(tenant, table, a);
         let meta = |marker, lsn| crate::scribe::replay::ReplayedAppendMeta {
             batch_id: [marker; 16],
-            payload_digest: [0; 32],
+            payload_digest: [0; 16],
             payload_len: 0,
             slice_count: 2,
             wal_lsn: WalLsn::new(lsn),
@@ -7437,9 +7442,9 @@ mod tests {
         ScribeAppendMeta {
             batch_id: *uuid::Uuid::now_v7().as_bytes(),
             schema_fingerprint: [0; 32],
-            data_digest: [0; 32],
+            data_digest: [0; 16],
             data_len: 0,
-            payload_digest: [0; 32],
+            payload_digest: [0; 16],
             payload_len: 0,
             slice_index: 0,
             slice_count: 1,
@@ -7753,10 +7758,10 @@ mod tests {
                     active_reserved: true,
                     batch_id: next_id,
                     schema_fingerprint: [0; 32],
-                    data_digest: [0; 32],
+                    data_digest: [0; 16],
                     data_len: 0,
                     lsn: WalLsn::new(2),
-                    payload_digest: [0; 32],
+                    payload_digest: [0; 16],
                     payload_len: 0,
                     slice_index: 0,
                     slice_count: 1,
@@ -9214,7 +9219,7 @@ mod tests {
         .bind(key.tenant.as_uuid())
         .bind(key.table.fqn())
         .bind(batch_ids[2])
-        .bind([0_u8; 32].as_slice())
+        .bind([0_u8; 16].as_slice())
         .bind(node.as_uuid())
         .bind(uuid::Uuid::now_v7())
         .execute(&mut *blocker)
@@ -9341,7 +9346,7 @@ mod tests {
             .bind(key.table.fqn())
             .bind(spent)
             .bind(accepted_version.get())
-            .bind([0xEE_u8; 32].as_slice())
+            .bind([0xEE_u8; 16].as_slice())
             .bind(uuid::Uuid::now_v7())
             .bind(uuid::Uuid::now_v7())
             .execute(&superuser)

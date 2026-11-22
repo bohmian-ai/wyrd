@@ -28,7 +28,7 @@ pub struct ScribeBatchCommit {
     /// Table version the batch was accepted under; a retry is compared under
     /// this version, never the table's current one.
     pub table_version: TableVersion,
-    /// SHA-256 digest over the batch's ordered logical slice identities.
+    /// XXH3-128 digest over the batch's ordered logical slice identities.
     ///
     /// This is a client-reproducible fact: it binds slice ordinals, the Arrow
     /// schema fingerprint, and the logical row identity, and deliberately not
@@ -36,7 +36,7 @@ pub struct ScribeBatchCommit {
     /// attempt. An honest retry of the same batch therefore
     /// produces this same digest, which is what makes idempotent acknowledgement
     /// distinguishable from a genuine identity contradiction.
-    pub slice_set_digest: [u8; 32],
+    pub slice_set_digest: [u8; 16],
     /// Number of validated slices in the closed set.
     pub slice_count: i32,
     /// WAL writer node identity.
@@ -291,7 +291,7 @@ pub struct AcceptedScribeBatch {
     /// Table version the retry was prepared under.
     pub table_version: TableVersion,
     /// Ordered logical slice-set digest of the retry.
-    pub slice_set_digest: [u8; 32],
+    pub slice_set_digest: [u8; 16],
     /// Closed slice-set cardinality of the retry.
     pub slice_count: i32,
 }
@@ -811,7 +811,7 @@ mod tests {
             logical_table_fqn: "bifrost.bifrost.events".to_owned(),
             batch_id: uuid::Uuid::now_v7(),
             table_version: wyrd_spec::vala::ids::TableVersion::INITIAL,
-            slice_set_digest: [7; 32],
+            slice_set_digest: [7; 16],
             slice_count: 2,
             wal_node_id: uuid::Uuid::now_v7(),
             wal_writer_epoch: 4,

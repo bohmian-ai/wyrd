@@ -310,12 +310,55 @@ pub struct LoginMethodsQuery {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct LoginMethodsResponse {
-    /// Username/password sign-in is offered.
+    /// Returning sign-in on the tenant's page.
+    #[serde(flatten)]
+    pub sign_in: SignInMethods,
+    /// Methods that prove a verified email address.
+    #[serde(flatten)]
+    pub email: EmailMethods,
+    /// Workspace creation.
+    #[serde(flatten)]
+    pub creation: CreationMethods,
+}
+
+/// Returning sign-in methods of a [`LoginMethodsResponse`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct SignInMethods {
+    /// The tenant's username/password sign-in is usable. Never offered
+    /// without a tenant: password is not a deployment-wide login.
     pub password: bool,
-    /// The tenant's company SSO connection is offered.
+    /// The tenant's Active company SSO connection is usable.
     pub company_sso: bool,
-    /// Enabled shared providers, in display order.
+    /// Shared providers usable for returning sign-in and invitation
+    /// acceptance, in display order.
     pub providers: Vec<SocialProvider>,
-    /// A visitor may create a new workspace with one of `providers`.
+}
+
+/// Email-proving methods of a [`LoginMethodsResponse`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct EmailMethods {
+    /// A visitor may prove an email address to list the workspaces that
+    /// address is a verified contact in.
+    pub email_discovery: bool,
+    /// A tenant password User may request a reset code at their verified
+    /// contact.
+    pub password_reset: bool,
+}
+
+/// Workspace-creation methods of a [`LoginMethodsResponse`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct CreationMethods {
+    /// At least one creation method is usable now: local signup or a
+    /// provider in `signup_providers`.
     pub signup: bool,
+    /// A visitor may create a workspace by proving an email address, then
+    /// choosing a local username and password.
+    pub local_signup: bool,
+    /// Public workspace creation always proves a verified contact first.
+    pub email_verification_required: bool,
+    /// Shared providers usable to create a workspace, in display order.
+    pub signup_providers: Vec<SocialProvider>,
 }

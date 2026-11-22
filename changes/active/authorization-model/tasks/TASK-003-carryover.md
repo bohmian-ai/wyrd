@@ -279,6 +279,69 @@ its policy checks, adding only their required behavior rather than rebuilding it
 and real Postgres. RED is incomplete capability metadata/enforcement. Contract/
 export checks prove projection parity, not a substitute for refused execution.
 
+**Evidence (cycle 5):** RED: `platform_admin_e2e::methods::methods_report_exactly_the_usable_capabilities`
+first failed at `methods.rs:114` because the report had only `{password, company_sso,
+providers, signup}`. The second RED,
+`platform_admin_e2e::methods::delivered_paths_refuse_a_method_no_longer_offered`,
+failed because password login answered `200` after the operator disabled password.
+
+GREEN came after these changes:
+- `LoginMethodsResponse` now carries the spec-named fields as three
+  `#[serde(flatten)]` groups (`SignInMethods`, `EmailMethods`, `CreationMethods`),
+  so the wire stays flat. The split meets clippy's limit of three bools per
+  struct without an `#[allow]`.
+- `SocialSignIn::login_methods(Option<TenantLogin>)` and its pure
+  `available_methods` are now the one evaluator.
+- `HumanConnections::tenant_login` reads the Active connection and the new
+  `wyrd.auth_login_policies` policy. Migration `20261121000007_login_policy.sql`
+  cites revision 3, "new tenant login-policy metadata", and forces RLS under
+  `tenant_isolation` and `operator_access`.
+- The server's `available_methods` is used by `GET /auth/browser/methods` and by
+  every consumer.
+
+The first journey covers these cases:
+- defaults
+- signup switched on without SMTP or a provider: still nothing to create
+- SMTP added: local signup, discovery and reset
+- Google enabled: separate `providers` and `signup_providers`
+- signup off
+- password off
+- required SSO without an Active connection: deployment creation and discovery
+  only, with no tenant fallback
+- required SSO with an Active connection
+- the root: never password or company SSO
+
+The second journey changes settings after the page rendered. With password
+disabled, then with company SSO required, it refuses password login, invited
+enrollment, change and administrator-reset redemption. Under required SSO it
+also refuses the returning Google start (`/auth/browser/login`). Each refusal
+is `401 WYRD_AUTH_401_INVALID_TOKEN` with reason `method_unavailable`, sets no
+session cookie and leaves the `auth_users` count unchanged. Lifting the policy
+restores password login.
+
+The delivered signup start and completion recheck now route through the same
+evaluator (`SocialSignIn::require_signup_provider`). Their existing journeys
+under `platform_admin_e2e::signup::` still pass.
+
+The returning social callback recheck under required SSO joins cycle 19, which
+owns the live-credential races. The UI `LoginMethods` type mirrors the wire shape.
+
+**Limitation (open):** neither `wyrd-client` nor `wyrd-mcp` has a methods or
+settings projection, so the MCP metadata check has nothing to inspect yet. HTTP
+and OpenAPI are the only typed projections today.
+
+`an_operator_relays_invitations_through_smtp` saw 2 messages where it expected 1.
+- Diagnosis: the session's single Mailpit kept the previous run's probe
+  addressed to the same deterministic `probe-test-tenant-1@example.test`, as
+  Mailpit search showed.
+- Cause: environment reuse. `with-test-postgres.sh` starts a fresh Mailpit for
+  each invocation.
+- Result: after `DELETE /api/v1/messages` it passes.
+
+**TDD: PASS.** Commands:
+- `cargo nextest run --locked -p wyrd-server --features test-support --test integration -E 'test(/^platform_admin_e2e::methods::/)'`
+- `cargo nextest run --locked -p wyrd-auth -p wyrd-server --features wyrd-server/test-support --lib --test integration -E 'kind(lib) | test(/^platform_admin_e2e::/) | test(/^pg_browser_sessions::/) | test(/social|login|openapi/)'` (906/906)
+
 ### 6. Sealed cookies and start admission leave no pre-proof signup row
 
 **Reuses:** Cycles 1–5 final source, counters, retention and methods; existing sealed-cookie, provider and ApplicationMail owners supply proof.

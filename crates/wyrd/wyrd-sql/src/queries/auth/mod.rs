@@ -13,6 +13,7 @@ pub mod browser_sessions;
 pub mod device_authorizations;
 pub mod human_connections;
 pub mod local_passwords;
+pub mod login_policy;
 pub mod login_state;
 /// Discovery of the users and Service or Agent principals a tenant
 /// administrator can assign Roles to.

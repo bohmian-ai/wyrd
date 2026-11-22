@@ -66,11 +66,11 @@ pub use principal_kind::PrincipalKindTag;
 pub use revoke::{REASON_MAX_BYTES, RevokePrincipalRequest};
 pub use secret_bearer::SecretBearer;
 pub use social::{
-    ConfigureMailRelayRequest, ConfigureSocialProviderRequest, EnableSocialProviderRequest,
-    LoginMethodsQuery, LoginMethodsResponse, LoginSettings, MailRelayView, MailSettings,
-    MailTestRequest, MailTestResponse, SmtpTls, SocialProvider, SocialProviderState,
-    SocialProviderTestRequest, SocialProviderTestResponse, SocialProviderView,
-    SocialProvidersResponse,
+    ConfigureMailRelayRequest, ConfigureSocialProviderRequest, CreationMethods, EmailMethods,
+    EnableSocialProviderRequest, LoginMethodsQuery, LoginMethodsResponse, LoginSettings,
+    MailRelayView, MailSettings, MailTestRequest, MailTestResponse, SignInMethods, SmtpTls,
+    SocialProvider, SocialProviderState, SocialProviderTestRequest, SocialProviderTestResponse,
+    SocialProviderView, SocialProvidersResponse,
 };
 pub use tenant_admin::{
     CreateTenantRequest, CreateTenantResponse, ProvisionedTenant, ProvisionedTenantAdmin,

@@ -623,6 +623,29 @@ impl HumanConnections {
         conn.commit().await.map_err(store_error)
     }
 
+    /// What `tenant` contributes to its sign-in methods: whether it has a
+    /// usable Active company connection and whether it requires company SSO.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::AuthVerifyUnavailable`] when the store fails or
+    /// the Active connection cannot be opened.
+    pub async fn tenant_login(
+        &self,
+        tenant: DataTenantId,
+    ) -> Result<crate::social::TenantLogin, WyrdError> {
+        let company_sso = self.active_connection(tenant).await?.is_some();
+        let mut conn = self.begin(tenant).await?;
+        let requires_company_sso =
+            wyrd_sql::queries::auth::login_policy::requires_company_sso(&mut conn)
+                .await
+                .map_err(store_error)?;
+        conn.commit().await.map_err(store_error)?;
+        Ok(crate::social::TenantLogin {
+            company_sso,
+            requires_company_sso,
+        })
+    }
+
     /// Resolve the tenant's Active connection, or `None` when it has none.
     ///
     /// Read durably on every call, so every replica sees activation,

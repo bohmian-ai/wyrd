@@ -37,6 +37,7 @@ use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::ids::TenantSlug;
 use wyrd_spec::request_id::RequestId;
 
+use crate::auth::social::available_methods;
 use crate::auth::source::RequestSource;
 use crate::auth::{RequestOrigin, auth_not_configured};
 use crate::components::platform::social::social;
@@ -242,18 +243,28 @@ pub async fn login(
             sessions.begin(&request.tenant, &origin).await?,
             LOGIN_COOKIE_PATH,
         ),
-        Some(provider) => (
-            sessions
-                .begin_social(
-                    social(&state)?,
-                    &request.tenant,
-                    provider,
-                    request.invitation_code.as_ref(),
-                    &origin,
-                )
-                .await?,
-            SOCIAL_LOGIN_COOKIE_PATH,
-        ),
+        Some(provider) => {
+            if !available_methods(&state, Some(&request.tenant))
+                .await?
+                .sign_in
+                .providers
+                .contains(&provider)
+            {
+                return Err(method_unavailable(&format!("{provider} sign-in")));
+            }
+            (
+                sessions
+                    .begin_social(
+                        social(&state)?,
+                        &request.tenant,
+                        provider,
+                        request.invitation_code.as_ref(),
+                        &origin,
+                    )
+                    .await?,
+                SOCIAL_LOGIN_COOKIE_PATH,
+            )
+        }
     };
     Ok(with_cookies(
         StatusCode::OK,
@@ -619,6 +630,7 @@ pub async fn password_signup(
 ) -> Result<Response, WyrdErrorResponse> {
     let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
     require_same_origin(&headers, &origin)?;
+    require_password(&state, &request.tenant).await?;
     let sessions = browser_sessions(&state)?;
     let created = sessions
         .password_signup(request, request_id(id).as_str())
@@ -666,6 +678,7 @@ pub async fn password_login(
 ) -> Result<Response, WyrdErrorResponse> {
     let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
     require_same_origin(&headers, &origin)?;
+    require_password(&state, &request.tenant).await?;
     let sessions = browser_sessions(&state)?;
     let created = sessions
         .password_login(request, source, request_id(id).as_str())
@@ -717,6 +730,7 @@ pub async fn password_change(
 ) -> Result<Response, WyrdErrorResponse> {
     let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
     require_same_origin(&headers, &origin)?;
+    require_password(&state, &request.tenant).await?;
     let sessions = browser_sessions(&state)?;
     let tenant = request.tenant.clone();
     let cookie = session_cookies(&headers)
@@ -770,6 +784,7 @@ pub async fn password_reset(
 ) -> Result<Response, WyrdErrorResponse> {
     let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
     require_same_origin(&headers, &origin)?;
+    require_password(&state, &request.tenant).await?;
     browser_sessions(&state)?.password_reset(request).await?;
     Ok(with_cookies(StatusCode::NO_CONTENT, Vec::new(), ()))
 }
@@ -779,6 +794,32 @@ pub async fn password_reset(
 ///
 /// # Errors
 /// Returns the refusals of [`BrowserSessions::view`].
+/// Refuse unless `tenant`'s current methods report offers password sign-in.
+///
+/// # Errors
+/// Returns [`WyrdError::InvalidToken`] with reason `method_unavailable` when
+/// password is disabled or the tenant requires company SSO, and `503` when the
+/// report cannot be read.
+async fn require_password(state: &AppState, tenant: &TenantSlug) -> Result<(), WyrdErrorResponse> {
+    if available_methods(state, Some(tenant))
+        .await?
+        .sign_in
+        .password
+    {
+        Ok(())
+    } else {
+        Err(method_unavailable("password sign-in"))
+    }
+}
+
+/// The refusal of a sign-in `method` the methods report no longer offers.
+pub(crate) fn method_unavailable(method: &str) -> WyrdErrorResponse {
+    WyrdErrorResponse::from(WyrdError::InvalidToken {
+        message: format!("{method} is not available for this workspace"),
+        details: serde_json::json!({ "reason": "method_unavailable" }),
+    })
+}
+
 async fn signed_in_view(
     sessions: &BrowserSessions,
     origin: &Url,

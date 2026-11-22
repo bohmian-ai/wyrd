@@ -17,6 +17,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use secrecy::ExposeSecret as _;
 use wyrd_auth::callback::LoginCompletion;
+use wyrd_auth::social::TenantLogin;
 use wyrd_spec::auth::{
     BrowserLoginResponse, CreateTenantRequest, SignupBeginRequest, SignupCompleteRequest,
     SignupCompleteResponse,
@@ -59,11 +60,29 @@ pub async fn methods(
     State(state): State<AppState>,
     Query(query): Query<LoginMethodsQuery>,
 ) -> Result<Json<LoginMethodsResponse>, WyrdErrorResponse> {
-    let company_sso = match (&query.tenant, &state.auth.human_connections) {
+    Ok(Json(
+        available_methods(&state, query.tenant.as_ref()).await?,
+    ))
+}
+
+/// The methods Rust allows now on `tenant`'s sign-in page, or the root's;
+/// the one report every login, enrollment, reset and creation path checks
+/// before it acts. An unknown tenant reads as one without company SSO or
+/// policy, so the report reveals nothing about which tenants exist.
+///
+/// # Errors
+/// Returns `503` when the platform or tenant store is unavailable.
+pub(crate) async fn available_methods(
+    state: &AppState,
+    tenant: Option<&wyrd_spec::TenantSlug>,
+) -> Result<LoginMethodsResponse, WyrdErrorResponse> {
+    let tenant = match (tenant, &state.auth.human_connections) {
+        (None, _) => None,
+        (Some(_), None) => Some(TenantLogin::default()),
         (Some(slug), Some(connections)) => {
             match state.postgres.wyrd().resolve_tenant_slug(slug).await {
-                Ok(Some(tenant)) => connections.active_connection(tenant).await?.is_some(),
-                Ok(None) => false,
+                Ok(Some(tenant)) => Some(connections.tenant_login(tenant).await?),
+                Ok(None) => Some(TenantLogin::default()),
                 Err(error) => {
                     tracing::error!(error = %error, "tenant slug resolution failed");
                     return Err(WyrdErrorResponse::from(WyrdError::AuthVerifyUnavailable {
@@ -73,9 +92,8 @@ pub async fn methods(
                 }
             }
         }
-        _ => false,
     };
-    Ok(Json(social(&state)?.login_methods(company_sso).await?))
+    Ok(social(state)?.login_methods(tenant).await?)
 }
 
 /// Finish a sign-in the shared provider returned to its fixed callback.

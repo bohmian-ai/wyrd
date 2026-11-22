@@ -31,9 +31,10 @@ use wyrd_auth_oidc::{
 use wyrd_crypt::SealingKeyring;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
-    AbsoluteUrl, CallbackQuery, ConfigureSocialProviderRequest, EnableSocialProviderRequest,
-    IssuerUrl, LoginMethodsResponse, LoginSettings, ProviderResponse, SecretBearer, Sha256Hex,
-    SocialProvider, SocialProviderState, SocialProviderView, SocialProvidersResponse,
+    AbsoluteUrl, CallbackQuery, ConfigureSocialProviderRequest, CreationMethods, EmailMethods,
+    EnableSocialProviderRequest, IssuerUrl, LoginMethodsResponse, LoginSettings, ProviderResponse,
+    SecretBearer, Sha256Hex, SignInMethods, SocialProvider, SocialProviderState,
+    SocialProviderView, SocialProvidersResponse,
 };
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::TenantSlug;
@@ -48,7 +49,7 @@ use wyrd_sql::queries::platform::signup::{
 };
 use wyrd_sql::queries::platform::social::{
     LoginSettingsRow, ProviderEnablement, SocialProviderRow, SocialTestState,
-    insert_social_test_state, login_settings, put_login_settings, put_social_provider,
+    insert_social_test_state, login_settings, mail_relay, put_login_settings, put_social_provider,
     set_social_provider_enabled, social_provider, social_providers, stamp_social_provider_tested,
     take_social_test_state,
 };
@@ -571,32 +572,33 @@ impl SocialSignIn {
         .map_err(store_error)
     }
 
-    /// The sign-in methods Rust currently allows, given whether the tenant
-    /// offers company SSO.
+    /// The sign-in methods Rust currently allows: the deployment's settings,
+    /// enabled providers and mail relay, narrowed by `tenant` when a tenant's
+    /// sign-in page asks. Every login, enrollment, reset and creation path
+    /// refuses a method this report does not offer.
     ///
     /// # Errors
     /// Returns [`WyrdError::AuthVerifyUnavailable`] when a read fails.
     pub async fn login_methods(
         &self,
-        company_sso: bool,
+        tenant: Option<TenantLogin>,
     ) -> Result<LoginMethodsResponse, WyrdError> {
         let settings = self.settings().await?;
         let rows = social_providers(&self.operator)
             .await
             .map_err(store_error)?;
-        let providers: Vec<SocialProvider> = SocialProvider::ALL
+        let enabled: Vec<SocialProvider> = SocialProvider::ALL
             .into_iter()
             .filter(|provider| {
                 rows.iter()
                     .any(|row| row.provider == provider.as_str() && row.enabled)
             })
             .collect();
-        Ok(LoginMethodsResponse {
-            password: settings.password_enabled,
-            company_sso,
-            signup: settings.signup_enabled && !providers.is_empty(),
-            providers,
-        })
+        let mail = mail_relay(&self.operator)
+            .await
+            .map_err(store_error)?
+            .is_some();
+        Ok(available_methods(settings, enabled, mail, tenant))
     }
 }
 
@@ -891,6 +893,54 @@ struct SocialAuthorization {
     redirect_uri: Url,
 }
 
+/// What a tenant contributes to its sign-in methods.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TenantLogin {
+    /// The tenant has an Active company SSO connection.
+    pub company_sso: bool,
+    /// The tenant requires company SSO, which leaves no password or social
+    /// fallback even while its connection is unavailable.
+    pub requires_company_sso: bool,
+}
+
+/// The methods `settings`, the `enabled` providers and a configured `mail`
+/// relay make usable, for `tenant` or, without one, the deployment root.
+///
+/// Password, returning providers and reset belong to a tenant and are never
+/// offered at the root; creation and discovery are deployment-wide.
+fn available_methods(
+    settings: LoginSettings,
+    enabled: Vec<SocialProvider>,
+    mail: bool,
+    tenant: Option<TenantLogin>,
+) -> LoginMethodsResponse {
+    let open = tenant.is_some_and(|tenant| !tenant.requires_company_sso);
+    let password = open && settings.password_enabled;
+    let local_signup = settings.signup_enabled && settings.password_enabled && mail;
+    let signup_providers = if settings.signup_enabled {
+        enabled.clone()
+    } else {
+        Vec::new()
+    };
+    LoginMethodsResponse {
+        sign_in: SignInMethods {
+            password,
+            company_sso: tenant.is_some_and(|tenant| tenant.company_sso),
+            providers: if open { enabled } else { Vec::new() },
+        },
+        email: EmailMethods {
+            email_discovery: mail,
+            password_reset: password && mail,
+        },
+        creation: CreationMethods {
+            signup: local_signup || !signup_providers.is_empty(),
+            local_signup,
+            email_verification_required: true,
+            signup_providers,
+        },
+    }
+}
+
 /// Claim mapping of an OIDC social provider: the standard subject and email,
 /// and never groups, because social sign-in grants no role.
 fn oidc_claims() -> ClaimMapping {
@@ -1023,9 +1073,7 @@ impl SocialSignIn {
         let start = self.pseudonym("start", crate::admission::source_key(source).as_bytes())?;
         self.admit(&[(SignupAdmissionScope::Start, start, SIGNUP_START_ATTEMPTS)])
             .await?;
-        if !self.settings().await?.signup_enabled {
-            return Err(signup_unavailable());
-        }
+        self.require_signup_provider(provider).await?;
         let row = social_provider(&self.operator, provider.as_str())
             .await
             .map_err(store_error)?
@@ -1277,6 +1325,26 @@ impl SocialSignIn {
             .map_err(store_error)
     }
 
+    /// Refuse unless the methods report offers `provider` for workspace
+    /// creation.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::InvalidToken`] when it does not, and the store
+    /// availability errors.
+    async fn require_signup_provider(&self, provider: SocialProvider) -> Result<(), WyrdError> {
+        if self
+            .login_methods(None)
+            .await?
+            .creation
+            .signup_providers
+            .contains(&provider)
+        {
+            Ok(())
+        } else {
+            Err(signup_unavailable())
+        }
+    }
+
     /// Refuse unless signup is enabled and `revision` is still `provider`'s
     /// current, enabled revision.
     ///
@@ -1288,9 +1356,7 @@ impl SocialSignIn {
         provider: SocialProvider,
         revision: i64,
     ) -> Result<(), WyrdError> {
-        if !self.settings().await?.signup_enabled {
-            return Err(signup_unavailable());
-        }
+        self.require_signup_provider(provider).await?;
         social_provider(&self.operator, provider.as_str())
             .await
             .map_err(store_error)?

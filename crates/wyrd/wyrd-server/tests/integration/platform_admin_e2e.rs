@@ -25,6 +25,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::principal::within_propagation;
 
+mod methods;
 mod signup;
 
 /// The one header every Wyrd plane authenticates on.
@@ -5549,7 +5550,7 @@ async fn an_operator_configures_and_tests_google_beside_company_sso() {
     assert_eq!(status, StatusCode::OK, "methods list: {offered}");
     assert_eq!(
         offered,
-        json!({ "password": true, "company_sso": true, "providers": [], "signup": false }),
+        json!({ "password": true, "company_sso": true, "providers": [], "signup": false, "local_signup": false, "email_discovery": false, "password_reset": false, "email_verification_required": true, "signup_providers": [] }),
         "password starts enabled, signup disabled, and no social button appears"
     );
     let (status, listed) = social_call(
@@ -5726,7 +5727,7 @@ async fn an_operator_configures_and_tests_google_beside_company_sso() {
         social_call(&replica, social_request(Method::GET, &methods, None, None)).await;
     assert_eq!(
         offered,
-        json!({ "password": true, "company_sso": true, "providers": ["google"], "signup": false }),
+        json!({ "password": true, "company_sso": true, "providers": ["google"], "signup": false, "local_signup": false, "email_discovery": false, "password_reset": false, "email_verification_required": true, "signup_providers": [] }),
         "Google is offered beside company SSO"
     );
 

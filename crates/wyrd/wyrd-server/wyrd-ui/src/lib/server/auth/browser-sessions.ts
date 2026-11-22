@@ -13,6 +13,11 @@ export type LoginMethods = {
   company_sso: boolean;
   providers: SocialProvider[];
   signup: boolean;
+  local_signup: boolean;
+  email_discovery: boolean;
+  password_reset: boolean;
+  email_verification_required: boolean;
+  signup_providers: SocialProvider[];
 };
 
 const sessionPrefix = 'wyrd_session_';

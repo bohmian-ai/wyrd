@@ -483,10 +483,14 @@ pub async fn receipt_streams(
 ///
 /// Only receipts accepted at or before `cutoff` are candidates and age is
 /// measured from it, so one sweep's work is finite however many receipts
-/// arrive meanwhile. The one statement ranks the tenant's receipts by
-/// acceptance per table, then deletes only rows whose current coordinates
-/// still name `shard` at or below its safe segment, so a candidate replaced by
-/// a later acceptance of the same identity elsewhere is never removed.
+/// arrive meanwhile. The one statement reads, per table of the shard, the
+/// newest identity outside count history (the `history.newest + 1`th by
+/// acceptance), selects the shard's handed-off receipts older than that
+/// identity or than the age history, and deletes only rows whose current
+/// coordinates still name `shard` at or below its safe segment, so a
+/// candidate replaced by a later acceptance of the same identity elsewhere is
+/// never removed. Its cost is one index walk of `history.newest` entries per
+/// table plus the shard's receipts, and does not depend on table statistics.
 /// Deleting a receipt removes no accepted row and no other custody.
 ///
 /// # Errors
@@ -500,26 +504,37 @@ pub async fn delete_handed_off(
     cutoff: DateTime<Utc>,
     limit: i64,
 ) -> Result<Vec<uuid::Uuid>, SqlError> {
-    // ponytail: ranks every receipt of the tenant per call, in
-    // `scribe_batch_commits_history_idx` order so no sort runs; the cleaner
-    // keeps that set near retry history. Rank per table if tenants hold
-    // receipt backlogs far beyond it.
+    // `horizon` is each table's newest identity outside count history, one
+    // `scribe_batch_commits_history_idx` walk of `newest` entries per table.
+    // Both CTEs are MATERIALIZED so each runs once whatever the planner
+    // believes: receipts arrive faster than statistics, and an inlined
+    // subquery re-run per shard row turns one sweep quadratic.
     sqlx::query_scalar(
-        "DELETE FROM vala.scribe_batch_commits AS receipt \
-          USING ( \
-            SELECT logical_table_fqn, batch_id FROM ( \
-              SELECT logical_table_fqn, batch_id, wal_node_id, wal_writer_epoch, \
-                     wal_shard_id, wal_segment_sequence, ingested_at, \
-                     row_number() OVER ( \
-                       PARTITION BY logical_table_fqn \
-                       ORDER BY ingested_at DESC, batch_id DESC) AS newest \
-                FROM vala.scribe_batch_commits) AS ranked \
-             WHERE wal_node_id = $1 AND wal_writer_epoch = $2 AND wal_shard_id = $3 \
-               AND wal_segment_sequence <= $4 AND ingested_at <= $8 \
-               AND (ingested_at < $8 - ($5 * interval '1 second') OR newest > $6) \
-             LIMIT $7) AS eligible \
-          WHERE receipt.logical_table_fqn = eligible.logical_table_fqn \
-            AND receipt.batch_id = eligible.batch_id \
+        "WITH horizon AS MATERIALIZED ( \
+           SELECT tables.logical_table_fqn, edge.ingested_at, edge.batch_id \
+             FROM (SELECT DISTINCT logical_table_fqn FROM vala.scribe_batch_commits \
+                    WHERE wal_node_id = $1 AND wal_writer_epoch = $2 \
+                      AND wal_shard_id = $3 AND wal_segment_sequence <= $4) AS tables \
+             LEFT JOIN LATERAL ( \
+               SELECT ingested_at, batch_id FROM vala.scribe_batch_commits AS newer \
+                WHERE newer.data_tenant_id = wyrd.current_tenant() \
+                  AND newer.logical_table_fqn = tables.logical_table_fqn \
+                ORDER BY ingested_at DESC, batch_id DESC \
+               OFFSET $6 LIMIT 1) AS edge ON true), \
+         due AS MATERIALIZED ( \
+           SELECT receipt.logical_table_fqn, receipt.batch_id \
+             FROM vala.scribe_batch_commits AS receipt \
+             JOIN horizon USING (logical_table_fqn) \
+            WHERE receipt.wal_node_id = $1 AND receipt.wal_writer_epoch = $2 \
+              AND receipt.wal_shard_id = $3 AND receipt.wal_segment_sequence <= $4 \
+              AND receipt.ingested_at <= $8 \
+              AND (receipt.ingested_at < $8 - ($5 * interval '1 second') \
+                   OR (receipt.ingested_at, receipt.batch_id) \
+                      <= (horizon.ingested_at, horizon.batch_id)) \
+            LIMIT $7) \
+         DELETE FROM vala.scribe_batch_commits AS receipt USING due \
+          WHERE receipt.logical_table_fqn = due.logical_table_fqn \
+            AND receipt.batch_id = due.batch_id \
             AND receipt.wal_node_id = $1 AND receipt.wal_writer_epoch = $2 \
             AND receipt.wal_shard_id = $3 AND receipt.wal_segment_sequence <= $4 \
           RETURNING receipt.batch_id",

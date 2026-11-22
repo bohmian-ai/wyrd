@@ -1404,7 +1404,7 @@ async fn a_restart_serves_reads_while_its_first_receipt_sweep_is_blocked() {
         let (waiting,): (i64,) = sqlx::query_as(
             "SELECT count(*) FROM pg_stat_activity \
               WHERE wait_event_type = 'Lock' \
-                AND query LIKE 'DELETE FROM vala.scribe_batch_commits%'",
+                AND query LIKE '%vala.scribe_batch_commits%'",
         )
         .fetch_one(&pool)
         .await

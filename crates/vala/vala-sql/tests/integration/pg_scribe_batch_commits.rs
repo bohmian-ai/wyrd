@@ -627,6 +627,69 @@ mod pg_tests {
         );
     }
 
+    /// A sweep DELETE stays linear in the receipts it reads when the table
+    /// grew faster than its planner statistics.
+    ///
+    /// A write load inserts receipts faster than autovacuum analyzes them, so
+    /// the planner believes the shard holds about one row. 30,000 fresh
+    /// receipts of one shard over four tables, none yet due, are recorded and
+    /// never analyzed; one DELETE must still finish within seconds and delete
+    /// nothing. A plan that re-ranks the table once per shard row takes tens
+    /// of seconds here.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot start, a statement fails, a receipt is
+    /// deleted, or the DELETE takes 3 s or longer.
+    #[tokio::test]
+    async fn a_sweep_delete_stays_linear_over_unanalyzed_receipts() {
+        let fixture = PgFixture::start().await.expect("fixture");
+        let tenant = fixture.data_tenant_id();
+        let node_id = Uuid::now_v7();
+        let accepted = Utc::now();
+        let receipts: Vec<_> = (0..30_000_i64)
+            .map(|lsn| {
+                let table = format!("bifrost.t{}", lsn % 4);
+                let receipt = ScribeBatchCommit {
+                    wal_node_id: node_id,
+                    ..fence(tenant, &table, Uuid::now_v7(), lsn * 2)
+                };
+                (receipt, accepted)
+            })
+            .collect();
+        for group in receipts.chunks(5_000) {
+            commit_group(&fixture, group).await;
+        }
+        let shard = HandedOffShard {
+            node_id,
+            writer_epoch: 1,
+            shard_id: 0,
+            safe_segment: 1,
+        };
+
+        let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
+            .await
+            .expect("tenant connection");
+        let started = std::time::Instant::now();
+        let deleted = delete_handed_off(
+            &mut conn,
+            &shard,
+            &RetryHistory::default(),
+            accepted + chrono::Duration::seconds(1),
+            1_000,
+        )
+        .await
+        .expect("the delete runs");
+        let elapsed = started.elapsed();
+        conn.commit().await.expect("commit");
+
+        assert!(deleted.is_empty(), "no receipt is due yet");
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "one sweep DELETE took {elapsed:?} over 30,000 unanalyzed receipts"
+        );
+    }
+
     /// A node's receipt streams are listed across every tenant and writer
     /// epoch, and another node's are not.
     ///

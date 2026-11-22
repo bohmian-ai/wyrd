@@ -72,8 +72,9 @@ pub struct GithubOAuth {
 /// with `error` set.
 #[derive(Deserialize)]
 struct TokenAnswer {
-    /// The access token, when the code was redeemed.
-    access_token: Option<SecretString>,
+    /// The access token, when the code was redeemed; wrapped in a
+    /// [`SecretString`] as soon as it is decoded.
+    access_token: Option<String>,
     /// GitHub's error code, when it was not.
     error: Option<String>,
 }
@@ -166,7 +167,7 @@ impl GithubOAuth {
             .map_err(|error| RelyingPartyError::Configuration(error.to_string()))?;
         let answer: TokenAnswer = self.json(request).await?;
         let token = match (answer.access_token, answer.error) {
-            (Some(token), None) => token,
+            (Some(token), None) => SecretString::from(token),
             (_, error) => {
                 return Err(RelyingPartyError::TokenRejected(error.unwrap_or_else(
                     || "the token answer carries no access token".to_owned(),

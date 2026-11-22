@@ -80,6 +80,59 @@ pub async fn insert_provisioning_tenant(
     })
 }
 
+/// Claim `slug` for the public signup `attempt`, or resume that attempt's own
+/// interrupted claim of it.
+///
+/// Unlike [`insert_provisioning_tenant`], only a `failed` or stale
+/// `provisioning` row this same attempt created is adopted, so no other
+/// visitor, signup or operator claim can be taken over.
+///
+/// # Errors
+/// Returns [`SqlError::UniqueViolation`] when the slug belongs to another
+/// tenant or claim, and [`SqlError::Query`] when the insert fails.
+pub async fn claim_signup_tenant(
+    pool: &OperatorPool,
+    data_tenant_id: DataTenantId,
+    slug: &str,
+    display_name: &str,
+    attempt: uuid::Uuid,
+) -> Result<TenantClaim, SqlError> {
+    let adopted = sqlx::query_scalar::<_, uuid::Uuid>(
+        "INSERT INTO platform.tenants
+             (data_tenant_id, slug, display_name, status, signup_attempt_id)
+         VALUES ($1, $2, $3, 'provisioning', $4)
+         ON CONFLICT (slug) DO UPDATE
+            SET display_name               = EXCLUDED.display_name,
+                status                     = 'provisioning',
+                provisioning_failed_reason = NULL,
+                updated_at                 = now()
+          WHERE platform.tenants.signup_attempt_id = EXCLUDED.signup_attempt_id
+            AND (platform.tenants.status = 'failed'
+                 OR (platform.tenants.status = 'provisioning'
+                     AND platform.tenants.updated_at < now() - interval '15 minutes'))
+         RETURNING data_tenant_id",
+    )
+    .bind(data_tenant_id.as_uuid())
+    .bind(slug)
+    .bind(display_name)
+    .bind(attempt)
+    .fetch_optional(pool.pool())
+    .await
+    .map_err(SqlError::from)?;
+    let Some(claimed) = adopted else {
+        return Err(SqlError::UniqueViolation {
+            constraint: "tenants_slug_key".to_owned(),
+        });
+    };
+    Ok(if claimed == data_tenant_id.as_uuid() {
+        TenantClaim::Created
+    } else {
+        TenantClaim::Resumed(
+            DataTenantId::try_from(claimed).map_err(SqlError::InvalidDataTenantId)?,
+        )
+    })
+}
+
 /// Which tenant row a provisioning attempt ended up owning.
 ///
 /// Resuming keeps the original tenant id, because a failed attempt may already

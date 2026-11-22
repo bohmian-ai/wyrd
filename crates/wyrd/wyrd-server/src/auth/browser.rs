@@ -149,7 +149,11 @@ pub(crate) fn cookie_header(
 }
 
 /// `Set-Cookie` that installs a tenant's new session cookie.
-fn set_session_cookie(origin: &Url, tenant: &TenantSlug, cookie: &SecretString) -> HeaderValue {
+pub(crate) fn set_session_cookie(
+    origin: &Url,
+    tenant: &TenantSlug,
+    cookie: &SecretString,
+) -> HeaderValue {
     cookie_header(
         origin,
         &format!("{SESSION_COOKIE_PREFIX}{tenant}"),
@@ -171,7 +175,7 @@ fn clear_session_cookie(origin: &Url, label: &str) -> HeaderValue {
 }
 
 /// A `no-store` response carrying `cookies` as separate `Set-Cookie` headers.
-fn with_cookies(
+pub(crate) fn with_cookies(
     status: StatusCode,
     cookies: Vec<HeaderValue>,
     body: impl IntoResponse,
@@ -185,7 +189,7 @@ fn with_cookies(
 
 /// The request id string for audit correlation, minting one when the
 /// request-id layer did not run.
-fn request_id(request_id: Option<Extension<RequestId>>) -> RequestId {
+pub(crate) fn request_id(request_id: Option<Extension<RequestId>>) -> RequestId {
     request_id.map_or_else(RequestId::now_v7, |Extension(id)| id)
 }
 
@@ -268,7 +272,7 @@ pub async fn login(
 }
 
 /// Name of the cookie holding a browser sign-in's login-transaction binding.
-const LOGIN_COOKIE: &str = "wyrd_login";
+pub(crate) const LOGIN_COOKIE: &str = "wyrd_login";
 
 /// The only path a company sign-in's login-transaction cookie is sent to.
 pub(crate) const LOGIN_COOKIE_PATH: &str = "/auth/callback";
@@ -278,7 +282,7 @@ pub(crate) const LOGIN_COOKIE_PATH: &str = "/auth/callback";
 pub(crate) const SOCIAL_LOGIN_COOKIE_PATH: &str = "/auth/social";
 
 /// Lifetime of the login-transaction cookie: the five-minute login state.
-const LOGIN_COOKIE_MAX_AGE_SECONDS: u64 = 300;
+pub(crate) const LOGIN_COOKIE_MAX_AGE_SECONDS: u64 = 300;
 
 /// The login-transaction binding a provider callback request presents, when
 /// it presents exactly one `wyrd_login` cookie.
@@ -374,7 +378,7 @@ pub(crate) async fn login_refused(
 
 /// `Set-Cookie` that removes the login-transaction cookie scoped to the
 /// callback `login_path`.
-fn clear_login_cookie(origin: &Url, login_path: &str) -> HeaderValue {
+pub(crate) fn clear_login_cookie(origin: &Url, login_path: &str) -> HeaderValue {
     cookie_header(origin, LOGIN_COOKIE, "", login_path, 0)
 }
 
@@ -383,7 +387,7 @@ fn clear_login_cookie(origin: &Url, login_path: &str) -> HeaderValue {
 ///
 /// # Panics
 /// Never: `location` is a path built from a route key, which is header-safe.
-fn see_other(location: &str, cookies: Vec<HeaderValue>) -> Response {
+pub(crate) fn see_other(location: &str, cookies: Vec<HeaderValue>) -> Response {
     let mut response = with_cookies(StatusCode::SEE_OTHER, cookies, ());
     response.headers_mut().insert(
         header::LOCATION,
@@ -579,7 +583,7 @@ pub async fn logout(
 
 /// The TCP peer the password failure source window is keyed by, when the
 /// listener recorded one.
-fn peer(connect: Option<Extension<ConnectInfo<SocketAddr>>>) -> Option<IpAddr> {
+pub(crate) fn peer(connect: Option<Extension<ConnectInfo<SocketAddr>>>) -> Option<IpAddr> {
     connect.map(|Extension(ConnectInfo(addr))| addr.ip())
 }
 

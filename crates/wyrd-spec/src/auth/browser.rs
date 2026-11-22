@@ -47,6 +47,38 @@ pub struct BrowserLoginResponse {
     pub authorization_url: AbsoluteUrl,
 }
 
+/// Body of `POST /auth/signup`: begin creating a workspace by proving a
+/// shared social provider identity in this browser.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct SignupBeginRequest {
+    /// The enabled shared social provider to prove an identity with.
+    pub provider: SocialProvider,
+}
+
+/// Body of `POST /auth/signup/complete`: create the workspace the proven
+/// identity will administer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct SignupCompleteRequest {
+    /// The new workspace's route key, unique across the deployment.
+    pub slug: TenantSlug,
+    /// The new workspace's human-readable name.
+    pub display_name: String,
+}
+
+/// Response of `POST /auth/signup/complete`: the created workspace, whose
+/// session cookie the response sets for its creator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct SignupCompleteResponse {
+    /// The created workspace's route key.
+    pub tenant: TenantSlug,
+}
+
 /// Body of `POST /auth/browser/api-key`: recover tenant access with an API
 /// key.
 ///

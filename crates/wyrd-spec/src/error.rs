@@ -621,6 +621,21 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// Too many workspace creations in the current fixed window, from this
+    /// source or for this provider identity.
+    #[error("[WYRD_AUTH_429_SIGNUP_ATTEMPTS] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_429_SIGNUP_ATTEMPTS",
+        status = 429,
+        title = "Too many workspace signups",
+        remediation = "Wait `details.retry_after_seconds` until the fixed signup window ends, then try again."
+    )]
+    SignupAttempts {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// An enrollment invitation or password-reset code is malformed, unknown,
     /// expired, revoked, already used, or for another tenant,
     /// indistinguishably.
@@ -4160,6 +4175,7 @@ impl WyrdError {
             | Self::OriginRefused { message, details }
             | Self::PasswordInvalid { message, details }
             | Self::PasswordAttempts { message, details }
+            | Self::SignupAttempts { message, details }
             | Self::OneTimeCodeInvalid { message, details }
             | Self::RecentLoginRequired { message, details }
             | Self::DeviceAuthorization { message, details }
@@ -5117,6 +5133,10 @@ mod tests {
             WyrdError::PasswordAttempts {
                 message: "too many password attempts".to_owned(),
                 details: serde_json::json!({ "retry_after_seconds": 900 }),
+            },
+            WyrdError::SignupAttempts {
+                message: "too many workspace signups".to_owned(),
+                details: serde_json::json!({ "retry_after_seconds": 3600 }),
             },
             WyrdError::OneTimeCodeInvalid {
                 message: "one-time code not accepted".to_owned(),

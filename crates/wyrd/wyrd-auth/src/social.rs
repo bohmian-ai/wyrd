@@ -41,6 +41,11 @@ use wyrd_sql::queries::auth::{
     BrowserSessionAuthority, SocialAnchor, SocialLoginState, consume_social_login_state,
     insert_social_login_state, insert_user, insert_user_identity, linked_identity,
 };
+use wyrd_sql::queries::platform::signup::{
+    PendingSignup, SignupAdmissionScope, SignupProof, admit_signup, finish_signup_creation,
+    insert_proven_signup, insert_signup_attempt, proven_signup, start_signup_creation,
+    take_signup_attempt,
+};
 use wyrd_sql::queries::platform::social::{
     LoginSettingsRow, ProviderEnablement, SocialProviderRow, SocialTestState,
     insert_social_test_state, login_settings, put_login_settings, put_social_provider,
@@ -949,5 +954,336 @@ fn validation(message: &str, field: &str) -> WyrdError {
     WyrdError::Validation {
         message: message.to_owned(),
         details: json!({ "field": field }),
+    }
+}
+
+/// How long a proven signup stays completable after its provider return.
+const SIGNUP_COMPLETION_TTL: std::time::Duration = std::time::Duration::from_mins(30);
+
+/// Workspace creations admitted per trusted source in one window.
+const SIGNUP_SOURCE_ATTEMPTS: i32 = 20;
+
+/// Workspace creations admitted per provider identity in one window.
+const SIGNUP_IDENTITY_ATTEMPTS: i32 = 5;
+
+/// Length of one signup admission window.
+const SIGNUP_WINDOW: std::time::Duration = std::time::Duration::from_hours(1);
+
+/// A proven signup this completion now holds for creating its workspace.
+#[derive(Debug, Clone)]
+pub struct SignupCreation {
+    /// The attempt id the tenant claim names.
+    pub attempt: Uuid,
+    /// The provider the identity was proven with.
+    pub provider: SocialProvider,
+    /// The exact provider revision of that proof.
+    pub provider_revision: i64,
+    /// The identity's issuer namespace.
+    pub issuer: String,
+    /// The identity's subject.
+    pub subject: String,
+    /// The provider's email, when it gave one.
+    pub email: Option<String>,
+    /// The tenant an earlier, failed completion of this attempt claimed, and
+    /// its slug.
+    pub claimed: Option<(DataTenantId, String)>,
+}
+
+impl SocialSignIn {
+    /// Begin a public workspace signup through the enabled shared
+    /// `provider`, from the browser that will hold the returned binding.
+    ///
+    /// Signup must be enabled. The attempt binds the exact provider revision,
+    /// the provider's social callback on `origin`, server-held PKCE and
+    /// nonce, and only the SHA-256 of the browser binding and state. Nothing
+    /// is created or audited.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::InvalidToken`] when signup or the provider is not
+    /// available, and the provider and store availability errors.
+    pub async fn begin_signup(
+        &self,
+        provider: SocialProvider,
+        origin: &Url,
+    ) -> Result<BegunBrowserLogin, WyrdError> {
+        if !self.settings().await?.signup_enabled {
+            return Err(signup_unavailable());
+        }
+        let row = social_provider(&self.operator, provider.as_str())
+            .await
+            .map_err(store_error)?
+            .filter(|row| row.enabled)
+            .ok_or_else(|| invalid_token(&format!("{provider} sign-in is not available")))?;
+        let authorization = self.authorize(provider, &row.client_id, origin).await?;
+        let binding = SecretString::from(random_secret());
+        insert_signup_attempt(
+            &self.operator,
+            Sha256Hex::digest(authorization.state.as_bytes()).as_bytes(),
+            &PendingSignup {
+                id: Uuid::now_v7(),
+                provider: provider.as_str().to_owned(),
+                provider_revision: row.revision,
+                redirect_uri: authorization.redirect_uri.to_string(),
+                code_verifier: authorization.code_verifier.expose_secret().to_owned(),
+                nonce: Some(authorization.nonce),
+                browser_binding_hash: Sha256Hex::digest(binding.expose_secret().as_bytes())
+                    .as_bytes()
+                    .to_vec(),
+            },
+            LOGIN_STATE_TTL,
+        )
+        .await
+        .map_err(store_error)?;
+        Ok(BegunBrowserLogin {
+            authorization_url: authorization.url,
+            binding,
+        })
+    }
+
+    /// Finish the provider return of a signup `provider` sent to its social
+    /// callback, for the browser presenting `browser_binding`, and return the
+    /// completion secret that browser must present to create its workspace.
+    ///
+    /// Returns `Ok(None)` when the state names no pending signup. Otherwise
+    /// the round-trip is consumed before any provider IO, the binding must
+    /// match, signup and the exact provider revision must still be enabled,
+    /// and the identity is verified. Only the identity and the secret's
+    /// SHA-256 are kept; the provider's tokens are not.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::InvalidState`] for another browser,
+    /// [`WyrdError::InvalidToken`] when signup or the provider changed or
+    /// verification fails, and the provider and store availability errors.
+    pub async fn prove_signup(
+        &self,
+        provider: SocialProvider,
+        query: &CallbackQuery,
+        browser_binding: Option<&str>,
+    ) -> Result<Option<SecretString>, WyrdError> {
+        let state_hash = Sha256Hex::digest(query.state.as_bytes());
+        let Some(attempt) =
+            take_signup_attempt(&self.operator, provider.as_str(), state_hash.as_bytes())
+                .await
+                .map_err(store_error)?
+        else {
+            return Ok(None);
+        };
+        if !browser_binding.is_some_and(|binding| {
+            attempt.browser_binding_hash == Sha256Hex::digest(binding.as_bytes()).as_bytes()
+        }) {
+            return Err(invalid_state(
+                "this browser did not begin the signup; start again",
+            ));
+        }
+        let code = match query.response()? {
+            ProviderResponse::Code(code) => code.into_secret_string(),
+            ProviderResponse::Error(error) => return Err(provider_refusal(&error)),
+        };
+        self.recheck_signup(provider, attempt.provider_revision)
+            .await?;
+        let enabled = self.revision(provider, attempt.provider_revision).await?;
+        let identity = self
+            .verify_code(
+                &enabled,
+                code,
+                &attempt.redirect_uri,
+                &SecretString::from(attempt.code_verifier.clone()),
+                attempt.nonce.as_deref(),
+                query.iss.as_deref(),
+            )
+            .await?;
+        let completion = SecretString::from(random_secret());
+        insert_proven_signup(
+            &self.operator,
+            &attempt,
+            state_hash.as_bytes(),
+            Sha256Hex::digest(completion.expose_secret().as_bytes()).as_bytes(),
+            &SignupProof {
+                issuer: self.issuer(provider),
+                subject: &identity.subject,
+                email: identity.email.as_deref(),
+            },
+            SIGNUP_COMPLETION_TTL,
+        )
+        .await
+        .map_err(store_error)?;
+        Ok(Some(completion))
+    }
+
+    /// Admit the proven signup held by `completion` to create its workspace,
+    /// counting it against the shared windows of `source` and its identity.
+    ///
+    /// Signup and the exact provider revision are rechecked. Exactly one
+    /// completion of an attempt runs at a time; a failed one may be retried
+    /// by the same attempt, which resumes its own claim.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::InvalidState`] for an unknown or expired proof,
+    /// [`WyrdError::Conflict`] when the attempt already created its workspace
+    /// (`details.tenant` names it) or another completion holds it,
+    /// [`WyrdError::InvalidToken`] when signup or the provider changed,
+    /// [`WyrdError::SignupAttempts`] while a window is exhausted, and
+    /// [`WyrdError::AuthVerifyUnavailable`] when the admission state cannot be
+    /// read.
+    pub async fn admit_signup(
+        &self,
+        completion: &str,
+        source: Option<std::net::IpAddr>,
+    ) -> Result<SignupCreation, WyrdError> {
+        let proven = proven_signup(
+            &self.operator,
+            Sha256Hex::digest(completion.as_bytes()).as_bytes(),
+        )
+        .await
+        .map_err(store_error)?
+        .ok_or_else(|| invalid_state("this signup has expired; start again"))?;
+        match proven.status.as_str() {
+            "completed" => {
+                return Err(WyrdError::Conflict {
+                    message: "this signup already created its workspace; sign in to it".to_owned(),
+                    details: json!({ "reason": "workspace_created", "tenant": proven.tenant_slug }),
+                });
+            }
+            "creating" => return Err(signup_busy()),
+            _ => {}
+        }
+        let provider = SocialProvider::parse(&proven.provider)
+            .ok_or_else(|| invalid_state("this signup names an unknown provider"))?;
+        self.recheck_signup(provider, proven.provider_revision)
+            .await?;
+        let identity = format!("{} {}", proven.issuer, proven.subject);
+        let mut windows = vec![(
+            SignupAdmissionScope::Identity,
+            identity,
+            SIGNUP_IDENTITY_ATTEMPTS,
+        )];
+        if let Some(source) = source {
+            windows.push((
+                SignupAdmissionScope::Source,
+                source.to_string(),
+                SIGNUP_SOURCE_ATTEMPTS,
+            ));
+        }
+        let mut wait = None;
+        for (scope, key, limit) in &windows {
+            let refused = admit_signup(&self.operator, *scope, key, *limit, SIGNUP_WINDOW)
+                .await
+                .map_err(store_error)?;
+            wait = wait.max(refused);
+        }
+        if let Some(wait) = wait {
+            return Err(WyrdError::SignupAttempts {
+                message: "too many workspace signups; wait before retrying".to_owned(),
+                details: json!({ "retry_after_seconds": wait.as_secs() }),
+            });
+        }
+        if !start_signup_creation(&self.operator, proven.id)
+            .await
+            .map_err(store_error)?
+        {
+            return Err(signup_busy());
+        }
+        let claimed = match (proven.tenant_id, proven.tenant_slug) {
+            (Some(id), Some(slug)) => Some((
+                DataTenantId::try_from(id)
+                    .map_err(|_| invalid_state("this signup names an invalid tenant"))?,
+                slug,
+            )),
+            _ => None,
+        };
+        Ok(SignupCreation {
+            attempt: proven.id,
+            provider,
+            provider_revision: proven.provider_revision,
+            issuer: proven.issuer,
+            subject: proven.subject,
+            email: proven.email,
+            claimed,
+        })
+    }
+
+    /// Record the end of `attempt`'s creation: `completed`, or `failed` so
+    /// the same attempt may retry.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::AuthVerifyUnavailable`] when the write fails.
+    pub async fn finish_signup(&self, attempt: Uuid, completed: bool) -> Result<(), WyrdError> {
+        finish_signup_creation(&self.operator, attempt, completed)
+            .await
+            .map_err(store_error)
+    }
+
+    /// Refuse unless signup is enabled and `revision` is still `provider`'s
+    /// current, enabled revision.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::InvalidToken`] otherwise, and the store
+    /// availability errors.
+    async fn recheck_signup(
+        &self,
+        provider: SocialProvider,
+        revision: i64,
+    ) -> Result<(), WyrdError> {
+        if !self.settings().await?.signup_enabled {
+            return Err(signup_unavailable());
+        }
+        social_provider(&self.operator, provider.as_str())
+            .await
+            .map_err(store_error)?
+            .filter(|row| row.revision == revision && row.enabled)
+            .map(|_| ())
+            .ok_or_else(revision_changed)
+    }
+}
+
+impl BrowserSessions {
+    /// Sign the creator of a just-activated workspace into it: `user_id`
+    /// through the linked identity `identity_id`, anchored to the exact
+    /// provider revision `creation` proved, audited as a login.
+    ///
+    /// # Errors
+    /// Returns the issuance refusals of an inactive tenant or User and the
+    /// store availability errors.
+    pub async fn open_signup_session(
+        &self,
+        tenant_id: DataTenantId,
+        user_id: Uuid,
+        identity_id: Uuid,
+        creation: &SignupCreation,
+        request_id: &str,
+    ) -> Result<CreatedBrowserSession, WyrdError> {
+        let anchor = SocialAnchor {
+            provider: creation.provider,
+            provider_revision: creation.provider_revision,
+            identity_id,
+        };
+        let mut conn = self
+            .connections
+            .postgres()
+            .tenant_conn(tenant_id)
+            .await
+            .map_err(store_error)?;
+        let verified = self
+            .issuer
+            .verify(&mut conn, user_id, TenantGrant::OidcLogin)
+            .await?;
+        let created =
+            create_session(&mut conn, verified, BrowserSessionAuthority::Social(anchor)).await?;
+        conn.commit().await.map_err(store_error)?;
+        self.stage_login(&created.session, request_id);
+        Ok(created)
+    }
+}
+
+/// Public signup is switched off.
+fn signup_unavailable() -> WyrdError {
+    invalid_token("workspace signup is not available")
+}
+
+/// Another completion of this signup is running.
+fn signup_busy() -> WyrdError {
+    WyrdError::Conflict {
+        message: "this signup is already creating its workspace; wait and retry".to_owned(),
+        details: json!({ "reason": "signup_in_progress" }),
     }
 }

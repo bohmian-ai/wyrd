@@ -5912,9 +5912,17 @@ async fn begin_google(srv: &WyrdTestServer, body: Value) -> BegunSocialLogin {
 /// # Panics
 /// Panics when sign-in does not begin or sets no `wyrd_login` cookie.
 async fn begin_social(srv: &WyrdTestServer, body: Value) -> BegunSocialLogin {
+    begin_social_at(srv, "/auth/browser/login", body).await
+}
+
+/// Begin a social round-trip at `uri` with the request `body`.
+///
+/// # Panics
+/// Panics when it does not begin or sets no `wyrd_login` cookie.
+async fn begin_social_at(srv: &WyrdTestServer, uri: &str, body: Value) -> BegunSocialLogin {
     let request = Request::builder()
         .method(Method::POST)
-        .uri("/auth/browser/login")
+        .uri(uri)
         .header(header::HOST, SOCIAL_HOST)
         .header(header::ORIGIN, format!("http://{SOCIAL_HOST}"))
         .header(header::CONTENT_TYPE, "application/json")
@@ -7481,4 +7489,457 @@ async fn an_invited_person_enrolls_with_github_and_returns() {
     assert!(status.is_server_error(), "a provider outage: {status}");
     assert!(cookie.is_none());
     assert_eq!(local_records(&superuser).await.0, records.0);
+}
+
+/// Prove `subject` at Google for a workspace signup begun from a fresh
+/// browser; returns that browser's `wyrd_signup` cookie pair.
+///
+/// # Panics
+/// Panics when signup does not begin, or the return is not sent on to the
+/// workspace form with a completion cookie.
+async fn prove_signup(
+    srv: &WyrdTestServer,
+    google: &wiremock::MockServer,
+    subject: &str,
+) -> String {
+    let begun = begin_social_at(srv, "/auth/signup", json!({ "provider": "google" })).await;
+    assert!(
+        begun.set_cookie.contains("Path=/auth/social"),
+        "{}",
+        begun.set_cookie
+    );
+    mount_platform_provider(
+        google,
+        platform_key_set("google-key"),
+        identity_token_reply(
+            &google.uri(),
+            &begun.query["nonce"],
+            "wyrd-google",
+            "google-key",
+            subject,
+            &format!("{subject}@example.test"),
+        ),
+    )
+    .await;
+    let resp = srv
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(social_callback(&begun.query["state"], &google.uri()))
+                .header(header::HOST, SOCIAL_HOST)
+                .header(header::COOKIE, &begun.cookie)
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("callback responds");
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        resp.headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("/signup/workspace")
+    );
+    let set_cookie = resp
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find(|value| value.starts_with("wyrd_signup="))
+        .expect("the completion cookie is set")
+        .to_owned();
+    assert!(set_cookie.contains("Path=/auth/signup"), "{set_cookie}");
+    assert!(set_cookie.contains("HttpOnly"), "{set_cookie}");
+    set_cookie
+        .split(';')
+        .next()
+        .expect("cookie pair")
+        .to_owned()
+}
+
+/// Complete the signup held by `cookie` as workspace `slug` from source
+/// `ip`; returns the status, body and new workspace's session cookie.
+async fn complete_signup(
+    srv: &WyrdTestServer,
+    cookie: &str,
+    slug: &str,
+    ip: [u8; 4],
+) -> (StatusCode, Value, Option<String>) {
+    let resp = srv
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/auth/signup/complete")
+                .header(header::HOST, SOCIAL_HOST)
+                .header(header::ORIGIN, format!("http://{SOCIAL_HOST}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, cookie)
+                .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                    ip, 40_000,
+                ))))
+                .body(Body::from(
+                    serde_json::to_vec(&json!({ "slug": slug, "display_name": "Acme" }))
+                        .expect("serializes"),
+                ))
+                .expect("request builds"),
+        )
+        .await
+        .expect("completion responds");
+    let status = resp.status();
+    let session = session_cookie(&resp, slug);
+    (status, body_json(resp).await, session)
+}
+
+/// The directory rows named `slug`: status and the attempt that claimed it.
+async fn tenants_named(pool: &PgPool, slug: &str) -> Vec<(uuid::Uuid, String, Option<uuid::Uuid>)> {
+    sqlx::query_as(
+        "SELECT data_tenant_id, status, signup_attempt_id FROM platform.tenants WHERE slug = $1",
+    )
+    .bind(slug)
+    .fetch_all(pool)
+    .await
+    .expect("directory reads")
+}
+
+/// A visitor proves Google, creates a workspace and administers it as an
+/// ordinary tenant User:
+///   1. while signup is off, signup cannot begin;
+///   2. an invalid or existing slug creates nothing and leaves the proof
+///      retryable;
+///   3. a valid slug provisions an active workspace whose builtin roles and
+///      SYSTEM exist, whose one User holds the admin binding through the
+///      proven identity, and whose response carries a tenant session and no
+///      key, platform principal or platform authority; that session invites
+///      a teammate;
+///   4. replaying the completion creates no second tenant, and a lost
+///      session response is recovered by returning Google sign-in;
+///   5. racing one proof across two replicas creates exactly one tenant;
+///   6. an interrupted claim resumes only for its own attempt: another
+///      identity cannot adopt it, and it never becomes active without its
+///      administrator;
+///   7. the same account creates a second independent workspace and gains
+///      nothing in the existing one;
+///   8. disabling signup or the provider after proof refuses completion;
+///   9. the shared identity and source windows refuse creation;
+///  10. unavailable admission state refuses creation.
+///
+/// # Panics
+/// Panics when any step's response or stored records differ.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_visitor_creates_a_workspace_with_google() {
+    let google = wiremock::MockServer::start().await;
+    let srv = WyrdTestServer::builder()
+        .with_social_endpoints_for_test(wyrd_server::config::SocialConfig {
+            google_issuer: Some(google.uri()),
+            ..Default::default()
+        })
+        .start_in_process()
+        .await
+        .expect("server starts");
+    let root = initialize_platform_root(&srv)
+        .await
+        .expect("deployment initializes");
+    let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    let existing = srv.pg_fixture().tenant_slug().to_owned();
+    mount_platform_provider(
+        &google,
+        platform_key_set("google-key"),
+        wiremock::ResponseTemplate::new(500),
+    )
+    .await;
+    enable_google(&srv, &session, &google).await;
+    let settings = |signup: bool| {
+        social_request(
+            Method::PUT,
+            "/platform/login-settings",
+            Some(&session),
+            Some(json!({ "password_enabled": true, "signup_enabled": signup })),
+        )
+    };
+    let home = [192, 0, 2, 10];
+
+    // 1. While signup is off, signup cannot begin.
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/auth/signup")
+        .header(header::HOST, SOCIAL_HOST)
+        .header(header::ORIGIN, format!("http://{SOCIAL_HOST}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"provider":"google"}"#))
+        .expect("request builds");
+    let (status, refused) = social_call(&srv, request).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{refused}");
+    assert_eq!(refused["code"], "WYRD_AUTH_401_INVALID_TOKEN", "{refused}");
+    let (status, changed) = social_call(&srv, settings(true)).await;
+    assert_eq!(status, StatusCode::OK, "signup enables: {changed}");
+
+    // 2. An invalid or existing slug creates nothing; the proof stays usable.
+    let ana = prove_signup(&srv, &google, "google-ana").await;
+    let (status, _, _) = complete_signup(&srv, &ana, "Not A Slug", home).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, taken, _) = complete_signup(&srv, &ana, &existing, home).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{taken}");
+    assert_eq!(tenants_named(&superuser, &existing).await.len(), 1);
+    assert_eq!(
+        tenants_named(&superuser, &existing).await[0].2,
+        None,
+        "an existing tenant is never adopted"
+    );
+
+    // 3. A valid slug provisions a usable workspace administered by its creator.
+    let operators = platform_principals(&superuser).await;
+    let (status, created, cookie) = complete_signup(&srv, &ana, "acme", home).await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    assert_eq!(
+        created,
+        json!({ "tenant": "acme" }),
+        "no key or platform authority"
+    );
+    let cookie = cookie.expect("the creator's session is set");
+    let rows = tenants_named(&superuser, "acme").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1, "active");
+    let acme = rows[0].0;
+    let (users, identities, admin_bindings, keys, services, roles, system): (
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+    ) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM wyrd.auth_users WHERE data_tenant_id = $1), \
+                (SELECT count(*) FROM wyrd.auth_user_identities \
+                  WHERE data_tenant_id = $1 AND subject = 'google-ana'), \
+                (SELECT count(*) FROM wyrd.auth_role_bindings b \
+                   JOIN wyrd.auth_roles r ON r.id = b.role_id \
+                  WHERE b.data_tenant_id = $1 AND r.name = 'admin' AND b.user_id IS NOT NULL), \
+                (SELECT count(*) FROM wyrd.auth_api_keys WHERE data_tenant_id = $1), \
+                (SELECT count(*) FROM wyrd.auth_service_accounts \
+                  WHERE data_tenant_id = $1 AND principal_kind <> 'system'), \
+                (SELECT count(*) FROM wyrd.auth_roles WHERE data_tenant_id = $1 AND builtin), \
+                (SELECT count(*) FROM wyrd.auth_service_accounts \
+                  WHERE data_tenant_id = $1 AND principal_kind = 'system')",
+    )
+    .bind(acme)
+    .fetch_one(&superuser)
+    .await
+    .expect("tenant records count");
+    assert_eq!((users, identities, admin_bindings), (1, 1, 1));
+    assert_eq!((keys, services), (0, 0), "no bootstrap principal or key");
+    assert!(roles > 0, "builtin roles are seeded");
+    assert_eq!(system, 1, "SYSTEM exists");
+    assert_eq!(
+        platform_principals(&superuser).await,
+        operators,
+        "no platform principal"
+    );
+    let (status, invited) = social_call(
+        &srv,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/v1/principals/users/invitations")
+            .header(header::HOST, SOCIAL_HOST)
+            .header(header::ORIGIN, format!("http://{SOCIAL_HOST}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::COOKIE, &cookie)
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "recipients": ["teammate@example.test"],
+                    "assignments": [{ "role": "viewer", "scope": "all" }],
+                }))
+                .expect("serializes"),
+            ))
+            .expect("request builds"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "the creator invites: {invited}"
+    );
+
+    // 4. A replay creates nothing; a lost response is recovered by sign-in.
+    let (status, replay, again) = complete_signup(&srv, &ana, "acme", home).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{replay}");
+    assert_eq!(replay["details"]["tenant"], "acme");
+    assert!(again.is_none(), "a replay opens no session");
+    let (status, _, _) = complete_signup(&srv, &ana, "acme-other", home).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a completed proof creates no other tenant"
+    );
+    assert!(tenants_named(&superuser, "acme-other").await.is_empty());
+    let begun = begin_google_login(&srv, "acme").await;
+    mount_platform_provider(
+        &google,
+        platform_key_set("google-key"),
+        identity_token_reply(
+            &google.uri(),
+            &begun.query["nonce"],
+            "wyrd-google",
+            "google-key",
+            "google-ana",
+            "ana@example.test",
+        ),
+    )
+    .await;
+    let (status, location, returned) =
+        finish_google_session(&srv, &begun, &google.uri(), "acme").await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "{location:?}");
+    assert_eq!(location.as_deref(), Some("/t/acme"));
+    assert!(returned.is_some(), "the creator signs back in");
+
+    // 5. One proof raced across replicas creates exactly one tenant.
+    let replica = srv
+        .start_replica(WyrdTestServer::builder())
+        .await
+        .expect("replica starts");
+    let bea = prove_signup(&srv, &google, "google-bea").await;
+    let (first, second) = tokio::join!(
+        complete_signup(&srv, &bea, "bea", home),
+        complete_signup(&replica, &bea, "bea", home),
+    );
+    let mut statuses = [first.0, second.0];
+    statuses.sort();
+    assert_eq!(
+        statuses,
+        [StatusCode::OK, StatusCode::CONFLICT],
+        "{first:?} {second:?}"
+    );
+    let rows = tenants_named(&superuser, "bea").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1, "active");
+
+    // 6. An interrupted claim resumes only for its own attempt.
+    let cara = prove_signup(&srv, &google, "google-cara").await;
+    let dan = prove_signup(&srv, &google, "google-dan").await;
+    let interrupted = uuid::Uuid::now_v7();
+    sqlx::query(
+        "WITH a AS (UPDATE platform.signup_attempts SET status = 'failed' \
+                     WHERE subject = 'google-cara' RETURNING id) \
+         INSERT INTO platform.tenants \
+             (data_tenant_id, slug, display_name, status, provisioning_failed_reason, signup_attempt_id) \
+         SELECT $1, 'cara', 'Cara', 'failed', 'interrupted', id FROM a",
+    )
+    .bind(interrupted)
+    .execute(&superuser)
+    .await
+    .expect("an interrupted creation is staged");
+    let (status, adopted, _) = complete_signup(&srv, &dan, "cara", home).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{adopted}");
+    let rows = tenants_named(&superuser, "cara").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1, "failed", "no active ownerless tenant");
+    let (status, resumed, cookie) = complete_signup(&srv, &cara, "cara", home).await;
+    assert_eq!(status, StatusCode::OK, "{resumed}");
+    assert!(cookie.is_some());
+    let rows = tenants_named(&superuser, "cara").await;
+    assert_eq!((rows[0].0, rows[0].1.as_str()), (interrupted, "active"));
+
+    // 7. The same account creates a second, independent workspace.
+    let ana_again = prove_signup(&srv, &google, "google-ana").await;
+    let (status, second, _) = complete_signup(&srv, &ana_again, "acme-two", home).await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    let users: Vec<(uuid::Uuid,)> = sqlx::query_as(
+        "SELECT user_id FROM wyrd.auth_user_identities WHERE subject = 'google-ana'",
+    )
+    .fetch_all(&superuser)
+    .await
+    .expect("identities read");
+    assert_eq!(users.len(), 2, "one User per workspace");
+    assert_ne!(users[0].0, users[1].0);
+    let tenant = srv.data_tenant_id();
+    let elsewhere: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM wyrd.auth_user_identities WHERE data_tenant_id = $1",
+    )
+    .bind(tenant.as_uuid())
+    .fetch_one(&superuser)
+    .await
+    .expect("identities count");
+    assert_eq!(elsewhere, 0, "no access to an existing workspace");
+
+    // 8. Disabling signup or the provider after proof refuses completion.
+    let eve = prove_signup(&srv, &google, "google-eve").await;
+    let (status, _) = social_call(&srv, settings(false)).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, off, _) = complete_signup(&srv, &eve, "eve", home).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{off}");
+    let (status, _) = social_call(&srv, settings(true)).await;
+    assert_eq!(status, StatusCode::OK);
+    set_google_enabled(&srv, &session, 1, false).await;
+    let (status, off, _) = complete_signup(&srv, &eve, "eve", home).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{off}");
+    assert!(tenants_named(&superuser, "eve").await.is_empty());
+    set_google_enabled(&srv, &session, 1, true).await;
+
+    // 9. The shared identity and source windows refuse creation.
+    let flood = [198, 51, 100, 7];
+    let mut proofs = Vec::new();
+    for subject in [
+        "google-f1",
+        "google-f2",
+        "google-f3",
+        "google-f4",
+        "google-f5",
+    ] {
+        proofs.push(prove_signup(&srv, &google, subject).await);
+    }
+    for proof in &proofs[..4] {
+        for _ in 0..5 {
+            let (status, body, _) = complete_signup(&srv, proof, &existing, flood).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        }
+    }
+    let (status, limited, _) = complete_signup(&replica, &proofs[0], &existing, home).await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "identity window: {limited}"
+    );
+    assert_eq!(limited["code"], "WYRD_AUTH_429_SIGNUP_ATTEMPTS");
+    assert!(limited["details"]["retry_after_seconds"].as_u64() > Some(0));
+    let (status, limited, _) = complete_signup(&replica, &proofs[4], "f5", flood).await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "source window: {limited}"
+    );
+    assert!(tenants_named(&superuser, "f5").await.is_empty());
+    let (status, admitted, _) = complete_signup(&srv, &proofs[4], "f5", home).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "another source is admitted: {admitted}"
+    );
+
+    // 10. Unavailable admission state refuses creation.
+    let gil = prove_signup(&srv, &google, "google-gil").await;
+    sqlx::query("ALTER TABLE platform.signup_admissions RENAME TO signup_admissions_down")
+        .execute(&superuser)
+        .await
+        .expect("admission state goes away");
+    let (status, down, _) = complete_signup(&srv, &gil, "gil", home).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{down}");
+    assert!(tenants_named(&superuser, "gil").await.is_empty());
+    sqlx::query("ALTER TABLE platform.signup_admissions_down RENAME TO signup_admissions")
+        .execute(&superuser)
+        .await
+        .expect("admission state returns");
+    let (status, created, _) = complete_signup(&srv, &gil, "gil", home).await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+}
+
+/// How many platform principals exist.
+async fn platform_principals(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM platform.principals")
+        .fetch_one(pool)
+        .await
+        .expect("platform principals count")
 }

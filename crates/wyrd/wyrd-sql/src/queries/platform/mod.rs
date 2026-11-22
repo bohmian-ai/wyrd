@@ -26,6 +26,7 @@ pub mod identity;
 pub mod principal_grants;
 pub mod principals;
 pub mod provisioning;
+pub mod signup;
 pub mod social;
 pub mod tenant_resolver;
 pub mod tenants;

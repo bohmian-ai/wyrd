@@ -4320,11 +4320,19 @@ impl WyrdTestServer {
         &self,
         mut req: Request<Body>,
     ) -> Result<Response<Body>, WyrdTestServerError> {
-        req.extensions_mut()
-            .insert(axum::extract::ConnectInfo(SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::LOCALHOST),
-                0,
-            )));
+        // A request that names its own peer keeps it, so a test can drive a
+        // per-source limit; every other request comes from loopback.
+        if req
+            .extensions()
+            .get::<axum::extract::ConnectInfo<SocketAddr>>()
+            .is_none()
+        {
+            req.extensions_mut()
+                .insert(axum::extract::ConnectInfo(SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    0,
+                )));
+        }
         self.inner
             .router
             .clone()

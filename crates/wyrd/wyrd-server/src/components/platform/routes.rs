@@ -263,7 +263,7 @@ async fn create_tenant(
 /// A denial and a taken slug are caller-correctable and say so; everything else
 /// is internal, because the caller can do nothing with a store failure's
 /// details and they may name infrastructure.
-fn provision_error(error: ProvisionError) -> WyrdErrorResponse {
+pub(crate) fn provision_error(error: ProvisionError) -> WyrdErrorResponse {
     match error {
         ProvisionError::Denied => WyrdErrorResponse::from(WyrdError::PermissionDeniedRbac {
             message: "not authorized to provision tenants".to_owned(),
@@ -406,7 +406,7 @@ async fn set_tenant_status(
 /// # Errors
 /// Returns the unconfigured-plane error when the deployment has no operator
 /// connection or this process retains no Bifrost catalog.
-fn directory(state: &AppState) -> Result<TenantProvisioning, WyrdErrorResponse> {
+pub(crate) fn directory(state: &AppState) -> Result<TenantProvisioning, WyrdErrorResponse> {
     let operator = state.postgres.operator_pool().ok_or_else(not_configured)?;
     let catalog = state.bifrost.catalog().ok_or_else(not_configured)?;
     Ok(TenantProvisioning::new(

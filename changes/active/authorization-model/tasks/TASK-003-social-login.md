@@ -599,6 +599,84 @@ with real Postgres failure/retry/concurrency proof. Initially fail on missing
 human-owner provisioning and public admission. Prove reuse of the existing
 directory lifecycle without claiming a cross-plane atomic transaction.
 
+**Evidence (server/API slice):**
+
+- Persistence: migration `20261121000006_workspace_signup.sql` adds
+  `platform.signup_attempts`, `platform.signup_admissions` and
+  `platform.tenants.signup_attempt_id`, as the spec's "Persistence and
+  authority changes" table names ("New platform pre-tenant signup records and
+  admission counters"; "platform.tenants and existing provisioning state").
+  Both tables enable and force RLS. They are platform records with no
+  tenant key. No provider token is stored. Queries live in
+  `wyrd-sql/src/queries/platform/signup.rs`, plus
+  `provisioning.rs::claim_signup_tenant`, which adopts only a `failed` or
+  stale claim that names the same attempt.
+- Reuse: `TenantProvisioning` keeps one owner. `claim_for_signup` plus
+  `provision_for_signup` share `complete`, `retire`,
+  `establish_and_promote`, `grant_admin`, the builtin-role/SYSTEM seeding,
+  `builtins.ensure_tenant` and `mark_tenant_active`/`failed` with the operator
+  flow. The human owner is a `User` and an `oidc` identity bound to `admin`
+  at tenant scope. No service account or key is created, and no platform
+  caller is fabricated. The two planes stay separate transactions: claim on
+  the platform pool, initialization in one tenant transaction, then
+  promotion.
+- Public surface: `POST /auth/signup` (begin), the shared social callback
+  dispatching a signup state to `SocialSignIn::prove_signup` (303 to
+  `/signup/workspace` with an HttpOnly `wyrd_signup` cookie on
+  `/auth/signup`), and `POST /auth/signup/complete`. Completion settles the
+  attempt before opening the session, so a lost response is recovered by
+  returning login and never by re-creation. There is a new stable code,
+  `WYRD_AUTH_429_SIGNUP_ATTEMPTS`; its TS error code is regenerated.
+- Test `platform_admin_e2e::a_visitor_creates_a_workspace_with_google`
+  covers steps 1–10:
+  1. signup off refuses begin with `WYRD_AUTH_401_INVALID_TOKEN`;
+  2. an invalid slug returns 400 and an existing slug returns 409, and the
+     existing tenant is never adopted;
+  3. `acme` becomes active with 1 User, 1 identity, 1 user `admin` binding,
+     0 API keys, 0 non-SYSTEM service accounts, builtin roles and SYSTEM.
+     The body is exactly `{"tenant":"acme"}` and no platform principal is
+     added. The session invites a teammate (201);
+  4. a replay returns 409 naming `acme`, opens no session and creates no other
+     slug; returning Google sign-in reaches `/t/acme`;
+  5. one proof raced on two replicas returns one 200 and one 409, with one
+     active tenant;
+  6. a staged interrupted claim, made by SQL fault injection with a `failed`
+     row and attempt, is refused (409) to another identity and stays
+     `failed`. Its own attempt resumes it under the same tenant id to
+     `active`;
+  7. the same Google account creates `acme-two` as a second, distinct User
+     and gains no identity in the fixture tenant;
+  8. turning signup off, or disabling Google after proof, refuses
+     completion (401) and creates no tenant;
+  9. after 4×5 completions from one source, the identity window refuses a
+     6th from another source and the source window refuses a 21st identity
+     (429, `retry_after_seconds` > 0), while another source is admitted;
+  10. with admission state unavailable (table renamed) completion returns
+      503 and creates no tenant, then succeeds once the state returns.
+- RED: the selector failed at signup begin with
+  `401 WYRD_AUTH_401_UNAUTHENTICATED` (no `/auth/signup` route). The
+  migration, SQL queries and `SocialSignIn` signup methods had been written
+  before this RED, which is a TDD process violation for those layers. The
+  provisioning human-owner path and routes followed the RED.
+- Diagnosis (step 9): **Symptom:** a 409 was expected inside the flood loop
+  but a 429 arrived. **Evidence:** `WyrdTestServer::raw_call`
+  (`wyrd-testing/src/server.rs`) inserted `ConnectInfo(127.0.0.1:0)` on every
+  request, overwriting the test's peer. **Cause:** every completion shared
+  one source window. **Fix site:** `raw_call` now inserts loopback only when
+  the request names no peer. A read-only codex diagnostician confirmed the
+  cause and fix site and checked the callers (`oneshot`,
+  `oneshot_authenticated`, `browser_json`, `token`). Requests without a peer
+  are unchanged.
+- GREEN: the same selector passed (3.5 s). Lanes: `fmt`, `lints`,
+  `codegen:regen`/`codegen:check`, `check:deps`, `check:tenant-isolation`,
+  `git diff --check`. wyrd-server integration `platform_admin_e2e::*`,
+  `pg_browser_sessions::*` and `provision*` passed 56/56. `wyrd-auth`,
+  `wyrd-auth-oidc` and `wyrd-sql` lib passed 279/279.
+- The GitHub token decoder now reads `access_token` as `String` and wraps it
+  immediately. It had compiled only when another crate enabled `secrecy`'s
+  serde feature.
+- **Open:** the UI signup page and journey, and the docs.
+
 ### 7. An existing User explicitly connects another sign-in method
 
 **Maps to:** REQ-012, REQ-015; AC-006.

@@ -10,21 +10,33 @@
 //! only what a visitor may already try; an unknown tenant reads exactly like a
 //! tenant without company SSO.
 
+use std::net::SocketAddr;
+
 use axum::Json;
-use axum::extract::{Extension, Path, Query, State};
+use axum::extract::rejection::JsonRejection;
+use axum::extract::{ConnectInfo, Extension, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
+use secrecy::ExposeSecret as _;
 use wyrd_auth::callback::LoginCompletion;
+use wyrd_spec::auth::{
+    BrowserLoginResponse, CreateTenantRequest, SignupBeginRequest, SignupCompleteRequest,
+    SignupCompleteResponse,
+};
 use wyrd_spec::auth::{CallbackQuery, LoginMethodsQuery, LoginMethodsResponse, SocialProvider};
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::request_id::RequestId;
 
 use crate::auth::RequestOrigin;
 use crate::auth::browser::{
-    SOCIAL_LOGIN_COOKIE_PATH, browser_sessions, login_binding, login_refused, signed_in,
+    LOGIN_COOKIE, LOGIN_COOKIE_MAX_AGE_SECONDS, SOCIAL_LOGIN_COOKIE_PATH, browser_sessions,
+    clear_login_cookie, cookie_header, cookie_pairs, login_binding, login_refused, peer,
+    request_id, require_same_origin, see_other, set_session_cookie, signed_in, with_cookies,
 };
+use crate::components::platform::provisioning::HumanOwner;
+use crate::components::platform::routes::{directory, provision_error};
 use crate::components::platform::social::social;
-use crate::http::error::WyrdErrorResponse;
+use crate::http::error::{WyrdErrorResponse, body_rejection};
 use crate::state::AppState;
 
 /// List the sign-in methods Rust currently allows for a tenant's sign-in page.
@@ -136,6 +148,35 @@ pub async fn callback(
         *page.status_mut() = StatusCode::OK;
         return Ok(page);
     }
+    match social
+        .prove_signup(provider, &query, login_binding(&headers).as_deref())
+        .await
+    {
+        Ok(None) => {}
+        Ok(Some(completion)) => {
+            return Ok(see_other(
+                SIGNUP_FORM,
+                vec![
+                    cookie_header(
+                        &origin,
+                        SIGNUP_COOKIE,
+                        completion.expose_secret(),
+                        SIGNUP_COOKIE_PATH,
+                        SIGNUP_COOKIE_MAX_AGE_SECONDS,
+                    ),
+                    clear_login_cookie(&origin, SOCIAL_LOGIN_COOKIE_PATH),
+                ],
+            ));
+        }
+        Err(error) if error.status() >= 500 => return Err(WyrdErrorResponse::from(error)),
+        Err(error) => {
+            tracing::info!(code = error.code(), "workspace signup proof refused");
+            return Ok(see_other(
+                "/signup?signup=failed",
+                vec![clear_login_cookie(&origin, SOCIAL_LOGIN_COOKIE_PATH)],
+            ));
+        }
+    }
     let request_id = id.map_or_else(RequestId::now_v7, |Extension(id)| id);
     match browser_sessions(&state)?
         .complete_social(
@@ -160,4 +201,199 @@ pub async fn callback(
             }))
         }
     }
+}
+
+/// The UI page a proven signup continues on to name its workspace.
+const SIGNUP_FORM: &str = "/signup/workspace";
+
+/// Name of the cookie holding a proven signup's completion secret.
+const SIGNUP_COOKIE: &str = "wyrd_signup";
+
+/// The only path the completion cookie is sent to.
+const SIGNUP_COOKIE_PATH: &str = "/auth/signup";
+
+/// Lifetime of the completion cookie: the proof's completion window.
+const SIGNUP_COOKIE_MAX_AGE_SECONDS: u64 = 1800;
+
+/// `POST /auth/signup` — begin creating a workspace by proving a shared
+/// social provider identity in this browser.
+///
+/// Sets the `wyrd_login` transaction cookie the provider callback requires
+/// and returns the provider authorization URL. Nothing is created.
+///
+/// # Errors
+/// `403 WYRD_AUTH_403_ORIGIN_REFUSED` without this deployment's exact
+/// `Origin`; `401 WYRD_AUTH_401_INVALID_TOKEN` when signup or the provider is
+/// not available; `503` when the provider or store is unavailable.
+#[utoipa::path(
+    post,
+    path = "/auth/signup",
+    request_body = SignupBeginRequest,
+    responses(
+        (status = 200, description = "Signup begun; the login-transaction cookie is set",
+          body = BrowserLoginResponse,
+          headers(("Set-Cookie" = String, description = "The `wyrd_login` transaction cookie"))),
+        (status = 401, description = "Signup or the provider is not available \
+          (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
+        (status = 403, description = "Origin absent or foreign \
+          (WYRD_AUTH_403_ORIGIN_REFUSED)", body = WyrdProblem),
+        (status = 503, description = "The identity provider or store is unavailable \
+          (WYRD_AUTH_503_DISCOVERY_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)",
+          body = WyrdProblem)
+    ),
+    security(()),
+    tag = "Auth"
+)]
+#[tracing::instrument(level = "debug", skip_all)]
+pub async fn signup(
+    State(state): State<AppState>,
+    RequestOrigin(origin): RequestOrigin,
+    headers: HeaderMap,
+    request: Result<Json<SignupBeginRequest>, JsonRejection>,
+) -> Result<Response, WyrdErrorResponse> {
+    let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
+    require_same_origin(&headers, &origin)?;
+    let begun = social(&state)?
+        .begin_signup(request.provider, &origin)
+        .await?;
+    Ok(with_cookies(
+        StatusCode::OK,
+        vec![cookie_header(
+            &origin,
+            LOGIN_COOKIE,
+            begun.binding.expose_secret(),
+            SOCIAL_LOGIN_COOKIE_PATH,
+            LOGIN_COOKIE_MAX_AGE_SECONDS,
+        )],
+        Json(BrowserLoginResponse {
+            authorization_url: begun.authorization_url,
+        }),
+    ))
+}
+
+/// `POST /auth/signup/complete` — create the workspace a proven signup will
+/// administer, and sign its creator into it.
+///
+/// The browser presents the `wyrd_signup` completion cookie its provider
+/// return set. Signup and the provider are rechecked and the attempt is
+/// counted against the shared source and identity windows before the
+/// existing provisioner claims the slug, initializes the tenant with the
+/// creator as its `admin` User and promotes it. The response sets the new
+/// workspace's session cookie and carries no key or platform authority. A
+/// completed attempt never creates another workspace; a creator whose
+/// response was lost signs in to it.
+///
+/// # Errors
+/// `400` for an invalid body or slug, or a missing or expired proof; `401`
+/// when signup or the provider changed; `409` when the slug is taken, the
+/// attempt already created its workspace or another completion holds it;
+/// `429 WYRD_AUTH_429_SIGNUP_ATTEMPTS` while a window is exhausted; `503`
+/// when admission state is unavailable; `500` when provisioning fails.
+#[utoipa::path(
+    post,
+    path = "/auth/signup/complete",
+    request_body = SignupCompleteRequest,
+    responses(
+        (status = 200, description = "The workspace exists and its session cookie is set",
+          body = SignupCompleteResponse,
+          headers(("Set-Cookie" = String, description = "The workspace session cookie"))),
+        (status = 400, description = "Invalid body or slug, or no live signup proof \
+          (WYRD_SPEC_400_VALIDATION, WYRD_AUTH_400_INVALID_STATE)", body = WyrdProblem),
+        (status = 401, description = "Signup or the provider changed after proof \
+          (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
+        (status = 403, description = "Origin absent or foreign \
+          (WYRD_AUTH_403_ORIGIN_REFUSED)", body = WyrdProblem),
+        (status = 409, description = "Slug taken, workspace already created, or creation \
+          in progress (WYRD_SPEC_409_CONFLICT)", body = WyrdProblem),
+        (status = 429, description = "Too many workspace signups \
+          (WYRD_AUTH_429_SIGNUP_ATTEMPTS)", body = WyrdProblem),
+        (status = 500, description = "Provisioning failed (WYRD_SPEC_500_INTERNAL)",
+          body = WyrdProblem),
+        (status = 503, description = "Admission state is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    security(()),
+    tag = "Auth"
+)]
+#[tracing::instrument(level = "info", skip_all)]
+pub async fn signup_complete(
+    State(state): State<AppState>,
+    RequestOrigin(origin): RequestOrigin,
+    headers: HeaderMap,
+    connect: Option<Extension<ConnectInfo<SocketAddr>>>,
+    id: Option<Extension<RequestId>>,
+    request: Result<Json<SignupCompleteRequest>, JsonRejection>,
+) -> Result<Response, WyrdErrorResponse> {
+    let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
+    require_same_origin(&headers, &origin)?;
+    let mut completions = cookie_pairs(&headers).filter(|(name, _)| *name == SIGNUP_COOKIE);
+    let completion = match (completions.next(), completions.next()) {
+        (Some((_, value)), None) => value.to_owned(),
+        _ => {
+            return Err(WyrdErrorResponse::from(WyrdError::InvalidState {
+                message: "no workspace signup is in progress in this browser; start again"
+                    .to_owned(),
+                details: serde_json::json!({}),
+            }));
+        }
+    };
+    let social = social(&state)?;
+    let sessions = browser_sessions(&state)?;
+    let provisioning = directory(&state)?;
+    let creation = social.admit_signup(&completion, peer(connect)).await?;
+    if let Some((_, claimed)) = &creation.claimed
+        && claimed != request.slug.as_str()
+    {
+        social.finish_signup(creation.attempt, false).await?;
+        return Err(WyrdErrorResponse::from(WyrdError::Conflict {
+            message: format!("this signup is creating workspace {claimed}; retry with that name"),
+            details: serde_json::json!({ "field": "slug", "tenant": claimed }),
+        }));
+    }
+    let owner = HumanOwner {
+        attempt: creation.attempt,
+        issuer: &creation.issuer,
+        subject: &creation.subject,
+        email: creation.email.as_deref(),
+    };
+    let tenant_request = CreateTenantRequest {
+        slug: request.slug.clone(),
+        display_name: request.display_name,
+    };
+    let provisioned = match provisioning.claim_for_signup(&owner, &tenant_request).await {
+        Ok(tenant) => {
+            let conn = state.postgres.tenant_conn(tenant).await;
+            provisioning
+                .provision_for_signup(tenant, owner, conn)
+                .await
+                .map(|owner| (tenant, owner))
+        }
+        Err(error) => Err(error),
+    };
+    // The attempt is settled before the session is opened: an active
+    // workspace is never created twice, and a lost session is recovered by
+    // signing in to it.
+    social
+        .finish_signup(creation.attempt, provisioned.is_ok())
+        .await?;
+    let (tenant, (user_id, identity_id)) = provisioned.map_err(provision_error)?;
+    let created = sessions
+        .open_signup_session(
+            tenant,
+            user_id,
+            identity_id,
+            &creation,
+            request_id(id).as_str(),
+        )
+        .await?;
+    Ok(with_cookies(
+        StatusCode::OK,
+        vec![
+            set_session_cookie(&origin, &request.slug, &created.cookie),
+            cookie_header(&origin, SIGNUP_COOKIE, "", SIGNUP_COOKIE_PATH, 0),
+        ],
+        Json(SignupCompleteResponse {
+            tenant: request.slug,
+        }),
+    ))
 }

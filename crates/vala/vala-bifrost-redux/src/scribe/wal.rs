@@ -2246,7 +2246,7 @@ impl WalHandle {
         active_paths: &HashSet<PathBuf>,
     ) -> Result<(), ScribeError> {
         self.writer
-            .close_segments_if_unowned(segments, active_paths)
+            .close_segments_if_unowned(self.shard_id, segments, active_paths)
     }
 }
 
@@ -2975,12 +2975,18 @@ impl WalWriter {
     /// retaining a low-volume current file forever when no later append causes
     /// a size rollover.
     ///
+    /// Only `shard_id`'s state is locked: a segment belongs to the one shard
+    /// that wrote it, and locking every shard would wait behind other shards'
+    /// appends and fsyncs.
+    ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::Internal`] when a shard state lock is poisoned or
-    /// returns the segment synchronization error before ownership is cleared.
+    /// Returns [`ScribeError::Internal`] when `shard_id` has no WAL state or its
+    /// lock is poisoned, or returns the segment synchronization error before
+    /// ownership is cleared.
     pub(crate) fn close_segments_if_unowned(
         &self,
+        shard_id: u8,
         segments: &[WalSegmentRef],
         active_paths: &HashSet<PathBuf>,
     ) -> Result<(), ScribeError> {
@@ -2992,20 +2998,25 @@ impl WalWriter {
         if candidates.is_empty() {
             return Ok(());
         }
-        for state in self.states.iter() {
-            let mut state = state.lock().map_err(|_| ScribeError::Internal {
+        let mut state = self
+            .states
+            .get(usize::from(shard_id))
+            .ok_or_else(|| ScribeError::Internal {
+                detail: format!("WAL has no shard {shard_id} (close segment)"),
+            })?
+            .lock()
+            .map_err(|_| ScribeError::Internal {
                 detail: "WAL state lock poisoned (close segment)".to_owned(),
             })?;
-            let Some(segment) = state.current_segment.as_ref() else {
-                continue;
-            };
-            if candidates.contains(segment.path()) {
-                segment.trim(state.current_segment_size)?;
-                segment.sync_data()?;
-                state.current_segment = None;
-                state.current_segment_size = 0;
-                state.current_segment_records = 0;
-            }
+        let Some(segment) = state.current_segment.as_ref() else {
+            return Ok(());
+        };
+        if candidates.contains(segment.path()) {
+            segment.trim(state.current_segment_size)?;
+            segment.sync_data()?;
+            state.current_segment = None;
+            state.current_segment_size = 0;
+            state.current_segment_records = 0;
         }
         Ok(())
     }
@@ -4183,6 +4194,22 @@ mod tests {
 
     use crate::namespaces::BifrostNamespace;
 
+    /// Returns the shard that wrote `segment`, read from its `shard-NN` directory.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the segment does not sit in a `shard-NN` directory.
+    fn shard_of(segment: &WalSegmentRef) -> u8 {
+        segment
+            .path
+            .parent()
+            .and_then(|directory| directory.file_name())
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("shard-"))
+            .and_then(|shard| shard.parse().ok())
+            .expect("a segment sits in its shard-NN directory")
+    }
+
     /// A writer that accepts at most `limit` bytes per call and first plays
     /// back `script`, recording what it received and how many calls it took.
     struct ScriptedWriter {
@@ -5237,6 +5264,7 @@ mod tests {
             .reference();
         writer
             .close_segments_if_unowned(
+                shard_of(&current),
                 std::slice::from_ref(&current),
                 &std::collections::HashSet::new(),
             )
@@ -5354,6 +5382,7 @@ mod tests {
         let segment = reader.segments[0].reference();
         writer
             .close_segments_if_unowned(
+                shard_of(&segment),
                 std::slice::from_ref(&segment),
                 &std::collections::HashSet::new(),
             )
@@ -5472,6 +5501,7 @@ mod tests {
             .expect("terminal commit LSN");
         writer
             .close_segments_if_unowned(
+                shard_of(&segment),
                 std::slice::from_ref(&segment),
                 &std::collections::HashSet::new(),
             )
@@ -5668,6 +5698,51 @@ mod tests {
         }
     }
 
+    /// Closing one shard's unowned segment touches only that shard's state.
+    ///
+    /// Every other shard's state lock is poisoned, standing in for a shard
+    /// busy in its own append or fsync; the close must neither wait on nor
+    /// fail over any of them, and must detach the segment from its own shard.
+    ///
+    /// # Panics
+    ///
+    /// Panics if setup fails, the close fails, or the segment stays current.
+    #[test]
+    fn closing_an_unowned_segment_locks_only_its_own_shard() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let key = test_seal_key(crate::test_support::tenant());
+        let writer =
+            WalWriter::new(temp_dir.path(), [24; 16], 1, WalConfig::default()).expect("writer");
+        writer
+            .append_and_fsync_for_test(&key, [4; 16], b"data")
+            .expect("append");
+        let segment = WalReader::open_directory_unfiltered(temp_dir.path())
+            .expect("reader")
+            .segments
+            .first()
+            .expect("segment")
+            .reference();
+        let own = shard_of(&segment);
+        for (shard, state) in writer.states.iter().enumerate() {
+            if shard != usize::from(own) {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _held = state.lock().expect("unpoisoned state");
+                    panic!("poison another shard's WAL state");
+                }));
+            }
+        }
+
+        writer
+            .close_segments_if_unowned(own, std::slice::from_ref(&segment), &HashSet::new())
+            .expect("the close ignores every other shard's state");
+
+        let state = writer.states[usize::from(own)].lock().expect("own state");
+        assert!(
+            state.current_segment.is_none(),
+            "the segment is detached from its shard"
+        );
+    }
+
     /// A released segment survives a skipped or failed deletion and is
     /// removed by the next retirement pass.
     ///
@@ -5699,7 +5774,11 @@ mod tests {
             "the current segment is never deleted"
         );
         writer
-            .close_segments_if_unowned(std::slice::from_ref(&segment), &HashSet::new())
+            .close_segments_if_unowned(
+                shard_of(&segment),
+                std::slice::from_ref(&segment),
+                &HashSet::new(),
+            )
             .expect("close");
         let shard_dir = segment.path.parent().expect("shard directory");
         std::fs::set_permissions(shard_dir, std::fs::Permissions::from_mode(0o500))

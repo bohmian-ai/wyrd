@@ -3186,6 +3186,9 @@ pub struct AuthConfig {
     /// [`Self::sealing_retained_keys`], and restart. Boot rewraps every stored
     /// secret under the write key and logs any value it could not open. Remove
     /// the old retained key only after boot reports zero values needing rewrap.
+    /// Signup creator accounting is a one-way pseudonym that cannot be
+    /// rewrapped: while the old key is retained the owned-workspace cap still
+    /// counts workspaces created under it, and removing it forgets them.
     #[serde(skip)]
     pub sealing_key: Option<SecretString>,
     /// Base64-encoded 32-byte keys retained only to open secrets sealed before

@@ -305,15 +305,25 @@ impl SealingKeyring {
     /// domain label, and `scope` is length-delimited from `value`, so the same
     /// value in two scopes yields unrelated pseudonyms. Every replica holding
     /// the same write key derives the same pseudonym; rotating the write key
-    /// starts a fresh pseudonym space.
+    /// starts a fresh pseudonym space, so a store that must keep matching
+    /// across a rotation compares against [`Self::pseudonyms`].
     #[must_use]
     pub fn pseudonym(&self, scope: &str, value: &[u8]) -> [u8; 32] {
-        let key = hmac_sha256(self.write.1.expose(), b"wyrd-pseudonym/v1");
-        let mut message = Vec::with_capacity(8 + scope.len() + value.len());
-        message.extend_from_slice(&(scope.len() as u64).to_be_bytes());
-        message.extend_from_slice(scope.as_bytes());
-        message.extend_from_slice(value);
-        hmac_sha256(&key, &message)
+        keyed_pseudonym(&self.write.1, scope, value)
+    }
+
+    /// The pseudonym of `value` within `scope` under every held key, the
+    /// write key's first.
+    ///
+    /// A store records the first and matches against all of them, so a value
+    /// recorded under a retained key still matches after the write key
+    /// rotates. Removing a retained key forgets the matches recorded under
+    /// it.
+    #[must_use]
+    pub fn pseudonyms(&self, scope: &str, value: &[u8]) -> Vec<[u8; 32]> {
+        self.keys()
+            .map(|key| keyed_pseudonym(key, scope, value))
+            .collect()
     }
 
     /// Every held key, write key first.
@@ -352,6 +362,18 @@ impl SealingKeyring {
             ciphertext: ciphertext.to_vec(),
         })
     }
+}
+
+/// The HMAC-SHA-256 pseudonym of `value` within `scope` under `key`: the
+/// HMAC key is derived from `key` under a fixed domain label, and `scope` is
+/// length-delimited from `value`.
+fn keyed_pseudonym(key: &SecretKey, scope: &str, value: &[u8]) -> [u8; 32] {
+    let key = hmac_sha256(key.expose(), b"wyrd-pseudonym/v1");
+    let mut message = Vec::with_capacity(8 + scope.len() + value.len());
+    message.extend_from_slice(&(scope.len() as u64).to_be_bytes());
+    message.extend_from_slice(scope.as_bytes());
+    message.extend_from_slice(value);
+    hmac_sha256(&key, &message)
 }
 
 impl std::fmt::Debug for SealingKeyring {
@@ -521,6 +543,21 @@ mod tests {
         assert_ne!(address, keyring.pseudonym("start", b"198.51.100.7"));
         assert_ne!(address, keyring.pseudonym("sourc", b"e198.51.100.7"));
         assert_ne!(address, other.pseudonym("source", b"198.51.100.7"));
+    }
+
+    /// Across a rotation both keyrings derive both pseudonyms, each its own
+    /// write key's first, so a value recorded on either side still matches.
+    #[test]
+    fn pseudonyms_match_across_a_rotation() {
+        let old = super::SealingKeyring::new(super::SecretKey::from_bytes([7; 32]))
+            .with_retained(super::SecretKey::from_bytes([8; 32]));
+        let new = super::SealingKeyring::new(super::SecretKey::from_bytes([8; 32]))
+            .with_retained(super::SecretKey::from_bytes([7; 32]));
+        let before = old.pseudonym("creator", b"ada");
+        let after = new.pseudonym("creator", b"ada");
+        assert_ne!(before, after);
+        assert_eq!(old.pseudonyms("creator", b"ada"), [before, after]);
+        assert_eq!(new.pseudonyms("creator", b"ada"), [after, before]);
     }
 
     use super::{

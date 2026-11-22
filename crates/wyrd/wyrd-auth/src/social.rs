@@ -1278,6 +1278,9 @@ pub struct SignupCreation {
     pub credential: SignupCredential,
     /// The identity's keyed creator pseudonym, recorded on the tenant.
     pub creator_key: [u8; 32],
+    /// The identity's creator pseudonyms under retained sealing keys, which
+    /// still match tenants it created before the write key rotated.
+    pub retained_creator_keys: Vec<[u8; 32]>,
     /// The tenant an earlier, failed completion of this attempt claimed, and
     /// its slug.
     pub claimed: Option<(DataTenantId, String)>,
@@ -1760,7 +1763,14 @@ impl SocialSignIn {
                 )
             }
         };
-        let creator_key = self.pseudonym("creator", &identity)?;
+        let mut creator_keys = self
+            .keyring
+            .as_ref()
+            .ok_or_else(sealing_key_missing)?
+            .pseudonyms("creator", &identity)
+            .into_iter();
+        let creator_key = creator_keys.next().ok_or_else(sealing_key_missing)?;
+        let retained_creator_keys = creator_keys.collect();
         self.admit(&[
             (
                 SignupAdmissionScope::Identity,
@@ -1804,6 +1814,7 @@ impl SocialSignIn {
             attempt: proven.id,
             credential,
             creator_key,
+            retained_creator_keys,
             claimed,
         }))
     }

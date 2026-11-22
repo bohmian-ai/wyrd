@@ -2,6 +2,12 @@
 
 Status: finalized
 
+Current target decision (approved spec revision 2): all previous performance
+targets are void for these refactored L1 cases. No replacement targets are
+defined by this change. Correctness, custody, sample-floor and lifecycle checks
+remain required. Earlier maintainer-review quotations below are historical;
+the revision 2 decision supersedes their performance-target expectations.
+
 Repository evidence was originally inspected at
 `d2f37d07b4c6e595ecdc9f59bb27cfa467be16b0`. The current proposal incorporates
 the maintainer review at the end of these notes. Benchmark execution is on hold.
@@ -101,14 +107,11 @@ bucket bounds. Existing p99/p95 floors (1,000/200 per window when judged) remain
 insufficient samples make the affected benchmark INVALID, without extending its
 window. A purely diagnostic percentile below its floor says unavailable.
 
-Judge existing case-level performance thresholds using the same aggregates the
-summary shows. Use ratios of totals for rates and pool histogram counts across
-the three windows for latency percentiles. Apply thresholds to the underlying
-reading with its recorded precision and bucket bounds. Preserve the existing
-threshold values and operators. Record the aggregation as part of the new
-protocol because pooling can change judgments compared with the old median of
-window results. Retain each window's readings, correctness checks and sample
-floors in the full case record.
+Use ratios of totals for rates and pool histogram counts across the three
+windows for latency percentiles. Record the aggregation as part of the new
+protocol. Previous performance thresholds and operators do not apply to these
+cases. Retain each window's readings, correctness checks and sample floors in
+the full case record.
 
 **Boundary separation:** at each stop, freeze successful work, CPU and interval
 counters against timestamped boundaries. Then drain in-flight requests before
@@ -350,14 +353,15 @@ registered case's unit and latency label explicitly:
 For UI SQL, expose only a CPU/page reading that uses matching server CPU and
 completed-page boundaries. Report unavailable where the record lacks a
 supported reading. Preserve percentile bucket bounds and use fixed precision
-and explicit units. Derive targets, statuses and displayed aggregates from
+and explicit units. Derive statuses and displayed aggregates from
 recorded evidence through the existing report calculations. Show unavailable
 and inapplicable separately from zero. Render invalid attempts with the reason
 and record reference, and render selected cases that could not start as
 `NOT RUN` with the reason. Withhold performance cells for both. Continue
 after an invalid case if cleanup succeeded. Stop and mark remaining cases
-unstarted if cleanup cannot be confirmed. A threshold miss remains distinct
-from an invalid measurement. Profiled sweeps are visibly marked as diagnostic.
+unstarted if cleanup cannot be confirmed. The Target column must not apply
+previous performance thresholds; this change defines no replacements.
+Profiled sweeps are visibly marked as diagnostic.
 
 ### 6. Full per-case report
 
@@ -366,7 +370,7 @@ For each execution, render:
 - The benchmark key, command, protocol version, fixture and load declaration,
   build and host identity, and mode.
 - VALID or INVALID with reasons, phase timings, isolation and teardown evidence.
-  A missed performance threshold is a separate judgment from measurement validity.
+  No legacy performance-target judgment applies.
 - The three windows and their aggregate, with successful work and elapsed time,
   whole-server CPU, rates and latency population, and registered criteria.
   Show units and distinguish zero, unavailable and inapplicable readings.
@@ -510,10 +514,10 @@ own full environment and retain it through that case's warmup and three windows.
 
 ## Handoff
 
-The maintainer agreed to short smoke checks in the harness test lane and to
-judging existing thresholds on the same aggregates displayed in the summary.
+The maintainer agreed to short smoke checks in the harness test lane and, in
+revision 2, voided all previous performance targets for the refactored cases.
 Full-size timing feasibility remains unverified and requires opt-in runs after
-the execution hold is lifted. The finalized design feeds the [draft specification](../spec.md).
+the execution hold is lifted. The finalized design feeds the [approved specification](../spec.md).
 
 ## Maintainer review — 2026-11-22
 

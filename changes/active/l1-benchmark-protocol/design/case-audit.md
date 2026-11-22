@@ -1,5 +1,10 @@
 # L1 benchmark case audit
 
+Performance-target references below describe the audited historical workloads.
+Under approved spec revision 2, all previous performance targets are void for
+the refactored L1 cases. These references do not carry thresholds into the new
+protocol. Correctness, custody, sample-floor and lifecycle checks still apply.
+
 The current inventory is **65 named timed cases**, with 48 in the default suite
 and 17 available by explicit selection. Gateway's arbitrary offered rates
 are additional parameterized runs. Peak/scaling rows, setup checks, and
@@ -110,12 +115,13 @@ and exact statement answers for each residence. [Query declarations](../../../..
 
 ## Dependencies and simplification
 
-- The approved Bifrost write-throughput requirement needs the full write
-  matrix and preserved hot/Parquet read criteria. Its qualification must
-  explicitly select all required cases if the routine suite omits any. The
-  current L2 consumer obtains spans/logs/native rates from a compatible
-  writes-parquet record. Preserve its required input coverage through the
-  refactor. [REQ-013](../../bifrost-write-throughput-and-retention/spec.md#required-behavior) · [L2 calibration](../../../../crates/wyrd/wyrd-testing/src/bin/capacity/query/mod.rs#L1209)
+- Preserve the full write matrix and hot/Parquet read workload coverage,
+  including correctness checks, as selectable cases. These historical
+  dependencies do not carry performance targets into the refactored cases.
+  The existing L2 consumer still calibrates from compatible historical
+  writes-parquet records; new L1 protocol records must not enter that path
+  silently. New calibration consumption and performance qualification remain
+  deferred under the current spec. [Historical requirement](../../bifrost-write-throughput-and-retention/spec.md#required-behavior) · [L2 calibration](../../../../crates/wyrd/wyrd-testing/src/bin/capacity/query/mod.rs#L1209)
 - Variant-file-reads needs matched leaves and query shapes across memory,
   staged and published sources, plus canonical and learned layout evidence.
   Moving a case out of the routine suite leaves that evidence requirement in

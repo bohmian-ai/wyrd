@@ -1,6 +1,6 @@
 ---
 id: SPEC-l1-benchmark-protocol
-revision: 1
+revision: 2
 status: approved
 ---
 
@@ -77,13 +77,13 @@ A missed deadline, failed integrity check, or missing required lifecycle or
 measurement evidence makes the attempt invalid. Record overruns and observed
 cleanup failures, including failures of external services to stop in time.
 
-**REQ-004 — Aggregates and targets.** Calculate rates and efficiency from sums
-of their matching raw numerators and denominators. Pool histogram counts for
-case-level percentiles, preserving sample counts and bucket bounds. Judge
-existing performance targets using the same case aggregates displayed in the
-summary, with existing thresholds and operators and before display rounding.
+**REQ-004 — Aggregates and measurement validity.** Calculate rates and efficiency
+from sums of their matching raw numerators and denominators. Pool histogram counts for
+case-level percentiles, preserving sample counts and bucket bounds. All previous
+performance targets are void for the refactored L1 cases; do not inherit their
+thresholds or operators. This change establishes no replacement performance targets.
 Keep per-window correctness checks, sample floors and detailed readings.
-A target miss is a performance result distinct from measurement validity.
+No performance-target judgment is required for these cases.
 Distinguish unavailable and inapplicable readings from zero.
 
 **REQ-005 — Case and sweep records.** Persist a full JSON record for each
@@ -108,7 +108,8 @@ selected case in the saved sweep order, with case, status, throughput, server CP
 per unit, labeled headline latency, target and case record reference. Bifrost
 adds an input column for OTLP input MiB/s and input MiB/server CPU-second.
 Use the workload-specific readings in the [summary design](design/notes.md#5-category-sweeps-and-deterministic-summaries).
-Apply the same case targets when profiling and mark the readings diagnostic.
+Do not apply previous targets in ordinary or profiled runs; target output must
+not imply that a legacy threshold still applies. Mark profiled readings diagnostic.
 Give invalid and unstarted rows their reasons
 and omit their performance cells. Benchmark contributor guidance directs
 reviewers to paste this table verbatim and add interpretation in prose.
@@ -133,9 +134,16 @@ performance-change qualification and L2 calibration policy are deferred.
 |---|---|
 | AC-001 | Each category resolves its exact routine selection. Listed targeted cases are selectable and bad selectors fail before launch. Selecting a case alone, in a subset or in a reordered sweep preserves its declaration. Profiled execution retains capture evidence and diagnostic labeling. (REQ-001, REQ-002, REQ-006) |
 | AC-002 | A short smoke sweep exercises startup, execution, drain, cleanup, persistence and rendering for multiple cases. Evidence confirms fresh resources at the case boundary. An invalid case with proven cleanup permits the next case to run. Unconfirmed cleanup stops later launches and keeps their rows visible. (REQ-002, REQ-003, REQ-005, REQ-007) |
-| AC-003 | Controlled measurement checks distinguish late work from interval totals and demonstrate aggregate rates and pooled latency with unequal window work. A valid target miss and an invalid measurement produce different outcomes. (REQ-003, REQ-004) |
+| AC-003 | Controlled measurement checks distinguish late work from interval totals and demonstrate aggregate rates and pooled latency with unequal window work. Correctness and evidence-integrity failures invalidate attempts; previous performance targets do not apply. (REQ-003, REQ-004) |
 | AC-004 | A saved sweep reproduces its emitted Markdown after temporary artifacts are removed. Its case records still reproduce detailed reports. Partial, invalid and profiled results retain their statuses, and legacy readers keep the old protocol interpretation. (REQ-005, REQ-006) |
 | AC-005 | When full-size performance execution resumes, verify per-phase timing and end-to-end feasibility on supported benchmark hosts. Report overruns as invalid attempts. (REQ-003) |
 
 Revision 1 was approved by the maintainer on 2026-11-22. Full-size
 feasibility remains unverified while performance execution is on hold.
+
+Revision 2 records the maintainer's explicit decision in the task-review
+follow-up: all previous performance targets are void because these are
+refactored benchmarks/cases. The maintainer approved revising the packet on
+that basis. Correctness, custody, sample-floor and lifecycle checks remain
+required; no replacement performance targets are introduced. Historical
+records retain their original interpretation under REQ-005.

@@ -1,7 +1,7 @@
 ---
 id: TASK-001
 kind: implementation
-status: proposed
+status: superseded
 spec: SPEC-l1-benchmark-protocol
 spec_revision: 1
 requirements: [REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, REQ-006, REQ-007, AC-001, AC-002, AC-003, AC-004, AC-005]
@@ -9,6 +9,13 @@ depends_on: []
 ---
 
 # Standardize L1 benchmark sweeps
+
+This task and its execution evidence record the reviewed revision 1 candidate.
+Approved spec revision 2 voids all previous performance targets for the
+refactored cases; target-preservation expectations below are historical and
+must not drive further implementation. Continue with the
+[revised remediation task](../review/task-001-1bcc403b-review-1/TASK-001-R1-l1-protocol-boundaries.md),
+which retains the six remaining findings and the original TDD disclosure.
 
 ## Outcome and approach
 

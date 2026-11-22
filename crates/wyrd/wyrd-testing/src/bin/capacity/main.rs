@@ -540,7 +540,12 @@ mod tests {
     /// A case script: `work` reads `per_window` in every window, OTLP
     /// writes send `wire_mib` MiB, and every server and client percentile
     /// reads a histogram of 2,000 samples at `nanos`, kept for pooling.
-    fn case_script(work: &'static str, per_window: f64, wire_mib: f64, nanos: u64) -> Script {
+    pub(crate) fn case_script(
+        work: &'static str,
+        per_window: f64,
+        wire_mib: f64,
+        nanos: u64,
+    ) -> Script {
         Box::new(move |_, _, repetition| {
             repetition.set(work, Reading::exact(per_window));
             if wire_mib > 0.0 {
@@ -566,7 +571,7 @@ mod tests {
 
     /// The case record of `selector` in `category`, measured on the case
     /// clock through the shared runner with `script`.
-    async fn case_record(
+    pub(crate) async fn case_record(
         category: Category,
         selector: &str,
         profile: Option<ProfileMode>,

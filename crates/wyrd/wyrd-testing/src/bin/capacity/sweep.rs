@@ -75,6 +75,9 @@ pub struct Sweep {
     pub stamp: String,
     /// The `capacity` program each case process runs: this binary.
     pub program: PathBuf,
+    /// The Docker client that lists and removes each case's Compose
+    /// resources.
+    pub docker: PathBuf,
 }
 
 impl Sweep {
@@ -101,6 +104,7 @@ impl Sweep {
             root: root.to_path_buf(),
             stamp,
             program: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("capacity")),
+            docker: PathBuf::from("docker"),
         }
     }
 
@@ -247,7 +251,8 @@ impl Sweep {
             storage_root: storage.display().to_string(),
             ..Cleanup::default()
         };
-        match compose_resources(&project).await {
+        let checked = clock + Duration::from_secs(allowances.setup_seconds);
+        match compose_resources(&self.docker, &project, checked).await {
             Ok(found) => cleanup.preexisting = found,
             Err(error) => reasons.push(format!(
                 "PostgreSQL ownership could not be checked: {error}"
@@ -294,32 +299,54 @@ impl Sweep {
         if self.mode == SweepMode::Smoke {
             command.arg("--smoke");
         }
-        let deadline = clock
+        let recorded = clock
             + Duration::from_secs(
                 allowances.total() - allowances.persist_seconds - allowances.teardown_seconds,
             );
+        let envelope = clock + Duration::from_secs(allowances.total() - allowances.persist_seconds);
         let teardown = Duration::from_secs(allowances.teardown_seconds);
+        let mut stopping: Option<Instant> = None;
         match command.spawn() {
             Err(error) => reasons.push(format!("the case process could not start: {error}")),
             Ok(mut child) => {
                 let group = child.id();
-                let status = tokio::select! {
-                    status = child.wait() => Some(status),
-                    () = tokio::time::sleep_until(deadline) => {
-                        reasons.push(format!(
-                            "the case did not finish within its {}s deadline; it was stopped",
-                            deadline.duration_since(clock).as_secs()
-                        ));
-                        None
-                    }
-                    () = interrupt.cancelled() => {
-                        reasons.push("the sweep was interrupted; the case was stopped".to_owned());
-                        None
+                let mut deadline = recorded;
+                let mut admitted = false;
+                let status = loop {
+                    tokio::select! {
+                        status = child.wait() => break Some(status),
+                        () = tokio::time::sleep_until(deadline) => {
+                            if !admitted && let Some(left) = teardown_left(&record_path, allowances) {
+                                admitted = true;
+                                deadline = Instant::now() + left;
+                                continue;
+                            }
+                            reasons.push(if admitted {
+                                format!(
+                                    "the case's teardown did not finish within its {}s allowance; it was stopped",
+                                    allowances.teardown_seconds
+                                )
+                            } else {
+                                format!(
+                                    "the case kept no record within its {}s deadline; it was stopped",
+                                    recorded.duration_since(clock).as_secs()
+                                )
+                            });
+                            break None;
+                        }
+                        () = interrupt.cancelled() => {
+                            reasons.push("the sweep was interrupted; the case was stopped".to_owned());
+                            break None;
+                        }
                     }
                 };
                 let status = match status {
                     Some(status) => status.ok(),
-                    None => stop(group, &mut child, teardown).await,
+                    None => {
+                        let now = Instant::now();
+                        stopping = Some(now);
+                        stop(group, &mut child, (now + teardown).min(envelope.max(now))).await
+                    }
                 };
                 match status {
                     Some(status) if status.success() || status.code() == Some(2) => {}
@@ -346,7 +373,7 @@ impl Sweep {
             .and_then(|record| record.lifecycle.as_ref())
             .map(|lifecycle| lifecycle.owned.clone())
             .unwrap_or_default();
-        let confirming = Instant::now();
+        let confirming = stopping.unwrap_or_else(Instant::now);
         let child_teardown = record.as_ref().map_or(0.0, |record| {
             (exited - record.finished_at).num_milliseconds().max(0) as f64 / 1e3
         });
@@ -357,7 +384,11 @@ impl Sweep {
                 let used = lifecycle.teardown_seconds + child_teardown;
                 Duration::from_secs_f64((allowances.teardown_seconds as f64 - used).max(0.0))
             });
-        let surviving = confirm(&project, &owned, &storage, left).await;
+        let confirmed_by = match stopping {
+            Some(stopped) => (stopped + teardown).min(envelope.max(stopped)),
+            None => confirming + left,
+        };
+        let surviving = confirm(&self.docker, &project, &owned, &storage, confirmed_by).await;
         cleanup.seconds = child_teardown + confirming.elapsed().as_secs_f64();
         cleanup.confirmed = surviving.is_empty();
         cleanup.surviving = surviving;
@@ -427,6 +458,21 @@ impl Sweep {
     }
 }
 
+/// What remains of the teardown allowance for the PostgreSQL wrapper of a
+/// case whose process already kept its engine record at `path`: the
+/// allowance less the process teardown the record charged and the time
+/// since it finished. `None` when there is no readable record yet, so the
+/// case process has not finished its work.
+fn teardown_left(path: &Path, allowances: Allowances) -> Option<Duration> {
+    let record = Record::parse(&std::fs::read_to_string(path).ok()?).ok()?;
+    let lifecycle = record.lifecycle.as_ref()?;
+    let since = (Utc::now() - record.finished_at).num_milliseconds().max(0) as f64 / 1e3;
+    let used = lifecycle.teardown_seconds + since;
+    Some(Duration::from_secs_f64(
+        (allowances.teardown_seconds as f64 - used).max(0.0),
+    ))
+}
+
 /// Whether `reasons` already holds `message`.
 fn record_has(reasons: &[String], message: &str) -> bool {
     reasons.iter().any(|reason| reason == message)
@@ -447,13 +493,15 @@ fn keep(directory: &Path, bytes: &[u8]) -> Result<tempfile::NamedTempFile, Strin
     Ok(file)
 }
 
-/// Stops the case process group `group` of `child`: TERM, so the wrapper
-/// tears its PostgreSQL down, then KILL once `grace` passes. Returns its
-/// exit status, or `None` when it could not be reaped.
+/// Stops the case process group `group` of `child` by `deadline`, the end
+/// of the teardown allowance its cleanup confirmation shares: TERM, so the
+/// wrapper tears its PostgreSQL down, then KILL once half the time left
+/// passes. Returns its exit status, or `None` when it could not be reaped
+/// by `deadline`.
 async fn stop(
     group: Option<u32>,
     child: &mut tokio::process::Child,
-    grace: Duration,
+    deadline: Instant,
 ) -> Option<std::process::ExitStatus> {
     let signal = |name: &str| {
         if let Some(group) = group {
@@ -463,23 +511,29 @@ async fn stop(
         }
     };
     signal("TERM");
-    if let Ok(status) = tokio::time::timeout(grace, child.wait()).await {
+    let term = Instant::now() + deadline.saturating_duration_since(Instant::now()) / 2;
+    if let Ok(status) = tokio::time::timeout_at(term, child.wait()).await {
         return status.ok();
     }
     signal("KILL");
-    tokio::time::timeout(grace, child.wait())
+    tokio::time::timeout_at(deadline, child.wait())
         .await
         .ok()
         .and_then(Result::ok)
 }
 
 /// The containers, volumes and networks Compose project `project` still
-/// has.
+/// has, asked of `docker` by `deadline`.
 ///
 /// # Errors
 ///
-/// Returns why Docker could not be asked.
-async fn compose_resources(project: &str) -> Result<Vec<String>, String> {
+/// Returns why Docker could not be asked, or that it did not answer by
+/// `deadline`; a timeout never reads as an empty project.
+async fn compose_resources(
+    docker: &Path,
+    project: &str,
+    deadline: Instant,
+) -> Result<Vec<String>, String> {
     let label = format!("label=com.docker.compose.project={project}");
     let mut found = Vec::new();
     for (what, args) in [
@@ -496,11 +550,21 @@ async fn compose_resources(project: &str) -> Result<Vec<String>, String> {
             vec!["network", "ls", "--quiet", "--filter", label.as_str()],
         ),
     ] {
-        let output = tokio::process::Command::new("docker")
-            .args(&args)
-            .output()
-            .await
-            .map_err(|error| format!("docker could not run: {error}"))?;
+        let output = tokio::time::timeout_at(
+            deadline,
+            tokio::process::Command::new(docker)
+                .args(&args)
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "docker {} did not answer within its allowance",
+                args.join(" ")
+            )
+        })?
+        .map_err(|error| format!("docker could not run: {error}"))?;
         if !output.status.success() {
             return Err(format!(
                 "docker {} failed: {}",
@@ -518,12 +582,19 @@ async fn compose_resources(project: &str) -> Result<Vec<String>, String> {
     Ok(found)
 }
 
-/// What still exists of a finished case within `left`: owned processes
-/// still running with their recorded start, Compose containers and volumes
-/// of `project` (removed once if the wrapper left them), and the storage
-/// root, which is removed. Empty when cleanup is confirmed.
-async fn confirm(project: &str, owned: &[Owned], storage: &Path, left: Duration) -> Vec<String> {
-    let deadline = Instant::now() + left;
+/// What still exists of a finished case by `deadline`, the end of its
+/// teardown allowance: owned processes still running with their recorded
+/// start, Compose containers and volumes of `project` (removed once if the
+/// wrapper left them), and the storage root, which is removed. Every Docker
+/// call is bounded by `deadline`, and an answer it did not give in time
+/// survives as unconfirmed. Empty only when cleanup is confirmed in time.
+async fn confirm(
+    docker: &Path,
+    project: &str,
+    owned: &[Owned],
+    storage: &Path,
+    deadline: Instant,
+) -> Vec<String> {
     let mut removed = false;
     loop {
         let mut surviving: Vec<String> = owned
@@ -531,20 +602,24 @@ async fn confirm(project: &str, owned: &[Owned], storage: &Path, left: Duration)
             .filter(|process| process.alive())
             .map(|process| format!("{} process {} still runs", process.role.name(), process.pid))
             .collect();
-        match compose_resources(project).await {
+        match compose_resources(docker, project, deadline).await {
             Ok(found) if !found.is_empty() && !removed => {
                 removed = true;
-                let _ = tokio::process::Command::new("docker")
-                    .args([
-                        "compose",
-                        "--project-name",
-                        project,
-                        "down",
-                        "--volumes",
-                        "--remove-orphans",
-                    ])
-                    .output()
-                    .await;
+                let _ = tokio::time::timeout_at(
+                    deadline,
+                    tokio::process::Command::new(docker)
+                        .args([
+                            "compose",
+                            "--project-name",
+                            project,
+                            "down",
+                            "--volumes",
+                            "--remove-orphans",
+                        ])
+                        .kill_on_drop(true)
+                        .output(),
+                )
+                .await;
                 surviving.extend(found);
             }
             Ok(found) => surviving.extend(found),
@@ -562,10 +637,16 @@ async fn confirm(project: &str, owned: &[Owned], storage: &Path, left: Duration)
                 surviving.push(format!("storage root {} still exists", storage.display()));
             }
         }
-        if surviving.is_empty() || Instant::now() >= deadline {
+        let now = Instant::now();
+        if surviving.is_empty() && now <= deadline {
             return surviving;
         }
-        tokio::time::sleep(POLL).await;
+        if now >= deadline {
+            surviving
+                .push("cleanup was not confirmed before its teardown allowance ran out".to_owned());
+            return surviving;
+        }
+        tokio::time::sleep(POLL.min(deadline - now)).await;
     }
 }
 
@@ -777,10 +858,11 @@ pub fn print_summary(sweep: &Sweep, record: &SweepRecord) -> u8 {
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use chrono::Utc;
     use tokio_util::sync::CancellationToken;
-    use wyrd_testing::experiment::Verdict;
+    use wyrd_testing::experiment::{Record, Verdict};
 
     use super::Sweep;
     use crate::cases::{Case, Category, Request, resolve};
@@ -885,6 +967,267 @@ mod tests {
             .expect("a protocol record");
         assert!(table.contains("| native-write-c1 | NOT RUN: not started: cleanup of `otlp-logs-c64` could not be confirmed within its teardown allowance | — | — | — | — | — | unavailable |"), "{table}");
         assert!(table.contains("| otlp-logs-c1 | INVALID: setup failed | — | — | — | — | — | 01-writes-parquet-otlp-logs-c1.json |"), "{table}");
+    }
+
+    /// The engine record a VALID Bifrost write case process keeps: 490 s
+    /// of setup through drain, `teardown` seconds stopping its processes, no
+    /// owned process still running, finished `ago` before now.
+    fn engine_record(teardown: f64, ago: chrono::Duration) -> Record {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .expect("runtime");
+        let case = runtime.block_on(crate::tests::case_record(
+            Category::Bifrost,
+            "native-write-c1",
+            None,
+            crate::tests::case_script("rows", 30_000.0, 0.0, 300_000),
+        ));
+        assert_eq!(case.verdict, Verdict::Valid, "{:?}", case.reasons);
+        let mut record = case.record.expect("an engine record");
+        let lifecycle = record.lifecycle.as_mut().expect("a lifecycle");
+        lifecycle.setup_seconds = 240.0;
+        lifecycle.warmup_seconds = 30.0;
+        lifecycle.measurement_seconds = 90.0;
+        lifecycle.drain_seconds = 130.0;
+        lifecycle.teardown_seconds = teardown;
+        lifecycle.owned.clear();
+        record.finished_at = Utc::now() - ago;
+        record
+    }
+
+    /// Writes an executable `sh` script of `body` at `path`.
+    fn script(path: &std::path::Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("directory");
+        std::fs::write(path, format!("#!/bin/sh\n{body}\n")).expect("script");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("executable");
+    }
+
+    /// A smoke sweep of `cases` under `root` whose PostgreSQL wrapper runs
+    /// `wrapper` with `$record` naming the engine record path, and whose
+    /// Docker client runs `docker`.
+    fn faked(root: &std::path::Path, cases: &str, wrapper: &str, docker: &str) -> Sweep {
+        script(
+            &root.join(super::POSTGRES),
+            &format!(
+                "while [ $# -gt 0 ]; do [ \"$1\" = --record ] && record=$2; shift; done\n{wrapper}"
+            ),
+        );
+        let docker_path = root.join("docker");
+        script(&docker_path, docker);
+        let mut sweep = sweep(Category::Bifrost, &["--cases", cases], root);
+        sweep.docker = docker_path;
+        sweep
+    }
+
+    /// Runs `sweep` through its real case attempts, returning the sweep
+    /// record and how many cases were launched.
+    async fn attempted_sweep(sweep: &Sweep) -> (summary::SweepRecord, usize) {
+        let interrupt = CancellationToken::new();
+        let launched = Arc::new(Mutex::new(0));
+        let record = sweep
+            .supervise(&interrupt, |case, n| {
+                *launched.lock().expect("launched") += 1;
+                let interrupt = &interrupt;
+                async move { sweep.attempt(case, n, interrupt).await }
+            })
+            .await;
+        let launched = *launched.lock().expect("launched");
+        (record, launched)
+    }
+
+    /// A case whose process kept its record after 490 s of setup through
+    /// drain and 10 s of process teardown, and whose PostgreSQL wrapper
+    /// then took 20 s more, fits the 590 s envelope: the supervisor charges
+    /// the wrapper's disposal to teardown, 30 s in all, and the case is
+    /// VALID with its cleanup confirmed.
+    #[test]
+    fn an_admitted_wrapper_teardown_is_charged_to_teardown() {
+        let root = tempfile::tempdir().expect("root");
+        let fixture = root.path().join("fixture.json");
+        let record = engine_record(10.0, chrono::Duration::seconds(20));
+        std::fs::write(&fixture, serde_json::to_vec(&record).expect("json")).expect("fixture");
+        let sweep = faked(
+            root.path(),
+            "native-write-c1",
+            &format!("cp '{}' \"$record\"", fixture.display()),
+            "exit 0",
+        );
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let (record, launched) = runtime.block_on(attempted_sweep(&sweep));
+        assert_eq!(launched, 1);
+        assert_eq!(
+            record.cases[0].status,
+            CaseStatus::Valid,
+            "{:?}",
+            record.cases[0].reasons
+        );
+        let case = summary::read_case(
+            &sweep
+                .directory
+                .join("01-writes-parquet-native-write-c1.json"),
+        )
+        .expect("case record");
+        assert!(case.cleanup.confirmed);
+        let teardown = case
+            .record
+            .as_ref()
+            .and_then(|record| record.lifecycle.as_ref())
+            .expect("lifecycle")
+            .teardown_seconds;
+        assert!((30.0..32.0).contains(&teardown), "{teardown}");
+    }
+
+    /// A case process that never keeps a record and ignores TERM is
+    /// stopped at the 510 s cutoff, which leaves teardown and persistence
+    /// their allowances, and its stop, Docker removal and confirmation share
+    /// one 60 s teardown allowance however long Docker hangs: the case is INVALID with its
+    /// cleanup unconfirmed, the sweep is kept, and the next case is NOT RUN
+    /// without being launched.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_case_is_stopped_at_its_cutoff_within_one_cleanup_allowance() {
+        let root = tempfile::tempdir().expect("root");
+        let sweep = faked(
+            root.path(),
+            "native-write-c1,native-write-c64",
+            "trap '' TERM\nexec sleep 600",
+            "exec sleep 600",
+        );
+        let started = tokio::time::Instant::now();
+        let (record, launched) =
+            tokio::time::timeout(Duration::from_secs(3_600), attempted_sweep(&sweep))
+                .await
+                .expect("the supervisor returns");
+        let elapsed = started.elapsed().as_secs_f64();
+        assert_eq!(launched, 1);
+        assert!((510.0..=571.0).contains(&elapsed), "{elapsed}");
+        let case = summary::read_case(
+            &sweep
+                .directory
+                .join("01-writes-parquet-native-write-c1.json"),
+        )
+        .expect("case record");
+        assert_eq!(case.verdict, Verdict::Invalid);
+        assert!(!case.cleanup.confirmed);
+        assert!(case.cleanup.seconds <= 60.5, "{}", case.cleanup.seconds);
+        for expected in [
+            "kept no record within its 510s deadline",
+            "kept no engine record",
+            "cleanup was not confirmed",
+        ] {
+            assert!(
+                case.reasons.iter().any(|reason| reason.contains(expected)),
+                "{expected}: {:?}",
+                case.reasons
+            );
+        }
+        assert_eq!(
+            record
+                .cases
+                .iter()
+                .map(|entry| entry.status)
+                .collect::<Vec<_>>(),
+            [CaseStatus::Invalid, CaseStatus::NotRun]
+        );
+        assert!(sweep.directory.join(summary::SWEEP_FILE).exists());
+    }
+
+    /// A case process that kept its record before the 510 s cutoff is in
+    /// teardown, not hung: its PostgreSQL wrapper may run past the cutoff for
+    /// what remains of the teardown allowance, 50 s after 10 s of process
+    /// teardown, before it is stopped, and the stop and confirmation still
+    /// end by the 570 s envelope that leaves persistence its allowance.
+    #[test]
+    fn a_recorded_case_keeps_its_teardown_allowance_past_the_cutoff() {
+        let root = tempfile::tempdir().expect("root");
+        let sweep = faked(
+            root.path(),
+            "native-write-c1",
+            "exec sleep 600",
+            "exec sleep 600",
+        );
+        let record = engine_record(10.0, chrono::Duration::zero());
+        let kept = sweep
+            .directory
+            .join("01-writes-parquet-native-write-c1")
+            .join("engine-record.json");
+        std::fs::create_dir_all(kept.parent().expect("parent")).expect("artifacts");
+        std::fs::write(&kept, serde_json::to_vec(&record).expect("json")).expect("record");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let started = tokio::time::Instant::now();
+            let (record, launched) =
+                tokio::time::timeout(Duration::from_secs(3_600), attempted_sweep(&sweep))
+                    .await
+                    .expect("the supervisor returns");
+            let elapsed = started.elapsed().as_secs_f64();
+            assert_eq!(launched, 1);
+            assert!((559.0..=571.0).contains(&elapsed), "{elapsed}");
+            assert_eq!(record.cases[0].status, CaseStatus::Invalid);
+            assert!(
+                record.cases[0]
+                    .reasons
+                    .iter()
+                    .any(|reason| reason
+                        .contains("teardown did not finish within its 60s allowance")),
+                "{:?}",
+                record.cases[0].reasons
+            );
+        });
+    }
+
+    /// Cleanup confirmation is bounded by what remains of the teardown
+    /// allowance: with 0.5 s left, a Docker check that answers "nothing
+    /// left" only after 2 s, or never answers, leaves cleanup unconfirmed,
+    /// so the next case is NOT RUN and never launched.
+    #[test]
+    fn late_or_missing_cleanup_answers_stop_the_sweep() {
+        for delay in ["2", "600"] {
+            let root = tempfile::tempdir().expect("root");
+            let fixture = root.path().join("fixture.json");
+            let marker = root.path().join("finished");
+            let record = engine_record(59.5, chrono::Duration::zero());
+            std::fs::write(&fixture, serde_json::to_vec(&record).expect("json")).expect("fixture");
+            let sweep = faked(
+                root.path(),
+                "native-write-c1,native-write-c64",
+                &format!(
+                    "cp '{}' \"$record\"\ntouch '{}'",
+                    fixture.display(),
+                    marker.display()
+                ),
+                &format!("[ -e '{}' ] && sleep {delay}\nexit 0", marker.display()),
+            );
+            let runtime = tokio::runtime::Runtime::new().expect("runtime");
+            let (record, launched) = runtime
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(20), attempted_sweep(&sweep)).await
+                })
+                .expect("the supervisor returns");
+            assert_eq!(launched, 1, "delay {delay}");
+            assert_eq!(
+                record
+                    .cases
+                    .iter()
+                    .map(|entry| entry.status)
+                    .collect::<Vec<_>>(),
+                [CaseStatus::Invalid, CaseStatus::NotRun],
+                "delay {delay}"
+            );
+            let case = summary::read_case(
+                &sweep
+                    .directory
+                    .join("01-writes-parquet-native-write-c1.json"),
+            )
+            .expect("case record");
+            assert!(!case.cleanup.confirmed, "delay {delay}");
+        }
     }
 
     /// An interrupt before a case starts records it and every later case

@@ -14,12 +14,15 @@
 //! reader of the earlier schema-3 experiment records refuses them instead of
 //! reading new evidence as old.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use wyrd_testing::experiment::{Over, Reading, Record, Repetition, Status, Verdict};
+use wyrd_testing::experiment::{
+    Over, Reading, Record, Repetition, Status, TimingEvidence, Verdict,
+};
 use wyrd_testing::profile::ProfileMode;
 
 use crate::cases::{Case, Category};
@@ -106,6 +109,12 @@ pub struct CaseRecord {
     /// The engine record of exactly this case, or `None` when the case
     /// process kept none.
     pub record: Option<Record>,
+    /// Each measured repetition's window snapshots by step id, in
+    /// repetition order: the evidence the case process kept in its
+    /// temporary artifacts, which the engine record never carries.
+    /// Reading the case record puts them back on its repetitions.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub timings: BTreeMap<String, Vec<Vec<TimingEvidence>>>,
     /// Teardown evidence.
     pub cleanup: Cleanup,
     /// VALID only when the engine record is VALID, every phase fit its
@@ -113,6 +122,70 @@ pub struct CaseRecord {
     pub verdict: Verdict,
     /// Every reason the case is INVALID.
     pub reasons: Vec<String>,
+}
+
+impl CaseRecord {
+    /// Moves each measured repetition's window snapshots out of `record`,
+    /// by step id, for [`Self::timings`].
+    #[must_use]
+    pub fn timings_of(record: &mut Record) -> BTreeMap<String, Vec<Vec<TimingEvidence>>> {
+        record
+            .steps
+            .iter_mut()
+            .filter(|step| {
+                step.repetitions
+                    .iter()
+                    .any(|repetition| !repetition.timings.is_empty())
+            })
+            .map(|step| {
+                let windows = step
+                    .repetitions
+                    .iter_mut()
+                    .map(|repetition| std::mem::take(&mut repetition.timings))
+                    .collect();
+                (step.id.clone(), windows)
+            })
+            .collect()
+    }
+
+    /// Moves the saved [`Self::timings`] back onto the engine record's
+    /// repetitions, so its full report lists every window series.
+    fn hydrate(&mut self) {
+        let Some(record) = self.record.as_mut() else {
+            return;
+        };
+        for step in &mut record.steps {
+            let Some(windows) = self.timings.remove(&step.id) else {
+                continue;
+            };
+            for (repetition, timings) in step.repetitions.iter_mut().zip(windows) {
+                repetition.timings = timings;
+            }
+        }
+    }
+
+    /// Sets the engine record's persistence time from the entry naming the
+    /// case file at `path` in the sweep record beside it: keeping a case
+    /// record is timed only once it is written, so its sweep entry holds
+    /// that time. It stays unavailable without such an entry.
+    fn persisted(&mut self, path: &Path) {
+        let name = path.file_name().and_then(|name| name.to_str());
+        let sweep = path.parent().map(|directory| directory.join(SWEEP_FILE));
+        if let (Some(name), Some(sweep)) = (name, sweep)
+            && let Ok(text) = std::fs::read_to_string(sweep)
+            && let Ok(sweep) = serde_json::from_str::<SweepRecord>(&text)
+            && let Some(entry) = sweep
+                .cases
+                .iter()
+                .find(|entry| entry.record.as_deref() == Some(name))
+            && let Some(lifecycle) = self
+                .record
+                .as_mut()
+                .and_then(|record| record.lifecycle.as_mut())
+        {
+            lifecycle.persist_seconds = entry.persist_seconds;
+        }
+    }
 }
 
 /// A case's outcome in its sweep.
@@ -155,6 +228,11 @@ pub struct SweepEntry {
     pub record: Option<String>,
     /// Why it is INVALID or NOT RUN.
     pub reasons: Vec<String>,
+    /// Seconds keeping the case record took, measured once it was written
+    /// and so kept here rather than in the case record itself; `None` when
+    /// it was never kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persist_seconds: Option<f64>,
 }
 
 /// One sweep's record.
@@ -236,8 +314,11 @@ pub fn parse(text: &str) -> Result<Option<Saved>, String> {
         Some(SWEEP_PROTOCOL) => serde_json::from_value(value)
             .map(|sweep| Some(Saved::Sweep(sweep)))
             .map_err(|error| format!("malformed sweep record: {error}")),
-        Some(CASE_PROTOCOL) => serde_json::from_value(value)
-            .map(|case| Some(Saved::Case(Box::new(case))))
+        Some(CASE_PROTOCOL) => serde_json::from_value::<CaseRecord>(value)
+            .map(|mut case| {
+                case.hydrate();
+                Some(Saved::Case(Box::new(case)))
+            })
             .map_err(|error| format!("malformed case record: {error}")),
         Some(other) => Err(format!("unknown record protocol `{other}`")),
         None => Ok(None),
@@ -833,7 +914,10 @@ pub fn report(path: &Path) -> Result<Option<String>, String> {
     let directory = path.parent().unwrap_or(Path::new("."));
     Ok(match parse(&text)? {
         None => None,
-        Some(Saved::Case(case)) => Some(render_case(&case)),
+        Some(Saved::Case(mut case)) => {
+            case.persisted(path);
+            Some(render_case(&case))
+        }
         Some(Saved::Sweep(sweep)) => {
             Some(render_sweep(&sweep, &path.display().to_string(), &|name| {
                 read_case(&directory.join(name))
@@ -842,17 +926,19 @@ pub fn report(path: &Path) -> Result<Option<String>, String> {
     })
 }
 
-/// Reads the case record at `path`.
+/// Reads the case record at `path`, with its engine record's persistence
+/// time from the sweep record beside it.
 ///
 /// # Errors
 ///
 /// Returns a message when it is unreadable or not a case record.
 pub fn read_case(path: &Path) -> Result<CaseRecord, String> {
     let text = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
-    match parse(&text)? {
-        Some(Saved::Case(case)) => Ok(*case),
-        _ => Err("not an L1 case record".to_owned()),
-    }
+    let Some(Saved::Case(mut case)) = parse(&text)? else {
+        return Err("not an L1 case record".to_owned());
+    };
+    case.persisted(path);
+    Ok(*case)
 }
 
 /// The sweep entry of `case` from its persisted outcome: the case record's
@@ -871,8 +957,10 @@ pub fn entry(
         Verdict::Valid => CaseStatus::Valid,
         Verdict::Invalid => CaseStatus::Invalid,
     };
+    let mut persisted = None;
     let reference = match kept {
         Ok((name, seconds)) => {
+            persisted = Some(seconds);
             if seconds > allowance as f64 {
                 status = CaseStatus::Invalid;
                 reasons.push(format!(
@@ -894,5 +982,6 @@ pub fn entry(
         status,
         record: reference,
         reasons,
+        persist_seconds: persisted,
     }
 }

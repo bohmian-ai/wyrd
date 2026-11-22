@@ -159,6 +159,7 @@ impl Sweep {
                     status: CaseStatus::NotRun,
                     record: None,
                     reasons: vec![reason.clone()],
+                    persist_seconds: None,
                 });
                 continue;
             }
@@ -356,12 +357,7 @@ impl Sweep {
             }
         }
         let exited = Utc::now();
-        let record = std::fs::read(&record_path)
-            .map_err(|error| error.to_string())
-            .and_then(|bytes| {
-                Record::parse(&String::from_utf8_lossy(&bytes)).map_err(|error| error.to_string())
-            });
-        let mut record = match record {
+        let mut record = match Record::read_with_timings(&record_path) {
             Ok(record) => Some(record),
             Err(error) => {
                 reasons.push(format!("the case process kept no engine record: {error}"));
@@ -417,7 +413,7 @@ impl Sweep {
         &self,
         case: Case,
         started_at: chrono::DateTime<Utc>,
-        record: Option<Record>,
+        mut record: Option<Record>,
         cleanup: Cleanup,
         mut reasons: Vec<String>,
     ) -> CaseRecord {
@@ -446,6 +442,10 @@ impl Sweep {
             mode: self.mode,
             profile: self.profile,
             started_at,
+            timings: record
+                .as_mut()
+                .map(CaseRecord::timings_of)
+                .unwrap_or_default(),
             record,
             verdict: if unique.is_empty() {
                 Verdict::Valid
@@ -894,6 +894,7 @@ mod tests {
             profile: None,
             started_at: Utc::now(),
             record: None,
+            timings: std::collections::BTreeMap::new(),
             cleanup: Cleanup {
                 project: "p".to_owned(),
                 confirmed,
@@ -1080,6 +1081,100 @@ mod tests {
         assert!((30.0..32.0).contains(&teardown), "{teardown}");
     }
 
+    /// A case's kept window snapshots (timing, scan, counter and gauge) go
+    /// from its process's artifacts into the saved case record, so after the
+    /// temporary artifacts are removed `capacity report` still lists every
+    /// window series with its original labels and the measured persistence
+    /// time, and regenerates the same sweep table.
+    #[test]
+    fn saved_cases_keep_window_snapshots_and_persistence_time() {
+        use wyrd_testing::experiment::{Role, TimingEvidence};
+        wyrd_benchmark::install().expect("the benchmark recorder installs");
+        let before = wyrd_benchmark::snapshot();
+        wyrd_benchmark::record_timing(
+            &tracing::Span::none(),
+            "bifrost.ingest",
+            "success",
+            Duration::from_micros(700),
+            None,
+        );
+        wyrd_benchmark::record_scan(&tracing::Span::none(), "success", Some(42), Some(4_096));
+        metrics::counter!("l1_saved_counter_total", "lane" => "kept").increment(3);
+        metrics::gauge!("l1_saved_gauge", "lane" => "kept").set(7.0);
+        let after = wyrd_benchmark::snapshot();
+        let evidence = vec![TimingEvidence {
+            window: "measured".to_owned(),
+            role: Role::Server,
+            before,
+            after,
+            reconciliation: Vec::new(),
+        }];
+        let root = tempfile::tempdir().expect("root");
+        let artifacts = root.path().join("artifacts");
+        let mut record = engine_record(10.0, chrono::Duration::seconds(1));
+        record.artifacts.directory = Some(artifacts.display().to_string());
+        let step = record.steps[0].id.clone();
+        let kept = artifacts
+            .join("timings")
+            .join(&step)
+            .join("repetition-1.json");
+        std::fs::create_dir_all(kept.parent().expect("parent")).expect("timings");
+        std::fs::write(&kept, serde_json::to_vec(&evidence).expect("json")).expect("kept");
+        let fixture = root.path().join("fixture.json");
+        std::fs::write(&fixture, serde_json::to_vec(&record).expect("json")).expect("fixture");
+        let sweep = faked(
+            root.path(),
+            "native-write-c1",
+            &format!("cp '{}' \"$record\"", fixture.display()),
+            "exit 0",
+        );
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let (swept, _) = runtime.block_on(attempted_sweep(&sweep));
+        assert_eq!(
+            swept.cases[0].status,
+            CaseStatus::Valid,
+            "{:?}",
+            swept.cases[0].reasons
+        );
+        let persisted = swept.cases[0]
+            .persist_seconds
+            .expect("measured persistence");
+        let sweep_file = sweep.directory.join(summary::SWEEP_FILE);
+        let table = summary::report(&sweep_file)
+            .expect("reads")
+            .expect("a sweep");
+        std::fs::remove_dir_all(&artifacts).expect("artifacts removed");
+        assert_eq!(
+            summary::report(&sweep_file)
+                .expect("reads")
+                .expect("a sweep"),
+            table,
+            "the same sweep table"
+        );
+        let case_file = sweep
+            .directory
+            .join("01-writes-parquet-native-write-c1.json");
+        let full = summary::report(&case_file).expect("reads").expect("a case");
+        for line in [
+            "  - repetition 1 server measured window (nearest-rank bucket bounds):",
+            "    - timing bifrost.ingest success case",
+            "    - scan success case",
+            "l1_saved_counter_total{lane=kept}",
+            "l1_saved_gauge{lane=kept}",
+        ] {
+            assert!(full.contains(line), "{line} in {full}");
+        }
+        assert!(
+            full.contains(&format!("| persist and report | {persisted:.1} | 20 |")),
+            "{full}"
+        );
+        let read = summary::read_case(&case_file).expect("case record");
+        assert_eq!(
+            read.record.as_ref().expect("record").steps[0].repetitions[0].timings,
+            evidence
+        );
+    }
+
     /// A case process that never keeps a record and ignores TERM is
     /// stopped at the 510 s cutoff, which leaves teardown and persistence
     /// their allowances, and its stop, Docker removal and confirmation share
@@ -1261,6 +1356,7 @@ mod tests {
         let unsaved = summary::entry(&case, &valid, Err("disk full".to_owned()), 20);
         assert_eq!(unsaved.status, CaseStatus::Invalid);
         assert_eq!(unsaved.record, None);
+        assert_eq!(unsaved.persist_seconds, None);
         assert_eq!(
             unsaved.reasons,
             ["the case record could not be kept: disk full"]
@@ -1273,6 +1369,7 @@ mod tests {
         );
         assert_eq!(late.status, CaseStatus::Invalid);
         assert_eq!(late.record.as_deref(), Some("01-overhead-x.json"));
+        assert_eq!(late.persist_seconds, Some(25.5));
         assert_eq!(
             late.reasons,
             ["persisting the case record took 25.5s, over its 20s allowance"]

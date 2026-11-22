@@ -139,7 +139,11 @@ sweep and case records, without live services or temporary artifacts, and
 `capacity report <case-record.json>` renders one case's full report: its
 identity, verdict and reasons, phase timings against their allowances,
 windows, ownership and cleanup evidence, outstanding work, profile captures
-or notes, aggregate, and the engine report of its windows.
+or notes, aggregate, and the engine report of its windows, with every
+window's server timing, scan, counter and gauge series from the snapshots
+the case record keeps. Keeping a case record is timed once it is written,
+so that persistence time is saved in its sweep entry and the case report
+reads it from the sweep record beside it.
 
 ## Prerequisites
 

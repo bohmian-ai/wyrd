@@ -582,7 +582,7 @@ mod tests {
         let rest: Vec<&str> = arguments[1..].iter().map(String::as_str).collect();
         let mut declaration = declare(category.engine(), Level::One, &rest, HOST, &repository());
         sweep::narrow(&mut declaration, case.id, false).expect("narrows");
-        let (record, _) = execute(declaration, script).await;
+        let (mut record, _) = execute(declaration, script).await;
         crate::summary::CaseRecord {
             protocol: crate::summary::CASE_PROTOCOL.to_owned(),
             protocol_version: crate::summary::PROTOCOL_VERSION,
@@ -603,6 +603,7 @@ mod tests {
                 .iter()
                 .map(|reason| reason.message.clone())
                 .collect(),
+            timings: crate::summary::CaseRecord::timings_of(&mut record),
             record: Some(record),
             cleanup: crate::summary::Cleanup {
                 project: format!("wyrd-l1-test-{}", case.id),

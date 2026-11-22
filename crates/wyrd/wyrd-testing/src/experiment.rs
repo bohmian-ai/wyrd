@@ -2207,12 +2207,11 @@ impl Lifecycle {
         });
     }
 
-    /// Charges `elapsed` of the final drain and stop: to what remains of
-    /// the drain allowance first, then to teardown.
+    /// Charges `elapsed` of stopping and reaping the case's processes to
+    /// teardown. Every request already drained inside its window, so a slow
+    /// stop never spends unused drain allowance.
     pub fn finish(&mut self, elapsed: Duration) {
-        let drain = elapsed.min(self.drain_left());
-        self.drain_seconds += drain.as_secs_f64();
-        self.teardown_seconds += elapsed.saturating_sub(drain).as_secs_f64();
+        self.teardown_seconds += elapsed.as_secs_f64();
     }
 
     /// Every phase over its allowance, as an INVALID reason naming it.
@@ -2669,9 +2668,9 @@ where
             }
             ledger.drain_seconds += reading.elapsed().as_secs_f64();
         }
-        let grace = lifecycle.as_ref().map_or(FINISH_GRACE, |ledger| {
-            ledger.drain_left() + ledger.teardown_left()
-        });
+        let grace = lifecycle
+            .as_ref()
+            .map_or(FINISH_GRACE, Lifecycle::teardown_left);
         let finishing = Instant::now();
         let finished = tokio::time::timeout(grace, workload.finish()).await;
         if let Some(ledger) = &mut lifecycle {
@@ -2682,6 +2681,13 @@ where
             Ok(Err(error)) => validity.push(Reason::new(
                 "workload.failed",
                 format!("drain or stop failed: {error}"),
+            )),
+            Err(_) if lifecycle.is_some() => validity.push(Reason::new(
+                "phase.deadline",
+                format!(
+                    "the case's processes did not stop within the {:.0}s left of the teardown allowance",
+                    grace.as_secs_f64()
+                ),
             )),
             Err(_) => validity.push(Reason::new(
                 "budget.exceeded",
@@ -7256,6 +7262,8 @@ Overloaded: do not compare languages here.
         drain: Duration,
         /// How long prepare takes.
         setup: Duration,
+        /// How long stopping its processes takes.
+        stop: Duration,
         /// Each call's start and return.
         calls: Arc<Mutex<Vec<(tokio::time::Instant, tokio::time::Instant)>>>,
     }
@@ -7287,6 +7295,7 @@ Overloaded: do not compare languages here.
         }
 
         async fn finish(&mut self) -> Result<(), ExperimentError> {
+            tokio::time::sleep(self.stop).await;
             Ok(())
         }
 
@@ -7296,12 +7305,14 @@ Overloaded: do not compare languages here.
     }
 
     /// Runs the case declaration over a [`Draining`] workload that drains
-    /// `drain` after each window and prepares in `setup`, `spent` setup
-    /// already used, and returns the record and each call's span.
+    /// `drain` after each window, prepares in `setup` and stops in `stop`,
+    /// `spent` setup already used, and returns the record and each call's
+    /// span.
     async fn case_run(
         drain: Duration,
         setup: Duration,
         spent: Duration,
+        stop: Duration,
     ) -> (Record, Vec<(tokio::time::Instant, tokio::time::Instant)>) {
         let directory = tempfile::tempdir().expect("artifacts");
         let calls = Arc::default();
@@ -7309,6 +7320,7 @@ Overloaded: do not compare languages here.
             repetition: window(1_000.0, 30.0, Some(3.0), &samples(2_000, 300_000)),
             drain,
             setup,
+            stop,
             calls: Arc::clone(&calls),
         };
         let options = Options {
@@ -7339,6 +7351,7 @@ Overloaded: do not compare languages here.
             Duration::from_secs(5),
             Duration::from_secs(10),
             Duration::from_secs(20),
+            Duration::ZERO,
         )
         .await;
         assert_eq!(record.verdict, Verdict::Valid, "{:?}", record.reasons);
@@ -7409,8 +7422,13 @@ Overloaded: do not compare languages here.
         assert_eq!(lifecycle.outstanding, Some(json!({ "staged_members": 0 })));
         assert_eq!(record.steps[0].timing.repetition_seconds, 30);
 
-        let (overrun, calls) =
-            case_run(Duration::from_secs(40), Duration::ZERO, Duration::ZERO).await;
+        let (overrun, calls) = case_run(
+            Duration::from_secs(40),
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .await;
         assert_eq!(overrun.verdict, Verdict::Invalid);
         assert_eq!(
             calls.len(),
@@ -7437,6 +7455,7 @@ Overloaded: do not compare languages here.
             Duration::ZERO,
             Duration::from_secs(30),
             Duration::from_secs(220),
+            Duration::ZERO,
         )
         .await;
         assert_eq!(late.verdict, Verdict::Invalid);
@@ -7452,7 +7471,13 @@ Overloaded: do not compare languages here.
             "the deadline never extends setup: {setup}"
         );
 
-        let (spent, _) = case_run(Duration::ZERO, Duration::ZERO, Duration::from_secs(250)).await;
+        let (spent, _) = case_run(
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::from_secs(250),
+            Duration::ZERO,
+        )
+        .await;
         assert_eq!(spent.verdict, Verdict::Invalid);
         assert!(
             spent
@@ -7462,6 +7487,62 @@ Overloaded: do not compare languages here.
                     && reason.message.contains("setup took 250.0s")),
             "{:?}",
             spent.reasons
+        );
+    }
+
+    /// Stopping a case's processes is teardown, never drain: after 1 s
+    /// drains a 10 s stop is charged to teardown and the case is VALID,
+    /// while a 70 s stop leaves the unused drain allowance untouched, is cut
+    /// at the 60 s teardown allowance and makes the case INVALID naming
+    /// teardown.
+    #[tokio::test(start_paused = true)]
+    async fn case_stops_spend_teardown_not_unused_drain() {
+        let drain = Duration::from_secs(1);
+        let (quick, _) = case_run(
+            drain,
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(quick.verdict, Verdict::Valid, "{:?}", quick.reasons);
+        let lifecycle = quick.lifecycle.as_ref().expect("lifecycle");
+        assert!(
+            (lifecycle.drain_seconds - 4.0).abs() < 0.01,
+            "{}",
+            lifecycle.drain_seconds
+        );
+        assert!(
+            (lifecycle.teardown_seconds - 10.0).abs() < 0.01,
+            "{}",
+            lifecycle.teardown_seconds
+        );
+
+        let (slow, _) = case_run(
+            drain,
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::from_secs(70),
+        )
+        .await;
+        assert_eq!(slow.verdict, Verdict::Invalid);
+        let lifecycle = slow.lifecycle.as_ref().expect("lifecycle");
+        assert!(
+            (lifecycle.drain_seconds - 4.0).abs() < 0.01,
+            "a stop is not drain: {}",
+            lifecycle.drain_seconds
+        );
+        assert!(
+            (lifecycle.teardown_seconds - 60.0).abs() < 0.01,
+            "{}",
+            lifecycle.teardown_seconds
+        );
+        assert!(
+            slow.reasons.iter().any(
+                |reason| reason.code == "phase.deadline" && reason.message.contains("teardown")
+            ),
+            "{:?}",
+            slow.reasons
         );
     }
 
@@ -7591,7 +7672,13 @@ Overloaded: do not compare languages here.
             Record::parse(&serde_json::to_string(&legacy).expect("json")).expect("reads"),
             legacy
         );
-        let (case, _) = case_run(Duration::ZERO, Duration::ZERO, Duration::ZERO).await;
+        let (case, _) = case_run(
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .await;
         let reread = Record::parse(&serde_json::to_string(&case).expect("json")).expect("reads");
         assert_eq!(reread, case);
         assert!(

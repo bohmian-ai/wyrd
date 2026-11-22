@@ -174,6 +174,31 @@ requests never run unbounded deletion. Install the final retention policy for pr
 creator accounting survives attempt purge. The completion cycle later exercises
 email clearing against this policy, retaining the separate verified tenant contact. Do not build another cleanup service.
 
+**Evidence (cycle 3):** RED — `platform_admin_e2e::signup::signup_state_is_pseudonymous_and_purged_in_batches`
+first failed at its key assertion: the `start` window key was the plain address
+`198.51.100.40` (13 bytes). GREEN: start/source/identity keys are 32-byte
+`SealingKeyring::pseudonym` HMACs holding no address, issuer host or subject; the
+created tenant's `signup_creator_key` is 32 bytes; a public start leaves 601 expired
+attempts in place; `SocialSignIn::purge_expired_signups` (the method the worker ticks)
+removes `[1000, 201, 0]` across batches of at most 500 windows + 500 attempts, keeping
+live windows and both live pending starts; after purge the tenant's
+`signup_attempt_id` is NULL and its creator key remains. Unit:
+`wyrd-crypt tests::pseudonyms_separate_scope_and_key` (scope/key separation).
+Regression: the cycle 1–2 signup journeys and `a_visitor_creates_a_workspace_with_google`
+pass (its staged interrupted claim now carries a creator key, required by the new
+`tenants_signup_creator` check). Schema (staged migration revised in place, citing
+revision 5's pseudonymous admission and creator-pseudonym purposes): admission `key`
+is `BYTEA` of length 32, a `window_start` purge index, `platform.tenants.signup_creator_key`.
+**Deviation:** no background auth maintenance existed — every auth table purged
+inline on insert. The inline signup purge is removed and `ServerAuth::maintenance_worker`
+(`auth_maintenance`, beside `refresh_worker` in `engine_workers`) is the one auth
+maintenance owner, draining bounded batches each minute; worker wiring is source-cited,
+the batch behavior runtime-proven. Mail-purpose HMAC scopes join the mail cycles
+(10, 12, 13) through the same `pseudonym`. **Risk:** rotating the sealing write key
+starts a fresh pseudonym space, so windows reset and cycle 8's cap cannot match
+pre-rotation creator keys. Completion-email clearing remains cycle 7. **TDD: PASS.**
+Same selector as cycle 1.
+
 **Proof:** real SQL/maintenance integration and real admission HTTP requests; RED is a plaintext
 key or missing/unbounded cleanup. Completion-email clearing is observed with
 completion below, without replacing this maintenance owner.

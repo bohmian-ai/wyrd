@@ -298,6 +298,24 @@ impl SealingKeyring {
             .map(|(_, key)| key)
     }
 
+    /// The keyed HMAC-SHA-256 pseudonym of `value` within `scope`.
+    ///
+    /// Lets a store count or match a value — an address, an identity — without
+    /// holding it. The HMAC key is derived from the write key under a fixed
+    /// domain label, and `scope` is length-delimited from `value`, so the same
+    /// value in two scopes yields unrelated pseudonyms. Every replica holding
+    /// the same write key derives the same pseudonym; rotating the write key
+    /// starts a fresh pseudonym space.
+    #[must_use]
+    pub fn pseudonym(&self, scope: &str, value: &[u8]) -> [u8; 32] {
+        let key = hmac_sha256(self.write.1.expose(), b"wyrd-pseudonym/v1");
+        let mut message = Vec::with_capacity(8 + scope.len() + value.len());
+        message.extend_from_slice(&(scope.len() as u64).to_be_bytes());
+        message.extend_from_slice(scope.as_bytes());
+        message.extend_from_slice(value);
+        hmac_sha256(&key, &message)
+    }
+
     /// Every held key, write key first.
     fn keys(&self) -> impl Iterator<Item = &SecretKey> {
         self.keys_with_ids().map(|(_, key)| key)
@@ -492,6 +510,19 @@ pub enum CryptError {
 
 #[cfg(test)]
 mod tests {
+    /// A pseudonym is stable per key and value, and separated by scope and
+    /// key.
+    #[test]
+    fn pseudonyms_separate_scope_and_key() {
+        let keyring = super::SealingKeyring::new(super::SecretKey::from_bytes([7; 32]));
+        let other = super::SealingKeyring::new(super::SecretKey::from_bytes([8; 32]));
+        let address = keyring.pseudonym("source", b"198.51.100.7");
+        assert_eq!(address, keyring.pseudonym("source", b"198.51.100.7"));
+        assert_ne!(address, keyring.pseudonym("start", b"198.51.100.7"));
+        assert_ne!(address, keyring.pseudonym("sourc", b"e198.51.100.7"));
+        assert_ne!(address, other.pseudonym("source", b"198.51.100.7"));
+    }
+
     use super::{
         SealingKeyId, SealingKeyring, SecretKey, decrypt, derive_key, encrypt, hmac_sha256, open,
         rewrap, seal, verify_hmac_sha256,

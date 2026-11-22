@@ -80,8 +80,9 @@ pub async fn insert_provisioning_tenant(
     })
 }
 
-/// Claim `slug` for the public signup `attempt`, or resume that attempt's own
-/// interrupted claim of it.
+/// Claim `slug` for the public signup `attempt` by the identity whose keyed
+/// pseudonym is `creator`, or resume that attempt's own interrupted claim of
+/// it. The creator key stays on the tenant after the attempt is purged.
 ///
 /// Unlike [`insert_provisioning_tenant`], only a `failed` or stale
 /// `provisioning` row this same attempt created is adopted, so no other
@@ -96,11 +97,13 @@ pub async fn claim_signup_tenant(
     slug: &str,
     display_name: &str,
     attempt: uuid::Uuid,
+    creator: &[u8; 32],
 ) -> Result<TenantClaim, SqlError> {
     let adopted = sqlx::query_scalar::<_, uuid::Uuid>(
         "INSERT INTO platform.tenants
-             (data_tenant_id, slug, display_name, status, signup_attempt_id)
-         VALUES ($1, $2, $3, 'provisioning', $4)
+             (data_tenant_id, slug, display_name, status, signup_attempt_id,
+              signup_creator_key)
+         VALUES ($1, $2, $3, 'provisioning', $4, $5)
          ON CONFLICT (slug) DO UPDATE
             SET display_name               = EXCLUDED.display_name,
                 status                     = 'provisioning',
@@ -116,6 +119,7 @@ pub async fn claim_signup_tenant(
     .bind(slug)
     .bind(display_name)
     .bind(attempt)
+    .bind(creator.as_slice())
     .fetch_optional(pool.pool())
     .await
     .map_err(SqlError::from)?;

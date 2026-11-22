@@ -149,4 +149,45 @@ impl ServerAuth {
             }),
         )
     }
+
+    /// The auth maintenance worker, which runs until `shutdown`.
+    ///
+    /// Every [`MAINTENANCE_INTERVAL`] it drains expired signup state one
+    /// bounded batch at a time, so no public request ever purges. `None`
+    /// without the platform plane, where there is no signup state.
+    pub(crate) fn maintenance_worker(
+        &self,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> Option<crate::state::EngineWorker> {
+        let social = self.social_sign_in.clone()?;
+        Some((
+            "auth_maintenance",
+            Box::pin(async move {
+                let drain = async {
+                    let mut ticks = tokio::time::interval(MAINTENANCE_INTERVAL);
+                    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        ticks.tick().await;
+                        loop {
+                            match social.purge_expired_signups().await {
+                                Ok(0) => break,
+                                Ok(_) => {}
+                                Err(error) => {
+                                    tracing::warn!(%error, "expired signup state purge failed");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                };
+                tokio::select! {
+                    () = shutdown.cancelled() => {}
+                    () = drain => {}
+                }
+            }),
+        ))
+    }
 }
+
+/// How often auth maintenance purges expired state.
+const MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_mins(1);

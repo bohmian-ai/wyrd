@@ -368,6 +368,7 @@ pub async fn signup_complete(
         issuer: &creation.issuer,
         subject: &creation.subject,
         email: creation.email.as_deref(),
+        creator_key: &creation.creator_key,
     };
     let tenant_request = CreateTenantRequest {
         slug: request.slug.clone(),

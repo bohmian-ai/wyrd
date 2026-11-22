@@ -78,7 +78,8 @@ impl SignupAdmissionScope {
 }
 
 /// Record a begun signup round-trip keyed by `state_hash`, expiring after
-/// `ttl`, and drop expired attempts no tenant names.
+/// `ttl`. Expired attempts leave only through
+/// [`purge_expired_signup_state`].
 ///
 /// # Errors
 /// Returns [`SqlError::Query`] when a statement fails.
@@ -88,10 +89,6 @@ pub async fn insert_signup_attempt(
     attempt: &PendingSignup,
     ttl: Duration,
 ) -> Result<(), SqlError> {
-    sqlx::query("DELETE FROM platform.signup_attempts WHERE expires_at <= statement_timestamp()")
-        .execute(pool.pool())
-        .await
-        .map_err(SqlError::from)?;
     sqlx::query(
         "INSERT INTO platform.signup_attempts
              (id, state_hash, provider, provider_revision, redirect_uri, code_verifier,
@@ -252,7 +249,7 @@ pub async fn finish_signup_creation(
     .map_err(SqlError::from)
 }
 
-/// Count one creation attempt for `key` in `scope`'s window of length
+/// Count one creation attempt for the pseudonym `key` in `scope`'s window of length
 /// `window`, and return how long until the window admits another when this
 /// one exceeds `limit`.
 ///
@@ -261,7 +258,7 @@ pub async fn finish_signup_creation(
 pub async fn admit_signup(
     pool: &OperatorPool,
     scope: SignupAdmissionScope,
-    key: &str,
+    key: &[u8; 32],
     limit: i32,
     window: Duration,
 ) -> Result<Option<Duration>, SqlError> {
@@ -280,10 +277,52 @@ pub async fn admit_signup(
                                       - statement_timestamp())::float8",
     )
     .bind(scope.as_str())
-    .bind(key)
+    .bind(key.as_slice())
     .bind(window.as_secs_f64())
     .fetch_one(pool.pool())
     .await
     .map_err(SqlError::from)?;
     Ok((attempts > limit).then(|| Duration::from_secs_f64(wait.max(1.0).ceil())))
+}
+
+/// Delete at most `batch` admission windows that ended more than `window`
+/// ago and at most `batch` signup attempts past their expiry, and return how
+/// many rows went.
+///
+/// Spent completion and state digests stay until their attempt expires, so
+/// a replayed proof is still recognized; a tenant an attempt claimed keeps
+/// its creator key when the attempt goes. Each statement is bounded, so a
+/// backlog drains over repeated calls rather than in one long delete.
+///
+/// # Errors
+/// Returns [`SqlError::Query`] when a statement fails.
+pub async fn purge_expired_signup_state(
+    pool: &OperatorPool,
+    window: Duration,
+    batch: i64,
+) -> Result<u64, SqlError> {
+    let windows = sqlx::query(
+        "DELETE FROM platform.signup_admissions
+          WHERE ctid = ANY(ARRAY(
+                SELECT ctid FROM platform.signup_admissions
+                 WHERE window_start <= statement_timestamp() - ($1 * interval '1 second')
+                 LIMIT $2))",
+    )
+    .bind(window.as_secs_f64())
+    .bind(batch)
+    .execute(pool.pool())
+    .await
+    .map_err(SqlError::from)?;
+    let attempts = sqlx::query(
+        "DELETE FROM platform.signup_attempts
+          WHERE ctid = ANY(ARRAY(
+                SELECT ctid FROM platform.signup_attempts
+                 WHERE expires_at <= statement_timestamp()
+                 LIMIT $1))",
+    )
+    .bind(batch)
+    .execute(pool.pool())
+    .await
+    .map_err(SqlError::from)?;
+    Ok(windows.rows_affected() + attempts.rows_affected())
 }

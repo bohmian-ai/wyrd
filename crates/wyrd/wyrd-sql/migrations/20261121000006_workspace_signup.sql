@@ -3,7 +3,11 @@
 -- admission counters; platform.tenants and existing provisioning state).
 -- The admission scopes are the windows REQ-014 names: signup start in its
 -- own shared source window ("Admission before work"), and completion's
--- separate source and proven-identity windows.
+-- separate source and proven-identity windows. Admission keys and the
+-- creator key are 32-byte HMAC-SHA-256 pseudonyms ("no plain identity or
+-- address in admission keys"; the creating identity's keyed pseudonym, so the
+-- owned-workspace cap survives attempt purge). The expiry indexes serve the
+-- bounded background purge ("Pseudonymous, bounded counters", REQ-014).
 --
 -- A signup attempt is one visitor's social proof and the creation it may
 -- complete. The provider round-trip is keyed by the SHA-256 of its `state`
@@ -46,15 +50,22 @@ CREATE INDEX platform_signup_attempts_expires_at
 
 CREATE TABLE platform.signup_admissions (
     scope         TEXT        NOT NULL CHECK (scope IN ('start', 'source', 'identity')),
-    key           TEXT        NOT NULL,
+    key           BYTEA       NOT NULL CHECK (length(key) = 32),
     window_start  TIMESTAMPTZ NOT NULL,
     attempts      INTEGER     NOT NULL CHECK (attempts > 0),
     PRIMARY KEY (scope, key)
 );
 
+CREATE INDEX platform_signup_admissions_window_start
+    ON platform.signup_admissions (window_start);
+
 ALTER TABLE platform.tenants
     ADD COLUMN signup_attempt_id UUID UNIQUE
-        REFERENCES platform.signup_attempts(id) ON DELETE SET NULL;
+        REFERENCES platform.signup_attempts(id) ON DELETE SET NULL,
+    ADD COLUMN signup_creator_key BYTEA
+        CHECK (length(signup_creator_key) = 32),
+    ADD CONSTRAINT tenants_signup_creator
+        CHECK (signup_attempt_id IS NULL OR signup_creator_key IS NOT NULL);
 
 ALTER TABLE platform.signup_attempts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE platform.signup_attempts FORCE ROW LEVEL SECURITY;

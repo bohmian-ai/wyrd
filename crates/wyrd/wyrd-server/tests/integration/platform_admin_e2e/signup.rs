@@ -379,3 +379,176 @@ async fn every_signup_throttle_carries_retry_after() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert_eq!(body["code"], "WYRD_AUTH_503_VERIFY_UNAVAILABLE", "{body}");
 }
+
+/// `(scope, stored key as text, key length in bytes)` for every admission
+/// window.
+async fn admission_keys(superuser: &sqlx::PgPool) -> Vec<(String, String, i32)> {
+    sqlx::query_as("SELECT scope, key::text, octet_length(key) FROM platform.signup_admissions")
+        .fetch_all(superuser)
+        .await
+        .expect("admission windows read")
+}
+
+/// The single count `sql` selects.
+async fn count(superuser: &sqlx::PgPool, sql: &'static str) -> i64 {
+    sqlx::query_scalar(sql)
+        .fetch_one(superuser)
+        .await
+        .expect("rows count")
+}
+
+/// Signup admission and creator accounting store keyed pseudonyms, and
+/// expired signup state leaves only through bounded maintenance batches:
+///   1. start, source and identity windows hold 32-byte HMACs, never an
+///      address, issuer or subject;
+///   2. the created tenant records a 32-byte creator pseudonym;
+///   3. a public start purges nothing;
+///   4. each maintenance batch removes at most 500 windows and 500 attempts,
+///      expired ones only, leaving live windows and pending starts;
+///   5. the creator pseudonym survives its attempt's purge.
+///
+/// # Panics
+/// Panics when a key is plain, the purge is unbounded or runs on a public
+/// request, or creator accounting is lost.
+#[tokio::test(flavor = "multi_thread")]
+async fn signup_state_is_pseudonymous_and_purged_in_batches() {
+    let google = wiremock::MockServer::start().await;
+    let (srv, _session) = signup_server(&google).await;
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+
+    // 1. Every window the journey opens is a pseudonym.
+    let (status, _, body) = start_signup(&srv, "10.1.0.1", Some("198.51.100.40")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let proof = prove_signup(&srv, &google, "google-pseudonym").await;
+    let (status, created, _) = complete_signup(&srv, &proof, "pseudonym-co", [192, 0, 2, 40]).await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let keys = admission_keys(&superuser).await;
+    let scopes: std::collections::BTreeSet<&str> =
+        keys.iter().map(|(scope, _, _)| scope.as_str()).collect();
+    assert_eq!(scopes, ["identity", "source", "start"].into());
+    let google_host = url::Url::parse(&google.uri())
+        .expect("mock url")
+        .host_str()
+        .expect("mock host")
+        .to_owned();
+    for (scope, key, len) in &keys {
+        assert_eq!(*len, 32, "{scope} key is an HMAC-SHA-256: {key}");
+        for plain in [
+            "198.51.100.40",
+            "192.0.2.40",
+            "127.0.0.1",
+            "google-pseudonym",
+        ] {
+            assert!(!key.contains(plain), "{scope} key {key} holds {plain}");
+        }
+        assert!(
+            !key.contains(&google_host),
+            "{scope} key {key} holds the issuer"
+        );
+    }
+
+    // 2. The tenant keeps its creator pseudonym.
+    let creator: Option<i32> = sqlx::query_scalar(
+        "SELECT octet_length(signup_creator_key) FROM platform.tenants WHERE slug = 'pseudonym-co'",
+    )
+    .fetch_one(&superuser)
+    .await
+    .expect("creator key reads");
+    assert_eq!(creator, Some(32));
+
+    // 3. Expired state survives a public start.
+    sqlx::query(
+        "INSERT INTO platform.signup_admissions (scope, key, window_start, attempts)
+         SELECT 'source', sha256(convert_to(n::text, 'UTF8')),
+                statement_timestamp() - interval '2 days', 1
+           FROM generate_series(1, 600) AS n",
+    )
+    .execute(&superuser)
+    .await
+    .expect("expired windows insert");
+    sqlx::query(
+        "INSERT INTO platform.signup_attempts
+             (id, state_hash, provider, provider_revision, redirect_uri, code_verifier,
+              browser_binding_hash, expires_at)
+         SELECT gen_random_uuid(), sha256(convert_to('state' || n, 'UTF8')), 'google', 1,
+                'http://wyrd.test/auth/social/google/callback', 'verifier',
+                sha256(convert_to('binding' || n, 'UTF8')),
+                statement_timestamp() - interval '1 hour'
+           FROM generate_series(1, 600) AS n",
+    )
+    .execute(&superuser)
+    .await
+    .expect("expired attempts insert");
+    sqlx::query(
+        "UPDATE platform.signup_attempts SET expires_at = statement_timestamp() - interval '1 minute'
+          WHERE id = (SELECT signup_attempt_id FROM platform.tenants WHERE slug = 'pseudonym-co')",
+    )
+    .execute(&superuser)
+    .await
+    .expect("completed attempt expires");
+    let live_windows = count(
+        &superuser,
+        "SELECT count(*) FROM platform.signup_admissions
+          WHERE window_start > statement_timestamp() - interval '1 hour'",
+    )
+    .await;
+    let (status, _, body) = start_signup(&srv, "10.1.0.1", Some("198.51.100.41")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let expired_attempts = "SELECT count(*) FROM platform.signup_attempts
+                             WHERE expires_at <= statement_timestamp()";
+    assert_eq!(
+        count(&superuser, expired_attempts).await,
+        601,
+        "a public start deletes nothing"
+    );
+
+    // 4. Maintenance removes expired state one bounded batch at a time.
+    let social = srv
+        .state()
+        .auth
+        .social_sign_in
+        .as_ref()
+        .expect("social sign-in is built");
+    let mut batches = Vec::new();
+    loop {
+        let removed = social.purge_expired_signups().await.expect("purge runs");
+        batches.push(removed);
+        if removed == 0 {
+            break;
+        }
+    }
+    assert_eq!(batches, [1000, 201, 0], "two bounded batches, then nothing");
+    assert_eq!(count(&superuser, expired_attempts).await, 0);
+    assert_eq!(
+        count(
+            &superuser,
+            "SELECT count(*) FROM platform.signup_admissions"
+        )
+        .await,
+        live_windows + 1,
+        "live windows, and the new start's, remain"
+    );
+    assert_eq!(
+        count(
+            &superuser,
+            "SELECT count(*) FROM platform.signup_attempts
+              WHERE expires_at > statement_timestamp()"
+        )
+        .await,
+        2,
+        "both live pending starts remain"
+    );
+
+    // 5. Creator accounting outlives the attempt.
+    let (attempt, creator): (Option<uuid::Uuid>, Option<i32>) = sqlx::query_as(
+        "SELECT signup_attempt_id, octet_length(signup_creator_key)
+           FROM platform.tenants WHERE slug = 'pseudonym-co'",
+    )
+    .fetch_one(&superuser)
+    .await
+    .expect("tenant reads");
+    assert_eq!((attempt, creator), (None, Some(32)));
+}

@@ -7832,8 +7832,10 @@ async fn a_visitor_creates_a_workspace_with_google() {
         "WITH a AS (UPDATE platform.signup_attempts SET status = 'failed' \
                      WHERE subject = 'google-cara' RETURNING id) \
          INSERT INTO platform.tenants \
-             (data_tenant_id, slug, display_name, status, provisioning_failed_reason, signup_attempt_id) \
-         SELECT $1, 'cara', 'Cara', 'failed', 'interrupted', id FROM a",
+             (data_tenant_id, slug, display_name, status, provisioning_failed_reason, \
+              signup_attempt_id, signup_creator_key) \
+         SELECT $1, 'cara', 'Cara', 'failed', 'interrupted', id, \
+                sha256(convert_to('cara', 'UTF8')) FROM a",
     )
     .bind(interrupted)
     .execute(&superuser)

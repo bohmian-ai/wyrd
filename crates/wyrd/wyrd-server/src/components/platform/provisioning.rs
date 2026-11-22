@@ -107,6 +107,8 @@ pub struct HumanOwner<'a> {
     pub subject: &'a str,
     /// The provider's email, when it gave one.
     pub email: Option<&'a str>,
+    /// The identity's keyed creator pseudonym, kept on the tenant.
+    pub creator_key: &'a [u8; 32],
 }
 
 /// The tenant administrator a provisioning run establishes.
@@ -314,6 +316,7 @@ impl TenantProvisioning {
             request.slug.as_str(),
             &request.display_name,
             owner.attempt,
+            owner.creator_key,
         )
         .await
         .map(|claim| claim.tenant_id(proposed))

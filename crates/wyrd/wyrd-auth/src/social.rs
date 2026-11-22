@@ -43,8 +43,8 @@ use wyrd_sql::queries::auth::{
 };
 use wyrd_sql::queries::platform::signup::{
     PendingSignup, SignupAdmissionScope, SignupProof, admit_signup, finish_signup_creation,
-    insert_proven_signup, insert_signup_attempt, proven_signup, start_signup_creation,
-    take_signup_attempt,
+    insert_proven_signup, insert_signup_attempt, proven_signup, purge_expired_signup_state,
+    start_signup_creation, take_signup_attempt,
 };
 use wyrd_sql::queries::platform::social::{
     LoginSettingsRow, ProviderEnablement, SocialProviderRow, SocialTestState,
@@ -972,6 +972,9 @@ const SIGNUP_IDENTITY_ATTEMPTS: i32 = 5;
 /// Length of one signup admission window.
 const SIGNUP_WINDOW: std::time::Duration = std::time::Duration::from_hours(1);
 
+/// Most expired windows, and most expired attempts, one purge batch removes.
+const SIGNUP_PURGE_BATCH: i64 = 500;
+
 /// A proven signup this completion now holds for creating its workspace.
 #[derive(Debug, Clone)]
 pub struct SignupCreation {
@@ -987,6 +990,8 @@ pub struct SignupCreation {
     pub subject: String,
     /// The provider's email, when it gave one.
     pub email: Option<String>,
+    /// The identity's keyed creator pseudonym, recorded on the tenant.
+    pub creator_key: [u8; 32],
     /// The tenant an earlier, failed completion of this attempt claimed, and
     /// its slug.
     pub claimed: Option<(DataTenantId, String)>,
@@ -1015,12 +1020,9 @@ impl SocialSignIn {
         source: Option<std::net::IpAddr>,
     ) -> Result<BegunBrowserLogin, WyrdError> {
         let source = source.ok_or_else(source_unknown)?;
-        self.admit(&[(
-            SignupAdmissionScope::Start,
-            crate::admission::source_key(source),
-            SIGNUP_START_ATTEMPTS,
-        )])
-        .await?;
+        let start = self.pseudonym("start", crate::admission::source_key(source).as_bytes())?;
+        self.admit(&[(SignupAdmissionScope::Start, start, SIGNUP_START_ATTEMPTS)])
+            .await?;
         if !self.settings().await?.signup_enabled {
             return Err(signup_unavailable());
         }
@@ -1167,16 +1169,17 @@ impl SocialSignIn {
             .ok_or_else(|| invalid_state("this signup names an unknown provider"))?;
         self.recheck_signup(provider, proven.provider_revision)
             .await?;
-        let identity = format!("{} {}", proven.issuer, proven.subject);
+        let identity = identity_value(&proven.issuer, &proven.subject);
+        let creator_key = self.pseudonym("creator", &identity)?;
         self.admit(&[
             (
                 SignupAdmissionScope::Identity,
-                identity,
+                self.pseudonym("identity", &identity)?,
                 SIGNUP_IDENTITY_ATTEMPTS,
             ),
             (
                 SignupAdmissionScope::Source,
-                crate::admission::source_key(source),
+                self.pseudonym("source", crate::admission::source_key(source).as_bytes())?,
                 SIGNUP_SOURCE_ATTEMPTS,
             ),
         ])
@@ -1202,8 +1205,38 @@ impl SocialSignIn {
             issuer: proven.issuer,
             subject: proven.subject,
             email: proven.email,
+            creator_key,
             claimed,
         })
+    }
+
+    /// Remove one bounded batch of expired signup admission windows and
+    /// attempts, returning how many rows went; `0` once nothing has expired.
+    ///
+    /// Background auth maintenance repeats this; no public request purges.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::AuthVerifyUnavailable`] when the store fails.
+    pub async fn purge_expired_signups(&self) -> Result<u64, WyrdError> {
+        purge_expired_signup_state(&self.operator, SIGNUP_WINDOW, SIGNUP_PURGE_BATCH)
+            .await
+            .map_err(store_error)
+    }
+
+    /// The keyring pseudonym of `value` in `scope`, which signup admission
+    /// and creator accounting store instead of the value.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::AuthVerifyUnavailable`] when the deployment has no
+    /// sealing keyring, which refuses signup rather than storing plain keys.
+    fn pseudonym(&self, scope: &str, value: &[u8]) -> Result<[u8; 32], WyrdError> {
+        self.keyring
+            .as_ref()
+            .map(|keyring| keyring.pseudonym(scope, value))
+            .ok_or_else(|| WyrdError::AuthVerifyUnavailable {
+                message: "signup needs the deployment sealing keyring".to_owned(),
+                details: json!({ "reason": "sealing_key_missing" }),
+            })
     }
 
     /// Count one attempt in every `(scope, key, limit)` window and refuse with
@@ -1215,7 +1248,7 @@ impl SocialSignIn {
     /// unavailable, which refuses rather than admits.
     async fn admit(
         &self,
-        windows: &[(SignupAdmissionScope, String, i32)],
+        windows: &[(SignupAdmissionScope, [u8; 32], i32)],
     ) -> Result<(), WyrdError> {
         let mut wait = None;
         for (scope, key, limit) in windows {
@@ -1308,6 +1341,16 @@ impl BrowserSessions {
 
 /// A signup request whose trusted source cannot be determined, which no
 /// per-source window could count.
+/// The admission value of a provider identity: its issuer namespace and
+/// subject, length-delimited so no two identities share one.
+fn identity_value(issuer: &str, subject: &str) -> Vec<u8> {
+    let mut value = Vec::with_capacity(8 + issuer.len() + subject.len());
+    value.extend_from_slice(&(issuer.len() as u64).to_be_bytes());
+    value.extend_from_slice(issuer.as_bytes());
+    value.extend_from_slice(subject.as_bytes());
+    value
+}
+
 fn source_unknown() -> WyrdError {
     WyrdError::AuthVerifyUnavailable {
         message: "this request's source cannot be determined, so signup cannot admit it".to_owned(),

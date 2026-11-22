@@ -90,6 +90,12 @@ pub async fn insert_provisioning_tenant(
 /// stale after two minutes without progress, inside its proof's five-minute
 /// completion window.
 ///
+/// A new claim is refused, returning `None`, when the creator already owns
+/// the deployment's owned-workspace cap of unretired signup tenants; failed
+/// and provisioning claims count, and resuming this attempt's own claim is
+/// not a new one. Claims by one creator are serialized on a transaction
+/// lock, so concurrent completions on any replica cannot exceed the cap.
+///
 /// # Errors
 /// Returns [`SqlError::UniqueViolation`] when the slug belongs to another
 /// tenant or claim, and [`SqlError::Query`] when the insert fails.
@@ -100,7 +106,30 @@ pub async fn claim_signup_tenant(
     display_name: &str,
     attempt: uuid::Uuid,
     creator: &[u8; 32],
-) -> Result<TenantClaim, SqlError> {
+) -> Result<Option<TenantClaim>, SqlError> {
+    let mut tx = pool.pool().begin().await.map_err(SqlError::from)?;
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(
+                    hashtextextended('wyrd.signup_creator:' || encode($1, 'hex'), 0))",
+    )
+    .bind(creator.as_slice())
+    .execute(&mut *tx)
+    .await
+    .map_err(SqlError::from)?;
+    let admitted: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM platform.tenants WHERE signup_attempt_id = $2)
+                OR (SELECT count(*) FROM platform.tenants
+                     WHERE signup_creator_key = $1 AND status <> 'deleted')
+                   < (SELECT signup_workspace_cap FROM platform.login_settings)",
+    )
+    .bind(creator.as_slice())
+    .bind(attempt)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(SqlError::from)?;
+    if !admitted {
+        return Ok(None);
+    }
     let adopted = sqlx::query_scalar::<_, uuid::Uuid>(
         "INSERT INTO platform.tenants
              (data_tenant_id, slug, display_name, status, signup_attempt_id,
@@ -122,7 +151,7 @@ pub async fn claim_signup_tenant(
     .bind(display_name)
     .bind(attempt)
     .bind(creator.as_slice())
-    .fetch_optional(pool.pool())
+    .fetch_optional(&mut *tx)
     .await
     .map_err(SqlError::from)?;
     let Some(claimed) = adopted else {
@@ -130,13 +159,14 @@ pub async fn claim_signup_tenant(
             constraint: "tenants_slug_key".to_owned(),
         });
     };
-    Ok(if claimed == data_tenant_id.as_uuid() {
+    tx.commit().await.map_err(SqlError::from)?;
+    Ok(Some(if claimed == data_tenant_id.as_uuid() {
         TenantClaim::Created
     } else {
         TenantClaim::Resumed(
             DataTenantId::try_from(claimed).map_err(SqlError::InvalidDataTenantId)?,
         )
-    })
+    }))
 }
 
 /// Which tenant row a provisioning attempt ended up owning.

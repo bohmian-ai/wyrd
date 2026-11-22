@@ -76,6 +76,16 @@ ALTER TABLE platform.tenants
     ADD CONSTRAINT tenants_signup_creator
         CHECK (signup_attempt_id IS NULL OR signup_creator_key IS NOT NULL);
 
+-- The owned-workspace cap counts a creator's unretired signup tenants.
+CREATE INDEX platform_tenants_signup_creator_key
+    ON platform.tenants (signup_creator_key) WHERE signup_creator_key IS NOT NULL;
+
+-- Each proven identity may own at most this many unretired signup-created
+-- tenants (revision 5 owned-workspace cap, default 3).
+ALTER TABLE platform.login_settings
+    ADD COLUMN signup_workspace_cap INTEGER NOT NULL DEFAULT 3
+        CHECK (signup_workspace_cap BETWEEN 1 AND 65535);
+
 ALTER TABLE platform.signup_attempts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE platform.signup_attempts FORCE ROW LEVEL SECURITY;
 CREATE POLICY operator_access ON platform.signup_attempts TO CURRENT_USER

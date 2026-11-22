@@ -181,6 +181,19 @@ pub struct LoginSettings {
     pub password_enabled: bool,
     /// Whether a visitor may create a new workspace with an enabled provider.
     pub signup_enabled: bool,
+    /// The most unretired signup-created workspaces one proven identity may
+    /// own; failed and provisioning claims count until retired.
+    #[serde(default = "LoginSettings::default_workspace_cap")]
+    #[cfg_attr(feature = "server", schema(value_type = u16, minimum = 1))]
+    pub signup_workspace_cap: std::num::NonZeroU16,
+}
+
+impl LoginSettings {
+    /// The owned-workspace cap a deployment starts with.
+    #[must_use]
+    pub const fn default_workspace_cap() -> std::num::NonZeroU16 {
+        std::num::NonZeroU16::MIN.saturating_add(2)
+    }
 }
 
 /// How Wyrd secures its connection to the SMTP relay.

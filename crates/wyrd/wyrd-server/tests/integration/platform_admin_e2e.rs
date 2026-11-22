@@ -5584,7 +5584,7 @@ async fn an_operator_configures_and_tests_google_beside_company_sso() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         settings,
-        json!({ "password_enabled": true, "signup_enabled": false })
+        json!({ "password_enabled": true, "signup_enabled": false, "signup_workspace_cap": 3 })
     );
 
     // 2. Storing the client discloses the callback and never the secret.

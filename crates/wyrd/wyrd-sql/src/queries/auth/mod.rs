@@ -96,7 +96,7 @@ pub use user_identities::{
     user_id_by_identity,
 };
 pub use users::{
-    LocalCredentialRow, UserRow, delete_user, insert_local_user, insert_user,
+    LocalCredentialRow, UserRow, delete_user, first_local_user, insert_local_user, insert_user,
     local_credential_by_username, local_credential_for_update, local_username, set_password_hash,
     user_by_id,
 };

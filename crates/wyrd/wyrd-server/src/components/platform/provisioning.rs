@@ -33,8 +33,8 @@ use wyrd_sql::queries::auth::{
     role_by_name, tenant_admin_principal_id,
 };
 use wyrd_sql::queries::auth::{
-    insert_local_user, insert_user, insert_user_identity, linked_identity,
-    local_credential_by_username, set_password_hash,
+    first_local_user, insert_local_user, insert_user, insert_user_identity, linked_identity,
+    set_password_hash,
 };
 use wyrd_sql::queries::platform::provisioning::{
     claim_signup_tenant, insert_provisioning_tenant, mark_tenant_active, mark_tenant_failed,
@@ -80,6 +80,10 @@ pub enum ProvisionError {
     /// discover which tenants exist.
     #[error("no active tenant to act on")]
     TenantUnavailable,
+    /// The signup's creator already owns the owned-workspace cap of
+    /// unretired signup-created tenants.
+    #[error("the owned-workspace cap is reached")]
+    WorkspaceLimit,
     /// A store write failed; the tenant is left visibly incomplete.
     #[error("tenant provisioning failed: {0}")]
     Store(String),
@@ -302,8 +306,9 @@ impl TenantProvisioning {
     ///
     /// # Errors
     /// Returns [`ProvisionError::SlugTaken`] when the slug belongs to
-    /// another tenant or claim, and [`ProvisionError::Store`] when the write
-    /// fails.
+    /// another tenant or claim, [`ProvisionError::WorkspaceLimit`] when the
+    /// creator is at the owned-workspace cap, and [`ProvisionError::Store`]
+    /// when the write fails.
     #[tracing::instrument(level = "info", skip(self, owner), fields(slug = %request.slug), err)]
     pub async fn claim_for_signup(
         &self,
@@ -320,8 +325,9 @@ impl TenantProvisioning {
             owner.creator_key,
         )
         .await
+        .map_err(slug_or_store)?
         .map(|claim| claim.tenant_id(proposed))
-        .map_err(slug_or_store)
+        .ok_or(ProvisionError::WorkspaceLimit)
     }
 
     /// Make a signup-claimed tenant usable with `owner` as its administrator
@@ -827,6 +833,9 @@ fn summarize(row: TenantRow) -> Result<ProvisionedTenant, ProvisionError> {
 /// The User, and its linked identity if any, that an earlier interrupted run
 /// of this signup already created for `credential`; `None` on a first run.
 ///
+/// A local owner is the tenant's one local User, so a retry under another
+/// username keeps the original administrator rather than adding a second.
+///
 /// # Errors
 /// Returns a SQLx error when the read fails.
 async fn existing_owner(
@@ -839,8 +848,8 @@ async fn existing_owner(
         } => linked_identity(conn, issuer, subject)
             .await?
             .map(|linked| (linked.user_id, Some(linked.id))),
-        SignupCredential::Local { username, .. } => local_credential_by_username(conn, username)
-            .await?
-            .map(|local| (local.id, None)),
+        SignupCredential::Local { .. } => {
+            first_local_user(conn).await?.map(|local| (local.id, None))
+        }
     })
 }

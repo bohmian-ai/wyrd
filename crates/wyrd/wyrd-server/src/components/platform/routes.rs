@@ -277,6 +277,14 @@ pub(crate) fn provision_error(error: ProvisionError) -> WyrdErrorResponse {
             message: "no active tenant to act on".to_owned(),
             details: serde_json::json!({ "resource": "tenant" }),
         }),
+        ProvisionError::WorkspaceLimit => {
+            WyrdErrorResponse::from(WyrdError::SignupWorkspaceLimit {
+                message: "this identity already owns the most workspaces signup allows; \
+                          retire one or ask an operator"
+                    .to_owned(),
+                details: serde_json::json!({}),
+            })
+        }
         ProvisionError::Store(reason) => {
             WyrdErrorResponse::from(internal_failure("tenant provisioning failed", &reason))
         }

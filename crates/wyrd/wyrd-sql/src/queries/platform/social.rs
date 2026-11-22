@@ -270,6 +270,8 @@ pub struct LoginSettingsRow {
     pub password_enabled: bool,
     /// Public workspace signup is available.
     pub signup_enabled: bool,
+    /// The owned-workspace cap per proven identity, at least 1.
+    pub signup_workspace_cap: i32,
 }
 
 /// Read the deployment login settings.
@@ -278,7 +280,8 @@ pub struct LoginSettingsRow {
 /// Returns [`SqlError::Query`] when the read fails, including a missing row.
 pub async fn login_settings(pool: &OperatorPool) -> Result<LoginSettingsRow, SqlError> {
     sqlx::query_as::<_, LoginSettingsRow>(
-        "SELECT password_enabled, signup_enabled FROM platform.login_settings",
+        "SELECT password_enabled, signup_enabled, signup_workspace_cap
+           FROM platform.login_settings",
     )
     .fetch_one(pool.pool())
     .await
@@ -295,10 +298,12 @@ pub async fn put_login_settings(
 ) -> Result<(), SqlError> {
     sqlx::query(
         "UPDATE platform.login_settings
-            SET password_enabled = $1, signup_enabled = $2, updated_at = now()",
+            SET password_enabled = $1, signup_enabled = $2,
+                signup_workspace_cap = $3, updated_at = now()",
     )
     .bind(settings.password_enabled)
     .bind(settings.signup_enabled)
+    .bind(settings.signup_workspace_cap)
     .execute(&mut **conn.transaction())
     .await
     .map(|_| ())

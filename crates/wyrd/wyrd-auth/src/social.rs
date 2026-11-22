@@ -551,6 +551,13 @@ impl SocialSignIn {
         Ok(LoginSettings {
             password_enabled: row.password_enabled,
             signup_enabled: row.signup_enabled,
+            signup_workspace_cap: u16::try_from(row.signup_workspace_cap)
+                .ok()
+                .and_then(std::num::NonZeroU16::new)
+                .ok_or_else(|| WyrdError::AuthVerifyUnavailable {
+                    message: "the stored workspace cap is out of range".to_owned(),
+                    details: json!({}),
+                })?,
         })
     }
 
@@ -568,6 +575,7 @@ impl SocialSignIn {
             LoginSettingsRow {
                 password_enabled: settings.password_enabled,
                 signup_enabled: settings.signup_enabled,
+                signup_workspace_cap: i32::from(settings.signup_workspace_cap.get()),
             },
         )
         .await

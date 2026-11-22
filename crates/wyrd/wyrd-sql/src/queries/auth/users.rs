@@ -151,6 +151,31 @@ pub async fn local_credential_by_username(
     .await
 }
 
+/// The tenant's first-created local User's credential, in any status;
+/// `None` when the tenant has no local User.
+///
+/// A signup-created tenant has exactly one local User until it is active,
+/// so a resumed creation finds its owner here whatever username the retry
+/// asks for.
+///
+/// # Errors
+/// Returns a SQLx error when Postgres rejects the read.
+pub async fn first_local_user(
+    conn: &mut TenantConn<'_>,
+) -> Result<Option<LocalCredentialRow>, sqlx::Error> {
+    sqlx::query_as::<_, LocalCredentialRow>(
+        r"
+        SELECT id, username, password_hash, password_revision, status
+          FROM wyrd.auth_users
+         WHERE password_hash IS NOT NULL
+         ORDER BY created_at, id
+         LIMIT 1
+        ",
+    )
+    .fetch_optional(&mut **conn.transaction())
+    .await
+}
+
 /// The local credential of User `id`, locked for update; `None` when the User
 /// has no local password.
 ///

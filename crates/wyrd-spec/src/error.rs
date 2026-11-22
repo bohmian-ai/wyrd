@@ -636,6 +636,22 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// The proven identity already owns the deployment's owned-workspace cap
+    /// of signup-created workspaces that are not retired. Waiting does not
+    /// clear it.
+    #[error("[WYRD_AUTH_403_SIGNUP_WORKSPACE_LIMIT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_403_SIGNUP_WORKSPACE_LIMIT",
+        status = 403,
+        title = "Workspace limit reached",
+        remediation = "Sign in to a workspace this identity already owns, or ask an operator to retire one; retrying does not help."
+    )]
+    SignupWorkspaceLimit {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// An enrollment invitation or password-reset code is malformed, unknown,
     /// expired, revoked, already used, or for another tenant,
     /// indistinguishably.
@@ -4176,6 +4192,7 @@ impl WyrdError {
             | Self::PasswordInvalid { message, details }
             | Self::PasswordAttempts { message, details }
             | Self::SignupAttempts { message, details }
+            | Self::SignupWorkspaceLimit { message, details }
             | Self::OneTimeCodeInvalid { message, details }
             | Self::RecentLoginRequired { message, details }
             | Self::DeviceAuthorization { message, details }
@@ -5137,6 +5154,10 @@ mod tests {
             WyrdError::SignupAttempts {
                 message: "too many workspace signups".to_owned(),
                 details: serde_json::json!({ "retry_after_seconds": 3600 }),
+            },
+            WyrdError::SignupWorkspaceLimit {
+                message: "workspace limit reached".to_owned(),
+                details: serde_json::json!({}),
             },
             WyrdError::OneTimeCodeInvalid {
                 message: "one-time code not accepted".to_owned(),

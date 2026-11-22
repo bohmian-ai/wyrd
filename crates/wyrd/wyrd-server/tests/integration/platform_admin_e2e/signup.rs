@@ -1067,7 +1067,8 @@ async fn statuses(superuser: &sqlx::PgPool, slug: &str) -> Vec<String> {
 ///      local User is its administrator, signs it in with a password
 ///      session, and clears the attempt's email;
 ///   4. replaying the spent completion names the same workspace, opens no
-///      session and creates nothing;
+///      session and creates nothing; a resumed creation retried under
+///      another username keeps the one original administrator;
 ///   5. a claim interrupted in `creating` beyond the two-minute staleness bound resumes
 ///      under its own tenant id only with its own completion cookie; another
 ///      proof cannot adopt it, and a recent one still reads as in progress;
@@ -1169,6 +1170,46 @@ async fn completion_consumes_either_proof_and_recovers_its_own_claim() {
     assert!(again.is_none(), "a replay opens no session");
     assert_eq!(statuses(&superuser, "harbor").await, ["active"]);
 
+    // 4b. A retry under another username keeps the original administrator.
+    sqlx::query(
+        "WITH a AS (UPDATE platform.signup_attempts SET status = 'failed', email = $1
+                     WHERE proof_kind = 'email' RETURNING id)
+         UPDATE platform.tenants SET status = 'failed', provisioning_failed_reason = 'interrupted'
+          WHERE slug = 'harbor' AND signup_attempt_id IN (SELECT id FROM a)",
+    )
+    .bind(&address)
+    .execute(&superuser)
+    .await
+    .expect("the completed creation is reopened as interrupted");
+    let retry = json!({ "slug": "harbor", "display_name": "Harbor", "local_credentials": {
+        "username": "grace", "password": "lantern quiet harbor" } });
+    let (status, resumed, body) = complete_with(&srv, &local, "198.51.100.90", &retry).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(resumed.is_some());
+    let users: Vec<String> = sqlx::query_scalar(
+        "SELECT u.username FROM wyrd.auth_users u JOIN platform.tenants t
+             ON t.data_tenant_id = u.data_tenant_id
+          WHERE t.slug = 'harbor' AND u.password_hash IS NOT NULL",
+    )
+    .fetch_all(&superuser)
+    .await
+    .expect("users read");
+    assert_eq!(users, ["ada"], "one administrator, under its original name");
+    let (status, _, body) = email_step(
+        &srv,
+        "/auth/browser/password/login",
+        "198.51.100.90",
+        None,
+        "wyrd_session_harbor",
+        &json!({ "tenant": "harbor", "username": "ada", "password": "lantern quiet harbor" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the retry's password signs in: {body}"
+    );
+
     // 5. An interrupted claim resumes only for its own attempt.
     let erin = prove_signup(&srv, &google, "google-erin").await;
     let other = prove_signup(&srv, &google, "google-other").await;
@@ -1251,4 +1292,213 @@ async fn completion_consumes_either_proof_and_recovers_its_own_claim() {
         ["provisioning"],
         "never active ownerless"
     );
+}
+
+/// Complete a Google proof for `subject` as `slug` from `client`; returns
+/// the status and body.
+async fn create_as(
+    srv: &WyrdTestServer,
+    google: &wiremock::MockServer,
+    subject: &str,
+    slug: &str,
+    client: &str,
+) -> (StatusCode, Value) {
+    let proof = prove_signup(srv, google, subject).await;
+    let (status, _, body) = complete_with(
+        srv,
+        &proof,
+        client,
+        &json!({ "slug": slug, "display_name": slug }),
+    )
+    .await;
+    (status, body)
+}
+
+/// Assert `body` is the owned-workspace cap refusal.
+fn at_cap(status: StatusCode, body: &Value, case: &str) {
+    assert_eq!(status, StatusCode::FORBIDDEN, "{case}: {body}");
+    assert_eq!(
+        body["code"], "WYRD_AUTH_403_SIGNUP_WORKSPACE_LIMIT",
+        "{case}"
+    );
+}
+
+/// Each proven identity owns at most the configured number of
+/// signup-created workspaces that are not retired:
+///   1. the cap is an operator login setting, default 3;
+///   2. at the cap a new claim is refused with `403`, not `429`, and creates
+///      nothing;
+///   3. the count survives purging the identity's attempts, and a failed
+///      claim still counts;
+///   4. retiring a workspace frees capacity;
+///   5. two concurrent claims across replicas at one slot left create one;
+///   6. resuming an attempt's own claim at the cap is not a new claim;
+///   7. an email identity at the same address is a different identity, and
+///      operator creation is never capped.
+///
+/// # Panics
+/// Panics when a claim is admitted or refused differently.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_owned_workspace_cap_holds_atomically_across_purge() {
+    let google = wiremock::MockServer::start().await;
+    let (srv, session) = signup_server(&google).await;
+    let api = relay_to_mailpit(&srv, &session).await;
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+
+    // 1. The cap is configurable and defaults to three.
+    let settings = |body: Option<Value>| {
+        social_request(
+            if body.is_some() {
+                Method::PUT
+            } else {
+                Method::GET
+            },
+            "/platform/login-settings",
+            Some(&session),
+            body,
+        )
+    };
+    let (status, current) = social_call(&srv, settings(None)).await;
+    assert_eq!(status, StatusCode::OK, "{current}");
+    assert_eq!(current["signup_workspace_cap"], 3, "{current}");
+    let (status, changed) = social_call(
+        &srv,
+        settings(Some(
+            json!({ "password_enabled": true, "signup_enabled": true,
+                               "signup_workspace_cap": 1 }),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{changed}");
+    let (status, refused) = social_call(
+        &srv,
+        settings(Some(
+            json!({ "password_enabled": true, "signup_enabled": true,
+                               "signup_workspace_cap": 0 }),
+        )),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a cap below one: {refused}"
+    );
+
+    // 2. At the cap a new claim is refused and creates nothing.
+    let (status, body) = create_as(&srv, &google, "google-cap", "cap-a", "198.51.100.100").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = create_as(&srv, &google, "google-cap", "cap-b", "198.51.100.101").await;
+    at_cap(status, &body, "second workspace");
+    assert!(statuses(&superuser, "cap-b").await.is_empty());
+
+    // 3. The count survives purge, and a failed claim counts.
+    sqlx::query("DELETE FROM platform.signup_attempts WHERE subject = 'google-cap'")
+        .execute(&superuser)
+        .await
+        .expect("attempts purge");
+    let (status, body) = create_as(&srv, &google, "google-cap", "cap-c", "198.51.100.102").await;
+    at_cap(status, &body, "after purge");
+    sqlx::query("UPDATE platform.tenants SET status = 'failed', provisioning_failed_reason = 'interrupted' WHERE slug = 'cap-a'")
+        .execute(&superuser)
+        .await
+        .expect("claim fails");
+    let (status, body) = create_as(&srv, &google, "google-cap", "cap-d", "198.51.100.103").await;
+    at_cap(status, &body, "a failed claim counts");
+
+    // 4. Retirement frees capacity.
+    sqlx::query("UPDATE platform.tenants SET status = 'deleted', provisioning_failed_reason = NULL WHERE slug = 'cap-a'")
+        .execute(&superuser)
+        .await
+        .expect("tenant retires");
+    let (status, body) = create_as(&srv, &google, "google-cap", "cap-e", "198.51.100.104").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // 5. Concurrent claims across replicas at one slot create one.
+    let replica = srv
+        .start_replica(
+            WyrdTestServer::builder().with_trusted_ingress_for_test(&[INGRESS], CLIENT_HEADER),
+        )
+        .await
+        .expect("replica starts");
+    let first = prove_signup(&srv, &google, "google-race").await;
+    let second = prove_signup(&srv, &google, "google-race").await;
+    let race_1 = json!({ "slug": "race-1", "display_name": "Race" });
+    let race_2 = json!({ "slug": "race-2", "display_name": "Race" });
+    let (one, two) = tokio::join!(
+        complete_with(&srv, &first, "198.51.100.105", &race_1),
+        complete_with(&replica, &second, "198.51.100.106", &race_2),
+    );
+    let mut outcomes = [one.0, two.0];
+    outcomes.sort();
+    assert_eq!(
+        outcomes,
+        [StatusCode::OK, StatusCode::FORBIDDEN],
+        "{one:?} {two:?}"
+    );
+    let created: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM platform.tenants WHERE slug IN ('race-1', 'race-2')",
+    )
+    .fetch_one(&superuser)
+    .await
+    .expect("directory reads");
+    assert_eq!(created, 1);
+
+    // 6. Resuming an own claim at the cap is not a new claim.
+    let resuming = prove_signup(&srv, &google, "google-race").await;
+    sqlx::query(
+        "WITH a AS (UPDATE platform.signup_attempts SET status = 'failed'
+                     WHERE id = (SELECT id FROM platform.signup_attempts
+                                  WHERE subject = 'google-race' AND status = 'proven'
+                                  ORDER BY id DESC LIMIT 1) RETURNING id)
+         INSERT INTO platform.tenants
+             (data_tenant_id, slug, display_name, status, provisioning_failed_reason,
+              signup_attempt_id, signup_creator_key)
+         SELECT $1, 'race-own', 'Race', 'failed', 'interrupted', a.id,
+                (SELECT signup_creator_key FROM platform.tenants
+                  WHERE slug IN ('race-1', 'race-2'))
+           FROM a",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .execute(&superuser)
+    .await
+    .expect("an own failed claim is staged");
+    let (status, _, body) = complete_with(
+        &srv,
+        &resuming,
+        "198.51.100.107",
+        &json!({ "slug": "race-own", "display_name": "Race" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(statuses(&superuser, "race-own").await, ["active"]);
+
+    // 7. Identities are never merged by email; operators are never capped.
+    let (local, _) = email_proof(&srv, &api, "google-cap@example.test", "198.51.100.108").await;
+    let (status, _, body) = complete_with(
+        &srv,
+        &local,
+        "198.51.100.108",
+        &json!({ "slug": "cap-mail", "display_name": "Mail",
+                 "local_credentials": { "username": "cap", "password": "quiet harbor lantern" } }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "same address, other identity: {body}"
+    );
+    let (status, body) = social_call(
+        &srv,
+        social_request(
+            Method::POST,
+            "/platform/tenants",
+            Some(&session),
+            Some(json!({ "slug": "operator-made", "display_name": "Operator" })),
+        ),
+    )
+    .await;
+    assert!(status.is_success(), "operator creation: {body}");
 }

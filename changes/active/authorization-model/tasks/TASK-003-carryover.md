@@ -493,7 +493,12 @@ before the old 15-minute staleness bound, so recovery was unreachable. The spec'
 "Crash recovery" bullet now sets a two-minute signup staleness bound. It is applied in
 `start_signup_creation` and in `claim_signup_tenant`'s adoption check. Operator
 `insert_provisioning_tenant` keeps 15 minutes. The journey stages a claim three minutes old with
-a live proof. Tenant contact retention joins cycle 10, which owns verified contact. **TDD: PASS** for step 1,
+a live proof. Follow-up: a resumed local creation used to look its owner up by the retried username, so
+a retry under another name added a second administrator. It now keeps the tenant's one local
+User (`first_local_user`). Step 4b reopens the completed `harbor` as interrupted and retries as
+`grace`. It asserts the only local User is still `ada` and that the retry's password signs
+`ada` in. The fix preceded this assertion, so this sub-case is a **TDD process violation**.
+Tenant contact retention joins cycle 10, which owns verified contact. **TDD: PASS** for step 1,
 with mutation proof for step 5. Commands: the selector above, and
 `cargo nextest run --locked -p wyrd-auth -p wyrd-sql -p wyrd-server --features
 wyrd-server/test-support --lib --test integration -E 'kind(lib) | test(/^platform_admin_e2e::/)
@@ -514,6 +519,39 @@ are unaffected. Never merge identities by email to deduplicate humans.
 
 **Proof:** tier-1 concurrent claims and SQL atomicity/retention assertions. RED is
 missing creator/cap persistence and claim enforcement in staged code.
+
+**Evidence (cycle 8):** RED — `platform_admin_e2e::signup::the_owned_workspace_cap_holds_atomically_across_purge`
+first failed because `GET /platform/login-settings` had no `signup_workspace_cap`. GREEN after
+these changes:
+- Migration 000006 (unapplied) adds `platform.login_settings.signup_workspace_cap` (default 3,
+  1–65535) and an index on `platform.tenants.signup_creator_key`, per spec "revision 5 adds the
+  owned-workspace cap".
+- `LoginSettings.signup_workspace_cap` is a `NonZeroU16` that defaults to 3 when omitted.
+- `PUT /platform/login-settings` now maps a bad body through the shared `body_rejection`, so a
+  cap of 0 answers `400 WYRD_SPEC_400_VALIDATION` instead of axum's bare `422`.
+- `claim_signup_tenant` takes a per-creator `pg_advisory_xact_lock`, then admits only the
+  attempt's own existing claim, or a creator below the cap. The count covers tenants with that
+  creator key whose status is not `deleted`.
+- The cap refusal is the new catalog error `WYRD_AUTH_403_SIGNUP_WORKSPACE_LIMIT`, carried
+  through `ProvisionError::WorkspaceLimit`. The TS error codes and the docs error page were
+  regenerated.
+
+The journey asserts, with cap 1:
+- a second claim gets `403` and creates nothing;
+- the refusal holds after the attempt rows are deleted, and while the claim is `failed`;
+- retiring the tenant (status `deleted`, set in SQL because no operator retirement surface
+  exists yet) frees the slot;
+- two completions of one identity raced on the server and a replica give `[200, 403]`, with
+  one tenant;
+- an own failed claim staged at the cap resumes to `active`;
+- an email identity at the same address creates its own workspace, so there is no merging by
+  email;
+- operator `POST /platform/tenants` succeeds.
+
+The login-settings shape assertion in `an_operator_configures_and_tests_google_beside_company_sso`
+was extended to the new field. **TDD: PASS.** Commands: the cycle 7 lane command
+(1012/1012 after the shape update), clippy `-D warnings`, `codegen:check`, `docs:check`,
+`check:tenant-isolation`.
 
 ### 9. Optional Turnstile validates after admission and before claim
 

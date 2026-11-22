@@ -327,14 +327,16 @@ async fn read_login_settings(
 /// Replace the deployment login settings.
 ///
 /// # Errors
-/// Returns a stable Wyrd error when the caller is unauthorized or the write
-/// fails.
+/// Returns a stable Wyrd error when the body is malformed, the caller is
+/// unauthorized or the write fails.
 #[utoipa::path(
     put,
     path = "/platform/login-settings",
     request_body = LoginSettings,
     responses(
         (status = 200, description = "The stored settings", body = LoginSettings),
+        (status = 400, description = "The body is malformed or the workspace cap is below one \
+          (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
         (status = 403, description = "Platform identity administration required \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
@@ -347,8 +349,10 @@ async fn read_login_settings(
 async fn write_login_settings(
     State(state): State<AppState>,
     caller: PlatformCaller,
-    Json(settings): Json<LoginSettings>,
+    settings: Result<Json<LoginSettings>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<LoginSettings>, WyrdErrorResponse> {
+    let Json(settings) =
+        settings.map_err(|rejection| crate::http::error::body_rejection(&rejection))?;
     let pool = operator(&state)?;
     let authz =
         PlatformAuthorization::new(pool.clone(), Arc::clone(state.bifrost.scribe_outbox()) as _);

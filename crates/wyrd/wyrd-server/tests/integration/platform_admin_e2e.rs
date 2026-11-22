@@ -7649,9 +7649,12 @@ async fn tenants_named(pool: &PgPool, slug: &str) -> Vec<(uuid::Uuid, String, Op
 ///      proven identity, and whose response carries a tenant session and no
 ///      key, platform principal or platform authority; that session invites
 ///      a teammate;
-///   4. replaying the completion creates no second tenant, and a lost
+///   4. repeating the completion returns the same tenant without a session
+///      and creates no second one, naming another slug conflicts, and a lost
 ///      session response is recovered by returning Google sign-in;
-///   5. racing one proof across two replicas creates exactly one tenant;
+///   5. racing one proof across two replicas creates exactly one tenant: the
+///      other completion is in progress or returns that tenant without a
+///      session;
 ///   6. an interrupted claim resumes only for its own attempt: another
 ///      identity cannot adopt it, and it never becomes active without its
 ///      administrator;
@@ -7802,10 +7805,11 @@ async fn a_visitor_creates_a_workspace_with_google() {
         "the creator invites: {invited}"
     );
 
-    // 4. A replay creates nothing; a lost response is recovered by sign-in.
+    // 4. A replay returns the same workspace and creates nothing; a lost
+    // response is recovered by sign-in.
     let (status, replay, again) = complete_signup(&srv, &ana, "acme", home).await;
-    assert_eq!(status, StatusCode::CONFLICT, "{replay}");
-    assert_eq!(replay["details"]["tenant"], "acme");
+    assert_eq!(status, StatusCode::OK, "{replay}");
+    assert_eq!(replay, json!({ "tenant": "acme" }));
     assert!(again.is_none(), "a replay opens no session");
     let (status, _, _) = complete_signup(&srv, &ana, "acme-other", home).await;
     assert_eq!(
@@ -7844,12 +7848,18 @@ async fn a_visitor_creates_a_workspace_with_google() {
         complete_signup(&srv, &bea, "bea", home),
         complete_signup(&replica, &bea, "bea", home),
     );
-    let mut statuses = [first.0, second.0];
-    statuses.sort();
+    for (status, body, _) in [&first, &second] {
+        assert!(
+            (*status == StatusCode::OK && *body == json!({ "tenant": "bea" }))
+                || (*status == StatusCode::CONFLICT
+                    && body["details"]["reason"] == "signup_in_progress"),
+            "each converges on the one workspace: {first:?} {second:?}"
+        );
+    }
     assert_eq!(
-        statuses,
-        [StatusCode::OK, StatusCode::CONFLICT],
-        "{first:?} {second:?}"
+        [&first.2, &second.2].iter().filter(|cookie| cookie.is_some()).count(),
+        1,
+        "only the creating completion opens a session: {first:?} {second:?}"
     );
     let rows = tenants_named(&superuser, "bea").await;
     assert_eq!(rows.len(), 1);

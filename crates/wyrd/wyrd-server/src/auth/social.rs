@@ -17,7 +17,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use secrecy::ExposeSecret as _;
 use wyrd_auth::callback::LoginCompletion;
-use wyrd_auth::social::{SIGNUP_EMAIL_TTL, TenantLogin};
+use wyrd_auth::social::{SIGNUP_EMAIL_TTL, SignupAdmission, TenantLogin};
 use wyrd_spec::auth::{
     BrowserLoginResponse, CreateTenantRequest, ProofStatus, ProofStatusResponse,
     SignupBeginRequest, SignupCompleteRequest, SignupCompleteResponse, SignupVerifyRequest,
@@ -414,13 +414,15 @@ pub async fn signup_verify(
 /// existing provisioner claims the slug, initializes the tenant with the
 /// creator as its `admin` User and promotes it. The response sets the new
 /// workspace's session cookie and carries no key or platform authority. A
-/// completed attempt never creates another workspace; a creator whose
-/// response was lost signs in to it.
+/// completed attempt never creates another workspace: repeating its
+/// completion, as after a lost response, answers the same `{tenant}` without
+/// a session, and the creator signs in to it; naming another slug conflicts.
 ///
 /// # Errors
 /// `400` for an invalid body or slug, or a missing or expired proof; `401`
-/// when signup or the provider changed; `409` when the slug is taken, the
-/// attempt already created its workspace or another completion holds it;
+/// when the provider revision changed; `403` when signup, password or the
+/// provider is no longer offered; `409` when the slug is taken, another
+/// completion holds it, or the attempt created a workspace under another slug;
 /// `429 WYRD_AUTH_429_SIGNUP_ATTEMPTS` while a window is exhausted; `503`
 /// when admission state is unavailable; `500` when provisioning fails.
 #[utoipa::path(
@@ -428,17 +430,19 @@ pub async fn signup_verify(
     path = "/auth/signup/complete",
     request_body = SignupCompleteRequest,
     responses(
-        (status = 200, description = "The workspace exists and its session cookie is set",
+        (status = 200, description = "The workspace exists and its session cookie is set; a \
+          repeated completion of a created workspace answers it without a session",
           body = SignupCompleteResponse,
           headers(("Set-Cookie" = String, description = "The workspace session cookie"))),
         (status = 400, description = "Invalid body or slug, or no live signup proof \
           (WYRD_SPEC_400_VALIDATION, WYRD_AUTH_400_INVALID_STATE)", body = WyrdProblem),
-        (status = 401, description = "Signup or the provider changed after proof \
+        (status = 401, description = "The provider revision changed after proof \
           (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
-        (status = 403, description = "Origin absent or foreign \
-          (WYRD_AUTH_403_ORIGIN_REFUSED)", body = WyrdProblem),
-        (status = 409, description = "Slug taken, workspace already created, or creation \
-          in progress (WYRD_SPEC_409_CONFLICT)", body = WyrdProblem),
+        (status = 403, description = "Origin absent or foreign, or signup, password or the \
+          provider is no longer offered (WYRD_AUTH_403_ORIGIN_REFUSED, \
+          WYRD_AUTH_403_METHOD_UNAVAILABLE)", body = WyrdProblem),
+        (status = 409, description = "Slug taken, creation in progress, or the attempt \
+          already created another workspace (WYRD_SPEC_409_CONFLICT)", body = WyrdProblem),
         (status = 429, description = "Too many workspace signups \
           (WYRD_AUTH_429_SIGNUP_ATTEMPTS)", body = WyrdProblem,
           headers(("Retry-After" = u64, description = "Seconds until the window ends"))),
@@ -475,9 +479,25 @@ pub async fn signup_complete(
     let social = social(&state)?;
     let sessions = browser_sessions(&state)?;
     let provisioning = directory(&state)?;
-    let creation = social
+    let creation = match social
         .admit_signup(&completion, request.local_credentials.as_ref(), source)
-        .await?;
+        .await?
+    {
+        SignupAdmission::Create(creation) => creation,
+        SignupAdmission::Created(tenant) if tenant != request.slug => {
+            return Err(WyrdErrorResponse::from(WyrdError::Conflict {
+                message: format!("this signup already created workspace {tenant}; sign in to it"),
+                details: serde_json::json!({ "reason": "workspace_created", "tenant": tenant }),
+            }));
+        }
+        SignupAdmission::Created(tenant) => {
+            return Ok(with_cookies(
+                StatusCode::OK,
+                vec![cookie_header(&origin, SIGNUP_COOKIE, "", SIGNUP_COOKIE_PATH, 0)],
+                Json(SignupCompleteResponse { tenant }),
+            ));
+        }
+    };
     // The challenge runs after admission, so refused traffic costs no
     // Siteverify call, and before the claim, so a refusal creates nothing.
     if let Err(error) = social

@@ -41,7 +41,10 @@ pub async fn insert_provisioning_tenant(
     // The window is generous so a slow but live attempt is never stolen from;
     // provisioning is a handful of writes and takes nothing like that long. An
     // `active` or `suspended` tenant, and a `provisioning` row that is still
-    // moving, are genuine collisions and still conflict.
+    // moving, are genuine collisions and still conflict. So is any claim a
+    // public signup made: only its own attempt may resume it, through
+    // `claim_signup_tenant`, and its creator key marks it after the attempt
+    // is purged.
     let adopted = sqlx::query_scalar::<_, uuid::Uuid>(
         "INSERT INTO platform.tenants (data_tenant_id, slug, display_name, status)
          VALUES ($1, $2, $3, 'provisioning')
@@ -51,9 +54,10 @@ pub async fn insert_provisioning_tenant(
                 status                    = 'provisioning',
                 provisioning_failed_reason = NULL,
                 updated_at                = now()
-          WHERE platform.tenants.status = 'failed'
-             OR (platform.tenants.status = 'provisioning'
-                 AND platform.tenants.updated_at < now() - interval '15 minutes')
+          WHERE platform.tenants.signup_creator_key IS NULL
+            AND (platform.tenants.status = 'failed'
+                 OR (platform.tenants.status = 'provisioning'
+                     AND platform.tenants.updated_at < now() - interval '15 minutes'))
          RETURNING data_tenant_id",
     )
     .bind(data_tenant_id.as_uuid())

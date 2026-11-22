@@ -1259,6 +1259,16 @@ struct ProviderReturn<'a> {
     response_issuer: Option<&'a str>,
 }
 
+/// What admitting a signup completion decided.
+#[derive(Debug, Clone)]
+pub enum SignupAdmission {
+    /// The completion holds the attempt and creates its workspace.
+    Create(SignupCreation),
+    /// The attempt already created the workspace with this slug; a repeated
+    /// completion returns it and creates nothing.
+    Created(TenantSlug),
+}
+
 /// A proven signup this completion now holds for creating its workspace.
 #[derive(Debug, Clone)]
 pub struct SignupCreation {
@@ -1453,7 +1463,8 @@ impl SocialSignIn {
     /// to create its workspace.
     ///
     /// The proof must match the cookie's digest before its deadline, and
-    /// local signup must still be offered. It is recorded once; the same
+    /// signup and password must still be enabled; removing the mail relay
+    /// withdraws new starts, not a proof already delivered. It is recorded once; the same
     /// browser presenting it again, as after a lost response, gets a fresh
     /// completion secret for the same proof, and any other flow is refused.
     /// A proof begun for a provider attempt instead records the address as
@@ -1463,8 +1474,8 @@ impl SocialSignIn {
     /// # Errors
     /// Returns [`WyrdError::OneTimeCodeInvalid`] for a missing or foreign
     /// cookie, a wrong or spent proof, [`WyrdError::InvalidState`] once
-    /// expired, [`WyrdError::InvalidToken`] when local signup is no longer
-    /// offered, and the store availability errors.
+    /// expired, [`WyrdError::MethodUnavailable`] when signup or password is
+    /// disabled, and the store availability errors.
     pub async fn verify_email_signup(
         &self,
         cookie: Option<&str>,
@@ -1504,9 +1515,7 @@ impl SocialSignIn {
                 Err(refused())
             };
         }
-        if !self.login_methods(None).await?.creation.local_signup {
-            return Err(signup_unavailable());
-        }
+        self.require_local_redemption().await?;
         let completion = SecretString::from(random_secret());
         let completion_hash = Sha256Hex::digest(completion.expose_secret().as_bytes());
         let binding_hash = Sha256Hex::digest(binding.as_bytes());
@@ -1632,26 +1641,31 @@ impl SocialSignIn {
     /// An email proof needs `local` credentials inside the password policy,
     /// which become the creator's tenant-local sign-in; a social proof
     /// refuses them. Signup and, for a social proof, the exact provider
-    /// revision are rechecked. Exactly one completion of an attempt runs at
-    /// a time; a failed one, or its own run interrupted past the
-    /// provisioning-claim staleness bound, may be retried by the same
-    /// attempt, which resumes its own claim.
+    /// revision are rechecked. Every cheap check and both windows come before
+    /// the password is derived, so a refused completion spends no hashing.
+    /// Exactly one completion of an attempt runs at a time; a failed one, or
+    /// its own run interrupted past the provisioning-claim staleness bound,
+    /// may be retried by the same attempt, which resumes its own claim. An
+    /// attempt that already created its workspace answers
+    /// [`SignupAdmission::Created`] with that workspace, as after a lost
+    /// response, and creates nothing.
     ///
     /// # Errors
     /// Returns [`WyrdError::Validation`] for credentials the proof kind or
     /// the password policy refuses, [`WyrdError::InvalidState`] for an
-    /// unknown or expired proof, [`WyrdError::Conflict`] when the attempt
-    /// already created its workspace (`details.tenant` names it) or another
-    /// completion holds it, [`WyrdError::InvalidToken`] when signup or the
-    /// provider changed, [`WyrdError::SignupAttempts`] while a window is
-    /// exhausted, and [`WyrdError::AuthVerifyUnavailable`] when the
-    /// admission state cannot be read.
+    /// unknown or expired proof, [`WyrdError::Conflict`] when another
+    /// completion holds it, [`WyrdError::MethodUnavailable`] when signup,
+    /// password or the provider is no longer offered,
+    /// [`WyrdError::InvalidToken`] when the provider revision changed,
+    /// [`WyrdError::SignupAttempts`] while a window is exhausted, and
+    /// [`WyrdError::AuthVerifyUnavailable`] when the admission state cannot
+    /// be read.
     pub async fn admit_signup(
         &self,
         completion: &str,
         local: Option<&LocalCredentials>,
         source: Option<std::net::IpAddr>,
-    ) -> Result<SignupCreation, WyrdError> {
+    ) -> Result<SignupAdmission, WyrdError> {
         let source = source.ok_or_else(source_unknown)?;
         let proven = proven_signup(
             &self.operator,
@@ -1660,13 +1674,34 @@ impl SocialSignIn {
         .await
         .map_err(store_error)?
         .ok_or_else(|| invalid_state("this signup has expired; start again"))?;
+        let social = match (
+            proven.provider.as_deref().and_then(SocialProvider::parse),
+            proven.provider_revision,
+        ) {
+            (Some(provider), Some(revision)) => Some((provider, revision)),
+            _ => None,
+        };
         if proven.status == "completed" {
-            return Err(WyrdError::Conflict {
-                message: "this signup already created its workspace; sign in to it".to_owned(),
-                details: json!({ "reason": "workspace_created", "tenant": proven.tenant_slug }),
-            });
+            match social {
+                Some((provider, revision)) => self.recheck_signup(provider, revision).await?,
+                None => self.require_local_redemption().await?,
+            }
+            return proven
+                .tenant_slug
+                .and_then(|slug| TenantSlug::new(&slug).ok())
+                .map(SignupAdmission::Created)
+                .ok_or_else(|| invalid_state("this signup's workspace is gone; start again"));
         }
-        let (credential, identity) = match (proven.proof_kind.as_str(), local) {
+        /// The creator's sign-in, its password not yet derived.
+        enum Pending {
+            Ready(SignupCredential),
+            Password {
+                username: String,
+                password: SecretString,
+                email: String,
+            },
+        }
+        let (pending, identity) = match (proven.proof_kind.as_str(), local) {
             ("email", Some(local)) => {
                 let address = proven
                     .email
@@ -1676,15 +1711,12 @@ impl SocialSignIn {
                     &local.password.clone().into_secret_string(),
                     "local_credentials.password",
                 )?;
-                if !self.login_methods(None).await?.creation.local_signup {
-                    return Err(signup_unavailable());
-                }
-                let verifier = hash_password(password).await?;
+                self.require_local_redemption().await?;
                 let identity = identity_value("mailto", &address);
                 (
-                    SignupCredential::Local {
+                    Pending::Password {
                         username,
-                        verifier,
+                        password,
                         email: address,
                     },
                     identity,
@@ -1701,12 +1733,9 @@ impl SocialSignIn {
                 ));
             }
             (_, None) => {
-                let (Some(provider), Some(provider_revision), Some(issuer), Some(subject)) = (
-                    proven.provider.as_deref().and_then(SocialProvider::parse),
-                    proven.provider_revision,
-                    proven.issuer,
-                    proven.subject,
-                ) else {
+                let (Some((provider, provider_revision)), Some(issuer), Some(subject)) =
+                    (social, proven.issuer, proven.subject)
+                else {
                     return Err(invalid_state(
                         "this signup's proof cannot create a workspace; start again",
                     ));
@@ -1720,13 +1749,13 @@ impl SocialSignIn {
                 self.recheck_signup(provider, provider_revision).await?;
                 let identity = identity_value(&issuer, &subject);
                 (
-                    SignupCredential::Social {
+                    Pending::Ready(SignupCredential::Social {
                         provider,
                         provider_revision,
                         issuer,
                         subject,
                         email,
-                    },
+                    }),
                     identity,
                 )
             }
@@ -1745,6 +1774,18 @@ impl SocialSignIn {
             ),
         ])
         .await?;
+        let credential = match pending {
+            Pending::Ready(credential) => credential,
+            Pending::Password {
+                username,
+                password,
+                email,
+            } => SignupCredential::Local {
+                username,
+                verifier: hash_password(password).await?,
+                email,
+            },
+        };
         if !start_signup_creation(&self.operator, proven.id)
             .await
             .map_err(store_error)?
@@ -1759,12 +1800,12 @@ impl SocialSignIn {
             )),
             _ => None,
         };
-        Ok(SignupCreation {
+        Ok(SignupAdmission::Create(SignupCreation {
             attempt: proven.id,
             credential,
             creator_key,
             claimed,
-        })
+        }))
     }
 
     /// Remove one bounded batch of expired signup admission windows and
@@ -1906,6 +1947,22 @@ impl SocialSignIn {
             .signup_providers
             .contains(&provider)
         {
+            Ok(())
+        } else {
+            Err(signup_unavailable())
+        }
+    }
+
+    /// Refuse unless an issued email proof may still be redeemed: signup and
+    /// password are enabled. The mail relay is a prerequisite of starting
+    /// only, so removing it leaves delivered proofs usable until they expire.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::MethodUnavailable`] otherwise, and the store
+    /// availability errors.
+    async fn require_local_redemption(&self) -> Result<(), WyrdError> {
+        let settings = self.settings().await?;
+        if settings.signup_enabled && settings.password_enabled {
             Ok(())
         } else {
             Err(signup_unavailable())

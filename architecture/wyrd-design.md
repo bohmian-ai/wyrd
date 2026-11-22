@@ -940,7 +940,8 @@ or anchor; expiry, one-use, replay, polling and browser-origin controls remain.
 
 Rust owns browser login transactions, callbacks, session creation, validation,
 expiry and revocation. Node renders the UI and forwards its selected tenant
-cookie to Rust; it does not redeem an OAuth code, retain a refresh token/API key,
+cookie to Rust; the platform console uses a separately scoped platform cookie.
+It does not redeem an OAuth code, retain a refresh token/API key,
 or encrypt a credential cookie. No UI-specific client secret, encryption key,
 environment variable, secret provisioning step, session service or sticky
 routing is required. Replicas resolve sessions through the existing Postgres.
@@ -984,11 +985,49 @@ a canonical tenant-local username; `/login`, `/change` and `/reset` verify,
 replace or reset the password. Rust stores only an Argon2id verifier,
 bounds failures per account and per source, and ends every local session of
 the User on change or reset; reset never signs in. `wyrd-server setup`
-creates no User. Provider-only Users initially have no password; adding one
+requires a named tenant-local human admin (`--admin-username` and hidden password
+prompt or `--admin-password-stdin`, optional unverified `--admin-email`) before
+claiming the tenant. It reuses human-owner provisioning, retains its separate
+automation/recovery credential result and returns login URL/username, never the
+password. Completed reruns never reset a password or duplicate an admin;
+interrupted operator-authorized recovery cannot activate ownerless. Provider-only Users initially have no password; adding one
 requires fresh current-method proof. Accounts are never linked by email or username. There is
-no OAuth password grant or public password signup. Google/GitHub public signup,
-when enabled, reuses tenant provisioning with a human administrator instead of
-a platform principal or bootstrap key. Shared provider and SMTP setup is
+no OAuth password grant. Verified-email/password and Google/GitHub public signup,
+when usable, reuse tenant provisioning with a human administrator instead of a
+platform principal or bootstrap key. Passwords use one 15–128-character NFC
+validator for setup, creation, invitation, change, reset and password-add, with
+blocklist and Argon2id; permit paste/managers without composition or rotation rules.
+
+Private defaults enable password but disable signup, with no SMTP/providers.
+Local public signup requires signup/password enabled plus SMTP: email proof first,
+then username/password and workspace confirmation. Public social creation also
+requires a verified contact, from validated provider proof or a bound Wyrd email
+challenge; returning login and invitation acceptance do not. Invitation possession
+never verifies its recipient address. Local creation yields a verified contact and
+password-anchored session; social creation need not add a password. Rust advertises
+returning and acquisition methods separately and rechecks them at start/completion;
+root/login/invitation/device pages offer only those advertised capabilities.
+
+At root, verified-email workspace discovery is available with SMTP alongside direct
+workspace URL/key entry and existing live-session enumeration. Generic requests
+disclose nothing; browser-bound proof permits bounded deduplicated active login
+links, never User IDs, sessions or membership authority. A minimal platform HMAC
+email projection points to tenant-qualified Users/contact revisions; validate the
+live tenant, User and current verified contact through their owners before revealing
+a link. Stale/unavailable validation fails closed; projection lag may omit links.
+Every workspace still requires its own allowed authentication. No global person
+account or email-based linking is introduced.
+
+A freshly authenticated User can separately verify/replace a recovery contact;
+setup and invitation remain usable offline without it. With SMTP and password
+allowed, a workspace + username reset request returns generic `202` for all
+accounts and sends only to eligible existing password Users' verified contacts.
+Codes are manual input, never URLs; expiry, one-use redemption and password-revision
+invalidation remain. Reset never signs in, adds a password or bypasses company SSO;
+notify on success and keep API keys unchanged. Without SMTP/contact use admin-issued
+codes. Proofs are purpose/browser-bound; email proofs last fifteen minutes and
+completion/discovery-read cookies five minutes. The security posture owns replay,
+contact/projection RLS, enumeration resistance and bounded transient mail sends. Shared provider and SMTP setup is
 operator administration; tenant admins manage company SSO and tenant login policy.
 
 `GET /v1/principals/me` returns the calling User's safe profile: principal,
@@ -1012,7 +1051,7 @@ an enabled exact provider revision and live identity; company SSO requires the
 exact Active connection. Requiring company SSO also refuses password/social
 browser sessions and CLI renewal; existing API-key and recovery policy remains.
 Current grant and token-ceiling semantics remain unchanged. Login transactions
-expire in five minutes and sessions in twelve hours, with no sliding renewal. Protected tenant `/v1`
+expire in five minutes and tenant sessions in twelve hours, with no sliding renewal. Protected tenant `/v1`
 HTTP APIs accept exactly one selected browser cookie through the existing
 principal/permission/audit boundary; ambiguous multiple session cookies are
 refused. Only metadata enumeration accepts multiple tenant sessions. Other
@@ -1028,6 +1067,29 @@ no-store POST action result and is never in the initial page load, history,
 storage, URLs, logs, telemetry, captures or cookies. Store failure is unavailable,
 not anonymous success. Prior credential-bearing UI cookies require re-login;
 no plaintext-cookie compatibility path is retained.
+
+The human platform console is `/platform`, headed **Platform admin**; tenant
+administrators remain **workspace admin**. Existing tenantless platform principals,
+`PlatformLogin` and `PlatformLoginRequest` own platform SSO, restricted to
+pre-registered operators pinned to issuer/subject. Installs without an IdP use
+platform-user passwords under the shared 15-character minimum. The Rust
+first-party browser-session owner supplies a distinct host-only Secure, HttpOnly,
+SameSite=Lax platform cookie scoped to `/platform`, with 15-minute idle and
+eight-hour absolute expiry. Platform and tenant sessions never cross planes.
+Fresh same-operator re-authentication precedes destructive console actions;
+platform MFA belongs to the IdP. Detailed anchors, invalidation, persistence and
+freshness are owned by the
+[security posture](wyrd-security-posture.md#platform-console-browser-sessions).
+The global/bootstrap administrative key remains CLI/API break-glass and never
+enters the browser or Node.
+
+Same-origin hosting reserves exact `/platform` and `/platform/ui` plus its subtree
+for SvelteKit console pages/actions. Other `/platform/*` paths remain Rust HTTP
+APIs, including browser operations under `/platform/browser/*`. Nginx exact matches for `/platform` and `/platform/ui` and a `^~` prefix
+for `/platform/ui/` take precedence over the existing API regex; no API is renamed, no
+`admin` alias is introduced and no Accept-header routing is used. The Node BFF
+forwards the platform cookie to Rust, which owns login/callback exchange,
+re-authentication, session resolution and management authorization.
 
 #### GitHub App association
 

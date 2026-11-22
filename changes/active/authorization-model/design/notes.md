@@ -9,9 +9,13 @@ its two-task limit applies to that original scope. The agreed addition is in
 [social sign-in and signup](social-login.md), finalized by
 the maintainer on 2026-11-21. It covers social signup/login, explicit linking,
 operator UI onboarding, addressed bulk invitations and generic SMTP delivery.
-It is recorded in [approved specification revision 3](../spec.md), with authority
+The subsequent [onboarding supplement](onboarding.md) is finalized: the maintainer
+accepted all eight decisions on 2026-11-21, including bounded verified-email
+discovery. It adds local acquisition, named human setup, verified contacts/reset,
+complete methods presentation and the 15-character minimum. The combined agreement
+is recorded in [approved specification revision 6](../spec.md), with authority
 reconciliation and explicit maintainer approval recorded on 2026-11-21.
-[Task 003](../tasks/TASK-003-social-login.md) now proposes the implementation
+[Task 003 carryover](../tasks/TASK-003-carryover.md) owns remaining implementation
 and ordered acceptance scenarios for that approved addition. The maintainer approved
 the PostgreSQL platform-storage distinction in the
 supplement on 2026-11-21; authority/spec reconciliation is recorded on that date.

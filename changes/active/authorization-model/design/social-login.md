@@ -5,15 +5,16 @@ Status: finalized
 The maintainer locked this addition to authorization-model on 2026-11-21,
 intended as task 003. Tasks 001 and 002 are complete according to the maintainer.
 This is the agreed design for specification, not implementation authority; it
-does not alter approved specification revision 2.
+preserves the revision-2 scope and completed evidence; approved revision 6 now owns the additions.
 
 
-Revision note (2026-11-21, maintainer decision): follow the conventional
-invitation model of GitLab, Grafana and Slack. Each invitation is a single-use
-link the administrator can copy; SMTP, when configured, also emails it.
-Possession of the live link admits enrollment; every recipient-proof, mailbox-challenge,
-provider-email-match and no-bearer-link statement in this document is withdrawn, because it made
-deployments without SMTP unable to invite password Users.
+Revision note (2026-11-21): approved revision 6 and
+[onboarding](onboarding.md) extend this design with verified local acquisition,
+named human setup, verified-email workspace discovery, verified-contact reset and
+a 15-character password minimum. All eight onboarding decisions are settled.
+Invitations retain revision 4's single-use bearer-link admission without recipient
+proof; this remains independent of mandatory public-acquisition contact verification.
+Revision 5's abuse controls remain required.
 
 ## Problem
 
@@ -52,8 +53,9 @@ and administrator invitations remain supported alongside public signup.
 Delivery scope: Google then GitHub.com within the addition, not a generic social
 provider framework. No email-based account merging, automatic duplicate-account
 merge, SCIM, continuous IdP offboarding, repository authorization, provider-token
-vault, new billing system, or public password signup. Existing invited password
-enrollment and administrator-assisted password reset remain supported.
+vault or new billing system. Verified local public signup and self-service
+verified-contact reset are included through onboarding; invited password enrollment
+and administrator-assisted password reset remain supported.
 
 ## Agreed implementation
 
@@ -145,13 +147,12 @@ creates the User, attaches the unique identity, applies the assignments, consume
 the invitation and creates the session, or commits none of them. Concurrent
 redemption cannot create two accounts or spend the invitation twice.
 
-Invitations name a recipient email address. Redemption requires both the live
-invitation and proof of control of that address, through an appropriate verified
-provider claim or a separate mailbox challenge. Apply this to invited password
-enrollment as well as social enrollment. Forwarding the original invitation
-alone must not let another person redeem it. Email checks invitation eligibility;
-it never selects, merges or links an existing User. Do not infer a recipient from
-a display label. This extends the existing bearer-code invitation contract.
+Invitations name the administrator's intended recipient. Possession of the live
+single-use fragment link admits enrollment with any allowed method; a differing
+provider email is permitted. Forwarding transfers the enrollment opportunity.
+Opening consumes nothing. Recipient metadata never verifies a recovery address
+or selects/links/merges an existing User. Separate authenticated contact verification
+is optional after joining and never blocks offline invitation enrollment.
 
 If the provider identity already belongs to a User, refuse this new-User
 enrollment flow with guidance to sign in and request access. Never create a
@@ -160,7 +161,7 @@ through the existing administrator binding flow.
 
 ### New-tenant signup
 
-The agreed journey is: sign up with Google/GitHub → enter a workspace name →
+The agreed journey is: prove Wyrd email or Google/GitHub plus a verified contact → enter a workspace name →
 Wyrd creates the tenant with that User as administrator → enter the workspace.
 Workspace slug validation follows existing tenant creation. Signup must remain
 enabled at completion. This purpose creates a new tenant only; it never joins
@@ -168,7 +169,7 @@ an existing tenant by email, domain, slug selection or provider organization.
 
 Extend the existing tenant provisioning owner: claim the directory entry,
 initialize builtin roles/SYSTEM/tables, create a tenant-local User with the
-verified external identity and a tenant-scoped admin binding, then promote the
+verified local credentials or external identity and a tenant-scoped admin binding, then promote the
 tenant only after it is usable. Return an ordinary tenant browser session after
 activation. Do not call the existing privileged endpoint with a fabricated
 platform principal or return its administrative bootstrap key to a signup user.
@@ -182,16 +183,19 @@ tenant. A lost session response can be recovered by signing into the completed
 tenant rather than provisioning it again.
 
 The implementation should be one additional human-owner initialization path in
-the existing provisioner: social proof → workspace name/slug → existing tenant
+the existing provisioner: local/email or social proof → workspace name/slug → existing tenant
 initialization with this User as admin → ordinary sign-in. Keep existing
 provisioning states and failure handling; no second onboarding service or new
 general workflow engine. Reuse the existing lifecycle rather than rebuilding it.
 
-For public signup, use a shared rate limit before expensive tenant creation,
-using the existing admission-counter pattern with trusted source and verified
-provider identity. Exact windows/limits belong in the spec. Operator-wide
-creation caps, mandatory signup contact-email verification and CAPTCHA are
-outside the agreed minimum flow. Invitation recipient proof remains required.
+Public acquisition follows [onboarding](onboarding.md#proofs-persistence-and-abuse)
+and approved REQ-014: source before provider/mail work, trusted ingress plus IPv6
+`/64`/missing-source refusal, sealed pre-proof cookies without pending rows,
+`Retry-After`, keyring-derived HMAC counters and bounded purge, completion-only
+owner crash recovery, atomic owned-workspace cap (default 3) and optional validated
+Turnstile. Public local/social creation requires verified contact; invitation join
+does not. Exact private admission windows remain implementation-owned. No global
+person or deployment-wide total cap is added.
 
 ### Explicit linking and removal
 
@@ -286,11 +290,10 @@ broker, platform-person account, per-tenant social connections or a provider
 plugin framework. GitHub needs a concrete OAuth identity adapter because the
 OIDC verifier cannot validate an identity token GitHub does not issue.
 
-Use recipient-addressed, expiring, single-use invitations.
-Redemption proves control of the invited address, either through
-an appropriate verified provider claim or a separate mailbox challenge. This
-checks invitation eligibility; it never links or resolves an existing account
-by email. Shared bearer-only invitations are outside this addition.
+Use recipient-addressed, expiring, single-use bearer invitation links. They may
+be copied without SMTP; possession admits one enrollment and forwarding transfers
+that opportunity. No recipient-email proof/match is required. Separate contact
+verification enables discovery/reset without changing invitation admission.
 
 For onboarding ten or more people, support pasting multiple email addresses,
 selecting scoped access once, and issuing a separate invitation to each person.
@@ -329,8 +332,8 @@ account and sending-domain setup outside Wyrd.
 Example: [Resend's SMTP documentation](https://resend.com/docs/send-with-smtp).
 
 Wyrd can run without SMTP; the UI must explain that emailed invitations require
-operator setup. A shared invitation link is not an automatic fallback for
-recipient-address verification. Report relay acceptance or send failure per
+operator setup. Each single-use bearer link can be copied and delivered without SMTP;
+there is no shared multi-use invitation. Report relay acceptance or send failure per
 recipient; SMTP acceptance is not proof of inbox delivery. A send failure leaves
 the invitation pending, creates no active User, and permits explicit resend.
 Do not hold a tenant
@@ -351,7 +354,7 @@ the existing tenant company-OIDC connection remains available independently.
 The maintainer approved the PostgreSQL platform-storage distinction on
 2026-11-21. The owning security posture now records shared operator providers,
 purpose-bound social admission, public signup through the existing provisioner,
-identity anchors, recipient proof, SMTP and tenant SSO policy. Its Postgres
+identity anchors, bearer invitation enrollment, SMTP and tenant SSO policy. Its Postgres
 section permits genuine platform/pre-tenant tables without `data_tenant_id`
 while requiring forced RLS on every table. The human-sign-in architecture agrees.
 No unresolved authority conflict remains for this design. Production code and
@@ -374,16 +377,16 @@ it does not relax tenant isolation or grant signup visitors platform authority.
 It does not define Bifrost or object-storage layout. Reuse existing owners before
 adding physical tables.
 
-Previously agreed shared providers, public signup, identity anchors, invitation
-recipient proof, SMTP and company-SSO policy remain unchanged. The owning architecture and approved revision 3 now record the approved storage
-distinction and behavior. The maintainer explicitly approved revision 3 on
+Previously agreed shared providers, public signup, identity anchors, bearer invitation
+enrollment, SMTP and company-SSO policy remain unchanged. The owning architecture and approved revision 6 record the approved storage
+distinction and current onboarding behavior. The maintainer explicitly approved revision 3 on
 2026-11-21.
 
 ## Handoff
 
-Finalized design is recorded in [approved specification revision 3](../spec.md).
+Finalized design is recorded in [approved specification revision 6](../spec.md).
 Authority reconciliation and explicit specification approval are recorded on
-2026-11-21. [Task 003](../tasks/TASK-003-social-login.md) carries this agreement
+2026-11-21. [Task 003 carryover](../tasks/TASK-003-carryover.md) carries the remaining agreement
 into an implementation proposal and ordered acceptance scenarios. Design
 finalization alone did not approve the spec. Existing tasks and evidence are preserved.
 
@@ -401,7 +404,8 @@ identity-conflict refusal; two tenants with the same person; signup disabled,
 throttled, replayed and failed midway; SSO-policy and provider revision changes
 during callback and with existing browser/device/refresh credentials. Verify
 social never clears company bindings and provider outages fail closed. Cover
-recipient mismatch and forwarding, provider/mailbox recipient proof, bulk
+permitted recipient mismatch and forwarded-link enrollment, optional separate
+verified contacts, bulk
 per-recipient results, SMTP absence/failure, resend and revocation. A local SMTP
 test server proves message contents and send-failure handling through the generic
 SMTP settings. No particular hosted email provider is required for verification.

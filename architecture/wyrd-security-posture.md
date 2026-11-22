@@ -47,7 +47,10 @@ of a tenant's administration. Its principals live in `platform.principals`,
 carry no tenant, and are never implicitly authorized over a tenant's
 resources. The **tenant plane** operates one tenant's resources. Its
 principals live under `wyrd.*` behind RLS and can never reach the platform
-plane. Neither plane's credential or token is accepted by the other.
+plane. Neither plane's credential, token or browser session is accepted by the
+other. The human platform console is headed **Platform admin**; tenant human
+administrators remain **workspace admin**. Platform-user passwords and console
+sessions belong to existing tenantless platform principals, never tenant Users.
 
 `PrincipalKindTag` is the closed wire set shared by both planes:
 `global_admin`, `tenant_admin`, `user`, `service`, and `system`. A
@@ -203,7 +206,13 @@ tenant's headless root of trust: it holds credentials and roles, federates no
 identity by itself, and coexists with any human administrator the tenant later
 adds. A platform administrator is created once, during deployment
 initialization, and administration of the platform plane is available through
-its credential whether or not a platform OIDC connection exists.
+its credential whether or not a platform OIDC connection exists. This bootstrap/global
+administrative key is CLI/API break-glass only and never enters a browser or Node.
+Human console operators use pre-registered platform `user` principals with the
+platform OIDC connection, or platform-user passwords for installs without an IdP.
+Password verifiers/revisions belong to the platform credential owner and share
+the tenant password validator (15–128 NFC-normalized Unicode characters,
+blocklist, Argon2id and bounded blocking/admission); they confer no tenant rights.
 
 Every authorization decision records the deciding principal's stored kind and,
 when the presented token was minted from a credential, that credential's
@@ -235,7 +244,7 @@ credential.
   platform-admin database access, creates no identity and writes no grant, and
   refuses on an uninitialized deployment. That database access is therefore
   equivalent in authority to holding the platform credential.
-- A platform session names the credential that minted it and re-reads that
+- A platform API token session names the credential that minted it and re-reads that
   credential on every request, so revoking a platform credential ends its live
   sessions on the next request. A platform session
   established by federated login names no credential; the principal itself is
@@ -382,8 +391,9 @@ credential.
   rate-limit `POST /auth/device`, the user-code entry form, per client address
   (RFC 8628 §5.1).
 - The deployment sealing keyring protects only stored provider and
-  workload-issuer client secrets, application SMTP credentials and gateway
-  `managed_secret` provider keys.
+  workload-issuer client secrets, application SMTP credentials, the signup
+  challenge secret and gateway `managed_secret` provider keys. It also derives
+  the signup admission pseudonym key.
   A gateway managed secret is sealed with its tenant, name, and provider
   inside the authenticated payload, so an envelope copied into another
   tenant's or credential's row does not open. Wyrd stores no recoverable access token,
@@ -399,7 +409,7 @@ credential.
 These capabilities ship in open source through one self-hosted/SaaS code path.
 Users remain tenant-local: the same person in two tenants has two independent
 Users. Platform administrators manage deployment-wide Google and GitHub.com
-clients, password availability, public social signup and application SMTP through
+clients, password availability, public local/social signup and application SMTP through
 Rust management APIs and their UI projections. Tenant administrators manage only
 their own company SSO connection and tenant login policy. Shared social providers
 sit beside the single Active company connection, not in its slot; platform SSO
@@ -409,8 +419,14 @@ no implicit tenant administration.
 Operator onboarding shows provider registration instructions and the exact callback
 URL, accepts sealed client credentials, tests sign-in and enables the tested
 configuration. Stored secrets are omitted from read responses. Password is enabled
-by default; public social signup is disabled by default. SaaS enables signup via
-the same operator setting. Rust offers and enforces current allowed methods.
+by default; public local/social signup is disabled by default. SaaS enables signup via
+the same operator setting. Rust offers and enforces current allowed methods. Private defaults include no
+SMTP/provider credentials. Local acquisition requires password/signup enabled and
+SMTP; social acquisition requires an enabled provider and verified contact. The
+methods response distinguishes returning/invitation providers from usable creation
+providers, and advertises local signup, email discovery and password reset only
+when usable. Every root/login/invitation/device UI uses that response; Rust rechecks
+current policy at start and completion, including racing settings changes.
 
 Rust binds each provider transaction to its purpose (returning login, invitation,
 new-tenant signup or linking), exact provider revision, browser, trusted origin,
@@ -424,7 +440,11 @@ Google uses OIDC with `openid email profile` and validated issuer, subject,
 audience, signature, nonce and expiry. GitHub.com uses authorization code with
 S256 PKCE and an authenticated user lookup, with numeric user ID under a fixed
 GitHub.com namespace. It supplies no OIDC ID token. Request no repository or
-organization or email API access. Provider tokens are transient identity-resolution
+organization access. For public acquisition only, GitHub may request `user:email`
+and fetch authenticated email records to prove a verified contact. Accept Google's
+`email_verified` only after OIDC validation; absent provider contact proof, require
+a separate Wyrd email challenge bound to the social attempt. Returning login and
+invitation acceptance have no added email-verification prerequisite. Provider tokens are transient identity-resolution
 inputs; retain no provider refresh-token vault.
 
 Returning social login resolves only tenant + issuer/provider namespace + subject.
@@ -447,7 +467,7 @@ commits none. Concurrent redemption has one winner. An identity already owned by
 a User refuses new-User enrollment and directs the person to sign in and request
 access through ordinary binding administration.
 
-Enabled public social signup proves identity, takes a new workspace name/slug
+Enabled public local/social signup proves a verified contact and its creation identity, takes a new workspace name/slug
 and invokes the existing tenant provisioner with a human-owner initialization
 path. It creates a new tenant and a tenant-local User with tenant-wide admin
 binding. It never joins an existing tenant by email, domain or slug, grants the
@@ -460,6 +480,38 @@ leaves no active ownerless tenant. A lost session response permits ordinary logi
 to the completed tenant. Signup remains enabled at completion. Shared admission
 limits trusted source and verified provider identity before expensive creation;
 unavailable admission state refuses creation.
+
+Signup stores no pending User/tenant/attempt before email/provider proof
+(bounded shared admission counters remain permitted): the round-trip state is a sealed,
+short-lived, HttpOnly, path-scoped cookie, and the recorded proof is unique per
+state, so one callback yields at most one proof. Starting signup has its own
+shared source window, checked before provider work. Throttles answer `429` with
+`Retry-After` in whole seconds equal to the problem retry field. Admission keys and a signup tenant's creator key are HMAC-SHA-256
+pseudonyms, keyed from the deployment sealing keyring; no plain issuer, subject
+or address is stored there. Expired windows and attempts are purged in bounded
+background batches; a completed attempt keeps no email. An operator may
+configure a Turnstile challenge on browser signup completion, validated
+server-side for success, hostname and `signup` action after admission and before
+a tenant is claimed; refused tokens use `WYRD_AUTH_403_SIGNUP_CHALLENGE`. An
+unreachable challenge provider refuses creation, and SDK, CLI, MCP and API
+traffic is never challenged. One proven identity may hold at most an
+operator-configured number (default 3) of non-retired signup-created tenants,
+checked atomically with the claim and refused with
+`WYRD_AUTH_403_SIGNUP_WORKSPACE_LIMIT`. Only the browser holding a proven
+attempt's completion cookie may restart its stale interrupted creation after the
+existing claim-staleness bound, and only before proof expiry. A failed/provisioning
+claim counts until retired; operator creation neither counts nor is refused.
+The creator HMAC survives attempt purge: verified email namespace for local creation,
+provider namespace/subject for social. This is per identity, not per human across
+methods; never unify social identities through email.
+
+A request's trusted source is its TCP peer, unless that peer is inside the
+deployment-configured trusted ingress IP/CIDR list; then it is the client
+address from the configured header (for example `CF-Connecting-IP`). Forwarding
+headers from other peers are ignored, IPv4-mapped addresses are normalized and
+IPv6 sources are admitted by `/64`. Signup and local password admission derive
+the source this way, each with its own windows. Without a determinable source,
+signup refuses.
 
 Linking requires fresh proof of the User's current allowed method within five
 minutes plus proof of the new identity in the same bound transaction. An old
@@ -495,10 +547,77 @@ stored as a PostgreSQL mail spool. No new mail queue, automatic retry subsystem 
 provider-specific integration is required; Resend is simply a compatible-provider
 example. Provider account and sending-domain setup remain external operator work.
 
+
+Local public creation proves email before collecting username/password. Use the
+existing provisioner with local or external human-owner proof, activating only a
+usable admin/workspace and issuing the appropriate ordinary tenant session.
+Successful completion retry returns the same tenant, not another creation. Setup
+requires a named local human admin before claim, using a hidden password prompt
+or stdin; optional email remains unverified. Keep separate automation/recovery
+credentials and safe reruns without password reset/duplicate admin. Machine-only
+administrative tenant creation may omit human-admin input. Invitation links remain
+bearer enrollment authority, never verified-contact proof.
+
+Authenticated fresh allowed-method contact verification is tenant/User/purpose-bound;
+it atomically replaces contact and revision plus directory-update intent, notifies
+the old verified address and invalidates old-contact reset proofs. Duplicate
+addresses remain permitted within/across tenants, distinct from profile or
+invitation metadata. Normalize whitespace/domain, preserve local-part case and
+original delivery address; never collapse dots, plus tags or aliases.
+
+With SMTP, browser-bound verified-email discovery returns bounded deduplicated
+active workspace login links only. Request responses are generic; proof mail names
+no workspace. The platform HMAC email → tenant/User/contact-revision projection is
+control-plane metadata, not a global person, authorization or identity store.
+Tenant contact transactions advance revisions and notify existing reconciliation;
+authorized tenant reads update/remove the projection. Before disclosure, revalidate
+current verified contact, live User and live tenant through their owners. Stale,
+revoked, disabled, retired or unavailable validation reveals nothing; eventual lag
+may omit new links. No usernames/principal IDs, session, User, grant or account
+link is returned/created. Selecting a link requires ordinary tenant authentication.
+Without SMTP discovery is absent; saved URLs, invitations and live-session
+metadata enumeration remain independent alternatives.
+
+Email proofs use sealed authenticated encrypted envelopes with random identifier,
+canonical address, purpose, deadline and initiating-browser binding, never password.
+No pre-proof pending signup row is stored. After proof retain unique identifier
+digests/spent-proof metadata until expiry for one-use consumption across replicas;
+a lost response resumes only in the bound browser. Email proofs last fifteen
+minutes; signup completion and discovery-read cookies five minutes. Purposes for
+signup, discovery, contact and reset never substitute. Persisted deadlines use
+PostgreSQL time; envelopes use the PostgreSQL-anchored clock. Links carry proof in
+fragments, not query strings; opening consumes nothing, page code POSTs proof and
+clears the fragment. Proof/result pages and responses are `no-store` and retain
+trusted Origin, CSRF and host-only Secure/HttpOnly/SameSite protections.
+
+Password reset request takes tenant + username and sends only to an active eligible
+password User's verified contact. Known/unknown/unverified/ineligible requests have
+generic `202` bodies and comparable timing distributions; recipient throttles and
+SMTP outcomes cannot reveal account existence. Apply independent shared source and
+address/account budgets, including resend, before SMTP/hashing for verification,
+discovery and reset. Source throttles may return `429`; requests never lock accounts.
+Reset uses existing fifteen-minute single-use code redemption with contact revision
+binding, invalidates local sessions/CLI renewal, leaves keys alone, never signs in,
+adds a password or bypasses SSO, and notifies the verified contact after success.
+Codes remain manual input, never URLs. Admin codes preserve offline recovery.
+
+ApplicationMail sends signup/contact/discovery/reset and reset-notification mail
+after transactions, outside locks. Reset requests use bounded process-owned
+transient sends on the same public response path for all accounts, with no durable
+delivery guarantee; a crash may lose a send and users request again. Account-specific
+relay failures are hidden; uniform deployment-wide `503` is permitted. Operator
+test-send and invitations retain honest relay outcomes. No mail queue, raw-body
+spool, automatic retry or provider-specific API is added. Removing SMTP disables
+mail-dependent starts, not password login or valid issued reset redemption; signed
+proofs retain their deadline if signup/method remain enabled. Never log addresses,
+passwords, codes or proofs; use HMAC admission keys and existing bounded Argon2id
+blocking strategy. These auth/control-plane operations add no verification,
+gateway, Oracle or Scribe hot-path wait; audit delivery remains nonblocking.
+
 ### First-party browser sessions
 
 - Rust owns the complete browser-session lifecycle in the existing auth and
-  SQL owners. Node renders pages and forwards the selected tenant's cookie
+  SQL owners. Node renders pages and forwards the selected plane's cookie
   and trusted public-origin context; it owns no durable session, OAuth code
   exchange, refresh token, API key or credential encryption. The existing
   database is the shared replica authority, with no additional secret/env
@@ -509,10 +628,11 @@ example. Provider account and sending-domain setup remain external operator work
   login transaction. State, nonce, PKCE, issuer, connection revision, public
   origin and one-use completion remain validated by the same Rust owners as
   device and connection-test login. Browser transaction cookies are opaque
-  bindings; no PKCE verifier is exposed to Node or browser storage. Login
+  bindings; signup pre-proof state may use an authenticated sealed HttpOnly cookie,
+  never a plaintext PKCE verifier exposed to Node or script storage. Login
   transactions expire within five minutes. Post-login redirection is to the
   resolved tenant's fixed signed-in path, never an arbitrary return URL.
-- Session identifiers use cryptographic randomness and are regenerated at
+- Tenant session identifiers use cryptographic randomness and are regenerated at
   successful login. A host-only HttpOnly, SameSite=Lax cookie carries only
   that identifier, not OAuth tokens, API keys or identity/permission claims.
   Cookies are Secure in production; only the existing loopback-development
@@ -538,10 +658,16 @@ example. Provider account and sending-domain setup remain external operator work
   session and clears its cookie. Recovery logout never revokes the API key or
   other browser sessions; logout does not end the IdP session.
 - Local password login (`POST /auth/browser/password/login`), invitation
-  signup, password change and code reset run in Rust. Passwords are 8–128
-  characters, NFC-normalized and blocklist-checked, stored only as an
+  signup, password change and code reset run in Rust. Passwords are 15–128
+  Unicode characters after NFC normalization, blocklist-checked, stored only as an
   Argon2id verifier, and never logged, echoed or relayed through Node storage.
-  Ten failures per tenant and username, or one hundred per source, refuse
+  One validator governs setup, direct/local creation, invitation, change, reset
+  and password-add. No truncation, composition rules or periodic rotation; allow
+  paste/password managers. Local signup requires completed email proof and creates
+  a password-anchored session only after provisioning promotion; social signup
+  creates its social anchor and no password. Email discovery creates no session.
+  Ten failures per tenant and username, or one hundred per trusted source
+  (see social admission), refuse
   further attempts with `429` and `Retry-After` until the window passes;
   unknown users and wrong passwords are indistinguishable. Invitation and
   reset codes are 256-bit, single-use, stored by SHA-256 verifier and bound to
@@ -564,8 +690,10 @@ example. Provider account and sending-domain setup remain external operator work
   signature verification remains local and synchronous; bearer and browser
   requests use the same cached current grants and restrictive ceilings.
 - The existing protected tenant `/v1` HTTP APIs explicitly accept cookie
-  sessions through their normal principal/permission boundary. Platform,
-  MCP, OTLP, gateway and gRPC routes do not inherit cookie authentication.
+  sessions through their normal principal/permission boundary. Platform operations
+  accept only their separately scoped platform browser session described below,
+  never a tenant cookie. MCP, OTLP, gateway and gRPC routes do not inherit cookie
+  authentication.
   Tenant API cookie authentication requires exactly one selected session;
   ambiguous multiple session cookies are refused, never first-cookie-wins.
   Only the session-metadata enumeration accepts multiple tenant sessions.
@@ -586,9 +714,49 @@ example. Provider account and sending-domain setup remain external operator work
   unavailable storage; a database outage cannot become anonymous, cached or
   mock success. Cookie authentication is documented alongside bearer
   authentication in served OpenAPI. UI-only OAuth issuance/renewal is retired
-  when its consumers move, without changing CLI/device, SDK, platform,
+  when its consumers move, without changing CLI/device, SDK, platform API tokens,
   workload or provider-test behavior. Existing credential-bearing UI cookies
   are cleared and require sign-in; there is no plaintext compatibility path.
+
+#### Platform console browser sessions
+
+The `/platform` console and `/platform/ui/*` pages use the existing Rust
+first-party browser-session machinery extended to the platform plane. Reuse
+`PlatformLogin` and the existing platform login wire contracts for the one
+platform OIDC connection, including pre-registration, issuer/subject pinning,
+state, PKCE, nonce and one-use callback proof. Unknown operators are refused,
+never enrolled. MFA is the IdP's policy. Without an IdP, an authorized registered
+platform `user` may authenticate with its platform-local password. No bootstrap
+key browser login, new principal kind or parallel authentication engine exists.
+
+Rust creates a fresh opaque identifier in a distinct host-only Secure, HttpOnly,
+SameSite=Lax cookie with `Path=/platform`. Rust's platform SQL owner stores only
+its digest, principal, exact password or connection revision anchor, creation and
+last activity, revocation and recent-authentication time. Records are tenantless
+in `platform`, with forced platform-owner RLS, unique digest lookup and bounded
+expiry cleanup through existing auth maintenance. Reuse existing platform login
+transaction storage for browser/session/principal binding and one-use login or
+re-authentication purpose. No provider token, raw cookie, password or bootstrap
+key is retained. PostgreSQL derives idle/absolute deadlines: 15 minutes idle and
+eight hours absolute; activity never extends the latter.
+
+Every request checks the live platform principal and original anchor; suspension,
+password invalidation or connection replacement refuses the session. Logout
+revokes the selected session. Node forwards only the selected platform cookie to
+Rust platform operations and safe metadata back to pages. It neither exchanges
+codes nor stores credentials. Tenant sessions are refused by platform handlers;
+platform cookies are never forwarded to or accepted on tenant routes/enumeration
+or other protocols. Cookie path scoping is additional to these server checks.
+Origin/CSRF, fixed redirects, no-store, secret redaction, fail-closed storage and
+nonblocking audit follow the shared browser machinery.
+
+Destructive console actions, including retiring a workspace or changing provider,
+SMTP or signup settings, require same-operator fresh password or platform OIDC
+re-authentication within the existing five-minute human-proof window. OIDC requests
+fresh IdP authentication; an existing Wyrd cookie alone cannot satisfy it. Stale,
+tenant, different-operator or break-glass proof cannot authorize the mutation.
+CLI/API credentials remain their separate authorization channel; the global key
+is never sent to Node or a browser. No platform refresh-token flow is added.
 
 ### Delegation and federation
 
@@ -1009,6 +1177,14 @@ tables. Genuine deployment-wide and pre-tenant records belong to the existing
 platform plane and may omit `data_tenant_id`; they remain protected by narrowly
 authorized platform operations and platform RLS policies. Do not fabricate a
 tenant or give a signup visitor platform authority to store those records.
+The only new cross-tenant lookup purpose is the bounded verified-email workspace
+projection: HMAC canonical email, tenant ID, User reference and contact revision,
+with no password, grants, sessions or evidence. It and pre-tenant proven-email /
+one-use redemption metadata are platform-owner-only forced-RLS records. Tenant
+verified contacts lead with `data_tenant_id`, force RLS and retain tenant-qualified
+User references. Tenant mutations notify reconciliation; results always revalidate
+current tenant/User/contact through authorized tenant owners before disclosure.
+A stale projection cannot confer access or reveal a revoked association.
 This exception is to the tenant-key requirement only, not forced RLS. Tenant
 tables carry a
 `tenant_isolation` policy with both predicates:

@@ -3,12 +3,20 @@ id: TASK-003
 kind: implementation
 status: proposed
 spec: SPEC-authorization-model
-spec_revision: 4
+spec_revision: 5
 requirements: [REQ-011, REQ-012, REQ-013, REQ-014, REQ-015, REQ-016, REQ-017]
 depends_on: [TASK-001, TASK-002]
 ---
 
 # Social sign-in, workspace signup and team invitations
+
+Remaining-work owner: [TASK-003-carryover](TASK-003-carryover.md), approved spec
+revision 6. Cycles 1–5 are completed/committed according to the maintainer; cycle
+6's server slice is staged, uncommitted evidence. All unchecked/open items and
+cycles 7–10 below are transferred to that task. This record retains historical
+scope/evidence (including prior TDD limitations); it assigns no remaining work.
+Where revision-3/4/5 text below differs from revision 6, the approved spec and
+carryover govern. Do not execute the historical instructions independently.
 
 An operator enables Google and GitHub sign-in and configures application email.
 A tenant administrator invites a team with scoped access through single-use
@@ -153,7 +161,7 @@ provider setup must not replace the tenant connection or create tenant grants.
     `mise run check:tenant-isolation` and `git diff --check`: clean.
 - RED: not observed. Production code was written before this test, so cycle 1
   is a **TDD process violation**. The journey was GREEN on its first run.
-- **Open, operator UI:** no platform administration UI exists, and approved
+- **Transferred to [TASK-003-carryover](TASK-003-carryover.md), cycles 14/18; historical open operator UI evidence:** no platform administration UI exists, and approved
   browser sessions are tenant-only ("First-party browser sessions"; Node owns
   no credential). The spec requires a "platform UI" (REQ-011), but a browser-held
   operator credential would be a new credential purpose. The operator-UI half
@@ -373,7 +381,7 @@ invitation rows.
   `wyrd-sql --test integration` 142/142 (migration idempotence); `fmt`,
   `lints`, `codegen:check`, `check:deps`, `check:tenant-isolation`,
   `docs:check`, `git diff --check`.
-- Limitation: the production UI has no operator relay page (same open
+- Limitation (transferred to [TASK-003-carryover](TASK-003-carryover.md), cycles 14/18): the production UI has no operator relay page (same open
   operator-UI decision as entry 1); the tenant Access page already labels
   `accepted` as "accepted by the mail relay" and `failed` as "email failed".
   The relay is managed over platform HTTP only, as are social providers.
@@ -594,6 +602,35 @@ Lose the successful session response, then sign into the completed tenant rather
 than creating it again. The same provider account can create a second independent
 tenant; email/domain/provider organization gives no access to an existing one.
 
+Revision 5 abuse controls (REQ-014):
+
+- **Transferred to [TASK-003-carryover](TASK-003-carryover.md), cycles 7–13:** Trusted source: behind a configured trusted ingress, two visitors with
+  distinct client-address headers get separate windows; that header from an
+  untrusted peer is ignored; password-login source admission uses the same
+  source. A request with no determinable source is refused, not admitted.
+- **Transferred to [TASK-003-carryover](TASK-003-carryover.md), cycles 7–13:** IPv6: two addresses in one `/64` share a source window; IPv4-mapped
+  addresses normalize to IPv4.
+- **Transferred to [TASK-003-carryover](TASK-003-carryover.md), cycles 7–13:** No pre-proof row: starting signup writes no `platform` row; the
+  round-trip state rides a sealed, short-lived, HttpOnly cookie. A replayed
+  callback records no second proof (state uniqueness at proof insert).
+- **Transferred to [TASK-003-carryover](TASK-003-carryover.md), cycles 7–13:** Initiation admission: a flood of signup starts from one source is
+  refused before provider discovery.
+- **Transferred to [TASK-003-carryover](TASK-003-carryover.md), cycles 7–13:** `Retry-After`: every signup `429` carries the header in whole seconds,
+  matching `details.retry_after_seconds`.
+- **Transferred to [TASK-003-carryover](TASK-003-carryover.md), cycles 7–13:** Pseudonymous, bounded state: stored admission keys hold no plain
+  issuer, subject or address; a background batch purges expired windows and
+  expired/completed attempts; no public request runs unbounded deletion;
+  a completed attempt keeps no email.
+- **Transferred to [TASK-003-carryover](TASK-003-carryover.md), cycles 7–13:** Challenge (when configured): a missing, invalid, wrong-hostname,
+  wrong-action or reused token creates no tenant; the provider being
+  unreachable refuses creation; admission runs first; no challenge when
+  unconfigured. Uses a local mock Siteverify server.
+- **Transferred to [TASK-003-carryover](TASK-003-carryover.md), cycles 7–13:** Owned-workspace cap: at the cap, creation is refused with a stable quota
+  error (not 429), atomically across concurrent completions; a retired
+  workspace no longer counts; the count survives attempt purge.
+- **Transferred to [TASK-003-carryover](TASK-003-carryover.md), cycles 7–13:** Crash recovery: an attempt left `creating` past the stale bound is
+  resumed by its own completion holder and refused to anyone else.
+
 **Proof:** Tier-1 public UI/API → existing provisioner → tenant administration,
 with real Postgres failure/retry/concurrency proof. Initially fail on missing
 human-owner provisioning and public admission. Prove reuse of the existing
@@ -675,9 +712,11 @@ directory lifecycle without claiming a cross-plane atomic transaction.
 - The GitHub token decoder now reads `access_token` as `String` and wraps it
   immediately. It had compiled only when another crate enabled `secrecy`'s
   serde feature.
-- **Open:** the UI signup page and journey, and the docs.
+- **Transferred:** the UI signup page and journey, and the docs → [TASK-003-carryover cycle 14](TASK-003-carryover.md#14-approved-mock-precedes-new-pages-and-remaining-cycle-6-ui-delivery).
 
 ### 7. An existing User explicitly connects another sign-in method
+
+**Transferred; do not execute here:** [TASK-003-carryover cycle 15](TASK-003-carryover.md). Intent below is retained as history.
 
 **Maps to:** REQ-012, REQ-015; AC-006.
 
@@ -703,6 +742,8 @@ observe preservation, not just identity row counts.
 
 ### 8. Removing or disabling a method invalidates its original credentials
 
+**Transferred; do not execute here:** [TASK-003-carryover cycle 16](TASK-003-carryover.md). Intent below is retained as history.
+
 **Maps to:** REQ-011, REQ-012, REQ-015; preserves REQ-002; AC-006.
 
 Give the linked User browser sessions and explicitly approved CLI refresh families
@@ -722,6 +763,8 @@ Postgres. Initially fail on missing social identity anchors and availability
 enforcement. Observe both selected invalidation and surviving credentials.
 
 ### 9. A tenant adopts company SSO without a password or social bypass
+
+**Transferred; do not execute here:** [TASK-003-carryover cycle 17](TASK-003-carryover.md). Intent below is retained as history.
 
 **Maps to:** REQ-016; preserves REQ-002/REQ-004/REQ-005; AC-006.
 
@@ -745,6 +788,8 @@ production UI, against real policy persistence. Initially fail on the absent
 policy and its completion/session/renewal checks; hidden buttons alone do not pass.
 
 ### 10. Delivered surfaces and real providers complete the same journey
+
+**Transferred; do not execute here:** [TASK-003-carryover cycle 18](TASK-003-carryover.md). Intent below is retained as history.
 
 **Maps to:** AC-004–AC-006 and the spec's shipped-surface safeguards.
 
@@ -770,6 +815,8 @@ Record missing live-provider access as a material verification limitation rather
 than claiming those smoke tests ran.
 
 ## Verification owners and handoff
+
+Remaining execution and verification belong to [TASK-003-carryover](TASK-003-carryover.md); the original recipes below are retained for evidence continuity.
 
 Extend the existing `wyrd-server` integration target for platform management,
 browser/password and identity journeys (`platform_admin_e2e.rs`,

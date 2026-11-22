@@ -1,10 +1,10 @@
 ---
 id: SPEC-authorization-model
-revision: 4
+revision: 7
 status: approved
 ---
 
-# Scoped authorization and tenant-local social signup
+# Scoped authorization and tenant-local onboarding
 
 ## Problem and outcome
 
@@ -35,7 +35,20 @@ Each invitation is a single-use link the administrator can copy; when an
 operator configures SMTP, Wyrd also emails it. No particular email provider is
 required.
 
-Agreement: [design notes](design/notes.md), the original three system scenarios
+Revision 6 adds provider-free verified-email workspace creation, named human
+setup, verified-email workspace discovery and self-service password reset. Private
+defaults remain unchanged: password enabled, signup disabled, no SMTP/providers.
+Each workspace still owns independent Users, credentials, grants and sessions.
+The maintainer approved all eight onboarding decisions on 2026-11-21.
+
+Revision 7 adds a platform-only human console session and resolves the inherited
+operator-UI credential blocker. Operators sign in to **Platform admin** using the
+existing platform OIDC connection or a platform-user password without an IdP;
+workspace administrators remain **workspace admin**. The maintainer explicitly
+approved this behavior and the foundations-first, build-once order on 2026-11-21.
+Nothing ships until the complete carryover is done.
+
+Agreement: [finalized onboarding](design/onboarding.md), [design notes](design/notes.md), the original three system scenarios
 and two-task split, [Rust responsibilities and token flow](design/rust-model.md),
 and [finalized social-login design](design/social-login.md), locked 2026-11-21.
 The Rust snippets illustrate the agreed responsibilities, not required private
@@ -86,6 +99,11 @@ provider anchor refuses renewal rather than switching authentication methods.
 Unapproved device records carry no authenticated principal/anchor. Preserve
 expiry, polling, replay detection, explicit approval and browser-origin controls.
 Rust retains browser-session and credential ownership; Node renders and forwards.
+
+Setup-created and publicly enrolled humans use this same tenant-bound RFC 8628
+flow. Discovery supplies a workspace login link, never CLI authority; local
+password approval needs neither SMTP nor an IdP. No password grant, browser-token
+handoff or new CLI identity is added.
 
 ### REQ-003 — Preserve runtime family, identity and attribution
 
@@ -278,10 +296,24 @@ platform administrators; it is not inherited tenant SSO, and platform authority
 does not implicitly authorize tenant settings changes.
 
 Password is enabled by default and can be disabled by the operator. Public
-social signup is separately disabled by default; SaaS enables it through the
-same setting. Rust returns and enforces allowed login methods from configured
+signup is separately disabled by default; SaaS enables it through the same setting.
+There are no bundled SMTP or provider credentials. Local public signup requires
+password enabled, signup enabled and configured SMTP. Social acquisition requires
+an enabled provider and verified contact proof; a provider-proven contact needs
+no SMTP. Returning social login and invitation enrollment need no verified email. Rust returns and enforces allowed login methods from configured
 providers and tenant policy, regardless of UI state. Absent/disabled providers
-are not offered. Users remain tenant-local; no cross-tenant person account is added.
+are not offered. The complete methods contract distinguishes returning/invitation
+providers from usable acquisition providers, local signup, email discovery and
+password-reset requests. `signup` means a creation method is usable now, not just
+that its setting is enabled. Root, tenant login, invitation and device approval
+render only advertised methods; Rust rechecks at start and completion, including
+policy changes after page load. Root offers key/URL entry, live-session enumeration,
+and Find my workspaces only when SMTP makes discovery usable. Show a root-page
+“Create a workspace” link only when signup is usable; distinguish that journey
+from “Join with an invitation”. Keep the tenant sign-in card narrow. At the
+owned-workspace limit, disable or replace the creation form with the refusal and
+recovery guidance. No unusable creation button is offered under private defaults.
+Users remain tenant-local; no cross-tenant person account is added.
 
 ### REQ-012 — Provider proof authenticates a bound purpose, never tenant access
 
@@ -298,7 +330,12 @@ Google reuses the OIDC relying party with `openid email profile`. GitHub.com
 uses authorization code/S256 PKCE and an authenticated user lookup; its numeric
 user ID is the subject under a fixed GitHub.com namespace. Do not use the mutable
 username or treat its OAuth access token as an OIDC ID token. Request no
-repository/organization or email API access. Drop provider access tokens after
+repository/organization access. For acquisition only, GitHub may request
+`user:email` and read its authenticated email API for a verified address. Google
+email verification is trusted only after validated OIDC `email_verified` proof.
+Without provider-verified contact, bind a separate Wyrd email challenge to that
+social attempt before creation. Email remains contact proof, never identity
+lookup or automatic account linking. Drop provider access tokens after
 identity resolution; retain no provider refresh-token vault.
 
 Resolve returning social login only by tenant + issuer/provider namespace +
@@ -352,10 +389,18 @@ provider identity already belongs to a User, refuse new-User enrollment and
 direct them to sign in and request access; do not transfer the identity or
 silently merge accounts.
 
+Invitation possession never verifies the recipient address. After joining,
+a User may separately verify a recovery contact under REQ-017; this never blocks
+offline enrollment or creates another workspace. Password signup under
+`/auth/browser/password/signup` stays invitation-only.
+
 ### REQ-014 — Public signup reuses tenant creation and makes its creator admin
 
-When public signup is enabled, a visitor proves Google/GitHub identity, enters
-a workspace name with existing slug validation, and confirms creation. Wyrd
+When public signup is usable, a visitor proves a mailbox through Wyrd email,
+or Google/GitHub identity plus verified contact, enters a workspace name with
+existing slug validation, and confirms creation. Local email acquisition collects
+no password before email proof; after proof require a tenant-local username and
+password. Social acquisition forbids local credentials and creates no password. Wyrd
 creates a new tenant with that tenant-local User bound to the tenant admin role,
 then signs the User into it. Creating the tenant grants this role; being the
 first visitor to an existing tenant does not. Email/domain/provider organization
@@ -369,15 +414,101 @@ and tenant transaction boundaries. Public signup confers only authority to creat
 this new tenant, never platform administrative authority, a platform principal,
 or the existing administrative bootstrap key in the response.
 
-Recheck signup enablement and provider validity at completion. Apply shared
-source/provider-identity rate limiting before expensive creation, so replicas
+Recheck signup enablement, method availability and provider validity where applicable at completion. Apply shared
+source/proven-identity rate limiting before expensive creation, so replicas
 cannot bypass the limit; unavailable shared admission state refuses creation.
 Bind retry/resumption to the original attempt and proven identity. Callback
 replay creates no second tenant, another identity cannot adopt a failed claim,
 and failure leaves no active ownerless tenant. A completed tenant remains
 accessible through returning login if its session response is lost. The same
-provider account can independently create or join another tenant without sharing
+proven identity can independently create or join another tenant without sharing
 that tenant's User, grants or credentials.
+
+Operator-authorized `wyrd-server setup --tenant acme --server URL` requires
+`--admin-username` plus a hidden password prompt or `--admin-password-stdin`;
+optional `--admin-email` is unverified. Never accept passwords in argv or an
+environment dump. Missing non-interactive human inputs fail before tenant claim.
+Extend the same provisioner's human-owner path for local credentials, retaining
+its separate automation/recovery bootstrap credential result. Setup activation
+requires a usable named human admin. Return login URL and username, never password.
+Safe reruns return completed status without resetting passwords or duplicating
+admins; interrupted setup resumes through existing operator-authorized recovery
+and cannot activate ownerless. Existing machine-only administrative tenant
+creation may omit the optional typed `human_admin:{username,password,email?}`.
+
+Local creation sets a verified tenant-local recovery contact, admin binding and
+ordinary password-anchored session only after promotion. Social creation stores
+its verified contact and ordinary social-anchored session. A claimed slug conflicts;
+choosing another before claim does not require a new email. Successful completion
+retries return the same tenant and never create another. Generalize creator
+accounting to a verified-email namespace for local creators and provider
+namespace/subject for social creators. The cap is per proven identity, not per
+human across methods; email never unifies social identities. Preserve every
+revision-5 control below.
+
+Revision 5 adds the following signup abuse controls. Each follows a published
+convention: Cloudflare visitor-IP restoration and `/64` grouping, Auth.js sealed
+OAuth-check cookies, RFC 6585 `Retry-After`, OWASP pseudonymization and
+cheap-checks-first, Turnstile server-side validation and per-user resource
+limits.
+
+- **Trusted source.** The source of a request is the TCP peer, unless that peer is
+  inside a trusted ingress IP/CIDR list named in deployment configuration (not
+  a database record). In that case it is the client address the ingress supplies
+  in the configured header, such as `CF-Connecting-IP`. A forwarding header from
+  any other peer is ignored. IPv4-mapped addresses are normalized. For admission
+  keys only, an IPv6 source counts as its `/64` prefix. Password-login source
+  admission uses the same derivation, with its own windows, not a shared budget.
+  When no source can be determined, signup start and completion are refused,
+  never admitted without a source limit.
+- **No pending row before proof.** Starting signup stores no pending signup/User/tenant PostgreSQL row;
+  shared bounded admission counters are permitted. The provider round-trip state lives in a sealed, short-lived, path-scoped,
+  HttpOnly cookie: state, PKCE verifier, nonce, provider and revision, redirect
+  and browser binding. The callback still yields at most one proof per state:
+  the provider redeems an authorization code once, and the proof record is
+  unique on the state's hash, so of concurrent or replayed callbacks with one
+  cookie exactly one records a proof and the others are refused. Only that
+  verified proof is persisted, because completion and retry ownership require
+  it.
+- **Admission before work.** Starting signup is admitted in its own shared
+  source window before any provider discovery or other work. No identity exists
+  then, so no identity window applies. Completion keeps its separate source and
+  identity windows. Unavailable admission state refuses start as it refuses
+  completion. A throttled request answers `429`
+  with `Retry-After` in whole seconds; the problem details carry the same value.
+- **Pseudonymous, bounded counters.** Admission keys and the tenant's creator
+  key are HMAC-SHA-256 values keyed from the deployment sealing keyring, over the scope and
+  value; no plain issuer, subject or address is stored there. Expired admission
+  windows and expired or completed signup records are purged in bounded
+  background batches. A public request never runs unbounded deletion. A
+  completed attempt keeps no email.
+- **Optional human challenge.** When the operator configures a challenge
+  (Cloudflare Turnstile site and secret key), workspace creation requires a
+  challenge token. Before claiming a tenant, the server sends the token and
+  secret to the provider's server-side validation endpoint. It requires the
+  provider's answer to report success, the deployment's own hostname and the
+  `signup` action. A missing, invalid or expired token, or one the provider
+  reports already used, creates no tenant and returns
+  `WYRD_AUTH_403_SIGNUP_CHALLENGE`. If the
+  challenge provider is unavailable, creation is refused. The challenge runs
+  after admission, so refused traffic incurs no validation call. It applies only
+  to the browser signup completion, never to SDK, CLI, MCP or API traffic.
+  Without the configuration, no challenge is required.
+- **Owned-workspace cap.** Each proven identity may have at most an
+  operator-configured number (default 3) of signup-created tenants in any state other than
+  retired, so a failed or provisioning claim counts until retired. A new claim
+  at the cap is refused with `WYRD_AUTH_403_SIGNUP_WORKSPACE_LIMIT`, not `429`,
+  because waiting does not clear it. Resuming an attempt's own claim is not a
+  new claim. The count is checked atomically with the claim, so concurrent
+  completions on any replicas cannot exceed it. Operator-created tenants
+  neither count nor are refused.
+- **Crash recovery.** A creation interrupted by a process failure stays
+  recoverable by its owner: the browser holding that proven attempt's
+  completion cookie. Once the attempt has stayed `creating` longer than the
+  existing provisioning-claim staleness bound, that holder may restart it;
+  nobody else can. After the proof expires, nobody can restart it; the claimed
+  tenant stays in its non-active failed or provisioning state until operator
+  retirement, never active and ownerless.
 
 ### REQ-015 — Explicit linking preserves the User and its access
 
@@ -406,6 +537,14 @@ Those changes invalidate the affected login paths even if a User has no other
 usable method. Operator recovery remains available; no automatic fallback or
 new grant is created.
 
+All local password operations (setup, direct creation, invited enrollment,
+change, reset and adding a password) use one validator: 15–128 Unicode characters
+after existing NFC normalization, existing blocklist and Argon2id. Reject shorter
+or oversized values without truncation. No composition rules or periodic forced
+rotation; allow paste and password managers. Reuse bounded blocking for hashing.
+Email reset changes only an existing password; it cannot add one to a social-only
+User. Verified contacts and reset never override required company SSO.
+
 ### REQ-016 — Company-SSO enforcement applies to existing human login paths
 
 A tenant administrator freshly authenticated through its tested Active company
@@ -429,7 +568,7 @@ connection; without a usable one it refuses rather than falling back to
 password/social. Replacement retains existing connection-revision invalidation
 and issuer/subject identity rules; it never moves identities between Users.
 
-### REQ-017 — Optional operator SMTP emails invitations with honest outcomes
+### REQ-017 — Application mail, verified contacts, discovery and recovery
 
 An operator administrator may configure one deployment SMTP service: host,
 port, TLS mode, optional credentials and sender address, with a test-send
@@ -447,6 +586,153 @@ after sending finishes. A send failure leaves the invitation pending, creates no
 active User and permits explicit resend, which returns a new link to copy. Without SMTP, invitations
 work through copied links and the UI says Wyrd will not email them. No new mail
 queue, automatic retry subsystem or provider-specific API is required.
+
+
+The same SMTP owner sends signup/contact proofs, workspace-discovery proof,
+password-reset codes and successful-reset notifications. Without SMTP, hide
+local creation, discovery and reset request; preserve password login, copied
+invitations, setup, administrator-issued reset and device approval. Removing SMTP
+prevents mail-dependent starts, not ordinary login or redemption of valid issued
+reset codes. Existing signed proofs remain usable until their deadline if signup
+and their method remain enabled.
+
+A freshly authenticated allowed-method tenant User can request and verify a
+recovery address. Keep verified contacts distinct from profile/invitation email;
+duplicate addresses are allowed within and across tenants. Bind verification to
+User, tenant and purpose. Atomically replace verified contact/revision and its
+directory update intent, notify the old verified address, and invalidate reset
+proofs bound to the old revision. No identity, password or grant changes. Setup
+and invited accounts remain usable without contacts but cannot use email recovery
+or discovery until separately verified.
+
+Root discovery requests return the same generic `202` for known/unknown email.
+Mail contains no workspace names. Only after browser-bound email proof may Rust
+return bounded, deduplicated active workspace links for that exact verified
+address, with no username/principal IDs. Links are fixed same-origin login paths;
+the proof grants directory read only and creates no session, User, grant or link.
+Each selected workspace requires its own normal authentication. No public email
+or domain membership search exists. The minimal HMAC directory is the only new
+cross-tenant lookup purpose. Revalidate live tenant, live User and current verified
+contact/revision through their authorized owners before disclosure; stale, revoked,
+disabled or unavailable validation never reveals a workspace. Eventual projection
+updates may temporarily omit a workspace. Existing live-session enumeration stays
+independent. Without SMTP, use saved URLs, invitations or an administrator.
+
+Password reset requests take workspace plus username, not email as identity.
+Return indistinguishable generic `202` bodies and comparable timing distributions
+for known, unknown, unverified and ineligible accounts. Send only to an active
+eligible password User's verified address. Use bounded process-owned transient
+send execution on the same public response path; crash may lose a send and the
+caller requests again. No durable delivery promise, plaintext spool, queue or
+automatic retry. SMTP errors never disclose an account-specific outcome; a
+deployment-wide outage may uniformly return `503`. Existing fifteen-minute,
+one-use reset-code redemption invalidates local sessions and CLI refresh chains,
+leaves keys alone, never signs in or adds a password, and cannot bypass company
+SSO. The email contains workspace URL plus a code to paste; reset codes never
+appear in URLs. Notify the verified address after success without the password.
+Administrator-issued codes remain the offline recovery path.
+
+Email proofs last fifteen minutes, signup completion proofs five minutes, and
+discovery-read cookies five minutes. Before proof, sealed encrypted email envelopes
+carry random identifier, canonical address, purpose, expiry and initiating-browser
+binding, never a password; no pending User/tenant/signup row is written. After
+proof, persist unique identifier digests for one-use consumption across replicas,
+retaining spent identifiers until expiry. Lost verification response resumes only
+in the same browser. Signup/discovery/contact/reset purposes cannot substitute
+for one another. Persisted deadlines use PostgreSQL `statement_timestamp()` and
+bound durations; pre-proof envelopes use the PostgreSQL-anchored server clock.
+Keep original address for delivery; trim input whitespace, canonicalize domain,
+preserve local-part case, and never collapse dots, plus tags or provider aliases.
+Use this comparison consistently, accepting missed differently cased addresses
+rather than merging accounts.
+
+Apply separate shared source and address/account budgets, including resend, before
+SMTP or hashing for signup/contact verification, discovery and reset. Use keyed
+pseudonyms; recipient throttles and comparable timing never expose account
+existence or delivery. Source throttles may return `429`. Reset requests never
+lock an existing account. Retain production TLS, host-only Secure/HttpOnly/SameSite
+cookies, trusted Origin, CSRF protections, fixed destinations and `no-store` for
+proof/result pages and responses. Email links place proof in fragments, not query
+strings; opening consumes nothing, page code POSTs proof then clears the fragment.
+Never log addresses, passwords, codes or proofs. Sends occur after transactions,
+outside locks; operator test-send/invitation delivery retain honest relay outcomes.
+
+### REQ-018 — Platform console sign-in stays in the platform plane
+
+An already registered platform operator opens `/platform`, with page heading
+**Platform admin**. Use the existing platform principals, `PlatformLogin`,
+`PlatformLoginRequest` and first-party Rust browser-session machinery; extend
+those owners for the browser purpose rather than duplicate login orchestration.
+The single platform OIDC connection authenticates pre-registered operators and
+retains issuer/subject pinning and unknown-subject refusal. Operator MFA belongs
+to the IdP. Installs without an IdP permit a registered platform `user` to sign
+in with a platform-user password using the same 15–128 normalized-character,
+blocklist and Argon2id policy as REQ-017. This is a platform credential, never a
+tenant User or a cross-tenant person account. Provision/manage it through the
+existing authorized platform principal/credential owners; there is no anonymous
+operator enrollment or first-visitor administration.
+
+Successful proof creates a regenerated opaque platform-only browser session,
+not a browser API token. Rust owns issuance, validation, revocation and expiry;
+Node only forwards the selected cookie and trusted origin and renders safe
+metadata. The host-only Secure, HttpOnly, SameSite=Lax cookie has `Path=/platform`
+and a distinct platform name. Tenant cookies are never accepted on platform
+operations; platform cookies are never forwarded to or accepted on tenant routes,
+tenant enumeration, MCP, CLI token exchange, gateway, OTLP or gRPC. Path scoping
+supplements Rust's plane checks; it does not replace them. Reuse browser origin,
+CSRF, one-use state/PKCE/nonce/issuer binding, fixed redirects, no-store, redaction,
+logout and bounded cleanup controls. Store failure refuses access.
+
+Sessions expire after 15 minutes idle or eight hours absolute, whichever comes
+first; activity cannot extend the absolute deadline. PostgreSQL owns persisted
+coordination timestamps. Check the current active platform principal and original
+password/connection revision; suspension, credential invalidation or platform
+connection replacement invalidates the anchored session. Logout revokes only the
+selected session. No refresh-token or recovery-key browser login is added.
+
+Before destructive operations, including workspace retirement and provider,
+SMTP or signup-setting changes, require fresh proof of the same platform user's
+allowed password or platform OIDC method. Reuse the existing five-minute recent
+human-proof window; OIDC must request fresh IdP authentication, not silently
+reuse a Wyrd cookie. A stale session alone, tenant proof, different operator or
+bootstrap key cannot satisfy re-authentication. Refusal performs no mutation.
+Ordinary CLI/API authorization remains its existing separate channel. The
+bootstrap/global administrative key is CLI/API break-glass only: it is never
+accepted by console login or placed in a browser, Node, page data or cookies.
+
+**Same-origin routing resolution:** official nginx currently sends the whole
+`/platform` prefix to Rust. Reserve exact `/platform` for the console entry and
+`/platform/ui` plus its subtree for SvelteKit pages/actions (including sign-in,
+callback landing and re-authentication). Use nginx exact matches for `/platform` and `/platform/ui`, and a `^~`
+prefix location for `/platform/ui/` ahead of the existing API regex; all other `/platform/*` routes stay Rust
+APIs, including Rust-owned browser-session operations under `/platform/browser/*`.
+The BFF calls those owners server to server with the platform cookie only; OAuth
+code exchange stays in Rust. Existing API paths, `platform` schema and `Platform*`
+types retain their names; add no `/admin` or other alias and use no content-type
+routing heuristic. The UI's `/platform/ui/*` namespace separates pages from
+existing management resources such as `/platform/tenants` and `/platform/mail`.
+
+### Revision-6 HTTP contracts (REQ-011–REQ-017)
+
+| Route | Request → response and authority |
+|---|---|
+| `GET /auth/browser/methods?tenant=acme` (tenant optional) | Retain `{password, company_sso, providers, signup}`; add `{local_signup, email_discovery, password_reset, email_verification_required:true, signup_providers:[...]}`. `providers` means returning/invitation methods; `signup_providers` means eligible creation methods. Without tenant, password is not a global login promise; root uses discovery/key entry. `signup` means at least one creation method is usable now, not merely that its operator switch is on. No secrets or account counts. |
+| `POST /auth/signup` | Tagged union `{method:"email", email}` or `{method:"social", provider}` replaces mandatory provider-only input. Email: `202 {status:"check_email"}`, sets sealed flow cookie. Social: `200 {authorization_url}`, sets existing sealed provider-check cookie. Local requires password enabled, signup enabled and SMTP; provider paths enforce configured enablement. |
+| `POST /auth/signup/verify` | `{proof}` + initiating cookie → `200 {status:"proven"}` and opaque completion cookie. Proof comes from an email fragment link or pasted token, never a password-bearing URL. Social callback reaches the same proven-attempt state. A provider lacking verified contact uses the email branch bound to that provider attempt before completion. |
+| `POST /auth/signup/complete` | `{slug, display_name, local_credentials?:{username,password}, challenge_token?}` + completion cookie → `200 {tenant}` + ordinary tenant session cookie. Credentials required for local proof and forbidden for social proof. Email, issuer, subject, role and tenant ID come from server-held proof. Repeat successful completion returns the same tenant; no second creation. |
+| `POST /auth/browser/workspaces/request` | `{email}` → `202 {status:"check_email"}` and sealed browser binding; uniform for known/unknown addresses. SMTP required. Mail goes to the submitted address with no workspace names. |
+| `POST /auth/browser/workspaces/verify` | `{proof}` + binding → `200 {workspaces:[{tenant,display_name,login_url}],next_cursor?}`. Bounded page, same short-lived discovery cookie for pagination via `GET /auth/browser/workspaces?cursor=...`. Result URLs are fixed same-origin workspace-login paths; proof grants directory read only. Empty result is normal after proof. |
+| `POST /auth/browser/password/reset/request` | `{tenant,username}` → `202 {status:"check_email"}` for every syntactically valid admitted request. Send only for an active eligible password User with verified contact. SMTP failure is not exposed as an account-specific error. |
+| Existing password routes | `/signup {tenant,invitation_code,username,password}` and `/login {tenant,username,password}` establish their existing session; `/change {tenant,current_password,new_password}` and `/reset {tenant,reset_code,new_password}` retain existing response contracts and invalidation. Reset never signs in. |
+| `POST /auth/browser/email/request` and `/verify` | Fresh allowed-method tenant session: `{tenant,email}` → `202 {status:"check_email"}`; `{tenant,proof}` → `204`. Bind proof to that User and purpose. On verification atomically replace the verified contact/revision and directory-update intent; notify the old verified address. No grant, identity or password change. |
+| Existing platform tenant creation and settings | Extend typed create-tenant input with optional `{human_admin:{username,password,email?}}`; setup requires it, existing machine-only administrative creation may omit it. Password never appears in response. Reuse existing platform login-settings and mail management operations, not a parallel setup API or configuration source. |
+
+Failures enter the stable Wyrd error catalog: distinguish disabled method
+(`403`), invalid/expired proof (`400`), unavailable dependency (`503`), claimed slug
+(`409`) and admission throttle (`429`, `Retry-After` header and equal whole-second
+problem field). Preserve `WYRD_AUTH_403_SIGNUP_WORKSPACE_LIMIT`. Account-sensitive
+request routes keep their generic `202`; a deployment-wide SMTP outage may return
+uniform `503`, never condition that response on an account lookup.
 
 ## Persistence and authority changes
 
@@ -485,17 +771,53 @@ additional isolation or authority exception is approved.
 | Owner/store | Required change |
 |---|---|
 | New platform social-provider configuration records | Provider kind, client metadata, sealed secret, tested/enabled state and revision; existing platform management authority; shared by replicas |
-| New platform application-mail/signup settings records | SMTP host/port/TLS/sender and sealed credentials, password availability and signup-enable setting; no tenant-visible secrets or implicit tenant administration rights |
+| New platform application-mail/signup settings records | SMTP host/port/TLS/sender and sealed credentials, password availability and signup-enable setting; revision 5 adds the owned-workspace cap and the optional challenge site key with sealed secret; no tenant-visible secrets or implicit tenant administration rights |
 | Existing tenant identity store and local User credentials | Reuse tenant/issuer/subject ownership uniqueness; explicit attachment/removal and lookup validity for anchors; no platform-person identity store |
 | wyrd.auth_login_state | Purpose-bound returning login, invitation and linking context, exact provider revision, browser binding and linked User/invitation where needed; preserve company/test/device flows |
-| New platform pre-tenant signup records and admission counters | Expiring browser/provider-bound signup proof and completion/retry ownership, reference to the provisioned tenant, and shared trusted-source/provider-identity rate-limit state; no provider token vault |
-| platform.tenants and existing provisioning state | Associate signup-created tenant/claim with its proven creation attempt so another caller cannot adopt a failed claim; retain the directory lifecycle |
+| New platform pre-tenant signup records and admission counters | Expiring verified signup proof and completion/retry ownership, reference to the provisioned tenant, and shared pseudonymous trusted-source/proven-identity rate-limit state; no pending signup record before email/provider proof, no plain identity or address in admission keys, no provider token vault (revision 5) |
+| platform.tenants and existing provisioning state | Associate signup-created tenant/claim with its proven creation attempt so another caller cannot adopt a failed claim; record the creating identity's keyed pseudonym, so the owned-workspace cap survives attempt purge (revision 5); retain the directory lifecycle |
 | wyrd.auth_browser_sessions, wyrd.auth_device_authorizations, wyrd.auth_refresh_tokens | Complete social provider/revision and linked-identity anchors, invalidation/renewal constraints; preserve password/company/recovery anchors and client binding |
 | New tenant login-policy metadata | Require-company-SSO state and revision tied to current Active company connection; integrate existing freshness/invalidation owners |
 | wyrd.auth_user_invitations | Recipient address, scoped intents, pending/revoke/expiry/consumption/resend and safe per-recipient send outcome; no raw invitation secret in storage |
 
+Revision 6 extends these approved stores as follows; this explicitly approves the
+bounded discovery projection rather than deferring it. Physical names remain
+implementation-owned. Required support columns, unique/lookup/expiry indexes,
+foreign keys, checks and RLS policies implement only the named properties.
+
+| Revision-6 persistence purpose | Boundary and reuse |
+|---|---|
+| Proven email signup/discovery/contact proof and one-use redemption | Genuine pre-tenant platform records may omit `data_tenant_id`, but enable and force RLS and permit only the existing platform owner. Extend proven signup state; no pre-proof pending row except shared abuse counters. Retain only bounded proof/consumption metadata, expiry, browser digest and necessary temporary address. No global person or global password store. |
+| Tenant-local verified recovery contact | Every tenant table leads with `data_tenant_id`, forces RLS and uses tenant-qualified User references. Track address, verification time and replacement revision separately from unverified profile/invitation email. Duplicate emails remain allowed across and within tenants. Reuse User/auth owners rather than changing identity uniqueness. |
+| Workspace discovery directory | Minimal platform control-plane projection: HMAC of canonical verified email → tenant ID and User reference/contact revision. Needed because tenant-RLS connections cannot scan every tenant at root; not an authorization or identity table. No passwords, grants, sessions or evidence. Tenant transaction updates a contact revision and notifies the existing reconciliation machinery; reconciliation reads through authorized tenant connections and updates/removes projection entries. Before revealing any result, revalidate current verified contact, live User and live tenant through those owners; stale or unavailable validation fails closed. Bound pages and cleanup. |
+| Recovery and admission metadata | Reuse tenant password-reset verifiers/revisions and shared counters, adding email-purpose/source HMAC scopes and spent-proof retention where needed. No raw reset secret or mail body in PostgreSQL; support indexes/constraints are limited to the purposes and properties named here. |
+| Provisioning and creator accounting | Existing tenant claim/proven-attempt ownership, initialization and activation. Generalize human owner to local credential or external identity. Keep creator HMAC after proof purge for cap enforcement; use verified email namespace for local creators and provider namespace/subject for social creators. Cap is per proven identity, not per human across methods. |
+
+Revision 7 additionally authorizes only these platform persistence purposes.
+Extend the existing platform identity and Rust browser-session/SQL owners; tenant
+session rows cannot represent a tenantless operator without violating tenant RLS.
+Physical names remain implementation-owned in the `platform` schema. Every table
+enables and forces platform-owner-only RLS; no fabricated tenant is used.
+
+| Revision-7 persistence purpose | Required data and permitted support properties |
+|---|---|
+| Platform-user local password credential | Existing platform `user` principal reference, unique principal ownership, Argon2id verifier, password revision and invalidation state. No plaintext/recoverable password, tenant credential, global person store or new principal kind. Reuse password validation and admission owners. |
+| Platform browser session | One-way opaque session digest, platform principal reference, exact password or platform OIDC connection/revision anchor, creation/last-activity time, 15-minute idle and eight-hour absolute deadlines, revocation and last fresh human-authentication time. Lookup uniqueness, principal/anchor references and bounded expiry/revocation cleanup indexes/constraints only. Never store raw session identifiers, bootstrap keys or provider tokens. |
+| Platform browser login and re-authentication binding | Extend existing platform login transaction metadata with browser binding, login versus same-operator re-authentication purpose, original session/principal and exact connection revision, fixed redirect and one-use expiry/consumption. Reuse existing state/PKCE/nonce owner and bounded cleanup; no second OAuth engine or SQL function. |
+
+These purposes include the support columns, constraints, lookup/expiry indexes
+and RLS policies needed for the named properties only. No migration is changed by
+this documentation revision; implementation must cite this section for each
+schema change and must never edit an applied migration.
+
+The uncommitted `20261121000006_workspace_signup.sql` is unapplied anywhere;
+revise it in place to the final revision-7 shape, rather than stacking a correction.
+Never edit an applied migration. No schema work is performed by this revision.
+
 Support constraints/indexes/policies are limited to provider/method validity,
-unique identity ownership, bound one-use completion, shared admission accounting,
+unique identity ownership, bound one-use completion and email proof consumption/expiry, verified-contact
+revision/tenant-qualified User ownership, HMAC directory lookup and revalidation,
+reset-contact revision validity, shared admission accounting,
 per-recipient lookup/state and tenant isolation. Invitation
 contents/raw codes are not a PostgreSQL mail spool; construct message content
 for sending, persisting only coordination metadata. Any additional persistence
@@ -509,7 +831,7 @@ tenant isolation and references, revision confirmation, login-anchor validity,
 invitation scopes, credential ceilings and their lookup paths. Physical names,
 JSON layout and cache representation remain implementation-owned. Naming a table
 does not authorize an unrelated change to it. Tables/records implementing the
-named revision-3 purposes above are permitted; splitting a purpose across
+named revision-3 through revision-7 purposes above are permitted; splitting a purpose across
 physical tables does not authorize another purpose. Tables, persistence purposes
 or indexes/policies outside the named purposes/properties, and any new SQL
 function, require a specification revision before schema implementation.
@@ -532,6 +854,11 @@ provisioner, social/identity anchors, addressed invitations, SMTP, company-SSO
 policy and the approved PostgreSQL platform-key distinction. This records the
 approved design boundary; it does not claim implementation or verification.
 
+Revision 7 reconciles the platform plane and first-party browser-session sections
+of the security posture and human sign-in in the design, plus official same-origin
+host routing in operations. The maintainer's explicit 2026-11-21 approval resolves
+the operator-UI blocker; this is approved behavior, not implementation evidence.
+
 ## Acceptance: connected system scenarios
 
 These are system observations, not one scenario per implementation feature.
@@ -546,8 +873,15 @@ absence of forbidden side effects, not only UI success messages.
 | AC-002: A provisioned Service operates across releases with correct attribution | Create checkout-runtime through HTTP/CLI and the UI variant; inspect the same family/grants. Run two checkout releases with the same account/key. Retained results preserve exact release, owning Card, subject, Verifier and actor attribution. Another runtime family's UID and an ungranted operation are refused without unauthorized work. | REQ-001, REQ-003, REQ-005, REQ-006, REQ-008 |
 | AC-003: Access changes affect existing sessions and credentials predictably | Copy a safe request, grant through HTTP/CLI, use the existing session, then remove/change through the UI. Observe healthy propagation, warm cache reuse, restricted/delegated limits and agreement across callers. Interrupt confirmation to prove known-invalidated refusal and the five-minute maximum with bearer requests independent of browser-store availability. | REQ-001, REQ-004, REQ-005, REQ-008, REQ-009, REQ-010 |
 | AC-004: An operator enables social login and an administrator invites a team | Set up/test/enable Google and GitHub through operator UI/APIs beside company SSO; tenant-admin changes to shared settings fail. Without SMTP, paste 10+ recipients with scoped access and copy each returned link; configure a local SMTP test server and observe separate emailed links, send outcomes and pending/resend/revoke state. Accept links using allowed password/provider methods; stranger login, expired/revoked/superseded/replayed links, an already-owned provider identity and concurrent redemption gain no unauthorized User/grant. SMTP failure is visible beside the returned link and creates no active User. Returning social login preserves access and company/direct bindings; another tenant remains separate. | REQ-011, REQ-012, REQ-013, REQ-017; preserves REQ-001, REQ-008 |
-| AC-005: A visitor creates a workspace and becomes its administrator | With signup enabled, prove Google/GitHub identity, choose a new workspace and observe a usable tenant, creator's admin binding and ordinary session. Disabled signup, rate-limit refusal, unavailable admission state and invalidated provider create no active tenant. Exercise replay, concurrent/retried creation, failed initialization and lost session response: no duplicate/ownerless active tenant or takeover of another attempt. An existing tenant's slug/domain grants no entry; no platform principal/privilege or bootstrap key is returned. | REQ-011, REQ-012, REQ-014 |
+| AC-005: A visitor creates a workspace and becomes its administrator | With signup enabled, prove Google/GitHub identity, choose a new workspace and observe a usable tenant, creator's admin binding and ordinary session. Disabled signup, rate-limit refusal, unavailable admission state and invalidated provider create no active tenant. Exercise replay, concurrent/retried creation, failed initialization and lost session response: no duplicate/ownerless active tenant or takeover of another attempt. An existing tenant's slug/domain grants no entry; no platform principal/privilege or bootstrap key is returned. Revision 5: behind configured trusted ingress, distinct visitors get distinct source windows, a spoofed forwarding header from an untrusted peer is ignored, rotating within one IPv6 /64 shares a window and a missing source refuses start and completion; starting signup leaves no pending signup row (bounded admission counters are allowed) and its flood is throttled before provider work; every throttle carries `Retry-After`; stored admission keys contain no plain identity or address; with a challenge configured, missing/invalid/wrong-hostname/wrong-action/reused tokens and an unavailable provider create no tenant, and unconfigured deployments and non-browser surfaces need none; a replayed or concurrent callback records one proof; the owned-workspace cap refuses a new claim with its quota error across replicas, while resuming an own claim and operator creation are unaffected; a completed attempt keeps no email; an interrupted `creating` attempt is resumed by its owner only. | REQ-011, REQ-012, REQ-014 |
 | AC-006: A User connects a method and the tenant adopts company SSO | Freshly prove a password User's existing method and connect Google/GitHub/company SSO; principal/access/keys remain. Stale/recovery-only proof, conflicts and races cannot transfer identities. Add a password from a social-only User, remove a method and inspect anchor invalidation; last-method removal is refused. Enable company-SSO policy after admin proof and observe refusal of password/social starts, racing callbacks, existing browser sessions and CLI renewals. Provider replacement/removal and policy apply across replicas; API keys and operator recovery retain existing policy. | REQ-012, REQ-015, REQ-016; preserves REQ-002, REQ-004, REQ-005 |
+| AC-007: Local verified-email creation works with private defaults preserved | Defaults advertise no usable signup and anonymous creation writes no tenant. Enable signup/password/SMTP; email proof precedes credentials, then one workspace/admin/verified contact/password session is created. No pending signup row before proof except bounded counters, no bootstrap secret, no duplicate on replay/concurrency/lost response. Without SMTP local signup is absent; social acquisition needs a validated provider contact or bound Wyrd proof, while invitations remain offline-capable. | REQ-011, REQ-012, REQ-013, REQ-014, REQ-017 |
+| AC-008: Setup yields a human admin and ordinary CLI access | With no SMTP/IdP, setup's named admin signs in and approves the real CLI device code. Missing noninteractive credentials claim nothing; rerun/crash does not duplicate/reset admins or activate unusable tenants. Automation/recovery output remains separate. Public signup User also approves the same tenant-bound device flow. | REQ-002, REQ-014 |
+| AC-009: Discovery reveals verified workspace links only | Known/unknown requests disclose nothing before browser-bound proof. Proof returns bounded deduplicated active links, never User IDs or a login session. Separate tenant passwords/grants remain independent; revoked/replaced contacts, disabled Users, retired tenants, stale rows, cross-tenant references and unavailable validation reveal nothing. Projection lag may omit links. No SMTP hides discovery. | REQ-011, REQ-017 |
+| AC-010: Verified contacts enable private self-service recovery | Verify/replace a contact after setup/invitation without blocking join. Known/unknown/unverified reset requests have indistinguishable bodies and comparable timing; no account lock or existence leak from recipient throttles/SMTP. Single-use/expired/replaced/replayed codes and old contact revisions refuse. Success invalidates local sessions/CLI renewal, leaves keys, requires login, notifies contact, and cannot add a password or bypass SSO. Offline admin reset still works. | REQ-002, REQ-013, REQ-015, REQ-016, REQ-017 |
+| AC-011: Every auth page obeys Rust's advertised methods | Exercise root, login, invitation, signup and device pages with no provider, no SMTP, password disabled, SSO required/unavailable and no usable methods; render only current capabilities. Race settings changes with POST and observe Rust refusal. Root creation link appears only when usable; create and join wording differ; narrow tenant card and quota refusal replace/disable the form. Refused configured challenge uses WYRD_AUTH_403_SIGNUP_CHALLENGE. | REQ-011, REQ-012, REQ-014, REQ-016, REQ-017 |
+| AC-012: Every password operation shares the minimum | Setup, direct creation, invitation, local signup, change, reset and password-add reject fourteen normalized characters and accept fifteen unless blocklisted; accept 128-character Unicode and paste, reject oversized without truncation. No password/code/proof reaches logs. | REQ-014, REQ-015, REQ-017 |
+| AC-013: A platform operator signs in and manages the deployment safely | Through the production `/platform` console headed Platform admin, a pre-registered operator signs in through controlled platform OIDC (fresh IdP re-authentication/MFA policy) and, without an IdP, a platform-user password. Unknown subjects cannot enroll; fourteen-character passwords refuse and fifteen-character passphrases work unless blocklisted. Observe host-only Secure/HttpOnly/SameSite=Lax `/platform` cookies, safe metadata and no bootstrap key/API token in browser or Node. Tenant sessions refuse platform access; platform sessions refuse tenant routes even if manually replayed. Exercise 15-minute idle and eight-hour absolute expiry, logout, suspension, password/connection revision invalidation, storage failure and replica continuity. Stale, different-operator and tenant proof cannot retire a workspace or change providers/SMTP/signup; fresh same-operator proof permits the authorized action without granting tenant authority. Through the official host, `/platform` and `/platform/ui/*` render pages while existing `/platform/*` APIs retain typed responses; the BFF forwards only the platform cookie to Rust. CLI/API break-glass remains available separately. | REQ-018; preserves REQ-011, REQ-017 and platform/tenant separation |
 
 Existing safeguards remain required as cases/regressions within these journeys:
 cross-tenant refusal, exact versus family scopes, direct/provider/group provenance,
@@ -585,11 +919,21 @@ Excluded: mandatory teams/ownership metadata, SCIM/group synchronization, new
 principal kinds, a policy language/service, general user-table row policies,
 per-release accounts/credentials, a UI-only workflow and an access-request inbox.
 The addition also excludes cross-tenant person accounts, automatic account
-merging, public password signup, generic operator OIDC/provider plugin frameworks,
-continuous IdP offboarding, new mail queues, provider-token vaults, CAPTCHA,
-operator-wide signup creation caps and provider-specific mail integrations/tests.
+merging, OAuth password grant, generic operator OIDC/provider plugin frameworks,
+continuous IdP offboarding, new mail queues, provider-token vaults, CAPTCHA
+other than REQ-014's optional server-validated challenge, deployment-wide
+total signup caps and provider-specific mail integrations/tests. Platform console sessions and
+platform-user password verifiers are explicitly included under REQ-018; excluded
+are browser/Node bootstrap-key login, tenant-to-platform session reuse, anonymous
+platform enrollment, a new principal kind, an `admin` route/schema/type alias,
+platform refresh tokens and a second authentication/session engine. Operator MFA
+is enforced by the IdP; Wyrd-native MFA is outside this change.
+The bounded verified-email discovery projection and email proof metadata are
+explicitly included; neither creates a global identity account.
 Email invitations do not add delivery/notifications to REQ-009's access-request
 copy flow.
+
+## Revision history
 
 Revision 2 makes local device-login anchors and scoped invitation consumption
 explicit, and removes shipped-system transition requirements because nothing has
@@ -603,4 +947,28 @@ conventional invitation model at the maintainer's direction: each invitation is
 a single-use link the administrator can copy, SMTP is optional delivery, and
 mailbox-challenge recipient proof and its records are removed. Task 003 is
 replanned against it.
+Revision 5 (approved by the maintainer, 2026-11-21) adds REQ-014's signup abuse controls at the maintainer's direction, following standard practice: trusted ingress source and IPv6 /64 grouping, no pre-proof row, admission before initiation, `Retry-After`, pseudonymous bounded counters, an optional server-validated challenge, an owned-workspace cap and crash recovery. It adds the public error `WYRD_AUTH_403_SIGNUP_WORKSPACE_LIMIT` and derives its HMAC key from the deployment sealing keyring. The owning [social admission](../../../architecture/wyrd-security-posture.md#social-admission-account-linking-and-application-mail), local-password source and sealing-keyring sections were reconciled on 2026-11-21 with the maintainer's agreement (default cap 3, `403` cap error, keyring-derived key). Task 003 cycle 6 is replanned against it.
 Specification approval does not authorize Git staging, commits or pushes.
+
+Revision 6 — status: approved; revision: 6; date: 2026-11-21. The maintainer said
+“i approve the spec revision” and accepted all eight “Decisions for the maintainer”
+in [onboarding](design/onboarding.md) exactly as recommended, including verified-email
+workspace discovery and its bounded projection. This approval retains revision 5
+(including REQ-014 abuse controls), adopts the six onboarding corrections, names
+their persistence purposes and AC-007–AC-012, and reconciles human sign-in,
+security posture and operations configuration. The previously approved UI direction
+and `WYRD_AUTH_403_SIGNUP_CHALLENGE` are recorded in REQ-011/014 and AC-011.
+TASK-003 completed-cycle evidence is retained; remaining work belongs solely to
+TASK-003-carryover at revision 6. No code, migration or mock is changed here.
+
+
+Revision 7 — status: approved; revision: 7; approval recorded: 2026-11-21.
+The maintainer explicitly approved decisions A (platform console sign-in) and B
+(nothing ships until complete; nothing built twice). REQ-018 and AC-013 reuse
+existing platform identity/OIDC and first-party browser-session owners, name the
+platform-only persistence purposes and resolve same-origin page/API routing.
+The carryover replaces its inherited operator-UI blocker with executable proof,
+orders final shared foundations before acquisition, then platform sessions, mock
+extension/approval, pages and original cycles 7–10. Existing REQ/AC observations
+and completed evidence remain intact. No implementation, migration, test, mock,
+staging, commit or push is authorized by this documentation handoff.

@@ -96,6 +96,48 @@ Unsuffixed `WYRD_DB_*` variables tune the tenant pool. `_MIGRATOR` and
 pool. Missing suffixed values use that role's typed defaults; they do not
 inherit the application value.
 
+### Human setup and acquisition configuration
+
+`wyrd-server setup --tenant acme --server URL --admin-username alice` requires a
+hidden password prompt or `--admin-password-stdin`; optional `--admin-email` is
+unverified. Noninteractive callers provide username and secret stdin before a
+claim is made. Passwords never enter argv or configuration dumps. Setup activates
+only a usable named human admin through existing provisioning and retains separate
+automation/recovery credentials. Output includes login URL/username, never password.
+Completed reruns report safe status without duplicate admins/password resets;
+interrupted setup uses existing operator-authorized recovery and cannot activate
+ownerless. Setup/password login and local CLI device approval work without SMTP/IdP.
+
+Private defaults are `password_enabled=true`, `signup_enabled=false`, no relay or
+social credentials. Use existing revisioned platform login-settings and mail
+management to enable acquisition, never another config source or Node secret.
+Local public signup requires password/signup enabled plus configured SMTP; public
+email verification is mandatory, not a bypass setting. Google/GitHub acquisition
+also needs a verified contact (validated provider proof, or bound Wyrd email proof);
+provider proof can permit social creation without SMTP. Returning social login and
+bearer invitation acceptance do not require verified email. Root creation is offered
+only while a method is usable; operator settings explain missing prerequisites.
+
+Configure the existing generic SMTP relay with explicit host, port, TLS mode,
+sender and optional sealed credentials; test-send before use. Prefer validated
+STARTTLS or TLS, plaintext only for an explicitly trusted local relay. No mail
+credentials are bundled. Without SMTP, hide local signup, workspace discovery and
+reset requests while copied invitations, setup, password login, administrator-issued
+reset and CLI device login remain available. Setup/invited contacts require separate
+verification for discovery/recovery. Removing SMTP disables dependent starts, not
+login or valid issued reset-code redemption; signed proofs retain their deadline
+while signup/their method remain enabled. Reset sends are bounded transient work,
+not durable delivery: after a crash the user requests again. Invitations/test-send
+report relay outcomes; public discovery/reset requests conceal account-specific
+outcomes. Discovery returns verified workspace links only and still requires login.
+
+Trusted ingress IP/CIDRs and client-address header are deployment configuration;
+ignore headers from untrusted peers, normalize mapped IPv4, group IPv6 `/64` and
+refuse missing signup source. Preserve revision-5 optional Turnstile settings,
+sealed secret and site key, and per-identity owned-workspace cap (default 3);
+there is no mandatory challenge or deployment-wide cap. Current policy is rechecked
+in Rust, and no new Node credential/encryption configuration is introduced.
+
 ## Browser-session deployment
 
 First-party UI sessions are Rust-owned and persisted by digest in the existing
@@ -241,7 +283,12 @@ The official images (`docker/official/{debian,rocky}/Dockerfile`) run
 stops the container. nginx serves HTTP on 8080, proxying the server's routes
 (`/v1`, `/v1beta`, `/auth`, `/platform`, `/mcp`, `/.well-known`,
 `/openapi.json`, `/healthz`, `/readyz`) to the server's loopback listener and
-every other path to the BFF, and gRPC on 50051. Each copies a Linux server
+every other path to the BFF, and gRPC on 50051. Exact `/platform` and
+`/platform/ui` plus its subtree are explicit page/action exceptions to that prefix
+rule, routed to the BFF with exact matches and a `^~ /platform/ui/` prefix
+that takes precedence over the Rust API regex. All other `/platform/*`
+paths, including `/platform/browser/*`, remain Rust-owned; paths are not rewritten
+and no `admin` alias or content-negotiation routing is used. Each copies a Linux server
 bundle and compiles nothing; the image supplies Node.js from the pinned
 official Node image. Release publishes `bohmian/wyrd:<distro>-<arch>-<version>`
 for debian on amd64 and arm64 and rocky on amd64 only, each built on a native

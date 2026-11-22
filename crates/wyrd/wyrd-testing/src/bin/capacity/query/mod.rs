@@ -177,11 +177,12 @@ pub enum Experiment {
 }
 
 impl Experiment {
-    /// Every experiment, in the order `l1 bifrost` runs them.
+    /// The experiments the routine Bifrost sweep's cases belong to, in the
+    /// order it runs them.
     pub const ALL: [Self; 4] = [Self::WritesParquet, Self::Hot, Self::Parquet, Self::UiSql];
 
-    /// The extended experiments, run only when selected by name: never part
-    /// of `l1 bifrost` or `l1`.
+    /// The extended experiments, whose cases are all targeted: never part of
+    /// the routine Bifrost sweep.
     pub const EXTENDED: [Self; 2] = [Self::UiSql10x, Self::UiSqlLearned];
 
     /// The experiment id: its command word and record directory.

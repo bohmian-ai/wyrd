@@ -386,11 +386,12 @@ fn aggregate(record: &Record) -> Option<&Repetition> {
 /// headline latency, input when the category has the column, and target.
 fn cells(category: Category, case: &CaseRecord) -> Vec<String> {
     let headline = Headline::of(category, &case.family, &case.case);
+    let width = if headline.input == Input::None { 4 } else { 5 };
     let Some(record) = &case.record else {
-        return vec!["unavailable: no engine record".to_owned(); 5];
+        return vec!["unavailable: no engine record".to_owned(); width];
     };
     let Some(aggregate) = aggregate(record) else {
-        return vec!["unavailable: no case aggregate".to_owned(); 5];
+        return vec!["unavailable: no case aggregate".to_owned(); width];
     };
     let work = exact(&aggregate.reading(headline.work));
     let cpu = aggregate

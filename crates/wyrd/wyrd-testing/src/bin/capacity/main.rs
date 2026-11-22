@@ -210,7 +210,7 @@ async fn level(level: Level, engine: Engine, arguments: &[String], root: &Path) 
 /// Makes this driver process a benchmark recorder before it creates any
 /// client, as `WYRD_METRICS_BENCHMARK_SNAPSHOT=1` makes its child server one,
 /// so its own client, attempt, and fixture observations are kept; only
-/// `l1`/`l2` start it, never `report` or `results`.
+/// an L1 case process and `l2` start it, never `report` or `results`.
 ///
 /// # Errors
 ///

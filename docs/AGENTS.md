@@ -71,7 +71,7 @@ Copy the named page when writing a new one of the same shape.
 
 | Shape | Sections | Copy |
 | --- | --- | --- |
-| Landing | One paragraph → how it fits (one diagram) → one example (its YAML, the program, and its output) → what Wyrd does not do → `## Next` | `get-started/introduction.md` |
+| Landing | One paragraph → one example (its program and its output) → how it fits (one diagram) → what Wyrd does not do → `## Next` | `get-started/introduction.md` |
 | Install | What you need (minimum versions table) → install, one command per language in `<LangTabs>` → start or check → `## If it fails` → `## Next` | `get-started/setup.md` |
 | Quickstart or guide | One-sentence goal → numbered `##` steps, each with its files, command, and output → `## If it fails` → `## Next` | `get-started/quickstart.md` |
 | Integration (a guide for one framework or interface, such as ASGI) | What you capture → Before you start → Install → Usage → Verify it worked → `## If it fails` → Advanced → Reference → `## Next`; Advanced and Reference only when needed | `connect/integrate-asgi.md` |
@@ -87,8 +87,16 @@ Copy the named page when writing a new one of the same shape.
   describe. Prose after a block covers only its output and what to do next.
 - Show the output a command prints when it confirms success, in a `text` block
   directly after the command.
+- Pass a model instance (Pydantic model, Zod-parsed object) straight to
+  `verify` or `submit`. Never `model_dump()` or rebuild a dict from it first:
+  the SDK reads the model's fields as the input slots.
 - Use `<LangTabs langs={['python', 'rust', 'typescript']}>` for anything that
   differs by language, in that order.
+- Show a Card declaration one of two ways. Where the page teaches the code
+  route, use code tabs and offer the same Cards as YAML. Everywhere else, show
+  YAML, the recommended production route, and link to Author in code. Show a
+  long example in full only on the page that runs it; other pages show the
+  region that makes their point.
 - Pin versions in install commands to the documented release.
 - Public pages use the reader's tools (`uv add`, `cargo add`, `pnpm add`,
   `wyrd ...`), never repository tasks; `scripts/check_commands.py` enforces it.

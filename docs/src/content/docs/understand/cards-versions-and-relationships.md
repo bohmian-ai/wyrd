@@ -3,27 +3,16 @@ title: Cards and versions
 description: A Service declaration is a set of versioned Cards, each one a declared component of an AI system.
 pillar: wyrd
 section: Understand
-order: 4
+order: 5
 ---
 
 A Card is a versioned declaration of one AI system component, or of one Verifier that checks components. Every observation and verdict points back to an exact Card version.
 
 ## The shape of a Card
 
-These are the two Cards from [Run your first verification](/get-started/quickstart/):
+This is the Service Card from the [setup check](/get-started/setup/#3-check-it-end-to-end):
 
-<Tabs>
-<Tab label="support-reply.yaml">
-
-<CodeFromFile file="examples/quickstart/support-reply.yaml" lang="yaml" title="support-reply.yaml" />
-
-</Tab>
-<Tab label="no-refund-promise.yaml">
-
-<CodeFromFile file="examples/quickstart/no-refund-promise.yaml" lang="yaml" title="no-refund-promise.yaml" />
-
-</Tab>
-</Tabs>
+<CodeFromFile file="examples/setup-check/support-reply.yaml" lang="yaml" title="support-reply.yaml" />
 
 An author writes `apiVersion`, `kind`, `metadata`, and `spec`. The server adds `relationships` and `status`.
 
@@ -57,4 +46,4 @@ Every Card therefore shows what it depends on and what depends on it. A running 
 
 ## Next
 
-[How verification works](/understand/how-verification-works/).
+[How verification works in Wyrd](/understand/how-verification-works/).

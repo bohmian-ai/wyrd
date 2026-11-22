@@ -760,17 +760,23 @@ the result and inputs rows. Nothing else reads it.
 
 Telemetry supports two setup paths:
 
-- **Wyrd-managed telemetry.** Configure the loaded state once, then call
-  `state.start_telemetry()` (or its language-native equivalent). Wyrd supplies
-  `service.name`, `service.version` and optional `deployment.environment.name`
-  from the frozen state context to its managed OpenTelemetry setup, and exports
-  with the state's validated workload context and existing authentication.
+- **Wyrd-managed telemetry.** Configure the loaded state once:
+  `state.configure()` fixes its context and, by default, installs Wyrd's
+  managed OpenTelemetry setup; `telemetry=False` (`{ telemetry: false }` in
+  TypeScript) fixes the context only. When the optional OpenTelemetry packages
+  are absent, a default `configure()` fails naming them. Rust configures
+  through `WyrdState::configure` and installs with
+  `wyrd_ai::otel::start_telemetry(&state)`, whose returned handle owns the
+  pipeline. Wyrd supplies `service.name`, `service.version` and optional
+  `deployment.environment.name` from the frozen state context to its managed
+  OpenTelemetry setup, and exports with the state's validated workload context
+  and existing authentication.
 - **Application-managed telemetry.** The application owns its OpenTelemetry
   providers, resources and lifecycle. It supplies `service.name`,
   `service.version` and optional `deployment.environment.name` on its resources,
   and sends spans, logs and metrics through standard OTLP exporters to Wyrd's
   supported endpoints with supported authentication. This path does not require
-  WyrdState, `state.start_telemetry()`, or an exporter accepting a state. Wyrd
+  WyrdState, Wyrd's managed setup, or an exporter accepting a state. Wyrd
   does not copy private state configuration into an application-owned provider.
 
 Both paths use the same ingest validation and table projection. An application
@@ -862,11 +868,12 @@ reuse that client's credential resolution and refresh rather than introducing
 another authentication implementation. Applications may attach those exporters
 to their own OpenTelemetry providers. Framework instrumentation remains owned
 by the application and framework; Wyrd never discovers or patches frameworks.
-A state's `start_telemetry` installs one managed global provider; that state's
+A state's managed setup installs one managed global provider; that state's
 `flush` and `shutdown` force-flush it before draining the writer, still drain
 when it fails, and report the failure as `WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT`
-or `WYRD_SDK_503_TELEMETRY_FLUSH_FAILED`. An application-owned provider is
-never flushed by a state.
+or `WYRD_SDK_503_TELEMETRY_FLUSH_FAILED`. A state that never started Bifrost
+has no writer to drain, so a telemetry-only program flushes without starting
+it. An application-owned provider is never flushed by a state.
 
 Env vars in deployed services:
 
@@ -1088,8 +1095,8 @@ introduce a competing request identity.
 #### Trace context — W3C `traceparent` and `tracestate`
 
 Every Wyrd SDK sends the caller's active OpenTelemetry span as W3C
-`traceparent`/`tracestate` on each HTTP and gRPC request, and its
-`start_telemetry` installs the W3C trace-context propagator, so standard
+`traceparent`/`tracestate` on each HTTP and gRPC request, and its managed
+telemetry setup installs the W3C trace-context propagator, so standard
 instrumentation carries the same trace to the next service. A queued Bifrost
 write records a `bifrost.enqueue` PRODUCER span in the caller's own tracer;
 the server's `bifrost.gate.write` CONSUMER span links each batch's producers.
@@ -3042,8 +3049,13 @@ values to executable arguments (`addInput`/`bindInput` in TypeScript). Their
 canonical `inputs` maps and whole-map setters retain their names. Rust accepts
 bare JSON Schemas and Python accepts schema dictionaries or supported model
 classes without a mandatory JSON-slot wrapper; a Python Verifier's `inputs`
-may also be one Pydantic model class whose fields are its named slots,
-and a Python Service `Table`'s `schema` may be a model class whose field
+may also be one Pydantic model class whose fields are its named slots.
+A field typed with the SDK's trace marker (`wyrd.verify.Trace` in Python,
+`verify.Trace(z.string())` in TypeScript, `wyrd_ai::verify::Trace` in Rust) declares a `trace`
+slot, whether it is a model field or a mapping value, and carries the trace ID
+string; every other field declares a `json` slot. The marker compiles to the
+canonical `trace` slot, so the stored Card is unchanged. A Python Service
+`Table`'s `schema` may be a model class whose field
 order is the column order. Pydantic is the optional `wyrd-ai[pydantic]` extra.
 Explicit canonical slot forms and distinct non-JSON slot constructors remain
 available. Execution references stay strings such as `inputs.report.text`.

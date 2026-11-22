@@ -13,7 +13,7 @@ import { fixture, declared, serverTest } from "../support/server.js";
 vi.setConfig({ testTimeout: 60_000 });
 
 const DESK = fixture("cards/declare_and_pull/support-desk.yaml");
-const QUICKSTART = resolve(import.meta.dirname, "../../../../../examples/quickstart");
+const SETUP_CHECK = resolve(import.meta.dirname, "../../../../../examples/setup-check");
 
 /** The support desk graph, declared after the artifact-bearing Model it references. */
 const test = serverTest().extend<{
@@ -53,13 +53,13 @@ test("service graph declares and pulls", async ({ cards, desk }) => {
   expect("artifacts" in state).toBe(false);
 });
 
-test("runs the Quickstart script from a directory holding only its Cards", async ({ server: _ }) => {
-  const reader = mkdtempSync(join(tmpdir(), "wyrd-ts-quickstart-reader-"));
+test("runs the setup check from a directory holding only its Cards", async ({ server: _ }) => {
+  const reader = mkdtempSync(join(tmpdir(), "wyrd-ts-setup-check-reader-"));
   for (const file of ["no-refund-promise.yaml", "support-reply.yaml"])
-    cpSync(join(QUICKSTART, file), join(reader, file));
+    cpSync(join(SETUP_CHECK, file), join(reader, file));
   const ref = (kind: string, name: string) => `${kind}/${name}@1\\.0\\.0#[0-9a-f-]+`;
   const printed = () =>
-    execFileSync(process.execPath, [join(QUICKSTART, "quickstart.ts")], { cwd: reader, encoding: "utf8" });
+    execFileSync(process.execPath, [join(SETUP_CHECK, "check.ts")], { cwd: reader, encoding: "utf8" });
 
   const first = printed();
   expect(first).toMatch(
@@ -74,7 +74,7 @@ test("runs the Quickstart script from a directory holding only its Cards", async
 
 test("declares a ready verification state", async ({ server, model: _ }) => {
   const quickstart = mkdtempSync(join(tmpdir(), "wyrd-ts-quickstart-"));
-  cpSync(QUICKSTART, quickstart, { recursive: true });
+  cpSync(SETUP_CHECK, quickstart, { recursive: true });
   const service = join(quickstart, "support-reply.yaml");
 
   const state = await WyrdState.declare(service);

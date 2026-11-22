@@ -24,6 +24,8 @@ export const TOPICS: Partial<Record<Section, readonly string[]>> = {
 
 export type DocMetadata = {
   title: string;
+  // Browser and social title when it must differ from the page heading.
+  browserTitle?: string;
   description?: string;
   pillar?: Pillar;
   section: Section;
@@ -102,6 +104,7 @@ export function validateFrontmatter(contentPath: string, raw: unknown): DocMetad
   }
   const result: DocMetadata = { title: title.trim(), pillar: meta.pillar, section };
   if (topics.length > 0) result.topic = meta.topic as string;
+  if (typeof meta?.browserTitle === 'string' && meta.browserTitle.trim() !== '') result.browserTitle = meta.browserTitle.trim();
   if (typeof meta?.description === 'string') result.description = meta.description;
   if (typeof meta?.order === 'number') result.order = meta.order;
   if (typeof meta?.draft === 'boolean') result.draft = meta.draft;

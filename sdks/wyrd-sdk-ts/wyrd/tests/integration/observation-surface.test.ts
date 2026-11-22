@@ -4,7 +4,7 @@
 import { expect, vi } from "vitest";
 import { z } from "zod";
 
-import { Bifrost, TableConfig, WyrdError, WyrdState } from "wyrd-ai";
+import { Bifrost, TableConfig, WyrdError, type WyrdState } from "wyrd-ai";
 
 import { observedServiceTest as test } from "../support/observed-service.js";
 
@@ -36,6 +36,35 @@ test("records land in their tables under the view that wrote them", async ({ ser
   expect(await read(SCORES)).toEqual([{ value: 42n, subject_card_uid: state.cardRef("model").uid }]);
 });
 
+test("submit and write start the writer on first use", async ({ server, reader, state }) => {
+  const registrar = await Bifrost.connect({ table: TableConfig.fromJsonSchema(ANSWERS, VALUE_ROW) });
+  await registrar.register();
+  await registrar.shutdown();
+  const model = state.run("model");
+
+  // Neither call is preceded by startBifrost.
+  await Promise.all([
+    model.observe.submit("observed-drift", { latency: 7 }),
+    model.observe.submit("observed-drift", { latency: 8 }),
+  ]);
+  await model.bifrost.writeTo(ANSWERS, { value: 45 });
+  await state.shutdown();
+  server.flushBifrost();
+
+  const samples = await reader.sql(
+    `SELECT COUNT(DISTINCT record_id) AS records FROM bifrost.drift.observations WHERE run_id = $1`,
+    [model.runId],
+    z.object({ records: z.bigint() }),
+  );
+  expect(samples).toEqual([{ records: 2n }]);
+  const rows = await reader.sql(
+    `SELECT value, subject_card_uid FROM ${ANSWERS} WHERE run_id = $1`,
+    [model.runId],
+    RecordRow,
+  );
+  expect(rows).toEqual([{ value: 45n, subject_card_uid: state.cardRef("model").uid }]);
+});
+
 test("write needs an active table, and switching it moves the destination", async ({ server, reader, state }) => {
   for (const table of [ANSWERS, SCORES]) {
     const registrar = await Bifrost.connect({ table: TableConfig.fromJsonSchema(table, VALUE_ROW) });
@@ -63,11 +92,6 @@ test("write needs an active table, and switching it moves the destination", asyn
 type Refusal = readonly [string, (state: WyrdState, bundle: string) => unknown, string];
 
 test.for<Refusal>([
-  [
-    "emit before Bifrost starts",
-    (_, bundle) => WyrdState.fromPath(bundle).run("model").observe.submit("observed-drift", { latency: 1 }),
-    "WYRD_SDK_400_BIFROST_NOT_STARTED",
-  ],
   [
     "write into a built-in table",
     (state) => state.run("agent").bifrost.writeTo("bifrost.drift.observations", { latency: 1 }),

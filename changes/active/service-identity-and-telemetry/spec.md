@@ -1,6 +1,6 @@
 ---
 id: SPEC-service-identity-and-telemetry
-revision: 16
+revision: 17
 status: approved
 ---
 
@@ -482,8 +482,15 @@ this draft alone.
 
 Telemetry supports two setup paths:
 
-- **Wyrd-managed telemetry.** Configure the loaded state once, then call
-  `state.start_telemetry()` (or its language-native equivalent). Wyrd supplies
+- **Wyrd-managed telemetry.** In Python and TypeScript, `state.configure()`
+  fixes the state context and then installs Wyrd's managed OpenTelemetry setup
+  by default; `telemetry=False` (TypeScript `{ telemetry: false }`) fixes the
+  context only. TypeScript `configure` is asynchronous, also with telemetry off,
+  because the optional OpenTelemetry packages load dynamically. Rust fixes the context with
+  `configure` and installs with `wyrd_ai::otel::start_telemetry(&state)`, which
+  returns the handle that owns the providers. A failed install leaves the
+  context fixed, so configuring again refuses as frozen; the caller corrects
+  code or dependencies and restarts the process. Wyrd supplies
   `service.name`, `service.version` and optional `deployment.environment.name`
   from the frozen state context to its managed OpenTelemetry setup, and exports
   with the state's validated workload context and existing authentication.
@@ -492,7 +499,7 @@ Telemetry supports two setup paths:
   `service.version` and optional `deployment.environment.name` on its resources,
   and sends spans, logs and metrics through standard OTLP exporters to Wyrd's
   supported endpoints with supported authentication. This path does not require
-  WyrdState, `state.start_telemetry()`, or an exporter accepting a state. Wyrd
+  WyrdState, Wyrd's managed setup, or an exporter accepting a state. Wyrd
   does not copy private state configuration into an application-owned provider.
 
 Both paths use the same ingest validation and table projection. An application
@@ -507,9 +514,11 @@ null. Environment remains descriptive and grants no permission.
 
 Automatic startup must not silently reuse a provider bound to another state or
 replace an application-owned provider. Refuse incompatible startup with existing
-`WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS`; its remediation is to keep the existing
-application-managed setup and use the second path. Wyrd never replaces or flushes
-that provider. Native state/Run contexts may coexist without multiple ambient
+`WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS`; its remediation is to turn off Wyrd's
+managed setup and use the second path. Wyrd never replaces or flushes
+that provider. A state's `flush` drains only what that state started: its managed
+providers and, when started, its Bifrost writer; a state that never started a
+writer flushes successfully, and a closed state still refuses. Native state/Run contexts may coexist without multiple ambient
 defaults. No new exporter input, public state client accessor, exporter-specific
 identity setting or provider pipeline is required.
 
@@ -758,3 +767,4 @@ changes.
 | 14 | approved | Maintainer-approved Service-only configure/subject model; six shared descriptive columns on eight attributable tables; shared four-key sorting and five attribution Blooms plus signal lookup keys; Task009 follows completed Task002, with Task004 engine reused. |
 | 15 | approved | Adds state.http_auth/httpAuth stock-provider SDK contract, automatic Service/subject/Run/environment/trace injection, two credential modes, validation/capture closure and approved Python/TypeScript examples; physical defaults unchanged. |
 | 16 | approved | Maintainer-directed two telemetry setup paths: Wyrd-managed frozen state context, or application-managed standard OpenTelemetry resources and OTLP export. Removes the requirement for state-bound external exporters; preserves validated UID attribution, signal schemas, partitions, sorts, Blooms and provider ownership. |
+| 17 | approved | Maintainer-approved on 2026-11-18 with SPEC-positioning revision 6: Python and TypeScript `configure()` installs the managed setup by default with a `telemetry` opt-out, so `start_telemetry` is no longer public there; TypeScript `configure` is asynchronous; Rust keeps `otel::start_telemetry`. `flush` succeeds without a started writer. No wire, schema, attribution or provider-ownership change. |

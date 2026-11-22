@@ -14,7 +14,7 @@ export const verificationPaths: SequenceSpec = {
   flows: [
     {
       name: 'verify',
-      rest: 'Your code sends named evidence and waits for the result, up to 60 seconds. The inputs and result are stored. Press Play to step through it.',
+      rest: 'Your code sends named evidence and waits for the result, up to 60 seconds. The server answers first and stores the inputs and result afterward. Press Play to step through it.',
       messages: [
         {
           from: 'svc',

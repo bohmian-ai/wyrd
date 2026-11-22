@@ -10,18 +10,34 @@ connection. A passing or empty window alerts no one. A second Service,
 baseline.
 """
 
+import contextlib
+import io
 import json
+import re
+import runpy
+import shutil
+import sys
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
 from pydantic import BaseModel
 from wyrd import WyrdError, verify
 from wyrd.bifrost import Bifrost
-from wyrd.cards import Cards
+from wyrd.cards import CardRef, Cards
+from wyrd.testing import WyrdTestServer
 
-from .support import FIXTURES, ON_CALL_TOKEN, Watch, client_of, details, scheduled_result
+from .support import (
+    FIXTURES,
+    ON_CALL_TOKEN,
+    Watch,
+    client_of,
+    details,
+    runtime_account,
+    scheduled_result,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -214,3 +230,84 @@ def test_scheduled_binding_scores_every_requirement(
         assert requirement["provenance"]["kind"] == "drift"
         window = requirement["provenance"]["window"]
         assert window["start"] < window["end"], window
+
+
+SCHEDULED_CHECK = FIXTURES.parent / "examples/scheduled-check"
+
+
+@pytest.fixture
+def checkout_reader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[WyrdTestServer]:
+    """The scheduled-check example in an empty directory, declared, pulled, and on a server of its own."""
+    reader = tmp_path / "scheduled-check"
+    shutil.copytree(SCHEDULED_CHECK, reader, ignore=shutil.ignore_patterns("*.rs", "*.ts", "*.txt"))
+    monkeypatch.chdir(reader)
+    monkeypatch.setenv("WYRD_CONFIG_HOME", str(tmp_path / "config"))
+    with WyrdTestServer(verification_runtime=True, mutate_env=False) as server:
+        monkeypatch.setenv("WYRD_SERVER_URL", server.base_url)
+        monkeypatch.setenv("WYRD_GRPC_URL", server.grpc_url)
+        monkeypatch.setenv("WYRD_API_KEY", server.tenant_admin_key())
+        # What `wyrd declare checkout/checkout.yaml` and `wyrd pull` do in the guide.
+        cards = Cards(client_of(server))
+        cards.declare_from_path(reader / "checkout/checkout.yaml")
+        cards.pull(CardRef("Service", "checkout", "1.0.0"), reader / ".wyrd-bundle")
+        yield server
+
+
+def run_program(monkeypatch: pytest.MonkeyPatch, program: str, *args: str) -> str:
+    """Run ``program`` as ``uv run <program> <args>`` does and return what it printed."""
+    printed = io.StringIO()
+    with monkeypatch.context() as scope, contextlib.redirect_stdout(printed):
+        scope.setattr(sys, "argv", [program, *args])
+        runpy.run_path(program, run_name="__main__")
+    return printed.getvalue()
+
+
+def record(monkeypatch: pytest.MonkeyPatch, key: str, latency: str) -> float:
+    """Record with the runtime key at least ten seconds before a minute boundary; return when, in epoch seconds."""
+    # A window is one minute: keep the samples clear of the boundary they would straddle.
+    if time.time() % 60 >= 50:
+        time.sleep(61 - time.time() % 60)
+    at = time.time()
+    with monkeypatch.context() as scope:
+        scope.setenv("WYRD_API_KEY", key)
+        printed = run_program(monkeypatch, "record.py", latency)
+    assert printed == f"recorded 5 requests at {latency} ms\n"
+    return at
+
+
+def window_verdict(server: WyrdTestServer, at: float) -> str:
+    """The verdict of the scheduled window holding ``at``, once the real scheduler stores it."""
+    admin = client_of(server)
+    uid = Cards(admin).get(CardRef("Verifier", "latency-budget", "1.0.0")).card_ref.uid
+    query = (
+        "SELECT to_unixtime(window_start) AS opened, to_unixtime(window_end) AS closed, verdict"
+        " FROM bifrost.verification.results WHERE verifier_card_uid = $1"
+    )
+    deadline = time.monotonic() + WAIT_SECONDS
+    while True:
+        server.flush_bifrost()
+        for row in Bifrost(client=admin).sql(query, [uid]).to_arrow().to_pylist():
+            if row["opened"] <= at < row["closed"]:
+                return row["verdict"]
+        assert time.monotonic() < deadline, f"no window holding {at} was judged"
+        time.sleep(1)
+
+
+def test_docsite_scheduled_verification_example(
+    checkout_reader: WyrdTestServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # What `wyrd principal credential create-principal ... --workload-name checkout` does.
+    _, runtime_key = runtime_account("checkout", client_of(checkout_reader))
+
+    # The every-minute schedule, not the test, judges each window.
+    fast = record(monkeypatch, runtime_key, "80")
+    assert window_verdict(checkout_reader, fast) == "passed"
+    slow = record(monkeypatch, runtime_key, "250")
+    assert window_verdict(checkout_reader, slow) == "failed"
+    quiet = time.time()
+    assert window_verdict(checkout_reader, quiet) == "inconclusive"
+
+    times = re.compile(r"\d\d:\d\d-\d\d:\d\d")
+    printed = run_program(monkeypatch, "results.py")
+    expected = (SCHEDULED_CHECK / "results-output.txt").read_text()
+    assert times.sub("HH:MM-HH:MM", printed) == times.sub("HH:MM-HH:MM", expected)

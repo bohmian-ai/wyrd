@@ -1,47 +1,83 @@
 ---
 title: Run your first verification
-description: Declare a Verifier and the Service it checks in two YAML files, then verify a passing and a failing support answer from one Python, Rust, or TypeScript program.
+browserTitle: "Quickstart: verify AI output against a policy document | Wyrd"
+description: Verify a finance report against three requirements, including a model that reads a sharing policy PDF, in one call, and release it only when the verdict passes. Python, Rust, or TypeScript.
 pillar: wyrd
 section: Get started
 order: 3
 ---
 
-You write two small YAML files and one short program in Python, Rust, or TypeScript. The program declares them to your server, then asks Wyrd to verify two support answers against one requirement: the answer never promises a guaranteed refund. One answer passes and one fails, and each verdict names the exact versions that produced it.
+Your application is about to send a customer report to an outside auditor. Before it does, it asks Wyrd one question: does this release meet the requirements? Wyrd returns a verdict, and your code releases the report or holds it for review.
 
-This is the simplest Verifier Wyrd runs. No model, provider key, or application is involved: you supply each answer as text.
+You build one Service, `finance-release`, verified by one Verifier, `release-check`, with three requirements:
+
+| Requirement | How it is judged |
+| --- | --- |
+| `recipient-authorized` | An assertion on the recipient record your application supplies |
+| `follows-policy` | A model reads the company sharing policy PDF and judges the report and its purpose |
+| `destination-restricted` | An assertion on the destination record your application supplies |
+
+One call judges all three. The reports, recipients, and destinations are synthetic, and nothing is sent anywhere: the program prints each decision.
 
 ## Prerequisites
 
-- The server from [Set up Wyrd](/get-started/setup/), running in its own terminal.
-- The `quickstart` directory from setup, with the SDK for your language installed. Run everything below there, in a second terminal.
+- The server from [Set up Wyrd](/get-started/setup/), running in its own terminal, and the `quickstart` directory from setup with the SDK for your language installed.
+- An OpenAI API key in `OPENAI_API_KEY`. The policy judge calls `gpt-4o`, which costs a few cents per run.
 
-## 1. Declare the requirement
+<Aside type="caution" title="What the model sees">
 
-Save the Verifier in your `quickstart` directory as `no-refund-promise.yaml`. Its one requirement checks that the input named `answer` never contains `guaranteed refund`:
+The policy judge sends the report text, the recipient record, and the policy text to OpenAI through your server. Use the synthetic data in this guide, not real customer data.
 
-<CodeFromFile file="examples/quickstart/no-refund-promise.yaml" lang="yaml" title="no-refund-promise.yaml" />
+</Aside>
 
-Save the subject beside it as `support-reply.yaml`. It is a Service, and `verified_by` binds the Verifier to it by relative path:
+## 1. Connect a model provider
 
-<CodeFromFile file="examples/quickstart/support-reply.yaml" lang="yaml" title="support-reply.yaml" />
+Skip this step if you accepted the gateway offer during `wyrd init`. Otherwise, run `wyrd` as in setup (`uv run wyrd` in Python, `pnpm wyrd` in TypeScript) to store your key on the server and create the `openai` deployment the judge calls:
 
-## 2. Verify two answers
+```bash
+wyrd gateway credential put --file - <<JSON
+{"name": "openai-key", "provider": "openai", "source": {"managed_secret": {"secret": "$OPENAI_API_KEY"}}}
+JSON
+wyrd gateway deployment put --file - <<'JSON'
+{"name": "openai", "adapter": "openai", "auth": {"bearer": {"credential": "openai-key"}}}
+JSON
+```
 
-Save the program and run it from the `quickstart` directory, so it finds both YAML files there:
+The key stays on the server. [LLM gateway](/connect/set-up-the-llm-gateway/) explains both commands.
+
+## 2. Declare and verify
+
+Download the sharing policy into `quickstart`:
+
+```bash
+curl -LO https://raw.githubusercontent.com/bohmian-ai/wyrd/v0.4.2/examples/finance-release/company-sharing-policy.pdf
+```
+
+Save the declaration and the program beside it, and run the program. The declaration builds the Service, the Verifier, and the judge Agent; the program declares them and verifies four releases. One report names a bank account, and two are shared for purposes other than an external audit:
 
 <LangTabs langs={['python', 'rust', 'typescript']}>
 <LangTab lang="python">
 
-<CodeFromFile file="examples/quickstart/quickstart.py" lang="python" title="quickstart.py" />
+The program declares its inputs as Pydantic models. Add Pydantic with the SDK's extra:
 
 ```bash
-uv run quickstart.py
+uv add "wyrd-ai[pydantic]==0.4.2"
+```
+
+<CodeFromFile file="examples/finance-release/finance_service.py" lang="python" title="finance_service.py" />
+
+<CodeFromFile file="examples/finance-release/finance_release.py" lang="python" title="finance_release.py" />
+
+```bash
+uv run finance_release.py
 ```
 
 </LangTab>
 <LangTab lang="rust">
 
-<CodeFromFile file="examples/quickstart/quickstart.rs" lang="rust" title="src/main.rs" />
+<CodeFromFile file="examples/finance-release/finance_service.rs" lang="rust" title="src/finance_service.rs" />
+
+<CodeFromFile file="examples/finance-release/finance_release.rs" lang="rust" title="src/main.rs" />
 
 ```bash
 cargo run
@@ -50,43 +86,72 @@ cargo run
 </LangTab>
 <LangTab lang="typescript">
 
-<CodeFromFile file="examples/quickstart/quickstart.ts" lang="typescript" title="quickstart.ts" />
+The program declares its inputs as a Zod schema. Add Zod:
 
 ```bash
-node quickstart.ts
+pnpm add zod
+```
+
+<CodeFromFile file="examples/finance-release/finance_service.ts" lang="typescript" title="finance_service.ts" />
+
+<CodeFromFile file="examples/finance-release/finance_release.ts" lang="typescript" title="finance_release.ts" />
+
+```bash
+node finance_release.ts
 ```
 
 </LangTab>
 </LangTabs>
 
-`verify` sends each answer as the Verifier's `answer` input and returns its verdict. Every language prints the same:
+The program uploads the policy with its extracted text and declares the Service, the Verifier, and the judge Agent. Then it verifies each release with one call and prints the verdict, with the reason for each requirement that did not pass:
 
-```text
-passed: the comparison held
-  subject:  Service/support-reply@1.0.0#<uid>
-  verifier: default/Verifier/no-refund-promise@1.0.0#<uid>
-failed: operator NotContains returned false
-  subject:  Service/support-reply@1.0.0#<uid>
-  verifier: default/Verifier/no-refund-promise@1.0.0#<uid>
-```
+<CodeFromFile file="examples/finance-release/output.txt" lang="text" title="output" />
 
-Each verdict names the exact version of the Service and Verifier it checked. Your `uid` values differ; the server assigns them.
+The judge's wording varies. The failed releases pass both assertions and fail `follows-policy`: the judge read the policy, found the bank account, and found that the policy permits sharing only for external audits.
 
-The second verdict is `failed`, and it is still a successful call: the check ran, and the answer promises a guaranteed refund.
+<Aside type="note" title="Declare the same Cards from YAML">
 
-Run the program again. Nothing changed, so you get the same verdicts and `uid` values.
+In production, Cards usually live in YAML files instead of code; [Code or YAML](/understand/how-verification-works/#code-or-yaml) explains why. These three files declare the same Service, Verifier, and judge Agent. Upload the policy with `wyrd artifact upload company-sharing-policy.pdf --name company-sharing-policy --version 0.1.0 --extract`, then pass the Service file to `WyrdState.declare` instead of the Service built in code.
 
-## 3. Confirm the stored verdicts
+<Tabs>
+<Tab label="finance-release.yaml">
 
-The server keeps every verdict as evidence, grouped by the Run that produced it. Run `wyrd` as in setup (`uv run wyrd` in Python, `pnpm wyrd` in TypeScript). Read the Service to get its `uid`, the one the verdicts printed after `#`:
+<CodeFromFile file="examples/finance-release/finance-release.yaml" lang="yaml" title="finance-release.yaml" />
+
+</Tab>
+<Tab label="release-check.yaml">
+
+<CodeFromFile file="examples/finance-release/release-check.yaml" lang="yaml" title="release-check.yaml" />
+
+</Tab>
+<Tab label="policy-judge.yaml">
+
+<CodeFromFile file="examples/finance-release/policy-judge.yaml" lang="yaml" title="policy-judge.yaml" />
+
+</Tab>
+</Tabs>
+
+</Aside>
+
+`verify` returns before your code acts, so the verdict is part of the request. Assertions add little time; the policy judge adds up to three model calls to that request. If the judge can't decide, the verdict is `inconclusive`, which is never a pass. [`submit`](/understand/how-verification-works/#verify-and-submit) queues the same check when the request can't wait.
+
+Run the program again. Nothing changed, so it declares nothing new.
+
+## 3. Check the other requirements
+
+In the program (`src/main.rs` in Rust), set the recipient's `authorized` to `false` and run again. Every release fails `recipient-authorized`. Set the destination's `restricted` to `false` instead, and `destination-restricted` fails. Each requirement is judged on its own. Set both back to `true` before you continue.
+
+## 4. Confirm the stored verdicts
+
+The server keeps every verdict as evidence. Read the Service to get its `uid`:
 
 ```bash
-wyrd get --kind Service --name support-reply --version 1.0.0
+wyrd get --kind Service --name finance-release --version 0.1.0
 ```
 
-Its `metadata.uid` is the Service's `uid`. Save this query as `stored-verdicts.sql`, with `<uid>` replaced by that value:
+Save this query as `stored-verdicts.sql`, with `<uid>` replaced by the Service's `metadata.uid`:
 
-<CodeFromFile file="examples/quickstart/stored-verdicts.sql" lang="sql" title="stored-verdicts.sql" />
+<CodeFromFile file="examples/finance-release/stored-verdicts.sql" lang="sql" title="stored-verdicts.sql" />
 
 Run it against the address `wyrd init` printed:
 
@@ -94,30 +159,39 @@ Run it against the address `wyrd init` printed:
 wyrd query --server http://127.0.0.1:8080 --file stored-verdicts.sql
 ```
 
-It prints one JSON row per stored verdict, newest first:
+It prints one JSON row per stored verdict, newest first. The server publishes rows shortly after the program ends: if a verdict is missing, repeat the query for up to a minute.
 
-```text
-{"result_id":"<id>","run_id":"<run_id>","subject_card_uid":"<uid>","verdict":"failed"}
-{"result_id":"<id>","run_id":"<run_id>","subject_card_uid":"<uid>","verdict":"passed"}
+Each row names its `execution_id`. To see the exact policy file a verdict used, read that execution's details: `Execution.details()` in the SDK, or [`verification.get_execution_details`](/reference/mcp-tools/) over MCP. They name the Verifier version and the policy Artifact version its judge read.
+
+## 5. Update the policy
+
+The revised policy also permits sharing for regulator requests. Download it over the original, and run the program again:
+
+```bash
+curl -L -o company-sharing-policy.pdf https://raw.githubusercontent.com/bohmian-ai/wyrd/v0.4.2/examples/finance-release/company-sharing-policy-revised.pdf
 ```
 
-The `failed` and `passed` rows with the same `run_id` are your program's two verdicts, and that `run_id` identifies its Run. The server publishes rows shortly after the program ends: if a verdict is missing, repeat the query for up to a minute.
+The server registers the changed file as a new policy version, and with it `release-check@0.1.1` and `finance-release@0.1.1`. The regulator request now passes:
 
-## 4. Change the requirement
+```text
+external audit · Synthetic customer report: quarterly total $120. → passed
+external audit · Synthetic customer report: paid from BANK-ACCOUNT-DEMO-001. → failed
+  follows-policy: the report names a bank account identifier, which the policy forbids
+marketing partnership · Synthetic customer report: quarterly total $120. → failed
+  follows-policy: the policy does not permit sharing for this purpose
+regulator request · Synthetic customer report: quarterly total $120. → passed
+```
 
-Edit `no-refund-promise.yaml` to `expected: guaranteed` and run the program again. It stops with `WYRD_REGISTRY_409_SPEC_DRIFT`: `no-refund-promise@1.0.0` already means the declaration that checks `guaranteed refund`, and a version never changes meaning.
-
-To change the requirement, give it a new version: set `version: 1.1.0` in `no-refund-promise.yaml`. The Service now references different content too, so set its `version: 1.1.0` as well. Run again, and the verdicts name `support-reply@1.1.0` and `no-refund-promise@1.1.0`.
+The judge's wording varies. `release-check@0.1.0` still mounts the original policy, and the details of each execution it ran name that file.
 
 ## If it fails
 
 | You see | Fix |
 | --- | --- |
-| `transport unavailable` | Start the server as in [Set up Wyrd](/get-started/setup/#1-start-the-server) |
+| `WYRD_GATEWAY_404_MODEL_UNAVAILABLE` | Create the `openai` deployment as in step 1 |
 | `WYRD_CLIENT_401_NO_CREDENTIALS` | Use the same `WYRD_CONFIG_HOME` as the server terminal |
-| `WYRD_LOADER_400_INVALID_ENVELOPE` | Run from the directory that holds both YAML files |
-| No rows after a minute | Check that `<uid>` is the `metadata.uid` that `wyrd get` printed |
+| `WYRD_LOADER_400_INVALID_ENVELOPE` | Run from the directory that holds `company-sharing-policy.pdf` |
 
 ## Next
 
-[What can I build?](/get-started/what-can-i-build/) matches your problem to a larger workflow, such as a policy document judged by an Agent or a long-running workflow verified step by step. [How verification works](/understand/how-verification-works/) explains requirements, checks, and verdicts. The [Verifier reference](/reference/verifier-card/) lists every field you can declare.
+[How verification works in Wyrd](/understand/how-verification-works/) explains what happens inside the call, and [Write verifiable requirements](/build-and-verify/declare/write-verifiable-requirements/) turns your own goals into requirements like these three. [Verify during a request](/build-and-verify/verify/verify-a-request-in-real-time/) puts the same call inside a web API that sends a report only after it passes, and [ASGI apps](/connect/integrate-asgi/) records each FastAPI or Starlette request as evidence. [What can I build?](/get-started/what-can-i-build/) matches your problem to a larger workflow. The [Verifier reference](/reference/verifier-card/) lists every field you can declare.

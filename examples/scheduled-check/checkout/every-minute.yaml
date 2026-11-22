@@ -1,0 +1,9 @@
+apiVersion: wyrd/v1
+kind: Trigger
+metadata:
+  name: every-minute
+  version: 1.0.0
+spec:
+  description: At the start of every minute, UTC.
+  kind: schedule
+  cron: "* * * * *"

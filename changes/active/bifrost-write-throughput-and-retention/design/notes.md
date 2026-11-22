@@ -17,6 +17,10 @@ comes after implementation; the design must be concrete and evidence-grounded
 now, rather than waiting for new measurements. Their independent reviews are
 complete and reconciled in [throughput.md](throughput.md). The earlier pipeline
 is deferred; the maintainer approved and locked the CPU-first design on 2026-11-20.
+A bounded two-group pipeline with independent completion and deliberate group
+collection is recorded, unapproved, in
+[group-commit-pipeline-proposal.md](group-commit-pipeline-proposal.md); adopting
+it requires a spec revision.
 
 Wall throughput, ACK latency and CPU efficiency are separate outcomes. The
 maintainer reports vectored writes reduced WAL-write time, while CPU efficiency

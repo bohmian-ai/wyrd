@@ -33,8 +33,8 @@ use wyrd_crypt::SealingKeyring;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
     AbsoluteUrl, CallbackQuery, ConfigureSocialProviderRequest, CreationMethods, EmailMethods,
-    EnableSocialProviderRequest, IssuerUrl, LoginMethodsResponse, LoginSettings, ProviderResponse,
-    SecretBearer, Sha256Hex, SignInMethods, SocialProvider, SocialProviderState,
+    EnableSocialProviderRequest, IssuerUrl, LocalCredentials, LoginMethodsResponse, LoginSettings,
+    ProviderResponse, SecretBearer, Sha256Hex, SignInMethods, SocialProvider, SocialProviderState,
     SocialProviderView, SocialProvidersResponse,
 };
 use wyrd_spec::error::WyrdError;
@@ -42,6 +42,7 @@ use wyrd_spec::ids::TenantSlug;
 use wyrd_sql::queries::auth::{
     BrowserSessionAuthority, SocialAnchor, SocialLoginState, consume_social_login_state,
     insert_social_login_state, insert_user, insert_user_identity, linked_identity,
+    local_credential_for_update,
 };
 use wyrd_sql::queries::platform::signup::{
     SignupAdmissionScope, SignupProof, admit_signup, finish_signup_creation, insert_proven_signup,
@@ -65,7 +66,7 @@ use crate::callback::{
 use crate::error::{relying_party_error, store_error};
 use crate::issuance::TenantGrant;
 use crate::login::{LOGIN_STATE_TTL, login_unavailable};
-use crate::passwords::code_hash;
+use crate::passwords::{canonical_username, code_hash, hash_password, new_password};
 
 /// Google's OpenID Connect issuer.
 pub const GOOGLE_ISSUER: &str = "https://accounts.google.com";
@@ -1008,8 +1009,8 @@ fn validation(message: &str, field: &str) -> WyrdError {
     }
 }
 
-/// How long a proven signup stays completable after its provider return.
-const SIGNUP_COMPLETION_TTL: std::time::Duration = std::time::Duration::from_mins(30);
+/// How long a proven signup stays completable after its proof.
+const SIGNUP_COMPLETION_TTL: std::time::Duration = std::time::Duration::from_mins(5);
 
 /// Signup starts admitted per trusted source in one window.
 const SIGNUP_START_ATTEMPTS: i32 = 20;
@@ -1085,21 +1086,39 @@ fn sealing_key_missing() -> WyrdError {
 pub struct SignupCreation {
     /// The attempt id the tenant claim names.
     pub attempt: Uuid,
-    /// The provider the identity was proven with.
-    pub provider: SocialProvider,
-    /// The exact provider revision of that proof.
-    pub provider_revision: i64,
-    /// The identity's issuer namespace.
-    pub issuer: String,
-    /// The identity's subject.
-    pub subject: String,
-    /// The provider's email, when it gave one.
-    pub email: Option<String>,
+    /// How the creator will sign in to the workspace.
+    pub credential: SignupCredential,
     /// The identity's keyed creator pseudonym, recorded on the tenant.
     pub creator_key: [u8; 32],
     /// The tenant an earlier, failed completion of this attempt claimed, and
     /// its slug.
     pub claimed: Option<(DataTenantId, String)>,
+}
+
+/// The sign-in a completed signup gives the workspace's creator, fixed by
+/// the kind of proof it consumed.
+#[derive(Debug, Clone)]
+pub enum SignupCredential {
+    /// A provider identity, linked to the creator's User.
+    Social {
+        /// The provider the identity was proven with.
+        provider: SocialProvider,
+        /// The exact provider revision of that proof.
+        provider_revision: i64,
+        /// The identity's issuer namespace.
+        issuer: String,
+        /// The identity's subject.
+        subject: String,
+        /// The provider's email, when it gave one.
+        email: Option<String>,
+    },
+    /// A tenant-local password, chosen at completion after an email proof.
+    Local {
+        /// The canonical username.
+        username: String,
+        /// The password's PHC verifier.
+        verifier: String,
+    },
 }
 
 impl SocialSignIn {
@@ -1363,21 +1382,27 @@ impl SocialSignIn {
     /// Admit the proven signup held by `completion` to create its workspace,
     /// counting it against the shared windows of `source` and its identity.
     ///
-    /// Signup and the exact provider revision are rechecked. Exactly one
-    /// completion of an attempt runs at a time; a failed one may be retried
-    /// by the same attempt, which resumes its own claim.
+    /// An email proof needs `local` credentials inside the password policy,
+    /// which become the creator's tenant-local sign-in; a social proof
+    /// refuses them. Signup and, for a social proof, the exact provider
+    /// revision are rechecked. Exactly one completion of an attempt runs at
+    /// a time; a failed one, or its own run interrupted past the
+    /// provisioning-claim staleness bound, may be retried by the same
+    /// attempt, which resumes its own claim.
     ///
     /// # Errors
-    /// Returns [`WyrdError::InvalidState`] for an unknown or expired proof,
-    /// [`WyrdError::Conflict`] when the attempt already created its workspace
-    /// (`details.tenant` names it) or another completion holds it,
-    /// [`WyrdError::InvalidToken`] when signup or the provider changed,
-    /// [`WyrdError::SignupAttempts`] while a window is exhausted, and
-    /// [`WyrdError::AuthVerifyUnavailable`] when the admission state cannot be
-    /// read.
+    /// Returns [`WyrdError::Validation`] for credentials the proof kind or
+    /// the password policy refuses, [`WyrdError::InvalidState`] for an
+    /// unknown or expired proof, [`WyrdError::Conflict`] when the attempt
+    /// already created its workspace (`details.tenant` names it) or another
+    /// completion holds it, [`WyrdError::InvalidToken`] when signup or the
+    /// provider changed, [`WyrdError::SignupAttempts`] while a window is
+    /// exhausted, and [`WyrdError::AuthVerifyUnavailable`] when the
+    /// admission state cannot be read.
     pub async fn admit_signup(
         &self,
         completion: &str,
+        local: Option<&LocalCredentials>,
         source: Option<std::net::IpAddr>,
     ) -> Result<SignupCreation, WyrdError> {
         let source = source.ok_or_else(source_unknown)?;
@@ -1388,28 +1413,66 @@ impl SocialSignIn {
         .await
         .map_err(store_error)?
         .ok_or_else(|| invalid_state("this signup has expired; start again"))?;
-        match proven.status.as_str() {
-            "completed" => {
-                return Err(WyrdError::Conflict {
-                    message: "this signup already created its workspace; sign in to it".to_owned(),
-                    details: json!({ "reason": "workspace_created", "tenant": proven.tenant_slug }),
-                });
-            }
-            "creating" => return Err(signup_busy()),
-            _ => {}
+        if proven.status == "completed" {
+            return Err(WyrdError::Conflict {
+                message: "this signup already created its workspace; sign in to it".to_owned(),
+                details: json!({ "reason": "workspace_created", "tenant": proven.tenant_slug }),
+            });
         }
-        let (Some(provider), Some(provider_revision), Some(issuer), Some(subject)) = (
-            proven.provider.as_deref().and_then(SocialProvider::parse),
-            proven.provider_revision,
-            proven.issuer,
-            proven.subject,
-        ) else {
-            return Err(invalid_state(
-                "this signup's proof cannot create a workspace yet; start again",
-            ));
+        let (credential, identity) = match (proven.proof_kind.as_str(), local) {
+            ("email", Some(local)) => {
+                let address = proven
+                    .email
+                    .ok_or_else(|| invalid_state("this signup's proof names no address"))?;
+                let username = canonical_username(&local.username)?;
+                let password = new_password(
+                    &local.password.clone().into_secret_string(),
+                    "local_credentials.password",
+                )?;
+                if !self.login_methods(None).await?.creation.local_signup {
+                    return Err(signup_unavailable());
+                }
+                let verifier = hash_password(password).await?;
+                (
+                    SignupCredential::Local { username, verifier },
+                    identity_value("mailto", &address),
+                )
+            }
+            ("email", None) => {
+                return Err(credentials_refused(
+                    "an email signup needs local_credentials for its administrator",
+                ));
+            }
+            (_, Some(_)) => {
+                return Err(credentials_refused(
+                    "a provider signup signs in with its provider; omit local_credentials",
+                ));
+            }
+            (_, None) => {
+                let (Some(provider), Some(provider_revision), Some(issuer), Some(subject)) = (
+                    proven.provider.as_deref().and_then(SocialProvider::parse),
+                    proven.provider_revision,
+                    proven.issuer,
+                    proven.subject,
+                ) else {
+                    return Err(invalid_state(
+                        "this signup's proof cannot create a workspace; start again",
+                    ));
+                };
+                self.recheck_signup(provider, provider_revision).await?;
+                let identity = identity_value(&issuer, &subject);
+                (
+                    SignupCredential::Social {
+                        provider,
+                        provider_revision,
+                        issuer,
+                        subject,
+                        email: proven.email,
+                    },
+                    identity,
+                )
+            }
         };
-        self.recheck_signup(provider, provider_revision).await?;
-        let identity = identity_value(&issuer, &subject);
         let creator_key = self.pseudonym("creator", &identity)?;
         self.admit(&[
             (
@@ -1440,11 +1503,7 @@ impl SocialSignIn {
         };
         Ok(SignupCreation {
             attempt: proven.id,
-            provider,
-            provider_revision,
-            issuer,
-            subject,
-            email: proven.email,
+            credential,
             creator_key,
             claimed,
         })
@@ -1610,9 +1669,11 @@ impl SocialSignIn {
 }
 
 impl BrowserSessions {
-    /// Sign the creator of a just-activated workspace into it: `user_id`
-    /// through the linked identity `identity_id`, anchored to the exact
-    /// provider revision `creation` proved, audited as a login.
+    /// Sign the creator of a just-activated workspace into it as `user_id`,
+    /// audited as a login: through the linked identity `identity_id`
+    /// anchored to the exact provider revision a social `creation` proved,
+    /// or with a password session at the User's current password revision
+    /// for a local one.
     ///
     /// # Errors
     /// Returns the issuance refusals of an inactive tenant or User and the
@@ -1621,30 +1682,62 @@ impl BrowserSessions {
         &self,
         tenant_id: DataTenantId,
         user_id: Uuid,
-        identity_id: Uuid,
+        identity_id: Option<Uuid>,
         creation: &SignupCreation,
         request_id: &str,
     ) -> Result<CreatedBrowserSession, WyrdError> {
-        let anchor = SocialAnchor {
-            provider: creation.provider,
-            provider_revision: creation.provider_revision,
-            identity_id,
-        };
         let mut conn = self
             .connections
             .postgres()
             .tenant_conn(tenant_id)
             .await
             .map_err(store_error)?;
-        let verified = self
-            .issuer
-            .verify(&mut conn, user_id, TenantGrant::OidcLogin)
-            .await?;
-        let created =
-            create_session(&mut conn, verified, BrowserSessionAuthority::Social(anchor)).await?;
+        let (grant, authority) = match (&creation.credential, identity_id) {
+            (
+                SignupCredential::Social {
+                    provider,
+                    provider_revision,
+                    ..
+                },
+                Some(identity_id),
+            ) => (
+                TenantGrant::OidcLogin,
+                BrowserSessionAuthority::Social(SocialAnchor {
+                    provider: *provider,
+                    provider_revision: *provider_revision,
+                    identity_id,
+                }),
+            ),
+            (SignupCredential::Local { .. }, None) => {
+                let revision = local_credential_for_update(&mut conn, user_id)
+                    .await
+                    .map_err(store_error)?
+                    .ok_or_else(|| invalid_state("the workspace's creator has no password"))?
+                    .password_revision;
+                (
+                    TenantGrant::PasswordLogin,
+                    BrowserSessionAuthority::Password(revision),
+                )
+            }
+            _ => {
+                return Err(invalid_state(
+                    "the workspace's creator has no matching sign-in",
+                ));
+            }
+        };
+        let verified = self.issuer.verify(&mut conn, user_id, grant).await?;
+        let created = create_session(&mut conn, verified, authority).await?;
         conn.commit().await.map_err(store_error)?;
         self.stage_login(&created.session, request_id);
         Ok(created)
+    }
+}
+
+/// Credentials the proof kind refuses, naming the field.
+fn credentials_refused(message: &str) -> WyrdError {
+    WyrdError::Validation {
+        message: message.to_owned(),
+        details: json!({ "field": "local_credentials" }),
     }
 }
 

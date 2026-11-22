@@ -86,7 +86,9 @@ pub async fn insert_provisioning_tenant(
 ///
 /// Unlike [`insert_provisioning_tenant`], only a `failed` or stale
 /// `provisioning` row this same attempt created is adopted, so no other
-/// visitor, signup or operator claim can be taken over.
+/// visitor, signup or operator claim can be taken over. A signup claim goes
+/// stale after two minutes without progress, inside its proof's five-minute
+/// completion window.
 ///
 /// # Errors
 /// Returns [`SqlError::UniqueViolation`] when the slug belongs to another
@@ -112,7 +114,7 @@ pub async fn claim_signup_tenant(
           WHERE platform.tenants.signup_attempt_id = EXCLUDED.signup_attempt_id
             AND (platform.tenants.status = 'failed'
                  OR (platform.tenants.status = 'provisioning'
-                     AND platform.tenants.updated_at < now() - interval '15 minutes'))
+                     AND platform.tenants.updated_at < now() - interval '2 minutes'))
          RETURNING data_tenant_id",
     )
     .bind(data_tenant_id.as_uuid())

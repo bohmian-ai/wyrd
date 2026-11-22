@@ -20,6 +20,7 @@ use wyrd_auth::platform_authz::{
     tenant_slug_resource,
 };
 use wyrd_auth::seed::seed_builtin_roles_for_tenant;
+use wyrd_auth::social::SignupCredential;
 use wyrd_runtime::Permission;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
@@ -31,7 +32,10 @@ use wyrd_sql::queries::auth::{
     insert_service_account, list_api_key_metadata, provision_system_principal, revoke_api_key,
     role_by_name, tenant_admin_principal_id,
 };
-use wyrd_sql::queries::auth::{insert_user, insert_user_identity, linked_identity};
+use wyrd_sql::queries::auth::{
+    insert_local_user, insert_user, insert_user_identity, linked_identity,
+    local_credential_by_username, set_password_hash,
+};
 use wyrd_sql::queries::platform::provisioning::{
     claim_signup_tenant, insert_provisioning_tenant, mark_tenant_active, mark_tenant_failed,
     set_tenant_suspended,
@@ -101,12 +105,9 @@ impl From<PlatformAuthzError> for ProvisionError {
 pub struct HumanOwner<'a> {
     /// The signup attempt the tenant claim names.
     pub attempt: Uuid,
-    /// The proven identity's issuer namespace.
-    pub issuer: &'a str,
-    /// The proven identity's subject.
-    pub subject: &'a str,
-    /// The provider's email, when it gave one.
-    pub email: Option<&'a str>,
+    /// How the administrator signs in: a linked provider identity or a
+    /// tenant-local password.
+    pub credential: &'a SignupCredential,
     /// The identity's keyed creator pseudonym, kept on the tenant.
     pub creator_key: &'a [u8; 32],
 }
@@ -128,8 +129,8 @@ enum Established {
     Human {
         /// The administrator User.
         user_id: Uuid,
-        /// Its linked provider identity.
-        identity_id: Uuid,
+        /// Its linked provider identity; `None` for a local password User.
+        identity_id: Option<Uuid>,
     },
 }
 
@@ -324,13 +325,13 @@ impl TenantProvisioning {
     }
 
     /// Make a signup-claimed tenant usable with `owner` as its administrator
-    /// User, and return that User and its linked identity.
+    /// User, and return that User and its linked identity, if any.
     ///
     /// The same initialization, promotion and failure handling as
     /// [`Self::provision`], except that the administrator is the proven
     /// person bound to the tenant `admin` role, and no service account or
     /// key is created. A resumed attempt keeps the User a failed one
-    /// committed.
+    /// committed; a local one takes the resumed completion's password.
     ///
     /// # Errors
     /// As [`Self::provision`].
@@ -340,9 +341,9 @@ impl TenantProvisioning {
         data_tenant_id: DataTenantId,
         owner: HumanOwner<'_>,
         conn: Result<TenantConn<'_>, SqlError>,
-    ) -> Result<(Uuid, Uuid), ProvisionError> {
+    ) -> Result<(Uuid, Option<Uuid>), ProvisionError> {
         let resumed = match conn {
-            Ok(mut conn) => linked_identity(&mut conn, owner.issuer, owner.subject)
+            Ok(mut conn) => existing_owner(&mut conn, owner.credential)
                 .await
                 .map(|linked| (conn, linked))
                 .map_err(|e| ProvisionError::Store(e.to_string())),
@@ -354,7 +355,7 @@ impl TenantProvisioning {
         };
         // The creator is the attributed author of everything initialized
         // for it, on a resumed attempt as on the first.
-        let user_id = linked.map_or_else(Uuid::now_v7, |linked| linked.user_id);
+        let user_id = linked.map_or_else(Uuid::now_v7, |(user_id, _)| user_id);
         let attribution = Attribution::direct(wyrd_spec::auth::PrincipalId::new(user_id));
         match self
             .complete(data_tenant_id, conn, TenantOwner::Human(owner), attribution)
@@ -613,26 +614,49 @@ impl TenantProvisioning {
                 .map(Established::Bootstrap);
         };
         // A resumed attempt finds the User a failed one committed together
-        // with its identity and grant, and keeps it.
-        if let Some(linked) = linked_identity(&mut conn, owner.issuer, owner.subject)
+        // with its sign-in and grant, and keeps it.
+        let existing = existing_owner(&mut conn, owner.credential)
             .await
-            .map_err(|e| ProvisionError::Store(e.to_string()))?
-        {
+            .map_err(|e| ProvisionError::Store(e.to_string()))?;
+        let store = |e: sqlx::Error| ProvisionError::Store(e.to_string());
+        if let Some((user_id, identity_id)) = existing {
+            if let SignupCredential::Local { verifier, .. } = owner.credential {
+                set_password_hash(&mut conn, user_id, verifier, false)
+                    .await
+                    .map_err(store)?;
+            }
             conn.commit()
                 .await
                 .map_err(|e| ProvisionError::Store(e.to_string()))?;
             return Ok(Established::Human {
-                user_id: linked.user_id,
-                identity_id: linked.id,
+                user_id,
+                identity_id,
             });
         }
         let user_id = attribution.sub_principal_id.as_uuid();
-        insert_user(&mut conn, user_id, owner.email, "oidc", None)
-            .await
-            .map_err(|e| ProvisionError::Store(e.to_string()))?;
-        let identity_id = insert_user_identity(&mut conn, owner.issuer, owner.subject, user_id)
-            .await
-            .map_err(|e| ProvisionError::Store(e.to_string()))?;
+        let identity_id = match owner.credential {
+            SignupCredential::Social {
+                issuer,
+                subject,
+                email,
+                ..
+            } => {
+                insert_user(&mut conn, user_id, email.as_deref(), "oidc", None)
+                    .await
+                    .map_err(store)?;
+                Some(
+                    insert_user_identity(&mut conn, issuer, subject, user_id)
+                        .await
+                        .map_err(store)?,
+                )
+            }
+            SignupCredential::Local { username, verifier } => {
+                insert_local_user(&mut conn, user_id, username, verifier)
+                    .await
+                    .map_err(store)?;
+                None
+            }
+        };
         self.grant_admin(
             &mut conn,
             SubjectColumns {
@@ -797,5 +821,26 @@ fn summarize(row: TenantRow) -> Result<ProvisionedTenant, ProvisionError> {
             .map_err(|e: wyrd_spec::ids::IdError| ProvisionError::Store(e.to_string()))?,
         display_name: row.display_name,
         status: row.status,
+    })
+}
+
+/// The User, and its linked identity if any, that an earlier interrupted run
+/// of this signup already created for `credential`; `None` on a first run.
+///
+/// # Errors
+/// Returns a SQLx error when the read fails.
+async fn existing_owner(
+    conn: &mut TenantConn<'_>,
+    credential: &SignupCredential,
+) -> Result<Option<(Uuid, Option<Uuid>)>, sqlx::Error> {
+    Ok(match credential {
+        SignupCredential::Social {
+            issuer, subject, ..
+        } => linked_identity(conn, issuer, subject)
+            .await?
+            .map(|linked| (linked.user_id, Some(linked.id))),
+        SignupCredential::Local { username, .. } => local_credential_by_username(conn, username)
+            .await?
+            .map(|local| (local.id, None)),
     })
 }

@@ -230,7 +230,7 @@ const SIGNUP_COOKIE: &str = "wyrd_signup";
 const SIGNUP_COOKIE_PATH: &str = "/auth/signup";
 
 /// Lifetime of the completion cookie: the proof's completion window.
-const SIGNUP_COOKIE_MAX_AGE_SECONDS: u64 = 1800;
+const SIGNUP_COOKIE_MAX_AGE_SECONDS: u64 = 300;
 
 /// `POST /auth/signup` — begin creating a workspace by proving, in this
 /// browser, a mailbox or a shared social provider identity.
@@ -468,7 +468,9 @@ pub async fn signup_complete(
     let social = social(&state)?;
     let sessions = browser_sessions(&state)?;
     let provisioning = directory(&state)?;
-    let creation = social.admit_signup(&completion, source).await?;
+    let creation = social
+        .admit_signup(&completion, request.local_credentials.as_ref(), source)
+        .await?;
     if let Some((_, claimed)) = &creation.claimed
         && claimed != request.slug.as_str()
     {
@@ -480,9 +482,7 @@ pub async fn signup_complete(
     }
     let owner = HumanOwner {
         attempt: creation.attempt,
-        issuer: &creation.issuer,
-        subject: &creation.subject,
-        email: creation.email.as_deref(),
+        credential: &creation.credential,
         creator_key: &creation.creator_key,
     };
     let tenant_request = CreateTenantRequest {

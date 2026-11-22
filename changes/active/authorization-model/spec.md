@@ -504,8 +504,9 @@ limits.
   neither count nor are refused.
 - **Crash recovery.** A creation interrupted by a process failure stays
   recoverable by its owner: the browser holding that proven attempt's
-  completion cookie. Once the attempt has stayed `creating` longer than the
-  existing provisioning-claim staleness bound, that holder may restart it;
+  completion cookie. Once the attempt and its claim have made no progress for
+  two minutes, the signup staleness bound, that holder may restart it inside
+  its five-minute completion window;
   nobody else can. After the proof expires, nobody can restart it; the claimed
   tenant stays in its non-active failed or provisioning state until operator
   retirement, never active and ownerless.

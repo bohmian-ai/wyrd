@@ -44,12 +44,12 @@ CREATE TABLE platform.signup_attempts (
     expires_at            TIMESTAMPTZ NOT NULL,
     updated_at            TIMESTAMPTZ NOT NULL DEFAULT statement_timestamp(),
     -- A social proof names its provider revision and identity; an email
-    -- proof names only its verified address.
+    -- proof names only its verified address, which completion clears.
     CONSTRAINT signup_attempts_proof CHECK (
         CASE proof_kind
             WHEN 'social' THEN num_nonnulls(provider, provider_revision, issuer, subject) = 4
             ELSE num_nonnulls(provider, provider_revision, issuer, subject) = 0
-                 AND email IS NOT NULL
+                 AND (email IS NOT NULL OR status = 'completed')
         END
     )
 );

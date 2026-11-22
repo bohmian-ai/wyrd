@@ -70,7 +70,7 @@ pub enum SignupBeginRequest {
 
 /// Body of `POST /auth/signup/complete`: create the workspace the proven
 /// identity will administer.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct SignupCompleteRequest {
@@ -78,6 +78,22 @@ pub struct SignupCompleteRequest {
     pub slug: TenantSlug,
     /// The new workspace's human-readable name.
     pub display_name: String,
+    /// The tenant-local administrator an email proof creates. Required for
+    /// an email proof and refused for a social one, whose creator signs in
+    /// with the provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_credentials: Option<LocalCredentials>,
+}
+
+/// The username and password of a workspace's first local administrator.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct LocalCredentials {
+    /// The tenant-local username.
+    pub username: String,
+    /// The password, 15–128 characters after NFC normalization.
+    pub password: SecretBearer,
 }
 
 /// Response of `POST /auth/signup/complete`: the created workspace, whose

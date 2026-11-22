@@ -971,3 +971,284 @@ async fn email_signup_proves_a_mailbox_in_the_browser_that_asked() {
         "every admitted start mailed once, the refused one not at all"
     );
 }
+
+/// Point the deployment's mail relay at the test Mailpit; returns its API.
+async fn relay_to_mailpit(srv: &WyrdTestServer, session: &str) -> String {
+    let (host, port, api) = mailpit();
+    let (status, relay) = social_call(
+        srv,
+        social_request(
+            Method::PUT,
+            "/platform/mail",
+            Some(session),
+            Some(
+                json!({ "host": host, "port": port, "tls": "none", "sender": "signup@wyrd.test" }),
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{relay}");
+    api
+}
+
+/// Prove `address` by email from visitor `client`; returns the completion
+/// cookie pair and its `Set-Cookie` attributes.
+async fn email_proof(
+    srv: &WyrdTestServer,
+    api: &str,
+    address: &str,
+    client: &str,
+) -> (String, String) {
+    let (status, flow, body) = email_step(
+        srv,
+        "/auth/signup",
+        client,
+        None,
+        "wyrd_signup_email",
+        &json!({ "method": "email", "email": address }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let flow = flow.expect("flow cookie");
+    let flow = flow.split(';').next().expect("pair");
+    let (proof, _) = mailed_proof(api, address).await;
+    let (status, completion, body) = email_step(
+        srv,
+        "/auth/signup/verify",
+        client,
+        Some(flow),
+        "wyrd_signup",
+        &json!({ "proof": proof }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let attributes = completion.expect("completion cookie");
+    (
+        attributes.split(';').next().expect("pair").to_owned(),
+        attributes,
+    )
+}
+
+/// Complete with the completion cookie `proof` and `body` from `client`;
+/// returns the status, the `slug` session cookie it set and the body.
+async fn complete_with(
+    srv: &WyrdTestServer,
+    proof: &str,
+    client: &str,
+    body: &Value,
+) -> (StatusCode, Option<String>, Value) {
+    let slug = body["slug"].as_str().unwrap_or_default().to_owned();
+    email_step(
+        srv,
+        "/auth/signup/complete",
+        client,
+        Some(proof),
+        &format!("wyrd_session_{slug}"),
+        body,
+    )
+    .await
+}
+
+/// The status of every directory row named `slug`.
+async fn statuses(superuser: &sqlx::PgPool, slug: &str) -> Vec<String> {
+    sqlx::query_scalar("SELECT status FROM platform.tenants WHERE slug = $1")
+        .bind(slug)
+        .fetch_all(superuser)
+        .await
+        .expect("directory reads")
+}
+
+/// Completion consumes either proof kind through the one claim path and
+/// recovers only its own interrupted claim:
+///   1. a completion cookie lasts the five-minute completion window;
+///   2. an email proof needs local credentials inside policy, and a social
+///      proof refuses them; each refusal creates nothing;
+///   3. an email proof with credentials creates an active workspace whose
+///      local User is its administrator, signs it in with a password
+///      session, and clears the attempt's email;
+///   4. replaying the spent completion names the same workspace, opens no
+///      session and creates nothing;
+///   5. a claim interrupted in `creating` beyond the two-minute staleness bound resumes
+///      under its own tenant id only with its own completion cookie; another
+///      proof cannot adopt it, and a recent one still reads as in progress;
+///   6. an expired proof cannot restart its interrupted claim, which stays
+///      unactivated.
+///
+/// # Panics
+/// Panics when a completion creates, refuses or resumes differently.
+#[tokio::test(flavor = "multi_thread")]
+async fn completion_consumes_either_proof_and_recovers_its_own_claim() {
+    let google = wiremock::MockServer::start().await;
+    let (srv, session) = signup_server(&google).await;
+    let api = relay_to_mailpit(&srv, &session).await;
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    let address = format!("owner-{}@example.test", uuid::Uuid::new_v4().simple());
+
+    // 1. The completion window is five minutes.
+    let (local, attributes) = email_proof(&srv, &api, &address, "198.51.100.90").await;
+    assert!(attributes.contains("Max-Age=300"), "{attributes}");
+
+    // 2. Credentials follow the proof kind and the password policy.
+    let named = |extra: Value| {
+        let mut body = json!({ "slug": "harbor", "display_name": "Harbor" });
+        if let (Some(body), Some(extra)) = (body.as_object_mut(), extra.as_object()) {
+            body.extend(extra.clone());
+        }
+        body
+    };
+    let credentials = json!({ "local_credentials": {
+        "username": "ada", "password": "quiet harbor lantern" } });
+    for (case, body) in [
+        ("no credentials", named(json!({}))),
+        (
+            "short password",
+            named(
+                json!({ "local_credentials": { "username": "ada", "password": "amber kestrel9" } }),
+            ),
+        ),
+    ] {
+        let (status, cookie, body) = complete_with(&srv, &local, "198.51.100.90", &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{case}: {body}");
+        assert_eq!(body["code"], "WYRD_SPEC_400_VALIDATION", "{case}");
+        assert!(cookie.is_none(), "{case}");
+    }
+    let social = prove_signup(&srv, &google, "google-harbor").await;
+    let (status, _, body) =
+        complete_with(&srv, &social, "198.51.100.91", &named(credentials.clone())).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "social with credentials: {body}"
+    );
+    assert_eq!(body["details"]["field"], "local_credentials", "{body}");
+    assert!(
+        statuses(&superuser, "harbor").await.is_empty(),
+        "nothing was created"
+    );
+
+    // 3. The email proof creates a workspace its local User administers.
+    let (status, cookie, body) =
+        complete_with(&srv, &local, "198.51.100.90", &named(credentials.clone())).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, json!({ "tenant": "harbor" }));
+    assert!(cookie.is_some(), "the creator is signed in");
+    assert_eq!(statuses(&superuser, "harbor").await, ["active"]);
+    let (status, signed_in, body) = email_step(
+        &srv,
+        "/auth/browser/password/login",
+        "198.51.100.90",
+        None,
+        "wyrd_session_harbor",
+        &json!({ "tenant": "harbor", "username": "ada", "password": "quiet harbor lantern" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(signed_in.is_some());
+    assert_eq!(body["credential"], "password");
+    assert_eq!(
+        body["permissions"],
+        json!(["wildcard:wildcard"]),
+        "the creator administers the workspace"
+    );
+    let cleared: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT status, email FROM platform.signup_attempts WHERE proof_kind = 'email'",
+    )
+    .fetch_all(&superuser)
+    .await
+    .expect("attempt reads");
+    assert_eq!(cleared, [("completed".to_owned(), None)]);
+
+    // 4. A replay names the same workspace and creates nothing.
+    let (status, again, body) =
+        complete_with(&srv, &local, "198.51.100.90", &named(credentials.clone())).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["details"]["tenant"], "harbor", "{body}");
+    assert!(again.is_none(), "a replay opens no session");
+    assert_eq!(statuses(&superuser, "harbor").await, ["active"]);
+
+    // 5. An interrupted claim resumes only for its own attempt.
+    let erin = prove_signup(&srv, &google, "google-erin").await;
+    let other = prove_signup(&srv, &google, "google-other").await;
+    let interrupted = uuid::Uuid::now_v7();
+    sqlx::query(
+        "WITH a AS (UPDATE platform.signup_attempts
+                       SET status = 'creating', updated_at = statement_timestamp() - interval '1 minute'
+                     WHERE subject = 'google-erin' RETURNING id)
+         INSERT INTO platform.tenants
+             (data_tenant_id, slug, display_name, status, signup_attempt_id, signup_creator_key,
+              updated_at)
+         SELECT $1, 'erin', 'Erin', 'provisioning', id, sha256(convert_to('erin', 'UTF8')),
+                now() - interval '1 minute' FROM a",
+    )
+    .bind(interrupted)
+    .execute(&superuser)
+    .await
+    .expect("an interrupted creation is staged");
+    let erin_body = json!({ "slug": "erin", "display_name": "Erin" });
+    let (status, _, body) = complete_with(&srv, &erin, "198.51.100.92", &erin_body).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a recent claim is in progress: {body}"
+    );
+    assert_eq!(body["details"]["reason"], "signup_in_progress", "{body}");
+    sqlx::raw_sql(
+        "UPDATE platform.signup_attempts SET updated_at = statement_timestamp() - interval '3 minutes'
+          WHERE subject = 'google-erin';
+         UPDATE platform.tenants SET updated_at = now() - interval '3 minutes' WHERE slug = 'erin'",
+    )
+    .execute(&superuser)
+    .await
+    .expect("the claim goes stale");
+    let (status, _, body) = complete_with(&srv, &other, "198.51.100.93", &erin_body).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "another proof cannot adopt it: {body}"
+    );
+    assert_eq!(statuses(&superuser, "erin").await, ["provisioning"]);
+    let (status, resumed, body) = complete_with(&srv, &erin, "198.51.100.92", &erin_body).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(resumed.is_some());
+    let (id, status): (uuid::Uuid, String) =
+        sqlx::query_as("SELECT data_tenant_id, status FROM platform.tenants WHERE slug = 'erin'")
+            .fetch_one(&superuser)
+            .await
+            .expect("tenant reads");
+    assert_eq!((id, status.as_str()), (interrupted, "active"));
+
+    // 6. An expired proof cannot restart its claim.
+    let finn = prove_signup(&srv, &google, "google-finn").await;
+    sqlx::query(
+        "WITH a AS (UPDATE platform.signup_attempts
+                       SET status = 'creating',
+                           updated_at = statement_timestamp() - interval '20 minutes',
+                           expires_at = statement_timestamp() - interval '1 second'
+                     WHERE subject = 'google-finn' RETURNING id)
+         INSERT INTO platform.tenants
+             (data_tenant_id, slug, display_name, status, signup_attempt_id, signup_creator_key,
+              updated_at)
+         SELECT gen_random_uuid(), 'finn', 'Finn', 'provisioning', id,
+                sha256(convert_to('finn', 'UTF8')), now() - interval '20 minutes' FROM a",
+    )
+    .execute(&superuser)
+    .await
+    .expect("an expired interrupted creation is staged");
+    let (status, _, body) = complete_with(
+        &srv,
+        &finn,
+        "198.51.100.94",
+        &json!({ "slug": "finn", "display_name": "Finn" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "WYRD_AUTH_400_INVALID_STATE", "{body}");
+    assert_eq!(
+        statuses(&superuser, "finn").await,
+        ["provisioning"],
+        "never active ownerless"
+    );
+}

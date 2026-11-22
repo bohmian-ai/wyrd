@@ -446,6 +446,60 @@ until operator retirement if proof expires.
 **Proof:** tier-1 provisioning/retry with real SQL fault/staleness seams; RED is
 staged `creating` recovery behavior, not just failed-claim retry already evidenced.
 
+**Evidence (cycle 7):** RED — `platform_admin_e2e::signup::completion_consumes_either_proof_and_recovers_its_own_claim`
+(written whole before production code) first failed when the completion cookie answered
+`Max-Age=1800`, not the five-minute window. Its later steps were not run RED separately: the
+staged `creating` recovery was then mutation-checked. With the stale takeover in
+`start_signup_creation` disabled, step 5's own-cookie resume fails `409 signup_in_progress`.
+GREEN once five changes landed:
+- `SIGNUP_COMPLETION_TTL` and the cookie became five minutes.
+- `SignupCompleteRequest.local_credentials` is checked by `admit_signup` before admission or
+  claim. An email proof requires it and a social proof refuses it, both
+  `400 WYRD_SPEC_400_VALIDATION`, field `local_credentials`. The password goes through the
+  cycle 4 `new_password`/`hash_password` owner.
+- `SignupCredential` (social identity | local username/verifier) flows through the one
+  `HumanOwner` → `claim_for_signup` → `provision_for_signup` path. That path creates a linked
+  OIDC User or a local password User bound to tenant `admin`. On resume it keeps the earlier
+  User, and a local one takes the retry's verifier.
+- `open_signup_session` opens a social- or password-anchored session.
+- `finish_signup` clears the attempt email on completion. The 000006 CHECK admits a null email
+  only for `completed` rows (spec "Email proofs last fifteen minutes, signup completion proofs
+  five minutes…" and REQ-012 one-use completion). `start_signup_creation` takes over its own
+  `creating` row once it has made no progress for the existing 15-minute provisioning
+  staleness bound, and only while the proof is live.
+
+The journey asserts:
+- each refusal creates no tenant;
+- the email proof creates an active `harbor`;
+- a password login as `ada` holds `wildcard:wildcard`;
+- the attempt row reads `completed` with a null email;
+- a replay answers `409` naming `harbor` with no session and no second row;
+- a recent `creating` claim reads as in progress;
+- a stale one refuses another proof, then resumes under its original tenant id with its own
+  cookie;
+- an expired proof answers `400 WYRD_AUTH_400_INVALID_STATE` and leaves its claim
+  `provisioning`.
+
+Cross-replica race and replay are covered by the existing
+`a_visitor_creates_a_workspace_with_google` steps 4–6, still green.
+
+Interpretation: "lost-response, replay and concurrent completion return the same successful
+tenant" is read against REQ-012 one-use completion. A replay or the losing racer answers `409`
+with `details.tenant` naming the one created workspace, and the creator recovers by signing in.
+No second completion succeeds.
+
+**Spec revision (maintainer-approved):** the five-minute completion proof always expired
+before the old 15-minute staleness bound, so recovery was unreachable. The spec's
+"Crash recovery" bullet now sets a two-minute signup staleness bound. It is applied in
+`start_signup_creation` and in `claim_signup_tenant`'s adoption check. Operator
+`insert_provisioning_tenant` keeps 15 minutes. The journey stages a claim three minutes old with
+a live proof. Tenant contact retention joins cycle 10, which owns verified contact. **TDD: PASS** for step 1,
+with mutation proof for step 5. Commands: the selector above, and
+`cargo nextest run --locked -p wyrd-auth -p wyrd-sql -p wyrd-server --features
+wyrd-server/test-support --lib --test integration -E 'kind(lib) | test(/^platform_admin_e2e::/)
+| test(/^pg_browser_sessions::/) | test(/social|login|openapi|signup/)'` (1011/1011), clippy
+`-D warnings`, `codegen:check`, `check:tenant-isolation`.
+
 ### 8. Owned-workspace cap is atomic and survives proof purge
 
 **Reuses:** Cycle 7 final claim/completion path and cycle 3 durable creator accounting; enforce quota at that same claim boundary.

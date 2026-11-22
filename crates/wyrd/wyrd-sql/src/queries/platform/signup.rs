@@ -180,8 +180,11 @@ pub async fn proven_signup(
     .map_err(SqlError::from)
 }
 
-/// Move `attempt` from `proven` or `failed` to `creating`; `false` when
-/// another completion holds it or it already completed.
+/// Move `attempt` from `proven` or `failed` to `creating`, or take over its
+/// own `creating` run once that run has made no progress for the two-minute
+/// signup staleness bound, inside the proof's completion window; `false`
+/// when another
+/// completion holds it, it already completed, or its proof expired.
 ///
 /// # Errors
 /// Returns [`SqlError::Query`] when the update fails.
@@ -189,7 +192,10 @@ pub async fn start_signup_creation(pool: &OperatorPool, attempt: Uuid) -> Result
     sqlx::query(
         "UPDATE platform.signup_attempts
             SET status = 'creating', updated_at = statement_timestamp()
-          WHERE id = $1 AND status IN ('proven', 'failed')
+          WHERE id = $1
+            AND (status IN ('proven', 'failed')
+                 OR (status = 'creating'
+                     AND updated_at < statement_timestamp() - interval '2 minutes'))
             AND expires_at > statement_timestamp()",
     )
     .bind(attempt)
@@ -199,8 +205,8 @@ pub async fn start_signup_creation(pool: &OperatorPool, attempt: Uuid) -> Result
     .map_err(SqlError::from)
 }
 
-/// End `attempt`'s creation as `completed` or, so its owner may retry,
-/// `failed`.
+/// End `attempt`'s creation as `completed`, clearing the address it was
+/// proven with, or, so its owner may retry, `failed`.
 ///
 /// # Errors
 /// Returns [`SqlError::Query`] when the update fails.
@@ -212,6 +218,7 @@ pub async fn finish_signup_creation(
     sqlx::query(
         "UPDATE platform.signup_attempts
             SET status = CASE WHEN $2 THEN 'completed' ELSE 'failed' END,
+                email = CASE WHEN $2 THEN NULL ELSE email END,
                 updated_at = statement_timestamp()
           WHERE id = $1 AND status = 'creating'",
     )

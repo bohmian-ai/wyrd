@@ -863,28 +863,30 @@ mod tests {
         assert!(legacy.compare(&legacy).is_err());
     }
 
-    /// A profiled sweep marks its mode and every VALID row diagnostic while
-    /// judging the same target predicate, and its case report keeps the
-    /// profile's capture notes.
+    /// Previous performance targets apply in neither ordinary nor profiled
+    /// sweeps: a case whose pooled p99 would miss the old overhead target
+    /// keeps that target inapplicable in both, its row's Target cell reads
+    /// `none`, and the profiled sweep marks its mode and every VALID row
+    /// diagnostic while its case report keeps the profile's capture notes.
     ///
     /// # Panics
     ///
-    /// Panics when profiling changes a target or loses its evidence.
+    /// Panics when a previous target is judged or profiling loses evidence.
     #[tokio::test(start_paused = true)]
-    async fn profiled_sweeps_keep_targets_and_capture_evidence() {
+    async fn profiled_sweeps_apply_no_previous_targets_and_keep_capture_evidence() {
         let root = tempfile::tempdir().expect("root");
         let mut profiled = case_record(
             Category::Verification,
             "direct-verify-c64",
             Some(ProfileMode::Cpu),
-            case_script("verifications", 3_000.0, 0.0, 300_000),
+            case_script("verifications", 3_000.0, 0.0, 900_000),
         )
         .await;
         let plain = case_record(
             Category::Verification,
             "direct-verify-c64",
             None,
-            case_script("verifications", 3_000.0, 0.0, 300_000),
+            case_script("verifications", 3_000.0, 0.0, 900_000),
         )
         .await;
         if let Some(record) = profiled.record.as_mut() {
@@ -904,9 +906,7 @@ mod tests {
             .expect("reads")
             .expect("a sweep");
         assert!(
-            printed.contains(
-                "Mode: diagnostic (profile cpu; readings are diagnostic, targets unchanged)\n"
-            ),
+            printed.contains("Mode: diagnostic (profile cpu; readings are diagnostic)\n"),
             "{printed}"
         );
         let row = printed
@@ -914,12 +914,22 @@ mod tests {
             .find(|line| line.starts_with("| direct-verify-c64"))
             .expect("row");
         assert!(row.starts_with("| direct-verify-c64 | VALID (diagnostic) | 100.0 verifications/s | 5000.00 µs/verification | server overhead p99: ("), "{row}");
+        assert!(
+            row.ends_with("| none | 01-direct-verify-direct-verify-c64.json |"),
+            "{row}"
+        );
         let target = |record: &crate::summary::CaseRecord| {
             record.record.as_ref().expect("record").steps[0]
                 .criteria
                 .iter()
                 .filter(|judgment| judgment.criterion.contains("overhead"))
-                .map(|judgment| (judgment.criterion.clone(), judgment.outcome))
+                .map(|judgment| {
+                    (
+                        judgment.criterion.clone(),
+                        judgment.outcome,
+                        judgment.applicable,
+                    )
+                })
                 .collect::<Vec<_>>()
         };
         let case = crate::summary::read_case(
@@ -931,16 +941,16 @@ mod tests {
         assert_eq!(target(&case), target(&plain));
         assert!(
             !target(&case).is_empty(),
-            "direct-verify-c64 declares its overhead target"
+            "direct-verify-c64 still reads its overhead aggregate"
         );
         assert!(
             target(&case)
                 .iter()
-                .all(|(_, outcome)| *outcome == Some(Outcome::Met)),
+                .all(|(_, outcome, applicable)| outcome.is_none() && !applicable),
             "{:?}",
             target(&case)
         );
-        assert!(row.contains(": met"), "{row}");
+        assert_eq!(plain.verdict, wyrd_testing::experiment::Verdict::Valid);
         let full = crate::summary::render_case(&case);
         assert!(
             full.contains("Mode: diagnostic (profile cpu; readings are diagnostic)\n"),

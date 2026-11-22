@@ -19,7 +19,7 @@ use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use wyrd_testing::experiment::{Outcome, Over, Reading, Record, Repetition, Status, Verdict};
+use wyrd_testing::experiment::{Over, Reading, Record, Repetition, Status, Verdict};
 use wyrd_testing::profile::ProfileMode;
 
 use crate::cases::{Case, Category};
@@ -42,8 +42,8 @@ pub const SWEEP_FILE: &str = "sweep.json";
 pub enum SweepMode {
     /// The standardized performance clock.
     Standard,
-    /// The standard clock with profilers attached: same targets, readings
-    /// marked diagnostic.
+    /// The standard clock with profilers attached: readings marked
+    /// diagnostic.
     Diagnostic,
     /// The harness smoke: short windows and small fixtures, judging
     /// workflow and evidence integrity only.
@@ -450,8 +450,10 @@ fn cells(category: Category, case: &CaseRecord) -> Vec<String> {
     row
 }
 
-/// The Target cell: each performance target of the case's step, judged on
-/// its aggregate, as `id: outcome`; `none` when the case declares none.
+/// The Target cell: each applicable performance target of the case's step,
+/// judged on its aggregate, as `id: outcome`; `none` when it has none.
+/// Previous performance targets are inapplicable to L1 cases, so a case
+/// declaring one still reads `none` rather than implying it applies.
 fn target(record: &Record) -> String {
     let targets: Vec<String> = record
         .steps
@@ -459,17 +461,15 @@ fn target(record: &Record) -> String {
         .filter(|step| step.status == Status::Measured)
         .flat_map(|step| &step.criteria)
         .filter(|judgment| {
-            record.criteria.criteria.iter().any(|criterion| {
-                criterion.id == judgment.criterion && criterion.rule.over == Over::Median
-            })
+            judgment.applicable
+                && record.criteria.criteria.iter().any(|criterion| {
+                    criterion.id == judgment.criterion && criterion.rule.over == Over::Median
+                })
         })
-        .map(|judgment| {
-            let outcome = match (judgment.outcome, judgment.applicable) {
-                (Some(outcome), true) => outcome.label(),
-                (Some(Outcome::Invalid), false) => Outcome::Invalid.label(),
-                _ => "not judged",
-            };
-            format!("{}: {outcome}", judgment.criterion)
+        .filter_map(|judgment| {
+            judgment
+                .outcome
+                .map(|outcome| format!("{}: {}", judgment.criterion, outcome.label()))
         })
         .collect();
     if targets.is_empty() {
@@ -509,7 +509,7 @@ pub fn render_sweep(
     let mode = match (sweep.mode, sweep.profile) {
         (SweepMode::Diagnostic, Some(profile)) => {
             format!(
-                "diagnostic (profile {}; readings are diagnostic, targets unchanged)",
+                "diagnostic (profile {}; readings are diagnostic)",
                 profile.name()
             )
         }

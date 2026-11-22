@@ -294,8 +294,10 @@ impl Allowances {
 /// A smoke runs the same declaration, fixtures, steps, phases,
 /// measurement, validity, and record as a full run with a smaller fixture
 /// and [`Level::smoke_timing`]. It only shows the workflow runs: it judges
-/// no criterion, so it is VALID or INVALID, never qualifies performance, and its records stay under
-/// `target/benchmarks/smoke/`. A record without a mode is a full run.
+/// no performance criterion, so it is VALID or INVALID, never qualifies
+/// performance, and its records stay under `target/benchmarks/smoke/`; an
+/// L1 case smoke still judges correctness and integrity per window. A
+/// record without a mode is a full run.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
@@ -3233,14 +3235,15 @@ fn summarize(declaration: &Declaration, repetitions: &[Repetition]) -> BTreeMap<
 /// Judges one criterion over a step's repetitions. A target reports met,
 /// missed or unsettled from its median repetition. A correctness or
 /// integrity criterion is met only when every repetition meets it, and is
-/// otherwise [`Outcome::Invalid`]. A smoke judges no criterion: once its
-/// evidence is present, every criterion is inapplicable, so a smoke is only
-/// VALID or INVALID; a missing reading or an empty percentile population is
-/// [`Outcome::Invalid`] in both modes. Under the L1 case protocol a target
-/// judges the case `aggregate` the summary displays instead of the median
-/// repetition, at its recorded precision and bucket bounds and before any
-/// display rounding; sample floors and correctness criteria still hold per
-/// window.
+/// otherwise [`Outcome::Invalid`]. An L2 smoke judges no criterion: once
+/// its evidence is present, every criterion is inapplicable, so a smoke is
+/// only VALID or INVALID; a missing reading or an empty percentile
+/// population is [`Outcome::Invalid`] in both modes. Under the L1 case
+/// protocol, marked by its case `aggregate`, previous performance targets
+/// do not apply: a target keeps the aggregate the summary displays as its
+/// observation and is inapplicable once its per-window evidence and sample
+/// floors hold, while correctness and integrity criteria are judged per
+/// window, in a case smoke too.
 fn judge_criterion(
     criterion: &Criterion,
     repetitions: &[Repetition],
@@ -3319,13 +3322,19 @@ fn judge_criterion(
         ));
         return judgment;
     }
-    if mode == Mode::Smoke {
+    let Rule { op, limit, over } = criterion.rule;
+    if aggregate.is_some() && over == Over::Median {
+        return inapplicable(
+            judgment,
+            "previous performance targets do not apply to L1 cases".to_owned(),
+        );
+    }
+    if mode == Mode::Smoke && aggregate.is_none() {
         return inapplicable(
             judgment,
             "not judged in a smoke: a smoke only shows the workflow runs".to_owned(),
         );
     }
-    let Rule { op, limit, over } = criterion.rule;
     if over == Over::Median && !judgment.observed.is_present() {
         judgment.reason = Some(format!(
             "the case aggregate of `{}` is missing: {}",
@@ -7546,42 +7555,51 @@ Overloaded: do not compare languages here.
         );
     }
 
-    /// A case's targets judge the same pooled aggregate its summary shows:
-    /// two fast windows and one slow one miss the p99 target although the
-    /// median window meets it, and the record stays VALID; a window under
-    /// its sample floor or failing a correctness check is INVALID instead.
+    /// Runs `windows` (the first also as the warmup) through `declaration`
+    /// over a scripted workload and returns the record.
+    async fn judged_case(declaration: Declaration, windows: Vec<Repetition>) -> Record {
+        let directory = tempfile::tempdir().expect("artifacts");
+        let mut script: VecDeque<Result<Repetition, String>> =
+            std::iter::once(Ok(windows[0].clone()))
+                .chain(windows.into_iter().map(Ok))
+                .collect();
+        script.push_back(Err("exhausted".to_owned()));
+        let mut workload = Scripted {
+            script,
+            ..Scripted::always(&good())
+        };
+        execute(
+            declaration,
+            &mut workload,
+            [Some(quiet()), Some(quiet())],
+            &options(directory.path()),
+        )
+        .await
+    }
+
+    /// Previous performance targets do not apply to L1 cases: a slow window
+    /// that would miss the old p99 target leaves it inapplicable and the
+    /// case VALID, judged from the pooled aggregate the summary shows,
+    /// while a window under its sample floor or failing a correctness check
+    /// still makes the case INVALID.
     #[tokio::test(start_paused = true)]
-    async fn case_targets_judge_aggregates_apart_from_validity() {
+    async fn case_targets_are_void_while_integrity_still_invalidates() {
         let fast = window(1_000.0, 30.0, Some(3.0), &samples(2_000, 300_000));
         let slow = window(1_000.0, 30.0, Some(3.0), &samples(2_000, 900_000));
-        let judged = |windows: Vec<Repetition>| async move {
-            let directory = tempfile::tempdir().expect("artifacts");
-            let mut script: VecDeque<Result<Repetition, String>> =
-                std::iter::once(Ok(windows[0].clone()))
-                    .chain(windows.into_iter().map(Ok))
-                    .collect();
-            script.push_back(Err("exhausted".to_owned()));
-            let mut workload = Scripted {
-                script,
-                ..Scripted::always(&good())
-            };
-            execute(
-                case_declaration(),
-                &mut workload,
-                [Some(quiet()), Some(quiet())],
-                &options(directory.path()),
-            )
-            .await
-        };
-        let missed = judged(vec![fast.clone(), fast.clone(), slow.clone()]).await;
-        assert_eq!(missed.verdict, Verdict::Valid, "{:?}", missed.reasons);
-        let step = &missed.steps[0];
+        let slower = judged_case(case_declaration(), vec![fast.clone(), fast.clone(), slow]).await;
+        assert_eq!(slower.verdict, Verdict::Valid, "{:?}", slower.reasons);
+        let step = &slower.steps[0];
         let slo = step
             .criteria
             .iter()
             .find(|judgment| judgment.criterion == "overhead-slo")
             .expect("judged");
-        assert_eq!(slo.outcome, Some(Outcome::Missed), "{slo:?}");
+        assert_eq!(slo.outcome, None, "{slo:?}");
+        assert!(!slo.applicable);
+        assert_eq!(
+            slo.reason.as_deref(),
+            Some("previous performance targets do not apply to L1 cases")
+        );
         assert_eq!(
             slo.observed,
             step.aggregate
@@ -7591,18 +7609,6 @@ Overloaded: do not compare languages here.
                 .bare()
         );
         assert_eq!(slo.observed.samples, Some(6_000));
-        assert!(
-            slo.reason
-                .as_deref()
-                .is_some_and(|reason| reason.starts_with("aggregate "))
-        );
-        assert!(
-            step.summary["p99_ms"]
-                .median
-                .value
-                .is_some_and(|value| value < 0.5),
-            "the median window meets it"
-        );
         assert!(
             slo.values.iter().all(|value| value.pool.is_none()),
             "judgments repeat no histogram"
@@ -7614,24 +7620,14 @@ Overloaded: do not compare languages here.
             "windows keep theirs"
         );
 
-        let met = judged(vec![fast.clone(), fast.clone(), fast.clone()]).await;
-        assert_eq!(
-            met.steps[0]
-                .criteria
-                .iter()
-                .find(|j| j.criterion == "overhead-slo")
-                .and_then(|j| j.outcome),
-            Some(Outcome::Met)
-        );
-
         let short = window(1_000.0, 30.0, Some(3.0), &samples(500, 300_000));
-        let floor = judged(vec![fast.clone(), short, fast.clone()]).await;
+        let floor = judged_case(case_declaration(), vec![fast.clone(), short, fast.clone()]).await;
         assert_eq!(floor.verdict, Verdict::Invalid);
         assert!(codes(&floor).contains(&"criterion.invalid"));
 
         let mut wrong = fast.clone();
         wrong.set("errors", Reading::count(1));
-        let integrity = judged(vec![fast.clone(), wrong, fast]).await;
+        let integrity = judged_case(case_declaration(), vec![fast.clone(), wrong, fast]).await;
         assert_eq!(integrity.verdict, Verdict::Invalid);
         assert!(
             integrity
@@ -7639,6 +7635,43 @@ Overloaded: do not compare languages here.
                 .iter()
                 .any(|reason| reason.criterion.as_deref() == Some("no-errors"))
         );
+    }
+
+    /// A case-protocol smoke still judges correctness and integrity per
+    /// window: one window with an error among otherwise healthy ones is
+    /// INVALID through the `no-errors` criterion, while its targets stay
+    /// inapplicable; the same smoke without the error is VALID.
+    #[tokio::test(start_paused = true)]
+    async fn case_smokes_judge_integrity_but_not_performance() {
+        let smoke = || {
+            let mut declaration = case_declaration();
+            declaration.timing = Level::case_smoke_timing();
+            declaration.mode = Mode::Smoke;
+            declaration
+        };
+        let fast = window(1_000.0, 2.0, Some(0.2), &samples(2_000, 300_000));
+        let healthy = judged_case(smoke(), vec![fast.clone(), fast.clone(), fast.clone()]).await;
+        assert_eq!(healthy.verdict, Verdict::Valid, "{:?}", healthy.reasons);
+        let mut wrong = fast.clone();
+        wrong.set("errors", Reading::count(10));
+        let failed = judged_case(smoke(), vec![fast.clone(), wrong, fast]).await;
+        assert_eq!(failed.verdict, Verdict::Invalid, "{:?}", failed.reasons);
+        assert!(
+            failed
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "criterion.invalid"
+                    && reason.criterion.as_deref() == Some("no-errors")),
+            "{:?}",
+            failed.reasons
+        );
+        let slo = failed.steps[0]
+            .criteria
+            .iter()
+            .find(|judgment| judgment.criterion == "overhead-slo")
+            .expect("judged");
+        assert!(!slo.applicable, "{slo:?}");
+        assert_eq!(slo.outcome, None);
     }
 
     /// Records outside the case protocol drop the kept window histograms

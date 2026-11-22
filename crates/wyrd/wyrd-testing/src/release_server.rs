@@ -360,6 +360,29 @@ impl LocalServer {
         Ok(Metrics::of_snapshot(&self.timings().await?)?)
     }
 
+    /// The publication and maintenance work the server still holds, from
+    /// one benchmark snapshot: Arrow bytes in active and immutable
+    /// memtables, live staged members and bytes, outstanding publication
+    /// claims, and items pending on each outbox. An L1 case keeps it before
+    /// teardown, so durable acknowledgement is never read as finished
+    /// publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`Self::metrics`] failure.
+    pub async fn outstanding(&self) -> Result<serde_json::Value> {
+        let metrics = self.metrics().await?;
+        let sum = |family: &str| metrics.sum(family, &[]);
+        Ok(serde_json::json!({
+            "memtable_bytes": sum("bifrost_scribe_active_memtable_bytes")
+                + sum("bifrost_scribe_immutable_memtable_bytes"),
+            "staged_members": sum("bifrost_scribe_staging_live_members"),
+            "staged_bytes": sum("bifrost_scribe_staging_live_bytes"),
+            "outstanding_claims": sum("bifrost_scribe_staging_outstanding_claims"),
+            "outbox_pending": sum("outbox_pending"),
+        }))
+    }
+
     /// Reads the server's cumulative benchmark snapshot, its timings and
     /// standard metrics, from the loopback metrics listener of the benchmark
     /// recorder that serving installs.

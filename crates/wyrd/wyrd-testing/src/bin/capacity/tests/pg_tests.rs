@@ -698,3 +698,277 @@ async fn engine_measurements_keep_boundaries_processes_and_windows() {
         );
     }
 }
+
+/// The L1 sweep smoke (REQ-002, REQ-003, REQ-005, REQ-007; AC-002): the
+/// sweep path the category commands use runs a Bifrost write case and then
+/// a Bifrost read case, each as its own case process under its own fresh
+/// PostgreSQL project, server, storage root and client state, through
+/// setup, warmup, three short windows, drains, outstanding-work capture,
+/// teardown and persistence, and the saved sweep regenerates its table. A
+/// second sweep proves a failed case with confirmed cleanup lets the next
+/// case start, and a case whose resources cannot be confirmed as its own
+/// stops every later launch while keeping their rows.
+///
+/// `mise run test:benchmark:l1` after `mise run bench:build`, with Docker.
+///
+/// # Panics
+///
+/// Panics when state is shared, cleanup evidence is missing, or a case
+/// launches after cleanup could not be confirmed.
+#[tokio::test]
+#[ignore = "needs the release server and driver from `mise run bench:build` and Docker"]
+async fn l1_sweeps_isolate_and_record_cases() {
+    use crate::cases::{Category, Request, resolve};
+    use crate::summary::{self, CaseStatus};
+    use crate::sweep::Sweep;
+    use wyrd_testing::experiment::Role;
+
+    let root = repository();
+    let program = wyrd_testing::capacity::release_binary()
+        .expect("the release server from `mise run bench:build`")
+        .with_file_name("capacity");
+    assert!(
+        program.exists(),
+        "the release driver from `mise run bench:build`"
+    );
+    let sweep_of = |rest: &[&str]| {
+        let arguments = line(rest);
+        let Ok(Request::Sweep(selection)) = resolve(Category::Bifrost, &arguments) else {
+            panic!("a sweep");
+        };
+        let mut sweep = Sweep::new(selection, &arguments, &root, true);
+        sweep.program.clone_from(&program);
+        sweep
+    };
+    let cases = |sweep: &Sweep| {
+        sweep
+            .cases
+            .iter()
+            .enumerate()
+            .map(|(index, case)| {
+                summary::read_case(
+                    &sweep
+                        .directory
+                        .join(format!("{}.json", Sweep::name(index + 1, case))),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let docker = |args: &[&str]| {
+        let output = std::process::Command::new("docker")
+            .args(args)
+            .output()
+            .expect("docker");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    };
+    let project_has = |kind: &str, project: &str| {
+        let label = format!("label=com.docker.compose.project={project}");
+        let listed = match kind {
+            "container" => docker(&["ps", "--all", "--quiet", "--filter", &label]),
+            other => docker(&[other, "ls", "--quiet", "--filter", &label]),
+        };
+        !listed.is_empty()
+    };
+
+    let isolated = sweep_of(&[
+        "--cases",
+        "native-write-c1,point-memtable-c1",
+        "--allow-dirty",
+    ]);
+    let interrupt = CancellationToken::new();
+    let record = isolated
+        .supervise(&interrupt, |case, n| {
+            let sweep = &isolated;
+            let interrupt = &interrupt;
+            async move { sweep.attempt(case, n, interrupt).await }
+        })
+        .await;
+    let attempted: Vec<summary::CaseRecord> = cases(&isolated)
+        .into_iter()
+        .map(|case| case.expect("a kept case record"))
+        .collect();
+    assert_eq!(attempted.len(), 2);
+    for (entry, case) in record.cases.iter().zip(&attempted) {
+        assert_eq!(
+            entry.status,
+            CaseStatus::Valid,
+            "{}: {:?}",
+            entry.selector,
+            case.reasons
+        );
+        assert!(
+            case.cleanup.confirmed
+                && case.cleanup.surviving.is_empty()
+                && case.cleanup.preexisting.is_empty(),
+            "{:?}",
+            case.cleanup
+        );
+        assert!(
+            !std::path::Path::new(&case.cleanup.storage_root).exists(),
+            "storage disposed"
+        );
+        for kind in ["container", "volume", "network"] {
+            assert!(
+                !project_has(kind, &case.cleanup.project),
+                "{kind} of {}",
+                case.cleanup.project
+            );
+        }
+        let engine = case.record.as_ref().expect("engine record");
+        let lifecycle = engine.lifecycle.as_ref().expect("lifecycle");
+        assert_eq!(lifecycle.windows.len(), 4, "a warmup and three windows");
+        assert!(lifecycle.setup_seconds > 0.0 && lifecycle.teardown_seconds > 0.0);
+        assert!(
+            lifecycle.owned.iter().all(|owned| !owned.alive()),
+            "every owned process was reaped"
+        );
+        for role in [Role::Server, Role::Driver] {
+            assert!(lifecycle.owned.iter().any(|owned| owned.role == role));
+        }
+        let outstanding = lifecycle
+            .outstanding
+            .as_ref()
+            .expect("outstanding work before teardown");
+        for key in [
+            "memtable_bytes",
+            "staged_members",
+            "outstanding_claims",
+            "outbox_pending",
+        ] {
+            assert!(outstanding.get(key).is_some(), "{key}: {outstanding}");
+        }
+        assert_eq!(engine.steps.len(), 1, "exactly its own case");
+        assert!(engine.steps[0].aggregate.is_some());
+    }
+    let [first, second] = attempted.as_slice() else {
+        panic!("two cases");
+    };
+    let identity = |case: &summary::CaseRecord| {
+        let owned: Vec<String> = case
+            .record
+            .as_ref()
+            .and_then(|record| record.lifecycle.as_ref())
+            .map(|lifecycle| {
+                lifecycle
+                    .owned
+                    .iter()
+                    .map(|owned| format!("{}:{:?}", owned.pid, owned.started_unix))
+                    .collect()
+            })
+            .unwrap_or_default();
+        (
+            case.cleanup.project.clone(),
+            case.cleanup.storage_root.clone(),
+            owned,
+        )
+    };
+    let (one, two) = (identity(first), identity(second));
+    assert_ne!(one.0, two.0, "distinct PostgreSQL projects");
+    assert_ne!(one.1, two.1, "distinct storage roots");
+    assert!(
+        one.2.iter().all(|process| !two.2.contains(process)),
+        "distinct processes: {one:?} / {two:?}"
+    );
+    let path = isolated.directory.join(summary::SWEEP_FILE);
+    let table = summary::report(&path).expect("reads").expect("a sweep");
+    assert!(
+        table.contains("| native-write-c1 | VALID |")
+            && table.contains("| point-memtable-c1 | VALID |"),
+        "{table}"
+    );
+    assert!(table.contains("Mode: smoke"));
+    for (index, case) in isolated.cases.iter().enumerate() {
+        let _ = std::fs::remove_dir_all(isolated.directory.join(Sweep::name(index + 1, case)));
+    }
+    assert_eq!(
+        summary::report(&path).expect("reads").expect("a sweep"),
+        table,
+        "regenerated without artifacts"
+    );
+
+    let mut failing = sweep_of(&[
+        "--cases",
+        "otlp-logs-c1,otlp-spans-c1,otlp-spans-1k-c1,native-write-c64",
+        "--allow-dirty",
+    ]);
+    failing
+        .forwarded
+        .extend(["--pace".to_owned(), "1".to_owned()]);
+    let planted = format!("wyrd-l1-planted-{}", failing.stamp);
+    docker(&[
+        "volume",
+        "create",
+        "--label",
+        &format!("com.docker.compose.project=wyrd-l1-{}-3", failing.stamp),
+        &planted,
+    ]);
+    let launched = Arc::new(Mutex::new(Vec::new()));
+    let record = failing
+        .supervise(&interrupt, |case, n| {
+            let sweep = &failing;
+            let interrupt = &interrupt;
+            let launched = Arc::clone(&launched);
+            async move {
+                launched
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(case.id);
+                sweep.attempt(case, n, interrupt).await
+            }
+        })
+        .await;
+    docker(&["volume", "rm", &planted]);
+    assert_eq!(
+        record
+            .cases
+            .iter()
+            .map(|entry| entry.status)
+            .collect::<Vec<_>>(),
+        [
+            CaseStatus::Invalid,
+            CaseStatus::Invalid,
+            CaseStatus::Invalid,
+            CaseStatus::NotRun
+        ]
+    );
+    assert_eq!(
+        *launched.lock().unwrap_or_else(PoisonError::into_inner),
+        ["otlp-logs-c1", "otlp-spans-c1", "otlp-spans-1k-c1"]
+    );
+    let kept = cases(&failing);
+    for case in &kept[..2] {
+        let case = case.as_ref().expect("kept");
+        assert!(case.cleanup.confirmed, "{:?}", case.cleanup);
+        assert!(
+            case.reasons
+                .iter()
+                .any(|reason| reason.contains("kept no engine record")),
+            "{:?}",
+            case.reasons
+        );
+        for kind in ["container", "volume", "network"] {
+            assert!(!project_has(kind, &case.cleanup.project), "{kind}");
+        }
+    }
+    let unowned = kept[2].as_ref().expect("kept");
+    assert!(!unowned.cleanup.confirmed);
+    assert!(
+        unowned
+            .cleanup
+            .preexisting
+            .iter()
+            .any(|item| item.contains("volume")),
+        "{:?}",
+        unowned.cleanup
+    );
+    assert!(
+        record.cases[3].reasons[0].contains("cleanup of `otlp-spans-1k-c1` could not be confirmed")
+    );
+    let table = summary::report(&failing.directory.join(summary::SWEEP_FILE))
+        .expect("reads")
+        .expect("a sweep");
+    assert!(
+        table.contains("| native-write-c64 | NOT RUN: not started: cleanup of `otlp-spans-1k-c1`"),
+        "{table}"
+    );
+}

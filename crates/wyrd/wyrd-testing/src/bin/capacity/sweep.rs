@@ -476,7 +476,8 @@ async fn stop(
         .and_then(Result::ok)
 }
 
-/// The containers and volumes Compose project `project` still has.
+/// The containers, volumes and networks Compose project `project` still
+/// has.
 ///
 /// # Errors
 ///
@@ -492,6 +493,10 @@ async fn compose_resources(project: &str) -> Result<Vec<String>, String> {
         (
             "volume",
             vec!["volume", "ls", "--quiet", "--filter", label.as_str()],
+        ),
+        (
+            "network",
+            vec!["network", "ls", "--quiet", "--filter", label.as_str()],
         ),
     ] {
         let output = tokio::process::Command::new("docker")

@@ -2141,7 +2141,8 @@ pub struct Lifecycle {
     pub persist_seconds: Option<f64>,
     /// Each warmup and window, in order.
     pub windows: Vec<PhaseWindow>,
-    /// The processes the case owned once prepared.
+    /// The processes the case owned once prepared: its server processes,
+    /// this case process, and any SDK client processes.
     pub owned: Vec<Owned>,
     /// Outstanding publication and maintenance work before teardown, as
     /// the workload read it; `None` when it read none.
@@ -2523,6 +2524,7 @@ where
                 .processes()
                 .into_iter()
                 .map(|pid| (Role::Server, pid))
+                .chain(std::iter::once((Role::Driver, std::process::id())))
                 .chain(workload.clients())
                 .map(|(role, pid)| Owned::read(role, pid))
                 .collect();
@@ -7376,9 +7378,34 @@ Overloaded: do not compare languages here.
                 .iter()
                 .all(|window| (window.drained_seconds - 5.0).abs() < 0.01)
         );
-        assert_eq!(lifecycle.owned.len(), 1);
-        assert_eq!(lifecycle.owned[0].pid, std::process::id());
-        assert!(lifecycle.owned[0].alive());
+        assert_eq!(
+            lifecycle
+                .owned
+                .iter()
+                .map(|owned| owned.role)
+                .collect::<Vec<_>>(),
+            [Role::Server, Role::Driver]
+        );
+        assert!(
+            lifecycle
+                .owned
+                .iter()
+                .all(|owned| owned.pid == std::process::id() && owned.alive())
+        );
+        assert!(
+            lifecycle
+                .owned
+                .iter()
+                .all(|owned| owned.started_unix.is_some())
+        );
+        assert!(
+            !super::Owned {
+                started_unix: lifecycle.owned[0].started_unix.map(|start| start + 1),
+                ..lifecycle.owned[0].clone()
+            }
+            .alive(),
+            "a reused PID with another start is another process"
+        );
         assert_eq!(lifecycle.outstanding, Some(json!({ "staged_members": 0 })));
         assert_eq!(record.steps[0].timing.repetition_seconds, 30);
 

@@ -44,14 +44,15 @@ other hot and Parquet read shapes, the single-client UI pages, and the
 `ui-sql-10x` and `ui-sql-learned` families. Arguments go after `--`:
 
 - `--list-cases` prints every exact selector with its family and its
-  routine or targeted status, and builds and runs nothing.
+  routine or targeted status from the registry file the driver compiles in,
+  `crates/wyrd/wyrd-testing/src/bin/capacity/cases.tsv`, and builds and runs
+  nothing.
 - `--cases <id>[,<id>...]` runs exactly those cases in the given order. A
   Bifrost id that recurs across families takes its family:
   `ui-sql-10x/staged-ui-c8`; `family/id` is always accepted. An unknown,
   ambiguous or repeated selector fails before any case starts.
 - `--profile cpu|heap|both` attaches the profilers to the routine sweep or
-  to a selection. Targets stay the same; the summary marks every reading
-  diagnostic.
+  to a selection. The summary marks every reading diagnostic.
 - `--allow-dirty` records a dirty source (see [Source](#source)); Gateway's
   `--pace <requests/s>` offers every window open loop at that rate.
 
@@ -98,16 +99,17 @@ stops and records every later case `NOT RUN`.
 The full-size phase timings are not yet verified on the supported
 benchmark hosts.
 
-### Aggregates and targets
+### Aggregates and validity
 
 A case's rates and efficiencies are ratios of the three windows' summed
 work, seconds, input bytes and server CPU, never averages of window ratios.
 Its percentiles pool the three windows' histogram counts, keeping the sample
-count and bucket bounds. Existing performance targets, with their existing
-thresholds and operators, judge those aggregates before any display
-rounding. A target miss is a performance result: it never makes a case
-INVALID. The full case report keeps every window's readings, correctness
-checks and sample floors. Unavailable and inapplicable readings are never
+count and bucket bounds. Previous performance targets do not apply to
+L1 cases, in ordinary or profiled sweeps, and no replacement targets are set:
+a case reports its declared targets as inapplicable. Correctness and
+integrity checks and sample floors still judge every window, in the harness
+smoke too, and a failure makes the case INVALID. The full case report keeps
+every window's readings. Unavailable and inapplicable readings are never
 shown as zero.
 
 ### The summary table
@@ -124,7 +126,7 @@ below it. It has one row per selected case in saved order:
 | Server CPU per unit | Server CPU microseconds per verification, request, row, query or page |
 | Headline latency | Verification server overhead p99; Gateway added overhead p99; Bifrost durable ACK p99, server query p99 (p95 for `full-scan-c1`), or UI client page p99; as its bucket interval with the pooled sample count |
 | Input | Bifrost only: OTLP input MiB/s and input MiB per server CPU-second; `unavailable` for native writes, whose input bytes are not measured; `n/a` for reads |
-| Target | Each target of the case judged on its aggregate: `met`, `missed`, `unsettled`, or `none` |
+| Target | `none`: previous performance targets do not apply to L1 cases |
 | Record | The case record's file beside the sweep record, or `unavailable` |
 
 INVALID and NOT RUN rows carry their reasons and no performance cells.
@@ -443,9 +445,9 @@ failure. Every run ends with one verdict and exit code:
   - a dirty source without `--allow-dirty`.
 
 Nothing exits 1. A performance target (an SLO, a sanity floor, a backlog or
-byte bound) judges an L1 case's aggregate (see
-[Aggregates and targets](#aggregates-and-targets)) and an L2 run's median
-repetition, and is reported as
+byte bound) judges an L2 run's median repetition; previous targets do not
+apply to L1 cases (see [Aggregates and validity](#aggregates-and-validity)).
+A target is reported as
 `met`, `missed`, or `unsettled` when a reading's precision cannot decide it;
 a target never changes the verdict or the exit code. Strict targets (`<`)
 are missed on equality. An L1 sweep continues after an INVALID case whose

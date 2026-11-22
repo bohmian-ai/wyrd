@@ -423,7 +423,7 @@ fn cells(category: Category, case: &CaseRecord) -> Vec<String> {
         Input::None => {}
         Input::Inapplicable => row.push("n/a".to_owned()),
         Input::Unmeasured => {
-            row.push("unavailable: native input bytes are not measured".to_owned())
+            row.push("unavailable: native input bytes are not measured".to_owned());
         }
         Input::Otlp => {
             let mib = exact(&aggregate.reading("wire_bytes")).map(|bytes| bytes / MIB);
@@ -722,7 +722,7 @@ pub fn render_case(case: &CaseRecord) -> String {
         ("preexisting", &cleanup.preexisting),
         ("surviving", &cleanup.surviving),
     ] {
-        for item in items.iter() {
+        for item in items {
             let _ = writeln!(out, "- {what}: {item}");
         }
     }

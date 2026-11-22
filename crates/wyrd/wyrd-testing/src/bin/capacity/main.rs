@@ -822,7 +822,7 @@ mod tests {
         );
         let engine = case.record.as_ref().expect("engine record");
         assert!(
-            full.ends_with(&format!("{}", engine.render())),
+            full.ends_with(&engine.render()),
             "the engine report follows"
         );
         assert!(

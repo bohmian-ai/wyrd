@@ -7431,7 +7431,7 @@ Overloaded: do not compare languages here.
             overrun.reasons
         );
         let drained = overrun.lifecycle.as_ref().expect("lifecycle").drain_seconds;
-        assert!(drained >= 150.0 && drained < 151.0, "{drained}");
+        assert!((150.0..151.0).contains(&drained), "{drained}");
 
         let (late, calls) = case_run(
             Duration::ZERO,

@@ -258,10 +258,7 @@ impl Sweep {
                 "the case storage root could not be created: {error}"
             ));
         }
-        if std::fs::read_dir(&storage)
-            .map(|mut entries| entries.next().is_some())
-            .unwrap_or(true)
-        {
+        if std::fs::read_dir(&storage).map_or(true, |mut entries| entries.next().is_some()) {
             cleanup
                 .preexisting
                 .push(format!("storage root {} is not empty", storage.display()));
@@ -552,7 +549,7 @@ async fn confirm(project: &str, owned: &[Owned], storage: &Path, left: Duration)
             }
             Ok(found) => surviving.extend(found),
             Err(error) => {
-                surviving.push(format!("PostgreSQL removal could not be checked: {error}"))
+                surviving.push(format!("PostgreSQL removal could not be checked: {error}"));
             }
         }
         if storage.exists() {

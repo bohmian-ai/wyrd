@@ -287,7 +287,7 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 [[package]]
 name = "arrow"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=f349772c38fe34d874f0050708da8386f3d1b849#f349772c38fe34d874f0050708da8386f3d1b849"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137cae3ce946a77eff045df4440a800e02ae"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -307,7 +307,7 @@ dependencies = [
 [[package]]
 name = "arrow-arith"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=f349772c38fe34d874f0050708da8386f3d1b849#f349772c38fe34d874f0050708da8386f3d1b849"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137cae3ce946a77eff045df4440a800e02ae"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -320,7 +320,7 @@ dependencies = [
 [[package]]
 name = "arrow-array"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=f349772c38fe34d874f0050708da8386f3d1b849#f349772c38fe34d874f0050708da8386f3d1b849"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137cae3ce946a77eff045df4440a800e02ae"
 dependencies = [
  "ahash",
  "arrow-buffer",
@@ -338,7 +338,7 @@ dependencies = [
 [[package]]
 name = "arrow-buffer"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=f349772c38fe34d874f0050708da8386f3d1b849#f349772c38fe34d874f0050708da8386f3d1b849"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137cae3ce946a77eff045df4440a800e02ae"
 dependencies = [
  "bytes",
  "half",
@@ -349,7 +349,7 @@ dependencies = [
 [[package]]
 name = "arrow-cast"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=f349772c38fe34d874f0050708da8386f3d1b849#f349772c38fe34d874f0050708da8386f3d1b849"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137cae3ce946a77eff045df4440a800e02ae"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -370,7 +370,7 @@ dependencies = [
 [[package]]
 name = "arrow-cmp"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=f349772c38fe34d874f0050708da8386f3d1b849#f349772c38fe34d874f0050708da8386f3d1b849"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137cae3ce946a77eff045df4440a800e02ae"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -380,7 +380,7 @@ dependencies = [
 [[package]]
 name = "arrow-csv"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=f349772c38fe34d874f0050708da8386f3d1b849#f349772c38fe34d874f0050708da8386f3d1b849"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137cae3ce946a77eff045df4440a800e02ae"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -394,7 +394,7 @@ dependencies = [
 [[package]]
 name = "arrow-data"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=f349772c38fe34d874f0050708da8386f3d1b849#f349772c38fe34d874f0050708da8386f3d1b849"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137cae3ce946a77eff045df4440a800e02ae"
 dependencies = [
  "arrow-buffer",
  "arrow-schema",
@@ -406,7 +406,7 @@ dependencies = [
 [[package]]
 name = "arrow-flight"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=f349772c38fe34d874f0050708da8386f3d1b849#f349772c38fe34d874f0050708da8386f3d1b849"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137cae3ce946a77eff045df4440a800e02ae"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -426,7 +426,7 @@ dependencies = [
 [[package]]
 name = "arrow-ipc"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=f349772c38fe34d874f0050708da8386f3d1b849#f349772c38fe34d874f0050708da8386f3d1b849"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137cae3ce946a77eff045df4440a800e02ae"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -441,7 +441,7 @@ dependencies = [
 [[package]]
 name = "arrow-json"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=f349772c38fe34d874f0050708da8386f3d1b849#f349772c38fe34d874f0050708da8386f3d1b849"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137cae3ce946a77eff045df4440a800e02ae"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -465,7 +465,7 @@ dependencies = [
 [[package]]
 name = "arrow-ord"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=f349772c38fe34d874f0050708da8386f3d1b849#f349772c38fe34d874f0050708da8386f3d1b849"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137cae3ce946a77eff045df4440a800e02ae"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -478,7 +478,7 @@ dependencies = [
 [[package]]
 name = "arrow-row"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=f349772c38fe34d874f0050708da8386f3d1b849#f349772c38fe34d874f0050708da8386f3d1b849"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137cae3ce946a77eff045df4440a800e02ae"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -490,7 +490,7 @@ dependencies = [
 [[package]]
 name = "arrow-schema"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=f349772c38fe34d874f0050708da8386f3d1b849#f349772c38fe34d874f0050708da8386f3d1b849"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137cae3ce946a77eff045df4440a800e02ae"
 dependencies = [
  "serde_core",
  "serde_json",
@@ -499,7 +499,7 @@ dependencies = [
 [[package]]
 name = "arrow-select"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=f349772c38fe34d874f0050708da8386f3d1b849#f349772c38fe34d874f0050708da8386f3d1b849"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137cae3ce946a77eff045df4440a800e02ae"
 dependencies = [
  "ahash",
  "arrow-array",
@@ -513,7 +513,7 @@ dependencies = [
 [[package]]
 name = "arrow-string"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=f349772c38fe34d874f0050708da8386f3d1b849#f349772c38fe34d874f0050708da8386f3d1b849"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137cae3ce946a77eff045df4440a800e02ae"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -1112,7 +1112,7 @@ dependencies = [
 [[package]]
 name = "bohmian-parquet-variant"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=f349772c38fe34d874f0050708da8386f3d1b849#f349772c38fe34d874f0050708da8386f3d1b849"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137cae3ce946a77eff045df4440a800e02ae"
 dependencies = [
  "arrow-schema",
  "chrono",
@@ -1125,7 +1125,7 @@ dependencies = [
 [[package]]
 name = "bohmian-parquet-variant-compute"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=f349772c38fe34d874f0050708da8386f3d1b849#f349772c38fe34d874f0050708da8386f3d1b849"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137cae3ce946a77eff045df4440a800e02ae"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -1141,7 +1141,7 @@ dependencies = [
 [[package]]
 name = "bohmian-parquet-variant-json"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=f349772c38fe34d874f0050708da8386f3d1b849#f349772c38fe34d874f0050708da8386f3d1b849"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137cae3ce946a77eff045df4440a800e02ae"
 dependencies = [
  "arrow-schema",
  "base64 0.23.1",
@@ -5950,7 +5950,7 @@ dependencies = [
 [[package]]
 name = "parquet"
 version = "60.0.0"
-source = "git+https://github.com/bohmian-ai/arrow-rs?rev=f349772c38fe34d874f0050708da8386f3d1b849#f349772c38fe34d874f0050708da8386f3d1b849"
+source = "git+https://github.com/bohmian-ai/arrow-rs?rev=cc90137cae3ce946a77eff045df4440a800e02ae#cc90137cae3ce946a77eff045df4440a800e02ae"
 dependencies = [
  "ahash",
  "arrow-array",

@@ -65,7 +65,9 @@ outside recent history when either its age has elapsed or it falls outside the
 newest 10,000 identities; PostgreSQL owns coordination time. Count can therefore
 shorten protection below one hour. While a receipt remains authoritative, matching
 retries and contradictory content retain the existing identity, version and
-conflict semantics. After actual deletion, an old identity may be accepted again.
+conflict semantics for client-supplied batch IDs. A Gate-derived OTLP batch ID
+is itself the XXH3-128 content identity, so its retries are recognised by ID
+alone. After actual deletion, an old identity may be accepted again.
 The in-memory committed-batch mirror must not acknowledge identities whose backing
 receipt has been removed. These limits do not expire stored rows.
 
@@ -165,12 +167,15 @@ allocation. Preserve existing borrowed log decoding and canonical Arrow ownershi
 Coalesce only redundant append-only inspection publication after mailbox drain;
 retain control-command publication and publication required before ACK.
 
-**REQ-011 — Carry compatible compressed IPC chunks through WAL.** Use the pinned
-Arrow encoder's ordered owned buffers through prepared WAL payloads and bounded
-vectored-write windows, without flattening them. Keep each slice an independent
-standard IPC stream with exact compressed-byte parity to the current writer under
-the existing settings. Preserve WAL format, ordered lengths/CRC/digests, canonical
-logical identity and its existing volatile-field exclusions. Many-chunk writes,
+**REQ-011 — Carry compatible compressed IPC through WAL.** Join each slice's
+pinned-encoder output once into one exact-length payload that the WAL writes in a
+single vectored write; carrying unjoined chunks measured slower. Keep each slice an
+independent standard IPC stream with exact compressed-byte parity to the current
+writer under the existing settings. Logical identities and WAL payload digests are
+XXH3-128 (16 bytes), replacing SHA-256 in place in the WAL, replay and PostgreSQL
+receipts with no compatibility path, since no installation holds earlier data.
+Preserve ordered lengths/CRC, the COMMIT binding of ordered slice digests,
+canonical logical identity input and its existing volatile-field exclusions. Many-chunk writes,
 partial/interrupted/zero-progress writes and errors retain existing rollback and
 replay behavior. Payload owners and memory leases remain live until IO settles.
 

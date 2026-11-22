@@ -249,6 +249,13 @@ server-owned fields. A retry preserves
 the batch ID. Within the idempotency-retention window,
 reusing an accepted ID requires the same source schema, row count, row
 order, and payload digest; any mismatch is a stable batch-identity conflict.
+Every Bifrost content digest, the logical batch identity and the WAL payload
+digest alike, is XXH3-128: these detect accidental mismatch within one tenant's
+own table, never adversarial collision, and CRC32C still frames each WAL
+record. An OTLP request carries no batch ID, so Gate derives it from the
+XXH3-128 logical identity of the accepted user columns and authenticated
+context; for these derived IDs the ID is the content, so a retry is recognised
+by ID alone and Scribe computes no separate slice identity for it.
 Resolve accepted retries under the fence's original `table_version`, even
 when current partitioning or schema would prepare different slices or reject
 the old request. Stale versions on new batches are typed table-version
@@ -1063,7 +1070,8 @@ operation IDs against `file_list` before opening admission. Unknown codec/table
 versions, unmappable legacy evidence, checksum mismatch,
 contradictory lineage or ambiguous authority fail closed. WAL SLICE and COMMIT
 bind the same table version and retain per-attempt CRC, ordinal/count, terminal
-and payload/WAL integrity checks; no recipe JSON travels in either record.
+and payload/WAL integrity checks; COMMIT binds each slice's ordinal, length and
+XXH3-128 payload digest. No recipe JSON travels in either record.
 A cold retry may leave a complete provisional attempt with different geometry.
 The durable fence's canonical coordinates select the accepted attempt;
 noncanonical attempts for that spent ID restore no rows. Do not reject those

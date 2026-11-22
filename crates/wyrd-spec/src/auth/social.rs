@@ -173,7 +173,7 @@ pub struct EnableSocialProviderRequest {
 /// Deployment-wide login settings.
 ///
 /// Password starts enabled and public signup starts disabled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct LoginSettings {
@@ -186,6 +186,25 @@ pub struct LoginSettings {
     #[serde(default = "LoginSettings::default_workspace_cap")]
     #[cfg_attr(feature = "server", schema(value_type = u16, minimum = 1))]
     pub signup_workspace_cap: std::num::NonZeroU16,
+    /// The optional human challenge browser workspace creation must pass;
+    /// `null` requires none. Writing `null` or omitting it removes it.
+    #[serde(default)]
+    pub signup_challenge: Option<SignupChallenge>,
+}
+
+/// A Cloudflare Turnstile challenge for browser workspace creation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct SignupChallenge {
+    /// The widget's public site key.
+    pub site_key: String,
+    /// The Siteverify secret; write-only, sealed before storage and never
+    /// returned. Omit it to keep the stored secret.
+    #[serde(default, skip_serializing)]
+    #[schemars(with = "Option<String>")]
+    #[cfg_attr(feature = "server", schema(value_type = Option<String>, write_only))]
+    pub secret: Option<SecretBearer>,
 }
 
 impl LoginSettings {

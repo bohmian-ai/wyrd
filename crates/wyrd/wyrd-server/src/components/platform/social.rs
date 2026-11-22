@@ -364,7 +364,7 @@ async fn write_login_settings(
     )
     .await?;
     social(&state)?
-        .put_settings(&mut decision, settings)
+        .put_settings(&mut decision, &settings)
         .await?;
     commit_decision(decision).await?;
     Ok(Json(settings))

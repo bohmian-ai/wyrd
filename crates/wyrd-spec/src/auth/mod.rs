@@ -69,9 +69,9 @@ pub use secret_bearer::SecretBearer;
 pub use social::{
     ConfigureMailRelayRequest, ConfigureSocialProviderRequest, CreationMethods, EmailMethods,
     EnableSocialProviderRequest, LoginMethodsQuery, LoginMethodsResponse, LoginSettings,
-    MailRelayView, MailSettings, MailTestRequest, MailTestResponse, SignInMethods, SmtpTls,
-    SocialProvider, SocialProviderState, SocialProviderTestRequest, SocialProviderTestResponse,
-    SocialProviderView, SocialProvidersResponse,
+    MailRelayView, MailSettings, MailTestRequest, MailTestResponse, SignInMethods, SignupChallenge,
+    SmtpTls, SocialProvider, SocialProviderState, SocialProviderTestRequest,
+    SocialProviderTestResponse, SocialProviderView, SocialProvidersResponse,
 };
 pub use tenant_admin::{
     CreateTenantRequest, CreateTenantResponse, ProvisionedTenant, ProvisionedTenantAdmin,

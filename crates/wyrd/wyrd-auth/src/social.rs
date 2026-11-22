@@ -25,6 +25,7 @@ use serde_json::json;
 use url::Url;
 use uuid::Uuid;
 pub use wyrd_auth_oidc::GithubEndpoints;
+use wyrd_auth_oidc::turnstile::{TURNSTILE_SITEVERIFY, Turnstile};
 use wyrd_auth_oidc::{
     ClaimMapping, ClaimPath, ClientAuth, CodeRedemption, GITHUB_NAMESPACE, GithubOAuth,
     MappedClaims, RelyingParty, ScreenedHttp,
@@ -34,8 +35,8 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
     AbsoluteUrl, CallbackQuery, ConfigureSocialProviderRequest, CreationMethods, EmailMethods,
     EnableSocialProviderRequest, IssuerUrl, LocalCredentials, LoginMethodsResponse, LoginSettings,
-    ProviderResponse, SecretBearer, Sha256Hex, SignInMethods, SocialProvider, SocialProviderState,
-    SocialProviderView, SocialProvidersResponse,
+    ProviderResponse, SecretBearer, Sha256Hex, SignInMethods, SignupChallenge, SocialProvider,
+    SocialProviderState, SocialProviderView, SocialProvidersResponse,
 };
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::TenantSlug;
@@ -52,10 +53,10 @@ use wyrd_sql::queries::platform::signup::{
 use wyrd_sql::queries::platform::social::{
     LoginSettingsRow, ProviderEnablement, SocialProviderRow, SocialTestState,
     insert_social_test_state, login_settings, mail_relay, put_login_settings, put_social_provider,
-    set_social_provider_enabled, social_provider, social_providers, stamp_social_provider_tested,
-    take_social_test_state,
+    set_social_provider_enabled, signup_challenge, social_provider, social_providers,
+    stamp_social_provider_tested, take_social_test_state,
 };
-use wyrd_sql::{OperatorPool, TenantConn};
+use wyrd_sql::{OperatorPool, SqlError, TenantConn};
 
 use crate::browser_sessions::{
     BegunBrowserLogin, BrowserSessions, CreatedBrowserSession, create_session, random_secret,
@@ -81,6 +82,8 @@ pub struct SocialEndpoints {
     pub google_issuer: IssuerUrl,
     /// GitHub's OAuth and API endpoints.
     pub github: GithubEndpoints,
+    /// Cloudflare Turnstile's Siteverify endpoint.
+    pub turnstile_siteverify: Url,
 }
 
 impl Default for SocialEndpoints {
@@ -89,6 +92,8 @@ impl Default for SocialEndpoints {
             google_issuer: IssuerUrl::new(GOOGLE_ISSUER)
                 .expect("invariant: Google's issuer is a valid issuer URL"),
             github: GithubEndpoints::default(),
+            turnstile_siteverify: Url::parse(TURNSTILE_SITEVERIFY)
+                .expect("invariant: Cloudflare's Siteverify URL parses"),
         }
     }
 }
@@ -106,6 +111,8 @@ pub struct SocialSignIn {
     relying_party: RelyingParty,
     /// Screened GitHub.com OAuth client.
     github: GithubOAuth,
+    /// Screened transport for Siteverify.
+    http: ScreenedHttp,
     /// Provider endpoints.
     endpoints: SocialEndpoints,
 }
@@ -147,6 +154,7 @@ impl SocialSignIn {
             keyring,
             relying_party: RelyingParty::new(http),
             github: GithubOAuth::new(http, endpoints.github.clone()),
+            http,
             endpoints,
         }
     }
@@ -558,28 +566,140 @@ impl SocialSignIn {
                     message: "the stored workspace cap is out of range".to_owned(),
                     details: json!({}),
                 })?,
+            signup_challenge: row
+                .signup_challenge_site_key
+                .map(|site_key| SignupChallenge {
+                    site_key,
+                    secret: None,
+                }),
         })
     }
 
     /// Replace the deployment login settings on the audited operator `conn`.
     ///
+    /// A signup challenge's secret is sealed under the deployment keyring;
+    /// a challenge sent without one keeps the stored secret.
+    ///
     /// # Errors
-    /// Returns [`WyrdError::AuthVerifyUnavailable`] when the write fails.
+    /// Returns [`WyrdError::Validation`] for a challenge with no secret
+    /// stored or sent, an empty site key or secret, or a deployment without
+    /// a sealing key, and [`WyrdError::AuthVerifyUnavailable`] when the write
+    /// fails.
     pub async fn put_settings(
         &self,
         conn: &mut TenantConn<'_>,
-        settings: LoginSettings,
+        settings: &LoginSettings,
     ) -> Result<(), WyrdError> {
+        let challenge = settings.signup_challenge.as_ref();
+        if challenge.is_some_and(|challenge| {
+            challenge.site_key.trim().is_empty()
+                || challenge
+                    .secret
+                    .as_ref()
+                    .is_some_and(|secret| secret.expose().is_empty())
+        }) {
+            return Err(validation(
+                "a signup challenge needs a site key and secret",
+                "signup_challenge",
+            ));
+        }
+        let sealed = match challenge.and_then(|challenge| challenge.secret.as_ref()) {
+            Some(secret) => Some(
+                self.keyring
+                    .as_ref()
+                    .ok_or_else(|| {
+                        validation(
+                            "this deployment has no sealing key, so a challenge secret cannot be stored",
+                            "signup_challenge.secret",
+                        )
+                    })?
+                    .seal(secret.expose().as_bytes())
+                    .map_err(|_| {
+                        validation(
+                            "the challenge secret could not be sealed",
+                            "signup_challenge.secret",
+                        )
+                    })?,
+            ),
+            None => None,
+        };
         put_login_settings(
             conn,
-            LoginSettingsRow {
+            &LoginSettingsRow {
                 password_enabled: settings.password_enabled,
                 signup_enabled: settings.signup_enabled,
                 signup_workspace_cap: i32::from(settings.signup_workspace_cap.get()),
+                signup_challenge_site_key: challenge.map(|challenge| challenge.site_key.clone()),
             },
+            sealed.as_deref(),
         )
         .await
-        .map_err(store_error)
+        .map_err(|error| match error {
+            SqlError::CheckViolation { .. } => validation(
+                "a signup challenge needs its secret the first time it is set",
+                "signup_challenge.secret",
+            ),
+            error => store_error(error),
+        })
+    }
+
+    /// Require a browser workspace creation from `source` to pass the
+    /// configured signup challenge with `token`, solved on `hostname` for
+    /// the `signup` action; nothing is required when no challenge is
+    /// configured.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::SignupChallenge`] for a missing token or one
+    /// Siteverify refuses, reports already used, or reports solved on
+    /// another hostname or for another action, and
+    /// [`WyrdError::AuthVerifyUnavailable`] when the challenge settings,
+    /// keyring or Siteverify are unavailable.
+    pub async fn require_challenge(
+        &self,
+        token: Option<&str>,
+        hostname: &str,
+        source: Option<std::net::IpAddr>,
+    ) -> Result<(), WyrdError> {
+        let Some((_, sealed)) = signup_challenge(&self.operator)
+            .await
+            .map_err(store_error)?
+        else {
+            return Ok(());
+        };
+        let refused = || WyrdError::SignupChallenge {
+            message: "complete the human check on the signup page, then try again".to_owned(),
+            details: json!({ "field": "challenge_token" }),
+        };
+        let token = token
+            .filter(|token| !token.is_empty())
+            .ok_or_else(refused)?;
+        let unavailable = || WyrdError::AuthVerifyUnavailable {
+            message: "the signup challenge cannot be checked right now; try again".to_owned(),
+            details: json!({ "reason": "challenge_unavailable" }),
+        };
+        let secret = self
+            .keyring
+            .as_ref()
+            .and_then(|keyring| keyring.open(&sealed).ok())
+            .and_then(|plain| String::from_utf8(plain).ok())
+            .map(SecretString::from)
+            .ok_or_else(unavailable)?;
+        let answer = Turnstile::new(self.http, self.endpoints.turnstile_siteverify.clone())
+            .verify(&secret, token, source)
+            .await
+            .map_err(|error| {
+                tracing::warn!(error = %error, "signup challenge unavailable");
+                unavailable()
+            })?;
+        if answer.success
+            && answer.hostname.as_deref() == Some(hostname)
+            && answer.action.as_deref() == Some("signup")
+        {
+            Ok(())
+        } else {
+            tracing::info!(codes = ?answer.error_codes, "signup challenge refused");
+            Err(refused())
+        }
     }
 
     /// The sign-in methods Rust currently allows: the deployment's settings,

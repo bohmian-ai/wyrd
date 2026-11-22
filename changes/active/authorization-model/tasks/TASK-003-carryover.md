@@ -570,6 +570,42 @@ and form-at-cap behavior connects cycle 16.
 **Proof:** tier-1 browser completion → local Siteverify → actual provisioner;
 RED is absent server-side optional challenge, not a page-only widget.
 
+**Evidence (cycle 9):** RED — `platform_admin_e2e::signup::a_configured_challenge_gates_browser_creation`
+first failed with `PUT /platform/login-settings` refusing the unknown field
+`signup_challenge`. Before that I added only the test-config field
+`SocialConfig.turnstile_siteverify_url`, so the test could compile. GREEN after these changes:
+- `LoginSettings.signup_challenge {site_key, secret}` is accepted through the existing
+  login-settings operation. The secret is write-only, sealed with the deployment keyring, and
+  kept when a later write omits it. Writing `null` clears the challenge.
+- Migration 000006 (unapplied) adds `signup_challenge_site_key` and `signup_challenge_secret`
+  under a both-or-neither CHECK, per spec "the optional challenge site key with sealed secret".
+- The new `wyrd_auth_oidc::turnstile::Turnstile` Siteverify client goes through the screened
+  transport.
+- `SocialSignIn::require_challenge` runs in `signup_complete` after `admit_signup` and before
+  the claim. A refusal settles the attempt `failed` so its owner can retry.
+- The new catalog error `WYRD_AUTH_403_SIGNUP_CHALLENGE` was added, and the TS codes and docs
+  were regenerated.
+
+The journey asserts:
+- the stored secret is never returned and is not stored in plain text;
+- a missing token, `invalid-input-response`, `timeout-or-duplicate` (already used), a wrong
+  hostname and the `login` action each answer `403` and create nothing;
+- a missing token makes no Siteverify call;
+- a `503` from Siteverify refuses with `503 challenge_unavailable`;
+- a valid token creates an active workspace and posts the stored secret, the token and the
+  visitor's address;
+- a source-less completion refused at admission makes no call;
+- operator `POST /platform/tenants` is never challenged;
+- clearing the setting removes the challenge.
+
+Unit: `turnstile::tests::{siteverify_receives_the_form_and_decodes_a_refusal,
+an_unavailable_siteverify_is_an_error}`; that client was written before those unit tests (TDD
+process violation for the unit tier only). The expired-token case is Siteverify's same
+`timeout-or-duplicate` refusal. The UI widget and the form-at-cap behavior join cycle 16.
+**TDD: PASS** (journey). Commands: the cycle 7 lane command plus `-p wyrd-auth-oidc` and
+`config` (1067/1067 after the login-settings shape update), clippy `-D warnings`,
+`codegen:check`, `docs:check`, `check:tenant-isolation`.
+
 ### 10. Built-in verified-email signup creates one tenant-local admin
 
 **Reuses:** Cycles 1–9 final signup/provisioning/session machinery and existing provider/mail owners; connect local/social acquisition and contacts once.

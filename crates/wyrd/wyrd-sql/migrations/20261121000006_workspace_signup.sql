@@ -84,7 +84,13 @@ CREATE INDEX platform_tenants_signup_creator_key
 -- tenants (revision 5 owned-workspace cap, default 3).
 ALTER TABLE platform.login_settings
     ADD COLUMN signup_workspace_cap INTEGER NOT NULL DEFAULT 3
-        CHECK (signup_workspace_cap BETWEEN 1 AND 65535);
+        CHECK (signup_workspace_cap BETWEEN 1 AND 65535),
+    -- The optional Turnstile challenge: site key and sealed secret together
+    -- (revision 5 "optional challenge site key with sealed secret").
+    ADD COLUMN signup_challenge_site_key TEXT,
+    ADD COLUMN signup_challenge_secret BYTEA,
+    ADD CONSTRAINT login_settings_signup_challenge
+        CHECK ((signup_challenge_site_key IS NULL) = (signup_challenge_secret IS NULL));
 
 ALTER TABLE platform.signup_attempts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE platform.signup_attempts FORCE ROW LEVEL SECURITY;

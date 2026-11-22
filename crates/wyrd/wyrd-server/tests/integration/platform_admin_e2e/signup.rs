@@ -26,11 +26,26 @@ const CLIENT_HEADER: &str = "CF-Connecting-IP";
 /// # Panics
 /// Panics when the server, operator session or provider setup fails.
 async fn signup_server(google: &wiremock::MockServer) -> (WyrdTestServer, String) {
-    let srv = WyrdTestServer::builder()
-        .with_social_endpoints_for_test(wyrd_server::config::SocialConfig {
+    signup_server_with(
+        google,
+        wyrd_server::config::SocialConfig {
             google_issuer: Some(google.uri()),
             ..Default::default()
-        })
+        },
+    )
+    .await
+}
+
+/// [`signup_server`] with the provider endpoints `social`.
+///
+/// # Panics
+/// As [`signup_server`].
+async fn signup_server_with(
+    google: &wiremock::MockServer,
+    social: wyrd_server::config::SocialConfig,
+) -> (WyrdTestServer, String) {
+    let srv = WyrdTestServer::builder()
+        .with_social_endpoints_for_test(social)
         .with_trusted_ingress_for_test(&[INGRESS], CLIENT_HEADER)
         .start_in_process()
         .await
@@ -1501,4 +1516,216 @@ async fn the_owned_workspace_cap_holds_atomically_across_purge() {
     )
     .await;
     assert!(status.is_success(), "operator creation: {body}");
+}
+
+/// Mount a Siteverify answer for the token `token`.
+async fn siteverify(cloudflare: &wiremock::MockServer, token: &str, status: u16, answer: Value) {
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::body_string_contains(format!(
+            "response={token}&"
+        )))
+        .respond_with(wiremock::ResponseTemplate::new(status).set_body_json(answer))
+        .mount(cloudflare)
+        .await;
+}
+
+/// With a Turnstile challenge configured, browser workspace creation needs a
+/// server-validated token, checked after admission and before the claim:
+///   1. the operator stores the site key and a sealed secret through the
+///      login settings, which never return the secret;
+///   2. a missing token, and tokens Siteverify refuses, reports as solved on
+///      another hostname or for another action, or reports already used,
+///      create no tenant and answer `WYRD_AUTH_403_SIGNUP_CHALLENGE`; a
+///      missing token makes no Siteverify call;
+///   3. an unavailable Siteverify refuses creation;
+///   4. a valid token creates the workspace, posting the stored secret;
+///   5. a completion refused by admission makes no Siteverify call;
+///   6. operator creation is never challenged, and clearing the setting
+///      removes the challenge.
+///
+/// # Panics
+/// Panics when a completion is admitted or refused differently.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_configured_challenge_gates_browser_creation() {
+    let google = wiremock::MockServer::start().await;
+    let cloudflare = wiremock::MockServer::start().await;
+    let (srv, session) = signup_server_with(
+        &google,
+        wyrd_server::config::SocialConfig {
+            google_issuer: Some(google.uri()),
+            turnstile_siteverify_url: Some(cloudflare.uri()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    let settings = |body: Option<Value>| {
+        social_request(
+            if body.is_some() {
+                Method::PUT
+            } else {
+                Method::GET
+            },
+            "/platform/login-settings",
+            Some(&session),
+            body,
+        )
+    };
+
+    // 1. The secret is stored sealed and never returned.
+    let (status, current) = social_call(&srv, settings(None)).await;
+    assert_eq!(status, StatusCode::OK, "{current}");
+    assert_eq!(current["signup_challenge"], Value::Null, "{current}");
+    let configured = json!({ "password_enabled": true, "signup_enabled": true,
+        "signup_challenge": { "site_key": "0x4AAA-site", "secret": "turnstile-secret" } });
+    let (status, stored) = social_call(&srv, settings(Some(configured))).await;
+    assert_eq!(status, StatusCode::OK, "{stored}");
+    assert_eq!(
+        stored["signup_challenge"],
+        json!({ "site_key": "0x4AAA-site" })
+    );
+    let (_, read) = social_call(&srv, settings(None)).await;
+    assert_eq!(
+        read["signup_challenge"],
+        json!({ "site_key": "0x4AAA-site" })
+    );
+    assert!(!read.to_string().contains("turnstile-secret"));
+    let plain: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM platform.login_settings
+          WHERE position('turnstile-secret' in encode(signup_challenge_secret, 'escape')) > 0",
+    )
+    .fetch_one(&superuser)
+    .await
+    .expect("settings read");
+    assert_eq!(plain, 0, "the secret is sealed");
+
+    // 2. Refused tokens create nothing.
+    let solved = |hostname: &str, action: &str| json!({ "success": true, "hostname": hostname, "action": action, "error-codes": [] });
+    siteverify(
+        &cloudflare,
+        "invalid",
+        200,
+        json!({ "success": false, "error-codes": ["invalid-input-response"] }),
+    )
+    .await;
+    siteverify(
+        &cloudflare,
+        "reused",
+        200,
+        json!({ "success": false, "error-codes": ["timeout-or-duplicate"] }),
+    )
+    .await;
+    siteverify(&cloudflare, "elsewhere", 200, solved("evil.test", "signup")).await;
+    siteverify(&cloudflare, "login", 200, solved(SOCIAL_HOST, "login")).await;
+    siteverify(&cloudflare, "down", 503, json!({})).await;
+    siteverify(&cloudflare, "good", 200, solved(SOCIAL_HOST, "signup")).await;
+    let attempt = |subject: &'static str, token: Option<&'static str>, client: &'static str| {
+        let srv = &srv;
+        let google = &google;
+        async move {
+            let proof = prove_signup(srv, google, subject).await;
+            let mut body = json!({ "slug": subject, "display_name": subject });
+            if let Some(token) = token {
+                body["challenge_token"] = json!(token);
+            }
+            let (status, cookie, body) = complete_with(srv, &proof, client, &body).await;
+            (status, cookie, body)
+        }
+    };
+    let (status, _, body) = attempt("chal-missing", None, "198.51.100.120").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["code"], "WYRD_AUTH_403_SIGNUP_CHALLENGE", "{body}");
+    let calls = || async {
+        cloudflare
+            .received_requests()
+            .await
+            .expect("recorded")
+            .len()
+    };
+    assert_eq!(
+        calls().await,
+        0,
+        "a missing token is refused without a call"
+    );
+    for (subject, token, client) in [
+        ("chal-invalid", "invalid", "198.51.100.121"),
+        ("chal-reused", "reused", "198.51.100.122"),
+        ("chal-elsewhere", "elsewhere", "198.51.100.123"),
+        ("chal-login", "login", "198.51.100.124"),
+    ] {
+        let (status, cookie, body) = attempt(subject, Some(token), client).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{token}: {body}");
+        assert_eq!(body["code"], "WYRD_AUTH_403_SIGNUP_CHALLENGE", "{token}");
+        assert!(cookie.is_none(), "{token}");
+        assert!(
+            statuses(&superuser, subject).await.is_empty(),
+            "{token} created nothing"
+        );
+    }
+
+    // 3. An unavailable provider refuses creation.
+    let (status, _, body) = attempt("chal-down", Some("down"), "198.51.100.125").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["details"]["reason"], "challenge_unavailable", "{body}");
+    assert!(statuses(&superuser, "chal-down").await.is_empty());
+
+    // 4. A valid token creates the workspace with the stored secret.
+    let (status, cookie, body) = attempt("chal-good", Some("good"), "198.51.100.126").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(cookie.is_some());
+    assert_eq!(statuses(&superuser, "chal-good").await, ["active"]);
+    let posted = cloudflare.received_requests().await.expect("recorded");
+    let last = String::from_utf8_lossy(&posted.last().expect("a call").body).into_owned();
+    assert!(
+        last.starts_with("secret=turnstile-secret&response=good&"),
+        "{last}"
+    );
+
+    // 5. Refused admission makes no call.
+    let before = calls().await;
+    let proof = prove_signup(&srv, &google, "chal-sourceless").await;
+    let mut request = from_peer(
+        Method::POST,
+        "/auth/signup/complete",
+        "10.1.0.1",
+        None,
+        &json!({ "slug": "chal-sourceless", "display_name": "x", "challenge_token": "good" }),
+    );
+    request
+        .headers_mut()
+        .insert(header::COOKIE, proof.parse().expect("cookie header"));
+    let resp = srv.oneshot(request).await.expect("completion responds");
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        calls().await,
+        before,
+        "admission refused before the challenge"
+    );
+
+    // 6. Operators are not challenged; clearing removes the challenge.
+    let (status, body) = social_call(
+        &srv,
+        social_request(
+            Method::POST,
+            "/platform/tenants",
+            Some(&session),
+            Some(json!({ "slug": "chal-operator", "display_name": "Operator" })),
+        ),
+    )
+    .await;
+    assert!(status.is_success(), "operator creation: {body}");
+    let (status, cleared) = social_call(
+        &srv,
+        settings(Some(
+            json!({ "password_enabled": true, "signup_enabled": true }),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{cleared}");
+    assert_eq!(cleared["signup_challenge"], Value::Null);
+    let (status, _, body) = attempt("chal-cleared", None, "198.51.100.127").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }

@@ -5584,7 +5584,8 @@ async fn an_operator_configures_and_tests_google_beside_company_sso() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         settings,
-        json!({ "password_enabled": true, "signup_enabled": false, "signup_workspace_cap": 3 })
+        json!({ "password_enabled": true, "signup_enabled": false, "signup_workspace_cap": 3,
+            "signup_challenge": null })
     );
 
     // 2. Storing the client discloses the callback and never the secret.
@@ -7256,6 +7257,7 @@ async fn an_invited_person_enrolls_with_github_and_returns() {
             google_issuer: None,
             github_url: Some(github.uri()),
             github_api_url: Some(github.uri()),
+            turnstile_siteverify_url: None,
         })
         .start_in_process()
         .await

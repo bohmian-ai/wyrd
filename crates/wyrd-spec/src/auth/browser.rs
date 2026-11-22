@@ -83,6 +83,10 @@ pub struct SignupCompleteRequest {
     /// with the provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_credentials: Option<LocalCredentials>,
+    /// The Turnstile token the signup page's widget produced; required when
+    /// the deployment configures a challenge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub challenge_token: Option<String>,
 }
 
 /// The username and password of a workspace's first local administrator.

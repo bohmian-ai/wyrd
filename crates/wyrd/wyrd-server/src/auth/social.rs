@@ -471,6 +471,19 @@ pub async fn signup_complete(
     let creation = social
         .admit_signup(&completion, request.local_credentials.as_ref(), source)
         .await?;
+    // The challenge runs after admission, so refused traffic costs no
+    // Siteverify call, and before the claim, so a refusal creates nothing.
+    if let Err(error) = social
+        .require_challenge(
+            request.challenge_token.as_deref(),
+            origin.host_str().unwrap_or_default(),
+            source,
+        )
+        .await
+    {
+        social.finish_signup(creation.attempt, false).await?;
+        return Err(WyrdErrorResponse::from(error));
+    }
     if let Some((_, claimed)) = &creation.claimed
         && claimed != request.slug.as_str()
     {

@@ -2471,6 +2471,10 @@ pub struct SocialConfig {
     /// unset, and only that in production.
     #[serde(default)]
     pub github_api_url: Option<String>,
+    /// Cloudflare Turnstile's Siteverify endpoint; Cloudflare's own when
+    /// unset, and only that in production.
+    #[serde(default)]
+    pub turnstile_siteverify_url: Option<String>,
 }
 
 impl SocialConfig {
@@ -2513,6 +2517,15 @@ impl SocialConfig {
                 )?,
             )
             .map_err(|_| invalid("GitHub endpoints do not form URLs"))?;
+        }
+        if let Some(siteverify) = &self.turnstile_siteverify_url {
+            if production {
+                return Err(invalid(
+                    "turnstile_siteverify_url cannot be overridden in production",
+                ));
+            }
+            endpoints.turnstile_siteverify = url::Url::parse(siteverify)
+                .map_err(|_| invalid("turnstile_siteverify_url is not a URL"))?;
         }
         Ok(endpoints)
     }

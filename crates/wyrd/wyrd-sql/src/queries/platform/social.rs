@@ -264,7 +264,7 @@ pub async fn take_social_test_state(
 }
 
 /// The deployment login settings row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct LoginSettingsRow {
     /// Password sign-in is available.
     pub password_enabled: bool,
@@ -272,6 +272,23 @@ pub struct LoginSettingsRow {
     pub signup_enabled: bool,
     /// The owned-workspace cap per proven identity, at least 1.
     pub signup_workspace_cap: i32,
+    /// The Turnstile site key, when a signup challenge is configured.
+    pub signup_challenge_site_key: Option<String>,
+}
+
+/// The configured signup challenge's site key and sealed Siteverify secret;
+/// `None` when no challenge is configured.
+///
+/// # Errors
+/// Returns [`SqlError::Query`] when the read fails.
+pub async fn signup_challenge(pool: &OperatorPool) -> Result<Option<(String, Vec<u8>)>, SqlError> {
+    sqlx::query_as::<_, (Option<String>, Option<Vec<u8>>)>(
+        "SELECT signup_challenge_site_key, signup_challenge_secret FROM platform.login_settings",
+    )
+    .fetch_one(pool.pool())
+    .await
+    .map(|(key, secret)| key.zip(secret))
+    .map_err(SqlError::from)
 }
 
 /// Read the deployment login settings.
@@ -280,7 +297,8 @@ pub struct LoginSettingsRow {
 /// Returns [`SqlError::Query`] when the read fails, including a missing row.
 pub async fn login_settings(pool: &OperatorPool) -> Result<LoginSettingsRow, SqlError> {
     sqlx::query_as::<_, LoginSettingsRow>(
-        "SELECT password_enabled, signup_enabled, signup_workspace_cap
+        "SELECT password_enabled, signup_enabled, signup_workspace_cap,
+                signup_challenge_site_key
            FROM platform.login_settings",
     )
     .fetch_one(pool.pool())
@@ -290,20 +308,32 @@ pub async fn login_settings(pool: &OperatorPool) -> Result<LoginSettingsRow, Sql
 
 /// Replace the deployment login settings on `conn`.
 ///
+/// A signup challenge without `sealed_secret` keeps the stored secret; no
+/// site key clears both.
+///
 /// # Errors
-/// Returns [`SqlError::Query`] when the write fails.
+/// Returns [`SqlError::Query`] when the write fails, including a check
+/// violation for a site key that would have no secret.
 pub async fn put_login_settings(
     conn: &mut TenantConn<'_>,
-    settings: LoginSettingsRow,
+    settings: &LoginSettingsRow,
+    sealed_secret: Option<&[u8]>,
 ) -> Result<(), SqlError> {
     sqlx::query(
         "UPDATE platform.login_settings
             SET password_enabled = $1, signup_enabled = $2,
-                signup_workspace_cap = $3, updated_at = now()",
+                signup_workspace_cap = $3,
+                signup_challenge_site_key = $4,
+                signup_challenge_secret = CASE
+                    WHEN $4 IS NULL THEN NULL
+                    ELSE coalesce($5, signup_challenge_secret) END,
+                updated_at = now()",
     )
     .bind(settings.password_enabled)
     .bind(settings.signup_enabled)
     .bind(settings.signup_workspace_cap)
+    .bind(settings.signup_challenge_site_key.as_deref())
+    .bind(sealed_secret)
     .execute(&mut **conn.transaction())
     .await
     .map(|_| ())

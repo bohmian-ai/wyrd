@@ -21,6 +21,7 @@ pub mod jwks;
 pub mod registry;
 pub mod relying_party;
 pub mod screening;
+pub mod turnstile;
 
 pub use claims::{MappedClaims, map_claims};
 pub use config::IssuerConfigResolver;

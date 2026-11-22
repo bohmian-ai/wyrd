@@ -250,7 +250,9 @@ mod tests {
     use wyrd_testing::release_server::{HostLoad, PEAK_SAMPLE_INTERVAL_MS};
 
     use super::dispatch;
+    use crate::cases::Category;
     use crate::levels::{self, Context};
+    use crate::sweep;
     use crate::{gateway, query, verification};
 
     /// The host the test declarations measure on.
@@ -533,6 +535,66 @@ mod tests {
                 repetition.set("wire_bytes", Reading::exact(40.0 * 1_048_576.0 * cpu));
             }
         })
+    }
+
+    /// Every registered L1 case is a measured step its engine declares when
+    /// the case's own plan arguments select it; narrowing keeps exactly that
+    /// step and the criteria judging it on the case clock, the declaration
+    /// admits work, and the same case narrows to the same declaration
+    /// however often it is resolved.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a registered case is undeclared or narrows differently.
+    #[test]
+    fn registered_cases_narrow_to_their_engine_declarations() {
+        let root = repository();
+        for category in Category::ALL {
+            for case in category.cases() {
+                let narrowed = || {
+                    let arguments = case.plan_arguments(&[]);
+                    let rest: Vec<&str> = arguments[1..].iter().map(String::as_str).collect();
+                    let mut declaration =
+                        declare(category.engine(), Level::One, &rest, HOST, &root);
+                    sweep::narrow(&mut declaration, case.id, false).expect("narrows");
+                    if let Some(timing) = declaration.controls.get_mut("timing") {
+                        timing["timer_resolution_ns"] = json!("measured on this host");
+                    }
+                    declaration
+                };
+                let declaration = narrowed();
+                assert_eq!(
+                    declaration
+                        .steps
+                        .iter()
+                        .map(|step| step.id.as_str())
+                        .collect::<Vec<_>>(),
+                    [case.id],
+                    "{}",
+                    case.selector()
+                );
+                assert_eq!(declaration.experiment, case.family, "{}", case.selector());
+                assert_eq!(declaration.timing, Level::case_timing());
+                assert_eq!(declaration.selection, None);
+                assert!(
+                    declaration
+                        .criteria
+                        .iter()
+                        .all(|criterion| criterion.steps == [case.id]),
+                    "{}",
+                    case.selector()
+                );
+                assert!(
+                    declaration.refusals().is_empty(),
+                    "{}: {:?}",
+                    case.selector(),
+                    declaration.refusals()
+                );
+                assert_eq!(declaration, narrowed(), "{}", case.selector());
+            }
+        }
+        let mut undeclared = declare(Engine::Gateway, Level::One, &[], HOST, &root);
+        assert!(sweep::narrow(&mut undeclared, "point-c1", false).is_err());
     }
 
     /// V10: each engine's default L1 declaration is complete, uses the

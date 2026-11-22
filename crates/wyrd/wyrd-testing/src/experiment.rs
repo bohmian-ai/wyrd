@@ -3568,8 +3568,19 @@ impl Record {
     /// # Errors
     ///
     /// Returns a message when the runs are of different engines,
-    /// experiments, or levels, or either is not VALID.
+    /// experiments, or levels, either is not VALID, or either was measured
+    /// under the L1 case protocol, whose comparison methodology is not yet
+    /// defined.
     pub fn compare(&self, after: &Self) -> Result<String, String> {
+        if [self, after]
+            .iter()
+            .any(|record| record.lifecycle.is_some())
+        {
+            return Err(
+                "an L1 case-protocol record is not comparable with this reader, which compares schema-3 experiment records"
+                    .to_owned(),
+            );
+        }
         if (self.engine, &self.experiment, self.level)
             != (after.engine, &after.experiment, after.level)
         {
@@ -4361,7 +4372,7 @@ mod tests {
     use std::time::Duration;
 
     use async_trait::async_trait;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use tokio_util::sync::CancellationToken;
 
     use super::{
@@ -6334,7 +6345,11 @@ Overloaded: do not compare languages here.
                 reading.is_present() && reading.rank.is_some(),
                 "{id}: {reading:?}"
             );
-            assert_eq!(rebuilt.reading(id), reading, "{id}");
+            assert_eq!(
+                rebuilt.reading(id).bare(),
+                reading,
+                "{id}: a schema-3 record keeps no window histogram"
+            );
         }
         assert_eq!(window.reconciliation, stored.reconciliation);
         assert_eq!(stored.reconciliation[0].recorded, 2);
@@ -7124,5 +7139,440 @@ Overloaded: do not compare languages here.
         }))
         .expect("an old note");
         assert_eq!((old.mode, old.roles.len()), (None, 0));
+    }
+
+    /// The representative declaration narrowed to its `op-64` case on the
+    /// L1 case clock, as a sweep's case process declares one case.
+    fn case_declaration() -> Declaration {
+        let mut declaration = declaration();
+        declaration.steps.retain(|step| step.id == "op-64");
+        declaration
+            .criteria
+            .retain(|criterion| criterion.steps.iter().any(|step| step == "op-64"));
+        for criterion in &mut declaration.criteria {
+            criterion.steps = vec!["op-64".to_owned()];
+        }
+        declaration.timing = Level::case_timing();
+        declaration
+    }
+
+    /// A window of `ops` operations over `seconds` on `cpu` server
+    /// CPU-seconds, with a p99 read from `latencies` nanoseconds.
+    fn window(ops: f64, seconds: f64, cpu: Option<f64>, latencies: &[u64]) -> Repetition {
+        let mut repetition = Repetition {
+            seconds,
+            server_cpu_seconds: cpu,
+            ..good()
+        };
+        repetition.set("ops", Reading::exact(ops));
+        let distribution =
+            wyrd_benchmark::Distribution::of_durations(latencies).expect("durations");
+        repetition.set(
+            "p99_ms",
+            Reading::quantile(&distribution, 0.99, crate::capacity::NANOS_PER_MS),
+        );
+        repetition
+    }
+
+    /// `count` latencies of `nanos` each.
+    fn samples(count: usize, nanos: u64) -> Vec<u64> {
+        vec![nanos; count]
+    }
+
+    /// A case's aggregate divides summed work by summed seconds and CPU,
+    /// never averaging window ratios, pools the windows' histograms for its
+    /// percentile with their combined sample count and bucket bounds, and
+    /// leaves a reading missing, never zero, when a window lacks CPU, work
+    /// or a kept histogram.
+    #[test]
+    fn case_aggregates_sum_windows_and_pool_histograms() {
+        let metrics = declaration().metrics;
+        let windows = [
+            window(100.0, 10.0, Some(1.0), &samples(1_000, 1_000_000)),
+            window(1_000.0, 30.0, Some(4.0), &samples(10, 100_000_000)),
+            window(10.0, 20.0, Some(0.5), &samples(1_000, 2_000_000)),
+        ];
+        let aggregate = Repetition::aggregate(&metrics, &windows);
+        assert_eq!(aggregate.seconds, 60.0);
+        assert_eq!(aggregate.server_cpu_seconds, Some(5.5));
+        assert_eq!(aggregate.reading("ops").value, Some(1_110.0));
+        let per_cpu = aggregate.reading("ops_per_cpu_s").value.expect("per cpu");
+        assert!((per_cpu - 1_110.0 / 5.5).abs() < 1e-9, "{per_cpu}");
+        let mean_of_ratios = (100.0 / 1.0 + 1_000.0 / 4.0 + 10.0 / 0.5) / 3.0;
+        assert!(
+            (per_cpu - mean_of_ratios).abs() > 10.0,
+            "never an average of ratios"
+        );
+        let pooled = aggregate.reading("p99_ms");
+        let mut all = samples(1_000, 1_000_000);
+        all.extend(samples(10, 100_000_000));
+        all.extend(samples(1_000, 2_000_000));
+        let expected = Reading::quantile(
+            &wyrd_benchmark::Distribution::of_durations(&all).expect("all"),
+            0.99,
+            crate::capacity::NANOS_PER_MS,
+        );
+        assert_eq!(pooled, expected);
+        assert_eq!(pooled.samples, Some(2_010));
+        assert_eq!(pooled.rank, Some(1_990));
+        assert!(
+            pooled.value.is_some_and(|value| value < 3.0),
+            "pooled, not the mean of window p99s: {pooled:?}"
+        );
+        let mut lost = windows.clone();
+        lost[1].server_cpu_seconds = None;
+        let aggregate = Repetition::aggregate(&metrics, &lost);
+        assert_eq!(aggregate.server_cpu_seconds, None);
+        assert!(!aggregate.reading("ops_per_cpu_s").is_present());
+        assert!(aggregate.reading("ops_per_cpu_s").reason.is_some());
+        let mut unread = windows.clone();
+        unread[2].set("ops", Reading::missing("the counter reset"));
+        assert!(
+            Repetition::aggregate(&metrics, &unread)
+                .reading("ops")
+                .reason
+                .is_some_and(
+                    |reason| reason.contains("window 3") && reason.contains("the counter reset")
+                )
+        );
+        let mut bare = windows;
+        bare[0].set("p99_ms", Reading::exact(1.0).with_samples(1_000));
+        let unpooled = Repetition::aggregate(&metrics, &bare).reading("p99_ms");
+        assert!(!unpooled.is_present());
+        assert_eq!(
+            unpooled.reason.as_deref(),
+            Some("window 1 kept no histogram to pool")
+        );
+    }
+
+    /// A workload whose every call admits for its window, then drains for
+    /// `drain`, recording when each call started and returned.
+    struct Draining {
+        /// The repetition each call returns.
+        repetition: Repetition,
+        /// The paused-clock drain after each window.
+        drain: Duration,
+        /// How long prepare takes.
+        setup: Duration,
+        /// Each call's start and return.
+        calls: Arc<Mutex<Vec<(tokio::time::Instant, tokio::time::Instant)>>>,
+    }
+
+    #[async_trait]
+    impl Workload for Draining {
+        async fn prepare(&mut self) -> Result<(), ExperimentError> {
+            tokio::time::sleep(self.setup).await;
+            Ok(())
+        }
+
+        fn processes(&self) -> Vec<u32> {
+            vec![std::process::id()]
+        }
+
+        async fn measure(
+            &mut self,
+            _: &Step,
+            _: Phase,
+            window: Duration,
+        ) -> Result<Repetition, ExperimentError> {
+            let opened = tokio::time::Instant::now();
+            tokio::time::sleep(window + self.drain).await;
+            self.calls
+                .lock()
+                .expect("calls")
+                .push((opened, tokio::time::Instant::now()));
+            Ok(self.repetition.clone())
+        }
+
+        async fn finish(&mut self) -> Result<(), ExperimentError> {
+            Ok(())
+        }
+
+        async fn outstanding(&mut self) -> Result<Option<Value>, ExperimentError> {
+            Ok(Some(json!({ "staged_members": 0 })))
+        }
+    }
+
+    /// Runs the case declaration over a [`Draining`] workload that drains
+    /// `drain` after each window and prepares in `setup`, `spent` setup
+    /// already used, and returns the record and each call's span.
+    async fn case_run(
+        drain: Duration,
+        setup: Duration,
+        spent: Duration,
+    ) -> (Record, Vec<(tokio::time::Instant, tokio::time::Instant)>) {
+        let directory = tempfile::tempdir().expect("artifacts");
+        let calls = Arc::default();
+        let mut workload = Draining {
+            repetition: window(1_000.0, 30.0, Some(3.0), &samples(2_000, 300_000)),
+            drain,
+            setup,
+            calls: Arc::clone(&calls),
+        };
+        let options = Options {
+            setup_spent: spent,
+            ..options(directory.path())
+        };
+        let mut samples = VecDeque::from([Some(quiet()), Some(quiet())]);
+        let record = run(
+            case_declaration().seal(),
+            &mut workload,
+            move |_| std::future::ready(samples.pop_front().flatten()),
+            &options,
+        )
+        .await;
+        let calls = calls.lock().expect("calls").clone();
+        (record, calls)
+    }
+
+    /// On the case clock a case warms up once, measures three fixed 30 s
+    /// windows whatever window its step declares, drains each window before
+    /// the next opens, charges every drain to the one shared drain
+    /// allowance, keeps its owned processes and outstanding work, and is
+    /// INVALID when a drain or its setup overruns an allowance, with the
+    /// phase named; nothing extends an allowance.
+    #[tokio::test(start_paused = true)]
+    async fn case_clock_charges_shared_allowances_and_invalidates_overruns() {
+        let (record, calls) = case_run(
+            Duration::from_secs(5),
+            Duration::from_secs(10),
+            Duration::from_secs(20),
+        )
+        .await;
+        assert_eq!(record.verdict, Verdict::Valid, "{:?}", record.reasons);
+        assert_eq!(calls.len(), 4, "a warmup and three windows");
+        for pair in calls.windows(2) {
+            assert!(
+                pair[1].0 >= pair[0].1,
+                "a window opens only after the last drained"
+            );
+        }
+        let lifecycle = record.lifecycle.as_ref().expect("a case lifecycle");
+        assert_eq!(lifecycle.allowances, super::Allowances::L1);
+        assert_eq!(lifecycle.allowances.total(), 590);
+        assert!(
+            (lifecycle.setup_seconds - 30.0).abs() < 0.01,
+            "{}",
+            lifecycle.setup_seconds
+        );
+        assert!((lifecycle.warmup_seconds - 30.0).abs() < 0.01);
+        assert!((lifecycle.measurement_seconds - 90.0).abs() < 0.01);
+        assert!(
+            (lifecycle.drain_seconds - 20.0).abs() < 0.01,
+            "{}",
+            lifecycle.drain_seconds
+        );
+        assert_eq!(
+            lifecycle
+                .windows
+                .iter()
+                .map(|window| window.phase.as_str())
+                .collect::<Vec<_>>(),
+            ["warmup", "repetition-1", "repetition-2", "repetition-3"]
+        );
+        assert!(
+            lifecycle
+                .windows
+                .iter()
+                .all(|window| (window.drained_seconds - 5.0).abs() < 0.01)
+        );
+        assert_eq!(lifecycle.owned.len(), 1);
+        assert_eq!(lifecycle.owned[0].pid, std::process::id());
+        assert!(lifecycle.owned[0].alive());
+        assert_eq!(lifecycle.outstanding, Some(json!({ "staged_members": 0 })));
+        assert_eq!(record.steps[0].timing.repetition_seconds, 30);
+
+        let (overrun, calls) =
+            case_run(Duration::from_secs(40), Duration::ZERO, Duration::ZERO).await;
+        assert_eq!(overrun.verdict, Verdict::Invalid);
+        assert_eq!(
+            calls.len(),
+            3,
+            "the fourth call ran out of shared drain allowance"
+        );
+        assert!(
+            codes(&overrun).contains(&"phase.deadline"),
+            "{:?}",
+            overrun.reasons
+        );
+        assert!(
+            overrun
+                .reasons
+                .iter()
+                .any(|reason| reason.message.contains("drain and capture allowance")),
+            "{:?}",
+            overrun.reasons
+        );
+        let drained = overrun.lifecycle.as_ref().expect("lifecycle").drain_seconds;
+        assert!(drained >= 150.0 && drained < 151.0, "{drained}");
+
+        let (late, calls) = case_run(
+            Duration::ZERO,
+            Duration::from_secs(30),
+            Duration::from_secs(220),
+        )
+        .await;
+        assert_eq!(late.verdict, Verdict::Invalid);
+        assert!(calls.is_empty(), "nothing is measured after setup overran");
+        assert!(
+            late.reasons
+                .iter()
+                .any(|reason| reason.code == "phase.deadline" && reason.message.contains("setup"))
+        );
+        let setup = late.lifecycle.as_ref().expect("lifecycle").setup_seconds;
+        assert!(
+            (setup - 240.0).abs() < 0.01,
+            "the deadline never extends setup: {setup}"
+        );
+
+        let (spent, _) = case_run(Duration::ZERO, Duration::ZERO, Duration::from_secs(250)).await;
+        assert_eq!(spent.verdict, Verdict::Invalid);
+        assert!(
+            spent
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "phase.overrun"
+                    && reason.message.contains("setup took 250.0s")),
+            "{:?}",
+            spent.reasons
+        );
+    }
+
+    /// A case's targets judge the same pooled aggregate its summary shows:
+    /// two fast windows and one slow one miss the p99 target although the
+    /// median window meets it, and the record stays VALID; a window under
+    /// its sample floor or failing a correctness check is INVALID instead.
+    #[tokio::test(start_paused = true)]
+    async fn case_targets_judge_aggregates_apart_from_validity() {
+        let fast = window(1_000.0, 30.0, Some(3.0), &samples(2_000, 300_000));
+        let slow = window(1_000.0, 30.0, Some(3.0), &samples(2_000, 900_000));
+        let judged = |windows: Vec<Repetition>| async move {
+            let directory = tempfile::tempdir().expect("artifacts");
+            let mut script: VecDeque<Result<Repetition, String>> =
+                std::iter::once(Ok(windows[0].clone()))
+                    .chain(windows.into_iter().map(Ok))
+                    .collect();
+            script.push_back(Err("exhausted".to_owned()));
+            let mut workload = Scripted {
+                script,
+                ..Scripted::always(&good())
+            };
+            execute(
+                case_declaration(),
+                &mut workload,
+                [Some(quiet()), Some(quiet())],
+                &options(directory.path()),
+            )
+            .await
+        };
+        let missed = judged(vec![fast.clone(), fast.clone(), slow.clone()]).await;
+        assert_eq!(missed.verdict, Verdict::Valid, "{:?}", missed.reasons);
+        let step = &missed.steps[0];
+        let slo = step
+            .criteria
+            .iter()
+            .find(|judgment| judgment.criterion == "overhead-slo")
+            .expect("judged");
+        assert_eq!(slo.outcome, Some(Outcome::Missed), "{slo:?}");
+        assert_eq!(
+            slo.observed,
+            step.aggregate
+                .as_ref()
+                .expect("aggregate")
+                .reading("p99_ms")
+                .bare()
+        );
+        assert_eq!(slo.observed.samples, Some(6_000));
+        assert!(
+            slo.reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("aggregate "))
+        );
+        assert!(
+            step.summary["p99_ms"]
+                .median
+                .value
+                .is_some_and(|value| value < 0.5),
+            "the median window meets it"
+        );
+        assert!(
+            slo.values.iter().all(|value| value.pool.is_none()),
+            "judgments repeat no histogram"
+        );
+        assert!(
+            step.repetitions
+                .iter()
+                .all(|window| window.reading("p99_ms").pool.is_some()),
+            "windows keep theirs"
+        );
+
+        let met = judged(vec![fast.clone(), fast.clone(), fast.clone()]).await;
+        assert_eq!(
+            met.steps[0]
+                .criteria
+                .iter()
+                .find(|j| j.criterion == "overhead-slo")
+                .and_then(|j| j.outcome),
+            Some(Outcome::Met)
+        );
+
+        let short = window(1_000.0, 30.0, Some(3.0), &samples(500, 300_000));
+        let floor = judged(vec![fast.clone(), short, fast.clone()]).await;
+        assert_eq!(floor.verdict, Verdict::Invalid);
+        assert!(codes(&floor).contains(&"criterion.invalid"));
+
+        let mut wrong = fast.clone();
+        wrong.set("errors", Reading::count(1));
+        let integrity = judged(vec![fast.clone(), wrong, fast]).await;
+        assert_eq!(integrity.verdict, Verdict::Invalid);
+        assert!(
+            integrity
+                .reasons
+                .iter()
+                .any(|reason| reason.criterion.as_deref() == Some("no-errors"))
+        );
+    }
+
+    /// Records outside the case protocol drop the kept window histograms
+    /// and carry no lifecycle, and a case-protocol record is refused by the
+    /// schema-3 comparison reader.
+    #[tokio::test(start_paused = true)]
+    async fn legacy_records_keep_their_protocol_boundary() {
+        let directory = tempfile::tempdir().expect("artifacts");
+        let fast = window(1_000.0, 30.0, Some(3.0), &samples(2_000, 300_000));
+        let mut workload = Scripted::always(&fast);
+        let legacy = execute(
+            declaration(),
+            &mut workload,
+            [Some(quiet()), Some(quiet())],
+            &options(directory.path()),
+        )
+        .await;
+        assert_eq!(legacy.lifecycle, None);
+        assert!(legacy.steps.iter().all(|step| step.aggregate.is_none()));
+        assert!(
+            legacy
+                .steps
+                .iter()
+                .flat_map(|step| &step.repetitions)
+                .all(|window| window
+                    .metrics
+                    .values()
+                    .all(|reading| reading.pool.is_none()))
+        );
+        assert_eq!(
+            Record::parse(&serde_json::to_string(&legacy).expect("json")).expect("reads"),
+            legacy
+        );
+        let (case, _) = case_run(Duration::ZERO, Duration::ZERO, Duration::ZERO).await;
+        let reread = Record::parse(&serde_json::to_string(&case).expect("json")).expect("reads");
+        assert_eq!(reread, case);
+        assert!(
+            legacy
+                .compare(&case)
+                .expect_err("refused")
+                .contains("L1 case-protocol")
+        );
+        assert!(case.compare(&case).is_err());
     }
 }

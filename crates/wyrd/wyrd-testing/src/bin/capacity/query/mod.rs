@@ -1,4 +1,4 @@
-//! The Bifrost engine's experiments, run through `mise run bench:l1:bifrost`
+//! The Bifrost engine's experiments, run through `mise run benchmark:l1:bifrost`
 //! and `mise run bench:l2:bifrost`.
 //!
 //! Both read as the production journey they measure. One release
@@ -1236,6 +1236,7 @@ pub fn calibrate(
                     == Some(&limits(&PARQUET_ENV, shard_override().as_deref()))
                 && record.validity.reasons.is_empty()
                 && record.mode == Mode::Full
+                && record.lifecycle.is_none()
         })
         .collect();
     compatible.sort_by_key(|record| std::cmp::Reverse(record.started_at));
@@ -1270,7 +1271,7 @@ pub fn calibrate(
         })
         .ok_or_else(|| {
             format!(
-                "no compatible valid L1 `writes-parquet` record measures every write path: {} records read, {} compatible; run `mise run bench:l1:bifrost:writes:parquet` (or `bench:l1:bifrost:writes`) on this host and build first",
+                "no compatible valid historical schema-3 L1 `writes-parquet` record measures every write path: {} records read, {} compatible; L1 case-protocol records never calibrate L2",
                 records.len(),
                 compatible.len()
             )

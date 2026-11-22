@@ -73,6 +73,8 @@ pub struct Sweep {
     pub root: PathBuf,
     /// The sweep's start stamp, which names its Compose projects.
     pub stamp: String,
+    /// The `capacity` program each case process runs: this binary.
+    pub program: PathBuf,
 }
 
 impl Sweep {
@@ -98,6 +100,7 @@ impl Sweep {
             invocation: invocation.to_vec(),
             root: root.to_path_buf(),
             stamp,
+            program: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("capacity")),
         }
     }
 
@@ -272,7 +275,7 @@ impl Sweep {
         command
             .current_dir(&self.root)
             .arg("--")
-            .arg(std::env::current_exe().unwrap_or_else(|_| PathBuf::from("capacity")))
+            .arg(&self.program)
             .args([
                 "case",
                 self.category.name(),

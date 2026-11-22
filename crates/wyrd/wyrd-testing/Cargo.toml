@@ -152,9 +152,9 @@ rmcp = { workspace = true, features = [
     "transport-streamable-http-client-reqwest",
 ] }
 
-# The opt-in benchmark experiments. Run only through `mise run bench:l1*` and
-# `mise run bench:l2:*`; only their unit tests run in a lane, with the crate's
-# other tests.
+# The opt-in benchmark experiments. Run only through `mise run benchmark:l1:*`
+# and `mise run bench:l2:*`; only their unit tests run in a lane, with the
+# crate's other tests, and their sweep smoke in `test:benchmark:l1`.
 [[bin]]
 name = "capacity"
 path = "src/bin/capacity/main.rs"

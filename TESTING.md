@@ -169,8 +169,10 @@ mise run test:rust                       # full Rust aggregate
 lane instead; Bifrost-only pull requests run `verify:bifrost`.
 
 Performance is measured by opt-in benchmark experiments, never by a test lane,
-`gate`, or CI: `mise run bench:l1` (or `bench:l1:<engine>`) and
+`gate`, or CI: `mise run benchmark:l1:<category>` and
 `mise run bench:l2:<engine>` for `bifrost`, `verification`, and `gateway`.
+`mise run test:benchmark:l1` is the harness lane for the L1 sweep path: short
+smoke sweeps that check workflow and evidence integrity, never performance.
 `benchmarks/README.md` explains levels, verdicts, records, baselines, and
 how reviewed same-method references are qualified and promoted.
 

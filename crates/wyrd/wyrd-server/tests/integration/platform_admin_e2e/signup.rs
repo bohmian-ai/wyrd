@@ -2,10 +2,12 @@
 //! creation, against a real server and repository Postgres.
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use serde_json::{Value, json};
+use wyrd_crypt::{SealingKeyring, SecretKey};
 use wyrd_testing::WyrdTestServer;
 
 use super::{
@@ -21,8 +23,23 @@ const INGRESS: &str = "10.0.0.0/8";
 /// The header that ingress names the visitor in.
 const CLIENT_HEADER: &str = "CF-Connecting-IP";
 
+/// The sealing write key every journey server starts with.
+const OLD_KEY: [u8; 32] = [9; 32];
+
+/// The sealing key a rotation switches to.
+const NEW_KEY: [u8; 32] = [10; 32];
+
+/// A keyring writing under `write` that retains `retained`.
+fn keyring(write: [u8; 32], retained: [u8; 32]) -> Arc<SealingKeyring> {
+    Arc::new(
+        SealingKeyring::new(SecretKey::from_bytes(write))
+            .with_retained(SecretKey::from_bytes(retained)),
+    )
+}
+
 /// A server behind [`INGRESS`] with Google enabled for signup, and its
-/// operator session.
+/// operator session. Its keyring writes under [`OLD_KEY`] and already
+/// retains [`NEW_KEY`], the first step of a documented rotation.
 ///
 /// # Panics
 /// Panics when the server, operator session or provider setup fails.
@@ -48,6 +65,7 @@ async fn signup_server_with(
     let srv = WyrdTestServer::builder()
         .with_social_endpoints_for_test(social)
         .with_trusted_ingress_for_test(&[INGRESS], CLIENT_HEADER)
+        .with_sealing_keyring(keyring(OLD_KEY, NEW_KEY))
         .start_in_process()
         .await
         .expect("server starts");
@@ -328,7 +346,7 @@ async fn complete_from(
 /// equal to `details.retry_after_seconds`:
 ///   1. the start source window;
 ///   2. the completion identity window;
-///   3. the completion source window;
+///   3. the completion source window, for a provider or a local proof;
 ///   4. unavailable admission state refuses start rather than admitting it.
 ///
 /// # Panics
@@ -337,7 +355,7 @@ async fn complete_from(
 #[tokio::test(flavor = "multi_thread")]
 async fn every_signup_throttle_carries_retry_after() {
     let google = wiremock::MockServer::start().await;
-    let (srv, _session) = signup_server(&google).await;
+    let (srv, session) = signup_server(&google).await;
     let taken = srv.pg_fixture().tenant_slug().to_owned();
 
     // 1. Start.
@@ -378,11 +396,29 @@ async fn every_signup_throttle_carries_retry_after() {
     let (headers, body) = source_throttle.expect("the source window is exhausted");
     stated_wait(&headers, &body);
 
-    // 4. Unavailable admission state refuses start.
+    // 3b. A local completion from that visitor is refused too, and claims
+    // nothing.
+    let api = relay_to_mailpit(&srv, &session).await;
+    let address = format!("throttled-{}@example.test", uuid::Uuid::new_v4().simple());
+    let (local, _) = email_proof(&srv, &api, &address, "198.51.100.22").await;
+    let (status, cookie, body) = complete_with(
+        &srv,
+        &local,
+        "198.51.100.22",
+        &json!({ "slug": "throttled-local", "display_name": "Throttled", "local_credentials": {
+            "username": "ada", "password": "quiet harbor lantern" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["code"], "WYRD_AUTH_429_SIGNUP_ATTEMPTS", "{body}");
+    assert!(cookie.is_none());
     let superuser = srv
         .pg_fixture()
         .superuser_pool()
         .expect("superuser pool opens");
+    assert!(statuses(&superuser, "throttled-local").await.is_empty());
+
+    // 4. Unavailable admission state refuses start.
     sqlx::query("ALTER TABLE platform.signup_admissions RENAME TO signup_admissions_down")
         .execute(&superuser)
         .await
@@ -807,7 +843,8 @@ async fn email_signup_proves_a_mailbox_in_the_browser_that_asked() {
         &start,
     )
     .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["code"], "WYRD_AUTH_403_METHOD_UNAVAILABLE", "{body}");
     assert!(cookie.is_none());
     assert!(
         mail_to(&api, &canonical).await.is_empty(),
@@ -958,6 +995,45 @@ async fn email_signup_proves_a_mailbox_in_the_browser_that_asked() {
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
 
+    // 5b. Once the completion window ends, cleanup keeps the spent proof for
+    // as long as its email link lives, so the asking browser replaying it
+    // gains no new completion; only later does cleanup remove it.
+    let social = srv
+        .state()
+        .auth
+        .social_sign_in
+        .as_ref()
+        .expect("social sign-in is built");
+    let expire = |ago: &'static str| {
+        sqlx::query(
+            "UPDATE platform.signup_attempts
+                SET expires_at = statement_timestamp() - $1::interval",
+        )
+        .bind(ago)
+        .execute(&superuser)
+    };
+    expire("1 second").await.expect("the completion window ends");
+    while social.purge_expired_signups().await.expect("purge runs") > 0 {}
+    let (status, replayed, body) = email_step(
+        &srv,
+        "/auth/signup/verify",
+        "198.51.100.70",
+        Some(&flow),
+        "wyrd_signup",
+        &verify(&proof),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert!(replayed.is_none(), "a spent proof yields no completion");
+    assert_eq!(
+        count(&superuser, attempts).await,
+        1,
+        "the spent proof outlives its completion window"
+    );
+    expire("11 minutes").await.expect("the email link has expired too");
+    while social.purge_expired_signups().await.expect("purge runs") > 0 {}
+    assert_eq!(count(&superuser, attempts).await, 0, "then cleanup removes it");
+
     // 6. The address's budget holds across sources, before SMTP.
     let mut admitted = 2;
     let throttled = loop {
@@ -1082,14 +1158,18 @@ async fn statuses(superuser: &sqlx::PgPool, slug: &str) -> Vec<String> {
 ///   3. an email proof with credentials creates an active workspace whose
 ///      local User is its administrator, signs it in with a password
 ///      session, and clears the attempt's email;
-///   4. replaying the spent completion names the same workspace, opens no
-///      session and creates nothing; a resumed creation retried under
-///      another username keeps the one original administrator;
+///   4. repeating the successful completion returns the same workspace,
+///      opens no session and creates nothing; a resumed creation retried
+///      under another username keeps the one original administrator;
 ///   5. a claim interrupted in `creating` beyond the two-minute staleness bound resumes
 ///      under its own tenant id only with its own completion cookie; another
 ///      proof cannot adopt it, and a recent one still reads as in progress;
 ///   6. an expired proof cannot restart its interrupted claim, which stays
-///      unactivated.
+///      unactivated;
+///   7. operator creation of that slug cannot adopt the expired signup
+///      claim, stale or failed, before or after its attempt is purged;
+///   8. removing the mail relay refuses new email starts but not a proof
+///      already delivered: it still verifies and completes.
 ///
 /// # Panics
 /// Panics when a completion creates, refuses or resumes differently.
@@ -1178,13 +1258,22 @@ async fn completion_consumes_either_proof_and_recovers_its_own_claim() {
     .expect("attempt reads");
     assert_eq!(cleared, [("completed".to_owned(), None)]);
 
-    // 4. A replay names the same workspace and creates nothing.
+    // 4. Repeating the successful completion, as after a lost response,
+    // returns the same workspace and creates nothing.
     let (status, again, body) =
         complete_with(&srv, &local, "198.51.100.90", &named(credentials.clone())).await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(body["details"]["tenant"], "harbor", "{body}");
-    assert!(again.is_none(), "a replay opens no session");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, json!({ "tenant": "harbor" }));
+    assert!(again.is_none(), "the creator signs in; a retry opens no session");
     assert_eq!(statuses(&superuser, "harbor").await, ["active"]);
+    let admins: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM wyrd.auth_users u JOIN platform.tenants t
+             ON t.data_tenant_id = u.data_tenant_id WHERE t.slug = 'harbor'",
+    )
+    .fetch_one(&superuser)
+    .await
+    .expect("users count");
+    assert_eq!(admins, 1, "one administrator");
 
     // 4b. A retry under another username keeps the original administrator.
     sqlx::query(
@@ -1308,6 +1397,107 @@ async fn completion_consumes_either_proof_and_recovers_its_own_claim() {
         ["provisioning"],
         "never active ownerless"
     );
+
+    // 7. Operator creation cannot adopt the expired signup claim.
+    for (case, stage, status) in [
+        ("stale provisioning", "SELECT 1", "provisioning"),
+        (
+            "failed",
+            "UPDATE platform.tenants SET status = 'failed',
+                    provisioning_failed_reason = 'interrupted' WHERE slug = 'finn'",
+            "failed",
+        ),
+        (
+            "failed after purge",
+            "DELETE FROM platform.signup_attempts WHERE subject = 'google-finn'",
+            "failed",
+        ),
+        (
+            "stale provisioning after purge",
+            "UPDATE platform.tenants SET status = 'provisioning', provisioning_failed_reason = NULL,
+                    updated_at = now() - interval '20 minutes' WHERE slug = 'finn'",
+            "provisioning",
+        ),
+    ] {
+        sqlx::raw_sql(stage).execute(&superuser).await.expect(case);
+        let (code, body) = social_call(
+            &srv,
+            social_request(
+                Method::POST,
+                "/platform/tenants",
+                Some(&session),
+                Some(json!({ "slug": "finn", "display_name": "Finn" })),
+            ),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CONFLICT, "{case}: {body}");
+        assert_eq!(statuses(&superuser, "finn").await, [status], "{case}");
+        let owners: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM wyrd.auth_users u JOIN platform.tenants t
+                 ON t.data_tenant_id = u.data_tenant_id WHERE t.slug = 'finn'",
+        )
+        .fetch_one(&superuser)
+        .await
+        .expect("users count");
+        assert_eq!(owners, 0, "{case}: no operator owner was initialized");
+    }
+
+    // 8. Removing the relay withdraws new email starts, not a delivered proof.
+    let late = format!("late-{}@example.test", uuid::Uuid::new_v4().simple());
+    let start = json!({ "method": "email", "email": late });
+    let (status, flow, body) = email_step(
+        &srv,
+        "/auth/signup",
+        "198.51.100.95",
+        None,
+        "wyrd_signup_email",
+        &start,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let flow = flow.expect("flow cookie");
+    let flow = flow.split(';').next().expect("pair");
+    let (proof, _) = mailed_proof(&api, &late).await;
+    sqlx::query(
+        "UPDATE platform.login_settings
+            SET smtp_host = NULL, smtp_port = NULL, smtp_tls = NULL, smtp_username = NULL,
+                smtp_password_enc = NULL, smtp_sender = NULL",
+    )
+    .execute(&superuser)
+    .await
+    .expect("the relay is removed");
+    let (status, _, body) = email_step(
+        &srv,
+        "/auth/signup",
+        "198.51.100.96",
+        None,
+        "wyrd_signup_email",
+        &start,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "a new start: {body}");
+    let (status, completion, body) = email_step(
+        &srv,
+        "/auth/signup/verify",
+        "198.51.100.95",
+        Some(flow),
+        "wyrd_signup",
+        &json!({ "proof": proof }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the delivered proof verifies: {body}");
+    let completion = completion.expect("completion cookie");
+    let (status, signed_in, body) = complete_with(
+        &srv,
+        completion.split(';').next().expect("pair"),
+        "198.51.100.95",
+        &json!({ "slug": "beacon", "display_name": "Beacon", "local_credentials": {
+            "username": "lin", "password": "quiet harbor lantern" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "and completes: {body}");
+    assert!(signed_in.is_some());
+    assert_eq!(statuses(&superuser, "beacon").await, ["active"]);
 }
 
 /// Complete a Google proof for `subject` as `slug` from `client`; returns
@@ -1344,10 +1534,12 @@ fn at_cap(status: StatusCode, body: &Value, case: &str) {
 ///   1. the cap is an operator login setting, default 3;
 ///   2. at the cap a new claim is refused with `403`, not `429`, and creates
 ///      nothing;
-///   3. the count survives purging the identity's attempts, and a failed
-///      claim still counts;
+///   3. the count survives purging the identity's attempts and rotating
+///      the sealing write key with the old key retained, and a failed claim
+///      still counts;
 ///   4. retiring a workspace frees capacity;
-///   5. two concurrent claims across replicas at one slot left create one;
+///   5. two concurrent claims at one slot left, across an old-key and a
+///      rotated replica, create one;
 ///   6. resuming an attempt's own claim at the cap is not a new claim;
 ///   7. an email identity at the same address is a different identity, and
 ///      operator creation is never capped.
@@ -1417,6 +1609,27 @@ async fn the_owned_workspace_cap_holds_atomically_across_purge() {
         .expect("attempts purge");
     let (status, body) = create_as(&srv, &google, "google-cap", "cap-c", "198.51.100.102").await;
     at_cap(status, &body, "after purge");
+
+    // 3b. Rotating the write key, the old key retained, keeps the count: a
+    // replica on the new key opens the old replica's proof and still refuses.
+    let rotated = srv
+        .start_replica(
+            WyrdTestServer::builder()
+                .with_trusted_ingress_for_test(&[INGRESS], CLIENT_HEADER)
+                .with_sealing_keyring(keyring(NEW_KEY, OLD_KEY)),
+        )
+        .await
+        .expect("rotated replica starts");
+    let proof = prove_signup(&srv, &google, "google-cap").await;
+    let (status, _, body) = complete_with(
+        &rotated,
+        &proof,
+        "198.51.100.109",
+        &json!({ "slug": "cap-r", "display_name": "cap-r" }),
+    )
+    .await;
+    at_cap(status, &body, "after rotation");
+    assert!(statuses(&superuser, "cap-r").await.is_empty());
     sqlx::query("UPDATE platform.tenants SET status = 'failed', provisioning_failed_reason = 'interrupted' WHERE slug = 'cap-a'")
         .execute(&superuser)
         .await
@@ -1432,20 +1645,16 @@ async fn the_owned_workspace_cap_holds_atomically_across_purge() {
     let (status, body) = create_as(&srv, &google, "google-cap", "cap-e", "198.51.100.104").await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
-    // 5. Concurrent claims across replicas at one slot create one.
-    let replica = srv
-        .start_replica(
-            WyrdTestServer::builder().with_trusted_ingress_for_test(&[INGRESS], CLIENT_HEADER),
-        )
-        .await
-        .expect("replica starts");
+    // 5. Concurrent claims at one slot, on an old-key and a rotated replica
+    // mid-rollout, create one.
+    let replica = &rotated;
     let first = prove_signup(&srv, &google, "google-race").await;
     let second = prove_signup(&srv, &google, "google-race").await;
     let race_1 = json!({ "slug": "race-1", "display_name": "Race" });
     let race_2 = json!({ "slug": "race-2", "display_name": "Race" });
     let (one, two) = tokio::join!(
         complete_with(&srv, &first, "198.51.100.105", &race_1),
-        complete_with(&replica, &second, "198.51.100.106", &race_2),
+        complete_with(replica, &second, "198.51.100.106", &race_2),
     );
     let mut outcomes = [one.0, two.0];
     outcomes.sort();

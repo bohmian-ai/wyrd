@@ -243,8 +243,9 @@ const SIGNUP_COOKIE_MAX_AGE_SECONDS: u64 = 300;
 ///
 /// # Errors
 /// `403 WYRD_AUTH_403_ORIGIN_REFUSED` without this deployment's exact
-/// `Origin`; `401 WYRD_AUTH_401_INVALID_TOKEN` when signup or the provider is
-/// not available; `503` when the provider or store is unavailable.
+/// `Origin` or `403 WYRD_AUTH_403_METHOD_UNAVAILABLE` when signup, local
+/// signup or the provider is not available; `503` when the provider or store
+/// is unavailable.
 #[utoipa::path(
     post,
     path = "/auth/signup",
@@ -258,10 +259,9 @@ const SIGNUP_COOKIE_MAX_AGE_SECONDS: u64 = 300;
           headers(("Set-Cookie" = String, description = "The `wyrd_signup_email` flow cookie"))),
         (status = 400, description = "The address is not an email address \
           (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
-        (status = 401, description = "Signup or the provider is not available \
-          (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
-        (status = 403, description = "Origin absent or foreign \
-          (WYRD_AUTH_403_ORIGIN_REFUSED)", body = WyrdProblem),
+        (status = 403, description = "Origin absent or foreign, or signup or the provider is \
+          not available (WYRD_AUTH_403_ORIGIN_REFUSED, WYRD_AUTH_403_METHOD_UNAVAILABLE)",
+          body = WyrdProblem),
         (status = 429, description = "Too many signup starts from this source \
           (WYRD_AUTH_429_SIGNUP_ATTEMPTS)", body = WyrdProblem,
           headers(("Retry-After" = u64, description = "Seconds until the window ends"))),
@@ -347,8 +347,8 @@ const SIGNUP_EMAIL_COOKIE: &str = "wyrd_signup_email";
 ///
 /// # Errors
 /// `401 WYRD_AUTH_401_ONE_TIME_CODE_INVALID` for a missing flow cookie or a
-/// wrong or spent proof; `400` once expired; `401
-/// WYRD_AUTH_401_INVALID_TOKEN` when local signup is no longer offered.
+/// wrong or spent proof; `400` once expired; `403
+/// WYRD_AUTH_403_METHOD_UNAVAILABLE` when signup or password is disabled.
 #[utoipa::path(
     post,
     path = "/auth/signup/verify",
@@ -359,11 +359,11 @@ const SIGNUP_EMAIL_COOKIE: &str = "wyrd_signup_email";
           headers(("Set-Cookie" = String, description = "The `wyrd_signup` completion cookie"))),
         (status = 400, description = "Invalid body, or the proof expired \
           (WYRD_SPEC_400_VALIDATION, WYRD_AUTH_400_INVALID_STATE)", body = WyrdProblem),
-        (status = 401, description = "No flow in this browser, a wrong or spent proof, or local \
-          signup is no longer offered (WYRD_AUTH_401_ONE_TIME_CODE_INVALID, \
-          WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
-        (status = 403, description = "Origin absent or foreign \
-          (WYRD_AUTH_403_ORIGIN_REFUSED)", body = WyrdProblem),
+        (status = 401, description = "No flow in this browser, or a wrong or spent proof \
+          (WYRD_AUTH_401_ONE_TIME_CODE_INVALID)", body = WyrdProblem),
+        (status = 403, description = "Origin absent or foreign, or signup or password is \
+          disabled (WYRD_AUTH_403_ORIGIN_REFUSED, WYRD_AUTH_403_METHOD_UNAVAILABLE)",
+          body = WyrdProblem),
         (status = 503, description = "The store is unavailable \
           (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),

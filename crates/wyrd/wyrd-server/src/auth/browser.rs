@@ -219,8 +219,8 @@ pub(crate) fn request_id(request_id: Option<Extension<RequestId>>) -> RequestId 
           headers(("Set-Cookie" = String, description = "The `wyrd_login` transaction cookie"))),
         (status = 401, description = "SSO sign-in is not available for this tenant \
           (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
-        (status = 403, description = "Origin absent or foreign \
-          (WYRD_AUTH_403_ORIGIN_REFUSED)", body = WyrdProblem),
+        (status = 403, description = "Origin absent or foreign, or the method is not offered \
+          (WYRD_AUTH_403_ORIGIN_REFUSED, WYRD_AUTH_403_METHOD_UNAVAILABLE)", body = WyrdProblem),
         (status = 503, description = "The identity provider or store is unavailable \
           (WYRD_AUTH_503_DISCOVERY_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)",
           body = WyrdProblem)
@@ -612,8 +612,8 @@ pub async fn logout(
           is taken (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The invitation is unknown, expired, revoked or used \
           (WYRD_AUTH_401_ONE_TIME_CODE_INVALID)", body = WyrdProblem),
-        (status = 403, description = "Origin absent or foreign \
-          (WYRD_AUTH_403_ORIGIN_REFUSED)", body = WyrdProblem),
+        (status = 403, description = "Origin absent or foreign, or the method is not offered \
+          (WYRD_AUTH_403_ORIGIN_REFUSED, WYRD_AUTH_403_METHOD_UNAVAILABLE)", body = WyrdProblem),
         (status = 503, description = "The store is unavailable \
           (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
@@ -656,8 +656,8 @@ pub async fn password_signup(
           headers(("Set-Cookie" = String, description = "The tenant session cookie"))),
         (status = 401, description = "Username or password not accepted \
           (WYRD_AUTH_401_PASSWORD_INVALID)", body = WyrdProblem),
-        (status = 403, description = "Origin absent or foreign \
-          (WYRD_AUTH_403_ORIGIN_REFUSED)", body = WyrdProblem),
+        (status = 403, description = "Origin absent or foreign, or the method is not offered \
+          (WYRD_AUTH_403_ORIGIN_REFUSED, WYRD_AUTH_403_METHOD_UNAVAILABLE)", body = WyrdProblem),
         (status = 429, description = "Too many failed attempts; retry after the window ends \
           (WYRD_AUTH_429_PASSWORD_ATTEMPTS)", body = WyrdProblem,
           headers(("Retry-After" = u64, description = "Seconds until the window ends"))),
@@ -710,8 +710,8 @@ pub async fn password_login(
         (status = 401, description = "No live password session for the tenant, or the current \
           password is not accepted (WYRD_AUTH_401_INVALID_TOKEN, \
           WYRD_AUTH_401_PASSWORD_INVALID)", body = WyrdProblem),
-        (status = 403, description = "Origin absent or foreign \
-          (WYRD_AUTH_403_ORIGIN_REFUSED)", body = WyrdProblem),
+        (status = 403, description = "Origin absent or foreign, or the method is not offered \
+          (WYRD_AUTH_403_ORIGIN_REFUSED, WYRD_AUTH_403_METHOD_UNAVAILABLE)", body = WyrdProblem),
         (status = 429, description = "Too many failed attempts \
           (WYRD_AUTH_429_PASSWORD_ATTEMPTS)", body = WyrdProblem),
         (status = 503, description = "The store is unavailable \
@@ -767,8 +767,8 @@ pub async fn password_change(
           (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The reset code is unknown, expired or used \
           (WYRD_AUTH_401_ONE_TIME_CODE_INVALID)", body = WyrdProblem),
-        (status = 403, description = "Origin absent or foreign \
-          (WYRD_AUTH_403_ORIGIN_REFUSED)", body = WyrdProblem),
+        (status = 403, description = "Origin absent or foreign, or the method is not offered \
+          (WYRD_AUTH_403_ORIGIN_REFUSED, WYRD_AUTH_403_METHOD_UNAVAILABLE)", body = WyrdProblem),
         (status = 503, description = "The store is unavailable \
           (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
@@ -792,7 +792,7 @@ pub async fn password_reset(
 /// Refuse unless `tenant`'s current methods report offers password sign-in.
 ///
 /// # Errors
-/// Returns [`WyrdError::InvalidToken`] with reason `method_unavailable` when
+/// Returns [`WyrdError::MethodUnavailable`] with reason `method_unavailable` when
 /// password is disabled or the tenant requires company SSO, and `503` when the
 /// report cannot be read.
 async fn require_password(state: &AppState, tenant: &TenantSlug) -> Result<(), WyrdErrorResponse> {
@@ -807,9 +807,10 @@ async fn require_password(state: &AppState, tenant: &TenantSlug) -> Result<(), W
     }
 }
 
-/// The refusal of a sign-in `method` the methods report no longer offers.
+/// The `403` refusal of a sign-in `method` the methods report no longer
+/// offers.
 pub(crate) fn method_unavailable(method: &str) -> WyrdErrorResponse {
-    WyrdErrorResponse::from(WyrdError::InvalidToken {
+    WyrdErrorResponse::from(WyrdError::MethodUnavailable {
         message: format!("{method} is not available for this workspace"),
         details: serde_json::json!({ "reason": "method_unavailable" }),
     })
@@ -1249,3 +1250,4 @@ mod pg_tests {
         );
     }
 }
+

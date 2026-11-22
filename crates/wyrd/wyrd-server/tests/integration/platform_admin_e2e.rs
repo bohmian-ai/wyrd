@@ -7710,8 +7710,8 @@ async fn a_visitor_creates_a_workspace_with_google() {
         .body(Body::from(r#"{"method":"social","provider":"google"}"#))
         .expect("request builds");
     let (status, refused) = social_call(&srv, request).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "{refused}");
-    assert_eq!(refused["code"], "WYRD_AUTH_401_INVALID_TOKEN", "{refused}");
+    assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+    assert_eq!(refused["code"], "WYRD_AUTH_403_METHOD_UNAVAILABLE", "{refused}");
     let (status, changed) = social_call(&srv, settings(true)).await;
     assert_eq!(status, StatusCode::OK, "signup enables: {changed}");
 
@@ -7910,12 +7910,14 @@ async fn a_visitor_creates_a_workspace_with_google() {
     let (status, _) = social_call(&srv, settings(false)).await;
     assert_eq!(status, StatusCode::OK);
     let (status, off, _) = complete_signup(&srv, &eve, "eve", home).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "{off}");
+    assert_eq!(status, StatusCode::FORBIDDEN, "{off}");
+    assert_eq!(off["code"], "WYRD_AUTH_403_METHOD_UNAVAILABLE", "{off}");
     let (status, _) = social_call(&srv, settings(true)).await;
     assert_eq!(status, StatusCode::OK);
     set_google_enabled(&srv, &session, 1, false).await;
     let (status, off, _) = complete_signup(&srv, &eve, "eve", home).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "{off}");
+    assert_eq!(status, StatusCode::FORBIDDEN, "{off}");
+    assert_eq!(off["code"], "WYRD_AUTH_403_METHOD_UNAVAILABLE", "{off}");
     assert!(tenants_named(&superuser, "eve").await.is_empty());
     set_google_enabled(&srv, &session, 1, true).await;
 

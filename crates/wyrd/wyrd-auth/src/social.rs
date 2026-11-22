@@ -1319,8 +1319,8 @@ impl SocialSignIn {
     /// # Errors
     /// Returns [`WyrdError::AuthVerifyUnavailable`] when `source` is unknown
     /// or admission state is unavailable, [`WyrdError::SignupAttempts`] while
-    /// the start window is exhausted, [`WyrdError::InvalidToken`] when signup
-    /// or the provider is not available, and the provider and store
+    /// the start window is exhausted, [`WyrdError::MethodUnavailable`] when
+    /// signup or the provider is not available, and the provider and store
     /// availability errors.
     pub async fn begin_signup(
         &self,
@@ -1375,7 +1375,7 @@ impl SocialSignIn {
     /// # Errors
     /// Returns [`WyrdError::Validation`] for an unparsable address,
     /// [`WyrdError::SignupAttempts`] while a window is exhausted,
-    /// [`WyrdError::InvalidToken`] when local signup is not offered, and
+    /// [`WyrdError::MethodUnavailable`] when local signup is not offered, and
     /// [`WyrdError::AuthVerifyUnavailable`] when the source is unknown or
     /// admission state, the clock or mail is unavailable.
     pub async fn begin_email_signup(
@@ -1549,8 +1549,10 @@ impl SocialSignIn {
     ///
     /// # Errors
     /// Returns [`WyrdError::InvalidState`] for an expired or already used
-    /// round-trip, [`WyrdError::InvalidToken`] when signup or the provider changed or
-    /// verification fails, and the provider and store availability errors.
+    /// round-trip, [`WyrdError::MethodUnavailable`] when signup or the
+    /// provider is no longer offered, [`WyrdError::InvalidToken`] when the
+    /// provider revision changed or verification fails, and the provider and
+    /// store availability errors.
     pub async fn prove_signup(
         &self,
         provider: SocialProvider,
@@ -1880,8 +1882,8 @@ impl SocialSignIn {
     /// creation.
     ///
     /// # Errors
-    /// Returns [`WyrdError::InvalidToken`] when it does not, and the store
-    /// availability errors.
+    /// Returns [`WyrdError::MethodUnavailable`] when it does not, and the
+    /// store availability errors.
     async fn require_signup_provider(&self, provider: SocialProvider) -> Result<(), WyrdError> {
         if self
             .login_methods(None)
@@ -1900,8 +1902,9 @@ impl SocialSignIn {
     /// current, enabled revision.
     ///
     /// # Errors
-    /// Returns [`WyrdError::InvalidToken`] otherwise, and the store
-    /// availability errors.
+    /// Returns [`WyrdError::MethodUnavailable`] when signup or the provider is
+    /// no longer offered, [`WyrdError::InvalidToken`] when the revision
+    /// changed, and the store availability errors.
     async fn recheck_signup(
         &self,
         provider: SocialProvider,
@@ -2011,7 +2014,10 @@ fn source_unknown() -> WyrdError {
 
 /// Public signup is switched off.
 fn signup_unavailable() -> WyrdError {
-    invalid_token("workspace signup is not available")
+    WyrdError::MethodUnavailable {
+        message: "workspace signup is not available".to_owned(),
+        details: json!({ "reason": "method_unavailable" }),
+    }
 }
 
 /// Another completion of this signup is running.

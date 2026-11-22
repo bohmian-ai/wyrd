@@ -590,6 +590,22 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// The sign-in, enrollment, recovery or signup method requested is not
+    /// offered now: the operator disabled it, the tenant requires company
+    /// SSO, or a prerequisite such as signup or its mail relay is absent.
+    #[error("[WYRD_AUTH_403_METHOD_UNAVAILABLE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_403_METHOD_UNAVAILABLE",
+        status = 403,
+        title = "Method not available",
+        remediation = "Reload the page or read `GET /auth/browser/methods` and use a method it currently offers; retrying the same method does not help until an operator enables it."
+    )]
+    MethodUnavailable {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// A local username and password did not sign in: an unknown username, a
     /// wrong password, a suspended User, or an account without a local
     /// password, indistinguishably.
@@ -4205,6 +4221,7 @@ impl WyrdError {
             | Self::UnsupportedGrantType { message, details }
             | Self::InvalidState { message, details }
             | Self::OriginRefused { message, details }
+            | Self::MethodUnavailable { message, details }
             | Self::PasswordInvalid { message, details }
             | Self::PasswordAttempts { message, details }
             | Self::SignupAttempts { message, details }
@@ -5159,6 +5176,10 @@ mod tests {
             WyrdError::OriginRefused {
                 message: "browser request origin refused".to_owned(),
                 details: serde_json::json!({}),
+            },
+            WyrdError::MethodUnavailable {
+                message: "password sign-in is not available for this workspace".to_owned(),
+                details: serde_json::json!({ "reason": "method_unavailable" }),
             },
             WyrdError::PasswordInvalid {
                 message: "username or password not accepted".to_owned(),

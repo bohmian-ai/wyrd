@@ -537,6 +537,454 @@ mod tests {
         })
     }
 
+    /// A case script: `work` reads `per_window` in every window, OTLP
+    /// writes send `wire_mib` MiB, and every server and client percentile
+    /// reads a histogram of 2,000 samples at `nanos`, kept for pooling.
+    fn case_script(work: &'static str, per_window: f64, wire_mib: f64, nanos: u64) -> Script {
+        Box::new(move |_, _, repetition| {
+            repetition.set(work, Reading::exact(per_window));
+            if wire_mib > 0.0 {
+                repetition.set("wire_bytes", Reading::exact(wire_mib * 1_048_576.0));
+            }
+            let latencies =
+                wyrd_benchmark::Distribution::of_durations(&vec![nanos; 2_000]).expect("durations");
+            let ids: Vec<String> = repetition.metrics.keys().cloned().collect();
+            for id in ids {
+                let q = if id.ends_with("p99_ms") {
+                    0.99
+                } else if id.ends_with("p95_ms") {
+                    0.95
+                } else if id.ends_with("p50_ms") {
+                    0.5
+                } else {
+                    continue;
+                };
+                repetition.set(&id, Reading::quantile(&latencies, q, 1e6));
+            }
+        })
+    }
+
+    /// The case record of `selector` in `category`, measured on the case
+    /// clock through the shared runner with `script`.
+    async fn case_record(
+        category: Category,
+        selector: &str,
+        profile: Option<ProfileMode>,
+        script: Script,
+    ) -> crate::summary::CaseRecord {
+        let case = category.case(selector).expect("registered");
+        let arguments = case.plan_arguments(&[]);
+        let rest: Vec<&str> = arguments[1..].iter().map(String::as_str).collect();
+        let mut declaration = declare(category.engine(), Level::One, &rest, HOST, &repository());
+        sweep::narrow(&mut declaration, case.id, false).expect("narrows");
+        let (record, _) = execute(declaration, script).await;
+        crate::summary::CaseRecord {
+            protocol: crate::summary::CASE_PROTOCOL.to_owned(),
+            protocol_version: crate::summary::PROTOCOL_VERSION,
+            category: category.name().to_owned(),
+            family: case.family.to_owned(),
+            case: case.id.to_owned(),
+            selector: case.selector(),
+            mode: if profile.is_some() {
+                crate::summary::SweepMode::Diagnostic
+            } else {
+                crate::summary::SweepMode::Standard
+            },
+            profile,
+            started_at: record.started_at,
+            verdict: record.verdict,
+            reasons: record
+                .reasons
+                .iter()
+                .map(|reason| reason.message.clone())
+                .collect(),
+            record: Some(record),
+            cleanup: crate::summary::Cleanup {
+                project: format!("wyrd-l1-test-{}", case.id),
+                confirmed: true,
+                ..crate::summary::Cleanup::default()
+            },
+        }
+    }
+
+    /// Runs `records` as the sweep `rest` of `category` under `root`, each
+    /// launch returning the next record, and returns the sweep and its
+    /// record.
+    async fn saved_sweep(
+        category: Category,
+        rest: &[&str],
+        root: &Path,
+        records: Vec<crate::summary::CaseRecord>,
+    ) -> (sweep::Sweep, crate::summary::SweepRecord) {
+        let arguments = line(rest);
+        let Ok(crate::cases::Request::Sweep(selection)) =
+            crate::cases::resolve(category, &arguments)
+        else {
+            panic!("a sweep");
+        };
+        let sweep = sweep::Sweep::new(selection, &arguments, root, false);
+        let pending = Arc::new(Mutex::new(std::collections::VecDeque::from(records)));
+        let record = sweep
+            .supervise(&CancellationToken::new(), |_, _| {
+                let pending = Arc::clone(&pending);
+                async move {
+                    pending
+                        .lock()
+                        .expect("pending")
+                        .pop_front()
+                        .expect("a record")
+                }
+            })
+            .await;
+        (sweep, record)
+    }
+
+    /// A saved Bifrost sweep renders the same table again through `capacity
+    /// report` after its temporary artifacts are removed: coverage, mode
+    /// and path, rows in saved order with fixed units, each workload's
+    /// headline (OTLP and native input, durable ACK p99, server query p99
+    /// and p95, client page p99), invalid and unstarted rows with their
+    /// reasons and no performance cells, and derived readings naming their
+    /// unselected inputs. Each case record still renders its full report,
+    /// and neither the schema-3 comparison nor the L2 calibration reads it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the regenerated table or a report differs.
+    #[tokio::test(start_paused = true)]
+    async fn saved_sweeps_regenerate_their_summary_and_case_reports() {
+        let root = tempfile::tempdir().expect("root");
+        let mut invalid = case_record(
+            Category::Bifrost,
+            "point-c64",
+            None,
+            case_script("queries", 30_000.0, 0.0, 1_000_000),
+        )
+        .await;
+        invalid.verdict = Verdict::Invalid;
+        invalid.reasons = vec!["window 2: wrong | answer".to_owned()];
+        invalid.cleanup.confirmed = false;
+        let records = vec![
+            case_record(
+                Category::Bifrost,
+                "otlp-logs-c64",
+                None,
+                case_script("rows", 30_000.0, 30.0, 2_000_000),
+            )
+            .await,
+            case_record(
+                Category::Bifrost,
+                "native-write-c1",
+                None,
+                case_script("rows", 15_000.0, 0.0, 2_000_000),
+            )
+            .await,
+            case_record(
+                Category::Bifrost,
+                "full-scan-c1",
+                None,
+                case_script("queries", 300.0, 0.0, 40_000_000),
+            )
+            .await,
+            case_record(
+                Category::Bifrost,
+                "ui-sql/published-ui-c8",
+                None,
+                case_script("requests", 600.0, 0.0, 9_000_000),
+            )
+            .await,
+            invalid,
+        ];
+        let (sweep, record) = saved_sweep(
+            Category::Bifrost,
+            &["--cases", "otlp-logs-c64,native-write-c1,full-scan-c1,ui-sql/published-ui-c8,point-c64,point-c1"],
+            root.path(),
+            records,
+        )
+        .await;
+        let path = sweep.directory.join(crate::summary::SWEEP_FILE);
+        let printed = crate::summary::report(&path)
+            .expect("reads")
+            .expect("a sweep");
+        std::fs::create_dir_all(
+            sweep
+                .directory
+                .join("01-writes-parquet-otlp-logs-c64/profiles"),
+        )
+        .expect("artifacts");
+        std::fs::remove_dir_all(sweep.directory.join("01-writes-parquet-otlp-logs-c64"))
+            .expect("removed");
+        assert_eq!(levels::report(&path).expect("regenerates"), printed);
+        assert_eq!(
+            dispatch(
+                &line(&["report", path.to_str().expect("path")]),
+                root.path()
+            )
+            .await,
+            0
+        );
+        let lines: Vec<&str> = printed.lines().collect();
+        assert_eq!(lines[0], "L1 bifrost sweep");
+        assert_eq!(lines[2], "Coverage: targeted selection of 6 cases");
+        assert_eq!(lines[3], "Mode: standard");
+        assert_eq!(lines[4], format!("Sweep: {}", path.display()));
+        assert_eq!(
+            lines[6],
+            "| Case | Status | Throughput | Server CPU per unit | Headline latency | Input | Target | Record |"
+        );
+        let rows: Vec<&str> = lines
+            .iter()
+            .copied()
+            .filter(|line| line.starts_with("| ") && !line.starts_with("| Case"))
+            .collect();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.split(" | ").next().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            [
+                "| otlp-logs-c64",
+                "| native-write-c1",
+                "| full-scan-c1",
+                "| ui-sql/published-ui-c8",
+                "| point-c64",
+                "| point-c1"
+            ]
+        );
+        assert!(
+            rows[0].starts_with(
+                "| otlp-logs-c64 | VALID | 1000.0 rows/s | 500.00 µs/row | durable ACK p99: ("
+            ),
+            "{}",
+            rows[0]
+        );
+        assert!(rows[0].contains(" ms, n=6000 | 1.00 MiB/s; 2.00 MiB/CPU-s | none | 01-writes-parquet-otlp-logs-c64.json |"), "{}", rows[0]);
+        assert!(
+            rows[1].starts_with(
+                "| native-write-c1 | VALID | 500.0 rows/s | 1000.00 µs/row | durable ACK p99: ("
+            ),
+            "{}",
+            rows[1]
+        );
+        assert!(
+            rows[1].contains("| unavailable: native input bytes are not measured |"),
+            "{}",
+            rows[1]
+        );
+        assert!(
+            rows[2].contains("| 10.0 queries/s | 50000.00 µs/query | server query p95: ("),
+            "{}",
+            rows[2]
+        );
+        assert!(rows[2].contains("| n/a |"), "{}", rows[2]);
+        assert!(
+            rows[3].contains("| 20.0 pages/s | 25000.00 µs/page | client page p99: ("),
+            "{}",
+            rows[3]
+        );
+        assert_eq!(
+            rows[4],
+            "| point-c64 | INVALID: window 2: wrong \\| answer | — | — | — | — | — | 05-parquet-point-c64.json |",
+        );
+        assert_eq!(
+            rows[5],
+            "| point-c1 | NOT RUN: not started: cleanup of `point-c64` could not be confirmed within its teardown allowance | — | — | — | — | — | unavailable |"
+        );
+        assert!(
+            printed.contains("- otlp-logs-peak: incomplete: `otlp-logs-c1` was not selected\n"),
+            "{printed}"
+        );
+        assert!(
+            printed
+                .contains("- native-write-peak: incomplete: `native-write-c64` was not selected\n"),
+            "{printed}"
+        );
+        assert!(
+            printed.contains(
+                "- point-scaling: incomplete: `point-c1` is not VALID; `point-c64` is not VALID\n"
+            ),
+            "{printed}"
+        );
+        assert!(!printed.contains("span-trace-scaling"), "no input selected");
+        assert_eq!(record.exit_code(), 2);
+
+        let case = crate::summary::read_case(
+            &sweep.directory.join("01-writes-parquet-otlp-logs-c64.json"),
+        )
+        .expect("case");
+        let full = levels::report(&sweep.directory.join("01-writes-parquet-otlp-logs-c64.json"))
+            .expect("full report");
+        assert!(full.starts_with("L1 case otlp-logs-c64 (bifrost / writes-parquet), protocol wyrd-l1-case v1\nMode: standard\n"), "{full}");
+        assert!(full.contains("| measurement | 90.0 | 90 |"), "{full}");
+        assert!(full.contains("| repetition-3 | 30.000 | 0.000 |"), "{full}");
+        assert!(
+            full.contains("Case aggregate: throughput 1000.0 rows/s; server CPU 500.00 µs/row;"),
+            "{full}"
+        );
+        let engine = case.record.as_ref().expect("engine record");
+        assert!(
+            full.ends_with(&format!("{}", engine.render())),
+            "the engine report follows"
+        );
+        assert!(
+            Record::parse(
+                &std::fs::read_to_string(
+                    sweep.directory.join("01-writes-parquet-otlp-logs-c64.json")
+                )
+                .expect("text")
+            )
+            .is_err(),
+            "a case record is never a schema-3 record"
+        );
+
+        let writes = declare(
+            Engine::Bifrost,
+            Level::One,
+            &["writes-parquet"],
+            HOST,
+            &repository(),
+        );
+        let (mut legacy, _) = execute(writes, bifrost_script(4.9)).await;
+        let base = declare(Engine::Bifrost, Level::Two, &[], HOST, root.path());
+        assert!(
+            query::calibrate(std::slice::from_ref(&legacy), &base).is_ok(),
+            "a historical record calibrates"
+        );
+        assert!(legacy.compare(&legacy).is_ok());
+        legacy.lifecycle.clone_from(&engine.lifecycle);
+        assert!(
+            query::calibrate(std::slice::from_ref(&legacy), &base).is_err(),
+            "a case-protocol record never calibrates"
+        );
+        assert!(legacy.compare(&legacy).is_err());
+    }
+
+    /// A profiled sweep marks its mode and every VALID row diagnostic while
+    /// judging the same target predicate, and its case report keeps the
+    /// profile's capture notes.
+    ///
+    /// # Panics
+    ///
+    /// Panics when profiling changes a target or loses its evidence.
+    #[tokio::test(start_paused = true)]
+    async fn profiled_sweeps_keep_targets_and_capture_evidence() {
+        let root = tempfile::tempdir().expect("root");
+        let mut profiled = case_record(
+            Category::Verification,
+            "direct-verify-c64",
+            Some(ProfileMode::Cpu),
+            case_script("verifications", 3_000.0, 0.0, 300_000),
+        )
+        .await;
+        let plain = case_record(
+            Category::Verification,
+            "direct-verify-c64",
+            None,
+            case_script("verifications", 3_000.0, 0.0, 300_000),
+        )
+        .await;
+        if let Some(record) = profiled.record.as_mut() {
+            record.artifacts.profile.requested = true;
+            record.artifacts.profile.mode = Some(ProfileMode::Cpu);
+            record.artifacts.profile.notes =
+                vec!["samply was not found: no CPU capture".to_owned()];
+        }
+        let (sweep, _) = saved_sweep(
+            Category::Verification,
+            &["--cases", "direct-verify-c64", "--profile", "cpu"],
+            root.path(),
+            vec![profiled],
+        )
+        .await;
+        let printed = crate::summary::report(&sweep.directory.join(crate::summary::SWEEP_FILE))
+            .expect("reads")
+            .expect("a sweep");
+        assert!(
+            printed.contains(
+                "Mode: diagnostic (profile cpu; readings are diagnostic, targets unchanged)\n"
+            ),
+            "{printed}"
+        );
+        let row = printed
+            .lines()
+            .find(|line| line.starts_with("| direct-verify-c64"))
+            .expect("row");
+        assert!(row.starts_with("| direct-verify-c64 | VALID (diagnostic) | 100.0 verifications/s | 5000.00 µs/verification | server overhead p99: ("), "{row}");
+        let target = |record: &crate::summary::CaseRecord| {
+            record.record.as_ref().expect("record").steps[0]
+                .criteria
+                .iter()
+                .filter(|judgment| judgment.criterion.contains("overhead"))
+                .map(|judgment| (judgment.criterion.clone(), judgment.outcome))
+                .collect::<Vec<_>>()
+        };
+        let case = crate::summary::read_case(
+            &sweep
+                .directory
+                .join("01-direct-verify-direct-verify-c64.json"),
+        )
+        .expect("case");
+        assert_eq!(target(&case), target(&plain));
+        assert!(
+            !target(&case).is_empty(),
+            "direct-verify-c64 declares its overhead target"
+        );
+        assert!(
+            target(&case)
+                .iter()
+                .all(|(_, outcome)| *outcome == Some(Outcome::Met)),
+            "{:?}",
+            target(&case)
+        );
+        assert!(row.contains(": met"), "{row}");
+        let full = crate::summary::render_case(&case);
+        assert!(
+            full.contains("Mode: diagnostic (profile cpu; readings are diagnostic)\n"),
+            "{full}"
+        );
+        assert!(
+            full.contains("- note: samply was not found: no CPU capture\n"),
+            "{full}"
+        );
+    }
+
+    /// Through the command line, `--list-cases` lists every category and
+    /// exits 0, and a bad selector, flag or profile mode exits 2, both
+    /// before any release build is read or sweep directory created; the
+    /// earlier per-engine L1 commands no longer exist.
+    ///
+    /// # Panics
+    ///
+    /// Panics when listing or refusal starts work.
+    #[tokio::test]
+    async fn category_commands_list_and_refuse_before_launch() {
+        let root = tempfile::tempdir().expect("root");
+        for category in ["verification", "gateway", "bifrost"] {
+            assert_eq!(
+                dispatch(&line(&["l1", category, "--list-cases"]), root.path()).await,
+                0
+            );
+        }
+        for refused in [
+            &["l1", "bifrost", "--cases", "memtable-ui-c8"][..],
+            &["l1", "gateway", "--cases", "point-c1"],
+            &["l1", "verification", "--steps", "direct-verify-c1"],
+            &["l1", "verification", "--profile", "wall"],
+            &["l1", "verification", "--smoke"],
+            &["l1"],
+            &["l1", "bifrost", "writes-parquet"],
+        ] {
+            assert_eq!(
+                dispatch(&line(refused), root.path()).await,
+                2,
+                "{refused:?}"
+            );
+        }
+        assert!(
+            !root.path().join("target").exists(),
+            "no sweep directory was created"
+        );
+    }
+
     /// Every registered L1 case is a measured step its engine declares when
     /// the case's own plan arguments select it; narrowing keeps exactly that
     /// step and the criteria judging it on the case clock, the declaration

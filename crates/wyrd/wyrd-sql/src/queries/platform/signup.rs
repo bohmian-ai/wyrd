@@ -296,19 +296,22 @@ pub async fn admit_signup(
 }
 
 /// Delete at most `batch` admission windows that ended more than `window`
-/// ago and at most `batch` signup attempts past their expiry, and return how
-/// many rows went.
+/// ago and at most `batch` signup attempts whose completion expired more
+/// than `retain` ago, and return how many rows went.
 ///
-/// Spent completion and state digests stay until their attempt expires, so
-/// a replayed proof is still recognized; a tenant an attempt claimed keeps
-/// its creator key when the attempt goes. Each statement is bounded, so a
-/// backlog drains over repeated calls rather than in one long delete.
+/// Spent email and state digests stay for `retain` past their completion
+/// window, so a proof replayed while its envelope lives is still recognized;
+/// a completed attempt has already lost its email. A tenant an attempt
+/// claimed keeps its creator key when the attempt goes. Each statement is
+/// bounded, so a backlog drains over repeated calls rather than in one long
+/// delete.
 ///
 /// # Errors
 /// Returns [`SqlError::Query`] when a statement fails.
 pub async fn purge_expired_signup_state(
     pool: &OperatorPool,
     window: Duration,
+    retain: Duration,
     batch: i64,
 ) -> Result<u64, SqlError> {
     let windows = sqlx::query(
@@ -327,10 +330,11 @@ pub async fn purge_expired_signup_state(
         "DELETE FROM platform.signup_attempts
           WHERE ctid = ANY(ARRAY(
                 SELECT ctid FROM platform.signup_attempts
-                 WHERE expires_at <= statement_timestamp()
+                 WHERE expires_at <= statement_timestamp() - ($2 * interval '1 second')
                  LIMIT $1))",
     )
     .bind(batch)
+    .bind(retain.as_secs_f64())
     .execute(pool.pool())
     .await
     .map_err(SqlError::from)?;

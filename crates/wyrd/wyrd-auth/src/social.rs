@@ -1178,6 +1178,13 @@ const SIGNUP_WINDOW: std::time::Duration = std::time::Duration::from_hours(1);
 /// Most expired windows, and most expired attempts, one purge batch removes.
 const SIGNUP_PURGE_BATCH: i64 = 500;
 
+/// How long a spent proof's digest outlives its completion window. A proof
+/// is recorded no earlier than its pre-proof envelope was sealed, and no
+/// envelope lives longer than an email link, so the digest outlasts every
+/// envelope that could still present it and a replay records nothing.
+const SIGNUP_SPENT_RETENTION: std::time::Duration =
+    SIGNUP_EMAIL_TTL.saturating_sub(SIGNUP_COMPLETION_TTL);
+
 /// A pre-proof signup flow, sealed into its browser's cookie instead of
 /// stored: nothing about an unproven visitor is written to PostgreSQL.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1762,13 +1769,20 @@ impl SocialSignIn {
 
     /// Remove one bounded batch of expired signup admission windows and
     /// attempts, returning how many rows went; `0` once nothing has expired.
+    /// An attempt stays past its completion window until no envelope that
+    /// could replay its proof is still live.
     ///
     /// Background auth maintenance repeats this; no public request purges.
     ///
     /// # Errors
     /// Returns [`WyrdError::AuthVerifyUnavailable`] when the store fails.
     pub async fn purge_expired_signups(&self) -> Result<u64, WyrdError> {
-        purge_expired_signup_state(&self.operator, SIGNUP_WINDOW, SIGNUP_PURGE_BATCH)
+        purge_expired_signup_state(
+            &self.operator,
+            SIGNUP_WINDOW,
+            SIGNUP_SPENT_RETENTION,
+            SIGNUP_PURGE_BATCH,
+        )
             .await
             .map_err(store_error)
     }

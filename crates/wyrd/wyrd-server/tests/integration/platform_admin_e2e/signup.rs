@@ -535,7 +535,7 @@ async fn signup_state_is_pseudonymous_and_purged_in_batches() {
     .await
     .expect("expired attempts insert");
     sqlx::query(
-        "UPDATE platform.signup_attempts SET expires_at = statement_timestamp() - interval '1 minute'
+        "UPDATE platform.signup_attempts SET expires_at = statement_timestamp() - interval '11 minutes'
           WHERE id = (SELECT signup_attempt_id FROM platform.tenants WHERE slug = 'pseudonym-co')",
     )
     .execute(&superuser)

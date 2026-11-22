@@ -700,6 +700,64 @@ Machine-only administrative creation may still omit human-admin input.
 repository Postgres and existing platform provisioning journey. RED is setup's
 absent required human-admin input/result; use existing lifecycle fault seams.
 
+**Where work stopped (cycle 11, in progress):** cycles 1–10 are committed with evidence.
+Cycle 11 has only its journey test, committed red on purpose:
+
+- **The test:** `platform_admin_e2e::setup::setup_creates_a_named_human_admin_without_smtp_or_an_idp`
+  in `crates/wyrd/wyrd-server/tests/integration/platform_admin_e2e/setup.rs`.
+- **RED observed:** it fails at its first step (`setup.rs:180`). `wyrd-server setup --tenant acme`
+  without `--admin-username` succeeds today; it should fail before claiming anything. No
+  production code for cycle 11 has been written.
+
+The remaining plan follows spec REQ-002 (setup) and the API table row "Existing platform tenant
+creation and settings".
+
+1. **Spec types** (`crates/wyrd-spec/src/auth/tenant_admin.rs`):
+   - `CreateTenantRequest` gains optional `human_admin: {username, password: SecretBearer,
+     email?}`, with `serde(default, skip_serializing_if)`.
+   - `CreateTenantResponse` gains optional `human_admin: {principal_id, username, login_url}`.
+     It never carries the password.
+   - Update the struct literals in `wyrd-cli/src/platform/tenant.rs`, `wyrd-server/src/main.rs`
+     and `wyrd-server/src/auth/social.rs:508` to `human_admin: None`, except setup.
+2. **Handler** `create_tenant` (`components/platform/routes.rs`):
+   - Validate before the claim, so a refusal claims nothing: `canonical_username` and
+     `new_password` (`wyrd-auth/src/passwords.rs`), then `hash_password`.
+   - Add the `RequestOrigin` extractor and build `login_url = origin/t/{slug}/login`.
+3. **Provisioning** (`components/platform/provisioning.rs`):
+   - The operator path carries an optional local human admin into
+     `establish_tenant_administration`.
+   - In the same tenant transaction as the bootstrap admin, insert the local User, with the
+     optional email as unverified profile email and no `auth_user_contacts` row, and grant it
+     `admin`. `insert_local_user` gains an `email: Option<&str>` parameter (3 callers).
+   - On resume, keep an existing `first_local_user` and do not reset its password. Activation
+     stays last, so an interrupted setup never activates ownerless.
+4. **Setup flags** (`wyrd-server/src/main.rs` `SetupArgs`/`setup`): `--admin-username`
+   (required), `--admin-password-stdin`, `--admin-email`.
+   - Without the stdin flag, use a hidden terminal prompt. No prompt crate is installed; use
+     the terminal's no-echo mode, or refuse when stdin is not a terminal. The test expects
+     stderr to name `--admin-password-stdin` in that case.
+   - Validate everything before `root_credential`/claim.
+   - Print `admin_username:` and `login_url:` beside the existing `admin_credential:`. Never
+     print the password.
+   - A completed rerun keeps today's "already set up" path.
+5. **Verify and record:** run the test, then the cycle 10 lane command plus
+   `test(/^platform_admin_e2e::setup::/)`, clippy, `codegen:check`, `docs:generate` +
+   `docs:check` (the OpenAPI shape changes) and `check:tenant-isolation`. Then record the
+   evidence here.
+
+After cycle 11: cycles 12–20 as listed below; cycle 15 is the UI mock gate.
+
+Notes for the final report:
+- TDD violations so far: cycle 7 step 4b; the turnstile unit tests were written before the
+  journey RED.
+- The 409-replay reading of "same tenant".
+- No tenant retirement surface exists; tests retire tenants through SQL.
+- MCP and `wyrd-client` projections for signup are missing.
+
+Environment: the test Postgres runs from `scripts/postgres/with-test-postgres.sh`. Its container
+ran out of storage once during cycle 10 and was restarted. If tests fail with `PoolTimedOut`,
+check `docker logs` first.
+
 ### 12. Verified contacts and discovery return bounded workspace links only
 
 **Reuses:** Cycles 10–11 tenant contacts, cycle 6 bound proof, cycle 3 HMAC/maintenance and cycle 5 methods; add authenticated contact verification/replacement and bounded discovery/revalidation.

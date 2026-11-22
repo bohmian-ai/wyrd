@@ -26,6 +26,7 @@ use wyrd_testing::WyrdTestServer;
 use wyrd_testing::principal::within_propagation;
 
 mod methods;
+mod setup;
 mod signup;
 
 /// The one header every Wyrd plane authenticates on.

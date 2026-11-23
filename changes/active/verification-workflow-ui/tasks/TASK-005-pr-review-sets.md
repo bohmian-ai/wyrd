@@ -421,7 +421,8 @@ proof, not manufactured failures.
      Fix site: none in code; `mise exec -- cargo build --locked -p wyrd-cli
      --bin wyrd`, then [D2] 1 passed. No diagnostician: the fix touches no
      test, timing or code.
-   - Status: navigation PASS; the items marked FAIL remain open.
+   - Status: PASS, pending the maintainer's ruling on the listed mock
+     differences (AC-009).
 
 ## Verification and handoff
 
@@ -444,8 +445,11 @@ affected BFF/session owner checks from the UI skill, including
 query consolidation and bounded reads; add no benchmark or unrelated gate.
 
 Gallery: `_gallery` has `ReviewSets` cases (latest, pinned, not retained,
-each state, narrow). Lanes run: `mise run ui:check` (exit 0),
-`mise run codegen:check` (exit 0), `git diff --check` (clean). TDD: the host
+each state, narrow). Final lanes at `c16f818fd`: `mise run fmt`, `lints`,
+`py:lints`, `codegen:check` and `ui:check` (112 passed) exit 0; [U1]
+`-t 'TASK-005|a reader of the subject but not the Verifier'` 5 passed; [D2]
+1 passed; `git diff --check` clean. [B1] last ran after the final Rust
+change (26 passed). TDD: the host
 link tests in scenario 5 and the browser/grant journeys in scenarios 3 and 5
 first ran after their production code; every other new behavior has an
 observed RED. Not run: `mise run test:identity:ui` (no BFF/session code

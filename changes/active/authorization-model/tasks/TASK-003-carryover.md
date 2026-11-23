@@ -883,6 +883,28 @@ directory-update owner once here; recovery below consumes its output.
     `insert_password_reset`, the contact-revision check in `password_reset`) went in with
     scenario 1, before this test. Expired, wrong-purpose, SSO, relay removal, operator offline reset
     and social-only are existing redemption behavior, proved here as regressions.
+- Scenario 3, throttled without locking or disclosing delivery:
+  `platform_admin_e2e::contacts::reset_requests_are_throttled_without_locking_or_disclosing_delivery`
+  (same file). It covers these cases:
+  - five requests for one User all get the generic `202`; once the account window shows five counted
+    attempts, exactly three codes were mailed, and the password still signs in (no lock);
+  - one source gets `202` thirty times, then `429 WYRD_AUTH_429_PASSWORD_ATTEMPTS` with
+    `retry_after_seconds`; another source is still admitted;
+  - with the relay pointed at a local listener that answers `554`, the request still gets the generic
+    `202`. After the listener saw the attempt and the relay was restored, only a new request mailed a
+    code (one message), that code reset, and the listener saw no second attempt (no retry).
+  - The test polls Mailpit and the admission row with a 10-second deadline, because sends run after
+    the answer. It has no fixed sleep.
+  - RED: none; it passed on its first run.
+  - GREEN: 1 passed. Mutation check: without the account window it fails with five messages against three.
+  - TDD VIOLATED for the account and source windows and the bounded send: they went in with scenario 1.
+- SQL integration: `pg_auth_contacts::pg_tests::mailed_resets_replace_mailed_codes_and_are_consumed_once`
+  (`crates/wyrd/wyrd-sql/tests/integration/pg_auth_contacts.rs`). A mailed reset replaces the earlier
+  mailed one and not the operator code, keeps its contact revision, and two racing consumptions of one
+  code have one winner. GREEN: 1 passed (beside the cycle-12 test, 2/2). TDD VIOLATED: written after
+  the query change.
+  - Command: `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner &&
+    cargo nextest run --locked -p wyrd-sql --test integration -E "test(/^pg_auth_contacts::/)"'`.
 
 ### 13. Verified contacts support private self-service reset
 

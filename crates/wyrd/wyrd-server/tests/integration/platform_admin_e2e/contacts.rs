@@ -991,3 +991,124 @@ async fn a_reset_code_refuses_every_stale_or_foreign_use() {
             .expect("the reset password signs in");
     }
 }
+
+/// Reset requests are throttled without locking or disclosing delivery:
+///   1. past its account window a User's requests still get the generic
+///      `202`, but only the first three are mailed, and the password still
+///      signs in;
+///   2. one source is refused with `429` once its window is spent;
+///   3. a relay that refuses the message changes nothing in the answer, and
+///      the lost code is never resent: once the relay works again only a new
+///      request mails one.
+///
+/// # Panics
+/// Panics when a request answers, mails or locks differently.
+#[tokio::test(flavor = "multi_thread")]
+async fn reset_requests_are_throttled_without_locking_or_disclosing_delivery() {
+    let (srv, operator) = contact_server("dock").await;
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    let api = relay_to_mailpit(&srv, &operator).await;
+    let ada = "ada.throttle@example.test";
+    let bea = "bea.throttle@example.test";
+    let session = sign_in(&srv, "dock").await;
+    verify_contact(&srv, &api, "dock", &session, ada).await;
+    let (status, _, body) = browser(
+        &srv,
+        "/v1/principals/users",
+        &[&session],
+        "-",
+        &json!({
+            "username": "bea",
+            "password": PASSWORD,
+            "assignments": [{ "role": "viewer", "scope": "all" }],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let bea_session = sign_in_as(&srv, "dock", "bea", PASSWORD)
+        .await
+        .expect("bea signs in");
+    verify_contact(&srv, &api, "dock", &bea_session, bea).await;
+
+    // 1. The account window silences mail, not the answer, and locks nothing.
+    for _ in 0..5 {
+        let (status, body, _) = request_reset(&srv, "dock", "admin", VISITOR).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        assert_eq!(body, json!({ "status": "check_email" }));
+    }
+    let counted = || async {
+        sqlx::query_scalar::<_, i32>(
+            "SELECT attempts FROM platform.signup_admissions WHERE scope = 'reset_account'",
+        )
+        .fetch_all(&superuser)
+        .await
+        .expect("account windows read")
+    };
+    for _ in 0..100 {
+        if counted().await == vec![5] {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(counted().await, vec![5], "every request was counted");
+    await_mail(&api, ada, RESET_SUBJECT, 3).await;
+    assert_eq!(mail_count(&api, ada, RESET_SUBJECT).await, 3, "three were mailed");
+    sign_in_as(&srv, "dock", "admin", PASSWORD)
+        .await
+        .expect("requests never lock the account");
+
+    // 2. One source's window ends in 429.
+    let source = "198.51.100.7";
+    for _ in 0..30 {
+        let (status, body, _) = request_reset(&srv, "dock", "nobody", source).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    }
+    let (status, body, _) = request_reset(&srv, "dock", "nobody", source).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["code"], "WYRD_AUTH_429_PASSWORD_ATTEMPTS", "{body}");
+    assert!(body["details"]["retry_after_seconds"].as_u64() > Some(0), "{body}");
+    let (status, _, _) = request_reset(&srv, "dock", "nobody", VISITOR).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "other sources are unaffected");
+
+    // 3. A refusing relay is invisible to the caller, and its loss is final.
+    let refusing = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a refusing relay binds");
+    let port = refusing.local_addr().expect("bound").port();
+    let (attempted, mut attempts) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = refusing.accept().await {
+            use tokio::io::AsyncWriteExt as _;
+            let _ = stream.write_all(b"554 5.3.0 no service\r\n").await;
+            let _ = attempted.send(());
+        }
+    });
+    let (status, relay) = social_call(
+        &srv,
+        social_request(
+            Method::PUT,
+            "/platform/mail",
+            Some(&operator),
+            Some(json!({ "host": "127.0.0.1", "port": port, "tls": "none", "sender": "accounts@wyrd.test" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{relay}");
+    let (status, body, _) = request_reset(&srv, "dock", "bea", VISITOR).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body, json!({ "status": "check_email" }));
+    tokio::time::timeout(std::time::Duration::from_secs(10), attempts.recv())
+        .await
+        .expect("the send reached the refusing relay")
+        .expect("the relay reports");
+    relay_to_mailpit(&srv, &operator).await;
+    assert_eq!(request_reset(&srv, "dock", "bea", VISITOR).await.0, StatusCode::ACCEPTED);
+    let texts = await_mail(&api, bea, RESET_SUBJECT, 1).await;
+    assert_eq!(texts.len(), 1, "the lost code was never resent");
+    let (status, _, body) = redeem(&srv, "dock", &reset_code(&texts[0]), "quiet harbor lanterns").await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert!(attempts.try_recv().is_err(), "nothing retried the refused send");
+}

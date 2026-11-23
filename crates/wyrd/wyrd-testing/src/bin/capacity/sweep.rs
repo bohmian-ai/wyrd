@@ -6,8 +6,9 @@
 //! temporary root for server storage and WAL, so no server, database,
 //! storage, client, SDK or provider state outlives it. The case process runs
 //! the engine plan of exactly that case through the shared runner on the
-//! case clock ([`Level::case_timing`]) and keeps its engine record. The
-//! supervisor owns the case deadline, confirms every owned process,
+//! case clock ([`Level::case_timing`]), announces its teardown before it
+//! stops any process, and keeps its engine record. The supervisor owns the
+//! case deadline and the one teardown deadline, confirms every owned process,
 //! container, volume and storage root is gone, keeps the [`CaseRecord`],
 //! and records the outcome in the [`SweepRecord`]. A case whose cleanup
 //! cannot be confirmed within its teardown allowance stops the sweep: every
@@ -22,7 +23,8 @@ use chrono::Utc;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use wyrd_testing::experiment::{
-    Allowances, Declaration, Level, Mode, Options, Owned, Profiling, Record, StepKind, Verdict, run,
+    Allowances, Declaration, Level, Lifecycle, Mode, Options, Owned, Profiling, Record, StepKind,
+    Verdict, run,
 };
 use wyrd_testing::profile::{ProfileMode, SAMPLY, SYMBOLS};
 use wyrd_testing::release_server::HostLoad;
@@ -234,9 +236,14 @@ impl Sweep {
 
     /// Runs case `case`, the `n`th, as its own process under the PostgreSQL
     /// wrapper and returns its case record: started only when its Compose
-    /// project does not yet exist, stopped at the case deadline, then
-    /// confirmed gone (processes, containers, volumes and storage root)
-    /// within the teardown allowance.
+    /// project does not yet exist, stopped when it has not begun teardown
+    /// by the 510 s cutoff, then confirmed gone (processes, containers,
+    /// volumes and storage root). Teardown has one deadline, the 60 s
+    /// allowance from when it began (announced by the case before it stops
+    /// a process, else the cutoff, an interrupt or the process ending)
+    /// within the 570 s envelope. Process stop, wrapper disposal, any
+    /// forced stop and confirmation all consume it; cleanup finished after
+    /// it is recorded but never confirmed.
     pub async fn attempt(&self, case: Case, n: usize, interrupt: &CancellationToken) -> CaseRecord {
         let allowances = Allowances::L1;
         let name = Self::name(n, &case);
@@ -300,43 +307,62 @@ impl Sweep {
         if self.mode == SweepMode::Smoke {
             command.arg("--smoke");
         }
-        let recorded = clock
+        let cutoff = clock
             + Duration::from_secs(
                 allowances.total() - allowances.persist_seconds - allowances.teardown_seconds,
             );
         let envelope = clock + Duration::from_secs(allowances.total() - allowances.persist_seconds);
-        let teardown = Duration::from_secs(allowances.teardown_seconds);
-        let mut stopping: Option<Instant> = None;
+        let allowance = Duration::from_secs(allowances.teardown_seconds);
+        let ends = |began: Instant| (began + allowance).min(envelope);
+        let second = |at: Instant| at.saturating_duration_since(clock).as_secs_f64();
+        let announced =
+            |now: Instant| Lifecycle::teardown_began(&artifacts).map(|at| (clock + at).min(now));
+        // Bounds cleanup work: the teardown deadline while it lasts, then the
+        // envelope, for physical cleanup that can no longer confirm anything.
+        let within = |deadline: Instant| {
+            let now = Instant::now();
+            if now < deadline {
+                deadline
+            } else {
+                envelope.max(now)
+            }
+        };
+        // When teardown began: set once, by the case's announcement, the
+        // cutoff, an interrupt or the case process ending, whichever is first.
+        let mut began: Option<Instant> = None;
         match command.spawn() {
             Err(error) => reasons.push(format!("the case process could not start: {error}")),
             Ok(mut child) => {
                 let group = child.id();
-                let mut deadline = recorded;
-                let mut admitted = false;
                 let status = loop {
+                    let wake = began.map_or_else(|| cutoff.min(Instant::now() + POLL), ends);
                     tokio::select! {
                         status = child.wait() => break Some(status),
-                        () = tokio::time::sleep_until(deadline) => {
-                            if !admitted && let Some(left) = teardown_left(&record_path, allowances) {
-                                admitted = true;
-                                deadline = Instant::now() + left;
-                                continue;
+                        () = tokio::time::sleep_until(wake) => {
+                            if let Some(began) = began {
+                                reasons.push(format!(
+                                    "the case's teardown did not finish within its {}s allowance, from {:.1}s to {:.1}s; it was stopped",
+                                    allowances.teardown_seconds,
+                                    second(began),
+                                    second(ends(began))
+                                ));
+                                break None;
                             }
-                            reasons.push(if admitted {
-                                format!(
-                                    "the case's teardown did not finish within its {}s allowance; it was stopped",
-                                    allowances.teardown_seconds
-                                )
-                            } else {
-                                format!(
-                                    "the case kept no record within its {}s deadline; it was stopped",
-                                    recorded.duration_since(clock).as_secs()
-                                )
-                            });
-                            break None;
+                            let now = Instant::now();
+                            began = announced(now);
+                            if began.is_none() && now >= cutoff {
+                                reasons.push(format!(
+                                    "the case did not begin teardown within its {}s deadline; it was stopped",
+                                    second(cutoff).round()
+                                ));
+                                began = Some(now);
+                                break None;
+                            }
                         }
                         () = interrupt.cancelled() => {
                             reasons.push("the sweep was interrupted; the case was stopped".to_owned());
+                            let now = Instant::now();
+                            began = began.or_else(|| announced(now)).or(Some(now));
                             break None;
                         }
                     }
@@ -344,9 +370,8 @@ impl Sweep {
                 let status = if let Some(status) = status {
                     status.ok()
                 } else {
-                    let now = Instant::now();
-                    stopping = Some(now);
-                    stop(group, &mut child, (now + teardown).min(envelope.max(now))).await
+                    let deadline = ends(began.unwrap_or_else(Instant::now));
+                    stop(group, &mut child, within(deadline)).await
                 };
                 match status {
                     Some(status) if status.success() || status.code() == Some(2) => {}
@@ -355,7 +380,10 @@ impl Sweep {
                 }
             }
         }
-        let exited = Utc::now();
+        let began = began
+            .or_else(|| announced(Instant::now()))
+            .unwrap_or_else(Instant::now);
+        let deadline = ends(began);
         let mut record = match Record::read_with_timings(&record_path) {
             Ok(record) => Some(record),
             Err(error) => {
@@ -368,27 +396,13 @@ impl Sweep {
             .and_then(|record| record.lifecycle.as_ref())
             .map(|lifecycle| lifecycle.owned.clone())
             .unwrap_or_default();
-        let confirming = stopping.unwrap_or_else(Instant::now);
-        let child_teardown = record.as_ref().map_or(0.0, |record| {
-            (exited - record.finished_at).num_milliseconds().max(0) as f64 / 1e3
-        });
-        let left = record
-            .as_ref()
-            .and_then(|record| record.lifecycle.as_ref())
-            .map_or(teardown, |lifecycle| {
-                let used = lifecycle.teardown_seconds + child_teardown;
-                Duration::from_secs_f64((allowances.teardown_seconds as f64 - used).max(0.0))
-            });
-        let confirmed_by = match stopping {
-            Some(stopped) => (stopped + teardown).min(envelope.max(stopped)),
-            None => confirming + left,
-        };
-        let surviving = confirm(&self.docker, &project, &owned, &storage, confirmed_by).await;
-        cleanup.seconds = child_teardown + confirming.elapsed().as_secs_f64();
-        cleanup.confirmed = surviving.is_empty();
+        let surviving = confirm(&self.docker, &project, &owned, &storage, within(deadline)).await;
+        let done = Instant::now();
+        cleanup.seconds = done.saturating_duration_since(began).as_secs_f64();
+        cleanup.confirmed = surviving.is_empty() && done < deadline;
         cleanup.surviving = surviving;
         if let Some(lifecycle) = record.as_mut().and_then(|record| record.lifecycle.as_mut()) {
-            lifecycle.teardown_seconds += cleanup.seconds;
+            lifecycle.teardown_seconds = cleanup.seconds;
             for overrun in lifecycle.overruns() {
                 if !record_has(&reasons, &overrun.message) {
                     reasons.push(overrun.message);
@@ -398,10 +412,15 @@ impl Sweep {
             reasons.push("the engine record has no case lifecycle".to_owned());
         }
         if !cleanup.confirmed {
-            reasons.push(format!(
-                "cleanup was not confirmed within the {}s teardown allowance: {}",
-                allowances.teardown_seconds,
+            let left = if cleanup.surviving.is_empty() {
+                format!("it finished at {:.1}s", second(done))
+            } else {
                 cleanup.surviving.join("; ")
+            };
+            reasons.push(format!(
+                "cleanup was not confirmed within the {}s teardown allowance ending at {:.1}s: {left}",
+                allowances.teardown_seconds,
+                second(deadline)
             ));
         }
         self.finished(case, started_at, record, cleanup, reasons)
@@ -457,21 +476,6 @@ impl Sweep {
     }
 }
 
-/// What remains of the teardown allowance for the PostgreSQL wrapper of a
-/// case whose process already kept its engine record at `path`: the
-/// allowance less the process teardown the record charged and the time
-/// since it finished. `None` when there is no readable record yet, so the
-/// case process has not finished its work.
-fn teardown_left(path: &Path, allowances: Allowances) -> Option<Duration> {
-    let record = Record::parse(&std::fs::read_to_string(path).ok()?).ok()?;
-    let lifecycle = record.lifecycle.as_ref()?;
-    let since = (Utc::now() - record.finished_at).num_milliseconds().max(0) as f64 / 1e3;
-    let used = lifecycle.teardown_seconds + since;
-    Some(Duration::from_secs_f64(
-        (allowances.teardown_seconds as f64 - used).max(0.0),
-    ))
-}
-
 /// Whether `reasons` already holds `message`.
 fn record_has(reasons: &[String], message: &str) -> bool {
     reasons.iter().any(|reason| reason == message)
@@ -492,10 +496,9 @@ fn keep(directory: &Path, bytes: &[u8]) -> Result<tempfile::NamedTempFile, Strin
     Ok(file)
 }
 
-/// Stops the case process group `group` of `child` by `deadline`, the end
-/// of the teardown allowance its cleanup confirmation shares: TERM, so the
-/// wrapper tears its PostgreSQL down, then KILL once half the time left
-/// passes. Returns its exit status, or `None` when it could not be reaped
+/// Stops the case process group `group` of `child` by `deadline`: TERM,
+/// so the wrapper tears its PostgreSQL down, then KILL once half the time
+/// left passes. Returns its exit status, or `None` when it could not be reaped
 /// by `deadline`.
 async fn stop(
     group: Option<u32>,
@@ -581,12 +584,13 @@ async fn compose_resources(
     Ok(found)
 }
 
-/// What still exists of a finished case by `deadline`, the end of its
-/// teardown allowance: owned processes still running with their recorded
+/// What still exists of a finished case, polled until nothing does or
+/// `deadline` passes: owned processes still running with their recorded
 /// start, Compose containers and volumes of `project` (removed once if the
 /// wrapper left them), and the storage root, which is removed. Every Docker
 /// call is bounded by `deadline`, and an answer it did not give in time
-/// survives as unconfirmed. Empty only when cleanup is confirmed in time.
+/// survives. Whether an empty answer came within the teardown allowance is
+/// the caller's judgment.
 async fn confirm(
     docker: &Path,
     project: &str,
@@ -637,12 +641,7 @@ async fn confirm(
             }
         }
         let now = Instant::now();
-        if surviving.is_empty() && now <= deadline {
-            return surviving;
-        }
-        if now >= deadline {
-            surviving
-                .push("cleanup was not confirmed before its teardown allowance ran out".to_owned());
+        if surviving.is_empty() || now >= deadline {
             return surviving;
         }
         tokio::time::sleep(POLL.min(deadline - now)).await;
@@ -861,7 +860,7 @@ mod tests {
 
     use chrono::Utc;
     use tokio_util::sync::CancellationToken;
-    use wyrd_testing::experiment::{Record, Verdict};
+    use wyrd_testing::experiment::{Lifecycle, Record, Verdict};
 
     use super::Sweep;
     use crate::cases::{Case, Category, Request, resolve};
@@ -969,10 +968,11 @@ mod tests {
         assert!(table.contains("| otlp-logs-c1 | INVALID: setup failed | — | — | — | — | — | 01-writes-parquet-otlp-logs-c1.json |"), "{table}");
     }
 
-    /// The engine record a VALID Bifrost write case process keeps: 490 s
-    /// of setup through drain, `teardown` seconds stopping its processes, no
-    /// owned process still running, finished `ago` before now.
-    fn engine_record(teardown: f64, ago: chrono::Duration) -> Record {
+    /// The engine record a Bifrost write case process keeps: 240 s of
+    /// setup, 30 s of warmup, 90 s measured, `drain` seconds of drain and
+    /// capture, `teardown` seconds stopping its processes, and no owned
+    /// process still running.
+    fn engine_record(drain: f64, teardown: f64) -> Record {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .start_paused(true)
@@ -990,10 +990,9 @@ mod tests {
         lifecycle.setup_seconds = 240.0;
         lifecycle.warmup_seconds = 30.0;
         lifecycle.measurement_seconds = 90.0;
-        lifecycle.drain_seconds = 130.0;
+        lifecycle.drain_seconds = drain;
         lifecycle.teardown_seconds = teardown;
         lifecycle.owned.clear();
-        record.finished_at = Utc::now() - ago;
         record
     }
 
@@ -1006,17 +1005,30 @@ mod tests {
     }
 
     /// A smoke sweep of `cases` under `root` whose PostgreSQL wrapper runs
-    /// `wrapper` with `$record` naming the engine record path, and whose
-    /// Docker client runs `docker`.
+    /// `wrapper` with `$record` and `$artifacts` naming the case's engine
+    /// record and artifacts, and whose Docker client runs `docker`. Both
+    /// may `gate NAME` to wait until a [`stepped`] test opens that gate,
+    /// `passed NAME` to tell it they passed, and the wrapper may
+    /// `announce SECOND` to announce the case's teardown as its runner does.
     fn faked(root: &std::path::Path, cases: &str, wrapper: &str, docker: &str) -> Sweep {
+        let gates = root.join("gates");
+        std::fs::create_dir_all(&gates).expect("gates");
+        let helpers = format!(
+            "gates='{}'\n\
+             gate() {{ until [ -e \"$gates/$1\" ]; do sleep 0.01; done; }}\n\
+             passed() {{ touch \"$gates/$1.passed\"; }}\n\
+             announce() {{ echo \"$1\" > \"$artifacts/{teardown}.partial\" && mv \"$artifacts/{teardown}.partial\" \"$artifacts/{teardown}\"; }}\n",
+            gates.display(),
+            teardown = Lifecycle::TEARDOWN_FILE,
+        );
         script(
             &root.join(super::POSTGRES),
             &format!(
-                "while [ $# -gt 0 ]; do [ \"$1\" = --record ] && record=$2; shift; done\n{wrapper}"
+                "{helpers}while [ $# -gt 0 ]; do case \"$1\" in --record) record=$2;; --artifacts) artifacts=$2;; esac; shift; done\n{wrapper}"
             ),
         );
         let docker_path = root.join("docker");
-        script(&docker_path, docker);
+        script(&docker_path, &format!("{helpers}{docker}"));
         let mut sweep = sweep(Category::Bifrost, &["--cases", cases], root);
         sweep.docker = docker_path;
         sweep
@@ -1038,25 +1050,110 @@ mod tests {
         (record, launched)
     }
 
-    /// A case whose process kept its record after 490 s of setup through
-    /// drain and 10 s of process teardown, and whose PostgreSQL wrapper
-    /// then took 20 s more, fits the 590 s envelope: the supervisor charges
-    /// the wrapper's disposal to teardown, 30 s in all, and the case is
-    /// VALID with its cleanup confirmed.
+    /// Runs `sweep`'s real case attempts under `root` on the paused clock,
+    /// held still while its processes and Docker calls run, so only
+    /// `steps` move it: each moves the clock to its case second in poll
+    /// advances, then, unless its gate is empty, opens that gate and waits
+    /// until the fake wrapper or Docker client passed it. Returns the sweep
+    /// record, how many cases launched and the case second the sweep
+    /// returned at.
+    async fn stepped(
+        sweep: &Sweep,
+        root: &std::path::Path,
+        steps: &[(f64, &str)],
+    ) -> (summary::SweepRecord, usize, f64) {
+        let started = tokio::time::Instant::now();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        // While a blocking task runs, the paused clock never advances itself.
+        let hold = tokio::task::spawn_blocking(move || held.recv_timeout(Duration::from_secs(60)));
+        let gates = root.join("gates");
+        let drive = async {
+            for &(second, gate) in steps {
+                let at = started + Duration::from_secs_f64(second);
+                while tokio::time::Instant::now() < at {
+                    tokio::time::advance(super::POLL.min(at - tokio::time::Instant::now())).await;
+                }
+                if gate.is_empty() {
+                    continue;
+                }
+                std::fs::write(gates.join(gate), "").expect("gate");
+                let passed = gates.join(format!("{gate}.passed"));
+                tokio::task::spawn_blocking(move || {
+                    let waiting = std::time::Instant::now();
+                    while !passed.exists() {
+                        assert!(
+                            waiting.elapsed() < Duration::from_secs(10),
+                            "nothing passed {}",
+                            passed.display()
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                })
+                .await
+                .expect("the gate wait");
+            }
+        };
+        let ((record, launched, returned), ()) = tokio::join!(
+            async {
+                let (record, launched) = attempted_sweep(sweep).await;
+                let returned = started.elapsed().as_secs_f64();
+                drop(release);
+                (record, launched, returned)
+            },
+            drive
+        );
+        let _ = hold.await;
+        (record, launched, returned)
+    }
+
+    /// Runs `future` to completion on a fresh paused-clock runtime.
+    fn paused<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .expect("runtime")
+            .block_on(future)
+    }
+
+    /// The saved case record of the first case of a native-write sweep.
+    fn first_case(sweep: &Sweep) -> CaseRecord {
+        summary::read_case(
+            &sweep
+                .directory
+                .join("01-writes-parquet-native-write-c1.json"),
+        )
+        .expect("case record")
+    }
+
+    /// A case that announces teardown at 500 s, after 240 s of setup, 30 s
+    /// of warmup, 90 s measured and 140 s of drain, is in allowed teardown
+    /// past the 510 s cutoff although it has no record yet: its process stop
+    /// keeps the record only at 520 s and its PostgreSQL wrapper is gone at
+    /// 530 s, inside the 560 s deadline set at 500 s. The case completes at
+    /// 530 s VALID, with cleanup confirmed and 30 s of teardown charged.
     #[test]
-    fn an_admitted_wrapper_teardown_is_charged_to_teardown() {
+    fn an_announced_teardown_runs_past_the_cutoff_before_its_record() {
         let root = tempfile::tempdir().expect("root");
         let fixture = root.path().join("fixture.json");
-        let record = engine_record(10.0, chrono::Duration::seconds(20));
+        let record = engine_record(140.0, 20.0);
         std::fs::write(&fixture, serde_json::to_vec(&record).expect("json")).expect("fixture");
         let sweep = faked(
             root.path(),
             "native-write-c1",
-            &format!("cp '{}' \"$record\"", fixture.display()),
+            &format!(
+                "gate teardown; announce 500; passed teardown\n\
+                 gate record; cp '{}' \"$record\"; passed record\n\
+                 gate exit; passed exit",
+                fixture.display()
+            ),
             "exit 0",
         );
-        let runtime = tokio::runtime::Runtime::new().expect("runtime");
-        let (record, launched) = runtime.block_on(attempted_sweep(&sweep));
+        let (record, launched, returned) = paused(stepped(
+            &sweep,
+            root.path(),
+            &[(500.0, "teardown"), (520.0, "record"), (530.0, "exit")],
+        ));
         assert_eq!(launched, 1);
         assert_eq!(
             record.cases[0].status,
@@ -1064,20 +1161,176 @@ mod tests {
             "{:?}",
             record.cases[0].reasons
         );
-        let case = summary::read_case(
-            &sweep
-                .directory
-                .join("01-writes-parquet-native-write-c1.json"),
-        )
-        .expect("case record");
+        assert!((returned - 530.0).abs() < 0.01, "{returned}");
+        let case = first_case(&sweep);
         assert!(case.cleanup.confirmed);
+        assert!(
+            (case.cleanup.seconds - 30.0).abs() < 0.01,
+            "{}",
+            case.cleanup.seconds
+        );
         let teardown = case
             .record
             .as_ref()
             .and_then(|record| record.lifecycle.as_ref())
             .expect("lifecycle")
             .teardown_seconds;
-        assert!((30.0..32.0).contains(&teardown), "{teardown}");
+        assert!((teardown - 30.0).abs() < 0.01, "{teardown}");
+    }
+
+    /// A process stop that outlives its teardown is an overrun, never a
+    /// reason to extend it: teardown announced at 500 s ends at 560 s, so
+    /// the case still stopping then is stopped at 560 s, INVALID naming the
+    /// deadline, its cleanup unconfirmed, and the next case is NOT RUN.
+    #[test]
+    fn a_stop_past_its_teardown_deadline_is_stopped_at_it() {
+        let root = tempfile::tempdir().expect("root");
+        let sweep = faked(
+            root.path(),
+            "native-write-c1,native-write-c64",
+            "trap 'exit 0' TERM\n\
+             gate teardown; announce 500; passed teardown\n\
+             gate never",
+            "exit 0",
+        );
+        let (record, launched, returned) = paused(stepped(
+            &sweep,
+            root.path(),
+            &[(500.0, "teardown"), (560.0, "")],
+        ));
+        assert_eq!(launched, 1);
+        assert!((returned - 560.0).abs() < 0.01, "{returned}");
+        assert_eq!(
+            record
+                .cases
+                .iter()
+                .map(|entry| entry.status)
+                .collect::<Vec<_>>(),
+            [CaseStatus::Invalid, CaseStatus::NotRun]
+        );
+        let case = first_case(&sweep);
+        assert!(!case.cleanup.confirmed);
+        assert!(
+            (case.cleanup.seconds - 60.0).abs() < 0.01,
+            "{}",
+            case.cleanup.seconds
+        );
+        for expected in [
+            "teardown did not finish within its 60s allowance, from 500.0s to 560.0s",
+            "kept no engine record",
+            "cleanup was not confirmed within the 60s teardown allowance ending at 560.0s",
+        ] {
+            assert!(
+                case.reasons.iter().any(|reason| reason.contains(expected)),
+                "{expected}: {:?}",
+                case.reasons
+            );
+        }
+    }
+
+    /// Teardown that expires cannot be confirmed later: announced at 490 s
+    /// with the record kept at 500 s, the PostgreSQL wrapper still runs at
+    /// the 550 s deadline, is stopped then and is gone at 555 s with nothing
+    /// left. That later absence is kept as evidence but confirms nothing:
+    /// the case is INVALID with cleanup unconfirmed at 550 s, and the next
+    /// case is NOT RUN without being launched.
+    #[test]
+    fn an_expired_teardown_cannot_confirm_later_cleanup() {
+        let root = tempfile::tempdir().expect("root");
+        let fixture = root.path().join("fixture.json");
+        let record = engine_record(130.0, 10.0);
+        std::fs::write(&fixture, serde_json::to_vec(&record).expect("json")).expect("fixture");
+        let sweep = faked(
+            root.path(),
+            "native-write-c1,native-write-c64",
+            &format!(
+                "trap 'gate exit; passed exit; exit 0' TERM\n\
+                 gate teardown; announce 490; passed teardown\n\
+                 gate record; cp '{}' \"$record\"; passed record\n\
+                 gate never",
+                fixture.display()
+            ),
+            "exit 0",
+        );
+        let (record, launched, returned) = paused(stepped(
+            &sweep,
+            root.path(),
+            &[(490.0, "teardown"), (500.0, "record"), (555.0, "exit")],
+        ));
+        assert_eq!(launched, 1);
+        assert!((returned - 555.0).abs() < 0.01, "{returned}");
+        assert_eq!(
+            record
+                .cases
+                .iter()
+                .map(|entry| entry.status)
+                .collect::<Vec<_>>(),
+            [CaseStatus::Invalid, CaseStatus::NotRun]
+        );
+        assert!(
+            record.cases[1].reasons[0].contains("could not be confirmed"),
+            "{:?}",
+            record.cases[1].reasons
+        );
+        let case = first_case(&sweep);
+        assert!(!case.cleanup.confirmed);
+        assert!(
+            case.cleanup.surviving.is_empty(),
+            "{:?}",
+            case.cleanup.surviving
+        );
+        assert!(
+            (case.cleanup.seconds - 65.0).abs() < 0.01,
+            "{}",
+            case.cleanup.seconds
+        );
+        for expected in [
+            "teardown did not finish within its 60s allowance, from 490.0s to 550.0s",
+            "cleanup was not confirmed within the 60s teardown allowance ending at 550.0s: it finished at 555.0s",
+            "teardown took 65.0s, over its 60s allowance",
+        ] {
+            assert!(
+                case.reasons.iter().any(|reason| reason.contains(expected)),
+                "{expected}: {:?}",
+                case.reasons
+            );
+        }
+    }
+
+    /// A case INVALID for a drain overrun whose cleanup is confirmed inside
+    /// its teardown allowance still lets the next case start: both cases
+    /// launch, both are INVALID, and both cleanups are confirmed.
+    #[test]
+    fn timely_cleanup_after_an_invalid_case_starts_the_next() {
+        let root = tempfile::tempdir().expect("root");
+        let fixture = root.path().join("fixture.json");
+        let record = engine_record(160.0, 10.0);
+        std::fs::write(&fixture, serde_json::to_vec(&record).expect("json")).expect("fixture");
+        let sweep = faked(
+            root.path(),
+            "native-write-c1,native-write-c64",
+            &format!("announce 0; cp '{}' \"$record\"", fixture.display()),
+            "exit 0",
+        );
+        let (record, launched, _) = paused(stepped(&sweep, root.path(), &[]));
+        assert_eq!(launched, 2);
+        assert_eq!(
+            record
+                .cases
+                .iter()
+                .map(|entry| entry.status)
+                .collect::<Vec<_>>(),
+            [CaseStatus::Invalid, CaseStatus::Invalid]
+        );
+        let case = first_case(&sweep);
+        assert!(case.cleanup.confirmed, "{:?}", case.reasons);
+        assert!(
+            case.reasons
+                .iter()
+                .any(|reason| reason.contains("drain and capture took 160.0s")),
+            "{:?}",
+            case.reasons
+        );
     }
 
     /// A case's kept window snapshots (timing, scan, counter and gauge) go
@@ -1110,7 +1363,7 @@ mod tests {
         }];
         let root = tempfile::tempdir().expect("root");
         let artifacts = root.path().join("artifacts");
-        let mut record = engine_record(10.0, chrono::Duration::seconds(1));
+        let mut record = engine_record(130.0, 10.0);
         record.artifacts.directory = Some(artifacts.display().to_string());
         let step = record.steps[0].id.clone();
         let kept = artifacts
@@ -1207,7 +1460,7 @@ mod tests {
         assert!(!case.cleanup.confirmed);
         assert!(case.cleanup.seconds <= 60.5, "{}", case.cleanup.seconds);
         for expected in [
-            "kept no record within its 510s deadline",
+            "did not begin teardown within its 510s deadline",
             "kept no engine record",
             "cleanup was not confirmed",
         ] {
@@ -1228,82 +1481,38 @@ mod tests {
         assert!(sweep.directory.join(summary::SWEEP_FILE).exists());
     }
 
-    /// A case process that kept its record before the 510 s cutoff is in
-    /// teardown, not hung: its PostgreSQL wrapper may run past the cutoff for
-    /// what remains of the teardown allowance, 50 s after 10 s of process
-    /// teardown, before it is stopped, and the stop and confirmation still
-    /// end by the 570 s envelope that leaves persistence its allowance.
-    #[test]
-    fn a_recorded_case_keeps_its_teardown_allowance_past_the_cutoff() {
-        let root = tempfile::tempdir().expect("root");
-        let sweep = faked(
-            root.path(),
-            "native-write-c1",
-            "exec sleep 600",
-            "exec sleep 600",
-        );
-        let record = engine_record(10.0, chrono::Duration::zero());
-        let kept = sweep
-            .directory
-            .join("01-writes-parquet-native-write-c1")
-            .join("engine-record.json");
-        std::fs::create_dir_all(kept.parent().expect("parent")).expect("artifacts");
-        std::fs::write(&kept, serde_json::to_vec(&record).expect("json")).expect("record");
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .start_paused(true)
-            .build()
-            .expect("runtime");
-        runtime.block_on(async {
-            let started = tokio::time::Instant::now();
-            let (record, launched) =
-                tokio::time::timeout(Duration::from_secs(3_600), attempted_sweep(&sweep))
-                    .await
-                    .expect("the supervisor returns");
-            let elapsed = started.elapsed().as_secs_f64();
-            assert_eq!(launched, 1);
-            assert!((559.0..=571.0).contains(&elapsed), "{elapsed}");
-            assert_eq!(record.cases[0].status, CaseStatus::Invalid);
-            assert!(
-                record.cases[0]
-                    .reasons
-                    .iter()
-                    .any(|reason| reason
-                        .contains("teardown did not finish within its 60s allowance")),
-                "{:?}",
-                record.cases[0].reasons
-            );
-        });
-    }
-
     /// Cleanup confirmation is bounded by what remains of the teardown
-    /// allowance: with 0.5 s left, a Docker check that answers "nothing
-    /// left" only after 2 s, or never answers, leaves cleanup unconfirmed,
-    /// so the next case is NOT RUN and never launched.
+    /// allowance: with the wrapper gone at 559.5 s of a teardown that ends
+    /// at 560 s, a Docker check that answers only after 2 s, or never
+    /// answers, leaves cleanup unconfirmed, so the next case is NOT RUN and
+    /// never launched.
     #[test]
     fn late_or_missing_cleanup_answers_stop_the_sweep() {
         for delay in ["2", "600"] {
             let root = tempfile::tempdir().expect("root");
             let fixture = root.path().join("fixture.json");
-            let marker = root.path().join("finished");
-            let record = engine_record(59.5, chrono::Duration::zero());
+            let record = engine_record(140.0, 5.0);
             std::fs::write(&fixture, serde_json::to_vec(&record).expect("json")).expect("fixture");
             let sweep = faked(
                 root.path(),
                 "native-write-c1,native-write-c64",
                 &format!(
-                    "cp '{}' \"$record\"\ntouch '{}'",
-                    fixture.display(),
-                    marker.display()
+                    "gate teardown; announce 500; cp '{}' \"$record\"; passed teardown\n\
+                     gate exit; passed exit",
+                    fixture.display()
                 ),
-                &format!("[ -e '{}' ] && sleep {delay}\nexit 0", marker.display()),
+                &format!("[ -e \"$gates/exit.passed\" ] && passed asked && sleep {delay}\nexit 0"),
             );
-            let runtime = tokio::runtime::Runtime::new().expect("runtime");
-            let (record, launched) = runtime
-                .block_on(async {
-                    tokio::time::timeout(Duration::from_secs(20), attempted_sweep(&sweep)).await
-                })
-                .expect("the supervisor returns");
+            let (record, launched, _) = paused(stepped(
+                &sweep,
+                root.path(),
+                &[
+                    (500.0, "teardown"),
+                    (559.5, "exit"),
+                    (559.5, "asked"),
+                    (561.5, ""),
+                ],
+            ));
             assert_eq!(launched, 1, "delay {delay}");
             assert_eq!(
                 record
@@ -1314,13 +1523,16 @@ mod tests {
                 [CaseStatus::Invalid, CaseStatus::NotRun],
                 "delay {delay}"
             );
-            let case = summary::read_case(
-                &sweep
-                    .directory
-                    .join("01-writes-parquet-native-write-c1.json"),
-            )
-            .expect("case record");
+            let case = first_case(&sweep);
             assert!(!case.cleanup.confirmed, "delay {delay}");
+            assert!(
+                case.cleanup
+                    .surviving
+                    .iter()
+                    .any(|item| item.contains("did not answer within its allowance")),
+                "delay {delay}: {:?}",
+                case.cleanup.surviving
+            );
         }
     }
 

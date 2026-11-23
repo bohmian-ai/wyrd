@@ -73,10 +73,12 @@ pub struct Cleanup {
     /// The case's own temporary root, holding its server storage and WAL.
     pub storage_root: String,
     /// Whether every owned process, container, volume and storage root was
-    /// confirmed gone within the teardown allowance.
+    /// confirmed gone before the teardown deadline; gone only later is
+    /// `false` with nothing `surviving`.
     pub confirmed: bool,
-    /// Seconds the supervisor spent stopping and confirming, after the case
-    /// process kept its record.
+    /// Seconds of teardown, from when it began (the case's announcement,
+    /// the cutoff, an interrupt or the case process ending) to the end of
+    /// confirmation.
     pub seconds: f64,
     /// What was found before the case started: it must be nothing.
     pub preexisting: Vec<String>,

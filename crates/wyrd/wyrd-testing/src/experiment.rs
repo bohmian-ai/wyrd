@@ -2123,8 +2123,10 @@ pub struct PhaseWindow {
 /// The L1 case lifecycle a record keeps: each phase's measured seconds
 /// against its allowance, every window's admission and drain, the processes
 /// the case owned, and the outstanding publication and maintenance work it
-/// captured before teardown. The supervisor completes teardown and persist
-/// after the case process exits.
+/// captured before teardown. The case announces its teardown before it
+/// stops any process ([`Lifecycle::announce_teardown`]); its supervisor
+/// charges all teardown from that moment, through process exit and cleanup
+/// confirmation, then completes persist.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Lifecycle {
     /// The allowances judged.
@@ -2189,6 +2191,35 @@ impl Lifecycle {
     #[must_use]
     pub fn teardown_left(&self) -> Duration {
         Self::left(self.allowances.teardown_seconds, self.teardown_seconds)
+    }
+
+    /// The file in a case's artifacts directory announcing that its
+    /// teardown began: the case-clock second it began. The case writes it
+    /// before it stops any process, so its supervisor holds the one
+    /// teardown deadline from that moment, not from the record written
+    /// after the stop.
+    pub const TEARDOWN_FILE: &'static str = "teardown";
+
+    /// Announces in `artifacts` that the case's teardown begins `at` on
+    /// the case clock, replacing [`Self::TEARDOWN_FILE`] by rename so a
+    /// reader never sees part of it.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the announcement could not be written or renamed.
+    pub fn announce_teardown(artifacts: &Path, at: Duration) -> std::io::Result<()> {
+        let partial = artifacts.join(format!("{}.partial", Self::TEARDOWN_FILE));
+        std::fs::create_dir_all(artifacts)?;
+        std::fs::write(&partial, format!("{:.3}", at.as_secs_f64()))?;
+        std::fs::rename(partial, artifacts.join(Self::TEARDOWN_FILE))
+    }
+
+    /// The case-clock second the case in `artifacts` announced its
+    /// teardown began, or `None` before it announced one.
+    #[must_use]
+    pub fn teardown_began(artifacts: &Path) -> Option<Duration> {
+        let text = std::fs::read_to_string(artifacts.join(Self::TEARDOWN_FILE)).ok()?;
+        Duration::try_from_secs_f64(text.trim().parse().ok()?).ok()
     }
 
     /// Charges one `phase` call of declared `length` that returned after
@@ -2669,6 +2700,17 @@ where
                 )),
             }
             ledger.drain_seconds += reading.elapsed().as_secs_f64();
+        }
+        if lifecycle.is_some()
+            && let Err(error) = Lifecycle::announce_teardown(
+                &options.artifacts,
+                options.setup_spent + clock.elapsed(),
+            )
+        {
+            validity.push(Reason::new(
+                "evidence.missing",
+                format!("the start of teardown could not be announced: {error}"),
+            ));
         }
         let grace = lifecycle
             .as_ref()
@@ -7275,6 +7317,10 @@ Overloaded: do not compare languages here.
         stop: Duration,
         /// Each call's start and return.
         calls: Arc<Mutex<Vec<(tokio::time::Instant, tokio::time::Instant)>>>,
+        /// The run's artifacts directory.
+        artifacts: PathBuf,
+        /// The teardown the run had announced there when its stop began.
+        announced: Arc<Mutex<Option<Duration>>>,
     }
 
     #[async_trait]
@@ -7304,6 +7350,8 @@ Overloaded: do not compare languages here.
         }
 
         async fn finish(&mut self) -> Result<(), ExperimentError> {
+            *self.announced.lock().expect("announced") =
+                super::Lifecycle::teardown_began(&self.artifacts);
             tokio::time::sleep(self.stop).await;
             Ok(())
         }
@@ -7331,6 +7379,8 @@ Overloaded: do not compare languages here.
             setup,
             stop,
             calls: Arc::clone(&calls),
+            artifacts: directory.path().to_path_buf(),
+            announced: Arc::default(),
         };
         let options = Options {
             setup_spent: spent,
@@ -7496,6 +7546,58 @@ Overloaded: do not compare languages here.
                     && reason.message.contains("setup took 250.0s")),
             "{:?}",
             spent.reasons
+        );
+    }
+
+    /// A case announces its teardown in its artifacts before it stops any
+    /// process, at the case second the stop begins: 20 s of setup before
+    /// the runner, a 30 s warmup, 90 s measured and four 1 s drains put it
+    /// at 144 s. The stop that follows is still charged to teardown, and the
+    /// record comes only after it.
+    #[tokio::test(start_paused = true)]
+    async fn a_case_announces_teardown_before_it_stops_its_processes() {
+        let directory = tempfile::tempdir().expect("artifacts");
+        let announced = Arc::default();
+        let mut workload = Draining {
+            repetition: window(1_000.0, 30.0, Some(3.0), &samples(2_000, 300_000)),
+            drain: Duration::from_secs(1),
+            setup: Duration::ZERO,
+            stop: Duration::from_secs(10),
+            calls: Arc::default(),
+            artifacts: directory.path().to_path_buf(),
+            announced: Arc::clone(&announced),
+        };
+        let options = Options {
+            setup_spent: Duration::from_secs(20),
+            ..options(directory.path())
+        };
+        let mut samples = VecDeque::from([Some(quiet()), Some(quiet())]);
+        let record = run(
+            case_declaration().seal(),
+            &mut workload,
+            move |_| std::future::ready(samples.pop_front().flatten()),
+            &options,
+        )
+        .await;
+        assert_eq!(record.verdict, Verdict::Valid, "{:?}", record.reasons);
+        let began = announced
+            .lock()
+            .expect("announced")
+            .expect("teardown was announced before the stop began");
+        assert!(
+            (began.as_secs_f64() - 144.0).abs() < 0.01,
+            "{}",
+            began.as_secs_f64()
+        );
+        assert_eq!(
+            super::Lifecycle::teardown_began(directory.path()),
+            Some(began)
+        );
+        let lifecycle = record.lifecycle.as_ref().expect("lifecycle");
+        assert!(
+            (lifecycle.teardown_seconds - 10.0).abs() < 0.01,
+            "{}",
+            lifecycle.teardown_seconds
         );
     }
 

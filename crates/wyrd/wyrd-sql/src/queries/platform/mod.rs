@@ -15,12 +15,16 @@
 //! connection, its login state, and the durable `(issuer, subject)` pin that
 //! resolves a human to an existing platform principal. It never creates one.
 //!
+//! `console` holds platform-user passwords and the platform browser sessions
+//! the console signs in to.
+//!
 //! `social` holds the shared Google and GitHub.com sign-in clients, their
 //! operator test transactions, and the deployment's login settings.
 //!
 //! `provisioning` owns the durable stages that admit a tenant, so a failure at
 //! any one of them leaves the directory entry failed rather than half-admitted.
 
+pub mod console;
 pub mod credentials;
 pub mod identity;
 pub mod principal_grants;

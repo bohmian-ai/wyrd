@@ -19,6 +19,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
 use uuid::Uuid;
+use wyrd_auth::passwords::{hash_password, new_password};
 use wyrd_auth::pg_resolvers::{
     IssuerSealError, client_auth_label, renew_platform_client_secret, seal_platform_client_secret,
 };
@@ -33,11 +34,12 @@ use wyrd_spec::auth::{
     ConfigurePlatformOidcRequest, IssuerUrl, LoginInitResponse, PlatformCallbackRequest,
     PlatformClientAuth, PlatformLoginRequest, PlatformOidcConnectionView,
     PlatformPrincipalListResponse, PlatformPrincipalSummary, PrincipalId, PrincipalKindTag,
-    RegisterPlatformAdminRequest, RegisterPlatformAdminResponse, SetPlatformPrincipalStatusRequest,
-    TokenResponse,
+    RegisterPlatformAdminRequest, RegisterPlatformAdminResponse, SetPlatformPasswordRequest,
+    SetPlatformPrincipalStatusRequest, TokenResponse,
 };
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::request_id::RequestId;
+use wyrd_sql::queries::platform::console::set_platform_password_tx;
 use wyrd_sql::queries::platform::identity::{
     delete_platform_oidc_connection, insert_platform_identity_tx, platform_oidc_connection,
     swap_platform_sealed_secret_tx, upsert_platform_oidc_connection,
@@ -86,6 +88,7 @@ pub fn platform_identity_router() -> OpenApiRouter<AppState> {
         .routes(routes!(renew_connection_encryption))
         .routes(routes!(register_admin, list_platform_admins))
         .routes(routes!(set_admin_status))
+        .routes(routes!(set_admin_password))
 }
 
 /// Build the anonymous platform login routes.
@@ -632,18 +635,27 @@ async fn register_admin(
     )
     .await?;
 
-    // Registering against no connection would create a principal that could
-    // never sign in, so the connection is required first. That refusal is a
-    // stable outcome of an evaluated permission, so the decision commits alone
-    // before it; a failed read commits nothing.
-    let Some(connection) = platform_oidc_connection(&pool).await.map_err(store_error)? else {
-        commit_decision(decision).await?;
-        return Err(WyrdErrorResponse::from(WyrdError::Validation {
-            message: "configure the platform OIDC connection before registering an \
-                      administrator"
-                .to_owned(),
-            details: serde_json::json!({}),
-        }));
+    // A matching claim registers against the connection, so registering one
+    // with no connection would create a principal that could never sign in
+    // that way. That refusal is a stable outcome of an evaluated permission,
+    // so the decision commits alone before it; a failed read commits nothing.
+    // Without a claim the principal signs in with a platform-user password
+    // set next, and needs no connection.
+    let connection = match &request.match_claim {
+        Some(claim) => {
+            let Some(connection) = platform_oidc_connection(&pool).await.map_err(store_error)?
+            else {
+                commit_decision(decision).await?;
+                return Err(WyrdErrorResponse::from(WyrdError::Validation {
+                    message: "configure the platform OIDC connection before registering an \
+                              administrator by matching claim"
+                        .to_owned(),
+                    details: serde_json::json!({}),
+                }));
+            };
+            Some((connection, claim))
+        }
+        None => None,
     };
 
     insert_platform_principal_tx(
@@ -654,14 +666,11 @@ async fn register_admin(
     )
     .await
     .map_err(taken_or_store)?;
-    insert_platform_identity_tx(
-        &mut decision,
-        principal_id,
-        &connection.issuer_url,
-        &request.match_claim,
-    )
-    .await
-    .map_err(taken_or_store)?;
+    if let Some((connection, claim)) = connection {
+        insert_platform_identity_tx(&mut decision, principal_id, &connection.issuer_url, claim)
+            .await
+            .map_err(taken_or_store)?;
+    }
 
     // Authority comes with registration, in the same transaction. A registered
     // human with no grant can complete federated login and then call nothing:
@@ -824,6 +833,71 @@ async fn set_admin_status(
                 "suspending this administrator would leave the deployment with no way                           in"
                     .to_owned(),
             details: serde_json::json!({ "principal_id": principal_id.to_string() }),
+        })),
+    }
+}
+
+/// Set or replace platform `user` `principal_id`'s platform-user password.
+///
+/// The password is checked against the local-password policy and derived
+/// before any permission is evaluated, so a refused password opens no
+/// decision. Replacing it advances the password revision, which ends every
+/// platform browser session the previous password created at its next
+/// request on any replica.
+///
+/// # Errors
+/// Returns a stable Wyrd error when the password fails policy, the caller is
+/// unauthorized or lacks fresh proof, the principal is not a platform
+/// `user`, or a write fails.
+#[utoipa::path(
+    put,
+    path = "/platform/admins/{principal_id}/password",
+    params(("principal_id" = Uuid, Path, description = "Platform user to change")),
+    request_body = SetPlatformPasswordRequest,
+    responses(
+        (status = 204, description = "Password set; sessions from an earlier password end"),
+        (status = 400, description = "A path identifier is not a valid UUID, or the password \
+          fails policy (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
+        (status = 403, description = "Platform identity administration or fresh proof required \
+          (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_AUTH_403_RECENT_LOGIN_REQUIRED)", body = WyrdProblem),
+        (status = 404, description = "Platform user not found (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem),
+        (status = 500, description = "A platform store read or write failed (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
+    ),
+    tag = "Platform"
+)]
+#[tracing::instrument(level = "info", skip(state, caller, request))]
+async fn set_admin_password(
+    State(state): State<AppState>,
+    caller: PlatformCaller,
+    principal_id: Result<Path<Uuid>, PathRejection>,
+    Json(request): Json<SetPlatformPasswordRequest>,
+) -> Result<StatusCode, WyrdErrorResponse> {
+    let Path(principal_id) = principal_id.map_err(|rejection| path_rejection(&rejection))?;
+    caller.require_recent_proof()?;
+    let password = new_password(&request.password.into_secret_string(), "password")?;
+    let verifier = hash_password(password).await?;
+
+    let pool = operator(&state)?;
+    // The handle must outlive the transaction it lends out.
+    let authz =
+        PlatformAuthorization::new(pool.clone(), Arc::clone(state.bifrost.scribe_outbox()) as _);
+    let mut decision = authorize(
+        &authz,
+        &caller,
+        &Permission::platform_identity_write(),
+        &platform_principal_resource(principal_id),
+    )
+    .await?;
+    let revision = set_platform_password_tx(&mut decision, principal_id, &verifier)
+        .await
+        .map_err(store_error)?;
+    commit_decision(decision).await?;
+    match revision {
+        Some(_) => Ok(StatusCode::NO_CONTENT),
+        None => Err(WyrdErrorResponse::from(WyrdError::NotFound {
+            message: "platform user not found".to_owned(),
+            details: serde_json::json!({}),
         })),
     }
 }

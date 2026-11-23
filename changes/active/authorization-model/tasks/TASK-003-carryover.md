@@ -919,6 +919,37 @@ RED is missing platform browser purpose/local credential/fresh-proof enforcement
 current platform API-token login is reused, not presented as browser proof.
 Production browser and host-routing proof follows cycle 16 after mock approval.
 
+#### Cycle 14 evidence
+
+Selector prefix: `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-server --features test-support --test integration --no-fail-fast -E "test(=<selector>)"'`.
+
+Schema (spec revision 9, REQ-018 / AC-013 platform-user password and platform
+browser sessions): migration `20261123000001_platform_console_sessions.sql`
+extends `platform.principals` (password verifier and revision, `user` only),
+`platform.oidc_connection` (revision) and `platform.login_state` (purpose,
+browser binding, re-auth session), and adds forced-RLS
+`platform.browser_sessions`. Like every other `platform.*` table it has no
+`data_tenant_id`: the platform plane is tenant-free by design.
+
+Decisions: password attempts share the existing per-source `admit_sign_in`
+window; "retiring a workspace" is the existing tenant suspension
+(`PUT /platform/tenants/{id}/status`), as no other retirement surface exists;
+fresh proof is enforced on browser-session callers only, so platform API tokens
+(the CLI/API break-glass channel) are unchanged; a platform-user password counts
+as a usable way in for the last-administrator guard.
+
+1. `platform_admin_e2e::console::a_registered_operator_signs_in_with_a_platform_password`
+   - RED: `POST /platform/admins {"name":"ops"}` returned 422 (`match_claim`
+     required; no IdP-free registration or platform password existed).
+   - GREEN: authorized registration without a claim, policy-checked
+     `PUT /platform/admins/{id}/password`, `POST /platform/browser/password/login`
+     (wrong/unknown/root-key-as-password 401 with no cookie, missing Origin 403),
+     regenerated opaque host-only Secure/HttpOnly/SameSite=Lax `Path=/platform`
+     cookie with token-free metadata, cookie use on platform reads and
+     same-origin mutations, tenant cookie refused on platform routes, platform
+     cookie refused on tenant routes and as a tenant cookie, logout revoking only
+     its own session, API token unaffected. 1 passed.
+
 ### 15. Extend and approve the complete mock before production pages
 
 **Reuses:** Cycles 5–14 final contracts, journeys and platform session metadata; reuse the already approved signup visual direction.

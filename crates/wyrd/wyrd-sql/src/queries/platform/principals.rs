@@ -309,6 +309,7 @@ pub async fn set_platform_principal_status(
 /// issuer must be the connection the deployment currently serves, because a
 /// removed or replaced connection cannot verify that subject any more. Counting
 /// either would let the last administrator who can really sign in be suspended.
+/// A platform-user password is a way in through the platform console.
 const USABLE_ADMINISTRATORS_SQL: &str = "WITH usable AS (
         SELECT p.id
           FROM platform.principals p
@@ -316,7 +317,8 @@ const USABLE_ADMINISTRATORS_SQL: &str = "WITH usable AS (
          WHERE p.status = 'active'
            AND g.permissions @> $2
            AND (
-          EXISTS (
+          p.password_hash IS NOT NULL
+          OR EXISTS (
             SELECT 1 FROM platform.credentials c
              WHERE c.principal_id = p.id
                AND c.revoked_at IS NULL

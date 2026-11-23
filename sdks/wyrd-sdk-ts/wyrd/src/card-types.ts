@@ -6182,6 +6182,13 @@ export interface PullRequestActivation {
    */
   readonly delivery_id?: string | null;
   /**
+   * The base repository's `owner/name` when this source was admitted, for
+   * linking to the pull request on the provider; display only, since a
+   * rename keeps `repository_id`. Absent on a source admitted before
+   * names were retained.
+   */
+  readonly full_name?: string | null;
+  /**
    * The admission every execution of this source shares.
    */
   readonly generation: string;

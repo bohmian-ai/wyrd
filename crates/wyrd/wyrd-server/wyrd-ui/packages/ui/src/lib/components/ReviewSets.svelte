@@ -38,7 +38,10 @@
           <span class="sep">·</span>#{input.number}<span class="sep">·</span>Repository Card {input.repository}
         </div>
       </div>
-      <div class="xactions"><ActionNote state={actions['review_set.open'] ?? actions['record.open'] ?? actions['card.open']} /></div>
+      <div class="xactions">
+        {#if source.full_name}<a class="btn btn-sm" href="https://{source.host}/{source.full_name}/pull/{input.number}" target="_blank" rel="noopener noreferrer">{source.full_name}#{input.number} ↗</a>{/if}
+        <ActionNote state={actions['review_set.open'] ?? actions['record.open'] ?? actions['card.open']} />
+      </div>
     </div>
 
     <section class="section" aria-labelledby="review-sets-heading">

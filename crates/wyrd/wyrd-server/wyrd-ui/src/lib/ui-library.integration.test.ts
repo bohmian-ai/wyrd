@@ -2264,6 +2264,8 @@ deferred('TASK-005: the current review set of a pull request loads its recorded 
           request_key: 'task-005-current',
           // The title GitHub showed when the review was admitted.
           title: 'Change',
+          // The repository's full name GitHub showed then, for linking back to it.
+          full_name: 'acme/api',
           complete: true
         });
         // Each member keeps its own status, selected result and verdict; the set has no verdict of its own.

@@ -598,6 +598,8 @@ async fn pull_request_lifecycle_admits_supersedes_and_ends_through_the_webhook()
             "host": mock.host(),
             "repository_id": "4242",
             "number": 7,
+            "title": "Change",
+            "full_name": "acme/policy",
             "base": {"ref": "main", "sha": "b1"},
             "head": {"ref": "feature", "sha": "a1"},
             "head_repository_id": "4242",

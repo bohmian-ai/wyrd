@@ -162,14 +162,19 @@ impl PullRequestEvent {
 /// What GitHub's current state of a PR asks for.
 #[derive(Debug, PartialEq, Eq)]
 enum Observed {
-    /// An open, ready PR under review at this source: base, head, head
-    /// repository and title.
-    Source(
-        PullRequestRef,
-        PullRequestRef,
-        Option<RepositoryId>,
-        Option<String>,
-    ),
+    /// An open, ready PR under review at this source.
+    Source {
+        /// Base branch and commit.
+        base: PullRequestRef,
+        /// Head branch and commit.
+        head: PullRequestRef,
+        /// Head repository; `None` once a fork is deleted.
+        head_repository_id: Option<RepositoryId>,
+        /// Title, for display.
+        title: Option<String>,
+        /// Base repository `owner/name`, for display.
+        full_name: Option<String>,
+    },
     /// A PR that ended or went back to draft.
     Ended(PullRequestEnd),
 }
@@ -193,18 +198,19 @@ impl Observed {
             .map(|repo| RepositoryId::new(repo.id.to_string()))
             .transpose()
             .map_err(|_| unavailable("the pull request read"))?;
-        Ok(Self::Source(
-            PullRequestRef {
+        Ok(Self::Source {
+            base: PullRequestRef {
                 ref_name: body.base.ref_name,
                 sha: body.base.sha,
             },
-            PullRequestRef {
+            head: PullRequestRef {
                 ref_name: body.head.ref_name,
                 sha: body.head.sha,
             },
             head_repository_id,
-            body.title,
-        ))
+            title: body.title,
+            full_name: body.base.repo.and_then(|repo| repo.full_name),
+        })
     }
 }
 
@@ -455,7 +461,7 @@ impl GithubConnections<'_> {
                 }),
             };
         }
-        let (base, head, head_repository_id, title) = match observed {
+        let (base, head, head_repository_id, title, full_name) = match observed {
             Observed::Ended(end) => {
                 if let Admitting::Request { .. } = admitting {
                     conn.commit().await.map_err(registry_db_error)?;
@@ -483,9 +489,13 @@ impl GithubConnections<'_> {
                 );
                 return Ok(None);
             }
-            Observed::Source(base, head, head_repository_id, title) => {
-                (base, head, head_repository_id, title)
-            }
+            Observed::Source {
+                base,
+                head,
+                head_repository_id,
+                title,
+                full_name,
+            } => (base, head, head_repository_id, title, full_name),
         };
         let (delivery_id, request_key, requester) = match admitting {
             Admitting::Delivery(delivery_id) => (Some(delivery_id.to_owned()), None, None),
@@ -496,6 +506,7 @@ impl GithubConnections<'_> {
             repository_id: key.repository_id.clone(),
             number: key.number,
             title,
+            full_name,
             base,
             head,
             head_repository_id,
@@ -978,7 +989,7 @@ mod tests {
                 "title": "Refund window",
                 "state": state,
                 "draft": draft,
-                "base": {"ref": "main", "sha": "b", "repo": {"id": 1}},
+                "base": {"ref": "main", "sha": "b", "repo": {"id": 1, "full_name": "acme/app"}},
                 "head": {"ref": "feature", "sha": "h", "repo": {"id": 9}},
             }))
             .expect("the body decodes")
@@ -997,18 +1008,19 @@ mod tests {
         );
         assert_eq!(
             Observed::of(body("open", false)).expect("classifies"),
-            Observed::Source(
-                PullRequestRef {
+            Observed::Source {
+                base: PullRequestRef {
                     ref_name: "main".to_owned(),
                     sha: "b".to_owned()
                 },
-                PullRequestRef {
+                head: PullRequestRef {
                     ref_name: "feature".to_owned(),
                     sha: "h".to_owned()
                 },
-                Some(RepositoryId::new("9").expect("valid")),
-                Some("Refund window".to_owned()),
-            )
+                head_repository_id: Some(RepositoryId::new("9").expect("valid")),
+                title: Some("Refund window".to_owned()),
+                full_name: Some("acme/app".to_owned()),
+            }
         );
     }
 }

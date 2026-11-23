@@ -3710,7 +3710,7 @@ test('the GitHub integration shows safe connection state and asks before disconn
 
 /** One retained admission record of pull request 7: a member of `generation`, which froze `members`. */
 function admitted(generation: string, recorded_at: string, execution_id: string, members: readonly string[], head = 'a1', title?: string): unknown[] {
-  const inputs = { host: 'github.com', repository_id: '1', number: 7, ...(title && { title }), base: { ref: 'main', sha: 'b1' }, head: { ref: 'feature', sha: head }, generation, members, request_key: `key-${generation}` };
+  const inputs = { host: 'github.com', repository_id: '1', number: 7, ...(title && { title, full_name: 'acme/api' }), base: { ref: 'main', sha: 'b1' }, head: { ref: 'feature', sha: head }, generation, members, request_key: `key-${generation}` };
   return ['1.0.0', 'policy-uid', recorded_at, JSON.stringify(inputs)];
 }
 const HISTORY_COLUMNS = ['subject_version', 'workload_card_uid', 'recorded_at', 'inputs'].map((name) => ({ name, data_type: 'Utf8', nullable: true }));
@@ -3805,6 +3805,8 @@ test('a pull request shows its review sets, each member with its own status and 
   // A set recorded before titles were retained is headed by its number.
   const untitled = render(ReviewSets, await loadReviewSets(PULL, { executor: reviewReads(history, [['e5', 'v1', 'running', null, null, null]]).executor }));
   expect(within(untitled.container).getByRole('heading', { level: 1 })).toHaveTextContent('#7');
+  // Nor does it link to GitHub: it recorded no full name.
+  expect(within(untitled.container).queryByRole('link', { name: /↗/ })).toBeNull();
   untitled.unmount();
 
   // Action: render it with the Verifier names the host read.
@@ -3816,6 +3818,9 @@ test('a pull request shows its review sets, each member with its own status and 
   expect(page.getByRole('heading', { level: 1 })).not.toHaveTextContent('#7');
   expect(view.container).toHaveTextContent('#7');
   expect(view.container).toHaveTextContent('Repository Card api');
+  // It links to the pull request on GitHub by the full name its set recorded, in a new tab.
+  expect(page.getByRole('link', { name: 'acme/api#7 ↗' })).toHaveAttribute('href', 'https://github.com/acme/api/pull/7');
+  expect(page.getByRole('link', { name: 'acme/api#7 ↗' })).toHaveAttribute('target', '_blank');
   // Every retained set is listed newest first; the latest is marked and the pinned one is current.
   const rows = within(page.getByRole('navigation', { name: 'Review sets of #7' })).getAllByRole('button');
   expect(rows.map((row) => row.textContent?.replace(/\s+/g, ' ').trim())).toEqual([

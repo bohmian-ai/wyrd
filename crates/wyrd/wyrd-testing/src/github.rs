@@ -165,8 +165,9 @@ impl PullRequest {
         }
     }
 
-    /// GitHub's JSON shape of the pull request numbered `number`.
-    fn json(&self, repository: u64, number: u64) -> Value {
+    /// GitHub's JSON shape of the pull request numbered `number` of
+    /// `repository`, named `full_name` when an installation selected it.
+    fn json(&self, repository: u64, full_name: Option<&str>, number: u64) -> Value {
         json!({
             "number": number,
             "html_url": format!("https://github.test/repositories/{repository}/pull/{number}"),
@@ -174,7 +175,7 @@ impl PullRequest {
             "state": if self.open { "open" } else { "closed" },
             "draft": self.draft,
             "merged": false,
-            "base": {"ref": self.base_ref, "sha": self.base_sha, "repo": {"id": repository}},
+            "base": {"ref": self.base_ref, "sha": self.base_sha, "repo": {"id": repository, "full_name": full_name}},
             "head": {
                 "ref": self.head_ref,
                 "sha": self.head_sha,
@@ -277,6 +278,16 @@ struct MockState {
     delivery_requests: Vec<(std::time::Instant, String)>,
     /// Counter for unique codes and tokens.
     serial: u64,
+}
+
+impl MockState {
+    /// The `owner/name` an installation selected `repository` under.
+    fn full_name(&self, repository: u64) -> Option<&str> {
+        self.installations
+            .values()
+            .find_map(|installation| installation.repositories.get(&repository))
+            .map(String::as_str)
+    }
 }
 
 /// The shared mock owner.
@@ -563,7 +574,7 @@ impl GithubAppMock {
         json!({
             "action": action,
             "number": number,
-            "pull_request": pull_request.json(repository, number),
+            "pull_request": pull_request.json(repository, state.full_name(repository), number),
             "repository": {"id": repository},
             "installation": {"id": installation},
         })
@@ -1229,7 +1240,8 @@ async fn pull_request(
             _ if !issued => StatusCode::UNAUTHORIZED.into_response(),
             (_, Some(status)) => status.into_response(),
             (Some(pull_request), None) if reachable => {
-                axum::Json(pull_request.json(repository, number)).into_response()
+                axum::Json(pull_request.json(repository, state.full_name(repository), number))
+                    .into_response()
             }
             _ => StatusCode::NOT_FOUND.into_response(),
         };

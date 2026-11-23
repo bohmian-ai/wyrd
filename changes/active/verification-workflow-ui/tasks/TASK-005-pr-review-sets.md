@@ -152,6 +152,26 @@ proof, not manufactured failures.
      1 passed; [D1] 1 passed; `mise run fmt`, `mise run lints`,
      `mise run py:lints`, `mise run codegen:check`, `mise run ui:check` all
      exit 0.
+   - GitHub link (maintainer decision, 2026-11-23, same exception): optional
+     `PullRequestActivation.full_name`, read from `base.repo.full_name` on
+     the same admission read; display only, since a rename keeps
+     `repository_id`. `ReviewSets` links `https://{host}/{full_name}/pull/{n}`
+     in a new tab; a set without one shows no link. The fake GitHub now
+     serves `full_name` from its installation's repository list.
+     RED: [U1] scenario 1, `full_name: 'acme/api'` missing; [U2] link
+     `acme/api#7 ↗` not found. GREEN: [U1] 3 passed; [U2]/[P1] 68 passed;
+     the Rust unit above 1 passed (now asserts `full_name`).
+   - Diagnosis: [B1]
+     `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-server --test integration -E "test(/^pg_github_pull_requests::/)"'`
+     failed 1 of 26. Symptom:
+     `pull_request_lifecycle_admits_supersedes_and_ends_through_the_webhook`
+     (`pg_github_pull_requests.rs:595`) whole-object `assert_eq!`. Evidence:
+     served source carries `"title": "Change"` and `"full_name": "acme/policy"`,
+     the expectation has neither. Cause: expectation predates the two
+     retained display fields. Fix site: that expectation; exact equality kept.
+     Diagnostician (codex `gpt-6.1-sol`, medium, read-only): same cause and
+     fix site; MCP, CLI and SDK journeys assert single fields or partial
+     objects and are unaffected. After the fix [B1] 26 passed.
    - Status: PASS.
 
 2. **Keep current and history exact.** Request a fresh review at the same head,

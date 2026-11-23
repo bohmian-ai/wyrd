@@ -116,6 +116,9 @@ pub(crate) struct PullRequestSide {
 pub(crate) struct PullRequestRepository {
     /// Stable repository id.
     pub(crate) id: u64,
+    /// `owner/name`; display only, since a rename keeps `id`.
+    #[serde(default)]
+    pub(crate) full_name: Option<String>,
 }
 
 /// `GET /repositories/{id}/pulls/{number}` body, as far as Wyrd reads it:

@@ -563,6 +563,12 @@ pub struct PullRequestActivation {
     /// before titles were retained.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// The base repository's `owner/name` when this source was admitted, for
+    /// linking to the pull request on the provider; display only, since a
+    /// rename keeps `repository_id`. Absent on a source admitted before
+    /// names were retained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_name: Option<String>,
     /// Base branch and commit.
     pub base: PullRequestRef,
     /// Head branch and commit.

@@ -558,7 +558,7 @@ const reviewSet = (generation: string, at: string, head: string, members: readon
   JSON.stringify({ host: 'github.com', repository_id: '718204331', number: REVIEW.number, base: { ref: 'main', sha: 'c0ffee1'.padEnd(40, '0') }, head: { ref: 'refund-window', sha: head.padEnd(40, '0') }, generation, members, ...source })
 ];
 const reviewSets = [
-  reviewSet(REVIEW.latest, '2026-10-20T11:57:40.000000Z', '9f2c1ab', ['exec_failed', 'exec_passed'], { delivery_id: 'd-2', title: 'Refund window follows the 30-day policy' }),
+  reviewSet(REVIEW.latest, '2026-10-20T11:57:40.000000Z', '9f2c1ab', ['exec_failed', 'exec_passed'], { delivery_id: 'd-2', title: 'Refund window follows the 30-day policy', full_name: 'acme/payments-api' }),
   reviewSet(REVIEW.earlier, '2026-10-20T11:28:00.000000Z', '41d07be', ['exec_cancelled', 'exec_waiting'], { request_key: 'review-1' })
 ];
 const reviewMembers: Record<string, unknown[]> = {

@@ -1361,6 +1361,8 @@ export interface ReviewSet {
   readonly number: number;
   /** The pull request's title when this set was admitted; absent on a set recorded before titles were retained. */
   readonly title?: string;
+  /** The base repository's `owner/name` when this set was admitted; absent on a set recorded before names were retained. */
+  readonly full_name?: string;
   readonly base: ReviewSetRef;
   readonly head: ReviewSetRef;
   /** The exact Repository policy version selected at admission, as recorded: its Card name, version and UID. */

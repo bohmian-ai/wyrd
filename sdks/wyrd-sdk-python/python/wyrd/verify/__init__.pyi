@@ -621,6 +621,8 @@ class PullRequestActivation(TypedDict):
     number: int
     title: NotRequired[str]
     """The pull request's title when this source was admitted; absent on older sources."""
+    full_name: NotRequired[str]
+    """The base repository's ``owner/name`` when this source was admitted; absent on older sources."""
     base: PullRequestRef
     head: PullRequestRef
     head_repository_id: NotRequired[str | None]

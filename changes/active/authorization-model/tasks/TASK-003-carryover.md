@@ -751,12 +751,24 @@ b7206eafe.
   - `cargo nextest run --locked -p wyrd-auth -p wyrd-sql -p wyrd-auth-oidc -p wyrd-cli -p
     wyrd-server --features wyrd-server/test-support --lib --test integration --no-fail-fast -E
     'kind(lib) | test(/^platform_admin_e2e::/) | test(/^pg_browser_sessions::/) |
-    test(/social|login|openapi|signup|config|github/)'` (1232/1233; the one failure is below);
+    test(/social|login|openapi|signup|config|github/)'` (1232/1233 before the gateway test fix below);
   - `mise run fmt`, `mise run lints`, `codegen:check`, `docs:generate` (no diff),
     `docs:check` and `check:tenant-isolation` are clean.
-- **Open:** `components::gateway::pg_administration_tests::gateway_managed_secret_renewal_keeps_the_key_and_loses_races`
-  fails intermittently (1 of 3 isolated runs) outside this cycle's write set. The
-  diagnostician's report is below.
+- **Lane regression outside the write set (fixed):**
+  - Symptom: `components::gateway::pg_administration_tests::gateway_managed_secret_renewal_keeps_the_key_and_loses_races`
+    failed in both lane runs and in 1 of 3 isolated runs at `pg_administration_tests.rs:639`.
+    The renewal returned `Ok` instead of losing to the replacement.
+  - Evidence and cause (read-only diagnostician, from source and trace): the renewal's reseal
+    and the replacement's seal both wait on the same 300 ms delayed transit fixture. The
+    replacement starts right after the renewal's encrypt arrives, so the commit order depends
+    on timer and wakeup order. Nothing in the test fixes it. The compare-and-swap in
+    `renew_gateway_credential` is correct. Cycle 11's diff is not involved; the leg came in
+    with 7c935655a.
+  - Fix site: the test only. The replacement seals through a second, undelayed
+    `TransitFixture`, so it commits inside the renewal's in-flight 300 ms, as the revoke leg
+    already does. The sibling races that use `start_delayed` race writes that make no key-service
+    call, so they stay deterministic.
+  - Result: 6/6 isolated runs pass.
 
 After cycle 11: cycles 12–20 as listed below; cycle 15 is the UI mock gate.
 

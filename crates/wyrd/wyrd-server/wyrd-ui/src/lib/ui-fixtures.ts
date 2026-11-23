@@ -356,15 +356,15 @@ export const VERIFIER_UIDS = { policy: '01a1e602-c0e3-7880-ad65-f29c521418cb', d
 export const verifierLabels = { [VERIFIER_UIDS.policy]: 'ticket-policy@1.1.0', [VERIFIER_UIDS.drift]: 'latency-drift@1.0.0' };
 /** Executions, as the Verify list reads them: shown columns, then execution_id. Completed with each verdict, a recorded cancel, a direct execution with no result, completed before its result row is visible, and one waiting. */
 export const executions = result(
-  [col('recorded_at', 'Timestamp(µs, "+00:00")'), col('verifier_card_uid'), col('subject_name'), col('run_id'), col('group_id'), col('service_name'), col('status'), col('verdict'), col('execution_id'), col('pull_request'), col('review_set')],
+  [col('recorded_at', 'Timestamp(µs, "+00:00")'), col('verifier_card_uid'), col('subject_name'), col('run_id'), col('group_id'), col('service_name'), col('status'), col('verdict'), col('execution_id'), col('pull_request'), col('review_set'), col('head'), col('policy')],
   [
-    ['2026-10-20T11:58:02.412000Z', VERIFIER_UIDS.policy, 'support-agent', '01a1e602-c9a9-7d0b-a028-5acc7427195f', null, 'support-api', 'completed', 'failed', 'exec_failed', 'payments-api#482', '01a1e7a0-5b1c-7d2e-9c41-0f6d2b7a9e11'],
-    ['2026-10-20T11:57:41.000000Z', VERIFIER_UIDS.policy, 'support-agent', '01a1e602-c7e4-7396-97d9-a8f9dfc2cde9', 'conversation-7', 'support-api', 'completed', 'passed', 'exec_passed', 'payments-api#482', '01a1e7a0-5b1c-7d2e-9c41-0f6d2b7a9e11'],
-    ['2026-10-20T11:40:00.000000Z', VERIFIER_UIDS.drift, 'latency-model', null, null, null, 'completed', 'inconclusive', 'exec_inconclusive', null, null],
-    ['2026-10-20T11:31:10.000000Z', VERIFIER_UIDS.drift, 'latency-model', null, null, null, 'cancelled', null, 'exec_cancelled', null, null],
-    ['2026-10-20T11:30:00.000000Z', VERIFIER_UIDS.policy, 'support-agent', null, null, 'support-api', 'not recorded', null, 'exec_open', null, null],
-    ['2026-10-20T11:29:00.000000Z', VERIFIER_UIDS.policy, 'support-agent', null, null, 'support-api', 'completed', null, 'exec_lagging', null, null],
-    ['2026-10-20T11:28:00.000000Z', VERIFIER_UIDS.policy, 'support-agent', null, null, 'support-api', 'waiting', null, 'exec_waiting', null, null]
+    ['2026-10-20T11:58:02.412000Z', VERIFIER_UIDS.policy, 'support-agent', '01a1e602-c9a9-7d0b-a028-5acc7427195f', null, 'support-api', 'completed', 'failed', 'exec_failed', 'payments-api#482', '01a1e7a0-5b1c-7d2e-9c41-0f6d2b7a9e11', '9f2c1ab0c4', 'payments-api@1.4.0'],
+    ['2026-10-20T11:57:41.000000Z', VERIFIER_UIDS.policy, 'support-agent', '01a1e602-c7e4-7396-97d9-a8f9dfc2cde9', 'conversation-7', 'support-api', 'completed', 'passed', 'exec_passed', 'payments-api#482', '01a1e7a0-5b1c-7d2e-9c41-0f6d2b7a9e11', '9f2c1ab0c4', 'payments-api@1.4.0'],
+    ['2026-10-20T11:40:00.000000Z', VERIFIER_UIDS.drift, 'latency-model', null, null, null, 'completed', 'inconclusive', 'exec_inconclusive', null, null, null, null],
+    ['2026-10-20T11:31:10.000000Z', VERIFIER_UIDS.drift, 'latency-model', null, null, null, 'cancelled', null, 'exec_cancelled', null, null, null, null],
+    ['2026-10-20T11:30:00.000000Z', VERIFIER_UIDS.policy, 'support-agent', null, null, 'support-api', 'not recorded', null, 'exec_open', null, null, null, null],
+    ['2026-10-20T11:29:00.000000Z', VERIFIER_UIDS.policy, 'support-agent', null, null, 'support-api', 'completed', null, 'exec_lagging', null, null, null, null],
+    ['2026-10-20T11:28:00.000000Z', VERIFIER_UIDS.policy, 'support-agent', null, null, 'support-api', 'waiting', null, 'exec_waiting', null, null, null, null]
   ]
 );
 /** Executions per bucket by verdict and by Verifier, as the two Verify charts read them. */

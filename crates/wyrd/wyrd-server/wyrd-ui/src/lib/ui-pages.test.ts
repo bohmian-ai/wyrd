@@ -1394,7 +1394,10 @@ test('Repository activity, Verify and an execution each lead to the pull request
   const repositoryUrl = new URL('http://ui.test/t/acme/repositories/payments-api?version=1.4.0');
   const repository = render(RepositoryPage, { data: { ...(await loadRepository({ ...session, params: { tenantKey: 'acme', name: 'payments-api' }, url: repositoryUrl, request: new Request(repositoryUrl) } as never)), tenant } } as never);
   const activity = within(repository.getByRole('region', { name: 'Verification activity' }));
-  expect(activity.getByRole('columnheader', { name: /Pull request/ })).toBeInTheDocument();
+  // Each row names its pull request, the head it reviewed and the policy version that admitted it, in the mock's order.
+  expect(activity.getAllByRole('columnheader').map((cell) => cell.textContent?.replace(/[↑↓]/g, '').trim())).toEqual(['Time', 'Pull request', 'Head', 'Verifier', 'Policy', 'Status', 'Verdict']);
+  const pulled = activity.getAllByRole('row').find((row) => row.textContent?.includes('payments-api#482'));
+  expect(pulled && within(pulled).getByTitle('9f2c1ab0c4')).toHaveTextContent(/^9f2c1ab$/);
   await fireEvent.click(activity.getAllByRole('button', { name: 'payments-api#482' })[0]);
   expect(goto).toHaveBeenLastCalledWith(`/t/acme/repositories/payments-api/pulls/482?set=${REVIEW.latest}`);
   repository.unmount();

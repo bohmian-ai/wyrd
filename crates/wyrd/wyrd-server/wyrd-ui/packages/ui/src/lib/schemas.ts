@@ -248,8 +248,10 @@ const SINCE = "$1::timestamptz - INTERVAL '1 hour'";
 const EXECUTIONS =
   '(SELECT i.execution_id, i.recorded_at, i.verifier_card_uid, i.binding_id, i.group_id, i.origin, i.run_id, ' +
   'i.subject_kind, i.subject_name, i.subject_version, i.subject_card_uid, i.workload_card_uid, i.service_name, i.service_version, i.deployment_environment, ' +
-  // A pull request execution's Repository Card and number as one value, and the review set that admitted it; text, so no other origin's input is ever cast.
+  // A pull request execution's Repository Card and number as one value, the review set that admitted it, the head it
+  // reviewed and the policy version that admitted it; text, so no other origin's input is ever cast.
   "CASE WHEN i.origin = 'pull_request' THEN i.subject_name || '#' || (i.inputs ->> 'number') END AS pull_request, CASE WHEN i.origin = 'pull_request' THEN i.inputs ->> 'generation' END AS review_set, " +
+  "CASE WHEN i.origin = 'pull_request' THEN i.inputs -> 'head' ->> 'sha' END AS head, CASE WHEN i.origin = 'pull_request' THEN i.subject_name || '@' || i.subject_version END AS policy, " +
   'r.result_id, r.verdict, r.ended_at, ' +
   "CASE WHEN i.origin = 'direct' THEN CASE WHEN r.result_id IS NOT NULL THEN 'completed' ELSE 'not recorded' END ELSE coalesce(q.status, 'pending') END AS status " +
   'FROM bifrost.verification.execution_inputs i ' +
@@ -312,7 +314,7 @@ export const SIGNALS = {
       'status', 'verdict', 'verifier_card_uid', 'service_name', 'subject_name', 'run_id', 'group_id', 'origin', 'binding_id', 'subject_kind', 'subject_version',
       'subject_card_uid', 'workload_card_uid', 'service_version', 'deployment_environment', 'execution_id', 'result_id', 'pull_request', 'review_set'
     ],
-    more: ['ended_at', 'pull_request', 'review_set']
+    more: ['ended_at', 'pull_request', 'review_set', 'head', 'policy']
   }
 } as const;
 

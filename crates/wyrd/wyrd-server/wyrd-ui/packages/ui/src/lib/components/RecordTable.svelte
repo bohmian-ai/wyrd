@@ -355,6 +355,8 @@
                         <span class="st tone-{mark[2]}" title={value === 'not recorded' ? UNSETTLED : undefined}><span aria-hidden="true">{mark[0]}</span>{mark[1]}</span>
                       {:else if signal === 'executions' && column === 'pull_request' && typeof value === 'string'}
                         <button type="button" class="pull" title="Open the review sets of {value}" onclick={(event) => (event.stopPropagation(), openPull(value, row[columnIndex(rows, 'review_set')]))}>{value}</button>
+                      {:else if signal === 'executions' && column === 'head' && typeof value === 'string'}
+                        <span class="id" title={value}>{value.slice(0, 7)}</span>
                       {:else if signal === 'executions' && value === null}
                         <span class="null">—</span>
                       {:else if signal === 'executions' && column === 'recorded_at'}

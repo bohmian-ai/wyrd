@@ -28,7 +28,7 @@ export const load: PageServerLoad = async ({ locals, params, url, request }) => 
   const [activity, [verifiers]] = await Promise.all([
     loadPanel(
       'RecordTable',
-      { signal: 'executions', where: activityWhere(params.name), columns: ['recorded_at', 'pull_request', 'verifier_card_uid', 'subject_version', 'status', 'verdict'], limit: ACTIVITY_ROWS },
+      { signal: 'executions', where: activityWhere(params.name), columns: ['recorded_at', 'pull_request', 'head', 'verifier_card_uid', 'policy', 'status', 'verdict'], limit: ACTIVITY_ROWS },
       { executor, range: resolveRange({ last: ACTIVITY_LAST }), signal: request.signal }
     ) as Promise<RecordTableProps | Problem>,
     // ponytail: one page of 200 Verifier versions is named; past that a row shows its exact UID, as on Verify.

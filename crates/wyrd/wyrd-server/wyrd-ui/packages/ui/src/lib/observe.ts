@@ -1635,6 +1635,8 @@ const LABELS: Readonly<Record<string, string>> = {
   group_id: 'Session',
   pull_request: 'Pull request',
   review_set: 'Review set',
+  head: 'Head',
+  policy: 'Policy',
   binding_id: 'Binding',
   origin: 'Origin',
   status: 'Status',

@@ -2281,16 +2281,16 @@ deferred('TASK-005: the current review set of a pull request loads its recorded 
   }
   await mcp.close();
 
-  // Verify's own list finds the same members by their pull request, each naming its review set.
+  // Verify's own list finds the same members by their pull request, each naming its review set and the head it reviewed.
   const hour = { from: new Date(Date.now() - 3_600_000).toISOString(), to: new Date(Date.now() + 60_000).toISOString() };
   const listed = await loadRecordTable(
-    { signal: 'executions', columns: ['pull_request', 'review_set', 'status'], where: [{ column: 'pull_request', value: `${policy.metadata.name}#7` }] },
+    { signal: 'executions', columns: ['pull_request', 'review_set', 'head', 'status'], where: [{ column: 'pull_request', value: `${policy.metadata.name}#7` }] },
     { executor: nodeExecutor(admin), range: hour }
   );
   if (listed.result.state !== 'populated') throw new Error(JSON.stringify(listed.result));
   const at = (name: string) => listed.result.state === 'populated' ? listed.result.data.rows.columns.findIndex((column) => column.name === name) : -1;
-  expect(listed.result.data.rows.rows.map((row) => [row[at('execution_id')], row[at('pull_request')], row[at('review_set')]]).sort()).toEqual(
-    accepted.executions.map((id) => [id, `${policy.metadata.name}#7`, accepted.generation]).sort()
+  expect(listed.result.data.rows.rows.map((row) => [row[at('execution_id')], row[at('pull_request')], row[at('review_set')], row[at('head')]]).sort()).toEqual(
+    accepted.executions.map((id) => [id, `${policy.metadata.name}#7`, accepted.generation, REVIEW_HEAD]).sort()
   );
 });
 

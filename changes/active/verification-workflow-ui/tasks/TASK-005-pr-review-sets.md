@@ -352,6 +352,16 @@ proof, not manufactured failures.
      button, never an `<a>` without `href` (asserted in [U2]; restoring the
      old choice fails it); occurrence takes each row's index instead of a
      per-row search.
+   - Repository activity Head and Policy (maintainer decision, 2026-11-23):
+     the shared executions population gains `head` (`inputs.head.sha`) and
+     `policy` (`subject_name@subject_version`), PR origin only, beside
+     `pull_request`; both selectable on Verify. Activity reads Time, Pull
+     request, Head, Verifier, Policy, Status, Verdict; Head shows 7 characters
+     with the full SHA as its title. RED: [U1] scenario 1 `No field named
+     head`; [P1] "Repository activity, Verify and an execution…" headers
+     lacked Head and Policy. GREEN: [U1] 3 passed; [P1]/[U2] 68 passed;
+     `ui:check` 112 passed; [D2] 1 passed. The "Latest per PR / Include
+     earlier review sets" switch is deferred (maintainer decision).
    - Diagnosis: [D2] first failed at `wyrd execution status`
      (`ui-pages.integration.test.ts:2849`) with `unknown field \`title\``.
      Evidence: `target/debug/wyrd` built 15:08, `wyrd-spec` change 16:25;

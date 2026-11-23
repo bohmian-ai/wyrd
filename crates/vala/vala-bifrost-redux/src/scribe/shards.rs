@@ -12933,5 +12933,173 @@ mod tests {
                 "the cancelled group's row is visible"
             );
         }
+
+        /// While the older group's fence COMMIT stays unresolved, the younger
+        /// group syncs but never fences and neither group is acknowledged;
+        /// once the COMMIT lands, both commit exactly once in order.
+        ///
+        /// A deferred constraint trigger fails every COMMIT carrying the older
+        /// batch, so each attempt is ambiguous and resolves absent; a sequence
+        /// counts the failures across rollbacks.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the younger group fences or either group is answered
+        /// during the ambiguity, or a row is lost or duplicated afterwards.
+        #[tokio::test]
+        async fn an_unresolved_older_commit_holds_the_younger_group_unfenced() {
+            let (fixture, owner, budget, command_tx) = PipelineFixture::start().await;
+            let ids = [uuid::Uuid::now_v7(), uuid::Uuid::now_v7()];
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "CREATE SEQUENCE public.ambiguous_commits; \
+                 CREATE FUNCTION public.fail_commit() RETURNS trigger \
+                 LANGUAGE plpgsql SECURITY DEFINER AS $body$ BEGIN \
+                 PERFORM nextval('public.ambiguous_commits'); \
+                 RAISE EXCEPTION 'injected ambiguous COMMIT'; END $body$; \
+                 CREATE CONSTRAINT TRIGGER fail_commit AFTER INSERT \
+                 ON vala.scribe_batch_commits DEFERRABLE INITIALLY DEFERRED \
+                 FOR EACH ROW WHEN (NEW.batch_id = '{}') \
+                 EXECUTE FUNCTION public.fail_commit();",
+                ids[0]
+            )))
+            .execute(&fixture.superuser)
+            .await
+            .expect("install the ambiguous COMMIT");
+            let failures = || async {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT CASE WHEN is_called THEN last_value ELSE 0 END \
+                     FROM public.ambiguous_commits",
+                )
+                .fetch_one(&fixture.superuser)
+                .await
+                .expect("read the failed COMMITs")
+            };
+            let (appends, mut acks) = acked_group_for_key(&budget, &fixture.key, &ids);
+            let mut appends = appends.into_iter();
+            let wal_io = owner.wal_io.clone();
+            let live = Arc::clone(&owner.memtable);
+            owner.pending.fetch_add(2, Ordering::AcqRel);
+            let task = tokio::spawn(owner.run());
+
+            submit(&command_tx, appends.next().into_iter().collect()).await;
+            let retried = async {
+                while failures().await < 2 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            };
+            tokio::time::timeout(DEADLOCK_BOUND, retried)
+                .await
+                .expect("the older COMMIT fails, resolves absent and retries");
+            let (synced, release_io) = wal_io.hold_next_sync_for_test();
+            submit(&command_tx, appends.collect()).await;
+            tokio::time::timeout(DEADLOCK_BOUND, synced)
+                .await
+                .expect("the younger group syncs during the ambiguity")
+                .expect("the held sync reports");
+            drop(release_io);
+            let seen = failures().await;
+            let still_ambiguous = async {
+                while failures().await < seen + 2 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            };
+            tokio::time::timeout(DEADLOCK_BOUND, still_ambiguous)
+                .await
+                .expect("the older COMMIT stays unresolved");
+            assert_eq!(
+                fixture.fenced(&ids[1..]).await,
+                0,
+                "the younger group never fences while the older COMMIT is unresolved"
+            );
+            assert!(
+                ack_pending(&mut acks[0]),
+                "the ambiguous group is unanswered"
+            );
+            assert!(ack_pending(&mut acks[1]), "the younger group is unanswered");
+            assert_eq!(
+                visible_rows(&live),
+                0,
+                "no row is visible during the ambiguity"
+            );
+
+            sqlx::raw_sql("DROP TRIGGER fail_commit ON vala.scribe_batch_commits")
+                .execute(&fixture.superuser)
+                .await
+                .expect("let the COMMIT land");
+            let older = settled(&mut acks[0], "the older group")
+                .await
+                .expect("the resolved group commits");
+            assert!(older.first_commit);
+            settled(&mut acks[1], "the younger group")
+                .await
+                .expect("the younger group commits");
+            assert_eq!(fixture.fenced(&ids).await, 2);
+            assert_eq!(visible_rows(&live), 2, "each row is visible exactly once");
+            command_tx
+                .send(ShardCommand::Shutdown)
+                .await
+                .expect("shutdown mailbox");
+            tokio::time::timeout(DEADLOCK_BOUND, task)
+                .await
+                .expect("the owner drains")
+                .expect("owner task");
+        }
+
+        /// An age seal that arrives while a group fences waits for that group
+        /// and seals only its expired key; a group queued after it lands in
+        /// the next generation.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the seal runs before the dispatched group inserts, a later
+        /// group dispatches ahead of it, or either group fails.
+        #[tokio::test]
+        async fn age_seals_wait_for_the_dispatched_group() {
+            let (fixture, owner, budget, command_tx) = PipelineFixture::start().await;
+            let ids = [uuid::Uuid::now_v7(), uuid::Uuid::now_v7()];
+            let blocker = fixture.hold_fence(ids[0]).await;
+            let (appends, mut acks) = acked_group_for_key(&budget, &fixture.key, &ids);
+            let mut appends = appends.into_iter();
+            let wal_io = owner.wal_io.clone();
+            let live = Arc::clone(&owner.memtable);
+            owner.pending.fetch_add(2, Ordering::AcqRel);
+            let task = tokio::spawn(owner.run());
+
+            submit(&command_tx, appends.next().into_iter().collect()).await;
+            fixture.fence_blocked().await;
+            command_tx
+                .send(ShardCommand::FlushExpired {
+                    now: std::time::Instant::now() + std::time::Duration::from_hours(24),
+                })
+                .await
+                .expect("age flush mailbox");
+            submit(&command_tx, appends.collect()).await;
+            assert_eq!(
+                wal_io.write_submissions_for_test(),
+                2,
+                "no group dispatches behind the waiting age seal"
+            );
+            blocker.rollback().await.expect("release the fence");
+            settled(&mut acks[0], "the fencing group")
+                .await
+                .expect("the fencing group commits");
+            settled(&mut acks[1], "the later group")
+                .await
+                .expect("the later group commits");
+            let stats = live.stats().expect("memtable stats");
+            assert_eq!(
+                (stats.immutable_rows, stats.writable_rows),
+                (1, 1),
+                "the age seal holds the fencing group's row and the later group writes fresh"
+            );
+            command_tx
+                .send(ShardCommand::Shutdown)
+                .await
+                .expect("shutdown mailbox");
+            tokio::time::timeout(DEADLOCK_BOUND, task)
+                .await
+                .expect("the owner drains")
+                .expect("owner task");
+        }
     }
 }

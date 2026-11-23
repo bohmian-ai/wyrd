@@ -12647,6 +12647,209 @@ mod tests {
                 .expect("owner task");
         }
 
+        /// Competing tenants and tables share one shard's two-slot pipeline:
+        /// each wave of appends for two tenants and two tables per tenant
+        /// syncs while the previous wave fences, every wave is acknowledged
+        /// while the next wave's IO is held, and rows land under their own
+        /// tenant and table exactly once.
+        ///
+        /// Each wave is queued at once, so it dispatches as one group mixing
+        /// both tenants and all four tables. One batch of each wave has its
+        /// fence key held, so the wave blocks inside its real fence while the
+        /// next wave writes and syncs; the next wave's IO completion is then
+        /// held while the fence is released. The last wave also carries a
+        /// retry of the wave before it, queued behind that table's fresh
+        /// appends: it stays out of the group its first attempt's slot still
+        /// owns and later converges on the first attempt's rows.
+        ///
+        /// # Panics
+        ///
+        /// Panics if a wave cannot sync during the earlier fence, a later
+        /// wave fences before an earlier one settles, an ACK waits on a later
+        /// wave's IO, a row lands under another tenant or table or twice, the
+        /// retry writes a second copy, or any request keeps its charge.
+        #[tokio::test]
+        async fn tenants_and_tables_interleave_through_both_slots_with_independent_acks() {
+            const WAVES: usize = 4;
+            const PER_KEY: usize = 2;
+            let (fixture, mut owner, budget, _) = PipelineFixture::start().await;
+            let (command_tx, receiver) = mpsc::channel(SHARD_COMMAND_CAPACITY);
+            owner.receiver = receiver;
+            let other_tenant = fixture
+                .database
+                .seed_additional_tenant("pipeline-tenants")
+                .await
+                .expect("second tenant");
+            let partition = || crate::test_support::day_partition(2026, 7, 24);
+            let other_table = TableRef::new(BifrostNamespace::Bifrost, "owner-test-other");
+            let keys = [
+                fixture.key.clone(),
+                SealKey::new(fixture.key.tenant, other_table.clone(), partition()),
+                SealKey::new(other_tenant, fixture.key.table.clone(), partition()),
+                SealKey::new(other_tenant, other_table, partition()),
+            ];
+            let ids: Vec<Vec<uuid::Uuid>> = (0..WAVES)
+                .map(|_| {
+                    (0..keys.len() * PER_KEY)
+                        .map(|_| uuid::Uuid::now_v7())
+                        .collect()
+                })
+                .collect();
+            let mut waves = Vec::new();
+            let mut acks = Vec::new();
+            for wave in &ids {
+                let mut appends = Vec::new();
+                let mut wave_acks = Vec::new();
+                for (index, batch_id) in wave.iter().enumerate() {
+                    let (append, ack) =
+                        acked_group_for_key(&budget, &keys[index % keys.len()], &[*batch_id]);
+                    appends.extend(append);
+                    wave_acks.extend(ack);
+                }
+                waves.push(appends);
+                acks.push(wave_acks);
+            }
+            // The first append of each wave is under the fixture key, whose
+            // fence key the fixture can hold.
+            let held = |wave: usize| ids[wave][0];
+            let retried = held(WAVES - 2);
+            let (retry, mut retry_ack) = acked_group_for_key(&budget, &fixture.key, &[retried]);
+            waves[WAVES - 1].extend(retry);
+            let wal_io = owner.wal_io.clone();
+            let live = Arc::clone(&owner.memtable);
+            let pending = Arc::clone(&owner.pending);
+            owner
+                .pending
+                .fetch_add(WAVES * keys.len() * PER_KEY + 1, Ordering::AcqRel);
+            let task = tokio::spawn(owner.run());
+            let mut waves = waves.into_iter();
+            let mut submit_wave = || {
+                for append in waves.next().expect("one queued wave per group") {
+                    command_tx
+                        .try_send(ShardCommand::Append(Box::new(append)))
+                        .expect("the mailbox holds the whole wave");
+                }
+            };
+            let fenced_waves = |range: std::ops::Range<usize>| {
+                ids[range].iter().flatten().copied().collect::<Vec<_>>()
+            };
+
+            let wal_bytes = || crate::scribe::wal::wal_file_bytes_for_test(fixture.wal_root.path());
+
+            let mut blocker = fixture.hold_fence(held(0)).await;
+            submit_wave();
+            fixture.fence_blocked().await;
+            let mut synced_bytes = vec![wal_bytes()];
+            for wave in 0..WAVES - 1 {
+                let (synced, release_io) = wal_io.hold_next_sync_for_test();
+                submit_wave();
+                tokio::time::timeout(DEADLOCK_BOUND, synced)
+                    .await
+                    .expect("the next wave syncs while this wave fences")
+                    .expect("the held sync reports");
+                synced_bytes.push(wal_bytes());
+                assert!(
+                    acks[wave].iter_mut().all(ack_pending),
+                    "wave {wave} is still fencing"
+                );
+                assert_eq!(
+                    fixture.fenced(&fenced_waves(wave + 1..WAVES)).await,
+                    0,
+                    "no later wave fences before wave {wave} settles"
+                );
+
+                blocker.rollback().await.expect("release this wave's fence");
+                for ack in &mut acks[wave] {
+                    let completion = settled(ack, "this wave's append")
+                        .await
+                        .expect("this wave's append commits");
+                    assert!(completion.first_commit);
+                }
+                assert!(
+                    acks[wave + 1].iter_mut().all(ack_pending),
+                    "the next wave's IO is held"
+                );
+                for key in &keys {
+                    assert_eq!(
+                        live.row_count(key).expect("row count"),
+                        (wave + 1) * PER_KEY,
+                        "each tenant and table holds exactly its own acknowledged rows"
+                    );
+                }
+                assert_eq!(
+                    fixture.fenced(&fenced_waves(0..wave + 1)).await,
+                    i64::try_from((wave + 1) * keys.len() * PER_KEY).expect("fits i64"),
+                    "every settled wave is fenced"
+                );
+                assert_eq!(
+                    fixture.fenced(&fenced_waves(wave + 1..WAVES)).await,
+                    0,
+                    "only the oldest wave fences"
+                );
+
+                blocker = fixture.hold_fence(held(wave + 1)).await;
+                drop(release_io);
+                fixture.fence_blocked().await;
+            }
+            let wave_bytes: Vec<u64> = synced_bytes
+                .windows(2)
+                .map(|pair| pair[1] - pair[0])
+                .collect();
+            assert!(
+                wave_bytes.iter().all(|bytes| *bytes == wave_bytes[0]),
+                "every wave writes the same records; the last wave's group holds no retry copy: {wave_bytes:?}"
+            );
+            assert!(
+                ack_pending(&mut retry_ack[0]),
+                "the retry waits for its first attempt's slot"
+            );
+            blocker.rollback().await.expect("release the last fence");
+            for ack in &mut acks[WAVES - 1] {
+                settled(ack, "the last wave's append")
+                    .await
+                    .expect("the last wave's append commits");
+            }
+            let retry = settled(&mut retry_ack[0], "the retry")
+                .await
+                .expect("the retry converges on its first attempt");
+            assert!(!retry.first_commit, "the retry is not a second commit");
+            for key in &keys {
+                assert_eq!(
+                    live.row_count(key).expect("row count"),
+                    WAVES * PER_KEY,
+                    "each tenant and table holds exactly its own rows once"
+                );
+            }
+            assert_eq!(
+                fixture.fenced(&fenced_waves(0..WAVES)).await,
+                i64::try_from(WAVES * keys.len() * PER_KEY).expect("fits i64"),
+                "every batch, the retried one included, is fenced once"
+            );
+            assert_eq!(
+                wal_io.sync_submissions_for_test(),
+                u64::try_from(WAVES).expect("fits u64"),
+                "each wave synced as one mixed group and the retry synced nothing"
+            );
+            command_tx
+                .send(ShardCommand::Shutdown)
+                .await
+                .expect("owner shutdown mailbox");
+            tokio::time::timeout(DEADLOCK_BOUND, task)
+                .await
+                .expect("owner drains and stops")
+                .expect("owner task");
+            assert_eq!(
+                transient_bytes(&budget),
+                0,
+                "every request's charge was released or moved into the memtable"
+            );
+            assert_eq!(
+                pending.load(Ordering::Acquire),
+                0,
+                "every accepted request left the drain count"
+            );
+        }
+
         /// A retried batch waits for its dispatched first attempt to settle
         /// while another table's append takes the free slot, so the retry
         /// converges on the first attempt's rows without a second WAL record.

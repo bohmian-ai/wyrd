@@ -4,6 +4,7 @@
  * `SIGNALS`; every value, range bound and identity is a typed `$n` bind.
  */
 import { failed, wyrdProblem, type Loaded, type Problem, type QueryParam, type QueryResult, type WireRequest } from './contract.js';
+import type { Part } from './execution.js';
 import { fmtDuration, fmtNumber, parseInstant } from './format.js';
 import { bucketFor, bucketWidth, chartParams, inputProblem, resolveRange, shapeChart, type ChartProps, type LoadContext } from './loaders.js';
 import { MAX_SERIES, columnIndex, identityCaptions, numeric } from './plot.js';
@@ -21,6 +22,7 @@ import {
   type Range,
   type RecordDetailInput,
   type RecordTableInput,
+  type ReviewSetsInput,
   type Signal,
   type Stat,
   type StatStripInput,
@@ -376,7 +378,7 @@ export const KEY_COLUMNS: Record<Signal, readonly string[]> = {
   spans: ['trace_id', 'span_id', 'parent_span_id'],
   logs: ['trace_id', 'span_id', 'observed_time_unix_nano', 'wyrd_request_id', 'severity_number'],
   metrics: [],
-  executions: ['execution_id', 'subject_kind', 'subject_version', 'subject_card_uid', 'result_id', 'binding_id', 'workload_card_uid']
+  executions: ['execution_id', 'subject_kind', 'subject_version', 'subject_card_uid', 'result_id', 'binding_id', 'workload_card_uid', 'review_set']
 };
 
 /** The columns a signal list shows. */
@@ -1338,6 +1340,135 @@ export async function loadExecutionDiscovery(input: FacetRailInput, context: Loa
   };
 }
 
+/** One side of a pull request as its admission pinned it. */
+export interface ReviewSetRef {
+  readonly ref: string;
+  readonly sha: string;
+}
+
+/**
+ * One review set as retained: the Verifier executions admitted together for
+ * one pull request source and review occurrence under one exact Repository
+ * policy. `member_ids` is the membership the admission froze, in binding
+ * order; a set has no verdict of its own.
+ */
+export interface ReviewSet {
+  readonly generation: string;
+  /** The server's observation time of the source, as recorded; the newest one is the current set. */
+  readonly recorded_at: unknown;
+  readonly host: string;
+  readonly repository_id: string;
+  readonly number: number;
+  /** The pull request's title when this set was admitted; absent on a set recorded before titles were retained. */
+  readonly title?: string;
+  readonly base: ReviewSetRef;
+  readonly head: ReviewSetRef;
+  /** The exact Repository policy version selected at admission, as recorded: its Card name, version and UID. */
+  readonly policy: { readonly name: string; readonly version: string | null; readonly uid: string | null };
+  /** The provider delivery that admitted the source, else absent. */
+  readonly delivery_id?: string;
+  /** The explicit review request that admitted the source, else absent. */
+  readonly request_key?: string;
+  readonly member_ids: readonly string[];
+}
+
+/** One member of a review set: its own recorded status, selected result and verdict, each null when none is recorded. */
+export interface ReviewMember {
+  readonly execution_id: string;
+  /** False while this member's record is not visible in retained data. */
+  readonly retained: boolean;
+  readonly verifier_card_uid: string | null;
+  readonly status: string | null;
+  readonly verdict: string | null;
+  readonly result_id: string | null;
+  /** The requirements the selected result recorded as failed. */
+  readonly failed: readonly string[];
+}
+
+/** What a pull request's review sets read as: its retained sets newest first, which is current, and the selected set's members. */
+export interface ReviewSetsData {
+  readonly sets: readonly ReviewSet[];
+  /** Older sets exist beyond the {@link REVIEW_SET_ROWS} records one history read returns. */
+  readonly more: boolean;
+  /** The generation with the newest retained observation. */
+  readonly current: string;
+  /** The pinned set, else the current one; absent when the pinned set is not retained. `complete` only when every frozen member's record is visible. */
+  readonly selected?: ReviewSet & { readonly members: readonly ReviewMember[]; readonly complete: boolean };
+}
+
+/** Props of the review sets of one pull request. */
+export interface ReviewSetsProps {
+  readonly input: ReviewSetsInput;
+  /** A pull request with no retained set is `empty` with its reason and no data. */
+  readonly result: Part<ReviewSetsData> | { readonly state: 'loading' };
+}
+
+/** The most retained member records one review-set history read returns. */
+export const REVIEW_SET_ROWS = 200;
+
+// ponytail: no time bound, so old sets stay reachable; the row bound is the only limit. Page by recorded_at if a pull request outgrows it.
+const REVIEW_SETS_OF =
+  'SELECT subject_version, workload_card_uid, recorded_at, to_json(inputs) AS inputs FROM bifrost.verification.execution_inputs ' +
+  "WHERE origin = 'pull_request' AND subject_kind = 'Repository' AND subject_name = $1 AND inputs ->> 'number' = $2";
+const REVIEW_SETS = `${REVIEW_SETS_OF} ORDER BY recorded_at DESC, execution_id LIMIT ${REVIEW_SET_ROWS + 1}`;
+/** The selected result's requirement outcomes, beside the row Verify lists for the same execution. */
+const REVIEW_MEMBERS = `SELECT executions.execution_id, verifier_card_uid, status, verdict, executions.result_id, to_json(o.output) AS output FROM ${SIGNALS.executions.table} LEFT JOIN bifrost.verification.execution_outputs o ON o.result_id = executions.result_id`;
+const REVIEW_SET = `${REVIEW_SETS_OF} AND inputs ->> 'generation' = $3 LIMIT 1`;
+
+/** A Variant column arrives as JSON text or as the value itself. */
+const variant = (value: unknown): unknown => (typeof value === 'string' ? JSON.parse(value) : value);
+const textOf = (value: unknown) => (typeof value === 'string' ? value : null);
+
+/** The review sets of `repository` that `rows` of {@link REVIEW_SETS_OF} name, in row order; every record of a set carries its whole frozen membership. */
+function reviewSets(repository: string, rows: readonly (readonly unknown[])[]): ReviewSet[] {
+  const sets = new Map<string, ReviewSet>();
+  for (const [version, uid, recorded_at, inputs] of rows) {
+    const { members, ...source } = variant(inputs) as Omit<ReviewSet, 'recorded_at' | 'policy' | 'member_ids'> & { readonly members?: readonly string[] };
+    if (!sets.has(source.generation)) sets.set(source.generation, { ...source, recorded_at, policy: { name: repository, version: textOf(version), uid: textOf(uid) }, member_ids: members ?? [] });
+  }
+  return [...sets.values()];
+}
+
+/**
+ * Load one pull request's review sets from its retained admission records,
+ * then the selected set's members from the Verify population: two reads,
+ * whatever the set's size. The current set is the one with the newest
+ * recorded observation, never the newest row to arrive. A pinned generation
+ * is read by its own identity, so it is found beyond the history bound and
+ * is never replaced by the current set when it is not retained. Each
+ * member's status and verdict are the ones Verify lists, read from the set's
+ * own observation time on, not the dashboard's range.
+ */
+export async function loadReviewSets(input: ReviewSetsInput, context: LoadContext): Promise<ReviewSetsProps> {
+  const pull = [input.repository, String(input.number)];
+  const [history, pin] = await context.executor.run(
+    [query(REVIEW_SETS, pull, REVIEW_SET_ROWS + 1), ...(input.generation ? [query(REVIEW_SET, [...pull, input.generation], 1)] : [])],
+    context.signal
+  );
+  const refused = [history, pin].find((read) => read && !read.ok);
+  if (!history.ok) return { input, result: failed(history.problem) };
+  if (refused && !refused.ok) return { input, result: failed(refused.problem) };
+  const sets = reviewSets(input.repository, history.value.rows.slice(0, REVIEW_SET_ROWS));
+  if (sets.length === 0) return { input, result: { state: 'empty', reason: 'No review set is retained for this pull request.' } };
+  const data = { sets, more: history.value.rows.length > REVIEW_SET_ROWS, current: sets[0].generation };
+  const [set] = pin?.ok ? reviewSets(input.repository, pin.value.rows) : sets;
+  if (!set) return { input, result: { state: 'populated', data } };
+
+  const observed = parseInstant(set.recorded_at);
+  const binds = Binds.over(`executions.${SIGNALS.executions.time}`, { from: new Date(observed - 1).toISOString(), to: new Date(observed + 2).toISOString() });
+  binds.clauses.push(`executions.execution_id IN (${set.member_ids.map((id) => binds.bind(id)).join(', ')})`);
+  const [listed] = await context.executor.run([query(`${REVIEW_MEMBERS} WHERE ${binds.sql}`, binds.params)], context.signal);
+  if (!listed.ok) return { input, result: failed(listed.problem) };
+  const rows = new Map(listed.value.rows.map((row) => [String(row[0]), row]));
+  const members = set.member_ids.map((execution_id): ReviewMember => {
+    const row = rows.get(execution_id);
+    const judged = (variant(row?.[5] ?? null) as { requirements?: readonly { id: string; outcome: string }[] } | null)?.requirements ?? [];
+    const failed = judged.filter((requirement) => requirement.outcome === 'failed').map((requirement) => requirement.id);
+    return { execution_id, retained: row !== undefined, verifier_card_uid: textOf(row?.[1]), status: textOf(row?.[2]), verdict: textOf(row?.[3]), result_id: textOf(row?.[4]), failed };
+  });
+  return { input, result: { state: 'populated', data: { ...data, selected: { ...set, members, complete: members.every((member) => member.retained) } } } };
+}
+
 /** How far a trace's spans may start outside its root's own start and end: clock skew between services, and work that outlives the root. */
 const TRACE_SLACK_MS = 3_600_000;
 
@@ -1500,6 +1631,8 @@ const LABELS: Readonly<Record<string, string>> = {
   subject_version: 'Card version',
   run_id: 'Run',
   group_id: 'Session',
+  pull_request: 'Pull request',
+  review_set: 'Review set',
   binding_id: 'Binding',
   origin: 'Origin',
   status: 'Status',

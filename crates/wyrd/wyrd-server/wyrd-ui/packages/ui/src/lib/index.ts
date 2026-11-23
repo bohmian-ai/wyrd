@@ -18,6 +18,7 @@ export { default as VerifierDefinition } from './components/VerifierDefinition.s
 export { default as RunsOn } from './components/RunsOn.svelte';
 export { default as RepositoryIndex } from './components/RepositoryIndex.svelte';
 export { default as RepositoryPolicy } from './components/RepositoryPolicy.svelte';
+export { default as ReviewSets } from './components/ReviewSets.svelte';
 export { default as RepositoryDeclare } from './components/RepositoryDeclare.svelte';
 export { default as GithubIntegration } from './components/GithubIntegration.svelte';
 export { default as VerificationExecution } from './components/VerificationExecution.svelte';

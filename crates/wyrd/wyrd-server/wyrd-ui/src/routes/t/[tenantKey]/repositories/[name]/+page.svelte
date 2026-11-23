@@ -2,7 +2,8 @@
   One exact Repository Card version: its policy and access, then this
   Repository's executions from the population Verify reads. The URL holds
   the viewed version and declaration tab; viewing a version changes no
-  selection. A row opens its exact execution page.
+  selection. A row opens its exact execution page, and its pull request
+  opens the review set that admitted it.
 -->
 <script lang="ts">
   import { requestable } from '$lib/access';
@@ -12,7 +13,7 @@
   import { validateIntent, type ComponentName } from 'wyrd-ai-ui/loaders';
   import Crumbs from '$lib/Crumbs.svelte';
   import { writeDetail } from '$lib/cards-host';
-  import { repositoryHref, verifyHref } from '$lib/repositories-host';
+  import { pullHref, repositoryHref, verifyHref } from '$lib/repositories-host';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();
@@ -25,7 +26,7 @@
       const valid = validateIntent(component, intent);
       if ('code' in valid) return void (actions[intent.name] = { state: 'error', problem: valid });
       if (!shown) return;
-      const input = valid.input as { card_ref?: CardRef; declaration?: string; execution_id?: unknown };
+      const input = valid.input as { card_ref?: CardRef; declaration?: string; execution_id?: unknown; repository?: string; number?: number; generation?: string };
       const here = { declaration: shown.declaration, back: data.back || undefined };
       const stay = { keepFocus: true, noScroll: true };
       actions[valid.name] = { state: 'pending' };
@@ -33,6 +34,7 @@
       else if (valid.name === 'repository.declaration') await goto(repositoryHref(base, shown.cardRef, { ...here, declaration: input.declaration }), stay);
       else if (valid.name === 'card.open' && input.card_ref) await goto(`${base}/cards/detail${writeDetail(input.card_ref)}`);
       else if (valid.name === 'connection.open') await goto(`${base}/settings/integrations/github`);
+      else if (valid.name === 'pull_request.open' && input.repository && input.number) await goto(pullHref(base, input.repository, input.number, input.generation));
       else if (valid.name === 'record.open' && typeof input.execution_id === 'string') await goto(`${base}/verify/executions/${encodeURIComponent(input.execution_id)}`);
       else return void (actions[valid.name] = { state: 'unavailable', reason: 'Open Verify to sort, filter or page these executions.' });
       delete actions[valid.name];

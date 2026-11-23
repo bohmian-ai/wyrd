@@ -9,6 +9,7 @@
   import { ActionButton, EmptyState, VerificationExecution, type ActionIntent, type ActionState, type CardRef, type Problem } from 'wyrd-ai-ui';
   import { validateIntent, type ExecutionInput } from 'wyrd-ai-ui/loaders';
   import { writeDetail } from '$lib/cards-host';
+  import { pullHref } from '$lib/repositories-host';
   import { writeExecution } from '$lib/verify-host';
   import type { PageProps } from './$types';
 
@@ -68,6 +69,8 @@
         return void navigate(valid.name, `${base}/verify/executions/${encodeURIComponent(input.execution_id as string)}`, true);
       case 'card.open':
         return void navigate(valid.name, `${base}/cards/detail${writeDetail(input.card_ref as CardRef)}`, true);
+      case 'pull_request.open':
+        return void navigate(valid.name, pullHref(base, input.repository as string, input.number as number, input.generation as string | undefined), true);
       case 'record.open':
         return void navigate(valid.name, `${base}/observe?${new URLSearchParams({ trace: input.trace_id as string, ...(input.span_id ? { span: input.span_id as string } : {}) })}`, true);
       case 'execution.cancel':

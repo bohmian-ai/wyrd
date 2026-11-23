@@ -80,6 +80,8 @@
     return [...(definition.spec.requirements ?? []), ...steps.flatMap((step) => step.requirements ?? [])].find((each) => each.id === id);
   });
 
+  /** Steps that recorded an invocation, in recorded order; the only steps known when the definition is unavailable. */
+  const ran = $derived([...new Set(items.filter((each) => each.state !== 'requirement').map((each) => each.producer.step_id))]);
   const attempts = $derived(type === 'step' ? attemptsOf(items, id) : []);
   const attempt = $derived(attempts.find((each) => selection.producer && sameProducer(each.producer, selection.producer)) ?? attempts.at(-1));
   const produced = $derived(attempt ? outputs.filter((each) => sameProducer(each.producer, attempt.producer)) : []);
@@ -272,6 +274,21 @@
             {/if}
           </dd>
         </div>
+        {#if status.pull_request}
+          {@const pull = status.pull_request}
+          {@const repository = data.repository}
+          <div class="fact">
+            <dt>Pull request</dt>
+            <dd>
+              {#if repository}
+                <button type="button" class="open" disabled={off('pull_request.open')} title="Open review set {pull.generation}" onclick={() => onaction?.({ name: 'pull_request.open', input: { repository, number: pull.number, generation: pull.generation } })}>{repository}#{pull.number}</button>
+              {:else}
+                #{pull.number}
+              {/if}
+              <span class="muted">head {pull.head.sha.slice(0, 7)}</span>
+            </dd>
+          </div>
+        {/if}
         {@render fact('Run', status.result?.run_id)}
         {@render fact('Session', status.group_id)}
         {@render fact('Owner Card', status.owner_card_uid)}
@@ -291,6 +308,19 @@
     {:else}
       <Panel title="Graph" note="The Verifier this execution ran">
         {@render refused(data.definition, 'Verifier definition')}
+        {@const judged = status.result?.outcome.requirements ?? []}
+        {#if judged.length + ran.length}
+          <div class="recorded" role="group" aria-label="Recorded without the definition">
+            <p class="hint">Recorded requirements and invocations stay selectable. Declared order and edges need the definition.</p>
+            {#each judged as each (each.id)}
+              <button type="button" class="tool" aria-pressed={selection.node === `req:${each.id}`} onclick={() => select({ node: `req:${each.id}` })}><span class="label">Requirement</span> {each.id} <span class="muted">{each.outcome.replace('_', ' ')}</span></button>
+            {/each}
+            {#each ran as step (step)}
+              {@const last = attemptsOf(items, step).at(-1)}
+              <button type="button" class="tool" aria-pressed={selection.node === `step:${step}`} onclick={() => select({ node: `step:${step}` })}><span class="label">Step</span> {step} {#if last}<span class="muted">{recorded(last)}</span>{/if}</button>
+            {/each}
+          </div>
+        {/if}
       </Panel>
     {/if}
     {#if data.invocations}{@render refused(data.invocations, 'Recorded progress')}{/if}
@@ -488,6 +518,19 @@
 {/if}
 
 <style>
+  .recorded {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+  }
+  .muted {
+    color: var(--muted);
+  }
+  .recorded .hint {
+    flex-basis: 100%;
+    margin: 0;
+  }
   .judge {
     display: flex;
     align-items: baseline;

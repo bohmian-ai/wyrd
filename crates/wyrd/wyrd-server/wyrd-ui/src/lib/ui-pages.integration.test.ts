@@ -16,7 +16,7 @@ import { chromium, type Browser, type Page } from 'playwright';
 import { test as base, expect, vi } from 'vitest';
 import { AGREES, assistantTest, judgeReply } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/assistant';
 import { declared, fixture, groupExecution, runtimeAccount, scheduledResult, serverTest } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/server';
-import { Bifrost, Cards, Principals, WyrdClient, WyrdState, verify } from 'wyrd-ai';
+import { Bifrost, Cards, GithubConnection, Principals, WyrdClient, WyrdState, verify } from 'wyrd-ai';
 import { z } from 'zod';
 import { loadExecution } from 'wyrd-ai-ui/loaders';
 import { nodeExecutor } from 'wyrd-ai-ui/node';
@@ -2876,9 +2876,40 @@ reviewing('Alice is given payments in Settings and sees only payments in her bro
     await her.goto(`${base}/repositories/payments?version=${paymentsCard.version}`);
     const activity = her.getByRole('region', { name: 'Verification activity', exact: true }).locator('tbody tr');
     await expect.poll(() => activity.count(), { timeout: 30_000 }).toBe(1);
-    await activity.first().click();
+    // The row names its pull request, which opens the review set that admitted it: one member, passed, and nothing of ledger.
+    const pinned = `${base}/repositories/payments/pulls/7?set=${review.inputs.generation}`;
+    await activity.first().getByRole('button', { name: 'payments#7' }).click();
+    await her.waitForURL(pinned);
+    const setMembers = her.getByRole('region', { name: /^Members of review set/ }).locator('tbody tr');
+    await expect.poll(() => setMembers.count(), { timeout: 30_000 }).toBe(1);
+    expect(await setMembers.first().textContent()).toContain('passed');
+    expect(await her.locator('main').textContent()).not.toContain('ledger');
+    // Ledger's pull request, which she was not granted, reads exactly as a pull request that was never reviewed.
+    const noSet = async (repository: string) => {
+      await her.goto(`${base}/repositories/${repository}/pulls/9`);
+      await expect.poll(() => her.locator('main').textContent()).toContain('No review set is retained for this pull request.');
+      return ((await her.locator('main').textContent()) ?? '').replaceAll(repository, '');
+    };
+    expect(await noSet('ledger')).toBe(await noSet('nosuch'));
+    // The member of the payments set opens as its own execution: completed, owned by payments.
+    await her.goto(pinned);
+    await setMembers.first().getByRole('button').click();
     await her.waitForURL(`${base}/verify/executions/${review.execution_id}`);
     await expect.poll(() => her.locator('[data-execution-status]').getAttribute('data-execution-status')).toBe('completed');
+    // Without the Verifier's definition she still selects the recorded requirement; a reload keeps it selected and Back returns to the same review set.
+    const recorded = her.getByRole('group', { name: 'Recorded without the definition' });
+    await recorded.getByRole('button', { name: /Requirement green/ }).click();
+    await her.waitForURL(/node=req(%3A|:)green/);
+    await her.reload();
+    await expect.poll(() => recorded.getByRole('button', { name: /Requirement green/ }).getAttribute('aria-pressed')).toBe('true');
+    expect(await her.locator('main').textContent()).toContain('Recorded judgment');
+    expect(await her.locator('[data-node]').count()).toBe(0);
+    await her.goBack();
+    await her.goBack();
+    await her.waitForURL(pinned);
+    await expect.poll(() => setMembers.count()).toBe(1);
+    await her.goForward();
+    await her.waitForURL(`${base}/verify/executions/${review.execution_id}`);
     // The Verifier that review ran is a Card she was not granted: its definition is refused on the member's page, by its own link and to her SDK, while the administrator reads it.
     const verifier = { kind: 'Verifier', name: 'ci-gate', version: '1.0.0' } as const;
     await cards.get(verifier);
@@ -2933,6 +2964,9 @@ reviewing('Alice is given payments in Settings and sees only payments in her bro
     await expect.poll(ledgerInBrowser, { timeout: 30_000 }).toBe(true);
     await expect.poll(ledgerInSdk, { timeout: 30_000 }).toBe(true);
     await expect.poll(ledgerInCli, { timeout: 30_000 }).toBe(true);
+    // The same grant opens ledger's review set in the session she already has.
+    await her.goto(`${base}/repositories/ledger/pulls/9`);
+    await expect.poll(() => her.getByRole('region', { name: /^Members of review set/ }).locator('tbody tr').count(), { timeout: 30_000 }).toBe(1);
 
     // The administrator removes that binding in Access. Alice loses ledger everywhere and keeps payments.
     await page.goto(`${base}/settings/access`);
@@ -2942,7 +2976,41 @@ reviewing('Alice is given payments in Settings and sees only payments in her bro
     await expect.poll(ledgerInBrowser, { timeout: 30_000 }).toBe(false);
     await expect.poll(ledgerInSdk, { timeout: 30_000 }).toBe(false);
     await expect.poll(ledgerInCli, { timeout: 30_000 }).toBe(false);
+    await her.goto(`${base}/repositories/ledger/pulls/9`);
+    await expect.poll(() => her.locator('main').textContent(), { timeout: 30_000 }).toContain('No review set is retained for this pull request.');
     expect((await hers.list({ kind: 'Repository' })).items.map((card) => card.name)).toEqual(['payments']);
+
+    // The administrator requests a fresh review of payments #7. Her pull request link follows the new set; the first set stays listed.
+    const rerequested = await (await GithubConnection.connect({ client: admin })).reviewPullRequest({ host: github.host, repository_id: '1', number: 7 }, 'alice-rerequest');
+    const setRows = her.getByRole('navigation', { name: 'Review sets of #7' }).getByRole('button');
+    await expect
+      .poll(
+        async () => {
+          server.flushBifrost();
+          await her.goto(`${base}/repositories/payments/pulls/7`);
+          return setRows.count();
+        },
+        { timeout: 30_000, interval: 500 }
+      )
+      .toBe(2);
+    expect(await setRows.first().getAttribute('aria-current')).toBe('true');
+    expect(await setRows.first().textContent()).toContain('latest');
+    // She selects the earlier set: the URL pins it, a reload stays on it, and its member is the first review's execution.
+    const earlierSet = `${base}/repositories/payments/pulls/7?set=${review.inputs.generation}`;
+    await setRows.nth(1).click();
+    await her.waitForURL(earlierSet);
+    await her.reload();
+    await expect.poll(() => her.getByRole('status').textContent()).toContain('You are viewing earlier review set');
+    expect(rerequested.generation).not.toBe(review.inputs.generation);
+    await her.getByRole('region', { name: /^Members of review set/ }).locator('tbody tr').first().getByRole('button').click();
+    await her.waitForURL(`${base}/verify/executions/${review.execution_id}`);
+    // The member names its pull request and leads back to its own set, not the latest; Back returns there too.
+    await her.getByRole('button', { name: 'payments#7' }).click();
+    await her.waitForURL(earlierSet);
+    await her.goBack();
+    await her.goBack();
+    await her.waitForURL(earlierSet);
+    await expect.poll(() => setRows.nth(1).getAttribute('aria-current')).toBe('true');
 
     // Her browser holds no credential a script can read.
     expect(await her.evaluate(() => `${document.cookie} ${JSON.stringify(localStorage)} ${JSON.stringify(sessionStorage)}`)).not.toMatch(/wyrd_session|eyJ|wyrd_[a-z]+_[A-Za-z0-9]{16}/);

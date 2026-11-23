@@ -444,6 +444,43 @@
         "No edit, activate, pause or rollback control. States: populated, denied, error, loading. Emits card.version, card.open, repository.declaration, connection.open."
       ]
     },
+    "ReviewSets": {
+      "status": "built",
+      "catalog": true,
+      "altitude": "quiet",
+      "consumers": [
+        "src/routes/t/[tenantKey]/repositories/[name]/pulls/[number]/+page.svelte",
+        "view documents (WyrdView)"
+      ],
+      "tokens": [
+        "--border",
+        "--border-soft",
+        "--danger",
+        "--declare",
+        "--declare-soft",
+        "--font-mono",
+        "--font-sans",
+        "--muted",
+        "--ok",
+        "--r",
+        "--surface",
+        "--surface-hover",
+        "--text",
+        "--warn"
+      ],
+      "props": {
+        "input": "ReviewSetsInput (schemas.ts)",
+        "result": "loader result",
+        "labels?": "Verifier Card UID to name@version, read by the host",
+        "actions?": "per-action state",
+        "onaction?": "(intent) => void"
+      },
+      "rules": [
+        "One pull request's retained review sets newest first. The plain input follows the latest set; a generation pins one set and is never replaced by the latest when it is not retained.",
+        "Members are the set's frozen list: each shows its own status, verdict and failed requirements, and a member whose record is not retained is listed as missing. A set has no combined verdict.",
+        "No review request, rerun or cancel control. States: populated, empty, denied, error, loading. Emits review_set.open, record.open, card.open."
+      ]
+    },
     "RepositoryDeclare": {
       "status": "built",
       "catalog": true,

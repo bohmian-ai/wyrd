@@ -69,6 +69,8 @@ export interface ExecutionData {
   readonly inputs?: Part<unknown>;
   /** The drift context of the selected drift requirement. */
   readonly drift?: Part<DriftContext>;
+  /** The Repository Card a pull request execution's retained input names; absent for other origins and until that input is visible. */
+  readonly repository?: string;
 }
 
 /** Props of `VerificationExecution`. */
@@ -97,6 +99,7 @@ const part = <T>(read: WireResult, value: (value: never) => T = (each) => each a
 const NOT_QUEUED = 'WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND';
 
 const VERIFIER_UID = 'SELECT verifier_card_uid FROM bifrost.verification.execution_inputs WHERE execution_id = $1 LIMIT 1';
+const REPOSITORY = 'SELECT subject_name FROM bifrost.verification.execution_inputs WHERE execution_id = $1 LIMIT 1';
 const INPUTS = 'SELECT to_json(inputs) AS inputs FROM bifrost.verification.execution_inputs WHERE execution_id = $1 LIMIT 1';
 const DRIFT_ROW = 'SELECT binding_id, window_start, window_end, ended_at FROM bifrost.verification.results WHERE execution_id = $1 LIMIT 1';
 const DRIFT_ROWS =
@@ -183,7 +186,8 @@ async function readPublication(
  * result is recorded yet, and the selection adds only what it names: the publication page for
  * the outputs or a step, completed details when asked for and the
  * execution has a result, one publication, one source slot's members, the
- * accepted inputs, or one drift requirement's recorded context. The returned
+ * accepted inputs, one drift requirement's recorded context, or a pull
+ * request execution's Repository Card name. The returned
  * input carries the selection actually shown.
  */
 export async function loadExecution(input: ExecutionInput, context: Context): Promise<VerificationExecutionProps> {
@@ -201,11 +205,11 @@ export async function loadExecution(input: ExecutionInput, context: Context): Pr
 
   const absent = (read: WireResult) => !read.ok && read.problem.code === NOT_QUEUED;
   const defined = readDefinition(state, one);
-  const [definition, invocations, publications, details, selected, members, inputs, drift] = await Promise.all([
+  const [definition, invocations, publications, details, selected, members, inputs, drift, repository] = await Promise.all([
     defined,
-    // Step states come from recorded progress, and so do requirement states until a result is recorded.
+    // Step states come from recorded progress, and so do requirement states until a result is recorded. Without a readable definition, recorded progress is the only list of steps to select.
     defined.then(async (definition) => {
-      if (state.result && type !== 'step' && !(definition.state === 'populated' && definition.data.graph.steps.length)) return undefined;
+      if (state.result && type !== 'step' && definition.state === 'populated' && !definition.data.graph.steps.length) return undefined;
       const read = await one({ op: 'verification.list_invocations', execution_id: id, limit: EXECUTION_PAGE, ...(input.invocations ? { cursor: input.invocations } : {}) });
       return absent(read) ? undefined : part<CardTypes.InvocationPage>(read);
     }),
@@ -235,13 +239,15 @@ export async function loadExecution(input: ExecutionInput, context: Context): Pr
                 : { state: 'empty', reason: 'The accepted inputs of this execution are not yet visible. Refresh to read them again.' }
         )
       : undefined,
-    drifted ? readDrift(id, node, one) : undefined
+    drifted ? readDrift(id, node, one) : undefined,
+    // A pull request's status names its provider repository; the Card name its review sets are read by is on the retained input.
+    state.pull_request ? one({ op: 'bifrost.query', sql: REPOSITORY, params: [id], max_rows: 1 }).then((read) => (read.ok ? text((read.value as QueryResult).rows[0]?.[0]) : null)) : undefined
   ]);
   return {
     input,
     result: {
       state: 'populated',
-      data: { status: state, definition, ...(invocations && { invocations }), ...(publications && { publications }), ...(details && { details }), ...selected, ...(members && { members }), ...(inputs && { inputs }), ...(drift && { drift }) }
+      data: { status: state, definition, ...(invocations && { invocations }), ...(publications && { publications }), ...(details && { details }), ...selected, ...(members && { members }), ...(inputs && { inputs }), ...(drift && { drift }), ...(repository && { repository }) }
     }
   };
 }

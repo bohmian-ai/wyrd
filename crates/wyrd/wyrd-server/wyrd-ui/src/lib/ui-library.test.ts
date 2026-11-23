@@ -60,6 +60,7 @@ import {
   RunsOn,
   RepositoryIndex,
   RepositoryPolicy,
+  ReviewSets,
   RepositoryDeclare,
   GithubIntegration,
   VerifierDefinition,
@@ -104,6 +105,8 @@ import {
   loadRunsOn,
   loadRepositoryIndex,
   loadRepositoryPolicy,
+  loadReviewSets,
+  REVIEW_SET_ROWS,
   loadRepositoryDeclare,
   loadGithubIntegration,
   loadVerifierDefinition,
@@ -1409,6 +1412,7 @@ test('TASK-004: Canonical signal interactions', async () => {
     'RunsOn',
     'RepositoryIndex',
     'RepositoryPolicy',
+    'ReviewSets',
     'RepositoryDeclare',
     'GithubIntegration',
     'VerificationExecution',
@@ -2907,9 +2911,9 @@ test('execution loader reads each part once and keeps refusals apart', async () 
   const unseen = fixtureRecording((request) => (request.op === 'bifrost.query' ? { ok: true, value: { columns: [], rows: [], terminal: terminal(0) } } : undefined));
   expect(partOf(await loadExecution({ executionId: EXECUTIONS.running }, { executor: unseen.executor })).definition).toEqual({ state: 'empty', reason: 'The Verifier this execution runs is not yet visible in retained metadata. Refresh to read it again.' });
   expect(reads(unseen.calls)).not.toContain('cards.get_by_uid');
-  // A refused Card or output read is its own part; with no graph to mark and a result recorded, progress is not read.
+  // A refused Card or output read is its own part; recorded progress is still read, because it is the only list of steps left to select.
   const noCard = partOf(await loadExecution({ executionId: EXECUTIONS.settled, node: 'outputs' }, { executor: fixtureRecording((request) => (request.op === 'cards.get_by_ref' || request.op === 'verification.list_publications' ? { ok: false, problem: denied } : undefined)).executor }));
-  expect([noCard.definition.state, noCard.invocations?.state, noCard.publications?.state]).toEqual(['denied', undefined, 'denied']);
+  expect([noCard.definition.state, noCard.invocations?.state, noCard.publications?.state]).toEqual(['denied', 'populated', 'denied']);
   const wrongKind = partOf(await loadExecution({ executionId: EXECUTIONS.settled }, { executor: fixtureRecording((request) => (request.op === 'cards.get_by_ref' ? { ok: true, value: agent } : undefined)).executor }));
   expect(wrongKind.definition).toMatchObject({ state: 'error', problem: { code: 'WYRD_SPEC_400_VALIDATION' } });
 
@@ -3702,4 +3706,260 @@ test('the GitHub integration shows safe connection state and asks before disconn
   expect(within(cardless.container).getAllByRole('row')).toHaveLength(4);
   expect(cardless.container).toHaveTextContent(`Repository Cards unavailable: ${denied.title} (${denied.code})`);
   expect(cardless.container.textContent).not.toMatch(/no Card|Not declared/);
+});
+
+/** One retained admission record of pull request 7: a member of `generation`, which froze `members`. */
+function admitted(generation: string, recorded_at: string, execution_id: string, members: readonly string[], head = 'a1', title?: string): unknown[] {
+  const inputs = { host: 'github.com', repository_id: '1', number: 7, ...(title && { title }), base: { ref: 'main', sha: 'b1' }, head: { ref: 'feature', sha: head }, generation, members, request_key: `key-${generation}` };
+  return ['1.0.0', 'policy-uid', recorded_at, JSON.stringify(inputs)];
+}
+const HISTORY_COLUMNS = ['subject_version', 'workload_card_uid', 'recorded_at', 'inputs'].map((name) => ({ name, data_type: 'Utf8', nullable: true }));
+const MEMBER_COLUMNS = ['execution_id', 'verifier_card_uid', 'status', 'verdict', 'result_id', 'output'].map((name) => ({ name, data_type: 'Utf8', nullable: true }));
+/** An executor answering the history read with `history`, the pinned-set read with its rows of the bound generation, and the member read with `members`. */
+function reviewReads(history: readonly unknown[][], members: readonly unknown[][]) {
+  return recording((request) => {
+    if (request.op !== 'bifrost.query') return { ok: false, problem: denied };
+    if (!request.sql.includes('bifrost.verification.execution_inputs WHERE')) return { ok: true, value: { columns: MEMBER_COLUMNS, rows: members, terminal: terminal(members.length) } };
+    const rows = request.sql.includes("inputs ->> 'generation' =") ? history.filter((row) => (row[3] as string).includes(`"generation":"${request.params?.[2]}"`)) : history;
+    return { ok: true, value: { columns: HISTORY_COLUMNS, rows, terminal: terminal(rows.length) } };
+  });
+}
+const PULL = { repository: 'api', number: 7 };
+
+test('review sets follow the newest observation, keep a pinned set, and report a missing pin instead of replacing it', async () => {
+  // Three sets, newest first as the read orders them: a new head, a rerequest on the first head, and the first review.
+  const history = [
+    admitted('g3', '2026-11-20T12:00:00.000300Z', 'e5', ['e5', 'e6'], 'b2'),
+    admitted('g3', '2026-11-20T12:00:00.000300Z', 'e6', ['e5', 'e6'], 'b2'),
+    admitted('g2', '2026-11-20T11:00:00.000200Z', 'e3', ['e3', 'e4']),
+    admitted('g2', '2026-11-20T11:00:00.000200Z', 'e4', ['e3', 'e4']),
+    admitted('g1', '2026-10-01T10:00:00.000100Z', 'e1', ['e1', 'e2']),
+    admitted('g1', '2026-10-01T10:00:00.000100Z', 'e2', ['e1', 'e2'])
+  ];
+  const members = [
+    ['e1', 'v1', 'cancelled', null, null],
+    ['e2', 'v2', 'completed', 'failed', 'r2', JSON.stringify({ requirements: [{ id: 'approves', outcome: 'failed' }, { id: 'green', outcome: 'passed' }] })]
+  ];
+
+  // No pin: the set with the newest observation is selected.
+  const latest = await loadReviewSets(PULL, { executor: reviewReads(history, [['e5', 'v1', 'pending', null, null], ['e6', 'v2', 'running', null, null]]).executor });
+  expect(latest.result.state === 'populated' && latest.result.data).toMatchObject({ current: 'g3', more: false, selected: { generation: 'g3', head: { sha: 'b2' }, policy: { name: 'api', version: '1.0.0', uid: 'policy-uid' }, complete: true } });
+  expect(latest.result.state === 'populated' && latest.result.data.sets.map((set) => [set.generation, set.head.sha, set.request_key])).toEqual([['g3', 'b2', 'key-g3'], ['g2', 'a1', 'key-g2'], ['g1', 'a1', 'key-g1']]);
+
+  // A pin selects exactly that set and reads its members from its own observation time, weeks before the newest.
+  const pinned = reviewReads(history, members);
+  const earlier = await loadReviewSets({ ...PULL, generation: 'g1' }, { executor: pinned.executor, range: RANGE });
+  expect(earlier.result.state === 'populated' && earlier.result.data).toMatchObject({
+    current: 'g3',
+    selected: { generation: 'g1', complete: true, members: [{ execution_id: 'e1', status: 'cancelled', verdict: null, result_id: null }, { execution_id: 'e2', status: 'completed', verdict: 'failed', result_id: 'r2', failed: ['approves'] }] }
+  });
+  const memberRead = pinned.calls.map((call) => call.request).find((request) => request.op === 'bifrost.query' && !request.sql.includes('execution_inputs WHERE'));
+  expect(memberRead?.op === 'bifrost.query' && memberRead.params).toEqual(['2026-10-01T09:59:59.999Z', '2026-10-01T10:00:00.002Z', 'e1', 'e2']);
+
+  // A pin that is not retained is reported: nothing is selected, no member is read, and the newest set is still named.
+  const absent = reviewReads(history, members);
+  const missing = await loadReviewSets({ ...PULL, generation: 'gone' }, { executor: absent.executor });
+  expect(missing.result.state === 'populated' && [missing.result.data.current, missing.result.data.selected]).toEqual(['g3', undefined]);
+  expect(absent.calls.every((call) => call.request.op === 'bifrost.query' && call.request.sql.includes('execution_inputs WHERE'))).toBe(true);
+});
+
+test('a review set is complete only when every frozen member is visible, within the history bound', async () => {
+  // One of the two frozen members has no visible record yet: the set is incomplete and that member has no status.
+  const interrupted = await loadReviewSets(PULL, { executor: reviewReads([admitted('g1', '2026-11-20T10:00:00Z', 'e1', ['e1', 'e2'])], [['e1', 'v1', 'pending', null, null]]).executor });
+  expect(interrupted.result.state === 'populated' && interrupted.result.data.selected).toMatchObject({
+    complete: false,
+    members: [{ execution_id: 'e1', retained: true, status: 'pending' }, { execution_id: 'e2', retained: false, status: null, verdict: null, verifier_card_uid: null }]
+  });
+
+  // A refused member has a record and its own status, and no verdict.
+  const refused = await loadReviewSets(PULL, { executor: reviewReads([admitted('g1', '2026-11-20T10:00:00Z', 'e1', ['e1'])], [['e1', 'v1', 'errored', null, null]]).executor });
+  expect(refused.result.state === 'populated' && refused.result.data.selected).toMatchObject({ complete: true, members: [{ status: 'errored', verdict: null }] });
+
+  // More records than one history read holds: the sets shown are the newest and older ones are said to exist.
+  const many = Array.from({ length: REVIEW_SET_ROWS + 1 }, (_, n) => admitted(`g${n}`, new Date(Date.UTC(2026, 10, 20) - n * 60_000).toISOString(), `e${n}`, [`e${n}`]));
+  const bounded = await loadReviewSets(PULL, { executor: reviewReads(many, [['e0', 'v1', 'pending', null, null]]).executor });
+  expect(bounded.result.state === 'populated' && [bounded.result.data.sets.length, bounded.result.data.more]).toEqual([REVIEW_SET_ROWS, true]);
+  // A pinned set older than that page is still read by its own generation.
+  const old = await loadReviewSets({ ...PULL, generation: `g${REVIEW_SET_ROWS}` }, { executor: reviewReads(many, [[`e${REVIEW_SET_ROWS}`, 'v1', 'cancelled', null, null]]).executor });
+  expect(old.result.state === 'populated' && old.result.data.selected?.generation).toBe(`g${REVIEW_SET_ROWS}`);
+
+  // No retained record, a refused history read and a refused member read are each their own state; none is an empty set.
+  expect((await loadReviewSets(PULL, { executor: reviewReads([], []).executor })).result).toMatchObject({ state: 'empty' });
+  const none = recording(() => ({ ok: false, problem: denied }));
+  expect((await loadReviewSets(PULL, { executor: none.executor })).result).toMatchObject({ state: 'denied', problem: denied });
+  expect(none.calls).toHaveLength(1);
+  const unread = recording((request) => (request.op === 'bifrost.query' && request.sql.includes('execution_inputs WHERE') ? { ok: true, value: { columns: HISTORY_COLUMNS, rows: [admitted('g1', '2026-11-20T10:00:00Z', 'e1', ['e1'])], terminal: terminal(1) } } : { ok: false, problem: denied }));
+  expect((await loadReviewSets(PULL, { executor: unread.executor })).result).toMatchObject({ state: 'denied' });
+});
+
+test('a pull request shows its review sets, each member with its own status and verdict, and no combined verdict', async () => {
+  // Setup: three retained sets; the link is pinned to the first one, whose two members are superseded.
+  const history = [admitted('g3', '2026-10-03T10:00:00Z', 'e5', ['e5'], 'b2'), admitted('g2', '2026-10-02T10:00:00Z', 'e3', ['e3']), admitted('g1', '2026-10-01T10:00:00Z', 'e1', ['e1', 'e2'], 'a1', 'Refund window')];
+  const members = [
+    ['e1', 'v1', 'cancelled', null, null, null],
+    ['e2', 'v2', 'completed', 'failed', 'r2', JSON.stringify({ requirements: [{ id: 'approves', outcome: 'failed' }, { id: 'green', outcome: 'passed' }] })]
+  ];
+  const pinned = await loadReviewSets({ ...PULL, generation: 'g1' }, { executor: reviewReads(history, members).executor });
+  const onaction = vi.fn();
+
+  // A set recorded before titles were retained is headed by its number.
+  const untitled = render(ReviewSets, await loadReviewSets(PULL, { executor: reviewReads(history, [['e5', 'v1', 'running', null, null, null]]).executor }));
+  expect(within(untitled.container).getByRole('heading', { level: 1 })).toHaveTextContent('#7');
+  untitled.unmount();
+
+  // Action: render it with the Verifier names the host read.
+  const view = render(ReviewSets, { ...pinned, labels: { v1: 'ci-gate@1.0.0', v2: 'code-review@2.1.0' }, onaction });
+  const page = within(view.container);
+
+  // The pull request is headed by the title the shown set recorded, with its number beside the Repository.
+  expect(page.getByRole('heading', { level: 1 })).toHaveTextContent('Refund window');
+  expect(page.getByRole('heading', { level: 1 })).not.toHaveTextContent('#7');
+  expect(view.container).toHaveTextContent('#7');
+  expect(view.container).toHaveTextContent('Repository Card api');
+  // Every retained set is listed newest first; the latest is marked and the pinned one is current.
+  const rows = within(page.getByRole('navigation', { name: 'Review sets of #7' })).getAllByRole('button');
+  expect(rows.map((row) => row.textContent?.replace(/\s+/g, ' ').trim())).toEqual([
+    'g3 requested review head b2 2026-10-03 10:00 UTC api@1.0.0 1 execution · latest',
+    'g2 requested review head a1 2026-10-02 10:00 UTC api@1.0.0 1 execution',
+    'g1 requested review head a1 2026-10-01 10:00 UTC api@1.0.0 2 executions'
+  ]);
+  expect(rows.map((row) => row.getAttribute('aria-current'))).toEqual([null, null, 'true']);
+  expect(page.getByRole('status')).toHaveTextContent('You are viewing earlier review set g1. This link stays on it. Latest set g3');
+  // Each member keeps its own status, verdict and failed requirements.
+  expect(page.getAllByRole('columnheader').map((cell) => cell.textContent)).toEqual(['Execution', 'Verifier', 'Status', 'Verdict', 'Failed requirements']);
+  const cells = page.getAllByRole('row').slice(1).map((row) => [...row.querySelectorAll('td')].map((cell) => cell.textContent?.trim()));
+  expect(cells).toEqual([
+    ['e1', 'ci-gate@1.0.0', '⊘cancelled', 'none', '—'],
+    ['e2', 'code-review@2.1.0', '■completed', '✕failed', 'approves']
+  ]);
+  expect(view.container).toHaveTextContent('Each Verifier records its own status and verdict. A review set has no combined verdict.');
+
+  // Action: follow the latest set, open another set, open a member and open the policy version.
+  await fireEvent.click(page.getByRole('button', { name: 'Latest set g3' }));
+  await fireEvent.click(rows[1]);
+  await fireEvent.click(page.getByRole('button', { name: 'e2' }));
+  await fireEvent.click(page.getByRole('button', { name: 'api' }));
+  const intents = onaction.mock.calls.map(([intent]) => intent);
+  expect(intents).toEqual([
+    { name: 'review_set.open', input: {} },
+    { name: 'review_set.open', input: { generation: 'g2' } },
+    { name: 'record.open', input: { execution_id: 'e2' } },
+    { name: 'card.open', input: { card_ref: { kind: 'Repository', name: 'api', version: '1.0.0' } } }
+  ]);
+  for (const intent of intents) expect(validateIntent('ReviewSets', intent)).toEqual(intent);
+});
+
+test('a review set says when it is the latest pin, incomplete, cut short or not retained', async () => {
+  const history = [admitted('g2', '2026-10-02T10:00:00Z', 'e3', ['e3', 'e4']), admitted('g1', '2026-10-01T10:00:00Z', 'e1', ['e1'])];
+
+  // A link pinned to the latest set says so; a member whose record is not retained is shown as missing, not dropped.
+  const latest = await loadReviewSets({ ...PULL, generation: 'g2' }, { executor: reviewReads(history, [['e3', 'v1', 'running', null, null, null]]).executor });
+  const partial = render(ReviewSets, latest);
+  expect(within(partial.container).getByRole('status')).toHaveTextContent('Pinned to g2, the latest set when this link was made. Follow the latest set');
+  expect(partial.container).toHaveTextContent('1 of 2 member records are retained. This set is incomplete.');
+  expect([...partial.container.querySelectorAll('tbody tr:last-child td')].map((cell) => cell.textContent?.trim())).toEqual(['e4', '—', 'record not retained', 'none', '—']);
+
+  // A pinned set that is not retained is reported; the latest is offered, never shown in its place.
+  const gone = render(ReviewSets, await loadReviewSets({ ...PULL, generation: 'gone' }, { executor: reviewReads(history, []).executor }));
+  expect(within(gone.container).getByRole('status')).toHaveTextContent('Review set gone is not retained for this pull request. Latest set g2');
+  expect(gone.container.querySelector('table')).toBeNull();
+
+  // More history than one read returns is said, not hidden.
+  const many = Array.from({ length: REVIEW_SET_ROWS + 1 }, (_, n) => admitted(`g${n}`, new Date(Date.UTC(2026, 9, 1) - n * 60_000).toISOString(), `m${n}`, [`m${n}`]));
+  const bounded = render(ReviewSets, await loadReviewSets(PULL, { executor: reviewReads(many, []).executor }));
+  expect(bounded.container).toHaveTextContent(`Review sets · ${REVIEW_SET_ROWS}+`);
+  expect(bounded.container).toHaveTextContent(`The newest ${REVIEW_SET_ROWS} member records are listed. Open an earlier set by its link.`);
+
+  // Empty, denied, error and loading are the panel's states, with no table.
+  const empty = render(ReviewSets, await loadReviewSets(PULL, { executor: reviewReads([], []).executor }));
+  expect(empty.container).toHaveTextContent('No review set is retained for this pull request.');
+  for (const state of ['denied', 'error'] as const) {
+    const refused = await loadReviewSets(PULL, { executor: stateExecutors[state] });
+    expect(refused.result.state).toBe(state);
+    expect(render(ReviewSets, refused).container.querySelector('table, nav')).toBeNull();
+  }
+  expect(render(ReviewSets, { input: PULL, result: { state: 'loading' } }).container).toHaveTextContent('Loading review sets of api#7');
+});
+
+test('an executions list names the pull request of each row and opens its review sets', async () => {
+  // Setup: one pull request execution of Repository api and one execution that is not from a pull request.
+  const columns = ['recorded_at', 'pull_request', 'status', 'verdict', 'execution_id', 'review_set'].map((name) => ({ name, data_type: 'Utf8', nullable: true }));
+  const rows = [
+    ['2026-10-20T11:58:02.412000Z', 'api#7', 'completed', 'passed', 'e1', 'g1'],
+    ['2026-10-20T11:57:00.000000Z', null, 'completed', 'failed', 'e2', null]
+  ];
+  const input: Parameters<typeof loadRecordTable>[0] = { signal: 'executions', columns: ['recorded_at', 'pull_request', 'status', 'verdict'], where: [{ column: 'pull_request', value: 'api#7' }] };
+  expect(validatePanel('RecordTable', input)).toMatchObject({ input });
+  expect(validatePanel('FacetRail', { signal: 'executions', facets: ['pull_request'] })).toMatchObject({ component: 'FacetRail' });
+  const onaction = vi.fn();
+
+  // Action: render the list and press the pull request of the first row.
+  const list = render(RecordTable, { input, result: { state: 'populated', data: { rows: { columns, rows, terminal: terminal(2) } } }, onaction });
+  expect(within(list.container).getByRole('columnheader', { name: /Pull request/ })).toBeInTheDocument();
+  await fireEvent.click(within(list.container).getByRole('button', { name: 'api#7' }));
+
+  // The exact review set the row belongs to is opened, and the row itself is not.
+  const intents = onaction.mock.calls.map(([intent]) => intent);
+  expect(intents).toEqual([{ name: 'pull_request.open', input: { repository: 'api', number: 7, generation: 'g1' } }]);
+  expect(validateIntent('RecordTable', intents[0])).toEqual(intents[0]);
+  // A row that is not from a pull request names none.
+  expect(within(list.container).getAllByRole('button', { name: /#/ })).toHaveLength(1);
+});
+
+test('an execution of a pull request names it and opens the review set that admitted it', async () => {
+  // Setup: the settled execution, admitted for pull request 482 of Repository payments-api in one review set.
+  const admitted = { host: 'github.com', repository_id: '718204331', number: 482, base: { ref: 'main', sha: 'b1' }, head: { ref: 'refund-window', sha: '9f2c1ab0c4' }, generation: 'g1', members: [EXECUTIONS.settled] };
+  const reads = fixtureRecording((request) =>
+    request.op === 'verification.get_execution' ? { ok: true, value: { ...executionStatus[EXECUTIONS.settled], pull_request: admitted } } : undefined
+  );
+  const onaction = vi.fn();
+
+  // Action: load and render it, then press its pull request.
+  const loaded = await loadExecution({ executionId: EXECUTIONS.settled, node: 'none' }, { executor: reads.executor });
+  const view = render(VerificationExecution, { ...loaded, onaction });
+  await fireEvent.click(within(view.container).getByRole('button', { name: 'payments-api#482' }));
+
+  // The Repository Card is the one its retained input recorded, and the link is pinned to its own review set.
+  expect(view.container).toHaveTextContent('head 9f2c1ab');
+  expect(onaction).toHaveBeenLastCalledWith({ name: 'pull_request.open', input: { repository: 'payments-api', number: 482, generation: 'g1' } });
+  expect(validateIntent('VerificationExecution', onaction.mock.lastCall?.[0])).toEqual(onaction.mock.lastCall?.[0]);
+
+  // An execution that is not from a pull request reads no Repository and shows no pull request.
+  const plain = fixtureRecording();
+  const other = await loadExecution({ executionId: EXECUTIONS.settled, node: 'none' }, { executor: plain.executor });
+  expect(plain.calls.some((call) => call.request.op === 'bifrost.query' && call.request.sql.includes('subject_name'))).toBe(false);
+  expect(render(VerificationExecution, other).container).not.toHaveTextContent('Pull request');
+});
+
+test('an execution whose Verifier definition is refused still lets a reader select what was recorded', async () => {
+  // Setup: a settled execution the reader may open, and a Verifier Card the reader may not.
+  const refusal = { code: 'WYRD_AUTH_403_FORBIDDEN', title: 'Forbidden', status: 403 };
+  const reads = fixtureRecording((request) => (request.op === 'cards.get_by_ref' ? { ok: false, problem: refusal } : undefined));
+  const onaction = vi.fn();
+
+  // Action: load it with nothing selected and render it.
+  const loaded = await loadExecution({ executionId: EXECUTIONS.settled, node: 'none' }, { executor: reads.executor });
+  const view = render(VerificationExecution, { ...loaded, onaction });
+
+  // The definition stays refused and no graph is drawn from the recorded facts.
+  expect(view.container.querySelector('[data-part="Verifier definition"]')).toHaveTextContent(refusal.code);
+  expect(view.container.querySelector('[data-node]')).toBeNull();
+
+  // The recorded requirements and the steps that recorded an invocation are listed, each with its recorded state.
+  const recorded = within(view.container).getByRole('group', { name: 'Recorded without the definition' });
+  const names = within(recorded).getAllByRole('button').map((button) => button.textContent?.replace(/\s+/g, ' ').trim());
+  expect(names).toEqual(['Requirement classified passed', 'Requirement policy-followed failed', 'Requirement has-answer passed', 'Step read-photo succeeded', 'Step score succeeded', 'Step classify succeeded', 'Step summarise succeeded']);
+
+  // Pressing one selects it through the same intent the graph sends.
+  await fireEvent.click(within(recorded).getByRole('button', { name: /Step score/ }));
+  expect(onaction).toHaveBeenLastCalledWith({ name: 'execution.select', input: { node: 'step:score' } });
+  await fireEvent.click(within(recorded).getByRole('button', { name: /Requirement policy-followed/ }));
+  expect(onaction).toHaveBeenLastCalledWith({ name: 'execution.select', input: { node: 'req:policy-followed' } });
+  view.unmount();
+
+  // A selected step shows its recorded invocation and outputs with the definition still refused.
+  const step = render(VerificationExecution, await loadExecution({ executionId: EXECUTIONS.settled, node: 'step:score' }, { executor: reads.executor }));
+  expect(step.container).toHaveTextContent('attempt 2');
+  expect(within(step.container).getByRole('button', { name: 'Preview' })).toBeInTheDocument();
+  expect(within(within(step.container).getByRole('group', { name: 'Recorded without the definition' })).getByRole('button', { name: /Step score/ })).toHaveAttribute('aria-pressed', 'true');
 });

@@ -86,6 +86,7 @@
       if ('unavailable' in next) return void (actions[valid.name] = { state: 'unavailable', reason: next.unavailable });
       delete actions[valid.name];
       if ('open' in next) return void goto(`${base}/verify/executions/${encodeURIComponent(next.open)}`);
+      if ('pull' in next) return void goto(`${base}${next.pull}`);
       if ('query' in next) return void goto(`${base}/query?${next.query}`);
       void go(next.state);
     };
@@ -118,7 +119,7 @@
     void go({ ...current, tz, ...('last' in range ? { last: range.last, from: undefined, to: undefined } : range) });
   }
   /** The Group by choices as the approved design words them. */
-  const GROUP_NAMES = { run_id: 'run', subject_name: 'Card', service_name: 'Service', group_id: 'session' } as const;
+  const GROUP_NAMES = { run_id: 'run', subject_name: 'Card', service_name: 'Service', group_id: 'session', pull_request: 'pull request' } as const;
   /** The exact Verifier definition a Verifier facet value names, when the host could name it. */
   function definition(column: string, value: unknown) {
     const [name, version] = (column === 'verifier_card_uid' && labels[String(value)]?.split('@')) || [];

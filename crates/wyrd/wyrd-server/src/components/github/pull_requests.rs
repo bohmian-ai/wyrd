@@ -162,8 +162,14 @@ impl PullRequestEvent {
 /// What GitHub's current state of a PR asks for.
 #[derive(Debug, PartialEq, Eq)]
 enum Observed {
-    /// An open, ready PR under review at this source.
-    Source(PullRequestRef, PullRequestRef, Option<RepositoryId>),
+    /// An open, ready PR under review at this source: base, head, head
+    /// repository and title.
+    Source(
+        PullRequestRef,
+        PullRequestRef,
+        Option<RepositoryId>,
+        Option<String>,
+    ),
     /// A PR that ended or went back to draft.
     Ended(PullRequestEnd),
 }
@@ -197,6 +203,7 @@ impl Observed {
                 sha: body.head.sha,
             },
             head_repository_id,
+            body.title,
         ))
     }
 }
@@ -448,7 +455,7 @@ impl GithubConnections<'_> {
                 }),
             };
         }
-        let (base, head, head_repository_id) = match observed {
+        let (base, head, head_repository_id, title) = match observed {
             Observed::Ended(end) => {
                 if let Admitting::Request { .. } = admitting {
                     conn.commit().await.map_err(registry_db_error)?;
@@ -476,7 +483,9 @@ impl GithubConnections<'_> {
                 );
                 return Ok(None);
             }
-            Observed::Source(base, head, head_repository_id) => (base, head, head_repository_id),
+            Observed::Source(base, head, head_repository_id, title) => {
+                (base, head, head_repository_id, title)
+            }
         };
         let (delivery_id, request_key, requester) = match admitting {
             Admitting::Delivery(delivery_id) => (Some(delivery_id.to_owned()), None, None),
@@ -486,6 +495,7 @@ impl GithubConnections<'_> {
             host: key.host.to_owned(),
             repository_id: key.repository_id.clone(),
             number: key.number,
+            title,
             base,
             head,
             head_repository_id,
@@ -965,6 +975,7 @@ mod tests {
     fn current_provider_state_decides_the_observation() {
         let body = |state: &str, draft: bool| -> PullRequestBody {
             serde_json::from_value(serde_json::json!({
+                "title": "Refund window",
                 "state": state,
                 "draft": draft,
                 "base": {"ref": "main", "sha": "b", "repo": {"id": 1}},
@@ -996,6 +1007,7 @@ mod tests {
                     sha: "h".to_owned()
                 },
                 Some(RepositoryId::new("9").expect("valid")),
+                Some("Refund window".to_owned()),
             )
         );
     }

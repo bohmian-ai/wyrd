@@ -235,6 +235,12 @@
     onaction?.({ name: 'record.open', input: target });
   }
 
+  /** Open the review sets of `pull`, a pull request column value (`<Repository Card>#<number>`), at the row's own review set. */
+  function openPull(pull: string, generation: unknown) {
+    const at = pull.lastIndexOf('#');
+    onaction?.({ name: 'pull_request.open', input: { repository: pull.slice(0, at), number: Number(pull.slice(at + 1)), ...(typeof generation === 'string' ? { generation } : {}) } });
+  }
+
   function onscroll(event: Event) {
     reading = (event.currentTarget as HTMLElement).scrollTop > 0;
   }
@@ -347,6 +353,8 @@
                       {:else if signal === 'executions' && column === 'status'}
                         {@const mark = EXECUTION_STATUS[String(value)] ?? ['', String(value), 'text']}
                         <span class="st tone-{mark[2]}" title={value === 'not recorded' ? UNSETTLED : undefined}><span aria-hidden="true">{mark[0]}</span>{mark[1]}</span>
+                      {:else if signal === 'executions' && column === 'pull_request' && typeof value === 'string'}
+                        <button type="button" class="pull" title="Open the review sets of {value}" onclick={(event) => (event.stopPropagation(), openPull(value, row[columnIndex(rows, 'review_set')]))}>{value}</button>
                       {:else if signal === 'executions' && value === null}
                         <span class="null">—</span>
                       {:else if signal === 'executions' && column === 'recorded_at'}
@@ -460,6 +468,17 @@
 {/snippet}
 
 <style>
+  .pull {
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--declare);
+    font: inherit;
+    cursor: pointer;
+  }
+  .pull:hover {
+    text-decoration: underline;
+  }
   .query {
     align-self: flex-end;
   }

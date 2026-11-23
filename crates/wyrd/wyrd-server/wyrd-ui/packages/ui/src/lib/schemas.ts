@@ -150,6 +150,12 @@ export const RepositoryPolicyInputSchema = z
   .object({ cardRef: CardRefSchema.extend({ kind: z.literal('Repository') }), declaration: z.enum(['yaml', 'toml']).optional() })
   .strict();
 
+/** One pull request of one Repository Card and, when known, one of its review sets: what a link to its review sets names. */
+export const PullRequestRefSchema = z.object({ repository: z.string().min(1).max(200), number: z.number().int().min(1), generation: z.string().min(1).max(64).optional() }).strict();
+
+/** One pull request of one Repository Card, by the Card name its admissions recorded and its number, and, for a pinned link, one exact review set. */
+export const ReviewSetsInputSchema = PullRequestRefSchema;
+
 /** The input of `RepositoryDeclare`: the provider's stable id of one reachable repository. */
 export const RepositoryDeclareInputSchema = z.object({ repositoryId: z.string().min(1).max(64) }).strict();
 
@@ -242,6 +248,8 @@ const SINCE = "$1::timestamptz - INTERVAL '1 hour'";
 const EXECUTIONS =
   '(SELECT i.execution_id, i.recorded_at, i.verifier_card_uid, i.binding_id, i.group_id, i.origin, i.run_id, ' +
   'i.subject_kind, i.subject_name, i.subject_version, i.subject_card_uid, i.workload_card_uid, i.service_name, i.service_version, i.deployment_environment, ' +
+  // A pull request execution's Repository Card and number as one value, and the review set that admitted it; text, so no other origin's input is ever cast.
+  "CASE WHEN i.origin = 'pull_request' THEN i.subject_name || '#' || (i.inputs ->> 'number') END AS pull_request, CASE WHEN i.origin = 'pull_request' THEN i.inputs ->> 'generation' END AS review_set, " +
   'r.result_id, r.verdict, r.ended_at, ' +
   "CASE WHEN i.origin = 'direct' THEN CASE WHEN r.result_id IS NOT NULL THEN 'completed' ELSE 'not recorded' END ELSE coalesce(q.status, 'pending') END AS status " +
   'FROM bifrost.verification.execution_inputs i ' +
@@ -302,9 +310,9 @@ export const SIGNALS = {
     columns: ['recorded_at', 'verifier_card_uid', 'subject_name', 'run_id', 'group_id', 'service_name', 'status', 'verdict'],
     filters: [
       'status', 'verdict', 'verifier_card_uid', 'service_name', 'subject_name', 'run_id', 'group_id', 'origin', 'binding_id', 'subject_kind', 'subject_version',
-      'subject_card_uid', 'workload_card_uid', 'service_version', 'deployment_environment', 'execution_id', 'result_id'
+      'subject_card_uid', 'workload_card_uid', 'service_version', 'deployment_environment', 'execution_id', 'result_id', 'pull_request', 'review_set'
     ],
-    more: ['ended_at']
+    more: ['ended_at', 'pull_request', 'review_set']
   }
 } as const;
 
@@ -662,6 +670,21 @@ export const components = {
       'connection.open': openConnection
     }
   },
+  ReviewSets: {
+    description:
+      "One pull request of a Repository: its retained review sets newest first, the latest or one pinned set selected, and that set's frozen members, each with its own status, verdict and failed requirements. A set has no combined verdict.",
+    input: ReviewSetsInputSchema,
+    states: ['populated', 'empty', 'denied', 'error', 'loading'],
+    emits: {
+      'review_set.open': {
+        description: 'Show one exact review set of this pull request, or with no generation follow the latest.',
+        input: z.object({ generation: z.string().min(1).max(64).optional() }).strict(),
+        completion: 'host-navigation'
+      },
+      'record.open': { description: 'Open one exact member execution.', input: z.object({ execution_id: z.string().min(1).max(200) }).strict(), completion: 'host-navigation' },
+      'card.open': openCard
+    }
+  },
   RepositoryDeclare: {
     description: 'One reachable GitHub repository with no Repository Card: its three separate facts and the wyrd.toml and command that declare it.',
     input: RepositoryDeclareInputSchema,
@@ -713,6 +736,7 @@ export const components = {
         completion: 'host-navigation'
       },
       'record.open': { description: 'Open the exact trace an input names, read with the viewer\'s current permissions.', input: spanRef, completion: 'host-navigation' },
+      'pull_request.open': { description: 'Open the review sets of the pull request this execution was admitted for, pinned to its own review set.', input: PullRequestRefSchema, completion: 'host-navigation' },
       'card.open': openCard
     }
   },
@@ -746,6 +770,11 @@ export const components = {
       'record.open': {
         description: 'Open one trace or span, one log record by its exact identity, or one exact Verifier execution.',
         input: z.union([spanRef, z.object({ log: LogKeySchema }).strict(), z.object({ execution_id: z.string().min(1).max(200) }).strict()]),
+        completion: 'host-navigation'
+      },
+      'pull_request.open': {
+        description: "Open the review sets of the pull request an execution row names, pinned to that row's review set when the list read it.",
+        input: PullRequestRefSchema,
         completion: 'host-navigation'
       },
       'record.open_in_query': {
@@ -804,6 +833,8 @@ export type RepositoryIndexInput = z.infer<typeof RepositoryIndexInputSchema>;
 export type RepositoryPolicyInput = z.infer<typeof RepositoryPolicyInputSchema>;
 /** A validated `RepositoryDeclare` input. */
 export type RepositoryDeclareInput = z.infer<typeof RepositoryDeclareInputSchema>;
+/** One pull request whose review sets are read. */
+export type ReviewSetsInput = z.infer<typeof ReviewSetsInputSchema>;
 /** A validated `GithubIntegration` input. */
 export type GithubIntegrationInput = z.infer<typeof GithubIntegrationInputSchema>;
 /** A validated `VerificationExecution` input. */

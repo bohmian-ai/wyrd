@@ -6218,6 +6218,12 @@ export interface PullRequestActivation {
    * for the same pull request returns this generation.
    */
   readonly request_key?: string | null;
+  /**
+   * The pull request's title when this source was admitted, for display
+   * only: a later title edit admits nothing. Absent on a source admitted
+   * before titles were retained.
+   */
+  readonly title?: string | null;
 }
 
 /**

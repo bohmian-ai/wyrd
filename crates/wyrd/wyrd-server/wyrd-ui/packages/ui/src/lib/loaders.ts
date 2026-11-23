@@ -20,11 +20,13 @@ import {
   loadFacetRail,
   loadRecordDetail,
   loadRecordTable,
+  loadReviewSets,
   loadStatStrip,
   loadTraceWaterfall,
   type FacetRailProps,
   type RecordDetailProps,
   type RecordTableProps,
+  type ReviewSetsProps,
   type StatStripProps,
   type TraceWaterfallProps
 } from './observe.js';
@@ -117,6 +119,7 @@ export interface ComponentProps {
   RunsOn: RunsOnProps;
   RepositoryIndex: RepositoryIndexProps;
   RepositoryPolicy: RepositoryPolicyProps;
+  ReviewSets: ReviewSetsProps;
   RepositoryDeclare: RepositoryDeclareProps;
   GithubIntegration: GithubIntegrationProps;
   VerificationExecution: VerificationExecutionProps;
@@ -272,6 +275,7 @@ const LOADERS: {
   RunsOn: loadRunsOn,
   RepositoryIndex: loadRepositoryIndex,
   RepositoryPolicy: loadRepositoryPolicy,
+  ReviewSets: loadReviewSets,
   RepositoryDeclare: loadRepositoryDeclare,
   GithubIntegration: loadGithubIntegration,
   VerificationExecution: loadExecution,

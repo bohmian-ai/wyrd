@@ -33,6 +33,7 @@
   import RunsOn from './components/RunsOn.svelte';
   import RepositoryIndex from './components/RepositoryIndex.svelte';
   import RepositoryPolicy from './components/RepositoryPolicy.svelte';
+  import ReviewSets from './components/ReviewSets.svelte';
   import RepositoryDeclare from './components/RepositoryDeclare.svelte';
   import GithubIntegration from './components/GithubIntegration.svelte';
   import VerificationExecution from './components/VerificationExecution.svelte';
@@ -94,6 +95,7 @@
     RunsOn,
     RepositoryIndex,
     RepositoryPolicy,
+    ReviewSets,
     RepositoryDeclare,
     GithubIntegration,
     VerificationExecution,

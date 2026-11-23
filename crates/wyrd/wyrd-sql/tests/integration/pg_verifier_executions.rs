@@ -4366,6 +4366,7 @@ fn pins(head: &str) -> PullRequestActivation {
         host: "github.com".to_owned(),
         repository_id: RepositoryId::new("42").expect("valid repository id"),
         number: 7,
+        title: None,
         base: PullRequestRef {
             ref_name: "main".to_owned(),
             sha: "b".repeat(40),

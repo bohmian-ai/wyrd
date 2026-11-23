@@ -558,6 +558,11 @@ pub struct PullRequestActivation {
     pub repository_id: RepositoryId,
     /// Pull request number in the base repository.
     pub number: u64,
+    /// The pull request's title when this source was admitted, for display
+    /// only: a later title edit admits nothing. Absent on a source admitted
+    /// before titles were retained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     /// Base branch and commit.
     pub base: PullRequestRef,
     /// Head branch and commit.

@@ -500,7 +500,7 @@ import { fireEvent, render, waitFor, within } from '@testing-library/svelte';
 import { vi } from 'vitest';
 import { goto, invalidate, invalidateAll } from '$app/navigation';
 import { EXECUTIONS, fixtureExecutor, PROMPT, SERVICE, stateExecutors, VERIFIER, VERIFIER_UIDS, verifiers } from '$lib/ui-fixtures';
-import { readExecution, writeExecution } from '$lib/verify-host';
+import { readExecution, verifyInputs, verifyStep, writeExecution } from '$lib/verify-host';
 import { load as loadExecutionPage } from '../routes/t/[tenantKey]/verify/executions/[executionId]/+page.server';
 import ExecutionPage from '../routes/t/[tenantKey]/verify/executions/[executionId]/+page.svelte';
 import { load as loadCardDetail } from '../routes/t/[tenantKey]/cards/detail/+page.server';
@@ -754,8 +754,8 @@ test('executions list, facets and charts read one population in bounded shared q
   expect(population).toContain('WHERE recorded_at >= $1::timestamptz AND recorded_at < $2::timestamptz AND status = $3 AND verdict IS NULL');
   expect(table.executed?.params).toEqual([RANGE.from, RANGE.to, 'completed']);
   expect(sql(list.calls[0])).toMatch(/ORDER BY recorded_at DESC, execution_id ASC LIMIT 51$/);
-  // Each row carries its exact identities and correlations, shown or not: the subject Card, the selected result, the binding and the Workload.
-  expect(sql(list.calls[0])).toMatch(/^SELECT .*, execution_id, subject_kind, subject_version, subject_card_uid, result_id, binding_id, workload_card_uid FROM /);
+  // Each row carries its exact identities and correlations, shown or not: the subject Card, the selected result, the binding, the Workload and its review set.
+  expect(sql(list.calls[0])).toMatch(/^SELECT .*, execution_id, subject_kind, subject_version, subject_card_uid, result_id, binding_id, workload_card_uid, review_set FROM /);
   expect(table.result).toMatchObject({ state: 'empty', reason: 'No execution matches these filters in this window.' });
 
   // Facets and both charts read that same population and WHERE in one aggregate; Verifiers are ranked by the server.
@@ -836,7 +836,7 @@ test('the Verify dashboard reads one population and keeps its investigation in t
   expect(rail.getByRole('button', { name: /no recorded verdict/ })).toHaveTextContent('2');
   expect(rail.getByRole('button', { name: /latency-drift@1.0.0/ })).toHaveTextContent('2');
   // The rail counts the facets of the approved design, in its order.
-  expect(rail.getAllByRole('heading').map((heading) => heading.textContent?.trim())).toEqual(['Status', 'Verdict', 'Verifier', 'Service', 'Card', 'Run', 'Session']);
+  expect(rail.getAllByRole('heading').map((heading) => heading.textContent?.trim())).toEqual(['Status', 'Verdict', 'Verifier', 'Service', 'Card', 'Run', 'Session', 'Pull request']);
   // A Verifier value links to its exact definition.
   expect(rail.getByRole('link', { name: 'Open Verifier latency-drift@1.0.0' })).toHaveAttribute('href', '/t/acme/cards/detail?kind=Verifier&name=latency-drift&version=1.0.0');
   const table = within(page.getByRole('region', { name: 'executions rows' }));
@@ -855,7 +855,7 @@ test('the Verify dashboard reads one population and keeps its investigation in t
   expect(goto).toHaveBeenLastCalledWith(`/t/acme/verify${search({ where: [{ column: 'verdict', value: 'failed' }] })}`, { keepFocus: true, noScroll: true });
   // Group by is a row of choices with the current one pressed, beside the total the status facet counts.
   const groups = within(page.getByRole('group', { name: 'Group by' }));
-  expect(groups.getAllByRole('button').map((button) => [button.textContent?.trim(), button.getAttribute('aria-pressed')])).toEqual([['none', 'true'], ['run', 'false'], ['Card', 'false'], ['Service', 'false'], ['session', 'false']]);
+  expect(groups.getAllByRole('button').map((button) => [button.textContent?.trim(), button.getAttribute('aria-pressed')])).toEqual([['none', 'true'], ['run', 'false'], ['Card', 'false'], ['Service', 'false'], ['session', 'false'], ['pull request', 'false']]);
   expect(page.getByText('7 executions')).toBeInTheDocument();
   // The list says how many of them it shows and has no more to ask for.
   expect(page.getByText('Showing 7 of 7 · newest first')).toBeInTheDocument();
@@ -925,7 +925,7 @@ test('the Verify dashboard reads one population and keeps its investigation in t
   }
 });
 
-import { readIndex, repositoryHref, writeIndex } from '$lib/repositories-host';
+import { pullHref, readIndex, repositoryHref, writeIndex } from '$lib/repositories-host';
 import { load as loadRepositories } from '../routes/t/[tenantKey]/repositories/+page.server';
 import { load as loadAccount } from '../routes/t/[tenantKey]/settings/account/+page.server';
 import type { RepositoryIndexProps } from 'wyrd-ai-ui/loaders';
@@ -934,9 +934,11 @@ import { load as loadRepository } from '../routes/t/[tenantKey]/repositories/[na
 import RepositoryPage from '../routes/t/[tenantKey]/repositories/[name]/+page.svelte';
 import { load as loadUndeclared } from '../routes/t/[tenantKey]/repositories/github/[repositoryId]/+page.server';
 import UndeclaredPage from '../routes/t/[tenantKey]/repositories/github/[repositoryId]/+page.svelte';
+import { load as loadPull } from '../routes/t/[tenantKey]/repositories/[name]/pulls/[number]/+page.server';
+import PullPage from '../routes/t/[tenantKey]/repositories/[name]/pulls/[number]/+page.svelte';
 import { load as loadGithub } from '../routes/t/[tenantKey]/settings/integrations/github/+page.server';
 import GithubPage from '../routes/t/[tenantKey]/settings/integrations/github/+page.svelte';
-import { connectionExecutor } from '$lib/ui-fixtures';
+import { connectionExecutor, REVIEW } from '$lib/ui-fixtures';
 import { EventEmitter } from 'node:events';
 import { GET as getObserveSupport } from '../routes/t/[tenantKey]/observe/support/+server';
 import { GET as getVerifySupport } from '../routes/t/[tenantKey]/verify/support/+server';
@@ -1313,4 +1315,94 @@ test('Settings connects and disconnects GitHub once through the host and reads s
   expect(calls).toEqual([{ op: 'github.get_connection' }]);
   fetched.mockRestore();
   opened.mockRestore();
+});
+
+test('a pull request page follows the latest review set, keeps a pinned set in its URL and opens a member', async () => {
+  const requests: WireRequest[] = [];
+  const tenant = { key: 'acme', name: 'Acme' };
+  /** The pull request page at `rest` of /t/acme/repositories/payments-api/pulls/. */
+  const pull = async (rest: string, executor: Executor = fixtureExecutor) => {
+    host.executor = { run: (batch, signal) => (requests.push(...batch), executor.run(batch, signal)) };
+    requests.length = 0;
+    const url = new URL(`http://ui.test/t/acme/repositories/payments-api/pulls/${rest}`);
+    const event = { locals: { browserSession: { client: () => ({}) } }, params: { tenantKey: 'acme', name: 'payments-api', number: rest.split('?')[0] }, url, request: new Request(url) };
+    return render(PullPage, { data: { ...(await loadPull(event as never)), tenant } } as never);
+  };
+  vi.mocked(goto).mockClear();
+  expect(pullHref('/t/acme', 'a b', 7)).toBe('/t/acme/repositories/a%20b/pulls/7');
+  expect(pullHref('/t/acme', 'a b', 7, 'g 1')).toBe('/t/acme/repositories/a%20b/pulls/7?set=g+1');
+
+  // The plain link shows the latest set and its members, named by the Verifiers the page read.
+  const latest = await pull(String(REVIEW.number));
+  expect(latest.getByRole('heading', { level: 1 })).toHaveTextContent('Refund window follows the 30-day policy');
+  expect(latest.getByRole('link', { name: 'payments-api' })).toHaveAttribute('href', '/t/acme/repositories/payments-api?version=1.4.0');
+  expect(latest.queryByRole('status')).toBeNull();
+  expect(latest.getAllByRole('row').slice(1).map((row) => row.querySelectorAll('td')[1].textContent?.trim())).toEqual(['ticket-policy@1.1.0', 'latency-drift@1.0.0']);
+  // A set is two list reads and the Verifier names: no execution's status or detail is read per member.
+  expect(requests.map((request) => request.op)).toEqual(['bifrost.query', 'bifrost.query', 'cards.list']);
+
+  // Choosing the earlier set puts it in the URL; opening a member leads to its exact execution.
+  const sets = within(latest.getByRole('navigation', { name: 'Review sets of #482' })).getAllByRole('button');
+  await fireEvent.click(sets[1]);
+  expect(goto).toHaveBeenLastCalledWith(`/t/acme/repositories/payments-api/pulls/482?set=${REVIEW.earlier}`, { keepFocus: true, noScroll: true });
+  await fireEvent.click(latest.getByRole('button', { name: 'exec_failed' }));
+  expect(goto).toHaveBeenLastCalledWith('/t/acme/verify/executions/exec_failed');
+  latest.unmount();
+
+  // The pinned link stays on its set and offers the latest.
+  const pinned = await pull(`482?set=${REVIEW.earlier}`);
+  expect(pinned.getByRole('status')).toHaveTextContent('You are viewing earlier review set');
+  // The earlier set was recorded before titles were retained, so it is headed by its number.
+  expect(pinned.getByRole('heading', { level: 1 })).toHaveTextContent('#482');
+  expect(pinned.getAllByRole('row').slice(1).map((row) => row.querySelector('td')?.textContent?.trim())).toEqual(['exec_cancelled', 'exec_waiting']);
+  await fireEvent.click(within(pinned.getByRole('status')).getByRole('button'));
+  expect(goto).toHaveBeenLastCalledWith('/t/acme/repositories/payments-api/pulls/482', { keepFocus: true, noScroll: true });
+  pinned.unmount();
+
+  // A pinned set that is not retained is reported and never replaced by the latest.
+  const gone = await pull('482?set=never-retained');
+  expect(gone.getByRole('status')).toHaveTextContent('is not retained for this pull request');
+  expect(gone.container.querySelector('table')).toBeNull();
+  gone.unmount();
+
+  // A refused Verifier-name read leaves the set readable, each member by its Verifier UID.
+  const unnamed = await pull('482', { run: (batch, signal) => (batch[0].op === 'cards.list' ? stateExecutors.denied.run(batch, signal) : fixtureExecutor.run(batch, signal)) });
+  expect(unnamed.getAllByRole('row')).toHaveLength(3);
+  expect(unnamed.container).not.toHaveTextContent('ticket-policy');
+  unnamed.unmount();
+
+  // A pull request with no retained set, a refused read and a malformed number each say so; the last reads nothing.
+  const none = await pull('1');
+  expect(none.container).toHaveTextContent('No review set is retained for this pull request.');
+  none.unmount();
+  const denied = await pull('482', stateExecutors.denied);
+  expect(denied.container).toHaveTextContent('WYRD_AUTH_403_FORBIDDEN');
+  expect(requests.map((request) => request.op)).toEqual(['bifrost.query']);
+  denied.unmount();
+  const malformed = await pull('latest');
+  expect(malformed.container).toHaveTextContent('WYRD_SPEC_400_VALIDATION');
+  expect(requests).toEqual([]);
+});
+
+test('Repository activity, Verify and an execution each lead to the pull request review sets', async () => {
+  const tenant = { key: 'acme', name: 'Acme' };
+  const session = { locals: { browserSession: { client: () => ({}), api: () => Promise.resolve(new Response()) } } };
+  host.executor = fixtureExecutor;
+  vi.mocked(goto).mockClear();
+
+  // Repository activity names each row's pull request; pressing it opens that row's own review set.
+  const repositoryUrl = new URL('http://ui.test/t/acme/repositories/payments-api?version=1.4.0');
+  const repository = render(RepositoryPage, { data: { ...(await loadRepository({ ...session, params: { tenantKey: 'acme', name: 'payments-api' }, url: repositoryUrl, request: new Request(repositoryUrl) } as never)), tenant } } as never);
+  const activity = within(repository.getByRole('region', { name: 'Verification activity' }));
+  expect(activity.getByRole('columnheader', { name: /Pull request/ })).toBeInTheDocument();
+  await fireEvent.click(activity.getAllByRole('button', { name: 'payments-api#482' })[0]);
+  expect(goto).toHaveBeenLastCalledWith(`/t/acme/repositories/payments-api/pulls/482?set=${REVIEW.latest}`);
+  repository.unmount();
+
+  // Verify counts and groups by pull request over the same population, and its rows open the same page.
+  const state = readState(new URLSearchParams());
+  expect(verifyInputs(state).facets.facets).toContain('pull_request');
+  expect(verifyInputs({ ...state, group: 'pull_request' }).list).toMatchObject({ groupBy: 'pull_request' });
+  expect(verifyStep(state, { name: 'pull_request.open', input: { repository: 'a b', number: 7 } }, '')).toEqual({ pull: '/repositories/a%20b/pulls/7' });
+  expect(verifyStep(state, { name: 'pull_request.open', input: { repository: 'api', number: 7, generation: 'g1' } }, '')).toEqual({ pull: '/repositories/api/pulls/7?set=g1' });
 });

@@ -122,6 +122,9 @@ pub(crate) struct PullRequestRepository {
 /// GitHub's current state of the pull request.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct PullRequestBody {
+    /// Title; display only, so a body without one still admits.
+    #[serde(default)]
+    pub(crate) title: Option<String>,
     /// `open` or `closed`.
     pub(crate) state: String,
     /// Whether it is a draft.

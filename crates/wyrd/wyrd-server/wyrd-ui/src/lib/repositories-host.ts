@@ -1,7 +1,7 @@
 /**
  * The Repositories pages' URL state: the index search and Show choice, one
- * exact Repository version with its declaration tab, and the index state a
- * detail page returns to. Every field round-trips through the URL.
+ * exact Repository version with its declaration tab, one pull request with
+ * its pinned review set, and the index state a detail page returns to. Every field round-trips through the URL.
  */
 import type { CardRef } from 'wyrd-ai-ui';
 import type { RepositoryIndexInput } from 'wyrd-ai-ui/loaders';
@@ -36,6 +36,11 @@ export function repositoryHref(base: string, ref: CardRef, extra: { declaration?
   const params = new URLSearchParams({ version: ref.version });
   if (extra.declaration && extra.declaration !== 'yaml') params.set('declaration', extra.declaration);
   return `${base}/repositories/${encodeURIComponent(ref.name)}${withBack(params, extra.back)}`;
+}
+
+/** One pull request's review sets: the plain link follows the latest set, and `generation` pins one exact set. */
+export function pullHref(base: string, name: string, number: number, generation?: string): string {
+  return `${base}/repositories/${encodeURIComponent(name)}/pulls/${number}${generation ? `?${new URLSearchParams({ set: generation })}` : ''}`;
 }
 
 /** The page of one reachable GitHub repository that has no Card. */

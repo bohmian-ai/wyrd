@@ -47,7 +47,7 @@
     timeseries,
     TRACE,
     VERIFIER
-  } from '$lib/ui-fixtures';
+ , REVIEW } from '$lib/ui-fixtures';
 
   let drawer = $state(false);
   let actions = $state<Record<string, ActionState>>({});
@@ -203,6 +203,18 @@
         { label: 'selected policy binds nothing', input: { cardRef: { ...REPOSITORY, name: 'docs-site', version: '0.3.0' } } },
         ...STATES.filter((state) => state !== 'empty').map((state) => ({ label: state, input: { cardRef: REPOSITORY }, state })),
         { label: 'narrow', input: { cardRef: REPOSITORY }, narrow: true }
+      ]
+    },
+    {
+      component: 'ReviewSets',
+      regions: [],
+      note: 'Reference: the approved verification mock, pull request page. Each member keeps its own status and verdict.',
+      cases: [
+        { label: 'latest set followed', input: { repository: REVIEW.repository, number: REVIEW.number } },
+        { label: 'earlier set pinned', input: { repository: REVIEW.repository, number: REVIEW.number, generation: REVIEW.earlier } },
+        { label: 'pinned set not retained', input: { repository: REVIEW.repository, number: REVIEW.number, generation: 'not-retained' } },
+        ...STATES.map((state) => ({ label: state, input: { repository: REVIEW.repository, number: REVIEW.number }, state })),
+        { label: 'narrow', input: { repository: REVIEW.repository, number: REVIEW.number }, narrow: true }
       ]
     },
     {

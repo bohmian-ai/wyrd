@@ -36,6 +36,10 @@ is superseded by authorization-model REQ-006/007 and the current
 Record the integrated revision and focused dependency results; neither old
 proposed headers nor specification approval establish runtime acceptance.
 
+Dependency evidence at base `05fc05138` with this task's changes in the tree:
+[D1] the first prerequisite command below, 1 passed; [D2] the second (the
+Alice journey), 1 passed before and after it was extended for this task.
+
 ## Existing owners and connected implementation
 
 Carry forward the design's “Proposed TASK-005 revision” and its rationale.
@@ -99,6 +103,57 @@ proof, not manufactured failures.
    real-server `ui-library.integration.test.ts`. The missing PR-set loader/
    presentation should produce RED.
 
+   - Reuse: retained `execution_inputs` rows (origin `pull_request`) carry the
+     frozen source, generation, `members` and the selected policy as
+     `workload_card_uid`; the Verify population (`SIGNALS.executions`) already
+     selects each execution's status and checkpoint-selected result. Gap: no
+     reader grouped those rows into sets. `loadReviewSets`
+     (`packages/ui/src/lib/observe.ts`) adds one history query and one member
+     query over that same population, through the existing `bifrost.query`
+     executors. No new server read, executor or table.
+   - Proof: "TASK-005: the current review set of a pull request loads its
+     recorded members through the Node and MCP hosts"
+     (`src/lib/ui-library.integration.test.ts`). A real connection, declared
+     two-Verifier policy (`policies/gated-review.toml`) and
+     `reviewPullRequest` admission; `ci-gate` passes on published evidence
+     and `code-review` ends inconclusive. Through both executors it asserts
+     the accepted generation, source pins, policy UID, request key, frozen
+     member order, each member's status/verdict against its exact status
+     read and its `result_id` against the retained result row, no `verdict`
+     key on the set or the data, and exactly two `bifrost.query` requests.
+   - Command [U1]: `mise exec -- scripts/postgres/with-test-postgres.sh -- env WYRD_UI_INTEGRATION=1 pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.integration.test.ts -t '<name>'`.
+   - RED: `TypeError: loadReviewSets is not a function`. GREEN: 1 passed.
+   - Test corrections before RED/GREEN (test input only): the fixture waited
+     on the member that was not parked for `ci`; the public status read has
+     no `result_id`, so the expectation now reads the retained result row.
+   - Design note: the loader is keyed by Repository Card name and number
+     (`{ repository, number, generation? }`), matching the mock's route
+     `/repositories/<name>/pulls/<number>`. The name is the retained
+     `subject_name`; no Card or GitHub read is needed to open a set. The same
+     test also reads the members back through `loadRecordTable` filtered by
+     `pull_request = '<name>#7'`, with their `review_set`.
+   - Presentation proof (`src/lib/ui-library.test.ts`, [U2]): "a pull
+     request shows its review sets, each member with its own status and
+     verdict, and no combined verdict" renders `ReviewSets` and checks the
+     emitted intents. RED: the component was undefined at render. GREEN.
+   - PR title (maintainer decision, 2026-11-23, replacing the "no new SDK wire
+     field" constraint for this one field): `PullRequestActivation.title`
+     (`crates/wyrd-spec/src/verification/execution.rs`) is optional and kept
+     from the GitHub pull request read that admission already makes
+     (`app.rs` `PullRequestBody`, `pull_requests.rs` `Observed::of`). It
+     is display only: set identity still compares base, head and head
+     repository, so a title edit admits nothing. Sources admitted before this
+     change have no title, and the page heads them with `#N`. TS wire types
+     regenerated; the Python stub `verify/__init__.pyi` updated by hand.
+     RED: [U1] scenario 1 test, `title: 'Change'` missing from the set, and
+     [U2] "a pull request shows its review sets…", heading without the title.
+     GREEN: [U1] 3 passed; [U2]/[P1] 68 passed; Rust
+     `components::github::pull_requests::tests::current_provider_state_decides_the_observation`
+     1 passed; [D1] 1 passed; `mise run fmt`, `mise run lints`,
+     `mise run py:lints`, `mise run codegen:check`, `mise run ui:check` all
+     exit 0.
+   - Status: PASS.
+
 2. **Keep current and history exact.** Request a fresh review at the same head,
    then advance the head. Follow current, pin an earlier generation outside the
    Verify time range, refresh with delayed older records, and request an absent
@@ -110,6 +165,40 @@ proof, not manufactured failures.
    UI integration owner consuming actual admission/retention outputs; pure
    selection/bounds branches in `ui-library.test.ts`. Missing history and
    completeness handling should produce RED; reuse backend retention proof.
+
+   - Proof (pure, `src/lib/ui-library.test.ts`): "review sets follow the
+     newest observation, keep a pinned set, and report a missing pin instead
+     of replacing it" and "a review set is complete only when every frozen
+     member is visible, within the history bound". They cover current
+     selection, a pin read from its own observation time under an unrelated
+     Verify range, a missing pin with no member read, an interrupted set
+     (`complete: false`, the unseen member `retained: false`), a refused
+     member with a status and no verdict, the history bound (`more`), a pin
+     older than the bound, and empty/denied history and denied member reads.
+     Command [U2]: `pnpm package && pnpm exec vitest run src/lib/ui-library.test.ts -t 'review set'`.
+   - RED: `more` absent and 201 sets returned for a 200-record bound; then
+     GREEN 2 passed. The interrupted-set assertions already passed on the
+     scenario 1 loader.
+   - Proof (real server): "TASK-005: a pull request follows its newest
+     review set while a pinned earlier set stays exact" (U1): first review,
+     rerequest at the same head, push; then another review while the pin is
+     open; then an unretained pin. Passed when first run, because the pin
+     and bound were implemented under the pure tests above.
+   - Reused backend proof [D1], run at this revision, 1 passed:
+     `pg_github_pull_requests::retained_reads_resolve_current_and_history_membership`
+     (the first prerequisite command below). It owns delayed older records
+     and interrupted handoff at the source; a TypeScript test cannot stall
+     Scribe, so "refresh with delayed older records" is not re-driven here.
+   - Presentation proof ([U2]): "a review set says when it is the latest
+     pin, incomplete, cut short or not retained". Page proof
+     (`src/lib/ui-pages.test.ts`, [P1]
+     `pnpm exec vitest run src/lib/ui-pages.test.ts -t '<name>'`): "a pull
+     request page follows the latest review set, keeps a pinned set in its URL
+     and opens a member". RED there was an unresolved import of the route,
+     which is a missing-module failure rather than an assertion failure.
+   - Browser proof: scenario 5's journey selects the earlier set, reloads and
+     stays on it.
+   - Status: PASS, with the delayed-records limit above.
 
 3. **Respect Repository grants everywhere.** Two Repositories share a Verifier.
    A family-scoped reader and a minimal custom Card-read role see only their
@@ -125,6 +214,34 @@ proof, not manufactured failures.
    than replacing its assertions. New PR-set consumer mismatches should be RED;
    unchanged source-boundary enforcement may already pass.
 
+   - Proof (real server, Node and MCP, [U1]): "TASK-005: a Repository grant
+     reads that Repository's review sets and nothing of another Repository".
+     `api` and `web` share `ci-gate`; `api` is reviewed under policy
+     versions 0.1.0 and 0.2.0. A family viewer and a custom `cards:read` role
+     read both `api` sets, get "no set" for `web`, count only `api#7` in
+     the Verify `pull_request` facet, and get
+     `WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND` for a `web` member. An
+     exact-version viewer sees only the set its policy UID admitted; a pin to
+     the other set is reported missing. A `bifrost_query:read` key with no
+     Card read gets no rows. Unbind then bind changes the same client's next
+     read.
+   - Proof (production BFF and browser, [D2]): the Alice journey now opens
+     `payments#7` from Repository activity, sees one passed member and no
+     `ledger` text, reads `ledger/pulls/9` identically to `nosuch/pulls/9`,
+     and gains then loses `ledger`'s set with the ledger grant in the same
+     session. Its existing assertions (GitHub configuration denied, foreign
+     execution link equal to an unknown one) are unchanged and pass.
+   - RED/GREEN: both passed once their test inputs were right; enforcement
+     is the existing Oracle boundary and the loader was already built under
+     scenarios 1 and 2. Test-input corrections only: `gated-review.toml`
+     needed its own version (0.2.0) to coexist with `gated`; the facet read
+     needed a time range; the exact-version reader's only visible set is its
+     current one.
+   - Limitation: the browser journey uses the family viewer. The custom role,
+     exact-version and table-only readers are proven through the shared
+     loaders, not through a browser session.
+   - Status: PASS at the loader and BFF tiers named above.
+
 4. **Inspect without definition access.** The permitted Repository reader has
    no grant to the member's Verifier definition; also exercise retained work
    after a source Card is deleted while its retained parent remains authorized.
@@ -135,6 +252,32 @@ proof, not manufactured failures.
    **Tier/owner:** component test plus real-server loader and BFF/browser.
    Missing recorded-selection navigation, including completed progress skipped
    because definition lookup failed, should produce RED.
+
+   - Change: `loadExecution` (`packages/ui/src/lib/execution.ts`) reads
+     recorded progress whenever the definition is not populated; it still
+     skips only for a readable definition with no steps.
+     `VerificationExecution` lists the recorded requirements and the steps
+     that recorded an invocation under the refusal, as buttons sending the
+     existing `execution.select` intent. No node or edge is drawn.
+   - Proof (component, [U2]): "an execution whose Verifier definition is
+     refused still lets a reader select what was recorded". RED: `Unable to
+     find an accessible element with the role "group" and name "Recorded
+     without the definition"`. GREEN.
+   - Two existing assertions pinned the old skip and now assert the read:
+     "execution loader reads each part once and keeps refusals apart"
+     (`ui-library.test.ts`) and "a judged execution shows its judgments…"
+     (`ui-library.integration.test.ts`, [U1], an `executions:read`-only key
+     through Node and MCP). Both failed on the old expectation, then passed.
+   - Proof (real server): the scenario 3 grant test opens an `api` member
+     as the family and custom readers: definition not populated, recorded
+     progress populated, Repository name present. The Alice journey [D2]
+     selects `Requirement green`, reloads with it still selected, and finds
+     no graph node.
+   - FAIL (not proven): work retained after its source Card is deleted; a
+     step output preview and download without the definition against a real
+     server (the `ci-gate` member has no steps; the component test covers
+     the preview with fixtures).
+   - Status: selection PASS; the two cases above remain open.
 
 5. **Connect navigation and hosts.** Through the production browser follow
    Repository → PR → older set → member → output → Back. Copy/reload links and
@@ -149,6 +292,38 @@ proof, not manufactured failures.
    definition-unavailable recorded selection; record AC-009 comparison evidence
    and get the maintainer's ruling on remaining mock differences as required by
    [wyrd-ui](../../../../.agents/skills/wyrd-ui/SKILL.md#matching-an-approved-mock).
+
+   - Proof (host units, [U2]/[P1]): "an executions list names the pull
+     request of each row and opens its review sets" (RED: `pull_request is
+     not a executions column`), "an execution of a pull request names it and
+     opens the review set that admitted it", and "Repository activity, Verify
+     and an execution each lead to the pull request review sets". The last
+     two were written before their production code; their first run was
+     after it, so no RED was observed for them.
+   - Proof (production browser, [D2]): Repository activity → `payments#7` →
+     pinned set → member → recorded selection → reload → Back to the pinned
+     set; then, after a rerequested review, latest set marked current →
+     earlier set → reload stays → member → its pull request link → the same
+     earlier set → Back.
+   - Existing discovery behavior: Verify's facet and group lists gained
+     `pull_request`; the two pinned lists in `ui-pages.test.ts` were
+     extended. `mise run ui:check`: 112 passed, 0 type errors.
+   - FAIL (not proven): the built `ui://wyrd/view` artifact and a custom
+     host rendering `ReviewSets`; "Copy link" on the pull request page (the
+     page has none; the URL carries the selection); changing the pull request
+     while a selection is open; light/dark, mobile, keyboard/touch and
+     long-content comparison against the mock (AC-009).
+   - Mock differences awaiting the maintainer's ruling: the heading shows
+     the retained title (scenario 1), but there is no GitHub link because the
+     repository's full name is not retained; occurrences read "requested review"
+     or "pull request event"; set and member rows are buttons rather than
+     anchors; members show no per-member time; a Verifier shows its label or
+     UID without a link; set and execution ids are shortened; Repository
+     activity has a "Pull request" column but not the mock's Head and Policy
+     columns or its "Latest per PR / Include earlier review sets" switch; the
+     definition-unavailable list of recorded requirements and steps is new
+     and has no mock.
+   - Status: navigation PASS; the items marked FAIL remain open.
 
 ## Verification and handoff
 
@@ -169,6 +344,14 @@ regeneration and `mise run codegen:check` for schema/catalog changes. Apply
 affected BFF/session owner checks from the UI skill, including
 `mise run test:identity:ui` where that boundary changes. Preserve existing
 query consolidation and bounded reads; add no benchmark or unrelated gate.
+
+Gallery: `_gallery` has `ReviewSets` cases (latest, pinned, not retained,
+each state, narrow). Lanes run: `mise run ui:check` (exit 0),
+`mise run codegen:check` (exit 0), `git diff --check` (clean). TDD: the host
+link tests in scenario 5 and the browser/grant journeys in scenarios 3 and 5
+first ran after their production code; every other new behavior has an
+observed RED. Not run: `mise run test:identity:ui` (no BFF/session code
+changed).
 
 Planning claims no implementation, runtime proof or independent acceptance.
 Full shipped-surface journey lanes belong to integrated change review.

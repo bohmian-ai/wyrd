@@ -2044,6 +2044,144 @@
         }
       ]
     },
+    "ReviewSets": {
+      "description": "One pull request of a Repository: its retained review sets newest first, the latest or one pinned set selected, and that set's frozen members, each with its own status, verdict and failed requirements. A set has no combined verdict.",
+      "input": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "repository": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "number": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "generation": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          }
+        },
+        "required": [
+          "repository",
+          "number"
+        ],
+        "additionalProperties": false
+      },
+      "states": [
+        "populated",
+        "empty",
+        "denied",
+        "error",
+        "loading"
+      ],
+      "emits": [
+        {
+          "name": "review_set.open",
+          "description": "Show one exact review set of this pull request, or with no generation follow the latest.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "generation": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64
+              }
+            },
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        },
+        {
+          "name": "record.open",
+          "description": "Open one exact member execution.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "execution_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200
+              }
+            },
+            "required": [
+              "execution_id"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        },
+        {
+          "name": "card.open",
+          "description": "Open this exact Card version.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "card_ref": {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "Data",
+                      "Model",
+                      "Artifact",
+                      "Experiment",
+                      "Prompt",
+                      "Agent",
+                      "Mcp",
+                      "Service",
+                      "Audit",
+                      "Verifier",
+                      "Trigger",
+                      "Operator",
+                      "Repository"
+                    ]
+                  },
+                  "name": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "version": {
+                    "type": "string",
+                    "pattern": "^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+                  },
+                  "uid": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "kind",
+                  "name",
+                  "version"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "card_ref"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        }
+      ]
+    },
     "RepositoryDeclare": {
       "description": "One reachable GitHub repository with no Repository Card: its three separate facts and the wyrd.toml and command that declare it.",
       "input": {
@@ -2498,6 +2636,37 @@
             },
             "required": [
               "trace_id"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        },
+        {
+          "name": "pull_request.open",
+          "description": "Open the review sets of the pull request this execution was admitted for, pinned to its own review set.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "repository": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200
+              },
+              "number": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "generation": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64
+              }
+            },
+            "required": [
+              "repository",
+              "number"
             ],
             "additionalProperties": false
           },
@@ -3156,6 +3325,37 @@
                 "additionalProperties": false
               }
             ]
+          },
+          "completion": "host-navigation"
+        },
+        {
+          "name": "pull_request.open",
+          "description": "Open the review sets of the pull request an execution row names, pinned to that row's review set when the list read it.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "repository": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200
+              },
+              "number": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "generation": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64
+              }
+            },
+            "required": [
+              "repository",
+              "number"
+            ],
+            "additionalProperties": false
           },
           "completion": "host-navigation"
         },

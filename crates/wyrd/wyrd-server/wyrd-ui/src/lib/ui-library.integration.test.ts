@@ -14,7 +14,7 @@ import { render } from '@testing-library/svelte';
 import { expect, vi } from 'vitest';
 import { StatStrip, TraceWaterfall, type RepositoryRow } from 'wyrd-ai-ui';
 import { z } from 'zod';
-import { Bifrost, Cards, Gateway, GithubConnection, Principals, TableConfig, WyrdClient, WyrdState } from 'wyrd-ai';
+import { Bifrost, Cards, Gateway, GithubConnection, Principals, TableConfig, WyrdClient, WyrdState, verify } from 'wyrd-ai';
 import { type NativeWyrdTestServer, signInGithubBrowser } from '@wyrd/testing';
 import {
   CardRefSchema,
@@ -31,6 +31,7 @@ import {
   loadRepositoryDeclare,
   loadRepositoryIndex,
   loadRepositoryPolicy,
+  loadReviewSets,
   loadRunsOn,
   loadUsedBy,
   loadVerifierDefinition,
@@ -1445,7 +1446,8 @@ judged('a judged execution shows its judgments, accepted inputs, completed detai
         expect((await loadExecution({ executionId }, { executor: foreign })).result, surface).toMatchObject({ state: 'error', problem: { code: 'WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND' } });
       const partial = data(await loadExecution({ executionId: refused, node: 'input:answer' }, { executor: narrow }), surface);
       expect(partial.status.result?.outcome.verdict, surface).toBe('failed');
-      expect(partial.invocations, surface).toBeUndefined();
+      // With the definition denied, recorded progress is the only list left to select from, so it is read.
+      expect(partial.invocations, surface).toMatchObject({ state: 'populated', data: { items: [{ state: 'requirement', outcome: 'failed', producer: { step_id: 'says-yes' } }] } });
       expect([partial.definition, partial.inputs], surface).toMatchObject([
         { state: 'denied', problem: { code: DENIED } },
         { state: 'populated', data: { kind: 'json', value: 'no' } }
@@ -2187,4 +2189,263 @@ reviewed('Repository Cards join GitHub access by repository id through the Node 
     { card: 'api', selected: second.version, versions: 2, fullName: undefined, repositoryId: '1', bindings: 2, access: 'none', readiness: 'inactive' },
     { card: 'web', selected: web.version, versions: 1, fullName: undefined, repositoryId: '2', bindings: 0, access: 'none', readiness: 'inactive' }
   ]);
+});
+
+/** The head commit the reviewed pull request is at. */
+const REVIEW_HEAD = 'a1'.repeat(20);
+
+deferred('TASK-005: the current review set of a pull request loads its recorded members through the Node and MCP hosts', async ({ server }) => {
+  // The tenant connects GitHub and declares a policy for `acme/api` that runs two Verifiers on every pull request.
+  const github = server.githubApp;
+  const admin = await connectGithub(server);
+  const cards = await Cards.connect({ client: admin });
+  await cards.declareFromPath(fixture('cards/deferred_evidence/repository.yaml'));
+  const policy = await cards.get(await declarePolicy(cards, github.host, 'acme/api', 'gated-review'));
+
+  // One review of pull request 7 admits both Verifiers together; CI then publishes the evidence `ci-gate` waits for.
+  github.setPullRequest(1, 7, 'b1'.repeat(20), REVIEW_HEAD);
+  const accepted = await (await GithubConnection.connect({ client: admin })).reviewPullRequest({ host: github.host, repository_id: '1', number: 7 }, 'task-005-current');
+  expect(accepted.executions).toHaveLength(2);
+  const members = await Promise.all(accepted.executions.map((id) => verify.Execution.connect(id, { client: admin })));
+  // The `ci-gate` member parks until CI publishes; find it by the input it waits for.
+  let gated: verify.Execution | undefined;
+  await vi.waitFor(
+    async () => {
+      const states = await Promise.all(members.map((member) => member.status()));
+      const waiting = states.findIndex((state) => state.waiting?.includes('ci'));
+      expect(waiting).toBeGreaterThanOrEqual(0);
+      gated = members[waiting];
+    },
+    { timeout: 30_000, interval: 200 }
+  );
+  if (!gated) throw new Error('no member waits for ci');
+  await (await verify.Evidence.connect({ client: admin })).publish('ci', { status: 'green' }, { repository: 'acme/api', commit: REVIEW_HEAD });
+  const judged = await gated.wait({ timeoutMs: 30_000 });
+  expect(judged.outcome.verdict).toBe('passed');
+
+  const retained = await Bifrost.connect({ client: admin });
+  const mcp = await mcpOver(server.baseUrl, admin);
+  for (const [host, executor] of [['node', nodeExecutor(admin)], ['mcp', mcp.executor]] as const) {
+    // What the server records for each member, to compare the set against: its exact status read and its one retained result.
+    server.flushBifrost();
+    const results = await retained.sql('SELECT execution_id, result_id FROM bifrost.verification.results', [], z.object({ execution_id: z.string(), result_id: z.string() }));
+    const recorded = await Promise.all(
+      accepted.executions.map(async (id) => {
+        const state = await (await verify.Execution.connect(id, { client: admin })).status();
+        const result = results.find((row) => row.execution_id === id);
+        return { execution_id: id, status: state.status, verdict: state.result?.outcome.verdict ?? null, result_id: result?.result_id ?? null };
+      })
+    );
+    expect(recorded.map((member) => member.result_id), host).not.toContain(null);
+    expect(recorded.map((member) => member.verdict), host).toContain('passed');
+
+    const requests: WireRequest[] = [];
+    const recording: Executor = { run: (batch, signal) => (requests.push(...batch), executor.run(batch, signal)) };
+    await vi.waitFor(
+      async () => {
+        server.flushBifrost();
+        requests.length = 0;
+        const loaded = await loadReviewSets({ repository: policy.metadata.name, number: 7 }, { executor: recording });
+        if (loaded.result.state !== 'populated') throw new Error(`${host}: ${JSON.stringify(loaded.result)}`);
+        const { sets, current, selected } = loaded.result.data;
+        if (!selected) throw new Error(`${host}: no review set is selected`);
+
+        // The one retained set is current: its recorded source, exact policy and frozen members, complete.
+        expect(sets.map((set) => set.generation), host).toEqual([accepted.generation]);
+        expect(current, host).toBe(accepted.generation);
+        expect(selected, host).toMatchObject({
+          generation: accepted.generation,
+          host: github.host,
+          repository_id: '1',
+          number: 7,
+          head: { ref: 'feature', sha: REVIEW_HEAD },
+          base: { ref: 'main', sha: 'b1'.repeat(20) },
+          policy: { name: policy.metadata.name, version: policy.metadata.version, uid: policy.metadata.uid },
+          request_key: 'task-005-current',
+          // The title GitHub showed when the review was admitted.
+          title: 'Change',
+          complete: true
+        });
+        // Each member keeps its own status, selected result and verdict; the set has no verdict of its own.
+        expect(selected.members.map(({ execution_id, status, verdict, result_id }) => ({ execution_id, status, verdict, result_id })), host).toEqual(recorded);
+        expect(selected.members.map((member) => member.verifier_card_uid).every((uid) => typeof uid === 'string'), host).toBe(true);
+        expect(Object.keys(selected), host).not.toContain('verdict');
+        expect(Object.keys(loaded.result.data), host).not.toContain('verdict');
+      },
+      { timeout: 30_000, interval: 500 }
+    );
+    // The set is two bounded queries, whatever its size: no status or detail read per member.
+    expect(requests.map((request) => request.op), host).toEqual(['bifrost.query', 'bifrost.query']);
+  }
+  await mcp.close();
+
+  // Verify's own list finds the same members by their pull request, each naming its review set.
+  const hour = { from: new Date(Date.now() - 3_600_000).toISOString(), to: new Date(Date.now() + 60_000).toISOString() };
+  const listed = await loadRecordTable(
+    { signal: 'executions', columns: ['pull_request', 'review_set', 'status'], where: [{ column: 'pull_request', value: `${policy.metadata.name}#7` }] },
+    { executor: nodeExecutor(admin), range: hour }
+  );
+  if (listed.result.state !== 'populated') throw new Error(JSON.stringify(listed.result));
+  const at = (name: string) => listed.result.state === 'populated' ? listed.result.data.rows.columns.findIndex((column) => column.name === name) : -1;
+  expect(listed.result.data.rows.rows.map((row) => [row[at('execution_id')], row[at('pull_request')], row[at('review_set')]]).sort()).toEqual(
+    accepted.executions.map((id) => [id, `${policy.metadata.name}#7`, accepted.generation]).sort()
+  );
+});
+
+deferred('TASK-005: a pull request follows its newest review set while a pinned earlier set stays exact', async ({ server }) => {
+  const github = server.githubApp;
+  const admin = await connectGithub(server);
+  const cards = await Cards.connect({ client: admin });
+  await cards.declareFromPath(fixture('cards/deferred_evidence/repository.yaml'));
+  const policy = await declarePolicy(cards, github.host, 'acme/api', 'gated-review');
+  const connection = await GithubConnection.connect({ client: admin });
+  const review = (key: string) => connection.reviewPullRequest({ host: github.host, repository_id: '1', number: 7 }, key);
+  const PULL = { repository: policy.name, number: 7 };
+  // Verify's own range is a day long ago: review sets are read by their recorded observation, not by it.
+  const context = { executor: nodeExecutor(admin), range: { from: '2020-01-01T00:00:00Z', to: '2020-01-02T00:00:00Z' } };
+  /** The review sets once `count` of them are retained. */
+  const load = async (count: number, generation?: string) => {
+    let data: Extract<Awaited<ReturnType<typeof loadReviewSets>>['result'], { state: 'populated' }>['data'] | undefined;
+    await vi.waitFor(
+      async () => {
+        server.flushBifrost();
+        const loaded = await loadReviewSets({ ...PULL, ...(generation ? { generation } : {}) }, context);
+        if (loaded.result.state !== 'populated') throw new Error(JSON.stringify(loaded.result));
+        expect(loaded.result.data.sets).toHaveLength(count);
+        data = loaded.result.data;
+      },
+      { timeout: 30_000, interval: 500 }
+    );
+    if (!data) throw new Error('no review set loaded');
+    return data;
+  };
+
+  // The pull request is reviewed, reviewed again at the same head, and then pushed to.
+  github.setPullRequest(1, 7, 'b1'.repeat(20), REVIEW_HEAD);
+  const first = await review('task-005-first');
+  const again = await review('task-005-again');
+  const PUSHED = 'c3'.repeat(20);
+  github.setPullRequest(1, 7, 'b1'.repeat(20), PUSHED);
+  expect(github.deliverPullRequest(server.baseUrl, 101, 1, 7, 'synchronize')).toBe(202);
+
+  // The plain link follows the newest set: the push. The rerequest and the first review are earlier sets on the same head.
+  const latest = await load(3);
+  const pushed = latest.selected;
+  expect(latest.current).toBe(pushed?.generation);
+  expect(latest.sets.map((set) => [set.generation, set.head.sha, set.request_key])).toEqual([
+    [pushed?.generation, PUSHED, undefined],
+    [again.generation, REVIEW_HEAD, 'task-005-again'],
+    [first.generation, REVIEW_HEAD, 'task-005-first']
+  ]);
+  expect(pushed?.delivery_id).toBeTruthy();
+  // The newest set's frozen members are the ones the server's exact read of a member names.
+  const [member] = pushed?.member_ids ?? [];
+  const exact = await (await verify.Execution.connect(member, { client: admin })).status();
+  expect([exact.pull_request?.generation, exact.pull_request?.members]).toEqual([pushed?.generation, pushed?.member_ids]);
+
+  // A link pinned to the first review stays on it: its frozen members, each superseded, never the newest set's.
+  const pinned = await load(3, first.generation);
+  expect(pinned.current).toBe(pushed?.generation);
+  expect(pinned.selected).toMatchObject({ generation: first.generation, head: { sha: REVIEW_HEAD }, complete: true });
+  expect(pinned.selected?.members.map((each) => [each.execution_id, each.status, each.verdict])).toEqual(first.executions.map((id) => [id, 'cancelled', null]));
+
+  // The pull request is reviewed once more while that link is open: the pin does not move, and the plain link does.
+  const newest = await review('task-005-newest');
+  const still = await load(4, first.generation);
+  expect([still.current, still.selected?.generation]).toEqual([newest.generation, first.generation]);
+  expect((await load(4)).selected?.generation).toBe(newest.generation);
+
+  // A pinned set that was never retained is reported as missing, not replaced by the newest.
+  const missing = await load(4, '00000000-0000-7000-8000-000000000000');
+  expect([missing.current, missing.selected]).toEqual([newest.generation, undefined]);
+});
+
+deferred('TASK-005: a Repository grant reads that Repository\'s review sets and nothing of another Repository', async ({ server }) => {
+  // Setup: Repositories `api` and `web` both run the `ci-gate` Verifier. `api` is reviewed under two policy versions, `web` once.
+  const github = server.githubApp;
+  const admin = await connectGithub(server);
+  const cards = await Cards.connect({ client: admin });
+  const principals = await Principals.connect({ client: admin });
+  const connection = await GithubConnection.connect({ client: admin });
+  await cards.declareFromPath(fixture('cards/deferred_evidence/repository.yaml'));
+  github.setPullRequest(1, 7, 'b1'.repeat(20), REVIEW_HEAD);
+  github.setPullRequest(2, 7, 'b2'.repeat(20), 'c2'.repeat(20));
+  const first = await cards.get(await declarePolicy(cards, github.host, 'acme/api', 'gated'));
+  const earlier = await connection.reviewPullRequest({ host: github.host, repository_id: '1', number: 7 }, 'task-005-grant-first');
+  const second = await cards.get(await declarePolicy(cards, github.host, 'acme/api', 'gated-review'));
+  const later = await connection.reviewPullRequest({ host: github.host, repository_id: '1', number: 7 }, 'task-005-grant-second');
+  const other = await connection.reviewPullRequest({ host: github.host, repository_id: '2', number: 7 }, 'task-005-grant-web');
+  const api = first.metadata.name;
+  expect(second.metadata.uid).not.toBe(first.metadata.uid);
+
+  // Four readers: the built-in viewer and a custom Card-read role at the `api` family, a viewer of the first policy version only, and a key that may query tables but read no Card.
+  await principals.putRole('card_reader', { operations: [{ resource: 'cards', action: 'read' }] });
+  const family = { card: { family: { kind: 'Repository', name: api } } } as const;
+  const reader = async (name: string, role: string, scope: object) =>
+    WyrdClient.connect({ credential: (await principals.createServicePrincipal({ name, assignments: [{ role, scope }] } as never)).credential });
+  const readers = {
+    viewer: await reader('pr-family-viewer', 'viewer', family),
+    custom: await reader('pr-custom-reader', 'card_reader', family),
+    exact: await reader('pr-exact-viewer', 'viewer', { card: { version: { kind: 'Repository', name: api, uid: first.metadata.uid } } }),
+    tableOnly: WyrdClient.connect({ credential: server.scopedApiKey('pr_table_only', ['bifrost_query:read']) })
+  };
+  /** Verify's time range for the facet read: the hour these reviews ran in. */
+  const lastHour = { from: new Date(Date.now() - 3_600_000).toISOString(), to: new Date(Date.now() + 600_000).toISOString() };
+  /** What one reader's loader returns for a pull request: its set generations, the selected members, and the state. */
+  const sets = async (client: WyrdClient, repository: string, executor = nodeExecutor(client)) => {
+    const loaded = await loadReviewSets({ repository, number: 7 }, { executor });
+    if (loaded.result.state !== 'populated') return { state: loaded.result.state, generations: [], members: [] };
+    const { sets, selected } = loaded.result.data;
+    return { state: 'populated', generations: sets.map((set) => set.generation), members: selected?.members.filter((member) => member.retained).map((member) => member.execution_id) ?? [] };
+  };
+
+  // The administrator sees every set once all three are retained.
+  await vi.waitFor(
+    async () => {
+      server.flushBifrost();
+      expect(await sets(admin, api)).toEqual({ state: 'populated', generations: [later.generation, earlier.generation], members: later.executions });
+      expect(await sets(admin, 'web')).toEqual({ state: 'populated', generations: [other.generation], members: other.executions });
+    },
+    { timeout: 60_000, interval: 500 }
+  );
+
+  // A family grant, built-in or custom, reads both `api` sets through either host, and `web` reads as a pull request with no set.
+  for (const [role, client] of [['viewer', readers.viewer], ['custom', readers.custom]] as const) {
+    const mcp = await mcpOver(server.baseUrl, client);
+    try {
+      for (const [host, executor] of [['node', nodeExecutor(client)], ['mcp', mcp.executor]] as const) {
+        expect(await sets(client, api, executor), `${role} ${host}`).toEqual({ state: 'populated', generations: [later.generation, earlier.generation], members: later.executions });
+        expect(await sets(client, 'web', executor), `${role} ${host}`).toEqual({ state: 'empty', generations: [], members: [] });
+        // Verify's pull request facet and list count `api` alone.
+        const rail = await loadFacetRail({ signal: 'executions', facets: ['pull_request'] }, { executor, range: lastHour });
+        if (rail.result.state !== 'populated') throw new Error(`${role} ${host}: ${JSON.stringify(rail.result)}`);
+        expect(rail.result, `${role} ${host}`).toMatchObject({ state: 'populated', data: { facets: [{ values: { rows: [[`${api}#7`, earlier.executions.length + later.executions.length]] } }] } });
+        // A `web` member opened by its link reads as an execution that does not exist.
+        expect((await loadExecution({ executionId: other.executions[0] }, { executor })).result, `${role} ${host}`).toMatchObject({ state: 'error', problem: { code: 'WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND' } });
+        // An `api` member opens with its recorded progress; its Verifier definition is a separate Card this reader was not granted.
+        const member = data(await loadExecution({ executionId: later.executions[0], node: 'none' }, { executor }), `${role} ${host}`);
+        expect([member.repository, member.definition.state === 'populated', member.invocations?.state], `${role} ${host}`).toEqual([api, false, 'populated']);
+      }
+    } finally {
+      await mcp.close();
+    }
+  }
+
+  // A grant of the first policy version reads the set that version admitted, and not the set the second version admitted.
+  expect(await sets(readers.exact, api)).toEqual({ state: 'populated', generations: [earlier.generation], members: earlier.executions });
+  const pinned = await loadReviewSets({ repository: api, number: 7, generation: earlier.generation }, { executor: nodeExecutor(readers.exact) });
+  expect(pinned.result).toMatchObject({ state: 'populated', data: { selected: { generation: earlier.generation, complete: true } } });
+  expect((await loadReviewSets({ repository: api, number: 7, generation: later.generation }, { executor: nodeExecutor(readers.exact) })).result).toMatchObject({ state: 'populated', data: { current: earlier.generation } });
+
+  // Table permission alone unlocks no Repository's rows.
+  expect(await sets(readers.tableOnly, api)).toEqual({ state: 'empty', generations: [], members: [] });
+  expect(await sets(readers.tableOnly, 'web')).toEqual({ state: 'empty', generations: [], members: [] });
+
+  // Removing the family grant ends the next read for the same client; granting it again restores it.
+  const viewerId = (await principals.list({ kind: 'service' })).principals.find((principal) => principal.name === 'pr-family-viewer')!.principal_id;
+  const [binding] = (await principals.bindings({ principal_id: viewerId })).bindings;
+  await principals.unbind(binding.id);
+  await vi.waitFor(async () => expect((await sets(readers.viewer, api)).state).not.toBe('populated'), { timeout: 30_000, interval: 500 });
+  await principals.bind({ subject: { principal: { id: viewerId, kind: 'service' } }, role: 'viewer', scope: family });
+  await vi.waitFor(async () => expect((await sets(readers.viewer, api)).generations).toEqual([later.generation, earlier.generation]), { timeout: 30_000, interval: 500 });
 });

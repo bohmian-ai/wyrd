@@ -1,0 +1,9 @@
+[repository.metadata]
+version = "0.2.0"
+
+[repository.verified_by]
+verifier = [
+  { kind = "Verifier", name = "ci-gate", version = "1.0.0" },
+  "./code-review.yaml",
+]
+runs_on = { kind = "pull_request" }

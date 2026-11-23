@@ -356,15 +356,15 @@ export const VERIFIER_UIDS = { policy: '01a1e602-c0e3-7880-ad65-f29c521418cb', d
 export const verifierLabels = { [VERIFIER_UIDS.policy]: 'ticket-policy@1.1.0', [VERIFIER_UIDS.drift]: 'latency-drift@1.0.0' };
 /** Executions, as the Verify list reads them: shown columns, then execution_id. Completed with each verdict, a recorded cancel, a direct execution with no result, completed before its result row is visible, and one waiting. */
 export const executions = result(
-  [col('recorded_at', 'Timestamp(µs, "+00:00")'), col('verifier_card_uid'), col('subject_name'), col('run_id'), col('group_id'), col('service_name'), col('status'), col('verdict'), col('execution_id')],
+  [col('recorded_at', 'Timestamp(µs, "+00:00")'), col('verifier_card_uid'), col('subject_name'), col('run_id'), col('group_id'), col('service_name'), col('status'), col('verdict'), col('execution_id'), col('pull_request'), col('review_set')],
   [
-    ['2026-10-20T11:58:02.412000Z', VERIFIER_UIDS.policy, 'support-agent', '01a1e602-c9a9-7d0b-a028-5acc7427195f', null, 'support-api', 'completed', 'failed', 'exec_failed'],
-    ['2026-10-20T11:57:41.000000Z', VERIFIER_UIDS.policy, 'support-agent', '01a1e602-c7e4-7396-97d9-a8f9dfc2cde9', 'conversation-7', 'support-api', 'completed', 'passed', 'exec_passed'],
-    ['2026-10-20T11:40:00.000000Z', VERIFIER_UIDS.drift, 'latency-model', null, null, null, 'completed', 'inconclusive', 'exec_inconclusive'],
-    ['2026-10-20T11:31:10.000000Z', VERIFIER_UIDS.drift, 'latency-model', null, null, null, 'cancelled', null, 'exec_cancelled'],
-    ['2026-10-20T11:30:00.000000Z', VERIFIER_UIDS.policy, 'support-agent', null, null, 'support-api', 'not recorded', null, 'exec_open'],
-    ['2026-10-20T11:29:00.000000Z', VERIFIER_UIDS.policy, 'support-agent', null, null, 'support-api', 'completed', null, 'exec_lagging'],
-    ['2026-10-20T11:28:00.000000Z', VERIFIER_UIDS.policy, 'support-agent', null, null, 'support-api', 'waiting', null, 'exec_waiting']
+    ['2026-10-20T11:58:02.412000Z', VERIFIER_UIDS.policy, 'support-agent', '01a1e602-c9a9-7d0b-a028-5acc7427195f', null, 'support-api', 'completed', 'failed', 'exec_failed', 'payments-api#482', '01a1e7a0-5b1c-7d2e-9c41-0f6d2b7a9e11'],
+    ['2026-10-20T11:57:41.000000Z', VERIFIER_UIDS.policy, 'support-agent', '01a1e602-c7e4-7396-97d9-a8f9dfc2cde9', 'conversation-7', 'support-api', 'completed', 'passed', 'exec_passed', 'payments-api#482', '01a1e7a0-5b1c-7d2e-9c41-0f6d2b7a9e11'],
+    ['2026-10-20T11:40:00.000000Z', VERIFIER_UIDS.drift, 'latency-model', null, null, null, 'completed', 'inconclusive', 'exec_inconclusive', null, null],
+    ['2026-10-20T11:31:10.000000Z', VERIFIER_UIDS.drift, 'latency-model', null, null, null, 'cancelled', null, 'exec_cancelled', null, null],
+    ['2026-10-20T11:30:00.000000Z', VERIFIER_UIDS.policy, 'support-agent', null, null, 'support-api', 'not recorded', null, 'exec_open', null, null],
+    ['2026-10-20T11:29:00.000000Z', VERIFIER_UIDS.policy, 'support-agent', null, null, 'support-api', 'completed', null, 'exec_lagging', null, null],
+    ['2026-10-20T11:28:00.000000Z', VERIFIER_UIDS.policy, 'support-agent', null, null, 'support-api', 'waiting', null, 'exec_waiting', null, null]
   ]
 );
 /** Executions per bucket by verdict and by Verifier, as the two Verify charts read them. */
@@ -549,12 +549,43 @@ export const executionDetails = {
     steps: [{ id: 'score', status: 'succeeded', attempts: 2, duration_ms: 1840 }, { id: 'classify', status: 'succeeded', attempts: 1, duration_ms: 920, provenance: { agent: AGENT } }]
   }
 } as unknown as CardTypes.VerificationDetails;
+/** One pull request's retained review sets: the latest after a push, and the earlier one it superseded. */
+export const REVIEW = { repository: 'payments-api', number: 482, latest: '01a1e7a0-5b1c-7d2e-9c41-0f6d2b7a9e11', earlier: '01a1e79f-2a40-7b93-8e15-6c0b1d4f7a22' } as const;
+const reviewSet = (generation: string, at: string, head: string, members: readonly string[], source: object) => [
+  '1.4.0',
+  'card_repository_payments-api_1.4.0',
+  at,
+  JSON.stringify({ host: 'github.com', repository_id: '718204331', number: REVIEW.number, base: { ref: 'main', sha: 'c0ffee1'.padEnd(40, '0') }, head: { ref: 'refund-window', sha: head.padEnd(40, '0') }, generation, members, ...source })
+];
+const reviewSets = [
+  reviewSet(REVIEW.latest, '2026-10-20T11:57:40.000000Z', '9f2c1ab', ['exec_failed', 'exec_passed'], { delivery_id: 'd-2', title: 'Refund window follows the 30-day policy' }),
+  reviewSet(REVIEW.earlier, '2026-10-20T11:28:00.000000Z', '41d07be', ['exec_cancelled', 'exec_waiting'], { request_key: 'review-1' })
+];
+const reviewMembers: Record<string, unknown[]> = {
+  exec_failed: ['exec_failed', VERIFIER_UIDS.policy, 'completed', 'failed', 'res_failed', JSON.stringify({ requirements: [{ id: 'policy-followed', outcome: 'failed' }, { id: 'tone', outcome: 'passed' }] })],
+  exec_passed: ['exec_passed', VERIFIER_UIDS.drift, 'completed', 'passed', 'res_passed', JSON.stringify({ requirements: [{ id: 'latency-stable', outcome: 'passed' }] })],
+  exec_cancelled: ['exec_cancelled', VERIFIER_UIDS.policy, 'cancelled', null, null, null],
+  exec_waiting: ['exec_waiting', VERIFIER_UIDS.drift, 'waiting', null, null, null]
+};
+/** The review-set reads: one pull request's history, one pinned set, and a set's members among the listed executions. */
+function reviewAnswer(sql: string, params: readonly unknown[]): QueryResult | undefined {
+  if (sql.includes("WHERE origin = 'pull_request'")) {
+    const mine = params[0] === REVIEW.repository && params[1] === String(REVIEW.number) ? reviewSets : [];
+    const rows = sql.includes("inputs ->> 'generation' =") ? mine.filter((row) => String(row[3]).includes(`"generation":"${params[2]}"`)) : mine;
+    return result([col('subject_version'), col('workload_card_uid'), col('recorded_at', 'Timestamp(µs, "+00:00")'), col('inputs')], rows);
+  }
+  if (!sql.startsWith('SELECT executions.execution_id')) return undefined;
+  const rows = params.slice(2).flatMap((id) => (reviewMembers[String(id)] ? [reviewMembers[String(id)]] : []));
+  return result([col('execution_id'), col('verifier_card_uid'), col('status'), col('verdict'), col('result_id'), col('output')], rows);
+}
+
 const executionMissing = { code: 'WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND', title: 'Execution not found', status: 404 };
 /** Retained metadata rows the execution loader reads, by the SQL's distinguishing text. */
 function executionAnswer(sql: string, params: readonly unknown[]): QueryResult | undefined {
   if (sql.includes(') AS executions')) return undefined;
   const id = String(params[0]);
   if (sql.startsWith('SELECT verifier_card_uid')) return result([col('verifier_card_uid')], executionStatus[id] ? [[verifiers['ticket-policy@1.1.0'].metadata.uid]] : []);
+  if (sql.startsWith('SELECT subject_name')) return result([col('subject_name')], [['payments-api']]);
   if (sql.startsWith('SELECT to_json(inputs)')) return result([col('inputs')], [[JSON.stringify({ ticket: { answer: 'Refund issued' }, photo: null })]]);
   if (sql.startsWith('SELECT binding_id')) return result([col('binding_id'), col('window_start', NS), col('window_end', NS), col('ended_at', NS)], [['bind_01', '2026-10-20T10:00:00Z', '2026-10-20T11:00:00Z', '2026-10-20T11:00:05Z']]);
   if (sql.startsWith('SELECT r.execution_id'))
@@ -680,7 +711,7 @@ export const fixtureExecutor: Executor = {
           case 'verification.read_publication_text':
             return { ok: true, value: { text: request.name === 'report' ? '# Report\n<img src=x onerror=alert(1)>' : null, truncated: false } };
           case 'bifrost.query': {
-            const recorded = executionAnswer(request.sql, request.params ?? []);
+            const recorded = reviewAnswer(request.sql, request.params ?? []) ?? executionAnswer(request.sql, request.params ?? []);
             if (recorded) return { ok: true, value: recorded };
             // Honour bound $1/$2 like the server, so a brushed range visibly narrows the plot.
             const observed = observeAnswer(request.sql);

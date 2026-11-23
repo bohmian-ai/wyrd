@@ -8,11 +8,12 @@
 import type { ActionIntent } from 'wyrd-ai-ui';
 import { sortColumns, type ExecutionInput } from 'wyrd-ai-ui/loaders';
 import { step, type HostStep, type ObserveState } from './observe-host';
+import { pullHref } from './repositories-host';
 
 /** The columns the Verify rail counts. */
-export const VERIFY_FACETS = ['status', 'verdict', 'verifier_card_uid', 'service_name', 'subject_name', 'run_id', 'group_id'] as const;
+export const VERIFY_FACETS = ['status', 'verdict', 'verifier_card_uid', 'service_name', 'subject_name', 'run_id', 'group_id', 'pull_request'] as const;
 /** The shown columns the Verify list may group by. Grouping only arranges rows; it is never a combined judgment. */
-export const VERIFY_GROUPS = ['run_id', 'subject_name', 'service_name', 'group_id'] as const;
+export const VERIFY_GROUPS = ['run_id', 'subject_name', 'service_name', 'group_id', 'pull_request'] as const;
 
 /** How many executions the Verify list shows first, and how many more each "Show more" adds. */
 export const VERIFY_PAGE = 50;
@@ -54,9 +55,10 @@ export function whereText(state: ObserveState): string {
     .join(' AND ');
 }
 
-/** Where a Verify intent leads: one exact execution's page, or the step Observe's grammar gives the same intent. */
-export function verifyStep(state: ObserveState, intent: ActionIntent, back: string): HostStep | { readonly open: string } {
+/** Where a Verify intent leads: one exact execution's page, a pull request's review sets (a path under the tenant), or the step Observe's grammar gives the same intent. */
+export function verifyStep(state: ObserveState, intent: ActionIntent, back: string): HostStep | { readonly open: string } | { readonly pull: string } {
   const input = intent.input as Record<string, unknown>;
+  if (intent.name === 'pull_request.open') return { pull: pullHref('', input.repository as string, input.number as number, input.generation as string | undefined) };
   if (intent.name === 'record.open') return typeof input.execution_id === 'string' ? { open: input.execution_id } : { unavailable: 'Verify opens executions only' };
   // A pressed facet value is its filter's off switch: the rail is the only place a filter is added or removed.
   const applied = state.where.filter((clause) => clause.column !== input.column || clause.value !== input.value || clause.not);

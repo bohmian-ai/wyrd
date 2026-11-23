@@ -1,6 +1,6 @@
 ---
 id: SPEC-authorization-model
-revision: 8
+revision: 9
 status: approved
 ---
 
@@ -55,6 +55,11 @@ That change deletes the deployment sealing keyring this spec relied on. The
 sign-in and signup behavior here does not change; what changes is how the server
 protects its secrets, and that the owned-workspace cap now survives a
 wrapping-key rotation (REQ-019).
+
+Revision 9 bounds the unauthenticated sign-in starts the same way signup is
+bounded: each start is admitted by a per-source window before it records a
+pending-login row, so a flood of starts records nothing beyond bounded
+counters (REQ-020).
 
 Agreement: [finalized onboarding](design/onboarding.md), [design notes](design/notes.md), the original three system scenarios
 and two-task split, [Rust responsibilities and token flow](design/rust-model.md),
@@ -767,6 +772,50 @@ in-flight flow cookies and proofs, resets admission windows, forgets creator
 counts and requires the discovery directory to be rebuilt from tenant contacts;
 that is outside this change.
 
+### REQ-020 — Sign-in starts are admitted before they record anything
+
+Revision 9. A sign-in start is an unauthenticated request that begins a
+provider or device round trip and, today, writes one `wyrd.auth_login_state`
+or `wyrd.auth_device_authorizations` row (a pending-login row) before the
+person has proven anything: `POST /auth/browser/login` (company SSO, social
+and invitation sign-in), `POST /auth/platform/login` and
+`POST /auth/device_authorization`. Linking (REQ-015) starts from a signed-in
+session and is not a sign-in start. In multi-tenant SaaS a client can send
+thousands of starts, so the server bounds them itself rather than relying on
+ingress configuration: the bundled per-container nginx would count per replica
+and, behind a load balancer, would see the balancer's address.
+
+- **Admission comes first.** Once the request body parses, and before tenant
+  or provider resolution, any pending-login row, provider discovery or cookie,
+  each start is counted in a sign-in window keyed by its trusted source. The
+  source is derived exactly as REQ-014 derives it, including IPv6 /64 grouping.
+  One window per source is shared by every replica, tenant and start route.
+  It is separate from signup's windows, so neither flow's flood blocks the
+  other. A window admits 300 starts per source per hour.
+- **Over the limit, nothing is recorded.** A refused start writes no
+  pending-login row, sets no cookie and contacts no provider. `Retry-After`
+  gives whole seconds until the window ends. The browser and platform starts
+  answer `429` problem+json `WYRD_AUTH_429_SIGN_IN_ATTEMPTS` with
+  `details.retry_after_seconds`. The device authorization endpoint keeps its
+  RFC 6749 §5.2 error form: `429` with `Retry-After` and
+  `{"error":"temporarily_unavailable"}`.
+- **Refuse when admission cannot run.** Window keys are keyed pseudonyms from
+  the platform derivation key, as signup's are (REQ-019); no plain address is
+  stored. When no trusted source can be derived, the key cannot be read, or the
+  counters cannot be read or written, the start refuses with `503` and records
+  nothing. The browser and platform starts use `WYRD_AUTH_503_VERIFY_UNAVAILABLE`;
+  the device endpoint uses `{"error":"temporarily_unavailable"}`. The
+  browser and platform refusals carry the server's usual retryable
+  `Retry-After: 1`; the device refusal carries none. REQ-019's flows needing the derivation key therefore
+  include these starts.
+
+Unaffected: tenant and platform password sign-in, the platform root
+credential (the operator's local break-glass sign-in), the pending-login row's
+contents and five-minute lifetime, password sign-in's own failure windows,
+signup's windows, and the device user-code entry form, whose code-guessing
+limit remains an ingress concern (RFC 8628 §5.1). Excluded: a deployment-wide
+aggregate ceiling and operator-configurable limits.
+
 ### Revision-6 HTTP contracts (REQ-011–REQ-017)
 
 | Route | Request → response and authority |
@@ -832,6 +881,7 @@ additional isolation or authority exception is approved.
 | New platform pre-tenant signup records and admission counters | Expiring verified signup proof and completion/retry ownership, reference to the provisioned tenant, and shared pseudonymous trusted-source/proven-identity rate-limit state; no pending signup record before email/provider proof, no plain identity or address in admission keys, no provider token vault (revision 5) |
 | platform.tenants and existing provisioning state | Associate signup-created tenant/claim with its proven creation attempt so another caller cannot adopt a failed claim; record the creating identity's keyed pseudonym, so the owned-workspace cap survives attempt purge (revision 5); retain the directory lifecycle |
 | New platform derivation-key record (revision 8) | One platform-scoped record holding the `WyrdKms` envelope of the platform derivation key (REQ-019), plus the owner identity and fence fields that SPEC-stored-secret-encryption maintenance uses for any other stored envelope; no raw key; forces RLS; permits only the existing platform owner. The provider, SMTP and challenge secret columns above hold `WyrdKms` envelopes instead of sealing-keyring values. |
+| Platform admission counters (revision 9) | The signup admission counters above gain one sign-in scope for REQ-020's per-source start windows: the same pseudonymous keys, fixed windows and batched expiry; no new table and no plain address. Nothing has shipped, so the unshipped workspace-signup migration's scope check is amended in place rather than by a new migration; this explicitly authorizes that one edit and the resulting local database reset |
 | wyrd.auth_browser_sessions, wyrd.auth_device_authorizations, wyrd.auth_refresh_tokens | Complete social provider/revision and linked-identity anchors, invalidation/renewal constraints; preserve password/company/recovery anchors and client binding |
 | New tenant login-policy metadata | Require-company-SSO state and revision tied to current Active company connection; integrate existing freshness/invalidation owners |
 | wyrd.auth_user_invitations | Recipient address, scoped intents, pending/revoke/expiry/consumption/resend and safe per-recipient send outcome; no raw invitation secret in storage |
@@ -939,6 +989,7 @@ absence of forbidden side effects, not only UI success messages.
 | AC-012: Every password operation shares the minimum | Setup, direct creation, invitation, local signup, change, reset and password-add reject fourteen normalized characters and accept fifteen unless blocklisted; accept 128-character Unicode and paste, reject oversized without truncation. No password/code/proof reaches logs. | REQ-014, REQ-015, REQ-017 |
 | AC-013: A platform operator signs in and manages the deployment safely | Through the production `/platform` console headed Platform admin, a pre-registered operator signs in through controlled platform OIDC (fresh IdP re-authentication/MFA policy) and, without an IdP, a platform-user password. Unknown subjects cannot enroll; fourteen-character passwords refuse and fifteen-character passphrases work unless blocklisted. Observe host-only Secure/HttpOnly/SameSite=Lax `/platform` cookies, safe metadata and no bootstrap key/API token in browser or Node. Tenant sessions refuse platform access; platform sessions refuse tenant routes even if manually replayed. Exercise 15-minute idle and eight-hour absolute expiry, logout, suspension, password/connection revision invalidation, storage failure and replica continuity. Stale, different-operator and tenant proof cannot retire a workspace or change providers/SMTP/signup; fresh same-operator proof permits the authorized action without granting tenant authority. Through the official host, `/platform` and `/platform/ui/*` render pages while existing `/platform/*` APIs retain typed responses; the BFF forwards only the platform cookie to Rust. CLI/API break-glass remains available separately. | REQ-018; preserves REQ-011, REQ-017 and platform/tenant separation |
 | AC-014: Signup and sign-in secrets survive wrapping-key rotation | With a file-backed `[kms]` key, an operator configures a social provider, SMTP and a challenge; a visitor creates workspaces up to the cap. Two replicas starting together keep one derivation key. Activate a new wrapping key with the old one retained, restart and run routine maintenance, then retire the old key and restart: provider sign-in, mail and the challenge still work, an in-flight signup completes, and the same identity is still refused at the cap. Stored values contain no plaintext secret or raw key. With the derivation key unavailable, signup, social sign-in and email-proof verification refuse with `WYRD_AUTH_503_VERIFY_UNAVAILABLE` and record nothing, while password sign-in works. With the challenge secret unreadable, signup completion refuses and creates no tenant. | REQ-019; preserves REQ-011, REQ-014, REQ-017 |
+| AC-015: A flood of sign-in starts records only counters | Through a configured trusted ingress, one source sends company-SSO, social, platform OIDC and device authorization starts, including starts for an unknown tenant, until refused at the 301st start in its window. Each refusal is `429` with whole-second `Retry-After`: problem+json `WYRD_AUTH_429_SIGN_IN_ATTEMPTS` with `details.retry_after_seconds`, or `temporarily_unavailable` on the device endpoint. From then on, no pending-login row, cookie or provider request is added. Another source, on the same tenant and on another tenant, still starts and completes a sign-in. The refused source can still start a signup, and a source refused by signup can still start a sign-in. Two replicas share one count. With no derivable source, the derivation key unavailable, or the counters unavailable, each start refuses with `503` and records nothing, while password and platform root sign-in still work. | REQ-020; preserves REQ-014, REQ-018, REQ-019 |
 
 Existing safeguards remain required as cases/regressions within these journeys:
 cross-tenant refusal, exact versus family scopes, direct/provider/group provenance,
@@ -1043,3 +1094,16 @@ new platform derivation-key record. Before implementation, the
 application-mail and browser-session sections that name the sealing keyring
 are reconciled with this revision at the maintainer's direction. Approval does not
 authorize staging, commits or pushes.
+
+Revision 9 — status: approved; revision: 9; approval recorded: 2026-11-23. At
+the maintainer's direction, an enterprise SaaS requirement: no per-request
+record before a visitor is validated, beyond bounded counters. REQ-020 and
+AC-015 admit each unauthenticated sign-in start through a per-source window in
+the server, not at ingress, before its pending-login row is written. The
+maintainer agreed the public error `WYRD_AUTH_429_SIGN_IN_ATTEMPTS`, the
+300-per-hour limit, admission on `POST /auth/device_authorization`, the
+`503` refusals when admission cannot run, and one added sign-in scope on the
+existing platform admission counters, amended in the unshipped migration
+rather than by a new one. The security posture's sign-in start note is
+reconciled to server admission. Approval does not authorize staging, commits
+or pushes.

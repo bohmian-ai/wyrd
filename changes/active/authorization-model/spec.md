@@ -1,6 +1,6 @@
 ---
 id: SPEC-authorization-model
-revision: 7
+revision: 8
 status: approved
 ---
 
@@ -47,6 +47,14 @@ existing platform OIDC connection or a platform-user password without an IdP;
 workspace administrators remain **workspace admin**. The maintainer explicitly
 approved this behavior and the foundations-first, build-once order on 2026-11-21.
 Nothing ships until the complete carryover is done.
+
+Revision 8 moves this change's secrets and keyed values onto the shared
+stored-secret encryption of
+[SPEC-stored-secret-encryption](../stored-secret-encryption/spec.md) (revision 2).
+That change deletes the deployment sealing keyring this spec relied on. The
+sign-in and signup behavior here does not change; what changes is how the server
+protects its secrets, and that the owned-workspace cap now survives a
+wrapping-key rotation (REQ-019).
 
 Agreement: [finalized onboarding](design/onboarding.md), [design notes](design/notes.md), the original three system scenarios
 and two-task split, [Rust responsibilities and token flow](design/rust-model.md),
@@ -477,7 +485,7 @@ limits.
   completion. A throttled request answers `429`
   with `Retry-After` in whole seconds; the problem details carry the same value.
 - **Pseudonymous, bounded counters.** Admission keys and the tenant's creator
-  key are HMAC-SHA-256 values keyed from the deployment sealing keyring, over the scope and
+  key are HMAC-SHA-256 values keyed from the platform derivation key (REQ-019), over the scope and
   value; no plain issuer, subject or address is stored there. Expired admission
   windows and expired or completed signup records are purged in bounded
   background batches. A public request never runs unbounded deletion. A
@@ -713,6 +721,52 @@ types retain their names; add no `/admin` or other alias and use no content-type
 routing heuristic. The UI's `/platform/ui/*` namespace separates pages from
 existing management resources such as `/platform/tenants` and `/platform/mail`.
 
+### REQ-019 — Sign-in and signup secrets use the shared stored-secret encryption
+
+Revision 8. The deployment sealing keyring is gone, so every secret and keyed
+value this change introduced moves onto the shared `WyrdKms` facade of
+[SPEC-stored-secret-encryption](../stored-secret-encryption/spec.md). No sign-in,
+signup, mail or challenge behavior changes.
+
+- **Stored secrets are ordinary stored secrets.** The shared social-provider
+  client secrets, the SMTP relay password and the signup challenge secret are
+  sealed and opened only through `WyrdKms`, each under its own purpose and bound
+  to its owning record, as that spec's owners are. They take part in its
+  encryption renewal and wrapping-key maintenance like every other store. A
+  configured secret that cannot be opened refuses the operation that needs it,
+  as an unavailable dependency does today: that provider's sign-in and signup,
+  mail sending, or, for the challenge, signup completion. It is never treated
+  as unconfigured, so an unreadable challenge secret never lets signup proceed
+  without a challenge.
+- **One platform derivation key for cookies and pseudonyms.** Sealed browser
+  flow cookies, email-proof envelopes and every keyed pseudonym (admission
+  keys, creator keys and the workspace discovery directory) use keys derived
+  from one platform derivation key. Each use derives its own key under a
+  distinct fixed label, so a value from one use never verifies or decrypts as
+  another; the derivation function and labels are implementation choices. The server
+  generates that random key once, wraps it with `WyrdKms` and stores the
+  wrapped form durably; every replica unwraps the same stored key, and when
+  several replicas start together exactly one generated key is kept. No raw key
+  is ever stored or configured.
+- **Rotation keeps pseudonyms stable.** Rotating the `WyrdKms` wrapping key
+  re-wraps the derivation key through the shared maintenance and never changes
+  it. A creator's tag is therefore the same before and after rotation, and the
+  owned-workspace cap keeps counting workspaces created under the old wrapping
+  key, including after that key is retired. This replaces any matching of tags
+  across several keys.
+- **Unavailable key refuses.** When the derivation key cannot be read or
+  unwrapped, every flow that needs it (signup start and completion, social
+  sign-in, invitation and linking round trips, email proof issue and
+  verification, and workspace discovery) refuses with
+  `WYRD_AUTH_503_VERIFY_UNAVAILABLE` and records nothing. Tenant and platform
+  password sign-in, which uses no flow cookie or pseudonym, keeps working.
+
+This change adds no operation that replaces the derivation key. If one is ever
+needed (for example after the key itself is exposed), replacing it ends
+in-flight flow cookies and proofs, resets admission windows, forgets creator
+counts and requires the discovery directory to be rebuilt from tenant contacts;
+that is outside this change.
+
 ### Revision-6 HTTP contracts (REQ-011–REQ-017)
 
 | Route | Request → response and authority |
@@ -777,6 +831,7 @@ additional isolation or authority exception is approved.
 | wyrd.auth_login_state | Purpose-bound returning login, invitation and linking context, exact provider revision, browser binding and linked User/invitation where needed; preserve company/test/device flows |
 | New platform pre-tenant signup records and admission counters | Expiring verified signup proof and completion/retry ownership, reference to the provisioned tenant, and shared pseudonymous trusted-source/proven-identity rate-limit state; no pending signup record before email/provider proof, no plain identity or address in admission keys, no provider token vault (revision 5) |
 | platform.tenants and existing provisioning state | Associate signup-created tenant/claim with its proven creation attempt so another caller cannot adopt a failed claim; record the creating identity's keyed pseudonym, so the owned-workspace cap survives attempt purge (revision 5); retain the directory lifecycle |
+| New platform derivation-key record (revision 8) | One platform-scoped record holding the `WyrdKms` envelope of the platform derivation key (REQ-019), plus the owner identity and fence fields that SPEC-stored-secret-encryption maintenance uses for any other stored envelope; no raw key; forces RLS; permits only the existing platform owner. The provider, SMTP and challenge secret columns above hold `WyrdKms` envelopes instead of sealing-keyring values. |
 | wyrd.auth_browser_sessions, wyrd.auth_device_authorizations, wyrd.auth_refresh_tokens | Complete social provider/revision and linked-identity anchors, invalidation/renewal constraints; preserve password/company/recovery anchors and client binding |
 | New tenant login-policy metadata | Require-company-SSO state and revision tied to current Active company connection; integrate existing freshness/invalidation owners |
 | wyrd.auth_user_invitations | Recipient address, scoped intents, pending/revoke/expiry/consumption/resend and safe per-recipient send outcome; no raw invitation secret in storage |
@@ -832,7 +887,7 @@ tenant isolation and references, revision confirmation, login-anchor validity,
 invitation scopes, credential ceilings and their lookup paths. Physical names,
 JSON layout and cache representation remain implementation-owned. Naming a table
 does not authorize an unrelated change to it. Tables/records implementing the
-named revision-3 through revision-7 purposes above are permitted; splitting a purpose across
+named revision-3 through revision-8 purposes above are permitted; splitting a purpose across
 physical tables does not authorize another purpose. Tables, persistence purposes
 or indexes/policies outside the named purposes/properties, and any new SQL
 function, require a specification revision before schema implementation.
@@ -883,6 +938,7 @@ absence of forbidden side effects, not only UI success messages.
 | AC-011: Every auth page obeys Rust's advertised methods | Exercise root, login, invitation, signup and device pages with no provider, no SMTP, password disabled, SSO required/unavailable and no usable methods; render only current capabilities. Race settings changes with POST and observe Rust refusal. Root creation link appears only when usable; create and join wording differ; narrow tenant card and quota refusal replace/disable the form. Refused configured challenge uses WYRD_AUTH_403_SIGNUP_CHALLENGE. | REQ-011, REQ-012, REQ-014, REQ-016, REQ-017 |
 | AC-012: Every password operation shares the minimum | Setup, direct creation, invitation, local signup, change, reset and password-add reject fourteen normalized characters and accept fifteen unless blocklisted; accept 128-character Unicode and paste, reject oversized without truncation. No password/code/proof reaches logs. | REQ-014, REQ-015, REQ-017 |
 | AC-013: A platform operator signs in and manages the deployment safely | Through the production `/platform` console headed Platform admin, a pre-registered operator signs in through controlled platform OIDC (fresh IdP re-authentication/MFA policy) and, without an IdP, a platform-user password. Unknown subjects cannot enroll; fourteen-character passwords refuse and fifteen-character passphrases work unless blocklisted. Observe host-only Secure/HttpOnly/SameSite=Lax `/platform` cookies, safe metadata and no bootstrap key/API token in browser or Node. Tenant sessions refuse platform access; platform sessions refuse tenant routes even if manually replayed. Exercise 15-minute idle and eight-hour absolute expiry, logout, suspension, password/connection revision invalidation, storage failure and replica continuity. Stale, different-operator and tenant proof cannot retire a workspace or change providers/SMTP/signup; fresh same-operator proof permits the authorized action without granting tenant authority. Through the official host, `/platform` and `/platform/ui/*` render pages while existing `/platform/*` APIs retain typed responses; the BFF forwards only the platform cookie to Rust. CLI/API break-glass remains available separately. | REQ-018; preserves REQ-011, REQ-017 and platform/tenant separation |
+| AC-014: Signup and sign-in secrets survive wrapping-key rotation | With a file-backed `[kms]` key, an operator configures a social provider, SMTP and a challenge; a visitor creates workspaces up to the cap. Two replicas starting together keep one derivation key. Activate a new wrapping key with the old one retained, restart and run routine maintenance, then retire the old key and restart: provider sign-in, mail and the challenge still work, an in-flight signup completes, and the same identity is still refused at the cap. Stored values contain no plaintext secret or raw key. With the derivation key unavailable, signup, social sign-in and email-proof verification refuse with `WYRD_AUTH_503_VERIFY_UNAVAILABLE` and record nothing, while password sign-in works. With the challenge secret unreadable, signup completion refuses and creates no tenant. | REQ-019; preserves REQ-011, REQ-014, REQ-017 |
 
 Existing safeguards remain required as cases/regressions within these journeys:
 cross-tenant refusal, exact versus family scopes, direct/provider/group provenance,
@@ -973,3 +1029,17 @@ orders final shared foundations before acquisition, then platform sessions, mock
 extension/approval, pages and original cycles 7–10. Existing REQ/AC observations
 and completed evidence remain intact. No implementation, migration, test, mock,
 staging, commit or push is authorized by this documentation handoff.
+
+Revision 8 — status: approved; revision: 8; approval recorded: 2026-11-23. The
+maintainer said "i approve" and directed the architecture reconciliation and the
+merge of SPEC-stored-secret-encryption's branch. Adopts SPEC-stored-secret-encryption revision 2,
+which removes the deployment sealing keyring. REQ-019 and AC-014 move this
+change's provider, SMTP and challenge secrets onto `WyrdKms` and key its cookies
+and pseudonyms from one `WyrdKms`-wrapped platform derivation key, which
+wrapping-key rotation re-wraps but never changes. This resolves
+FIND-003-carryover-5 without matching tags under several keys. It authorizes one
+new platform derivation-key record. Before implementation, the
+[security posture](../../../architecture/wyrd-security-posture.md) social-admission,
+application-mail and browser-session sections that name the sealing keyring
+are reconciled with this revision at the maintainer's direction. Approval does not
+authorize staging, commits or pushes.

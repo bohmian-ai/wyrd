@@ -13074,6 +13074,166 @@ mod tests {
             );
         }
 
+        /// An older group whose fence COMMIT is ambiguous and whose fresh
+        /// reconciliation lookup then fails leaves the shard failed closed:
+        /// both groups stay charged and unanswered, the younger group that
+        /// synced meanwhile never fences, its submitted IO is drained before
+        /// the owner exits, and restart restores neither provisional batch.
+        ///
+        /// A deferred constraint trigger holds the older batch's COMMIT on an
+        /// advisory lock the test owns, then fails it. While the COMMIT waits,
+        /// the younger group syncs and the test revokes read access to the
+        /// fence table, so the fresh reconciliation after the ambiguous
+        /// COMMIT cannot read it.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the shard does not fail closed, a waiter is answered,
+        /// a charge is released before restart, the younger group fences, the
+        /// owner exits before the younger IO completes, or restart restores
+        /// a batch.
+        #[tokio::test]
+        async fn an_unavailable_commit_reconciliation_retains_both_groups_for_restart() {
+            let (mut fixture, owner, budget, command_tx) = PipelineFixture::start().await;
+            let (older_id, younger_id) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+            const COMMIT_GATE: i64 = 7_017;
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "CREATE FUNCTION public.fail_commit() RETURNS trigger \
+                 LANGUAGE plpgsql SECURITY DEFINER AS $body$ BEGIN \
+                 PERFORM pg_advisory_xact_lock({COMMIT_GATE}); \
+                 RAISE EXCEPTION 'injected ambiguous COMMIT'; END $body$; \
+                 CREATE CONSTRAINT TRIGGER fail_commit AFTER INSERT \
+                 ON vala.scribe_batch_commits DEFERRABLE INITIALLY DEFERRED \
+                 FOR EACH ROW WHEN (NEW.batch_id = '{older_id}') \
+                 EXECUTE FUNCTION public.fail_commit();"
+            )))
+            .execute(&fixture.superuser)
+            .await
+            .expect("install the ambiguous COMMIT");
+            let readers: Vec<String> = sqlx::query_scalar(
+                "SELECT DISTINCT grantee::text FROM information_schema.role_table_grants \
+                 WHERE table_schema = 'vala' AND table_name = 'scribe_batch_commits' \
+                 AND privilege_type = 'SELECT'",
+            )
+            .fetch_all(&fixture.superuser)
+            .await
+            .expect("fence table readers");
+            let set_readers = |verb: &str| {
+                readers
+                    .iter()
+                    .map(|reader| {
+                        format!(
+                            "{verb} SELECT ON vala.scribe_batch_commits {} \"{reader}\";",
+                            if verb == "GRANT" { "TO" } else { "FROM" }
+                        )
+                    })
+                    .collect::<String>()
+            };
+            let mut gate = fixture.superuser.begin().await.expect("COMMIT gate");
+            sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(COMMIT_GATE)
+                .execute(&mut *gate)
+                .await
+                .expect("hold the COMMIT gate");
+            let (older, mut older_ack) = acked_group_for_key(&budget, &fixture.key, &[older_id]);
+            let (younger, mut younger_ack) =
+                acked_group_for_key(&budget, &fixture.key, &[younger_id]);
+            let ownership = owner.memory_ownership.clone();
+            let wal_io = owner.wal_io.clone();
+            owner.pending.fetch_add(2, Ordering::AcqRel);
+            let task = tokio::spawn(owner.run());
+
+            submit(&command_tx, older).await;
+            fixture.fence_blocked().await;
+            let (synced, release_io) = wal_io.hold_next_sync_for_test();
+            submit(&command_tx, younger).await;
+            tokio::time::timeout(DEADLOCK_BOUND, synced)
+                .await
+                .expect("the younger group syncs while the older group fences")
+                .expect("the held sync reports");
+            sqlx::raw_sql(sqlx::AssertSqlSafe(set_readers("REVOKE")))
+                .execute(&fixture.superuser)
+                .await
+                .expect("make the fence lookup unavailable");
+            gate.rollback().await.expect("let the older COMMIT fail");
+            let failed_closed = async {
+                while !ownership.is_poisoned() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            };
+            tokio::time::timeout(DEADLOCK_BOUND, failed_closed)
+                .await
+                .expect("the unresolved COMMIT fails the shard closed");
+            assert!(
+                ack_pending(&mut older_ack[0]),
+                "the uncertain group is unanswered"
+            );
+            assert!(
+                ack_pending(&mut younger_ack[0]),
+                "the younger group is unanswered"
+            );
+            assert!(
+                transient_bytes(&budget) > 0,
+                "the retained groups keep their charge"
+            );
+
+            command_tx
+                .send(ShardCommand::Shutdown)
+                .await
+                .expect("shutdown mailbox");
+            assert_eq!(
+                fixture.fenced(&[older_id, younger_id]).await,
+                0,
+                "neither the uncertain nor the younger group fences"
+            );
+            assert_eq!(
+                command_tx.max_capacity() - command_tx.capacity(),
+                1,
+                "shutdown waits while the younger group's IO is outstanding"
+            );
+            assert!(
+                !task.is_finished(),
+                "the owner does not abandon submitted IO"
+            );
+            drop(release_io);
+            tokio::time::timeout(DEADLOCK_BOUND, task)
+                .await
+                .expect("the owner drains its submitted IO and exits")
+                .expect("owner task");
+            for (name, ack) in [
+                ("uncertain", &mut older_ack[0]),
+                ("younger", &mut younger_ack[0]),
+            ] {
+                assert!(
+                    matches!(
+                        ack.try_recv(),
+                        Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+                    ),
+                    "the {name} batch's waiter is left for restart recovery"
+                );
+            }
+            assert_eq!(
+                fixture.fenced(&[older_id, younger_id]).await,
+                0,
+                "the younger group never fences"
+            );
+
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "DROP TRIGGER fail_commit ON vala.scribe_batch_commits; {}",
+                set_readers("GRANT")
+            )))
+            .execute(&fixture.superuser)
+            .await
+            .expect("restore the fence table");
+            let (mut restarted, budget, command_tx, wal, stream) = fixture.open(2);
+            replay_into_owner(&mut restarted, &wal, stream, command_tx, &budget).await;
+            assert_eq!(
+                visible_rows(&restarted.memtable),
+                0,
+                "restart restores neither provisional batch"
+            );
+        }
+
         /// A younger group whose WAL sync fails is refused while the older
         /// group fences, and the older group still becomes visible and
         /// acknowledged.

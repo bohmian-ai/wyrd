@@ -1251,8 +1251,11 @@ async fn a_pass_stalled_on_a_locked_store_answers_within_its_budget() {
 /// A swap that waits on a locked row is abandoned at the pass budget without
 /// losing earlier work: the three envelopes moved before it stay moved, the
 /// locked Gateway credential keeps its bytes and counts as `remaining`, and
-/// the abandoned update never lands later. The same mode then moves exactly
-/// the two rows left and leaves the finished three byte-identical.
+/// the abandoned update never lands later. The Operator store, the only one
+/// after the Gateway's, is held too, so the pass ends at that store's read
+/// wherever PostgreSQL cancels the update within the budget. The same mode
+/// then moves exactly the two rows left, the Gateway credential among them,
+/// and leaves the finished three byte-identical.
 ///
 /// # Panics
 /// Panics when the pass outlives its budget, the abandoned swap applies, or a
@@ -1279,6 +1282,13 @@ async fn a_swap_stalled_on_a_locked_row_is_abandoned_and_resumed() {
         .execute(&mut *lock)
         .await
         .expect("row locks");
+    // PostgreSQL may cancel the waiting swap a moment before the pass's own
+    // deadline. Holding the Operator store makes its read wait out the rest,
+    // so no later row moves in that moment.
+    sqlx::query("LOCK TABLE wyrd.operator_connections IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock)
+        .await
+        .expect("store locks");
     let started = std::time::Instant::now();
     let (status, stalled) = maintain(&srv, &session, json!({ "mode": "routine" })).await;
     let elapsed = started.elapsed();
@@ -1286,6 +1296,8 @@ async fn a_swap_stalled_on_a_locked_row_is_abandoned_and_resumed() {
 
     assert_eq!(status, StatusCode::OK, "{stalled}");
     assert!(elapsed < EDGE_TIMEOUT, "the pass took {elapsed:?}");
+    // Human connection, trusted issuer, and platform connection moved; the
+    // Gateway credential was read and left; the Operator store was never read.
     assert_eq!(
         (
             &stalled["changed"],
@@ -1296,11 +1308,13 @@ async fn a_swap_stalled_on_a_locked_row_is_abandoned_and_resumed() {
         "{stalled}"
     );
     let interrupted = stored_envelopes(&srv).await;
-    assert_eq!(
-        of_store(&interrupted, "gateway_credential"),
-        of_store(&before, "gateway_credential"),
-        "the abandoned swap left the credential's bytes"
-    );
+    for store in ["gateway_credential", "operator_connection"] {
+        assert_eq!(
+            of_store(&interrupted, store),
+            of_store(&before, store),
+            "{store} keeps its bytes"
+        );
+    }
     let finished: Vec<&Stored> = interrupted
         .iter()
         .filter(|(_, _, envelope)| envelope_parts(envelope).0 == "k2")
@@ -1326,6 +1340,14 @@ async fn a_swap_stalled_on_a_locked_row_is_abandoned_and_resumed() {
             after.contains(row),
             "a finished envelope is never redone: {}",
             row.1
+        );
+    }
+    for store in ["gateway_credential", "operator_connection"] {
+        assert!(
+            of_store(&after, store)
+                .iter()
+                .all(|(_, _, envelope)| envelope_parts(envelope).0 == "k2"),
+            "the repeat moves {store}"
         );
     }
     srv.shutdown().await.expect("server shuts down");

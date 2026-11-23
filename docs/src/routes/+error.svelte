@@ -12,7 +12,9 @@
 
 <svelte:head>
   <title>{page.status} | Wyrd</title>
-  <meta name="robots" content="noindex" />
+  <!-- Only a real miss is excluded: a transient failure, such as a module that
+       fails to load during hydration, must not deindex a valid URL. -->
+  {#if page.status === 404}<meta name="robots" content="noindex" />{/if}
 </svelte:head>
 
 <!-- adapter-static emits this as 404.html via fallback: '404.html'. -->

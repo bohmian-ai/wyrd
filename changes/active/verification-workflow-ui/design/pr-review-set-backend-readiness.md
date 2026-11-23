@@ -2,6 +2,13 @@
 
 Status: finalized
 
+Historical 2026-11-19 prerequisite investigation. TASK-005A subsequently delivered
+the request/retention output, and authorization-model supplied trusted-parent
+reads. Approved [UI spec revision 8](../spec.md) and the
+[resumption design](resume-005-007.md) supersede the old retained-read blocker
+and identify TASK-007's bounded status projection correction. The original
+findings below remain historical evidence, not current activation instructions.
+
 ## Approved decision — 2026-11-19
 
 The maintainer approved the prerequisite scope, then selected the recommended

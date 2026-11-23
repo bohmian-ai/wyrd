@@ -1,8 +1,123 @@
 # Verification workflows and repository UI
 
-Status: finalized
+Status: finalized — the 2026-11-23 request to revise tasks 005–007 selects the
+resumption recommendations below. The centralized visual design remains approved;
+specification revision 8 records the maintainer's explicit approval.
+
+## Task revision handoff — 2026-11-23
+
+The maintainer requested `wyrd-plan` revisions based on the recommendations and
+agreed approach. That selects the recorded-selection fallback without definition
+access, truthful approval lifecycle wording, host/coarse hints with authoritative
+submission refusal, and the agreed retained-status correction. These decisions
+are finalized for specification/task handoff. The subsequent instruction to
+revise, approve and commit explicitly approves specification revision 8; it does
+not certify runtime implementation or independent task acceptance.
+
+Tasks [005](../tasks/TASK-005-pr-review-sets.md),
+[006](../tasks/TASK-006-waiting-and-approval.md) and
+[007](../tasks/TASK-007-delivery-status.md) now contain the selected connected flow
+and ordered test-first scenarios. TASK-003 remains implemented. TASK-007 begins
+with the bounded backend projection repair and then consumes its existing status
+response in the UI; it adds no predecessor to TASK-005/006 and no extra task file.
+
+The maintainer's explicit instruction to revise, approve and commit resolves the
+prior specification blocker. Approved revision 8 aligns REQ-003/020, clarifies
+the fallback/approval/delivery behavior and assigns REQ-021/AC-014's retained-status
+repair to TASK-007. All three revised tasks reference revision 8; their proposed
+status still distinguishes planning from implementation/acceptance. Revision 7
+is archived unchanged. The separate PR-write permission alignment issue in
+REQ-019 remains outside these read/UI tasks.
+
+Planning verification: local reference targets and diff whitespace were checked;
+no runtime test was run or claimed. One independent comprehension reader read
+the current spec and all three revised tasks together, without design/code or
+conversation context. Its visual-proof wording concern was corrected: AC-009
+requires comparison evidence; rulings on remaining mock differences come from
+`wyrd-ui`, not an invented additional blanket acceptance gate. The same reader
+then checked revised spec 8 and tasks 005–007 together and found the former
+contradictions resolved, REQ-021/AC-014 mapped and no remaining comprehension
+gap. This is document comprehension evidence, not runtime or task acceptance.
+
+## Tasks 005–007 audit and resumption proposal — 2026-11-23
+
+The maintainer requested a full audit and proposal for revising/resuming the
+remaining tasks, and confirmed TASK-003 is implemented. The
+[audit and proposal](resume-005-007.md) records current source/recorded evidence,
+specification contradictions, connected implementation flow, verification and
+four proposed presentation/contract choices. It supersedes the preliminary
+checkpoint's recommendation where more specific; it does not rewrite the
+approved spec or tasks or claim fresh runtime qualification.
+
+Recommendation: align the UI spec with trusted Repository-parent visibility,
+then revise 005–007. Reuse existing scoped SQL/domain reads, completed discovery,
+the inspector and host actions. TASK-005 owns PR sets and the affected readable
+execution navigation when a referenced Verifier definition is unavailable;
+006 consumes existing approval occurrences and implements the UI action with
+exact-Verifier approve plus parent read; 007 displays existing delivery state
+separately from verdict. Keep unsupported/unknown facts truthful instead of
+adding backend fields, permission preflights or provider workflows.
+
+Agreed on 2026-11-23: correct the existing backend status projection to retain PR
+association/generation and delivery state after scheduling-row cleanup, using
+Bifrost and the existing response. This is a bounded prerequisite for TASK-007;
+it does not restart TASK-003 or block all TASK-005/006 work. The proposal records
+the cleanup/scoped-reader proof and distinguishes retained execution data from
+PostgreSQL-owned registry/auth/live coordination. No PostgreSQL-free request or
+whole-UI availability promise is introduced.
+
+The subsequent planning request selects recorded selection without a readable
+definition graph, approval lifecycle wording instead of unserved timestamps,
+and coarse action hints with authoritative submission refusals. The supplement
+contains the details and costs. No settled visual decision beyond these specific
+permission/missing-field cases is reopened. The revision handoff above records
+the proposed tasks and explicit revision-8 approval.
+
+## Resume checkpoint — 2026-11-23
+
+Historical reconstruction before revision-8 approval; the current handoff above
+supersedes its next-step and readiness recommendations.
+
+Read-only reconstruction of the stopping point; the approved visual design and
+product decisions below remain unchanged. No fresh runtime verification ran.
+
+- TASK-001, TASK-001A and TASK-002 are marked complete in the current working
+  tree. TASK-003/003A, TASK-004/004A/004B and TASK-005A also contain substantial
+  implementation evidence despite their proposed headers; do not restart them
+  from those headers alone. TASK-003 still records visual/acceptance gaps.
+- The interruption was TASK-005's retained PR review-set read. TASK-005A had
+  delivered the request and membership retention, but table-level Bifrost
+  permission could expose another Repository's members and counts. The local
+  [authorization exploration](authorization-model.md) led to the separate
+  [authorization-model packet](../../authorization-model/spec.md).
+- Current security authority now makes the Repository the trusted read parent
+  for PR sets, executions and evidence, with visibility applied before counts
+  and pagination. A separate referenced Verifier read is unnecessary for these
+  reads; opening its definition remains independently authorized. This
+  supersedes the earlier proposed per-member Verifier read prerequisite.
+- Authorization TASK-001 has a [passing backend review](../../authorization-model/review/task-001-r2-300542877-20261120/verdict.md).
+  TASK-002's [latest recorded review](../../authorization-model/review/task-002-r2-3cc2052d9-20261120/verdict.md)
+  closes its behavioral findings, including actual scoped review-output reads,
+  but leaves mandatory dependency lint qualification open. The later onboarding
+  carryover is unfinished; its bounded R2 PASS is not whole-change acceptance.
+- Stored-secret encryption is a separate packet, integrated into authorization
+  history. Its active packet and remaining review/lifecycle work must not be
+  mistaken for completed change acceptance or for new verification UI scope.
+
+Recommended next step: reconcile TASK-005's stale read prerequisite and related
+source alignment against the current approved authorization contract, preserving
+the settled UI design. Re-establish the connected journey: a user granted one
+Repository sees only its sets/counts/members and opens one exact execution;
+another Repository stays hidden. Use that evidence to decide TASK-005 readiness,
+then resume its PR context and rendering. TASK-006/007 remain later waiting/
+approval and delivery-status work. This checkpoint does not approve a spec
+revision, task activation, implementation or review.
 
 ## TASK-005 backend readiness — resumed 2026-11-19
+
+Historical checkpoint. TASK-005A subsequently delivered admission/retention;
+authorization-model supplied parent-based reads. Revision 8 and the current
+TASK-005 replace the activation assumptions in this section.
 
 On 2026-11-19 the maintainer requested specification approval for the backend
 prerequisite tracked by TASK-005A. This approves the prerequisite's scope:
@@ -248,12 +363,15 @@ discarded work is attributable and never presented as a successful judgment.
 Show waiting-for-evidence input names and waiting-for-approval messages separately.
 A blocked branch can coexist with running peers; waiting is nonterminal and has
 no final verdict. Approval inspection identifies the exact server-issued occurrence,
-step/item/iteration, expiry and current decision state.
+step/item/iteration and current decision state. Expiry follows the execution's
+original deadline, cancellation or supersession; the UI shows recorded expiry
+and lifecycle wording, not timestamps absent from the wire contract.
 
 For authorized pending approvals, show Approve and Reject with an optional reason.
 Submit the existing server action with that occurrence identity; show pending,
-denied/error, and authoritative accepted decision states. Normal current scoped
-authorization applies, with no new login ceremony. A stale/expired/conflicting
+denied/error, and authoritative accepted decision states. Exact-Verifier approve
+and trusted-parent read are both required; host/coarse operation hints never
+establish exact authority. No new login ceremony is introduced. A stale/expired/conflicting
 occurrence is refreshed and explained, never silently applied to a newer occurrence.
 An ambiguous submission is resolved through the recorded decision/readback rather
 than automatically issuing a new decision. The same execution resumes under its
@@ -390,7 +508,8 @@ never overrides those contracts by itself.
 
 The combined mock and behavior are approved. There are no remaining product
 decisions for this design. The spec records UI behavior over existing public read/action
-owners. Missing input capability is a dependency, not a new backend assignment.
+owners and the explicitly approved bounded backend supplements. Missing input
+capability outside those supplements is a dependency, not a new backend assignment.
 Exact internal query/layout/cursor mechanics remain implementation-owned. Do not
 add another storage or orchestration owner.
 
@@ -402,11 +521,12 @@ ordinary implementation work within the accepted visual contract.
 
 ## Handoff
 
-The [specification](../spec.md), revision 3, records the user's 2026-11-12
-agreement: adapt the approved UI to existing Card/Bifrost/verification reads and
-the compact/details split, with no underlying server changes. The visual design
-and original scope transfer remain intact. Revised TASK-002 through TASK-007
-carry the existing-read map, inputs, consumers and proof; TASK-001 stays complete.
+The [specification](../spec.md), approved revision 8, preserves the original
+visual/scope agreement and records current parent-based authorization,
+definition-independent inspection, approval presentation and TASK-007's bounded
+retained-status correction. Revised TASK-005–007 carry the connected inputs,
+consumers and proof. Existing implemented discovery/inspection is reused;
+specification approval is not a claim that the remaining tasks are implemented.
 
 Revision 7 settles the same-commit input as an explicit Wyrd PR-wide request
 through HTTP/SDKs/MCP. TASK-005A delivers its replay identity and complete

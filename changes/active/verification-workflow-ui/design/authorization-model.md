@@ -1,7 +1,11 @@
 # Authorization model
 
-Status: exploring — not approved for implementation. Every question below
-needs a maintainer decision before a spec can be written.
+Status: historical exploration — superseded by
+[authorization-model's approved specification](../../authorization-model/spec.md)
+and this packet's [revision-8 resumption agreement](resume-005-007.md).
+The findings/questions below describe the 2026-11-19 stopping point, not current
+permissions or unresolved decisions for tasks 005–007. Preserve them as research
+provenance; use the current owning security/Bifrost contracts for implementation.
 
 ## Why this exists
 
@@ -1230,7 +1234,7 @@ These findings are static source observations.
 | Trusted workload issuers default to viewer. Human OIDC login does not use this fallback. | [builtin_roles.rs:110](../../../../crates/shared/wyrd-runtime/src/builtin_roles.rs:110) |
 | `card_access` is attribution authority, not a read ACL; using it to solve Repository visibility would be incorrect. | [workload.rs:216](../../../../crates/wyrd-spec/src/auth/workload.rs:216) |
 | Personal API-key ceiling strings parse into All scope, preventing typed team/object narrowing. | [issuance.rs:845](../../../../crates/wyrd/wyrd-auth/src/issuance.rs:845), [permission.rs:923](../../../../crates/shared/wyrd-runtime/src/permission.rs:923) |
-| IdP groups project directly into roles; provider removal reaches persisted grants on next login. | [callback.rs:647](../../../../crates/wyrd/wyrd-auth/src/callback.rs:647), [role_assignments.rs:151](../../../../crates/wyrd/wyrd-sql/src/queries/auth/role_assignments.rs:151) |
+| IdP groups project directly into roles; provider removal reaches persisted grants on next login. | [callback.rs:647](../../../../crates/wyrd/wyrd-auth/src/callback.rs:647), `role_assignments.rs:151` (removed historical source) |
 | PR retained-execution reads check Verifier authority plus generic Card read, without the owning Repository identity. | [inspection.rs:521](../../../../crates/wyrd/wyrd-server/src/components/verification/service/inspection.rs:521) |
 | Card lists authorize generic Card read; the SQL list filters metadata and paginates without a visibility predicate. | [routes.rs:381](../../../../crates/wyrd/wyrd-server/src/components/cards/routes.rs:381), [list.rs:108](../../../../crates/wyrd/wyrd-sql/src/queries/cards/list.rs:108) |
 | Oracle authorizes resolved tables without constructing Card/Repository row predicates. Its extra payload check is gateway-specific. | [oracle/mod.rs:3820](../../../../crates/vala/vala-bifrost-redux/src/oracle/mod.rs:3820), [oracle/mod.rs:3856](../../../../crates/vala/vala-bifrost-redux/src/oracle/mod.rs:3856) |

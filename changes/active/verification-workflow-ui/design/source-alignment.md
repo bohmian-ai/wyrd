@@ -1,9 +1,27 @@
 # Source alignment and existing-read boundaries
 
+## Current alignment — revision 8, 2026-11-23
+
+The approved [spec revision 8](../spec.md) and
+[resumption design](resume-005-007.md) supersede the older permission/readiness
+assumptions below. Consume authorization-model approved revision 9 and current
+retained-parent architecture: Repository access covers its PR sets/executions/
+evidence, while referenced definitions and GitHub configuration stay independently
+authorized. TASK-003 is implemented. TASK-005/006 extend its inspector/navigation
+and existing approval operations; TASK-007 first corrects the existing queue-free
+PR/delivery status projection under REQ-021/AC-014. No new wire field or endpoint.
+
+The resumption audit inspected HEAD `63ee31a0205c9b59a11877d5cf571d7bd0632cd6`;
+the planning recheck confirmed the queue-free status limitation still exists.
+Neither source inspection nor approval is fresh runtime qualification. The
+implementation records its actual integrated revision and focused proof.
+
+## Historical TASK-001A alignment
+
 Updated 2026-11-16 with the TASK-001A integrated revision. The selected approach is
 in [notes](notes.md#reopened-ui-only-contract-alignment-2026-11-12) and the
 [field-to-existing-read map](contract-alignment-research.md). This is inspected
-source and planning evidence; the TASK-001A revision below is the integrated baseline.
+source and planning evidence; the TASK-001A revision below is its historical baseline.
 
 ## Source revisions
 

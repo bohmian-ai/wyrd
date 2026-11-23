@@ -3,165 +3,172 @@ id: TASK-005
 kind: implementation
 status: proposed
 spec: SPEC-verification-workflow-ui
-spec_revision: 7
-requirements: [REQ-002, REQ-003, REQ-011, REQ-012, REQ-014, AC-007, AC-008, AC-009]
+spec_revision: 8
+supporting_spec: SPEC-authorization-model
+supporting_spec_revision: 9
+requirements: [REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, REQ-006, REQ-011, REQ-012, REQ-014, REQ-020, AC-001, AC-002, AC-007, AC-008, AC-009]
 depends_on: [TASK-002, TASK-003, TASK-004, TASK-005A]
 ---
 
 # Current and historical PR verification sets
 
-## Outcome and input
+## Outcome and activation
 
-A general PR link opens its latest review set; explicit history and execution
-links remain pinned. Each set shows its actual Verifier executions with separate
-status/verdict, then opens the same workflow page. Repository activity and Verify
-filters use that exact association. There is no aggregate verdict, special
-review Verifier type or separate DAG viewer.
+A person granted one Repository follows its PR link to the latest review set,
+selects an earlier set, opens a member and retained output, then returns with
+the same selection. Another Repository contributes no members, counts or facets.
+Each member keeps its own status and recorded verdict; a set has no combined
+verdict.
 
-Consume 002's exact viewer, 003's summary/read/filter owner and 004's Repository
-workspace. The delivered admission capability must supply durably accepted execution IDs
-with frozen exact Repository policy, PR source and review occurrence/generation.
-Record actual delivered contract and surface proof. Accepted admission is an input,
-not a claim that the review-set list/history read already exists. No dependency
-on PR extraction or provider delivery is needed to prove navigation with ordinary
-declared Verifiers admitted through the real PR path.
+Approved revision 8 reconciles REQ-003/020 with current retained-parent authority
+and records this task's no-definition presentation in the selected
+[resumption design](../design/resume-005-007.md). Before implementation, record
+the integrated predecessor outputs and actual dependency proof below;
+specification approval does not certify their runtime qualification.
 
-## Same-commit request dependency
+TASK-003 is implemented. Consume its shared discovery queries and URL/filter
+owners; do not restart it. TASK-002 supplies the inspector and exact producer
+reads; TASK-004 supplies Repository navigation. TASK-005A supplies admitted
+generations and complete retained membership, including refusals. Its request
+and retention have recorded delivery evidence; the old table-only read blocker
+is superseded by authorization-model REQ-006/007 and the current
+[retained-parent authority](../../../../architecture/wyrd-security-posture.md#resource-and-retained-data-visibility).
+Record the integrated revision and focused dependency results; neither old
+proposed headers nor specification approval establish runtime acceptance.
 
-[TASK-005A](TASK-005A-pr-review-admission-prerequisite.md) tracks delivery of this
-backend prerequisite, including retention of refused members and proof of the
-authorized current/history read input. Approved revision 7 defines the explicit
-Wyrd HTTP/SDK/MCP rerequest operation; delivery remains pending. Consume its actual contract and journey evidence
-before activating this task; its existence does not establish readiness.
+## Existing owners and connected implementation
 
-Before this task is ready, the external admission owner must confirm
-which supported input requests another review at the same commit and exposes
-its durable review-occurrence identity. A distinct explicit request creates a
-new occurrence with the policy/membership frozen at acceptance; retry/redelivery
-of the same request reuses that occurrence and does not admit duplicate members.
-REQ-019 defines the explicit PR-wide Wyrd operation and REQ-020 defines retained
-membership. Contract approval is not delivered API evidence.
+Carry forward the design's “Proposed TASK-005 revision” and its rationale.
+Existing `execution_inputs` rows supply provider host/stable repository ID,
+PR number, exact Repository policy, PostgreSQL observation time retained as
+`recorded_at`, generation, complete member IDs and request/delivery identity.
+TASK-005A's explicit review request is fixture input where needed, not a new UI
+action. Admission authorization remains independent of reading a set.
 
-Record the owner's confirmed operation/contract revision and real journey proof
-here before activation. Delivery is pending; this task remains proposed.
-Do not invent a public endpoint, create review membership in the browser or add
-a UI rerun button. This dependency does not block tasks 001–004 or 006/007 beyond
-their own stated predecessors.
+Use existing caller-authenticated `bifrost.query` through the shared Node/MCP
+executors. Oracle applies parent visibility before expressions, counts and
+pagination. Repository Card read includes its PR execution/evidence reads,
+including custom roles; no referenced-Verifier read or GitHub configuration
+grant is needed. Table permission alone cannot unlock another parent's rows.
+Opening a Verifier definition checks that Card independently.
 
-## Extension and consumer
+Extend existing shared schemas/loaders/catalog/components, `observe.ts`,
+`execution.ts`, `verify-host.ts` and Repository/page owners as appropriate:
 
-Read actual accepted admission/set identity, exact frozen member execution IDs,
-and current/history association through existing permitted Bifrost queries or
-delivered domain operations. Reuse TASK-003's shared UI query/filter owner and
-member summaries; TASK-002 supplies per-member detail on opening. Do not add a
-server read, table, Card kind, SDK wire projection or membership ledger, or infer
-membership from timestamps, display names, SHA alone or session group text.
-A per-execution PR generation is input evidence, not proof that an existing
-operation supplies full set membership/history. In TASK-001A's integrated
-baseline (`cd204b404`) execution status carries `pull_request`
-(`PullRequestActivation`, `wyrd-spec/src/verification/execution.rs:548`:
-repository, number, base/head, delivery and admission `generation`), but no
-review-set list/history read or same-commit request existed in that baseline.
-TASK-005A supplies the revised admission prerequisite. Record its delivered capability
-before activation; if absent, retain the dependency instead of implementing it
-here. These constraints preserve exact membership and authorization.
+- Resolve current from the newest retained observation for that PR, not row
+  arrival, SHA alone or the Verify time picker. Explicit generation links never
+  fall back to current when absent. Read bounded history with explicit bounds.
+- Use frozen member identities and show incomplete retention/truncation
+  truthfully. Reuse server-selected result semantics: a queued member's selected
+  checkpoint result supplies its verdict, not the newest arbitrary result row.
+  The dashboard's time-range/slack assumptions cannot silently cut off old sets.
+- Add the approved PR context to Repository activity, Verify filters/groups/
+  columns and exact execution links. Keep general verification filters and both
+  charts on the same authorized population. No per-member status/detail fanout
+  to render a set or list.
+- Reuse the inspector on member open. When definition lookup is refused or the
+  Card has been deleted, keep its truthful refusal and allow selection of
+  readable recorded requirements, invocations and publications. Use existing
+  node/producer selection and bounded reads; do not invent authored nodes/edges,
+  make a definition grant implicit or hide completed progress solely because
+  its definition is unavailable. Occurrence/decision controls belong to 006.
+- Retained history uses its recorded identity; a current Repository policy or
+  GitHub configuration read must not become a prerequisite for a retained PR
+  link. Independent definition/configuration failures do not erase readable
+  execution facts.
 
-**Delivered by TASK-005A** (commits `f4ce139ce` through `64fb741fe`; spec revision 7):
+Route names, query decomposition, bounds, private helpers and component
+factoring are implementation-owned. No new server endpoint, SDK wire field,
+membership ledger, permission evaluator, migration, provider lookup, rerun
+button or separate PR dashboard. Backend retained-status correction is in 007
+and is not a predecessor of this task.
 
-- **Request.** `POST /v1/integrations/github/pull-requests/reviews` takes
-  `{host, repository_id, number}` and a required `Idempotency-Key`. It
-  answers 202 with `{generation, executions}`. The same operation is
-  `review_pull_request`/`reviewPullRequest` on `GithubConnection` in the
-  Rust, Python and TypeScript SDKs, and the MCP tool
-  `github_connection.review_pull_request`.
-- **Authorization.** It requires `cards:read`, then `verifier:read` and
-  `verifier:run` on every selected Verifier. A distinct key admits and
-  supersedes; a retried key returns the same generation and members, even
-  after the head moves.
-- **Refusals.** An ineligible PR answers
-  `WYRD_GITHUB_409_PULL_REQUEST_NOT_REVIEWABLE` with `details.reason`.
-  Provider and authority outages answer typed 503s.
-- **Membership.** `pull_request` pins now carry `members` (every member,
-  refused ones included) and `request_key` or `delivery_id`. Each member's
-  pins are retained in `bifrost.verification.execution_inputs` with origin
-  `pull_request`.
-- **Reading sets.** `recorded_at` is the generation's PostgreSQL observation
-  time. The current set is the latest `recorded_at`. A set is complete only
-  when every listed member has a record. No implicit time range applies, so
-  history is selected by an explicit `recorded_at` bound.
-- **Read authorization: not delivered.** Existing Bifrost reads are not enough: `bifrost.verification.execution_inputs` is gated only by table-level `bifrost_query:read`. The Oracle object check (`crates/wyrd/wyrd-server/src/query/service.rs:213`) gates the table, and the only payload gate covers gateway-call columns (`service.rs:370`). So a caller with table query permission but no `verifier:read` on a member's Verifier, or no `cards:read`, can read that member's pins and count members. REQ-020 and `architecture/bifrost-design.md` require tenant, Card, exact Verifier and sensitive-payload checks before membership or counts are disclosed. Closing this needs Verifier- and Card-scoped authorization on the retained read, either as an Oracle row policy or as a domain read of a whole set. This task excludes a dedicated history API, and per-member detail reads cannot stand in for it. TASK-005 stays blocked on this
-  until a spec revision decides the read path.
-- **Journeys.** `pg_github_pull_requests::` (26 tests), the MCP
-  `github::pg_tests::` journeys, Rust SDK `repository_declaration::`, and the
-  focused Python and TypeScript review journeys all pass.
+## Ordered acceptance scenarios and evidence
 
-Extend the existing typed shared loader/host contract and use the approved PR
-context in the [composition](../design/consolidation.md) and [mock](../design/mock/README.md).
-The general tenant-scoped PR link follows the latest admitted set across head
-updates; a selected set/execution stays exact during live refresh. Show recorded
-repository, PR/head, policy and member identities. Wire Repository activity,
-copy links and Verify repository/PR filters to these actual server associations.
-Each member opens 002 with correct return context. A review set with no recorded
-judgment does not acquire a calculated verdict or imply every member completed.
+Implement each missing scenario test-first. Add assertion locations, exact
+selectors, observed RED/GREEN and limitations to these entries; do not create a
+second evidence ledger. Already-correct upstream behavior needs focused reuse
+proof, not manufactured failures.
 
-## Observable proof
+1. **Open an actual current set.** Public connection/declaration and PR admission
+   produce a multi-Verifier generation and retained pins. A permitted caller
+   loads it through the shared Node/MCP loader: exact source/policy/member IDs
+   and each member's nullable selected result, status and verdict match the
+   accepted records, with no combined verdict and no detail/status fanout.
+   **Map:** REQ-003/012/014/020, AC-007/008. **Tier/owner:** shared loader and
+   real-server `ui-library.integration.test.ts`. The missing PR-set loader/
+   presentation should produce RED.
 
-Use real connection/declaration/admission outputs to admit multiple Verifiers
-together, rerequest at the same head and then advance the head. Through existing
-HTTP/SDK/MCP/Bifrost reads and the shared UI loaders assert current resolution, bounded history and exact
-frozen membership, authorization before counts and no foreign disclosure.
-The UI reads must consume the actual accepted admission records through existing
-query/domain operations. Include a set with running, judged and details-unavailable
-members: do not fetch every member's detail to render the set, invent a combined
-verdict or let delayed detail replace selected history.
+2. **Keep current and history exact.** Request a fresh review at the same head,
+   then advance the head. Follow current, pin an earlier generation outside the
+   Verify time range, refresh with delayed older records, and request an absent
+   pinned generation. Current follows the latest retained observation; pinned
+   history/execution never switches, and missing pinned history is reported
+   rather than replaced. Interrupted retention, refused members and a read/page
+   bound never turn a subset into a complete set.
+   **Map:** REQ-002/003/012/020, AC-007/008. **Tier/owner:** existing real-server
+   UI integration owner consuming actual admission/retention outputs; pure
+   selection/bounds branches in `ui-library.test.ts`. Missing history and
+   completeness handling should produce RED; reuse backend retention proof.
 
-In the real browser, follow the general PR link, select a previous set, open a
-member/output and return. Advance source while each view is open: only the
-unselected current link follows latest; selected history/execution remains
-pinned. Repository activity and Verify filtering select those same records.
-Verify no combined verdict and no recomputation/resubmission. Run shared host
-and built-artifact parity and the owner checks below
-for the changed UI contracts. Compare PR context/history/member list with the approved
-mock; no fixture-only admission closes this task.
+3. **Respect Repository grants everywhere.** Two Repositories share a Verifier.
+   A family-scoped reader and a minimal custom Card-read role see only their
+   Repository's sets/members/counts/pages/Verify facets. An exact-version grant
+   covers only its policy UID; table-only permission reveals no hidden managed
+   rows. GitHub configuration stays denied. Foreign/inaccessible execution links
+   are indistinguishable from unknown; grant/removal affects subsequent
+   authoritative reads in the existing signed-in session.
+   **Map:** REQ-001/003/011/012/014/020, AC-001/007/008;
+   authorization-model REQ-004/006/007. **Tier/owner:** real server → shared
+   Node/MCP reads and production BFF in the existing UI integration owners.
+   Extend the existing Alice journey's actual grants/admitted reviews rather
+   than replacing its assertions. New PR-set consumer mismatches should be RED;
+   unchanged source-boundary enforcement may already pass.
 
-## Execution and verification
+4. **Inspect without definition access.** The permitted Repository reader has
+   no grant to the member's Verifier definition; also exercise retained work
+   after a source Card is deleted while its retained parent remains authorized.
+   Open the member, select a recorded requirement/producer/output and refresh.
+   Authorized facts, bounded progress, previews/downloads and exact selection
+   remain usable; graph/YAML stays unavailable and no topology is fabricated.
+   **Map:** REQ-002/004/005/006/014, AC-002/008; authorization-model REQ-006.
+   **Tier/owner:** component test plus real-server loader and BFF/browser.
+   Missing recorded-selection navigation, including completed progress skipped
+   because definition lookup failed, should produce RED.
 
-This task consumes approved spec revision 7, preserving revision 3's synchronized
-UI scope transfer. Activation requires only this task's named contract/authority
-and predecessor outputs. Unrelated backend delivery
-or authority amendments do not block it. This packet consumes existing read/action
-capabilities and adds no underlying server changes; a missing required capability
-remains an explicit external dependency. Record the integrated source revisions
-and actual dependency journeys it consumes; upstream task status is not proof.
+5. **Connect navigation and hosts.** Through the production browser follow
+   Repository → PR → older set → member → output → Back. Copy/reload links and
+   change the PR while each selection is open. Return context, selected
+   generation/execution/producer and existing general discovery behavior remain
+   correct. Exercise affected reads in Node/MCP/custom/built-artifact hosts,
+   denied/unavailable/empty/partial states, and the approved desktop/mobile,
+   light/dark, keyboard/touch and long-content composition.
+   **Map:** REQ-001/002/011/012/014, AC-001/007/008/009. **Tier/owner:** existing
+   UI host/artifact and production-browser integration owners. Missing links/
+   return wiring should produce RED. Supplement the approved mock only for
+   definition-unavailable recorded selection; record AC-009 comparison evidence
+   and get the maintainer's ruling on remaining mock differences as required by
+   [wyrd-ui](../../../../.agents/skills/wyrd-ui/SKILL.md#matching-an-approved-mock).
 
-Read the repo-local `wyrd-ui` skill before UI edits. Reuse the shared component,
-loader, catalog, Node/MCP executor and host action owners. Test shared components
-in `src/lib/ui-library.test.ts` and pages in `src/lib/ui-pages.test.ts`;
-authorized host/built-artifact proof belongs to `ui-library.integration.test.ts`
-and production BFF/Chromium/public-login proof to `ui-pages.integration.test.ts`.
-Record actual focused selectors for added tests before their first run; follow
-the existing TDD discipline without inventing test names in this task.
+## Verification and handoff
 
-```bash
-mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.test.ts src/lib/ui-pages.test.ts
-mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui check
-mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui build
-mise exec -- scripts/postgres/with-test-postgres.sh -- env WYRD_UI_INTEGRATION=1 pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.integration.test.ts src/lib/ui-pages.integration.test.ts
+Read `wyrd-ui` before UI edits. Existing owners are `ui-library.test.ts`,
+`ui-pages.test.ts`, `ui-library.integration.test.ts` and
+`ui-pages.integration.test.ts`; fixtures supplement connected journeys.
+Record new focused selectors before RED. Current prerequisite regression commands:
+
+```sh
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-server --test integration -E "test(=pg_github_pull_requests::retained_reads_resolve_current_and_history_membership)"'
+mise exec -- scripts/postgres/with-test-postgres.sh -- env WYRD_UI_INTEGRATION=1 pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-pages.integration.test.ts -t 'Alice is given payments in Settings'
 ```
 
-Narrow test files with actual relevant selectors. The integration command needs
-the existing `ts:build`, `ts:build:testing`, `build:server` and UI-build
-prerequisites; inspect `mise.toml` and the managed Postgres wrapper before
-running it. Missing prerequisites are not passing or skipped proof.
+Prepare current `ts:build`, `ts:build:testing`, `build:server` and UI build
+prerequisites through mise before UI integration. Run focused new/affected
+component and integration selectors, `mise run ui:check`, UI build, catalog
+regeneration and `mise run codegen:check` for schema/catalog changes. Apply
+affected BFF/session owner checks from the UI skill, including
+`mise run test:identity:ui` where that boundary changes. Preserve existing
+query consolidation and bounded reads; add no benchmark or unrelated gate.
 
-Extend normal `mise run dev:full` public setup where needed to demonstrate this
-task's real inputs. Independently compare each introduced component/page with
-the approved mock on desktop/mobile, light/dark, keyboard/focus/touch, long
-content and error states. Record reference regions, screenshots and individual
-human acceptance. Fixtures and automated checks alone do not prove fidelity.
-
-Use the existing UI integration owners to prove real Bifrost/domain inputs through
-Node/MCP/BFF/custom/built-artifact adapters. Do not add or change server/SDK wire
-contracts or their generators. Regenerate the UI catalog when schemas change and
-run `mise run codegen:check` where applicable. Full shipped-surface journey lanes
-belong to integrated change review; focused UI/host journeys prove this task.
+Planning claims no implementation, runtime proof or independent acceptance.
+Full shipped-surface journey lanes belong to integrated change review.

@@ -1,6 +1,6 @@
 ---
 id: SPEC-verification-workflow-ui
-revision: 7
+revision: 8
 status: approved
 ---
 
@@ -21,7 +21,10 @@ drift and approval-wait workflows. Code review is an authored workflow, not a
 verification type.
 
 The [finalized design](design/notes.md), [composition](design/consolidation.md)
-and [centralized mock](design/mock/README.md) record the agreement. The mock is
+and [centralized mock](design/mock/README.md) record the agreement. The
+[tasks 005–007 resumption design](design/resume-005-007.md) records revision 8's
+authorization alignment, presentation decisions and retained-read correction.
+The mock is
 the approved visual target; its sample IDs, hash routes and simulated responses
 are illustrative, not production contracts. The preserved original
 [canvases](references/original-canvas/README.md) explain the retained foundation.
@@ -36,9 +39,11 @@ adds no server fields, endpoints, query services, storage or execution logic
 apart from REQ-015's status recording and revision 5's bounded verdict/citation
 correction under REQ-016/017, and revision 6's public EXPLAIN support under
 REQ-018, and revision 7's PR rerequest and retained-membership prerequisite under
-REQ-019/020. TASK-004A owns the verdict/citation correction and its development
+REQ-019/020, and revision 8's existing retained-status read correction under
+REQ-021. TASK-004A owns the verdict/citation correction and its development
 journey; TASK-004B owns explanation and UI query consolidation; TASK-005A owns
-the bounded admission extension before TASK-005. All other
+the bounded admission extension before TASK-005. TASK-007 owns REQ-021's
+backend read correction before consuming that response in the UI. All other
 server exclusions remain unchanged.
 Costs are UI queries, adapters, presentation, status-event writes and real-server visual/journey proof;
 the prototype supplies none of that production evidence.
@@ -78,12 +83,19 @@ read adapters; do not add server endpoints, response fields or query services.
 Rows carry exact execution, Verifier and subject identity, lifecycle status,
 nullable selected result and recorded verdict, the discovery correlations above,
 and repository/PR/review-set association when recorded. Completed-result rows
-alone do not represent unfinished executions. Current tenant and exact Verifier
-read restrictions must be enforced by existing read/query authority before
-pagination and counts; a browser filter is never authorization. If an existing
+alone do not represent unfinished executions. Current tenant, trusted retained
+parent visibility and sensitive-content controls are enforced by existing
+read/query authority before user expressions, pagination and counts; a browser
+filter is never authorization. The parent is the subject Card for ordinary
+verification, the Verifier for subjectless direct work and the Repository for
+PR work and its members. Repository Card read covers its retained PR sets,
+executions and evidence, including custom roles, without a separate referenced
+Verifier read or GitHub-configuration grant. Opening another Card's definition
+checks that Card independently. These are the existing authorization-model
+REQ-006/007 boundaries, not new UI permission behavior. If an existing
 surface cannot supply a required authorized projection, record that precise
 external dependency and leave the affected work proposed rather than changing
-the server beyond the explicit REQ-015–020 exceptions, relaxing access or fabricating records. Discovery must not enumerate
+the server beyond the explicit REQ-015–021 exceptions, relaxing access or fabricating records. Discovery must not enumerate
 every execution in the browser or infer review membership.
 
 ### Inspect one workflow
@@ -103,7 +115,11 @@ fanout work uses authored step nodes with exact item/iteration/attempt selection
 in the inspector. Support pan/zoom and usable keyboard selection. The exact
 Verifier Card reuses the graph without runtime coloring, with description,
 version, Graph/YAML, where-it-runs and Results in Verify filtered to that exact
-Verifier; no separate Results tab.
+Verifier; no separate Results tab. The authored graph and YAML require that
+definition's own read access. If the definition is denied, missing or deleted,
+show its truthful unavailability while keeping independently readable recorded
+facts selectable in the same inspector. Do not fabricate declared nodes or
+edges from partial execution records or implicitly grant definition access.
 
 **REQ-005 — Recorded state and evidence.** The inspector shows the selected
 step's recorded state/reason and instances, or the requirement's recorded
@@ -112,7 +128,11 @@ action success, requirement verdict, speculative/discarded disposition and
 execution status. A fresh recorded judgment initially selects its first failed
 requirement when present; subsequent updates do not steal selection. Read the
 execution's selected result before treating retained output as authoritative.
-Load the graph from the exact Verifier Card through existing registry APIs.
+Load an authorized graph from the exact Verifier Card through existing registry APIs.
+Without that definition, allow selection of recorded requirements, bounded
+invocations and retained publications through the existing exact node/producer
+selection. Missing definition access must not suppress completed recorded
+progress needed for that inspection; only recorded, authorized facts appear.
 Render compact result judgments without assuming they contain steps, checks,
 provenance or evidence; obtain those recorded fields through the existing
 explicit details read or authorized Bifrost queries. Use existing invocation
@@ -153,9 +173,19 @@ baseline distributions. These are contextual views in the shared inspector.
 **REQ-008 — Waiting and approval.** Distinguish missing-evidence inputs from
 pending approval, including running peers; waiting is nonterminal and supplies
 no final verdict. An approval identifies the exact server-issued occurrence,
-step/item/iteration, message, expiry and recorded decision. Authorized users
-can Approve or Reject with an optional reason through the existing domain
-action. Show pending, accepted, denied and failed outcomes. Refresh and explain
+step/item/iteration, message, recorded state and decision. Explain that expiry
+follows the execution's original deadline, cancellation or supersession; display
+the server-recorded expired state, not an invented requested-at/expiry timestamp
+or browser countdown. Occurrences remain inspectable without completed details
+or a readable Verifier definition. Approve/Reject requires both exact-Verifier
+`verifier:approve` and read on the trusted retained parent; neither grant implies
+the other. Submit the exact occurrence with an optional reason through the
+existing domain action. Host support and current coarse operation hints may
+inform read-only/unavailable presentation but never establish target authority;
+Rust checks current grants on submission. A supported host without a reliable
+hint can submit and display the refusal. Unsupported hosts issue no write.
+No new permission preflight API or role-name gate is introduced.
+Show pending, accepted, denied and failed outcomes. Refresh and explain
 stale, expired or conflicting decisions; never apply them to a newer occurrence.
 Resolve ambiguous submission through recorded decision readback rather than
 automatically issuing a new decision. Continuation belongs to the same server
@@ -170,7 +200,13 @@ accepted progress/publications and does not promise to retract provider IO
 already sent. Missing, denied, unavailable, empty, not-yet-visible, skipped,
 expired and terminal-error states remain distinguishable. GitHub delivery
 status is separate from verification verdict; delivery retries are not
-verification retries. The UI never resubmits work to repair inspection.
+verification retries. Read GitHub delivery from the execution's existing
+authorized status projection, displaying its pending/delivered/skipped/failed
+state, reason and sanitized problems independently of verdict. No GitHub
+configuration grant, provider request, separate delivery read or UI retry
+workflow is required. A failed status read is not a provider outcome; a recorded
+failed delivery is not failed verification. Non-PR executions have no delivery
+section. The UI never resubmits work to repair inspection.
 
 ### Repositories, PR links and GitHub settings
 
@@ -250,8 +286,10 @@ process may leave the list stale. No migration, table, column, endpoint,
 reconciliation or crash-durability guarantee is added. The
 [finalized status-event design](design/verify-status-events.md) records the
 selected implementation flow; TASK-003A supplies the server writes and TASK-003
-owns UI consumption. Failed-requirement IDs and Verifier-scoped viewers are
-outside this server supplement.
+owns UI consumption. Failed-requirement IDs and new scoped-viewer machinery are
+outside this server supplement. Current managed-row visibility applies to the
+implemented discovery queries; revision 8 does not restart TASK-003 or introduce
+a separate scoped dashboard product.
 
 **REQ-016 — Preserve valid check verdicts.** When an Agent or code check
 returns a structurally valid verdict, the engine preserves its authored
@@ -361,8 +399,8 @@ handoff preserves the same identities and does not insert duplicate members.
 
 Existing authorized Bifrost/domain reads supply bounded current/history and
 exact membership to TASK-005, independent of its default Verify time range;
-delayed older records cannot replace a newer current set. Apply existing
-tenant, exact Verifier, Card and payload authorization before counts or member
+delayed older records cannot replace a newer current set. Apply REQ-003's
+existing trusted-parent and sensitive-content boundary before counts or member
 disclosure. Retained metadata may extend existing verification input/event
 records only; no new table, storage family, history endpoint or payload
 reclassification is authorized. Persist accepted rerequest identity with its
@@ -372,6 +410,29 @@ approved specification revision before implementation.
 
 **Implementation boundary for REQ-019/020.** Extend existing admission and
 retention owners; do not change verification execution or other hot paths.
+
+### Retained PR execution inspection
+
+**REQ-021 — Retain PR context and delivery after queue cleanup.** For a PR
+execution whose accepted inputs, state, selected result and delivery outcome
+are retained in Bifrost, the existing execution-status read returns the same
+PR source/generation/member association, selected judgment and recorded delivery
+after its terminal PostgreSQL scheduling row is removed. Extend only the
+existing verification retained-status and GitHub delivery readers, using their
+canonical retained records and existing response fields. Reopening must not
+recreate a scheduling row, execute verification or contact/write GitHub.
+
+Apply current caller authorization on the retained parent before disclosure;
+inaccessible/unknown exact executions remain indistinguishable. Preserve
+independently readable progress/publications and ordinary direct/non-PR status
+behavior. An unavailable required retained source is an explicit read failure,
+not absent context or fabricated pending delivery. Unprovable parents stay hidden.
+The correction restores retained inspection; it does not move registry/auth/live
+coordination out of PostgreSQL or promise a PostgreSQL-free request. File bytes
+remain with their storage owner. No new endpoint, wire field, migration, storage
+family, query service, permission model or execution hot-path change is authorized.
+TASK-007 proves this backend output before its UI consumes it; TASK-005/006 do
+not depend on this correction.
 
 No visual workflow editor, new verification kind, finding schema, separate PR
 dashboard, general Cards redesign, activation/pause/rollback editor or broader
@@ -384,7 +445,9 @@ additional bounded exception for explanation through the existing query API;
 it does not authorize storage/execution redesign or a separate query service.
 REQ-019/020 are the additional bounded exception for one explicit PR-wide write
 operation, its normal client projections and complete retained admission records;
-they authorize no other server extension or migration. Internal layout algorithms, cursor encoding,
+they authorize no other server extension or migration. REQ-021 is the bounded
+exception for correcting the existing retained-status projection; it adds no
+public operation, response field, durable behavior or migration. Internal layout algorithms, cursor encoding,
 refresh scheduling and component decomposition remain implementation-owned.
 
 ## Dependencies, authority and scope transfer
@@ -409,13 +472,16 @@ citable, with the shipped example/demo corrected and the original passing PR
 acceptance retained.
 
 Native Repository, connection, admission, deferred input, approval and delivery
-remain external backend capabilities with their owning authority amendments.
-The newest inspected backend contract is revision 7 at source `54aa8f4a9`; its
-approved nonblocking-execution semantics are not proof of implementation.
+remain backend-owned capabilities with their owning authority amendments.
+The earlier backend revision-7 inspection at `54aa8f4a9` is historical.
+Revision 8 consumes authorization-model approved revision 9 and the current
+retained-parent architecture; the resumption design records inspected source
+and historical proof separately. Contract approval is not delivery evidence.
 Positive approval receipts retain durable decision acceptance; direct/live
 results do not certify retained visibility. This packet neither implements those
 semantics nor changes their storage, credential or permission owners, apart from
-REQ-019/020's explicit admission extension under those same existing owners.
+REQ-019/020's explicit admission extension and REQ-021's read correction under
+those same existing owners.
 
 Approval of revision 2 enacts the following bounded transfer. The original
 packet records it beside the affected requirements and tasks:
@@ -432,7 +498,8 @@ enumerated above and was synchronized into the original packet on approval
 here, and its retained Changes obligations are unchanged. Do not execute conflicting original tasks
 or mark the entire original Changes task superseded. Discovery/review-set UI queries and adapters belong to this packet over existing
 read surfaces. Apart from REQ-015's status recording and REQ-016/017's verdict/PR citation
-correction, REQ-018's query explanation and REQ-019/020's admission prerequisite,
+correction, REQ-018's query explanation, REQ-019/020's admission prerequisite
+and REQ-021's retained-status projection repair,
 server contract, engine and installation changes remain outside this packet; a missing input is an external dependency, not an implementation
 assignment here.
 
@@ -442,9 +509,9 @@ or starting unrelated work:
 
 | Owning document | Required backend amendment and current boundary |
 |---|---|
-| `architecture/wyrd-design.md` and root contributor Card inventory | Native Repository Card/declaration and TOML root, closed PR activation, deferred-input/approval and public inspection contracts. Main still describes 12 Card kinds and the older verification surface; this specification does not amend them. |
-| `architecture/wyrd-security-posture.md` | Backend-owned connection authorization, exact approve scope and accepted-authority rules for PR/deferred/approval behavior. Consume its approved amendments; do not derive authority from this UI. |
-| `architecture/bifrost-design.md` | Backend-owned evidence custody/admission changes, retaining sensitive-payload protections. This packet consumes existing authorized queries/reads; no new domain projection or payload reclassification is authorized. |
+| `architecture/wyrd-design.md` and root contributor Card inventory | Current native Repository/Card identity, closed PR activation, deferred-input/approval and retained inspection/delivery contracts. Consume them without changing Card kinds or backend ownership. |
+| `architecture/wyrd-security-posture.md` | Current trusted-parent visibility, exact-Verifier approve plus parent read and accepted-authority rules. Definitions and GitHub configuration remain independently authorized; no UI-created authority. |
+| `architecture/bifrost-design.md` | Current managed-row source visibility and evidence custody. Consume existing authorized queries/reads; REQ-021 repairs the existing status projection without new fields or payload reclassification. |
 
 Specification approval fixes the agreed UI behavior and bounded scope transfer;
 it does not certify backend delivery. Synchronize the affected original-packet
@@ -457,14 +524,14 @@ its applicable current authority.
 |---|---|
 | 001 — Definition graph | Existing exact Card/Verifier definitions; complete against revision 2. |
 | 002 — Execution inspection | 001 graph; existing status, compact result, explicit details, invocation/publication/file/cancel operations and permitted Bifrost context queries. |
-| 003 — Verify discovery | 002 inspector; 003A's retained queued status events; existing authorized accepted-execution/result data for bounded queries, counts and filters. Other missing read coverage remains an external dependency. |
+| 003 — Verify discovery | Implemented discovery consumes 002 inspector, 003A retained status events and existing authorized bounded reads. Reuse it; no restart is assigned. |
 | 003A — Queued status events | Existing queue transition owners, completion group commit and process Scribe outbox; implements only REQ-015. |
 | 004A — Dev repository review and citation correction | Implemented 004 views; existing check/extraction/evidence owners; portable upstream demo files and available pinned commit. Implements REQ-016/017 before completing the passing/failing live PR journey. |
 | 004 — Repositories/settings | 001/003 plus delivered connection/access and native Repository/selected-policy operations with owning authority. |
 | 005A — PR admission prerequisite | Existing GitHub admission, queue and Scribe owners; implements REQ-019/020 and proves the retained input consumed by 005. |
-| 005 — PR review sets | 002/003/004 plus 005A's delivered rerequest operation and complete authorized admission membership/history. |
-| 006 — Waiting/approval | 002 plus delivered occurrence/wait/decision/readback/continuation operations and owning authority. |
-| 007 — Delivery status | 002/005 plus delivered authorized provider delivery projection. |
+| 005 — PR review sets | Existing 002/003/004 and 005A admission/retention outputs under current parent visibility; extend shared recorded-selection navigation without requiring a readable definition. |
+| 006 — Waiting/approval | 002 inspector and existing occurrence/decision/readback/continuation operations. Reuse 005's shared fallback if available; PR-set UI and 007's correction are not prerequisites. |
+| 007 — Delivery status | 002 inspector and 005 PR context; first correct/prove the existing backend retained-status response under REQ-021, then consume it in the UI. |
 
 TASK-005A delivers the explicit Wyrd request and retained membership required by
 REQ-019/020 before TASK-005 activates. Specification approval is not delivery
@@ -483,20 +550,33 @@ not merely the existence of a route/component or a successful command.
 | Proof | Situation and expected observation | Requirements (REQ-*) |
 |---|---|---|
 | AC-001 Discovery and return | Create unfinished and completed ordinary/session/drift/PR executions. Combine status/verdict/general/repository filters, brush both charts, page/group, open a row and return. Counts and rows describe the same authorized population; no-result work has no verdict; discovery context survives. | 001–003 |
-| AC-002 Exact graph and publications | Follow an execution link during parallel/repeated work, choose item/iteration/attempt and open intermediate outputs; refresh as work progresses and reopen after completion. Producer/result identity, selection and viewport remain stable, all outputs are peers and unsafe/oversized previews fail visibly without executing content. Check ordinary and wide graphs against the approved mock. | 002,004–006 |
+| AC-002 Exact graph and publications | Follow an execution link during parallel/repeated work, choose item/iteration/attempt and open intermediate outputs; refresh as work progresses and reopen after completion. Producer/result identity, selection and viewport remain stable, all outputs are peers and unsafe/oversized previews fail visibly without executing content. With no definition grant or a deleted definition, recorded facts remain selectable and graph/YAML remains unavailable without invented topology. Check authorized ordinary/wide graphs and the fallback against the approved design. | 002,004–006 |
 | AC-003 Session, drift and citations | Open distinct owner-scoped session reviews, pinned members and an authorized cross-workload/untagged trace beyond list range; inspect drift windows/features/history. Exact recorded membership/judgments remain unchanged after later activity/spans; denied/truncated evidence is visible. | 005,007 |
-| AC-004 Waiting and decisions | Exercise a blocked branch with a running peer, approved/rejected/expired decisions, stale/conflicting occurrence and denied action. Read back an ambiguous submission and continuation. No decision affects newer source/occurrence; accepted continuation stays on the same execution and accepted authority. | 008 |
+| AC-004 Waiting and decisions | Exercise a blocked branch with a running peer, exact repeated/fanout occurrences, approved/rejected/expired decisions, stale/conflicting occurrence and denied action. Occurrences remain reachable without completed details/definition access and show lifecycle-based expiry without invented timestamps. Compare parent-read-only, approve-without-parent and both-grant callers; hints never bypass target checks and unsupported hosts issue no write. Read back an ambiguous submission before explicit retry. No decision affects newer source/occurrence; accepted continuation stays on the same execution and accepted authority. | 008 |
 | AC-005 Cancel and retain | Cancel unfinished work, race completion and reopen evidence; inspect provider delivery failure/retry independently. Authoritative terminal state wins, publications remain readable and no inspection/delivery action starts replacement verification. | 006,009 |
 | AC-006 Repository onboarding | Complete Wyrd-first and GitHub-first connection through public server operations; inspect accessible-but-undeclared, declared-with-empty-bindings, ready and access-lost repositories. View an old policy, follow activity to Verify, return and disconnect. No connection/view selects or creates policy; access loss retains authorized Cards/evidence and reflects backend cancellation. | 010,011,013 |
 | AC-007 PR navigation | Admit multiple Verifiers together, rerequest on the same commit, then update the head. The general PR link follows the current set; explicitly selected history/execution stays exact. Membership and source/policy are server-recorded and no combined verdict appears. | 003,012 |
-| AC-008 Authorization and hosts | Exercise foreign IDs, restricted Verifier scopes, denied prerequisites and unavailable reads through the real supported HTTP/SDK/MCP and browser adapters. No foreign content/counts or follow-on sensitive reads appear; denial/unavailability never becomes empty success. Repeat affected reads/actions in supported host consumers. | 003,005,008–014 |
+| AC-008 Authorization and hosts | Exercise foreign IDs, Repository family/exact-version and custom-role readers, two Repositories sharing a Verifier, restricted Verifier actions, denied prerequisites and unavailable reads through real HTTP/SDK/MCP/browser adapters. Matching scoped rows/counts/pages/facets expose no other Repository; a table grant alone unlocks no hidden managed row. Independent Verifier-definition/GitHub-configuration denial does not hide readable retained execution facts. Grant/removal affects subsequent authoritative reads in the existing session; denial/unavailability never becomes empty success. Repeat affected reads/actions in supported hosts. | 003,005,008–014,020,021 |
 | AC-009 Visual and development journey | Produce representative ordinary, session, drift, PR and approval executions through normal public development workflows; navigate Verify, Repositories and Settings in the real browser. Individually compare components/pages with the approved mock in both themes, narrow/wide layouts and keyboard/touch interaction. No inert fixture action or absent prerequisite is accepted as production completion. | 001,004,007,010–014 |
 | AC-010 Retained lifecycle events | Through real public SDK/server operations, cancel pending and running work, revoke a principal with multiple unfinished executions, and hold other work at running/retrying/input-wait/approval-wait before completion or timeout/error. Public Bifrost queries over `event = 'status'` return the expected newest words and specified row fields. Exercise ordinary release/defer returning to pending/retrying. Repeated cancellation, stale settlement and rollback add no event. Focused owner proof preserves grouped completion, shared status-row batching, attribution and retry identity; existing checkpoint recovery and tenant-isolation proof remains passing. | 015 |
 | AC-011 Verdict and PR evidence integrity | Exercise Agent/code checks returning valid passed/failed/inconclusive outcomes, including an uncited pass; outcomes remain authored. Malformed output and invalid supplied citations produce explicit validation failures, never silently filtered evidence. Run the shipped PR example and pinned demo through real extraction, review and final code check: a clean review passes with a valid citation to the retained pinned PR source, a high finding fails, and incomplete coverage remains inconclusive. Preserve source reachability through workspace/derived output and existing retained recovery; wrong-execution/tenant/locator citations are rejected. Live demo proof still includes actual GitHub delivery and existing UI visibility under AC-009. | 016,017 |
 | AC-012 Public query explanation | Through existing SDK/HTTP/MCP query paths and the query editor, explain a bound SELECT and analyze its real execution. Plain EXPLAIN performs no underlying data execution; ANALYZE retains the SELECT's execution selection and governs its work. Both preserve tenant/table/payload checks and complete-stream semantics. Invalid statements, denied access, resource/output exhaustion, deadline and cancellation remain typed failures without successful partial plans. | 018 |
 | AC-013 PR admission prerequisite | Through the real Wyrd HTTP/SDK/MCP operation, rerequest a multi-member PR at the same head, retry concurrently and after restart, then change policy/head and retry the older request. Accepted identities stay stable and obsolete work is never reactivated. Query mixed/all-refused sets and interrupt/recover handoff: every authorized member is retained with exact source/policy/status, incomplete visibility is distinguishable, and denied/foreign callers learn no membership/counts. Refused members never run; ordinary source-event replay remains unchanged. | 019,020 |
+| AC-014 Queue-free PR inspection | Complete actual admitted PR work and record delivery, capture the public status, then clean up its terminal scheduling row while Postgres and retained records remain available. A Repository-scoped reader obtains the same PR/generation/members, selected result/verdict and recorded delivery through HTTP, Rust/Python/TypeScript SDKs, MCP and the connected UI. Another Repository/shared-Verifier-only/foreign reader remains refused or not-found as applicable. The browser reopens a pinned set/member after cleanup; provider failure/skip/retry stays separate from the judgment, and no queue row, execution or provider write is created by inspection. | 002,005,006,009,014,020,021 |
 
 ## Approval and revision history
+
+Revision 8 records the maintainer's explicit 2026-11-23 instruction to revise,
+approve and commit the selected spec/task amendments. It aligns reads with
+authorization-model revision 9 and current retained-parent authority, preserves
+independent definition/configuration checks, and records the agreed fallback,
+approval lifecycle/action presentation and existing delivery projection.
+REQ-021/AC-014 assign TASK-007 the bounded backend retained-status repair before
+UI consumption; TASK-003 stays implemented and 005/006 do not depend on that
+repair. No new endpoint, wire field, migration, permission model or PostgreSQL
+outage guarantee is approved. Revision 7 is preserved in
+[the prior revision](spec-revisions/revision-7.md). Approval establishes scope,
+not implementation or independent acceptance.
 
 Revision 7 records the maintainer's 2026-11-19 approval of the backend
 prerequisite and subsequent selection of the recommended Wyrd API/SDK/MCP
@@ -546,6 +626,6 @@ capability readiness is still checked per task; unavailable data is not invented
 | 3 | approved (2026-11-12) | Record the user-agreed UI-only implementation boundary: existing Card/Bifrost/domain reads, compact judgments and explicit details, unchanged task order, no new server APIs/fields/query services or runtime behavior. |
 | 4 | approved (2026-11-16) | Add REQ-015/AC-010: queued lifecycle status rows through the existing Scribe outbox, retaining completion group commit, shared batching and unchanged checkpoints/recovery. Include release/defer status recording; no migration, new endpoint, additional PostgreSQL statement or crash-durability guarantee. |
 | 5 | approved (2026-11-17) | Preserve valid Agent/code check verdicts; reject invalid supplied citations explicitly; make retained pinned PR extraction citable and carry provenance through the review/check flow; correct shipped example/demo and retain clean-PR passed/success. TASK-004A owns this bounded runtime and development supplement. |
-
 | 6 | approved scope (2026-11-18) | Add maintainer-requested public EXPLAIN and selected EXPLAIN ANALYZE in TASK-004B; all-route consolidation verified with existing tests and query plans, without benchmarks or dev:full. |
 | 7 | approved (2026-11-19) | Add TASK-005A under REQ-019/020 and AC-013: explicit Wyrd PR-wide rerequest via HTTP/SDKs/MCP, replay identity and complete retained membership including refusals. Preserve UI exclusions and existing admission/security owners; no migration authorized. |
+| 8 | approved (2026-11-23) | Align tasks 005–007 with current Repository-parent reads, definition-independent recorded selection and exact approval permissions/lifecycle; add REQ-021/AC-014 for the existing queue-free PR/delivery status correction in TASK-007. Preserve implemented TASK-003 and existing wire/storage boundaries. |

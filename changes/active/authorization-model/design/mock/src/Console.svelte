@@ -27,27 +27,31 @@
     if (session.recent) apply();
     else { pending = { label, apply }; reauthIssue = null; reauthPassword = ''; }
   }
-  function proven() {
+  // A proof finishing after Cancel (or for an older prompt) applies nothing.
+  function proven(change) {
+    if (pending !== change) return;
     session.recent = platformSession.recent = true;
     confirming = false;
-    const { apply } = pending;
     pending = null;
-    apply();
+    change.apply();
   }
   // Simulates POST /platform/browser/password/reauth {password}: 200 with recent: true, same cookie.
   function reauthPasswordSubmit(event) {
     event.preventDefault();
     if (!reauthPassword) return document.getElementById('reauth-password').focus();
     confirming = true;
+    const change = pending;
     setTimeout(() => {
+      if (pending !== change) return;
       if (reauthPassword === 'not-my-password' || reauthPassword === 'wrong') { reauthIssue = P.reauthRefused; confirming = false; return; }
-      proven();
+      proven(change);
     }, 700);
   }
   // Simulates POST /platform/browser/oidc/reauth (prompt=login, max_age=0), the IdP and the console callback.
   function reauthSso() {
     confirming = true;
-    setTimeout(proven, 1000);
+    const change = pending;
+    setTimeout(() => proven(change), 1000);
   }
   // Simulates POST /platform/browser/logout: 204, only this session.
   function signOut() {
@@ -77,8 +81,11 @@
     notice = ''; issue = null;
     if (preview === 'conflict') { issue = P.providerConflict; return; }
     p.testing = true;
+    const revision = p.revision;
     setTimeout(() => {
       p.testing = false;
+      // A test of a revision that was replaced meanwhile proves nothing about the new one.
+      if (p.revision !== revision) return;
       if (p.state === 'untested') p.state = 'tested';
       notice = `Signed in at ${PROVIDERS[p.provider]}. Revision ${p.revision} is tested${p.state === 'tested' ? '; enable it to offer it' : ''}.`;
     }, 1000);
@@ -151,14 +158,14 @@
             <input id="reauth-password" class="app-input" type="password" autocomplete="current-password" readonly={confirming} bind:value={reauthPassword} />
             <div class="row">
               <button class="app-control primary" type="submit" disabled={confirming} aria-busy={confirming ? 'true' : undefined} data-testid="reauth-confirm">{confirming ? 'Confirming…' : 'Confirm'}</button>
-              <button class="app-control" type="button" onclick={() => (pending = null)}>Cancel</button>
+              <button class="app-control" type="button" onclick={() => { pending = null; confirming = false; }}>Cancel</button>
             </div>
           </form>
         {:else}
           <p>Your identity provider asks you to sign in again, even if you are signed in there.</p>
           <div class="row">
             <button class="app-control primary" type="button" onclick={reauthSso} disabled={confirming} aria-busy={confirming ? 'true' : undefined} data-testid="reauth-sso">{confirming ? 'Waiting for platform SSO…' : 'Continue with platform SSO'}</button>
-            <button class="app-control" type="button" onclick={() => (pending = null)}>Cancel</button>
+            <button class="app-control" type="button" onclick={() => { pending = null; confirming = false; }}>Cancel</button>
           </div>
         {/if}
       </div>

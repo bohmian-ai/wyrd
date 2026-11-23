@@ -23,7 +23,6 @@ use serde_json::Value;
 use sqlx::types::Uuid;
 use tokio::time::Instant;
 
-use crate::operator_pool::within;
 use crate::row_types::auth::HumanConnectionRow;
 use crate::{OperatorPool, SqlError, TenantConn};
 
@@ -531,20 +530,6 @@ impl StoredSecretTable {
     }
 }
 
-/// PostgreSQL's `query_canceled` code: a statement ended by `statement_timeout`.
-const QUERY_CANCELED: &str = "57014";
-
-/// `Ok(None)` when `result` failed because its statement timeout elapsed.
-fn unless_timed_out<T>(result: Result<T, sqlx::Error>) -> Result<Option<T>, SqlError> {
-    match result {
-        Ok(value) => Ok(Some(value)),
-        Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some(QUERY_CANCELED) => {
-            Ok(None)
-        }
-        Err(error) => Err(SqlError::from(error)),
-    }
-}
-
 /// List every stored envelope of `table` across all tenants, with the owner
 /// metadata its context binds.
 ///
@@ -560,13 +545,8 @@ pub async fn stored_secrets(
     table: StoredSecretTable,
     deadline: Option<Instant>,
 ) -> Result<Option<Vec<StoredSecretRow>>, SqlError> {
-    let Some(mut tx) = operator.begin_bounded(deadline).await? else {
-        return Ok(None);
-    };
-    let read = sqlx::query_as::<_, StoredSecretRow>(table.select_sql()).fetch_all(&mut *tx);
-    within(deadline, read)
-        .await
-        .map_or(Ok(None), unless_timed_out)
+    let read = sqlx::query_as::<_, StoredSecretRow>(table.select_sql());
+    operator.fetch_all_bounded(read, deadline).await
 }
 
 /// Replace `row`'s envelope with `replacement` if the column still holds
@@ -590,25 +570,11 @@ pub async fn swap_stored_secret(
     replacement: &[u8],
     deadline: Instant,
 ) -> Result<Option<bool>, SqlError> {
-    let deadline = Some(deadline);
-    let Some(mut tx) = operator.begin_bounded(deadline).await? else {
-        return Ok(None);
-    };
-    let update = sqlx::query(table.swap_sql())
+    let swap = sqlx::query(table.swap_sql())
         .bind(row.data_tenant_id)
         .bind(&row.row_key)
         .bind(&row.envelope)
-        .bind(replacement)
-        .execute(&mut *tx);
-    let Some(result) = within(deadline, update)
-        .await
-        .map_or(Ok(None), unless_timed_out)?
-    else {
-        return Ok(None);
-    };
-    let Some(committed) = within(deadline, tx.commit()).await else {
-        return Ok(None);
-    };
-    committed.map_err(SqlError::from)?;
-    Ok(Some(result.rows_affected() == 1))
+        .bind(replacement);
+    let swapped = operator.execute_bounded(swap, deadline).await?;
+    Ok(swapped.map(|rows| rows == 1))
 }

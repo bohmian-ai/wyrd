@@ -284,7 +284,9 @@ and `mise run docs:check` pass, and every focused command above is GREEN.
 Command `P` substitutes the named test into the server selector. The
 cross-store slots live in `wyrd-sql` `queries/auth/human_connections.rs`
 because `check:tenant-isolation` rejects a standalone module that reads tenant
-tables without `TenantConn`. The stale rewrap comment in applied migration
+tables without `TenantConn`. They only build their statements: `OperatorPool`
+runs each one as a complete bounded operation, so no auth query module opens,
+receives, or commits a transaction. The stale rewrap comment in applied migration
 `20261001000000_operator_connections.sql` stays (applied migrations are never
 edited).
 

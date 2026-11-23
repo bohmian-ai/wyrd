@@ -9,7 +9,9 @@
 
 use std::future::Future;
 
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::postgres::{PgArguments, PgRow};
+use sqlx::query::{Query, QueryAs};
+use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use tokio::time::Instant;
 use wyrd_spec::DataTenantId;
 
@@ -55,23 +57,84 @@ impl OperatorPool {
         TenantConn::acquire(&self.0, DataTenantId::SYSTEM_OWNER).await
     }
 
-    /// Opens one operator transaction for an operation that must finish by
-    /// `deadline`, or `None` once the deadline passes first.
+    /// Run `read` in one operator transaction that must finish by `deadline`,
+    /// or `None` once the deadline passes first.
+    ///
+    /// The connection wait, `BEGIN`, timeout setup, and the read all spend the
+    /// one deadline (see [`Self::open_bounded`]). The read-only transaction is
+    /// dropped afterwards, which rolls it back. A `None` deadline waits as long
+    /// as the read takes.
+    ///
+    /// # Errors
+    /// Returns [`SqlError`] when the transaction cannot open or the read fails
+    /// other than by its statement timeout.
+    pub(crate) async fn fetch_all_bounded<O>(
+        &self,
+        read: QueryAs<'_, Postgres, O, PgArguments>,
+        deadline: Option<Instant>,
+    ) -> Result<Option<Vec<O>>, SqlError>
+    where
+        O: Send + Unpin + for<'r> FromRow<'r, PgRow>,
+    {
+        let Some(mut tx) = self.open_bounded(deadline).await? else {
+            return Ok(None);
+        };
+        within(deadline, read.fetch_all(&mut *tx))
+            .await
+            .map_or(Ok(None), unless_timed_out)
+    }
+
+    /// Run `write` in one operator transaction and commit it, all by
+    /// `deadline`, returning the rows it affected, or `None` once the deadline
+    /// passes first.
+    ///
+    /// The connection wait, `BEGIN`, timeout setup, the write, and the commit
+    /// all spend the one deadline; none restarts it. A write cut before its
+    /// commit is sent never lands: PostgreSQL cancels a still-waiting statement
+    /// and the dropped transaction rolls back. A commit cut after it was sent
+    /// may have landed, so the caller resumes from what is stored.
+    ///
+    /// # Errors
+    /// Returns [`SqlError`] when the transaction cannot open, or the write or
+    /// commit fails other than by its deadline.
+    pub(crate) async fn execute_bounded(
+        &self,
+        write: Query<'_, Postgres, PgArguments>,
+        deadline: Instant,
+    ) -> Result<Option<u64>, SqlError> {
+        let deadline = Some(deadline);
+        let Some(mut tx) = self.open_bounded(deadline).await? else {
+            return Ok(None);
+        };
+        let Some(result) = within(deadline, write.execute(&mut *tx))
+            .await
+            .map_or(Ok(None), unless_timed_out)?
+        else {
+            return Ok(None);
+        };
+        let Some(committed) = within(deadline, tx.commit()).await else {
+            return Ok(None);
+        };
+        committed.map_err(SqlError::from)?;
+        Ok(Some(result.rows_affected()))
+    }
+
+    /// Open the operator transaction a bounded operation runs in, or `None`
+    /// once `deadline` passes first.
     ///
     /// Waiting for a connection, `BEGIN`, and the setup statement all spend
     /// the same deadline; none of them restarts it. The transaction's
     /// statements then carry a transaction-local `statement_timeout` of the
     /// time left, so PostgreSQL itself cancels a statement still waiting, for
     /// example on a lock, with `query_canceled` (`57014`) and an abandoned
-    /// write rolls back with the transaction rather than landing later. Each
-    /// later step of the operation, including its commit, must also run
-    /// [`within`] the same deadline. The timeout never returns to the pool. A
-    /// `None` deadline waits as long as the pool and statements take.
+    /// write rolls back with the transaction rather than landing later. The
+    /// timeout never returns to the pool. A `None` deadline waits as long as
+    /// the pool and statements take.
     ///
     /// # Errors
     /// Returns [`SqlError`] when the transaction cannot begin or its timeout
     /// cannot be set.
-    pub async fn begin_bounded(
+    async fn open_bounded(
         &self,
         deadline: Option<Instant>,
     ) -> Result<Option<Transaction<'static, Postgres>>, SqlError> {
@@ -110,6 +173,23 @@ impl From<PgPool> for OperatorPool {
     }
 }
 
+/// PostgreSQL's `query_canceled` code: a statement ended by `statement_timeout`.
+const QUERY_CANCELED: &str = "57014";
+
+/// `Ok(None)` when `result` failed because its statement timeout elapsed.
+///
+/// # Errors
+/// Returns [`SqlError`] for any other failure.
+fn unless_timed_out<T>(result: Result<T, sqlx::Error>) -> Result<Option<T>, SqlError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some(QUERY_CANCELED) => {
+            Ok(None)
+        }
+        Err(error) => Err(SqlError::from(error)),
+    }
+}
+
 /// Await `operation` until `deadline`, or `None` once the deadline passes
 /// first; a `None` deadline awaits it to completion.
 ///
@@ -118,10 +198,7 @@ impl From<PgPool> for OperatorPool {
 /// connection's return to the pool, and a commit it had not yet sent is never
 /// sent. A commit already sent may still land, so a cut caller counts only
 /// what it observed and resumes from what is stored.
-pub(crate) async fn within<F: Future>(
-    deadline: Option<Instant>,
-    operation: F,
-) -> Option<F::Output> {
+async fn within<F: Future>(deadline: Option<Instant>, operation: F) -> Option<F::Output> {
     let Some(deadline) = deadline else {
         return Some(operation.await);
     };

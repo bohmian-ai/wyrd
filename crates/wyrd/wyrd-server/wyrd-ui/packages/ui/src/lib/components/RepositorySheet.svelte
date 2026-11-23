@@ -157,7 +157,7 @@
     color: var(--text);
     cursor: default;
   }
-  .repo :global(a) {
+  :where(.repo) :global(a) {
     color: var(--declare);
   }
   .repo :global(a.btn) {

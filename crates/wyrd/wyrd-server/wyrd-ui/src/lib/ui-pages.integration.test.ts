@@ -12,7 +12,7 @@ import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
-import { chromium, type Browser, type Page } from 'playwright';
+import { chromium, type Browser, type Locator, type Page } from 'playwright';
 import { test as base, expect, vi } from 'vitest';
 import { AGREES, assistantTest, judgeReply } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/assistant';
 import { declared, fixture, groupExecution, runtimeAccount, scheduledResult, serverTest } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/server';
@@ -2995,12 +2995,17 @@ reviewing('Alice is given payments in Settings and sees only payments in her bro
       .toBe(2);
     expect(await setRows.first().getAttribute('aria-current')).toBe('true');
     expect(await setRows.first().textContent()).toContain('latest');
+    await captureRepositories(her, 'pull-latest');
+    // A set row reads as body text, as the heading does, not in the link colour.
+    const textColour = (locator: Locator) => locator.evaluate((element) => getComputedStyle(element).color);
+    expect(await textColour(setRows.first().locator('span').first())).toBe(await textColour(her.getByRole('heading', { level: 1 })));
     // She selects the earlier set: the URL pins it, a reload stays on it, and its member is the first review's execution.
     const earlierSet = `${base}/repositories/payments/pulls/7?set=${review.inputs.generation}`;
     await setRows.nth(1).click();
     await her.waitForURL(earlierSet);
     await her.reload();
     await expect.poll(() => her.getByRole('status').textContent()).toContain('You are viewing earlier review set');
+    await captureRepositories(her, 'pull-pinned');
     expect(rerequested.generation).not.toBe(review.inputs.generation);
     await her.getByRole('region', { name: /^Members of review set/ }).locator('tbody tr').first().getByRole('link').first().click();
     await her.waitForURL(`${base}/verify/executions/${review.execution_id}`);

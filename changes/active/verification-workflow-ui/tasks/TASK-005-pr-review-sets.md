@@ -354,8 +354,36 @@ proof, not manufactured failures.
      selection from its URL data.
    - "Copy link": the page has no copy control; the URL carries the set and
      the browser journey reloads it ([D2]). Nothing to add.
-   - FAIL (not proven): light/dark, mobile, keyboard/touch and long-content
-     comparison against the mock (AC-009).
+   - AC-009 comparison: the mock's `selfcheck.mjs --shots` (`pull-482`
+     light, dark, mobile) beside the [D2] journey's `captureRepositories` of
+     the latest and the pinned set at 1440 and 390, light and dark
+     (`WYRD_UI_CAPTURE_DIR`; the journey also asserts no sideways scroll at
+     either width). Found and fixed: set rows drew their id, occurrence and
+     head in link blue, and the header meta had a stray space before `·`.
+     RED: [D2] `expected 'rgb(77, 94, 240)' to be 'rgb(16, 16, 20)'` for a
+     set row's text against the heading. Diagnosis: Symptom, link-blue row
+     text. Evidence and cause (codex `gpt-6.1-sol` medium, read-only):
+     `RepositorySheet.svelte` `.repo :global(a)` compiles to 0,2,1 and
+     beats the scoped `.setrow` (0,2,0). Fix site: that shared default, now
+     `:where(.repo) :global(a)` (0,0,1), so component rules win; ordinary
+     links and `a.btn` keep their colours. GREEN: [D2] 1 passed;
+     `ui:check` 112 passed. Keyboard: sets, members, Verifiers and the
+     banner are real links with the shared focus ring; touch targets are the
+     full set row. Long content: rows wrap at 390 and the member table scrolls
+     inside its own region (390 capture).
+   - Remaining differences from the mock, for the maintainer's ruling:
+     1. set ids are the retained generation, shortened (mock `rs-482-3`;
+        kept by an earlier decision);
+     2. no per-member time under each execution (not in the set rows read);
+     3. timestamps use the UI's `YYYY-MM-DD HH:MM UTC` format (mock
+        `Nov 9 14:02:05 UTC`);
+     4. the meta line leads with the Repository Card name, not the GitHub
+        `owner/name` (the GitHub link sits at the right, as in the mock);
+     5. no free-text explanation under the set heading (the mock's "by
+        m.ito after rs-482-2 errored" is not retained);
+     6. a member whose Verifier the reader may not read shows its short UID;
+     7. the "Latest per PR / Include earlier review sets" switch is deferred
+        (maintainer decision).
    - Links and wording (maintainer decision, 2026-11-23: follow the mock and
      link conventions). `ReviewSets` takes an optional `link` (intent → URL);
      the pull request page supplies it, so set rows, the banner's latest-set

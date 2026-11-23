@@ -58,8 +58,7 @@
       <div class="xtitle">
         <div class="xname"><span class="kt">Pull request</span>{#if source.title}<h1>{source.title}</h1>{:else}<h1 class="mono">#{input.number}</h1>{/if}</div>
         <div class="xmeta">
-          {#if source.policy.version}{@render nav({ name: 'card.open', input: { card_ref: { kind: 'Repository', name: input.repository, version: source.policy.version } } }, input.repository)}{:else}{input.repository}{/if}
-          <span class="sep">·</span>#{input.number}<span class="sep">·</span>Repository Card {input.repository}
+          {#if source.policy.version}{@render nav({ name: 'card.open', input: { card_ref: { kind: 'Repository', name: input.repository, version: source.policy.version } } }, input.repository)}{:else}{input.repository}{/if}<span class="sep">·</span>#{input.number}<span class="sep">·</span>Repository Card {input.repository}
         </div>
       </div>
       <div class="xactions">

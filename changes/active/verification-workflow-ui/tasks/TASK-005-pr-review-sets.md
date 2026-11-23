@@ -421,8 +421,8 @@ proof, not manufactured failures.
      Fix site: none in code; `mise exec -- cargo build --locked -p wyrd-cli
      --bin wyrd`, then [D2] 1 passed. No diagnostician: the fix touches no
      test, timing or code.
-   - Status: PASS, pending the maintainer's ruling on the listed mock
-     differences (AC-009).
+   - Status: navigation and hosts PASS. FAIL (open): AC-009 is not met until
+     the maintainer rules on each listed mock difference.
 
 ## Verification and handoff
 

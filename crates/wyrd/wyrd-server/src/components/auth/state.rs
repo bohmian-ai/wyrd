@@ -203,14 +203,16 @@ impl ServerAuth {
 
     /// The auth maintenance worker, which runs until `shutdown`.
     ///
-    /// Every [`MAINTENANCE_INTERVAL`] it drains expired signup state one
-    /// bounded batch at a time, so no public request ever purges. `None`
-    /// without the platform plane, where there is no signup state.
+    /// Every [`MAINTENANCE_INTERVAL`] it drains expired signup state and
+    /// ended platform browser sessions one bounded batch at a time, so no
+    /// public request ever purges. `None` without the platform plane, where
+    /// there is no such state.
     pub(crate) fn maintenance_worker(
         &self,
         shutdown: tokio_util::sync::CancellationToken,
     ) -> Option<crate::state::EngineWorker> {
         let social = self.social_sign_in.clone()?;
+        let platform = self.platform_login.clone();
         Some((
             "auth_maintenance",
             Box::pin(async move {
@@ -226,6 +228,18 @@ impl ServerAuth {
                                 Err(error) => {
                                     tracing::warn!(%error, "expired signup state purge failed");
                                     break;
+                                }
+                            }
+                        }
+                        if let Some(platform) = &platform {
+                            loop {
+                                match platform.sessions().purge_ended_browser_sessions().await {
+                                    Ok(0) => break,
+                                    Ok(_) => {}
+                                    Err(error) => {
+                                        tracing::warn!(%error, "ended platform session purge failed");
+                                        break;
+                                    }
                                 }
                             }
                         }

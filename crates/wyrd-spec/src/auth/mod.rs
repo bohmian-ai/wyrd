@@ -59,10 +59,11 @@ pub use permission_scope::{
     GatewayAccess, PermissionScope, PermissionScopeError,
 };
 pub use platform_identity::{
-    ConfigurePlatformOidcRequest, IssuePlatformCredentialRequest, PlatformCallbackRequest,
-    PlatformClientAuth, PlatformLoginRequest, PlatformOidcConnectionView,
+    ConfigurePlatformOidcRequest, IssuePlatformCredentialRequest, PlatformBrowserMethod,
+    PlatformBrowserSessionView, PlatformCallbackRequest, PlatformClientAuth, PlatformLoginRequest,
+    PlatformOidcConnectionView, PlatformPasswordLoginRequest, PlatformPasswordReauthRequest,
     PlatformPrincipalListResponse, PlatformPrincipalSummary, RegisterPlatformAdminRequest,
-    RegisterPlatformAdminResponse, SetPlatformPrincipalStatusRequest,
+    RegisterPlatformAdminResponse, SetPlatformPasswordRequest, SetPlatformPrincipalStatusRequest,
 };
 pub use principal_id::{PLATFORM_AUDIT_PRINCIPAL, PrincipalId};
 pub use principal_kind::PrincipalKindTag;

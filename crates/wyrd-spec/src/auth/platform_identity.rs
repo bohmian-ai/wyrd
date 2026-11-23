@@ -85,9 +85,84 @@ pub struct PlatformOidcConnectionView {
 pub struct RegisterPlatformAdminRequest {
     /// Operator-facing name, unique across the deployment.
     pub name: String,
-    /// Claim value matched on this administrator's first login only. After that
-    /// the pinned subject resolves them and this is no longer consulted.
-    pub match_claim: String,
+    /// Claim value matched on this administrator's first login through the
+    /// platform OIDC connection only. After that the pinned subject resolves
+    /// them and this is no longer consulted. Omit it to register a platform
+    /// `user` that signs in with a platform-user password instead
+    /// (`PUT /platform/admins/{principal_id}/password`); no connection is then
+    /// required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_claim: Option<String>,
+}
+
+/// Body of `PUT /platform/admins/{principal_id}/password`: set or replace a
+/// platform `user`'s platform-user password.
+///
+/// The password follows the tenant local-password policy: 15–128 characters
+/// after NFC normalization, no control characters and not blocklisted.
+/// Replacing it ends every platform browser session it created.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct SetPlatformPasswordRequest {
+    /// The new password; never stored or returned.
+    #[schemars(with = "String")]
+    pub password: SecretBearer,
+}
+
+/// Body of `POST /platform/browser/password/login`: sign a platform `user` in
+/// to the platform console with its platform-user password.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct PlatformPasswordLoginRequest {
+    /// The platform principal's operator-facing name.
+    pub username: String,
+    /// The platform-user password.
+    #[schemars(with = "String")]
+    pub password: SecretBearer,
+}
+
+/// Body of `POST /platform/browser/password/reauth`: prove the signed-in
+/// platform `user`'s password again before a destructive operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct PlatformPasswordReauthRequest {
+    /// The signed-in platform user's password.
+    #[schemars(with = "String")]
+    pub password: SecretBearer,
+}
+
+/// How a platform browser session was created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum PlatformBrowserMethod {
+    /// A platform-user password.
+    Password,
+    /// The platform OIDC connection.
+    Oidc,
+}
+
+/// Safe metadata of the platform browser session a request presents. It
+/// carries no session identifier, API token, bootstrap key or provider token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct PlatformBrowserSessionView {
+    /// The signed-in platform principal.
+    pub principal_id: PrincipalId,
+    /// Its operator-facing name.
+    pub name: String,
+    /// How the session was created.
+    pub method: PlatformBrowserMethod,
+    /// The absolute deadline; activity never extends it.
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+    /// The idle deadline after this request's activity.
+    pub idle_expires_at: chrono::DateTime<chrono::Utc>,
+    /// Whether the session holds fresh human proof, which destructive
+    /// platform operations require.
+    pub recent: bool,
 }
 
 /// A registered human platform administrator, awaiting first login.

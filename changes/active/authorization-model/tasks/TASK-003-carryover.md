@@ -1095,6 +1095,105 @@ RED is missing platform browser purpose/local credential/fresh-proof enforcement
 current platform API-token login is reused, not presented as browser proof.
 Production browser and host-routing proof follows cycle 16 after mock approval.
 
+#### Cycle 14 evidence
+
+Selector prefix: `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-server --features test-support --test integration --no-fail-fast -E "test(=<selector>)"'`.
+
+Schema (spec revision 9, REQ-018 / AC-013 platform-user password and platform
+browser sessions): migration `20261123000001_platform_console_sessions.sql`
+extends `platform.principals` (password verifier and revision, `user` only),
+`platform.oidc_connection` (revision) and `platform.login_state` (purpose,
+browser binding, re-auth session), and adds forced-RLS
+`platform.browser_sessions`. Like every other `platform.*` table it has no
+`data_tenant_id`: the platform plane is tenant-free by design.
+
+Decisions: password attempts share the existing per-source `admit_sign_in`
+window; "retiring a workspace" is the existing tenant suspension
+(`PUT /platform/tenants/{id}/status`), as no other retirement surface exists;
+fresh proof is enforced on browser-session callers only, so platform API tokens
+(the CLI/API break-glass channel) are unchanged; a platform-user password counts
+as a usable way in for the last-administrator guard.
+
+1. `platform_admin_e2e::console::a_registered_operator_signs_in_with_a_platform_password`
+   - RED: `POST /platform/admins {"name":"ops"}` returned 422 (`match_claim`
+     required; no IdP-free registration or platform password existed).
+   - GREEN: authorized registration without a claim, policy-checked
+     `PUT /platform/admins/{id}/password`, `POST /platform/browser/password/login`
+     (wrong/unknown/root-key-as-password 401 with no cookie, missing Origin 403),
+     regenerated opaque host-only Secure/HttpOnly/SameSite=Lax `Path=/platform`
+     cookie with token-free metadata, cookie use on platform reads and
+     same-origin mutations, tenant cookie refused on platform routes, platform
+     cookie refused on tenant routes and as a tenant cookie, logout revoking only
+     its own session, API token unaffected. 1 passed.
+
+2. `platform_admin_e2e::console::platform_console_sessions_end_on_every_replica`
+   - RED: after suspending and reactivating the operator, its old session
+     resolved again (`after active`: 200, expected 401). TDD note: steps 1–3
+     (idle expiry, activity capped at the absolute deadline, logout across
+     replicas) already passed because scenario 1's resolve statement checked
+     both deadlines and revocation; they are regression proof, not new RED. Two
+     earlier failures were test-setup bugs in how the test aged a session and
+     are not counted as RED.
+   - GREEN: suspension revokes the principal's platform browser sessions in its
+     own transaction. Idle expiry and the absolute cap hold on both replicas;
+     a password change ends earlier sessions and only the new password signs
+     in; when the session store cannot be written, a platform cookie gets 503
+     on session reads and platform routes, then works again. 1 passed.
+
+3. `platform_admin_e2e::console::a_registered_operator_signs_in_to_the_console_through_platform_oidc`
+   - RED: `POST /platform/browser/oidc/login` answered 401 "missing
+     X-Wyrd-Access-Token header" (expected 403 without Origin); the route did
+     not exist.
+   - GREEN: `POST /platform/browser/oidc/login` (same-origin, counted in the
+     per-source sign-in window, fixed `{origin}/platform/ui/callback`
+     redirect, `wyrd_platform_login` binding cookie on `Path=/platform`) and
+     `POST /platform/browser/oidc/callback`. The login state records purpose,
+     binding digest and connection revision, and is consumed only with the
+     matching binding. A missing or foreign binding, an unregistered subject,
+     a replay, and swapping API-token and browser states each create no
+     session. The registered subject gets an `oidc` session with no provider
+     token in its body or cookies. Replacing the connection advances its
+     revision and ends the sessions it created; the pinned subject signs in
+     again. Pre-registration and issuer/subject pinning reuse the existing
+     `PlatformSessions` owner: a first-login pin and its browser session
+     commit in one transaction. 1 passed; the existing platform OIDC journeys
+     (7) and `pg_platform_identity` (11) still pass.
+
+4. `platform_admin_e2e::console::destructive_console_changes_need_fresh_password_proof` and
+   `platform_admin_e2e::console::destructive_console_changes_accept_forced_fresh_idp_proof`
+   - RED (both): with proof older than five minutes, `PUT
+     /platform/tenants/{id}/status` (retiring a workspace) returned 200
+     (expected 403). Nothing checked browser freshness.
+   - GREEN: `PlatformCaller::require_recent_proof` runs first in tenant
+     status, social provider configure/enable, login settings, mail relay,
+     OIDC connection configure/remove, admin status and admin password. It
+     refuses only browser sessions whose `fresh_at` is outside the shared
+     five-minute window (`WYRD_AUTH_403_RECENT_LOGIN_REQUIRED`); platform API
+     tokens pass unchanged. With stale proof, retirement, provider, signup
+     settings and SMTP changes all refuse and the API-token readback is
+     unchanged. `POST /platform/browser/password/reauth` checks only the
+     session principal's own password: another operator's password, the
+     bootstrap key or a request with no session refreshes nothing; the right
+     password refreshes in place (no new cookie) and the changes land.
+     `POST /platform/browser/oidc/reauth` begins a login bound to this session
+     with `prompt=login` and `max_age=0`. The callback refreshes only that
+     presenting session, only for a token whose `auth_time` is within five
+     minutes and whose subject is already pinned to the same principal;
+     another registered operator's identity and a 10-minute-old
+     authentication refresh nothing. 2 passed.
+
+5. `platform_admin_e2e::console::maintenance_removes_ended_platform_sessions`
+   - RED: TDD deviation. The test did not compile because the platform
+     session owner had no purge entry point (`PlatformLogin::sessions`,
+     `purge_ended_browser_sessions`), so ended sessions would accumulate.
+     This is a compile-time RED, not a behavioral one.
+   - GREEN: the auth maintenance worker also drains ended platform browser
+     sessions (revoked, idle-expired or past the absolute deadline) in
+     batches of 1000 through `PlatformSessions::purge_ended_browser_sessions`.
+     The journey removes 3 ended sessions in one batch, then 0, and the live
+     session still resolves. Login states that reference a purged session
+     cascade with it. 1 passed.
+
 ### 15. Extend and approve the complete mock before production pages
 
 **Reuses:** Cycles 5–14 final contracts, journeys and platform session metadata; reuse the already approved signup visual direction.

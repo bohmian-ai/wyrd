@@ -245,6 +245,8 @@ const PLATFORM_STATUS_LOCK: i64 = 0x7779_7264_7073_7461;
 /// with a grant and no way in cannot justify suspending the one that has both.
 ///
 /// Restoring a principal can only raise that count, so it is never guarded.
+/// Suspension also revokes the principal's platform browser sessions in the
+/// same transaction, so restoring it never revives one.
 ///
 /// # Errors
 /// Returns [`SqlError::Query`] when the lock, the count, or the update fails,
@@ -294,6 +296,18 @@ pub async fn set_platform_principal_status(
         .execute(&mut **conn.transaction())
         .await
         .map_err(SqlError::from)?;
+    // Suspension ends the principal's platform browser sessions for good, so
+    // a later reactivation never revives one.
+    if status == "suspended" {
+        sqlx::query(
+            "UPDATE platform.browser_sessions SET revoked_at = statement_timestamp()
+              WHERE principal_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(id)
+        .execute(&mut **conn.transaction())
+        .await
+        .map_err(SqlError::from)?;
+    }
     Ok(StatusChange::Changed)
 }
 
@@ -309,6 +323,7 @@ pub async fn set_platform_principal_status(
 /// issuer must be the connection the deployment currently serves, because a
 /// removed or replaced connection cannot verify that subject any more. Counting
 /// either would let the last administrator who can really sign in be suspended.
+/// A platform-user password is a way in through the platform console.
 const USABLE_ADMINISTRATORS_SQL: &str = "WITH usable AS (
         SELECT p.id
           FROM platform.principals p
@@ -316,7 +331,8 @@ const USABLE_ADMINISTRATORS_SQL: &str = "WITH usable AS (
          WHERE p.status = 'active'
            AND g.permissions @> $2
            AND (
-          EXISTS (
+          p.password_hash IS NOT NULL
+          OR EXISTS (
             SELECT 1 FROM platform.credentials c
              WHERE c.principal_id = p.id
                AND c.revoked_at IS NULL

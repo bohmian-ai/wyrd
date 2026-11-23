@@ -20,15 +20,22 @@ use wyrd_auth_verify::{PLATFORM_TOKEN_SCOPE, PlatformAccessTokenClaims};
 use wyrd_runtime::audit::AuditStage;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{Attribution, PrincipalId, PrincipalKindTag};
+use wyrd_spec::auth::{PlatformBrowserMethod, PlatformBrowserSessionView, Sha256Hex};
 use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
+use wyrd_sql::queries::platform::console::{
+    PlatformBrowserSessionRow, PlatformSessionAnchor, PlatformSessionWindows,
+    insert_platform_browser_session, platform_password_by_id, platform_password_by_name,
+    purge_ended_platform_browser_sessions, refresh_platform_browser_session,
+    resolve_platform_browser_session, revoke_platform_browser_session,
+};
 use wyrd_sql::queries::platform::credentials::platform_credential_by_id;
 use wyrd_sql::queries::platform::identity::{
-    pin_platform_identity, platform_identity_by_subject_tx,
+    pin_platform_identity, platform_identity_by_subject, platform_identity_by_subject_tx,
 };
 use wyrd_sql::queries::platform::principals::{
-    platform_principal_by_id, platform_principal_by_id_tx,
+    PlatformPrincipalRow, platform_principal_by_id, platform_principal_by_id_tx,
 };
-use wyrd_sql::{OperatorPool, SqlError};
+use wyrd_sql::{OperatorPool, SqlError, TenantConn};
 
 use crate::audit::{TOKEN_EXCHANGE_OPERATION, auth_event, principal_kind_tag};
 use crate::platform_credentials::{PlatformCredentialError, authenticate_for_session};
@@ -40,6 +47,114 @@ use std::fmt::{Debug, Formatter, Result as FmtResult};
 /// replayable until it expires, and the platform plane is the most privileged
 /// surface in the deployment.
 pub const DEFAULT_PLATFORM_TOKEN_TTL_MINUTES: i64 = 15;
+
+/// The deadlines every platform browser session lives under: 15 minutes
+/// idle, eight hours absolute, and the shared five-minute recent-proof
+/// window destructive operations require.
+pub const PLATFORM_BROWSER_WINDOWS: PlatformSessionWindows = PlatformSessionWindows {
+    idle: std::time::Duration::from_mins(15),
+    absolute: std::time::Duration::from_hours(8),
+    recent: std::time::Duration::from_mins(5),
+};
+
+/// Most ended platform browser sessions one maintenance statement deletes.
+const BROWSER_PURGE_BATCH: i64 = 1000;
+
+/// A platform browser session resolved for one request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlatformBrowserSession {
+    /// The session's durable id, never its cookie secret.
+    pub id: Uuid,
+    /// The principal the session acts as.
+    pub principal_id: PrincipalId,
+    /// The kind the directory stores for that principal.
+    pub principal_kind: PrincipalKindTag,
+    /// The session's safe metadata.
+    pub view: PlatformBrowserSessionView,
+}
+
+impl PlatformBrowserSession {
+    /// The resolved session from its row.
+    fn from_row(row: PlatformBrowserSessionRow) -> Self {
+        let principal_id = PrincipalId::new(row.principal_id);
+        Self {
+            id: row.id,
+            principal_id,
+            principal_kind: principal_kind_tag(&row.principal_kind),
+            view: PlatformBrowserSessionView {
+                principal_id,
+                name: row.name,
+                method: if row.password {
+                    PlatformBrowserMethod::Password
+                } else {
+                    PlatformBrowserMethod::Oidc
+                },
+                expires_at: row.expires_at,
+                idle_expires_at: row.idle_expires_at,
+                recent: row.recent,
+            },
+        }
+    }
+}
+
+/// A platform browser session just created, with its cookie secret
+/// returned exactly once.
+pub struct CreatedPlatformBrowserSession {
+    /// The opaque cookie value; only its SHA-256 is stored.
+    pub cookie: SecretString,
+    /// The new session.
+    pub session: PlatformBrowserSession,
+}
+
+impl Debug for CreatedPlatformBrowserSession {
+    /// Formats the session and omits the cookie, its only copy.
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        f.debug_struct("CreatedPlatformBrowserSession")
+            .field("session", &self.session)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The active platform principal a verified federated identity resolves
+/// to on `conn`: its pinned subject, or on a first login the pre-registration
+/// `match_claim` matches, which is pinned here.
+///
+/// The store's `subject IS NULL` predicate makes pinning a one-time
+/// transition, so a concurrent second login pins nothing and is refused
+/// rather than racing. The principal is re-read so a suspended one gets
+/// nothing even with a valid provider token.
+///
+/// # Errors
+/// Returns [`PlatformSessionError::Invalid`] when nothing matches or the
+/// principal is not active, and [`PlatformSessionError::Store`] when the
+/// store fails.
+async fn federated_principal(
+    conn: &mut TenantConn<'_>,
+    issuer: &str,
+    subject: &str,
+    match_claim: Option<&str>,
+) -> Result<PlatformPrincipalRow, PlatformSessionError> {
+    let pinned = platform_identity_by_subject_tx(conn, issuer, subject).await?;
+    let principal_id = if let Some(identity) = pinned {
+        identity.principal_id
+    } else {
+        let Some(claim) = match_claim else {
+            return Err(PlatformSessionError::Invalid);
+        };
+        pin_platform_identity(conn, issuer, claim, subject)
+            .await?
+            .ok_or(PlatformSessionError::Invalid)?
+    };
+    platform_principal_by_id_tx(conn, principal_id)
+        .await?
+        .filter(PlatformPrincipalRow::is_active)
+        .ok_or(PlatformSessionError::Invalid)
+}
+
+/// The stored digest of a platform browser cookie value.
+fn cookie_digest(cookie: &str) -> Sha256Hex {
+    Sha256Hex::digest(cookie.as_bytes())
+}
 
 /// A platform session that was just minted.
 #[derive(Debug)]
@@ -223,28 +338,8 @@ impl PlatformSessions {
         request_id: &str,
     ) -> Result<SecretString, PlatformSessionError> {
         let mut conn = self.pool.begin_platform_audited().await?;
-        let pinned = platform_identity_by_subject_tx(&mut conn, issuer, subject).await?;
-        let principal_id = if let Some(identity) = pinned {
-            identity.principal_id
-        } else {
-            // First login: match the pre-registered claim and pin the subject.
-            // The store's `subject IS NULL` predicate makes this a one-time
-            // transition, so a concurrent second login pins nothing and is
-            // refused rather than racing.
-            let Some(claim) = match_claim else {
-                return Err(PlatformSessionError::Invalid);
-            };
-            pin_platform_identity(&mut conn, issuer, claim, subject)
-                .await?
-                .ok_or(PlatformSessionError::Invalid)?
-        };
-
-        let Some(principal) = platform_principal_by_id_tx(&mut conn, principal_id).await? else {
-            return Err(PlatformSessionError::Invalid);
-        };
-        if !principal.is_active() {
-            return Err(PlatformSessionError::Invalid);
-        }
+        let principal = federated_principal(&mut conn, issuer, subject, match_claim).await?;
+        let principal_id = principal.id;
 
         let token = self
             .issuing_key
@@ -261,6 +356,233 @@ impl PlatformSessions {
             request_id,
         );
         Ok(SecretString::from(token))
+    }
+
+    /// Sign platform `user` `username` in to a new browser session with its
+    /// platform-user password.
+    ///
+    /// An unknown or inactive name, a principal without a password and a
+    /// wrong password each cost one bounded derivation and give the same
+    /// refusal. The session is created only when, in the same statement,
+    /// the principal is still active and its password is still the revision
+    /// that was verified. The cookie secret is new on every sign-in.
+    ///
+    /// # Errors
+    /// Returns [`PlatformSessionError::Invalid`] for every refusal,
+    /// [`PlatformSessionError::Key`] when derivation cannot run, and
+    /// [`PlatformSessionError::Store`] when the store fails.
+    #[tracing::instrument(level = "debug", skip_all, err)]
+    pub async fn password_login(
+        &self,
+        username: &str,
+        password: &SecretString,
+        request_id: &str,
+    ) -> Result<CreatedPlatformBrowserSession, PlatformSessionError> {
+        let password = crate::passwords::presented_password(password)
+            .map_err(|_| PlatformSessionError::Invalid)?;
+        let stored = platform_password_by_name(&self.pool, username.trim()).await?;
+        let matched = crate::passwords::password_matches(
+            password,
+            stored.as_ref().map(|row| row.password_hash.clone()),
+        )
+        .await
+        .map_err(|error| PlatformSessionError::Key(error.to_string()))?;
+        let Some(stored) = stored.filter(|_| matched) else {
+            return Err(PlatformSessionError::Invalid);
+        };
+        let conn = self.pool.begin_platform_audited().await?;
+        self.create_browser(
+            conn,
+            stored.id,
+            PlatformSessionAnchor::Password(stored.password_revision),
+            request_id,
+        )
+        .await
+    }
+
+    /// Sign the platform principal a federated login just verified in to a
+    /// new browser session anchored to connection revision
+    /// `connection_revision`.
+    ///
+    /// Resolving or first-pinning the identity and creating the session
+    /// commit together, as [`Self::issue_federated`] does for a token.
+    ///
+    /// # Errors
+    /// Returns [`PlatformSessionError::Invalid`] when no active registration
+    /// matches, or the connection was replaced since the login began, and
+    /// [`PlatformSessionError::Store`] when the store fails.
+    #[tracing::instrument(level = "debug", skip(self), err)]
+    pub async fn browser_federated(
+        &self,
+        issuer: &str,
+        subject: &str,
+        match_claim: Option<&str>,
+        connection_revision: i64,
+        request_id: &str,
+    ) -> Result<CreatedPlatformBrowserSession, PlatformSessionError> {
+        let mut conn = self.pool.begin_platform_audited().await?;
+        let principal = federated_principal(&mut conn, issuer, subject, match_claim).await?;
+        self.create_browser(
+            conn,
+            principal.id,
+            PlatformSessionAnchor::Connection(connection_revision),
+            request_id,
+        )
+        .await
+    }
+
+    /// Create a browser session for `principal_id` under `anchor` on `conn`,
+    /// commit it, and stage its grant record.
+    ///
+    /// # Errors
+    /// Returns [`PlatformSessionError::Invalid`] when the principal is no
+    /// longer active or the anchor is no longer current, and
+    /// [`PlatformSessionError::Store`] when the store fails.
+    async fn create_browser(
+        &self,
+        mut conn: TenantConn<'_>,
+        principal_id: Uuid,
+        anchor: PlatformSessionAnchor,
+        request_id: &str,
+    ) -> Result<CreatedPlatformBrowserSession, PlatformSessionError> {
+        let cookie = crate::browser_sessions::random_secret();
+        let row = insert_platform_browser_session(
+            &mut conn,
+            Uuid::now_v7(),
+            cookie_digest(&cookie).as_bytes(),
+            principal_id,
+            anchor,
+            PLATFORM_BROWSER_WINDOWS,
+        )
+        .await?
+        .ok_or(PlatformSessionError::Invalid)?;
+        conn.commit().await?;
+        let session = PlatformBrowserSession::from_row(row);
+        self.record_grant(
+            session.principal_id,
+            session.principal_kind,
+            None,
+            request_id,
+        );
+        Ok(CreatedPlatformBrowserSession {
+            cookie: SecretString::from(cookie),
+            session,
+        })
+    }
+
+    /// Resolve the browser session `cookie` names, recording this request's
+    /// activity.
+    ///
+    /// # Errors
+    /// Returns [`PlatformSessionError::Invalid`] when it is unknown, revoked,
+    /// idle or past its absolute deadline, its principal is not active, or its
+    /// password or connection revision is no longer current; and
+    /// [`PlatformSessionError::Store`] when the store fails, which is never
+    /// read as an invalid session.
+    #[tracing::instrument(level = "debug", skip_all, err)]
+    pub async fn resolve_browser(
+        &self,
+        cookie: &str,
+    ) -> Result<PlatformBrowserSession, PlatformSessionError> {
+        resolve_platform_browser_session(
+            &self.pool,
+            cookie_digest(cookie).as_bytes(),
+            PLATFORM_BROWSER_WINDOWS,
+        )
+        .await?
+        .map(PlatformBrowserSession::from_row)
+        .ok_or(PlatformSessionError::Invalid)
+    }
+
+    /// Revoke the one browser session `cookie` names; an unknown or already
+    /// revoked value revokes nothing.
+    ///
+    /// # Errors
+    /// Returns [`PlatformSessionError::Store`] when the store fails.
+    #[tracing::instrument(level = "debug", skip_all, err)]
+    pub async fn logout_browser(&self, cookie: &str) -> Result<(), PlatformSessionError> {
+        revoke_platform_browser_session(&self.pool, cookie_digest(cookie).as_bytes()).await?;
+        Ok(())
+    }
+
+    /// Record fresh proof on `session` after its own principal's
+    /// platform-user password verifies again.
+    ///
+    /// # Errors
+    /// Returns [`PlatformSessionError::Invalid`] when the principal has no
+    /// password, the password does not match, or the session is no longer
+    /// live; [`PlatformSessionError::Key`] when derivation cannot run; and
+    /// [`PlatformSessionError::Store`] when the store fails.
+    #[tracing::instrument(level = "debug", skip_all, err)]
+    pub async fn reauthenticate_password(
+        &self,
+        session: &PlatformBrowserSession,
+        password: &SecretString,
+    ) -> Result<(), PlatformSessionError> {
+        let password = crate::passwords::presented_password(password)
+            .map_err(|_| PlatformSessionError::Invalid)?;
+        let stored = platform_password_by_id(&self.pool, session.principal_id.as_uuid()).await?;
+        let matched =
+            crate::passwords::password_matches(password, stored.map(|row| row.password_hash))
+                .await
+                .map_err(|error| PlatformSessionError::Key(error.to_string()))?;
+        if !matched {
+            return Err(PlatformSessionError::Invalid);
+        }
+        self.refresh_browser(session).await
+    }
+
+    /// Record fresh proof on `session` after the platform IdP freshly
+    /// authenticated `subject` at `issuer`, which must be the identity
+    /// already pinned to the session's own principal. Re-authentication never
+    /// pins: an unpinned or another operator's identity refreshes nothing.
+    ///
+    /// # Errors
+    /// Returns [`PlatformSessionError::Invalid`] when the identity is not the
+    /// session principal's or the session is no longer live, and
+    /// [`PlatformSessionError::Store`] when the store fails.
+    #[tracing::instrument(level = "debug", skip(self, session), err)]
+    pub async fn reauthenticate_federated(
+        &self,
+        session: &PlatformBrowserSession,
+        issuer: &str,
+        subject: &str,
+    ) -> Result<(), PlatformSessionError> {
+        match platform_identity_by_subject(&self.pool, issuer, subject).await? {
+            Some(identity) if identity.principal_id == session.principal_id.as_uuid() => {
+                self.refresh_browser(session).await
+            }
+            _ => Err(PlatformSessionError::Invalid),
+        }
+    }
+
+    /// Remove one bounded batch of ended platform browser sessions,
+    /// returning how many went; `0` once none remain.
+    ///
+    /// Background auth maintenance repeats this; no request purges.
+    ///
+    /// # Errors
+    /// Returns [`PlatformSessionError::Store`] when the store fails.
+    pub async fn purge_ended_browser_sessions(&self) -> Result<u64, PlatformSessionError> {
+        Ok(purge_ended_platform_browser_sessions(&self.pool, BROWSER_PURGE_BATCH).await?)
+    }
+
+    /// Record fresh proof on `session`, which must still be live.
+    ///
+    /// # Errors
+    /// Returns [`PlatformSessionError::Invalid`] when the session is no
+    /// longer live and [`PlatformSessionError::Store`] when the store fails.
+    async fn refresh_browser(
+        &self,
+        session: &PlatformBrowserSession,
+    ) -> Result<(), PlatformSessionError> {
+        if refresh_platform_browser_session(&self.pool, session.id, session.principal_id.as_uuid())
+            .await?
+        {
+            Ok(())
+        } else {
+            Err(PlatformSessionError::Invalid)
+        }
     }
 
     /// Stage the one canonical grant record for a platform session.

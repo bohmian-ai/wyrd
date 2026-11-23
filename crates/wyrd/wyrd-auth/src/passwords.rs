@@ -227,6 +227,20 @@ async fn check_password(
     .await?
 }
 
+/// Whether `password` matches `verifier`, costing one bounded derivation
+/// against a dummy verifier when there is none, so an unknown account and a
+/// wrong password cost the same.
+///
+/// # Errors
+/// Returns [`WyrdError::Internal`] when derivation cannot run.
+pub(crate) async fn password_matches(
+    password: SecretString,
+    verifier: Option<String>,
+) -> Result<bool, WyrdError> {
+    let check = check_password(capacity().await?, password, verifier).await?;
+    Ok(matches!(check, PasswordCheck::Matched { .. }))
+}
+
 /// Run one derivation under a process permit on the blocking pool.
 ///
 /// The permit moves into the blocking job, so a cancelled caller (a request

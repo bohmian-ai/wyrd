@@ -404,6 +404,7 @@ async fn set_tenant_status(
     tenant_id: Result<Path<DataTenantId>, PathRejection>,
     Json(request): Json<SetTenantStatusRequest>,
 ) -> Result<(), WyrdErrorResponse> {
+    caller.require_recent_proof()?;
     let Path(tenant_id) = tenant_id.map_err(|rejection| path_rejection(&rejection))?;
     // Only the two states an operator may assert are settable. `provisioning`
     // and `failed` describe what provisioning observed, and letting an operator

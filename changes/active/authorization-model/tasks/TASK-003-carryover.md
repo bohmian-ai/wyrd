@@ -913,8 +913,14 @@ directory-update owner once here; recovery below consumes its output.
   - harbor's entry is deleted and a stale cove entry inserted, then the worker's LISTEN backend is terminated. The worker resubscribes and resyncs to exactly `["harbor"]`;
   - with `SELECT` on contacts revoked from `wyrd_tenant`, discovery lists nothing, and after the grant it lists harbor again.
   - TDD VIOLATED: the code came with scenario 2. Mutations: skipping the stale-entry removal fails the test (`["cove","harbor"]`), and treating a failed revalidation as valid fails it too. The code was restored.
-- Still open in cycle 12:
-  - SQL: the projection holds only address keys, and RLS is forced (structural check);
+- SQL structure: `pg_auth_contacts::pg_tests::discovery_tables_hold_only_digests_behind_forced_rls`.
+  - `platform.workspace_directory` has exactly `data_tenant_id, user_id, address_key, contact_revision`.
+  - `platform.discovery_proofs` has exactly `proof_hash, browser_binding_hash, read_until, expires_at`.
+  - Both enable and force RLS, and a tenant connection sees none of their rows while the platform owner inserted them.
+  - Structural proof, so no RED applies. Command: `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-sql --test integration -E "test(/pg_auth_contacts/)"'`.
+- Invalidating old-contact reset proofs landed with cycle 13 (`wyrd.auth_password_resets.contact_revision`; scenario `platform_admin_e2e::resets::a_reset_code_refuses_every_stale_or_foreign_use`), merged in c27c06f79.
+- Cycle 12 status: IMPLEMENTED. Every case has a runtime or structural proof except expiry of the pre-proof sealed envelope (see scenario 6).
+  - TDD VIOLATED for: the first-contact race fix, pagination (scenario 5), purpose and read expiry (scenario 6) and reconciliation and revalidation (scenario 7). In each, the code preceded its test, and a mutation check shows the test now catches the defect.
   - removing the old revision's reset proofs (the reset owner is cycle 13).
 - Commands:
   - the Postgres journey command, with selector `test(=platform_admin_e2e::contacts::a_signed_in_user_verifies_and_replaces_a_recovery_contact)`;

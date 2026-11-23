@@ -161,4 +161,107 @@ mod pg_tests {
         assert_eq!(operator.contact_revision, None);
         conn.commit().await.expect("commits");
     }
+
+    /// The discovery tables hold no address, only keyed digests, and force
+    /// row-level security so a tenant login reads none of their rows while
+    /// the platform owner does.
+    ///
+    /// # Panics
+    /// Panics when a column beyond the minimal projection exists, RLS is not
+    /// forced, or a tenant connection sees a directory or proof row.
+    #[tokio::test]
+    async fn discovery_tables_hold_only_digests_behind_forced_rls() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let superuser = fixture.superuser_pool().expect("superuser pool opens");
+        let columns = |table: &'static str| {
+            let superuser = superuser.clone();
+            async move {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT column_name::text FROM information_schema.columns
+                      WHERE table_schema = 'platform' AND table_name = $1
+                      ORDER BY ordinal_position",
+                )
+                .bind(table)
+                .fetch_all(&superuser)
+                .await
+                .expect("columns read")
+            }
+        };
+        assert_eq!(
+            columns("workspace_directory").await,
+            [
+                "data_tenant_id",
+                "user_id",
+                "address_key",
+                "contact_revision"
+            ]
+        );
+        assert_eq!(
+            columns("discovery_proofs").await,
+            [
+                "proof_hash",
+                "browser_binding_hash",
+                "read_until",
+                "expires_at"
+            ]
+        );
+        let forced: Vec<(String, bool, bool)> = sqlx::query_as(
+            "SELECT relname::text, relrowsecurity, relforcerowsecurity FROM pg_class
+              WHERE relnamespace = 'platform'::regnamespace
+                AND relname IN ('workspace_directory', 'discovery_proofs')
+              ORDER BY relname",
+        )
+        .fetch_all(&superuser)
+        .await
+        .expect("security reads");
+        assert_eq!(
+            forced,
+            [
+                ("discovery_proofs".to_owned(), true, true),
+                ("workspace_directory".to_owned(), true, true),
+            ]
+        );
+
+        let user = Uuid::now_v7();
+        let mut conn = fixture.tenant_conn().await.expect("conn opens");
+        insert_local_user(
+            &mut conn,
+            user,
+            "ada",
+            "$argon2id$v=19$m=19456,t=2,p=1$x$y",
+            None,
+        )
+        .await
+        .expect("user inserts");
+        conn.commit().await.expect("user commits");
+        sqlx::query(
+            "INSERT INTO platform.workspace_directory
+                 (data_tenant_id, user_id, address_key, contact_revision)
+             VALUES ($1, $2, sha256('key'::bytea), 1)",
+        )
+        .bind(fixture.data_tenant_id().as_uuid())
+        .bind(user)
+        .execute(&superuser)
+        .await
+        .expect("an entry inserts");
+        sqlx::query(
+            "INSERT INTO platform.discovery_proofs
+                 (proof_hash, browser_binding_hash, read_until, expires_at)
+             VALUES (sha256('p'::bytea), sha256('b'::bytea), now(), now())",
+        )
+        .execute(&superuser)
+        .await
+        .expect("a proof inserts");
+        let mut conn = fixture.tenant_conn().await.expect("conn opens");
+        for table in ["platform.workspace_directory", "platform.discovery_proofs"] {
+            let seen: Result<i64, _> =
+                sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {table}")))
+                    .fetch_one(&mut **conn.transaction())
+                    .await;
+            assert!(
+                seen.as_ref().map_or(true, |rows| *rows == 0),
+                "{table} is hidden from a tenant login: {seen:?}"
+            );
+        }
+    }
 }

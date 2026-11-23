@@ -1,4 +1,5 @@
 import { env } from '$env/dynamic/private';
+import { getRequestEvent } from '$app/server';
 import { problem } from './problem';
 
 /** `localhost` or a literal loopback address, as normalized by the URL parser. */
@@ -47,6 +48,19 @@ const dropped = [
   'x-real-ip'
 ];
 
+/**
+ * State the visitor's address in the deployment's client-address header
+ * (`WYRD_CLIENT_ADDRESS_HEADER`, the name the server reads from its trusted
+ * ingress), replacing any value the browser sent. The address is the one
+ * adapter-node establishes for the current request, so a deployment that lists
+ * this BFF as trusted ingress keys admission by visitor rather than by this
+ * process. Without the setting nothing is added.
+ */
+export function stateSource(headers: Headers): void {
+  const name = env.WYRD_CLIENT_ADDRESS_HEADER?.trim();
+  if (name) headers.set(name, getRequestEvent().getClientAddress());
+}
+
 /** The server's sign-in binding cookie, which every forwarded `/auth/*` request carries. */
 const loginCookie = 'wyrd_login';
 
@@ -66,7 +80,8 @@ const sessionPrefix = 'wyrd_session_';
  * code without a provider.
  * `url` is the request's public URL as this BFF established it, so the server
  * derives sign-in redirects and callbacks from the origin the browser actually
- * reached, never from a forwarded header the browser sent. A server that
+ * reached, never from a forwarded header the browser sent, and the visitor's
+ * address goes as {@link stateSource} states it. A server that
  * cannot be reached is the stable `upstream` problem.
  */
 export async function forwardAuth(
@@ -88,6 +103,7 @@ export async function forwardAuth(
   else headers.delete('cookie');
   headers.set('x-forwarded-host', url.host);
   headers.set('x-forwarded-proto', url.protocol.slice(0, -1));
+  stateSource(headers);
   const body = request.method === 'GET' || request.method === 'HEAD' ? undefined : request.body;
   let answer: Response;
   try {

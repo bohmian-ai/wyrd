@@ -3004,7 +3004,9 @@ pub struct HttpConfig {
     pub trusted_ingress: Vec<String>,
     /// The header a trusted ingress supplies the client address in, such as
     /// `CF-Connecting-IP` (`WYRD_CLIENT_ADDRESS_HEADER`). Required exactly when
-    /// [`Self::trusted_ingress`] is not empty.
+    /// [`Self::trusted_ingress`] is not empty. The production UI's BFF reads the
+    /// same variable and states each visitor's address in it, so a deployment
+    /// whose BFF reaches the server lists the BFF's address as trusted ingress.
     #[serde(default)]
     pub client_address_header: Option<String>,
 }

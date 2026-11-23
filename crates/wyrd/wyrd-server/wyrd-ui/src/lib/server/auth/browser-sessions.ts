@@ -1,6 +1,6 @@
 import type { Cookies } from '@sveltejs/kit';
 import { WyrdClient } from 'wyrd-ai';
-import { serverUrl } from '../upstream';
+import { serverUrl, stateSource } from '../upstream';
 import { upstreamProblem } from '../problem';
 import { reject, type SessionMetadata, type TenantContext } from './session';
 
@@ -39,20 +39,23 @@ type Call = { method: 'GET' | 'POST' | 'DELETE'; cookie?: string; body?: unknown
 /**
  * Call one Rust `/auth/browser/*` or `/v1` operation server to server as the
  * browser at `url`: the trusted public origin goes as `Origin` and the
- * forwarded host and scheme, and only the cookie the caller selected is sent.
+ * forwarded host and scheme, the visitor's address as `stateSource` states it,
+ * and only the cookie the caller selected is sent.
  * An unreachable server is the stable `upstream` problem.
  */
 async function call(path: string, url: URL, { method, cookie, body }: Call): Promise<Response> {
+  const headers = new Headers({
+    origin: url.origin,
+    'x-forwarded-host': url.host,
+    'x-forwarded-proto': url.protocol.slice(0, -1),
+    ...(cookie ? { cookie } : {}),
+    ...(body === undefined ? {} : { 'content-type': 'application/json' })
+  });
+  stateSource(headers);
   try {
     return await fetch(new URL(path, serverUrl()), {
       method,
-      headers: {
-        origin: url.origin,
-        'x-forwarded-host': url.host,
-        'x-forwarded-proto': url.protocol.slice(0, -1),
-        ...(cookie ? { cookie } : {}),
-        ...(body === undefined ? {} : { 'content-type': 'application/json' })
-      },
+      headers,
       body: body === undefined ? undefined : JSON.stringify(body),
       redirect: 'manual',
       signal: AbortSignal.timeout(30_000)

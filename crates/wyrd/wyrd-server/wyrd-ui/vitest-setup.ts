@@ -1,4 +1,12 @@
 import '@testing-library/jest-dom/vitest';
+import { vi } from 'vitest';
+
+// This config resolves `$app/server` to SvelteKit's browser build, which needs `window`; server units run outside any request.
+vi.mock('$app/server', () => ({
+  getRequestEvent: () => {
+    throw new Error('no request event in a unit test');
+  }
+}));
 
 // jsdom does no layout; `bind:clientWidth` needs an observer, and components fall back to their default width.
 // `ResizeObserver.notify()` reports every observed element, as a browser does after a layout change.

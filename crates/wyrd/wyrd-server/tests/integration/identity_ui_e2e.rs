@@ -115,11 +115,16 @@ fn ui_dir() -> PathBuf {
 /// never read from request headers), and wait until it answers. `extra_ca` is the
 /// PEM file Node adds to its trust store, so a replica given the TLS
 /// terminator's `https:` origin verifies it through the ordinary native
-/// `fetch` path.
+/// `fetch` path. `extra_env` adds deployment settings to the process.
 ///
 /// # Panics
 /// Panics when the build output is missing or the process never answers.
-async fn start_bff(server_url: &str, origin: &str, extra_ca: Option<&std::path::Path>) -> Bff {
+async fn start_bff(
+    server_url: &str,
+    origin: &str,
+    extra_ca: Option<&std::path::Path>,
+    extra_env: &[(&str, &str)],
+) -> Bff {
     let ui = ui_dir();
     assert!(
         ui.join("build/index.js").is_file(),
@@ -137,6 +142,7 @@ async fn start_bff(server_url: &str, origin: &str, extra_ca: Option<&std::path::
         .env("PORT", port.to_string())
         .env("ORIGIN", origin)
         .env("WYRD_SERVER_URL", server_url)
+        .envs(extra_env.iter().copied())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
@@ -153,6 +159,86 @@ async fn start_bff(server_url: &str, origin: &str, extra_ca: Option<&std::path::
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("BFF on port {port} never answered");
+}
+
+/// The client-address header the source journey's deployment names.
+const CLIENT_ADDRESS_HEADER: &str = "x-wyrd-client";
+
+/// A production BFF is the trusted ingress of its server: behind a load
+/// balancer that states each visitor in `X-Forwarded-For`, it carries that
+/// visitor's address to a replica trusting the BFF's loopback peer, on both
+/// its page-action calls and its forwarded `/auth/*` requests. Each distinct
+/// visitor fails into its own password source window, never the BFF's own
+/// address, and a client-address header the browser forges chooses no
+/// window.
+///
+/// # Panics
+/// Panics when the replica or BFF fails to start or a stored window differs.
+async fn bff_preserves_trusted_sources(srv: &WyrdTestServer, origin: &str) {
+    let replica = Box::pin(srv.start_bound_replica(
+        WyrdTestServerBuilder::default()
+            .with_trusted_ingress_for_test(&["127.0.0.1/32", "::1/128"], CLIENT_ADDRESS_HEADER),
+    ))
+    .await
+    .expect("trusted-ingress replica starts");
+    let bff = start_bff(
+        replica.base_url().expect("bound replica has a URL"),
+        origin,
+        None,
+        &[
+            ("WYRD_CLIENT_ADDRESS_HEADER", CLIENT_ADDRESS_HEADER),
+            ("ADDRESS_HEADER", "x-forwarded-for"),
+            ("XFF_DEPTH", "1"),
+        ],
+    )
+    .await;
+    let tenant = srv.pg_fixture().tenant_slug().to_owned();
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("client builds");
+    for visitor in ["198.51.100.31", "198.51.100.32"] {
+        client
+            .post(format!("{}/t/{tenant}/login?/password", bff.url))
+            .header("origin", origin)
+            .header("x-forwarded-for", visitor)
+            .header(CLIENT_ADDRESS_HEADER, "203.0.113.9")
+            .form(&[("username", "nobody"), ("password", "not-the-password")])
+            .send()
+            .await
+            .expect("the BFF answers the sign-in action");
+    }
+    client
+        .post(format!("{}/auth/browser/password/login", bff.url))
+        .header("origin", origin)
+        .header("x-forwarded-for", "198.51.100.33")
+        .header(CLIENT_ADDRESS_HEADER, "203.0.113.9")
+        .json(&json!({ "tenant": tenant, "username": "nobody", "password": "not-the-password" }))
+        .send()
+        .await
+        .expect("the BFF forwards the sign-in request");
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    let windows: Vec<(String, i32)> = sqlx::query_as(
+        "SELECT subject, failures FROM wyrd.auth_password_attempts \
+          WHERE scope = 'source' ORDER BY subject",
+    )
+    .fetch_all(&superuser)
+    .await
+    .expect("source windows read");
+    assert_eq!(
+        windows,
+        [
+            ("198.51.100.31".to_owned(), 1),
+            ("198.51.100.32".to_owned(), 1),
+            ("198.51.100.33".to_owned(), 1),
+        ],
+        "each visitor fails into its own window"
+    );
+    drop(bff);
+    replica.shutdown().await.expect("trusted-ingress replica shuts down");
 }
 
 /// Node TLS terminator: accepts TLS with `TLS_KEY`/`TLS_CERT` on `TLS_PORT`
@@ -491,8 +577,9 @@ async fn production_ui_bff_journey() {
     // serves crosses a real TLS hop to the other server replica.
     let material = std::env::temp_dir().join(format!("wyrd-ui-tls-{}", uuid::Uuid::new_v4()));
     let (terminator, ca) = start_tls_terminator(&replica_url, &material).await;
-    let first = start_bff(&server, &origin, None).await;
-    let second = start_bff(&terminator.url, &origin, Some(&ca)).await;
+    let first = start_bff(&server, &origin, None, &[]).await;
+    let second = start_bff(&terminator.url, &origin, Some(&ca), &[]).await;
+    bff_preserves_trusted_sources(&srv, &origin).await;
     let fixture = json!({
         "origin": origin,
         "servers": [server, replica_url],

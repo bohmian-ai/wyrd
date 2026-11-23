@@ -1364,6 +1364,21 @@ impl Workload for Bench {
         }
         Ok(())
     }
+    /// Reads the server's outstanding publication and maintenance work
+    /// ([`LocalServer::outstanding`]) before teardown; none before the
+    /// server started.
+    async fn outstanding(
+        &mut self,
+    ) -> std::result::Result<Option<serde_json::Value>, ExperimentError> {
+        match &self.server {
+            Some(server) => server
+                .outstanding()
+                .await
+                .map(Some)
+                .map_err(ExperimentError::workload),
+            None => Ok(None),
+        }
+    }
 
     /// The server's PID, once it runs.
     fn processes(&self) -> Vec<u32> {
@@ -3712,11 +3727,13 @@ mod tests {
                 repetitions: 2,
                 budget_seconds: 600,
                 minimum_seconds: 0,
+                phases: None,
             };
             let options = Options {
                 artifacts: directory.path().join("artifacts"),
                 profile: None,
                 interrupt: CancellationToken::new(),
+                setup_spent: Duration::ZERO,
             };
             let mut workload = Calibration {
                 bench: Bench::new(Level::One, directory.path().join("logs"), false, None),

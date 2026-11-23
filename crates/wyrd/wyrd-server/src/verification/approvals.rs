@@ -3,11 +3,12 @@
 //!
 //! One decision is one `bifrost.verification.approvals` row, written through
 //! Scribe as its own batch under a batch id its approval id derives. The
-//! batch fence, committed before Scribe acknowledges, is the authoritative
-//! record that the occurrence was decided: an unfenced decision is absent,
-//! and a fenced one whose row a query cannot see yet is unavailable, never
-//! absent. The first accepted decision is final. Nothing is mirrored in
-//! PostgreSQL; the queue only learns that the execution is due.
+//! row is the one record that the occurrence was decided, and reads come
+//! only from Bifrost. A decision Scribe accepted but no query sees yet reads
+//! as undecided: the execution stays parked until a later read sees it, and
+//! a different decision for it is refused under the same batch id, so the
+//! first accepted decision is final. Nothing is mirrored in PostgreSQL; the
+//! queue only learns that the execution is due.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -15,8 +16,6 @@ use std::time::Instant;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use tokio::sync::oneshot;
-use uuid::Uuid;
-use vala_bifrost_redux::contracts::committed_batches;
 use vala_bifrost_redux::tables::DomainTable;
 use vala_bifrost_redux::tables::staged::{Cell, StagedRow};
 use vala_bifrost_redux::tables::verification::ApprovalsTable;
@@ -29,7 +28,7 @@ use wyrd_spec::vala::managed_columns::{RUN_ID, SUBJECT_CARD_UID, WORKLOAD_CARD_U
 use wyrd_spec::verification::execution::{ApprovalReceipt, ApprovalStatus};
 
 use super::inputs::InputResolver;
-use crate::scribe_outbox::{ScribeTable, ScribeWrite, fenced_batch_id};
+use crate::scribe_outbox::{ScribeTable, ScribeWrite};
 use crate::state::AppState;
 
 /// The table every decision is a row of, and the logical table of every
@@ -64,11 +63,11 @@ impl<'a> ApprovalDecisions<'a> {
     /// The accepted decision of each of `execution_id`'s `approvals` that
     /// has one, read through `records`; an undecided occurrence is absent.
     ///
+    /// A decision no query sees yet is absent here; see the module docs.
+    ///
     /// # Errors
-    /// Returns [`WyrdError::ServiceUnavailable`] when the fences cannot be
-    /// read, or an accepted decision is not visible yet, so a decision is
-    /// never mistaken for absence; the query error or an internal error when
-    /// a row cannot be read or is malformed.
+    /// Returns the query error, or an internal error when a row is
+    /// malformed.
     pub(crate) async fn decided(
         &self,
         records: &InputResolver<'_>,
@@ -78,36 +77,11 @@ impl<'a> ApprovalDecisions<'a> {
         if approvals.is_empty() {
             return Ok(BTreeMap::new());
         }
-        let fences: Vec<Uuid> = approvals.iter().map(|id| self.fence(*id)).collect();
-        let mut conn = self
-            .app
-            .postgres
-            .vala()
-            .tenant_conn(self.tenant)
-            .await
-            .map_err(|error| unavailable(&error))?;
-        let fenced = committed_batches(&mut conn, APPROVALS_TABLE, &fences)
-            .await
-            .map_err(|error| unavailable(&error))?;
-        drop(conn);
-        let held: Vec<ApprovalId> = approvals
-            .iter()
-            .zip(&fences)
-            .filter(|(_, fence)| fenced.contains(fence))
-            .map(|(id, _)| *id)
-            .collect();
-        if held.is_empty() {
-            return Ok(BTreeMap::new());
-        }
         let mut rows = records.decisions(execution_id).await?;
-        held.into_iter()
-            .map(|id| {
-                let decided = rows
-                    .remove(&id)
-                    .ok_or_else(|| unavailable(&"an accepted decision is not visible yet"))?;
-                Ok((id, decided))
-            })
-            .collect()
+        Ok(approvals
+            .iter()
+            .filter_map(|id| rows.remove_entry(id))
+            .collect())
     }
 
     /// Accept `receipt`, a decision of `execution_id`'s approval occurrence
@@ -165,11 +139,6 @@ impl<'a> ApprovalDecisions<'a> {
             }
         }
     }
-
-    /// The batch fence of the decision of `approval_id`.
-    fn fence(&self, approval_id: ApprovalId) -> Uuid {
-        fenced_batch_id(self.tenant, ScribeTable::Approvals, approval_id.as_uuid())
-    }
 }
 
 /// `receipt` as its staged row.
@@ -219,38 +188,4 @@ fn row(
         .collect();
     StagedRow::new(Arc::clone(&SCHEMA), cells)
         .map_err(|error| WyrdError::internal(format!("approval row: {error}")))
-}
-
-/// An unreadable fence or invisible accepted decision as a retryable
-/// unavailability. The cause is traced here and never reaches the caller.
-fn unavailable(error: &dyn std::fmt::Display) -> WyrdError {
-    tracing::warn!(cause = %error, "approval decisions cannot be read");
-    WyrdError::ServiceUnavailable {
-        message: "approval decisions cannot be read now; try again".to_owned(),
-        details: serde_json::json!({ "table": APPROVALS_TABLE }),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use wyrd_spec::error::WyrdError;
-
-    use super::{APPROVALS_TABLE, unavailable};
-
-    /// Proves an unreadable decision answers a retryable unavailability that
-    /// names the table but never the internal cause.
-    ///
-    /// # Panics
-    /// Panics when the error is not `ServiceUnavailable`, loses its table
-    /// detail, or carries the cause.
-    #[test]
-    fn an_unavailable_read_hides_its_cause() {
-        let WyrdError::ServiceUnavailable { message, details } =
-            unavailable(&"connection to 10.0.0.7:5432 refused")
-        else {
-            panic!("an unreadable decision is unavailable");
-        };
-        assert!(!message.contains("10.0.0.7"), "{message}");
-        assert_eq!(details["table"], APPROVALS_TABLE);
-    }
 }

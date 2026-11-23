@@ -1,20 +1,28 @@
 //! Fixed-capacity OTLP logs protobuf preflight and typed construction.
 
+use std::borrow::Cow;
 use std::mem::size_of;
 
-use vala_bifrost_redux::gate::{IngestError, OtlpWireLimits};
-use vala_bifrost_redux::tables::logs::log_row_output_bytes;
+use vala_bifrost_redux::gate::{
+    AuthContext, IngestError, LogsOutcome, OtlpWireLimits, PreparedExport,
+};
+use vala_bifrost_redux::tables::logs::input::{BodyInput, RecordInput};
+use vala_bifrost_redux::tables::logs::{LogInput, log_row_output_bytes};
+use vala_bifrost_redux::tables::signal::{
+    AttributeList, AttributePool, PoolRange, ResourceInput, ScopeInput,
+};
 use wyrd_tonic::otlp::common::v1::{AnyValue, EntityRef, KeyValue};
 use wyrd_tonic::otlp::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest;
 
 use crate::otlp_decode::{
-    AnyValueBodies, GROUP_FAN_OUT, OtlpDecodePlan, ProjectedOutput, RESOURCE_FAN_OUT, Scanned,
-    WireFields, WireValue, decode_any_value, decode_key_value, decode_merged_any_value,
+    AnyValueBodies, GROUP_FAN_OUT, OtlpDecodePlan, PoolDecoder, ProjectedOutput, RESOURCE_FAN_OUT,
+    Scanned, WireFields, WireValue, decode_any_value, decode_key_value, decode_merged_any_value,
     decode_merged_resource, decode_merged_scope, decode_resource, decode_scope,
     enforce_expanded_ceiling, last_bytes_across_messages, last_bytes_field, malformed,
-    protobuf_i32, protobuf_u32, repeated_message_count, select_any_value_bodies, wrong_wire,
+    protobuf_i32, protobuf_u32, repeated_message_count, select_any_value_bodies, text, wrong_wire,
 };
+use crate::state::ServerGate;
 
 /// Bounded counters accumulated while walking one logs export.
 #[derive(Debug)]
@@ -27,6 +35,27 @@ struct LogsWireFacts {
     decode_bytes: usize,
     /// Conservative projected canonical output.
     output: ProjectedOutput,
+    /// The views and pooled values a borrowed decode holds.
+    pool: LogPoolCounts,
+}
+
+/// How many of each view and pooled value a borrowed decode of one log
+/// export holds, counted by [`preflight_logs_protobuf`].
+///
+/// Resource and scope attributes are decoded into owned messages, so they are
+/// not counted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LogPoolCounts {
+    /// Resource groups.
+    pub(crate) resources: usize,
+    /// Scope groups.
+    pub(crate) scopes: usize,
+    /// Log records.
+    pub(crate) records: usize,
+    /// Record attribute entries, nested entries included.
+    pub(crate) entries: usize,
+    /// Record bodies and array items.
+    pub(crate) values: usize,
 }
 
 impl LogsWireFacts {
@@ -37,6 +66,7 @@ impl LogsWireFacts {
             row_bytes: log_row_output_bytes(),
             decode_bytes: size_of::<ExportLogsServiceRequest>(),
             output: ProjectedOutput::default(),
+            pool: LogPoolCounts::default(),
         }
     }
 
@@ -68,11 +98,14 @@ impl LogsWireFacts {
     ///
     /// Returns a malformed refusal on arithmetic overflow.
     fn add_attribute(&mut self) -> Result<(), IngestError> {
+        self.pool.entries += 1;
         self.add_decode_bytes(size_of::<KeyValue>())
     }
 }
 
 /// Preflights one OTLP logs protobuf body without constructing generated types.
+///
+/// Returns the plan and the counts that size a borrowed decode.
 ///
 /// # Errors
 ///
@@ -81,7 +114,7 @@ impl LogsWireFacts {
 pub(crate) fn preflight_logs_protobuf(
     bytes: &[u8],
     limits: OtlpWireLimits,
-) -> Result<OtlpDecodePlan, IngestError> {
+) -> Result<(OtlpDecodePlan, LogPoolCounts), IngestError> {
     if bytes.len() > limits.request_bytes {
         return Err(IngestError::PayloadTooLarge {
             bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
@@ -97,6 +130,7 @@ pub(crate) fn preflight_logs_protobuf(
                     .output
                     .open(facts.decode_bytes, size_of::<ResourceLogs>());
                 facts.add_decode_bytes(size_of::<ResourceLogs>())?;
+                facts.pool.resources += 1;
                 visit_resource_logs(resource, &mut facts)?;
                 facts
                     .output
@@ -107,11 +141,14 @@ pub(crate) fn preflight_logs_protobuf(
         }
     }
     enforce_expanded_ceiling(facts.decode_bytes, facts.output.bytes(), limits)?;
-    Ok(OtlpDecodePlan {
-        wire_bytes: bytes.len(),
-        decode_bytes: facts.decode_bytes,
-        projected_bytes: facts.output.bytes(),
-    })
+    Ok((
+        OtlpDecodePlan {
+            wire_bytes: bytes.len(),
+            decode_bytes: facts.decode_bytes,
+            projected_bytes: facts.output.bytes(),
+        },
+        facts.pool,
+    ))
 }
 
 /// Visits one resource group and its merged resource plus repeated scopes.
@@ -133,6 +170,7 @@ fn visit_resource_logs(bytes: &[u8], facts: &mut LogsWireFacts) -> Result<(), In
                     .output
                     .open(facts.decode_bytes, size_of::<ScopeLogs>());
                 facts.add_decode_bytes(size_of::<ScopeLogs>())?;
+                facts.pool.scopes += 1;
                 visit_scope_logs(scope, facts)?;
                 facts.output.close_group(facts.decode_bytes, GROUP_FAN_OUT);
             }
@@ -172,6 +210,7 @@ fn visit_merged_resource(
 ///
 /// Returns a stable refusal for malformed fields or configured limits.
 fn visit_resource(bytes: &[u8], facts: &mut LogsWireFacts) -> Result<(), IngestError> {
+    let pool = facts.pool;
     let mut fields = WireFields::with_group_depth(bytes, facts.limits.value_depth);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
@@ -185,6 +224,7 @@ fn visit_resource(bytes: &[u8], facts: &mut LogsWireFacts) -> Result<(), IngestE
             _ => {}
         }
     }
+    facts.pool = pool;
     Ok(())
 }
 
@@ -237,6 +277,7 @@ fn visit_scope_logs(bytes: &[u8], facts: &mut LogsWireFacts) -> Result<(), Inges
                     .output
                     .open(facts.decode_bytes, size_of::<LogRecord>());
                 facts.add_decode_bytes(size_of::<LogRecord>())?;
+                facts.pool.records += 1;
                 visit_log_record(record, facts)?;
                 facts
                     .output
@@ -256,6 +297,7 @@ fn visit_scope_logs(bytes: &[u8], facts: &mut LogsWireFacts) -> Result<(), Inges
 ///
 /// Returns a stable refusal for malformed fields or configured limits.
 fn visit_scope(bytes: &[u8], facts: &mut LogsWireFacts) -> Result<(), IngestError> {
+    let pool = facts.pool;
     let mut fields = WireFields::with_group_depth(bytes, facts.limits.value_depth);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
@@ -265,6 +307,7 @@ fn visit_scope(bytes: &[u8], facts: &mut LogsWireFacts) -> Result<(), IngestErro
             _ => {}
         }
     }
+    facts.pool = pool;
     Ok(())
 }
 
@@ -278,6 +321,9 @@ fn visit_log_record(bytes: &[u8], facts: &mut LogsWireFacts) -> Result<(), Inges
         if let Some(value) = last_bytes_field(bytes, tag)? {
             facts.add_value_bytes(value.len())?;
         }
+    }
+    if last_bytes_field(bytes, 5)?.is_some() {
+        facts.pool.values += 1;
     }
     visit_merged_any_value(
         AnyValueBodies::Repeated {
@@ -384,6 +430,7 @@ fn visit_merged_any_value(
                         match (value_tag, value) {
                             (1, WireValue::Bytes(value)) => {
                                 facts.add_decode_bytes(size_of::<AnyValue>())?;
+                                facts.pool.values += 1;
                                 visit_any_value(value, depth + 1, facts)?;
                             }
                             (1, _) => return Err(wrong_wire("OTLP value array")),
@@ -516,9 +563,219 @@ fn decode_log_record(bytes: &[u8]) -> Result<LogRecord, IngestError> {
     Ok(record)
 }
 
+/// Borrows one preflighted logs export straight from its wire.
+///
+/// Text and bytes borrow `bytes`; record attributes and bodies land in the
+/// input's pool, and each resource and scope is decoded into an owned message
+/// once per group. Returns `None` when [`decode_logs_protobuf`] must decide
+/// instead: for any framing, wire-type, or UTF-8 refusal, and for any
+/// encoding protobuf merges, which is a singular message (resource, scope,
+/// body, attribute value) occurring twice or an `AnyValue` carrying two oneof
+/// fields. Repeated scalars and strings keep protobuf's last-wins rule here.
+///
+/// `counts` sizes every view and pool exactly, so the input never outgrows
+/// the generated request [`OtlpDecodePlan::reservation_bytes`] admitted.
+pub(crate) fn decode_log_input(bytes: &[u8], counts: LogPoolCounts) -> Option<LogInput<'_>> {
+    let mut decoder = LogInputDecoder {
+        pool: PoolDecoder::new(bytes, counts.entries, counts.values),
+        input: LogInput {
+            resources: Vec::with_capacity(counts.resources),
+            scopes: Vec::with_capacity(counts.scopes),
+            records: Vec::with_capacity(counts.records),
+            pool: AttributePool::default(),
+        },
+    };
+    decoder.request(bytes)?;
+    decoder.input.pool = decoder.pool.finish()?;
+    Some(decoder.input)
+}
+
+/// One logs protobuf export, borrowed from its wire whenever
+/// [`decode_log_input`] can.
+#[derive(Debug)]
+pub(crate) enum DecodedLogs<'a> {
+    /// Borrowed straight from the wire.
+    Borrowed(LogInput<'a>),
+    /// Built by [`decode_logs_protobuf`] for an encoding protobuf merges.
+    Generated(Box<ExportLogsServiceRequest>),
+}
+
+/// Decodes one preflighted logs export, borrowing it when possible.
+///
+/// # Errors
+///
+/// Returns the stable malformed-request error [`decode_logs_protobuf`]
+/// returns for a refused export.
+pub(crate) fn decode_logs(
+    bytes: &[u8],
+    counts: LogPoolCounts,
+) -> Result<DecodedLogs<'_>, IngestError> {
+    match decode_log_input(bytes, counts) {
+        Some(input) => Ok(DecodedLogs::Borrowed(input)),
+        None => {
+            decode_logs_protobuf(bytes).map(|request| DecodedLogs::Generated(Box::new(request)))
+        }
+    }
+}
+
+impl DecodedLogs<'_> {
+    /// Authorize, attribute, and project the export through
+    /// [`ServerGate::prepare_log_input`].
+    ///
+    /// The returned batch owns its data, so the caller may release the wire
+    /// before dispatching it.
+    ///
+    /// # Errors
+    ///
+    /// Returns authorization, attribution, or projection errors.
+    pub(crate) async fn prepare(
+        &self,
+        gate: &ServerGate,
+        auth: &AuthContext,
+    ) -> Result<PreparedExport<LogsOutcome>, IngestError> {
+        match self {
+            Self::Borrowed(input) => gate.prepare_log_input(auth, input).await,
+            Self::Generated(request) => {
+                gate.prepare_log_input(auth, &LogInput::from_generated(&request.resource_logs))
+                    .await
+            }
+        }
+    }
+}
+
+/// Fills one [`LogInput`] from protobuf wire; see [`decode_log_input`].
+#[derive(Debug)]
+struct LogInputDecoder<'a> {
+    /// The export's record attributes and bodies, pooled as they are reached.
+    pool: PoolDecoder<'a>,
+    /// The input being filled; its pool is moved in when the walk ends.
+    input: LogInput<'a>,
+}
+
+impl<'a> LogInputDecoder<'a> {
+    /// Walks the export's resource groups.
+    fn request(&mut self, bytes: &'a [u8]) -> Option<()> {
+        let mut fields = WireFields::new(bytes);
+        while let Some((tag, value)) = fields.next().ok()? {
+            match (tag, value) {
+                (1, WireValue::Bytes(group)) => self.resource_logs(group)?,
+                (1, _) => return None,
+                _ => {}
+            }
+        }
+        Some(())
+    }
+
+    /// Walks one resource group and its scope groups.
+    fn resource_logs(&mut self, bytes: &'a [u8]) -> Option<()> {
+        let first_scope = self.input.scopes.len();
+        let (mut resource, mut resources, mut schema_url) = (None, 0_usize, "");
+        let mut fields = WireFields::new(bytes);
+        while let Some((tag, value)) = fields.next().ok()? {
+            match (tag, value) {
+                (1, WireValue::Bytes(body)) => (resource, resources) = (Some(body), resources + 1),
+                (2, WireValue::Bytes(body)) => self.scope_logs(body)?,
+                (3, WireValue::Bytes(body)) => schema_url = text(body)?,
+                (1..=3, _) => return None,
+                _ => {}
+            }
+        }
+        if resources > 1 {
+            return None;
+        }
+        self.input.resources.push(ResourceInput {
+            resource: match resource {
+                Some(body) => Some(Cow::Owned(decode_resource(body).ok()?)),
+                None => None,
+            },
+            schema_url,
+            scopes: first_scope..self.input.scopes.len(),
+        });
+        Some(())
+    }
+
+    /// Walks one scope group and its records.
+    fn scope_logs(&mut self, bytes: &'a [u8]) -> Option<()> {
+        let first_record = self.input.records.len();
+        let (mut scope, mut scopes, mut schema_url) = (None, 0_usize, "");
+        let mut fields = WireFields::new(bytes);
+        while let Some((tag, value)) = fields.next().ok()? {
+            match (tag, value) {
+                (1, WireValue::Bytes(body)) => (scope, scopes) = (Some(body), scopes + 1),
+                (2, WireValue::Bytes(body)) => self.record(body)?,
+                (3, WireValue::Bytes(body)) => schema_url = text(body)?,
+                (1..=3, _) => return None,
+                _ => {}
+            }
+        }
+        if scopes > 1 {
+            return None;
+        }
+        self.input.scopes.push(ScopeInput {
+            scope: match scope {
+                Some(body) => Some(Cow::Owned(decode_scope(body).ok()?)),
+                None => None,
+            },
+            schema_url,
+            records: first_record..self.input.records.len(),
+        });
+        Some(())
+    }
+
+    /// Walks one log record, pooling its attributes and then its body.
+    fn record(&mut self, bytes: &'a [u8]) -> Option<()> {
+        let first_entry = self.pool.entries();
+        let mut record = RecordInput {
+            time_unix_nano: 0,
+            observed_time_unix_nano: 0,
+            severity_number: 0,
+            severity_text: "",
+            body: None,
+            attributes: AttributeList::Pooled(PoolRange::default()),
+            dropped_attributes_count: 0,
+            flags: 0,
+            trace_id: &[],
+            span_id: &[],
+            event_name: "",
+        };
+        let (mut body, mut bodies) = (None, 0_usize);
+        let mut fields = WireFields::new(bytes);
+        while let Some((tag, value)) = fields.next().ok()? {
+            match (tag, value) {
+                (1, WireValue::Fixed64(value)) => record.time_unix_nano = value,
+                (2, WireValue::Varint(value)) => record.severity_number = protobuf_i32(value),
+                (3, WireValue::Bytes(value)) => record.severity_text = text(value)?,
+                (5, WireValue::Bytes(value)) => (body, bodies) = (Some(value), bodies + 1),
+                (6, WireValue::Bytes(value)) => self.pool.entry(value)?,
+                (7, WireValue::Varint(value)) => {
+                    record.dropped_attributes_count = protobuf_u32(value);
+                }
+                (8, WireValue::Fixed32(value)) => record.flags = value,
+                (9, WireValue::Bytes(value)) => record.trace_id = value,
+                (10, WireValue::Bytes(value)) => record.span_id = value,
+                (11, WireValue::Fixed64(value)) => record.observed_time_unix_nano = value,
+                (12, WireValue::Bytes(value)) => record.event_name = text(value)?,
+                (1..=12, _) => return None,
+                _ => {}
+            }
+        }
+        if bodies > 1 {
+            return None;
+        }
+        record.attributes = AttributeList::Pooled(self.pool.range_from(first_entry));
+        record.body = match body {
+            Some(value) => Some(BodyInput::Pooled(self.pool.push_value(value)?)),
+            None => None,
+        };
+        self.input.records.push(record);
+        Some(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vala_bifrost_redux::tables::signal::{PooledEntry, PooledValue};
     use wyrd_tonic::otlp::common::v1::{ArrayValue, InstrumentationScope, KeyValueList, any_value};
     use wyrd_tonic::otlp::resource::v1::Resource;
     use wyrd_tonic::prost::Message;
@@ -717,14 +974,10 @@ mod tests {
         AnyValue { value: Some(value) }
     }
 
-    /// Proves rich logs decode matches Prost and exact owner accounting.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the valid fixture cannot encode or decode.
-    #[test]
-    fn logs_fixed_decode_matches_prost_and_exact_capacity() {
-        let request = ExportLogsServiceRequest {
+    /// Builds one log export carrying every field, a nested body, and a
+    /// resource and scope with attributes and entity references.
+    fn rich_logs_request() -> ExportLogsServiceRequest {
+        ExportLogsServiceRequest {
             resource_logs: vec![ResourceLogs {
                 resource: Some(Resource {
                     attributes: vec![attribute(
@@ -776,11 +1029,21 @@ mod tests {
                 }],
                 schema_url: "resource/v1".to_owned(),
             }],
-        };
+        }
+    }
+
+    /// Proves rich logs decode matches Prost and exact owner accounting.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the valid fixture cannot encode or decode.
+    #[test]
+    fn logs_fixed_decode_matches_prost_and_exact_capacity() {
+        let request = rich_logs_request();
         let mut bytes = request.encode_to_vec();
         bytes.extend_from_slice(&[0xa0, 0x06, 0x01]);
         let expected = ExportLogsServiceRequest::decode(bytes.as_slice()).expect("prost fixture");
-        let plan =
+        let (plan, _) =
             preflight_logs_protobuf(&bytes, vala_bifrost_redux::gate::limits::OTLP_WIRE_LIMITS)
                 .expect("logs preflight");
         let decoded = decode_logs_protobuf(&bytes).expect("fixed logs decode");
@@ -845,7 +1108,7 @@ mod tests {
         push_raw_message_field(&mut request, 1, &resource);
 
         let expected = ExportLogsServiceRequest::decode(request.as_slice()).expect("prost fixture");
-        let plan =
+        let (plan, _) =
             preflight_logs_protobuf(&request, vala_bifrost_redux::gate::limits::OTLP_WIRE_LIMITS)
                 .expect("logs preflight");
         let decoded = decode_logs_protobuf(&request).expect("fixed logs decode");
@@ -896,6 +1159,234 @@ mod tests {
             preflight_logs_protobuf(&bytes, vala_bifrost_redux::gate::limits::OTLP_WIRE_LIMITS,)
                 .is_err()
         );
+    }
+
+    /// Encodes one length-delimited protobuf field.
+    fn field(tag: u32, body: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        push_raw_message_field(&mut bytes, tag, body);
+        bytes
+    }
+
+    /// Computes the heap one borrowed log input holds, owned resources and
+    /// scopes included.
+    fn borrowed_log_capacity(input: &LogInput<'_>) -> usize {
+        input.resources.capacity() * size_of::<ResourceInput<'_>>()
+            + input
+                .resources
+                .iter()
+                .filter_map(|group| group.resource.as_deref())
+                .map(decoded_resource_capacity)
+                .sum::<usize>()
+            + input.scopes.capacity() * size_of::<ScopeInput<'_>>()
+            + input
+                .scopes
+                .iter()
+                .filter_map(|group| group.scope.as_deref())
+                .map(|scope| {
+                    scope.name.capacity()
+                        + scope.version.capacity()
+                        + decoded_attributes_capacity(&scope.attributes)
+                })
+                .sum::<usize>()
+            + input.records.capacity() * size_of::<RecordInput<'_>>()
+            + input.pool.entries.capacity() * size_of::<PooledEntry<'_>>()
+            + input.pool.values.capacity() * size_of::<PooledValue<'_>>()
+    }
+
+    /// Builds records covering every body form, duplicate keys, empty
+    /// values, a Card reference, and records projection rejects.
+    fn edge_logs_request() -> ExportLogsServiceRequest {
+        let card = "0190f7a4-1c2b-7d3e-8f40-123456789abc";
+        let body = |value: Option<any_value::Value>| Some(AnyValue { value });
+        let good = LogRecord {
+            body: body(Some(any_value::Value::StringValue("text".to_owned()))),
+            attributes: vec![
+                attribute("dup", any_value::Value::IntValue(1)),
+                KeyValue {
+                    key: "absent".to_owned(),
+                    value: None,
+                },
+                KeyValue {
+                    key: "unset".to_owned(),
+                    value: Some(AnyValue { value: None }),
+                },
+                KeyValue {
+                    key: "deep".to_owned(),
+                    value: Some(alternating_value(7)),
+                },
+                attribute(
+                    "wyrd.card_uid",
+                    any_value::Value::StringValue(card.to_owned()),
+                ),
+                attribute(
+                    "exception.type",
+                    any_value::Value::StringValue("Boom".to_owned()),
+                ),
+                attribute("dup", any_value::Value::StringValue("last".to_owned())),
+            ],
+            ..LogRecord::default()
+        };
+        let forms = [
+            None,
+            body(None),
+            Some(alternating_value(8)),
+            body(Some(any_value::Value::DoubleValue(-0.0))),
+            body(Some(any_value::Value::BytesValue(vec![0, 0xff]))),
+            body(Some(any_value::Value::DoubleValue(f64::NAN))),
+            body(Some(any_value::Value::StringValue("x".repeat(70_000)))),
+        ];
+        let mut records: Vec<LogRecord> = forms
+            .into_iter()
+            .map(|body| LogRecord {
+                body,
+                ..good.clone()
+            })
+            .collect();
+        records.push(LogRecord {
+            trace_id: vec![0; 3],
+            ..good.clone()
+        });
+        records.push(good);
+        ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![ScopeLogs {
+                    log_records: records,
+                    ..ScopeLogs::default()
+                }],
+                ..ResourceLogs::default()
+            }],
+        }
+    }
+
+    /// Proves a borrowed decode projects and attributes exactly like the
+    /// generated decode of the same wire, within the generated reservation.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture falls back or either projection differs.
+    #[test]
+    fn borrowed_log_decode_projects_like_generated_decode() {
+        use vala_bifrost_redux::gate::attribution::log_card_uids;
+        use vala_bifrost_redux::tables::logs::project_log_input;
+        let mut rich = rich_logs_request().encode_to_vec();
+        rich.extend_from_slice(&[0xa0, 0x06, 0x01]);
+        let many = ExportLogsServiceRequest {
+            resource_logs: (0..3)
+                .map(|resource| ResourceLogs {
+                    resource: Some(Resource {
+                        attributes: vec![attribute(
+                            "service.name",
+                            any_value::Value::StringValue(format!("service-{resource}")),
+                        )],
+                        ..Resource::default()
+                    }),
+                    scope_logs: (0..2)
+                        .map(|scope| ScopeLogs {
+                            scope: Some(InstrumentationScope {
+                                name: format!("scope-{scope}"),
+                                ..InstrumentationScope::default()
+                            }),
+                            log_records: (0..4)
+                                .map(|record| LogRecord {
+                                    severity_text: format!("level-{record}"),
+                                    attributes: vec![attribute(
+                                        "index",
+                                        any_value::Value::IntValue(record),
+                                    )],
+                                    ..LogRecord::default()
+                                })
+                                .collect(),
+                            ..ScopeLogs::default()
+                        })
+                        .collect(),
+                    ..ResourceLogs::default()
+                })
+                .collect(),
+        };
+        for bytes in [
+            rich,
+            many.encode_to_vec(),
+            edge_logs_request().encode_to_vec(),
+            Vec::new(),
+        ] {
+            let generated = decode_logs_protobuf(&bytes).expect("fixture decodes");
+            let generated_input = LogInput::from_generated(&generated.resource_logs);
+            let (plan, counts) =
+                preflight_logs_protobuf(&bytes, vala_bifrost_redux::gate::limits::OTLP_WIRE_LIMITS)
+                    .expect("fixture preflights");
+            let borrowed = decode_log_input(&bytes, counts).expect("fixture borrows");
+            assert!(
+                borrowed_log_capacity(&borrowed) <= plan.reservation_bytes(),
+                "a borrowed decode must fit the generated reservation"
+            );
+            let (expected, expected_outcome) =
+                project_log_input(&generated_input, None, usize::MAX).expect("generated projects");
+            let (batch, outcome) =
+                project_log_input(&borrowed, None, usize::MAX).expect("borrowed projects");
+            assert_eq!(batch, expected);
+            assert_eq!(outcome.accepted_records, expected_outcome.accepted_records);
+            assert_eq!(outcome.rejected_records, expected_outcome.rejected_records);
+            assert_eq!(
+                outcome.rejection_message,
+                expected_outcome.rejection_message
+            );
+            assert_eq!(log_card_uids(&borrowed), log_card_uids(&generated_input));
+        }
+    }
+
+    /// Proves wire that protobuf must merge, or that the generated decoder
+    /// refuses, is left to the generated decoder.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the borrowed decoder accepts a merge or refused encoding.
+    #[test]
+    fn borrowed_log_decode_defers_merges_and_refusals() {
+        let text = |value: &str| {
+            AnyValue {
+                value: Some(any_value::Value::StringValue(value.to_owned())),
+            }
+            .encode_to_vec()
+        };
+        let export = |record: &[u8]| field(1, &field(2, &field(2, record)));
+        let two_bodies = export(&[field(5, &text("a")), field(5, &text("b"))].concat());
+        let two_oneofs = export(&field(5, &[text("a"), vec![0x18, 0x03]].concat()));
+        let two_values = export(&field(
+            6,
+            &[field(1, b"key"), field(2, &text("a")), field(2, &text("b"))].concat(),
+        ));
+        let resource = Resource::default().encode_to_vec();
+        let two_resources = field(
+            1,
+            &[
+                field(1, &resource),
+                field(1, &resource),
+                field(2, &field(2, &[])),
+            ]
+            .concat(),
+        );
+        let scope = InstrumentationScope::default().encode_to_vec();
+        let two_scopes = field(
+            1,
+            &field(
+                2,
+                &[field(1, &scope), field(1, &scope), field(2, &[])].concat(),
+            ),
+        );
+        for bytes in [
+            two_bodies,
+            two_oneofs,
+            two_values,
+            two_resources,
+            two_scopes,
+        ] {
+            decode_logs_protobuf(&bytes).expect("merge fixture decodes");
+            assert!(decode_log_input(&bytes, LogPoolCounts::default()).is_none());
+        }
+        let invalid_text = export(&field(3, &[0xff]));
+        assert!(decode_logs_protobuf(&invalid_text).is_err());
+        assert!(decode_log_input(&invalid_text, LogPoolCounts::default()).is_none());
     }
 
     /// Appends one canonical protobuf varint.

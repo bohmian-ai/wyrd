@@ -108,6 +108,16 @@ pub(crate) fn children_cpu_usec(parent: u32) -> Option<u64> {
     )
 }
 
+/// When process `pid` started, seconds since the Unix epoch, or `None`
+/// when it is gone; with the PID it names one process even after the OS
+/// reuses the number.
+pub(crate) fn process_started(pid: u32) -> Option<u64> {
+    let pid = Pid::from_u32(pid);
+    let mut system = System::new();
+    refresh_process(&mut system, pid, ProcessRefreshKind::nothing());
+    system.process(pid).map(sysinfo::Process::start_time)
+}
+
 /// Seconds of user plus system CPU this process has used, or `None` when
 /// unreadable.
 pub(crate) fn self_cpu_seconds() -> Option<f64> {

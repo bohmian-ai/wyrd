@@ -5,9 +5,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::scribe::wal::ContentHasher;
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Utc};
-use sha2::{Digest, Sha256};
 
 use tokio::runtime::Handle;
 use tokio::sync::Notify;
@@ -880,7 +880,7 @@ struct ShardOwner {
     pending: Arc<AtomicUsize>,
     /// Notification used by runtime drains to await accepted work.
     drained: Arc<Notify>,
-    /// Pod-wide index of fenced, visible batches this owner records into.
+    /// Pod-wide index this owner records its own committed, visible batches into.
     committed: Arc<crate::scribe::committed_batches::CommittedBatches>,
     /// One-shot retirement release fault used only by deterministic owner tests.
     #[cfg(test)]
@@ -922,7 +922,7 @@ pub(crate) struct ScribeShardRuntime {
     drained: Arc<Notify>,
     /// Whether external shard admission has closed.
     closed: AtomicBool,
-    /// Batches every owner fenced and made visible, consulted by the ingress
+    /// Batches this pod's owners committed and made visible, consulted by the ingress
     /// to answer an honest retry without re-entering a shard.
     committed: Arc<crate::scribe::committed_batches::CommittedBatches>,
     /// Owner acknowledgements received through the graceful flush path.
@@ -1189,6 +1189,11 @@ impl ScribeShardRuntime {
     #[must_use]
     pub(crate) fn shard_count(&self) -> usize {
         self.senders.len()
+    }
+
+    /// This pod's committed-batch mirror, shared with receipt cleanup.
+    pub(crate) fn committed(&self) -> Arc<crate::scribe::committed_batches::CommittedBatches> {
+        Arc::clone(&self.committed)
     }
 
     /// Rows of `append` when it is an honest retry of a batch some owner
@@ -1463,12 +1468,7 @@ impl ShardOwner {
                     self.publish_snapshot();
                 }
             }
-            while let Ok(command) = self.receiver.try_recv() {
-                if self.handle_command(command).await {
-                    self.shutting_down = true;
-                }
-                self.publish_snapshot();
-            }
+            self.drain_mailbox().await;
             let group = self.scheduler.pop_group();
             self.scheduler.record_closed(&group);
             if !group.is_empty() {
@@ -1494,12 +1494,7 @@ impl ShardOwner {
             tokio::select! {
                 command = self.receiver.recv() => {
                     match command {
-                        Some(command) => {
-                            if self.handle_command(command).await {
-                                self.shutting_down = true;
-                            }
-                            self.publish_snapshot();
-                        }
+                        Some(command) => self.apply_command(command).await,
                         None => break,
                     }
                 }
@@ -1509,6 +1504,29 @@ impl ShardOwner {
                     }
                 }
             }
+        }
+    }
+
+    /// Applies every command already queued in the mailbox.
+    ///
+    /// Queuing an append changes no memtable state, so it publishes nothing;
+    /// its rows reach inspection in the group's publication before its ACK.
+    /// Every control command still publishes right after it applies.
+    async fn drain_mailbox(&mut self) {
+        while let Ok(command) = self.receiver.try_recv() {
+            self.apply_command(command).await;
+        }
+    }
+
+    /// Applies one mailbox command, publishing inspection after a control
+    /// command; see [`Self::drain_mailbox`].
+    async fn apply_command(&mut self, command: ShardCommand) {
+        let control = !matches!(command, ShardCommand::Append(_));
+        if self.handle_command(command).await {
+            self.shutting_down = true;
+        }
+        if control {
+            self.publish_snapshot();
         }
     }
 
@@ -1920,47 +1938,20 @@ impl ShardOwner {
             });
         }
         let commits = replayed.commits.clone();
-        let fenced_only = crate::tables::builtin_table(
-            replayed
-                .seal_key
-                .table
-                .namespace
-                .as_str()
-                .strip_prefix("bifrost.")
-                .unwrap_or_default(),
-            &replayed.seal_key.table.name,
-        )
-        .is_some_and(|definition| definition.fenced_only);
         let mut suppressed = Vec::new();
         for commit in &commits {
             match self.resolve_replayed_commit(replayed, commit).await? {
-                // A fenced-only table's batch is accepted only with its
-                // fence, so an unfenced one was never accepted or ACKed.
+                // Only an accepted batch was ever acknowledged, so an
+                // unfenced attempt restores nothing, and neither does a
+                // later attempt of an accepted batch.
                 vala_sql::queries::scribe_batch_commits::ScribeBatchReplayResolution::Unfenced
-                    if fenced_only =>
-                {
+                | vala_sql::queries::scribe_batch_commits::ScribeBatchReplayResolution::Suppress => {
                     suppressed.push((
                         commit.batch_id,
                         commit.wal_lsn_min.as_u64()..=commit.wal_lsn_max.as_u64(),
                     ));
                 }
-                vala_sql::queries::scribe_batch_commits::ScribeBatchReplayResolution::Suppress => {
-                    suppressed.push((
-                        commit.batch_id,
-                        commit.wal_lsn_min.as_u64()..=commit.wal_lsn_max.as_u64(),
-                    ));
-                }
-                vala_sql::queries::scribe_batch_commits::ScribeBatchReplayResolution::Unfenced
-                    if commit.contested =>
-                {
-                    return Err(ScribeError::Internal {
-                        detail: "WAL replay holds differing attempts at an unfenced batch id"
-                            .to_owned(),
-                    });
-                }
-                vala_sql::queries::scribe_batch_commits::ScribeBatchReplayResolution::Unfenced
-                | vala_sql::queries::scribe_batch_commits::ScribeBatchReplayResolution::Restore => {
-                }
+                vala_sql::queries::scribe_batch_commits::ScribeBatchReplayResolution::Restore => {}
             }
         }
         suppressed.extend(
@@ -3177,13 +3168,13 @@ struct DurableSlice {
     /// Stable Arrow schema identity for logical retry comparison.
     schema_fingerprint: [u8; 32],
     /// Stable Arrow data digest for logical retry comparison.
-    data_digest: [u8; 32],
+    data_digest: crate::scribe::wal::ContentDigest,
     /// Stable Arrow data length for logical retry comparison.
     data_len: u32,
     /// WAL sequence number assigned to the durable append.
     lsn: crate::scribe::wal::WalLsn,
-    /// SHA-256 digest of this exact WAL slice payload.
-    payload_digest: [u8; 32],
+    /// XXH3-128 digest of this exact WAL slice payload.
+    payload_digest: crate::scribe::wal::ContentDigest,
     /// Exact WAL slice payload length.
     payload_len: u32,
     /// Zero-based ordinal in the closed batch slice set.
@@ -3201,8 +3192,8 @@ struct DurableSlice {
 struct WalSliceState {
     /// WAL sequence number that can be reused without another append.
     lsn: crate::scribe::wal::WalLsn,
-    /// SHA-256 digest of the exact durable slice payload.
-    payload_digest: [u8; 32],
+    /// XXH3-128 digest of the exact durable slice payload.
+    payload_digest: crate::scribe::wal::ContentDigest,
     /// Exact durable slice payload length.
     payload_len: u32,
     /// Stable ordinal in the committed batch slice set.
@@ -3226,13 +3217,13 @@ struct BatchCommitIdentity {
     /// This is a WAL integrity fact: it authorizes exactly the slices that were
     /// fsynced, so a substituted or reordered slice cannot be closed by a valid
     /// terminal record.
-    wal_digest: [u8; 32],
+    wal_digest: crate::scribe::wal::ContentDigest,
     /// Digest over stable logical row identity, stored in the durable SQL fence.
     ///
     /// This is a client-visible idempotency fact: it must be reproducible by an
     /// honest retry of the same batch, so it binds only the rows and their
     /// schema and never the per-attempt managed columns or WAL coordinates.
-    logical_digest: [u8; 32],
+    logical_digest: crate::scribe::wal::ContentDigest,
 }
 
 /// Most Variant conversions of one group that run on the ingress lane at once.
@@ -3559,7 +3550,12 @@ struct GroupWalState {
     /// `prepared`; recorded into the pod-wide index once the group's rows are
     /// visible. The version is captured at fence time because insertion
     /// moves the slices that carry it.
-    fenced: Vec<(usize, [u8; 32], u32, wyrd_spec::vala::ids::TableVersion)>,
+    fenced: Vec<(
+        usize,
+        crate::scribe::wal::ContentDigest,
+        u32,
+        wyrd_spec::vala::ids::TableVersion,
+    )>,
 }
 
 /// Owns one WAL/SQL-committed group until every retained batch is query-visible.
@@ -3607,7 +3603,7 @@ impl ShardOwner {
         record_group_size("requests", group.len());
         let rotating = Instant::now();
         self.retry_retained_post_commit()?;
-        self.rotate_before_append_if_needed(&group)?;
+        self.rotate_before_append_if_needed(&group).await?;
         record_group_stage("rotate", rotating.elapsed());
         let stages = GroupStages::default();
         let write = stages.write.timer();
@@ -3719,19 +3715,23 @@ impl ShardOwner {
         record_group_size("wal_bytes", total(|slice| slice.payload_len as usize));
     }
 
-    /// Records every batch this group fenced into the pod-wide index, once its
-    /// rows are query-visible, so a later honest retry is answered at ingress.
+    /// Records every batch this group committed into the pod-wide index, once
+    /// its rows are query-visible, so a later honest retry is answered at
+    /// ingress.
+    ///
+    /// Only acceptances this group made are recorded. A spent batch, whose
+    /// fence another attempt already holds (already committed, accepted under
+    /// another version, or conflicted), is skipped: its receipt may belong to
+    /// another pod, whose cleaner forgets only its own index, so recording it
+    /// here could acknowledge the identity after that receipt is deleted. An
+    /// entry this pod recorded earlier is left as it is.
     ///
     /// Only the successful path records: a group that failed after its sync
     /// stays retained for serial retry and records nothing until it settles.
     fn record_committed(&self, state: &GroupWalState) {
         for &(index, logical_digest, slice_count, table_version) in &state.fenced {
             let append = &state.prepared[index];
-            if state
-                .accepted_under
-                .contains_key(append.batch_id.as_bytes())
-                || state.conflicted.contains(append.batch_id.as_bytes())
-            {
+            if state.spent_batch_ids.contains(append.batch_id.as_bytes()) {
                 continue;
             }
             self.committed.record(
@@ -3810,7 +3810,7 @@ impl ShardOwner {
     ///
     /// Returns a sizing, WAL close/retention, memtable, binding, or accounting
     /// error before the incoming group mutates WAL.
-    fn rotate_before_append_if_needed(
+    async fn rotate_before_append_if_needed(
         &mut self,
         group: &[PreparedAppend],
     ) -> Result<(), ScribeError> {
@@ -3878,7 +3878,7 @@ impl ShardOwner {
         } else {
             "memtable_arrow"
         };
-        let rotation_result = self.rotate_active_generation();
+        let rotation_result = self.rotate_active_generation().await;
         if let Err(error) = &rotation_result {
             tracing::warn!(
                 shard_id = self.id,
@@ -3897,7 +3897,7 @@ impl ShardOwner {
     /// Returns when WAL retention, atomic all-key freeze, accounting transfer,
     /// binding resolution, or queue construction fails. The incoming append has
     /// not started when this method is called.
-    fn rotate_active_generation(&mut self) -> Result<(), ScribeError> {
+    async fn rotate_active_generation(&mut self) -> Result<(), ScribeError> {
         // Resolve every member and prove the complete accounting transfer
         // before closing the only active WAL. Nothing below this point may
         // discover an ordinary retryable preparation failure after durable
@@ -3919,7 +3919,7 @@ impl ShardOwner {
         self.memory_ownership
             .preflight_move_active_to_immutable(active_bytes)?;
 
-        let result = self.rotate_active_generation_after_preflight();
+        let result = self.rotate_active_generation_after_preflight().await;
         if result.is_err() {
             // Once WAL close begins, retrying as a normal active generation
             // could duplicate cohort ownership. Preserve every durable file
@@ -3932,18 +3932,34 @@ impl ShardOwner {
 
     /// Completes an automatic rotation after all retryable preparation passed.
     ///
+    /// The active WAL generation closes, and an unread closed cohort retires,
+    /// on the WAL IO lane: both fsync, and this owner runs on an async worker.
+    /// The owner awaits each before freezing, so no append reaches the closing
+    /// generation.
+    ///
     /// # Errors
     ///
     /// Returns a fail-stop error for WAL close/retention, all-key freeze,
     /// accounting transfer, or queue installation. The caller poisons
     /// readiness and leaves WAL/staged state intact for deterministic replay.
-    fn rotate_active_generation_after_preflight(&mut self) -> Result<(), ScribeError> {
+    async fn rotate_active_generation_after_preflight(&mut self) -> Result<(), ScribeError> {
         let mut segment_refs = self
             .wal_segments
             .values()
             .flat_map(|segments| segments.values().map(|segment| segment.reference()))
             .collect::<Vec<_>>();
-        if let Some(closed) = self.wal_handle.close_active_generation()?
+        let ScribeWalIoResult::GenerationClosed(closed) = self
+            .wal_io
+            .submit(ScribeWalIoOp::CloseActiveGeneration {
+                wal: self.wal_handle.clone(),
+            })
+            .await?
+        else {
+            return Err(ScribeError::Internal {
+                detail: "WAL IO lane returned the wrong generation close result".to_owned(),
+            });
+        };
+        if let Some(closed) = closed
             && !segment_refs
                 .iter()
                 .any(|segment| segment.path == closed.path)
@@ -3998,7 +4014,12 @@ impl ShardOwner {
             // above forever: the closed bytes would never become deletable and
             // WAL disk pressure could never clear. Release the reference
             // instead, which is exactly what a terminal cohort would have done.
-            self.wal_handle.retire_segments(&segment_refs)?;
+            self.wal_io
+                .submit(ScribeWalIoOp::RetireWal {
+                    wal: self.wal_handle.clone(),
+                    segments: segment_refs.clone(),
+                })
+                .await?;
         } else {
             self.rotation_cohorts.push_back(ShardRotationCohort {
                 shard_id: self.id,
@@ -4111,7 +4132,7 @@ impl ShardOwner {
                 detail: "cannot commit an incomplete or unordered WAL slice set".to_owned(),
             });
         }
-        let mut wal_digest = Sha256::new();
+        let mut wal_digest = ContentHasher::new();
         let mut logical = crate::scribe::preprocess::LogicalBatchDigest::new();
         for slice_index in 0..slice_count {
             let slice = state
@@ -4139,7 +4160,7 @@ impl ShardOwner {
         Ok(Some(BatchCommitIdentity {
             first_index,
             slice_count,
-            wal_digest: wal_digest.finalize().into(),
+            wal_digest: wal_digest.finish(),
             logical_digest: logical.finish(),
         }))
     }
@@ -4228,6 +4249,18 @@ impl ShardOwner {
             }
         }
         commit.done();
+        // A batch's partitions seal and retire independently, so each keeps
+        // every segment the group wrote: otherwise retiring one partition
+        // could free a segment still holding another's slice or the COMMIT.
+        // ponytail: group-wide rather than per batch; narrow it if retained
+        // WAL grows.
+        for slice in &state.durable {
+            let held = self.wal_segments.entry(slice.seal_key.clone()).or_default();
+            for (path, segment) in &group_segments {
+                held.entry(path.clone())
+                    .or_insert_with(|| Arc::clone(segment));
+            }
+        }
         let sync = stages.sync.timer();
         self.sync_group(&group_segments).await?;
         sync.done();
@@ -4910,7 +4943,7 @@ impl ShardOwner {
                 data_digest: wal_append.logical_data_digest,
                 data_len: wal_append.logical_data_len,
                 lsn: crate::scribe::wal::WalLsn::ZERO,
-                payload_digest: [0; 32],
+                payload_digest: [0; crate::scribe::wal::DIGEST_BYTES],
                 payload_len: 0,
                 slice_index: wal_append.slice_index,
                 slice_count: wal_append.slice_count,
@@ -5409,8 +5442,8 @@ mod tests {
     ///
     /// Panics if the isolated WAL, memtable, root ownership, or owner rotation
     /// cannot be constructed and settled for either threshold case.
-    #[test]
-    fn distinct_wal_and_memtable_thresholds_drive_owner_rotation() {
+    #[tokio::test]
+    async fn distinct_wal_and_memtable_thresholds_drive_owner_rotation() {
         for (wal_target, memtable_target) in [(1, usize::MAX), (u64::MAX, 1)] {
             let key = owner_key();
             let memtable = Memtable::new();
@@ -5446,6 +5479,7 @@ mod tests {
 
             owner
                 .rotate_before_append_if_needed(&[])
+                .await
                 .expect("threshold rotates owner");
 
             assert_eq!(owner.rotation_cohorts.len(), 1);
@@ -5597,8 +5631,8 @@ mod tests {
     ///
     /// Panics when isolated owners cannot be built or the all-key rotation does
     /// not preserve one complete cohort before admitting a fresh generation.
-    #[test]
-    fn shard_owner_rotation_swaps_complete_generation_before_fresh_append() {
+    #[tokio::test]
+    async fn shard_owner_rotation_swaps_complete_generation_before_fresh_append() {
         let first = owner_key();
         let second = SealKey::new(
             first.tenant,
@@ -5631,11 +5665,18 @@ mod tests {
             .memory_ownership
             .reserve_active(active_bytes)
             .expect("active memory ownership");
+        let closes_before = owner.wal_io.close_submissions_for_test();
 
         owner
             .rotate_active_generation()
+            .await
             .expect("automatic all-key rotation");
 
+        assert_eq!(
+            owner.wal_io.close_submissions_for_test(),
+            closes_before + 1,
+            "the WAL generation closes on the WAL IO lane, not the owner's async worker"
+        );
         let stats = owner.memtable.stats().expect("rotated statistics");
         assert_eq!(stats.writable_buckets, 0);
         assert_eq!(stats.immutable_generations, 2);
@@ -5684,8 +5725,8 @@ mod tests {
     ///
     /// Panics when the isolated owner cannot append its WAL records, transfer
     /// active ownership, rotate all keys, reset its clock, or admit fresh state.
-    #[test]
-    fn automatic_age_rotation_is_whole_shard_below_high_water() {
+    #[tokio::test]
+    async fn automatic_age_rotation_is_whole_shard_below_high_water() {
         let first = owner_key();
         let second = SealKey::new(
             first.tenant,
@@ -5730,6 +5771,7 @@ mod tests {
 
         owner
             .rotate_before_append_if_needed(&[])
+            .await
             .expect("automatic age owner rotation");
 
         assert_eq!(owner.rotation_cohorts.len(), 1);
@@ -7179,7 +7221,7 @@ mod tests {
         let retry = [2_u8; 16];
         let commit = |batch_id, lsn: u64| crate::scribe::replay::ReplayedCommitIdentity {
             batch_id,
-            slice_set_digest: [3; 32],
+            slice_set_digest: [3; 16],
             slice_count: 1,
             segment_sequence: 1,
             wal_lsn_min: WalLsn::new(lsn),
@@ -7189,7 +7231,7 @@ mod tests {
         };
         let meta = |batch_id, lsn| crate::scribe::replay::ReplayedAppendMeta {
             batch_id,
-            payload_digest: [0; 32],
+            payload_digest: [0; 16],
             payload_len: 0,
             slice_count: 1,
             wal_lsn: WalLsn::new(lsn),
@@ -7229,7 +7271,7 @@ mod tests {
         let key = owner_key();
         let meta = |marker, lsn| crate::scribe::replay::ReplayedAppendMeta {
             batch_id: [marker; 16],
-            payload_digest: [0; 32],
+            payload_digest: [0; 16],
             payload_len: 0,
             slice_count: 1,
             wal_lsn: WalLsn::new(lsn),
@@ -7342,7 +7384,7 @@ mod tests {
         let key = SealKey::new(tenant, table, a);
         let meta = |marker, lsn| crate::scribe::replay::ReplayedAppendMeta {
             batch_id: [marker; 16],
-            payload_digest: [0; 32],
+            payload_digest: [0; 16],
             payload_len: 0,
             slice_count: 2,
             wal_lsn: WalLsn::new(lsn),
@@ -7430,9 +7472,9 @@ mod tests {
         ScribeAppendMeta {
             batch_id: *uuid::Uuid::now_v7().as_bytes(),
             schema_fingerprint: [0; 32],
-            data_digest: [0; 32],
+            data_digest: [0; 16],
             data_len: 0,
-            payload_digest: [0; 32],
+            payload_digest: [0; 16],
             payload_len: 0,
             slice_index: 0,
             slice_count: 1,
@@ -7531,6 +7573,179 @@ mod tests {
         (owner, budget, command_tx, completion_tx, pressure_tx)
     }
 
+    /// A mailbox drain of append-only commands leaves the published inspection
+    /// snapshot alone, because queuing an append changes no memtable state; a
+    /// control command in the same mailbox still publishes the current state.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an append-only drain republishes the snapshot, the appends are
+    /// not queued, or a drained control command does not publish.
+    #[tokio::test]
+    async fn mailbox_drain_publishes_inspection_only_for_control_commands() {
+        let key = owner_key();
+        let memtable = Memtable::new();
+        memtable
+            .insert(&key, owner_meta(&key), owner_batch())
+            .expect("owner insert");
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+        let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+        let (mut owner, budget) =
+            owner_for_completion_test_with_budget(memtable, &wal, wal_handle, stream);
+        let (commands, receiver) = mpsc::channel(4);
+        owner.receiver = receiver;
+        let stale = || ShardMemtableSnapshot {
+            stats: MemtableStats {
+                writable_rows: usize::MAX,
+                ..MemtableStats::default()
+            },
+            ..ShardMemtableSnapshot::default()
+        };
+        let published_rows = |owner: &ShardOwner| {
+            owner
+                .snapshot
+                .lock()
+                .expect("snapshot lock")
+                .stats
+                .writable_rows
+        };
+        *owner.snapshot.lock().expect("snapshot lock") = stale();
+
+        for _ in 0..2 {
+            commands
+                .try_send(ShardCommand::Append(Box::new(
+                    prepared_append_for_group_test(&budget),
+                )))
+                .expect("queue append");
+        }
+        owner.drain_mailbox().await;
+
+        assert_eq!(
+            owner.scheduler.pop_group().len(),
+            2,
+            "both appends are queued"
+        );
+        assert_eq!(
+            published_rows(&owner),
+            usize::MAX,
+            "appends do not republish"
+        );
+
+        let (response, flushed) = tokio::sync::oneshot::channel();
+        commands
+            .try_send(ShardCommand::FlushAll { response })
+            .expect("queue flush");
+        owner.drain_mailbox().await;
+
+        let _ = flushed.await.expect("flush response");
+        let current = owner
+            .memtable
+            .stats()
+            .expect("memtable stats")
+            .writable_rows;
+        assert_ne!(current, usize::MAX);
+        assert_eq!(
+            published_rows(&owner),
+            current,
+            "the flush publishes current state"
+        );
+    }
+
+    /// Proves the pod-wide index records only batches this group committed:
+    /// a retry the durable fence already held under another attempt, which
+    /// another pod may own and delete, never enters it, and a batch this pod
+    /// cached earlier stays matched when a later attempt of it is spent.
+    #[test]
+    fn record_committed_skips_spent_retries_and_keeps_cached_acceptances() {
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+        let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+        let (owner, budget) =
+            owner_for_completion_test_with_budget(Memtable::new(), &wal, wal_handle, stream);
+        let key = owner_key();
+        let committed = prepared_append_for_key(&budget, key.clone(), uuid::Uuid::now_v7());
+        let retried = prepared_append_for_key(&budget, key.clone(), uuid::Uuid::now_v7());
+        let cached = prepared_append_for_key(&budget, key.clone(), uuid::Uuid::now_v7());
+        let fence = |index: usize, append: &PreparedAppend| {
+            let (digest, slices, _) = append.logical_identity().expect("logical identity");
+            (
+                index,
+                digest,
+                slices,
+                append.table_version().expect("table version"),
+            )
+        };
+        let identity = |append: &PreparedAppend| {
+            let (_, digest, slices, version) = fence(0, append);
+            crate::scribe::committed_batches::CommittedBatch {
+                table_fqn: append.table.fqn(),
+                table_version: version,
+                logical_digest: digest,
+                slice_count: slices,
+            }
+        };
+        owner
+            .committed
+            .record(cached.tenant, cached.batch_id, identity(&cached));
+        let state = GroupWalState {
+            fenced: vec![fence(0, &committed), fence(1, &retried), fence(2, &cached)],
+            spent_batch_ids: HashSet::from([
+                *retried.batch_id.as_bytes(),
+                *cached.batch_id.as_bytes(),
+            ]),
+            prepared: vec![committed, retried, cached],
+            durable: Vec::new(),
+            touched: HashMap::new(),
+            rows_by_append: HashMap::new(),
+            accepted_under: HashMap::new(),
+            conflicted: HashSet::new(),
+            inserted_batch_ids: HashSet::new(),
+        };
+
+        owner.record_committed(&state);
+
+        let [committed, retried, cached] = &state.prepared[..] else {
+            panic!("three prepared appends");
+        };
+        assert!(
+            owner
+                .committed
+                .contains(committed.tenant, committed.batch_id, &identity(committed)),
+            "a locally committed batch is matched exactly"
+        );
+        assert!(
+            !owner.committed.knows(retried.tenant, retried.batch_id),
+            "a spent retry never creates an index entry"
+        );
+        assert!(
+            owner
+                .committed
+                .contains(cached.tenant, cached.batch_id, &identity(cached)),
+            "an earlier local acceptance stays matched after a spent attempt"
+        );
+    }
+
     /// Proves shard insertion seals a full bucket before a crossing append lands.
     #[test]
     fn insert_group_pre_seals_full_bucket() {
@@ -7573,10 +7788,10 @@ mod tests {
                     active_reserved: true,
                     batch_id: next_id,
                     schema_fingerprint: [0; 32],
-                    data_digest: [0; 32],
+                    data_digest: [0; 16],
                     data_len: 0,
                     lsn: WalLsn::new(2),
-                    payload_digest: [0; 32],
+                    payload_digest: [0; 16],
                     payload_len: 0,
                     slice_index: 0,
                     slice_count: 1,
@@ -7758,8 +7973,8 @@ mod tests {
         let memory = budget
             .try_reserve_ingress(MemoryCategory::Raw, initial_bytes)
             .expect("ingress memory");
-        let mut prepared =
-            crate::scribe::preprocess::prepare_append(crate::scribe::preprocess::AdmittedAppend {
+        let mut prepared = crate::scribe::preprocess::prepare_append(
+            crate::scribe::preprocess::AdmittedAppend {
                 batch_id,
                 request_id: uuid::Uuid::now_v7(),
                 ingested_at_micros: 0,
@@ -7775,8 +7990,10 @@ mod tests {
                 queued_at: std::time::Instant::now(),
                 durable_ack: None,
                 profile: Arc::default(),
-            })
-            .expect("prepared append");
+            },
+            &crate::scribe::preprocess::EncoderContexts::default(),
+        )
+        .expect("prepared append");
         let prepared_bytes = prepared.prepared_bytes;
         prepared
             .memory
@@ -8239,7 +8456,7 @@ mod tests {
             )
             .expect("capture reads");
         let mut values = Vec::new();
-        for readable in read.batches {
+        for readable in read.evaluated().expect("batches evaluate") {
             let attrs = readable.batch.column_by_name("attrs").expect("attrs");
             assert_eq!(
                 attrs.data_type(),
@@ -8968,21 +9185,24 @@ mod tests {
         );
     }
 
-    /// A crash after the group COMMIT sync but before the last fence replays once.
+    /// A crash after the group COMMIT sync but before the last fence restores
+    /// nothing, and the producer's retry writes every batch once.
     ///
     /// An uncommitted row holds the third batch's fence key, so the real owner
     /// syncs all three COMMIT records and blocks inside the group's one fence
     /// transaction. Dropping the owner there is the crash: no ACK was delivered
     /// and, because the group's fences commit together, none is durable. A
-    /// next-epoch owner replays the same WAL against `PostgreSQL`, and a retry
-    /// of the same IDs acknowledges every batch without a second row.
+    /// next-epoch owner replays the same WAL against `PostgreSQL` and restores
+    /// none of the never-accepted attempts; a retry of the same IDs
+    /// acknowledges every batch and holds each row once.
     ///
     /// # Panics
     ///
     /// Panics if the fixture cannot start, the group does not block on the last
-    /// fence, any ACK precedes the crash, replay fails, or row counts diverge.
+    /// fence, any ACK precedes the crash, replay fails, replay restores a row,
+    /// or the retry does not hold each row once.
     #[tokio::test]
-    async fn group_commit_crash_between_sync_and_fence_replays() {
+    async fn group_commit_crash_between_sync_and_fence_restores_nothing() {
         let database = wyrd_dev_fixtures::pg::PgFixture::start()
             .await
             .expect("Postgres fixture");
@@ -9029,7 +9249,7 @@ mod tests {
         .bind(key.tenant.as_uuid())
         .bind(key.table.fqn())
         .bind(batch_ids[2])
-        .bind([0_u8; 32].as_slice())
+        .bind([0_u8; 16].as_slice())
         .bind(node.as_uuid())
         .bind(uuid::Uuid::now_v7())
         .execute(&mut *blocker)
@@ -9075,7 +9295,7 @@ mod tests {
             let stats = owner.memtable.stats().expect("memtable stats");
             stats.writable_rows + stats.immutable_rows
         };
-        assert_eq!(rows(&owner), batch_ids.len());
+        assert_eq!(rows(&owner), 0, "a never-accepted attempt restores no rows");
 
         let (retry, acks) = acked_group_for_key(&budget, &key, &batch_ids);
         owner.process_group(retry).await.expect("same-ID retry");
@@ -9156,7 +9376,7 @@ mod tests {
             .bind(key.table.fqn())
             .bind(spent)
             .bind(accepted_version.get())
-            .bind([0xEE_u8; 32].as_slice())
+            .bind([0xEE_u8; 16].as_slice())
             .bind(uuid::Uuid::now_v7())
             .bind(uuid::Uuid::now_v7())
             .execute(&superuser)
@@ -10185,7 +10405,14 @@ mod tests {
             "a non-final holder keeps the charge"
         );
         assert_eq!(read.batches.len(), 1);
-        assert_eq!(read.batches[0].batch.num_rows(), 1);
+        assert_eq!(
+            read.batches[0]
+                .evaluate()
+                .expect("the batch evaluates")
+                .expect("its row is kept")
+                .num_rows(),
+            1
+        );
         drop(read);
         assert_eq!(
             budget.memory_snapshot().scribe_total_bytes,
@@ -10352,6 +10579,80 @@ mod tests {
         assert_eq!(token_after.seal_id, token_before.seal_id);
         assert_eq!(token_after.arrow_bytes, token_before.arrow_bytes);
         assert!(owner.memory_ownership.is_poisoned());
+    }
+
+    /// Every partition of a batch keeps every WAL segment the batch wrote.
+    ///
+    /// One batch spans two day partitions, and its records are large enough
+    /// that the WAL rolls between them. Each partition's active bucket must
+    /// hold both segments, so sealing and retiring either partition alone
+    /// never frees a segment the other partition's slice or the COMMIT still
+    /// needs for recovery.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the owner cannot append the batch, the batch does not span
+    /// two segments, or a partition holds fewer segments than the batch wrote.
+    #[tokio::test]
+    async fn every_partition_of_a_batch_keeps_all_its_segments() {
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::new(16 * 1024).expect("small WAL segments"),
+            )
+            .expect("WAL writer"),
+        );
+        let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+        let (mut owner, budget, _command_tx, _completion_tx, _pressure_tx) =
+            owner_for_completion_test_with_channels(Memtable::new(), &wal, wal_handle, stream);
+        let rows_per_day = 2_000_usize;
+        let day = |day: u32| {
+            NaiveDate::from_ymd_opt(2026, 7, day)
+                .and_then(|date| date.and_hms_opt(12, 0, 0))
+                .expect("valid event timestamp")
+                .and_utc()
+                .timestamp_micros()
+        };
+        let values = (0..2 * rows_per_day)
+            .map(|index| {
+                i64::try_from(index)
+                    .expect("row index fits i64")
+                    .wrapping_mul(0x1E37_79B9_7F4A_7C15)
+            })
+            .collect::<Vec<_>>();
+        let times = (0..2 * rows_per_day)
+            .map(|index| day(if index < rows_per_day { 24 } else { 25 }))
+            .collect::<Vec<_>>();
+        let rows = RecordBatch::try_new(
+            owner_prepared_batch().schema(),
+            vec![
+                Arc::new(Int64Array::from(values)),
+                Arc::new(TimestampMicrosecondArray::from(times).with_timezone("UTC")),
+            ],
+        )
+        .expect("two-day rows");
+        let append = prepared_append_with_rows(&budget, owner_key(), uuid::Uuid::now_v7(), rows);
+        owner.process_group(vec![append]).await.expect("append");
+
+        let segments = owner.wal_segments.values().collect::<Vec<_>>();
+        assert_eq!(segments.len(), 2, "the batch spans two partitions");
+        let written = segments
+            .iter()
+            .flat_map(|held| held.keys())
+            .collect::<HashSet<_>>();
+        assert!(written.len() > 1, "the WAL rolled inside the batch");
+        for held in segments {
+            assert_eq!(
+                held.keys().collect::<HashSet<_>>(),
+                written,
+                "a partition holds every segment of its batch"
+            );
+        }
     }
 
     /// A segment shared by selective members retires with the last of them.

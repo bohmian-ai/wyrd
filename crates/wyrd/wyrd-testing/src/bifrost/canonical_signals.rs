@@ -580,7 +580,6 @@ pub fn logs(schema: &SchemaRef, scope: &str, anchor_nanos: i64) -> RecordBatch {
         ("severity_number", Cell::Int32(17)),
         ("severity_text", Cell::Text("ERROR".to_owned())),
         ("event_name", Cell::Text("tool.retry.exhausted".to_owned())),
-        ("body", Cell::Variant(Value::String(LOG_BODY.to_owned()))),
         ("trace_id", Cell::Bytes(TRACE_ID.to_vec())),
         ("span_id", Cell::Bytes(CHILD_SPAN_ID.to_vec())),
         (

@@ -1196,7 +1196,7 @@ impl PointColumns {
             variant_column(self.resource_attributes.iter().map(Some)),
             u32_as_i64_column(self.resource_dropped_attributes_count),
             utf8_column(&self.resource_schema_url),
-            entity_refs_column(&self.entity_refs, &self.entity_ref_lengths)?,
+            entity_refs_column(self.entity_refs.iter(), &self.entity_ref_lengths)?,
             bool_column(self.scope_present),
             utf8_column(&self.scope_name),
             utf8_column(&self.scope_version),

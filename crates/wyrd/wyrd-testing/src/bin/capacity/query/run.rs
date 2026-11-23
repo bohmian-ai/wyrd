@@ -16,8 +16,9 @@ use arrow::datatypes::{DataType, Int64Type};
 use num_traits::ToPrimitive;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use wyrd_benchmark::Observation;
 use wyrd_client::bifrost::{BifrostClientError, BifrostOptions, TableConfig};
-use wyrd_client::transport::trace::{benchmark_headers, with_benchmark_labels};
+use wyrd_client::transport::trace::{benchmark_cohort, benchmark_headers, with_benchmark_labels};
 use wyrd_client::{Bifrost, WyrdClient};
 use wyrd_spec::vala::api::{BifrostQueryRequest, QueryTerminalOutcome};
 use wyrd_testing::release_server::LocalServer;
@@ -188,30 +189,55 @@ pub enum Sender {
     Ui(Otlp, Journey),
 }
 
+/// The most closed-loop writers any step runs, and so the HTTP/2
+/// connections [`Otlp::connect`] opens: one per writer, as that many
+/// independent OpenTelemetry SDK exporters would hold.
+pub const OTLP_CONNECTIONS: usize = 64;
+
 /// The server's OTLP gRPC collector, reached with the client's exchanged
 /// bearer as an application's OpenTelemetry SDK exporter would.
+///
+/// Holds [`OTLP_CONNECTIONS`] connections opened before any window and
+/// sends on the one its `slot` selects, so concurrent writers never share an
+/// HTTP/2 connection's single dispatch task.
 #[derive(Clone)]
 pub struct Otlp {
-    /// The connected gRPC channel.
-    channel: Channel,
+    /// The connected gRPC channels, one HTTP/2 connection each.
+    channels: Arc<[Channel]>,
+    /// The index of the channel this handle sends on.
+    slot: usize,
     /// The client whose bearer every export presents.
     client: WyrdClient,
 }
 
 impl Otlp {
-    /// Connects to `client`'s gRPC endpoint.
+    /// Opens [`OTLP_CONNECTIONS`] connections to `client`'s gRPC endpoint,
+    /// each established before this returns.
     ///
     /// # Errors
     ///
     /// Returns the endpoint or connection failure.
     pub async fn connect(client: &WyrdClient) -> Result<Self> {
-        let channel = Channel::from_shared(client.grpc_url().to_owned())?
-            .connect()
-            .await?;
         Ok(Self {
-            channel,
+            channels: channels(client.grpc_url(), OTLP_CONNECTIONS).await?,
+            slot: 0,
             client: client.clone(),
         })
+    }
+
+    /// This collector on its `writer`th connection, wrapping past
+    /// [`OTLP_CONNECTIONS`].
+    #[must_use]
+    fn on_connection(&self, writer: usize) -> Self {
+        Self {
+            slot: writer % self.channels.len(),
+            ..self.clone()
+        }
+    }
+
+    /// The channel this handle sends on.
+    fn channel(&self) -> Channel {
+        self.channels[self.slot].clone()
     }
 
     /// The `x-wyrd-access-token` value of the client's current bearer.
@@ -270,6 +296,18 @@ impl Sender {
         }
     }
 
+    /// This sender on its `writer`th OTLP connection; a native writer is
+    /// unchanged.
+    #[must_use]
+    fn on_connection(&self, writer: usize) -> Self {
+        match self {
+            Self::Native { .. } => self.clone(),
+            Self::Spans(otlp, fixture) => Self::Spans(otlp.on_connection(writer), *fixture),
+            Self::Logs(otlp, fixture) => Self::Logs(otlp.on_connection(writer), *fixture),
+            Self::Ui(otlp, journey) => Self::Ui(otlp.on_connection(writer), *journey),
+        }
+    }
+
     /// Sends rows `first..last` as one request and resolves at their durable
     /// acknowledgement with the encoded OTLP bytes sent (zero for native).
     ///
@@ -295,28 +333,44 @@ impl Sender {
                 Ok(0)
             }
             Self::Spans(otlp, fixture) => {
+                let mut observation = Observation::start(OTLP_EXPORT_ROOT, benchmark_cohort);
+                let started = observation.now();
                 let body = fixture.request(first, last);
                 let encoded = body.encoded_len();
+                observation.since("build", started);
+                let started = observation.now();
                 let token = otlp.token().await?;
-                let response = TraceServiceClient::new(otlp.channel.clone())
-                    .export(authorized(body, &token)?)
-                    .await
-                    .map_err(|status| Refused::otlp(&status))?;
+                observation.since("token", started);
+                let request = authorized(body, &token)?;
+                let started = observation.now();
+                let response = TraceServiceClient::new(otlp.channel())
+                    .export(request)
+                    .await;
+                observation.since("export", started);
+                observation.settle(&response);
                 let rejected = response
+                    .map_err(|status| Refused::otlp(&status))?
                     .into_inner()
                     .partial_success
                     .map_or(0, |partial| partial.rejected_spans);
                 Ok(accepted(encoded, rejected)?)
             }
             Self::Logs(otlp, fixture) => {
+                let mut observation = Observation::start(OTLP_EXPORT_ROOT, benchmark_cohort);
+                let started = observation.now();
                 let body = fixture.request(first, last);
                 let encoded = body.encoded_len();
+                observation.since("build", started);
+                let started = observation.now();
                 let token = otlp.token().await?;
-                let response = LogsServiceClient::new(otlp.channel.clone())
-                    .export(authorized(body, &token)?)
-                    .await
-                    .map_err(|status| Refused::otlp(&status))?;
+                observation.since("token", started);
+                let request = authorized(body, &token)?;
+                let started = observation.now();
+                let response = LogsServiceClient::new(otlp.channel()).export(request).await;
+                observation.since("export", started);
+                observation.settle(&response);
                 let rejected = response
+                    .map_err(|status| Refused::otlp(&status))?
                     .into_inner()
                     .partial_success
                     .map_or(0, |partial| partial.rejected_log_records);
@@ -324,7 +378,7 @@ impl Sender {
             }
             Self::Ui(otlp, journey) => {
                 let token = otlp.token().await?;
-                let channel = otlp.channel.clone();
+                let channel = otlp.channel();
                 let (encoded, rejected) = match journey.export(first) {
                     Export::Spans(body) => (
                         body.encoded_len(),
@@ -382,8 +436,8 @@ impl Sender {
     ) -> Outcome {
         let chunk = self.request_rows();
         let mut tasks = JoinSet::new();
-        for _ in 0..writers {
-            let (sender, cursor) = (self.clone(), Arc::clone(cursor));
+        for writer in 0..writers {
+            let (sender, cursor) = (self.on_connection(writer), Arc::clone(cursor));
             tasks.spawn(async move {
                 let mut outcome = Outcome::default();
                 while admission.open() {
@@ -422,6 +476,18 @@ impl Sender {
         join(tasks).await
     }
 }
+
+/// The driver's benchmark root of one OTLP export attempt, from building its
+/// request until its decoded response or refusal.
+pub const OTLP_EXPORT_ROOT: &str = "client.otlp.export";
+
+/// [`OTLP_EXPORT_ROOT`] with its disjoint components, as a driver root a
+/// write window diagnoses: `build` makes the fixture's request and sizes it,
+/// `token` reads the cached bearer token, and `export` is the gRPC call from
+/// handing the request to the channel until its decoded response, so it
+/// holds encoding, transmission, the server's handling, and response delivery.
+pub const OTLP_DRIVER_ROOT: (&str, bool, &[&str]) =
+    (OTLP_EXPORT_ROOT, false, &["build", "token", "export"]);
 
 /// The delay the server advertises for a busy ingest refusal (`Retry-After`
 /// and `retry-after-ms`), used once the native client's own bounded busy
@@ -789,6 +855,21 @@ pub fn micros(sent: Instant) -> u64 {
     u64::try_from(sent.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
+/// `count` channels to `url`, each its own eagerly connected HTTP/2
+/// connection.
+///
+/// # Errors
+///
+/// Returns the endpoint or connection failure.
+async fn channels(url: &str, count: usize) -> Result<Arc<[Channel]>> {
+    let endpoint = Channel::from_shared(url.to_owned())?;
+    let mut channels = Vec::with_capacity(count);
+    for _ in 0..count {
+        channels.push(endpoint.connect().await?);
+    }
+    Ok(channels.into())
+}
+
 /// Wraps `body` in a gRPC request carrying the `x-wyrd-access-token` bearer
 /// and, inside [`with_benchmark_labels`], the benchmark case and phase the
 /// server classifies its timing by; outside a labelled scope it carries
@@ -816,14 +897,38 @@ fn authorized<T>(body: T, token: &str) -> std::result::Result<Request<T>, String
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use wyrd_client::transport::trace::with_benchmark_labels;
     use wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest;
     use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
     use wyrd_tonic::tonic::Request;
 
-    use super::{Admission, Outcome, accepted, authorized};
+    use super::{Admission, Outcome, accepted, authorized, channels};
+
+    /// The OTLP sender set opens one distinct HTTP/2 connection per writer,
+    /// every one established before it returns, so concurrent writers never
+    /// share a connection's dispatch task.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the endpoint accepts fewer or more connections than
+    /// channels were opened.
+    #[tokio::test]
+    async fn otlp_channels_are_distinct_eager_connections() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a local listener");
+        let url = format!("http://{}", listener.local_addr().expect("an address"));
+        let opened = channels(&url, 8).await.expect("eight connections");
+        let mut accepted = Vec::new();
+        while let Ok(Ok((socket, _))) =
+            tokio::time::timeout(Duration::from_millis(200), listener.accept()).await
+        {
+            accepted.push(socket);
+        }
+        assert_eq!((opened.len(), accepted.len()), (8, 8));
+    }
 
     /// The `(bearer, case, phase)` metadata `request` carries.
     fn metadata<T>(request: &Request<T>) -> [Option<String>; 3] {

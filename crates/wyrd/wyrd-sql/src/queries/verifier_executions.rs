@@ -390,6 +390,9 @@ const ADVANCE_EXPECTED_CURSOR_SQL: &str = r"
 /// without computing; the queue cannot see Bifrost to decide that itself.
 /// Every claimed row draws its own random lease token, returned as `lease_token`, so each
 /// claim renews and settles independently.
+/// Whether the row held a token before the claim is returned as
+/// `claimed_before`: admission inserts none, and no later transition clears
+/// it, so `false` proves no earlier attempt could have written state.
 ///
 /// Due and lease-expired rows are each read in the order of their own
 /// partial index (`verifier_runs_due`, `verifier_runs_leased`) and merged, so
@@ -410,7 +413,8 @@ const ADVANCE_EXPECTED_CURSOR_SQL: &str = r"
 /// principal are resolved by the caller through `wyrd.verification_target`.
 const CLAIM_SQL: &str = r"
     WITH due AS (
-        SELECT execution_id, next_attempt_at AS due_at, false AS exhausted
+        SELECT execution_id, next_attempt_at AS due_at, false AS exhausted,
+               lease_token IS NOT NULL AS claimed_before
           FROM wyrd.verifier_executions
          WHERE status IN ('pending', 'retrying') AND next_attempt_at <= statement_timestamp()
          ORDER BY next_attempt_at, execution_id
@@ -418,7 +422,8 @@ const CLAIM_SQL: &str = r"
            FOR UPDATE SKIP LOCKED
     ),
     expired AS (
-        SELECT execution_id, lease_expires_at AS due_at, attempts >= max_attempts AS exhausted
+        SELECT execution_id, lease_expires_at AS due_at, attempts >= max_attempts AS exhausted,
+               true AS claimed_before
           FROM wyrd.verifier_executions
          WHERE status = 'running' AND lease_expires_at <= statement_timestamp()
          ORDER BY lease_expires_at, execution_id
@@ -426,9 +431,9 @@ const CLAIM_SQL: &str = r"
            FOR UPDATE SKIP LOCKED
     ),
     candidate AS (
-        SELECT execution_id, due_at, exhausted FROM due
+        SELECT execution_id, due_at, exhausted, claimed_before FROM due
         UNION ALL
-        SELECT execution_id, due_at, exhausted FROM expired
+        SELECT execution_id, due_at, exhausted, claimed_before FROM expired
         ORDER BY due_at, execution_id
         LIMIT $2
     )
@@ -447,7 +452,7 @@ const CLAIM_SQL: &str = r"
               e.sub_principal_id, e.act_principal_id, e.authority, e.attempts,
               e.max_attempts, e.lease_expires_at, e.cause_trace_id,
               e.cause_span_id, e.cause_sampled, e.group_id, e.deployment_environment,
-              e.pull_request, candidate.exhausted,
+              e.pull_request, candidate.exhausted, candidate.claimed_before,
               GREATEST(0, (EXTRACT(EPOCH FROM statement_timestamp() - candidate.due_at)
                            * 1000)::bigint) AS queue_wait_ms,
               GREATEST(0, (EXTRACT(EPOCH FROM statement_timestamp() - e.created_at)
@@ -645,7 +650,8 @@ const INACTIVE_PRINCIPALS_SQL: &str = r"
 const STATUS_SQL: &str = r"
     SELECT execution_id, status, sub_principal_id, act_principal_id,
            verifier_card_uid, card_uid, result_id, error,
-           group_id, owner_card_uid, deployment_environment, pull_request
+           group_id, owner_card_uid, deployment_environment, pull_request,
+           lease_token IS NOT NULL AS claimed
       FROM wyrd.verifier_executions
      WHERE execution_id = $1
 ";
@@ -1580,6 +1586,11 @@ pub struct ClaimedExecution {
     /// execution already selected, or settles it as exhausted, and never
     /// computes.
     pub exhausted: bool,
+    /// Whether an earlier claim ever leased this execution. Only a lease
+    /// holder writes execution state, so `false` proves no state revision
+    /// exists and the runner starts fresh without recovering; release,
+    /// retry and expiry never clear it, though they may refund the attempt.
+    pub claimed_before: bool,
     /// Exact Verifier Card UID.
     pub verifier_card_uid: CardUid,
     /// Exact Verifier Card version.
@@ -1690,6 +1701,9 @@ pub struct ExecutionStatus {
     /// The deployment environment tag the execution was accepted with;
     /// `None` when the invocation carried none.
     pub deployment_environment: Option<String>,
+    /// Whether any claim ever leased the execution; `false` proves it holds
+    /// no execution state.
+    pub claimed: bool,
 }
 
 /// Bounded retry of engine failures: attempts and exponential backoff.
@@ -3285,6 +3299,7 @@ impl VerifierExecutionQueue {
                     .map(|id| stored(VerificationResultId::new(id)))
                     .transpose()?,
                 deployment_environment: row.deployment_environment,
+                claimed: row.claimed,
             }))
         })
         .await
@@ -3598,6 +3613,8 @@ struct ClaimedRow {
     max_attempts: i32,
     /// Whether this claim took an expired final attempt.
     exhausted: bool,
+    /// Whether the row held a lease token before this claim.
+    claimed_before: bool,
     /// Lease expiry.
     lease_expires_at: DateTime<Utc>,
     /// Submitting request's trace id, 16 bytes.
@@ -3695,6 +3712,7 @@ impl ClaimedRow {
             attempt: self.attempts,
             max_attempts: self.max_attempts,
             exhausted: self.exhausted,
+            claimed_before: self.claimed_before,
             verifier_card_uid: stored(CardUid::from_uuid(self.verifier_card_uid))?,
             verifier_version: self.verifier_version,
             card_uid: stored(CardUid::from_uuid(self.card_uid))?,
@@ -3790,6 +3808,8 @@ struct StatusRow {
     deployment_environment: Option<String>,
     /// Admitted pull request pins of a `pull_request` execution.
     pull_request: Option<Json<PullRequestActivation>>,
+    /// Whether any claim ever set the lease token.
+    claimed: bool,
 }
 
 /// A dispatch row from [`DISPATCHES_SQL`].

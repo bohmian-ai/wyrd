@@ -18,6 +18,7 @@ use wyrd_testing::github::DeliveryFault;
 use super::pg_github_pull_request_extraction::{
     Deployment, HANDLER_A, INSTALLATION, PATCH_A, PR, REPOSITORY, hold_scribe, sha,
 };
+use super::pg_github_pull_requests::expire_receipts;
 
 /// The requirement every Verifier here is judged by: the change touches a
 /// file.
@@ -693,6 +694,91 @@ async fn a_restart_before_the_outcome_finds_what_already_landed() {
         &after[reads..]
     );
     drop(scribe);
+}
+
+/// A recorded delivery outcome outlives its retry receipts: its Bifrost
+/// record stays the authority once cleanup removes the receipts.
+///
+/// One execution is delivered and its outcome recorded. Once every accepted
+/// row is published, the execution's revision and outcome receipts are
+/// removed: inspection still serves the same completed result and the
+/// delivered outcome, never pending, and GitHub receives nothing more.
+/// Inspection never reads receipts: while they cannot be read at all, it
+/// still serves the delivered outcome.
+///
+/// # Panics
+/// Panics when the outcome or result changes after the receipts are
+/// removed, anything is sent again, or inspection depends on the receipts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_recorded_outcome_outlives_its_retry_receipts() {
+    let deployment = bound(&[("review", located())], &[]).await;
+    let execution = deployment.admit(&sha('a'), "opened").await;
+    let delivered = outcome(&deployment, execution).await;
+    assert_eq!(delivered["github_delivery"], json!({"status": "delivered"}));
+    let requests = deployment.mock.delivery_requests().len();
+
+    expire_receipts(
+        &deployment.server,
+        &["bifrost.verification.execution_events"],
+    )
+    .await;
+    let served = deployment
+        .get(&format!("/v1/verification/executions/{execution}"))
+        .await;
+    assert_eq!(served["status"], "completed", "{served}");
+    assert_eq!(served["result"], delivered["result"], "{served}");
+    assert_eq!(
+        served["github_delivery"],
+        json!({"status": "delivered"}),
+        "the recorded outcome is still found: {served}"
+    );
+    assert_eq!(
+        deployment.mock.delivery_requests().len(),
+        requests,
+        "nothing is delivered again"
+    );
+
+    let pool = deployment
+        .server
+        .pg_fixture()
+        .superuser_pool()
+        .expect("fixture exposes a superuser pool");
+    let grant = |statement: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(statement)
+                .execute(&pool)
+                .await
+                .expect("the receipt grant changes");
+        }
+    };
+    grant("REVOKE SELECT ON vala.scribe_batch_commits FROM wyrd_tenant").await;
+    let response = deployment
+        .server
+        .oneshot_authenticated(
+            &deployment.jwt,
+            axum::http::Request::builder()
+                .uri(format!("/v1/verification/executions/{execution}"))
+                .body(axum::body::Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("status responds");
+    grant("GRANT SELECT ON vala.scribe_batch_commits TO wyrd_tenant").await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "inspection reads no receipt"
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("status body reads");
+    let served: Value = serde_json::from_slice(&body).expect("status is JSON");
+    assert_eq!(
+        served["github_delivery"],
+        json!({"status": "delivered"}),
+        "the outcome reads from Bifrost alone: {served}"
+    );
 }
 
 /// A new head pushed while the Check create is in flight supersedes the

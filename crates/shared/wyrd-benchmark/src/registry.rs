@@ -633,6 +633,29 @@ impl Distribution {
     pub fn buckets(&self) -> Buckets {
         Buckets::of(&self.0)
     }
+
+    /// The histogram parameters a kept distribution needs to rebuild:
+    /// lowest discernible value, highest trackable value, and significant
+    /// digits.
+    #[must_use]
+    pub fn bounds(&self) -> [u64; 3] {
+        [self.0.low(), self.0.high(), u64::from(self.0.sigfig())]
+    }
+
+    /// Rebuilds a distribution kept as [`Self::bounds`] and
+    /// [`Self::buckets`], so a reader can pool kept windows without the
+    /// process that recorded them.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message for invalid parameters or a bucket outside them.
+    pub fn restore(bounds: [u64; 3], buckets: &Buckets) -> Result<Self, String> {
+        let [low, high, sigfig] = bounds;
+        let sigfig = u8::try_from(sigfig).map_err(|_| format!("{sigfig} significant digits"))?;
+        let empty = Histogram::new_with_bounds(low, high, sigfig)
+            .map_err(|error| format!("histogram bounds {bounds:?} are invalid: {error}"))?;
+        Self::rebuild(buckets, empty)
+    }
 }
 
 /// One timing series over an interval.
@@ -955,7 +978,7 @@ impl IntervalScan {
 mod tests {
     use std::time::Duration;
 
-    use super::{Registry, Series, durations};
+    use super::{Distribution, Registry, Series, durations};
     use crate::Labels;
 
     /// Records `elapsed`/`excluded` nanoseconds into `registry` under
@@ -1207,5 +1230,27 @@ mod tests {
             certain <= 3 && 3 <= possible && possible - certain <= 1,
             "{certain}..{possible}"
         );
+    }
+
+    /// A kept distribution restores to the same buckets, so two kept
+    /// windows pool to the counts recorded across both, and invalid kept
+    /// parameters are refused.
+    #[test]
+    fn kept_distributions_restore_and_pool() {
+        let first = Distribution::of_durations(&[1_000, 2_000, 400_000]).expect("first");
+        let second = Distribution::of_durations(&[3_000, 900_000]).expect("second");
+        let mut restored =
+            Distribution::restore(first.bounds(), &first.buckets()).expect("restores");
+        assert_eq!(restored.buckets(), first.buckets());
+        restored
+            .add(&Distribution::restore(second.bounds(), &second.buckets()).expect("restores"))
+            .expect("pools");
+        let both =
+            Distribution::of_durations(&[1_000, 2_000, 400_000, 3_000, 900_000]).expect("both");
+        assert_eq!(restored.len(), 5);
+        assert_eq!(restored.buckets(), both.buckets());
+        assert_eq!(restored.quantile(0.99), both.quantile(0.99));
+        assert!(Distribution::restore([0, 1, 9], &first.buckets()).is_err());
+        assert!(Distribution::restore([1, 10, 3], &first.buckets()).is_err());
     }
 }

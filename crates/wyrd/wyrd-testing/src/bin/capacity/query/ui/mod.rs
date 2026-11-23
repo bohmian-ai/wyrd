@@ -133,6 +133,16 @@ pub fn declare(
         "ms",
         "diagnostic: the first statement's time after the rows reached the step's residence, before any warmup",
     ));
+    metrics.push(Metric::raw(
+        "memtable_rows_per_query",
+        "rows/query",
+        "diagnostic: the window's captured memtable rows Scribe live reads examined after batch pruning and before any row filter (`bifrost_scribe_live_rows_examined_total`), per answered query; a memory batch is never a physical scan",
+    ));
+    metrics.push(Metric::raw(
+        "memtable_bytes_per_query",
+        "B/query",
+        "diagnostic: the recorded decoded Arrow bytes of the columns those examined rows read (`bifrost_scribe_live_bytes_examined_total`), per answered query; never Parquet `bytes_scanned`",
+    ));
     for page in PAGES {
         metrics.extend(Metric::diagnostic(
             &observation("page", page),

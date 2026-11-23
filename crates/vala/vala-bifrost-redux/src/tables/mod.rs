@@ -337,9 +337,6 @@ pub struct BuiltinTableDefinition {
     /// row, the Parquet Bloom recipe, and every partition identity — is derived
     /// from that one canonical layout.
     pub physical_layout: fn() -> PhysicalLayoutWire,
-    /// Whether only fenced batches hold the table's records; see
-    /// [`DomainTable::FENCED_ONLY`].
-    pub fenced_only: bool,
 }
 
 /// Enforce the Variant contract over one supplied batch at the trust boundary.
@@ -609,14 +606,6 @@ pub trait DomainTable: Send + Sync + 'static {
     /// The pre-declared validator refuses a row that sets only some children
     /// of one of these columns; see [`refuse_partial_structs`].
     const WHOLE_STRUCTS: &'static [&'static str] = &[];
-
-    /// Whether only a batch with a durable fence holds the table's records.
-    ///
-    /// A writer of such a table treats a batch as accepted only once its
-    /// fence commits, so WAL replay never restores a batch the fence never
-    /// accepted: it was never acknowledged, and a later batch may already
-    /// hold its batch id.
-    const FENCED_ONLY: bool = false;
 
     /// User-owned fields, excluding correlation and system fields.
     fn arrow_fields() -> Vec<Field>;
@@ -1279,7 +1268,6 @@ const fn definition<T: DomainTable>() -> BuiltinTableDefinition {
         canonical_validator: T::CANONICAL_VALIDATOR,
         derived_columns: T::DERIVED_COLUMNS,
         physical_layout: T::physical_layout,
-        fenced_only: T::FENCED_ONLY,
     }
 }
 
@@ -2413,7 +2401,6 @@ mod tests {
             "exception_type",
             "exception_message",
             "exception_stacktrace",
-            "body_text",
             "is_exception",
         ];
         let [spans, logs, metrics] = promotion_batches();
@@ -2469,6 +2456,54 @@ mod tests {
             matches!(&refusal, BifrostError::SchemaParse { detail } if detail.contains("gen_ai")),
             "{refusal:?}"
         );
+    }
+
+    /// A native log batch stores a string body once, in `body_text`: a string
+    /// in the `body` Variant, or a `body_text` beside a non-null `body`, is
+    /// refused, and a structured body alone is accepted.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a duplicated body is accepted, a refusal is not the
+    /// catalogued schema-parse error naming `body`, or a canonical batch is
+    /// refused.
+    #[test]
+    fn native_logs_refuse_a_string_body_stored_twice() {
+        let [_, logs, _] = promotion_batches();
+        let native = signal::without_correlation_columns(&logs).expect("user block");
+        let validate = logs::records::RecordsTable::CANONICAL_VALIDATOR;
+        let with_body = |body: Value, text: Option<&str>| {
+            let schema = native.schema();
+            let rows = native.num_rows();
+            let body = signal::any_value_variant("body", &AnyValue { value: Some(body) })
+                .expect("encodes");
+            let mut columns = native.columns().to_vec();
+            columns[schema.index_of("body").expect("body")] =
+                signal::variant_column(std::iter::repeat_n(Some(&body), rows));
+            columns[schema.index_of("body_text").expect("body_text")] =
+                Arc::new(StringArray::from(vec![text; rows]));
+            RecordBatch::try_new(schema, columns).expect("assembles")
+        };
+
+        validate(&with_body(Value::IntValue(7), None)).expect("a structured body is canonical");
+        for (case, batch) in [
+            (
+                "a string in body",
+                with_body(Value::StringValue("twice".to_owned()), Some("twice")),
+            ),
+            (
+                "body_text beside a body",
+                with_body(Value::IntValue(7), Some("7")),
+            ),
+        ] {
+            let refusal = validate(&batch)
+                .err()
+                .unwrap_or_else(|| panic!("{case} is refused"));
+            assert!(
+                matches!(&refusal, BifrostError::SchemaParse { detail } if detail.contains("body")),
+                "{case}: {refusal:?}"
+            );
+        }
     }
 
     /// Assert two field lists have one exact Arrow layout.

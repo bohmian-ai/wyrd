@@ -134,9 +134,6 @@ zip = { workspace = true }
 [dev-dependencies]
 bohmian-code-review-pipeline = { workspace = true, features = ["testing"] }
 sha1 = { workspace = true }
-# The benchmark recorder, snapshot, and heap routes are proved in every lane
-# that builds this crate's tests.
-wyrd-server = { path = ".", features = ["bench"] }
 object_store = { workspace = true }
 workspace-hack.workspace = true
 tracing-subscriber = { workspace = true }

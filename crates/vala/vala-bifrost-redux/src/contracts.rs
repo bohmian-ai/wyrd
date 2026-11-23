@@ -80,10 +80,6 @@ impl From<Attribution> for StampedAttribution {
     }
 }
 
-/// The durable-fence lookup a writer that derives its batch ids from its
-/// record identity learns its accepted records through.
-pub use vala_sql::queries::scribe_batch_commits::committed_batches;
-
 /// One logical batch crossing the Gate-to-Scribe boundary.
 #[derive(Debug)]
 pub struct ScribeIngressFrame {

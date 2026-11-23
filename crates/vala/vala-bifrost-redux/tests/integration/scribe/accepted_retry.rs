@@ -324,7 +324,7 @@ mod pg_tests {
             .bind(fixture.binding.table_ref.fqn())
             .bind(batch_id)
             .bind(table_version)
-            .bind([0xEE_u8; 32].as_slice())
+            .bind([0xEE_u8; 16].as_slice())
             .bind(uuid::Uuid::now_v7())
             .bind(uuid::Uuid::now_v7())
             .execute(&mut *blocker)

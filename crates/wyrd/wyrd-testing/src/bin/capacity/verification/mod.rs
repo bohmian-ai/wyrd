@@ -1,5 +1,5 @@
 //! The Verification engine's experiments (REQ-015, AC-009), run through
-//! `mise run bench:l1:verification` and `mise run bench:l2:verification`.
+//! `mise run benchmark:l1:verification` and `mise run bench:l2:verification`.
 //!
 //! Both read as the production journey they measure. One release
 //! `wyrd-server` starts through the local-development guide (`migrate`,

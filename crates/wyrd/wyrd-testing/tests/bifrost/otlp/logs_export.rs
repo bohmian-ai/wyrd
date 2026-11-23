@@ -155,9 +155,13 @@ mod pg_tests {
                 "{transport} stores the OTel event name rather than folding it away"
             );
             assert_eq!(
-                support::variant_json(column::<StructArray>(&row, "body")),
-                support::expected_any_value(Some(&support::log_body())),
-                "{transport} keeps the body as a Variant of its OTLP value"
+                column::<StringArray>(&row, "body_text").value(0),
+                support::LOG_BODY_TEXT,
+                "{transport} stores the string body as text"
+            );
+            assert!(
+                column::<StructArray>(&row, "body").is_null(0),
+                "{transport} stores a string body once, not also as a Variant"
             );
             assert_eq!(
                 column::<FixedSizeBinaryArray>(&row, "trace_id").value(0),
@@ -303,9 +307,13 @@ mod pg_tests {
             .await;
 
         assert_eq!(
-            support::variant_json(column::<StructArray>(&row, "body")),
-            serde_json::json!("order delayed"),
-            "the emitted body is stored as a Variant string"
+            column::<StringArray>(&row, "body_text").value(0),
+            "order delayed",
+            "the emitted string body is stored as text"
+        );
+        assert!(
+            column::<StructArray>(&row, "body").is_null(0),
+            "the emitted string body is stored once"
         );
         assert_eq!(
             column::<Int32Array>(&row, "severity_number").value(0),
@@ -455,13 +463,13 @@ mod pg_tests {
 
         let text = support::row_by_string(batches, "event_name", "text");
         assert_eq!(
-            support::variant_json(column::<StructArray>(&text, "body")),
-            VARIANT_BODY_TEXT
-        );
-        assert_eq!(
             column::<StringArray>(&text, "body_text").value(0),
             VARIANT_BODY_TEXT,
-            "a text body is promoted into `body_text`"
+            "a text body is stored in `body_text`"
+        );
+        assert!(
+            column::<StructArray>(&text, "body").is_null(0),
+            "a text body is stored once, not also as a Variant"
         );
 
         let unset = support::row_by_string(batches, "event_name", "unset");

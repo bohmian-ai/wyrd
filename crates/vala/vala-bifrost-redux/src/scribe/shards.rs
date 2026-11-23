@@ -12141,6 +12141,22 @@ mod tests {
                 .unwrap_or_else(|_| panic!("{what} is answered"))
         }
 
+        /// Scribe bytes still charged to request-transient categories: raw,
+        /// decoded, prepared and queued. Zero once every admitted request's
+        /// charge was released or transferred to the memtable.
+        fn transient_bytes(budget: &crate::resources::ScribeResources) -> usize {
+            let categories = budget.accounting_snapshot_for_test().category_bytes;
+            [
+                crate::scribe::memory::MemoryCategory::Raw,
+                crate::scribe::memory::MemoryCategory::Decode,
+                crate::scribe::memory::MemoryCategory::Prepared,
+                crate::scribe::memory::MemoryCategory::Queued,
+            ]
+            .into_iter()
+            .map(|category| categories[category as usize])
+            .sum()
+        }
+
         /// Counts the owner's query-visible rows.
         fn visible_rows(memtable: &Memtable) -> usize {
             let stats = memtable.stats().expect("memtable stats");
@@ -12250,6 +12266,11 @@ mod tests {
             assert_eq!(
                 fixture.fenced(&batch_ids).await,
                 i64::try_from(GROUPS).expect("group count fits i64")
+            );
+            assert_eq!(
+                transient_bytes(&budget),
+                0,
+                "every request's charge was released or moved into the memtable"
             );
             command_tx
                 .send(ShardCommand::Shutdown)
@@ -12438,6 +12459,10 @@ mod tests {
             tokio::time::timeout(DEADLOCK_BOUND, failed_closed)
                 .await
                 .expect("the shard fails closed");
+            assert!(
+                transient_bytes(&budget) > 0,
+                "the retained groups keep their charge"
+            );
             drop(release_io);
             command_tx
                 .send(ShardCommand::Shutdown)
@@ -12524,6 +12549,11 @@ mod tests {
                 "only the older group's row is visible"
             );
             assert_eq!(fixture.fenced(&[older_id, younger_id]).await, 1);
+            assert_eq!(
+                transient_bytes(&budget),
+                0,
+                "every request's charge was released or moved into the memtable"
+            );
             command_tx
                 .send(ShardCommand::Shutdown)
                 .await
@@ -12595,6 +12625,11 @@ mod tests {
                 (1, 1),
                 "the later group lands in the next generation"
             );
+            assert_eq!(
+                transient_bytes(&budget),
+                0,
+                "every request's charge was released or moved into the memtable"
+            );
             command_tx
                 .send(ShardCommand::Shutdown)
                 .await
@@ -12649,6 +12684,11 @@ mod tests {
                 .await
                 .expect("the owner exits once drained")
                 .expect("owner task");
+            assert_eq!(
+                transient_bytes(&budget),
+                0,
+                "every request's charge was released or moved into the memtable"
+            );
             assert_eq!(fixture.fenced(&ids).await, 2);
         }
 
@@ -12694,6 +12734,11 @@ mod tests {
             settled(&mut acks[1], "the waiting group")
                 .await
                 .expect("the waiting group commits");
+            assert_eq!(
+                transient_bytes(&budget),
+                0,
+                "every request's charge was released or moved into the memtable"
+            );
             command_tx
                 .send(ShardCommand::Shutdown)
                 .await
@@ -12741,6 +12786,11 @@ mod tests {
                 (stats.immutable_rows, stats.writable_rows),
                 (1, 1),
                 "the seal holds the fencing group's row and the next group writes fresh"
+            );
+            assert_eq!(
+                transient_bytes(&budget),
+                0,
+                "every request's charge was released or moved into the memtable"
             );
             command_tx
                 .send(ShardCommand::Shutdown)
@@ -12805,6 +12855,11 @@ mod tests {
                 visible_rows(&live),
                 1,
                 "only the younger group's row is visible"
+            );
+            assert_eq!(
+                transient_bytes(&budget),
+                0,
+                "every request's charge was released or moved into the memtable"
             );
             command_tx
                 .send(ShardCommand::Shutdown)
@@ -12875,6 +12930,11 @@ mod tests {
                 .expect("the younger group commits");
             assert_eq!(visible_rows(&live), 2, "each group's row is visible once");
             assert_eq!(fixture.fenced(&ids).await, 2);
+            assert_eq!(
+                transient_bytes(&budget),
+                0,
+                "every request's charge was released or moved into the memtable"
+            );
             command_tx
                 .send(ShardCommand::Shutdown)
                 .await
@@ -12922,6 +12982,11 @@ mod tests {
                 .await
                 .expect("the owner drains")
                 .expect("owner task");
+            assert_eq!(
+                transient_bytes(&budget),
+                0,
+                "every request's charge was released or moved into the memtable"
+            );
             assert_eq!(
                 fixture.fenced(&ids).await,
                 2,
@@ -13035,6 +13100,11 @@ mod tests {
                 .expect("the younger group commits");
             assert_eq!(fixture.fenced(&ids).await, 2);
             assert_eq!(visible_rows(&live), 2, "each row is visible exactly once");
+            assert_eq!(
+                transient_bytes(&budget),
+                0,
+                "every request's charge was released or moved into the memtable"
+            );
             command_tx
                 .send(ShardCommand::Shutdown)
                 .await
@@ -13091,6 +13161,11 @@ mod tests {
                 (stats.immutable_rows, stats.writable_rows),
                 (1, 1),
                 "the age seal holds the fencing group's row and the later group writes fresh"
+            );
+            assert_eq!(
+                transient_bytes(&budget),
+                0,
+                "every request's charge was released or moved into the memtable"
             );
             command_tx
                 .send(ShardCommand::Shutdown)

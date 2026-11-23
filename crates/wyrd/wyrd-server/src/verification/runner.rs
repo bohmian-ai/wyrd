@@ -1539,7 +1539,7 @@ impl LeasedWork for VerifierRunner {
             "task_start_delay_us",
             u64::try_from(spawned_at.elapsed().as_micros()).unwrap_or(u64::MAX),
         );
-        self.attempt(tenant, &run, verifier, loaded, &stop, &abandon)
+        Box::pin(self.attempt(tenant, &run, verifier, loaded, &stop, &abandon))
             .instrument(span)
             .await
     }

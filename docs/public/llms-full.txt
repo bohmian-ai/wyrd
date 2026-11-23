@@ -8628,6 +8628,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_AUTH_401_TOKEN_EXPIRED` | 401 | Token expired | Re-authenticate to obtain a fresh token. |
 | `WYRD_AUTH_401_UNAUTHENTICATED` | 401 | Not authenticated | Present a valid Wyrd token as `X-Wyrd-Access-Token: Bearer &lt;token&gt;`. |
 | `WYRD_AUTH_401_WORKLOAD_UID_REFUSED` | 401 | Workload root refused | `workload_uid` is optional. When supplied it must name an active, registered Service Card version in this tenant that the account's workload restriction allows; unknown and foreign roots are refused identically. Omit it to authenticate the account without workload context, or register the release and pass its exact Card UID. |
+| `WYRD_AUTH_403_METHOD_UNAVAILABLE` | 403 | Method not available | Reload the page or read `GET /auth/browser/methods` and use a method it currently offers; retrying the same method does not help until an operator enables it. |
 | `WYRD_AUTH_403_ORIGIN_REFUSED` | 403 | Request origin refused | Send browser-session requests from the Wyrd application's own origin; cross-site and origin-less browser-session mutations are refused. |
 | `WYRD_AUTH_403_PRINCIPAL_ORPHANED` | 403 | The backing Service or Agent card has been soft-deleted | Re-declare the card or use a different principal to obtain a token. |
 | `WYRD_AUTH_403_RECENT_LOGIN_REQUIRED` | 403 | Recent sign-in required | Sign in again with your password or SSO, then create the key within five minutes; an API key or recovery session cannot create one. |

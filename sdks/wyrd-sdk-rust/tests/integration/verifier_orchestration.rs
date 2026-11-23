@@ -440,7 +440,7 @@ impl Desk {
     async fn start() -> Self {
         let upstream = upstream().await;
         let builder = builder(&upstream);
-        Self::start_with(upstream, builder).await
+        Box::pin(Self::start_with(upstream, builder)).await
     }
 
     /// [`Self::start`] with the server `builder` configures over

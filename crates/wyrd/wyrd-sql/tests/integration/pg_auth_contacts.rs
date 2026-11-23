@@ -162,13 +162,13 @@ mod pg_tests {
         conn.commit().await.expect("commits");
     }
 
-    /// The discovery tables hold no address, only keyed digests, and force
-    /// row-level security so a tenant login reads none of their rows while
-    /// the platform owner does.
+    /// The discovery tables hold no address, only keyed digests, force
+    /// row-level security, and refuse a tenant login outright with
+    /// permission denied while the platform owner writes them.
     ///
     /// # Panics
     /// Panics when a column beyond the minimal projection exists, RLS is not
-    /// forced, or a tenant connection sees a directory or proof row.
+    /// forced, or a tenant connection is not refused with SQLSTATE 42501.
     #[tokio::test]
     async fn discovery_tables_hold_only_digests_behind_forced_rls() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -252,15 +252,21 @@ mod pg_tests {
         .execute(&superuser)
         .await
         .expect("a proof inserts");
-        let mut conn = fixture.tenant_conn().await.expect("conn opens");
         for table in ["platform.workspace_directory", "platform.discovery_proofs"] {
-            let seen: Result<i64, _> =
-                sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {table}")))
-                    .fetch_one(&mut **conn.transaction())
-                    .await;
-            assert!(
-                seen.as_ref().map_or(true, |rows| *rows == 0),
-                "{table} is hidden from a tenant login: {seen:?}"
+            let mut conn = fixture.tenant_conn().await.expect("conn opens");
+            let refused = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
+                "SELECT count(*) FROM {table}"
+            )))
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect_err("a tenant login cannot read the table");
+            assert_eq!(
+                refused
+                    .as_database_error()
+                    .and_then(sqlx::error::DatabaseError::code)
+                    .as_deref(),
+                Some("42501"),
+                "{table} refuses a tenant login with permission denied: {refused}"
             );
         }
     }

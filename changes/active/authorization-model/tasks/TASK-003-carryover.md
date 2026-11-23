@@ -916,7 +916,7 @@ directory-update owner once here; recovery below consumes its output.
 - SQL structure: `pg_auth_contacts::pg_tests::discovery_tables_hold_only_digests_behind_forced_rls`.
   - `platform.workspace_directory` has exactly `data_tenant_id, user_id, address_key, contact_revision`.
   - `platform.discovery_proofs` has exactly `proof_hash, browser_binding_hash, read_until, expires_at`.
-  - Both enable and force RLS, and a tenant connection sees none of their rows while the platform owner inserted them.
+  - Both enable and force RLS. A tenant connection, each on its own transaction, is refused with exactly SQLSTATE 42501 ("permission denied"), while the platform owner writes them. An earlier draft accepted any SQL error; the commit hook flagged it and it was tightened.
   - Structural proof, so no RED applies. Command: `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-sql --test integration -E "test(/pg_auth_contacts/)"'`.
 - Invalidating old-contact reset proofs landed with cycle 13 (`wyrd.auth_password_resets.contact_revision`; scenario `platform_admin_e2e::resets::a_reset_code_refuses_every_stale_or_foreign_use`), merged in c27c06f79.
 - Cycle 12 status: IMPLEMENTED. Every case has a runtime or structural proof except expiry of the pre-proof sealed envelope (see scenario 6).

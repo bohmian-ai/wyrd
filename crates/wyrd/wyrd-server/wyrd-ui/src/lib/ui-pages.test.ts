@@ -1320,14 +1320,16 @@ test('Settings connects and disconnects GitHub once through the host and reads s
 test('a pull request page follows the latest review set, keeps a pinned set in its URL and opens a member', async () => {
   const requests: WireRequest[] = [];
   const tenant = { key: 'acme', name: 'Acme' };
-  /** The pull request page at `rest` of /t/acme/repositories/payments-api/pulls/. */
-  const pull = async (rest: string, executor: Executor = fixtureExecutor) => {
+  /** The page data of /t/acme/repositories/payments-api/pulls/`rest`. */
+  const load = async (rest: string, executor: Executor = fixtureExecutor) => {
     host.executor = { run: (batch, signal) => (requests.push(...batch), executor.run(batch, signal)) };
     requests.length = 0;
     const url = new URL(`http://ui.test/t/acme/repositories/payments-api/pulls/${rest}`);
     const event = { locals: { browserSession: { client: () => ({}) } }, params: { tenantKey: 'acme', name: 'payments-api', number: rest.split('?')[0] }, url, request: new Request(url) };
-    return render(PullPage, { data: { ...(await loadPull(event as never)), tenant } } as never);
+    return { data: { ...(await loadPull(event as never)), tenant } };
   };
+  /** The pull request page at `rest`. */
+  const pull = async (rest: string, executor?: Executor) => render(PullPage, (await load(rest, executor)) as never);
   vi.mocked(goto).mockClear();
   expect(pullHref('/t/acme', 'a b', 7)).toBe('/t/acme/repositories/a%20b/pulls/7');
   expect(pullHref('/t/acme', 'a b', 7, 'g 1')).toBe('/t/acme/repositories/a%20b/pulls/7?set=g+1');
@@ -1357,6 +1359,12 @@ test('a pull request page follows the latest review set, keeps a pinned set in i
   expect(pinned.getByRole('heading', { level: 1 })).toHaveTextContent('#482');
   expect(pinned.getAllByRole('row').slice(1).map((row) => row.querySelector('td')?.textContent?.trim())).toEqual(['exec_cancelled', 'exec_waiting']);
   expect(within(pinned.getByRole('status')).getByRole('link')).toHaveAttribute('href', '/t/acme/repositories/payments-api/pulls/482');
+  // Changing the pull request while that set is open shows the other pull request alone: no pinned banner, set or member carries over.
+  await pinned.rerender((await load('1')) as never);
+  expect(pinned.container).toHaveTextContent('No review set is retained for this pull request.');
+  expect(pinned.queryByRole('status')).toBeNull();
+  expect(pinned.container.querySelector('table')).toBeNull();
+  expect(pinned.container).not.toHaveTextContent('exec_cancelled');
   pinned.unmount();
 
   // A pinned set that is not retained is reported and never replaced by the latest.

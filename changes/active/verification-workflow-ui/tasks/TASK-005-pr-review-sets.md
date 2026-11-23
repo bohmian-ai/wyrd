@@ -339,11 +339,23 @@ proof, not manufactured failures.
    - Existing discovery behavior: Verify's facet and group lists gained
      `pull_request`; the two pinned lists in `ui-pages.test.ts` were
      extended. `mise run ui:check`: 112 passed, 0 type errors.
-   - FAIL (not proven): the built `ui://wyrd/view` artifact and a custom
-     host rendering `ReviewSets`; "Copy link" on the pull request page (the
-     page has none; the URL carries the selection); changing the pull request
-     while a selection is open; light/dark, mobile, keyboard/touch and
-     long-content comparison against the mock (AC-009).
+   - Proof (hosts, [U1]): scenario 1's journey also loads the set through
+     the built `ui://wyrd/view` artifact, each tools/call answered by the
+     real MCP server (one set row and the member rows drawn, set rows are
+     buttons, the GitHub link resolves, no `<a>` without `href`, only
+     `bifrost.query` called), and through the example custom app's server
+     (populated, current set selected, key never returned). Passed on its
+     first run once the view document carried its required `range` (the
+     first run refused the document with `View input.range: Invalid
+     input`, a setup error in the new test); the hosts needed no change.
+   - Proof (page, [P1]): "a pull request page follows…" rerenders the page
+     pinned on an earlier set of #482 with #1's data: no pinned banner, set
+     table or member remains. Passed on its first run: the page derives all
+     selection from its URL data.
+   - "Copy link": the page has no copy control; the URL carries the set and
+     the browser journey reloads it ([D2]). Nothing to add.
+   - FAIL (not proven): light/dark, mobile, keyboard/touch and long-content
+     comparison against the mock (AC-009).
    - Links and wording (maintainer decision, 2026-11-23: follow the mock and
      link conventions). `ReviewSets` takes an optional `link` (intent → URL);
      the pull request page supplies it, so set rows, the banner's latest-set

@@ -25,8 +25,8 @@ use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
 use wyrd_sql::queries::platform::console::{
     PlatformBrowserSessionRow, PlatformSessionAnchor, PlatformSessionWindows,
     insert_platform_browser_session, platform_password_by_id, platform_password_by_name,
-    refresh_platform_browser_session, resolve_platform_browser_session,
-    revoke_platform_browser_session,
+    purge_ended_platform_browser_sessions, refresh_platform_browser_session,
+    resolve_platform_browser_session, revoke_platform_browser_session,
 };
 use wyrd_sql::queries::platform::credentials::platform_credential_by_id;
 use wyrd_sql::queries::platform::identity::{
@@ -56,6 +56,9 @@ pub const PLATFORM_BROWSER_WINDOWS: PlatformSessionWindows = PlatformSessionWind
     absolute: std::time::Duration::from_hours(8),
     recent: std::time::Duration::from_mins(5),
 };
+
+/// Most ended platform browser sessions one maintenance statement deletes.
+const BROWSER_PURGE_BATCH: i64 = 1000;
 
 /// A platform browser session resolved for one request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -551,6 +554,17 @@ impl PlatformSessions {
             }
             _ => Err(PlatformSessionError::Invalid),
         }
+    }
+
+    /// Remove one bounded batch of ended platform browser sessions,
+    /// returning how many went; `0` once none remain.
+    ///
+    /// Background auth maintenance repeats this; no request purges.
+    ///
+    /// # Errors
+    /// Returns [`PlatformSessionError::Store`] when the store fails.
+    pub async fn purge_ended_browser_sessions(&self) -> Result<u64, PlatformSessionError> {
+        Ok(purge_ended_platform_browser_sessions(&self.pool, BROWSER_PURGE_BATCH).await?)
     }
 
     /// Record fresh proof on `session`, which must still be live.

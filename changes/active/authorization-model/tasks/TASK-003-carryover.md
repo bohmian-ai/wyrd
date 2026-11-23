@@ -1006,6 +1006,18 @@ as a usable way in for the last-administrator guard.
      another registered operator's identity and a 10-minute-old
      authentication refresh nothing. 2 passed.
 
+5. `platform_admin_e2e::console::maintenance_removes_ended_platform_sessions`
+   - RED: TDD deviation. The test did not compile because the platform
+     session owner had no purge entry point (`PlatformLogin::sessions`,
+     `purge_ended_browser_sessions`), so ended sessions would accumulate.
+     This is a compile-time RED, not a behavioral one.
+   - GREEN: the auth maintenance worker also drains ended platform browser
+     sessions (revoked, idle-expired or past the absolute deadline) in
+     batches of 1000 through `PlatformSessions::purge_ended_browser_sessions`.
+     The journey removes 3 ended sessions in one batch, then 0, and the live
+     session still resolves. Login states that reference a purged session
+     cascade with it. 1 passed.
+
 ### 15. Extend and approve the complete mock before production pages
 
 **Reuses:** Cycles 5–14 final contracts, journeys and platform session metadata; reuse the already approved signup visual direction.

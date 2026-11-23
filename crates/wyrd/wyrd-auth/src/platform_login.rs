@@ -131,6 +131,13 @@ impl PlatformLogin {
         }
     }
 
+    /// The platform session owner this login signs operators in through,
+    /// shared with background maintenance.
+    #[must_use]
+    pub fn sessions(&self) -> &PlatformSessions {
+        &self.sessions
+    }
+
     /// The relying party, and so the provider cache, this login's begin and
     /// callback use.
     ///

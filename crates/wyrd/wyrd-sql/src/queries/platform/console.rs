@@ -277,3 +277,33 @@ pub async fn revoke_platform_browser_session(
     .map(|_| ())
     .map_err(SqlError::from)
 }
+
+/// Delete at most `batch` platform browser sessions that have ended
+/// (revoked, idle past their idle deadline, or past their absolute
+/// deadline) and return how many went.
+///
+/// Resolution already refuses an ended session, so this only stops them
+/// accumulating; it is never what ends one. Bounded, so a backlog drains
+/// over repeated calls rather than in one long delete.
+///
+/// # Errors
+/// Returns [`SqlError::Query`] when the delete fails.
+pub async fn purge_ended_platform_browser_sessions(
+    pool: &OperatorPool,
+    batch: i64,
+) -> Result<u64, SqlError> {
+    sqlx::query(
+        "DELETE FROM platform.browser_sessions
+          WHERE id = ANY(ARRAY(
+                SELECT id FROM platform.browser_sessions
+                 WHERE revoked_at IS NOT NULL
+                    OR idle_expires_at <= statement_timestamp()
+                    OR expires_at <= statement_timestamp()
+                 LIMIT $1))",
+    )
+    .bind(batch)
+    .execute(pool.pool())
+    .await
+    .map(|done| done.rows_affected())
+    .map_err(SqlError::from)
+}

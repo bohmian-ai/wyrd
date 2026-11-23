@@ -1260,3 +1260,58 @@ async fn destructive_console_changes_accept_forced_fresh_idp_proof() {
     let reply = browser(&srv, Method::PUT, &retire, &[&ops], true, Some(&suspend)).await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
 }
+
+/// Background maintenance removes ended platform browser sessions in
+/// bounded batches and keeps live ones:
+///   1. revoked, idle-expired and absolute-expired sessions are deleted;
+///   2. a live session survives and still signs the operator in.
+///
+/// # Panics
+/// Panics when an ended session survives the purge or a live one does not.
+#[tokio::test(flavor = "multi_thread")]
+async fn maintenance_removes_ended_platform_sessions() {
+    let (srv, _root, api) = console_server().await;
+    register_password_operator(&srv, &api, "ops").await;
+    let live = signed_in(&srv, "ops", OPERATOR_PASSWORD).await;
+    let revoked = signed_in(&srv, "ops", OPERATOR_PASSWORD).await;
+    let reply = browser(
+        &srv,
+        Method::POST,
+        "/platform/browser/logout",
+        &[&revoked],
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::NO_CONTENT, "{}", reply.body);
+    let idle = signed_in(&srv, "ops", OPERATOR_PASSWORD).await;
+    age_session(&srv, &idle, "16 minutes").await;
+    let expired = signed_in(&srv, "ops", OPERATOR_PASSWORD).await;
+    age_session(&srv, &expired, "9 hours").await;
+
+    let sessions = srv
+        .state()
+        .auth
+        .platform_login
+        .as_ref()
+        .expect("platform login is built")
+        .sessions();
+    let mut batches = Vec::new();
+    loop {
+        let removed = sessions
+            .purge_ended_browser_sessions()
+            .await
+            .expect("purge runs");
+        batches.push(removed);
+        if removed == 0 {
+            break;
+        }
+    }
+    assert_eq!(batches, [3, 0], "every ended session goes, then nothing");
+    let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM platform.browser_sessions")
+        .fetch_one(srv.operator_pool().pool())
+        .await
+        .expect("sessions count");
+    assert_eq!(remaining, 1, "only the live session remains");
+    assert_eq!(session_status(&srv, &live).await, StatusCode::OK);
+}

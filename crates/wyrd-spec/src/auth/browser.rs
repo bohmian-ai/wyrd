@@ -234,8 +234,24 @@ pub struct PasswordChangeRequest {
     pub new_password: SecretBearer,
 }
 
-/// Body of `POST /auth/browser/password/reset`: choose a new password with an
-/// operator-issued one-time reset code.
+/// Body of `POST /auth/browser/password/reset/request`: ask for a reset code
+/// to be mailed to the named User's verified recovery address.
+///
+/// Every admitted request gets the same answer whether or not the
+/// workspace, User or address exists, so the request names the account by
+/// workspace and username, never by email.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct PasswordResetCodeRequest {
+    /// The tenant's route key.
+    pub tenant: TenantSlug,
+    /// The local username, canonicalized by the server.
+    pub username: String,
+}
+
+/// Body of `POST /auth/browser/password/reset`: choose a new password with a
+/// one-time reset code, operator-issued or mailed to a verified contact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]

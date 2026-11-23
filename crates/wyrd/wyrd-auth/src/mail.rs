@@ -315,6 +315,42 @@ impl ApplicationMail {
             .await
     }
 
+    /// Mail `to`, a User's verified contact, the code that resets the
+    /// User's password and the workspace `reset_page` to paste it into. The
+    /// code is never part of a URL.
+    ///
+    /// # Errors
+    /// As [`Self::send_signup_proof`].
+    pub async fn send_password_reset(
+        &self,
+        to: &EmailAddress,
+        reset_page: &str,
+        code: &str,
+    ) -> Result<(), WyrdError> {
+        let body = format!(
+            "Someone asked to reset the password of your Wyrd account. Open this \
+             page:\n\n{reset_page}\n\nand paste this code there:\n\n{code}\n\nIt works \
+             once and expires in fifteen minutes. If you did not ask for this, ignore \
+             this message; your password stays as it is.\n"
+        );
+        self.send_notice(to, "Reset your Wyrd password", body).await
+    }
+
+    /// Tell `to`, a User's verified contact, that the User's password was
+    /// reset. The message carries no password or code.
+    ///
+    /// # Errors
+    /// As [`Self::send_signup_proof`].
+    pub async fn send_password_reset_done(&self, to: &EmailAddress) -> Result<(), WyrdError> {
+        let body = "The password of your Wyrd account was reset, and every browser and \
+                    CLI sign-in with the old password has ended. Sign in again with the \
+                    new password. If you did not do this, contact your workspace \
+                    administrator.\n"
+            .to_owned();
+        self.send_notice(to, "Your Wyrd password was reset", body)
+            .await
+    }
+
     /// Send one message through the configured relay.
     ///
     /// # Errors

@@ -51,6 +51,10 @@ pub enum SignupAdmissionScope {
     Identity,
     /// The trusted source of an unauthenticated sign-in start.
     SignIn,
+    /// The trusted source of a password-reset request.
+    Reset,
+    /// The tenant account a password-reset request names.
+    ResetAccount,
 }
 
 impl SignupAdmissionScope {
@@ -62,6 +66,8 @@ impl SignupAdmissionScope {
             Self::Source => "source",
             Self::Identity => "identity",
             Self::SignIn => "sign_in",
+            Self::Reset => "reset",
+            Self::ResetAccount => "reset_account",
         }
     }
 }

@@ -73,6 +73,74 @@ async fn relay_to_mailpit(srv: &WyrdTestServer, session: &str) -> String {
     api
 }
 
+/// The visitor address the browser helpers present unless told otherwise.
+const VISITOR: &str = "203.0.113.9";
+
+/// One request body: JSON, or an urlencoded form.
+enum Payload<'a> {
+    /// No body.
+    Empty,
+    /// A JSON body.
+    Json(&'a Value),
+    /// An `application/x-www-form-urlencoded` body.
+    Form(String),
+}
+
+/// A same-origin browser request to `uri` through the ingress from the
+/// visitor `client`, carrying `cookies`; returns the status, every
+/// `Set-Cookie` value and the body (`null` when it is not JSON).
+async fn ingress(
+    srv: &WyrdTestServer,
+    method: Method,
+    uri: &str,
+    client: &str,
+    cookies: &[&str],
+    payload: Payload<'_>,
+) -> (StatusCode, Vec<String>, Value) {
+    let peer: IpAddr = "10.7.0.1".parse().expect("peer address");
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::HOST, SOCIAL_HOST)
+        .header(header::ORIGIN, format!("http://{SOCIAL_HOST}"))
+        .header(CLIENT_HEADER, client)
+        .extension(axum::extract::ConnectInfo(SocketAddr::new(peer, 40_000)));
+    if !cookies.is_empty() {
+        builder = builder.header(header::COOKIE, cookies.join("; "));
+    }
+    let body = match payload {
+        Payload::Empty => Body::empty(),
+        Payload::Json(body) => {
+            builder = builder.header(header::CONTENT_TYPE, "application/json");
+            Body::from(serde_json::to_vec(body).expect("serializes"))
+        }
+        Payload::Form(form) => {
+            builder = builder.header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+            Body::from(form)
+        }
+    };
+    let resp = srv
+        .oneshot(builder.body(body).expect("request builds"))
+        .await
+        .expect("route responds");
+    let status = resp.status();
+    let cookies = resp
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .collect();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .expect("read body");
+    (
+        status,
+        cookies,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
 /// A same-origin browser `POST` of `body` to `uri` through the ingress,
 /// carrying `cookies`; returns the status, the value of the `Set-Cookie`
 /// named `set`, and the body.
@@ -83,45 +151,40 @@ async fn browser(
     set: &str,
     body: &Value,
 ) -> (StatusCode, Option<String>, Value) {
-    let peer: IpAddr = "10.7.0.1".parse().expect("peer address");
-    let mut builder = Request::builder()
-        .method(Method::POST)
-        .uri(uri)
-        .header(header::HOST, SOCIAL_HOST)
-        .header(header::ORIGIN, format!("http://{SOCIAL_HOST}"))
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(CLIENT_HEADER, "203.0.113.9")
-        .extension(axum::extract::ConnectInfo(SocketAddr::new(peer, 40_000)));
-    if !cookies.is_empty() {
-        builder = builder.header(header::COOKIE, cookies.join("; "));
-    }
-    let request = builder
-        .body(Body::from(serde_json::to_vec(body).expect("serializes")))
-        .expect("request builds");
-    let resp = srv.oneshot(request).await.expect("route responds");
-    let status = resp.status();
+    let (status, set_cookies, body) = ingress(
+        srv,
+        Method::POST,
+        uri,
+        VISITOR,
+        cookies,
+        Payload::Json(body),
+    )
+    .await;
     let prefix = format!("{set}=");
-    let cookie = resp
-        .headers()
-        .get_all(header::SET_COOKIE)
+    let cookie = set_cookies
         .iter()
-        .filter_map(|value| value.to_str().ok())
         .find(|value| value.starts_with(&prefix))
         .and_then(|value| value.split(';').next())
         .map(str::to_owned);
-    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
-        .await
-        .expect("read body");
-    (
-        status,
-        cookie,
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
-    )
+    (status, cookie, body)
 }
 
 /// Sign `admin` in to `slug` with [`PASSWORD`]; returns its session
 /// cookie pair.
 async fn sign_in(srv: &WyrdTestServer, slug: &str) -> String {
+    sign_in_as(srv, slug, "admin", PASSWORD)
+        .await
+        .expect("a password session")
+}
+
+/// Sign `username` in to `slug` with `password`; returns its session
+/// cookie pair, or the refusal's status.
+async fn sign_in_as(
+    srv: &WyrdTestServer,
+    slug: &str,
+    username: &str,
+    password: &str,
+) -> Result<String, StatusCode> {
     let resp = srv
         .oneshot(
             Request::builder()
@@ -130,21 +193,23 @@ async fn sign_in(srv: &WyrdTestServer, slug: &str) -> String {
                 .header(header::HOST, SOCIAL_HOST)
                 .header(header::ORIGIN, format!("http://{SOCIAL_HOST}"))
                 .header(header::CONTENT_TYPE, "application/json")
-                .header(CLIENT_HEADER, "203.0.113.9")
+                .header(CLIENT_HEADER, VISITOR)
                 .extension(axum::extract::ConnectInfo(SocketAddr::new(
                     "10.7.0.1".parse().expect("peer"),
                     40_000,
                 )))
                 .body(Body::from(
-                    json!({ "tenant": slug, "username": "admin", "password": PASSWORD })
+                    json!({ "tenant": slug, "username": username, "password": password })
                         .to_string(),
                 ))
                 .expect("request builds"),
         )
         .await
         .expect("login responds");
-    assert_eq!(resp.status(), StatusCode::OK);
-    session_cookie(&resp, slug).expect("a password session")
+    if resp.status() != StatusCode::OK {
+        return Err(resp.status());
+    }
+    Ok(session_cookie(&resp, slug).expect("a password session"))
 }
 
 /// The proof the newest message to `address` carries in its link fragment,
@@ -362,4 +427,384 @@ async fn a_signed_in_user_verifies_and_replaces_a_recovery_contact() {
         "the notice names no new address"
     );
     sign_in(&srv, "harbor").await;
+}
+
+/// Make `address` the verified contact of the User signed in by
+/// `session` to `slug`, through the mailed proof.
+///
+/// # Panics
+/// Panics when the request, mail or verification fails.
+async fn verify_contact(srv: &WyrdTestServer, api: &str, slug: &str, session: &str, address: &str) {
+    let (status, flow, body) = browser(
+        srv,
+        "/auth/browser/email/request",
+        &[session],
+        "wyrd_contact",
+        &json!({ "tenant": slug, "email": address }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let (proof, _) = mailed_proof(api, address).await;
+    let (status, _, body) = browser(
+        srv,
+        "/auth/browser/email/verify",
+        &[session, &flow.expect("a flow cookie")],
+        "wyrd_contact",
+        &json!({ "tenant": slug, "proof": proof }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+}
+
+/// The subject of a mailed reset code.
+const RESET_SUBJECT: &str = "Reset your Wyrd password";
+
+/// The subject of the notice that a reset took effect.
+const RESET_DONE_SUBJECT: &str = "Your Wyrd password was reset";
+
+/// Ask for a reset of `username` at `tenant` from the visitor `client`;
+/// returns the status, the body and how long the answer took.
+async fn request_reset(
+    srv: &WyrdTestServer,
+    tenant: &str,
+    username: &str,
+    client: &str,
+) -> (StatusCode, Value, std::time::Duration) {
+    let started = std::time::Instant::now();
+    let (status, _, body) = ingress(
+        srv,
+        Method::POST,
+        "/auth/browser/password/reset/request",
+        client,
+        &[],
+        Payload::Json(&json!({ "tenant": tenant, "username": username })),
+    )
+    .await;
+    (status, body, started.elapsed())
+}
+
+/// The texts of the messages with `subject` to `address`, newest first,
+/// once there are at least `count`.
+///
+/// Reset mail is sent after the answer, so this polls Mailpit for up to ten
+/// seconds.
+///
+/// # Panics
+/// Panics when fewer than `count` arrive in time.
+async fn await_mail(api: &str, address: &str, subject: &str, count: usize) -> Vec<String> {
+    for _ in 0..100 {
+        let texts: Vec<String> = mail_to(api, address)
+            .await
+            .into_iter()
+            .filter(|(_, _, sent, _)| sent == subject)
+            .map(|(_, _, _, text)| text)
+            .collect();
+        if texts.len() >= count {
+            return texts;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("fewer than {count} messages titled {subject:?} arrived");
+}
+
+/// How many messages with `subject` Mailpit holds for `address`.
+async fn mail_count(api: &str, address: &str, subject: &str) -> usize {
+    mail_to(api, address)
+        .await
+        .iter()
+        .filter(|(_, _, sent, _)| sent == subject)
+        .count()
+}
+
+/// The pasteable reset code a reset message carries: its one 43-character
+/// base64url word.
+///
+/// # Panics
+/// Panics when the message has no such word, or more than one.
+fn reset_code(text: &str) -> String {
+    let codes: Vec<&str> = text
+        .split_whitespace()
+        .filter(|word| {
+            word.len() == 43
+                && word
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        })
+        .collect();
+    assert_eq!(codes.len(), 1, "one code to paste: {text}");
+    codes[0].to_owned()
+}
+
+/// Redeem `code` at `tenant` with `new_password`; returns the status,
+/// every `Set-Cookie` and the body.
+async fn redeem(
+    srv: &WyrdTestServer,
+    tenant: &str,
+    code: &str,
+    new_password: &str,
+) -> (StatusCode, Vec<String>, Value) {
+    ingress(
+        srv,
+        Method::POST,
+        "/auth/browser/password/reset",
+        VISITOR,
+        &[],
+        Payload::Json(
+            &json!({ "tenant": tenant, "reset_code": code, "new_password": new_password }),
+        ),
+    )
+    .await
+}
+
+/// The median of `samples`.
+fn median(mut samples: Vec<std::time::Duration>) -> std::time::Duration {
+    samples.sort();
+    samples[samples.len() / 2]
+}
+
+/// A real `wyrd-cli` device sign-in approved by `session` at `slug`;
+/// returns the token response.
+///
+/// # Panics
+/// Panics when a step of the device flow fails.
+async fn device_sign_in(srv: &WyrdTestServer, slug: &str, session: &str) -> Value {
+    let (status, _, device) = ingress(
+        srv,
+        Method::POST,
+        "/auth/device_authorization",
+        VISITOR,
+        &[],
+        Payload::Form(format!("client_id=wyrd-cli&tenant={slug}")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{device}");
+    let approve = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("tenant", slug)
+        .append_pair(
+            "user_code",
+            device["user_code"].as_str().expect("user code"),
+        )
+        .append_pair("decision", "approve")
+        .finish();
+    let (status, _, _) = ingress(
+        srv,
+        Method::POST,
+        "/auth/device",
+        VISITOR,
+        &[session],
+        Payload::Form(approve),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the signed-in session approves");
+    let poll = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("grant_type", "urn:ietf:params:oauth:grant-type:device_code")
+        .append_pair(
+            "device_code",
+            device["device_code"].as_str().expect("device code"),
+        )
+        .append_pair("client_id", "wyrd-cli")
+        .finish();
+    let (status, _, token) = ingress(
+        srv,
+        Method::POST,
+        "/auth/token",
+        VISITOR,
+        &[],
+        Payload::Form(poll),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{token}");
+    token
+}
+
+/// Renew a CLI sign-in with `refresh`; returns the status and body.
+async fn renew(srv: &WyrdTestServer, refresh: &str) -> (StatusCode, Value) {
+    let form = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("grant_type", "refresh_token")
+        .append_pair("refresh_token", refresh)
+        .append_pair("client_id", "wyrd-cli")
+        .finish();
+    let (status, _, body) = ingress(
+        srv,
+        Method::POST,
+        "/auth/token",
+        VISITOR,
+        &[],
+        Payload::Form(form),
+    )
+    .await;
+    (status, body)
+}
+
+/// A local User who forgot a password resets it through a verified contact:
+///   1. reset requests for a verified User, an unknown username, an
+///      unverified User, a suspended User and an unknown workspace all get the
+///      same generic `202` body with comparable timing, and only the
+///      verified User's contact is mailed: a workspace reset link and a code
+///      to paste, never a code in a URL;
+///   2. redeeming the newest mailed code sets the password and signs nothing
+///      in; the old password, browser session and CLI renewal stop working,
+///      the personal API key keeps working and the new password signs in;
+///   3. the contact is told the reset took effect, without the password, and
+///      the same code cannot be used again.
+///
+/// # Panics
+/// Panics when a step answers, mails or resets differently.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_verified_contact_resets_a_forgotten_password() {
+    let (srv, operator) = contact_server("quay").await;
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    let api = relay_to_mailpit(&srv, &operator).await;
+    let ada = "ada.reset@example.test";
+    let cy = "cy.reset@example.test";
+    let session = sign_in(&srv, "quay").await;
+    verify_contact(&srv, &api, "quay", &session, ada).await;
+    for name in ["bea", "cyd"] {
+        let (status, _, body) = browser(
+            &srv,
+            "/v1/principals/users",
+            &[&session],
+            "-",
+            &json!({
+                "username": name,
+                "password": PASSWORD,
+                "assignments": [{ "role": "viewer", "scope": "all" }],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    let cy_session = sign_in_as(&srv, "quay", "cyd", PASSWORD)
+        .await
+        .expect("cyd signs in");
+    verify_contact(&srv, &api, "quay", &cy_session, cy).await;
+    sqlx::query("UPDATE wyrd.auth_users SET status = 'suspended' WHERE username = 'cyd'")
+        .execute(&superuser)
+        .await
+        .expect("cyd is suspended");
+    let (status, _, me) = ingress(
+        &srv,
+        Method::GET,
+        "/v1/principals/me",
+        VISITOR,
+        &[&session],
+        Payload::Empty,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    let admin = me["principal_id"]
+        .as_str()
+        .expect("principal id")
+        .to_owned();
+    let (status, _, key) = browser(
+        &srv,
+        &format!("/v1/principals/{admin}/credentials"),
+        &[&session],
+        "-",
+        &json!({ "name": "laptop", "permission_ceiling": ["cards:read"], "expires_in": 3600 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{key}");
+    let key = secrecy::SecretString::from(key["credential"].as_str().expect("key").to_owned());
+    let cli = device_sign_in(&srv, "quay", &session).await;
+    let (status, cli) = renew(&srv, cli["refresh_token"].as_str().expect("refresh")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the CLI renews before the reset: {cli}"
+    );
+
+    // 1. Every request gets the same answer; only the verified User is mailed.
+    let mut known = Vec::new();
+    let mut others = Vec::new();
+    for _ in 0..3 {
+        for (tenant, username) in [
+            ("quay", "admin"),
+            ("quay", "nobody"),
+            ("quay", "bea"),
+            ("quay", "cyd"),
+            ("nowhere", "admin"),
+        ] {
+            let (status, body, took) = request_reset(&srv, tenant, username, VISITOR).await;
+            assert_eq!(status, StatusCode::ACCEPTED, "{tenant}/{username}: {body}");
+            assert_eq!(
+                body,
+                json!({ "status": "check_email" }),
+                "{tenant}/{username}"
+            );
+            if username == "admin" && tenant == "quay" {
+                known.push(took);
+            } else {
+                others.push(took);
+            }
+        }
+    }
+    let (known, others) = (median(known), median(others));
+    assert!(
+        known.abs_diff(others) < others.max(std::time::Duration::from_millis(25)),
+        "known {known:?} against others {others:?}"
+    );
+    let texts = await_mail(&api, ada, RESET_SUBJECT, 3).await;
+    for text in &texts {
+        assert!(text.contains("http://wyrd.test/t/quay/reset"), "{text}");
+        let code = reset_code(text);
+        for line in text.lines().filter(|line| line.contains("http")) {
+            assert!(!line.contains(&code), "the code is never in a URL: {line}");
+        }
+    }
+    assert_eq!(
+        mail_count(&api, cy, RESET_SUBJECT).await,
+        0,
+        "a suspended User gets nothing"
+    );
+
+    // 2. The newest code sets the password, signs nothing in and ends local sign-ins.
+    let fresh = "quiet harbor lanterns";
+    let code = reset_code(&texts[0]);
+    let (status, cookies, body) = redeem(&srv, "quay", &code, fresh).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert!(
+        !cookies
+            .iter()
+            .any(|cookie| cookie.starts_with("wyrd_session_")),
+        "a reset signs nothing in: {cookies:?}"
+    );
+    let (status, _, _) = ingress(
+        &srv,
+        Method::GET,
+        "/auth/browser/session?tenant=quay",
+        VISITOR,
+        &[&session],
+        Payload::Empty,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "the old session ended");
+    let (status, body) = renew(&srv, cli["refresh_token"].as_str().expect("refresh")).await;
+    assert!(
+        status.is_client_error(),
+        "the CLI cannot renew: {status} {body}"
+    );
+    srv.exchange_api_key(&key)
+        .await
+        .expect("the personal key survives the reset");
+    assert_eq!(
+        sign_in_as(&srv, "quay", "admin", PASSWORD).await,
+        Err(StatusCode::UNAUTHORIZED)
+    );
+    sign_in_as(&srv, "quay", "admin", fresh)
+        .await
+        .expect("the new password signs in");
+
+    // 3. The contact hears of it, and the code is spent.
+    let notices = await_mail(&api, ada, RESET_DONE_SUBJECT, 1).await;
+    assert!(!notices[0].contains(fresh), "the notice omits the password");
+    let (status, _, body) = redeem(&srv, "quay", &code, "another quiet harbor").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(
+        body["code"], "WYRD_AUTH_401_ONE_TIME_CODE_INVALID",
+        "{body}"
+    );
 }

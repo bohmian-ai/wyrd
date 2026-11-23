@@ -22,3 +22,10 @@ CREATE POLICY tenant_isolation ON wyrd.auth_user_contacts
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
 CREATE POLICY operator_access ON wyrd.auth_user_contacts TO CURRENT_USER
     USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
+
+-- A reset code mailed to a verified contact is bound to that contact's
+-- revision; replacing the contact makes the code unusable (revision 6,
+-- "Recovery and admission metadata" and the "reset-contact revision validity"
+-- support property). Operator-issued codes carry none.
+ALTER TABLE wyrd.auth_password_resets
+    ADD COLUMN contact_revision BIGINT CHECK (contact_revision > 0);

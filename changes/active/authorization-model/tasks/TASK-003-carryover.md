@@ -888,6 +888,54 @@ reset still works; removing SMTP does not invalidate issued codes.
 and key use, plus tenant SQL one-use/contact-revision integration. RED is missing
 reset-request/send isolation; existing contact and reset redemption are reused and regressed.
 
+**Cycle 13 evidence (in progress).**
+
+- Scenario 1, a verified contact resets a forgotten password:
+  `platform_admin_e2e::contacts::a_verified_contact_resets_a_forgotten_password`
+  (`crates/wyrd/wyrd-server/tests/integration/platform_admin_e2e/contacts.rs`).
+  It covers these cases:
+  - three rounds of requests for a verified User, an unknown username, an unverified User, a
+    suspended User with a verified contact and an unknown workspace all get `202`
+    `{"status":"check_email"}`; the verified User's median answer time is within the others'
+    median (or 25 ms) of theirs;
+  - only the verified User's contact is mailed: three messages, each with the workspace reset page
+    `/t/quay/reset` and one code to paste that is on no URL line; the suspended User's contact gets none;
+  - the newest code gives `204` with no session cookie; the old browser session gets `401`, the
+    CLI refresh token from a real device approval (which renewed once before) is refused, the
+    personal API key still exchanges, the old password is refused and the new one signs in;
+  - the contact receives one "password was reset" notice without the password; the same code then
+    gets `401 WYRD_AUTH_401_ONE_TIME_CODE_INVALID`.
+  - RED: `contacts.rs:710`, `401 WYRD_AUTH_401_UNAUTHENTICATED` for the unmatched route
+    `/auth/browser/password/reset/request` (the route did not exist). All setup before it
+    (contacts, Users, key, device sign-in and renewal) passed.
+  - First run failed in setup: the test's own username `cy` is shorter than the 3-character
+    minimum (`400` from `POST /v1/principals/users`). I renamed it `cyd`; no assertion changed.
+  - GREEN: 1 passed; 4 more consecutive runs in one container passed.
+  - In those reruns the cycle-12 journey failed at `contacts.rs:283` ("nothing was mailed")
+    only because Mailpit keeps the first run's messages to the same address inside one container.
+    Its first run in the container passed; a fresh container is the lane's setup.
+- Implementation:
+  - `POST /auth/browser/password/reset/request` `{tenant, username}` (`PasswordResetCodeRequest`).
+    The handler admits the request in its per-source window (`429 PASSWORD_ATTEMPTS`), refuses
+    with `403 METHOD_UNAVAILABLE` when the tenant's methods report does not offer
+    `password_reset` (no relay, password off, or company SSO required), then answers `202`.
+  - `SocialSignIn::request_password_reset` (`wyrd-auth/src/social/contacts.rs`) answers before any
+    account read. A process semaphore (16 permits) bounds the spawned send; with none free the
+    request sends nothing. The send resolves the tenant, counts the account window silently (3
+    messages per hour), and mails only an active local password User with a verified contact.
+    The code is issued through the existing `issue_password_reset`, bound to the password
+    revision and the contact revision, and replaces the User's earlier mailed codes. Mail goes
+    after the commit; a failed send is logged and not retried.
+  - Redemption reuses `BrowserSessions::password_reset`. A mailed code also needs its contact
+    revision to still be current, which is how a contact replacement invalidates old-contact codes.
+    After the commit the verified contact is told.
+  - Schema, both edited in place (unshipped, maintainer-approved): `platform.signup_admissions`
+    scopes gain `reset` and `reset_account` (`20261121000006`), and
+    `wyrd.auth_password_resets` gains a nullable `contact_revision` (`20261121000008`). Both cite
+    the spec's revision-6 "Recovery and admission metadata" row and the "reset-contact revision
+    validity" support property. No new table.
+- TDD: PASS for scenario 1.
+
 ### 14. Platform operators obtain isolated browser sessions and re-authenticate
 
 **Reuses:** Cycles 1–5 shared source/admission/password/method foundations and existing PlatformLogin/PlatformLoginRequest/platform principal and browser-session owners; add only the approved platform purpose.

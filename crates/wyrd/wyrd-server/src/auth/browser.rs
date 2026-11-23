@@ -31,8 +31,8 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
     BrowserApiKeyRequest, BrowserLoginRequest, BrowserLoginResponse, BrowserLogoutRequest,
     BrowserSessionQuery, BrowserSessionView, BrowserSessionsResponse, ContactRequest,
-    ContactVerifyRequest, PasswordChangeRequest, PasswordLoginRequest, PasswordResetRequest,
-    PasswordSignupRequest, ProofStatus, ProofStatusResponse,
+    ContactVerifyRequest, PasswordChangeRequest, PasswordLoginRequest, PasswordResetCodeRequest,
+    PasswordResetRequest, PasswordSignupRequest, ProofStatus, ProofStatusResponse,
 };
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::ids::TenantSlug;
@@ -973,8 +973,80 @@ pub async fn password_reset(
     let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
     require_same_origin(&headers, &origin)?;
     require_password(&state, &request.tenant).await?;
-    browser_sessions(&state)?.password_reset(request).await?;
+    browser_sessions(&state)?
+        .password_reset(request, state.auth.application_mail.as_ref())
+        .await?;
     Ok(with_cookies(StatusCode::NO_CONTENT, Vec::new(), ()))
+}
+
+/// `POST /auth/browser/password/reset/request` — mail a reset code to the
+/// named User's verified recovery address.
+///
+/// Every admitted request for a tenant that offers password reset gets the
+/// same `202`, answered before any account is read: only an active local
+/// password User with a verified contact is mailed, and a lost send is not
+/// retried. The request never locks the account.
+///
+/// # Errors
+/// `403 WYRD_AUTH_403_ORIGIN_REFUSED` without this deployment's exact
+/// `Origin`; `429 WYRD_AUTH_429_PASSWORD_ATTEMPTS` while this source's
+/// window is exhausted; `403 WYRD_AUTH_403_METHOD_UNAVAILABLE` when the
+/// tenant does not offer password reset; `503` when admission or the store
+/// is unavailable.
+#[utoipa::path(
+    post,
+    path = "/auth/browser/password/reset/request",
+    request_body = PasswordResetCodeRequest,
+    responses(
+        (status = 202, description = "Accepted; a code is mailed only when the account can \
+          use one", body = ProofStatusResponse),
+        (status = 400, description = "Invalid body (WYRD_SPEC_400_VALIDATION)",
+          body = WyrdProblem),
+        (status = 403, description = "Origin absent or foreign, or password reset is not \
+          offered (WYRD_AUTH_403_ORIGIN_REFUSED, WYRD_AUTH_403_METHOD_UNAVAILABLE)",
+          body = WyrdProblem),
+        (status = 429, description = "Too many requests from this source \
+          (WYRD_AUTH_429_PASSWORD_ATTEMPTS)", body = WyrdProblem,
+          headers(("Retry-After" = u64, description = "Seconds until the window ends"))),
+        (status = 503, description = "Admission or the store is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    security(()),
+    tag = "Auth"
+)]
+#[tracing::instrument(level = "debug", skip_all)]
+pub async fn password_reset_request(
+    State(state): State<AppState>,
+    RequestOrigin(origin): RequestOrigin,
+    headers: HeaderMap,
+    RequestSource(source): RequestSource,
+    request: Result<Json<PasswordResetCodeRequest>, JsonRejection>,
+) -> Result<Response, WyrdErrorResponse> {
+    let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
+    require_same_origin(&headers, &origin)?;
+    let social = social(&state)?;
+    social.admit_password_reset(source).await?;
+    if !available_methods(&state, Some(&request.tenant))
+        .await?
+        .email
+        .password_reset
+    {
+        return Err(method_unavailable("password reset"));
+    }
+    social.request_password_reset(
+        &browser_sessions(&state)?,
+        application_mail(&state)?,
+        request.tenant,
+        request.username,
+        &origin,
+    );
+    Ok(with_cookies(
+        StatusCode::ACCEPTED,
+        Vec::new(),
+        Json(ProofStatusResponse {
+            status: ProofStatus::CheckEmail,
+        }),
+    ))
 }
 
 /// Refuse unless `tenant`'s current methods report offers password sign-in.

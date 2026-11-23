@@ -38,6 +38,7 @@ use wyrd_sql::queries::auth::{
     attempt_refusal, consume_invitation, consume_password_reset, insert_invitation,
     insert_local_user, insert_password_reset, local_credential_by_username,
     local_credential_for_update, record_attempt_failure, reissue_invitation, set_password_hash,
+    verified_contact_for_update,
 };
 
 use crate::browser_sessions::{
@@ -46,6 +47,7 @@ use crate::browser_sessions::{
 };
 use crate::error::store_error;
 use crate::issuance::TenantGrant;
+use crate::mail::{ApplicationMail, EmailAddress};
 use crate::roles::{bind_assignments, validate_assignments};
 
 /// Largest raw password or code input accepted, in bytes, before any costly
@@ -487,7 +489,11 @@ pub async fn reissue(
 
 /// Record a one-use password reset for the local User `user_id`, issued by
 /// `issuer`, on `conn`; returns it with its code, shown once. `None` when the
-/// id names no local password User.
+/// id names no local password User, so a reset never adds a password.
+///
+/// A code to mail to the User's verified contact passes that contact's
+/// `contact_revision`: it replaces the User's earlier mailed codes and
+/// stops working once the contact is replaced. An operator passes `None`.
 ///
 /// # Errors
 /// Returns [`WyrdError::AuthVerifyUnavailable`] when the store fails.
@@ -495,6 +501,7 @@ pub async fn issue_password_reset(
     conn: &mut TenantConn<'_>,
     issuer: Uuid,
     user_id: Uuid,
+    contact_revision: Option<i64>,
 ) -> Result<Option<(PasswordResetRow, SecretBearer)>, WyrdError> {
     let Some(user) = local_credential_for_update(conn, user_id)
         .await
@@ -510,6 +517,7 @@ pub async fn issue_password_reset(
         user.id,
         user.password_revision,
         issuer,
+        contact_revision,
     )
     .await
     .map_err(store_error)?;
@@ -743,20 +751,29 @@ impl BrowserSessions {
         conn.commit().await.map_err(store_error)
     }
 
-    /// Set a local User's password with a one-use operator reset code.
+    /// Set a local User's password with a one-use reset code, operator-issued
+    /// or mailed to the User's verified contact.
     ///
     /// The code is checked for shape and the new password for policy before
     /// any lookup or derivation. One transaction then consumes the code and
     /// requires it to name an active local User whose password revision is
-    /// still the one it was issued at; success advances the revision,
-    /// ending every local session and spending every other reset code. Reset
-    /// never signs the browser in.
+    /// still the one it was issued at, and a mailed code's contact revision to
+    /// be the User's current one; success advances the password revision,
+    /// ending every local session and CLI renewal and spending every other
+    /// reset code, and leaves API keys alone. Reset never signs the browser
+    /// in. After the commit the User's verified contact, if any, is told
+    /// through `mail`; a notice that cannot be sent is logged and changes
+    /// nothing.
     ///
     /// # Errors
     /// Returns [`WyrdError::Validation`] for a new password outside policy,
     /// [`WyrdError::OneTimeCodeInvalid`] for an unknown tenant or an unusable
     /// code, and [`WyrdError::AuthVerifyUnavailable`] when the store fails.
-    pub async fn password_reset(&self, request: PasswordResetRequest) -> Result<(), WyrdError> {
+    pub async fn password_reset(
+        &self,
+        request: PasswordResetRequest,
+        mail: Option<&ApplicationMail>,
+    ) -> Result<(), WyrdError> {
         let code = code_hash(&request.reset_code)?;
         let replacement = new_password(&request.new_password.into_secret_string(), "new_password")?;
         let postgres = self.connections.postgres();
@@ -780,10 +797,26 @@ impl BrowserSessions {
         if !current {
             return Err(one_time_code_invalid());
         }
+        let contact = verified_contact_for_update(&mut conn, reset.user_id)
+            .await
+            .map_err(store_error)?;
+        if reset
+            .contact_revision
+            .is_some_and(|bound| contact.as_ref().map(|c| c.revision) != Some(bound))
+        {
+            return Err(one_time_code_invalid());
+        }
         set_password_hash(&mut conn, reset.user_id, &verifier, true)
             .await
             .map_err(store_error)?;
-        conn.commit().await.map_err(store_error)
+        conn.commit().await.map_err(store_error)?;
+        if let (Some(mail), Some(contact)) = (mail, contact)
+            && let Ok(to) = EmailAddress::parse(&contact.address, "email")
+            && let Err(error) = mail.send_password_reset_done(&to).await
+        {
+            tracing::warn!(error = %error, "the password reset notice was not sent");
+        }
+        Ok(())
     }
 
     /// Create a password session for `user_id` at `revision` on `conn`.

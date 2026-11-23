@@ -2281,6 +2281,31 @@ deferred('TASK-005: the current review set of a pull request loads its recorded 
   }
   await mcp.close();
 
+  // The built `ui://wyrd/view` artifact draws the same set through host tools/call alone, each answered by the real MCP server; with no host URLs its navigation stays buttons.
+  const host = new Client({ name: 'wyrd-ui-artifact-host', version: '1.0.0' }, { versionNegotiation: { mode: 'auto' } });
+  await host.connect(new StreamableHTTPClientTransport(new URL('/mcp', server.baseUrl), { fetch: admin.httpAuth }));
+  try {
+    const range = { from: new Date(Date.now() - 3_600_000).toISOString(), to: new Date(Date.now() + 60_000).toISOString() };
+    const doc = { version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range, panels: [{ id: 'sets', component: 'ReviewSets', input: { repository: policy.metadata.name, number: 7 } }] };
+    const built = await appBridgeView(doc, async (name, args) => ((await host.callTool({ name, arguments: args })).structuredContent ?? {}) as object);
+    const panel = () => built.document.querySelector('[data-panel="sets"]') as Element;
+    await vi.waitFor(() => expect(panel().querySelectorAll('.outs tbody tr')).toHaveLength(accepted.executions.length));
+    expect([...panel().querySelectorAll('.setrow')].map((row) => row.tagName)).toEqual(['BUTTON']);
+    expect(panel().querySelector('a[href$="/acme/api/pull/7"]')?.getAttribute('href')).toBe(`https://${github.host}/acme/api/pull/7`);
+    expect(panel().querySelector('a:not([href])')).toBeNull();
+    expect(new Set(built.calls.map((call) => call.name))).toEqual(new Set(['bifrost.query']));
+  } finally {
+    await host.close();
+  }
+
+  // A custom app's server loads the same set with its own key and never returns the key.
+  const custom = await loadExamplePanel({
+    request: new Request('http://app.test/view/load', { method: 'POST', body: JSON.stringify({ component: 'ReviewSets', input: { repository: policy.metadata.name, number: 7 }, range: { from: new Date(Date.now() - 3_600_000).toISOString(), to: new Date(Date.now() + 60_000).toISOString() } }) })
+  } as never);
+  const customText = await custom.text();
+  expect(customText).not.toContain(server.apiKey);
+  expect(JSON.parse(customText)).toMatchObject({ result: { state: 'populated', data: { current: accepted.generation, selected: { generation: accepted.generation, complete: true } } } });
+
   // Verify's own list finds the same members by their pull request, each naming its review set and the head it reviewed.
   const hour = { from: new Date(Date.now() - 3_600_000).toISOString(), to: new Date(Date.now() + 60_000).toISOString() };
   const listed = await loadRecordTable(

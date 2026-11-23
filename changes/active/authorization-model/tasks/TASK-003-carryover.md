@@ -983,6 +983,29 @@ as a usable way in for the last-administrator guard.
      commit in one transaction. 1 passed; the existing platform OIDC journeys
      (7) and `pg_platform_identity` (11) still pass.
 
+4. `platform_admin_e2e::console::destructive_console_changes_need_fresh_password_proof` and
+   `platform_admin_e2e::console::destructive_console_changes_accept_forced_fresh_idp_proof`
+   - RED (both): with proof older than five minutes, `PUT
+     /platform/tenants/{id}/status` (retiring a workspace) returned 200
+     (expected 403). Nothing checked browser freshness.
+   - GREEN: `PlatformCaller::require_recent_proof` runs first in tenant
+     status, social provider configure/enable, login settings, mail relay,
+     OIDC connection configure/remove, admin status and admin password. It
+     refuses only browser sessions whose `fresh_at` is outside the shared
+     five-minute window (`WYRD_AUTH_403_RECENT_LOGIN_REQUIRED`); platform API
+     tokens pass unchanged. With stale proof, retirement, provider, signup
+     settings and SMTP changes all refuse and the API-token readback is
+     unchanged. `POST /platform/browser/password/reauth` checks only the
+     session principal's own password: another operator's password, the
+     bootstrap key or a request with no session refreshes nothing; the right
+     password refreshes in place (no new cookie) and the changes land.
+     `POST /platform/browser/oidc/reauth` begins a login bound to this session
+     with `prompt=login` and `max_age=0`. The callback refreshes only that
+     presenting session, only for a token whose `auth_time` is within five
+     minutes and whose subject is already pinned to the same principal;
+     another registered operator's identity and a 10-minute-old
+     authentication refresh nothing. 2 passed.
+
 ### 15. Extend and approve the complete mock before production pages
 
 **Reuses:** Cycles 5–14 final contracts, journeys and platform session metadata; reuse the already approved signup visual direction.

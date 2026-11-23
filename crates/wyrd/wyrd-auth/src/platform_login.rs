@@ -37,7 +37,8 @@ use crate::callback::verify_response_issuer;
 use crate::error::relying_party_error;
 use crate::pg_resolvers::platform_connection_from_row;
 use crate::platform_sessions::{
-    CreatedPlatformBrowserSession, PlatformSessionError, PlatformSessions,
+    CreatedPlatformBrowserSession, PLATFORM_BROWSER_WINDOWS, PlatformBrowserSession,
+    PlatformSessionError, PlatformSessions,
 };
 use std::fmt::{Debug, Formatter, Result as FmtResult};
 
@@ -185,20 +186,24 @@ impl PlatformLogin {
             .await
     }
 
-    /// Begin a platform console sign-in in a browser.
+    /// Begin a platform console sign-in, or with `reauthenticate` a
+    /// same-operator re-authentication of that session, in a browser.
     ///
     /// As [`Self::begin`], and the login is also bound to a new random
     /// browser binding returned once for an `HttpOnly` cookie (only its
     /// SHA-256 is stored) and to the connection's current revision, so only
     /// that browser can finish it and a connection replaced meanwhile
-    /// refuses it.
+    /// refuses it. A re-authentication also records the session it
+    /// refreshes and asks the provider for a new login (`prompt=login`,
+    /// `max_age=0`).
     ///
     /// # Errors
     /// As [`Self::begin`].
-    #[tracing::instrument(level = "info", skip(self), err)]
+    #[tracing::instrument(level = "info", skip(self, reauthenticate), err)]
     pub async fn begin_browser(
         &self,
         redirect_uri: String,
+        reauthenticate: Option<&PlatformBrowserSession>,
     ) -> Result<BegunPlatformBrowserLogin, PlatformLoginError> {
         let (connection, revision) = self.connection().await?;
         let provider = self
@@ -215,6 +220,7 @@ impl PlatformLogin {
                 redirect_uri,
                 Some(PlatformLoginBinding {
                     browser_binding_hash: digest.as_bytes(),
+                    session_id: reauthenticate.map(|session| session.id),
                     connection_revision: revision,
                 }),
             )
@@ -245,7 +251,7 @@ impl PlatformLogin {
         redirect_uri: String,
         binding: Option<PlatformLoginBinding<'_>>,
     ) -> Result<LoginInitResponse, PlatformLoginError> {
-        let authorization = self
+        let mut authorization = self
             .relying_party
             .authorize(provider, &connection.client_id, &redirect_uri)
             .map_err(|error| match error {
@@ -255,6 +261,15 @@ impl PlatformLogin {
                 error => provider_unavailable(error),
             })?;
 
+        // A re-authentication must be a new login at the provider, not a
+        // provider session it already holds.
+        if binding.is_some_and(|binding| binding.session_id.is_some()) {
+            authorization
+                .url
+                .query_pairs_mut()
+                .append_pair("prompt", "login")
+                .append_pair("max_age", "0");
+        }
         insert_platform_login_state(
             &self.pool,
             NewPlatformLoginState {
@@ -345,26 +360,32 @@ impl PlatformLogin {
             .map_err(session_error)
     }
 
-    /// Complete a platform console sign-in in a browser and create its
-    /// platform browser session.
+    /// Complete a platform console sign-in or re-authentication in a
+    /// browser.
     ///
     /// As [`Self::complete`], except the login state is taken only with the
-    /// browser binding it began with, must belong to the connection revision
-    /// still in place, and the result is a browser session anchored to that
-    /// revision rather than a token.
+    /// browser binding it began with and must belong to the connection
+    /// revision still in place. A sign-in creates a browser session anchored
+    /// to that revision. A re-authentication must be presented by the very
+    /// session it began from (`presented`), carry a provider `auth_time`
+    /// within the recent-proof window, and verify to the identity already
+    /// pinned to that session's principal; it then refreshes that session.
     ///
     /// # Errors
-    /// As [`Self::complete`]; a missing or foreign binding, or a connection
-    /// replaced since begin, is [`PlatformLoginError::InvalidState`].
-    #[tracing::instrument(level = "info", skip(self, code, binding), err)]
+    /// As [`Self::complete`]; a missing or foreign binding, a connection
+    /// replaced since begin, or a re-authentication without its session is
+    /// [`PlatformLoginError::InvalidState`]; an old or absent `auth_time` or
+    /// another operator's identity is [`PlatformLoginError::NotAccepted`].
+    #[tracing::instrument(level = "info", skip(self, code, binding, presented), err)]
     pub async fn complete_browser(
         &self,
         code: SecretString,
         state: &str,
         response_issuer: Option<&str>,
         binding: &str,
+        presented: Option<&PlatformBrowserSession>,
         request_id: &str,
-    ) -> Result<CreatedPlatformBrowserSession, PlatformLoginError> {
+    ) -> Result<PlatformBrowserLogin, PlatformLoginError> {
         let digest = Sha256Hex::digest(binding.as_bytes());
         let VerifiedReturn {
             connection,
@@ -377,16 +398,31 @@ impl PlatformLogin {
         if login_state.connection_revision != Some(revision) {
             return Err(PlatformLoginError::InvalidState);
         }
+        let issuer = connection.verification.issuer.as_str();
+        if let Some(session_id) = login_state.session_id {
+            let session = presented
+                .filter(|session| session.id == session_id)
+                .ok_or(PlatformLoginError::InvalidState)?;
+            if !authenticated_recently(&verified) {
+                return Err(PlatformLoginError::NotAccepted);
+            }
+            self.sessions
+                .reauthenticate_federated(session, issuer, &verified.identity.subject)
+                .await
+                .map_err(session_error)?;
+            return Ok(PlatformBrowserLogin::Reauthenticated);
+        }
         let match_claim = verified_email(&verified);
         self.sessions
             .browser_federated(
-                connection.verification.issuer.as_str(),
+                issuer,
                 &verified.identity.subject,
                 match_claim.as_deref(),
                 revision,
                 request_id,
             )
             .await
+            .map(PlatformBrowserLogin::SignedIn)
             .map_err(session_error)
     }
 
@@ -485,6 +521,15 @@ impl Debug for BegunPlatformBrowserLogin {
     }
 }
 
+/// What a completed browser login did.
+#[derive(Debug)]
+pub enum PlatformBrowserLogin {
+    /// A sign-in created this session.
+    SignedIn(CreatedPlatformBrowserSession),
+    /// A re-authentication refreshed the session that presented it.
+    Reauthenticated,
+}
+
 /// A provider return this login verified.
 struct VerifiedReturn {
     /// The connection it was verified against.
@@ -545,6 +590,17 @@ fn verified_email(token: &VerifiedIdToken) -> Option<String> {
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     verified.then(|| token.identity.email.clone()).flatten()
+}
+
+/// Whether the provider says it authenticated the subject within the
+/// recent-proof window. A token without `auth_time` proves nothing fresh.
+fn authenticated_recently(token: &VerifiedIdToken) -> bool {
+    let window = PLATFORM_BROWSER_WINDOWS.recent.as_secs();
+    token
+        .claims
+        .get("auth_time")
+        .and_then(serde_json::Value::as_i64)
+        .is_some_and(|at| chrono::Utc::now().timestamp().abs_diff(at) <= window)
 }
 
 /// Project a session-owner refusal onto login: an identity that resolves to

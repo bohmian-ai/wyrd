@@ -247,6 +247,7 @@ async fn configure_connection(
     caller: PlatformCaller,
     Json(request): Json<ConfigurePlatformOidcRequest>,
 ) -> Result<Json<PlatformOidcConnectionView>, WyrdErrorResponse> {
+    caller.require_recent_proof()?;
     let pool = operator(&state)?;
     // The handle must outlive the transaction it lends out.
     let authz =
@@ -546,6 +547,7 @@ async fn remove_connection(
     State(state): State<AppState>,
     caller: PlatformCaller,
 ) -> Result<StatusCode, WyrdErrorResponse> {
+    caller.require_recent_proof()?;
     let pool = operator(&state)?;
     // The handle must outlive the transaction it lends out.
     let authz =
@@ -786,6 +788,7 @@ async fn set_admin_status(
     principal_id: Result<Path<Uuid>, PathRejection>,
     Json(request): Json<SetPlatformPrincipalStatusRequest>,
 ) -> Result<StatusCode, WyrdErrorResponse> {
+    caller.require_recent_proof()?;
     let Path(principal_id) = principal_id.map_err(|rejection| path_rejection(&rejection))?;
     // A malformed status is refused before any permission is evaluated, so the
     // request never opens a decision it would then have to discard.

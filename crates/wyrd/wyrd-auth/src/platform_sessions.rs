@@ -30,7 +30,7 @@ use wyrd_sql::queries::platform::console::{
 };
 use wyrd_sql::queries::platform::credentials::platform_credential_by_id;
 use wyrd_sql::queries::platform::identity::{
-    pin_platform_identity, platform_identity_by_subject_tx,
+    pin_platform_identity, platform_identity_by_subject, platform_identity_by_subject_tx,
 };
 use wyrd_sql::queries::platform::principals::{
     PlatformPrincipalRow, platform_principal_by_id, platform_principal_by_id_tx,
@@ -529,12 +529,36 @@ impl PlatformSessions {
         self.refresh_browser(session).await
     }
 
+    /// Record fresh proof on `session` after the platform IdP freshly
+    /// authenticated `subject` at `issuer`, which must be the identity
+    /// already pinned to the session's own principal. Re-authentication never
+    /// pins: an unpinned or another operator's identity refreshes nothing.
+    ///
+    /// # Errors
+    /// Returns [`PlatformSessionError::Invalid`] when the identity is not the
+    /// session principal's or the session is no longer live, and
+    /// [`PlatformSessionError::Store`] when the store fails.
+    #[tracing::instrument(level = "debug", skip(self, session), err)]
+    pub async fn reauthenticate_federated(
+        &self,
+        session: &PlatformBrowserSession,
+        issuer: &str,
+        subject: &str,
+    ) -> Result<(), PlatformSessionError> {
+        match platform_identity_by_subject(&self.pool, issuer, subject).await? {
+            Some(identity) if identity.principal_id == session.principal_id.as_uuid() => {
+                self.refresh_browser(session).await
+            }
+            _ => Err(PlatformSessionError::Invalid),
+        }
+    }
+
     /// Record fresh proof on `session`, which must still be live.
     ///
     /// # Errors
     /// Returns [`PlatformSessionError::Invalid`] when the session is no
     /// longer live and [`PlatformSessionError::Store`] when the store fails.
-    pub(crate) async fn refresh_browser(
+    async fn refresh_browser(
         &self,
         session: &PlatformBrowserSession,
     ) -> Result<(), PlatformSessionError> {

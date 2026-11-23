@@ -178,6 +178,9 @@ pub async fn swap_platform_sealed_secret_tx(
 pub struct PlatformLoginBinding<'a> {
     /// SHA-256 of the browser binding cookie the callback must present.
     pub browser_binding_hash: &'a [u8],
+    /// The platform browser session a same-operator re-authentication
+    /// refreshes; `None` for a sign-in.
+    pub session_id: Option<Uuid>,
     /// The connection revision the login began against.
     pub connection_revision: i64,
 }
@@ -197,7 +200,9 @@ pub struct NewPlatformLoginState<'a> {
     pub redirect_uri: &'a str,
     /// How long the login may take; `PostgreSQL` derives the expiry.
     pub ttl: Duration,
-    /// `None` for an API-token login; otherwise a browser sign-in's binding.
+    /// `None` for an API-token login; otherwise the browser binding of a
+    /// sign-in or, when it names a session, a same-operator
+    /// re-authentication.
     pub binding: Option<PlatformLoginBinding<'a>>,
 }
 
@@ -215,14 +220,20 @@ pub async fn insert_platform_login_state(
     login: NewPlatformLoginState<'_>,
 ) -> Result<(), SqlError> {
     let binding = login.binding;
-    let purpose = if binding.is_some() { "login" } else { "token" };
+    let purpose = match binding {
+        None => "token",
+        Some(PlatformLoginBinding {
+            session_id: None, ..
+        }) => "login",
+        Some(_) => "reauth",
+    };
     sqlx::query(
         "INSERT INTO platform.login_state
              (state, code_verifier, nonce, issuer, redirect_uri, expires_at,
-              purpose, browser_binding_hash, connection_revision)
+              purpose, browser_binding_hash, session_id, connection_revision)
          VALUES ($1, $2, $3, $4, $5,
                  statement_timestamp() + ($6 * interval '1 second'),
-                 $7, $8, $9)",
+                 $7, $8, $9, $10)",
     )
     .bind(login.state)
     .bind(login.code_verifier)
@@ -232,6 +243,7 @@ pub async fn insert_platform_login_state(
     .bind(login.ttl.as_secs_f64())
     .bind(purpose)
     .bind(binding.map(|binding| binding.browser_binding_hash))
+    .bind(binding.and_then(|binding| binding.session_id))
     .bind(binding.map(|binding| binding.connection_revision))
     .execute(pool.pool())
     .await
@@ -252,6 +264,8 @@ pub struct PlatformLoginStateRow {
     pub redirect_uri: String,
     /// Whether `PostgreSQL` judged the row still live when it deleted it.
     pub live: bool,
+    /// The browser session a re-authentication refreshes.
+    pub session_id: Option<Uuid>,
     /// The connection revision a browser login began against.
     pub connection_revision: Option<i64>,
 }
@@ -282,7 +296,7 @@ pub async fn take_platform_login_state(
                     ELSE browser_binding_hash = $2 END
          RETURNING code_verifier, nonce, issuer, redirect_uri,
                    expires_at > statement_timestamp() AS live,
-                   connection_revision",
+                   session_id, connection_revision",
     )
     .bind(state)
     .bind(browser_binding_hash)

@@ -899,3 +899,364 @@ async fn a_registered_operator_signs_in_to_the_console_through_platform_oidc() {
     let reply = oidc_callback(&srv, &[&again.binding], &again.state, &issuer).await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
 }
+
+/// Make the session `cookie` names hold no fresh proof, as if its last
+/// sign-in or re-authentication were six minutes ago.
+///
+/// # Panics
+/// Panics when the update fails or matches no session.
+async fn stale_proof(srv: &WyrdTestServer, cookie: &str) {
+    let value = cookie.split_once('=').expect("cookie pair").1;
+    let staled = sqlx::query(
+        "UPDATE platform.browser_sessions SET fresh_at = fresh_at - interval '6 minutes'
+          WHERE session_hash = sha256(convert_to($1, 'UTF8'))",
+    )
+    .bind(value)
+    .execute(srv.operator_pool().pool())
+    .await
+    .expect("proof stales");
+    assert_eq!(staled.rows_affected(), 1, "the cookie names one session");
+}
+
+/// The destructive platform changes fresh proof guards: retiring workspace
+/// `tenant`, changing a social provider, signup settings and SMTP.
+fn destructive_changes(tenant: &str) -> Vec<(String, Value)> {
+    vec![
+        (
+            format!("/platform/tenants/{tenant}/status"),
+            json!({ "status": "suspended" }),
+        ),
+        (
+            "/platform/social/providers/google".to_owned(),
+            json!({ "client_id": "wyrd-google", "client_secret": "google-client-secret-value" }),
+        ),
+        (
+            "/platform/login-settings".to_owned(),
+            json!({ "password_enabled": true, "signup_enabled": false,
+                "signup_workspace_cap": 4, "signup_challenge": null }),
+        ),
+        (
+            "/platform/mail".to_owned(),
+            json!({ "host": "relay.wyrd.test", "port": 2525, "tls": "none",
+                "username": "relay-user", "password": "relay-password-plaintext",
+                "sender": "invites@wyrd.test" }),
+        ),
+    ]
+}
+
+/// What the destructive changes would alter, read through the API token.
+async fn platform_settings(srv: &WyrdTestServer, api: &str, tenant: &str) -> Vec<Value> {
+    let mut read = Vec::new();
+    for uri in [
+        format!("/platform/tenants/{tenant}"),
+        "/platform/social/providers".to_owned(),
+        "/platform/login-settings".to_owned(),
+        "/platform/mail".to_owned(),
+    ] {
+        let (status, body) =
+            social_call(srv, social_request(Method::GET, &uri, Some(api), None)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        read.push(body);
+    }
+    read
+}
+
+/// Attempt every destructive change with `cookie` and return each status.
+async fn attempt_destructive_changes(
+    srv: &WyrdTestServer,
+    cookie: &str,
+    tenant: &str,
+) -> Vec<StatusCode> {
+    let mut statuses = Vec::new();
+    for (uri, body) in destructive_changes(tenant) {
+        statuses.push(
+            browser(srv, Method::PUT, &uri, &[cookie], true, Some(&body))
+                .await
+                .status,
+        );
+    }
+    statuses
+}
+
+/// Create workspace `slug` through the API token and return its id.
+///
+/// # Panics
+/// Panics when provisioning is refused.
+async fn create_workspace(srv: &WyrdTestServer, api: &str, slug: &str) -> String {
+    let (status, created) = social_call(
+        srv,
+        social_request(
+            Method::POST,
+            "/platform/tenants",
+            Some(api),
+            Some(json!({ "slug": slug, "display_name": slug })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    created["tenant"]["id"]
+        .as_str()
+        .expect("tenant id")
+        .to_owned()
+}
+
+/// Destructive platform changes from the console need fresh proof from the
+/// same operator, by password:
+///   1. a session whose proof is older than five minutes changes nothing:
+///      workspace retirement, providers, signup settings and SMTP all refuse;
+///   2. another operator's password, the bootstrap key, or a tenant session
+///      cannot supply the proof;
+///   3. the operator's own password re-authenticates the session, and the
+///      same changes then succeed;
+///   4. the API-token channel stays available without browser proof.
+///
+/// # Panics
+/// Panics when a change lands without fresh proof or fresh proof is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn destructive_console_changes_need_fresh_password_proof() {
+    let (srv, root, api) = console_server().await;
+    register_password_operator(&srv, &api, "ops").await;
+    let other = register_password_operator(&srv, &api, "other").await;
+    set_operator_password(&srv, &api, &other, "copper finch 2026").await;
+    let tenant = create_workspace(&srv, &api, "retiring").await;
+    let cookie = signed_in(&srv, "ops", OPERATOR_PASSWORD).await;
+    let before = platform_settings(&srv, &api, &tenant).await;
+
+    // 1. Stale proof changes nothing.
+    stale_proof(&srv, &cookie).await;
+    for status in attempt_destructive_changes(&srv, &cookie, &tenant).await {
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+    assert_eq!(
+        platform_settings(&srv, &api, &tenant).await,
+        before,
+        "no mutation"
+    );
+
+    // 2. Nobody else's proof re-authenticates this session.
+    let reauth = |cookies: Vec<String>, password: String| {
+        let srv = &srv;
+        async move {
+            let cookies: Vec<&str> = cookies.iter().map(String::as_str).collect();
+            browser(
+                srv,
+                Method::POST,
+                "/platform/browser/password/reauth",
+                &cookies,
+                true,
+                Some(&json!({ "password": password })),
+            )
+            .await
+        }
+    };
+    for password in ["copper finch 2026", root.as_str()] {
+        let reply = reauth(vec![cookie.clone()], password.to_owned()).await;
+        assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{}", reply.body);
+    }
+    let reply = reauth(Vec::new(), OPERATOR_PASSWORD.to_owned()).await;
+    assert_eq!(
+        reply.status,
+        StatusCode::UNAUTHORIZED,
+        "no session, no proof"
+    );
+    for status in attempt_destructive_changes(&srv, &cookie, &tenant).await {
+        assert_eq!(status, StatusCode::FORBIDDEN, "still stale");
+    }
+    assert_eq!(
+        platform_settings(&srv, &api, &tenant).await,
+        before,
+        "no mutation"
+    );
+
+    // 3. The operator's own password makes the proof fresh.
+    let reply = reauth(vec![cookie.clone()], OPERATOR_PASSWORD.to_owned()).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    assert_eq!(reply.body["recent"], true);
+    assert!(
+        reply.cookie(PLATFORM_COOKIE).is_none(),
+        "the session is kept"
+    );
+    for status in attempt_destructive_changes(&srv, &cookie, &tenant).await {
+        assert!(status.is_success(), "{status}");
+    }
+    assert_ne!(
+        platform_settings(&srv, &api, &tenant).await,
+        before,
+        "the changes landed"
+    );
+
+    // 4. The API token needs no browser proof.
+    let (status, body) = social_call(
+        &srv,
+        social_request(
+            Method::PUT,
+            &format!("/platform/tenants/{tenant}/status"),
+            Some(&api),
+            Some(json!({ "status": "active" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// A token-endpoint reply whose ID token, for `nonce`, asserts provider
+/// `subject` with verified `email` and an authentication at `auth_time`.
+///
+/// # Panics
+/// Panics when the test key does not load or the token does not sign.
+fn authenticated_at(
+    issuer: &str,
+    nonce: &str,
+    subject: &str,
+    email: &str,
+    auth_time: i64,
+) -> wiremock::ResponseTemplate {
+    let now = chrono::Utc::now().timestamp();
+    let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::EdDSA);
+    header.kid = Some("mock-1".to_owned());
+    let key = jsonwebtoken::EncodingKey::from_ed_pem(super::PLATFORM_SIGNING_KEY.as_bytes())
+        .expect("test key loads");
+    let id_token = jsonwebtoken::encode(
+        &header,
+        &json!({
+            "iss": issuer, "sub": subject, "aud": super::PLATFORM_CLIENT,
+            "exp": now + 3600, "iat": now, "nonce": nonce,
+            "email": email, "email_verified": true, "auth_time": auth_time,
+        }),
+        &key,
+    )
+    .expect("token signs");
+    wiremock::ResponseTemplate::new(200).set_body_json(json!({
+        "access_token": "provider-access", "token_type": "Bearer", "id_token": id_token,
+    }))
+}
+
+/// Destructive platform changes from the console accept forced-fresh proof
+/// from the platform IdP, and only from the same operator:
+///   1. re-authentication begins only from a live platform session and asks
+///      the provider for a new login (`prompt=login`, `max_age=0`);
+///   2. a return for another registered operator, or one whose
+///      authentication is older than five minutes, refreshes nothing;
+///   3. a fresh return for the same operator refreshes the session it
+///      began from, without a new cookie, and the change then succeeds.
+///
+/// # Panics
+/// Panics when proof is accepted from the wrong identity or time, or
+/// refused from the right one.
+#[tokio::test(flavor = "multi_thread")]
+async fn destructive_console_changes_accept_forced_fresh_idp_proof() {
+    let (srv, _root, api) = console_server().await;
+    let provider = wiremock::MockServer::start().await;
+    let issuer = provider.uri();
+    let mount =
+        |reply| super::mount_platform_provider(&provider, super::platform_key_set("mock-1"), reply);
+    mount(wiremock::ResponseTemplate::new(500)).await;
+    configure_platform_oidc(&srv, &api, &issuer).await;
+    let now = chrono::Utc::now().timestamp();
+    let mut sessions = Vec::new();
+    for (name, subject, email) in [
+        ("ops-lead", "provider-subject-1", "ops@example.com"),
+        ("deputy", "provider-subject-2", "deputy@example.com"),
+    ] {
+        let (status, body) = social_call(
+            &srv,
+            social_request(
+                Method::POST,
+                "/platform/admins",
+                Some(&api),
+                Some(json!({ "name": name, "match_claim": email })),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let begun = begin_oidc(&srv).await;
+        mount(authenticated_at(&issuer, &begun.nonce, subject, email, now)).await;
+        let reply = oidc_callback(&srv, &[&begun.binding], &begun.state, &issuer).await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+        sessions.push(reply.cookie(PLATFORM_COOKIE).expect("platform cookie"));
+    }
+    let ops = sessions[0].clone();
+    let tenant = create_workspace(&srv, &api, "retiring").await;
+    let retire = format!("/platform/tenants/{tenant}/status");
+    let suspend = json!({ "status": "suspended" });
+    stale_proof(&srv, &ops).await;
+    let reply = browser(&srv, Method::PUT, &retire, &[&ops], true, Some(&suspend)).await;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN, "{}", reply.body);
+
+    // 1. Re-authentication starts from a live session and forces a login.
+    let reply = browser(
+        &srv,
+        Method::POST,
+        "/platform/browser/oidc/reauth",
+        &[],
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{}", reply.body);
+    let reauth = |cookie: String| {
+        let srv = &srv;
+        async move {
+            let reply = browser(
+                srv,
+                Method::POST,
+                "/platform/browser/oidc/reauth",
+                &[&cookie],
+                true,
+                None,
+            )
+            .await;
+            assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+            let url = url::Url::parse(reply.body["authorization_url"].as_str().expect("url"))
+                .expect("url parses");
+            let query: std::collections::HashMap<String, String> =
+                url.query_pairs().into_owned().collect();
+            assert_eq!(query.get("prompt").map(String::as_str), Some("login"));
+            assert_eq!(query.get("max_age").map(String::as_str), Some("0"));
+            (
+                reply.cookie(LOGIN_COOKIE).expect("binding"),
+                query["state"].clone(),
+                query["nonce"].clone(),
+            )
+        }
+    };
+
+    // 2. Another operator's, or an old, authentication refreshes nothing.
+    for (subject, email, at) in [
+        ("provider-subject-2", "deputy@example.com", now),
+        ("provider-subject-1", "ops@example.com", now - 600),
+    ] {
+        let (binding, state, nonce) = reauth(ops.clone()).await;
+        mount(authenticated_at(&issuer, &nonce, subject, email, at)).await;
+        let reply = oidc_callback(&srv, &[&ops, &binding], &state, &issuer).await;
+        assert_eq!(
+            reply.status,
+            StatusCode::UNAUTHORIZED,
+            "{subject} at {at}: {}",
+            reply.body
+        );
+        let reply = browser(&srv, Method::PUT, &retire, &[&ops], true, Some(&suspend)).await;
+        assert_eq!(reply.status, StatusCode::FORBIDDEN, "{}", reply.body);
+    }
+
+    // 3. A fresh authentication by the same operator refreshes its session.
+    let (binding, state, nonce) = reauth(ops.clone()).await;
+    mount(authenticated_at(
+        &issuer,
+        &nonce,
+        "provider-subject-1",
+        "ops@example.com",
+        chrono::Utc::now().timestamp(),
+    ))
+    .await;
+    let reply = oidc_callback(&srv, &[&ops, &binding], &state, &issuer).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    assert_eq!(reply.body["recent"], true);
+    assert_eq!(reply.body["name"], "ops-lead");
+    assert!(
+        reply.cookie(PLATFORM_COOKIE).is_none(),
+        "the session is kept"
+    );
+    let reply = browser(&srv, Method::PUT, &retire, &[&ops], true, Some(&suspend)).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+}

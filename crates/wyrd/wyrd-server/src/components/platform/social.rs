@@ -189,6 +189,7 @@ async fn configure_provider(
     Path(name): Path<String>,
     Json(request): Json<ConfigureSocialProviderRequest>,
 ) -> Result<Json<SocialProviderView>, WyrdErrorResponse> {
+    caller.require_recent_proof()?;
     let provider = provider(&name)?;
     let pool = operator(&state)?;
     let authz =
@@ -294,6 +295,7 @@ async fn enable_provider(
     Path(name): Path<String>,
     Json(request): Json<EnableSocialProviderRequest>,
 ) -> Result<Json<SocialProviderView>, WyrdErrorResponse> {
+    caller.require_recent_proof()?;
     let provider = provider(&name)?;
     let pool = operator(&state)?;
     let authz =
@@ -374,6 +376,7 @@ async fn write_login_settings(
     caller: PlatformCaller,
     settings: Result<Json<LoginSettings>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<LoginSettings>, WyrdErrorResponse> {
+    caller.require_recent_proof()?;
     let Json(settings) =
         settings.map_err(|rejection| crate::http::error::body_rejection(&rejection))?;
     let pool = operator(&state)?;
@@ -454,6 +457,7 @@ async fn write_mail(
     caller: PlatformCaller,
     Json(request): Json<ConfigureMailRelayRequest>,
 ) -> Result<Json<MailSettings>, WyrdErrorResponse> {
+    caller.require_recent_proof()?;
     let pool = operator(&state)?;
     let authz =
         PlatformAuthorization::new(pool.clone(), Arc::clone(state.bifrost.scribe_outbox()) as _);

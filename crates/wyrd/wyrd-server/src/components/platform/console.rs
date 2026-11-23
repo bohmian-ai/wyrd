@@ -23,12 +23,13 @@ use secrecy::{ExposeSecret as _, SecretString};
 use url::Url;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
+use wyrd_auth::platform_login::PlatformBrowserLogin;
 use wyrd_auth::platform_sessions::{
-    PLATFORM_BROWSER_WINDOWS, PlatformSessionError, PlatformSessions,
+    PLATFORM_BROWSER_WINDOWS, PlatformBrowserSession, PlatformSessionError, PlatformSessions,
 };
 use wyrd_spec::auth::{
     LoginInitResponse, PlatformBrowserSessionView, PlatformCallbackRequest,
-    PlatformPasswordLoginRequest,
+    PlatformPasswordLoginRequest, PlatformPasswordReauthRequest,
 };
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::request_id::RequestId;
@@ -60,6 +61,8 @@ pub fn platform_console_router() -> OpenApiRouter<AppState> {
         .routes(routes!(logout))
         .routes(routes!(oidc_login))
         .routes(routes!(oidc_callback))
+        .routes(routes!(password_reauth))
+        .routes(routes!(oidc_reauth))
 }
 
 /// Name of the cookie binding a platform OIDC browser login to the browser
@@ -311,33 +314,18 @@ async fn oidc_login(
 ) -> Result<Response, WyrdErrorResponse> {
     require_same_origin(&headers, &origin)?;
     admit_sign_in(&state, source).await?;
-    let redirect = origin
-        .join(CONSOLE_CALLBACK_PATH)
-        .map_err(|_| auth_not_configured())?;
-    let begun = login_service(&state)?
-        .begin_browser(redirect.to_string())
-        .await
-        .map_err(login_error)?;
-    Ok(with_cookies(
-        StatusCode::OK,
-        vec![cookie_header(
-            &origin,
-            LOGIN_BINDING_COOKIE,
-            begun.binding.expose_secret(),
-            PLATFORM_COOKIE_PATH,
-            LOGIN_BINDING_MAX_AGE,
-        )],
-        Json(begun.init),
-    ))
+    begin_console_login(&state, &origin, None).await
 }
 
 /// `POST /platform/browser/oidc/callback` — finish a platform console
 /// sign-in with the provider's return, from the browser that began it.
 ///
-/// Success clears the binding cookie and sets a freshly generated platform
-/// session cookie anchored to the connection's current revision. A missing
-/// or foreign binding, a replay, an unregistered subject or a connection
-/// replaced since begin creates no session.
+/// Success clears the binding cookie. A sign-in sets a freshly generated
+/// platform session cookie anchored to the connection's current revision; a
+/// re-authentication, presented with the session it began from, refreshes
+/// that session's proof and sets no new cookie. A missing or foreign
+/// binding, a replay, an unregistered subject, another operator's or an old
+/// authentication, or a connection replaced since begin changes nothing.
 ///
 /// # Errors
 /// `403 WYRD_AUTH_403_ORIGIN_REFUSED` without this deployment's exact
@@ -375,22 +363,194 @@ async fn oidc_callback(
         .find_map(|(name, value)| (name == LOGIN_BINDING_COOKIE).then_some(value))
         .filter(|value| !value.is_empty())
         .ok_or_else(|| session_error(PlatformSessionError::Invalid))?;
-    let created = login_service(&state)?
+    // A re-authentication is finished by the session it began from; a
+    // sign-in needs none, so an absent or dead cookie is simply no session.
+    let presented = match platform_cookie(&headers) {
+        Some(cookie) => match platform_sessions(&state)?.resolve_browser(cookie).await {
+            Ok(session) => Some(session),
+            Err(PlatformSessionError::Invalid) => None,
+            Err(error) => return Err(session_error(error)),
+        },
+        None => None,
+    };
+    let clear_binding = cookie_header(&origin, LOGIN_BINDING_COOKIE, "", PLATFORM_COOKIE_PATH, 0);
+    match login_service(&state)?
         .complete_browser(
             SecretString::from(request.code),
             &request.state,
             request.iss.as_deref(),
             binding,
+            presented.as_ref(),
             request_id(id).as_str(),
         )
+        .await
+        .map_err(login_error)?
+    {
+        PlatformBrowserLogin::SignedIn(created) => Ok(with_cookies(
+            StatusCode::OK,
+            vec![
+                set_platform_cookie(&origin, created.cookie.expose_secret()),
+                clear_binding,
+            ],
+            Json(created.session.view),
+        )),
+        PlatformBrowserLogin::Reauthenticated => {
+            let session = presented.ok_or_else(|| session_error(PlatformSessionError::Invalid))?;
+            Ok(with_cookies(
+                StatusCode::OK,
+                vec![clear_binding],
+                Json(refreshed(session)),
+            ))
+        }
+    }
+}
+
+/// The metadata of `session` once its proof has just been refreshed.
+fn refreshed(session: PlatformBrowserSession) -> PlatformBrowserSessionView {
+    PlatformBrowserSessionView {
+        recent: true,
+        ..session.view
+    }
+}
+
+/// The platform browser session a console caller presents.
+///
+/// # Errors
+/// `401 WYRD_AUTH_401_UNAUTHENTICATED` when the caller authenticated with a
+/// platform token instead.
+fn browser_session(caller: PlatformCaller) -> Result<PlatformBrowserSession, WyrdErrorResponse> {
+    caller
+        .browser
+        .ok_or_else(|| session_error(PlatformSessionError::Invalid))
+}
+
+/// `POST /platform/browser/password/reauth` — prove the signed-in platform
+/// user's own password again, refreshing this session's proof for
+/// destructive platform changes.
+///
+/// Counted in the source's sign-in window. Only the session's own
+/// principal's password is checked, so another operator's password or a
+/// bootstrap key refreshes nothing.
+///
+/// # Errors
+/// `401 WYRD_AUTH_401_UNAUTHENTICATED` without a live platform session or
+/// when the password is not accepted; `403 WYRD_AUTH_403_ORIGIN_REFUSED`
+/// without this deployment's exact `Origin`; `429
+/// WYRD_AUTH_429_SIGN_IN_ATTEMPTS` while the window is exhausted; `503
+/// WYRD_AUTH_503_VERIFY_UNAVAILABLE` when the store fails.
+#[utoipa::path(
+    post,
+    path = "/platform/browser/password/reauth",
+    request_body = PlatformPasswordReauthRequest,
+    responses(
+        (status = 200, description = "Proof refreshed", body = PlatformBrowserSessionView),
+        (status = 401, description = "No live session, or password not accepted \
+          (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
+        (status = 403, description = "Origin absent or foreign \
+          (WYRD_AUTH_403_ORIGIN_REFUSED)", body = WyrdProblem),
+        (status = 429, description = "Too many sign-in starts from this source \
+          (WYRD_AUTH_429_SIGN_IN_ATTEMPTS)", body = WyrdProblem,
+          headers(("Retry-After" = u64, description = "Seconds until the window ends"))),
+        (status = 503, description = "The store is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    security(()),
+    tag = "Platform"
+)]
+#[tracing::instrument(level = "debug", skip_all)]
+async fn password_reauth(
+    State(state): State<AppState>,
+    caller: PlatformCaller,
+    RequestSource(source): RequestSource,
+    request: Result<Json<PlatformPasswordReauthRequest>, JsonRejection>,
+) -> Result<Response, WyrdErrorResponse> {
+    let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
+    let session = browser_session(caller)?;
+    admit_sign_in(&state, source).await?;
+    platform_sessions(&state)?
+        .reauthenticate_password(&session, &request.password.into_secret_string())
+        .await
+        .map_err(session_error)?;
+    Ok(with_cookies(
+        StatusCode::OK,
+        Vec::new(),
+        Json(refreshed(session)),
+    ))
+}
+
+/// `POST /platform/browser/oidc/reauth` — begin a forced-fresh platform IdP
+/// re-authentication of this session.
+///
+/// Counted in the source's sign-in window. The provider is asked for a new
+/// login (`prompt=login`, `max_age=0`) and returns to the console callback,
+/// which this session must then present with the binding cookie set here.
+///
+/// # Errors
+/// `401 WYRD_AUTH_401_UNAUTHENTICATED` without a live platform session;
+/// `403 WYRD_AUTH_403_ORIGIN_REFUSED` without this deployment's exact
+/// `Origin`; `404 WYRD_SPEC_404_NOT_FOUND` without a connection; `429
+/// WYRD_AUTH_429_SIGN_IN_ATTEMPTS` while the window is exhausted; `503
+/// WYRD_AUTH_503_VERIFY_UNAVAILABLE` when the provider is unavailable.
+#[utoipa::path(
+    post,
+    path = "/platform/browser/oidc/reauth",
+    responses(
+        (status = 200, description = "Re-authentication begun; a login binding cookie is set",
+          body = LoginInitResponse,
+          headers(("Set-Cookie" = String, description = "The login binding cookie"))),
+        (status = 401, description = "No live platform session \
+          (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
+        (status = 403, description = "Origin absent or foreign \
+          (WYRD_AUTH_403_ORIGIN_REFUSED)", body = WyrdProblem),
+        (status = 404, description = "No platform OIDC connection \
+          (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem),
+        (status = 429, description = "Too many sign-in starts from this source \
+          (WYRD_AUTH_429_SIGN_IN_ATTEMPTS)", body = WyrdProblem,
+          headers(("Retry-After" = u64, description = "Seconds until the window ends"))),
+        (status = 503, description = "The provider is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    security(()),
+    tag = "Platform"
+)]
+#[tracing::instrument(level = "debug", skip_all)]
+async fn oidc_reauth(
+    State(state): State<AppState>,
+    caller: PlatformCaller,
+    RequestOrigin(origin): RequestOrigin,
+    RequestSource(source): RequestSource,
+) -> Result<Response, WyrdErrorResponse> {
+    let session = browser_session(caller)?;
+    admit_sign_in(&state, source).await?;
+    begin_console_login(&state, &origin, Some(&session)).await
+}
+
+/// Begin a console OIDC login returning to the fixed console callback,
+/// re-authenticating `session` when given, and set its binding cookie.
+///
+/// # Errors
+/// The login owner's refusals, projected by [`login_error`].
+async fn begin_console_login(
+    state: &AppState,
+    origin: &Url,
+    session: Option<&PlatformBrowserSession>,
+) -> Result<Response, WyrdErrorResponse> {
+    let redirect = origin
+        .join(CONSOLE_CALLBACK_PATH)
+        .map_err(|_| auth_not_configured())?;
+    let begun = login_service(state)?
+        .begin_browser(redirect.to_string(), session)
         .await
         .map_err(login_error)?;
     Ok(with_cookies(
         StatusCode::OK,
-        vec![
-            set_platform_cookie(&origin, created.cookie.expose_secret()),
-            cookie_header(&origin, LOGIN_BINDING_COOKIE, "", PLATFORM_COOKIE_PATH, 0),
-        ],
-        Json(created.session.view),
+        vec![cookie_header(
+            origin,
+            LOGIN_BINDING_COOKIE,
+            begun.binding.expose_secret(),
+            PLATFORM_COOKIE_PATH,
+            LOGIN_BINDING_MAX_AGE,
+        )],
+        Json(begun.init),
     ))
 }

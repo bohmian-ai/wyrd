@@ -341,13 +341,12 @@ impl Sweep {
                         }
                     }
                 };
-                let status = match status {
-                    Some(status) => status.ok(),
-                    None => {
-                        let now = Instant::now();
-                        stopping = Some(now);
-                        stop(group, &mut child, (now + teardown).min(envelope.max(now))).await
-                    }
+                let status = if let Some(status) = status {
+                    status.ok()
+                } else {
+                    let now = Instant::now();
+                    stopping = Some(now);
+                    stop(group, &mut child, (now + teardown).min(envelope.max(now))).await
                 };
                 match status {
                     Some(status) if status.success() || status.code() == Some(2) => {}

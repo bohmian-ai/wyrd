@@ -12751,5 +12751,187 @@ mod tests {
                 .expect("the owner drains")
                 .expect("owner task");
         }
+
+        /// A normal batch conflict refuses only the older group: its waiter
+        /// gets the conflict while the younger group's IO is still held, and
+        /// the younger group then commits.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the conflict is not reported independently of the
+        /// younger group, the younger group fails, or the shard poisons.
+        #[tokio::test]
+        async fn an_older_group_conflict_refuses_it_while_the_younger_group_commits() {
+            let (fixture, owner, budget, command_tx) = PipelineFixture::start().await;
+            let (older_id, younger_id) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+            let blocker = fixture.hold_fence(older_id).await;
+            let (older, mut older_ack) = acked_group_for_key(&budget, &fixture.key, &[older_id]);
+            let (younger, mut younger_ack) =
+                acked_group_for_key(&budget, &fixture.key, &[younger_id]);
+            let ownership = owner.memory_ownership.clone();
+            let wal_io = owner.wal_io.clone();
+            let live = Arc::clone(&owner.memtable);
+            owner.pending.fetch_add(2, Ordering::AcqRel);
+            let task = tokio::spawn(owner.run());
+
+            submit(&command_tx, older).await;
+            fixture.fence_blocked().await;
+            let (synced, release_io) = wal_io.hold_next_sync_for_test();
+            submit(&command_tx, younger).await;
+            tokio::time::timeout(DEADLOCK_BOUND, synced)
+                .await
+                .expect("the younger group syncs")
+                .expect("the held sync reports");
+            blocker
+                .commit()
+                .await
+                .expect("commit a contradictory fence for the older batch");
+            settled(&mut older_ack[0], "the older group")
+                .await
+                .expect_err("the contradictory fence refuses the older group");
+            assert!(
+                ack_pending(&mut younger_ack[0]),
+                "the younger group's IO is still held"
+            );
+            drop(release_io);
+            settled(&mut younger_ack[0], "the younger group")
+                .await
+                .expect("the younger group commits");
+            assert!(
+                !ownership.is_poisoned(),
+                "a conflict does not fail the shard closed"
+            );
+            assert_eq!(
+                visible_rows(&live),
+                1,
+                "only the younger group's row is visible"
+            );
+            command_tx
+                .send(ShardCommand::Shutdown)
+                .await
+                .expect("shutdown mailbox");
+            tokio::time::timeout(DEADLOCK_BOUND, task)
+                .await
+                .expect("the owner drains")
+                .expect("owner task");
+        }
+
+        /// An older group whose insertion fails after its fence is retained
+        /// unanswered and inserted again before the younger group fences, so
+        /// both are acknowledged in order and the older ACK reports its first
+        /// commit.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the younger group fences while the older owner is
+        /// retained, either group fails, or a row is lost or duplicated.
+        #[tokio::test]
+        async fn a_post_fence_insertion_failure_is_retried_before_the_younger_group_fences() {
+            let (fixture, owner, budget, command_tx) = PipelineFixture::start().await;
+            let ids = [uuid::Uuid::now_v7(), uuid::Uuid::now_v7()];
+            let blocker = fixture.hold_fence(ids[0]).await;
+            let (appends, mut acks) = acked_group_for_key(&budget, &fixture.key, &ids);
+            let mut appends = appends.into_iter();
+            let wal_io = owner.wal_io.clone();
+            let live = Arc::clone(&owner.memtable);
+            let mut retained = fixture.writers[0].post_sync_held_for_test();
+            owner.pending.fetch_add(2, Ordering::AcqRel);
+            let task = tokio::spawn(owner.run());
+
+            submit(&command_tx, appends.next().into_iter().collect()).await;
+            fixture.fence_blocked().await;
+            let (synced, release_io) = wal_io.hold_next_sync_for_test();
+            submit(&command_tx, appends.collect()).await;
+            tokio::time::timeout(DEADLOCK_BOUND, synced)
+                .await
+                .expect("the younger group syncs")
+                .expect("the held sync reports");
+            fixture.writers[0].trip_post_sync_failure_for_test();
+            blocker.rollback().await.expect("release the older fence");
+            tokio::time::timeout(DEADLOCK_BOUND, retained.changed())
+                .await
+                .expect("the older group is retained after its fence")
+                .expect("retention watch");
+            assert!(
+                ack_pending(&mut acks[0]),
+                "the retained group is unanswered"
+            );
+            assert_eq!(
+                fixture.fenced(&ids[1..]).await,
+                0,
+                "the younger group does not fence while the older owner is retained"
+            );
+
+            drop(release_io);
+            let older = settled(&mut acks[0], "the retained group")
+                .await
+                .expect("the retried insertion acknowledges");
+            assert!(
+                older.first_commit,
+                "the retried insertion is the first commit"
+            );
+            settled(&mut acks[1], "the younger group")
+                .await
+                .expect("the younger group commits");
+            assert_eq!(visible_rows(&live), 2, "each group's row is visible once");
+            assert_eq!(fixture.fenced(&ids).await, 2);
+            command_tx
+                .send(ShardCommand::Shutdown)
+                .await
+                .expect("shutdown mailbox");
+            tokio::time::timeout(DEADLOCK_BOUND, task)
+                .await
+                .expect("the owner drains")
+                .expect("owner task");
+        }
+
+        /// A client that stops waiting for its ACK does not stop its group:
+        /// the cancelled older group still fences and becomes visible, and the
+        /// younger group is acknowledged.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the younger group fails, or the cancelled group is not
+        /// fenced and visible once the owner drains.
+        #[tokio::test]
+        async fn a_cancelled_waiter_does_not_stop_its_group() {
+            let (fixture, owner, budget, command_tx) = PipelineFixture::start().await;
+            let ids = [uuid::Uuid::now_v7(), uuid::Uuid::now_v7()];
+            let blocker = fixture.hold_fence(ids[0]).await;
+            let (appends, acks) = acked_group_for_key(&budget, &fixture.key, &ids);
+            let mut appends = appends.into_iter();
+            let mut acks = acks.into_iter();
+            let live = Arc::clone(&owner.memtable);
+            owner.pending.fetch_add(2, Ordering::AcqRel);
+            let task = tokio::spawn(owner.run());
+
+            submit(&command_tx, appends.next().into_iter().collect()).await;
+            fixture.fence_blocked().await;
+            drop(acks.next());
+            submit(&command_tx, appends.collect()).await;
+            blocker.rollback().await.expect("release the fence");
+            let mut younger_ack = acks.next().expect("younger waiter");
+            settled(&mut younger_ack, "the younger group")
+                .await
+                .expect("the younger group commits");
+            command_tx
+                .send(ShardCommand::Shutdown)
+                .await
+                .expect("shutdown mailbox");
+            tokio::time::timeout(DEADLOCK_BOUND, task)
+                .await
+                .expect("the owner drains")
+                .expect("owner task");
+            assert_eq!(
+                fixture.fenced(&ids).await,
+                2,
+                "the cancelled group still fences"
+            );
+            assert_eq!(
+                visible_rows(&live),
+                2,
+                "the cancelled group's row is visible"
+            );
+        }
     }
 }

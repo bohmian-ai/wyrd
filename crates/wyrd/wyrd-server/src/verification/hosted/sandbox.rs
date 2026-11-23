@@ -174,6 +174,11 @@ impl Sandbox {
     /// returned hold drops, raising the pressure the process samples and
     /// refusing retained inputs that do not fit in `leave`.
     ///
+    /// The hold is attributed to the Verification workload, as hosted
+    /// Python memory is, and pressure is sampled once it is taken, so new
+    /// hosted work waits in admission while the hold leaves Verification
+    /// over its contended share.
+    ///
     /// Memory other owners release while the hold lives is absorbed into it
     /// soon after, so the free bytes return to `leave`.
     ///
@@ -183,9 +188,10 @@ impl Sandbox {
     #[must_use]
     pub fn occupy_for_test(&self, leave: u64) -> OccupiedForTest {
         let memory = self.memory.clone();
-        let charge = Arc::new(std::sync::Mutex::new(Some(
-            memory.charge_infallible(memory.available().saturating_sub(leave)),
-        )));
+        let operation = self.workloads.begin(Workload::Verification, None, None);
+        let mut held = memory.charge_infallible(memory.available().saturating_sub(leave));
+        held.attribute(&operation);
+        let charge = Arc::new(std::sync::Mutex::new(Some(held)));
         let held = Arc::clone(&charge);
         let pin = tokio::spawn(async move {
             loop {
@@ -206,7 +212,12 @@ impl Sandbox {
                 changed.await;
             }
         });
-        OccupiedForTest { charge, pin }
+        self.workloads.sample(0);
+        OccupiedForTest {
+            charge,
+            pin,
+            _operation: operation,
+        }
     }
 
     /// Report one worker committing more memory than the process ceiling
@@ -436,6 +447,15 @@ impl Sandbox {
         let retained = u64::try_from(retained).unwrap_or(u64::MAX);
         let victim = CancellationToken::new();
         let waited = Instant::now();
+        // Retained inputs that cannot fit are refused now rather than after
+        // an admission wait, and stay charged while the operation waits.
+        let mut held = self.memory.try_charge(retained).map_err(|_| {
+            refused(
+                "memory",
+                waited,
+                "process memory cannot hold the Python operation now",
+            )
+        })?;
         let operation = envelopes
             .time(Envelope::Capacity, async {
                 self.waiting.fetch_add(1, Ordering::Relaxed);
@@ -466,13 +486,6 @@ impl Sandbox {
             .await?;
         metrics::histogram!(VERIFICATION_HOSTED_WAIT_SECONDS, "outcome" => "granted")
             .record(waited.elapsed().as_secs_f64());
-        let mut held = self.memory.try_charge(retained).map_err(|_| {
-            refused(
-                "memory",
-                waited,
-                "process memory cannot hold the Python operation now",
-            )
-        })?;
         held.attribute(&operation);
         let context = operation.context();
         let _active = (
@@ -1030,6 +1043,9 @@ pub struct OccupiedForTest {
     charge: Arc<std::sync::Mutex<Option<ByteCharge>>>,
     /// The task absorbing released memory into the charge.
     pin: tokio::task::JoinHandle<()>,
+    /// The Verification operation the charge is attributed to; dropped
+    /// after the charge returns its bytes.
+    _operation: wyrd_runtime::resources::Operation,
 }
 
 #[cfg(feature = "test-support")]

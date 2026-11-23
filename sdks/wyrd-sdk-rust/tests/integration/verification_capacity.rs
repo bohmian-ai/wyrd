@@ -19,9 +19,10 @@ use crate::support::{Deployment, declare, pull};
 /// The direct deadline every journey here runs under.
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Process memory left free while an operation should wait: short of one
-/// session envelope, with room for the Scribe work that shares the ledger.
-const SHORT_OF_A_SESSION: u64 = 64 << 20;
+/// Process memory left free while an operation should wait: the held memory
+/// puts Verification over its contended share, with room for the Scribe work
+/// that shares the ledger.
+const CONTENDED: u64 = 64 << 20;
 
 /// Bytes of the answer the full-memory refusal sends.
 const REQUEST_BYTES: usize = 256 << 10;
@@ -128,7 +129,7 @@ impl Desk {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn verify_waits_for_hosted_memory_then_passes() {
     let desk = Desk::start().await;
-    let held = desk.occupy(SHORT_OF_A_SESSION);
+    let held = desk.occupy(CONTENDED);
 
     let waiting = tokio::spawn(Desk::verify(desk.state.clone()));
     desk.await_waiters(1).await;
@@ -174,7 +175,7 @@ async fn verify_refusals_follow_the_arrival_deadline() {
         "{refused}"
     );
 
-    let held = desk.occupy(SHORT_OF_A_SESSION);
+    let held = desk.occupy(CONTENDED);
     let started = Instant::now();
     let timed_out = Desk::verify(desk.state.clone())
         .await
@@ -205,18 +206,17 @@ async fn verify_refusals_follow_the_arrival_deadline() {
     desk.deployment.shutdown().await;
 }
 
-/// A submit under occupied process memory is still accepted; its queued
-/// execution defers rather than fails while memory is held, and is judged
-/// once the memory frees.
+/// A submit under occupied process memory is still accepted, and its queued
+/// execution is judged once the memory frees.
 ///
 /// # Panics
 /// Panics when the submit is refused or recorded, or the execution does not
 /// pass after memory frees.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn submit_defers_under_hosted_memory_then_passes() {
+async fn submit_under_hosted_memory_is_accepted_then_passes() {
     let desk = Desk::start().await;
-    let held = desk.occupy(SHORT_OF_A_SESSION);
+    let held = desk.occupy(CONTENDED);
 
     let Submission::Queued(execution) = desk
         .state
@@ -229,7 +229,6 @@ async fn submit_defers_under_hosted_memory_then_passes() {
     else {
         panic!("Run evidence queues an execution");
     };
-    desk.await_waiters(1).await;
     drop(held);
     let result = execution
         .wait(WAIT)

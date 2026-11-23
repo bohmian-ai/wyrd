@@ -33,9 +33,9 @@ use wyrd_sql::queries::platform::identity::{
     pin_platform_identity, platform_identity_by_subject_tx,
 };
 use wyrd_sql::queries::platform::principals::{
-    platform_principal_by_id, platform_principal_by_id_tx,
+    PlatformPrincipalRow, platform_principal_by_id, platform_principal_by_id_tx,
 };
-use wyrd_sql::{OperatorPool, SqlError};
+use wyrd_sql::{OperatorPool, SqlError, TenantConn};
 
 use crate::audit::{TOKEN_EXCHANGE_OPERATION, auth_event, principal_kind_tag};
 use crate::platform_credentials::{PlatformCredentialError, authenticate_for_session};
@@ -110,6 +110,42 @@ impl Debug for CreatedPlatformBrowserSession {
             .field("session", &self.session)
             .finish_non_exhaustive()
     }
+}
+
+/// The active platform principal a verified federated identity resolves
+/// to on `conn`: its pinned subject, or on a first login the pre-registration
+/// `match_claim` matches, which is pinned here.
+///
+/// The store's `subject IS NULL` predicate makes pinning a one-time
+/// transition, so a concurrent second login pins nothing and is refused
+/// rather than racing. The principal is re-read so a suspended one gets
+/// nothing even with a valid provider token.
+///
+/// # Errors
+/// Returns [`PlatformSessionError::Invalid`] when nothing matches or the
+/// principal is not active, and [`PlatformSessionError::Store`] when the
+/// store fails.
+async fn federated_principal(
+    conn: &mut TenantConn<'_>,
+    issuer: &str,
+    subject: &str,
+    match_claim: Option<&str>,
+) -> Result<PlatformPrincipalRow, PlatformSessionError> {
+    let pinned = platform_identity_by_subject_tx(conn, issuer, subject).await?;
+    let principal_id = if let Some(identity) = pinned {
+        identity.principal_id
+    } else {
+        let Some(claim) = match_claim else {
+            return Err(PlatformSessionError::Invalid);
+        };
+        pin_platform_identity(conn, issuer, claim, subject)
+            .await?
+            .ok_or(PlatformSessionError::Invalid)?
+    };
+    platform_principal_by_id_tx(conn, principal_id)
+        .await?
+        .filter(PlatformPrincipalRow::is_active)
+        .ok_or(PlatformSessionError::Invalid)
 }
 
 /// The stored digest of a platform browser cookie value.
@@ -299,28 +335,8 @@ impl PlatformSessions {
         request_id: &str,
     ) -> Result<SecretString, PlatformSessionError> {
         let mut conn = self.pool.begin_platform_audited().await?;
-        let pinned = platform_identity_by_subject_tx(&mut conn, issuer, subject).await?;
-        let principal_id = if let Some(identity) = pinned {
-            identity.principal_id
-        } else {
-            // First login: match the pre-registered claim and pin the subject.
-            // The store's `subject IS NULL` predicate makes this a one-time
-            // transition, so a concurrent second login pins nothing and is
-            // refused rather than racing.
-            let Some(claim) = match_claim else {
-                return Err(PlatformSessionError::Invalid);
-            };
-            pin_platform_identity(&mut conn, issuer, claim, subject)
-                .await?
-                .ok_or(PlatformSessionError::Invalid)?
-        };
-
-        let Some(principal) = platform_principal_by_id_tx(&mut conn, principal_id).await? else {
-            return Err(PlatformSessionError::Invalid);
-        };
-        if !principal.is_active() {
-            return Err(PlatformSessionError::Invalid);
-        }
+        let principal = federated_principal(&mut conn, issuer, subject, match_claim).await?;
+        let principal_id = principal.id;
 
         let token = self
             .issuing_key
@@ -371,7 +387,9 @@ impl PlatformSessions {
         let Some(stored) = stored.filter(|_| matched) else {
             return Err(PlatformSessionError::Invalid);
         };
+        let conn = self.pool.begin_platform_audited().await?;
         self.create_browser(
+            conn,
             stored.id,
             PlatformSessionAnchor::Password(stored.password_revision),
             request_id,
@@ -379,22 +397,54 @@ impl PlatformSessions {
         .await
     }
 
-    /// Create a browser session for `principal_id` under `anchor` and stage
-    /// its grant record.
+    /// Sign the platform principal a federated login just verified in to a
+    /// new browser session anchored to connection revision
+    /// `connection_revision`.
+    ///
+    /// Resolving or first-pinning the identity and creating the session
+    /// commit together, as [`Self::issue_federated`] does for a token.
+    ///
+    /// # Errors
+    /// Returns [`PlatformSessionError::Invalid`] when no active registration
+    /// matches, or the connection was replaced since the login began, and
+    /// [`PlatformSessionError::Store`] when the store fails.
+    #[tracing::instrument(level = "debug", skip(self), err)]
+    pub async fn browser_federated(
+        &self,
+        issuer: &str,
+        subject: &str,
+        match_claim: Option<&str>,
+        connection_revision: i64,
+        request_id: &str,
+    ) -> Result<CreatedPlatformBrowserSession, PlatformSessionError> {
+        let mut conn = self.pool.begin_platform_audited().await?;
+        let principal = federated_principal(&mut conn, issuer, subject, match_claim).await?;
+        self.create_browser(
+            conn,
+            principal.id,
+            PlatformSessionAnchor::Connection(connection_revision),
+            request_id,
+        )
+        .await
+    }
+
+    /// Create a browser session for `principal_id` under `anchor` on `conn`,
+    /// commit it, and stage its grant record.
     ///
     /// # Errors
     /// Returns [`PlatformSessionError::Invalid`] when the principal is no
     /// longer active or the anchor is no longer current, and
     /// [`PlatformSessionError::Store`] when the store fails.
-    pub(crate) async fn create_browser(
+    async fn create_browser(
         &self,
+        mut conn: TenantConn<'_>,
         principal_id: Uuid,
         anchor: PlatformSessionAnchor,
         request_id: &str,
     ) -> Result<CreatedPlatformBrowserSession, PlatformSessionError> {
         let cookie = crate::browser_sessions::random_secret();
         let row = insert_platform_browser_session(
-            &self.pool,
+            &mut conn,
             Uuid::now_v7(),
             cookie_digest(&cookie).as_bytes(),
             principal_id,
@@ -403,6 +453,7 @@ impl PlatformSessions {
         )
         .await?
         .ok_or(PlatformSessionError::Invalid)?;
+        conn.commit().await?;
         let session = PlatformBrowserSession::from_row(row);
         self.record_grant(
             session.principal_id,

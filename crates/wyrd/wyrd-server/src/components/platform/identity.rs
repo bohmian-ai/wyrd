@@ -907,7 +907,7 @@ async fn set_admin_password(
 /// # Errors
 /// Returns an internal error when the platform plane or the signing key is not
 /// configured, so no platform login owner was built.
-fn login_service(state: &AppState) -> Result<&PlatformLogin, WyrdErrorResponse> {
+pub(super) fn login_service(state: &AppState) -> Result<&PlatformLogin, WyrdErrorResponse> {
     state.auth.platform_login.as_ref().ok_or_else(|| {
         WyrdErrorResponse::from(WyrdError::Internal {
             message: "platform federated login is not configured".to_owned(),
@@ -1034,7 +1034,7 @@ pub(super) fn platform_authz_error(
 ///
 /// Every identity rejection collapses to one unauthenticated error, so a caller
 /// learns whether it got in and never whether a subject is registered.
-fn login_error(error: PlatformLoginError) -> WyrdErrorResponse {
+pub(super) fn login_error(error: PlatformLoginError) -> WyrdErrorResponse {
     match error {
         PlatformLoginError::NotConfigured => WyrdErrorResponse::from(WyrdError::NotFound {
             message: "platform federated login is not configured".to_owned(),

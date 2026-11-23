@@ -139,12 +139,14 @@ pub struct PlatformSessionWindows {
 /// Create a browser session for principal `principal_id` under `anchor`
 /// when, in the same statement, the principal is active and the anchor is
 /// still its current password revision or the current connection revision.
-/// Returns the session, or `None` when that check fails.
+/// Returns the session, or `None` when that check fails. Runs on the
+/// caller's operator transaction, so a first federated login's pin and its
+/// session commit together.
 ///
 /// # Errors
 /// Returns [`SqlError::Query`] when the insert fails.
 pub async fn insert_platform_browser_session(
-    pool: &OperatorPool,
+    conn: &mut TenantConn<'_>,
     id: Uuid,
     session_hash: &[u8],
     principal_id: Uuid,
@@ -183,7 +185,7 @@ pub async fn insert_platform_browser_session(
     .bind(connection)
     .bind(windows.idle.as_secs_f64())
     .bind(windows.absolute.as_secs_f64())
-    .fetch_optional(pool.pool())
+    .fetch_optional(&mut **conn.transaction())
     .await
     .map_err(SqlError::from)
 }

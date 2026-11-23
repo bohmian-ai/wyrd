@@ -16,9 +16,9 @@ mod pg_tests {
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::auth::PrincipalKindTag;
     use wyrd_sql::queries::platform::identity::{
-        delete_platform_oidc_connection, insert_platform_identity_tx, insert_platform_login_state,
-        pin_platform_identity, platform_identity_by_subject, platform_oidc_connection,
-        purge_expired_platform_login_state, take_platform_login_state,
+        NewPlatformLoginState, delete_platform_oidc_connection, insert_platform_identity_tx,
+        insert_platform_login_state, pin_platform_identity, platform_identity_by_subject,
+        platform_oidc_connection, purge_expired_platform_login_state, take_platform_login_state,
         upsert_platform_oidc_connection,
     };
     use wyrd_sql::queries::platform::principal_grants::set_platform_grant;
@@ -154,17 +154,20 @@ mod pg_tests {
 
         insert_platform_login_state(
             pool,
-            "state-1",
-            "verifier-1",
-            "nonce-1",
-            ISSUER,
-            "https://wyrd.example/callback",
-            std::time::Duration::from_mins(5),
+            NewPlatformLoginState {
+                state: "state-1",
+                code_verifier: "verifier-1",
+                nonce: "nonce-1",
+                issuer: ISSUER,
+                redirect_uri: "https://wyrd.example/callback",
+                ttl: std::time::Duration::from_mins(5),
+                binding: None,
+            },
         )
         .await
         .expect("state inserts");
 
-        let first = take_platform_login_state(pool, "state-1")
+        let first = take_platform_login_state(pool, "state-1", None)
             .await
             .expect("first take succeeds")
             .expect("state exists");
@@ -172,7 +175,7 @@ mod pg_tests {
         assert_eq!(first.code_verifier, "verifier-1");
 
         assert!(
-            take_platform_login_state(pool, "state-1")
+            take_platform_login_state(pool, "state-1", None)
                 .await
                 .expect("second take succeeds")
                 .is_none(),
@@ -191,26 +194,29 @@ mod pg_tests {
 
         insert_platform_login_state(
             pool,
-            "state-expired",
-            "verifier",
-            "nonce",
-            ISSUER,
-            "https://wyrd.example/callback",
-            // A zero lifetime expires the instant PostgreSQL writes it.
-            std::time::Duration::ZERO,
+            NewPlatformLoginState {
+                state: "state-expired",
+                code_verifier: "verifier",
+                nonce: "nonce",
+                issuer: ISSUER,
+                redirect_uri: "https://wyrd.example/callback",
+                // A zero lifetime expires the instant PostgreSQL writes it.
+                ttl: std::time::Duration::ZERO,
+                binding: None,
+            },
         )
         .await
         .expect("state inserts");
 
         assert!(
-            take_platform_login_state(pool, "state-expired")
+            take_platform_login_state(pool, "state-expired", None)
                 .await
                 .expect("take succeeds")
                 .is_none(),
             "an expired state is refused"
         );
         assert!(
-            take_platform_login_state(pool, "never-existed")
+            take_platform_login_state(pool, "never-existed", None)
                 .await
                 .expect("take succeeds")
                 .is_none(),
@@ -229,23 +235,29 @@ mod pg_tests {
 
         insert_platform_login_state(
             pool,
-            "state-live",
-            "v",
-            "n",
-            ISSUER,
-            "https://wyrd.example/callback",
-            std::time::Duration::from_mins(5),
+            NewPlatformLoginState {
+                state: "state-live",
+                code_verifier: "v",
+                nonce: "n",
+                issuer: ISSUER,
+                redirect_uri: "https://wyrd.example/callback",
+                ttl: std::time::Duration::from_mins(5),
+                binding: None,
+            },
         )
         .await
         .expect("live state inserts");
         insert_platform_login_state(
             pool,
-            "state-dead",
-            "v",
-            "n",
-            ISSUER,
-            "https://wyrd.example/callback",
-            std::time::Duration::ZERO,
+            NewPlatformLoginState {
+                state: "state-dead",
+                code_verifier: "v",
+                nonce: "n",
+                issuer: ISSUER,
+                redirect_uri: "https://wyrd.example/callback",
+                ttl: std::time::Duration::ZERO,
+                binding: None,
+            },
         )
         .await
         .expect("dead state inserts");
@@ -258,7 +270,7 @@ mod pg_tests {
             "only the abandoned login is purged"
         );
         assert!(
-            take_platform_login_state(pool, "state-live")
+            take_platform_login_state(pool, "state-live", None)
                 .await
                 .expect("take succeeds")
                 .is_some(),

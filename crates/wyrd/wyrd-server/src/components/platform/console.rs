@@ -19,14 +19,17 @@ use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
-use secrecy::ExposeSecret as _;
+use secrecy::{ExposeSecret as _, SecretString};
 use url::Url;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 use wyrd_auth::platform_sessions::{
     PLATFORM_BROWSER_WINDOWS, PlatformSessionError, PlatformSessions,
 };
-use wyrd_spec::auth::{PlatformBrowserSessionView, PlatformPasswordLoginRequest};
+use wyrd_spec::auth::{
+    LoginInitResponse, PlatformBrowserSessionView, PlatformCallbackRequest,
+    PlatformPasswordLoginRequest,
+};
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::request_id::RequestId;
 
@@ -36,6 +39,7 @@ use crate::auth::browser::{
 use crate::auth::source::RequestSource;
 use crate::auth::{RequestOrigin, auth_not_configured};
 use crate::components::auth::PlatformCaller;
+use crate::components::platform::identity::{login_error, login_service};
 use crate::components::platform::social::admit_sign_in;
 use crate::http::error::{WyrdErrorResponse, body_rejection};
 use crate::state::AppState;
@@ -54,7 +58,19 @@ pub fn platform_console_router() -> OpenApiRouter<AppState> {
         .routes(routes!(password_login))
         .routes(routes!(session))
         .routes(routes!(logout))
+        .routes(routes!(oidc_login))
+        .routes(routes!(oidc_callback))
 }
+
+/// Name of the cookie binding a platform OIDC browser login to the browser
+/// that began it.
+const LOGIN_BINDING_COOKIE: &str = "wyrd_platform_login";
+
+/// Lifetime of the login binding cookie, matching the login state's.
+const LOGIN_BINDING_MAX_AGE: u64 = 300;
+
+/// The fixed console page the platform provider returns a browser login to.
+const CONSOLE_CALLBACK_PATH: &str = "/platform/ui/callback";
 
 /// The value of the platform session cookie a request presents, if any.
 pub(crate) fn platform_cookie(headers: &HeaderMap) -> Option<&str> {
@@ -250,5 +266,131 @@ async fn logout(
         StatusCode::NO_CONTENT,
         vec![clear_platform_cookie(&origin)],
         (),
+    ))
+}
+
+/// `POST /platform/browser/oidc/login` — begin a platform console sign-in
+/// through the platform OIDC connection.
+///
+/// The start is counted in its source's sign-in window first. The provider
+/// returns to this deployment's fixed console callback page; a
+/// platform-scoped `HttpOnly` binding cookie ties the login to this browser.
+///
+/// # Errors
+/// `403 WYRD_AUTH_403_ORIGIN_REFUSED` without this deployment's exact
+/// `Origin`; `404 WYRD_SPEC_404_NOT_FOUND` when no connection is configured;
+/// `429 WYRD_AUTH_429_SIGN_IN_ATTEMPTS` while the source's window is
+/// exhausted; `503 WYRD_AUTH_503_VERIFY_UNAVAILABLE` when the provider is
+/// unavailable.
+#[utoipa::path(
+    post,
+    path = "/platform/browser/oidc/login",
+    responses(
+        (status = 200, description = "Login begun; a login binding cookie is set",
+          body = LoginInitResponse,
+          headers(("Set-Cookie" = String, description = "The login binding cookie"))),
+        (status = 403, description = "Origin absent or foreign \
+          (WYRD_AUTH_403_ORIGIN_REFUSED)", body = WyrdProblem),
+        (status = 404, description = "No platform OIDC connection \
+          (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem),
+        (status = 429, description = "Too many sign-in starts from this source \
+          (WYRD_AUTH_429_SIGN_IN_ATTEMPTS)", body = WyrdProblem,
+          headers(("Retry-After" = u64, description = "Seconds until the window ends"))),
+        (status = 503, description = "The provider is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    security(()),
+    tag = "Platform"
+)]
+#[tracing::instrument(level = "debug", skip_all)]
+async fn oidc_login(
+    State(state): State<AppState>,
+    RequestOrigin(origin): RequestOrigin,
+    headers: HeaderMap,
+    RequestSource(source): RequestSource,
+) -> Result<Response, WyrdErrorResponse> {
+    require_same_origin(&headers, &origin)?;
+    admit_sign_in(&state, source).await?;
+    let redirect = origin
+        .join(CONSOLE_CALLBACK_PATH)
+        .map_err(|_| auth_not_configured())?;
+    let begun = login_service(&state)?
+        .begin_browser(redirect.to_string())
+        .await
+        .map_err(login_error)?;
+    Ok(with_cookies(
+        StatusCode::OK,
+        vec![cookie_header(
+            &origin,
+            LOGIN_BINDING_COOKIE,
+            begun.binding.expose_secret(),
+            PLATFORM_COOKIE_PATH,
+            LOGIN_BINDING_MAX_AGE,
+        )],
+        Json(begun.init),
+    ))
+}
+
+/// `POST /platform/browser/oidc/callback` — finish a platform console
+/// sign-in with the provider's return, from the browser that began it.
+///
+/// Success clears the binding cookie and sets a freshly generated platform
+/// session cookie anchored to the connection's current revision. A missing
+/// or foreign binding, a replay, an unregistered subject or a connection
+/// replaced since begin creates no session.
+///
+/// # Errors
+/// `403 WYRD_AUTH_403_ORIGIN_REFUSED` without this deployment's exact
+/// `Origin`; `401 WYRD_AUTH_401_UNAUTHENTICATED` for every refusal;
+/// `503 WYRD_AUTH_503_VERIFY_UNAVAILABLE` when the provider is unavailable.
+#[utoipa::path(
+    post,
+    path = "/platform/browser/oidc/callback",
+    request_body = PlatformCallbackRequest,
+    responses(
+        (status = 200, description = "Signed in; a fresh platform session cookie is set",
+          body = PlatformBrowserSessionView,
+          headers(("Set-Cookie" = String, description = "The platform session cookie"))),
+        (status = 401, description = "Identity not accepted \
+          (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
+        (status = 403, description = "Origin absent or foreign \
+          (WYRD_AUTH_403_ORIGIN_REFUSED)", body = WyrdProblem),
+        (status = 503, description = "The provider is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    security(()),
+    tag = "Platform"
+)]
+#[tracing::instrument(level = "debug", skip_all)]
+async fn oidc_callback(
+    State(state): State<AppState>,
+    RequestOrigin(origin): RequestOrigin,
+    headers: HeaderMap,
+    id: Option<Extension<RequestId>>,
+    request: Result<Json<PlatformCallbackRequest>, JsonRejection>,
+) -> Result<Response, WyrdErrorResponse> {
+    let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
+    require_same_origin(&headers, &origin)?;
+    let binding = cookie_pairs(&headers)
+        .find_map(|(name, value)| (name == LOGIN_BINDING_COOKIE).then_some(value))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| session_error(PlatformSessionError::Invalid))?;
+    let created = login_service(&state)?
+        .complete_browser(
+            SecretString::from(request.code),
+            &request.state,
+            request.iss.as_deref(),
+            binding,
+            request_id(id).as_str(),
+        )
+        .await
+        .map_err(login_error)?;
+    Ok(with_cookies(
+        StatusCode::OK,
+        vec![
+            set_platform_cookie(&origin, created.cookie.expose_secret()),
+            cookie_header(&origin, LOGIN_BINDING_COOKIE, "", PLATFORM_COOKIE_PATH, 0),
+        ],
+        Json(created.session.view),
     ))
 }

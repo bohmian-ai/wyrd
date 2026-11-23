@@ -964,6 +964,25 @@ as a usable way in for the last-administrator guard.
      in; when the session store cannot be written, a platform cookie gets 503
      on session reads and platform routes, then works again. 1 passed.
 
+3. `platform_admin_e2e::console::a_registered_operator_signs_in_to_the_console_through_platform_oidc`
+   - RED: `POST /platform/browser/oidc/login` answered 401 "missing
+     X-Wyrd-Access-Token header" (expected 403 without Origin); the route did
+     not exist.
+   - GREEN: `POST /platform/browser/oidc/login` (same-origin, counted in the
+     per-source sign-in window, fixed `{origin}/platform/ui/callback`
+     redirect, `wyrd_platform_login` binding cookie on `Path=/platform`) and
+     `POST /platform/browser/oidc/callback`. The login state records purpose,
+     binding digest and connection revision, and is consumed only with the
+     matching binding. A missing or foreign binding, an unregistered subject,
+     a replay, and swapping API-token and browser states each create no
+     session. The registered subject gets an `oidc` session with no provider
+     token in its body or cookies. Replacing the connection advances its
+     revision and ends the sessions it created; the pinned subject signs in
+     again. Pre-registration and issuer/subject pinning reuse the existing
+     `PlatformSessions` owner: a first-login pin and its browser session
+     commit in one transaction. 1 passed; the existing platform OIDC journeys
+     (7) and `pg_platform_identity` (11) still pass.
+
 ### 15. Extend and approve the complete mock before production pages
 
 **Reuses:** Cycles 5–14 final contracts, journeys and platform session metadata; reuse the already approved signup visual direction.

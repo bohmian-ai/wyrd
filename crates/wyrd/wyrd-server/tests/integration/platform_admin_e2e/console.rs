@@ -443,9 +443,16 @@ async fn signed_in(srv: &WyrdTestServer, name: &str, password: &str) -> String {
 
 /// The status of `GET /platform/browser/session` with `cookie` on `srv`.
 async fn session_status(srv: &WyrdTestServer, cookie: &str) -> StatusCode {
-    browser(srv, Method::GET, "/platform/browser/session", &[cookie], false, None)
-        .await
-        .status
+    browser(
+        srv,
+        Method::GET,
+        "/platform/browser/session",
+        &[cookie],
+        false,
+        None,
+    )
+    .await
+    .status
 }
 
 /// Move every timestamp of the session `cookie` names `elapsed` into the
@@ -492,7 +499,9 @@ async fn age_session(srv: &WyrdTestServer, cookie: &str, elapsed: &str) {
 async fn platform_console_sessions_end_on_every_replica() {
     let (srv, _root, api) = console_server().await;
     let replica = srv
-        .start_replica(WyrdTestServer::builder().with_trusted_ingress_for_test(&[INGRESS], CLIENT_HEADER))
+        .start_replica(
+            WyrdTestServer::builder().with_trusted_ingress_for_test(&[INGRESS], CLIENT_HEADER),
+        )
         .await
         .expect("replica starts");
     let principal = register_password_operator(&srv, &api, "ops").await;
@@ -501,9 +510,16 @@ async fn platform_console_sessions_end_on_every_replica() {
     let idle = signed_in(&srv, "ops", OPERATOR_PASSWORD).await;
     assert_eq!(session_status(&replica, &idle).await, StatusCode::OK);
     age_session(&srv, &idle, "14 minutes").await;
-    assert_eq!(session_status(&replica, &idle).await, StatusCode::OK, "activity within the window");
+    assert_eq!(
+        session_status(&replica, &idle).await,
+        StatusCode::OK,
+        "activity within the window"
+    );
     age_session(&srv, &idle, "16 minutes").await;
-    assert_eq!(session_status(&replica, &idle).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        session_status(&replica, &idle).await,
+        StatusCode::UNAUTHORIZED
+    );
     assert_eq!(session_status(&srv, &idle).await, StatusCode::UNAUTHORIZED);
 
     // 2. Activity cannot extend the absolute deadline.
@@ -522,18 +538,38 @@ async fn platform_console_sessions_end_on_every_replica() {
     .execute(srv.operator_pool().pool())
     .await
     .expect("session ages");
-    let view = browser(&replica, Method::GET, "/platform/browser/session", &[&long], false, None).await;
+    let view = browser(
+        &replica,
+        Method::GET,
+        "/platform/browser/session",
+        &[&long],
+        false,
+        None,
+    )
+    .await;
     assert_eq!(view.status, StatusCode::OK, "{}", view.body);
     assert_eq!(
         view.body["idle_expires_at"], view.body["expires_at"],
-        "activity stops at the absolute deadline: {}", view.body
+        "activity stops at the absolute deadline: {}",
+        view.body
     );
     age_session(&srv, &long, "2 minutes").await;
-    assert_eq!(session_status(&replica, &long).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        session_status(&replica, &long).await,
+        StatusCode::UNAUTHORIZED
+    );
 
     // 3. Logout on one replica ends the session on the other.
     let left = signed_in(&replica, "ops", OPERATOR_PASSWORD).await;
-    let reply = browser(&replica, Method::POST, "/platform/browser/logout", &[&left], true, None).await;
+    let reply = browser(
+        &replica,
+        Method::POST,
+        "/platform/browser/logout",
+        &[&left],
+        true,
+        None,
+    )
+    .await;
     assert_eq!(reply.status, StatusCode::NO_CONTENT, "{}", reply.body);
     assert_eq!(session_status(&srv, &left).await, StatusCode::UNAUTHORIZED);
 
@@ -561,19 +597,305 @@ async fn platform_console_sessions_end_on_every_replica() {
     // 5. A password change ends sessions from the earlier password.
     let before = signed_in(&srv, "ops", OPERATOR_PASSWORD).await;
     set_operator_password(&srv, &api, &principal, "copper finch 2026").await;
-    assert_eq!(session_status(&replica, &before).await, StatusCode::UNAUTHORIZED);
     assert_eq!(
-        password_login(&replica, "ops", OPERATOR_PASSWORD).await.status,
+        session_status(&replica, &before).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        password_login(&replica, "ops", OPERATOR_PASSWORD)
+            .await
+            .status,
         StatusCode::UNAUTHORIZED
     );
     let after = signed_in(&replica, "ops", "copper finch 2026").await;
 
     // 6. An unwritable store refuses rather than accepts or signs out.
     let pool = srv.operator_pool();
-    super::fail_writes_to(pool.pool(), "console", "platform.browser_sessions", "UPDATE").await;
-    assert_eq!(session_status(&replica, &after).await, StatusCode::SERVICE_UNAVAILABLE);
-    let reply = browser(&srv, Method::GET, "/platform/tenants", &[&after], false, None).await;
-    assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE, "{}", reply.body);
+    super::fail_writes_to(
+        pool.pool(),
+        "console",
+        "platform.browser_sessions",
+        "UPDATE",
+    )
+    .await;
+    assert_eq!(
+        session_status(&replica, &after).await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    let reply = browser(
+        &srv,
+        Method::GET,
+        "/platform/tenants",
+        &[&after],
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(
+        reply.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        reply.body
+    );
     super::stop_failing_writes(pool.pool(), "console", "platform.browser_sessions").await;
     assert_eq!(session_status(&replica, &after).await, StatusCode::OK);
+}
+
+/// The platform login-binding cookie's name.
+const LOGIN_COOKIE: &str = "wyrd_platform_login";
+
+/// A begun platform browser OIDC login: its binding cookie pair, its state,
+/// the nonce the provider must echo and the authorization URL.
+struct BegunOidc {
+    /// The `wyrd_platform_login` cookie pair.
+    binding: String,
+    /// The opaque state the provider returns.
+    state: String,
+    /// The nonce the ID token must carry.
+    nonce: String,
+    /// The provider authorization URL.
+    url: url::Url,
+}
+
+/// Begin a platform browser OIDC login from this deployment's origin.
+///
+/// # Panics
+/// Panics when begin is refused or sets no binding cookie.
+async fn begin_oidc(srv: &WyrdTestServer) -> BegunOidc {
+    let reply = browser(
+        srv,
+        Method::POST,
+        "/platform/browser/oidc/login",
+        &[],
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    let set = reply
+        .set_cookies
+        .iter()
+        .find(|value| value.starts_with(&format!("{LOGIN_COOKIE}=")))
+        .expect("a login binding cookie");
+    for attribute in [
+        "; Path=/platform;",
+        "; HttpOnly",
+        "; SameSite=Lax",
+        "; Secure",
+    ] {
+        assert!(set.contains(attribute), "{attribute} is set: {set}");
+    }
+    let url = url::Url::parse(
+        reply.body["authorization_url"]
+            .as_str()
+            .expect("authorization url"),
+    )
+    .expect("authorization url parses");
+    let query = |name: &str| {
+        url.query_pairs()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.into_owned())
+            .expect("authorization parameter")
+    };
+    BegunOidc {
+        binding: reply.cookie(LOGIN_COOKIE).expect("binding pair"),
+        state: query("state"),
+        nonce: query("nonce"),
+        url: url.clone(),
+    }
+}
+
+/// Present the provider's return for `state` to the platform browser
+/// callback with `cookies`.
+async fn oidc_callback(
+    srv: &WyrdTestServer,
+    cookies: &[&str],
+    state: &str,
+    issuer: &str,
+) -> BrowserReply {
+    browser(
+        srv,
+        Method::POST,
+        "/platform/browser/oidc/callback",
+        cookies,
+        true,
+        Some(&json!({ "code": "provider-code", "state": state, "iss": issuer })),
+    )
+    .await
+}
+
+/// Configure the platform OIDC connection to `issuer` as a public client.
+///
+/// # Panics
+/// Panics when configuration is refused.
+async fn configure_platform_oidc(srv: &WyrdTestServer, api: &str, issuer: &str) {
+    let resp = srv
+        .oneshot(super::platform_request(
+            Method::PUT,
+            "/platform/oidc/connection",
+            api,
+            Some(json!({
+                "issuer_url": issuer,
+                "client_id": super::PLATFORM_CLIENT,
+                "client_auth": { "method": "public" },
+            })),
+        ))
+        .await
+        .expect("configure route responds");
+    assert_eq!(resp.status(), StatusCode::OK, "connection configures");
+}
+
+/// A pre-registered platform operator signs in to the platform console
+/// through the platform OIDC connection:
+///   1. begin requires this deployment's Origin, binds the login to this
+///      browser with a platform-scoped cookie, and returns to the fixed
+///      console callback;
+///   2. a return without that browser's binding creates no session;
+///   3. an authenticated but unregistered subject creates no session;
+///   4. the registered subject gets an opaque `oidc` session whose metadata
+///      and cookies carry no provider token;
+///   5. the same return cannot be replayed;
+///   6. an API-token login's state cannot finish a browser login, nor the
+///      reverse;
+///   7. replacing the connection ends the sessions it created, and the
+///      pinned subject signs in again.
+///
+/// # Panics
+/// Panics when any step signs in, refuses or reveals differently.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_registered_operator_signs_in_to_the_console_through_platform_oidc() {
+    let (srv, _root, api) = console_server().await;
+    let provider = wiremock::MockServer::start().await;
+    let issuer = provider.uri();
+    let mount =
+        |reply| super::mount_platform_provider(&provider, super::platform_key_set("mock-1"), reply);
+    mount(wiremock::ResponseTemplate::new(500)).await;
+    configure_platform_oidc(&srv, &api, &issuer).await;
+    let (status, body) = social_call(
+        &srv,
+        social_request(
+            Method::POST,
+            "/platform/admins",
+            Some(&api),
+            Some(json!({ "name": "ops-lead", "match_claim": "ops@example.com" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // 1. Begin is same-origin, browser-bound and returns to the console.
+    let reply = browser(
+        &srv,
+        Method::POST,
+        "/platform/browser/oidc/login",
+        &[],
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN, "{}", reply.body);
+    let begun = begin_oidc(&srv).await;
+    let redirect = begun
+        .url
+        .query_pairs()
+        .find(|(key, _)| key == "redirect_uri")
+        .map(|(_, value)| value.into_owned());
+    assert_eq!(
+        redirect.as_deref(),
+        Some("http://wyrd.test/platform/ui/callback")
+    );
+
+    // 2. Another browser's return, or one with no binding, is refused.
+    mount(super::platform_token_reply(
+        &issuer,
+        &begun.nonce,
+        super::PLATFORM_CLIENT,
+        "mock-1",
+    ))
+    .await;
+    let other = begin_oidc(&srv).await;
+    for cookies in [vec![], vec![other.binding.as_str()]] {
+        let reply = oidc_callback(&srv, &cookies, &begun.state, &issuer).await;
+        assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{}", reply.body);
+        assert!(reply.cookie(PLATFORM_COOKIE).is_none());
+    }
+
+    // 3. An unregistered subject gets nothing.
+    mount(super::identity_token_reply(
+        &issuer,
+        &other.nonce,
+        super::PLATFORM_CLIENT,
+        "mock-1",
+        "provider-subject-9",
+        "stranger@example.com",
+    ))
+    .await;
+    let reply = oidc_callback(&srv, &[&other.binding], &other.state, &issuer).await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{}", reply.body);
+    assert!(reply.cookie(PLATFORM_COOKIE).is_none());
+
+    // 4. The registered subject signs in to an oidc session.
+    mount(super::platform_token_reply(
+        &issuer,
+        &begun.nonce,
+        super::PLATFORM_CLIENT,
+        "mock-1",
+    ))
+    .await;
+    let reply = oidc_callback(&srv, &[&begun.binding], &begun.state, &issuer).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    assert_eq!(reply.body["method"], "oidc");
+    assert_eq!(reply.body["name"], "ops-lead");
+    let revealed = format!("{} {:?}", reply.body, reply.set_cookies);
+    assert!(
+        !revealed.contains("provider-access") && !revealed.contains("eyJ"),
+        "{revealed}"
+    );
+    let session = reply.cookie(PLATFORM_COOKIE).expect("platform cookie");
+    let tenants = browser(
+        &srv,
+        Method::GET,
+        "/platform/tenants",
+        &[&session],
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(tenants.status, StatusCode::OK, "{}", tenants.body);
+
+    // 5. The return is single-use.
+    let replay = oidc_callback(&srv, &[&begun.binding], &begun.state, &issuer).await;
+    assert_eq!(replay.status, StatusCode::UNAUTHORIZED, "{}", replay.body);
+
+    // 6. API-token and browser logins cannot finish each other.
+    let (token_state, token_nonce) = super::begin_platform_login(&srv).await;
+    mount(super::platform_token_reply(
+        &issuer,
+        &token_nonce,
+        super::PLATFORM_CLIENT,
+        "mock-1",
+    ))
+    .await;
+    let fresh = begin_oidc(&srv).await;
+    let reply = oidc_callback(&srv, &[&fresh.binding], &token_state, &issuer).await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{}", reply.body);
+    let (status, body) = super::platform_callback(&srv, &fresh.state, Some(&issuer)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+
+    // 7. Replacing the connection ends the sessions it created.
+    configure_platform_oidc(&srv, &api, &issuer).await;
+    assert_eq!(
+        session_status(&srv, &session).await,
+        StatusCode::UNAUTHORIZED
+    );
+    let again = begin_oidc(&srv).await;
+    mount(super::platform_token_reply(
+        &issuer,
+        &again.nonce,
+        super::PLATFORM_CLIENT,
+        "mock-1",
+    ))
+    .await;
+    let reply = oidc_callback(&srv, &[&again.binding], &again.state, &issuer).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
 }

@@ -25,18 +25,20 @@ use wyrd_auth_oidc::{
     RelyingPartyError, ScreenedHttp, VerifiedIdToken,
 };
 use wyrd_kms::WyrdKms;
-use wyrd_spec::auth::LoginInitResponse;
+use wyrd_spec::auth::{LoginInitResponse, Sha256Hex};
 use wyrd_spec::error::WyrdError;
 use wyrd_sql::queries::platform::identity::{
-    PlatformOidcConnectionRow, insert_platform_login_state, platform_oidc_connection,
-    take_platform_login_state,
+    NewPlatformLoginState, PlatformLoginBinding, PlatformLoginStateRow, PlatformOidcConnectionRow,
+    insert_platform_login_state, platform_oidc_connection, take_platform_login_state,
 };
 use wyrd_sql::{OperatorPool, SqlError};
 
 use crate::callback::verify_response_issuer;
 use crate::error::relying_party_error;
 use crate::pg_resolvers::platform_connection_from_row;
-use crate::platform_sessions::{PlatformSessionError, PlatformSessions};
+use crate::platform_sessions::{
+    CreatedPlatformBrowserSession, PlatformSessionError, PlatformSessions,
+};
 use std::fmt::{Debug, Formatter, Result as FmtResult};
 
 /// How long a started platform login may take to complete.
@@ -146,11 +148,12 @@ impl PlatformLogin {
     /// Returns [`PlatformLoginError::NotConfigured`] when no connection exists,
     /// [`PlatformLoginError::ConnectionUnusable`] when the stored row cannot be
     /// decoded, and [`PlatformLoginError::Store`] when the read fails.
-    async fn connection(&self) -> Result<PlatformConnection, PlatformLoginError> {
+    async fn connection(&self) -> Result<(PlatformConnection, i64), PlatformLoginError> {
         let row = platform_oidc_connection(&self.pool)
             .await?
             .ok_or(PlatformLoginError::NotConfigured)?;
-        decode_connection(row, self.kms.as_deref()).await
+        let revision = row.revision;
+        Ok((decode_connection(row, self.kms.as_deref()).await?, revision))
     }
 
     /// Begin a platform login and return the provider authorization URL.
@@ -172,13 +175,54 @@ impl PlatformLogin {
         &self,
         redirect_uri: String,
     ) -> Result<LoginInitResponse, PlatformLoginError> {
-        let connection = self.connection().await?;
+        let (connection, _) = self.connection().await?;
         let provider = self
             .relying_party
             .cached(&connection.verification.issuer)
             .await
             .map_err(provider_unavailable)?;
-        self.authorize(&connection, &provider, redirect_uri).await
+        self.authorize(&connection, &provider, redirect_uri, None)
+            .await
+    }
+
+    /// Begin a platform console sign-in in a browser.
+    ///
+    /// As [`Self::begin`], and the login is also bound to a new random
+    /// browser binding returned once for an `HttpOnly` cookie (only its
+    /// SHA-256 is stored) and to the connection's current revision, so only
+    /// that browser can finish it and a connection replaced meanwhile
+    /// refuses it.
+    ///
+    /// # Errors
+    /// As [`Self::begin`].
+    #[tracing::instrument(level = "info", skip(self), err)]
+    pub async fn begin_browser(
+        &self,
+        redirect_uri: String,
+    ) -> Result<BegunPlatformBrowserLogin, PlatformLoginError> {
+        let (connection, revision) = self.connection().await?;
+        let provider = self
+            .relying_party
+            .cached(&connection.verification.issuer)
+            .await
+            .map_err(provider_unavailable)?;
+        let binding = crate::browser_sessions::random_secret();
+        let digest = Sha256Hex::digest(binding.as_bytes());
+        let init = self
+            .authorize(
+                &connection,
+                &provider,
+                redirect_uri,
+                Some(PlatformLoginBinding {
+                    browser_binding_hash: digest.as_bytes(),
+                    connection_revision: revision,
+                }),
+            )
+            .await?;
+        Ok(BegunPlatformBrowserLogin {
+            init,
+            binding: SecretString::from(binding),
+        })
     }
 
     /// Screen the discovered authorization endpoint, persist the login state,
@@ -199,6 +243,7 @@ impl PlatformLogin {
         connection: &PlatformConnection,
         provider: &ProviderMetadata,
         redirect_uri: String,
+        binding: Option<PlatformLoginBinding<'_>>,
     ) -> Result<LoginInitResponse, PlatformLoginError> {
         let authorization = self
             .relying_party
@@ -212,12 +257,15 @@ impl PlatformLogin {
 
         insert_platform_login_state(
             &self.pool,
-            &authorization.state,
-            authorization.code_verifier.expose_secret(),
-            &authorization.nonce,
-            connection.verification.issuer.as_str(),
-            &redirect_uri,
-            LOGIN_STATE_TTL,
+            NewPlatformLoginState {
+                state: &authorization.state,
+                code_verifier: authorization.code_verifier.expose_secret(),
+                nonce: &authorization.nonce,
+                issuer: connection.verification.issuer.as_str(),
+                redirect_uri: &redirect_uri,
+                ttl: LOGIN_STATE_TTL,
+                binding,
+            },
         )
         .await?;
 
@@ -265,8 +313,101 @@ impl PlatformLogin {
         response_issuer: Option<&str>,
         request_id: &str,
     ) -> Result<SecretString, PlatformLoginError> {
-        let connection = self.connection().await?;
-        let login_state = take_platform_login_state(&self.pool, state)
+        let VerifiedReturn {
+            connection,
+            verified,
+            ..
+        } = self
+            .verify_return(code, state, response_issuer, None)
+            .await?;
+
+        // Everything after this point is the grant, and the grant is one
+        // transaction the sessions owner holds: resolving or pinning the
+        // identity, re-reading the principal, minting, and auditing commit
+        // together or not at all. This owner hands over only what it verified.
+        //
+        // The claim must be a *verified* email. An unverified one is a string
+        // the subject chose, and pinning on it would let anyone at this issuer
+        // who can set their email to the pre-registered address capture that
+        // principal — permanently, since pinning is one-way. A provider that
+        // does not assert `email_verified` cannot be used to establish a
+        // platform administrator at all, which is the right outcome rather than
+        // a weaker match.
+        let match_claim = verified_email(&verified);
+        self.sessions
+            .issue_federated(
+                connection.verification.issuer.as_str(),
+                &verified.identity.subject,
+                match_claim.as_deref(),
+                request_id,
+            )
+            .await
+            .map_err(session_error)
+    }
+
+    /// Complete a platform console sign-in in a browser and create its
+    /// platform browser session.
+    ///
+    /// As [`Self::complete`], except the login state is taken only with the
+    /// browser binding it began with, must belong to the connection revision
+    /// still in place, and the result is a browser session anchored to that
+    /// revision rather than a token.
+    ///
+    /// # Errors
+    /// As [`Self::complete`]; a missing or foreign binding, or a connection
+    /// replaced since begin, is [`PlatformLoginError::InvalidState`].
+    #[tracing::instrument(level = "info", skip(self, code, binding), err)]
+    pub async fn complete_browser(
+        &self,
+        code: SecretString,
+        state: &str,
+        response_issuer: Option<&str>,
+        binding: &str,
+        request_id: &str,
+    ) -> Result<CreatedPlatformBrowserSession, PlatformLoginError> {
+        let digest = Sha256Hex::digest(binding.as_bytes());
+        let VerifiedReturn {
+            connection,
+            revision,
+            login_state,
+            verified,
+        } = self
+            .verify_return(code, state, response_issuer, Some(digest.as_bytes()))
+            .await?;
+        if login_state.connection_revision != Some(revision) {
+            return Err(PlatformLoginError::InvalidState);
+        }
+        let match_claim = verified_email(&verified);
+        self.sessions
+            .browser_federated(
+                connection.verification.issuer.as_str(),
+                &verified.identity.subject,
+                match_claim.as_deref(),
+                revision,
+                request_id,
+            )
+            .await
+            .map_err(session_error)
+    }
+
+    /// Consume the login state `state` names and verify the provider's
+    /// return for it: the response issuer (RFC 9207), then the code exchange
+    /// and the ID token.
+    ///
+    /// `browser_binding_hash` selects a browser login's state bound to that
+    /// digest; `None` selects an API-token login's.
+    ///
+    /// # Errors
+    /// As [`Self::complete`], before any session is involved.
+    async fn verify_return(
+        &self,
+        code: SecretString,
+        state: &str,
+        response_issuer: Option<&str>,
+        browser_binding_hash: Option<&[u8]>,
+    ) -> Result<VerifiedReturn, PlatformLoginError> {
+        let (connection, revision) = self.connection().await?;
+        let mut login_state = take_platform_login_state(&self.pool, state, browser_binding_hash)
             .await?
             .ok_or(PlatformLoginError::InvalidState)?;
 
@@ -294,7 +435,7 @@ impl PlatformLogin {
             tracing::warn!(error = %error, "platform authorization response issuer refused");
             PlatformLoginError::NotAccepted
         })?;
-        let code_verifier = SecretString::from(login_state.code_verifier);
+        let code_verifier = SecretString::from(std::mem::take(&mut login_state.code_verifier));
         let redemption = CodeRedemption {
             client_id: &connection.client_id,
             client_auth: &connection.client_auth,
@@ -317,33 +458,43 @@ impl PlatformLogin {
                 error => provider_unavailable(error),
             })?;
 
-        // Everything after this point is the grant, and the grant is one
-        // transaction the sessions owner holds: resolving or pinning the
-        // identity, re-reading the principal, minting, and auditing commit
-        // together or not at all. This owner hands over only what it verified.
-        //
-        // The claim must be a *verified* email. An unverified one is a string
-        // the subject chose, and pinning on it would let anyone at this issuer
-        // who can set their email to the pre-registered address capture that
-        // principal — permanently, since pinning is one-way. A provider that
-        // does not assert `email_verified` cannot be used to establish a
-        // platform administrator at all, which is the right outcome rather than
-        // a weaker match.
-        let match_claim = verified_email(&verified);
-        self.sessions
-            .issue_federated(
-                connection.verification.issuer.as_str(),
-                &verified.identity.subject,
-                match_claim.as_deref(),
-                request_id,
-            )
-            .await
-            .map_err(|error| match error {
-                PlatformSessionError::Invalid => PlatformLoginError::NotAccepted,
-                PlatformSessionError::Store(error) => PlatformLoginError::Store(error),
-                PlatformSessionError::Key(message) => PlatformLoginError::Session(message),
-            })
+        Ok(VerifiedReturn {
+            connection,
+            revision,
+            login_state,
+            verified,
+        })
     }
+}
+
+/// A browser login just begun: the provider destination and the binding
+/// secret the browser must present at the callback.
+pub struct BegunPlatformBrowserLogin {
+    /// The authorization URL and state.
+    pub init: LoginInitResponse,
+    /// The binding cookie value, returned exactly once.
+    pub binding: SecretString,
+}
+
+impl Debug for BegunPlatformBrowserLogin {
+    /// Formats the destination and omits the binding secret.
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        f.debug_struct("BegunPlatformBrowserLogin")
+            .field("init", &self.init)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A provider return this login verified.
+struct VerifiedReturn {
+    /// The connection it was verified against.
+    connection: PlatformConnection,
+    /// That connection's current revision.
+    revision: i64,
+    /// The login state it consumed.
+    login_state: PlatformLoginStateRow,
+    /// The verified ID token.
+    verified: VerifiedIdToken,
 }
 
 /// The platform OIDC connection in usable form.
@@ -394,6 +545,16 @@ fn verified_email(token: &VerifiedIdToken) -> Option<String> {
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     verified.then(|| token.identity.email.clone()).flatten()
+}
+
+/// Project a session-owner refusal onto login: an identity that resolves to
+/// no usable principal is not accepted.
+fn session_error(error: PlatformSessionError) -> PlatformLoginError {
+    match error {
+        PlatformSessionError::Invalid => PlatformLoginError::NotAccepted,
+        PlatformSessionError::Store(error) => PlatformLoginError::Store(error),
+        PlatformSessionError::Key(message) => PlatformLoginError::Session(message),
+    }
 }
 
 /// The provider could not be reached, or refused or garbled the exchange.
@@ -534,6 +695,7 @@ mod pg_tests {
                 &connection,
                 &provider,
                 "https://wyrd.example/callback".to_owned(),
+                None,
             )
             .await
             .expect_err("a cleartext browser destination is refused");
@@ -565,6 +727,7 @@ mod pg_tests {
                 &connection,
                 &provider,
                 "https://wyrd.example/callback".to_owned(),
+                None,
             )
             .await
             .expect("an https browser destination is accepted");

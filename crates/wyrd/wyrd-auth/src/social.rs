@@ -1323,6 +1323,16 @@ pub const SIGNUP_EMAIL_TTL: std::time::Duration = std::time::Duration::from_mins
 /// source.
 const SIGNUP_ADDRESS_ATTEMPTS: i32 = 5;
 
+/// Emailed-proof requests admitted per trusted source in one window.
+const EMAIL_SOURCE_ATTEMPTS: i32 = 20;
+
+/// Emailed-proof requests mailed to one address in one window, whatever their
+/// source.
+const EMAIL_ADDRESS_ATTEMPTS: i32 = 5;
+
+/// Emailed-proof requests admitted per signed-in account in one window.
+const EMAIL_ACCOUNT_ATTEMPTS: i32 = 5;
+
 /// The envelope context of the one signup challenge secret, which
 /// stored-secret maintenance rebuilds from the same fixed owner.
 const CHALLENGE_CONTEXT: SecretContext<'static> = SecretContext {
@@ -1518,6 +1528,78 @@ impl SocialSignIn {
                 details: json!({ "retry_after_seconds": wait.as_secs() }),
             }),
         }
+    }
+
+    /// Admit one emailed-proof request of `purpose` (`discovery`, `contact`
+    /// or `reset`) for `address` from `source`, and for `account` when a
+    /// signed-in User asks, before anything is mailed.
+    ///
+    /// Each window is shared by every replica and keyed by a pseudonym. The
+    /// source and account windows refuse; the address window only answers
+    /// `false`, so the caller sends nothing yet answers as if it had and a
+    /// recipient throttle never shows whether an account exists or mail went.
+    /// The address window is per purpose, so a flood of one kind of request
+    /// cannot withhold another kind's mail, such as a reset.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::EmailAttempts`] with `retry_after_seconds` once
+    /// the source or account window is exhausted, and
+    /// [`WyrdError::AuthVerifyUnavailable`] for an unknown source or when
+    /// admission state is unavailable, which refuses rather than admits.
+    pub(crate) async fn admit_email(
+        &self,
+        purpose: &str,
+        source: Option<std::net::IpAddr>,
+        address: &crate::mail::EmailAddress,
+        account: Option<(DataTenantId, Uuid)>,
+    ) -> Result<bool, WyrdError> {
+        let source = source.ok_or_else(source_unknown)?;
+        let mut refusing = vec![(
+            SignupAdmissionScope::EmailSource,
+            self.pseudonym(
+                "email_source",
+                crate::admission::source_key(source).as_bytes(),
+            )
+            .await?,
+            EMAIL_SOURCE_ATTEMPTS,
+        )];
+        if let Some((tenant, user)) = account {
+            refusing.push((
+                SignupAdmissionScope::EmailAccount,
+                self.pseudonym("email_account", format!("{tenant}:{user}").as_bytes())
+                    .await?,
+                EMAIL_ACCOUNT_ATTEMPTS,
+            ));
+        }
+        let mut wait = None;
+        for (scope, key, limit) in &refusing {
+            let refused = admit_signup(&self.operator, *scope, key, *limit, SIGNUP_WINDOW)
+                .await
+                .map_err(store_error)?;
+            wait = wait.max(refused);
+        }
+        if let Some(wait) = wait {
+            return Err(WyrdError::EmailAttempts {
+                message: "too many email requests; wait before retrying".to_owned(),
+                details: json!({ "retry_after_seconds": wait.as_secs() }),
+            });
+        }
+        let mailbox = self
+            .pseudonym(
+                "email_address",
+                format!("{purpose}:{}", address.canonical).as_bytes(),
+            )
+            .await?;
+        let held = admit_signup(
+            &self.operator,
+            SignupAdmissionScope::EmailAddress,
+            &mailbox,
+            EMAIL_ADDRESS_ATTEMPTS,
+            SIGNUP_WINDOW,
+        )
+        .await
+        .map_err(store_error)?;
+        Ok(held.is_none())
     }
 
     /// Begin a public workspace signup by proving the mailbox `typed`, from

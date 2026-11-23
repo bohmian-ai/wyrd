@@ -51,6 +51,12 @@ pub enum SignupAdmissionScope {
     Identity,
     /// The trusted source of an unauthenticated sign-in start.
     SignIn,
+    /// The trusted source of an emailed discovery, contact or reset proof.
+    EmailSource,
+    /// The address such a proof is mailed to.
+    EmailAddress,
+    /// The signed-in account asking for such a proof.
+    EmailAccount,
 }
 
 impl SignupAdmissionScope {
@@ -62,6 +68,9 @@ impl SignupAdmissionScope {
             Self::Source => "source",
             Self::Identity => "identity",
             Self::SignIn => "sign_in",
+            Self::EmailSource => "email_source",
+            Self::EmailAddress => "email_address",
+            Self::EmailAccount => "email_account",
         }
     }
 }

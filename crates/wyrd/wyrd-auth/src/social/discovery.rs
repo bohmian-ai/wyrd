@@ -53,21 +53,26 @@ const DISCOVERY_CANDIDATES: i64 = 80;
 const DIRECTORY_SCOPE: &str = "directory";
 
 impl SocialSignIn {
-    /// Mail a discovery proof to `typed` and return the sealed flow cookie
-    /// the same browser must present to read its workspaces.
+    /// Mail a discovery proof to `typed`, asked for from `source`, and
+    /// return the sealed flow cookie the same browser must present to read
+    /// its workspaces.
     ///
     /// The answer is the same whether or not any workspace knows the
-    /// address. The message links `/workspaces/verify` on `origin` with the
-    /// proof in its fragment and names no workspace.
+    /// address, and whether or not the address's email window let the
+    /// message go. The request is admitted in its source's window first. The
+    /// message links `/workspaces/verify` on `origin` with the proof in its
+    /// fragment and names no workspace.
     ///
     /// # Errors
     /// Returns [`WyrdError::MethodUnavailable`] without a mail relay,
-    /// [`WyrdError::Validation`] for an unparsable address, and
+    /// [`WyrdError::Validation`] for an unparsable address,
+    /// [`WyrdError::EmailAttempts`] past the source window, and
     /// [`WyrdError::AuthVerifyUnavailable`] when the store, key or relay
     /// fails.
     pub async fn begin_discovery(
         &self,
         mail: &ApplicationMail,
+        source: Option<std::net::IpAddr>,
         typed: &str,
         origin: &Url,
     ) -> Result<SecretString, WyrdError> {
@@ -78,6 +83,9 @@ impl SocialSignIn {
             });
         }
         let address = EmailAddress::parse(typed, "email")?;
+        let send = self
+            .admit_email("discovery", source, &address, None)
+            .await?;
         let proof = random_secret();
         let cookie = self
             .seal_envelope(&SignupEnvelope::DiscoveryEmail {
@@ -91,8 +99,10 @@ impl SocialSignIn {
             .join("workspaces/verify")
             .map_err(|_| super::invalid_state("the deployment origin is invalid"))?;
         link.set_fragment(Some(&format!("proof={proof}")));
-        mail.send_discovery_proof(&address, link.as_str(), &proof)
-            .await?;
+        if send {
+            mail.send_discovery_proof(&address, link.as_str(), &proof)
+                .await?;
+        }
         Ok(cookie)
     }
 

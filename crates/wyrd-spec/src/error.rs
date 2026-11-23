@@ -667,6 +667,22 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// Too many emailed-proof requests (workspace discovery, contact
+    /// verification, password reset) from this source or for this account in
+    /// the current fixed window; nothing was mailed.
+    #[error("[WYRD_AUTH_429_EMAIL_ATTEMPTS] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_429_EMAIL_ATTEMPTS",
+        status = 429,
+        title = "Too many email requests",
+        remediation = "Wait `details.retry_after_seconds` until the fixed email window ends, then ask again."
+    )]
+    EmailAttempts {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// The proven identity already owns the deployment's owned-workspace cap
     /// of signup-created workspaces that are not retired. Waiting does not
     /// clear it.
@@ -4229,6 +4245,7 @@ impl WyrdError {
             | Self::PasswordAttempts { message, details }
             | Self::SignupAttempts { message, details }
             | Self::SignInAttempts { message, details }
+            | Self::EmailAttempts { message, details }
             | Self::SignupWorkspaceLimit { message, details }
             | Self::SignupChallenge { message, details }
             | Self::OneTimeCodeInvalid { message, details }
@@ -5198,6 +5215,10 @@ mod tests {
             },
             WyrdError::SignInAttempts {
                 message: "too many sign-in starts".to_owned(),
+                details: serde_json::json!({ "retry_after_seconds": 3600 }),
+            },
+            WyrdError::EmailAttempts {
+                message: "too many email requests".to_owned(),
                 details: serde_json::json!({ "retry_after_seconds": 3600 }),
             },
             WyrdError::SignupWorkspaceLimit {

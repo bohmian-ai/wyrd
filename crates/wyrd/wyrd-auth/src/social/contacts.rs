@@ -10,7 +10,7 @@
 use secrecy::SecretString;
 use serde_json::json;
 use url::Url;
-use wyrd_spec::auth::{SecretBearer, Sha256Hex};
+use wyrd_spec::auth::{ContactRequest, SecretBearer, Sha256Hex};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::TenantSlug;
 use wyrd_sql::queries::auth::{replace_verified_contact, verified_contact_for_update};
@@ -25,20 +25,24 @@ use crate::passwords::code_hash;
 const CONTACT_EMAIL_TTL: std::time::Duration = std::time::Duration::from_mins(15);
 
 impl SocialSignIn {
-    /// Mail a proof of `typed` to that address for the User signed in by
-    /// `session` to `tenant`, and return the sealed flow cookie the same
-    /// browser must present to verify it.
+    /// Mail a proof of `request.email` to that address for the User signed
+    /// in by `session` to `request.tenant`, asking from `source`, and
+    /// return the sealed flow cookie the same browser must present to verify
+    /// it.
     ///
     /// The session must be a password or provider sign-in from the last five
     /// minutes, and a mail relay must be configured. The message links
     /// `/t/{tenant}/contact/verify` on `origin` with the proof in its
-    /// fragment.
+    /// fragment. The request is admitted in its source's, its account's and
+    /// its address's email windows first; past the address window nothing is
+    /// mailed, though the answer is the same.
     ///
     /// # Errors
     /// Returns [`WyrdError::InvalidToken`] when the session is not
     /// `tenant`'s, [`WyrdError::RecentLoginRequired`] for an older or
     /// recovery session, [`WyrdError::MethodUnavailable`] without a relay,
-    /// [`WyrdError::Validation`] for an unparsable address, and
+    /// [`WyrdError::Validation`] for an unparsable address,
+    /// [`WyrdError::EmailAttempts`] past the source or account window, and
     /// [`WyrdError::AuthVerifyUnavailable`] when the store, key or relay
     /// fails.
     pub async fn request_contact(
@@ -46,10 +50,11 @@ impl SocialSignIn {
         sessions: &BrowserSessions,
         mail: &ApplicationMail,
         session: &BrowserSession,
-        tenant: &TenantSlug,
-        typed: &str,
+        source: Option<std::net::IpAddr>,
+        request: &ContactRequest,
         origin: &Url,
     ) -> Result<SecretString, WyrdError> {
+        let tenant = &request.tenant;
         let postgres = sessions.connections.postgres();
         let principal = &session.verified.principal;
         let routed = postgres
@@ -73,7 +78,15 @@ impl SocialSignIn {
                 details: json!({ "reason": "method_unavailable" }),
             });
         }
-        let address = EmailAddress::parse(typed, "email")?;
+        let address = EmailAddress::parse(&request.email, "email")?;
+        let send = self
+            .admit_email(
+                "contact",
+                source,
+                &address,
+                Some((principal.tenant_id, principal.id.as_uuid())),
+            )
+            .await?;
         let revision = {
             let mut conn = postgres
                 .tenant_conn(principal.tenant_id)
@@ -100,8 +113,10 @@ impl SocialSignIn {
             .join(&format!("t/{tenant}/contact/verify"))
             .map_err(|_| super::invalid_state("the deployment origin is invalid"))?;
         link.set_fragment(Some(&format!("proof={proof}")));
-        mail.send_contact_proof(&address, link.as_str(), &proof)
-            .await?;
+        if send {
+            mail.send_contact_proof(&address, link.as_str(), &proof)
+                .await?;
+        }
         Ok(cookie)
     }
 

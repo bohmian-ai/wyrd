@@ -102,6 +102,20 @@ async fn browser(
     set: &str,
     body: &Value,
 ) -> (StatusCode, Option<String>, Value) {
+    let (status, _, cookie, body) = browser_from(srv, "203.0.113.9", uri, cookies, set, body).await;
+    (status, cookie, body)
+}
+
+/// [`browser`] from the visitor `client` the ingress names, also returning
+/// the `Retry-After` header.
+async fn browser_from(
+    srv: &WyrdTestServer,
+    client: &str,
+    uri: &str,
+    cookies: &[&str],
+    set: &str,
+    body: &Value,
+) -> (StatusCode, Option<String>, Option<String>, Value) {
     let peer: IpAddr = "10.7.0.1".parse().expect("peer address");
     let mut builder = Request::builder()
         .method(Method::POST)
@@ -109,7 +123,7 @@ async fn browser(
         .header(header::HOST, SOCIAL_HOST)
         .header(header::ORIGIN, format!("http://{SOCIAL_HOST}"))
         .header(header::CONTENT_TYPE, "application/json")
-        .header(CLIENT_HEADER, "203.0.113.9")
+        .header(CLIENT_HEADER, client)
         .extension(axum::extract::ConnectInfo(SocketAddr::new(peer, 40_000)));
     if !cookies.is_empty() {
         builder = builder.header(header::COOKIE, cookies.join("; "));
@@ -119,6 +133,11 @@ async fn browser(
         .expect("request builds");
     let resp = srv.oneshot(request).await.expect("route responds");
     let status = resp.status();
+    let retry_after = resp
+        .headers()
+        .get(header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     let prefix = format!("{set}=");
     let cookie = resp
         .headers()
@@ -133,6 +152,7 @@ async fn browser(
         .expect("read body");
     (
         status,
+        retry_after,
         cookie,
         serde_json::from_slice(&bytes).unwrap_or(Value::Null),
     )
@@ -619,4 +639,102 @@ async fn a_visitor_discovers_only_live_workspaces_for_a_verified_address() {
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// Assert `(status, retry_after, body)` is the email admission refusal, with
+/// a `Retry-After` equal to its whole-second problem field.
+fn assert_throttled(status: StatusCode, retry_after: Option<&str>, body: &Value) {
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["code"], "WYRD_AUTH_429_EMAIL_ATTEMPTS", "{body}");
+    let seconds = body["details"]["retry_after_seconds"]
+        .as_u64()
+        .expect("whole-second wait");
+    assert!(seconds > 0);
+    assert_eq!(retry_after, Some(seconds.to_string().as_str()));
+}
+
+/// Email requests are counted before any mail is sent:
+///   1. one address asked about again and again still gets the generic
+///      `202`, but past its budget no further mail goes to it;
+///   2. one visitor asking about many addresses is refused with `429`
+///      and `Retry-After` once its source budget is spent, while another
+///      visitor is still served;
+///   3. a signed-in User asking to verify address after address is refused
+///      with `429` once the account budget is spent, and nothing more is
+///      mailed.
+///
+/// # Panics
+/// Panics when a budget admits, refuses or mails differently.
+#[tokio::test(flavor = "multi_thread")]
+async fn email_requests_are_admitted_before_any_mail_is_sent() {
+    let (srv, operator) = contact_server("harbor").await;
+    let api = relay_to_mailpit(&srv, &operator).await;
+    let discover_from = |client: &'static str, email: String| {
+        let srv = &srv;
+        async move {
+            browser_from(
+                srv,
+                client,
+                "/auth/browser/workspaces/request",
+                &[],
+                "wyrd_discovery",
+                &json!({ "email": email }),
+            )
+            .await
+        }
+    };
+
+    // 1. The address budget never shows in the response.
+    let asked = "gus.budget@example.test";
+    for _ in 0..7 {
+        let (status, _, _, body) = discover_from("198.51.100.1", asked.to_owned()).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        assert_eq!(body, json!({ "status": "check_email" }));
+    }
+    assert_eq!(
+        mail_to(&api, asked).await.len(),
+        5,
+        "the address budget stops mail"
+    );
+
+    // 2. The source budget refuses with Retry-After.
+    let mut refused = None;
+    for n in 0..22 {
+        let (status, retry_after, _, body) =
+            discover_from("198.51.100.2", format!("hal{n}.budget@example.test")).await;
+        if status != StatusCode::ACCEPTED {
+            refused = Some((n, status, retry_after, body));
+            break;
+        }
+    }
+    let (n, status, retry_after, body) = refused.expect("the source budget refuses");
+    assert_eq!(n, 20, "twenty requests per source are admitted");
+    assert_throttled(status, retry_after.as_deref(), &body);
+    assert!(mail_to(&api, "hal20.budget@example.test").await.is_empty());
+    let (status, _, _, _) =
+        discover_from("198.51.100.3", "ivy.budget@example.test".to_owned()).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "another source is unaffected");
+
+    // 3. The account budget refuses a signed-in User.
+    let session = sign_in(&srv, "harbor").await;
+    let mut refused = None;
+    for n in 0..7 {
+        let (status, retry_after, _, body) = browser_from(
+            &srv,
+            "198.51.100.4",
+            "/auth/browser/email/request",
+            &[&session],
+            "wyrd_contact",
+            &json!({ "tenant": "harbor", "email": format!("jo{n}.budget@example.test") }),
+        )
+        .await;
+        if status != StatusCode::ACCEPTED {
+            refused = Some((n, status, retry_after, body));
+            break;
+        }
+    }
+    let (n, status, retry_after, body) = refused.expect("the account budget refuses");
+    assert_eq!(n, 5, "five contact requests per account are admitted");
+    assert_throttled(status, retry_after.as_deref(), &body);
+    assert!(mail_to(&api, "jo5.budget@example.test").await.is_empty());
 }

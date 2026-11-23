@@ -90,6 +90,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_AUTH_409_CONNECTION_NOT_TESTED` | 409 | Tenant OIDC candidate is not freshly tested | Run POST /v1/identity/oidc/candidate/test against this exact candidate revision, complete the provider sign-in at the returned authorization_url, and activate within 15 minutes of that successful test. |
 | `WYRD_AUTH_409_WORKLOAD_BINDING_CONFLICT` | 409 | Workload family already has a runtime account | Each Service family has at most one family-restricted runtime account. Issue another credential on that account for rotation or concurrent releases, or first set the existing account's restriction to `unrestricted`. |
 | `WYRD_AUTH_413_CARD_SCOPE_TOO_LARGE` | 413 | Card scope too large | Reduce or split the selected root's declared Card graph so its transitive observation-target scope fits the token size limit, or select a root with a smaller graph. |
+| `WYRD_AUTH_429_EMAIL_ATTEMPTS` | 429 | Too many email requests | Wait `details.retry_after_seconds` until the fixed email window ends, then ask again. |
 | `WYRD_AUTH_429_PASSWORD_ATTEMPTS` | 429 | Too many password attempts | Wait `details.retry_after_seconds` until the fixed attempt window ends, then try again. |
 | `WYRD_AUTH_429_SIGNUP_ATTEMPTS` | 429 | Too many workspace signups | Wait `details.retry_after_seconds` until the fixed signup window ends, then try again. |
 | `WYRD_AUTH_429_SIGN_IN_ATTEMPTS` | 429 | Too many sign-in starts | Wait `details.retry_after_seconds` until the fixed sign-in window ends, then start the sign-in again. |

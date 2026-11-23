@@ -803,8 +803,9 @@ fn application_mail(state: &AppState) -> Result<&wyrd_auth::mail::ApplicationMai
 /// `401 WYRD_AUTH_401_INVALID_TOKEN` without a live session for `tenant`;
 /// `403 WYRD_AUTH_403_RECENT_LOGIN_REQUIRED` for an older or recovery
 /// session; `403 WYRD_AUTH_403_METHOD_UNAVAILABLE` without a relay;
-/// `400 WYRD_SPEC_400_VALIDATION` for an unparsable address; `503` when
-/// the store, key or relay fails.
+/// `400 WYRD_SPEC_400_VALIDATION` for an unparsable address;
+/// `429 WYRD_AUTH_429_EMAIL_ATTEMPTS` once the source's or account's email
+/// window is exhausted; `503` when the store, key or relay fails.
 #[utoipa::path(
     post,
     path = "/auth/browser/email/request",
@@ -821,6 +822,9 @@ fn application_mail(state: &AppState) -> Result<&wyrd_auth::mail::ApplicationMai
           mail is not configured (WYRD_AUTH_403_ORIGIN_REFUSED, \
           WYRD_AUTH_403_RECENT_LOGIN_REQUIRED, WYRD_AUTH_403_METHOD_UNAVAILABLE)",
           body = WyrdProblem),
+        (status = 429, description = "The source's or account's email window is exhausted; nothing was mailed \
+          (WYRD_AUTH_429_EMAIL_ATTEMPTS)", body = WyrdProblem,
+          headers(("Retry-After" = String, description = "Whole seconds until the window ends"))),
         (status = 503, description = "The store, key or relay is unavailable \
           (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
@@ -832,6 +836,7 @@ pub async fn contact_request(
     State(state): State<AppState>,
     RequestOrigin(origin): RequestOrigin,
     headers: HeaderMap,
+    RequestSource(source): RequestSource,
     request: Result<Json<ContactRequest>, JsonRejection>,
 ) -> Result<Response, WyrdErrorResponse> {
     let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
@@ -845,8 +850,8 @@ pub async fn contact_request(
             &sessions,
             application_mail(&state)?,
             &session,
-            &request.tenant,
-            &request.email,
+            source,
+            &request,
             &origin,
         )
         .await?;
@@ -969,8 +974,9 @@ fn discovery_cookie(headers: &HeaderMap) -> Option<&str> {
 ///
 /// # Errors
 /// `403 WYRD_AUTH_403_METHOD_UNAVAILABLE` without a mail relay;
-/// `400 WYRD_SPEC_400_VALIDATION` for an unparsable address; `503` when the
-/// store, key or relay fails.
+/// `400 WYRD_SPEC_400_VALIDATION` for an unparsable address;
+/// `429 WYRD_AUTH_429_EMAIL_ATTEMPTS` once the source's email window is
+/// exhausted; `503` when the store, key or relay fails.
 #[utoipa::path(
     post,
     path = "/auth/browser/workspaces/request",
@@ -983,6 +989,9 @@ fn discovery_cookie(headers: &HeaderMap) -> Option<&str> {
           body = WyrdProblem),
         (status = 403, description = "Origin absent or foreign, or mail is not configured \
           (WYRD_AUTH_403_ORIGIN_REFUSED, WYRD_AUTH_403_METHOD_UNAVAILABLE)", body = WyrdProblem),
+        (status = 429, description = "The source's email window is exhausted; nothing was mailed \
+          (WYRD_AUTH_429_EMAIL_ATTEMPTS)", body = WyrdProblem,
+          headers(("Retry-After" = String, description = "Whole seconds until the window ends"))),
         (status = 503, description = "The store, key or relay is unavailable \
           (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
@@ -994,12 +1003,13 @@ pub async fn discovery_request(
     State(state): State<AppState>,
     RequestOrigin(origin): RequestOrigin,
     headers: HeaderMap,
+    RequestSource(source): RequestSource,
     request: Result<Json<DiscoveryRequest>, JsonRejection>,
 ) -> Result<Response, WyrdErrorResponse> {
     let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
     require_same_origin(&headers, &origin)?;
     let flow = social(&state)?
-        .begin_discovery(application_mail(&state)?, &request.email, &origin)
+        .begin_discovery(application_mail(&state)?, source, &request.email, &origin)
         .await?;
     Ok(with_cookies(
         StatusCode::ACCEPTED,

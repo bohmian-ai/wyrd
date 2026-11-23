@@ -880,9 +880,22 @@ directory-update owner once here; recovery below consumes its output.
 - Not fixed, outside this task: `pg_hosted_artifacts::busy_queued_execution_is_deferred_until_capacity_frees` fails intermittently (2 of 5 solo runs, and once in the lane).
   - Cause, from a read-only diagnostician: after the runner admits an attempt, its input read's Oracle admission joins the operation and waits out the 20 s execution deadline while pressure is `Critical` (`runner.rs:808-813`, `oracle/mod.rs:2342-2346`, `workload.rs:622-660`). The working-tree diff is not involved.
   - Fix site: the verification runner's nested admissions, which are on a hot path. Left for a maintainer decision.
+- Scenario 3, email request budgets: `platform_admin_e2e::contacts::email_requests_are_admitted_before_any_mail_is_sent` (same file). It covers these cases:
+  - one address asked about seven times always gets the same `202 {"status":"check_email"}`, but only five messages reach it (silent recipient throttle);
+  - one source asking about many addresses is refused on its 21st request with `429 WYRD_AUTH_429_EMAIL_ATTEMPTS` and a `Retry-After` equal to `details.retry_after_seconds`. Nothing is mailed to the refused address, and another source is still served;
+  - a signed-in User asking to verify address after address is refused on the 6th request with the same 429, and nothing more is mailed.
+  - RED: `the address budget stops mail`, left 7, right 5 (every request mailed).
+  - GREEN: 1 passed. The contacts and signup modules then passed twice in a row (14 tests).
+  - Implementation:
+    - `SocialSignIn::admit_email` (`wyrd-auth/src/social.rs`) runs before any mail, on the existing `platform.signup_admissions` windows.
+    - Three new scopes: `email_source` (20 an hour), `email_account` (5 an hour), and `email_address` (5 an hour, keyed per purpose so a discovery flood cannot withhold a reset).
+    - The scope CHECK is in the unshipped migration 0006, edited in place (spec "Apply separate shared source and address/account budgets, including resend, … for signup/contact verification, discovery and reset"; "Source throttles may return `429`"; maintainer approval: "nothing has shipped").
+    - New stable code `WYRD_AUTH_429_EMAIL_ATTEMPTS` with `Retry-After`; projections regenerated (`codegen:regen`, UI catalog) and the errors reference updated.
+    - The two request handlers take `RequestSource`. `request_contact` now takes the `ContactRequest` body (the argument limit).
+  - First GREEN attempt: the earlier discovery journey failed because it asks about one address six times across contact and discovery. Cause: the address window was shared across purposes. It is now keyed per purpose. The 10-an-hour source limit then refused that journey's twelfth request from one browser; it was raised to 20 to match signup starts. The new test was adjusted before its first commit.
+  - Unexplained, not reproduced: in one combined run, `platform_admin_e2e::signup::completion_consumes_either_proof_and_recovers_its_own_claim` failed once. Its panic was lost to output trimming. It then passed in 5 runs, 3 of them under clippy load. One Mailpit `connection refused` also happened once while the teammates' test stacks were starting, and passed on rerun.
 - Still open in cycle 12:
   - a second User's session;
-  - contact and discovery admission budgets;
   - pagination past one page;
   - removing the old revision's reset proofs (the reset owner is cycle 13).
 - Commands:

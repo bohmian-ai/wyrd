@@ -161,6 +161,14 @@ async fn browser_from(
 /// Sign `admin` in to `slug` with [`PASSWORD`]; returns its session
 /// cookie pair.
 async fn sign_in(srv: &WyrdTestServer, slug: &str) -> String {
+    sign_in_as(srv, slug, "admin", PASSWORD).await
+}
+
+/// Sign `username` in to `slug` with `password`; returns the session cookie.
+///
+/// # Panics
+/// Panics when the sign-in is refused.
+async fn sign_in_as(srv: &WyrdTestServer, slug: &str, username: &str, password: &str) -> String {
     let resp = srv
         .oneshot(
             Request::builder()
@@ -175,7 +183,7 @@ async fn sign_in(srv: &WyrdTestServer, slug: &str) -> String {
                     40_000,
                 )))
                 .body(Body::from(
-                    json!({ "tenant": slug, "username": "admin", "password": PASSWORD })
+                    json!({ "tenant": slug, "username": username, "password": password })
                         .to_string(),
                 ))
                 .expect("request builds"),
@@ -737,4 +745,193 @@ async fn email_requests_are_admitted_before_any_mail_is_sent() {
     assert_eq!(n, 5, "five contact requests per account are admitted");
     assert_throttled(status, retry_after.as_deref(), &body);
     assert!(mail_to(&api, "jo5.budget@example.test").await.is_empty());
+}
+
+/// A contact flow belongs to the User and tenant that began it:
+///   1. another User of the same tenant, signed in and recent, presenting
+///      the flow cookie and its proof is refused and nothing is stored;
+///   2. the User who began it still completes it afterwards;
+///   3. a session for one tenant cannot ask for another tenant's contact.
+///
+/// # Panics
+/// Panics when another User's session verifies or stores a contact.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_contact_flow_belongs_to_the_user_who_began_it() {
+    let (srv, operator) = contact_server("harbor").await;
+    add_tenant(&srv, &operator, "cove").await;
+    let api = relay_to_mailpit(&srv, &operator).await;
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    let tenant: uuid::Uuid =
+        sqlx::query_scalar("SELECT data_tenant_id FROM platform.tenants WHERE slug = 'harbor'")
+            .fetch_one(&superuser)
+            .await
+            .expect("tenant id");
+    let admin = srv
+        .bootstrap_service_in_tenant(
+            wyrd_spec::ids::DataTenantId::new(tenant).expect("a UUIDv7 tenant"),
+            "contacts-admin",
+            &["admin"],
+        )
+        .await
+        .expect("tenant admin bootstraps");
+    let admin = srv
+        .exchange_api_key(admin.api_key().expect("admin key"))
+        .await
+        .expect("admin key exchanges");
+    let other_password = "quiet harbor lantern";
+    let (status, created) = social_call(
+        &srv,
+        social_request(
+            Method::POST,
+            "/v1/principals/users",
+            Some(&admin),
+            Some(json!({
+                "username": "ada", "password": other_password,
+                "assignments": [{ "role": "viewer", "scope": "all" }],
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let address = "owner.flow@example.test";
+    let owner = sign_in(&srv, "harbor").await;
+    let (status, flow, body) = browser(
+        &srv,
+        "/auth/browser/email/request",
+        &[&owner],
+        "wyrd_contact",
+        &json!({ "tenant": "harbor", "email": address }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let flow = flow.expect("a flow cookie");
+    let (proof, _) = mailed_proof(&api, address).await;
+    let verify = json!({ "tenant": "harbor", "proof": proof });
+
+    // 1. Another User's session cannot take the flow over.
+    let other = sign_in_as(&srv, "harbor", "ada", other_password).await;
+    let (status, _, body) = browser(
+        &srv,
+        "/auth/browser/email/verify",
+        &[&other, &flow],
+        "wyrd_contact",
+        &verify,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(
+        body["code"], "WYRD_AUTH_401_ONE_TIME_CODE_INVALID",
+        "{body}"
+    );
+    assert!(
+        contacts(&superuser, "harbor").await.is_empty(),
+        "nothing stored"
+    );
+
+    // 2. The User who began it completes it.
+    let (status, _, body) = browser(
+        &srv,
+        "/auth/browser/email/verify",
+        &[&owner, &flow],
+        "wyrd_contact",
+        &verify,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert_eq!(contacts(&superuser, "harbor").await.len(), 1);
+
+    // 3. A session for one tenant asks nothing of another.
+    let (status, _, _) = browser(
+        &srv,
+        "/auth/browser/email/request",
+        &[&owner],
+        "wyrd_contact",
+        &json!({ "tenant": "cove", "email": "cove.flow@example.test" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(mail_to(&api, "cove.flow@example.test").await.is_empty());
+    assert!(contacts(&superuser, "cove").await.is_empty());
+}
+
+/// A discovery read pages through every live workspace:
+///   1. an address that reaches 23 workspaces reads the first 20 in
+///      route-key order with a `next_cursor`;
+///   2. the read cookie and that cursor return the last 3 and no cursor;
+///   3. the next page without the read cookie is refused.
+///
+/// # Panics
+/// Panics when a page is missing, repeats or reorders a workspace.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_discovery_read_pages_through_every_workspace() {
+    let (srv, operator) = bare_server().await;
+    let api = relay_to_mailpit(&srv, &operator).await;
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    let slugs: Vec<String> = (0..23).map(|n| format!("page-{n:02}")).collect();
+    for slug in &slugs {
+        add_tenant(&srv, &operator, slug).await;
+    }
+    let address = "pager@example.test";
+    sqlx::query(
+        "INSERT INTO wyrd.auth_user_contacts (data_tenant_id, user_id, address)
+         SELECT u.data_tenant_id, u.id, $1
+           FROM wyrd.auth_users u JOIN platform.tenants t USING (data_tenant_id)
+          WHERE t.slug LIKE 'page-%'",
+    )
+    .bind(address)
+    .execute(&superuser)
+    .await
+    .expect("contacts seed");
+    assert_eq!(
+        within_propagation(&23, || directory_entries(&superuser)).await,
+        23
+    );
+
+    // 1. The first page.
+    let (status, first, read) = discover(&srv, &api, address).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let listed = |page: &Value| {
+        workspaces(page)
+            .into_iter()
+            .map(|(slug, _, _)| slug)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(listed(&first), slugs[..20]);
+    let cursor = first["next_cursor"].as_str().expect("a next cursor");
+
+    // 2. and 3. The next page needs the read cookie.
+    let next = |cookie: Option<String>| {
+        let mut request = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/auth/browser/workspaces?cursor={cursor}"))
+            .header(header::HOST, SOCIAL_HOST);
+        if let Some(cookie) = cookie {
+            request = request.header(header::COOKIE, cookie);
+        }
+        let request = request.body(Body::empty()).expect("request builds");
+        let srv = &srv;
+        async move {
+            let resp = srv.oneshot(request).await.expect("page responds");
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("page body");
+            (
+                status,
+                serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+            )
+        }
+    };
+    let (status, rest) = next(Some(read)).await;
+    assert_eq!(status, StatusCode::OK, "{rest}");
+    assert_eq!(listed(&rest), slugs[20..]);
+    assert!(rest.get("next_cursor").is_none_or(Value::is_null), "{rest}");
+    let (status, _) = next(None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }

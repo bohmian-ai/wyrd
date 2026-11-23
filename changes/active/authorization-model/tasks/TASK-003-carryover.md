@@ -894,9 +894,18 @@ directory-update owner once here; recovery below consumes its output.
     - The two request handlers take `RequestSource`. `request_contact` now takes the `ContactRequest` body (the argument limit).
   - First GREEN attempt: the earlier discovery journey failed because it asks about one address six times across contact and discovery. Cause: the address window was shared across purposes. It is now keyed per purpose. The 10-an-hour source limit then refused that journey's twelfth request from one browser; it was raised to 20 to match signup starts. The new test was adjusted before its first commit.
   - Unexplained, not reproduced: in one combined run, `platform_admin_e2e::signup::completion_consumes_either_proof_and_recovers_its_own_claim` failed once. Its panic was lost to output trimming. It then passed in 5 runs, 3 of them under clippy load. One Mailpit `connection refused` also happened once while the teammates' test stacks were starting, and passed on rerun.
+- Scenario 4, a contact flow belongs to the User who began it: `platform_admin_e2e::contacts::a_contact_flow_belongs_to_the_user_who_began_it`. It covers these cases:
+  - another recent User of the same tenant presenting the flow cookie and the real proof gets 401 `ONE_TIME_CODE_INVALID`, and nothing is stored;
+  - the owner then completes the flow (204, one contact);
+  - a session for `harbor` asking for `cove`'s contact gets 401, mails nothing and stores nothing.
+  - No RED: the User and tenant checks shipped with scenario 1 and passed on first run. Mutation: dropping `user != principal.id` in `verify_contact` fails the test (204, expected 401). The code was restored.
+- Scenario 5, discovery pagination: `platform_admin_e2e::contacts::a_discovery_read_pages_through_every_workspace`.
+  - 23 workspaces for one address. Contacts are seeded through SQL because the per-purpose address window allows 5 verifications an hour; the projection still arrives through the real notification worker.
+  - The first page lists 20 in route-key order with `next_cursor`. The read cookie and that cursor return the last 3 with no cursor. Without the read cookie the next page gets 401.
+  - TDD VIOLATED: the paging code went in with scenario 2, before this test, which passed on first run. Mutation: returning no cursor from a full page fails the test (`a next cursor`). The code was restored.
 - Still open in cycle 12:
-  - a second User's session;
-  - pagination past one page;
+  - expired and wrong-purpose discovery proofs;
+  - SQL integration: address-key-only projection and forced RLS, reconciliation after a missed notification, and refusal when validation is unavailable;
   - removing the old revision's reset proofs (the reset owner is cycle 13).
 - Commands:
   - the Postgres journey command, with selector `test(=platform_admin_e2e::contacts::a_signed_in_user_verifies_and_replaces_a_recovery_contact)`;

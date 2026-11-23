@@ -903,9 +903,18 @@ directory-update owner once here; recovery below consumes its output.
   - 23 workspaces for one address. Contacts are seeded through SQL because the per-purpose address window allows 5 verifications an hour; the projection still arrives through the real notification worker.
   - The first page lists 20 in route-key order with `next_cursor`. The read cookie and that cursor return the last 3 with no cursor. Without the read cookie the next page gets 401.
   - TDD VIOLATED: the paging code went in with scenario 2, before this test, which passed on first run. Mutation: returning no cursor from a full page fails the test (`a next cursor`). The code was restored.
+- Scenario 6, purpose and read expiry: `platform_admin_e2e::contacts::only_a_live_discovery_proof_reads_workspaces`. It covers these cases:
+  - a contact proof and flow cookie presented as a discovery flow get 401 and no read cookie;
+  - a discovery proof presented to contact verification gets 401, and the contact is unchanged;
+  - once the spent proof's read deadline passes (aged through SQL), the same browser's repeat gets 401.
+  - TDD VIOLATED: the code came with scenario 2. Mutation: dropping `read_until > statement_timestamp()` from `spend_discovery_proof` fails the test (200, expected 401). The code was restored.
+  - Not proven: expiry of the pre-proof sealed envelope. Its deadline is sealed in the cookie and checked by the shared `require_live` against the database clock, which no journey can advance. Signup has the same gap.
+- Scenario 7, reconciliation and revalidation: `platform_admin_e2e::contacts::the_directory_heals_and_discloses_only_what_it_revalidates`. It covers these cases:
+  - harbor's entry is deleted and a stale cove entry inserted, then the worker's LISTEN backend is terminated. The worker resubscribes and resyncs to exactly `["harbor"]`;
+  - with `SELECT` on contacts revoked from `wyrd_tenant`, discovery lists nothing, and after the grant it lists harbor again.
+  - TDD VIOLATED: the code came with scenario 2. Mutations: skipping the stale-entry removal fails the test (`["cove","harbor"]`), and treating a failed revalidation as valid fails it too. The code was restored.
 - Still open in cycle 12:
-  - expired and wrong-purpose discovery proofs;
-  - SQL integration: address-key-only projection and forced RLS, reconciliation after a missed notification, and refusal when validation is unavailable;
+  - SQL: the projection holds only address keys, and RLS is forced (structural check);
   - removing the old revision's reset proofs (the reset owner is cycle 13).
 - Commands:
   - the Postgres journey command, with selector `test(=platform_admin_e2e::contacts::a_signed_in_user_verifies_and_replaces_a_recovery_contact)`;

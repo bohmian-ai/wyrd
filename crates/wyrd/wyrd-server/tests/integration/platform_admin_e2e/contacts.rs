@@ -935,3 +935,205 @@ async fn a_discovery_read_pages_through_every_workspace() {
     let (status, _) = next(None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
+
+/// A discovery read is granted only by a live discovery proof:
+///   1. a contact proof and its flow cookie, presented as a discovery
+///      flow, read nothing;
+///   2. a discovery proof and its flow cookie, presented to contact
+///      verification by a signed-in User, verify nothing;
+///   3. once the read a proof granted has expired, the same browser
+///      repeating that proof reads nothing.
+///
+/// # Panics
+/// Panics when a proof of another purpose or past its read reads a page.
+#[tokio::test(flavor = "multi_thread")]
+async fn only_a_live_discovery_proof_reads_workspaces() {
+    let (srv, operator) = contact_server("harbor").await;
+    let api = relay_to_mailpit(&srv, &operator).await;
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    let known = "known.purpose@example.test";
+    verify_admin_contact(&srv, &api, "harbor", known).await;
+    assert_eq!(
+        within_propagation(&1, || directory_entries(&superuser)).await,
+        1
+    );
+    let renamed = |cookie: &str, to: &str| {
+        let (_, value) = cookie.split_once('=').expect("a cookie pair");
+        format!("{to}={value}")
+    };
+
+    // 1. A contact proof is not a discovery proof.
+    let session = sign_in(&srv, "harbor").await;
+    let candidate = "candidate.purpose@example.test";
+    let (status, flow, body) = browser(
+        &srv,
+        "/auth/browser/email/request",
+        &[&session],
+        "wyrd_contact",
+        &json!({ "tenant": "harbor", "email": candidate }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let contact_flow = flow.expect("a contact flow cookie");
+    let (contact_proof, _) = mailed_proof(&api, candidate).await;
+    let (status, read, body) = browser(
+        &srv,
+        "/auth/browser/workspaces/verify",
+        &[&renamed(&contact_flow, "wyrd_discovery")],
+        "wyrd_discovery",
+        &json!({ "proof": contact_proof }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert!(read.is_none(), "no read cookie");
+
+    // 2. A discovery proof is not a contact proof.
+    let (status, flow, _) = browser(
+        &srv,
+        "/auth/browser/workspaces/request",
+        &[],
+        "wyrd_discovery",
+        &json!({ "email": known }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let discovery_flow = flow.expect("a discovery flow cookie");
+    let (discovery_proof, _) = mailed_proof(&api, known).await;
+    let (status, _, body) = browser(
+        &srv,
+        "/auth/browser/email/verify",
+        &[&session, &renamed(&discovery_flow, "wyrd_contact")],
+        "wyrd_contact",
+        &json!({ "tenant": "harbor", "proof": discovery_proof }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(
+        contacts(&superuser, "harbor").await,
+        [(known.to_owned(), 1)],
+        "the contact is unchanged"
+    );
+
+    // 3. A spent proof past its read deadline reads nothing.
+    let verify = |proof: String| {
+        let (srv, discovery_flow) = (&srv, &discovery_flow);
+        async move {
+            browser(
+                srv,
+                "/auth/browser/workspaces/verify",
+                &[discovery_flow],
+                "wyrd_discovery",
+                &json!({ "proof": proof }),
+            )
+            .await
+        }
+    };
+    let (status, _, page) = verify(discovery_proof.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(workspaces(&page).len(), 1);
+    sqlx::query(
+        "UPDATE platform.discovery_proofs
+            SET read_until = statement_timestamp() - interval '1 second'",
+    )
+    .execute(&superuser)
+    .await
+    .expect("the read expires");
+    let (status, read, body) = verify(discovery_proof).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert!(read.is_none(), "no read cookie");
+}
+
+/// The tenants the directory holds entries for, in slug order.
+async fn directory_tenants(superuser: &sqlx::PgPool) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT t.slug FROM platform.workspace_directory d
+           JOIN platform.tenants t USING (data_tenant_id) ORDER BY t.slug",
+    )
+    .fetch_all(superuser)
+    .await
+    .expect("directory reads")
+}
+
+/// The directory heals after missed notifications, and discovery discloses
+/// nothing it cannot revalidate:
+///   1. with a lost entry and a stale one left behind, interrupting the
+///      directory listener makes it resubscribe and resynchronize every
+///      live tenant, restoring the lost entry and removing the stale one;
+///   2. while the tenant contact cannot be read, discovery lists no
+///      workspace, and lists it again once the read works.
+///
+/// # Panics
+/// Panics when the directory does not heal or an unvalidated workspace is
+/// listed.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_directory_heals_and_discloses_only_what_it_revalidates() {
+    let (srv, operator) = contact_server("harbor").await;
+    add_tenant(&srv, &operator, "cove").await;
+    let api = relay_to_mailpit(&srv, &operator).await;
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    let address = "healing@example.test";
+    verify_admin_contact(&srv, &api, "harbor", address).await;
+    let healed = vec!["harbor".to_owned()];
+    assert_eq!(
+        within_propagation(&healed, || directory_tenants(&superuser)).await,
+        healed
+    );
+
+    // 1. Lose harbor's entry, leave a stale one for cove, interrupt the listener.
+    sqlx::query("DELETE FROM platform.workspace_directory")
+        .execute(&superuser)
+        .await
+        .expect("the entry is lost");
+    sqlx::query(
+        "INSERT INTO platform.workspace_directory
+             (data_tenant_id, user_id, address_key, contact_revision)
+         SELECT u.data_tenant_id, u.id, sha256('stale'::bytea), 1
+           FROM wyrd.auth_users u JOIN platform.tenants t USING (data_tenant_id)
+          WHERE t.slug = 'cove'",
+    )
+    .execute(&superuser)
+    .await
+    .expect("a stale entry stays");
+    assert_eq!(directory_tenants(&superuser).await, ["cove"]);
+    let interrupted: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM (
+             SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+              WHERE datname = current_database() AND pid <> pg_backend_pid()
+                AND query ILIKE '%LISTEN%wyrd_contact%'
+         ) terminated",
+    )
+    .fetch_one(&superuser)
+    .await
+    .expect("the listener is interrupted");
+    assert_eq!(interrupted, 1, "one directory listener");
+    assert_eq!(
+        within_propagation(&healed, || directory_tenants(&superuser)).await,
+        healed,
+        "resubscription resynchronizes"
+    );
+    let (status, page, _) = discover(&srv, &api, address).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(workspaces(&page).len(), 1);
+
+    // 2. Revalidation that cannot read the contact lists nothing.
+    sqlx::query("REVOKE SELECT ON wyrd.auth_user_contacts FROM wyrd_tenant")
+        .execute(&superuser)
+        .await
+        .expect("contact reads fail");
+    let (status, page, _) = discover(&srv, &api, address).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert!(workspaces(&page).is_empty(), "{page}");
+    sqlx::query("GRANT SELECT ON wyrd.auth_user_contacts TO wyrd_tenant")
+        .execute(&superuser)
+        .await
+        .expect("contact reads work");
+    let (status, page, _) = discover(&srv, &api, address).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(workspaces(&page).len(), 1);
+}

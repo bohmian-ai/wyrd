@@ -28,9 +28,13 @@ trap 'kill -TERM "${pids[@]}" 2>/dev/null; wait' TERM INT
 pids+=($!)
 wait_for_port "${WYRD_SERVER_BIND##*:}" wyrd-server "${pids[0]}"
 
-# nginx states the public origin in X-Forwarded-*; the BFF trusts only that.
+# nginx states the public origin in X-Forwarded-*, and the visitor in the
+# client-address header the server trusts from it; the BFF reads the visitor
+# from that same header and restates it on every server call, so a page action
+# and a direct /auth request through nginx derive the same source.
 HOST="${WYRD_UI_BIND%:*}" PORT="${WYRD_UI_BIND##*:}" \
   PROTOCOL_HEADER=x-forwarded-proto HOST_HEADER=x-forwarded-host \
+  ADDRESS_HEADER="${WYRD_CLIENT_ADDRESS_HEADER:-}" \
   WYRD_SERVER_URL="http://${WYRD_SERVER_BIND}" \
   node /app/ui/build/index.js &
 pids+=($!)

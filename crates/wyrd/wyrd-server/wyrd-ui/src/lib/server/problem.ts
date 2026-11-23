@@ -17,10 +17,12 @@ export function problem(kind: keyof typeof examples): WyrdProblem {
   return structuredClone(examples[kind]);
 }
 
+/** Throttles whose positive whole `retry_after_seconds` the person needs to know when to try again. */
+const throttles: ReadonlySet<string> = new Set(['passwordAttempts', 'signInAttempts']);
+
 /**
  * Preserve known canonical metadata, never arbitrary upstream diagnostics.
- * The one detail kept is a throttled password attempt's positive whole
- * `retry_after_seconds`, which the person needs to know when to try again.
+ * The one detail kept is a throttle's positive whole `retry_after_seconds`.
  */
 export function safeProblem(cause: unknown): WyrdProblem {
   const body: unknown = isHttpError(cause) ? cause.body : cause;
@@ -28,7 +30,7 @@ export function safeProblem(cause: unknown): WyrdProblem {
     for (const kind of Object.keys(examples) as (keyof typeof examples)[]) {
       if (examples[kind].code !== body.code) continue;
       const value = problem(kind);
-      const wait = kind === 'passwordAttempts' ? retryAfter(body) : undefined;
+      const wait = throttles.has(kind) ? retryAfter(body) : undefined;
       if (wait) value.details = { retry_after_seconds: wait };
       return value;
     }

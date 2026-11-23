@@ -110,6 +110,10 @@ curl -s -o /dev/null -w '%{http_code}\n' http://<server-host>:8080/readyz
 
 `200` means the server checked the schema and the login and is serving. If the server exits instead, its last log line says why; see [Troubleshoot a deployment](/operate/troubleshoot-a-deployment/).
 
+<Aside type="caution" title="Put the image behind a proxy that keeps each visitor's address">
+Wyrd limits sign-in and signup starts per visitor address. The `bohmian/wyrd` image takes each visitor's address from the TCP connection that reaches its port 8080. Behind a load balancer that opens its own connections, every visitor arrives from the balancer's address and shares one limit. Use a balancer that preserves the client address, or set `WYRD_CLIENT_ADDRESS_HEADER` to a single-address header your edge always overwrites, such as `CF-Connecting-IP`, and make sure nothing else can reach port 8080.
+</Aside>
+
 ## 4. Create the first tenant
 
 With the server running, from a machine that has the same two database URLs exported:

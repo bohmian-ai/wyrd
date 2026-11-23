@@ -35,6 +35,15 @@
     "title": "Internal error",
     "type": "https://wyrd.dev/problems/WYRD_SPEC_500_INTERNAL"
   },
+  "methodUnavailable": {
+    "code": "WYRD_AUTH_403_METHOD_UNAVAILABLE",
+    "detail": "Method not available",
+    "details": {},
+    "remediation": "Reload the page or read `GET /auth/browser/methods` and use a method it currently offers; retrying the same method does not help until an operator enables it.",
+    "status": 403,
+    "title": "Method not available",
+    "type": "https://wyrd.dev/problems/WYRD_AUTH_403_METHOD_UNAVAILABLE"
+  },
   "notFound": {
     "code": "WYRD_SPEC_404_NOT_FOUND",
     "detail": "Resource not found",
@@ -79,6 +88,15 @@
     "status": 403,
     "title": "Recent sign-in required",
     "type": "https://wyrd.dev/problems/WYRD_AUTH_403_RECENT_LOGIN_REQUIRED"
+  },
+  "signInAttempts": {
+    "code": "WYRD_AUTH_429_SIGN_IN_ATTEMPTS",
+    "detail": "Too many sign-in starts",
+    "details": {},
+    "remediation": "Wait `details.retry_after_seconds` until the fixed sign-in window ends, then start the sign-in again.",
+    "status": 429,
+    "title": "Too many sign-in starts",
+    "type": "https://wyrd.dev/problems/WYRD_AUTH_429_SIGN_IN_ATTEMPTS"
   },
   "unauthenticated": {
     "code": "WYRD_AUTH_401_UNAUTHENTICATED",

@@ -28,7 +28,7 @@ use wyrd_spec::auth::{
 };
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 
-use super::identity::{authorize, authorize_read, commit_decision, operator};
+use super::identity::{authorize, authorize_read, commit_decision, decide, operator};
 use crate::auth::RequestOrigin;
 use crate::components::auth::PlatformCaller;
 use crate::http::error::WyrdErrorResponse;
@@ -193,17 +193,17 @@ async fn configure_provider(
     let pool = operator(&state)?;
     let authz =
         PlatformAuthorization::new(pool.clone(), Arc::clone(state.bifrost.scribe_outbox()) as _);
-    let mut decision = authorize(
+    // Sealing waits on the key service, so the owner opens the write
+    // transaction only after it.
+    decide(
         &authz,
         &caller,
         &Permission::platform_identity_write(),
         SOCIAL_PROVIDERS_RESOURCE,
-    )
-    .await?;
+    )?;
     let view = social(&state)?
-        .configure(&mut decision, provider, &request, &origin)
+        .configure(provider, &request, &origin)
         .await?;
-    commit_decision(decision).await?;
     Ok(Json(view))
 }
 
@@ -379,17 +379,15 @@ async fn write_login_settings(
     let pool = operator(&state)?;
     let authz =
         PlatformAuthorization::new(pool.clone(), Arc::clone(state.bifrost.scribe_outbox()) as _);
-    let mut decision = authorize(
+    // Sealing a challenge secret waits on the key service, so the owner
+    // opens the write transaction only after it.
+    decide(
         &authz,
         &caller,
         &Permission::platform_identity_write(),
         LOGIN_SETTINGS_RESOURCE,
-    )
-    .await?;
-    social(&state)?
-        .put_settings(&mut decision, &settings)
-        .await?;
-    commit_decision(decision).await?;
+    )?;
+    social(&state)?.put_settings(&settings).await?;
     Ok(Json(settings))
 }
 
@@ -459,15 +457,15 @@ async fn write_mail(
     let pool = operator(&state)?;
     let authz =
         PlatformAuthorization::new(pool.clone(), Arc::clone(state.bifrost.scribe_outbox()) as _);
-    let mut decision = authorize(
+    // Sealing the password waits on the key service, so the owner opens the
+    // write transaction only after it.
+    decide(
         &authz,
         &caller,
         &Permission::platform_identity_write(),
         MAIL_RESOURCE,
-    )
-    .await?;
-    let settings = mail(&state)?.configure(&mut decision, &request).await?;
-    commit_decision(decision).await?;
+    )?;
+    let settings = mail(&state)?.configure(&request).await?;
     Ok(Json(settings))
 }
 

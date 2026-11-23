@@ -32,6 +32,17 @@ export const load: PageServerLoad = async ({ params, cookies, url }) => {
   };
 };
 
+/**
+ * The safe problem a refused sign-in action answers, telling the browser
+ * when a throttled one may retry.
+ */
+function refusal(cause: unknown, setHeaders: (headers: Record<string, string>) => void) {
+  const value = safeProblem(cause);
+  const wait = retryAfter(value);
+  if (wait) setHeaders({ 'retry-after': String(wait) });
+  return value;
+}
+
 export const actions: Actions = {
   /** Local password sign-in; the Rust server verifies the password and sets the session cookie. */
   password: async ({ params, request, cookies, url, setHeaders }) => {
@@ -50,26 +61,25 @@ export const actions: Actions = {
       );
     } catch (cause) {
       if (!isHttpError(cause)) throw cause;
-      const value = safeProblem(cause);
-      const wait = retryAfter(value);
-      if (wait) setHeaders({ 'retry-after': String(wait) });
+      const value = refusal(cause, setHeaders);
       return fail(value.status, { problem: value, username });
     }
     redirect(303, target);
   },
-  sso: async ({ params, cookies, url }) => {
+  sso: async ({ params, cookies, url, setHeaders }) => {
     let target: string;
     try {
       if (localAuthEnabled()) reject('denied');
       target = await browserSessions.begin(params.tenantKey, url, cookies);
     } catch (cause) {
       if (!isHttpError(cause)) throw cause;
-      return fail(cause.status, { problem: safeProblem(cause) });
+      const value = refusal(cause, setHeaders);
+      return fail(value.status, { problem: value });
     }
     redirect(303, target);
   },
   /** Shared social sign-in; with an invitation code it redeems that link. */
-  social: async ({ params, request, cookies, url }) => {
+  social: async ({ params, request, cookies, url, setHeaders }) => {
     let target: string;
     try {
       if (localAuthEnabled()) reject('denied');
@@ -80,7 +90,8 @@ export const actions: Actions = {
       target = await browserSessions.begin(params.tenantKey, url, cookies, provider, code || undefined);
     } catch (cause) {
       if (!isHttpError(cause)) throw cause;
-      return fail(cause.status, { problem: safeProblem(cause) });
+      const value = refusal(cause, setHeaders);
+      return fail(value.status, { problem: value });
     }
     redirect(303, target);
   }

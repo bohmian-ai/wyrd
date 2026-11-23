@@ -2,8 +2,9 @@
 //!
 //! [`SocialSignIn`] is the one owner of the deployment's shared Google and
 //! GitHub.com clients and its login settings. Platform administration
-//! authorizes each operation and hands the audited operator transaction in;
-//! this owner validates, seals and stores. A stored client is a new, untested,
+//! authorizes each operation; this owner validates, seals and stores. A write
+//! that seals a secret seals it before its own short audited operator
+//! transaction opens, and any other write runs on the transaction handed in. A stored client is a new, untested,
 //! disabled revision. [`SocialSignIn::begin_test`] starts a real provider
 //! sign-in bound to that exact revision and its tester, the provider-specific
 //! social callback finishes it through [`SocialSignIn::complete_test`], and
@@ -195,16 +196,19 @@ impl SocialSignIn {
         Ok(SocialProvidersResponse { providers })
     }
 
-    /// Seal and store `provider`'s client on the audited operator `conn` as
-    /// a new untested, disabled revision.
+    /// Seal and store `provider`'s client as a new untested, disabled
+    /// revision, for a caller platform authorization already allowed.
+    ///
+    /// The secret is sealed before the audited operator transaction opens,
+    /// so no transaction waits on the key service; a refused seal leaves the
+    /// committed client unchanged.
     ///
     /// # Errors
-    /// Returns [`WyrdError::Validation`] for an empty client id or secret or a
-    /// deployment without `[kms]`, and
+    /// Returns [`WyrdError::Validation`] for an empty client id or secret, a
+    /// deployment without `[kms]` or a seal the key service refuses, and
     /// [`WyrdError::AuthVerifyUnavailable`] when the write fails.
     pub async fn configure(
         &self,
-        conn: &mut TenantConn<'_>,
         provider: SocialProvider,
         request: &ConfigureSocialProviderRequest,
         origin: &Url,
@@ -232,9 +236,15 @@ impl SocialSignIn {
                 tracing::warn!(%error, "provider client secret could not be sealed");
                 validation("the client secret could not be sealed", "client_secret")
             })?;
-        let row = put_social_provider(conn, provider.as_str(), client_id, &sealed)
+        let mut conn = self
+            .operator
+            .begin_platform_audited()
             .await
             .map_err(store_error)?;
+        let row = put_social_provider(&mut conn, provider.as_str(), client_id, &sealed)
+            .await
+            .map_err(store_error)?;
+        conn.commit().await.map_err(store_error)?;
         view(provider, Some(&row), origin)
     }
 
@@ -628,21 +638,19 @@ impl SocialSignIn {
         })
     }
 
-    /// Replace the deployment login settings on the audited operator `conn`.
+    /// Replace the deployment login settings, for a caller platform
+    /// authorization already allowed.
     ///
-    /// A signup challenge's secret is sealed through `[kms]`;
-    /// a challenge sent without one keeps the stored secret.
+    /// A signup challenge's secret is sealed through `[kms]` before the
+    /// audited operator transaction opens, so no transaction waits on the key
+    /// service; a challenge sent without one keeps the stored secret.
     ///
     /// # Errors
     /// Returns [`WyrdError::Validation`] for a challenge with no secret
-    /// stored or sent, an empty site key or secret, or a deployment without
-    /// `[kms]`, and [`WyrdError::AuthVerifyUnavailable`] when the write
-    /// fails.
-    pub async fn put_settings(
-        &self,
-        conn: &mut TenantConn<'_>,
-        settings: &LoginSettings,
-    ) -> Result<(), WyrdError> {
+    /// stored or sent, an empty site key or secret, a deployment without
+    /// `[kms]` or a seal the key service refuses, and
+    /// [`WyrdError::AuthVerifyUnavailable`] when the write fails.
+    pub async fn put_settings(&self, settings: &LoginSettings) -> Result<(), WyrdError> {
         let challenge = settings.signup_challenge.as_ref();
         if challenge.is_some_and(|challenge| {
             challenge.site_key.trim().is_empty()
@@ -678,8 +686,13 @@ impl SocialSignIn {
             ),
             None => None,
         };
+        let mut conn = self
+            .operator
+            .begin_platform_audited()
+            .await
+            .map_err(store_error)?;
         put_login_settings(
-            conn,
+            &mut conn,
             &LoginSettingsRow {
                 password_enabled: settings.password_enabled,
                 signup_enabled: settings.signup_enabled,
@@ -695,7 +708,8 @@ impl SocialSignIn {
                 "signup_challenge.secret",
             ),
             error => store_error(error),
-        })
+        })?;
+        conn.commit().await.map_err(store_error)
     }
 
     /// Require a browser workspace creation from `source` to pass the

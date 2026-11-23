@@ -3,6 +3,7 @@ import { afterEach, expect, test, vi } from 'vitest';
 import type { Cookies } from '@sveltejs/kit';
 import { BrowserSessions } from './browser-sessions';
 import { load as loadTenantLayout } from '../../../routes/t/[tenantKey]/+layout.server';
+import { actions as loginActions } from '../../../routes/t/[tenantKey]/login/+page.server';
 
 vi.mock('$env/dynamic/private', () => ({
   env: { WYRD_SERVER_URL: 'http://127.0.0.1:8080' }
@@ -265,4 +266,46 @@ test('the tenant layout enumerates sessions without depending on the URL, so cli
   expect(data).toMatchObject({ tenant: { key: 'acme', name: 'Acme' }, session: { tenants: [{ key: 'acme', name: 'Acme' }] } });
   expect(requests).toHaveLength(1);
   expect(tracked).toEqual([]);
+});
+
+test('a throttled SSO or social sign-in start keeps its refusal and when to retry, and sets no cookie', async () => {
+  const refusal = {
+    type: 'https://wyrd.dev/problems/WYRD_AUTH_429_SIGN_IN_ATTEMPTS',
+    title: 'Too many sign-in starts',
+    status: 429,
+    detail: 'backend diagnostic 198.51.100.7',
+    code: 'WYRD_AUTH_429_SIGN_IN_ATTEMPTS',
+    details: { retry_after_seconds: 840, source: '198.51.100.7' },
+    remediation: 'Wait.'
+  };
+  server(
+    () =>
+      new Response(JSON.stringify(refusal), {
+        status: 429,
+        headers: { 'content-type': 'application/problem+json', 'retry-after': '840' }
+      })
+  );
+  const social = new FormData();
+  social.set('provider', 'google');
+  for (const [action, form] of [
+    [loginActions.sso, new FormData()],
+    [loginActions.social, social]
+  ] as const) {
+    const browser = jar();
+    const headers: Record<string, string> = {};
+    const result = (await action!({
+      params: { tenantKey: 'acme' },
+      request: new Request(url, { method: 'POST', body: form }),
+      cookies: browser.cookies,
+      url,
+      setHeaders: (values: Record<string, string>) => Object.assign(headers, values)
+    } as never)) as { status: number; data: { problem: Record<string, unknown> } };
+
+    expect(result.status).toBe(429);
+    expect(result.data.problem.code).toBe('WYRD_AUTH_429_SIGN_IN_ATTEMPTS');
+    expect(result.data.problem.details).toEqual({ retry_after_seconds: 840 });
+    expect(headers['retry-after']).toBe('840');
+    expect(result.data.problem.detail).not.toContain('198.51.100.7');
+    expect(browser.values.size).toBe(0);
+  }
 });

@@ -25,8 +25,8 @@ use wyrd_spec::auth::{
     SmtpTls,
 };
 use wyrd_spec::error::WyrdError;
+use wyrd_sql::OperatorPool;
 use wyrd_sql::queries::platform::social::{MailRelayRow, mail_relay, put_mail_relay};
-use wyrd_sql::{OperatorPool, TenantConn};
 
 use crate::error::store_error;
 
@@ -98,17 +98,20 @@ impl ApplicationMail {
         })
     }
 
-    /// Validate, seal and store `request` as the relay on the audited
-    /// operator `conn`, replacing any earlier relay.
+    /// Validate, seal and store `request` as the relay, replacing any
+    /// earlier relay, for a caller platform authorization already allowed.
+    ///
+    /// The password is sealed before the audited operator transaction opens,
+    /// so no transaction waits on the key service; a refused seal leaves the
+    /// committed relay unchanged.
     ///
     /// # Errors
     /// Returns [`WyrdError::Validation`] for an empty host, a zero port, an
-    /// unparsable sender, a password without a username or a password on a
-    /// deployment without `[kms]`, and
+    /// unparsable sender, a password without a username, a password on a
+    /// deployment without `[kms]` or a seal the key service refuses, and
     /// [`WyrdError::AuthVerifyUnavailable`] when the write fails.
     pub async fn configure(
         &self,
-        conn: &mut TenantConn<'_>,
         request: &ConfigureMailRelayRequest,
     ) -> Result<MailSettings, WyrdError> {
         let host = request.host.trim();
@@ -160,7 +163,13 @@ impl ApplicationMail {
             password_enc,
             sender: sender.to_owned(),
         };
-        put_mail_relay(conn, &row).await.map_err(store_error)?;
+        let mut conn = self
+            .operator
+            .begin_platform_audited()
+            .await
+            .map_err(store_error)?;
+        put_mail_relay(&mut conn, &row).await.map_err(store_error)?;
+        conn.commit().await.map_err(store_error)?;
         Ok(MailSettings {
             relay: Some(view(&row)),
         })

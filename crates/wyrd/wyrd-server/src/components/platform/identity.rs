@@ -144,6 +144,30 @@ pub(super) async fn authorize<'a>(
         .map_err(|error| platform_authz_error(&error, required))
 }
 
+/// Decide one platform identity operation without opening its transaction.
+///
+/// For a write that waits on a remote service, such as the key service, before
+/// it stores anything: the decision is staged on the process audit outbox, and
+/// the owner opens its own short transaction after the wait.
+///
+/// # Errors
+/// Returns a permission error when the grant does not cover `required`.
+pub(super) fn decide(
+    authz: &PlatformAuthorization,
+    caller: &PlatformCaller,
+    required: &Permission,
+    resource: &str,
+) -> Result<(), WyrdErrorResponse> {
+    authz
+        .decide(
+            &caller.context,
+            required,
+            caller.request_id.as_str(),
+            resource,
+        )
+        .map_err(|error| platform_authz_error(&error, required))
+}
+
 /// Commit whatever the caller wrote on an authorized transaction.
 ///
 /// # Errors

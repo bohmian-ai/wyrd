@@ -161,16 +161,18 @@ async fn start_bff(
     panic!("BFF on port {port} never answered");
 }
 
-/// The client-address header the source journey's deployment names.
-const CLIENT_ADDRESS_HEADER: &str = "x-wyrd-client";
+/// The client-address header the official image names: its bundled nginx
+/// states each visitor's TCP address in `X-Real-IP`, replacing any value the
+/// browser sent.
+const CLIENT_ADDRESS_HEADER: &str = "x-real-ip";
 
-/// A production BFF is the trusted ingress of its server: behind a load
-/// balancer that states each visitor in `X-Forwarded-For`, it carries that
-/// visitor's address to a replica trusting the BFF's loopback peer, on both
-/// its page-action calls and its forwarded `/auth/*` requests. Each distinct
-/// visitor fails into its own password source window, never the BFF's own
-/// address, and a client-address header the browser forges chooses no
-/// window.
+/// A production BFF started as the official image starts it is the trusted
+/// ingress of its server: behind the bundled nginx, which states each
+/// visitor in `X-Real-IP`, it carries that visitor's address to a replica
+/// trusting the BFF's loopback peer, on both its page-action calls and its
+/// forwarded `/auth/*` requests. Each distinct visitor fails into its own
+/// password source window, never the BFF's own address, and a forwarding
+/// chain the browser forges chooses no window.
 ///
 /// # Panics
 /// Panics when the replica or BFF fails to start or a stored window differs.
@@ -187,10 +189,11 @@ async fn bff_preserves_trusted_sources(srv: &WyrdTestServer, origin: &str) {
         replica.base_url().expect("bound replica has a URL"),
         origin,
         None,
+        // The client-address settings the official entrypoint passes its BFF:
+        // adapter-node reads the visitor from the header the server trusts.
         &[
             ("WYRD_CLIENT_ADDRESS_HEADER", CLIENT_ADDRESS_HEADER),
-            ("ADDRESS_HEADER", "x-forwarded-for"),
-            ("XFF_DEPTH", "1"),
+            ("ADDRESS_HEADER", CLIENT_ADDRESS_HEADER),
         ],
     )
     .await;
@@ -203,8 +206,8 @@ async fn bff_preserves_trusted_sources(srv: &WyrdTestServer, origin: &str) {
         client
             .post(format!("{}/t/{tenant}/login?/password", bff.url))
             .header("origin", origin)
-            .header("x-forwarded-for", visitor)
-            .header(CLIENT_ADDRESS_HEADER, "203.0.113.9")
+            .header(CLIENT_ADDRESS_HEADER, visitor)
+            .header("x-forwarded-for", "203.0.113.9")
             .form(&[("username", "nobody"), ("password", "not-the-password")])
             .send()
             .await
@@ -213,8 +216,8 @@ async fn bff_preserves_trusted_sources(srv: &WyrdTestServer, origin: &str) {
     client
         .post(format!("{}/auth/browser/password/login", bff.url))
         .header("origin", origin)
-        .header("x-forwarded-for", "198.51.100.33")
-        .header(CLIENT_ADDRESS_HEADER, "203.0.113.9")
+        .header(CLIENT_ADDRESS_HEADER, "198.51.100.33")
+        .header("x-forwarded-for", "203.0.113.9")
         .json(&json!({ "tenant": tenant, "username": "nobody", "password": "not-the-password" }))
         .send()
         .await

@@ -445,6 +445,20 @@ fn write_problem_examples(out: &Path) -> Result<(), Box<dyn StdError>> {
             },
         ),
         (
+            "signInAttempts",
+            WyrdError::SignInAttempts {
+                message: String::new(),
+                details: json!({}),
+            },
+        ),
+        (
+            "methodUnavailable",
+            WyrdError::MethodUnavailable {
+                message: String::new(),
+                details: json!({}),
+            },
+        ),
+        (
             "oneTimeCodeInvalid",
             WyrdError::OneTimeCodeInvalid {
                 message: String::new(),

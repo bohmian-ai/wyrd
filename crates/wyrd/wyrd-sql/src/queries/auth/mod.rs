@@ -42,7 +42,8 @@ pub use browser_sessions::{
     live_browser_session, revoke_browser_session,
 };
 pub use contacts::{
-    VerifiedContact, insert_verified_contact, replace_verified_contact, verified_contact_for_update,
+    CONTACT_CHANNEL, VerifiedContact, insert_verified_contact, live_contact,
+    replace_verified_contact, tenant_contacts, verified_contact_for_update,
 };
 pub use device_authorizations::{
     DevicePoll, approve_device_authorization, delete_device_authorization,

@@ -8,6 +8,7 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use serde_json::{Value, json};
 use wyrd_testing::WyrdTestServer;
+use wyrd_testing::principal::within_propagation;
 
 use super::{
     SOCIAL_HOST, initialize_platform_root, mail_to, mailpit, platform_session, session_cookie,
@@ -29,6 +30,16 @@ const PASSWORD: &str = "amber kestrel lantern";
 /// # Panics
 /// Panics when the server, operator session or tenant cannot be set up.
 async fn contact_server(slug: &str) -> (WyrdTestServer, String) {
+    let (srv, session) = bare_server().await;
+    add_tenant(&srv, &session, slug).await;
+    (srv, session)
+}
+
+/// A server behind [`INGRESS`] with no tenant, and its operator session.
+///
+/// # Panics
+/// Panics when the server or operator session cannot be set up.
+async fn bare_server() -> (WyrdTestServer, String) {
     let srv = WyrdTestServer::builder()
         .with_trusted_ingress_for_test(&[INGRESS], CLIENT_HEADER)
         .start_in_process()
@@ -38,22 +49,30 @@ async fn contact_server(slug: &str) -> (WyrdTestServer, String) {
         .await
         .expect("deployment initializes");
     let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
+    (srv, session)
+}
+
+/// Create tenant `slug`, displayed as `Slug Team`, whose `admin` signs in
+/// with [`PASSWORD`].
+///
+/// # Panics
+/// Panics when the tenant is not created.
+async fn add_tenant(srv: &WyrdTestServer, operator: &str, slug: &str) {
     let (status, created) = social_call(
-        &srv,
+        srv,
         social_request(
             Method::POST,
             "/platform/tenants",
-            Some(&session),
+            Some(operator),
             Some(json!({
                 "slug": slug,
-                "display_name": slug,
+                "display_name": format!("{slug} team"),
                 "human_admin": { "username": "admin", "password": PASSWORD },
             })),
         ),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{created}");
-    (srv, session)
 }
 
 /// Point the deployment's mail relay at the test Mailpit; returns its API.
@@ -362,4 +381,242 @@ async fn a_signed_in_user_verifies_and_replaces_a_recovery_contact() {
         "the notice names no new address"
     );
     sign_in(&srv, "harbor").await;
+}
+
+/// Make `email` the verified contact of `slug`'s `admin` through a fresh
+/// sign-in and the mailed proof.
+///
+/// # Panics
+/// Panics when any step is refused.
+async fn verify_admin_contact(srv: &WyrdTestServer, api: &str, slug: &str, email: &str) {
+    let session = sign_in(srv, slug).await;
+    let (status, flow, body) = browser(
+        srv,
+        "/auth/browser/email/request",
+        &[&session],
+        "wyrd_contact",
+        &json!({ "tenant": slug, "email": email }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let (proof, _) = mailed_proof(api, email).await;
+    let (status, _, body) = browser(
+        srv,
+        "/auth/browser/email/verify",
+        &[&session, &flow.expect("a flow cookie")],
+        "wyrd_contact",
+        &json!({ "tenant": slug, "proof": proof }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+}
+
+/// How many directory entries the deployment holds.
+async fn directory_entries(superuser: &sqlx::PgPool) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM platform.workspace_directory")
+        .fetch_one(superuser)
+        .await
+        .expect("directory counts")
+}
+
+/// Ask for the workspaces of `email` from a new browser, read the mailed
+/// proof and verify it there; returns the verify status, its body and the
+/// discovery read cookie.
+///
+/// # Panics
+/// Panics when the request is not accepted or no proof arrives.
+async fn discover(srv: &WyrdTestServer, api: &str, email: &str) -> (StatusCode, Value, String) {
+    let (status, binding, body) = browser(
+        srv,
+        "/auth/browser/workspaces/request",
+        &[],
+        "wyrd_discovery",
+        &json!({ "email": email }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body, json!({ "status": "check_email" }));
+    let binding = binding.expect("a discovery binding cookie");
+    let (proof, _) = mailed_proof(api, email).await;
+    let (status, read, body) = browser(
+        srv,
+        "/auth/browser/workspaces/verify",
+        &[&binding],
+        "wyrd_discovery",
+        &json!({ "proof": proof }),
+    )
+    .await;
+    (status, body, read.unwrap_or_default())
+}
+
+/// The `(tenant, display_name, login_url)` of each workspace in a discovery
+/// page, refusing any other field.
+fn workspaces(page: &Value) -> Vec<(String, String, String)> {
+    page["workspaces"]
+        .as_array()
+        .expect("a workspace list")
+        .iter()
+        .map(|workspace| {
+            let fields = workspace.as_object().expect("a workspace object");
+            assert_eq!(
+                fields.len(),
+                3,
+                "only tenant, name and login link: {workspace}"
+            );
+            let text = |key: &str| workspace[key].as_str().expect(key).to_owned();
+            (text("tenant"), text("display_name"), text("login_url"))
+        })
+        .collect()
+}
+
+/// A visitor discovers only the live workspaces whose User verified the
+/// address, and still signs in to each:
+///   1. without a mail relay, discovery is not offered;
+///   2. known and unknown addresses get the same `202` and a mail with a
+///      fragment proof and no workspace name;
+///   3. the proof in another browser reads nothing; in its own browser it
+///      returns the two workspaces whose admin verified the address, as
+///      fixed same-origin login links, sets no session, and an unknown
+///      address gets an empty list;
+///   4. the same browser repeating the verification gets the same result;
+///   5. replacing one contact, suspending the other User and retiring a
+///      tenant each remove a workspace at once, before any reconciliation;
+///   6. a listed login link still needs that workspace's own sign-in.
+///
+/// # Panics
+/// Panics when discovery discloses, omits or mails differently.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_visitor_discovers_only_live_workspaces_for_a_verified_address() {
+    let (srv, operator) = bare_server().await;
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    for slug in ["north", "south", "east", "west"] {
+        add_tenant(&srv, &operator, slug).await;
+    }
+    let shared = "dana.discover@example.test";
+    let other = "eli.discover@example.test";
+    let unknown = "fay.discover@example.test";
+
+    // 1. No relay, no discovery.
+    let (status, _, body) = browser(
+        &srv,
+        "/auth/browser/workspaces/request",
+        &[],
+        "wyrd_discovery",
+        &json!({ "email": shared }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["code"], "WYRD_AUTH_403_METHOD_UNAVAILABLE", "{body}");
+
+    let api = relay_to_mailpit(&srv, &operator).await;
+    for slug in ["north", "south", "east"] {
+        verify_admin_contact(&srv, &api, slug, shared).await;
+    }
+    verify_admin_contact(&srv, &api, "west", other).await;
+    assert_eq!(
+        within_propagation(&4, || directory_entries(&superuser)).await,
+        4,
+        "every verified contact reaches the directory"
+    );
+
+    // 2. and 3. A proof read in another browser discloses nothing.
+    let (status, binding, _) = browser(
+        &srv,
+        "/auth/browser/workspaces/request",
+        &[],
+        "wyrd_discovery",
+        &json!({ "email": shared }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert!(binding.is_some());
+    let (proof, text) = mailed_proof(&api, shared).await;
+    for name in ["north", "south", "east", "west"] {
+        assert!(!text.contains(name), "the mail names no workspace: {text}");
+    }
+    let (status, _, _) = browser(
+        &srv,
+        "/auth/browser/workspaces/verify",
+        &[],
+        "wyrd_discovery",
+        &json!({ "proof": proof }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, page, read) = discover(&srv, &api, shared).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert!(!read.is_empty(), "a discovery read cookie");
+    let login = |slug: &str| {
+        (
+            slug.to_owned(),
+            format!("{slug} team"),
+            format!("http://{SOCIAL_HOST}/t/{slug}/login"),
+        )
+    };
+    assert_eq!(
+        workspaces(&page),
+        vec![login("east"), login("north"), login("south")]
+    );
+    assert!(page.get("next_cursor").is_none_or(Value::is_null), "{page}");
+    let (status, page, _) = discover(&srv, &api, unknown).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert!(workspaces(&page).is_empty());
+
+    // 4. The same browser repeating its verification reads the same page.
+    let (status, binding, _) = browser(
+        &srv,
+        "/auth/browser/workspaces/request",
+        &[],
+        "wyrd_discovery",
+        &json!({ "email": shared }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let binding = binding.expect("a binding");
+    let (proof, _) = mailed_proof(&api, shared).await;
+    for _ in 0..2 {
+        let (status, _, page) = browser(
+            &srv,
+            "/auth/browser/workspaces/verify",
+            &[&binding],
+            "wyrd_discovery",
+            &json!({ "proof": proof }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(workspaces(&page).len(), 3);
+    }
+
+    // 5. Revalidation removes a workspace before reconciliation catches up.
+    verify_admin_contact(&srv, &api, "south", other).await;
+    sqlx::query(
+        "UPDATE wyrd.auth_users u SET status = 'suspended'
+           FROM platform.tenants t
+          WHERE t.data_tenant_id = u.data_tenant_id AND t.slug = 'east'",
+    )
+    .execute(&superuser)
+    .await
+    .expect("east's admin is suspended");
+    let (_, page, _) = discover(&srv, &api, shared).await;
+    assert_eq!(workspaces(&page), vec![login("north")]);
+    sqlx::query("UPDATE platform.tenants SET status = 'deleted' WHERE slug = 'north'")
+        .execute(&superuser)
+        .await
+        .expect("north is retired");
+    let (_, page, _) = discover(&srv, &api, shared).await;
+    assert!(workspaces(&page).is_empty(), "{page}");
+    let (_, page, _) = discover(&srv, &api, other).await;
+    assert_eq!(workspaces(&page), vec![login("south"), login("west")]);
+
+    // 6. A listed workspace still needs its own sign-in.
+    let (status, _) = social_call(
+        &srv,
+        social_request(Method::GET, "/auth/browser/session?tenant=west", None, None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }

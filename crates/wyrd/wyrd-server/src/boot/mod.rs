@@ -1480,6 +1480,7 @@ impl AppState {
         }
         workers.push(self.auth.refresh_worker(postgres, shutdown.clone()));
         workers.extend(self.auth.maintenance_worker(shutdown.clone()));
+        workers.extend(self.auth.directory_worker(postgres, shutdown.clone()));
         workers.push(self.gateway.refresh_worker(postgres, shutdown.clone()));
         workers.extend(self.verification.refresh_worker(postgres, shutdown.clone()));
         #[cfg(feature = "test-support")]

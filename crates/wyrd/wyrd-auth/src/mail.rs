@@ -300,6 +300,27 @@ impl ApplicationMail {
             .await
     }
 
+    /// Mail `to` the link and proof that list the workspaces it may sign in
+    /// to. The message names no workspace.
+    ///
+    /// # Errors
+    /// As [`Self::send_signup_proof`].
+    pub async fn send_discovery_proof(
+        &self,
+        to: &EmailAddress,
+        link: &str,
+        proof: &str,
+    ) -> Result<(), WyrdError> {
+        let body = format!(
+            "Open this link in the browser where you asked which Wyrd workspaces \
+             this address can sign in to:\n\n{link}\n\nOr paste this code there:\n\n\
+             {proof}\n\nIt works once and expires in fifteen minutes. If you did not \
+             ask for this, ignore this message.\n"
+        );
+        self.send_notice(to, "Find your Wyrd workspaces", body)
+            .await
+    }
+
     /// Tell `to`, a replaced recovery address, that it no longer recovers
     /// its account. The message names neither the new address nor the
     /// workspace.

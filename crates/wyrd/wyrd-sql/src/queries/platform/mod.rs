@@ -22,6 +22,7 @@
 //! any one of them leaves the directory entry failed rather than half-admitted.
 
 pub mod credentials;
+pub mod discovery;
 pub mod identity;
 pub mod principal_grants;
 pub mod principals;

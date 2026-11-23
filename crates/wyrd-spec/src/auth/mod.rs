@@ -35,7 +35,8 @@ pub use attribution::Attribution;
 pub use browser::{
     BrowserApiKeyRequest, BrowserCredential, BrowserLoginRequest, BrowserLoginResponse,
     BrowserLogoutRequest, BrowserSessionQuery, BrowserSessionView, BrowserSessionsResponse,
-    ContactRequest, ContactVerifyRequest, LocalCredentials, PasswordChangeRequest,
+    ContactRequest, ContactVerifyRequest, DiscoveredWorkspace, DiscoveryPage, DiscoveryQuery,
+    DiscoveryRequest, DiscoveryVerifyRequest, LocalCredentials, PasswordChangeRequest,
     PasswordLoginRequest, PasswordResetRequest, PasswordSignupRequest, ProofStatus,
     ProofStatusResponse, SignupBeginRequest, SignupCompleteRequest, SignupCompleteResponse,
     SignupVerifyRequest,

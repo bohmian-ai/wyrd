@@ -167,6 +167,63 @@ pub struct ContactVerifyRequest {
     pub proof: SecretBearer,
 }
 
+/// Body of `POST /auth/browser/workspaces/request`: mail a discovery proof to
+/// an address.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct DiscoveryRequest {
+    /// The address whose workspaces to find, as typed.
+    pub email: String,
+}
+
+/// Body of `POST /auth/browser/workspaces/verify`: the proof a discovery
+/// message carried, presented by the browser that asked for it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct DiscoveryVerifyRequest {
+    /// The proof from the message's link fragment, or pasted.
+    #[schemars(with = "String")]
+    pub proof: SecretBearer,
+}
+
+/// Query of `GET /auth/browser/workspaces`: the next page of a discovery the
+/// browser's read cookie already holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::IntoParams, utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct DiscoveryQuery {
+    /// The `next_cursor` of the previous page.
+    pub cursor: String,
+}
+
+/// One workspace a verified address may sign in to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct DiscoveredWorkspace {
+    /// The workspace's route key.
+    pub tenant: TenantSlug,
+    /// The workspace's display name.
+    pub display_name: String,
+    /// The workspace's fixed same-origin sign-in page.
+    pub login_url: String,
+}
+
+/// One bounded page of the workspaces a verified address may sign in to.
+/// An empty page is a normal result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct DiscoveryPage {
+    /// Workspaces in route-key order, each once.
+    pub workspaces: Vec<DiscoveredWorkspace>,
+    /// Present when more workspaces may follow; pass it as `cursor`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
 /// Body of `POST /auth/browser/api-key`: recover tenant access with an API
 /// key.
 ///

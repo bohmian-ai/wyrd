@@ -1081,25 +1081,31 @@ impl WyrdTestServer {
         Ok(replica)
     }
 
-    /// Start the current-authority propagation worker of an unbound server,
-    /// leaving its other workers for [`Self::bind`].
+    /// Start the current-authority propagation and workspace-directory
+    /// workers of an unbound server, leaving its other workers for
+    /// [`Self::bind`].
     ///
-    /// Current authority reaches an unbound server's cache as it reaches a
-    /// bound one's, so a test observes access changes committed through
-    /// another replica within the propagation bound. Idempotent: the worker
-    /// leaves the pending set when it starts.
+    /// Current authority and the discovery directory reach an unbound
+    /// server as they reach a bound one, so a test observes access and
+    /// contact changes committed through any replica within their
+    /// propagation bound. Idempotent: each worker leaves the pending set when
+    /// it starts.
     fn propagate_authority(&self) {
-        let authority = {
+        let started: Vec<_> = {
             let mut workers = self
                 .workers
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            workers
-                .iter()
-                .position(|(name, _)| *name == "authorization_cache")
-                .map(|at| workers.remove(at).1)
+            let (projections, rest) =
+                std::mem::take(&mut *workers)
+                    .into_iter()
+                    .partition(|(name, _)| {
+                        matches!(*name, "authorization_cache" | "workspace_directory")
+                    });
+            *workers = rest;
+            projections
         };
-        if let Some(worker) = authority {
+        for (_, worker) in started {
             wyrd_runtime::runtime().spawn(worker);
         }
     }

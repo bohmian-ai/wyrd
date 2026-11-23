@@ -6,6 +6,10 @@ use uuid::Uuid;
 
 use crate::TenantConn;
 
+/// The channel every committed contact change notifies with
+/// `<data_tenant_id>:<user_id>`.
+pub const CONTACT_CHANNEL: &str = "wyrd_contact";
+
 /// A User's verified recovery contact.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct VerifiedContact {
@@ -62,6 +66,57 @@ pub async fn replace_verified_contact(
     .bind(expected)
     .fetch_optional(&mut **conn.transaction())
     .await
+}
+
+/// `user_id`'s verified contact while the User is active; `None` when it
+/// has none or is suspended or deleted.
+///
+/// # Errors
+/// Returns a SQLx error when the read fails.
+pub async fn live_contact(
+    conn: &mut TenantConn<'_>,
+    user_id: Uuid,
+) -> Result<Option<VerifiedContact>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT c.address, c.revision
+           FROM wyrd.auth_user_contacts c
+           JOIN wyrd.auth_users u ON u.id = c.user_id
+          WHERE c.user_id = $1 AND u.status = 'active'",
+    )
+    .bind(user_id)
+    .fetch_optional(&mut **conn.transaction())
+    .await
+}
+
+/// Every verified contact the tenant holds, as `(user_id, contact)`.
+///
+/// # Errors
+/// Returns a SQLx error when the read fails.
+pub async fn tenant_contacts(
+    conn: &mut TenantConn<'_>,
+) -> Result<Vec<(Uuid, VerifiedContact)>, sqlx::Error> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        user_id: Uuid,
+        address: String,
+        revision: i64,
+    }
+    let rows: Vec<Row> =
+        sqlx::query_as("SELECT user_id, address, revision FROM wyrd.auth_user_contacts")
+            .fetch_all(&mut **conn.transaction())
+            .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.user_id,
+                VerifiedContact {
+                    address: row.address,
+                    revision: row.revision,
+                },
+            )
+        })
+        .collect())
 }
 
 /// Record `address`, already proven, as `user_id`'s verified contact at

@@ -1281,6 +1281,24 @@ enum SignupEnvelope {
         #[serde(default)]
         attempt: Option<Uuid>,
     },
+    /// A workspace-discovery proof sent to an address.
+    DiscoveryEmail {
+        /// SHA-256 of the proof the message carries.
+        proof_hash: Sha256Hex,
+        /// The address in comparison form.
+        address: String,
+        /// Random browser binding; its digest marks the spent proof.
+        binding: String,
+        /// Database-clock deadline, in Unix seconds.
+        expires_at: i64,
+    },
+    /// The directory read a spent discovery proof granted its browser.
+    DiscoveryRead {
+        /// The proven address in comparison form.
+        address: String,
+        /// Database-clock deadline, in Unix seconds.
+        expires_at: i64,
+    },
     /// A recovery-contact proof sent for a signed-in User.
     ContactEmail {
         /// SHA-256 of the proof the message carries.
@@ -1331,6 +1349,7 @@ const fn provider_context<'a>(provider: &'a str, client_id: &'a [&'a str]) -> Se
 const ENVELOPE_LABEL: &str = "signup-envelope";
 
 mod contacts;
+mod discovery;
 
 /// One provider return to redeem: its code and the round-trip values the
 /// redemption must match.

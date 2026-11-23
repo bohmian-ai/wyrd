@@ -311,7 +311,7 @@ async fn renewal_keeps_revocation_and_refuses_without_authority() {
     custom_role(
         &server,
         "operators_reader",
-        json!([{ "resource": "operators", "action": "read", "scope": "all" }]),
+        json!([{ "resource": "operators", "action": "read" }]),
     )
     .await;
     let (reader_id, reader) = user(&server, "oc-renew-reader", &["operators_reader"]).await;

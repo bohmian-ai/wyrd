@@ -31,8 +31,9 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
     BrowserApiKeyRequest, BrowserLoginRequest, BrowserLoginResponse, BrowserLogoutRequest,
     BrowserSessionQuery, BrowserSessionView, BrowserSessionsResponse, ContactRequest,
-    ContactVerifyRequest, PasswordChangeRequest, PasswordLoginRequest, PasswordResetRequest,
-    PasswordSignupRequest, ProofStatus, ProofStatusResponse,
+    ContactVerifyRequest, DiscoveryPage, DiscoveryQuery, DiscoveryRequest, DiscoveryVerifyRequest,
+    PasswordChangeRequest, PasswordLoginRequest, PasswordResetRequest, PasswordSignupRequest,
+    ProofStatus, ProofStatusResponse,
 };
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::ids::TenantSlug;
@@ -935,6 +936,184 @@ pub async fn contact_verify(
         )],
         (),
     ))
+}
+
+/// Name of the cookie holding a discovery's sealed flow, then its read.
+const DISCOVERY_COOKIE: &str = "wyrd_discovery";
+
+/// Path the discovery cookie is scoped to.
+const DISCOVERY_COOKIE_PATH: &str = "/auth/browser/workspaces";
+
+/// Lifetime of the discovery flow cookie: the proof's fifteen minutes.
+const DISCOVERY_FLOW_MAX_AGE_SECONDS: u64 = 900;
+
+/// Lifetime of the discovery read cookie.
+const DISCOVERY_READ_MAX_AGE_SECONDS: u64 = 300;
+
+/// The one `wyrd_discovery` cookie `headers` carry; `None` for none or
+/// several.
+fn discovery_cookie(headers: &HeaderMap) -> Option<&str> {
+    let mut found = cookie_pairs(headers).filter(|(name, _)| *name == DISCOVERY_COOKIE);
+    match (found.next(), found.next()) {
+        (Some((_, value)), None) => Some(value),
+        _ => None,
+    }
+}
+
+/// `POST /auth/browser/workspaces/request` — mail a proof that lists the
+/// workspaces an address may sign in to.
+///
+/// Answers `202` alike for every address and sets the `wyrd_discovery`
+/// flow cookie the same browser presents to verify. The message names no
+/// workspace.
+///
+/// # Errors
+/// `403 WYRD_AUTH_403_METHOD_UNAVAILABLE` without a mail relay;
+/// `400 WYRD_SPEC_400_VALIDATION` for an unparsable address; `503` when the
+/// store, key or relay fails.
+#[utoipa::path(
+    post,
+    path = "/auth/browser/workspaces/request",
+    request_body = DiscoveryRequest,
+    responses(
+        (status = 202, description = "A proof was mailed; the flow cookie is set",
+          body = ProofStatusResponse,
+          headers(("Set-Cookie" = String, description = "The `wyrd_discovery` flow cookie"))),
+        (status = 400, description = "Invalid body or address (WYRD_SPEC_400_VALIDATION)",
+          body = WyrdProblem),
+        (status = 403, description = "Origin absent or foreign, or mail is not configured \
+          (WYRD_AUTH_403_ORIGIN_REFUSED, WYRD_AUTH_403_METHOD_UNAVAILABLE)", body = WyrdProblem),
+        (status = 503, description = "The store, key or relay is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    security(()),
+    tag = "Auth"
+)]
+#[tracing::instrument(level = "debug", skip_all)]
+pub async fn discovery_request(
+    State(state): State<AppState>,
+    RequestOrigin(origin): RequestOrigin,
+    headers: HeaderMap,
+    request: Result<Json<DiscoveryRequest>, JsonRejection>,
+) -> Result<Response, WyrdErrorResponse> {
+    let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
+    require_same_origin(&headers, &origin)?;
+    let flow = social(&state)?
+        .begin_discovery(application_mail(&state)?, &request.email, &origin)
+        .await?;
+    Ok(with_cookies(
+        StatusCode::ACCEPTED,
+        vec![cookie_header(
+            &origin,
+            DISCOVERY_COOKIE,
+            flow.expose_secret(),
+            DISCOVERY_COOKIE_PATH,
+            DISCOVERY_FLOW_MAX_AGE_SECONDS,
+        )],
+        Json(ProofStatusResponse {
+            status: ProofStatus::CheckEmail,
+        }),
+    ))
+}
+
+/// `POST /auth/browser/workspaces/verify` — spend a discovery proof in the
+/// browser that asked for it and read the first page of its workspaces.
+///
+/// Replaces the flow cookie with a five-minute read cookie for the next
+/// pages. Creates no session, User or grant.
+///
+/// # Errors
+/// `401 WYRD_AUTH_401_ONE_TIME_CODE_INVALID` for a missing or foreign flow,
+/// a wrong proof or a spent one; `400` once expired; `503` when the store or
+/// key fails.
+#[utoipa::path(
+    post,
+    path = "/auth/browser/workspaces/verify",
+    request_body = DiscoveryVerifyRequest,
+    responses(
+        (status = 200, description = "The first page of workspaces; the read cookie is set",
+          body = DiscoveryPage,
+          headers(("Set-Cookie" = String, description = "The `wyrd_discovery` read cookie"))),
+        (status = 400, description = "Invalid body, or the proof expired \
+          (WYRD_SPEC_400_VALIDATION, WYRD_AUTH_400_INVALID_STATE)", body = WyrdProblem),
+        (status = 401, description = "No usable flow or proof in this browser \
+          (WYRD_AUTH_401_ONE_TIME_CODE_INVALID)", body = WyrdProblem),
+        (status = 403, description = "Origin absent or foreign (WYRD_AUTH_403_ORIGIN_REFUSED)",
+          body = WyrdProblem),
+        (status = 503, description = "The store or key is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    security(()),
+    tag = "Auth"
+)]
+#[tracing::instrument(level = "debug", skip_all)]
+pub async fn discovery_verify(
+    State(state): State<AppState>,
+    RequestOrigin(origin): RequestOrigin,
+    headers: HeaderMap,
+    request: Result<Json<DiscoveryVerifyRequest>, JsonRejection>,
+) -> Result<Response, WyrdErrorResponse> {
+    let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
+    require_same_origin(&headers, &origin)?;
+    let (read, page) = social(&state)?
+        .verify_discovery(
+            state.postgres.wyrd(),
+            discovery_cookie(&headers),
+            &request.proof,
+            &origin,
+        )
+        .await?;
+    Ok(with_cookies(
+        StatusCode::OK,
+        vec![cookie_header(
+            &origin,
+            DISCOVERY_COOKIE,
+            read.expose_secret(),
+            DISCOVERY_COOKIE_PATH,
+            DISCOVERY_READ_MAX_AGE_SECONDS,
+        )],
+        Json(page),
+    ))
+}
+
+/// `GET /auth/browser/workspaces` — the next page of the discovery this
+/// browser's read cookie holds.
+///
+/// # Errors
+/// `401 WYRD_AUTH_401_ONE_TIME_CODE_INVALID` without a read cookie; `400`
+/// once it expired; `503` when the store or key fails.
+#[utoipa::path(
+    get,
+    path = "/auth/browser/workspaces",
+    params(DiscoveryQuery),
+    responses(
+        (status = 200, description = "The next page of workspaces", body = DiscoveryPage),
+        (status = 400, description = "The read expired (WYRD_AUTH_400_INVALID_STATE)",
+          body = WyrdProblem),
+        (status = 401, description = "No discovery read in this browser \
+          (WYRD_AUTH_401_ONE_TIME_CODE_INVALID)", body = WyrdProblem),
+        (status = 503, description = "The store or key is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    security(()),
+    tag = "Auth"
+)]
+#[tracing::instrument(level = "debug", skip_all)]
+pub async fn discovery_next(
+    State(state): State<AppState>,
+    RequestOrigin(origin): RequestOrigin,
+    headers: HeaderMap,
+    Query(query): Query<DiscoveryQuery>,
+) -> Result<Json<DiscoveryPage>, WyrdErrorResponse> {
+    let page = social(&state)?
+        .discovery_next(
+            state.postgres.wyrd(),
+            discovery_cookie(&headers),
+            &query.cursor,
+            &origin,
+        )
+        .await?;
+    Ok(Json(page))
 }
 
 /// `POST /auth/browser/password/reset` — set a local User's password with a

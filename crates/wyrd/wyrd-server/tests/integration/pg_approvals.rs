@@ -729,7 +729,9 @@ async fn a_decision_outlives_its_retry_receipt() {
         .as_str()
         .expect("approval id")
         .to_owned();
-    let (approver, approver_jwt) = deployment.user("approval-editor", &["editor"]).await;
+    let (approver, approver_jwt) = deployment
+        .user("approval-editor", &["approver", "viewer"])
+        .await;
     let approve = json!({"decision": "approved", "reason": "reviewed the diff"});
     let (status, receipt) = deployment
         .decide(&approver_jwt, execution, &approval, &approve)

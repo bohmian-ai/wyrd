@@ -848,10 +848,42 @@ directory-update owner once here; recovery below consumes its output.
   - Command: `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-sql --test integration -E "test(=pg_auth_contacts::pg_tests::contact_replacement_takes_effect_only_at_its_expected_revision)"'`. GREEN: 1 passed.
   - Mutation check: without the guard it fails with `(Some(1), Some(2))` against `(Some(1), None)`.
   - TDD VIOLATED for this fix: the guard was written before its test.
+- Scenario 2, bounded discovery with revalidation:
+  `platform_admin_e2e::contacts::a_visitor_discovers_only_live_workspaces_for_a_verified_address`
+  (same file). It covers these cases:
+  - without a relay, a request gets 403 `METHOD_UNAVAILABLE`;
+  - verified contacts reach the directory within the propagation bound (`within_propagation`);
+  - known and unknown addresses both get exactly `202 {"status":"check_email"}` and a binding cookie, and the mail names no workspace;
+  - the proof without its binding cookie gets 401;
+  - in its own browser it gives 200 with exactly `tenant`, `display_name` and `login_url` per workspace. The links are fixed same-origin `/t/{slug}/login` paths, in route-key order, with no `next_cursor`, and a read cookie is set. An unknown address gets an empty list;
+  - the same browser repeating a spent proof gets the same page;
+  - replacing one contact, suspending one User and retiring one tenant (through SQL; there is no retirement surface) each drop that workspace at once, before reconciliation;
+  - a listed workspace still needs its own sign-in (401 without a session).
+  - RED: 401 from the middleware for the unmatched route `/auth/browser/workspaces/request`.
+  - GREEN: 1 passed.
+  - A first GREEN attempt saw an empty directory. Cause: an unbound `WyrdTestServer` starts only `authorization_cache` and leaves the other workers for `bind()`, so the new `workspace_directory` worker never ran under `oneshot`. Fix site: `WyrdTestServer::propagate_authority` (`crates/wyrd/wyrd-testing/src/server.rs`), which now also starts `workspace_directory`. Callers: every unbound test server.
+- Implementation:
+  - Schema: unshipped migration 0008 edited in place (spec revision 6 "Workspace discovery directory" and "Proven email … discovery … proof and one-use redemption"; maintainer approval: "nothing has shipped").
+    - `platform.workspace_directory` holds tenant, User, the HMAC address key and the contact revision.
+    - `platform.discovery_proofs` holds the proof digest, browser digest, read deadline and expiry.
+    - Both force operator-only RLS.
+    - A trigger on `wyrd.auth_user_contacts` notifies `wyrd_contact`.
+  - Owners: `SocialSignIn` in `wyrd-auth/src/social/discovery.rs`, the queries in `wyrd-sql/src/queries/platform/discovery.rs`, `live_contact`/`tenant_contacts`, and a `workspace_directory` worker on the existing `NotificationListener`.
+    - The worker reprojects a User on each notification and resyncs every live tenant on each (re)subscribe.
+    - Each page revalidates the active User and the exact current contact and revision through the tenant's connection. Any failure omits the workspace.
+    - Spent proofs are purged by the existing maintenance purge.
+  - Routes: `POST /auth/browser/workspaces/request`, `POST /auth/browser/workspaces/verify` and `GET /auth/browser/workspaces?cursor=`.
+- Lane regressions fixed: the full lane named below turned up two stale fixtures from merge 70a56a136, which predate operation-bundle roles. A read-only diagnostician found them; its report is summarized here.
+  - `pg_approvals::a_decision_outlives_its_retry_receipt`: `editor` no longer approves (`builtin_roles.rs`), so the test now uses `["approver","viewer"]` like its siblings.
+  - `pg_operator_connection_routes::renewal_keeps_revocation_and_refuses_without_authority`: a raw role row carried `"scope"`, which `Operation` refuses. The test drops it, like the same file's `:694`.
+  - Both pass. Neither assertion changed.
+- Not fixed, outside this task: `pg_hosted_artifacts::busy_queued_execution_is_deferred_until_capacity_frees` fails intermittently (2 of 5 solo runs, and once in the lane).
+  - Cause, from a read-only diagnostician: after the runner admits an attempt, its input read's Oracle admission joins the operation and waits out the 20 s execution deadline while pressure is `Critical` (`runner.rs:808-813`, `oracle/mod.rs:2342-2346`, `workload.rs:622-660`). The working-tree diff is not involved.
+  - Fix site: the verification runner's nested admissions, which are on a hot path. Left for a maintainer decision.
 - Still open in cycle 12:
   - a second User's session;
   - contact and discovery admission budgets;
-  - the discovery directory and its revalidation;
+  - pagination past one page;
   - removing the old revision's reset proofs (the reset owner is cycle 13).
 - Commands:
   - the Postgres journey command, with selector `test(=platform_admin_e2e::contacts::a_signed_in_user_verifies_and_replaces_a_recovery_contact)`;

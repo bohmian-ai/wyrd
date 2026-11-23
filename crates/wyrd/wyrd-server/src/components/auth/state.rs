@@ -150,6 +150,57 @@ impl ServerAuth {
         )
     }
 
+    /// The workspace-directory reconciliation worker over `postgres`, which
+    /// runs until `shutdown`; `None` without the platform plane.
+    ///
+    /// Every `wyrd_contact` notification reprojects that User's entry, and
+    /// every (re)subscription resynchronizes every live tenant, so a change
+    /// made while the listener was down is reconciled once it is back.
+    /// Discovery revalidates each entry before disclosing it, so a lagging
+    /// projection may omit a workspace but never reveals a stale one.
+    pub(crate) fn directory_worker(
+        &self,
+        postgres: &wyrd_sql::WyrdPostgres,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> Option<crate::state::EngineWorker> {
+        let social = self.social_sign_in.clone()?;
+        let postgres = postgres.clone();
+        Some((
+            "workspace_directory",
+            Box::pin(async move {
+                let (send, mut work) = tokio::sync::mpsc::unbounded_channel::<Option<String>>();
+                let listener = postgres.listener(wyrd_sql::queries::auth::CONTACT_CHANNEL);
+                let listen = listener.watch(
+                    shutdown.clone(),
+                    |listening| {
+                        if listening {
+                            let _ = send.send(None);
+                        }
+                    },
+                    |payload| {
+                        let _ = send.send(Some(payload.to_owned()));
+                    },
+                );
+                let apply = async {
+                    while let Some(item) = work.recv().await {
+                        let applied = match item {
+                            Some(payload) => social.reconcile_contact(&postgres, &payload).await,
+                            None => social.reconcile_directory(&postgres).await,
+                        };
+                        if let Err(error) = applied {
+                            tracing::warn!(%error, "workspace directory reconciliation failed");
+                        }
+                    }
+                };
+                tokio::select! {
+                    () = shutdown.cancelled() => {}
+                    () = listen => {}
+                    () = apply => {}
+                }
+            }),
+        ))
+    }
+
     /// The auth maintenance worker, which runs until `shutdown`.
     ///
     /// Every [`MAINTENANCE_INTERVAL`] it drains expired signup state one

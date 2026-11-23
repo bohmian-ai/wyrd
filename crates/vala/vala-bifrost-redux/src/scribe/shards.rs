@@ -13094,9 +13094,9 @@ mod tests {
         /// a batch.
         #[tokio::test]
         async fn an_unavailable_commit_reconciliation_retains_both_groups_for_restart() {
+            const COMMIT_GATE: i64 = 7_017;
             let (mut fixture, owner, budget, command_tx) = PipelineFixture::start().await;
             let (older_id, younger_id) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
-            const COMMIT_GATE: i64 = 7_017;
             sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
                 "CREATE FUNCTION public.fail_commit() RETURNS trigger \
                  LANGUAGE plpgsql SECURITY DEFINER AS $body$ BEGIN \
@@ -13127,7 +13127,8 @@ mod tests {
                             if verb == "GRANT" { "TO" } else { "FROM" }
                         )
                     })
-                    .collect::<String>()
+                    .collect::<Vec<_>>()
+                    .join(" ")
             };
             let mut gate = fixture.superuser.begin().await.expect("COMMIT gate");
             sqlx::query("SELECT pg_advisory_xact_lock($1)")

@@ -921,9 +921,14 @@ segment it touched before it records the batch fences. One group writes the WAL
 at a time, and only the older group fences, inserts, publishes or acknowledges,
 so the younger group writes and syncs while the older one awaits PostgreSQL, and
 groups settle in dispatch order. A group's ACK never waits on the next group's
-IO. Beside a dispatched group, the free slot collects up to 32 requests or until
-1 ms after its first collected request, whichever comes first; an idle shard
-dispatches at once. A tenant, table and batch id a dispatched group owns is
+IO. Beside a dispatched group, the free slot waits for new arrivals until it
+holds 32 eligible requests or until 1 ms after its first eligible request; that
+deadline never resets, and the predecessor's completion ends the wait. The 32
+is a soft target: the group still drains every ready eligible request up to the
+existing byte and 64-request limits. Requests a dispatched group's identity
+holds back are not eligible and never end the wait. An idle shard dispatches at
+once, and the shard services a ready group completion before it prepares the
+next group or routes more than one bounded mailbox chunk. A tenant, table and batch id a dispatched group owns is
 skipped by the other slot until it settles, keeping that table's FIFO while
 other tables proceed. Control commands, pressure seals and a group that needs a
 generation rotation wait until no group is dispatched, and no group dispatches

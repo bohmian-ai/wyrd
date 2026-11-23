@@ -425,6 +425,10 @@ pub const SHARD_COMMAND_CAPACITY: usize = 256;
 /// Maximum requests in one tenant scheduling group.
 pub const MAX_GROUP_ITEMS: usize = 64;
 
+/// Mailbox commands a shard routes before it again services ready group
+/// completions, so a mailbox backlog cannot delay a ready ACK.
+const MAILBOX_SERVICE_CHUNK: usize = MAX_GROUP_ITEMS;
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PressureSignal {
     pub(crate) keys: Vec<crate::scribe::seal_key::SealKey>,
@@ -721,6 +725,35 @@ impl<T: ShardItem> TenantTableRoundRobin<T> {
         self.len
     }
 
+    /// Counts, up to `limit`, the requests [`Self::pop_group`] may take
+    /// now: each table's requests ahead of its first one whose identity is
+    /// in `held` or repeats an earlier request of that table.
+    ///
+    /// Collection timing counts only these, so requests a dispatched group
+    /// holds back never end the free slot's wait for arrivals.
+    #[must_use]
+    pub fn eligible(&self, held: &HashSet<BatchIdentity>, limit: usize) -> usize {
+        let mut eligible = 0;
+        let mut batches = Vec::new();
+        for (tenant, queues) in &self.pending_by_tenant {
+            for (table, queue) in &queues.by_table {
+                batches.clear();
+                for item in queue {
+                    if eligible == limit {
+                        return eligible;
+                    }
+                    let batch = item.batch_id();
+                    if batches.contains(&batch) || held.contains(&(*tenant, table.clone(), batch)) {
+                        break;
+                    }
+                    batches.push(batch);
+                    eligible += 1;
+                }
+            }
+        }
+        eligible
+    }
+
     /// Reports whether the shard has no queued requests at any level.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -930,6 +963,14 @@ struct ShardOwner {
     /// One-shot retirement release fault used only by deterministic owner tests.
     #[cfg(test)]
     fail_next_retirement_release: bool,
+    /// Pauses each group preparation until a test releases it: the sender
+    /// reports that preparation was reached, then preparation takes one
+    /// permit. Deterministic coordinator-ordering tests only.
+    #[cfg(test)]
+    preparation_hold: Option<(
+        tokio::sync::mpsc::UnboundedSender<()>,
+        Arc<tokio::sync::Semaphore>,
+    )>,
 }
 
 /// Last owner-published state used by synchronous inspection surfaces.
@@ -1185,6 +1226,8 @@ impl ScribeShardRuntime {
                 committed: Arc::clone(&committed),
                 #[cfg(test)]
                 fail_next_retirement_release: false,
+                #[cfg(test)]
+                preparation_hold: None,
             };
             let task = runtime.spawn(owner.run());
             abort_handles
@@ -1524,6 +1567,12 @@ impl ShardOwner {
                 }
                 continue;
             }
+            if let Some((slot, meta, done)) = self.pipeline.ready_stage().await {
+                if let Some(Err(error)) = self.finish_stage(slot, meta, done) {
+                    self.log_group_failure(&error);
+                }
+                continue;
+            }
             if self.pipeline.is_idle() {
                 if detached {
                     break;
@@ -1596,10 +1645,14 @@ impl ShardOwner {
         }
     }
 
-    /// Routes every command already queued in the mailbox; see
-    /// [`Self::route_command`].
+    /// Routes up to [`MAILBOX_SERVICE_CHUNK`] commands already queued in the
+    /// mailbox; see [`Self::route_command`]. The run loop services ready
+    /// group completions between chunks.
     async fn drain_mailbox(&mut self) {
-        while let Ok(command) = self.receiver.try_recv() {
+        for _ in 0..MAILBOX_SERVICE_CHUNK {
+            let Ok(command) = self.receiver.try_recv() else {
+                break;
+            };
             self.route_command(command).await;
         }
     }
@@ -3853,9 +3906,12 @@ const COLLECTION_WAIT: Duration = Duration::from_millis(1);
 /// Times the group the free slot collects while another group is dispatched.
 ///
 /// An idle shard dispatches at once. Beside a dispatched group, a group
-/// below [`COLLECTION_TARGET`] waits for arrivals until [`COLLECTION_WAIT`]
-/// after its first collected request; later arrivals never move that
-/// deadline. The deadline clears only when the group dispatches.
+/// below [`COLLECTION_TARGET`] eligible requests waits for arrivals until
+/// [`COLLECTION_WAIT`] after its first eligible request; later arrivals never
+/// move that deadline. Requests a dispatched group's identity holds back are
+/// not eligible. The target only ends waiting: the dispatched group still
+/// drains every ready eligible request up to [`MAX_GROUP_ITEMS`]. The
+/// deadline clears only when the group dispatches.
 #[derive(Debug, Default)]
 struct GroupCollection {
     /// When the collecting group dispatches regardless of its size.
@@ -3863,14 +3919,14 @@ struct GroupCollection {
 }
 
 impl GroupCollection {
-    /// Reports whether the collected group dispatches now, starting its
-    /// deadline at its first collected request.
-    fn due(&mut self, queued: usize, overlapping: bool, now: tokio::time::Instant) -> bool {
-        if queued == 0 {
+    /// Reports whether the collected group of `eligible` requests dispatches
+    /// now, starting its deadline at its first eligible request.
+    fn due(&mut self, eligible: usize, overlapping: bool, now: tokio::time::Instant) -> bool {
+        if eligible == 0 {
             return false;
         }
         let deadline = *self.deadline.get_or_insert(now + COLLECTION_WAIT);
-        let due = !overlapping || queued >= COLLECTION_TARGET || now >= deadline;
+        let due = !overlapping || eligible >= COLLECTION_TARGET || now >= deadline;
         if due {
             self.deadline = None;
         }
@@ -3950,6 +4006,21 @@ impl GroupPipeline {
             .flatten()
             .flat_map(|group| group.meta.identities.iter().cloned())
             .collect()
+    }
+
+    /// Takes a dispatched group whose running stage has already completed,
+    /// oldest first, without waiting for a stage that has not.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancel-safe: an unfinished stage stays in its slot.
+    async fn ready_stage(&mut self) -> Option<(GroupSlot, GroupMeta, StageDone)> {
+        tokio::select! {
+            biased;
+            (meta, done) = Self::stage_done(&mut self.older) => Some((GroupSlot::Older, meta, done)),
+            (meta, done) = Self::stage_done(&mut self.newer) => Some((GroupSlot::Newer, meta, done)),
+            () = std::future::ready(()) => None,
+        }
     }
 
     /// Puts a group back into the slot it was taken from.
@@ -4146,16 +4217,24 @@ impl ShardOwner {
             return true;
         }
         let overlapping = !self.pipeline.is_idle();
-        // ponytail: queued counts requests a dispatched group's identity
-        // holds back, so a collision may re-arm the deadline until it settles.
+        let held = self.pipeline.held_identities();
         if !self.pipeline.collection.due(
-            self.scheduler.len(),
+            self.scheduler.eligible(&held, COLLECTION_TARGET),
             overlapping,
             tokio::time::Instant::now(),
         ) {
             return false;
         }
-        let mut group = self.scheduler.pop_group(&self.pipeline.held_identities());
+        #[cfg(test)]
+        if let Some((reached, release)) = &self.preparation_hold {
+            let _ = reached.send(());
+            release
+                .acquire()
+                .await
+                .expect("the preparation hold stays open")
+                .forget();
+        }
+        let mut group = self.scheduler.pop_group(&held);
         self.scheduler.record_closed(&group);
         if group.is_empty() {
             return false;
@@ -8576,6 +8655,7 @@ mod tests {
             drained: Arc::new(Notify::new()),
             committed: Arc::default(),
             fail_next_retirement_release: false,
+            preparation_hold: None,
         };
         (owner, budget, command_tx, completion_tx, pressure_tx)
     }
@@ -10946,6 +11026,291 @@ mod tests {
             "a group at the soft target dispatches without waiting"
         );
         assert_eq!(collection.deadline(), None);
+    }
+
+    /// An owner on a fresh WAL with no fence database, so a group's fence
+    /// resolves the first time the coordinator polls it. Returns the WAL
+    /// directory, the owner, its budget, a production-capacity mailbox
+    /// sender, and the pressure sender the owner needs kept open.
+    fn mailbox_owner() -> (
+        tempfile::TempDir,
+        ShardOwner,
+        crate::resources::ScribeResources,
+        mpsc::Sender<ShardCommand>,
+        watch::Sender<Option<PressureSignal>>,
+    ) {
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+        let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+        let (mut owner, budget, _, _, pressure) =
+            owner_for_completion_test_with_channels(Memtable::new(), &wal, wal_handle, stream);
+        let (command_tx, receiver) = mpsc::channel(SHARD_COMMAND_CAPACITY);
+        owner.receiver = receiver;
+        (wal_root, owner, budget, command_tx, pressure)
+    }
+
+    /// Dispatches `group` as the owner's head group and advances it, synced,
+    /// into its fence.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the group does not dispatch, sync and start fencing.
+    async fn fencing_head(owner: &mut ShardOwner, group: Vec<PreparedAppend>) {
+        owner.pending.fetch_add(group.len(), Ordering::AcqRel);
+        owner
+            .dispatch_group(group)
+            .await
+            .expect("the head dispatches");
+        assert!(owner.advance_pipeline().await.is_none(), "the head syncs");
+        assert!(matches!(
+            owner.pipeline.older.as_ref().map(|group| &group.stage),
+            Some(GroupStage::Fencing(_))
+        ));
+    }
+
+    /// A second table in `key`'s tenant and partition.
+    fn other_table(key: &SealKey, name: &str) -> SealKey {
+        SealKey::new(
+            key.tenant,
+            TableRef::new(BifrostNamespace::Bifrost, name),
+            crate::test_support::day_partition(2026, 7, 24),
+        )
+    }
+
+    /// A head group whose fence is ready becomes visible and acknowledged
+    /// before the coordinator prepares the next group, and the mailbox is
+    /// served one bounded chunk at a time, so a backlog larger than a chunk
+    /// cannot delay that completion.
+    ///
+    /// The head's fence resolves on its first poll while a backlog of appends
+    /// for another table, far above the collection target, waits in the
+    /// mailbox. Preparation of the next group is held at its start; by then
+    /// the head must be visible and acknowledged, and only one service chunk
+    /// may have left the mailbox.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the next group prepares before the head's ACK or before its
+    /// rows are visible, more than one chunk leaves the mailbox before that
+    /// preparation, or a backlog append does not commit.
+    #[tokio::test]
+    async fn a_ready_head_completion_is_acknowledged_before_the_next_group_prepares() {
+        const BACKLOG: usize = MAILBOX_SERVICE_CHUNK * 2 + 1;
+        let (_wal_root, mut owner, budget, command_tx, _pressure) = mailbox_owner();
+        let head_key = owner_key();
+        let backlog_key = other_table(&head_key, "owner-test-backlog");
+        let (head, mut head_ack) = acked_group_for_key(&budget, &head_key, &[uuid::Uuid::now_v7()]);
+        fencing_head(&mut owner, head).await;
+        let backlog_ids: Vec<uuid::Uuid> = (0..BACKLOG).map(|_| uuid::Uuid::now_v7()).collect();
+        let (backlog, backlog_acks) = acked_group_for_key(&budget, &backlog_key, &backlog_ids);
+        owner.pending.fetch_add(BACKLOG, Ordering::AcqRel);
+        for append in backlog {
+            command_tx
+                .try_send(ShardCommand::Append(Box::new(append)))
+                .expect("the mailbox holds the backlog");
+        }
+        let (reached_tx, mut reached) = mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        owner.preparation_hold = Some((reached_tx, Arc::clone(&release)));
+        let live = Arc::clone(&owner.memtable);
+        let task = tokio::spawn(owner.run());
+
+        tokio::time::timeout(Duration::from_secs(10), reached.recv())
+            .await
+            .expect("the next group prepares")
+            .expect("preparation hold");
+        let head = head_ack[0]
+            .try_recv()
+            .expect("the ready head is acknowledged before the next group prepares")
+            .expect("the head commits");
+        assert!(head.first_commit);
+        let stats = live.stats().expect("memtable stats");
+        assert_eq!(
+            u64::try_from(stats.writable_rows + stats.immutable_rows).expect("rows fit u64"),
+            head.rows,
+            "the head's rows are visible before the next group prepares"
+        );
+        assert_eq!(
+            command_tx.max_capacity() - command_tx.capacity(),
+            BACKLOG - MAILBOX_SERVICE_CHUNK,
+            "one bounded chunk left the mailbox before the next group prepared"
+        );
+
+        release.add_permits(BACKLOG);
+        for (index, ack) in backlog_acks.into_iter().enumerate() {
+            tokio::time::timeout(Duration::from_secs(10), ack)
+                .await
+                .unwrap_or_else(|_| panic!("backlog append {index} settles"))
+                .expect("ACK delivered")
+                .unwrap_or_else(|error| panic!("backlog append {index} commits: {error}"));
+        }
+        command_tx
+            .send(ShardCommand::Shutdown)
+            .await
+            .expect("shutdown mailbox");
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the owner drains")
+            .expect("owner task");
+    }
+
+    /// Retries a dispatched group's identity holds back cannot end the
+    /// overlapping group's collection: only eligible requests count toward
+    /// the soft target, arrivals never move the first eligible request's
+    /// deadline, and once the target is met the group drains every ready
+    /// eligible request while the held table keeps its retries queued.
+    ///
+    /// # Panics
+    ///
+    /// Panics if held retries dispatch the eligible group, an arrival moves
+    /// the deadline, the group stops at the target instead of draining ready
+    /// requests, or a held retry joins the group.
+    #[tokio::test(start_paused = true)]
+    async fn held_retries_do_not_satisfy_the_collection_target() {
+        let (_wal_root, mut owner, budget, _command_tx, _pressure) = mailbox_owner();
+        let held_key = owner_key();
+        let other_key = other_table(&held_key, "owner-test-other");
+        let held_id = uuid::Uuid::now_v7();
+        let (head, _head_ack) = acked_group_for_key(&budget, &held_key, &[held_id]);
+        fencing_head(&mut owner, head).await;
+        for _ in 1..COLLECTION_TARGET {
+            owner
+                .scheduler
+                .push(prepared_append_for_key(&budget, held_key.clone(), held_id));
+        }
+        let queue_eligible = |owner: &mut ShardOwner, count: usize| {
+            for _ in 0..count {
+                owner.scheduler.push(prepared_append_for_key(
+                    &budget,
+                    other_key.clone(),
+                    uuid::Uuid::now_v7(),
+                ));
+            }
+        };
+
+        queue_eligible(&mut owner, 1);
+        assert!(
+            !owner.dispatch_next().await,
+            "held retries do not complete the eligible group"
+        );
+        let deadline = owner
+            .pipeline
+            .collection
+            .deadline()
+            .expect("the first eligible request starts the deadline");
+        tokio::time::advance(COLLECTION_WAIT / 2).await;
+        queue_eligible(&mut owner, 5);
+        assert!(!owner.dispatch_next().await, "a short group keeps waiting");
+        assert_eq!(
+            owner.pipeline.collection.deadline(),
+            Some(deadline),
+            "arrivals never move the deadline"
+        );
+
+        queue_eligible(&mut owner, COLLECTION_TARGET + 2);
+        assert!(
+            owner.dispatch_next().await,
+            "eligible requests at the target dispatch"
+        );
+        let group = &owner
+            .pipeline
+            .newer
+            .as_ref()
+            .expect("the eligible group takes the free slot")
+            .meta;
+        assert_eq!(
+            group.requests,
+            COLLECTION_TARGET + 8,
+            "ready eligible requests above the target drain into the group"
+        );
+        assert!(
+            group
+                .identities
+                .iter()
+                .all(|(_, table, _)| *table == other_key.table),
+            "no held retry joins the group"
+        );
+        assert_eq!(
+            owner.scheduler.len(),
+            COLLECTION_TARGET - 1,
+            "the held table keeps its retries queued"
+        );
+        assert_eq!(owner.pipeline.collection.deadline(), None);
+    }
+
+    /// A short eligible group waiting beside held retries dispatches as soon
+    /// as its predecessor settles, before its deadline, and the held table
+    /// resumes in arrival order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if held retries dispatch the eligible group, the predecessor
+    /// does not settle, or the short group waits after it settles.
+    #[tokio::test(start_paused = true)]
+    async fn a_predecessor_completion_dispatches_a_short_eligible_group() {
+        let (_wal_root, mut owner, budget, _command_tx, _pressure) = mailbox_owner();
+        let held_key = owner_key();
+        let other_key = other_table(&held_key, "owner-test-other");
+        let held_id = uuid::Uuid::now_v7();
+        let (head, mut head_ack) = acked_group_for_key(&budget, &held_key, &[held_id]);
+        fencing_head(&mut owner, head).await;
+        for _ in 1..COLLECTION_TARGET {
+            owner
+                .scheduler
+                .push(prepared_append_for_key(&budget, held_key.clone(), held_id));
+        }
+        let eligible = uuid::Uuid::now_v7();
+        owner.scheduler.push(prepared_append_for_key(
+            &budget,
+            other_key.clone(),
+            eligible,
+        ));
+        assert!(
+            !owner.dispatch_next().await,
+            "held retries do not complete the eligible group"
+        );
+
+        assert!(
+            matches!(owner.advance_pipeline().await, Some(Ok(()))),
+            "the predecessor settles"
+        );
+        head_ack[0]
+            .try_recv()
+            .expect("the predecessor is acknowledged")
+            .expect("the predecessor commits");
+        assert!(
+            owner.dispatch_next().await,
+            "the predecessor's completion dispatches the short group at once"
+        );
+        let group = &owner
+            .pipeline
+            .older
+            .as_ref()
+            .expect("the short group dispatches")
+            .meta;
+        assert_eq!(
+            group.identities,
+            vec![
+                (held_key.tenant, held_key.table.clone(), *held_id.as_bytes()),
+                (
+                    other_key.tenant,
+                    other_key.table.clone(),
+                    *eligible.as_bytes()
+                ),
+            ],
+            "the released table's first retry and the eligible request dispatch"
+        );
+        assert_eq!(owner.scheduler.len(), COLLECTION_TARGET - 2);
     }
 
     /// A table whose next request a dispatched group still owns is skipped

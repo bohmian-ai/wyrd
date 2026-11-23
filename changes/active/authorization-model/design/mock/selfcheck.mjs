@@ -1,4 +1,4 @@
-// Real-browser self-check for the workspace signup design preview. Serves the repository root on an ephemeral
+// Real-browser self-check for the onboarding and platform console design preview. Serves the repository root on an ephemeral
 // localhost port, drives dist/ with the Playwright already installed for wyrd-ui, and writes screenshots to a temp
 // directory outside the source tree. Fails on any page error, script dialog, or request outside design/mock/.
 // Run after building: mise exec -C changes/active/authorization-model/design/mock -- node selfcheck.mjs
@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve, extname, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
-import { STATES, slugify, slugError } from './src/data.js';
+import { STATES, slugify, slugError, passwordError } from './src/data.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, '../../../../..');
@@ -46,7 +46,7 @@ function watch(page) {
 async function open(page, hash, mode) {
   await page.goto('about:blank');
   await page.goto(`${base}${mode === 'light' ? '?mode=light' : ''}${hash}`);
-  await page.waitForSelector('main.entry');
+  await page.waitForSelector('main');
   await page.evaluate(() => document.fonts.ready);
 }
 const slugOf = (hash) => hash.replace(/^#\/?/, '').replace(/[^a-z0-9]+/gi, '-').replace(/-$/, '') || 'sign-in';
@@ -87,7 +87,7 @@ try {
     assert.notEqual(await bg(), dark);
     for (const [label, hash] of STATES) {
       await p.selectOption('[data-testid=states]', hash);
-      await p.waitForSelector('main.entry');
+      await p.waitForSelector('main');
       assert.equal(await hashOf(p), hash);
       assert.equal(await p.locator('[data-testid=missing]').count(), 0, label);
     }
@@ -116,7 +116,7 @@ try {
   await check('journey: provider, name, derived then edited slug, create, land on /t/<slug>', async () => {
     const p = await fresh('#/signup');
     await p.click('button[data-provider=google]');
-    assert.equal(await p.locator('[data-testid=identity]').innerText(), 'Signed in with Google as sam@example.com.');
+    assert.equal(await p.locator('[data-testid=identity]').innerText(), 'Signed in with Google as sam@example.test.');
     assert.equal(await p.locator('[data-testid=turnstile]').count(), 0);
     await p.fill('#display-name', 'Acme Research');
     assert.equal(await p.inputValue('#slug'), 'acme-research');
@@ -196,6 +196,148 @@ try {
     await open(p, '#/signup/workspace?preview=creating');
     assert.ok(await p.locator('[data-testid=create]').isDisabled());
     assert.equal(await p.getAttribute('[data-testid=create]', 'aria-busy'), 'true');
+    await p.close();
+  });
+
+
+  await check('email signup: check-email answer, fragment proof POSTed then cleared, then administrator credentials', async () => {
+    const p = await fresh('#/signup');
+    await p.click('[data-testid=email-start]');
+    assert.match(await p.locator('#email-error').innerText(), /Enter an email address/);
+    await p.fill('#email', 'owner@example.test');
+    await p.click('[data-testid=email-start]');
+    assert.match(await p.locator('[data-testid=check-email]').innerText(), /owner@example\.test[\s\S]*fifteen minutes/);
+    await open(p, '#/signup?local=off');
+    assert.equal(await p.locator('#email').count(), 0, 'no relay, no email signup');
+    await open(p, '#/signup/verify?proof=sample-proof');
+    assert.doesNotMatch(await p.evaluate(() => location.href), /proof=/, 'the proof leaves the address bar at once');
+    await p.locator('[data-testid=proven]').waitFor();
+    await p.click('[data-testid=continue]');
+    await p.waitForSelector('#username');
+    await p.fill('#display-name', 'Owner Lab');
+    await p.fill('#username', 'owner');
+    await p.fill('#password', 'short');
+    await p.click('[data-testid=create]');
+    assert.match(await p.locator('#password-error').innerText(), /15 to 128/);
+    await p.fill('#password', 'a long enough passphrase');
+    await p.click('[data-testid=create]');
+    await p.locator('[data-testid=landing]').waitFor();
+    assert.equal(passwordError('x'.repeat(14)), 'Use 15 to 128 characters.');
+    assert.equal(passwordError('x'.repeat(15)), '');
+    await p.close();
+  });
+
+  await check('a provider without a verified email is refused 409, then proves one by email or ends without a relay', async () => {
+    const p = await fresh('#/signup/workspace?identity=github');
+    await p.fill('#display-name', 'Git Lab');
+    await p.click('[data-testid=create]');
+    assert.match(await problem(p), /Confirm an email address[\s\S]*WYRD_SPEC_409_CONFLICT/);
+    await p.fill('#contact-email', 'owner@example.test');
+    await p.click('[data-testid=contact-branch] button');
+    await p.fill('#proof', 'pasted-proof');
+    await p.click('[data-testid=verify]');
+    await p.locator('[data-testid=contact-proven]').waitFor();
+    await p.click('[data-testid=create]');
+    await p.locator('[data-testid=landing]').waitFor();
+    await open(p, '#/signup/workspace?identity=github&local=off&preview=contact');
+    assert.equal(await p.locator('form').count(), 0);
+    assert.ok(await p.getByRole('link', { name: 'Start again' }).isVisible());
+    await p.close();
+  });
+
+  await check('discovery: same answer for any address, links only, 20 per page then more, empty in the same tone', async () => {
+    const p = await fresh('#/workspaces');
+    await p.fill('#email', 'nobody@example.test');
+    await p.click('[data-testid=discover]');
+    const unknown = (await p.locator('[data-testid=check-email]').innerText()).replace('nobody', 'X');
+    await open(p, '#/workspaces');
+    await p.fill('#email', 'sam@example.test');
+    await p.click('[data-testid=discover]');
+    assert.equal((await p.locator('[data-testid=check-email]').innerText()).replace('sam', 'X'), unknown);
+    await open(p, '#/workspaces/verify?preview=proven');
+    const links = p.locator('[data-testid=workspaces] a');
+    assert.equal(await links.count(), 20);
+    assert.equal(await links.first().getAttribute('href'), '#/t/acme-research/login');
+    assert.equal(await links.first().innerText(), 'Acme Research\nacme-research');
+    await p.click('[data-testid=more]');
+    await p.locator('[data-testid=workspaces] li').nth(22).waitFor();
+    assert.equal(await p.locator('[data-testid=more]').count(), 0);
+    await open(p, '#/workspaces/verify?preview=empty');
+    assert.equal(await p.locator('[data-testid=problem]').count(), 0, 'empty is not an error');
+    assert.ok(await p.locator('[data-testid=empty]').isVisible());
+    await open(p, '#/workspaces?preview=throttled');
+    assert.match(await problem(p), /Try again in 9 minutes\.[\s\S]*WYRD_AUTH_429_EMAIL_ATTEMPTS/);
+    await p.close();
+  });
+
+  await check('recovery contact: request, recent sign-in and relay refusals, verified result', async () => {
+    const p = await fresh('#/t/acme-research/settings/account');
+    await p.fill('#recovery-email', 'sam.recovery@example.test');
+    await p.click('[data-testid=contact-start]');
+    await p.fill('#proof', 'pasted-proof');
+    await p.click('[data-testid=verify]');
+    await p.locator('[data-testid=proven]').waitFor();
+    assert.equal(await hashOf(p), '#/t/acme-research/contact/verify?preview=proven');
+    await open(p, '#/t/acme-research/settings/account?preview=recent');
+    assert.match(await problem(p), /WYRD_AUTH_403_RECENT_LOGIN_REQUIRED/);
+    assert.ok(await p.getByRole('link', { name: 'Sign in again' }).isVisible());
+    await open(p, '#/t/acme-research/settings/account?preview=unavailable');
+    assert.match(await problem(p), /WYRD_AUTH_403_METHOD_UNAVAILABLE/);
+    assert.equal(await p.locator('form').count(), 0);
+    await p.close();
+  });
+
+  await check('reset: one answer for every account, paste-code redemption, refusals, SSO-required has no form', async () => {
+    const p = await fresh('#/t/acme-research/reset');
+    await p.fill('#username', 'nobody');
+    await p.click('[data-testid=reset-request]');
+    const sent = (await p.locator('[data-testid=reset-sent]').innerText()).replace('nobody', 'X');
+    await open(p, '#/t/acme-research/reset');
+    await p.fill('#username', 'sam');
+    await p.click('[data-testid=reset-request]');
+    assert.equal((await p.locator('[data-testid=reset-sent]').innerText()).replace('sam', 'X'), sent);
+    await p.fill('#reset-code', 'mailed-code');
+    await p.fill('#new-password', 'a long enough passphrase');
+    await p.click('[data-testid=reset-set]');
+    await p.locator('[data-testid=reset-done]').waitFor();
+    await open(p, '#/t/acme-research/reset?preview=nomail');
+    assert.equal(await p.locator('[data-testid=reset-request]').count(), 0);
+    assert.equal(await p.locator('#reset-code').count(), 1);
+    await open(p, '#/t/acme-research/reset?preview=sso');
+    assert.equal(await p.locator('form').count(), 0);
+    assert.match(await problem(p), /WYRD_AUTH_403_METHOD_UNAVAILABLE/);
+    await p.close();
+  });
+
+  await check('platform: "Platform admin" sign-in, console, destructive change waits for same-operator proof', async () => {
+    const p = await fresh('#/platform');
+    assert.equal(await p.locator('h1').innerText(), 'Platform admin');
+    assert.equal(await p.locator('input').count(), 2, 'username and password only: no key field');
+    await p.fill('#username', 'ops-oncall');
+    await p.fill('#password', 'a long enough passphrase');
+    await p.click('[data-testid=platform-signin]');
+    await p.locator('[data-testid=operator]').waitFor();
+    assert.equal(await hashOf(p), '#/platform/ui');
+    await open(p, '#/platform/ui?preview=reauth');
+    assert.match(await p.locator('[data-testid=reauth]').innerText(), /Suspending acme-research/);
+    assert.equal(await p.locator('[data-testid=status-acme-research]').innerText(), '✓ active', 'nothing changes before proof');
+    await p.fill('#reauth-password', 'wrong');
+    await p.click('[data-testid=reauth-confirm]');
+    await p.locator('[data-testid=reauth] [data-testid=problem]').waitFor();
+    assert.equal(await p.locator('[data-testid=status-acme-research]').innerText(), '✓ active');
+    await p.fill('#reauth-password', 'a long enough passphrase');
+    await p.click('[data-testid=reauth-confirm]');
+    await p.locator('[data-testid=notice]').waitFor();
+    assert.equal(await p.locator('[data-testid=status-acme-research]').innerText(), '⊘ suspended');
+    assert.equal(await p.locator('[data-testid=recent]').innerText(), '✓ yes · changes apply at once');
+    await open(p, '#/platform/ui/providers');
+    assert.ok(await p.locator('[data-testid=toggle-github]').isDisabled(), 'an untested revision cannot be enabled');
+    await p.click('[data-testid=test-github]');
+    await p.locator('[data-testid=notice]').waitFor();
+    assert.ok(await p.locator('[data-testid=toggle-github]').isEnabled());
+    await open(p, '#/platform/ui/mail?preview=none');
+    assert.ok(await p.locator('[data-testid=no-relay]').isVisible());
+    assert.equal(await p.locator('[data-testid=mail-test]').count(), 0);
     await p.close();
   });
 

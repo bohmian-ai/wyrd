@@ -1,7 +1,8 @@
 <!-- #/signup/workspace: after provider proof, name the workspace and choose its URL slug. -->
 <script>
   import Entry from './Entry.svelte';
-  import { PROVIDERS, IDENTITIES, PROBLEMS, TAKEN, slugify, slugError } from './data.js';
+  import CheckEmail from './CheckEmail.svelte';
+  import { PROVIDERS, IDENTITIES, PROBLEMS, P, TAKEN, slugify, slugError, passwordError, emailError } from './data.js';
   let { query } = $props();
 
   // Each preview state starts as the server would leave the page after that answer.
@@ -10,6 +11,12 @@
   const preview = param('preview');
   const identity = IDENTITIES[param('identity')] ?? IDENTITIES.google;
   const challenge = param('challenge') === 'on';
+  // An email proof needs local_credentials; a provider proof refuses them.
+  const local = identity.provider === 'email';
+  // GET /auth/browser/methods: local_signup, i.e. a relay exists for the contact email branch.
+  const mail = param('local') !== 'off';
+  const unverified = identity.provider !== 'email' && !identity.email;
+  const contactProblem = mail ? PROBLEMS.contact : P.contactNoMail;
   const sample = { invalid: ['Acme Research', '-Acme_Research'], taken: ['Acme', 'acme'], challenge: ['Acme Research', 'acme-research'] }[preview]
     ?? (preview ? ['Acme Research', 'acme-research'] : ['', '']);
 
@@ -20,13 +27,21 @@
   let human = $state(false);
   let phase = $state(preview === 'creating' ? 'creating' : preview === 'created' ? 'created' : 'idle');
   // Raw: refusals are compared by identity below.
-  let issue = $state.raw(PROBLEMS[preview] ?? null);
+  let issue = $state.raw(preview === 'contact' ? contactProblem : PROBLEMS[preview] ?? null);
+  let username = $state('');
+  let password = $state('');
+  let contactEmail = $state('');
+  let contactSent = $state(false);
+  let contactProven = $state(false);
 
   const nameError = $derived(checked && !name.trim() ? 'Enter a workspace name.' : '');
   const slugProblem = $derived(checked ? slugError(slug) : '');
   const takenSlug = $derived(issue === PROBLEMS.taken);
   // A refusal that ends this attempt leaves nothing to submit.
-  const ended = $derived(issue === PROBLEMS.disabled || issue === PROBLEMS.expired);
+  const ended = $derived(issue === PROBLEMS.disabled || issue === PROBLEMS.expired || issue === P.contactNoMail);
+  const userError = $derived(local && checked && !username.trim() ? 'Enter a username.' : '');
+  const pwError = $derived(local && checked ? passwordError(password) : '');
+  const contactError = $derived(contactSent || !contactEmail ? '' : emailError(contactEmail));
   const busy = $derived(phase !== 'idle');
 
   function rename() {
@@ -42,14 +57,15 @@
   function create(event) {
     event.preventDefault();
     checked = true;
-    if (!name.trim() || slugError(slug)) {
-      document.getElementById(name.trim() ? 'slug' : 'display-name').focus();
+    const first = !name.trim() ? 'display-name' : slugError(slug) ? 'slug' : local && !username.trim() ? 'username' : local && passwordError(password) ? 'password' : '';
+    if (first) {
+      document.getElementById(first).focus();
       return;
     }
     issue = null;
     phase = 'creating';
     setTimeout(() => {
-      const refusal = challenge && !human ? PROBLEMS.challenge : TAKEN.includes(slug) ? PROBLEMS.taken : null;
+      const refusal = challenge && !human ? PROBLEMS.challenge : TAKEN.includes(slug) ? PROBLEMS.taken : unverified && !contactProven ? contactProblem : null;
       if (refusal) {
         issue = refusal;
         phase = 'idle';
@@ -59,14 +75,39 @@
       setTimeout(() => { location.hash = `#/t/${slug}`; }, 1200);
     }, 900);
   }
+
+  // Simulates POST /auth/signup {method:"email", email} with the provider attempt's completion cookie, then
+  // POST /auth/signup/verify: the mailbox is bound to this provider attempt.
+  function sendContact(event) {
+    event.preventDefault();
+    if (emailError(contactEmail)) return document.getElementById('contact-email').focus();
+    contactSent = true;
+  }
+  function contactVerified() {
+    setTimeout(() => { contactProven = true; issue = null; }, 600);
+  }
 </script>
 
 <Entry heading="Name your workspace" {issue}>
   {#if ended}
-    <a class="app-control primary wide" href={issue === PROBLEMS.expired ? '#/signup' : '#/'}>{issue === PROBLEMS.expired ? 'Start again' : 'Sign in to an existing workspace'}</a>
+    <a class="app-control primary wide" href={issue === PROBLEMS.disabled ? '#/' : '#/signup'}>{issue === PROBLEMS.disabled ? 'Sign in to an existing workspace' : 'Start again'}</a>
   {:else}
+    {#if issue === PROBLEMS.contact}
+      {#if contactSent}
+        <CheckEmail address={contactEmail.trim()} onverify={contactVerified} />
+      {:else}
+        <form class="fields" novalidate onsubmit={sendContact} data-testid="contact-branch">
+          <label for="contact-email">Email to confirm</label>
+          <input id="contact-email" class="app-input" type="email" autocomplete="email" bind:value={contactEmail}
+            aria-invalid={contactError ? 'true' : undefined} aria-describedby={contactError ? 'contact-error' : undefined} />
+          {#if contactError}<p class="field-error" id="contact-error">⊘ {contactError}</p>{/if}
+          <button class="app-control wide" type="submit">Send a link</button>
+        </form>
+      {/if}
+    {/if}
+    {#if contactProven}<p class="identity done" role="status" data-testid="contact-proven"><span class="ok">✓</span> Email confirmed. Create the workspace again.</p>{/if}
     <p class="identity" data-testid="identity">
-      Signed in with {PROVIDERS[identity.provider]}{#if identity.email}{' '}as <b>{identity.email}</b>{/if}.
+      {#if local}Email confirmed in this browser. Choose the username and password you will sign in with.{:else}Signed in with {PROVIDERS[identity.provider]}{#if identity.email}{' '}as <b>{identity.email}</b>{/if}.{/if}
     </p>
     <form class="fields" novalidate onsubmit={create}>
       <label for="display-name">Workspace name</label>
@@ -85,6 +126,18 @@
         <p class="field-error">⊘ <code>/t/{slug}</code> belongs to another workspace.</p>
       {/if}
       <p id="slug-hint">3–63 characters: lowercase letters, digits and hyphens, starting and ending with a letter or digit.</p>
+
+      {#if local}
+        <label for="username">Your username</label>
+        <input id="username" class="app-input" name="username" required autocomplete="username" autocapitalize="none" spellcheck="false" readonly={busy}
+          aria-invalid={userError ? 'true' : undefined} aria-describedby={userError ? 'username-error' : undefined} bind:value={username} />
+        {#if userError}<p class="field-error" id="username-error">⊘ {userError}</p>{/if}
+        <label for="password">Your password</label>
+        <input id="password" class="app-input" type="password" name="password" required autocomplete="new-password" readonly={busy}
+          aria-invalid={pwError ? 'true' : undefined} aria-describedby="password-hint{pwError ? ' password-error' : ''}" bind:value={password} />
+        {#if pwError}<p class="field-error" id="password-error">⊘ {pwError}</p>{/if}
+        <p id="password-hint">15 to 128 characters. You sign in to this workspace with this username and password.</p>
+      {/if}
 
       {#if challenge}
         <div class="turnstile" data-testid="turnstile">
@@ -109,29 +162,8 @@
   .identity {
     text-align: center;
   }
-  .identity b {
-    color: var(--text);
-    font-weight: var(--weight-strong);
-    overflow-wrap: anywhere;
-  }
-  code {
-    font: 11px var(--font-mono);
-    color: var(--text);
-    overflow-wrap: anywhere;
-  }
-  /* aria-invalid marks the field; the ⊘ line beneath carries the reason in words. */
-  .app-input[aria-invalid='true'] {
-    border-color: var(--danger);
-  }
-  .app-input[readonly] {
-    opacity: 0.6;
-  }
-  p.field-error,
   p.created {
     color: var(--text);
-  }
-  .ok {
-    color: var(--ok);
   }
   .created {
     text-align: center;

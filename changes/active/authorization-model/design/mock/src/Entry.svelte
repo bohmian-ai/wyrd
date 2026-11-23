@@ -1,7 +1,7 @@
 <!-- The signed-out entry card, as wyrd-ui's src/lib/Entry.svelte: mark, heading, the safe problem, then the page. -->
 <script>
   import logo from '../../../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/logo.svg';
-  import { guidance } from './data.js';
+  import Problem from './Problem.svelte';
   let { heading, issue = null, children } = $props();
 </script>
 
@@ -12,15 +12,7 @@
       <span class="product">WYRD</span>
     </header>
     <h1>{heading}</h1>
-    {#if issue}
-      <div role="alert">
-        <div class="app-problem" id="problem" data-testid="problem" data-state="unauthorized">
-          <strong>⊘ {issue.title}</strong>
-          <p>{guidance(issue)}</p>
-          {#if issue.code}<code>{issue.code}</code>{/if}
-        </div>
-      </div>
-    {/if}
+    {#if issue}<Problem {issue} />{/if}
     {@render children()}
   </div>
 </main>
@@ -95,6 +87,19 @@
   }
   .card :global(.links a) {
     color: var(--muted);
+  }
+  .card :global(.or) {
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
+    align-items: center;
+    gap: 10px;
+    font: 11px var(--font-mono);
+    color: var(--muted);
+  }
+  .card :global(.or)::before,
+  .card :global(.or)::after {
+    content: '';
+    border-top: 1px solid var(--border-soft);
   }
   @media (max-width: 767px) {
     .entry {

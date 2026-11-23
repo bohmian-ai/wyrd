@@ -269,6 +269,63 @@ impl ApplicationMail {
         link: &str,
         proof: &str,
     ) -> Result<(), WyrdError> {
+        let body = format!(
+            "Open this link in the browser where you started creating your Wyrd \
+             workspace:\n\n{link}\n\nOr paste this code there:\n\n{proof}\n\n\
+             It works once and expires in fifteen minutes. If you did not ask to \
+             create a workspace, ignore this message.\n"
+        );
+        self.send_notice(to, "Confirm your email for Wyrd", body)
+            .await
+    }
+
+    /// Mail `to` the link and proof that verify it as the sender's recovery
+    /// address.
+    ///
+    /// # Errors
+    /// As [`Self::send_signup_proof`].
+    pub async fn send_contact_proof(
+        &self,
+        to: &EmailAddress,
+        link: &str,
+        proof: &str,
+    ) -> Result<(), WyrdError> {
+        let body = format!(
+            "Open this link in the browser where you asked to verify this address \
+             for Wyrd account recovery:\n\n{link}\n\nOr paste this code there:\n\n\
+             {proof}\n\nIt works once and expires in fifteen minutes. If you did not \
+             ask for this, ignore this message.\n"
+        );
+        self.send_notice(to, "Verify your recovery email for Wyrd", body)
+            .await
+    }
+
+    /// Tell `to`, a replaced recovery address, that it no longer recovers
+    /// its account. The message names neither the new address nor the
+    /// workspace.
+    ///
+    /// # Errors
+    /// As [`Self::send_signup_proof`].
+    pub async fn send_contact_changed(&self, to: &EmailAddress) -> Result<(), WyrdError> {
+        let body = "The recovery email of your Wyrd account was changed, so this \
+                    address no longer recovers it. If you did not make this change, \
+                    contact your workspace administrator.\n"
+            .to_owned();
+        self.send_notice(to, "Your Wyrd recovery email changed", body)
+            .await
+    }
+
+    /// Send one message through the configured relay.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::AuthVerifyUnavailable`] when no relay is
+    /// configured, it cannot be opened, or it refuses the message.
+    async fn send_notice(
+        &self,
+        to: &EmailAddress,
+        subject: &str,
+        body: String,
+    ) -> Result<(), WyrdError> {
         let unavailable = || WyrdError::AuthVerifyUnavailable {
             message: "email could not be sent; try again later".to_owned(),
             details: json!({ "retry_after_seconds": 60 }),
@@ -281,17 +338,11 @@ impl ApplicationMail {
                 return Err(unavailable());
             }
         };
-        let body = format!(
-            "Open this link in the browser where you started creating your Wyrd \
-             workspace:\n\n{link}\n\nOr paste this code there:\n\n{proof}\n\n\
-             It works once and expires in fifteen minutes. If you did not ask to \
-             create a workspace, ignore this message.\n"
-        );
         relay
-            .send(relay.message(to.delivery.clone(), "Confirm your email for Wyrd", body))
+            .send(relay.message(to.delivery.clone(), subject, body))
             .await
             .map_err(|error| {
-                tracing::warn!(error = %error, "the mail relay refused a signup proof");
+                tracing::warn!(error = %error, "the mail relay refused a message");
                 unavailable()
             })
     }

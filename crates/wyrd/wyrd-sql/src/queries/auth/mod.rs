@@ -41,7 +41,9 @@ pub use browser_sessions::{
     BrowserSessionAuthority, LiveBrowserSession, SocialAnchor, insert_browser_session,
     live_browser_session, revoke_browser_session,
 };
-pub use contacts::insert_verified_contact;
+pub use contacts::{
+    VerifiedContact, insert_verified_contact, replace_verified_contact, verified_contact_for_update,
+};
 pub use device_authorizations::{
     DevicePoll, approve_device_authorization, delete_device_authorization,
     deny_device_authorization, insert_device_authorization, pending_device_authorization,

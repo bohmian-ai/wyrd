@@ -35,9 +35,10 @@ pub use attribution::Attribution;
 pub use browser::{
     BrowserApiKeyRequest, BrowserCredential, BrowserLoginRequest, BrowserLoginResponse,
     BrowserLogoutRequest, BrowserSessionQuery, BrowserSessionView, BrowserSessionsResponse,
-    LocalCredentials, PasswordChangeRequest, PasswordLoginRequest, PasswordResetRequest,
-    PasswordSignupRequest, ProofStatus, ProofStatusResponse, SignupBeginRequest,
-    SignupCompleteRequest, SignupCompleteResponse, SignupVerifyRequest,
+    ContactRequest, ContactVerifyRequest, LocalCredentials, PasswordChangeRequest,
+    PasswordLoginRequest, PasswordResetRequest, PasswordSignupRequest, ProofStatus,
+    ProofStatusResponse, SignupBeginRequest, SignupCompleteRequest, SignupCompleteResponse,
+    SignupVerifyRequest,
 };
 pub use device::{DeviceAuthorization, DeviceAuthorizationRequest, TokenRevocationRequest};
 pub use human_connection::{

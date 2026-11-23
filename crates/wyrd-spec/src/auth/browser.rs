@@ -142,6 +142,31 @@ pub struct SignupVerifyRequest {
     pub proof: SecretBearer,
 }
 
+/// Body of `POST /auth/browser/email/request`: send a proof to the
+/// recovery address the signed-in User wants verified.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ContactRequest {
+    /// The tenant's route key whose session asks.
+    pub tenant: TenantSlug,
+    /// The address to verify, as typed.
+    pub email: String,
+}
+
+/// Body of `POST /auth/browser/email/verify`: the proof a contact message
+/// carried, presented by the session and browser that asked for it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ContactVerifyRequest {
+    /// The tenant's route key whose session verifies.
+    pub tenant: TenantSlug,
+    /// The proof from the message's link fragment, or pasted.
+    #[schemars(with = "String")]
+    pub proof: SecretBearer,
+}
+
 /// Body of `POST /auth/browser/api-key`: recover tenant access with an API
 /// key.
 ///

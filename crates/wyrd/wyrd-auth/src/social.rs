@@ -1281,6 +1281,21 @@ enum SignupEnvelope {
         #[serde(default)]
         attempt: Option<Uuid>,
     },
+    /// A recovery-contact proof sent for a signed-in User.
+    ContactEmail {
+        /// SHA-256 of the proof the message carries.
+        proof_hash: Sha256Hex,
+        /// The User's tenant.
+        tenant: Uuid,
+        /// The User the address is verified for.
+        user: Uuid,
+        /// The address as typed, which becomes the contact.
+        address: String,
+        /// The contact revision the flow was begun against; zero for none.
+        revision: i64,
+        /// Database-clock deadline, in Unix seconds.
+        expires_at: i64,
+    },
 }
 
 /// How long an email signup proof stays usable.
@@ -1314,6 +1329,8 @@ const fn provider_context<'a>(provider: &'a str, client_id: &'a [&'a str]) -> Se
 
 /// Label of the derivation subkey that seals signup flow cookies.
 const ENVELOPE_LABEL: &str = "signup-envelope";
+
+mod contacts;
 
 /// One provider return to redeem: its code and the round-trip values the
 /// redemption must match.

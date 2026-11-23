@@ -5,6 +5,8 @@
 //! nextest selects a surface with `-E 'test(/^<module>::/)'`.
 
 mod pg_admin_principals;
+/// Verified-contact revision history.
+mod pg_auth_contacts;
 mod pg_cards_declare;
 /// Code-review cache metadata: pointer publication, collection claims and context expiry.
 mod pg_code_review_cache;

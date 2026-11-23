@@ -820,6 +820,48 @@ RED is absent authenticated contact request/verify/replace, discovery proof/
 pagination or bounded projection/revalidation. Build the contact revision and
 directory-update owner once here; recovery below consumes its output.
 
+**Cycle 12 evidence (in progress).**
+
+- Scenario 1, authenticated contact request, verify and replace:
+  `platform_admin_e2e::contacts::a_signed_in_user_verifies_and_replaces_a_recovery_contact`
+  (`crates/wyrd/wyrd-server/tests/integration/platform_admin_e2e/contacts.rs`).
+  It covers these cases:
+  - without a relay, a request is refused with 403 `METHOD_UNAVAILABLE` and nothing is mailed;
+  - a request with no session gets 401, and a session older than five minutes gets 403 `RECENT_LOGIN_REQUIRED`;
+  - a fresh session gets 202 `check_email`, a flow cookie that does not hold the proof, and a mail with `#proof=`;
+  - a wrong proof, or the right proof without the flow cookie, gets 401 and stores nothing;
+  - the right proof gives 204 and stores the contact at revision 1; repeating it gives 204 with no change;
+  - a replacement stores revision 2, a flow begun before it gets 401, and the old address receives one notice with no proof and no new address;
+  - the password still signs in.
+  - RED: 401 from the authentication middleware for the unmatched route `/auth/browser/email/request` (the route did not exist).
+  - GREEN: 1 passed.
+  - A first GREEN run panicked in the test's own body reader on the empty 204 body. I changed the local `browser` helper to read bodies leniently, the way `social_call` does. No assertion changed.
+  - Before GREEN I dropped my own unrun assertion that the contact mail omits the slug. REQ-017 forbids workspace names only in discovery mail, and the contact link is `/t/{slug}/contact/verify`.
+- Implementation:
+  - A `ContactEmail` purpose in the sealed envelope carries the proof digest, tenant, User, address, the contact revision the flow began against, and a deadline. Nothing is stored before proof.
+  - Verification is a compare-and-swap on that revision under `FOR UPDATE`, so each proof works once and a flow begun before a replacement verifies nothing. A lost-response replay succeeds only when the current contact is exactly that flow's result.
+  - Owners: `SocialSignIn` (`wyrd-auth/src/social/contacts.rs`), the `verified_contact_for_update` and `replace_verified_contact` queries, and two `ApplicationMail` messages. `send_signup_proof` now shares their send path.
+  - Routes: `POST /auth/browser/email/request` and `/verify`.
+  - My reading: verify needs a live session of the same User, not a recent one, because the proof itself lives 15 minutes.
+- First-contact race (raised by the commit hook before the first commit): `FOR UPDATE` locks nothing when no contact exists, so two flows begun at revision 0 could both succeed. `replace_verified_contact` now updates only `WHERE revision = expected` and returns `None` otherwise.
+  - Proof: `pg_auth_contacts::pg_tests::contact_replacement_takes_effect_only_at_its_expected_revision` (`crates/wyrd/wyrd-sql/tests/integration/pg_auth_contacts.rs`).
+  - Command: `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-sql --test integration -E "test(=pg_auth_contacts::pg_tests::contact_replacement_takes_effect_only_at_its_expected_revision)"'`. GREEN: 1 passed.
+  - Mutation check: without the guard it fails with `(Some(1), Some(2))` against `(Some(1), None)`.
+  - TDD VIOLATED for this fix: the guard was written before its test.
+- Still open in cycle 12:
+  - a second User's session;
+  - contact and discovery admission budgets;
+  - the discovery directory and its revalidation;
+  - removing the old revision's reset proofs (the reset owner is cycle 13).
+- Commands:
+  - the Postgres journey command, with selector `test(=platform_admin_e2e::contacts::a_signed_in_user_verifies_and_replaces_a_recovery_contact)`;
+  - `mise run fmt`;
+  - `cargo clippy --locked -p wyrd-spec -p wyrd-sql -p wyrd-auth -p wyrd-server --features wyrd-server/test-support --all-targets -- -D warnings`;
+  - `mise run codegen:check`;
+  - `mise run check:tenant-isolation`.
+  All are clean.
+- TDD: PASS for scenario 1.
+
 ### 13. Verified contacts support private self-service reset
 
 **Reuses:** Cycle 12 completed contact verification/replacement and cycles 10–12 proof/directory intent, plus cycles 1–5 admission/password/methods; reuse reset redemption.

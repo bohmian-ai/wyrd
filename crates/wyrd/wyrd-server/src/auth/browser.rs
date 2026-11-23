@@ -30,8 +30,9 @@ use wyrd_auth::browser_sessions::{BROWSER_SESSION_TTL, BrowserSessions, CreatedB
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
     BrowserApiKeyRequest, BrowserLoginRequest, BrowserLoginResponse, BrowserLogoutRequest,
-    BrowserSessionQuery, BrowserSessionView, BrowserSessionsResponse, PasswordChangeRequest,
-    PasswordLoginRequest, PasswordResetRequest, PasswordSignupRequest,
+    BrowserSessionQuery, BrowserSessionView, BrowserSessionsResponse, ContactRequest,
+    ContactVerifyRequest, PasswordChangeRequest, PasswordLoginRequest, PasswordResetRequest,
+    PasswordSignupRequest, ProofStatus, ProofStatusResponse,
 };
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::ids::TenantSlug;
@@ -741,18 +742,197 @@ pub async fn password_change(
     require_password(&state, &request.tenant).await?;
     let sessions = browser_sessions(&state)?;
     let tenant = request.tenant.clone();
-    let cookie = session_cookies(&headers)
-        .into_iter()
-        .find_map(|(label, value)| (label.as_ref() == Some(&tenant)).then_some(value))
-        .ok_or_else(|| WyrdError::InvalidToken {
-            message: "no live browser session; sign in again".to_owned(),
-            details: serde_json::json!({ "reason": "browser_session_invalid" }),
-        })?;
-    let session = sessions.resolve(&cookie).await?;
+    let session = sessions
+        .resolve(&tenant_session(&headers, &tenant)?)
+        .await?;
     sessions.password_change(&session, request, source).await?;
     Ok(with_cookies(
         StatusCode::NO_CONTENT,
         vec![clear_session_cookie(&origin, tenant.as_str())],
+        (),
+    ))
+}
+
+/// The value of `tenant`'s session cookie among `headers`.
+///
+/// # Errors
+/// Returns [`WyrdError::InvalidToken`] when the request carries none.
+fn tenant_session(headers: &HeaderMap, tenant: &TenantSlug) -> Result<String, WyrdError> {
+    session_cookies(headers)
+        .into_iter()
+        .find_map(|(label, value)| (label.as_ref() == Some(tenant)).then_some(value))
+        .ok_or_else(|| WyrdError::InvalidToken {
+            message: "no live browser session; sign in again".to_owned(),
+            details: serde_json::json!({ "reason": "browser_session_invalid" }),
+        })
+}
+
+/// Name of the cookie holding a contact verification's sealed flow.
+const CONTACT_COOKIE: &str = "wyrd_contact";
+
+/// Path the contact flow cookie is scoped to.
+const CONTACT_COOKIE_PATH: &str = "/auth/browser/email";
+
+/// Lifetime of the contact flow cookie: the proof's fifteen minutes.
+const CONTACT_COOKIE_MAX_AGE_SECONDS: u64 = 900;
+
+/// The deployment's application mail owner.
+///
+/// # Errors
+/// Returns `503` when application mail is not configured on this server.
+fn application_mail(state: &AppState) -> Result<&wyrd_auth::mail::ApplicationMail, WyrdError> {
+    state
+        .auth
+        .application_mail
+        .as_ref()
+        .ok_or_else(|| WyrdError::AuthVerifyUnavailable {
+            message: "application mail is not configured".to_owned(),
+            details: serde_json::json!({}),
+        })
+}
+
+/// `POST /auth/browser/email/request` — mail a proof of a recovery address
+/// for the signed-in User.
+///
+/// Needs `tenant`'s password or provider session from the last five
+/// minutes and a configured mail relay. Sets the `wyrd_contact` flow cookie
+/// the same browser presents to verify.
+///
+/// # Errors
+/// `401 WYRD_AUTH_401_INVALID_TOKEN` without a live session for `tenant`;
+/// `403 WYRD_AUTH_403_RECENT_LOGIN_REQUIRED` for an older or recovery
+/// session; `403 WYRD_AUTH_403_METHOD_UNAVAILABLE` without a relay;
+/// `400 WYRD_SPEC_400_VALIDATION` for an unparsable address; `503` when
+/// the store, key or relay fails.
+#[utoipa::path(
+    post,
+    path = "/auth/browser/email/request",
+    request_body = ContactRequest,
+    responses(
+        (status = 202, description = "A proof was mailed; the flow cookie is set",
+          body = ProofStatusResponse,
+          headers(("Set-Cookie" = String, description = "The `wyrd_contact` flow cookie"))),
+        (status = 400, description = "Invalid body or address (WYRD_SPEC_400_VALIDATION)",
+          body = WyrdProblem),
+        (status = 401, description = "No live session for the tenant \
+          (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
+        (status = 403, description = "Origin absent or foreign, the sign-in is not recent, or \
+          mail is not configured (WYRD_AUTH_403_ORIGIN_REFUSED, \
+          WYRD_AUTH_403_RECENT_LOGIN_REQUIRED, WYRD_AUTH_403_METHOD_UNAVAILABLE)",
+          body = WyrdProblem),
+        (status = 503, description = "The store, key or relay is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    security(()),
+    tag = "Auth"
+)]
+#[tracing::instrument(level = "debug", skip_all)]
+pub async fn contact_request(
+    State(state): State<AppState>,
+    RequestOrigin(origin): RequestOrigin,
+    headers: HeaderMap,
+    request: Result<Json<ContactRequest>, JsonRejection>,
+) -> Result<Response, WyrdErrorResponse> {
+    let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
+    require_same_origin(&headers, &origin)?;
+    let sessions = browser_sessions(&state)?;
+    let session = sessions
+        .resolve(&tenant_session(&headers, &request.tenant)?)
+        .await?;
+    let flow = social(&state)?
+        .request_contact(
+            &sessions,
+            application_mail(&state)?,
+            &session,
+            &request.tenant,
+            &request.email,
+            &origin,
+        )
+        .await?;
+    Ok(with_cookies(
+        StatusCode::ACCEPTED,
+        vec![cookie_header(
+            &origin,
+            CONTACT_COOKIE,
+            flow.expose_secret(),
+            CONTACT_COOKIE_PATH,
+            CONTACT_COOKIE_MAX_AGE_SECONDS,
+        )],
+        Json(ProofStatusResponse {
+            status: ProofStatus::CheckEmail,
+        }),
+    ))
+}
+
+/// `POST /auth/browser/email/verify` — make the address a contact message
+/// was sent to the signed-in User's verified recovery contact.
+///
+/// The browser presents its `wyrd_contact` flow cookie, `tenant`'s session
+/// for the same User and the proof from the message. The address replaces
+/// any earlier contact, which is told of the change.
+///
+/// # Errors
+/// `401 WYRD_AUTH_401_INVALID_TOKEN` without a live session for `tenant`;
+/// `401 WYRD_AUTH_401_ONE_TIME_CODE_INVALID` for a missing, foreign or
+/// stale flow or a wrong proof; `400` once expired; `503` when the store
+/// or key fails.
+#[utoipa::path(
+    post,
+    path = "/auth/browser/email/verify",
+    request_body = ContactVerifyRequest,
+    responses(
+        (status = 204, description = "The address is the verified contact; the flow cookie is \
+          cleared", headers(("Set-Cookie" = String, description = "The cleared flow cookie"))),
+        (status = 400, description = "Invalid body, or the proof expired \
+          (WYRD_SPEC_400_VALIDATION, WYRD_AUTH_400_INVALID_STATE)", body = WyrdProblem),
+        (status = 401, description = "No live session, or no usable flow or proof \
+          (WYRD_AUTH_401_INVALID_TOKEN, WYRD_AUTH_401_ONE_TIME_CODE_INVALID)",
+          body = WyrdProblem),
+        (status = 403, description = "Origin absent or foreign \
+          (WYRD_AUTH_403_ORIGIN_REFUSED)", body = WyrdProblem),
+        (status = 503, description = "The store or key is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    security(()),
+    tag = "Auth"
+)]
+#[tracing::instrument(level = "debug", skip_all)]
+pub async fn contact_verify(
+    State(state): State<AppState>,
+    RequestOrigin(origin): RequestOrigin,
+    headers: HeaderMap,
+    request: Result<Json<ContactVerifyRequest>, JsonRejection>,
+) -> Result<Response, WyrdErrorResponse> {
+    let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
+    require_same_origin(&headers, &origin)?;
+    let sessions = browser_sessions(&state)?;
+    let session = sessions
+        .resolve(&tenant_session(&headers, &request.tenant)?)
+        .await?;
+    let mut flows = cookie_pairs(&headers).filter(|(name, _)| *name == CONTACT_COOKIE);
+    let flow = match (flows.next(), flows.next()) {
+        (Some((_, value)), None) => Some(value),
+        _ => None,
+    };
+    social(&state)?
+        .verify_contact(
+            &sessions,
+            application_mail(&state)?,
+            &session,
+            &request.tenant,
+            flow,
+            &request.proof,
+        )
+        .await?;
+    Ok(with_cookies(
+        StatusCode::NO_CONTENT,
+        vec![cookie_header(
+            &origin,
+            CONTACT_COOKIE,
+            "",
+            CONTACT_COOKIE_PATH,
+            0,
+        )],
         (),
     ))
 }

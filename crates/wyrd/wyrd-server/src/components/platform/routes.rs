@@ -32,10 +32,11 @@ use wyrd_spec::auth::{SecretBearer, TokenRequest, TokenResponse, TokenType};
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::request_id::RequestId;
 
+use crate::auth::RequestOrigin;
 use crate::auth::oauth::{OAuthError, OAuthForm, TOKEN_EXCHANGE, no_store};
 use crate::components::auth::PlatformCaller;
 use crate::components::platform::builtins::BuiltinTables;
-use crate::components::platform::provisioning::{ProvisionError, TenantProvisioning};
+use crate::components::platform::provisioning::{LocalAdmin, ProvisionError, TenantProvisioning};
 use crate::components::platform::recovery::TenantRecovery;
 use crate::http::error::{WyrdErrorResponse, internal_failure, path_rejection};
 use crate::state::AppState;
@@ -213,11 +214,18 @@ fn not_configured() -> WyrdErrorResponse {
     })
 }
 
-/// Provision a tenant and return its one-time administrative credential.
+/// Provision a tenant and return its one-time administrative credential,
+/// creating the requested named human administrator beside it.
+///
+/// The human administrator is validated before the claim, so a refused
+/// username, password or email claims nothing. It signs in at this request's
+/// origin under `/t/{slug}/login`; only a request naming one needs a usable
+/// `Host`.
 ///
 /// # Errors
-/// Returns a stable Wyrd error when the caller is unauthorized, the slug is
-/// taken, the platform plane is unconfigured, or provisioning fails.
+/// Returns a stable Wyrd error when the human administrator is invalid, the
+/// caller is unauthorized, the slug is taken, the platform plane is
+/// unconfigured, or provisioning fails.
 #[utoipa::path(
     post,
     path = "/platform/tenants",
@@ -225,6 +233,7 @@ fn not_configured() -> WyrdErrorResponse {
     responses(
         (status = 200, description = "Provisioned tenant and its one-time administrative credential",
          body = CreateTenantResponse),
+        (status = 400, description = "Human administrator username, password or email refused (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
         (status = 403, description = "Tenant creation not granted (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 409, description = "Slug already in use by a live tenant (WYRD_SPEC_409_CONFLICT)", body = WyrdProblem),
@@ -232,13 +241,23 @@ fn not_configured() -> WyrdErrorResponse {
     ),
     tag = "Platform"
 )]
-#[tracing::instrument(level = "info", skip(state, caller, request))]
+#[tracing::instrument(level = "info", skip(state, caller, origin, request))]
 async fn create_tenant(
     State(state): State<AppState>,
     caller: PlatformCaller,
+    origin: Result<RequestOrigin, WyrdErrorResponse>,
     Json(request): Json<CreateTenantRequest>,
 ) -> Result<Json<CreateTenantResponse>, WyrdErrorResponse> {
     let provisioning = directory(&state)?;
+    let human_admin = match &request.human_admin {
+        Some(human) => {
+            // Only a human administrator needs the origin it signs in at.
+            let RequestOrigin(origin) = origin?;
+            let login_url = format!("{origin}t/{}/login", request.slug);
+            Some(LocalAdmin::admit(human, login_url).await?)
+        }
+        None => None,
+    };
 
     // Two phases because the tenant id is only settled by the directory claim:
     // a resumed attempt adopts the failed attempt's id. The connection is
@@ -252,7 +271,7 @@ async fn create_tenant(
     let conn = state.postgres.tenant_conn(tenant_id).await;
 
     provisioning
-        .provision(&caller, tenant_id, request, conn)
+        .provision(&caller, tenant_id, request, human_admin, conn)
         .await
         .map(Json)
         .map_err(provision_error)

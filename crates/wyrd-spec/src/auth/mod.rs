@@ -74,8 +74,9 @@ pub use social::{
     SocialProviderTestResponse, SocialProviderView, SocialProvidersResponse,
 };
 pub use tenant_admin::{
-    CreateTenantRequest, CreateTenantResponse, ProvisionedTenant, ProvisionedTenantAdmin,
-    RecoverTenantAdminRequest, SetTenantStatusRequest, TenantListResponse,
+    CreateTenantRequest, CreateTenantResponse, ProvisionedHumanAdmin, ProvisionedTenant,
+    ProvisionedTenantAdmin, RecoverTenantAdminRequest, SetTenantStatusRequest, TenantHumanAdmin,
+    TenantListResponse,
 };
 pub use tenant_principals::{
     AccountAuthentication, CREDENTIAL_CURSOR_MAX_BYTES, CREDENTIAL_PAGE_DEFAULT,

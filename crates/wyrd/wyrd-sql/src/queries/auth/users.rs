@@ -98,7 +98,8 @@ pub struct LocalCredentialRow {
 }
 
 /// Insert a new active local User with canonical `username` and the PHC
-/// `password_hash` verifier, at password revision zero.
+/// `password_hash` verifier, at password revision zero, and the optional
+/// unverified profile `email`. A profile email is never a verified contact.
 ///
 /// Advances the tenant's authorization revision in the same transaction, so
 /// every replica's authority cache reloads the changed account or credential.
@@ -111,18 +112,20 @@ pub async fn insert_local_user(
     id: Uuid,
     username: &str,
     password_hash: &str,
+    email: Option<&str>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         r"
         INSERT INTO wyrd.auth_users (
-            id, data_tenant_id, username, password_hash, auth_type, status
-        ) VALUES ($1, $2, $3, $4, 'password', 'active')
+            id, data_tenant_id, username, password_hash, email, auth_type, status
+        ) VALUES ($1, $2, $3, $4, $5, 'password', 'active')
         ",
     )
     .bind(id)
     .bind(conn.data_tenant_id().as_uuid())
     .bind(username)
     .bind(password_hash)
+    .bind(email)
     .execute(&mut **conn.transaction())
     .await?;
     super::advance_authorization_revision(conn).await?;

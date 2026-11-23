@@ -361,7 +361,7 @@ pub async fn create_local_user(
     assignments: &[ScopedRoleAssignment],
 ) -> Result<Uuid, WyrdError> {
     let user_id = Uuid::now_v7();
-    insert_local_user(conn, user_id, username, verifier)
+    insert_local_user(conn, user_id, username, verifier, None)
         .await
         .map_err(enrollment_error)?;
     bind_assignments(conn, user_subject(user_id), assignments).await?;
@@ -374,6 +374,23 @@ fn user_subject(id: Uuid) -> SubjectColumns {
         user_id: Some(id),
         ..SubjectColumns::default()
     }
+}
+
+/// Whether `address` is a plausible bare email address: at most 254 bytes, a
+/// non-empty local part and a dotted domain, without whitespace, control
+/// characters or display-name punctuation.
+#[must_use]
+pub fn is_email_address(address: &str) -> bool {
+    address.len() <= 254
+        && address.split_once('@').is_some_and(|(local, domain)| {
+            !local.is_empty()
+                && !domain.contains('@')
+                && domain.split('.').count() > 1
+                && domain.split('.').all(|label| !label.is_empty())
+        })
+        && !address
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || "<>,;:\\\"()[]".contains(c))
 }
 
 /// The trimmed invitation `recipients`, refused as a whole unless there are 1
@@ -401,17 +418,7 @@ pub fn invitation_recipients(recipients: &[String]) -> Result<Vec<String>, WyrdE
         .iter()
         .map(|raw| {
             let address = raw.trim();
-            let plausible = address.len() <= 254
-                && address.split_once('@').is_some_and(|(local, domain)| {
-                    !local.is_empty()
-                        && !domain.contains('@')
-                        && domain.split('.').count() > 1
-                        && domain.split('.').all(|label| !label.is_empty())
-                })
-                && !address
-                    .chars()
-                    .any(|c| c.is_whitespace() || c.is_control() || "<>,;:\\\"()[]".contains(c));
-            if !plausible {
+            if !is_email_address(address) {
                 return Err(refuse(format!("{address:?} is not an email address")));
             }
             if !seen.insert(address.to_ascii_lowercase()) {
@@ -542,7 +549,7 @@ impl BrowserSessions {
         let verifier = hash_password(password).await?;
         let mut conn = postgres.tenant_conn(tenant).await.map_err(store_error)?;
         let user_id = Uuid::now_v7();
-        insert_local_user(&mut conn, user_id, &username, &verifier)
+        insert_local_user(&mut conn, user_id, &username, &verifier, None)
             .await
             .map_err(enrollment_error)?;
         self.redeem_invitation(&mut conn, &code, user_id).await?;

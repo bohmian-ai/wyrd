@@ -85,7 +85,7 @@ metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 rand = { workspace = true }
 regex = { workspace = true }
-rustix = { workspace = true }
+rustix = { workspace = true, features = ["termios"] }
 secrecy = { workspace = true, features = ["serde"] }
 serde = { workspace = true }
 schemars = { workspace = true }

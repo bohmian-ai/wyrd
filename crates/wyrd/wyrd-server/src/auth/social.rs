@@ -534,6 +534,7 @@ pub async fn signup_complete(
     let tenant_request = CreateTenantRequest {
         slug: request.slug.clone(),
         display_name: request.display_name,
+        human_admin: None,
     };
     let provisioned = match provisioning.claim_for_signup(&owner, &tenant_request).await {
         Ok(tenant) => {

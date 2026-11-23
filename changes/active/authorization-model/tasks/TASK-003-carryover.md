@@ -700,50 +700,63 @@ Machine-only administrative creation may still omit human-admin input.
 repository Postgres and existing platform provisioning journey. RED is setup's
 absent required human-admin input/result; use existing lifecycle fault seams.
 
-**Where work stopped (cycle 11, in progress):** cycles 1–10 are committed with evidence.
-Cycle 11 has only its journey test, committed red on purpose:
+**Cycle 11 evidence.** Journey
+`platform_admin_e2e::setup::setup_creates_a_named_human_admin_without_smtp_or_an_idp`
+(`crates/wyrd/wyrd-server/tests/integration/platform_admin_e2e/setup.rs`), committed red in
+b7206eafe.
 
-- **The test:** `platform_admin_e2e::setup::setup_creates_a_named_human_admin_without_smtp_or_an_idp`
-  in `crates/wyrd/wyrd-server/tests/integration/platform_admin_e2e/setup.rs`.
-- **RED observed:** it fails at its first step (`setup.rs:180`). `wyrd-server setup --tenant acme`
-  without `--admin-username` succeeds today; it should fail before claiming anything. No
-  production code for cycle 11 has been written.
-
-The remaining plan follows spec REQ-002 (setup) and the API table row "Existing platform tenant
-creation and settings".
-
-1. **Spec types** (`crates/wyrd-spec/src/auth/tenant_admin.rs`):
-   - `CreateTenantRequest` gains optional `human_admin: {username, password: SecretBearer,
-     email?}`, with `serde(default, skip_serializing_if)`.
-   - `CreateTenantResponse` gains optional `human_admin: {principal_id, username, login_url}`.
-     It never carries the password.
-   - Update the struct literals in `wyrd-cli/src/platform/tenant.rs`, `wyrd-server/src/main.rs`
-     and `wyrd-server/src/auth/social.rs:508` to `human_admin: None`, except setup.
-2. **Handler** `create_tenant` (`components/platform/routes.rs`):
-   - Validate before the claim, so a refusal claims nothing: `canonical_username` and
-     `new_password` (`wyrd-auth/src/passwords.rs`), then `hash_password`.
-   - Add the `RequestOrigin` extractor and build `login_url = origin/t/{slug}/login`.
-3. **Provisioning** (`components/platform/provisioning.rs`):
-   - The operator path carries an optional local human admin into
-     `establish_tenant_administration`.
-   - In the same tenant transaction as the bootstrap admin, insert the local User, with the
-     optional email as unverified profile email and no `auth_user_contacts` row, and grant it
-     `admin`. `insert_local_user` gains an `email: Option<&str>` parameter (3 callers).
-   - On resume, keep an existing `first_local_user` and do not reset its password. Activation
-     stays last, so an interrupted setup never activates ownerless.
-4. **Setup flags** (`wyrd-server/src/main.rs` `SetupArgs`/`setup`): `--admin-username`
-   (required), `--admin-password-stdin`, `--admin-email`.
-   - Without the stdin flag, use a hidden terminal prompt. No prompt crate is installed; use
-     the terminal's no-echo mode, or refuse when stdin is not a terminal. The test expects
-     stderr to name `--admin-password-stdin` in that case.
-   - Validate everything before `root_credential`/claim.
-   - Print `admin_username:` and `login_url:` beside the existing `admin_credential:`. Never
-     print the password.
-   - A completed rerun keeps today's "already set up" path.
-5. **Verify and record:** run the test, then the cycle 10 lane command plus
-   `test(/^platform_admin_e2e::setup::/)`, clippy, `codegen:check`, `docs:generate` +
-   `docs:check` (the OpenAPI shape changes) and `check:tenant-isolation`. Then record the
-   evidence here.
+- **RED:** step 1 (`setup.rs:180`): `wyrd-server setup --tenant acme` without
+  `--admin-username` succeeded. That is the missing behavior, not a setup failure.
+- **GREEN:** the same selector passes (1/1). It proves each case:
+  - missing username (clap), no terminal without `--admin-password-stdin`, and a policy-refused
+    password all fail, and `acme` has no directory row (`setup.rs:177-188`);
+  - an activation fault leaves `acme` inactive with at most one User. The rerun with
+    `WYRD_PLATFORM_CREDENTIAL` gives one active tenant, one admin-role User `founder` whose
+    profile email is unverified and who has no `auth_user_contacts` row, prints
+    `admin_credential`, `admin_username` and `login_url` (`/t/acme/login`), and never
+    prints the password in any output (`setup.rs:190-250`);
+  - password sign-in approves a real `wyrd-cli` device code, and the redeemed token reads
+    `founder` from `/v1/principals/me` (`setup.rs:252-309`);
+  - a completed rerun prints "already set up", discloses no key, adds no admin and keeps the
+    original password (`setup.rs:311-327`);
+  - machine-only `POST /platform/tenants` returns no `human_admin` (`setup.rs:329-345`).
+- **Implementation:**
+  - `CreateTenantRequest.human_admin: Option<TenantHumanAdmin>` and
+    `CreateTenantResponse.human_admin: Option<ProvisionedHumanAdmin>` (`wyrd-spec`
+    `tenant_admin.rs`). The response never carries the password.
+  - `create_tenant` validates through `LocalAdmin::admit` before the claim:
+    `canonical_username`, `new_password`, the shared `is_email_address` (extracted from
+    `invitation_recipients`), then `hash_password`. Only a request with a human admin needs
+    `RequestOrigin`.
+  - The operator path (`TenantOwner::Bootstrap(Option<&LocalAdmin>)`) inserts the User and its
+    admin grant in the bootstrap admin's tenant transaction. A resume keeps `first_local_user`
+    without resetting its password. Activation stays last.
+  - `insert_local_user` takes `email: Option<&str>`, and its 3 existing callers pass `None`.
+  - Setup gains `--admin-username` (required), `--admin-password-stdin` and
+    `--admin-email`. Input is checked with `LocalAdmin::check` before `root_credential`.
+    Without the stdin flag, setup prompts with echo off (rustix `termios`, already in the
+    resolved feature set; POSIX on macOS and Linux) and refuses when stdin is not a terminal.
+- **Reuse:** the provisioning owner, its resume path, the password policy, the device flow and
+  `RequestOrigin` are reused. There is no new owner and no migration.
+- **Diagnosis (lane regression, fixed):**
+  - Symptom: 40 `platform_admin_e2e` tests got `400` from `POST /platform/tenants`.
+  - Evidence: the request metric shows `status="400"` with no `create_tenant` span. The test
+    helper `platform_post` sends no `Host`.
+  - Cause: the new `RequestOrigin` extractor refused the request before the handler ran.
+  - Fix site: `create_tenant` takes `Result<RequestOrigin, _>` and requires it only for a
+    human admin. No other caller is affected.
+- **TDD: PASS.**
+- **Commands:**
+  - the selector above;
+  - `cargo nextest run --locked -p wyrd-auth -p wyrd-sql -p wyrd-auth-oidc -p wyrd-cli -p
+    wyrd-server --features wyrd-server/test-support --lib --test integration --no-fail-fast -E
+    'kind(lib) | test(/^platform_admin_e2e::/) | test(/^pg_browser_sessions::/) |
+    test(/social|login|openapi|signup|config|github/)'` (1232/1233; the one failure is below);
+  - `mise run fmt`, `mise run lints`, `codegen:check`, `docs:generate` (no diff),
+    `docs:check` and `check:tenant-isolation` are clean.
+- **Open:** `components::gateway::pg_administration_tests::gateway_managed_secret_renewal_keeps_the_key_and_loses_races`
+  fails intermittently (1 of 3 isolated runs) outside this cycle's write set. The
+  diagnostician's report is below.
 
 After cycle 11: cycles 12–20 as listed below; cycle 15 is the UI mock gate.
 

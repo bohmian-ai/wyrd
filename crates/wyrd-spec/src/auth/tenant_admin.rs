@@ -15,6 +15,39 @@ pub struct CreateTenantRequest {
     pub slug: TenantSlug,
     /// Human-readable tenant name.
     pub display_name: String,
+    /// A named local human administrator to create beside the administrative
+    /// service account. Setup requires it; machine-only administrative
+    /// creation omits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_admin: Option<TenantHumanAdmin>,
+}
+
+/// A tenant's first local human administrator, signing in with a password
+/// and needing neither SMTP nor an identity provider.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct TenantHumanAdmin {
+    /// The tenant-local username, canonicalized by the server.
+    pub username: String,
+    /// The password, held to the tenant password policy. Never returned.
+    #[schemars(with = "String")]
+    pub password: SecretBearer,
+    /// An optional profile email. It stays unverified and is not a contact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+}
+
+/// The local human administrator provisioning created or kept.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ProvisionedHumanAdmin {
+    /// The administrator User's principal id.
+    pub principal_id: PrincipalId,
+    /// Its canonical username.
+    pub username: String,
+    /// Where the administrator signs in with that username and password.
+    pub login_url: String,
 }
 
 /// The tenant that was provisioned.
@@ -54,6 +87,9 @@ pub struct CreateTenantResponse {
     pub tenant: ProvisionedTenant,
     /// Its administrative principal and one-time credential.
     pub admin: ProvisionedTenantAdmin,
+    /// The named human administrator, when the request asked for one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_admin: Option<ProvisionedHumanAdmin>,
 }
 
 /// Request to restore administrative access to a tenant.

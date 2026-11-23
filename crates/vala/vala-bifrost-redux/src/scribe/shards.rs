@@ -551,6 +551,8 @@ pub struct TenantTableRoundRobin<T> {
     pending_by_tenant: HashMap<DataTenantId, TenantTableQueues<T>>,
     /// Tenants with at least one pending request, in service order.
     active_tenants: VecDeque<DataTenantId>,
+    /// Queued requests across every level.
+    len: usize,
 }
 
 /// One tenant's table queues and its table-level rotation.
@@ -594,6 +596,7 @@ impl<T> Default for TenantTableRoundRobin<T> {
         Self {
             pending_by_tenant: HashMap::new(),
             active_tenants: VecDeque::new(),
+            len: 0,
         }
     }
 }
@@ -612,6 +615,7 @@ impl<T: ShardItem> TenantTableRoundRobin<T> {
         let queue = queues.by_table.entry(table.clone()).or_default();
         let table_was_idle = queue.is_empty();
         queue.push_back(item);
+        self.len += 1;
         if table_was_idle {
             queues.active_tables.push_back(table);
         }
@@ -672,6 +676,7 @@ impl<T: ShardItem> TenantTableRoundRobin<T> {
                 continue;
             };
             batches.insert((tenant, item.table().clone(), item.batch_id()));
+            self.len -= 1;
             result.push(item);
             if queues.active_tables.is_empty() {
                 self.pending_by_tenant.remove(&tenant);
@@ -708,6 +713,12 @@ impl<T: ShardItem> TenantTableRoundRobin<T> {
             return Some(item);
         }
         None
+    }
+
+    /// Counts the queued requests at every level.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
     }
 
     /// Reports whether the shard has no queued requests at any level.
@@ -1545,6 +1556,7 @@ impl ShardOwner {
             }
             let idle = self.pipeline.is_idle();
             let pressure_waits = self.pressure_receiver.has_changed().unwrap_or(false) && !idle;
+            let collected = self.pipeline.collection.deadline();
             let wake = tokio::select! {
                 biased;
                 (meta, done) = GroupPipeline::stage_done(&mut self.pipeline.older) => {
@@ -1557,6 +1569,8 @@ impl ShardOwner {
                 changed = self.pressure_receiver.changed(), if !detached && !pressure_waits => {
                     ShardWake::Pressure(changed.is_ok())
                 }
+                () = tokio::time::sleep_until(collected.unwrap_or_else(tokio::time::Instant::now)),
+                    if collected.is_some() => ShardWake::Collected,
             };
             match wake {
                 ShardWake::Stage(slot, meta, done) => {
@@ -1566,7 +1580,7 @@ impl ShardOwner {
                 }
                 ShardWake::Command(Some(command)) => self.route_command(command).await,
                 ShardWake::Command(None) | ShardWake::Pressure(false) => detached = true,
-                ShardWake::Pressure(true) => {}
+                ShardWake::Pressure(true) | ShardWake::Collected => {}
             }
         }
     }
@@ -3821,6 +3835,49 @@ enum ShardWake {
     Command(Option<ShardCommand>),
     /// The pressure signal changed (`true`) or its sender closed (`false`).
     Pressure(bool),
+    /// The collecting group's deadline passed.
+    Collected,
+}
+
+/// Requests at which a group collected beside a dispatched group stops
+/// waiting for arrivals.
+const COLLECTION_TARGET: usize = 32;
+
+/// Longest a group collected beside a dispatched group waits for arrivals,
+/// measured from its first collected request.
+const COLLECTION_WAIT: Duration = Duration::from_millis(1);
+
+/// Times the group the free slot collects while another group is dispatched.
+///
+/// An idle shard dispatches at once. Beside a dispatched group, a group
+/// below [`COLLECTION_TARGET`] waits for arrivals until [`COLLECTION_WAIT`]
+/// after its first collected request; later arrivals never move that
+/// deadline. The deadline clears only when the group dispatches.
+#[derive(Debug, Default)]
+struct GroupCollection {
+    /// When the collecting group dispatches regardless of its size.
+    deadline: Option<tokio::time::Instant>,
+}
+
+impl GroupCollection {
+    /// Reports whether the collected group dispatches now, starting its
+    /// deadline at its first collected request.
+    fn due(&mut self, queued: usize, overlapping: bool, now: tokio::time::Instant) -> bool {
+        if queued == 0 {
+            return false;
+        }
+        let deadline = *self.deadline.get_or_insert(now + COLLECTION_WAIT);
+        let due = !overlapping || queued >= COLLECTION_TARGET || now >= deadline;
+        if due {
+            self.deadline = None;
+        }
+        due
+    }
+
+    /// The collecting group's deadline, when it has one.
+    fn deadline(&self) -> Option<tokio::time::Instant> {
+        self.deadline
+    }
 }
 
 /// The shard's bounded two-group write pipeline.
@@ -3842,6 +3899,8 @@ struct GroupPipeline {
     deferred: VecDeque<ShardCommand>,
     /// Layouts the dispatched groups chose.
     layouts: LayoutChoices,
+    /// Timing of the group the free slot collects.
+    collection: GroupCollection,
 }
 
 impl GroupPipeline {
@@ -4083,12 +4142,22 @@ impl ShardOwner {
             self.dispatch_logged(group).await;
             return true;
         }
+        let overlapping = !self.pipeline.is_idle();
+        // ponytail: queued counts requests a dispatched group's identity
+        // holds back, so a collision may re-arm the deadline until it settles.
+        if !self.pipeline.collection.due(
+            self.scheduler.len(),
+            overlapping,
+            tokio::time::Instant::now(),
+        ) {
+            return false;
+        }
         let mut group = self.scheduler.pop_group(&self.pipeline.held_identities());
         self.scheduler.record_closed(&group);
         if group.is_empty() {
             return false;
         }
-        if !self.pipeline.is_idle() {
+        if overlapping {
             match self.rotation_trigger(&group, self.pipeline.pending_bytes()) {
                 Ok(None) => {}
                 Ok(Some(rotation_trigger)) => {
@@ -10779,6 +10848,59 @@ mod tests {
             quiet_order, expected_order,
             "cross-drain rotation must not reorder a tenant's own arrivals"
         );
+    }
+
+    /// An idle shard dispatches at once; beside a dispatched group, a short
+    /// group waits only until one fixed deadline after its first collected
+    /// request, and a group at the soft target dispatches without waiting.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an idle or full group waits, when a short overlapping
+    /// group dispatches before its deadline, or when an arrival or an empty
+    /// queue moves the deadline.
+    #[test]
+    fn group_collection_waits_once_from_its_first_request() {
+        let start = tokio::time::Instant::now();
+        let mut collection = GroupCollection::default();
+        assert!(
+            collection.due(1, false, start),
+            "an idle shard dispatches at once"
+        );
+        assert!(
+            !collection.due(0, true, start),
+            "nothing collected dispatches nothing"
+        );
+        assert_eq!(
+            collection.deadline(),
+            None,
+            "an empty queue starts no deadline"
+        );
+
+        let first = start + COLLECTION_WAIT;
+        assert!(
+            !collection.due(1, true, first),
+            "a short overlapping group waits"
+        );
+        assert_eq!(collection.deadline(), Some(first + COLLECTION_WAIT));
+        let arrival = first + COLLECTION_WAIT / 2;
+        assert!(!collection.due(5, true, arrival));
+        assert_eq!(
+            collection.deadline(),
+            Some(first + COLLECTION_WAIT),
+            "later arrivals never move the deadline"
+        );
+        assert!(
+            collection.due(5, true, first + COLLECTION_WAIT),
+            "the deadline dispatches a short group"
+        );
+        assert_eq!(collection.deadline(), None, "dispatch clears the deadline");
+
+        assert!(
+            collection.due(COLLECTION_TARGET, true, arrival),
+            "a group at the soft target dispatches without waiting"
+        );
+        assert_eq!(collection.deadline(), None);
     }
 
     /// A table whose next request a dispatched group still owns is skipped

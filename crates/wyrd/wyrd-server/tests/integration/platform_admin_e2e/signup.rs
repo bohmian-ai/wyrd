@@ -94,6 +94,18 @@ async fn signup_server_with(
     google: &wiremock::MockServer,
     social: wyrd_server::config::SocialConfig,
 ) -> (WyrdTestServer, String) {
+    let (srv, session, _) = rooted_signup_server(google, social).await;
+    (srv, session)
+}
+
+/// [`signup_server_with`], also returning the platform root credential.
+///
+/// # Panics
+/// As [`signup_server`].
+async fn rooted_signup_server(
+    google: &wiremock::MockServer,
+    social: wyrd_server::config::SocialConfig,
+) -> (WyrdTestServer, String, secrecy::SecretString) {
     let srv = WyrdTestServer::builder()
         .with_social_endpoints_for_test(social)
         .with_trusted_ingress_for_test(&[INGRESS], CLIENT_HEADER)
@@ -123,7 +135,7 @@ async fn signup_server_with(
     )
     .await;
     assert_eq!(status, StatusCode::OK, "signup enables: {changed}");
-    (srv, session)
+    (srv, session, root)
 }
 
 /// A browser request from TCP `peer`, naming `client` in the ingress header
@@ -1979,7 +1991,8 @@ async fn siteverify(cloudflare: &wiremock::MockServer, token: &str, status: u16,
 ///      email proof's verification each answer
 ///      `WYRD_AUTH_503_VERIFY_UNAVAILABLE` and record no admission window,
 ///      and a Google sign-in to an existing workspace refuses alike at its
-///      return, creating no User, identity, session or grant;
+///      start, setting no cookie and creating no User, identity, session or
+///      grant;
 ///   2. a workspace administrator still signs in there with a password.
 ///
 /// # Panics
@@ -2075,38 +2088,25 @@ async fn signup_refuses_without_its_derivation_key() {
         assert_eq!(windows().await, before, "{case} records no window");
     }
 
-    // A tenant Google sign-in keeps its pending state server-side; its
-    // return needs the derivation key and refuses as unavailable, signing
-    // nobody in.
-    let begun = begin_google_login(&keyless, "keyless").await;
-    mount_platform_provider(
-        &google,
-        platform_key_set("google-key"),
-        identity_token_reply_with(
-            &google.uri(),
-            &begun.query["nonce"],
-            "wyrd-google",
-            "google-key",
-            "google-keyless",
-            "google-keyless@example.test",
-            true,
-        ),
+    // A tenant Google sign-in start is admitted by a pseudonymous window,
+    // which needs the derivation key, so it refuses and records nothing.
+    let records = local_records(&superuser).await;
+    let (status, headers, body) = start_sign_in(
+        &keyless,
+        "/auth/browser/login",
+        Some("198.51.100.142"),
+        &json!({ "tenant": "keyless", "provider": "google" }),
     )
     .await;
-    let records = local_records(&superuser).await;
-    let (status, location) =
-        finish_google_login(&keyless, &begun, Some(&begun.cookie), &google.uri()).await;
-    assert_eq!(
-        status,
-        StatusCode::SERVICE_UNAVAILABLE,
-        "social sign-in refuses"
-    );
-    assert!(location.is_none(), "no session redirect");
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["code"], "WYRD_AUTH_503_VERIFY_UNAVAILABLE");
+    assert!(headers.get(header::SET_COOKIE).is_none(), "no login cookie");
     assert_eq!(
         local_records(&superuser).await,
         records,
         "nothing is created"
     );
+    assert_eq!(windows().await, before, "the start records no window");
 
     // 2. Password sign-in does not need the derivation key.
     let (status, signed_in, body) = email_step(
@@ -2120,6 +2120,297 @@ async fn signup_refuses_without_its_derivation_key() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(signed_in.is_some());
+}
+
+/// One JSON sign-in start at `uri` through [`INGRESS`] naming `client`, or
+/// naming nobody when `None`; returns the status, headers and body.
+async fn start_sign_in(
+    srv: &WyrdTestServer,
+    uri: &str,
+    client: Option<&str>,
+    body: &Value,
+) -> (StatusCode, HeaderMap, Value) {
+    let resp = srv
+        .oneshot(from_peer(Method::POST, uri, "10.0.0.9", client, body))
+        .await
+        .expect("sign-in start responds");
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    (status, headers, body_json(resp).await)
+}
+
+/// One CLI device authorization start for `tenant` through [`INGRESS`]
+/// naming `client`; returns the status, headers and RFC 6749 body.
+async fn start_device(
+    srv: &WyrdTestServer,
+    tenant: &str,
+    client: &str,
+) -> (StatusCode, HeaderMap, Value) {
+    let resp = srv
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/auth/device_authorization")
+                .header(header::HOST, SOCIAL_HOST)
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header(CLIENT_HEADER, client)
+                .extension(axum::extract::ConnectInfo(SocketAddr::new(
+                    "10.0.0.9".parse().expect("peer address"),
+                    40_000,
+                )))
+                .body(Body::from(format!("client_id=wyrd-cli&tenant={tenant}")))
+                .expect("request builds"),
+        )
+        .await
+        .expect("device start responds");
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    (status, headers, body_json(resp).await)
+}
+
+/// Pending sign-in rows across every tenant: login transactions and device
+/// authorizations.
+async fn pending_sign_ins(superuser: &sqlx::PgPool) -> i64 {
+    count(
+        superuser,
+        "SELECT (SELECT count(*) FROM wyrd.auth_login_state) \
+              + (SELECT count(*) FROM wyrd.auth_device_authorizations)",
+    )
+    .await
+}
+
+/// A flood of unauthenticated sign-in starts from one source records only a
+/// counter:
+///   1. company SSO, social and device starts, including for an unknown
+///      tenant, share one window per source; the 301st is refused on every
+///      start route with `429` and a whole-second `Retry-After`
+///      (`WYRD_AUTH_429_SIGN_IN_ATTEMPTS`, or `temporarily_unavailable` on
+///      the device endpoint), and adds no pending row, cookie or provider
+///      request;
+///   2. another replica counts in the same window;
+///   3. another source still starts and completes a Google sign-in;
+///   4. the refused source may still start a signup, and a source refused by
+///      signup may still start a sign-in;
+///   5. a start whose source cannot be derived, or on a replica without the
+///      derivation key, refuses with `503` and records nothing, while
+///      password and platform root sign-in still work there.
+///
+/// # Panics
+/// Panics when a start is admitted or refused differently, or records state.
+#[tokio::test(flavor = "multi_thread")]
+async fn sign_in_starts_are_admitted_per_source() {
+    let google = wiremock::MockServer::start().await;
+    let (srv, _, root) = rooted_signup_server(
+        &google,
+        wyrd_server::config::SocialConfig {
+            google_issuer: Some(google.uri()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    let creator = prove_signup(&srv, &google, "google-flood").await;
+    let (status, body, _) = complete_signup(&srv, &creator, "flood", [198, 51, 100, 150]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let flooder = Some("203.0.113.5");
+
+    // 1. Unknown-tenant starts are counted like any other.
+    for start in 0..300 {
+        let (status, _, body) = if start % 3 == 2 {
+            start_device(&srv, "no-such-tenant", "203.0.113.5").await
+        } else {
+            start_sign_in(
+                &srv,
+                "/auth/browser/login",
+                flooder,
+                &json!({ "tenant": "no-such-tenant" }),
+            )
+            .await
+        };
+        assert_ne!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "start {start}: {body}"
+        );
+    }
+    let pending = pending_sign_ins(&superuser).await;
+    let discoveries = google
+        .received_requests()
+        .await
+        .map_or(0, |seen| seen.len());
+    for (case, uri, body) in [
+        (
+            "company SSO",
+            "/auth/browser/login",
+            json!({ "tenant": "flood" }),
+        ),
+        (
+            "social",
+            "/auth/browser/login",
+            json!({ "tenant": "flood", "provider": "google" }),
+        ),
+        (
+            "platform OIDC",
+            "/auth/platform/login",
+            json!({ "redirect_uri": format!("http://{SOCIAL_HOST}/platform/callback") }),
+        ),
+    ] {
+        let (status, headers, body) = start_sign_in(&srv, uri, flooder, &body).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{case}: {body}");
+        assert_eq!(body["code"], "WYRD_AUTH_429_SIGN_IN_ATTEMPTS", "{case}");
+        assert!(stated_wait(&headers, &body) > 0, "{case} states its wait");
+        assert!(
+            headers.get(header::SET_COOKIE).is_none(),
+            "{case} sets no cookie"
+        );
+    }
+    let (status, headers, body) = start_device(&srv, "flood", "203.0.113.5").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "device: {body}");
+    assert_eq!(body["error"], "temporarily_unavailable");
+    assert_eq!(body["code"], "WYRD_AUTH_429_SIGN_IN_ATTEMPTS");
+    let wait: u64 = headers
+        .get(header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+        .expect("the device refusal states its wait");
+    assert!((1..=3600).contains(&wait), "{wait}");
+    assert_eq!(
+        pending_sign_ins(&superuser).await,
+        pending,
+        "refusals record nothing"
+    );
+    assert_eq!(
+        google
+            .received_requests()
+            .await
+            .map_or(0, |seen| seen.len()),
+        discoveries,
+        "refusals contact no provider"
+    );
+
+    // 2. Another replica shares the count.
+    let twin = srv
+        .start_replica(
+            WyrdTestServer::builder()
+                .with_trusted_ingress_for_test(&[INGRESS], CLIENT_HEADER)
+                .with_kms_for_test(srv.kms_config_for_test().clone()),
+        )
+        .await
+        .expect("a replica starts");
+    let (status, _, body) = start_sign_in(
+        &twin,
+        "/auth/browser/login",
+        flooder,
+        &json!({ "tenant": "flood" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "replica: {body}");
+
+    // 3. Another source signs in to the same workspace.
+    let begun = begin_google_login(&srv, "flood").await;
+    mount_platform_provider(
+        &google,
+        platform_key_set("google-key"),
+        identity_token_reply_with(
+            &google.uri(),
+            &begun.query["nonce"],
+            "wyrd-google",
+            "google-key",
+            "google-flood",
+            "google-flood@example.test",
+            true,
+        ),
+    )
+    .await;
+    let (status, location) =
+        finish_google_login(&srv, &begun, Some(&begun.cookie), &google.uri()).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let location = location.expect("the sign-in redirects");
+    assert!(!location.contains("login="), "signed in: {location}");
+
+    // 4. Sign-in and signup windows are separate.
+    let (status, _, body) = start_signup(&srv, "10.0.0.9", flooder).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the flooder may still sign up: {body}"
+    );
+    let signup_flooder = Some("203.0.113.77");
+    starts_until_throttled(&srv, "10.0.0.9", signup_flooder).await;
+    let (status, _, body) = start_sign_in(
+        &srv,
+        "/auth/browser/login",
+        signup_flooder,
+        &json!({ "tenant": "flood", "provider": "google" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a signup flooder may still sign in: {body}"
+    );
+
+    // 5. Without a source or the derivation key, starts refuse.
+    let (status, _, body) = start_sign_in(
+        &srv,
+        "/auth/browser/login",
+        None,
+        &json!({ "tenant": "flood" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "no source: {body}");
+    assert_eq!(body["code"], "WYRD_AUTH_503_VERIFY_UNAVAILABLE");
+    let keys = srv
+        .kms_config_for_test()
+        .key_dir
+        .clone()
+        .expect("the journey server uses a file key directory");
+    let keyless = srv
+        .start_replica(
+            WyrdTestServer::builder()
+                .with_trusted_ingress_for_test(&[INGRESS], CLIENT_HEADER)
+                .with_kms_for_test(kms(&keys, FOREIGN_KEY, &[])),
+        )
+        .await
+        .expect("a replica without the wrapping keys starts");
+    let pending = pending_sign_ins(&superuser).await;
+    let fresh = Some("203.0.113.99");
+    for (case, uri, body) in [
+        (
+            "company SSO",
+            "/auth/browser/login",
+            json!({ "tenant": "flood" }),
+        ),
+        (
+            "platform OIDC",
+            "/auth/platform/login",
+            json!({ "redirect_uri": format!("http://{SOCIAL_HOST}/platform/callback") }),
+        ),
+    ] {
+        let (status, headers, body) = start_sign_in(&keyless, uri, fresh, &body).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{case}: {body}");
+        assert_eq!(body["code"], "WYRD_AUTH_503_VERIFY_UNAVAILABLE", "{case}");
+        assert_eq!(
+            headers
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1"),
+            "{case} is retryable"
+        );
+    }
+    let (status, headers, body) = start_device(&keyless, "flood", "203.0.113.99").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "device: {body}");
+    assert_eq!(body["error"], "temporarily_unavailable");
+    assert!(headers.get(header::RETRY_AFTER).is_none());
+    assert_eq!(
+        pending_sign_ins(&superuser).await,
+        pending,
+        "nothing is recorded"
+    );
+    platform_session(&keyless, secrecy::ExposeSecret::expose_secret(&root)).await;
 }
 
 /// With a Turnstile challenge configured, browser workspace creation needs a

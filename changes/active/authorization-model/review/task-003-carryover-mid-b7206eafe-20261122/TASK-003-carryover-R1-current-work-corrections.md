@@ -81,3 +81,22 @@ No broad `gate`, full journey aggregate, benchmark, new diagnostic subsystem or 
 Keep independent tenant Users/credentials/grants/sessions; local verified-email and provider-subject creator namespaces; exact provider revision/purpose/browser bindings; no pre-proof pending signup row; optional browser-only challenge after admission/before claim; promotion only after human administration; nonblocking audit; tenant-qualified RLS and PostgreSQL-owned coordination time. Reuse existing auth/mail/claim/session/maintenance owners. Do not add a compatibility path, global person, second provisioning engine, new rate limiter, mail queue or provider token store.
 
 Cycle 11 and cycles 12–20 remain in the original task, including the mock gate, remaining client/MCP projections, retirement delivery/evidence limit and live-provider proof. Do not relabel those as independently found defects, accept their outcomes through these fixes, or implement them as hidden remediation scope. Preserve the recorded TDD violations of cycles 1, 7 step 4b and 9; they are historical process facts, not requests to manufacture RED.
+
+**REQ-020 / AC-015 (spec revision 9, maintainer-directed into this work):**
+Sign-in starts are admitted per source before they record anything.
+`SocialSignIn::admit_sign_in` reuses signup's admission counters under a new
+`sign_in` scope, and the browser, platform OIDC and device start handlers call
+it first. Evidence: `platform_admin_e2e::signup::sign_in_starts_are_admitted_per_source`
+(flood, shared replica count, other source completes, separate signup windows,
+no-source and keyless `503`, password and platform root unaffected) and
+`signup_refuses_without_its_derivation_key` (start refuses at `503`). Three
+journeys that pinned absolute Transit/envelope counts now compare before and
+after, because the first sign-in start seals the derivation key once; a
+read-only diagnostician confirmed that cause before the assertions changed.
+`setup::setup_creates_a_named_human_admin_without_smtp_or_an_idp` fails with
+and without this change (intentional RED for pending setup flags). TDD:
+VIOLATED (production code preceded the journey). Commands: lints, fmt,
+codegen:check, migrations idempotent, server unit slice 16/16,
+`platform_admin_e2e::` 97/101 before the count fixes and the four fixed
+selectors 4/4 after, `identity_e2e`/`pg_openapi_contract`/`methods` 28/28,
+`test:identity:journey` pass.

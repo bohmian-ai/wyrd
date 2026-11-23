@@ -204,7 +204,7 @@ impl Derivation {
 /// unavailable for `reason`.
 fn unavailable(reason: &str) -> WyrdError {
     WyrdError::AuthVerifyUnavailable {
-        message: "signup and social sign-in are unavailable right now; try again".to_owned(),
+        message: "sign-in and signup are unavailable right now; try again".to_owned(),
         details: json!({ "reason": reason }),
     }
 }

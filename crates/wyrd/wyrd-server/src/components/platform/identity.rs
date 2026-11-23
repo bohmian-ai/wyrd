@@ -48,7 +48,9 @@ use wyrd_sql::queries::platform::principals::{
 };
 use wyrd_sql::{OperatorPool, SqlError, TenantConn};
 
+use crate::auth::source::RequestSource;
 use crate::components::auth::PlatformCaller;
+use crate::components::platform::social::admit_sign_in;
 use wyrd_sql::queries::platform::principal_grants::set_platform_grant_tx;
 
 use crate::boot::init::platform_administrator_grant;
@@ -818,8 +820,12 @@ fn login_service(state: &AppState) -> Result<&PlatformLogin, WyrdErrorResponse> 
 
 /// Begin a platform federated login.
 ///
+/// The start is first counted in its source's sign-in window, so a refused
+/// start records no login state.
+///
 /// # Errors
-/// Returns a stable Wyrd error when federated login is not configured, the
+/// Returns a stable Wyrd error when the source's sign-in window is exhausted
+/// or the start cannot be admitted, federated login is not configured, the
 /// provider cannot be reached, or the login state cannot be persisted.
 #[utoipa::path(
     post,
@@ -829,8 +835,11 @@ fn login_service(state: &AppState) -> Result<&PlatformLogin, WyrdErrorResponse> 
         (status = 200, description = "Provider authorization URL and opaque state",
          body = LoginInitResponse),
         (status = 404, description = "Federated login is not configured (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem),
-        (status = 503, description = "Identity provider unavailable \
-          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem),
+        (status = 429, description = "Too many sign-in starts from this source \
+          (WYRD_AUTH_429_SIGN_IN_ATTEMPTS)", body = WyrdProblem,
+          headers(("Retry-After" = u64, description = "Seconds until the window ends"))),
+        (status = 503, description = "Identity provider unavailable, or the start cannot be \
+          admitted (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem),
         (status = 500, description = "A platform store read or write failed \
           (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
@@ -842,8 +851,10 @@ fn login_service(state: &AppState) -> Result<&PlatformLogin, WyrdErrorResponse> 
 #[tracing::instrument(level = "info", skip(state, request))]
 async fn begin_login(
     State(state): State<AppState>,
+    RequestSource(source): RequestSource,
     Json(request): Json<PlatformLoginRequest>,
 ) -> Result<Json<LoginInitResponse>, WyrdErrorResponse> {
+    admit_sign_in(&state, source).await?;
     login_service(&state)?
         .begin(request.redirect_uri)
         .await

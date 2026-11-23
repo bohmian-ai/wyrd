@@ -49,6 +49,8 @@ pub enum SignupAdmissionScope {
     Source,
     /// The proven identity.
     Identity,
+    /// The trusted source of an unauthenticated sign-in start.
+    SignIn,
 }
 
 impl SignupAdmissionScope {
@@ -59,6 +61,7 @@ impl SignupAdmissionScope {
             Self::Address => "address",
             Self::Source => "source",
             Self::Identity => "identity",
+            Self::SignIn => "sign_in",
         }
     }
 }

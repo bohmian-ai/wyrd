@@ -1133,14 +1133,16 @@ async fn removing_a_key_refuses_its_envelopes_until_it_is_restored() {
         json!({ "mode": "routine" }),
     )
     .await;
-    // Each tenant owner's renewal already resealed it; the pass moves the rest.
+    // Each tenant owner's renewal already resealed it, and the first platform
+    // sign-in start sealed the derivation key under k2; the pass moves the
+    // rest.
     assert_eq!(
         (
             &restored["current"],
             &restored["changed"],
             &restored["remaining"]
         ),
-        (&json!(4), &json!(1), &json!(0)),
+        (&json!(5), &json!(1), &json!(0)),
         "{restored}"
     );
     srv.shutdown().await.expect("server shuts down");

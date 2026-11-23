@@ -58,7 +58,7 @@ CREATE INDEX platform_signup_attempts_expires_at
     ON platform.signup_attempts (expires_at);
 
 CREATE TABLE platform.signup_admissions (
-    scope         TEXT        NOT NULL CHECK (scope IN ('start', 'address', 'source', 'identity')),
+    scope         TEXT        NOT NULL CHECK (scope IN ('start', 'address', 'source', 'identity', 'sign_in')),
     key           BYTEA       NOT NULL CHECK (length(key) = 32),
     window_start  TIMESTAMPTZ NOT NULL,
     attempts      INTEGER     NOT NULL CHECK (attempts > 0),

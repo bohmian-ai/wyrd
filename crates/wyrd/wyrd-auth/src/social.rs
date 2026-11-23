@@ -1210,6 +1210,9 @@ const SIGNUP_SOURCE_ATTEMPTS: i32 = 20;
 /// Workspace creations admitted per provider identity in one window.
 const SIGNUP_IDENTITY_ATTEMPTS: i32 = 5;
 
+/// Unauthenticated sign-in starts admitted per trusted source in one window.
+const SIGN_IN_START_ATTEMPTS: i32 = 300;
+
 /// Length of one signup admission window.
 const SIGNUP_WINDOW: std::time::Duration = std::time::Duration::from_hours(1);
 
@@ -1430,6 +1433,41 @@ impl SocialSignIn {
             authorization_url: authorization.url,
             binding,
         })
+    }
+
+    /// Count one unauthenticated sign-in start from `source` in its shared
+    /// per-source window, before the start records anything.
+    ///
+    /// Company SSO, social, invitation, platform OIDC and device starts all
+    /// count in the one window of their source, separate from signup's
+    /// windows; the window key is a pseudonym, never the address.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::SignInAttempts`] with `retry_after_seconds`
+    /// while the window is exhausted, and [`WyrdError::AuthVerifyUnavailable`]
+    /// when the source is unknown or the derivation key or admission state is
+    /// unavailable, which refuses rather than admits.
+    pub async fn admit_sign_in(&self, source: Option<std::net::IpAddr>) -> Result<(), WyrdError> {
+        let source = source.ok_or_else(source_unknown)?;
+        let key = self
+            .pseudonym("sign_in", crate::admission::source_key(source).as_bytes())
+            .await?;
+        let refused = admit_signup(
+            &self.operator,
+            SignupAdmissionScope::SignIn,
+            &key,
+            SIGN_IN_START_ATTEMPTS,
+            SIGNUP_WINDOW,
+        )
+        .await
+        .map_err(store_error)?;
+        match refused {
+            None => Ok(()),
+            Some(wait) => Err(WyrdError::SignInAttempts {
+                message: "too many sign-in starts; wait before retrying".to_owned(),
+                details: json!({ "retry_after_seconds": wait.as_secs() }),
+            }),
+        }
     }
 
     /// Begin a public workspace signup by proving the mailbox `typed`, from
@@ -2130,7 +2168,7 @@ fn credentials_refused(message: &str) -> WyrdError {
     }
 }
 
-/// A signup request whose trusted source cannot be determined, which no
+/// A signup or sign-in start whose trusted source cannot be determined, which no
 /// per-source window could count.
 /// The admission value of a provider identity: its issuer namespace and
 /// subject, length-delimited so no two identities share one.
@@ -2144,7 +2182,7 @@ fn identity_value(issuer: &str, subject: &str) -> Vec<u8> {
 
 fn source_unknown() -> WyrdError {
     WyrdError::AuthVerifyUnavailable {
-        message: "this request's source cannot be determined, so signup cannot admit it".to_owned(),
+        message: "this request's source cannot be determined, so it cannot be admitted".to_owned(),
         details: json!({ "reason": "source_unknown" }),
     }
 }

@@ -70,6 +70,29 @@ pub(crate) fn social(state: &AppState) -> Result<&SocialSignIn, WyrdErrorRespons
     })
 }
 
+/// Admit one unauthenticated sign-in start from `source` before it records
+/// anything (see [`SocialSignIn::admit_sign_in`]).
+///
+/// # Errors
+/// Returns [`WyrdError::SignInAttempts`] while the source's window is
+/// exhausted, and [`WyrdError::AuthVerifyUnavailable`] when admission cannot
+/// run, including without the platform plane.
+pub(crate) async fn admit_sign_in(
+    state: &AppState,
+    source: Option<std::net::IpAddr>,
+) -> Result<(), WyrdError> {
+    let social =
+        state
+            .auth
+            .social_sign_in
+            .as_ref()
+            .ok_or_else(|| WyrdError::AuthVerifyUnavailable {
+                message: "sign-in starts cannot be admitted without the platform plane".to_owned(),
+                details: serde_json::json!({ "reason": "admission_unavailable" }),
+            })?;
+    social.admit_sign_in(source).await
+}
+
 /// The process application-mail owner.
 ///
 /// # Errors

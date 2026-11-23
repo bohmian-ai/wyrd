@@ -1992,6 +1992,8 @@ async fn platform_sign_in_opens_its_client_secret_through_vault_transit_across_r
     confidential_platform_sign_in(&srv, &provider).await;
     let opened = transit.requests("decrypt").await;
     assert!(opened >= 1, "the sign-in opened the secret through Transit");
+    // The first sign-in start also seals the platform derivation key once.
+    let sealed = transit.requests("encrypt").await;
 
     // 3. The restarted process opens the committed envelope again.
     let srv = Box::pin(srv.restart_bound(WyrdTestServer::builder()))
@@ -2002,7 +2004,11 @@ async fn platform_sign_in_opens_its_client_secret_through_vault_transit_across_r
         transit.requests("decrypt").await > opened,
         "the restarted process opened the secret through Transit"
     );
-    assert_eq!(transit.requests("encrypt").await, 1, "nothing was resealed");
+    assert_eq!(
+        transit.requests("encrypt").await,
+        sealed,
+        "nothing was resealed"
+    );
 
     srv.shutdown().await.expect("server shuts down");
 }
@@ -2089,7 +2095,9 @@ async fn renewing_platform_connection_encryption_keeps_its_sign_in() {
     );
     confidential_platform_sign_in(&srv, &provider).await;
 
-    // A key outage refuses the renewal and changes nothing.
+    // A key outage refuses the renewal and changes nothing. The sign-in
+    // start above sealed the platform derivation key once.
+    let sealed = transit.requests("encrypt").await;
     transit.set_available(false);
     let resp = renew().await.expect("renew route responds");
     transit.set_available(true);
@@ -2100,7 +2108,7 @@ async fn renewing_platform_connection_encryption_keeps_its_sign_in() {
     );
     assert_eq!(
         transit.requests("encrypt").await,
-        2,
+        sealed,
         "the outage resealed nothing"
     );
     confidential_platform_sign_in(&srv, &provider).await;

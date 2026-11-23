@@ -652,6 +652,21 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// Too many unauthenticated sign-in starts from this source in the
+    /// current fixed window; the start recorded nothing.
+    #[error("[WYRD_AUTH_429_SIGN_IN_ATTEMPTS] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_429_SIGN_IN_ATTEMPTS",
+        status = 429,
+        title = "Too many sign-in starts",
+        remediation = "Wait `details.retry_after_seconds` until the fixed sign-in window ends, then start the sign-in again."
+    )]
+    SignInAttempts {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// The proven identity already owns the deployment's owned-workspace cap
     /// of signup-created workspaces that are not retired. Waiting does not
     /// clear it.
@@ -4213,6 +4228,7 @@ impl WyrdError {
             | Self::PasswordInvalid { message, details }
             | Self::PasswordAttempts { message, details }
             | Self::SignupAttempts { message, details }
+            | Self::SignInAttempts { message, details }
             | Self::SignupWorkspaceLimit { message, details }
             | Self::SignupChallenge { message, details }
             | Self::OneTimeCodeInvalid { message, details }
@@ -5178,6 +5194,10 @@ mod tests {
             },
             WyrdError::SignupAttempts {
                 message: "too many workspace signups".to_owned(),
+                details: serde_json::json!({ "retry_after_seconds": 3600 }),
+            },
+            WyrdError::SignInAttempts {
+                message: "too many sign-in starts".to_owned(),
                 details: serde_json::json!({ "retry_after_seconds": 3600 }),
             },
             WyrdError::SignupWorkspaceLimit {

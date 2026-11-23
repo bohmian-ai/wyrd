@@ -40,7 +40,7 @@ use wyrd_spec::request_id::RequestId;
 use crate::auth::social::available_methods;
 use crate::auth::source::RequestSource;
 use crate::auth::{RequestOrigin, auth_not_configured};
-use crate::components::platform::social::social;
+use crate::components::platform::social::{admit_sign_in, social};
 use crate::http::error::{WyrdErrorResponse, body_rejection};
 use crate::state::AppState;
 
@@ -201,11 +201,14 @@ pub(crate) fn request_id(request_id: Option<Extension<RequestId>>) -> RequestId 
 /// binding in the `wyrd_login` cookie, scoped to that flow's callback and
 /// living as long as the login state. The provider callback completes the
 /// sign-in only for the browser presenting that binding. The response
-/// carries the provider authorization URL the browser navigates to.
+/// carries the provider authorization URL the browser navigates to. The
+/// start is first counted in its source's sign-in window, so a refused start
+/// records nothing.
 ///
 /// # Errors
 /// `403 WYRD_AUTH_403_ORIGIN_REFUSED` without this deployment's exact
-/// `Origin`; `401 WYRD_AUTH_401_INVALID_TOKEN` for an unknown tenant or one
+/// `Origin`; `429 WYRD_AUTH_429_SIGN_IN_ATTEMPTS` with `Retry-After` while
+/// the source's window is exhausted; `401 WYRD_AUTH_401_INVALID_TOKEN` for an unknown tenant or one
 /// without an Active connection, indistinguishably; `503
 /// WYRD_AUTH_503_DISCOVERY_UNAVAILABLE` or `WYRD_AUTH_503_VERIFY_UNAVAILABLE`
 /// when the provider or store is unavailable.
@@ -221,9 +224,12 @@ pub(crate) fn request_id(request_id: Option<Extension<RequestId>>) -> RequestId 
           (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
         (status = 403, description = "Origin absent or foreign, or the method is not offered \
           (WYRD_AUTH_403_ORIGIN_REFUSED, WYRD_AUTH_403_METHOD_UNAVAILABLE)", body = WyrdProblem),
-        (status = 503, description = "The identity provider or store is unavailable \
-          (WYRD_AUTH_503_DISCOVERY_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)",
-          body = WyrdProblem)
+        (status = 429, description = "Too many sign-in starts from this source \
+          (WYRD_AUTH_429_SIGN_IN_ATTEMPTS)", body = WyrdProblem,
+          headers(("Retry-After" = u64, description = "Seconds until the window ends"))),
+        (status = 503, description = "The identity provider or store is unavailable, or the \
+          start cannot be admitted (WYRD_AUTH_503_DISCOVERY_UNAVAILABLE, \
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
     security(()),
     tag = "Auth"
@@ -233,10 +239,12 @@ pub async fn login(
     State(state): State<AppState>,
     RequestOrigin(origin): RequestOrigin,
     headers: HeaderMap,
+    RequestSource(source): RequestSource,
     request: Result<Json<BrowserLoginRequest>, JsonRejection>,
 ) -> Result<Response, WyrdErrorResponse> {
     let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
     require_same_origin(&headers, &origin)?;
+    admit_sign_in(&state, source).await?;
     let sessions = browser_sessions(&state)?;
     let (begun, path) = match request.provider {
         None => (
@@ -948,10 +956,12 @@ mod pg_tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     use wyrd_auth::connections::HumanConnections;
+    use wyrd_auth::social::{SocialEndpoints, SocialSignIn};
     use wyrd_auth_issue::IssuingKey;
     use wyrd_auth_oidc::ScreenedHttp;
     use wyrd_auth_verify::Kid;
     use wyrd_dev_fixtures::pg::{PgFixture, seed_active_human_connection};
+    use wyrd_kms::{KmsBackendKind, KmsConfig, WyrdKms};
     use wyrd_spec::auth::{BrowserLoginResponse, Sha256Hex};
     use wyrd_spec::error::WyrdError;
     use wyrd_storage::{LocalSigner, StorageHandle};
@@ -1029,6 +1039,22 @@ mod pg_tests {
                     ScreenedHttp::allowing_internal(),
                     audit,
                 )),
+                social_sign_in: Some(SocialSignIn::new(
+                    fixture.operator_pool().clone(),
+                    Some(Arc::new(
+                        WyrdKms::new(
+                            &KmsConfig {
+                                backend: Some(KmsBackendKind::Memory),
+                                active_key: Some("dev".to_owned()),
+                                ..KmsConfig::default()
+                            },
+                            false,
+                        )
+                        .expect("memory facade builds"),
+                    )),
+                    ScreenedHttp::allowing_internal(),
+                    SocialEndpoints::default(),
+                )),
                 ..ServerAuth::default()
             }
         })
@@ -1046,6 +1072,10 @@ mod pg_tests {
             .with_state(state)
             .oneshot(
                 Request::post("/auth/browser/login")
+                    .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                        [198, 51, 100, 7],
+                        443,
+                    ))))
                     .header(header::HOST, "wyrd.example.com")
                     .header("x-forwarded-proto", "https")
                     .header(header::ORIGIN, origin)

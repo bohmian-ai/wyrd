@@ -16,8 +16,8 @@ use serde::Deserialize;
 use wyrd_auth::browser_sessions::BrowserSession;
 use wyrd_auth::cli_logins::{CliLogins, DEVICE_VERIFICATION_PATH};
 use wyrd_spec::auth::{
-    DeviceAuthorization, DeviceAuthorizationRequest, OAuthClientId, OAuthErrorResponse,
-    TokenRevocationRequest,
+    DeviceAuthorization, DeviceAuthorizationRequest, OAuthClientId, OAuthErrorCode,
+    OAuthErrorResponse, TokenRevocationRequest,
 };
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::ids::TenantSlug;
@@ -26,7 +26,9 @@ use wyrd_sql::row_types::auth::HumanLoginAnchor;
 
 use crate::auth::browser::{browser_sessions, session_cookies};
 use crate::auth::oauth::{ClientForm, OAuthError, OAuthForm, no_store};
+use crate::auth::source::RequestSource;
 use crate::auth::{RequestOrigin, auth_not_configured};
+use crate::components::platform::social::admit_sign_in;
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
@@ -51,12 +53,17 @@ pub(crate) fn cli_logins(state: &AppState) -> Result<CliLogins, WyrdError> {
 ///
 /// The public client `wyrd-cli` identifies itself with `client_id`; another
 /// client is `unauthorized_client`. Like `POST /auth/browser/login` it
-/// appends no audit event: it evaluates no principal permission.
+/// appends no audit event: it evaluates no principal permission, and it is
+/// first counted in its source's sign-in window, so a refused start records
+/// no device authorization.
 ///
 /// # Errors
 /// Answers the RFC 6749 §5.2 body for a malformed request, an unidentified
 /// or other client, and every refusal of [`CliLogins::authorize`]: an
-/// unknown tenant or one without SSO is `invalid_request`.
+/// unknown tenant or one without SSO is `invalid_request`. An exhausted
+/// sign-in window answers `429` `temporarily_unavailable` with
+/// `Retry-After`; a start that cannot be admitted is `503`
+/// `temporarily_unavailable`.
 #[utoipa::path(
     post,
     path = "/auth/device_authorization",
@@ -70,6 +77,9 @@ pub(crate) fn cli_logins(state: &AppState) -> Result<CliLogins, WyrdError> {
           a tenant without SSO, or `unauthorized_client`",
           body = OAuthErrorResponse),
         (status = 401, description = "`invalid_client`", body = OAuthErrorResponse),
+        (status = 429, description = "`temporarily_unavailable`: too many sign-in starts \
+          from this source", body = OAuthErrorResponse,
+          headers(("Retry-After" = u64, description = "Seconds until the window ends"))),
         (status = 500, description = "`server_error`", body = OAuthErrorResponse),
         (status = 503, description = "`temporarily_unavailable`", body = OAuthErrorResponse)
     ),
@@ -83,15 +93,45 @@ pub async fn device_authorization(
     State(state): State<AppState>,
     RequestOrigin(origin): RequestOrigin,
     headers: HeaderMap,
+    RequestSource(source): RequestSource,
     form: OAuthForm,
 ) -> Result<Response, OAuthError> {
     let OAuthClientId::WyrdCli = crate::auth::oauth::require_client(&headers, &form)?;
     let request: DeviceAuthorizationRequest = form.decode()?;
+    match admit_sign_in(&state, source).await {
+        Ok(()) => {}
+        Err(error @ WyrdError::SignInAttempts { .. }) => return Ok(slow_start(&error)),
+        Err(error) => return Err(OAuthError::request(error)),
+    }
     let device = cli_logins(&state)?
         .authorize(&request.tenant, &origin)
         .await
         .map_err(OAuthError::request)?;
     Ok(no_store(StatusCode::OK, Json(device)))
+}
+
+/// The `429` RFC 6749 §5.2 refusal of a device start whose source's
+/// sign-in window is exhausted (`error`): `temporarily_unavailable` with its
+/// Wyrd code and `Retry-After` set to the whole seconds until the window
+/// ends.
+fn slow_start(error: &WyrdError) -> Response {
+    tracing::info!(wyrd_code = error.code(), %error, "device start refused");
+    let mut response = no_store(
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(OAuthErrorResponse {
+            error: OAuthErrorCode::TemporarilyUnavailable,
+            error_description: None,
+            code: Some(error.code().to_owned()),
+        }),
+    );
+    if let WyrdError::SignInAttempts { details, .. } = error
+        && let Some(seconds) = details["retry_after_seconds"].as_u64()
+    {
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from(seconds));
+    }
+    response
 }
 
 /// Query of the verification page: the tenant, and the user code when the

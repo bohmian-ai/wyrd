@@ -19,17 +19,17 @@ use super::{
 const INGRESS: &str = "10.0.0.0/8";
 
 /// The header that ingress names the visitor in.
-const CLIENT_HEADER: &str = "CF-Connecting-IP";
+pub(super) const CLIENT_HEADER: &str = "CF-Connecting-IP";
 
 /// The administrator's password.
-const PASSWORD: &str = "amber kestrel lantern";
+pub(super) const PASSWORD: &str = "amber kestrel lantern";
 
 /// A server behind [`INGRESS`] with tenant `slug`, whose `admin` signs in
 /// with [`PASSWORD`], and its operator session.
 ///
 /// # Panics
 /// Panics when the server, operator session or tenant cannot be set up.
-async fn contact_server(slug: &str) -> (WyrdTestServer, String) {
+pub(super) async fn contact_server(slug: &str) -> (WyrdTestServer, String) {
     let (srv, session) = bare_server().await;
     add_tenant(&srv, &session, slug).await;
     (srv, session)
@@ -76,7 +76,7 @@ async fn add_tenant(srv: &WyrdTestServer, operator: &str, slug: &str) {
 }
 
 /// Point the deployment's mail relay at the test Mailpit; returns its API.
-async fn relay_to_mailpit(srv: &WyrdTestServer, session: &str) -> String {
+pub(super) async fn relay_to_mailpit(srv: &WyrdTestServer, session: &str) -> String {
     let (host, port, api) = mailpit();
     let (status, relay) = social_call(
         srv,
@@ -95,7 +95,7 @@ async fn relay_to_mailpit(srv: &WyrdTestServer, session: &str) -> String {
 /// A same-origin browser `POST` of `body` to `uri` through the ingress,
 /// carrying `cookies`; returns the status, the value of the `Set-Cookie`
 /// named `set`, and the body.
-async fn browser(
+pub(super) async fn browser(
     srv: &WyrdTestServer,
     uri: &str,
     cookies: &[&str],
@@ -160,15 +160,20 @@ async fn browser_from(
 
 /// Sign `admin` in to `slug` with [`PASSWORD`]; returns its session
 /// cookie pair.
-async fn sign_in(srv: &WyrdTestServer, slug: &str) -> String {
-    sign_in_as(srv, slug, "admin", PASSWORD).await
+pub(super) async fn sign_in(srv: &WyrdTestServer, slug: &str) -> String {
+    sign_in_as(srv, slug, "admin", PASSWORD)
+        .await
+        .expect("a password session")
 }
 
-/// Sign `username` in to `slug` with `password`; returns the session cookie.
-///
-/// # Panics
-/// Panics when the sign-in is refused.
-async fn sign_in_as(srv: &WyrdTestServer, slug: &str, username: &str, password: &str) -> String {
+/// Sign `username` in to `slug` with `password`; returns its session
+/// cookie pair, or the refusal's status.
+pub(super) async fn sign_in_as(
+    srv: &WyrdTestServer,
+    slug: &str,
+    username: &str,
+    password: &str,
+) -> Result<String, StatusCode> {
     let resp = srv
         .oneshot(
             Request::builder()
@@ -190,13 +195,15 @@ async fn sign_in_as(srv: &WyrdTestServer, slug: &str, username: &str, password: 
         )
         .await
         .expect("login responds");
-    assert_eq!(resp.status(), StatusCode::OK);
-    session_cookie(&resp, slug).expect("a password session")
+    if resp.status() != StatusCode::OK {
+        return Err(resp.status());
+    }
+    Ok(session_cookie(&resp, slug).expect("a password session"))
 }
 
 /// The proof the newest message to `address` carries in its link fragment,
 /// and that message's text.
-async fn mailed_proof(api: &str, address: &str) -> (String, String) {
+pub(super) async fn mailed_proof(api: &str, address: &str) -> (String, String) {
     let mail = mail_to(api, address).await;
     let (_, _, _, text) = mail.first().expect("a message arrived");
     let proof = text
@@ -209,7 +216,7 @@ async fn mailed_proof(api: &str, address: &str) -> (String, String) {
 }
 
 /// `slug`'s verified contacts: address and revision.
-async fn contacts(superuser: &sqlx::PgPool, slug: &str) -> Vec<(String, i64)> {
+pub(super) async fn contacts(superuser: &sqlx::PgPool, slug: &str) -> Vec<(String, i64)> {
     sqlx::query_as(
         "SELECT c.address, c.revision FROM wyrd.auth_user_contacts c
            JOIN platform.tenants t ON t.data_tenant_id = c.data_tenant_id
@@ -812,7 +819,9 @@ async fn a_contact_flow_belongs_to_the_user_who_began_it() {
     let verify = json!({ "tenant": "harbor", "proof": proof });
 
     // 1. Another User's session cannot take the flow over.
-    let other = sign_in_as(&srv, "harbor", "ada", other_password).await;
+    let other = sign_in_as(&srv, "harbor", "ada", other_password)
+        .await
+        .expect("a password session");
     let (status, _, body) = browser(
         &srv,
         "/auth/browser/email/verify",

@@ -27,6 +27,7 @@ use wyrd_testing::principal::within_propagation;
 
 mod contacts;
 mod methods;
+mod resets;
 mod setup;
 mod signup;
 

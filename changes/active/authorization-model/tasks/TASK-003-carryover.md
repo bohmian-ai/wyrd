@@ -924,6 +924,65 @@ directory-update owner once here; recovery below consumes its output.
   - `mise run check:tenant-isolation`.
   All are clean.
 - TDD: PASS for scenario 1.
+- Scenario 2, every stale or foreign use refuses and the offline paths stay usable:
+  `platform_admin_e2e::contacts::a_reset_code_refuses_every_stale_or_foreign_use` (same file).
+  It covers these cases:
+  - a mailed code replaced by a newer request, then the newer one once expired (both aged
+    16 minutes in SQL), each get `401 ONE_TIME_CODE_INVALID`;
+  - a contact proof used as a reset code (wrong purpose), and a code mailed before the contact was
+    replaced (old contact), each get `401`; the password is unchanged afterwards;
+  - with company SSO required (policy row set in SQL), a request gets `403 METHOD_UNAVAILABLE` and
+    a live mailed code gets `403` at redemption;
+  - an operator reset for a social-only User (inserted in SQL) gets `404`, so no reset adds a password;
+  - with the relay removed (SQL, as no relay-removal surface exists), a request gets
+    `403 METHOD_UNAVAILABLE`, while a code mailed before and an operator-issued code both reset
+    (`204`) and their new passwords sign in.
+  - RED: none. The first run failed only in setup (the test's social-only insert used a retired
+    `auth_type`; fixed to `oidc`). Every assertion before it already passed.
+  - GREEN: 1 passed.
+  - Mutation check: without the mailed-code supersession, or without the contact-revision check, the
+    test fails with `204` where `401` is expected.
+  - TDD VIOLATED for the replaced and old-contact cases: their production code (supersession in
+    `insert_password_reset`, the contact-revision check in `password_reset`) went in with
+    scenario 1, before this test. Expired, wrong-purpose, SSO, relay removal, operator offline reset
+    and social-only are existing redemption behavior, proved here as regressions.
+- Scenario 3, throttled without locking or disclosing delivery:
+  `platform_admin_e2e::contacts::reset_requests_are_throttled_without_locking_or_disclosing_delivery`
+  (same file). It covers these cases:
+  - five requests for one User all get the generic `202`; once the account window shows five counted
+    attempts, exactly three codes were mailed, and the password still signs in (no lock);
+  - one source gets `202` thirty times, then `429 WYRD_AUTH_429_PASSWORD_ATTEMPTS` with
+    `retry_after_seconds`; another source is still admitted;
+  - with the relay pointed at a local listener that answers `554`, the request still gets the generic
+    `202`. After the listener saw the attempt and the relay was restored, only a new request mailed a
+    code (one message), that code reset, and the listener saw no second attempt (no retry).
+  - The test polls Mailpit and the admission row with a 10-second deadline, because sends run after
+    the answer. It has no fixed sleep.
+  - RED: none; it passed on its first run.
+  - GREEN: 1 passed. Mutation check: without the account window it fails with five messages against three.
+  - TDD VIOLATED for the account and source windows and the bounded send: they went in with scenario 1.
+- SQL integration: `pg_auth_contacts::pg_tests::mailed_resets_replace_mailed_codes_and_are_consumed_once`
+  (`crates/wyrd/wyrd-sql/tests/integration/pg_auth_contacts.rs`). A mailed reset replaces the earlier
+  mailed one and not the operator code, keeps its contact revision, and two racing consumptions of one
+  code have one winner. GREEN: 1 passed (beside the cycle-12 test, 2/2). TDD VIOLATED: written after
+  the query change.
+  - Command: `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner &&
+    cargo nextest run --locked -p wyrd-sql --test integration -E "test(/^pg_auth_contacts::/)"'`.
+- Commands (all clean):
+  - the Postgres journey command with each scenario's exact selector, and with
+    `test(/^platform_admin_e2e::/) | test(/^pg_browser_sessions::/)` (90/90, the existing operator
+    reset and browser-session regressions included);
+  - `cargo nextest run --locked -p wyrd-auth -p wyrd-sql --lib -E 'not test(/pg_tests::/)'` (125/125);
+  - `mise run fmt`; `cargo clippy --locked -p wyrd-spec -p wyrd-sql -p wyrd-auth -p wyrd-server
+    --features wyrd-server/test-support --all-targets -- -D warnings`; `mise run codegen:check`;
+    `mise run check:tenant-isolation`; `git diff --check`.
+- Left open:
+  - The timing comparison is a coarse median check (within the other classes' median, or 25 ms).
+    The public path is the same code for every account, because all account work runs after the answer.
+  - Social-only Users have no username, so a reset request cannot name them. The journey proves the
+    operator path refuses them (`404`); the mailed path finds no local credential by construction.
+  - No relay-removal or tenant-policy write surface was needed here; the tests set both in SQL.
+  - MCP and `wyrd-client` projections of the reset request are not added (as for signup).
 
 ### 13. Verified contacts support private self-service reset
 
@@ -950,6 +1009,54 @@ reset still works; removing SMTP does not invalidate issued codes.
 **Proof:** tier-1 Rust/HTTP/Mailpit → redemption → real local session/device renewal
 and key use, plus tenant SQL one-use/contact-revision integration. RED is missing
 reset-request/send isolation; existing contact and reset redemption are reused and regressed.
+
+**Cycle 13 evidence.**
+
+- Scenario 1, a verified contact resets a forgotten password:
+  `platform_admin_e2e::contacts::a_verified_contact_resets_a_forgotten_password`
+  (`crates/wyrd/wyrd-server/tests/integration/platform_admin_e2e/contacts.rs`).
+  It covers these cases:
+  - three rounds of requests for a verified User, an unknown username, an unverified User, a
+    suspended User with a verified contact and an unknown workspace all get `202`
+    `{"status":"check_email"}`; the verified User's median answer time is within the others'
+    median (or 25 ms) of theirs;
+  - only the verified User's contact is mailed: three messages, each with the workspace reset page
+    `/t/quay/reset` and one code to paste that is on no URL line; the suspended User's contact gets none;
+  - the newest code gives `204` with no session cookie; the old browser session gets `401`, the
+    CLI refresh token from a real device approval (which renewed once before) is refused, the
+    personal API key still exchanges, the old password is refused and the new one signs in;
+  - the contact receives one "password was reset" notice without the password; the same code then
+    gets `401 WYRD_AUTH_401_ONE_TIME_CODE_INVALID`.
+  - RED: `contacts.rs:710`, `401 WYRD_AUTH_401_UNAUTHENTICATED` for the unmatched route
+    `/auth/browser/password/reset/request` (the route did not exist). All setup before it
+    (contacts, Users, key, device sign-in and renewal) passed.
+  - First run failed in setup: the test's own username `cy` is shorter than the 3-character
+    minimum (`400` from `POST /v1/principals/users`). I renamed it `cyd`; no assertion changed.
+  - GREEN: 1 passed; 4 more consecutive runs in one container passed.
+  - In those reruns the cycle-12 journey failed at `contacts.rs:283` ("nothing was mailed")
+    only because Mailpit keeps the first run's messages to the same address inside one container.
+    Its first run in the container passed; a fresh container is the lane's setup.
+- Implementation:
+  - `POST /auth/browser/password/reset/request` `{tenant, username}` (`PasswordResetCodeRequest`).
+    The handler admits the request in its per-source window (`429 PASSWORD_ATTEMPTS`), refuses
+    with `403 METHOD_UNAVAILABLE` when the tenant's methods report does not offer
+    `password_reset` (no relay, password off, or company SSO required), then answers `202`.
+  - `SocialSignIn::request_password_reset` (`wyrd-auth/src/social/contacts.rs`) answers before any
+    account read. A process semaphore (16 permits) bounds the spawned send; with none free the
+    request sends nothing. The send resolves the tenant, counts the account window silently (3
+    messages per hour), and mails only an active local password User with a verified contact.
+    The code is issued through the existing `issue_password_reset`, bound to the password
+    revision and the contact revision, and replaces the User's earlier mailed codes. Mail goes
+    after the commit; a failed send is logged and not retried.
+  - Redemption reuses `BrowserSessions::password_reset`. A mailed code also needs its contact
+    revision to still be current, which is how a contact replacement invalidates old-contact codes.
+    After the commit the verified contact is told.
+  - Schema, both edited in place (unshipped, maintainer-approved): `platform.signup_admissions`
+    scopes gain `reset` and `reset_account` (`20261121000006`), and
+    `wyrd.auth_password_resets` gains a nullable `contact_revision` (`20261121000008`). Both cite
+    the spec's revision-6 "Recovery and admission metadata" row and the "reset-contact revision
+    validity" support property. No new table.
+- TDD: PASS for scenario 1.
 
 ### 14. Platform operators obtain isolated browser sessions and re-authenticate
 

@@ -87,3 +87,10 @@ $$;
 CREATE TRIGGER auth_user_contacts_notify
     AFTER INSERT OR UPDATE OR DELETE ON wyrd.auth_user_contacts
     FOR EACH ROW EXECUTE FUNCTION wyrd.notify_contact_change();
+
+-- A reset code mailed to a verified contact is bound to that contact's
+-- revision; replacing the contact makes the code unusable (revision 6,
+-- "Recovery and admission metadata" and the "reset-contact revision validity"
+-- support property). Operator-issued codes carry none.
+ALTER TABLE wyrd.auth_password_resets
+    ADD COLUMN contact_revision BIGINT CHECK (contact_revision > 0);

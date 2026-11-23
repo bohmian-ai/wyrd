@@ -57,6 +57,10 @@ pub enum SignupAdmissionScope {
     EmailAddress,
     /// The signed-in account asking for such a proof.
     EmailAccount,
+    /// The trusted source of a password-reset request.
+    Reset,
+    /// The tenant account a password-reset request names.
+    ResetAccount,
 }
 
 impl SignupAdmissionScope {
@@ -71,6 +75,8 @@ impl SignupAdmissionScope {
             Self::EmailSource => "email_source",
             Self::EmailAddress => "email_address",
             Self::EmailAccount => "email_account",
+            Self::Reset => "reset",
+            Self::ResetAccount => "reset_account",
         }
     }
 }

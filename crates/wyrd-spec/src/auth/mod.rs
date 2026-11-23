@@ -37,9 +37,9 @@ pub use browser::{
     BrowserLogoutRequest, BrowserSessionQuery, BrowserSessionView, BrowserSessionsResponse,
     ContactRequest, ContactVerifyRequest, DiscoveredWorkspace, DiscoveryPage, DiscoveryQuery,
     DiscoveryRequest, DiscoveryVerifyRequest, LocalCredentials, PasswordChangeRequest,
-    PasswordLoginRequest, PasswordResetRequest, PasswordSignupRequest, ProofStatus,
-    ProofStatusResponse, SignupBeginRequest, SignupCompleteRequest, SignupCompleteResponse,
-    SignupVerifyRequest,
+    PasswordLoginRequest, PasswordResetCodeRequest, PasswordResetRequest, PasswordSignupRequest,
+    ProofStatus, ProofStatusResponse, SignupBeginRequest, SignupCompleteRequest,
+    SignupCompleteResponse, SignupVerifyRequest,
 };
 pub use device::{DeviceAuthorization, DeviceAuthorizationRequest, TokenRevocationRequest};
 pub use human_connection::{

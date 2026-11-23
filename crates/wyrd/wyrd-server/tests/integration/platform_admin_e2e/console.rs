@@ -387,3 +387,193 @@ async fn a_registered_operator_signs_in_with_a_platform_password() {
     .await;
     assert_eq!(status, StatusCode::OK, "the API-token consumer still works");
 }
+
+/// Register platform `user` `name` through the API-token channel and give
+/// it [`OPERATOR_PASSWORD`]. Returns its principal id.
+///
+/// # Panics
+/// Panics when registration or the password write is refused.
+async fn register_password_operator(srv: &WyrdTestServer, api: &str, name: &str) -> String {
+    let (status, registered) = social_call(
+        srv,
+        social_request(
+            Method::POST,
+            "/platform/admins",
+            Some(api),
+            Some(json!({ "name": name })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{registered}");
+    let principal = registered["principal_id"]
+        .as_str()
+        .expect("principal id")
+        .to_owned();
+    set_operator_password(srv, api, &principal, OPERATOR_PASSWORD).await;
+    principal
+}
+
+/// Set platform `user` `principal`'s password through the API-token channel.
+///
+/// # Panics
+/// Panics when the write is refused.
+async fn set_operator_password(srv: &WyrdTestServer, api: &str, principal: &str, password: &str) {
+    let (status, body) = social_call(
+        srv,
+        social_request(
+            Method::PUT,
+            &format!("/platform/admins/{principal}/password"),
+            Some(api),
+            Some(json!({ "password": password })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+}
+
+/// Sign `name` in with `password` and return the platform cookie pair.
+///
+/// # Panics
+/// Panics when sign-in is refused or sets no cookie.
+async fn signed_in(srv: &WyrdTestServer, name: &str, password: &str) -> String {
+    let reply = password_login(srv, name, password).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    reply.cookie(PLATFORM_COOKIE).expect("platform cookie")
+}
+
+/// The status of `GET /platform/browser/session` with `cookie` on `srv`.
+async fn session_status(srv: &WyrdTestServer, cookie: &str) -> StatusCode {
+    browser(srv, Method::GET, "/platform/browser/session", &[cookie], false, None)
+        .await
+        .status
+}
+
+/// Move every timestamp of the session `cookie` names `elapsed` into the
+/// past, as if that much time had passed since its last request.
+///
+/// # Panics
+/// Panics when the update fails or matches no session.
+async fn age_session(srv: &WyrdTestServer, cookie: &str, elapsed: &str) {
+    let value = cookie.split_once('=').expect("cookie pair").1;
+    let aged = sqlx::query(
+        "UPDATE platform.browser_sessions
+            SET created_at = created_at - $2::interval,
+                last_active_at = last_active_at - $2::interval,
+                fresh_at = fresh_at - $2::interval,
+                idle_expires_at = idle_expires_at - $2::interval,
+                expires_at = expires_at - $2::interval
+          WHERE session_hash = sha256(convert_to($1, 'UTF8'))",
+    )
+    .bind(value)
+    .bind(elapsed)
+    .execute(srv.operator_pool().pool())
+    .await
+    .expect("session ages");
+    assert_eq!(aged.rows_affected(), 1, "the cookie names one session");
+}
+
+/// Platform console sessions end everywhere under the same rules:
+///   1. a session signed in on one replica serves the other, and ends on
+///      both 15 minutes after its last request;
+///   2. activity moves the idle deadline but never past the eight-hour
+///      absolute one, after which the session ends;
+///   3. logout on one replica ends the session on the other;
+///   4. suspension ends the operator's sessions, and reactivation does not
+///      revive them;
+///   5. a password change ends sessions from the earlier password, and only
+///      the new password signs in;
+///   6. when the session store cannot be written, a platform cookie is
+///      refused as unavailable, never accepted or read as signed out.
+///
+/// # Panics
+/// Panics when any session outlives its rule or the store failure reads
+/// differently.
+#[tokio::test(flavor = "multi_thread")]
+async fn platform_console_sessions_end_on_every_replica() {
+    let (srv, _root, api) = console_server().await;
+    let replica = srv
+        .start_replica(WyrdTestServer::builder().with_trusted_ingress_for_test(&[INGRESS], CLIENT_HEADER))
+        .await
+        .expect("replica starts");
+    let principal = register_password_operator(&srv, &api, "ops").await;
+
+    // 1. Idle expiry, observed on both replicas.
+    let idle = signed_in(&srv, "ops", OPERATOR_PASSWORD).await;
+    assert_eq!(session_status(&replica, &idle).await, StatusCode::OK);
+    age_session(&srv, &idle, "14 minutes").await;
+    assert_eq!(session_status(&replica, &idle).await, StatusCode::OK, "activity within the window");
+    age_session(&srv, &idle, "16 minutes").await;
+    assert_eq!(session_status(&replica, &idle).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(session_status(&srv, &idle).await, StatusCode::UNAUTHORIZED);
+
+    // 2. Activity cannot extend the absolute deadline.
+    let long = signed_in(&srv, "ops", OPERATOR_PASSWORD).await;
+    // Seven hours 59 minutes since sign-in, the last request just now.
+    let value = long.split_once('=').expect("cookie pair").1;
+    sqlx::query(
+        "UPDATE platform.browser_sessions
+            SET created_at = created_at - interval '7 hours 59 minutes',
+                expires_at = expires_at - interval '7 hours 59 minutes',
+                idle_expires_at = LEAST(idle_expires_at,
+                                        expires_at - interval '7 hours 59 minutes')
+          WHERE session_hash = sha256(convert_to($1, 'UTF8'))",
+    )
+    .bind(value)
+    .execute(srv.operator_pool().pool())
+    .await
+    .expect("session ages");
+    let view = browser(&replica, Method::GET, "/platform/browser/session", &[&long], false, None).await;
+    assert_eq!(view.status, StatusCode::OK, "{}", view.body);
+    assert_eq!(
+        view.body["idle_expires_at"], view.body["expires_at"],
+        "activity stops at the absolute deadline: {}", view.body
+    );
+    age_session(&srv, &long, "2 minutes").await;
+    assert_eq!(session_status(&replica, &long).await, StatusCode::UNAUTHORIZED);
+
+    // 3. Logout on one replica ends the session on the other.
+    let left = signed_in(&replica, "ops", OPERATOR_PASSWORD).await;
+    let reply = browser(&replica, Method::POST, "/platform/browser/logout", &[&left], true, None).await;
+    assert_eq!(reply.status, StatusCode::NO_CONTENT, "{}", reply.body);
+    assert_eq!(session_status(&srv, &left).await, StatusCode::UNAUTHORIZED);
+
+    // 4. Suspension ends the session for good.
+    let suspended = signed_in(&srv, "ops", OPERATOR_PASSWORD).await;
+    for status in ["suspended", "active"] {
+        let (code, body) = social_call(
+            &srv,
+            social_request(
+                Method::PUT,
+                &format!("/platform/admins/{principal}/status"),
+                Some(&api),
+                Some(json!({ "status": status })),
+            ),
+        )
+        .await;
+        assert_eq!(code, StatusCode::NO_CONTENT, "{body}");
+        assert_eq!(
+            session_status(&replica, &suspended).await,
+            StatusCode::UNAUTHORIZED,
+            "after {status}"
+        );
+    }
+
+    // 5. A password change ends sessions from the earlier password.
+    let before = signed_in(&srv, "ops", OPERATOR_PASSWORD).await;
+    set_operator_password(&srv, &api, &principal, "copper finch 2026").await;
+    assert_eq!(session_status(&replica, &before).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        password_login(&replica, "ops", OPERATOR_PASSWORD).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    let after = signed_in(&replica, "ops", "copper finch 2026").await;
+
+    // 6. An unwritable store refuses rather than accepts or signs out.
+    let pool = srv.operator_pool();
+    super::fail_writes_to(pool.pool(), "console", "platform.browser_sessions", "UPDATE").await;
+    assert_eq!(session_status(&replica, &after).await, StatusCode::SERVICE_UNAVAILABLE);
+    let reply = browser(&srv, Method::GET, "/platform/tenants", &[&after], false, None).await;
+    assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE, "{}", reply.body);
+    super::stop_failing_writes(pool.pool(), "console", "platform.browser_sessions").await;
+    assert_eq!(session_status(&replica, &after).await, StatusCode::OK);
+}

@@ -950,6 +950,20 @@ as a usable way in for the last-administrator guard.
      cookie refused on tenant routes and as a tenant cookie, logout revoking only
      its own session, API token unaffected. 1 passed.
 
+2. `platform_admin_e2e::console::platform_console_sessions_end_on_every_replica`
+   - RED: after suspending and reactivating the operator, its old session
+     resolved again (`after active`: 200, expected 401). TDD note: steps 1–3
+     (idle expiry, activity capped at the absolute deadline, logout across
+     replicas) already passed because scenario 1's resolve statement checked
+     both deadlines and revocation; they are regression proof, not new RED. Two
+     earlier failures were test-setup bugs in how the test aged a session and
+     are not counted as RED.
+   - GREEN: suspension revokes the principal's platform browser sessions in its
+     own transaction. Idle expiry and the absolute cap hold on both replicas;
+     a password change ends earlier sessions and only the new password signs
+     in; when the session store cannot be written, a platform cookie gets 503
+     on session reads and platform routes, then works again. 1 passed.
+
 ### 15. Extend and approve the complete mock before production pages
 
 **Reuses:** Cycles 5–14 final contracts, journeys and platform session metadata; reuse the already approved signup visual direction.

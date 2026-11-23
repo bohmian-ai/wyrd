@@ -707,7 +707,10 @@ async fn engine_measurements_keep_boundaries_processes_and_windows() {
 /// teardown and persistence, and the saved sweep regenerates its table. A
 /// second sweep proves a failed case with confirmed cleanup lets the next
 /// case start, and a case whose resources cannot be confirmed as its own
-/// stops every later launch while keeping their rows.
+/// stops every later launch while keeping their rows. A Gateway smoke
+/// offered far more than it can serve counts every missed arrival as an
+/// error, so integrity judgment makes both of its cases INVALID in the saved
+/// sweep while each case's cleanup is confirmed and the next case runs.
 ///
 /// `mise run test:benchmark:l1` after `mise run bench:build`, with Docker.
 ///
@@ -731,15 +734,16 @@ async fn l1_sweeps_isolate_and_record_cases() {
         program.exists(),
         "the release driver from `mise run bench:build`"
     );
-    let sweep_of = |rest: &[&str]| {
+    let sweep_in = |category: Category, rest: &[&str]| {
         let arguments = line(rest);
-        let Ok(Request::Sweep(selection)) = resolve(Category::Bifrost, &arguments) else {
+        let Ok(Request::Sweep(selection)) = resolve(category, &arguments) else {
             panic!("a sweep");
         };
         let mut sweep = Sweep::new(selection, &arguments, &root, true);
         sweep.program.clone_from(&program);
         sweep
     };
+    let sweep_of = |rest: &[&str]| sweep_in(Category::Bifrost, rest);
     let cases = |sweep: &Sweep| {
         sweep
             .cases
@@ -884,6 +888,53 @@ async fn l1_sweeps_isolate_and_record_cases() {
         summary::report(&path).expect("reads").expect("a sweep"),
         table,
         "regenerated without artifacts"
+    );
+
+    let flooded = sweep_in(
+        Category::Gateway,
+        &[
+            "--cases",
+            "buffered-1kib-capture-metadata.c1,streamed-1kib-capture-metadata.c1",
+            "--pace",
+            "1000000",
+            "--allow-dirty",
+        ],
+    );
+    let record = flooded
+        .supervise(&interrupt, |case, n| {
+            let sweep = &flooded;
+            let interrupt = &interrupt;
+            async move { sweep.attempt(case, n, interrupt).await }
+        })
+        .await;
+    for (entry, case) in record.cases.iter().zip(cases(&flooded)) {
+        let case = case.expect("a kept case record");
+        assert_eq!(
+            entry.status,
+            CaseStatus::Invalid,
+            "{}: {:?}",
+            entry.selector,
+            case.reasons
+        );
+        let engine = case.record.as_ref().expect("engine record");
+        assert!(
+            engine
+                .reasons
+                .iter()
+                .any(|reason| reason.criterion.as_deref() == Some("no-errors")),
+            "{}: {:?}",
+            entry.selector,
+            engine.reasons
+        );
+        assert!(case.cleanup.confirmed, "{:?}", case.cleanup);
+    }
+    let table = summary::report(&flooded.directory.join(summary::SWEEP_FILE))
+        .expect("reads")
+        .expect("a sweep");
+    assert!(
+        table.contains("| buffered-1kib-capture-metadata.c1 | INVALID: ")
+            && table.contains("| streamed-1kib-capture-metadata.c1 | INVALID: "),
+        "{table}"
     );
 
     let mut failing = sweep_of(&[

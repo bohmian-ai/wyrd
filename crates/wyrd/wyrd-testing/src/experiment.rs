@@ -7503,7 +7503,8 @@ Overloaded: do not compare languages here.
     /// drains a 10 s stop is charged to teardown and the case is VALID,
     /// while a 70 s stop leaves the unused drain allowance untouched, is cut
     /// at the 60 s teardown allowance and makes the case INVALID naming
-    /// teardown.
+    /// teardown. A slow real drain is still drain: 10 s drains spend 40 s
+    /// of the drain allowance and none of teardown's.
     #[tokio::test(start_paused = true)]
     async fn case_stops_spend_teardown_not_unused_drain() {
         let drain = Duration::from_secs(1);
@@ -7552,6 +7553,26 @@ Overloaded: do not compare languages here.
             ),
             "{:?}",
             slow.reasons
+        );
+
+        let (draining, _) = case_run(
+            Duration::from_secs(10),
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(draining.verdict, Verdict::Valid, "{:?}", draining.reasons);
+        let lifecycle = draining.lifecycle.as_ref().expect("lifecycle");
+        assert!(
+            (lifecycle.drain_seconds - 40.0).abs() < 0.01,
+            "a slow drain is drain: {}",
+            lifecycle.drain_seconds
+        );
+        assert!(
+            (lifecycle.teardown_seconds - 10.0).abs() < 0.01,
+            "{}",
+            lifecycle.teardown_seconds
         );
     }
 

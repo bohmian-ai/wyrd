@@ -2893,7 +2893,7 @@ reviewing('Alice is given payments in Settings and sees only payments in her bro
     expect(await noSet('ledger')).toBe(await noSet('nosuch'));
     // The member of the payments set opens as its own execution: completed, owned by payments.
     await her.goto(pinned);
-    await setMembers.first().getByRole('button').click();
+    await setMembers.first().getByRole('link').first().click();
     await her.waitForURL(`${base}/verify/executions/${review.execution_id}`);
     await expect.poll(() => her.locator('[data-execution-status]').getAttribute('data-execution-status')).toBe('completed');
     // Without the Verifier's definition she still selects the recorded requirement; a reload keeps it selected and Back returns to the same review set.
@@ -2982,7 +2982,7 @@ reviewing('Alice is given payments in Settings and sees only payments in her bro
 
     // The administrator requests a fresh review of payments #7. Her pull request link follows the new set; the first set stays listed.
     const rerequested = await (await GithubConnection.connect({ client: admin })).reviewPullRequest({ host: github.host, repository_id: '1', number: 7 }, 'alice-rerequest');
-    const setRows = her.getByRole('navigation', { name: 'Review sets of #7' }).getByRole('button');
+    const setRows = her.getByRole('navigation', { name: 'Review sets of #7' }).getByRole('link');
     await expect
       .poll(
         async () => {
@@ -3002,7 +3002,7 @@ reviewing('Alice is given payments in Settings and sees only payments in her bro
     await her.reload();
     await expect.poll(() => her.getByRole('status').textContent()).toContain('You are viewing earlier review set');
     expect(rerequested.generation).not.toBe(review.inputs.generation);
-    await her.getByRole('region', { name: /^Members of review set/ }).locator('tbody tr').first().getByRole('button').click();
+    await her.getByRole('region', { name: /^Members of review set/ }).locator('tbody tr').first().getByRole('link').first().click();
     await her.waitForURL(`${base}/verify/executions/${review.execution_id}`);
     // The member names its pull request and leads back to its own set, not the latest; Back returns there too.
     await her.getByRole('button', { name: 'payments#7' }).click();

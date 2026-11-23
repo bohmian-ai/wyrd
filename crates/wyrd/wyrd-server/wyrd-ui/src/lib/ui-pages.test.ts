@@ -1335,18 +1335,19 @@ test('a pull request page follows the latest review set, keeps a pinned set in i
   // The plain link shows the latest set and its members, named by the Verifiers the page read.
   const latest = await pull(String(REVIEW.number));
   expect(latest.getByRole('heading', { level: 1 })).toHaveTextContent('Refund window follows the 30-day policy');
-  expect(latest.getByRole('link', { name: 'payments-api' })).toHaveAttribute('href', '/t/acme/repositories/payments-api?version=1.4.0');
+  // The Repository named in the header and in the crumbs leads to the policy version the set recorded.
+  expect(latest.getAllByRole('link', { name: 'payments-api' }).map((link) => link.getAttribute('href'))).toEqual(['/t/acme/repositories/payments-api?version=1.4.0', '/t/acme/repositories/payments-api?version=1.4.0']);
   expect(latest.queryByRole('status')).toBeNull();
   expect(latest.getAllByRole('row').slice(1).map((row) => row.querySelectorAll('td')[1].textContent?.trim())).toEqual(['ticket-policy@1.1.0', 'latency-drift@1.0.0']);
   // A set is two list reads and the Verifier names: no execution's status or detail is read per member.
   expect(requests.map((request) => request.op)).toEqual(['bifrost.query', 'bifrost.query', 'cards.list']);
 
-  // Choosing the earlier set puts it in the URL; opening a member leads to its exact execution.
-  const sets = within(latest.getByRole('navigation', { name: 'Review sets of #482' })).getAllByRole('button');
-  await fireEvent.click(sets[1]);
-  expect(goto).toHaveBeenLastCalledWith(`/t/acme/repositories/payments-api/pulls/482?set=${REVIEW.earlier}`, { keepFocus: true, noScroll: true });
-  await fireEvent.click(latest.getByRole('button', { name: 'exec_failed' }));
-  expect(goto).toHaveBeenLastCalledWith('/t/acme/verify/executions/exec_failed');
+  // Each set, member and Verifier is a link: the earlier set's URL pins it, a member leads to its exact execution
+  // and a Verifier to its exact definition.
+  const sets = within(latest.getByRole('navigation', { name: 'Review sets of #482' })).getAllByRole('link');
+  expect(sets.map((link) => link.getAttribute('href'))).toEqual(['/t/acme/repositories/payments-api/pulls/482', `/t/acme/repositories/payments-api/pulls/482?set=${REVIEW.earlier}`]);
+  expect(latest.getByRole('link', { name: 'exec_failed' })).toHaveAttribute('href', '/t/acme/verify/executions/exec_failed');
+  expect(latest.getByRole('link', { name: 'ticket-policy@1.1.0' })).toHaveAttribute('href', '/t/acme/cards/detail?kind=Verifier&name=ticket-policy&version=1.1.0');
   latest.unmount();
 
   // The pinned link stays on its set and offers the latest.
@@ -1355,8 +1356,7 @@ test('a pull request page follows the latest review set, keeps a pinned set in i
   // The earlier set was recorded before titles were retained, so it is headed by its number.
   expect(pinned.getByRole('heading', { level: 1 })).toHaveTextContent('#482');
   expect(pinned.getAllByRole('row').slice(1).map((row) => row.querySelector('td')?.textContent?.trim())).toEqual(['exec_cancelled', 'exec_waiting']);
-  await fireEvent.click(within(pinned.getByRole('status')).getByRole('button'));
-  expect(goto).toHaveBeenLastCalledWith('/t/acme/repositories/payments-api/pulls/482', { keepFocus: true, noScroll: true });
+  expect(within(pinned.getByRole('status')).getByRole('link')).toHaveAttribute('href', '/t/acme/repositories/payments-api/pulls/482');
   pinned.unmount();
 
   // A pinned set that is not retained is reported and never replaced by the latest.

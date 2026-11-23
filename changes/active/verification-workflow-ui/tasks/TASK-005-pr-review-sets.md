@@ -333,16 +333,33 @@ proof, not manufactured failures.
      page has none; the URL carries the selection); changing the pull request
      while a selection is open; light/dark, mobile, keyboard/touch and
      long-content comparison against the mock (AC-009).
-   - Mock differences awaiting the maintainer's ruling: the heading shows
-     the retained title (scenario 1), but there is no GitHub link because the
-     repository's full name is not retained; occurrences read "requested review"
-     or "pull request event"; set and member rows are buttons rather than
-     anchors; members show no per-member time; a Verifier shows its label or
-     UID without a link; set and execution ids are shortened; Repository
-     activity has a "Pull request" column but not the mock's Head and Policy
-     columns or its "Latest per PR / Include earlier review sets" switch; the
-     definition-unavailable list of recorded requirements and steps is new
-     and has no mock.
+   - Links and wording (maintainer decision, 2026-11-23: follow the mock and
+     link conventions). `ReviewSets` takes an optional `link` (intent → URL);
+     the pull request page supplies it, so set rows, the banner's latest-set
+     link, member executions, the Repository and each named Verifier are
+     `<a href>`; without `link` (the MCP artifact) they stay buttons that emit
+     the same intents. Set occurrence uses the mock's words from recorded facts:
+     a request is "rerequested", a head differing from the set before it is
+     "new head", the first set of a fully read history is "opened", otherwise
+     "pull request event" (GitHub's action is not retained). RED: [U2] rows
+     read "requested review"; [P1] "a pull request page follows…" found only
+     the crumb link. GREEN: [U2]/[P1] 68 passed; `mise run ui:check` 112
+     passed, 0 type errors; [D2] Alice journey 1 passed with set and member
+     selectors changed from button to link.
+   - Preference review (commit hook, then codex `gpt-6.1-sol` medium for the
+     full text): the page's `onaction` now navigates through its `link`, card
+     URLs reuse `writeDetail`; an intent the host gives no URL renders as a
+     button, never an `<a>` without `href` (asserted in [U2]; restoring the
+     old choice fails it); occurrence takes each row's index instead of a
+     per-row search.
+   - Diagnosis: [D2] first failed at `wyrd execution status`
+     (`ui-pages.integration.test.ts:2849`) with `unknown field \`title\``.
+     Evidence: `target/debug/wyrd` built 15:08, `wyrd-spec` change 16:25;
+     `PullRequestActivation` is `deny_unknown_fields` like the other wire
+     types. Cause: a stale CLI binary; `build:server` does not rebuild it.
+     Fix site: none in code; `mise exec -- cargo build --locked -p wyrd-cli
+     --bin wyrd`, then [D2] 1 passed. No diagnostician: the fix touches no
+     test, timing or code.
    - Status: navigation PASS; the items marked FAIL remain open.
 
 ## Verification and handoff

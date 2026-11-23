@@ -7,23 +7,47 @@
   requests a review or reruns one.
 -->
 <script lang="ts">
-  import type { ActionProps } from '../contract.js';
+  import type { ActionIntent, ActionProps } from '../contract.js';
   import { fmtInstant, fmtShortId, parseInstant } from '../format.js';
   import { EXECUTION_STATUS, EXECUTION_VERDICT, REVIEW_SET_ROWS, type ReviewSet, type ReviewSetsProps } from '../observe.js';
   import ActionNote from './ActionNote.svelte';
   import EmptyState from './EmptyState.svelte';
   import RepositorySheet from './RepositorySheet.svelte';
 
-  /** `labels` names the Verifier Card UIDs the host read; an unnamed one shows its UID. */
-  let { input, result, actions = {}, onaction, labels = {} }: ReviewSetsProps & ActionProps & { labels?: Readonly<Record<string, string>> } = $props();
+  /**
+   * `labels` names the Verifier Card UIDs the host read; an unnamed one shows its UID.
+   * `link` is the URL a routing host gives an intent: each navigation is then a real link. Without one, it is a button.
+   */
+  let { input, result, actions = {}, onaction, labels = {}, link }: ReviewSetsProps & ActionProps & { labels?: Readonly<Record<string, string>>; link?: (intent: ActionIntent) => string | undefined } = $props();
 
   const disabled = $derived(!onaction);
   const pull = $derived(`${input.repository}#${input.number}`);
-  const show = (generation?: string) => onaction?.({ name: 'review_set.open', input: generation ? { generation } : {} });
-  /** What started a set: a review someone requested, or a pull request event GitHub delivered. */
-  const occurrence = (set: ReviewSet) => (set.request_key ? 'requested review' : 'pull request event');
+  const openSet = (generation?: string): ActionIntent => ({ name: 'review_set.open', input: generation ? { generation } : {} });
+  /** A link to `intent` where the host routes it, else a button that emits it: the element and its attributes. */
+  const go = (intent: ActionIntent) => {
+    const href = link?.(intent);
+    return href ? { tag: 'a', attrs: { href } } : { tag: 'button', attrs: { type: 'button', disabled, onclick: () => onaction?.(intent) } };
+  };
+  /** The exact Verifier definition a named member links to. */
+  const verifierRef = (label?: string) => {
+    const at = label?.lastIndexOf('@') ?? -1;
+    return label && at > 0 ? { kind: 'Verifier', name: label.slice(0, at), version: label.slice(at + 1) } : undefined;
+  };
+  /**
+   * What started a set, from what it recorded: a requested review is a rerequest, a head that differs from the set
+   * before it is a new head, and the first retained set of a fully read history is the opening. Anything else is a
+   * pull request event; GitHub's action is not retained.
+   */
+  function occurrence(sets: readonly ReviewSet[], more: boolean, set: ReviewSet, at: number) {
+    if (set.request_key) return 'rerequested';
+    const before = at < 0 ? undefined : sets[at + 1];
+    if (before) return before.head.sha === set.head.sha ? 'pull request event' : 'new head';
+    return at === sets.length - 1 && !more ? 'opened' : 'pull request event';
+  }
   const head = (set: ReviewSet) => `head ${set.head.sha.slice(0, 7)}`;
 </script>
+
+{#snippet nav(intent: ActionIntent, text: string, title?: string)}{@const to = go(intent)}<svelte:element this={to.tag} class={title ? 'link mono' : 'link'} {title} {...to.attrs}>{text}</svelte:element>{/snippet}
 
 <RepositorySheet>
   {#if result.state === 'populated'}
@@ -34,7 +58,7 @@
       <div class="xtitle">
         <div class="xname"><span class="kt">Pull request</span>{#if source.title}<h1>{source.title}</h1>{:else}<h1 class="mono">#{input.number}</h1>{/if}</div>
         <div class="xmeta">
-          <button type="button" class="link" {disabled} onclick={() => source.policy.version && onaction?.({ name: 'card.open', input: { card_ref: { kind: 'Repository', name: input.repository, version: source.policy.version } } })}>{input.repository}</button>
+          {#if source.policy.version}{@render nav({ name: 'card.open', input: { card_ref: { kind: 'Repository', name: input.repository, version: source.policy.version } } }, input.repository)}{:else}{input.repository}{/if}
           <span class="sep">·</span>#{input.number}<span class="sep">·</span>Repository Card {input.repository}
         </div>
       </div>
@@ -47,16 +71,17 @@
     <section class="section" aria-labelledby="review-sets-heading">
       <div class="section-head"><h2 class="h" id="review-sets-heading">Review sets · {data.sets.length}{data.more ? '+' : ''}</h2></div>
       <nav class="sets" aria-label="Review sets of #{input.number}">
-        {#each data.sets as each (each.generation)}
+        {#each data.sets as each, at (each.generation)}
           {@const count = each.member_ids.length}
-          <button type="button" class="setrow" {disabled} aria-current={each.generation === set?.generation ? 'true' : undefined} onclick={() => show(each.generation === data.current ? undefined : each.generation)}>
+          {@const to = go(openSet(each.generation === data.current ? undefined : each.generation))}
+          <svelte:element this={to.tag} class="setrow" aria-current={each.generation === set?.generation ? 'true' : undefined} {...to.attrs}>
             <span class="mono" title={each.generation}>{fmtShortId(each.generation)}</span>
-            <span class="small">{occurrence(each)}</span>
+            <span class="small">{occurrence(data.sets, data.more, each, at)}</span>
             <span class="mono small" title={each.head.sha}>{head(each)}</span>
             <span class="mono small muted">{fmtInstant(parseInstant(each.recorded_at))}</span>
             <span class="mono small muted">{each.policy.name}@{each.policy.version ?? '—'}</span>
             <span class="small muted push">{count} {count === 1 ? 'execution' : 'executions'}{each.generation === data.current ? ' · latest' : ''}</span>
-          </button>
+          </svelte:element>
         {/each}
       </nav>
       {#if data.more}<p class="note">The newest {REVIEW_SET_ROWS} member records are listed. Open an earlier set by its link.</p>{/if}
@@ -65,22 +90,22 @@
     {#if !set}
       <div class="banner warn" role="status">
         Review set {fmtShortId(input.generation ?? '')} is not retained for this pull request.
-        <button type="button" class="link" {disabled} onclick={() => show()}>Latest set {fmtShortId(data.current)}</button>
+        {@render nav(openSet(), `Latest set ${fmtShortId(data.current)}`)}
       </div>
     {:else}
       {#if input.generation && set.generation !== data.current}
         <div class="banner" role="status">
           You are viewing earlier review set {fmtShortId(set.generation)}. This link stays on it.
-          <button type="button" class="link" {disabled} onclick={() => show()}>Latest set {fmtShortId(data.current)}</button>
+          {@render nav(openSet(), `Latest set ${fmtShortId(data.current)}`)}
         </div>
       {:else if input.generation}
         <div class="banner" role="status">
           Pinned to {fmtShortId(set.generation)}, the latest set when this link was made.
-          <button type="button" class="link" {disabled} onclick={() => show()}>Follow the latest set</button>
+          {@render nav(openSet(), 'Follow the latest set')}
         </div>
       {/if}
       <section class="section" aria-labelledby="review-members-heading">
-        <div class="section-head"><h2 class="h" id="review-members-heading">{fmtShortId(set.generation)} · {occurrence(set)} · {head(set)}</h2></div>
+        <div class="section-head"><h2 class="h" id="review-members-heading">{fmtShortId(set.generation)} · {occurrence(data.sets, data.more, set, data.sets.findIndex((each) => each.generation === set.generation))} · {head(set)}</h2></div>
         {#if !set.complete}
           <p class="note box">{set.members.filter((member) => member.retained).length} of {set.members.length} member records are retained. This set is incomplete.</p>
         {/if}
@@ -94,9 +119,10 @@
                 {@const status = member.status ? (EXECUTION_STATUS[member.status] ?? ['', member.status, 'text']) : undefined}
                 {@const verdict = member.verdict ? EXECUTION_VERDICT[member.verdict] : undefined}
                 {@const verifier = member.verifier_card_uid}
+                {@const definition = verifierRef(verifier ? labels[verifier] : undefined)}
                 <tr>
-                  <td><div class="cellbox"><button type="button" class="link mono" {disabled} title={member.execution_id} onclick={() => onaction?.({ name: 'record.open', input: { execution_id: member.execution_id } })}>{fmtShortId(member.execution_id)}</button></div></td>
-                  <td><div class="cellbox">{#if verifier}<span class="mono" title={verifier}>{labels[verifier] ?? fmtShortId(verifier)}</span>{:else}<span class="muted mono">—</span>{/if}</div></td>
+                  <td><div class="cellbox">{@render nav({ name: 'record.open', input: { execution_id: member.execution_id } }, fmtShortId(member.execution_id), member.execution_id)}</div></td>
+                  <td><div class="cellbox">{#if verifier && definition}{@render nav({ name: 'card.open', input: { card_ref: definition } }, labels[verifier], verifier)}{:else if verifier}<span class="mono" title={verifier}>{fmtShortId(verifier)}</span>{:else}<span class="muted mono">—</span>{/if}</div></td>
                   <td><div class="cellbox">{#if status}<span class="st c-{status[2]}"><span aria-hidden="true">{status[0]}</span>{status[1]}</span>{:else}<span class="muted">record not retained</span>{/if}</div></td>
                   <td><div class="cellbox">{#if verdict}<span class="badge c-{verdict[2]}"><span aria-hidden="true">{verdict[0]}</span>{verdict[1]}</span>{:else}<span class="muted">none</span>{/if}</div></td>
                   <td><div class="cellbox">{#if member.failed.length}<span class="mono c-danger">{member.failed.join(', ')}</span>{:else}<span class="muted mono">—</span>{/if}</div></td>
@@ -127,6 +153,7 @@
   }
   .setrow {
     display: flex;
+    text-decoration: none;
     flex-wrap: wrap;
     align-items: baseline;
     gap: 4px 14px;

@@ -47,6 +47,7 @@ import { fireEvent, waitFor, within } from '@testing-library/svelte';
 import { tick } from 'svelte';
 import { vi } from 'vitest';
 import {
+  type ActionIntent,
   ArtifactTable,
   CardFacts,
   CardHeader,
@@ -3709,8 +3710,9 @@ test('the GitHub integration shows safe connection state and asks before disconn
 });
 
 /** One retained admission record of pull request 7: a member of `generation`, which froze `members`. */
-function admitted(generation: string, recorded_at: string, execution_id: string, members: readonly string[], head = 'a1', title?: string): unknown[] {
-  const inputs = { host: 'github.com', repository_id: '1', number: 7, ...(title && { title, full_name: 'acme/api' }), base: { ref: 'main', sha: 'b1' }, head: { ref: 'feature', sha: head }, generation, members, request_key: `key-${generation}` };
+function admitted(generation: string, recorded_at: string, execution_id: string, members: readonly string[], head = 'a1', title?: string, requested = true): unknown[] {
+  const origin = requested ? { request_key: `key-${generation}` } : { delivery_id: `delivery-${generation}` };
+  const inputs = { host: 'github.com', repository_id: '1', number: 7, ...(title && { title, full_name: 'acme/api' }), base: { ref: 'main', sha: 'b1' }, head: { ref: 'feature', sha: head }, generation, members, ...origin };
   return ['1.0.0', 'policy-uid', recorded_at, JSON.stringify(inputs)];
 }
 const HISTORY_COLUMNS = ['subject_version', 'workload_card_uid', 'recorded_at', 'inputs'].map((name) => ({ name, data_type: 'Utf8', nullable: true }));
@@ -3794,7 +3796,8 @@ test('a review set is complete only when every frozen member is visible, within 
 
 test('a pull request shows its review sets, each member with its own status and verdict, and no combined verdict', async () => {
   // Setup: three retained sets; the link is pinned to the first one, whose two members are superseded.
-  const history = [admitted('g3', '2026-10-03T10:00:00Z', 'e5', ['e5'], 'b2'), admitted('g2', '2026-10-02T10:00:00Z', 'e3', ['e3']), admitted('g1', '2026-10-01T10:00:00Z', 'e1', ['e1', 'e2'], 'a1', 'Refund window')];
+  // GitHub opened the pull request (g1) and later delivered a new head (g2); then someone requested a review (g3).
+  const history = [admitted('g3', '2026-10-03T10:00:00Z', 'e5', ['e5'], 'b2'), admitted('g2', '2026-10-02T10:00:00Z', 'e3', ['e3'], 'b2', undefined, false), admitted('g1', '2026-10-01T10:00:00Z', 'e1', ['e1', 'e2'], 'a1', 'Refund window', false)];
   const members = [
     ['e1', 'v1', 'cancelled', null, null, null],
     ['e2', 'v2', 'completed', 'failed', 'r2', JSON.stringify({ requirements: [{ id: 'approves', outcome: 'failed' }, { id: 'green', outcome: 'passed' }] })]
@@ -3824,9 +3827,9 @@ test('a pull request shows its review sets, each member with its own status and 
   // Every retained set is listed newest first; the latest is marked and the pinned one is current.
   const rows = within(page.getByRole('navigation', { name: 'Review sets of #7' })).getAllByRole('button');
   expect(rows.map((row) => row.textContent?.replace(/\s+/g, ' ').trim())).toEqual([
-    'g3 requested review head b2 2026-10-03 10:00 UTC api@1.0.0 1 execution · latest',
-    'g2 requested review head a1 2026-10-02 10:00 UTC api@1.0.0 1 execution',
-    'g1 requested review head a1 2026-10-01 10:00 UTC api@1.0.0 2 executions'
+    'g3 rerequested head b2 2026-10-03 10:00 UTC api@1.0.0 1 execution · latest',
+    'g2 new head head b2 2026-10-02 10:00 UTC api@1.0.0 1 execution',
+    'g1 opened head a1 2026-10-01 10:00 UTC api@1.0.0 2 executions'
   ]);
   expect(rows.map((row) => row.getAttribute('aria-current'))).toEqual([null, null, 'true']);
   expect(page.getByRole('status')).toHaveTextContent('You are viewing earlier review set g1. This link stays on it. Latest set g3');
@@ -3852,6 +3855,26 @@ test('a pull request shows its review sets, each member with its own status and 
     { name: 'card.open', input: { card_ref: { kind: 'Repository', name: 'api', version: '1.0.0' } } }
   ]);
   for (const intent of intents) expect(validateIntent('ReviewSets', intent)).toEqual(intent);
+  view.unmount();
+
+  // Action: render it in a host that can route each intent to a URL.
+  const href = (intent: ActionIntent) => `/to/${intent.name}?${new URLSearchParams(Object.entries(intent.input as Record<string, unknown>).map(([key, value]) => [key, typeof value === 'object' ? JSON.stringify(value) : String(value)]))}`;
+  const linked = within(render(ReviewSets, { ...pinned, labels: { v1: 'ci-gate@1.0.0', v2: 'code-review@2.1.0' }, onaction, link: href }).container);
+  // Every navigation is a real link, so it opens in a new tab and copies like any other.
+  const links = within(linked.getByRole('navigation', { name: 'Review sets of #7' })).getAllByRole('link');
+  expect(links.map((link) => link.getAttribute('href'))).toEqual(['/to/review_set.open?', '/to/review_set.open?generation=g2', '/to/review_set.open?generation=g1']);
+  expect(links.map((link) => link.getAttribute('aria-current'))).toEqual([null, null, 'true']);
+  expect(linked.getByRole('link', { name: 'Latest set g3' })).toHaveAttribute('href', '/to/review_set.open?');
+  expect(linked.getByRole('link', { name: 'e2' })).toHaveAttribute('href', '/to/record.open?execution_id=e2');
+  expect(linked.getByRole('link', { name: 'api' })).toHaveAttribute('href', `/to/card.open?card_ref=${encodeURIComponent(JSON.stringify({ kind: 'Repository', name: 'api', version: '1.0.0' }))}`);
+  // A named Verifier links to its exact definition.
+  expect(linked.getByRole('link', { name: 'code-review@2.1.0' })).toHaveAttribute('href', `/to/card.open?card_ref=${encodeURIComponent(JSON.stringify({ kind: 'Verifier', name: 'code-review', version: '2.1.0' }))}`);
+  expect(linked.queryAllByRole('button')).toEqual([]);
+
+  // A host that gives no URL for an intent gets a button for it, never an anchor without a destination.
+  const unrouted = render(ReviewSets, { ...pinned, labels: { v1: 'ci-gate@1.0.0', v2: 'code-review@2.1.0' }, onaction, link: () => undefined });
+  expect(unrouted.container.querySelectorAll('a:not([href])')).toHaveLength(0);
+  expect(within(unrouted.container).getByRole('button', { name: 'e2' })).toBeEnabled();
 });
 
 test('a review set says when it is the latest pin, incomplete, cut short or not retained', async () => {

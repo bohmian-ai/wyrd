@@ -9,6 +9,7 @@
   import { EmptyState, ReviewSets, type ActionIntent, type ActionState, type CardRef } from 'wyrd-ai-ui';
   import { validateIntent } from 'wyrd-ai-ui/loaders';
   import { requestable } from '$lib/access';
+  import { writeDetail } from '$lib/cards-host';
   import AccessRequest from '$lib/AccessRequest.svelte';
   import Crumbs from '$lib/Crumbs.svelte';
   import { pullHref, repositoryHref } from '$lib/repositories-host';
@@ -20,14 +21,22 @@
   const policy = $derived('code' in data.sets || data.sets.result.state !== 'populated' ? undefined : (data.sets.result.data.selected ?? data.sets.result.data.sets[0]).policy.version);
   let actions = $state<Record<string, ActionState>>({});
 
+  /** The URL of each navigation the review sets offer, so it is a real link. */
+  function link(intent: ActionIntent): string | undefined {
+    const input = intent.input as { generation?: string; execution_id?: string; card_ref?: CardRef };
+    if (intent.name === 'review_set.open') return pullHref(base, data.name, data.number, input.generation);
+    if (intent.name === 'record.open' && input.execution_id) return `${base}/verify/executions/${encodeURIComponent(input.execution_id)}`;
+    if (intent.name !== 'card.open' || !input.card_ref) return undefined;
+    return input.card_ref.kind === 'Repository' ? repositoryHref(base, input.card_ref) : `${base}/cards/detail${writeDetail(input.card_ref)}`;
+  }
+
   async function onaction(intent: ActionIntent) {
     const valid = validateIntent('ReviewSets', intent);
     if ('code' in valid) return void (actions[intent.name] = { state: 'error', problem: valid });
-    const input = valid.input as { generation?: string; execution_id?: string; card_ref?: CardRef };
+    const to = link(valid);
+    if (!to) return;
     actions[valid.name] = { state: 'pending' };
-    if (valid.name === 'review_set.open') await goto(pullHref(base, data.name, data.number, input.generation), { keepFocus: true, noScroll: true });
-    else if (valid.name === 'record.open' && input.execution_id) await goto(`${base}/verify/executions/${encodeURIComponent(input.execution_id)}`);
-    else if (valid.name === 'card.open' && input.card_ref) await goto(repositoryHref(base, input.card_ref));
+    await goto(to, valid.name === 'review_set.open' ? { keepFocus: true, noScroll: true } : undefined);
     delete actions[valid.name];
   }
 </script>
@@ -45,7 +54,7 @@
   {#if 'code' in data.sets}
     <EmptyState state="error" problem={data.sets} />
   {:else}
-    <ReviewSets {...data.sets} labels={data.labels} {actions} {onaction} />
+    <ReviewSets {...data.sets} labels={data.labels} {link} {actions} {onaction} />
   {/if}
   {#if requestable(data.sets)}<AccessRequest action="Read this Repository's pull requests" />{/if}
 </div>

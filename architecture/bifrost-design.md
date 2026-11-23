@@ -914,10 +914,24 @@ validate and split by canonical physical partition
   -> acknowledgement
 ```
 
-A shard commits admitted requests in groups. One group cycle writes every
-SLICE record, appends each complete batch's COMMIT record, and makes both
-durable with one sync over every segment the cycle touched before it records
-the batch fences. Each tenant's group uses one multi-row INSERT in its existing
+A shard commits admitted requests in groups, with at most two groups
+dispatched at once. Each group writes every SLICE record, appends each
+complete batch's COMMIT record, and makes both durable with one sync over every
+segment it touched before it records the batch fences. One group writes the WAL
+at a time, and only the older group fences, inserts, publishes or acknowledges,
+so the younger group writes and syncs while the older one awaits PostgreSQL, and
+groups settle in dispatch order. A group's ACK never waits on the next group's
+IO. Beside a dispatched group, the free slot collects up to 32 requests or until
+1 ms after its first collected request, whichever comes first; an idle shard
+dispatches at once. A tenant, table and batch id a dispatched group owns is
+skipped by the other slot until it settles, keeping that table's FIFO while
+other tables proceed. Control commands, pressure seals and a group that needs a
+generation rotation wait until no group is dispatched, and no group dispatches
+while they wait; shutdown drains dispatched groups. A synced but unfenced group
+stays provisional. When a later tenant's fence fails after an earlier tenant's
+fences in the same group were accepted, the shard fails closed and retains both
+groups for restart recovery. Each tenant's group uses one multi-row INSERT in
+its existing
 tenant transaction, then one batched SELECT for conflicting identities if
 needed. Classify each batch by full durable key in original group order;
 RETURNING order is not input order. A contradictory duplicate rolls back that
@@ -1129,7 +1143,7 @@ are recovered from durable state; full channels cannot block ingestion. Tenant S
 deletes in bounded batches only when a receipt is outside recent age/count history
 and its current canonical stream/shard terminal COMMIT segment is at or below that
 stream's persisted safe frontier. Recheck canonical coordinates so a stale candidate
-cannot delete a replacement acceptance. The serial shard loop and ACK never await
+cannot delete a replacement acceptance. The shard loop and ACK never await
 cleanup or run its SQL; Forge does not own receipt cleanup.
 
 The existing admission owner checks local cleanup health, alongside existing

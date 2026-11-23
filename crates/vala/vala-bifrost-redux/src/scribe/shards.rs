@@ -1580,7 +1580,10 @@ impl ShardOwner {
                 }
                 ShardWake::Command(Some(command)) => self.route_command(command).await,
                 ShardWake::Command(None) | ShardWake::Pressure(false) => detached = true,
-                ShardWake::Pressure(true) | ShardWake::Collected => {}
+                // `changed()` marked the signal seen; keep it for the idle
+                // seal and the dispatch barrier.
+                ShardWake::Pressure(true) => self.pressure_receiver.mark_changed(),
+                ShardWake::Collected => {}
             }
         }
     }
@@ -10261,11 +10264,13 @@ mod tests {
         .expect("hold the last fence key");
         let last_fence_blocked = async {
             loop {
-                let waiting: i64 =
-                    sqlx::query_scalar("SELECT count(*) FROM pg_locks WHERE NOT granted")
-                        .fetch_one(&superuser)
-                        .await
-                        .expect("lock wait probe");
+                let waiting: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid \
+                     WHERE NOT l.granted AND a.datname = current_database()",
+                )
+                .fetch_one(&superuser)
+                .await
+                .expect("lock wait probe");
                 if waiting > 0 {
                     return;
                 }
@@ -12065,7 +12070,8 @@ mod tests {
                 let probe = async {
                     loop {
                         let waiting: i64 =
-                            sqlx::query_scalar("SELECT count(*) FROM pg_locks WHERE NOT granted")
+                            sqlx::query_scalar("SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid \
+                     WHERE NOT l.granted AND a.datname = current_database()")
                                 .fetch_one(&self.superuser)
                                 .await
                                 .expect("lock wait probe");
@@ -12688,6 +12694,54 @@ mod tests {
             settled(&mut acks[1], "the waiting group")
                 .await
                 .expect("the waiting group commits");
+            command_tx
+                .send(ShardCommand::Shutdown)
+                .await
+                .expect("shutdown mailbox");
+            tokio::time::timeout(DEADLOCK_BOUND, task)
+                .await
+                .expect("the owner drains")
+                .expect("owner task");
+        }
+
+        /// A pressure seal that arrives while a group fences waits for the
+        /// group to settle, so the sealed generation holds that group's rows
+        /// and the next group writes into a fresh one.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the seal mutates the generation before the dispatched
+        /// group inserts, or either group fails.
+        #[tokio::test]
+        async fn pressure_seals_wait_for_the_dispatched_group() {
+            let (fixture, owner, budget, command_tx) = PipelineFixture::start().await;
+            let ids = [uuid::Uuid::now_v7(), uuid::Uuid::now_v7()];
+            let blocker = fixture.hold_fence(ids[0]).await;
+            let (appends, mut acks) = acked_group_for_key(&budget, &fixture.key, &ids);
+            let mut appends = appends.into_iter();
+            let live = Arc::clone(&owner.memtable);
+            owner.pending.fetch_add(2, Ordering::AcqRel);
+            let task = tokio::spawn(owner.run());
+
+            submit(&command_tx, appends.next().into_iter().collect()).await;
+            fixture.fence_blocked().await;
+            fixture.pressure[0].send_replace(Some(PressureSignal {
+                keys: vec![fixture.key.clone()],
+            }));
+            blocker.rollback().await.expect("release the fence");
+            settled(&mut acks[0], "the fencing group")
+                .await
+                .expect("the fencing group commits");
+            submit(&command_tx, appends.collect()).await;
+            settled(&mut acks[1], "the next group")
+                .await
+                .expect("the next group commits");
+            let stats = live.stats().expect("memtable stats");
+            assert_eq!(
+                (stats.immutable_rows, stats.writable_rows),
+                (1, 1),
+                "the seal holds the fencing group's row and the next group writes fresh"
+            );
             command_tx
                 .send(ShardCommand::Shutdown)
                 .await
